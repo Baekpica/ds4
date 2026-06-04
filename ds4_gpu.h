@@ -1032,6 +1032,10 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                n_comp,
+        /* Phase 2 Step 4a: per-seq compressed-cache bank stride (rows); the
+         * kernel reads row t's compressed rows from bank seq_id[t]*comp_cap.
+         * Ignored when seq_id==NULL (single bank, bit-exact). */
+        uint32_t                comp_cap,
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,

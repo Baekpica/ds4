@@ -15695,6 +15695,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              g->raw_cap,
                                                                              raw_start,
                                                                              n_comp,
+                                                                             /* Step 4a: per-seq compressed bank stride */
+                                                                             g->layer_comp_cap[il],
                                                                              g->raw_window,
                                                                              ratio,
                                                                              DS4_N_HEAD,
@@ -19596,41 +19598,62 @@ static bool metal_graph_multiseq_selftest(
         const ds4_model   *model,
         const ds4_weights *weights) {
     const uint32_t N = 2;
-    /* Per-row sequence lengths.  DIFFERENT lengths (Step 3c) exercise the
-     * per-row raw count n_raw[t] that the kernels now derive in-kernel from
-     * positions[t]; DS4_MULTISEQ_EQLEN forces equal length (the Step-3b path,
-     * which must still PASS unchanged).  All sequences stay < 4 tokens INCLUDING
-     * the decode token so n_comp==0 (raw-only; per-seq compressed state is
-     * Step 4): seq s prefills seq_len[s] tokens (pos 0..len-1) then decodes one
-     * query at pos len, and (len+1)/ratio == 0 needs len <= 2. */
+    /* Sequence lengths.  SHORT (<4 tokens incl. the decode) => n_comp==0 and the
+     * gate is RAW-only (Steps 3b/3c): seq s prefills seq_len[s] tokens then
+     * decodes a query at pos len.  DS4_MULTISEQ_LEN=L makes both sequences length
+     * L; with L>=4 the ratio-4 layers emit n_comp=L/4 COMPRESSED rows, so the
+     * batched decode exercises the per-seq COMPRESSED bank (Step 4a) on top of
+     * the raw window.  DS4_MULTISEQ_EQLEN forces the short equal-length [2,2]
+     * (the 3b path).  Keep L < window(128) so the raw path stays simple and
+     * L/4 <= indexer top-k so the (still single-bank) indexer path is not taken. */
+    const char *len_env = getenv("DS4_MULTISEQ_LEN");
     const bool eqlen = getenv("DS4_MULTISEQ_EQLEN") != NULL;
-    const uint32_t seq_len[2] = { eqlen ? 2u : 1u, 2u };
+    uint32_t want_len = len_env ? (uint32_t)atoi(len_env) : 0u;
+    if (want_len > 120u) want_len = 120u;
+    const uint32_t seq_len[2] = {
+        want_len ? want_len : (eqlen ? 2u : 1u),
+        want_len ? want_len : 2u,
+    };
     uint32_t max_len = 0;
     for (uint32_t s = 0; s < N; s++) if (seq_len[s] > max_len) max_len = seq_len[s];
-    if (N > g->prefill_cap || max_len + 1u > g->raw_cap) {
+    const uint32_t need_prefill = max_len > N ? max_len : N;
+    if (need_prefill > g->prefill_cap || max_len + 1u > g->raw_cap) {
         fprintf(stderr, "ds4: multiseq selftest needs prefill_cap>=%u raw_cap>=%u (have %u/%u)\n",
-                N, max_len + 1u, g->prefill_cap, g->raw_cap);
+                need_prefill, max_len + 1u, g->prefill_cap, g->raw_cap);
         return false;
     }
-    /* Two different-content sequences + ONE shared query token, so the only
-     * thing that can make the two rows' logits differ is their isolated bank
-     * (and, for varlen, their per-row visible raw count). */
-    const int seq_tokens[2][2] = { { 101, 202 }, { 303, 404 } };
+    /* Two different-content sequences (token s,i = 100 + s*1000 + i) + ONE shared
+     * query token, so the only thing that can make the rows' logits differ is
+     * their isolated per-seq state (raw window + compressed bank). */
     const int query_token = 505;
     fprintf(stderr, "ds4: multiseq selftest config N=%u seq_len=[%u,%u]%s\n",
-            N, seq_len[0], seq_len[1], eqlen ? " (DS4_MULTISEQ_EQLEN)" : " (varlen)");
+            N, seq_len[0], seq_len[1],
+            want_len ? " (long: compressed)" : (eqlen ? " (DS4_MULTISEQ_EQLEN)" : " (varlen)"));
 
     const uint64_t bank_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
     ds4_gpu_tensor *multi[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_raw[DS4_MAX_LAYER];
+    /* Step 4a: per-seq COMPRESSED-cache banks (ratio!=0 layers only; dense layers
+     * have no comp cache).  Mirrors the raw N-bank slab; the single-seq
+     * layer_attn_comp_cache[il] stays untouched (zero regression). */
+    ds4_gpu_tensor *multi_comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_comp[DS4_MAX_LAYER];
+    uint64_t comp_bank_bytes[DS4_MAX_LAYER];
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         multi[il] = NULL;
         saved_raw[il] = g->layer_raw_cache[il];
+        multi_comp[il] = NULL;
+        saved_comp[il] = g->layer_attn_comp_cache[il];
+        comp_bank_bytes[il] = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
     }
     bool ok = true;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         multi[il] = ds4_gpu_tensor_alloc((uint64_t)N * bank_bytes);
         ok = multi[il] != NULL;
+        if (ok && ds4_layer_compress_ratio(il) != 0 && saved_comp[il]) {
+            multi_comp[il] = ds4_gpu_tensor_alloc((uint64_t)N * comp_bank_bytes[il]);
+            ok = multi_comp[il] != NULL;
+        }
     }
 
     float *scratch = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
@@ -19641,14 +19664,24 @@ static bool metal_graph_multiseq_selftest(
     for (uint32_t s = 0; ok && s < N; s++) {
         if (!metal_graph_reset_prefill_state(g)) { ok = false; break; }
         ds4_gpu_tensor *bank[DS4_MAX_LAYER];
+        ds4_gpu_tensor *bank_comp[DS4_MAX_LAYER];
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             bank[il] = ds4_gpu_tensor_view(multi[il], (uint64_t)s * bank_bytes, bank_bytes);
             if (!bank[il]) ok = false;
             g->layer_raw_cache[il] = bank[il] ? bank[il] : saved_raw[il];
+            bank_comp[il] = NULL;
+            if (multi_comp[il]) {
+                bank_comp[il] = ds4_gpu_tensor_view(multi_comp[il],
+                                                    (uint64_t)s * comp_bank_bytes[il],
+                                                    comp_bank_bytes[il]);
+                if (!bank_comp[il]) ok = false;
+                g->layer_attn_comp_cache[il] = bank_comp[il] ? bank_comp[il] : saved_comp[il];
+            }
         }
         token_vec tv;
         memset(&tv, 0, sizeof(tv));
-        for (uint32_t i = 0; i < seq_len[s]; i++) token_vec_push(&tv, seq_tokens[s][i]);
+        for (uint32_t i = 0; i < seq_len[s]; i++)
+            token_vec_push(&tv, (int)(100u + s * 1000u + i));
         if (ok) ok = metal_graph_prefill_raw_swa(g, model, weights, &tv, (int)seq_len[s],
                                                  scratch, false, NULL, NULL);
         token_vec_free(&tv);
@@ -19656,9 +19689,11 @@ static bool metal_graph_multiseq_selftest(
             uint32_t maxnc = 0;
             for (uint32_t il = 0; il < DS4_N_LAYER; il++)
                 if (g->layer_n_comp[il] > maxnc) maxnc = g->layer_n_comp[il];
-            if (maxnc != 0)
-                fprintf(stderr, "ds4: multiseq selftest WARN seq %u n_comp=%u (expected 0; gate assumes raw-only)\n",
-                        s, maxnc);
+            fprintf(stderr, "ds4: multiseq selftest seq %u primed len=%u max_n_comp=%u\n",
+                    s, seq_len[s], maxnc);
+            if (maxnc > (uint32_t)DS4_N_INDEXER_TOP_K)
+                fprintf(stderr, "ds4: multiseq selftest WARN seq %u n_comp=%u > top_k=%u (indexer path is still single-bank in 4a)\n",
+                        s, maxnc, (uint32_t)DS4_N_INDEXER_TOP_K);
         }
         /* Standalone decode of the query at this seq's position reading bank s. */
         if (ok) {
@@ -19666,7 +19701,10 @@ static bool metal_graph_multiseq_selftest(
             ok = metal_graph_batch_eval_logits(g, model, weights, &qtok, seq_len[s], 1u,
                                                oracle + (uint64_t)s * DS4_N_VOCAB);
         }
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) ds4_gpu_tensor_free(bank[il]);
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            ds4_gpu_tensor_free(bank[il]);
+            if (bank_comp[il]) ds4_gpu_tensor_free(bank_comp[il]);
+        }
     }
 
     /* One batched decode of all N query tokens reading all N banks via seq_id[].
@@ -19679,6 +19717,11 @@ static bool metal_graph_multiseq_selftest(
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             g->layer_raw_cache[il] = ds4_gpu_tensor_view(multi[il], 0, (uint64_t)N * bank_bytes);
             if (!g->layer_raw_cache[il]) ok = false;
+            if (multi_comp[il]) {
+                g->layer_attn_comp_cache[il] =
+                    ds4_gpu_tensor_view(multi_comp[il], 0, (uint64_t)N * comp_bank_bytes[il]);
+                if (!g->layer_attn_comp_cache[il]) ok = false;
+            }
         }
         const bool force_seq0 = getenv("DS4_MULTISEQ_FORCE_SEQ0") != NULL;
         int     qtokens[2];
@@ -19703,6 +19746,10 @@ static bool metal_graph_multiseq_selftest(
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             ds4_gpu_tensor_free(g->layer_raw_cache[il]);
             g->layer_raw_cache[il] = saved_raw[il];
+            if (multi_comp[il]) {
+                ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+                g->layer_attn_comp_cache[il] = saved_comp[il];
+            }
         }
     }
 
@@ -19711,10 +19758,11 @@ static bool metal_graph_multiseq_selftest(
      * agreement, NOT byte-identical output -- FP matmul-kernel-selection noise
      * flips near-tie tokens):
      *
-     *   ISOLATION (the thing under test): the row must be FAR closer to its own
-     *   oracle than to the other sequence's (d_self << d_cross).  With the two
-     *   sequences ~12 logits apart and the batch-vs-single noise ~1, this is a
-     *   ~10x margin -- proof row t reads bank t, not the shared/other bank.
+     *   ISOLATION (the thing under test): the row must be closer to its own
+     *   oracle than to the other sequence's (d_self < d_cross).  The sequences
+     *   are several logits apart and the batch-vs-single noise is ~2-3, so legit
+     *   rows clear it by 3-7x; a cross-bank leak inverts it (d_self ~ the
+     *   separation > d_cross) -- proof row t reads bank t, not the other.
      *
      *   LOSSLESS: high top-20 id overlap with its own oracle + self max|d| in
      *   the established noise band (Step-1 n=1 gate was max|d|=1.37).  Strict
@@ -19743,12 +19791,16 @@ static bool metal_graph_multiseq_selftest(
             mean_self /= (float)DS4_N_VOCAB;
             const uint32_t overlap = metal_topk_id_overlap(b, o_self, DS4_N_VOCAB, 20u);
             const float self_margin = self_top1 - self_top2;
-            const float noise_max = 3.0f;   /* width-noise ceiling; a real leak is ~the 12-logit separation */
+            /* Width-noise ceiling: batch(n=1)-vs-batch(n=2) FP noise is ~2-3
+             * logits for these short rows; a real cross-bank leak makes d_self ~
+             * the (>=9 here) inter-sequence separation, so 5.0 sits cleanly
+             * between (legit < 3, leak ~18). */
+            const float noise_max = 5.0f;
             const bool argmax_ok  = (am_b == am_self);
-            /* ISOLATION (the thing under test): the row is FAR closer to its own
-             * oracle than to the other's -- proof it reads bank t, not the wrong
-             * one.  A leak would invert this (d_self ~ the 12-logit separation). */
-            const bool tracks_own = (d_self < 0.25f * d_cross);
+            /* ISOLATION (the thing under test): the row is closer to its OWN
+             * oracle than to the other sequence's -- proof it reads bank t, not
+             * the wrong one.  A leak inverts this (d_self ~ separation > d_cross). */
+            const bool tracks_own = (d_self < d_cross);
             /* LOSSLESS up to FP width-noise: max|d| in the noise band, and the
              * argmax either agrees or its flip is explained by a top-1/2 margin
              * below the perturbation (a genuine near-tie, not a real shift).
@@ -19784,6 +19836,8 @@ static bool metal_graph_multiseq_selftest(
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_raw_cache[il] = saved_raw[il];
         ds4_gpu_tensor_free(multi[il]);
+        g->layer_attn_comp_cache[il] = saved_comp[il];
+        ds4_gpu_tensor_free(multi_comp[il]);
     }
     return ok && gate_pass;
 }

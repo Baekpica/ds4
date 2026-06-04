@@ -5694,6 +5694,11 @@ __global__ static void attention_decode_mixed_kernel(
         uint32_t raw_cap,
         uint32_t raw_start,
         uint32_t n_comp,
+        /* Phase 2 Step 4a: per-seq compressed-cache bank stride (rows).  When
+         * seq_id is set, row t reads its compressed rows from bank seq_id[t] at
+         * base seq_id[t]*comp_cap; seq_id==NULL keeps comp_seq_base=0 (single
+         * bank, comp_cap ignored, bit-exact). */
+        uint32_t comp_cap,
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
@@ -5701,9 +5706,9 @@ __global__ static void attention_decode_mixed_kernel(
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (n_tokens
          * entries).  positions -> row t's query position (replaces pos0+t,
          * required for multi-seq where rows are independent sequences);
-         * seq_id -> per-seq raw-ring bank base seq_id[t]*raw_cap.  Both NULL
-         * keeps the single-sequence scalar path (bit-exact).  Compressed-key
-         * reads are NOT per-seq here (multi-seq test runs at n_comp==0). */
+         * seq_id -> per-seq raw-ring bank base seq_id[t]*raw_cap AND per-seq
+         * compressed-cache bank base seq_id[t]*comp_cap (Step 4a).  Both NULL
+         * keeps the single-sequence scalar path (bit-exact). */
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
         /* Optional device-side scalars override (Step-4 Commit B / R5).
@@ -5766,6 +5771,9 @@ __global__ static void attention_decode_mixed_kernel(
     }
     uint32_t first_raw_pos = positions ? (qpos + 1u - row_n_raw) : (pos0 + n_tokens - n_raw);
     uint32_t seq_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
+    /* Phase 2 Step 4a: per-seq compressed-cache bank base (rows).  Each row's
+     * visible compressed rows live in its own bank at seq_id[t]*comp_cap. */
+    uint32_t comp_seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
@@ -5824,7 +5832,7 @@ __global__ static void attention_decode_mixed_kernel(
                         dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, c, d);
                     }
                 } else {
-                    const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+                    const float *kvrow = comp_kv + (uint64_t)(comp_seq_base + c) * head_dim;
                     for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
                 }
                 s = dot * scale + add;
@@ -5852,7 +5860,7 @@ __global__ static void attention_decode_mixed_kernel(
                             fp8_row = true;
                             fp8_c = c;
                         } else {
-                            kvrow = comp_kv + (uint64_t)c * head_dim;
+                            kvrow = comp_kv + (uint64_t)(comp_seq_base + c) * head_dim;
                         }
                     }
                 }
@@ -5922,7 +5930,7 @@ __global__ static void attention_decode_mixed_kernel(
         } else {
             for (uint32_t c = 0; c < visible_comp; c++) {
                 float s = scores[raw_count + c];
-                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                const float *kv = comp_kv + (uint64_t)(comp_seq_base + c) * head_dim;
                 acc0 += kv[d0] * s;
                 acc1 += kv[d1] * s;
             }
@@ -5938,7 +5946,7 @@ __global__ static void attention_decode_mixed_kernel(
                     acc += fp8_kv_read(comp_fp8, comp_scale, c, d) * scores[raw_count + c];
                 }
             } else {
-                for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+                for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)(comp_seq_base + c) * head_dim + d] * scores[raw_count + c];
             }
             oh[d] = acc / denom;
         }
@@ -12638,7 +12646,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
-                                                 0, 0, n_head, head_dim,
+                                                 /*comp_cap=*/0u, 0, 0, n_head, head_dim,
                                                  /*positions=*/NULL, /*seq_id=*/NULL,
                                                  (const struct ds4_decode_scalars *)scalars,
                                                  ls_override,
@@ -12762,6 +12770,9 @@ static int attention_decode_batch_launch(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                n_comp,
+        /* Phase 2 Step 4a: per-seq compressed-cache bank stride (rows); only
+         * the main kernel honours it (multi-seq is forced down that path). */
+        uint32_t                comp_cap,
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
@@ -12860,7 +12871,7 @@ static int attention_decode_batch_launch(
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
-                                                 raw_start, n_comp, window, ratio, n_head, head_dim,
+                                                 raw_start, n_comp, comp_cap, window, ratio, n_head, head_dim,
                                                  pos_dev, seq_dev,
                                                  /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL,
                                                  fp8_codes,
@@ -12888,7 +12899,7 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         const ds4_gpu_tensor *seq_id) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
-                                      n_raw, raw_cap, raw_start, 0, window, 1,
+                                      n_raw, raw_cap, raw_start, 0, /*comp_cap=*/0u, window, 1,
                                       n_head, head_dim,
                                       /* comp_fp8 */ NULL, /* comp_scale */ NULL,
                                       positions, seq_id);
@@ -12911,6 +12922,8 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                n_comp,
+        /* Phase 2 Step 4a: per-seq compressed-cache bank stride (rows). */
+        uint32_t                comp_cap,
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
@@ -12926,7 +12939,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
-                                      n_comp, window, ratio, n_head, head_dim,
+                                      n_comp, comp_cap, window, ratio, n_head, head_dim,
                                       comp_fp8, comp_scale,
                                       positions, seq_id);
 }

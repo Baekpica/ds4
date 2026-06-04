@@ -12335,6 +12335,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                n_comp,
+        uint32_t                comp_cap,
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
@@ -12346,6 +12347,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
     /* Opp C Phase 1A.3: Metal mirror lives in CUDA only today; ignore. */
     (void)comp_fp8;
     (void)comp_scale;
+    (void)comp_cap;  /* Phase 2 Step 4a: per-seq compressed bank is CUDA-only. */
     (void)positions; (void)seq_id;  /* Phase 2 Step 3: CUDA-only (see store stub). */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
