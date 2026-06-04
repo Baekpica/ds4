@@ -8853,6 +8853,14 @@ typedef struct {
      * persistent caches used by decode.  Keeping this separate from decode
      * avoids a slow loop of one-token graph steps for long prompts. */
     ds4_gpu_tensor *prefill_tokens;
+    /* Phase 2 Step 2: per-row absolute positions (int32, prefill_cap entries).
+     * When batch_use_positions is set, the batched attention path reads row t's
+     * position from batch_positions[t] instead of deriving it as pos0 + t.  The
+     * scalar (pos0 + t) fast-path is retained for prefill/decode so they don't
+     * regress; only the multi-sequence batch_eval path (and the DS4_BATCH_POSITIONS
+     * bit-exactness test) set this.  Unblocks per-seq independent positions (Step 3). */
+    ds4_gpu_tensor *batch_positions;
+    bool            batch_use_positions;
     ds4_gpu_tensor *batch_cur_hc;
     ds4_gpu_tensor *batch_next_hc;
     ds4_gpu_tensor *batch_flat_hc;
@@ -8964,6 +8972,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_group_tmp);
     ds4_gpu_tensor_free(g->batch_attn_out);
     ds4_gpu_tensor_free(g->batch_attn_low);
+    ds4_gpu_tensor_free(g->batch_positions);
     ds4_gpu_tensor_free(g->batch_heads);
     ds4_gpu_tensor_free(g->batch_indexer_weights);
     ds4_gpu_tensor_free(g->batch_indexer_q);
@@ -9646,6 +9655,8 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_indexer_q = ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
     g->batch_indexer_weights = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
     g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    g->batch_positions = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));  /* Phase 2 Step 2 */
+    g->batch_use_positions = false;
     g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
     g->batch_attn_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_group_tmp = ds4_gpu_tensor_alloc(pc * group_dim * sizeof(float));
@@ -9739,7 +9750,8 @@ static bool metal_graph_alloc_raw_cap(
                     g->batch_kv_raw && g->batch_kv &&
                     g->batch_comp_kv && g->batch_comp_sc &&
                     g->batch_indexer_q && g->batch_indexer_weights &&
-                    g->batch_heads && g->batch_attn_low && g->batch_attn_out &&
+                    g->batch_heads && g->batch_positions &&
+                    g->batch_attn_low && g->batch_attn_out &&
                     g->batch_group_tmp && g->batch_low_tmp && g->batch_after_attn_hc &&
                     g->batch_ffn_cur && g->batch_ffn_norm &&
                     g->batch_shared_gate && g->batch_shared_up &&
@@ -11907,6 +11919,7 @@ static bool metal_graph_decode2_q_batch_diff(
                                       DS4_N_HEAD_DIM,
                                       DS4_N_ROT,
                                       pos0,
+                                      /*positions=*/NULL,
                                       compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                       false,
                                       freq_base,
@@ -14148,6 +14161,32 @@ static bool metal_graph_upload_prompt_tokens(
     return ok;
 }
 
+/* Phase 2 Step 2: fill g->batch_positions[0..n) with consecutive absolute
+ * positions pos0..pos0+n-1 and upload to the device.  At this step the values
+ * are still the consecutive identity (one sequence), so reading positions[t]
+ * is bit-identical to the scalar pos0+t derivation; the point is to thread the
+ * per-row position array through the kernels so Step 3 can make them per-seq
+ * independent. */
+static bool metal_graph_fill_batch_positions(ds4_gpu_graph *g, uint32_t pos0, uint32_t n_tokens) {
+    if (!g || !g->batch_positions || n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    int32_t *pos = xmalloc((size_t)n_tokens * sizeof(pos[0]));
+    for (uint32_t i = 0; i < n_tokens; i++) pos[i] = (int32_t)(pos0 + i);
+    const bool ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos,
+                                         (uint64_t)n_tokens * sizeof(pos[0])) != 0;
+    free(pos);
+    return ok;
+}
+
+/* DS4_BATCH_POSITIONS=1 forces the per-row positions[] array path on for ALL
+ * batched attention (including prefill), not just the multi-seq batch_eval path.
+ * With consecutive positions this must be bit-identical to the scalar path, so
+ * it is the Step-2 n>1 regression test (prefill-with-array == prefill-scalar). */
+static bool metal_graph_batch_positions_forced(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_BATCH_POSITIONS") != NULL ? 1 : 0;
+    return cached != 0;
+}
+
 /* Rebuild ratio-4 compressor state after chunked prefill so a following decode
  * token sees the same rolling compression window. */
 static bool metal_graph_refresh_ratio4_compressor_state(
@@ -14408,6 +14447,17 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
 
+    /* Phase 2 Step 2: per-row absolute positions.  When enabled (multi-seq
+     * batch_eval, or the DS4_BATCH_POSITIONS bit-exactness test), fill the array
+     * once at il==0 and pass its device pointer to the position-dependent kernels;
+     * they read positions[t] instead of deriving pos0+t.  Otherwise positions is
+     * NULL and the kernels keep the scalar pos0+t fast-path (prefill unchanged). */
+    const bool use_positions = g->batch_use_positions || metal_graph_batch_positions_forced();
+    if (use_positions && il == 0) {
+        if (!metal_graph_fill_batch_positions(g, pos0, n_tokens)) return false;
+    }
+    ds4_gpu_tensor *positions = use_positions ? g->batch_positions : NULL;
+
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -14629,6 +14679,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                             DS4_N_HEAD_DIM,
                                             DS4_N_ROT,
                                             pos0,
+                                            positions,
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false,
                                             freq_base,
@@ -14677,6 +14728,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                             DS4_N_HEAD_DIM,
                                             DS4_N_ROT,
                                             pos0,
+                                            positions,
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false,
                                             freq_base,
@@ -15165,6 +15217,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                     DS4_N_INDEXER_HEAD_DIM,
                                                     DS4_N_ROT,
                                                     pos0,
+                                                    positions,
                                                     compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                     false,
                                                     freq_base,
@@ -15832,6 +15885,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                             DS4_N_HEAD_DIM,
                                             DS4_N_ROT,
                                             pos0,
+                                            positions,
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             true,
                                             freq_base,
@@ -21168,7 +21222,12 @@ static bool metal_graph_batch_eval_logits(
     token_vec_free(&tv);
     if (!ok) return false;
 
-    /* No spec_capture: commit the KV + compressor state, like a prefill chunk. */
+    /* No spec_capture: commit the KV + compressor state, like a prefill chunk.
+     * Step 2: drive the per-row positions[] array path (filled with pos0+t at
+     * il==0 inside the attention-batch fn).  At n=1 / consecutive positions this
+     * is bit-identical to the scalar path; it exercises the array read so Step 3
+     * can make positions per-seq independent. */
+    g->batch_use_positions = true;
     ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = metal_graph_encode_layer_batch(g,
@@ -21178,6 +21237,7 @@ static bool metal_graph_batch_eval_logits(
                                             pos0,
                                             n);
     }
+    g->batch_use_positions = false;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (!ok) return false;

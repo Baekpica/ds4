@@ -6882,6 +6882,7 @@ int ds4_gpu_rope_tail_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot,
         uint32_t          pos0,
+        const ds4_gpu_tensor *positions,
         uint32_t          n_ctx_orig,
         bool              inverse,
         float             freq_base,
@@ -6890,6 +6891,12 @@ int ds4_gpu_rope_tail_tensor(
         float             attn_factor,
         float             beta_fast,
         float             beta_slow) {
+    /* Phase 2 Step 2: per-row positions[].  At this step the array always holds
+     * consecutive positions pos0..pos0+n_tok-1, which the scalar pos0+stride
+     * encode below reproduces bit-for-bit, so the Metal stub ignores it.  The
+     * CUDA backend (the Phase 2 target) honours it per-row; if Metal ever needs
+     * true per-seq positions (Step 3+), this stub must read the array.  */
+    (void)positions;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || n_rot > head_dim || (n_rot & 1u) != 0) {
         return 0;
@@ -6961,7 +6968,7 @@ int ds4_gpu_rope_tail_scalars_tensor(
     }
     const uint32_t pos0 = (uint32_t)((int32_t)g_metal_decode_pos0 + pos_offset);
     return ds4_gpu_rope_tail_tensor(x, n_tok, n_head, head_dim, n_rot,
-                                      pos0, n_ctx_orig, inverse,
+                                      pos0, /*positions=*/NULL, n_ctx_orig, inverse,
                                       freq_base, freq_scale, ext_factor,
                                       attn_factor, beta_fast, beta_slow);
 }
@@ -9213,6 +9220,7 @@ int ds4_gpu_compressor_update_tensor(
                                             head_dim,
                                             n_rot,
                                             comp_pos,
+                                            /*positions=*/NULL,
                                             n_ctx_orig,
                                             false,
                                             freq_base,

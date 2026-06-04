@@ -724,6 +724,9 @@ int ds4_gpu_rope_tail_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot,
         uint32_t          pos0,
+        /* Phase 2 Step 2: optional per-row absolute positions (int32 device
+         * tensor, n_tok entries).  NULL -> scalar fast-path (pos0 + t). */
+        const ds4_gpu_tensor *positions,
         uint32_t          n_ctx_orig,
         bool              inverse,
         float             freq_base,
