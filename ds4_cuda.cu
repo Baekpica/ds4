@@ -5365,6 +5365,12 @@ __global__ static void indexer_hadamard_fp4_row_kernel(
 __global__ static void store_raw_kv_batch_kernel(
         float *raw, const float *kv,
         uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (n_tokens
+         * entries).  positions -> write slot from the row's absolute position
+         * positions[t]; seq_id -> per-seq ring bank base seq_id[t]*raw_cap.
+         * Both NULL keeps the single-sequence scalar path (bit-exact). */
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
         const struct ds4_decode_scalars * __restrict__ s_override) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * head_dim;
@@ -5381,7 +5387,9 @@ __global__ static void store_raw_kv_batch_kernel(
     if (s_override != NULL && n_tokens == 1u) {
         row = s_override->raw_row;
     } else {
-        row = (pos0 + t) % raw_cap;
+        uint32_t pos = positions ? (uint32_t)positions[t] : pos0 + t;
+        uint32_t seq_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
+        row = seq_base + (pos % raw_cap);
     }
     raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[(uint64_t)t * head_dim + d]));
 }
@@ -5690,6 +5698,14 @@ __global__ static void attention_decode_mixed_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (n_tokens
+         * entries).  positions -> row t's query position (replaces pos0+t,
+         * required for multi-seq where rows are independent sequences);
+         * seq_id -> per-seq raw-ring bank base seq_id[t]*raw_cap.  Both NULL
+         * keeps the single-sequence scalar path (bit-exact).  Compressed-key
+         * reads are NOT per-seq here (multi-seq test runs at n_comp==0). */
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
         /* Optional device-side scalars override (Step-4 Commit B / R5).
          * When non-NULL the kernel reads n_raw, raw_start from the struct
          * at execution time instead of using the inline args.  pos0,
@@ -5729,8 +5745,13 @@ __global__ static void attention_decode_mixed_kernel(
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
     const bool single_all = (n_tokens == 1u && ratio == 0u);
-    uint32_t qpos = pos0 + t;
-    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    /* Phase 2 Step 3: per-row position.  positions[t] is the row's absolute
+     * query position; first_raw_pos = positions[t]+1-n_raw is the oldest raw
+     * row still in the (per-seq) window.  At single-seq positions[t]==pos0+t
+     * and n_tokens-1 collapse to the original pos0+n_tokens-n_raw form. */
+    uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t first_raw_pos = positions ? (qpos + 1u - n_raw) : (pos0 + n_tokens - n_raw);
+    uint32_t seq_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
@@ -5766,7 +5787,7 @@ __global__ static void attention_decode_mixed_kernel(
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = seq_base + ((raw_start + raw_first_idx + r) % raw_cap);
     }
     __syncthreads();
     uint32_t n_score = raw_count + visible_comp;
@@ -6208,6 +6229,12 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (n_tokens
+         * entries).  positions -> row query position; seq_id -> per-seq raw
+         * bank base.  Both NULL = single-sequence scalar path.  Compressed
+         * (topk) reads are NOT per-seq here (multi-seq test runs n_comp==0). */
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
         const struct ds4_decode_scalars * __restrict__ s_override,
         /* Step 4c A1: per-layer n_comp override.  See
          * attention_decode_mixed_kernel for rationale. */
@@ -6262,8 +6289,10 @@ __global__ static void attention_indexed_mixed_kernel(
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
-    uint32_t qpos = pos0 + t;
-    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    /* Phase 2 Step 3: per-row position (see attention_decode_mixed_kernel). */
+    uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t first_raw_pos = positions ? (qpos + 1u - n_raw) : (pos0 + n_tokens - n_raw);
+    uint32_t seq_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
     uint32_t visible_comp = n_comp;
     if (ratio != 0) {
         visible_comp = (qpos + 1u) / ratio;
@@ -6303,7 +6332,7 @@ __global__ static void attention_indexed_mixed_kernel(
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = seq_base + ((raw_start + raw_first_idx + r) % raw_cap);
     }
     /* Determinism fix (2026-05-26 long-context nondeterminism postmortem):
      * the prior parallel `atomicAdd(&comp_count, 1u)` compaction produced an
@@ -11954,20 +11983,30 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
     store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)raw_cache->ptr, (const float *)kv->ptr,
             raw_cap, row, 1, head_dim,
+            /*positions=*/NULL, /*seq_id=*/NULL,
             (const struct ds4_decode_scalars *)scalars);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
-extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
+extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (int32, n_tokens
+         * entries).  NULL = single-sequence scalar (pos0+t, bank 0). */
+        const ds4_gpu_tensor *positions, const ds4_gpu_tensor *seq_id) {
     if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
+    /* With per-seq banks the cache holds n_seq*raw_cap rows; the single-seq
+     * path still requires at least one bank. */
+    if (!seq_id && raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) return 0;
+    if (positions && positions->bytes < (uint64_t)n_tokens * sizeof(int32_t)) return 0;
+    if (seq_id && seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t)) return 0;
+    const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
+    const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
     uint64_t n = (uint64_t)n_tokens * head_dim;
     /* PC4 (K0): batch path (n_tokens > 1) not capture-targeted; pass
      * NULL for scalars so the kernel uses the inline pos0 + per-thread
-     * mod. */
+     * mod (or positions[t]/seq_id[t] when provided). */
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)raw_cache->ptr, (const float *)kv->ptr,
-            raw_cap, pos0, n_tokens, head_dim, NULL);
+            raw_cap, pos0, n_tokens, head_dim, pos_dev, seq_dev, NULL);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
 extern "C" int ds4_gpu_compressor_store_batch_tensor(
@@ -12578,6 +12617,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim,
+                                                 /*positions=*/NULL, /*seq_id=*/NULL,
                                                  (const struct ds4_decode_scalars *)scalars,
                                                  ls_override,
                                                  fp8_codes,
@@ -12709,7 +12749,14 @@ static int attention_decode_batch_launch(
          * (attention_decode_mixed_kernel) branch reads from it -- the
          * window/online fallbacks above keep reading FP32. */
         const ds4_gpu_tensor *comp_fp8,
-        const ds4_gpu_tensor *comp_scale) {
+        const ds4_gpu_tensor *comp_scale,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (int32, n_tokens
+         * entries).  positions -> per-row query position; seq_id -> per-seq raw
+         * bank.  Both NULL = single-sequence scalar path.  Only the main
+         * attention_decode_mixed_kernel honours them; multi-seq is forced down
+         * that path (the heads8-online variants are not per-seq yet). */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id) {
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -12720,15 +12767,22 @@ static int attention_decode_batch_launch(
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
-        (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
+        (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) ||
+        (positions && positions->bytes < (uint64_t)n_tokens * sizeof(int32_t)) ||
+        (seq_id && seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t))) {
         return 0;
     }
     if (n_comp != 0 && ratio == 0) return 0;
+    const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
+    const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
+    /* Multi-seq (per-row positions/seq) must use the main kernel; the
+     * heads8-online fast paths below are not per-seq aware yet. */
+    const bool force_main_kernel = (pos_dev != NULL || seq_dev != NULL);
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        if (!use_comp_mask && head_dim == 512u &&
+        if (!force_main_kernel && !use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
@@ -12752,7 +12806,7 @@ static int attention_decode_batch_launch(
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
+    if (!force_main_kernel && !use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -12785,6 +12839,7 @@ static int attention_decode_batch_launch(
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim,
+                                                 pos_dev, seq_dev,
                                                  /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL,
                                                  fp8_codes,
                                                  fp8_sc);
@@ -12805,12 +12860,16 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                raw_start,
         uint32_t                window,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim,
-                                      /* comp_fp8 */ NULL, /* comp_scale */ NULL);
+                                      /* comp_fp8 */ NULL, /* comp_scale */ NULL,
+                                      positions, seq_id);
 }
 
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
@@ -12837,13 +12896,17 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         /* Opp C Phase 1A.3: optional packed FP8 mirror; NULL/NULL when
          * DS4_CUDA_FP8_KV is off. */
         const ds4_gpu_tensor *comp_fp8,
-        const ds4_gpu_tensor *comp_scale) {
+        const ds4_gpu_tensor *comp_scale,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id) {
     if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim,
-                                      comp_fp8, comp_scale);
+                                      comp_fp8, comp_scale,
+                                      positions, seq_id);
 }
 
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
@@ -12884,7 +12947,11 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * callers pass the pointers unconditionally so the env-gated
          * fallback path benefits too. */
         const ds4_gpu_tensor *comp_fp8,
-        const ds4_gpu_tensor *comp_scale) {
+        const ds4_gpu_tensor *comp_scale,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq).
+         * Force the generic kernel (heads8 indexed fast path is not per-seq yet). */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id) {
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -12902,6 +12969,13 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    if ((positions && positions->bytes < (uint64_t)n_tokens * sizeof(int32_t)) ||
+        (seq_id && seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t))) return 0;
+    const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
+    const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
+    /* Multi-seq forces the generic indexed kernel below (heads8 indexed fast
+     * path is not per-seq aware yet). */
+    const bool force_main_kernel = (pos_dev != NULL || seq_dev != NULL);
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
@@ -12912,7 +12986,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
+    if (!force_main_kernel && n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
@@ -13031,6 +13105,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   ratio,
                                                   n_head,
                                                   head_dim,
+                                                  pos_dev, seq_dev,
                                                   (const struct ds4_decode_scalars *)scalars,
                                                   ls_override,
                                                   fp8_codes,

@@ -10767,7 +10767,8 @@ static bool metal_graph_encode_decode_layer_impl(
                      * decode reads.  NULL when off; the kernel collapses
                      * to FP32. */
                     g->layer_comp_cache_fp8[il],
-                    g->layer_comp_scale[il]) != 0;
+                    g->layer_comp_scale[il],
+                    /*positions=*/NULL, /*seq_id=*/NULL) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -14766,7 +14767,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     g->raw_cap,
                                                                     pos0,
                                                                     n_tokens,
-                                                                    DS4_N_HEAD_DIM) != 0;
+                                                                    DS4_N_HEAD_DIM,
+                                                                    /*positions=*/NULL, /*seq_id=*/NULL) != 0;
     const bool raw_batch_attention = zero_prefix && ratio == 0;
     bool batch_attention_done = false;
 
@@ -14801,7 +14803,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                  g->raw_cap,
                                                  pos0,
                                                  n_tokens,
-                                                 DS4_N_HEAD_DIM) != 0;
+                                                 DS4_N_HEAD_DIM,
+                                                 /*positions=*/NULL, /*seq_id=*/NULL) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("raw_cache",
                                           g->layer_raw_cache[il],
@@ -14823,7 +14826,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                    raw_start,
                                                                    g->raw_window,
                                                                    DS4_N_HEAD,
-                                                                   DS4_N_HEAD_DIM) != 0;
+                                                                   DS4_N_HEAD_DIM,
+                                                                   /*positions=*/NULL, /*seq_id=*/NULL) != 0;
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -15483,7 +15487,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      g->raw_cap,
                                                      pos0,
                                                      n_tokens,
-                                                     DS4_N_HEAD_DIM) != 0;
+                                                     DS4_N_HEAD_DIM,
+                                                     /*positions=*/NULL, /*seq_id=*/NULL) != 0;
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {
@@ -15582,7 +15587,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                                * so the gridX=1 fallback (DS4_CUDA_NO_INDEXED_
                                                                                * HEADS8) also benefits. */
                                                                               g->layer_comp_cache_fp8[il],
-                                                                              g->layer_comp_scale[il]) != 0;
+                                                                              g->layer_comp_scale[il],
+                                                                              /*positions=*/NULL, /*seq_id=*/NULL) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -15614,7 +15620,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              DS4_N_HEAD_DIM,
                                                                              /* Opp C Phase 1A.3: packed FP8 mirror; NULL when off. */
                                                                              g->layer_comp_cache_fp8[il],
-                                                                             g->layer_comp_scale[il]) != 0;
+                                                                             g->layer_comp_scale[il],
+                                                                             /*positions=*/NULL, /*seq_id=*/NULL) != 0;
                 }
             }
             if (ok) batch_attention_done = true;
@@ -15705,7 +15712,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */,
                                                                           /* Opp C Phase 1A.4: packed FP8 mirror. */
                                                                           g->layer_comp_cache_fp8[il],
-                                                                          g->layer_comp_scale[il]) != 0;
+                                                                          g->layer_comp_scale[il],
+                                                                          /*positions=*/NULL, /*seq_id=*/NULL) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                     il,
@@ -15842,7 +15850,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               /* Opp C Phase 1A.4: packed FP8 mirror for
                                                                                * decode2-exact indexer attention. */
                                                                               cur_comp ? g->layer_comp_cache_fp8[il] : NULL,
-                                                                              cur_comp ? g->layer_comp_scale[il]    : NULL) != 0;
+                                                                              cur_comp ? g->layer_comp_scale[il]    : NULL,
+                                                                              /*positions=*/NULL, /*seq_id=*/NULL) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,

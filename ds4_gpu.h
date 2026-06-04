@@ -800,7 +800,11 @@ int ds4_gpu_store_raw_kv_batch_tensor(
         uint32_t                raw_cap,
         uint32_t                pos0,
         uint32_t                n_tokens,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (int32 device
+         * tensors, n_tokens entries).  NULL = single-sequence scalar path. */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id);
 
 /* =========================================================================
  * KV Compression and Attention.
@@ -1006,7 +1010,10 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                raw_start,
         uint32_t                window,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -1032,7 +1039,10 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         /* Opp C Phase 1A.3: optional packed FP8 mirror; see
          * ds4_gpu_attention_decode_heads_tensor for semantics. */
         const ds4_gpu_tensor *comp_fp8,
-        const ds4_gpu_tensor *comp_scale);
+        const ds4_gpu_tensor *comp_scale,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id);
 
 /* Decode-time indexed-attention shim.  See ds4_gpu_attention_decode_heads_
  * tensor for the `scalars` semantics.  Pass NULL for the batched/prefill
@@ -1071,7 +1081,10 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * disables the heads8 fast path.  The heads8 variants
          * themselves still read FP32. */
         const ds4_gpu_tensor *comp_fp8,
-        const ds4_gpu_tensor *comp_scale);
+        const ds4_gpu_tensor *comp_scale,
+        /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
