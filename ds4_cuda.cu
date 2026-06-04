@@ -5750,7 +5750,21 @@ __global__ static void attention_decode_mixed_kernel(
      * row still in the (per-seq) window.  At single-seq positions[t]==pos0+t
      * and n_tokens-1 collapse to the original pos0+n_tokens-n_raw form. */
     uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
-    uint32_t first_raw_pos = positions ? (qpos + 1u - n_raw) : (pos0 + n_tokens - n_raw);
+    /* Phase 2 Step 3c: per-row raw span.  In multi-seq each row is an
+     * independent sequence whose visible raw count + ring base depend on ITS
+     * own position, so derive row_n_raw/row_raw_start per row from positions[t]
+     * (a pure function of qpos, window, raw_cap -- it reproduces the host scalar
+     * n_raw/raw_start exactly when all rows share a length, so the Step-3b
+     * equal-length gate is bit-identical).  Single-seq (positions==NULL) keeps
+     * the scalar inline args. */
+    uint32_t row_n_raw     = n_raw;
+    uint32_t row_raw_start = raw_start;
+    if (positions) {
+        row_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (row_n_raw > raw_cap) row_n_raw = raw_cap;
+        row_raw_start = (qpos + 1u - row_n_raw) % raw_cap;
+    }
+    uint32_t first_raw_pos = positions ? (qpos + 1u - row_n_raw) : (pos0 + n_tokens - n_raw);
     uint32_t seq_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
@@ -5766,10 +5780,10 @@ __global__ static void attention_decode_mixed_kernel(
     if (threadIdx.x == 0) {
         raw_count = 0;
         raw_first_idx = 0;
-        if (n_raw != 0) {
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (row_n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + row_n_raw - 1u;
             if (single_all) {
-                raw_count = n_raw > 256u ? 256u : n_raw;
+                raw_count = row_n_raw > 256u ? 256u : row_n_raw;
             } else if (qpos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
                 if (window != 0 && qpos + 1u > window) {
@@ -5787,7 +5801,7 @@ __global__ static void attention_decode_mixed_kernel(
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = seq_base + ((raw_start + raw_first_idx + r) % raw_cap);
+        raw_rows[r] = seq_base + ((row_raw_start + raw_first_idx + r) % raw_cap);
     }
     __syncthreads();
     uint32_t n_score = raw_count + visible_comp;
@@ -6291,7 +6305,15 @@ __global__ static void attention_indexed_mixed_kernel(
     if (t >= n_tokens || h >= n_head) return;
     /* Phase 2 Step 3: per-row position (see attention_decode_mixed_kernel). */
     uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
-    uint32_t first_raw_pos = positions ? (qpos + 1u - n_raw) : (pos0 + n_tokens - n_raw);
+    /* Phase 2 Step 3c: per-row raw span (see attention_decode_mixed_kernel). */
+    uint32_t row_n_raw     = n_raw;
+    uint32_t row_raw_start = raw_start;
+    if (positions) {
+        row_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (row_n_raw > raw_cap) row_n_raw = raw_cap;
+        row_raw_start = (qpos + 1u - row_n_raw) % raw_cap;
+    }
+    uint32_t first_raw_pos = positions ? (qpos + 1u - row_n_raw) : (pos0 + n_tokens - n_raw);
     uint32_t seq_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
     uint32_t visible_comp = n_comp;
     if (ratio != 0) {
@@ -6313,8 +6335,8 @@ __global__ static void attention_indexed_mixed_kernel(
         raw_count = 0;
         raw_first_idx = 0;
         comp_count = 0;
-        if (n_raw != 0) {
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (row_n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + row_n_raw - 1u;
             if (qpos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
                 if (window != 0 && qpos + 1u > window) {
@@ -6332,7 +6354,7 @@ __global__ static void attention_indexed_mixed_kernel(
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = seq_base + ((raw_start + raw_first_idx + r) % raw_cap);
+        raw_rows[r] = seq_base + ((row_raw_start + raw_first_idx + r) % raw_cap);
     }
     /* Determinism fix (2026-05-26 long-context nondeterminism postmortem):
      * the prior parallel `atomicAdd(&comp_count, 1u)` compaction produced an

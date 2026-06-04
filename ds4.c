@@ -8874,6 +8874,12 @@ typedef struct {
     ds4_gpu_tensor *batch_seq_id;
     bool            batch_multiseq;
     uint32_t        batch_n_seq;
+    /* Phase 2 Step 3c: when set, the driver has ALREADY written per-row
+     * positions[]/seq_id[] into batch_positions/batch_seq_id (genuinely
+     * per-sequence lengths -- different-length sequences), so the il==0 fill in
+     * the attention-batch path must NOT overwrite them with the equal-length
+     * pos0 fill.  Clear = the equal-length 3b path (fill positions[t]=pos0). */
+    bool            batch_multiseq_prefilled;
     ds4_gpu_tensor *batch_cur_hc;
     ds4_gpu_tensor *batch_next_hc;
     ds4_gpu_tensor *batch_flat_hc;
@@ -9674,6 +9680,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_seq_id = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));     /* Phase 2 Step 3b */
     g->batch_multiseq = false;
     g->batch_n_seq = 0;
+    g->batch_multiseq_prefilled = false;                             /* Phase 2 Step 3c */
     g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
     g->batch_attn_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_group_tmp = ds4_gpu_tensor_alloc(pc * group_dim * sizeof(float));
@@ -14505,7 +14512,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                metal_graph_batch_positions_forced();
     if (use_positions && il == 0) {
         if (use_multiseq) {
-            if (!metal_graph_fill_batch_multiseq(g, pos0, n_tokens)) return false;
+            /* Step 3c: skip the equal-length fill when the driver has already
+             * written genuinely per-row positions[]/seq_id[] (varlen). */
+            if (!g->batch_multiseq_prefilled &&
+                !metal_graph_fill_batch_multiseq(g, pos0, n_tokens)) return false;
         } else {
             if (!metal_graph_fill_batch_positions(g, pos0, n_tokens)) return false;
         }
@@ -19586,16 +19596,29 @@ static bool metal_graph_multiseq_selftest(
         const ds4_model   *model,
         const ds4_weights *weights) {
     const uint32_t N = 2;
-    const uint32_t L = 2;          /* prefill tokens/seq; L+1 tokens < ratio-4 window => n_comp==0 */
-    if (N > g->prefill_cap || L + 1u > g->raw_cap) {
+    /* Per-row sequence lengths.  DIFFERENT lengths (Step 3c) exercise the
+     * per-row raw count n_raw[t] that the kernels now derive in-kernel from
+     * positions[t]; DS4_MULTISEQ_EQLEN forces equal length (the Step-3b path,
+     * which must still PASS unchanged).  All sequences stay < 4 tokens INCLUDING
+     * the decode token so n_comp==0 (raw-only; per-seq compressed state is
+     * Step 4): seq s prefills seq_len[s] tokens (pos 0..len-1) then decodes one
+     * query at pos len, and (len+1)/ratio == 0 needs len <= 2. */
+    const bool eqlen = getenv("DS4_MULTISEQ_EQLEN") != NULL;
+    const uint32_t seq_len[2] = { eqlen ? 2u : 1u, 2u };
+    uint32_t max_len = 0;
+    for (uint32_t s = 0; s < N; s++) if (seq_len[s] > max_len) max_len = seq_len[s];
+    if (N > g->prefill_cap || max_len + 1u > g->raw_cap) {
         fprintf(stderr, "ds4: multiseq selftest needs prefill_cap>=%u raw_cap>=%u (have %u/%u)\n",
-                N, L + 1u, g->prefill_cap, g->raw_cap);
+                N, max_len + 1u, g->prefill_cap, g->raw_cap);
         return false;
     }
     /* Two different-content sequences + ONE shared query token, so the only
-     * thing that can make the two rows' logits differ is their isolated bank. */
+     * thing that can make the two rows' logits differ is their isolated bank
+     * (and, for varlen, their per-row visible raw count). */
     const int seq_tokens[2][2] = { { 101, 202 }, { 303, 404 } };
     const int query_token = 505;
+    fprintf(stderr, "ds4: multiseq selftest config N=%u seq_len=[%u,%u]%s\n",
+            N, seq_len[0], seq_len[1], eqlen ? " (DS4_MULTISEQ_EQLEN)" : " (varlen)");
 
     const uint64_t bank_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
     ds4_gpu_tensor *multi[DS4_MAX_LAYER];
@@ -19625,8 +19648,8 @@ static bool metal_graph_multiseq_selftest(
         }
         token_vec tv;
         memset(&tv, 0, sizeof(tv));
-        for (uint32_t i = 0; i < L; i++) token_vec_push(&tv, seq_tokens[s][i]);
-        if (ok) ok = metal_graph_prefill_raw_swa(g, model, weights, &tv, (int)L,
+        for (uint32_t i = 0; i < seq_len[s]; i++) token_vec_push(&tv, seq_tokens[s][i]);
+        if (ok) ok = metal_graph_prefill_raw_swa(g, model, weights, &tv, (int)seq_len[s],
                                                  scratch, false, NULL, NULL);
         token_vec_free(&tv);
         if (ok) {
@@ -19637,28 +19660,46 @@ static bool metal_graph_multiseq_selftest(
                 fprintf(stderr, "ds4: multiseq selftest WARN seq %u n_comp=%u (expected 0; gate assumes raw-only)\n",
                         s, maxnc);
         }
-        /* Standalone decode of the query at position L reading bank s only. */
+        /* Standalone decode of the query at this seq's position reading bank s. */
         if (ok) {
             const int qtok = query_token;
-            ok = metal_graph_batch_eval_logits(g, model, weights, &qtok, L, 1u,
+            ok = metal_graph_batch_eval_logits(g, model, weights, &qtok, seq_len[s], 1u,
                                                oracle + (uint64_t)s * DS4_N_VOCAB);
         }
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) ds4_gpu_tensor_free(bank[il]);
     }
 
-    /* One batched decode of all N query tokens reading all N banks via seq_id[]. */
+    /* One batched decode of all N query tokens reading all N banks via seq_id[].
+     * The driver writes genuinely per-row positions[t]=seq_len[t] + seq_id[t]=t
+     * directly (varlen) and sets batch_multiseq_prefilled so the equal-length
+     * il==0 fill is skipped; pos0=max_len keeps zero_prefix=false and gives the
+     * host scalar raw-span a valid upper bound (the kernels derive per-row).
+     * DS4_MULTISEQ_FORCE_SEQ0 pins all rows to bank 0 (gate-teeth mutation). */
     if (ok) {
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             g->layer_raw_cache[il] = ds4_gpu_tensor_view(multi[il], 0, (uint64_t)N * bank_bytes);
             if (!g->layer_raw_cache[il]) ok = false;
         }
-        int qtokens[2];
-        for (uint32_t s = 0; s < N; s++) qtokens[s] = query_token;
+        const bool force_seq0 = getenv("DS4_MULTISEQ_FORCE_SEQ0") != NULL;
+        int     qtokens[2];
+        int32_t pos_arr[2];
+        int32_t sid_arr[2];
+        for (uint32_t s = 0; s < N; s++) {
+            qtokens[s] = query_token;
+            pos_arr[s] = (int32_t)seq_len[s];
+            sid_arr[s] = force_seq0 ? 0 : (int32_t)s;
+        }
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr,
+                                          (uint64_t)N * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr,
+                                          (uint64_t)N * sizeof(int32_t)) != 0;
         g->batch_multiseq = true;
         g->batch_n_seq = N;
-        if (ok) ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, L, N, batched);
+        g->batch_multiseq_prefilled = true;
+        if (ok) ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, max_len, N, batched);
         g->batch_multiseq = false;
         g->batch_n_seq = 0;
+        g->batch_multiseq_prefilled = false;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             ds4_gpu_tensor_free(g->layer_raw_cache[il]);
             g->layer_raw_cache[il] = saved_raw[il];
@@ -19734,8 +19775,8 @@ static bool metal_graph_multiseq_selftest(
         fprintf(stderr, "ds4: multiseq selftest oracle separation max|seqA-seqB|=%.4f %s\n",
                 o_diff, o_diff > 1.0f ? "(sequences distinct)" : "(WEAK: sequences nearly identical)");
     }
-    fprintf(stderr, "ds4: multiseq selftest %s (N=%u L=%u)\n",
-            (ok && gate_pass) ? "PASS" : "FAIL", N, L);
+    fprintf(stderr, "ds4: multiseq selftest %s (N=%u seq_len=[%u,%u])\n",
+            (ok && gate_pass) ? "PASS" : "FAIL", N, seq_len[0], seq_len[1]);
 
     free(scratch);
     free(oracle);
