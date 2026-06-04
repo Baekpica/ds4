@@ -6246,6 +6246,11 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t raw_cap,
         uint32_t raw_start,
         uint32_t n_comp,
+        /* Phase 2 Step 4b: per-seq compressed-cache bank stride (rows).  When
+         * seq_id is set, row t reads its topk-selected compressed rows from
+         * bank seq_id[t] at base seq_id[t]*comp_cap; seq_id==NULL keeps
+         * comp_seq_base=0 (single bank, comp_cap ignored, bit-exact). */
+        uint32_t comp_cap,
         uint32_t top_k,
         uint32_t window,
         uint32_t ratio,
@@ -6253,8 +6258,8 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t head_dim,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (n_tokens
          * entries).  positions -> row query position; seq_id -> per-seq raw
-         * bank base.  Both NULL = single-sequence scalar path.  Compressed
-         * (topk) reads are NOT per-seq here (multi-seq test runs n_comp==0). */
+         * bank base AND (Step 4b) per-seq compressed bank base seq_id[t]*comp_cap.
+         * Both NULL = single-sequence scalar path. */
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
         const struct ds4_decode_scalars * __restrict__ s_override,
@@ -6323,6 +6328,9 @@ __global__ static void attention_indexed_mixed_kernel(
     }
     uint32_t first_raw_pos = positions ? (qpos + 1u - row_n_raw) : (pos0 + n_tokens - n_raw);
     uint32_t seq_base = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
+    /* Phase 2 Step 4b: per-seq compressed bank base.  comp_rows[] indices are
+     * into this row's OWN n_comp, so the absolute row is comp_seq_base+comp_rows[c]. */
+    uint32_t comp_seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
     uint32_t visible_comp = n_comp;
     if (ratio != 0) {
         visible_comp = (qpos + 1u) / ratio;
@@ -6412,7 +6420,7 @@ __global__ static void attention_indexed_mixed_kernel(
                 if (!fp8_row) {
                     kvrow = row < raw_count
                         ? raw_kv + (uint64_t)raw_rows[row] * head_dim
-                        : comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
+                        : comp_kv + (uint64_t)(comp_seq_base + comp_rows[row - raw_count]) * head_dim;
                 }
                 float dot = 0.0f;
                 if (fp8_row) {
@@ -6477,7 +6485,7 @@ __global__ static void attention_indexed_mixed_kernel(
         } else {
             for (uint32_t c = 0; c < comp_count; c++) {
                 float s = scores[raw_count + c];
-                const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
+                const float *kv = comp_kv + (uint64_t)(comp_seq_base + comp_rows[c]) * head_dim;
                 acc0 += kv[d0] * s;
                 acc1 += kv[d1] * s;
             }
@@ -6493,7 +6501,7 @@ __global__ static void attention_indexed_mixed_kernel(
                     acc += fp8_kv_read(comp_fp8, comp_scale, comp_rows[s], d) * scores[raw_count + s];
                 }
             } else {
-                for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv[(uint64_t)comp_rows[s] * head_dim + d] * scores[raw_count + s];
+                for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv[(uint64_t)(comp_seq_base + comp_rows[s]) * head_dim + d] * scores[raw_count + s];
             }
             oh[d] = acc / denom;
         }
@@ -7956,6 +7964,70 @@ __global__ static void indexer_score_one_direct_kernel(
     if (tid == 0) scores[c] = total;
 }
 
+/* Phase 2 Step 4b: per-seq multi-sequence indexer scores.  The batched decode
+ * scores path normally uses the WMMA tiled kernels, which share a tile's
+ * index_comp rows across 16 query tokens -- incompatible with each token
+ * reading its OWN sequence's index_comp bank.  So multi-seq (seq_id != NULL)
+ * is forced onto this per-(comp-row, token) kernel, mirroring the raw/mixed
+ * decode's `force_main_kernel`.  The per-token reduction is bit-identical to
+ * indexer_score_one_direct_kernel (ls_override == NULL), so for equal-length
+ * sequences each row reproduces its own n=1 standalone-decode oracle exactly.
+ * Requires the indexer dims (head_dim==128, n_head==64). */
+__global__ static void indexer_scores_multiseq_kernel(
+        float *scores,            /* [n_tokens, n_comp]                       */
+        const float *q,           /* [n_tokens, 64, 128]                      */
+        const float *weights,     /* [n_tokens, 64]                           */
+        const float *index_comp,  /* [N_banks * comp_cap, 128]                */
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t ratio,
+        uint32_t comp_cap,
+        float scale,
+        int causal,
+        /* Per-row query position (causal clamp) + per-seq bank base.  positions
+         * NULL falls back to pos0 (equal-length); seq_id NULL falls back to
+         * bank 0 (bit-exact single bank). */
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id) {
+    const uint32_t c   = blockIdx.x;
+    const uint32_t t   = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (c >= n_comp || t >= n_tokens || tid >= 128u) return;
+    const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0;
+    if (causal) {
+        const uint32_t visible = ratio ? (qpos + 1u) / ratio : n_comp;
+        if (c >= visible) {
+            if (tid == 0) scores[(uint64_t)t * n_comp + c] = -INFINITY;
+            return;
+        }
+    }
+    const uint32_t seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
+    const float *qrow = q + (uint64_t)t * 64u * 128u;
+    const float *wrow = weights + (uint64_t)t * 64u;
+
+    __shared__ float krow[128];
+    __shared__ float partial[4];
+    if (tid < 128u) krow[tid] = index_comp[(uint64_t)(seq_base + c) * 128u + tid];
+    __syncthreads();
+
+    float total = 0.0f;
+    for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
+        const uint32_t h = h0 + warp;
+        const float4 qv = ((const float4 *)(qrow + (uint64_t)h * 128u))[lane];
+        const float4 kv = ((const float4 *)krow)[lane];
+        float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+        dot = warp_sum_f32(dot);
+        if (lane == 0) partial[warp] = fmaxf(dot, 0.0f) * wrow[h] * scale;
+        __syncthreads();
+        if (tid == 0) total += partial[0] + partial[1] + partial[2] + partial[3];
+        __syncthreads();
+    }
+    if (tid == 0) scores[(uint64_t)t * n_comp + c] = total;
+}
+
 __global__ static void indexer_scores_wmma_kernel(
         float *scores,
         const float *q,
@@ -9060,7 +9132,16 @@ static int indexer_scores_launch(
          *   il          -- layer index for ls_override read; UINT32_MAX
          *                  signals "no substrate" (legacy path). */
         uint32_t                n_comp_max,
-        uint32_t                il) {
+        uint32_t                il,
+        /* Phase 2 Step 4b: per-seq index_comp bank stride (rows) + optional
+         * per-row positions[]/seq_id[] (n_tokens entries).  When seq_id is set
+         * (multi-seq batched decode) the scores are forced onto the per-row
+         * indexer_scores_multiseq_kernel so row t reads bank seq_id[t] at base
+         * seq_id[t]*comp_cap; positions gives the per-row causal clamp.  All
+         * NULL/0 => the existing single-bank WMMA/direct paths (bit-exact). */
+        uint32_t                comp_cap,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id) {
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -9070,6 +9151,24 @@ static int indexer_scores_launch(
         return 0;
     }
     if (causal && ratio == 0) return 0;
+    /* Phase 2 Step 4b: per-seq multi-sequence path (forces the per-row kernel;
+     * the WMMA tiles below share index_comp rows across a token tile and cannot
+     * read per-seq banks).  Indexer dims are always 128/64. */
+    const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
+    const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
+    if (seq_dev != NULL && head_dim == 128u && n_head == 64u) {
+        if ((positions && positions->bytes < (uint64_t)n_tokens * sizeof(int32_t)) ||
+            (seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t))) return 0;
+        dim3 grid(n_comp, n_tokens, 1);
+        indexer_scores_multiseq_kernel<<<grid, 128, 0, ds4_current_stream()>>>(
+                (float *)scores->ptr,
+                (const float *)q->ptr,
+                (const float *)weights->ptr,
+                (const float *)index_comp->ptr,
+                n_comp, n_tokens, pos0, ratio, comp_cap, scale,
+                causal ? 1 : 0, pos_dev, seq_dev);
+        return cuda_ok(cudaGetLastError(), "indexer scores multiseq launch");
+    }
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
         /* PC5: max-grid path is active when (a) shim caller plumbed a
@@ -9220,7 +9319,8 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         uint32_t                il) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
                                  n_head, head_dim, 1, scale, 0,
-                                 n_comp_max, il);
+                                 n_comp_max, il,
+                                 /* Step 4b: single-seq */ 0u, NULL, NULL);
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
@@ -9238,7 +9338,8 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
      * legacy (0, UINT32_MAX) so n_comp_max never activates. */
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, 0,
                                  n_head, head_dim, ratio, scale, 1,
-                                 0u, UINT32_MAX);
+                                 0u, UINT32_MAX,
+                                 /* Step 4b: single-seq */ 0u, NULL, NULL);
 }
 
 extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
@@ -9252,11 +9353,17 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale) {
+        float                   scale,
+        /* Phase 2 Step 4b: per-seq index_comp bank stride + optional
+         * positions[]/seq_id[] (NULL = single seq, bit-exact). */
+        uint32_t                comp_cap,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id) {
     /* PC5: batch path never hits the _direct kernel either (n_tokens > 1). */
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
                                  n_head, head_dim, ratio, scale, 1,
-                                 0u, UINT32_MAX);
+                                 0u, UINT32_MAX,
+                                 comp_cap, positions, seq_id);
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(
@@ -12960,6 +13067,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                n_comp,
+        /* Phase 2 Step 4b: per-seq compressed-cache bank stride (rows). */
+        uint32_t                comp_cap,
         uint32_t                top_k,
         uint32_t                window,
         uint32_t                ratio,
@@ -13135,6 +13244,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   raw_cap,
                                                   raw_start,
                                                   n_comp,
+                                                  comp_cap,
                                                   top_k,
                                                   window,
                                                   ratio,

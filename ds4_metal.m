@@ -5558,7 +5558,11 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale) {
+        float                   scale,
+        uint32_t                comp_cap,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id) {
+    (void)comp_cap; (void)positions; (void)seq_id;  /* Phase 2 Step 4b: CUDA-only. */
     return ds4_gpu_indexer_scores_batch_tensor(scores,
                                                  q,
                                                  weights,
@@ -12419,6 +12423,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                n_comp,
+        uint32_t                comp_cap,
         uint32_t                top_k,
         uint32_t                window,
         uint32_t                ratio,
@@ -12430,7 +12435,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_scale,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id) {
-    (void)scalars; (void)il_for_decode1;
+    (void)scalars; (void)il_for_decode1; (void)comp_cap;  /* Step 4b: CUDA-only. */
     /* Opp C Phase 1A.4: Metal mirror lives in CUDA only today; ignore. */
     (void)comp_fp8;
     (void)comp_scale;

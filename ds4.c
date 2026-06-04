@@ -10780,6 +10780,8 @@ static bool metal_graph_encode_decode_layer_impl(
                     raw_cap,
                     raw_start,
                     n_comp,
+                    /* Step 4b: per-seq comp bank stride (inert here, seq_id NULL) */
+                    g->layer_comp_cap[il],
                     n_selected,
                     g->raw_window,
                     ds4_layer_compress_ratio(il),
@@ -15590,7 +15592,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                   DS4_N_INDEXER_HEAD,
                                                                   DS4_N_INDEXER_HEAD_DIM,
                                                                   ratio,
-                                                                  index_scale) != 0;
+                                                                  index_scale,
+                                                                  /* Step 4b: per-seq index_comp bank */
+                                                                  g->layer_comp_cap[il],
+                                                                  seq_positions, seq_id) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                     il,
@@ -15655,6 +15660,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->raw_cap,
                                                                               raw_start,
                                                                               n_comp,
+                                                                              /* Step 4b: per-seq compressed bank stride */
+                                                                              g->layer_comp_cap[il],
                                                                               DS4_N_INDEXER_TOP_K,
                                                                               g->raw_window,
                                                                               ratio,
@@ -15787,6 +15794,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           g->raw_cap,
                                                                           0,
                                                                           n_comp,
+                                                                          /* Step 4b: per-seq comp bank stride (inert here, seq_id NULL) */
+                                                                          g->layer_comp_cap[il],
                                                                           DS4_N_INDEXER_TOP_K,
                                                                           g->raw_window,
                                                                           ratio,
@@ -15924,6 +15933,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->raw_cap,
                                                                               raw_start,
                                                                               cur_comp,
+                                                                              /* Step 4b: per-seq comp bank stride (inert here, seq_id NULL) */
+                                                                              g->layer_comp_cap[il],
                                                                               n_selected,
                                                                               g->raw_window,
                                                                               ratio,
@@ -19610,6 +19621,22 @@ static bool metal_graph_multiseq_selftest(
     const bool eqlen = getenv("DS4_MULTISEQ_EQLEN") != NULL;
     uint32_t want_len = len_env ? (uint32_t)atoi(len_env) : 0u;
     if (want_len > 120u) want_len = 120u;
+    /* Step 4b gate knob: the indexer path fires only at n_comp > DS4_N_INDEXER_TOP_K
+     * (default 512 => L>=~2048, impractical for a self-test).  DS4_MULTISEQ_TOPK
+     * lowers top_k for the duration of this run so a modest L (e.g. 24 => n_comp=6)
+     * exercises the per-seq index_comp + indexed-attention banks.  comp_selected
+     * was sized at the original top_k, so lowering is always safe (oversized).
+     * Priming, oracle, and batched decode all read the same lowered value =>
+     * consistent.  Restored before return. */
+    const char *topk_env = getenv("DS4_MULTISEQ_TOPK");
+    const uint32_t saved_top_k = g_ds4_shape.n_indexer_top_k;
+    if (topk_env) {
+        uint32_t tk = (uint32_t)atoi(topk_env);
+        if (tk == 0u) tk = 1u;
+        g_ds4_shape.n_indexer_top_k = tk;
+        fprintf(stderr, "ds4: multiseq selftest lowering indexer top_k %u -> %u (Step 4b indexer gate)\n",
+                saved_top_k, tk);
+    }
     const uint32_t seq_len[2] = {
         want_len ? want_len : (eqlen ? 2u : 1u),
         want_len ? want_len : 2u,
@@ -19639,12 +19666,21 @@ static bool metal_graph_multiseq_selftest(
     ds4_gpu_tensor *multi_comp[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp[DS4_MAX_LAYER];
     uint64_t comp_bank_bytes[DS4_MAX_LAYER];
+    /* Step 4b: per-seq INDEX-COMPRESSED-cache banks (ratio==4 layers only -- only
+     * those have layer_index_comp_cache).  When the indexer path fires
+     * (n_comp > top_k) each seq's index_comp must be isolated like attn_comp. */
+    ds4_gpu_tensor *multi_index[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index[DS4_MAX_LAYER];
+    uint64_t index_bank_bytes[DS4_MAX_LAYER];
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         multi[il] = NULL;
         saved_raw[il] = g->layer_raw_cache[il];
         multi_comp[il] = NULL;
         saved_comp[il] = g->layer_attn_comp_cache[il];
         comp_bank_bytes[il] = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
+        multi_index[il] = NULL;
+        saved_index[il] = g->layer_index_comp_cache[il];
+        index_bank_bytes[il] = (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
     }
     bool ok = true;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -19653,6 +19689,10 @@ static bool metal_graph_multiseq_selftest(
         if (ok && ds4_layer_compress_ratio(il) != 0 && saved_comp[il]) {
             multi_comp[il] = ds4_gpu_tensor_alloc((uint64_t)N * comp_bank_bytes[il]);
             ok = multi_comp[il] != NULL;
+        }
+        if (ok && ds4_layer_compress_ratio(il) == 4 && saved_index[il]) {
+            multi_index[il] = ds4_gpu_tensor_alloc((uint64_t)N * index_bank_bytes[il]);
+            ok = multi_index[il] != NULL;
         }
     }
 
@@ -19665,6 +19705,7 @@ static bool metal_graph_multiseq_selftest(
         if (!metal_graph_reset_prefill_state(g)) { ok = false; break; }
         ds4_gpu_tensor *bank[DS4_MAX_LAYER];
         ds4_gpu_tensor *bank_comp[DS4_MAX_LAYER];
+        ds4_gpu_tensor *bank_index[DS4_MAX_LAYER];
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             bank[il] = ds4_gpu_tensor_view(multi[il], (uint64_t)s * bank_bytes, bank_bytes);
             if (!bank[il]) ok = false;
@@ -19676,6 +19717,14 @@ static bool metal_graph_multiseq_selftest(
                                                     comp_bank_bytes[il]);
                 if (!bank_comp[il]) ok = false;
                 g->layer_attn_comp_cache[il] = bank_comp[il] ? bank_comp[il] : saved_comp[il];
+            }
+            bank_index[il] = NULL;
+            if (multi_index[il]) {
+                bank_index[il] = ds4_gpu_tensor_view(multi_index[il],
+                                                     (uint64_t)s * index_bank_bytes[il],
+                                                     index_bank_bytes[il]);
+                if (!bank_index[il]) ok = false;
+                g->layer_index_comp_cache[il] = bank_index[il] ? bank_index[il] : saved_index[il];
             }
         }
         token_vec tv;
@@ -19692,7 +19741,7 @@ static bool metal_graph_multiseq_selftest(
             fprintf(stderr, "ds4: multiseq selftest seq %u primed len=%u max_n_comp=%u\n",
                     s, seq_len[s], maxnc);
             if (maxnc > (uint32_t)DS4_N_INDEXER_TOP_K)
-                fprintf(stderr, "ds4: multiseq selftest WARN seq %u n_comp=%u > top_k=%u (indexer path is still single-bank in 4a)\n",
+                fprintf(stderr, "ds4: multiseq selftest seq %u n_comp=%u > top_k=%u -> indexer path EXERCISED (Step 4b per-seq index_comp + indexed attention)\n",
                         s, maxnc, (uint32_t)DS4_N_INDEXER_TOP_K);
         }
         /* Standalone decode of the query at this seq's position reading bank s. */
@@ -19704,6 +19753,7 @@ static bool metal_graph_multiseq_selftest(
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             ds4_gpu_tensor_free(bank[il]);
             if (bank_comp[il]) ds4_gpu_tensor_free(bank_comp[il]);
+            if (bank_index[il]) ds4_gpu_tensor_free(bank_index[il]);
         }
     }
 
@@ -19721,6 +19771,11 @@ static bool metal_graph_multiseq_selftest(
                 g->layer_attn_comp_cache[il] =
                     ds4_gpu_tensor_view(multi_comp[il], 0, (uint64_t)N * comp_bank_bytes[il]);
                 if (!g->layer_attn_comp_cache[il]) ok = false;
+            }
+            if (multi_index[il]) {
+                g->layer_index_comp_cache[il] =
+                    ds4_gpu_tensor_view(multi_index[il], 0, (uint64_t)N * index_bank_bytes[il]);
+                if (!g->layer_index_comp_cache[il]) ok = false;
             }
         }
         const bool force_seq0 = getenv("DS4_MULTISEQ_FORCE_SEQ0") != NULL;
@@ -19749,6 +19804,10 @@ static bool metal_graph_multiseq_selftest(
             if (multi_comp[il]) {
                 ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
                 g->layer_attn_comp_cache[il] = saved_comp[il];
+            }
+            if (multi_index[il]) {
+                ds4_gpu_tensor_free(g->layer_index_comp_cache[il]);
+                g->layer_index_comp_cache[il] = saved_index[il];
             }
         }
     }
@@ -19838,7 +19897,10 @@ static bool metal_graph_multiseq_selftest(
         ds4_gpu_tensor_free(multi[il]);
         g->layer_attn_comp_cache[il] = saved_comp[il];
         ds4_gpu_tensor_free(multi_comp[il]);
+        g->layer_index_comp_cache[il] = saved_index[il];
+        ds4_gpu_tensor_free(multi_index[il]);
     }
+    g_ds4_shape.n_indexer_top_k = saved_top_k;   /* Step 4b: restore lowered top_k */
     return ok && gate_pass;
 }
 

@@ -440,7 +440,12 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale);
+        float                   scale,
+        /* Phase 2 Step 4b: per-seq index_comp bank stride + optional
+         * per-row positions[]/seq_id[] (NULL = single seq, bit-exact). */
+        uint32_t                comp_cap,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id);
 
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
@@ -1068,6 +1073,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                n_comp,
+        /* Phase 2 Step 4b: per-seq compressed-cache bank stride (rows). */
+        uint32_t                comp_cap,
         uint32_t                top_k,
         uint32_t                window,
         uint32_t                ratio,
