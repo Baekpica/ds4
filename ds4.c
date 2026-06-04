@@ -16212,6 +16212,33 @@ static bool metal_graph_encode_layer_batch(
 }
 
 /* Execute one Metal decode token and read back logits. */
+/* Phase 2 Step 1: forward decl so the single-token decode funnel can route to
+ * the batched path under DS4_USE_BATCH_EVAL (defined later, needs helpers that
+ * appear after this point). */
+static bool metal_graph_batch_eval_logits(
+        ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
+        const int *tokens, uint32_t pos0, uint32_t n, float *logits_out);
+
+/* Phase 2 Step 1 validation: one-shot dump of the first decode token's full
+ * logits to DS4_DUMP_FIRST_LOGITS (a binary float32[DS4_N_VOCAB]).  Run once via
+ * the decode path and once via batch_eval (same prefill -> identical pre-state)
+ * and diff the two files to quantify the batch-vs-decode logit delta + argmax
+ * agreement -- the proper lossless gate (byte-identical output is too strict
+ * given FP matmul-kernel-selection noise). */
+static void maybe_dump_first_logits(const float *logits) {
+    static int done = 0;
+    if (done || !logits) return;
+    const char *path = getenv("DS4_DUMP_FIRST_LOGITS");
+    if (!path || !path[0]) return;
+    done = 1;
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(logits, sizeof(float), (size_t)DS4_N_VOCAB, f);
+        fclose(f);
+        fprintf(stderr, "ds4: dumped first decode logits to %s\n", path);
+    }
+}
+
 static bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -16219,6 +16246,13 @@ static bool metal_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
+    /* Phase 2 Step 1: route every single-token decode through the batched
+     * forward (n=1) when DS4_USE_BATCH_EVAL is set.  This is the funnel all
+     * decode call sites (CLI generate, eval_internal, speculative) pass
+     * through.  Requires a logits sink. */
+    if (logits != NULL && getenv("DS4_USE_BATCH_EVAL") != NULL) {
+        return metal_graph_batch_eval_logits(g, model, weights, &token, pos, 1u, logits);
+    }
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
@@ -16232,6 +16266,7 @@ static bool metal_graph_eval_token_raw_swa(
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    if (ok && logits) maybe_dump_first_logits(logits);
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
         fprintf(stderr,
@@ -21076,6 +21111,93 @@ static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t depth) {
 
 static bool spec_frontier_commit_prefix1(ds4_session *s) {
     return spec_frontier_commit_prefix(s, 1);
+}
+
+/* ----------------------------------------------------------------------- *
+ * Phase 2 Step 1: batched eval entry (skeleton).
+ *
+ * Runs `n` consecutive tokens of ONE sequence starting at pos0 through the
+ * batch forward path (metal_graph_encode_layer_batch) and reads back full
+ * per-row logits into logits_out (row r at logits_out + r*DS4_N_VOCAB).
+ *
+ * Unlike the MTP verify (which wraps the encode in spec_capture to defer the
+ * commit) this COMMITS the per-layer KV + recurrent compressor state -- exactly
+ * like a 1-chunk prefill -- so it can drive the generate loop.  The carried
+ * state (g->layer_raw_cache / layer_*_comp_cache / layer_n_comp / compressor
+ * state) is the SAME set of buffers the single-token decode path advances, so
+ * routing a decode step through this n=1 path keeps state continuity and the
+ * only difference vs metal_graph_eval_token_raw_swa is FP matmul-kernel
+ * selection (argmax-equal, small logit delta -- the known width-noise).
+ *
+ * At n=1 this is the batched-path equivalent of metal_graph_eval_token_raw_swa;
+ * "n=1 batch == decode" (lossless/argmax) is the Step-1 validation gate.
+ * Per-row INDEPENDENT positions and per-sequence KV (true multi-sequence) are
+ * Steps 2-4; this skeleton runs all n rows as one sequence sharing one KV. */
+static bool metal_graph_batch_eval_logits(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *tokens,
+        uint32_t           pos0,
+        uint32_t           n,
+        float             *logits_out) {
+    if (!g || !model || !weights || !tokens || !logits_out) return false;
+    if (n == 0 || n > g->prefill_cap) return false;
+
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "ds4: batch_eval engaged (first call n=%u pos0=%u)\n", n, pos0);
+    }
+
+    /* The embed helpers source tokens from a token_vec by index; build a small
+     * temp vec [tokens0..n).  Embedding is position-independent, so the source
+     * index (0..n) is decoupled from the absolute position pos0 the layer
+     * forward uses below. */
+    token_vec tv;
+    memset(&tv, 0, sizeof(tv));
+    for (uint32_t i = 0; i < n; i++) token_vec_push(&tv, tokens[i]);
+    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &tv, 0, n);
+    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                         g->prefill_tokens,
+                                                         model,
+                                                         weights,
+                                                         &tv,
+                                                         0,
+                                                         n);
+    token_vec_free(&tv);
+    if (!ok) return false;
+
+    /* No spec_capture: commit the KV + compressor state, like a prefill chunk. */
+    ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = metal_graph_encode_layer_batch(g,
+                                            model,
+                                            &weights->layer[il],
+                                            il,
+                                            pos0,
+                                            n);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) return false;
+
+    /* Per-row full-logit readback (mirrors the verify's logits_row path). */
+    for (uint32_t row = 0; ok && row < n; row++) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              row,
+                                                              weights->output->dim[1],
+                                                              false);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) ok = metal_graph_read_current_logits(g,
+                                                     logits_out + (uint64_t)row * DS4_N_VOCAB);
+    }
+    if (ok) maybe_dump_first_logits(logits_out);   /* row-0 logits (Step-1 gate) */
+    return ok;
 }
 
 static bool metal_graph_verify_decode3_top2_output(
