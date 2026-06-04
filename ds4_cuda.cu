@@ -5775,6 +5775,14 @@ __global__ static void attention_decode_mixed_kernel(
      * visible compressed rows live in its own bank at seq_id[t]*comp_cap. */
     uint32_t comp_seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    /* Phase 2 Step 4c: per-row compressed count for varlen multi-seq.  The
+     * (qpos+1)/ratio formula over-counts by 1 when qpos ≡ ratio-1 (mod ratio);
+     * single-seq relies on the scalar n_comp clamp below to correct it, but
+     * varlen rows share one scalar (= max over seqs), so derive each row's true
+     * count floor(qpos/ratio) here.  Equal-length is unchanged (floor(qpos/ratio)
+     * == the scalar n_comp), so 3b/4a/4b gates stay bit-identical. */
+    if (positions && ratio != 0u && !single_all && visible_comp > qpos / ratio)
+        visible_comp = qpos / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
@@ -6334,6 +6342,8 @@ __global__ static void attention_indexed_mixed_kernel(
     uint32_t visible_comp = n_comp;
     if (ratio != 0) {
         visible_comp = (qpos + 1u) / ratio;
+        /* Step 4c: per-row varlen compressed count (see attention_decode_mixed_kernel). */
+        if (positions && visible_comp > qpos / ratio) visible_comp = qpos / ratio;
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
@@ -7998,7 +8008,11 @@ __global__ static void indexer_scores_multiseq_kernel(
     if (c >= n_comp || t >= n_tokens || tid >= 128u) return;
     const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0;
     if (causal) {
-        const uint32_t visible = ratio ? (qpos + 1u) / ratio : n_comp;
+        uint32_t visible = ratio ? (qpos + 1u) / ratio : n_comp;
+        /* Step 4c: per-row varlen count -- floor(qpos/ratio) is the true number
+         * of complete compressed rows; mark rows beyond it (unprimed bank slots
+         * for shorter seqs) as -INF so topk never selects them. */
+        if (positions && ratio && visible > qpos / ratio) visible = qpos / ratio;
         if (c >= visible) {
             if (tid == 0) scores[(uint64_t)t * n_comp + c] = -INFINITY;
             return;

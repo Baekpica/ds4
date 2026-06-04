@@ -19621,6 +19621,14 @@ static bool metal_graph_multiseq_selftest(
     const bool eqlen = getenv("DS4_MULTISEQ_EQLEN") != NULL;
     uint32_t want_len = len_env ? (uint32_t)atoi(len_env) : 0u;
     if (want_len > 120u) want_len = 120u;
+    /* Step 4c gate knob: DS4_MULTISEQ_LEN2 overrides seq 1's length so the two
+     * sequences have DIFFERENT compressed-row counts (varlen compressed).  The
+     * per-row visible_comp = floor(qpos/ratio) fix lets each row read exactly its
+     * own n_comp; a length L ≡ ratio-1 (mod ratio), e.g. 15, exercises the +1
+     * over-count the fix removes.  Unset => seq 1 == want_len (equal-length). */
+    const char *len2_env = getenv("DS4_MULTISEQ_LEN2");
+    uint32_t want_len2 = len2_env ? (uint32_t)atoi(len2_env) : 0u;
+    if (want_len2 > 120u) want_len2 = 120u;
     /* Step 4b gate knob: the indexer path fires only at n_comp > DS4_N_INDEXER_TOP_K
      * (default 512 => L>=~2048, impractical for a self-test).  DS4_MULTISEQ_TOPK
      * lowers top_k for the duration of this run so a modest L (e.g. 24 => n_comp=6)
@@ -19639,7 +19647,7 @@ static bool metal_graph_multiseq_selftest(
     }
     const uint32_t seq_len[2] = {
         want_len ? want_len : (eqlen ? 2u : 1u),
-        want_len ? want_len : 2u,
+        want_len2 ? want_len2 : (want_len ? want_len : 2u),
     };
     uint32_t max_len = 0;
     for (uint32_t s = 0; s < N; s++) if (seq_len[s] > max_len) max_len = seq_len[s];
@@ -19653,9 +19661,12 @@ static bool metal_graph_multiseq_selftest(
      * query token, so the only thing that can make the rows' logits differ is
      * their isolated per-seq state (raw window + compressed bank). */
     const int query_token = 505;
+    const bool varlen_comp = (seq_len[0] != seq_len[1]) && want_len;
     fprintf(stderr, "ds4: multiseq selftest config N=%u seq_len=[%u,%u]%s\n",
             N, seq_len[0], seq_len[1],
-            want_len ? " (long: compressed)" : (eqlen ? " (DS4_MULTISEQ_EQLEN)" : " (varlen)"));
+            varlen_comp ? " (varlen compressed: 4c)"
+                        : (want_len ? " (long: compressed)"
+                                    : (eqlen ? " (DS4_MULTISEQ_EQLEN)" : " (varlen)")));
 
     const uint64_t bank_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
     ds4_gpu_tensor *multi[DS4_MAX_LAYER];
@@ -19672,11 +19683,20 @@ static bool metal_graph_multiseq_selftest(
     ds4_gpu_tensor *multi_index[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_index[DS4_MAX_LAYER];
     uint64_t index_bank_bytes[DS4_MAX_LAYER];
+    /* Step 4c: per-layer MAX compressed count over all primed seqs.  The batched
+     * decode reads g->layer_n_comp[il] as the SCALAR n_comp (bank extent + the
+     * final visible_comp clamp); for varlen it must be the max so the longest
+     * seq's rows aren't capped.  The per-row floor(qpos/ratio) fix then gives each
+     * row its own (smaller-or-equal) count.  Equal-length: max == every seq. */
+    uint32_t primed_n_comp_max[DS4_MAX_LAYER];
+    uint32_t primed_n_index_comp_max[DS4_MAX_LAYER];
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         multi[il] = NULL;
         saved_raw[il] = g->layer_raw_cache[il];
         multi_comp[il] = NULL;
         saved_comp[il] = g->layer_attn_comp_cache[il];
+        primed_n_comp_max[il] = 0u;
+        primed_n_index_comp_max[il] = 0u;
         comp_bank_bytes[il] = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
         multi_index[il] = NULL;
         saved_index[il] = g->layer_index_comp_cache[il];
@@ -19735,6 +19755,14 @@ static bool metal_graph_multiseq_selftest(
                                                  scratch, false, NULL, NULL);
         token_vec_free(&tv);
         if (ok) {
+            /* Step 4c: accumulate the per-layer MAX compressed/index counts across
+             * seqs so the batched decode's scalar n_comp covers the longest seq. */
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                if (g->layer_n_comp[il] > primed_n_comp_max[il])
+                    primed_n_comp_max[il] = g->layer_n_comp[il];
+                if (g->layer_n_index_comp[il] > primed_n_index_comp_max[il])
+                    primed_n_index_comp_max[il] = g->layer_n_index_comp[il];
+            }
             uint32_t maxnc = 0;
             for (uint32_t il = 0; il < DS4_N_LAYER; il++)
                 if (g->layer_n_comp[il] > maxnc) maxnc = g->layer_n_comp[il];
@@ -19777,6 +19805,11 @@ static bool metal_graph_multiseq_selftest(
                     ds4_gpu_tensor_view(multi_index[il], 0, (uint64_t)N * index_bank_bytes[il]);
                 if (!g->layer_index_comp_cache[il]) ok = false;
             }
+            /* Step 4c: scalar n_comp = max over seqs so the longest row isn't
+             * capped; the per-row floor(qpos/ratio) clamp gives each row its own
+             * count.  After priming, layer_n_comp holds only the LAST seq's count. */
+            g->layer_n_comp[il] = primed_n_comp_max[il];
+            g->layer_n_index_comp[il] = primed_n_index_comp_max[il];
         }
         const bool force_seq0 = getenv("DS4_MULTISEQ_FORCE_SEQ0") != NULL;
         int     qtokens[2];
