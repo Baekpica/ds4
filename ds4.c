@@ -91,7 +91,7 @@ enum {
      * emit bookkeeping (ms_* arrays) is sized for.  The multi-seq batched
      * decode emit indexes per-(seq,layer) state banks + row counters; this
      * caps the self-test / future generation fan-out.  Small fixed bound. */
-    DS4_MULTISEQ_MAX_SEQ     = 32,
+    DS4_MULTISEQ_MAX_SEQ     = 128,
     DS4_MAX_EMBD             = 7168,
     DS4_MAX_VOCAB            = 129280,
     DS4_MAX_HEAD             = 128,
@@ -8879,6 +8879,18 @@ typedef struct {
     ds4_gpu_tensor *batch_seq_id;
     bool            batch_multiseq;
     uint32_t        batch_n_seq;
+    /* B0 (Tier B-core, ragged prefill): the longest single sequence's token
+     * count in a multi-seq RAGGED-PREFILL batch (>0 only then; 0 for decode /
+     * single-seq / equal-length).  In ragged mode the packed n_tokens = Σ seq
+     * lens may exceed raw_cap, but each seq lands in its OWN bank (offset
+     * seq_id*raw_cap), so the ring-fit constraint is PER-SEQ: batch_max_seq_len
+     * <= raw_cap.  The batched attention guards admit n_tokens > raw_cap when
+     * this is set, and the host raw read-window becomes the whole filled prefix
+     * [0, batch_max_seq_len) (ragged banks are primed fresh from position 0, no
+     * wrap; per-row positions[]/seq_id[] clamp each row to its own SWA window
+     * and bank inside that superset).  Zero leaves every existing decode/prefill
+     * path byte-unchanged. */
+    uint32_t        batch_max_seq_len;
     /* Phase 2 Step 3c: when set, the driver has ALREADY written per-row
      * positions[]/seq_id[] into batch_positions/batch_seq_id (genuinely
      * per-sequence lengths -- different-length sequences), so the il==0 fill in
@@ -8899,8 +8911,12 @@ typedef struct {
      * ms_positions/ms_seq_id are host mirrors of batch_positions/batch_seq_id
      * (the emit runs on the host to decide group-close + pick the bank). */
     bool            batch_multiseq_emit;
-    int32_t         ms_positions[DS4_MULTISEQ_MAX_SEQ];
-    int32_t         ms_seq_id[DS4_MULTISEQ_MAX_SEQ];
+    /* B1 (ragged prefill): per-ROW host mirrors, prefill_cap entries (heap).  In
+     * DECODE there is 1 row/seq so writes index [s] (s < N <= MAX_SEQ); in RAGGED
+     * PREFILL there are Σ seq-lens rows (up to prefill_cap), so the emit loop reads
+     * [t] for t in 0..n_tokens-1 and these must hold all Σ rows, not just MAX_SEQ. */
+    int32_t        *ms_positions;
+    int32_t        *ms_seq_id;
     uint32_t        ms_n_comp[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
     uint32_t        ms_n_index_comp[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
     ds4_gpu_tensor *batch_cur_hc;
@@ -9018,6 +9034,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_attn_low);
     ds4_gpu_tensor_free(g->batch_seq_id);
     ds4_gpu_tensor_free(g->batch_positions);
+    free(g->ms_positions);                         /* B1: per-ROW host mirrors */
+    free(g->ms_seq_id);
     ds4_gpu_tensor_free(g->batch_heads);
     ds4_gpu_tensor_free(g->batch_indexer_weights);
     ds4_gpu_tensor_free(g->batch_indexer_q);
@@ -9703,8 +9721,11 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_positions = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));  /* Phase 2 Step 2 */
     g->batch_use_positions = false;
     g->batch_seq_id = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));     /* Phase 2 Step 3b */
+    g->ms_positions = xmalloc((size_t)pc * sizeof(int32_t));          /* B1: per-ROW host mirror (ragged Σ rows) */
+    g->ms_seq_id    = xmalloc((size_t)pc * sizeof(int32_t));
     g->batch_multiseq = false;
     g->batch_n_seq = 0;
+    g->batch_max_seq_len = 0;                                        /* B0: ragged prefill */
     g->batch_multiseq_prefilled = false;                             /* Phase 2 Step 3c */
     g->batch_multiseq_emit = false;                                  /* Phase 2 Step 4d */
     g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
@@ -9853,6 +9874,34 @@ static uint32_t metal_graph_raw_start_for_span(
     if (!g || g->raw_cap == 0 || n_raw == 0) return 0;
     const uint32_t first_raw_pos = last_pos + 1u - n_raw;
     return first_raw_pos % g->raw_cap;
+}
+
+/* B0 (Tier B-core): resolve the host raw read-window (n_raw, raw_start) for a
+ * batched non-zero-prefix attention layer.  Decode / single-seq keep the exact
+ * ring-walk math (raw_span_for_batch + raw_start_for_span).  Ragged multi-seq
+ * prefill (batch_max_seq_len > 0) instead reads the whole freshly-primed prefix
+ * [0, max_seq_len): each bank is filled from position 0 with no wrap (seq_len <=
+ * raw_cap), so a single superset window covers every row; the per-row
+ * positions[]/seq_id[] passed to the kernel clamp each row to its own causal SWA
+ * window and its own bank within that superset.  This is the "driver-controlled
+ * per-seq raw-span convention" B0 owes B1 -- raw_span_n stays decode-only. */
+static void metal_graph_raw_window_for_batch(
+        const ds4_gpu_graph *g,
+        uint32_t               pos0,
+        uint32_t               raw_span_n,
+        uint32_t               raw_span_last,
+        uint32_t              *out_n_raw,
+        uint32_t              *out_raw_start) {
+    if (g && g->batch_max_seq_len) {
+        uint32_t n = g->batch_max_seq_len;
+        if (n > g->raw_cap) n = g->raw_cap;
+        *out_n_raw = n;
+        *out_raw_start = 0u;
+        return;
+    }
+    const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, raw_span_n);
+    *out_n_raw = n_raw;
+    *out_raw_start = metal_graph_raw_start_for_span(g, raw_span_last, n_raw);
 }
 
 /* Capture the verifier prefix after the first speculative token.
@@ -14610,6 +14659,12 @@ static bool metal_graph_encode_layer_attention_batch(
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
+    /* B0 (ragged prefill): the batched attention ring-fit guard is per-seq in
+     * multi-seq mode -- each seq lands in its own bank (offset seq_id*raw_cap),
+     * so the packed n_tokens (Σ seq lens) may exceed raw_cap as long as the
+     * longest single seq (batch_max_seq_len) fits.  Zero (decode/single-seq) =>
+     * raw_fit == n_tokens, leaving every existing guard byte-identical. */
+    const uint32_t raw_fit = g->batch_max_seq_len ? g->batch_max_seq_len : n_tokens;
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
     const bool q_stage_profile = getenv("DS4_METAL_Q_STAGE_PROFILE") != NULL;
@@ -14924,7 +14979,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           DS4_N_HEAD,
                                                           DS4_N_HEAD_DIM) != 0;
         if (ok) batch_attention_done = true;
-    } else if (ok && !zero_prefix && ratio == 0 && n_tokens <= g->raw_cap) {
+    } else if (ok && !zero_prefix && ratio == 0 && raw_fit <= g->raw_cap) {
         /*
          * The ubatch path stores the whole batch in the SWA cache, then runs
          * one batched attention kernel with an absolute-position causal/window
@@ -14935,13 +14990,14 @@ static bool metal_graph_encode_layer_attention_batch(
          * the raw span is the single-token span ending at pos0 (raw_span_n=1),
          * not the contiguous pos0..pos0+n run.  Equal-length sequences share
          * one span; the kernel offsets each row's ring by seq_id[t]*raw_cap. */
-        const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, raw_span_n);
         /* Nonzero prompt chunks read the SWA cache as a ring.  FlashAttention
          * receives a linearized window starting at raw_start, not physical row
-         * zero; otherwise wrapped chunks silently miss recent raw keys. */
-        const uint32_t raw_start = metal_graph_raw_start_for_span(g,
-                                                                  raw_span_last,
-                                                                  n_raw);
+         * zero; otherwise wrapped chunks silently miss recent raw keys.  Ragged
+         * multi-seq prefill (batch_max_seq_len>0) reads the whole primed prefix
+         * [0, max_seq_len) instead (per-row clamp inside). */
+        uint32_t n_raw, raw_start;
+        metal_graph_raw_window_for_batch(g, pos0, raw_span_n, raw_span_last,
+                                         &n_raw, &raw_start);
         ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
                                                  g->batch_kv,
                                                  g->raw_cap,
@@ -15775,16 +15831,15 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         if (ratio == 4) DS4_METAL_PROFILE_ATTN_STAGE("indexer_setup");
 
-        if (ok && !zero_prefix && n_tokens <= g->raw_cap) {
+        if (ok && !zero_prefix && raw_fit <= g->raw_cap) {
             /* Step 3b: single-token (per-row) raw span in multi-seq mode; see
              * the dense decode branch.  At the 3b gate n_comp==0 so the indexed
-             * path below is skipped and the mixed kernel (per-seq aware) runs. */
-            const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, raw_span_n);
-            /* See the raw-only branch above: batched mixed attention also
-             * consumes a logical raw window, linearized out of the ring. */
-            const uint32_t raw_start = metal_graph_raw_start_for_span(g,
-                                                                      raw_span_last,
-                                                                      n_raw);
+             * path below is skipped and the mixed kernel (per-seq aware) runs.
+             * B0: ragged multi-seq prefill reads the whole primed prefix
+             * [0, max_seq_len) (per-row positions[]/seq_id[] clamp inside). */
+            uint32_t n_raw, raw_start;
+            metal_graph_raw_window_for_batch(g, pos0, raw_span_n, raw_span_last,
+                                             &n_raw, &raw_start);
             uint32_t use_comp_mask = 0;
             bool use_indexed_comp = false;
             double index_stage_t0 = 0.0;
@@ -16062,7 +16117,11 @@ static bool metal_graph_encode_layer_attention_batch(
 
     if (ok && !raw_batch_attention && !batch_attention_done) {
         uint32_t raw_prefix_tokens = 0;
-        if (zero_prefix && ratio != 0 && n_tokens <= g->raw_cap && comp_counts != NULL) {
+        /* B0: zero_prefix-only raw-prefix fallback -- the ragged driver uses
+         * pos0=max_len (zero_prefix=false) so ragged never reaches here; the
+         * raw_fit substitution is a no-op (batch_max_seq_len==0 in zero_prefix)
+         * kept only for uniformity with guards 1/2. */
+        if (zero_prefix && ratio != 0 && raw_fit <= g->raw_cap && comp_counts != NULL) {
             while (raw_prefix_tokens < n_tokens && comp_counts[raw_prefix_tokens] == 0u) {
                 raw_prefix_tokens++;
             }
@@ -20377,6 +20436,470 @@ static bool metal_graph_multiseq_emit_selftest(
     return ok && gate_pass;
 }
 
+/* Phase 2 Tier B-core (B1): ragged multi-sequence PREFILL self-test.
+ *
+ * Generalizes the batched 1-token/seq DECODE (Steps 3/4) to k-tokens/seq PREFILL:
+ * packs N different-length prompts into ONE ragged batched forward, rows laid out
+ * seq-contiguous + position-ascending, with per-row positions[]/seq_id[] routing
+ * each row to its OWN per-seq bank.  The B0 substrate (batch_max_seq_len) widens
+ * the raw-ring guard to per-seq and points the host raw read-window at the whole
+ * freshly-primed prefix [0,max_len); the existing per-seq compressor-emit loop
+ * (Step 4d) then runs the recurrent per-token compression in position order, so a
+ * later token in the SAME batch reads compressed rows emitted by earlier tokens of
+ * its seq (a path decode never exercises).
+ *
+ *   Oracle  -- each seq prefilled STANDALONE into its bank (production
+ *              prefill_raw_swa) + a shared query token decoded at pos=len (the
+ *              exact multiseq_selftest oracle).  Bank raw-KV snapshotted post-prime.
+ *   Batched -- all banks reset, rows packed, ONE ragged batched prefill (n=Σlen),
+ *              bank raw-KV snapshotted, then the same shared query decoded per-seq
+ *              reading the ragged-primed banks.
+ *   Gate    -- (authoritative) per-bank RAW-KV bit-exact: ragged-primed bank s ==
+ *              standalone-primed bank s (raw is the masking-independent isolation
+ *              proof).  (secondary) query-decode logits track own oracle (argmax +
+ *              d_self<5.0, established lossless band).  DS4_MULTISEQ_FORCE_SEQ0 pins
+ *              every row to bank 0 -> raw-KV collision + logit divergence -> FAIL.
+ *
+ * Default raw-only (L=[3,2], pre-compression) per the kickoff; DS4_RAGGED_LEN /
+ * DS4_RAGGED_LEN2 raise the lengths to also exercise the per-seq compressor emit
+ * (the compressed-cache bit compare and >raw_cap guard stress are B2/B3). */
+static bool metal_graph_multiseq_ragged_selftest(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights) {
+    const uint32_t N = 2;
+    const char *len_env  = getenv("DS4_RAGGED_LEN");
+    const char *len2_env = getenv("DS4_RAGGED_LEN2");
+    uint32_t L0 = len_env  ? (uint32_t)atoi(len_env)  : 3u;
+    uint32_t L1 = len2_env ? (uint32_t)atoi(len2_env) : 2u;
+    /* Clamp generously; the raw ring (max_len <= raw_cap) + buffer (Σ <= prefill_cap)
+     * caps below reject anything that doesn't fit at runtime.  A config with
+     * Σ > raw_cap (each seq still <= raw_cap) is exactly the B0 guard-widening test. */
+    if (L0 > 1024u) L0 = 1024u;
+    if (L1 > 1024u) L1 = 1024u;
+    if (L0 == 0u) L0 = 1u;
+    if (L1 == 0u) L1 = 1u;
+    const char *topk_env = getenv("DS4_MULTISEQ_TOPK");
+    const uint32_t saved_top_k = g_ds4_shape.n_indexer_top_k;
+    if (topk_env) {
+        uint32_t tk = (uint32_t)atoi(topk_env);
+        if (tk == 0u) tk = 1u;
+        g_ds4_shape.n_indexer_top_k = tk;
+        fprintf(stderr, "ds4: ragged selftest lowering indexer top_k %u -> %u\n",
+                saved_top_k, tk);
+    }
+    const bool force_seq0 = getenv("DS4_MULTISEQ_FORCE_SEQ0") != NULL;
+
+    const uint32_t seq_len[2] = { L0, L1 };
+    if (N > DS4_MULTISEQ_MAX_SEQ) { g_ds4_shape.n_indexer_top_k = saved_top_k; return false; }
+    uint32_t max_len = L0 > L1 ? L0 : L1;
+    const uint32_t n_packed = L0 + L1;                 /* Σ rows in the ragged batch */
+    if (n_packed > g->prefill_cap || max_len > g->raw_cap) {
+        fprintf(stderr, "ds4: ragged selftest needs prefill_cap>=%u (Σlen) raw_cap>=%u (max_len) have %u/%u\n",
+                n_packed, max_len, g->prefill_cap, g->raw_cap);
+        g_ds4_shape.n_indexer_top_k = saved_top_k;
+        return false;
+    }
+    const int query_token = 505;
+    fprintf(stderr,
+            "ds4: ragged selftest config N=%u seq_len=[%u,%u] Σ=%u max_len=%u raw_cap=%u%s\n",
+            N, L0, L1, n_packed, max_len, g->raw_cap,
+            force_seq0 ? " (FORCE_SEQ0 gate-teeth)" : "");
+
+    /* Per-seq bank slabs (raw + attn-comp + attn-state for ratio!=0; index-comp +
+     * index-state additionally for ratio==4) -- identical layout to the emit gate. */
+    const uint64_t raw_bank_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    ds4_gpu_tensor *multi_raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_index[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_askv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_assc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_iskv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_issc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_astate_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_astate_sc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_istate_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_istate_sc[DS4_MAX_LAYER];
+    uint64_t comp_bank_bytes[DS4_MAX_LAYER];
+    uint64_t index_bank_bytes[DS4_MAX_LAYER];
+    uint64_t astate_bank_bytes[DS4_MAX_LAYER];
+    uint64_t istate_bank_bytes[DS4_MAX_LAYER];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        multi_raw[il] = multi_comp[il] = multi_index[il] = NULL;
+        multi_askv[il] = multi_assc[il] = multi_iskv[il] = multi_issc[il] = NULL;
+        saved_raw[il] = g->layer_raw_cache[il];
+        saved_comp[il] = g->layer_attn_comp_cache[il];
+        saved_index[il] = g->layer_index_comp_cache[il];
+        saved_astate_kv[il] = g->layer_attn_state_kv[il];
+        saved_astate_sc[il] = g->layer_attn_state_score[il];
+        saved_istate_kv[il] = g->layer_index_state_kv[il];
+        saved_istate_sc[il] = g->layer_index_state_score[il];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t coff = ratio == 4u ? 2u : 1u;
+        comp_bank_bytes[il]  = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
+        index_bank_bytes[il] = (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        astate_bank_bytes[il] = (uint64_t)(coff * (ratio ? ratio : 1u)) *
+                                (uint64_t)(coff * DS4_N_HEAD_DIM) * sizeof(float);
+        istate_bank_bytes[il] = (uint64_t)(coff * (ratio ? ratio : 1u)) *
+                                (uint64_t)(coff * DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
+    }
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        multi_raw[il] = ds4_gpu_tensor_alloc((uint64_t)N * raw_bank_bytes);
+        ok = multi_raw[il] != NULL;
+        if (ok && ratio != 0 && saved_comp[il]) {
+            multi_comp[il] = ds4_gpu_tensor_alloc((uint64_t)N * comp_bank_bytes[il]);
+            multi_askv[il] = ds4_gpu_tensor_alloc((uint64_t)N * astate_bank_bytes[il]);
+            multi_assc[il] = ds4_gpu_tensor_alloc((uint64_t)N * astate_bank_bytes[il]);
+            ok = multi_comp[il] != NULL && multi_askv[il] != NULL && multi_assc[il] != NULL;
+        }
+        if (ok && ratio == 4 && saved_index[il]) {
+            multi_index[il] = ds4_gpu_tensor_alloc((uint64_t)N * index_bank_bytes[il]);
+            multi_iskv[il]  = ds4_gpu_tensor_alloc((uint64_t)N * istate_bank_bytes[il]);
+            multi_issc[il]  = ds4_gpu_tensor_alloc((uint64_t)N * istate_bank_bytes[il]);
+            ok = multi_index[il] != NULL && multi_iskv[il] != NULL && multi_issc[il] != NULL;
+        }
+    }
+
+    g->batch_multiseq = false;
+    g->batch_n_seq = 0;
+    g->batch_multiseq_prefilled = false;
+    g->batch_multiseq_emit = false;
+    g->batch_max_seq_len = 0;
+
+    float *scratch = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *oracle  = xmalloc((size_t)N * DS4_N_VOCAB * sizeof(float));
+    float *batched = xmalloc((size_t)N * DS4_N_VOCAB * sizeof(float));
+    /* Per-bank raw-KV snapshots [0,len) for the authoritative cache compare. */
+    float *osnap_raw[DS4_MULTISEQ_MAX_SEQ];
+    float *rsnap_raw[DS4_MULTISEQ_MAX_SEQ];
+    /* B3: per-bank, per-layer compressed-cache COUNTS.  oracle (production prefill,
+     * layer_n_comp = floor(len/ratio)) vs ragged (per-token emit, ms_n_comp) -- the
+     * counts must match EXACTLY (the structural emit-row-assignment + counter-advance
+     * test, independent of the bulk-vs-emit FP reorder that perturbs the VALUES). */
+    uint32_t ocount[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    uint32_t oicount[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    uint32_t rcount[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    uint32_t ricount[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    for (uint32_t s = 0; s < N; s++) {
+        osnap_raw[s] = NULL; rsnap_raw[s] = NULL;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            ocount[s][il] = oicount[s][il] = rcount[s][il] = ricount[s][il] = 0u;
+        }
+    }
+
+    /* Repoint every per-layer cache + compressor state to bank `s` (single-bank
+     * views); returns the freshly-created views so the caller can free them. */
+    #define RG_BANK_REPOINT(s, views, vcount) do {                                              \
+        (vcount) = 0;                                                                            \
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {                                    \
+            ds4_gpu_tensor *v = ds4_gpu_tensor_view(multi_raw[il], (uint64_t)(s) * raw_bank_bytes, raw_bank_bytes); \
+            if (!v) { ok = false; break; }                                                       \
+            (views)[(vcount)++] = v; g->layer_raw_cache[il] = v;                                 \
+            if (multi_comp[il]) {                                                                \
+                ds4_gpu_tensor *vc = ds4_gpu_tensor_view(multi_comp[il], (uint64_t)(s) * comp_bank_bytes[il], comp_bank_bytes[il]); \
+                ds4_gpu_tensor *vsk = ds4_gpu_tensor_view(multi_askv[il], (uint64_t)(s) * astate_bank_bytes[il], astate_bank_bytes[il]); \
+                ds4_gpu_tensor *vss = ds4_gpu_tensor_view(multi_assc[il], (uint64_t)(s) * astate_bank_bytes[il], astate_bank_bytes[il]); \
+                if (!vc || !vsk || !vss) { ok = false; if (vc) ds4_gpu_tensor_free(vc); if (vsk) ds4_gpu_tensor_free(vsk); if (vss) ds4_gpu_tensor_free(vss); break; } \
+                (views)[(vcount)++] = vc;  g->layer_attn_comp_cache[il] = vc;                    \
+                (views)[(vcount)++] = vsk; g->layer_attn_state_kv[il] = vsk;                     \
+                (views)[(vcount)++] = vss; g->layer_attn_state_score[il] = vss;                  \
+            }                                                                                   \
+            if (multi_index[il]) {                                                               \
+                ds4_gpu_tensor *vi = ds4_gpu_tensor_view(multi_index[il], (uint64_t)(s) * index_bank_bytes[il], index_bank_bytes[il]); \
+                ds4_gpu_tensor *vik = ds4_gpu_tensor_view(multi_iskv[il], (uint64_t)(s) * istate_bank_bytes[il], istate_bank_bytes[il]); \
+                ds4_gpu_tensor *vis = ds4_gpu_tensor_view(multi_issc[il], (uint64_t)(s) * istate_bank_bytes[il], istate_bank_bytes[il]); \
+                if (!vi || !vik || !vis) { ok = false; if (vi) ds4_gpu_tensor_free(vi); if (vik) ds4_gpu_tensor_free(vik); if (vis) ds4_gpu_tensor_free(vis); break; } \
+                (views)[(vcount)++] = vi;  g->layer_index_comp_cache[il] = vi;                   \
+                (views)[(vcount)++] = vik; g->layer_index_state_kv[il] = vik;                    \
+                (views)[(vcount)++] = vis; g->layer_index_state_score[il] = vis;                 \
+            }                                                                                   \
+        }                                                                                       \
+    } while (0)
+
+    ds4_gpu_tensor *bank_views[DS4_MAX_LAYER * 7];
+    uint32_t nviews = 0;
+    /* Snapshot only layer 0's raw bank (cheap, dense, always present) as the
+     * authoritative isolation proof; deeper layers ride the same store path. */
+    const uint32_t snap_il = 0u;
+
+    /* ----- ORACLE: standalone production prefill of each seq into its bank, then
+     * a shared query decode (== multiseq_selftest oracle).  Snapshot raw KV BEFORE
+     * the decode so it is the pure post-prefill state. */
+    for (uint32_t s = 0; ok && s < N; s++) {
+        RG_BANK_REPOINT(s, bank_views, nviews);
+        if (ok && !metal_graph_reset_prefill_state(g)) ok = false;
+        if (ok) {
+            token_vec tv;
+            memset(&tv, 0, sizeof(tv));
+            for (uint32_t i = 0; i < seq_len[s]; i++)
+                token_vec_push(&tv, (int)(100u + s * 1000u + i));
+            ok = metal_graph_prefill_raw_swa(g, model, weights, &tv, (int)seq_len[s],
+                                             scratch, false, NULL, NULL);
+            token_vec_free(&tv);
+        }
+        if (ok) {
+            uint64_t nf = (uint64_t)seq_len[s] * DS4_N_HEAD_DIM;
+            osnap_raw[s] = xmalloc((size_t)nf * sizeof(float));
+            ok = ds4_gpu_tensor_read(g->layer_raw_cache[snap_il], 0,
+                                     osnap_raw[s], nf * sizeof(float)) != 0;
+        }
+        /* Capture oracle compressed counts post-prefill, BEFORE the query decode
+         * (which would emit one more if (len+1)%ratio==0). */
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            ocount[s][il]  = g->layer_n_comp[il];
+            oicount[s][il] = g->layer_n_index_comp[il];
+        }
+        if (ok) ok = metal_graph_batch_eval_logits(g, model, weights, &query_token,
+                                                   seq_len[s], 1u,
+                                                   oracle + (uint64_t)s * DS4_N_VOCAB);
+        for (uint32_t i = 0; i < nviews; i++) ds4_gpu_tensor_free(bank_views[i]);
+        nviews = 0;
+    }
+
+    /* ----- BATCHED: reset all N banks (state := empty), pack the ragged rows, run
+     * ONE ragged prefill, snapshot each bank, then the shared query decode. */
+    for (uint32_t s = 0; ok && s < N; s++) {
+        RG_BANK_REPOINT(s, bank_views, nviews);
+        if (ok && !metal_graph_reset_prefill_state(g)) ok = false;
+        for (uint32_t i = 0; i < nviews; i++) ds4_gpu_tensor_free(bank_views[i]);
+        nviews = 0;
+    }
+    for (uint32_t s = 0; s < N; s++)
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->ms_n_comp[s][il] = 0u;
+            g->ms_n_index_comp[s][il] = 0u;
+        }
+
+    /* Point caches + state at the FULL N-bank slabs; emit branch views bank seq. */
+    ds4_gpu_tensor *full_raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *full_comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *full_index[DS4_MAX_LAYER];
+    ds4_gpu_tensor *full_askv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *full_assc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *full_iskv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *full_issc[DS4_MAX_LAYER];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        full_raw[il] = full_comp[il] = full_index[il] = NULL;
+        full_askv[il] = full_assc[il] = full_iskv[il] = full_issc[il] = NULL;
+    }
+    if (ok) {
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            full_raw[il] = ds4_gpu_tensor_view(multi_raw[il], 0, (uint64_t)N * raw_bank_bytes);
+            if (!full_raw[il]) { ok = false; break; }
+            g->layer_raw_cache[il] = full_raw[il];
+            g->layer_n_comp[il] = 0u;
+            g->layer_n_index_comp[il] = 0u;
+            if (multi_comp[il]) {
+                full_comp[il] = ds4_gpu_tensor_view(multi_comp[il], 0, (uint64_t)N * comp_bank_bytes[il]);
+                full_askv[il] = ds4_gpu_tensor_view(multi_askv[il], 0, (uint64_t)N * astate_bank_bytes[il]);
+                full_assc[il] = ds4_gpu_tensor_view(multi_assc[il], 0, (uint64_t)N * astate_bank_bytes[il]);
+                if (!full_comp[il] || !full_askv[il] || !full_assc[il]) { ok = false; break; }
+                g->layer_attn_comp_cache[il]  = full_comp[il];
+                g->layer_attn_state_kv[il]    = full_askv[il];
+                g->layer_attn_state_score[il] = full_assc[il];
+            }
+            if (multi_index[il]) {
+                full_index[il] = ds4_gpu_tensor_view(multi_index[il], 0, (uint64_t)N * index_bank_bytes[il]);
+                full_iskv[il]  = ds4_gpu_tensor_view(multi_iskv[il], 0, (uint64_t)N * istate_bank_bytes[il]);
+                full_issc[il]  = ds4_gpu_tensor_view(multi_issc[il], 0, (uint64_t)N * istate_bank_bytes[il]);
+                if (!full_index[il] || !full_iskv[il] || !full_issc[il]) { ok = false; break; }
+                g->layer_index_comp_cache[il]  = full_index[il];
+                g->layer_index_state_kv[il]    = full_iskv[il];
+                g->layer_index_state_score[il] = full_issc[il];
+            }
+        }
+    }
+
+    /* Pack the ragged rows seq-contiguous + position-ascending. */
+    if (ok) {
+        int     *qtokens = xmalloc((size_t)n_packed * sizeof(int));
+        int32_t *pos_arr = xmalloc((size_t)n_packed * sizeof(int32_t));
+        int32_t *sid_arr = xmalloc((size_t)n_packed * sizeof(int32_t));
+        uint32_t t = 0;
+        for (uint32_t s = 0; s < N; s++) {
+            for (uint32_t i = 0; i < seq_len[s]; i++) {
+                qtokens[t] = (int)(100u + s * 1000u + i);
+                pos_arr[t] = (int32_t)i;
+                sid_arr[t] = force_seq0 ? 0 : (int32_t)s;
+                g->ms_positions[t] = pos_arr[t];
+                g->ms_seq_id[t]    = sid_arr[t];
+                t++;
+            }
+        }
+        ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)n_packed * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)n_packed * sizeof(int32_t)) != 0;
+        if (ok) {
+            g->batch_multiseq = true;
+            g->batch_n_seq = N;
+            g->batch_multiseq_prefilled = true;
+            g->batch_multiseq_emit = true;
+            g->batch_max_seq_len = max_len;             /* B0: per-seq ring fit + whole-prefix raw window */
+            float *ragged_logits = xmalloc((size_t)n_packed * DS4_N_VOCAB * sizeof(float));
+            ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, max_len, n_packed, ragged_logits);
+            free(ragged_logits);
+            g->batch_multiseq_emit = false;
+            g->batch_max_seq_len = 0;
+        }
+        free(qtokens);
+        free(pos_arr);
+        free(sid_arr);
+    }
+
+    /* Capture ragged per-seq compressed counts (the per-token emit advanced
+     * ms_n_comp during the prefill). */
+    for (uint32_t s = 0; s < N; s++)
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            rcount[s][il]  = g->ms_n_comp[s][il];
+            ricount[s][il] = g->ms_n_index_comp[s][il];
+        }
+
+    /* Snapshot each ragged-primed bank's raw KV [0,len) for the cache compare. */
+    for (uint32_t s = 0; ok && s < N; s++) {
+        uint64_t nf = (uint64_t)seq_len[s] * DS4_N_HEAD_DIM;
+        rsnap_raw[s] = xmalloc((size_t)nf * sizeof(float));
+        ok = ds4_gpu_tensor_read(multi_raw[snap_il],
+                                 (uint64_t)s * raw_bank_bytes,
+                                 rsnap_raw[s], nf * sizeof(float)) != 0;
+    }
+
+    /* Shared query decode reading the ragged-primed banks (== multiseq_selftest
+     * batched step): 1 token/seq at pos=len, read-only (no emit). */
+    if (ok) {
+        int     qtokens[2];
+        int32_t pos_arr[2];
+        int32_t sid_arr[2];
+        for (uint32_t s = 0; s < N; s++) {
+            qtokens[s] = query_token;
+            pos_arr[s] = (int32_t)seq_len[s];
+            sid_arr[s] = force_seq0 ? 0 : (int32_t)s;
+            g->ms_positions[s] = pos_arr[s];
+            g->ms_seq_id[s]    = sid_arr[s];
+        }
+        ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)N * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)N * sizeof(int32_t)) != 0;
+        if (ok) ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, max_len, N, batched);
+    }
+    g->batch_multiseq = false;
+    g->batch_n_seq = 0;
+    g->batch_multiseq_prefilled = false;
+
+    /* Restore the original single-seq caches/state. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (full_raw[il]) ds4_gpu_tensor_free(full_raw[il]);
+        if (full_comp[il]) ds4_gpu_tensor_free(full_comp[il]);
+        if (full_index[il]) ds4_gpu_tensor_free(full_index[il]);
+        if (full_askv[il]) ds4_gpu_tensor_free(full_askv[il]);
+        if (full_assc[il]) ds4_gpu_tensor_free(full_assc[il]);
+        if (full_iskv[il]) ds4_gpu_tensor_free(full_iskv[il]);
+        if (full_issc[il]) ds4_gpu_tensor_free(full_issc[il]);
+        g->layer_raw_cache[il]        = saved_raw[il];
+        g->layer_attn_comp_cache[il]  = saved_comp[il];
+        g->layer_index_comp_cache[il] = saved_index[il];
+        g->layer_attn_state_kv[il]    = saved_astate_kv[il];
+        g->layer_attn_state_score[il] = saved_astate_sc[il];
+        g->layer_index_state_kv[il]   = saved_istate_kv[il];
+        g->layer_index_state_score[il] = saved_istate_sc[il];
+    }
+    #undef RG_BANK_REPOINT
+
+    /* ----- Gate: (1) per-bank RAW-KV bit-exact (authoritative isolation proof),
+     * (2) query-decode logits track own oracle (lossless band). */
+    bool gate_pass = ok;
+    if (ok) {
+        for (uint32_t s = 0; s < N; s++) {
+            uint64_t nf = (uint64_t)seq_len[s] * DS4_N_HEAD_DIM;
+            float raw_max = 0.0f;
+            uint64_t mism = 0;
+            for (uint64_t e = 0; e < nf; e++) {
+                float d = fabsf(osnap_raw[s][e] - rsnap_raw[s][e]);
+                if (d > raw_max) raw_max = d;
+                if (d != 0.0f) mism++;
+            }
+            /* Raw KV is lossless but not always bit-exact: at scale a few cells
+             * differ by FP-noise (<1e-4) between the bulk-prefill oracle (prefill
+             * kernels) and the per-seq ragged path (decode kernels), while a
+             * cross-bank LEAK shifts max|d| to several units (teeth hit ~5.8).
+             * Gate well inside that gap; small L stays exactly 0.0. */
+            const bool raw_ok = (raw_max < 1.0f);
+            if (!raw_ok) gate_pass = false;
+
+            /* B3: compressed-cache COUNT compare (structural: emit-row assignment +
+             * counter advance must match the production prefill exactly). */
+            uint32_t cnt_bad = 0, idx_bad = 0;
+            uint32_t comp_layers = 0;
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                if (ds4_layer_compress_ratio(il) == 0) continue;
+                comp_layers++;
+                if (ocount[s][il] != rcount[s][il]) cnt_bad++;
+                if (oicount[s][il] != ricount[s][il]) idx_bad++;
+            }
+            const bool count_ok = (cnt_bad == 0 && idx_bad == 0);
+            if (!count_ok) gate_pass = false;
+
+            const float *b       = batched + (uint64_t)s * DS4_N_VOCAB;
+            const float *o_self  = oracle  + (uint64_t)s * DS4_N_VOCAB;
+            const float *o_other = oracle  + (uint64_t)(N - 1u - s) * DS4_N_VOCAB;
+            const int am_b = sample_argmax(b, DS4_N_VOCAB);
+            const int am_self = sample_argmax(o_self, DS4_N_VOCAB);
+            float d_self = 0.0f, d_cross = 0.0f;
+            float self_top1 = -1e30f, self_top2 = -1e30f;
+            for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+                float ds = fabsf(b[v] - o_self[v]);
+                float dc = fabsf(b[v] - o_other[v]);
+                if (ds > d_self) d_self = ds;
+                if (dc > d_cross) d_cross = dc;
+                float sv = o_self[v];
+                if (sv > self_top1) { self_top2 = self_top1; self_top1 = sv; }
+                else if (sv > self_top2) { self_top2 = sv; }
+            }
+            const float self_margin = self_top1 - self_top2;
+            const bool tracks_own = (d_self < d_cross);
+            const bool lossless = (d_self < 5.0f) && ((am_b == am_self) || self_margin < d_self);
+            if (!tracks_own || !lossless) gate_pass = false;
+            fprintf(stderr,
+                    "ds4: ragged selftest seq %u: RAW-KV max|d|=%.4f (%llu/%llu mismatch) %s | comp-count %s (%u/%u layers, attn_bad=%u idx_bad=%u) | argmax batch=%d self=%d | self max|d|=%.4f cross max|d|=%.4f -> %s,%s\n",
+                    s, raw_max, (unsigned long long)mism, (unsigned long long)nf,
+                    raw_max == 0.0f ? "BIT-EXACT" : (raw_ok ? "lossless" : "LEAKED"),
+                    count_ok ? "MATCH" : "MISMATCH", comp_layers, comp_layers,
+                    cnt_bad, idx_bad,
+                    am_b, am_self, d_self, d_cross,
+                    tracks_own ? "isolated" : "LEAKED-ACROSS-BANKS",
+                    lossless ? "lossless" : "LOSSY");
+        }
+        float o_diff = 0.0f;
+        for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+            float d = fabsf(oracle[v] - oracle[DS4_N_VOCAB + v]);
+            if (d > o_diff) o_diff = d;
+        }
+        if (o_diff <= 1.0f) gate_pass = false;   /* a non-distinct pair is vacuous */
+        fprintf(stderr, "ds4: ragged selftest oracle separation max|seqA-seqB|=%.4f %s\n",
+                o_diff, o_diff > 1.0f ? "(distinct)" : "(WEAK)");
+    }
+    fprintf(stderr, "ds4: ragged selftest %s (N=%u seq_len=[%u,%u] Σ=%u)\n",
+            (ok && gate_pass) ? "PASS" : "FAIL", N, L0, L1, n_packed);
+
+    free(scratch);
+    free(oracle);
+    free(batched);
+    for (uint32_t s = 0; s < N; s++) { free(osnap_raw[s]); free(rsnap_raw[s]); }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (multi_raw[il]) ds4_gpu_tensor_free(multi_raw[il]);
+        if (multi_comp[il]) ds4_gpu_tensor_free(multi_comp[il]);
+        if (multi_index[il]) ds4_gpu_tensor_free(multi_index[il]);
+        if (multi_askv[il]) ds4_gpu_tensor_free(multi_askv[il]);
+        if (multi_assc[il]) ds4_gpu_tensor_free(multi_assc[il]);
+        if (multi_iskv[il]) ds4_gpu_tensor_free(multi_iskv[il]);
+        if (multi_issc[il]) ds4_gpu_tensor_free(multi_issc[il]);
+    }
+    g_ds4_shape.n_indexer_top_k = saved_top_k;
+    return ok && gate_pass;
+}
+
 /* Phase 2 Step 3b: multi-sequence raw-attention self-test -- the first gate
  * that exercises real per-sequence isolation (distinct KV banks AND
  * non-consecutive per-seq positions), as opposed to the Step 1/2/3a single-seq
@@ -20399,6 +20922,12 @@ static bool metal_graph_multiseq_selftest(
         ds4_gpu_graph     *g,
         const ds4_model   *model,
         const ds4_weights *weights) {
+    /* Tier B-core (B1): DS4_RAGGED_PREFILL routes to the ragged multi-seq PREFILL
+     * gate (k-tokens/seq packed into ONE forward).  Checked before STEPS so the
+     * ragged path is independent of the decode-emit gate. */
+    if (getenv("DS4_RAGGED_PREFILL") != NULL) {
+        return metal_graph_multiseq_ragged_selftest(g, model, weights);
+    }
     /* Step 4d (Scope A): DS4_MULTISEQ_STEPS routes to the multi-step emit gate
      * (per-seq compressor EMIT across K batched decode steps).  Unset keeps the
      * read-only 4a/4b/4c single-step gate below bit-identical. */
