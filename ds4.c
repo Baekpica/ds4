@@ -20677,6 +20677,386 @@ static bool metal_graph_multiseq_selftest(
     return ok && gate_pass;
 }
 
+/* Phase 2 Step 6: decode-batch payoff measurement.  Primes N_max per-seq banks
+ * to a fixed context depth, then times a single batched forward of N rows (one
+ * token/seq) against the single-stream decode cost, for several batch widths.
+ *
+ *   payoff(N) = N * T_single / T_batch(N)      (ideal == N; %ideal = payoff/N)
+ *
+ * This is the "should we build prefill batching?" precursor (re-plan §6, Alt B):
+ * it quantifies how much of the weight-amortization ceiling decode batching
+ * alone realizes.  It is pure timing -- no logits gate -- so it reuses the
+ * proven multiseq-selftest bank machinery verbatim and mutates nothing on the
+ * single-seq path (gated entirely on DS4_MULTISEQ_BENCH).  Baseline = batch_eval
+ * at n=1 on the scalar path (== a real single-stream decode step); each width N
+ * = one batched forward reading N per-seq banks via seq_id[].  Include "1" in
+ * DS4_BENCH_N to also get the multiseq-path-at-N=1 timing as a cross-check.
+ *
+ * Env:  DS4_BENCH_N      csv batch widths        (default "2,4,8,16,32")
+ *       DS4_BENCH_CTX    primed per-seq depth    (default 128, clamped to caps)
+ *       DS4_BENCH_STEPS  timed reps per width    (default 30)
+ *       DS4_BENCH_WARMUP warmup reps per width   (default 5)
+ */
+static bool metal_graph_multiseq_bench(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights) {
+    /* --- parse batch widths (csv) --- */
+    uint32_t Nlist[DS4_MULTISEQ_MAX_SEQ];
+    uint32_t n_widths = 0u, n_max = 0u;
+    const char *n_env = getenv("DS4_BENCH_N");
+    if (n_env && n_env[0]) {
+        const char *p = n_env;
+        while (*p && n_widths < (uint32_t)DS4_MULTISEQ_MAX_SEQ) {
+            while (*p == ' ' || *p == ',') p++;
+            if (!*p) break;
+            uint32_t v = (uint32_t)strtoul(p, NULL, 10);
+            if (v >= 1u) {
+                if (v > (uint32_t)DS4_MULTISEQ_MAX_SEQ) v = (uint32_t)DS4_MULTISEQ_MAX_SEQ;
+                Nlist[n_widths++] = v;
+                if (v > n_max) n_max = v;
+            }
+            while (*p && *p != ',') p++;
+        }
+    }
+    if (n_widths == 0u) {
+        static const uint32_t defs[] = { 2u, 4u, 8u, 16u, 32u };
+        for (uint32_t i = 0; i < 5u; i++) {
+            uint32_t v = defs[i];
+            if (v > (uint32_t)DS4_MULTISEQ_MAX_SEQ) continue;
+            Nlist[n_widths++] = v;
+            if (v > n_max) n_max = v;
+        }
+    }
+    /* batch_eval requires n <= prefill_cap; drop any wider widths. */
+    if (n_max > g->prefill_cap) {
+        uint32_t w = 0u; n_max = 0u;
+        for (uint32_t i = 0; i < n_widths; i++)
+            if (Nlist[i] <= g->prefill_cap) {
+                Nlist[w++] = Nlist[i];
+                if (Nlist[i] > n_max) n_max = Nlist[i];
+            }
+        n_widths = w;
+        fprintf(stderr, "ds4: multiseq bench dropped batch widths > prefill_cap=%u\n", g->prefill_cap);
+    }
+    if (n_widths == 0u || n_max == 0u) {
+        fprintf(stderr, "ds4: multiseq bench has no valid batch widths (prefill_cap=%u)\n", g->prefill_cap);
+        return false;
+    }
+
+    /* --- parse CTX / reps / warmup --- */
+    const char *ctx_env = getenv("DS4_BENCH_CTX");
+    uint32_t CTX = ctx_env ? (uint32_t)atoi(ctx_env) : 128u;
+    if (CTX < 1u) CTX = 1u;
+    if (CTX > g->prefill_cap) CTX = g->prefill_cap;        /* priming needs CTX <= prefill_cap */
+    if (CTX + 1u > g->raw_cap) CTX = g->raw_cap - 1u;      /* keep the primed seq in the SWA ring */
+    const char *reps_env = getenv("DS4_BENCH_STEPS");
+    uint32_t reps = reps_env ? (uint32_t)atoi(reps_env) : 30u;
+    if (reps < 1u) reps = 1u;
+    const char *warm_env = getenv("DS4_BENCH_WARMUP");
+    uint32_t warmup = warm_env ? (uint32_t)atoi(warm_env) : 5u;
+
+    fprintf(stderr,
+            "ds4: multiseq bench config CTX=%u widths=%u reps=%u warmup=%u (prefill_cap=%u raw_cap=%u n_max=%u)\n",
+            CTX, n_widths, reps, warmup, g->prefill_cap, g->raw_cap, n_max);
+
+    /* --- allocate N_max per-seq banks: raw + attn-comp + index-comp AND the
+     * per-seq compressor STATE banks (attn kv/score, index kv/score).  A multi-
+     * seq batched decode MUST route through the per-seq emit branch
+     * (batch_multiseq_emit=true) -- without it, an N-row batch where N%ratio==0
+     * is mis-read as a contiguous prefill chunk and compresses N/ratio rows per
+     * forward, overflowing the comp cache.  The emit branch reads per-row
+     * ms_positions[t] (all == CTX here) so (CTX+1)%ratio!=0 => no spurious emit;
+     * it still runs the per-seq streaming compressor_update (realistic decode
+     * work) into each seq's OWN state bank.  Mirrors the emit-selftest layout. */
+    const uint64_t raw_bank_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    ds4_gpu_tensor *multi_raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_index[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_askv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_assc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_iskv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_issc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_askv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_assc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_iskv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_issc[DS4_MAX_LAYER];
+    uint64_t comp_bank_bytes[DS4_MAX_LAYER];
+    uint64_t index_bank_bytes[DS4_MAX_LAYER];
+    uint64_t astate_bank_bytes[DS4_MAX_LAYER];
+    uint64_t istate_bank_bytes[DS4_MAX_LAYER];
+    uint32_t primed_n_comp_max[DS4_MAX_LAYER];
+    uint32_t primed_n_index_comp_max[DS4_MAX_LAYER];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        multi_raw[il] = multi_comp[il] = multi_index[il] = NULL;
+        multi_askv[il] = multi_assc[il] = multi_iskv[il] = multi_issc[il] = NULL;
+        saved_raw[il]   = g->layer_raw_cache[il];
+        saved_comp[il]  = g->layer_attn_comp_cache[il];
+        saved_index[il] = g->layer_index_comp_cache[il];
+        saved_askv[il]  = g->layer_attn_state_kv[il];
+        saved_assc[il]  = g->layer_attn_state_score[il];
+        saved_iskv[il]  = g->layer_index_state_kv[il];
+        saved_issc[il]  = g->layer_index_state_score[il];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t coff  = ratio == 4u ? 2u : 1u;
+        comp_bank_bytes[il]  = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
+        index_bank_bytes[il] = (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        astate_bank_bytes[il] = (uint64_t)(coff * (ratio ? ratio : 1u)) *
+                                (uint64_t)(coff * DS4_N_HEAD_DIM) * sizeof(float);
+        istate_bank_bytes[il] = (uint64_t)(coff * (ratio ? ratio : 1u)) *
+                                (uint64_t)(coff * DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
+        primed_n_comp_max[il]       = 0u;
+        primed_n_index_comp_max[il] = 0u;
+    }
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        multi_raw[il] = ds4_gpu_tensor_alloc((uint64_t)n_max * raw_bank_bytes);
+        ok = multi_raw[il] != NULL;
+        if (ok && ratio != 0 && saved_comp[il]) {
+            multi_comp[il] = ds4_gpu_tensor_alloc((uint64_t)n_max * comp_bank_bytes[il]);
+            multi_askv[il] = ds4_gpu_tensor_alloc((uint64_t)n_max * astate_bank_bytes[il]);
+            multi_assc[il] = ds4_gpu_tensor_alloc((uint64_t)n_max * astate_bank_bytes[il]);
+            ok = multi_comp[il] != NULL && multi_askv[il] != NULL && multi_assc[il] != NULL;
+        }
+        if (ok && ratio == 4 && saved_index[il]) {
+            multi_index[il] = ds4_gpu_tensor_alloc((uint64_t)n_max * index_bank_bytes[il]);
+            multi_iskv[il]  = ds4_gpu_tensor_alloc((uint64_t)n_max * istate_bank_bytes[il]);
+            multi_issc[il]  = ds4_gpu_tensor_alloc((uint64_t)n_max * istate_bank_bytes[il]);
+            ok = multi_index[il] != NULL && multi_iskv[il] != NULL && multi_issc[il] != NULL;
+        }
+    }
+
+    float *logits = ok ? xmalloc((size_t)n_max * DS4_N_VOCAB * sizeof(float)) : NULL;
+    if (!logits) ok = false;
+
+    /* Install bank `sb`'s single-bank views into g->layer_* (all 7 tensors),
+     * recording them in (vbuf)[0..*(vn)) for later free. */
+    #define BENCH_REPOINT(sb, vbuf, vn) do {                                                       \
+        (vn) = 0;                                                                                  \
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {                                       \
+            ds4_gpu_tensor *vr = ds4_gpu_tensor_view(multi_raw[il], (uint64_t)(sb) * raw_bank_bytes, raw_bank_bytes); \
+            if (!vr) { ok = false; break; }                                                        \
+            (vbuf)[(vn)++] = vr; g->layer_raw_cache[il] = vr;                                       \
+            if (multi_comp[il]) {                                                                   \
+                ds4_gpu_tensor *vc = ds4_gpu_tensor_view(multi_comp[il], (uint64_t)(sb) * comp_bank_bytes[il], comp_bank_bytes[il]); \
+                ds4_gpu_tensor *vk = ds4_gpu_tensor_view(multi_askv[il], (uint64_t)(sb) * astate_bank_bytes[il], astate_bank_bytes[il]); \
+                ds4_gpu_tensor *vs = ds4_gpu_tensor_view(multi_assc[il], (uint64_t)(sb) * astate_bank_bytes[il], astate_bank_bytes[il]); \
+                if (!vc || !vk || !vs) { ok = false; if (vc) ds4_gpu_tensor_free(vc); if (vk) ds4_gpu_tensor_free(vk); if (vs) ds4_gpu_tensor_free(vs); break; } \
+                (vbuf)[(vn)++] = vc; g->layer_attn_comp_cache[il]  = vc;                            \
+                (vbuf)[(vn)++] = vk; g->layer_attn_state_kv[il]    = vk;                            \
+                (vbuf)[(vn)++] = vs; g->layer_attn_state_score[il] = vs;                            \
+            }                                                                                      \
+            if (multi_index[il]) {                                                                  \
+                ds4_gpu_tensor *vi  = ds4_gpu_tensor_view(multi_index[il], (uint64_t)(sb) * index_bank_bytes[il], index_bank_bytes[il]); \
+                ds4_gpu_tensor *vik = ds4_gpu_tensor_view(multi_iskv[il], (uint64_t)(sb) * istate_bank_bytes[il], istate_bank_bytes[il]); \
+                ds4_gpu_tensor *vis = ds4_gpu_tensor_view(multi_issc[il], (uint64_t)(sb) * istate_bank_bytes[il], istate_bank_bytes[il]); \
+                if (!vi || !vik || !vis) { ok = false; if (vi) ds4_gpu_tensor_free(vi); if (vik) ds4_gpu_tensor_free(vik); if (vis) ds4_gpu_tensor_free(vis); break; } \
+                (vbuf)[(vn)++] = vi;  g->layer_index_comp_cache[il]  = vi;                          \
+                (vbuf)[(vn)++] = vik; g->layer_index_state_kv[il]    = vik;                         \
+                (vbuf)[(vn)++] = vis; g->layer_index_state_score[il] = vis;                         \
+            }                                                                                      \
+        }                                                                                          \
+    } while (0)
+
+    /* Re-pin the per-seq + scalar comp counters to their primed values before a
+     * forward, so repeated fixed-position decodes never accumulate (robust even
+     * if CTX did land on a ratio boundary). */
+    #define BENCH_RESET_COUNTERS(NN) do {                                  \
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {                    \
+            g->layer_n_comp[il]       = primed_n_comp_max[il];             \
+            g->layer_n_index_comp[il] = primed_n_index_comp_max[il];       \
+            for (uint32_t s = 0; s < (NN); s++) {                          \
+                g->ms_n_comp[s][il]       = primed_n_comp_max[il];         \
+                g->ms_n_index_comp[s][il] = primed_n_index_comp_max[il];   \
+            }                                                              \
+        }                                                                  \
+    } while (0)
+
+    ds4_gpu_tensor *bviews[DS4_MAX_LAYER * 7];
+    uint32_t nv = 0;
+
+    /* --- prime each bank to CTX (identical content; timing is content-free) --- */
+    for (uint32_t s = 0; ok && s < n_max; s++) {
+        BENCH_REPOINT(s, bviews, nv);
+        if (ok && !metal_graph_reset_prefill_state(g)) ok = false;
+        if (ok) {
+            token_vec tv;
+            memset(&tv, 0, sizeof(tv));
+            for (uint32_t i = 0; i < CTX; i++) token_vec_push(&tv, (int)(100u + i));
+            ok = metal_graph_prefill_raw_swa(g, model, weights, &tv, (int)CTX,
+                                             logits, false, NULL, NULL);
+            token_vec_free(&tv);
+        }
+        if (ok) {
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                if (g->layer_n_comp[il] > primed_n_comp_max[il])
+                    primed_n_comp_max[il] = g->layer_n_comp[il];
+                if (g->layer_n_index_comp[il] > primed_n_index_comp_max[il])
+                    primed_n_index_comp_max[il] = g->layer_n_index_comp[il];
+            }
+        }
+        for (uint32_t i = 0; i < nv; i++) ds4_gpu_tensor_free(bviews[i]);
+        nv = 0;
+    }
+    if (ok) fprintf(stderr, "ds4: multiseq bench primed %u banks to CTX=%u (n_comp[2]=%u)\n",
+                    n_max, CTX, primed_n_comp_max[2 < DS4_N_LAYER ? 2 : 0]);
+    /* Restore graph pointers to their originals after priming. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_raw_cache[il]        = saved_raw[il];
+        g->layer_attn_comp_cache[il]  = saved_comp[il];
+        g->layer_index_comp_cache[il] = saved_index[il];
+        g->layer_attn_state_kv[il]    = saved_askv[il];
+        g->layer_attn_state_score[il] = saved_assc[il];
+        g->layer_index_state_kv[il]   = saved_iskv[il];
+        g->layer_index_state_score[il]= saved_issc[il];
+    }
+
+    /* --- single-stream baseline: n=1 single-seq decode reading bank 0 --- */
+    double t_single_ms = 0.0;
+    if (ok) {
+        BENCH_REPOINT(0, bviews, nv);
+        g->batch_multiseq = false;
+        g->batch_n_seq = 0;
+        g->batch_multiseq_prefilled = false;
+        g->batch_multiseq_emit = false;
+        const int qtok = 505;
+        for (uint32_t w = 0; ok && w < warmup; w++) {
+            BENCH_RESET_COUNTERS(0u);
+            ok = metal_graph_batch_eval_logits(g, model, weights, &qtok, CTX, 1u, logits);
+        }
+        const double t0 = now_sec();
+        for (uint32_t r = 0; ok && r < reps; r++) {
+            BENCH_RESET_COUNTERS(0u);
+            ok = metal_graph_batch_eval_logits(g, model, weights, &qtok, CTX, 1u, logits);
+        }
+        const double t1 = now_sec();
+        t_single_ms = (t1 - t0) * 1000.0 / (double)reps;
+        for (uint32_t i = 0; i < nv; i++) ds4_gpu_tensor_free(bviews[i]);
+        nv = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->layer_raw_cache[il]        = saved_raw[il];
+            g->layer_attn_comp_cache[il]  = saved_comp[il];
+            g->layer_index_comp_cache[il] = saved_index[il];
+            g->layer_attn_state_kv[il]    = saved_askv[il];
+            g->layer_attn_state_score[il] = saved_assc[il];
+            g->layer_index_state_kv[il]   = saved_iskv[il];
+            g->layer_index_state_score[il]= saved_issc[il];
+        }
+        if (ok) fprintf(stderr,
+                        "ds4: multiseq bench baseline n=1: %.3f ms/forward -> %.2f tok/s\n",
+                        t_single_ms, t_single_ms > 0.0 ? 1000.0 / t_single_ms : 0.0);
+    }
+
+    /* --- batched sweep: N rows, one token/seq, per-seq emit path --- */
+    if (ok) fprintf(stderr, "ds4: multiseq bench  N    batch_ms   batch_tok/s   payoff   %%ideal\n");
+    for (uint32_t wi = 0; ok && wi < n_widths; wi++) {
+        const uint32_t N = Nlist[wi];
+        ds4_gpu_tensor *full[DS4_MAX_LAYER * 7];
+        uint32_t nf = 0;
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            ds4_gpu_tensor *vr = ds4_gpu_tensor_view(multi_raw[il], 0, (uint64_t)N * raw_bank_bytes);
+            if (!vr) { ok = false; break; }
+            full[nf++] = vr; g->layer_raw_cache[il] = vr;
+            if (multi_comp[il]) {
+                ds4_gpu_tensor *vc = ds4_gpu_tensor_view(multi_comp[il], 0, (uint64_t)N * comp_bank_bytes[il]);
+                ds4_gpu_tensor *vk = ds4_gpu_tensor_view(multi_askv[il], 0, (uint64_t)N * astate_bank_bytes[il]);
+                ds4_gpu_tensor *vs = ds4_gpu_tensor_view(multi_assc[il], 0, (uint64_t)N * astate_bank_bytes[il]);
+                if (!vc || !vk || !vs) { ok = false; if (vc) ds4_gpu_tensor_free(vc); if (vk) ds4_gpu_tensor_free(vk); if (vs) ds4_gpu_tensor_free(vs); break; }
+                full[nf++] = vc; g->layer_attn_comp_cache[il]  = vc;
+                full[nf++] = vk; g->layer_attn_state_kv[il]    = vk;
+                full[nf++] = vs; g->layer_attn_state_score[il] = vs;
+            }
+            if (multi_index[il]) {
+                ds4_gpu_tensor *vi  = ds4_gpu_tensor_view(multi_index[il], 0, (uint64_t)N * index_bank_bytes[il]);
+                ds4_gpu_tensor *vik = ds4_gpu_tensor_view(multi_iskv[il], 0, (uint64_t)N * istate_bank_bytes[il]);
+                ds4_gpu_tensor *vis = ds4_gpu_tensor_view(multi_issc[il], 0, (uint64_t)N * istate_bank_bytes[il]);
+                if (!vi || !vik || !vis) { ok = false; if (vi) ds4_gpu_tensor_free(vi); if (vik) ds4_gpu_tensor_free(vik); if (vis) ds4_gpu_tensor_free(vis); break; }
+                full[nf++] = vi;  g->layer_index_comp_cache[il]  = vi;
+                full[nf++] = vik; g->layer_index_state_kv[il]    = vik;
+                full[nf++] = vis; g->layer_index_state_score[il] = vis;
+            }
+        }
+        int     qtokens[DS4_MULTISEQ_MAX_SEQ];
+        int32_t pos_arr[DS4_MULTISEQ_MAX_SEQ];
+        int32_t sid_arr[DS4_MULTISEQ_MAX_SEQ];
+        for (uint32_t s = 0; s < N; s++) {
+            qtokens[s] = 505;
+            pos_arr[s] = (int32_t)CTX;
+            sid_arr[s] = (int32_t)s;
+            g->ms_positions[s] = pos_arr[s];
+            g->ms_seq_id[s]    = sid_arr[s];
+        }
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr,
+                                          (uint64_t)N * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr,
+                                          (uint64_t)N * sizeof(int32_t)) != 0;
+        g->batch_multiseq = true;
+        g->batch_n_seq = N;
+        g->batch_multiseq_prefilled = true;
+        g->batch_multiseq_emit = true;
+        for (uint32_t wm = 0; ok && wm < warmup; wm++) {
+            BENCH_RESET_COUNTERS(N);
+            ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, CTX, N, logits);
+        }
+        const double t0 = now_sec();
+        for (uint32_t r = 0; ok && r < reps; r++) {
+            BENCH_RESET_COUNTERS(N);
+            ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, CTX, N, logits);
+        }
+        const double t1 = now_sec();
+        g->batch_multiseq = false;
+        g->batch_n_seq = 0;
+        g->batch_multiseq_prefilled = false;
+        g->batch_multiseq_emit = false;
+        const double batch_ms  = (t1 - t0) * 1000.0 / (double)reps;
+        const double batch_tps = batch_ms > 0.0 ? (double)N * 1000.0 / batch_ms : 0.0;
+        const double payoff    = (t_single_ms > 0.0 && batch_ms > 0.0)
+                                 ? (double)N * t_single_ms / batch_ms : 0.0;
+        if (ok) fprintf(stderr,
+                        "ds4: multiseq bench  %-3u %8.3f   %10.2f   %5.2fx   %5.1f%%\n",
+                        N, batch_ms, batch_tps, payoff,
+                        N > 0u ? 100.0 * payoff / (double)N : 0.0);
+        for (uint32_t i = 0; i < nf; i++) ds4_gpu_tensor_free(full[i]);
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->layer_raw_cache[il]        = saved_raw[il];
+            g->layer_attn_comp_cache[il]  = saved_comp[il];
+            g->layer_index_comp_cache[il] = saved_index[il];
+            g->layer_attn_state_kv[il]    = saved_askv[il];
+            g->layer_attn_state_score[il] = saved_assc[il];
+            g->layer_index_state_kv[il]   = saved_iskv[il];
+            g->layer_index_state_score[il]= saved_issc[il];
+        }
+    }
+    #undef BENCH_REPOINT
+    #undef BENCH_RESET_COUNTERS
+
+    fprintf(stderr, "ds4: multiseq bench %s\n", ok ? "DONE" : "FAILED");
+
+    /* --- cleanup: restore graph pointers + free all slabs --- */
+    if (logits) free(logits);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_raw_cache[il]        = saved_raw[il];
+        g->layer_attn_comp_cache[il]  = saved_comp[il];
+        g->layer_index_comp_cache[il] = saved_index[il];
+        g->layer_attn_state_kv[il]    = saved_askv[il];
+        g->layer_attn_state_score[il] = saved_assc[il];
+        g->layer_index_state_kv[il]   = saved_iskv[il];
+        g->layer_index_state_score[il]= saved_issc[il];
+        if (multi_raw[il])   ds4_gpu_tensor_free(multi_raw[il]);
+        if (multi_comp[il])  ds4_gpu_tensor_free(multi_comp[il]);
+        if (multi_index[il]) ds4_gpu_tensor_free(multi_index[il]);
+        if (multi_askv[il])  ds4_gpu_tensor_free(multi_askv[il]);
+        if (multi_assc[il])  ds4_gpu_tensor_free(multi_assc[il]);
+        if (multi_iskv[il])  ds4_gpu_tensor_free(multi_iskv[il]);
+        if (multi_issc[il])  ds4_gpu_tensor_free(multi_issc[il]);
+    }
+    return ok;
+}
+
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: chunked/layer-major prefill followed by graph decode steps. */
 static int generate_metal_graph_raw_swa(
@@ -20731,6 +21111,15 @@ static int generate_metal_graph_raw_swa(
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+
+    /* Phase 2 Step 6: decode-batch payoff measurement (re-plan Alt B precursor).
+     * Primes its own banks + ignores the prompt, like the self-test. */
+    if (getenv("DS4_MULTISEQ_BENCH") != NULL) {
+        const bool okb = metal_graph_multiseq_bench(&g, model, weights);
+        free(logits);
+        metal_graph_free(&g);
+        return okb ? 0 : 1;
+    }
 
     /* Phase 2 Step 3b gate: run the multi-sequence raw-attention self-test on
      * the freshly-allocated (un-prefilled) graph, then exit -- it primes its
@@ -22483,6 +22872,16 @@ static bool metal_graph_batch_eval_logits(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (!ok) return false;
+
+    /* Step 6 bench knob: DS4_BENCH_FWD_ONLY skips the per-row output head +
+     * logit readback so the 43-layer forward can be timed in isolation (the
+     * output head is N serial vocab-projections, un-amortized; this isolates
+     * how much of the falling %ideal is the forward vs the head).  Default off
+     * (cached once) -- a no-op for every production caller, which never sets it. */
+    static int bench_fwd_only = -1;
+    if (bench_fwd_only < 0)
+        bench_fwd_only = getenv("DS4_BENCH_FWD_ONLY") != NULL ? 1 : 0;
+    if (bench_fwd_only) return ok;   /* logits_out left stale; bench times only */
 
     /* Per-row full-logit readback (mirrors the verify's logits_row path). */
     for (uint32_t row = 0; ok && row < n; row++) {
