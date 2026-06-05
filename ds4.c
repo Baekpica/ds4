@@ -8927,6 +8927,7 @@ typedef struct {
     ds4_gpu_tensor *batch_after_attn_hc;
     ds4_gpu_tensor *batch_ffn_cur;
     ds4_gpu_tensor *batch_ffn_norm;
+    ds4_gpu_tensor *batch_logits;   /* Phase 2 Step 6+: batched output-head logits, G=DS4_MULTISEQ_MAX_SEQ rows */
     ds4_gpu_tensor *batch_shared_gate;
     ds4_gpu_tensor *batch_shared_up;
     ds4_gpu_tensor *batch_shared_mid;
@@ -9007,6 +9008,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_shared_mid);
     ds4_gpu_tensor_free(g->batch_shared_up);
     ds4_gpu_tensor_free(g->batch_shared_gate);
+    ds4_gpu_tensor_free(g->batch_logits);
     ds4_gpu_tensor_free(g->batch_ffn_norm);
     ds4_gpu_tensor_free(g->batch_ffn_cur);
     ds4_gpu_tensor_free(g->batch_after_attn_hc);
@@ -9712,6 +9714,12 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_after_attn_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_ffn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_ffn_norm = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+    /* Phase 2 Step 6+: fixed-width destination for the batched output head so
+     * batch_eval can run the vocab projection over G rows at once instead of N
+     * serial begin/end/sync round-trips.  G = DS4_MULTISEQ_MAX_SEQ (32 rows,
+     * ~16.5 MB at vocab ~129k); batch_eval chunks any n into <=G groups so this
+     * stays bounded regardless of prefill_cap. */
+    g->batch_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_MULTISEQ_MAX_SEQ * DS4_N_VOCAB * sizeof(float));
     g->batch_shared_gate = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
     g->batch_shared_up = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
     g->batch_shared_mid = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
@@ -13129,23 +13137,30 @@ static bool metal_graph_encode_output_head_batch_row(
     return ok;
 }
 
-/* Batched output head for speculative verification.
+/* Batched output head into a caller-supplied logits destination.
  *
- * A target verifier only needs top-1 ids for intermediate draft rows and full
- * logits for the last accepted row.  Running the normal one-row output head in
- * a loop serializes the HC collapse, output norm, and Q8 vocab projection.  For
- * tiny MTP suffixes we instead process all rows together and let the GPU reduce
- * each row to a top id; the CPU reads back just those ids plus the last row's
- * logits needed to continue the exact target stream. */
-static bool metal_graph_encode_output_head_batch(
-        ds4_gpu_graph *g,
+ * Runs the full output head (HC collapse, output norm, Q8 vocab projection)
+ * over n_tokens contiguous rows of g->batch_cur_hc starting at src_row_offset,
+ * writing n_tokens rows of logits into dst_logits[0..n_tokens).  Batching the
+ * vocab projection amortizes the weight load across rows instead of paying it
+ * per row (Step 6 measured the per-row head at ~2.4 ms/row, ~32% of an N=32
+ * decode).  Used by:
+ *   - speculative-MTP verification (dst = g->spec_logits, offset 0), and
+ *   - batch_eval's multi-row decode/prefill (dst = g->batch_logits, chunked).
+ * dst_logits must hold at least n_tokens rows; the scratch (batch_flat_hc,
+ * batch_hc_mix/split, batch_ffn_cur/norm) is prefill_cap rows so n_tokens<=pc. */
+static bool metal_graph_encode_output_head_batch_into(
+        ds4_gpu_graph         *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
+        uint32_t               src_row_offset,
         uint32_t               n_tokens,
-        uint64_t               vocab_dim) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+        uint64_t               vocab_dim,
+        ds4_gpu_tensor        *dst_logits) {
+    if (n_tokens == 0 || n_tokens > g->prefill_cap || !dst_logits) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_gpu_tensor *src_hc = NULL;
     ds4_gpu_tensor *output_pre = NULL;
     ds4_gpu_tensor *output_weights = NULL;
     ds4_gpu_tensor *output_embd = NULL;
@@ -13153,6 +13168,9 @@ static bool metal_graph_encode_output_head_batch(
     ds4_gpu_tensor *logits = NULL;
 
     bool ok = true;
+    src_hc = ds4_gpu_tensor_view(g->batch_cur_hc,
+                                   (uint64_t)src_row_offset * hc_dim * sizeof(float),
+                                   (uint64_t)n_tokens * hc_dim * sizeof(float));
     output_pre = ds4_gpu_tensor_view(g->batch_hc_mix,
                                        0,
                                        (uint64_t)n_tokens * DS4_N_HC * sizeof(float));
@@ -13165,13 +13183,13 @@ static bool metal_graph_encode_output_head_batch(
     output_norm = ds4_gpu_tensor_view(g->batch_ffn_norm,
                                         0,
                                         (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
-    logits = ds4_gpu_tensor_view(g->spec_logits,
+    logits = ds4_gpu_tensor_view(dst_logits,
                                    0,
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
-    ok = output_pre && output_weights && output_embd && output_norm && logits;
+    ok = src_hc && output_pre && output_weights && output_embd && output_norm && logits;
 
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
-                                                      g->batch_cur_hc,
+                                                      src_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       DS4_RMS_EPS) != 0;
@@ -13192,7 +13210,7 @@ static bool metal_graph_encode_output_head_batch(
                                                     DS4_N_HC,
                                                     DS4_HC_EPS) != 0;
     if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(output_embd,
-                                                  g->batch_cur_hc,
+                                                  src_hc,
                                                   output_weights,
                                                   DS4_N_EMBD,
                                                   DS4_N_HC) != 0;
@@ -13218,7 +13236,29 @@ static bool metal_graph_encode_output_head_batch(
     ds4_gpu_tensor_free(output_embd);
     ds4_gpu_tensor_free(output_weights);
     ds4_gpu_tensor_free(output_pre);
+    ds4_gpu_tensor_free(src_hc);
     return ok;
+}
+
+/* Batched output head for speculative verification.
+ *
+ * A target verifier only needs top-1 ids for intermediate draft rows and full
+ * logits for the last accepted row.  Running the normal one-row output head in
+ * a loop serializes the HC collapse, output norm, and Q8 vocab projection.  For
+ * tiny MTP suffixes we instead process all rows together and let the GPU reduce
+ * each row to a top id; the CPU reads back just those ids plus the last row's
+ * logits needed to continue the exact target stream.  Thin wrapper over
+ * _into() targeting g->spec_logits from row 0. */
+static bool metal_graph_encode_output_head_batch(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint32_t               n_tokens,
+        uint64_t               vocab_dim) {
+    if (!g->spec_logits) return false;
+    return metal_graph_encode_output_head_batch_into(g, model, weights,
+                                                     0u, n_tokens, vocab_dim,
+                                                     g->spec_logits);
 }
 
 static bool metal_graph_matmul_plain_tensor(
@@ -17605,6 +17645,20 @@ static bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, flo
     if (!g || !g->spec_logits || !logits || row >= g->prefill_cap) return false;
     const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
     return ds4_gpu_tensor_read(g->spec_logits,
+                                 (uint64_t)row * row_bytes,
+                                 logits,
+                                 row_bytes) != 0;
+}
+
+/* Read one full-vocab logits row out of an arbitrary device logits tensor
+ * (used to drain g->batch_logits chunk rows in batch_eval). */
+static bool metal_graph_read_logits_row_from(ds4_gpu_graph *g,
+                                             ds4_gpu_tensor *src,
+                                             uint32_t row,
+                                             float *logits) {
+    if (!g || !src || !logits) return false;
+    const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    return ds4_gpu_tensor_read(src,
                                  (uint64_t)row * row_bytes,
                                  logits,
                                  row_bytes) != 0;
@@ -22883,19 +22937,49 @@ static bool metal_graph_batch_eval_logits(
         bench_fwd_only = getenv("DS4_BENCH_FWD_ONLY") != NULL ? 1 : 0;
     if (bench_fwd_only) return ok;   /* logits_out left stale; bench times only */
 
-    /* Per-row full-logit readback (mirrors the verify's logits_row path). */
-    for (uint32_t row = 0; ok && row < n; row++) {
+    /* Output head + full-logit readback.
+     *
+     * n == 1: keep the bit-identical per-row path -- this is the selftest oracle
+     *   (a separate eager decode the gates diff against), so it must not change.
+     * n  > 1: batch the vocab projection.  The per-row head pays one
+     *   begin/end/sync + Q8 weight load per row (Step 6: ~2.4 ms/row, ~32% of an
+     *   N=32 decode).  Instead run the batched head over chunks of up to
+     *   G=DS4_MULTISEQ_MAX_SEQ rows into g->batch_logits, collapsing N syncs to
+     *   ceil(n/G), then drain each chunk row into logits_out.  Same math as the
+     *   per-row head; the only delta is GEMM M=1-vs-M=N FP-selection noise, which
+     *   the gates already tolerate (argmax/top-k, d_self < 5.0). */
+    if (n == 1) {
         ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = metal_graph_encode_output_head_batch_row(g,
                                                               model,
                                                               weights,
-                                                              row,
+                                                              0u,
                                                               weights->output->dim[1],
                                                               false);
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
-        if (ok) ok = metal_graph_read_current_logits(g,
-                                                     logits_out + (uint64_t)row * DS4_N_VOCAB);
+        if (ok) ok = metal_graph_read_current_logits(g, logits_out);
+    } else {
+        const uint32_t G = (uint32_t)DS4_MULTISEQ_MAX_SEQ;
+        for (uint32_t base = 0; ok && base < n; base += G) {
+            uint32_t chunk = n - base;
+            if (chunk > G) chunk = G;
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_output_head_batch_into(g,
+                                                                  model,
+                                                                  weights,
+                                                                  base,
+                                                                  chunk,
+                                                                  weights->output->dim[1],
+                                                                  g->batch_logits);
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
+            for (uint32_t r = 0; ok && r < chunk; r++)
+                ok = metal_graph_read_logits_row_from(g,
+                                                      g->batch_logits,
+                                                      r,
+                                                      logits_out + (uint64_t)(base + r) * DS4_N_VOCAB);
+        }
     }
     if (ok) maybe_dump_first_logits(logits_out);   /* row-0 logits (Step-1 gate) */
     return ok;
