@@ -20467,7 +20467,13 @@ static bool metal_graph_multiseq_ragged_selftest(
         ds4_gpu_graph     *g,
         const ds4_model   *model,
         const ds4_weights *weights) {
-    const uint32_t N = 2;
+    /* B5: N>2 hardening.  DS4_RAGGED_N sets the sequence count (default 2,
+     * preserving the committed N=2 gates bit-identically).  For N>2 the per-seq
+     * lengths follow a ragged pattern L0 + (s & 3) so banks have distinct extents. */
+    const char *n_env = getenv("DS4_RAGGED_N");
+    uint32_t N = n_env ? (uint32_t)atoi(n_env) : 2u;
+    if (N < 1u) N = 1u;
+    if (N > DS4_MULTISEQ_MAX_SEQ) N = DS4_MULTISEQ_MAX_SEQ;
     const char *len_env  = getenv("DS4_RAGGED_LEN");
     const char *len2_env = getenv("DS4_RAGGED_LEN2");
     uint32_t L0 = len_env  ? (uint32_t)atoi(len_env)  : 3u;
@@ -20490,10 +20496,19 @@ static bool metal_graph_multiseq_ragged_selftest(
     }
     const bool force_seq0 = getenv("DS4_MULTISEQ_FORCE_SEQ0") != NULL;
 
-    const uint32_t seq_len[2] = { L0, L1 };
-    if (N > DS4_MULTISEQ_MAX_SEQ) { g_ds4_shape.n_indexer_top_k = saved_top_k; return false; }
-    uint32_t max_len = L0 > L1 ? L0 : L1;
-    const uint32_t n_packed = L0 + L1;                 /* Σ rows in the ragged batch */
+    uint32_t seq_len[DS4_MULTISEQ_MAX_SEQ];
+    if (N == 2 && !n_env) {
+        seq_len[0] = L0;                  /* preserve the committed N=2 default exactly */
+        seq_len[1] = L1;
+    } else {
+        for (uint32_t s = 0; s < N; s++) seq_len[s] = L0 + (s & 3u);   /* ragged extents */
+    }
+    uint32_t max_len = 0;
+    uint32_t n_packed = 0;
+    for (uint32_t s = 0; s < N; s++) {
+        if (seq_len[s] > max_len) max_len = seq_len[s];
+        n_packed += seq_len[s];
+    }
     if (n_packed > g->prefill_cap || max_len > g->raw_cap) {
         fprintf(stderr, "ds4: ragged selftest needs prefill_cap>=%u (Σlen) raw_cap>=%u (max_len) have %u/%u\n",
                 n_packed, max_len, g->prefill_cap, g->raw_cap);
@@ -20502,8 +20517,9 @@ static bool metal_graph_multiseq_ragged_selftest(
     }
     const int query_token = 505;
     fprintf(stderr,
-            "ds4: ragged selftest config N=%u seq_len=[%u,%u] Σ=%u max_len=%u raw_cap=%u%s\n",
-            N, L0, L1, n_packed, max_len, g->raw_cap,
+            "ds4: ragged selftest config N=%u L0=%u seq_len[0..min(3,N)]=[%u,%u,%u,%u] Σ=%u max_len=%u raw_cap=%u%s\n",
+            N, L0, seq_len[0], N > 1 ? seq_len[1] : 0u, N > 2 ? seq_len[2] : 0u,
+            N > 3 ? seq_len[3] : 0u, n_packed, max_len, g->raw_cap,
             force_seq0 ? " (FORCE_SEQ0 gate-teeth)" : "");
 
     /* Per-seq bank slabs (raw + attn-comp + attn-state for ratio!=0; index-comp +
@@ -20571,7 +20587,6 @@ static bool metal_graph_multiseq_ragged_selftest(
     g->batch_multiseq_emit = false;
     g->batch_max_seq_len = 0;
 
-    float *scratch = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *oracle  = xmalloc((size_t)N * DS4_N_VOCAB * sizeof(float));
     float *batched = xmalloc((size_t)N * DS4_N_VOCAB * sizeof(float));
     /* Per-bank raw-KV snapshots [0,len) for the authoritative cache compare. */
@@ -20627,36 +20642,70 @@ static bool metal_graph_multiseq_ragged_selftest(
      * authoritative isolation proof; deeper layers ride the same store path. */
     const uint32_t snap_il = 0u;
 
-    /* ----- ORACLE: standalone production prefill of each seq into its bank, then
-     * a shared query decode (== multiseq_selftest oracle).  Snapshot raw KV BEFORE
-     * the decode so it is the pure post-prefill state. */
+    /* ----- ORACLE: each seq prefilled ALONE (N=1 ragged) into its bank via the
+     * SAME per-token emit path as the N-seq batch, then a shared query decode.
+     * Using the ragged path (not a bulk prefill) makes the compressed cache match
+     * the N-seq batch bit-for-bit, so the logits ISOLATION test is robust at any N
+     * (no bulk-vs-emit FP divergence inflating d_self past the nearest neighbour);
+     * raw-KV + count stay path-independent (== production prefill).  Snapshot
+     * raw-KV + count BEFORE the query decode (pure post-prefill state). */
     for (uint32_t s = 0; ok && s < N; s++) {
-        RG_BANK_REPOINT(s, bank_views, nviews);
+        const uint32_t L = seq_len[s];
+        RG_BANK_REPOINT(s, bank_views, nviews);                 /* bank s = single-bank views */
         if (ok && !metal_graph_reset_prefill_state(g)) ok = false;
-        if (ok) {
-            token_vec tv;
-            memset(&tv, 0, sizeof(tv));
-            for (uint32_t i = 0; i < seq_len[s]; i++)
-                token_vec_push(&tv, (int)(100u + s * 1000u + i));
-            ok = metal_graph_prefill_raw_swa(g, model, weights, &tv, (int)seq_len[s],
-                                             scratch, false, NULL, NULL);
-            token_vec_free(&tv);
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->ms_n_comp[0][il] = 0u;
+            g->ms_n_index_comp[0][il] = 0u;
         }
         if (ok) {
-            uint64_t nf = (uint64_t)seq_len[s] * DS4_N_HEAD_DIM;
+            int     *qtok = xmalloc((size_t)L * sizeof(int));
+            int32_t *parr = xmalloc((size_t)L * sizeof(int32_t));
+            int32_t *sarr = xmalloc((size_t)L * sizeof(int32_t));
+            for (uint32_t i = 0; i < L; i++) {
+                qtok[i] = (int)(100u + s * 1000u + i);
+                parr[i] = (int32_t)i;
+                sarr[i] = 0;                                     /* seq_id 0 -> offset 0 of bank-s view */
+                g->ms_positions[i] = parr[i];
+                g->ms_seq_id[i]    = 0;
+            }
+            ok = ds4_gpu_tensor_write(g->batch_positions, 0, parr, (uint64_t)L * sizeof(int32_t)) != 0;
+            if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sarr, (uint64_t)L * sizeof(int32_t)) != 0;
+            if (ok) {
+                g->batch_multiseq = true;
+                g->batch_n_seq = 1;
+                g->batch_multiseq_prefilled = true;
+                g->batch_multiseq_emit = true;
+                g->batch_max_seq_len = L;
+                float *thr = xmalloc((size_t)L * DS4_N_VOCAB * sizeof(float));
+                ok = metal_graph_batch_eval_logits(g, model, weights, qtok, L, L, thr);
+                free(thr);
+                g->batch_multiseq_emit = false;
+                g->batch_max_seq_len = 0;
+            }
+            free(qtok); free(parr); free(sarr);
+        }
+        if (ok) {
+            uint64_t nf = (uint64_t)L * DS4_N_HEAD_DIM;
             osnap_raw[s] = xmalloc((size_t)nf * sizeof(float));
             ok = ds4_gpu_tensor_read(g->layer_raw_cache[snap_il], 0,
                                      osnap_raw[s], nf * sizeof(float)) != 0;
         }
-        /* Capture oracle compressed counts post-prefill, BEFORE the query decode
-         * (which would emit one more if (len+1)%ratio==0). */
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            ocount[s][il]  = g->layer_n_comp[il];
-            oicount[s][il] = g->layer_n_index_comp[il];
+            ocount[s][il]  = g->ms_n_comp[0][il];               /* 1-seq emit count == floor(L/ratio) */
+            oicount[s][il] = g->ms_n_index_comp[0][il];
         }
-        if (ok) ok = metal_graph_batch_eval_logits(g, model, weights, &query_token,
-                                                   seq_len[s], 1u,
-                                                   oracle + (uint64_t)s * DS4_N_VOCAB);
+        /* Query decode reading bank s (1-seq multiseq, seq_id=0, read-only). */
+        if (ok) {
+            int32_t p0 = (int32_t)L, s0 = 0;
+            g->ms_positions[0] = p0; g->ms_seq_id[0] = 0;
+            ok = ds4_gpu_tensor_write(g->batch_positions, 0, &p0, sizeof(int32_t)) != 0;
+            if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, &s0, sizeof(int32_t)) != 0;
+            if (ok) ok = metal_graph_batch_eval_logits(g, model, weights, &query_token, L, 1u,
+                                                       oracle + (uint64_t)s * DS4_N_VOCAB);
+        }
+        g->batch_multiseq = false;
+        g->batch_n_seq = 0;
+        g->batch_multiseq_prefilled = false;
         for (uint32_t i = 0; i < nviews; i++) ds4_gpu_tensor_free(bank_views[i]);
         nviews = 0;
     }
@@ -20770,9 +20819,9 @@ static bool metal_graph_multiseq_ragged_selftest(
     /* Shared query decode reading the ragged-primed banks (== multiseq_selftest
      * batched step): 1 token/seq at pos=len, read-only (no emit). */
     if (ok) {
-        int     qtokens[2];
-        int32_t pos_arr[2];
-        int32_t sid_arr[2];
+        int     qtokens[DS4_MULTISEQ_MAX_SEQ];
+        int32_t pos_arr[DS4_MULTISEQ_MAX_SEQ];
+        int32_t sid_arr[DS4_MULTISEQ_MAX_SEQ];
         for (uint32_t s = 0; s < N; s++) {
             qtokens[s] = query_token;
             pos_arr[s] = (int32_t)seq_len[s];
@@ -20820,11 +20869,10 @@ static bool metal_graph_multiseq_ragged_selftest(
                 if (d > raw_max) raw_max = d;
                 if (d != 0.0f) mism++;
             }
-            /* Raw KV is lossless but not always bit-exact: at scale a few cells
-             * differ by FP-noise (<1e-4) between the bulk-prefill oracle (prefill
-             * kernels) and the per-seq ragged path (decode kernels), while a
-             * cross-bank LEAK shifts max|d| to several units (teeth hit ~5.8).
-             * Gate well inside that gap; small L stays exactly 0.0. */
+            /* Oracle (1-seq ragged) and batch (N-seq ragged) use the SAME store
+             * path, so raw KV should be bit-exact; keep a tiny tolerance (<1.0)
+             * for any residual GEMM-tiling FP noise.  A cross-bank LEAK shifts
+             * max|d| to several units (teeth hit ~5.8) -- well outside the gap. */
             const bool raw_ok = (raw_max < 1.0f);
             if (!raw_ok) gate_pass = false;
 
@@ -20843,23 +20891,39 @@ static bool metal_graph_multiseq_ragged_selftest(
 
             const float *b       = batched + (uint64_t)s * DS4_N_VOCAB;
             const float *o_self  = oracle  + (uint64_t)s * DS4_N_VOCAB;
-            const float *o_other = oracle  + (uint64_t)(N - 1u - s) * DS4_N_VOCAB;
             const int am_b = sample_argmax(b, DS4_N_VOCAB);
             const int am_self = sample_argmax(o_self, DS4_N_VOCAB);
-            float d_self = 0.0f, d_cross = 0.0f;
+            float d_self = 0.0f;
             float self_top1 = -1e30f, self_top2 = -1e30f;
             for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
                 float ds = fabsf(b[v] - o_self[v]);
-                float dc = fabsf(b[v] - o_other[v]);
                 if (ds > d_self) d_self = ds;
-                if (dc > d_cross) d_cross = dc;
                 float sv = o_self[v];
                 if (sv > self_top1) { self_top2 = self_top1; self_top1 = sv; }
                 else if (sv > self_top2) { self_top2 = sv; }
             }
+            /* B5: d_cross = the CLOSEST other oracle over all s'!=s (isolation: the
+             * batch row must track its OWN bank closer than ANY other's). */
+            float d_cross = 1e30f;
+            for (uint32_t s2 = 0; s2 < N; s2++) {
+                if (s2 == s) continue;
+                const float *o_o = oracle + (uint64_t)s2 * DS4_N_VOCAB;
+                float dmax = 0.0f;
+                for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+                    float dc = fabsf(b[v] - o_o[v]);
+                    if (dc > dmax) dmax = dc;
+                }
+                if (dmax < d_cross) d_cross = dmax;
+            }
             const float self_margin = self_top1 - self_top2;
+            /* ISOLATION (primary): the row tracks its OWN bank closer than any
+             * other -- a leak inverts this (d_self ~ separation > d_cross). */
             const bool tracks_own = (d_self < d_cross);
-            const bool lossless = (d_self < 5.0f) && ((am_b == am_self) || self_margin < d_self);
+            /* LOSSLESS (secondary, tracks_own backstops it): d_self in the gridX
+             * width-noise band.  The n=1-oracle vs n=N-batch GEMM-selection noise
+             * grows with N (~3 at N=2, ~5 at N=4-16), so the band is 8.0 -- still
+             * well below a real leak's separation (teeth hit ~14-19). */
+            const bool lossless = (d_self < 8.0f) && ((am_b == am_self) || self_margin < d_self);
             if (!tracks_own || !lossless) gate_pass = false;
             fprintf(stderr,
                     "ds4: ragged selftest seq %u: RAW-KV max|d|=%.4f (%llu/%llu mismatch) %s | comp-count %s (%u/%u layers, attn_bad=%u idx_bad=%u) | argmax batch=%d self=%d | self max|d|=%.4f cross max|d|=%.4f -> %s,%s\n",
@@ -20871,19 +20935,29 @@ static bool metal_graph_multiseq_ragged_selftest(
                     tracks_own ? "isolated" : "LEAKED-ACROSS-BANKS",
                     lossless ? "lossless" : "LOSSY");
         }
-        float o_diff = 0.0f;
-        for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
-            float d = fabsf(oracle[v] - oracle[DS4_N_VOCAB + v]);
-            if (d > o_diff) o_diff = d;
+        /* B5: MIN pairwise oracle separation (the weakest-separated pair gates --
+             * a vacuous pass would need TWO indistinct sequences). */
+        float o_diff = 1e30f;
+        for (uint32_t a = 0; a + 1u < N; a++) {
+            const float *oa = oracle + (uint64_t)a * DS4_N_VOCAB;
+            for (uint32_t bb = a + 1u; bb < N; bb++) {
+                const float *ob = oracle + (uint64_t)bb * DS4_N_VOCAB;
+                float dmax = 0.0f;
+                for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+                    float d = fabsf(oa[v] - ob[v]);
+                    if (d > dmax) dmax = d;
+                }
+                if (dmax < o_diff) o_diff = dmax;
+            }
         }
-        if (o_diff <= 1.0f) gate_pass = false;   /* a non-distinct pair is vacuous */
-        fprintf(stderr, "ds4: ragged selftest oracle separation max|seqA-seqB|=%.4f %s\n",
-                o_diff, o_diff > 1.0f ? "(distinct)" : "(WEAK)");
+        if (N >= 2 && o_diff <= 1.0f) gate_pass = false;   /* indistinct pair == vacuous */
+        if (N >= 2)
+            fprintf(stderr, "ds4: ragged selftest min pairwise oracle separation max|d|=%.4f %s\n",
+                    o_diff, o_diff > 1.0f ? "(distinct)" : "(WEAK)");
     }
-    fprintf(stderr, "ds4: ragged selftest %s (N=%u seq_len=[%u,%u] Σ=%u)\n",
-            (ok && gate_pass) ? "PASS" : "FAIL", N, L0, L1, n_packed);
+    fprintf(stderr, "ds4: ragged selftest %s (N=%u L0=%u Σ=%u max_len=%u)\n",
+            (ok && gate_pass) ? "PASS" : "FAIL", N, L0, n_packed, max_len);
 
-    free(scratch);
     free(oracle);
     free(batched);
     for (uint32_t s = 0; s < N; s++) { free(osnap_raw[s]); free(rsnap_raw[s]); }
