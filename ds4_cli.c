@@ -48,6 +48,7 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    const char *batch_prompts_file;   /* W1: one prompt per line -> batched generate */
 } cli_generation_options;
 
 typedef struct {
@@ -219,6 +220,10 @@ static void usage(FILE *fp) {
         "Diagnostics:\n"
         "  --inspect\n"
         "      Load the model and print a summary only.\n"
+        "  --batch FILE\n"
+        "      Batched greedy generation: one prompt per line, ragged-prefilled +\n"
+        "      batch-decoded in a single forward (compact-on-finish). Use -n for the\n"
+        "      per-sequence token budget. Graph backend only (--cuda/--metal).\n"
         "  --dump-tokens\n"
         "      Tokenize -p/--prompt-file exactly as written, then exit without inference.\n"
         "  --dump-logits FILE\n"
@@ -350,6 +355,7 @@ static double cli_now_sec(void) {
 }
 
 static char *read_prompt_file(const char *path, bool fatal);
+static char *trim_inplace(char *s);
 
 typedef struct {
     int base_tokens;
@@ -1020,6 +1026,64 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     return 0;
 }
 
+/* W1: batched greedy generation from a prompts file (one prompt per line).  Each
+ * line is rendered as a chat prompt, all are ragged-prefilled + batch-decoded in
+ * one ds4_engine_batched_generate call (compact-on-finish), and each completion
+ * is printed.  Greedy (temp 0); a serving-shaped smoke test for the W1 API. */
+#define DS4_CLI_BATCH_MAX 128
+static int run_batch_generate(ds4_engine *engine, const cli_config *cfg) {
+    char *content = read_prompt_file(cfg->gen.batch_prompts_file, false);
+    if (!content) return 1;
+
+    ds4_tokens prompts[DS4_CLI_BATCH_MAX];
+    int n = 0;
+    const ds4_think_mode tm = cli_effective_think_mode(&cfg->gen);
+    char *save = NULL;
+    for (char *line = strtok_r(content, "\n", &save); line && n < DS4_CLI_BATCH_MAX;
+         line = strtok_r(NULL, "\n", &save)) {
+        char *t = trim_inplace(line);
+        if (!*t) continue;
+        ds4_tokens toks = {0};
+        ds4_encode_chat_prompt(engine, cfg->gen.system, t, tm, &toks);
+        if (toks.len > 0) prompts[n++] = toks; else ds4_tokens_free(&toks);
+    }
+    free(content);
+    if (n == 0) {
+        fprintf(stderr, "ds4: --batch file had no usable prompts (cap %d)\n", DS4_CLI_BATCH_MAX);
+        return 1;
+    }
+    fprintf(stderr, "ds4: batched generate: %d prompts, max_new=%d ctx=%d\n",
+            n, cfg->gen.n_predict, cfg->gen.ctx_size);
+
+    ds4_batch_gen_options opts = {
+        .max_new_tokens = cfg->gen.n_predict > 0 ? cfg->gen.n_predict : 64,
+        .eos_id = ds4_token_eos(engine),
+    };
+    ds4_batch_gen_result *res = calloc((size_t)n, sizeof(*res));
+    char err[256] = {0};
+    int rc = res ? ds4_engine_batched_generate(engine, prompts, n, cfg->gen.ctx_size,
+                                               &opts, res, err, sizeof(err)) : 1;
+    if (rc != 0) {
+        fprintf(stderr, "ds4: batched_generate failed: %s\n", err[0] ? err : "out of memory");
+    } else {
+        const int eos = ds4_token_eos(engine);
+        for (int i = 0; i < n; i++) {
+            printf("=== seq %d (%s, %d tok) ===\n", i,
+                   res[i].finish ? "eos" : "budget", res[i].n_tokens);
+            for (int k = 0; k < res[i].n_tokens; k++) {
+                if (res[i].tokens[k] == eos) break;
+                size_t plen = 0;
+                char *piece = ds4_token_text(engine, res[i].tokens[k], &plen);
+                if (piece) { fwrite(piece, 1, plen, stdout); free(piece); }
+            }
+            printf("\n");
+        }
+    }
+    for (int i = 0; i < n; i++) { if (res) free(res[i].tokens); ds4_tokens_free(&prompts[i]); }
+    free(res);
+    return rc;
+}
+
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
@@ -1682,6 +1746,8 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--metal-graph-full-test")) {
             c.gen.metal_graph_full_test = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--batch")) {
+            c.gen.batch_prompts_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
             c.gen.metal_graph_prompt_test = true;
             c.engine.backend = DS4_BACKEND_METAL;
@@ -1785,6 +1851,8 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
+    } else if (cfg.gen.batch_prompts_file) {
+        rc = run_batch_generate(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {

@@ -163,6 +163,26 @@ int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
                                void *emit_ud,
                                ds4_session_progress_fn progress,
                                void *progress_ud);
+
+/* Phase 2 W1: batched greedy generation.  Ragged-prefills `n` prompts in one
+ * forward, then batch-decodes all sequences with compact-on-finish.  Each
+ * out[i].tokens is a malloc'd stream the CALLER must free(); out[i].finish is 1
+ * when the sequence hit EOS, 0 when it hit the token budget. */
+typedef struct {
+    int max_new_tokens;   /* per-sequence decode budget (>=1) */
+    int eos_id;           /* sequence-ending token; <0 => engine default */
+} ds4_batch_gen_options;
+
+typedef struct {
+    int *tokens;          /* malloc'd generated tokens; caller frees */
+    int  n_tokens;        /* count generated (<= max_new_tokens) */
+    int  finish;          /* 1 = hit EOS, 0 = hit budget */
+} ds4_batch_gen_result;
+
+int ds4_engine_batched_generate(ds4_engine *e, const ds4_tokens *prompts, int n,
+                                int ctx_size, const ds4_batch_gen_options *opts,
+                                ds4_batch_gen_result *out,
+                                char *err, size_t errlen);
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
                                const char *output_path,

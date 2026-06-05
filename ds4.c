@@ -22038,6 +22038,688 @@ static bool metal_graph_multiseq_generate(
     return ok;
 }
 
+/* ===================================================================== *
+ * Phase 2 W1: batched generation (ragged-prefill + compact-on-finish).
+ *
+ * Promotes the env-gated ragged-prefill selftest + G8 generate driver into a
+ * reusable serving primitive: a persistent N-bank slab set that ragged-prefills
+ * N prompts of DIFFERENT lengths in ONE forward, seeds each seq's first token
+ * from its last prompt-row logits, then batch-decodes all active sequences in
+ * lockstep -- dropping (compacting) a row the instant its sequence finishes.
+ *
+ * ds4_batch_slabs factors the N-bank alloc + the single/full repoint (the
+ * RG_BANK_REPOINT / GEN_REPOINT macros) into one allocation path that W1/W2/W3
+ * share.  Repoint installs single-bank views (bank_count==1, for per-seq prefill
+ * or the per-seq reference) or the full N-bank slab (bank_count==N, for batched
+ * decode); the byte math is identical to the proven selftest.
+ * ===================================================================== */
+typedef struct {
+    uint32_t        N;
+    uint64_t        raw_bank_bytes;
+    uint64_t        comp_bank_bytes[DS4_MAX_LAYER];
+    uint64_t        index_bank_bytes[DS4_MAX_LAYER];
+    uint64_t        astate_bank_bytes[DS4_MAX_LAYER];
+    uint64_t        istate_bank_bytes[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_index[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_askv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_assc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_iskv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_issc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_askv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_assc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_iskv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_issc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cur_views[DS4_MAX_LAYER * 7];
+    uint32_t        n_cur_views;
+} ds4_batch_slabs;
+
+/* Allocate N per-seq KV banks (raw + attn-comp + attn-state for ratio!=0; index
+ * banks additionally for ratio==4) and snapshot the graph's current single-seq
+ * cache pointers so ds4_batch_slabs_free can restore them.  Mirrors the byte math
+ * in metal_graph_multiseq_ragged_selftest / metal_graph_multiseq_generate. */
+static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_t N) {
+    memset(sl, 0, sizeof(*sl));
+    sl->N = N;
+    sl->raw_bank_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        sl->saved_raw[il]   = g->layer_raw_cache[il];
+        sl->saved_comp[il]  = g->layer_attn_comp_cache[il];
+        sl->saved_index[il] = g->layer_index_comp_cache[il];
+        sl->saved_askv[il]  = g->layer_attn_state_kv[il];
+        sl->saved_assc[il]  = g->layer_attn_state_score[il];
+        sl->saved_iskv[il]  = g->layer_index_state_kv[il];
+        sl->saved_issc[il]  = g->layer_index_state_score[il];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t coff  = ratio == 4u ? 2u : 1u;
+        sl->comp_bank_bytes[il]   = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
+        sl->index_bank_bytes[il]  = (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        sl->astate_bank_bytes[il] = (uint64_t)(coff * (ratio ? ratio : 1u)) *
+                                    (uint64_t)(coff * DS4_N_HEAD_DIM) * sizeof(float);
+        sl->istate_bank_bytes[il] = (uint64_t)(coff * (ratio ? ratio : 1u)) *
+                                    (uint64_t)(coff * DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
+    }
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        sl->multi_raw[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->raw_bank_bytes);
+        ok = sl->multi_raw[il] != NULL;
+        if (ok && ratio != 0 && sl->saved_comp[il]) {
+            sl->multi_comp[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->comp_bank_bytes[il]);
+            sl->multi_askv[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
+            sl->multi_assc[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
+            ok = sl->multi_comp[il] && sl->multi_askv[il] && sl->multi_assc[il];
+        }
+        if (ok && ratio == 4 && sl->saved_index[il]) {
+            sl->multi_index[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->index_bank_bytes[il]);
+            sl->multi_iskv[il]  = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
+            sl->multi_issc[il]  = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
+            ok = sl->multi_index[il] && sl->multi_iskv[il] && sl->multi_issc[il];
+        }
+    }
+    return ok;
+}
+
+/* Free any currently-installed views (the previous repoint) WITHOUT restoring
+ * the saved single-seq pointers.  Call before re-pointing or freeing. */
+static void ds4_batch_slabs_unpoint(ds4_batch_slabs *sl) {
+    for (uint32_t i = 0; i < sl->n_cur_views; i++)
+        if (sl->cur_views[i]) ds4_gpu_tensor_free(sl->cur_views[i]);
+    sl->n_cur_views = 0;
+}
+
+/* Install views over banks [bank_lo, bank_lo+bank_count) into g->layer_*.
+ * bank_count==1 => one per-seq bank; bank_count==N => the full slab (batched).
+ * Frees the prior view set first; the new set is owned by sl (freed on unpoint
+ * or free).  Returns false (and leaves ok-state) on view-alloc failure. */
+static bool ds4_batch_slabs_repoint(ds4_batch_slabs *sl, ds4_gpu_graph *g,
+                                    uint32_t bank_lo, uint32_t bank_count) {
+    ds4_batch_slabs_unpoint(sl);
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor *vr = ds4_gpu_tensor_view(sl->multi_raw[il],
+                (uint64_t)bank_lo * sl->raw_bank_bytes,
+                (uint64_t)bank_count * sl->raw_bank_bytes);
+        if (!vr) { ok = false; break; }
+        sl->cur_views[sl->n_cur_views++] = vr; g->layer_raw_cache[il] = vr;
+        if (sl->multi_comp[il]) {
+            ds4_gpu_tensor *vc = ds4_gpu_tensor_view(sl->multi_comp[il],
+                    (uint64_t)bank_lo * sl->comp_bank_bytes[il],
+                    (uint64_t)bank_count * sl->comp_bank_bytes[il]);
+            ds4_gpu_tensor *vk = ds4_gpu_tensor_view(sl->multi_askv[il],
+                    (uint64_t)bank_lo * sl->astate_bank_bytes[il],
+                    (uint64_t)bank_count * sl->astate_bank_bytes[il]);
+            ds4_gpu_tensor *vs = ds4_gpu_tensor_view(sl->multi_assc[il],
+                    (uint64_t)bank_lo * sl->astate_bank_bytes[il],
+                    (uint64_t)bank_count * sl->astate_bank_bytes[il]);
+            if (!vc || !vk || !vs) {
+                ok = false;
+                if (vc) ds4_gpu_tensor_free(vc);
+                if (vk) ds4_gpu_tensor_free(vk);
+                if (vs) ds4_gpu_tensor_free(vs);
+                break;
+            }
+            sl->cur_views[sl->n_cur_views++] = vc; g->layer_attn_comp_cache[il]  = vc;
+            sl->cur_views[sl->n_cur_views++] = vk; g->layer_attn_state_kv[il]    = vk;
+            sl->cur_views[sl->n_cur_views++] = vs; g->layer_attn_state_score[il] = vs;
+        }
+        if (sl->multi_index[il]) {
+            ds4_gpu_tensor *vi  = ds4_gpu_tensor_view(sl->multi_index[il],
+                    (uint64_t)bank_lo * sl->index_bank_bytes[il],
+                    (uint64_t)bank_count * sl->index_bank_bytes[il]);
+            ds4_gpu_tensor *vik = ds4_gpu_tensor_view(sl->multi_iskv[il],
+                    (uint64_t)bank_lo * sl->istate_bank_bytes[il],
+                    (uint64_t)bank_count * sl->istate_bank_bytes[il]);
+            ds4_gpu_tensor *vis = ds4_gpu_tensor_view(sl->multi_issc[il],
+                    (uint64_t)bank_lo * sl->istate_bank_bytes[il],
+                    (uint64_t)bank_count * sl->istate_bank_bytes[il]);
+            if (!vi || !vik || !vis) {
+                ok = false;
+                if (vi)  ds4_gpu_tensor_free(vi);
+                if (vik) ds4_gpu_tensor_free(vik);
+                if (vis) ds4_gpu_tensor_free(vis);
+                break;
+            }
+            sl->cur_views[sl->n_cur_views++] = vi;  g->layer_index_comp_cache[il]  = vi;
+            sl->cur_views[sl->n_cur_views++] = vik; g->layer_index_state_kv[il]    = vik;
+            sl->cur_views[sl->n_cur_views++] = vis; g->layer_index_state_score[il] = vis;
+        }
+    }
+    return ok;
+}
+
+/* Restore the graph's original single-seq cache pointers and free the slabs. */
+static void ds4_batch_slabs_free(ds4_batch_slabs *sl, ds4_gpu_graph *g) {
+    ds4_batch_slabs_unpoint(sl);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_raw_cache[il]         = sl->saved_raw[il];
+        g->layer_attn_comp_cache[il]   = sl->saved_comp[il];
+        g->layer_index_comp_cache[il]  = sl->saved_index[il];
+        g->layer_attn_state_kv[il]     = sl->saved_askv[il];
+        g->layer_attn_state_score[il]  = sl->saved_assc[il];
+        g->layer_index_state_kv[il]    = sl->saved_iskv[il];
+        g->layer_index_state_score[il] = sl->saved_issc[il];
+        if (sl->multi_raw[il])   ds4_gpu_tensor_free(sl->multi_raw[il]);
+        if (sl->multi_comp[il])  ds4_gpu_tensor_free(sl->multi_comp[il]);
+        if (sl->multi_index[il]) ds4_gpu_tensor_free(sl->multi_index[il]);
+        if (sl->multi_askv[il])  ds4_gpu_tensor_free(sl->multi_askv[il]);
+        if (sl->multi_assc[il])  ds4_gpu_tensor_free(sl->multi_assc[il]);
+        if (sl->multi_iskv[il])  ds4_gpu_tensor_free(sl->multi_iskv[il]);
+        if (sl->multi_issc[il])  ds4_gpu_tensor_free(sl->multi_issc[il]);
+    }
+    memset(sl, 0, sizeof(*sl));
+}
+
+/* Core batched generation over a caller-owned graph.  Ragged-prefills the N
+ * prompts (token arrays prompt_tok[s][0..prompt_len[s])) in ONE forward, seeds
+ * each seq's first token, then batch-decodes with compact-on-finish until every
+ * sequence stops (EOS when eos_id>=0, or its per-seq budget max_new).  Writes
+ * gen[s*max_new + 0..genlen[s]) (first token included) + fin[s] (1==EOS).  The
+ * graph is restored to its original single-seq state on return.  Reusable: the
+ * same g can be called repeatedly (e.g. the per-seq N=1 reference, then the
+ * N-seq batch).  Returns true on success. */
+static bool ds4_batch_generate_core(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int        **prompt_tok,
+        const uint32_t    *prompt_len,
+        uint32_t           N,
+        uint32_t           max_new,
+        int                eos_id,
+        int               *gen,        /* N * max_new */
+        uint32_t          *genlen,     /* N */
+        uint8_t           *fin) {      /* N, 1 == hit EOS */
+    if (N == 0u || max_new == 0u) return false;
+    if (N > (uint32_t)DS4_MULTISEQ_MAX_SEQ) return false;
+
+    uint32_t max_len = 0u, n_packed = 0u;
+    for (uint32_t s = 0; s < N; s++) {
+        if (prompt_len[s] == 0u) { fprintf(stderr, "ds4: batch gen seq %u empty\n", s); return false; }
+        if (prompt_len[s] > max_len) max_len = prompt_len[s];
+        n_packed += prompt_len[s];
+        genlen[s] = 0u;
+        fin[s] = 0u;
+    }
+    if (n_packed > g->prefill_cap || max_len > g->raw_cap) {
+        fprintf(stderr, "ds4: batch gen needs prefill_cap>=%u (Σlen) raw_cap>=%u (max_len) have %u/%u\n",
+                n_packed, max_len, g->prefill_cap, g->raw_cap);
+        return false;
+    }
+
+    ds4_batch_slabs sl;
+    if (!ds4_batch_slabs_alloc(&sl, g, N)) {
+        fprintf(stderr, "ds4: batch gen slab alloc failed (N=%u)\n", N);
+        ds4_batch_slabs_free(&sl, g);
+        return false;
+    }
+
+    g->batch_multiseq = false;
+    g->batch_n_seq = 0;
+    g->batch_multiseq_prefilled = false;
+    g->batch_multiseq_emit = false;
+    g->batch_max_seq_len = 0;
+
+    bool ok = true;
+
+    /* --- reset every bank to empty + zero its per-seq compressor counts. --- */
+    for (uint32_t s = 0; ok && s < N; s++) {
+        ok = ds4_batch_slabs_repoint(&sl, g, s, 1u);
+        if (ok && !metal_graph_reset_prefill_state(g)) ok = false;
+    }
+    ds4_batch_slabs_unpoint(&sl);
+    for (uint32_t s = 0; s < N; s++)
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->ms_n_comp[s][il] = 0u;
+            g->ms_n_index_comp[s][il] = 0u;
+        }
+
+    /* --- repoint the FULL N-bank slab; the emit branch banks by seq_id. --- */
+    if (ok) ok = ds4_batch_slabs_repoint(&sl, g, 0u, N);
+    if (ok)
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->layer_n_comp[il] = 0u;
+            g->layer_n_index_comp[il] = 0u;
+        }
+
+    int *cur = ok ? xmalloc((size_t)N * sizeof(int)) : NULL;        /* next input token / seq */
+    uint32_t *posv = ok ? xmalloc((size_t)N * sizeof(uint32_t)) : NULL; /* current position / seq */
+    if (ok && (!cur || !posv)) ok = false;
+
+    /* --- ONE ragged prefill: pack rows seq-contiguous + position-ascending. --- */
+    if (ok) {
+        int     *qtokens = xmalloc((size_t)n_packed * sizeof(int));
+        int32_t *pos_arr = xmalloc((size_t)n_packed * sizeof(int32_t));
+        int32_t *sid_arr = xmalloc((size_t)n_packed * sizeof(int32_t));
+        float   *pf_logits = xmalloc((size_t)n_packed * DS4_N_VOCAB * sizeof(float));
+        if (!qtokens || !pos_arr || !sid_arr || !pf_logits) ok = false;
+        uint32_t t = 0;
+        for (uint32_t s = 0; ok && s < N; s++)
+            for (uint32_t i = 0; i < prompt_len[s]; i++) {
+                qtokens[t] = prompt_tok[s][i];
+                pos_arr[t] = (int32_t)i;
+                sid_arr[t] = (int32_t)s;
+                g->ms_positions[t] = pos_arr[t];
+                g->ms_seq_id[t]    = sid_arr[t];
+                t++;
+            }
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)n_packed * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)n_packed * sizeof(int32_t)) != 0;
+        if (ok) {
+            g->batch_multiseq = true;
+            g->batch_n_seq = N;
+            g->batch_multiseq_prefilled = true;
+            g->batch_multiseq_emit = true;
+            g->batch_max_seq_len = max_len;
+            ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, max_len, n_packed, pf_logits);
+            g->batch_multiseq_emit = false;
+            g->batch_max_seq_len = 0;
+        }
+        /* Seed each seq's first token from its LAST prompt-row logits. */
+        if (ok) {
+            uint32_t base = 0;
+            for (uint32_t s = 0; s < N; s++) {
+                const uint32_t last = base + prompt_len[s] - 1u;
+                const int nt = sample_argmax(pf_logits + (uint64_t)last * DS4_N_VOCAB, DS4_N_VOCAB);
+                gen[(size_t)s * max_new + 0] = nt;
+                genlen[s] = 1u;
+                cur[s] = nt;
+                posv[s] = prompt_len[s];
+                if (eos_id >= 0 && nt == eos_id) fin[s] = 1u;
+                base += prompt_len[s];
+            }
+        }
+        free(qtokens); free(pos_arr); free(sid_arr); free(pf_logits);
+    }
+
+    /* --- decode loop with compact-on-finish.  active[] holds the still-running
+     * bank indices, re-packed to [0,n_active) each step; banks stay in place
+     * (a finished bank simply stops being decoded).  batch_n_seq stays N so the
+     * scalar read-window max covers every bank. --- */
+    uint32_t steps = 0;
+    double decode_ms = 0.0;
+    if (ok) {
+        uint32_t active[DS4_MULTISEQ_MAX_SEQ];
+        uint32_t n_active = 0;
+        for (uint32_t s = 0; s < N; s++)
+            if (!fin[s] && genlen[s] < max_new) active[n_active++] = s;
+
+        float   *logits = xmalloc((size_t)N * DS4_N_VOCAB * sizeof(float));
+        int      qtokens[DS4_MULTISEQ_MAX_SEQ];
+        int32_t  pos_arr[DS4_MULTISEQ_MAX_SEQ];
+        int32_t  sid_arr[DS4_MULTISEQ_MAX_SEQ];
+        if (!logits) ok = false;
+
+        g->batch_multiseq = true;
+        g->batch_n_seq = N;
+        g->batch_multiseq_prefilled = true;
+        g->batch_multiseq_emit = true;
+        const double t0 = now_sec();
+        while (ok && n_active > 0u) {
+            /* Refresh the scalar read-count to the per-seq max over all banks
+             * (the compressor emitted new rows last step). */
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                uint32_t mc = 0, mi = 0;
+                for (uint32_t s = 0; s < N; s++) {
+                    if (g->ms_n_comp[s][il] > mc) mc = g->ms_n_comp[s][il];
+                    if (g->ms_n_index_comp[s][il] > mi) mi = g->ms_n_index_comp[s][il];
+                }
+                g->layer_n_comp[il] = mc;
+                g->layer_n_index_comp[il] = mi;
+            }
+            uint32_t maxpos = 0;
+            for (uint32_t k = 0; k < n_active; k++) {
+                const uint32_t s = active[k];
+                qtokens[k] = cur[s];
+                pos_arr[k] = (int32_t)posv[s];
+                sid_arr[k] = (int32_t)s;
+                g->ms_positions[k] = pos_arr[k];
+                g->ms_seq_id[k]    = sid_arr[k];
+                if (posv[s] > maxpos) maxpos = posv[s];
+            }
+            ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)n_active * sizeof(int32_t)) != 0;
+            if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)n_active * sizeof(int32_t)) != 0;
+            if (ok) ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, maxpos, n_active, logits);
+            if (!ok) break;
+            steps++;
+            /* Sample, append, advance, then stable-compact the active list. */
+            uint32_t w = 0;
+            for (uint32_t k = 0; k < n_active; k++) {
+                const uint32_t s = active[k];
+                const int nt = sample_argmax(logits + (uint64_t)k * DS4_N_VOCAB, DS4_N_VOCAB);
+                gen[(size_t)s * max_new + genlen[s]] = nt;
+                genlen[s]++;
+                cur[s] = nt;
+                posv[s]++;
+                const bool eos = (eos_id >= 0 && nt == eos_id);
+                if (eos) fin[s] = 1u;
+                const bool stop = eos || genlen[s] >= max_new;
+                if (!stop) active[w++] = s;
+            }
+            n_active = w;
+        }
+        decode_ms = (now_sec() - t0) * 1000.0;
+        g->batch_multiseq = false;
+        g->batch_n_seq = 0;
+        g->batch_multiseq_prefilled = false;
+        g->batch_multiseq_emit = false;
+        if (logits) free(logits);
+    }
+
+    if (ok && getenv("DS4_BATCH_GEN_TIMING")) {
+        const double rows = (double)steps * (double)N;
+        fprintf(stderr, "ds4: batch gen core N=%u steps=%u decode=%.1f ms (%.1f tok/s agg, prefill Σ=%u)\n",
+                N, steps, decode_ms, decode_ms > 0 ? rows * 1000.0 / decode_ms : 0.0, n_packed);
+    }
+
+    ds4_batch_slabs_free(&sl, g);
+    if (cur)  free(cur);
+    if (posv) free(posv);
+    return ok;
+}
+
+/* Env-gated W1 determinism gate (DS4_BATCH_GEN): the multi-step, compaction-aware
+ * extension of the ragged-prefill gate.  N distinct synthetic prompts (ragged
+ * lengths) are (1) generated ALONE (N=1) to fix a per-seq reference trajectory +
+ * per-step reference logits, then (2) re-run BATCHED, TEACHER-FORCED along that
+ * exact trajectory, comparing each batch row's logits to its own reference at
+ * the SAME step.  Teacher forcing is essential: free-running greedy streams
+ * cascade-diverge on the first benign near-tie flip (the batch's M=N output head
+ * differs from the reference's M=1 head by legit FP noise), so stream-equality
+ * is the wrong gate -- per-step argmax-consistency along an aligned trajectory is
+ * the established standard.  The criterion is the ragged gate's, per step:
+ *   isolation tracks_own (d_self < d_cross over the OTHER active refs) +
+ *   lossless (argmax agrees OR the flip is a genuine near-tie, self_margin <
+ *   d_self).  Compaction is exercised by dropping rows at staggered steps; a
+ *   survivor's logits must stay matched to its (isolated) reference after the
+ *   active list shrinks + re-packs.  Distinct prompts make it non-vacuous (a
+ *   bank leak makes a row track the WRONG reference => tracks_own fails). */
+static bool ds4_batch_generate_selftest(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights) {
+    const char *n_env = getenv("DS4_BATCH_GEN_N");
+    const char *l_env = getenv("DS4_BATCH_GEN_LEN");
+    const char *t_env = getenv("DS4_BATCH_GEN_TOKENS");
+    const char *topk_env = getenv("DS4_MULTISEQ_TOPK");                  /* lower => engage indexer */
+    const bool force_seq0 = getenv("DS4_MULTISEQ_FORCE_SEQ0") != NULL;   /* gate-teeth */
+    uint32_t N = n_env ? (uint32_t)atoi(n_env) : 4u;
+    uint32_t L0 = l_env ? (uint32_t)atoi(l_env) : 8u;
+    uint32_t T  = t_env ? (uint32_t)atoi(t_env) : 16u;
+    if (N < 1u) N = 1u;
+    if (N > (uint32_t)DS4_MULTISEQ_MAX_SEQ) N = (uint32_t)DS4_MULTISEQ_MAX_SEQ;
+    if (L0 < 1u) L0 = 1u;
+    if (T  < 2u) T  = 2u;
+
+    uint32_t plen[DS4_MULTISEQ_MAX_SEQ];
+    uint32_t max_len = 0, n_packed = 0;
+    for (uint32_t s = 0; s < N; s++) {
+        plen[s] = L0 + (s & 3u);                 /* ragged extents, distinct banks */
+        if (plen[s] > max_len) max_len = plen[s];
+        n_packed += plen[s];
+    }
+    /* Cap T so the longest seq stays inside the raw SWA ring (no wrap in W1). */
+    if (max_len + T > g->raw_cap) {
+        uint32_t Tcap = g->raw_cap > max_len + 1u ? g->raw_cap - max_len : 2u;
+        fprintf(stderr, "ds4: batch gen selftest capping T %u -> %u (max_len=%u raw_cap=%u, no ring wrap)\n",
+                T, Tcap, max_len, g->raw_cap);
+        T = Tcap;
+    }
+    if (T < 2u) T = 2u;
+    if (n_packed > g->prefill_cap || max_len > g->raw_cap) {
+        fprintf(stderr, "ds4: batch gen selftest needs prefill_cap>=%u raw_cap>=%u have %u/%u\n",
+                n_packed, max_len, g->prefill_cap, g->raw_cap);
+        return false;
+    }
+    const uint32_t saved_top_k = g_ds4_shape.n_indexer_top_k;
+    if (topk_env) {
+        uint32_t tk = (uint32_t)atoi(topk_env);
+        if (tk == 0u) tk = 1u;
+        g_ds4_shape.n_indexer_top_k = tk;
+        fprintf(stderr, "ds4: batch gen selftest lowering indexer top_k %u -> %u\n", saved_top_k, tk);
+    }
+    fprintf(stderr, "ds4: batch gen selftest N=%u L0=%u T=%u (Σ=%u max_len=%u raw_cap=%u prefill_cap=%u)%s\n",
+            N, L0, T, n_packed, max_len, g->raw_cap, g->prefill_cap,
+            force_seq0 ? " (FORCE_SEQ0 gate-teeth)" : "");
+
+    /* Per-seq distinct synthetic prompts (tok = 100 + s*1000 + i) + packed offsets. */
+    int *tokbuf = xmalloc((size_t)n_packed * sizeof(int));
+    uint32_t off[DS4_MULTISEQ_MAX_SEQ];
+    {
+        uint32_t base = 0;
+        for (uint32_t s = 0; s < N; s++) {
+            off[s] = base;
+            for (uint32_t i = 0; i < plen[s]; i++) tokbuf[base + i] = (int)(100u + s * 1000u + i);
+            base += plen[s];
+        }
+    }
+
+    /* Staggered drop schedule: seq s decoded for steps 1..stop[s] then compacted
+     * out (stop in [1, T-1]); drops land at distinct steps and seq N-1 runs the
+     * full budget so the survivor is checked across every step. */
+    uint32_t stop[DS4_MULTISEQ_MAX_SEQ];
+    for (uint32_t s = 0; s < N; s++) {
+        uint32_t st = (N > 1u) ? (1u + (s * (T - 1u)) / N) : (T - 1u);
+        if (st < 1u) st = 1u;
+        if (st > T - 1u) st = T - 1u;
+        stop[s] = st;
+    }
+    stop[N - 1u] = T - 1u;
+
+    /* Per-step reference logits [s][k] (k=0 is the prefill last-row) + argmax
+     * trajectory.  ref_logits is the gate's big buffer (N*T*VOCAB). */
+    float *ref_logits   = xmalloc((size_t)N * T * DS4_N_VOCAB * sizeof(float));
+    int   *traj         = xmalloc((size_t)N * T * sizeof(int));
+    float *pf_logits    = xmalloc((size_t)n_packed * DS4_N_VOCAB * sizeof(float));
+    float *batch_logits = xmalloc((size_t)N * DS4_N_VOCAB * sizeof(float));
+    bool ok = ref_logits && traj && pf_logits && batch_logits;
+
+    ds4_batch_slabs sl;
+    bool slabs_live = false;
+    if (ok) { slabs_live = ds4_batch_slabs_alloc(&sl, g, N); if (!slabs_live) { fprintf(stderr, "ds4: batch gen gate slab alloc failed\n"); ok = false; } }
+
+    g->batch_multiseq = false; g->batch_n_seq = 0;
+    g->batch_multiseq_prefilled = false; g->batch_multiseq_emit = false; g->batch_max_seq_len = 0;
+
+    /* ---- PHASE 1: per-seq reference (each seq ALONE, N=1 into bank s). ---- */
+    for (uint32_t s = 0; ok && s < N; s++) {
+        ok = ds4_batch_slabs_repoint(&sl, g, s, 1u);
+        if (ok && !metal_graph_reset_prefill_state(g)) ok = false;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) { g->ms_n_comp[0][il] = 0u; g->ms_n_index_comp[0][il] = 0u; }
+        const uint32_t L = plen[s];
+        if (ok) {
+            int     *qa = xmalloc((size_t)L * sizeof(int));
+            int32_t *pp = xmalloc((size_t)L * sizeof(int32_t));
+            int32_t *ssid = xmalloc((size_t)L * sizeof(int32_t));
+            for (uint32_t i = 0; i < L; i++) { qa[i] = tokbuf[off[s] + i]; pp[i] = (int32_t)i; ssid[i] = 0;
+                                               g->ms_positions[i] = pp[i]; g->ms_seq_id[i] = 0; }
+            ok = ds4_gpu_tensor_write(g->batch_positions, 0, pp, (uint64_t)L * sizeof(int32_t)) != 0;
+            if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, ssid, (uint64_t)L * sizeof(int32_t)) != 0;
+            if (ok) {
+                g->batch_multiseq = true; g->batch_n_seq = 1; g->batch_multiseq_prefilled = true;
+                g->batch_multiseq_emit = true; g->batch_max_seq_len = L;
+                ok = metal_graph_batch_eval_logits(g, model, weights, qa, L, L, pf_logits);
+                g->batch_multiseq_emit = false; g->batch_max_seq_len = 0;
+            }
+            if (ok) memcpy(ref_logits + (size_t)(s * T + 0u) * DS4_N_VOCAB,
+                           pf_logits + (uint64_t)(L - 1u) * DS4_N_VOCAB, DS4_N_VOCAB * sizeof(float));
+            free(qa); free(pp); free(ssid);
+        }
+        if (ok) traj[s * T + 0u] = sample_argmax(ref_logits + (size_t)(s * T + 0u) * DS4_N_VOCAB, DS4_N_VOCAB);
+        for (uint32_t k = 1; ok && k < T; k++) {
+            const int in_tok = traj[s * T + (k - 1u)];
+            const int32_t p0 = (int32_t)(L + (k - 1u));
+            const int32_t z = 0;
+            g->ms_positions[0] = p0; g->ms_seq_id[0] = 0;
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                g->layer_n_comp[il] = g->ms_n_comp[0][il];
+                g->layer_n_index_comp[il] = g->ms_n_index_comp[0][il];
+            }
+            ok = ds4_gpu_tensor_write(g->batch_positions, 0, &p0, sizeof(int32_t)) != 0;
+            if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, &z, sizeof(int32_t)) != 0;
+            if (ok) {
+                g->batch_multiseq = true; g->batch_n_seq = 1; g->batch_multiseq_prefilled = true;
+                g->batch_multiseq_emit = true;
+                ok = metal_graph_batch_eval_logits(g, model, weights, &in_tok, (uint32_t)p0, 1u,
+                                                   ref_logits + (size_t)(s * T + k) * DS4_N_VOCAB);
+                g->batch_multiseq_emit = false;
+            }
+            if (ok) traj[s * T + k] = sample_argmax(ref_logits + (size_t)(s * T + k) * DS4_N_VOCAB, DS4_N_VOCAB);
+        }
+        g->batch_multiseq = false; g->batch_n_seq = 0; g->batch_multiseq_prefilled = false;
+    }
+    ds4_batch_slabs_unpoint(&sl);
+
+    /* ---- PHASE 2: batched, teacher-forced along traj, with compaction. ---- */
+    for (uint32_t s = 0; ok && s < N; s++) {
+        ok = ds4_batch_slabs_repoint(&sl, g, s, 1u);
+        if (ok && !metal_graph_reset_prefill_state(g)) ok = false;
+    }
+    ds4_batch_slabs_unpoint(&sl);
+    for (uint32_t s = 0; s < N; s++)
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) { g->ms_n_comp[s][il] = 0u; g->ms_n_index_comp[s][il] = 0u; }
+    if (ok) ok = ds4_batch_slabs_repoint(&sl, g, 0u, N);
+    if (ok) for (uint32_t il = 0; il < DS4_N_LAYER; il++) { g->layer_n_comp[il] = 0u; g->layer_n_index_comp[il] = 0u; }
+
+    bool gate = ok;
+    float *bat_step = ok ? xmalloc((size_t)N * DS4_N_VOCAB * sizeof(float)) : NULL;  /* step-0 batch rows */
+    if (ok && !bat_step) ok = false;
+    if (ok) {
+        int     *qtokens = xmalloc((size_t)n_packed * sizeof(int));
+        int32_t *pos_arr = xmalloc((size_t)n_packed * sizeof(int32_t));
+        int32_t *sid_arr = xmalloc((size_t)n_packed * sizeof(int32_t));
+        uint32_t t = 0;
+        for (uint32_t s = 0; s < N; s++)
+            for (uint32_t i = 0; i < plen[s]; i++) {
+                qtokens[t] = tokbuf[off[s] + i]; pos_arr[t] = (int32_t)i;
+                sid_arr[t] = force_seq0 ? 0 : (int32_t)s;
+                g->ms_positions[t] = pos_arr[t]; g->ms_seq_id[t] = sid_arr[t]; t++;
+            }
+        ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)n_packed * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)n_packed * sizeof(int32_t)) != 0;
+        if (ok) {
+            g->batch_multiseq = true; g->batch_n_seq = N; g->batch_multiseq_prefilled = true;
+            g->batch_multiseq_emit = true; g->batch_max_seq_len = max_len;
+            ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, max_len, n_packed, pf_logits);
+            g->batch_multiseq_emit = false; g->batch_max_seq_len = 0;
+        }
+        if (ok) for (uint32_t s = 0; s < N; s++)
+            memcpy(bat_step + (size_t)s * DS4_N_VOCAB,
+                   pf_logits + (uint64_t)(off[s] + plen[s] - 1u) * DS4_N_VOCAB,
+                   DS4_N_VOCAB * sizeof(float));
+        free(qtokens); free(pos_arr); free(sid_arr);
+    }
+
+    uint32_t active[DS4_MULTISEQ_MAX_SEQ];
+    uint32_t n_active = N;
+    for (uint32_t s = 0; s < N; s++) active[s] = s;
+    double worst_dself = 0.0, tight_cross = 1e30;
+    uint32_t fail_steps = 0;
+
+    /* Per-step comparator over the active set (ragged gate's criterion). */
+    #define BG_COMPARE_STEP(rows, kk) do {                                                         \
+        for (uint32_t a = 0; a < n_active; a++) {                                                  \
+            const uint32_t s = active[a];                                                          \
+            const float *b      = (rows) + (uint64_t)a * DS4_N_VOCAB;                              \
+            const float *o_self = ref_logits + (size_t)(s * T + (kk)) * DS4_N_VOCAB;               \
+            const int am_b = sample_argmax(b, DS4_N_VOCAB);                                        \
+            const int am_self = traj[s * T + (kk)];                                                \
+            float d_self = 0.0f, top1 = -1e30f, top2 = -1e30f;                                     \
+            for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {                                           \
+                float dd = fabsf(b[v] - o_self[v]); if (dd > d_self) d_self = dd;                  \
+                float sv = o_self[v];                                                              \
+                if (sv > top1) { top2 = top1; top1 = sv; } else if (sv > top2) top2 = sv;          \
+            }                                                                                      \
+            float d_cross = 1e30f;                                                                 \
+            for (uint32_t a2 = 0; a2 < n_active; a2++) {                                           \
+                if (a2 == a) continue;                                                             \
+                const float *o_o = ref_logits + (size_t)(active[a2] * T + (kk)) * DS4_N_VOCAB;     \
+                float dmax = 0.0f;                                                                 \
+                for (uint32_t v = 0; v < DS4_N_VOCAB; v++) { float dc = fabsf(b[v] - o_o[v]); if (dc > dmax) dmax = dc; } \
+                if (dmax < d_cross) d_cross = dmax;                                                \
+            }                                                                                      \
+            const float self_margin = top1 - top2;                                                 \
+            const bool tracks_own = (n_active < 2u) ? true : (d_self < d_cross);                    \
+            const bool lossless = (am_b == am_self) || (self_margin < d_self);                      \
+            if (!tracks_own || !lossless) { gate = false; fail_steps++;                             \
+                fprintf(stderr, "ds4: batch gen FAIL step %u seq %u: am batch=%d self=%d d_self=%.4f d_cross=%.4f margin=%.4f %s%s\n", \
+                        (kk), s, am_b, am_self, (double)d_self, (double)d_cross, (double)self_margin, \
+                        tracks_own ? "" : "[LEAK]", lossless ? "" : "[LOSSY]"); }                   \
+            if (d_self > worst_dself) worst_dself = d_self;                                          \
+            if (n_active >= 2u && d_cross < tight_cross) tight_cross = d_cross;                      \
+        }                                                                                          \
+    } while (0)
+
+    /* step 0: prefill last-row logits, all N active. */
+    if (ok) BG_COMPARE_STEP(bat_step, 0u);
+
+    /* teacher-forced decode steps. */
+    for (uint32_t k = 1; ok && k < T; k++) {
+        uint32_t w = 0;                                  /* compact: drop seqs past their stop step */
+        for (uint32_t a = 0; a < n_active; a++) if (k <= stop[active[a]]) active[w++] = active[a];
+        n_active = w;
+        if (n_active == 0u) break;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            uint32_t mc = 0, mi = 0;
+            for (uint32_t s = 0; s < N; s++) { if (g->ms_n_comp[s][il] > mc) mc = g->ms_n_comp[s][il];
+                                               if (g->ms_n_index_comp[s][il] > mi) mi = g->ms_n_index_comp[s][il]; }
+            g->layer_n_comp[il] = mc; g->layer_n_index_comp[il] = mi;
+        }
+        int     qa[DS4_MULTISEQ_MAX_SEQ]; int32_t pa[DS4_MULTISEQ_MAX_SEQ]; int32_t sa[DS4_MULTISEQ_MAX_SEQ];
+        uint32_t maxpos = 0;
+        for (uint32_t a = 0; a < n_active; a++) {
+            const uint32_t s = active[a];
+            qa[a] = traj[s * T + (k - 1u)];
+            pa[a] = (int32_t)(plen[s] + (k - 1u));
+            sa[a] = force_seq0 ? 0 : (int32_t)s;
+            g->ms_positions[a] = pa[a]; g->ms_seq_id[a] = sa[a];
+            if ((uint32_t)pa[a] > maxpos) maxpos = (uint32_t)pa[a];
+        }
+        ok = ds4_gpu_tensor_write(g->batch_positions, 0, pa, (uint64_t)n_active * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sa, (uint64_t)n_active * sizeof(int32_t)) != 0;
+        if (ok) {
+            g->batch_multiseq = true; g->batch_n_seq = N; g->batch_multiseq_prefilled = true;
+            g->batch_multiseq_emit = true;
+            ok = metal_graph_batch_eval_logits(g, model, weights, qa, maxpos, n_active, batch_logits);
+            g->batch_multiseq_emit = false;
+        }
+        if (ok) BG_COMPARE_STEP(batch_logits, k);
+    }
+    g->batch_multiseq = false; g->batch_n_seq = 0; g->batch_multiseq_prefilled = false;
+    #undef BG_COMPARE_STEP
+
+    if (slabs_live) ds4_batch_slabs_free(&sl, g);
+
+    /* Vacuity guard: per-seq references must be pairwise distinct at step 0. */
+    if (ok && N >= 2u) {
+        float o_diff = 1e30f;
+        for (uint32_t a = 0; a + 1u < N; a++)
+            for (uint32_t b = a + 1u; b < N; b++) {
+                const float *oa = ref_logits + (size_t)(a * T + 0u) * DS4_N_VOCAB;
+                const float *ob = ref_logits + (size_t)(b * T + 0u) * DS4_N_VOCAB;
+                float dmax = 0.0f;
+                for (uint32_t v = 0; v < DS4_N_VOCAB; v++) { float d = fabsf(oa[v] - ob[v]); if (d > dmax) dmax = d; }
+                if (dmax < o_diff) o_diff = dmax;
+            }
+        if (o_diff <= 1.0f) { gate = false; fprintf(stderr, "ds4: batch gen references WEAK (min pairwise %.4f) -- VACUOUS\n", (double)o_diff); }
+        else fprintf(stderr, "ds4: batch gen references distinct (min pairwise max|d|=%.4f)\n", (double)o_diff);
+    }
+
+    fprintf(stderr, "ds4: batch gen worst d_self=%.4f tightest d_cross=%.4f fail_steps=%u\n",
+            worst_dself, tight_cross >= 1e29 ? 0.0 : tight_cross, fail_steps);
+    fprintf(stderr, "ds4: batch gen selftest %s (N=%u L0=%u T=%u, compaction staggered)\n",
+            (ok && gate) ? "PASS" : "FAIL", N, L0, T);
+
+    free(tokbuf); free(ref_logits); free(traj); free(pf_logits); free(batch_logits);
+    if (bat_step) free(bat_step);
+    g_ds4_shape.n_indexer_top_k = saved_top_k;
+    return ok && gate;
+}
+
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: chunked/layer-major prefill followed by graph decode steps. */
 static int generate_metal_graph_raw_swa(
@@ -22092,6 +22774,16 @@ static int generate_metal_graph_raw_swa(
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+
+    /* Phase 2 W1: batched-generate determinism gate -- N distinct synthetic
+     * prompts generated batched (ragged-prefill + compact-on-finish) vs each
+     * alone, asserting per-seq stream isolation.  Ignores the prompt. */
+    if (getenv("DS4_BATCH_GEN") != NULL) {
+        const bool okb = ds4_batch_generate_selftest(&g, model, weights);
+        free(logits);
+        metal_graph_free(&g);
+        return okb ? 0 : 1;
+    }
 
     /* Phase 2 G8: minimal multi-seq generation/scheduler loop -- prefills N
      * banks with the prompt and runs a real greedy batched-decode loop end to
@@ -25216,6 +25908,92 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     free(dataset);
     return ok ? 0 : 1;
 #endif
+}
+
+/* Phase 2 W1: batched greedy generation over the public engine boundary.
+ * Ragged-prefills the n prompts in ONE forward, then batch-decodes all sequences
+ * with compact-on-finish (a sequence's row is dropped the moment it hits EOS or
+ * its budget; the active batch shrinks).  Each out[i] is filled with a malloc'd
+ * token stream the caller frees.  Greedy (temp 0) -- W1 is the deterministic
+ * foundation; sampling/streaming come with W2/W3.  Returns 0 on success. */
+int ds4_engine_batched_generate(
+        ds4_engine                   *e,
+        const ds4_tokens             *prompts,
+        int                           n,
+        int                           ctx_size,
+        const ds4_batch_gen_options  *opts,
+        ds4_batch_gen_result         *out,
+        char                         *err,
+        size_t                        errlen) {
+#define BG_API_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
+    if (out) for (int i = 0; i < (n > 0 ? n : 0); i++) { out[i].tokens = NULL; out[i].n_tokens = 0; out[i].finish = 0; }
+    if (!e || !prompts || !opts || !out) { BG_API_ERR("batched_generate: null argument"); return 1; }
+    if (n <= 0 || n > DS4_MULTISEQ_MAX_SEQ) { BG_API_ERR("batched_generate: n=%d out of [1,%d]", n, DS4_MULTISEQ_MAX_SEQ); return 1; }
+    if (ctx_size <= 0) { BG_API_ERR("batched_generate: ctx_size must be > 0"); return 1; }
+    if (!ds4_backend_uses_graph(e->backend)) { BG_API_ERR("batched_generate: graph (CUDA/Metal) backend required"); return 1; }
+#ifdef DS4_NO_GPU
+    BG_API_ERR("batched_generate: build has no graph backend");
+    return 1;
+#else
+    if (!e->metal_ready) { BG_API_ERR("batched_generate: graph backend unavailable"); return 1; }
+
+    uint32_t max_len = 0, n_packed = 0;
+    for (int i = 0; i < n; i++) {
+        if (prompts[i].len <= 0) { BG_API_ERR("batched_generate: prompt %d is empty", i); return 1; }
+        if (prompts[i].len > ctx_size) { BG_API_ERR("batched_generate: prompt %d (%d tok) exceeds ctx %d", i, prompts[i].len, ctx_size); return 1; }
+        const uint32_t L = (uint32_t)prompts[i].len;
+        if (L > max_len) max_len = L;
+        n_packed += L;
+    }
+
+    /* Ragged prefill is one un-chunked forward, so prefill_cap must cover Σlen. */
+    const uint32_t prefill_cap = n_packed;
+    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    if (max_len > raw_cap) { BG_API_ERR("batched_generate: longest prompt %u exceeds raw_cap %u", max_len, raw_cap); return 1; }
+
+    uint32_t max_new = opts->max_new_tokens > 0 ? (uint32_t)opts->max_new_tokens : 1u;
+    if (max_len + max_new > raw_cap) {                 /* W1: keep positions inside the SWA ring (no wrap). */
+        uint32_t cap = raw_cap > max_len ? raw_cap - max_len : 1u;
+        if (max_new > cap) max_new = cap;
+    }
+    const int eos_id = opts->eos_id >= 0 ? opts->eos_id : e->vocab.eos_id;
+
+    ds4_gpu_graph g;
+    if (!metal_graph_alloc_raw_cap(&g, &e->weights, &e->weights.layer[0],
+                                   raw_cap, (uint32_t)ctx_size, prefill_cap, false)) {
+        BG_API_ERR("batched_generate: graph alloc failed (raw_cap=%u prefill_cap=%u)", raw_cap, prefill_cap);
+        return 1;
+    }
+    g.quality = e->quality;
+    g.power_percent = e->power_percent > 0 ? (uint32_t)e->power_percent : 100u;
+
+    const int   **ptok = xmalloc((size_t)n * sizeof(int *));
+    uint32_t      *plen = xmalloc((size_t)n * sizeof(uint32_t));
+    int           *gen    = xmalloc((size_t)n * (size_t)max_new * sizeof(int));
+    uint32_t      *genlen = xmalloc((size_t)n * sizeof(uint32_t));
+    uint8_t       *fin    = xmalloc((size_t)n * sizeof(uint8_t));
+    for (int i = 0; i < n; i++) { ptok[i] = prompts[i].v; plen[i] = (uint32_t)prompts[i].len; }
+
+    const bool ok = ds4_batch_generate_core(&g, &e->model, &e->weights,
+                                            ptok, plen, (uint32_t)n, max_new, eos_id,
+                                            gen, genlen, fin);
+    if (ok) {
+        for (int i = 0; i < n; i++) {
+            const uint32_t gl = genlen[i];
+            out[i].tokens = xmalloc((size_t)(gl ? gl : 1u) * sizeof(int));
+            memcpy(out[i].tokens, gen + (size_t)i * max_new, (size_t)gl * sizeof(int));
+            out[i].n_tokens = (int)gl;
+            out[i].finish = fin[i] ? 1 : 0;
+        }
+    } else {
+        BG_API_ERR("batched_generate: core generation failed");
+    }
+
+    free(ptok); free(plen); free(gen); free(genlen); free(fin);
+    metal_graph_free(&g);
+    return ok ? 0 : 1;
+#endif
+#undef BG_API_ERR
 }
 
 int ds4_engine_generate_argmax(
