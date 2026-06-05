@@ -7848,6 +7848,10 @@ struct server {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
+    /* W2: serializes all GPU generation -- the single worker's session decode
+     * AND the /v1/batch handler's ds4_engine_batched_generate (its own graph,
+     * but the same device/command stream).  Held only during GPU work. */
+    pthread_mutex_t gen_mu;
     job *head;
     job *tail;
     bool stopping;
@@ -11093,7 +11097,9 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
         generate_job(s, j);
+        pthread_mutex_unlock(&s->gen_mu);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -11268,6 +11274,135 @@ static void client_done(server *s) {
 
 static void set_client_socket_nonblocking(int fd);
 
+/* W2: POST /v1/batch -- batched greedy generation over the W1 engine API.
+ * Body: {"prompts":["...", ...], "max_tokens":N, "model":"...", "think":bool}.
+ * Each prompt is chat-rendered, then all are ragged-prefilled + batch-decoded in
+ * ONE ds4_engine_batched_generate call (compact-on-finish).  Synchronous: runs on
+ * the client thread, holding gen_mu to serialize the GPU with the worker.  Reply:
+ *   {"object":"batch","model":"...","completions":[
+ *      {"index":i,"text":"...","finish_reason":"stop|length","n_tokens":k}, ...]}.
+ * NOTE: cross-request coalescing + per-seq budgets + streaming are W3. */
+#define DS4_SERVER_BATCH_MAX 64
+static void handle_batch(server *s, int fd, const char *body) {
+    const char *p = body ? body : "";
+    char *prompts[DS4_SERVER_BATCH_MAX];
+    int n = 0;
+    int max_tokens = s->default_tokens;
+    char *model = NULL;
+    bool think = false;
+    bool parse_ok = true;
+
+    json_ws(&p);
+    if (*p != '{') { http_error(fd, s->enable_cors, 400, "batch: body must be a JSON object"); return; }
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) { parse_ok = false; break; }
+        json_ws(&p);
+        if (*p != ':') { free(key); parse_ok = false; break; }
+        p++;
+        json_ws(&p);
+        if (!strcmp(key, "prompts")) {
+            if (*p != '[') { free(key); parse_ok = false; break; }
+            p++; json_ws(&p);
+            while (*p && *p != ']') {
+                char *str = NULL;
+                if (!json_string(&p, &str)) { parse_ok = false; break; }
+                if (n < DS4_SERVER_BATCH_MAX) prompts[n++] = str; else free(str);
+                json_ws(&p);
+                if (*p == ',') { p++; json_ws(&p); }
+            }
+            if (parse_ok && *p == ']') p++; else parse_ok = false;
+        } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
+            if (!json_int(&p, &max_tokens)) parse_ok = false;
+        } else if (!strcmp(key, "model")) {
+            if (!json_string(&p, &model)) parse_ok = false;
+        } else if (!strcmp(key, "think")) {
+            if (!json_bool(&p, &think)) parse_ok = false;
+        } else {
+            if (!json_skip_value(&p)) parse_ok = false;
+        }
+        free(key);
+        if (!parse_ok) break;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (parse_ok && *p != '}') parse_ok = false;
+
+    if (!parse_ok || n == 0) {
+        for (int i = 0; i < n; i++) free(prompts[i]);
+        free(model);
+        http_error(fd, s->enable_cors, 400,
+                   parse_ok ? "batch: 'prompts' must be a non-empty array of strings"
+                            : "batch: malformed JSON body");
+        return;
+    }
+
+    const int ctx_size = ds4_session_ctx(s->session);
+    const ds4_think_mode tm = think ? ds4_think_mode_for_context(DS4_THINK_HIGH, ctx_size)
+                                    : DS4_THINK_NONE;
+    ds4_tokens *toks = calloc((size_t)n, sizeof(*toks));
+    ds4_batch_gen_result *res = calloc((size_t)n, sizeof(*res));
+    bool oom = (!toks || !res);
+    if (!oom)
+        for (int i = 0; i < n; i++)
+            ds4_encode_chat_prompt(s->engine, "You are a helpful assistant", prompts[i], tm, &toks[i]);
+
+    ds4_batch_gen_options opts = {
+        .max_new_tokens = max_tokens > 0 ? max_tokens : 64,
+        .eos_id = ds4_token_eos(s->engine),
+    };
+    char err[256] = {0};
+    int rc = 1;
+    if (!oom) {
+        pthread_mutex_lock(&s->gen_mu);
+        rc = ds4_engine_batched_generate(s->engine, toks, n, ctx_size, &opts, res, err, sizeof(err));
+        pthread_mutex_unlock(&s->gen_mu);
+    }
+
+    if (oom) {
+        http_error(fd, s->enable_cors, 500, "batch: out of memory");
+    } else if (rc != 0) {
+        http_error(fd, s->enable_cors, 500, err[0] ? err : "batch generation failed");
+    } else {
+        const int eos = ds4_token_eos(s->engine);
+        buf b = {0};
+        buf_puts(&b, "{\"object\":\"batch\",\"model\":");
+        json_escape(&b, model ? model : server_model_id_from_engine(s->engine));
+        buf_puts(&b, ",\"completions\":[");
+        for (int i = 0; i < n; i++) {
+            if (i) buf_putc(&b, ',');
+            buf txt = {0};
+            int emitted = 0;
+            for (int k = 0; k < res[i].n_tokens; k++) {
+                if (res[i].tokens[k] == eos) break;
+                size_t pl = 0;
+                char *piece = ds4_token_text(s->engine, res[i].tokens[k], &pl);
+                if (piece) { buf_append(&txt, piece, pl); free(piece); }
+                emitted++;
+            }
+            buf_putc(&txt, '\0');
+            buf_printf(&b, "{\"index\":%d,\"text\":", i);
+            json_escape(&b, txt.ptr ? txt.ptr : "");
+            buf_printf(&b, ",\"finish_reason\":\"%s\",\"n_tokens\":%d}",
+                       res[i].finish ? "stop" : "length", emitted);
+            buf_free(&txt);
+        }
+        buf_puts(&b, "]}\n");
+        http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+        buf_free(&b);
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (res) free(res[i].tokens);
+        if (toks) ds4_tokens_free(&toks[i]);
+        free(prompts[i]);
+    }
+    free(res); free(toks); free(model);
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -11298,6 +11433,12 @@ static void *client_main(void *arg) {
         server_model_alias_known(hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/batch")) {
+        handle_batch(s, fd, hr.body);
         http_request_free(&hr);
         goto done;
     }
@@ -11807,6 +11948,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
+    pthread_mutex_init(&s.gen_mu, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
     if (cfg.trace_path) {
