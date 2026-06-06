@@ -206,6 +206,30 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx);
 int  ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                      const int *max_new_tokens, const int *eos_ids,
                                      ds4_batch_gen_result *out, char *err, size_t errlen);
+
+/* Phase 2 W5: continuous batching (mid-flight admit/evict) over a persistent ctx.
+ * The scheduler maintains a rolling active set of up to ctx max_seq sequences: each
+ * step it admits waiting requests into freed KV banks (ragged-prefill the prompt)
+ * and evicts finished ones, so short requests don't wait for long ones.  Greedy
+ * (argmax) only; CUDA backend only (the Metal path ignores per-seq bank ids). */
+typedef struct {
+    const int *tokens;   /* prompt tokens (caller-owned; must outlive the admit) */
+    int        n;        /* prompt length (>0, <= ctx raw_cap) */
+    int        max_new;  /* per-seq decode budget (>=1) */
+    int        eos;      /* per-seq EOS token; <0 => engine default */
+    void      *user;     /* opaque handle echoed back to on_done */
+} ds4_cont_request;
+/* admit: fill *req for the next waiting request and return 1; return 0 when none is
+ *   available right now (the loop keeps decoding the active set and ends once the
+ *   active set is empty AND admit returns 0).
+ * on_done: a sequence finished -- tokens[0..n) is its full generation (caller must
+ *   NOT free; valid only during the call), finish=1 if it hit EOS (0 = budget).
+ * Returns 0 on success. */
+int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
+                                    int (*admit)(void *ud, ds4_cont_request *req),
+                                    void (*on_done)(void *ud, void *user,
+                                                    const int *tokens, int n, int finish),
+                                    void *ud, char *err, size_t errlen);
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
                                const char *output_path,
