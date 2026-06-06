@@ -191,6 +191,21 @@ int ds4_engine_batched_generate_ex(ds4_engine *e, const ds4_tokens *prompts, int
                                    const int *max_new_tokens, const int *eos_ids,
                                    ds4_batch_gen_result *out,
                                    char *err, size_t errlen);
+
+/* Phase 2 W4: persistent batched-generation context.  Allocates the graph + N KV
+ * bank slabs ONCE (sized for up to max_seq sequences and max_total_tokens packed
+ * prompt tokens at the given ctx_size) and reuses them across batches, removing
+ * the per-batch graph/slab alloc from the server's hot path.  Opaque handle. */
+typedef struct ds4_batch_ctx ds4_batch_ctx;
+int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
+                          ds4_batch_ctx **out, char *err, size_t errlen);
+void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx);
+/* Batched generation over a persistent context (W4); same semantics as
+ * ds4_engine_batched_generate_ex but reuses ctx's graph + slabs.  n <= ctx max_seq,
+ * Σ(prompt len) <= ctx max_total_tokens. Returns 0 on success. */
+int  ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
+                                     const int *max_new_tokens, const int *eos_ids,
+                                     ds4_batch_gen_result *out, char *err, size_t errlen);
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
                                const char *output_path,

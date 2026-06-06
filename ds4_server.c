@@ -7852,6 +7852,14 @@ struct server {
      * AND the /v1/batch handler's ds4_engine_batched_generate (its own graph,
      * but the same device/command stream).  Held only during GPU work. */
     pthread_mutex_t gen_mu;
+    /* W4: server-owned persistent batched-generation context (graph + N KV-bank
+     * slabs allocated ONCE), used by generate_batch_jobs to avoid per-batch graph/
+     * slab alloc.  NULL when coalescing is off or ctx creation failed (then the
+     * batch path falls back to the per-call ds4_engine_batched_generate_ex).
+     * Sized for batches up to batch_ctx_max_seq jobs / batch_ctx_max_tokens Σlen. */
+    ds4_batch_ctx *batch_ctx;
+    int batch_ctx_max_seq;
+    int batch_ctx_max_tokens;
     job *head;
     job *tail;
     bool stopping;
@@ -11251,18 +11259,28 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
     int *max_new = xmalloc((size_t)n * sizeof(int));
     int *eos_ids = xmalloc((size_t)n * sizeof(int));
     ds4_batch_gen_result *res = calloc((size_t)n, sizeof(*res));
+    int n_packed = 0;
     for (int i = 0; i < n; i++) {
         prompts[i] = jobs[i]->req.prompt;   /* shallow read-only view */
         max_new[i] = jobs[i]->req.max_tokens > 0 ? jobs[i]->req.max_tokens : s->default_tokens;
         eos_ids[i] = eos;
+        n_packed += prompts[i].len;
     }
 
+    /* W4: use the persistent ctx when the group fits its sizing; else fall back to
+     * the per-call _ex path (which allocs a right-sized graph for this batch). */
+    const bool use_ctx = s->batch_ctx && n <= s->batch_ctx_max_seq &&
+                         n_packed <= s->batch_ctx_max_tokens;
     char err[256] = {0};
     int rc = 1;
     if (res) {
         pthread_mutex_lock(&s->gen_mu);
-        rc = ds4_engine_batched_generate_ex(s->engine, prompts, n, ctx_size,
-                                            max_new, eos_ids, res, err, sizeof(err));
+        if (use_ctx)
+            rc = ds4_engine_batched_generate_ctx(s->batch_ctx, prompts, n,
+                                                 max_new, eos_ids, res, err, sizeof(err));
+        else
+            rc = ds4_engine_batched_generate_ex(s->engine, prompts, n, ctx_size,
+                                                max_new, eos_ids, res, err, sizeof(err));
         pthread_mutex_unlock(&s->gen_mu);
     }
 
@@ -11272,7 +11290,8 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
                    n, err[0] ? err : "out of memory");
         for (int i = 0; i < n; i++) run_job_single(s, jobs[i]);
     } else {
-        server_log(DS4_LOG_GENERATION, "ds4-server: coalesced batch n=%d ctx=%d", n, ctx_size);
+        server_log(DS4_LOG_GENERATION, "ds4-server: coalesced batch n=%d ctx=%d path=%s",
+                   n, ctx_size, use_ctx ? "ctx" : "percall");
         for (int i = 0; i < n; i++) {
             write_batch_completion(s, jobs[i], &res[i]);
             job_finish(jobs[i]);
@@ -11840,6 +11859,8 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    ds4_batch_ctx_destroy(s->batch_ctx);   /* W4: NULL-safe */
+    s->batch_ctx = NULL;
     ds4_session_free(s->session);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
@@ -12167,6 +12188,38 @@ int main(int argc, char **argv) {
         }
         setvbuf(s.trace, NULL, _IONBF, 0);
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
+    }
+
+    /* W4: build the persistent batched-generation context, sized to the same
+     * coalescing bounds the worker enforces (so every coalesced group fits).  On
+     * failure (or when coalescing is off) batch_ctx stays NULL and the batch path
+     * falls back to the per-call ds4_engine_batched_generate_ex. */
+    {
+        const char *ce = getenv("DS4_SERVER_COALESCE");
+        const bool coalesce_on = !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+        const char *cm = getenv("DS4_SERVER_COALESCE_MAX");
+        int cmax = cm ? atoi(cm) : 16;
+        if (cmax < 1) cmax = 1;
+        if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
+        const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
+        int cmaxtok = ct ? atoi(ct) : 8192;
+        if (cmaxtok <= 0) cmaxtok = 8192;          /* unbounded coalesce -> size ctx to default */
+        if (cmaxtok < cmax) cmaxtok = cmax;        /* need >=1 token per seq */
+        if (coalesce_on && cmax > 1) {
+            char cerr[256] = {0};
+            if (ds4_batch_ctx_create(s.engine, ds4_session_ctx(s.session), cmax, cmaxtok,
+                                     &s.batch_ctx, cerr, sizeof(cerr)) == 0) {
+                s.batch_ctx_max_seq = cmax;
+                s.batch_ctx_max_tokens = cmaxtok;
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d)",
+                           cmax, cmaxtok, ds4_session_ctx(s.session));
+            } else {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: persistent batch ctx unavailable (%s); using per-call batch path",
+                           cerr[0] ? cerr : "unknown error");
+            }
+        }
     }
 
     pthread_t worker;
