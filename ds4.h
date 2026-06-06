@@ -183,6 +183,14 @@ int ds4_engine_batched_generate(ds4_engine *e, const ds4_tokens *prompts, int n,
                                 int ctx_size, const ds4_batch_gen_options *opts,
                                 ds4_batch_gen_result *out,
                                 char *err, size_t errlen);
+/* Per-sequence variant: max_new_tokens[i]/eos_ids[i] are length-n arrays
+ * (max_new_tokens entry <=0 => 1; eos_ids may be NULL or an entry <0 => engine
+ * default EOS).  Used by the server's request-coalescing path. */
+int ds4_engine_batched_generate_ex(ds4_engine *e, const ds4_tokens *prompts, int n,
+                                   int ctx_size,
+                                   const int *max_new_tokens, const int *eos_ids,
+                                   ds4_batch_gen_result *out,
+                                   char *err, size_t errlen);
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
                                const char *output_path,

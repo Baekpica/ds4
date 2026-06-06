@@ -11092,18 +11092,230 @@ static job *dequeue(server *s) {
     return j;
 }
 
+/* ---- W3: request-coalescing ------------------------------------------------
+ * The single worker drains a contiguous run of "batchable" queued requests and
+ * runs them through ONE ragged-prefill + batched-decode call
+ * (ds4_engine_batched_generate_ex), then writes each request its own response.
+ * Coalescing is correctness-preserving for the batchable set: the batched core
+ * is greedy argmax (same as a temp=0 session decode, modulo M=1-vs-M=N output-
+ * head FP noise -- the W1 standard), uses no tools/stop-strings/streaming, and
+ * does not touch the session KV (so interleaving with session jobs is safe,
+ * exactly as the /v1/batch path).  Anything not batchable stays on the single
+ * generate_job() path.  Phase 1 only: mid-flight admit/evict and a persistent
+ * batch ctx are deferred. */
+#define DS4_COALESCE_HARD_MAX 64
+
+/* A request may be coalesced only when its completion does not depend on any of
+ * generate_job()'s richer machinery (tools, stop sequences, streaming, token-id
+ * echo, anthropic/responses envelopes) AND its single-path decode would be plain
+ * greedy argmax -- so the batched core (always argmax) produces the same answer.
+ * Two things force the greedy requirement:
+ *   - temperature <= 0 (the request itself asks for greedy), and
+ *   - thinking DISABLED: generate_job() OVERRIDES temperature to
+ *     DS4_DEFAULT_TEMPERATURE (1.0) whenever think_mode is enabled (it samples
+ *     reasoning stochastically regardless of the requested temperature), so a
+ *     thinking request is NOT greedy on the single path and must not be coalesced
+ *     into the greedy batch.  (Per-seq sampling is a future phase.) */
+static bool job_is_batchable(const request *r) {
+    return r->api == API_OPENAI
+        && (r->kind == REQ_CHAT || r->kind == REQ_COMPLETION)
+        && !r->stream
+        && !r->has_tools
+        && !r->return_token_ids
+        && r->stops.len == 0
+        && r->temperature <= 0.0f
+        && !ds4_think_mode_enabled(r->think_mode);
+}
+
+static void job_finish(job *j) {
+    pthread_mutex_lock(&j->mu);
+    j->done = true;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+/* The original single-request path: serialize the GPU, run, signal done. */
+static void run_job_single(server *s, job *j) {
+    pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
+    generate_job(s, j);
+    pthread_mutex_unlock(&s->gen_mu);
+    job_finish(j);
+}
+
+/* Pull additional batchable jobs from the head of the FIFO into out[1..cap).
+ * out[0] is preset by the caller.  Only a CONTIGUOUS run of batchable jobs is
+ * taken: a non-batchable head stops the gather so strict FIFO order is kept.
+ * The cumulative prompt-token count is bounded by max_tok_total: ragged prefill
+ * is one un-chunked forward, so its host logits buffer is Σlen * vocab * 4 bytes
+ * -- without a bound, auto-combining several long prompts could trigger a
+ * multi-GB allocation (and ds4_die).  A peer that would exceed the budget is left
+ * queued for the next batch (the head job alone is always kept, even if large).
+ * If the queue is momentarily empty and wait_ms>0, briefly wait for stragglers
+ * (so a burst of concurrent clients coalesces even with slight arrival skew). */
+static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_tok_total) {
+    int n = 1;
+    long tok_total = out[0]->req.prompt.len;
+    struct timespec deadline;
+    bool have_deadline = false;
+    pthread_mutex_lock(&s->mu);
+    while (n < cap) {
+        if (s->head && job_is_batchable(&s->head->req)) {
+            if (max_tok_total > 0 && tok_total + s->head->req.prompt.len > max_tok_total)
+                break;                         /* token budget: split into another batch */
+            job *g = s->head;
+            s->head = g->next;
+            if (!s->head) s->tail = NULL;
+            g->next = NULL;
+            tok_total += g->req.prompt.len;
+            out[n++] = g;
+            continue;
+        }
+        if (s->head) break;                    /* next is non-batchable: preserve order */
+        if (s->stopping || wait_ms <= 0) break;
+        if (!have_deadline) {
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec  += wait_ms / 1000;
+            deadline.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+            if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+            have_deadline = true;
+        }
+        if (pthread_cond_timedwait(&s->cv, &s->mu, &deadline) != 0) break;  /* timeout */
+    }
+    pthread_mutex_unlock(&s->mu);
+    return n;
+}
+
+/* Detokenize a batched result's tokens into `out` (NUL-terminated), stopping
+ * before the first EOS; returns the count emitted (EOS excluded).  Shared by the
+ * coalesced path and the /v1/batch handler so the two cannot drift. */
+static int detok_result_until_eos(server *s, const int *tokens, int n_tokens, int eos, buf *out) {
+    int emitted = 0;
+    for (int k = 0; k < n_tokens; k++) {
+        if (tokens[k] == eos) break;
+        size_t pl = 0;
+        char *piece = ds4_token_text(s->engine, tokens[k], &pl);
+        if (piece) { buf_append(out, piece, pl); free(piece); }
+        emitted++;
+    }
+    buf_putc(out, '\0');
+    return emitted;
+}
+
+/* Format one coalesced job's HTTP response from its generated tokens, mirroring
+ * the non-streaming OpenAI tail of generate_job() (detok to first EOS, then
+ * parse_generated_message_for_response for chat to split reasoning/content). */
+static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result *r) {
+    const int eos = ds4_token_eos(s->engine);
+    char id[96];
+    snprintf(id, sizeof(id), "%s-%llu",
+             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+             (unsigned long long)++s->seq);
+
+    buf text = {0};
+    int emitted = detok_result_until_eos(s, r->tokens, r->n_tokens, eos, &text);
+    const char *finish = r->finish ? "stop" : "length";
+    const int prompt_tokens = j->req.prompt.len;
+
+    if (j->req.kind == REQ_CHAT) {
+        tool_calls calls = {0};
+        char *content = NULL, *reasoning = NULL;
+        const char *fin = finish;
+        char perr[160] = {0};
+        bool recovered = false;
+        parse_generated_message_for_response(text.ptr ? text.ptr : "",
+                                             false /*has_tools*/, false /*saw_tool_start*/,
+                                             ds4_think_mode_enabled(j->req.think_mode),
+                                             &fin, perr, sizeof(perr),
+                                             &content, &reasoning, &calls, &recovered);
+        final_response(j->fd, s->enable_cors, &j->req, id,
+                       content ? content : (text.ptr ? text.ptr : ""),
+                       reasoning, &calls, fin, prompt_tokens, emitted);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    } else {
+        tool_calls empty = {0};
+        final_response(j->fd, s->enable_cors, &j->req, id,
+                       text.ptr ? text.ptr : "", NULL, &empty, finish,
+                       prompt_tokens, emitted);
+    }
+    buf_free(&text);
+}
+
+/* Run a coalesced group (n>=2) as one batched call, then write+signal each job.
+ * On batched failure, degrade gracefully to the single path per job. */
+static void generate_batch_jobs(server *s, job **jobs, int n) {
+    const int ctx_size = ds4_session_ctx(s->session);
+    const int eos = ds4_token_eos(s->engine);
+    ds4_tokens *prompts = xmalloc((size_t)n * sizeof(*prompts));
+    int *max_new = xmalloc((size_t)n * sizeof(int));
+    int *eos_ids = xmalloc((size_t)n * sizeof(int));
+    ds4_batch_gen_result *res = calloc((size_t)n, sizeof(*res));
+    for (int i = 0; i < n; i++) {
+        prompts[i] = jobs[i]->req.prompt;   /* shallow read-only view */
+        max_new[i] = jobs[i]->req.max_tokens > 0 ? jobs[i]->req.max_tokens : s->default_tokens;
+        eos_ids[i] = eos;
+    }
+
+    char err[256] = {0};
+    int rc = 1;
+    if (res) {
+        pthread_mutex_lock(&s->gen_mu);
+        rc = ds4_engine_batched_generate_ex(s->engine, prompts, n, ctx_size,
+                                            max_new, eos_ids, res, err, sizeof(err));
+        pthread_mutex_unlock(&s->gen_mu);
+    }
+
+    if (rc != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: coalesced batch n=%d failed (%s); falling back to single path",
+                   n, err[0] ? err : "out of memory");
+        for (int i = 0; i < n; i++) run_job_single(s, jobs[i]);
+    } else {
+        server_log(DS4_LOG_GENERATION, "ds4-server: coalesced batch n=%d ctx=%d", n, ctx_size);
+        for (int i = 0; i < n; i++) {
+            write_batch_completion(s, jobs[i], &res[i]);
+            job_finish(jobs[i]);
+        }
+    }
+
+    if (res) for (int i = 0; i < n; i++) free(res[i].tokens);
+    free(res);
+    free(prompts);
+    free(max_new);
+    free(eos_ids);
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
+    /* Coalescing config (read once; single worker thread). */
+    const char *ce = getenv("DS4_SERVER_COALESCE");
+    const bool coalesce = !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+    const char *cm = getenv("DS4_SERVER_COALESCE_MAX");
+    int cmax = cm ? atoi(cm) : 16;
+    if (cmax < 1) cmax = 1;
+    if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
+    const char *cw = getenv("DS4_SERVER_COALESCE_WAIT_MS");
+    int cwait = cw ? atoi(cw) : 0;
+    if (cwait < 0) cwait = 0;
+    /* Cap the combined prompt tokens of a coalesced group; ragged prefill's host
+     * logits buffer is Σlen * vocab * 4 bytes, so this bounds peak host memory. */
+    const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
+    int cmaxtok = ct ? atoi(ct) : 8192;
+    if (cmaxtok < 0) cmaxtok = 0;
+
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
-        generate_job(s, j);
-        pthread_mutex_unlock(&s->gen_mu);
-        pthread_mutex_lock(&j->mu);
-        j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        if (coalesce && cmax > 1 && job_is_batchable(&j->req)) {
+            job *batch[DS4_COALESCE_HARD_MAX];
+            batch[0] = j;
+            int n = coalesce_gather(s, batch, cmax, cwait, cmaxtok);
+            if (n == 1) run_job_single(s, j);
+            else        generate_batch_jobs(s, batch, n);
+        } else {
+            run_job_single(s, j);
+        }
     }
     return NULL;
 }
@@ -11281,7 +11493,9 @@ static void set_client_socket_nonblocking(int fd);
  * the client thread, holding gen_mu to serialize the GPU with the worker.  Reply:
  *   {"object":"batch","model":"...","completions":[
  *      {"index":i,"text":"...","finish_reason":"stop|length","n_tokens":k}, ...]}.
- * NOTE: cross-request coalescing + per-seq budgets + streaming are W3. */
+ * NOTE: cross-request coalescing of single-prompt requests + per-seq budgets
+ * landed in W3 (see worker_main/generate_batch_jobs); per-seq SSE streaming is
+ * still future. */
 #define DS4_SERVER_BATCH_MAX 64
 static void handle_batch(server *s, int fd, const char *body) {
     const char *p = body ? body : "";
@@ -11375,15 +11589,7 @@ static void handle_batch(server *s, int fd, const char *body) {
         for (int i = 0; i < n; i++) {
             if (i) buf_putc(&b, ',');
             buf txt = {0};
-            int emitted = 0;
-            for (int k = 0; k < res[i].n_tokens; k++) {
-                if (res[i].tokens[k] == eos) break;
-                size_t pl = 0;
-                char *piece = ds4_token_text(s->engine, res[i].tokens[k], &pl);
-                if (piece) { buf_append(&txt, piece, pl); free(piece); }
-                emitted++;
-            }
-            buf_putc(&txt, '\0');
+            int emitted = detok_result_until_eos(s, res[i].tokens, res[i].n_tokens, eos, &txt);
             buf_printf(&b, "{\"index\":%d,\"text\":", i);
             json_escape(&b, txt.ptr ? txt.ptr : "");
             buf_printf(&b, ",\"finish_reason\":\"%s\",\"n_tokens\":%d}",

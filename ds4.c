@@ -22229,13 +22229,19 @@ static bool ds4_batch_generate_core(
         const int        **prompt_tok,
         const uint32_t    *prompt_len,
         uint32_t           N,
-        uint32_t           max_new,
-        int                eos_id,
-        int               *gen,        /* N * max_new */
+        const uint32_t    *max_new,    /* N, per-seq token budget (each >=1, <=gen_stride) */
+        const int         *eos_id,     /* N, per-seq EOS token (<0 => no EOS for that seq) */
+        uint32_t           gen_stride, /* row stride into gen (>= max over max_new[]) */
+        int               *gen,        /* N * gen_stride */
         uint32_t          *genlen,     /* N */
         uint8_t           *fin) {      /* N, 1 == hit EOS */
-    if (N == 0u || max_new == 0u) return false;
+    if (N == 0u || gen_stride == 0u) return false;
     if (N > (uint32_t)DS4_MULTISEQ_MAX_SEQ) return false;
+    for (uint32_t s = 0; s < N; s++)
+        if (max_new[s] == 0u || max_new[s] > gen_stride) {
+            fprintf(stderr, "ds4: batch gen seq %u max_new=%u out of [1,%u]\n", s, max_new[s], gen_stride);
+            return false;
+        }
 
     uint32_t max_len = 0u, n_packed = 0u;
     for (uint32_t s = 0; s < N; s++) {
@@ -22325,11 +22331,11 @@ static bool ds4_batch_generate_core(
             for (uint32_t s = 0; s < N; s++) {
                 const uint32_t last = base + prompt_len[s] - 1u;
                 const int nt = sample_argmax(pf_logits + (uint64_t)last * DS4_N_VOCAB, DS4_N_VOCAB);
-                gen[(size_t)s * max_new + 0] = nt;
+                gen[(size_t)s * gen_stride + 0] = nt;
                 genlen[s] = 1u;
                 cur[s] = nt;
                 posv[s] = prompt_len[s];
-                if (eos_id >= 0 && nt == eos_id) fin[s] = 1u;
+                if (eos_id[s] >= 0 && nt == eos_id[s]) fin[s] = 1u;
                 base += prompt_len[s];
             }
         }
@@ -22346,7 +22352,7 @@ static bool ds4_batch_generate_core(
         uint32_t active[DS4_MULTISEQ_MAX_SEQ];
         uint32_t n_active = 0;
         for (uint32_t s = 0; s < N; s++)
-            if (!fin[s] && genlen[s] < max_new) active[n_active++] = s;
+            if (!fin[s] && genlen[s] < max_new[s]) active[n_active++] = s;
 
         float   *logits = xmalloc((size_t)N * DS4_N_VOCAB * sizeof(float));
         int      qtokens[DS4_MULTISEQ_MAX_SEQ];
@@ -22391,13 +22397,13 @@ static bool ds4_batch_generate_core(
             for (uint32_t k = 0; k < n_active; k++) {
                 const uint32_t s = active[k];
                 const int nt = sample_argmax(logits + (uint64_t)k * DS4_N_VOCAB, DS4_N_VOCAB);
-                gen[(size_t)s * max_new + genlen[s]] = nt;
+                gen[(size_t)s * gen_stride + genlen[s]] = nt;
                 genlen[s]++;
                 cur[s] = nt;
                 posv[s]++;
-                const bool eos = (eos_id >= 0 && nt == eos_id);
+                const bool eos = (eos_id[s] >= 0 && nt == eos_id[s]);
                 if (eos) fin[s] = 1u;
-                const bool stop = eos || genlen[s] >= max_new;
+                const bool stop = eos || genlen[s] >= max_new[s];
                 if (!stop) active[w++] = s;
             }
             n_active = w;
@@ -25910,24 +25916,28 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 #endif
 }
 
-/* Phase 2 W1: batched greedy generation over the public engine boundary.
- * Ragged-prefills the n prompts in ONE forward, then batch-decodes all sequences
- * with compact-on-finish (a sequence's row is dropped the moment it hits EOS or
+/* Batched greedy generation over the public engine boundary, with PER-SEQUENCE
+ * token budgets + EOS ids (max_new_tokens[i]/eos_ids[i], length n).  Ragged-
+ * prefills the n prompts in ONE forward, then batch-decodes all sequences with
+ * compact-on-finish (a sequence's row is dropped the moment it hits its EOS or
  * its budget; the active batch shrinks).  Each out[i] is filled with a malloc'd
- * token stream the caller frees.  Greedy (temp 0) -- W1 is the deterministic
- * foundation; sampling/streaming come with W2/W3.  Returns 0 on success. */
-int ds4_engine_batched_generate(
+ * token stream the caller frees.  Greedy/argmax only (sampling is a future
+ * phase); the scalar ds4_engine_batched_generate wraps this.  W1 is the
+ * deterministic foundation; W3's server request-coalescing calls this directly.
+ * Returns 0 on success. */
+int ds4_engine_batched_generate_ex(
         ds4_engine                   *e,
         const ds4_tokens             *prompts,
         int                           n,
         int                           ctx_size,
-        const ds4_batch_gen_options  *opts,
+        const int                    *max_new_tokens,  /* per-seq, len n; entry <=0 => 1 */
+        const int                    *eos_ids,         /* per-seq, len n; NULL or entry <0 => vocab eos */
         ds4_batch_gen_result         *out,
         char                         *err,
         size_t                        errlen) {
 #define BG_API_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
     if (out) for (int i = 0; i < (n > 0 ? n : 0); i++) { out[i].tokens = NULL; out[i].n_tokens = 0; out[i].finish = 0; }
-    if (!e || !prompts || !opts || !out) { BG_API_ERR("batched_generate: null argument"); return 1; }
+    if (!e || !prompts || !out) { BG_API_ERR("batched_generate: null argument"); return 1; }
     if (n <= 0 || n > DS4_MULTISEQ_MAX_SEQ) { BG_API_ERR("batched_generate: n=%d out of [1,%d]", n, DS4_MULTISEQ_MAX_SEQ); return 1; }
     if (ctx_size <= 0) { BG_API_ERR("batched_generate: ctx_size must be > 0"); return 1; }
     if (!ds4_backend_uses_graph(e->backend)) { BG_API_ERR("batched_generate: graph (CUDA/Metal) backend required"); return 1; }
@@ -25951,12 +25961,21 @@ int ds4_engine_batched_generate(
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
     if (max_len > raw_cap) { BG_API_ERR("batched_generate: longest prompt %u exceeds raw_cap %u", max_len, raw_cap); return 1; }
 
-    uint32_t max_new = opts->max_new_tokens > 0 ? (uint32_t)opts->max_new_tokens : 1u;
-    if (max_len + max_new > raw_cap) {                 /* W1: keep positions inside the SWA ring (no wrap). */
-        uint32_t cap = raw_cap > max_len ? raw_cap - max_len : 1u;
-        if (max_new > cap) max_new = cap;
+    /* Per-seq token budgets + EOS.  Cap each seq so its OWN positions stay inside
+     * the SWA raw ring (no wrap): prompt_len[i] + max_new[i] <= raw_cap.  The gen
+     * buffer is row-major with stride = max over the per-seq budgets. */
+    uint32_t mn[DS4_MULTISEQ_MAX_SEQ];
+    int      ei[DS4_MULTISEQ_MAX_SEQ];
+    uint32_t gen_stride = 1u;
+    for (int i = 0; i < n; i++) {
+        uint32_t m = (max_new_tokens && max_new_tokens[i] > 0) ? (uint32_t)max_new_tokens[i] : 1u;
+        const uint32_t plen_i = (uint32_t)prompts[i].len;
+        const uint32_t cap = raw_cap > plen_i ? raw_cap - plen_i : 1u;
+        if (m > cap) m = cap;
+        mn[i] = m;
+        if (m > gen_stride) gen_stride = m;
+        ei[i] = (eos_ids && eos_ids[i] >= 0) ? eos_ids[i] : e->vocab.eos_id;
     }
-    const int eos_id = opts->eos_id >= 0 ? opts->eos_id : e->vocab.eos_id;
 
     ds4_gpu_graph g;
     if (!metal_graph_alloc_raw_cap(&g, &e->weights, &e->weights.layer[0],
@@ -25969,19 +25988,19 @@ int ds4_engine_batched_generate(
 
     const int   **ptok = xmalloc((size_t)n * sizeof(int *));
     uint32_t      *plen = xmalloc((size_t)n * sizeof(uint32_t));
-    int           *gen    = xmalloc((size_t)n * (size_t)max_new * sizeof(int));
+    int           *gen    = xmalloc((size_t)n * (size_t)gen_stride * sizeof(int));
     uint32_t      *genlen = xmalloc((size_t)n * sizeof(uint32_t));
     uint8_t       *fin    = xmalloc((size_t)n * sizeof(uint8_t));
     for (int i = 0; i < n; i++) { ptok[i] = prompts[i].v; plen[i] = (uint32_t)prompts[i].len; }
 
     const bool ok = ds4_batch_generate_core(&g, &e->model, &e->weights,
-                                            ptok, plen, (uint32_t)n, max_new, eos_id,
+                                            ptok, plen, (uint32_t)n, mn, ei, gen_stride,
                                             gen, genlen, fin);
     if (ok) {
         for (int i = 0; i < n; i++) {
             const uint32_t gl = genlen[i];
             out[i].tokens = xmalloc((size_t)(gl ? gl : 1u) * sizeof(int));
-            memcpy(out[i].tokens, gen + (size_t)i * max_new, (size_t)gl * sizeof(int));
+            memcpy(out[i].tokens, gen + (size_t)i * gen_stride, (size_t)gl * sizeof(int));
             out[i].n_tokens = (int)gl;
             out[i].finish = fin[i] ? 1 : 0;
         }
@@ -25994,6 +26013,28 @@ int ds4_engine_batched_generate(
     return ok ? 0 : 1;
 #endif
 #undef BG_API_ERR
+}
+
+/* Scalar convenience wrapper: same budget + EOS for every sequence. */
+int ds4_engine_batched_generate(
+        ds4_engine                   *e,
+        const ds4_tokens             *prompts,
+        int                           n,
+        int                           ctx_size,
+        const ds4_batch_gen_options  *opts,
+        ds4_batch_gen_result         *out,
+        char                         *err,
+        size_t                        errlen) {
+    if (out) for (int i = 0; i < (n > 0 ? n : 0); i++) { out[i].tokens = NULL; out[i].n_tokens = 0; out[i].finish = 0; }
+    if (!opts) { if (err && errlen) snprintf(err, errlen, "batched_generate: null argument"); return 1; }
+    if (n <= 0 || n > DS4_MULTISEQ_MAX_SEQ) {
+        if (err && errlen) snprintf(err, errlen, "batched_generate: n=%d out of [1,%d]", n, DS4_MULTISEQ_MAX_SEQ);
+        return 1;
+    }
+    int mn[DS4_MULTISEQ_MAX_SEQ];
+    int ei[DS4_MULTISEQ_MAX_SEQ];
+    for (int i = 0; i < n; i++) { mn[i] = opts->max_new_tokens; ei[i] = opts->eos_id; }
+    return ds4_engine_batched_generate_ex(e, prompts, n, ctx_size, mn, ei, out, err, errlen);
 }
 
 int ds4_engine_generate_argmax(
