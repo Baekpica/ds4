@@ -11156,10 +11156,12 @@ static job *dequeue(server *s) {
  * independent RNG stream, so temp>0 requests batch and stay reproducible.  A
  * temp<=0 request still samples greedy argmax in the engine (sample_top_p_min_p
  * short-circuits), so the W1/W3 determinism golden is preserved.
- * Thinking stays EXCLUDED: generate_job() overrides temperature for thinking AND
- * splits reasoning_content/content (single-path SSE state machine + buffered
- * split), which the content-only continuous stream (cont_stream) does not yet do
- * -- batching thinking needs that reasoning/content split first (W7 follow-up).
+ * W7-followup: THINKING is batchable too -- cont_admit mirrors generate_job's
+ * think-mode sampling override (temp/top-k/top-p/min-p -> defaults), and the
+ * continuous stream reuses the single path's openai_stream projection to split
+ * reasoning_content vs content (cont_stream.ostream).  (The argmax-only STATIC
+ * path still excludes thinking -- see job_is_static_batchable -- because it can't
+ * apply the override.)
  * W6: streaming IS batchable -- the continuous path streams each row's tokens as
  * produced (cont_on_token); only OpenAI chat/completion SSE is handled, which is
  * why anthropic/responses (api != API_OPENAI) and token-id echo stay excluded. */
@@ -11168,19 +11170,20 @@ static bool job_is_batchable(const request *r) {
         && (r->kind == REQ_CHAT || r->kind == REQ_COMPLETION)
         && !r->has_tools
         && !r->return_token_ids
-        && r->stops.len == 0
-        && !ds4_think_mode_enabled(r->think_mode);
+        && r->stops.len == 0;
 }
 
 /* The STATIC W3/W4 batched path (coalesce_gather -> generate_batch_jobs) writes one
- * BUFFERED response per job AND samples greedy argmax ONLY (no per-seq sampler), so
- * it can serve a request only if it is batchable, NON-streaming, and temperature<=0.
- * Streaming goes to the continuous/single path (W6); temp>0 goes to the continuous
- * path (per-seq sampler) or the single path (generate_job) -- never here, or its
- * temperature/seed would be silently ignored.  ONE predicate so the two callers
- * (coalesce_gather peers + worker_main dispatch) cannot drift apart. */
+ * BUFFERED response per job AND samples greedy argmax ONLY (no per-seq sampler, no
+ * think-mode override), so it can serve a request only if it is batchable,
+ * NON-streaming, temperature<=0, AND non-thinking.  Streaming goes to the
+ * continuous/single path (W6); temp>0 and thinking go to the continuous path
+ * (per-seq sampler + think override) or the single path (generate_job) -- never
+ * here, or temperature/seed/reasoning would be silently wrong.  ONE predicate so
+ * the two callers (coalesce_gather peers + worker_main dispatch) cannot drift. */
 static bool job_is_static_batchable(const request *r) {
-    return job_is_batchable(r) && !r->stream && r->temperature <= 0.0f;
+    return job_is_batchable(r) && !r->stream && r->temperature <= 0.0f
+        && !ds4_think_mode_enabled(r->think_mode);
 }
 
 static void job_finish(job *j) {
@@ -11449,17 +11452,27 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     req->max_new = j->req.max_tokens > 0 ? j->req.max_tokens : s->default_tokens;
     req->eos     = ds4_token_eos(s->engine);
     req->user    = j;
-    /* W7: per-seq sampling.  job_is_batchable excludes thinking, so generate_job's
-     * think-mode temperature override never applies here -- pass the request's own
-     * params straight through (temperature<=0 => the engine samples greedy argmax,
-     * matching the W5/W6 path).  resolve_job_seed gives an unseeded request the same
+    /* W7: per-seq sampling.  resolve_job_seed gives an unseeded request the same
      * distinct, non-repeating stream the single path would (shared helper, so the two
      * paths can't desync).  s->seq is read here on the single worker thread only (no
-     * other thread mints response ids), so the read needs no lock. */
-    req->temperature = j->req.temperature;
-    req->top_k       = j->req.top_k;
-    req->top_p       = j->req.top_p;
-    req->min_p       = j->req.min_p;
+     * other thread mints response ids), so the read needs no lock.
+     * W7-followup: when thinking is enabled, generate_job OVERRIDES the sampling
+     * params (reasoning is sampled stochastically regardless of the requested
+     * temperature) -- mirror that EXACTLY so a batched thinking request matches the
+     * single path.  (Tool-call temp=0 override is N/A: job_is_batchable excludes
+     * tools.)  Otherwise pass the request's own params through (temperature<=0 =>
+     * the engine samples greedy argmax, matching the W5/W6 path). */
+    if (ds4_think_mode_enabled(j->req.think_mode)) {
+        req->temperature = DS4_DEFAULT_TEMPERATURE;
+        req->top_k       = 0;
+        req->top_p       = DS4_DEFAULT_TOP_P;
+        req->min_p       = DS4_DEFAULT_MIN_P;
+    } else {
+        req->temperature = j->req.temperature;
+        req->top_k       = j->req.top_k;
+        req->top_p       = j->req.top_p;
+        req->min_p       = j->req.min_p;
+    }
     req->seed        = resolve_job_seed(s, j);
     return 1;
 }
@@ -11475,8 +11488,12 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
  * no reasoning/content split, no tool deltas, no token_ids. */
 struct cont_stream {
     char   id[96];        /* minted chatcmpl-/cmpl-<seq> */
-    buf    text;          /* cumulative detok'd output */
-    size_t emitted;       /* bytes already streamed as deltas */
+    buf    text;          /* cumulative detok'd output (the openai_stream "raw" buffer) */
+    /* W7-followup: reuse the single path's OpenAI SSE projection so a thinking
+     * request streams reasoning_content vs content with the SAME <think>/</think>
+     * split + hold-back logic.  job_is_batchable still excludes tools + token_ids,
+     * so only the THINKING/TEXT modes are exercised here. */
+    openai_stream ostream;
     int    prompt_tokens; /* for the usage chunk */
     int    completion;    /* visible (non-EOS) tokens streamed */
     bool   started;       /* SSE headers (+ chat role preamble) sent */
@@ -11501,6 +11518,7 @@ static void cont_stream_start(server *s, job *j) {
              (unsigned long long)++s->seq);
     st->prompt_tokens = j->req.prompt.len;
     st->started = true;
+    openai_stream_start(&j->req, &st->ostream); /* THINKING if think enabled, else TEXT */
     if (!sse_headers(j->fd, s->enable_cors)) { st->failed = true; return; }
     if (j->req.kind == REQ_CHAT && !sse_chunk(j->fd, &j->req, st->id, NULL, NULL))
         st->failed = true;                     /* {"delta":{"role":"assistant"}} */
@@ -11512,14 +11530,16 @@ static void cont_stream_start(server *s, job *j) {
 static void cont_stream_finalize(server *s, job *j, const char *fin) {
     cont_stream *st = cont_stream_ensure(j);   /* empty completion (EOS at seed) still closes cleanly */
     if (!st->started) cont_stream_start(s, j);
-    if (!st->failed && st->text.len > st->emitted) {
-        char *d = xstrndup(st->text.ptr + st->emitted, st->text.len - st->emitted);
-        if (!sse_chunk(j->fd, &j->req, st->id, d, NULL)) st->failed = true;
-        free(d);
-        st->emitted = st->text.len;
+    /* Flush any held-back reasoning/content tail, emit the finish chunk + usage +
+     * [DONE] -- the exact single-path finalize (no tools on this path). */
+    if (!st->failed) {
+        tool_calls empty = {0};
+        if (!openai_sse_finish_live(j->fd, s, &j->req, st->id, &st->ostream,
+                                    st->text.ptr ? st->text.ptr : "", st->text.len,
+                                    &empty, fin, st->prompt_tokens, st->completion))
+            st->failed = true;
     }
-    if (!st->failed) sse_chunk(j->fd, &j->req, st->id, NULL, fin);
-    if (!st->failed) sse_done(j->fd, &j->req, st->id, st->prompt_tokens, st->completion);
+    openai_stream_free(&st->ostream);
     buf_free(&st->text);
     free(st);
     j->cstream = NULL;
@@ -11540,15 +11560,13 @@ static int cont_on_token(void *ud, void *user, int token) {
     char *piece = ds4_token_text(s->engine, token, &pl);
     if (piece) { buf_append(&st->text, piece, pl); free(piece); }
     st->completion++;
-    /* Emit the UTF-8-safe prefix not yet sent (hold back an incomplete trailing
-     * multibyte char until the next token completes it). */
-    size_t safe = utf8_stream_safe_len(st->text.ptr, st->emitted, st->text.len, false);
-    if (safe > st->emitted) {
-        char *d = xstrndup(st->text.ptr + st->emitted, safe - st->emitted);
-        bool ok = sse_chunk(j->fd, &j->req, st->id, d, NULL);   /* -> job_emit (client_gone => false) */
-        free(d);
-        st->emitted = safe;
-        if (!ok) { st->failed = true; t_emit_job = NULL; return 0; }
+    /* Project the cumulative raw buffer into OpenAI SSE deltas: reasoning_content
+     * while inside <think>...</think> (thinking requests), content after; the
+     * machine handles UTF-8 + close-tag hold-back.  Writes redirect into j->out
+     * (W8a t_emit_job); a false return means the client is gone -> evict. */
+    if (!openai_sse_stream_update(j->fd, s, &j->req, st->id, &st->ostream,
+                                  st->text.ptr ? st->text.ptr : "", st->text.len, false)) {
+        st->failed = true; t_emit_job = NULL; return 0;
     }
     t_emit_job = NULL;
     return 1;
