@@ -24913,6 +24913,18 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
  * "n=1 batch == decode" (lossless/argmax) is the Step-1 validation gate.
  * Per-row INDEPENDENT positions and per-sequence KV (true multi-sequence) are
  * Steps 2-4; this skeleton runs all n rows as one sequence sharing one KV. */
+/* W8 reassessment (throwaway, env DS4_CONT_PROFILE, default OFF): per-phase
+ * wall-time accounting for the continuous batched decode, to decide whether
+ * kernel-launch overhead (-> graph capture, W8c) or output-head+readback
+ * (-> overlap/GPU-sampler, W8b) dominates.  Host-only timers, zero GPU-semantics
+ * impact.  ds4_engine_continuous_generate resets these at entry and prints them
+ * at exit; metal_graph_batch_eval_logits accumulates fwd vs post per call. */
+static int      g_cont_prof       = -1;
+static double   g_cont_be_fwd_s   = 0.0;   /* 43-layer batched forward */
+static double   g_cont_be_post_s  = 0.0;   /* output head + logit readback */
+static uint64_t g_cont_be_calls   = 0;
+static uint64_t g_cont_be_rows    = 0;     /* Sum of n over all calls */
+
 static bool metal_graph_batch_eval_logits(
         ds4_gpu_graph     *g,
         const ds4_model   *model,
@@ -24929,6 +24941,9 @@ static bool metal_graph_batch_eval_logits(
         announced = 1;
         fprintf(stderr, "ds4: batch_eval engaged (first call n=%u pos0=%u)\n", n, pos0);
     }
+
+    if (g_cont_prof < 0) g_cont_prof = getenv("DS4_CONT_PROFILE") != NULL ? 1 : 0;
+    const double be_t0 = g_cont_prof ? now_sec() : 0.0;
 
     /* The embed helpers source tokens from a token_vec by index; build a small
      * temp vec [tokens0..n).  Embedding is position-independent, so the source
@@ -24967,6 +24982,14 @@ static bool metal_graph_batch_eval_logits(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (!ok) return false;
+
+    double be_t_fwd = be_t0;
+    if (g_cont_prof) {
+        be_t_fwd = now_sec();
+        g_cont_be_fwd_s += be_t_fwd - be_t0;
+        g_cont_be_calls++;
+        g_cont_be_rows  += n;
+    }
 
     /* Step 6 bench knob: DS4_BENCH_FWD_ONLY skips the per-row output head +
      * logit readback so the 43-layer forward can be timed in isolation (the
@@ -25023,6 +25046,7 @@ static bool metal_graph_batch_eval_logits(
         }
     }
     if (ok) maybe_dump_first_logits(logits_out);   /* row-0 logits (Step-1 gate) */
+    if (g_cont_prof) g_cont_be_post_s += now_sec() - be_t_fwd;
     return ok;
 }
 
@@ -26638,6 +26662,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     }
 
     uint32_t steps = 0;
+    /* W8 reassessment: reset per-call phase accumulators (see DS4_CONT_PROFILE). */
+    if (g_cont_prof < 0) g_cont_prof = getenv("DS4_CONT_PROFILE") != NULL ? 1 : 0;
+    if (g_cont_prof) { g_cont_be_fwd_s = g_cont_be_post_s = 0.0; g_cont_be_calls = g_cont_be_rows = 0; }
+    double t_sample_s = 0.0;
     while (ok) {
         /* ---- ADMIT: fill free banks from the waiting queue. ---- */
         bool admit_drained = false;
@@ -26734,6 +26762,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         steps++;
 
         /* ---- sample + evict finished. ---- */
+        const double smp_t0 = g_cont_prof ? now_sec() : 0.0;
         for (uint32_t r = 0; r < k; r++) {
             const uint32_t b = rowbank[r];
             const int nt = sample_top_p_min_p(logits + (uint64_t)r * DS4_N_VOCAB, DS4_N_VOCAB,
@@ -26750,10 +26779,30 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
             }
         }
+        if (g_cont_prof) t_sample_s += now_sec() - smp_t0;
     }
 
     if (getenv("DS4_CONT_GEN_TIMING"))
         fprintf(stderr, "ds4: continuous gen: %u decode steps over max_seq=%u\n", steps, MS);
+
+    if (g_cont_prof) {
+        const double tot = g_cont_be_fwd_s + g_cont_be_post_s + t_sample_s;
+        fprintf(stderr,
+            "ds4: CONT_PROFILE steps=%u be_calls=%llu rows=%llu avg_k=%.2f | "
+            "per-step: fwd=%.3fms post=%.3fms sample=%.3fms | "
+            "totals: fwd=%.1fms(%.0f%%) post=%.1fms(%.0f%%) sample=%.1fms(%.0f%%) | "
+            "tok=%.3fms/tok\n",
+            steps,
+            (unsigned long long)g_cont_be_calls, (unsigned long long)g_cont_be_rows,
+            g_cont_be_calls ? (double)g_cont_be_rows / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_be_fwd_s  * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_be_post_s * 1e3 / (double)g_cont_be_calls : 0.0,
+            steps          ? t_sample_s        * 1e3 / (double)steps           : 0.0,
+            g_cont_be_fwd_s  * 1e3, tot > 0 ? g_cont_be_fwd_s  / tot * 100.0 : 0.0,
+            g_cont_be_post_s * 1e3, tot > 0 ? g_cont_be_post_s / tot * 100.0 : 0.0,
+            t_sample_s       * 1e3, tot > 0 ? t_sample_s       / tot * 100.0 : 0.0,
+            g_cont_be_rows ? tot * 1e3 / (double)g_cont_be_rows : 0.0);
+    }
 
     g->batch_multiseq = false;
     g->batch_n_seq = 0;
