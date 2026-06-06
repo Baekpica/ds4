@@ -4133,7 +4133,15 @@ static long long wall_ms(void) {
     return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+/* W8a: when set (on the worker thread, around a continuous-batch callback),
+ * send_all() buffers into the job's async `out` instead of writing the socket, so
+ * a slow client never stalls the GPU loop -- client_main drains `out` to the fd. */
+struct job;
+static __thread struct job *t_emit_job;
+static bool job_emit(struct job *j, const void *p, size_t n);
+
 static bool send_all(int fd, const void *p, size_t n) {
+    if (t_emit_job) return job_emit(t_emit_job, p, n);   /* W8a: redirect to job buffer */
     const char *s = p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
@@ -7885,6 +7893,16 @@ struct job {
      * path (NULL on every other path).  Set on the first streamed token, freed
      * when the sequence finalizes; only the single worker thread touches it. */
     cont_stream *cstream;
+    /* W8a: async output -- the continuous-batch worker (under gen_mu) appends
+     * response bytes here via job_emit instead of writing the socket directly, and
+     * client_main (this job's own client thread) drains `out` to `fd`.  This keeps
+     * a slow/stalled client off the GPU-critical section: the worker only ever
+     * touches a mutex-guarded memory buffer, never a blocking socket.  The single
+     * and static-batch paths leave `out` empty and write `fd` directly on the
+     * worker (no head-of-line risk there), so client_main just waits for done.
+     * Guarded by `mu`/`cv` (same lock as `done`). */
+    buf  out;
+    bool client_gone;       /* client_main's send failed, or `out` hit its cap */
 };
 
 /* =========================================================================
@@ -11172,6 +11190,28 @@ static void job_finish(job *j) {
     pthread_mutex_unlock(&j->mu);
 }
 
+/* W8a: bound a slow client's buffered output.  If the worker outruns the client
+ * by more than this, evict the row rather than grow the buffer without limit. */
+#define DS4_JOB_OUT_CAP (16u * 1024u * 1024u)
+
+/* W8a: append worker-produced response bytes to the job's async `out` buffer and
+ * wake client_main to drain them.  Returns false once the client is gone (its send
+ * failed) or the buffer hit its cap, so the continuous producer stops emitting and
+ * the engine evicts that row (bounded, like the W6 fail-row, but the GPU loop is
+ * never blocked on a socket).  Called only on the worker thread via send_all's
+ * t_emit_job redirect. */
+static bool job_emit(struct job *j, const void *p, size_t n) {
+    pthread_mutex_lock(&j->mu);
+    if (!j->client_gone) {
+        if (j->out.len + n > DS4_JOB_OUT_CAP) j->client_gone = true;   /* too slow -> evict */
+        else buf_append(&j->out, p, n);
+    }
+    bool gone = j->client_gone;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+    return !gone;
+}
+
 /* The original single-request path: serialize the GPU, run, signal done. */
 static void run_job_single(server *s, job *j) {
     pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
@@ -11493,8 +11533,9 @@ static int cont_on_token(void *ud, void *user, int token) {
     job *j = user;
     if (!j->req.stream) return 1;              /* non-streaming: engine buffers -> on_done */
     cont_stream *st = cont_stream_ensure(j);
+    t_emit_job = j;                            /* W8a: send_all -> j->out (off the GPU path) */
     if (!st->started) cont_stream_start(s, j); /* first token: headers + role preamble */
-    if (st->failed) return 0;
+    if (st->failed || j->client_gone) { t_emit_job = NULL; return 0; }
     size_t pl = 0;
     char *piece = ds4_token_text(s->engine, token, &pl);
     if (piece) { buf_append(&st->text, piece, pl); free(piece); }
@@ -11504,11 +11545,12 @@ static int cont_on_token(void *ud, void *user, int token) {
     size_t safe = utf8_stream_safe_len(st->text.ptr, st->emitted, st->text.len, false);
     if (safe > st->emitted) {
         char *d = xstrndup(st->text.ptr + st->emitted, safe - st->emitted);
-        bool ok = sse_chunk(j->fd, &j->req, st->id, d, NULL);
+        bool ok = sse_chunk(j->fd, &j->req, st->id, d, NULL);   /* -> job_emit (client_gone => false) */
         free(d);
         st->emitted = safe;
-        if (!ok) { st->failed = true; return 0; }
+        if (!ok) { st->failed = true; t_emit_job = NULL; return 0; }
     }
+    t_emit_job = NULL;
     return 1;
 }
 
@@ -11523,12 +11565,14 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
         if (cs->inflight[i] == user) { cs->inflight[i] = NULL; break; }
     cs->served++;
     job *j = user;
+    t_emit_job = j;                            /* W8a: buffer the finalize/response into j->out */
     if (j->req.stream) {                       /* W6: close the live SSE stream. */
         cont_stream_finalize(cs->s, j, finish ? "stop" : "length");
     } else {                                   /* W5: write the whole response now. */
         ds4_batch_gen_result r = { .tokens = (int *)tokens, .n_tokens = n, .finish = finish };
         write_batch_completion(cs->s, j, &r);
     }
+    t_emit_job = NULL;                         /* clear BEFORE job_finish (the last touch) */
     job_finish(j);
 }
 
@@ -11564,8 +11608,10 @@ static void generate_continuous_jobs(server *s, job *first) {
     for (int i = 0; i < cs.max_seq; i++) {
         job *jb = cs.inflight[i];
         if (!jb) continue;
-        if (jb->cstream) { cont_stream_finalize(s, jb, "length"); job_finish(jb); }
-        else             run_job_single(s, jb);
+        if (jb->cstream) {       /* already streamed into jb->out -> finalize there too */
+            t_emit_job = jb; cont_stream_finalize(s, jb, "length"); t_emit_job = NULL;
+            job_finish(jb);
+        } else run_job_single(s, jb);   /* never emitted (out empty) -> direct fd is fine */
         fallback++;
     }
     if (cs.primed) { run_job_single(s, cs.primed); fallback++; }
@@ -12020,11 +12066,32 @@ static void *client_main(void *arg) {
         request_free(&j.req);
         goto done;
     }
-    while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
+    /* W8a: drain worker-produced output to the socket on THIS (client) thread, so a
+     * slow client never blocks the GPU worker.  The continuous path appends bytes
+     * via job_emit (under j.mu) and signals; we send whatever is buffered with j.mu
+     * RELEASED (so the worker's next append never waits on our socket), then wait for
+     * more or for done.  The single/static paths leave j.out empty and write the
+     * socket directly on the worker, so here the loop just waits for done.  A failed
+     * send sets client_gone, which the worker reads to evict the row (bounded). */
+    for (;;) {
+        while (!j.done && j.out.len == 0) pthread_cond_wait(&j.cv, &j.mu);
+        if (j.out.len > 0) {
+            buf pending = j.out;
+            j.out = (buf){0};
+            bool gone = j.client_gone;
+            pthread_mutex_unlock(&j.mu);
+            if (!gone && !send_all(fd, pending.ptr, pending.len)) gone = true;
+            buf_free(&pending);
+            pthread_mutex_lock(&j.mu);
+            if (gone) j.client_gone = true;
+        }
+        if (j.done && j.out.len == 0) break;
+    }
     pthread_mutex_unlock(&j.mu);
 
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
+    buf_free(&j.out);
     request_free(&j.req);
 done:
     close(fd);
