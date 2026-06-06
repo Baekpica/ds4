@@ -12581,7 +12581,14 @@ int main(int argc, char **argv) {
         const char *ce = getenv("DS4_SERVER_COALESCE");
         const bool coalesce_on = !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
         const char *cm = getenv("DS4_SERVER_COALESCE_MAX");
-        int cmax = cm ? atoi(cm) : 16;
+        /* W8 reassessment (2026-06-06): default raised 16->32.  Measured on GB10
+         * (ctx=4096) max_seq=32 yields ~24% higher decode throughput than 16
+         * (6.60 vs 8.70 ms/tok at saturation) -- the continuous batch keeps
+         * amortizing the ~51ms fixed forward cost.  This dwarfs the ~3% CUDA-graph
+         * ceiling that deprioritized W8c/W8b.  max_seq=64 did NOT fit GB10 KV at
+         * ctx=4096, so we fit-or-reduce below rather than silently falling back to
+         * the per-call static path (which loses W5-W8 continuous features). */
+        int cmax = cm ? atoi(cm) : 32;
         if (cmax < 1) cmax = 1;
         if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
         const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
@@ -12590,14 +12597,27 @@ int main(int argc, char **argv) {
         if (cmaxtok < cmax) cmaxtok = cmax;        /* need >=1 token per seq */
         if (coalesce_on && cmax > 1) {
             char cerr[256] = {0};
-            if (ds4_batch_ctx_create(s.engine, ds4_session_ctx(s.session), cmax, cmaxtok,
-                                     &s.batch_ctx, cerr, sizeof(cerr)) == 0) {
-                s.batch_ctx_max_seq = cmax;
-                s.batch_ctx_max_tokens = cmaxtok;
-                server_log(DS4_LOG_DEFAULT,
-                           "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d)",
-                           cmax, cmaxtok, ds4_session_ctx(s.session));
-            } else {
+            /* Fit-or-reduce: if the KV slab for cmax banks won't fit (larger -c
+             * contexts, tighter memory), halve and retry down to 2 rather than
+             * dropping all the way to the per-call path.  Always get the largest
+             * continuous batch that fits. */
+            int try_seq = cmax;
+            bool made = false;
+            while (try_seq >= 2) {
+                if (ds4_batch_ctx_create(s.engine, ds4_session_ctx(s.session), try_seq, cmaxtok,
+                                         &s.batch_ctx, cerr, sizeof(cerr)) == 0) {
+                    s.batch_ctx_max_seq = try_seq;
+                    s.batch_ctx_max_tokens = cmaxtok;
+                    server_log(DS4_LOG_DEFAULT,
+                               "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d)%s",
+                               try_seq, cmaxtok, ds4_session_ctx(s.session),
+                               try_seq < cmax ? " [reduced from requested to fit memory]" : "");
+                    made = true;
+                    break;
+                }
+                try_seq /= 2;   /* KV slab didn't fit; try a smaller continuous batch. */
+            }
+            if (!made) {
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: persistent batch ctx unavailable (%s); using per-call batch path",
                            cerr[0] ? cerr : "unknown error");
