@@ -226,11 +226,17 @@ typedef struct {
 /* admit: fill *req for the next waiting request and return 1; return 0 when none is
  *   available right now (the loop keeps decoding the active set and ends once the
  *   active set is empty AND admit returns 0).
+ * on_token (may be NULL): called once per newly sampled NON-EOS token, in order,
+ *   for the sequence identified by `user` (seed token then each decode step).
+ *   Return 1 to keep generating, 0 to ABORT that sequence now (e.g. its client
+ *   disconnected) -- the engine evicts it this step and still calls on_done
+ *   (finish=0).  NULL disables streaming (pure buffer-then-on_done, the W5 path).
  * on_done: a sequence finished -- tokens[0..n) is its full generation (caller must
- *   NOT free; valid only during the call), finish=1 if it hit EOS (0 = budget).
+ *   NOT free; valid only during the call), finish=1 if it hit EOS (0 = budget/abort).
  * Returns 0 on success. */
 int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                     int (*admit)(void *ud, ds4_cont_request *req),
+                                    int (*on_token)(void *ud, void *user, int token),
                                     void (*on_done)(void *ud, void *user,
                                                     const int *tokens, int n, int finish),
                                     void *ud, char *err, size_t errlen);

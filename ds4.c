@@ -26587,6 +26587,7 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
  * (idle banks have ms_n_comp=0 so they don't raise the max read-count).  Greedy only. */
 int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                    int (*admit)(void *ud, ds4_cont_request *req),
+                                   int (*on_token)(void *ud, void *user, int token),
                                    void (*on_done)(void *ud, void *user,
                                                    const int *tokens, int n, int finish),
                                    void *ud, char *err, size_t errlen) {
@@ -26660,7 +26661,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             bmax[b] = mn;
             usr[b]  = req.user;
             const bool hit_eos = (beos[b] >= 0 && nt == beos[b]);
-            if (hit_eos || glen[b] >= mn) {
+            /* Stream the seed token (skip EOS, which carries no visible text and
+             * is the stop signal); on_token returning 0 aborts this seq. */
+            bool aborted = false;
+            if (!hit_eos && on_token && !on_token(ud, usr[b], nt)) aborted = true;
+            if (hit_eos || glen[b] >= mn || aborted) {
                 on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                 free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
             } else {
@@ -26720,7 +26725,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             cur[b] = nt;
             posv[b]++;
             const bool hit_eos = (beos[b] >= 0 && nt == beos[b]);
-            if (hit_eos || glen[b] >= bmax[b]) {
+            bool aborted = false;
+            if (!hit_eos && on_token && !on_token(ud, usr[b], nt)) aborted = true;
+            if (hit_eos || glen[b] >= bmax[b] || aborted) {
                 on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                 free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
             }
@@ -26762,10 +26769,11 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
 }
 int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                    int (*admit)(void *ud, ds4_cont_request *req),
+                                   int (*on_token)(void *ud, void *user, int token),
                                    void (*on_done)(void *ud, void *user,
                                                    const int *tokens, int n, int finish),
                                    void *ud, char *err, size_t errlen) {
-    (void)ctx; (void)admit; (void)on_done; (void)ud;
+    (void)ctx; (void)admit; (void)on_token; (void)on_done; (void)ud;
     if (err && errlen) snprintf(err, errlen, "continuous_generate: build has no graph backend");
     return 1;
 }

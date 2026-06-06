@@ -7757,6 +7757,7 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
 }
 
 typedef struct job job;
+typedef struct cont_stream cont_stream;   /* W6: per-seq SSE streaming state */
 
 typedef ds4_kvstore_entry kv_entry;
 typedef ds4_kvstore_options kv_cache_options;
@@ -7880,6 +7881,10 @@ struct job {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
+    /* W6: per-seq SSE streaming scratch, owned by the continuous-batching worker
+     * path (NULL on every other path).  Set on the first streamed token, freed
+     * when the sequence finalizes; only the single worker thread touches it. */
+    cont_stream *cstream;
 };
 
 /* =========================================================================
@@ -11114,20 +11119,22 @@ static job *dequeue(server *s) {
 #define DS4_COALESCE_HARD_MAX 64
 
 /* A request may be coalesced only when its completion does not depend on any of
- * generate_job()'s richer machinery (tools, stop sequences, streaming, token-id
- * echo, anthropic/responses envelopes) AND its single-path decode would be plain
- * greedy argmax -- so the batched core (always argmax) produces the same answer.
+ * generate_job()'s richer machinery (tools, stop sequences, token-id echo,
+ * anthropic/responses envelopes) AND its single-path decode would be plain greedy
+ * argmax -- so the batched core (always argmax) produces the same answer.
  * Two things force the greedy requirement:
  *   - temperature <= 0 (the request itself asks for greedy), and
  *   - thinking DISABLED: generate_job() OVERRIDES temperature to
  *     DS4_DEFAULT_TEMPERATURE (1.0) whenever think_mode is enabled (it samples
  *     reasoning stochastically regardless of the requested temperature), so a
  *     thinking request is NOT greedy on the single path and must not be coalesced
- *     into the greedy batch.  (Per-seq sampling is a future phase.) */
+ *     into the greedy batch.  (Per-seq sampling is a future phase.)
+ * W6: streaming IS batchable now -- the continuous path streams each row's tokens
+ * as produced (cont_on_token); only OpenAI chat/completion SSE is handled, which
+ * is why anthropic/responses (api != API_OPENAI) and token-id echo stay excluded. */
 static bool job_is_batchable(const request *r) {
     return r->api == API_OPENAI
         && (r->kind == REQ_CHAT || r->kind == REQ_COMPLETION)
-        && !r->stream
         && !r->has_tools
         && !r->return_token_ids
         && r->stops.len == 0
@@ -11167,7 +11174,10 @@ static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_t
     bool have_deadline = false;
     pthread_mutex_lock(&s->mu);
     while (n < cap) {
-        if (s->head && job_is_batchable(&s->head->req)) {
+        /* The STATIC batched path writes one buffered response per job, so it can
+         * only gather NON-streaming jobs (W6 streaming is handled by the continuous
+         * path / single path).  A streaming head stops the gather, preserving FIFO. */
+        if (s->head && job_is_batchable(&s->head->req) && !s->head->req.stream) {
             if (max_tok_total > 0 && tok_total + s->head->req.prompt.len > max_tok_total)
                 break;                         /* token budget: split into another batch */
             job *g = s->head;
@@ -11380,9 +11390,98 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     return 1;
 }
 
+/* ---- W6: per-seq SSE streaming ---------------------------------------------
+ * For a STREAMING job in the continuous batch, the engine reports each non-EOS
+ * token via cont_on_token as it is produced; we detok it and emit a content
+ * delta on that job's socket immediately, so a short request streams while long
+ * ones keep decoding.  Writes happen on the worker thread under gen_mu, so a
+ * stalled/closed client must not wedge the batch: a failed send marks the row
+ * and returns 0, telling the engine to evict that sequence.  Greedy + non-thinking
+ * + non-tool only (job_is_batchable), so this is the simple content-only stream --
+ * no reasoning/content split, no tool deltas, no token_ids. */
+struct cont_stream {
+    char   id[96];        /* minted chatcmpl-/cmpl-<seq> */
+    buf    text;          /* cumulative detok'd output */
+    size_t emitted;       /* bytes already streamed as deltas */
+    int    prompt_tokens; /* for the usage chunk */
+    int    completion;    /* visible (non-EOS) tokens streamed */
+    bool   started;       /* SSE headers (+ chat role preamble) sent */
+    bool   failed;        /* a socket write failed -> stop writing, just finalize */
+};
+
+/* Lazily allocate the per-seq stream state (zeroed). */
+static cont_stream *cont_stream_ensure(job *j) {
+    if (!j->cstream) {
+        j->cstream = xmalloc(sizeof(*j->cstream));
+        memset(j->cstream, 0, sizeof(*j->cstream));
+    }
+    return j->cstream;
+}
+
+/* Send SSE headers + (chat) role preamble and mint the completion id.  Sets
+ * failed (not started=false) on a write error so callers stop touching the fd. */
+static void cont_stream_start(server *s, job *j) {
+    cont_stream *st = j->cstream;
+    snprintf(st->id, sizeof(st->id), "%s-%llu",
+             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+             (unsigned long long)++s->seq);
+    st->prompt_tokens = j->req.prompt.len;
+    st->started = true;
+    if (!sse_headers(j->fd, s->enable_cors)) { st->failed = true; return; }
+    if (j->req.kind == REQ_CHAT && !sse_chunk(j->fd, &j->req, st->id, NULL, NULL))
+        st->failed = true;                     /* {"delta":{"role":"assistant"}} */
+}
+
+/* Flush any held-back tail, emit the finish chunk + [DONE], and free the state.
+ * fin is "stop" (EOS) or "length" (budget/aborted).  Does NOT job_finish (caller
+ * does, as the last touch). */
+static void cont_stream_finalize(server *s, job *j, const char *fin) {
+    cont_stream *st = cont_stream_ensure(j);   /* empty completion (EOS at seed) still closes cleanly */
+    if (!st->started) cont_stream_start(s, j);
+    if (!st->failed && st->text.len > st->emitted) {
+        char *d = xstrndup(st->text.ptr + st->emitted, st->text.len - st->emitted);
+        if (!sse_chunk(j->fd, &j->req, st->id, d, NULL)) st->failed = true;
+        free(d);
+        st->emitted = st->text.len;
+    }
+    if (!st->failed) sse_chunk(j->fd, &j->req, st->id, NULL, fin);
+    if (!st->failed) sse_done(j->fd, &j->req, st->id, st->prompt_tokens, st->completion);
+    buf_free(&st->text);
+    free(st);
+    j->cstream = NULL;
+}
+
+/* on_token: stream one non-EOS token as a content delta.  Returns 0 to tell the
+ * engine to ABORT this sequence (client gone / write stalled), 1 to continue. */
+static int cont_on_token(void *ud, void *user, int token) {
+    cont_sched *cs = ud;
+    server *s = cs->s;
+    job *j = user;
+    if (!j->req.stream) return 1;              /* non-streaming: engine buffers -> on_done */
+    cont_stream *st = cont_stream_ensure(j);
+    if (!st->started) cont_stream_start(s, j); /* first token: headers + role preamble */
+    if (st->failed) return 0;
+    size_t pl = 0;
+    char *piece = ds4_token_text(s->engine, token, &pl);
+    if (piece) { buf_append(&st->text, piece, pl); free(piece); }
+    st->completion++;
+    /* Emit the UTF-8-safe prefix not yet sent (hold back an incomplete trailing
+     * multibyte char until the next token completes it). */
+    size_t safe = utf8_stream_safe_len(st->text.ptr, st->emitted, st->text.len, false);
+    if (safe > st->emitted) {
+        char *d = xstrndup(st->text.ptr + st->emitted, safe - st->emitted);
+        bool ok = sse_chunk(j->fd, &j->req, st->id, d, NULL);
+        free(d);
+        st->emitted = safe;
+        if (!ok) { st->failed = true; return 0; }
+    }
+    return 1;
+}
+
 /* on_done: a sequence finished (or was rejected).  tokens==NULL => the engine
  * declined it (oversized); leave it in the in-flight set for the single-path
- * fallback.  Otherwise write its response and finish it (the LAST touch of j). */
+ * fallback.  Otherwise finalize: a streaming job flushes its live SSE stream; a
+ * non-streaming job writes its whole response.  job_finish is the LAST touch. */
 static void cont_on_done(void *ud, void *user, const int *tokens, int n, int finish) {
     cont_sched *cs = ud;
     if (!tokens) return;                       /* rejected: slot stays -> fallback. */
@@ -11390,8 +11489,12 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
         if (cs->inflight[i] == user) { cs->inflight[i] = NULL; break; }
     cs->served++;
     job *j = user;
-    ds4_batch_gen_result r = { .tokens = (int *)tokens, .n_tokens = n, .finish = finish };
-    write_batch_completion(cs->s, j, &r);
+    if (j->req.stream) {                       /* W6: close the live SSE stream. */
+        cont_stream_finalize(cs->s, j, finish ? "stop" : "length");
+    } else {                                   /* W5: write the whole response now. */
+        ds4_batch_gen_result r = { .tokens = (int *)tokens, .n_tokens = n, .finish = finish };
+        write_batch_completion(cs->s, j, &r);
+    }
     job_finish(j);
 }
 
@@ -11411,8 +11514,8 @@ static void generate_continuous_jobs(server *s, job *first) {
 
     char err[256] = {0};
     pthread_mutex_lock(&s->gen_mu);
-    int rc = ds4_engine_continuous_generate(s->batch_ctx, cont_admit, cont_on_done,
-                                            &cs, err, sizeof(err));
+    int rc = ds4_engine_continuous_generate(s->batch_ctx, cont_admit, cont_on_token,
+                                            cont_on_done, &cs, err, sizeof(err));
     pthread_mutex_unlock(&s->gen_mu);
 
     /* Fallback for every job the engine did not finish, so no client can hang:
@@ -11420,10 +11523,17 @@ static void generate_continuous_jobs(server *s, job *first) {
      *    mid-loop failure, or rejected as oversized -> on_done(NULL) keeps slot),
      *  - the primed first job if the engine failed before its very first admit
      *    (cont_admit clears cs.primed once it consumes it).
-     * Run each on the single path now that gen_mu is released. */
+     * A job that already began streaming (cstream set) can't be restarted on the
+     * single path (its SSE headers are on the wire) -- close it gracefully;
+     * everything else runs on the single path now that gen_mu is released. */
     int fallback = 0;
-    for (int i = 0; i < cs.max_seq; i++)
-        if (cs.inflight[i]) { run_job_single(s, cs.inflight[i]); fallback++; }
+    for (int i = 0; i < cs.max_seq; i++) {
+        job *jb = cs.inflight[i];
+        if (!jb) continue;
+        if (jb->cstream) { cont_stream_finalize(s, jb, "length"); job_finish(jb); }
+        else             run_job_single(s, jb);
+        fallback++;
+    }
     if (cs.primed) { run_job_single(s, cs.primed); fallback++; }
     free(cs.inflight);
 
@@ -11464,17 +11574,21 @@ static void *worker_main(void *arg) {
         if (!j) break;
         if (coalesce && cmax > 1 && job_is_batchable(&j->req)) {
             /* W5: continuous path when a ctx exists and the first prompt fits a
-             * single bank; otherwise fall back to W3/W4 static coalescing (which
-             * also covers continuous-off and oversized first prompts). */
+             * single bank (it streams W6 jobs and buffers the rest).  Else fall
+             * back: the static W3/W4 batched path can only carry NON-streaming
+             * jobs (it writes one buffered response each), so a streaming job with
+             * no continuous ctx goes to the single generate_job() stream path. */
             if (continuous && s->batch_ctx && j->req.prompt.len > 0 &&
                 j->req.prompt.len <= ds4_batch_ctx_raw_cap(s->batch_ctx)) {
                 generate_continuous_jobs(s, j);
-            } else {
+            } else if (!j->req.stream) {
                 job *batch[DS4_COALESCE_HARD_MAX];
                 batch[0] = j;
                 int n = coalesce_gather(s, batch, cmax, cwait, cmaxtok);
                 if (n == 1) run_job_single(s, j);
                 else        generate_batch_jobs(s, batch, n);
+            } else {
+                run_job_single(s, j);   /* streaming, no continuous ctx -> single path */
             }
         } else {
             run_job_single(s, j);
