@@ -22116,6 +22116,34 @@ typedef struct {
     uint32_t        n_cur_views;
 } ds4_batch_slabs;
 
+/* Phase 2 S1: per-bank MTP draft state for the continuous batched path.
+ * The single-seq MTP recurrence keeps three pieces of per-sequence state in the
+ * graph: the MTP layer's own raw-KV ring (g->mtp_raw_cache), the recurrent hidden
+ * carry (g->mtp_state_hc / g->mtp_next_hc toggle), and the ring fill counter
+ * (g->mtp_n_raw).  For N concurrent banks each needs its own copy.  This mirrors
+ * ds4_batch_slabs: allocate MS-bank slabs once, save the graph's single-seq
+ * pointers, and repoint g->mtp_raw_cache / mtp_state_hc / mtp_next_hc to ONE
+ * bank's view before that bank's serial draft (mtp_n_raw is a plain host array,
+ * loaded into g->mtp_n_raw on repoint and read back after the draft).  The
+ * drafter's other scratch (mtp_embed/enorm/.../input_hc, g->logits,
+ * g->comp_selected, g->cur_hc/after_ffn_hc) is recomputed per call and shared
+ * safely because banks draft serially within a decode step. */
+typedef struct {
+    uint32_t        N;
+    uint64_t        raw_bank_bytes;     /* raw_cap * head_dim * sizeof(float) */
+    uint64_t        hc_bank_bytes;      /* hc_dim   * sizeof(float)           */
+    ds4_gpu_tensor *multi_mtp_raw;      /* N * raw_bank_bytes */
+    ds4_gpu_tensor *multi_mtp_state;    /* N * hc_bank_bytes  */
+    ds4_gpu_tensor *multi_mtp_next;     /* N * hc_bank_bytes  */
+    ds4_gpu_tensor *saved_mtp_raw;      /* graph's single-seq pointers (restored on free) */
+    ds4_gpu_tensor *saved_mtp_state;
+    ds4_gpu_tensor *saved_mtp_next;
+    ds4_gpu_tensor *cur_mtp_raw;        /* currently-installed bank views (freed on repoint/free) */
+    ds4_gpu_tensor *cur_mtp_state;
+    ds4_gpu_tensor *cur_mtp_next;
+    uint32_t        mtp_n_raw[DS4_MULTISEQ_MAX_SEQ];  /* per-bank ring fill counter */
+} ds4_mtp_slabs;
+
 /* Allocate N per-seq KV banks (raw + attn-comp + attn-state for ratio!=0; index
  * banks additionally for ratio==4) and snapshot the graph's current single-seq
  * cache pointers so ds4_batch_slabs_free can restore them.  Mirrors the byte math
@@ -22260,6 +22288,82 @@ static void ds4_batch_slabs_free(ds4_batch_slabs *sl, ds4_gpu_graph *g) {
         if (sl->multi_issc[il])  ds4_gpu_tensor_free(sl->multi_issc[il]);
     }
     memset(sl, 0, sizeof(*sl));
+}
+
+/* S1: allocate N per-bank MTP draft banks (raw ring + two hc carry buffers).
+ * Requires the graph to have been allocated with enable_mtp=true so g->mtp_*
+ * exist as the single-seq pointers we save and shadow.  Returns false on alloc
+ * failure (caller frees via ds4_mtp_slabs_free). */
+static bool ds4_mtp_slabs_alloc(ds4_mtp_slabs *msl, ds4_gpu_graph *g, uint32_t N) {
+    memset(msl, 0, sizeof(*msl));
+    if (!g->mtp_raw_cache || !g->mtp_state_hc || !g->mtp_next_hc) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    msl->N              = N;
+    msl->raw_bank_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    msl->hc_bank_bytes  = hc_dim * sizeof(float);
+    msl->saved_mtp_raw   = g->mtp_raw_cache;
+    msl->saved_mtp_state = g->mtp_state_hc;
+    msl->saved_mtp_next  = g->mtp_next_hc;
+    msl->multi_mtp_raw   = ds4_gpu_tensor_alloc((uint64_t)N * msl->raw_bank_bytes);
+    msl->multi_mtp_state = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
+    msl->multi_mtp_next  = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
+    return msl->multi_mtp_raw && msl->multi_mtp_state && msl->multi_mtp_next;
+}
+
+/* S1: install bank b's MTP views into g->mtp_raw_cache/mtp_state_hc/mtp_next_hc
+ * and load g->mtp_n_raw from the per-bank counter.  Frees the prior bank's views
+ * first.  Call before bank b's serial draft; after drafting, the caller reads
+ * msl->mtp_n_raw[b] back from g->mtp_n_raw (see ds4_mtp_slabs_save_bank). */
+static bool ds4_mtp_slabs_repoint_bank(ds4_mtp_slabs *msl, ds4_gpu_graph *g, uint32_t b) {
+    if (msl->cur_mtp_raw)   ds4_gpu_tensor_free(msl->cur_mtp_raw);
+    if (msl->cur_mtp_state) ds4_gpu_tensor_free(msl->cur_mtp_state);
+    if (msl->cur_mtp_next)  ds4_gpu_tensor_free(msl->cur_mtp_next);
+    msl->cur_mtp_raw = msl->cur_mtp_state = msl->cur_mtp_next = NULL;
+    ds4_gpu_tensor *vr = ds4_gpu_tensor_view(msl->multi_mtp_raw,
+            (uint64_t)b * msl->raw_bank_bytes, msl->raw_bank_bytes);
+    ds4_gpu_tensor *vs = ds4_gpu_tensor_view(msl->multi_mtp_state,
+            (uint64_t)b * msl->hc_bank_bytes, msl->hc_bank_bytes);
+    ds4_gpu_tensor *vn = ds4_gpu_tensor_view(msl->multi_mtp_next,
+            (uint64_t)b * msl->hc_bank_bytes, msl->hc_bank_bytes);
+    if (!vr || !vs || !vn) {
+        if (vr) ds4_gpu_tensor_free(vr);
+        if (vs) ds4_gpu_tensor_free(vs);
+        if (vn) ds4_gpu_tensor_free(vn);
+        return false;
+    }
+    msl->cur_mtp_raw = vr; msl->cur_mtp_state = vs; msl->cur_mtp_next = vn;
+    g->mtp_raw_cache = vr; g->mtp_state_hc = vs; g->mtp_next_hc = vn;
+    g->mtp_n_raw = msl->mtp_n_raw[b];
+    return true;
+}
+
+/* S1: write back bank b's ring counter after a draft (mirrors repoint's load). */
+static void ds4_mtp_slabs_save_bank(ds4_mtp_slabs *msl, ds4_gpu_graph *g, uint32_t b) {
+    msl->mtp_n_raw[b] = g->mtp_n_raw;
+}
+
+/* S1: drop the current bank views and restore the graph's single-seq MTP
+ * pointers WITHOUT freeing the slabs (readies the graph for non-MTP use or for
+ * ds4_mtp_slabs_free). */
+static void ds4_mtp_slabs_restore(ds4_mtp_slabs *msl, ds4_gpu_graph *g) {
+    if (msl->cur_mtp_raw)   ds4_gpu_tensor_free(msl->cur_mtp_raw);
+    if (msl->cur_mtp_state) ds4_gpu_tensor_free(msl->cur_mtp_state);
+    if (msl->cur_mtp_next)  ds4_gpu_tensor_free(msl->cur_mtp_next);
+    msl->cur_mtp_raw = msl->cur_mtp_state = msl->cur_mtp_next = NULL;
+    if (msl->saved_mtp_raw)   g->mtp_raw_cache = msl->saved_mtp_raw;
+    if (msl->saved_mtp_state) g->mtp_state_hc  = msl->saved_mtp_state;
+    if (msl->saved_mtp_next)  g->mtp_next_hc   = msl->saved_mtp_next;
+}
+
+/* S1: restore single-seq pointers and free the per-bank slabs.  Safe to call on
+ * a zeroed struct (all NULL -> no-op), so batch_ctx_destroy can call it
+ * unconditionally. */
+static void ds4_mtp_slabs_free(ds4_mtp_slabs *msl, ds4_gpu_graph *g) {
+    ds4_mtp_slabs_restore(msl, g);
+    if (msl->multi_mtp_raw)   ds4_gpu_tensor_free(msl->multi_mtp_raw);
+    if (msl->multi_mtp_state) ds4_gpu_tensor_free(msl->multi_mtp_state);
+    if (msl->multi_mtp_next)  ds4_gpu_tensor_free(msl->multi_mtp_next);
+    memset(msl, 0, sizeof(*msl));
 }
 
 /* W5 helper: reset ONE bank to empty (raw ring + compressor state + per-seq comp
@@ -26479,6 +26583,8 @@ struct ds4_batch_ctx {
     ds4_engine     *e;
     ds4_gpu_graph   g;
     ds4_batch_slabs sl;            /* allocated for max_seq banks */
+    ds4_mtp_slabs   msl;           /* S1: per-bank MTP draft banks (only if mtp) */
+    bool            mtp;           /* S1: speculative MTP enabled for this ctx */
     uint32_t        ctx_size;
     uint32_t        prefill_cap;   /* = max_total_tokens (ragged Σlen cap) */
     uint32_t        raw_cap;       /* SWA raw ring (per-seq prompt+budget bound) */
@@ -26507,9 +26613,13 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
     ctx->prefill_cap = prefill_cap;
     ctx->raw_cap = raw_cap;
     ctx->max_seq = (uint32_t)max_seq;
+    /* S1: enable MTP scaffolding in the batched graph only when the engine has a
+     * support model loaded (--mtp).  Without it, enable_mtp stays false and the
+     * continuous/batched path is byte-for-byte unchanged. */
+    ctx->mtp = e->mtp_ready;
 
     if (!metal_graph_alloc_raw_cap(&ctx->g, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, prefill_cap, false)) {
+                                   raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp)) {
         BC_ERR("batch_ctx_create: graph alloc failed (raw_cap=%u prefill_cap=%u)", raw_cap, prefill_cap);
         free(ctx);
         return 1;
@@ -26524,6 +26634,14 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
         free(ctx);
         return 1;
     }
+    if (ctx->mtp && !ds4_mtp_slabs_alloc(&ctx->msl, &ctx->g, ctx->max_seq)) {
+        BC_ERR("batch_ctx_create: MTP slab alloc failed (max_seq=%u)", ctx->max_seq);
+        ds4_mtp_slabs_free(&ctx->msl, &ctx->g);    /* frees any partial banks + restores */
+        ds4_batch_slabs_free(&ctx->sl, &ctx->g);
+        metal_graph_free(&ctx->g);
+        free(ctx);
+        return 1;
+    }
     *out = ctx;
     return 0;
 #undef BC_ERR
@@ -26531,6 +26649,7 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
 
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     if (!ctx) return;
+    ds4_mtp_slabs_free(&ctx->msl, &ctx->g);   /* restores g->mtp_* before metal_graph_free; no-op if !mtp */
     ds4_batch_slabs_free(&ctx->sl, &ctx->g);
     metal_graph_free(&ctx->g);
     free(ctx);
@@ -26650,8 +26769,21 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     int32_t  pos_arr[DS4_MULTISEQ_MAX_SEQ];
     int32_t  sid_arr[DS4_MULTISEQ_MAX_SEQ];
     uint32_t rowbank[DS4_MULTISEQ_MAX_SEQ];
+    int      sampled[DS4_MULTISEQ_MAX_SEQ];   /* S1.0b: token the base model sampled per row */
     bool ok = live && usr && posv && cur && beos && bmax && glen && gbuf &&
               btemp && btopk && btopp && bminp && brng && logits && seedlog;
+
+    /* S1.0b: per-bank MTP draft probe (DS4_CONT_MTP_DRAFT_PROBE).  Runs the
+     * per-bank drafter in lockstep with the real decode (depth 1), seeded from
+     * each row's post-forward hidden carry (g->batch_cur_hc row r), and counts
+     * how often its draft equals the token the base model actually sampled --
+     * i.e. the model's natural MTP acceptance rate.  Proves the per-bank seed
+     * extraction + recurrence are correct WITHOUT accepting drafts (production
+     * output is byte-for-byte unchanged).  Off by default. */
+    const int mtp_probe = (ctx->mtp && ctx->e->mtp_ready &&
+                           getenv("DS4_CONT_MTP_DRAFT_PROBE") != NULL) ? 1 : 0;
+    const uint64_t hc_dim_cont = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    uint64_t mtp_probe_total = 0, mtp_probe_hit = 0;
 
     if (ok) ok = ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS);
     if (ok) {
@@ -26687,6 +26819,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             if (!bg_reset_bank(&ctx->sl, g, b)) { ok = false; break; }
             if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
             if (!bg_prefill_bank(g, model, weights, b, req.tokens, L, seedlog)) { ok = false; break; }
+            if (ctx->mtp) ctx->msl.mtp_n_raw[b] = 0u;   /* S1: fresh MTP ring for this admit */
             /* W7: capture this seq's sampling params + seed its RNG, then sample
              * the seed token from the same stream the decode steps will continue. */
             btemp[b] = req.temperature;
@@ -26767,6 +26900,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             const uint32_t b = rowbank[r];
             const int nt = sample_top_p_min_p(logits + (uint64_t)r * DS4_N_VOCAB, DS4_N_VOCAB,
                                               btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
+            sampled[r] = nt;            /* S1.0b: probe compares draft0 against this */
             gbuf[b][glen[b]] = nt;
             glen[b]++;
             cur[b] = nt;
@@ -26780,7 +26914,52 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             }
         }
         if (g_cont_prof) t_sample_s += now_sec() - smp_t0;
+
+        /* ---- S1.0b: per-bank MTP draft probe (lockstep, depth 1, non-accepting).
+         * For each row r decoded this step, seed the per-bank drafter from the
+         * row's post-forward hidden carry (batch_cur_hc row r) and the committed
+         * token (qtokens[r] @ pos_arr[r]), then compare its draft to the token the
+         * base model actually sampled (sampled[r]).  The drafter writes the
+         * committed token's KV into bank b's own MTP ring (mtp_n_raw[b] += 1), so
+         * the recurrence stays valid across steps without rollback (depth 1 never
+         * drafts past a committed token).  Runs single-seq mode (batched flags
+         * cleared) so the MTP layer takes the scalar decode path. ---- */
+        if (ok && mtp_probe && k > 0) {
+            const bool sav_ms = g->batch_multiseq;
+            const bool sav_em = g->batch_multiseq_emit;
+            const bool sav_pf = g->batch_multiseq_prefilled;
+            g->batch_multiseq = false;
+            g->batch_multiseq_emit = false;
+            g->batch_multiseq_prefilled = false;
+            for (uint32_t r = 0; ok && r < k; r++) {
+                const uint32_t b = rowbank[r];
+                ds4_gpu_tensor *seed_hc = metal_graph_tensor_row_view(g->batch_cur_hc, r, hc_dim_cont);
+                if (!seed_hc) { ok = false; break; }
+                if (!ds4_mtp_slabs_repoint_bank(&ctx->msl, g, b)) {
+                    ds4_gpu_tensor_free(seed_hc); ok = false; break;
+                }
+                int draft0 = -1;
+                const bool dok = metal_graph_eval_mtp_draft_from_hc(
+                        g, &ctx->e->model, &ctx->e->weights,
+                        &ctx->e->mtp_model, &ctx->e->mtp_weights,
+                        seed_hc, g->mtp_state_hc, qtokens[r], (uint32_t)pos_arr[r],
+                        NULL, &draft0, NULL);
+                ds4_gpu_tensor_free(seed_hc);
+                ds4_mtp_slabs_save_bank(&ctx->msl, g, b);
+                if (!dok) { ok = false; break; }
+                mtp_probe_total++;
+                if (draft0 == sampled[r]) mtp_probe_hit++;
+            }
+            g->batch_multiseq = sav_ms;
+            g->batch_multiseq_emit = sav_em;
+            g->batch_multiseq_prefilled = sav_pf;
+        }
     }
+
+    if (mtp_probe)
+        fprintf(stderr, "ds4: CONT_MTP_PROBE drafts=%llu hits=%llu accept=%.1f%%\n",
+                (unsigned long long)mtp_probe_total, (unsigned long long)mtp_probe_hit,
+                mtp_probe_total ? 100.0 * (double)mtp_probe_hit / (double)mtp_probe_total : 0.0);
 
     if (getenv("DS4_CONT_GEN_TIMING"))
         fprintf(stderr, "ds4: continuous gen: %u decode steps over max_seq=%u\n", steps, MS);
@@ -26808,6 +26987,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     g->batch_n_seq = 0;
     g->batch_multiseq_prefilled = false;
     g->batch_multiseq_emit = false;
+    if (ctx->mtp) ds4_mtp_slabs_restore(&ctx->msl, g);   /* S1: drop bank views, restore single-seq mtp ptrs */
     ds4_batch_slabs_restore(&ctx->sl, g);
 
     if (gbuf) for (uint32_t b = 0; b < MS; b++) free(gbuf[b]);
