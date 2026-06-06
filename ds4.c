@@ -26512,6 +26512,10 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     free(ctx);
 }
 
+int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) {
+    return ctx ? (int)ctx->raw_cap : 0;
+}
+
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {
@@ -26747,6 +26751,7 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
     return 1;
 }
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) { (void)ctx; }
+int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {

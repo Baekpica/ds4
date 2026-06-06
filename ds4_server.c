@@ -11305,11 +11305,147 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
     free(eos_ids);
 }
 
+/* ---- W5: continuous batching (mid-flight admit/evict) -----------------------
+ * Instead of gathering a fixed group and running it to completion (W3/W4 static
+ * coalescing), the worker drives ds4_engine_continuous_generate: it maintains a
+ * rolling active set of up to batch_ctx_max_seq sequences, admitting waiting jobs
+ * into KV banks freed by finished ones -- so a short request isn't blocked behind
+ * a long one sharing the batch.  All three callbacks run on the worker thread
+ * inside the gen_mu critical section (the engine does all GPU work there), so:
+ *   - cont_admit pulls from the FIFO under s->mu (lock order gen_mu -> s->mu;
+ *     no path takes s->mu then gen_mu, so this cannot deadlock);
+ *   - cont_on_done writes the response and finishes each job exactly as the W4
+ *     static path does, under gen_mu (same as run_job_single's generate_job).
+ * Job lifetime: a job is stack-owned by its client thread, which frees it right
+ * after job_finish() wakes it -- so job_finish MUST be the last touch, and a
+ * finished job must never be dereferenced again (we only compare its pointer). */
+typedef struct {
+    server *s;
+    job    *primed;        /* first job (already dequeued by the worker), admitted first;
+                            * cont_admit clears it once consumed, so a non-NULL value
+                            * after the loop means the engine failed before its first
+                            * admit -- the driver then runs it on the single path. */
+    int     raw_cap;       /* per-seq prompt cap of the ctx (peer admit pre-check) */
+    int     max_seq;       /* size of inflight[] */
+    int     served;        /* sequences completed via on_done (observability) */
+    /* In-flight set, indexed by an arbitrary free slot (NULL = empty).  At most
+     * max_seq jobs are live at once (the engine admits only to free banks), so a
+     * fixed array suffices and slots recycle as sequences finish -- no unbounded
+     * growth even under a sustained stream through one continuous_generate call.
+     * A slot left non-NULL after the loop is a job that was admitted but never
+     * completed (engine failed mid-loop) or rejected (oversized prompt -> on_done
+     * with tokens==NULL): the driver runs each on the single path afterwards. */
+    job   **inflight;
+} cont_sched;
+
+/* admit: hand the engine the next waiting request, or 0 to stop admitting now. */
+static int cont_admit(void *ud, ds4_cont_request *req) {
+    cont_sched *cs = ud;
+    server *s = cs->s;
+    /* Reserve a free in-flight slot BEFORE removing any job from the FIFO, so a
+     * job is never dequeued (nor the primed job consumed) when it cannot be
+     * placed -- otherwise it would be silently dropped and its client would hang.
+     * The engine only admits to free banks, so a slot normally always exists;
+     * this just makes the invariant safe to violate. */
+    int slot = -1;
+    for (int i = 0; i < cs->max_seq; i++) if (!cs->inflight[i]) { slot = i; break; }
+    if (slot < 0) return 0;
+
+    job *j = NULL;
+    if (cs->primed) {
+        j = cs->primed;          /* the worker's first job (pre-checked to fit). */
+        cs->primed = NULL;
+    } else {
+        /* Pull one job from the FIFO head iff it is batchable AND its prompt fits
+         * a single bank.  A non-batchable head, or one too long to fit, stops
+         * admits (return 0) so it stays at the head and is served next -- the
+         * same FIFO discipline coalesce_gather uses, so nothing is starved. */
+        pthread_mutex_lock(&s->mu);
+        if (s->head && job_is_batchable(&s->head->req) &&
+            s->head->req.prompt.len > 0 && s->head->req.prompt.len <= cs->raw_cap) {
+            j = s->head;
+            s->head = j->next;
+            if (!s->head) s->tail = NULL;
+            j->next = NULL;
+        }
+        pthread_mutex_unlock(&s->mu);
+        if (!j) return 0;
+    }
+    cs->inflight[slot] = j;
+    req->tokens  = j->req.prompt.v;
+    req->n       = j->req.prompt.len;
+    req->max_new = j->req.max_tokens > 0 ? j->req.max_tokens : s->default_tokens;
+    req->eos     = ds4_token_eos(s->engine);
+    req->user    = j;
+    return 1;
+}
+
+/* on_done: a sequence finished (or was rejected).  tokens==NULL => the engine
+ * declined it (oversized); leave it in the in-flight set for the single-path
+ * fallback.  Otherwise write its response and finish it (the LAST touch of j). */
+static void cont_on_done(void *ud, void *user, const int *tokens, int n, int finish) {
+    cont_sched *cs = ud;
+    if (!tokens) return;                       /* rejected: slot stays -> fallback. */
+    for (int i = 0; i < cs->max_seq; i++)      /* free the slot (pointer compare). */
+        if (cs->inflight[i] == user) { cs->inflight[i] = NULL; break; }
+    cs->served++;
+    job *j = user;
+    ds4_batch_gen_result r = { .tokens = (int *)tokens, .n_tokens = n, .finish = finish };
+    write_batch_completion(cs->s, j, &r);
+    job_finish(j);
+}
+
+/* Drive continuous generation for a batchable first job.  Holds gen_mu across the
+ * whole rolling loop (it is all GPU work); after it returns, any job still parked
+ * in the in-flight set was stranded (engine failure) or rejected (oversized) and
+ * is run on the single path now that gen_mu is free. */
+static void generate_continuous_jobs(server *s, job *first) {
+    cont_sched cs;
+    cs.s = s;
+    cs.primed = first;
+    cs.raw_cap = ds4_batch_ctx_raw_cap(s->batch_ctx);
+    cs.max_seq = s->batch_ctx_max_seq;
+    cs.served = 0;
+    cs.inflight = xmalloc((size_t)cs.max_seq * sizeof(job *));
+    for (int i = 0; i < cs.max_seq; i++) cs.inflight[i] = NULL;
+
+    char err[256] = {0};
+    pthread_mutex_lock(&s->gen_mu);
+    int rc = ds4_engine_continuous_generate(s->batch_ctx, cont_admit, cont_on_done,
+                                            &cs, err, sizeof(err));
+    pthread_mutex_unlock(&s->gen_mu);
+
+    /* Fallback for every job the engine did not finish, so no client can hang:
+     *  - jobs still parked in the in-flight set (admitted but stranded by a
+     *    mid-loop failure, or rejected as oversized -> on_done(NULL) keeps slot),
+     *  - the primed first job if the engine failed before its very first admit
+     *    (cont_admit clears cs.primed once it consumes it).
+     * Run each on the single path now that gen_mu is released. */
+    int fallback = 0;
+    for (int i = 0; i < cs.max_seq; i++)
+        if (cs.inflight[i]) { run_job_single(s, cs.inflight[i]); fallback++; }
+    if (cs.primed) { run_job_single(s, cs.primed); fallback++; }
+    free(cs.inflight);
+
+    if (rc != 0)
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: continuous batch failed (%s); served=%d fallback=%d",
+                   err[0] ? err : "error", cs.served, fallback);
+    else
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: continuous batch ctx=%d path=cont served=%d fallback=%d",
+                   ds4_session_ctx(s->session), cs.served, fallback);
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     /* Coalescing config (read once; single worker thread). */
     const char *ce = getenv("DS4_SERVER_COALESCE");
     const bool coalesce = !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+    /* W5: continuous batching is the default serving path when a persistent batch
+     * ctx exists; DS4_SERVER_CONTINUOUS=0 reverts to W3/W4 static coalescing. */
+    const char *cc = getenv("DS4_SERVER_CONTINUOUS");
+    const bool continuous = !(cc && cc[0] == '0' && cc[1] == '\0');  /* default ON */
     const char *cm = getenv("DS4_SERVER_COALESCE_MAX");
     int cmax = cm ? atoi(cm) : 16;
     if (cmax < 1) cmax = 1;
@@ -11327,11 +11463,19 @@ static void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         if (coalesce && cmax > 1 && job_is_batchable(&j->req)) {
-            job *batch[DS4_COALESCE_HARD_MAX];
-            batch[0] = j;
-            int n = coalesce_gather(s, batch, cmax, cwait, cmaxtok);
-            if (n == 1) run_job_single(s, j);
-            else        generate_batch_jobs(s, batch, n);
+            /* W5: continuous path when a ctx exists and the first prompt fits a
+             * single bank; otherwise fall back to W3/W4 static coalescing (which
+             * also covers continuous-off and oversized first prompts). */
+            if (continuous && s->batch_ctx && j->req.prompt.len > 0 &&
+                j->req.prompt.len <= ds4_batch_ctx_raw_cap(s->batch_ctx)) {
+                generate_continuous_jobs(s, j);
+            } else {
+                job *batch[DS4_COALESCE_HARD_MAX];
+                batch[0] = j;
+                int n = coalesce_gather(s, batch, cmax, cwait, cmaxtok);
+                if (n == 1) run_job_single(s, j);
+                else        generate_batch_jobs(s, batch, n);
+            }
         } else {
             run_job_single(s, j);
         }
