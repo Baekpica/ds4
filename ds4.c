@@ -26612,13 +26612,22 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint32_t *bmax = xcalloc(MS, sizeof(uint32_t));
     uint32_t *glen = xcalloc(MS, sizeof(uint32_t));
     int     **gbuf = xcalloc(MS, sizeof(int *));
+    /* W7: per-bank sampling state -- each live bank samples with its own params
+     * and an independent RNG stream (brng), so concurrent rows never perturb each
+     * other's draws and a seeded request is reproducible regardless of batchmates. */
+    float    *btemp = xcalloc(MS, sizeof(float));
+    int      *btopk = xcalloc(MS, sizeof(int));
+    float    *btopp = xcalloc(MS, sizeof(float));
+    float    *bminp = xcalloc(MS, sizeof(float));
+    uint64_t *brng  = xcalloc(MS, sizeof(uint64_t));
     float    *logits  = xmalloc((size_t)MS * DS4_N_VOCAB * sizeof(float));
     float    *seedlog = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     int      qtokens[DS4_MULTISEQ_MAX_SEQ];
     int32_t  pos_arr[DS4_MULTISEQ_MAX_SEQ];
     int32_t  sid_arr[DS4_MULTISEQ_MAX_SEQ];
     uint32_t rowbank[DS4_MULTISEQ_MAX_SEQ];
-    bool ok = live && usr && posv && cur && beos && bmax && glen && gbuf && logits && seedlog;
+    bool ok = live && usr && posv && cur && beos && bmax && glen && gbuf &&
+              btemp && btopk && btopp && bminp && brng && logits && seedlog;
 
     if (ok) ok = ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS);
     if (ok) {
@@ -26650,7 +26659,15 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             if (!bg_reset_bank(&ctx->sl, g, b)) { ok = false; break; }
             if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
             if (!bg_prefill_bank(g, model, weights, b, req.tokens, L, seedlog)) { ok = false; break; }
-            const int nt = sample_argmax(seedlog, DS4_N_VOCAB);
+            /* W7: capture this seq's sampling params + seed its RNG, then sample
+             * the seed token from the same stream the decode steps will continue. */
+            btemp[b] = req.temperature;
+            btopk[b] = req.top_k;
+            btopp[b] = req.top_p;
+            bminp[b] = req.min_p;
+            brng[b]  = req.seed;
+            const int nt = sample_top_p_min_p(seedlog, DS4_N_VOCAB,
+                                              btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
             gbuf[b] = xmalloc((size_t)mn * sizeof(int));
             if (!gbuf[b]) { ok = false; break; }
             gbuf[b][0] = nt;
@@ -26719,7 +26736,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         /* ---- sample + evict finished. ---- */
         for (uint32_t r = 0; r < k; r++) {
             const uint32_t b = rowbank[r];
-            const int nt = sample_argmax(logits + (uint64_t)r * DS4_N_VOCAB, DS4_N_VOCAB);
+            const int nt = sample_top_p_min_p(logits + (uint64_t)r * DS4_N_VOCAB, DS4_N_VOCAB,
+                                              btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
             gbuf[b][glen[b]] = nt;
             glen[b]++;
             cur[b] = nt;
@@ -26745,6 +26763,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
 
     if (gbuf) for (uint32_t b = 0; b < MS; b++) free(gbuf[b]);
     free(live); free(usr); free(posv); free(cur); free(beos); free(bmax); free(glen); free(gbuf);
+    free(btemp); free(btopk); free(btopp); free(bminp); free(brng);
     free(logits); free(seedlog);
     return ok ? 0 : 1;
 #undef CG_ERR

@@ -10058,6 +10058,19 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+
+/* Resolve a job's RNG seed: the client seed if set, else a per-job value derived
+ * from wall-clock + the response counter + the job address (the parser maps an
+ * unset/<=0 seed to 0, so 0 means "unseeded").  ONE definition shared by the
+ * single path (generate_job) and the continuous path (cont_admit) so an unseeded
+ * request seeds identically regardless of which path serves it -- changing the
+ * mixing formula in one place must not desync the two.  Caller context: s->seq is
+ * read on the single worker thread only (no other thread mints ids), so no lock. */
+static uint64_t resolve_job_seed(const server *s, const job *j) {
+    return j->req.seed ? j->req.seed :
+        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+}
+
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
@@ -10423,8 +10436,7 @@ static void generate_job(server *s, job *j) {
     }
 
     bool dsml_recovery_attempted = false;
-    uint64_t rng = j->req.seed ? j->req.seed :
-        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+    uint64_t rng = resolve_job_seed(s, j);
 decode_again:
     ;
     buf text = {0};
@@ -11120,26 +11132,37 @@ static job *dequeue(server *s) {
 
 /* A request may be coalesced only when its completion does not depend on any of
  * generate_job()'s richer machinery (tools, stop sequences, token-id echo,
- * anthropic/responses envelopes) AND its single-path decode would be plain greedy
- * argmax -- so the batched core (always argmax) produces the same answer.
- * Two things force the greedy requirement:
- *   - temperature <= 0 (the request itself asks for greedy), and
- *   - thinking DISABLED: generate_job() OVERRIDES temperature to
- *     DS4_DEFAULT_TEMPERATURE (1.0) whenever think_mode is enabled (it samples
- *     reasoning stochastically regardless of the requested temperature), so a
- *     thinking request is NOT greedy on the single path and must not be coalesced
- *     into the greedy batch.  (Per-seq sampling is a future phase.)
- * W6: streaming IS batchable now -- the continuous path streams each row's tokens
- * as produced (cont_on_token); only OpenAI chat/completion SSE is handled, which
- * is why anthropic/responses (api != API_OPENAI) and token-id echo stay excluded. */
+ * anthropic/responses envelopes).
+ * W7: temperature is NO LONGER a gate -- the continuous engine carries each seq's
+ * own temperature/top-k/top-p/min-p/seed (cont_admit) and samples it with an
+ * independent RNG stream, so temp>0 requests batch and stay reproducible.  A
+ * temp<=0 request still samples greedy argmax in the engine (sample_top_p_min_p
+ * short-circuits), so the W1/W3 determinism golden is preserved.
+ * Thinking stays EXCLUDED: generate_job() overrides temperature for thinking AND
+ * splits reasoning_content/content (single-path SSE state machine + buffered
+ * split), which the content-only continuous stream (cont_stream) does not yet do
+ * -- batching thinking needs that reasoning/content split first (W7 follow-up).
+ * W6: streaming IS batchable -- the continuous path streams each row's tokens as
+ * produced (cont_on_token); only OpenAI chat/completion SSE is handled, which is
+ * why anthropic/responses (api != API_OPENAI) and token-id echo stay excluded. */
 static bool job_is_batchable(const request *r) {
     return r->api == API_OPENAI
         && (r->kind == REQ_CHAT || r->kind == REQ_COMPLETION)
         && !r->has_tools
         && !r->return_token_ids
         && r->stops.len == 0
-        && r->temperature <= 0.0f
         && !ds4_think_mode_enabled(r->think_mode);
+}
+
+/* The STATIC W3/W4 batched path (coalesce_gather -> generate_batch_jobs) writes one
+ * BUFFERED response per job AND samples greedy argmax ONLY (no per-seq sampler), so
+ * it can serve a request only if it is batchable, NON-streaming, and temperature<=0.
+ * Streaming goes to the continuous/single path (W6); temp>0 goes to the continuous
+ * path (per-seq sampler) or the single path (generate_job) -- never here, or its
+ * temperature/seed would be silently ignored.  ONE predicate so the two callers
+ * (coalesce_gather peers + worker_main dispatch) cannot drift apart. */
+static bool job_is_static_batchable(const request *r) {
+    return job_is_batchable(r) && !r->stream && r->temperature <= 0.0f;
 }
 
 static void job_finish(job *j) {
@@ -11174,10 +11197,9 @@ static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_t
     bool have_deadline = false;
     pthread_mutex_lock(&s->mu);
     while (n < cap) {
-        /* The STATIC batched path writes one buffered response per job, so it can
-         * only gather NON-streaming jobs (W6 streaming is handled by the continuous
-         * path / single path).  A streaming head stops the gather, preserving FIFO. */
-        if (s->head && job_is_batchable(&s->head->req) && !s->head->req.stream) {
+        /* Only gather jobs the static argmax path can serve (non-streaming,
+         * temp<=0); a head that fails stops the gather, preserving FIFO. */
+        if (s->head && job_is_static_batchable(&s->head->req)) {
             if (max_tok_total > 0 && tok_total + s->head->req.prompt.len > max_tok_total)
                 break;                         /* token budget: split into another batch */
             job *g = s->head;
@@ -11387,6 +11409,18 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     req->max_new = j->req.max_tokens > 0 ? j->req.max_tokens : s->default_tokens;
     req->eos     = ds4_token_eos(s->engine);
     req->user    = j;
+    /* W7: per-seq sampling.  job_is_batchable excludes thinking, so generate_job's
+     * think-mode temperature override never applies here -- pass the request's own
+     * params straight through (temperature<=0 => the engine samples greedy argmax,
+     * matching the W5/W6 path).  resolve_job_seed gives an unseeded request the same
+     * distinct, non-repeating stream the single path would (shared helper, so the two
+     * paths can't desync).  s->seq is read here on the single worker thread only (no
+     * other thread mints response ids), so the read needs no lock. */
+    req->temperature = j->req.temperature;
+    req->top_k       = j->req.top_k;
+    req->top_p       = j->req.top_p;
+    req->min_p       = j->req.min_p;
+    req->seed        = resolve_job_seed(s, j);
     return 1;
 }
 
@@ -11581,14 +11615,20 @@ static void *worker_main(void *arg) {
             if (continuous && s->batch_ctx && j->req.prompt.len > 0 &&
                 j->req.prompt.len <= ds4_batch_ctx_raw_cap(s->batch_ctx)) {
                 generate_continuous_jobs(s, j);
-            } else if (!j->req.stream) {
+            } else if (job_is_static_batchable(&j->req)) {
+                /* Static batched path: argmax-only + buffered, so temp>0 and
+                 * streaming are excluded (they would lose temperature/seed or get a
+                 * non-streamed reply) -- those went to the continuous path above, or
+                 * fall to the single path below. */
                 job *batch[DS4_COALESCE_HARD_MAX];
                 batch[0] = j;
                 int n = coalesce_gather(s, batch, cmax, cwait, cmaxtok);
                 if (n == 1) run_job_single(s, j);
                 else        generate_batch_jobs(s, batch, n);
             } else {
-                run_job_single(s, j);   /* streaming, no continuous ctx -> single path */
+                /* streaming, OR temp>0 without a continuous ctx -> single path
+                 * (generate_job samples per-request and streams correctly). */
+                run_job_single(s, j);
             }
         } else {
             run_job_single(s, j);

@@ -214,14 +214,25 @@ int  ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *promp
 /* Phase 2 W5: continuous batching (mid-flight admit/evict) over a persistent ctx.
  * The scheduler maintains a rolling active set of up to ctx max_seq sequences: each
  * step it admits waiting requests into freed KV banks (ragged-prefill the prompt)
- * and evicts finished ones, so short requests don't wait for long ones.  Greedy
- * (argmax) only; CUDA backend only (the Metal path ignores per-seq bank ids). */
+ * and evicts finished ones, so short requests don't wait for long ones.  CUDA
+ * backend only (the Metal path ignores per-seq bank ids).
+ * W7: per-sequence sampling -- each request carries its own temperature/top-k/
+ * top-p/min-p/seed, sampled with an independent RNG stream so concurrent rows in
+ * one batch do not perturb each other.  A zeroed sampling block (temperature<=0)
+ * is greedy argmax, bit-identical to the W5/W6 default. */
 typedef struct {
     const int *tokens;   /* prompt tokens (caller-owned; must outlive the admit) */
     int        n;        /* prompt length (>0, <= ctx raw_cap) */
     int        max_new;  /* per-seq decode budget (>=1) */
     int        eos;      /* per-seq EOS token; <0 => engine default */
     void      *user;     /* opaque handle echoed back to on_done */
+    /* W7 per-seq sampling (zeroed => greedy argmax, the W5/W6 default):       */
+    float      temperature; /* <= 0 => greedy argmax (ignores the rest)        */
+    int        top_k;       /* <= 0 => full vocab                              */
+    float      top_p;       /* nucleus; <=0 or >1 treated as 1.0               */
+    float      min_p;       /* relative floor; <0 => 0                         */
+    uint64_t   seed;        /* per-seq RNG seed (caller resolves 0 if it wants */
+                            /* distinct streams; 0 is a fixed, valid sequence) */
 } ds4_cont_request;
 /* admit: fill *req for the next waiting request and return 1; return 0 when none is
  *   available right now (the loop keeps decoding the active set and ends once the
