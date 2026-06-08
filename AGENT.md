@@ -71,6 +71,15 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   correctness proof on the grounds that "we already had it before" is how the
   pos0 regression slipped past three previous commits.
 
+## MTP / compressed-KV decode rules
+
+- Lossless = verified tokens AND committed compressed-KV == the accepted-prefix transition. Not bit-identity (cross-width MoE order differs), not tokens alone (carried state sets future logits).
+- Emit compressor state in the verify forward, roll back rejects; never re-emit in a second pass (a commit-reforward emit was ~100% wrong).
+- Gate on ‖Δcompressed-cache‖ and long context, not short-prompt tokens — short context hides cache corruption behind raw/windowed KV.
+- FP vs structural is element-wise magnitude (rel ≈1e-6 vs ≈1); a late token flip is not FP.
+- Size GPU-readback buffers to the tensor and fail loud — undersized returns a constant → false "identical".
+- At D>=1 the batched verify (width 1+D) is NOT bit-identical to a width-1 decode (cross-width MoE-order FP, same as N=1 vs N=8). Validate rollback WIDTH-MATCHED: vary the rejected-draft VALUES and expect bit-identical committed cache; comparing D>=1 against width-1 mode-0 conflates inherent FP with real bugs.
+
 ## Testing
 
 Use `make` for build validation. Use `make test` for unit/regression tests when a
