@@ -12333,10 +12333,21 @@ extern "C" int ds4_gpu_compressor_update_tensor(
      * fallback path (NULL scalars) used by batch/prefill callers
      * elsewhere; here on the decode-time emit path scalars != NULL and
      * the kernel ignores the inline arg. */
+    /* S1.1a root-cause fix: read pos0 from the device decode-scalars substrate
+     * (g_decode_dev) ONLY in the single-token capture path (il < count).  The
+     * batched/multiseq caller passes il == UINT32_MAX and supplies the correct
+     * per-row pos inline; it must NOT read g_decode_dev.  Otherwise a concurrent
+     * MTP draft that publishes decode-scalars overwrites g_decode_dev with the
+     * DRAFTER's pos, so the main forward's store applies the WRONG absolute-
+     * position encoding to the compressed-KV row -- a large, structural
+     * divergence first visible at the ratio-group emit (the batched-MTP
+     * determinism gate's flip).  This mirrors the substrate gating that already
+     * guards row_ptr_dev and the emit-row rope below. */
+    const bool use_substrate = (g_layer_dev != NULL && il < DS4_LAYER_SCALARS_COUNT);
     if (!ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
                                                  model_map, model_size, ape_offset, ape_type,
                                                  head_dim, ratio, pos, 1,
-                                                 ds4_gpu_decode_scalars_device_ptr())) {
+                                                 use_substrate ? ds4_gpu_decode_scalars_device_ptr() : NULL)) {
         return 0;
     }
     if (!emit) return 1;
@@ -12355,7 +12366,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
      * The R5 audit gate `git grep ds4_gpu_tensor_view ds4_cuda.cu` within
      * this function body returns 0 hits after this commit. */
     const uint32_t *row_ptr_dev = NULL;
-    if (g_layer_dev != NULL && il < DS4_LAYER_SCALARS_COUNT) {
+    if (use_substrate) {
         row_ptr_dev = (row_field == DS4_COMPRESSOR_ROW_INDEX)
             ? &g_layer_dev[il].index_row
             : &g_layer_dev[il].comp_row;
