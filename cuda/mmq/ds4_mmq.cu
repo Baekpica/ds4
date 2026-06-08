@@ -271,6 +271,20 @@ int ds4_mmq_dense_impl(
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
 
+    // S1.1a fix: the mmq Y (activation) buffer is over-allocated for the kernel's
+    // tail-tile reads (the +mmq_x_max blocks above), and ne11 columns may not fill
+    // the final column tile -- but quantize_mmq_q8_1_cuda only writes the ne11 valid
+    // columns.  The mmq kernel (mmq.cuh:3528) unconditionally loads the full column
+    // tile, reading the never-written tail.  Pool allocs reuse stale device memory,
+    // so that tail is non-deterministic: any allocator/stream perturbation (e.g. an
+    // MTP draft's cudaMalloc) changes it and flips a near-threshold argmax in the
+    // batched forward (confirmed by compute-sanitizer --tool initcheck on a PRO6000
+    // / sm_120: 4-byte uninitialized __global__ read in mul_mat_q_process_tile).
+    // The tail's dot-products are masked out by write_back, so only their
+    // non-determinism matters; zero the buffer so the tail is a deterministic zero
+    // (a zero q8_1 block contributes 0 to the dot product).
+    cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream);
+
     quantize_mmq_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
         type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
@@ -445,6 +459,15 @@ int ds4_mmq_moe_impl(
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
 
+    // S1.1a fix (same as the dense path): the mmq Y buffer is over-allocated for the
+    // kernel's tail-tile reads and ne_get_rows columns need not fill the final mmq
+    // column tile, but quantize only writes the valid columns.  The mmq kernel
+    // (mmq.cuh:3528) unconditionally loads the full tile, reading the never-written
+    // tail from stale pool memory -> allocator-perturbation-dependent garbage in the
+    // (write_back-masked) tail lanes -> non-deterministic batched-forward output.
+    // Zero it so the masked-out tail is a deterministic zero.
+    cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream);
+
     // src1 logical [K, ne11=1, ne12=n_tokens, ne13=1] - K innermost, then
     // one row per channel, channels = tokens.
     const int64_t s11_src = (int64_t)K;                                 // stride between rows of a channel
@@ -598,6 +621,11 @@ int ds4_mmq_moe_pair_impl(
         ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+
+    // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
+    // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
+    // a deterministic zero instead of allocator-perturbation-dependent stale memory.
+    cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream);
 
     const int64_t s11_src = (int64_t)K;
     const int64_t s12_src = (int64_t)K * ne11;
