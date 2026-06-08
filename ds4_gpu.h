@@ -471,6 +471,17 @@ int ds4_gpu_argmax_tensor(
         const ds4_gpu_tensor *logits,
         uint32_t                n_vocab);
 
+/* Batched argmax: one winning index per row over a [n_rows x n_vocab] logits
+ * tensor.  Writes n_rows int32 ids to out_idx[0..n_rows).  Same tie-break as
+ * ds4_gpu_argmax_tensor (larger value, lower index).  Runs on the current
+ * stream so it joins the draft command buffer (one end_commands sync covers
+ * all rows). */
+int ds4_gpu_argmax_rows_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab,
+        uint32_t                n_rows);
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
@@ -618,6 +629,16 @@ int ds4_gpu_repeat_hc_tensor(
         const ds4_gpu_tensor *row,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* Batched repeat_hc: for each of n_rows embd-vectors in `rows` ([n_rows x
+ * n_embd]), broadcast it into n_hc consecutive copies, writing
+ * [n_rows x n_hc x n_embd] to `out` (row-major). */
+int ds4_gpu_repeat_hc_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *rows,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_rows);
 
 int ds4_gpu_rms_norm_plain_tensor(
         ds4_gpu_tensor       *out,

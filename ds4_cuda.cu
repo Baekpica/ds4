@@ -3550,6 +3550,19 @@ __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n
     out[i] = row[i % n_embd];
 }
 
+/* Batched repeat_hc: rows[n_rows x n_embd] -> out[n_rows x n_hc x n_embd].
+ * Row r's embd vector is broadcast into n_hc consecutive copies. */
+__global__ static void repeat_hc_rows_kernel(float *out, const float *rows,
+                                             uint32_t n_embd, uint32_t n_hc, uint32_t n_rows) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t per_row = (uint64_t)n_embd * n_hc;
+    uint64_t total = per_row * n_rows;
+    if (i >= total) return;
+    uint64_t row = i / per_row;
+    uint64_t d   = (i % per_row) % n_embd;
+    out[i] = rows[row * n_embd + d];
+}
+
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2half(x[i]);
@@ -8590,6 +8603,51 @@ __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint
     if (tid == 0) *out_idx = sm_idx[0];
 }
 
+/* Batched argmax: one block per row over logits[n_rows x n_vocab], writing
+ * out_idx[row].  Identical reduction + tie-break (larger value, lower index)
+ * as argmax_kernel. */
+__global__ static void argmax_rows_kernel(int32_t *out_idx, const float *logits,
+                                          uint32_t n_vocab, uint32_t n_rows) {
+    enum { THREADS = 1024 };
+    __shared__ float sm_val[THREADS];
+    __shared__ int32_t sm_idx[THREADS];
+
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const float *rlog = logits + (uint64_t)row * n_vocab;
+
+    const uint32_t tid = threadIdx.x;
+    float local_v = -INFINITY;
+    int32_t local_i = 0;
+    for (uint32_t i = tid; i < n_vocab; i += THREADS) {
+        const float v = rlog[i];
+        if (v > local_v) {
+            local_v = v;
+            local_i = (int32_t)i;
+        }
+    }
+    sm_val[tid] = local_v;
+    sm_idx[tid] = local_i;
+    __syncthreads();
+
+    for (uint32_t s = THREADS / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            const float vr = sm_val[tid + s];
+            const int32_t ir = sm_idx[tid + s];
+            const float vl = sm_val[tid];
+            const int32_t il = sm_idx[tid];
+            const bool take_right = (vr > vl) || (vr == vl && ir < il);
+            if (take_right) {
+                sm_val[tid] = vr;
+                sm_idx[tid] = ir;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) out_idx[row] = sm_idx[0];
+}
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k,
         /* PC5 substrate override (see indexer_topk_8192_cub_kernel docstring). */
         const struct ds4_layer_scalars * __restrict__ ls_override) {
@@ -9623,6 +9681,21 @@ extern "C" int ds4_gpu_argmax_tensor(
                                (const float *)logits->ptr,
                                n_vocab);
     return cuda_ok(cudaGetLastError(), "argmax launch");
+}
+
+extern "C" int ds4_gpu_argmax_rows_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab,
+        uint32_t                n_rows) {
+    if (!out_idx || !logits || n_vocab == 0 || n_rows == 0 ||
+        out_idx->bytes < (uint64_t)n_rows * sizeof(int32_t) ||
+        logits->bytes < (uint64_t)n_vocab * n_rows * sizeof(float)) {
+        return 0;
+    }
+    argmax_rows_kernel<<<n_rows, 1024, 0, ds4_current_stream()>>>(
+        (int32_t *)out_idx->ptr, (const float *)logits->ptr, n_vocab, n_rows);
+    return cuda_ok(cudaGetLastError(), "argmax_rows launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
@@ -11928,6 +12001,19 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
     uint64_t n = (uint64_t)n_embd * n_hc;
     repeat_hc_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)row->ptr, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "repeat_hc launch");
+}
+
+extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *rows,
+                                             uint32_t n_embd, uint32_t n_hc, uint32_t n_rows) {
+    if (!out || !rows || n_embd == 0 || n_hc == 0 || n_rows == 0 ||
+        rows->bytes < (uint64_t)n_embd * n_rows * sizeof(float) ||
+        out->bytes  < (uint64_t)n_embd * n_hc * n_rows * sizeof(float)) {
+        return 0;
+    }
+    uint64_t total = (uint64_t)n_embd * n_hc * n_rows;
+    repeat_hc_rows_kernel<<<(total + 255) / 256, 256, 0, ds4_current_stream()>>>(
+        (float *)out->ptr, (const float *)rows->ptr, n_embd, n_hc, n_rows);
+    return cuda_ok(cudaGetLastError(), "repeat_hc_rows launch");
 }
 
 extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
