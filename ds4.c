@@ -22298,6 +22298,26 @@ typedef struct {
     ds4_gpu_tensor *cur_mtp_state;
     ds4_gpu_tensor *cur_mtp_next;
     uint32_t        mtp_n_raw[DS4_MULTISEQ_MAX_SEQ];  /* per-bank ring fill counter */
+    /* M4b Inc2: N-row scratch for the batched cross-bank draft forward
+     * (metal_graph_eval_mtp_draft_batch, Inc3).  The serial drafter recomputes
+     * its per-call scratch from the single-seq graph tensors (g->mtp_embed ..
+     * g->mtp_input_hc, g->logits); the batched drafter needs N-row-wide copies so
+     * all live banks draft as rows in ONE forward (one begin/end_commands per
+     * depth instead of N).  Sized to N=max_seq here, where the runtime shape
+     * (DS4_N_EMBD / DS4_N_HC / DS4_N_VOCAB) is known.  The layer INPUT/OUTPUT
+     * reuses g->batch_cur_hc/batch_next_hc (the batched layer kernels read/write
+     * those), so there is no draft_input_hc here.  All freed in
+     * ds4_mtp_slabs_free; zeroed by the alloc/free memset like the rest. */
+    ds4_gpu_tensor *draft_embed;      /* [N x DS4_N_EMBD]   embed_tokens_hc(n_hc=1) */
+    ds4_gpu_tensor *draft_enorm;      /* [N x DS4_N_EMBD]   rms_norm_rows(enorm)    */
+    ds4_gpu_tensor *draft_eproj;      /* [N x DS4_N_EMBD]   matmul(e_proj)          */
+    ds4_gpu_tensor *draft_eproj_hc;   /* [N x hc_dim]       repeat_hc_rows          */
+    ds4_gpu_tensor *draft_hnorm_hc;   /* [N x hc_dim]       rms_norm_rows(hnorm)    */
+    ds4_gpu_tensor *draft_hproj_hc;   /* [N x hc_dim]       matmul(h_proj)          */
+    ds4_gpu_tensor *draft_prev_hc;    /* [N x hc_dim]       recurrent carry (seed / layer-out copy) */
+    ds4_gpu_tensor *draft_logits;     /* [N x DS4_N_VOCAB]  batched output-head logits (spec_logits is only 16 rows) */
+    ds4_gpu_tensor *draft_tokens_dev; /* [N x int32]        per-row feed tokens (device) */
+    ds4_gpu_tensor *draft_ids;        /* [N x int32]        argmax_rows output ids   */
 } ds4_mtp_slabs;
 
 /* Allocate N per-seq KV banks (raw + attn-comp + attn-state for ratio!=0; index
@@ -22479,7 +22499,24 @@ static bool ds4_mtp_slabs_alloc(ds4_mtp_slabs *msl, ds4_gpu_graph *g, uint32_t N
     msl->multi_mtp_raw   = ds4_gpu_tensor_alloc((uint64_t)N * msl->raw_bank_bytes);
     msl->multi_mtp_state = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
     msl->multi_mtp_next  = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
-    return msl->multi_mtp_raw && msl->multi_mtp_state && msl->multi_mtp_next;
+    /* M4b Inc2: N-row batched-draft scratch (see struct comment).  hc_dim ==
+     * DS4_N_HC*DS4_N_EMBD == hc_bank_bytes/sizeof(float). */
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    msl->draft_embed      = ds4_gpu_tensor_alloc((uint64_t)N * embd_bytes);
+    msl->draft_enorm      = ds4_gpu_tensor_alloc((uint64_t)N * embd_bytes);
+    msl->draft_eproj      = ds4_gpu_tensor_alloc((uint64_t)N * embd_bytes);
+    msl->draft_eproj_hc   = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
+    msl->draft_hnorm_hc   = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
+    msl->draft_hproj_hc   = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
+    msl->draft_prev_hc    = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
+    msl->draft_logits     = ds4_gpu_tensor_alloc((uint64_t)N * DS4_N_VOCAB * sizeof(float));
+    msl->draft_tokens_dev = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(int32_t));
+    msl->draft_ids        = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(int32_t));
+    return msl->multi_mtp_raw && msl->multi_mtp_state && msl->multi_mtp_next &&
+           msl->draft_embed && msl->draft_enorm && msl->draft_eproj &&
+           msl->draft_eproj_hc && msl->draft_hnorm_hc && msl->draft_hproj_hc &&
+           msl->draft_prev_hc && msl->draft_logits &&
+           msl->draft_tokens_dev && msl->draft_ids;
 }
 
 /* S1: install bank b's MTP views into g->mtp_raw_cache/mtp_state_hc/mtp_next_hc
@@ -22535,6 +22572,17 @@ static void ds4_mtp_slabs_free(ds4_mtp_slabs *msl, ds4_gpu_graph *g) {
     if (msl->multi_mtp_raw)   ds4_gpu_tensor_free(msl->multi_mtp_raw);
     if (msl->multi_mtp_state) ds4_gpu_tensor_free(msl->multi_mtp_state);
     if (msl->multi_mtp_next)  ds4_gpu_tensor_free(msl->multi_mtp_next);
+    /* M4b Inc2: N-row batched-draft scratch */
+    if (msl->draft_embed)      ds4_gpu_tensor_free(msl->draft_embed);
+    if (msl->draft_enorm)      ds4_gpu_tensor_free(msl->draft_enorm);
+    if (msl->draft_eproj)      ds4_gpu_tensor_free(msl->draft_eproj);
+    if (msl->draft_eproj_hc)   ds4_gpu_tensor_free(msl->draft_eproj_hc);
+    if (msl->draft_hnorm_hc)   ds4_gpu_tensor_free(msl->draft_hnorm_hc);
+    if (msl->draft_hproj_hc)   ds4_gpu_tensor_free(msl->draft_hproj_hc);
+    if (msl->draft_prev_hc)    ds4_gpu_tensor_free(msl->draft_prev_hc);
+    if (msl->draft_logits)     ds4_gpu_tensor_free(msl->draft_logits);
+    if (msl->draft_tokens_dev) ds4_gpu_tensor_free(msl->draft_tokens_dev);
+    if (msl->draft_ids)        ds4_gpu_tensor_free(msl->draft_ids);
     memset(msl, 0, sizeof(*msl));
 }
 
