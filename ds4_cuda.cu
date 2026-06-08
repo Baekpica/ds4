@@ -319,6 +319,18 @@ static int g_layer_dev_idx = 0;
 
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
+/* S1.1a: dedicated, zeroed cuBLAS workspace.  cuBLAS GemmEx split-K reduces read
+ * padding slots of the split-K partials workspace that the GEMM did not write
+ * (analogous to the mmq Y-buffer tail).  With no explicit workspace cuBLAS
+ * recycles uninitialized device memory, so any allocator perturbation (e.g. an
+ * MTP draft's cudaMalloc) changes those reads -> a near-threshold argmax flip in
+ * the batched (prefill) forward.  Confirmed via compute-sanitizer initcheck on a
+ * B200: "Uninitialized __global__ memory read" in cublasLt::splitKreduce_kernel
+ * under cublasGemmEx in ds4_gpu_matmul_f16_tensor.  We give cuBLAS our own
+ * workspace and zero it before each f16 GemmEx so the padding reads are a
+ * deterministic 0. */
+static void *g_cublas_ws = NULL;
+static size_t g_cublas_ws_bytes = 0;
 static int g_quality_mode;
 static int g_attention_output_b_n2_q8_override;
 
@@ -482,6 +494,16 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
         (void)cudaGetLastError();
         return NULL;
     }
+    /* Deterministic-init the freshly (re)allocated scratch.  Some batched
+     * kernels read padding/tail elements of this shared scratch that they did
+     * not write (e.g. cublas workspace tails, topk-sort padding beyond n_comp).
+     * cudaMalloc returns recycled memory whose contents depend on the prior
+     * allocation history, so when an UNRELATED allocation (e.g. the MTP
+     * drafter's decode_scalars cudaMalloc) shifts where this buffer lands on a
+     * mid-run resize, those unwritten tail reads change -> a near-threshold
+     * argmax flip downstream.  Zeroing on (re)alloc makes the read-before-write
+     * deterministic.  Cheap: resizes are rare (sticky high-water buffer). */
+    if (ptr) (void)cudaMemset(ptr, 0, (size_t)bytes);
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
@@ -2167,6 +2189,19 @@ extern "C" int ds4_gpu_init(void) {
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
+        /* S1.1a: dedicated split-K workspace (see g_cublas_ws decl).  32 MiB is
+         * cuBLAS's recommended workspace on recent archs; on alloc failure we
+         * leave it NULL and cuBLAS falls back to its own (non-deterministic)
+         * workspace -- correctness of the GEMM is unaffected either way. */
+        const size_t cublas_ws_bytes = (size_t)32u * 1024u * 1024u;
+        if (cudaMalloc(&g_cublas_ws, cublas_ws_bytes) == cudaSuccess) {
+            g_cublas_ws_bytes = cublas_ws_bytes;
+            (void)cublasSetWorkspace(g_cublas, g_cublas_ws, g_cublas_ws_bytes);
+        } else {
+            (void)cudaGetLastError();
+            g_cublas_ws = NULL;
+            g_cublas_ws_bytes = 0;
+        }
         g_cublas_ready = 1;
     }
     /* Dedicated split-K F16 partials scratch. Allocated here (eager init,
@@ -2228,6 +2263,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
         g_cublas = NULL;
+    }
+    if (g_cublas_ws) {
+        (void)cudaFree(g_cublas_ws);
+        g_cublas_ws = NULL;
+        g_cublas_ws_bytes = 0;
     }
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -10997,6 +11037,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             if (!xh) return 0;
             f32_to_f16_kernel<<<(xh_count + 255) / 256, 256, 0, ds4_current_stream()>>>(xh, (const float *)x->ptr, xh_count);
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
+            /* S1.1a: zero cuBLAS's split-K workspace before the GemmEx (see
+             * g_cublas_ws) so the split-K reduce reads deterministic 0 padding. */
+            if (g_cublas_ws) (void)cudaMemsetAsync(g_cublas_ws, 0, g_cublas_ws_bytes, ds4_current_stream());
             const float alpha = 1.0f;
             const float beta = 0.0f;
             cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -11706,6 +11749,11 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256, 0, ds4_current_stream()>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
+        /* S1.1a: zero cuBLAS's split-K workspace so its split-K reduce reads a
+         * deterministic 0 for unwritten padding (see g_cublas_ws).  Same stream
+         * (default, == ds4_current_stream() off-capture) as the GemmEx, so it is
+         * ordered before the matmul reads it. */
+        if (g_cublas_ws) (void)cudaMemsetAsync(g_cublas_ws, 0, g_cublas_ws_bytes, ds4_current_stream());
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,
