@@ -27496,7 +27496,20 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 for (uint32_t b = 0; ok && b < MS; b++) {
                     ndr[b] = 0u;
                     if (!live[b] || cfirst[b] == UINT32_MAX) continue;
-                    const uint32_t last_row = cfirst[b] + committed_rows[b] - 1u;
+                    /* Seed off the LAST COMMITTED row's hidden state in batch_cur_hc.  Which
+                     * layout that buffer holds depends on the commit path:
+                     *  - no_defer (M3 in-forward emit, Dspec in {0,1,2}): the commit re-forward
+                     *    above was SKIPPED, so batch_cur_hc still holds the VERIFY forward's
+                     *    output -- the packed (vfirst) layout, K2 rows.  Last committed row of
+                     *    bank b is vfirst[b] + (M-1).
+                     *  - deferred (Dspec>2, gate-only): the commit re-forward overwrote
+                     *    batch_cur_hc with the COMPACT (cfirst) layout, C2 rows.  Last committed
+                     *    row is cfirst[b] + (M-1).
+                     * Using cfirst on the no_defer path seeds the WRONG row whenever an earlier
+                     * bank committed fewer rows than it packed (cfirst[b] < vfirst[b]); harmless
+                     * at N=1 (vfirst==cfirst==0) but tanks the N>1 accept rate. */
+                    const uint32_t base_row = no_defer ? vfirst[b] : cfirst[b];
+                    const uint32_t last_row = base_row + committed_rows[b] - 1u;
                     ds4_gpu_tensor *seed_hc = metal_graph_tensor_row_view(g->batch_cur_hc, last_row, hc_dim_cont);
                     if (!seed_hc) { ok = false; break; }
                     int chain[DS4_CONT_MTP_MAX_DEPTH];
