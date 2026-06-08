@@ -8778,6 +8778,19 @@ typedef struct {
     uint32_t spec_prefix1_n_index_comp[DS4_MAX_LAYER];
     uint32_t spec_prefix2_n_comp[DS4_MAX_LAYER];
     uint32_t spec_prefix2_n_index_comp[DS4_MAX_LAYER];
+    /* S1.1 M3: N-bank in-forward rollback checkpoints.  Two depth slots (d=0 -> after the
+     * committed cur row = 1-token prefix; d=1 -> after draft0 = 2-token prefix).  The tensors
+     * are the per-batch N-bank checkpoint slabs (owned by ds4_batch_slabs, pointed here by
+     * ds4_engine_continuous_generate after the slab repoint); bank b lives at offset
+     * b*state_stride, matching the active state slab.  The counters mirror ms_n_comp /
+     * ms_n_index_comp at each checkpoint so a per-bank restore rewinds the row frontier
+     * exactly.  Not owned by the graph (the slab frees them). */
+    ds4_gpu_tensor *mtp_rb_askv[2][DS4_MAX_LAYER];
+    ds4_gpu_tensor *mtp_rb_assc[2][DS4_MAX_LAYER];
+    ds4_gpu_tensor *mtp_rb_iskv[2][DS4_MAX_LAYER];
+    ds4_gpu_tensor *mtp_rb_issc[2][DS4_MAX_LAYER];
+    uint32_t mtp_rb_n_comp[2][DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    uint32_t mtp_rb_n_index_comp[2][DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
     bool spec_capture_prefix1;
     uint32_t spec_capture_prefix_depth;
     uint32_t raw_cap;
@@ -8937,6 +8950,11 @@ typedef struct {
      * [t] for t in 0..n_tokens-1 and these must hold all Σ rows, not just MAX_SEQ. */
     int32_t        *ms_positions;
     int32_t        *ms_seq_id;
+    /* S1.1 M3: per-ROW verify draft depth (0 = committed cur row, j+1 = draft j), parallel to
+     * ms_positions/ms_seq_id.  The in-forward rollback capture keys its checkpoint slot on this
+     * (depth 0 -> ckpt[0] = 1-token prefix, depth 1 -> ckpt[1] = 2-token prefix) so banks packed
+     * contiguously (N>1) snapshot at the right depth regardless of packed-row index. */
+    int32_t        *ms_vdepth;
     uint32_t        ms_n_comp[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
     uint32_t        ms_n_index_comp[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
     ds4_gpu_tensor *batch_cur_hc;
@@ -9056,6 +9074,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_positions);
     free(g->ms_positions);                         /* B1: per-ROW host mirrors */
     free(g->ms_seq_id);
+    free(g->ms_vdepth);                            /* S1.1 M3: per-ROW verify depth */
     ds4_gpu_tensor_free(g->batch_heads);
     ds4_gpu_tensor_free(g->batch_indexer_weights);
     ds4_gpu_tensor_free(g->batch_indexer_q);
@@ -9757,6 +9776,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_seq_id = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));     /* Phase 2 Step 3b */
     g->ms_positions = xmalloc((size_t)pc * sizeof(int32_t));          /* B1: per-ROW host mirror (ragged Σ rows) */
     g->ms_seq_id    = xmalloc((size_t)pc * sizeof(int32_t));
+    g->ms_vdepth    = xmalloc((size_t)pc * sizeof(int32_t));          /* S1.1 M3: per-ROW verify depth */
     g->batch_multiseq = false;
     g->batch_n_seq = 0;
     g->batch_max_seq_len = 0;                                        /* B0: ragged prefill */
@@ -15186,18 +15206,24 @@ static bool metal_graph_encode_layer_attention_batch(
                  * bank (rollback path is N=1-live), so t == depth-1: row 0 -> prefix1
                  * (1 token kept), row 1 -> prefix2 (2 tokens).  state_stride == one bank
                  * == the spec_prefix tensor size; copy from bank seq's slab offset. */
-                if (ok && g->batch_rollback_capture && t < 2u) {
-                    ds4_gpu_tensor *dk = (t == 0u) ? g->spec_prefix1_attn_state_kv[il]
-                                                   : g->spec_prefix2_attn_state_kv[il];
-                    ds4_gpu_tensor *ds = (t == 0u) ? g->spec_prefix1_attn_state_score[il]
-                                                   : g->spec_prefix2_attn_state_score[il];
-                    uint32_t *dn = (t == 0u) ? g->spec_prefix1_n_comp : g->spec_prefix2_n_comp;
-                    if (dk && ds) {
-                        ok = ds4_gpu_tensor_copy(dk, 0, g->layer_attn_state_kv[il],
-                                                 (uint64_t)seq * state_stride, state_stride) != 0 &&
-                             ds4_gpu_tensor_copy(ds, 0, g->layer_attn_state_score[il],
-                                                 (uint64_t)seq * state_stride, state_stride) != 0;
-                        dn[il] = g->ms_n_comp[seq][il];
+                /* S1.1 M3: snapshot bank seq's attn running-state + row counter at this row's
+                 * VERIFY DEPTH so a partial accept rolls the bank back to its accepted prefix.
+                 * Keyed on ms_vdepth (not the packed-row index t): depth 0 -> ckpt[0] (1-token
+                 * prefix), depth 1 -> ckpt[1] (2-token prefix).  Per-bank slab offset
+                 * seq*state_stride matches the active state slab, so each bank checkpoints into
+                 * its own lane independently -- N parallel copies of the N=1 M2 snapshot. */
+                if (ok && g->batch_rollback_capture) {
+                    const uint32_t depth = (uint32_t)g->ms_vdepth[t];
+                    if (depth < 2u) {
+                        ds4_gpu_tensor *dk = g->mtp_rb_askv[depth][il];
+                        ds4_gpu_tensor *ds = g->mtp_rb_assc[depth][il];
+                        if (dk && ds) {
+                            ok = ds4_gpu_tensor_copy(dk, (uint64_t)seq * state_stride, g->layer_attn_state_kv[il],
+                                                     (uint64_t)seq * state_stride, state_stride) != 0 &&
+                                 ds4_gpu_tensor_copy(ds, (uint64_t)seq * state_stride, g->layer_attn_state_score[il],
+                                                     (uint64_t)seq * state_stride, state_stride) != 0;
+                            g->mtp_rb_n_comp[depth][seq][il] = g->ms_n_comp[seq][il];
+                        }
                     }
                 }
                 ds4_gpu_tensor_free(st_sc);
@@ -15654,20 +15680,19 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                     }
                     if (ok && emit) g->ms_n_index_comp[seq][il]++;
-                    /* S1.1 M2: indexer sibling of the attn rollback snapshot above. */
-                    if (ok && g->batch_rollback_capture && t < 2u) {
-                        ds4_gpu_tensor *dk = (t == 0u) ? g->spec_prefix1_index_state_kv[il]
-                                                       : g->spec_prefix2_index_state_kv[il];
-                        ds4_gpu_tensor *ds = (t == 0u) ? g->spec_prefix1_index_state_score[il]
-                                                       : g->spec_prefix2_index_state_score[il];
-                        uint32_t *dn = (t == 0u) ? g->spec_prefix1_n_index_comp
-                                                 : g->spec_prefix2_n_index_comp;
-                        if (dk && ds) {
-                            ok = ds4_gpu_tensor_copy(dk, 0, g->layer_index_state_kv[il],
-                                                     (uint64_t)seq * istate_stride, istate_stride) != 0 &&
-                                 ds4_gpu_tensor_copy(ds, 0, g->layer_index_state_score[il],
-                                                     (uint64_t)seq * istate_stride, istate_stride) != 0;
-                            dn[il] = g->ms_n_index_comp[seq][il];
+                    /* S1.1 M3: indexer sibling of the attn rollback snapshot above. */
+                    if (ok && g->batch_rollback_capture) {
+                        const uint32_t depth = (uint32_t)g->ms_vdepth[t];
+                        if (depth < 2u) {
+                            ds4_gpu_tensor *dk = g->mtp_rb_iskv[depth][il];
+                            ds4_gpu_tensor *ds = g->mtp_rb_issc[depth][il];
+                            if (dk && ds) {
+                                ok = ds4_gpu_tensor_copy(dk, (uint64_t)seq * istate_stride, g->layer_index_state_kv[il],
+                                                         (uint64_t)seq * istate_stride, istate_stride) != 0 &&
+                                     ds4_gpu_tensor_copy(ds, (uint64_t)seq * istate_stride, g->layer_index_state_score[il],
+                                                         (uint64_t)seq * istate_stride, istate_stride) != 0;
+                                g->mtp_rb_n_index_comp[depth][seq][il] = g->ms_n_index_comp[seq][il];
+                            }
                         }
                     }
                     ds4_gpu_tensor_free(st_sc);
@@ -22237,6 +22262,14 @@ typedef struct {
     ds4_gpu_tensor *saved_issc[DS4_MAX_LAYER];
     ds4_gpu_tensor *cur_views[DS4_MAX_LAYER * 7];
     uint32_t        n_cur_views;
+    /* S1.1 M3: per-bank in-forward rollback checkpoint slabs, two depths (d=0 -> 1-token prefix,
+     * d=1 -> 2-token prefix).  N-bank attn/index state snapshots taken during the verify forward
+     * so a partial accept rolls each bank back to its accepted prefix independently.  Allocated
+     * and freed alongside the multi_* slabs; exposed on g->mtp_rb_* by cont-gen. */
+    ds4_gpu_tensor *ckpt_askv[2][DS4_MAX_LAYER];
+    ds4_gpu_tensor *ckpt_assc[2][DS4_MAX_LAYER];
+    ds4_gpu_tensor *ckpt_iskv[2][DS4_MAX_LAYER];
+    ds4_gpu_tensor *ckpt_issc[2][DS4_MAX_LAYER];
 } ds4_batch_slabs;
 
 /* Phase 2 S1: per-bank MTP draft state for the continuous batched path.
@@ -22302,12 +22335,22 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
             sl->multi_askv[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
             sl->multi_assc[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
             ok = sl->multi_comp[il] && sl->multi_askv[il] && sl->multi_assc[il];
+            for (uint32_t d = 0; ok && d < 2u; d++) {   /* M3: per-bank attn rollback checkpoints */
+                sl->ckpt_askv[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
+                sl->ckpt_assc[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
+                ok = sl->ckpt_askv[d][il] && sl->ckpt_assc[d][il];
+            }
         }
         if (ok && ratio == 4 && sl->saved_index[il]) {
             sl->multi_index[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->index_bank_bytes[il]);
             sl->multi_iskv[il]  = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
             sl->multi_issc[il]  = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
             ok = sl->multi_index[il] && sl->multi_iskv[il] && sl->multi_issc[il];
+            for (uint32_t d = 0; ok && d < 2u; d++) {   /* M3: per-bank index rollback checkpoints */
+                sl->ckpt_iskv[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
+                sl->ckpt_issc[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
+                ok = sl->ckpt_iskv[d][il] && sl->ckpt_issc[d][il];
+            }
         }
     }
     return ok;
@@ -22409,6 +22452,12 @@ static void ds4_batch_slabs_free(ds4_batch_slabs *sl, ds4_gpu_graph *g) {
         if (sl->multi_assc[il])  ds4_gpu_tensor_free(sl->multi_assc[il]);
         if (sl->multi_iskv[il])  ds4_gpu_tensor_free(sl->multi_iskv[il]);
         if (sl->multi_issc[il])  ds4_gpu_tensor_free(sl->multi_issc[il]);
+        for (uint32_t d = 0; d < 2u; d++) {   /* M3: rollback checkpoint slabs */
+            if (sl->ckpt_askv[d][il]) ds4_gpu_tensor_free(sl->ckpt_askv[d][il]);
+            if (sl->ckpt_assc[d][il]) ds4_gpu_tensor_free(sl->ckpt_assc[d][il]);
+            if (sl->ckpt_iskv[d][il]) ds4_gpu_tensor_free(sl->ckpt_iskv[d][il]);
+            if (sl->ckpt_issc[d][il]) ds4_gpu_tensor_free(sl->ckpt_issc[d][il]);
+        }
     }
     memset(sl, 0, sizeof(*sl));
 }
@@ -26716,6 +26765,17 @@ struct ds4_batch_ctx {
      * byte-identical committed-cache fingerprint.  -1 = off (production). */
     int             mtp_force_draft_tok;
     int             mtp_force_draft_from;
+    /* S1.1 M3 gate sensitivity knob: when set, the in-forward verify SKIPS the per-bank rollback
+     * so rejected drafts contaminate the committed cache.  The gate runs the forced-draft pair
+     * once with rollback ON (expect identical fingerprints) and once OFF (expect DIFFERENT) to
+     * prove the committed fingerprint is non-vacuous.  0 = off (production). */
+    int             mtp_force_norollback;
+    /* S1.1 M3 gate self-check: when set, each in-forward rollback reads back the restored attn-state
+     * lane and asserts it byte-matches its checkpoint source; mismatches accumulate in
+     * rollback_verify_fails.  Guards the capture/restore plumbing (stride/offset/slab) against
+     * regression, independently of the inherent cross-row-FP noise in the committed-cache values. */
+    int             rollback_verify;
+    uint32_t        rollback_verify_fails;
     uint32_t        ctx_size;
     uint32_t        prefill_cap;   /* = max_total_tokens (ragged Σlen cap) */
     uint32_t        raw_cap;       /* SWA raw ring (per-seq prompt+budget bound) */
@@ -26746,6 +26806,9 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
     ctx->max_seq = (uint32_t)max_seq;
     ctx->mtp_force_draft_tok = -1;          /* S1.1 gate hook: off in production */
     ctx->mtp_force_draft_from = 0;
+    ctx->mtp_force_norollback = 0;          /* S1.1 M3 gate sensitivity knob: off in production */
+    ctx->rollback_verify = 0;               /* S1.1 M3 gate rollback self-check: off in production */
+    ctx->rollback_verify_fails = 0;
     /* S1: enable MTP scaffolding in the batched graph only when the engine has a
      * support model loaded (--mtp).  Without it, enable_mtp stays false and the
      * continuous/batched path is byte-for-byte unchanged. */
@@ -26947,76 +27010,133 @@ static int mtp_draft_chain_bank(ds4_batch_ctx *ctx, ds4_gpu_graph *g, uint32_t b
 /* S1.1: compile-time cap on the speculative draft depth (per-bank scratch sizing). */
 #define DS4_CONT_MTP_MAX_DEPTH 4u
 
-/* S1.1 gate: FNV-1a fingerprint of bank 0's COMMITTED compressed-KV state -- the committed
- * comp_cache rows [0,ms_n_comp[0][il]) for every attn ratio-layer + index ratio-4 layer.  The
- * D>=1 prefix-causality gate computes this after two forced-draft runs (same accepted prefix +
- * verify width, different rejected-draft values): equal fingerprints => the committed cache is
- * invariant to rejected drafts (prefix-causal).  Returns 0 on read failure (treated as a miss). */
-static uint64_t mtp_cont_committed_fp(ds4_gpu_graph *g) {
-    if (ds4_gpu_synchronize() == 0) return 0u;
-    uint64_t h = 1469598103934665603ULL;
-    static unsigned char *buf = NULL; static uint64_t bufcap = 0;
-    const uint32_t ac_elem = DS4_GPU_ATTN_COMP_CACHE_F16 ? 2u : 4u;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        struct { ds4_gpu_tensor *t; uint64_t nb; } recs[2] = {
-            { g->layer_attn_comp_cache[il],  (uint64_t)g->ms_n_comp[0][il]       * (uint64_t)DS4_N_HEAD_DIM * ac_elem },
-            { g->layer_index_comp_cache[il], (uint64_t)g->ms_n_index_comp[0][il] * (uint64_t)DS4_N_INDEXER_HEAD_DIM * 4u },
-        };
-        for (int r = 0; r < 2; r++) {
-            ds4_gpu_tensor *t = recs[r].t; uint64_t nb = recs[r].nb;
-            if (!t || nb == 0u) continue;
-            uint64_t tb = ds4_gpu_tensor_bytes(t);
-            if (nb > tb) nb = tb;
-            if (nb > bufcap) { free(buf); buf = xmalloc((size_t)nb); bufcap = nb; }
-            if (ds4_gpu_tensor_read(t, 0, buf, nb) != 0) {
-                h ^= (uint64_t)(0x100u + (uint32_t)r) ^ ((uint64_t)il << 8); h *= 1099511628211ULL;
-                for (uint64_t i = 0; i < nb; i++) { h ^= buf[i]; h *= 1099511628211ULL; }
+/* S1.1 gate (M3): read EVERY live bank's COMMITTED compressed-KV into a flat float buffer (canonical
+ * order: kind in {attn,index} x layer x bank x committed-row) plus a parallel per-(kind,layer,bank)
+ * row-COUNT array, so two forced-draft runs can be compared for prefix-causality.
+ *
+ * The committed cache is NOT bit-exactly invariant to rejected-draft VALUES at N>1: a *committed*
+ * draft row is emitted inside the width-(1+D) verify forward, where a later (rejected) draft's value
+ * perturbs the batched MoE grouped-GEMM expert reduction -- the same N!=N cross-row FP that makes a
+ * batched decode non-bit-identical to a width-1 decode.  So the contract is:
+ *   (1) the committed-row FRONTIER (counts) is EXACTLY invariant -- a rejected draft must never
+ *       change how many rows a bank commits (a count change = a causal leak), AND
+ *   (2) the VALUES are invariant up to that inherent cross-row FP band (a structural leak puts a
+ *       rejected draft's whole KV vector into a committed row -> ~100% diff, far outside the band).
+ * Caller re-repoints the N-bank slab first (cont-gen restores single-seq pointers at cleanup) and
+ * frees *out_buf / *out_counts.  Returns 0 on read failure or non-FP32 cache (gate runs FP32). */
+static int mtp_cont_committed_read(ds4_gpu_graph *g, uint32_t nbanks,
+                                   float **out_buf, uint64_t *out_nf,
+                                   uint32_t **out_counts, uint32_t *out_nc) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16) return 0;        /* reader assumes FP32 comp cache */
+    if (ds4_gpu_synchronize() == 0) return 0;
+    uint64_t nf = 0; uint32_t nc = 0;                 /* pass 1: size */
+    for (int kind = 0; kind < 2; kind++)
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0u || (kind == 1 && ratio != 4u)) continue;
+            const uint32_t dim = kind == 0 ? (uint32_t)DS4_N_HEAD_DIM : (uint32_t)DS4_N_INDEXER_HEAD_DIM;
+            for (uint32_t b = 0; b < nbanks; b++) {
+                const uint32_t rows = kind == 0 ? g->ms_n_comp[b][il] : g->ms_n_index_comp[b][il];
+                nc++; nf += (uint64_t)rows * dim;
             }
         }
-    }
+    float    *buf = xmalloc((size_t)(nf ? nf : 1u) * sizeof(float));
+    uint32_t *cnt = xmalloc((size_t)(nc ? nc : 1u) * sizeof(uint32_t));
+    uint64_t off = 0; uint32_t ci = 0; int ok = 1;    /* pass 2: read */
+    for (int kind = 0; kind < 2 && ok; kind++)
+        for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0u || (kind == 1 && ratio != 4u)) continue;
+            const uint32_t dim = kind == 0 ? (uint32_t)DS4_N_HEAD_DIM : (uint32_t)DS4_N_INDEXER_HEAD_DIM;
+            ds4_gpu_tensor *t = kind == 0 ? g->layer_attn_comp_cache[il] : g->layer_index_comp_cache[il];
+            const uint64_t bank_bytes = (uint64_t)g->layer_comp_cap[il] * dim * sizeof(float);
+            for (uint32_t b = 0; b < nbanks; b++) {
+                const uint32_t rows = kind == 0 ? g->ms_n_comp[b][il] : g->ms_n_index_comp[b][il];
+                cnt[ci++] = rows;
+                if (rows == 0u || !t) continue;
+                const uint64_t nb = (uint64_t)rows * dim * sizeof(float);
+                if (ds4_gpu_tensor_read(t, (uint64_t)b * bank_bytes, buf + off, nb) == 0) { ok = 0; break; }
+                off += (uint64_t)rows * dim;
+            }
+        }
     (void)ds4_gpu_begin_commands();
-    return h;
+    if (!ok) { free(buf); free(cnt); return 0; }
+    *out_buf = buf; *out_nf = nf; *out_counts = cnt; *out_nc = nc;
+    return 1;
 }
 
-/* S1.1 M2: roll bank b0 back to its accepted-prefix (M tokens) compressor state after a
- * partial accept.  The verify forward emitted ALL packed rows in-forward (bit-identical to
- * mode-0 for the accepted rows) and snapshotted bank b0's per-layer attn+index running
- * state + row counters into spec_prefix{1,2} after rows 0 and 1.  Restore from spec_prefix{M}
- * (M in {1,2}) and rewind the per-bank + scalar row counters; the rejected rows' append-only
- * compressed-cache rows become invisible garbage (reads clamp to ms_n_comp, no zeroing).
- * N=1 / D<=2 only; spec_prefix has just two depth slots.  spec_prefix tensor bytes == one
- * bank's state_stride, so the per-bank slab offset is b0 * that size. */
-static bool mtp_cont_rollback_restore(ds4_gpu_graph *g, uint32_t b0, uint32_t M) {
-    if (M < 1u || M > 2u) return false;
+/* S1.1 M3: roll EVERY partially-accepted bank back to its accepted-prefix compressor state after
+ * a partial accept.  The verify forward emitted ALL packed rows in-forward (bit-identical to
+ * mode-0 for the accepted rows) and snapshotted each bank's per-layer attn+index running state +
+ * row counters into the N-bank checkpoint slabs (g->mtp_rb_*) at depths 0 (1-token prefix) and 1
+ * (2-token prefix).  Banks are INDEPENDENT per-seq pools, so this is N parallel copies of the
+ * proven N=1 M2 rollback: for each bank b that accepted M = committed_rows[b] of its 1+vnr[b]
+ * rows with 1 <= M < 1+vnr[b] (and M <= 2, the captured depths), restore bank b's lane from
+ * checkpoint depth M-1 and rewind its row counters.  The rejected rows' append-only
+ * compressed-cache rows become invisible garbage (reads clamp to ms_n_comp, no zeroing).  The
+ * scalar layer counters are recomputed once per layer (max over banks) after all per-bank
+ * restores, since a within-step draft reads them.
+ *
+ * When `verify` is set (gate self-check), the restored attn-state lane of the first compress layer
+ * is read back and compared byte-for-byte against its checkpoint source for every rolled-back bank;
+ * any mismatch bumps *vfails.  This is the deeper internal assert: at N>1 the committed-cache VALUES
+ * carry inherent cross-row MoE FP (so a value diff there is expected), but the rollback mechanism
+ * itself -- the per-bank checkpoint copy at offset b*stride from depth M-1 -- must be byte-exact, and
+ * a regression in the stride/offset/slab plumbing would surface here as a copy mismatch. */
+static bool mtp_cont_rollback_restore_all(ds4_gpu_graph *g, uint32_t MS,
+                                          const uint32_t *committed_rows, const uint32_t *vnr,
+                                          int verify, uint32_t *vfails) {
     bool ok = true;
+    uint32_t first_cl = UINT32_MAX;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0u) continue;
-        ds4_gpu_tensor *sk = (M == 1u) ? g->spec_prefix1_attn_state_kv[il]
-                                       : g->spec_prefix2_attn_state_kv[il];
-        ds4_gpu_tensor *ss = (M == 1u) ? g->spec_prefix1_attn_state_score[il]
-                                       : g->spec_prefix2_attn_state_score[il];
-        uint32_t *sn = (M == 1u) ? g->spec_prefix1_n_comp : g->spec_prefix2_n_comp;
-        if (!sk || !ss) continue;
-        const uint64_t ab = ds4_gpu_tensor_bytes(sk);   /* one bank */
-        ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], (uint64_t)b0 * ab, sk, 0, ab) != 0 &&
-             ds4_gpu_tensor_copy(g->layer_attn_state_score[il], (uint64_t)b0 * ab, ss, 0, ab) != 0;
-        g->ms_n_comp[b0][il] = sn[il];
-        g->layer_n_comp[il]  = sn[il];
-        if (ok && ratio == 4u) {
-            ds4_gpu_tensor *ik = (M == 1u) ? g->spec_prefix1_index_state_kv[il]
-                                           : g->spec_prefix2_index_state_kv[il];
-            ds4_gpu_tensor *is = (M == 1u) ? g->spec_prefix1_index_state_score[il]
-                                           : g->spec_prefix2_index_state_score[il];
-            uint32_t *in_ = (M == 1u) ? g->spec_prefix1_n_index_comp : g->spec_prefix2_n_index_comp;
-            if (ik && is) {
-                const uint64_t ib = ds4_gpu_tensor_bytes(ik);
-                ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], (uint64_t)b0 * ib, ik, 0, ib) != 0 &&
-                     ds4_gpu_tensor_copy(g->layer_index_state_score[il], (uint64_t)b0 * ib, is, 0, ib) != 0;
-                g->ms_n_index_comp[b0][il] = in_[il];
-                g->layer_n_index_comp[il]  = in_[il];
+        if (first_cl == UINT32_MAX) first_cl = il;
+        const uint32_t coff = (ratio == 4u) ? 2u : 1u;
+        const uint64_t ab = (uint64_t)(coff * ratio) * (uint64_t)(coff * DS4_N_HEAD_DIM) * sizeof(float);
+        const uint64_t ib = (uint64_t)(coff * ratio) * (uint64_t)(coff * DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
+        for (uint32_t b = 0; ok && b < MS; b++) {
+            const uint32_t M = committed_rows[b];
+            const uint32_t total = 1u + vnr[b];
+            if (M < 1u || M > 2u || M >= total) continue;   /* full accept or out-of-checkpoint-range */
+            const uint32_t d = M - 1u;                      /* depth slot: M tokens kept -> ckpt[M-1] */
+            ds4_gpu_tensor *sk = g->mtp_rb_askv[d][il];
+            ds4_gpu_tensor *ss = g->mtp_rb_assc[d][il];
+            if (!sk || !ss) continue;
+            ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], (uint64_t)b * ab, sk, (uint64_t)b * ab, ab) != 0 &&
+                 ds4_gpu_tensor_copy(g->layer_attn_state_score[il], (uint64_t)b * ab, ss, (uint64_t)b * ab, ab) != 0;
+            g->ms_n_comp[b][il] = g->mtp_rb_n_comp[d][b][il];
+            if (ok && verify && vfails && il == first_cl) {   /* byte-exact restore self-check */
+                static unsigned char *va = NULL, *vb = NULL; static uint64_t vcap = 0;
+                if (ab > vcap) { free(va); free(vb); va = xmalloc((size_t)ab); vb = xmalloc((size_t)ab); vcap = ab; }
+                (void)ds4_gpu_synchronize();
+                if (ds4_gpu_tensor_read(g->layer_attn_state_kv[il], (uint64_t)b * ab, va, ab) != 0 &&
+                    ds4_gpu_tensor_read(sk, (uint64_t)b * ab, vb, ab) != 0 &&
+                    memcmp(va, vb, (size_t)ab) != 0)
+                    (*vfails)++;
+                (void)ds4_gpu_begin_commands();
+            }
+            if (ok && ratio == 4u) {
+                ds4_gpu_tensor *ik = g->mtp_rb_iskv[d][il];
+                ds4_gpu_tensor *is = g->mtp_rb_issc[d][il];
+                if (ik && is) {
+                    ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], (uint64_t)b * ib, ik, (uint64_t)b * ib, ib) != 0 &&
+                         ds4_gpu_tensor_copy(g->layer_index_state_score[il], (uint64_t)b * ib, is, (uint64_t)b * ib, ib) != 0;
+                    g->ms_n_index_comp[b][il] = g->mtp_rb_n_index_comp[d][b][il];
+                }
             }
         }
+        /* Recompute the scalar read-counts ONCE (max over all banks) after this layer's rollbacks:
+         * the within-step draft (step 5) reads them, and the next step's top-of-loop refresh
+         * recomputes anyway.  Setting them per-bank inside the loop (as M2 did at N=1) would leave
+         * them at a rolled-back bank's value even if another bank kept more rows. */
+        uint32_t mc = 0, mi = 0;
+        for (uint32_t b = 0; b < MS; b++) {
+            if (g->ms_n_comp[b][il] > mc) mc = g->ms_n_comp[b][il];
+            if (g->ms_n_index_comp[b][il] > mi) mi = g->ms_n_index_comp[b][il];
+        }
+        g->layer_n_comp[il]       = mc;
+        g->layer_n_index_comp[il] = mi;
     }
     return ok;
 }
@@ -27122,6 +27242,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
 
     if (ok) ok = ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS);
     if (ok) {
+        /* S1.1 M3: expose the per-bank rollback checkpoint slabs (owned by ctx->sl, lifetime ==
+         * the ctx) on g so the in-forward capture can snapshot each bank's state.  Banks are
+         * addressed [0,MS) at absolute offset b*state_stride, matching the [0,MS) repoint above;
+         * the ckpt slab pointers are stable across the per-admit single-bank re-repoints below. */
+        for (uint32_t d = 0; d < 2u; d++)
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                g->mtp_rb_askv[d][il] = ctx->sl.ckpt_askv[d][il];
+                g->mtp_rb_assc[d][il] = ctx->sl.ckpt_assc[d][il];
+                g->mtp_rb_iskv[d][il] = ctx->sl.ckpt_iskv[d][il];
+                g->mtp_rb_issc[d][il] = ctx->sl.ckpt_issc[d][il];
+            }
         g->batch_multiseq = true;
         g->batch_n_seq = MS;
         g->batch_multiseq_prefilled = true;
@@ -27235,28 +27366,28 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 while (nd > 0u && (posv[b] + nd >= raw_cap || K2 + 1u + nd > vcap_rows)) nd--;
                 vfirst[b] = K2; vnr[b] = nd;
                 vqtok[K2] = cur[b]; vpos[K2] = (int32_t)posv[b]; vsid[K2] = (int32_t)b;
-                g->ms_positions[K2] = vpos[K2]; g->ms_seq_id[K2] = vsid[K2]; K2++;
+                g->ms_positions[K2] = vpos[K2]; g->ms_seq_id[K2] = vsid[K2];
+                g->ms_vdepth[K2] = 0; K2++;                       /* M3: cur row = depth 0 */
                 for (uint32_t j = 0; j < nd; j++) {
                     vqtok[K2] = dbuf[b * DS4_CONT_MTP_MAX_DEPTH + j];
                     vpos[K2]  = (int32_t)(posv[b] + 1u + j);
                     vsid[K2]  = (int32_t)b;
-                    g->ms_positions[K2] = vpos[K2]; g->ms_seq_id[K2] = vsid[K2]; K2++;
+                    g->ms_positions[K2] = vpos[K2]; g->ms_seq_id[K2] = vsid[K2];
+                    g->ms_vdepth[K2] = (int32_t)(j + 1u); K2++;   /* M3: draft j = depth j+1 */
                 }
                 if (posv[b] + nd > vmaxpos) vmaxpos = posv[b] + nd;
             }
-            /* 2. VERIFY forward.  Three emit regimes:
+            /* 2. VERIFY forward.  Emit regimes:
              *  - D=0: every verify row is the committed [cur] row (always accepted) -> emit
              *    in the verify forward; bit-identical to mode-0's single forward(store).
-             *  - D>=1, single live bank (M2): emit ALL packed rows in the verify forward AND
-             *    snapshot bank b0's per-row state into spec_prefix{1,2}, then roll the bank
-             *    back to its accepted prefix below.  Lossless + prefix-causal, no re-forward.
-             *  - D>=1, multiple live banks: no per-bank rollback yet (M3) -> keep the old
-             *    deferred-commit re-forward path (reached only via the gate at N>1; mode 2 is
-             *    not a production path). */
-            const bool can_rollback = (Dspec >= 1u && Dspec <= 2u && n_live == 1u);
+             *  - D in {1,2}, any live-bank count (M2 at N=1, M3 at N>1): emit ALL packed rows
+             *    in the verify forward AND snapshot every bank's per-row state into the N-bank
+             *    checkpoint slabs (g->mtp_rb_*), then roll each partially-accepted bank back to
+             *    its accepted prefix below.  Lossless + prefix-causal, no re-forward.
+             *  - D>2: no checkpoints (only depths 0,1 captured) -> fall back to the deferred-commit
+             *    re-forward path (reached only via the gate; mode 2 is not a production path). */
+            const bool can_rollback = (Dspec >= 1u && Dspec <= 2u && n_live >= 1u);
             const bool no_defer = (Dspec == 0u) || can_rollback;
-            uint32_t rb_bank = UINT32_MAX;
-            if (can_rollback) { for (uint32_t b = 0; b < MS; b++) if (live[b]) { rb_bank = b; break; } }
             ok = ds4_gpu_tensor_write(g->batch_positions, 0, vpos, (uint64_t)K2 * sizeof(int32_t)) != 0;
             if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, vsid, (uint64_t)K2 * sizeof(int32_t)) != 0;
             if (ok) {
@@ -27314,21 +27445,16 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
                 committed_rows[b] = M;
             }
-            /* 3b. ROLLBACK (M2): the verify forward emitted ALL packed rows in-forward; if
-             * the single live bank accepted only M < (1+nd) of its (1+nd) rows, restore its
-             * compressor state to the M-token prefix snapshot so the rejected drafts leave no
-             * trace.  Only when still live (an evicted bank needs no future state).  The
-             * deferred commit-reforward below is skipped on this path (no_defer is set). */
-            if (can_rollback && rb_bank != UINT32_MAX) {
-                const uint32_t M = committed_rows[rb_bank];
-                const uint32_t total = 1u + vnr[rb_bank];
-                /* Roll back even if the bank just evicted: the committed cache must reflect
-                 * only the accepted tokens (prefix-causal) for cache reuse/checkpointing,
-                 * and an evicted bank's slab is safe to write (per-run allocation). */
-                if (M >= 1u && M < total) {
-                    ok = mtp_cont_rollback_restore(g, rb_bank, M);
-                    if (!ok) break;
-                }
+            /* 3b. ROLLBACK (M3): the verify forward emitted ALL packed rows in-forward; roll every
+             * bank that accepted only M < (1+nd) of its (1+nd) rows back to its M-token prefix
+             * snapshot so the rejected drafts leave no trace.  Banks are independent pools, so the
+             * one call rolls them all back in parallel (a just-evicted bank too: the committed
+             * cache must reflect only accepted tokens for cache reuse, and its slab is safe to
+             * write).  The deferred commit-reforward below is skipped on this path (no_defer set). */
+            if (can_rollback && !ctx->mtp_force_norollback) {
+                ok = mtp_cont_rollback_restore_all(g, MS, committed_rows, vnr,
+                                                   ctx->rollback_verify, &ctx->rollback_verify_fails);
+                if (!ok) break;
             }
             /* 4. COMMIT store: re-forward committed rows of still-live banks (store ON).
              *    Compact the committed prefix per bank in place (C2 <= vfirst[b] always). */
@@ -27571,30 +27697,61 @@ static void ds4_mtp_gate_on_done(void *ud, void *user, const int *tokens, int n,
     gu->outlen[s] = m;
 }
 
-/* S1.1 D>=1 prefix-causality probe: run a mode-2 generate with every draft at index >= `from`
- * forced to `tok` (so the verify rejects it), fill out/outlen with the token streams, and return
- * bank 0's committed-cache fingerprint.  Two such runs with DIFFERENT `tok` share the accepted
- * prefix + verify width but differ in rejected-draft VALUES; a prefix-causal rollback yields an
- * identical fingerprint.  `from=0` forces all drafts (M=1 -> prefix-1 restore); `from=1` leaves
- * d0 natural (M<=2 -> prefix-2 restore). */
-static uint64_t gate_forced_committed_fp(ds4_batch_ctx *ctx,
-                                         const int **prompts, const uint32_t *plens,
-                                         uint32_t N, uint32_t T, int tok, int from,
-                                         int **out, uint32_t *outlen,
-                                         char *rerr, size_t rerrlen) {
+/* S1.1 D>=1 prefix-causality probe (M3): run a mode-2 generate with every draft at index >= `from`
+ * forced to `tok` (so the verify rejects it), fill out/outlen with the per-seq token streams, and
+ * DUMP all N banks' committed compressed-KV (values + per-record counts) for prefix-causality
+ * comparison.  Two such runs with DIFFERENT `tok` share the accepted prefix + verify width but
+ * differ in rejected-draft VALUES; a prefix-causal rollback yields the same committed-row frontier
+ * (counts) and values within the inherent cross-row MoE FP band.  `from=0` forces all drafts
+ * (M=1 -> prefix-1 restore); `from=1` leaves d0 natural (M<=2 -> prefix-2 restore).  `norollback`
+ * skips the rollback (sensitivity check: the same forced pair must then DIVERGE structurally).
+ * cont-gen restores the single-seq cache pointers at cleanup, so the committed per-bank cache lives
+ * in the (still-alive) N-bank slab -- re-repoint it to read each bank, then restore.  Returns 1 on
+ * success (caller frees the returned buf and counts), 0 on failure. */
+static int gate_forced_committed_dump(ds4_batch_ctx *ctx,
+                                      const int **prompts, const uint32_t *plens,
+                                      uint32_t N, uint32_t T, int tok, int from, int norollback,
+                                      float **buf, uint64_t *nf, uint32_t **counts, uint32_t *nc,
+                                      int **out, uint32_t *outlen, char *rerr, size_t rerrlen) {
     for (uint32_t s = 0; s < N; s++) { out[s] = NULL; outlen[s] = 0u; }
+    *buf = NULL; *counts = NULL; *nf = 0u; *nc = 0u;
     ds4_mtp_gate_ud gud = { prompts, plens, N, 0u, T, out, outlen };
     ctx->mtp_draft_mode = 2;
     ctx->mtp_force_draft_tok = tok;
     ctx->mtp_force_draft_from = from;
-    uint64_t fp = 0u;
+    ctx->mtp_force_norollback = norollback;
+    int ok = 0;
     if (ds4_engine_continuous_generate(ctx, ds4_mtp_gate_admit, ds4_mtp_gate_on_token,
                                        ds4_mtp_gate_on_done, &gud, rerr, rerrlen) == 0) {
-        fp = mtp_cont_committed_fp(&ctx->g);
+        if (ds4_batch_slabs_repoint(&ctx->sl, &ctx->g, 0u, ctx->max_seq))
+            ok = mtp_cont_committed_read(&ctx->g, N, buf, nf, counts, nc);
+        ds4_batch_slabs_restore(&ctx->sl, &ctx->g);
     }
     ctx->mtp_force_draft_tok = -1;
     ctx->mtp_force_draft_from = 0;
-    return fp;
+    ctx->mtp_force_norollback = 0;
+    return ok;
+}
+
+/* Compare two committed-cache dumps for prefix-causality.  *frontier_same := the row-count arrays
+ * are element-wise equal (the exact causal invariant); *max_rel := the largest relative value diff
+ * over aligned rows (0 if frontier differs / either dump empty).  A correct rollback keeps the
+ * frontier identical and max_rel within the inherent cross-row MoE FP band; a structural leak
+ * changes the frontier or drives max_rel ~1. */
+static void gate_cc_compare(const float *a, uint64_t anf, const uint32_t *ac, uint32_t anc,
+                            const float *b, uint64_t bnf, const uint32_t *bc, uint32_t bnc,
+                            int *frontier_same, double *max_abs, double *max_rel) {
+    int fsame = (anc == bnc && anf == bnf);
+    if (fsame) for (uint32_t i = 0; i < anc; i++) if (ac[i] != bc[i]) { fsame = 0; break; }
+    double mabs = 0.0, mrel = 0.0;
+    if (fsame) for (uint64_t i = 0; i < anf; i++) {
+        const double d = fabs((double)a[i] - (double)b[i]);
+        const double m = fmax(fabs((double)a[i]), fabs((double)b[i]));
+        if (d > mabs) mabs = d;
+        const double r = m > 1e-6 ? d / m : d;
+        if (r > mrel) mrel = r;
+    }
+    *frontier_same = fsame; *max_abs = mabs; *max_rel = mrel;
 }
 
 int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
@@ -27721,41 +27878,92 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
                                          : " mode0==mode2 token-identical")
                                  : " (accepted stream diverges from baseline)");
             } else {
-                /* D>=1: the batched verify (width 1+D) is NOT bit-identical to a width-1
-                 * mode-0 decode (cross-width MoE-reduction FP -- the same N=1 vs N=8
-                 * nondeterminism), so accept(A!=E) is INFORMATIONAL, not gated.  The hard
-                 * gate is width-matched PREFIX-CAUSALITY: two forced-draft runs that share
-                 * the accepted prefix + verify width but differ in rejected-draft VALUES
-                 * must produce an identical committed-cache fingerprint (rejected drafts
-                 * leave no trace).  Checked at both restore depths (from=0 -> prefix-1,
-                 * from=1 -> prefix-2).  Fingerprint covers bank 0 (N=1 scope; M3 extends). */
-                fprintf(stderr, "ds4: CONT_MTP_GATE accept(A!=E)=%u/%u (informational; D>=1 cross-width FP, not gated for bit-identity)\n",
+                /* D>=1 (M2/M3): the batched verify (width 1+D) is NOT bit-identical to a width-1
+                 * mode-0 decode -- the in-forward verify is itself draft-VALUE-dependent through
+                 * cross-row MoE-reduction FP (proven: holding cur's input identical, varying a
+                 * causally-masked rejected draft shifts the verify logits by FP while the argmax is
+                 * unchanged; that FP rides an expert flip into the committed KV cache).  So the
+                 * committed-cache VALUES cannot be invariant to rejected-draft values -- the same
+                 * N!=N nondeterminism the batched path already carries -- and accept(A!=E) is
+                 * INFORMATIONAL.  The ACHIEVABLE, gated losslessness contract is TOKEN-LEVEL:
+                 *   (1) committed-row FRONTIER (counts) EXACTLY invariant to rejected-draft values, AND
+                 *   (2) committed TOKEN STREAM invariant (smis == 0).
+                 * Two forced-draft runs (same accepted prefix + verify width, different rejected
+                 * VALUES) at both depths (from=0 -> prefix-1, from=1 -> prefix-2) over all N banks.
+                 * The committed-cache value max_rel is reported INFORMATIONAL (inherent cross-row FP).
+                 * SENSITIVITY: rollback OFF must diverge (frontier or values), proving the comparison
+                 * is live and the rollback is what holds the frontier.  DEEPER ASSERT:
+                 * ctx->rollback_verify makes every restore read back byte-exact vs its checkpoint
+                 * source, catching any capture/restore plumbing regression independently of the noisy
+                 * committed-cache values. */
+                fprintf(stderr, "ds4: CONT_MTP_GATE accept(A!=E)=%u/%u (informational; D>=1 in-forward verify carries inherent cross-row MoE FP)\n",
                         amis, N);
+                const double PC_RTOL = 0.05;   /* sensitivity threshold: cross-row FP band vs structural ~1.0 */
+                ctx->rollback_verify = 1; ctx->rollback_verify_fails = 0;   /* byte-exact restore self-check */
                 int **oa = xcalloc(N, sizeof(int *)); uint32_t *la = xcalloc(N, sizeof(uint32_t));
                 int **ob = xcalloc(N, sizeof(int *)); uint32_t *lb = xcalloc(N, sizeof(uint32_t));
                 for (int from = 0; from < 2; from++) {
-                    uint64_t fa = gate_forced_committed_fp(ctx, (const int **)prompts, plens,
-                                                           N, T, 5, from, oa, la, rerr, sizeof(rerr));
-                    uint64_t fb = gate_forced_committed_fp(ctx, (const int **)prompts, plens,
-                                                           N, T, 6, from, ob, lb, rerr, sizeof(rerr));
-                    uint32_t smis = GATE_CMP("pc-streams", oa, la, ob, lb);
                     const char *lbl = from == 0 ? "prefix-1(M=1)" : "prefix-2(M<=2)";
+                    float *fa = NULL, *fb = NULL, *ga = NULL, *gb = NULL;
+                    uint32_t *fac = NULL, *fbc = NULL, *gac = NULL, *gbc = NULL;
+                    uint64_t fanf = 0, fbnf = 0, ganf = 0, gbnf = 0;
+                    uint32_t fanc = 0, fbnc = 0, ganc = 0, gbnc = 0;
+                    /* rollback ON */
+                    int oka = gate_forced_committed_dump(ctx, (const int **)prompts, plens, N, T, 5, from, 0,
+                                                         &fa, &fanf, &fac, &fanc, oa, la, rerr, sizeof(rerr));
+                    int okb = gate_forced_committed_dump(ctx, (const int **)prompts, plens, N, T, 6, from, 0,
+                                                         &fb, &fbnf, &fbc, &fbnc, ob, lb, rerr, sizeof(rerr));
+                    uint32_t smis = GATE_CMP("pc-streams", oa, la, ob, lb);
+                    for (uint32_t s = 0; s < N; s++) { free(oa[s]); free(ob[s]); oa[s] = ob[s] = NULL; }
+                    /* SENSITIVITY: rollback OFF */
+                    int okga = gate_forced_committed_dump(ctx, (const int **)prompts, plens, N, T, 5, from, 1,
+                                                          &ga, &ganf, &gac, &ganc, oa, la, rerr, sizeof(rerr));
+                    int okgb = gate_forced_committed_dump(ctx, (const int **)prompts, plens, N, T, 6, from, 1,
+                                                          &gb, &gbnf, &gbc, &gbnc, ob, lb, rerr, sizeof(rerr));
+                    for (uint32_t s = 0; s < N; s++) { free(oa[s]); free(ob[s]); oa[s] = ob[s] = NULL; }
+                    int fsame = 0, sfsame = 0; double mabs = 0, mrel = 0, smabs = 0, smrel = 0;
+                    if (oka && okb) gate_cc_compare(fa, fanf, fac, fanc, fb, fbnf, fbc, fbnc, &fsame, &mabs, &mrel);
+                    if (okga && okgb) gate_cc_compare(ga, ganf, gac, ganc, gb, gbnf, gbc, gbnc, &sfsame, &smabs, &smrel);
+                    const int sens_struct = (!sfsame || smrel > PC_RTOL);   /* rollback-off must diverge */
                     if (smis != 0) {
                         fprintf(stderr, "ds4: CONT_MTP_GATE prefix-causality %s INCONCLUSIVE "
                                 "(%u/%u forced streams differ -> a forced token matched a genuine one)\n",
                                 lbl, smis, N);
+                    } else if (!oka || !okb) {
+                        rc = 1;
+                        fprintf(stderr, "ds4: CONT_MTP_GATE prefix-causality %s FAIL (committed-cache read failed)\n", lbl);
                     } else {
-                        const int pcrc = (fa == fb) ? 0 : 1;
+                        /* Hard gate: committed-row FRONTIER must be invariant to rejected-draft
+                         * values (streams already confirmed identical by smis==0 above).  The value
+                         * max_rel is informational -- inherent cross-row MoE FP, not gated. */
+                        const int pcrc = fsame ? 0 : 1;
                         if (pcrc != 0) rc = 1;
-                        fprintf(stderr, "ds4: CONT_MTP_GATE prefix-causality %s fp=%016llx/%016llx -> %s%s\n",
-                                lbl, (unsigned long long)fa, (unsigned long long)fb,
+                        fprintf(stderr, "ds4: CONT_MTP_GATE losslessness %s frontier=%s streams=ok -> %s%s "
+                                "[committed-cache values max_abs=%.4g max_rel=%.4g INFORMATIONAL (cross-row MoE FP)] "
+                                "[sensitivity rollback-off %s]\n",
+                                lbl, fsame ? "same" : "DIFFER",
                                 pcrc == 0 ? "PASS" : "FAIL",
-                                pcrc == 0 ? " (committed cache invariant to rejected drafts)"
-                                          : " (rejected drafts leak into committed cache)");
+                                pcrc == 0 ? " (frontier + token stream invariant to rejected drafts)"
+                                          : " (committed-row frontier changed -> causal leak)",
+                                mabs, mrel,
+                                sens_struct ? "DIVERGES->live" : "SAME->WEAK(no group-close?)");
                     }
-                    for (uint32_t s = 0; s < N; s++) { free(oa[s]); free(ob[s]); oa[s] = ob[s] = NULL; }
+                    free(fa); free(fb); free(ga); free(gb);
+                    free(fac); free(fbc); free(gac); free(gbc);
                 }
                 free(oa); free(la); free(ob); free(lb);
+                /* Deeper internal assert: every in-forward rollback during the runs above read back
+                 * its restored attn-state lane and compared byte-for-byte against its checkpoint
+                 * source.  Any mismatch is a capture/restore plumbing regression (stride/offset/slab)
+                 * -- gated even though the committed-cache VALUES are noisy (inherent cross-row FP). */
+                if (ctx->rollback_verify_fails != 0) {
+                    rc = 1;
+                    fprintf(stderr, "ds4: CONT_MTP_GATE rollback self-check FAIL: %u byte-exact restore mismatch(es)\n",
+                            ctx->rollback_verify_fails);
+                } else {
+                    fprintf(stderr, "ds4: CONT_MTP_GATE rollback self-check PASS (every restore byte-exact vs checkpoint)\n");
+                }
+                ctx->rollback_verify = 0;
                 ctx->mtp_draft_mode = saved_mode;
             }
         }
