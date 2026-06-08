@@ -3633,7 +3633,13 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                // ds4 (S1.1a): the final column tile of an expert is partial
+                // when col_diff % mmq_x != 0; reading all mmq_x lanes over-reads
+                // ids_dst past col_high (OOB for the last expert -- confirmed by
+                // compute-sanitizer memcheck).  These lanes are masked out of
+                // write-back (tile_y_max_j), so clamp the read to valid columns.
+                const int j_col = jt*mmq_x + j;
+                ids_dst_shared[j] = j_col < col_diff ? ids_dst[col_low + j_col] : 0;
             }
             __syncthreads();
         }
@@ -3713,7 +3719,13 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+                // ds4 (S1.1a): the final column tile of an expert is partial
+                // when col_diff % mmq_x != 0; reading all mmq_x lanes over-reads
+                // ids_dst past col_high (OOB for the last expert -- confirmed by
+                // compute-sanitizer memcheck).  These lanes are masked out of
+                // write-back (tile_y_max_j), so clamp the read to valid columns.
+                const int j_col = jt*mmq_x + j;
+                ids_dst_shared[j] = j_col < col_diff ? ids_dst[col_low + j_col] : 0;
             }
             __syncthreads();
         }
@@ -3915,7 +3927,11 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int col_diff = col_high - col_low;
 
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < mmq_x; j += nwarps*warp_size) {
-        ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+        // ds4 (S1.1a): clamp the partial last-tile read to valid columns; the
+        // masked-out lanes (tile_y_max_j) otherwise over-read ids_dst past
+        // col_high -- OOB for the last expert (compute-sanitizer memcheck).
+        const int j_col = jt*mmq_x + j;
+        ids_dst_shared[j] = j_col < col_diff ? ids_dst[col_low + j_col] : 0;
     }
     __syncthreads();
 
