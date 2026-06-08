@@ -12625,6 +12625,22 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* S1.1: deterministic MTP gate -- run instead of serving when DS4_CONT_MTP_GATE
+     * is set.  Drives the continuous engine over fixed synthetic prompts and asserts
+     * the per-bank MTP draft path is token-identical to the plain decode.  Requires
+     * --mtp (so s.batch_ctx is MTP-enabled).  Exits with the gate's rc. */
+    if (getenv("DS4_CONT_MTP_GATE") != NULL) {
+        if (!s.batch_ctx) {
+            server_log(DS4_LOG_WARNING, "ds4-server: DS4_CONT_MTP_GATE set but no batch ctx (need --mtp); skipping");
+            return 2;
+        }
+        char gerr[256] = {0};
+        int grc = ds4_cont_mtp_gate(s.batch_ctx, gerr, sizeof(gerr));
+        if (grc == 2) server_log(DS4_LOG_WARNING, "ds4-server: CONT_MTP_GATE setup error: %s", gerr);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: CONT_MTP_GATE rc=%d (0=PASS 1=MISMATCH 2=ERR)", grc);
+        return grc;
+    }
+
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
 

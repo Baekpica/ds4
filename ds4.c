@@ -10444,6 +10444,7 @@ static bool metal_graph_encode_decode_layer_impl(
      * starts after that, where FP8 KV quantization and raw-cache storage can
      * share one pass without changing the trigonometric path. */
     if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+    if (!ok && getenv("DS4_MTP_GATE_DEBUG")) fprintf(stderr, "ds4: decode_layer FAIL @qkv/rope/kv_store il=%u pos=%u raw_row=%u\n", il, pos, raw_row);
     DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
@@ -10811,6 +10812,10 @@ static bool metal_graph_encode_decode_layer_impl(
 
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+        if (getenv("DS4_MTP_GATE_DEBUG") && il <= 1u)
+            fprintf(stderr, "ds4: decode_layer il=%u pos=%u compressed=%d n_raw=%u raw_start=%u raw_row=%u n_comp=%u comp_cache=%p comp_sel=%p n_sel=%u\n",
+                    il, pos, (int)compressed, n_raw, raw_start, raw_row, n_comp,
+                    (void *)comp_cache, (void *)comp_selected, n_selected);
         /* Step 4a + 4c A1: n_raw and raw_start are token-stable (same
          * across all layers within a token) and live in the token-stable
          * struct ds4_decode_scalars (set once at the top of the token).
@@ -10939,6 +10944,7 @@ static bool metal_graph_encode_decode_layer_impl(
      * attention kernel itself is the suspect despite the 7c4b84d fix. */
     ds4_cuda_dump_hash_at_slot(g->heads, q_dim,
         "decode_layer.heads.after_rope_back", 180u + il);
+    if (!ok && getenv("DS4_MTP_GATE_DEBUG")) fprintf(stderr, "ds4: decode_layer FAIL @attn(pre-output) il=%u pos=%u\n", il, pos);
     if (stop_at == METAL_GRAPH_DECODE_LAYER_BEFORE_ATTN_OUTPUT) return ok;
     const bool fuse_attn_out_hc =
         !metal_graph_directional_steering_attn_enabled(g) &&
@@ -10997,6 +11003,7 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
+    if (!ok && getenv("DS4_MTP_GATE_DEBUG")) fprintf(stderr, "ds4: decode_layer FAIL @attn-output/after-attn il=%u pos=%u\n", il, pos);
     if (stop_at == METAL_GRAPH_DECODE_LAYER_AFTER_ATTN) return ok;
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
@@ -11195,6 +11202,7 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
+    if (!ok && getenv("DS4_MTP_GATE_DEBUG")) fprintf(stderr, "ds4: decode_layer FAIL @ffn/moe il=%u pos=%u\n", il, pos);
     return ok;
 }
 
@@ -16826,8 +16834,47 @@ static bool metal_graph_eval_mtp_draft_from_hc(
 
     ds4_gpu_tensor *saved_cur = g->cur_hc;
     ds4_gpu_tensor *saved_after = g->after_ffn_hc;
+    /* DS4_MTP_DRAFT_NO* : bisection knobs to localize which draft stage perturbs
+     * the shared GPU scratch the batched forward reads.  Hierarchy (each implies
+     * the next): NOSCALARS -> NOPRELAYER -> NOLAYER -> NOHEAD.  Diagnostic only. */
+    const bool draft_noscalars  = getenv("DS4_MTP_DRAFT_NOSCALARS")  != NULL;
+    const bool draft_noprelayer = draft_noscalars  || getenv("DS4_MTP_DRAFT_NOPRELAYER") != NULL;
+    const bool draft_nolayer    = draft_noprelayer || getenv("DS4_MTP_DRAFT_NOLAYER")    != NULL;
+    const bool draft_nohead     = draft_nolayer    || getenv("DS4_MTP_DRAFT_NOHEAD")     != NULL;
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(g->mtp_embed,
+    /* S1.1: publish the per-token position scalars to the GPU mirror BEFORE the
+     * MTP layer's rope / raw-store kernels read them via
+     * ds4_gpu_decode_scalars_device_ptr().  The single-token decode hot path
+     * (metal_graph_encode_token_raw_swa) normally does this, but this drafter
+     * calls metal_graph_encode_decode_layer DIRECTLY.  In the single-seq spec
+     * path a preceding encode_token_raw_swa already set them to this same pos,
+     * so it "worked" by inheritance; in the batched/continuous path NO single-
+     * token decode ever runs (the base forward is metal_graph_batch_eval_logits,
+     * which uses a different position mechanism), so g_decode_dev would be NULL
+     * (rope kernel -> illegal memory access -> decode_layer FAIL @qkv/rope) or
+     * stale.  Publishing here makes the drafter self-contained and uses the
+     * correct pos for every draft (incl. recursive depth>1).  Mirrors the
+     * decode_scalars block in metal_graph_encode_token_raw_swa.
+     *
+     * NOTE: we deliberately do NOT publish decode_LAYER_scalars (g_layer_dev)
+     * here.  The MTP block at il=1 is DENSE (compress ratio 0 -> no compressed
+     * attention), so it never reads the per-layer n_comp/comp_row scalars.  And
+     * g_layer_dev's per-layer kernel pointers are baked/shared with the batched
+     * forward (metal_graph_encode_layer_batch), so overwriting it inside a draft
+     * leaked into the next batched step and diverged seq 0 at N>=3.  Leaving it
+     * untouched keeps the draft non-invasive. */
+    if (ok && !draft_noscalars) {
+        ds4_gpu_decode_scalars_init();
+        ds4_gpu_decode_scalars_set(pos,
+                                     g->raw_cap,
+                                     g->raw_window ? g->raw_window : g->raw_cap,
+                                     4u, /* ratio */
+                                     0u, /* n_comp (rope_tail-only) */
+                                     0u, /* flags */
+                                     (uint32_t)token);
+        ds4_gpu_decode_scalars_flush();
+    }
+    if (ok && !draft_noprelayer) ok = ds4_gpu_embed_token_hc_tensor(g->mtp_embed,
                                                   base_model->map,
                                                   base_model->size,
                                                   base_weights->token_embd->abs_offset,
@@ -16835,14 +16882,14 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                                   (uint32_t)token,
                                                   DS4_N_EMBD,
                                                   1) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_enorm,
+    if (ok && !draft_noprelayer) ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_enorm,
                                                   g->mtp_embed,
                                                   mtp_model->map,
                                                   mtp_model->size,
                                                   mtp->enorm->abs_offset,
                                                   DS4_N_EMBD,
                                                   DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_eproj,
+    if (ok && !draft_noprelayer) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_eproj,
                                               mtp_model->map,
                                               mtp_model->size,
                                               mtp->e_proj->abs_offset,
@@ -16850,11 +16897,11 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                               DS4_N_EMBD,
                                               g->mtp_enorm,
                                               1) != 0;
-    if (ok) ok = ds4_gpu_repeat_hc_tensor(g->mtp_eproj_hc,
+    if (ok && !draft_noprelayer) ok = ds4_gpu_repeat_hc_tensor(g->mtp_eproj_hc,
                                             g->mtp_eproj,
                                             DS4_N_EMBD,
                                             DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mtp_hnorm_hc,
+    if (ok && !draft_noprelayer) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mtp_hnorm_hc,
                                                        prev_hc,
                                                        mtp_model->map,
                                                        mtp_model->size,
@@ -16862,7 +16909,7 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                                        DS4_N_EMBD,
                                                        DS4_N_HC,
                                                        DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_hproj_hc,
+    if (ok && !draft_noprelayer) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_hproj_hc,
                                               mtp_model->map,
                                               mtp_model->size,
                                               mtp->h_proj->abs_offset,
@@ -16870,11 +16917,12 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                               DS4_N_EMBD,
                                               g->mtp_hnorm_hc,
                                               DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_add_tensor(g->mtp_input_hc,
+    if (ok && !draft_noprelayer) ok = ds4_gpu_add_tensor(g->mtp_input_hc,
                                       g->mtp_eproj_hc,
                                       g->mtp_hproj_hc,
                                       (uint32_t)hc_dim) != 0;
-    if (ok) {
+    if (!ok && getenv("DS4_MTP_GATE_DEBUG")) fprintf(stderr, "ds4: mtp draft FAIL @pre-layer (embed/norm/proj)\n");
+    if (ok && !draft_nolayer) {
         g->cur_hc = g->mtp_input_hc;
         g->after_ffn_hc = out_hc;
         ok = metal_graph_encode_decode_layer(g,
@@ -16887,16 +16935,19 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                              raw_row,
                                              n_raw,
                                              token);
+        if (!ok && getenv("DS4_MTP_GATE_DEBUG")) fprintf(stderr, "ds4: mtp draft FAIL @encode_decode_layer pos=%u raw_row=%u n_raw=%u raw_cap=%u\n", pos, raw_row, n_raw, g->raw_cap);
     }
     if (ok) g->cur_hc = out_hc;
-    if (ok) ok = metal_graph_encode_output_head_mtp(g,
+    if (ok && !draft_nohead) { ok = metal_graph_encode_output_head_mtp(g,
                                                     base_model,
                                                     base_weights,
                                                     mtp_model,
                                                     mtp,
                                                     base_weights->output->dim[1],
                                                     top2_only);
-    if (ok && top_id && !top2_only) {
+        if (!ok && getenv("DS4_MTP_GATE_DEBUG")) fprintf(stderr, "ds4: mtp draft FAIL @output_head_mtp\n");
+    }
+    if (ok && !draft_nohead && top_id && !top2_only) {
         ok = ds4_gpu_argmax_tensor(g->comp_selected,
                                    g->logits,
                                    DS4_N_VOCAB) != 0;
@@ -26585,6 +26636,7 @@ struct ds4_batch_ctx {
     ds4_batch_slabs sl;            /* allocated for max_seq banks */
     ds4_mtp_slabs   msl;           /* S1: per-bank MTP draft banks (only if mtp) */
     bool            mtp;           /* S1: speculative MTP enabled for this ctx */
+    int             mtp_draft_mode;/* S1: 0=off, 1=draft-probe (non-accepting), 2=accept */
     uint32_t        ctx_size;
     uint32_t        prefill_cap;   /* = max_total_tokens (ragged Σlen cap) */
     uint32_t        raw_cap;       /* SWA raw ring (per-seq prompt+budget bound) */
@@ -26722,6 +26774,47 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
 #undef BCG_ERR
 }
 
+/* S1.1: run the per-bank MTP drafter for bank b, returning its greedy draft token
+ * in *draft_out.  The drafter (metal_graph_eval_mtp_draft_from_hc) runs the MTP
+ * support block at layer slot il=1 over bank b's OWN MTP raw ring (g->mtp_raw_cache)
+ * + recurrent hidden carry (g->mtp_state_hc/mtp_next_hc) + ring counter (g->mtp_n_raw)
+ * -- all per-bank via ds4_mtp_slabs_repoint_bank.  In THIS model layer 1 is a DENSE
+ * attention layer (sl->multi_comp[1]==NULL), so the MTP block touches NO base
+ * per-bank compressed KV: the only per-sequence state is the MTP ring, which is
+ * already isolated.  The remaining compute (mtp_embed/enorm/.../input_hc, the dense
+ * attention scratch g->q/attn_norm/heads/..., the output head) is recomputed per
+ * call and shared safely because banks draft serially within a decode step.
+ * prev_hc seeds the recurrence (the row's post-forward carry for the first draft);
+ * out_hc receives the next MTP state.  (If a future model makes il=1 a COMPRESSING
+ * layer, the drafter would also append to base layer-1's compressed cache and that
+ * would need per-bank repoint + rollback -- asserted against below.) */
+static bool mtp_draft_bank_isolated(
+        ds4_batch_ctx  *ctx,
+        ds4_gpu_graph  *g,
+        uint32_t        b,
+        ds4_gpu_tensor *prev_hc,
+        int             token,
+        uint32_t        pos,
+        int            *draft_out) {
+    /* Repoint FIRST: this frees the previous step's bank views and installs bank b's,
+     * so g->mtp_state_hc (the drafter's out_hc) must be read AFTER -- reading it before
+     * (and passing it in) would hand the drafter a view that repoint just freed. */
+    if (!ds4_mtp_slabs_repoint_bank(&ctx->msl, g, b)) return false;
+    int top = -1;
+    const bool ok = metal_graph_eval_mtp_draft_from_hc(
+            g, &ctx->e->model, &ctx->e->weights, &ctx->e->mtp_model, &ctx->e->mtp_weights,
+            prev_hc, g->mtp_state_hc, token, pos, NULL, &top, NULL);
+    ds4_mtp_slabs_save_bank(&ctx->msl, g, b);   /* keep the MTP ring advance (recurrence) */
+    if (!ok && getenv("DS4_MTP_GATE_DEBUG")) {
+        static int once = 0;
+        if (!once) { once = 1; fprintf(stderr,
+            "ds4: mtp_draft_bank_isolated FAIL bank=%u pos=%u tok=%d mraw=%p state=%p prev_hc=%p\n",
+            b, pos, token, (void *)g->mtp_raw_cache, (void *)g->mtp_state_hc, (void *)prev_hc); }
+    }
+    if (draft_out) *draft_out = top;
+    return ok;
+}
+
 /* W5: continuous batching (mid-flight admit/evict) over a persistent ctx.  Maintains
  * a rolling active set of up to ctx->max_seq banks: each iteration admits waiting
  * requests into free banks (reset + ragged-prefill via bg_reset_bank/bg_prefill_bank)
@@ -26778,10 +26871,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * each row's post-forward hidden carry (g->batch_cur_hc row r), and counts
      * how often its draft equals the token the base model actually sampled --
      * i.e. the model's natural MTP acceptance rate.  Proves the per-bank seed
-     * extraction + recurrence are correct WITHOUT accepting drafts (production
-     * output is byte-for-byte unchanged).  Off by default. */
-    const int mtp_probe = (ctx->mtp && ctx->e->mtp_ready &&
-                           getenv("DS4_CONT_MTP_DRAFT_PROBE") != NULL) ? 1 : 0;
+     * extraction + recurrence are correct.  S1.1: each draft runs through
+     * mtp_draft_bank_isolated (per-bank layer-1 repoint + compressor-state
+     * rollback) so the probe is NON-invasive -- production greedy output is
+     * byte-for-byte identical to probe-off.  Off by default. */
+    int mtp_mode = ctx->mtp_draft_mode;
+    if (mtp_mode == 0 && getenv("DS4_CONT_MTP_DRAFT_PROBE") != NULL) mtp_mode = 1;
+    const int mtp_probe = (ctx->mtp && ctx->e->mtp_ready && mtp_mode >= 1) ? 1 : 0;
     const uint64_t hc_dim_cont = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     uint64_t mtp_probe_total = 0, mtp_probe_hit = 0;
 
@@ -26891,6 +26987,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, maxpos, k, logits);
             g->batch_multiseq_emit = false;
         }
+        if (ok && getenv("DS4_CONT_SYNC_STEP")) (void)ds4_gpu_synchronize();  /* DIAG: race test */
         if (!ok) break;
         steps++;
 
@@ -26915,15 +27012,14 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         }
         if (g_cont_prof) t_sample_s += now_sec() - smp_t0;
 
-        /* ---- S1.0b: per-bank MTP draft probe (lockstep, depth 1, non-accepting).
-         * For each row r decoded this step, seed the per-bank drafter from the
-         * row's post-forward hidden carry (batch_cur_hc row r) and the committed
-         * token (qtokens[r] @ pos_arr[r]), then compare its draft to the token the
-         * base model actually sampled (sampled[r]).  The drafter writes the
-         * committed token's KV into bank b's own MTP ring (mtp_n_raw[b] += 1), so
-         * the recurrence stays valid across steps without rollback (depth 1 never
-         * drafts past a committed token).  Runs single-seq mode (batched flags
-         * cleared) so the MTP layer takes the scalar decode path. ---- */
+        /* ---- S1.1: per-bank MTP draft probe (lockstep, depth 1, NON-invasive).
+         * For each row r decoded this step, seed the per-bank drafter from the row's
+         * post-forward hidden carry (batch_cur_hc row r) and the committed token
+         * (qtokens[r] @ pos_arr[r]) via mtp_draft_bank_isolated, which repoints bank
+         * b's MTP ring + layer-1 caches and rolls back the layer-1 compressor state
+         * so the base model's per-bank KV is unchanged; then compare the draft to the
+         * token the base model actually sampled (sampled[r]).  Runs single-seq mode
+         * (batched flags cleared) so the MTP layer takes the scalar decode path. ---- */
         if (ok && mtp_probe && k > 0) {
             const bool sav_ms = g->batch_multiseq;
             const bool sav_em = g->batch_multiseq_emit;
@@ -26935,17 +27031,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 const uint32_t b = rowbank[r];
                 ds4_gpu_tensor *seed_hc = metal_graph_tensor_row_view(g->batch_cur_hc, r, hc_dim_cont);
                 if (!seed_hc) { ok = false; break; }
-                if (!ds4_mtp_slabs_repoint_bank(&ctx->msl, g, b)) {
-                    ds4_gpu_tensor_free(seed_hc); ok = false; break;
-                }
                 int draft0 = -1;
-                const bool dok = metal_graph_eval_mtp_draft_from_hc(
-                        g, &ctx->e->model, &ctx->e->weights,
-                        &ctx->e->mtp_model, &ctx->e->mtp_weights,
-                        seed_hc, g->mtp_state_hc, qtokens[r], (uint32_t)pos_arr[r],
-                        NULL, &draft0, NULL);
+                const bool dok = mtp_draft_bank_isolated(
+                        ctx, g, b, seed_hc, qtokens[r], (uint32_t)pos_arr[r], &draft0);
                 ds4_gpu_tensor_free(seed_hc);
-                ds4_mtp_slabs_save_bank(&ctx->msl, g, b);
                 if (!dok) { ok = false; break; }
                 mtp_probe_total++;
                 if (draft0 == sampled[r]) mtp_probe_hit++;
@@ -26997,7 +27086,163 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     return ok ? 0 : 1;
 #undef CG_ERR
 }
+
+/* S1.1 deterministic MTP gate.  Drives ds4_engine_continuous_generate with a FIXED
+ * set of distinct synthetic prompts admitted in a deterministic order (all at step 0,
+ * no server timing) so the batch composition is reproducible, then asserts the per-seq
+ * output token streams are IDENTICAL between two MTP modes:
+ *   mode 0 (off, the plain batched greedy decode) vs
+ *   mode 1 (per-bank MTP draft probe, NON-accepting).
+ * Because mode 1 only RUNS the per-bank isolated drafter (it never changes which token
+ * is emitted), a PASS proves the drafter + its layer-1 rollback leave the base decode
+ * byte-for-byte unperturbed -- the clean non-invasiveness proof the live-server diff
+ * could not give (no batch-composition / routing confound).  Later, mode 2 (accept)
+ * will be gated the same way against mode 0.  Returns 0 PASS, 1 MISMATCH, 2 setup err. */
+typedef struct {
+    const int **prompts;
+    const uint32_t *plens;
+    uint32_t   N;
+    uint32_t   cursor;
+    uint32_t   T;
+    int      **out;
+    uint32_t  *outlen;
+} ds4_mtp_gate_ud;
+
+static int ds4_mtp_gate_admit(void *ud, ds4_cont_request *req) {
+    ds4_mtp_gate_ud *gu = ud;
+    if (gu->cursor >= gu->N) return 0;
+    const uint32_t s = gu->cursor++;
+    memset(req, 0, sizeof(*req));
+    req->tokens = gu->prompts[s];
+    req->n = (int)gu->plens[s];
+    req->max_new = (int)gu->T;
+    req->eos = -1;            /* no EOS -> decode the full budget deterministically */
+    req->temperature = 0.0f;  /* greedy */
+    req->user = (void *)(uintptr_t)s;
+    return 1;
+}
+static int ds4_mtp_gate_on_token(void *ud, void *user, int token) {
+    (void)ud; (void)user; (void)token; return 1;
+}
+static void ds4_mtp_gate_on_done(void *ud, void *user, const int *tokens, int n, int finish) {
+    ds4_mtp_gate_ud *gu = ud; (void)finish;
+    const uint32_t s = (uint32_t)(uintptr_t)user;
+    if (s >= gu->N || gu->out[s]) return;
+    const uint32_t m = n > 0 ? (uint32_t)n : 0u;
+    gu->out[s] = xmalloc((size_t)(m ? m : 1u) * sizeof(int));
+    if (m) memcpy(gu->out[s], tokens, (size_t)m * sizeof(int));
+    gu->outlen[s] = m;
+}
+
+int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
+#define GATE_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
+    if (!ctx || !ctx->mtp || !ctx->e || !ctx->e->mtp_ready) {
+        GATE_ERR("cont_mtp_gate: requires a ctx created with --mtp"); return 2; }
+    const char *ne = getenv("DS4_CONT_MTP_GATE_N");
+    const char *te = getenv("DS4_CONT_MTP_GATE_T");
+    const char *le = getenv("DS4_CONT_MTP_GATE_LEN");
+    uint32_t N = ne ? (uint32_t)atoi(ne) : 4u;
+    uint32_t T = te ? (uint32_t)atoi(te) : 24u;
+    uint32_t L = le ? (uint32_t)atoi(le) : 8u;
+    if (N < 1u) N = 1u;
+    if (N > ctx->max_seq) N = ctx->max_seq;
+    if (L < 1u) L = 1u;
+    const uint32_t maxplen = L + 3u;                 /* plen[s] = L + (s & 3) */
+    if (maxplen + T > ctx->raw_cap) T = ctx->raw_cap > maxplen + 1u ? ctx->raw_cap - maxplen : 1u;
+    if (T < 1u) T = 1u;
+
+    int      **prompts = xcalloc(N, sizeof(int *));
+    uint32_t  *plens   = xcalloc(N, sizeof(uint32_t));
+    int      **out0 = xcalloc(N, sizeof(int *)); uint32_t *ol0 = xcalloc(N, sizeof(uint32_t));
+    int      **out1 = xcalloc(N, sizeof(int *)); uint32_t *ol1 = xcalloc(N, sizeof(uint32_t));
+    int      **outD = xcalloc(N, sizeof(int *)); uint32_t *olD = xcalloc(N, sizeof(uint32_t));
+    for (uint32_t s = 0; s < N; s++) {
+        plens[s] = L + (s & 3u);
+        prompts[s] = xmalloc((size_t)plens[s] * sizeof(int));
+        for (uint32_t i = 0; i < plens[s]; i++) prompts[s][i] = (int)(100u + s * 1000u + i);
+    }
+
+    const int saved_mode = ctx->mtp_draft_mode;
+    char rerr[256] = {0};
+    int rc = 0;
+
+    /* Three runs, all from the same deterministic admission/batch composition:
+     *   A = mode 0 (baseline, no probe)
+     *   B = mode 0 again (determinism CONTROL: A vs B isolates inherent run-to-run
+     *       batch FP nondeterminism -- e.g. non-deterministic cuBLAS reductions --
+     *       from any effect the probe has)
+     *   C = mode 1 (per-bank MTP draft probe, non-accepting)
+     * The probe is "non-invasive" iff (A vs C) divergence == (A vs B) divergence.
+     * mode 0 runs FIRST so a probe never contaminates a later run's fresh prefill
+     * (a cross-run artifact of the engine's uninitialized-padding sensitivity). */
+    ds4_mtp_gate_ud gA = { (const int **)prompts, plens, N, 0u, T, out0, ol0 };
+    ctx->mtp_draft_mode = 0;
+    if (ds4_engine_continuous_generate(ctx, ds4_mtp_gate_admit, ds4_mtp_gate_on_token,
+                                       ds4_mtp_gate_on_done, &gA, rerr, sizeof(rerr)) != 0) {
+        GATE_ERR("cont_mtp_gate: baseline A (mode 0) run failed: %s", rerr); rc = 2;
+    }
+    if (rc == 0) {
+        ds4_mtp_gate_ud gB = { (const int **)prompts, plens, N, 0u, T, outD, olD };
+        ctx->mtp_draft_mode = 0;
+        if (ds4_engine_continuous_generate(ctx, ds4_mtp_gate_admit, ds4_mtp_gate_on_token,
+                                           ds4_mtp_gate_on_done, &gB, rerr, sizeof(rerr)) != 0) {
+            GATE_ERR("cont_mtp_gate: control B (mode 0) run failed: %s", rerr); rc = 2;
+        }
+    }
+    if (rc == 0) {
+        ds4_mtp_gate_ud gC = { (const int **)prompts, plens, N, 0u, T, out1, ol1 };
+        ctx->mtp_draft_mode = 1;
+        if (ds4_engine_continuous_generate(ctx, ds4_mtp_gate_admit, ds4_mtp_gate_on_token,
+                                           ds4_mtp_gate_on_done, &gC, rerr, sizeof(rerr)) != 0) {
+            GATE_ERR("cont_mtp_gate: MTP C (mode 1) run failed: %s", rerr); rc = 2;
+        }
+    }
+    ctx->mtp_draft_mode = saved_mode;
+
+    /* compare token streams of two output sets; returns #mismatched seqs and logs
+     * the first divergence per seq when DS4_MTP_GATE_DEBUG is set. */
+#define GATE_CMP(LABEL, XA, LA, XB, LB) ({ \
+        uint32_t _mism = 0; \
+        for (uint32_t s = 0; s < N; s++) { \
+            bool _bad = ((LA)[s] != (LB)[s]); uint32_t _fk = 0; bool _f = false; \
+            uint32_t _km = (LA)[s] < (LB)[s] ? (LA)[s] : (LB)[s]; \
+            for (uint32_t k = 0; k < _km; k++) { \
+                if ((XA)[s][k] != (XB)[s][k]) { _fk = k; _f = true; _bad = true; break; } } \
+            if (_bad) { _mism++; \
+                if (getenv("DS4_MTP_GATE_DEBUG")) { \
+                    fprintf(stderr, "ds4: CONT_MTP_GATE[%s] seq %u DIVERGE lenA=%u lenB=%u firstk=%s%u", \
+                            LABEL, s, (LA)[s], (LB)[s], _f ? "" : "(len-only)", _fk); \
+                    if (_f) { uint32_t _a = _fk >= 2 ? _fk - 2 : 0; fprintf(stderr, " ctx["); \
+                        for (uint32_t k = _a; k <= _fk && k < _km; k++) \
+                            fprintf(stderr, " a=%d/b=%d", (XA)[s][k], (XB)[s][k]); \
+                        fprintf(stderr, " ]"); } \
+                    fprintf(stderr, "\n"); } } } \
+        _mism; })
+
+    if (rc == 0) {
+        uint32_t ctrl = GATE_CMP("ctrl A-vs-B", out0, ol0, outD, olD);  /* determinism */
+        uint32_t mism = GATE_CMP("probe A-vs-C", out0, ol0, out1, ol1); /* probe */
+        /* PASS iff the probe adds NO divergence beyond inherent nondeterminism. */
+        rc = (mism <= ctrl) ? 0 : 1;
+        fprintf(stderr, "ds4: CONT_MTP_GATE N=%u T=%u ctrl(A!=B)=%u/%u probe(A!=C)=%u/%u -> %s%s\n",
+                N, T, ctrl, N, mism, N,
+                rc == 0 ? "PASS" : "FAIL",
+                rc == 0 ? (ctrl ? " (probe within inherent batch nondeterminism)"
+                                : " mode0==mode1 token-identical")
+                        : " (probe diverges beyond control)");
+    }
+    for (uint32_t s = 0; s < N; s++) { free(prompts[s]); free(out0[s]); free(out1[s]); free(outD[s]); }
+    free(prompts); free(plens); free(out0); free(ol0); free(out1); free(ol1); free(outD); free(olD);
+    return rc;
+#undef GATE_CMP
+#undef GATE_ERR
+}
 #else  /* DS4_NO_GPU: graph backend absent -- stubs that fail cleanly. */
+int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
+    (void)ctx;
+    if (err && errlen) snprintf(err, errlen, "cont_mtp_gate: build has no graph backend");
+    return 2;
+}
 int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                          ds4_batch_ctx **out, char *err, size_t errlen) {
     (void)e; (void)ctx_size; (void)max_seq; (void)max_total_tokens;

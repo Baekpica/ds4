@@ -251,6 +251,13 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                     void (*on_done)(void *ud, void *user,
                                                     const int *tokens, int n, int finish),
                                     void *ud, char *err, size_t errlen);
+
+/* Phase 2 S1.1: deterministic MTP gate.  Drives the continuous engine over a fixed
+ * set of synthetic prompts (deterministic admission) and asserts the per-seq output
+ * tokens are identical with the per-bank MTP draft path off vs on -- the clean
+ * non-invasiveness/exactness proof (no server-timing / batch-composition confound).
+ * Requires a ctx created with --mtp.  Returns 0 PASS, 1 token MISMATCH, 2 setup error. */
+int  ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen);
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
                                const char *output_path,
