@@ -1039,7 +1039,10 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                head_dim,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id);
+        const ds4_gpu_tensor *seq_id,
+        /* M4b Inc3: optional per-row raw-span override for the batched MTP draft
+         * (NULL = bit-exact for the normal batched decode). */
+        const ds4_gpu_tensor *draft_n_raw);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,

@@ -8944,6 +8944,13 @@ typedef struct {
      * forward (bit-identical to mode-0 for accepted rows), then restore rejected banks
      * to checkpoint[M-1].  Set only on the rollback path; clear elsewhere. */
     bool            batch_rollback_capture;
+    /* M4b Inc3: optional per-row raw-span override (device int32, n_rows entries)
+     * threaded into the batched dense decode attention for the batched MTP draft.
+     * NULL for every normal batched forward (bit-exact); set transiently by
+     * metal_graph_eval_mtp_draft_batch from msl->mtp_n_raw[bank] so the sparsely-
+     * filled MTP ring is read with the exact serial-drafter span, restored to
+     * NULL after the draft layer. */
+    ds4_gpu_tensor *batch_draft_n_raw;
     /* B1 (ragged prefill): per-ROW host mirrors, prefill_cap entries (heap).  In
      * DECODE there is 1 row/seq so writes index [s] (s < N <= MAX_SEQ); in RAGGED
      * PREFILL there are Σ seq-lens rows (up to prefill_cap), so the emit loop reads
@@ -14770,14 +14777,19 @@ static bool metal_graph_encode_layer_attention_batch(
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
-                                             model->map,
-                                             model->size,
-                                             layer->hc_attn_fn->abs_offset,
-                                             hc_dim,
-                                             mix_hc,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
+    /* M4b Inc3: dtype-aware so the batched layer can serve BOTH the base blocks
+     * (hc_attn_fn = F16) AND the reused MTP block (hc_attn_fn = F32, see the MTP
+     * layout check ~2694).  For F16 this dispatches to the identical
+     * ds4_gpu_matmul_f16_tensor (base path bit-exact); for the MTP F32 weight it
+     * uses matmul_f32.  The hardcoded F16 here silently produced NaN hc_mix for
+     * the MTP draft (it read F32 bytes as F16). */
+    if (ok) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
+                                                 model,
+                                                 layer->hc_attn_fn,
+                                                 hc_dim,
+                                                 mix_hc,
+                                                 g->batch_flat_hc,
+                                                 n_tokens);
     if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
@@ -15091,7 +15103,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                    g->raw_window,
                                                                    DS4_N_HEAD,
                                                                    DS4_N_HEAD_DIM,
-                                                                   seq_positions, seq_id) != 0;
+                                                                   seq_positions, seq_id,
+                                                                   /* M4b Inc3: per-row MTP draft span (NULL except the batched draft) */
+                                                                   g->batch_draft_n_raw) != 0;
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -16488,14 +16502,16 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
-                                             model->map,
-                                             model->size,
-                                             layer->hc_ffn_fn->abs_offset,
-                                             hc_dim,
-                                             mix_hc,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
+    /* M4b Inc3: dtype-aware (base hc_ffn_fn = F16, reused MTP block = F32; see the
+     * matching hc_attn_fn fix in metal_graph_encode_layer_attention_batch).  F16
+     * dispatches to the identical kernel (base bit-exact); F32 for the MTP draft. */
+    if (ok) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
+                                                 model,
+                                                 layer->hc_ffn_fn,
+                                                 hc_dim,
+                                                 mix_hc,
+                                                 g->batch_flat_hc,
+                                                 n_tokens);
     if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
@@ -16543,14 +16559,16 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("norm");
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_router_logits,
-                                             model->map,
-                                             model->size,
-                                             layer->ffn_gate_inp->abs_offset,
-                                             DS4_N_EMBD,
-                                             DS4_N_EXPERT,
-                                             g->batch_ffn_norm,
-                                             n_tokens) != 0;
+    /* M4b Inc3: dtype-aware MoE router (base ffn_gate_inp = F16, reused MTP block
+     * = F32; see hc_attn_fn/hc_ffn_fn fixes).  F16 dispatches to the identical
+     * kernel (base bit-exact); F32 for the MTP draft routing. */
+    if (ok) ok = metal_graph_matmul_plain_tensor(g->batch_router_logits,
+                                                 model,
+                                                 layer->ffn_gate_inp,
+                                                 DS4_N_EMBD,
+                                                 DS4_N_EXPERT,
+                                                 g->batch_ffn_norm,
+                                                 n_tokens);
 
     if (ok) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
@@ -17104,6 +17122,63 @@ static bool metal_graph_eval_mtp_draft(
                                               logits,
                                               top_id,
                                               top2);
+}
+
+/* M4b Inc3: batched (N-row) MTP output head.  Clone of
+ * metal_graph_encode_output_head_batch_into (13265) but with the MTP head
+ * weights (mtp->hc_head_fn / hc_head_scale / hc_head_base / mtp->norm) and the
+ * BASE vocab projection (base_weights->output) -- i.e. the N-row analog of the
+ * single-row metal_graph_encode_output_head_mtp (13422).  Reads n_rows rows from
+ * src_hc (a view over the MTP layer output) and writes n_rows rows of logits to
+ * dst_logits.  Reuses the batch_* head scratch (prefill_cap rows) exactly like
+ * _batch_into; must be called inside a begin/end_commands block, after the MTP
+ * layer (so the batch_* scratch is free again).  The HC-weight / weighted-sum /
+ * rms-norm-rows kernels derive their row count from the tensor sizes, so passing
+ * the n_row-wide views suffices (no per-row n_tokens arg). */
+static bool metal_graph_encode_output_head_mtp_batch_into(
+        ds4_gpu_graph         *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        ds4_gpu_tensor        *src_hc,
+        uint32_t               n_rows,
+        uint64_t               vocab_dim,
+        ds4_gpu_tensor        *dst_logits) {
+    if (n_rows == 0 || n_rows > g->prefill_cap || !src_hc || !dst_logits) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_gpu_tensor *output_pre = NULL, *output_weights = NULL, *output_embd = NULL,
+                   *output_norm = NULL, *logits = NULL;
+    output_pre     = ds4_gpu_tensor_view(g->batch_hc_mix,   0, (uint64_t)n_rows * DS4_N_HC   * sizeof(float));
+    output_weights = ds4_gpu_tensor_view(g->batch_hc_split, 0, (uint64_t)n_rows * DS4_N_HC   * sizeof(float));
+    output_embd    = ds4_gpu_tensor_view(g->batch_ffn_cur,  0, (uint64_t)n_rows * DS4_N_EMBD * sizeof(float));
+    output_norm    = ds4_gpu_tensor_view(g->batch_ffn_norm, 0, (uint64_t)n_rows * DS4_N_EMBD * sizeof(float));
+    logits         = ds4_gpu_tensor_view(dst_logits,        0, (uint64_t)n_rows * vocab_dim  * sizeof(float));
+    bool ok = output_pre && output_weights && output_embd && output_norm && logits;
+    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, src_hc,
+                                                      (uint32_t)hc_dim, n_rows, DS4_RMS_EPS) != 0;
+    if (ok) ok = metal_graph_matmul_plain_tensor(output_pre, mtp_model, mtp->hc_head_fn,
+                                                 hc_dim, DS4_N_HC, g->batch_flat_hc, n_rows);
+    if (ok) ok = ds4_gpu_output_hc_weights_tensor(output_weights, output_pre,
+                                                    mtp_model->map, mtp_model->size,
+                                                    mtp->hc_head_scale->abs_offset,
+                                                    mtp->hc_head_base->abs_offset,
+                                                    DS4_N_HC, DS4_HC_EPS) != 0;
+    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(output_embd, src_hc, output_weights,
+                                                  DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(output_norm, output_embd,
+                                                       mtp_model->map, mtp_model->size,
+                                                       mtp->norm->abs_offset,
+                                                       DS4_N_EMBD, n_rows, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(logits, base_model->map, base_model->size,
+                                              base_weights->output->abs_offset,
+                                              DS4_N_EMBD, vocab_dim, output_norm, n_rows) != 0;
+    if (logits)         ds4_gpu_tensor_free(logits);
+    if (output_norm)    ds4_gpu_tensor_free(output_norm);
+    if (output_embd)    ds4_gpu_tensor_free(output_embd);
+    if (output_weights) ds4_gpu_tensor_free(output_weights);
+    if (output_pre)     ds4_gpu_tensor_free(output_pre);
+    return ok;
 }
 
 /* =========================================================================
@@ -22314,10 +22389,12 @@ typedef struct {
     ds4_gpu_tensor *draft_eproj_hc;   /* [N x hc_dim]       repeat_hc_rows          */
     ds4_gpu_tensor *draft_hnorm_hc;   /* [N x hc_dim]       rms_norm_rows(hnorm)    */
     ds4_gpu_tensor *draft_hproj_hc;   /* [N x hc_dim]       matmul(h_proj)          */
-    ds4_gpu_tensor *draft_prev_hc;    /* [N x hc_dim]       recurrent carry (seed / layer-out copy) */
+    ds4_gpu_tensor *draft_prev_hc;    /* [N x hc_dim]       recurrent carry in (seed / prev depth out) */
+    ds4_gpu_tensor *draft_out_hc;     /* [N x hc_dim]       recurrent carry out (layer-out copy; ping-pong w/ prev) */
     ds4_gpu_tensor *draft_logits;     /* [N x DS4_N_VOCAB]  batched output-head logits (spec_logits is only 16 rows) */
     ds4_gpu_tensor *draft_tokens_dev; /* [N x int32]        per-row feed tokens (device) */
     ds4_gpu_tensor *draft_ids;        /* [N x int32]        argmax_rows output ids   */
+    ds4_gpu_tensor *draft_n_raw_dev;  /* [N x int32]        per-row MTP ring span = min(mtp_n_raw[bank]+1, raw_window, raw_cap) */
 } ds4_mtp_slabs;
 
 /* Allocate N per-seq KV banks (raw + attn-comp + attn-state for ratio!=0; index
@@ -22509,14 +22586,16 @@ static bool ds4_mtp_slabs_alloc(ds4_mtp_slabs *msl, ds4_gpu_graph *g, uint32_t N
     msl->draft_hnorm_hc   = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
     msl->draft_hproj_hc   = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
     msl->draft_prev_hc    = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
+    msl->draft_out_hc     = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
     msl->draft_logits     = ds4_gpu_tensor_alloc((uint64_t)N * DS4_N_VOCAB * sizeof(float));
     msl->draft_tokens_dev = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(int32_t));
     msl->draft_ids        = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(int32_t));
+    msl->draft_n_raw_dev  = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(int32_t));
     return msl->multi_mtp_raw && msl->multi_mtp_state && msl->multi_mtp_next &&
            msl->draft_embed && msl->draft_enorm && msl->draft_eproj &&
            msl->draft_eproj_hc && msl->draft_hnorm_hc && msl->draft_hproj_hc &&
-           msl->draft_prev_hc && msl->draft_logits &&
-           msl->draft_tokens_dev && msl->draft_ids;
+           msl->draft_prev_hc && msl->draft_out_hc && msl->draft_logits &&
+           msl->draft_tokens_dev && msl->draft_ids && msl->draft_n_raw_dev;
 }
 
 /* S1: install bank b's MTP views into g->mtp_raw_cache/mtp_state_hc/mtp_next_hc
@@ -22580,9 +22659,11 @@ static void ds4_mtp_slabs_free(ds4_mtp_slabs *msl, ds4_gpu_graph *g) {
     if (msl->draft_hnorm_hc)   ds4_gpu_tensor_free(msl->draft_hnorm_hc);
     if (msl->draft_hproj_hc)   ds4_gpu_tensor_free(msl->draft_hproj_hc);
     if (msl->draft_prev_hc)    ds4_gpu_tensor_free(msl->draft_prev_hc);
+    if (msl->draft_out_hc)     ds4_gpu_tensor_free(msl->draft_out_hc);
     if (msl->draft_logits)     ds4_gpu_tensor_free(msl->draft_logits);
     if (msl->draft_tokens_dev) ds4_gpu_tensor_free(msl->draft_tokens_dev);
     if (msl->draft_ids)        ds4_gpu_tensor_free(msl->draft_ids);
+    if (msl->draft_n_raw_dev)  ds4_gpu_tensor_free(msl->draft_n_raw_dev);
     memset(msl, 0, sizeof(*msl));
 }
 
@@ -27007,6 +27088,248 @@ static bool mtp_draft_bank_isolated(
     return ok;
 }
 
+/* M4b Inc3: ONE depth of the batched cross-bank MTP draft forward.  Drafts
+ * n_rows banks AS ROWS in a single forward (one begin/end_commands), replacing
+ * n_rows serial metal_graph_eval_mtp_draft_from_hc calls (each of which ends in
+ * its own cudaDeviceSynchronize -> the M4a sync-bound bottleneck).  Per-row
+ * inputs (host arrays, length n_rows):
+ *   tokens[r]    -- the feed token for row r,
+ *   positions[r] -- its absolute position,
+ *   seq_ids[r]   -- the bank that owns row r (addresses the per-bank MTP KV ring),
+ *   prev_hc      -- [n_rows x hc_dim] recurrent carry in (gathered seeds / prev depth out).
+ * Outputs: ids_out[r] = argmax of row r's MTP logits; out_hc = [n_rows x hc_dim]
+ * copy of the layer output (the next depth's prev_hc).  prev_hc and out_hc MUST
+ * NOT alias (the prelayer overwrites batch_cur_hc, which is also the layer out).
+ *
+ * Mirrors the single-row drafter's pipeline (prelayer 16974-17020 + dense il=1
+ * layer + MTP head + argmax) but:
+ *  - the prelayer is N rows wide (embed_tokens_hc n_hc=1 / rms_norm_rows /
+ *    matmul / repeat_hc_rows / rms_norm_rows / matmul / add into batch_cur_hc),
+ *  - the dense ratio-0 attention+ffn REUSES metal_graph_encode_layer_batch with
+ *    the MTP block at il=1, binding the per-bank MTP KV by temporarily pointing
+ *    g->layer_raw_cache[1] at the N-bank MTP slab (msl->multi_mtp_raw; bank b at
+ *    b*raw_bank_bytes -- identical multiseq layout to multi_raw[1]).  il=1 is
+ *    DENSE for FLASH (ds4_expected_layer_compress_ratio: il<2 -> 0), so the
+ *    compressor/index branches are skipped and only the raw ring is touched.
+ *  - multiseq mode reads per-row positions/seq_id from g->batch_positions /
+ *    batch_seq_id (NOT the single-token g_decode_dev substrate), so it is
+ *    self-contained and never touches the capture-substrate scalars.
+ * Preconditions (true inside cont-gen step 5): the base decode slab is repointed
+ * [0,MS), g->batch_n_seq covers every seq_id, g->batch_positions/seq_id sized
+ * >= n_rows.  Best-effort: a wrong draft only lowers the accept rate (draft
+ * quality != correctness), so this does NOT roll back the MTP ring. */
+static bool metal_graph_eval_mtp_draft_batch(
+        ds4_batch_ctx  *ctx,
+        ds4_gpu_graph  *g,
+        uint32_t        n_rows,
+        ds4_gpu_tensor *prev_hc,
+        const int32_t  *tokens,
+        const int32_t  *positions,
+        const int32_t  *seq_ids,
+        ds4_gpu_tensor *out_hc,
+        int32_t        *ids_out) {
+    ds4_mtp_slabs *msl = &ctx->msl;
+    if (n_rows == 0 || n_rows > g->prefill_cap || !prev_hc || !out_hc || !ids_out) return false;
+    if (!msl->multi_mtp_raw || !msl->draft_embed || !msl->draft_logits) return false;
+    const ds4_model       *base_model   = &ctx->e->model;
+    const ds4_weights     *base_weights = &ctx->e->weights;
+    const ds4_model       *mtp_model    = &ctx->e->mtp_model;
+    const ds4_mtp_weights *mtp          = &ctx->e->mtp_weights;
+    if (!mtp->block.attn_q_a) return false;
+    const uint64_t hc_dim    = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t vocab_dim = base_weights->output->dim[1];
+
+    /* max absolute position -> pos0 (multiseq raw_span_last fallback; the per-row
+     * span derives from batch_positions in the kernel). */
+    uint32_t pos0 = 0;
+    for (uint32_t r = 0; r < n_rows; r++)
+        if ((uint32_t)positions[r] > pos0) pos0 = (uint32_t)positions[r];
+
+    /* Publish per-row tokens / positions / seq_ids to the device mirrors the
+     * batched kernels read. */
+    bool ok = ds4_gpu_tensor_write(msl->draft_tokens_dev, 0, tokens,
+                                   (uint64_t)n_rows * sizeof(int32_t)) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, positions,
+                                      (uint64_t)n_rows * sizeof(int32_t)) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, seq_ids,
+                                      (uint64_t)n_rows * sizeof(int32_t)) != 0;
+    /* M4b Inc3: per-row raw-span = the serial drafter's n_raw for each bank's
+     * sparsely-filled MTP ring, min(mtp_n_raw[bank]+1, raw_window, raw_cap)
+     * (mirrors metal_graph_eval_mtp_draft_from_hc).  Threaded into the dense
+     * decode attention via g->batch_draft_n_raw so the batched span matches the
+     * serial drafter exactly; without it the positions-derived span
+     * min(window, pos+1) reads stale/never-written ring slots on the first draft
+     * step after a fresh admit (mtp_n_raw[bank]==0). */
+    if (ok && n_rows <= (uint32_t)DS4_MULTISEQ_MAX_SEQ) {
+        int32_t draft_nr[DS4_MULTISEQ_MAX_SEQ];
+        for (uint32_t r = 0; r < n_rows; r++) {
+            uint32_t bank = (uint32_t)seq_ids[r];
+            uint32_t nr = (bank < (uint32_t)DS4_MULTISEQ_MAX_SEQ ? msl->mtp_n_raw[bank] : 0u) + 1u;
+            if (nr > g->raw_window) nr = g->raw_window;
+            if (nr > g->raw_cap)    nr = g->raw_cap;
+            draft_nr[r] = (int32_t)nr;
+        }
+        ok = ds4_gpu_tensor_write(msl->draft_n_raw_dev, 0, draft_nr,
+                                  (uint64_t)n_rows * sizeof(int32_t)) != 0;
+    } else if (ok) {
+        ok = false;  /* n_rows bounded by live banks (<= N <= MAX_SEQ); guard the host buffer */
+    }
+    if (!ok) return false;
+
+    /* Bind the per-bank MTP KV: point base layer-1's raw cache at the N-bank MTP
+     * slab for the duration of the draft layer.  Safe in step 5 (base forward is
+     * not running).  il=1 is dense -> only layer_raw_cache[1] matters. */
+    ds4_gpu_tensor *saved_raw1 = g->layer_raw_cache[1];
+    const bool sav_ms = g->batch_multiseq;
+    const bool sav_pf = g->batch_multiseq_prefilled;
+    const bool sav_em = g->batch_multiseq_emit;
+    const bool sav_df = g->batch_defer_comp_store;
+    const bool sav_rc = g->batch_rollback_capture;
+    ds4_gpu_tensor *sav_dnr = g->batch_draft_n_raw;
+    g->layer_raw_cache[1]       = msl->multi_mtp_raw;
+    g->batch_multiseq           = true;
+    g->batch_multiseq_prefilled = true;
+    g->batch_multiseq_emit      = false;   /* il=1 dense: no compressor commit anyway */
+    g->batch_defer_comp_store   = false;
+    g->batch_rollback_capture   = false;
+    g->batch_draft_n_raw        = msl->draft_n_raw_dev;  /* per-row MTP ring span */
+
+    ds4_gpu_tensor *cur_view = NULL, *src_hc = NULL;
+    const char *stage = "begin";
+    ok = ds4_gpu_begin_commands() != 0;
+
+    /* ---- N-row PRELAYER (mirror 16974-17020 with row counts) ---- */
+    if (ok) { stage = "embed"; ok = ds4_gpu_embed_tokens_hc_tensor(msl->draft_embed, msl->draft_tokens_dev,
+                                                base_model->map, base_model->size,
+                                                base_weights->token_embd->abs_offset,
+                                                (uint32_t)base_weights->token_embd->dim[1],
+                                                n_rows, DS4_N_EMBD, 1) != 0; }
+    if (ok) { stage = "enorm"; ok = ds4_gpu_rms_norm_weight_rows_tensor(msl->draft_enorm, msl->draft_embed,
+                                                     mtp_model->map, mtp_model->size,
+                                                     mtp->enorm->abs_offset,
+                                                     DS4_N_EMBD, n_rows, DS4_RMS_EPS) != 0; }
+    if (ok) { stage = "eproj"; ok = ds4_gpu_matmul_q8_0_tensor(msl->draft_eproj, mtp_model->map, mtp_model->size,
+                                            mtp->e_proj->abs_offset, DS4_N_EMBD, DS4_N_EMBD,
+                                            msl->draft_enorm, n_rows) != 0; }
+    if (ok) { stage = "repeat_hc"; ok = ds4_gpu_repeat_hc_rows_tensor(msl->draft_eproj_hc, msl->draft_eproj,
+                                               DS4_N_EMBD, DS4_N_HC, n_rows) != 0; }
+    if (ok) { stage = "hnorm"; ok = ds4_gpu_rms_norm_weight_rows_tensor(msl->draft_hnorm_hc, prev_hc,
+                                                     mtp_model->map, mtp_model->size,
+                                                     mtp->hnorm->abs_offset,
+                                                     DS4_N_EMBD, n_rows * DS4_N_HC, DS4_RMS_EPS) != 0; }
+    if (ok) { stage = "hproj"; ok = ds4_gpu_matmul_q8_0_tensor(msl->draft_hproj_hc, mtp_model->map, mtp_model->size,
+                                            mtp->h_proj->abs_offset, DS4_N_EMBD, DS4_N_EMBD,
+                                            msl->draft_hnorm_hc, n_rows * DS4_N_HC) != 0; }
+    /* sum into batch_cur_hc rows [0,n_rows): the batched layer reads it as input. */
+    if (ok) {
+        stage = "cur_view";
+        cur_view = ds4_gpu_tensor_view(g->batch_cur_hc, 0, (uint64_t)n_rows * hc_dim * sizeof(float));
+        ok = cur_view != NULL;
+    }
+    if (ok) { stage = "add"; ok = ds4_gpu_add_tensor(cur_view, msl->draft_eproj_hc, msl->draft_hproj_hc,
+                                    (uint32_t)((uint64_t)n_rows * hc_dim)) != 0; }
+
+    /* ---- DENSE il=1 attention+ffn (+ the cur/next swap) via the reused batched
+     * layer.  The MTP block's hc_attn_fn/hc_ffn_fn/ffn_gate_inp are F32 (base is
+     * F16); the batched layer's matmuls are dtype-aware (metal_graph_matmul_plain_
+     * tensor), so reusing it for the MTP block is correct.  No extra sync: the
+     * q4k multi-token MoE runs cleanly on stream 0 now that the F32 weights are
+     * read at the right width (a stale F16 read used to NaN the hidden state ->
+     * garbage MoE indices -> the "needs a sync" illegal access). */
+    if (ok) { stage = "layer"; ok = metal_graph_encode_layer_batch(g, mtp_model, &mtp->block, 1u, pos0, n_rows); }
+
+    /* ---- N-row MTP OUTPUT HEAD + per-row argmax ---- */
+    if (ok) {
+        stage = "src_view";
+        src_hc = ds4_gpu_tensor_view(g->batch_cur_hc, 0, (uint64_t)n_rows * hc_dim * sizeof(float));
+        ok = src_hc != NULL;
+    }
+    if (ok) { stage = "head"; ok = metal_graph_encode_output_head_mtp_batch_into(g, base_model, base_weights,
+                                                              mtp_model, mtp, src_hc,
+                                                              n_rows, vocab_dim, msl->draft_logits); }
+    if (ok) { stage = "argmax"; ok = ds4_gpu_argmax_rows_tensor(msl->draft_ids, msl->draft_logits,
+                                            (uint32_t)vocab_dim, n_rows) != 0; }
+    /* save the layer output as the next depth's carry BEFORE end (device copy). */
+    if (ok) ok = ds4_gpu_tensor_copy(out_hc, 0, g->batch_cur_hc, 0,
+                                     (uint64_t)n_rows * hc_dim * sizeof(float)) != 0;
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok) ok = ds4_gpu_tensor_read(msl->draft_ids, 0, ids_out,
+                                     (uint64_t)n_rows * sizeof(int32_t)) != 0;
+
+    if (cur_view) ds4_gpu_tensor_free(cur_view);
+    if (src_hc)   ds4_gpu_tensor_free(src_hc);
+    g->layer_raw_cache[1]       = saved_raw1;
+    g->batch_multiseq           = sav_ms;
+    g->batch_multiseq_prefilled = sav_pf;
+    g->batch_multiseq_emit      = sav_em;
+    g->batch_defer_comp_store   = sav_df;
+    g->batch_rollback_capture   = sav_rc;
+    g->batch_draft_n_raw        = sav_dnr;
+    if (!ok) {
+        (void)ds4_gpu_synchronize();
+        if (getenv("DS4_MTP_GATE_DEBUG"))
+            fprintf(stderr, "ds4: metal_graph_eval_mtp_draft_batch FAIL @%s n_rows=%u pos0=%u raw_cap=%u max_seq_len=%u n_seq=%u prefill_cap=%u\n",
+                    stage, n_rows, pos0, g->raw_cap, g->batch_max_seq_len, g->batch_n_seq, g->prefill_cap);
+    }
+    return ok;
+}
+
+/* M4b Inc3 validation: serial-vs-batched parity for ONE draft depth.  For each of
+ * n_live banks, runs the SERIAL single-depth drafter (mtp_draft_bank_isolated)
+ * AND the BATCHED drafter (metal_graph_eval_mtp_draft_batch) from the SAME
+ * pre-state, and reports per-bank top-1 agreement.  Keeping both passes on the
+ * same MTP ring: the serial pass advances each bank's ring by one entry (stored
+ * at pos%raw_cap) and bumps mtp_n_raw; we restore mtp_n_raw[] before the batched
+ * pass, whose store OVERWRITES that same ring row, so both attend an identical
+ * span (the recurrent carry is not read for a SEEDED single depth).  Net effect
+ * on the real draft loop that follows is nil: mtp_n_raw is restored and the row
+ * at pos%raw_cap is re-written by the real chain's i=0.  Remaining top-1 flips
+ * are cross-row MoE FP in the batched FFN (acceptable; draft quality !=
+ * correctness) -- this counts them to de-risk the Inc5 wiring.  Triggered by
+ * DS4_MTP_BATCH_DRAFT_PARITY in cont-gen step 5 (single-seq flags already set). */
+static void metal_graph_mtp_draft_batch_selftest(
+        ds4_batch_ctx *ctx, ds4_gpu_graph *g, uint32_t n_live,
+        ds4_gpu_tensor **seed_rows, const int *seedtok,
+        const uint32_t *seedpos, const uint32_t *banks) {
+    ds4_mtp_slabs *msl = &ctx->msl;
+    if (n_live == 0 || n_live > msl->N || !msl->draft_prev_hc) return;
+    const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < n_live; i++)                 /* gather seeds */
+        ok = ds4_gpu_tensor_copy(msl->draft_prev_hc, (uint64_t)i * hc_bytes,
+                                 seed_rows[i], 0, hc_bytes) != 0;
+    uint32_t saved_nraw[DS4_MULTISEQ_MAX_SEQ];
+    memcpy(saved_nraw, msl->mtp_n_raw, sizeof(saved_nraw));
+    int serial_top[DS4_MULTISEQ_MAX_SEQ];
+    for (uint32_t i = 0; ok && i < n_live; i++) {               /* SERIAL pass */
+        int top = -1;
+        ok = mtp_draft_bank_isolated(ctx, g, banks[i], seed_rows[i],
+                                     seedtok[i], seedpos[i], &top);
+        serial_top[i] = top;
+    }
+    memcpy(msl->mtp_n_raw, saved_nraw, sizeof(saved_nraw));     /* rewind ring counters */
+    int32_t btok[DS4_MULTISEQ_MAX_SEQ], bpos[DS4_MULTISEQ_MAX_SEQ],
+            bsid[DS4_MULTISEQ_MAX_SEQ], bids[DS4_MULTISEQ_MAX_SEQ];
+    for (uint32_t i = 0; i < n_live; i++) {
+        btok[i] = seedtok[i]; bpos[i] = (int32_t)seedpos[i];
+        bsid[i] = (int32_t)banks[i]; bids[i] = -1;
+    }
+    if (ok) ok = metal_graph_eval_mtp_draft_batch(ctx, g, n_live, msl->draft_prev_hc,
+                                                  btok, bpos, bsid, msl->draft_out_hc, bids);
+    memcpy(msl->mtp_n_raw, saved_nraw, sizeof(saved_nraw));     /* leave real loop clean */
+    if (!ok) { fprintf(stderr, "ds4: MTP_BATCH_DRAFT_PARITY n=%u FAILED to run\n", n_live); return; }
+    uint32_t agree = 0;
+    for (uint32_t i = 0; i < n_live; i++) if (serial_top[i] == bids[i]) agree++;
+    fprintf(stderr,
+            "ds4: MTP_BATCH_DRAFT_PARITY n=%u agree=%u/%u (top-1 flips=%u; cross-row MoE FP acceptable)\n",
+            n_live, agree, n_live, n_live - agree);
+    if (getenv("DS4_MTP_BATCH_DRAFT_PARITY_V"))
+        for (uint32_t i = 0; i < n_live; i++)
+            if (serial_top[i] != bids[i])
+                fprintf(stderr, "ds4:   bank %u pos %u: serial=%d batched=%d\n",
+                        banks[i], seedpos[i], serial_top[i], bids[i]);
+}
+
 /* S1.1: produce a depth-D speculative draft CHAIN for bank b, seeded from the
  * just-forwarded committed token's hidden carry.  Inputs: seed_hc = hc of the last
  * committed token (a row-view into batch_cur_hc), seed_tok/seed_pos = that token and
@@ -27057,6 +27380,118 @@ static int mtp_draft_chain_bank(ds4_batch_ctx *ctx, ds4_gpu_graph *g, uint32_t b
 
 /* S1.1: compile-time cap on the speculative draft depth (per-bank scratch sizing). */
 #define DS4_CONT_MTP_MAX_DEPTH 4u
+
+/* M4b Inc4: depth-major BATCHED MTP draft chain over n_rows banks -- the N-row
+ * analog of mtp_draft_chain_bank.  Loops i=0..D over the single-depth batched
+ * primitive (metal_graph_eval_mtp_draft_batch), ping-ponging the recurrent carry
+ * between draft_prev_hc and draft_out_hc and advancing each bank's MTP ring fill
+ * (mtp_n_raw) one slot per depth, EXACTLY mirroring the serial recurrence:
+ *   i=0 discards its prediction (~=committed, already known) and re-conditions on
+ *       committed[r] at seed_pos[r]+1;
+ *   i>=1 records the draft for seed_pos[r]+1+i.
+ * The caller MUST gather the n_rows committed-row carries into msl->draft_prev_hc
+ * first (the depth-0 prev_hc).  seed_tok/seed_pos/seq_ids/committed are host arrays
+ * of length n_rows.  drafts_out is row-major [n_rows x D]: drafts_out[r*D + j] is
+ * bank r's draft for position seed_pos[r]+2+j.  Returns D on success (all rows
+ * filled) or 0 on any forward failure.  Like the serial chain it does NOT roll back
+ * the MTP ring (draft quality != correctness; the committed stream is independent
+ * of draft values).  ~D+1 device syncs total vs the serial chain's n_rows*(D+1). */
+static int metal_graph_eval_mtp_draft_chain_batch(
+        ds4_batch_ctx *ctx, ds4_gpu_graph *g, uint32_t n_rows,
+        const int32_t *seed_tok, const int32_t *seed_pos, const int32_t *seq_ids,
+        const int32_t *committed, int32_t *drafts_out, int D) {
+    if (D <= 0 || n_rows == 0 || n_rows > (uint32_t)DS4_MULTISEQ_MAX_SEQ) return 0;
+    ds4_mtp_slabs *msl = &ctx->msl;
+    if (!msl->draft_prev_hc || !msl->draft_out_hc) return 0;
+    int32_t feed[DS4_MULTISEQ_MAX_SEQ], pos[DS4_MULTISEQ_MAX_SEQ], ids[DS4_MULTISEQ_MAX_SEQ];
+    for (uint32_t r = 0; r < n_rows; r++) { feed[r] = seed_tok[r]; pos[r] = seed_pos[r]; }
+    ds4_gpu_tensor *prev = msl->draft_prev_hc, *out = msl->draft_out_hc;
+    for (int i = 0; i <= D; i++) {
+        if (!metal_graph_eval_mtp_draft_batch(ctx, g, n_rows, prev, feed, pos, seq_ids, out, ids))
+            return 0;
+        /* advance each bank's ring fill by one (mirror metal_graph_eval_mtp_draft_
+         * from_hc's `if (mtp_n_raw < raw_window) mtp_n_raw++`) so depth i+1's
+         * per-row span = mtp_n_raw[bank]+1 grows exactly like the serial chain. */
+        for (uint32_t r = 0; r < n_rows; r++) {
+            uint32_t bank = (uint32_t)seq_ids[r];
+            if (bank < (uint32_t)DS4_MULTISEQ_MAX_SEQ && msl->mtp_n_raw[bank] < g->raw_window)
+                msl->mtp_n_raw[bank]++;
+        }
+        if (i == 0) {
+            for (uint32_t r = 0; r < n_rows; r++) { feed[r] = committed[r]; pos[r] = seed_pos[r] + 1; }
+        } else {
+            for (uint32_t r = 0; r < n_rows; r++) {
+                drafts_out[r * D + (i - 1)] = ids[r];
+                feed[r] = ids[r];
+                pos[r]  = seed_pos[r] + 1 + i;
+            }
+        }
+        ds4_gpu_tensor *tmp = prev; prev = out; out = tmp;
+    }
+    return D;
+}
+
+/* M4b Inc4 validation: serial-vs-batched parity for the FULL depth-D CHAIN.  For
+ * each of n_live banks, runs the SERIAL mtp_draft_chain_bank AND the BATCHED
+ * metal_graph_eval_mtp_draft_chain_batch from the SAME pre-state (same seed carry,
+ * tok, pos, committed) and reports per-(bank,depth) top-1 agreement.  Saves/restores
+ * mtp_n_raw[] around both passes so it is non-invasive to the real draft loop.  As
+ * with the single-depth probe, residual flips are cross-row MoE FP (the batched FFN
+ * runs the q4k experts mmq over n_live rows vs the serial mmvq per row) -- acceptable
+ * (draft quality != correctness).  Triggered by DS4_MTP_BATCH_DRAFT_CHAIN_PARITY. */
+static void metal_graph_mtp_draft_chain_batch_selftest(
+        ds4_batch_ctx *ctx, ds4_gpu_graph *g, uint32_t n_live,
+        ds4_gpu_tensor **seed_rows, const int *seedtok, const uint32_t *seedpos,
+        const int *committed, const uint32_t *banks, int D) {
+    ds4_mtp_slabs *msl = &ctx->msl;
+    if (n_live == 0 || n_live > msl->N || D <= 0 || D > (int)DS4_CONT_MTP_MAX_DEPTH ||
+        !msl->draft_prev_hc) return;
+    const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    uint32_t saved_nraw[DS4_MULTISEQ_MAX_SEQ];
+    memcpy(saved_nraw, msl->mtp_n_raw, sizeof(saved_nraw));
+    int  serial[DS4_MULTISEQ_MAX_SEQ][DS4_CONT_MTP_MAX_DEPTH];
+    int  serial_n[DS4_MULTISEQ_MAX_SEQ];
+    for (uint32_t i = 0; i < n_live; i++) {                      /* SERIAL chains */
+        int chain[DS4_CONT_MTP_MAX_DEPTH];
+        int n = mtp_draft_chain_bank(ctx, g, banks[i], seed_rows[i], seedtok[i],
+                                     seedpos[i], committed[i], chain, D);
+        serial_n[i] = n;
+        for (int j = 0; j < n && j < (int)DS4_CONT_MTP_MAX_DEPTH; j++) serial[i][j] = chain[j];
+    }
+    memcpy(msl->mtp_n_raw, saved_nraw, sizeof(saved_nraw));      /* rewind ring counters */
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < n_live; i++)                  /* gather seeds */
+        ok = ds4_gpu_tensor_copy(msl->draft_prev_hc, (uint64_t)i * hc_bytes,
+                                 seed_rows[i], 0, hc_bytes) != 0;
+    int32_t btok[DS4_MULTISEQ_MAX_SEQ], bpos[DS4_MULTISEQ_MAX_SEQ],
+            bsid[DS4_MULTISEQ_MAX_SEQ], bcom[DS4_MULTISEQ_MAX_SEQ];
+    static int32_t bdr[DS4_MULTISEQ_MAX_SEQ * DS4_CONT_MTP_MAX_DEPTH];
+    for (uint32_t i = 0; i < n_live; i++) {
+        btok[i] = seedtok[i]; bpos[i] = (int32_t)seedpos[i];
+        bsid[i] = (int32_t)banks[i]; bcom[i] = committed[i];
+    }
+    int bn = ok ? metal_graph_eval_mtp_draft_chain_batch(ctx, g, n_live, btok, bpos,
+                                                         bsid, bcom, bdr, D) : 0;
+    memcpy(msl->mtp_n_raw, saved_nraw, sizeof(saved_nraw));      /* leave real loop clean */
+    if (bn != D) { fprintf(stderr, "ds4: MTP_BATCH_DRAFT_CHAIN_PARITY n=%u D=%d FAILED to run\n", n_live, D); return; }
+    uint32_t agree = 0, total = 0, full = 0;
+    for (uint32_t i = 0; i < n_live; i++) {
+        uint32_t bank_agree = 0; int eff = serial_n[i] < D ? serial_n[i] : D;
+        for (int j = 0; j < eff; j++) { total++; if (serial[i][j] == bdr[i * D + j]) { agree++; bank_agree++; } }
+        if ((int)bank_agree == eff && eff == D) full++;
+    }
+    fprintf(stderr,
+            "ds4: MTP_BATCH_DRAFT_CHAIN_PARITY n=%u D=%d depth-agree=%u/%u banks-full=%u/%u (cross-row MoE FP acceptable)\n",
+            n_live, D, agree, total, full, n_live);
+    if (getenv("DS4_MTP_BATCH_DRAFT_PARITY_V"))
+        for (uint32_t i = 0; i < n_live; i++) {
+            int eff = serial_n[i] < D ? serial_n[i] : D;
+            for (int j = 0; j < eff; j++)
+                if (serial[i][j] != bdr[i * D + j])
+                    fprintf(stderr, "ds4:   bank %u depth %d: serial=%d batched=%d\n",
+                            banks[i], j, serial[i][j], bdr[i * D + j]);
+        }
+}
 
 /* S1.1 gate (M3): read EVERY live bank's COMMITTED compressed-KV into a flat float buffer (canonical
  * order: kind in {attn,index} x layer x bank x committed-row) plus a parallel per-(kind,layer,bank)
@@ -27541,6 +27976,31 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 const bool sav_em = g->batch_multiseq_emit;
                 const bool sav_pf = g->batch_multiseq_prefilled;
                 g->batch_multiseq = false; g->batch_multiseq_emit = false; g->batch_multiseq_prefilled = false;
+                /* M4b Inc3: optional serial-vs-batched single-depth parity probe (off in
+                 * production; DS4_MTP_BATCH_DRAFT_PARITY).  Non-invasive: restores the MTP
+                 * ring counters so the real draft chain below proceeds unchanged. */
+                if (ctx->mtp && (getenv("DS4_MTP_BATCH_DRAFT_PARITY") ||
+                                 getenv("DS4_MTP_BATCH_DRAFT_CHAIN_PARITY"))) {
+                    ds4_gpu_tensor *srows[DS4_MULTISEQ_MAX_SEQ];
+                    int      stok[DS4_MULTISEQ_MAX_SEQ], scom[DS4_MULTISEQ_MAX_SEQ];
+                    uint32_t spos[DS4_MULTISEQ_MAX_SEQ], sbank[DS4_MULTISEQ_MAX_SEQ];
+                    uint32_t nl = 0; bool gok = true;
+                    for (uint32_t b = 0; gok && b < MS; b++) {
+                        if (!live[b] || cfirst[b] == UINT32_MAX) continue;
+                        const uint32_t base_row = no_defer ? vfirst[b] : cfirst[b];
+                        const uint32_t last_row = base_row + committed_rows[b] - 1u;
+                        ds4_gpu_tensor *sv = metal_graph_tensor_row_view(g->batch_cur_hc, last_row, hc_dim_cont);
+                        if (!sv) { gok = false; break; }
+                        srows[nl] = sv; stok[nl] = seedtok[b]; scom[nl] = cur[b];
+                        spos[nl] = posv[b] - 1u; sbank[nl] = b; nl++;
+                    }
+                    if (gok && getenv("DS4_MTP_BATCH_DRAFT_PARITY"))
+                        metal_graph_mtp_draft_batch_selftest(ctx, g, nl, srows, stok, spos, sbank);
+                    if (gok && getenv("DS4_MTP_BATCH_DRAFT_CHAIN_PARITY"))
+                        metal_graph_mtp_draft_chain_batch_selftest(ctx, g, nl, srows, stok, spos,
+                                                                   scom, sbank, (int)Dspec);
+                    for (uint32_t i = 0; i < nl; i++) ds4_gpu_tensor_free(srows[i]);
+                }
                 for (uint32_t b = 0; ok && b < MS; b++) {
                     ndr[b] = 0u;
                     if (!live[b] || cfirst[b] == UINT32_MAX) continue;

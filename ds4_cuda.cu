@@ -5787,7 +5787,16 @@ __global__ static void attention_decode_mixed_kernel(
          * NULL when DS4_CUDA_FP8_KV is off or no compressed rows exist;
          * raw_kv and the rotary tail handling are untouched. */
         const unsigned char * __restrict__ comp_fp8,
-        const float         * __restrict__ comp_scale) {
+        const float         * __restrict__ comp_scale,
+        /* M4b Inc3: optional per-row raw-span override (n_tokens entries).  The
+         * batched MTP draft reuses this decode attention, but its KV ring is
+         * sparsely filled (drafts only, not prefill/decode), so the positions-
+         * derived span min(window, qpos+1) would read stale/never-written slots.
+         * When non-NULL, row t uses draft_n_raw[t] = min(mtp_n_raw[bank]+1,
+         * raw_window, raw_cap) raw rows ending at positions[t] -- matching the
+         * serial drafter (metal_graph_eval_mtp_draft_from_hc) exactly.  NULL =
+         * untouched (every non-draft caller stays bit-exact). */
+        const int32_t       * __restrict__ draft_n_raw) {
     if (s_override) {
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
@@ -5819,6 +5828,14 @@ __global__ static void attention_decode_mixed_kernel(
     uint32_t row_raw_start = raw_start;
     if (positions) {
         row_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (row_n_raw > raw_cap) row_n_raw = raw_cap;
+        row_raw_start = (qpos + 1u - row_n_raw) % raw_cap;
+    }
+    /* M4b Inc3: MTP draft per-row raw-span override (see signature).  The host
+     * already clamps to <= min(raw_window, raw_cap); guard >=1 defensively. */
+    if (draft_n_raw) {
+        row_n_raw = (uint32_t)draft_n_raw[t];
+        if (row_n_raw == 0u) row_n_raw = 1u;
         if (row_n_raw > raw_cap) row_n_raw = raw_cap;
         row_raw_start = (qpos + 1u - row_n_raw) % raw_cap;
     }
@@ -12917,7 +12934,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  (const struct ds4_decode_scalars *)scalars,
                                                  ls_override,
                                                  fp8_codes,
-                                                 fp8_sc);
+                                                 fp8_sc,
+                                                 /*draft_n_raw=*/(const int32_t *)NULL);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
@@ -13055,7 +13073,11 @@ static int attention_decode_batch_launch(
          * attention_decode_mixed_kernel honours them; multi-seq is forced down
          * that path (the heads8-online variants are not per-seq yet). */
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        /* M4b Inc3: optional per-row raw-span override for the batched MTP draft
+         * (NULL = every non-draft caller, bit-exact).  Only the main kernel
+         * honours it; multi-seq is already forced down that path. */
+        const ds4_gpu_tensor *draft_n_raw) {
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -13074,6 +13096,7 @@ static int attention_decode_batch_launch(
     if (n_comp != 0 && ratio == 0) return 0;
     const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
+    const int32_t *draft_n_raw_dev = draft_n_raw ? (const int32_t *)draft_n_raw->ptr : NULL;
     /* Multi-seq (per-row positions/seq) must use the main kernel; the
      * heads8-online fast paths below are not per-seq aware yet. */
     const bool force_main_kernel = (pos_dev != NULL || seq_dev != NULL);
@@ -13141,7 +13164,8 @@ static int attention_decode_batch_launch(
                                                  pos_dev, seq_dev,
                                                  /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL,
                                                  fp8_codes,
-                                                 fp8_sc);
+                                                 fp8_sc,
+                                                 draft_n_raw_dev);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
@@ -13162,13 +13186,16 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                head_dim,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        /* M4b Inc3: optional per-row raw-span override for the batched MTP draft
+         * (NULL = bit-exact for the normal batched decode). */
+        const ds4_gpu_tensor *draft_n_raw) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, /*comp_cap=*/0u, window, 1,
                                       n_head, head_dim,
                                       /* comp_fp8 */ NULL, /* comp_scale */ NULL,
-                                      positions, seq_id);
+                                      positions, seq_id, draft_n_raw);
 }
 
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
@@ -13207,7 +13234,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, comp_cap, window, ratio, n_head, head_dim,
                                       comp_fp8, comp_scale,
-                                      positions, seq_id);
+                                      positions, seq_id, /*draft_n_raw=*/NULL);
 }
 
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
@@ -16266,13 +16293,15 @@ static int routed_moe_launch(
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
-    /* Q4_K with shapes other than (n_tokens=1, n_expert=6) is supported only
-     * through the mmq path added in Step 2 of the optimization plan; that
-     * path runs before this dispatcher.  If we get here for Q4_K with a
-     * wider shape, mmq declined -- reject and let the caller fall back.
-     * Note n_total_expert (runtime, was constant 256 before PRO support)
-     * sizes the model weight stride. */
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+    /* Q4_K MoE: the LEGACY fallback (mmq_moe_fallback:) only handles the V4-Flash
+     * decode shape (n_tokens=1, n_expert=6); wider Q4_K shapes are served by the
+     * mmq block below (ds4_mmq_q4_K_moe_pair, n_tokens >= mmq_moe_min_tokens).
+     * M4b: the batched MTP draft runs the Q4_K MTP experts at n_tokens>1, so we
+     * must NOT reject q4k-wide up front -- let it reach the mmq dispatch; the
+     * fallback's own guard (below) still rejects any shape mmq declines.  (Base
+     * V4-Flash uses IQ2_XXS experts, not q4k, so this path is MTP-only.)
+     * Note n_total_expert (runtime, was constant 256 before PRO support) sizes
+     * the model weight stride. */
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
