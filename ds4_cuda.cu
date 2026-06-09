@@ -14526,6 +14526,7 @@ __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -14587,6 +14588,7 @@ __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_warp8_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -14635,6 +14637,7 @@ __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_hwarp16_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -14682,6 +14685,7 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     for (uint32_t rr = 0; rr < 4u; rr++) {
@@ -14734,6 +14738,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
@@ -14783,6 +14788,7 @@ __global__ static void moe_count_sorted_pairs_kernel(
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= 256) expert_i = 255;  /* routed n_expert fixed at 256 */
     atomicAdd(counts + (uint32_t)expert_i, 1u);
 }
 
@@ -14810,6 +14816,7 @@ __global__ static void moe_scatter_sorted_pairs_kernel(
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= 256) expert_i = 255;  /* routed n_expert fixed at 256 */
     uint32_t pos = atomicAdd(cursors + (uint32_t)expert_i, 1u);
     sorted_pairs[pos] = pair;
 }
@@ -14870,6 +14877,7 @@ __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -15341,6 +15349,7 @@ __global__ static void moe_gate_up_mid_sorted_p2_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -15383,6 +15392,7 @@ __global__ static DS4_CUDA_UNUSED void moe_down_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -15416,6 +15426,7 @@ __global__ static DS4_CUDA_UNUSED void moe_down_warp8_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -15442,6 +15453,7 @@ __global__ static DS4_CUDA_UNUSED void moe_down_hwarp16_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -15468,6 +15480,7 @@ __global__ static void moe_down_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -15499,6 +15512,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     for (uint32_t rr = 0; rr < 4u; rr++) {
@@ -15547,6 +15561,7 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
     for (uint32_t slot = 0; slot < 6u; slot++) {
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
+        if (expert_i >= 256) expert_i = 255;  /* routed n_expert fixed at 256 */
         const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
         const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
         float acc = 0.0f;
@@ -15575,6 +15590,7 @@ __global__ static void moe_down_sum6_n2_qwarp32_kernel(
     for (uint32_t slot = 0; slot < 6u; slot++) {
         int32_t expert_i = selected[(uint64_t)tok * 6u + slot];
         if (expert_i < 0) expert_i = 0;
+        if (expert_i >= 256) expert_i = 255;  /* routed n_expert fixed at 256 */
         const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
         const cuda_block_q8_K *xq = midq + ((uint64_t)tok * 6u + slot) * midq_blocks;
         float acc = 0.0f;
@@ -15606,6 +15622,7 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     for (uint32_t slot = 0; slot < 6u; slot++) {
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
+        if (expert_i >= 256) expert_i = 255;  /* routed n_expert fixed at 256 */
         const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
         const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
         float acc = 0.0f;
@@ -15635,6 +15652,7 @@ __global__ static void moe_down_sorted_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -16045,6 +16063,7 @@ __global__ static void moe_down_sorted_p2_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -16180,6 +16199,7 @@ __global__ static void moe_gate_up_mid_f32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     uint32_t expert = (uint32_t)expert_i;
     const uint32_t nb = expert_in_dim / CUDA_QK_K;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -16235,6 +16255,7 @@ __global__ static void moe_down_f32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
     const uint32_t nb = expert_mid_dim / CUDA_QK_K;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const float *xr = mid + (uint64_t)pair * expert_mid_dim;

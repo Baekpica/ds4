@@ -22576,6 +22576,21 @@ static bool ds4_mtp_slabs_alloc(ds4_mtp_slabs *msl, ds4_gpu_graph *g, uint32_t N
     msl->multi_mtp_raw   = ds4_gpu_tensor_alloc((uint64_t)N * msl->raw_bank_bytes);
     msl->multi_mtp_state = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
     msl->multi_mtp_next  = ds4_gpu_tensor_alloc((uint64_t)N * msl->hc_bank_bytes);
+    /* M4b Inc5: zero the batched MTP raw ring at alloc.  The per-bank ring fill
+     * mtp_n_raw[bank] resets to 0 each admit and advances D+1 per step while the
+     * position advances only by the accepted count M (<= D+1), so under <100%
+     * acceptance mtp_n_raw OUTPACES position and the draft attention's read span
+     * [pos-mtp_n_raw, pos] reaches BEFORE the bank's admit position.  For a first-
+     * admit bank those slots are uninitialized cudaMalloc garbage -> NaN hidden ->
+     * NaN router logits -> a garbage expert id (the q4k/iq2 MoE kernels clamp
+     * expert<0 but not expert>=n_expert) -> OOB expert gather -> intermittent
+     * illegal memory access.  Zeroing makes the read-before-write deterministic (a
+     * zero K/V row contributes a finite 0 score, never NaN), mirroring the scratch
+     * allocator's zero-on-realloc.  The serial drafter is immune: its long-lived
+     * shared mtp_raw_cache holds prior valid KV in those slots, not fresh garbage. */
+    if (msl->multi_mtp_raw)
+        (void)ds4_gpu_tensor_fill_f32(msl->multi_mtp_raw, 0.0f,
+                                      (uint64_t)N * g->raw_cap * DS4_N_HEAD_DIM);
     /* M4b Inc2: N-row batched-draft scratch (see struct comment).  hc_dim ==
      * DS4_N_HC*DS4_N_EMBD == hc_bank_bytes/sizeof(float). */
     const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
@@ -27196,6 +27211,12 @@ static bool metal_graph_eval_mtp_draft_batch(
 
     ds4_gpu_tensor *cur_view = NULL, *src_hc = NULL;
     const char *stage = "begin";
+    /* DIAG (DS4_MTP_BATCH_DRAFT_SYNC): sync + error-check after each stage to
+     * localize an intermittent illegal access to its launching kernel.  Eager
+     * path, so a mid-sequence sync is safe; print-only, off in production. */
+    const bool sync_dbg = getenv("DS4_MTP_BATCH_DRAFT_SYNC") != NULL;
+#define DRAFT_SYNCCK() do { if (ok && sync_dbg) { if (ds4_gpu_synchronize() == 0) { \
+        fprintf(stderr, "ds4: BATCH_DRAFT_SYNC FAIL @%s n_rows=%u pos0=%u\n", stage, n_rows, pos0); ok = false; } } } while (0)
     ok = ds4_gpu_begin_commands() != 0;
 
     /* ---- N-row PRELAYER (mirror 16974-17020 with row counts) ---- */
@@ -27204,6 +27225,7 @@ static bool metal_graph_eval_mtp_draft_batch(
                                                 base_weights->token_embd->abs_offset,
                                                 (uint32_t)base_weights->token_embd->dim[1],
                                                 n_rows, DS4_N_EMBD, 1) != 0; }
+    DRAFT_SYNCCK();
     if (ok) { stage = "enorm"; ok = ds4_gpu_rms_norm_weight_rows_tensor(msl->draft_enorm, msl->draft_embed,
                                                      mtp_model->map, mtp_model->size,
                                                      mtp->enorm->abs_offset,
@@ -27226,8 +27248,11 @@ static bool metal_graph_eval_mtp_draft_batch(
         cur_view = ds4_gpu_tensor_view(g->batch_cur_hc, 0, (uint64_t)n_rows * hc_dim * sizeof(float));
         ok = cur_view != NULL;
     }
+    if (ok) { stage = "hproj_sync"; }
+    DRAFT_SYNCCK();
     if (ok) { stage = "add"; ok = ds4_gpu_add_tensor(cur_view, msl->draft_eproj_hc, msl->draft_hproj_hc,
                                     (uint32_t)((uint64_t)n_rows * hc_dim)) != 0; }
+    DRAFT_SYNCCK();
 
     /* ---- DENSE il=1 attention+ffn (+ the cur/next swap) via the reused batched
      * layer.  The MTP block's hc_attn_fn/hc_ffn_fn/ffn_gate_inp are F32 (base is
@@ -27237,6 +27262,7 @@ static bool metal_graph_eval_mtp_draft_batch(
      * read at the right width (a stale F16 read used to NaN the hidden state ->
      * garbage MoE indices -> the "needs a sync" illegal access). */
     if (ok) { stage = "layer"; ok = metal_graph_encode_layer_batch(g, mtp_model, &mtp->block, 1u, pos0, n_rows); }
+    DRAFT_SYNCCK();
 
     /* ---- N-row MTP OUTPUT HEAD + per-row argmax ---- */
     if (ok) {
@@ -27247,8 +27273,10 @@ static bool metal_graph_eval_mtp_draft_batch(
     if (ok) { stage = "head"; ok = metal_graph_encode_output_head_mtp_batch_into(g, base_model, base_weights,
                                                               mtp_model, mtp, src_hc,
                                                               n_rows, vocab_dim, msl->draft_logits); }
+    DRAFT_SYNCCK();
     if (ok) { stage = "argmax"; ok = ds4_gpu_argmax_rows_tensor(msl->draft_ids, msl->draft_logits,
                                             (uint32_t)vocab_dim, n_rows) != 0; }
+    DRAFT_SYNCCK();
     /* save the layer output as the next depth's carry BEFORE end (device copy). */
     if (ok) ok = ds4_gpu_tensor_copy(out_hc, 0, g->batch_cur_hc, 0,
                                      (uint64_t)n_rows * hc_dim * sizeof(float)) != 0;
@@ -27271,6 +27299,7 @@ static bool metal_graph_eval_mtp_draft_batch(
             fprintf(stderr, "ds4: metal_graph_eval_mtp_draft_batch FAIL @%s n_rows=%u pos0=%u raw_cap=%u max_seq_len=%u n_seq=%u prefill_cap=%u\n",
                     stage, n_rows, pos0, g->raw_cap, g->batch_max_seq_len, g->batch_n_seq, g->prefill_cap);
     }
+#undef DRAFT_SYNCCK
     return ok;
 }
 
@@ -27722,6 +27751,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     float    *vlogits= mtp_accept ? xmalloc((size_t)vcap_rows * DS4_N_VOCAB * sizeof(float)) : NULL;
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
     if (mtp_accept) ok = ok && dbuf && ndr && vqtok && vpos && vsid && vfirst && vnr && vlogits;
+    /* M4b Inc5: batched cross-bank MTP draft chain (one depth-major forward over all
+     * live banks, ~D+1 device syncs/step) instead of the per-bank serial
+     * mtp_draft_chain_bank (N*(D+1) syncs).  Pure perf: the verify forward is the sole
+     * source of committed tokens, so a different draft only shifts the accept rate,
+     * never correctness (gate proves accept-stream == mode-0 regardless of drafts).
+     * Off by default; flip on to A/B the accept rate + throughput vs serial. */
+    const bool mtp_batch_draft = mtp_accept && getenv("DS4_CONT_MTP_BATCH_DRAFT") != NULL;
 
     if (ok) ok = ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS);
     if (ok) {
@@ -28001,6 +28037,56 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                                                    scom, sbank, (int)Dspec);
                     for (uint32_t i = 0; i < nl; i++) ds4_gpu_tensor_free(srows[i]);
                 }
+                if (mtp_batch_draft) {
+                    /* M4b Inc5: BATCHED draft chain.  Gather every live bank's last-committed-
+                     * row carry into the N-row draft slab (draft_prev_hc), run ONE depth-major
+                     * batched chain over all live banks, scatter the per-bank drafts back into
+                     * dbuf.  base_row/last_row select the SAME committed-row hidden state the
+                     * serial path seeds from (see the serial branch's note on no_defer vs
+                     * deferred layout).  metal_graph_eval_mtp_draft_chain_batch advances each
+                     * bank's mtp_n_raw exactly like the serial chain, so the MTP ring stays
+                     * coherent across steps as long as this path is used exclusively. */
+                    ds4_mtp_slabs *msl = &ctx->msl;
+                    const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+                    int32_t btok[DS4_MULTISEQ_MAX_SEQ], bpos[DS4_MULTISEQ_MAX_SEQ],
+                            bsid[DS4_MULTISEQ_MAX_SEQ], bcom[DS4_MULTISEQ_MAX_SEQ];
+                    uint32_t bmap[DS4_MULTISEQ_MAX_SEQ];   /* row -> bank */
+                    static int32_t bdr[DS4_MULTISEQ_MAX_SEQ * DS4_CONT_MTP_MAX_DEPTH];
+                    uint32_t nl = 0;
+                    for (uint32_t b = 0; b < MS; b++) ndr[b] = 0u;
+                    for (uint32_t b = 0; ok && b < MS; b++) {
+                        if (!live[b] || cfirst[b] == UINT32_MAX) continue;
+                        const uint32_t base_row = no_defer ? vfirst[b] : cfirst[b];
+                        const uint32_t last_row = base_row + committed_rows[b] - 1u;
+                        ds4_gpu_tensor *sv = metal_graph_tensor_row_view(g->batch_cur_hc, last_row, hc_dim_cont);
+                        if (!sv) { ok = false; break; }
+                        ok = ds4_gpu_tensor_copy(msl->draft_prev_hc, (uint64_t)nl * hc_bytes,
+                                                 sv, 0, hc_bytes) != 0;
+                        ds4_gpu_tensor_free(sv);
+                        btok[nl] = seedtok[b]; bpos[nl] = (int32_t)(posv[b] - 1u);
+                        bsid[nl] = (int32_t)b; bcom[nl] = cur[b]; bmap[nl] = b;
+                        nl++;
+                    }
+                    if (ok && nl > 0u && Dspec > 0u) {
+                        const int bn = metal_graph_eval_mtp_draft_chain_batch(
+                                ctx, g, nl, btok, bpos, bsid, bcom, bdr, (int)Dspec);
+                        if (bn != (int)Dspec) ok = false;
+                        for (uint32_t r = 0; ok && r < nl; r++) {
+                            const uint32_t b = bmap[r];
+                            for (uint32_t j = 0; j < Dspec; j++)
+                                dbuf[b * DS4_CONT_MTP_MAX_DEPTH + j] = bdr[r * (int)Dspec + (int)j];
+                            /* same prefix-causality gate hook as the serial branch. */
+                            if (ctx->mtp_force_draft_tok >= 0) {
+                                const int fv = ctx->mtp_force_draft_tok;
+                                const uint32_t from = ctx->mtp_force_draft_from > 0
+                                                      ? (uint32_t)ctx->mtp_force_draft_from : 0u;
+                                for (uint32_t j = from; j < Dspec; j++)
+                                    dbuf[b * DS4_CONT_MTP_MAX_DEPTH + j] = fv;
+                            }
+                            ndr[b] = Dspec;
+                        }
+                    }
+                } else {
                 for (uint32_t b = 0; ok && b < MS; b++) {
                     ndr[b] = 0u;
                     if (!live[b] || cfirst[b] == UINT32_MAX) continue;
@@ -28036,6 +28122,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         for (int j = from; j < n; j++) dbuf[b * DS4_CONT_MTP_MAX_DEPTH + j] = fv;
                     }
                     ndr[b] = (uint32_t)(n > 0 ? n : 0);
+                }
                 }
                 g->batch_multiseq = sav_ms; g->batch_multiseq_emit = sav_em; g->batch_multiseq_prefilled = sav_pf;
             }
