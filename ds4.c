@@ -9967,7 +9967,12 @@ static void metal_graph_raw_window_for_batch(
         uint32_t n = g->batch_max_seq_len;
         if (n > g->raw_cap) n = g->raw_cap;
         *out_n_raw = n;
-        *out_raw_start = 0u;
+        /* R2 (raw-ring shrink): once the frontier passes raw_cap the primed
+         * prefix rings, so the superset window is the LAST raw_cap positions,
+         * linearized from frontier % raw_cap.  No-wrap (frontier <= raw_cap,
+         * every legacy config) keeps the historical raw_start = 0.  The per-row
+         * positions[]/seq_id[] still clamp each row inside this superset. */
+        *out_raw_start = (g->batch_max_seq_len - n) % g->raw_cap;
         return;
     }
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, raw_span_n);
@@ -14742,8 +14747,22 @@ static bool metal_graph_encode_layer_attention_batch(
      * multi-seq mode -- each seq lands in its own bank (offset seq_id*raw_cap),
      * so the packed n_tokens (Σ seq lens) may exceed raw_cap as long as the
      * longest single seq (batch_max_seq_len) fits.  Zero (decode/single-seq) =>
-     * raw_fit == n_tokens, leaving every existing guard byte-identical. */
-    const uint32_t raw_fit = g->batch_max_seq_len ? g->batch_max_seq_len : n_tokens;
+     * raw_fit == n_tokens, leaving every existing guard byte-identical.
+     * R2 (raw-ring shrink): the batch also fits when it RINGS -- a batch whose
+     * per-bank row count plus the SWA window fits the ring never evicts a slot
+     * any of its rows still read (writes at pos clobber pos-raw_cap, which is
+     * window-stale for every query in the batch).  n_tokens bounds the per-bank
+     * row count, so min(batch_max_seq_len, n_tokens + raw_window) <= raw_cap
+     * accepts either regime: fresh-primed no-wrap (the proven B0 case, frontier
+     * <= raw_cap) OR ring wrap (chunked admission past the ring, frontier
+     * unbounded).  Legacy configs always satisfied the first arm, so the min
+     * never changes a legacy guard outcome. */
+    uint32_t raw_fit = n_tokens;
+    if (g->batch_max_seq_len) {
+        raw_fit = g->batch_max_seq_len;
+        const uint32_t ring_fit = n_tokens + g->raw_window;
+        if (ring_fit < raw_fit) raw_fit = ring_fit;
+    }
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
     const bool q_stage_profile = getenv("DS4_METAL_Q_STAGE_PROFILE") != NULL;
@@ -22850,7 +22869,17 @@ static bool bg_prefill_bank_at(ds4_gpu_graph *g, const ds4_model *model, const d
         free(qtokens); free(pos_arr); free(sid_arr); free(pf);
         return ok;
     }
-    const uint32_t cap = W < g->prefill_cap ? W : g->prefill_cap;
+    uint32_t cap = W < g->prefill_cap ? W : g->prefill_cap;
+    /* R2 (raw-ring shrink): a chunk of n rows into one bank evicts ring slots
+     * [pos-raw_cap] for each written pos; the earliest row's SWA window stays
+     * intact iff n + raw_window <= raw_cap.  The ctx sizes raw_cap as
+     * align256(raw_window + chunk) so this clamp is a no-op at defaults; it
+     * protects env-forced combos (DS4_METAL_GRAPH_RAW_CAP sweeps). */
+    {
+        const uint32_t ring_budget =
+            g->raw_cap > g->raw_window ? g->raw_cap - g->raw_window : 1u;
+        if (cap > ring_budget) cap = ring_budget;
+    }
     int32_t *pos_arr = xmalloc((size_t)cap * sizeof(int32_t));
     int32_t *sid_arr = xmalloc((size_t)cap * sizeof(int32_t));
     bool ok = pos_arr && sid_arr;
@@ -27093,9 +27122,18 @@ struct ds4_batch_ctx {
     uint32_t        rollback_verify_fails;
     uint32_t        ctx_size;
     uint32_t        prefill_cap;   /* = max_total_tokens (ragged Σlen cap) */
-    uint32_t        raw_cap;       /* SWA raw ring (per-seq prompt+budget bound) */
+    uint32_t        raw_cap;       /* SWA raw ring ROWS per bank (R2: ring only --
+                                    * align256(raw_window + admission chunk) when
+                                    * chunking; sequence bounds live in seq_cap) */
+    /* R2 (raw-ring shrink): per-bank committed-token bound (admit + decode
+     * budget + bank_hist capacity).  Chunked admission rings the raw slab, so
+     * the frontier is bounded by the COMPRESSED caches (sized by ctx_size),
+     * not the raw ring: seq_cap = ctx_size.  Legacy one-shot admission
+     * (DS4_CONT_PREFILL_CHUNK=0) keeps seq_cap = raw_cap -- every clamp,
+     * stride and allocation byte-identical to pre-R2. */
+    uint32_t        seq_cap;
     uint32_t        max_seq;       /* max sequences per batch */
-    /* A2a warm start: per-bank committed token history.  bank_hist[b*raw_cap..]
+    /* A2a warm start: per-bank committed token history.  bank_hist[b*seq_cap..]
      * holds EXACTLY the tokens whose KV is committed in bank b, in order --
      * appended at the same points the cache commits (cold prefill, decode
      * forward, spec-accept kept rows, warm suffix prefill) and reset with the
@@ -27125,13 +27163,25 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
     if (!e->metal_ready) { BC_ERR("batch_ctx_create: graph backend unavailable"); return 1; }
 
     const uint32_t prefill_cap = (uint32_t)max_total_tokens;
-    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    /* R2 (raw-ring shrink): with chunked admission (W > 0) no single forward
+     * ever lands more than min(W, prefill_cap) rows in one bank, so the per-bank
+     * raw slab only needs the SWA window + one chunk (the serial path has run
+     * this exact window+chunk wrapping ring for years); rows past the ring are
+     * evicted by position mod, and only the compressed caches (ctx-sized) bound
+     * the sequence.  W == 0 (legacy one-shot) keeps the pre-R2 sizing, where the
+     * ring must hold a whole admission with no wrap.  On GB10/Flash this is
+     * 4352 rows (~383 MB/bank raw) at the default W=4096 vs 8192 (~722 MB). */
+    const uint32_t chunk_w = bg_prefill_chunk_tokens();
+    uint32_t raw_sizing_width = prefill_cap;
+    if (chunk_w != 0 && chunk_w < raw_sizing_width) raw_sizing_width = chunk_w;
+    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, raw_sizing_width);
 
     ds4_batch_ctx *ctx = xcalloc(1, sizeof(*ctx));
     ctx->e = e;
     ctx->ctx_size = (uint32_t)ctx_size;
     ctx->prefill_cap = prefill_cap;
     ctx->raw_cap = raw_cap;
+    ctx->seq_cap = chunk_w != 0 ? (uint32_t)ctx_size : raw_cap;
     ctx->max_seq = (uint32_t)max_seq;
     ctx->mtp_force_draft_tok = -1;          /* S1.1 gate hook: off in production */
     ctx->mtp_force_draft_from = 0;
@@ -27179,8 +27229,9 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
         free(ctx);
         return 1;
     }
-    /* A2a: per-bank committed-history records (host-side, tiny vs the slabs). */
-    ctx->bank_hist       = xmalloc((size_t)ctx->max_seq * raw_cap * sizeof(int));
+    /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
+     * R2: sized by seq_cap (the committed-token bound), not the raw ring. */
+    ctx->bank_hist       = xmalloc((size_t)ctx->max_seq * ctx->seq_cap * sizeof(int));
     ctx->bank_hist_len   = xcalloc(ctx->max_seq, sizeof(uint32_t));
     ctx->bank_hist_valid = xcalloc(ctx->max_seq, sizeof(uint8_t));
     *out = ctx;
@@ -27212,8 +27263,8 @@ static void bank_hist_invalidate_all(ds4_batch_ctx *ctx) {
 }
 static void bank_hist_append(ds4_batch_ctx *ctx, uint32_t b, int tok) {
     if (!ctx->bank_hist_valid[b]) return;
-    if (ctx->bank_hist_len[b] >= ctx->raw_cap) { ctx->bank_hist_valid[b] = 0u; return; }
-    ctx->bank_hist[(size_t)b * ctx->raw_cap + ctx->bank_hist_len[b]++] = tok;
+    if (ctx->bank_hist_len[b] >= ctx->seq_cap) { ctx->bank_hist_valid[b] = 0u; return; }
+    ctx->bank_hist[(size_t)b * ctx->seq_cap + ctx->bank_hist_len[b]++] = tok;
 }
 static void bank_hist_append_n(ds4_batch_ctx *ctx, uint32_t b, const int *tok, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) bank_hist_append(ctx, b, tok[i]);
@@ -27223,8 +27274,9 @@ static void bank_hist_append_n(ds4_batch_ctx *ctx, uint32_t b, const int *tok, u
  * guarantees both banks are idle (no live row) and src's history is valid; the
  * admit pass runs between fully-synchronized forwards, so the synchronous D2D
  * copies are race-free.  Copies, per layer, exactly the committed extent: raw
- * ring rows [0,P) (P = src committed length; the cont path never wraps the
- * ring), compressed attn/index cache rows [0,ms_n_comp)/[0,ms_n_index_comp),
+ * ring rows [0, min(P, raw_cap)) (P = src committed length; R2: past raw_cap
+ * the ring has wrapped and every slot is live, so the whole bank is the
+ * committed extent), compressed attn/index cache rows [0,ms_n_comp)/[0,ms_n_index_comp),
  * and the compressor running-state lanes whole (the in-progress pooling
  * group); then mirrors the host row counters and the committed history.  dst
  * rows beyond the copied extent stay stale -- invisible, reads clamp to the
@@ -27235,7 +27287,8 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
     ds4_batch_slabs *sl = &ctx->sl;
     ds4_gpu_graph   *g  = &ctx->g;
     const uint64_t P = ctx->bank_hist_len[src];
-    const uint64_t raw_bytes = P * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t raw_rows = P < ctx->raw_cap ? P : (uint64_t)ctx->raw_cap;
+    const uint64_t raw_bytes = raw_rows * DS4_N_HEAD_DIM * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (raw_bytes &&
             ds4_gpu_tensor_copy(sl->multi_raw[il], (uint64_t)dst * sl->raw_bank_bytes,
@@ -27268,8 +27321,8 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
         g->ms_n_comp[dst][il]       = g->ms_n_comp[src][il];
         g->ms_n_index_comp[dst][il] = g->ms_n_index_comp[src][il];
     }
-    memcpy(ctx->bank_hist + (size_t)dst * ctx->raw_cap,
-           ctx->bank_hist + (size_t)src * ctx->raw_cap, (size_t)P * sizeof(int));
+    memcpy(ctx->bank_hist + (size_t)dst * ctx->seq_cap,
+           ctx->bank_hist + (size_t)src * ctx->seq_cap, (size_t)P * sizeof(int));
     ctx->bank_hist_len[dst]   = (uint32_t)P;
     ctx->bank_hist_valid[dst] = 1u;
     return true;
@@ -27279,12 +27332,20 @@ int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int *
     if (toks) *toks = NULL;
     if (!ctx || bank < 0 || (uint32_t)bank >= ctx->max_seq) return 0;
     if (!ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0u) return 0;
-    if (toks) *toks = ctx->bank_hist + (size_t)bank * ctx->raw_cap;
+    if (toks) *toks = ctx->bank_hist + (size_t)bank * ctx->seq_cap;
     return (int)ctx->bank_hist_len[bank];
 }
 
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) {
     return ctx ? (int)ctx->raw_cap : 0;
+}
+
+/* R2: per-bank committed-token bound of the continuous path (admit pre-check +
+ * decode budget).  With chunked admission the raw ring wraps, so this is the
+ * ctx size, NOT the ring rows; legacy one-shot (DS4_CONT_PREFILL_CHUNK=0)
+ * returns raw_cap, the historical bound. */
+int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) {
+    return ctx ? (int)ctx->seq_cap : 0;
 }
 
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
@@ -27965,7 +28026,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     const ds4_model   *model   = &ctx->e->model;
     const ds4_weights *weights = &ctx->e->weights;
     const uint32_t     MS      = ctx->max_seq;
-    const uint32_t     raw_cap = ctx->raw_cap;
+    /* R2: per-bank committed-token bound -- admit guard, decode budget, MTP
+     * verify frontier, bank_hist stride.  == raw_cap in legacy one-shot mode
+     * (DS4_CONT_PREFILL_CHUNK=0); == ctx_size with chunked admission (the raw
+     * ring wraps, the compressed caches bound the sequence). */
+    const uint32_t     seq_cap = ctx->seq_cap;
     const int          dflt_eos = ctx->e->vocab.eos_id;
 
     /* Per-bank rolling state (indexed by absolute bank id). */
@@ -28087,7 +28152,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             memset(&req, 0, sizeof(req));
             req.eos = -1;
             if (!admit(ud, &req)) { admit_drained = true; break; }
-            if (!req.tokens || req.n <= 0 || (uint32_t)req.n > raw_cap) {
+            if (!req.tokens || req.n <= 0 || (uint32_t)req.n > seq_cap) {
                 on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
                 continue;
             }
@@ -28116,7 +28181,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 fork = fs >= 0 && fs < (int)MS && !live[fs] && ctx->bank_hist_valid[fs] &&
                        (uint32_t)req.n_cached == ctx->bank_hist_len[fs] &&
                        L > (uint32_t)req.n_cached &&
-                       memcmp(req.tokens, ctx->bank_hist + (size_t)fs * raw_cap,
+                       memcmp(req.tokens, ctx->bank_hist + (size_t)fs * seq_cap,
                               (size_t)req.n_cached * sizeof(int)) == 0;
                 if (fork && (uint32_t)fs == b) { fork = false; warm = true; }
                 if (fork || warm) ctx->fork_admits++; else ctx->fork_rejects++;
@@ -28125,12 +28190,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 warm = pb >= 0 && b == (uint32_t)pb && ctx->bank_hist_valid[b] &&
                        (uint32_t)req.n_cached == ctx->bank_hist_len[b] &&
                        L > (uint32_t)req.n_cached &&
-                       memcmp(req.tokens, ctx->bank_hist + (size_t)b * raw_cap,
+                       memcmp(req.tokens, ctx->bank_hist + (size_t)b * seq_cap,
                               (size_t)req.n_cached * sizeof(int)) == 0;
                 if (warm) ctx->warm_admits++; else ctx->warm_rejects++;
             }
             uint32_t mn = req.max_new > 0 ? (uint32_t)req.max_new : 1u;
-            const uint32_t cap = raw_cap > L ? raw_cap - L : 1u;   /* no ring wrap */
+            const uint32_t cap = seq_cap > L ? seq_cap - L : 1u;   /* frontier bound (R2: ring wraps; comp caches bound the seq) */
             if (mn > cap) mn = cap;
             if (fork) {
                 /* fork: D2D-clone the source bank's committed state into b, then
@@ -28248,8 +28313,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 if (!live[b]) continue;
                 uint32_t nd = ndr[b];
                 if (nd > Dspec) nd = Dspec;
-                /* keep every row inside the raw ring (no wrap) and the forward's row cap. */
-                while (nd > 0u && (posv[b] + nd >= raw_cap || K2 + 1u + nd > vcap_rows)) nd--;
+                /* keep every row inside the per-seq frontier bound and the forward's row cap. */
+                while (nd > 0u && (posv[b] + nd >= seq_cap || K2 + 1u + nd > vcap_rows)) nd--;
                 vfirst[b] = K2; vnr[b] = nd;
                 vqtok[K2] = cur[b]; vpos[K2] = (int32_t)posv[b]; vsid[K2] = (int32_t)b;
                 g->ms_positions[K2] = vpos[K2]; g->ms_seq_id[K2] = vsid[K2];
@@ -28778,7 +28843,7 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
     if (N > ctx->max_seq) N = ctx->max_seq;
     if (L < 1u) L = 1u;
     const uint32_t maxplen = L + 3u;                 /* plen[s] = L + (s & 3) */
-    if (maxplen + T > ctx->raw_cap) T = ctx->raw_cap > maxplen + 1u ? ctx->raw_cap - maxplen : 1u;
+    if (maxplen + T > ctx->seq_cap) T = ctx->seq_cap > maxplen + 1u ? ctx->seq_cap - maxplen : 1u;   /* R2: admit bound, not ring rows */
     if (T < 1u) T = 1u;
 
     int      **prompts = xcalloc(N, sizeof(int *));
@@ -29129,15 +29194,15 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
     double smax_rel = 0.0, emax_rel = 0.0;
     uint64_t wa0, wr0, fa0, fr0;
     int *o1[2] = {0}, *o2[2] = {0}; uint32_t l1[2] = {0}, l2[2] = {0};
-    int *hist = xmalloc((size_t)ctx->raw_cap * sizeof(int));      /* committed-history snapshot */
-    int *full = xmalloc((size_t)ctx->raw_cap * sizeof(int));      /* effective prompt scratch */
+    int *hist = xmalloc((size_t)ctx->seq_cap * sizeof(int));      /* committed-history snapshot (R2: hist bound = seq_cap) */
+    int *full = xmalloc((size_t)ctx->seq_cap * sizeof(int));      /* effective prompt scratch */
     int *fD1 = NULL, *fD2 = NULL, *trunk = NULL;
     const uint32_t L = (uint32_t)tA.len;
     const int *pA = tA.v;
     if (tA.len <= 0 || tD1.len <= 0 || tD2.len <= 0 || sA.len <= 0 || sB.len <= 0 ||
         sC.len <= 0 || sD1.len <= 0 || sD2.len <= 0 ||
-        L + 4u * T + (uint32_t)(sA.len + sB.len + sC.len + sD1.len) + 16u > ctx->raw_cap) {
-        WGATE_ERR("cont_warm_gate: prompt construction failed (raw_cap=%u)", ctx->raw_cap);
+        L + 4u * T + (uint32_t)(sA.len + sB.len + sC.len + sD1.len) + 16u > ctx->seq_cap) {
+        WGATE_ERR("cont_warm_gate: prompt construction failed (seq_cap=%u)", ctx->seq_cap);
         rc = 2; goto done;
     }
 
@@ -29461,6 +29526,7 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
 }
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) { (void)ctx; }
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {

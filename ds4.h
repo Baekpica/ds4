@@ -200,10 +200,17 @@ typedef struct ds4_batch_ctx ds4_batch_ctx;
 int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                           ds4_batch_ctx **out, char *err, size_t errlen);
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx);
-/* Per-sequence prompt+budget bound of the persistent ctx (the SWA raw ring): a
- * single sequence's prompt length must be <= this for the batch/continuous path
- * (no ring wrap).  Returns 0 if ctx is NULL. */
+/* SWA raw ring rows per bank of the persistent ctx.  R2: this is the RING size
+ * only -- the STATIC batch path (ds4_engine_batched_generate_ctx) still bounds
+ * prompt+budget by it (one-shot prefill, no wrap), but the continuous path's
+ * per-sequence bound is ds4_batch_ctx_seq_cap.  Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx);
+/* Per-sequence committed-token bound (prompt + generation) of the CONTINUOUS
+ * path: the admit pre-check + decode budget cap.  With chunked admission
+ * (DS4_CONT_PREFILL_CHUNK > 0, the default) the raw ring wraps and this is the
+ * ctx size; legacy one-shot admission (=0) keeps the historical raw-ring bound.
+ * Returns 0 if ctx is NULL. */
+int  ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx);
 /* Batched generation over a persistent context (W4); same semantics as
  * ds4_engine_batched_generate_ex but reuses ctx's graph + slabs.  n <= ctx max_seq,
  * Σ(prompt len) <= ctx max_total_tokens. Returns 0 on success. */

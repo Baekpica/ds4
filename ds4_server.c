@@ -11443,7 +11443,9 @@ typedef struct {
                             * cont_admit clears it once consumed, so a non-NULL value
                             * after the loop means the engine failed before its first
                             * admit -- the driver then runs it on the single path. */
-    int     raw_cap;       /* per-seq prompt cap of the ctx (peer admit pre-check) */
+    int     seq_cap;       /* per-seq prompt cap of the ctx (peer admit pre-check;
+                            * R2: the cont path's committed-token bound, not the
+                            * raw ring -- ds4_batch_ctx_seq_cap) */
     int     max_seq;       /* size of inflight[] */
     int     served;        /* sequences completed via on_done (observability) */
     /* In-flight set, indexed by an arbitrary free slot (NULL = empty).  At most
@@ -11540,7 +11542,7 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                                                            ptext + best_len,
                                                            &j->warm_prompt);
             if (j->warm_prompt.len > hl &&
-                j->warm_prompt.len <= ds4_batch_ctx_raw_cap(s->batch_ctx)) {
+                j->warm_prompt.len <= ds4_batch_ctx_seq_cap(s->batch_ctx)) {
                 req->tokens     = j->warm_prompt.v;
                 req->n          = j->warm_prompt.len;
                 req->n_cached   = hl;
@@ -11613,7 +11615,7 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
          * same FIFO discipline coalesce_gather uses, so nothing is starved. */
         pthread_mutex_lock(&s->mu);
         if (s->head && job_is_batchable(&s->head->req) &&
-            s->head->req.prompt.len > 0 && s->head->req.prompt.len <= cs->raw_cap) {
+            s->head->req.prompt.len > 0 && s->head->req.prompt.len <= cs->seq_cap) {
             j = s->head;
             s->head = j->next;
             if (!s->head) s->tail = NULL;
@@ -11983,7 +11985,7 @@ static void generate_continuous_jobs(server *s, job *first) {
     cont_sched cs;
     cs.s = s;
     cs.primed = first;
-    cs.raw_cap = ds4_batch_ctx_raw_cap(s->batch_ctx);
+    cs.seq_cap = ds4_batch_ctx_seq_cap(s->batch_ctx);
     cs.max_seq = s->batch_ctx_max_seq;
     cs.served = 0;
     cs.inflight = xmalloc((size_t)cs.max_seq * sizeof(job *));
@@ -12065,7 +12067,7 @@ static void *worker_main(void *arg) {
              * jobs (it writes one buffered response each), so a streaming job with
              * no continuous ctx goes to the single generate_job() stream path. */
             if (continuous && s->batch_ctx && j->req.prompt.len > 0 &&
-                j->req.prompt.len <= ds4_batch_ctx_raw_cap(s->batch_ctx)) {
+                j->req.prompt.len <= ds4_batch_ctx_seq_cap(s->batch_ctx)) {
                 generate_continuous_jobs(s, j);
             } else if (job_is_static_batchable(&j->req)) {
                 /* Static batched path: argmax-only + buffered, so temp>0 and
@@ -13011,8 +13013,10 @@ int main(int argc, char **argv) {
                         s.warm_fork = !(fe && fe[0] == '0' && fe[1] == '\0');
                     }
                     server_log(DS4_LOG_DEFAULT,
-                               "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d)%s",
+                               "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d seq_cap=%d)%s",
                                try_seq, cmaxtok, ds4_session_ctx(s.session),
+                               ds4_batch_ctx_raw_cap(s.batch_ctx),
+                               ds4_batch_ctx_seq_cap(s.batch_ctx),
                                try_seq < cmax ? " [reduced from requested to fit memory]" : "");
                     made = true;
                     break;
