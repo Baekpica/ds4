@@ -12856,6 +12856,22 @@ int main(int argc, char **argv) {
         return grc;
     }
 
+    /* A2a: deterministic warm-start gate -- run instead of serving when
+     * DS4_CONT_WARM_GATE is set.  Asserts warm (suffix-only) admits are
+     * token-identical to cold full prefills and that non-matching cached
+     * prefixes degrade to cold.  Needs only a batch ctx (no --mtp). */
+    if (getenv("DS4_CONT_WARM_GATE") != NULL) {
+        if (!s.batch_ctx) {
+            server_log(DS4_LOG_WARNING, "ds4-server: DS4_CONT_WARM_GATE set but no batch ctx; skipping");
+            return 2;
+        }
+        char gerr[256] = {0};
+        int grc = ds4_cont_warm_gate(s.batch_ctx, gerr, sizeof(gerr));
+        if (grc == 2) server_log(DS4_LOG_WARNING, "ds4-server: CONT_WARM_GATE setup error: %s", gerr);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: CONT_WARM_GATE rc=%d (0=PASS 1=MISMATCH 2=ERR)", grc);
+        return grc;
+    }
+
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
 

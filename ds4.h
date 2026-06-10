@@ -233,7 +233,28 @@ typedef struct {
     float      min_p;       /* relative floor; <0 => 0                         */
     uint64_t   seed;        /* per-seq RNG seed (caller resolves 0 if it wants */
                             /* distinct streams; 0 is a fixed, valid sequence) */
+    /* A2a warm start.  Zero-init = engine-managed cold admit (the W5..W7
+     * behavior, unchanged).  place_bank is a bank id + 1 placement directive
+     * (0 = engine picks the first free bank); it lets the caller route a
+     * request to a specific FREE bank -- warm continuation, or directed cold
+     * placement away from valuable retired banks.  n_cached > 0 requests a
+     * WARM admit into bank place_bank-1: tokens[0..n_cached) must equal that
+     * bank's committed history exactly (ENGINE-VALIDATED against its own
+     * per-bank record; any mismatch degrades to a cold reset, never reuses a
+     * non-matching cache), and only tokens[n_cached..n) are prefilled. */
+    int        place_bank;  /* bank id + 1; 0 = engine's choice               */
+    int        n_cached;    /* committed prefix length in bank place_bank-1;  */
+                            /* 0 = cold admit                                  */
+    int       *bank_used;   /* OUT (optional): engine writes the bank id this */
+                            /* request was placed in, at admit time           */
 } ds4_cont_request;
+/* A2a: a bank's committed token history (engine-authoritative bookkeeping for
+ * warm start).  *toks points at ctx-owned storage, valid until the next admit
+ * or reset that touches the bank; returns the committed length, 0 when the
+ * bank is out of range or its state is not reuse-trustworthy (engine failure,
+ * static-path reuse of the slabs, deferred-commit MTP path). */
+int  ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank,
+                                  const int **toks);
 /* admit: fill *req for the next waiting request and return 1; return 0 when none is
  *   available right now (the loop keeps decoding the active set and ends once the
  *   active set is empty AND admit returns 0).
@@ -258,6 +279,18 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
  * non-invasiveness/exactness proof (no server-timing / batch-composition confound).
  * Requires a ctx created with --mtp.  Returns 0 PASS, 1 token MISMATCH, 2 setup error. */
 int  ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen);
+
+/* Phase 2 A2a: deterministic warm-start gate.  Drives the continuous engine with
+ * fixed REAL-TEXT prompts (confident greedy margins, so cross-packing token
+ * comparison is meaningful) and asserts (a) STRUCTURAL: an isolated warm suffix
+ * prefill leaves the committed compressed-cache frontier (per-layer counts)
+ * exactly equal to a cold full prefill, at two group alignments; (b) a warm
+ * admit's token stream matches a cold full prefill of the same effective prompt,
+ * including a chained second warm turn and a LONG suffix; (c) a non-matching
+ * cached prefix is rejected and degrades to a byte-identical cold run; (d) two
+ * banks warm in one run with out-of-order placement directives.  Needs only a
+ * batch ctx (no --mtp).  Returns 0 PASS, 1 MISMATCH, 2 setup error. */
+int  ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen);
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
                                const char *output_path,

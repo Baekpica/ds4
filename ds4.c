@@ -22782,9 +22782,14 @@ static bool bg_reset_bank(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_t b) {
  * Requires the FULL slab already repointed [0,max_seq) so seq_id=b addresses bank b,
  * and batch_multiseq/batch_n_seq set by the caller.  Uses pos0=L (the seq_id-addressed
  * emit path -- pos0=0 would hit the zero_prefix branch that writes bank 0 + the global
- * scalar count).  Generalizes the core's ragged-prefill block to a single bank. */
-static bool bg_prefill_bank(ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
-                            uint32_t b, const int *tok, uint32_t L, float *last_logits) {
+ * scalar count).  Generalizes the core's ragged-prefill block to a single bank.
+ * A2a: pos_base > 0 prefills the rows at positions pos_base..pos_base+L-1 ON TOP of
+ * the bank's committed state (warm suffix prefill): the per-seq emit path appends to
+ * the bank's existing ms_n_comp counters and the retained in-progress pooling state,
+ * exactly as the mode-2 verify forward does at small widths. */
+static bool bg_prefill_bank_at(ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
+                               uint32_t b, const int *tok, uint32_t L, uint32_t pos_base,
+                               float *last_logits) {
     int     *qtokens = xmalloc((size_t)L * sizeof(int));
     int32_t *pos_arr = xmalloc((size_t)L * sizeof(int32_t));
     int32_t *sid_arr = xmalloc((size_t)L * sizeof(int32_t));
@@ -22792,7 +22797,7 @@ static bool bg_prefill_bank(ds4_gpu_graph *g, const ds4_model *model, const ds4_
     bool ok = qtokens && pos_arr && sid_arr && pf;
     for (uint32_t i = 0; ok && i < L; i++) {
         qtokens[i] = tok[i];
-        pos_arr[i] = (int32_t)i;
+        pos_arr[i] = (int32_t)(pos_base + i);
         sid_arr[i] = (int32_t)b;
         g->ms_positions[i] = pos_arr[i];
         g->ms_seq_id[i]    = sid_arr[i];
@@ -22801,8 +22806,8 @@ static bool bg_prefill_bank(ds4_gpu_graph *g, const ds4_model *model, const ds4_
     if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)L * sizeof(int32_t)) != 0;
     if (ok) {
         g->batch_multiseq_emit = true;
-        g->batch_max_seq_len = L;
-        ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, L, L, pf);
+        g->batch_max_seq_len = pos_base + L;
+        ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, pos_base + L, L, pf);
         g->batch_multiseq_emit = false;
         g->batch_max_seq_len = 0;
     }
@@ -22810,6 +22815,11 @@ static bool bg_prefill_bank(ds4_gpu_graph *g, const ds4_model *model, const ds4_
         memcpy(last_logits, pf + (uint64_t)(L - 1u) * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
     free(qtokens); free(pos_arr); free(sid_arr); free(pf);
     return ok;
+}
+
+static bool bg_prefill_bank(ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
+                            uint32_t b, const int *tok, uint32_t L, float *last_logits) {
+    return bg_prefill_bank_at(g, model, weights, b, tok, L, 0u, last_logits);
 }
 
 /* Core batched generation over a caller-owned graph.  Ragged-prefills the N
@@ -27002,6 +27012,18 @@ struct ds4_batch_ctx {
     uint32_t        prefill_cap;   /* = max_total_tokens (ragged Σlen cap) */
     uint32_t        raw_cap;       /* SWA raw ring (per-seq prompt+budget bound) */
     uint32_t        max_seq;       /* max sequences per batch */
+    /* A2a warm start: per-bank committed token history.  bank_hist[b*raw_cap..]
+     * holds EXACTLY the tokens whose KV is committed in bank b, in order --
+     * appended at the same points the cache commits (cold prefill, decode
+     * forward, spec-accept kept rows, warm suffix prefill) and reset with the
+     * bank.  valid=0 marks a bank whose GPU state is not reuse-trustworthy
+     * (engine failure mid-run, static-path slab reuse, deferred-commit MTP
+     * path); a warm admit against it degrades to cold. */
+    int            *bank_hist;       /* max_seq * raw_cap */
+    uint32_t       *bank_hist_len;   /* committed tokens per bank */
+    uint8_t        *bank_hist_valid;
+    uint64_t        warm_admits;     /* observability + gate hooks */
+    uint64_t        warm_rejects;    /* n_cached>0 admits that degraded to cold */
 };
 
 int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
@@ -27072,6 +27094,10 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
         free(ctx);
         return 1;
     }
+    /* A2a: per-bank committed-history records (host-side, tiny vs the slabs). */
+    ctx->bank_hist       = xmalloc((size_t)ctx->max_seq * raw_cap * sizeof(int));
+    ctx->bank_hist_len   = xcalloc(ctx->max_seq, sizeof(uint32_t));
+    ctx->bank_hist_valid = xcalloc(ctx->max_seq, sizeof(uint8_t));
     *out = ctx;
     return 0;
 #undef BC_ERR
@@ -27082,7 +27108,38 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     ds4_mtp_slabs_free(&ctx->msl, &ctx->g);   /* restores g->mtp_* before metal_graph_free; no-op if !mtp */
     ds4_batch_slabs_free(&ctx->sl, &ctx->g);
     metal_graph_free(&ctx->g);
+    free(ctx->bank_hist);
+    free(ctx->bank_hist_len);
+    free(ctx->bank_hist_valid);
     free(ctx);
+}
+
+/* A2a: per-bank committed-history bookkeeping.  The invariant these maintain:
+ * bank_hist[b][0..len) == the tokens whose KV is committed in bank b, in order.
+ * Appends happen exactly where the cache commits; anything that touches the
+ * bank slabs without this bookkeeping must invalidate. */
+static void bank_hist_reset(ds4_batch_ctx *ctx, uint32_t b) {
+    ctx->bank_hist_len[b] = 0u;
+    ctx->bank_hist_valid[b] = 1u;
+}
+static void bank_hist_invalidate_all(ds4_batch_ctx *ctx) {
+    memset(ctx->bank_hist_valid, 0, (size_t)ctx->max_seq);
+}
+static void bank_hist_append(ds4_batch_ctx *ctx, uint32_t b, int tok) {
+    if (!ctx->bank_hist_valid[b]) return;
+    if (ctx->bank_hist_len[b] >= ctx->raw_cap) { ctx->bank_hist_valid[b] = 0u; return; }
+    ctx->bank_hist[(size_t)b * ctx->raw_cap + ctx->bank_hist_len[b]++] = tok;
+}
+static void bank_hist_append_n(ds4_batch_ctx *ctx, uint32_t b, const int *tok, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) bank_hist_append(ctx, b, tok[i]);
+}
+
+int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int **toks) {
+    if (toks) *toks = NULL;
+    if (!ctx || bank < 0 || (uint32_t)bank >= ctx->max_seq) return 0;
+    if (!ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0u) return 0;
+    if (toks) *toks = ctx->bank_hist + (size_t)bank * ctx->raw_cap;
+    return (int)ctx->bank_hist_len[bank];
 }
 
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) {
@@ -27097,6 +27154,9 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
     if (!ctx || !prompts || !out) { BCG_ERR("batched_generate_ctx: null argument"); return 1; }
     if (n <= 0 || (uint32_t)n > ctx->max_seq) {
         BCG_ERR("batched_generate_ctx: n=%d out of [1,%u]", n, ctx->max_seq); return 1; }
+    /* A2a: the static path reuses ctx->sl banks without committed-history
+     * bookkeeping -- retired warm state is gone after this call. */
+    bank_hist_invalidate_all(ctx);
 
     ds4_engine *e = ctx->e;
     uint32_t max_len = 0, n_packed = 0;
@@ -27874,10 +27934,14 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (g_cont_prof) { g_cont_be_fwd_s = g_cont_be_post_s = 0.0; g_cont_be_calls = g_cont_be_rows = 0; }
     double t_sample_s = 0.0;
     while (ok) {
-        /* ---- ADMIT: fill free banks from the waiting queue. ---- */
+        /* ---- ADMIT: fill free banks from the waiting queue.  At most MS
+         * placements per pass (the outer loop re-enters immediately when
+         * everything finished at seed, matching the old per-bank bound). ---- */
         bool admit_drained = false;
-        for (uint32_t b = 0; ok && b < MS; b++) {
-            if (live[b]) continue;
+        for (uint32_t pass = 0; ok && pass < MS; pass++) {
+            uint32_t fb = MS;
+            for (uint32_t i = 0; i < MS; i++) if (!live[i]) { fb = i; break; }
+            if (fb == MS) break;                     /* no free bank */
             ds4_cont_request req;
             memset(&req, 0, sizeof(req));
             req.eos = -1;
@@ -27887,13 +27951,49 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 continue;
             }
             const uint32_t L = (uint32_t)req.n;
+            /* A2a placement: a directive (place_bank = bank id + 1) may target any
+             * FREE bank; otherwise (or if the target is live/out of range) use the
+             * scan's first free bank, the historical order. */
+            uint32_t b = fb;
+            const int pb = req.place_bank - 1;
+            if (pb >= 0 && pb < (int)MS && !live[pb]) b = (uint32_t)pb;
+            /* A2a warm admit: reuse the bank's committed cache and prefill ONLY the
+             * suffix iff the request's claimed cached prefix exactly matches the
+             * bank's committed history.  Engine-validated: a stale or buggy caller
+             * directive degrades to a cold reset, it can never reuse a cache that
+             * does not byte-match the prompt (cross-bank contamination is
+             * structurally impossible).  Full-frontier match only -- the committed
+             * cache is not truncatable (M3), so a partial prefix cannot be reused. */
+            bool warm = false;
+            if (req.n_cached > 0) {
+                warm = pb >= 0 && b == (uint32_t)pb && ctx->bank_hist_valid[b] &&
+                       (uint32_t)req.n_cached == ctx->bank_hist_len[b] &&
+                       L > (uint32_t)req.n_cached &&
+                       memcmp(req.tokens, ctx->bank_hist + (size_t)b * raw_cap,
+                              (size_t)req.n_cached * sizeof(int)) == 0;
+                if (warm) ctx->warm_admits++; else ctx->warm_rejects++;
+            }
             uint32_t mn = req.max_new > 0 ? (uint32_t)req.max_new : 1u;
             const uint32_t cap = raw_cap > L ? raw_cap - L : 1u;   /* no ring wrap */
             if (mn > cap) mn = cap;
+            if (warm) {
+                /* warm: NO reset -- prefill the suffix on top of the committed state. */
+                const uint32_t P = (uint32_t)req.n_cached, S = L - P;
+                if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
+                if (!bg_prefill_bank_at(g, model, weights, b, req.tokens + P, S, P, seedlog)) {
+                    ctx->bank_hist_valid[b] = 0u;    /* partial prefill: state unknown */
+                    ok = false; break;
+                }
+                bank_hist_append_n(ctx, b, req.tokens + P, S);
+            } else {
             /* reset bank b (repoints b,1), restore full slab, prefill into bank b. */
             if (!bg_reset_bank(&ctx->sl, g, b)) { ok = false; break; }
             if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
             if (!bg_prefill_bank(g, model, weights, b, req.tokens, L, seedlog)) { ok = false; break; }
+            bank_hist_reset(ctx, b);
+            bank_hist_append_n(ctx, b, req.tokens, L);
+            }
+            if (req.bank_used) *req.bank_used = (int)b;
             if (ctx->mtp) {
                 ctx->msl.mtp_n_raw[b] = 0u;             /* S1: fresh MTP ring for this admit */
                 /* Task #22 diag: level >= 2 re-poisons this bank's MTP ring rows so
@@ -28070,6 +28170,18 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     }
                 }
                 committed_rows[b] = M;
+                /* A2a: the M kept verify rows' input tokens are exactly what entered
+                 * the cache (the rollback below removes the rejected tail) -- append
+                 * them even for a just-evicted bank (its committed cache must reflect
+                 * only accepted tokens for reuse).  On the imperfect deferred-commit
+                 * path (D>2, or rollback forced off) the cache is NOT
+                 * reuse-trustworthy: invalidate instead. */
+                if (no_defer && !ctx->mtp_force_norollback) {
+                    for (uint32_t j = 0; j < M; j++)
+                        bank_hist_append(ctx, b, vqtok[f + j]);
+                } else {
+                    ctx->bank_hist_valid[b] = 0u;
+                }
             }
             /* 3b. ROLLBACK (M3): the verify forward emitted ALL packed rows in-forward; roll every
              * bank that accepted only M < (1+nd) of its (1+nd) rows back to its M-token prefix
@@ -28278,6 +28390,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             const int nt = sample_top_p_min_p(logits + (uint64_t)r * DS4_N_VOCAB, DS4_N_VOCAB,
                                               btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
             sampled[r] = nt;            /* S1.0b: probe compares draft0 against this */
+            bank_hist_append(ctx, b, qtokens[r]);   /* A2a: the forwarded token is now committed */
             gbuf[b][glen[b]] = nt;
             glen[b]++;
             cur[b] = nt;
@@ -28325,6 +28438,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             g->batch_multiseq_prefilled = sav_pf;
         }
     }
+
+    /* A2a: a failed run leaves bank GPU state mid-step -- nothing is reuse-trustworthy. */
+    if (!ok) bank_hist_invalidate_all(ctx);
 
     if (mtp_probe)
         fprintf(stderr, "ds4: CONT_MTP_PROBE drafts=%llu hits=%llu accept=%.1f%%\n",
@@ -28702,11 +28818,355 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
 #undef GATE_CMP
 #undef GATE_ERR
 }
+
+/* ====================== A2a deterministic warm-start gate ======================
+ * Engine-level proof of the warm-admit contract (see ds4.h ds4_cont_warm_gate):
+ * fixed synthetic prompts, greedy, no EOS, every run a fresh continuous_generate
+ * call so warm state must survive across calls.  Phases:
+ *   A  cold seed -> WARM short-suffix continuation vs directed-cold reference
+ *      (plus a cold-vs-cold CONTROL run bounding inherent batch FP nondeterminism)
+ *   B  CHAINED warm continuation with a LONG suffix (the new "many prefill rows on
+ *      top of committed state" width regime)
+ *   C  warm directive with a MUTATED cached token -> engine must reject (degrade
+ *      to cold) and match a cold reference byte-for-byte
+ *   D  two banks warm in ONE run with out-of-order placement directives
+ * PASS iff every warm/reject stream matches its cold reference within the control
+ * band, every placement landed where directed, and the warm/reject counters moved
+ * exactly as expected. */
+typedef struct {
+    const int *tokens; uint32_t n;
+    int place_bank;            /* bank id + 1; 0 = engine's choice */
+    int n_cached;              /* warm committed prefix; 0 = cold */
+    int bank_used;             /* OUT: engine-reported placement */
+} ds4_warm_gate_req;
+typedef struct {
+    ds4_warm_gate_req *reqs;
+    uint32_t N, cursor, T;
+    int **out; uint32_t *outlen;
+} ds4_warm_gate_ud;
+
+static int ds4_warm_gate_admit(void *ud, ds4_cont_request *req) {
+    ds4_warm_gate_ud *gu = ud;
+    if (gu->cursor >= gu->N) return 0;
+    ds4_warm_gate_req *r = &gu->reqs[gu->cursor];
+    const uint32_t s = gu->cursor++;
+    memset(req, 0, sizeof(*req));
+    req->tokens     = r->tokens;
+    req->n          = (int)r->n;
+    req->max_new    = (int)gu->T;
+    req->eos        = -1;          /* no EOS -> decode the full budget deterministically */
+    req->temperature = 0.0f;       /* greedy */
+    req->place_bank = r->place_bank;
+    req->n_cached   = r->n_cached;
+    req->bank_used  = &r->bank_used;
+    req->user       = (void *)(uintptr_t)s;
+    return 1;
+}
+static void ds4_warm_gate_on_done(void *ud, void *user, const int *tokens, int n, int finish) {
+    ds4_warm_gate_ud *gu = ud; (void)finish;
+    const uint32_t s = (uint32_t)(uintptr_t)user;
+    if (s >= gu->N || gu->out[s]) return;
+    const uint32_t m = n > 0 ? (uint32_t)n : 0u;
+    gu->out[s] = xmalloc((size_t)(m ? m : 1u) * sizeof(int));
+    if (m) memcpy(gu->out[s], tokens, (size_t)m * sizeof(int));
+    gu->outlen[s] = m;
+}
+static int ds4_warm_gate_run(ds4_batch_ctx *ctx, ds4_warm_gate_req *reqs, uint32_t N,
+                             uint32_t T, int **out, uint32_t *outlen,
+                             char *rerr, size_t rerrlen) {
+    for (uint32_t s = 0; s < N; s++) { out[s] = NULL; outlen[s] = 0u; reqs[s].bank_used = -1; }
+    ds4_warm_gate_ud gud = { reqs, N, 0u, T, out, outlen };
+    return ds4_engine_continuous_generate(ctx, ds4_warm_gate_admit, NULL,
+                                          ds4_warm_gate_on_done, &gud, rerr, rerrlen);
+}
+/* compare two single-seq token streams; log first divergence. */
+static uint32_t ds4_warm_gate_cmp(const char *label, const int *a, uint32_t la,
+                                  const int *b, uint32_t lb) {
+    uint32_t k = 0;
+    const uint32_t km = la < lb ? la : lb;
+    while (k < km && a[k] == b[k]) k++;
+    if (la == lb && k == km) return 0u;
+    fprintf(stderr, "ds4: CONT_WARM_GATE[%s] DIVERGE lenA=%u lenB=%u firstk=%u a=%d b=%d\n",
+            label, la, lb, k, k < la ? a[k] : -1, k < lb ? b[k] : -1);
+    return 1u;
+}
+
+/* dump bank 0's committed compressed cache (counts + values); caller frees. */
+static int ds4_warm_gate_dump(ds4_batch_ctx *ctx, float **vals, uint64_t *nf,
+                              uint32_t **cnts, uint32_t *nc) {
+    int ok = 0;
+    if (ds4_batch_slabs_repoint(&ctx->sl, &ctx->g, 0u, ctx->max_seq))
+        ok = mtp_cont_committed_read(&ctx->g, 1u, vals, nf, cnts, nc);
+    ds4_batch_slabs_restore(&ctx->sl, &ctx->g);
+    return ok;
+}
+
+int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
+#define WGATE_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
+    if (!ctx || !ctx->e) { WGATE_ERR("cont_warm_gate: null ctx"); return 2; }
+    if (ctx->max_seq < 2u) { WGATE_ERR("cont_warm_gate: needs max_seq >= 2"); return 2; }
+    ds4_engine *e = ctx->e;
+    const char *te = getenv("DS4_CONT_WARM_GATE_T");
+    uint32_t T  = te ? (uint32_t)atoi(te) : 24u;
+    if (T < 2u) T = 2u;
+
+    /* REAL-TEXT prompts.  Warm-vs-cold compares two different row PACKINGS of the
+     * same token sequence (suffix-only forward vs one full prefill), so near-tie
+     * argmax flips are the inherent cross-row FP class (M3/M4c: the committed
+     * cache is not value-invariant across packings; mode-0 N=1 vs N=4 streams
+     * differ legitimately).  Synthetic gibberish ids give near-uniform logits and
+     * flip constantly -- they gate nothing.  Confident counting text keeps greedy
+     * margins wide (the A1 byte-parity class), making token-stream equality a
+     * meaningful HARD assertion; the structural phase below gates the cache
+     * FRONTIER exactly, which packing FP cannot move. */
+    ds4_tokens tA = {0}, tD1 = {0}, tD2 = {0}, sA = {0}, sB = {0}, sC = {0},
+               sD1 = {0}, sD2 = {0};
+    ds4_tokenize_rendered_chat(e,
+        "Count upward by one, one number per line:\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"
+        "11\n12\n13\n14\n15\n16\n", &tA);
+    ds4_tokenize_rendered_chat(e,
+        "List the even numbers upward, one per line:\n2\n4\n6\n8\n10\n12\n14\n16\n18\n20\n", &tD1);
+    ds4_tokenize_rendered_chat(e,
+        "List the odd numbers upward, one per line:\n1\n3\n5\n7\n9\n11\n13\n15\n17\n19\n", &tD2);
+    ds4_tokenize_rendered_chat(e, "\nNow restart from 101:\n101\n102\n103\n104\n", &sA);
+    {   /* LONG suffix (the new "many prefill rows on committed state" regime). */
+        char *lb = xmalloc(8192);
+        size_t off = (size_t)snprintf(lb, 8192, "\nNow restart from 401:\n");
+        for (int v = 401; v <= 500; v++)
+            off += (size_t)snprintf(lb + off, 8192 - off, "%d\n", v);
+        ds4_tokenize_rendered_chat(e, lb, &sB);
+        free(lb);
+    }
+    ds4_tokenize_rendered_chat(e, "\nNow restart from 701:\n701\n702\n703\n", &sC);
+    ds4_tokenize_rendered_chat(e, "\nNow restart from 211:\n211\n212\n", &sD1);
+    ds4_tokenize_rendered_chat(e, "\nNow restart from 311:\n311\n312\n", &sD2);
+
+    const int saved_mode = ctx->mtp_draft_mode;
+    ctx->mtp_draft_mode = 0;     /* warm start is gated on the production mode-0 path */
+    char rerr[256] = {0};
+    int rc = 0;
+    uint32_t mismA = 0, mismB = 0, mismC = 0, mismD = 0, ctrl = 0, placebad = 0;
+    uint32_t sfrontier_bad = 0, sdumps = 0;
+    double smax_rel = 0.0;
+    uint64_t wa0, wr0;
+    int *o1[2] = {0}, *o2[2] = {0}; uint32_t l1[2] = {0}, l2[2] = {0};
+    int *hist = xmalloc((size_t)ctx->raw_cap * sizeof(int));      /* committed-history snapshot */
+    int *full = xmalloc((size_t)ctx->raw_cap * sizeof(int));      /* effective prompt scratch */
+    int *fD1 = NULL, *fD2 = NULL;
+    const uint32_t L = (uint32_t)tA.len;
+    const int *pA = tA.v;
+    if (tA.len <= 0 || tD1.len <= 0 || tD2.len <= 0 || sA.len <= 0 || sB.len <= 0 ||
+        sC.len <= 0 || sD1.len <= 0 || sD2.len <= 0 ||
+        L + 4u * T + (uint32_t)(sA.len + sB.len + sC.len) + 16u > ctx->raw_cap) {
+        WGATE_ERR("cont_warm_gate: prompt construction failed (raw_cap=%u)", ctx->raw_cap);
+        rc = 2; goto done;
+    }
+
+#define WGATE_RUN1(REQ, OUT, OL) do { \
+        ds4_warm_gate_req _r = (REQ); \
+        if (ds4_warm_gate_run(ctx, &_r, 1u, T, (OUT), (OL), rerr, sizeof(rerr)) != 0) { \
+            WGATE_ERR("cont_warm_gate: run failed: %s", rerr); rc = 2; goto done; } \
+        if (_r.bank_used != _r.place_bank - 1) placebad++; \
+    } while (0)
+#define WGATE_SNAP(BANK, EXPECT_LEN, PH) do { \
+        const int *_t = NULL; \
+        const int _hl = ds4_batch_ctx_bank_committed(ctx, (BANK), &_t); \
+        if (_hl <= 0 || (uint32_t)_hl != (EXPECT_LEN)) { \
+            WGATE_ERR("cont_warm_gate: phase %s: bank %d committed=%d want %u", \
+                      (PH), (BANK), _hl, (EXPECT_LEN)); rc = 2; goto done; } \
+        memcpy(hist, _t, (size_t)_hl * sizeof(int)); \
+    } while (0)
+
+    /* ---- Phase S: STRUCTURAL -- isolated suffix prefill (max_new=1, no decode
+     * steps) vs cold full prefill of the same tokens, at both ratio-group
+     * alignments.  The committed compressed-cache FRONTIER (per-layer counts)
+     * must be EXACTLY equal: a misplaced or missing emit moves it, packing FP
+     * cannot.  Values are compared informationally only (cross-packing FP band;
+     * MoE expert flips can spike single elements legitimately -- M3). */
+    for (uint32_t align = 0; align <= 1u; align++) {
+        const uint32_t seedT = 1u + align;
+        ds4_warm_gate_req rs = { pA, L, 1, 0, -1 };
+        if (ds4_warm_gate_run(ctx, &rs, 1u, seedT, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
+            WGATE_ERR("cont_warm_gate: phase S seed run failed: %s", rerr); rc = 2; goto done; }
+        free(o1[0]); o1[0] = NULL;
+        const uint32_t P = L + seedT - 1u;
+        WGATE_SNAP(0, P, "S");
+        memcpy(full, hist, (size_t)P * sizeof(int));
+        memcpy(full + P, sA.v, (size_t)sA.len * sizeof(int));
+        const uint32_t nS = P + (uint32_t)sA.len;
+        wa0 = ctx->warm_admits;
+        ds4_warm_gate_req rw = { full, nS, 1, (int)P, -1 };
+        if (ds4_warm_gate_run(ctx, &rw, 1u, 1u, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
+            WGATE_ERR("cont_warm_gate: phase S warm run failed: %s", rerr); rc = 2; goto done; }
+        free(o1[0]); o1[0] = NULL;
+        if (ctx->warm_admits != wa0 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase S warm admit not taken (align %u)", align); rc = 2; goto done; }
+        float *vw = NULL, *vc = NULL; uint32_t *cw = NULL, *cc = NULL;
+        uint64_t nfw = 0, nfc = 0; uint32_t ncw = 0, ncc = 0;
+        const int dok_w = ds4_warm_gate_dump(ctx, &vw, &nfw, &cw, &ncw);
+        ds4_warm_gate_req rcold = { full, nS, 1, 0, -1 };
+        if (ds4_warm_gate_run(ctx, &rcold, 1u, 1u, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
+            free(vw); free(cw);
+            WGATE_ERR("cont_warm_gate: phase S cold run failed: %s", rerr); rc = 2; goto done; }
+        free(o1[0]); o1[0] = NULL;
+        const int dok_c = ds4_warm_gate_dump(ctx, &vc, &nfc, &cc, &ncc);
+        if (dok_w && dok_c) {
+            int fsame; double mabs, mrel;
+            gate_cc_compare(vw, nfw, cw, ncw, vc, nfc, cc, ncc, &fsame, &mabs, &mrel);
+            sdumps++;
+            if (!fsame) sfrontier_bad++;
+            if (mrel > smax_rel) smax_rel = mrel;
+            fprintf(stderr, "ds4: CONT_WARM_GATE[S align%u] P=%u S=%d frontier=%s "
+                    "max_abs=%.3g max_rel=%.3g (values informational, cross-packing FP)\n",
+                    align, P, sA.len, fsame ? "same" : "DIFF", mabs, mrel);
+        } else {
+            fprintf(stderr, "ds4: CONT_WARM_GATE[S align%u] dump unavailable (comp cache not FP32?) -- skipped\n",
+                    align);
+        }
+        free(vw); free(cw); free(vc); free(cc);
+    }
+
+    /* ---- Phase A: cold seed, then warm short-suffix vs directed cold (+ control). */
+    {
+        ds4_warm_gate_req r0 = { pA, L, 1, 0, -1 };
+        WGATE_RUN1(r0, &o1[0], &l1[0]);
+        if (l1[0] != T) { WGATE_ERR("cont_warm_gate: seed run produced %u/%u tokens", l1[0], T); rc = 2; goto done; }
+        WGATE_SNAP(0, L + T - 1u, "A");
+        const uint32_t hl = L + T - 1u;
+        memcpy(full, hist, (size_t)hl * sizeof(int));
+        memcpy(full + hl, sA.v, (size_t)sA.len * sizeof(int));
+        const uint32_t n1 = hl + (uint32_t)sA.len;
+        free(o1[0]); o1[0] = NULL;
+        wa0 = ctx->warm_admits; wr0 = ctx->warm_rejects;
+        ds4_warm_gate_req rw = { full, n1, 1, (int)hl, -1 };
+        WGATE_RUN1(rw, &o1[0], &l1[0]);                            /* WARM */
+        if (ctx->warm_admits != wa0 + 1u || ctx->warm_rejects != wr0) {
+            WGATE_ERR("cont_warm_gate: phase A warm admit not taken (admits %llu->%llu rejects %llu->%llu)",
+                      (unsigned long long)wa0, (unsigned long long)ctx->warm_admits,
+                      (unsigned long long)wr0, (unsigned long long)ctx->warm_rejects);
+            rc = 2; goto done; }
+        ds4_warm_gate_req rc1 = { full, n1, 1, 0, -1 };
+        WGATE_RUN1(rc1, &o2[0], &l2[0]);                           /* directed COLD ref */
+        mismA = ds4_warm_gate_cmp("A warm-vs-cold", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL;
+        ds4_warm_gate_req rc2 = { full, n1, 1, 0, -1 };
+        WGATE_RUN1(rc2, &o1[0], &l1[0]);                           /* cold CONTROL */
+        ctrl = ds4_warm_gate_cmp("A cold-vs-cold ctrl", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
+
+        /* ---- Phase B: chained warm with a LONG suffix off the control run's state. */
+        WGATE_SNAP(0, n1 + T - 1u, "B");
+        const uint32_t h2 = n1 + T - 1u;
+        memcpy(full, hist, (size_t)h2 * sizeof(int));
+        memcpy(full + h2, sB.v, (size_t)sB.len * sizeof(int));
+        const uint32_t n2 = h2 + (uint32_t)sB.len;
+        wa0 = ctx->warm_admits;
+        ds4_warm_gate_req rw2 = { full, n2, 1, (int)h2, -1 };
+        WGATE_RUN1(rw2, &o1[0], &l1[0]);                           /* WARM, long suffix */
+        if (ctx->warm_admits != wa0 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase B warm admit not taken"); rc = 2; goto done; }
+        ds4_warm_gate_req rc3 = { full, n2, 1, 0, -1 };
+        WGATE_RUN1(rc3, &o2[0], &l2[0]);                           /* directed COLD ref */
+        mismB = ds4_warm_gate_cmp("B warm-long-vs-cold", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
+
+        /* ---- Phase C: mutated cached token -> reject (degrade to cold), match cold. */
+        WGATE_SNAP(0, n2 + T - 1u, "C");
+        const uint32_t h3 = n2 + T - 1u;
+        memcpy(full, hist, (size_t)h3 * sizeof(int));
+        full[5] = full[5] == 777 ? 778 : 777;                      /* corrupt the cached region */
+        memcpy(full + h3, sC.v, (size_t)sC.len * sizeof(int));
+        const uint32_t n3 = h3 + (uint32_t)sC.len;
+        wa0 = ctx->warm_admits; wr0 = ctx->warm_rejects;
+        ds4_warm_gate_req rr = { full, n3, 1, (int)h3, -1 };
+        WGATE_RUN1(rr, &o1[0], &l1[0]);                            /* must DEGRADE to cold */
+        if (ctx->warm_admits != wa0 || ctx->warm_rejects != wr0 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase C mutated prefix was NOT rejected"); rc = 2; goto done; }
+        ds4_warm_gate_req rc4 = { full, n3, 1, 0, -1 };
+        WGATE_RUN1(rc4, &o2[0], &l2[0]);                           /* directed COLD ref */
+        mismC = ds4_warm_gate_cmp("C reject-vs-cold", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
+    }
+
+    /* ---- Phase D: two banks warm in ONE run, out-of-order placement directives. */
+    {
+        const uint32_t LD1 = (uint32_t)tD1.len, LD2 = (uint32_t)tD2.len;
+        ds4_warm_gate_req seedD[2] = {
+            { tD1.v, LD1, 1, 0, -1 },
+            { tD2.v, LD2, 2, 0, -1 },
+        };
+        if (ds4_warm_gate_run(ctx, seedD, 2u, T, o1, l1, rerr, sizeof(rerr)) != 0) {
+            WGATE_ERR("cont_warm_gate: phase D seed run failed: %s", rerr); rc = 2; goto done; }
+        if (seedD[0].bank_used != 0 || seedD[1].bank_used != 1) placebad++;
+        free(o1[0]); free(o1[1]); o1[0] = o1[1] = NULL;
+        const uint32_t hD1 = LD1 + T - 1u, hD2 = LD2 + T - 1u;
+        WGATE_SNAP(0, hD1, "D");
+        fD1 = xmalloc((size_t)(hD1 + (uint32_t)sD1.len) * sizeof(int));
+        memcpy(fD1, hist, (size_t)hD1 * sizeof(int));
+        memcpy(fD1 + hD1, sD1.v, (size_t)sD1.len * sizeof(int));
+        WGATE_SNAP(1, hD2, "D2");
+        fD2 = xmalloc((size_t)(hD2 + (uint32_t)sD2.len) * sizeof(int));
+        memcpy(fD2, hist, (size_t)hD2 * sizeof(int));
+        memcpy(fD2 + hD2, sD2.v, (size_t)sD2.len * sizeof(int));
+        wa0 = ctx->warm_admits;
+        ds4_warm_gate_req warmD[2] = {                /* bank 1 FIRST: out-of-order */
+            { fD2, hD2 + (uint32_t)sD2.len, 2, (int)hD2, -1 },
+            { fD1, hD1 + (uint32_t)sD1.len, 1, (int)hD1, -1 },
+        };
+        if (ds4_warm_gate_run(ctx, warmD, 2u, T, o1, l1, rerr, sizeof(rerr)) != 0) {
+            WGATE_ERR("cont_warm_gate: phase D warm run failed: %s", rerr); rc = 2; goto done; }
+        if (ctx->warm_admits != wa0 + 2u) {
+            WGATE_ERR("cont_warm_gate: phase D expected 2 warm admits"); rc = 2; goto done; }
+        if (warmD[0].bank_used != 1 || warmD[1].bank_used != 0) placebad++;
+        ds4_warm_gate_req coldD[2] = {
+            { fD2, hD2 + (uint32_t)sD2.len, 2, 0, -1 },
+            { fD1, hD1 + (uint32_t)sD1.len, 1, 0, -1 },
+        };
+        if (ds4_warm_gate_run(ctx, coldD, 2u, T, o2, l2, rerr, sizeof(rerr)) != 0) {
+            WGATE_ERR("cont_warm_gate: phase D cold run failed: %s", rerr); rc = 2; goto done; }
+        mismD = ds4_warm_gate_cmp("D bank1 warm-vs-cold", o1[0], l1[0], o2[0], l2[0]) +
+                ds4_warm_gate_cmp("D bank0 warm-vs-cold", o1[1], l1[1], o2[1], l2[1]);
+    }
+
+    /* PASS iff the structural frontier is exact, no warm/reject stream diverges
+     * beyond the inherent control band, and every directive landed in its bank. */
+    rc = (sfrontier_bad == 0u && mismA <= ctrl && mismB <= ctrl && mismC <= ctrl &&
+          mismD <= 2u * ctrl && placebad == 0u) ? 0 : 1;
+    fprintf(stderr, "ds4: CONT_WARM_GATE T=%u L=%u sA=%d sB=%d ctrl=%u "
+            "S(frontier_bad=%u/%u max_rel=%.3g) A=%u B=%u C=%u D=%u placebad=%u "
+            "warm_admits=%llu warm_rejects=%llu -> %s\n",
+            T, L, sA.len, sB.len, ctrl, sfrontier_bad, sdumps, smax_rel,
+            mismA, mismB, mismC, mismD, placebad,
+            (unsigned long long)ctx->warm_admits, (unsigned long long)ctx->warm_rejects,
+            rc == 0 ? "PASS" : "FAIL");
+
+done:
+    ctx->mtp_draft_mode = saved_mode;
+    free(o1[0]); free(o1[1]); free(o2[0]); free(o2[1]);
+    free(hist); free(full); free(fD1); free(fD2);
+    ds4_tokens_free(&tA); ds4_tokens_free(&tD1); ds4_tokens_free(&tD2);
+    ds4_tokens_free(&sA); ds4_tokens_free(&sB); ds4_tokens_free(&sC);
+    ds4_tokens_free(&sD1); ds4_tokens_free(&sD2);
+    return rc;
+#undef WGATE_SNAP
+#undef WGATE_RUN1
+#undef WGATE_ERR
+}
 #else  /* DS4_NO_GPU: graph backend absent -- stubs that fail cleanly. */
 int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
     (void)ctx;
     if (err && errlen) snprintf(err, errlen, "cont_mtp_gate: build has no graph backend");
     return 2;
+}
+int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
+    (void)ctx;
+    if (err && errlen) snprintf(err, errlen, "cont_warm_gate: build has no graph backend");
+    return 2;
+}
+int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int **toks) {
+    (void)ctx; (void)bank;
+    if (toks) *toks = NULL;
+    return 0;
 }
 int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                          ds4_batch_ctx **out, char *err, size_t errlen) {
