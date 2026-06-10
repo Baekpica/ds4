@@ -478,6 +478,14 @@ __global__ static void dequant_q8_0_to_f32_kernel(
         uint64_t out_dim,
         uint64_t blocks);
 
+/* Captured decode graphs (g_layer_graphs / g_dense_graphs / g_moe_graphs)
+ * bake raw device pointers into their kernel-node arg lists, including the
+ * sticky high-water scratch buffers below.  Freeing such a buffer for
+ * growth leaves every cached exec holding a dangling pointer; the next
+ * replay reads freed memory (CUDA illegal memory access).  Defined after
+ * the three cache tables; forward-declared here for the allocators. */
+static void ds4_cuda_invalidate_captured_graphs(const char *why);
+
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     /* Task #22 diag (DS4_CUDA_TMP_PREALLOC_MB): floor the shared scratch so it
@@ -497,6 +505,16 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes < floor_bytes) bytes = floor_bytes;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
     if (g_cuda_tmp) {
+        /* Growth frees a pointer that cached captured graphs may have
+         * baked at capture time (decode-body consumers: indexer topk
+         * tree scratch, topk sort, q8 prequant).  An EAGER prefill of a
+         * new-max prompt length lands here mid-session; without the
+         * invalidation the next decode replays against freed memory.
+         * Repro: serial server, full re-prefill longer than every prior
+         * prefill, first decode after it dies (2026-06-11 serial-conc
+         * crash).  Resizes are rare (sticky high-water), so the
+         * recapture cost decays to zero. */
+        ds4_cuda_invalidate_captured_graphs(what ? what : "cuda_tmp resize");
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
@@ -6258,6 +6276,9 @@ static float *fp8_predecode_scratch_alloc(uint64_t bytes) {
         return NULL;
     }
     if (g_fp8_predecode_scratch) {
+        /* Same dangling-baked-pointer hazard as cuda_tmp_alloc: cached
+         * captured graphs may reference the buffer being retired. */
+        ds4_cuda_invalidate_captured_graphs("fp8 predecode scratch resize");
         (void)cudaFree(g_fp8_predecode_scratch);
     }
     g_fp8_predecode_scratch = ptr;
@@ -10539,6 +10560,52 @@ extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
  * appears later, switch to __thread / thread_local. */
 static struct layer_graph_entry *g_layer_graph_capturing_slot = NULL;
 static uint32_t                  g_layer_graph_capturing_il   = UINT32_MAX;
+
+/* Drop every cached captured graph (layer / dense-vec / routed-MoE).
+ * Called by the sticky-scratch allocators right before they cudaFree a
+ * buffer whose address may be baked into cached execs.  Callers run
+ * eagerly outside capture (capture-time growth is prevented by the
+ * warmup pre-sizing) and outside replay (decode-time requests stay under
+ * the warm floor, so resizes only happen from prefill, after the prior
+ * token's end-of-token device sync) -- no exec can be in flight here.
+ * The layer slots keep `warmed`: the scratch only ever grows, so the
+ * lazy-alloc sizing the warm pass established still holds and the next
+ * sighting of each key recaptures directly against the new pointer. */
+static void ds4_cuda_invalidate_captured_graphs(const char *why) {
+    if (g_layer_graph_capturing_slot != NULL || ds4_capture_active()) {
+        /* Should be unreachable (see header comment); refuse to destroy
+         * execs under an open capture rather than corrupt its state. */
+        fprintf(stderr, "ds4: captured-graph invalidation requested during "
+                        "capture (%s); skipped\n", why ? why : "?");
+        return;
+    }
+    int n = 0;
+    for (uint32_t i = 0; i < DS4_LAYER_GRAPH_CACHE_SIZE; i++) {
+        if (!g_layer_graphs[i].valid) continue;
+        cudaGraphExecDestroy(g_layer_graphs[i].exec);
+        g_layer_graphs[i].valid = 0;
+        g_layer_graphs[i].hits = 0;
+        n++;
+    }
+    for (uint32_t i = 0; i < DS4_DENSE_GRAPH_CACHE_SIZE; i++) {
+        if (!g_dense_graphs[i].valid) continue;
+        cudaGraphExecDestroy(g_dense_graphs[i].exec);
+        g_dense_graphs[i].valid = 0;
+        g_dense_graphs[i].hits = 0;
+        n++;
+    }
+    for (uint32_t i = 0; i < DS4_MOE_GRAPH_CACHE_SIZE; i++) {
+        if (!g_moe_graphs[i].valid) continue;
+        cudaGraphExecDestroy(g_moe_graphs[i].exec);
+        g_moe_graphs[i].valid = 0;
+        g_moe_graphs[i].hits = 0;
+        n++;
+    }
+    if (n > 0) {
+        fprintf(stderr, "ds4: invalidated %d captured graph(s): %s\n",
+                n, why ? why : "scratch resize");
+    }
+}
 
 /* Step 6 fixup: pre-warm session-global scratch buffers that lazy-grow
  * via cudaMalloc.  Capture mode forbids cudaMalloc/cudaFree, so the first
