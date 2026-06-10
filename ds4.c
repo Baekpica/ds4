@@ -8924,6 +8924,13 @@ typedef struct {
      * ms_positions/ms_seq_id are host mirrors of batch_positions/batch_seq_id
      * (the emit runs on the host to decide group-close + pick the bank). */
     bool            batch_multiseq_emit;
+    /* R3 (chunked admission): when set, metal_graph_batch_eval_logits runs the
+     * output head over the LAST row only (row n-1, decode-style: one head GEMM
+     * into g->logits, one DS4_N_VOCAB readback) instead of all n rows.  Set by
+     * bg_prefill_bank_at's final chunk -- the prefill callers only ever consume
+     * the prompt's last-row logits, so the per-row head + full-batch readback
+     * (~n x 516 KB) is pure waste there.  Clear = historical per-row behavior. */
+    bool            batch_head_last_only;
     /* S1.1 (deferred-commit MTP verify): when set, the multi-seq DECODE compressor
      * STORE pass (both attn 4d emit and the indexer sibling) is SKIPPED -- no
      * running-state advance, no compressed-row emit, no ms_n_comp/ms_n_index_comp
@@ -9789,6 +9796,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_max_seq_len = 0;                                        /* B0: ragged prefill */
     g->batch_multiseq_prefilled = false;                             /* Phase 2 Step 3c */
     g->batch_multiseq_emit = false;                                  /* Phase 2 Step 4d */
+    g->batch_head_last_only = false;                                 /* R3 chunked admission */
     g->batch_defer_comp_store = false;                               /* S1.1 deferred-commit */
     g->batch_rollback_capture = false;                               /* S1.1 M2 in-forward rollback */
     g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
@@ -22786,34 +22794,90 @@ static bool bg_reset_bank(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_t b) {
  * A2a: pos_base > 0 prefills the rows at positions pos_base..pos_base+L-1 ON TOP of
  * the bank's committed state (warm suffix prefill): the per-seq emit path appends to
  * the bank's existing ms_n_comp counters and the retained in-progress pooling state,
- * exactly as the mode-2 verify forward does at small widths. */
+ * exactly as the mode-2 verify forward does at small widths.
+ * R3: long prefills run as a loop of <=W-token chunks (DS4_CONT_PREFILL_CHUNK; 0 =
+ * legacy one-shot).  Each chunk commits exactly like a warm suffix prefill -- chunk
+ * c+1 reads the bank state chunk c committed, the per-bank pooling lanes carry any
+ * ratio-group remainder across the boundary (arbitrary widths are fine; the A2a/A2b
+ * gates prove this body at arbitrary pos_base/suffix lengths).  Non-final chunks skip
+ * the output head entirely (logits_out=NULL); the final chunk runs the head on its
+ * LAST row only (batch_head_last_only) -- the one-shot path computed and read back
+ * full per-row logits (L x DS4_N_VOCAB, ~1.5 GB at 3k tokens) to use one row. */
+static uint32_t bg_prefill_chunk_tokens(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_CONT_PREFILL_CHUNK");
+        /* Default 4096 = the serial path's long-prompt chunk size.  The R3
+         * GB10 sweep (2.5k-token cold admit) showed the forward is fastest at
+         * maximal width -- 12.75s at 4096 vs 16.8s at 512 vs 31.3s at 128 --
+         * so the loop only engages past 4096; the big R3 win at default config
+         * is the last-row-only head (legacy one-shot: 22.6s, 42% head+readback). */
+        v = (e && e[0]) ? atoi(e) : 4096;
+        if (v < 0) v = 0;
+    }
+    return (uint32_t)v;
+}
+
 static bool bg_prefill_bank_at(ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
                                uint32_t b, const int *tok, uint32_t L, uint32_t pos_base,
                                float *last_logits) {
-    int     *qtokens = xmalloc((size_t)L * sizeof(int));
-    int32_t *pos_arr = xmalloc((size_t)L * sizeof(int32_t));
-    int32_t *sid_arr = xmalloc((size_t)L * sizeof(int32_t));
-    float   *pf      = xmalloc((size_t)L * DS4_N_VOCAB * sizeof(float));
-    bool ok = qtokens && pos_arr && sid_arr && pf;
-    for (uint32_t i = 0; ok && i < L; i++) {
-        qtokens[i] = tok[i];
-        pos_arr[i] = (int32_t)(pos_base + i);
-        sid_arr[i] = (int32_t)b;
-        g->ms_positions[i] = pos_arr[i];
-        g->ms_seq_id[i]    = sid_arr[i];
+    const uint32_t W = bg_prefill_chunk_tokens();
+    if (W == 0) {
+        /* Legacy one-shot ragged forward (bit-exact pre-R3 path). */
+        int     *qtokens = xmalloc((size_t)L * sizeof(int));
+        int32_t *pos_arr = xmalloc((size_t)L * sizeof(int32_t));
+        int32_t *sid_arr = xmalloc((size_t)L * sizeof(int32_t));
+        float   *pf      = xmalloc((size_t)L * DS4_N_VOCAB * sizeof(float));
+        bool ok = qtokens && pos_arr && sid_arr && pf;
+        for (uint32_t i = 0; ok && i < L; i++) {
+            qtokens[i] = tok[i];
+            pos_arr[i] = (int32_t)(pos_base + i);
+            sid_arr[i] = (int32_t)b;
+            g->ms_positions[i] = pos_arr[i];
+            g->ms_seq_id[i]    = sid_arr[i];
+        }
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)L * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)L * sizeof(int32_t)) != 0;
+        if (ok) {
+            g->batch_multiseq_emit = true;
+            g->batch_max_seq_len = pos_base + L;
+            ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, pos_base + L, L, pf);
+            g->batch_multiseq_emit = false;
+            g->batch_max_seq_len = 0;
+        }
+        if (ok && last_logits)
+            memcpy(last_logits, pf + (uint64_t)(L - 1u) * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+        free(qtokens); free(pos_arr); free(sid_arr); free(pf);
+        return ok;
     }
-    if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)L * sizeof(int32_t)) != 0;
-    if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)L * sizeof(int32_t)) != 0;
-    if (ok) {
-        g->batch_multiseq_emit = true;
-        g->batch_max_seq_len = pos_base + L;
-        ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, pos_base + L, L, pf);
-        g->batch_multiseq_emit = false;
-        g->batch_max_seq_len = 0;
+    const uint32_t cap = W < g->prefill_cap ? W : g->prefill_cap;
+    int32_t *pos_arr = xmalloc((size_t)cap * sizeof(int32_t));
+    int32_t *sid_arr = xmalloc((size_t)cap * sizeof(int32_t));
+    bool ok = pos_arr && sid_arr;
+    for (uint32_t off = 0; ok && off < L; off += cap) {
+        uint32_t n = L - off;
+        if (n > cap) n = cap;
+        const bool last = off + n == L;
+        for (uint32_t i = 0; i < n; i++) {
+            pos_arr[i] = (int32_t)(pos_base + off + i);
+            sid_arr[i] = (int32_t)b;
+            g->ms_positions[i] = pos_arr[i];
+            g->ms_seq_id[i]    = sid_arr[i];
+        }
+        ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)n * sizeof(int32_t)) != 0 &&
+             ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)n * sizeof(int32_t)) != 0;
+        if (ok) {
+            g->batch_multiseq_emit = true;
+            g->batch_head_last_only = last;
+            g->batch_max_seq_len = pos_base + off + n;
+            ok = metal_graph_batch_eval_logits(g, model, weights, tok + off, pos_base + off + n, n,
+                                               last ? last_logits : NULL);
+            g->batch_multiseq_emit = false;
+            g->batch_head_last_only = false;
+            g->batch_max_seq_len = 0;
+        }
     }
-    if (ok && last_logits)
-        memcpy(last_logits, pf + (uint64_t)(L - 1u) * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
-    free(qtokens); free(pos_arr); free(sid_arr); free(pf);
+    free(pos_arr); free(sid_arr);
     return ok;
 }
 
@@ -25441,7 +25505,11 @@ static bool metal_graph_batch_eval_logits(
         uint32_t           pos0,
         uint32_t           n,
         float             *logits_out) {
-    if (!g || !model || !weights || !tokens || !logits_out) return false;
+    /* R3: logits_out == NULL = forward-only (commit the KV/compressor state,
+     * skip the output head + readback entirely).  Non-final prefill chunks
+     * need no logits at all.  With g->batch_head_last_only set, logits_out
+     * receives ONE row (the last row's DS4_N_VOCAB floats), not n rows. */
+    if (!g || !model || !weights || !tokens) return false;
     if (n == 0 || n > g->prefill_cap) return false;
 
     static int announced = 0;
@@ -25508,6 +25576,7 @@ static bool metal_graph_batch_eval_logits(
     if (bench_fwd_only < 0)
         bench_fwd_only = getenv("DS4_BENCH_FWD_ONLY") != NULL ? 1 : 0;
     if (bench_fwd_only) return ok;   /* logits_out left stale; bench times only */
+    if (!logits_out) return ok;      /* R3: forward-only chunk, no head wanted */
 
     /* Output head + full-logit readback.
      *
@@ -25526,6 +25595,20 @@ static bool metal_graph_batch_eval_logits(
                                                               model,
                                                               weights,
                                                               0u,
+                                                              weights->output->dim[1],
+                                                              false);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) ok = metal_graph_read_current_logits(g, logits_out);
+    } else if (g->batch_head_last_only) {
+        /* R3 final prefill chunk: the caller consumes only the LAST row.  One
+         * decode-style head on row n-1 (same math as the n==1 oracle path,
+         * different row) + one DS4_N_VOCAB readback into logits_out[0]. */
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
+                                                              model,
+                                                              weights,
+                                                              n - 1u,
                                                               weights->output->dim[1],
                                                               false);
         if (ok) ok = ds4_gpu_end_commands() != 0;
