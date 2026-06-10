@@ -8927,9 +8927,10 @@ typedef struct {
     /* R3 (chunked admission): when set, metal_graph_batch_eval_logits runs the
      * output head over the LAST row only (row n-1, decode-style: one head GEMM
      * into g->logits, one DS4_N_VOCAB readback) instead of all n rows.  Set by
-     * bg_prefill_bank_at's final chunk -- the prefill callers only ever consume
-     * the prompt's last-row logits, so the per-row head + full-batch readback
-     * (~n x 516 KB) is pure waste there.  Clear = historical per-row behavior. */
+     * the admission prefill's final chunk (bg_prefill_rows) -- the prefill
+     * callers only ever consume the prompt's last-row logits, so the per-row
+     * head + full-batch readback (~n x 516 KB) is pure waste there.
+     * Clear = historical per-row behavior. */
     bool            batch_head_last_only;
     /* S1.1 (deferred-commit MTP verify): when set, the multi-seq DECODE compressor
      * STORE pass (both attn 4d emit and the indexer sibling) is SKIPPED -- no
@@ -22804,24 +22805,28 @@ static bool bg_reset_bank(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_t b) {
     return true;
 }
 
-/* W5 helper: ragged-prefill ONE sequence (tok[0..L)) into bank b in a single forward
- * and return the prompt's LAST-row logits in last_logits (>= DS4_N_VOCAB floats).
+/* W5 helper family: ragged-prefill ONE sequence into bank b.
  * Requires the FULL slab already repointed [0,max_seq) so seq_id=b addresses bank b,
- * and batch_multiseq/batch_n_seq set by the caller.  Uses pos0=L (the seq_id-addressed
- * emit path -- pos0=0 would hit the zero_prefix branch that writes bank 0 + the global
- * scalar count).  Generalizes the core's ragged-prefill block to a single bank.
- * A2a: pos_base > 0 prefills the rows at positions pos_base..pos_base+L-1 ON TOP of
+ * and batch_multiseq/batch_n_seq set by the caller.  Uses pos0=pos_base+n (the
+ * seq_id-addressed emit path -- pos0=0 would hit the zero_prefix branch that writes
+ * bank 0 + the global scalar count).  Generalizes the core's ragged-prefill block to
+ * a single bank.
+ * A2a: pos_base > 0 prefills the rows at positions pos_base..pos_base+n-1 ON TOP of
  * the bank's committed state (warm suffix prefill): the per-seq emit path appends to
  * the bank's existing ms_n_comp counters and the retained in-progress pooling state,
  * exactly as the mode-2 verify forward does at small widths.
- * R3: long prefills run as a loop of <=W-token chunks (DS4_CONT_PREFILL_CHUNK; 0 =
- * legacy one-shot).  Each chunk commits exactly like a warm suffix prefill -- chunk
- * c+1 reads the bank state chunk c committed, the per-bank pooling lanes carry any
- * ratio-group remainder across the boundary (arbitrary widths are fine; the A2a/A2b
- * gates prove this body at arbitrary pos_base/suffix lengths).  Non-final chunks skip
- * the output head entirely (logits_out=NULL); the final chunk runs the head on its
- * LAST row only (batch_head_last_only) -- the one-shot path computed and read back
- * full per-row logits (L x DS4_N_VOCAB, ~1.5 GB at 3k tokens) to use one row. */
+ * R3: long prefills run as a sequence of <=W-token chunks (DS4_CONT_PREFILL_CHUNK;
+ * 0 = legacy one-shot).  Each chunk commits exactly like a warm suffix prefill --
+ * chunk c+1 reads the bank state chunk c committed, the per-bank pooling lanes carry
+ * any ratio-group remainder across the boundary (arbitrary widths are fine; the
+ * A2a/A2b gates prove this body at arbitrary pos_base/suffix lengths).  Non-final
+ * chunks skip the output head entirely (logits_out=NULL); the final chunk runs the
+ * head on its LAST row only (batch_head_last_only) -- the one-shot path computed and
+ * read back full per-row logits (L x DS4_N_VOCAB, ~1.5 GB at 3k tokens) to use one
+ * row.
+ * R4 (overlap-lite): the chunk loop lives in the continuous loop's admission state
+ * machine, not here, so decode steps for live banks can run BETWEEN chunks --
+ * bg_prefill_rows runs exactly one chunk forward. */
 static uint32_t bg_prefill_chunk_tokens(void) {
     static int v = -1;
     if (v < 0) {
@@ -22837,82 +22842,121 @@ static uint32_t bg_prefill_chunk_tokens(void) {
     return (uint32_t)v;
 }
 
-static bool bg_prefill_bank_at(ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
-                               uint32_t b, const int *tok, uint32_t L, uint32_t pos_base,
-                               float *last_logits) {
-    const uint32_t W = bg_prefill_chunk_tokens();
-    if (W == 0) {
-        /* Legacy one-shot ragged forward (bit-exact pre-R3 path). */
-        int     *qtokens = xmalloc((size_t)L * sizeof(int));
-        int32_t *pos_arr = xmalloc((size_t)L * sizeof(int32_t));
-        int32_t *sid_arr = xmalloc((size_t)L * sizeof(int32_t));
-        float   *pf      = xmalloc((size_t)L * DS4_N_VOCAB * sizeof(float));
-        bool ok = qtokens && pos_arr && sid_arr && pf;
-        for (uint32_t i = 0; ok && i < L; i++) {
-            qtokens[i] = tok[i];
-            pos_arr[i] = (int32_t)(pos_base + i);
-            sid_arr[i] = (int32_t)b;
-            g->ms_positions[i] = pos_arr[i];
-            g->ms_seq_id[i]    = sid_arr[i];
-        }
-        if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)L * sizeof(int32_t)) != 0;
-        if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)L * sizeof(int32_t)) != 0;
-        if (ok) {
-            g->batch_multiseq_emit = true;
-            g->batch_max_seq_len = pos_base + L;
-            ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, pos_base + L, L, pf);
-            g->batch_multiseq_emit = false;
-            g->batch_max_seq_len = 0;
-        }
-        if (ok && last_logits)
-            memcpy(last_logits, pf + (uint64_t)(L - 1u) * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
-        free(qtokens); free(pos_arr); free(sid_arr); free(pf);
-        return ok;
+/* R4: admission chunk width while OTHER banks are decoding (the decode-stall
+ * quantum: live streams wait at most one such chunk forward between steps).
+ * 0 disables interleaving -- an admission drains all its chunks back-to-back
+ * before decode resumes, the pre-R4 (R3) behavior.  Going SMALLER than the
+ * boot chunk is always ring-safe (R2 sizes the raw ring for
+ * DS4_CONT_PREFILL_CHUNK at ctx create); larger values are clamped down. */
+static uint32_t bg_prefill_chunk_live_tokens(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_CONT_PREFILL_CHUNK_LIVE");
+        /* Default 512: on GB10 the eager single-bank chunk forward runs ~150
+         * tok/s at this width (R3 sweep), so live streams stall ~3.5s per
+         * quantum instead of the full admission (14-31s for 3-6k prompts),
+         * while a busy-server cold admit pays ~+30% prefill wall. */
+        v = (e && e[0]) ? atoi(e) : 512;
+        if (v < 0) v = 0;
     }
-    uint32_t cap = W < g->prefill_cap ? W : g->prefill_cap;
-    /* R2 (raw-ring shrink): a chunk of n rows into one bank evicts ring slots
-     * [pos-raw_cap] for each written pos; the earliest row's SWA window stays
-     * intact iff n + raw_window <= raw_cap.  The ctx sizes raw_cap as
-     * align256(raw_window + chunk) so this clamp is a no-op at defaults; it
-     * protects env-forced combos (DS4_METAL_GRAPH_RAW_CAP sweeps). */
-    {
-        const uint32_t ring_budget =
-            g->raw_cap > g->raw_window ? g->raw_cap - g->raw_window : 1u;
-        if (cap > ring_budget) cap = ring_budget;
-    }
-    int32_t *pos_arr = xmalloc((size_t)cap * sizeof(int32_t));
-    int32_t *sid_arr = xmalloc((size_t)cap * sizeof(int32_t));
+    return (uint32_t)v;
+}
+
+/* R2 (raw-ring shrink): a chunk of n rows into one bank evicts ring slots
+ * [pos-raw_cap] for each written pos; the earliest row's SWA window stays
+ * intact iff n + raw_window <= raw_cap.  The ctx sizes raw_cap as
+ * align256(raw_window + chunk) so this clamp is a no-op at defaults; it
+ * protects env-forced combos (DS4_METAL_GRAPH_RAW_CAP sweeps, an
+ * over-sized DS4_CONT_PREFILL_CHUNK_LIVE). */
+static uint32_t bg_prefill_width_clamp(const ds4_gpu_graph *g, uint32_t w) {
+    if (w > g->prefill_cap) w = g->prefill_cap;
+    const uint32_t ring_budget =
+        g->raw_cap > g->raw_window ? g->raw_cap - g->raw_window : 1u;
+    if (w > ring_budget) w = ring_budget;
+    return w;
+}
+
+/* One chunk forward: n rows at positions pos_base..pos_base+n-1 into bank b.
+ * final -> run the last-row-only output head into last_logits; else no head.
+ * Caller owns the chunk-width policy (n must be bg_prefill_width_clamp-ed). */
+static bool bg_prefill_rows(ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
+                            uint32_t b, const int *tok, uint32_t n, uint32_t pos_base,
+                            bool final, float *last_logits) {
+    int32_t *pos_arr = xmalloc((size_t)n * sizeof(int32_t));
+    int32_t *sid_arr = xmalloc((size_t)n * sizeof(int32_t));
     bool ok = pos_arr && sid_arr;
-    for (uint32_t off = 0; ok && off < L; off += cap) {
-        uint32_t n = L - off;
-        if (n > cap) n = cap;
-        const bool last = off + n == L;
+    if (ok) {
         for (uint32_t i = 0; i < n; i++) {
-            pos_arr[i] = (int32_t)(pos_base + off + i);
+            pos_arr[i] = (int32_t)(pos_base + i);
             sid_arr[i] = (int32_t)b;
             g->ms_positions[i] = pos_arr[i];
             g->ms_seq_id[i]    = sid_arr[i];
         }
         ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)n * sizeof(int32_t)) != 0 &&
              ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)n * sizeof(int32_t)) != 0;
-        if (ok) {
-            g->batch_multiseq_emit = true;
-            g->batch_head_last_only = last;
-            g->batch_max_seq_len = pos_base + off + n;
-            ok = metal_graph_batch_eval_logits(g, model, weights, tok + off, pos_base + off + n, n,
-                                               last ? last_logits : NULL);
-            g->batch_multiseq_emit = false;
-            g->batch_head_last_only = false;
-            g->batch_max_seq_len = 0;
-        }
+    }
+    if (ok) {
+        g->batch_multiseq_emit = true;
+        g->batch_head_last_only = final;
+        g->batch_max_seq_len = pos_base + n;
+        ok = metal_graph_batch_eval_logits(g, model, weights, tok, pos_base + n, n,
+                                           final ? last_logits : NULL);
+        g->batch_multiseq_emit = false;
+        g->batch_head_last_only = false;
+        g->batch_max_seq_len = 0;
     }
     free(pos_arr); free(sid_arr);
     return ok;
 }
 
+/* Legacy one-shot ragged forward (bit-exact pre-R3 path, DS4_CONT_PREFILL_CHUNK=0):
+ * the whole prompt in one forward with full per-row logits, last row copied out. */
+static bool bg_prefill_oneshot(ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
+                               uint32_t b, const int *tok, uint32_t L, uint32_t pos_base,
+                               float *last_logits) {
+    int     *qtokens = xmalloc((size_t)L * sizeof(int));
+    int32_t *pos_arr = xmalloc((size_t)L * sizeof(int32_t));
+    int32_t *sid_arr = xmalloc((size_t)L * sizeof(int32_t));
+    float   *pf      = xmalloc((size_t)L * DS4_N_VOCAB * sizeof(float));
+    bool ok = qtokens && pos_arr && sid_arr && pf;
+    for (uint32_t i = 0; ok && i < L; i++) {
+        qtokens[i] = tok[i];
+        pos_arr[i] = (int32_t)(pos_base + i);
+        sid_arr[i] = (int32_t)b;
+        g->ms_positions[i] = pos_arr[i];
+        g->ms_seq_id[i]    = sid_arr[i];
+    }
+    if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos_arr, (uint64_t)L * sizeof(int32_t)) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, sid_arr, (uint64_t)L * sizeof(int32_t)) != 0;
+    if (ok) {
+        g->batch_multiseq_emit = true;
+        g->batch_max_seq_len = pos_base + L;
+        ok = metal_graph_batch_eval_logits(g, model, weights, qtokens, pos_base + L, L, pf);
+        g->batch_multiseq_emit = false;
+        g->batch_max_seq_len = 0;
+    }
+    if (ok && last_logits)
+        memcpy(last_logits, pf + (uint64_t)(L - 1u) * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+    free(qtokens); free(pos_arr); free(sid_arr); free(pf);
+    return ok;
+}
+
+/* Whole-prompt convenience: drain every chunk back-to-back (no decode interleave)
+ * with the boot chunk policy -- the pre-R4 admission shape, kept for the W5
+ * substrate selftest's admit primitive. */
 static bool bg_prefill_bank(ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
                             uint32_t b, const int *tok, uint32_t L, float *last_logits) {
-    return bg_prefill_bank_at(g, model, weights, b, tok, L, 0u, last_logits);
+    const uint32_t W = bg_prefill_chunk_tokens();
+    if (W == 0u) return bg_prefill_oneshot(g, model, weights, b, tok, L, 0u, last_logits);
+    const uint32_t cap = bg_prefill_width_clamp(g, W);
+    for (uint32_t off = 0; off < L; off += cap) {
+        uint32_t n = L - off;
+        if (n > cap) n = cap;
+        const bool final = off + n == L;
+        if (!bg_prefill_rows(g, model, weights, b, tok + off, n, off, final,
+                             final ? last_logits : NULL)) return false;
+    }
+    return true;
 }
 
 /* Core batched generation over a caller-owned graph.  Ragged-prefills the N
@@ -28007,10 +28051,14 @@ static bool mtp_cont_rollback_restore_all(ds4_gpu_graph *g, uint32_t MS,
 
 /* W5: continuous batching (mid-flight admit/evict) over a persistent ctx.  Maintains
  * a rolling active set of up to ctx->max_seq banks: each iteration admits waiting
- * requests into free banks (reset + ragged-prefill via bg_reset_bank/bg_prefill_bank)
- * and evicts finished ones, so short requests don't wait for long ones.  The full slab
- * is repointed [0,max_seq) for the whole run; banks are addressed by absolute seq_id
- * (idle banks have ms_n_comp=0 so they don't raise the max read-count).  Greedy only. */
+ * requests into free banks and evicts finished ones, so short requests don't wait
+ * for long ones.  R4 (overlap-lite): an admission INSTALLS its bank state (reset /
+ * fork copy / warm reuse via bg_reset_bank etc.) and then prefills incrementally --
+ * one <=DS4_CONT_PREFILL_CHUNK_LIVE-token chunk per loop pass while other banks are
+ * decoding -- so live streams stall at most one chunk forward per token instead of a
+ * whole admission.  The full slab is repointed [0,max_seq) for the whole run; banks
+ * are addressed by absolute seq_id (idle banks have ms_n_comp=0 so they don't raise
+ * the max read-count). */
 int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                    int (*admit)(void *ud, ds4_cont_request *req),
                                    int (*on_token)(void *ud, void *user, int token),
@@ -28052,13 +28100,28 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint64_t *brng  = xcalloc(MS, sizeof(uint64_t));
     float    *logits  = xmalloc((size_t)MS * DS4_N_VOCAB * sizeof(float));
     float    *seedlog = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    /* R4 (overlap-lite): per-bank pending admission prefill.  A bank mid-prefill
+     * is neither free (admit skips it) nor live (decode skips it); the loop
+     * advances pending prefills FCFS, one chunk per pass, so live banks' decode
+     * stalls are bounded by ONE chunk forward instead of a whole admission.
+     * pftok is an engine-owned copy of the not-yet-prefilled tokens (the admit
+     * contract only guarantees req.tokens through the admit call); pflen != 0
+     * marks the bank pending; the seed token is sampled at completion. */
+    int     **pftok  = xcalloc(MS, sizeof(int *));
+    uint32_t *pflen  = xcalloc(MS, sizeof(uint32_t));   /* suffix length to prefill */
+    uint32_t *pfoff  = xcalloc(MS, sizeof(uint32_t));   /* tokens already committed */
+    uint32_t *pfbase = xcalloc(MS, sizeof(uint32_t));   /* suffix start position    */
+    double   *pft0   = xcalloc(MS, sizeof(double));     /* install time (timing log) */
+    uint32_t  pfq[DS4_MULTISEQ_MAX_SEQ];                /* FCFS queue of pending banks */
+    uint32_t  pfq_h = 0, pfq_n = 0;
     int      qtokens[DS4_MULTISEQ_MAX_SEQ];
     int32_t  pos_arr[DS4_MULTISEQ_MAX_SEQ];
     int32_t  sid_arr[DS4_MULTISEQ_MAX_SEQ];
     uint32_t rowbank[DS4_MULTISEQ_MAX_SEQ];
     int      sampled[DS4_MULTISEQ_MAX_SEQ];   /* S1.0b: token the base model sampled per row */
     bool ok = live && usr && posv && cur && beos && bmax && glen && gbuf &&
-              btemp && btopk && btopp && bminp && brng && logits && seedlog;
+              btemp && btopk && btopp && bminp && brng && logits && seedlog &&
+              pftok && pflen && pfoff && pfbase && pft0;
 
     /* S1.0b: per-bank MTP draft probe (DS4_CONT_MTP_DRAFT_PROBE).  Runs the
      * per-bank drafter in lockstep with the real decode (depth 1), seeded from
@@ -28146,7 +28209,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         bool admit_drained = false;
         for (uint32_t pass = 0; ok && pass < MS; pass++) {
             uint32_t fb = MS;
-            for (uint32_t i = 0; i < MS; i++) if (!live[i]) { fb = i; break; }
+            for (uint32_t i = 0; i < MS; i++) if (!live[i] && !pflen[i]) { fb = i; break; }
             if (fb == MS) break;                     /* no free bank */
             ds4_cont_request req;
             memset(&req, 0, sizeof(req));
@@ -28162,7 +28225,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * scan's first free bank, the historical order. */
             uint32_t b = fb;
             const int pb = req.place_bank - 1;
-            if (pb >= 0 && pb < (int)MS && !live[pb]) b = (uint32_t)pb;
+            if (pb >= 0 && pb < (int)MS && !live[pb] && !pflen[pb]) b = (uint32_t)pb;
             /* A2a warm admit: reuse the bank's committed cache and prefill ONLY the
              * suffix iff the request's claimed cached prefix exactly matches the
              * bank's committed history.  Engine-validated: a stale or buggy caller
@@ -28178,7 +28241,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * target degenerates to a plain warm admit (the state is already
                  * in place).  Any failure degrades to cold. */
                 const int fs = req.fork_bank - 1;
-                fork = fs >= 0 && fs < (int)MS && !live[fs] && ctx->bank_hist_valid[fs] &&
+                fork = fs >= 0 && fs < (int)MS && !live[fs] && !pflen[fs] && ctx->bank_hist_valid[fs] &&
                        (uint32_t)req.n_cached == ctx->bank_hist_len[fs] &&
                        L > (uint32_t)req.n_cached &&
                        memcmp(req.tokens, ctx->bank_hist + (size_t)fs * seq_cap,
@@ -28197,33 +28260,39 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             uint32_t mn = req.max_new > 0 ? (uint32_t)req.max_new : 1u;
             const uint32_t cap = seq_cap > L ? seq_cap - L : 1u;   /* frontier bound (R2: ring wraps; comp caches bound the seq) */
             if (mn > cap) mn = cap;
-            if (fork) {
-                /* fork: D2D-clone the source bank's committed state into b, then
-                 * prefill the suffix exactly like a warm admit.  No reset of b. */
-                const uint32_t P = (uint32_t)req.n_cached, S = L - P;
-                if (!bank_fork_copy(ctx, fsrc, b)) { ok = false; break; }
-                if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
-                if (!bg_prefill_bank_at(g, model, weights, b, req.tokens + P, S, P, seedlog)) {
-                    ctx->bank_hist_valid[b] = 0u;    /* partial prefill: state unknown */
-                    ok = false; break;
+            /* R4: ADMISSION = INSTALL ONLY.  Bank state is prepared here (reset /
+             * fork copy / warm reuse) and the tokens to prefill are parked in the
+             * pending-prefill state; the chunks run in the advance phase below so
+             * decode steps can interleave.  Blocking configs drain there too --
+             * same code path, the chunks just run back-to-back. */
+            {
+                const uint32_t P = (fork || warm) ? (uint32_t)req.n_cached : 0u;
+                const uint32_t S = L - P;
+                if (fork) {
+                    /* fork: D2D-clone the source bank's committed state into b,
+                     * then prefill the suffix exactly like a warm admit.  No
+                     * reset of b. */
+                    if (!bank_fork_copy(ctx, fsrc, b)) { ok = false; break; }
+                    if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
+                } else if (warm) {
+                    /* warm: NO reset -- the suffix prefills on top of the
+                     * committed state. */
+                    if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
+                } else {
+                    /* cold: reset bank b (repoints b,1), restore the full slab. */
+                    if (!bg_reset_bank(&ctx->sl, g, b)) { ok = false; break; }
+                    if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
+                    bank_hist_reset(ctx, b);
                 }
-                bank_hist_append_n(ctx, b, req.tokens + P, S);
-            } else if (warm) {
-                /* warm: NO reset -- prefill the suffix on top of the committed state. */
-                const uint32_t P = (uint32_t)req.n_cached, S = L - P;
-                if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
-                if (!bg_prefill_bank_at(g, model, weights, b, req.tokens + P, S, P, seedlog)) {
-                    ctx->bank_hist_valid[b] = 0u;    /* partial prefill: state unknown */
-                    ok = false; break;
-                }
-                bank_hist_append_n(ctx, b, req.tokens + P, S);
-            } else {
-            /* reset bank b (repoints b,1), restore full slab, prefill into bank b. */
-            if (!bg_reset_bank(&ctx->sl, g, b)) { ok = false; break; }
-            if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
-            if (!bg_prefill_bank(g, model, weights, b, req.tokens, L, seedlog)) { ok = false; break; }
-            bank_hist_reset(ctx, b);
-            bank_hist_append_n(ctx, b, req.tokens, L);
+                pftok[b] = xmalloc((size_t)S * sizeof(int));
+                if (!pftok[b]) { ok = false; break; }
+                memcpy(pftok[b], req.tokens + P, (size_t)S * sizeof(int));
+                pfbase[b] = P;
+                pflen[b]  = S;
+                pfoff[b]  = 0u;
+                pft0[b]   = now_sec();
+                pfq[(pfq_h + pfq_n) % MS] = b;
+                pfq_n++;
             }
             if (req.bank_used) *req.bank_used = (int)b;
             if (ctx->mtp) {
@@ -28238,34 +28307,93 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
             }
             if (mtp_accept) ndr[b] = 0u;                /* S1.1: no drafts until first step */
-            /* W7: capture this seq's sampling params + seed its RNG, then sample
-             * the seed token from the same stream the decode steps will continue. */
+            /* W7: capture this seq's sampling params + RNG seed now; the seed
+             * token is sampled at prefill completion (advance phase) from the
+             * same stream the decode steps will continue. */
             btemp[b] = req.temperature;
             btopk[b] = req.top_k;
             btopp[b] = req.top_p;
             bminp[b] = req.min_p;
             brng[b]  = req.seed;
-            const int nt = sample_top_p_min_p(seedlog, DS4_N_VOCAB,
-                                              btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
-            gbuf[b] = xmalloc((size_t)mn * sizeof(int));
-            if (!gbuf[b]) { ok = false; break; }
-            gbuf[b][0] = nt;
-            glen[b] = 1u;
-            cur[b]  = nt;
-            posv[b] = L;
             beos[b] = req.eos >= 0 ? req.eos : dflt_eos;
             bmax[b] = mn;
             usr[b]  = req.user;
-            const bool hit_eos = (beos[b] >= 0 && nt == beos[b]);
-            /* Stream the seed token (skip EOS, which carries no visible text and
-             * is the stop signal); on_token returning 0 aborts this seq. */
-            bool aborted = false;
-            if (!hit_eos && on_token && !on_token(ud, usr[b], nt)) aborted = true;
-            if (hit_eos || glen[b] >= mn || aborted) {
-                on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
-                free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
-            } else {
-                live[b] = 1u;
+        }
+        if (!ok) break;
+
+        /* ---- R4: advance pending admission prefills (FCFS).  Interleaved mode
+         * (DS4_CONT_PREFILL_CHUNK_LIVE > 0, the default) runs ONE chunk then
+         * falls through to decode, so live banks stall at most one chunk
+         * forward per step; the chunk narrows to the _LIVE width only while
+         * someone is actually decoding (idle prefills keep the full boot
+         * width).  Blocking configs (legacy one-shot W=0, or _LIVE=0) drain
+         * every pending prefill here back-to-back -- the pre-R4 behavior.
+         * On the final chunk the seed token is sampled and the bank goes
+         * live (or finishes at seed), exactly as the old inline admit did. ---- */
+        {
+            const uint32_t W_boot = bg_prefill_chunk_tokens();
+            uint32_t W_live = bg_prefill_chunk_live_tokens();
+            if (W_live > W_boot) W_live = W_boot;       /* ring sized for W_boot */
+            const bool interleave = W_boot != 0u && W_live != 0u;
+            while (ok && pfq_n) {
+                const uint32_t b = pfq[pfq_h];
+                uint32_t n_live_now = 0;
+                for (uint32_t i = 0; i < MS; i++) if (live[i]) n_live_now++;
+                uint32_t n = pflen[b] - pfoff[b];
+                bool final = true;
+                if (W_boot == 0u) {
+                    /* legacy one-shot (bit-exact pre-R3): whole suffix, one forward. */
+                    ok = bg_prefill_oneshot(g, model, weights, b, pftok[b], n,
+                                            pfbase[b], seedlog);
+                } else {
+                    uint32_t W_eff = (interleave && n_live_now > 0u) ? W_live : W_boot;
+                    W_eff = bg_prefill_width_clamp(g, W_eff);
+                    if (n > W_eff) n = W_eff;
+                    final = pfoff[b] + n == pflen[b];
+                    ok = bg_prefill_rows(g, model, weights, b, pftok[b] + pfoff[b], n,
+                                         pfbase[b] + pfoff[b], final,
+                                         final ? seedlog : NULL);
+                }
+                if (!ok) {
+                    ctx->bank_hist_valid[b] = 0u;       /* partial prefill: state unknown */
+                    break;
+                }
+                bank_hist_append_n(ctx, b, pftok[b] + pfoff[b], n);
+                pfoff[b] += n;
+                if (final) {
+                    /* prefill complete: release the pending state, sample the seed
+                     * token, stream it, and make the bank live (or finish at seed). */
+                    const uint32_t Ltot = pfbase[b] + pflen[b];
+                    const double   tadm = pft0[b];
+                    free(pftok[b]); pftok[b] = NULL;
+                    pflen[b] = pfoff[b] = 0u;
+                    pfq_h = (pfq_h + 1u) % MS;
+                    pfq_n--;
+                    const int nt = sample_top_p_min_p(seedlog, DS4_N_VOCAB,
+                                                      btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
+                    gbuf[b] = xmalloc((size_t)bmax[b] * sizeof(int));
+                    if (!gbuf[b]) { ok = false; break; }
+                    gbuf[b][0] = nt;
+                    glen[b] = 1u;
+                    cur[b]  = nt;
+                    posv[b] = Ltot;
+                    const bool hit_eos = (beos[b] >= 0 && nt == beos[b]);
+                    /* Stream the seed token (skip EOS, which carries no visible text
+                     * and is the stop signal); on_token returning 0 aborts this seq. */
+                    bool aborted = false;
+                    if (!hit_eos && on_token && !on_token(ud, usr[b], nt)) aborted = true;
+                    if (hit_eos || glen[b] >= bmax[b] || aborted) {
+                        on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
+                        free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
+                    } else {
+                        live[b] = 1u;
+                    }
+                    if (getenv("DS4_CONT_GEN_TIMING"))
+                        fprintf(stderr, "ds4: cont admit bank=%u pos_base=%u suffix=%u wall=%.2fs%s\n",
+                                b, pfbase[b], Ltot - pfbase[b], now_sec() - tadm,
+                                interleave && n_live_now > 0u ? " (interleaved)" : "");
+                }
+                if (interleave) break;                  /* one quantum, then decode */
             }
         }
         if (!ok) break;
@@ -28273,6 +28401,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         uint32_t n_live = 0;
         for (uint32_t b = 0; b < MS; b++) if (live[b]) n_live++;
         if (n_live == 0u) {
+            if (pfq_n) continue;        /* admissions still prefilling -> keep chunking */
             if (admit_drained) break;   /* queue empty and nothing in flight -> done */
             continue;                   /* admitted seqs all finished at seed -> poll again */
         }
@@ -28717,8 +28846,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     ds4_batch_slabs_restore(&ctx->sl, g);
 
     if (gbuf) for (uint32_t b = 0; b < MS; b++) free(gbuf[b]);
+    if (pftok) for (uint32_t b = 0; b < MS; b++) free(pftok[b]);
     free(live); free(usr); free(posv); free(cur); free(beos); free(bmax); free(glen); free(gbuf);
     free(btemp); free(btopk); free(btopp); free(bminp); free(brng);
+    free(pftok); free(pflen); free(pfoff); free(pfbase); free(pft0);
     free(logits); free(seedlog);
     free(dbuf); free(ndr); free(vqtok); free(vpos); free(vsid); free(vfirst); free(vnr); free(vlogits);
     return ok ? 0 : 1;
