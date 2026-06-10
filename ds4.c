@@ -27024,6 +27024,8 @@ struct ds4_batch_ctx {
     uint8_t        *bank_hist_valid;
     uint64_t        warm_admits;     /* observability + gate hooks */
     uint64_t        warm_rejects;    /* n_cached>0 admits that degraded to cold */
+    uint64_t        fork_admits;     /* A2b: fork_bank>0 admits served by copy (or */
+    uint64_t        fork_rejects;    /* the src==dst warm degenerate) vs degraded  */
 };
 
 int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
@@ -27132,6 +27134,62 @@ static void bank_hist_append(ds4_batch_ctx *ctx, uint32_t b, int tok) {
 }
 static void bank_hist_append_n(ds4_batch_ctx *ctx, uint32_t b, const int *tok, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) bank_hist_append(ctx, b, tok[i]);
+}
+
+/* A2b: clone bank src's committed state into bank dst (fork-by-copy).  Caller
+ * guarantees both banks are idle (no live row) and src's history is valid; the
+ * admit pass runs between fully-synchronized forwards, so the synchronous D2D
+ * copies are race-free.  Copies, per layer, exactly the committed extent: raw
+ * ring rows [0,P) (P = src committed length; the cont path never wraps the
+ * ring), compressed attn/index cache rows [0,ms_n_comp)/[0,ms_n_index_comp),
+ * and the compressor running-state lanes whole (the in-progress pooling
+ * group); then mirrors the host row counters and the committed history.  dst
+ * rows beyond the copied extent stay stale -- invisible, reads clamp to the
+ * per-bank counts (the same invariant a warm admit relies on).  Works directly
+ * on the multi_* slabs at bank offsets (the M3 checkpoint pattern): no
+ * repoint, no reset, no allocation (nothing for captured graphs to bake). */
+static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
+    ds4_batch_slabs *sl = &ctx->sl;
+    ds4_gpu_graph   *g  = &ctx->g;
+    const uint64_t P = ctx->bank_hist_len[src];
+    const uint64_t raw_bytes = P * DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (raw_bytes &&
+            ds4_gpu_tensor_copy(sl->multi_raw[il], (uint64_t)dst * sl->raw_bank_bytes,
+                                sl->multi_raw[il], (uint64_t)src * sl->raw_bank_bytes,
+                                raw_bytes) == 0) return false;
+        if (sl->multi_comp[il]) {
+            const uint64_t cb = (uint64_t)g->ms_n_comp[src][il] * DS4_N_HEAD_DIM * sizeof(float);
+            if (cb && ds4_gpu_tensor_copy(sl->multi_comp[il], (uint64_t)dst * sl->comp_bank_bytes[il],
+                                          sl->multi_comp[il], (uint64_t)src * sl->comp_bank_bytes[il],
+                                          cb) == 0) return false;
+            if (ds4_gpu_tensor_copy(sl->multi_askv[il], (uint64_t)dst * sl->astate_bank_bytes[il],
+                                    sl->multi_askv[il], (uint64_t)src * sl->astate_bank_bytes[il],
+                                    sl->astate_bank_bytes[il]) == 0 ||
+                ds4_gpu_tensor_copy(sl->multi_assc[il], (uint64_t)dst * sl->astate_bank_bytes[il],
+                                    sl->multi_assc[il], (uint64_t)src * sl->astate_bank_bytes[il],
+                                    sl->astate_bank_bytes[il]) == 0) return false;
+        }
+        if (sl->multi_index[il]) {
+            const uint64_t ib = (uint64_t)g->ms_n_index_comp[src][il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            if (ib && ds4_gpu_tensor_copy(sl->multi_index[il], (uint64_t)dst * sl->index_bank_bytes[il],
+                                          sl->multi_index[il], (uint64_t)src * sl->index_bank_bytes[il],
+                                          ib) == 0) return false;
+            if (ds4_gpu_tensor_copy(sl->multi_iskv[il], (uint64_t)dst * sl->istate_bank_bytes[il],
+                                    sl->multi_iskv[il], (uint64_t)src * sl->istate_bank_bytes[il],
+                                    sl->istate_bank_bytes[il]) == 0 ||
+                ds4_gpu_tensor_copy(sl->multi_issc[il], (uint64_t)dst * sl->istate_bank_bytes[il],
+                                    sl->multi_issc[il], (uint64_t)src * sl->istate_bank_bytes[il],
+                                    sl->istate_bank_bytes[il]) == 0) return false;
+        }
+        g->ms_n_comp[dst][il]       = g->ms_n_comp[src][il];
+        g->ms_n_index_comp[dst][il] = g->ms_n_index_comp[src][il];
+    }
+    memcpy(ctx->bank_hist + (size_t)dst * ctx->raw_cap,
+           ctx->bank_hist + (size_t)src * ctx->raw_cap, (size_t)P * sizeof(int));
+    ctx->bank_hist_len[dst]   = (uint32_t)P;
+    ctx->bank_hist_valid[dst] = 1u;
+    return true;
 }
 
 int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int **toks) {
@@ -27964,8 +28022,23 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * does not byte-match the prompt (cross-bank contamination is
              * structurally impossible).  Full-frontier match only -- the committed
              * cache is not truncatable (M3), so a partial prefix cannot be reused. */
-            bool warm = false;
-            if (req.n_cached > 0) {
+            bool warm = false, fork = false;
+            uint32_t fsrc = 0;
+            if (req.fork_bank > 0 && req.n_cached > 0) {
+                /* A2b fork: validate against the SOURCE bank's committed history
+                 * (mirrors warm; additionally the source must be idle).  src ==
+                 * target degenerates to a plain warm admit (the state is already
+                 * in place).  Any failure degrades to cold. */
+                const int fs = req.fork_bank - 1;
+                fork = fs >= 0 && fs < (int)MS && !live[fs] && ctx->bank_hist_valid[fs] &&
+                       (uint32_t)req.n_cached == ctx->bank_hist_len[fs] &&
+                       L > (uint32_t)req.n_cached &&
+                       memcmp(req.tokens, ctx->bank_hist + (size_t)fs * raw_cap,
+                              (size_t)req.n_cached * sizeof(int)) == 0;
+                if (fork && (uint32_t)fs == b) { fork = false; warm = true; }
+                if (fork || warm) ctx->fork_admits++; else ctx->fork_rejects++;
+                if (fork) fsrc = (uint32_t)fs;
+            } else if (req.n_cached > 0) {
                 warm = pb >= 0 && b == (uint32_t)pb && ctx->bank_hist_valid[b] &&
                        (uint32_t)req.n_cached == ctx->bank_hist_len[b] &&
                        L > (uint32_t)req.n_cached &&
@@ -27976,7 +28049,18 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             uint32_t mn = req.max_new > 0 ? (uint32_t)req.max_new : 1u;
             const uint32_t cap = raw_cap > L ? raw_cap - L : 1u;   /* no ring wrap */
             if (mn > cap) mn = cap;
-            if (warm) {
+            if (fork) {
+                /* fork: D2D-clone the source bank's committed state into b, then
+                 * prefill the suffix exactly like a warm admit.  No reset of b. */
+                const uint32_t P = (uint32_t)req.n_cached, S = L - P;
+                if (!bank_fork_copy(ctx, fsrc, b)) { ok = false; break; }
+                if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
+                if (!bg_prefill_bank_at(g, model, weights, b, req.tokens + P, S, P, seedlog)) {
+                    ctx->bank_hist_valid[b] = 0u;    /* partial prefill: state unknown */
+                    ok = false; break;
+                }
+                bank_hist_append_n(ctx, b, req.tokens + P, S);
+            } else if (warm) {
                 /* warm: NO reset -- prefill the suffix on top of the committed state. */
                 const uint32_t P = (uint32_t)req.n_cached, S = L - P;
                 if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
@@ -28830,14 +28914,24 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
  *   C  warm directive with a MUTATED cached token -> engine must reject (degrade
  *      to cold) and match a cold reference byte-for-byte
  *   D  two banks warm in ONE run with out-of-order placement directives
+ *   E  (A2b) fork-by-copy: STRUCTURAL -- a fork admit (D2D bank clone + suffix
+ *      prefill, max_new=1) leaves the committed frontier of BOTH banks exactly
+ *      equal to a directed cold prefill's (source provably untouched); then a
+ *      SECOND fork from the same source (fan-out reuse, long suffix) must
+ *      token-match its cold reference
+ *   F  the source bank still WARM-continues byte-identically after serving two
+ *      forks (the D2D copy is read-only on the source, end to end)
+ *   G  fork directive with a MUTATED cached token -> reject (degrade to cold),
+ *      match the cold reference
  * PASS iff every warm/reject stream matches its cold reference within the control
- * band, every placement landed where directed, and the warm/reject counters moved
+ * band, every placement landed where directed, and the warm/fork counters moved
  * exactly as expected. */
 typedef struct {
     const int *tokens; uint32_t n;
     int place_bank;            /* bank id + 1; 0 = engine's choice */
     int n_cached;              /* warm committed prefix; 0 = cold */
     int bank_used;             /* OUT: engine-reported placement */
+    int fork_bank;             /* A2b: source bank id + 1; 0 = no fork */
 } ds4_warm_gate_req;
 typedef struct {
     ds4_warm_gate_req *reqs;
@@ -28859,6 +28953,7 @@ static int ds4_warm_gate_admit(void *ud, ds4_cont_request *req) {
     req->place_bank = r->place_bank;
     req->n_cached   = r->n_cached;
     req->bank_used  = &r->bank_used;
+    req->fork_bank  = r->fork_bank;
     req->user       = (void *)(uintptr_t)s;
     return 1;
 }
@@ -28891,12 +28986,12 @@ static uint32_t ds4_warm_gate_cmp(const char *label, const int *a, uint32_t la,
     return 1u;
 }
 
-/* dump bank 0's committed compressed cache (counts + values); caller frees. */
-static int ds4_warm_gate_dump(ds4_batch_ctx *ctx, float **vals, uint64_t *nf,
+/* dump banks [0,nbanks)'s committed compressed cache (counts + values); caller frees. */
+static int ds4_warm_gate_dump(ds4_batch_ctx *ctx, uint32_t nbanks, float **vals, uint64_t *nf,
                               uint32_t **cnts, uint32_t *nc) {
     int ok = 0;
     if (ds4_batch_slabs_repoint(&ctx->sl, &ctx->g, 0u, ctx->max_seq))
-        ok = mtp_cont_committed_read(&ctx->g, 1u, vals, nf, cnts, nc);
+        ok = mtp_cont_committed_read(&ctx->g, nbanks, vals, nf, cnts, nc);
     ds4_batch_slabs_restore(&ctx->sl, &ctx->g);
     return ok;
 }
@@ -28946,18 +29041,19 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
     char rerr[256] = {0};
     int rc = 0;
     uint32_t mismA = 0, mismB = 0, mismC = 0, mismD = 0, ctrl = 0, placebad = 0;
-    uint32_t sfrontier_bad = 0, sdumps = 0;
-    double smax_rel = 0.0;
-    uint64_t wa0, wr0;
+    uint32_t mismE = 0, mismF = 0, mismG = 0;
+    uint32_t sfrontier_bad = 0, sdumps = 0, efrontier_bad = 0, edumps = 0;
+    double smax_rel = 0.0, emax_rel = 0.0;
+    uint64_t wa0, wr0, fa0, fr0;
     int *o1[2] = {0}, *o2[2] = {0}; uint32_t l1[2] = {0}, l2[2] = {0};
     int *hist = xmalloc((size_t)ctx->raw_cap * sizeof(int));      /* committed-history snapshot */
     int *full = xmalloc((size_t)ctx->raw_cap * sizeof(int));      /* effective prompt scratch */
-    int *fD1 = NULL, *fD2 = NULL;
+    int *fD1 = NULL, *fD2 = NULL, *trunk = NULL;
     const uint32_t L = (uint32_t)tA.len;
     const int *pA = tA.v;
     if (tA.len <= 0 || tD1.len <= 0 || tD2.len <= 0 || sA.len <= 0 || sB.len <= 0 ||
         sC.len <= 0 || sD1.len <= 0 || sD2.len <= 0 ||
-        L + 4u * T + (uint32_t)(sA.len + sB.len + sC.len) + 16u > ctx->raw_cap) {
+        L + 4u * T + (uint32_t)(sA.len + sB.len + sC.len + sD1.len) + 16u > ctx->raw_cap) {
         WGATE_ERR("cont_warm_gate: prompt construction failed (raw_cap=%u)", ctx->raw_cap);
         rc = 2; goto done;
     }
@@ -28985,7 +29081,7 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
      * MoE expert flips can spike single elements legitimately -- M3). */
     for (uint32_t align = 0; align <= 1u; align++) {
         const uint32_t seedT = 1u + align;
-        ds4_warm_gate_req rs = { pA, L, 1, 0, -1 };
+        ds4_warm_gate_req rs = { pA, L, 1, 0, -1, 0 };
         if (ds4_warm_gate_run(ctx, &rs, 1u, seedT, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
             WGATE_ERR("cont_warm_gate: phase S seed run failed: %s", rerr); rc = 2; goto done; }
         free(o1[0]); o1[0] = NULL;
@@ -28995,7 +29091,7 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
         memcpy(full + P, sA.v, (size_t)sA.len * sizeof(int));
         const uint32_t nS = P + (uint32_t)sA.len;
         wa0 = ctx->warm_admits;
-        ds4_warm_gate_req rw = { full, nS, 1, (int)P, -1 };
+        ds4_warm_gate_req rw = { full, nS, 1, (int)P, -1, 0 };
         if (ds4_warm_gate_run(ctx, &rw, 1u, 1u, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
             WGATE_ERR("cont_warm_gate: phase S warm run failed: %s", rerr); rc = 2; goto done; }
         free(o1[0]); o1[0] = NULL;
@@ -29003,13 +29099,13 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
             WGATE_ERR("cont_warm_gate: phase S warm admit not taken (align %u)", align); rc = 2; goto done; }
         float *vw = NULL, *vc = NULL; uint32_t *cw = NULL, *cc = NULL;
         uint64_t nfw = 0, nfc = 0; uint32_t ncw = 0, ncc = 0;
-        const int dok_w = ds4_warm_gate_dump(ctx, &vw, &nfw, &cw, &ncw);
-        ds4_warm_gate_req rcold = { full, nS, 1, 0, -1 };
+        const int dok_w = ds4_warm_gate_dump(ctx, 1u, &vw, &nfw, &cw, &ncw);
+        ds4_warm_gate_req rcold = { full, nS, 1, 0, -1, 0 };
         if (ds4_warm_gate_run(ctx, &rcold, 1u, 1u, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
             free(vw); free(cw);
             WGATE_ERR("cont_warm_gate: phase S cold run failed: %s", rerr); rc = 2; goto done; }
         free(o1[0]); o1[0] = NULL;
-        const int dok_c = ds4_warm_gate_dump(ctx, &vc, &nfc, &cc, &ncc);
+        const int dok_c = ds4_warm_gate_dump(ctx, 1u, &vc, &nfc, &cc, &ncc);
         if (dok_w && dok_c) {
             int fsame; double mabs, mrel;
             gate_cc_compare(vw, nfw, cw, ncw, vc, nfc, cc, ncc, &fsame, &mabs, &mrel);
@@ -29028,7 +29124,7 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
 
     /* ---- Phase A: cold seed, then warm short-suffix vs directed cold (+ control). */
     {
-        ds4_warm_gate_req r0 = { pA, L, 1, 0, -1 };
+        ds4_warm_gate_req r0 = { pA, L, 1, 0, -1, 0 };
         WGATE_RUN1(r0, &o1[0], &l1[0]);
         if (l1[0] != T) { WGATE_ERR("cont_warm_gate: seed run produced %u/%u tokens", l1[0], T); rc = 2; goto done; }
         WGATE_SNAP(0, L + T - 1u, "A");
@@ -29038,18 +29134,18 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
         const uint32_t n1 = hl + (uint32_t)sA.len;
         free(o1[0]); o1[0] = NULL;
         wa0 = ctx->warm_admits; wr0 = ctx->warm_rejects;
-        ds4_warm_gate_req rw = { full, n1, 1, (int)hl, -1 };
+        ds4_warm_gate_req rw = { full, n1, 1, (int)hl, -1, 0 };
         WGATE_RUN1(rw, &o1[0], &l1[0]);                            /* WARM */
         if (ctx->warm_admits != wa0 + 1u || ctx->warm_rejects != wr0) {
             WGATE_ERR("cont_warm_gate: phase A warm admit not taken (admits %llu->%llu rejects %llu->%llu)",
                       (unsigned long long)wa0, (unsigned long long)ctx->warm_admits,
                       (unsigned long long)wr0, (unsigned long long)ctx->warm_rejects);
             rc = 2; goto done; }
-        ds4_warm_gate_req rc1 = { full, n1, 1, 0, -1 };
+        ds4_warm_gate_req rc1 = { full, n1, 1, 0, -1, 0 };
         WGATE_RUN1(rc1, &o2[0], &l2[0]);                           /* directed COLD ref */
         mismA = ds4_warm_gate_cmp("A warm-vs-cold", o1[0], l1[0], o2[0], l2[0]);
         free(o1[0]); o1[0] = NULL;
-        ds4_warm_gate_req rc2 = { full, n1, 1, 0, -1 };
+        ds4_warm_gate_req rc2 = { full, n1, 1, 0, -1, 0 };
         WGATE_RUN1(rc2, &o1[0], &l1[0]);                           /* cold CONTROL */
         ctrl = ds4_warm_gate_cmp("A cold-vs-cold ctrl", o1[0], l1[0], o2[0], l2[0]);
         free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
@@ -29061,11 +29157,11 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
         memcpy(full + h2, sB.v, (size_t)sB.len * sizeof(int));
         const uint32_t n2 = h2 + (uint32_t)sB.len;
         wa0 = ctx->warm_admits;
-        ds4_warm_gate_req rw2 = { full, n2, 1, (int)h2, -1 };
+        ds4_warm_gate_req rw2 = { full, n2, 1, (int)h2, -1, 0 };
         WGATE_RUN1(rw2, &o1[0], &l1[0]);                           /* WARM, long suffix */
         if (ctx->warm_admits != wa0 + 1u) {
             WGATE_ERR("cont_warm_gate: phase B warm admit not taken"); rc = 2; goto done; }
-        ds4_warm_gate_req rc3 = { full, n2, 1, 0, -1 };
+        ds4_warm_gate_req rc3 = { full, n2, 1, 0, -1, 0 };
         WGATE_RUN1(rc3, &o2[0], &l2[0]);                           /* directed COLD ref */
         mismB = ds4_warm_gate_cmp("B warm-long-vs-cold", o1[0], l1[0], o2[0], l2[0]);
         free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
@@ -29078,11 +29174,11 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
         memcpy(full + h3, sC.v, (size_t)sC.len * sizeof(int));
         const uint32_t n3 = h3 + (uint32_t)sC.len;
         wa0 = ctx->warm_admits; wr0 = ctx->warm_rejects;
-        ds4_warm_gate_req rr = { full, n3, 1, (int)h3, -1 };
+        ds4_warm_gate_req rr = { full, n3, 1, (int)h3, -1, 0 };
         WGATE_RUN1(rr, &o1[0], &l1[0]);                            /* must DEGRADE to cold */
         if (ctx->warm_admits != wa0 || ctx->warm_rejects != wr0 + 1u) {
             WGATE_ERR("cont_warm_gate: phase C mutated prefix was NOT rejected"); rc = 2; goto done; }
-        ds4_warm_gate_req rc4 = { full, n3, 1, 0, -1 };
+        ds4_warm_gate_req rc4 = { full, n3, 1, 0, -1, 0 };
         WGATE_RUN1(rc4, &o2[0], &l2[0]);                           /* directed COLD ref */
         mismC = ds4_warm_gate_cmp("C reject-vs-cold", o1[0], l1[0], o2[0], l2[0]);
         free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
@@ -29092,8 +29188,8 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
     {
         const uint32_t LD1 = (uint32_t)tD1.len, LD2 = (uint32_t)tD2.len;
         ds4_warm_gate_req seedD[2] = {
-            { tD1.v, LD1, 1, 0, -1 },
-            { tD2.v, LD2, 2, 0, -1 },
+            { tD1.v, LD1, 1, 0, -1, 0 },
+            { tD2.v, LD2, 2, 0, -1, 0 },
         };
         if (ds4_warm_gate_run(ctx, seedD, 2u, T, o1, l1, rerr, sizeof(rerr)) != 0) {
             WGATE_ERR("cont_warm_gate: phase D seed run failed: %s", rerr); rc = 2; goto done; }
@@ -29110,8 +29206,8 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
         memcpy(fD2 + hD2, sD2.v, (size_t)sD2.len * sizeof(int));
         wa0 = ctx->warm_admits;
         ds4_warm_gate_req warmD[2] = {                /* bank 1 FIRST: out-of-order */
-            { fD2, hD2 + (uint32_t)sD2.len, 2, (int)hD2, -1 },
-            { fD1, hD1 + (uint32_t)sD1.len, 1, (int)hD1, -1 },
+            { fD2, hD2 + (uint32_t)sD2.len, 2, (int)hD2, -1, 0 },
+            { fD1, hD1 + (uint32_t)sD1.len, 1, (int)hD1, -1, 0 },
         };
         if (ds4_warm_gate_run(ctx, warmD, 2u, T, o1, l1, rerr, sizeof(rerr)) != 0) {
             WGATE_ERR("cont_warm_gate: phase D warm run failed: %s", rerr); rc = 2; goto done; }
@@ -29119,31 +29215,136 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
             WGATE_ERR("cont_warm_gate: phase D expected 2 warm admits"); rc = 2; goto done; }
         if (warmD[0].bank_used != 1 || warmD[1].bank_used != 0) placebad++;
         ds4_warm_gate_req coldD[2] = {
-            { fD2, hD2 + (uint32_t)sD2.len, 2, 0, -1 },
-            { fD1, hD1 + (uint32_t)sD1.len, 1, 0, -1 },
+            { fD2, hD2 + (uint32_t)sD2.len, 2, 0, -1, 0 },
+            { fD1, hD1 + (uint32_t)sD1.len, 1, 0, -1, 0 },
         };
         if (ds4_warm_gate_run(ctx, coldD, 2u, T, o2, l2, rerr, sizeof(rerr)) != 0) {
             WGATE_ERR("cont_warm_gate: phase D cold run failed: %s", rerr); rc = 2; goto done; }
         mismD = ds4_warm_gate_cmp("D bank1 warm-vs-cold", o1[0], l1[0], o2[0], l2[0]) +
                 ds4_warm_gate_cmp("D bank0 warm-vs-cold", o1[1], l1[1], o2[1], l2[1]);
+        free(o1[0]); free(o1[1]); o1[0] = o1[1] = NULL;
+        free(o2[0]); free(o2[1]); o2[0] = o2[1] = NULL;
     }
 
-    /* PASS iff the structural frontier is exact, no warm/reject stream diverges
-     * beyond the inherent control band, and every directive landed in its bank. */
-    rc = (sfrontier_bad == 0u && mismA <= ctrl && mismB <= ctrl && mismC <= ctrl &&
-          mismD <= 2u * ctrl && placebad == 0u) ? 0 : 1;
+    /* ---- Phase E: A2b fork-by-copy.  Fresh trunk in bank 0, then (structural)
+     * a fork into bank 1 must leave BOTH banks' committed frontiers exactly
+     * equal to a directed cold prefill's -- the dump covers banks [0,2), so a
+     * fork that perturbed its source would fail here too; then (stream) a
+     * SECOND fork from the same trunk with the LONG suffix must token-match
+     * its cold reference (fan-out: one trunk serving repeated forks). */
+    {
+        ds4_warm_gate_req e0 = { pA, L, 1, 0, -1, 0 };
+        WGATE_RUN1(e0, &o1[0], &l1[0]);
+        free(o1[0]); o1[0] = NULL;
+        const uint32_t hE = L + T - 1u;
+        WGATE_SNAP(0, hE, "E");
+        trunk = xmalloc((size_t)hE * sizeof(int));
+        memcpy(trunk, hist, (size_t)hE * sizeof(int));
+        /* E structural: fork (max_new=1), dump, directed cold, dump, compare. */
+        memcpy(full, trunk, (size_t)hE * sizeof(int));
+        memcpy(full + hE, sA.v, (size_t)sA.len * sizeof(int));
+        const uint32_t nE1 = hE + (uint32_t)sA.len;
+        fa0 = ctx->fork_admits; fr0 = ctx->fork_rejects;
+        ds4_warm_gate_req ef1 = { full, nE1, 2, (int)hE, -1, 1 };
+        if (ds4_warm_gate_run(ctx, &ef1, 1u, 1u, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
+            WGATE_ERR("cont_warm_gate: phase E fork run failed: %s", rerr); rc = 2; goto done; }
+        free(o1[0]); o1[0] = NULL;
+        if (ef1.bank_used != 1) placebad++;
+        if (ctx->fork_admits != fa0 + 1u || ctx->fork_rejects != fr0) {
+            WGATE_ERR("cont_warm_gate: phase E fork admit not taken (admits %llu->%llu rejects %llu->%llu)",
+                      (unsigned long long)fa0, (unsigned long long)ctx->fork_admits,
+                      (unsigned long long)fr0, (unsigned long long)ctx->fork_rejects);
+            rc = 2; goto done; }
+        float *vw = NULL, *vc = NULL; uint32_t *cw = NULL, *cc = NULL;
+        uint64_t nfw = 0, nfc = 0; uint32_t ncw = 0, ncc = 0;
+        const int dok_w = ds4_warm_gate_dump(ctx, 2u, &vw, &nfw, &cw, &ncw);
+        ds4_warm_gate_req ec1 = { full, nE1, 2, 0, -1, 0 };
+        if (ds4_warm_gate_run(ctx, &ec1, 1u, 1u, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
+            free(vw); free(cw);
+            WGATE_ERR("cont_warm_gate: phase E cold run failed: %s", rerr); rc = 2; goto done; }
+        free(o1[0]); o1[0] = NULL;
+        const int dok_c = ds4_warm_gate_dump(ctx, 2u, &vc, &nfc, &cc, &ncc);
+        if (dok_w && dok_c) {
+            int fsame; double mabs, mrel;
+            gate_cc_compare(vw, nfw, cw, ncw, vc, nfc, cc, ncc, &fsame, &mabs, &mrel);
+            edumps++;
+            if (!fsame) efrontier_bad++;
+            if (mrel > emax_rel) emax_rel = mrel;
+            fprintf(stderr, "ds4: CONT_WARM_GATE[E struct] P=%u S=%d frontier(banks 0+1)=%s "
+                    "max_abs=%.3g max_rel=%.3g (values informational, cross-packing FP)\n",
+                    hE, sA.len, fsame ? "same" : "DIFF", mabs, mrel);
+        } else {
+            fprintf(stderr, "ds4: CONT_WARM_GATE[E struct] dump unavailable (comp cache not FP32?) -- skipped\n");
+        }
+        free(vw); free(cw); free(vc); free(cc);
+        /* E stream: second fork from the SAME trunk, long suffix, full budget. */
+        memcpy(full, trunk, (size_t)hE * sizeof(int));
+        memcpy(full + hE, sB.v, (size_t)sB.len * sizeof(int));
+        const uint32_t nE2 = hE + (uint32_t)sB.len;
+        fa0 = ctx->fork_admits;
+        ds4_warm_gate_req ef2 = { full, nE2, 2, (int)hE, -1, 1 };
+        WGATE_RUN1(ef2, &o1[0], &l1[0]);                           /* FORK, long suffix */
+        if (ctx->fork_admits != fa0 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase E second fork admit not taken"); rc = 2; goto done; }
+        ds4_warm_gate_req ec2 = { full, nE2, 2, 0, -1, 0 };
+        WGATE_RUN1(ec2, &o2[0], &l2[0]);                           /* directed COLD ref */
+        mismE = ds4_warm_gate_cmp("E fork-vs-cold", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
+
+        /* ---- Phase F: the trunk must still warm-continue byte-identically after
+         * serving two forks (the D2D copy is read-only on the source). */
+        memcpy(full, trunk, (size_t)hE * sizeof(int));
+        memcpy(full + hE, sC.v, (size_t)sC.len * sizeof(int));
+        const uint32_t nF = hE + (uint32_t)sC.len;
+        wa0 = ctx->warm_admits;
+        ds4_warm_gate_req fw = { full, nF, 1, (int)hE, -1, 0 };
+        WGATE_RUN1(fw, &o1[0], &l1[0]);                            /* WARM trunk */
+        if (ctx->warm_admits != wa0 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase F trunk warm admit not taken after forks"); rc = 2; goto done; }
+        ds4_warm_gate_req fc = { full, nF, 1, 0, -1, 0 };
+        WGATE_RUN1(fc, &o2[0], &l2[0]);                            /* directed COLD ref */
+        mismF = ds4_warm_gate_cmp("F trunk-warm-after-forks", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
+
+        /* ---- Phase G: mutated cached token in a fork -> reject (degrade to cold). */
+        const uint32_t hG = nE2 + T - 1u;          /* bank 1 = phase E's cold ref state */
+        WGATE_SNAP(1, hG, "G");
+        memcpy(full, hist, (size_t)hG * sizeof(int));
+        full[5] = full[5] == 777 ? 778 : 777;                      /* corrupt the cached region */
+        memcpy(full + hG, sD1.v, (size_t)sD1.len * sizeof(int));
+        const uint32_t nG = hG + (uint32_t)sD1.len;
+        fa0 = ctx->fork_admits; fr0 = ctx->fork_rejects;
+        ds4_warm_gate_req gr = { full, nG, 1, (int)hG, -1, 2 };
+        WGATE_RUN1(gr, &o1[0], &l1[0]);                            /* must DEGRADE to cold */
+        if (ctx->fork_admits != fa0 || ctx->fork_rejects != fr0 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase G mutated fork prefix was NOT rejected"); rc = 2; goto done; }
+        ds4_warm_gate_req gc = { full, nG, 1, 0, -1, 0 };
+        WGATE_RUN1(gc, &o2[0], &l2[0]);                            /* directed COLD ref */
+        mismG = ds4_warm_gate_cmp("G fork-reject-vs-cold", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
+    }
+
+    /* PASS iff the structural frontiers are exact, no warm/fork/reject stream
+     * diverges beyond the inherent control band, and every directive landed in
+     * its bank. */
+    rc = (sfrontier_bad == 0u && efrontier_bad == 0u && mismA <= ctrl && mismB <= ctrl &&
+          mismC <= ctrl && mismD <= 2u * ctrl && mismE <= ctrl && mismF <= ctrl &&
+          mismG <= ctrl && placebad == 0u) ? 0 : 1;
     fprintf(stderr, "ds4: CONT_WARM_GATE T=%u L=%u sA=%d sB=%d ctrl=%u "
-            "S(frontier_bad=%u/%u max_rel=%.3g) A=%u B=%u C=%u D=%u placebad=%u "
-            "warm_admits=%llu warm_rejects=%llu -> %s\n",
+            "S(frontier_bad=%u/%u max_rel=%.3g) A=%u B=%u C=%u D=%u "
+            "E(frontier_bad=%u/%u max_rel=%.3g)=%u F=%u G=%u placebad=%u "
+            "warm_admits=%llu warm_rejects=%llu fork_admits=%llu fork_rejects=%llu -> %s\n",
             T, L, sA.len, sB.len, ctrl, sfrontier_bad, sdumps, smax_rel,
-            mismA, mismB, mismC, mismD, placebad,
+            mismA, mismB, mismC, mismD, efrontier_bad, edumps, emax_rel,
+            mismE, mismF, mismG, placebad,
             (unsigned long long)ctx->warm_admits, (unsigned long long)ctx->warm_rejects,
+            (unsigned long long)ctx->fork_admits, (unsigned long long)ctx->fork_rejects,
             rc == 0 ? "PASS" : "FAIL");
 
 done:
     ctx->mtp_draft_mode = saved_mode;
     free(o1[0]); free(o1[1]); free(o2[0]); free(o2[1]);
-    free(hist); free(full); free(fD1); free(fD2);
+    free(hist); free(full); free(fD1); free(fD2); free(trunk);
     ds4_tokens_free(&tA); ds4_tokens_free(&tD1); ds4_tokens_free(&tD2);
     ds4_tokens_free(&sA); ds4_tokens_free(&sB); ds4_tokens_free(&sC);
     ds4_tokens_free(&sD1); ds4_tokens_free(&sD2);

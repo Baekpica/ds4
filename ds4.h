@@ -247,6 +247,18 @@ typedef struct {
                             /* 0 = cold admit                                  */
     int       *bank_used;   /* OUT (optional): engine writes the bank id this */
                             /* request was placed in, at admit time           */
+    /* A2b fork-by-copy.  fork_bank = source bank id + 1 (0 = no fork): the
+     * request's tokens[0..n_cached) must equal the SOURCE bank's committed
+     * history (ENGINE-VALIDATED, like warm; the source must also be idle --
+     * not generating).  The engine D2D-copies the source bank's committed
+     * state into the target bank (place_bank directive or engine's pick) and
+     * prefills only tokens[n_cached..n), leaving the source bank untouched --
+     * N requests sharing a long prefix pay one prefill + N cheap copies.
+     * Any validation failure degrades to a cold admit.  When fork_bank > 0,
+     * n_cached describes the SOURCE bank (warm matching is skipped); if the
+     * target resolves to the source itself the fork becomes a plain warm
+     * admit (no copy). */
+    int        fork_bank;   /* source bank id + 1; 0 = no fork                */
 } ds4_cont_request;
 /* A2a: a bank's committed token history (engine-authoritative bookkeeping for
  * warm start).  *toks points at ctx-owned storage, valid until the next admit
@@ -288,8 +300,13 @@ int  ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen);
  * admit's token stream matches a cold full prefill of the same effective prompt,
  * including a chained second warm turn and a LONG suffix; (c) a non-matching
  * cached prefix is rejected and degrades to a byte-identical cold run; (d) two
- * banks warm in one run with out-of-order placement directives.  Needs only a
- * batch ctx (no --mtp).  Returns 0 PASS, 1 MISMATCH, 2 setup error. */
+ * banks warm in one run with out-of-order placement directives.  A2b adds the
+ * fork-by-copy phases: (e) a fork admit (D2D bank copy + suffix prefill) is
+ * STRUCTURALLY frontier-exact vs a cold prefill and token-matches it, including
+ * a second fork from the same source (fan-out reuse); (f) the source bank still
+ * warm-continues byte-identically after serving two forks; (g) a fork with a
+ * mutated cached token is rejected and degrades to cold.  Needs only a batch
+ * ctx (no --mtp).  Returns 0 PASS, 1 MISMATCH, 2 setup error. */
 int  ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen);
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
