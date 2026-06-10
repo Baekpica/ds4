@@ -12380,12 +12380,14 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_fp8,
         const ds4_gpu_tensor *comp_scale,
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                allow_mseq_heads8) {
     /* Opp C Phase 1A.3: Metal mirror lives in CUDA only today; ignore. */
     (void)comp_fp8;
     (void)comp_scale;
     (void)comp_cap;  /* Phase 2 Step 4a: per-seq compressed bank is CUDA-only. */
     (void)positions; (void)seq_id;  /* Phase 2 Step 3: CUDA-only (see store stub). */
+    (void)allow_mseq_heads8;  /* FB1: per-seq heads8 fast path is CUDA-only. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -12467,12 +12469,14 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_fp8,
         const ds4_gpu_tensor *comp_scale,
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                allow_mseq_heads8) {
     (void)scalars; (void)il_for_decode1; (void)comp_cap;  /* Step 4b: CUDA-only. */
     /* Opp C Phase 1A.4: Metal mirror lives in CUDA only today; ignore. */
     (void)comp_fp8;
     (void)comp_scale;
     (void)positions; (void)seq_id;  /* Phase 2 Step 3: CUDA-only (see store stub). */
+    (void)allow_mseq_heads8;  /* FB1: per-seq heads8 fast path is CUDA-only. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||

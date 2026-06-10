@@ -6823,7 +6823,18 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        /* FB1 (per-seq admission chunks): optional per-row positions[]/seq_id[]
+         * + per-seq compressed bank stride, mirroring the generic
+         * attention_indexed_mixed_kernel semantics exactly: per-row raw window
+         * derived from positions[t], raw ring base seq_id[t]*raw_cap, comp bank
+         * base seq_id[t]*comp_cap, floor(qpos/ratio) per-row visible clamp, and
+         * the deterministic single-thread topk compaction (the topk may carry
+         * -1 / over-visible ids per row in multi-seq).  All NULL/0 keeps the
+         * single-seq path bit-exact. */
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        uint32_t comp_cap) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -6833,23 +6844,35 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     const bool valid_head = head < n_head;
 
     __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t comp_rows[512];
     __shared__ uint32_t raw_count;
     __shared__ uint32_t raw_first_idx;
+    __shared__ uint32_t comp_count_s;
     __shared__ float4 kv_shared[ROWS_PER_STAGE * 128];
 
-    uint32_t qpos = pos0 + t;
-    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t row_n_raw     = n_raw;
+    uint32_t row_raw_start = raw_start;
+    if (positions) {
+        row_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (row_n_raw > raw_cap) row_n_raw = raw_cap;
+        row_raw_start = (qpos + 1u - row_n_raw) % raw_cap;
+    }
+    uint32_t first_raw_pos = positions ? (qpos + 1u - row_n_raw) : (pos0 + n_tokens - n_raw);
+    const uint32_t seq_base      = seq_id ? (uint32_t)seq_id[t] * raw_cap  : 0u;
+    const uint32_t comp_seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
     uint32_t visible_comp = n_comp;
     if (ratio != 0) {
         visible_comp = (qpos + 1u) / ratio;
+        if (positions && visible_comp > qpos / ratio) visible_comp = qpos / ratio;
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
 
     if (threadIdx.x == 0) {
         raw_count = 0;
         raw_first_idx = 0;
-        if (n_raw != 0) {
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (row_n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + row_n_raw - 1u;
             if (qpos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
                 if (window != 0 && qpos + 1u > window) {
@@ -6864,15 +6887,32 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
                 }
             }
         }
+        /* FB1: deterministic per-row topk compaction (multi-seq only) -- the
+         * same order-preserving single-thread fill as the generic kernel (see
+         * the 2026-05-26 nondeterminism postmortem there). */
+        comp_count_s = 0;
+        if (positions) {
+            uint32_t cc = 0;
+            for (uint32_t i = 0; i < top_k && cc < 512u; i++) {
+                const int32_t c = topk[(uint64_t)t * top_k + i];
+                if (c >= 0 && (uint32_t)c < visible_comp) comp_rows[cc++] = (uint32_t)c;
+            }
+            comp_count_s = cc;
+        }
     }
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = seq_base + ((row_raw_start + raw_first_idx + r) % raw_cap);
     }
     __syncthreads();
 
-    uint32_t comp_count = top_k < visible_comp ? top_k : visible_comp;
-    if (comp_count > 512u) comp_count = 512u;
+    uint32_t comp_count;
+    if (positions) {
+        comp_count = comp_count_s;
+    } else {
+        comp_count = top_k < visible_comp ? top_k : visible_comp;
+        if (comp_count > 512u) comp_count = 512u;
+    }
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
@@ -6900,10 +6940,11 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
             const uint32_t sr = row0 + rr;
             const uint32_t comp_idx = sr < raw_count
                 ? 0u
-                : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
+                : (positions ? comp_rows[sr - raw_count]
+                             : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)]);
             const float4 *src = sr < raw_count
                 ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim);
+                : (const float4 *)(comp_kv + (uint64_t)(comp_seq_base + comp_idx) * head_dim);
             kv_shared[off] = src[c4];
         }
         __syncthreads();
@@ -7111,6 +7152,15 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
+        /* FB1 (per-seq admission chunks): optional per-row positions[]/seq_id[]
+         * + per-seq compressed bank stride, mirroring the generic
+         * attention_decode_mixed_kernel semantics exactly (per-row raw window
+         * from positions[t], raw ring base seq_id[t]*raw_cap, comp bank base
+         * seq_id[t]*comp_cap, floor(qpos/ratio) per-row visible clamp).  All
+         * NULL/0 keeps the single-seq path bit-exact. */
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        uint32_t comp_cap,
         const struct ds4_decode_scalars * __restrict__ s_override,
         /* Step 4c A1: per-layer n_comp override. */
         const struct ds4_layer_scalars  * __restrict__ ls_override) {
@@ -7134,22 +7184,33 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     __shared__ uint32_t raw_first_idx_s;
     __shared__ float4 kv_shared[4 * 128];
 
-    const uint32_t qpos = pos0 + t;
-    const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t row_n_raw     = n_raw;
+    uint32_t row_raw_start = raw_start;
+    if (positions) {
+        row_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (row_n_raw > raw_cap) row_n_raw = raw_cap;
+        row_raw_start = (qpos + 1u - row_n_raw) % raw_cap;
+    }
+    const uint32_t first_raw_pos = positions ? (qpos + 1u - row_n_raw)
+                                             : (pos0 + n_tokens - n_raw);
+    const uint32_t seq_base      = seq_id ? (uint32_t)seq_id[t] * raw_cap  : 0u;
+    const uint32_t comp_seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
     uint32_t comp_count = 0;
     if (n_comp != 0u) {
         if (n_tokens == 1u && ratio == 0u) {
             comp_count = n_comp;
         } else if (ratio != 0u) {
             comp_count = (qpos + 1u) / ratio;
+            if (positions && comp_count > qpos / ratio) comp_count = qpos / ratio;
             if (comp_count > n_comp) comp_count = n_comp;
         }
     }
     if (threadIdx.x == 0) {
         uint32_t raw_count = 0;
         uint32_t raw_first_idx = 0;
-        if (n_raw != 0u) {
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (row_n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + row_n_raw - 1u;
             if (qpos >= first_raw_pos) {
                 uint32_t lo = first_raw_pos;
                 if (window != 0u && qpos + 1u > window) {
@@ -7171,7 +7232,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t raw_count = raw_count_s;
     const uint32_t raw_first_idx = raw_first_idx_s;
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
-        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+        raw_rows[r] = seq_base + ((row_raw_start + raw_first_idx + r) % raw_cap);
     }
     __syncthreads();
 
@@ -7202,7 +7263,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t sr = row0 + rr;
             const float4 *src = sr < raw_count
                 ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
+                : (const float4 *)(comp_kv + (uint64_t)(comp_seq_base + (sr - raw_count)) * head_dim);
             kv_shared[off] = src[c4];
         }
         __syncthreads();
@@ -12954,6 +13015,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               0,
                                                                               n_head,
                                                                               head_dim,
+                                                                              /* FB1: single-seq */ (const int32_t *)NULL, (const int32_t *)NULL, 0u,
                                                                               (const struct ds4_decode_scalars *)scalars,
                                                                               ls_override);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
@@ -13165,7 +13227,11 @@ static int attention_decode_batch_launch(
         /* M4b Inc3: optional per-row raw-span override for the batched MTP draft
          * (NULL = every non-draft caller, bit-exact).  Only the main kernel
          * honours it; multi-seq is already forced down that path. */
-        const ds4_gpu_tensor *draft_n_raw) {
+        const ds4_gpu_tensor *draft_n_raw,
+        /* FB1: caller opt-in for the per-seq heads8-online fast path (the
+         * admission-chunk forward).  0 keeps every per-seq caller on the main
+         * kernel (bit-exact pre-FB1); single-seq dispatch is unaffected. */
+        uint32_t                allow_mseq_heads8) {
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -13185,9 +13251,16 @@ static int attention_decode_batch_launch(
     const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
     const int32_t *draft_n_raw_dev = draft_n_raw ? (const int32_t *)draft_n_raw->ptr : NULL;
-    /* Multi-seq (per-row positions/seq) must use the main kernel; the
-     * heads8-online fast paths below are not per-seq aware yet. */
-    const bool force_main_kernel = (pos_dev != NULL || seq_dev != NULL);
+    /* Multi-seq (per-row positions/seq) uses the main kernel UNLESS the caller
+     * opted into the per-seq heads8-online path (FB1: the admission-chunk
+     * forward, wide single-bank batches).  The opt-in additionally requires no
+     * draft-span override and no FP8 mirror (heads8 reads FP32 only) and a
+     * wide batch so decode/MTP shapes keep their exact pre-FB1 kernels. */
+    const bool perseq = (pos_dev != NULL || seq_dev != NULL);
+    const bool mseq_heads8 = perseq && allow_mseq_heads8 != 0u && n_tokens >= 128u &&
+                             draft_n_raw_dev == NULL &&
+                             comp_fp8 == NULL && comp_scale == NULL;
+    const bool force_main_kernel = perseq && !mseq_heads8;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -13210,6 +13283,7 @@ static int attention_decode_batch_launch(
                                                                               ratio,
                                                                               n_head,
                                                                               head_dim,
+                                                                              pos_dev, seq_dev, comp_cap,
                                                                               /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
@@ -13218,7 +13292,8 @@ static int attention_decode_batch_launch(
     }
     if (!force_main_kernel && !use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        (mseq_heads8 ||
+         getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                    sinks,
@@ -13235,6 +13310,7 @@ static int attention_decode_batch_launch(
                                                                    ratio,
                                                                    n_head,
                                                                    head_dim,
+                                                                   pos_dev, seq_dev, comp_cap,
                                                                    /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
@@ -13283,7 +13359,8 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                                       n_raw, raw_cap, raw_start, 0, /*comp_cap=*/0u, window, 1,
                                       n_head, head_dim,
                                       /* comp_fp8 */ NULL, /* comp_scale */ NULL,
-                                      positions, seq_id, draft_n_raw);
+                                      positions, seq_id, draft_n_raw,
+                                      /* FB1 allow_mseq_heads8 */ 0u);
 }
 
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
@@ -13315,14 +13392,18 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_scale,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        /* FB1: caller opt-in for the per-seq heads8-online fast path (the
+         * admission-chunk forward); 0 = pre-FB1 dispatch, bit-exact. */
+        uint32_t                allow_mseq_heads8) {
     if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, comp_cap, window, ratio, n_head, head_dim,
                                       comp_fp8, comp_scale,
-                                      positions, seq_id, /*draft_n_raw=*/NULL);
+                                      positions, seq_id, /*draft_n_raw=*/NULL,
+                                      allow_mseq_heads8);
 }
 
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
@@ -13367,9 +13448,13 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_fp8,
         const ds4_gpu_tensor *comp_scale,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq).
-         * Force the generic kernel (heads8 indexed fast path is not per-seq yet). */
+         * Per-seq runs the generic kernel below UNLESS the caller passes
+         * allow_mseq_heads8 (FB1: the admission-chunk forward). */
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        /* FB1: caller opt-in for the per-seq heads8-online fast path; 0 =
+         * pre-FB1 dispatch (per-seq always generic), bit-exact. */
+        uint32_t                allow_mseq_heads8) {
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -13391,9 +13476,19 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         (seq_id && seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t))) return 0;
     const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
-    /* Multi-seq forces the generic indexed kernel below (heads8 indexed fast
-     * path is not per-seq aware yet). */
-    const bool force_main_kernel = (pos_dev != NULL || seq_dev != NULL);
+    const struct ds4_layer_scalars *ls_override =
+        (g_layer_dev != NULL && il_for_decode1 < DS4_LAYER_SCALARS_COUNT)
+            ? g_layer_dev + il_for_decode1 : NULL;
+    /* Multi-seq runs the generic indexed kernel below unless the caller opted
+     * into the per-seq heads8-online path (FB1).  The opt-in additionally
+     * requires a wide batch and no substrate/scalars/FP8 (heads8 reads inline
+     * args + FP32 only), so decode/MTP/capture shapes keep their exact
+     * pre-FB1 kernels. */
+    const bool perseq = (pos_dev != NULL || seq_dev != NULL);
+    const bool mseq_heads8 = perseq && allow_mseq_heads8 != 0u && n_tokens >= 128u &&
+                             scalars == NULL && ls_override == NULL &&
+                             comp_fp8 == NULL && comp_scale == NULL;
+    const bool force_main_kernel = perseq && !mseq_heads8;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
@@ -13406,7 +13501,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     }
     if (!force_main_kernel && n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
-        if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+        if (perseq || getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+            /* Per-seq always takes the online variant (the rb4 two-pass
+             * experiment is single-seq only). */
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                                sinks,
@@ -13424,7 +13521,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                                window,
                                                                                ratio,
                                                                                n_head,
-                                                                               head_dim);
+                                                                               head_dim,
+                                                                               pos_dev, seq_dev, comp_cap);
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -13447,9 +13545,6 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                  head_dim);
         return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
     }
-    const struct ds4_layer_scalars *ls_override =
-        (g_layer_dev != NULL && il_for_decode1 < DS4_LAYER_SCALARS_COUNT)
-            ? g_layer_dev + il_for_decode1 : NULL;
     /* Opp C Phase 1A.4: prefer the packed FP8 mirror when both pointers are
      * non-NULL.  The heads8 branches above keep reading FP32 -- they never
      * fire at decode (n_tokens==1), so leaving them on FP32 keeps them

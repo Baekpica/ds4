@@ -1076,7 +1076,11 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_scale,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id);
+        const ds4_gpu_tensor *seq_id,
+        /* FB1: caller opt-in for the per-seq heads8-online fast path (the
+         * admission-chunk forward; wide single-bank batches).  0 keeps every
+         * per-seq caller on the generic kernel (pre-FB1 dispatch, bit-exact). */
+        uint32_t                allow_mseq_heads8);
 
 /* Decode-time indexed-attention shim.  See ds4_gpu_attention_decode_heads_
  * tensor for the `scalars` semantics.  Pass NULL for the batched/prefill
@@ -1120,7 +1124,10 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_scale,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq). */
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id);
+        const ds4_gpu_tensor *seq_id,
+        /* FB1: caller opt-in for the per-seq heads8-online fast path; 0 =
+         * pre-FB1 dispatch (per-seq always generic), bit-exact. */
+        uint32_t                allow_mseq_heads8);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
