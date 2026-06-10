@@ -11149,8 +11149,8 @@ static job *dequeue(server *s) {
 #define DS4_COALESCE_HARD_MAX 64
 
 /* A request may be coalesced only when its completion does not depend on any of
- * generate_job()'s richer machinery (tools, stop sequences, token-id echo,
- * anthropic/responses envelopes).
+ * generate_job()'s richer machinery (token-id echo, anthropic/responses
+ * envelopes, the serial session-recovery loops).
  * W7: temperature is NO LONGER a gate -- the continuous engine carries each seq's
  * own temperature/top-k/top-p/min-p/seed (cont_admit) and samples it with an
  * independent RNG stream, so temp>0 requests batch and stay reproducible.  A
@@ -11164,13 +11164,24 @@ static job *dequeue(server *s) {
  * apply the override.)
  * W6: streaming IS batchable -- the continuous path streams each row's tokens as
  * produced (cont_on_token); only OpenAI chat/completion SSE is handled, which is
- * why anthropic/responses (api != API_OPENAI) and token-id echo stay excluded. */
+ * why anthropic/responses (api != API_OPENAI) and token-id echo stay excluded.
+ * A1: STOP STRINGS and TOOL CALLS are batchable too -- the continuous path
+ * scans both host-side per row (cont_on_token mirrors generate_job's per-token
+ * scan) and finalizes with the same parse/response helpers.  Tools stay
+ * greedy-only: generate_job's per-token DSML sampling override (structural
+ * syntax at temp 0, payload at request temp) needs in-flight sampler swaps the
+ * engine's fixed per-seq params can't express, and think-mode forces
+ * stochastic sampling -- both keep falling back to the single path. */
 static bool job_is_batchable(const request *r) {
-    return r->api == API_OPENAI
-        && (r->kind == REQ_CHAT || r->kind == REQ_COMPLETION)
-        && !r->has_tools
-        && !r->return_token_ids
-        && r->stops.len == 0;
+    if (r->api != API_OPENAI) return false;
+    if (r->kind != REQ_CHAT && r->kind != REQ_COMPLETION) return false;
+    if (r->return_token_ids) return false;
+    if (r->has_tools) {
+        if (r->kind != REQ_CHAT) return false;
+        if (r->temperature > 0.0f) return false;
+        if (ds4_think_mode_enabled(r->think_mode)) return false;
+    }
+    return true;
 }
 
 /* The STATIC W3/W4 batched path (coalesce_gather -> generate_batch_jobs) writes one
@@ -11183,7 +11194,11 @@ static bool job_is_batchable(const request *r) {
  * the two callers (coalesce_gather peers + worker_main dispatch) cannot drift. */
 static bool job_is_static_batchable(const request *r) {
     return job_is_batchable(r) && !r->stream && r->temperature <= 0.0f
-        && !ds4_think_mode_enabled(r->think_mode);
+        && !ds4_think_mode_enabled(r->think_mode)
+        /* A1: stop/tool scanning lives in the continuous path only; the static
+         * W3/W4 path would decode straight past a stop string or tool block,
+         * so those requests go serial when no continuous ctx exists. */
+        && !r->has_tools && r->stops.len == 0;
 }
 
 static void job_finish(job *j) {
@@ -11459,8 +11474,9 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
      * W7-followup: when thinking is enabled, generate_job OVERRIDES the sampling
      * params (reasoning is sampled stochastically regardless of the requested
      * temperature) -- mirror that EXACTLY so a batched thinking request matches the
-     * single path.  (Tool-call temp=0 override is N/A: job_is_batchable excludes
-     * tools.)  Otherwise pass the request's own params through (temperature<=0 =>
+     * single path.  (Tool-call per-token temp override is N/A: job_is_batchable
+     * admits tools only at temperature<=0, where the override is a no-op.)
+     * Otherwise pass the request's own params through (temperature<=0 =>
      * the engine samples greedy argmax, matching the W5/W6 path). */
     if (ds4_think_mode_enabled(j->req.think_mode)) {
         req->temperature = DS4_DEFAULT_TEMPERATURE;
@@ -11491,14 +11507,33 @@ struct cont_stream {
     buf    text;          /* cumulative detok'd output (the openai_stream "raw" buffer) */
     /* W7-followup: reuse the single path's OpenAI SSE projection so a thinking
      * request streams reasoning_content vs content with the SAME <think>/</think>
-     * split + hold-back logic.  job_is_batchable still excludes tools + token_ids,
-     * so only the THINKING/TEXT modes are exercised here. */
+     * split + hold-back logic.  A1: the machine's TOOL mode is now exercised too
+     * (it detects DSML starts itself when r->has_tools and streams tool deltas);
+     * token_ids stays excluded. */
     openai_stream ostream;
     int    prompt_tokens; /* for the usage chunk */
-    int    completion;    /* visible (non-EOS) tokens streamed */
+    int    completion;    /* visible (non-EOS) tokens produced */
     bool   started;       /* SSE headers (+ chat role preamble) sent */
     bool   failed;        /* a socket write failed -> stop writing, just finalize */
+    /* A1: host-side stop/tool scan state -- the cont-path port of
+     * generate_job's per-token scan, so stop-string and tool-call requests ride
+     * the batched path.  `text` is also accumulated for NON-streaming rows that
+     * need scanning (cont_needs_text); plain non-streaming rows still skip
+     * detok entirely. */
+    size_t stop_scan_from;     /* rolling stop-window start */
+    size_t tool_scan_from;     /* rolling marker-window start */
+    bool   saw_tool_start;
+    bool   saw_tool_end;
+    bool   saw_orphan_tool_end;
+    const char *finish_override; /* "stop"/"tool_calls": scan verdict; beats the
+                                  * engine's eos/budget finish at finalize */
 };
+
+/* A1: does this row need host-side text (stream projection or stop/tool scan)? */
+static bool cont_needs_text(const request *r) {
+    return r->stream || r->stops.len > 0 ||
+           (r->kind == REQ_CHAT && r->has_tools);
+}
 
 /* Lazily allocate the per-seq stream state (zeroed). */
 static cont_stream *cont_stream_ensure(job *j) {
@@ -11507,6 +11542,16 @@ static cont_stream *cont_stream_ensure(job *j) {
         memset(j->cstream, 0, sizeof(*j->cstream));
     }
     return j->cstream;
+}
+
+/* Free the per-seq state without touching the socket (non-streaming rows, and
+ * the stranded-job fallback before a single-path rerun). */
+static void cont_stream_discard(job *j) {
+    if (!j->cstream) return;
+    openai_stream_free(&j->cstream->ostream);
+    buf_free(&j->cstream->text);
+    free(j->cstream);
+    j->cstream = NULL;
 }
 
 /* Send SSE headers + (chat) role preamble and mint the completion id.  Sets
@@ -11524,51 +11569,214 @@ static void cont_stream_start(server *s, job *j) {
         st->failed = true;                     /* {"delta":{"role":"assistant"}} */
 }
 
+/* A1: resolve a finished chat row's accumulated text into content/reasoning/
+ * tool calls -- the generate_job tail (truncation repair + parse + id
+ * assignment + tool memory), MINUS the serial session-recovery loop the
+ * batched path cannot run: an unrepairable/unparsable block lands exactly
+ * where the serial STREAMING branch lands (raw text fallback / "error"
+ * finish), it just can't feed the model a corrective tool error mid-flight.
+ * May replace st->text with the repaired block (the serial buf_take pattern). */
+static void cont_resolve_chat(server *s, job *j, cont_stream *st,
+                              const char **fin_io,
+                              char **content, char **reasoning,
+                              tool_calls *calls) {
+    if (j->req.has_tools && st->saw_tool_start && !st->saw_tool_end) {
+        /* Budget/eviction cut the block: deterministically complete a simple
+         * truncation (verify the repaired text actually parses to calls). */
+        buf repaired = {0};
+        if (try_repair_dsml(st->text.ptr, st->text.len, &repaired)) {
+            tool_calls tc = {0};
+            char *c2 = NULL, *r2 = NULL;
+            if (parse_generated_message_ex(repaired.ptr, false, &c2, &r2, &tc) &&
+                tc.len > 0) {
+                free(st->text.ptr);
+                st->text.ptr = buf_take(&repaired);
+                st->text.len = strlen(st->text.ptr);
+                st->saw_tool_end = true;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: cont chat repaired unterminated tool call (%d calls recovered)",
+                           tc.len);
+            } else {
+                buf_free(&repaired);
+            }
+            free(c2);
+            free(r2);
+            tool_calls_free(&tc);
+        } else {
+            buf_free(&repaired);
+        }
+        if (!st->saw_tool_end) *fin_io = "error";
+    }
+    char perr[160] = {0};
+    bool recovered = false;
+    parse_generated_message_for_response(st->text.ptr ? st->text.ptr : "",
+                                         j->req.has_tools, st->saw_tool_start,
+                                         ds4_think_mode_enabled(j->req.think_mode),
+                                         fin_io, perr, sizeof(perr),
+                                         content, reasoning, calls, &recovered);
+    if (recovered)
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: cont chat invalid tool call returned as assistant text finish=%s",
+                   *fin_io);
+    if (calls->len) {
+        if (j->req.stream) apply_openai_stream_tool_ids(calls, &st->ostream);
+        assign_tool_call_ids(s, calls, j->req.api);
+        tool_memory_remember(s, calls);
+        *fin_io = "tool_calls";
+    }
+}
+
 /* Flush any held-back tail, emit the finish chunk + [DONE], and free the state.
- * fin is "stop" (EOS) or "length" (budget/aborted).  Does NOT job_finish (caller
+ * fin is "stop" (EOS) or "length" (budget/aborted); a host-side scan verdict
+ * (stop string / closed tool block) overrides it.  Does NOT job_finish (caller
  * does, as the last touch). */
 static void cont_stream_finalize(server *s, job *j, const char *fin) {
     cont_stream *st = cont_stream_ensure(j);   /* empty completion (EOS at seed) still closes cleanly */
     if (!st->started) cont_stream_start(s, j);
+    if (st->finish_override) fin = st->finish_override;
+    /* A1: chat rows resolve tool calls/reasoning exactly like the single path;
+     * the SSE machine already streamed tool deltas (TOOL mode), so finish_live
+     * only emits the tool_calls delta when none were streamed. */
+    tool_calls calls = {0};
+    char *content = NULL, *reasoning = NULL;
+    if (j->req.kind == REQ_CHAT && j->req.has_tools)
+        cont_resolve_chat(s, j, st, &fin, &content, &reasoning, &calls);
     /* Flush any held-back reasoning/content tail, emit the finish chunk + usage +
-     * [DONE] -- the exact single-path finalize (no tools on this path). */
+     * [DONE] -- the exact single-path finalize. */
     if (!st->failed) {
-        tool_calls empty = {0};
         if (!openai_sse_finish_live(j->fd, s, &j->req, st->id, &st->ostream,
                                     st->text.ptr ? st->text.ptr : "", st->text.len,
-                                    &empty, fin, st->prompt_tokens, st->completion))
+                                    &calls, fin, st->prompt_tokens, st->completion))
             st->failed = true;
     }
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
     openai_stream_free(&st->ostream);
     buf_free(&st->text);
     free(st);
     j->cstream = NULL;
 }
 
-/* on_token: stream one non-EOS token as a content delta.  Returns 0 to tell the
- * engine to ABORT this sequence (client gone / write stalled), 1 to continue. */
+/* A1: format a NON-streaming continuous row's response from its host-side
+ * accumulated text (stop-truncated / tool-scanned) -- write_batch_completion's
+ * shape, but from st->text instead of a re-detok, with scan-verdict finish
+ * semantics and real tool parsing.  Frees the cont_stream state. */
+static void write_cont_completion(server *s, job *j, int engine_finish) {
+    cont_stream *st = j->cstream;
+    char id[96];
+    snprintf(id, sizeof(id), "%s-%llu",
+             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+             (unsigned long long)++s->seq);
+    const char *fin = st->finish_override ? st->finish_override
+                                          : (engine_finish ? "stop" : "length");
+    const int prompt_tokens = j->req.prompt.len;
+
+    if (j->req.kind == REQ_CHAT) {
+        tool_calls calls = {0};
+        char *content = NULL, *reasoning = NULL;
+        if (j->req.has_tools) {
+            cont_resolve_chat(s, j, st, &fin, &content, &reasoning, &calls);
+        } else {
+            char perr[160] = {0};
+            bool recovered = false;
+            parse_generated_message_for_response(st->text.ptr ? st->text.ptr : "",
+                                                 false /*has_tools*/, false /*saw_tool_start*/,
+                                                 ds4_think_mode_enabled(j->req.think_mode),
+                                                 &fin, perr, sizeof(perr),
+                                                 &content, &reasoning, &calls, &recovered);
+        }
+        final_response(j->fd, s->enable_cors, &j->req, id,
+                       content ? content : (st->text.ptr ? st->text.ptr : ""),
+                       reasoning, &calls, fin, prompt_tokens, st->completion);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    } else {
+        tool_calls empty = {0};
+        final_response(j->fd, s->enable_cors, &j->req, id,
+                       st->text.ptr ? st->text.ptr : "", NULL, &empty, fin,
+                       prompt_tokens, st->completion);
+    }
+    cont_stream_discard(j);
+}
+
+/* on_token: accumulate one non-EOS token, run the host-side stop/tool scan
+ * (A1: the cont-path port of generate_job's per-token scan), and stream a
+ * content delta when the row is streaming.  Returns 0 to tell the engine to
+ * ABORT this sequence (client gone / write stalled / stop hit / tool block
+ * closed -- the scan verdict lands in st->finish_override), 1 to continue. */
 static int cont_on_token(void *ud, void *user, int token) {
     cont_sched *cs = ud;
     server *s = cs->s;
     job *j = user;
-    if (!j->req.stream) return 1;              /* non-streaming: engine buffers -> on_done */
+    if (!cont_needs_text(&j->req)) return 1;   /* plain non-streaming: engine buffers -> on_done */
     cont_stream *st = cont_stream_ensure(j);
     t_emit_job = j;                            /* W8a: send_all -> j->out (off the GPU path) */
-    if (!st->started) cont_stream_start(s, j); /* first token: headers + role preamble */
+    if (j->req.stream && !st->started) cont_stream_start(s, j); /* first token: headers + role preamble */
     if (st->failed || j->client_gone) { t_emit_job = NULL; return 0; }
     size_t pl = 0;
     char *piece = ds4_token_text(s->engine, token, &pl);
     if (piece) { buf_append(&st->text, piece, pl); free(piece); }
     st->completion++;
+
+    /* Stop scan + stream hold-back, the generate_job shape: never emit bytes
+     * that could be a stop-string prefix; on a hit the text truncates to the
+     * match start (stop string excluded from output) and the row aborts. */
+    size_t stop_pos = 0, stop_len = 0;
+    bool hit_stop = stop_list_find_from(&j->req.stops, st->text.ptr,
+                                        st->stop_scan_from, &stop_pos, &stop_len);
+    size_t stream_len = hit_stop ?
+        stop_pos : stop_list_stream_safe_len(&j->req.stops, st->text.len);
+    if (stream_len > st->text.len) stream_len = st->text.len;
+    if (!hit_stop && j->req.stops.max_len > 1) {
+        const size_t hold = j->req.stops.max_len - 1;
+        st->stop_scan_from = st->text.len > hold ? st->text.len - hold : 0;
+    }
+
+    /* Tool-marker observation (rolling window, generate_job's marker_hold).
+     * No think gating: thinking+tools is not batchable (job_is_batchable). */
+    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
+        if (st->tool_scan_from > st->text.len) st->tool_scan_from = st->text.len;
+        const char *tool_scan = st->text.ptr ? st->text.ptr + st->tool_scan_from : "";
+        bool orphan_end = false;
+        observe_tool_markers(tool_scan, &st->saw_tool_start, &st->saw_tool_end,
+                             &orphan_end);
+        if (orphan_end && !st->saw_orphan_tool_end) {
+            st->saw_orphan_tool_end = true;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: cont chat ignored orphan tool-call end marker after %d generated tokens",
+                       st->completion);
+        }
+        const size_t marker_hold = 80;
+        size_t hold_from = st->text.len > marker_hold ? st->text.len - marker_hold : 0;
+        if (hold_from > st->tool_scan_from) st->tool_scan_from = hold_from;
+    }
+
     /* Project the cumulative raw buffer into OpenAI SSE deltas: reasoning_content
-     * while inside <think>...</think> (thinking requests), content after; the
-     * machine handles UTF-8 + close-tag hold-back.  Writes redirect into j->out
-     * (W8a t_emit_job); a false return means the client is gone -> evict. */
-    if (!openai_sse_stream_update(j->fd, s, &j->req, st->id, &st->ostream,
-                                  st->text.ptr ? st->text.ptr : "", st->text.len, false)) {
+     * while inside <think>...</think> (thinking requests), content after, tool
+     * deltas inside a DSML block (the machine detects starts itself); the
+     * machine handles UTF-8 + close-tag hold-back, and the stop-safe stream_len
+     * clamp keeps potential stop prefixes off the wire.  Writes redirect into
+     * j->out (W8a t_emit_job); a false return means the client is gone -> evict. */
+    if (j->req.stream &&
+        !openai_sse_stream_update(j->fd, s, &j->req, st->id, &st->ostream,
+                                  st->text.ptr ? st->text.ptr : "", stream_len, false)) {
         st->failed = true; t_emit_job = NULL; return 0;
     }
     t_emit_job = NULL;
+
+    if (hit_stop) {
+        (void)stop_len;
+        st->text.len = stop_pos;
+        if (st->text.ptr) st->text.ptr[st->text.len] = '\0';
+        st->finish_override = "stop";
+        return 0;
+    }
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && st->saw_tool_end) {
+        st->finish_override = "tool_calls";
+        return 0;
+    }
     return 1;
 }
 
@@ -11586,6 +11794,8 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
     t_emit_job = j;                            /* W8a: buffer the finalize/response into j->out */
     if (j->req.stream) {                       /* W6: close the live SSE stream. */
         cont_stream_finalize(cs->s, j, finish ? "stop" : "length");
+    } else if (j->cstream) {                   /* A1: stop/tool row -> host-side text. */
+        write_cont_completion(cs->s, j, finish);
     } else {                                   /* W5: write the whole response now. */
         ds4_batch_gen_result r = { .tokens = (int *)tokens, .n_tokens = n, .finish = finish };
         write_batch_completion(cs->s, j, &r);
@@ -11626,10 +11836,15 @@ static void generate_continuous_jobs(server *s, job *first) {
     for (int i = 0; i < cs.max_seq; i++) {
         job *jb = cs.inflight[i];
         if (!jb) continue;
-        if (jb->cstream) {       /* already streamed into jb->out -> finalize there too */
+        if (jb->cstream && jb->req.stream) { /* already streamed into jb->out -> finalize there too */
             t_emit_job = jb; cont_stream_finalize(s, jb, "length"); t_emit_job = NULL;
             job_finish(jb);
-        } else run_job_single(s, jb);   /* never emitted (out empty) -> direct fd is fine */
+        } else {
+            /* A1: a NON-streaming row may carry scan state (cstream) without
+             * having written a byte -- drop it and rerun cleanly. */
+            cont_stream_discard(jb);
+            run_job_single(s, jb);   /* never emitted (out empty) -> direct fd is fine */
+        }
         fallback++;
     }
     if (cs.primed) { run_job_single(s, cs.primed); fallback++; }

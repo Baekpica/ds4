@@ -4698,6 +4698,36 @@ int ds4_gpu_synchronize(void) {
     return ds4_gpu_finish_command_buffer(cb, 1, "synchronize");
 }
 
+/* task #22 diag: CUDA legacy-stream-only sync; Metal has no stream split, so
+ * a full synchronize is the same barrier. */
+int ds4_gpu_stream_synchronize(void) {
+    return ds4_gpu_synchronize();
+}
+
+/* M4b Inc1: the batched cross-bank MTP draft kernels are CUDA-only (the
+ * multi-seq continuous path runs on GB10).  These stubs keep the link whole;
+ * metal_graph_eval_mtp_draft_batch fails cleanly if ever reached on Metal. */
+int ds4_gpu_repeat_hc_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *rows,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_rows) {
+    (void)out; (void)rows; (void)n_embd; (void)n_hc; (void)n_rows;
+    fprintf(stderr, "ds4: repeat_hc_rows is CUDA-only (batched MTP draft)\n");
+    return 0;
+}
+
+int ds4_gpu_argmax_rows_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab,
+        uint32_t                n_rows) {
+    (void)out_idx; (void)logits; (void)n_vocab; (void)n_rows;
+    fprintf(stderr, "ds4: argmax_rows is CUDA-only (batched MTP draft)\n");
+    return 0;
+}
+
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
 
@@ -5721,7 +5751,8 @@ int ds4_gpu_argmax_tensor(
         return 0;
     }
 
-    return ds4_gpu_indexer_topk_tensor(out_idx, logits, n_vocab, 1, 1);
+    return ds4_gpu_indexer_topk_tensor(out_idx, logits, n_vocab, 1, 1,
+                                       n_vocab, 0 /* PC5 params: ignored on Metal */);
 }
 
 int ds4_gpu_dsv4_topk_mask_tensor(
@@ -12274,8 +12305,10 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        const ds4_gpu_tensor *draft_n_raw) {
     (void)positions; (void)seq_id;  /* Phase 2 Step 3: CUDA-only (see store stub). */
+    (void)draft_n_raw;              /* M4b Inc3: CUDA-only per-row draft span. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap) {
