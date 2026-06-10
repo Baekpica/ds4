@@ -480,6 +480,21 @@ __global__ static void dequant_q8_0_to_f32_kernel(
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
+    /* Task #22 diag (DS4_CUDA_TMP_PREALLOC_MB): floor the shared scratch so it
+     * never resizes mid-run.  Discriminates the free-while-in-use resize hazard
+     * below without changing launch timing. */
+    static uint64_t floor_bytes = 0;
+    static int floor_read = 0;
+    if (!floor_read) {
+        floor_read = 1;
+        const char *e = getenv("DS4_CUDA_TMP_PREALLOC_MB");
+        if (e && e[0]) {
+            char *end = NULL;
+            unsigned long long mb = strtoull(e, &end, 10);
+            if (end != e && mb > 0) floor_bytes = (uint64_t)mb * 1048576ull;
+        }
+    }
+    if (bytes < floor_bytes) bytes = floor_bytes;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
@@ -2465,6 +2480,12 @@ extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+/* Task #22 diag: legacy-stream-only sync.  Unlike ds4_gpu_synchronize it does
+ * NOT drain non-blocking streams, so it discriminates "all actors are
+ * blocking-stream-ordered" from "a non-blocking-stream actor races the layer". */
+extern "C" int ds4_gpu_stream_synchronize(void) {
+    return cuda_ok(cudaStreamSynchronize(ds4_current_stream()), "stream synchronize");
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;

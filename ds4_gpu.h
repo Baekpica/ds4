@@ -58,6 +58,7 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+int ds4_gpu_stream_synchronize(void);   /* task #22 diag: legacy-stream-only sync */
 
 /* =========================================================================
  * Decode-time position scalars (full-layer CUDA-graph capture, Step A).

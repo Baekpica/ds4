@@ -16802,8 +16802,31 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+    /* Task #22 diag (DS4_LAYER_STAGE_SYNC): sync at the attn/ffn half boundary to
+     * split the batched-draft illegal access between the halves.  Both-sides sync
+     * (=3) SUPPRESSES the crash while a whole-layer sync does not, so the fault is
+     * a cross-half race.  One-sided bisect: =1 syncs only after attn (serializes
+     * attn-in-flight vs ffn-enqueue), =2 only after ffn (prior-layer-ffn vs
+     * next-layer-attn-enqueue), =3 both.  =4: post-attn LEGACY-STREAM-only sync
+     * (cudaStreamSynchronize, not device-wide) -- discriminates "all actors are
+     * blocking-stream-ordered" (suppresses like =1) from "a non-blocking-stream
+     * actor races the layer" (still crashes).  Print-only + env-gated. */
+    const char *lsync_env = getenv("DS4_LAYER_STAGE_SYNC");
+    const int lsync = lsync_env ? atoi(lsync_env) : 0;
     bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
+    if (ok && (lsync & 1) && ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: LAYER_STAGE_SYNC FAIL @attn il=%u n=%u pos0=%u\n", il, n_tokens, pos0);
+        ok = false;
+    }
+    if (ok && (lsync & 4) && ds4_gpu_stream_synchronize() == 0) {
+        fprintf(stderr, "ds4: LAYER_STAGE_SYNC FAIL @attn-stream il=%u n=%u pos0=%u\n", il, n_tokens, pos0);
+        ok = false;
+    }
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
+    if (ok && (lsync & 2) && ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: LAYER_STAGE_SYNC FAIL @ffn il=%u n=%u pos0=%u\n", il, n_tokens, pos0);
+        ok = false;
+    }
     if (ok) {
         ds4_gpu_tensor *tmp = g->batch_cur_hc;
         g->batch_cur_hc = g->batch_next_hc;
@@ -22401,6 +22424,26 @@ typedef struct {
  * banks additionally for ratio==4) and snapshot the graph's current single-seq
  * cache pointers so ds4_batch_slabs_free can restore them.  Mirrors the byte math
  * in metal_graph_multiseq_ragged_selftest / metal_graph_multiseq_generate. */
+/* Task #22 diag (DS4_MTP_SLAB_POISON / DS4_BATCH_SLAB_POISON): fill slab
+ * allocations with quiet-NaN bits (0x7FC00000) instead of leaving bare-cudaMalloc
+ * garbage (or the zero fill).  Any surviving read-before-write becomes a
+ * deterministic NaN cascade instead of an ~8% uninit-bytes lottery; with the MoE
+ * expert-id clamps a NaN must stay a benign garbage draft, so a poison-run crash
+ * localizes the unhardened consumer.  As int32 the pattern is 2143289344 -- a
+ * wild-index canary for the integer slabs.  Level >= 2 (MTP knob) additionally
+ * re-poisons a bank's MTP ring rows on every admit, exercising the
+ * span-before-admit reads that the design holds benign-by-construction.
+ * Diagnostic only; both knobs OFF (unset) in production. */
+static int ds4_slab_poison_level(const char *env_name) {
+    const char *e = getenv(env_name);
+    return e ? atoi(e) : 0;
+}
+static void ds4_slab_poison_fill(ds4_gpu_tensor *t) {
+    union { uint32_t u; float f; } qnan;
+    qnan.u = 0x7FC00000u;
+    if (t) (void)ds4_gpu_tensor_fill_f32(t, qnan.f, ds4_gpu_tensor_bytes(t) / sizeof(float));
+}
+
 static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_t N) {
     memset(sl, 0, sizeof(*sl));
     sl->N = N;
@@ -22447,6 +22490,23 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
                 sl->ckpt_iskv[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
                 sl->ckpt_issc[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
                 ok = sl->ckpt_iskv[d][il] && sl->ckpt_issc[d][il];
+            }
+        }
+    }
+    if (ok && ds4_slab_poison_level("DS4_BATCH_SLAB_POISON") >= 1) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            ds4_slab_poison_fill(sl->multi_raw[il]);
+            ds4_slab_poison_fill(sl->multi_comp[il]);
+            ds4_slab_poison_fill(sl->multi_askv[il]);
+            ds4_slab_poison_fill(sl->multi_assc[il]);
+            ds4_slab_poison_fill(sl->multi_index[il]);
+            ds4_slab_poison_fill(sl->multi_iskv[il]);
+            ds4_slab_poison_fill(sl->multi_issc[il]);
+            for (uint32_t d = 0; d < 2u; d++) {
+                ds4_slab_poison_fill(sl->ckpt_askv[d][il]);
+                ds4_slab_poison_fill(sl->ckpt_assc[d][il]);
+                ds4_slab_poison_fill(sl->ckpt_iskv[d][il]);
+                ds4_slab_poison_fill(sl->ckpt_issc[d][il]);
             }
         }
     }
@@ -22606,6 +22666,24 @@ static bool ds4_mtp_slabs_alloc(ds4_mtp_slabs *msl, ds4_gpu_graph *g, uint32_t N
     msl->draft_tokens_dev = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(int32_t));
     msl->draft_ids        = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(int32_t));
     msl->draft_n_raw_dev  = ds4_gpu_tensor_alloc((uint64_t)N * sizeof(int32_t));
+    if (ds4_slab_poison_level("DS4_MTP_SLAB_POISON") >= 1) {
+        ds4_slab_poison_fill(msl->multi_mtp_raw);   /* overrides the zero fill: tests the
+                                                     * benign-by-construction span claim */
+        ds4_slab_poison_fill(msl->multi_mtp_state);
+        ds4_slab_poison_fill(msl->multi_mtp_next);
+        ds4_slab_poison_fill(msl->draft_embed);
+        ds4_slab_poison_fill(msl->draft_enorm);
+        ds4_slab_poison_fill(msl->draft_eproj);
+        ds4_slab_poison_fill(msl->draft_eproj_hc);
+        ds4_slab_poison_fill(msl->draft_hnorm_hc);
+        ds4_slab_poison_fill(msl->draft_hproj_hc);
+        ds4_slab_poison_fill(msl->draft_prev_hc);
+        ds4_slab_poison_fill(msl->draft_out_hc);
+        ds4_slab_poison_fill(msl->draft_logits);
+        ds4_slab_poison_fill(msl->draft_tokens_dev);
+        ds4_slab_poison_fill(msl->draft_ids);
+        ds4_slab_poison_fill(msl->draft_n_raw_dev);
+    }
     return msl->multi_mtp_raw && msl->multi_mtp_state && msl->multi_mtp_next &&
            msl->draft_embed && msl->draft_enorm && msl->draft_eproj &&
            msl->draft_eproj_hc && msl->draft_hnorm_hc && msl->draft_hproj_hc &&
@@ -27307,9 +27385,9 @@ static bool metal_graph_eval_mtp_draft_batch(
     g->batch_draft_n_raw        = sav_dnr;
     if (!ok) {
         (void)ds4_gpu_synchronize();
-        if (getenv("DS4_MTP_GATE_DEBUG"))
-            fprintf(stderr, "ds4: metal_graph_eval_mtp_draft_batch FAIL @%s n_rows=%u pos0=%u raw_cap=%u max_seq_len=%u n_seq=%u prefill_cap=%u\n",
-                    stage, n_rows, pos0, g->raw_cap, g->batch_max_seq_len, g->batch_n_seq, g->prefill_cap);
+        /* failure path only (task #22): always name the stage, not just under GATE_DEBUG */
+        fprintf(stderr, "ds4: metal_graph_eval_mtp_draft_batch FAIL @%s n_rows=%u pos0=%u raw_cap=%u max_seq_len=%u n_seq=%u prefill_cap=%u\n",
+                stage, n_rows, pos0, g->raw_cap, g->batch_max_seq_len, g->batch_n_seq, g->prefill_cap);
     }
 #undef DRAFT_SYNCCK
     return ok;
@@ -27816,7 +27894,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             if (!bg_reset_bank(&ctx->sl, g, b)) { ok = false; break; }
             if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
             if (!bg_prefill_bank(g, model, weights, b, req.tokens, L, seedlog)) { ok = false; break; }
-            if (ctx->mtp) ctx->msl.mtp_n_raw[b] = 0u;   /* S1: fresh MTP ring for this admit */
+            if (ctx->mtp) {
+                ctx->msl.mtp_n_raw[b] = 0u;             /* S1: fresh MTP ring for this admit */
+                /* Task #22 diag: level >= 2 re-poisons this bank's MTP ring rows so
+                 * every span-before-admit read hits NaN, not zeros/stale KV. */
+                if (ds4_slab_poison_level("DS4_MTP_SLAB_POISON") >= 2 && ctx->msl.multi_mtp_raw) {
+                    ds4_gpu_tensor *pv = ds4_gpu_tensor_view(ctx->msl.multi_mtp_raw,
+                                                             (uint64_t)b * ctx->msl.raw_bank_bytes,
+                                                             ctx->msl.raw_bank_bytes);
+                    if (pv) { ds4_slab_poison_fill(pv); ds4_gpu_tensor_free(pv); }
+                }
+            }
             if (mtp_accept) ndr[b] = 0u;                /* S1.1: no drafts until first step */
             /* W7: capture this seq's sampling params + seed its RNG, then sample
              * the seed token from the same stream the decode steps will continue. */
@@ -27930,7 +28018,14 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 g->batch_defer_comp_store = false;
                 g->batch_multiseq_emit = false;
             }
-            if (!ok) break;
+            /* Task #22: phase-attributed failure prints (failure path only, no sync
+             * added -- end_commands already synchronized) so an intermittent illegal
+             * access names its step phase instead of dying generic. */
+            if (!ok) {
+                fprintf(stderr, "ds4: cont-mtp step %u FAIL @verify (K2=%u live=%u)\n",
+                        steps, K2, n_live);
+                break;
+            }
             steps++; mtp_acc_steps++;
             /* 3. ACCEPT + emit + evict (greedy argmax). */
             for (uint32_t b = 0; b < MS; b++) {
@@ -27985,7 +28080,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             if (can_rollback && !ctx->mtp_force_norollback) {
                 ok = mtp_cont_rollback_restore_all(g, MS, committed_rows, vnr,
                                                    ctx->rollback_verify, &ctx->rollback_verify_fails);
-                if (!ok) break;
+                if (!ok) {
+                    fprintf(stderr, "ds4: cont-mtp step %u FAIL @rollback (live=%u)\n",
+                            steps, n_live);
+                    break;
+                }
             }
             /* 4. COMMIT store: re-forward committed rows of still-live banks (store ON).
              *    Compact the committed prefix per bank in place (C2 <= vfirst[b] always). */
@@ -28017,7 +28116,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     g->batch_multiseq_emit = false;
                 }
             }
-            if (!ok) break;
+            if (!ok) {
+                fprintf(stderr, "ds4: cont-mtp step %u FAIL @commit (C2=%u no_defer=%d)\n",
+                        steps, C2, (int)no_defer);
+                break;
+            }
             /* 5. DRAFT the next chain for each still-live bank (off its last committed row). */
             {
                 const bool sav_ms = g->batch_multiseq;
@@ -28138,7 +28241,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
                 g->batch_multiseq = sav_ms; g->batch_multiseq_emit = sav_em; g->batch_multiseq_prefilled = sav_pf;
             }
-            if (!ok) break;
+            if (!ok) {
+                fprintf(stderr, "ds4: cont-mtp step %u FAIL @draft (batch=%d live=%u)\n",
+                        steps, (int)mtp_batch_draft, n_live);
+                break;
+            }
             if (g_cont_prof) t_sample_s += now_sec() - smp_t0;
         } else {
         uint32_t maxpos = 0;
