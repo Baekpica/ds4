@@ -26957,6 +26957,18 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
      * support model loaded (--mtp).  Without it, enable_mtp stays false and the
      * continuous/batched path is byte-for-byte unchanged. */
     ctx->mtp = e->mtp_ready;
+    /* M4c: production enablement of the speculative path.  DS4_CONT_MTP_MODE sets
+     * the continuous loop's default (0=off, 1=non-accepting probe, 2=verify+accept;
+     * depth via DS4_CONT_MTP_DEPTH, batched drafter via DS4_CONT_MTP_BATCH_DRAFT).
+     * Gate runs (DS4_CONT_MTP_GATE) set ctx->mtp_draft_mode explicitly per run and
+     * restore it, so this default composes with the gate unchanged. */
+    if (ctx->mtp) {
+        const char *me = getenv("DS4_CONT_MTP_MODE");
+        if (me && me[0]) {
+            const int mv = atoi(me);
+            if (mv >= 0 && mv <= 2) ctx->mtp_draft_mode = mv;
+        }
+    }
 
     if (!metal_graph_alloc_raw_cap(&ctx->g, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp)) {
