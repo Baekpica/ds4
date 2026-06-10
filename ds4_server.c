@@ -7869,6 +7869,22 @@ struct server {
     ds4_batch_ctx *batch_ctx;
     int batch_ctx_max_seq;
     int batch_ctx_max_tokens;
+    /* A2a: per-bank retirement records for warm start on the continuous path.
+     * text is the byte key a follow-up request extending that bank's
+     * conversation will resend as its prompt prefix: the request's rendered
+     * prompt text + the committed generated text (detok'd pieces; tool turns
+     * stay matchable because the next renderer replays raw_dsml verbatim).
+     * The matching is advisory only -- the ENGINE validates every warm admit
+     * against its own committed history, so a stale record degrades to a cold
+     * reset.  Touched only on the worker thread (cont_admit / cont_on_done,
+     * under gen_mu). */
+    struct {
+        char    *text;
+        size_t   len;
+        uint64_t last_use;
+        bool     valid;
+    } *warm;
+    uint64_t warm_clock;
     job *head;
     job *tail;
     bool stopping;
@@ -7903,6 +7919,14 @@ struct job {
      * Guarded by `mu`/`cv` (same lock as `done`). */
     buf  out;
     bool client_gone;       /* client_main's send failed, or `out` hit its cap */
+    /* A2a warm start (continuous path; worker-owned, jobs are memset-0 at
+     * creation).  cont_bank is the engine-reported bank this job was placed in
+     * (via ds4_cont_request.bank_used; cont_admit sets it to -1 first).
+     * warm_prompt is the job-owned effective prompt of a warm admit (the bank's
+     * exact committed history + the tokenized text suffix); freed at on_done /
+     * the stranded sweep. */
+    int cont_bank;
+    ds4_tokens warm_prompt;
 };
 
 /* =========================================================================
@@ -11428,6 +11452,113 @@ typedef struct {
     job   **inflight;
 } cont_sched;
 
+/* ---- A2a: per-bank warm start (retirement records + matching + placement).
+ * All of this runs on the worker thread under gen_mu.  The matching is
+ * ADVISORY: the engine validates every warm admit against its own committed
+ * history (full-frontier memcmp) and degrades any mismatch to a cold reset, so
+ * a stale or wrong record can cost a prefill but never correctness. ---- */
+
+/* Drop a bank's record (being overwritten, or its state is no longer known). */
+static void warm_rec_invalidate(server *s, int bank) {
+    if (!s->warm || bank < 0 || bank >= s->batch_ctx_max_seq) return;
+    free(s->warm[bank].text);
+    s->warm[bank].text = NULL;
+    s->warm[bank].len = 0;
+    s->warm[bank].valid = false;
+}
+
+/* Retire job j's bank at on_done: rebuild the record a follow-up request
+ * extending this conversation will byte-prefix-match.  The engine never
+ * forwards the final sample, so the committed generation is tokens[0..n-2]
+ * uniformly (EOS/budget/abort, and mode-2's per-step commits).  Thinking rows
+ * retire INVALID -- the next rendering omits reasoning, so a raw text key
+ * would be wrong.  Tool turns stay matchable because the next renderer
+ * replays the remembered raw_dsml verbatim.  Stop-finish rows build records
+ * that simply never match (committed post-stop tokens) -- harmless. */
+static void cont_warm_retire(server *s, job *j, const int *tokens, int n) {
+    if (!s->warm || j->cont_bank < 0 || j->cont_bank >= s->batch_ctx_max_seq) return;
+    const int bank = j->cont_bank;
+    warm_rec_invalidate(s, bank);
+    s->warm[bank].last_use = ++s->warm_clock;
+    if (!tokens || n <= 0) return;
+    if (!j->req.prompt_text || !j->req.prompt_text[0]) return;
+    if (ds4_think_mode_enabled(j->req.think_mode)) return;
+    buf tb = {0};
+    buf_puts(&tb, j->req.prompt_text);
+    for (int k = 0; k < n - 1; k++) {
+        size_t pl = 0;
+        char *piece = ds4_token_text(s->engine, tokens[k], &pl);
+        if (piece) { buf_append(&tb, piece, pl); free(piece); }
+    }
+    s->warm[bank].text = tb.ptr;
+    s->warm[bank].len = tb.len;
+    s->warm[bank].valid = true;
+}
+
+/* Placement (and warm-continuation) pick for job j's admit.  On a record match
+ * the effective prompt = the bank's EXACT committed token history + the
+ * tokenized text suffix (BPE can merge across the byte boundary, so canonical
+ * full-prompt tokens are never sliced -- the serial path's idiom), parked in
+ * j->warm_prompt (job-owned; freed at on_done / the stranded sweep).  With no
+ * match, direct the cold admit to a bank with no retained value (else LRU):
+ * the engine's default is the LOWEST free bank, which would constantly reset
+ * the most-recently-retired (most valuable) state. */
+static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *req) {
+    if (!s->warm || !s->batch_ctx) return;
+    bool occ[DS4_COALESCE_HARD_MAX] = {false};
+    for (int i = 0; i < cs->max_seq; i++) {
+        const job *o = cs->inflight[i];
+        if (o && o != j && o->cont_bank >= 0 && o->cont_bank < s->batch_ctx_max_seq)
+            occ[o->cont_bank] = true;
+    }
+    const char *ptext = j->req.prompt_text;
+    const size_t plen = ptext ? strlen(ptext) : 0;
+    int best = -1, lru = -1, fresh = -1;
+    size_t best_len = 0;
+    uint64_t lru_use = UINT64_MAX;
+    for (int b = 0; b < s->batch_ctx_max_seq; b++) {
+        if (occ[b]) continue;
+        if (!s->warm[b].valid) { if (fresh < 0) fresh = b; continue; }
+        if (s->warm[b].last_use < lru_use) { lru_use = s->warm[b].last_use; lru = b; }
+        if (plen && s->warm[b].len > 0 && s->warm[b].len < plen &&
+            s->warm[b].len > best_len &&
+            byte_prefix_match(ptext, plen, s->warm[b].text, s->warm[b].len)) {
+            best = b;
+            best_len = s->warm[b].len;
+        }
+    }
+    if (best >= 0) {
+        const int *htok = NULL;
+        const int hl = ds4_batch_ctx_bank_committed(s->batch_ctx, best, &htok);
+        if (hl > 0 && htok) {
+            ds4_tokens exact = { (int *)htok, hl, hl };
+            build_prompt_from_exact_prefix_and_text_suffix(s->engine, &exact,
+                                                           ptext + best_len,
+                                                           &j->warm_prompt);
+            if (j->warm_prompt.len > hl &&
+                j->warm_prompt.len <= ds4_batch_ctx_raw_cap(s->batch_ctx)) {
+                req->tokens     = j->warm_prompt.v;
+                req->n          = j->warm_prompt.len;
+                req->place_bank = best + 1;
+                req->n_cached   = hl;
+                s->warm[best].last_use = ++s->warm_clock;
+                warm_rec_invalidate(s, best);        /* being overwritten now */
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: warm admit bank=%d cached=%d suffix=%d",
+                           best, hl, req->n - hl);
+                return;
+            }
+            ds4_tokens_free(&j->warm_prompt);
+            memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));
+        }
+    }
+    const int target = fresh >= 0 ? fresh : lru;
+    if (target >= 0) {
+        req->place_bank = target + 1;                /* directed COLD admit */
+        warm_rec_invalidate(s, target);
+    }
+}
+
 /* admit: hand the engine the next waiting request, or 0 to stop admitting now. */
 static int cont_admit(void *ud, ds4_cont_request *req) {
     cont_sched *cs = ud;
@@ -11467,6 +11598,11 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     req->max_new = j->req.max_tokens > 0 ? j->req.max_tokens : s->default_tokens;
     req->eos     = ds4_token_eos(s->engine);
     req->user    = j;
+    /* A2a: engine-reported placement + warm-continuation matching (may swap
+     * req->tokens for the bank-exact effective prompt in j->warm_prompt). */
+    j->cont_bank   = -1;
+    req->bank_used = &j->cont_bank;
+    cont_warm_pick(s, cs, j, req);
     /* W7: per-seq sampling.  resolve_job_seed gives an unseeded request the same
      * distinct, non-repeating stream the single path would (shared helper, so the two
      * paths can't desync).  s->seq is read here on the single worker thread only (no
@@ -11791,6 +11927,11 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
         if (cs->inflight[i] == user) { cs->inflight[i] = NULL; break; }
     cs->served++;
     job *j = user;
+    /* A2a: retire the bank this job occupied (rebuild its warm record) and drop
+     * the warm effective prompt -- the engine is done reading it. */
+    cont_warm_retire(cs->s, j, tokens, n);
+    ds4_tokens_free(&j->warm_prompt);
+    memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));
     t_emit_job = j;                            /* W8a: buffer the finalize/response into j->out */
     if (j->req.stream) {                       /* W6: close the live SSE stream. */
         cont_stream_finalize(cs->s, j, finish ? "stop" : "length");
@@ -11836,6 +11977,8 @@ static void generate_continuous_jobs(server *s, job *first) {
     for (int i = 0; i < cs.max_seq; i++) {
         job *jb = cs.inflight[i];
         if (!jb) continue;
+        ds4_tokens_free(&jb->warm_prompt);   /* A2a: engine no longer reads it */
+        memset(&jb->warm_prompt, 0, sizeof(jb->warm_prompt));
         if (jb->cstream && jb->req.stream) { /* already streamed into jb->out -> finalize there too */
             t_emit_job = jb; cont_stream_finalize(s, jb, "length"); t_emit_job = NULL;
             job_finish(jb);
@@ -12823,6 +12966,15 @@ int main(int argc, char **argv) {
                                          &s.batch_ctx, cerr, sizeof(cerr)) == 0) {
                     s.batch_ctx_max_seq = try_seq;
                     s.batch_ctx_max_tokens = cmaxtok;
+                    /* A2a warm-start records; DS4_SERVER_WARM=0 disables matching
+                     * + placement steering entirely (A/B + emergency off-switch:
+                     * with s.warm NULL every warm helper is a no-op and the
+                     * engine-side behavior is the historical cold admit). */
+                    const char *we = getenv("DS4_SERVER_WARM");
+                    if (!(we && we[0] == '0' && we[1] == '\0')) {
+                        s.warm = xmalloc((size_t)try_seq * sizeof(*s.warm));
+                        memset(s.warm, 0, (size_t)try_seq * sizeof(*s.warm));
+                    }
                     server_log(DS4_LOG_DEFAULT,
                                "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d)%s",
                                try_seq, cmaxtok, ds4_session_ctx(s.session),
