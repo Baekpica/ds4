@@ -426,6 +426,12 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
+    // ds4 task #23 (same guard as mul_mat_vec_q_moe): a -1 router id cast to
+    // uint32 is a wild weight-channel offset.  Redirect to channel 0 and skip
+    // the dot loop below so the output is a clean 0.
+    const bool invalid_id = ncols_dst == 1 && ids && (int32_t)channel_x < 0;
+    if (invalid_id) channel_x = 0;
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
@@ -483,7 +489,7 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = tid / (qi/vdr); !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -625,7 +631,15 @@ static __global__ void mul_mat_vec_q_moe(
         return;
     }
 
-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    // ds4 task #23: the router's NaN path emits -1 expert ids by design; cast
+    // to uint32 that becomes a wild weight-channel offset (cuda-gdb-convicted
+    // Warp Illegal Address in vec_dot_q4_K_q8_1 on sm_100).  Redirect the
+    // pointer math to expert 0 and skip the dot loop so the row writes a
+    // clean 0 through the unchanged reduction/write-back.  Warp-uniform:
+    // token_idx is constant across a warp's lanes.
+    const int32_t  id_raw     = ids[channel_dst + token_idx * ids_stride];
+    const bool     invalid_id = id_raw < 0;
+    const uint32_t channel_x  = invalid_id ? 0u : (uint32_t)id_raw;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
@@ -634,7 +648,7 @@ static __global__ void mul_mat_vec_q_moe(
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = threadIdx.x / (qi/vdr); !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 

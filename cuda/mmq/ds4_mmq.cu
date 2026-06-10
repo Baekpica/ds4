@@ -255,6 +255,15 @@ int ds4_mmq_dense_impl(
         return -1;
     }
 
+    /* Task #22 fix: order the pool's cudaMallocAsync/cudaFreeAsync on the SAME
+     * stream the kernels below launch on.  The pool defaults to
+     * cudaStreamPerThread; with kernels on the legacy stream the RAII free is
+     * ordered on an EMPTY stream, so the driver can recycle/remap the scratch
+     * while the in-flight quantize/GEMM still reads it -> intermittent illegal
+     * access under shape churn (the batched-draft early-step crash).  The vec
+     * impls already do this (graph-capture fix); the batched impls were missed. */
+    ds4_pool_set_stream(stream);
+
     // 1. Quantize the F32 activation into the mmq Q8_1 format. The
     //    target_type parameter only affects the activation scale strategy
     //    that the quantizer picks (matched to the weight type's K-block
@@ -422,6 +431,8 @@ int ds4_mmq_moe_impl(
         return -1;
     }
 
+    ds4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ds4_mmq_dense_impl) */
+
     const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
     const int64_t ne00         = K;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -435,6 +446,19 @@ int ds4_mmq_moe_impl(
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx->pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
+
+    // Task #22 root-cause fix: mm_ids_helper COMPACTS - it only writes ids_src1
+    // entries for in-range router ids and drops invalid ones (the router's NaN
+    // path emits -1 by design), so with any dropped id the tail of ids_src1
+    // stays unwritten pool memory.  quantize_mmq_q8_1's grid covers all
+    // ne_get_rows rows and gathers x rows via ids_src1[i1] unconditionally
+    // (quantize.cu:304), so a stale/garbage tail entry becomes a wild OOB read
+    // (the intermittent batched-draft illegal access; B200 memcheck-convicted).
+    // Zero both id maps so unwritten tail slots gather/scatter row 0 instead:
+    // those lanes' output is never consumed (the mmq write-back loop is
+    // expert_bounds-bounded), the cost is a few KB of memset on-stream.
+    cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
+    cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
 
     // si1 = stride between tokens in the ids tensor, in elements. Our ids is
     // contiguous [n_tokens, n_expert_used] so si1 = n_expert_used.
@@ -591,6 +615,8 @@ int ds4_mmq_moe_pair_impl(
         return -1;
     }
 
+    ds4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ds4_mmq_dense_impl) */
+
     const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
     const int64_t ne00         = K;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -603,6 +629,12 @@ int ds4_mmq_moe_pair_impl(
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx->pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
+
+    // Task #22 root-cause fix (same as ds4_mmq_moe_impl): zero the id maps so
+    // entries mm_ids_helper drops (invalid/-1 router ids) gather row 0 instead
+    // of unwritten pool memory -> wild OOB read in quantize_mmq_q8_1.
+    cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
+    cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
 
     const int si1  = n_expert_used;
     const int sis1 = 1;
