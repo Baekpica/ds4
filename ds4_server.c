@@ -7885,6 +7885,10 @@ struct server {
         bool     valid;
     } *warm;
     uint64_t warm_clock;
+    /* A2b: serve a warm match by FORKING the matched bank into a different free
+     * bank (engine D2D copy + suffix prefill) instead of consuming it in place,
+     * preserving the trunk record for shared-prefix fan-out and later turns. */
+    bool warm_fork;
     job *head;
     job *tail;
     bool stopping;
@@ -11539,13 +11543,39 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                 j->warm_prompt.len <= ds4_batch_ctx_raw_cap(s->batch_ctx)) {
                 req->tokens     = j->warm_prompt.v;
                 req->n          = j->warm_prompt.len;
-                req->place_bank = best + 1;
                 req->n_cached   = hl;
                 s->warm[best].last_use = ++s->warm_clock;
-                warm_rec_invalidate(s, best);        /* being overwritten now */
-                server_log(DS4_LOG_GENERATION,
-                           "ds4-server: warm admit bank=%d cached=%d suffix=%d",
-                           best, hl, req->n - hl);
+                /* A2b: prefer serving the match as a FORK into a different free
+                 * bank -- the trunk record survives, so siblings sharing the
+                 * prefix (fan-out) and later turns keep matching it.  Target =
+                 * a no-value bank, else the LRU record excluding the trunk;
+                 * with no other free bank fall back to the in-place warm
+                 * continuation (which consumes the record). */
+                int ft = -1;
+                if (s->warm_fork) {
+                    uint64_t fu = UINT64_MAX;
+                    int flru = -1;
+                    for (int b = 0; b < s->batch_ctx_max_seq; b++) {
+                        if (occ[b] || b == best) continue;
+                        if (!s->warm[b].valid) { ft = b; break; }
+                        if (s->warm[b].last_use < fu) { fu = s->warm[b].last_use; flru = b; }
+                    }
+                    if (ft < 0) ft = flru;
+                }
+                if (ft >= 0) {
+                    req->place_bank = ft + 1;
+                    req->fork_bank  = best + 1;
+                    warm_rec_invalidate(s, ft);      /* target being overwritten */
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: fork admit src=%d dst=%d cached=%d suffix=%d",
+                               best, ft, hl, req->n - hl);
+                } else {
+                    req->place_bank = best + 1;
+                    warm_rec_invalidate(s, best);    /* being overwritten now */
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: warm admit bank=%d cached=%d suffix=%d",
+                               best, hl, req->n - hl);
+                }
                 return;
             }
             ds4_tokens_free(&j->warm_prompt);
@@ -12974,6 +13004,11 @@ int main(int argc, char **argv) {
                     if (!(we && we[0] == '0' && we[1] == '\0')) {
                         s.warm = xmalloc((size_t)try_seq * sizeof(*s.warm));
                         memset(s.warm, 0, (size_t)try_seq * sizeof(*s.warm));
+                        /* A2b fork-by-copy serving of warm matches; the engine
+                         * validates every fork, so this only steers placement.
+                         * DS4_SERVER_FORK=0 = in-place warm continuation (A2a). */
+                        const char *fe = getenv("DS4_SERVER_FORK");
+                        s.warm_fork = !(fe && fe[0] == '0' && fe[1] == '\0');
                     }
                     server_log(DS4_LOG_DEFAULT,
                                "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d)%s",
