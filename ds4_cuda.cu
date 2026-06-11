@@ -4854,6 +4854,90 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
     if (lane == 0) low[tok * low_dim + row] = acc;
 }
 
+/* FD Inc2b: multi-column variant of grouped_q8_0_a_preq_warp8_kernel.
+ * The per-token kernel above re-reads the full out_a weight matrix for
+ * every token (grid.y = n_tokens), so at decode widths 2..8 the weight
+ * traffic scales with width; that re-read is what made it lose to the
+ * cublas f16 path at k>=2 (fd-inc2 scoping: native 6.6 ms/step at k=1
+ * vs cublas 13.6 at k=2).  Here one warp owns one low row and dots each
+ * weight block against all NCOLS tokens' activations, so the weight
+ * matrix is read exactly once regardless of width.  Per-column block
+ * striding and accumulation order match the per-token kernel.  NCOLS is
+ * a compile-time template so the accumulators stay in registers.  Fixed
+ * 256-thread blocks: no per-arch launch-bounds table to mismatch on
+ * CUDA_ARCH= builds (the Inc2a compiled-vs-runtime arch gotcha). */
+template <int NCOLS>
+__global__ static void grouped_q8_0_a_preq_warp8_mc_kernel(
+        float *low,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row >= low_dim) return;
+
+    const uint64_t group = row / rank;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc[NCOLS];
+#pragma unroll
+    for (int t = 0; t < NCOLS; t++) acc[t] = 0.0f;
+
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = group_dim - i0 < 32 ? group_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const float ws = __half2float(*scale_h);
+#pragma unroll
+        for (int t = 0; t < NCOLS; t++) {
+            /* token t's activation row for this group: t * n_groups + group */
+            const uint64_t xrow = (uint64_t)t * n_groups + group;
+            const int dot = dot_i8_block(qs, xq + (xrow * blocks + b) * 32, bn, use_dp4a);
+            acc[t] += ws * xscale[xrow * blocks + b] * (float)dot;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NCOLS; t++) {
+        acc[t] = warp_sum_f32(acc[t]);
+        if (lane == 0) low[(uint64_t)t * low_dim + row] = acc[t];
+    }
+}
+
+/* Host-side template dispatch for the multi-column kernel.  Returns 1 when
+ * a kernel was launched, 0 when n_tokens is outside the instantiated 2..8
+ * range (caller falls back to the per-token kernel). */
+static int grouped_q8_0_a_preq_warp8_mc_launch(
+        float *low,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint32_t n_tokens,
+        uint64_t blocks,
+        int use_dp4a,
+        cudaStream_t stream) {
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const dim3 grid(((unsigned)low_dim + 7u) / 8u, 1, 1);
+    switch (n_tokens) {
+    case 2: grouped_q8_0_a_preq_warp8_mc_kernel<2><<<grid, 256, 0, stream>>>(low, w, xq, xscale, group_dim, rank, n_groups, blocks, use_dp4a); return 1;
+    case 3: grouped_q8_0_a_preq_warp8_mc_kernel<3><<<grid, 256, 0, stream>>>(low, w, xq, xscale, group_dim, rank, n_groups, blocks, use_dp4a); return 1;
+    case 4: grouped_q8_0_a_preq_warp8_mc_kernel<4><<<grid, 256, 0, stream>>>(low, w, xq, xscale, group_dim, rank, n_groups, blocks, use_dp4a); return 1;
+    case 5: grouped_q8_0_a_preq_warp8_mc_kernel<5><<<grid, 256, 0, stream>>>(low, w, xq, xscale, group_dim, rank, n_groups, blocks, use_dp4a); return 1;
+    case 6: grouped_q8_0_a_preq_warp8_mc_kernel<6><<<grid, 256, 0, stream>>>(low, w, xq, xscale, group_dim, rank, n_groups, blocks, use_dp4a); return 1;
+    case 7: grouped_q8_0_a_preq_warp8_mc_kernel<7><<<grid, 256, 0, stream>>>(low, w, xq, xscale, group_dim, rank, n_groups, blocks, use_dp4a); return 1;
+    case 8: grouped_q8_0_a_preq_warp8_mc_kernel<8><<<grid, 256, 0, stream>>>(low, w, xq, xscale, group_dim, rank, n_groups, blocks, use_dp4a); return 1;
+    default: return 0;
+    }
+}
+
 __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
@@ -10880,20 +10964,33 @@ static void ds4_cuda_invalidate_captured_graphs(const char *why) {
  * captured kernel that triggers growth (e.g. indexer_topk_tree scratch
  * scaling with n_comp) puts the stream into sticky-error state.
  *
- * Pre-allocating once to a max-decode-conservative size sidesteps the
- * issue entirely: every cuda_tmp_alloc call in the captured region then
- * hits the cached pointer (g_cuda_tmp_bytes >= request) and skips the
- * malloc.  4 MB is ~330x the largest observed decode-time scratch
- * (indexer_topk_tree at max n_comp=comp_cap=8194, n_tokens=1, ~12 KB)
- * and absorbs any growth from MTP n_tok=2 paths or future kernels. */
-static void ds4_cuda_layer_graph_warm_tmp_scratch(void) {
+ * Pre-allocating once to a conservative high-water sidesteps the issue
+ * entirely: every cuda_tmp_alloc call in the captured region then hits
+ * the cached pointer (g_cuda_tmp_bytes >= request) and skips the malloc.
+ *
+ * FD Inc2b hardening: runs before the FIRST capture of ANY kind (layer,
+ * dense, MoE), not just the serial layer-graph entry.  The continuous
+ * server captures dense/MoE graphs without ever passing through
+ * begin_or_replay, so its cuda_tmp grew organically and a later, larger
+ * request (first wide decode step, or a live admission chunk) freed a
+ * pointer ~160 cached execs still held -> full invalidate + recapture
+ * storm mid-serving (FD-X mechanism). */
+static void ds4_cuda_capture_warm_tmp_scratch(void) {
     static int warmed = 0;
     if (warmed) return;
     warmed = 1;
     /* cuda_tmp_alloc returns the cached pointer when already large enough;
      * when sized below the request it does cudaFree(old) + cudaMalloc(new).
-     * Pass 4 MiB to force at least that much. */
-    (void)cuda_tmp_alloc((uint64_t)4 * 1024 * 1024, "layer_graph_warmup");
+     * 48 MiB sizing: the serial decode envelope needs < 1 MiB
+     * (indexer_topk_tree at max n_comp=comp_cap=8194, n_tokens=1, ~12 KB;
+     * MTP n_tok=2 paths similar).  The continuous path's largest steady-
+     * state consumer is the output_a cublas f16 staging buffer at one live
+     * admission chunk: DS4_CONT_PREFILL_CHUNK_LIVE default 512 tokens x
+     * n_head x head_dim x 2 B = 32 MiB on V4-Flash.  48 MiB covers both
+     * with margin.  Cold blocking admits (4096-token chunks) can still
+     * grow it once per high-water step; DS4_CUDA_TMP_PREALLOC_MB is the
+     * manual floor for workloads that want zero resizes ever. */
+    (void)cuda_tmp_alloc((uint64_t)48 * 1024 * 1024, "capture_warmup");
 
     /* Opp C Phase 1A staged prototype: the FP8 predecode scratch has the
      * SAME failure mode as cuda_tmp_alloc -- it's a sticky pointer that
@@ -10952,7 +11049,7 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
         const struct ds4_layer_graph_key *key) {
     if (!ds4_cuda_layer_graphs_enabled()) return -1;
     if (il >= DS4_LAYER_SCALARS_COUNT || !key) return -1;
-    ds4_cuda_layer_graph_warm_tmp_scratch();
+    ds4_cuda_capture_warm_tmp_scratch();
     if (g_layer_graph_capturing_slot != NULL) {
         /* Caller error: a prior begin_or_replay returned 0 but didn't get
          * matched by end_or_commit.  Refuse rather than corrupt state. */
@@ -11334,6 +11431,32 @@ static uint32_t cuda_moe_vec_max_assign(void) {
     return v;
 }
 
+/* FD Inc2b: attention output_a multi-column native ceiling.  n_tokens in
+ * [2, max] takes grouped_q8_0_a_preq_warp8_mc_kernel (one weight read for
+ * all columns) instead of the cublas f16 strided-batched GEMM; beyond it
+ * the pre-Inc2b dispatch applies (cublas at n_tokens >=
+ * DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN).  Capped at 8 -- the largest
+ * instantiated template width, matching the decode-width envelope of the
+ * other native small-batch tiers.  fdi4 A/B (GB10, V4-Flash): fwd ms/step
+ * w2 76.4->70.3 (-8%), w4 99.0->96.2 at higher avg_k, w8 154.9->153.7;
+ * w1 parity; no crossover -- the mc kernel never loses to cublas in
+ * [2, 8], though the gap narrows as the batched GEMM amortizes (w8 -1%).
+ * DS4_CUDA_ATTENTION_OUTPUT_A_MC_MAX=0 (or 1) restores the pre-Inc2b
+ * dispatch. */
+static uint32_t cuda_output_a_mc_max(void) {
+    static int init = 0;
+    static uint32_t v = 8;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_ATTENTION_OUTPUT_A_MC_MAX");
+        if (s && *s) {
+            long x = strtol(s, NULL, 10);
+            if (x >= 0 && x <= 8) v = (uint32_t)x;
+        }
+    }
+    return v;
+}
+
 /* FD Inc1: decode-width ceiling for the native split-K F16 path.  n_tok in
  * [2, max] loop-launches the n=1 split-K kernel pair per row instead of the
  * cuBLAS cutlass GEMM + f32->f16 conversion (FD Inc0 nsys: 357us vs 14.5us
@@ -11415,6 +11538,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
          * just above), so they fold into the outer graph as proper nodes
          * with explicit dependencies on the surrounding work. */
         if (ds4_cuda_moe_graphs_enabled() && moe_stream && !ds4_capture_active()) {
+            ds4_cuda_capture_warm_tmp_scratch();
             struct dense_graph_key dkey;
             memset(&dkey, 0, sizeof(dkey));
             dkey.weight_offset = weight_offset;
@@ -14153,7 +14277,15 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         long v = strtol(out_a_min_env, &endp, 10);
         if (endp != out_a_min_env && v > 1 && v < 4096) out_a_cublas_min_tokens = (uint32_t)v;
     }
-    if (!g_quality_mode &&
+    /* FD Inc2b: decode widths 2..mc_max ride the multi-column grouped
+     * native kernel in the prequant branch below (weights read once for
+     * all columns); the cublas f16 path only serves wider batches
+     * (admission/prefill chunks).  Quality mode keeps the per-token
+     * reference kernel at every width, as before. */
+    const uint32_t out_a_mc_max = g_quality_mode ? 0u : cuda_output_a_mc_max();
+    const int out_a_use_mc = (n_tokens >= 2u && n_tokens <= out_a_mc_max);
+    if (!out_a_use_mc &&
+        !g_quality_mode &&
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
@@ -14216,17 +14348,30 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                 group_dim,
                                                 blocks_a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
-        dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
-        grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>((float *)low->ptr,
-                                                          out_a,
-                                                          xq,
-                                                          xscale,
-                                                          group_dim,
-                                                          rank,
-                                                          n_groups,
-                                                          n_tokens,
-                                                          blocks_a,
-                                                          use_dp4a);
+        if (!out_a_use_mc ||
+            !grouped_q8_0_a_preq_warp8_mc_launch((float *)low->ptr,
+                                                 out_a,
+                                                 xq,
+                                                 xscale,
+                                                 group_dim,
+                                                 rank,
+                                                 n_groups,
+                                                 n_tokens,
+                                                 blocks_a,
+                                                 use_dp4a,
+                                                 ds4_current_stream())) {
+            dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
+            grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>((float *)low->ptr,
+                                                              out_a,
+                                                              xq,
+                                                              xscale,
+                                                              group_dim,
+                                                              rank,
+                                                              n_groups,
+                                                              n_tokens,
+                                                              blocks_a,
+                                                              use_dp4a);
+        }
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
     }
 
@@ -16916,6 +17061,7 @@ static int routed_moe_launch(
              * entirely (both HIT path and MISS path are unsafe under outer
              * capture -- see the matching guard at the dense Q8_0 site). */
             if (ds4_cuda_moe_graphs_enabled() && moe_stream && !ds4_capture_active()) {
+                ds4_cuda_capture_warm_tmp_scratch();
                 struct moe_graph_key key;
                 memset(&key, 0, sizeof(key));
                 key.gate_offset     = gate_offset;
