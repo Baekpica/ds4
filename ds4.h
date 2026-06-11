@@ -199,7 +199,21 @@ int ds4_engine_batched_generate_ex(ds4_engine *e, const ds4_tokens *prompts, int
 typedef struct ds4_batch_ctx ds4_batch_ctx;
 int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                           ds4_batch_ctx **out, char *err, size_t errlen);
+/* R5 Inc1a: like ds4_batch_ctx_create, but treats max_seq as a CAP and sizes
+ * the bank count DOWN to (free device memory - headroom) / per-bank-bytes
+ * before allocating, instead of the caller probing by failing whole creates
+ * (on unified memory those probes can summon the OOM killer before they
+ * fail).  Residual slab failures descend by 3/4 internally.  Knobs:
+ * DS4_BATCH_FIT=0 keeps caller-driven sizing, DS4_BATCH_FIT_HEADROOM_MB
+ * (default 8192) reserves runtime growth room.  Backends with no memory
+ * query (Metal) skip the budget.  Read the chosen width back with
+ * ds4_batch_ctx_max_seq. */
+int  ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
+                              ds4_batch_ctx **out, char *err, size_t errlen);
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx);
+/* Bank count of the persistent ctx (create_fit may size it below the
+ * requested cap).  Returns 0 if ctx is NULL. */
+int  ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx);
 /* SWA raw ring rows per bank of the persistent ctx.  R2: this is the RING size
  * only -- the STATIC batch path (ds4_engine_batched_generate_ctx) still bounds
  * prompt+budget by it (one-shot prefill, no wrap), but the continuous path's

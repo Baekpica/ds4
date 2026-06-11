@@ -12987,16 +12987,18 @@ int main(int argc, char **argv) {
         if (cmaxtok < cmax) cmaxtok = cmax;        /* need >=1 token per seq */
         if (coalesce_on && cmax > 1) {
             char cerr[256] = {0};
-            /* Fit-or-reduce: if the KV slab for cmax banks won't fit (larger -c
-             * contexts, tighter memory), halve and retry down to 2 rather than
-             * dropping all the way to the per-call path.  Always get the largest
-             * continuous batch that fits. */
+            /* Fit-or-reduce: create_fit budgets the bank count from free
+             * memory up front (R5 Inc1a) and descends internally on residual
+             * slab failures.  The outer halving loop survives only as the
+             * fallback shell for backends with no memory query (Metal /
+             * DS4_BATCH_FIT=0) and for non-slab create failures. */
             int try_seq = cmax;
             bool made = false;
             while (try_seq >= 2) {
-                if (ds4_batch_ctx_create(s.engine, ds4_session_ctx(s.session), try_seq, cmaxtok,
-                                         &s.batch_ctx, cerr, sizeof(cerr)) == 0) {
-                    s.batch_ctx_max_seq = try_seq;
+                if (ds4_batch_ctx_create_fit(s.engine, ds4_session_ctx(s.session), try_seq, cmaxtok,
+                                             &s.batch_ctx, cerr, sizeof(cerr)) == 0) {
+                    const int got_seq = ds4_batch_ctx_max_seq(s.batch_ctx);  /* may be < try_seq (budget fit) */
+                    s.batch_ctx_max_seq = got_seq;
                     s.batch_ctx_max_tokens = cmaxtok;
                     /* A2a warm-start records; DS4_SERVER_WARM=0 disables matching
                      * + placement steering entirely (A/B + emergency off-switch:
@@ -13004,8 +13006,8 @@ int main(int argc, char **argv) {
                      * engine-side behavior is the historical cold admit). */
                     const char *we = getenv("DS4_SERVER_WARM");
                     if (!(we && we[0] == '0' && we[1] == '\0')) {
-                        s.warm = xmalloc((size_t)try_seq * sizeof(*s.warm));
-                        memset(s.warm, 0, (size_t)try_seq * sizeof(*s.warm));
+                        s.warm = xmalloc((size_t)got_seq * sizeof(*s.warm));
+                        memset(s.warm, 0, (size_t)got_seq * sizeof(*s.warm));
                         /* A2b fork-by-copy serving of warm matches; the engine
                          * validates every fork, so this only steers placement.
                          * DS4_SERVER_FORK=0 = in-place warm continuation (A2a). */
@@ -13014,14 +13016,17 @@ int main(int argc, char **argv) {
                     }
                     server_log(DS4_LOG_DEFAULT,
                                "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d seq_cap=%d)%s",
-                               try_seq, cmaxtok, ds4_session_ctx(s.session),
+                               got_seq, cmaxtok, ds4_session_ctx(s.session),
                                ds4_batch_ctx_raw_cap(s.batch_ctx),
                                ds4_batch_ctx_seq_cap(s.batch_ctx),
-                               try_seq < cmax ? " [reduced from requested to fit memory]" : "");
+                               got_seq < cmax ? " [reduced from requested to fit memory]" : "");
                     made = true;
                     break;
                 }
-                try_seq /= 2;   /* KV slab didn't fit; try a smaller continuous batch. */
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: batch ctx attempt (max_seq<=%d) failed: %s",
+                           try_seq, cerr[0] ? cerr : "unknown error");
+                try_seq /= 2;   /* fallback shell; see comment above */
             }
             if (!made) {
                 server_log(DS4_LOG_WARNING,

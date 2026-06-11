@@ -27403,8 +27403,45 @@ struct ds4_batch_ctx {
     uint64_t        fork_rejects;    /* the src==dst warm degenerate) vs degraded  */
 };
 
-int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
-                         ds4_batch_ctx **out, char *err, size_t errlen) {
+/* R5 Inc1a: slab bytes ONE bank costs, mirroring exactly what
+ * ds4_batch_slabs_alloc (+ ds4_mtp_slabs_alloc when MTP is on) allocates per
+ * bank.  Used to budget the bank count from free device memory BEFORE the big
+ * allocations: on unified-memory boxes (GB10) discovering the limit by failing
+ * multi-GB cudaMallocs can summon the OOM killer before the alloc fails. */
+static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp) {
+    const uint64_t raw_bank = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    uint64_t per_bank = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t coff  = ratio == 4u ? 2u : 1u;
+        per_bank += raw_bank;
+        if (ratio != 0 && g->layer_attn_comp_cache[il]) {
+            const uint64_t astate = (uint64_t)(coff * ratio) *
+                                    (uint64_t)(coff * DS4_N_HEAD_DIM) * sizeof(float);
+            per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
+            per_bank += 6ull * astate;   /* live kv+score + 2 ckpt depths x kv+score */
+        }
+        if (ratio == 4u && g->layer_index_comp_cache[il]) {
+            const uint64_t istate = (uint64_t)(coff * ratio) *
+                                    (uint64_t)(coff * DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
+            per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            per_bank += 6ull * istate;
+        }
+    }
+    if (mtp) {
+        const uint64_t hc_bank = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        const uint64_t embd    = (uint64_t)DS4_N_EMBD * sizeof(float);
+        per_bank += raw_bank;                              /* MTP raw ring */
+        per_bank += 7ull * hc_bank;                        /* state+next + 5 draft hc scratch */
+        per_bank += 3ull * embd;                           /* draft embed/enorm/eproj */
+        per_bank += (uint64_t)DS4_N_VOCAB * sizeof(float); /* draft logits row */
+        per_bank += 3ull * sizeof(int32_t);                /* draft tokens/ids/n_raw */
+    }
+    return per_bank;
+}
+
+static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
+                                     bool fit, ds4_batch_ctx **out, char *err, size_t errlen) {
 #define BC_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
     if (out) *out = NULL;
     if (!e || !out) { BC_ERR("batch_ctx_create: null argument"); return 1; }
@@ -27468,20 +27505,60 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
     ctx->g.quality = e->quality;
     ctx->g.power_percent = e->power_percent > 0 ? (uint32_t)e->power_percent : 100u;
 
-    if (!ds4_batch_slabs_alloc(&ctx->sl, &ctx->g, ctx->max_seq)) {
-        BC_ERR("batch_ctx_create: slab alloc failed (max_seq=%u)", ctx->max_seq);
-        ds4_batch_slabs_free(&ctx->sl, &ctx->g);   /* frees any partial banks */
-        metal_graph_free(&ctx->g);
-        free(ctx);
-        return 1;
+    /* R5 Inc1a: with the graph's fixed allocations in place, budget the bank
+     * count from what is actually free instead of letting the caller probe by
+     * failing whole creates (blind halving both risks the OOM killer on
+     * unified memory and can strand a third of the achievable banks).
+     * DS4_BATCH_FIT_HEADROOM_MB (default 8192) reserves room for runtime
+     * growth: tmp pools, capture graphs, logits staging.  DS4_BATCH_FIT=0
+     * keeps caller-driven sizing.  Backends with no memory query (Metal)
+     * skip the budget and rely on the descent loop below. */
+    if (fit) {
+        const char *fe = getenv("DS4_BATCH_FIT");
+        uint64_t free_b = 0, total_b = 0;
+        const uint64_t per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, ctx->mtp);
+        if (!(fe && fe[0] == '0' && fe[1] == '\0') &&
+            per_bank != 0 && ds4_gpu_mem_info(&free_b, &total_b) == 0) {
+            const char *he = getenv("DS4_BATCH_FIT_HEADROOM_MB");
+            uint64_t headroom = 8192ull << 20;
+            if (he && he[0]) {
+                const long hv = atol(he);
+                if (hv >= 0) headroom = (uint64_t)hv << 20;
+            }
+            const uint64_t budget = free_b > headroom ? free_b - headroom : 0;
+            uint32_t n = (uint32_t)(budget / per_bank);
+            if (n < 2u) n = 2u;   /* still try the floor: a failing 2-bank slab
+                                   * alloc is a ~2-GB poke, not a 20-GB one */
+            if (n < ctx->max_seq) {
+                fprintf(stderr,
+                        "ds4: batch fit: free=%.2f GiB headroom=%.2f GiB per_bank=%.1f MiB -> max_seq %u (requested %u)\n",
+                        (double)free_b / 1073741824.0, (double)headroom / 1073741824.0,
+                        (double)per_bank / 1048576.0, n, ctx->max_seq);
+                ctx->max_seq = n;
+            }
+        }
     }
-    if (ctx->mtp && !ds4_mtp_slabs_alloc(&ctx->msl, &ctx->g, ctx->max_seq)) {
-        BC_ERR("batch_ctx_create: MTP slab alloc failed (max_seq=%u)", ctx->max_seq);
-        ds4_mtp_slabs_free(&ctx->msl, &ctx->g);    /* frees any partial banks + restores */
-        ds4_batch_slabs_free(&ctx->sl, &ctx->g);
-        metal_graph_free(&ctx->g);
-        free(ctx);
-        return 1;
+
+    for (;;) {
+        const bool slabs_ok = ds4_batch_slabs_alloc(&ctx->sl, &ctx->g, ctx->max_seq);
+        const bool mtp_ok = slabs_ok &&
+                            (!ctx->mtp || ds4_mtp_slabs_alloc(&ctx->msl, &ctx->g, ctx->max_seq));
+        if (slabs_ok && mtp_ok) break;
+        if (slabs_ok) ds4_mtp_slabs_free(&ctx->msl, &ctx->g);  /* frees partial banks + restores */
+        ds4_batch_slabs_free(&ctx->sl, &ctx->g);               /* frees any partial banks */
+        if (!fit || ctx->max_seq <= 2u) {
+            if (!slabs_ok) BC_ERR("batch_ctx_create: slab alloc failed (max_seq=%u)", ctx->max_seq);
+            else           BC_ERR("batch_ctx_create: MTP slab alloc failed (max_seq=%u)", ctx->max_seq);
+            metal_graph_free(&ctx->g);
+            free(ctx);
+            return 1;
+        }
+        /* Finer than halving so a near-miss budget doesn't cost half the banks. */
+        uint32_t next = ctx->max_seq * 3u / 4u;
+        if (next < 2u) next = 2u;
+        fprintf(stderr, "ds4: batch fit: %s alloc failed at max_seq=%u, retrying at %u\n",
+                slabs_ok ? "MTP slab" : "slab", ctx->max_seq, next);
+        ctx->max_seq = next;
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
      * R2: sized by seq_cap (the committed-token bound), not the raw ring. */
@@ -27491,6 +27568,16 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
     *out = ctx;
     return 0;
 #undef BC_ERR
+}
+
+int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
+                         ds4_batch_ctx **out, char *err, size_t errlen) {
+    return ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, false, out, err, errlen);
+}
+
+int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
+                             ds4_batch_ctx **out, char *err, size_t errlen) {
+    return ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, true, out, err, errlen);
 }
 
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
@@ -27592,6 +27679,12 @@ int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int *
 
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) {
     return ctx ? (int)ctx->raw_cap : 0;
+}
+
+/* R5 Inc1a: actual bank count, which create_fit may have sized below the
+ * requested cap. */
+int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) {
+    return ctx ? (int)ctx->max_seq : 0;
 }
 
 /* R2: per-bank committed-token bound of the continuous path (admit pre-check +
@@ -29865,8 +29958,13 @@ int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total
     if (err && errlen) snprintf(err, errlen, "batch_ctx_create: build has no graph backend");
     return 1;
 }
+int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
+                             ds4_batch_ctx **out, char *err, size_t errlen) {
+    return ds4_batch_ctx_create(e, ctx_size, max_seq, max_total_tokens, out, err, errlen);
+}
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) { (void)ctx; }
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,

@@ -354,6 +354,10 @@ int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, cons
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
+/* R5 Inc1a: device memory snapshot for budget-computed batch-bank sizing.
+   Returns 0 and writes the allocator's current free/total bytes; nonzero when
+   the backend cannot answer (Metal) -- callers fall back to try-and-reduce. */
+int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
 void ds4_gpu_set_attention_output_b_n2_q8_override(int enabled);

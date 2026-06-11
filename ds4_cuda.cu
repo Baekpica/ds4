@@ -2429,6 +2429,46 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     return free_bytes - context_bytes < reserve_bytes;
 }
 
+extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 1;
+    }
+    uint64_t free_out = (uint64_t)free_b;
+#ifdef __linux__
+    /* Integrated/unified (GB10): cudaMemGetInfo's free tracks MemFree and
+     * ignores reclaimable page cache -- on this box often tens of GB of cold
+     * gguf file pages that cudaMalloc can claim just fine.  MemAvailable is
+     * the kernel's own "allocatable before OOM" answer, which is the budget
+     * question; take whichever is larger. */
+    int dev = 0;
+    int integrated = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess &&
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess &&
+        integrated) {
+        FILE *f = fopen("/proc/meminfo", "r");
+        if (f) {
+            char line[160];
+            while (fgets(line, sizeof line, f)) {
+                unsigned long long kb = 0;
+                if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                    if (kb * 1024ull > free_out) free_out = kb * 1024ull;
+                    break;
+                }
+            }
+            fclose(f);
+        }
+    }
+    (void)cudaGetLastError();
+#endif
+    if (free_bytes) *free_bytes = free_out;
+    if (total_bytes) *total_bytes = (uint64_t)total_b;
+    return 0;
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));

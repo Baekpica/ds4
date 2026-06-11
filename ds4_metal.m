@@ -4446,6 +4446,14 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
     return 0;
 }
 
+int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+    /* R5 Inc1a: no reliable free-memory answer on Metal (unified, no
+     * MTLDevice free query); callers fall back to try-and-reduce sizing. */
+    (void)free_bytes;
+    (void)total_bytes;
+    return 1;
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base) return NULL;
     const DS4MetalTensor *base_obj = ds4_gpu_tensor_const_obj(base);
