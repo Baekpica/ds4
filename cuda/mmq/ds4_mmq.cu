@@ -844,11 +844,8 @@ int ds4_mmq_moe_vec_impl(
     // max(n_tokens, n_expert_used) depending on which dim we route into.
     // We follow upstream's convention: ne_y = n_tokens, ne_dst = n_expert_used.
     // So ncols_dst = n_tokens and nchannels_dst = n_expert_used.
-    if (n_tokens > MMVQ_MAX_BATCH_SIZE) {
-        fprintf(stderr, "%s: n_tokens=%d exceeds MMVQ_MAX_BATCH_SIZE=%d\n",
-                tag, n_tokens, MMVQ_MAX_BATCH_SIZE);
-        return -1;
-    }
+    // FD Inc2a: n_tokens beyond the per-launch column cap no longer rejects;
+    // the launch loop below splits the column dim into capped chunks.
 
     const int dev = ggml_cuda_get_device();
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
@@ -908,16 +905,28 @@ int ds4_mmq_moe_vec_impl(
     //      nchannels_y        = ne11 = 1
     //      nchannels_dst      = ne1  = n_expert_used
     //      stride_col_y       = s12  = ne11 * (ne10_padded / QK8_1)
-    //      stride_col_dst     = s2   = M (column stride in dst)
+    //      stride_col_dst     = s2   = n_expert_used * M (token stride in dst)
     //      stride_channel_y   = s11  = ne10_padded / QK8_1
-    //      stride_channel_dst = s1   = M (channel stride in dst)
+    //      stride_channel_dst = s1   = M (channel/slot stride in dst)
     //      ids_stride         = stride between rows of ids[] tensor
+    //
+    //    FD Inc2a stride fix: stride_col_dst was previously M, same as the
+    //    channel stride.  That was invisible while every caller degenerated
+    //    one dim (gate/up at n_tokens=1: col index always 0; down at
+    //    n_expert_used=1: channel index always 0, and 1 * M == M keeps it
+    //    bit-identical here).  At n_tokens >= 2 with n_expert_used > 1 the
+    //    multi-token MoE kernel writes dst[chan*s1 + col*s2 + row], and
+    //    equal strides collide (token=0,slot=1) with (token=1,slot=0).
+    //    s2 = n_expert_used * M yields the row-major
+    //    [token * n_expert_used + slot, M] layout the swiglu consumer
+    //    expects.
     const int64_t blck      = ggml_blck_size(type);
     const int64_t s01_row   = (int64_t)K / blck;            // weight row stride in blocks
     const int64_t s02_chan  = (int64_t)M * s01_row;         // expert-stack stride
     const int64_t s11_y     = ne10_padded / QK8_1;          // src1 channel stride in blocks
     const int64_t s12_y     = (int64_t)1 * s11_y;           // ne11 * s11
-    const int64_t s1_dst    = (int64_t)M;                   // dst col stride
+    const int64_t s1_dst    = (int64_t)M;                   // dst channel (slot) stride
+    const int64_t s2_dst    = (int64_t)n_expert_used * M;   // dst col (token) stride
 
     // ids_stride: stride between rows of the ids tensor in int32 elements.
     // Caller passes ids[t * n_expert_used + s], so stride between tokens
@@ -926,30 +935,48 @@ int ds4_mmq_moe_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
-    mul_mat_vec_q_switch_type(
-        /*vx=*/W, /*type_x=*/type,
-        /*vy=*/(const void *)src1_q8_1_ptr,
-        /*ids=*/ids, /*fusion=*/fusion,
-        /*dst=*/out_f32,
-        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/n_tokens,
-        /*stride_row_x=*/(int)s01_row,
-        /*stride_col_y=*/(int)s12_y,
-        /*stride_col_dst=*/(int)s1_dst,
-        /*nchannels_x=*/n_experts,
-        /*nchannels_y=*/1,
-        /*nchannels_dst=*/n_expert_used,
-        /*stride_channel_x=*/(int)s02_chan,
-        /*stride_channel_y=*/(int)s11_y,
-        /*stride_channel_dst=*/(int)s1_dst,
-        /*nsamples_x=*/1, /*nsamples_dst=*/1,
-        /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
-        /*ids_stride=*/ids_stride, stream);
+    // FD Inc2a: one mmvq launch serves at most col_cap columns -- the moe
+    // kernel runs one warp per column (block.y = ncols_dst) under
+    // __launch_bounds__ baked per COMPILED arch + type
+    // (get_mmvq_mmid_max_batch_for_device).  The runtime device cc can
+    // exceed the compiled arch (CUDA_ARCH= builds run default-arch PTX on
+    // newer GPUs), so the host cap MUST be looked up at the compiled arch:
+    // asking the runtime cc says 8 where the compiled bounds say 7 (e.g.
+    // Q2_K builds at turing_plus -> 7*warp_size threads) and the launch
+    // dies with cudaErrorInvalidValue.  Wider batches run as
+    // ceil(n_tokens / col_cap) launches; every per-column stride (vy, ids,
+    // dst) is uniform, so a chunk is plain pointer offsets.  The single
+    // quantize above already covers all columns.
+    const int cc      = ggml_cuda_info().devices[dev].cc;
+    const int col_cap = get_mmvq_mmid_max_batch(type, ggml_cuda_highest_compiled_arch(cc));
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: mul_mat_vec_q_switch_type launch failed: %s\n",
-                tag, cudaGetErrorString(err));
-        return -3;
+    for (int c0 = 0; c0 < n_tokens; c0 += col_cap) {
+        const int ncols = (n_tokens - c0 < col_cap) ? (n_tokens - c0) : col_cap;
+        mul_mat_vec_q_switch_type(
+            /*vx=*/W, /*type_x=*/type,
+            /*vy=*/(const void *)(src1_q8_1_ptr + (size_t)c0 * s12_y * sizeof(block_q8_1)),
+            /*ids=*/ids + (size_t)c0 * ids_stride, /*fusion=*/fusion,
+            /*dst=*/out_f32 + (int64_t)c0 * s2_dst,
+            /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/ncols,
+            /*stride_row_x=*/(int)s01_row,
+            /*stride_col_y=*/(int)s12_y,
+            /*stride_col_dst=*/(int)s2_dst,
+            /*nchannels_x=*/n_experts,
+            /*nchannels_y=*/1,
+            /*nchannels_dst=*/n_expert_used,
+            /*stride_channel_x=*/(int)s02_chan,
+            /*stride_channel_y=*/(int)s11_y,
+            /*stride_channel_dst=*/(int)s1_dst,
+            /*nsamples_x=*/1, /*nsamples_dst=*/1,
+            /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+            /*ids_stride=*/ids_stride, stream);
+
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: mul_mat_vec_q_switch_type launch failed: %s (cols %d..%d cap %d)\n",
+                    tag, cudaGetErrorString(err), c0, c0 + ncols - 1, col_cap);
+            return -3;
+        }
     }
 
     return 0;

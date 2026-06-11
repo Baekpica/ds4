@@ -11281,7 +11281,7 @@ static int ds4_cuda_use_cublas_q8(void) {
 /* FD Inc1: shared small-batch vec-tier threshold for the dense Q8_0 site and
  * routed_moe_launch.  Batches of n_tokens <= this go through the mmvq vec
  * kernels instead of mmq's tile path (the routed-MoE site additionally caps
- * by its assignment envelope n_tokens * top_k <= MMVQ_MAX_BATCH_SIZE).
+ * by its assignment envelope, cuda_moe_vec_max_assign() below).
  *   DS4_CUDA_NO_MMVQ_DECODE=1            -> 0 (vec tier off)
  *   DS4_CUDA_MMVQ_DECODE_MAX_TOKENS=0..8 -> explicit threshold (wins)
  * Default 8 (FD Inc1, fd2/fd3 A/B): the vec tier beats mmq tiles for every
@@ -11298,6 +11298,37 @@ static uint32_t cuda_mmvq_decode_max_tokens(void) {
         if (s && *s) {
             long x = strtol(s, NULL, 10);
             if (x >= 0 && x <= 8) v = (uint32_t)x;
+        }
+    }
+    return v;
+}
+
+/* FD Inc2a: routed-MoE vec-tier assignment envelope.  The down matmul's
+ * ncols_dst = n_tokens * top_k assignment rows; one mmvq launch caps at a
+ * per-COMPILED-arch per-type column count (<= MMVQ_MAX_BATCH_SIZE=8), so
+ * wider batches are split into capped chunks inside ds4_mmq_moe_vec_impl
+ * (single quantize, ceil(n/cap) matvec launches).  This knob bounds
+ * how many assignments the (split) vec tier serves before routed_moe_launch
+ * falls back to mmq tiles, which amortize expert-weight reads across
+ * assignment columns and would win back at some larger width (vec cost is
+ * ~linear in assignments).  fdi3 A/B (GB10): no crossover anywhere in the
+ * reachable range -- vec wins at every decode width, fwd ms/step
+ * w2 89.6->76.2 (-15%), w4 117.0->98.8 (-16%), w8 190.4->153.2 (-19%),
+ * w1 parity; aggregate w8 +24%.
+ *   DS4_CUDA_MOE_VEC_MAX_ASSIGN=N -> explicit envelope
+ *     (8 restores the pre-Inc2a single-launch behavior; < top_k disables
+ *     the vec tier even for single-token decode)
+ * Default 48 = the max reachable under the outer gate (8 tokens x top_k 6),
+ * i.e. the vec tier serves every batch the gate admits. */
+static uint32_t cuda_moe_vec_max_assign(void) {
+    static int init = 0;
+    static uint32_t v = 48;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_MOE_VEC_MAX_ASSIGN");
+        if (s && *s) {
+            long x = strtol(s, NULL, 10);
+            if (x >= 0 && x <= 0x10000) v = (uint32_t)x;
         }
     }
     return v;
@@ -16823,10 +16854,17 @@ static int routed_moe_launch(
      * kernels, which are structurally optimised for small batch.
      *
      * Constraints:
-     *   - Down matmul ncols_dst = n_tokens * n_expert_used must stay
-     *     <= MMVQ_MAX_BATCH_SIZE=8.  For V4 Flash (top_k=6) this caps
-     *     n_tokens at 1.  Higher n_tokens fall through to the mmq path
-     *     below; that path is already great for medium/large batches.
+     *   - Gate/up matmul ncols_dst = n_tokens must stay
+     *     <= MMVQ_MAX_BATCH_SIZE=8; guaranteed by the outer
+     *     cuda_mmvq_decode_max_tokens() gate (clamped to 8).
+     *   - Down matmul ncols_dst = n_tokens * n_expert_used has no such
+     *     guarantee; FD Inc2a: ds4_mmq_moe_vec_impl splits the column dim
+     *     into per-compiled-arch capped chunks internally (every (token,
+     *     slot) row is an independent single-expert matvec, so chunking
+     *     is just pointer offsets).  The vec tier as a whole is
+     *     bounded by cuda_moe_vec_max_assign(); beyond it, fall through
+     *     to the mmq tile path below, which amortizes expert-weight
+     *     reads across assignment columns.
      *
      * The DeepSeek V4 clamp (clamp=10 in this build) is applied by the
      * existing moe_mmq_swiglu_weighted_clamp_kernel after the two matmuls.
@@ -16844,10 +16882,11 @@ static int routed_moe_launch(
         const uint32_t n_expert_used   = n_expert;
         const uint32_t n_experts_total = 256u;
         const uint64_t n_assignments   = (uint64_t)n_tokens * n_expert_used;
-        /* Both gate and down ncols_dst must fit under MMVQ_MAX_BATCH_SIZE=8.
-         * gate ncols_dst = n_tokens; down ncols_dst = n_assignments. */
-        if (n_assignments > 8u) {
-            /* Outside the mmvq vec path's batch envelope; fall through. */
+        /* gate ncols_dst = n_tokens (<= 8 by the outer gate); down's wider
+         * column dim is chunk-split inside the vec impl.  FD Inc2a: the
+         * tier envelope is the assignment knob, no longer a hard 8. */
+        if (n_assignments > (uint64_t)cuda_moe_vec_max_assign()) {
+            /* Beyond the vec tier's assignment envelope; fall through. */
         } else {
             /* Step 8: graph cache fast path.  If enabled, check the cache
              * for a captured graph matching the current shape + pointers.
@@ -16999,7 +17038,10 @@ static int routed_moe_launch(
             /* 3. Down matmul: same reinterpretation trick the mmq path uses -
              *    treat each (token, slot) pair as a separate "token" with
              *    one expert.  Routes through mmvq's multi-token MoE kernel
-             *    (mul_mat_vec_q_moe) at ncols_dst = n_assignments. */
+             *    (mul_mat_vec_q_moe).  FD Inc2a: n_assignments may exceed
+             *    one launch's column cap; ds4_mmq_moe_vec_impl splits the
+             *    column dim into per-COMPILED-arch capped chunks internally
+             *    (single quantize, ceil(n/cap) matvec launches). */
             if (q4k_path) {
                 rc = ds4_mmq_q4_K_moe_vec(down_w, (const float *)mid->ptr,
                                           (const int32_t *)selected->ptr,
