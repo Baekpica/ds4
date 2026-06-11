@@ -11278,6 +11278,54 @@ static int ds4_cuda_use_cublas_q8(void) {
     return ds4_cuda_q8_strategy() == DS4_Q8_STRATEGY_CUBLAS && g_cublas_ready;
 }
 
+/* FD Inc1: shared small-batch vec-tier threshold for the dense Q8_0 site and
+ * routed_moe_launch.  Batches of n_tokens <= this go through the mmvq vec
+ * kernels instead of mmq's tile path (the routed-MoE site additionally caps
+ * by its assignment envelope n_tokens * top_k <= MMVQ_MAX_BATCH_SIZE).
+ *   DS4_CUDA_NO_MMVQ_DECODE=1            -> 0 (vec tier off)
+ *   DS4_CUDA_MMVQ_DECODE_MAX_TOKENS=0..8 -> explicit threshold (wins)
+ * Default 8 (FD Inc1, fd2/fd3 A/B): the vec tier beats mmq tiles for every
+ * decode width 2..8 (fwd -1.5 to -8 ms/step) and also carries the per-row
+ * head matmuls (post -1.4 ms/step).  Set =1 to restore the pre-FD
+ * decode-only behavior. */
+static uint32_t cuda_mmvq_decode_max_tokens(void) {
+    static int init = 0;
+    static uint32_t v = 8;
+    if (!init) {
+        init = 1;
+        if (getenv("DS4_CUDA_NO_MMVQ_DECODE")) v = 0;
+        const char *s = getenv("DS4_CUDA_MMVQ_DECODE_MAX_TOKENS");
+        if (s && *s) {
+            long x = strtol(s, NULL, 10);
+            if (x >= 0 && x <= 8) v = (uint32_t)x;
+        }
+    }
+    return v;
+}
+
+/* FD Inc1: decode-width ceiling for the native split-K F16 path.  n_tok in
+ * [2, max] loop-launches the n=1 split-K kernel pair per row instead of the
+ * cuBLAS cutlass GEMM + f32->f16 conversion (FD Inc0 nsys: 357us vs 14.5us
+ * per matmul at decode shapes).  Each row is bit-identical to the n=1 decode
+ * path; the shared partials scratch is safe because same-stream ordering
+ * serializes each row's write->combine.  Default 8 (FD Inc1, fd3 A/B: the
+ * single biggest decode-width lever -- w2 fwd 133->91 ms/step, the w2<w1
+ * aggregate inversion gone).  DS4_CUDA_NATIVE_F16_MAX_TOKENS=1 restores
+ * legacy cuBLAS dispatch for n_tok > 1. */
+static uint32_t cuda_native_f16_max_tokens(void) {
+    static int init = 0;
+    static uint32_t v = 8;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_NATIVE_F16_MAX_TOKENS");
+        if (s && *s) {
+            long x = strtol(s, NULL, 10);
+            if (x >= 1 && x <= 16) v = (uint32_t)x;
+        }
+    }
+    return v;
+}
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
@@ -11289,22 +11337,23 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
 
-    /* mmvq dense vec path (Step 6).  At n_tok=1 (attention projection
-     * decode) mmvq is structurally better than mmq's tile-based code:
-     * one CUDA block per output row, no column-tile waste.  Tries mmvq
-     * first; on failure falls through to mmq dense, which itself falls
-     * through to the legacy native kernels at the bottom of this function.
-     *
-     * Opt-out: DS4_CUDA_NO_MMVQ_DECODE=1 (same flag as routed_moe_launch).
+    /* mmvq dense vec path (Step 6; FD Inc1 widened to small batches).
+     * At small n_tok mmvq is structurally better than mmq's tile-based
+     * code: one CUDA block per output row, no column-tile waste.  The
+     * kernel entry takes n_tok <= MMVQ_MAX_BATCH_SIZE=8 columns; the
+     * tier threshold comes from cuda_mmvq_decode_max_tokens().  Tries
+     * mmvq first; on failure falls through to mmq dense, which itself
+     * falls through to the legacy native kernels at the bottom of this
+     * function.
      *
      * Step 8.2: when DS4_CUDA_MOE_GRAPHS=1 also enables graph capture
-     * around this branch.  Each (weight_offset, x_ptr, out_ptr) tuple
-     * gets its own cached cudaGraphExec_t.  On cache hit, a single
-     * cudaGraphLaunch replaces the alloc + quantize + mmvq + free
-     * launches.  Same g_moe_stream + ds4_pool_set_stream plumbing as
-     * the routed-MoE graph branch. */
-    if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok == 1u &&
-        getenv("DS4_CUDA_NO_MMVQ_DECODE") == NULL) {
+     * around this branch.  Each (weight_offset, dims, n_tok, x_ptr,
+     * out_ptr) tuple gets its own cached cudaGraphExec_t.  On cache hit,
+     * a single cudaGraphLaunch replaces the alloc + quantize + mmvq +
+     * free launches.  Same g_moe_stream + ds4_pool_set_stream plumbing
+     * as the routed-MoE graph branch. */
+    if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) &&
+        n_tok >= 1u && n_tok <= cuda_mmvq_decode_max_tokens()) {
 
         struct dense_graph_entry *dslot = NULL;
         int dcapturing = 0;
@@ -12189,7 +12238,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_router &&
         n_tok == 1u &&
         getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
-    if (!serial_f16 && g_cublas_ready && n_tok > 1) {
+    if (!serial_f16 && g_cublas_ready && n_tok > cuda_native_f16_max_tokens()) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
@@ -12241,7 +12290,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
      * fills the GPU, leaving ksplit==1 and a path byte-identical to
      * matmul_f16_kernel. */
     uint32_t ksplit = 1u;
-    if (n_tok == 1u && g_f16_splitk_partials != NULL) {
+    if (n_tok >= 1u && n_tok <= cuda_native_f16_max_tokens() && g_f16_splitk_partials != NULL) {
         const uint32_t target_blocks = 2048u;
         const uint32_t min_seg = 512u;
         /* Split whenever the single-block-per-row kernel under-fills the SMs
@@ -12265,10 +12314,15 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                 && (((uintptr_t)w & 15u) == 0u)
                 && (((uintptr_t)x->ptr & 15u) == 0u);
         dim3 sgrid((unsigned)out_dim, ksplit, 1);
-        matmul_f16_splitk_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
-                g_f16_splitk_partials, w, (const float *)x->ptr, in_dim, out_dim, ksplit, vec_ok);
-        matmul_f16_splitk_combine_kernel<<<(unsigned)((out_dim + 255u) / 256u), 256, 0, ds4_current_stream()>>>(
-                (float *)out->ptr, g_f16_splitk_partials, out_dim, ksplit);
+        /* FD Inc1: rows beyond the first reuse the partials scratch; the
+         * stream serializes each row's splitk write before its combine read,
+         * so every row computes exactly the n=1 decode result. */
+        for (uint64_t r = 0; r < n_tok; r++) {
+            matmul_f16_splitk_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
+                    g_f16_splitk_partials, w, (const float *)x->ptr + r * in_dim, in_dim, out_dim, ksplit, vec_ok);
+            matmul_f16_splitk_combine_kernel<<<(unsigned)((out_dim + 255u) / 256u), 256, 0, ds4_current_stream()>>>(
+                    (float *)out->ptr + r * out_dim, g_f16_splitk_partials, out_dim, ksplit);
+        }
         return cuda_ok(cudaGetLastError(), "matmul_f16_splitk launch");
     }
     matmul_f16_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
@@ -16784,19 +16838,8 @@ static int routed_moe_launch(
      * Threshold override: DS4_CUDA_MMVQ_DECODE_MAX_TOKENS=N (0 disables,
      *   1 = decode-only [default], 8 = use vec for all short batches).
      */
-    static int mmvq_decode_init = 0;
-    static uint32_t mmvq_decode_max_tokens = 1;
-    if (!mmvq_decode_init) {
-        mmvq_decode_init = 1;
-        if (getenv("DS4_CUDA_NO_MMVQ_DECODE")) {
-            mmvq_decode_max_tokens = 0;
-        }
-        const char *s = getenv("DS4_CUDA_MMVQ_DECODE_MAX_TOKENS");
-        if (s && *s) {
-            long v = strtol(s, NULL, 10);
-            if (v >= 0 && v <= 8) mmvq_decode_max_tokens = (uint32_t)v;
-        }
-    }
+    /* FD Inc1: threshold logic unified with the dense Q8_0 site. */
+    const uint32_t mmvq_decode_max_tokens = cuda_mmvq_decode_max_tokens();
     if (ds4_cuda_use_mmq() && n_tokens > 0u && n_tokens <= mmvq_decode_max_tokens) {
         const uint32_t n_expert_used   = n_expert;
         const uint32_t n_experts_total = 256u;
