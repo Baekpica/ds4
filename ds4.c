@@ -10260,6 +10260,24 @@ static ds4_gpu_tensor *metal_graph_attn_comp_row_view(
                                (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
 }
 
+/* R5 Inc1b: demand-map the cache rows a compressor emit is about to write.
+ * Always true for eager allocations (the only reserved tensors are the batch
+ * ctx's comp/index slabs, DS4_BATCH_VMM_COMP); works on views too -- the
+ * backend resolves through the containing reservation, so callers pass
+ * whatever cache pointer they are about to write at its own row offsets.
+ * Failure means the driver could not back the pages: callers fail the forward
+ * exactly like the capacity-exceeded path (graceful stream error, no crash). */
+static bool metal_graph_cache_ensure_rows(const ds4_gpu_tensor *cache,
+                                          uint64_t first_row, uint64_t rows,
+                                          uint64_t row_bytes,
+                                          const char *what, uint32_t il) {
+    if (!cache || rows == 0) return true;
+    if (ds4_gpu_tensor_ensure(cache, first_row * row_bytes, rows * row_bytes)) return true;
+    fprintf(stderr, "ds4: %s demand-map failed at layer %u (rows %llu+%llu)\n",
+            what, il, (unsigned long long)first_row, (unsigned long long)rows);
+    return false;
+}
+
 static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
         ds4_gpu_graph *g,
         uint32_t       il,
@@ -10267,6 +10285,11 @@ static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
         uint32_t       rows) {
     if (DS4_GPU_ATTN_COMP_CACHE_F16) return g->attn_comp_stage;
     const uint32_t view_rows = rows ? rows : 1u;
+    if (!metal_graph_cache_ensure_rows(g->layer_attn_comp_cache[il],
+                                       first_row, view_rows,
+                                       (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                       "attn comp prefill", il))
+        return NULL;
     return ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
                                (uint64_t)first_row * DS4_N_HEAD_DIM * sizeof(float),
                                (uint64_t)view_rows * DS4_N_HEAD_DIM * sizeof(float));
@@ -15249,6 +15272,13 @@ static bool metal_graph_encode_layer_attention_batch(
                         ok = false;
                         break;
                     }
+                    if (!metal_graph_cache_ensure_rows(g->layer_attn_comp_cache[il],
+                            (uint64_t)seq * g->layer_comp_cap[il] + comp_before, comp_chunk,
+                            (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                            "FB2 multi-seq comp emit", il)) {
+                        ok = false;
+                        break;
+                    }
                     ds4_gpu_tensor *target = ds4_gpu_tensor_view(
                             g->layer_attn_comp_cache[il],
                             ((uint64_t)seq * g->layer_comp_cap[il] + comp_before) * DS4_N_HEAD_DIM * sizeof(float),
@@ -15322,6 +15352,13 @@ static bool metal_graph_encode_layer_attention_batch(
                 const uint32_t comp_row_local = g->ms_n_comp[seq][il];
                 if (emit && comp_row_local >= g->layer_comp_cap[il]) {
                     fprintf(stderr, "ds4: Step 4d multi-seq compressed cache capacity exceeded at layer %u seq %u\n", il, seq);
+                    ok = false;
+                    break;
+                }
+                if (emit && !metal_graph_cache_ensure_rows(g->layer_attn_comp_cache[il],
+                        (uint64_t)seq * g->layer_comp_cap[il] + comp_row_local, 1u,
+                        (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                        "multi-seq comp emit", il)) {
                     ok = false;
                     break;
                 }
@@ -15801,6 +15838,13 @@ static bool metal_graph_encode_layer_attention_batch(
                             ok = false;
                             break;
                         }
+                        if (!metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
+                                (uint64_t)seq * g->layer_comp_cap[il] + index_before, index_chunk,
+                                (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                "FB2 multi-seq indexer emit", il)) {
+                            ok = false;
+                            break;
+                        }
                         ds4_gpu_tensor *index_view = ds4_gpu_tensor_view(
                                 g->layer_index_comp_cache[il],
                                 ((uint64_t)seq * g->layer_comp_cap[il] + index_before) * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -15865,6 +15909,13 @@ static bool metal_graph_encode_layer_attention_batch(
                     const uint32_t index_row_local = g->ms_n_index_comp[seq][il];
                     if (emit && index_row_local >= g->layer_comp_cap[il]) {
                         fprintf(stderr, "ds4: Step 4d multi-seq indexer cache capacity exceeded at layer %u seq %u\n", il, seq);
+                        ok = false;
+                        break;
+                    }
+                    if (emit && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
+                            (uint64_t)seq * g->layer_comp_cap[il] + index_row_local, 1u,
+                            (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                            "multi-seq indexer emit", il)) {
                         ok = false;
                         break;
                     }
@@ -15946,6 +15997,10 @@ static bool metal_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
+                if (ok && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
+                        0u, n_comp, (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        "indexer prefill", il))
+                    ok = false;
                 if (ok) {
                     ok = ds4_gpu_compressor_prefill_tensor(g->layer_index_comp_cache[il],
                                                              g->layer_index_state_kv[il],
@@ -16026,6 +16081,11 @@ static bool metal_graph_encode_layer_attention_batch(
                         fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                     }
+                    if (ok && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
+                            index_before, index_chunk,
+                            (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                            "indexer chunk emit", il))
+                        ok = false;
                     ds4_gpu_tensor *index_view = NULL;
                     if (ok) {
                         index_view = ds4_gpu_tensor_view(
@@ -22566,6 +22626,7 @@ static bool metal_graph_multiseq_generate(
  * ===================================================================== */
 typedef struct {
     uint32_t        N;
+    bool            vmm;             /* R5 Inc1b: comp/index slabs are demand-mapped reservations */
     uint64_t        raw_bank_bytes;
     uint64_t        comp_bank_bytes[DS4_MAX_LAYER];
     uint64_t        index_bank_bytes[DS4_MAX_LAYER];
@@ -22671,9 +22732,35 @@ static void ds4_slab_poison_fill(ds4_gpu_tensor *t) {
     if (t) (void)ds4_gpu_tensor_fill_f32(t, qnan.f, ds4_gpu_tensor_bytes(t) / sizeof(float));
 }
 
+/* R5 Inc1b: the ctx-scaled comp/index cache slabs (226 MB/bank at 16k, 902 MB
+ * at 64k -- vs the ctx-independent ~390 MB of ring+states) are reserved as
+ * demand-mapped virtual ranges when the backend supports it: full VIRTUAL
+ * stride (views, seq_id*comp_cap kernel arithmetic, and bank offsets are
+ * byte-identical to an eager slab) but physical pages map only as conversations
+ * actually grow, via the metal_graph_cache_ensure_rows hooks at every emit
+ * site and the bank_fork_copy dst pre-map.  The single-token SERIAL decode
+ * path is deliberately unhooked: it can never target these slabs (cont decode
+ * is the multiseq path; the serial session and selftests use eager caches).
+ * DS4_BATCH_VMM_COMP=0 forces eager (bit-identical to pre-Inc1b); slab poison
+ * diagnostics force eager too since they fill the whole slab. */
+static bool ds4_batch_vmm_comp_enabled(void) {
+    const char *e = getenv("DS4_BATCH_VMM_COMP");
+    if (e && e[0] == '0' && e[1] == '\0') return false;
+    if (ds4_slab_poison_level("DS4_BATCH_SLAB_POISON") >= 1) return false;
+    return ds4_gpu_vmm_demand_page() != 0;
+}
+static ds4_gpu_tensor *ds4_batch_cache_slab_alloc(uint64_t bytes, bool vmm) {
+    if (vmm) {
+        ds4_gpu_tensor *t = ds4_gpu_tensor_reserve(bytes);
+        if (t) return t;
+    }
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
 static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_t N) {
     memset(sl, 0, sizeof(*sl));
     sl->N = N;
+    sl->vmm = ds4_batch_vmm_comp_enabled();
     sl->raw_bank_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         sl->saved_raw[il]   = g->layer_raw_cache[il];
@@ -22698,7 +22785,7 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
         sl->multi_raw[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->raw_bank_bytes);
         ok = sl->multi_raw[il] != NULL;
         if (ok && ratio != 0 && sl->saved_comp[il]) {
-            sl->multi_comp[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->comp_bank_bytes[il]);
+            sl->multi_comp[il] = ds4_batch_cache_slab_alloc((uint64_t)N * sl->comp_bank_bytes[il], sl->vmm);
             sl->multi_askv[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
             sl->multi_assc[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
             ok = sl->multi_comp[il] && sl->multi_askv[il] && sl->multi_assc[il];
@@ -22709,7 +22796,7 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
             }
         }
         if (ok && ratio == 4 && sl->saved_index[il]) {
-            sl->multi_index[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->index_bank_bytes[il]);
+            sl->multi_index[il] = ds4_batch_cache_slab_alloc((uint64_t)N * sl->index_bank_bytes[il], sl->vmm);
             sl->multi_iskv[il]  = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
             sl->multi_issc[il]  = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
             ok = sl->multi_index[il] && sl->multi_iskv[il] && sl->multi_issc[il];
@@ -27401,16 +27488,50 @@ struct ds4_batch_ctx {
     uint64_t        warm_rejects;    /* n_cached>0 admits that degraded to cold */
     uint64_t        fork_admits;     /* A2b: fork_bank>0 admits served by copy (or */
     uint64_t        fork_rejects;    /* the src==dst warm degenerate) vs degraded  */
+    /* R5 Inc1b: page budget for the demand-mapped comp/index slabs (bytes;
+     * 0 = no gating) + admits rejected because mapping the request's projected
+     * committed length would bust it. */
+    uint64_t        comp_map_budget;
+    uint64_t        mem_rejects;
 };
+
+/* R5 Inc1b: first-touch page floor of ONE ACTIVE bank's demand-mapped cache
+ * slabs -- any bank actually serving a conversation maps at least one page per
+ * comp/index slab (min() amortizes slabs whose per-bank stride is sub-page:
+ * several banks then share a page).  ~90 MiB/bank on GB10, ctx-INDEPENDENT --
+ * this is what makes large-ctx banks cheap (the 64k eager cache is 902 MiB). */
+static uint64_t ds4_batch_vmm_floor_per_bank(const ds4_gpu_graph *g) {
+    const uint64_t page = ds4_gpu_vmm_demand_page();
+    if (page == 0) return 0;
+    uint64_t floor_b = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0 && g->layer_attn_comp_cache[il]) {
+            const uint64_t cb = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
+            floor_b += cb < page ? cb : page;
+        }
+        if (ratio == 4u && g->layer_index_comp_cache[il]) {
+            const uint64_t ib = (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            floor_b += ib < page ? ib : page;
+        }
+    }
+    return floor_b;
+}
 
 /* R5 Inc1a: slab bytes ONE bank costs, mirroring exactly what
  * ds4_batch_slabs_alloc (+ ds4_mtp_slabs_alloc when MTP is on) allocates per
  * bank.  Used to budget the bank count from free device memory BEFORE the big
  * allocations: on unified-memory boxes (GB10) discovering the limit by failing
- * multi-GB cudaMallocs can summon the OOM killer before the alloc fails. */
-static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp) {
+ * multi-GB cudaMallocs can summon the OOM killer before the alloc fails.
+ * R5 Inc1b: vmm_comp = the comp/index CACHE slabs will be demand-mapped
+ * reservations, so a bank costs only their first-touch page FLOOR here, not
+ * the ctx-sized cache; growth past the floor is gated at admit time against
+ * comp_map_budget (which grants the floors back -- fit and the page budget
+ * split the same free memory, no double-booking of the headroom).  The
+ * compressor STATE slabs stay eager and keep counting. */
+static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, bool vmm_comp) {
     const uint64_t raw_bank = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
-    uint64_t per_bank = 0;
+    uint64_t per_bank = vmm_comp ? ds4_batch_vmm_floor_per_bank(g) : 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff  = ratio == 4u ? 2u : 1u;
@@ -27418,13 +27539,15 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp) {
         if (ratio != 0 && g->layer_attn_comp_cache[il]) {
             const uint64_t astate = (uint64_t)(coff * ratio) *
                                     (uint64_t)(coff * DS4_N_HEAD_DIM) * sizeof(float);
-            per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
+            if (!vmm_comp)
+                per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
             per_bank += 6ull * astate;   /* live kv+score + 2 ckpt depths x kv+score */
         }
         if (ratio == 4u && g->layer_index_comp_cache[il]) {
             const uint64_t istate = (uint64_t)(coff * ratio) *
                                     (uint64_t)(coff * DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
-            per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            if (!vmm_comp)
+                per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
             per_bank += 6ull * istate;
         }
     }
@@ -27438,6 +27561,70 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp) {
         per_bank += 3ull * sizeof(int32_t);                /* draft tokens/ids/n_raw */
     }
     return per_bank;
+}
+
+/* R5 Inc1a/1b shared knob: bytes the bank-count fit and the comp-page budget
+ * both leave free for runtime growth (tmp pools, capture graphs, logits
+ * staging). */
+static uint64_t ds4_batch_fit_headroom_bytes(void) {
+    const char *he = getenv("DS4_BATCH_FIT_HEADROOM_MB");
+    uint64_t headroom = 8192ull << 20;
+    if (he && he[0]) {
+        const long hv = atol(he);
+        if (hv >= 0) headroom = (uint64_t)hv << 20;
+    }
+    return headroom;
+}
+
+/* R5 Inc1b: resident bytes across the comp/index cache slabs (page multiples
+ * for demand-mapped reservations; eager slabs report their full size, but
+ * callers only budget when sl->vmm).  Host-side page-flag scan, no driver
+ * calls. */
+static uint64_t ds4_batch_slabs_cache_resident(const ds4_batch_slabs *sl) {
+    uint64_t r = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (sl->multi_comp[il])
+            r += ds4_gpu_tensor_resident(sl->multi_comp[il], 0,
+                                         (uint64_t)sl->N * sl->comp_bank_bytes[il]);
+        if (sl->multi_index[il])
+            r += ds4_gpu_tensor_resident(sl->multi_index[il], 0,
+                                         (uint64_t)sl->N * sl->index_bank_bytes[il]);
+    }
+    return r;
+}
+
+/* R5 Inc1b: page-rounded bytes that growing bank b to seq_len committed tokens
+ * may still need to map (the projected per-layer cache extents minus what is
+ * already resident there -- a warm/fork prefix and any pages a previous tenant
+ * of the bank mapped count as paid).  Page rounding and the +2 row slack
+ * overestimate slightly, the safe direction for an admission budget check. */
+static uint64_t ds4_batch_bank_map_projection(const ds4_batch_ctx *ctx, uint32_t b, uint64_t seq_len) {
+    const ds4_batch_slabs *sl = &ctx->sl;
+    const uint64_t page = ds4_gpu_vmm_demand_page();
+    if (page == 0) return 0;
+    uint64_t need = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        uint64_t rows = seq_len / ratio + 2u;
+        if (rows > ctx->g.layer_comp_cap[il]) rows = ctx->g.layer_comp_cap[il];
+        if (rows == 0) continue;
+        if (sl->multi_comp[il]) {
+            const uint64_t off = (uint64_t)b * sl->comp_bank_bytes[il];
+            const uint64_t len = rows * DS4_N_HEAD_DIM * sizeof(float);
+            const uint64_t span = ((off + len - 1u) / page - off / page + 1u) * page;
+            const uint64_t res = ds4_gpu_tensor_resident(sl->multi_comp[il], off, len);
+            need += span > res ? span - res : 0;
+        }
+        if (sl->multi_index[il]) {
+            const uint64_t off = (uint64_t)b * sl->index_bank_bytes[il];
+            const uint64_t len = rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            const uint64_t span = ((off + len - 1u) / page - off / page + 1u) * page;
+            const uint64_t res = ds4_gpu_tensor_resident(sl->multi_index[il], off, len);
+            need += span > res ? span - res : 0;
+        }
+    }
+    return need;
 }
 
 static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
@@ -27516,15 +27703,14 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     if (fit) {
         const char *fe = getenv("DS4_BATCH_FIT");
         uint64_t free_b = 0, total_b = 0;
-        const uint64_t per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, ctx->mtp);
+        /* R5 Inc1b: demand-mapped comp/index slabs cost the bank count nothing
+         * at boot (resident floor 0); their growth is budgeted per-admission
+         * below.  Eager mode keeps the full Inc1a per-bank cost. */
+        const uint64_t per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, ctx->mtp,
+                                                             ds4_batch_vmm_comp_enabled());
         if (!(fe && fe[0] == '0' && fe[1] == '\0') &&
             per_bank != 0 && ds4_gpu_mem_info(&free_b, &total_b) == 0) {
-            const char *he = getenv("DS4_BATCH_FIT_HEADROOM_MB");
-            uint64_t headroom = 8192ull << 20;
-            if (he && he[0]) {
-                const long hv = atol(he);
-                if (hv >= 0) headroom = (uint64_t)hv << 20;
-            }
+            const uint64_t headroom = ds4_batch_fit_headroom_bytes();
             const uint64_t budget = free_b > headroom ? free_b - headroom : 0;
             uint32_t n = (uint32_t)(budget / per_bank);
             if (n < 2u) n = 2u;   /* still try the floor: a failing 2-bank slab
@@ -27559,6 +27745,38 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         fprintf(stderr, "ds4: batch fit: %s alloc failed at max_seq=%u, retrying at %u\n",
                 slabs_ok ? "MTP slab" : "slab", ctx->max_seq, next);
         ctx->max_seq = next;
+    }
+    /* R5 Inc1b: when the comp/index slabs are demand-mapped reservations,
+     * record the page budget admissions check against: everything still free
+     * now (minus the Inc1a headroom) may go to cache pages.  Advisory -- the
+     * ensure() hooks fail a stream gracefully if the driver runs out first --
+     * but rejecting at ADMIT beats burning a long prefill that is doomed.
+     * 0 = no gating (eager slabs, or no memory answer from the backend). */
+    ctx->comp_map_budget = 0;
+    if (ctx->sl.vmm) {
+        uint64_t vfree = 0, vtotal = 0;
+        const uint64_t floor_pb = ds4_batch_vmm_floor_per_bank(&ctx->g);
+        const uint64_t cache_per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, false, false) -
+                                        ds4_batch_slabs_bank_bytes(&ctx->g, false, true) + floor_pb;
+        if (ds4_gpu_mem_info(&vfree, &vtotal) == 0) {
+            const uint64_t headroom = ds4_batch_fit_headroom_bytes();
+            const uint64_t res = ds4_batch_slabs_cache_resident(&ctx->sl);
+            /* The fit already charged every bank its first-touch floor, so the
+             * budget grants those floors back on top of what is free beyond
+             * the headroom -- fit and page budget split the same memory. */
+            ctx->comp_map_budget = res + (vfree > headroom ? vfree - headroom : 0) +
+                                   (uint64_t)ctx->max_seq * floor_pb;
+        }
+        /* Explicit override (MB): pins the page budget regardless of the
+         * free-memory answer -- ops guardrail + the only way a gate can force
+         * the admission reject path deterministically. */
+        { const char *be = getenv("DS4_BATCH_VMM_BUDGET_MB");
+          if (be && be[0]) { const long bv = atol(be); if (bv > 0) ctx->comp_map_budget = (uint64_t)bv << 20; } }
+        fprintf(stderr,
+                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB)\n",
+                (unsigned long long)(ds4_gpu_vmm_demand_page() >> 10),
+                (double)cache_per_bank / 1048576.0, (double)floor_pb / 1048576.0,
+                ctx->max_seq, (double)ctx->comp_map_budget / 1073741824.0);
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
      * R2: sized by seq_cap (the committed-token bound), not the raw ring. */
@@ -27637,6 +27855,13 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
                                 raw_bytes) == 0) return false;
         if (sl->multi_comp[il]) {
             const uint64_t cb = (uint64_t)g->ms_n_comp[src][il] * DS4_N_HEAD_DIM * sizeof(float);
+            /* R5 Inc1b: demand-map the dst extent before the D2D (src rows are
+             * mapped by construction -- they were written). */
+            if (cb && ds4_gpu_tensor_ensure(sl->multi_comp[il],
+                                            (uint64_t)dst * sl->comp_bank_bytes[il], cb) == 0) {
+                fprintf(stderr, "ds4: fork comp demand-map failed at layer %u\n", il);
+                return false;
+            }
             if (cb && ds4_gpu_tensor_copy(sl->multi_comp[il], (uint64_t)dst * sl->comp_bank_bytes[il],
                                           sl->multi_comp[il], (uint64_t)src * sl->comp_bank_bytes[il],
                                           cb) == 0) return false;
@@ -27649,6 +27874,11 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
         }
         if (sl->multi_index[il]) {
             const uint64_t ib = (uint64_t)g->ms_n_index_comp[src][il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            if (ib && ds4_gpu_tensor_ensure(sl->multi_index[il],
+                                            (uint64_t)dst * sl->index_bank_bytes[il], ib) == 0) {
+                fprintf(stderr, "ds4: fork indexer demand-map failed at layer %u\n", il);
+                return false;
+            }
             if (ib && ds4_gpu_tensor_copy(sl->multi_index[il], (uint64_t)dst * sl->index_bank_bytes[il],
                                           sl->multi_index[il], (uint64_t)src * sl->index_bank_bytes[il],
                                           ib) == 0) return false;
@@ -28563,6 +28793,29 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             uint32_t mn = req.max_new > 0 ? (uint32_t)req.max_new : 1u;
             const uint32_t cap = seq_cap > L ? seq_cap - L : 1u;   /* frontier bound (R2: ring wraps; comp caches bound the seq) */
             if (mn > cap) mn = cap;
+            /* R5 Inc1b: budget the cache pages this admission may map (prompt
+             * + generation budget, capped at seq_cap) BEFORE installing it.
+             * Mapping is grow-only -- bank reuse rides its existing pages for
+             * free, and the projection charges only the extent beyond what is
+             * resident -- so once the budget is truly spent only requests
+             * fitting an already-grown bank pass.  Trim + eviction-aware
+             * placement are Inc2; the warm/fork match counters above count
+             * VALIDATION, so a budget-rejected match still ticks them. */
+            if (ctx->sl.vmm && ctx->comp_map_budget != 0) {
+                uint64_t flen = (uint64_t)L + mn;
+                if (flen > seq_cap) flen = seq_cap;
+                const uint64_t mneed = ds4_batch_bank_map_projection(ctx, b, flen);
+                const uint64_t mres  = ds4_batch_slabs_cache_resident(&ctx->sl);
+                if (mneed != 0 && mres + mneed > ctx->comp_map_budget) {
+                    ctx->mem_rejects++;
+                    fprintf(stderr,
+                            "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + need %.1f MiB > budget %.1f MiB)\n",
+                            b, (double)mres / 1048576.0, (double)mneed / 1048576.0,
+                            (double)ctx->comp_map_budget / 1048576.0);
+                    on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
+                    continue;
+                }
+            }
             /* R4: ADMISSION = INSTALL ONLY.  Bank state is prepared here (reset /
              * fork copy / warm reuse) and the tokens to prefill are parked in the
              * pending-prefill state; the chunks run in the advance phase below so

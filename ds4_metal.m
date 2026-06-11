@@ -4454,6 +4454,32 @@ int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
     return 1;
 }
 
+/* R5 Inc1b: Metal has no VMM reserve/map-on-demand; reserve() returns NULL so
+ * callers allocate eagerly, ensure() is a mapped no-op, resident() reports the
+ * range itself (eager tensors are always fully resident). */
+ds4_gpu_tensor *ds4_gpu_tensor_reserve(uint64_t bytes) {
+    (void)bytes;
+    return NULL;
+}
+
+int ds4_gpu_tensor_ensure(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    if (!tensor) return 0;
+    if (bytes == 0) return 1;
+    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+    return offset <= obj.bytes && bytes <= obj.bytes - offset;
+}
+
+uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    if (!tensor || bytes == 0) return 0;
+    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+    if (offset > obj.bytes) return 0;
+    return bytes <= obj.bytes - offset ? bytes : obj.bytes - offset;
+}
+
+uint64_t ds4_gpu_vmm_demand_page(void) {
+    return 0;
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base) return NULL;
     const DS4MetalTensor *base_obj = ds4_gpu_tensor_const_obj(base);

@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <new>
 
 #include "cuda/mmq/ds4_mmq.h"
 
@@ -1891,6 +1892,67 @@ static void cuda_vmm_arenas_release_all(void) {
     g_vmm_arenas.clear();
 }
 
+// R5 Inc1b: demand-mapped reserved tensors.  ds4_gpu_tensor_reserve() takes
+// the full VIRTUAL range up front (so views, kernel pointer arithmetic, and
+// uniform per-bank strides are byte-identical to an eager cudaMalloc slab)
+// but maps NO physical pages; ds4_gpu_tensor_ensure() maps granularity-sized
+// pages on demand as the caller is about to write.  Distinct from the weight
+// arena above: that one is a bump allocator that maps everything at creation
+// and is policy-gated off when weights are imported (DS4_CUDA_WEIGHT_IPC_
+// MANIFEST) -- exactly how production clients run -- so demand reservation
+// keeps its own capability probe with no weight-policy entanglement.
+// Registry-keyed by VA range: ensure()/resident() accept ANY tensor (slab
+// base, view at a bank offset, eager allocation) and resolve through the
+// containing reservation; eager tensors fall through as mapped no-ops.
+// Single-threaded by contract, like every other graph-state mutation: the
+// engine's forward/admit loop is the only caller.
+struct cuda_vmm_demand {
+    CUdeviceptr va;
+    uint64_t    span;        // page-rounded reserved bytes
+    uint64_t    page;        // mapping granularity at reserve time
+    uint64_t    mapped;      // resident bytes (page multiples)
+    std::vector<CUmemGenericAllocationHandle> pages;  // 0 = unmapped
+};
+static std::vector<cuda_vmm_demand *> g_vmm_demand;
+static int g_vmm_demand_caps = -1;       // -1 unprobed, 0 no, 1 yes
+static uint64_t g_vmm_demand_page = 0;   // minimum mapping granularity
+
+extern "C" uint64_t ds4_gpu_vmm_demand_page(void) {
+    if (g_vmm_demand_caps != -1) return g_vmm_demand_caps ? g_vmm_demand_page : 0;
+    g_vmm_demand_caps = 0;
+    if (!driver_ok(cuInit(0), "init for VMM demand probe")) return 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    CUdevice cu_dev;
+    if (cuDeviceGet(&cu_dev, dev) != CUDA_SUCCESS) return 0;
+    int vmm = 0;
+    if (cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu_dev) != CUDA_SUCCESS || !vmm)
+        return 0;
+    CUmemAllocationProp prop;
+    memset(&prop, 0, sizeof(prop));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+    size_t gran = 0;
+    // MINIMUM, not RECOMMENDED: the resident floor of a sparse cache scales
+    // with the page size, so smaller is strictly better here.
+    if (cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || gran == 0)
+        return 0;
+    g_vmm_demand_page = (uint64_t)gran;
+    g_vmm_demand_caps = 1;
+    return g_vmm_demand_page;
+}
+
+// The reservation containing [p+offset, p+offset+bytes), or NULL (eager).
+static cuda_vmm_demand *cuda_vmm_demand_find(const void *p, uint64_t offset, uint64_t bytes) {
+    const uint64_t a = (uint64_t)(uintptr_t)p + offset;
+    for (cuda_vmm_demand *d : g_vmm_demand)
+        if (a >= (uint64_t)d->va && a + bytes <= (uint64_t)d->va + d->span)
+            return d;
+    return NULL;
+}
+
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
@@ -2479,8 +2541,113 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     return t;
 }
 
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_reserve(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    const uint64_t page = ds4_gpu_vmm_demand_page();
+    if (page == 0) return NULL;                /* no VMM: caller allocates eagerly */
+    const uint64_t span = (bytes + page - 1u) / page * page;
+    CUdeviceptr va = 0;
+    if (!driver_ok(cuMemAddressReserve(&va, (size_t)span, (size_t)page, 0, 0),
+                   "VMM demand reserve"))
+        return NULL;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    cuda_vmm_demand *d = new (std::nothrow) cuda_vmm_demand();
+    if (!t || !d) {
+        (void)cuMemAddressFree(va, (size_t)span);
+        free(t);
+        delete d;
+        return NULL;
+    }
+    d->va = va;
+    d->span = span;
+    d->page = page;
+    d->mapped = 0;
+    d->pages.assign((size_t)(span / page), 0);
+    g_vmm_demand.push_back(d);
+    t->ptr = (void *)(uintptr_t)va;
+    t->bytes = bytes;
+    t->owner = 2;                              /* reserved: freed via the registry */
+    return t;
+}
+
+extern "C" int ds4_gpu_tensor_ensure(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    if (!tensor) return 0;
+    if (bytes == 0) return 1;
+    if (offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    cuda_vmm_demand *d = cuda_vmm_demand_find(tensor->ptr, offset, bytes);
+    if (!d) return 1;                          /* eager allocation: always resident */
+    const uint64_t rel = ((uint64_t)(uintptr_t)tensor->ptr + offset) - (uint64_t)d->va;
+    const uint64_t p0 = rel / d->page;
+    const uint64_t p1 = (rel + bytes - 1u) / d->page;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    for (uint64_t p = p0; p <= p1; p++) {
+        if (d->pages[(size_t)p]) continue;
+        CUmemAllocationProp prop;
+        memset(&prop, 0, sizeof(prop));
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = dev;
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+        CUmemGenericAllocationHandle h;
+        memset(&h, 0, sizeof(h));
+        if (!driver_ok(cuMemCreate(&h, (size_t)d->page, &prop, 0), "VMM demand page create"))
+            return 0;
+        const CUdeviceptr pa = d->va + (CUdeviceptr)(p * d->page);
+        if (!driver_ok(cuMemMap(pa, (size_t)d->page, 0, h, 0), "VMM demand page map")) {
+            (void)cuMemRelease(h);
+            return 0;
+        }
+        CUmemAccessDesc access;
+        memset(&access, 0, sizeof(access));
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = dev;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (!driver_ok(cuMemSetAccess(pa, (size_t)d->page, &access, 1), "VMM demand page access")) {
+            (void)cuMemUnmap(pa, (size_t)d->page);
+            (void)cuMemRelease(h);
+            return 0;
+        }
+        d->pages[(size_t)p] = h;
+        d->mapped += d->page;
+    }
+    return 1;
+}
+
+extern "C" uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    if (!tensor || bytes == 0) return 0;
+    if (offset > tensor->bytes) return 0;
+    if (bytes > tensor->bytes - offset) bytes = tensor->bytes - offset;
+    const cuda_vmm_demand *d = cuda_vmm_demand_find(tensor->ptr, offset, bytes);
+    if (!d) return bytes;                      /* eager allocation: fully resident */
+    const uint64_t rel = ((uint64_t)(uintptr_t)tensor->ptr + offset) - (uint64_t)d->va;
+    const uint64_t p0 = rel / d->page;
+    const uint64_t p1 = (rel + bytes - 1u) / d->page;
+    uint64_t res = 0;
+    for (uint64_t p = p0; p <= p1; p++)
+        if (d->pages[(size_t)p]) res += d->page;
+    return res;
+}
+
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
+    if (tensor->owner == 2) {
+        for (size_t i = 0; i < g_vmm_demand.size(); i++) {
+            cuda_vmm_demand *d = g_vmm_demand[i];
+            if ((void *)(uintptr_t)d->va != tensor->ptr) continue;
+            for (size_t p = 0; p < d->pages.size(); p++) {
+                if (!d->pages[p]) continue;
+                (void)cuMemUnmap(d->va + (CUdeviceptr)(p * d->page), (size_t)d->page);
+                (void)cuMemRelease(d->pages[p]);
+            }
+            (void)cuMemAddressFree(d->va, (size_t)d->span);
+            g_vmm_demand.erase(g_vmm_demand.begin() + (ptrdiff_t)i);
+            delete d;
+            break;
+        }
+        free(tensor);
+        return;
+    }
     if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
     free(tensor);
 }

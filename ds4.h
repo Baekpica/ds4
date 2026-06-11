@@ -207,7 +207,14 @@ int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_tota
  * DS4_BATCH_FIT=0 keeps caller-driven sizing, DS4_BATCH_FIT_HEADROOM_MB
  * (default 8192) reserves runtime growth room.  Backends with no memory
  * query (Metal) skip the budget.  Read the chosen width back with
- * ds4_batch_ctx_max_seq. */
+ * ds4_batch_ctx_max_seq.
+ * R5 Inc1b: on backends with VMM (CUDA) the ctx-scaled compressed/indexer
+ * cache slabs are demand-mapped virtual reservations by default -- they cost
+ * the bank-count budget nothing at boot and map physical pages only as
+ * conversations grow, gated per-admission against the remaining free memory
+ * (rejected admits report a comp-cache-budget error; mapping is grow-only, so
+ * bank reuse rides previously mapped pages).  DS4_BATCH_VMM_COMP=0 forces
+ * eager ctx-sized slabs, bit-identical to pre-Inc1b sizing. */
 int  ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                               ds4_batch_ctx **out, char *err, size_t errlen);
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx);

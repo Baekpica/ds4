@@ -36,6 +36,19 @@ void ds4_gpu_cleanup(void);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
+/* R5 Inc1b: demand-mapped reserved tensors.  reserve() takes the full VIRTUAL
+ * range (views and pointer arithmetic behave exactly like an eager alloc) but
+ * maps no physical pages; ensure() maps the pages covering [offset, offset+
+ * bytes) before a write -- pass ANY tensor (reserved base, view into one, or
+ * an eager alloc: eager succeeds as a no-op, so call sites need no mode
+ * checks).  resident() reports the mapped bytes overlapping the range (eager:
+ * the range itself).  vmm_demand_page() returns the mapping granularity, 0
+ * when the backend cannot demand-map (Metal; CUDA without VMM) -- reserve()
+ * then returns NULL and callers fall back to eager allocation. */
+ds4_gpu_tensor *ds4_gpu_tensor_reserve(uint64_t bytes);
+int ds4_gpu_tensor_ensure(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
+uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
+uint64_t ds4_gpu_vmm_demand_page(void);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 /* Step 6: opaque-pointer accessor for cache-key construction in ds4.c.
