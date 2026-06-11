@@ -11501,13 +11501,55 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n) {
     s->warm[bank].valid = true;
 }
 
+/* R5 Inc2: a free bank's record is SUPERSEDED when it is a byte-prefix of
+ * another free bank's at-least-as-long record -- the same conversation at an
+ * older turn, e.g. the trunk a fork-by-copy admit preserved after its
+ * follow-up retired a longer record.  The matcher always picks the LONGEST
+ * record, so for a linear multi-turn chain a superseded record can win a
+ * match only after its superseder is evicted: under bank pressure these are
+ * the right first victims, while with slack they keep serving shared-prefix
+ * fan-out (siblings extend the TRUNK, not each other's retirements). */
+static bool warm_rec_superseded(const server *s, const bool *occ, int b) {
+    if (s->warm[b].len == 0) return false;
+    for (int o = 0; o < s->batch_ctx_max_seq; o++) {
+        if (o == b || occ[o] || !s->warm[o].valid) continue;
+        if (byte_prefix_match(s->warm[o].text, s->warm[o].len,
+                              s->warm[b].text, s->warm[b].len))
+            return true;
+    }
+    return false;
+}
+
+/* R5 Inc2 victim pick for an overwriting admit: a no-value bank first, else
+ * the LRU SUPERSEDED record, else -- only when evict_lru (cold admits must
+ * place somewhere) -- the plain LRU.  Multi-tenant replay measured the old
+ * fork-into-LRU policy evicting live tenants' only records while superseded
+ * trunks (clock-bumped at every match) survived: at 10 tenants on 14 banks
+ * round-robin the warm hit rate was 50% where every alternative reaches 100%.
+ * excl = a bank that must not be chosen (the fork trunk), or -1. */
+static int warm_victim_pick(const server *s, const bool *occ, int excl, bool evict_lru) {
+    int sup = -1, lru = -1;
+    uint64_t sup_use = UINT64_MAX, lru_use = UINT64_MAX;
+    for (int b = 0; b < s->batch_ctx_max_seq; b++) {
+        if (occ[b] || b == excl) continue;
+        if (!s->warm[b].valid) return b;             /* no retained value */
+        if (s->warm[b].last_use < lru_use) { lru_use = s->warm[b].last_use; lru = b; }
+        if (s->warm[b].last_use < sup_use && warm_rec_superseded(s, occ, b)) {
+            sup_use = s->warm[b].last_use;
+            sup = b;
+        }
+    }
+    if (sup >= 0) return sup;
+    return evict_lru ? lru : -1;
+}
+
 /* Placement (and warm-continuation) pick for job j's admit.  On a record match
  * the effective prompt = the bank's EXACT committed token history + the
  * tokenized text suffix (BPE can merge across the byte boundary, so canonical
  * full-prompt tokens are never sliced -- the serial path's idiom), parked in
  * j->warm_prompt (job-owned; freed at on_done / the stranded sweep).  With no
- * match, direct the cold admit to a bank with no retained value (else LRU):
- * the engine's default is the LOWEST free bank, which would constantly reset
+ * match, direct the cold admit to a victim bank (warm_victim_pick): the
+ * engine's default is the LOWEST free bank, which would constantly reset
  * the most-recently-retired (most valuable) state. */
 static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *req) {
     if (!s->warm || !s->batch_ctx) return;
@@ -11519,13 +11561,10 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
     }
     const char *ptext = j->req.prompt_text;
     const size_t plen = ptext ? strlen(ptext) : 0;
-    int best = -1, lru = -1, fresh = -1;
+    int best = -1;
     size_t best_len = 0;
-    uint64_t lru_use = UINT64_MAX;
     for (int b = 0; b < s->batch_ctx_max_seq; b++) {
-        if (occ[b]) continue;
-        if (!s->warm[b].valid) { if (fresh < 0) fresh = b; continue; }
-        if (s->warm[b].last_use < lru_use) { lru_use = s->warm[b].last_use; lru = b; }
+        if (occ[b] || !s->warm[b].valid) continue;
         if (plen && s->warm[b].len > 0 && s->warm[b].len < plen &&
             s->warm[b].len > best_len &&
             byte_prefix_match(ptext, plen, s->warm[b].text, s->warm[b].len)) {
@@ -11550,20 +11589,14 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                 /* A2b: prefer serving the match as a FORK into a different free
                  * bank -- the trunk record survives, so siblings sharing the
                  * prefix (fan-out) and later turns keep matching it.  Target =
-                 * a no-value bank, else the LRU record excluding the trunk;
-                 * with no other free bank fall back to the in-place warm
-                 * continuation (which consumes the record). */
+                 * a no-value bank, else the LRU SUPERSEDED record excluding the
+                 * trunk; R5 Inc2: with neither, degrade to the in-place warm
+                 * continuation (consumes the record) instead of evicting a live
+                 * record -- forking is a luxury worth a redundant bank, never
+                 * another tenant's only state. */
                 int ft = -1;
-                if (s->warm_fork) {
-                    uint64_t fu = UINT64_MAX;
-                    int flru = -1;
-                    for (int b = 0; b < s->batch_ctx_max_seq; b++) {
-                        if (occ[b] || b == best) continue;
-                        if (!s->warm[b].valid) { ft = b; break; }
-                        if (s->warm[b].last_use < fu) { fu = s->warm[b].last_use; flru = b; }
-                    }
-                    if (ft < 0) ft = flru;
-                }
+                if (s->warm_fork)
+                    ft = warm_victim_pick(s, occ, best, false);
                 if (ft >= 0) {
                     req->place_bank = ft + 1;
                     req->fork_bank  = best + 1;
@@ -11584,7 +11617,7 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
             memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));
         }
     }
-    const int target = fresh >= 0 ? fresh : lru;
+    const int target = warm_victim_pick(s, occ, -1, true);
     if (target >= 0) {
         req->place_bank = target + 1;                /* directed COLD admit */
         warm_rec_invalidate(s, target);
