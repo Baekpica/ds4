@@ -9664,7 +9664,14 @@ static int indexer_scores_launch(
          * NULL/0 => the existing single-bank WMMA/direct paths (bit-exact). */
         uint32_t                comp_cap,
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        /* FE1: when the caller proves the batch is ONE bank's consecutive-
+         * position run (admission chunks: positions[t] == pos0 + t, uniform
+         * seq), single_bank carries that bank id and the WMMA tile paths
+         * below serve the scores through a bank-offset view of index_comp
+         * (the per-row multiseq kernel is ~8.7x slower per pass).
+         * UINT32_MAX = no claim (per-row kernel, bit-exact). */
+        uint32_t                single_bank) {
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -9679,6 +9686,31 @@ static int indexer_scores_launch(
      * read per-seq banks).  Indexer dims are always 128/64. */
     const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
+    /* FE1: a single-bank consecutive run IS a serial-shaped problem -- shift
+     * the cache view to the bank and clear the per-row arrays so the WMMA
+     * tiles below serve it.  Causal clamp note: the WMMA epilogue exposes
+     * (pos0+t+1)/ratio compressed rows per row where the per-row kernel
+     * clamps at (pos0+t)/ratio; for admission chunks every block through
+     * (qpos+1)/ratio is emitted before scoring (FB2 emit precedes scores in
+     * the layer pass), so the extra row is valid -- these are exactly the
+     * serial-prefill semantics, and the indexed-attention compaction already
+     * filters over-visible ids per row.  n_tokens >= 2 keeps 1-row chunks on
+     * the per-row kernel (the n_tokens==1 _direct path below is decode-
+     * substrate territory). */
+    ds4_gpu_tensor fe1_bank_view;
+    if (seq_dev != NULL && single_bank != UINT32_MAX && comp_cap != 0u &&
+        n_tokens >= 2u) {
+        const uint64_t bank_off =
+            (uint64_t)single_bank * comp_cap * head_dim * sizeof(float);
+        if (index_comp->bytes >= bank_off + (uint64_t)n_comp * head_dim * sizeof(float)) {
+            fe1_bank_view = *index_comp;
+            fe1_bank_view.ptr = (char *)fe1_bank_view.ptr + bank_off;
+            fe1_bank_view.bytes -= bank_off;
+            index_comp = &fe1_bank_view;
+            pos_dev = NULL;
+            seq_dev = NULL;
+        }
+    }
     if (seq_dev != NULL && head_dim == 128u && n_head == 64u) {
         if ((positions && positions->bytes < (uint64_t)n_tokens * sizeof(int32_t)) ||
             (seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t))) return 0;
@@ -9843,7 +9875,8 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
                                  n_head, head_dim, 1, scale, 0,
                                  n_comp_max, il,
-                                 /* Step 4b: single-seq */ 0u, NULL, NULL);
+                                 /* Step 4b: single-seq */ 0u, NULL, NULL,
+                                 /* FE1: no single-bank claim */ UINT32_MAX);
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
@@ -9862,7 +9895,8 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, 0,
                                  n_head, head_dim, ratio, scale, 1,
                                  0u, UINT32_MAX,
-                                 /* Step 4b: single-seq */ 0u, NULL, NULL);
+                                 /* Step 4b: single-seq */ 0u, NULL, NULL,
+                                 /* FE1: no single-bank claim */ UINT32_MAX);
 }
 
 extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
@@ -9881,12 +9915,15 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
          * positions[]/seq_id[] (NULL = single seq, bit-exact). */
         uint32_t                comp_cap,
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        /* FE1: bank id when the batch is one bank's consecutive-position run
+         * (admission chunks); UINT32_MAX = no claim (per-row kernel). */
+        uint32_t                single_bank) {
     /* PC5: batch path never hits the _direct kernel either (n_tokens > 1). */
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
                                  n_head, head_dim, ratio, scale, 1,
                                  0u, UINT32_MAX,
-                                 comp_cap, positions, seq_id);
+                                 comp_cap, positions, seq_id, single_bank);
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(
@@ -13769,14 +13806,21 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         const ds4_gpu_tensor *seq_id,
         /* M4b Inc3: optional per-row raw-span override for the batched MTP draft
          * (NULL = bit-exact for the normal batched decode). */
-        const ds4_gpu_tensor *draft_n_raw) {
+        const ds4_gpu_tensor *draft_n_raw,
+        /* FE2: caller opt-in for the per-seq heads8-online fast path (the
+         * admission-chunk forward through the ratio==0 layers).  FB1 plumbed
+         * this through the mixed/indexed wrappers but left this one hardcoded
+         * to 0, so wide per-seq raw-only chunks fell to the generic
+         * 1-head/block kernel (~14x slower per pass; FE Inc0).  0 keeps every
+         * per-seq caller on the main kernel, bit-exact pre-FE2. */
+        uint32_t                allow_mseq_heads8) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, /*comp_cap=*/0u, window, 1,
                                       n_head, head_dim,
                                       /* comp_fp8 */ NULL, /* comp_scale */ NULL,
                                       positions, seq_id, draft_n_raw,
-                                      /* FB1 allow_mseq_heads8 */ 0u);
+                                      allow_mseq_heads8);
 }
 
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(

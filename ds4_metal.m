@@ -5625,8 +5625,10 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         float                   scale,
         uint32_t                comp_cap,
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id) {
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                single_bank) {
     (void)comp_cap; (void)positions; (void)seq_id;  /* Phase 2 Step 4b: CUDA-only. */
+    (void)single_bank;                              /* FE1: CUDA-only. */
     return ds4_gpu_indexer_scores_batch_tensor(scores,
                                                  q,
                                                  weights,
@@ -12340,9 +12342,11 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                head_dim,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        const ds4_gpu_tensor *draft_n_raw) {
+        const ds4_gpu_tensor *draft_n_raw,
+        uint32_t                allow_mseq_heads8) {
     (void)positions; (void)seq_id;  /* Phase 2 Step 3: CUDA-only (see store stub). */
     (void)draft_n_raw;              /* M4b Inc3: CUDA-only per-row draft span. */
+    (void)allow_mseq_heads8;        /* FE2: CUDA-only heads8 opt-in. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap) {

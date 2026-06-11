@@ -463,7 +463,12 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
          * per-row positions[]/seq_id[] (NULL = single seq, bit-exact). */
         uint32_t                comp_cap,
         const ds4_gpu_tensor *positions,
-        const ds4_gpu_tensor *seq_id);
+        const ds4_gpu_tensor *seq_id,
+        /* FE1: bank id when the caller proves the batch is ONE bank's
+         * consecutive-position run (admission chunks); the CUDA backend then
+         * serves the scores on the serial WMMA path through a bank-offset
+         * view.  UINT32_MAX = no claim (per-row kernel, bit-exact). */
+        uint32_t                single_bank);
 
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
@@ -1060,7 +1065,10 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         const ds4_gpu_tensor *seq_id,
         /* M4b Inc3: optional per-row raw-span override for the batched MTP draft
          * (NULL = bit-exact for the normal batched decode). */
-        const ds4_gpu_tensor *draft_n_raw);
+        const ds4_gpu_tensor *draft_n_raw,
+        /* FE2: caller opt-in for the per-seq heads8-online fast path (the
+         * admission-chunk forward); 0 = pre-FE2 dispatch, bit-exact. */
+        uint32_t                allow_mseq_heads8);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,

@@ -14797,33 +14797,35 @@ static bool metal_graph_encode_layer_attention_batch(
         const uint32_t ring_fit = n_tokens + g->raw_window;
         if (ring_fit < raw_fit) raw_fit = ring_fit;
     }
-    /* FB2 (admission-chunk batched compressor emit): when the multiseq emit
-     * batch is ONE bank's consecutive-position run (the bg_prefill_rows chunk
-     * shape; batch_admit_fast is its opt-in, same as the FB1 attention fast
-     * path), the per-row compressor/indexer emit loops below collapse to the
-     * single-seq aligned-chunk batched kernels on bank-offset views: f2_head
-     * per-row rows up to the first ratio boundary, then ONE batched emit over
-     * f2_mid rows, then per-row tail (< ratio rows).  f2_mid == 0 = no fast
-     * path (decode shapes, ragged batches, rollback capture, Metal F16
-     * staging) -- the loops run per-row exactly as before. */
-    uint32_t f2_head = 0u, f2_mid = 0u;
+    /* FB2/FE1 shared: is this multiseq batch ONE bank's consecutive-position
+     * run (the bg_prefill_rows admission-chunk shape; batch_admit_fast is the
+     * opt-in)?  Verified against the host mirrors, never assumed. */
+    bool admit_single_run = false;
     if (g->batch_admit_fast && use_multiseq && !zero_prefix &&
-        g->batch_multiseq_emit && !g->batch_defer_comp_store &&
+        g->batch_multiseq_emit) {
+        admit_single_run = true;
+        const int32_t ar_p0 = g->ms_positions[0];
+        const int32_t ar_s0 = g->ms_seq_id[0];
+        for (uint32_t t = 1; t < n_tokens; t++) {
+            if (g->ms_seq_id[t] != ar_s0 ||
+                g->ms_positions[t] != ar_p0 + (int32_t)t) { admit_single_run = false; break; }
+        }
+    }
+    /* FB2 (admission-chunk batched compressor emit): on a single-bank run the
+     * per-row compressor/indexer emit loops below collapse to the single-seq
+     * aligned-chunk batched kernels on bank-offset views: f2_head per-row rows
+     * up to the first ratio boundary, then ONE batched emit over f2_mid rows,
+     * then per-row tail (< ratio rows).  f2_mid == 0 = no fast path (decode
+     * shapes, ragged batches, rollback capture, Metal F16 staging) -- the
+     * loops run per-row exactly as before. */
+    uint32_t f2_head = 0u, f2_mid = 0u;
+    if (admit_single_run && !g->batch_defer_comp_store &&
         !g->batch_rollback_capture && !DS4_GPU_ATTN_COMP_CACHE_F16 &&
         ratio != 0u && n_tokens >= ratio) {
-        bool single = true;
-        const int32_t f2_p0 = g->ms_positions[0];
-        const int32_t f2_s0 = g->ms_seq_id[0];
-        for (uint32_t t = 1; t < n_tokens; t++) {
-            if (g->ms_seq_id[t] != f2_s0 ||
-                g->ms_positions[t] != f2_p0 + (int32_t)t) { single = false; break; }
-        }
-        if (single) {
-            const uint32_t h = (ratio - ((uint32_t)f2_p0 % ratio)) % ratio;
-            if (h < n_tokens) {
-                const uint32_t m = ((n_tokens - h) / ratio) * ratio;
-                if (m != 0u) { f2_head = h; f2_mid = m; }
-            }
+        const uint32_t h = (ratio - ((uint32_t)g->ms_positions[0] % ratio)) % ratio;
+        if (h < n_tokens) {
+            const uint32_t m = ((n_tokens - h) / ratio) * ratio;
+            if (m != 0u) { f2_head = h; f2_mid = m; }
         }
     }
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
@@ -15195,7 +15197,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                    DS4_N_HEAD_DIM,
                                                                    seq_positions, seq_id,
                                                                    /* M4b Inc3: per-row MTP draft span (NULL except the batched draft) */
-                                                                   g->batch_draft_n_raw) != 0;
+                                                                   g->batch_draft_n_raw,
+                                                                   /* FE2: admission-chunk heads8 fast path (ratio==0 layers) */
+                                                                   g->batch_admit_fast ? 1u : 0u) != 0;
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -16261,20 +16265,29 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
+                /* FE1: single-bank contiguous chunk -> serial WMMA scores on a
+                 * bank-offset view.  The WMMA causal clamp is pos0-anchored
+                 * (visible = (pos0+t+1)/ratio), and this function's pos0 arg is
+                 * caller-convention (bg admission passes the frontier), so the
+                 * row-0 position comes from the host mirrors -- the same truth
+                 * the per-row kernel reads from positions[]. */
                 ok = ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
                                                                   g->batch_indexer_q,
                                                                   g->batch_indexer_weights,
                                                                   g->layer_index_comp_cache[il],
                                                                   n_comp,
                                                                   n_tokens,
-                                                                  pos0,
+                                                                  admit_single_run
+                                                                      ? (uint32_t)g->ms_positions[0] : pos0,
                                                                   DS4_N_INDEXER_HEAD,
                                                                   DS4_N_INDEXER_HEAD_DIM,
                                                                   ratio,
                                                                   index_scale,
                                                                   /* Step 4b: per-seq index_comp bank */
                                                                   g->layer_comp_cap[il],
-                                                                  seq_positions, seq_id) != 0;
+                                                                  seq_positions, seq_id,
+                                                                  admit_single_run
+                                                                      ? (uint32_t)g->ms_seq_id[0] : UINT32_MAX) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                     il,
