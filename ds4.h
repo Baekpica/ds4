@@ -285,7 +285,21 @@ typedef struct {
      * Any validation failure degrades to a cold admit.  When fork_bank > 0,
      * n_cached describes the SOURCE bank (warm matching is skipped); if the
      * target resolves to the source itself the fork becomes a plain warm
-     * admit (no copy). */
+     * admit (no copy).
+     * P1 (partial-prefix fork): n_cached BELOW the source's committed length
+     * requests reuse of just the shared prefix -- the request DIVERGES from
+     * the source mid-prompt.  The engine rewinds to the replay base
+     * R = (n_cached - 4) aligned down to the model's largest compress ratio
+     * (128 on Flash: the boundary where every layer's in-progress pooling
+     * group is rebuildable), validates tokens[0..R+4) against the source
+     * history, clones only the state below R, and re-prefills the shared
+     * tail [R, n_cached) together with the divergent suffix -- so the
+     * admit's pos_base is R, not n_cached, and cuts below ~(align + 4)
+     * tokens degrade to cold (no reuse worth having there anyway).  src ==
+     * target is an in-place truncate-reuse (no copies; the bank's committed
+     * state rewinds to R).  Unsatisfiable cuts (too short, or a wrapped
+     * source ring that no longer covers the replay's attention window)
+     * degrade to cold like any other validation failure. */
     int        fork_bank;   /* source bank id + 1; 0 = no fork                */
 } ds4_cont_request;
 /* A2a: a bank's committed token history (engine-authoritative bookkeeping for

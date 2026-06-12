@@ -7889,6 +7889,14 @@ struct server {
      * bank (engine D2D copy + suffix prefill) instead of consuming it in place,
      * preserving the trunk record for shared-prefix fan-out and later turns. */
     bool warm_fork;
+    /* P1: when no record fully prefix-matches, serve a request that DIVERGES
+     * from a record mid-prompt (shared system prompt / few-shot block -- the
+     * dominant single-turn API shape) as a PARTIAL fork: the engine clones the
+     * trunk's state below the divergence cut and prefills only the divergent
+     * suffix.  warm_partial_min = minimum shared CANONICAL TOKENS worth a fork
+     * (also keeps template-header-only overlap from triggering reuse). */
+    bool warm_fork_partial;
+    int  warm_partial_min;
     job *head;
     job *tail;
     bool stopping;
@@ -8802,6 +8810,15 @@ static void kv_cache_close(kv_disk_cache *kc) {
 
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
     return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
+}
+
+/* P1: longest common byte prefix -- ranks warm records against a request that
+ * shares a partial prefix (neither side need be a prefix of the other). */
+static size_t byte_common_prefix(const char *a, size_t la, const char *b, size_t lb) {
+    const size_t n = la < lb ? la : lb;
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) i++;
+    return i;
 }
 
 static bool byte_prefix_match(const char *text, size_t text_len,
@@ -11617,6 +11634,60 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
             memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));
         }
     }
+    /* P1: no record is a full byte-prefix of this request.  The dominant
+     * single-turn shape (shared system prompt / few-shot block, divergent
+     * tail -- 0/2137 admissions warmed on the eval corpus) DIVERGES from a
+     * retained record mid-prompt, which the full match above can never serve.
+     * Serve it as a PARTIAL fork: rank records by longest common byte prefix,
+     * then cut at the token-LCP between the trunk's committed history and the
+     * request's CANONICAL tokens -- the cached prefix is then a canonical
+     * token prefix of the request, so no re-tokenization is needed and the
+     * engine's prefix memcmp validates it directly (it also aligns the cut
+     * down and replays the boundary group; pos_base in the admit line is the
+     * engine truth).  The trunk record survives a fork, so siblings sharing
+     * the prefix keep matching it. */
+    if (s->warm_fork_partial && plen) {
+        int pb = -1;
+        size_t plcp = 0;
+        for (int b2 = 0; b2 < s->batch_ctx_max_seq; b2++) {
+            if (occ[b2] || !s->warm[b2].valid || s->warm[b2].len == 0) continue;
+            const size_t l = byte_common_prefix(ptext, plen,
+                                                s->warm[b2].text, s->warm[b2].len);
+            if (l > plcp) { plcp = l; pb = b2; }
+        }
+        /* Byte prefilter: a cut of warm_partial_min tokens spans at least that
+         * many bytes, so a shorter byte-LCP can never reach the token floor. */
+        if (pb >= 0 && plcp >= (size_t)s->warm_partial_min) {
+            const int *htok = NULL;
+            const int hl = ds4_batch_ctx_bank_committed(s->batch_ctx, pb, &htok);
+            const int pcap = j->req.prompt.len - 1 < hl ? j->req.prompt.len - 1 : hl;
+            int cut = 0;
+            if (htok)
+                while (cut < pcap && htok[cut] == j->req.prompt.v[cut]) cut++;
+            if (cut >= s->warm_partial_min) {
+                req->n_cached  = cut;                /* engine aligns + validates */
+                req->fork_bank = pb + 1;
+                s->warm[pb].last_use = ++s->warm_clock;
+                const int ft = warm_victim_pick(s, occ, pb, false);
+                if (ft >= 0) {
+                    req->place_bank = ft + 1;
+                    warm_rec_invalidate(s, ft);      /* target being overwritten */
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: partial fork admit src=%d dst=%d cut=%d suffix=%d",
+                               pb, ft, cut, req->n - cut);
+                } else {
+                    /* No free target: truncate the trunk in place (consumes the
+                     * record; still strictly cheaper than a cold prefill). */
+                    req->place_bank = pb + 1;
+                    warm_rec_invalidate(s, pb);
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: partial truncate admit bank=%d cut=%d suffix=%d",
+                               pb, cut, req->n - cut);
+                }
+                return;
+            }
+        }
+    }
     const int target = warm_victim_pick(s, occ, -1, true);
     if (target >= 0) {
         req->place_bank = target + 1;                /* directed COLD admit */
@@ -13046,6 +13117,18 @@ int main(int argc, char **argv) {
                          * DS4_SERVER_FORK=0 = in-place warm continuation (A2a). */
                         const char *fe = getenv("DS4_SERVER_FORK");
                         s.warm_fork = !(fe && fe[0] == '0' && fe[1] == '\0');
+                        /* P1 partial forks (mid-prompt divergence reuse).
+                         * DS4_SERVER_FORK_PARTIAL=0 = full-prefix matching
+                         * only (the pre-P1 behavior); _MIN = minimum shared
+                         * canonical tokens worth a fork (default 128). */
+                        const char *pe = getenv("DS4_SERVER_FORK_PARTIAL");
+                        s.warm_fork_partial = !(pe && pe[0] == '0' && pe[1] == '\0');
+                        const char *pm = getenv("DS4_SERVER_FORK_PARTIAL_MIN");
+                        s.warm_partial_min = (pm && pm[0]) ? atoi(pm) : 192;
+                        /* The engine's replay base aligns down to the largest
+                         * compress ratio (128 on Flash) -- cuts below align+4
+                         * degrade to cold, so don't bother issuing them. */
+                        if (s.warm_partial_min < 136) s.warm_partial_min = 136;
                     }
                     server_log(DS4_LOG_DEFAULT,
                                "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d seq_cap=%d)%s",

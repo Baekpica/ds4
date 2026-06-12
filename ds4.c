@@ -8980,6 +8980,22 @@ typedef struct {
     int32_t        *ms_vdepth;
     uint32_t        ms_n_comp[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
     uint32_t        ms_n_index_comp[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    /* P1 (partial-prefix fork): per-bank emit-keep threshold in COMPRESSED-ROW
+     * space.  A partial fork copies comp/index rows [0, keep) from the trunk
+     * but rewinds the counters to keep-1 and replays the last shared ratio
+     * group, because the pooling lanes (the only other input to an emit) exist
+     * only at a frontier and are rebuilt by the replay group's stores.  That
+     * replay group's own emit recomputes row keep-1 against the STALE lanes it
+     * is in the middle of replacing -- a wrong value -- so right after that
+     * emit (and before any attention read: emits precede the mixed-attention
+     * section in the layer encode, and visible_comp = floor(pos/ratio) hides
+     * the row from the replay rows themselves) the caller restores the row
+     * from emit_stash_{comp,index}, stashed at fork install.  Counters pass
+     * keep after exactly one emit per layer, so the rule self-deactivates.
+     * 0 = no suppression (every non-partial admit). */
+    uint32_t        ms_emit_keep[DS4_MULTISEQ_MAX_SEQ];
+    ds4_gpu_tensor *emit_stash_comp;   /* max_seq x N_LAYER x DS4_N_HEAD_DIM f32 */
+    ds4_gpu_tensor *emit_stash_index;  /* max_seq x N_LAYER x DS4_N_INDEXER_HEAD_DIM f32 */
     ds4_gpu_tensor *batch_cur_hc;
     ds4_gpu_tensor *batch_next_hc;
     ds4_gpu_tensor *batch_flat_hc;
@@ -14726,6 +14742,37 @@ static bool metal_graph_q_stage_profile_boundary(
     return ds4_gpu_begin_commands() != 0;
 }
 
+/* P1 (partial-prefix fork): undo the replay's recomputation of the pre-copied
+ * ratio-4 boundary row.  A partial fork rewinds bank seq's ratio-4 counters
+ * to R/4 but leaves the byte-valid row R/4 in the cache; the suffix's first
+ * emit then recomputes that row against the stale pooling lanes it is
+ * rebuilding -- a wrong value -- so the emit sites call this right after
+ * (same stream => ordered before the layer's attention reads; the replay
+ * rows themselves never see the row: visible_comp = floor(pos/ratio)).
+ * RATIO-4 ONLY: larger-ratio layers resume at a group boundary (empty
+ * in-progress group, single-group pooling) and have no boundary row -- their
+ * small row indices must NOT trip the threshold.  No-op for every non-partial
+ * admit (ms_emit_keep == 0) and for every emit at or beyond the threshold;
+ * counters pass keep after one emit per layer, so the rule self-deactivates. */
+static bool ms_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t seq,
+                                 uint32_t ratio, uint32_t row0,
+                                 uint32_t rows_emitted, bool indexer) {
+    if (ratio != 4u || rows_emitted == 0u || row0 >= g->ms_emit_keep[seq]) return true;
+    const uint64_t hd = indexer ? DS4_N_INDEXER_HEAD_DIM : DS4_N_HEAD_DIM;
+    ds4_gpu_tensor *stash = indexer ? g->emit_stash_index : g->emit_stash_comp;
+    ds4_gpu_tensor *cache = indexer ? g->layer_index_comp_cache[il] : g->layer_attn_comp_cache[il];
+    if (!stash || !cache) return true;
+    if (ds4_gpu_tensor_copy(cache,
+                            ((uint64_t)seq * g->layer_comp_cap[il] + row0) * hd * sizeof(float),
+                            stash,
+                            ((uint64_t)seq * DS4_N_LAYER + il) * hd * sizeof(float),
+                            hd * sizeof(float)) == 0) {
+        fprintf(stderr, "ds4: partial-fork boundary-row restore failed at layer %u seq %u\n", il, seq);
+        return false;
+    }
+    return true;
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15341,6 +15388,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                 f2_head + f2_mid);
                     }
                     if (ok) g->ms_n_comp[seq][il] = comp_before + comp_chunk;
+                    if (ok) ok = ms_emit_keep_restore(g, il, seq, ratio, comp_before, comp_chunk, false);
                     ds4_gpu_tensor_free(sc_rows);
                     ds4_gpu_tensor_free(kv_rows);
                     ds4_gpu_tensor_free(bst_sc);
@@ -15404,6 +15452,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                         UINT32_MAX,                  /* eager, inline comp_row */
                                                         DS4_COMPRESSOR_ROW_COMP) != 0;
                 if (ok && emit) g->ms_n_comp[seq][il]++;
+                if (ok && emit) ok = ms_emit_keep_restore(g, il, seq, ratio, comp_row_local, 1u, false);
                 /* S1.1 M2: snapshot bank seq's attn running-state + row counter after
                  * this row, so a partial accept can roll the bank back to its accepted
                  * prefix.  Rows arrive in chain order [cur, d0, d1] for the single live
@@ -15898,6 +15947,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                     f2_head + f2_mid);
                         }
                         if (ok) g->ms_n_index_comp[seq][il] = index_before + index_chunk;
+                        if (ok) ok = ms_emit_keep_restore(g, il, seq, ratio, index_before, index_chunk, true);
                         ds4_gpu_tensor_free(sc_rows);
                         ds4_gpu_tensor_free(kv_rows);
                         ds4_gpu_tensor_free(ist_sc);
@@ -15970,6 +16020,7 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                     }
                     if (ok && emit) g->ms_n_index_comp[seq][il]++;
+                    if (ok && emit) ok = ms_emit_keep_restore(g, il, seq, ratio, index_row_local, 1u, true);
                     /* S1.1 M3: indexer sibling of the attn rollback snapshot above. */
                     if (ok && g->batch_rollback_capture) {
                         const uint32_t depth = (uint32_t)g->ms_vdepth[t];
@@ -23101,6 +23152,7 @@ static bool bg_reset_bank(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_t b) {
         g->ms_n_comp[b][il] = 0u;
         g->ms_n_index_comp[b][il] = 0u;
     }
+    g->ms_emit_keep[b] = 0u;          /* P1: cold state has no pre-copied boundary row */
     return true;
 }
 
@@ -27501,6 +27553,9 @@ struct ds4_batch_ctx {
     uint64_t        warm_rejects;    /* n_cached>0 admits that degraded to cold */
     uint64_t        fork_admits;     /* A2b: fork_bank>0 admits served by copy (or */
     uint64_t        fork_rejects;    /* the src==dst warm degenerate) vs degraded  */
+    uint64_t        fork_partial;    /* P1: of fork_admits, those served below the
+                                      * source frontier (prefix cut + group replay;
+                                      * src==dst = in-place truncate-reuse) */
     /* R5 Inc1b: page budget for the demand-mapped comp/index slabs (bytes;
      * 0 = no gating) + admits rejected because mapping the request's projected
      * committed length would bust it. */
@@ -27796,6 +27851,20 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     ctx->bank_hist       = xmalloc((size_t)ctx->max_seq * ctx->seq_cap * sizeof(int));
     ctx->bank_hist_len   = xcalloc(ctx->max_seq, sizeof(uint32_t));
     ctx->bank_hist_valid = xcalloc(ctx->max_seq, sizeof(uint8_t));
+    /* P1: one stashed compressed row per (bank, layer) for the partial-fork
+     * boundary-row restore (see ms_emit_keep).  Tiny vs the slabs
+     * (max_seq x n_layer x head_dim floats); allocated unconditionally so the
+     * emit-site restore never depends on admission history. */
+    memset(ctx->g.ms_emit_keep, 0, sizeof(ctx->g.ms_emit_keep));
+    ctx->g.emit_stash_comp = ds4_gpu_tensor_alloc(
+        (uint64_t)ctx->max_seq * DS4_N_LAYER * DS4_N_HEAD_DIM * sizeof(float));
+    ctx->g.emit_stash_index = ds4_gpu_tensor_alloc(
+        (uint64_t)ctx->max_seq * DS4_N_LAYER * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    if (!ctx->g.emit_stash_comp || !ctx->g.emit_stash_index) {
+        BC_ERR("batch ctx: emit-stash alloc failed");
+        ds4_batch_ctx_destroy(ctx);
+        return 1;
+    }
     *out = ctx;
     return 0;
 #undef BC_ERR
@@ -27815,6 +27884,8 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     if (!ctx) return;
     ds4_mtp_slabs_free(&ctx->msl, &ctx->g);   /* restores g->mtp_* before metal_graph_free; no-op if !mtp */
     ds4_batch_slabs_free(&ctx->sl, &ctx->g);
+    if (ctx->g.emit_stash_comp)  { ds4_gpu_tensor_free(ctx->g.emit_stash_comp);  ctx->g.emit_stash_comp = NULL; }
+    if (ctx->g.emit_stash_index) { ds4_gpu_tensor_free(ctx->g.emit_stash_index); ctx->g.emit_stash_index = NULL; }
     metal_graph_free(&ctx->g);
     free(ctx->bank_hist);
     free(ctx->bank_hist_len);
@@ -27909,6 +27980,140 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
            ctx->bank_hist + (size_t)src * ctx->seq_cap, (size_t)P * sizeof(int));
     ctx->bank_hist_len[dst]   = (uint32_t)P;
     ctx->bank_hist_valid[dst] = 1u;
+    return true;
+}
+
+/* P1: the partial-fork replay base must sit at a group boundary of EVERY
+ * compress ratio in the model (Flash: ratio-4 even layers, ratio-128 odd
+ * layers).  At an aligned base the larger-ratio layers have an EMPTY
+ * in-progress pooling group -- nothing to rebuild from their lanes, and their
+ * single-group (non-overlapping) pooling needs no boundary-row trick.  Only
+ * the ratio-4 layers' two-group-overlapped pooling needs the pre-copied,
+ * emit-suppressed boundary row. */
+static uint32_t ds4_partial_fork_base_align(void) {
+    static uint32_t a = 0;
+    if (a == 0u) {
+        uint32_t m = 4u;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t r = ds4_layer_compress_ratio(il);
+            if (r > m) m = r;
+        }
+        a = m;
+    }
+    return a;
+}
+
+/* P1: prefix-cut fork.  Clone bank src's committed state below a replay base
+ * R (R aligned to ds4_partial_fork_base_align(), R >= align, R + 4 <= the
+ * validated shared-prefix extent) into bank dst, leaving dst at frontier R so
+ * the admission suffix prefill replays forward from there.  Per layer:
+ *   - raw ring rows: unwrapped src (hist <= raw_cap) -> slots [0, R) are
+ *     positions [0, R); wrapped -> every slot is live and slot identity is
+ *     position % raw_cap, so the whole ring is copied (the admit validation
+ *     already proved the suffix's window reads stay inside it).
+ *   - ratio-4 comp/index caches: rows [0, R/4 + 1) -- one row MORE than the
+ *     rewound counter (R/4) admits.  Row R/4 pools positions [R-4, R+4),
+ *     entirely inside the validated shared prefix, so it is byte-valid; but
+ *     the suffix's own first emit would recompute it against the stale
+ *     pooling lanes it is in the middle of rebuilding, so the emit path
+ *     undoes that write via ms_emit_keep + the stash rows written here.
+ *   - larger-ratio comp caches (no indexer): rows [0, R/ratio), counter
+ *     R/ratio.  R is a group boundary for them, so the in-progress group is
+ *     empty and every later emit pools only freshly-stored suffix rows -- no
+ *     boundary row, no suppression.
+ *   - the state lanes are copied only for uninit-read hygiene (their values
+ *     describe src's frontier, not R, and are fully rebuilt by the suffix's
+ *     stores before any kept pool consumes them).
+ * src == dst degenerates to in-place truncate-reuse: no tensor copies, the
+ * counters/history simply rewind (rows beyond the cut go invisible, exactly
+ * like a fresh bank's stale tail).  Mirrors host counters + history prefix. */
+static bool bank_fork_copy_cut(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst, uint32_t R) {
+    ds4_batch_slabs *sl = &ctx->sl;
+    ds4_gpu_graph   *g  = &ctx->g;
+    const uint64_t hl = ctx->bank_hist_len[src];
+    const uint32_t align = ds4_partial_fork_base_align();
+    if (R < align || (R % align) != 0u || (uint64_t)R + 4u > hl) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t keep4 = R / 4u;             /* ratio-4 rows below the base */
+        if (dst != src) {
+            const uint64_t raw_rows = hl <= ctx->raw_cap ? (uint64_t)R : (uint64_t)ctx->raw_cap;
+            const uint64_t raw_bytes = raw_rows * DS4_N_HEAD_DIM * sizeof(float);
+            if (raw_bytes &&
+                ds4_gpu_tensor_copy(sl->multi_raw[il], (uint64_t)dst * sl->raw_bank_bytes,
+                                    sl->multi_raw[il], (uint64_t)src * sl->raw_bank_bytes,
+                                    raw_bytes) == 0) return false;
+            if (sl->multi_comp[il] && ratio != 0u) {
+                const uint64_t crows = ratio == 4u ? (uint64_t)keep4 + 1u
+                                                   : (uint64_t)R / ratio;
+                const uint64_t cb = crows * DS4_N_HEAD_DIM * sizeof(float);
+                if (cb && ds4_gpu_tensor_ensure(sl->multi_comp[il],
+                                                (uint64_t)dst * sl->comp_bank_bytes[il], cb) == 0) {
+                    fprintf(stderr, "ds4: partial fork comp demand-map failed at layer %u\n", il);
+                    return false;
+                }
+                if (cb && ds4_gpu_tensor_copy(sl->multi_comp[il], (uint64_t)dst * sl->comp_bank_bytes[il],
+                                              sl->multi_comp[il], (uint64_t)src * sl->comp_bank_bytes[il],
+                                              cb) == 0) return false;
+                if (ds4_gpu_tensor_copy(sl->multi_askv[il], (uint64_t)dst * sl->astate_bank_bytes[il],
+                                        sl->multi_askv[il], (uint64_t)src * sl->astate_bank_bytes[il],
+                                        sl->astate_bank_bytes[il]) == 0 ||
+                    ds4_gpu_tensor_copy(sl->multi_assc[il], (uint64_t)dst * sl->astate_bank_bytes[il],
+                                        sl->multi_assc[il], (uint64_t)src * sl->astate_bank_bytes[il],
+                                        sl->astate_bank_bytes[il]) == 0) return false;
+            }
+            if (sl->multi_index[il]) {
+                const uint64_t ib = ((uint64_t)keep4 + 1u) * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                if (ds4_gpu_tensor_ensure(sl->multi_index[il],
+                                          (uint64_t)dst * sl->index_bank_bytes[il], ib) == 0) {
+                    fprintf(stderr, "ds4: partial fork indexer demand-map failed at layer %u\n", il);
+                    return false;
+                }
+                if (ds4_gpu_tensor_copy(sl->multi_index[il], (uint64_t)dst * sl->index_bank_bytes[il],
+                                        sl->multi_index[il], (uint64_t)src * sl->index_bank_bytes[il],
+                                        ib) == 0) return false;
+                if (ds4_gpu_tensor_copy(sl->multi_iskv[il], (uint64_t)dst * sl->istate_bank_bytes[il],
+                                        sl->multi_iskv[il], (uint64_t)src * sl->istate_bank_bytes[il],
+                                        sl->istate_bank_bytes[il]) == 0 ||
+                    ds4_gpu_tensor_copy(sl->multi_issc[il], (uint64_t)dst * sl->istate_bank_bytes[il],
+                                        sl->multi_issc[il], (uint64_t)src * sl->istate_bank_bytes[il],
+                                        sl->istate_bank_bytes[il]) == 0) return false;
+            }
+        }
+        /* Counters at frontier R + the ratio-4 boundary-row stash. */
+        if (sl->multi_comp[il] && ratio != 0u) {
+            if (ratio == 4u) {
+                if (ds4_gpu_tensor_copy(g->emit_stash_comp,
+                                        ((uint64_t)dst * DS4_N_LAYER + il) * DS4_N_HEAD_DIM * sizeof(float),
+                                        sl->multi_comp[il],
+                                        (uint64_t)dst * sl->comp_bank_bytes[il] +
+                                            (uint64_t)keep4 * DS4_N_HEAD_DIM * sizeof(float),
+                                        (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) == 0) return false;
+                g->ms_n_comp[dst][il] = keep4;
+            } else {
+                g->ms_n_comp[dst][il] = R / ratio;
+            }
+        } else {
+            g->ms_n_comp[dst][il] = 0u;
+        }
+        if (sl->multi_index[il]) {
+            if (ds4_gpu_tensor_copy(g->emit_stash_index,
+                                    ((uint64_t)dst * DS4_N_LAYER + il) * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                    sl->multi_index[il],
+                                    (uint64_t)dst * sl->index_bank_bytes[il] +
+                                        (uint64_t)keep4 * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                    (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float)) == 0) return false;
+            g->ms_n_index_comp[dst][il] = keep4;
+        } else {
+            g->ms_n_index_comp[dst][il] = 0u;
+        }
+    }
+    if (dst != src)
+        memcpy(ctx->bank_hist + (size_t)dst * ctx->seq_cap,
+               ctx->bank_hist + (size_t)src * ctx->seq_cap, (size_t)R * sizeof(int));
+    ctx->bank_hist_len[dst]   = R;
+    ctx->bank_hist_valid[dst] = 1u;
+    g->ms_emit_keep[dst] = R / 4u + 1u;            /* ratio-4 row threshold only */
     return true;
 }
 
@@ -28779,22 +28984,50 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * does not byte-match the prompt (cross-bank contamination is
              * structurally impossible).  Full-frontier match only -- the committed
              * cache is not truncatable (M3), so a partial prefix cannot be reused. */
-            bool warm = false, fork = false;
-            uint32_t fsrc = 0;
+            bool warm = false, fork = false, partial = false;
+            uint32_t fsrc = 0, cutC = 0;
             if (req.fork_bank > 0 && req.n_cached > 0) {
                 /* A2b fork: validate against the SOURCE bank's committed history
                  * (mirrors warm; additionally the source must be idle).  src ==
                  * target degenerates to a plain warm admit (the state is already
-                 * in place).  Any failure degrades to cold. */
+                 * in place).  Any failure degrades to cold.
+                 * P1: n_cached BELOW the source frontier is a partial-prefix
+                 * fork -- the request diverges from the trunk mid-prompt.  The
+                 * engine rewinds to the replay base R = (n_cached - 4) aligned
+                 * down to the largest compress ratio (the boundary where every
+                 * layer's in-progress pooling group is rebuildable -- see
+                 * bank_fork_copy_cut / ms_emit_keep), clones rows below R and
+                 * re-prefills from there.  A wrapped trunk additionally
+                 * requires the replay's raw-window reads to still be inside
+                 * the ring.  src == target is in-place truncate-reuse. */
                 const int fs = req.fork_bank - 1;
-                fork = fs >= 0 && fs < (int)MS && !live[fs] && !pflen[fs] && ctx->bank_hist_valid[fs] &&
-                       (uint32_t)req.n_cached == ctx->bank_hist_len[fs] &&
-                       L > (uint32_t)req.n_cached &&
-                       memcmp(req.tokens, ctx->bank_hist + (size_t)fs * seq_cap,
-                              (size_t)req.n_cached * sizeof(int)) == 0;
-                if (fork && (uint32_t)fs == b) { fork = false; warm = true; }
-                if (fork || warm) ctx->fork_admits++; else ctx->fork_rejects++;
-                if (fork) fsrc = (uint32_t)fs;
+                const bool src_ok = fs >= 0 && fs < (int)MS && !live[fs] &&
+                                    !pflen[fs] && ctx->bank_hist_valid[fs];
+                const uint32_t hl = src_ok ? ctx->bank_hist_len[fs] : 0u;
+                const uint32_t nc = (uint32_t)req.n_cached;
+                if (src_ok && nc == hl) {
+                    fork = L > nc &&
+                           memcmp(req.tokens, ctx->bank_hist + (size_t)fs * seq_cap,
+                                  (size_t)nc * sizeof(int)) == 0;
+                    if (fork && (uint32_t)fs == b) { fork = false; warm = true; }
+                } else if (src_ok && nc < hl) {
+                    const uint32_t align = ds4_partial_fork_base_align();
+                    uint32_t R = nc >= 4u ? ((nc - 4u) / align) * align : 0u;
+                    if (R >= align && hl > ctx->raw_cap) {
+                        const uint32_t W = g->raw_window ? g->raw_window : DS4_N_SWA;
+                        const uint32_t oldest = hl - ctx->raw_cap;
+                        if ((uint64_t)R < (uint64_t)W + oldest) R = 0u;
+                    }
+                    if (R >= align && L > R + 4u &&
+                        memcmp(req.tokens, ctx->bank_hist + (size_t)fs * seq_cap,
+                               (size_t)(R + 4u) * sizeof(int)) == 0) {
+                        partial = true;
+                        cutC = R;
+                    }
+                }
+                if (fork || warm || partial) ctx->fork_admits++; else ctx->fork_rejects++;
+                if (partial) ctx->fork_partial++;
+                if (fork || partial) fsrc = (uint32_t)fs;
             } else if (req.n_cached > 0) {
                 warm = pb >= 0 && b == (uint32_t)pb && ctx->bank_hist_valid[b] &&
                        (uint32_t)req.n_cached == ctx->bank_hist_len[b] &&
@@ -28835,18 +29068,28 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * decode steps can interleave.  Blocking configs drain there too --
              * same code path, the chunks just run back-to-back. */
             {
-                const uint32_t P = (fork || warm) ? (uint32_t)req.n_cached : 0u;
+                const uint32_t P = partial ? cutC
+                                 : (fork || warm) ? (uint32_t)req.n_cached : 0u;
                 const uint32_t S = L - P;
-                if (fork) {
+                if (partial) {
+                    /* P1: prefix-cut clone (or in-place truncate when src==b),
+                     * frontier = the aligned replay base; the suffix prefill
+                     * below replays the shared tail first (lane rebuild +
+                     * suppressed ratio-4 boundary emit via ms_emit_keep). */
+                    if (!bank_fork_copy_cut(ctx, fsrc, b, cutC)) { ok = false; break; }
+                    if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
+                } else if (fork) {
                     /* fork: D2D-clone the source bank's committed state into b,
                      * then prefill the suffix exactly like a warm admit.  No
                      * reset of b. */
                     if (!bank_fork_copy(ctx, fsrc, b)) { ok = false; break; }
                     if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
+                    g->ms_emit_keep[b] = 0u;
                 } else if (warm) {
                     /* warm: NO reset -- the suffix prefills on top of the
                      * committed state. */
                     if (!ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) { ok = false; break; }
+                    g->ms_emit_keep[b] = 0u;
                 } else {
                     /* cold: reset bank b (repoints b,1), restore the full slab. */
                     if (!bg_reset_bank(&ctx->sl, g, b)) { ok = false; break; }
@@ -29771,6 +30014,11 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
  *      forks (the D2D copy is read-only on the source, end to end)
  *   G  fork directive with a MUTATED cached token -> reject (degrade to cold),
  *      match the cold reference
+ *   P  (P1) PARTIAL-prefix fork: a request diverging from the trunk MID-PROMPT
+ *      (n_cached below the source frontier) -- STRUCTURAL frontier equality vs
+ *      directed cold with the trunk unperturbed, stream parity for both the
+ *      fork and the src==dst truncate-reuse, and a mutated token below the
+ *      cut still rejects to cold
  * PASS iff every warm/reject stream matches its cold reference within the control
  * band, every placement landed where directed, and the warm/fork counters moved
  * exactly as expected. */
@@ -29863,10 +30111,19 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
      * meaningful HARD assertion; the structural phase below gates the cache
      * FRONTIER exactly, which packing FP cannot move. */
     ds4_tokens tA = {0}, tD1 = {0}, tD2 = {0}, sA = {0}, sB = {0}, sC = {0},
-               sD1 = {0}, sD2 = {0};
+               sD1 = {0}, sD2 = {0}, tP = {0};
     ds4_tokenize_rendered_chat(e,
         "Count upward by one, one number per line:\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"
         "11\n12\n13\n14\n15\n16\n", &tA);
+    {   /* Phase P trunk: long enough that a mid-prompt cut clears the partial
+         * fork's aligned replay base (>= 132 tokens before the divergence). */
+        char *pb = xmalloc(8192);
+        size_t off = (size_t)snprintf(pb, 8192, "Count upward by one, one number per line:\n");
+        for (int v = 1; v <= 140; v++)
+            off += (size_t)snprintf(pb + off, 8192 - off, "%d\n", v);
+        ds4_tokenize_rendered_chat(e, pb, &tP);
+        free(pb);
+    }
     ds4_tokenize_rendered_chat(e,
         "List the even numbers upward, one per line:\n2\n4\n6\n8\n10\n12\n14\n16\n18\n20\n", &tD1);
     ds4_tokenize_rendered_chat(e,
@@ -29890,8 +30147,10 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
     int rc = 0;
     uint32_t mismA = 0, mismB = 0, mismC = 0, mismD = 0, ctrl = 0, placebad = 0;
     uint32_t mismE = 0, mismF = 0, mismG = 0;
+    uint32_t mismP1 = 0, mismP2 = 0, mismP3 = 0;
     uint32_t sfrontier_bad = 0, sdumps = 0, efrontier_bad = 0, edumps = 0;
-    double smax_rel = 0.0, emax_rel = 0.0;
+    uint32_t pfrontier_bad = 0, pdumps = 0;
+    double smax_rel = 0.0, emax_rel = 0.0, pmax_rel = 0.0;
     uint64_t wa0, wr0, fa0, fr0;
     int *o1[2] = {0}, *o2[2] = {0}; uint32_t l1[2] = {0}, l2[2] = {0};
     int *hist = xmalloc((size_t)ctx->seq_cap * sizeof(int));      /* committed-history snapshot (R2: hist bound = seq_cap) */
@@ -30172,21 +30431,138 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
         free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
     }
 
+    /* ---- Phase P: P1 partial-prefix fork.  A request that DIVERGES from the
+     * trunk mid-prompt (the eval/agent shared-prefix shape the full-frontier
+     * matcher can never serve) forks below the trunk's frontier: the engine
+     * aligns the cut, clones rows below it, replays the last shared group to
+     * rebuild the pooling lanes, and keeps the pre-copied boundary row through
+     * the replay's suppressed emit (ms_emit_keep).  Structural: frontier after
+     * a partial fork == directed cold's, trunk unperturbed.  Stream: partial
+     * fork and the src==dst truncate-reuse both token-match their cold refs;
+     * a mutated token BELOW the cut still rejects to cold. */
+    {
+        const uint32_t LP = (uint32_t)tP.len;
+        if (LP < 170u || LP + 2u * T + (uint32_t)(sD1.len + sD2.len) + 64u > ctx->seq_cap) {
+            WGATE_ERR("cont_warm_gate: phase P trunk too short/long (LP=%u)", LP);
+            rc = 2; goto done; }
+        ds4_warm_gate_req p0 = { tP.v, LP, 1, 0, -1, 0 };
+        WGATE_RUN1(p0, &o1[0], &l1[0]);                            /* fresh trunk, bank 0 */
+        free(o1[0]); o1[0] = NULL;
+        const uint32_t hP = LP + T - 1u;
+        WGATE_SNAP(0, hP, "P");
+        free(trunk);
+        trunk = xmalloc((size_t)(hP + 64u) * sizeof(int));
+        memcpy(trunk, hist, (size_t)hP * sizeof(int));
+        /* Divergence point inside the PROMPT, deliberately unaligned so the
+         * engine's align-down to the replay base is exercised; cutP >= 136
+         * keeps the aligned base >= one full max-ratio group. */
+        const uint32_t cutP = (LP - 24u) | 1u;
+        memcpy(full, trunk, (size_t)cutP * sizeof(int));
+        memcpy(full + cutP, sD2.v, (size_t)sD2.len * sizeof(int));
+        const uint32_t nP1 = cutP + (uint32_t)sD2.len;
+        /* P structural: partial fork (max_new=1), dump banks [0,2), cold, compare. */
+        fa0 = ctx->fork_admits; fr0 = ctx->fork_rejects;
+        const uint64_t fp0 = ctx->fork_partial;
+        ds4_warm_gate_req pf1 = { full, nP1, 2, (int)cutP, -1, 1 };
+        if (ds4_warm_gate_run(ctx, &pf1, 1u, 1u, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
+            WGATE_ERR("cont_warm_gate: phase P partial-fork run failed: %s", rerr); rc = 2; goto done; }
+        free(o1[0]); o1[0] = NULL;
+        if (pf1.bank_used != 1) placebad++;
+        if (ctx->fork_admits != fa0 + 1u || ctx->fork_rejects != fr0 ||
+            ctx->fork_partial != fp0 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase P partial fork not taken (admits %llu->%llu rejects %llu->%llu partial %llu->%llu)",
+                      (unsigned long long)fa0, (unsigned long long)ctx->fork_admits,
+                      (unsigned long long)fr0, (unsigned long long)ctx->fork_rejects,
+                      (unsigned long long)fp0, (unsigned long long)ctx->fork_partial);
+            rc = 2; goto done; }
+        float *vw = NULL, *vc = NULL; uint32_t *cw = NULL, *cc = NULL;
+        uint64_t nfw = 0, nfc = 0; uint32_t ncw = 0, ncc = 0;
+        const int dok_w = ds4_warm_gate_dump(ctx, 2u, &vw, &nfw, &cw, &ncw);
+        ds4_warm_gate_req pc1 = { full, nP1, 2, 0, -1, 0 };
+        if (ds4_warm_gate_run(ctx, &pc1, 1u, 1u, &o1[0], &l1[0], rerr, sizeof(rerr)) != 0) {
+            free(vw); free(cw);
+            WGATE_ERR("cont_warm_gate: phase P cold run failed: %s", rerr); rc = 2; goto done; }
+        free(o1[0]); o1[0] = NULL;
+        const int dok_c = ds4_warm_gate_dump(ctx, 2u, &vc, &nfc, &cc, &ncc);
+        if (dok_w && dok_c) {
+            int fsame; double mabs, mrel;
+            gate_cc_compare(vw, nfw, cw, ncw, vc, nfc, cc, ncc, &fsame, &mabs, &mrel);
+            pdumps++;
+            if (!fsame) pfrontier_bad++;
+            if (mrel > pmax_rel) pmax_rel = mrel;
+            fprintf(stderr, "ds4: CONT_WARM_GATE[P struct] trunk=%u cut=%u n=%u frontier(banks 0+1)=%s "
+                    "max_abs=%.3g max_rel=%.3g (values informational, cross-packing FP)\n",
+                    hP, cutP, nP1, fsame ? "same" : "DIFF", mabs, mrel);
+        } else {
+            fprintf(stderr, "ds4: CONT_WARM_GATE[P struct] dump unavailable (comp cache not FP32?) -- skipped\n");
+        }
+        free(vw); free(cw); free(vc); free(cc);
+        /* P stream: fresh partial fork from the same trunk, full budget. */
+        fa0 = ctx->fork_admits;
+        ds4_warm_gate_req pf2 = { full, nP1, 2, (int)cutP, -1, 1 };
+        WGATE_RUN1(pf2, &o1[0], &l1[0]);                           /* PARTIAL FORK */
+        if (ctx->fork_admits != fa0 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase P stream partial fork not taken"); rc = 2; goto done; }
+        ds4_warm_gate_req pc2 = { full, nP1, 2, 0, -1, 0 };
+        WGATE_RUN1(pc2, &o2[0], &l2[0]);                           /* directed COLD ref */
+        mismP1 = ds4_warm_gate_cmp("P partial-fork-vs-cold", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
+
+        /* P2: src==dst truncate-reuse.  Bank 1 now holds the cold ref's state;
+         * truncate it in place at a late divergence (the cut may land in the
+         * GENERATED region -- committed history is committed history). */
+        const uint32_t hQ = nP1 + T - 1u;
+        WGATE_SNAP(1, hQ, "P2");
+        const uint32_t cutQ = (hQ - 24u) | 1u;
+        memcpy(full, hist, (size_t)cutQ * sizeof(int));
+        memcpy(full + cutQ, sD1.v, (size_t)sD1.len * sizeof(int));
+        const uint32_t nP2 = cutQ + (uint32_t)sD1.len;
+        fa0 = ctx->fork_admits;
+        const uint64_t fp1 = ctx->fork_partial;
+        ds4_warm_gate_req pt = { full, nP2, 2, (int)cutQ, -1, 2 };
+        WGATE_RUN1(pt, &o1[0], &l1[0]);                            /* TRUNCATE-REUSE */
+        if (ctx->fork_admits != fa0 + 1u || ctx->fork_partial != fp1 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase P truncate-reuse not taken"); rc = 2; goto done; }
+        ds4_warm_gate_req ptc = { full, nP2, 2, 0, -1, 0 };
+        WGATE_RUN1(ptc, &o2[0], &l2[0]);                           /* directed COLD ref */
+        mismP2 = ds4_warm_gate_cmp("P truncate-vs-cold", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
+
+        /* P3: mutated token BELOW the cut -> reject (degrade to cold). */
+        memcpy(full, trunk, (size_t)cutP * sizeof(int));
+        full[5] = full[5] == 777 ? 778 : 777;
+        memcpy(full + cutP, sD2.v, (size_t)sD2.len * sizeof(int));
+        fa0 = ctx->fork_admits; fr0 = ctx->fork_rejects;
+        ds4_warm_gate_req pr = { full, nP1, 2, (int)cutP, -1, 1 };
+        WGATE_RUN1(pr, &o1[0], &l1[0]);                            /* must DEGRADE to cold */
+        if (ctx->fork_admits != fa0 || ctx->fork_rejects != fr0 + 1u) {
+            WGATE_ERR("cont_warm_gate: phase P mutated partial prefix was NOT rejected"); rc = 2; goto done; }
+        ds4_warm_gate_req prc = { full, nP1, 2, 0, -1, 0 };
+        WGATE_RUN1(prc, &o2[0], &l2[0]);                           /* directed COLD ref */
+        mismP3 = ds4_warm_gate_cmp("P reject-vs-cold", o1[0], l1[0], o2[0], l2[0]);
+        free(o1[0]); o1[0] = NULL; free(o2[0]); o2[0] = NULL;
+    }
+
     /* PASS iff the structural frontiers are exact, no warm/fork/reject stream
      * diverges beyond the inherent control band, and every directive landed in
      * its bank. */
-    rc = (sfrontier_bad == 0u && efrontier_bad == 0u && mismA <= ctrl && mismB <= ctrl &&
+    rc = (sfrontier_bad == 0u && efrontier_bad == 0u && pfrontier_bad == 0u &&
+          mismA <= ctrl && mismB <= ctrl &&
           mismC <= ctrl && mismD <= 2u * ctrl && mismE <= ctrl && mismF <= ctrl &&
-          mismG <= ctrl && placebad == 0u) ? 0 : 1;
+          mismG <= ctrl && mismP1 <= ctrl && mismP2 <= ctrl && mismP3 <= ctrl &&
+          placebad == 0u) ? 0 : 1;
     fprintf(stderr, "ds4: CONT_WARM_GATE T=%u L=%u sA=%d sB=%d ctrl=%u "
             "S(frontier_bad=%u/%u max_rel=%.3g) A=%u B=%u C=%u D=%u "
-            "E(frontier_bad=%u/%u max_rel=%.3g)=%u F=%u G=%u placebad=%u "
-            "warm_admits=%llu warm_rejects=%llu fork_admits=%llu fork_rejects=%llu -> %s\n",
+            "E(frontier_bad=%u/%u max_rel=%.3g)=%u F=%u G=%u "
+            "P(frontier_bad=%u/%u max_rel=%.3g)=%u/%u/%u placebad=%u "
+            "warm_admits=%llu warm_rejects=%llu fork_admits=%llu fork_rejects=%llu fork_partial=%llu -> %s\n",
             T, L, sA.len, sB.len, ctrl, sfrontier_bad, sdumps, smax_rel,
             mismA, mismB, mismC, mismD, efrontier_bad, edumps, emax_rel,
-            mismE, mismF, mismG, placebad,
+            mismE, mismF, mismG,
+            pfrontier_bad, pdumps, pmax_rel, mismP1, mismP2, mismP3, placebad,
             (unsigned long long)ctx->warm_admits, (unsigned long long)ctx->warm_rejects,
             (unsigned long long)ctx->fork_admits, (unsigned long long)ctx->fork_rejects,
+            (unsigned long long)ctx->fork_partial,
             rc == 0 ? "PASS" : "FAIL");
 
 done:
@@ -30195,7 +30571,7 @@ done:
     free(hist); free(full); free(fD1); free(fD2); free(trunk);
     ds4_tokens_free(&tA); ds4_tokens_free(&tD1); ds4_tokens_free(&tD2);
     ds4_tokens_free(&sA); ds4_tokens_free(&sB); ds4_tokens_free(&sC);
-    ds4_tokens_free(&sD1); ds4_tokens_free(&sD2);
+    ds4_tokens_free(&sD1); ds4_tokens_free(&sD2); ds4_tokens_free(&tP);
     return rc;
 #undef WGATE_SNAP
 #undef WGATE_RUN1
