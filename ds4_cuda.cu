@@ -5448,7 +5448,12 @@ __device__ static unsigned long long g_fp8_kv_indexed_read_path_blocks = 0ull;
  * the value reconstructs as sign * decode_table[idx] * scale[block].  For
  * d>=448 the lane is the FP32 rotary tail copied verbatim at emit.  The
  * mirror only carries the compressed-row payload, so the caller must have
- * already filtered out raw-row reads. */
+ * already filtered out raw-row reads.
+ *
+ * P2 Inc2a: `c` is the ABSOLUTE mirror row.  The mirror slabs share the
+ * F32 comp cache's bank layout (bank stride = comp_cap rows), so per-seq
+ * callers must pass comp_seq_base + local_row, exactly mirroring their
+ * F32 `comp_kv + (comp_seq_base + c) * head_dim` reads. */
 __device__ static float fp8_kv_read(
         const unsigned char * __restrict__ codes_base,
         const float         * __restrict__ scale_base,
@@ -6237,7 +6242,7 @@ __global__ static void attention_decode_mixed_kernel(
                 float dot = 0.0f;
                 if (use_fp8) {
                     for (uint32_t d = 0; d < head_dim; d++) {
-                        dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, c, d);
+                        dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + c, d);
                     }
                 } else {
                     const float *kvrow = comp_kv + (uint64_t)(comp_seq_base + c) * head_dim;
@@ -6266,7 +6271,7 @@ __global__ static void attention_decode_mixed_kernel(
                     if (add > -1.0e20f) {
                         if (use_fp8) {
                             fp8_row = true;
-                            fp8_c = c;
+                            fp8_c = comp_seq_base + c;
                         } else {
                             kvrow = comp_kv + (uint64_t)(comp_seq_base + c) * head_dim;
                         }
@@ -6332,8 +6337,8 @@ __global__ static void attention_decode_mixed_kernel(
         if (use_fp8) {
             for (uint32_t c = 0; c < visible_comp; c++) {
                 float s = scores[raw_count + c];
-                acc0 += fp8_kv_read(comp_fp8, comp_scale, c, d0) * s;
-                acc1 += fp8_kv_read(comp_fp8, comp_scale, c, d1) * s;
+                acc0 += fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + c, d0) * s;
+                acc1 += fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + c, d1) * s;
             }
         } else {
             for (uint32_t c = 0; c < visible_comp; c++) {
@@ -6351,7 +6356,7 @@ __global__ static void attention_decode_mixed_kernel(
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
             if (use_fp8) {
                 for (uint32_t c = 0; c < visible_comp; c++) {
-                    acc += fp8_kv_read(comp_fp8, comp_scale, c, d) * scores[raw_count + c];
+                    acc += fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + c, d) * scores[raw_count + c];
                 }
             } else {
                 for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)(comp_seq_base + c) * head_dim + d] * scores[raw_count + c];
@@ -6391,6 +6396,9 @@ __global__ static void attention_decode_split_kernel(
         uint32_t n_split,
         const struct ds4_decode_scalars * __restrict__ s_override,
         const struct ds4_layer_scalars  * __restrict__ ls_override,
+        /* P2 Inc2a note: this kernel is single-seq only (no positions/
+         * seq_id), so its bare-row fp8_kv_read indices ARE the absolute
+         * mirror rows (comp_seq_base == 0). */
         const unsigned char * __restrict__ comp_fp8,
         const float         * __restrict__ comp_scale) {
     if (s_override) { n_raw = s_override->n_raw; raw_start = s_override->raw_start; }
@@ -6828,7 +6836,7 @@ __global__ static void attention_indexed_mixed_kernel(
             uint32_t row = row0 + qgroup;
             if (row < n_score) {
                 const bool fp8_row = use_fp8 && (row >= raw_count);
-                const uint32_t fp8_c = fp8_row ? comp_rows[row - raw_count] : 0u;
+                const uint32_t fp8_c = fp8_row ? comp_seq_base + comp_rows[row - raw_count] : 0u;
                 const float *kvrow = NULL;
                 if (!fp8_row) {
                     kvrow = row < raw_count
@@ -6891,7 +6899,7 @@ __global__ static void attention_indexed_mixed_kernel(
         if (use_fp8) {
             for (uint32_t c = 0; c < comp_count; c++) {
                 float s = scores[raw_count + c];
-                const uint32_t cr = comp_rows[c];
+                const uint32_t cr = comp_seq_base + comp_rows[c];
                 acc0 += fp8_kv_read(comp_fp8, comp_scale, cr, d0) * s;
                 acc1 += fp8_kv_read(comp_fp8, comp_scale, cr, d1) * s;
             }
@@ -6911,7 +6919,7 @@ __global__ static void attention_indexed_mixed_kernel(
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
             if (use_fp8) {
                 for (uint32_t s = 0; s < comp_count; s++) {
-                    acc += fp8_kv_read(comp_fp8, comp_scale, comp_rows[s], d) * scores[raw_count + s];
+                    acc += fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + comp_rows[s], d) * scores[raw_count + s];
                 }
             } else {
                 for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv[(uint64_t)(comp_seq_base + comp_rows[s]) * head_dim + d] * scores[raw_count + s];
@@ -13710,17 +13718,15 @@ static int attention_decode_batch_launch(
      * draft-span override and no FP8 mirror (heads8 reads FP32 only) and a
      * wide batch so decode/MTP shapes keep their exact pre-FB1 kernels. */
     const bool perseq = (pos_dev != NULL || seq_dev != NULL);
-    /* P2 Inc1: the packed FP8 mirror is single-bank and maintained only by
-     * the serial-path emits (the multiseq Step 4d emits intentionally skip
-     * it -- see ds4.c).  fp8_kv_read() also indexes rows bare, without
-     * comp_seq_base, so a per-seq read would hit stale bank-0 codes.  Null
-     * the mirror for every per-seq caller -- they keep the bank-strided
-     * FP32 reads -- and do it here rather than at the call sites so wide
-     * admission chunks also keep the heads8 tier when DS4_CUDA_FP8_KV=1. */
-    if (perseq) { comp_fp8 = NULL; comp_scale = NULL; }
+    /* P2 Inc2a: the FP8 mirror is now per-bank (slabs beside multi_comp,
+     * same comp_cap row stride; multiseq emits write it) and fp8_kv_read
+     * callers index it with comp_seq_base + row, so per-seq callers keep
+     * their mirror pointers -- the Inc1 null-guard is gone.  The heads8
+     * tier below still reads FP32 only; its launch simply never receives
+     * the mirror, so tier selection stays independent of DS4_CUDA_FP8_KV
+     * (wide admission chunks keep heads8 with the mirror on). */
     const bool mseq_heads8 = perseq && allow_mseq_heads8 != 0u && n_tokens >= 128u &&
-                             draft_n_raw_dev == NULL &&
-                             comp_fp8 == NULL && comp_scale == NULL;
+                             draft_n_raw_dev == NULL;
     const bool force_main_kernel = perseq && !mseq_heads8;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
@@ -13912,8 +13918,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * (they never fire at decode under default settings -- Phase 0
          * phase0_measurements doc -- so a parallel rewrite is deferred);
          * callers pass the pointers unconditionally so the env-gated
-         * fallback path benefits too.  Per-seq callers are nulled inside
-         * (P2 Inc1): the mirror is single-bank, serial-emits-only. */
+         * fallback path benefits too.  P2 Inc2a: the mirror is per-bank
+         * (comp_cap row stride, multiseq emits write it), so per-seq
+         * callers keep their pointers and the kernel reads
+         * comp_seq_base + row. */
         const ds4_gpu_tensor *comp_fp8,
         const ds4_gpu_tensor *comp_scale,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq).
@@ -13954,14 +13962,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
      * args + FP32 only), so decode/MTP/capture shapes keep their exact
      * pre-FB1 kernels. */
     const bool perseq = (pos_dev != NULL || seq_dev != NULL);
-    /* P2 Inc1: per-seq callers must not read the single-bank FP8 mirror
-     * (serial emits only, bare-row indexing) -- same guard as the dense
-     * decode wrapper above; nulling here also keeps the admission chunks
-     * on the heads8 tier when DS4_CUDA_FP8_KV=1. */
-    if (perseq) { comp_fp8 = NULL; comp_scale = NULL; }
+    /* P2 Inc2a: per-seq callers keep their FP8 mirror pointers -- the
+     * mirror is per-bank now and the indexed kernel reads it at
+     * comp_seq_base + comp_rows[].  Tier selection no longer keys on the
+     * mirror (the heads8 launch reads FP32 only and never receives it). */
     const bool mseq_heads8 = perseq && allow_mseq_heads8 != 0u && n_tokens >= 128u &&
-                             scalars == NULL && ls_override == NULL &&
-                             comp_fp8 == NULL && comp_scale == NULL;
+                             scalars == NULL && ls_override == NULL;
     const bool force_main_kernel = perseq && !mseq_heads8;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     if (n_tokens > 1u && top_k == 512u &&
@@ -14036,9 +14042,17 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
      *
      * Fallback: if scratch alloc fails OR the predecode launch errors, leave
      * fp8_codes/fp8_sc/comp_kv unchanged so the attention kernel falls back
-     * to the existing scalar in-kernel decode -- no regression. */
+     * to the existing scalar in-kernel decode -- no regression.
+     *
+     * P2 Inc2a: SERIAL-ONLY (pos_dev/seq_dev NULL).  The predecode kernel
+     * and its scratch are indexed by bank-LOCAL comp row; two per-seq rows
+     * selecting the same local row in different banks would collide in the
+     * scratch.  Per-seq callers take the in-kernel bank-strided fp8 reads
+     * instead; a (t, slot)-packed per-seq predecode is an Inc2b option. */
     const float *comp_kv_dev = (const float *)comp_kv->ptr;
-    if (fp8_codes != NULL && fp8_sc != NULL && ds4_cuda_fp8_kv_predecode_enabled()) {
+    if (fp8_codes != NULL && fp8_sc != NULL &&
+        pos_dev == NULL && seq_dev == NULL &&
+        ds4_cuda_fp8_kv_predecode_enabled()) {
         const uint64_t scratch_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
         float *scratch = fp8_predecode_scratch_alloc(scratch_bytes);
         if (scratch != NULL) {
