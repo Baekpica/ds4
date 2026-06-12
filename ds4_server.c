@@ -996,10 +996,15 @@ static int utf8_expected_len(unsigned char c) {
  * SSE delta ends at that boundary, some clients replace the incomplete byte
  * sequence with U+FFFD and later send the corrupted text back, destroying KV
  * cache prefix matches.  Hold only the trailing incomplete character; the next
- * generated token will complete it. */
+ * generated token will complete it.  At final there IS no next token (a
+ * length-stopped generation can cut the detok stream mid-character), and the
+ * dangling bytes would make the whole response body invalid UTF-8 for strict
+ * clients -- so the incomplete tail is dropped instead.  Hold and drop are
+ * the same length computation; `final` only documents the caller's framing. */
 static size_t utf8_stream_safe_len(const char *s, size_t start,
                                    size_t limit, bool final) {
-    if (final || !s || limit <= start) return limit;
+    (void)final;
+    if (!s || limit <= start) return limit;
 
     size_t p = limit;
     int cont = 0;
@@ -4196,6 +4201,15 @@ static void json_escape_n(buf *b, const char *s, size_t n) {
     free(tmp);
 }
 
+/* Length-stopped generations can cut the detok stream mid multi-byte UTF-8
+ * character.  The transcript keeps the raw bytes (a continuation request may
+ * complete them); the response boundary must not -- dangling bytes make the
+ * whole JSON body invalid UTF-8 for strict clients.  Dup the longest
+ * complete-character prefix for rendering (no-op for complete text). */
+static char *utf8_trim_tail_dup(const char *s) {
+    return s ? xstrndup(s, utf8_stream_safe_len(s, 0, strlen(s), true)) : NULL;
+}
+
 static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
@@ -5998,7 +6012,9 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
-            limit = raw_len;
+            /* No closing tag is coming: trim a trailing incomplete UTF-8
+             * character instead of flushing its dangling bytes. */
+            limit = utf8_stream_safe_len(raw, st->emit_pos, raw_len, true);
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
@@ -6708,7 +6724,9 @@ static bool responses_sse_stream_update(int fd, const request *r,
         if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
-            limit = raw_len;
+            /* No closing tag is coming: trim a trailing incomplete UTF-8
+             * character instead of flushing its dangling bytes. */
+            limit = utf8_stream_safe_len(raw, st->emit_pos, raw_len, true);
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
@@ -6852,6 +6870,10 @@ static bool responses_final_response(int fd, bool enable_cors,
                                      const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
     (void)id;
+    char *text_t = utf8_trim_tail_dup(text);
+    char *reasoning_t = utf8_trim_tail_dup(reasoning);
+    text = text_t;
+    reasoning = reasoning_t;
     char response_id[40], reasoning_id[40], message_id[40];
     responses_random_id(response_id, sizeof(response_id), "resp_");
     responses_random_id(reasoning_id, sizeof(reasoning_id), "rs_");
@@ -6917,6 +6939,8 @@ static bool responses_final_response(int fd, bool enable_cors,
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     free(items);
+    free(text_t);
+    free(reasoning_t);
     return ok;
 }
 
@@ -6924,6 +6948,10 @@ static bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
                            int prompt_tokens, int completion_tokens) {
+    char *text_t = utf8_trim_tail_dup(text);
+    char *reasoning_t = utf8_trim_tail_dup(reasoning);
+    text = text_t;
+    reasoning = reasoning_t;
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -6955,6 +6983,8 @@ static bool final_response(int fd, bool enable_cors,
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
+    free(text_t);
+    free(reasoning_t);
     return ok;
 }
 
@@ -7037,6 +7067,10 @@ static bool anthropic_final_response(int fd, bool enable_cors,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
+    char *text_t = utf8_trim_tail_dup(text);
+    char *reasoning_t = utf8_trim_tail_dup(reasoning);
+    text = text_t;
+    reasoning = reasoning_t;
     buf b = {0};
     buf_printf(&b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
     json_escape(&b, r->model);
@@ -7049,6 +7083,8 @@ static bool anthropic_final_response(int fd, bool enable_cors,
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
+    free(text_t);
+    free(reasoning_t);
     return ok;
 }
 
@@ -7585,7 +7621,9 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
-            limit = raw_len;
+            /* No closing tag is coming: trim a trailing incomplete UTF-8
+             * character instead of flushing its dangling bytes. */
+            limit = utf8_stream_safe_len(raw, st->emit_pos, raw_len, true);
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
