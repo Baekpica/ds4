@@ -16412,11 +16412,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               DS4_N_HEAD_DIM,
                                                                               /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */,
                                                                               /* Opp C Phase 1A.4: packed FP8 mirror.
-                                                                               * Batch path (n_tokens>1) takes the heads8
-                                                                               * branches inside the wrapper, which keep
-                                                                               * reading FP32; we pass the pointers anyway
-                                                                               * so the gridX=1 fallback (DS4_CUDA_NO_INDEXED_
-                                                                               * HEADS8) also benefits. */
+                                                                               * Per-seq callers never read it -- the
+                                                                               * wrapper nulls both pointers (single-bank
+                                                                               * mirror, serial emits only; P2 Inc1).
+                                                                               * Passing them stays harmless here and
+                                                                               * correct for single-seq callers. */
                                                                               g->layer_comp_cache_fp8[il],
                                                                               g->layer_comp_scale[il],
                                                                               seq_positions, seq_id,

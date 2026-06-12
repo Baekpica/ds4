@@ -13710,6 +13710,14 @@ static int attention_decode_batch_launch(
      * draft-span override and no FP8 mirror (heads8 reads FP32 only) and a
      * wide batch so decode/MTP shapes keep their exact pre-FB1 kernels. */
     const bool perseq = (pos_dev != NULL || seq_dev != NULL);
+    /* P2 Inc1: the packed FP8 mirror is single-bank and maintained only by
+     * the serial-path emits (the multiseq Step 4d emits intentionally skip
+     * it -- see ds4.c).  fp8_kv_read() also indexes rows bare, without
+     * comp_seq_base, so a per-seq read would hit stale bank-0 codes.  Null
+     * the mirror for every per-seq caller -- they keep the bank-strided
+     * FP32 reads -- and do it here rather than at the call sites so wide
+     * admission chunks also keep the heads8 tier when DS4_CUDA_FP8_KV=1. */
+    if (perseq) { comp_fp8 = NULL; comp_scale = NULL; }
     const bool mseq_heads8 = perseq && allow_mseq_heads8 != 0u && n_tokens >= 128u &&
                              draft_n_raw_dev == NULL &&
                              comp_fp8 == NULL && comp_scale == NULL;
@@ -13904,7 +13912,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * (they never fire at decode under default settings -- Phase 0
          * phase0_measurements doc -- so a parallel rewrite is deferred);
          * callers pass the pointers unconditionally so the env-gated
-         * fallback path benefits too. */
+         * fallback path benefits too.  Per-seq callers are nulled inside
+         * (P2 Inc1): the mirror is single-bank, serial-emits-only. */
         const ds4_gpu_tensor *comp_fp8,
         const ds4_gpu_tensor *comp_scale,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq).
@@ -13945,6 +13954,11 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
      * args + FP32 only), so decode/MTP/capture shapes keep their exact
      * pre-FB1 kernels. */
     const bool perseq = (pos_dev != NULL || seq_dev != NULL);
+    /* P2 Inc1: per-seq callers must not read the single-bank FP8 mirror
+     * (serial emits only, bare-row indexing) -- same guard as the dense
+     * decode wrapper above; nulling here also keeps the admission chunks
+     * on the heads8 tier when DS4_CUDA_FP8_KV=1. */
+    if (perseq) { comp_fp8 = NULL; comp_scale = NULL; }
     const bool mseq_heads8 = perseq && allow_mseq_heads8 != 0u && n_tokens >= 128u &&
                              scalars == NULL && ls_override == NULL &&
                              comp_fp8 == NULL && comp_scale == NULL;
