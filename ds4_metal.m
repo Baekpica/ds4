@@ -7130,6 +7130,20 @@ int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
     return ok;
 }
 
+/* P2 Inc2b: packed FP8 storage is CUDA-only; no Metal caller can reach this
+ * (ds4.c gates every call on g->layer_comp_cache_fp8[il], NULL on Metal).
+ * Fail loudly rather than fabricate data. */
+int ds4_gpu_dsv4_fp8_kv_dequant_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *codes,
+        const ds4_gpu_tensor *scale,
+        uint32_t                n_rows,
+        uint32_t                head_dim) {
+    (void)dst; (void)codes; (void)scale; (void)n_rows; (void)head_dim;
+    fprintf(stderr, "ds4: fp8 kv dequant is not available on Metal\n");
+    return 0;
+}
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -12674,7 +12688,13 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        /* P2 Inc2b: packed FP8 mirror is CUDA-only; Metal keeps the
+         * F32/F16 comp cache as the read source. */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale) {
+    (void)comp_fp8;
+    (void)comp_scale;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         ratio == 0 || (n_comp != 0 && !comp_kv)) {
@@ -12738,7 +12758,12 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        /* P2 Inc2b: packed FP8 mirror is CUDA-only (see above). */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale) {
+    (void)comp_fp8;
+    (void)comp_scale;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !comp_kv || !comp_mask || !model_map ||
         n_tokens == 0 || n_comp == 0 || ratio == 0) {

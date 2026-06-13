@@ -5470,6 +5470,55 @@ __device__ static float fp8_kv_read(
     return tail[d - DS4_OPP_C_FP8_NOPE_DEV];
 }
 
+/* P2 Inc2b: vector companion of fp8_kv_read() for the heads8/float4 staging
+ * loops (kv_shared[off] = src[c4], c4 in [0, head_dim/4)).  Reads lanes
+ * 4*c4 .. 4*c4+3 of row `c` (same ABSOLUTE row convention as fp8_kv_read).
+ * For 4*c4 < 448 the four codes sit in one uchar4 -- the row start is
+ * 16-byte aligned (704 = 44*16) and 4*c4 is 4-aligned -- and share one
+ * 64-lane scale block (64 % 4 == 0: a quad never straddles blocks).  From
+ * c4 >= 112 the lanes are the verbatim FP32 rotary tail, float4-aligned at
+ * +448.  Each lane reconstructs exactly as fp8_kv_read would. */
+__device__ static float4 fp8_kv_read4(
+        const unsigned char * __restrict__ codes_base,
+        const float         * __restrict__ scale_base,
+        uint32_t                          c,
+        uint32_t                          c4) {
+    const uint64_t row_off = (uint64_t)c * DS4_OPP_C_FP8_ROW_BYTES_DEV;
+    const uint32_t d = c4 << 2u;
+    if (d < DS4_OPP_C_FP8_NOPE_DEV) {
+        const uchar4 q = *(const uchar4 *)(codes_base + row_off + d);
+        const float scale = scale_base[(uint64_t)c * DS4_OPP_C_FP8_BLOCKS_DEV + (d >> 6u)];
+        const float mx = dsv4_e4m3fn_decode_table[q.x & 0x7fu];
+        const float my = dsv4_e4m3fn_decode_table[q.y & 0x7fu];
+        const float mz = dsv4_e4m3fn_decode_table[q.z & 0x7fu];
+        const float mw = dsv4_e4m3fn_decode_table[q.w & 0x7fu];
+        return make_float4(((q.x & 0x80u) ? -mx : mx) * scale,
+                           ((q.y & 0x80u) ? -my : my) * scale,
+                           ((q.z & 0x80u) ? -mz : mz) * scale,
+                           ((q.w & 0x80u) ? -mw : mw) * scale);
+    }
+    const float4 *tail = (const float4 *)(codes_base + row_off + DS4_OPP_C_FP8_NOPE_DEV);
+    return tail[c4 - (DS4_OPP_C_FP8_NOPE_DEV >> 2u)];
+}
+
+/* P2 Inc2b: expand packed rows [0..n_rows) back to dense FP32 -- the exact
+ * inverse of the encode (same fp8_kv_read reconstruction the attention
+ * kernels use, so the expansion is bit-identical to what they read).  Block
+ * per row; codes/scale bases are row-0-positioned views. */
+__global__ static void fp8_kv_dequant_rows_kernel(
+        float * __restrict__ dst,
+        const unsigned char * __restrict__ codes_base,
+        const float         * __restrict__ scale_base,
+        uint32_t n_rows,
+        uint32_t head_dim) {
+    const uint32_t r = blockIdx.x;
+    if (r >= n_rows) return;
+    float *out = dst + (uint64_t)r * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        out[d] = fp8_kv_read(codes_base, scale_base, r, d);
+    }
+}
+
 __device__ static float dsv4_e2m1fn_value_dev(int i) {
     switch (i & 7) {
     case 0: return 0.0f;
@@ -5851,7 +5900,13 @@ __global__ static void attention_prefill_mixed_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        /* P2 Inc2b: optional packed FP8 mirror of the compressed rows; when
+         * both are non-NULL the comp lanes decode via fp8_kv_read() (bare
+         * row index -- this kernel's comp_kv base is already the row-0 base
+         * of the same cache the mirror views share). */
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -5860,6 +5915,10 @@ __global__ static void attention_prefill_mixed_kernel(
     uint32_t raw_count = t + 1u - raw_start;
     uint32_t visible_comp = (t + 1u) / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
+    if (use_fp8 && visible_comp != 0u && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_read_path_blocks, 1ull);
+    }
     __shared__ float scores[512];
     __shared__ float partial[256];
     __shared__ float max_s;
@@ -5879,9 +5938,13 @@ __global__ static void attention_prefill_mixed_kernel(
         float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
         float s = -INFINITY;
         if (add > -1.0e20f) {
-            const float *kvrow = comp_kv + (uint64_t)c * head_dim;
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            if (use_fp8) {
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, c, d);
+            } else {
+                const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            }
             s = dot * scale + add;
         }
         scores[raw_count + c] = s;
@@ -5912,7 +5975,11 @@ __global__ static void attention_prefill_mixed_kernel(
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
-        for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+        if (use_fp8) {
+            for (uint32_t c = 0; c < visible_comp; c++) acc += fp8_kv_read(comp_fp8, comp_scale, c, d) * scores[raw_count + c];
+        } else {
+            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+        }
         oh[d] = acc / denom;
     }
 }
@@ -6026,14 +6093,28 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
         const float *comp_kv,
         uint32_t n_tokens,
         uint32_t n_comp,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        /* P2 Inc2b: optional packed FP8 mirror; the pack decodes comp lanes
+         * once into the FP32 scratch the cublas score/value GEMMs consume
+         * (bare row index, same base as comp_kv). */
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
+    if (use_fp8 && n_comp != 0u && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_read_path_blocks, 1ull);
+    }
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)(n_tokens + n_comp) * head_dim;
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
     uint32_t r = gid / head_dim;
-    dst[gid] = r < n_tokens ? raw_kv[(uint64_t)r * head_dim + d]
-                             : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+    if (r < n_tokens) {
+        dst[gid] = raw_kv[(uint64_t)r * head_dim + d];
+    } else if (use_fp8) {
+        dst[gid] = fp8_kv_read(comp_fp8, comp_scale, r - n_tokens, d);
+    } else {
+        dst[gid] = comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+    }
 }
 
 __global__ static void attention_prefill_unpack_heads_kernel(
@@ -6652,6 +6733,63 @@ __global__ static void attention_fp8_predecode_kernel(
     }
 }
 
+/* P2 Inc2b: per-seq (t, slot)-packed predecode.  The serial predecode above
+ * is c-indexed (scratch row = bank-LOCAL comp row), which collides across
+ * banks when per-seq rows select the same local row -- so Inc2a kept per-seq
+ * decode on in-kernel scalar fp8_kv_read() at a measured 15-20% step cost.
+ * This variant packs by (t, compacted slot) instead: block (t, i) recomputes
+ * the consumer's deterministic single-thread topk compaction (count of valid
+ * ids before i; same order, same validity filter -- see the 2026-05-26
+ * nondeterminism postmortem in attention_indexed_mixed_kernel) and decodes
+ * absolute row comp_seq_base + c into scratch[(t*top_k + slot) * head_dim].
+ * attention_indexed_mixed_kernel then reads slot s of row t directly: its
+ * comp_rows[s] is the s-th valid id by construction.  Bit-identical to the
+ * in-kernel path (same fp8_kv_read).  Counts on the indexed tripwire so the
+ * MIRROR_READ gates stay armed when this path supersedes in-kernel reads. */
+__global__ static void attention_fp8_predecode_tslot_kernel(
+        float * __restrict__ scratch,
+        const int32_t * __restrict__ topk,
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale,
+        uint32_t n_tokens,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t head_dim,
+        uint32_t ratio,
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        uint32_t comp_cap) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t i = blockIdx.y;
+    if (t >= n_tokens || i >= top_k) return;
+    if (threadIdx.x == 0 && i == 0) {
+        atomicAdd(&g_fp8_kv_indexed_read_path_blocks, 1ull);
+    }
+    /* Per-row visible_comp: EXACT copy of the consumer's perseq formula. */
+    const uint32_t qpos = (uint32_t)positions[t];
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > qpos / ratio) visible_comp = qpos / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+    const int32_t c = topk[(uint64_t)t * top_k + i];
+    if (c < 0 || (uint32_t)c >= visible_comp) return;
+    /* Compacted slot = number of valid ids before i (order-preserving, every
+     * thread computes the same value; the broadcast loads hit cache). */
+    uint32_t slot = 0;
+    for (uint32_t j = 0; j < i; j++) {
+        const int32_t cj = topk[(uint64_t)t * top_k + j];
+        if (cj >= 0 && (uint32_t)cj < visible_comp) slot++;
+    }
+    if (slot >= 512u) return;   /* consumer caps comp_rows[] at 512 */
+    const uint32_t comp_seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
+    float *out = scratch + ((uint64_t)t * top_k + slot) * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        out[d] = fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + (uint32_t)c, d);
+    }
+}
+
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -6693,7 +6831,14 @@ __global__ static void attention_indexed_mixed_kernel(
          * numerics test).  NULL when DS4_CUDA_FP8_KV is off; raw KV and
          * the rotary tail handling are untouched. */
         const unsigned char * __restrict__ comp_fp8,
-        const float         * __restrict__ comp_scale) {
+        const float         * __restrict__ comp_scale,
+        /* P2 Inc2b: optional (t, slot)-packed predecoded comp rows (see
+         * attention_fp8_predecode_tslot_kernel).  When non-NULL, comp slot s
+         * of row t reads scratch[(t*top_k + s) * head_dim] -- the predecode
+         * wrote the compacted slots in this kernel's exact order.  The
+         * launch NULLs comp_fp8/comp_scale alongside, mirroring the serial
+         * predecode's comp_kv swap. */
+        const float * __restrict__ comp_predec) {
     if (s_override) {
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
@@ -6839,9 +6984,13 @@ __global__ static void attention_indexed_mixed_kernel(
                 const uint32_t fp8_c = fp8_row ? comp_seq_base + comp_rows[row - raw_count] : 0u;
                 const float *kvrow = NULL;
                 if (!fp8_row) {
-                    kvrow = row < raw_count
-                        ? raw_kv + (uint64_t)raw_rows[row] * head_dim
-                        : comp_kv + (uint64_t)(comp_seq_base + comp_rows[row - raw_count]) * head_dim;
+                    if (comp_predec != NULL && row >= raw_count) {
+                        kvrow = comp_predec + ((uint64_t)t * top_k + (row - raw_count)) * head_dim;
+                    } else {
+                        kvrow = row < raw_count
+                            ? raw_kv + (uint64_t)raw_rows[row] * head_dim
+                            : comp_kv + (uint64_t)(comp_seq_base + comp_rows[row - raw_count]) * head_dim;
+                    }
                 }
                 float dot = 0.0f;
                 if (fp8_row) {
@@ -6896,7 +7045,14 @@ __global__ static void attention_indexed_mixed_kernel(
             acc0 += kv[d0] * s;
             acc1 += kv[d1] * s;
         }
-        if (use_fp8) {
+        if (comp_predec != NULL) {
+            for (uint32_t c = 0; c < comp_count; c++) {
+                float s = scores[raw_count + c];
+                const float *kv = comp_predec + ((uint64_t)t * top_k + c) * head_dim;
+                acc0 += kv[d0] * s;
+                acc1 += kv[d1] * s;
+            }
+        } else if (use_fp8) {
             for (uint32_t c = 0; c < comp_count; c++) {
                 float s = scores[raw_count + c];
                 const uint32_t cr = comp_seq_base + comp_rows[c];
@@ -6917,7 +7073,9 @@ __global__ static void attention_indexed_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            if (use_fp8) {
+            if (comp_predec != NULL) {
+                for (uint32_t s = 0; s < comp_count; s++) acc += comp_predec[((uint64_t)t * top_k + s) * head_dim + d] * scores[raw_count + s];
+            } else if (use_fp8) {
                 for (uint32_t s = 0; s < comp_count; s++) {
                     acc += fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + comp_rows[s], d) * scores[raw_count + s];
                 }
@@ -6946,7 +7104,11 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        /* P2 Inc2b: optional packed FP8 mirror (single-seq kernel: bare row
+         * indices, same base as comp_kv -- absolute by construction). */
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -6954,6 +7116,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
 
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t comp_rows[512];
@@ -7003,6 +7166,9 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         }
     }
     __syncthreads();
+    if (use_fp8 && comp_count != 0u && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_indexed_read_path_blocks, 1ull);
+    }
 
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
@@ -7024,10 +7190,13 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                kv_shared[off] = ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4];
+            } else if (use_fp8) {
+                kv_shared[off] = fp8_kv_read4(comp_fp8, comp_scale, comp_rows[sr - raw_count], c4);
+            } else {
+                kv_shared[off] = ((const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim))[c4];
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -7072,10 +7241,13 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                kv_shared[off] = ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4];
+            } else if (use_fp8) {
+                kv_shared[off] = fp8_kv_read4(comp_fp8, comp_scale, comp_rows[sr - raw_count], c4);
+            } else {
+                kv_shared[off] = ((const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim))[c4];
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -7133,7 +7305,11 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
          * single-seq path bit-exact. */
         const int32_t * __restrict__ positions,
         const int32_t * __restrict__ seq_id,
-        uint32_t comp_cap) {
+        uint32_t comp_cap,
+        /* P2 Inc2b: optional packed FP8 mirror (absolute rows: this kernel
+         * reads comp at comp_seq_base + id, matching the generic kernel). */
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -7141,6 +7317,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t head = head_group * HEADS_PER_GROUP + warp;
     const bool valid_head = head < n_head;
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
 
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t comp_rows[512];
@@ -7212,6 +7389,9 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         comp_count = top_k < visible_comp ? top_k : visible_comp;
         if (comp_count > 512u) comp_count = 512u;
     }
+    if (use_fp8 && comp_count != 0u && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_indexed_read_path_blocks, 1ull);
+    }
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
@@ -7237,14 +7417,16 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const uint32_t comp_idx = sr < raw_count
-                ? 0u
-                : (positions ? comp_rows[sr - raw_count]
-                             : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)]);
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(comp_seq_base + comp_idx) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                kv_shared[off] = ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4];
+            } else {
+                const uint32_t comp_idx = positions
+                    ? comp_rows[sr - raw_count]
+                    : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
+                kv_shared[off] = use_fp8
+                    ? fp8_kv_read4(comp_fp8, comp_scale, comp_seq_base + comp_idx, c4)
+                    : ((const float4 *)(comp_kv + (uint64_t)(comp_seq_base + comp_idx) * head_dim))[c4];
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -7322,7 +7504,11 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        /* P2 Inc2b: optional packed FP8 mirror (single-seq prefill tier:
+         * bare row indices, same base as comp_kv). */
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -7330,6 +7516,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
 
     __shared__ float4 kv_shared[4 * 128];
 
@@ -7339,6 +7526,9 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     if (n_comp != 0u && ratio != 0u) {
         comp_count = (t + 1u) / ratio;
         if (comp_count > n_comp) comp_count = n_comp;
+    }
+    if (use_fp8 && comp_count != 0u && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_read_path_blocks, 1ull);
     }
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
@@ -7365,10 +7555,13 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                kv_shared[off] = ((const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim))[c4];
+            } else if (use_fp8) {
+                kv_shared[off] = fp8_kv_read4(comp_fp8, comp_scale, sr - raw_count, c4);
+            } else {
+                kv_shared[off] = ((const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim))[c4];
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -7462,7 +7655,11 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         uint32_t comp_cap,
         const struct ds4_decode_scalars * __restrict__ s_override,
         /* Step 4c A1: per-layer n_comp override. */
-        const struct ds4_layer_scalars  * __restrict__ ls_override) {
+        const struct ds4_layer_scalars  * __restrict__ ls_override,
+        /* P2 Inc2b: optional packed FP8 mirror (absolute rows: this kernel
+         * reads comp at comp_seq_base + row, matching the generic kernel). */
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
     if (s_override) {
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
@@ -7477,6 +7674,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
 
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count_s;
@@ -7504,6 +7702,9 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             if (positions && comp_count > qpos / ratio) comp_count = qpos / ratio;
             if (comp_count > n_comp) comp_count = n_comp;
         }
+    }
+    if (use_fp8 && comp_count != 0u && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_read_path_blocks, 1ull);
     }
     if (threadIdx.x == 0) {
         uint32_t raw_count = 0;
@@ -7560,10 +7761,13 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(comp_seq_base + (sr - raw_count)) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                kv_shared[off] = ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4];
+            } else if (use_fp8) {
+                kv_shared[off] = fp8_kv_read4(comp_fp8, comp_scale, comp_seq_base + (sr - raw_count), c4);
+            } else {
+                kv_shared[off] = ((const float4 *)(comp_kv + (uint64_t)(comp_seq_base + (sr - raw_count)) * head_dim))[c4];
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -10681,18 +10885,22 @@ extern "C" int ds4_cuda_fp8_kv_predecode_enabled(void) {
     static int enabled = 0;
     if (!init) {
         init = 1;
+        /* P2 Inc2b: default ON.  Predecode is bit-identical to the
+         * in-kernel scalar decode (Inc1 A/B: 3/3 + 6/6 proof cells) and
+         * strictly faster once every comp read goes through the packed
+         * codes (serial 14.58 -> 17.16 t/s; batched in-kernel reads cost
+         * 15-20%/step).  DS4_CUDA_FP8_KV_PREDECODE=0 restores the scalar
+         * path for A/B. */
         const char *s = getenv("DS4_CUDA_FP8_KV_PREDECODE");
-        if (s && *s &&
-            (strcmp(s, "1") == 0 ||
-             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
-             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
-             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
-            enabled = 1;
-            fprintf(stderr, "ds4: DS4_CUDA_FP8_KV_PREDECODE=%s - "
-                    "FP8 mirror predecoded to FP32 scratch before "
-                    "attention_indexed_mixed_kernel (Opp C Phase 1A staged "
-                    "prototype; supersedes in-kernel scalar fp8_kv_read)\n", s);
-        }
+        enabled = !(s && *s &&
+                    (strcmp(s, "0") == 0 ||
+                     strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+                     strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+                     strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0));
+        /* No banner either way: the lazy first check lands mid-generation
+         * and an unbuffered stderr line splices into the buffered stdout
+         * token stream (breaks line-oriented text-parity gates).  The mode
+         * is visible in the DS4_CUDA_FP8_KV_DEBUG path stats. */
     }
     return enabled;
 }
@@ -12787,6 +12995,27 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
     return ok_fp8;
 }
 
+/* P2 Inc2b: packed-FP8 -> FP32 row expansion (see ds4_gpu.h). */
+extern "C" int ds4_gpu_dsv4_fp8_kv_dequant_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *codes,
+        const ds4_gpu_tensor *scale,
+        uint32_t                n_rows,
+        uint32_t                head_dim) {
+    if (!dst || !codes || !scale || n_rows == 0 || head_dim != 512u ||
+        dst->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        codes->bytes < (uint64_t)n_rows * DS4_OPP_C_FP8_ROW_BYTES_DEV ||
+        scale->bytes < (uint64_t)n_rows * DS4_OPP_C_FP8_BLOCKS_DEV * sizeof(float)) {
+        return 0;
+    }
+    fp8_kv_dequant_rows_kernel<<<n_rows, 128, 0, ds4_current_stream()>>>(
+            (float *)dst->ptr,
+            (const unsigned char *)codes->ptr,
+            (const float *)scale->ptr,
+            n_rows, head_dim);
+    return cuda_ok(cudaGetLastError(), "fp8_kv_dequant launch");
+}
+
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
@@ -13457,6 +13686,12 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const struct ds4_layer_scalars *ls_override =
         (g_layer_dev != NULL && il_for_decode1 < DS4_LAYER_SCALARS_COUNT)
             ? g_layer_dev + il_for_decode1 : NULL;
+    /* Opp C Phase 1A.3: prefer the packed FP8 mirror when both pointers are
+     * non-NULL.  P2 Inc2b: every branch below (score-buffer online fallback
+     * included) now takes the mirror, so the comp reads no longer depend on
+     * the FP32 cache. */
+    const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
+    const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
@@ -13478,19 +13713,14 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               head_dim,
                                                                               /* FB1: single-seq */ (const int32_t *)NULL, (const int32_t *)NULL, 0u,
                                                                               (const struct ds4_decode_scalars *)scalars,
-                                                                              ls_override);
+                                                                              ls_override,
+                                                                              fp8_codes,
+                                                                              fp8_sc);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
-    /* Opp C Phase 1A.3: prefer the packed FP8 mirror when both pointers are
-     * non-NULL.  The score-buffer fallback above keeps reading FP32 -- it is
-     * never reached at decode in practice (cuda_attention_score_buffer_fits
-     * is true for every layer at decode), so leaving the online kernel on
-     * FP32 keeps it bit-identical without needing a parallel rewrite. */
-    const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
-    const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
     /* Flash-decode split: when the per-head decode grid under-fills the machine
      * (n_head < SM count, e.g. 64 heads on the PRO 6000's 188 SMs), split each
      * head's KV reduction across n_split blocks + a fixed-order combine to fill
@@ -13573,7 +13803,9 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                                    window,
                                                                    1,
                                                                    n_head,
-                                                                   head_dim);
+                                                                   head_dim,
+                                                                   /* raw-only: no comp rows */ (const unsigned char *)NULL,
+                                                                   (const float *)NULL);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
@@ -13715,22 +13947,23 @@ static int attention_decode_batch_launch(
     /* Multi-seq (per-row positions/seq) uses the main kernel UNLESS the caller
      * opted into the per-seq heads8-online path (FB1: the admission-chunk
      * forward, wide single-bank batches).  The opt-in additionally requires no
-     * draft-span override and no FP8 mirror (heads8 reads FP32 only) and a
-     * wide batch so decode/MTP shapes keep their exact pre-FB1 kernels. */
+     * draft-span override and a wide batch so decode/MTP shapes keep their
+     * exact pre-FB1 kernels. */
     const bool perseq = (pos_dev != NULL || seq_dev != NULL);
-    /* P2 Inc2a: the FP8 mirror is now per-bank (slabs beside multi_comp,
-     * same comp_cap row stride; multiseq emits write it) and fp8_kv_read
-     * callers index it with comp_seq_base + row, so per-seq callers keep
-     * their mirror pointers -- the Inc1 null-guard is gone.  The heads8
-     * tier below still reads FP32 only; its launch simply never receives
-     * the mirror, so tier selection stays independent of DS4_CUDA_FP8_KV
-     * (wide admission chunks keep heads8 with the mirror on). */
+    /* P2 Inc2a: the FP8 mirror is per-bank (slabs beside multi_comp, same
+     * comp_cap row stride; multiseq emits write it) and fp8_kv_read callers
+     * index it with comp_seq_base + row, so per-seq callers keep their
+     * mirror pointers.  P2 Inc2b: the heads8 tier reads the mirror too
+     * (fp8_kv_read4 in the float4 staging loop); tier selection stays
+     * independent of DS4_CUDA_FP8_KV. */
     const bool mseq_heads8 = perseq && allow_mseq_heads8 != 0u && n_tokens >= 128u &&
                              draft_n_raw_dev == NULL;
     const bool force_main_kernel = perseq && !mseq_heads8;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
+    const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!force_main_kernel && !use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
@@ -13751,7 +13984,9 @@ static int attention_decode_batch_launch(
                                                                               n_head,
                                                                               head_dim,
                                                                               pos_dev, seq_dev, comp_cap,
-                                                                              /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL);
+                                                                              /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL,
+                                                                              fp8_codes,
+                                                                              fp8_sc);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -13778,11 +14013,11 @@ static int attention_decode_batch_launch(
                                                                    n_head,
                                                                    head_dim,
                                                                    pos_dev, seq_dev, comp_cap,
-                                                                   /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL);
+                                                                   /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL,
+                                                                   fp8_codes,
+                                                                   fp8_sc);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
-    const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
-    const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
     dim3 grid(n_tokens, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                  sinks,
@@ -13910,18 +14145,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * substrate (decode2-exact / batch paths use inline n_comp). */
         uint32_t                il_for_decode1,
         /* Opp C Phase 1A.4: optional packed FP8 mirror of the compressed
-         * rows.  Consumed by the generic attention_indexed_mixed_kernel
-         * launch below -- the one that fires for all decode
-         * (n_tokens==1) and also for the batch path (n_tokens>1) when
-         * DS4_CUDA_NO_INDEXED_HEADS8 disables the heads8 fast path
-         * above.  The two heads8 variants themselves keep reading FP32
-         * (they never fire at decode under default settings -- Phase 0
-         * phase0_measurements doc -- so a parallel rewrite is deferred);
-         * callers pass the pointers unconditionally so the env-gated
-         * fallback path benefits too.  P2 Inc2a: the mirror is per-bank
-         * (comp_cap row stride, multiseq emits write it), so per-seq
-         * callers keep their pointers and the kernel reads
-         * comp_seq_base + row. */
+         * rows.  P2 Inc2b: consumed by EVERY branch -- the generic
+         * attention_indexed_mixed_kernel, both heads8 variants
+         * (fp8_kv_read4 staging), and the predecode kernels.  P2 Inc2a:
+         * the mirror is per-bank (comp_cap row stride, multiseq emits
+         * write it), so per-seq callers keep their pointers and the
+         * kernels read comp_seq_base + row. */
         const ds4_gpu_tensor *comp_fp8,
         const ds4_gpu_tensor *comp_scale,
         /* Phase 2 Step 3: optional per-row positions[]/seq_id[] (NULL = single seq).
@@ -13958,17 +14187,19 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ? g_layer_dev + il_for_decode1 : NULL;
     /* Multi-seq runs the generic indexed kernel below unless the caller opted
      * into the per-seq heads8-online path (FB1).  The opt-in additionally
-     * requires a wide batch and no substrate/scalars/FP8 (heads8 reads inline
-     * args + FP32 only), so decode/MTP/capture shapes keep their exact
-     * pre-FB1 kernels. */
+     * requires a wide batch and no substrate/scalars (heads8 reads inline
+     * args), so decode/MTP/capture shapes keep their exact pre-FB1 kernels. */
     const bool perseq = (pos_dev != NULL || seq_dev != NULL);
     /* P2 Inc2a: per-seq callers keep their FP8 mirror pointers -- the
-     * mirror is per-bank now and the indexed kernel reads it at
-     * comp_seq_base + comp_rows[].  Tier selection no longer keys on the
-     * mirror (the heads8 launch reads FP32 only and never receives it). */
+     * mirror is per-bank and the indexed kernels read it at
+     * comp_seq_base + comp_rows[].  P2 Inc2b: the heads8 tiers read the
+     * mirror too (fp8_kv_read4 in the float4 staging loops); tier
+     * selection stays independent of DS4_CUDA_FP8_KV. */
     const bool mseq_heads8 = perseq && allow_mseq_heads8 != 0u && n_tokens >= 128u &&
                              scalars == NULL && ls_override == NULL;
     const bool force_main_kernel = perseq && !mseq_heads8;
+    const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
+    const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
@@ -14002,7 +14233,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                                ratio,
                                                                                n_head,
                                                                                head_dim,
-                                                                               pos_dev, seq_dev, comp_cap);
+                                                                               pos_dev, seq_dev, comp_cap,
+                                                                               fp8_codes,
+                                                                               fp8_sc);
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -14022,15 +14255,11 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                  window,
                                                                  ratio,
                                                                  n_head,
-                                                                 head_dim);
+                                                                 head_dim,
+                                                                 fp8_codes,
+                                                                 fp8_sc);
         return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
     }
-    /* Opp C Phase 1A.4: prefer the packed FP8 mirror when both pointers are
-     * non-NULL.  The heads8 branches above keep reading FP32 -- they never
-     * fire at decode (n_tokens==1), so leaving them on FP32 keeps them
-     * bit-identical without needing a parallel rewrite. */
-    const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
-    const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
 
     /* Opp C Phase 1A staged prototype: when DS4_CUDA_FP8_KV_PREDECODE is set
      * AND we have a packed FP8 mirror, run attention_fp8_predecode_kernel
@@ -14044,12 +14273,13 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
      * fp8_codes/fp8_sc/comp_kv unchanged so the attention kernel falls back
      * to the existing scalar in-kernel decode -- no regression.
      *
-     * P2 Inc2a: SERIAL-ONLY (pos_dev/seq_dev NULL).  The predecode kernel
-     * and its scratch are indexed by bank-LOCAL comp row; two per-seq rows
-     * selecting the same local row in different banks would collide in the
-     * scratch.  Per-seq callers take the in-kernel bank-strided fp8 reads
-     * instead; a (t, slot)-packed per-seq predecode is an Inc2b option. */
+     * P2 Inc2a: this c-indexed variant is SERIAL-ONLY (pos_dev/seq_dev
+     * NULL).  The scratch is indexed by bank-LOCAL comp row; two per-seq
+     * rows selecting the same local row in different banks would collide.
+     * P2 Inc2b: per-seq callers get the (t, slot)-packed variant in the
+     * else-branch below instead. */
     const float *comp_kv_dev = (const float *)comp_kv->ptr;
+    const float *comp_predec = NULL;
     if (fp8_codes != NULL && fp8_sc != NULL &&
         pos_dev == NULL && seq_dev == NULL &&
         ds4_cuda_fp8_kv_predecode_enabled()) {
@@ -14086,6 +14316,40 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
              * below will surface any sticky propagation through its own
              * cuda_ok(...) check. */
         }
+    } else if (fp8_codes != NULL && fp8_sc != NULL &&
+               pos_dev != NULL &&
+               scalars == NULL && ls_override == NULL &&
+               ds4_cuda_fp8_kv_predecode_enabled()) {
+        /* P2 Inc2b: per-seq (t, slot)-packed predecode -- decodes each
+         * row's compacted topk selection once into scratch instead of
+         * n_head in-kernel scalar decodes per row (the Inc2a-measured
+         * 15-20% batched-decode cost).  Requires positions[] (the per-row
+         * visible_comp filter) and no execution-time overrides (the slot
+         * scan must see the same n_comp the consumer sees).  Fallback on
+         * alloc/launch failure: in-kernel scalar fp8 reads, no regression. */
+        const uint64_t scratch_bytes = (uint64_t)n_tokens * top_k * head_dim * sizeof(float);
+        float *scratch = fp8_predecode_scratch_alloc(scratch_bytes);
+        if (scratch != NULL) {
+            dim3 pre_grid(n_tokens, top_k, 1);
+            attention_fp8_predecode_tslot_kernel<<<pre_grid, 128, 0, ds4_current_stream()>>>(
+                    scratch,
+                    topk_ptr,
+                    fp8_codes,
+                    fp8_sc,
+                    n_tokens,
+                    n_comp,
+                    top_k,
+                    head_dim,
+                    ratio,
+                    pos_dev,
+                    seq_dev,
+                    comp_cap);
+            if (cuda_ok(cudaGetLastError(), "attention fp8 tslot predecode launch")) {
+                comp_predec = scratch;
+                fp8_codes = NULL;
+                fp8_sc = NULL;
+            }
+        }
     }
 
     dim3 grid(n_tokens, n_head, 1);
@@ -14111,7 +14375,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   (const struct ds4_decode_scalars *)scalars,
                                                   ls_override,
                                                   fp8_codes,
-                                                  fp8_sc);
+                                                  fp8_sc,
+                                                  comp_predec);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 
@@ -14130,7 +14395,17 @@ static int attention_prefill_mixed_launch(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        /* P2 Inc2b: optional packed FP8 mirror of the compressed rows
+         * (NULL/NULL when DS4_CUDA_FP8_KV is off).  All three branches
+         * consume it: the heads8 window tier and the small-batch kernel
+         * read it in-kernel, the cublas tier decodes it once in the KV
+         * pack.  Bare row indices -- the caller passes mirror tensors
+         * sharing comp_kv's row-0 base. */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale) {
+    const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
+    const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 || ratio == 0 ||
         (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
         sinks_offset > model_size ||
@@ -14159,7 +14434,9 @@ static int attention_prefill_mixed_launch(
                                                                    window,
                                                                    ratio,
                                                                    n_head,
-                                                                   head_dim);
+                                                                   head_dim,
+                                                                   fp8_codes,
+                                                                   fp8_sc);
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
@@ -14184,7 +14461,9 @@ static int attention_prefill_mixed_launch(
                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                 n_tokens,
                 n_comp,
-                head_dim);
+                head_dim,
+                fp8_codes,
+                fp8_sc);
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
@@ -14255,7 +14534,9 @@ static int attention_prefill_mixed_launch(
                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                   use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                   use_comp_mask, n_tokens, n_comp, window, ratio,
-                                                  n_head, head_dim);
+                                                  n_head, head_dim,
+                                                  fp8_codes,
+                                                  fp8_sc);
     return cuda_ok(cudaGetLastError(), "attention prefill mixed launch");
 }
 
@@ -14273,11 +14554,15 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        /* P2 Inc2b: optional packed FP8 mirror (see attention_prefill_mixed_launch). */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale) {
     if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, NULL, 0, n_tokens,
-                                       n_comp, window, ratio, n_head, head_dim);
+                                       n_comp, window, ratio, n_head, head_dim,
+                                       comp_fp8, comp_scale);
 }
 
 extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
@@ -14295,11 +14580,15 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        /* P2 Inc2b: optional packed FP8 mirror (see attention_prefill_mixed_launch). */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale) {
     if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
-                                       n_comp, window, ratio, n_head, head_dim);
+                                       n_comp, window, ratio, n_head, head_dim,
+                                       comp_fp8, comp_scale);
 }
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,

@@ -754,6 +754,21 @@ int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *codes_mirror,
         ds4_gpu_tensor *scale_mirror);
 
+/* P2 Inc2b: expand packed FP8 rows back to FP32 -- the exact inverse of the
+ * quantize encode (each lane reconstructs bit-identically to what the
+ * attention-side fp8_kv_read returns).  `codes`/`scale` are views positioned
+ * at the first row to expand; `dst` receives rows [0..n_rows) densely.  Used
+ * by the fp8-primary paths that still need an F32 image of stored rows:
+ * checkpoint save, the partial-fork boundary-row stash, and the MTP
+ * committed-context host read.  CUDA only -- Metal never stores FP8 and its
+ * stub fails loudly. */
+int ds4_gpu_dsv4_fp8_kv_dequant_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *codes,
+        const ds4_gpu_tensor *scale,
+        uint32_t                n_rows,
+        uint32_t                head_dim);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -1168,7 +1183,12 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        /* P2 Inc2b: optional packed FP8 mirror of the compressed rows
+         * (CUDA only; NULL/NULL when DS4_CUDA_FP8_KV is off, ignored on
+         * Metal).  Same row-0 base as comp_kv. */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale);
 
 int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -1185,7 +1205,10 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        /* P2 Inc2b: optional packed FP8 mirror (CUDA only, see above). */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale);
 
 int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,

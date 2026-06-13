@@ -8996,6 +8996,16 @@ typedef struct {
     uint32_t        ms_emit_keep[DS4_MULTISEQ_MAX_SEQ];
     ds4_gpu_tensor *emit_stash_comp;   /* max_seq x N_LAYER x DS4_N_HEAD_DIM f32 */
     ds4_gpu_tensor *emit_stash_index;  /* max_seq x N_LAYER x DS4_N_INDEXER_HEAD_DIM f32 */
+    /* P2 Inc2b (fp8-primary): grow-only F32 working buffer the eager emit
+     * paths target instead of the F32 comp cache when the packed mirror is
+     * attached -- the compressor writes rows here, the quantize packs them
+     * into codes+scales, and the F32 cache slab is never touched (a VMM
+     * bank reservation then stays at zero resident pages).  Also reused as
+     * the dequant staging for checkpoint save / fork stash / MTP reads.
+     * Never used under capture (the captured serial decode keeps its F32
+     * cache write). */
+    ds4_gpu_tensor *comp_emit_scratch;
+    uint64_t        comp_emit_scratch_rows;
     ds4_gpu_tensor *batch_cur_hc;
     ds4_gpu_tensor *batch_next_hc;
     ds4_gpu_tensor *batch_flat_hc;
@@ -9086,6 +9096,9 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    ds4_gpu_tensor_free(g->comp_emit_scratch);     /* P2 Inc2b: fp8-primary emit/dequant scratch */
+    g->comp_emit_scratch = NULL;
+    g->comp_emit_scratch_rows = 0;
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
@@ -10294,6 +10307,27 @@ static bool metal_graph_cache_ensure_rows(const ds4_gpu_tensor *cache,
     return false;
 }
 
+/* P2 Inc2b (fp8-primary): grow-only F32 working buffer for eager emits +
+ * dequant staging.  Returns the cached tensor sized for at least `rows`
+ * DS4_N_HEAD_DIM-wide rows.  Growth frees the old buffer (cudaFree
+ * stream-syncs, and the scratch is never referenced by captured graphs --
+ * eager paths only). */
+static ds4_gpu_tensor *metal_graph_comp_emit_scratch(ds4_gpu_graph *g, uint64_t rows) {
+    const uint64_t need = rows ? rows : 1u;
+    if (g->comp_emit_scratch && g->comp_emit_scratch_rows >= need)
+        return g->comp_emit_scratch;
+    ds4_gpu_tensor *nt = ds4_gpu_tensor_alloc(need * DS4_N_HEAD_DIM * sizeof(float));
+    if (!nt) {
+        fprintf(stderr, "ds4: fp8-primary emit scratch alloc failed (%llu rows)\n",
+                (unsigned long long)need);
+        return NULL;
+    }
+    if (g->comp_emit_scratch) ds4_gpu_tensor_free(g->comp_emit_scratch);
+    g->comp_emit_scratch = nt;
+    g->comp_emit_scratch_rows = need;
+    return nt;
+}
+
 static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
         ds4_gpu_graph *g,
         uint32_t       il,
@@ -10301,6 +10335,18 @@ static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
         uint32_t       rows) {
     if (DS4_GPU_ATTN_COMP_CACHE_F16) return g->attn_comp_stage;
     const uint32_t view_rows = rows ? rows : 1u;
+    /* P2 Inc2b: with the packed mirror attached the F32 comp cache is
+     * write-dead -- emit into the shared scratch instead (the caller's
+     * mirror views carry the absolute row placement, and every reader
+     * takes the codes).  Skipping the F32 demand-map is what keeps a VMM
+     * bank reservation at zero resident pages. */
+    if (g->layer_comp_cache_fp8[il]) {
+        ds4_gpu_tensor *scratch = metal_graph_comp_emit_scratch(g, view_rows);
+        return scratch
+            ? ds4_gpu_tensor_view(scratch, 0,
+                                  (uint64_t)view_rows * DS4_N_HEAD_DIM * sizeof(float))
+            : NULL;
+    }
     if (!metal_graph_cache_ensure_rows(g->layer_attn_comp_cache[il],
                                        first_row, view_rows,
                                        (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
@@ -14762,7 +14808,12 @@ static bool ms_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t seq,
     ds4_gpu_tensor *stash = indexer ? g->emit_stash_index : g->emit_stash_comp;
     ds4_gpu_tensor *cache = indexer ? g->layer_index_comp_cache[il] : g->layer_attn_comp_cache[il];
     if (!stash || !cache) return true;
-    if (ds4_gpu_tensor_copy(cache,
+    /* P2 Inc2b: fp8-primary -- the F32 cache row is write-dead, so the
+     * restore is purely a mirror re-encode from the stash (below).  Copying
+     * into the cache would needlessly demand-map a bank page. */
+    const bool fp8_primary = !indexer && g->layer_comp_cache_fp8[il] != NULL;
+    if (!fp8_primary &&
+        ds4_gpu_tensor_copy(cache,
                             ((uint64_t)seq * g->layer_comp_cap[il] + row0) * hd * sizeof(float),
                             stash,
                             ((uint64_t)seq * DS4_N_LAYER + il) * hd * sizeof(float),
@@ -14771,14 +14822,18 @@ static bool ms_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t seq,
         return false;
     }
     /* P2 Inc2a: the suffix's first emit also rewrote the boundary row's FP8
-     * mirror entry; regenerate it from the restored F32 row.  The stashed row
+     * mirror entry; regenerate it from the stashed F32 row.  The stashed row
      * is a committed (already round-tripped) row, so the quantize is an exact
      * idempotent re-encode -- F32 unchanged, codes+scales reproduce the
-     * trunk's bit pattern.  Mirror rows were demand-mapped by the fork copy. */
+     * trunk's bit pattern.  Mirror rows were demand-mapped by the fork copy.
+     * P2 Inc2b: source the stash row directly (the cache row no longer
+     * carries the value in fp8-primary mode; in mirror mode the two are
+     * byte-identical after the copy above, so this is the same encode). */
     if (!indexer && g->layer_comp_cache_fp8[il]) {
         const uint64_t mrow = (uint64_t)seq * g->layer_comp_cap[il] + row0;
-        ds4_gpu_tensor *crow = ds4_gpu_tensor_view(cache,
-                mrow * hd * sizeof(float), hd * sizeof(float));
+        ds4_gpu_tensor *crow = ds4_gpu_tensor_view(stash,
+                ((uint64_t)seq * DS4_N_LAYER + il) * hd * sizeof(float),
+                hd * sizeof(float));
         ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_comp_cache_fp8[il],
                 mrow * DS4_OPP_C_FP8_ROW_BYTES, (uint64_t)DS4_OPP_C_FP8_ROW_BYTES);
         ds4_gpu_tensor *scale = ds4_gpu_tensor_view(g->layer_comp_scale[il],
@@ -15353,14 +15408,29 @@ static bool metal_graph_encode_layer_attention_batch(
                         ok = false;
                         break;
                     }
-                    if (!metal_graph_cache_ensure_rows(g->layer_attn_comp_cache[il],
+                    /* P2 Inc2b: fp8-primary emits the chunk into the scratch
+                     * and packs from there (mirror views below carry the
+                     * absolute bank rows); no F32 demand-map, no F32 write. */
+                    const bool f2_fp8_primary = !DS4_GPU_ATTN_COMP_CACHE_F16 &&
+                                                g->layer_comp_cache_fp8[il] != NULL;
+                    if (!f2_fp8_primary &&
+                        !metal_graph_cache_ensure_rows(g->layer_attn_comp_cache[il],
                             (uint64_t)seq * g->layer_comp_cap[il] + comp_before, comp_chunk,
                             (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
                             "FB2 multi-seq comp emit", il)) {
                         ok = false;
                         break;
                     }
-                    ds4_gpu_tensor *target = ds4_gpu_tensor_view(
+                    ds4_gpu_tensor *f2_scratch = f2_fp8_primary
+                        ? metal_graph_comp_emit_scratch(g, comp_chunk) : NULL;
+                    if (f2_fp8_primary && !f2_scratch) {
+                        ok = false;
+                        break;
+                    }
+                    ds4_gpu_tensor *target = f2_fp8_primary
+                        ? ds4_gpu_tensor_view(f2_scratch, 0,
+                              (uint64_t)comp_chunk * DS4_N_HEAD_DIM * sizeof(float))
+                        : ds4_gpu_tensor_view(
                             g->layer_attn_comp_cache[il],
                             ((uint64_t)seq * g->layer_comp_cap[il] + comp_before) * DS4_N_HEAD_DIM * sizeof(float),
                             (uint64_t)comp_chunk * DS4_N_HEAD_DIM * sizeof(float));
@@ -15462,7 +15532,9 @@ static bool metal_graph_encode_layer_attention_batch(
                     ok = false;
                     break;
                 }
-                if (emit && !metal_graph_cache_ensure_rows(g->layer_attn_comp_cache[il],
+                if (emit && !DS4_GPU_ATTN_COMP_CACHE_F16 &&
+                    g->layer_comp_cache_fp8[il] == NULL &&
+                    !metal_graph_cache_ensure_rows(g->layer_attn_comp_cache[il],
                         (uint64_t)seq * g->layer_comp_cap[il] + comp_row_local, 1u,
                         (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
                         "multi-seq comp emit", il)) {
@@ -15477,14 +15549,22 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             (uint64_t)seq * state_stride, state_stride);
                 /* CUDA writes the FP32 cache directly at comp_row; the cache
                  * pointer is the full N-bank slab, so seq*comp_cap+local lands
-                 * in bank seq. */
+                 * in bank seq.  P2 Inc2b: fp8-primary writes the scratch row
+                 * instead (eager path, inline row arg) and packs from there --
+                 * the bank F32 slab is never touched. */
                 const uint32_t comp_row_global = seq * g->layer_comp_cap[il] + comp_row_local;
-                ok = kv_view && sc_view && st_kv && st_sc &&
+                const bool ms_fp8_primary = !DS4_GPU_ATTN_COMP_CACHE_F16 &&
+                                            g->layer_comp_cache_fp8[il] != NULL;
+                ds4_gpu_tensor *ms_row_scratch = ms_fp8_primary
+                    ? metal_graph_comp_emit_scratch(g, 1u) : NULL;
+                if (ms_fp8_primary && !ms_row_scratch) ok = false;
+                ok = ok && kv_view && sc_view && st_kv && st_sc &&
                      ds4_gpu_compressor_update_tensor(kv_view,
                                                         sc_view,
                                                         st_kv,
                                                         st_sc,
-                                                        g->layer_attn_comp_cache[il],
+                                                        ms_fp8_primary ? ms_row_scratch
+                                                                       : g->layer_attn_comp_cache[il],
                                                         model->map,
                                                         model->size,
                                                         layer->attn_compressor_ape->abs_offset,
@@ -15494,7 +15574,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                         DS4_N_HEAD_DIM,
                                                         ratio,
                                                         pos,
-                                                        comp_row_global,
+                                                        ms_fp8_primary ? 0u : comp_row_global,
                                                         DS4_N_ROT,
                                                         compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                         freq_base,
@@ -15510,8 +15590,12 @@ static bool metal_graph_encode_layer_attention_batch(
                     /* P2 Inc2a: E4M3 round-trip of the just-emitted row (model
                      * semantics -- see the block comment above) + the per-bank
                      * FP8 mirror row when the mirror is on.  Eager path,
-                     * transient views like the single-seq branch below. */
-                    ds4_gpu_tensor *crow = ds4_gpu_tensor_view(
+                     * transient views like the single-seq branch below.
+                     * P2 Inc2b: fp8-primary sources the scratch row. */
+                    ds4_gpu_tensor *crow = ms_fp8_primary
+                        ? ds4_gpu_tensor_view(ms_row_scratch, 0,
+                                              (uint64_t)DS4_N_HEAD_DIM * sizeof(float))
+                        : ds4_gpu_tensor_view(
                             g->layer_attn_comp_cache[il],
                             (uint64_t)comp_row_global * DS4_N_HEAD_DIM * sizeof(float),
                             (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
@@ -15836,12 +15920,22 @@ static bool metal_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
                     ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
                     const uint32_t comp_row = g->layer_n_comp[il];
-                    ok = kv_view && sc_view &&
+                    /* P2 Inc2b: fp8-primary -- emit into the scratch row and
+                     * pack from there; the F32 cache stays untouched.  This
+                     * eager branch passes the row inline (no substrate), so
+                     * the redirect is a plain argument swap. */
+                    const bool row_fp8_primary = !DS4_GPU_ATTN_COMP_CACHE_F16 &&
+                                                 g->layer_comp_cache_fp8[il] != NULL;
+                    ds4_gpu_tensor *row_scratch = row_fp8_primary
+                        ? metal_graph_comp_emit_scratch(g, 1u) : NULL;
+                    if (row_fp8_primary && !row_scratch) ok = false;
+                    ok = ok && kv_view && sc_view &&
                          ds4_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
                                                             g->layer_attn_state_kv[il],
                                                             g->layer_attn_state_score[il],
-                                                            metal_graph_attn_comp_update_target(g, il),
+                                                            row_fp8_primary ? row_scratch
+                                                                            : metal_graph_attn_comp_update_target(g, il),
                                                             model->map,
                                                             model->size,
                                                             layer->attn_compressor_ape->abs_offset,
@@ -15851,7 +15945,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_N_HEAD_DIM,
                                                             ratio,
                                                             pos,
-                                                            metal_graph_attn_comp_update_row(comp_row),
+                                                            row_fp8_primary ? 0u
+                                                                            : metal_graph_attn_comp_update_row(comp_row),
                                                             DS4_N_ROT,
                                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                             freq_base,
@@ -15864,7 +15959,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             UINT32_MAX,                  /* PC2: decode2-exact, no substrate; inline comp_row */
                                                             DS4_COMPRESSOR_ROW_COMP      /* PC2: row_field ignored when il==UINT32_MAX */) != 0;
                     if (ok && emit) {
-                        ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
+                        ds4_gpu_tensor *comp_row_view = row_fp8_primary
+                            ? ds4_gpu_tensor_view(row_scratch, 0,
+                                                  (uint64_t)DS4_N_HEAD_DIM * sizeof(float))
+                            : metal_graph_attn_comp_row_view(g, il, comp_row);
                         /* Opp C Phase 1A: matching single-row FP8 mirror views
                          * for this emit (decode2-exact, not under capture).
                          * P2 Inc2a: demand-map first (bank views of the VMM
@@ -16702,7 +16800,12 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                        g->raw_window,
                                                                        ratio,
                                                                        DS4_N_HEAD,
-                                                                       DS4_N_HEAD_DIM) != 0;
+                                                                       DS4_N_HEAD_DIM,
+                                                                       /* P2 Inc2b: packed FP8 mirror (same row-0
+                                                                        * base as the comp cache; repoint keeps
+                                                                        * them in lockstep on the batched path). */
+                                                                       g->layer_comp_cache_fp8[il],
+                                                                       g->layer_comp_scale[il]) != 0;
             if (ok) batch_attention_done = true;
         }
     }
@@ -25562,6 +25665,35 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                                       DS4_SESSION_IO_CHUNK,
                                                       err,
                                                       errlen);
+        } else if (g->layer_comp_cache_fp8[il] && g->layer_n_comp[il] != 0u) {
+            /* P2 Inc2b: fp8-primary -- the F32 cache rows are unwritten
+             * (emits pack straight to codes); expand the packed rows into
+             * the scratch and persist that.  The file format stays F32,
+             * and the expansion is the exact value every reader
+             * reconstructs, so save/load round-trips bit-identically. */
+            const uint32_t rows = g->layer_n_comp[il];
+            ds4_gpu_tensor *stg = metal_graph_comp_emit_scratch(g, rows);
+            ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(g->layer_comp_cache_fp8[il],
+                    0, (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES) : NULL;
+            ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(g->layer_comp_scale[il],
+                    0, (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES) : NULL;
+            if (!codes || !scale ||
+                ds4_gpu_dsv4_fp8_kv_dequant_tensor(stg, codes, scale,
+                                                   rows, DS4_N_HEAD_DIM) == 0) {
+                payload_set_err(err, errlen, "fp8 comp expand for save failed");
+                rc = 1;
+            } else {
+                rc = payload_write_tensor_span(fp,
+                                               stg,
+                                               0,
+                                               (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float),
+                                               buf,
+                                               DS4_SESSION_IO_CHUNK,
+                                               err,
+                                               errlen);
+            }
+            ds4_gpu_tensor_free(scale);
+            ds4_gpu_tensor_free(codes);
         } else {
             rc = payload_write_tensor_span(fp,
                                            g->layer_attn_comp_cache[il],
@@ -27912,14 +28044,16 @@ static uint64_t ds4_batch_vmm_floor_per_bank(const ds4_gpu_graph *g) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0 && g->layer_attn_comp_cache[il]) {
-            const uint64_t cb = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
-            floor_b += cb < page ? cb : page;
-            /* P2 Inc2a: the demand-mapped FP8 codes slab adds its own
-             * first-touch page (the tiny scale slab stays eager and is
-             * charged in bank_bytes instead). */
+            /* P2 Inc2b: fp8-primary -- the F32 comp slab is write-dead (no
+             * first touch ever happens), so its floor page drops out; only
+             * the codes slab pays a first-touch page.  Without the packed
+             * store the F32 slab keeps its page as before. */
             if (g->layer_comp_cache_fp8[il]) {
                 const uint64_t fb = (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES;
                 floor_b += fb < page ? fb : page;
+            } else {
+                const uint64_t cb = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
+                floor_b += cb < page ? cb : page;
             }
         }
         if (ratio == 4u && g->layer_index_comp_cache[il]) {
@@ -28031,7 +28165,9 @@ static uint64_t ds4_batch_bank_map_projection(const ds4_batch_ctx *ctx, uint32_t
         uint64_t rows = seq_len / ratio + 2u;
         if (rows > ctx->g.layer_comp_cap[il]) rows = ctx->g.layer_comp_cap[il];
         if (rows == 0) continue;
-        if (sl->multi_comp[il]) {
+        /* P2 Inc2b: fp8-primary never maps the F32 comp slab -- project it
+         * only when the packed store is absent. */
+        if (sl->multi_comp[il] && !sl->multi_comp_fp8[il]) {
             const uint64_t off = (uint64_t)b * sl->comp_bank_bytes[il];
             const uint64_t len = rows * DS4_N_HEAD_DIM * sizeof(float);
             const uint64_t span = ((off + len - 1u) / page - off / page + 1u) * page;
@@ -28302,16 +28438,22 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
         if (sl->multi_comp[il]) {
             const uint64_t cb = (uint64_t)g->ms_n_comp[src][il] * DS4_N_HEAD_DIM * sizeof(float);
             /* R5 Inc1b: demand-map the dst extent before the D2D (src rows are
-             * mapped by construction -- they were written). */
-            if (cb && ds4_gpu_tensor_ensure(sl->multi_comp[il],
-                                            (uint64_t)dst * sl->comp_bank_bytes[il], cb) == 0) {
+             * mapped by construction -- they were written).  P2 Inc2b:
+             * fp8-primary skips the F32 copy outright -- the slab is
+             * write-dead (emits pack straight to codes) and copying it
+             * would map dst pages for nothing. */
+            const bool fork_fp8_primary = sl->multi_comp_fp8[il] != NULL;
+            if (!fork_fp8_primary && cb &&
+                ds4_gpu_tensor_ensure(sl->multi_comp[il],
+                                      (uint64_t)dst * sl->comp_bank_bytes[il], cb) == 0) {
                 fprintf(stderr, "ds4: fork comp demand-map failed at layer %u\n", il);
                 return false;
             }
-            if (cb && ds4_gpu_tensor_copy(sl->multi_comp[il], (uint64_t)dst * sl->comp_bank_bytes[il],
-                                          sl->multi_comp[il], (uint64_t)src * sl->comp_bank_bytes[il],
-                                          cb) == 0) return false;
-            /* P2 Inc2a: the FP8 mirror rows move with the F32 rows. */
+            if (!fork_fp8_primary && cb &&
+                ds4_gpu_tensor_copy(sl->multi_comp[il], (uint64_t)dst * sl->comp_bank_bytes[il],
+                                    sl->multi_comp[il], (uint64_t)src * sl->comp_bank_bytes[il],
+                                    cb) == 0) return false;
+            /* P2 Inc2a: the FP8 mirror rows move with the bank. */
             if (sl->multi_comp_fp8[il] && g->ms_n_comp[src][il] != 0u) {
                 const uint64_t f8b  = (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES;
                 const uint64_t scb  = (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_SCALE_BYTES;
@@ -28425,14 +28567,19 @@ static bool bank_fork_copy_cut(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst, u
                 const uint64_t crows = ratio == 4u ? (uint64_t)keep4 + 1u
                                                    : (uint64_t)R / ratio;
                 const uint64_t cb = crows * DS4_N_HEAD_DIM * sizeof(float);
-                if (cb && ds4_gpu_tensor_ensure(sl->multi_comp[il],
-                                                (uint64_t)dst * sl->comp_bank_bytes[il], cb) == 0) {
+                /* P2 Inc2b: fp8-primary -- F32 prefix copy skipped (slab is
+                 * write-dead; the codes+scales copy below carries the rows). */
+                const bool cut_fp8_primary = sl->multi_comp_fp8[il] != NULL;
+                if (!cut_fp8_primary && cb &&
+                    ds4_gpu_tensor_ensure(sl->multi_comp[il],
+                                          (uint64_t)dst * sl->comp_bank_bytes[il], cb) == 0) {
                     fprintf(stderr, "ds4: partial fork comp demand-map failed at layer %u\n", il);
                     return false;
                 }
-                if (cb && ds4_gpu_tensor_copy(sl->multi_comp[il], (uint64_t)dst * sl->comp_bank_bytes[il],
-                                              sl->multi_comp[il], (uint64_t)src * sl->comp_bank_bytes[il],
-                                              cb) == 0) return false;
+                if (!cut_fp8_primary && cb &&
+                    ds4_gpu_tensor_copy(sl->multi_comp[il], (uint64_t)dst * sl->comp_bank_bytes[il],
+                                        sl->multi_comp[il], (uint64_t)src * sl->comp_bank_bytes[il],
+                                        cb) == 0) return false;
                 /* P2 Inc2a: FP8 mirror rows for the same prefix (incl. the
                  * ratio-4 boundary row -- its mirror entry is regenerated by
                  * ms_emit_keep_restore after the suffix's first emit). */
@@ -28480,7 +28627,32 @@ static bool bank_fork_copy_cut(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst, u
         /* Counters at frontier R + the ratio-4 boundary-row stash. */
         if (sl->multi_comp[il] && ratio != 0u) {
             if (ratio == 4u) {
-                if (ds4_gpu_tensor_copy(g->emit_stash_comp,
+                if (sl->multi_comp_fp8[il]) {
+                    /* P2 Inc2b: fp8-primary -- the F32 slab is unwritten, so
+                     * the stash expands the boundary row from dst's codes
+                     * (copied just above).  The expansion is the exact value
+                     * the trunk's F32 row carried (bit-lossless storage), so
+                     * the keep_restore re-encode reproduces the trunk's
+                     * codes byte-for-byte, as before. */
+                    ds4_gpu_tensor *srow = ds4_gpu_tensor_view(g->emit_stash_comp,
+                            ((uint64_t)dst * DS4_N_LAYER + il) * DS4_N_HEAD_DIM * sizeof(float),
+                            (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                    ds4_gpu_tensor *codes = ds4_gpu_tensor_view(sl->multi_comp_fp8[il],
+                            (uint64_t)dst * g->layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES +
+                                (uint64_t)keep4 * DS4_OPP_C_FP8_ROW_BYTES,
+                            (uint64_t)DS4_OPP_C_FP8_ROW_BYTES);
+                    ds4_gpu_tensor *scale = ds4_gpu_tensor_view(sl->multi_comp_scale[il],
+                            (uint64_t)dst * g->layer_comp_cap[il] * DS4_OPP_C_FP8_SCALE_BYTES +
+                                (uint64_t)keep4 * DS4_OPP_C_FP8_SCALE_BYTES,
+                            (uint64_t)DS4_OPP_C_FP8_SCALE_BYTES);
+                    const bool sok = srow && codes && scale &&
+                        ds4_gpu_dsv4_fp8_kv_dequant_tensor(srow, codes, scale,
+                                                           1u, DS4_N_HEAD_DIM) != 0;
+                    ds4_gpu_tensor_free(scale);
+                    ds4_gpu_tensor_free(codes);
+                    ds4_gpu_tensor_free(srow);
+                    if (!sok) return false;
+                } else if (ds4_gpu_tensor_copy(g->emit_stash_comp,
                                         ((uint64_t)dst * DS4_N_LAYER + il) * DS4_N_HEAD_DIM * sizeof(float),
                                         sl->multi_comp[il],
                                         (uint64_t)dst * sl->comp_bank_bytes[il] +
@@ -29111,7 +29283,26 @@ static int mtp_cont_committed_read(ds4_gpu_graph *g, uint32_t nbanks,
                 cnt[ci++] = rows;
                 if (rows == 0u || !t) continue;
                 const uint64_t nb = (uint64_t)rows * dim * sizeof(float);
-                if (ds4_gpu_tensor_read(t, (uint64_t)b * bank_bytes, buf + off, nb) == 0) { ok = 0; break; }
+                if (kind == 0 && g->layer_comp_cache_fp8[il]) {
+                    /* P2 Inc2b: fp8-primary -- the F32 slab is unwritten;
+                     * expand the bank's packed rows into the scratch and
+                     * read from there (bit-identical to what the attention
+                     * kernels reconstruct). */
+                    ds4_gpu_tensor *stg = metal_graph_comp_emit_scratch(g, rows);
+                    ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(g->layer_comp_cache_fp8[il],
+                            (uint64_t)b * g->layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES,
+                            (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES) : NULL;
+                    ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(g->layer_comp_scale[il],
+                            (uint64_t)b * g->layer_comp_cap[il] * DS4_OPP_C_FP8_SCALE_BYTES,
+                            (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES) : NULL;
+                    ok = codes && scale &&
+                         ds4_gpu_dsv4_fp8_kv_dequant_tensor(stg, codes, scale,
+                                                            rows, DS4_N_HEAD_DIM) != 0 &&
+                         ds4_gpu_tensor_read(stg, 0, buf + off, nb) != 0;
+                    ds4_gpu_tensor_free(scale);
+                    ds4_gpu_tensor_free(codes);
+                    if (!ok) break;
+                } else if (ds4_gpu_tensor_read(t, (uint64_t)b * bank_bytes, buf + off, nb) == 0) { ok = 0; break; }
                 off += (uint64_t)rows * dim;
             }
         }
