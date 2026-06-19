@@ -1215,6 +1215,7 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool self_test_extractors;
+    bool batched;
 } eval_config;
 
 typedef struct {
@@ -1594,6 +1595,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--regrade-trace")) {
             c.regrade_trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--batched")) {
+            c.batched = true;
         } else if (!strcmp(arg, "--soft-limit-reply-budget")) {
             c.soft_limit_reply_budget = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--hard-limit-reply-budget")) {
@@ -3857,6 +3860,97 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
     }
 }
 
+/* Batched eval: encode all cases, run them through ds4_engine_batched_generate in
+ * one ragged-prefill + batch-decode forward (chunks of <=DS4_EVAL_BATCH_MAX), then
+ * grade each with the same find_case_answer/answer_matches used by the sequential
+ * path and --regrade-trace.  Plain greedy (no per-token </think> reply-budget
+ * controller) -- fair for a RELATIVE A/B since both models run the identical path. */
+#define DS4_EVAL_BATCH_MAX 128
+#define DS4_EVAL_BATCH_DEFAULT 8   /* safe chunk: the full ~24k-tok prefill asserts on mmid.cu's shared-mem cap (sm_103) */
+static int run_eval_batched(ds4_engine *engine, const eval_config *cfg, int ncases) {
+    const char *system = eval_system_prompt();
+    const ds4_think_mode tm = ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
+    const int eos = ds4_token_eos(engine);
+    int cap = cfg->max_tokens;
+    if (cap > cfg->ctx_size - 1) cap = cfg->ctx_size - 1;
+    if (cap < 1) cap = 1;
+    int passed = 0, graded = 0, skipped = 0;
+
+    /* The batched MoE prefill kernel (mmid.cu) caps shared memory per launch, so a
+     * very large ragged prefill (all 92 prompts at once) asserts on sm_103.  Chunk
+     * the prompts into bounded batched calls; DS4_EVAL_BATCH overrides the size. */
+    int batch_cap = DS4_EVAL_BATCH_DEFAULT;
+    { const char *e = getenv("DS4_EVAL_BATCH"); if (e && atoi(e) > 0) batch_cap = atoi(e); }
+    if (batch_cap > DS4_EVAL_BATCH_MAX) batch_cap = DS4_EVAL_BATCH_MAX;
+    if (batch_cap < 1) batch_cap = 1;
+
+    for (int base = 0; base < ncases; base += batch_cap) {
+        int chunk = ncases - base;
+        if (chunk > batch_cap) chunk = batch_cap;
+        ds4_tokens *prompts = calloc((size_t)chunk, sizeof(*prompts));
+        int *slot2case = calloc((size_t)chunk, sizeof(int));
+        if (!prompts || !slot2case) { free(prompts); free(slot2case); return 1; }
+        int n = 0;
+        for (int j = 0; j < chunk; j++) {
+            const eval_case *tc = &eval_cases[base + j];
+            char *q = build_question_prompt(tc);
+            ds4_tokens p = {0};
+            if (q) ds4_encode_chat_prompt(engine, system, q, tm, &p);
+            free(q);
+            if (p.len == 0 || p.len >= cfg->ctx_size) {
+                fprintf(stderr, "[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
+                        base + j + 1, ncases, tc->source, tc->id, p.len, cfg->ctx_size);
+                ds4_tokens_free(&p);
+                skipped++;
+                continue;
+            }
+            prompts[n] = p;
+            slot2case[n] = base + j;
+            n++;
+        }
+        if (n == 0) { free(prompts); free(slot2case); continue; }
+        ds4_batch_gen_options opts = { .max_new_tokens = cap, .eos_id = eos };
+        ds4_batch_gen_result *res = calloc((size_t)n, sizeof(*res));
+        char err[256] = {0};
+        fprintf(stderr, "ds4-eval: batched generate %d prompts (cap=%d ctx=%d)\n",
+                n, cap, cfg->ctx_size);
+        int rc = res ? ds4_engine_batched_generate(engine, prompts, n, cfg->ctx_size,
+                                                    &opts, res, err, sizeof(err)) : 1;
+        if (rc != 0) {
+            fprintf(stderr, "ds4-eval: batched_generate failed: %s\n", err[0] ? err : "out of memory");
+            for (int k = 0; k < n; k++) ds4_tokens_free(&prompts[k]);
+            free(prompts); free(slot2case); free(res);
+            return 1;
+        }
+        for (int k = 0; k < n; k++) {
+            byte_buf out = {0};
+            for (int t = 0; t < res[k].n_tokens; t++) {
+                if (res[k].tokens[t] == eos) break;
+                size_t plen = 0;
+                char *piece = ds4_token_text(engine, res[k].tokens[t], &plen);
+                if (piece) { buf_append(&out, piece, plen); free(piece); }
+            }
+            const eval_case *tc = &eval_cases[slot2case[k]];
+            char got[EVAL_ANSWER_MAX];
+            find_case_answer(tc, out.v ? out.v : "", got, sizeof(got));
+            bool ok = answer_matches(tc, got);
+            passed += ok ? 1 : 0;
+            graded++;
+            printf("[%d/%d] %s %s/%s got=%s expected=%s (%s, %d tok)\n",
+                   slot2case[k] + 1, ncases, ok ? "PASSED" : "FAILED",
+                   tc->source, tc->id, got[0] ? got : "?", tc->answer ? tc->answer : "?",
+                   res[k].finish ? "eos" : "budget", res[k].n_tokens);
+            fflush(stdout);
+            free(res[k].tokens);
+            buf_free(&out);
+            ds4_tokens_free(&prompts[k]);
+        }
+        free(prompts); free(slot2case); free(res);
+    }
+    printf("ds4-eval: %d/%d passed (batched; %d skipped)\n", passed, graded, skipped);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();
@@ -3940,6 +4034,11 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "ds4-eval: model shape %s\n", ds4_engine_model_name(engine));
     eval_warn_think_max_downgraded(&cfg);
+    if (cfg.batched) {
+        int rc = run_eval_batched(engine, &cfg, ncases);
+        ds4_engine_close(engine);
+        return rc;
+    }
     trace_write_header(trace, &cfg, ds4_engine_model_name(engine), ncases, max_prompt_tokens);
     log_context_memory(cfg.backend, cfg.ctx_size);
 
