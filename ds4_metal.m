@@ -429,6 +429,13 @@ int ds4_cuda_fp8_kv_enabled(void) {
     return 0;
 }
 
+/* P2 Inc3: the packed FP4 indexer mirror is a CUDA-only decode optimisation.
+ * Metal builds always report it disabled, so the FP4 buffers are never
+ * allocated and ds4.c keeps its existing F32 indexer-comp path unchanged. */
+int ds4_cuda_fp4_index_enabled(void) {
+    return 0;
+}
+
 int ds4_cuda_layer_graph_begin_or_replay(uint32_t il,
                                            const struct ds4_layer_graph_key *key) {
     (void)il; (void)key;
@@ -5337,8 +5344,11 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale,
         uint32_t                n_comp_max,
-        uint32_t                il) {
+        uint32_t                il,
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale) {
     (void)n_comp_max; (void)il;  /* PC5: Metal reads inline n_comp; no max-grid substrate. */
+    (void)index_fp4; (void)index_scale;  /* P2 Inc3: Metal never stores FP4. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_head == 0 || head_dim == 0) {
@@ -7144,10 +7154,24 @@ int ds4_gpu_dsv4_fp8_kv_dequant_tensor(
     return 0;
 }
 
+int ds4_gpu_dsv4_indexer_fp4_dequant_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *codes,
+        const ds4_gpu_tensor *scale,
+        uint32_t                n_rows,
+        uint32_t                head_dim) {
+    (void)dst; (void)codes; (void)scale; (void)n_rows; (void)head_dim;
+    fprintf(stderr, "ds4: fp4 indexer dequant is not available on Metal\n");
+    return 0;
+}
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
-        uint32_t          head_dim) {
+        uint32_t          head_dim,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror) {
+    (void)codes_mirror; (void)scale_mirror;  /* P2 Inc3: Metal never stores FP4 */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!x || n_rows == 0 || head_dim != 128u) return 0;
 
@@ -7189,14 +7213,17 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
 int ds4_gpu_dsv4_indexer_qat_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
-        uint32_t          il) {
+        uint32_t          il,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror) {
+    (void)codes_mirror; (void)scale_mirror;  /* P2 Inc3: Metal never stores FP4 */
     if (!base || il >= DS4_METAL_LAYER_SCALARS_COUNT) return 0;
     const uint32_t index_row = g_metal_layer_scalars[il].index_row;
     ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,
         (uint64_t)index_row * head_dim * sizeof(float),
         (uint64_t)head_dim * sizeof(float));
     if (!row_view) return 0;
-    int ok = ds4_gpu_dsv4_indexer_qat_tensor(row_view, 1, head_dim);
+    int ok = ds4_gpu_dsv4_indexer_qat_tensor(row_view, 1, head_dim, NULL, NULL);
     ds4_gpu_tensor_free(row_view);
     return ok;
 }

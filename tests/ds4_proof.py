@@ -302,6 +302,14 @@ OVERLAYS: dict[str, Overlay] = {
         env={"DS4_CUDA_FP8_KV_PREDECODE": "1"},
         requires=("fp8-kv",),
     ),
+    # P2 Inc3: packed FP4 (e2m1) indexer compressed-KV storage.  Bit-lossless
+    # by construction (the model already stores Hadamard/e2m1-rounded indexer
+    # values), so this cell must be token-IDENTICAL to the cuda-default
+    # baseline -- a parity expectation, not the FP8 drift framing below.
+    "fp4-index": Overlay(
+        "fp4-index",
+        env={"DS4_CUDA_FP4_INDEX": "1"},
+    ),
 }
 
 
@@ -1319,6 +1327,8 @@ SCENARIOS: dict[str, Scenario] = {
             (),
             ("fp8-kv",),
             ("fp8-kv", "fp8-kv-predecode"),
+            ("fp4-index",),
+            ("fp8-kv", "fp4-index"),
         ),
         prompts=("@tests/long_context_essay_prompt.txt",),
         budget="candidate",

@@ -2266,8 +2266,10 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 static int ds4_cuda_fp8_kv_decode_table_init(void);
 extern "C" int ds4_cuda_fp8_kv_enabled(void);
 extern "C" int ds4_cuda_fp8_kv_debug_enabled(void);
+extern "C" int ds4_cuda_fp4_index_enabled(void);  /* P2 Inc3 */
 extern "C" unsigned long long ds4_cuda_fp8_kv_read_path_blocks(void);
 extern "C" unsigned long long ds4_cuda_fp8_kv_indexed_read_path_blocks(void);
+extern "C" unsigned long long ds4_cuda_fp4_index_read_path_blocks(void);  /* P2 Inc3 */
 
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
@@ -2353,6 +2355,13 @@ extern "C" void ds4_gpu_cleanup(void) {
         const unsigned long long indexed = ds4_cuda_fp8_kv_indexed_read_path_blocks();
         fprintf(stderr, "ds4: DS4_CUDA_FP8_KV path stats -- dense decode blocks: %llu, indexed decode blocks: %llu\n",
                 dense, indexed);
+    }
+    /* P2 Inc3: FP4 indexer read tripwire (reuses the same debug gate).  Nonzero
+     * proves indexer_score_one_direct consumed the packed mirror, so a matching
+     * token-MD5 vs fp4-off reflects bit-identical reconstruction. */
+    if (ds4_cuda_fp4_index_enabled() && ds4_cuda_fp8_kv_debug_enabled()) {
+        fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX path stats -- indexer_score_one_direct fp4 blocks: %llu\n",
+                ds4_cuda_fp4_index_read_path_blocks());
     }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
@@ -5442,6 +5451,9 @@ __device__ static unsigned long long g_fp8_kv_read_path_blocks = 0ull;
  * indexer-layer count grows linearly with context, the dense one does
  * not, and conflating them masks regressions in either branch. */
 __device__ static unsigned long long g_fp8_kv_indexed_read_path_blocks = 0ull;
+/* P2 Inc3: read-tripwire for the packed FP4 indexer mirror (one atomic per
+ * scorer block that consumed the mirror). */
+__device__ static unsigned long long g_fp4_index_read_path_blocks = 0ull;
 
 /* Read one (row, dim) lane out of the packed FP8 mirror.  For d<448 the
  * code is 1 byte (sign in bit 7, magnitude index 0..126 in bits 0..6) and
@@ -5532,9 +5544,12 @@ __device__ static float dsv4_e2m1fn_value_dev(int i) {
     }
 }
 
-__device__ static float dsv4_e2m1fn_dequant_dev(float x) {
-    float sign = x < 0.0f ? -1.0f : 1.0f;
-    float ax = fminf(fabsf(x), 6.0f);
+/* P2 Inc3: nearest e2m1 magnitude level (0..7) for |x| (clamped to the 6.0
+ * ceiling) -- the exact search dsv4_e2m1fn_dequant_dev used, even-index
+ * tiebreak preserved, factored out so the FP4 encode and the F32 dequant pick
+ * the identical level and the packed indexer mirror is bit-lossless. */
+__device__ static int dsv4_e2m1fn_level_dev(float ax) {
+    ax = fminf(ax, 6.0f);
     int best = 0;
     float best_diff = fabsf(ax - dsv4_e2m1fn_value_dev(0));
     for (int i = 1; i < 8; i++) {
@@ -5544,7 +5559,53 @@ __device__ static float dsv4_e2m1fn_dequant_dev(float x) {
             best_diff = diff;
         }
     }
-    return sign * dsv4_e2m1fn_value_dev(best);
+    return best;
+}
+
+__device__ static float dsv4_e2m1fn_dequant_dev(float x) {
+    float sign = x < 0.0f ? -1.0f : 1.0f;
+    return sign * dsv4_e2m1fn_value_dev(dsv4_e2m1fn_level_dev(fabsf(x)));
+}
+
+/* P2 Inc3: pack a (clamped) post-Hadamard value into a 4-bit e2m1 nibble --
+ * bit3 = sign, bits0..2 = magnitude level.  Same level search as the dequant,
+ * so (sign?-1:1)*value[level]*scale reproduces the F32 the QAT writes
+ * bit-for-bit. */
+__device__ static DS4_CUDA_UNUSED unsigned char dsv4_e2m1fn_encode_dev(float x) {
+    unsigned int sign = (x < 0.0f) ? 8u : 0u;
+    return (unsigned char)(sign | (unsigned int)dsv4_e2m1fn_level_dev(fabsf(x)));
+}
+
+/* P2 Inc3: bit-exact reconstruction of one packed FP4 indexer lane (the
+ * indexer is always head_dim 128, so the row strides are constant: 64 code
+ * bytes -- 2 nibbles/byte, lane d -> byte d>>1, low nibble for even d -- and 4
+ * per-32-lane F32 block scales).  Returns (sign?-1:1)*e2m1_value[level]*scale,
+ * == the F32 the indexer QAT wrote.  Mirrors fp8_kv_read. */
+__device__ static DS4_CUDA_UNUSED float indexer_fp4_read(
+        const unsigned char * __restrict__ codes_base,
+        const float         * __restrict__ scale_base,
+        uint32_t row, uint32_t d) {
+    const unsigned char byte = codes_base[(uint64_t)row * 64u + (d >> 1u)];
+    const uint32_t nib = ((uint32_t)byte >> (4u * (d & 1u))) & 0xFu;
+    const float sign = (nib & 8u) ? -1.0f : 1.0f;
+    const float scale = scale_base[(uint64_t)row * 4u + (d >> 5u)];
+    return sign * dsv4_e2m1fn_value_dev((int)(nib & 7u)) * scale;
+}
+
+/* P2 Inc3: expand packed FP4 rows [0..n_rows) back to dense F32 -- exact
+ * inverse of the encode (mirrors fp8_kv_dequant_rows_kernel).  Block per row;
+ * codes/scale bases are row-0-positioned views. */
+__global__ static void indexer_fp4_dequant_rows_kernel(
+        float * __restrict__ dst,
+        const unsigned char * __restrict__ codes_base,
+        const float         * __restrict__ scale_base,
+        uint32_t n_rows, uint32_t head_dim) {
+    const uint32_t r = blockIdx.x;
+    if (r >= n_rows) return;
+    float *out = dst + (uint64_t)r * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        out[d] = indexer_fp4_read(codes_base, scale_base, r, d);
+    }
 }
 
 __device__ static float model_scalar_dev(const void *base, uint64_t offset, uint32_t type, uint64_t idx) {
@@ -5707,7 +5768,14 @@ __global__ static void fp8_kv_quantize_row_kernel(
     }
 }
 
-__global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
+__global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim,
+        /* P2 Inc3: optional packed FP4 mirror (NULL-passthrough, exactly like
+         * fp8_kv_quantize_kernel).  When non-NULL, lane tid's sign+level nibble
+         * packs into codes_base[row*64 + tid/2] (low nibble = even tid) and the
+         * per-32-lane block scale into scale_base[row*4 + tid/32].  The packed
+         * row reconstructs xr[tid] bit-for-bit via indexer_fp4_read. */
+        unsigned char * __restrict__ codes_base,
+        float         * __restrict__ scale_base) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
@@ -5746,7 +5814,20 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
 
     float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
     float scale = exp2f(ceilf(log2f(amax / 6.0f)));
-    xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
+    /* P2 Inc3: F32 write is bit-identical to the prior
+     * dsv4_e2m1fn_dequant_dev(clamp)*scale (now factored through
+     * dsv4_e2m1fn_level_dev), plus the optional packed-mirror emit.  The
+     * even lane packs its own low nibble with the odd neighbour's nibble
+     * (warp shuffle); lane 0 of each 32-lane block writes the block scale. */
+    float clamp = fminf(6.0f, fmaxf(-6.0f, v / scale));
+    int level = dsv4_e2m1fn_level_dev(fabsf(clamp));
+    xr[tid] = ((clamp < 0.0f ? -1.0f : 1.0f) * dsv4_e2m1fn_value_dev(level)) * scale;
+    if (codes_base) {
+        uint32_t nib = (clamp < 0.0f ? 8u : 0u) | (uint32_t)level;
+        uint32_t hi  = __shfl_down_sync(0xffffffffu, nib, 1u);
+        if ((tid & 1u) == 0u)  codes_base[(uint64_t)row * 64u + (tid >> 1u)] = (unsigned char)(nib | (hi << 4u));
+        if ((tid & 31u) == 0u) scale_base[(uint64_t)row * 4u + (tid >> 5u)] = scale;
+    }
 }
 
 /* R1 / Step-4c variant: writes exactly one row of `base` at index
@@ -5758,7 +5839,14 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
 __global__ static void indexer_hadamard_fp4_row_kernel(
         float *base,
         uint32_t head_dim,
-        const struct ds4_layer_scalars * __restrict__ ls) {
+        const struct ds4_layer_scalars * __restrict__ ls,
+        /* P2 Inc3: optional packed FP4 mirror for the single row ls->index_row.
+         * Same NULL-passthrough + pack layout as indexer_hadamard_fp4_kernel.
+         * NB: this row variant does NOT apply the 1/sqrt(128) normalisation the
+         * batch kernel does -- the pack stores whatever value this kernel
+         * writes, so the asymmetry is preserved by construction. */
+        unsigned char * __restrict__ codes_base,
+        float         * __restrict__ scale_base) {
     uint32_t tid = threadIdx.x;
     if (head_dim != 128u || tid >= 128u) return;
 
@@ -5796,7 +5884,17 @@ __global__ static void indexer_hadamard_fp4_row_kernel(
 
     float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
     float scale = exp2f(ceilf(log2f(amax / 6.0f)));
-    xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
+    /* P2 Inc3: bit-identical F32 write + optional packed-mirror emit (see
+     * indexer_hadamard_fp4_kernel for the packing rationale). */
+    float clamp = fminf(6.0f, fmaxf(-6.0f, v / scale));
+    int level = dsv4_e2m1fn_level_dev(fabsf(clamp));
+    xr[tid] = ((clamp < 0.0f ? -1.0f : 1.0f) * dsv4_e2m1fn_value_dev(level)) * scale;
+    if (codes_base) {
+        uint32_t nib = (clamp < 0.0f ? 8u : 0u) | (uint32_t)level;
+        uint32_t hi  = __shfl_down_sync(0xffffffffu, nib, 1u);
+        if ((tid & 1u) == 0u)  codes_base[(uint64_t)ls->index_row * 64u + (tid >> 1u)] = (unsigned char)(nib | (hi << 4u));
+        if ((tid & 31u) == 0u) scale_base[(uint64_t)ls->index_row * 4u + (tid >> 5u)] = scale;
+    }
 }
 
 __global__ static void store_raw_kv_batch_kernel(
@@ -8615,7 +8713,12 @@ __global__ static void indexer_score_one_direct_kernel(
          * Lets the shim launch with a session-stable max grid (e.g.
          * comp_cap) for capture-safety while preserving correctness
          * via this bounds check.  NULL = legacy path (n_comp == grid).*/
-        const struct ds4_layer_scalars * __restrict__ ls_override) {
+        const struct ds4_layer_scalars * __restrict__ ls_override,
+        /* P2 Inc3: optional packed FP4 indexer mirror.  When non-NULL the krow
+         * lane reads via indexer_fp4_read (bit-identical to index_comp) and the
+         * block arms the FP4 read tripwire.  NULL = F32 (default / fp4 off). */
+        const unsigned char * __restrict__ index_fp4,
+        const float         * __restrict__ index_scale) {
     const uint32_t c = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -8630,9 +8733,14 @@ __global__ static void indexer_score_one_direct_kernel(
         }
     }
 
+    const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
+    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
     __shared__ float krow[128];
     __shared__ float partial[4];
-    if (tid < 128u) krow[tid] = index_comp[(uint64_t)c * 128u + tid];
+    if (tid < 128u) {
+        krow[tid] = use_fp4 ? indexer_fp4_read(index_fp4, index_scale, c, tid)
+                            : index_comp[(uint64_t)c * 128u + tid];
+    }
     __syncthreads();
 
     float total = 0.0f;
@@ -9883,7 +9991,12 @@ static int indexer_scores_launch(
          * below serve the scores through a bank-offset view of index_comp
          * (the per-row multiseq kernel is ~8.7x slower per pass).
          * UINT32_MAX = no claim (per-row kernel, bit-exact). */
-        uint32_t                single_bank) {
+        uint32_t                single_bank,
+        /* P2 Inc3: optional packed FP4 indexer mirror for the _direct fast path
+         * (NULL = F32).  Only indexer_score_one_direct_kernel consumes it in
+         * Inc3a; the WMMA/multiseq paths below still read index_comp (F32). */
+        const ds4_gpu_tensor *index_fp4,
+        const ds4_gpu_tensor *index_scale) {
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -9996,7 +10109,9 @@ static int indexer_scores_launch(
                 (const float *)weights->ptr,
                 (const float *)index_comp->ptr,
                 n_comp, pos0, ratio,
-                scale, causal ? 1 : 0, ls);
+                scale, causal ? 1 : 0, ls,
+                index_fp4   ? (const unsigned char *)index_fp4->ptr   : NULL,
+                index_scale ? (const float *)index_scale->ptr         : NULL);
         /* TEMPORARY DIAGNOSTIC: scores AFTER the science kernel writes.
          * Fixed-size 3000 floats (well past any realistic n_comp).  If this
          * matches BE vs BC, the science kernel produced identical output and
@@ -10083,12 +10198,16 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
          * check path.  Decode1 caller passes (g->layer_comp_cap[il], il);
          * decode2-exact + Metal stub pass (0, UINT32_MAX) for legacy. */
         uint32_t                n_comp_max,
-        uint32_t                il) {
+        uint32_t                il,
+        /* P2 Inc3: optional packed FP4 indexer mirror (NULL = F32). */
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
                                  n_head, head_dim, 1, scale, 0,
                                  n_comp_max, il,
                                  /* Step 4b: single-seq */ 0u, NULL, NULL,
-                                 /* FE1: no single-bank claim */ UINT32_MAX);
+                                 /* FE1: no single-bank claim */ UINT32_MAX,
+                                 index_fp4, index_scale);
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
@@ -10108,7 +10227,8 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
                                  n_head, head_dim, ratio, scale, 1,
                                  0u, UINT32_MAX,
                                  /* Step 4b: single-seq */ 0u, NULL, NULL,
-                                 /* FE1: no single-bank claim */ UINT32_MAX);
+                                 /* FE1: no single-bank claim */ UINT32_MAX,
+                                 /* P2 Inc3: prefill uses WMMA, no FP4 mirror */ NULL, NULL);
 }
 
 extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
@@ -10135,7 +10255,8 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
                                  n_head, head_dim, ratio, scale, 1,
                                  0u, UINT32_MAX,
-                                 comp_cap, positions, seq_id, single_bank);
+                                 comp_cap, positions, seq_id, single_bank,
+                                 /* P2 Inc3: multiseq/WMMA path, no FP4 mirror in Inc3a */ NULL, NULL);
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(
@@ -10832,6 +10953,18 @@ extern "C" unsigned long long ds4_cuda_fp8_kv_indexed_read_path_blocks(void) {
     return v;
 }
 
+/* P2 Inc3 tripwire getter: blocks of indexer_score_one_direct that read the
+ * packed FP4 mirror (evidence the fp4 read path actually executed). */
+extern "C" unsigned long long ds4_cuda_fp4_index_read_path_blocks(void) {
+    unsigned long long v = 0ull;
+    if (cudaMemcpyFromSymbol(&v, g_fp4_index_read_path_blocks,
+                             sizeof(v), 0, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0ull;
+    }
+    return v;
+}
+
 extern "C" int ds4_cuda_fp8_kv_enabled(void) {
     static int init = 0;
     static int enabled = 0;
@@ -10845,6 +10978,26 @@ extern "C" int ds4_cuda_fp8_kv_enabled(void) {
              strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
             enabled = 1;
             fprintf(stderr, "ds4: DS4_CUDA_FP8_KV=%s - packed FP8 compressed-KV mirror enabled (Opp C Phase 1A)\n", s);
+        }
+    }
+    return enabled;
+}
+
+/* P2 Inc3: gate for packed FP4 (e2m1) indexer compressed-KV storage.  Same
+ * truthy-env parsing as ds4_cuda_fp8_kv_enabled; default OFF. */
+extern "C" int ds4_cuda_fp4_index_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_FP4_INDEX");
+        if (s && *s &&
+            (strcmp(s, "1") == 0 ||
+             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
+             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
+             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
+            enabled = 1;
+            fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX=%s - packed FP4 indexer compressed-KV mirror enabled (P2 Inc3)\n", s);
         }
     }
     return enabled;
@@ -13016,12 +13169,42 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_dequant_tensor(
     return cuda_ok(cudaGetLastError(), "fp8_kv_dequant launch");
 }
 
-extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
+/* P2 Inc3: packed-FP4 -> F32 indexer row expansion (see ds4_gpu.h).  Mirrors
+ * ds4_gpu_dsv4_fp8_kv_dequant_tensor; head_dim is the indexer width 128, so
+ * the packed row is 64 code bytes + 4 F32 block scales. */
+extern "C" int ds4_gpu_dsv4_indexer_fp4_dequant_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *codes,
+        const ds4_gpu_tensor *scale,
+        uint32_t                n_rows,
+        uint32_t                head_dim) {
+    if (!dst || !codes || !scale || n_rows == 0 || head_dim != 128u ||
+        dst->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        codes->bytes < (uint64_t)n_rows * 64u ||
+        scale->bytes < (uint64_t)n_rows * 4u * sizeof(float)) {
+        return 0;
+    }
+    indexer_fp4_dequant_rows_kernel<<<n_rows, 128, 0, ds4_current_stream()>>>(
+            (float *)dst->ptr,
+            (const unsigned char *)codes->ptr,
+            (const float *)scale->ptr,
+            n_rows, head_dim);
+    return cuda_ok(cudaGetLastError(), "indexer_fp4_dequant launch");
+}
+
+extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim,
+        ds4_gpu_tensor *codes_mirror, ds4_gpu_tensor *scale_mirror) {
     if (!x || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
         return 0;
     }
-    indexer_hadamard_fp4_kernel<<<n_rows, 128, 0, ds4_current_stream()>>>((float *)x->ptr, n_rows, head_dim);
+    /* P2 Inc3: NULL-passthrough packed FP4 mirror (analogous to
+     * ds4_gpu_dsv4_fp8_kv_quantize_tensor).  Both NULL when DS4_CUDA_FP4_INDEX
+     * is off; the kernel skips the mirror writes. */
+    unsigned char *codes_ptr = codes_mirror ? (unsigned char *)codes_mirror->ptr : (unsigned char *)0;
+    float *scale_ptr = scale_mirror ? (float *)scale_mirror->ptr : (float *)0;
+    indexer_hadamard_fp4_kernel<<<n_rows, 128, 0, ds4_current_stream()>>>((float *)x->ptr, n_rows, head_dim,
+            codes_ptr, scale_ptr);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
 }
 
@@ -13032,13 +13215,19 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
 extern "C" int ds4_gpu_dsv4_indexer_qat_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t head_dim,
-        uint32_t il) {
+        uint32_t il,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror) {
     if (!base || g_layer_dev == NULL || head_dim != 128u ||
         il >= DS4_LAYER_SCALARS_COUNT ||
         base->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+    /* P2 Inc3: per-layer baked mirror pointers (g->layer_index_comp_cache_fp4
+     * [il] / g->layer_index_comp_scale[il]); NULL when the feature is off. */
+    unsigned char *codes_ptr = codes_mirror ? (unsigned char *)codes_mirror->ptr : (unsigned char *)0;
+    float *scale_ptr = scale_mirror ? (float *)scale_mirror->ptr : (float *)0;
     indexer_hadamard_fp4_row_kernel<<<1, 128, 0, ds4_current_stream()>>>(
             (float *)base->ptr, head_dim,
-            g_layer_dev + il);
+            g_layer_dev + il, codes_ptr, scale_ptr);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4_row launch");
 }
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, const ds4_gpu_tensor *positions, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {

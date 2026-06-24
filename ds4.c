@@ -8705,6 +8705,15 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
                                    + (uint64_t)DS4_N_ROT * sizeof(float))    /* 704 */
 #define DS4_OPP_C_FP8_SCALE_BYTES ((uint64_t)DS4_OPP_C_FP8_BLOCKS * sizeof(float)) /* 28 */
 
+/* P2 Inc3a: packed FP4 indexer compressed-KV mirror geometry.  The indexer
+ * compressed cache stores Hadamard/FP4-QAT rows at head_dim 128; the FP4
+ * mirror packs each row as 128 e2m1 nibbles (2 codes/byte = 64 code bytes)
+ * with one F32 block scale per 32-lane block (4 scales = 16 bytes).  Both
+ * mirror buffers are allocated only when DS4_CUDA_FP4_INDEX is enabled
+ * (default OFF) and only for ratio==4 layers; NULL otherwise. */
+#define DS4_INDEXER_FP4_ROW_BYTES   ((uint64_t)(DS4_N_INDEXER_HEAD_DIM / 2u))            /* 64 */
+#define DS4_INDEXER_FP4_SCALE_BYTES ((uint64_t)(DS4_N_INDEXER_HEAD_DIM / 32u) * sizeof(float)) /* 16 */
+
 typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -8748,6 +8757,15 @@ typedef struct {
     ds4_gpu_tensor *layer_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
+    /* P2 Inc3a: packed FP4 mirror of the indexer-compressed cache, allocated
+     * only for ratio==4 layers when DS4_CUDA_FP4_INDEX is enabled (default
+     * OFF -> NULL).  layer_index_comp_cache_fp4 holds DS4_INDEXER_FP4_ROW_BYTES
+     * (64) of e2m1 codes per compressed row; layer_index_comp_scale holds the
+     * DS4_INDEXER_FP4_SCALE_BYTES (16) per-32-lane FP32 block scales.  Faithful
+     * analog of the FP8 attention mirror (layer_comp_cache_fp8/layer_comp_scale);
+     * the F32 index cache stays primary and resident in Inc3a. */
+    ds4_gpu_tensor *layer_index_comp_cache_fp4[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_index_comp_scale[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
 
@@ -9217,6 +9235,12 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_index_comp_cache[il]);
+    }
+    /* P2 Inc3a: NULL-safe -- these stay NULL when DS4_CUDA_FP4_INDEX is off
+     * (or for ratio!=4 layers), so an unconditional free is correct. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_index_comp_cache_fp4[il]);
+        ds4_gpu_tensor_free(g->layer_index_comp_scale[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_index_state_kv[il]);
@@ -9699,6 +9723,17 @@ static bool metal_graph_alloc_raw_cap(
                 g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
                         managed_kv_cache,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                /* P2 Inc3a: packed FP4 indexer mirror, gated on DS4_CUDA_FP4_INDEX
+                 * (default OFF -> these stay NULL).  Same comp_cap row count as
+                 * the F32 index cache it shadows; row=64 codes + 16 scale bytes. */
+                if (ds4_cuda_fp4_index_enabled()) {
+                    g->layer_index_comp_cache_fp4[il] = metal_graph_alloc_kv_cache_tensor(
+                            managed_kv_cache,
+                            (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES);
+                    g->layer_index_comp_scale[il] = metal_graph_alloc_kv_cache_tensor(
+                            managed_kv_cache,
+                            (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES);
+                }
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 if (enable_mtp) {
@@ -10836,7 +10871,12 @@ static bool metal_graph_encode_decode_layer_impl(
                 ok = ds4_gpu_dsv4_indexer_qat_row_tensor(
                         g->layer_index_comp_cache[il],
                         DS4_N_INDEXER_HEAD_DIM,
-                        il) != 0;
+                        il,
+                        /* P2 Inc3a: whole-cache mirrors; the kernel indexes both
+                         * F32 base and FP4 mirror at g_layer_dev[il].index_row.
+                         * NULL when DS4_CUDA_FP4_INDEX is off. */
+                        g->layer_index_comp_cache_fp4[il],
+                        g->layer_index_comp_scale[il]) != 0;
             }
             /* Fixed-size post-qat cache hash, slot 60+il.  Same 3000 rows.
              * Comparing slot 0+il (post-update) vs 60+il (post-qat) tells
@@ -10887,7 +10927,9 @@ static bool metal_graph_encode_decode_layer_impl(
                                                         DS4_ROPE_YARN_BETA_SLOW) != 0;
                 if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->indexer_q,
                                                               DS4_N_INDEXER_HEAD,
-                                                              DS4_N_INDEXER_HEAD_DIM) != 0;
+                                                              DS4_N_INDEXER_HEAD_DIM,
+                                                              /* indexer-Q QAT, not the comp cache: no mirror. */
+                                                              NULL, NULL) != 0;
                 if (ok) ok = ds4_gpu_matmul_f16_tensor(g->indexer_weights, model->map, model->size,
                                                          layer->indexer_proj->abs_offset,
                                                          DS4_N_EMBD, DS4_N_INDEXER_HEAD,
@@ -10910,7 +10952,9 @@ static bool metal_graph_encode_decode_layer_impl(
                                                                 DS4_N_INDEXER_HEAD_DIM,
                                                                 index_scale,
                                                                 g->layer_comp_cap[il],  /* PC5: per-layer max for grid bound */
-                                                                il                      /* PC5: substrate index for ls_override */) != 0;
+                                                                il,                     /* PC5: substrate index for ls_override */
+                                                                g->layer_index_comp_cache_fp4[il],
+                                                                g->layer_index_comp_scale[il]) != 0;
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_score",
                                                                     il,
@@ -16079,7 +16123,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                     DS4_ROPE_YARN_BETA_SLOW) != 0;
             if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
                                                           n_tokens * DS4_N_INDEXER_HEAD,
-                                                          DS4_N_INDEXER_HEAD_DIM) != 0;
+                                                          DS4_N_INDEXER_HEAD_DIM,
+                                                          /* indexer-Q QAT, not the comp cache: no mirror. */
+                                                          NULL, NULL) != 0;
             if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
                                                      model->map,
                                                      model->size,
@@ -16150,9 +16196,30 @@ static bool metal_graph_encode_layer_attention_batch(
                                     /* Indexer cache stays FP32; no mirror. */ NULL, NULL) != 0;
                         }
                         if (ok && index_chunk != 0u) {
-                            ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
-                                                                  index_chunk,
-                                                                  DS4_N_INDEXER_HEAD_DIM) != 0;
+                            /* P2 Inc3a: FP4 mirror views at the matching absolute
+                             * bank row (seq*comp_cap + index_before), so the
+                             * mirror rows align with index_view's F32 rows.
+                             * NULL passthrough when the mirror is off. */
+                            ds4_gpu_tensor *fp4_rows = NULL;
+                            ds4_gpu_tensor *sc4_rows = NULL;
+                            if (g->layer_index_comp_cache_fp4[il]) {
+                                const uint64_t mrow0 = (uint64_t)seq * g->layer_comp_cap[il] + index_before;
+                                fp4_rows = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                                        mrow0 * DS4_INDEXER_FP4_ROW_BYTES,
+                                        (uint64_t)index_chunk * DS4_INDEXER_FP4_ROW_BYTES);
+                                sc4_rows = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                                        mrow0 * DS4_INDEXER_FP4_SCALE_BYTES,
+                                        (uint64_t)index_chunk * DS4_INDEXER_FP4_SCALE_BYTES);
+                                ok = fp4_rows != NULL && sc4_rows != NULL;
+                            }
+                            if (ok) {
+                                ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
+                                                                      index_chunk,
+                                                                      DS4_N_INDEXER_HEAD_DIM,
+                                                                      fp4_rows, sc4_rows) != 0;
+                            }
+                            if (fp4_rows) ds4_gpu_tensor_free(fp4_rows);
+                            if (sc4_rows) ds4_gpu_tensor_free(sc4_rows);
                         }
                         if (ok) {
                             ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -16236,7 +16303,25 @@ static bool metal_graph_encode_layer_attention_batch(
                         if (!row_view) {
                             ok = false;
                         } else {
-                            ok = ds4_gpu_dsv4_indexer_qat_tensor(row_view, 1, DS4_N_INDEXER_HEAD_DIM) != 0;
+                            /* P2 Inc3a: 1-row FP4 mirror views at index_row_global
+                             * (the same absolute bank row as row_view). */
+                            ds4_gpu_tensor *fp4_row = NULL;
+                            ds4_gpu_tensor *sc4_row = NULL;
+                            if (g->layer_index_comp_cache_fp4[il]) {
+                                fp4_row = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                                        (uint64_t)index_row_global * DS4_INDEXER_FP4_ROW_BYTES,
+                                        DS4_INDEXER_FP4_ROW_BYTES);
+                                sc4_row = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                                        (uint64_t)index_row_global * DS4_INDEXER_FP4_SCALE_BYTES,
+                                        DS4_INDEXER_FP4_SCALE_BYTES);
+                                ok = fp4_row != NULL && sc4_row != NULL;
+                            }
+                            if (ok) {
+                                ok = ds4_gpu_dsv4_indexer_qat_tensor(row_view, 1, DS4_N_INDEXER_HEAD_DIM,
+                                                                      fp4_row, sc4_row) != 0;
+                            }
+                            if (fp4_row) ds4_gpu_tensor_free(fp4_row);
+                            if (sc4_row) ds4_gpu_tensor_free(sc4_row);
                             ds4_gpu_tensor_free(row_view);
                         }
                     }
@@ -16308,9 +16393,14 @@ static bool metal_graph_encode_layer_attention_batch(
                                                              NULL) != 0;
                 }
                 if (ok && n_comp != 0) {
+                    /* P2 Inc3a: serial prefill writes rows [0..n_comp) from the
+                     * cache base; pass the whole FP4 mirror buffers (NULL when
+                     * the feature is off).  Same shape as the FP8 prefill emit. */
                     ok = ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
                                                           n_comp,
-                                                          DS4_N_INDEXER_HEAD_DIM) != 0;
+                                                          DS4_N_INDEXER_HEAD_DIM,
+                                                          g->layer_index_comp_cache_fp4[il],
+                                                          g->layer_index_comp_scale[il]) != 0;
                 }
                 if (ok) {
                     ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -16401,9 +16491,27 @@ static bool metal_graph_encode_layer_attention_batch(
                                 NULL) != 0;
                     }
                     if (ok && index_chunk != 0) {
-                        ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
-                                                              index_chunk,
-                                                              DS4_N_INDEXER_HEAD_DIM) != 0;
+                        /* P2 Inc3a: single-seq chunk -- FP4 mirror views at the
+                         * matching cache row (index_before), index_chunk rows. */
+                        ds4_gpu_tensor *fp4_rows = NULL;
+                        ds4_gpu_tensor *sc4_rows = NULL;
+                        if (g->layer_index_comp_cache_fp4[il]) {
+                            fp4_rows = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                                    (uint64_t)index_before * DS4_INDEXER_FP4_ROW_BYTES,
+                                    (uint64_t)index_chunk * DS4_INDEXER_FP4_ROW_BYTES);
+                            sc4_rows = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                                    (uint64_t)index_before * DS4_INDEXER_FP4_SCALE_BYTES,
+                                    (uint64_t)index_chunk * DS4_INDEXER_FP4_SCALE_BYTES);
+                            ok = fp4_rows != NULL && sc4_rows != NULL;
+                        }
+                        if (ok) {
+                            ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
+                                                                  index_chunk,
+                                                                  DS4_N_INDEXER_HEAD_DIM,
+                                                                  fp4_rows, sc4_rows) != 0;
+                        }
+                        if (fp4_rows) ds4_gpu_tensor_free(fp4_rows);
+                        if (sc4_rows) ds4_gpu_tensor_free(sc4_rows);
                     }
                     if (ok) {
                         ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -16489,9 +16597,27 @@ static bool metal_graph_encode_layer_attention_batch(
                             if (!index_row_view) {
                                 ok = false;
                             } else {
-                                ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
-                                                                      1,
-                                                                      DS4_N_INDEXER_HEAD_DIM) != 0;
+                                /* P2 Inc3a: single-seq 1-row FP4 mirror views at
+                                 * the matching cache row (index_row). */
+                                ds4_gpu_tensor *fp4_row = NULL;
+                                ds4_gpu_tensor *sc4_row = NULL;
+                                if (g->layer_index_comp_cache_fp4[il]) {
+                                    fp4_row = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                                            (uint64_t)index_row * DS4_INDEXER_FP4_ROW_BYTES,
+                                            DS4_INDEXER_FP4_ROW_BYTES);
+                                    sc4_row = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                                            (uint64_t)index_row * DS4_INDEXER_FP4_SCALE_BYTES,
+                                            DS4_INDEXER_FP4_SCALE_BYTES);
+                                    ok = fp4_row != NULL && sc4_row != NULL;
+                                }
+                                if (ok) {
+                                    ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
+                                                                          1,
+                                                                          DS4_N_INDEXER_HEAD_DIM,
+                                                                          fp4_row, sc4_row) != 0;
+                                }
+                                if (fp4_row) ds4_gpu_tensor_free(fp4_row);
+                                if (sc4_row) ds4_gpu_tensor_free(sc4_row);
                                 ds4_gpu_tensor_free(index_row_view);
                             }
                         }
@@ -16860,7 +16986,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_N_INDEXER_HEAD_DIM,
                                                             index_scale,
                                                             0u,           /* PC5: decode2-exact, legacy n_comp grid */
-                                                            UINT32_MAX    /* PC5: no substrate */) != 0 &&
+                                                            UINT32_MAX,   /* PC5: no substrate */
+                                                            g->layer_index_comp_cache_fp4[il],
+                                                            g->layer_index_comp_scale[il]) != 0 &&
                          ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                                        g->indexer_scores,
                                                        cur_index,
@@ -20844,6 +20972,8 @@ static bool metal_graph_multiseq_emit_selftest(
     ds4_gpu_tensor *saved_istate_sc[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_fp8[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_scale[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index_fp4[DS4_MAX_LAYER];   /* P2 Inc3a: detached FP4 index mirror */
+    ds4_gpu_tensor *saved_index_scale[DS4_MAX_LAYER];
     uint64_t comp_bank_bytes[DS4_MAX_LAYER];
     uint64_t index_bank_bytes[DS4_MAX_LAYER];
     uint64_t astate_bank_bytes[DS4_MAX_LAYER];
@@ -20868,6 +20998,13 @@ static bool metal_graph_multiseq_emit_selftest(
         saved_comp_scale[il] = g->layer_comp_scale[il];
         g->layer_comp_cache_fp8[il] = NULL;
         g->layer_comp_scale[il]     = NULL;
+        /* P2 Inc3a: detach the FP4 index mirror for the same multi-bank
+         * aliasing reason as the FP8 mirror above (no per-bank FP4 slabs in
+         * this selftest); the QAT emit calls run with NULL mirrors. */
+        saved_index_fp4[il]   = g->layer_index_comp_cache_fp4[il];
+        saved_index_scale[il] = g->layer_index_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = NULL;
+        g->layer_index_comp_scale[il]     = NULL;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff = ratio == 4u ? 2u : 1u;
         comp_bank_bytes[il]  = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
@@ -21299,6 +21436,8 @@ static bool metal_graph_multiseq_emit_selftest(
         g->layer_index_state_score[il]= saved_istate_sc[il];
         g->layer_comp_cache_fp8[il]   = saved_comp_fp8[il];
         g->layer_comp_scale[il]       = saved_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = saved_index_fp4[il];   /* P2 Inc3a */
+        g->layer_index_comp_scale[il]     = saved_index_scale[il];
         if (multi_raw[il])   ds4_gpu_tensor_free(multi_raw[il]);
         if (multi_comp[il])  ds4_gpu_tensor_free(multi_comp[il]);
         if (multi_index[il]) ds4_gpu_tensor_free(multi_index[il]);
@@ -21416,6 +21555,8 @@ static bool metal_graph_multiseq_ragged_selftest(
     ds4_gpu_tensor *saved_istate_sc[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_fp8[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_scale[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index_fp4[DS4_MAX_LAYER];   /* P2 Inc3a: detached FP4 index mirror */
+    ds4_gpu_tensor *saved_index_scale[DS4_MAX_LAYER];
     uint64_t comp_bank_bytes[DS4_MAX_LAYER];
     uint64_t index_bank_bytes[DS4_MAX_LAYER];
     uint64_t astate_bank_bytes[DS4_MAX_LAYER];
@@ -21440,6 +21581,13 @@ static bool metal_graph_multiseq_ragged_selftest(
         saved_comp_scale[il] = g->layer_comp_scale[il];
         g->layer_comp_cache_fp8[il] = NULL;
         g->layer_comp_scale[il]     = NULL;
+        /* P2 Inc3a: detach the FP4 index mirror for the same multi-bank
+         * aliasing reason as the FP8 mirror above (no per-bank FP4 slabs in
+         * this selftest); the QAT emit calls run with NULL mirrors. */
+        saved_index_fp4[il]   = g->layer_index_comp_cache_fp4[il];
+        saved_index_scale[il] = g->layer_index_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = NULL;
+        g->layer_index_comp_scale[il]     = NULL;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff = ratio == 4u ? 2u : 1u;
         comp_bank_bytes[il]  = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
@@ -21742,6 +21890,8 @@ static bool metal_graph_multiseq_ragged_selftest(
         g->layer_index_state_score[il] = saved_istate_sc[il];
         g->layer_comp_cache_fp8[il]   = saved_comp_fp8[il];
         g->layer_comp_scale[il]       = saved_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = saved_index_fp4[il];   /* P2 Inc3a */
+        g->layer_index_comp_scale[il]     = saved_index_scale[il];
     }
     #undef RG_BANK_REPOINT
 
@@ -21983,6 +22133,8 @@ static bool metal_graph_multiseq_selftest(
     uint32_t primed_n_index_comp_max[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_fp8[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_scale[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index_fp4[DS4_MAX_LAYER];   /* P2 Inc3a: detached FP4 index mirror */
+    ds4_gpu_tensor *saved_index_scale[DS4_MAX_LAYER];
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         multi[il] = NULL;
         saved_raw[il] = g->layer_raw_cache[il];
@@ -22000,6 +22152,13 @@ static bool metal_graph_multiseq_selftest(
         saved_comp_scale[il] = g->layer_comp_scale[il];
         g->layer_comp_cache_fp8[il] = NULL;
         g->layer_comp_scale[il]     = NULL;
+        /* P2 Inc3a: detach the FP4 index mirror for the same multi-bank
+         * aliasing reason as the FP8 mirror above (no per-bank FP4 slabs in
+         * this selftest); the QAT emit calls run with NULL mirrors. */
+        saved_index_fp4[il]   = g->layer_index_comp_cache_fp4[il];
+        saved_index_scale[il] = g->layer_index_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = NULL;
+        g->layer_index_comp_scale[il]     = NULL;
     }
     bool ok = true;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -22233,6 +22392,8 @@ static bool metal_graph_multiseq_selftest(
         ds4_gpu_tensor_free(multi_index[il]);
         g->layer_comp_cache_fp8[il] = saved_comp_fp8[il];
         g->layer_comp_scale[il]     = saved_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = saved_index_fp4[il];   /* P2 Inc3a */
+        g->layer_index_comp_scale[il]     = saved_index_scale[il];
     }
     g_ds4_shape.n_indexer_top_k = saved_top_k;   /* Step 4b: restore lowered top_k */
     return ok && gate_pass;
@@ -22353,6 +22514,8 @@ static bool metal_graph_multiseq_bench(
     uint32_t primed_n_index_comp_max[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_fp8[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_scale[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index_fp4[DS4_MAX_LAYER];   /* P2 Inc3a: detached FP4 index mirror */
+    ds4_gpu_tensor *saved_index_scale[DS4_MAX_LAYER];
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         multi_raw[il] = multi_comp[il] = multi_index[il] = NULL;
         multi_askv[il] = multi_assc[il] = multi_iskv[il] = multi_issc[il] = NULL;
@@ -22370,6 +22533,13 @@ static bool metal_graph_multiseq_bench(
         saved_comp_scale[il] = g->layer_comp_scale[il];
         g->layer_comp_cache_fp8[il] = NULL;
         g->layer_comp_scale[il]     = NULL;
+        /* P2 Inc3a: detach the FP4 index mirror for the same multi-bank
+         * aliasing reason as the FP8 mirror above (no per-bank FP4 slabs in
+         * this selftest); the QAT emit calls run with NULL mirrors. */
+        saved_index_fp4[il]   = g->layer_index_comp_cache_fp4[il];
+        saved_index_scale[il] = g->layer_index_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = NULL;
+        g->layer_index_comp_scale[il]     = NULL;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff  = ratio == 4u ? 2u : 1u;
         comp_bank_bytes[il]  = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
@@ -22618,6 +22788,8 @@ static bool metal_graph_multiseq_bench(
         g->layer_index_state_score[il]= saved_issc[il];
         g->layer_comp_cache_fp8[il]   = saved_comp_fp8[il];
         g->layer_comp_scale[il]       = saved_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = saved_index_fp4[il];   /* P2 Inc3a */
+        g->layer_index_comp_scale[il]     = saved_index_scale[il];
         if (multi_raw[il])   ds4_gpu_tensor_free(multi_raw[il]);
         if (multi_comp[il])  ds4_gpu_tensor_free(multi_comp[il]);
         if (multi_index[il]) ds4_gpu_tensor_free(multi_index[il]);
@@ -22717,6 +22889,8 @@ static bool metal_graph_multiseq_generate(
     ds4_gpu_tensor *multi_comp_scale[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_fp8[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_scale[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index_fp4[DS4_MAX_LAYER];   /* P2 Inc3a: detached FP4 index mirror */
+    ds4_gpu_tensor *saved_index_scale[DS4_MAX_LAYER];
     uint64_t comp_bank_bytes[DS4_MAX_LAYER];
     uint64_t index_bank_bytes[DS4_MAX_LAYER];
     uint64_t astate_bank_bytes[DS4_MAX_LAYER];
@@ -22736,6 +22910,8 @@ static bool metal_graph_multiseq_generate(
         saved_issc[il]  = g->layer_index_state_score[il];
         saved_comp_fp8[il]   = g->layer_comp_cache_fp8[il];
         saved_comp_scale[il] = g->layer_comp_scale[il];
+        saved_index_fp4[il]   = g->layer_index_comp_cache_fp4[il];   /* P2 Inc3a */
+        saved_index_scale[il] = g->layer_index_comp_scale[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff  = ratio == 4u ? 2u : 1u;
         comp_bank_bytes[il]  = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
@@ -23004,6 +23180,8 @@ static bool metal_graph_multiseq_generate(
         g->layer_index_state_score[il]= saved_issc[il];
         g->layer_comp_cache_fp8[il]   = saved_comp_fp8[il];
         g->layer_comp_scale[il]       = saved_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = saved_index_fp4[il];   /* P2 Inc3a */
+        g->layer_index_comp_scale[il]     = saved_index_scale[il];
         if (multi_raw[il])   ds4_gpu_tensor_free(multi_raw[il]);
         if (multi_comp[il])  ds4_gpu_tensor_free(multi_comp[il]);
         if (multi_index[il]) ds4_gpu_tensor_free(multi_index[il]);
@@ -23062,6 +23240,15 @@ typedef struct {
      * multi_comp; the tiny scale slab stays eager. */
     ds4_gpu_tensor *multi_comp_fp8[DS4_MAX_LAYER];
     ds4_gpu_tensor *multi_comp_scale[DS4_MAX_LAYER];
+    /* P2 Inc3a: per-bank packed FP4 indexer mirror slabs (codes 64 B/row +
+     * scales 16 B/row, bank stride = comp_cap rows -- same row indexing as
+     * multi_index).  Allocated only when DS4_CUDA_FP4_INDEX is on for ratio==4
+     * layers (the serial graph's index mirror exists); repoint installs matching
+     * bank views into g->layer_index_comp_cache_fp4/scale so emit sites stay
+     * offset-coherent with the F32 index views.  Codes are demand-mapped like
+     * multi_index; the tiny scale slab stays eager. */
+    ds4_gpu_tensor *multi_index_fp4[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_index_scale[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_raw[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_index[DS4_MAX_LAYER];
@@ -23071,7 +23258,13 @@ typedef struct {
     ds4_gpu_tensor *saved_issc[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_fp8[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_comp_scale[DS4_MAX_LAYER];
-    ds4_gpu_tensor *cur_views[DS4_MAX_LAYER * 9];
+    /* P2 Inc3a: parallel save slots for the FP4 index mirror (populated like
+     * saved_comp_fp8/scale; restored on free). */
+    ds4_gpu_tensor *saved_index_fp4[DS4_MAX_LAYER];
+    ds4_gpu_tensor *saved_index_scale[DS4_MAX_LAYER];
+    /* Per-layer view budget: raw(1) + comp/askv/assc(3) + fp8 codes/scale(2)
+     * + index/iskv/issc(3) + fp4 index codes/scale(2) = 11. */
+    ds4_gpu_tensor *cur_views[DS4_MAX_LAYER * 11];
     uint32_t        n_cur_views;
     /* S1.1 M3: per-bank in-forward rollback checkpoint slabs, two depths (d=0 -> 1-token prefix,
      * d=1 -> 2-token prefix).  N-bank attn/index state snapshots taken during the verify forward
@@ -23197,6 +23390,8 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
         sl->saved_issc[il]  = g->layer_index_state_score[il];
         sl->saved_comp_fp8[il]   = g->layer_comp_cache_fp8[il];
         sl->saved_comp_scale[il] = g->layer_comp_scale[il];
+        sl->saved_index_fp4[il]   = g->layer_index_comp_cache_fp4[il];   /* P2 Inc3a */
+        sl->saved_index_scale[il] = g->layer_index_comp_scale[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff  = ratio == 4u ? 2u : 1u;
         sl->comp_bank_bytes[il]   = (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float);
@@ -23234,6 +23429,13 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
             sl->multi_iskv[il]  = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
             sl->multi_issc[il]  = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
             ok = sl->multi_index[il] && sl->multi_iskv[il] && sl->multi_issc[il];
+            if (ok && sl->saved_index_fp4[il]) {   /* P2 Inc3a: per-bank FP4 index mirror */
+                sl->multi_index_fp4[il] = ds4_batch_cache_slab_alloc(
+                        (uint64_t)N * g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES, sl->vmm);
+                sl->multi_index_scale[il] = ds4_gpu_tensor_alloc(
+                        (uint64_t)N * g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES);
+                ok = sl->multi_index_fp4[il] && sl->multi_index_scale[il];
+            }
             for (uint32_t d = 0; ok && d < 2u; d++) {   /* M3: per-bank index rollback checkpoints */
                 sl->ckpt_iskv[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
                 sl->ckpt_issc[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
@@ -23250,6 +23452,8 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
             ds4_slab_poison_fill(sl->multi_askv[il]);
             ds4_slab_poison_fill(sl->multi_assc[il]);
             ds4_slab_poison_fill(sl->multi_index[il]);
+            ds4_slab_poison_fill(sl->multi_index_fp4[il]);
+            ds4_slab_poison_fill(sl->multi_index_scale[il]);
             ds4_slab_poison_fill(sl->multi_iskv[il]);
             ds4_slab_poison_fill(sl->multi_issc[il]);
             for (uint32_t d = 0; d < 2u; d++) {
@@ -23346,6 +23550,26 @@ static bool ds4_batch_slabs_repoint(ds4_batch_slabs *sl, ds4_gpu_graph *g,
             sl->cur_views[sl->n_cur_views++] = vi;  g->layer_index_comp_cache[il]  = vi;
             sl->cur_views[sl->n_cur_views++] = vik; g->layer_index_state_kv[il]    = vik;
             sl->cur_views[sl->n_cur_views++] = vis; g->layer_index_state_score[il] = vis;
+            /* P2 Inc3a: matching FP4 index mirror bank views, same bank slicing
+             * as the F32 index view so local row offsets stay coherent across
+             * the QAT emit sites.  When the mirror is off the slabs are NULL and
+             * the graph pointers were NULL already. */
+            if (sl->multi_index_fp4[il]) {
+                const uint64_t f4b = (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
+                const uint64_t sc4b = (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
+                ds4_gpu_tensor *v4 = ds4_gpu_tensor_view(sl->multi_index_fp4[il],
+                        (uint64_t)bank_lo * f4b, (uint64_t)bank_count * f4b);
+                ds4_gpu_tensor *v4s = ds4_gpu_tensor_view(sl->multi_index_scale[il],
+                        (uint64_t)bank_lo * sc4b, (uint64_t)bank_count * sc4b);
+                if (!v4 || !v4s) {
+                    ok = false;
+                    if (v4)  ds4_gpu_tensor_free(v4);
+                    if (v4s) ds4_gpu_tensor_free(v4s);
+                    break;
+                }
+                sl->cur_views[sl->n_cur_views++] = v4;  g->layer_index_comp_cache_fp4[il] = v4;
+                sl->cur_views[sl->n_cur_views++] = v4s; g->layer_index_comp_scale[il]     = v4s;
+            }
         }
     }
     return ok;
@@ -23367,6 +23591,8 @@ static void ds4_batch_slabs_restore(ds4_batch_slabs *sl, ds4_gpu_graph *g) {
         g->layer_index_state_score[il] = sl->saved_issc[il];
         g->layer_comp_cache_fp8[il]    = sl->saved_comp_fp8[il];
         g->layer_comp_scale[il]        = sl->saved_comp_scale[il];
+        g->layer_index_comp_cache_fp4[il] = sl->saved_index_fp4[il];   /* P2 Inc3a */
+        g->layer_index_comp_scale[il]     = sl->saved_index_scale[il];
     }
 }
 
@@ -23383,6 +23609,8 @@ static void ds4_batch_slabs_free(ds4_batch_slabs *sl, ds4_gpu_graph *g) {
         if (sl->multi_issc[il])  ds4_gpu_tensor_free(sl->multi_issc[il]);
         if (sl->multi_comp_fp8[il])   ds4_gpu_tensor_free(sl->multi_comp_fp8[il]);
         if (sl->multi_comp_scale[il]) ds4_gpu_tensor_free(sl->multi_comp_scale[il]);
+        if (sl->multi_index_fp4[il])   ds4_gpu_tensor_free(sl->multi_index_fp4[il]);   /* P2 Inc3a */
+        if (sl->multi_index_scale[il]) ds4_gpu_tensor_free(sl->multi_index_scale[il]);
         for (uint32_t d = 0; d < 2u; d++) {   /* M3: rollback checkpoint slabs */
             if (sl->ckpt_askv[d][il]) ds4_gpu_tensor_free(sl->ckpt_askv[d][il]);
             if (sl->ckpt_assc[d][il]) ds4_gpu_tensor_free(sl->ckpt_assc[d][il]);

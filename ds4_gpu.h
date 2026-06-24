@@ -433,7 +433,13 @@ int ds4_gpu_indexer_score_one_tensor(
          * env var DS4_CUDA_PC5_LEGACY_GRID=1 to force the legacy path
          * for A/B perf measurement. */
         uint32_t                n_comp_max,
-        uint32_t                il);
+        uint32_t                il,
+        /* P2 Inc3: optional packed FP4 indexer mirror (g->layer_index_comp_
+         * cache_fp4[il] / layer_index_comp_scale[il]); the CUDA _direct kernel
+         * reads it bit-identically and arms the read tripwire.  NULL = F32
+         * (Metal accepts + ignores). */
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale);
 
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
@@ -769,17 +775,42 @@ int ds4_gpu_dsv4_fp8_kv_dequant_tensor(
         uint32_t                n_rows,
         uint32_t                head_dim);
 
+/* P2 Inc3: when DS4_CUDA_FP4_INDEX is enabled, `codes_mirror`/`scale_mirror`
+ * are the per-layer packed FP4 indexer mirror tensors
+ * (g->layer_index_comp_cache_fp4[il] / g->layer_index_comp_scale[il]); the QAT
+ * kernel writes the 4-bit e2m1 codes (64 B/row) + per-32-lane block scales
+ * (16 B/row) in addition to its in-place F32 quantisation.  Both NULL when the
+ * feature is off (Metal always passes NULL). */
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
-        uint32_t          head_dim);
+        uint32_t          head_dim,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror);
 
 /* R1 row-variant (Step 4c R1'): writes one row of `base` at the index
  * taken from g_layer_dev[il].index_row. */
 int ds4_gpu_dsv4_indexer_qat_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
-        uint32_t          il);
+        uint32_t          il,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror);
+
+/* P2 Inc3: expand packed FP4 indexer rows back to F32 -- exact inverse of the
+ * encode (bit-identical to indexer_fp4_read).  `codes`/`scale` are views at
+ * the first row to expand; `dst` receives rows [0..n_rows) densely (head_dim
+ * 128).  Used by the fp4-primary host paths (checkpoint save, partial-fork
+ * boundary stash, MTP committed read).  CUDA only -- Metal stub fails loud. */
+int ds4_gpu_dsv4_indexer_fp4_dequant_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *codes,
+        const ds4_gpu_tensor *scale,
+        uint32_t                n_rows,
+        uint32_t                head_dim);
+
+/* P2 Inc3: 1 when DS4_CUDA_FP4_INDEX selects packed FP4 indexer storage. */
+int ds4_cuda_fp4_index_enabled(void);
 
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
