@@ -9014,6 +9014,13 @@ typedef struct {
     uint32_t        ms_emit_keep[DS4_MULTISEQ_MAX_SEQ];
     ds4_gpu_tensor *emit_stash_comp;   /* max_seq x N_LAYER x DS4_N_HEAD_DIM f32 */
     ds4_gpu_tensor *emit_stash_index;  /* max_seq x N_LAYER x DS4_N_INDEXER_HEAD_DIM f32 */
+    /* P2 Inc3b (fp4-primary): the boundary-row stash in CODES space.  The index
+     * QAT applies a Hadamard transform, so it is NOT idempotent on a committed
+     * (post-QAT) row -- dequant+re-encode would corrupt it.  Instead the partial
+     * fork stashes the boundary row's packed codes+scales and restores them
+     * byte-for-byte after the suffix's first emit overwrites the mirror row. */
+    ds4_gpu_tensor *emit_stash_index_fp4;   /* max_seq x N_LAYER x DS4_INDEXER_FP4_ROW_BYTES */
+    ds4_gpu_tensor *emit_stash_index_scale; /* max_seq x N_LAYER x DS4_INDEXER_FP4_SCALE_BYTES */
     /* P2 Inc2b (fp8-primary): grow-only F32 working buffer the eager emit
      * paths target instead of the F32 comp cache when the packed mirror is
      * attached -- the compressor writes rows here, the quantize packs them
@@ -9024,6 +9031,12 @@ typedef struct {
      * cache write). */
     ds4_gpu_tensor *comp_emit_scratch;
     uint64_t        comp_emit_scratch_rows;
+    /* P2 Inc3b: the 128-wide indexer analog (separate from the 512-wide comp
+     * scratch above -- DS4_N_INDEXER_HEAD_DIM != DS4_N_HEAD_DIM).  When the FP4
+     * indexer mirror is attached the F32 index cache is write-dead; the eager
+     * compressor + QAT round-trip emit codes via this scratch. */
+    ds4_gpu_tensor *index_emit_scratch;
+    uint64_t        index_emit_scratch_rows;
     ds4_gpu_tensor *batch_cur_hc;
     ds4_gpu_tensor *batch_next_hc;
     ds4_gpu_tensor *batch_flat_hc;
@@ -9117,6 +9130,9 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->comp_emit_scratch);     /* P2 Inc2b: fp8-primary emit/dequant scratch */
     g->comp_emit_scratch = NULL;
     g->comp_emit_scratch_rows = 0;
+    ds4_gpu_tensor_free(g->index_emit_scratch);    /* P2 Inc3b: fp4-primary index emit/dequant scratch */
+    g->index_emit_scratch = NULL;
+    g->index_emit_scratch_rows = 0;
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
@@ -10360,6 +10376,28 @@ static ds4_gpu_tensor *metal_graph_comp_emit_scratch(ds4_gpu_graph *g, uint64_t 
     if (g->comp_emit_scratch) ds4_gpu_tensor_free(g->comp_emit_scratch);
     g->comp_emit_scratch = nt;
     g->comp_emit_scratch_rows = need;
+    return nt;
+}
+
+/* P2 Inc3b: the 128-wide indexer analog of metal_graph_comp_emit_scratch.  With
+ * the FP4 mirror attached the F32 index cache is write-dead -- the eager
+ * compressor + QAT round-trip run here (codes land in the resident FP4 view the
+ * caller built at the absolute row), so the F32 index VMM bank stays at zero
+ * resident pages.  Separate buffer because DS4_N_INDEXER_HEAD_DIM (128) is a
+ * quarter of DS4_N_HEAD_DIM (512). */
+static ds4_gpu_tensor *metal_graph_index_emit_scratch(ds4_gpu_graph *g, uint64_t rows) {
+    const uint64_t need = rows ? rows : 1u;
+    if (g->index_emit_scratch && g->index_emit_scratch_rows >= need)
+        return g->index_emit_scratch;
+    ds4_gpu_tensor *nt = ds4_gpu_tensor_alloc(need * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    if (!nt) {
+        fprintf(stderr, "ds4: fp4-primary index emit scratch alloc failed (%llu rows)\n",
+                (unsigned long long)need);
+        return NULL;
+    }
+    if (g->index_emit_scratch) ds4_gpu_tensor_free(g->index_emit_scratch);
+    g->index_emit_scratch = nt;
+    g->index_emit_scratch_rows = need;
     return nt;
 }
 
@@ -14855,8 +14893,10 @@ static bool ms_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t seq,
     /* P2 Inc2b: fp8-primary -- the F32 cache row is write-dead, so the
      * restore is purely a mirror re-encode from the stash (below).  Copying
      * into the cache would needlessly demand-map a bank page. */
-    const bool fp8_primary = !indexer && g->layer_comp_cache_fp8[il] != NULL;
-    if (!fp8_primary &&
+    /* P2 Inc3b: generalize the write-dead gate to the indexer's FP4 mirror. */
+    const bool primary_packed = indexer ? (g->layer_index_comp_cache_fp4[il] != NULL)
+                                         : (g->layer_comp_cache_fp8[il] != NULL);
+    if (!primary_packed &&
         ds4_gpu_tensor_copy(cache,
                             ((uint64_t)seq * g->layer_comp_cap[il] + row0) * hd * sizeof(float),
                             stash,
@@ -14890,6 +14930,25 @@ static bool ms_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t seq,
         ds4_gpu_tensor_free(crow);
         if (!ok) {
             fprintf(stderr, "ds4: partial-fork boundary-row fp8 refresh failed at layer %u seq %u\n", il, seq);
+            return false;
+        }
+    }
+    /* P2 Inc3b: the indexer FP4 analog -- the suffix's first emit rewrote the
+     * boundary row's codes, so restore them from the codes stash byte-for-byte
+     * (the QAT is not idempotent on a committed post-Hadamard row). */
+    if (indexer && g->layer_index_comp_cache_fp4[il]) {
+        const uint64_t mrow = (uint64_t)seq * g->layer_comp_cap[il] + row0;
+        if (ds4_gpu_tensor_copy(g->layer_index_comp_cache_fp4[il],
+                                mrow * DS4_INDEXER_FP4_ROW_BYTES,
+                                g->emit_stash_index_fp4,
+                                ((uint64_t)seq * DS4_N_LAYER + il) * DS4_INDEXER_FP4_ROW_BYTES,
+                                (uint64_t)DS4_INDEXER_FP4_ROW_BYTES) == 0 ||
+            ds4_gpu_tensor_copy(g->layer_index_comp_scale[il],
+                                mrow * DS4_INDEXER_FP4_SCALE_BYTES,
+                                g->emit_stash_index_scale,
+                                ((uint64_t)seq * DS4_N_LAYER + il) * DS4_INDEXER_FP4_SCALE_BYTES,
+                                (uint64_t)DS4_INDEXER_FP4_SCALE_BYTES) == 0) {
+            fprintf(stderr, "ds4: partial-fork boundary-row fp4 restore failed at layer %u seq %u\n", il, seq);
             return false;
         }
     }
@@ -16153,19 +16212,29 @@ static bool metal_graph_encode_layer_attention_batch(
                         const uint32_t mpos0 = (uint32_t)g->ms_positions[t];
                         const uint32_t index_before = g->ms_n_index_comp[seq][il];
                         const uint32_t index_chunk = f2_mid / ratio;
+                        /* P2 Inc3b: write-dead F32 cache when the FP4 mirror is on. */
+                        const bool fp4_primary = g->layer_index_comp_cache_fp4[il] != NULL;
+                        ds4_gpu_tensor *idx_emit = NULL;
                         if (index_before + index_chunk > g->layer_comp_cap[il]) {
                             fprintf(stderr, "ds4: FB2 multi-seq indexer cache capacity exceeded at layer %u seq %u\n", il, seq);
                             ok = false;
                             break;
                         }
-                        if (!metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
+                        if (fp4_primary && index_chunk != 0u) {
+                            idx_emit = metal_graph_index_emit_scratch(g, index_chunk);
+                            if (!idx_emit) { ok = false; break; }
+                        }
+                        if (!fp4_primary && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
                                 (uint64_t)seq * g->layer_comp_cap[il] + index_before, index_chunk,
                                 (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                 "FB2 multi-seq indexer emit", il)) {
                             ok = false;
                             break;
                         }
-                        ds4_gpu_tensor *index_view = ds4_gpu_tensor_view(
+                        ds4_gpu_tensor *index_view = (fp4_primary && idx_emit)
+                            ? ds4_gpu_tensor_view(idx_emit, 0,
+                                (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float))
+                            : ds4_gpu_tensor_view(
                                 g->layer_index_comp_cache[il],
                                 ((uint64_t)seq * g->layer_comp_cap[il] + index_before) * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                 (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
@@ -16204,13 +16273,25 @@ static bool metal_graph_encode_layer_attention_batch(
                             ds4_gpu_tensor *sc4_rows = NULL;
                             if (g->layer_index_comp_cache_fp4[il]) {
                                 const uint64_t mrow0 = (uint64_t)seq * g->layer_comp_cap[il] + index_before;
-                                fp4_rows = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
-                                        mrow0 * DS4_INDEXER_FP4_ROW_BYTES,
-                                        (uint64_t)index_chunk * DS4_INDEXER_FP4_ROW_BYTES);
-                                sc4_rows = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
-                                        mrow0 * DS4_INDEXER_FP4_SCALE_BYTES,
-                                        (uint64_t)index_chunk * DS4_INDEXER_FP4_SCALE_BYTES);
-                                ok = fp4_rows != NULL && sc4_rows != NULL;
+                                /* P2 Inc3b: map the demand-mapped mirror pages the
+                                 * QAT is about to write (the bank-view is a VMM
+                                 * reservation; codes slab is demand-mapped, scale
+                                 * slab is eager and no-ops here). */
+                                ok = metal_graph_cache_ensure_rows(g->layer_index_comp_cache_fp4[il],
+                                         mrow0, index_chunk, DS4_INDEXER_FP4_ROW_BYTES,
+                                         "fp4 index emit", il) &&
+                                     metal_graph_cache_ensure_rows(g->layer_index_comp_scale[il],
+                                         mrow0, index_chunk, DS4_INDEXER_FP4_SCALE_BYTES,
+                                         "fp4 index scale emit", il);
+                                if (ok) {
+                                    fp4_rows = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                                            mrow0 * DS4_INDEXER_FP4_ROW_BYTES,
+                                            (uint64_t)index_chunk * DS4_INDEXER_FP4_ROW_BYTES);
+                                    sc4_rows = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                                            mrow0 * DS4_INDEXER_FP4_SCALE_BYTES,
+                                            (uint64_t)index_chunk * DS4_INDEXER_FP4_SCALE_BYTES);
+                                    ok = fp4_rows != NULL && sc4_rows != NULL;
+                                }
                             }
                             if (ok) {
                                 ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
@@ -16249,12 +16330,21 @@ static bool metal_graph_encode_layer_attention_batch(
                     const uint32_t pos = (uint32_t)g->ms_positions[t];
                     const bool emit = ((pos + 1u) % ratio) == 0u;
                     const uint32_t index_row_local = g->ms_n_index_comp[seq][il];
+                    /* P2 Inc3b: write-dead F32 cache when the FP4 mirror is on --
+                     * the cont-decode emit (this site) round-trips one row in the
+                     * scratch so the per-bank F32 index slab stays zero resident. */
+                    const bool fp4_primary = g->layer_index_comp_cache_fp4[il] != NULL;
+                    ds4_gpu_tensor *idx_emit = NULL;
                     if (emit && index_row_local >= g->layer_comp_cap[il]) {
                         fprintf(stderr, "ds4: Step 4d multi-seq indexer cache capacity exceeded at layer %u seq %u\n", il, seq);
                         ok = false;
                         break;
                     }
-                    if (emit && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
+                    if (fp4_primary) {
+                        idx_emit = metal_graph_index_emit_scratch(g, 1u);
+                        if (!idx_emit) { ok = false; break; }
+                    }
+                    if (emit && !fp4_primary && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
                             (uint64_t)seq * g->layer_comp_cap[il] + index_row_local, 1u,
                             (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                             "multi-seq indexer emit", il)) {
@@ -16268,12 +16358,17 @@ static bool metal_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor *st_sc = ds4_gpu_tensor_view(g->layer_index_state_score[il],
                                                                 (uint64_t)seq * istate_stride, istate_stride);
                     const uint32_t index_row_global = seq * g->layer_comp_cap[il] + index_row_local;
+                    /* P2 Inc3b: redirect the compressor's row write to the scratch
+                     * (row 0) when fp4-primary; codes land at the absolute row via
+                     * the FP4 mirror views below. */
+                    ds4_gpu_tensor *idx_ct = fp4_primary ? idx_emit : g->layer_index_comp_cache[il];
+                    const uint32_t idx_wrow = fp4_primary ? 0u : index_row_global;
                     ok = kv_view && sc_view && st_kv && st_sc &&
                          ds4_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
                                                             st_kv,
                                                             st_sc,
-                                                            g->layer_index_comp_cache[il],
+                                                            idx_ct,
                                                             model->map,
                                                             model->size,
                                                             layer->indexer_compressor_ape->abs_offset,
@@ -16283,7 +16378,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_N_INDEXER_HEAD_DIM,
                                                             ratio,
                                                             pos,
-                                                            index_row_global,
+                                                            idx_wrow,
                                                             DS4_N_ROT,
                                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                             freq_base,
@@ -16308,16 +16403,26 @@ static bool metal_graph_encode_layer_attention_batch(
                             ds4_gpu_tensor *fp4_row = NULL;
                             ds4_gpu_tensor *sc4_row = NULL;
                             if (g->layer_index_comp_cache_fp4[il]) {
-                                fp4_row = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
-                                        (uint64_t)index_row_global * DS4_INDEXER_FP4_ROW_BYTES,
-                                        DS4_INDEXER_FP4_ROW_BYTES);
-                                sc4_row = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
-                                        (uint64_t)index_row_global * DS4_INDEXER_FP4_SCALE_BYTES,
-                                        DS4_INDEXER_FP4_SCALE_BYTES);
-                                ok = fp4_row != NULL && sc4_row != NULL;
+                                /* P2 Inc3b: map the demand-mapped mirror row before the QAT writes. */
+                                ok = metal_graph_cache_ensure_rows(g->layer_index_comp_cache_fp4[il],
+                                         (uint64_t)index_row_global, 1u, DS4_INDEXER_FP4_ROW_BYTES,
+                                         "fp4 index emit", il) &&
+                                     metal_graph_cache_ensure_rows(g->layer_index_comp_scale[il],
+                                         (uint64_t)index_row_global, 1u, DS4_INDEXER_FP4_SCALE_BYTES,
+                                         "fp4 index scale emit", il);
+                                if (ok) {
+                                    fp4_row = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                                            (uint64_t)index_row_global * DS4_INDEXER_FP4_ROW_BYTES,
+                                            DS4_INDEXER_FP4_ROW_BYTES);
+                                    sc4_row = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                                            (uint64_t)index_row_global * DS4_INDEXER_FP4_SCALE_BYTES,
+                                            DS4_INDEXER_FP4_SCALE_BYTES);
+                                    ok = fp4_row != NULL && sc4_row != NULL;
+                                }
                             }
                             if (ok) {
-                                ok = ds4_gpu_dsv4_indexer_qat_tensor(row_view, 1, DS4_N_INDEXER_HEAD_DIM,
+                                ok = ds4_gpu_dsv4_indexer_qat_tensor(fp4_primary ? idx_emit : row_view,
+                                                                      1, DS4_N_INDEXER_HEAD_DIM,
                                                                       fp4_row, sc4_row) != 0;
                             }
                             if (fp4_row) ds4_gpu_tensor_free(fp4_row);
@@ -16354,16 +16459,27 @@ static bool metal_graph_encode_layer_attention_batch(
                     g->layer_n_index_comp[il] = mx;
                 }
             } else if (zero_prefix) {
+                /* P2 Inc3b: FP4 mirror attached -> the F32 index cache is
+                 * write-dead; the compressor + QAT round-trip in the 128-wide
+                 * scratch and codes land in the resident FP4 base [0..n_comp),
+                 * so the F32 index VMM bank stays at zero resident pages. */
+                const bool fp4_primary = g->layer_index_comp_cache_fp4[il] != NULL;
+                ds4_gpu_tensor *idx_emit = NULL;
                 if (ok && n_comp > g->layer_comp_cap[il]) {
                     fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                if (ok && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
+                if (ok && fp4_primary) {
+                    idx_emit = metal_graph_index_emit_scratch(g, n_comp ? n_comp : 1u);
+                    if (!idx_emit) ok = false;
+                }
+                if (ok && !fp4_primary && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
                         0u, n_comp, (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                         "indexer prefill", il))
                     ok = false;
+                ds4_gpu_tensor *idx_target = fp4_primary ? idx_emit : g->layer_index_comp_cache[il];
                 if (ok) {
-                    ok = ds4_gpu_compressor_prefill_tensor(g->layer_index_comp_cache[il],
+                    ok = ds4_gpu_compressor_prefill_tensor(idx_target,
                                                              g->layer_index_state_kv[il],
                                                              g->layer_index_state_score[il],
                                                              g->batch_comp_kv,
@@ -16393,10 +16509,18 @@ static bool metal_graph_encode_layer_attention_batch(
                                                              NULL) != 0;
                 }
                 if (ok && n_comp != 0) {
+                    /* P2 Inc3b: map the demand-mapped mirror rows [0..n_comp) the
+                     * QAT is about to write (codes slab is VMM; scale is eager). */
+                    if (g->layer_index_comp_cache_fp4[il]) {
+                        ok = metal_graph_cache_ensure_rows(g->layer_index_comp_cache_fp4[il],
+                                 0, n_comp, DS4_INDEXER_FP4_ROW_BYTES, "fp4 index emit", il) &&
+                             metal_graph_cache_ensure_rows(g->layer_index_comp_scale[il],
+                                 0, n_comp, DS4_INDEXER_FP4_SCALE_BYTES, "fp4 index scale emit", il);
+                    }
                     /* P2 Inc3a: serial prefill writes rows [0..n_comp) from the
                      * cache base; pass the whole FP4 mirror buffers (NULL when
                      * the feature is off).  Same shape as the FP8 prefill emit. */
-                    ok = ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
+                    if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(idx_target,
                                                           n_comp,
                                                           DS4_N_INDEXER_HEAD_DIM,
                                                           g->layer_index_comp_cache_fp4[il],
@@ -16443,18 +16567,30 @@ static bool metal_graph_encode_layer_attention_batch(
                 if (aligned_chunk) {
                     const uint32_t index_before = g->layer_n_index_comp[il];
                     const uint32_t index_chunk = n_tokens / ratio;
+                    /* P2 Inc3b: write-dead F32 cache when the FP4 mirror is on --
+                     * the compressor + QAT round-trip in the scratch view, codes
+                     * land in the resident FP4 view at index_before. */
+                    const bool fp4_primary = g->layer_index_comp_cache_fp4[il] != NULL;
+                    ds4_gpu_tensor *idx_emit = NULL;
                     if (index_before + index_chunk > g->layer_comp_cap[il]) {
                         fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                     }
-                    if (ok && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
+                    if (ok && fp4_primary && index_chunk != 0u) {
+                        idx_emit = metal_graph_index_emit_scratch(g, index_chunk);
+                        if (!idx_emit) ok = false;
+                    }
+                    if (ok && !fp4_primary && !metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
                             index_before, index_chunk,
                             (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                             "indexer chunk emit", il))
                         ok = false;
                     ds4_gpu_tensor *index_view = NULL;
                     if (ok) {
-                        index_view = ds4_gpu_tensor_view(
+                        index_view = (fp4_primary && idx_emit)
+                            ? ds4_gpu_tensor_view(idx_emit, 0,
+                                (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float))
+                            : ds4_gpu_tensor_view(
                                 g->layer_index_comp_cache[il],
                                 (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                 (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
@@ -16496,13 +16632,22 @@ static bool metal_graph_encode_layer_attention_batch(
                         ds4_gpu_tensor *fp4_rows = NULL;
                         ds4_gpu_tensor *sc4_rows = NULL;
                         if (g->layer_index_comp_cache_fp4[il]) {
-                            fp4_rows = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
-                                    (uint64_t)index_before * DS4_INDEXER_FP4_ROW_BYTES,
-                                    (uint64_t)index_chunk * DS4_INDEXER_FP4_ROW_BYTES);
-                            sc4_rows = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
-                                    (uint64_t)index_before * DS4_INDEXER_FP4_SCALE_BYTES,
-                                    (uint64_t)index_chunk * DS4_INDEXER_FP4_SCALE_BYTES);
-                            ok = fp4_rows != NULL && sc4_rows != NULL;
+                            /* P2 Inc3b: map the demand-mapped mirror rows before the QAT writes. */
+                            ok = metal_graph_cache_ensure_rows(g->layer_index_comp_cache_fp4[il],
+                                     index_before, index_chunk, DS4_INDEXER_FP4_ROW_BYTES,
+                                     "fp4 index emit", il) &&
+                                 metal_graph_cache_ensure_rows(g->layer_index_comp_scale[il],
+                                     index_before, index_chunk, DS4_INDEXER_FP4_SCALE_BYTES,
+                                     "fp4 index scale emit", il);
+                            if (ok) {
+                                fp4_rows = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                                        (uint64_t)index_before * DS4_INDEXER_FP4_ROW_BYTES,
+                                        (uint64_t)index_chunk * DS4_INDEXER_FP4_ROW_BYTES);
+                                sc4_rows = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                                        (uint64_t)index_before * DS4_INDEXER_FP4_SCALE_BYTES,
+                                        (uint64_t)index_chunk * DS4_INDEXER_FP4_SCALE_BYTES);
+                                ok = fp4_rows != NULL && sc4_rows != NULL;
+                            }
                         }
                         if (ok) {
                             ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
@@ -16562,12 +16707,22 @@ static bool metal_graph_encode_layer_attention_batch(
                         ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
                         ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
                         const uint32_t index_row = g->layer_n_index_comp[il];
-                        ok = kv_view && sc_view &&
+                        /* P2 Inc3b: write-dead F32 cache when the FP4 mirror is on
+                         * -- round-trip one row in the scratch, codes at index_row. */
+                        const bool fp4_primary = g->layer_index_comp_cache_fp4[il] != NULL;
+                        ds4_gpu_tensor *idx_emit = NULL;
+                        if (fp4_primary) {
+                            idx_emit = metal_graph_index_emit_scratch(g, 1u);
+                            if (!idx_emit) ok = false;
+                        }
+                        ds4_gpu_tensor *idx_ct = fp4_primary ? idx_emit : g->layer_index_comp_cache[il];
+                        const uint32_t idx_wrow = fp4_primary ? 0u : index_row;
+                        ok = ok && kv_view && sc_view &&
                              ds4_gpu_compressor_update_tensor(kv_view,
                                                                 sc_view,
                                                                 g->layer_index_state_kv[il],
                                                                 g->layer_index_state_score[il],
-                                                                g->layer_index_comp_cache[il],
+                                                                idx_ct,
                                                                 model->map,
                                                                 model->size,
                                                                 layer->indexer_compressor_ape->abs_offset,
@@ -16577,7 +16732,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_N_INDEXER_HEAD_DIM,
                                                                 ratio,
                                                                 pos,
-                                                                index_row,
+                                                                idx_wrow,
                                                                 DS4_N_ROT,
                                                                 compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                                 freq_base,
@@ -16602,16 +16757,25 @@ static bool metal_graph_encode_layer_attention_batch(
                                 ds4_gpu_tensor *fp4_row = NULL;
                                 ds4_gpu_tensor *sc4_row = NULL;
                                 if (g->layer_index_comp_cache_fp4[il]) {
-                                    fp4_row = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
-                                            (uint64_t)index_row * DS4_INDEXER_FP4_ROW_BYTES,
-                                            DS4_INDEXER_FP4_ROW_BYTES);
-                                    sc4_row = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
-                                            (uint64_t)index_row * DS4_INDEXER_FP4_SCALE_BYTES,
-                                            DS4_INDEXER_FP4_SCALE_BYTES);
-                                    ok = fp4_row != NULL && sc4_row != NULL;
+                                    /* P2 Inc3b: map the demand-mapped mirror row before the QAT writes. */
+                                    ok = metal_graph_cache_ensure_rows(g->layer_index_comp_cache_fp4[il],
+                                             index_row, 1u, DS4_INDEXER_FP4_ROW_BYTES,
+                                             "fp4 index emit", il) &&
+                                         metal_graph_cache_ensure_rows(g->layer_index_comp_scale[il],
+                                             index_row, 1u, DS4_INDEXER_FP4_SCALE_BYTES,
+                                             "fp4 index scale emit", il);
+                                    if (ok) {
+                                        fp4_row = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                                                (uint64_t)index_row * DS4_INDEXER_FP4_ROW_BYTES,
+                                                DS4_INDEXER_FP4_ROW_BYTES);
+                                        sc4_row = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                                                (uint64_t)index_row * DS4_INDEXER_FP4_SCALE_BYTES,
+                                                DS4_INDEXER_FP4_SCALE_BYTES);
+                                        ok = fp4_row != NULL && sc4_row != NULL;
+                                    }
                                 }
                                 if (ok) {
-                                    ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
+                                    ok = ds4_gpu_dsv4_indexer_qat_tensor(fp4_primary ? idx_emit : index_row_view,
                                                                           1,
                                                                           DS4_N_INDEXER_HEAD_DIM,
                                                                           fp4_row, sc4_row) != 0;
@@ -16685,7 +16849,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                   g->layer_comp_cap[il],
                                                                   seq_positions, seq_id,
                                                                   admit_single_run
-                                                                      ? (uint32_t)g->ms_seq_id[0] : UINT32_MAX) != 0;
+                                                                      ? (uint32_t)g->ms_seq_id[0] : UINT32_MAX,
+                                                                  /* P2 Inc3b: FP4 indexer mirror */
+                                                                  g->layer_index_comp_cache_fp4[il],
+                                                                  g->layer_index_comp_scale[il]) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                     il,
@@ -16832,7 +16999,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          DS4_N_INDEXER_HEAD,
                                                          DS4_N_INDEXER_HEAD_DIM,
                                                          ratio,
-                                                         index_scale) != 0;
+                                                         index_scale,
+                                                         /* P2 Inc3b: FP4 indexer mirror */
+                                                         g->layer_index_comp_cache_fp4[il],
+                                                         g->layer_index_comp_scale[il]) != 0;
             if (ok && index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                 il,
@@ -22891,16 +23061,23 @@ static bool metal_graph_multiseq_generate(
     ds4_gpu_tensor *saved_comp_scale[DS4_MAX_LAYER];
     ds4_gpu_tensor *saved_index_fp4[DS4_MAX_LAYER];   /* P2 Inc3a: detached FP4 index mirror */
     ds4_gpu_tensor *saved_index_scale[DS4_MAX_LAYER];
+    /* P2 Inc3b: REAL per-bank FP4 index mirror -- like multi_comp_fp8, so the
+     * batched-decode FP4 read and the Step 4d FP4 emits are exercised here. */
+    ds4_gpu_tensor *multi_index_fp4[DS4_MAX_LAYER];
+    ds4_gpu_tensor *multi_index_scale[DS4_MAX_LAYER];
     uint64_t comp_bank_bytes[DS4_MAX_LAYER];
     uint64_t index_bank_bytes[DS4_MAX_LAYER];
     uint64_t astate_bank_bytes[DS4_MAX_LAYER];
     uint64_t istate_bank_bytes[DS4_MAX_LAYER];
     uint64_t fp8_bank_bytes[DS4_MAX_LAYER];
     uint64_t fp8s_bank_bytes[DS4_MAX_LAYER];
+    uint64_t idx4_bank_bytes[DS4_MAX_LAYER];   /* P2 Inc3b */
+    uint64_t idxs4_bank_bytes[DS4_MAX_LAYER];
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         multi_raw[il] = multi_comp[il] = multi_index[il] = NULL;
         multi_askv[il] = multi_assc[il] = multi_iskv[il] = multi_issc[il] = NULL;
         multi_comp_fp8[il] = multi_comp_scale[il] = NULL;
+        multi_index_fp4[il] = multi_index_scale[il] = NULL;   /* P2 Inc3b */
         saved_raw[il]   = g->layer_raw_cache[il];
         saved_comp[il]  = g->layer_attn_comp_cache[il];
         saved_index[il] = g->layer_index_comp_cache[il];
@@ -22922,6 +23099,8 @@ static bool metal_graph_multiseq_generate(
                                 (uint64_t)(coff * DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
         fp8_bank_bytes[il]  = (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES;
         fp8s_bank_bytes[il] = (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_SCALE_BYTES;
+        idx4_bank_bytes[il]  = (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;   /* P2 Inc3b */
+        idxs4_bank_bytes[il] = (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
     }
     bool ok = true;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -22944,6 +23123,11 @@ static bool metal_graph_multiseq_generate(
             multi_iskv[il]  = ds4_gpu_tensor_alloc((uint64_t)N * istate_bank_bytes[il]);
             multi_issc[il]  = ds4_gpu_tensor_alloc((uint64_t)N * istate_bank_bytes[il]);
             ok = multi_index[il] != NULL && multi_iskv[il] != NULL && multi_issc[il] != NULL;
+            if (ok && saved_index_fp4[il]) {   /* P2 Inc3b: REAL per-bank FP4 mirror */
+                multi_index_fp4[il]   = ds4_gpu_tensor_alloc((uint64_t)N * idx4_bank_bytes[il]);
+                multi_index_scale[il] = ds4_gpu_tensor_alloc((uint64_t)N * idxs4_bank_bytes[il]);
+                ok = multi_index_fp4[il] != NULL && multi_index_scale[il] != NULL;
+            }
         }
     }
 
@@ -22986,11 +23170,18 @@ static bool metal_graph_multiseq_generate(
                 (vbuf)[(vn)++] = vi;  g->layer_index_comp_cache[il]  = vi;                          \
                 (vbuf)[(vn)++] = vik; g->layer_index_state_kv[il]    = vik;                         \
                 (vbuf)[(vn)++] = vis; g->layer_index_state_score[il] = vis;                         \
+                if (multi_index_fp4[il]) {  /* P2 Inc3b */                                          \
+                    ds4_gpu_tensor *v4  = ds4_gpu_tensor_view(multi_index_fp4[il], (uint64_t)(sb) * idx4_bank_bytes[il], idx4_bank_bytes[il]); \
+                    ds4_gpu_tensor *v4s = ds4_gpu_tensor_view(multi_index_scale[il], (uint64_t)(sb) * idxs4_bank_bytes[il], idxs4_bank_bytes[il]); \
+                    if (!v4 || !v4s) { ok = false; if (v4) ds4_gpu_tensor_free(v4); if (v4s) ds4_gpu_tensor_free(v4s); break; } \
+                    (vbuf)[(vn)++] = v4;  g->layer_index_comp_cache_fp4[il] = v4;                   \
+                    (vbuf)[(vn)++] = v4s; g->layer_index_comp_scale[il]     = v4s;                  \
+                }                                                                                  \
             }                                                                                      \
         }                                                                                          \
     } while (0)
 
-    ds4_gpu_tensor *gviews[DS4_MAX_LAYER * 9];
+    ds4_gpu_tensor *gviews[DS4_MAX_LAYER * 11];
     uint32_t nv = 0;
 
     /* --- prefill the prompt into each bank; seed cur[s] from its last-token
@@ -23028,7 +23219,7 @@ static bool metal_graph_multiseq_generate(
     }
 
     /* --- repoint caches at the FULL N-bank slabs for batched decode. --- */
-    ds4_gpu_tensor *full[DS4_MAX_LAYER * 9];
+    ds4_gpu_tensor *full[DS4_MAX_LAYER * 11];   /* P2 Inc3b: +2 FP4 views/layer */
     uint32_t nf = 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor *vr = ds4_gpu_tensor_view(multi_raw[il], 0, (uint64_t)N * raw_bank_bytes);
@@ -23058,6 +23249,13 @@ static bool metal_graph_multiseq_generate(
             full[nf++] = vi;  g->layer_index_comp_cache[il]  = vi;
             full[nf++] = vik; g->layer_index_state_kv[il]    = vik;
             full[nf++] = vis; g->layer_index_state_score[il] = vis;
+            if (multi_index_fp4[il]) {  /* P2 Inc3b */
+                ds4_gpu_tensor *v4  = ds4_gpu_tensor_view(multi_index_fp4[il], 0, (uint64_t)N * idx4_bank_bytes[il]);
+                ds4_gpu_tensor *v4s = ds4_gpu_tensor_view(multi_index_scale[il], 0, (uint64_t)N * idxs4_bank_bytes[il]);
+                if (!v4 || !v4s) { ok = false; if (v4) ds4_gpu_tensor_free(v4); if (v4s) ds4_gpu_tensor_free(v4s); break; }
+                full[nf++] = v4;  g->layer_index_comp_cache_fp4[il] = v4;
+                full[nf++] = v4s; g->layer_index_comp_scale[il]     = v4s;
+            }
         }
     }
 
@@ -23191,6 +23389,8 @@ static bool metal_graph_multiseq_generate(
         if (multi_issc[il])  ds4_gpu_tensor_free(multi_issc[il]);
         if (multi_comp_fp8[il])   ds4_gpu_tensor_free(multi_comp_fp8[il]);
         if (multi_comp_scale[il]) ds4_gpu_tensor_free(multi_comp_scale[il]);
+        if (multi_index_fp4[il])   ds4_gpu_tensor_free(multi_index_fp4[il]);   /* P2 Inc3b */
+        if (multi_index_scale[il]) ds4_gpu_tensor_free(multi_index_scale[il]);
     }
     if (logits) free(logits);
     if (gen)    free(gen);
@@ -25949,14 +26149,38 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_index_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+            if (g->layer_index_comp_cache_fp4[il] && g->layer_n_index_comp[il] != 0u) {
+                /* P2 Inc3b: fp4-primary -- the F32 index rows are unwritten;
+                 * expand the packed rows into the index scratch and persist that
+                 * (file format stays F32, bit-identical save/load round-trip). */
+                const uint32_t irows = g->layer_n_index_comp[il];
+                ds4_gpu_tensor *stg = metal_graph_index_emit_scratch(g, irows);
+                ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                        0, (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES) : NULL;
+                ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                        0, (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES) : NULL;
+                if (!codes || !scale ||
+                    ds4_gpu_dsv4_indexer_fp4_dequant_tensor(stg, codes, scale,
+                                                       irows, DS4_N_INDEXER_HEAD_DIM) == 0) {
+                    payload_set_err(err, errlen, "fp4 index expand for save failed");
+                    rc = 1;
+                } else {
+                    rc = payload_write_tensor_span(fp, stg, 0,
+                                                   (uint64_t)irows * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                                   buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                }
+                ds4_gpu_tensor_free(scale);
+                ds4_gpu_tensor_free(codes);
+            } else {
+                rc = payload_write_tensor_span(fp,
+                                               g->layer_index_comp_cache[il],
+                                               0,
+                                               (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                               buf,
+                                               DS4_SESSION_IO_CHUNK,
+                                               err,
+                                               errlen);
+            }
             if (rc == 0) rc = payload_write_tensor_span(fp,
                                                         g->layer_index_state_kv[il],
                                                         0,
@@ -26186,6 +26410,27 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                           &remaining,
                                           err,
                                           errlen);
+            /* P2 Inc3b: regenerate the FP4 mirror from the restored F32 rows
+             * (the file stores F32; a stale mirror would serve pre-restore codes
+             * to the scorers).  The committed rows are post-QAT values, so the
+             * no-Hadamard encode reproduces them value-bit-exact. */
+            if (rc == 0 && g->layer_index_comp_cache_fp4[il] && n_index_comp[i] != 0u) {
+                ds4_gpu_tensor *irows_v = ds4_gpu_tensor_view(g->layer_index_comp_cache[il], 0,
+                        (uint64_t)n_index_comp[i] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il], 0,
+                        (uint64_t)n_index_comp[i] * DS4_INDEXER_FP4_ROW_BYTES);
+                ds4_gpu_tensor *scale = ds4_gpu_tensor_view(g->layer_index_comp_scale[il], 0,
+                        (uint64_t)n_index_comp[i] * DS4_INDEXER_FP4_SCALE_BYTES);
+                if (!irows_v || !codes || !scale ||
+                    ds4_gpu_dsv4_indexer_fp4_encode_tensor(irows_v, codes, scale,
+                                                      n_index_comp[i], DS4_N_INDEXER_HEAD_DIM) == 0) {
+                    payload_set_err(err, errlen, "failed to refresh FP4 index mirror after restore");
+                    rc = 1;
+                }
+                ds4_gpu_tensor_free(scale);
+                ds4_gpu_tensor_free(codes);
+                ds4_gpu_tensor_free(irows_v);
+            }
             if (rc == 0) rc = payload_read_tensor_span(fp,
                                                        g->layer_index_state_kv[il],
                                                        0,
@@ -27716,6 +27961,26 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                           &remaining,
                                           err,
                                           errlen);
+            /* P2 Inc3b: regenerate the FP4 mirror from the restored F32 rows
+             * (no-Hadamard encode of committed post-QAT values; the file stores
+             * F32 only and a stale mirror would serve pre-restore codes). */
+            if (rc == 0 && g->layer_index_comp_cache_fp4[il] && n_index_comp[il] != 0u) {
+                ds4_gpu_tensor *irows_v = ds4_gpu_tensor_view(g->layer_index_comp_cache[il], 0,
+                        (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il], 0,
+                        (uint64_t)n_index_comp[il] * DS4_INDEXER_FP4_ROW_BYTES);
+                ds4_gpu_tensor *scale = ds4_gpu_tensor_view(g->layer_index_comp_scale[il], 0,
+                        (uint64_t)n_index_comp[il] * DS4_INDEXER_FP4_SCALE_BYTES);
+                if (!irows_v || !codes || !scale ||
+                    ds4_gpu_dsv4_indexer_fp4_encode_tensor(irows_v, codes, scale,
+                                                      n_index_comp[il], DS4_N_INDEXER_HEAD_DIM) == 0) {
+                    payload_set_err(err, errlen, "failed to refresh FP4 index mirror after session restore");
+                    rc = 1;
+                }
+                ds4_gpu_tensor_free(scale);
+                ds4_gpu_tensor_free(codes);
+                ds4_gpu_tensor_free(irows_v);
+            }
             if (rc == 0) rc = payload_read_tensor_span(fp,
                                                        g->layer_index_state_kv[il],
                                                        0,
@@ -28285,8 +28550,16 @@ static uint64_t ds4_batch_vmm_floor_per_bank(const ds4_gpu_graph *g) {
             }
         }
         if (ratio == 4u && g->layer_index_comp_cache[il]) {
-            const uint64_t ib = (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-            floor_b += ib < page ? ib : page;
+            /* P2 Inc3b: fp4-primary -- the F32 index slab is write-dead (no first
+             * touch ever happens), so its floor page drops out; only the codes
+             * slab pays a first-touch page. */
+            if (g->layer_index_comp_cache_fp4[il]) {
+                const uint64_t f4 = (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
+                floor_b += f4 < page ? f4 : page;
+            } else {
+                const uint64_t ib = (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                floor_b += ib < page ? ib : page;
+            }
         }
     }
     return floor_b;
@@ -28329,6 +28602,13 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
                                     (uint64_t)(coff * DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
             if (!vmm_comp)
                 per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            /* P2 Inc3b: FP4 mirror -- eager codes only when not demand-mapped
+             * (vmm charges their floor above); the scale slab is always eager. */
+            if (g->layer_index_comp_cache_fp4[il]) {
+                if (!vmm_comp)
+                    per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
+                per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
+            }
             per_bank += 6ull * istate;
         }
     }
@@ -28373,6 +28653,12 @@ static uint64_t ds4_batch_slabs_cache_resident(const ds4_batch_slabs *sl) {
         if (sl->multi_index[il])
             r += ds4_gpu_tensor_resident(sl->multi_index[il], 0,
                                          (uint64_t)sl->N * sl->index_bank_bytes[il]);
+        if (sl->multi_index_fp4[il]) {   /* P2 Inc3b: demand-mapped index codes+scales */
+            r += ds4_gpu_tensor_resident(sl->multi_index_fp4[il], 0,
+                                         ds4_gpu_tensor_bytes(sl->multi_index_fp4[il]));
+            r += ds4_gpu_tensor_resident(sl->multi_index_scale[il], 0,
+                                         ds4_gpu_tensor_bytes(sl->multi_index_scale[il]));
+        }
     }
     return r;
 }
@@ -28410,12 +28696,28 @@ static uint64_t ds4_batch_bank_map_projection(const ds4_batch_ctx *ctx, uint32_t
             const uint64_t res = ds4_gpu_tensor_resident(sl->multi_comp_fp8[il], off, len);
             need += span > res ? span - res : 0;
         }
-        if (sl->multi_index[il]) {
+        /* P2 Inc3b: fp4-primary never maps the F32 index slab -- project it
+         * only when the packed store is absent. */
+        if (sl->multi_index[il] && !sl->multi_index_fp4[il]) {
             const uint64_t off = (uint64_t)b * sl->index_bank_bytes[il];
             const uint64_t len = rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
             const uint64_t span = ((off + len - 1u) / page - off / page + 1u) * page;
             const uint64_t res = ds4_gpu_tensor_resident(sl->multi_index[il], off, len);
             need += span > res ? span - res : 0;
+        }
+        if (sl->multi_index_fp4[il]) {   /* P2 Inc3b: packed codes+scales extent */
+            const uint64_t f4b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
+            const uint64_t off = (uint64_t)b * f4b;
+            const uint64_t len = rows * DS4_INDEXER_FP4_ROW_BYTES;
+            const uint64_t span = ((off + len - 1u) / page - off / page + 1u) * page;
+            const uint64_t res = ds4_gpu_tensor_resident(sl->multi_index_fp4[il], off, len);
+            need += span > res ? span - res : 0;
+            const uint64_t s4b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
+            const uint64_t soff = (uint64_t)b * s4b;
+            const uint64_t slen = rows * DS4_INDEXER_FP4_SCALE_BYTES;
+            const uint64_t sspan = ((soff + slen - 1u) / page - soff / page + 1u) * page;
+            const uint64_t sres = ds4_gpu_tensor_resident(sl->multi_index_scale[il], soff, slen);
+            need += sspan > sres ? sspan - sres : 0;
         }
     }
     return need;
@@ -28586,7 +28888,14 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         (uint64_t)ctx->max_seq * DS4_N_LAYER * DS4_N_HEAD_DIM * sizeof(float));
     ctx->g.emit_stash_index = ds4_gpu_tensor_alloc(
         (uint64_t)ctx->max_seq * DS4_N_LAYER * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-    if (!ctx->g.emit_stash_comp || !ctx->g.emit_stash_index) {
+    /* P2 Inc3b: codes-space boundary stash (tiny; allocated unconditionally so
+     * the fp4-primary restore never depends on admission history). */
+    ctx->g.emit_stash_index_fp4 = ds4_gpu_tensor_alloc(
+        (uint64_t)ctx->max_seq * DS4_N_LAYER * DS4_INDEXER_FP4_ROW_BYTES);
+    ctx->g.emit_stash_index_scale = ds4_gpu_tensor_alloc(
+        (uint64_t)ctx->max_seq * DS4_N_LAYER * DS4_INDEXER_FP4_SCALE_BYTES);
+    if (!ctx->g.emit_stash_comp || !ctx->g.emit_stash_index ||
+        !ctx->g.emit_stash_index_fp4 || !ctx->g.emit_stash_index_scale) {
         BC_ERR("batch ctx: emit-stash alloc failed");
         ds4_batch_ctx_destroy(ctx);
         return 1;
@@ -28612,6 +28921,8 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     ds4_batch_slabs_free(&ctx->sl, &ctx->g);
     if (ctx->g.emit_stash_comp)  { ds4_gpu_tensor_free(ctx->g.emit_stash_comp);  ctx->g.emit_stash_comp = NULL; }
     if (ctx->g.emit_stash_index) { ds4_gpu_tensor_free(ctx->g.emit_stash_index); ctx->g.emit_stash_index = NULL; }
+    if (ctx->g.emit_stash_index_fp4)   { ds4_gpu_tensor_free(ctx->g.emit_stash_index_fp4);   ctx->g.emit_stash_index_fp4 = NULL; }
+    if (ctx->g.emit_stash_index_scale) { ds4_gpu_tensor_free(ctx->g.emit_stash_index_scale); ctx->g.emit_stash_index_scale = NULL; }
     metal_graph_free(&ctx->g);
     free(ctx->bank_hist);
     free(ctx->bank_hist_len);
@@ -28706,14 +29017,33 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
         }
         if (sl->multi_index[il]) {
             const uint64_t ib = (uint64_t)g->ms_n_index_comp[src][il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-            if (ib && ds4_gpu_tensor_ensure(sl->multi_index[il],
+            /* P2 Inc3b: fp4-primary skips the F32 index copy (write-dead slab) --
+             * the codes+scales below carry the bank's rows. */
+            const bool fork_fp4_primary = sl->multi_index_fp4[il] != NULL;
+            if (!fork_fp4_primary && ib && ds4_gpu_tensor_ensure(sl->multi_index[il],
                                             (uint64_t)dst * sl->index_bank_bytes[il], ib) == 0) {
                 fprintf(stderr, "ds4: fork indexer demand-map failed at layer %u\n", il);
                 return false;
             }
-            if (ib && ds4_gpu_tensor_copy(sl->multi_index[il], (uint64_t)dst * sl->index_bank_bytes[il],
+            if (!fork_fp4_primary && ib && ds4_gpu_tensor_copy(sl->multi_index[il], (uint64_t)dst * sl->index_bank_bytes[il],
                                           sl->multi_index[il], (uint64_t)src * sl->index_bank_bytes[il],
                                           ib) == 0) return false;
+            /* P2 Inc3b: the FP4 index mirror rows move with the bank. */
+            if (sl->multi_index_fp4[il] && g->ms_n_index_comp[src][il] != 0u) {
+                const uint64_t f4b = (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
+                const uint64_t s4b = (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
+                const uint64_t f4n = (uint64_t)g->ms_n_index_comp[src][il] * DS4_INDEXER_FP4_ROW_BYTES;
+                const uint64_t s4n = (uint64_t)g->ms_n_index_comp[src][il] * DS4_INDEXER_FP4_SCALE_BYTES;
+                if (ds4_gpu_tensor_ensure(sl->multi_index_fp4[il], (uint64_t)dst * f4b, f4n) == 0) {
+                    fprintf(stderr, "ds4: fork fp4 index demand-map failed at layer %u\n", il);
+                    return false;
+                }
+                if (ds4_gpu_tensor_copy(sl->multi_index_fp4[il], (uint64_t)dst * f4b,
+                                        sl->multi_index_fp4[il], (uint64_t)src * f4b, f4n) == 0 ||
+                    ds4_gpu_tensor_copy(sl->multi_index_scale[il], (uint64_t)dst * s4b,
+                                        sl->multi_index_scale[il], (uint64_t)src * s4b, s4n) == 0)
+                    return false;
+            }
             if (ds4_gpu_tensor_copy(sl->multi_iskv[il], (uint64_t)dst * sl->istate_bank_bytes[il],
                                     sl->multi_iskv[il], (uint64_t)src * sl->istate_bank_bytes[il],
                                     sl->istate_bank_bytes[il]) == 0 ||
@@ -28836,14 +29166,36 @@ static bool bank_fork_copy_cut(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst, u
             }
             if (sl->multi_index[il]) {
                 const uint64_t ib = ((uint64_t)keep4 + 1u) * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
-                if (ds4_gpu_tensor_ensure(sl->multi_index[il],
+                /* P2 Inc3b: fp4-primary skips the F32 prefix copy (write-dead);
+                 * the codes+scales below carry the rows incl. the keep4 boundary
+                 * row (its mirror entry is regenerated by ms_emit_keep_restore
+                 * after the suffix's first emit). */
+                const bool cut_fp4_primary = sl->multi_index_fp4[il] != NULL;
+                if (!cut_fp4_primary && ds4_gpu_tensor_ensure(sl->multi_index[il],
                                           (uint64_t)dst * sl->index_bank_bytes[il], ib) == 0) {
                     fprintf(stderr, "ds4: partial fork indexer demand-map failed at layer %u\n", il);
                     return false;
                 }
-                if (ds4_gpu_tensor_copy(sl->multi_index[il], (uint64_t)dst * sl->index_bank_bytes[il],
+                if (!cut_fp4_primary && ds4_gpu_tensor_copy(sl->multi_index[il], (uint64_t)dst * sl->index_bank_bytes[il],
                                         sl->multi_index[il], (uint64_t)src * sl->index_bank_bytes[il],
                                         ib) == 0) return false;
+                if (cut_fp4_primary) {
+                    const uint64_t crows = (uint64_t)keep4 + 1u;
+                    const uint64_t f4b = (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
+                    const uint64_t s4b = (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
+                    if (ds4_gpu_tensor_ensure(sl->multi_index_fp4[il], (uint64_t)dst * f4b,
+                                              crows * DS4_INDEXER_FP4_ROW_BYTES) == 0) {
+                        fprintf(stderr, "ds4: partial fork fp4 index demand-map failed at layer %u\n", il);
+                        return false;
+                    }
+                    if (ds4_gpu_tensor_copy(sl->multi_index_fp4[il], (uint64_t)dst * f4b,
+                                            sl->multi_index_fp4[il], (uint64_t)src * f4b,
+                                            crows * DS4_INDEXER_FP4_ROW_BYTES) == 0 ||
+                        ds4_gpu_tensor_copy(sl->multi_index_scale[il], (uint64_t)dst * s4b,
+                                            sl->multi_index_scale[il], (uint64_t)src * s4b,
+                                            crows * DS4_INDEXER_FP4_SCALE_BYTES) == 0)
+                        return false;
+                }
                 if (ds4_gpu_tensor_copy(sl->multi_iskv[il], (uint64_t)dst * sl->istate_bank_bytes[il],
                                         sl->multi_iskv[il], (uint64_t)src * sl->istate_bank_bytes[il],
                                         sl->istate_bank_bytes[il]) == 0 ||
@@ -28894,7 +29246,25 @@ static bool bank_fork_copy_cut(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst, u
             g->ms_n_comp[dst][il] = 0u;
         }
         if (sl->multi_index[il]) {
-            if (ds4_gpu_tensor_copy(g->emit_stash_index,
+            if (sl->multi_index_fp4[il]) {
+                /* P2 Inc3b: fp4-primary -- the F32 slab is unwritten; stash the
+                 * keep4 boundary row's packed codes+scales from dst's mirror
+                 * (copied above).  The index QAT applies a Hadamard transform and
+                 * is NOT idempotent on a committed row, so ms_emit_keep_restore
+                 * copies these codes back byte-for-byte rather than re-encoding. */
+                const uint64_t f4src = (uint64_t)dst * g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES +
+                                       (uint64_t)keep4 * DS4_INDEXER_FP4_ROW_BYTES;
+                const uint64_t s4src = (uint64_t)dst * g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES +
+                                       (uint64_t)keep4 * DS4_INDEXER_FP4_SCALE_BYTES;
+                const uint64_t f4dst = ((uint64_t)dst * DS4_N_LAYER + il) * DS4_INDEXER_FP4_ROW_BYTES;
+                const uint64_t s4dst = ((uint64_t)dst * DS4_N_LAYER + il) * DS4_INDEXER_FP4_SCALE_BYTES;
+                if (ds4_gpu_tensor_copy(g->emit_stash_index_fp4, f4dst,
+                                        sl->multi_index_fp4[il], f4src,
+                                        (uint64_t)DS4_INDEXER_FP4_ROW_BYTES) == 0 ||
+                    ds4_gpu_tensor_copy(g->emit_stash_index_scale, s4dst,
+                                        sl->multi_index_scale[il], s4src,
+                                        (uint64_t)DS4_INDEXER_FP4_SCALE_BYTES) == 0) return false;
+            } else if (ds4_gpu_tensor_copy(g->emit_stash_index,
                                     ((uint64_t)dst * DS4_N_LAYER + il) * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                     sl->multi_index[il],
                                     (uint64_t)dst * sl->index_bank_bytes[il] +
@@ -29526,6 +29896,25 @@ static int mtp_cont_committed_read(ds4_gpu_graph *g, uint32_t nbanks,
                     ok = codes && scale &&
                          ds4_gpu_dsv4_fp8_kv_dequant_tensor(stg, codes, scale,
                                                             rows, DS4_N_HEAD_DIM) != 0 &&
+                         ds4_gpu_tensor_read(stg, 0, buf + off, nb) != 0;
+                    ds4_gpu_tensor_free(scale);
+                    ds4_gpu_tensor_free(codes);
+                    if (!ok) break;
+                } else if (kind == 1 && g->layer_index_comp_cache_fp4[il]) {
+                    /* P2 Inc3b: fp4-primary -- the F32 index slab is unwritten;
+                     * expand the bank's packed index rows into the 128-wide
+                     * index scratch and read from there (bit-identical to the
+                     * scorers' reconstruction). */
+                    ds4_gpu_tensor *stg = metal_graph_index_emit_scratch(g, rows);
+                    ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                            (uint64_t)b * g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES,
+                            (uint64_t)rows * DS4_INDEXER_FP4_ROW_BYTES) : NULL;
+                    ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                            (uint64_t)b * g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES,
+                            (uint64_t)rows * DS4_INDEXER_FP4_SCALE_BYTES) : NULL;
+                    ok = codes && scale &&
+                         ds4_gpu_dsv4_indexer_fp4_dequant_tensor(stg, codes, scale,
+                                                            rows, DS4_N_INDEXER_HEAD_DIM) != 0 &&
                          ds4_gpu_tensor_read(stg, 0, buf + off, nb) != 0;
                     ds4_gpu_tensor_free(scale);
                     ds4_gpu_tensor_free(codes);

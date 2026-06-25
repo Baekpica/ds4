@@ -5562,7 +5562,7 @@ __device__ static int dsv4_e2m1fn_level_dev(float ax) {
     return best;
 }
 
-__device__ static float dsv4_e2m1fn_dequant_dev(float x) {
+__device__ static DS4_CUDA_UNUSED float dsv4_e2m1fn_dequant_dev(float x) {
     float sign = x < 0.0f ? -1.0f : 1.0f;
     return sign * dsv4_e2m1fn_value_dev(dsv4_e2m1fn_level_dev(fabsf(x)));
 }
@@ -5606,6 +5606,46 @@ __global__ static void indexer_fp4_dequant_rows_kernel(
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         out[d] = indexer_fp4_read(codes_base, scale_base, r, d);
     }
+}
+
+/* P2 Inc3b: pack already-committed F32 index rows into the packed FP4 mirror --
+ * the encode body of indexer_hadamard_fp4_kernel WITHOUT the Hadamard transform
+ * or its 1/sqrt(128) normalisation (the input is the post-QAT committed value,
+ * so re-running the transform would corrupt it).  Used by the session-load path
+ * to regenerate a stale mirror after the F32 rows are restored from the file.
+ * Value-bit-exact: the committed value is sign*e2m1_value(level)*scale, and the
+ * power-of-two block-scale rederivation keeps every lane on the e2m1 grid, so
+ * indexer_fp4_read reproduces the input.  xr is rewritten to the reconstructed
+ * value so the F32 cache and the mirror stay byte-consistent. */
+__global__ static void indexer_fp4_encode_rows_kernel(
+        float * __restrict__ x, uint32_t n_rows, uint32_t head_dim,
+        unsigned char * __restrict__ codes_base, float * __restrict__ scale_base) {
+    uint32_t row = blockIdx.x;
+    uint32_t tid = threadIdx.x;
+    if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
+    __shared__ float absbuf[128];
+    float *xr = x + (uint64_t)row * head_dim;
+    float v = xr[tid];                       /* committed value -- NO Hadamard */
+    uint32_t fp4_block = tid >> 5u;
+    uint32_t lane = tid & 31u;
+    uint32_t block_base = fp4_block * 32u;
+    absbuf[tid] = fabsf(v);
+    __syncthreads();
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            absbuf[block_base + lane] = fmaxf(absbuf[block_base + lane],
+                                              absbuf[block_base + lane + stride]);
+        __syncthreads();
+    }
+    float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
+    float scale = exp2f(ceilf(log2f(amax / 6.0f)));
+    float clamp = fminf(6.0f, fmaxf(-6.0f, v / scale));
+    int level = dsv4_e2m1fn_level_dev(fabsf(clamp));
+    xr[tid] = ((clamp < 0.0f ? -1.0f : 1.0f) * dsv4_e2m1fn_value_dev(level)) * scale;
+    uint32_t nib = (clamp < 0.0f ? 8u : 0u) | (uint32_t)level;
+    uint32_t hi  = __shfl_down_sync(0xffffffffu, nib, 1u);
+    if ((tid & 1u) == 0u)  codes_base[(uint64_t)row * 64u + (tid >> 1u)] = (unsigned char)(nib | (hi << 4u));
+    if ((tid & 31u) == 0u) scale_base[(uint64_t)row * 4u + (tid >> 5u)] = scale;
 }
 
 __device__ static float model_scalar_dev(const void *base, uint64_t offset, uint32_t type, uint64_t idx) {
@@ -8667,7 +8707,12 @@ __global__ static void indexer_scores_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (row stride 64 code
+         * bytes + 4 block scales).  When non-NULL each lane reads via
+         * indexer_fp4_read (bit-identical to index_comp).  NULL = F32. */
+        const unsigned char * __restrict__ index_fp4,
+        const float         * __restrict__ index_scale) {
     uint32_t c = blockIdx.x;
     uint32_t t = blockIdx.y;
     if (c >= n_comp || t >= n_tokens) return;
@@ -8678,12 +8723,15 @@ __global__ static void indexer_scores_kernel(
             return;
         }
     }
+    const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
+    if (use_fp4 && threadIdx.x == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
     float total = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
         const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
         const float *kh = index_comp + (uint64_t)c * head_dim;
         float dot = 0.0f;
-        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) dot += qh[d] * kh[d];
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
+            dot += qh[d] * (use_fp4 ? indexer_fp4_read(index_fp4, index_scale, c, d) : kh[d]);
         __shared__ float partial[256];
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -8783,7 +8831,11 @@ __global__ static void indexer_scores_multiseq_kernel(
          * NULL falls back to pos0 (equal-length); seq_id NULL falls back to
          * bank 0 (bit-exact single bank). */
         const int32_t * __restrict__ positions,
-        const int32_t * __restrict__ seq_id) {
+        const int32_t * __restrict__ seq_id,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (whole slab; the kernel
+         * applies the same seq_base+c row index as index_comp).  NULL = F32. */
+        const unsigned char * __restrict__ index_fp4,
+        const float         * __restrict__ index_scale) {
     const uint32_t c   = blockIdx.x;
     const uint32_t t   = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -8805,10 +8857,14 @@ __global__ static void indexer_scores_multiseq_kernel(
     const uint32_t seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
     const float *qrow = q + (uint64_t)t * 64u * 128u;
     const float *wrow = weights + (uint64_t)t * 64u;
+    const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
+    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     __shared__ float krow[128];
     __shared__ float partial[4];
-    if (tid < 128u) krow[tid] = index_comp[(uint64_t)(seq_base + c) * 128u + tid];
+    if (tid < 128u)
+        krow[tid] = use_fp4 ? indexer_fp4_read(index_fp4, index_scale, seq_base + c, tid)
+                            : index_comp[(uint64_t)(seq_base + c) * 128u + tid];
     __syncthreads();
 
     float total = 0.0f;
@@ -8838,13 +8894,18 @@ __global__ static void indexer_scores_wmma_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (NULL = F32). */
+        const unsigned char * __restrict__ index_fp4,
+        const float         * __restrict__ index_scale) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 16u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
     if (tid >= 32u || head_dim != 128u) return;
+    const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
+    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
@@ -8876,7 +8937,8 @@ __global__ static void indexer_scores_wmma_kernel(
         const uint32_t d = i & 127u;
         const uint32_t comp = tile_c + c;
         float v = 0.0f;
-        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        if (comp < n_comp) v = use_fp4 ? indexer_fp4_read(index_fp4, index_scale, comp, d)
+                                       : index_comp[(uint64_t)comp * head_dim + d];
         b_sh[d + c * 128u] = __float2half(v);
     }
     __syncthreads();
@@ -8946,7 +9008,10 @@ __global__ static void indexer_scores_wmma32_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (NULL = F32). */
+        const unsigned char * __restrict__ index_fp4,
+        const float         * __restrict__ index_scale) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 32u;
@@ -8954,6 +9019,8 @@ __global__ static void indexer_scores_wmma32_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t warp = tid >> 5u;
     if (tid >= 64u || head_dim != 128u) return;
+    const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
+    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
@@ -8985,7 +9052,8 @@ __global__ static void indexer_scores_wmma32_kernel(
         const uint32_t d = i & 127u;
         const uint32_t comp = tile_c + c;
         float v = 0.0f;
-        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        if (comp < n_comp) v = use_fp4 ? indexer_fp4_read(index_fp4, index_scale, comp, d)
+                                       : index_comp[(uint64_t)comp * head_dim + d];
         b_sh[d + c * 128u] = __float2half(v);
     }
     __syncthreads();
@@ -9062,7 +9130,10 @@ __global__ static void indexer_scores_wmma64_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (NULL = F32). */
+        const unsigned char * __restrict__ index_fp4,
+        const float         * __restrict__ index_scale) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 64u;
@@ -9070,6 +9141,8 @@ __global__ static void indexer_scores_wmma64_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t warp = tid >> 5u;
     if (tid >= 128u || head_dim != 128u) return;
+    const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
+    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
@@ -9101,7 +9174,8 @@ __global__ static void indexer_scores_wmma64_kernel(
         const uint32_t d = i & 127u;
         const uint32_t comp = tile_c + c;
         float v = 0.0f;
-        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        if (comp < n_comp) v = use_fp4 ? indexer_fp4_read(index_fp4, index_scale, comp, d)
+                                       : index_comp[(uint64_t)comp * head_dim + d];
         b_sh[d + c * 128u] = __float2half(v);
     }
     __syncthreads();
@@ -9178,7 +9252,10 @@ __global__ static void indexer_scores_wmma128_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (NULL = F32). */
+        const unsigned char * __restrict__ index_fp4,
+        const float         * __restrict__ index_scale) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 128u;
@@ -9186,6 +9263,8 @@ __global__ static void indexer_scores_wmma128_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t warp = tid >> 5u;
     if (tid >= 256u || head_dim != 128u) return;
+    const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
+    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
@@ -9219,7 +9298,8 @@ __global__ static void indexer_scores_wmma128_kernel(
         const uint32_t d = i & 127u;
         const uint32_t comp = tile_c + c;
         float v = 0.0f;
-        if (comp < n_comp) v = index_comp[(uint64_t)comp * head_dim + d];
+        if (comp < n_comp) v = use_fp4 ? indexer_fp4_read(index_fp4, index_scale, comp, d)
+                                       : index_comp[(uint64_t)comp * head_dim + d];
         b_sh[d + c * 128u] = __float2half(v);
     }
     __syncthreads();
@@ -10011,6 +10091,14 @@ static int indexer_scores_launch(
      * read per-seq banks).  Indexer dims are always 128/64. */
     const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
     const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
+    /* P2 Inc3b: hoist the FP4 mirror base ptrs so every reader path (multiseq,
+     * WMMA tiles, generic, _direct) can consume them.  index_fp4 = packed codes
+     * (row stride 64 B), index_scale = per-32-lane block scales (16 B/row).
+     * NULL when the layer has no FP4 mirror (F32 primary / fp4 off). */
+    const unsigned char *index_fp4_ptr =
+        index_fp4 ? (const unsigned char *)index_fp4->ptr : NULL;
+    const float *index_scale_ptr =
+        index_scale ? (const float *)index_scale->ptr : NULL;
     /* FE1: a single-bank consecutive run IS a serial-shaped problem -- shift
      * the cache view to the bank and clear the per-row arrays so the WMMA
      * tiles below serve it.  Causal clamp note: the WMMA epilogue exposes
@@ -10034,6 +10122,12 @@ static int indexer_scores_launch(
             index_comp = &fe1_bank_view;
             pos_dev = NULL;
             seq_dev = NULL;
+            /* P2 Inc3b: shift the FP4 mirror to the same bank so the WMMA tiles
+             * below read bank-local rows (codes 64 B/row, scales 4 floats/row). */
+            if (index_fp4_ptr)
+                index_fp4_ptr += (uint64_t)single_bank * comp_cap * 64u;
+            if (index_scale_ptr)
+                index_scale_ptr += (uint64_t)single_bank * comp_cap * 4u;
         }
     }
     if (seq_dev != NULL && head_dim == 128u && n_head == 64u) {
@@ -10046,7 +10140,8 @@ static int indexer_scores_launch(
                 (const float *)weights->ptr,
                 (const float *)index_comp->ptr,
                 n_comp, n_tokens, pos0, ratio, comp_cap, scale,
-                causal ? 1 : 0, pos_dev, seq_dev);
+                causal ? 1 : 0, pos_dev, seq_dev,
+                index_fp4_ptr, index_scale_ptr);
         return cuda_ok(cudaGetLastError(), "indexer scores multiseq launch");
     }
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
@@ -10110,8 +10205,7 @@ static int indexer_scores_launch(
                 (const float *)index_comp->ptr,
                 n_comp, pos0, ratio,
                 scale, causal ? 1 : 0, ls,
-                index_fp4   ? (const unsigned char *)index_fp4->ptr   : NULL,
-                index_scale ? (const float *)index_scale->ptr         : NULL);
+                index_fp4_ptr, index_scale_ptr);
         /* TEMPORARY DIAGNOSTIC: scores AFTER the science kernel writes.
          * Fixed-size 3000 floats (well past any realistic n_comp).  If this
          * matches BE vs BC, the science kernel produced identical output and
@@ -10144,7 +10238,8 @@ static int indexer_scores_launch(
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
                                                          n_comp, n_tokens, pos0, n_head,
-                                                         head_dim, ratio, scale, causal ? 1 : 0);
+                                                         head_dim, ratio, scale, causal ? 1 : 0,
+                                                         index_fp4_ptr, index_scale_ptr);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
         } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA64") == NULL) {
             dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1);
@@ -10153,7 +10248,8 @@ static int indexer_scores_launch(
                                                         (const float *)weights->ptr,
                                                         (const float *)index_comp->ptr,
                                                         n_comp, n_tokens, pos0, n_head,
-                                                        head_dim, ratio, scale, causal ? 1 : 0);
+                                                        head_dim, ratio, scale, causal ? 1 : 0,
+                                                        index_fp4_ptr, index_scale_ptr);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma64 launch");
         } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA32") == NULL) {
             dim3 grid((n_comp + 31u) / 32u, (n_tokens + 15u) / 16u, 1);
@@ -10162,7 +10258,8 @@ static int indexer_scores_launch(
                                                        (const float *)weights->ptr,
                                                        (const float *)index_comp->ptr,
                                                        n_comp, n_tokens, pos0, n_head,
-                                                       head_dim, ratio, scale, causal ? 1 : 0);
+                                                       head_dim, ratio, scale, causal ? 1 : 0,
+                                                       index_fp4_ptr, index_scale_ptr);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma32 launch");
         } else {
             dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
@@ -10171,7 +10268,8 @@ static int indexer_scores_launch(
                                                      (const float *)weights->ptr,
                                                      (const float *)index_comp->ptr,
                                                      n_comp, n_tokens, pos0, n_head,
-                                                     head_dim, ratio, scale, causal ? 1 : 0);
+                                                     head_dim, ratio, scale, causal ? 1 : 0,
+                                                     index_fp4_ptr, index_scale_ptr);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma launch");
         }
     }
@@ -10181,7 +10279,8 @@ static int indexer_scores_launch(
                                          (const float *)weights->ptr,
                                          (const float *)index_comp->ptr,
                                          n_comp, n_tokens, pos0, n_head,
-                                         head_dim, ratio, scale, causal ? 1 : 0);
+                                         head_dim, ratio, scale, causal ? 1 : 0,
+                                         index_fp4_ptr, index_scale_ptr);
     return cuda_ok(cudaGetLastError(), "indexer scores launch");
 }
 
@@ -10220,7 +10319,11 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale) {
+        float                   scale,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (NULL = F32).  Prefill
+         * uses the WMMA tile readers, which now decode it bit-identically. */
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale) {
     /* PC5: prefill never hits the _direct path (n_tokens > 1).  Pass
      * legacy (0, UINT32_MAX) so n_comp_max never activates. */
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, 0,
@@ -10228,7 +10331,7 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
                                  0u, UINT32_MAX,
                                  /* Step 4b: single-seq */ 0u, NULL, NULL,
                                  /* FE1: no single-bank claim */ UINT32_MAX,
-                                 /* P2 Inc3: prefill uses WMMA, no FP4 mirror */ NULL, NULL);
+                                 index_fp4, index_scale);
 }
 
 extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
@@ -10250,13 +10353,18 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
         const ds4_gpu_tensor *seq_id,
         /* FE1: bank id when the batch is one bank's consecutive-position run
          * (admission chunks); UINT32_MAX = no claim (per-row kernel). */
-        uint32_t                single_bank) {
+        uint32_t                single_bank,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (NULL = F32).  The
+         * multiseq + WMMA tile readers decode it bit-identically; the FE1
+         * single-bank path shifts the mirror to the bank inside the launch. */
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale) {
     /* PC5: batch path never hits the _direct kernel either (n_tokens > 1). */
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
                                  n_head, head_dim, ratio, scale, 1,
                                  0u, UINT32_MAX,
                                  comp_cap, positions, seq_id, single_bank,
-                                 /* P2 Inc3: multiseq/WMMA path, no FP4 mirror in Inc3a */ NULL, NULL);
+                                 index_fp4, index_scale);
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(
@@ -13190,6 +13298,29 @@ extern "C" int ds4_gpu_dsv4_indexer_fp4_dequant_tensor(
             (const float *)scale->ptr,
             n_rows, head_dim);
     return cuda_ok(cudaGetLastError(), "indexer_fp4_dequant launch");
+}
+
+/* P2 Inc3b: regenerate the packed FP4 mirror from already-committed F32 index
+ * rows (no Hadamard; see indexer_fp4_encode_rows_kernel).  Used by session load
+ * to refresh a stale mirror after the F32 rows are restored from the file. */
+extern "C" int ds4_gpu_dsv4_indexer_fp4_encode_tensor(
+        ds4_gpu_tensor       *x,
+        ds4_gpu_tensor       *codes,
+        ds4_gpu_tensor       *scale,
+        uint32_t                n_rows,
+        uint32_t                head_dim) {
+    if (!x || !codes || !scale || n_rows == 0 || head_dim != 128u ||
+        x->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        codes->bytes < (uint64_t)n_rows * 64u ||
+        scale->bytes < (uint64_t)n_rows * 4u * sizeof(float)) {
+        return 0;
+    }
+    indexer_fp4_encode_rows_kernel<<<n_rows, 128, 0, ds4_current_stream()>>>(
+            (float *)x->ptr,
+            n_rows, head_dim,
+            (unsigned char *)codes->ptr,
+            (float *)scale->ptr);
+    return cuda_ok(cudaGetLastError(), "indexer_fp4_encode launch");
 }
 
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim,

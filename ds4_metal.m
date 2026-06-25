@@ -5607,7 +5607,10 @@ int ds4_gpu_indexer_scores_prefill_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale) {
+        float                   scale,
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale) {
+    (void)index_fp4; (void)index_scale;  /* P2 Inc3b: FP4 mirror is CUDA-only. */
     return ds4_gpu_indexer_scores_batch_tensor(scores,
                                                  q,
                                                  weights,
@@ -5636,9 +5639,12 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                comp_cap,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                single_bank) {
+        uint32_t                single_bank,
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale) {
     (void)comp_cap; (void)positions; (void)seq_id;  /* Phase 2 Step 4b: CUDA-only. */
     (void)single_bank;                              /* FE1: CUDA-only. */
+    (void)index_fp4; (void)index_scale;             /* P2 Inc3b: FP4 mirror CUDA-only. */
     return ds4_gpu_indexer_scores_batch_tensor(scores,
                                                  q,
                                                  weights,
@@ -7162,6 +7168,17 @@ int ds4_gpu_dsv4_indexer_fp4_dequant_tensor(
         uint32_t                head_dim) {
     (void)dst; (void)codes; (void)scale; (void)n_rows; (void)head_dim;
     fprintf(stderr, "ds4: fp4 indexer dequant is not available on Metal\n");
+    return 0;
+}
+
+int ds4_gpu_dsv4_indexer_fp4_encode_tensor(
+        ds4_gpu_tensor       *x,
+        ds4_gpu_tensor       *codes,
+        ds4_gpu_tensor       *scale,
+        uint32_t                n_rows,
+        uint32_t                head_dim) {
+    (void)x; (void)codes; (void)scale; (void)n_rows; (void)head_dim;
+    fprintf(stderr, "ds4: fp4 indexer encode is not available on Metal\n");
     return 0;
 }
 

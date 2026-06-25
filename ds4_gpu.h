@@ -451,7 +451,11 @@ int ds4_gpu_indexer_scores_prefill_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale);
+        float                   scale,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (NULL = F32; Metal
+         * accepts + ignores).  Prefill uses the WMMA tile readers. */
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale);
 
 int ds4_gpu_indexer_scores_decode_batch_tensor(
         ds4_gpu_tensor       *scores,
@@ -474,7 +478,11 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
          * consecutive-position run (admission chunks); the CUDA backend then
          * serves the scores on the serial WMMA path through a bank-offset
          * view.  UINT32_MAX = no claim (per-row kernel, bit-exact). */
-        uint32_t                single_bank);
+        uint32_t                single_bank,
+        /* P2 Inc3b: optional packed FP4 indexer mirror (NULL = F32; Metal
+         * accepts + ignores).  multiseq + WMMA readers decode it. */
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale);
 
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
@@ -806,6 +814,17 @@ int ds4_gpu_dsv4_indexer_fp4_dequant_tensor(
         ds4_gpu_tensor       *dst,
         const ds4_gpu_tensor *codes,
         const ds4_gpu_tensor *scale,
+        uint32_t                n_rows,
+        uint32_t                head_dim);
+
+/* P2 Inc3b: pack already-committed F32 index rows into the packed FP4 mirror
+ * (no Hadamard -- the input is the post-QAT committed value).  Rewrites `x`
+ * with the reconstructed value too, so F32 and codes stay consistent.  Used by
+ * session load to refresh a stale mirror.  CUDA only -- Metal stub fails loud. */
+int ds4_gpu_dsv4_indexer_fp4_encode_tensor(
+        ds4_gpu_tensor       *x,
+        ds4_gpu_tensor       *codes,
+        ds4_gpu_tensor       *scale,
         uint32_t                n_rows,
         uint32_t                head_dim);
 
