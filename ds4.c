@@ -31524,6 +31524,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                              getenv("DS4_CONT_DSPARK") != NULL) ? 1 : 0;
     const ds4_model          *dspark_model = &ctx->e->dspark_model;
     const ds4_dspark_weights *dw           = &ctx->e->dspark_weights;
+    /* D4.5e: inject the cold/suffix PREFILL region's target hidden into the DSpark
+     * rings (so the drafter attends real prefix KV from the first decode step instead
+     * of zero ring slots).  On by default when dspark_mode; DS4_DSPARK_NO_PREFILL_INJECT
+     * disables it (A/B + ops escape hatch).  Accept-rate only -- never affects output. */
+    const int dspark_prefill_inject = dspark_mode && getenv("DS4_DSPARK_NO_PREFILL_INJECT") == NULL;
     const uint64_t hc_dim_cont = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     uint64_t mtp_probe_total = 0, mtp_probe_hit = 0;
 
@@ -31569,9 +31574,14 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * its head ON DEVICE and the on-device Markov refine reads it ON DEVICE, so a
      * device tensor is required.  Sized like vlogits (vcap_rows = min(MS*B, prefill_cap)). */
     ds4_gpu_tensor *mk_logits = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)vcap_rows * DS4_N_VOCAB * sizeof(float)) : NULL;
+    /* D4.5e: host position/seq_id scratch for injecting a PREFILL chunk's target hidden
+     * into the bank's DSpark ring (so the drafter attends real prefix KV, not zero slots,
+     * from the first decode step).  Sized for the widest prefill chunk (prefill_cap). */
+    int32_t *pf_inj_pos = dspark_mode ? xmalloc((size_t)ctx->prefill_cap * sizeof(int32_t)) : NULL;
+    int32_t *pf_inj_sid = dspark_mode ? xmalloc((size_t)ctx->prefill_cap * sizeof(int32_t)) : NULL;
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
     if (mtp_accept) ok = ok && dbuf && ndr && vqtok && vpos && vsid && vfirst && vnr && vlogits;
-    if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits;
+    if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits && pf_inj_pos && pf_inj_sid;
     /* M4b Inc5: batched cross-bank MTP draft chain (one depth-major forward over all
      * live banks, ~D+1 device syncs/step) instead of the per-bank serial
      * mtp_draft_chain_bank (N*(D+1) syncs).  Pure perf: the verify forward is the sole
@@ -31804,6 +31814,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 for (uint32_t i = 0; i < MS; i++) if (live[i]) n_live_now++;
                 uint32_t n = pflen[b] - pfoff[b];
                 bool final = true;
+                /* D4.5e: tap the target hidden for THIS prefill chunk (layers 40/41/42 ->
+                 * dspark_concat[0..n)) so the chunk's positions can be injected into bank b's
+                 * DSpark ring below.  Zero extra forward; off => bit-identical prefill. */
+                g->dspark_capture = dspark_prefill_inject ? true : false;
                 if (W_boot == 0u) {
                     /* legacy one-shot (bit-exact pre-R3): whole suffix, one forward. */
                     ok = bg_prefill_oneshot(g, model, weights, b, pftok[b], n,
@@ -31817,9 +31831,38 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                          pfbase[b] + pfoff[b], final,
                                          final ? seedlog : NULL);
                 }
+                g->dspark_capture = false;
                 if (!ok) {
                     ctx->bank_hist_valid[b] = 0u;       /* partial prefill: state unknown */
                     break;
+                }
+                /* D4.5e: fuse main_x for this chunk's captured hidden and inject it into bank b's
+                 * ring at the chunk's absolute positions [pbase, pbase+n) (seq_id = b).  Now the
+                 * block draft's prefix window reads real prefix KV from the first decode step
+                 * instead of zero ring slots (accept-rate only; never affects committed tokens).
+                 * Warm/fork admits inject only the re-prefilled SUFFIX; the reused prefix's DSpark
+                 * KV is absent (its window contribution slides out after ~SWA decode steps). */
+                if (dspark_prefill_inject && n > 0u) {
+                    const uint32_t pbase = pfbase[b] + pfoff[b];
+                    for (uint32_t i = 0; i < n; i++) { pf_inj_pos[i] = (int32_t)(pbase + i); pf_inj_sid[i] = (int32_t)b; }
+                    bool iok = ds4_gpu_tensor_write(g->batch_positions, 0, pf_inj_pos, (uint64_t)n * sizeof(int32_t)) != 0;
+                    if (iok) iok = ds4_gpu_tensor_write(g->batch_seq_id, 0, pf_inj_sid, (uint64_t)n * sizeof(int32_t)) != 0;
+                    if (iok) iok = ds4_gpu_begin_commands() != 0;
+                    if (iok) iok = ds4_gpu_matmul_q8_0_tensor(g->batch_attn_cur, dspark_model->map, dspark_model->size,
+                                        dw->main_proj->abs_offset, 3u * DS4_N_EMBD, DS4_N_EMBD, g->dspark_concat, n) != 0;
+                    if (iok) iok = ds4_gpu_rms_norm_weight_rows_tensor(g->dspark_main_x, g->batch_attn_cur,
+                                        dspark_model->map, dspark_model->size, dw->main_norm->abs_offset,
+                                        DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
+                    if (iok) iok = ds4_gpu_end_commands() != 0;
+                    if (iok) {
+                        ds4_gpu_tensor *ip = ds4_gpu_tensor_view(g->batch_positions, 0, (uint64_t)n * sizeof(int32_t));
+                        ds4_gpu_tensor *is = ds4_gpu_tensor_view(g->batch_seq_id, 0, (uint64_t)n * sizeof(int32_t));
+                        iok = ip && is && metal_graph_dspark_inject(g, dspark_model, dw, g->dspark_main_x,
+                                                                    n, ip, is, ctx->dsl.multi_raw);
+                        if (ip) ds4_gpu_tensor_free(ip);
+                        if (is) ds4_gpu_tensor_free(is);
+                    }
+                    if (!iok) { fprintf(stderr, "ds4: cont-dspark prefill inject FAIL (bank %u pbase=%u n=%u)\n", b, pbase, n); ok = false; break; }
                 }
                 bank_hist_append_n(ctx, b, pftok[b] + pfoff[b], n);
                 pfoff[b] += n;
@@ -32394,6 +32437,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (mk_prev)   ds4_gpu_tensor_free(mk_prev);
     if (mk_bias)   ds4_gpu_tensor_free(mk_bias);
     if (mk_logits) ds4_gpu_tensor_free(mk_logits);
+    free(pf_inj_pos); free(pf_inj_sid);
     return ok ? 0 : 1;
 #undef CG_ERR
 }
