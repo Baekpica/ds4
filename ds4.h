@@ -374,6 +374,9 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
  * against the trace's 3-slice hidden. Near-zero diff proves the inline serving
  * capture is faithful. Returns 0 on success. */
 int ds4_dspark_capture_validate(ds4_engine *e, ds4_session *s, const char *trace_path);
+/* DSpark per-bank injected-KV ring isolation gate (D4.5b): injects different
+ * records into different banks and verifies cross-bank ring isolation. 0 = pass. */
+int ds4_dspark_slabs_validate(ds4_engine *e, ds4_session *s, const char *trace_path);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);

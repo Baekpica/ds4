@@ -18395,6 +18395,42 @@ static bool metal_graph_encode_output_head_dspark_batch_into(
     return ok;
 }
 
+/* D4.5b: inject n_rows target-fused positions' KV into the CURRENT drafter rings
+ * (g->dspark_raw_cache[0..2]) at ring slots positions[t] % raw_cap.  main_x =
+ * [n_rows x n_embd] device (main_norm(main_proj(concat hc40/41/42))); positions =
+ * [n_rows] int32 device (absolute positions).  Per layer: wkv@main_x -> kv_a_norm
+ * -> rope-per-pos -> store_raw_kv.  This is the serving inject (1 row per committed
+ * token, or a window during prefill).  Caller wraps nothing -- own begin/end here. */
+static bool metal_graph_dspark_inject(
+        ds4_gpu_graph            *g,
+        const ds4_model          *dspark_model,
+        const ds4_dspark_weights *dw,
+        ds4_gpu_tensor           *main_x,
+        uint32_t                  n_rows,
+        ds4_gpu_tensor           *positions) {
+    if (!main_x || !positions || n_rows == 0 || n_rows > g->prefill_cap) return false;
+    const float freq_base = layer_rope_freq_base(1), freq_scale = layer_rope_freq_scale(1);
+    bool ok = ds4_gpu_begin_commands() != 0;
+    const char *stage = "begin";
+    for (uint32_t li = 0; ok && li < DS4_DSPARK_N_LAYER; li++) {
+        const ds4_layer_weights *lw = &dw->layer[li];
+        if (!g->dspark_raw_cache[li]) { ok = false; stage = "ring"; break; }
+        if (ok) { stage = "kv"; ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw, dspark_model->map, dspark_model->size,
+                                        lw->attn_kv->abs_offset, DS4_N_EMBD, DS4_N_HEAD_DIM, main_x, n_rows) != 0; }
+        if (ok) { stage = "kv_norm"; ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_kv, g->batch_kv_raw,
+                                        dspark_model->map, dspark_model->size, lw->attn_kv_a_norm->abs_offset,
+                                        DS4_N_HEAD_DIM, n_rows, DS4_RMS_EPS) != 0; }
+        if (ok) { stage = "rope"; ok = ds4_gpu_rope_tail_tensor(g->batch_kv, n_rows, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                                        DS4_N_ROT, 0, positions, 0, false, freq_base, freq_scale, 0.0f, 1.0f,
+                                        DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0; }
+        if (ok) { stage = "store"; ok = ds4_gpu_store_raw_kv_batch_tensor(g->dspark_raw_cache[li], g->batch_kv,
+                                        g->raw_cap, 0, n_rows, DS4_N_HEAD_DIM, positions, NULL) != 0; }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (!ok) { (void)ds4_gpu_synchronize(); fprintf(stderr, "ds4: dspark_inject FAIL @%s n_rows=%u\n", stage, n_rows); }
+    return ok;
+}
+
 /* One DSpark block forward.  inj_kv[li] = the FULL per-layer target-fused KV
  * [<=prefill_cap rows x head_dim], already rope'd per absolute position (built
  * once per record by the caller).  Pre-fills each ring with the prefix window
@@ -24457,6 +24493,85 @@ static void ds4_mtp_slabs_free(ds4_mtp_slabs *msl, ds4_gpu_graph *g) {
     memset(msl, 0, sizeof(*msl));
 }
 
+/* D4.5b: per-bank DSpark drafter injected-KV rings.  Each concurrent sequence
+ * owns its own 3 target-fused KV rings (one per draft layer); the drafter block
+ * scratch (dspark_main_x/concat/kv, batch_*, block_logits) is recomputed per call
+ * and shared because banks draft serially within a decode step (mirror of the MTP
+ * slab discipline).  repoint_bank installs bank b's ring views into
+ * g->dspark_raw_cache[0..2] + loads g->dspark_n_raw from the per-bank counter;
+ * save_bank writes the counter back.  Grown incrementally (1 row per committed
+ * token, via metal_graph_dspark_inject). */
+typedef struct {
+    uint32_t        N;
+    uint64_t        raw_bank_bytes;                       /* raw_cap * head_dim * sizeof(float) */
+    ds4_gpu_tensor *multi_raw[DS4_DSPARK_N_LAYER];        /* N * raw_bank_bytes each */
+    ds4_gpu_tensor *saved_raw[DS4_DSPARK_N_LAYER];        /* graph single-seq rings (restore on free) */
+    ds4_gpu_tensor *cur_raw[DS4_DSPARK_N_LAYER];          /* currently-installed bank views */
+    uint32_t        n_raw[DS4_MULTISEQ_MAX_SEQ];          /* per-bank injected-ring fill counter */
+} ds4_dspark_slabs;
+
+static bool ds4_dspark_slabs_alloc(ds4_dspark_slabs *dsl, ds4_gpu_graph *g, uint32_t N) {
+    memset(dsl, 0, sizeof(*dsl));
+    if (N == 0 || N > (uint32_t)DS4_MULTISEQ_MAX_SEQ) return false;
+    for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++)
+        if (!g->dspark_raw_cache[li]) return false;
+    dsl->N = N;
+    dsl->raw_bank_bytes = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    bool ok = true;
+    for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) {
+        dsl->saved_raw[li] = g->dspark_raw_cache[li];
+        dsl->multi_raw[li] = ds4_gpu_tensor_alloc((uint64_t)N * dsl->raw_bank_bytes);
+        /* zero-fill: a first-admit bank's read span [pos-n_raw,pos] can reach
+         * before its admit position (n_raw outpaces position under <100% accept,
+         * exactly as in ds4_mtp_slabs_alloc); a zero K/V row scores finite, never
+         * NaN -> garbage expert id -> OOB gather. */
+        if (dsl->multi_raw[li])
+            (void)ds4_gpu_tensor_fill_f32(dsl->multi_raw[li], 0.0f,
+                                          (uint64_t)N * g->raw_cap * DS4_N_HEAD_DIM);
+        else ok = false;
+    }
+    if (ds4_slab_poison_level("DS4_DSPARK_SLAB_POISON") >= 1)
+        for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) ds4_slab_poison_fill(dsl->multi_raw[li]);
+    return ok;
+}
+
+/* Install bank b's ring views into g->dspark_raw_cache[0..2] + load g->dspark_n_raw.
+ * Frees the prior bank's views first.  Call before bank b's inject/draft. */
+static bool ds4_dspark_slabs_repoint_bank(ds4_dspark_slabs *dsl, ds4_gpu_graph *g, uint32_t b) {
+    if (b >= dsl->N) return false;
+    ds4_gpu_tensor *v[DS4_DSPARK_N_LAYER] = {0};
+    for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) {
+        v[li] = ds4_gpu_tensor_view(dsl->multi_raw[li], (uint64_t)b * dsl->raw_bank_bytes, dsl->raw_bank_bytes);
+        if (!v[li]) { for (uint32_t k = 0; k < li; k++) ds4_gpu_tensor_free(v[k]); return false; }
+    }
+    for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) {
+        if (dsl->cur_raw[li]) ds4_gpu_tensor_free(dsl->cur_raw[li]);
+        dsl->cur_raw[li] = v[li];
+        g->dspark_raw_cache[li] = v[li];
+    }
+    g->dspark_n_raw = dsl->n_raw[b];
+    return true;
+}
+
+static void ds4_dspark_slabs_save_bank(ds4_dspark_slabs *dsl, ds4_gpu_graph *g, uint32_t b) {
+    if (b < dsl->N) dsl->n_raw[b] = g->dspark_n_raw;
+}
+
+static void ds4_dspark_slabs_restore(ds4_dspark_slabs *dsl, ds4_gpu_graph *g) {
+    for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) {
+        if (dsl->cur_raw[li]) ds4_gpu_tensor_free(dsl->cur_raw[li]);
+        dsl->cur_raw[li] = NULL;
+        if (dsl->saved_raw[li]) g->dspark_raw_cache[li] = dsl->saved_raw[li];
+    }
+}
+
+static void ds4_dspark_slabs_free(ds4_dspark_slabs *dsl, ds4_gpu_graph *g) {
+    ds4_dspark_slabs_restore(dsl, g);
+    for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++)
+        if (dsl->multi_raw[li]) ds4_gpu_tensor_free(dsl->multi_raw[li]);
+    memset(dsl, 0, sizeof(*dsl));
+}
+
 /* W5 helper: reset ONE bank to empty (raw ring + compressor state + per-seq comp
  * counts), so a freed bank can be re-admitted with a new prompt.  Repoints the slab
  * to that single bank (so metal_graph_reset_prefill_state touches only bank b's
@@ -25953,6 +26068,125 @@ int ds4_dspark_capture_validate(ds4_engine *e, ds4_session *s, const char *trace
     }
     for (int k = 0; k < 3; k++) { free(stored[k]); free(live[k]); }
     free(toks);
+    fclose(f);
+    return rc;
+}
+
+/* D4.5b gate: per-bank DSpark ring isolation.  Injects record A into bank0 and a
+ * DIFFERENT record B into bank1, then re-reads bank0 -- it MUST be byte-unchanged
+ * (bank1's inject went to bank1's slab, not bank0's).  Also injects record A into
+ * bank2 and confirms bank2 == bank0 (repoint targets the right bank; injection is
+ * deterministic).  Catches the cross-bank ring-contamination / wrong-bank-pointer
+ * class. Needs >=2 trace records. */
+int ds4_dspark_slabs_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    if (!e || !s || !e->dspark_ready) { fprintf(stderr, "ds4: dspark slabs validate: drafter not loaded\n"); return 1; }
+    ds4_gpu_graph *g = &s->graph;
+    const ds4_model *dspark_model = &e->dspark_model;
+    const ds4_dspark_weights *dw = &e->dspark_weights;
+    const uint32_t pc = g->prefill_cap;
+    const uint32_t NB = 3u;   /* banks: 0=A, 1=B, 2=A(copy) */
+    if (NB > (uint32_t)DS4_MULTISEQ_MAX_SEQ) { fprintf(stderr, "ds4: slabs validate: NB too large\n"); return 1; }
+
+    FILE *f = fopen(trace_path, "rb");
+    if (!f) { fprintf(stderr, "ds4: cannot open trace %s\n", trace_path); return 1; }
+    char magic[8]; uint32_t hdr[3];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "DS4DSPK1", 8) != 0 ||
+        fread(hdr, sizeof(uint32_t), 3, f) != 3) { fprintf(stderr, "ds4: bad trace header\n"); fclose(f); return 1; }
+    if (hdr[0] != (uint32_t)DS4_N_EMBD || hdr[1] != 3u || hdr[2] < 2u) {
+        fprintf(stderr, "ds4: slabs validate needs >=2 records (have %u)\n", hdr[2]); fclose(f); return 1;
+    }
+
+    const uint64_t raw_words = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM;
+    float *concat = xmalloc((size_t)pc * 3u * DS4_N_EMBD * sizeof(float));
+    float *hcbuf  = xmalloc((size_t)pc * DS4_N_EMBD * sizeof(float));
+    int32_t *toks = xmalloc((size_t)pc * sizeof(int32_t));
+    int32_t *pos  = xmalloc((size_t)pc * sizeof(int32_t));
+    /* per-(bank,layer) ring readbacks */
+    float *ring[3][DS4_DSPARK_N_LAYER];
+    for (uint32_t b = 0; b < 3; b++) for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++)
+        ring[b][li] = xmalloc((size_t)raw_words * sizeof(float));
+    uint32_t rec_total[2] = {0,0};
+
+    ds4_dspark_slabs dsl;
+    bool slabs_ok = ds4_dspark_slabs_alloc(&dsl, g, NB);
+    int rc = slabs_ok ? 0 : 1;
+    if (!slabs_ok) fprintf(stderr, "ds4: slabs validate: alloc failed\n");
+
+    /* read 2 records, fuse main_x, inject: rec0->bank0, rec1->bank1, rec0->bank2 */
+    for (uint32_t ri = 0; rc == 0 && ri < 2; ri++) {
+        uint32_t plen = 0, total = 0;
+        if (fread(&plen, 4, 1, f) != 1 || fread(&total, 4, 1, f) != 1) { rc = 1; break; }
+        if (total == 0 || total > pc || total + DS4_DSPARK_BLOCK > g->raw_cap) {
+            fprintf(stderr, "ds4: slabs validate: rec %u total=%u unfit (pc=%u raw_cap=%u)\n", ri, total, pc, g->raw_cap);
+            rc = 1; break;
+        }
+        if (fread(toks, sizeof(int32_t), total, f) != total) { rc = 1; break; }
+        for (uint32_t cap = 0; cap < 3; cap++) {
+            if (fread(hcbuf, sizeof(float), (size_t)total * DS4_N_EMBD, f) != (size_t)total * DS4_N_EMBD) { rc = 1; break; }
+            for (uint32_t row = 0; row < total; row++)
+                memcpy(concat + (size_t)row * 3u * DS4_N_EMBD + (size_t)cap * DS4_N_EMBD,
+                       hcbuf + (size_t)row * DS4_N_EMBD, DS4_N_EMBD * sizeof(float));
+        }
+        if (rc) break;
+        rec_total[ri] = total;
+        for (uint32_t i = 0; i < total; i++) pos[i] = (int32_t)i;
+        /* fuse main_x on GPU */
+        bool ok = ds4_gpu_tensor_write(g->dspark_concat, 0, concat, (uint64_t)total * 3u * DS4_N_EMBD * sizeof(float)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, pos, (uint64_t)total * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_attn_cur, dspark_model->map, dspark_model->size,
+                                                dw->main_proj->abs_offset, 3u * DS4_N_EMBD, DS4_N_EMBD, g->dspark_concat, total) != 0;
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->dspark_main_x, g->batch_attn_cur,
+                                                dspark_model->map, dspark_model->size, dw->main_norm->abs_offset,
+                                                DS4_N_EMBD, total, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        ds4_gpu_tensor *pos_t = ds4_gpu_tensor_view(g->batch_positions, 0, (uint64_t)total * sizeof(int32_t));
+        /* inject this record's bank(s): rec0 -> banks {0,2}; rec1 -> bank {1} */
+        const uint32_t banks0[2] = {0u, 2u};
+        const uint32_t *banks = (ri == 0) ? banks0 : (const uint32_t[]){1u};
+        const uint32_t nbk = (ri == 0) ? 2u : 1u;
+        for (uint32_t bi = 0; ok && bi < nbk; bi++) {
+            ok = ds4_dspark_slabs_repoint_bank(&dsl, g, banks[bi]) &&
+                 metal_graph_dspark_inject(g, dspark_model, dw, g->dspark_main_x, total, pos_t);
+            ds4_dspark_slabs_save_bank(&dsl, g, banks[bi]);
+        }
+        if (pos_t) ds4_gpu_tensor_free(pos_t);
+        /* IMPORTANT: inject bank2(=rec0) is done in the ri==0 pass BEFORE bank1(rec1)
+         * so that bank1's inject (ri==1) lands AFTER bank0/bank2 -- the isolation
+         * check then proves bank0/bank2 survive a later different-bank inject. */
+        if (!ok) { fprintf(stderr, "ds4: slabs validate: inject failed rec %u\n", ri); rc = 1; break; }
+    }
+
+    /* read back all 3 banks (after all injects) */
+    for (uint32_t b = 0; rc == 0 && b < 3; b++) {
+        if (!ds4_dspark_slabs_repoint_bank(&dsl, g, b)) { rc = 1; break; }
+        for (uint32_t li = 0; rc == 0 && li < DS4_DSPARK_N_LAYER; li++)
+            if (ds4_gpu_tensor_read(g->dspark_raw_cache[li], 0, ring[b][li], raw_words * sizeof(float)) == 0) rc = 1;
+    }
+
+    if (rc == 0) {
+        /* bank0 (rec0) vs bank2 (rec0): MUST match (same record, isolated banks). */
+        double d02 = 0.0, d01 = 0.0;
+        for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++)
+            for (uint64_t i = 0; i < raw_words; i++) {
+                double a = fabs((double)ring[0][li][i] - (double)ring[2][li][i]);
+                if (a > d02) d02 = a;
+                double b = fabs((double)ring[0][li][i] - (double)ring[1][li][i]);
+                if (b > d01) d01 = b;   /* rec0 vs rec1: SHOULD differ (sanity) */
+            }
+        const bool isolated = (d02 == 0.0);
+        const bool distinct = (rec_total[0] != rec_total[1]) || (d01 > 0.0);
+        fprintf(stderr, "ds4: DSPARK SLABS %s: bank0==bank2 (same rec0) max_diff=%.3e [%s]; "
+                "bank0 vs bank1 (rec0 vs rec1) max_diff=%.3e [%s]\n",
+                (isolated && distinct) ? "ISOLATED" : "SUSPECT",
+                d02, isolated ? "OK" : "CONTAMINATED",
+                d01, distinct ? "distinct" : "WARN-identical");
+        if (!isolated || !distinct) rc = 1;
+    }
+
+    ds4_dspark_slabs_free(&dsl, g);
+    for (uint32_t b = 0; b < 3; b++) for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) free(ring[b][li]);
+    free(pos); free(toks); free(hcbuf); free(concat);
     fclose(f);
     return rc;
 }

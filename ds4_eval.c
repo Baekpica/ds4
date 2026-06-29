@@ -4240,6 +4240,19 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* D4.5b gate: per-bank DSpark injected-KV ring isolation. */
+    {
+        const char *sl_path = getenv("DS4_DSPARK_SLABS_VALIDATE");
+        if (sl_path && sl_path[0]) {
+            int drc = ds4_dspark_slabs_validate(engine, session, sl_path);
+            ds4_session_free(session);
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            return drc;
+        }
+    }
+
     eval_ui ui;
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
     tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);
