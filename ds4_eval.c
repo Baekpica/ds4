@@ -4253,6 +4253,19 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* D4.5c gate: inline capture tap during the production batched forward. */
+    {
+        const char *tap_path = getenv("DS4_DSPARK_TAP_VALIDATE");
+        if (tap_path && tap_path[0]) {
+            int drc = ds4_dspark_tap_validate(engine, session, tap_path);
+            ds4_session_free(session);
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            return drc;
+        }
+    }
+
     eval_ui ui;
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
     tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);

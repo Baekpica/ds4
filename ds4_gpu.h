@@ -1449,6 +1449,19 @@ int ds4_gpu_hc_weighted_sum_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* DSpark D4.5c inline capture: mean over n_hc HC lanes of `hc` ([n_tokens x
+ * n_hc x n_embd]) -> `concat` ([n_tokens x (n_slots*n_embd)]) at column
+ * slot*n_embd.  Enqueue right after a layer's encode to snapshot its mean hidden
+ * into the fusion concat without a readback. */
+int ds4_gpu_dspark_capture_mean_tensor(
+        ds4_gpu_tensor       *concat,
+        const ds4_gpu_tensor *hc,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens,
+        uint32_t                slot,
+        uint32_t                n_slots);
+
 int ds4_gpu_hc_weighted_sum_split_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,

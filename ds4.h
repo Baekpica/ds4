@@ -377,6 +377,9 @@ int ds4_dspark_capture_validate(ds4_engine *e, ds4_session *s, const char *trace
 /* DSpark per-bank injected-KV ring isolation gate (D4.5b): injects different
  * records into different banks and verifies cross-bank ring isolation. 0 = pass. */
 int ds4_dspark_slabs_validate(ds4_engine *e, ds4_session *s, const char *trace_path);
+/* DSpark inline capture-tap gate (D4.5c): runs the production batched forward with
+ * the layer-40/41/42 capture hook on and compares to the trace's 3-slice hidden. */
+int ds4_dspark_tap_validate(ds4_engine *e, ds4_session *s, const char *trace_path);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);

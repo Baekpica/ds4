@@ -2428,6 +2428,7 @@ typedef struct {
 #define DS4_DSPARK_N_LAYER 3
 #define DS4_DSPARK_BLOCK    5   /* drafter block length B (noise-filled) */
 #define DS4_DSPARK_NOISE_TOKEN 128799  /* DSpark block filler token (paper) */
+#define DS4_DSPARK_CAP_LAYER0 40       /* first target layer captured for KV injection (40/41/42) */
 
 typedef struct {
     ds4_tensor *main_proj;
@@ -9100,6 +9101,10 @@ typedef struct {
     ds4_gpu_tensor *dspark_block_logits; /* base_logits [B,vocab] */
     uint32_t dspark_n_raw;
     bool dspark_enabled;
+    /* D4.5c: when set, the batched verify/prefill forward taps batch_cur_hc after
+     * layers 40/41/42 into dspark_concat (mean-HC) -- a zero-extra-forward inline
+     * capture. Off (default) = bit-identical to the non-DSpark forward. */
+    bool dspark_capture;
 
     uint32_t prefill_cap;
     uint32_t raw_window;
@@ -26191,6 +26196,88 @@ int ds4_dspark_slabs_validate(ds4_engine *e, ds4_session *s, const char *trace_p
     return rc;
 }
 
+/* D4.5c gate: INLINE capture tap.  Runs the PRODUCTION batched verify/prefill
+ * forward (metal_graph_batch_eval_logits) over each record's tokens with
+ * g->dspark_capture on -- the capture-mean kernel snapshots layers 40/41/42 into
+ * dspark_concat during the forward the engine already runs (zero extra forward).
+ * Compares the inline-captured mean-HC (dspark_concat slices) to the trace's
+ * stored 3-slice mean-HC.  Tiny diff (GPU lane-mean vs the dump's host mean of
+ * the SAME hidden) = MATCH -> the inline serving tap is faithful. */
+int ds4_dspark_tap_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    if (!e || !s) { fprintf(stderr, "ds4: dspark tap validate: no engine/session\n"); return 1; }
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->dspark_concat) { fprintf(stderr, "ds4: dspark tap validate: capture buffers absent (need DS4_DSPARK_MODEL)\n"); return 1; }
+    const uint32_t pc = g->prefill_cap;
+    int max_rec = 0;
+    { const char *v = getenv("DS4_DSPARK_TAP_MAXREC"); if (v && atoi(v) > 0) max_rec = atoi(v); }
+
+    FILE *f = fopen(trace_path, "rb");
+    if (!f) { fprintf(stderr, "ds4: cannot open trace %s\n", trace_path); return 1; }
+    char magic[8]; uint32_t hdr[3];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "DS4DSPK1", 8) != 0 ||
+        fread(hdr, sizeof(uint32_t), 3, f) != 3) { fprintf(stderr, "ds4: bad trace header\n"); fclose(f); return 1; }
+    if (hdr[0] != (uint32_t)DS4_N_EMBD || hdr[1] != 3u) { fprintf(stderr, "ds4: trace mismatch\n"); fclose(f); return 1; }
+    const uint32_t use_rec = (max_rec > 0 && (uint32_t)max_rec < hdr[2]) ? (uint32_t)max_rec : hdr[2];
+
+    int32_t *toks = xmalloc((size_t)pc * sizeof(int32_t));
+    int     *itoks = xmalloc((size_t)pc * sizeof(int));
+    float   *stored[3]; for (int k = 0; k < 3; k++) stored[k] = xmalloc((size_t)pc * DS4_N_EMBD * sizeof(float));
+    float   *cap = xmalloc((size_t)pc * 3u * DS4_N_EMBD * sizeof(float));
+    double worst_max = 0.0, worst_rel = 0.0;
+    int rc = 0; char err[160];
+
+    for (uint32_t ri = 0; ri < use_rec && rc == 0; ri++) {
+        uint32_t plen = 0, total = 0;
+        if (fread(&plen, 4, 1, f) != 1 || fread(&total, 4, 1, f) != 1) { rc = 1; break; }
+        if (total == 0 || total > pc) {
+            fseek(f, (long)total * 4 + (long)3 * total * DS4_N_EMBD * 4, SEEK_CUR);
+            fprintf(stderr, "ds4: tap: skip rec %u total=%u\n", ri, total); continue;
+        }
+        if (fread(toks, sizeof(int32_t), total, f) != total) { rc = 1; break; }
+        for (int k = 0; k < 3; k++)
+            if (fread(stored[k], sizeof(float), (size_t)total * DS4_N_EMBD, f) != (size_t)total * DS4_N_EMBD) { rc = 1; break; }
+        if (rc) break;
+        for (uint32_t i = 0; i < total; i++) itoks[i] = toks[i];
+
+        (void)ds4_session_layer_slice_reset(s, err, sizeof(err));
+        g->dspark_capture = true;
+        bool ok = metal_graph_batch_eval_logits(g, &e->model, &e->weights, itoks, 0u, total, NULL);
+        g->dspark_capture = false;
+        if (ok) ok = ds4_gpu_tensor_read(g->dspark_concat, 0, cap,
+                                         (uint64_t)total * 3u * DS4_N_EMBD * sizeof(float)) != 0;
+        (void)ds4_session_layer_slice_reset(s, err, sizeof(err));
+        if (!ok) { fprintf(stderr, "ds4: tap: forward/read failed rec %u\n", ri); rc = 1; break; }
+
+        double rec_max = 0.0, rec_ref = 0.0;
+        for (uint32_t t = 0; t < total; t++)
+            for (int k = 0; k < 3; k++) {
+                const float *capk = cap + (size_t)t * 3u * DS4_N_EMBD + (size_t)k * DS4_N_EMBD;
+                const float *stk  = stored[k] + (size_t)t * DS4_N_EMBD;
+                for (uint32_t d = 0; d < (uint32_t)DS4_N_EMBD; d++) {
+                    double diff = fabs((double)capk[d] - (double)stk[d]);
+                    if (diff > rec_max) rec_max = diff;
+                    double a = fabs((double)stk[d]); if (a > rec_ref) rec_ref = a;
+                }
+            }
+        const double rel = rec_ref > 0 ? rec_max / rec_ref : rec_max;
+        if (rec_max > worst_max) worst_max = rec_max;
+        if (rel > worst_rel) worst_rel = rel;
+        fprintf(stderr, "ds4: dspark tap rec %u: total=%u max_abs_diff=%.3e rel=%.3e\n", ri, total, rec_max, rel);
+    }
+
+    if (rc == 0) {
+        const bool pass = worst_rel < 1e-4;   /* GPU lane-mean vs host lane-mean of identical hidden */
+        fprintf(stderr, "ds4: DSPARK TAP %s: worst max_abs_diff=%.3e worst_rel=%.3e "
+                "(inline production-forward capture vs 3-slice dump)\n",
+                pass ? "MATCH" : "DIVERGE", worst_max, worst_rel);
+        if (!pass) rc = 1;
+    }
+    for (int k = 0; k < 3; k++) free(stored[k]);
+    free(cap); free(itoks); free(toks);
+    fclose(f);
+    return rc;
+}
+
 /* Host Markov rank-r refine: refined[v] = base_logits_i[v] + sum_k w2[v,k]*prev_embed[k]. */
 typedef struct {
     const float    *base_logits_i;
@@ -27962,6 +28049,16 @@ static bool metal_graph_batch_eval_logits(
                                             il,
                                             pos0,
                                             n);
+        /* D4.5c inline target-hidden capture: after layers 40/41/42 snapshot the
+         * mean-HC hidden into dspark_concat[*,slot*n_embd] (slot 0/1/2).  Stream-
+         * ordered after this layer's encode, before the next overwrites batch_cur_hc.
+         * Off unless g->dspark_capture (DSpark spec mode) -- zero cost otherwise. */
+        if (ok && g->dspark_capture && g->dspark_concat &&
+            il >= DS4_DSPARK_CAP_LAYER0 && il < DS4_DSPARK_CAP_LAYER0 + DS4_DSPARK_N_LAYER) {
+            ok = ds4_gpu_dspark_capture_mean_tensor(g->dspark_concat, g->batch_cur_hc,
+                                                    DS4_N_EMBD, DS4_N_HC, n,
+                                                    il - DS4_DSPARK_CAP_LAYER0, DS4_DSPARK_N_LAYER) != 0;
+        }
     }
     g->batch_use_positions = false;
     if (ok) ok = ds4_gpu_end_commands() != 0;

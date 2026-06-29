@@ -8040,6 +8040,27 @@ __global__ static void hc_weighted_sum_kernel(float *out, const float *x, const 
     out[(uint64_t)t * n_embd + d] = acc;
 }
 
+/* DSpark D4.5c inline capture: mean over the n_hc HC lanes of a just-computed
+ * layer's hidden (batch_cur_hc) and write it DIRECTLY into the [n_tokens x
+ * (n_slots*n_embd)] concat buffer at column slot*n_embd (slot 0/1/2 = the fused
+ * hidden from target layers 40/41/42).  One pass: read full hc once, write n_embd
+ * (4x less than a full snapshot), no readback.  Enqueued right after the layer's
+ * encode in the live verify/prefill forward -- stream order guarantees it reads
+ * the layer output before the next layer overwrites batch_cur_hc. */
+__global__ static void dspark_capture_mean_kernel(
+        float *concat, const float *hc, uint32_t n_embd, uint32_t n_hc,
+        uint32_t n_tokens, uint32_t slot, uint32_t n_slots) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_embd * n_tokens;
+    if (gid >= n) return;
+    uint32_t d = gid % n_embd;
+    uint32_t t = gid / n_embd;
+    float acc = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++)
+        acc += hc[(uint64_t)t * n_hc * n_embd + (uint64_t)h * n_embd + d];
+    concat[(uint64_t)t * n_slots * n_embd + (uint64_t)slot * n_embd + d] = acc / (float)n_hc;
+}
+
 __global__ static void hc_expand_kernel(
         float *out_hc,
         const float *block_out,
@@ -18632,6 +18653,14 @@ extern "C" int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu
         (float *)out->ptr, (const float *)residual_hc->ptr, (const float *)weights->ptr,
         n_embd, n_hc, n_tokens, n_hc);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum launch");
+}
+extern "C" int ds4_gpu_dspark_capture_mean_tensor(ds4_gpu_tensor *concat, const ds4_gpu_tensor *hc,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t slot, uint32_t n_slots) {
+    if (!concat || !hc || n_embd == 0 || n_hc == 0 || n_tokens == 0 || slot >= n_slots) return 0;
+    uint64_t n = (uint64_t)n_embd * n_tokens;
+    dspark_capture_mean_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
+        (float *)concat->ptr, (const float *)hc->ptr, n_embd, n_hc, n_tokens, slot, n_slots);
+    return cuda_ok(cudaGetLastError(), "dspark_capture_mean launch");
 }
 extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
