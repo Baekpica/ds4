@@ -4211,6 +4211,21 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* D4.4 gate: replay a DS4DSPK1 trace through the in-engine DSpark block
+     * forward + Markov refine and report the GPU accept length (must reproduce
+     * the offline probe: pos-0 ~0.875 / commit ~3.12). Needs DS4_DSPARK_MODEL. */
+    {
+        const char *blk_path = getenv("DS4_DSPARK_BLOCK_VALIDATE");
+        if (blk_path && blk_path[0]) {
+            int drc = ds4_dspark_block_validate(engine, session, blk_path);
+            ds4_session_free(session);
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            return drc;
+        }
+    }
+
     eval_ui ui;
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
     tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);

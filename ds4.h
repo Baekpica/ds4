@@ -364,6 +364,11 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
 /* Standalone DSpark/dflash drafter GGUF load + strict layout validation (D1 gate).
  * Low-RAM: opens only the drafter file, no base model required. Returns 0 on OK. */
 int ds4_dspark_validate(const char *path);
+/* DSpark GPU block-forward accept gate (D4.4): replays a DS4DSPK1 hidden trace
+ * through the in-engine drafter block forward + Markov refine and reports
+ * pos-0 accept / mean commit (target: ~0.875 / ~3.12). Needs base + drafter
+ * loaded + a live session. Returns 0 on success. */
+int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_path);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
