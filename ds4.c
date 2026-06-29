@@ -18441,6 +18441,60 @@ static bool metal_graph_dspark_inject(
     return ok;
 }
 
+/* D4.5c on-device Markov refine: cand[b][0]=bonus[b]; cand[b][j+1]=argmax over
+ * (base_logits[(b*B+j)*vocab] + markov_w2 @ markov_w1[cand[b][j]]).  All on device,
+ * 4 autoregressive steps in ONE begin/end (stream order satisfies the recurrence) --
+ * NO per-step logit readback (only the final [B*nb] candidate ids leave the GPU).
+ * Reuses the F16 embed-gather (markov_w1 is a [vocab x rank] F16 table) + matmul_f16
+ * (markov_w2) + the fused markov-step argmax.  cand_dev = [B*nb] i32 scratch laid out
+ * row-major by block-position (row j = the j-th candidate of every bank, contiguous),
+ * so step j gathers cand_dev row j and writes row j+1 with no strided copy.  Writes
+ * out_cand[b*B + j] (host).  Pure accept-rate side. */
+static bool metal_graph_dspark_markov_refine(
+        ds4_gpu_graph            *g,
+        const ds4_model          *dspark_model,
+        const ds4_dspark_weights *dw,
+        ds4_gpu_tensor           *base_logits,
+        uint32_t                  nb,
+        uint32_t                  B,
+        uint64_t                  vocab,
+        const int32_t            *bonus,
+        ds4_gpu_tensor           *cand_dev,    /* [B*nb] i32 scratch */
+        ds4_gpu_tensor           *prev_embed,  /* [nb*markov_rank] f32 scratch */
+        ds4_gpu_tensor           *bias,        /* [nb*vocab] f32 scratch */
+        int32_t                  *out_cand) {
+    if (nb == 0 || B == 0 || !base_logits || !cand_dev || !prev_embed || !bias || !out_cand) return false;
+    const uint32_t mr   = (uint32_t)dw->markov_w2->dim[0];     /* rank (256) */
+    const uint32_t mv   = (uint32_t)dw->markov_w1->dim[1];     /* markov table vocab rows */
+    /* row 0 of cand_dev = the per-bank bonus token */
+    bool ok = ds4_gpu_tensor_write(cand_dev, 0, bonus, (uint64_t)nb * sizeof(int32_t)) != 0;
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    const char *stage = "begin";
+    for (uint32_t j = 0; ok && j + 1u < B; j++) {
+        ds4_gpu_tensor *prev_ids = ds4_gpu_tensor_view(cand_dev, (uint64_t)j * nb * sizeof(int32_t), (uint64_t)nb * sizeof(int32_t));
+        ds4_gpu_tensor *next_ids = ds4_gpu_tensor_view(cand_dev, (uint64_t)(j + 1u) * nb * sizeof(int32_t), (uint64_t)nb * sizeof(int32_t));
+        ok = prev_ids && next_ids;
+        if (ok) { stage = "gather"; ok = ds4_gpu_embed_tokens_hc_tensor(prev_embed, prev_ids,
+                                        dspark_model->map, dspark_model->size, dw->markov_w1->abs_offset,
+                                        mv, nb, mr, 1u) != 0; }
+        if (ok) { stage = "matvec"; ok = ds4_gpu_matmul_f16_tensor(bias, dspark_model->map, dspark_model->size,
+                                        dw->markov_w2->abs_offset, mr, vocab, prev_embed, nb) != 0; }
+        if (ok) { stage = "argmax"; ok = ds4_gpu_dspark_markov_step_tensor(next_ids, base_logits, j, B, bias, (uint32_t)vocab, nb) != 0; }
+        if (prev_ids) ds4_gpu_tensor_free(prev_ids);
+        if (next_ids) ds4_gpu_tensor_free(next_ids);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    /* read the [B*nb] candidate grid (row j = j-th cand of all banks) -> out_cand[b*B+j] */
+    if (ok) {
+        int32_t *grid = xmalloc((size_t)B * nb * sizeof(int32_t));
+        ok = ds4_gpu_tensor_read(cand_dev, 0, grid, (uint64_t)B * nb * sizeof(int32_t)) != 0;
+        if (ok) for (uint32_t b = 0; b < nb; b++) for (uint32_t j = 0; j < B; j++) out_cand[b * B + j] = grid[j * nb + b];
+        free(grid);
+    }
+    if (!ok) { (void)ds4_gpu_synchronize(); fprintf(stderr, "ds4: dspark_markov_refine FAIL @%s nb=%u\n", stage, nb); }
+    return ok;
+}
+
 /* One DSpark block forward.  inj_kv[li] = the FULL per-layer target-fused KV
  * [<=prefill_cap rows x head_dim], already rope'd per absolute position (built
  * once per record by the caller).  Pre-fills each ring with the prefix window
@@ -26462,6 +26516,18 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
     bool ms_slab_ok = !ms_mode || ds4_dspark_slabs_alloc(&ms_slab, g, 1u);
     if (ms_mode && !ms_slab_ok) { fprintf(stderr, "ds4: dspark block MS: slab alloc failed\n"); }
 
+    /* DS4_DSPARK_MARKOV_DEV: also run the ON-DEVICE Markov refine per step (nb=1) and
+     * count argmax agreement vs the host refine -- validates the device path. */
+    const bool markov_dev = getenv("DS4_DSPARK_MARKOV_DEV") != NULL;
+    ds4_gpu_tensor *mk_cand = NULL, *mk_prev = NULL, *mk_bias = NULL;
+    uint64_t mkdev_total = 0, mkdev_agree = 0;
+    if (markov_dev) {
+        mk_cand = ds4_gpu_tensor_alloc((uint64_t)B * sizeof(int32_t));            /* [B*nb=B] */
+        mk_prev = ds4_gpu_tensor_alloc((uint64_t)markov_rank * sizeof(float));    /* [nb*rank] */
+        mk_bias = ds4_gpu_tensor_alloc((uint64_t)vocab * sizeof(float));          /* [nb*vocab] */
+        if (!mk_cand || !mk_prev || !mk_bias) { fprintf(stderr, "ds4: markov-dev scratch alloc failed\n"); }
+    }
+
     FILE *f = fopen(trace_path, "rb");
     if (!f) { fprintf(stderr, "ds4: cannot open trace %s\n", trace_path); return 1; }
     char magic[8];
@@ -26584,6 +26650,14 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
                 for (uint64_t v = 1; v < vocab; v++) if (refined[v] > bv) { bv = refined[v]; best = (int)v; }
                 cand[i + 1] = best;
             }
+            /* D4.5c on-device Markov A/B: same base_logits + bonus -> compare argmax cands */
+            if (markov_dev && mk_cand && mk_prev && mk_bias) {
+                int32_t dev_cand[DS4_DSPARK_BLOCK]; int32_t bonus1 = bonus;
+                if (metal_graph_dspark_markov_refine(g, dspark_model, dw, g->dspark_block_logits,
+                                                     1u, B, vocab, &bonus1, mk_cand, mk_prev, mk_bias, dev_cand)) {
+                    for (uint32_t j = 1; j < B; j++) { mkdev_total++; if (dev_cand[j] == cand[j]) mkdev_agree++; }
+                }
+            }
             uint32_t al = 0;
             for (uint32_t j = 1; j < B; j++) {
                 if (P + j < total && cand[j] == toks[P + j]) al++; else break;
@@ -26606,11 +26680,20 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
                 mean_accept, mean_accept + 1.0, dist[0], dist[1], dist[2], dist[3], dist[4]);
         fprintf(stderr, "ds4: D4.4 %s (commit %.2f vs probe 3.12 / break-even 2.3; pos0 vs probe 0.875)\n",
                 (mean_accept + 1.0 >= 2.3) ? "GO" : "NO-GO", mean_accept + 1.0);
+        if (markov_dev && mkdev_total > 0) {
+            const double agr = (double)mkdev_agree / (double)mkdev_total;
+            fprintf(stderr, "ds4: DSPARK MARKOV-DEV %s: argmax agree=%llu/%llu (%.4f) vs host refine\n",
+                    agr >= 0.999 ? "MATCH" : "DIVERGE", (unsigned long long)mkdev_agree,
+                    (unsigned long long)mkdev_total, agr);
+        }
     } else if (rc == 0) {
         fprintf(stderr, "ds4: DSPARK BLOCK GPU: no steps measured\n");
     }
 
     if (ms_mode) ds4_dspark_slabs_free(&ms_slab, g);
+    if (mk_cand) ds4_gpu_tensor_free(mk_cand);
+    if (mk_prev) ds4_gpu_tensor_free(mk_prev);
+    if (mk_bias) ds4_gpu_tensor_free(mk_bias);
     for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) if (inj_kv[li]) ds4_gpu_tensor_free(inj_kv[li]);
     free(refined); free(blk); free(prev_embed); free(pos_host); free(toks); free(hc_buf); free(concat);
     fclose(f);

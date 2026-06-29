@@ -519,6 +519,18 @@ int ds4_gpu_argmax_rows_tensor(
         uint32_t                n_vocab,
         uint32_t                n_rows);
 
+/* DSpark D4.5c on-device Markov refine step: per bank b (0..nb), argmax over
+ * (base_logits[(b*B+blk_pos)*vocab + v] + bias[b*vocab + v]) -> cand_out[b].
+ * bias = markov_w2 @ markov_w1[prev]; base_logits = the [nb*B, vocab] block output. */
+int ds4_gpu_dspark_markov_step_tensor(
+        ds4_gpu_tensor       *cand_out,
+        const ds4_gpu_tensor *base_logits,
+        uint32_t                blk_pos,
+        uint32_t                B,
+        const ds4_gpu_tensor *bias,
+        uint32_t                vocab,
+        uint32_t                nb);
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,

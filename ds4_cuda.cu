@@ -9480,6 +9480,39 @@ __global__ static void argmax_rows_kernel(int32_t *out_idx, const float *logits,
     if (tid == 0) out_idx[row] = sm_idx[0];
 }
 
+/* DSpark D4.5c on-device Markov refine step: for each of nb banks, argmax over
+ * (base_logits[(b*B + blk_pos)*vocab + v] + bias[b*vocab + v]).  base_logits is the
+ * [nb*B, vocab] block-forward output (block row b*B+blk_pos is bank b's blk_pos-th
+ * draft position); bias = markov_w2 @ markov_w1[prev_cand[b]] ([nb, vocab]).  Tie ->
+ * lowest index (matches the host refine's strict-greater scan).  One block per bank. */
+__global__ static void dspark_markov_step_kernel(int32_t *cand_out, const float *base_logits,
+        uint32_t blk_pos, uint32_t B, const float *bias, uint32_t vocab, uint32_t nb) {
+    enum { THREADS = 1024 };
+    __shared__ float sm_val[THREADS];
+    __shared__ int32_t sm_idx[THREADS];
+    const uint32_t b = blockIdx.x;
+    if (b >= nb) return;
+    const float *blog = base_logits + (uint64_t)(b * B + blk_pos) * vocab;
+    const float *brow = bias + (uint64_t)b * vocab;
+    const uint32_t tid = threadIdx.x;
+    float local_v = -INFINITY; int32_t local_i = 0;
+    for (uint32_t v = tid; v < vocab; v += THREADS) {
+        const float s = blog[v] + brow[v];
+        if (s > local_v) { local_v = s; local_i = (int32_t)v; }
+    }
+    sm_val[tid] = local_v; sm_idx[tid] = local_i;
+    __syncthreads();
+    for (uint32_t s = THREADS / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            const float vr = sm_val[tid + s]; const int32_t ir = sm_idx[tid + s];
+            const float vl = sm_val[tid];     const int32_t il = sm_idx[tid];
+            if ((vr > vl) || (vr == vl && ir < il)) { sm_val[tid] = vr; sm_idx[tid] = ir; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) cand_out[b] = sm_idx[0];
+}
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k,
         /* PC5 substrate override (see indexer_topk_8192_cub_kernel docstring). */
         const struct ds4_layer_scalars * __restrict__ ls_override) {
@@ -10606,6 +10639,15 @@ extern "C" int ds4_gpu_argmax_rows_tensor(
     argmax_rows_kernel<<<n_rows, 1024, 0, ds4_current_stream()>>>(
         (int32_t *)out_idx->ptr, (const float *)logits->ptr, n_vocab, n_rows);
     return cuda_ok(cudaGetLastError(), "argmax_rows launch");
+}
+
+extern "C" int ds4_gpu_dspark_markov_step_tensor(ds4_gpu_tensor *cand_out, const ds4_gpu_tensor *base_logits,
+        uint32_t blk_pos, uint32_t B, const ds4_gpu_tensor *bias, uint32_t vocab, uint32_t nb) {
+    if (!cand_out || !base_logits || !bias || vocab == 0 || nb == 0 || B == 0 || blk_pos >= B) return 0;
+    dspark_markov_step_kernel<<<nb, 1024, 0, ds4_current_stream()>>>(
+        (int32_t *)cand_out->ptr, (const float *)base_logits->ptr, blk_pos, B,
+        (const float *)bias->ptr, vocab, nb);
+    return cuda_ok(cudaGetLastError(), "dspark_markov_step launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
