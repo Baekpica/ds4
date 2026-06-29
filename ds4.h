@@ -369,6 +369,11 @@ int ds4_dspark_validate(const char *path);
  * pos-0 accept / mean commit (target: ~0.875 / ~3.12). Needs base + drafter
  * loaded + a live session. Returns 0 on success. */
 int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_path);
+/* DSpark single-forward target-hidden capture gate (D4.5a): live-captures the
+ * mean-HC hidden at layers 40/41/42 from each trace record's tokens and compares
+ * against the trace's 3-slice hidden. Near-zero diff proves the inline serving
+ * capture is faithful. Returns 0 on success. */
+int ds4_dspark_capture_validate(ds4_engine *e, ds4_session *s, const char *trace_path);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);

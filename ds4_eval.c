@@ -4226,6 +4226,20 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* D4.5a gate: single-forward target-hidden capture vs the trace's 3-slice
+     * hidden (the inline serving-capture mechanism). Near-zero diff = MATCH. */
+    {
+        const char *cap_path = getenv("DS4_DSPARK_CAPTURE_VALIDATE");
+        if (cap_path && cap_path[0]) {
+            int drc = ds4_dspark_capture_validate(engine, session, cap_path);
+            ds4_session_free(session);
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            return drc;
+        }
+    }
+
     eval_ui ui;
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
     tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);

@@ -25808,6 +25808,155 @@ struct ds4_session {
 };
 
 #ifndef DS4_NO_GPU
+/* D4.5a single-forward target-hidden capture: forward layers [0,42] over a
+ * zero-prefix token span in ONE pass and snapshot the mean-HC hidden after each
+ * of layers 40/41/42 into out_mean[0..2] ([n_tok x n_embd] host buffers).  This
+ * is the in-engine single-pass equivalent of the dump's 3-slice capture
+ * (eval_dspark_dump runs eval_layer_slice 3x = 3 forwards over 0..40/41/42); the
+ * serving spec path will tap these same 3 layers inline during its verify
+ * forward.  Caller resets prefill state between spans (zero-prefix each). */
+static bool metal_graph_dspark_capture_hc(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *tokens,
+        uint32_t           n_tok,
+        float             *out_mean[3]) {
+    const uint32_t cap_layers[3] = { 40u, 41u, 42u };
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    if (n_tok == 0 || n_tok > g->prefill_cap || cap_layers[2] >= (uint32_t)DS4_N_LAYER) return false;
+    ds4_gpu_tensor *cap[3] = {0};
+    for (int k = 0; k < 3; k++) cap[k] = ds4_gpu_tensor_alloc((uint64_t)n_tok * hc_dim * sizeof(float));
+    float *host = xmalloc((size_t)n_tok * hc_dim * sizeof(float));
+    bool ok = cap[0] && cap[1] && cap[2] && host;
+
+    const bool sav_ms = g->batch_multiseq, sav_pf = g->batch_multiseq_prefilled,
+               sav_up = g->batch_use_positions;
+    const uint32_t sav_msl = g->batch_max_seq_len;
+    g->batch_multiseq = false; g->batch_multiseq_prefilled = false;
+    g->batch_use_positions = false; g->batch_max_seq_len = 0;
+
+    ds4_tokens span = { .v = (int *)tokens, .len = (int)n_tok, .cap = (int)n_tok };
+    if (ok) ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tok);
+    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc, g->prefill_tokens,
+                                                         model, weights, &span, 0, n_tok);
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    int cidx = 0;
+    for (uint32_t il = 0; ok && il <= cap_layers[2]; il++) {
+        ok = metal_graph_encode_layer_batch(g, model, &weights->layer[il], il, 0, n_tok);
+        if (ok && cidx < 3 && il == cap_layers[cidx]) {
+            ok = ds4_gpu_tensor_copy(cap[cidx], 0, g->batch_cur_hc, 0,
+                                     (uint64_t)n_tok * hc_dim * sizeof(float)) != 0;
+            cidx++;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    /* readback + mean over the n_hc lanes (host; matches eval_dspark_dump exactly) */
+    const float inv = 1.0f / (float)DS4_N_HC;
+    for (int k = 0; ok && k < 3; k++) {
+        ok = ds4_gpu_tensor_read(cap[k], 0, host, (uint64_t)n_tok * hc_dim * sizeof(float)) != 0;
+        for (uint32_t p = 0; ok && p < n_tok; p++) {
+            const float *src = host + (uint64_t)p * hc_dim;
+            float *dst = out_mean[k] + (uint64_t)p * DS4_N_EMBD;
+            for (uint32_t d = 0; d < (uint32_t)DS4_N_EMBD; d++) {
+                float acc = 0.0f;
+                for (uint32_t h = 0; h < (uint32_t)DS4_N_HC; h++) acc += src[(uint64_t)h * DS4_N_EMBD + d];
+                dst[d] = acc * inv;
+            }
+        }
+    }
+    g->batch_multiseq = sav_ms; g->batch_multiseq_prefilled = sav_pf;
+    g->batch_use_positions = sav_up; g->batch_max_seq_len = sav_msl;
+    for (int k = 0; k < 3; k++) if (cap[k]) ds4_gpu_tensor_free(cap[k]);
+    free(host);
+    if (!ok) (void)ds4_gpu_synchronize();
+    return ok;
+}
+
+/* D4.5a gate: for each DS4DSPK1 record, single-forward-capture the mean-HC hidden
+ * from the record's TOKENS and compare against the trace's stored (3-slice) hidden.
+ * Near-zero diff proves the inline single-pass capture == the dump's capture, the
+ * one new serving mechanism (the fusion + block forward are already validated by
+ * D4.4).  Env: DS4_DSPARK_CAPTURE_MAXREC (0=all). */
+int ds4_dspark_capture_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    if (!e || !s) { fprintf(stderr, "ds4: dspark capture validate: no engine/session\n"); return 1; }
+    ds4_gpu_graph *g = &s->graph;
+    const uint32_t pc = g->prefill_cap;
+    int max_rec = 0;
+    { const char *v = getenv("DS4_DSPARK_CAPTURE_MAXREC"); if (v && atoi(v) > 0) max_rec = atoi(v); }
+
+    FILE *f = fopen(trace_path, "rb");
+    if (!f) { fprintf(stderr, "ds4: cannot open trace %s\n", trace_path); return 1; }
+    char magic[8]; uint32_t hdr[3];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "DS4DSPK1", 8) != 0 ||
+        fread(hdr, sizeof(uint32_t), 3, f) != 3) { fprintf(stderr, "ds4: bad trace header\n"); fclose(f); return 1; }
+    const uint32_t t_embd = hdr[0], n_cap = hdr[1], n_rec = hdr[2];
+    if (t_embd != (uint32_t)DS4_N_EMBD || n_cap != 3) {
+        fprintf(stderr, "ds4: trace mismatch n_embd=%u n_cap=%u\n", t_embd, n_cap); fclose(f); return 1;
+    }
+    const uint32_t use_rec = (max_rec > 0 && (uint32_t)max_rec < n_rec) ? (uint32_t)max_rec : n_rec;
+
+    int32_t *toks = xmalloc((size_t)pc * sizeof(int32_t));
+    float *stored[3], *live[3];
+    for (int k = 0; k < 3; k++) {
+        stored[k] = xmalloc((size_t)pc * DS4_N_EMBD * sizeof(float));
+        live[k]   = xmalloc((size_t)pc * DS4_N_EMBD * sizeof(float));
+    }
+    double worst_max = 0.0, worst_rel = 0.0;
+    int rc = 0;
+    char err[160];
+
+    for (uint32_t ri = 0; ri < use_rec && rc == 0; ri++) {
+        uint32_t plen = 0, total = 0;
+        if (fread(&plen, 4, 1, f) != 1 || fread(&total, 4, 1, f) != 1) { rc = 1; break; }
+        if (total == 0 || total > pc) {
+            long skip = (long)total * 4 + (long)3 * total * DS4_N_EMBD * 4;
+            fseek(f, skip, SEEK_CUR);
+            fprintf(stderr, "ds4: capture: skip rec %u total=%u (pc=%u)\n", ri, total, pc);
+            continue;
+        }
+        if (fread(toks, sizeof(int32_t), total, f) != total) { rc = 1; break; }
+        for (int k = 0; k < 3; k++)
+            if (fread(stored[k], sizeof(float), (size_t)total * DS4_N_EMBD, f) != (size_t)total * DS4_N_EMBD) { rc = 1; break; }
+        if (rc) break;
+
+        (void)ds4_session_layer_slice_reset(s, err, sizeof(err));
+        int *itoks = xmalloc((size_t)total * sizeof(int));
+        for (uint32_t i = 0; i < total; i++) itoks[i] = toks[i];
+        float *mean_ptr[3] = { live[0], live[1], live[2] };
+        bool ok = metal_graph_dspark_capture_hc(g, &e->model, &e->weights, itoks, total, mean_ptr);
+        free(itoks);
+        if (!ok) { fprintf(stderr, "ds4: capture: forward failed rec %u\n", ri); rc = 1; break; }
+        (void)ds4_session_layer_slice_reset(s, err, sizeof(err));
+
+        double rec_max = 0.0, rec_ref = 0.0;
+        for (int k = 0; k < 3; k++) {
+            for (size_t i = 0; i < (size_t)total * DS4_N_EMBD; i++) {
+                double d = fabs((double)live[k][i] - (double)stored[k][i]);
+                if (d > rec_max) rec_max = d;
+                double a = fabs((double)stored[k][i]);
+                if (a > rec_ref) rec_ref = a;
+            }
+        }
+        const double rel = rec_ref > 0 ? rec_max / rec_ref : rec_max;
+        if (rec_max > worst_max) worst_max = rec_max;
+        if (rel > worst_rel) worst_rel = rel;
+        fprintf(stderr, "ds4: dspark capture rec %u: total=%u max_abs_diff=%.3e rel=%.3e\n",
+                ri, total, rec_max, rel);
+    }
+
+    if (rc == 0) {
+        const bool pass = worst_max < 1e-2 && worst_rel < 1e-3;
+        fprintf(stderr, "ds4: DSPARK CAPTURE %s: worst max_abs_diff=%.3e worst_rel=%.3e "
+                "(single-forward capture vs 3-slice dump)\n",
+                pass ? "MATCH" : "DIVERGE", worst_max, worst_rel);
+    }
+    for (int k = 0; k < 3; k++) { free(stored[k]); free(live[k]); }
+    free(toks);
+    fclose(f);
+    return rc;
+}
+
 /* Host Markov rank-r refine: refined[v] = base_logits_i[v] + sum_k w2[v,k]*prev_embed[k]. */
 typedef struct {
     const float    *base_logits_i;
