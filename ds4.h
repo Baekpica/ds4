@@ -89,6 +89,7 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *dspark_path;   /* DSpark/dflash block-drafter GGUF (optional) */
     ds4_backend backend;
     int n_threads;
     int mtp_draft_tokens;
@@ -141,6 +142,8 @@ const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
+/* Number of hyper-connection lanes (n_hc); hidden_f32_values / n_hc == n_embd. */
+int ds4_engine_n_hc(ds4_engine *e);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */

@@ -3951,6 +3951,137 @@ static int run_eval_batched(ds4_engine *engine, const eval_config *cfg, int ncas
     return 0;
 }
 
+/* ===================== DSpark D2: target hidden-state dump ===========================
+ * Greedy-decode the (2-bit) target on real eval prompts and write, per sequence
+ * position, the gold token plus the target's mean-HC hidden after layers 40/41/42 --
+ * the DSpark fusion inputs (main_proj(concat(hc40,hc41,hc42))). Consumed offline by
+ * gguf-tools/dspark_probe.py to measure the drafter's accept length (GO/NO-GO).
+ *
+ * Activated by DS4_DSPARK_DUMP=<trace_path> (DS4_DSPARK_DUMP_CASES / _GEN tune size).
+ * Reuses the eval-harness prompts + the standard session greedy loop, then captures
+ * via three clean batched prefills of the full gold sequence (ds4_session_eval_layer_
+ * slice with a reset between each -- no live-KV pollution).
+ *
+ * Trace format (little-endian):
+ *   magic char[8] "DS4DSPK1" ; u32 n_embd ; u32 n_cap_layers(=3) ; u32 n_records
+ *   per record: u32 prompt_len ; u32 total_len ; i32 token[total_len] ;
+ *               f32 hc40[total_len*n_embd] ; f32 hc41[...] ; f32 hc42[...]   */
+static int eval_dspark_dump(ds4_engine *engine, ds4_session *session,
+                            const eval_config *cfg, const char *trace_path) {
+    const uint64_t hc_dim = ds4_engine_hidden_f32_values(engine);
+    const int n_hc = ds4_engine_n_hc(engine);
+    if (n_hc <= 0 || hc_dim == 0 || hc_dim % (uint64_t)n_hc != 0) {
+        fprintf(stderr, "dspark-dump: bad hc geometry hc_dim=%llu n_hc=%d\n",
+                (unsigned long long)hc_dim, n_hc);
+        return 1;
+    }
+    const uint32_t n_embd = (uint32_t)(hc_dim / (uint64_t)n_hc);
+    const int prefill_cap = ds4_session_prefill_cap(session);
+    const int eos = ds4_token_eos(engine);
+    if (prefill_cap < 4) { fprintf(stderr, "dspark-dump: prefill cap too small (%d)\n", prefill_cap); return 1; }
+
+    int n_cases = 6, gen_len = 192;
+    { const char *e = getenv("DS4_DSPARK_DUMP_CASES"); if (e && atoi(e) > 0) n_cases = atoi(e); }
+    { const char *e = getenv("DS4_DSPARK_DUMP_GEN");   if (e && atoi(e) > 0) gen_len = atoi(e); }
+    const int total_cases = (int)(sizeof(eval_cases) / sizeof(eval_cases[0]));
+    if (n_cases > total_cases) n_cases = total_cases;
+
+    FILE *fp = fopen(trace_path, "wb");
+    if (!fp) { fprintf(stderr, "dspark-dump: cannot open %s: %s\n", trace_path, strerror(errno)); return 1; }
+    const char magic[8] = {'D','S','4','D','S','P','K','1'};
+    uint32_t hdr[3] = { n_embd, 3u, 0u };
+    fwrite(magic, 1, 8, fp);
+    long hdr_pos = ftell(fp);
+    fwrite(hdr, sizeof(uint32_t), 3, fp);
+
+    const ds4_think_mode tmode = ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
+    const char *system = eval_system_prompt();
+
+    float *cap_hc = malloc((size_t)prefill_cap * hc_dim * sizeof(float));
+    float *mean[3] = {0};
+    for (int i = 0; i < 3; i++) mean[i] = malloc((size_t)prefill_cap * (size_t)n_embd * sizeof(float));
+    int *seq = malloc((size_t)prefill_cap * sizeof(int));
+    if (!cap_hc || !mean[0] || !mean[1] || !mean[2] || !seq) {
+        fprintf(stderr, "dspark-dump: OOM\n");
+        free(cap_hc); free(mean[0]); free(mean[1]); free(mean[2]); free(seq); fclose(fp); return 1;
+    }
+
+    const uint32_t cap_layers[3] = { 40u, 41u, 42u };
+    uint32_t n_records = 0;
+    char err[256];
+
+    for (int ci = 0; ci < n_cases; ci++) {
+        const eval_case *tc = &eval_cases[ci];
+        char *question = build_question_prompt(tc);
+        if (!question) continue;
+        ds4_tokens prompt = {0};
+        ds4_encode_chat_prompt(engine, system, question, tmode, &prompt);
+        free(question);
+        if (prompt.len < 1 || prompt.len + 2 >= prefill_cap) { ds4_tokens_free(&prompt); continue; }
+
+        /* pass 1: greedy-generate the gold continuation */
+        int seq_len = 0;
+        for (int i = 0; i < prompt.len && seq_len < prefill_cap; i++) seq[seq_len++] = prompt.v[i];
+        const uint32_t prompt_len = (uint32_t)seq_len;
+        int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+        ds4_tokens_free(&prompt);
+        if (sync_rc != 0) { fprintf(stderr, "dspark-dump: sync failed case %d: %s\n", ci, err); continue; }
+
+        int gend = 0;
+        while (gend < gen_len && seq_len < prefill_cap) {
+            int tok = ds4_session_argmax(session);
+            if (tok < 0 || tok == eos) break;
+            seq[seq_len++] = tok; gend++;
+            if (ds4_session_eval(session, tok, err, sizeof(err)) != 0) {
+                fprintf(stderr, "dspark-dump: eval failed case %d: %s\n", ci, err); break;
+            }
+        }
+        if (seq_len < 2) continue;
+
+        /* pass 2: capture mean-HC at layers 40/41/42 over the full gold sequence */
+        bool cap_ok = true;
+        const float inv = 1.0f / (float)n_hc;
+        for (int li = 0; li < 3 && cap_ok; li++) {
+            if (ds4_session_layer_slice_reset(session, err, sizeof(err)) != 0) {
+                fprintf(stderr, "dspark-dump: slice reset failed: %s\n", err); cap_ok = false; break;
+            }
+            if (ds4_session_eval_layer_slice(session, seq, (uint32_t)seq_len, 0,
+                                             0, cap_layers[li], NULL, cap_hc,
+                                             false, NULL, err, sizeof(err)) != 0) {
+                fprintf(stderr, "dspark-dump: layer-slice [0,%u] failed: %s\n", cap_layers[li], err);
+                cap_ok = false; break;
+            }
+            for (int p = 0; p < seq_len; p++) {
+                const float *src = cap_hc + (uint64_t)p * hc_dim;
+                float *dst = mean[li] + (uint64_t)p * n_embd;
+                for (uint32_t d = 0; d < n_embd; d++) {
+                    float acc = 0.0f;
+                    for (int h = 0; h < n_hc; h++) acc += src[(uint64_t)h * (uint64_t)n_embd + d];
+                    dst[d] = acc * inv;
+                }
+            }
+        }
+        (void)ds4_session_layer_slice_reset(session, err, sizeof(err));  /* leave session clean */
+        if (!cap_ok) continue;
+
+        uint32_t rec[2] = { prompt_len, (uint32_t)seq_len };
+        fwrite(rec, sizeof(uint32_t), 2, fp);
+        fwrite(seq, sizeof(int), (size_t)seq_len, fp);
+        for (int li = 0; li < 3; li++) fwrite(mean[li], sizeof(float), (size_t)seq_len * n_embd, fp);
+        n_records++;
+        fprintf(stderr, "dspark-dump: case %d/%d prompt=%u gen=%d total=%d\n",
+                ci + 1, n_cases, prompt_len, gend, seq_len);
+    }
+
+    fseek(fp, hdr_pos, SEEK_SET);
+    hdr[2] = n_records;
+    fwrite(hdr, sizeof(uint32_t), 3, fp);
+    fclose(fp);
+    free(cap_hc); free(mean[0]); free(mean[1]); free(mean[2]); free(seq);
+    fprintf(stderr, "dspark-dump: wrote %u records (n_embd=%u) to %s\n", n_records, n_embd, trace_path);
+    return n_records > 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     /* D1 gate: validate a DSpark drafter GGUF standalone (no base model, low RAM).
      *   DS4_DSPARK_VALIDATE=/path/to/dspark.gguf ds4-eval */
@@ -4064,6 +4195,20 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         free(case_sequence);
         return 1;
+    }
+
+    /* D2 gate: dump target hidden states (layers 40/41/42) + gold tokens for the
+     * offline DSpark accept probe. Reuses the engine+session; exits when done. */
+    {
+        const char *dump_path = getenv("DS4_DSPARK_DUMP");
+        if (dump_path && dump_path[0]) {
+            int drc = eval_dspark_dump(engine, session, &cfg, dump_path);
+            ds4_session_free(session);
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            return drc;
+        }
     }
 
     eval_ui ui;

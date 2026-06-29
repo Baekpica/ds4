@@ -2426,6 +2426,7 @@ typedef struct {
  * (hc_head_*) + norm feeding the shared target lm_head.
  */
 #define DS4_DSPARK_N_LAYER 3
+#define DS4_DSPARK_BLOCK    5   /* drafter block length B (noise-filled) */
 
 typedef struct {
     ds4_tensor *main_proj;
@@ -9087,6 +9088,18 @@ typedef struct {
     ds4_gpu_tensor *spec_mtp_next_hc;
     ds4_gpu_tensor *spec_mtp_raw_cache;
     uint32_t mtp_n_raw;
+
+    /* Optional DSpark/dflash block-drafter state.  Three target-fused raw KV
+     * rings (one per draft layer), plus fusion + injection scratch.  The
+     * per-block (5-row) layer math reuses the batch_* prefill scratch. */
+    ds4_gpu_tensor *dspark_raw_cache[DS4_DSPARK_N_LAYER];
+    ds4_gpu_tensor *dspark_main_x;       /* main_norm(main_proj(concat)) [pc,n_embd] */
+    ds4_gpu_tensor *dspark_concat;       /* captured hidden 40/41/42 [pc,3*n_embd] */
+    ds4_gpu_tensor *dspark_kv;           /* kv_from_hidden output [pc,head_dim] */
+    ds4_gpu_tensor *dspark_block_logits; /* base_logits [B,vocab] */
+    uint32_t dspark_n_raw;
+    bool dspark_enabled;
+
     uint32_t prefill_cap;
     uint32_t raw_window;
 
@@ -9390,6 +9403,13 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->output_cert_group_norms);
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->spec_cur_hc);
+    ds4_gpu_tensor_free(g->dspark_block_logits);
+    ds4_gpu_tensor_free(g->dspark_kv);
+    ds4_gpu_tensor_free(g->dspark_concat);
+    ds4_gpu_tensor_free(g->dspark_main_x);
+    for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) {
+        ds4_gpu_tensor_free(g->dspark_raw_cache[li]);
+    }
     ds4_gpu_tensor_free(g->spec_mtp_raw_cache);
     ds4_gpu_tensor_free(g->spec_mtp_next_hc);
     ds4_gpu_tensor_free(g->spec_mtp_state_hc);
@@ -9802,9 +9822,11 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
-        bool                    enable_mtp) {
+        bool                    enable_mtp,
+        bool                    enable_dspark) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    g->dspark_enabled = enable_dspark;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -10048,6 +10070,21 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_n_raw = 0;
     }
 
+    /* DSpark drafter scratch: 3 target-fused raw KV rings + fusion/injection
+     * buffers + block logits.  Same managed-kv-cache policy as mtp_raw_cache. */
+    if (enable_dspark) {
+        for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) {
+            g->dspark_raw_cache[li] = metal_graph_alloc_kv_cache_tensor(
+                    managed_kv_cache,
+                    (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        }
+        g->dspark_main_x       = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+        g->dspark_concat       = ds4_gpu_tensor_alloc(pc * 3u * DS4_N_EMBD * sizeof(float));
+        g->dspark_kv           = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
+        g->dspark_block_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_DSPARK_BLOCK * DS4_N_VOCAB * sizeof(float));
+        g->dspark_n_raw = 0;
+    }
+
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -10213,7 +10250,7 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, false);
 }
 
 static uint32_t metal_graph_raw_span_for_batch(
@@ -19839,7 +19876,7 @@ static int metal_graph_prompt_logits_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
+                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false, false);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -20136,9 +20173,11 @@ struct ds4_vocab {
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
+    ds4_model dspark_model;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
+    ds4_dspark_weights dspark_weights;
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -20151,6 +20190,7 @@ struct ds4_engine {
     ds4_distributed_options distributed;
     bool metal_ready;
     bool mtp_ready;
+    bool dspark_ready;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -25195,7 +25235,7 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -28427,7 +28467,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -28603,7 +28643,7 @@ int ds4_engine_batched_generate_ex(
 
     ds4_gpu_graph g;
     if (!metal_graph_alloc_raw_cap(&g, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, prefill_cap, false)) {
+                                   raw_cap, (uint32_t)ctx_size, prefill_cap, false, false)) {
         BG_API_ERR("batched_generate: graph alloc failed (raw_cap=%u prefill_cap=%u)", raw_cap, prefill_cap);
         return 1;
     }
@@ -28986,7 +29026,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     }
 
     if (!metal_graph_alloc_raw_cap(&ctx->g, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp)) {
+                                   raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp, false)) {
         BC_ERR("batch_ctx_create: graph alloc failed (raw_cap=%u prefill_cap=%u)", raw_cap, prefill_cap);
         free(ctx);
         return 1;
@@ -32337,6 +32377,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 e->mtp_draft_tokens);
     }
 
+    /* DSpark/dflash block-drafter: a second support model (3 MoE layers + heads)
+     * loaded after the base shape is fixed.  Optional; env fallback lets dev
+     * runs attach it without threading a flag through every tool yet. */
+    {
+        const char *dspark_path = opt->dspark_path;
+        if (!dspark_path || !dspark_path[0]) dspark_path = getenv("DS4_DSPARK_MODEL");
+        if (dspark_path && dspark_path[0] &&
+            opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+            model_open(&e->dspark_model, dspark_path, graph_backend, true);
+            dspark_weights_bind(&e->dspark_weights, &e->dspark_model);
+            e->dspark_ready = true;
+            fprintf(stderr, "ds4: DSpark drafter loaded: %s (%u layers)\n",
+                    dspark_path, (unsigned)DS4_DSPARK_N_LAYER);
+        }
+    }
+
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
 #ifdef __APPLE__
@@ -32569,6 +32625,11 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
 }
 
+int ds4_engine_n_hc(ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_HC;
+}
+
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
     return (int)DS4_MODEL_VARIANT;
@@ -32580,6 +32641,7 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
+    if (e->dspark_ready) model_close(&e->dspark_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
@@ -32618,7 +32680,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready, e->dspark_ready))
     {
         free(s);
         return 1;
