@@ -92,6 +92,13 @@ enum {
      * decode emit indexes per-(seq,layer) state banks + row counters; this
      * caps the self-test / future generation fan-out.  Small fixed bound. */
     DS4_MULTISEQ_MAX_SEQ     = 128,
+    /* S1.1 M3 / D4.5d: number of per-bank speculative-rollback checkpoint depths.
+     * The verify forward snapshots each bank's compressor state after committing a
+     * 1..DS4_MTP_RB_DEPTH-token prefix, so a partial accept of M kept tokens
+     * (M <= DS4_MTP_RB_DEPTH) restores from depth M-1 with no re-forward.  =2 was
+     * enough for MTP depth<=2; the DSpark block of 5 accepts up to 4 drafts, so the
+     * lossless in-forward-emit+rollback path needs 4 checkpoint depths. */
+    DS4_MTP_RB_DEPTH         = 4,
     DS4_MAX_EMBD             = 7168,
     DS4_MAX_VOCAB            = 129280,
     DS4_MAX_HEAD             = 128,
@@ -9012,12 +9019,12 @@ typedef struct {
      * b*state_stride, matching the active state slab.  The counters mirror ms_n_comp /
      * ms_n_index_comp at each checkpoint so a per-bank restore rewinds the row frontier
      * exactly.  Not owned by the graph (the slab frees them). */
-    ds4_gpu_tensor *mtp_rb_askv[2][DS4_MAX_LAYER];
-    ds4_gpu_tensor *mtp_rb_assc[2][DS4_MAX_LAYER];
-    ds4_gpu_tensor *mtp_rb_iskv[2][DS4_MAX_LAYER];
-    ds4_gpu_tensor *mtp_rb_issc[2][DS4_MAX_LAYER];
-    uint32_t mtp_rb_n_comp[2][DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
-    uint32_t mtp_rb_n_index_comp[2][DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    ds4_gpu_tensor *mtp_rb_askv[DS4_MTP_RB_DEPTH][DS4_MAX_LAYER];
+    ds4_gpu_tensor *mtp_rb_assc[DS4_MTP_RB_DEPTH][DS4_MAX_LAYER];
+    ds4_gpu_tensor *mtp_rb_iskv[DS4_MTP_RB_DEPTH][DS4_MAX_LAYER];
+    ds4_gpu_tensor *mtp_rb_issc[DS4_MTP_RB_DEPTH][DS4_MAX_LAYER];
+    uint32_t mtp_rb_n_comp[DS4_MTP_RB_DEPTH][DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    uint32_t mtp_rb_n_index_comp[DS4_MTP_RB_DEPTH][DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
     bool spec_capture_prefix1;
     uint32_t spec_capture_prefix_depth;
     uint32_t raw_cap;
@@ -15994,7 +16001,7 @@ static bool metal_graph_encode_layer_attention_batch(
                  * its own lane independently -- N parallel copies of the N=1 M2 snapshot. */
                 if (ok && g->batch_rollback_capture) {
                     const uint32_t depth = (uint32_t)g->ms_vdepth[t];
-                    if (depth < 2u) {
+                    if (depth < DS4_MTP_RB_DEPTH) {
                         ds4_gpu_tensor *dk = g->mtp_rb_askv[depth][il];
                         ds4_gpu_tensor *ds = g->mtp_rb_assc[depth][il];
                         if (dk && ds) {
@@ -16684,7 +16691,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     /* S1.1 M3: indexer sibling of the attn rollback snapshot above. */
                     if (ok && g->batch_rollback_capture) {
                         const uint32_t depth = (uint32_t)g->ms_vdepth[t];
-                        if (depth < 2u) {
+                        if (depth < DS4_MTP_RB_DEPTH) {
                             ds4_gpu_tensor *dk = g->mtp_rb_iskv[depth][il];
                             ds4_gpu_tensor *ds = g->mtp_rb_issc[depth][il];
                             if (dk && ds) {
@@ -24193,10 +24200,10 @@ typedef struct {
      * d=1 -> 2-token prefix).  N-bank attn/index state snapshots taken during the verify forward
      * so a partial accept rolls each bank back to its accepted prefix independently.  Allocated
      * and freed alongside the multi_* slabs; exposed on g->mtp_rb_* by cont-gen. */
-    ds4_gpu_tensor *ckpt_askv[2][DS4_MAX_LAYER];
-    ds4_gpu_tensor *ckpt_assc[2][DS4_MAX_LAYER];
-    ds4_gpu_tensor *ckpt_iskv[2][DS4_MAX_LAYER];
-    ds4_gpu_tensor *ckpt_issc[2][DS4_MAX_LAYER];
+    ds4_gpu_tensor *ckpt_askv[DS4_MTP_RB_DEPTH][DS4_MAX_LAYER];
+    ds4_gpu_tensor *ckpt_assc[DS4_MTP_RB_DEPTH][DS4_MAX_LAYER];
+    ds4_gpu_tensor *ckpt_iskv[DS4_MTP_RB_DEPTH][DS4_MAX_LAYER];
+    ds4_gpu_tensor *ckpt_issc[DS4_MTP_RB_DEPTH][DS4_MAX_LAYER];
 } ds4_batch_slabs;
 
 /* Phase 2 S1: per-bank MTP draft state for the continuous batched path.
@@ -24341,7 +24348,7 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
                         (uint64_t)N * g->layer_comp_cap[il] * DS4_OPP_C_FP8_SCALE_BYTES);
                 ok = sl->multi_comp_fp8[il] && sl->multi_comp_scale[il];
             }
-            for (uint32_t d = 0; ok && d < 2u; d++) {   /* M3: per-bank attn rollback checkpoints */
+            for (uint32_t d = 0; ok && d < DS4_MTP_RB_DEPTH; d++) {   /* M3: per-bank attn rollback checkpoints */
                 sl->ckpt_askv[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
                 sl->ckpt_assc[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->astate_bank_bytes[il]);
                 ok = sl->ckpt_askv[d][il] && sl->ckpt_assc[d][il];
@@ -24359,7 +24366,7 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
                         (uint64_t)N * g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES);
                 ok = sl->multi_index_fp4[il] && sl->multi_index_scale[il];
             }
-            for (uint32_t d = 0; ok && d < 2u; d++) {   /* M3: per-bank index rollback checkpoints */
+            for (uint32_t d = 0; ok && d < DS4_MTP_RB_DEPTH; d++) {   /* M3: per-bank index rollback checkpoints */
                 sl->ckpt_iskv[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
                 sl->ckpt_issc[d][il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->istate_bank_bytes[il]);
                 ok = sl->ckpt_iskv[d][il] && sl->ckpt_issc[d][il];
@@ -24379,7 +24386,7 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
             ds4_slab_poison_fill(sl->multi_index_scale[il]);
             ds4_slab_poison_fill(sl->multi_iskv[il]);
             ds4_slab_poison_fill(sl->multi_issc[il]);
-            for (uint32_t d = 0; d < 2u; d++) {
+            for (uint32_t d = 0; d < DS4_MTP_RB_DEPTH; d++) {
                 ds4_slab_poison_fill(sl->ckpt_askv[d][il]);
                 ds4_slab_poison_fill(sl->ckpt_assc[d][il]);
                 ds4_slab_poison_fill(sl->ckpt_iskv[d][il]);
@@ -24534,7 +24541,7 @@ static void ds4_batch_slabs_free(ds4_batch_slabs *sl, ds4_gpu_graph *g) {
         if (sl->multi_comp_scale[il]) ds4_gpu_tensor_free(sl->multi_comp_scale[il]);
         if (sl->multi_index_fp4[il])   ds4_gpu_tensor_free(sl->multi_index_fp4[il]);   /* P2 Inc3a */
         if (sl->multi_index_scale[il]) ds4_gpu_tensor_free(sl->multi_index_scale[il]);
-        for (uint32_t d = 0; d < 2u; d++) {   /* M3: rollback checkpoint slabs */
+        for (uint32_t d = 0; d < DS4_MTP_RB_DEPTH; d++) {   /* M3: rollback checkpoint slabs */
             if (sl->ckpt_askv[d][il]) ds4_gpu_tensor_free(sl->ckpt_askv[d][il]);
             if (sl->ckpt_assc[d][il]) ds4_gpu_tensor_free(sl->ckpt_assc[d][il]);
             if (sl->ckpt_iskv[d][il]) ds4_gpu_tensor_free(sl->ckpt_iskv[d][il]);
@@ -29865,6 +29872,7 @@ struct ds4_batch_ctx {
     ds4_gpu_graph   g;
     ds4_batch_slabs sl;            /* allocated for max_seq banks */
     ds4_mtp_slabs   msl;           /* S1: per-bank MTP draft banks (only if mtp) */
+    ds4_dspark_slabs dsl;          /* D4.5d: per-bank DSpark injected-KV rings (only if dspark_ready) */
     bool            mtp;           /* S1: speculative MTP enabled for this ctx */
     int             mtp_draft_mode;/* S1: 0=off, 1=draft-probe (non-accepting), 2=accept */
     /* S1.1 gate hook: when >=0, force every draft token at index >= mtp_force_draft_from to
@@ -29992,7 +30000,7 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
                     per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES;
                 per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_SCALE_BYTES;
             }
-            per_bank += 6ull * astate;   /* live kv+score + 2 ckpt depths x kv+score */
+            per_bank += (2ull + 2ull * (uint64_t)DS4_MTP_RB_DEPTH) * astate;   /* live kv+score + DS4_MTP_RB_DEPTH ckpt depths x kv+score */
         }
         if (ratio == 4u && g->layer_index_comp_cache[il]) {
             const uint64_t istate = (uint64_t)(coff * ratio) *
@@ -30006,7 +30014,7 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
                     per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
                 per_bank += (uint64_t)g->layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
             }
-            per_bank += 6ull * istate;
+            per_bank += (2ull + 2ull * (uint64_t)DS4_MTP_RB_DEPTH) * istate;  /* live + DS4_MTP_RB_DEPTH ckpt depths x kv+score */
         }
     }
     if (mtp) {
@@ -30177,7 +30185,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     }
 
     if (!metal_graph_alloc_raw_cap(&ctx->g, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp, false)) {
+                                   raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp, e->dspark_ready)) {
         BC_ERR("batch_ctx_create: graph alloc failed (raw_cap=%u prefill_cap=%u)", raw_cap, prefill_cap);
         free(ctx);
         return 1;
@@ -30297,6 +30305,15 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         ds4_batch_ctx_destroy(ctx);
         return 1;
     }
+    /* D4.5d: per-bank DSpark injected-KV rings, parallel to ctx->msl.  Allocated
+     * only when a drafter is loaded (DS4_DSPARK_MODEL); the cont loop's DSpark spec
+     * branch (DS4_CONT_DSPARK) routes each bank's committed KV here.  Zeroed dsl is
+     * safe to free (destroy path) even if the drafter is absent. */
+    if (e->dspark_ready && !ds4_dspark_slabs_alloc(&ctx->dsl, &ctx->g, ctx->max_seq)) {
+        BC_ERR("batch ctx: dspark slab alloc failed (max_seq=%u)", ctx->max_seq);
+        ds4_batch_ctx_destroy(ctx);
+        return 1;
+    }
     *out = ctx;
     return 0;
 #undef BC_ERR
@@ -30314,6 +30331,7 @@ int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_t
 
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     if (!ctx) return;
+    ds4_dspark_slabs_free(&ctx->dsl, &ctx->g); /* restores g->dspark_raw_cache before metal_graph_free; no-op if zeroed */
     ds4_mtp_slabs_free(&ctx->msl, &ctx->g);   /* restores g->mtp_* before metal_graph_free; no-op if !mtp */
     ds4_batch_slabs_free(&ctx->sl, &ctx->g);
     if (ctx->g.emit_stash_comp)  { ds4_gpu_tensor_free(ctx->g.emit_stash_comp);  ctx->g.emit_stash_comp = NULL; }
@@ -31359,7 +31377,7 @@ static bool mtp_cont_rollback_restore_all(ds4_gpu_graph *g, uint32_t MS,
         for (uint32_t b = 0; ok && b < MS; b++) {
             const uint32_t M = committed_rows[b];
             const uint32_t total = 1u + vnr[b];
-            if (M < 1u || M > 2u || M >= total) continue;   /* full accept or out-of-checkpoint-range */
+            if (M < 1u || M > DS4_MTP_RB_DEPTH || M >= total) continue;   /* full accept or out-of-checkpoint-range */
             const uint32_t d = M - 1u;                      /* depth slot: M tokens kept -> ckpt[M-1] */
             ds4_gpu_tensor *sk = g->mtp_rb_askv[d][il];
             ds4_gpu_tensor *ss = g->mtp_rb_assc[d][il];
@@ -31493,6 +31511,19 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * separate decode-step branch below, so mode 2 does NOT run the probe block. */
     const int mtp_accept = (ctx->mtp && ctx->e->mtp_ready && mtp_mode == 2) ? 1 : 0;
     const int mtp_probe = (ctx->mtp && ctx->e->mtp_ready && mtp_mode == 1) ? 1 : 0;
+    /* D4.5d: DSpark block spec-decode.  Rides the mode-2 verify/accept/rollback
+     * machinery UNCHANGED -- it only swaps the draft source (MTP chain -> DSpark
+     * block forward + Markov) and adds the inline target-hidden capture + per-bank
+     * KV injection.  Capture/inject/draft/Markov are all accept-rate-only: the verify
+     * forward remains the sole source of committed tokens, so losslessness holds by
+     * construction.  Requires the drafter loaded + its slab allocated.  N=1 first
+     * (the cont loop's multiseq forward has an unfixed race; drafts are race-tolerant
+     * but the verify path is gated single-seq first).  Off unless DS4_CONT_DSPARK. */
+    const int dspark_mode = (mtp_accept && ctx->e->dspark_ready &&
+                             ctx->dsl.multi_raw[0] != NULL &&
+                             getenv("DS4_CONT_DSPARK") != NULL) ? 1 : 0;
+    const ds4_model          *dspark_model = &ctx->e->dspark_model;
+    const ds4_dspark_weights *dw           = &ctx->e->dspark_weights;
     const uint64_t hc_dim_cont = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     uint64_t mtp_probe_total = 0, mtp_probe_hit = 0;
 
@@ -31510,6 +31541,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * D>=1 is NOT lossless (in-forward emit contaminates the pooled cache). */
     { const char *de = getenv("DS4_CONT_MTP_DEPTH"); if (de && de[0]) { int dv = atoi(de); if (dv >= 0) Dspec = (uint32_t)dv; } }
     if (Dspec > DS4_CONT_MTP_MAX_DEPTH) Dspec = DS4_CONT_MTP_MAX_DEPTH;
+    /* D4.5d: the DSpark block always drafts B-1 tokens per step (the [bonus,noise*4]
+     * block yields 4 verifiable drafts) -- pin depth to DS4_DSPARK_BLOCK-1 (=4 =
+     * DS4_CONT_MTP_MAX_DEPTH) so the verify pack reserves exactly the block width. */
+    if (dspark_mode) Dspec = (uint32_t)(DS4_DSPARK_BLOCK - 1);
     const uint32_t vrows_per_bank = Dspec + 1u;                 /* committed + D drafts */
     uint32_t vcap_rows = MS * vrows_per_bank;
     if (vcap_rows > ctx->prefill_cap) vcap_rows = ctx->prefill_cap;  /* forward tensors sized for prefill_cap */
@@ -31521,8 +31556,22 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint32_t *vfirst = mtp_accept ? xmalloc((size_t)MS * sizeof(uint32_t)) : NULL;
     uint32_t *vnr    = mtp_accept ? xmalloc((size_t)MS * sizeof(uint32_t)) : NULL;  /* drafts packed for bank */
     float    *vlogits= mtp_accept ? xmalloc((size_t)vcap_rows * DS4_N_VOCAB * sizeof(float)) : NULL;
+    /* D4.5d: on-device Markov-refine scratch (DSpark draft step).  mk_cand holds the
+     * [B*MS] candidate grid (row j = j-th cand of every bank), mk_prev the [MS*rank]
+     * gathered markov_w1 rows, mk_bias the [MS*vocab] per-bank bias.  Allocated once;
+     * the block draft reuses vlogits as the base-logits dst (vcap_rows = MS*B >= nl*B). */
+    const uint32_t mk_rank = dspark_mode ? (uint32_t)dw->markov_w2->dim[0] : 0u;
+    ds4_gpu_tensor *mk_cand = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)DS4_DSPARK_BLOCK * MS * sizeof(int32_t)) : NULL;
+    ds4_gpu_tensor *mk_prev = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)MS * mk_rank * sizeof(float)) : NULL;
+    ds4_gpu_tensor *mk_bias = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)MS * DS4_N_VOCAB * sizeof(float)) : NULL;
+    /* Device base-logits dst for the block draft [(nl*B), vocab].  vlogits is a HOST
+     * buffer (the verify forward reads logits back to host); the block forward writes
+     * its head ON DEVICE and the on-device Markov refine reads it ON DEVICE, so a
+     * device tensor is required.  Sized like vlogits (vcap_rows = min(MS*B, prefill_cap)). */
+    ds4_gpu_tensor *mk_logits = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)vcap_rows * DS4_N_VOCAB * sizeof(float)) : NULL;
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
     if (mtp_accept) ok = ok && dbuf && ndr && vqtok && vpos && vsid && vfirst && vnr && vlogits;
+    if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits;
     /* M4b Inc5: batched cross-bank MTP draft chain (one depth-major forward over all
      * live banks, ~D+1 device syncs/step) instead of the per-bank serial
      * mtp_draft_chain_bank (N*(D+1) syncs).  Pure perf: the verify forward is the sole
@@ -31537,7 +31586,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
          * the ctx) on g so the in-forward capture can snapshot each bank's state.  Banks are
          * addressed [0,MS) at absolute offset b*state_stride, matching the [0,MS) repoint above;
          * the ckpt slab pointers are stable across the per-admit single-bank re-repoints below. */
-        for (uint32_t d = 0; d < 2u; d++)
+        for (uint32_t d = 0; d < DS4_MTP_RB_DEPTH; d++)
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 g->mtp_rb_askv[d][il] = ctx->sl.ckpt_askv[d][il];
                 g->mtp_rb_assc[d][il] = ctx->sl.ckpt_assc[d][il];
@@ -31874,13 +31923,14 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             /* 2. VERIFY forward.  Emit regimes:
              *  - D=0: every verify row is the committed [cur] row (always accepted) -> emit
              *    in the verify forward; bit-identical to mode-0's single forward(store).
-             *  - D in {1,2}, any live-bank count (M2 at N=1, M3 at N>1): emit ALL packed rows
-             *    in the verify forward AND snapshot every bank's per-row state into the N-bank
-             *    checkpoint slabs (g->mtp_rb_*), then roll each partially-accepted bank back to
-             *    its accepted prefix below.  Lossless + prefix-causal, no re-forward.
-             *  - D>2: no checkpoints (only depths 0,1 captured) -> fall back to the deferred-commit
-             *    re-forward path (reached only via the gate; mode 2 is not a production path). */
-            const bool can_rollback = (Dspec >= 1u && Dspec <= 2u && n_live >= 1u);
+             *  - D in [1,DS4_MTP_RB_DEPTH], any live-bank count (M2 at N=1, M3 at N>1): emit ALL
+             *    packed rows in the verify forward AND snapshot every bank's per-row state into the
+             *    N-bank checkpoint slabs (g->mtp_rb_*, DS4_MTP_RB_DEPTH deep), then roll each
+             *    partially-accepted bank back to its accepted prefix below.  Lossless +
+             *    prefix-causal, no re-forward.  The DSpark block of 5 (D=4) lands here.
+             *  - D>DS4_MTP_RB_DEPTH: no checkpoints past the captured depths -> fall back to the
+             *    deferred-commit re-forward path (reached only via the gate; not a production path). */
+            const bool can_rollback = (Dspec >= 1u && Dspec <= (uint32_t)DS4_MTP_RB_DEPTH && n_live >= 1u);
             const bool no_defer = (Dspec == 0u) || can_rollback;
             ok = ds4_gpu_tensor_write(g->batch_positions, 0, vpos, (uint64_t)K2 * sizeof(int32_t)) != 0;
             if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, vsid, (uint64_t)K2 * sizeof(int32_t)) != 0;
@@ -31888,7 +31938,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 g->batch_multiseq_emit = true;
                 g->batch_defer_comp_store = !no_defer;
                 g->batch_rollback_capture = can_rollback;
+                /* D4.5d/E5: tap the target hidden after layers 40/41/42 inline in this
+                 * forward (zero extra forward) -> dspark_concat[0..K2).  Accept-rate-only;
+                 * off => bit-identical to the non-DSpark verify forward. */
+                g->dspark_capture = dspark_mode ? true : false;
                 ok = metal_graph_batch_eval_logits(g, model, weights, vqtok, vmaxpos, K2, vlogits);
+                g->dspark_capture = false;
                 g->batch_rollback_capture = false;
                 g->batch_defer_comp_store = false;
                 g->batch_multiseq_emit = false;
@@ -31956,6 +32011,39 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         bank_hist_append(ctx, b, vqtok[f + j]);
                 } else {
                     ctx->bank_hist_valid[b] = 0u;
+                }
+            }
+            /* D4.5d/E6: FUSE + INJECT.  Build each verify row's drafter KV from the target
+             * hidden captured this step (dspark_concat[0..K2)): main_x = main_norm(main_proj(
+             * concat)), then wkv@main_x -> kv_a_norm -> rope -> store into each row's bank ring
+             * at slot vsid*raw_cap + vpos%raw_cap.  Inject ALL K2 rows: committed rows land at
+             * their committed positions (genuine prefix KV); rejected-draft rows land at
+             * speculative positions [posv_new..posv_new+B-1] that the NEXT block-draft KV store
+             * overwrites before they are ever read as a prefix (see design).  Pure accept-rate
+             * side -- the verify forward already set every committed token.  vpos/vsid are the
+             * original pack arrays (untouched by the accept loop, which only advanced posv[]). */
+            if (dspark_mode && K2 > 0u) {
+                ok = ds4_gpu_tensor_write(g->batch_positions, 0, vpos, (uint64_t)K2 * sizeof(int32_t)) != 0;
+                if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, vsid, (uint64_t)K2 * sizeof(int32_t)) != 0;
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_attn_cur, dspark_model->map, dspark_model->size,
+                                   dw->main_proj->abs_offset, 3u * DS4_N_EMBD, DS4_N_EMBD, g->dspark_concat, K2) != 0;
+                if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->dspark_main_x, g->batch_attn_cur,
+                                   dspark_model->map, dspark_model->size, dw->main_norm->abs_offset,
+                                   DS4_N_EMBD, K2, DS4_RMS_EPS) != 0;
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                if (ok) {
+                    ds4_gpu_tensor *ip = ds4_gpu_tensor_view(g->batch_positions, 0, (uint64_t)K2 * sizeof(int32_t));
+                    ds4_gpu_tensor *is = ds4_gpu_tensor_view(g->batch_seq_id, 0, (uint64_t)K2 * sizeof(int32_t));
+                    ok = ip && is && metal_graph_dspark_inject(g, dspark_model, dw, g->dspark_main_x,
+                                                               K2, ip, is, ctx->dsl.multi_raw);
+                    if (ip) ds4_gpu_tensor_free(ip);
+                    if (is) ds4_gpu_tensor_free(is);
+                }
+                if (!ok) {
+                    fprintf(stderr, "ds4: cont-dspark step %u FAIL @inject (K2=%u live=%u)\n",
+                            steps, K2, n_live);
+                    break;
                 }
             }
             /* 3b. ROLLBACK (M3): the verify forward emitted ALL packed rows in-forward; roll every
@@ -32039,7 +32127,42 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                                                    scom, sbank, (int)Dspec);
                     for (uint32_t i = 0; i < nl; i++) ds4_gpu_tensor_free(srows[i]);
                 }
-                if (mtp_batch_draft) {
+                if (dspark_mode) {
+                    /* D4.5d/E7: DSpark BLOCK draft.  For every still-live committed bank,
+                     * draft a [bonus,noise*4] block at positions [posv[b]..posv[b]+4] with
+                     * bonus = cur[b] (the last committed token, the block's seed row), in ONE
+                     * multiseq forward over the per-bank injected rings; then refine on-device
+                     * (Markov) -> candidates [bonus, d0..d3].  Scatter the 4 refined drafts into
+                     * dbuf for the next step's verify pack.  mk_logits (device) is the base-logits
+                     * dst (sized vcap_rows = min(MS*B, prefill_cap) >= nl*B).  Pure accept-rate side. */
+                    int32_t  Pbank[DS4_MULTISEQ_MAX_SEQ], bonusv[DS4_MULTISEQ_MAX_SEQ];
+                    uint32_t bankmap[DS4_MULTISEQ_MAX_SEQ];
+                    int32_t  out_cand[DS4_MULTISEQ_MAX_SEQ * DS4_DSPARK_BLOCK];
+                    uint32_t nl = 0;
+                    for (uint32_t b = 0; b < MS; b++) {
+                        ndr[b] = 0u;
+                        if (!live[b] || cfirst[b] == UINT32_MAX) continue;
+                        Pbank[nl]   = (int32_t)posv[b];
+                        bonusv[nl]  = cur[b];
+                        bankmap[nl] = b;
+                        nl++;
+                    }
+                    if (nl > 0u && nl * (uint32_t)DS4_DSPARK_BLOCK <= vcap_rows) {
+                        ok = metal_graph_eval_dspark_block_ms(g, model, weights, dspark_model, dw,
+                                ctx->dsl.multi_raw, nl, Pbank, bonusv, DS4_N_SWA, mk_logits);
+                        if (ok) ok = metal_graph_dspark_markov_refine(g, dspark_model, dw, mk_logits,
+                                nl, DS4_DSPARK_BLOCK, DS4_N_VOCAB, bonusv, mk_cand, mk_prev, mk_bias, out_cand);
+                        if (ok) {
+                            for (uint32_t r = 0; r < nl; r++) {
+                                const uint32_t b = bankmap[r];
+                                for (uint32_t j = 0; j + 1u < DS4_DSPARK_BLOCK; j++)
+                                    dbuf[b * DS4_CONT_MTP_MAX_DEPTH + j] =
+                                        out_cand[r * DS4_DSPARK_BLOCK + (j + 1u)];
+                                ndr[b] = (uint32_t)(DS4_DSPARK_BLOCK - 1);
+                            }
+                        }
+                    }
+                } else if (mtp_batch_draft) {
                     /* M4b Inc5: BATCHED draft chain.  Gather every live bank's last-committed-
                      * row carry into the N-row draft slab (draft_prev_hc), run ONE depth-major
                      * batched chain over all live banks, scatter the per-bank drafts back into
@@ -32223,8 +32346,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 mtp_probe_total ? 100.0 * (double)mtp_probe_hit / (double)mtp_probe_total : 0.0);
 
     if (mtp_accept)
-        fprintf(stderr, "ds4: CONT_MTP_ACCEPT D=%u steps=%llu emit=%llu drafts=%llu hits=%llu "
+        fprintf(stderr, "ds4: CONT_MTP_ACCEPT%s D=%u steps=%llu emit=%llu drafts=%llu hits=%llu "
                 "accept=%.1f%% tok/step=%.2f\n",
+                dspark_mode ? "(DSpark)" : "",
                 Dspec, (unsigned long long)mtp_acc_steps, (unsigned long long)mtp_acc_emit,
                 (unsigned long long)mtp_acc_drafts, (unsigned long long)mtp_acc_hits,
                 mtp_acc_drafts ? 100.0 * (double)mtp_acc_hits / (double)mtp_acc_drafts : 0.0,
@@ -32266,6 +32390,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     free(pftok); free(pflen); free(pfoff); free(pfbase); free(pft0);
     free(logits); free(seedlog);
     free(dbuf); free(ndr); free(vqtok); free(vpos); free(vsid); free(vfirst); free(vnr); free(vlogits);
+    if (mk_cand)   ds4_gpu_tensor_free(mk_cand);
+    if (mk_prev)   ds4_gpu_tensor_free(mk_prev);
+    if (mk_bias)   ds4_gpu_tensor_free(mk_bias);
+    if (mk_logits) ds4_gpu_tensor_free(mk_logits);
     return ok ? 0 : 1;
 #undef CG_ERR
 }
