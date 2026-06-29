@@ -18400,26 +18400,31 @@ static bool metal_graph_encode_output_head_dspark_batch_into(
     return ok;
 }
 
-/* D4.5b: inject n_rows target-fused positions' KV into the CURRENT drafter rings
- * (g->dspark_raw_cache[0..2]) at ring slots positions[t] % raw_cap.  main_x =
- * [n_rows x n_embd] device (main_norm(main_proj(concat hc40/41/42))); positions =
- * [n_rows] int32 device (absolute positions).  Per layer: wkv@main_x -> kv_a_norm
- * -> rope-per-pos -> store_raw_kv.  This is the serving inject (1 row per committed
- * token, or a window during prefill).  Caller wraps nothing -- own begin/end here. */
+/* D4.5b/c: inject n_rows target-fused positions' KV into drafter rings at slot
+ * positions[t] % raw_cap.  main_x = [n_rows x n_embd] device (main_norm(main_proj(
+ * concat hc40/41/42))); positions = [n_rows] int32 device.  Per layer: wkv@main_x
+ * -> kv_a_norm -> rope-per-pos -> store_raw_kv.  `rings` selects the target per
+ * layer (NULL => the CURRENT g->dspark_raw_cache, the single-bank/repointed path).
+ * `seq_id` (NULL = single seq) routes row t to bank seq_id[t] (slot = seq_id*raw_cap
+ * + pos%raw_cap) -- ONE multiseq store across all banks' committed rows.  Own
+ * begin/end.  This sits on the accept-rate-only side: never affects committed output. */
 static bool metal_graph_dspark_inject(
         ds4_gpu_graph            *g,
         const ds4_model          *dspark_model,
         const ds4_dspark_weights *dw,
         ds4_gpu_tensor           *main_x,
         uint32_t                  n_rows,
-        ds4_gpu_tensor           *positions) {
+        ds4_gpu_tensor           *positions,
+        ds4_gpu_tensor           *seq_id,
+        ds4_gpu_tensor * const   *rings) {
     if (!main_x || !positions || n_rows == 0 || n_rows > g->prefill_cap) return false;
+    if (!rings) rings = g->dspark_raw_cache;
     const float freq_base = layer_rope_freq_base(1), freq_scale = layer_rope_freq_scale(1);
     bool ok = ds4_gpu_begin_commands() != 0;
     const char *stage = "begin";
     for (uint32_t li = 0; ok && li < DS4_DSPARK_N_LAYER; li++) {
         const ds4_layer_weights *lw = &dw->layer[li];
-        if (!g->dspark_raw_cache[li]) { ok = false; stage = "ring"; break; }
+        if (!rings[li]) { ok = false; stage = "ring"; break; }
         if (ok) { stage = "kv"; ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw, dspark_model->map, dspark_model->size,
                                         lw->attn_kv->abs_offset, DS4_N_EMBD, DS4_N_HEAD_DIM, main_x, n_rows) != 0; }
         if (ok) { stage = "kv_norm"; ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_kv, g->batch_kv_raw,
@@ -18428,8 +18433,8 @@ static bool metal_graph_dspark_inject(
         if (ok) { stage = "rope"; ok = ds4_gpu_rope_tail_tensor(g->batch_kv, n_rows, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
                                         DS4_N_ROT, 0, positions, 0, false, freq_base, freq_scale, 0.0f, 1.0f,
                                         DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0; }
-        if (ok) { stage = "store"; ok = ds4_gpu_store_raw_kv_batch_tensor(g->dspark_raw_cache[li], g->batch_kv,
-                                        g->raw_cap, 0, n_rows, DS4_N_HEAD_DIM, positions, NULL) != 0; }
+        if (ok) { stage = "store"; ok = ds4_gpu_store_raw_kv_batch_tensor(rings[li], g->batch_kv,
+                                        g->raw_cap, 0, n_rows, DS4_N_HEAD_DIM, positions, seq_id) != 0; }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (!ok) { (void)ds4_gpu_synchronize(); fprintf(stderr, "ds4: dspark_inject FAIL @%s n_rows=%u\n", stage, n_rows); }
@@ -26152,7 +26157,7 @@ int ds4_dspark_slabs_validate(ds4_engine *e, ds4_session *s, const char *trace_p
         const uint32_t nbk = (ri == 0) ? 2u : 1u;
         for (uint32_t bi = 0; ok && bi < nbk; bi++) {
             ok = ds4_dspark_slabs_repoint_bank(&dsl, g, banks[bi]) &&
-                 metal_graph_dspark_inject(g, dspark_model, dw, g->dspark_main_x, total, pos_t);
+                 metal_graph_dspark_inject(g, dspark_model, dw, g->dspark_main_x, total, pos_t, NULL, NULL);
             ds4_dspark_slabs_save_bank(&dsl, g, banks[bi]);
         }
         if (pos_t) ds4_gpu_tensor_free(pos_t);
