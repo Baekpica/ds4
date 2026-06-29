@@ -3952,6 +3952,12 @@ static int run_eval_batched(ds4_engine *engine, const eval_config *cfg, int ncas
 }
 
 int main(int argc, char **argv) {
+    /* D1 gate: validate a DSpark drafter GGUF standalone (no base model, low RAM).
+     *   DS4_DSPARK_VALIDATE=/path/to/dspark.gguf ds4-eval */
+    {
+        const char *dspark_path = getenv("DS4_DSPARK_VALIDATE");
+        if (dspark_path && dspark_path[0]) return ds4_dspark_validate(dspark_path);
+    }
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();
     if (cfg.regrade_trace_path) return regrade_trace_file(cfg.regrade_trace_path);

@@ -358,6 +358,9 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int max_tokens);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+/* Standalone DSpark/dflash drafter GGUF load + strict layout validation (D1 gate).
+ * Low-RAM: opens only the drafter file, no base model required. Returns 0 on OK. */
+int ds4_dspark_validate(const char *path);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);

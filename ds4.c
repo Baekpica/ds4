@@ -2413,6 +2413,33 @@ typedef struct {
     ds4_layer_weights block;
 } ds4_mtp_weights;
 
+/*
+ * DSpark / DFlash speculative block-drafter.
+ *
+ * The drafter is a small parallel backbone of DS4_DSPARK_N_LAYER full
+ * DeepSeek-V4 MoE layers (byte-identical layout to base/MTP layers, so they run
+ * on the existing layer kernels) plus a lightweight semi-autoregressive Markov
+ * head. Its persistent KV is always fused from the target's hidden states
+ * captured at layers 40/41/42 (main_proj/main_norm), never its own block KV.
+ * Heads: main_proj (12288->4096 fusion), main_norm, markov_w1/w2 (rank-256
+ * vocab refine), conf_proj (confidence), and a final hc-collapse head
+ * (hc_head_*) + norm feeding the shared target lm_head.
+ */
+#define DS4_DSPARK_N_LAYER 3
+
+typedef struct {
+    ds4_tensor *main_proj;
+    ds4_tensor *main_norm;
+    ds4_tensor *markov_w1;
+    ds4_tensor *markov_w2;
+    ds4_tensor *conf_proj;
+    ds4_tensor *hc_head_base;
+    ds4_tensor *hc_head_fn;
+    ds4_tensor *hc_head_scale;
+    ds4_tensor *norm;
+    ds4_layer_weights layer[DS4_DSPARK_N_LAYER];
+} ds4_dspark_weights;
+
 /* =========================================================================
  * Fixed Weight Binding and Model Validation.
  * =========================================================================
@@ -3264,6 +3291,185 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     l->ffn_down_shexp  = required_tensor(m, "mtp.0.ffn_down_shexp.weight");
 
     mtp_weights_validate_layout(w);
+}
+
+/* Validate one DSpark MoE layer. The drafter layers are dense (SWA-128, no
+ * compressor/indexer), so the contract matches the MTP block exactly. */
+static void dspark_layer_validate_layout(const ds4_layer_weights *l) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+
+    tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
+    tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
+    tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
+    tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+    tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
+    tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
+    tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+    tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
+    tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
+    tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+    tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
+
+    tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
+    tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
+    tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
+    tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+    if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
+        ds4_die("DSpark routed gate/up experts use different quant types");
+    }
+    tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+}
+
+static void dspark_weights_validate_layout(const ds4_dspark_weights *w, const ds4_model *m) {
+    const uint64_t markov_rank = required_u32(m, "deepseek4.dspark.markov_rank");
+    const uint64_t main_in = 3u * (uint64_t)DS4_N_EMBD;      /* concat of 3 target hidden */
+    const uint64_t conf_in = (uint64_t)DS4_N_EMBD + markov_rank; /* [hidden ; markov_embed] */
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+
+    tensor_expect_layout(w->main_proj,     DS4_TENSOR_Q8_0, 2, main_in, DS4_N_EMBD, 0);
+    tensor_expect_layout(w->main_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(w->markov_w1,     DS4_TENSOR_F16,  2, markov_rank, DS4_N_VOCAB, 0);
+    tensor_expect_layout(w->markov_w2,     DS4_TENSOR_F16,  2, markov_rank, DS4_N_VOCAB, 0);
+    tensor_expect_layout(w->conf_proj,     DS4_TENSOR_F32,  2, conf_in, 1, 0);
+    tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
+    tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
+    tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
+    tensor_expect_layout(w->norm,          DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+
+    for (uint32_t L = 0; L < DS4_DSPARK_N_LAYER; L++) {
+        dspark_layer_validate_layout(&w->layer[L]);
+    }
+}
+
+static void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
+    memset(w, 0, sizeof(*w));
+
+    w->main_proj     = required_tensor(m, "dspark.main_proj.weight");
+    w->main_norm     = required_tensor(m, "dspark.main_norm.weight");
+    w->markov_w1     = required_tensor(m, "dspark.markov_w1.weight");
+    w->markov_w2     = required_tensor(m, "dspark.markov_w2.weight");
+    w->conf_proj     = required_tensor(m, "dspark.conf_proj.weight");
+    w->hc_head_fn    = required_tensor(m, "dspark.hc_head_fn.weight");
+    w->hc_head_base  = required_tensor(m, "dspark.hc_head_base.weight");
+    w->hc_head_scale = required_tensor(m, "dspark.hc_head_scale.weight");
+    w->norm          = required_tensor(m, "dspark.norm.weight");
+
+    for (uint32_t L = 0; L < DS4_DSPARK_N_LAYER; L++) {
+        ds4_layer_weights *l = &w->layer[L];
+        l->hc_attn_fn      = required_tensorf(m, "dspark.%u.hc_attn_fn.weight", L);
+        l->hc_attn_scale   = required_tensorf(m, "dspark.%u.hc_attn_scale.weight", L);
+        l->hc_attn_base    = required_tensorf(m, "dspark.%u.hc_attn_base.weight", L);
+        l->attn_norm       = required_tensorf(m, "dspark.%u.attn_norm.weight", L);
+        l->attn_q_a        = required_tensorf(m, "dspark.%u.attn_q_a.weight", L);
+        l->attn_q_a_norm   = required_tensorf(m, "dspark.%u.attn_q_a_norm.weight", L);
+        l->attn_q_b        = required_tensorf(m, "dspark.%u.attn_q_b.weight", L);
+        l->attn_kv         = required_tensorf(m, "dspark.%u.attn_kv.weight", L);
+        l->attn_kv_a_norm  = required_tensorf(m, "dspark.%u.attn_kv_a_norm.weight", L);
+        l->attn_sinks      = required_tensorf(m, "dspark.%u.attn_sinks.weight", L);
+        l->attn_output_a   = required_tensorf(m, "dspark.%u.attn_output_a.weight", L);
+        l->attn_output_b   = required_tensorf(m, "dspark.%u.attn_output_b.weight", L);
+        l->hc_ffn_fn       = required_tensorf(m, "dspark.%u.hc_ffn_fn.weight", L);
+        l->hc_ffn_scale    = required_tensorf(m, "dspark.%u.hc_ffn_scale.weight", L);
+        l->hc_ffn_base     = required_tensorf(m, "dspark.%u.hc_ffn_base.weight", L);
+        l->ffn_norm        = required_tensorf(m, "dspark.%u.ffn_norm.weight", L);
+        l->ffn_gate_inp    = required_tensorf(m, "dspark.%u.ffn_gate_inp.weight", L);
+        l->ffn_exp_probs_b = required_tensorf(m, "dspark.%u.exp_probs_b.bias", L);
+        l->ffn_gate_exps   = required_tensorf(m, "dspark.%u.ffn_gate_exps.weight", L);
+        l->ffn_up_exps     = required_tensorf(m, "dspark.%u.ffn_up_exps.weight", L);
+        l->ffn_down_exps   = required_tensorf(m, "dspark.%u.ffn_down_exps.weight", L);
+        l->ffn_gate_shexp  = required_tensorf(m, "dspark.%u.ffn_gate_shexp.weight", L);
+        l->ffn_up_shexp    = required_tensorf(m, "dspark.%u.ffn_up_shexp.weight", L);
+        l->ffn_down_shexp  = required_tensorf(m, "dspark.%u.ffn_down_shexp.weight", L);
+    }
+
+    dspark_weights_validate_layout(w, m);
+}
+
+/*
+ * Standalone DSpark GGUF load + validation (D1 gate).
+ *
+ * Opens ONLY the drafter file with a private, non-prefetched CPU mapping (low
+ * RAM: tensor pointers index the mmap, nothing is faulted in), binds every
+ * tensor, and runs the strict layout check. Reachable without the base model so
+ * it can be run safely alongside a large co-resident inference server. Returns
+ * 0 on success; the strict checks call exit(1) on any mismatch.
+ */
+int ds4_dspark_validate(const char *path) {
+    /* The drafter shares the DeepSeek-V4-Flash architecture dims; the dspark
+     * GGUF carries only deepseek4.dspark.* metadata, so pin the shape here
+     * (it is already the default, but be explicit and order-independent). */
+    g_ds4_shape = DS4_SHAPE_FLASH;
+
+    ds4_model m;
+    model_open(&m, path, false, false);
+
+    printf("dspark: file %s\n", path);
+    printf("dspark: gguf v%u, %" PRIu64 " tensors, %" PRIu64 " metadata keys\n",
+           m.version, m.n_tensors, m.n_kv);
+
+    uint32_t layer_count = 0, block_size = 0, markov_rank = 0,
+             noise_token = 0, expert_count = 0;
+    model_get_u32(&m, "deepseek4.dspark.layer_count", &layer_count);
+    model_get_u32(&m, "deepseek4.dspark.block_size", &block_size);
+    model_get_u32(&m, "deepseek4.dspark.markov_rank", &markov_rank);
+    model_get_u32(&m, "deepseek4.dspark.noise_token_id", &noise_token);
+    model_get_u32(&m, "deepseek4.dspark.expert_count", &expert_count);
+    printf("dspark: layers=%u block=%u markov_rank=%u noise_token=%u experts=%u\n",
+           layer_count, block_size, markov_rank, noise_token, expert_count);
+
+    ds4_array_ref tl = {0};
+    if (model_get_array(&m, "deepseek4.dspark.target_layers", &tl) && tl.len <= 64) {
+        printf("dspark: target_layers=[");
+        ds4_cursor c = cursor_at(&m, tl.data_pos);
+        for (uint64_t i = 0; i < tl.len; i++) {
+            uint32_t v = 0;
+            if (!cursor_u32(&c, &v)) break;   /* INT32/UINT32 are both 4 bytes */
+            printf("%s%u", i ? "," : "", v);
+        }
+        printf("]\n");
+    }
+
+    if (layer_count != DS4_DSPARK_N_LAYER) {
+        fprintf(stderr, "dspark: ERROR layer_count=%u but engine expects %u\n",
+                layer_count, DS4_DSPARK_N_LAYER);
+        model_close(&m);
+        return 1;
+    }
+
+    ds4_dspark_weights w;
+    dspark_weights_bind(&w, &m);   /* binds all tensors + strict layout (exits on mismatch) */
+
+    printf("dspark: bound %u layers x 24 + 9 heads = %u tensors, layout OK\n",
+           DS4_DSPARK_N_LAYER, DS4_DSPARK_N_LAYER * 24u + 9u);
+    printf("dspark: main_proj[%" PRIu64 ",%" PRIu64 "] main_norm[%" PRIu64 "] "
+           "markov_w1[%" PRIu64 ",%" PRIu64 "] conf_proj[%" PRIu64 ",%" PRIu64 "]\n",
+           w.main_proj->dim[0], w.main_proj->dim[1], w.main_norm->dim[0],
+           w.markov_w1->dim[0], w.markov_w1->dim[1],
+           w.conf_proj->dim[0], w.conf_proj->dim[1]);
+    for (uint32_t L = 0; L < DS4_DSPARK_N_LAYER; L++) {
+        const ds4_layer_weights *l = &w.layer[L];
+        printf("dspark: layer%u attn_q_b=%s ffn_gate_exps=%s[%" PRIu64 ",%" PRIu64 ",%" PRIu64 "] "
+               "shexp_gate=%s\n",
+               L, tensor_type_name(l->attn_q_b->type),
+               tensor_type_name(l->ffn_gate_exps->type),
+               l->ffn_gate_exps->dim[0], l->ffn_gate_exps->dim[1], l->ffn_gate_exps->dim[2],
+               tensor_type_name(l->ffn_gate_shexp->type));
+    }
+
+    model_close(&m);
+    printf("dspark: VALIDATE OK\n");
+    return 0;
 }
 
 static void weights_free(ds4_weights *w) {
