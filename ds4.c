@@ -31524,6 +31524,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                              getenv("DS4_CONT_DSPARK") != NULL) ? 1 : 0;
     const ds4_model          *dspark_model = &ctx->e->dspark_model;
     const ds4_dspark_weights *dw           = &ctx->e->dspark_weights;
+    /* D4.5e concurrency auto-gate: spec-decode is a LOW-CONCURRENCY lever -- it wins
+     * when decode is weight-bandwidth-bound (the wide verify forward is ~free over a
+     * 1-wide decode), but once n_live banks make the verify forward N*BLOCK rows it goes
+     * compute-bound and the per-step cost outpaces the token savings (measured: net
+     * speedup >1 at n_live<=2-3, parity ~4, NET-NEGATIVE >=8).  So gate the per-step
+     * DSpark work (capture/inject/draft + verify width) on n_live <= DS4_DSPARK_MAX_NLIVE;
+     * above it the step degrades to plain batched decode (the D=0 lossless base case),
+     * matching base throughput.  Default 3 (env-overridable); 0 disables the gate (always
+     * spec).  Lossless either way -- the verify forward is the sole source of tokens. */
+    uint32_t dspark_max_nlive = 3u;
+    { const char *me = getenv("DS4_DSPARK_MAX_NLIVE"); if (me && me[0]) { long v = atol(me); if (v >= 0) dspark_max_nlive = (uint32_t)v; } }
     /* D4.5e: inject the cold/suffix PREFILL region's target hidden into the DSpark
      * rings (so the drafter attends real prefix KV from the first decode step instead
      * of zero ring slots).  On by default when dspark_mode; DS4_DSPARK_NO_PREFILL_INJECT
@@ -31911,6 +31922,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             if (admit_drained) break;   /* queue empty and nothing in flight -> done */
             continue;                   /* admitted seqs all finished at seed -> poll again */
         }
+        /* D4.5e: per-step DSpark gate (see dspark_max_nlive above).  When concurrency
+         * exceeds the threshold this step runs plain batched decode (no drafts/capture/
+         * inject); the verify-pack forces nd=0 and the draft/capture/inject branches are
+         * skipped.  Transitions are lossless; a high->low concurrency flip resumes spec
+         * with a brief accept ramp where the block window spans positions decoded while
+         * gated off (their KV was not injected -- same self-healing class as prefill). */
+        const int dspark_now = dspark_mode && (dspark_max_nlive == 0u || n_live <= dspark_max_nlive);
 
         /* ---- refresh scalar read-counts = max over ALL banks (reset clobbers them,
          * and the just-admitted bank's emitted rows must be counted). ---- */
@@ -31948,6 +31966,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 if (!live[b]) continue;
                 uint32_t nd = ndr[b];
                 if (nd > Dspec) nd = Dspec;
+                /* D4.5e gate: when DSpark is concurrency-gated OFF this step, verify the
+                 * committed row only (drop any drafts from a prior low-concurrency step) ->
+                 * 1 row/bank = plain batched decode width. */
+                if (dspark_mode && !dspark_now) nd = 0u;
                 /* keep every row inside the per-seq frontier bound and the forward's row cap. */
                 while (nd > 0u && (posv[b] + nd >= seq_cap || K2 + 1u + nd > vcap_rows)) nd--;
                 vfirst[b] = K2; vnr[b] = nd;
@@ -31980,11 +32002,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             if (ok) {
                 g->batch_multiseq_emit = true;
                 g->batch_defer_comp_store = !no_defer;
-                g->batch_rollback_capture = can_rollback;
+                /* D4.5e gate: when DSpark is concurrency-gated off every bank packs nd=0
+                 * (full accept of its single committed row), so no rollback is ever needed
+                 * this step -> skip the per-bank checkpoint capture (match base decode cost).
+                 * can_rollback stays true so no_defer holds (in-forward emit); the rollback
+                 * call below no-ops (M >= total for all banks). */
+                g->batch_rollback_capture = can_rollback && !(dspark_mode && !dspark_now);
                 /* D4.5d/E5: tap the target hidden after layers 40/41/42 inline in this
                  * forward (zero extra forward) -> dspark_concat[0..K2).  Accept-rate-only;
-                 * off => bit-identical to the non-DSpark verify forward. */
-                g->dspark_capture = dspark_mode ? true : false;
+                 * off => bit-identical to the non-DSpark verify forward.  Gated off when
+                 * DSpark is concurrency-gated this step (no draft -> no need to capture). */
+                g->dspark_capture = dspark_now ? true : false;
                 ok = metal_graph_batch_eval_logits(g, model, weights, vqtok, vmaxpos, K2, vlogits);
                 g->dspark_capture = false;
                 g->batch_rollback_capture = false;
@@ -32065,7 +32093,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * overwrites before they are ever read as a prefix (see design).  Pure accept-rate
              * side -- the verify forward already set every committed token.  vpos/vsid are the
              * original pack arrays (untouched by the accept loop, which only advanced posv[]). */
-            if (dspark_mode && K2 > 0u) {
+            if (dspark_now && K2 > 0u) {
                 ok = ds4_gpu_tensor_write(g->batch_positions, 0, vpos, (uint64_t)K2 * sizeof(int32_t)) != 0;
                 if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, vsid, (uint64_t)K2 * sizeof(int32_t)) != 0;
                 if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -32170,7 +32198,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                                                    scom, sbank, (int)Dspec);
                     for (uint32_t i = 0; i < nl; i++) ds4_gpu_tensor_free(srows[i]);
                 }
-                if (dspark_mode) {
+                if (dspark_mode && !dspark_now) {
+                    /* D4.5e gate: DSpark concurrency-gated OFF this step -> draft nothing, so
+                     * the next step's verify is 1 row/bank (plain batched decode). */
+                    for (uint32_t b = 0; b < MS; b++) ndr[b] = 0u;
+                } else if (dspark_mode) {
                     /* D4.5d/E7: DSpark BLOCK draft.  For every still-live committed bank,
                      * draft a [bonus,noise*4] block at positions [posv[b]..posv[b]+4] with
                      * bonus = cur[b] (the last committed token, the block's seed row), in ONE
