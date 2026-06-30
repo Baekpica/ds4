@@ -105,11 +105,12 @@ namespace {
  * behaviour).  Step 8 / CUDA Graphs sets this to the capture stream
  * before allocating, so the alloc node lives on the captured stream
  * and capture is not invalidated.  Set via ds4_pool_set_stream() from
- * ds4_mmq.cu wrappers. */
+ * ds4_mmq.cu wrappers; an explicit stream=0 means the legacy default
+ * stream so pool ops stay ordered with legacy-stream kernels. */
 static thread_local cudaStream_t t_ds4_pool_stream = cudaStreamPerThread;
 
 extern "C" void ds4_pool_set_stream(cudaStream_t stream) {
-    t_ds4_pool_stream = stream ? stream : cudaStreamPerThread;
+    t_ds4_pool_stream = stream;
 }
 
 extern "C" cudaStream_t ds4_pool_get_stream(void) {
