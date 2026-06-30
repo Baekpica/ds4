@@ -94,6 +94,15 @@ static __global__ void mm_ids_helper(
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
 
+    // Post-Volta independent thread scheduling: the store[] writes above are done by
+    // some warp lanes and read below by other lanes. Without an explicit warp barrier
+    // those shared-memory writes are not guaranteed visible to the cross-lane reads,
+    // so a lane could read a stale/uninitialized store[] slot -> wrong compacted
+    // expert ids -> nondeterministic MoE routing. On GB10 (sm_121) this realized as
+    // the cont-multiseq non-determinism + BOS-spam (compute-sanitizer racecheck:
+    // "RAW hazard at __shared__" between the store writes and these reads).
+    __syncwarp();
+
     for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
         const mm_ids_helper_store store_it = store[itc];
         const int it       = store_it.it();

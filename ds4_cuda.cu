@@ -16171,6 +16171,25 @@ __global__ static void moe_prefix_sorted_pairs_kernel(
     }
 }
 
+/* DS4_CUDA_DETERMINISTIC: route the known scheduling-dependent MoE reductions/scatters
+ * to fixed-order variants so multiseq output is bit-reproducible run-to-run (the
+ * compute-sanitizer memcheck behavior, without the slowdown).  Default OFF (fast
+ * path).  Currently gates: the sorted-pairs scatter order and the down-projection
+ * accumulation (atomic vs fixed-order).  This is a building block for the
+ * cont-multiseq determinism work, NOT a complete fix -- the residual warm-state FP
+ * reduction-order race still needs its source serialized (see the root-cause task /
+ * cont-server-nondeterminism postmortem). */
+static int ds4_cuda_deterministic(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_CUDA_DETERMINISTIC"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+
+/* Fast default scatter: parallel, places pairs into their expert bucket in
+ * NON-deterministic atomic-arrival order.  Within-bucket order is irrelevant to the
+ * per-pair down outputs (written by original pair index) but DOES shuffle the pair
+ * grouping the sorted-pairs / expert-tile MoE kernels consume, contributing 1-ULP
+ * run-to-run divergence.  For bit-determinism use the _det variant (DS4_CUDA_DETERMINISTIC). */
 __global__ static void moe_scatter_sorted_pairs_kernel(
         uint32_t *sorted_pairs,
         uint32_t *cursors,
@@ -16183,6 +16202,26 @@ __global__ static void moe_scatter_sorted_pairs_kernel(
     if (expert_i >= 256) expert_i = 255;  /* routed n_expert fixed at 256 */
     uint32_t pos = atomicAdd(cursors + (uint32_t)expert_i, 1u);
     sorted_pairs[pos] = pair;
+}
+
+/* Determinism-mode scatter: single-thread, places each pair into its expert bucket in
+ * ASCENDING pair order so the per-expert grouping is reproducible run-to-run -> fixed
+ * FP accumulation order downstream.  cursors[e] starts at offsets[e]
+ * (moe_prefix_sorted_pairs_kernel); one int loop per layer is negligible.  Same
+ * single-thread-deterministic pattern as the 2026-05-26 comp_rows / mm_ids fix.
+ * Launch <<<1,1>>>. */
+__global__ static void moe_scatter_sorted_pairs_det_kernel(
+        uint32_t *sorted_pairs,
+        uint32_t *cursors,
+        const int32_t *selected,
+        uint32_t pair_count) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    for (uint32_t pair = 0u; pair < pair_count; pair++) {
+        int32_t expert_i = selected[pair];
+        if (expert_i < 0) expert_i = 0;
+        if (expert_i >= 256) expert_i = 255;
+        sorted_pairs[cursors[(uint32_t)expert_i]++] = pair;
+    }
 }
 
 __global__ static void moe_build_expert_tile_offsets_kernel(
@@ -18161,7 +18200,10 @@ mmq_moe_fallback:
         const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
         const uint32_t use_p2_sorted = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
-        const uint32_t use_atomic_down = use_expert_tiles &&
+        /* atomicAdd(down_out) accumulates experts in nondeterministic order (finite,
+         * 1-ULP, never NaN, gated n_tokens>=128).  Determinism mode forces the
+         * fixed-order non-atomic per-pair path instead. */
+        const uint32_t use_atomic_down = use_expert_tiles && !ds4_cuda_deterministic() &&
             (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
              (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
         const uint32_t use_gate_row2048 = use_expert_tiles && expert_tile_m == 8u &&
@@ -18271,11 +18313,12 @@ mmq_moe_fallback:
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
                 if (ok) {
-                    moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
-                        sorted_pairs,
-                        cursors,
-                        (const int32_t *)selected->ptr,
-                        pair_count);
+                    if (ds4_cuda_deterministic())
+                        moe_scatter_sorted_pairs_det_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+                            sorted_pairs, cursors, (const int32_t *)selected->ptr, pair_count);
+                    else
+                        moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
+                            sorted_pairs, cursors, (const int32_t *)selected->ptr, pair_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
                 if (ok && use_expert_tiles) {
