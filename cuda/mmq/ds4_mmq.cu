@@ -20,6 +20,7 @@
 #include "mmid.cuh"
 
 #include <cstdio>
+#include <cstdlib>
 
 // ----------------------------------------------------------------------------
 // Init
@@ -211,6 +212,18 @@ extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
 // device is sufficient for the dense path.
 namespace {
 
+__global__ static void ds4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = p[i];
+    if (!isfinite(v)) p[i] = 0.0f;
+}
+
+static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
+    if (!p || n == 0) return;
+    ds4_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
+}
+
 ggml_backend_cuda_context * get_ctx_for_device(int device) {
     static ggml_backend_cuda_context * cached[GGML_CUDA_MAX_DEVICES] = {};
     if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return nullptr;
@@ -319,6 +332,8 @@ int ds4_mmq_dense_impl(
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
 
+    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+
     const mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
@@ -343,6 +358,7 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
+    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
 
@@ -530,6 +546,8 @@ int ds4_mmq_moe_impl(
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
 
+    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+
     const mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
@@ -554,7 +572,7 @@ int ds4_mmq_moe_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
-        /*ncols_max=*/(int64_t)n_tokens,
+        /*ncols_max=*/ne_get_rows,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -564,6 +582,7 @@ int ds4_mmq_moe_impl(
         fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, cudaGetErrorString(err));
         return -4;
     }
+    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     return 0;
 }
 
@@ -683,6 +702,9 @@ int ds4_mmq_moe_pair_impl(
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
 
+    cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+    cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+
     mmq_args args = {
         /*x=*/(const char *)W_a,
         /*type_x=*/type,
@@ -707,7 +729,7 @@ int ds4_mmq_moe_pair_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
-        /*ncols_max=*/(int64_t)n_tokens,
+        /*ncols_max=*/ne_get_rows,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -726,6 +748,8 @@ int ds4_mmq_moe_pair_impl(
         fprintf(stderr, "%s: mul_mat_q_case (pair b) launch failed: %s\n", tag, cudaGetErrorString(err));
         return -5;
     }
+    ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+    ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     return 0;
 }
 
@@ -935,6 +959,8 @@ int ds4_mmq_moe_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
+    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float), stream);
+
     // FD Inc2a: one mmvq launch serves at most col_cap columns -- the moe
     // kernel runs one warp per column (block.y = ncols_dst) under
     // __launch_bounds__ baked per COMPILED arch + type
@@ -979,6 +1005,7 @@ int ds4_mmq_moe_vec_impl(
         }
     }
 
+    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used, stream);
     return 0;
 }
 
@@ -1063,6 +1090,8 @@ int ds4_mmq_moe_pair_vec_impl(
     fusion.gate   = W_b;
     fusion.glu_op = GGML_GLU_OP_SWIGLU;
 
+    cudaMemsetAsync(out_silu, 0, (size_t)M * (size_t)n_expert_used * sizeof(float), stream);
+
     mul_mat_vec_q_switch_type(
         /*vx=*/W_a, /*type_x=*/type,
         /*vy=*/(const void *)src1_q8_1.get(),
@@ -1088,6 +1117,7 @@ int ds4_mmq_moe_pair_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
+    ds4_mmq_sanitize_f32(out_silu, (uint64_t)M * (uint64_t)n_expert_used, stream);
     return 0;
 }
 
@@ -1166,6 +1196,8 @@ int ds4_mmq_dense_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
+    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/type,
         /*vy=*/(const void *)src1_q8_1.get(),
@@ -1191,6 +1223,7 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
+    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
 

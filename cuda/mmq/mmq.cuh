@@ -3225,7 +3225,8 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
                 continue;
             }
 
-            dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
+            const int dst_j = ids_dst ? ids_dst[j] : j;
+            dst[dst_j*stride + i] = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
         }
     }
 }
@@ -3273,7 +3274,8 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                     continue;
                 }
 
-                dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                const int dst_j = ids_dst ? ids_dst[j] : j;
+                dst[dst_j*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
             }
         }
     }
@@ -3537,7 +3539,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 
     if (fixup) {
-        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
+        write_back(sum, nullptr, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
     } else {
         write_back(sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
     }
@@ -4043,6 +4045,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
     if (fixup_needed) {
         tmp_fixup.alloc(block_nums_stream_k.x * mmq_x*mmq_y);
+        CUDA_CHECK(cudaMemsetAsync(tmp_fixup.ptr, 0,
+                    (size_t)block_nums_stream_k.x * (size_t)mmq_x * (size_t)mmq_y * sizeof(float),
+                    stream));
     }
 
     const dim3 block_nums_fixup(block_nums_stream_k.x, mmq_y/warp_size, 1);
@@ -4208,4 +4213,3 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
-

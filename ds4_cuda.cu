@@ -556,6 +556,68 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+static int cuda_model_current_direct_available(const void *model_map) {
+    return model_map && model_map == g_model_host_base &&
+           (g_model_device_owned || g_model_registered);
+}
+
+static int cuda_model_has_full_range(const void *model_map, uint64_t model_size) {
+    if (!model_map || model_size == 0) return 0;
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && r.offset == 0 && r.bytes >= model_size) return 1;
+    }
+    return 0;
+}
+
+static void cuda_model_preserve_current_direct_mapping(void) {
+    if (!g_model_host_base || g_model_registered_size == 0) return;
+    if (!g_model_device_owned && !g_model_registered) return;
+
+    if (!cuda_model_has_full_range(g_model_host_base, g_model_registered_size)) {
+        if (g_model_device_owned && g_model_device_base) {
+            g_model_ranges.push_back({
+                g_model_host_base,
+                0,
+                g_model_registered_size,
+                (char *)g_model_device_base,
+                NULL,
+                NULL,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            });
+            g_model_range_by_offset[0] = g_model_ranges.size() - 1u;
+            g_model_range_bytes += g_model_registered_size;
+        } else if (g_model_registered && g_model_device_base) {
+            g_model_ranges.push_back({
+                g_model_host_base,
+                0,
+                g_model_registered_size,
+                (char *)g_model_device_base,
+                (void *)g_model_host_base,
+                (char *)g_model_device_base,
+                g_model_registered_size,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            });
+            g_model_range_by_offset[0] = g_model_ranges.size() - 1u;
+        }
+    }
+
+    g_model_device_owned = 0;
+    g_model_registered = 0;
+}
+
 /* Allocate a device-resident copy of [offset, offset+bytes) from model_map and
  * push it into g_model_ranges so future cuda_model_range_ptr lookups hit it.
  * Returns the device pointer on success, NULL on cudaMalloc/cudaMemcpy failure.
@@ -628,8 +690,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
-    if (g_model_hmm_direct &&
+    if (cuda_model_current_direct_available(model_map)) return cuda_model_ptr(model_map, offset);
+    if (model_map == g_model_host_base && g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
         return cuda_model_ptr(model_map, offset);
@@ -1998,7 +2060,8 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
  * HMM-prefetched the mapping.  Otherwise let the caller try per-range mapping
  * or a device copy instead of surfacing an async illegal access later. */
 static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
-    if (g_model_device_owned || g_model_registered || g_model_hmm_direct ||
+    if (cuda_model_current_direct_available(model_map) ||
+        (model_map == g_model_host_base && g_model_hmm_direct) ||
         getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return cuda_model_ptr(model_map, offset);
     }
@@ -2724,24 +2787,7 @@ extern "C" int ds4_gpu_stream_synchronize(void) {
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
-    cuda_model_range_release_all();
-    cuda_q8_f16_cache_release_all();
-    g_q8_f16_disabled_after_oom = 0;
-    g_q8_f16_budget_notice_printed = 0;
-    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
-    g_q8_f32_ranges.clear();
-    g_q8_f32_by_offset.clear();
-    g_q8_f32_bytes = 0;
-    if (g_model_device_owned && g_model_device_base) {
-        (void)cudaFree((void *)g_model_device_base);
-        g_model_device_owned = 0;
-    }
-    if (g_model_registered && g_model_host_base) {
-        (void)cudaHostUnregister((void *)g_model_host_base);
-        g_model_registered = 0;
-    }
+    cuda_model_preserve_current_direct_mapping();
     g_model_host_base = model_map;
     g_model_device_base = (const char *)model_map;
     g_model_registered_size = model_size;

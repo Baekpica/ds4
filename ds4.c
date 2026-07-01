@@ -24815,11 +24815,8 @@ static uint32_t bg_prefill_chunk_tokens(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DS4_CONT_PREFILL_CHUNK");
-        /* Default 4096 = the serial path's long-prompt chunk size.  The R3
-         * GB10 sweep (2.5k-token cold admit) showed the forward is fastest at
-         * maximal width -- 12.75s at 4096 vs 16.8s at 512 vs 31.3s at 128 --
-         * so the loop only engages past 4096; the big R3 win at default config
-         * is the last-row-only head (legacy one-shot: 22.6s, 42% head+readback). */
+        /* Default 4096: amortizes cold admission while keeping raw KV sized to
+         * window+chunk instead of a whole prompt.  Set to 0 for legacy one-shot. */
         v = (e && e[0]) ? atoi(e) : 4096;
         if (v < 0) v = 0;
     }
@@ -24897,6 +24894,14 @@ static bool bg_prefill_rows(ds4_gpu_graph *g, const ds4_model *model, const ds4_
     }
     free(pos_arr); free(sid_arr);
     return ok;
+}
+
+static bool logits_have_nonfinite(const float *logits, uint32_t n_vocab) {
+    if (!logits) return true;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (!isfinite(logits[i])) return true;
+    }
+    return false;
 }
 
 /* Legacy one-shot ragged forward (bit-exact pre-R3 path, DS4_CONT_PREFILL_CHUNK=0):
@@ -28361,19 +28366,23 @@ static bool metal_graph_batch_eval_logits(
         else (void)ds4_gpu_synchronize();
         if (ok) ok = metal_graph_read_current_logits(g, logits_out);
     } else if (g->batch_head_last_only) {
-        /* R3 final prefill chunk: the caller consumes only the LAST row.  One
-         * decode-style head on row n-1 (same math as the n==1 oracle path,
-         * different row) + one DS4_N_VOCAB readback into logits_out[0]. */
+        /* R3 final prefill chunk: the caller consumes only the LAST row.  Compute
+         * a tail chunk through the batched-head path and read its last row, avoiding
+         * the legacy full prompt-length logits buffer/readback. */
+        const uint32_t G = (uint32_t)DS4_MULTISEQ_MAX_SEQ;
+        const uint32_t base = n > G ? n - G : 0u;
+        const uint32_t chunk = n - base;
         ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = metal_graph_encode_output_head_batch_row(g,
-                                                              model,
-                                                              weights,
-                                                              n - 1u,
-                                                              weights->output->dim[1],
-                                                              false);
+        if (ok) ok = metal_graph_encode_output_head_batch_into(g,
+                                                               model,
+                                                               weights,
+                                                               base,
+                                                               chunk,
+                                                               weights->output->dim[1],
+                                                               g->batch_logits);
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
-        if (ok) ok = metal_graph_read_current_logits(g, logits_out);
+        if (ok) ok = metal_graph_read_logits_row_from(g, g->batch_logits, chunk - 1u, logits_out);
     } else {
         const uint32_t G = (uint32_t)DS4_MULTISEQ_MAX_SEQ;
         for (uint32_t base = 0; ok && base < n; base += G) {
@@ -31847,6 +31856,29 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     ctx->bank_hist_valid[b] = 0u;       /* partial prefill: state unknown */
                     break;
                 }
+                if (final && pfbase[b] == 0u && pfoff[b] == 0u &&
+                    logits_have_nonfinite(seedlog, DS4_N_VOCAB)) {
+                    /* Validate before DSpark prefix injection.  If the cold
+                     * target prefill poisoned the seed row, discard the bank
+                     * and redo the forward so no derived draft KV is injected
+                     * from corrupt hidden states. */
+                    fprintf(stderr, "ds4: cont prefill retry after nonfinite seed logits (bank %u n=%u)\n",
+                            b, n);
+                    if (!bg_reset_bank(&ctx->sl, g, b) ||
+                        !ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) {
+                        ok = false;
+                        break;
+                    }
+                    bank_hist_reset(ctx, b);
+                    g->dspark_capture = dspark_prefill_inject ? true : false;
+                    ok = bg_prefill_oneshot(g, model, weights, b, pftok[b], n, 0u, seedlog);
+                    g->dspark_capture = false;
+                    if (!ok || logits_have_nonfinite(seedlog, DS4_N_VOCAB)) {
+                        fprintf(stderr, "ds4: cont prefill retry failed (bank %u n=%u)\n", b, n);
+                        ok = false;
+                        break;
+                    }
+                }
                 /* D4.5e: fuse main_x for this chunk's captured hidden and inject it into bank b's
                  * ring at the chunk's absolute positions [pbase, pbase+n) (seq_id = b).  Now the
                  * block draft's prefix window reads real prefix KV from the first decode step
@@ -33856,6 +33888,21 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        if (e->dspark_ready &&
+            !ds4_gpu_set_model_map_range(e->dspark_model.map,
+                                          e->dspark_model.size,
+                                          e->dspark_model.tensor_data_pos,
+                                          e->dspark_model.size - e->dspark_model.tensor_data_pos,
+                                          e->dspark_model.max_tensor_bytes))
+        {
+            fprintf(stderr,
+                    "ds4: %s failed to map DSpark model views; aborting startup. "
+                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
 #ifndef __APPLE__
         const char *weight_ipc_manifest = getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST");
         if (weight_ipc_manifest && weight_ipc_manifest[0]) {
@@ -33899,9 +33946,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
         }
 #endif
-        // Pre-cache both main and MTP tensor spans into device memory at
-        // startup, so the first decode (or first MTP draft) doesn't pay a
-        // multi-second cudaMemcpy cost in the hot path.  The previous
+        // Pre-cache main and support-model tensor spans into device memory at
+        // startup, so the first decode, MTP draft, or DSpark block doesn't pay
+        // a multi-second cudaMemcpy cost in the hot path.  The previous
         // !e->mtp_ready guard skipped both pre-caches when MTP was loaded,
         // which left the entire 3.6 GiB Q4_K MoE weight set to be copied
         // synchronously on the first MTP routed_moe invocation.
@@ -33919,6 +33966,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          * skips `mtp.0.ffn_*_exps.weight` automatically. */
         if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
             fprintf(stderr, "ds4: %s failed to prepare MTP startup model cache\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->dspark_ready && !accelerator_cache_model_tensors(e->backend, &e->dspark_model)) {
+            fprintf(stderr, "ds4: %s failed to prepare DSpark startup model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
