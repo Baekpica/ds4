@@ -8107,6 +8107,19 @@ __global__ static void dspark_capture_mean_kernel(
     concat[(uint64_t)t * n_slots * n_embd + (uint64_t)slot * n_embd + d] = acc / (float)n_hc;
 }
 
+__global__ static void dspark_gather_concat_kernel(
+        float *dst, const float *src, const int32_t *src_rows,
+        uint32_t n_rows, uint32_t row_floats) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_rows * row_floats;
+    if (gid >= n) return;
+    uint32_t d = gid % row_floats;
+    uint32_t r = gid / row_floats;
+    int32_t sr = src_rows[r];
+    if (sr < 0) return;
+    dst[(uint64_t)r * row_floats + d] = src[(uint64_t)(uint32_t)sr * row_floats + d];
+}
+
 __global__ static void hc_expand_kernel(
         float *out_hc,
         const float *block_out,
@@ -10696,6 +10709,18 @@ extern "C" int ds4_gpu_dspark_markov_step_tensor(ds4_gpu_tensor *cand_out, const
     return cuda_ok(cudaGetLastError(), "dspark_markov_step launch");
 }
 
+extern "C" int ds4_gpu_dspark_gather_concat_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, const ds4_gpu_tensor *src_rows,
+        uint32_t n_rows, uint32_t row_floats) {
+    if (!dst || !src || !src_rows || n_rows == 0 || row_floats == 0) return 0;
+    const uint64_t dst_bytes = (uint64_t)n_rows * row_floats * sizeof(float);
+    if (dst->bytes < dst_bytes || src_rows->bytes < (uint64_t)n_rows * sizeof(int32_t)) return 0;
+    dspark_gather_concat_kernel<<<(dst_bytes / sizeof(float) + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
+        (float *)dst->ptr, (const float *)src->ptr, (const int32_t *)src_rows->ptr,
+        n_rows, row_floats);
+    return cuda_ok(cudaGetLastError(), "dspark_gather_concat launch");
+}
+
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
@@ -11835,6 +11860,7 @@ extern "C" void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
  * Opt out (restore legacy warp8 forcing; drifts from base, for bisection):
  *   DS4_CUDA_MTP_VERIFIER_FORCE_WARP8=1   (or back-compat DS4_CUDA_MTP_VERIFIER_USE_MMQ=0) */
 static __thread int g_in_mtp_verifier = 0;
+static __thread int g_in_mtp_verifier_scope = 0;
 static int g_mtp_verifier_bypass_init = 0;
 static int g_mtp_verifier_bypass = 1;  /* default: mmq stays active in verifier (exact vs base) */
 
@@ -11857,6 +11883,7 @@ static int ds4_cuda_mtp_verifier_bypass(void) {
 }
 
 extern "C" void ds4_gpu_set_mtp_verifier(int on) {
+    g_in_mtp_verifier_scope = on ? 1 : 0;
     if (ds4_cuda_mtp_verifier_bypass()) { g_in_mtp_verifier = 0; return; }
     g_in_mtp_verifier = on ? 1 : 0;
 }
@@ -12052,6 +12079,46 @@ static uint32_t cuda_moe_vec_max_assign(void) {
         }
     }
     return v;
+}
+
+/* Small verifier MoE tier.  Widths <=8 are handled by the MMVQ vec tier;
+ * widths 9..16 are too small for the general sorted/MMQ MoE machinery to
+ * amortize, but large enough to show up as DSpark/MTP verifier batches.  A
+ * value of 0 disables the direct tier and restores the prior MMQ dispatch. */
+static uint32_t cuda_moe_small16_max_tokens(void) {
+    static int init = 0;
+    static uint32_t v = 16;
+    if (!init) {
+        init = 1;
+        if (getenv("DS4_CUDA_MOE_NO_SMALL16")) v = 0;
+        const char *s = getenv("DS4_CUDA_MOE_SMALL16");
+        if (s && *s) {
+            long x = strtol(s, NULL, 10);
+            if (x <= 0) v = 0;
+            else if (x >= 9 && x <= 16) v = (uint32_t)x;
+            else v = 16;
+        }
+    }
+    return v;
+}
+
+static uint32_t cuda_moe_small16_scope_active(uint32_t q4k_path, uint64_t model_size) {
+    static int init = 0;
+    static uint32_t all_models = 0;
+    static uint32_t mtp_draft = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_MOE_SMALL16_ALL");
+        all_models = (s && *s && strcmp(s, "0") != 0) ? 1u : 0u;
+        const char *m = getenv("DS4_CUDA_MOE_NO_SMALL16_MTP_DRAFT");
+        mtp_draft = (m && *m && strcmp(m, "0") != 0) ? 0u : 1u;
+    }
+    if (all_models || g_in_mtp_verifier_scope) return 1u;
+    /* The MTP support GGUF is a small Q4_K model (~3.6 GB); DSpark's Q4_K
+     * drafter is much larger (~10.7 GB).  Keep the draft-side speedup for the
+     * MTP support model without perturbing DSpark block-drafter numerics. */
+    if (mtp_draft && q4k_path && model_size <= 6ull * 1024ull * 1024ull * 1024ull) return 1u;
+    return 0u;
 }
 
 /* FD Inc2b: attention output_a multi-column native ceiling.  n_tokens in
@@ -15936,7 +16003,7 @@ __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -15998,7 +16065,7 @@ __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_warp8_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -16047,7 +16114,7 @@ __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_hwarp16_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -16095,7 +16162,7 @@ __global__ static void moe_gate_up_mid_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     for (uint32_t rr = 0; rr < 4u; rr++) {
@@ -16148,7 +16215,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
@@ -16326,7 +16393,7 @@ __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -16798,7 +16865,7 @@ __global__ static void moe_gate_up_mid_sorted_p2_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -16841,7 +16908,7 @@ __global__ static DS4_CUDA_UNUSED void moe_down_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -16875,7 +16942,7 @@ __global__ static DS4_CUDA_UNUSED void moe_down_warp8_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -16902,7 +16969,7 @@ __global__ static DS4_CUDA_UNUSED void moe_down_hwarp16_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -16929,7 +16996,7 @@ __global__ static void moe_down_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -16961,7 +17028,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     for (uint32_t rr = 0; rr < 4u; rr++) {
@@ -17050,11 +17117,41 @@ __global__ static void moe_down_sum6_n2_qwarp32_kernel(
     if (lane == 0) out[(uint64_t)tok * out_dim + row] = total;
 }
 
+__global__ static void moe_down_sum6_nt_qwarp32_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_tokens) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int32_t expert_i = selected[(uint64_t)tok * 6u + slot];
+        if (expert_i < 0) expert_i = 0;
+        if (expert_i >= 256) expert_i = 255;  /* routed n_expert fixed at 256 */
+        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + ((uint64_t)tok * 6u + slot) * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = total;
+}
+
 // Q4_K fused 6-expert down + experts-sum (n_expert=6, n_tokens=1).  Mirrors
 // moe_down_sum6_qwarp32_kernel for IQ2+Q2K.  Eliminates the per-expert scratch
 // buffer plus the separate moe_sum_kernel pass; writes one F32 per output row
 // after summing six experts' down contributions in registers.
-__global__ static void moe_down_q4K_sum6_qwarp32_kernel(
+__global__ static DS4_CUDA_UNUSED void moe_down_q4K_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -17082,6 +17179,36 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
+__global__ static void moe_down_q4K_sum6_nt_qwarp32_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_tokens) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int32_t expert_i = selected[(uint64_t)tok * 6u + slot];
+        if (expert_i < 0) expert_i = 0;
+        if (expert_i >= 256) expert_i = 255;  /* routed n_expert fixed at 256 */
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + ((uint64_t)tok * 6u + slot) * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = total;
+}
+
 __global__ static void moe_down_sorted_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -17101,7 +17228,7 @@ __global__ static void moe_down_sorted_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -17512,7 +17639,7 @@ __global__ static void moe_down_sorted_p2_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -17648,7 +17775,7 @@ __global__ static void moe_gate_up_mid_f32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     uint32_t expert = (uint32_t)expert_i;
     const uint32_t nb = expert_in_dim / CUDA_QK_K;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
@@ -17704,7 +17831,7 @@ __global__ static void moe_down_f32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    if (expert_i >= (int32_t)n_expert) expert_i = (int32_t)n_expert - 1;
+    if (expert_i >= 256) expert_i = 255;  /* routed expert ids fixed at 256 */
     const uint32_t nb = expert_mid_dim / CUDA_QK_K;
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const float *xr = mid + (uint64_t)pair * expert_mid_dim;
@@ -17828,17 +17955,15 @@ static int routed_moe_launch(
      * kernels, which are structurally optimised for small batch.
      *
      * Constraints:
-     *   - Gate/up matmul ncols_dst = n_tokens must stay
-     *     <= MMVQ_MAX_BATCH_SIZE=8; guaranteed by the outer
-     *     cuda_mmvq_decode_max_tokens() gate (clamped to 8).
-     *   - Down matmul ncols_dst = n_tokens * n_expert_used has no such
-     *     guarantee; FD Inc2a: ds4_mmq_moe_vec_impl splits the column dim
-     *     into per-compiled-arch capped chunks internally (every (token,
-     *     slot) row is an independent single-expert matvec, so chunking
-     *     is just pointer offsets).  The vec tier as a whole is
-     *     bounded by cuda_moe_vec_max_assign(); beyond it, fall through
-     *     to the mmq tile path below, which amortizes expert-weight
-     *     reads across assignment columns.
+     *   - ds4_mmq_moe_vec_impl splits its column dim into per-compiled-arch
+     *     capped chunks internally, so the default <=8 tier and the scoped
+     *     small16 extension share the same Q8_1 vector machinery.  Every
+     *     (token, slot) row is an independent single-expert matvec, so
+     *     chunking is just pointer offsets.
+     *   - Outside the scoped small16 extension, the vec tier as a whole is
+     *     bounded by cuda_moe_vec_max_assign(); beyond it, fall through to
+     *     the mmq tile path below, which amortizes expert-weight reads
+     *     across assignment columns.
      *
      * The DeepSeek V4 clamp (clamp=10 in this build) is applied by the
      * existing moe_mmq_swiglu_weighted_clamp_kernel after the two matmuls.
@@ -17852,14 +17977,24 @@ static int routed_moe_launch(
      */
     /* FD Inc1: threshold logic unified with the dense Q8_0 site. */
     const uint32_t mmvq_decode_max_tokens = cuda_mmvq_decode_max_tokens();
-    if (ds4_cuda_use_mmq() && n_tokens > 0u && n_tokens <= mmvq_decode_max_tokens) {
+    const uint32_t small16_max_tokens = cuda_moe_small16_max_tokens();
+    const uint32_t small16_scope_active = cuda_moe_small16_scope_active(q4k_path, model_size);
+    const uint32_t small16_vec_active =
+        small16_scope_active &&
+        small16_max_tokens != 0u &&
+        n_tokens > 8u && n_tokens <= small16_max_tokens &&
+        n_expert == 6u;
+    const uint32_t mmvq_token_ceiling = small16_vec_active ? small16_max_tokens : mmvq_decode_max_tokens;
+    if (ds4_cuda_use_mmq() && n_tokens > 0u && n_tokens <= mmvq_token_ceiling) {
         const uint32_t n_expert_used   = n_expert;
         const uint32_t n_experts_total = 256u;
         const uint64_t n_assignments   = (uint64_t)n_tokens * n_expert_used;
         /* gate ncols_dst = n_tokens (<= 8 by the outer gate); down's wider
          * column dim is chunk-split inside the vec impl.  FD Inc2a: the
          * tier envelope is the assignment knob, no longer a hard 8. */
-        if (n_assignments > (uint64_t)cuda_moe_vec_max_assign()) {
+        uint64_t vec_max_assign = (uint64_t)cuda_moe_vec_max_assign();
+        if (small16_vec_active && vec_max_assign < n_assignments) vec_max_assign = n_assignments;
+        if (n_assignments > vec_max_assign) {
             /* Beyond the vec tier's assignment envelope; fall through. */
         } else {
             /* Step 8: graph cache fast path.  If enabled, check the cache
@@ -17954,97 +18089,325 @@ static int routed_moe_launch(
             }
 
             int rc = -1;
-            /* 1. Two separate gate/up matmuls through mmvq.  Each call
-             *    re-quantizes the activation - acceptable for n_tokens=1
-             *    (4KB Q8_1 buffer) and avoids needing a shared-buffer API
-             *    in this first iteration. */
-            if (q4k_path) {
-                rc = ds4_mmq_q4_K_moe_vec(gate_w, (const float *)x->ptr,
-                                          (const int32_t *)selected->ptr,
-                                          (float *)gate->ptr,
-                                          (int)expert_mid_dim, (int)expert_in_dim,
-                                          (int)n_tokens, (int)n_experts_total,
-                                          (int)n_expert_used, moe_stream);
+            int gate_up_fused = 0;
+            int down_sum_fused = 0;
+            const uint32_t use_q81_fused_moe =
+                getenv("DS4_CUDA_MOE_Q81_FUSED") != NULL;
+            const uint32_t use_q8k_gate_in_vec =
+                n_expert_used == 6u && getenv("DS4_CUDA_MOE_Q8K_GATE_IN_VEC") != NULL;
+            const uint32_t use_q8k_down_in_vec =
+                n_expert_used == 6u && getenv("DS4_CUDA_MOE_Q8K_DOWN_IN_VEC") != NULL;
+            const uint32_t use_pair_raw_vec =
+                n_expert_used == 6u && getenv("DS4_CUDA_MOE_PAIR_RAW_VEC") != NULL;
+            const uint32_t profile_mmvq_moe =
+                getenv("DS4_CUDA_MOE_PROFILE") != NULL && !ds4_capture_active();
+            cudaEvent_t mmvq_prof_ev[5] = {NULL, NULL, NULL, NULL, NULL};
+            if (profile_mmvq_moe) {
+                for (uint32_t i = 0; i < 5u; i++) {
+                    if (cudaEventCreate(&mmvq_prof_ev[i]) != cudaSuccess) {
+                        for (uint32_t j = 0; j < i; j++) (void)cudaEventDestroy(mmvq_prof_ev[j]);
+                        memset(mmvq_prof_ev, 0, sizeof(mmvq_prof_ev));
+                        break;
+                    }
+                }
+                if (mmvq_prof_ev[0]) (void)cudaEventRecord(mmvq_prof_ev[0], ds4_current_stream());
+            }
+
+            /* 1. Gate + up + SwiGLU.  For V4 top_k=6, fuse the two
+             *    canonical-Q8_1 matvecs and the clamp/SwiGLU/router-weight
+             *    epilogue into mid directly.  This removes one activation
+             *    quantize, one vector matmul sequence, and the separate
+             *    swiglu launch while preserving the Q8_1 dot path. */
+            if (use_q8k_gate_in_vec) {
+                const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+                const uint64_t xq_bytes = (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
+                if (expert_in_dim % CUDA_QK_K == 0u && down->bytes >= xq_bytes) {
+                    cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
+                    dim3 xq_grid(xq_blocks, n_tokens, 1);
+                    q8_K_quantize_kernel<<<xq_grid, 256, 0, ds4_current_stream()>>>(
+                        xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+                    if (!cuda_ok(cudaGetLastError(), "mmvq q8k gate x quantize launch")) goto mmvq_decode_bail;
+
+                    dim3 qgrid((expert_mid_dim + 127u) / 128u, n_assignments, 1);
+                    if (q4k_path) {
+                        moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256, 0, ds4_current_stream()>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert_used,
+                            /*write_aux=*/0u,
+                            clamp);
+                    } else {
+                        moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256, 0, ds4_current_stream()>>>(
+                            (float *)gate->ptr,
+                            (float *)up->ptr,
+                            (float *)mid->ptr,
+                            gate_w,
+                            up_w,
+                            xq,
+                            (const int32_t *)selected->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes,
+                            gate_row_bytes,
+                            xq_blocks,
+                            expert_mid_dim,
+                            n_expert_used,
+                            /*write_aux=*/0u,
+                            clamp);
+                    }
+                    if (!cuda_ok(cudaGetLastError(), "mmvq q8k gate/up launch")) goto mmvq_decode_bail;
+                    gate_up_fused = 1;
+                } else {
+                    fprintf(stderr, "ds4: DS4_CUDA_MOE_Q8K_GATE_IN_VEC requested but scratch/shape invalid; falling back to Q8_1 gate/up\n");
+                }
+            } else if (use_q81_fused_moe && n_expert_used == 6u) {
+                if (q4k_path) {
+                    rc = ds4_mmq_q4_K_moe_gate_up_mid_vec(gate_w, up_w,
+                                                          (const float *)x->ptr,
+                                                          (const int32_t *)selected->ptr,
+                                                          (const float *)weights->ptr,
+                                                          (float *)mid->ptr,
+                                                          (int)expert_mid_dim, (int)expert_in_dim,
+                                                          (int)n_tokens, (int)n_experts_total,
+                                                          (int)n_expert_used, clamp, moe_stream);
+                } else {
+                    rc = ds4_mmq_iq2_xxs_moe_gate_up_mid_vec(gate_w, up_w,
+                                                             (const float *)x->ptr,
+                                                             (const int32_t *)selected->ptr,
+                                                             (const float *)weights->ptr,
+                                                             (float *)mid->ptr,
+                                                             (int)expert_mid_dim, (int)expert_in_dim,
+                                                             (int)n_tokens, (int)n_experts_total,
+                                                             (int)n_expert_used, clamp, moe_stream);
+                }
+                if (rc == 0) {
+                    gate_up_fused = 1;
+                } else {
+                    fprintf(stderr, "ds4: ds4_mmq_<>_moe_gate_up_mid_vec returned %d; falling back to unfused gate/up\n", rc);
+                }
+            }
+            if (gate_up_fused) {
+                if (mmvq_prof_ev[1]) (void)cudaEventRecord(mmvq_prof_ev[1], ds4_current_stream());
+                if (mmvq_prof_ev[2]) (void)cudaEventRecord(mmvq_prof_ev[2], ds4_current_stream());
+            }
+            if (!gate_up_fused) {
+                int gate_up_pair_raw = 0;
+                if (use_pair_raw_vec) {
+                    if (q4k_path) {
+                        rc = ds4_mmq_q4_K_moe_pair_raw_vec(gate_w, up_w,
+                                                           (const float *)x->ptr,
+                                                           (const int32_t *)selected->ptr,
+                                                           (float *)gate->ptr, (float *)up->ptr,
+                                                           (int)expert_mid_dim, (int)expert_in_dim,
+                                                           (int)n_tokens, (int)n_experts_total,
+                                                           (int)n_expert_used, moe_stream);
+                    } else {
+                        rc = ds4_mmq_iq2_xxs_moe_pair_raw_vec(gate_w, up_w,
+                                                              (const float *)x->ptr,
+                                                              (const int32_t *)selected->ptr,
+                                                              (float *)gate->ptr, (float *)up->ptr,
+                                                              (int)expert_mid_dim, (int)expert_in_dim,
+                                                              (int)n_tokens, (int)n_experts_total,
+                                                              (int)n_expert_used, moe_stream);
+                    }
+                    if (rc == 0) {
+                        gate_up_pair_raw = 1;
+                    } else {
+                        fprintf(stderr, "ds4: ds4_mmq_<>_moe_pair_raw_vec returned %d; falling back to separate gate/up\n", rc);
+                    }
+                }
+                /* Two separate gate/up matmuls through mmvq. */
+                if (!gate_up_pair_raw && q4k_path) {
+                    rc = ds4_mmq_q4_K_moe_vec(gate_w, (const float *)x->ptr,
+                                              (const int32_t *)selected->ptr,
+                                              (float *)gate->ptr,
+                                              (int)expert_mid_dim, (int)expert_in_dim,
+                                              (int)n_tokens, (int)n_experts_total,
+                                              (int)n_expert_used, moe_stream);
+                    if (rc != 0) {
+                        fprintf(stderr, "ds4: ds4_mmq_q4_K_moe_vec (gate) returned %d; falling back\n", rc);
+                        goto mmvq_decode_bail;
+                    }
+                    rc = ds4_mmq_q4_K_moe_vec(up_w, (const float *)x->ptr,
+                                              (const int32_t *)selected->ptr,
+                                              (float *)up->ptr,
+                                              (int)expert_mid_dim, (int)expert_in_dim,
+                                              (int)n_tokens, (int)n_experts_total,
+                                              (int)n_expert_used, moe_stream);
+                } else if (!gate_up_pair_raw) {
+                    rc = ds4_mmq_iq2_xxs_moe_vec(gate_w, (const float *)x->ptr,
+                                                 (const int32_t *)selected->ptr,
+                                                 (float *)gate->ptr,
+                                                 (int)expert_mid_dim, (int)expert_in_dim,
+                                                 (int)n_tokens, (int)n_experts_total,
+                                                 (int)n_expert_used, moe_stream);
+                    if (rc != 0) {
+                        fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_vec (gate) returned %d; falling back\n", rc);
+                        goto mmvq_decode_bail;
+                    }
+                    rc = ds4_mmq_iq2_xxs_moe_vec(up_w, (const float *)x->ptr,
+                                                 (const int32_t *)selected->ptr,
+                                                 (float *)up->ptr,
+                                                 (int)expert_mid_dim, (int)expert_in_dim,
+                                                 (int)n_tokens, (int)n_experts_total,
+                                                 (int)n_expert_used, moe_stream);
+                }
                 if (rc != 0) {
-                    fprintf(stderr, "ds4: ds4_mmq_q4_K_moe_vec (gate) returned %d; falling back\n", rc);
+                    fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (up) returned %d; falling back\n", rc);
                     goto mmvq_decode_bail;
                 }
-                rc = ds4_mmq_q4_K_moe_vec(up_w, (const float *)x->ptr,
-                                          (const int32_t *)selected->ptr,
-                                          (float *)up->ptr,
-                                          (int)expert_mid_dim, (int)expert_in_dim,
-                                          (int)n_tokens, (int)n_experts_total,
-                                          (int)n_expert_used, moe_stream);
-            } else {
-                rc = ds4_mmq_iq2_xxs_moe_vec(gate_w, (const float *)x->ptr,
-                                             (const int32_t *)selected->ptr,
-                                             (float *)gate->ptr,
-                                             (int)expert_mid_dim, (int)expert_in_dim,
-                                             (int)n_tokens, (int)n_experts_total,
-                                             (int)n_expert_used, moe_stream);
+                if (mmvq_prof_ev[1]) (void)cudaEventRecord(mmvq_prof_ev[1], ds4_current_stream());
+
+                /* 2. SwiGLU + clamp + router_weight.  Same kernel as the mmq
+                 *    path uses - applies the V4 clamp to gate/up BEFORE silu. */
+                {
+                    const uint64_t mid_floats = n_assignments * expert_mid_dim;
+                    moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256, 0, ds4_current_stream()>>>(
+                        (float *)mid->ptr, /*gate_out_dbg=*/nullptr, /*up_out_dbg=*/nullptr,
+                        (const float *)gate->ptr, (const float *)up->ptr,
+                        (const float *)weights->ptr,
+                        expert_mid_dim, n_tokens, n_expert_used, clamp);
+                    if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe swiglu launch")) goto mmvq_decode_bail;
+                }
+                if (mmvq_prof_ev[2]) (void)cudaEventRecord(mmvq_prof_ev[2], ds4_current_stream());
+            }
+
+            /* 3. Down matmul + slot sum.  For V4's top_k=6 shape use the
+             *    fused canonical-Q8_1 helper: one quantize of mid and one
+             *    launch that accumulates all six selected experts directly
+             *    into out[token,row].  This preserves the vec tier's Q8_1
+             *    numerics while avoiding ceil(n_assignments/cap) down
+             *    launches, the [token,slot,out_dim] down buffer write, and
+             *    the separate moe_sum_kernel. */
+            if (use_q8k_down_in_vec) {
+                const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+                const uint64_t midq_bytes = n_assignments * (uint64_t)midq_blocks * sizeof(cuda_block_q8_K);
+                if (expert_mid_dim % CUDA_QK_K == 0u && gate->bytes >= midq_bytes) {
+                    cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
+                    dim3 midq_grid(midq_blocks, n_assignments, 1);
+                    q8_K_quantize_kernel<<<midq_grid, 256, 0, ds4_current_stream()>>>(
+                        midq, (const float *)mid->ptr, expert_mid_dim, (uint32_t)n_assignments);
+                    if (!cuda_ok(cudaGetLastError(), "mmvq q8k down mid quantize launch")) goto mmvq_decode_bail;
+
+                    dim3 sgrid((out_dim + 31u) / 32u, n_tokens, 1);
+                    if (q4k_path) {
+                        moe_down_q4K_sum6_nt_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
+                            (float *)out->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_tokens);
+                    } else {
+                        moe_down_sum6_nt_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
+                            (float *)out->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_tokens);
+                    }
+                    if (!cuda_ok(cudaGetLastError(), "mmvq q8k down/sum launch")) goto mmvq_decode_bail;
+                    down_sum_fused = 1;
+                } else {
+                    fprintf(stderr, "ds4: DS4_CUDA_MOE_Q8K_DOWN_IN_VEC requested but scratch/shape invalid; falling back to Q8_1 down\n");
+                }
+            } else if (use_q81_fused_moe && n_expert_used == 6u) {
+                if (q4k_path) {
+                    rc = ds4_mmq_q4_K_moe_down_sum6_vec(down_w, (const float *)mid->ptr,
+                                                        (const int32_t *)selected->ptr,
+                                                        (float *)out->ptr,
+                                                        (int)out_dim, (int)expert_mid_dim,
+                                                        (int)n_tokens, (int)n_experts_total,
+                                                        (int)n_expert_used, moe_stream);
+                } else {
+                    rc = ds4_mmq_q2_K_moe_down_sum6_vec(down_w, (const float *)mid->ptr,
+                                                        (const int32_t *)selected->ptr,
+                                                        (float *)out->ptr,
+                                                        (int)out_dim, (int)expert_mid_dim,
+                                                        (int)n_tokens, (int)n_experts_total,
+                                                        (int)n_expert_used, moe_stream);
+                }
+                if (rc == 0) {
+                    down_sum_fused = 1;
+                } else {
+                    fprintf(stderr, "ds4: ds4_mmq_<>_moe_down_sum6_vec returned %d; falling back to unfused down\n", rc);
+                }
+            }
+            if (down_sum_fused) {
+                if (mmvq_prof_ev[3]) (void)cudaEventRecord(mmvq_prof_ev[3], ds4_current_stream());
+                if (mmvq_prof_ev[4]) (void)cudaEventRecord(mmvq_prof_ev[4], ds4_current_stream());
+            }
+            if (!down_sum_fused) {
+                /* Same reinterpretation trick the mmq path uses: treat each
+                 * (token, slot) pair as a separate "token" with one expert.
+                 * FD Inc2a: n_assignments may exceed one launch's column cap;
+                 * ds4_mmq_moe_vec_impl splits the column dim internally. */
+                if (q4k_path) {
+                    rc = ds4_mmq_q4_K_moe_vec(down_w, (const float *)mid->ptr,
+                                              (const int32_t *)selected->ptr,
+                                              (float *)down->ptr,
+                                              (int)out_dim, (int)expert_mid_dim,
+                                              (int)n_assignments, (int)n_experts_total,
+                                              /*n_expert_used=*/1, moe_stream);
+                } else {
+                    rc = ds4_mmq_q2_K_moe_vec(down_w, (const float *)mid->ptr,
+                                              (const int32_t *)selected->ptr,
+                                              (float *)down->ptr,
+                                              (int)out_dim, (int)expert_mid_dim,
+                                              (int)n_assignments, (int)n_experts_total,
+                                              /*n_expert_used=*/1, moe_stream);
+                }
                 if (rc != 0) {
-                    fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_vec (gate) returned %d; falling back\n", rc);
+                    fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (down) returned %d; falling back\n", rc);
                     goto mmvq_decode_bail;
                 }
-                rc = ds4_mmq_iq2_xxs_moe_vec(up_w, (const float *)x->ptr,
-                                             (const int32_t *)selected->ptr,
-                                             (float *)up->ptr,
-                                             (int)expert_mid_dim, (int)expert_in_dim,
-                                             (int)n_tokens, (int)n_experts_total,
-                                             (int)n_expert_used, moe_stream);
-            }
-            if (rc != 0) {
-                fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (up) returned %d; falling back\n", rc);
-                goto mmvq_decode_bail;
-            }
+                if (mmvq_prof_ev[3]) (void)cudaEventRecord(mmvq_prof_ev[3], ds4_current_stream());
 
-            /* 2. SwiGLU + clamp + router_weight.  Same kernel as the mmq
-             *    path uses - applies the V4 clamp to gate/up BEFORE silu. */
-            {
-                const uint64_t mid_floats = n_assignments * expert_mid_dim;
-                moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256, 0, ds4_current_stream()>>>(
-                    (float *)mid->ptr, /*gate_out_dbg=*/nullptr, /*up_out_dbg=*/nullptr,
-                    (const float *)gate->ptr, (const float *)up->ptr,
-                    (const float *)weights->ptr,
-                    expert_mid_dim, n_tokens, n_expert_used, clamp);
-                if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe swiglu launch")) goto mmvq_decode_bail;
+                /* 4. Sum across n_expert_used dim - same kernel as the mmq
+                 *    path.  Only needed when fused down+sum is unavailable. */
+                {
+                    uint64_t n = (uint64_t)n_tokens * out_dim;
+                    moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, ds4_current_stream()>>>(
+                        (float *)out->ptr, (const float *)down->ptr,
+                        out_dim, n_expert_used, n_tokens);
+                    if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe sum launch")) goto mmvq_decode_bail;
+                }
+                if (mmvq_prof_ev[4]) (void)cudaEventRecord(mmvq_prof_ev[4], ds4_current_stream());
             }
-
-            /* 3. Down matmul: same reinterpretation trick the mmq path uses -
-             *    treat each (token, slot) pair as a separate "token" with
-             *    one expert.  Routes through mmvq's multi-token MoE kernel
-             *    (mul_mat_vec_q_moe).  FD Inc2a: n_assignments may exceed
-             *    one launch's column cap; ds4_mmq_moe_vec_impl splits the
-             *    column dim into per-COMPILED-arch capped chunks internally
-             *    (single quantize, ceil(n/cap) matvec launches). */
-            if (q4k_path) {
-                rc = ds4_mmq_q4_K_moe_vec(down_w, (const float *)mid->ptr,
-                                          (const int32_t *)selected->ptr,
-                                          (float *)down->ptr,
-                                          (int)out_dim, (int)expert_mid_dim,
-                                          (int)n_assignments, (int)n_experts_total,
-                                          /*n_expert_used=*/1, moe_stream);
-            } else {
-                rc = ds4_mmq_q2_K_moe_vec(down_w, (const float *)mid->ptr,
-                                          (const int32_t *)selected->ptr,
-                                          (float *)down->ptr,
-                                          (int)out_dim, (int)expert_mid_dim,
-                                          (int)n_assignments, (int)n_experts_total,
-                                          /*n_expert_used=*/1, moe_stream);
-            }
-            if (rc != 0) {
-                fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (down) returned %d; falling back\n", rc);
-                goto mmvq_decode_bail;
-            }
-
-            /* 4. Sum across n_expert_used dim - same kernel as the mmq path.
-             *    Launched on moe_stream so Step 8 capture is consistent. */
-            {
-                uint64_t n = (uint64_t)n_tokens * out_dim;
-                moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, ds4_current_stream()>>>(
-                    (float *)out->ptr, (const float *)down->ptr,
-                    out_dim, n_expert_used, n_tokens);
-                if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe sum launch")) goto mmvq_decode_bail;
+            if (mmvq_prof_ev[4]) {
+                if (cudaEventSynchronize(mmvq_prof_ev[4]) == cudaSuccess) {
+                    float ms_gateup = 0.0f, ms_swiglu = 0.0f, ms_down = 0.0f, ms_sum = 0.0f, ms_total = 0.0f;
+                    (void)cudaEventElapsedTime(&ms_gateup, mmvq_prof_ev[0], mmvq_prof_ev[1]);
+                    (void)cudaEventElapsedTime(&ms_swiglu, mmvq_prof_ev[1], mmvq_prof_ev[2]);
+                    (void)cudaEventElapsedTime(&ms_down, mmvq_prof_ev[2], mmvq_prof_ev[3]);
+                    (void)cudaEventElapsedTime(&ms_sum, mmvq_prof_ev[3], mmvq_prof_ev[4]);
+                    (void)cudaEventElapsedTime(&ms_total, mmvq_prof_ev[0], mmvq_prof_ev[4]);
+                    fprintf(stderr,
+                            "ds4: CUDA MoE mmvq profile tokens=%u assignments=%llu q4k=%u q81_fused=%u pair_raw=%u q8k_gate=%u q8k_down=%u gateup=%.3f swiglu=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
+                            n_tokens, (unsigned long long)n_assignments, q4k_path,
+                            use_q81_fused_moe, use_pair_raw_vec, use_q8k_gate_in_vec, use_q8k_down_in_vec,
+                            ms_gateup, ms_swiglu, ms_down, ms_sum, ms_total);
+                }
+                for (uint32_t i = 0; i < 5u; i++) {
+                    (void)cudaEventDestroy(mmvq_prof_ev[i]);
+                    mmvq_prof_ev[i] = NULL;
+                }
             }
             /* Step 8: if we were capturing, finalize the graph and replay
              * it.  cudaStreamEndCapture builds the graph object; the
@@ -18093,6 +18456,12 @@ static int routed_moe_launch(
             }
             return 1;
         mmvq_decode_bail:
+            if (mmvq_prof_ev[0]) {
+                for (uint32_t i = 0; i < 5u; i++) {
+                    if (mmvq_prof_ev[i]) (void)cudaEventDestroy(mmvq_prof_ev[i]);
+                    mmvq_prof_ev[i] = NULL;
+                }
+            }
             /* Failure inside the mmvq decode branch: end any in-flight
              * capture cleanly (discard the partial graph) before falling
              * through to the mmq path. */
@@ -18112,10 +18481,12 @@ static int routed_moe_launch(
                 graph_capturing = 0;
                 if (graph_slot) graph_slot->valid = 0;
             }
+            if (small16_vec_active) goto mmq_moe_path;
             goto mmq_moe_fallback;
         }
     }
 
+mmq_moe_path:
     if (ds4_cuda_use_mmq() && n_tokens >= mmq_moe_min_tokens) {
         const uint32_t n_expert_used = n_expert;   /* parameter name is a misnomer; this is top_k */
         const uint32_t n_experts_total = 256u;     /* matches the hardcoded constant at line 11437 */
@@ -18202,12 +18573,6 @@ static int routed_moe_launch(
         return 1;
     }
 mmq_moe_fallback:
-    /* The legacy fallback dispatch handles Q4_K only for the V4-Flash decode
-     * shape (n_tokens=1, n_expert=6).  Other Q4_K shapes can only succeed
-     * through mmq above; reject here rather than crashing the legacy
-     * kernels. */
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
-
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
@@ -18237,11 +18602,21 @@ mmq_moe_fallback:
             if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
         }
         const uint32_t pair_count = n_tokens * n_expert;
+        const uint32_t small16_direct_enabled =
+            getenv("DS4_CUDA_MOE_SMALL16_DIRECT") != NULL;
+        const uint32_t use_direct_gate_up_small16 =
+            small16_direct_enabled &&
+            small16_scope_active &&
+            small16_max_tokens != 0u &&
+            n_tokens > 8u && n_tokens <= small16_max_tokens &&
+            n_expert == 6u &&
+            getenv("DS4_CUDA_MOE_NO_GATE_UP_SMALL16") == NULL;
         const uint32_t use_direct_gate_up_n2 =
             n_tokens == 2u && n_expert == 6u &&
             xq_blocks <= 16u &&
             getenv("DS4_CUDA_MOE_NO_GATE_UP_N2_LUT") == NULL;
-        const uint32_t use_sorted_pairs = n_tokens > 1u && !use_direct_gate_up_n2;
+        const uint32_t use_direct_gate_up = use_direct_gate_up_n2 || use_direct_gate_up_small16;
+        const uint32_t use_sorted_pairs = n_tokens > 1u && !use_direct_gate_up;
         const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
         const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
@@ -18265,6 +18640,11 @@ mmq_moe_fallback:
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
             getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
+        const uint32_t use_gate_up_lut =
+            !q4k_path &&
+            (use_decode_lut_gate ||
+             (use_direct_gate_up && xq_blocks <= 16u &&
+              getenv("DS4_CUDA_MOE_NO_GATE_UP_SMALL16_LUT") == NULL));
         const uint32_t gate_row_span =
             getenv("DS4_CUDA_MOE_GATE_ROW512") != NULL ? 512u :
             getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ? 2048u : 1024u;
@@ -18285,9 +18665,24 @@ mmq_moe_fallback:
             n_tokens == 2u && n_expert == 6u &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6_N2") == NULL &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
-        const uint32_t use_direct_down_sum6 =
-            ((n_tokens == 1u && n_expert == 6u) || use_direct_down_sum6_n2) &&
+        const uint32_t use_direct_down_sum6_small16 =
+            small16_direct_enabled &&
+            small16_scope_active &&
+            small16_max_tokens != 0u &&
+            n_tokens > 8u && n_tokens <= small16_max_tokens &&
+            n_expert == 6u &&
+            getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6_SMALL16") == NULL &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
+        const uint32_t use_direct_down_sum6 =
+            ((n_tokens == 1u && n_expert == 6u) ||
+             use_direct_down_sum6_n2 ||
+             use_direct_down_sum6_small16) &&
+            getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
+        /* Q4_K fallback kernels are only implemented for the direct top-k=6
+         * shape.  Larger Q4_K MoE still belongs to the MMQ path. */
+        if (q4k_path && (!(use_decode_lut_gate || use_direct_gate_up) || !use_direct_down_sum6)) {
+            return 0;
+        }
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
         uint32_t *sorted_counts = NULL;
@@ -18470,7 +18865,7 @@ mmq_moe_fallback:
                     clamp);
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
-                if (use_decode_lut_gate && q4k_path) {
+                if (q4k_path && (use_decode_lut_gate || use_direct_gate_up)) {
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -18487,7 +18882,7 @@ mmq_moe_fallback:
                         n_expert,
                         write_gate_up,
                         clamp);
-                } else if (use_decode_lut_gate || use_direct_gate_up_n2) {
+                } else if (use_gate_up_lut) {
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -18545,8 +18940,8 @@ mmq_moe_fallback:
             }
             if (use_direct_down_sum6) {
                 if (q4k_path) {
-                    dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
-                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
+                    dim3 sgrid((out_dim + 31u) / 32u, n_tokens, 1);
+                    moe_down_q4K_sum6_nt_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -18554,7 +18949,20 @@ mmq_moe_fallback:
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
-                        out_dim);
+                        out_dim,
+                        n_tokens);
+                } else if (use_direct_down_sum6_small16) {
+                    dim3 sgrid((out_dim + 31u) / 32u, n_tokens, 1);
+                    moe_down_sum6_nt_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
+                        (float *)out->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_tokens);
                 } else if (use_direct_down_sum6_n2) {
                     dim3 sgrid((out_dim + 31u) / 32u, 2, 1);
                     moe_down_sum6_n2_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(

@@ -31566,10 +31566,24 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * D>=1 is NOT lossless (in-forward emit contaminates the pooled cache). */
     { const char *de = getenv("DS4_CONT_MTP_DEPTH"); if (de && de[0]) { int dv = atoi(de); if (dv >= 0) Dspec = (uint32_t)dv; } }
     if (Dspec > DS4_CONT_MTP_MAX_DEPTH) Dspec = DS4_CONT_MTP_MAX_DEPTH;
-    /* D4.5d: the DSpark block always drafts B-1 tokens per step (the [bonus,noise*4]
-     * block yields 4 verifiable drafts) -- pin depth to DS4_DSPARK_BLOCK-1 (=4 =
-     * DS4_CONT_MTP_MAX_DEPTH) so the verify pack reserves exactly the block width. */
-    if (dspark_mode) Dspec = (uint32_t)(DS4_DSPARK_BLOCK - 1);
+    /* D4.5d: the DSpark block drafts B-1 tokens per step (the [bonus,noise*4]
+     * block yields 4 verifiable drafts), so the default verify depth is
+     * DS4_DSPARK_BLOCK-1.  DS4_DSPARK_VERIFY_DEPTH is a diagnostic/perf dial for
+     * finding the speed/acceptance optimum on small-width hardware; it verifies
+     * only the prefix of the generated block and leaves the next block draft
+     * unchanged. */
+    int dspark_verify_depth_forced = 0;
+    if (dspark_mode) {
+        Dspec = (uint32_t)(DS4_DSPARK_BLOCK - 1);
+        const char *de_dspark = getenv("DS4_DSPARK_VERIFY_DEPTH");
+        if (de_dspark && de_dspark[0]) {
+            int dv = atoi(de_dspark);
+            if (dv >= 1 && dv < (int)DS4_DSPARK_BLOCK) {
+                Dspec = (uint32_t)dv;
+                dspark_verify_depth_forced = 1;
+            }
+        }
+    }
     const uint32_t vrows_per_bank = Dspec + 1u;                 /* committed + D drafts */
     uint32_t vcap_rows = MS * vrows_per_bank;
     if (vcap_rows > ctx->prefill_cap) vcap_rows = ctx->prefill_cap;  /* forward tensors sized for prefill_cap */
@@ -31599,9 +31613,14 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * from the first decode step).  Sized for the widest prefill chunk (prefill_cap). */
     int32_t *pf_inj_pos = dspark_mode ? xmalloc((size_t)ctx->prefill_cap * sizeof(int32_t)) : NULL;
     int32_t *pf_inj_sid = dspark_mode ? xmalloc((size_t)ctx->prefill_cap * sizeof(int32_t)) : NULL;
+    int32_t *dspark_step_inj_pos = dspark_mode ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
+    int32_t *dspark_step_inj_sid = dspark_mode ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
+    int32_t *dspark_step_inj_src = dspark_mode ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
+    uint32_t *dspark_depth_cap = dspark_mode ? xcalloc(MS, sizeof(uint32_t)) : NULL;
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
     if (mtp_accept) ok = ok && dbuf && ndr && vqtok && vpos && vsid && vfirst && vnr && vlogits;
-    if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits && pf_inj_pos && pf_inj_sid;
+    if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits && pf_inj_pos && pf_inj_sid &&
+                         dspark_step_inj_pos && dspark_step_inj_sid && dspark_step_inj_src && dspark_depth_cap;
     /* M4b Inc5: batched cross-bank MTP draft chain (one depth-major forward over all
      * live banks, ~D+1 device syncs/step) instead of the per-bank serial
      * mtp_draft_chain_bank (N*(D+1) syncs).  Pure perf: the verify forward is the sole
@@ -31634,6 +31653,16 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (g_cont_prof < 0) g_cont_prof = getenv("DS4_CONT_PROFILE") != NULL ? 1 : 0;
     if (g_cont_prof) { g_cont_be_fwd_s = g_cont_be_post_s = 0.0; g_cont_be_calls = g_cont_be_rows = 0; }
     double t_sample_s = 0.0;
+    const int dspark_prof = dspark_mode && getenv("DS4_DSPARK_PROFILE") != NULL;
+    const int dspark_compact_inject = dspark_mode && getenv("DS4_DSPARK_COMPACT_INJECT") != NULL;
+    const int dspark_adapt_depth = dspark_mode && !dspark_verify_depth_forced &&
+                                   getenv("DS4_DSPARK_ADAPT_DEPTH") != NULL;
+    double dspark_t_verify_s = 0.0, dspark_t_accept_s = 0.0, dspark_t_inj_pack_s = 0.0;
+    double dspark_t_inj_proj_s = 0.0, dspark_t_inj_store_s = 0.0, dspark_t_rollback_s = 0.0;
+    double dspark_t_commit_s = 0.0, dspark_t_draft_block_s = 0.0, dspark_t_markov_s = 0.0;
+    uint64_t dspark_prof_steps = 0, dspark_prof_verify_rows = 0, dspark_prof_inject_rows = 0;
+    uint64_t dspark_prof_draft_rows = 0, dspark_prof_compact_saved = 0;
+    uint64_t dspark_prof_auto_depth3_steps = 0, dspark_prof_adapt_saved_rows = 0;
     while (ok) {
         /* ---- ADMIT: fill free banks from the waiting queue.  At most MS
          * placements per pass (the outer loop re-enters immediately when
@@ -31936,6 +31965,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
                     } else {
                         live[b] = 1u;
+                        if (dspark_depth_cap) dspark_depth_cap[b] = Dspec;
                     }
                     if (getenv("DS4_CONT_GEN_TIMING"))
                         fprintf(stderr, "ds4: cont admit bank=%u pos_base=%u suffix=%u wall=%.2fs%s\n",
@@ -31994,10 +32024,20 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             for (uint32_t b = 0; b < MS; b++) { committed_rows[b] = 0u; seedtok[b] = -1; }
             /* 1. PACK verify rows. */
             uint32_t K2 = 0, vmaxpos = 0;
+            const uint32_t Dstep = (dspark_mode && dspark_now && !dspark_verify_depth_forced &&
+                                    n_live == 3u && Dspec > 3u) ? 3u : Dspec;
             for (uint32_t b = 0; b < MS; b++) {
                 if (!live[b]) continue;
                 uint32_t nd = ndr[b];
-                if (nd > Dspec) nd = Dspec;
+                if (nd > Dstep) nd = Dstep;
+                if (dspark_adapt_depth) {
+                    uint32_t cap = dspark_depth_cap[b];
+                    if (cap == 0u || cap > Dstep) cap = Dstep;
+                    if (nd > cap) {
+                        if (dspark_prof && dspark_now) dspark_prof_adapt_saved_rows += (uint64_t)(nd - cap);
+                        nd = cap;
+                    }
+                }
                 /* D4.5e gate: when DSpark is concurrency-gated OFF this step, verify the
                  * committed row only (drop any drafts from a prior low-concurrency step) ->
                  * 1 row/bank = plain batched decode width. */
@@ -32045,7 +32085,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * off => bit-identical to the non-DSpark verify forward.  Gated off when
                  * DSpark is concurrency-gated this step (no draft -> no need to capture). */
                 g->dspark_capture = dspark_now ? true : false;
+                ds4_gpu_set_mtp_verifier(1);
+                const double verify_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
                 ok = metal_graph_batch_eval_logits(g, model, weights, vqtok, vmaxpos, K2, vlogits);
+                if (dspark_prof && dspark_now) dspark_t_verify_s += now_sec() - verify_t0;
+                ds4_gpu_set_mtp_verifier(0);
                 g->dspark_capture = false;
                 g->batch_rollback_capture = false;
                 g->batch_defer_comp_store = false;
@@ -32060,7 +32104,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 break;
             }
             steps++; mtp_acc_steps++;
+            if (dspark_prof && dspark_now) {
+                dspark_prof_steps++;
+                dspark_prof_verify_rows += K2;
+                if (Dstep != Dspec) dspark_prof_auto_depth3_steps++;
+            }
             /* 3. ACCEPT + emit + evict (greedy argmax). */
+            const double accept_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
             for (uint32_t b = 0; b < MS; b++) {
                 if (!live[b]) continue;
                 const uint32_t f = vfirst[b];
@@ -32103,6 +32153,22 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     }
                 }
                 committed_rows[b] = M;
+                if (dspark_adapt_depth && dspark_depth_cap && dspark_now) {
+                    uint32_t cap = dspark_depth_cap[b];
+                    if (cap == 0u || cap > Dspec) cap = Dspec;
+                    const uint32_t accepted_drafts = M > 0u ? M - 1u : 0u;
+                    if (!evicted) {
+                        if (nd > 0u && accepted_drafts >= nd) {
+                            if (cap < Dspec) cap++;
+                        } else {
+                            uint32_t next_cap = accepted_drafts + 1u;
+                            if (next_cap < 1u) next_cap = 1u;
+                            if (next_cap < cap) cap = next_cap;
+                        }
+                        if (cap > Dspec) cap = Dspec;
+                        dspark_depth_cap[b] = cap;
+                    }
+                }
                 /* A2a: the M kept verify rows' input tokens are exactly what entered
                  * the cache (the rollback below removes the rejected tail) -- append
                  * them even for a just-evicted bank (its committed cache must reflect
@@ -32116,6 +32182,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     ctx->bank_hist_valid[b] = 0u;
                 }
             }
+            if (dspark_prof && dspark_now) dspark_t_accept_s += now_sec() - accept_t0;
             /* D4.5d/E6: FUSE + INJECT.  Build each verify row's drafter KV from the target
              * hidden captured this step (dspark_concat[0..K2)): main_x = main_norm(main_proj(
              * concat)), then wkv@main_x -> kv_a_norm -> rope -> store into each row's bank ring
@@ -32126,26 +32193,65 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * side -- the verify forward already set every committed token.  vpos/vsid are the
              * original pack arrays (untouched by the accept loop, which only advanced posv[]). */
             if (dspark_now && K2 > 0u) {
-                ok = ds4_gpu_tensor_write(g->batch_positions, 0, vpos, (uint64_t)K2 * sizeof(int32_t)) != 0;
-                if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, vsid, (uint64_t)K2 * sizeof(int32_t)) != 0;
+                const double pack_t0 = dspark_prof ? now_sec() : 0.0;
+                uint32_t I2 = K2;
+                ds4_gpu_tensor *inject_concat = g->dspark_concat;
+                const int compact_step = dspark_compact_inject && dspark_step_inj_pos &&
+                                         dspark_step_inj_sid && dspark_step_inj_src && mk_cand;
+                if (compact_step) {
+                    I2 = 0u;
+                    for (uint32_t b = 0; b < MS; b++) {
+                        const uint32_t M = committed_rows[b];
+                        if (M == 0u) continue;
+                        const uint32_t f = vfirst[b];
+                        for (uint32_t j = 0; j < M; j++) {
+                            const uint32_t src = f + j;
+                            if (src >= K2 || I2 >= vcap_rows) { ok = false; break; }
+                            dspark_step_inj_pos[I2] = vpos[src];
+                            dspark_step_inj_sid[I2] = vsid[src];
+                            dspark_step_inj_src[I2] = (int32_t)src;
+                            I2++;
+                        }
+                        if (!ok) break;
+                    }
+                    if (ok && I2 > 0u) ok = ds4_gpu_tensor_write(mk_cand, 0, dspark_step_inj_src,
+                                            (uint64_t)I2 * sizeof(int32_t)) != 0;
+                    if (ok && I2 > 0u) ok = ds4_gpu_dspark_gather_concat_tensor(g->batch_cur_hc,
+                                            g->dspark_concat, mk_cand, I2, 3u * DS4_N_EMBD) != 0;
+                    inject_concat = g->batch_cur_hc;
+                }
+                const int32_t *ip_host = compact_step ? dspark_step_inj_pos : vpos;
+                const int32_t *is_host = compact_step ? dspark_step_inj_sid : vsid;
+                if (dspark_prof) {
+                    dspark_t_inj_pack_s += now_sec() - pack_t0;
+                    dspark_prof_inject_rows += I2;
+                    if (K2 > I2) dspark_prof_compact_saved += (uint64_t)(K2 - I2);
+                }
+                ok = ok && I2 > 0u;
+                if (ok) ok = ds4_gpu_tensor_write(g->batch_positions, 0, ip_host, (uint64_t)I2 * sizeof(int32_t)) != 0;
+                if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, is_host, (uint64_t)I2 * sizeof(int32_t)) != 0;
+                const double proj_t0 = dspark_prof ? now_sec() : 0.0;
                 if (ok) ok = ds4_gpu_begin_commands() != 0;
                 if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_attn_cur, dspark_model->map, dspark_model->size,
-                                   dw->main_proj->abs_offset, 3u * DS4_N_EMBD, DS4_N_EMBD, g->dspark_concat, K2) != 0;
+                                   dw->main_proj->abs_offset, 3u * DS4_N_EMBD, DS4_N_EMBD, inject_concat, I2) != 0;
                 if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->dspark_main_x, g->batch_attn_cur,
                                    dspark_model->map, dspark_model->size, dw->main_norm->abs_offset,
-                                   DS4_N_EMBD, K2, DS4_RMS_EPS) != 0;
+                                   DS4_N_EMBD, I2, DS4_RMS_EPS) != 0;
                 if (ok) ok = ds4_gpu_end_commands() != 0;
+                if (dspark_prof) dspark_t_inj_proj_s += now_sec() - proj_t0;
+                const double store_t0 = dspark_prof ? now_sec() : 0.0;
                 if (ok) {
-                    ds4_gpu_tensor *ip = ds4_gpu_tensor_view(g->batch_positions, 0, (uint64_t)K2 * sizeof(int32_t));
-                    ds4_gpu_tensor *is = ds4_gpu_tensor_view(g->batch_seq_id, 0, (uint64_t)K2 * sizeof(int32_t));
+                    ds4_gpu_tensor *ip = ds4_gpu_tensor_view(g->batch_positions, 0, (uint64_t)I2 * sizeof(int32_t));
+                    ds4_gpu_tensor *is = ds4_gpu_tensor_view(g->batch_seq_id, 0, (uint64_t)I2 * sizeof(int32_t));
                     ok = ip && is && metal_graph_dspark_inject(g, dspark_model, dw, g->dspark_main_x,
-                                                               K2, ip, is, ctx->dsl.multi_raw);
+                                                               I2, ip, is, ctx->dsl.multi_raw);
                     if (ip) ds4_gpu_tensor_free(ip);
                     if (is) ds4_gpu_tensor_free(is);
                 }
+                if (dspark_prof) dspark_t_inj_store_s += now_sec() - store_t0;
                 if (!ok) {
-                    fprintf(stderr, "ds4: cont-dspark step %u FAIL @inject (K2=%u live=%u)\n",
-                            steps, K2, n_live);
+                    fprintf(stderr, "ds4: cont-dspark step %u FAIL @inject (K2=%u I2=%u live=%u compact=%d)\n",
+                            steps, K2, I2, n_live, compact_step);
                     break;
                 }
             }
@@ -32156,8 +32262,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * cache must reflect only accepted tokens for cache reuse, and its slab is safe to
              * write).  The deferred commit-reforward below is skipped on this path (no_defer set). */
             if (can_rollback && !ctx->mtp_force_norollback) {
+                const double rb_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
                 ok = mtp_cont_rollback_restore_all(g, MS, committed_rows, vnr,
                                                    ctx->rollback_verify, &ctx->rollback_verify_fails);
+                if (dspark_prof && dspark_now) dspark_t_rollback_s += now_sec() - rb_t0;
                 if (!ok) {
                     fprintf(stderr, "ds4: cont-mtp step %u FAIL @rollback (live=%u)\n",
                             steps, n_live);
@@ -32186,6 +32294,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * (the re-forward's compressor emit drifts vs in-forward); M3 replaces it with
              * per-bank in-forward emit + rollback.  Mode 2 is gate-only, not production. */
             if (ok && C2 > 0u && !no_defer) {
+                const double commit_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
                 ok = ds4_gpu_tensor_write(g->batch_positions, 0, vpos, (uint64_t)C2 * sizeof(int32_t)) != 0;
                 if (ok) ok = ds4_gpu_tensor_write(g->batch_seq_id, 0, vsid, (uint64_t)C2 * sizeof(int32_t)) != 0;
                 if (ok) {
@@ -32193,6 +32302,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     ok = metal_graph_batch_eval_logits(g, model, weights, vqtok, cmaxpos, C2, vlogits);
                     g->batch_multiseq_emit = false;
                 }
+                if (dspark_prof && dspark_now) dspark_t_commit_s += now_sec() - commit_t0;
             }
             if (!ok) {
                 fprintf(stderr, "ds4: cont-mtp step %u FAIL @commit (C2=%u no_defer=%d)\n",
@@ -32255,10 +32365,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         nl++;
                     }
                     if (nl > 0u && nl * (uint32_t)DS4_DSPARK_BLOCK <= vcap_rows) {
+                        const double block_t0 = dspark_prof ? now_sec() : 0.0;
                         ok = metal_graph_eval_dspark_block_ms(g, model, weights, dspark_model, dw,
                                 ctx->dsl.multi_raw, nl, Pbank, bonusv, DS4_N_SWA, mk_logits);
+                        if (dspark_prof) dspark_t_draft_block_s += now_sec() - block_t0;
+                        const double markov_t0 = dspark_prof ? now_sec() : 0.0;
                         if (ok) ok = metal_graph_dspark_markov_refine(g, dspark_model, dw, mk_logits,
                                 nl, DS4_DSPARK_BLOCK, DS4_N_VOCAB, bonusv, mk_cand, mk_prev, mk_bias, out_cand);
+                        if (dspark_prof) {
+                            dspark_t_markov_s += now_sec() - markov_t0;
+                            dspark_prof_draft_rows += (uint64_t)nl * (uint64_t)DS4_DSPARK_BLOCK;
+                        }
                         if (ok) {
                             for (uint32_t r = 0; r < nl; r++) {
                                 const uint32_t b = bankmap[r];
@@ -32461,6 +32578,34 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 mtp_acc_drafts ? 100.0 * (double)mtp_acc_hits / (double)mtp_acc_drafts : 0.0,
                 mtp_acc_steps ? (double)mtp_acc_emit / (double)mtp_acc_steps : 0.0);
 
+    if (dspark_prof) {
+        const double denom = dspark_prof_steps ? (double)dspark_prof_steps : 1.0;
+        fprintf(stderr,
+                "ds4: DSPARK_PROFILE compact_inject=%d steps=%llu verify_rows=%llu inject_rows=%llu "
+                "draft_rows=%llu compact_saved=%llu auto_d3_steps=%llu adapt_saved=%llu avg_verify_rows=%.2f avg_inject_rows=%.2f | "
+                "per-step ms: verify=%.3f accept=%.3f inj_pack=%.3f inj_proj=%.3f inj_store=%.3f "
+                "rollback=%.3f commit=%.3f block=%.3f markov=%.3f\n",
+                dspark_compact_inject,
+                (unsigned long long)dspark_prof_steps,
+                (unsigned long long)dspark_prof_verify_rows,
+                (unsigned long long)dspark_prof_inject_rows,
+                (unsigned long long)dspark_prof_draft_rows,
+                (unsigned long long)dspark_prof_compact_saved,
+                (unsigned long long)dspark_prof_auto_depth3_steps,
+                (unsigned long long)dspark_prof_adapt_saved_rows,
+                dspark_prof_steps ? (double)dspark_prof_verify_rows / (double)dspark_prof_steps : 0.0,
+                dspark_prof_steps ? (double)dspark_prof_inject_rows / (double)dspark_prof_steps : 0.0,
+                dspark_t_verify_s      * 1e3 / denom,
+                dspark_t_accept_s      * 1e3 / denom,
+                dspark_t_inj_pack_s    * 1e3 / denom,
+                dspark_t_inj_proj_s    * 1e3 / denom,
+                dspark_t_inj_store_s   * 1e3 / denom,
+                dspark_t_rollback_s    * 1e3 / denom,
+                dspark_t_commit_s      * 1e3 / denom,
+                dspark_t_draft_block_s * 1e3 / denom,
+                dspark_t_markov_s      * 1e3 / denom);
+    }
+
     if (getenv("DS4_CONT_GEN_TIMING"))
         fprintf(stderr, "ds4: continuous gen: %u decode steps over max_seq=%u\n", steps, MS);
 
@@ -32502,6 +32647,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (mk_bias)   ds4_gpu_tensor_free(mk_bias);
     if (mk_logits) ds4_gpu_tensor_free(mk_logits);
     free(pf_inj_pos); free(pf_inj_sid);
+    free(dspark_step_inj_pos); free(dspark_step_inj_sid); free(dspark_step_inj_src); free(dspark_depth_cap);
     return ok ? 0 : 1;
 #undef CG_ERR
 }

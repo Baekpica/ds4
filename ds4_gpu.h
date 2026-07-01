@@ -531,6 +531,15 @@ int ds4_gpu_dspark_markov_step_tensor(
         uint32_t                vocab,
         uint32_t                nb);
 
+/* Pack selected DSpark capture rows into a contiguous [n_rows x row_floats]
+ * scratch tensor.  src_rows is an int32 device tensor of source row indices. */
+int ds4_gpu_dspark_gather_concat_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        const ds4_gpu_tensor *src_rows,
+        uint32_t                n_rows,
+        uint32_t                row_floats);
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
