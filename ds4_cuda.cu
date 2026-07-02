@@ -12391,7 +12391,112 @@ static uint32_t cuda_native_f16_max_tokens(void) {
     return v;
 }
 
+/* Q8_PROF_LITE (env DS4_CUDA_Q8_PROF_LITE): per-(in_dim,out_dim,n_tok) lazy-
+ * event spans over the whole Q8_0 dense funnel below -- STAGE_PROF_LITE showed
+ * the attention half dominated by these GEMVs; this attributes WHICH
+ * projection.  Same ring discipline as moe_lite; events on the stream the
+ * dense-vec tier will use. */
+#define DS4_Q8PROF_RING 2048
+#define DS4_Q8PROF_BUCKETS 48
+static cudaEvent_t g_q8p_ev0[DS4_Q8PROF_RING], g_q8p_ev1[DS4_Q8PROF_RING];
+static uint32_t    g_q8p_tag[DS4_Q8PROF_RING];
+static uint32_t    g_q8p_head = 0;
+static int         g_q8p_init = 0;
+static struct { uint64_t in_dim, out_dim, n_tok; double ms; uint64_t n; }
+                   g_q8p_b[DS4_Q8PROF_BUCKETS];
+static uint32_t    g_q8p_nb = 0;
+static uint64_t    g_q8p_harvested = 0;
+
+static int q8p_enabled(void) {
+    static int en = -1;
+    if (en < 0) en = getenv("DS4_CUDA_Q8_PROF_LITE") != NULL ? 1 : 0;
+    return en;
+}
+
+static uint32_t q8p_bucket(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
+    for (uint32_t i = 0; i < g_q8p_nb; i++)
+        if (g_q8p_b[i].in_dim == in_dim && g_q8p_b[i].out_dim == out_dim &&
+            g_q8p_b[i].n_tok == n_tok) return i;
+    if (g_q8p_nb >= DS4_Q8PROF_BUCKETS) return UINT32_MAX;
+    g_q8p_b[g_q8p_nb].in_dim = in_dim; g_q8p_b[g_q8p_nb].out_dim = out_dim;
+    g_q8p_b[g_q8p_nb].n_tok = n_tok;   g_q8p_b[g_q8p_nb].ms = 0.0;
+    g_q8p_b[g_q8p_nb].n = 0;
+    return g_q8p_nb++;
+}
+
+static uint32_t q8p_begin(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok, cudaStream_t s) {
+    if (!q8p_enabled() || ds4_capture_active()) return UINT32_MAX;
+    const uint32_t b = q8p_bucket(in_dim, out_dim, n_tok);
+    if (b == UINT32_MAX) return UINT32_MAX;
+    if (!g_q8p_init) {
+        g_q8p_init = 1;
+        for (int i = 0; i < DS4_Q8PROF_RING; i++) {
+            if (cudaEventCreate(&g_q8p_ev0[i]) != cudaSuccess ||
+                cudaEventCreate(&g_q8p_ev1[i]) != cudaSuccess) { g_q8p_init = -1; break; }
+            g_q8p_tag[i] = UINT32_MAX;
+        }
+    }
+    if (g_q8p_init < 0) return UINT32_MAX;
+    const uint32_t slot = g_q8p_head;
+    g_q8p_head = (g_q8p_head + 1u) % DS4_Q8PROF_RING;
+    if (g_q8p_tag[slot] != UINT32_MAX && cudaEventQuery(g_q8p_ev1[slot]) == cudaSuccess) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, g_q8p_ev0[slot], g_q8p_ev1[slot]) == cudaSuccess &&
+            ms >= 0.0f && ms < 10000.0f) {
+            const uint32_t ob = g_q8p_tag[slot];
+            g_q8p_b[ob].ms += (double)ms; g_q8p_b[ob].n++;
+            if ((++g_q8p_harvested & 16383u) == 0u) {
+                fprintf(stderr, "ds4: Q8_PROF_LITE gpu-span ms/call by (in,out,ntok):\n");
+                for (uint32_t i = 0; i < g_q8p_nb; i++) {
+                    if (!g_q8p_b[i].n) continue;
+                    /* 34 bytes per 32-elem block */
+                    const double mib = (double)(g_q8p_b[i].in_dim / 32 * 34 * g_q8p_b[i].out_dim) / 1048576.0;
+                    const double avg = g_q8p_b[i].ms / (double)g_q8p_b[i].n;
+                    fprintf(stderr, "ds4:   %llux%llu n%llu  %.4f ms/call /%llu  (%.1f MiB, %.0f GB/s)\n",
+                            (unsigned long long)g_q8p_b[i].in_dim,
+                            (unsigned long long)g_q8p_b[i].out_dim,
+                            (unsigned long long)g_q8p_b[i].n_tok,
+                            avg, (unsigned long long)g_q8p_b[i].n,
+                            mib, avg > 0.0 ? mib / 1024.0 / (avg / 1000.0) : 0.0);
+                }
+            }
+        }
+    }
+    g_q8p_tag[slot] = UINT32_MAX;
+    if (cudaEventRecord(g_q8p_ev0[slot], s) != cudaSuccess) return UINT32_MAX;
+    g_q8p_tag[slot] = b;
+    return slot;
+}
+
+static void q8p_end(uint32_t slot, cudaStream_t s) {
+    if (slot == UINT32_MAX || g_q8p_init <= 0) return;
+    (void)cudaEventRecord(g_q8p_ev1[slot], s);
+}
+
+static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label);
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+    uint32_t slot = UINT32_MAX;
+    cudaStream_t s = (cudaStream_t)0;
+    /* Only instrument when the dense-vec tier will run (its stream is the one
+     * mirrored below); legacy tiers launch on ds4_current_stream() and the
+     * moe_stream events would bracket nothing (measured: impossible GB/s).
+     * CAVEAT: with MoE graphs ON these spans include cross-stream sync_pre
+     * waits (overlapped stream0 work, NOT pure kernel time) -- for true
+     * kernel cost measure a DS4_CUDA_MOE_GRAPHS=0 run (2026-07-02: 8192x4096
+     * 0.595 ms "56 GB/s" under graphs vs 0.172 ms 193 GB/s single-stream). */
+    if (q8p_enabled() && n_tok <= 8u && ds4_cuda_use_mmq() && (in_dim % 256u == 0)) {
+        if (ds4_capture_active()) s = ds4_current_stream();
+        else s = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
+        slot = q8p_begin(in_dim, out_dim, n_tok, s);
+    }
+    const int rc = cuda_matmul_q8_0_tensor_labeled_impl(out, model_map, model_size, weight_offset,
+                                                        in_dim, out_dim, x, n_tok, label);
+    q8p_end(slot, s);
+    return rc;
+}
+
+static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
