@@ -15782,6 +15782,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                           pos0);
         }
         if (ok) {
+            const uint32_t sp_core = ds4_gpu_stage_prof_begin(DS4_SPROF_ATTNCORE);
             ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
                                                                    model->map,
                                                                    model->size,
@@ -15801,6 +15802,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                    g->batch_draft_n_raw,
                                                                    /* FE2: admission-chunk heads8 fast path (ratio==0 layers) */
                                                                    g->batch_admit_fast ? 1u : 0u) != 0;
+            ds4_gpu_stage_prof_end(sp_core);
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -15868,6 +15870,7 @@ static bool metal_graph_encode_layer_attention_batch(
             const uint64_t state_stride =
                 (uint64_t)(coff * ratio) * comp_width * sizeof(float);
             const double emit_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
+            const uint32_t sp_emit = ds4_gpu_stage_prof_begin(DS4_SPROF_EMIT);
             for (uint32_t t = 0; ok && t < n_tokens; t++) {
                 /* FB2: batched middle -- one aligned-chunk emit over f2_mid
                  * rows into bank seq's cache/state views, the multiseq mirror
@@ -16035,6 +16038,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     ? metal_graph_comp_emit_scratch(g, 1u) : NULL;
                 if (ms_fp8_primary && !ms_row_scratch) ok = false;
                 const double cupd_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
+                const uint32_t sp_cupd = ds4_gpu_stage_prof_begin(DS4_SPROF_CUPD);
                 ok = ok && kv_view && sc_view && st_kv && st_sc &&
                      ds4_gpu_compressor_update_tensor(kv_view,
                                                         sc_view,
@@ -16063,6 +16067,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                         DS4_RMS_EPS,
                                                         UINT32_MAX,                  /* eager, inline comp_row */
                                                         DS4_COMPRESSOR_ROW_COMP) != 0;
+                ds4_gpu_stage_prof_end(sp_cupd);
                 if (g_cont_prof > 0) g_cont_lyr_cupd_s += now_sec() - cupd_t0;
                 if (ok && emit) {
                     /* P2 Inc2a: E4M3 round-trip of the just-emitted row (model
@@ -16120,6 +16125,7 @@ static bool metal_graph_encode_layer_attention_batch(
                  * its own lane independently -- N parallel copies of the N=1 M2 snapshot. */
                 if (ok && g->batch_rollback_capture) {
                     const double rbcp_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
+                    const uint32_t sp_rbcp = ds4_gpu_stage_prof_begin(DS4_SPROF_RBCP);
                     const uint32_t depth = (uint32_t)g->ms_vdepth[t];
                     if (depth < DS4_MTP_RB_DEPTH) {
                         ds4_gpu_tensor *dk = g->mtp_rb_askv[depth][il];
@@ -16132,6 +16138,7 @@ static bool metal_graph_encode_layer_attention_batch(
                             g->mtp_rb_n_comp[depth][seq][il] = g->ms_n_comp[seq][il];
                         }
                     }
+                    ds4_gpu_stage_prof_end(sp_rbcp);
                     if (g_cont_prof > 0) g_cont_lyr_rbcp_s += now_sec() - rbcp_t0;
                 }
                 ds4_gpu_tensor_free(st_sc);
@@ -16139,6 +16146,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 ds4_gpu_tensor_free(sc_view);
                 ds4_gpu_tensor_free(kv_view);
             }
+            ds4_gpu_stage_prof_end(sp_emit);
             if (g_cont_prof > 0) g_cont_lyr_emit_s += now_sec() - emit_t0;
             if (ok) {
                 /* Scalar n_comp = running max over banks.  The read path's
@@ -17196,6 +17204,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      DS4_N_HEAD_DIM,
                                                      seq_positions, seq_id) != 0;
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
+                const uint32_t sp_idx = ds4_gpu_stage_prof_begin(DS4_SPROF_IDXSCORE);
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary(NULL,
@@ -17270,11 +17279,13 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           pos0);
                     }
                 }
+                ds4_gpu_stage_prof_end(sp_idx);
                 if (ok) {
                     use_indexed_comp = true;
                 }
                 use_comp_mask = 1;
             }
+            const uint32_t sp_core = ok ? ds4_gpu_stage_prof_begin(DS4_SPROF_ATTNCORE) : UINT32_MAX;
             if (ok) {
                 if (use_indexed_comp) {
                     /* Out-of-decode-body caller (batch path): scalars=NULL
@@ -17353,6 +17364,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              g->batch_admit_fast ? 1u : 0u) != 0;
                 }
             }
+            ds4_gpu_stage_prof_end(sp_core);
             if (ok) batch_attention_done = true;
         }
 
@@ -17892,6 +17904,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
 
     const double moe_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
+    const uint32_t sp_moe = ok ? ds4_gpu_stage_prof_begin(DS4_SPROF_MOE) : UINT32_MAX;
     if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_gate,
@@ -17922,6 +17935,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16) != 0;
     }
+    ds4_gpu_stage_prof_end(sp_moe);
     if (g_cont_prof > 0) g_cont_lyr_moe_s += now_sec() - moe_t0;
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
@@ -18069,7 +18083,9 @@ static bool metal_graph_encode_layer_batch(
     const char *lsync_env = getenv("DS4_LAYER_STAGE_SYNC");
     const int lsync = lsync_env ? atoi(lsync_env) : 0;
     const double lyr_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
+    const uint32_t sp_attn = ds4_gpu_stage_prof_begin(DS4_SPROF_ATTN);
     bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
+    ds4_gpu_stage_prof_end(sp_attn);
     const double lyr_t1 = g_cont_prof > 0 ? now_sec() : 0.0;
     if (g_cont_prof > 0) g_cont_lyr_attn_s += lyr_t1 - lyr_t0;
     if (ok && (lsync & 1) && ds4_gpu_synchronize() == 0) {
@@ -18080,7 +18096,9 @@ static bool metal_graph_encode_layer_batch(
         fprintf(stderr, "ds4: LAYER_STAGE_SYNC FAIL @attn-stream il=%u n=%u pos0=%u\n", il, n_tokens, pos0);
         ok = false;
     }
+    const uint32_t sp_ffn = ok ? ds4_gpu_stage_prof_begin(DS4_SPROF_FFN) : UINT32_MAX;
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
+    ds4_gpu_stage_prof_end(sp_ffn);
     if (g_cont_prof > 0) g_cont_lyr_ffn_s += now_sec() - lyr_t1;
     if (ok && (lsync & 2) && ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: LAYER_STAGE_SYNC FAIL @ffn il=%u n=%u pos0=%u\n", il, n_tokens, pos0);
@@ -28419,6 +28437,7 @@ static bool metal_graph_batch_eval_logits(
     token_vec tv;
     memset(&tv, 0, sizeof(tv));
     for (uint32_t i = 0; i < n; i++) token_vec_push(&tv, tokens[i]);
+    const uint32_t sp_emb = ds4_gpu_stage_prof_begin(DS4_SPROF_EMBED);
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &tv, 0, n);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                          g->prefill_tokens,
@@ -28427,6 +28446,7 @@ static bool metal_graph_batch_eval_logits(
                                                          &tv,
                                                          0,
                                                          n);
+    ds4_gpu_stage_prof_end(sp_emb);
     token_vec_free(&tv);
     if (!ok) return false;
     const double be_t_emb = g_cont_prof ? now_sec() : 0.0;
@@ -28439,6 +28459,7 @@ static bool metal_graph_batch_eval_logits(
      * is bit-identical to the scalar path; it exercises the array read so Step 3
      * can make positions per-seq independent. */
     g->batch_use_positions = true;
+    const uint32_t sp_fwd = ds4_gpu_stage_prof_begin(DS4_SPROF_FWD);
     ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = metal_graph_encode_layer_batch(g,
@@ -28466,6 +28487,7 @@ static bool metal_graph_batch_eval_logits(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+    ds4_gpu_stage_prof_end(sp_fwd);
     if (!ok) return false;
 
     double be_t_fwd = be_t0;
@@ -28499,6 +28521,7 @@ static bool metal_graph_batch_eval_logits(
      *   ceil(n/G), then drain each chunk row into logits_out.  Same math as the
      *   per-row head; the only delta is GEMM M=1-vs-M=N FP-selection noise, which
      *   the gates already tolerate (argmax/top-k, d_self < 5.0). */
+    const uint32_t sp_head = ds4_gpu_stage_prof_begin(DS4_SPROF_HEAD);
     if (n == 1) {
         ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = metal_graph_encode_output_head_batch_row(g,
@@ -28550,6 +28573,7 @@ static bool metal_graph_batch_eval_logits(
                                                       logits_out + (uint64_t)(base + r) * DS4_N_VOCAB);
         }
     }
+    ds4_gpu_stage_prof_end(sp_head);
     if (ok) maybe_dump_first_logits(logits_out);   /* row-0 logits (Step-1 gate) */
     if (g_cont_prof) g_cont_be_post_s += now_sec() - be_t_fwd;
     return ok;

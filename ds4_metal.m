@@ -4745,6 +4745,16 @@ int ds4_gpu_stream_synchronize(void) {
     return ds4_gpu_synchronize();
 }
 
+/* STAGE_PROF_LITE is a CUDA-event instrument; no Metal counterpart. */
+uint32_t ds4_gpu_stage_prof_begin(uint32_t stage) {
+    (void)stage;
+    return UINT32_MAX;
+}
+
+void ds4_gpu_stage_prof_end(uint32_t slot) {
+    (void)slot;
+}
+
 /* M4b Inc1: the batched cross-bank MTP draft kernels are CUDA-only (the
  * multi-seq continuous path runs on GB10).  These stubs keep the link whole;
  * metal_graph_eval_mtp_draft_batch fails cleanly if ever reached on Metal. */

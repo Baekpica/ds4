@@ -54,6 +54,46 @@ The bandwidth figure is informational; we don't tier on it.
   that must remain after an anon huge-page model copy; below it the copy is
   skipped. See `DS4_MODEL_ANON_HUGE`.
 
+- `-DDS4_CUDA_SPARK_HBM_CACHE=1` (COMPILE-TIME define, not an env var; in the
+  Makefile's `CUDA_SPARK_FLAGS`, applied by the `cuda-spark` target but NOT by
+  a plain `make ds4-server`). Enables the startup HBM cache walk
+  (`accelerator_cache_model_tensor_spans`): every non-MoE tensor span (~8.4
+  GiB on V4-Flash: attn projections + compressor + indexer + shexp + dense
+  FFN + embedding + output head) is copied into `cudaMalloc` device memory at
+  boot (~0.5 s) and all decode reads of the dense half run at device rate.
+  WHY THIS MATTERS ON GB10 (measured 2026-07-02): GPU streaming reads of
+  `cudaHostRegister`'d host memory (mmap OR anon-THP) cap at ~161 GB/s while
+  `cudaMalloc` device memory reads at ~236 GB/s on the same LPDDR5x —
+  a hard substrate ceiling, not a kernel property (`micro_bw`). With the walk
+  on (plus the two-pass range-lookup fix, see below) base decode is 63.3
+  ms/tok vs 68.5 anon-THP / 73-74 without the define — and MoE spans drop
+  below their old "floor" (w1 0.280 &rarr; 0.261 ms) because dense reads stop
+  competing for mapped bandwidth. Managed memory (`cudaMallocManaged`, any
+  advise/prefetch combination) is NOT an escape hatch: it reads at the same
+  ~161 GB/s, and host code cannot dereference `cudaMalloc` pointers on GB10
+  (segfault), so full device residency of the MoE set needs the VMM-arena
+  loader follow-up, not a bigger cache cap. Opt-outs at runtime:
+  `DS4_CUDA_NO_HBM_CACHE=1`, cap via `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB`
+  (default 24).
+
+- Range-lookup fix note (no env var; 2026-07-02): `cuda_model_range_ptr` now
+  resolves device-resident HBM cache copies in a first pass before the
+  whole-model registered mapping. Previously a single ordered scan returned
+  the mapped (slow) pointer for every offset interior to a cached span —
+  the registered whole-model range is pushed first — so only tensors that
+  happened to start a merged span (in practice just the output head) ever hit
+  the cache. This is why the HBM cache historically looked like "~10%".
+
+- `DS4_CUDA_STAGE_PROF_LITE=1` (default off). Lazy-event GPU-span measurement
+  of whole decode-forward stages (fwd/embed/attn/attncore/idxscore/cupd/emit/
+  rbcp/ffn/moe/head), the MOE_PROF_LITE discipline generalized: event pairs on
+  the current stream, non-blocking harvest on ring wrap, two stderr lines
+  every 8192 harvests (`ms/call` per stage and `ms/fwd` = per-decode-step
+  attribution). Valid in async production; nested stages overlap by design
+  (attn ⊃ attncore/idxscore/emit ⊃ cupd/rbcp; ffn ⊃ moe) — subtract when
+  attributing. Σ(fwd+embed+head) ≈ wall ms/tok when healthy; a gap means an
+  unbracketed stage or launch bubbles.
+
 - Budgeting note (no env var; behavior change 2026-07-02): on integrated GPUs
   the KV-bank budget (`ds4_gpu_mem_info`) now subtracts GPU-pinned
   *file-backed* weight registrations from MemAvailable. The kernel keeps

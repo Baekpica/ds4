@@ -73,6 +73,32 @@ int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 int ds4_gpu_stream_synchronize(void);   /* task #22 diag: legacy-stream-only sync */
 
+/* STAGE_PROF_LITE (env DS4_CUDA_STAGE_PROF_LITE): lazy-event GPU-span
+ * measurement of whole forward stages, bracketed from ds4.c at the
+ * CONT_PROFILE host-bracket points.  Same discipline as MOE_PROF_LITE
+ * (per-call sync and CUDA_LAUNCH_BLOCKING both inflate GB10 spans 5-20x;
+ * host wall brackets smear under async launch billing): a persistent event
+ * ring brackets each stage dispatch on the current stream, pairs are
+ * harvested non-blocking when the ring wraps.  begin() returns a slot or
+ * UINT32_MAX (disabled / capture active / ring init failed); end() is a
+ * no-op for UINT32_MAX.  Metal: stubs, always UINT32_MAX. */
+enum ds4_stage_prof_id {
+    DS4_SPROF_FWD = 0,   /* whole 43-layer batched forward (per decode step) */
+    DS4_SPROF_EMBED,     /* token upload + HC embedding */
+    DS4_SPROF_ATTN,      /* per-layer attention half (encloses the four below) */
+    DS4_SPROF_ATTNCORE,  /* heads attention read (raw/mixed/indexed batch) */
+    DS4_SPROF_IDXSCORE,  /* indexer scoring + top-k */
+    DS4_SPROF_CUPD,      /* compressor update (inside EMIT) */
+    DS4_SPROF_EMIT,      /* multiseq per-row compressor/indexer emit loop */
+    DS4_SPROF_RBCP,      /* rollback-capture state snapshots (inside EMIT) */
+    DS4_SPROF_FFN,       /* per-layer FFN half (encloses MOE) */
+    DS4_SPROF_MOE,       /* routed-MoE section (host-side; cross-check MOE_PROF_LITE) */
+    DS4_SPROF_HEAD,      /* output head + logits readback */
+    DS4_SPROF_COUNT
+};
+uint32_t ds4_gpu_stage_prof_begin(uint32_t stage);
+void     ds4_gpu_stage_prof_end(uint32_t slot);
+
 /* =========================================================================
  * Decode-time position scalars (full-layer CUDA-graph capture, Step A).
  * =========================================================================

@@ -725,6 +725,17 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         const cuda_model_range &r = g_model_ranges[exact->second];
         if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
     }
+    /* Two passes: device-resident copies must win over the whole-model
+     * registered mapping even though the registered range was pushed first
+     * (a single ordered scan returned the mapped pointer for every offset
+     * interior to a cached span, silently starving the HBM cache -- only
+     * exact span-start offsets ever hit it via the map above). */
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && !r.host_registered &&
+            offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+            return r.device_ptr + (offset - r.offset);
+        }
+    }
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
             return r.device_ptr + (offset - r.offset);
@@ -11123,6 +11134,83 @@ static uint32_t moe_lite_begin(uint32_t n_tokens, int q4k, cudaStream_t s) {
 static void moe_lite_end(uint32_t slot, cudaStream_t s) {
     if (slot == UINT32_MAX || g_moelite_init <= 0) return;
     (void)cudaEventRecord(g_moelite_ev1[slot], s);
+}
+
+/* STAGE_PROF_LITE (env DS4_CUDA_STAGE_PROF_LITE): the MOE_PROF_LITE lazy-event
+ * discipline generalized to whole forward stages, bracketed from ds4.c (see
+ * the ds4_stage_prof_id enum in ds4_gpu.h).  Ring of 2048 pairs (~260 pairs
+ * per N=1 decode step -> ~8 steps of harvest latency); events on the current
+ * stream at record time.  Two print lines every 8192 harvests: per-call
+ * averages, and per-FWD attribution (stage ms / fwd count = ms per decode
+ * step, directly comparable to the 68.5 ms/tok wall).  Nested stages overlap
+ * by design (ATTN encloses ATTNCORE/IDXSCORE/EMIT; EMIT encloses CUPD/RBCP;
+ * FFN encloses MOE) -- subtract when attributing. */
+#define DS4_SPROF_RING 2048
+#define DS4_SPROF_NSTAGE 11   /* == DS4_SPROF_COUNT in ds4_gpu.h */
+static cudaEvent_t g_sprof_ev0[DS4_SPROF_RING], g_sprof_ev1[DS4_SPROF_RING];
+static uint32_t    g_sprof_tag[DS4_SPROF_RING];
+static uint32_t    g_sprof_head = 0;
+static int         g_sprof_init = 0;
+static double      g_sprof_ms[DS4_SPROF_NSTAGE] = {0};
+static uint64_t    g_sprof_n[DS4_SPROF_NSTAGE]  = {0};
+static uint64_t    g_sprof_harvested = 0;
+static const char *g_sprof_name[DS4_SPROF_NSTAGE] = {
+    "fwd", "embed", "attn", "attncore", "idxscore",
+    "cupd", "emit", "rbcp", "ffn", "moe", "head"};
+
+extern "C" uint32_t ds4_gpu_stage_prof_begin(uint32_t stage) {
+    static int en = -1;
+    if (en < 0) en = getenv("DS4_CUDA_STAGE_PROF_LITE") != NULL ? 1 : 0;
+    if (!en || stage >= DS4_SPROF_NSTAGE || ds4_capture_active()) return UINT32_MAX;
+    if (!g_sprof_init) {
+        g_sprof_init = 1;
+        for (int i = 0; i < DS4_SPROF_RING; i++) {
+            if (cudaEventCreate(&g_sprof_ev0[i]) != cudaSuccess ||
+                cudaEventCreate(&g_sprof_ev1[i]) != cudaSuccess) { g_sprof_init = -1; break; }
+            g_sprof_tag[i] = UINT32_MAX;
+        }
+    }
+    if (g_sprof_init < 0) return UINT32_MAX;
+    const uint32_t slot = g_sprof_head;
+    g_sprof_head = (g_sprof_head + 1u) % DS4_SPROF_RING;
+    if (g_sprof_tag[slot] != UINT32_MAX && cudaEventQuery(g_sprof_ev1[slot]) == cudaSuccess) {
+        float ms = 0.0f;
+        /* same guard as moe_lite: an error path can leave ev1 stale */
+        if (cudaEventElapsedTime(&ms, g_sprof_ev0[slot], g_sprof_ev1[slot]) == cudaSuccess &&
+            ms >= 0.0f && ms < 10000.0f) {
+            const uint32_t st = g_sprof_tag[slot];
+            g_sprof_ms[st] += (double)ms; g_sprof_n[st]++;
+            if ((++g_sprof_harvested & 8191u) == 0u) {
+                char line[512]; int off = 0;
+                off += snprintf(line + off, sizeof(line) - (size_t)off,
+                                "ds4: STAGE_PROF_LITE ms/call:");
+                for (int s2 = 0; s2 < DS4_SPROF_NSTAGE; s2++)
+                    off += snprintf(line + off, sizeof(line) - (size_t)off, " %s=%.3f/%llu",
+                                    g_sprof_name[s2],
+                                    g_sprof_n[s2] ? g_sprof_ms[s2] / (double)g_sprof_n[s2] : 0.0,
+                                    (unsigned long long)g_sprof_n[s2]);
+                fprintf(stderr, "%s\n", line);
+                if (g_sprof_n[0]) {
+                    off = 0;
+                    off += snprintf(line + off, sizeof(line) - (size_t)off,
+                                    "ds4: STAGE_PROF_LITE ms/fwd:");
+                    for (int s2 = 0; s2 < DS4_SPROF_NSTAGE; s2++)
+                        off += snprintf(line + off, sizeof(line) - (size_t)off, " %s=%.2f",
+                                        g_sprof_name[s2], g_sprof_ms[s2] / (double)g_sprof_n[0]);
+                    fprintf(stderr, "%s\n", line);
+                }
+            }
+        }
+    }
+    g_sprof_tag[slot] = UINT32_MAX;
+    if (cudaEventRecord(g_sprof_ev0[slot], ds4_current_stream()) != cudaSuccess) return UINT32_MAX;
+    g_sprof_tag[slot] = stage;
+    return slot;
+}
+
+extern "C" void ds4_gpu_stage_prof_end(uint32_t slot) {
+    if (slot == UINT32_MAX || g_sprof_init <= 0) return;
+    (void)cudaEventRecord(g_sprof_ev1[slot], ds4_current_stream());
 }
 
 /* Step 8.2: dense Q8_0 vec graph cache.  Each n_tok=1 attention-side
