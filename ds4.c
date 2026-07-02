@@ -1470,6 +1470,72 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+/* DS4_MODEL_ANON_HUGE=1: replace the file-backed model mapping with an
+ * anonymous transparent-huge-page copy. The mmap'd GGUF leaves weights on 4KB
+ * page-cache folios whose physical contiguity depends on how they entered the
+ * cache (sequential readahead vs random demand faults); GPU registration pins
+ * whatever layout it finds, and fragmented pins cost a measured ~5x on
+ * unified-memory parts (GB10 routed-MoE spans 1.0 -> 5.1 ms). A 2MB-THP anon
+ * copy makes boot performance independent of prior page-cache state for the
+ * cost of one streamed read of the file. */
+/* Refuse the copy when it would push the box into the THP-shatter regime:
+ * anon memory is unevictable, and once true free RAM hits ~0 the kernel
+ * splits the huge pages under reclaim pressure, landing BELOW plain mmap
+ * (measured: the 95 GiB model set on a 121 GiB GB10). The margin also has
+ * to cover KV banks and runtime allocated after load; ctx-scaled bank
+ * growth (32k+) can still exceed it — prefer mmap for long-ctx boots. */
+static int model_anon_huge_fits(size_t size, const char *path) {
+    unsigned long long kb = 0;
+    FILE *mf = fopen("/proc/meminfo", "r");
+    if (mf) {
+        char ln[160];
+        while (fgets(ln, sizeof ln, mf))
+            if (sscanf(ln, "MemAvailable: %llu kB", &kb) == 1) break;
+        fclose(mf);
+    }
+    if (kb == 0) return 1;  /* unknown: let the copy try */
+    const char *mg = getenv("DS4_MODEL_ANON_HUGE_MARGIN_GB");
+    unsigned long long margin = (mg && *mg ? strtoull(mg, NULL, 10) : 20ull) << 30;
+    if ((unsigned long long)size + margin <= kb * 1024ull) return 1;
+    fprintf(stderr,
+            "ds4: model %s: anon huge-page copy SKIPPED (%.1f GiB copy + %.0f GiB margin "
+            "> %.1f GiB available; keeping file mapping)\n",
+            path, (double)size / 1073741824.0, (double)margin / 1073741824.0,
+            (double)(kb * 1024ull) / 1073741824.0);
+    return 0;
+}
+
+static void *model_copy_anon_huge(int fd, size_t size, const char *path) {
+    const size_t huge = (size_t)2 << 20;
+    const size_t alen = (size + huge - 1) & ~(huge - 1);
+    void *raw = mmap(NULL, alen + huge, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) return NULL;
+    uintptr_t a0 = ((uintptr_t)raw + huge - 1) & ~(uintptr_t)(huge - 1);
+    if (a0 > (uintptr_t)raw) munmap(raw, a0 - (uintptr_t)raw);
+    if ((uintptr_t)raw + alen + huge > a0 + alen)
+        munmap((void *)(a0 + alen), (uintptr_t)raw + alen + huge - (a0 + alen));
+    char *dst = (char *)a0;
+    (void)madvise(dst, alen, MADV_HUGEPAGE);
+    const size_t chunk = (size_t)32 << 20;
+    size_t off = 0;
+    while (off < size) {
+        size_t want = size - off < chunk ? size - off : chunk;
+        ssize_t got = pread(fd, dst + off, want, (off_t)off);
+        if (got <= 0) { munmap(dst, alen); return NULL; }
+        off += (size_t)got;
+        /* drop the streamed-through page cache as we go: the model is roughly
+         * the size of total RAM, so the copy must not compete with itself */
+        (void)posix_fadvise(fd, (off_t)(off - (size_t)got), (off_t)got, POSIX_FADV_DONTNEED);
+    }
+    (void)mprotect(dst, alen, PROT_READ);
+    fprintf(stderr, "ds4: model %s: %.2f GiB copied into anon huge-page memory\n",
+            path, (double)size / 1073741824.0);
+    return dst;
+}
+#endif
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
@@ -1501,6 +1567,29 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
+
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    /* GPU-backend opens only: tokenizer/inspect callers must not pay the copy.
+     * Value > 1 = only copy models of at least that many GiB ("32" = base model
+     * only): anon memory is unevictable, and copying every sibling model can
+     * overshoot RAM (base+MTP+drafter = 95 GiB on a 121 GiB GB10 -> avail 0,
+     * bank budget starved, THP split back down under pressure). */
+    const char *anon_huge = getenv("DS4_MODEL_ANON_HUGE");
+    if (metal_mapping && anon_huge && *anon_huge &&
+        (atof(anon_huge) <= 1.0 ||
+         (double)st.st_size >= atof(anon_huge) * 1073741824.0) &&
+        model_anon_huge_fits((size_t)st.st_size, path)) {
+        void *anon = model_copy_anon_huge(fd, (size_t)st.st_size, path);
+        if (anon) {
+            munmap(map, (size_t)st.st_size);
+            map = anon;
+        } else {
+            fprintf(stderr,
+                    "ds4: warning: anon huge-page copy failed for %s; keeping file mapping\n",
+                    path);
+        }
+    }
+#endif
 
     m->fd = fd;
     m->map = map;
@@ -15211,6 +15300,33 @@ static bool ms_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t seq,
     return true;
 }
 
+/* DS4_CONT_PROFILE fwd-split drill-down (host timers, zero added syncs):
+ * per-layer host encode cost split attn vs ffn, with the routed-MoE dispatch
+ * inside ffn accounted separately.  g_cont_prof is a tentative definition here
+ * (the initialized definition lives with the other g_cont_be_* accumulators
+ * below); the lyr accumulators are zero-initialized tentative definitions,
+ * reset alongside the be_* set at continuous-generate entry. */
+static int    g_cont_prof;
+static double g_cont_lyr_attn_s;
+static double g_cont_lyr_ffn_s;
+static double g_cont_lyr_moe_s;
+/* attn-half sub-split: the per-token compressor store/emit loop (Step 4d
+ * multiseq), the compressor_update launches inside it, and the S1.1 M3
+ * rollback-checkpoint D2D copies inside it. */
+static double g_cont_lyr_emit_s;
+static double g_cont_lyr_cupd_s;
+static double g_cont_lyr_rbcp_s;
+/* enc thread-CPU time over the same bracket as g_cont_be_enc_s.  Discriminates
+ * genuine host encode work (cpu ~= wall -> capture/batching fixes it) from
+ * blocking in the driver on launch-queue backpressure (cpu << wall -> the GPU
+ * is the real bottleneck and enc wall is disguised GPU time). */
+static double g_cont_be_enc_cpu_s;
+static double now_thread_cpu_sec(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15751,6 +15867,7 @@ static bool metal_graph_encode_layer_attention_batch(
              * comp_cap row stride). */
             const uint64_t state_stride =
                 (uint64_t)(coff * ratio) * comp_width * sizeof(float);
+            const double emit_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
             for (uint32_t t = 0; ok && t < n_tokens; t++) {
                 /* FB2: batched middle -- one aligned-chunk emit over f2_mid
                  * rows into bank seq's cache/state views, the multiseq mirror
@@ -15917,6 +16034,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 ds4_gpu_tensor *ms_row_scratch = ms_fp8_primary
                     ? metal_graph_comp_emit_scratch(g, 1u) : NULL;
                 if (ms_fp8_primary && !ms_row_scratch) ok = false;
+                const double cupd_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
                 ok = ok && kv_view && sc_view && st_kv && st_sc &&
                      ds4_gpu_compressor_update_tensor(kv_view,
                                                         sc_view,
@@ -15945,6 +16063,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                         DS4_RMS_EPS,
                                                         UINT32_MAX,                  /* eager, inline comp_row */
                                                         DS4_COMPRESSOR_ROW_COMP) != 0;
+                if (g_cont_prof > 0) g_cont_lyr_cupd_s += now_sec() - cupd_t0;
                 if (ok && emit) {
                     /* P2 Inc2a: E4M3 round-trip of the just-emitted row (model
                      * semantics -- see the block comment above) + the per-bank
@@ -16000,6 +16119,7 @@ static bool metal_graph_encode_layer_attention_batch(
                  * seq*state_stride matches the active state slab, so each bank checkpoints into
                  * its own lane independently -- N parallel copies of the N=1 M2 snapshot. */
                 if (ok && g->batch_rollback_capture) {
+                    const double rbcp_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
                     const uint32_t depth = (uint32_t)g->ms_vdepth[t];
                     if (depth < DS4_MTP_RB_DEPTH) {
                         ds4_gpu_tensor *dk = g->mtp_rb_askv[depth][il];
@@ -16012,12 +16132,14 @@ static bool metal_graph_encode_layer_attention_batch(
                             g->mtp_rb_n_comp[depth][seq][il] = g->ms_n_comp[seq][il];
                         }
                     }
+                    if (g_cont_prof > 0) g_cont_lyr_rbcp_s += now_sec() - rbcp_t0;
                 }
                 ds4_gpu_tensor_free(st_sc);
                 ds4_gpu_tensor_free(st_kv);
                 ds4_gpu_tensor_free(sc_view);
                 ds4_gpu_tensor_free(kv_view);
             }
+            if (g_cont_prof > 0) g_cont_lyr_emit_s += now_sec() - emit_t0;
             if (ok) {
                 /* Scalar n_comp = running max over banks.  The read path's
                  * per-row visible_comp clamp (4c) caps each row to its own
@@ -17769,6 +17891,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         }
     }
 
+    const double moe_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
     if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_gate,
@@ -17799,6 +17922,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16) != 0;
     }
+    if (g_cont_prof > 0) g_cont_lyr_moe_s += now_sec() - moe_t0;
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
@@ -17944,7 +18068,10 @@ static bool metal_graph_encode_layer_batch(
      * actor races the layer" (still crashes).  Print-only + env-gated. */
     const char *lsync_env = getenv("DS4_LAYER_STAGE_SYNC");
     const int lsync = lsync_env ? atoi(lsync_env) : 0;
+    const double lyr_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
     bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
+    const double lyr_t1 = g_cont_prof > 0 ? now_sec() : 0.0;
+    if (g_cont_prof > 0) g_cont_lyr_attn_s += lyr_t1 - lyr_t0;
     if (ok && (lsync & 1) && ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: LAYER_STAGE_SYNC FAIL @attn il=%u n=%u pos0=%u\n", il, n_tokens, pos0);
         ok = false;
@@ -17954,6 +18081,7 @@ static bool metal_graph_encode_layer_batch(
         ok = false;
     }
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
+    if (g_cont_prof > 0) g_cont_lyr_ffn_s += now_sec() - lyr_t1;
     if (ok && (lsync & 2) && ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: LAYER_STAGE_SYNC FAIL @ffn il=%u n=%u pos0=%u\n", il, n_tokens, pos0);
         ok = false;
@@ -28251,6 +28379,14 @@ static double   g_cont_be_fwd_s   = 0.0;   /* 43-layer batched forward */
 static double   g_cont_be_post_s  = 0.0;   /* output head + logit readback */
 static uint64_t g_cont_be_calls   = 0;
 static uint64_t g_cont_be_rows    = 0;     /* Sum of n over all calls */
+/* fwd split (host timers at existing sync boundaries, zero added syncs):
+ * emb = token/embedding upload; enc = eager begin+43-layer encode/launch loop
+ * (pure HOST cost -- the GPU executes async underneath); syn = end_commands
+ * (the wait for the GPU to drain).  enc >> syn => host-launch-bound forward;
+ * syn >> enc => GPU-compute-bound. */
+static double   g_cont_be_emb_s   = 0.0;
+static double   g_cont_be_enc_s   = 0.0;
+static double   g_cont_be_syn_s   = 0.0;
 
 static bool metal_graph_batch_eval_logits(
         ds4_gpu_graph     *g,
@@ -28293,6 +28429,9 @@ static bool metal_graph_batch_eval_logits(
                                                          n);
     token_vec_free(&tv);
     if (!ok) return false;
+    const double be_t_emb = g_cont_prof ? now_sec() : 0.0;
+    if (g_cont_prof) g_cont_be_emb_s += be_t_emb - be_t0;
+    const double be_c_emb = g_cont_prof ? now_thread_cpu_sec() : 0.0;
 
     /* No spec_capture: commit the KV + compressor state, like a prefill chunk.
      * Step 2: drive the per-row positions[] array path (filled with pos0+t at
@@ -28320,6 +28459,11 @@ static bool metal_graph_batch_eval_logits(
         }
     }
     g->batch_use_positions = false;
+    const double be_t_enc = g_cont_prof ? now_sec() : 0.0;
+    if (g_cont_prof) {
+        g_cont_be_enc_s     += be_t_enc - be_t_emb;
+        g_cont_be_enc_cpu_s += now_thread_cpu_sec() - be_c_emb;
+    }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (!ok) return false;
@@ -28328,6 +28472,7 @@ static bool metal_graph_batch_eval_logits(
     if (g_cont_prof) {
         be_t_fwd = now_sec();
         g_cont_be_fwd_s += be_t_fwd - be_t0;
+        g_cont_be_syn_s += be_t_fwd - be_t_enc;
         g_cont_be_calls++;
         g_cont_be_rows  += n;
     }
@@ -31651,7 +31796,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint32_t steps = 0;
     /* W8 reassessment: reset per-call phase accumulators (see DS4_CONT_PROFILE). */
     if (g_cont_prof < 0) g_cont_prof = getenv("DS4_CONT_PROFILE") != NULL ? 1 : 0;
-    if (g_cont_prof) { g_cont_be_fwd_s = g_cont_be_post_s = 0.0; g_cont_be_calls = g_cont_be_rows = 0; }
+    if (g_cont_prof) { g_cont_be_fwd_s = g_cont_be_post_s = 0.0; g_cont_be_calls = g_cont_be_rows = 0;
+                       g_cont_be_emb_s = g_cont_be_enc_s = g_cont_be_syn_s = 0.0;
+                       g_cont_lyr_attn_s = g_cont_lyr_ffn_s = g_cont_lyr_moe_s = 0.0;
+                       g_cont_lyr_emit_s = g_cont_lyr_cupd_s = g_cont_lyr_rbcp_s = 0.0;
+                       g_cont_be_enc_cpu_s = 0.0; }
     double t_sample_s = 0.0;
     const int dspark_prof = dspark_mode && getenv("DS4_DSPARK_PROFILE") != NULL;
     const int dspark_compact_inject = dspark_mode && getenv("DS4_DSPARK_COMPACT_INJECT") != NULL;
@@ -32614,6 +32763,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         fprintf(stderr,
             "ds4: CONT_PROFILE steps=%u be_calls=%llu rows=%llu avg_k=%.2f | "
             "per-step: fwd=%.3fms post=%.3fms sample=%.3fms | "
+            "fwd-split/call: emb=%.3f enc=%.3f (enc_cpu=%.3f) sync=%.3fms | "
+            "enc-split/call: attn=%.3f ffn=%.3f (moe=%.3f emit=%.3f cupd=%.3f rbcp=%.3f)ms | "
             "totals: fwd=%.1fms(%.0f%%) post=%.1fms(%.0f%%) sample=%.1fms(%.0f%%) | "
             "tok=%.3fms/tok\n",
             steps,
@@ -32622,6 +32773,16 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             g_cont_be_calls ? g_cont_be_fwd_s  * 1e3 / (double)g_cont_be_calls : 0.0,
             g_cont_be_calls ? g_cont_be_post_s * 1e3 / (double)g_cont_be_calls : 0.0,
             steps          ? t_sample_s        * 1e3 / (double)steps           : 0.0,
+            g_cont_be_calls ? g_cont_be_emb_s * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_be_enc_s * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_be_enc_cpu_s * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_be_syn_s * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_lyr_attn_s * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_lyr_ffn_s  * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_lyr_moe_s  * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_lyr_emit_s * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_lyr_cupd_s * 1e3 / (double)g_cont_be_calls : 0.0,
+            g_cont_be_calls ? g_cont_lyr_rbcp_s * 1e3 / (double)g_cont_be_calls : 0.0,
             g_cont_be_fwd_s  * 1e3, tot > 0 ? g_cont_be_fwd_s  / tot * 100.0 : 0.0,
             g_cont_be_post_s * 1e3, tot > 0 ? g_cont_be_post_s / tot * 100.0 : 0.0,
             t_sample_s       * 1e3, tot > 0 ? t_sample_s       / tot * 100.0 : 0.0,

@@ -29,6 +29,39 @@ The bandwidth figure is informational; we don't tier on it.
 
 ## Env-var inventory
 
+- `DS4_MODEL_ANON_HUGE=N` (Linux, default off; lives in ds4.c model_open, not
+  the CUDA backend). Copy GPU-backend model files out of the file-backed mmap
+  into anonymous `MADV_HUGEPAGE` memory at load. `N<=1` copies every GPU
+  model; `N>1` copies only files of at least `N` GiB (e.g. `32` = base model
+  only). WHY: the mmap'd GGUF leaves weights on 4 KB page-cache folios whose
+  physical contiguity depends on how they entered the cache; on GB10 the
+  GPU-side cost is decided at `cudaHostRegister` pin time — fragmented folios
+  cost ~5x on routed-MoE spans, and even sequentially-rewarmed cache pays
+  2-3.6x vs anon-THP (measured 2026-07-02: base decode 86-96 &rarr; 68.5
+  ms/tok, w1 MoE span 0.276 ms = isolated-kernel floor). CAUTION: anon memory
+  is unevictable — only enable when total copied bytes leave ~10 GB of true
+  free RAM after banks/runtime, else the kernel splits the huge pages under
+  reclaim pressure and performance lands BELOW plain mmap (measured: the
+  95 GB base+MTP+drafter set on a 121 GB GB10). The copy streams with
+  `posix_fadvise(DONTNEED)` so it does not compete with itself for RAM; boot
+  cost is one sequential read of the file (~25 s for 81 GB on GB10 NVMe).
+  A pressure guard skips the copy (keeping the file mapping, with a log line)
+  when it would leave less than `DS4_MODEL_ANON_HUGE_MARGIN_GB` (default 20)
+  of MemAvailable — the margin must also cover KV banks and runtime, and
+  ctx-scaled bank growth at 32k+ can still exceed it.
+
+- `DS4_MODEL_ANON_HUGE_MARGIN_GB=N` (default 20). Minimum GiB of MemAvailable
+  that must remain after an anon huge-page model copy; below it the copy is
+  skipped. See `DS4_MODEL_ANON_HUGE`.
+
+- Budgeting note (no env var; behavior change 2026-07-02): on integrated GPUs
+  the KV-bank budget (`ds4_gpu_mem_info`) now subtracts GPU-pinned
+  *file-backed* weight registrations from MemAvailable. The kernel keeps
+  counting pinned page-cache pages as reclaimable, so the old budget spent
+  the model's own residency on banks — the measured NVMe-thrash mechanism at
+  32 banks. Default bank counts on GB10 drop accordingly (the honest number);
+  `DS4_SERVER_COALESCE_MAX` still caps explicitly.
+
 - `DS4_CUDA_PREFILL_PATH=mmq|cublas|warp8|auto` (default `auto` &rarr; mmq).
   Explicit override. `auto` and unset both resolve to mmq.
 

@@ -427,6 +427,54 @@ static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static std::vector<cuda_derived_range> g_derived_ranges;
 static uint64_t g_model_range_bytes;
 static uint64_t g_derived_range_bytes;
+
+/* Pinned FILE-BACKED registration accounting.  cudaHostRegister pins the
+ * pages, but the kernel keeps counting pinned page-cache pages as
+ * reclaimable in MemAvailable -- so budget decisions that trust MemAvailable
+ * overcommit by the whole registered model and spend its residency on KV
+ * banks (the measured NVMe-thrash mechanism at 32 banks).  Anonymous
+ * mappings (DS4_MODEL_ANON_HUGE copies) are already excluded from
+ * MemAvailable, so only file-backed registrations are counted here. */
+static std::unordered_map<uintptr_t, uint64_t> g_pinned_file_reg;
+static uint64_t g_pinned_file_bytes;
+
+static int cuda_host_range_is_file_backed(const void *p) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    const unsigned long long addr = (unsigned long long)(uintptr_t)p;
+    char line[512];
+    int file_backed = 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long lo = 0, hi = 0, off = 0, inode = 0;
+        char perms[8] = {0}, dev[16] = {0};
+        if (sscanf(line, "%llx-%llx %7s %llx %15s %llu",
+                   &lo, &hi, perms, &off, dev, &inode) == 6 &&
+            addr >= lo && addr < hi) {
+            file_backed = inode != 0;
+            break;
+        }
+    }
+    fclose(f);
+    return file_backed;
+#else
+    (void)p;
+    return 0;
+#endif
+}
+
+static void cuda_pinned_file_note_register(const void *base, uint64_t bytes) {
+    if (bytes == 0 || !cuda_host_range_is_file_backed(base)) return;
+    g_pinned_file_reg[(uintptr_t)base] = bytes;
+    g_pinned_file_bytes += bytes;
+}
+
+static void cuda_pinned_file_note_unregister(const void *base) {
+    auto it = g_pinned_file_reg.find((uintptr_t)base);
+    if (it == g_pinned_file_reg.end()) return;
+    g_pinned_file_bytes -= it->second <= g_pinned_file_bytes ? it->second : g_pinned_file_bytes;
+    g_pinned_file_reg.erase(it);
+}
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -717,6 +765,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                                (size_t)reg_bytes,
                                cudaHostRegisterMapped);
         if (err == cudaSuccess) {
+            cuda_pinned_file_note_register((void *)reg_addr, reg_bytes);
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
                 char *dev_ptr = (char *)reg_dev + reg_delta;
@@ -732,6 +781,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
             (void)cudaHostUnregister((void *)reg_addr);
+            cuda_pinned_file_note_unregister((void *)reg_addr);
             (void)cudaGetLastError();
         } else {
             if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
@@ -2283,6 +2333,7 @@ static void cuda_model_range_release_all(void) {
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
+            cuda_pinned_file_note_unregister(r.registered_base);
         } else if (r.imported_vmm) {
             if (r.vmm_va && r.vmm_alloc_bytes) {
                 (void)cuMemUnmap(r.vmm_va, (size_t)r.vmm_alloc_bytes);
@@ -2477,6 +2528,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     if (g_model_registered && g_model_host_base) {
         (void)cudaHostUnregister((void *)g_model_host_base);
+        cuda_pinned_file_note_unregister(g_model_host_base);
     }
     g_model_host_base = NULL;
     g_model_device_base = NULL;
@@ -2589,7 +2641,15 @@ extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
             while (fgets(line, sizeof line, f)) {
                 unsigned long long kb = 0;
                 if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-                    if (kb * 1024ull > free_out) free_out = kb * 1024ull;
+                    /* MemAvailable still counts GPU-pinned page-cache pages as
+                     * reclaimable; they cannot actually be claimed, and budgets
+                     * that spend them evict the model's residency (NVMe thrash
+                     * mid-decode).  Subtract the registered file-backed weight
+                     * mappings; anon (DS4_MODEL_ANON_HUGE) copies are already
+                     * excluded by the kernel. */
+                    uint64_t avail = kb * 1024ull;
+                    avail = avail > g_pinned_file_bytes ? avail - g_pinned_file_bytes : 0;
+                    if (avail > free_out) free_out = avail;
                     break;
                 }
             }
@@ -2865,6 +2925,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
                                        cudaHostRegisterMapped);
     if (err == cudaSuccess) {
+        cuda_pinned_file_note_register(model_map, model_size);
         void *dev = NULL;
         err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
         if (err == cudaSuccess && dev) {
@@ -10992,6 +11053,78 @@ static struct moe_graph_entry *moe_graph_slot(const struct moe_graph_key *key) {
     return &g_moe_graphs[h % DS4_MOE_GRAPH_CACHE_SIZE];
 }
 
+/* MOE_PROF_LITE (env DS4_CUDA_MOE_PROF_LITE): lazy-event GPU-span measurement
+ * of the routed-MoE section, valid in ASYNC production (graph replays on,
+ * zero added syncs).  A persistent ring of event pairs brackets each MoE
+ * dispatch (graph replay or eager); a pair is harvested with non-blocking
+ * cudaEventQuery only when the ring wraps 512 calls later (long complete),
+ * accumulated into per-width buckets split target/drafter, printed every 1024.
+ * Rationale: per-call sync on GB10 costs ~0.3-1.3 ms completion latency, so
+ * sync-per-call profiling and CUDA_LAUNCH_BLOCKING both inflate; lazily
+ * queried event spans do not. */
+static cudaEvent_t g_moelite_ev0[512], g_moelite_ev1[512];
+static uint32_t    g_moelite_tag[512];
+static uint32_t    g_moelite_head = 0;
+static int         g_moelite_init = 0;
+static double      g_moelite_ms[8] = {0};   /* [q4k*4 + (w1|w2-4|w5-8|w9+)] */
+static uint64_t    g_moelite_n[8]  = {0};
+static uint64_t    g_moelite_harvested = 0;
+
+static int moe_lite_enabled(void) {
+    static int en = -1;
+    if (en < 0) en = getenv("DS4_CUDA_MOE_PROF_LITE") != NULL ? 1 : 0;
+    return en;
+}
+
+static uint32_t moe_lite_begin(uint32_t n_tokens, int q4k, cudaStream_t s) {
+    if (!moe_lite_enabled() || ds4_capture_active()) return UINT32_MAX;
+    if (!g_moelite_init) {
+        g_moelite_init = 1;
+        for (int i = 0; i < 512; i++) {
+            if (cudaEventCreate(&g_moelite_ev0[i]) != cudaSuccess ||
+                cudaEventCreate(&g_moelite_ev1[i]) != cudaSuccess) { g_moelite_init = -1; break; }
+            g_moelite_tag[i] = UINT32_MAX;
+        }
+    }
+    if (g_moelite_init < 0) return UINT32_MAX;
+    const uint32_t slot = g_moelite_head;
+    g_moelite_head = (g_moelite_head + 1u) % 512u;
+    if (g_moelite_tag[slot] != UINT32_MAX && cudaEventQuery(g_moelite_ev1[slot]) == cudaSuccess) {
+        float ms = 0.0f;
+        /* ms guard: an error path can leave ev1 stale (before ev0) -> negative
+         * or absurd spans; drop those pairs. */
+        if (cudaEventElapsedTime(&ms, g_moelite_ev0[slot], g_moelite_ev1[slot]) == cudaSuccess &&
+            ms >= 0.0f && ms < 10000.0f) {
+            const uint32_t t = g_moelite_tag[slot] & 0xFFFFu;
+            const int b = (int)((g_moelite_tag[slot] >> 16) & 1u) * 4 +
+                          (t <= 1u ? 0 : t <= 4u ? 1 : t <= 8u ? 2 : 3);
+            g_moelite_ms[b] += (double)ms; g_moelite_n[b]++;
+            if ((++g_moelite_harvested & 1023u) == 0u) {
+                fprintf(stderr, "ds4: MOE_PROF_LITE gpu-span ms/call: "
+                        "tgt[w1=%.3f/%llu w2-4=%.3f/%llu w5-8=%.3f/%llu w9+=%.3f/%llu] "
+                        "q4k[w1=%.3f/%llu w2-4=%.3f/%llu w5-8=%.3f/%llu w9+=%.3f/%llu]\n",
+                        g_moelite_n[0] ? g_moelite_ms[0] / (double)g_moelite_n[0] : 0.0, (unsigned long long)g_moelite_n[0],
+                        g_moelite_n[1] ? g_moelite_ms[1] / (double)g_moelite_n[1] : 0.0, (unsigned long long)g_moelite_n[1],
+                        g_moelite_n[2] ? g_moelite_ms[2] / (double)g_moelite_n[2] : 0.0, (unsigned long long)g_moelite_n[2],
+                        g_moelite_n[3] ? g_moelite_ms[3] / (double)g_moelite_n[3] : 0.0, (unsigned long long)g_moelite_n[3],
+                        g_moelite_n[4] ? g_moelite_ms[4] / (double)g_moelite_n[4] : 0.0, (unsigned long long)g_moelite_n[4],
+                        g_moelite_n[5] ? g_moelite_ms[5] / (double)g_moelite_n[5] : 0.0, (unsigned long long)g_moelite_n[5],
+                        g_moelite_n[6] ? g_moelite_ms[6] / (double)g_moelite_n[6] : 0.0, (unsigned long long)g_moelite_n[6],
+                        g_moelite_n[7] ? g_moelite_ms[7] / (double)g_moelite_n[7] : 0.0, (unsigned long long)g_moelite_n[7]);
+            }
+        }
+    }
+    g_moelite_tag[slot] = UINT32_MAX;
+    if (cudaEventRecord(g_moelite_ev0[slot], s) != cudaSuccess) return UINT32_MAX;
+    g_moelite_tag[slot] = (n_tokens & 0xFFFFu) | (q4k ? 0x10000u : 0u);
+    return slot;
+}
+
+static void moe_lite_end(uint32_t slot, cudaStream_t s) {
+    if (slot == UINT32_MAX || g_moelite_init <= 0) return;
+    (void)cudaEventRecord(g_moelite_ev1[slot], s);
+}
+
 /* Step 8.2: dense Q8_0 vec graph cache.  Each n_tok=1 attention-side
  * matmul (q/k/v/output projections and HC-expand variants) becomes its
  * own cached cudaGraphExec_t.  V4 Flash has ~5 such projections per
@@ -18049,6 +18182,7 @@ static int routed_moe_launch(
                     memcmp(&graph_slot->key, &key, sizeof(key)) == 0) {
                     /* HIT: replay the cached graph and return. */
                     ds4_cuda_moe_stream_sync_pre(moe_stream);
+                    const uint32_t lite_slot_hit = moe_lite_begin(n_tokens, q4k_path, moe_stream);
                     cudaError_t ge = cudaGraphLaunch(graph_slot->exec, moe_stream);
                     if (ge != cudaSuccess) {
                         fprintf(stderr, "ds4: cudaGraphLaunch failed: %s; recapturing\n",
@@ -18057,6 +18191,7 @@ static int routed_moe_launch(
                         graph_slot->valid = 0;
                         /* fall through to capture path below */
                     } else {
+                        moe_lite_end(lite_slot_hit, moe_stream);
                         ds4_cuda_moe_stream_sync_post(moe_stream);
                         graph_slot->hits++;
                         return 1;
@@ -18101,6 +18236,12 @@ static int routed_moe_launch(
                 n_expert_used == 6u && getenv("DS4_CUDA_MOE_PAIR_RAW_VEC") != NULL;
             const uint32_t profile_mmvq_moe =
                 getenv("DS4_CUDA_MOE_PROFILE") != NULL && !ds4_capture_active();
+            /* MOE_PROF_LITE: eager/graphs-off path bracket (the graph-replay
+             * HIT path is bracketed at its cudaGraphLaunch above; see the
+             * moe_lite_* helpers next to moe_graph_slot). */
+            const uint32_t lite_slot = graph_capturing
+                ? UINT32_MAX
+                : moe_lite_begin(n_tokens, q4k_path, moe_stream ? moe_stream : ds4_current_stream());
             cudaEvent_t mmvq_prof_ev[5] = {NULL, NULL, NULL, NULL, NULL};
             if (profile_mmvq_moe) {
                 for (uint32_t i = 0; i < 5u; i++) {
@@ -18390,6 +18531,7 @@ static int routed_moe_launch(
                 }
                 if (mmvq_prof_ev[4]) (void)cudaEventRecord(mmvq_prof_ev[4], ds4_current_stream());
             }
+            moe_lite_end(lite_slot, moe_stream ? moe_stream : ds4_current_stream());
             if (mmvq_prof_ev[4]) {
                 if (cudaEventSynchronize(mmvq_prof_ev[4]) == cudaSuccess) {
                     float ms_gateup = 0.0f, ms_swiglu = 0.0f, ms_down = 0.0f, ms_sum = 0.0f, ms_total = 0.0f;
