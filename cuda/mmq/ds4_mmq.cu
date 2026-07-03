@@ -1009,6 +1009,66 @@ int ds4_mmq_moe_vec_impl(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Aligned-SoA IQ2_XXS decode matvec (megakernel program M1-Inc1).
+//
+// Layout contract (see ds4_mmq.h): W_aligned = [__half dq[nblk]][pad to 64B]
+// [uint2 qs[nblk*8]], nblk = n_experts * M * (K/256), block linear order equal
+// to the raw tensor byte order.  Per-pair integer math is bit-identical to
+// vec_dot_iq2_xxs_q8_1 (vecdotq.cuh); only the float accumulation order
+// differs (per-warp-row here vs per-mmvq-tile there).  Proven +12% over the
+// raw-layout vec path at the production decode shape
+// (cuda/mmq/test/proto_iq2_aligned.cu).
+__global__ void iq2_xxs_aligned_moe_vec_kernel(
+        float             *out,        // [n_expert_used, M]
+        const uint2       *qs,         // 64B-aligned code pairs
+        const __half      *dq,         // block scales
+        const block_q8_1  *x8,         // [K/32] canonical Q8_1 activation
+        const int32_t     *ids,        // [n_expert_used] expert ids
+        int                M,
+        int                nb)         // IQ2_XXS blocks per row = K/256
+{
+    const int row  = blockIdx.x;
+    const int slot = blockIdx.y;
+    const int lane = threadIdx.x;      // 32 lanes: lane covers (block b, pair p)
+    const long long rbase = ((long long)ids[slot] * M + row) * nb;
+
+    float acc = 0.0f;
+    // 32 lanes cover 4 blocks x 8 pairs per pass.
+    for (int b0 = 0; b0 < nb; b0 += 4) {
+        const int b = b0 + (lane >> 3);
+        const int p = lane & 7;
+        const uint2 cw   = qs[(rbase + b) * 8 + p];   // aligned 8B load
+        const uint32_t q2 = cw.x, aux32 = cw.y;
+        const uint8_t *aux8 = (const uint8_t *)&q2;
+
+        int sumi = 0;
+        const int q8i = (b * 256 + p * 32) / 32;   // q8_1 block covering these 32 values
+        const int *u = (const int *)x8[q8i].qs;
+#pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8[k0 / 2]];
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+
+            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+            sumi = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi);
+
+            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+            sumi = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi);
+        }
+        const int ls = aux32 >> 27 | 1;
+        sumi = sumi * ls / 8;
+        const float d = __half2float(dq[rbase + b]) * __low2float(x8[q8i].ds);
+        acc += d * (float)sumi;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) out[(long long)slot * M + row] = acc;
+}
+
 template <ggml_type type>
 int ds4_mmq_moe_pair_raw_vec_impl(
         const char    * tag,
@@ -1975,6 +2035,80 @@ extern "C" int ds4_mmq_q4_K_moe_vec(
     return ds4_mmq_moe_vec_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts) {
+    if (M <= 0 || K <= 0 || n_experts <= 0 || K % 256 != 0) return 0;
+    const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
+    const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+    return dq_bytes + nblk * 64u;
+}
+
+extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
+        const void * W_aligned, const float * X_f32, const int32_t * ids, float * out_f32,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    const char *tag = "ds4_mmq_iq2_xxs_aligned_moe_vec";
+    if (!W_aligned || !X_f32 || !ids || !out_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    // n_tokens == 1 only: the warp-per-row kernel reads one activation vector.
+    // K % 1024: the lane->(block,pair) mapping covers 4 blocks per pass.
+    if (n_tokens != 1 || M <= 0 || K <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
+        n_expert_used > n_experts || K % 1024 != 0) {
+        return -1;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return -1;
+    }
+    ds4_pool_set_stream(stream);
+
+    // Quantize X into canonical Q8_1, exactly as ds4_mmq_moe_vec_impl does, so
+    // the aligned path shares its activation numerics (and its persistent
+    // scratch when enabled).
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t  nbytes_q8_1 = (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    char *src1_q8_1_ptr = nullptr;
+    if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
+        src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
+    } else {
+        src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
+        src1_q8_1_ptr = src1_q8_1_pool.get();
+    }
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)src1_q8_1_ptr,
+        GGML_TYPE_IQ2_XXS, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K,
+        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
+        stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
+    const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+    const __half *dq = (const __half *)W_aligned;
+    const uint2  *qs = (const uint2 *)((const char *)W_aligned + dq_bytes);
+
+    dim3 grid((unsigned)M, (unsigned)n_expert_used, 1);
+    iq2_xxs_aligned_moe_vec_kernel<<<grid, 32, 0, stream>>>(
+        out_f32, qs, dq, (const block_q8_1 *)src1_q8_1_ptr, ids, M, K / 256);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+
+    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_expert_used, stream);
+    return 0;
 }
 
 extern "C" int ds4_mmq_q2_K_moe_down_sum6_vec(

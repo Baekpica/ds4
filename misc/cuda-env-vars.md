@@ -164,6 +164,20 @@ The bandwidth figure is informational; we don't tier on it.
   runs, set `DS4_CUDA_LAYER_GRAPHS=0 DS4_CUDA_MOE_GRAPHS=0` so event recording
   is not inside a captured CUDA graph.
 
+- `DS4_CUDA_MOE_NO_IQ2_ALIGNED=1`. Kill switch for the aligned-SoA IQ2_XXS
+  decode path (megakernel program M1-Inc1). The path activates automatically
+  at `n_tokens=1` when the weight server was started with
+  `--repack-iq2-aligned`, which re-serves the routed-expert gate/up stacks in
+  a byte-neutral 64B-aligned layout (`[dq][pad][qs]`, replacing their raw
+  ranges) and lifts the vec-tier gate/up rate from ~142 GB/s (66-byte block
+  stride, 2x16-bit code loads) to ~215+ GB/s. With repacked artifacts
+  present, raw-layout consumers (prefill MMQ tiles, widths 2..16) read the
+  gate/up ranges directly from the client mmap through HMM instead of the
+  device copy — correct, prefill-amortized, but slower per byte; do not
+  combine a repack server with `DS4_CUDA_NO_DERIVED_WEIGHTS=1` (that hides
+  the artifacts AND the raw exclusion remains, forcing every consumer onto
+  the mmap substrate). Parity gate: `cuda/mmq/test/test_iq2_aligned_entry.cu`.
+
 - `DS4_CUDA_MMQ_X_MAX=N`. Clip `get_mmq_x_max_host` to N (rounded down to a
   multiple of 8) when sweeping tile widths. Diagnostic only; the vanilla
   128 wins on sm_120.

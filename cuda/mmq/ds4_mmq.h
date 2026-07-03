@@ -279,6 +279,37 @@ int ds4_mmq_q4_K_moe_vec(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// Aligned-SoA IQ2_XXS decode matvec (megakernel program M1-Inc1).
+//
+// block_iq2_xxs is 66 bytes, so the raw expert stream is only 2-byte aligned
+// and every 32-bit code word costs two 16-bit loads.  W_aligned is a repacked
+// copy of the SAME bytes with the block scales split out and the code stream
+// 64B-aligned:
+//
+//   [ __half dq[nblk] ][ pad to 64B ][ uint2 qs[nblk * 8] ]
+//
+// where nblk = n_experts * M * (K / 256) and block linear order matches the
+// raw tensor byte order (expert-major, then row, then block).  The weight
+// server builds this layout (--repack-iq2-aligned); use
+// ds4_mmq_iq2_xxs_aligned_bytes to size or validate an artifact.
+//
+// Semantics and output layout are identical to ds4_mmq_iq2_xxs_moe_vec at
+// n_tokens == 1 (the only supported width; other widths return non-zero so
+// the caller can fall back).
+uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts);
+
+int ds4_mmq_iq2_xxs_aligned_moe_vec(
+    const void    * W_aligned,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
 // Fused down+sum vector entries for routed MoE with top_k=6. These preserve
 // the canonical Q8_1 activation quantization used by the regular _moe_vec
 // path, but avoid materializing [token, slot, out_dim] down results and avoid

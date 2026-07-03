@@ -395,6 +395,11 @@ enum cuda_derived_kind {
     CUDA_DERIVED_Q8_0_ROW_GROUP_NORMS = 1,
     CUDA_DERIVED_Q8_0_F16_COLMAJOR = 2,
     CUDA_DERIVED_Q8_0_F32_COLMAJOR = 3,
+    /* Aligned-SoA IQ2_XXS expert repack (weight server --repack-iq2-aligned).
+     * The artifact REPLACES the raw range (byte-neutral layout, see
+     * ds4_mmq_iq2_xxs_aligned_moe_vec in cuda/mmq/ds4_mmq.h); raw-layout
+     * consumers of the same tensor fall back to the registered-host mmap. */
+    CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE = 4,
 };
 
 struct cuda_derived_range {
@@ -12348,6 +12353,21 @@ static uint32_t cuda_moe_small16_scope_active(uint32_t q4k_path, uint64_t model_
     return 0u;
 }
 
+/* M1-Inc1: aligned-SoA IQ2_XXS decode dispatch.  Active only when the weight
+ * server was started with --repack-iq2-aligned (the derived artifacts exist)
+ * AND this kill switch is not set.  DS4_CUDA_NO_DERIVED_WEIGHTS also disables
+ * it globally via cuda_derived_weight_ptr. */
+static uint32_t cuda_moe_iq2_aligned_enabled(void) {
+    static int init = 0;
+    static uint32_t v = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_MOE_NO_IQ2_ALIGNED");
+        if (s && *s && strcmp(s, "0") != 0) v = 0;
+    }
+    return v;
+}
+
 /* FD Inc2b: attention output_a multi-column native ceiling.  n_tokens in
  * [2, max] takes grouped_q8_0_a_preq_warp8_mc_kernel (one weight read for
  * all columns) instead of the cublas f16 strided-batched GEMM; beyond it
@@ -18354,8 +18374,42 @@ static int routed_moe_launch(
         down_bytes > model_size - down_offset) {
         return 0;
     }
-    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
+    /* M1-Inc1: probe for aligned-SoA IQ2_XXS gate/up artifacts (weight server
+     * --repack-iq2-aligned).  When present, the raw gate/up ranges were
+     * EXCLUDED from the upload, so resolving them via cuda_model_range_ptr
+     * would fall into its register-or-copy miss path and pin/duplicate the
+     * ~45 GiB of expert weights.  Resolve them as plain mmap pointers
+     * instead: the decode vec branch below dispatches on the artifacts and
+     * never reads the raw pointers; the batched/mmq paths read the raw
+     * layout directly through HMM at mmap rates (prefill-amortized). */
+    const char *gate_iq2_aligned = NULL;
+    const char *up_iq2_aligned = NULL;
+    if (!q4k_path) {
+        const uint64_t iq2_al_bytes = ds4_mmq_iq2_xxs_aligned_bytes(
+            (int)expert_mid_dim, (int)expert_in_dim, (int)n_total_expert);
+        if (iq2_al_bytes != 0) {
+            gate_iq2_aligned = cuda_derived_weight_ptr(
+                model_map, gate_offset, gate_bytes,
+                CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+                expert_in_dim, expert_mid_dim, n_total_expert,
+                iq2_al_bytes, "moe_gate_iq2_aligned");
+            up_iq2_aligned = cuda_derived_weight_ptr(
+                model_map, up_offset, gate_bytes,
+                CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+                expert_in_dim, expert_mid_dim, n_total_expert,
+                iq2_al_bytes, "moe_up_iq2_aligned");
+        }
+        if (!gate_iq2_aligned || !up_iq2_aligned) {
+            gate_iq2_aligned = NULL;
+            up_iq2_aligned = NULL;
+        }
+    }
+    const char *gate_w = gate_iq2_aligned
+        ? cuda_model_ptr(model_map, gate_offset)
+        : cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
+    const char *up_w = up_iq2_aligned
+        ? cuda_model_ptr(model_map, up_offset)
+        : cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
     const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
@@ -18700,22 +18754,60 @@ static int routed_moe_launch(
                                               (int)n_tokens, (int)n_experts_total,
                                               (int)n_expert_used, moe_stream);
                 } else if (!gate_up_pair_raw) {
-                    rc = ds4_mmq_iq2_xxs_moe_vec(gate_w, (const float *)x->ptr,
-                                                 (const int32_t *)selected->ptr,
-                                                 (float *)gate->ptr,
-                                                 (int)expert_mid_dim, (int)expert_in_dim,
-                                                 (int)n_tokens, (int)n_experts_total,
-                                                 (int)n_expert_used, moe_stream);
-                    if (rc != 0) {
-                        fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_vec (gate) returned %d; falling back\n", rc);
-                        goto mmvq_decode_bail;
+                    /* M1-Inc1: aligned-SoA IQ2_XXS decode path.  When the
+                     * weight server repacked the gate/up expert stacks
+                     * (--repack-iq2-aligned; probed at the top of this
+                     * function), dispatch the 64B-aligned warp-per-row
+                     * kernel instead of the raw-layout vec entry (+12% at
+                     * the decode shape; the 66-byte block stride makes raw
+                     * code-word loads 2x16-bit).  Any failure falls through
+                     * to the raw path, whose gate_w/up_w resolve to the
+                     * plain mmap pointers when the raw ranges were excluded
+                     * from the upload. */
+                    const char *gate_al = NULL;
+                    const char *up_al = NULL;
+                    if (n_tokens == 1u && cuda_moe_iq2_aligned_enabled()) {
+                        gate_al = gate_iq2_aligned;
+                        up_al = up_iq2_aligned;
                     }
-                    rc = ds4_mmq_iq2_xxs_moe_vec(up_w, (const float *)x->ptr,
-                                                 (const int32_t *)selected->ptr,
-                                                 (float *)up->ptr,
-                                                 (int)expert_mid_dim, (int)expert_in_dim,
-                                                 (int)n_tokens, (int)n_experts_total,
-                                                 (int)n_expert_used, moe_stream);
+                    if (gate_al && up_al) {
+                        rc = ds4_mmq_iq2_xxs_aligned_moe_vec(gate_al, (const float *)x->ptr,
+                                                             (const int32_t *)selected->ptr,
+                                                             (float *)gate->ptr,
+                                                             (int)expert_mid_dim, (int)expert_in_dim,
+                                                             (int)n_tokens, (int)n_total_expert,
+                                                             (int)n_expert_used, moe_stream);
+                        if (rc == 0) {
+                            rc = ds4_mmq_iq2_xxs_aligned_moe_vec(up_al, (const float *)x->ptr,
+                                                                 (const int32_t *)selected->ptr,
+                                                                 (float *)up->ptr,
+                                                                 (int)expert_mid_dim, (int)expert_in_dim,
+                                                                 (int)n_tokens, (int)n_total_expert,
+                                                                 (int)n_expert_used, moe_stream);
+                        }
+                        if (rc != 0) {
+                            fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_aligned_moe_vec returned %d; using raw vec path\n", rc);
+                            gate_al = NULL;
+                        }
+                    }
+                    if (!gate_al || !up_al) {
+                        rc = ds4_mmq_iq2_xxs_moe_vec(gate_w, (const float *)x->ptr,
+                                                     (const int32_t *)selected->ptr,
+                                                     (float *)gate->ptr,
+                                                     (int)expert_mid_dim, (int)expert_in_dim,
+                                                     (int)n_tokens, (int)n_experts_total,
+                                                     (int)n_expert_used, moe_stream);
+                        if (rc != 0) {
+                            fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_vec (gate) returned %d; falling back\n", rc);
+                            goto mmvq_decode_bail;
+                        }
+                        rc = ds4_mmq_iq2_xxs_moe_vec(up_w, (const float *)x->ptr,
+                                                     (const int32_t *)selected->ptr,
+                                                     (float *)up->ptr,
+                                                     (int)expert_mid_dim, (int)expert_in_dim,
+                                                     (int)n_tokens, (int)n_experts_total,
+                                                     (int)n_expert_used, moe_stream);
+                    }
                 }
                 if (rc != 0) {
                     fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (up) returned %d; falling back\n", rc);
