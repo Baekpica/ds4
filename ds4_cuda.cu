@@ -400,6 +400,11 @@ enum cuda_derived_kind {
      * ds4_mmq_iq2_xxs_aligned_moe_vec in cuda/mmq/ds4_mmq.h); raw-layout
      * consumers of the same tensor fall back to the registered-host mmap. */
     CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE = 4,
+    /* Aligned-SoA Q8_0 dense repack (weight server --repack-q8-aligned).
+     * ADDITIVE: the raw range stays served, so only the n_tokens==1 decode
+     * GEMV dispatches on the artifact (ds4_mmq_q8_0_aligned_dense_vec);
+     * every other consumer reads raw as before. */
+    CUDA_DERIVED_Q8_0_ALIGNED_DENSE = 5,
 };
 
 struct cuda_derived_range {
@@ -12368,6 +12373,21 @@ static uint32_t cuda_moe_iq2_aligned_enabled(void) {
     return v;
 }
 
+/* M1-Inc3: aligned-SoA Q8_0 dense decode dispatch.  Active only when the
+ * weight server was started with --repack-q8-aligned AND this kill switch is
+ * not set.  The artifacts are additive (raw stays served), so disabling just
+ * restores the raw-layout mmvq entry. */
+static uint32_t cuda_q8_aligned_enabled(void) {
+    static int init = 0;
+    static uint32_t v = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_NO_Q8_ALIGNED");
+        if (s && *s && strcmp(s, "0") != 0) v = 0;
+    }
+    return v;
+}
+
 /* M1-Inc2b: raw-layout device scratch for the batched/mmq MoE consumers when
  * the raw gate/up spans were EXCLUDED from the upload (--repack-iq2-aligned).
  * Without this, the mmq tile path reads the raw layout through the client
@@ -12696,7 +12716,39 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
             }
         }
 
-        int rc = ds4_mmq_q8_0_dense_vec(wptr, (const float *)x->ptr, (float *)out->ptr,
+        /* M1-Inc3: aligned-SoA Q8_0 artifact (weight server
+         * --repack-q8-aligned, additive — raw stays served).  Decode-width
+         * only; wider mmvq batches keep the raw entry.  proto_q8_aligned:
+         * attn_q_b 217->235, mid 172->218, out_a 199->230, head 224->243
+         * GB/s, and the warp-per-row accumulation is closer to the double
+         * reference than the mmvq tile order. */
+        int rc = -1;
+        if (n_tok == 1u && in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
+            const uint64_t q8_al_bytes = ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
+            const char *w_aligned = q8_al_bytes != 0
+                ? cuda_derived_weight_ptr(model_map, weight_offset, weight_bytes,
+                                          CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+                                          in_dim, out_dim, 1u, q8_al_bytes, label)
+                : NULL;
+            if (w_aligned) {
+                rc = ds4_mmq_q8_0_aligned_dense_vec(w_aligned, (const float *)x->ptr,
+                                                    (float *)out->ptr,
+                                                    (int)out_dim, 1, (int)in_dim,
+                                                    moe_stream);
+                if (rc == 0) {
+                    static int logged = 0;
+                    if (!logged) {
+                        logged = 1;
+                        fprintf(stderr, "ds4: dense decode using aligned Q8_0 artifacts (M1-Inc3)\n");
+                    }
+                } else {
+                    fprintf(stderr, "ds4: ds4_mmq_q8_0_aligned_dense_vec returned %d (label='%s'); using raw entry\n",
+                            rc, label ? label : "");
+                }
+            }
+        }
+        if (rc != 0)
+            rc = ds4_mmq_q8_0_dense_vec(wptr, (const float *)x->ptr, (float *)out->ptr,
                                         (int)out_dim, (int)n_tok, (int)in_dim,
                                         moe_stream);
 

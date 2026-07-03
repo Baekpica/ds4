@@ -311,6 +311,23 @@ int ds4_mmq_iq2_xxs_aligned_derepack(
     int             n_experts,
     cudaStream_t    stream);
 
+// M1-Inc3: aligned-SoA Q8_0 dense decode matvec.  Artifact layout
+// [__half dq[nblk]][pad to 64B][int8 qs[nblk*32]], nblk = M * (K/32), block
+// order equal to the raw tensor byte order (weight server
+// --repack-q8-aligned; raw spans stay served — dense artifacts duplicate,
+// they do not replace).  n_tokens == 1 and K % 1024 == 0 only; other shapes
+// return non-zero so the caller can fall back to ds4_mmq_q8_0_dense_vec.
+uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K);
+
+int ds4_mmq_q8_0_aligned_dense_vec(
+    const void  * W_aligned,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 int ds4_mmq_iq2_xxs_aligned_moe_vec(
     const void    * W_aligned,
     const float   * X_f32,

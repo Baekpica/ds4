@@ -483,6 +483,19 @@ int ds4_mmq_moe_impl(
     const int si1  = n_expert_used;
     const int sis1 = 1;
 
+    // mm_ids_helper uses n_tokens * 4 bytes of dynamic shared memory and
+    // GGML_ASSERT-aborts past the device cap.  The down matmul reaches here
+    // with n_tokens = assignments (6x the forward width), so an unchunked
+    // >~4.1k-token forward would abort the process (seen: a serial warm-start
+    // suffix prefill of 4511 tokens -> 27066 assignments = 108 KB > smpbo).
+    // Refuse instead; the caller falls back to the legacy MoE path, which
+    // scales its grids by n_tokens.
+    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo) {
+        fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
+                tag, n_tokens);
+        return -1;
+    }
+
     ggml_cuda_launch_mm_ids_helper(
         ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
         n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11, si1, sis1, stream);
@@ -657,6 +670,15 @@ int ds4_mmq_moe_pair_impl(
 
     const int si1  = n_expert_used;
     const int sis1 = 1;
+
+    // Same shared-mem cap guard as ds4_mmq_moe_impl: mm_ids_helper
+    // GGML_ASSERT-aborts at n_tokens * 4 > smpbo; refuse so the caller can
+    // fall back to the legacy MoE path.
+    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo) {
+        fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
+                tag, n_tokens);
+        return -1;
+    }
 
     ggml_cuda_launch_mm_ids_helper(
         ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
@@ -2229,6 +2251,117 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
         (const __half *)W_aligned,
         nblk);
     cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Aligned-SoA Q8_0 dense decode matvec (megakernel program M1-Inc3).
+//
+// block_q8_0 is 34 bytes ([half d][int8 qs[32]]), so the raw code stream is
+// only 2-byte aligned — the same misalignment class proto_iq2_aligned proved
+// costly.  Artifact layout (weight server --repack-q8-aligned, derived kind
+// DERIVED_Q8_0_ALIGNED_DENSE): [__half dq[nblk]][pad to 64B][int8 qs[nblk*32]]
+// with nblk = M * (K/32), block order equal to the raw tensor byte order.
+// Unlike the IQ2 expert repack, the raw spans stay SERVED (dense tensors are
+// ~6 GiB total, affordable to duplicate), so every other consumer is
+// unchanged.  proto_q8_aligned.cu A/B (GB10, L2-defeating rotation, double-ref
+// parity): attn_q_b 217->235, mid 2048x4096 172->218, out_a 8192x4096
+// 199->230, head 224->243 GB/s; the warp-per-row accumulation is also ~1000x
+// closer to the double reference than the mmvq tile order at K>=4096.
+__global__ void q8_0_aligned_dense_vec_kernel(
+        float             *out,        // [M]
+        const int4        *qs,         // aligned codes, 2 int4 per block
+        const __half      *dq,         // block scales
+        const block_q8_1  *x8,         // [K/32] canonical Q8_1 activation
+        int                M,
+        int                nb)         // blocks per row = K/32
+{
+    const int row  = blockIdx.x;
+    const int lane = threadIdx.x;
+    const long long rbase = (long long)row * nb;
+
+    float acc = 0.0f;
+    for (int b0 = 0; b0 < nb; b0 += 32) {
+        const int b = b0 + lane;
+        const int4 w0 = qs[(rbase + b) * 2 + 0];   // aligned 16B loads
+        const int4 w1 = qs[(rbase + b) * 2 + 1];
+        const int *u = (const int *)x8[b].qs;
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
+        sumi = ggml_cuda_dp4a(w0.y, u[1], sumi);
+        sumi = ggml_cuda_dp4a(w0.z, u[2], sumi);
+        sumi = ggml_cuda_dp4a(w0.w, u[3], sumi);
+        sumi = ggml_cuda_dp4a(w1.x, u[4], sumi);
+        sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
+        sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
+        sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
+        acc += __half2float(dq[rbase + b]) * __low2float(x8[b].ds) * (float)sumi;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) out[row] = acc;
+}
+
+extern "C" uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K) {
+    if (M <= 0 || K <= 0 || K % 1024 != 0) return 0;
+    const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
+    const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+    return dq_bytes + nblk * 32u;
+}
+
+extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
+        const void * W_aligned, const float * X_f32, float * out_f32,
+        int M, int N, int K, cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q8_0_aligned_dense_vec";
+    if (!W_aligned || !X_f32 || !out_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    // K % 1024: the kernel's 32-blocks-per-pass loop needs nb % 32 == 0.
+    if (N != 1 || M <= 0 || K <= 0 || K % 1024 != 0) return -1;
+
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return -1;
+    }
+    ds4_pool_set_stream(stream);
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t  nbytes_q8_1 = (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> q8_pool;
+    char *x8 = nullptr;
+    if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
+        x8 = (char *)g_q81_scratch_ptr;
+    } else {
+        q8_pool.alloc(ctx->pool(), nbytes_q8_1);
+        x8 = q8_pool.get();
+    }
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)x8,
+        GGML_TYPE_Q8_0, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K,
+        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
+        stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
+    const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+    q8_0_aligned_dense_vec_kernel<<<(unsigned)M, 32, 0, stream>>>(
+        out_f32,
+        (const int4 *)((const char *)W_aligned + dq_bytes),
+        (const __half *)W_aligned,
+        (const block_q8_1 *)x8, M, K / 32);
+    err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;

@@ -188,6 +188,17 @@ The bandwidth figure is informational; we don't tier on it.
   log: `iq2 derepack scratch active`. Disabling restores the mmap-raw
   behavior above; decode (`n_tokens=1`) is unaffected either way.
 
+- `DS4_CUDA_NO_Q8_ALIGNED=1`. Kill switch for the aligned-SoA Q8_0 dense
+  decode path (M1-Inc3). Activates automatically at `n_tokens=1` when the
+  weight server ran with `--repack-q8-aligned` (302 artifacts, ~6.1 GiB,
+  ADDITIVE — raw stays served, so all other consumers are unchanged; one-shot
+  boot log `dense decode using aligned Q8_0 artifacts`). Kernel-isolated
+  gains are large (attn_q_b 217→235, mid 172→218, out_a 199→230, head
+  224→243 GB/s, proto_q8_aligned.cu), but e2e decode-only gained only
+  ~0.4 ms/tok on GB10: the production dense GEMVs run environment-bound
+  (146-164 GB/s in-graph vs 217-243 isolated), so treat the WS flag as
+  opt-in until the environment deficit is closed.
+
 - `DS4_CUDA_MMQ_X_MAX=N`. Clip `get_mmq_x_max_host` to N (rounded down to a
   multiple of 8) when sweeping tile widths. Diagnostic only; the vanilla
   128 wins on sm_120.
