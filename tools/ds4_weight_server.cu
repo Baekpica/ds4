@@ -2015,9 +2015,13 @@ static void usage(FILE *fp) {
             "  --derive-q8-f32 NAME Build a base Q8_0 tensor as imported F32 layout. Repeatable\n"
             "  --derive-budget-gb N Maximum derived artifact memory. Default: 4\n"
             "  --repack-iq2-aligned Serve base IQ2_XXS routed-expert gate/up stacks in the\n"
-            "                    64B-aligned SoA layout (replaces their raw ranges; byte-neutral)\n"
+            "                    64B-aligned SoA layout (replaces their raw ranges; byte-neutral).\n"
+            "                    Default: ON. Disable with --no-repack-iq2-aligned.\n"
+            "                    NOTE: needs clients >= 136cec7 (older MoE decode widths >=2\n"
+            "                    fall to a catastrophic host-mmap tier on a repacked manifest).\n"
             "  --repack-q8-aligned Additionally serve large base Q8_0 dense tensors in the\n"
-            "                    64B-aligned SoA layout (raw ranges stay served; ~6 GiB extra)\n"
+            "                    64B-aligned SoA layout (raw ranges stay served; ~6 GiB extra).\n"
+            "                    Default: ON. Disable with --no-repack-q8-aligned.\n"
             "  --dry-run         Parse GGUFs, print upload plan, and exit before allocation\n");
 }
 
@@ -2039,8 +2043,14 @@ int main(int argc, char **argv) {
     std::vector<std::string> derive_q8_f16;
     std::vector<std::string> derive_q8_f32;
     uint64_t derive_budget_bytes = 4ull * 1073741824ull;
-    bool repack_iq2_aligned = false;
-    bool repack_q8_aligned = false;
+    /* Aligned-SoA repacks default ON (quality gate passed 2026-07-04:
+     * gsm8k 97.4 / HumanEval 92.1 / MBPP 89.0 vs 97.6/88.4/90.0 baselines;
+     * serial decode −1.4 ms/tok).  NOTE the iq2 repack REPLACES raw ranges:
+     * clients older than 136cec7 fall to a host-mmap tier at MoE decode
+     * widths >=2 — pair a repacked manifest with current clients only. */
+    bool repack_iq2_aligned = true;
+    bool repack_q8_aligned = true;
+    bool repack_explicit = false;
     bool dry_run = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--base") && i + 1 < argc) base = argv[++i];
@@ -2068,8 +2078,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--derive-q8-f16") && i + 1 < argc) derive_q8_f16.push_back(argv[++i]);
         else if (!strcmp(argv[i], "--derive-q8-f32") && i + 1 < argc) derive_q8_f32.push_back(argv[++i]);
         else if (!strcmp(argv[i], "--derive-budget-gb") && i + 1 < argc) derive_budget_bytes = parse_gib(argv[++i], derive_budget_bytes);
-        else if (!strcmp(argv[i], "--repack-iq2-aligned")) repack_iq2_aligned = true;
-        else if (!strcmp(argv[i], "--repack-q8-aligned")) repack_q8_aligned = true;
+        else if (!strcmp(argv[i], "--repack-iq2-aligned")) { repack_iq2_aligned = true; repack_explicit = true; }
+        else if (!strcmp(argv[i], "--repack-q8-aligned")) { repack_q8_aligned = true; repack_explicit = true; }
+        else if (!strcmp(argv[i], "--no-repack-iq2-aligned")) repack_iq2_aligned = false;
+        else if (!strcmp(argv[i], "--no-repack-q8-aligned")) repack_q8_aligned = false;
         else if (!strcmp(argv[i], "--dry-run")) dry_run = true;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(stdout);
@@ -2099,8 +2111,16 @@ int main(int argc, char **argv) {
     if (span_bytes > 4096ull * 1048576ull) span_bytes = 4096ull * 1048576ull;
     if (copy_chunk_bytes < 16ull * 1048576ull) copy_chunk_bytes = 16ull * 1048576ull;
     if (copy_chunk_bytes > 1024ull * 1048576ull) copy_chunk_bytes = 1024ull * 1048576ull;
-    if ((derive_output_certifier || !derive_q8_f16.empty() || !derive_q8_f32.empty() ||
-         repack_iq2_aligned || repack_q8_aligned) && !want_base) {
+    if (!want_base && (repack_iq2_aligned || repack_q8_aligned)) {
+        if (repack_explicit) {
+            fprintf(stderr, "ds4_weight_server: derived artifacts currently require base scope\n");
+            return 2;
+        }
+        /* default-on repacks quietly drop out of a base-less scope */
+        repack_iq2_aligned = false;
+        repack_q8_aligned = false;
+    }
+    if ((derive_output_certifier || !derive_q8_f16.empty() || !derive_q8_f32.empty()) && !want_base) {
         fprintf(stderr, "ds4_weight_server: derived artifacts currently require base scope\n");
         return 2;
     }

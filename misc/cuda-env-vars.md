@@ -166,8 +166,11 @@ The bandwidth figure is informational; we don't tier on it.
 
 - `DS4_CUDA_MOE_NO_IQ2_ALIGNED=1`. Kill switch for the aligned-SoA IQ2_XXS
   decode path (megakernel program M1-Inc1). The path activates automatically
-  at `n_tokens=1` when the weight server was started with
-  `--repack-iq2-aligned`, which re-serves the routed-expert gate/up stacks in
+  at decode widths 1..16 (`136cec7` extended it past `n_tokens=1`) when the
+  weight server serves repacked artifacts — DEFAULT ON since the 2026-07-04
+  quality gate (gsm8k 97.4 / HumanEval 92.1 / MBPP 89.0 vs 97.6/88.4/90.0;
+  disable server-side with `--no-repack-iq2-aligned`). The historical
+  opt-in flag `--repack-iq2-aligned` re-serves the routed-expert gate/up stacks in
   a byte-neutral 64B-aligned layout (`[dq][pad][qs]`, replacing their raw
   ranges) and lifts the vec-tier gate/up rate from ~142 GB/s (66-byte block
   stride, 2x16-bit code loads) to ~215+ GB/s. With repacked artifacts
@@ -191,16 +194,20 @@ The bandwidth figure is informational; we don't tier on it.
 - `DS4_CUDA_NO_Q8_ALIGNED=1`. Kill switch for ALL aligned-SoA Q8_0 decode
   paths: the dense mmvq site (M1-Inc3) and the three custom warp8 kernels
   (M1-Inc4: hc_expand, q8 pair, grouped output_a). They activate
-  automatically at decode when the weight server ran with
-  `--repack-q8-aligned` (345 artifacts, ~6.2 GiB, ADDITIVE — raw stays
+  automatically at decode when the weight server serves the q8 artifacts —
+  DEFAULT ON since the 2026-07-04 quality gate; disable server-side with
+  `--no-repack-q8-aligned` (345 artifacts, ~6.2 GiB, ADDITIVE — raw stays
   served, so every fallback is still a device read; one-shot boot logs
   `dense decode using aligned Q8_0 artifacts` plus three `M1-Inc4` lines).
   Inc3 alone was ~0.4 ms/tok (the dense mmvq site covers only a small span);
   Inc4 extends the layout to the warp8 kernels (21.2 ms/step of the serial
   decode) — proto_q8_warp8.cu shows +7-13% per kernel with bit-identical
   accumulation, and the combined e2e decode-only win is ~1.4 ms/tok on GB10
-  (.33: 53.1 -> 51.7). With Inc4 the WS flag is worth having on for serial
-  N=1 serving.
+  (.33: 53.1 -> 51.7). With Inc4 the artifacts are worth serving for serial
+  N=1 production, hence the default flip. CAVEAT: high-N continuous serving
+  (decode widths >16, the MMQ tile path) still reads raw iq2 from mmap or
+  pays derepack refills on a repacked manifest — keep a raw manifest
+  (`--no-repack-iq2-aligned`) for that regime until the gap is closed.
 
 - `DS4_CUDA_MMQ_X_MAX=N`. Clip `get_mmq_x_max_host` to N (rounded down to a
   multiple of 8) when sweeping tile widths. Diagnostic only; the vanilla
