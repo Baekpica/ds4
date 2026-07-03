@@ -102,6 +102,26 @@ The bandwidth figure is informational; we don't tier on it.
   32 banks. Default bank counts on GB10 drop accordingly (the honest number);
   `DS4_SERVER_COALESCE_MAX` still caps explicitly.
 
+- `DS4_BATCH_FIT_HEADROOM_MB=N`. Bytes the bank-count fit and the VMM
+  comp-page budget leave free for runtime growth (tmp pools, capture graphs,
+  logits staging). Ctx-aware default since 2026-07-03: 6144 for boots with
+  `-c` &le; 16384 (GB10: +20% N=8 agg from the extra banks, N=1 neutral),
+  8192 above (at 57k ctx the extra resident slabs steal page cache from the
+  mmap weights and decode regresses ~7%). Setting the env pins one value for
+  both regimes.
+
+- Serving-path note (2026-07-03): `DS4_SERVER_CONTINUOUS=0` routes requests
+  down the original graph-captured serial session path — on GB10 short-ctx
+  this decodes ~11% faster at N=1 (56.5 vs 63.3 ms/tok) because the eager
+  continuous-batch width-1 forward carries ~7 ms/tok of un-captured
+  per-step overhead. It serializes the GPU per request, so it is a
+  dedicated single-user setting only; the continuous default is correct
+  for any concurrent serving. (This also explains the historical
+  `DS4_CUDA_Q8_F16_PRELOAD` "win": the F16 copies starved the bank budget,
+  continuous admission failed, and requests silently fell back to the
+  serial path — the preload itself contributes nothing and is not a
+  recommended knob.)
+
 - `DS4_CUDA_PREFILL_PATH=mmq|cublas|warp8|auto` (default `auto` &rarr; mmq).
   Explicit override. `auto` and unset both resolve to mmq.
 
@@ -118,11 +138,17 @@ The bandwidth figure is informational; we don't tier on it.
   the MMQ tile path for these small batches and reuses the CUDA MMVQ/Q8_1
   vector machinery with internal column chunking above width 8.
   `N` may be 9..16 to cap coverage; `DS4_CUDA_MOE_NO_SMALL16=1` is an alias
-  for disable. The tier applies to verifier forwards and the small Q4_K MTP
-  support model by default, but leaves the larger Q4_K DSpark drafter on its
-  existing MMQ numerics. Set `DS4_CUDA_MOE_NO_SMALL16_MTP_DRAFT=1` to restrict
-  it to verifier forwards only, or `DS4_CUDA_MOE_SMALL16_ALL=1` for diagnostic
-  all-model A/B runs. `DS4_CUDA_MOE_SMALL16_DIRECT=1` selects the experimental
+  for disable. Since 2026-07-03 the tier applies to ALL models by default
+  (`DS4_CUDA_MOE_SMALL16_ALL=0` restores the old MTP/verifier + small-Q4_K
+  scope): base continuous-batch decode at widths 9..16 previously fell into
+  the sorted/MMQ machinery and cliffed hard at n_live=9 (GB10 N=12 agg
+  26.2 -> 41.3 tok/s with the tier; widths <=8 unaffected; quality-gated
+  within score band on gsm8k/HumanEval/MBPP at conc 12). The larger Q4_K
+  DSpark drafter still keeps its MMQ numerics unless SMALL16_ALL is set
+  explicitly; `DS4_CUDA_MOE_NO_SMALL16_MTP_DRAFT=1` restricts the legacy
+  scope to verifier forwards only. Widths 17..23 remain a known dead zone
+  (fall back to MMQ, N=20 agg ~26 vs N=16 ~51 on GB10) — prefer scheduling
+  decode widths <=16 or >=24. `DS4_CUDA_MOE_SMALL16_DIRECT=1` selects the experimental
   Q8_K direct fallback instead of preserving the normal MMQ backup path.
   `DS4_CUDA_MOE_Q81_FUSED=1` selects experimental canonical-Q8_1 fused
   gate+up+mid and down+sum helpers; early GB10 probes preserved acceptance but

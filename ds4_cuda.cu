@@ -12323,14 +12323,20 @@ static uint32_t cuda_moe_small16_max_tokens(void) {
     return v;
 }
 
+/* Scope default flipped to ALL models (2026-07-03): base cont decode at
+ * widths 9..16 previously fell into the sorted/MMQ machinery and cliffed
+ * (N=12 agg 26.2 -> 41.3 with the direct tier; no regression at widths
+ * <=8).  Quality-gated at conc 12: gsm8k 97.2 / HumanEval 87.8 / MBPP 90.0
+ * vs baselines 97.6 / 88.4 / 90.0 -- all within score band.
+ * DS4_CUDA_MOE_SMALL16_ALL=0 restores the old MTP/verifier-only scope. */
 static uint32_t cuda_moe_small16_scope_active(uint32_t q4k_path, uint64_t model_size) {
     static int init = 0;
-    static uint32_t all_models = 0;
+    static uint32_t all_models = 1;
     static uint32_t mtp_draft = 1;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_MOE_SMALL16_ALL");
-        all_models = (s && *s && strcmp(s, "0") != 0) ? 1u : 0u;
+        if (s && *s) all_models = strcmp(s, "0") != 0 ? 1u : 0u;
         const char *m = getenv("DS4_CUDA_MOE_NO_SMALL16_MTP_DRAFT");
         mtp_draft = (m && *m && strcmp(m, "0") != 0) ? 0u : 1u;
     }

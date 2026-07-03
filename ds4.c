@@ -30209,10 +30209,15 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
 
 /* R5 Inc1a/1b shared knob: bytes the bank-count fit and the comp-page budget
  * both leave free for runtime growth (tmp pools, capture graphs, logits
- * staging). */
-static uint64_t ds4_batch_fit_headroom_bytes(void) {
+ * staging).  Ctx-aware default (2026-07-03): short-ctx boots (<=16k) run
+ * safely at 6144 MiB (N=8 agg +20% cross-box from the extra banks, N=1
+ * neutral), but at 57k ctx the extra resident slabs steal page cache from
+ * the mmap weights and decode regresses ~7%, so long-ctx keeps 8192.
+ * DS4_BATCH_FIT_HEADROOM_MB overrides both regimes. */
+static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     const char *he = getenv("DS4_BATCH_FIT_HEADROOM_MB");
-    uint64_t headroom = 8192ull << 20;
+    uint64_t headroom = (ctx_size > 0 && ctx_size <= 16384) ? (6144ull << 20)
+                                                            : (8192ull << 20);
     if (he && he[0]) {
         const long hv = atol(he);
         if (hv >= 0) headroom = (uint64_t)hv << 20;
@@ -30389,7 +30394,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                                                              ds4_batch_vmm_comp_enabled());
         if (!(fe && fe[0] == '0' && fe[1] == '\0') &&
             per_bank != 0 && ds4_gpu_mem_info(&free_b, &total_b) == 0) {
-            const uint64_t headroom = ds4_batch_fit_headroom_bytes();
+            const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
             const uint64_t budget = free_b > headroom ? free_b - headroom : 0;
             uint32_t n = (uint32_t)(budget / per_bank);
             if (n < 2u) n = 2u;   /* still try the floor: a failing 2-bank slab
@@ -30438,7 +30443,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         const uint64_t cache_per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, false, false) -
                                         ds4_batch_slabs_bank_bytes(&ctx->g, false, true) + floor_pb;
         if (ds4_gpu_mem_info(&vfree, &vtotal) == 0) {
-            const uint64_t headroom = ds4_batch_fit_headroom_bytes();
+            const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
             const uint64_t res = ds4_batch_slabs_cache_resident(&ctx->sl);
             /* The fit already charged every bank its first-touch floor, so the
              * budget grants those floors back on top of what is free beyond
