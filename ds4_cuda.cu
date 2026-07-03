@@ -12408,7 +12408,8 @@ static cudaEvent_t g_q8p_ev0[DS4_Q8PROF_RING], g_q8p_ev1[DS4_Q8PROF_RING];
 static uint32_t    g_q8p_tag[DS4_Q8PROF_RING];
 static uint32_t    g_q8p_head = 0;
 static int         g_q8p_init = 0;
-static struct { uint64_t in_dim, out_dim, n_tok; double ms; uint64_t n; }
+static struct { const char *what; uint64_t in_dim, out_dim, n_tok, bytes;
+                double ms; uint64_t n; }
                    g_q8p_b[DS4_Q8PROF_BUCKETS];
 static uint32_t    g_q8p_nb = 0;
 static uint64_t    g_q8p_harvested = 0;
@@ -12419,20 +12420,28 @@ static int q8p_enabled(void) {
     return en;
 }
 
-static uint32_t q8p_bucket(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
+static uint32_t q8p_bucket(const char *what, uint64_t in_dim, uint64_t out_dim,
+                           uint64_t n_tok, uint64_t bytes) {
     for (uint32_t i = 0; i < g_q8p_nb; i++)
-        if (g_q8p_b[i].in_dim == in_dim && g_q8p_b[i].out_dim == out_dim &&
+        if (g_q8p_b[i].what == what &&
+            g_q8p_b[i].in_dim == in_dim && g_q8p_b[i].out_dim == out_dim &&
             g_q8p_b[i].n_tok == n_tok) return i;
     if (g_q8p_nb >= DS4_Q8PROF_BUCKETS) return UINT32_MAX;
+    g_q8p_b[g_q8p_nb].what = what;
     g_q8p_b[g_q8p_nb].in_dim = in_dim; g_q8p_b[g_q8p_nb].out_dim = out_dim;
-    g_q8p_b[g_q8p_nb].n_tok = n_tok;   g_q8p_b[g_q8p_nb].ms = 0.0;
-    g_q8p_b[g_q8p_nb].n = 0;
+    g_q8p_b[g_q8p_nb].n_tok = n_tok;   g_q8p_b[g_q8p_nb].bytes = bytes;
+    g_q8p_b[g_q8p_nb].ms = 0.0;        g_q8p_b[g_q8p_nb].n = 0;
     return g_q8p_nb++;
 }
 
-static uint32_t q8p_begin(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok, cudaStream_t s) {
+/* Tagged span entry: `what` must be a string literal (pointer-compared),
+ * `bytes` the true weight bytes the op streams (F16 = in*out*2, Q8_0 =
+ * out*ceil(in/32)*34), so the printed GB/s is honest per path.  Same ring +
+ * capture-skip discipline as the classic q8p_begin below. */
+static uint32_t q8p_begin_tagged(const char *what, uint64_t in_dim, uint64_t out_dim,
+                                 uint64_t n_tok, uint64_t bytes, cudaStream_t s) {
     if (!q8p_enabled() || ds4_capture_active()) return UINT32_MAX;
-    const uint32_t b = q8p_bucket(in_dim, out_dim, n_tok);
+    const uint32_t b = q8p_bucket(what, in_dim, out_dim, n_tok, bytes);
     if (b == UINT32_MAX) return UINT32_MAX;
     if (!g_q8p_init) {
         g_q8p_init = 1;
@@ -12452,13 +12461,13 @@ static uint32_t q8p_begin(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok, cud
             const uint32_t ob = g_q8p_tag[slot];
             g_q8p_b[ob].ms += (double)ms; g_q8p_b[ob].n++;
             if ((++g_q8p_harvested & 16383u) == 0u) {
-                fprintf(stderr, "ds4: Q8_PROF_LITE gpu-span ms/call by (in,out,ntok):\n");
+                fprintf(stderr, "ds4: Q8_PROF_LITE gpu-span ms/call by (what,in,out,ntok):\n");
                 for (uint32_t i = 0; i < g_q8p_nb; i++) {
                     if (!g_q8p_b[i].n) continue;
-                    /* 34 bytes per 32-elem block */
-                    const double mib = (double)(g_q8p_b[i].in_dim / 32 * 34 * g_q8p_b[i].out_dim) / 1048576.0;
+                    const double mib = (double)g_q8p_b[i].bytes / 1048576.0;
                     const double avg = g_q8p_b[i].ms / (double)g_q8p_b[i].n;
-                    fprintf(stderr, "ds4:   %llux%llu n%llu  %.4f ms/call /%llu  (%.1f MiB, %.0f GB/s)\n",
+                    fprintf(stderr, "ds4:   %-12s %llux%llu n%llu  %.4f ms/call /%llu  (%.1f MiB, %.0f GB/s)\n",
+                            g_q8p_b[i].what ? g_q8p_b[i].what : "q8",
                             (unsigned long long)g_q8p_b[i].in_dim,
                             (unsigned long long)g_q8p_b[i].out_dim,
                             (unsigned long long)g_q8p_b[i].n_tok,
@@ -12472,6 +12481,11 @@ static uint32_t q8p_begin(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok, cud
     if (cudaEventRecord(g_q8p_ev0[slot], s) != cudaSuccess) return UINT32_MAX;
     g_q8p_tag[slot] = b;
     return slot;
+}
+
+static uint32_t q8p_begin(uint64_t in_dim, uint64_t out_dim, uint64_t n_tok, cudaStream_t s) {
+    return q8p_begin_tagged("q8", in_dim, out_dim, n_tok,
+                            out_dim * ((in_dim + 31) / 32) * 34, s);
 }
 
 static void q8p_end(uint32_t slot, cudaStream_t s) {
@@ -13205,7 +13219,32 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
 }
 
+static int cuda_matmul_q8_0_hc_expand_tensor_labeled_body(
+        ds4_gpu_tensor *out_hc, ds4_gpu_tensor *block_out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint64_t in_dim,
+        uint64_t out_dim, const ds4_gpu_tensor *x, const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+        uint32_t n_embd, uint32_t n_hc, const char *label);
+
+/* Span wrapper: `label` here is always a string-literal ("q8_hc_expand" /
+ * "shared_down_hc_expand"), so it doubles as the q8p bucket tag. */
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
+        ds4_gpu_tensor *out_hc, ds4_gpu_tensor *block_out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint64_t in_dim,
+        uint64_t out_dim, const ds4_gpu_tensor *x, const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+        uint32_t n_embd, uint32_t n_hc, const char *label) {
+    const uint32_t q8ps = q8p_begin_tagged(label, in_dim, out_dim, 1,
+                                           out_dim * ((in_dim + 31) / 32) * 34,
+                                           ds4_current_stream());
+    const int rc = cuda_matmul_q8_0_hc_expand_tensor_labeled_body(
+            out_hc, block_out, model_map, model_size, weight_offset, in_dim,
+            out_dim, x, block_add, residual_hc, split, n_embd, n_hc, label);
+    q8p_end(q8ps, ds4_current_stream());
+    return rc;
+}
+
+static int cuda_matmul_q8_0_hc_expand_tensor_labeled_body(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,
@@ -13389,7 +13428,18 @@ static int cuda_matmul_q8_0_hc_expand_n2_split_residual_tensor_labeled(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand_n2 launch");
 }
 
+static int cuda_matmul_f16_tensor_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok);
+
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    const uint32_t q8ps = q8p_begin_tagged("f16", in_dim, out_dim, n_tok,
+                                           in_dim * out_dim * 2, ds4_current_stream());
+    const int rc = cuda_matmul_f16_tensor_impl(out, model_map, model_size, weight_offset,
+                                               in_dim, out_dim, x, n_tok);
+    q8p_end(q8ps, ds4_current_stream());
+    return rc;
+}
+
+static int cuda_matmul_f16_tensor_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
@@ -15418,7 +15468,43 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                        n_comp, window, ratio, n_head, head_dim,
                                        comp_fp8, comp_scale);
 }
+static int cuda_attention_output_q8_batch_impl(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low, ds4_gpu_tensor *group_tmp,
+        ds4_gpu_tensor *low_tmp, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset, uint64_t group_dim,
+        uint64_t rank, uint32_t n_groups, uint64_t out_dim,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens);
+
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t w_bytes = low_dim * ((group_dim + 31) / 32) * 34 +
+                             out_dim * ((low_dim + 31) / 32) * 34;
+    const uint32_t q8ps = q8p_begin_tagged("attn_out_ab", group_dim, out_dim,
+                                           n_tokens, w_bytes, ds4_current_stream());
+    const int rc = cuda_attention_output_q8_batch_impl(out, low, group_tmp, low_tmp,
+                                                       model_map, model_size,
+                                                       out_a_offset, out_b_offset,
+                                                       group_dim, rank, n_groups,
+                                                       out_dim, heads, n_tokens);
+    q8p_end(q8ps, ds4_current_stream());
+    return rc;
+}
+
+static int cuda_attention_output_q8_batch_impl(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         ds4_gpu_tensor       *group_tmp,
@@ -15575,7 +15661,37 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                            n_tokens,
                                            "attn_output_b");
 }
+static int cuda_attention_output_low_q8_impl(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads);
+
 extern "C" int ds4_gpu_attention_output_low_q8_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads) {
+    const uint64_t w_bytes = (uint64_t)n_groups * rank * ((group_dim + 31) / 32) * 34;
+    const uint32_t q8ps = q8p_begin_tagged("attn_out_a", group_dim,
+                                           (uint64_t)n_groups * rank, 1, w_bytes,
+                                           ds4_current_stream());
+    const int rc = cuda_attention_output_low_q8_impl(low, model_map, model_size,
+                                                     out_a_offset, group_dim, rank,
+                                                     n_groups, heads);
+    q8p_end(q8ps, ds4_current_stream());
+    return rc;
+}
+
+static int cuda_attention_output_low_q8_impl(
         ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
