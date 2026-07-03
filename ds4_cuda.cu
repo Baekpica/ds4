@@ -18745,7 +18745,12 @@ static int routed_moe_launch(
              * A/B: 0.130 ms (2x aligned Inc1) -> 0.118, both DRAM-honest at
              * ~218 GB/s, plus the swiglu launch removed.  Diagnostic env
              * paths below still take priority when explicitly requested. */
-            if (n_tokens == 1u && gate_iq2_aligned && up_iq2_aligned &&
+            /* n_tokens <= 16: the aligned kernels cover the whole vec-tier
+             * envelope (widths 2..8 default, 9..16 under small16).  This is
+             * load-bearing under --repack-iq2-aligned: the raw iq2 ranges are
+             * replaced by the artifacts, so the legacy vec path below reads
+             * host mmap at ~100x cost (the 2026-07-03 batch_eval "hang"). */
+            if (n_tokens <= 16u && gate_iq2_aligned && up_iq2_aligned &&
                 cuda_moe_iq2_aligned_enabled() &&
                 !use_q8k_gate_in_vec && !use_q81_fused_moe && !use_pair_raw_vec) {
                 rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
@@ -18911,7 +18916,7 @@ static int routed_moe_launch(
                      * from the upload. */
                     const char *gate_al = NULL;
                     const char *up_al = NULL;
-                    if (n_tokens == 1u && cuda_moe_iq2_aligned_enabled()) {
+                    if (n_tokens <= 16u && cuda_moe_iq2_aligned_enabled()) {
                         gate_al = gate_iq2_aligned;
                         up_al = up_iq2_aligned;
                     }
