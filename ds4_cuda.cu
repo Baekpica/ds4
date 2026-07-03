@@ -12368,6 +12368,69 @@ static uint32_t cuda_moe_iq2_aligned_enabled(void) {
     return v;
 }
 
+/* M1-Inc2b: raw-layout device scratch for the batched/mmq MoE consumers when
+ * the raw gate/up spans were EXCLUDED from the upload (--repack-iq2-aligned).
+ * Without this, the mmq tile path reads the raw layout through the client
+ * mmap at page-fault rates (~350 ms/layer during prefill).  Instead, invert
+ * the weight-server repack device->device into two persistent scratch
+ * buffers (gate + up, ~553 MiB each at the V4-Flash shape) tagged by model
+ * offset; a chunked prefill refills each per layer (~10 ms/layer).
+ *
+ * Returns the raw-layout scratch pointer, or NULL to keep the caller's mmap
+ * fallback (alloc/launch failure, kill switch, or active graph capture --
+ * a captured fill would bake one layer's tensor choice into the graph while
+ * the tag cache assumes the fill really ran).  Fill is launched on the
+ * caller's consuming stream so ordering is free.
+ * Kill switch: DS4_CUDA_MOE_NO_IQ2_DEREPACK=1. */
+static const char *cuda_moe_iq2_derepack_scratch(
+        int which,                 /* 0 = gate, 1 = up */
+        const char *art,
+        uint64_t model_offset,
+        uint64_t raw_bytes,
+        uint32_t expert_mid_dim,
+        uint32_t expert_in_dim,
+        uint32_t n_total_expert,
+        cudaStream_t stream) {
+    static int init = 0;
+    static uint32_t enabled = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_MOE_NO_IQ2_DEREPACK");
+        if (s && *s && strcmp(s, "0") != 0) enabled = 0;
+    }
+    if (!enabled || which < 0 || which > 1 || !art || raw_bytes == 0) return NULL;
+    if (ds4_capture_active()) return NULL;
+    static void    *buf[2]       = {NULL, NULL};
+    static uint64_t buf_bytes[2] = {0, 0};
+    static uint64_t tag[2]       = {UINT64_MAX, UINT64_MAX};
+    if (buf_bytes[which] < raw_bytes) {
+        if (buf[which]) { (void)cudaFree(buf[which]); buf[which] = NULL; buf_bytes[which] = 0; tag[which] = UINT64_MAX; }
+        cudaError_t err = cudaMalloc(&buf[which], raw_bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: iq2 derepack scratch alloc failed (%.1f MiB): %s; using mmap raw\n",
+                    (double)raw_bytes / (1024.0 * 1024.0), cudaGetErrorString(err));
+            buf[which] = NULL;
+            enabled = 0;   /* don't retry the alloc every layer */
+            return NULL;
+        }
+        buf_bytes[which] = raw_bytes;
+        tag[which] = UINT64_MAX;
+        fprintf(stderr, "ds4: iq2 derepack scratch active (%s, %.1f MiB)\n",
+                which == 0 ? "gate" : "up", (double)raw_bytes / (1024.0 * 1024.0));
+    }
+    if (tag[which] != model_offset) {
+        if (ds4_mmq_iq2_xxs_aligned_derepack(
+                art, buf[which],
+                (int)expert_mid_dim, (int)expert_in_dim, (int)n_total_expert,
+                stream) != 0) {
+            tag[which] = UINT64_MAX;
+            return NULL;
+        }
+        tag[which] = model_offset;
+    }
+    return (const char *)buf[which];
+}
+
 /* FD Inc2b: attention output_a multi-column native ceiling.  n_tokens in
  * [2, max] takes grouped_q8_0_a_preq_warp8_mc_kernel (one weight read for
  * all columns) instead of the cublas f16 strided-batched GEMM; beyond it
@@ -18644,6 +18707,11 @@ static int routed_moe_launch(
                     (int)n_expert_used, clamp, moe_stream);
                 if (rc == 0) {
                     gate_up_fused = 1;
+                    static int logged = 0;
+                    if (!logged) {
+                        logged = 1;
+                        fprintf(stderr, "ds4: MoE decode using aligned fused gate+up+swiglu (M1-Inc2)\n");
+                    }
                 } else {
                     fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec returned %d; falling back\n", rc);
                 }
@@ -19090,7 +19158,25 @@ mmq_moe_path:
                 goto mmq_moe_fallback;
             }
         } else {
-            rc = ds4_mmq_iq2_xxs_moe_pair(gate_w, up_w, (const float *)x->ptr,
+            /* M1-Inc2b: when the raw gate/up spans were excluded from the
+             * upload (--repack-iq2-aligned), gate_w/up_w point at the client
+             * mmap; de-repack the aligned artifacts into the persistent
+             * device scratch instead (same stream as the consuming pair
+             * launch, so ordering is free).  NULL keeps the mmap fallback. */
+            const char *gate_mmq = gate_w;
+            const char *up_mmq = up_w;
+            if (gate_iq2_aligned && up_iq2_aligned && cuda_moe_iq2_aligned_enabled()) {
+                const char *g = cuda_moe_iq2_derepack_scratch(
+                    0, gate_iq2_aligned, gate_offset, gate_bytes,
+                    expert_mid_dim, expert_in_dim, n_total_expert,
+                    ds4_mmq_stream_for_call());
+                const char *u = g ? cuda_moe_iq2_derepack_scratch(
+                    1, up_iq2_aligned, up_offset, gate_bytes,
+                    expert_mid_dim, expert_in_dim, n_total_expert,
+                    ds4_mmq_stream_for_call()) : NULL;
+                if (g && u) { gate_mmq = g; up_mmq = u; }
+            }
+            rc = ds4_mmq_iq2_xxs_moe_pair(gate_mmq, up_mmq, (const float *)x->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)gate->ptr, (float *)up->ptr,
                                           (int)expert_mid_dim, (int)expert_in_dim,

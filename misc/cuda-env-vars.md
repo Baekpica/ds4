@@ -178,6 +178,16 @@ The bandwidth figure is informational; we don't tier on it.
   the artifacts AND the raw exclusion remains, forcing every consumer onto
   the mmap substrate). Parity gate: `cuda/mmq/test/test_iq2_aligned_entry.cu`.
 
+- `DS4_CUDA_MOE_NO_IQ2_DEREPACK=1`. Kill switch for the M1-Inc2b raw-layout
+  device scratch. With repacked artifacts present, the prefill MMQ tile path
+  no longer reads the excluded gate/up ranges from the client mmap; it
+  inverts the repack device->device (`ds4_mmq_iq2_xxs_aligned_derepack`)
+  into two persistent ~528 MiB scratch buffers, refilled per layer
+  (~4.8 ms/tensor at ~233 GB/s), byte-exact. A/B on GB10, 15.2k-token
+  prefill: 50-55 s vs 391-394 s on the mmap fallback (7.9x). One-shot boot
+  log: `iq2 derepack scratch active`. Disabling restores the mmap-raw
+  behavior above; decode (`n_tokens=1`) is unaffected either way.
+
 - `DS4_CUDA_MMQ_X_MAX=N`. Clip `get_mmq_x_max_host` to N (rounded down to a
   multiple of 8) when sweeping tile widths. Diagnostic only; the vanilla
   128 wins on sm_120.

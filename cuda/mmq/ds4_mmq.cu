@@ -2185,6 +2185,57 @@ extern "C" int ds4_mmq_q4_K_moe_vec(
         n_tokens, n_experts, n_expert_used, stream);
 }
 
+// M1-Inc2b: exact inverse of the weight-server repack
+// (repack_iq2_xxs_aligned_kernel, tools/ds4_weight_server.cu): aligned-SoA
+// artifact -> raw block_iq2_xxs byte stream (66B = [half d][8 x uint2
+// codes]).  Device->device fill of a raw-layout scratch so the batched/mmq
+// consumers keep their layout while the raw spans stay excluded from the
+// upload.  One thread per (block, pair); p==0 additionally writes the
+// 2-byte scale.  Destination blocks are 66B so stores are byte-granular.
+__global__ void iq2_xxs_aligned_derepack_kernel(
+        unsigned char     *raw,        // [nblk * 66]
+        const uint2       *qs,         // 64B-aligned code pairs
+        const __half      *dq,         // block scales
+        uint64_t           nblk)
+{
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nblk * 8ull) return;
+    const uint64_t blk = i >> 3;
+    const uint32_t p = (uint32_t)(i & 7u);
+    unsigned char *dst = raw + blk * 66ull;
+    if (p == 0u) {
+        const uint16_t h = __half_as_ushort(dq[blk]);
+        memcpy(dst, &h, 2u);
+    }
+    const uint2 v = qs[blk * 8ull + p];
+    memcpy(dst + 2u + (uint64_t)p * 8u, &v, 8u);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
+        const void * W_aligned, void * raw_out,
+        int M, int K, int n_experts, cudaStream_t stream) {
+    const char *tag = "ds4_mmq_iq2_xxs_aligned_derepack";
+    if (!W_aligned || !raw_out) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M <= 0 || K <= 0 || n_experts <= 0 || K % 256 != 0) return -1;
+    const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
+    const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+    const uint64_t n_threads = nblk * 8ull;
+    iq2_xxs_aligned_derepack_kernel<<<(unsigned)((n_threads + 255ull) / 256ull), 256, 0, stream>>>(
+        (unsigned char *)raw_out,
+        (const uint2 *)((const char *)W_aligned + dq_bytes),
+        (const __half *)W_aligned,
+        nblk);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
 extern "C" uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts) {
     if (M <= 0 || K <= 0 || n_experts <= 0 || K % 256 != 0) return 0;
     const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);

@@ -298,6 +298,19 @@ int ds4_mmq_q4_K_moe_vec(
 // the caller can fall back).
 uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts);
 
+// M1-Inc2b: exact inverse of the weight-server repack.  Fills raw_out
+// (nblk * 66 bytes, raw block_iq2_xxs byte stream) from an aligned artifact,
+// device->device on `stream`.  Lets the batched/mmq raw-layout consumers run
+// from a device scratch instead of the client mmap when the raw spans were
+// excluded from the upload.
+int ds4_mmq_iq2_xxs_aligned_derepack(
+    const void    * W_aligned,
+    void          * raw_out,
+    int             M,
+    int             K,
+    int             n_experts,
+    cudaStream_t    stream);
+
 int ds4_mmq_iq2_xxs_aligned_moe_vec(
     const void    * W_aligned,
     const float   * X_f32,

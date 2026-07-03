@@ -99,6 +99,34 @@ int main(int argc, char **argv) {
     cudaStream_t stream; CK(cudaStreamCreate(&stream));
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
 
+    // ---- de-repack round-trip (M1-Inc2b): artifact -> raw must be byte-exact
+    {
+        uint8_t *dRaw2; CK(cudaMalloc(&dRaw2, W.size()));
+        CK(cudaMemset(dRaw2, 0xAB, W.size()));
+        const int drc = ds4_mmq_iq2_xxs_aligned_derepack(dArt, dRaw2, M, K, n_experts, stream);
+        if (drc != 0) { printf("derepack rc=%d\n", drc); return 1; }
+        CK(cudaStreamSynchronize(stream));
+        std::vector<uint8_t> RT(W.size());
+        CK(cudaMemcpy(RT.data(), dRaw2, W.size(), cudaMemcpyDeviceToHost));
+        if (memcmp(RT.data(), W.data(), W.size()) != 0) {
+            size_t off = 0; while (off < W.size() && RT[off] == W[off]) off++;
+            printf("derepack round-trip MISMATCH at byte %zu\n", off);
+            return 1;
+        }
+        CK(cudaEventRecord(e0, stream));
+        const int dr_iters = 50;
+        for (int i = 0; i < dr_iters; i++)
+            (void)ds4_mmq_iq2_xxs_aligned_derepack(dArt, dRaw2, M, K, n_experts, stream);
+        CK(cudaEventRecord(e1, stream));
+        CK(cudaStreamSynchronize(stream));
+        float ms_dr = 0.0f; CK(cudaEventElapsedTime(&ms_dr, e0, e1));
+        ms_dr /= dr_iters;
+        printf("  derepack round-trip: byte-exact PASS, %.3f ms/fill -> %.1f GB/s (%.1f MB tensor)\n",
+               ms_dr, (double)(ART.size() + W.size()) / ms_dr / 1e6,
+               (double)W.size() / 1e6);
+        CK(cudaFree(dRaw2));
+    }
+
     // ---- baseline: raw-layout production vec entry -------------------------
     int rc = ds4_mmq_iq2_xxs_moe_vec(dW, dX, dIds, dOutBase, M, K, 1, n_experts, n_slots, stream);
     if (rc != 0) { printf("baseline moe_vec rc=%d\n", rc); return 1; }
