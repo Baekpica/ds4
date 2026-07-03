@@ -18623,12 +18623,37 @@ static int routed_moe_launch(
                 if (mmvq_prof_ev[0]) (void)cudaEventRecord(mmvq_prof_ev[0], ds4_current_stream());
             }
 
+            /* M1-Inc2: aligned-SoA fused gate+up+SwiGLU.  One activation
+             * quantize + one warp-per-row launch over both aligned artifacts
+             * with the clamp/SwiGLU/router-weight epilogue folded in
+             * (nonfinite zeroed in-kernel; no sanitize pass).  Entry-level
+             * A/B: 0.130 ms (2x aligned Inc1) -> 0.118, both DRAM-honest at
+             * ~218 GB/s, plus the swiglu launch removed.  Diagnostic env
+             * paths below still take priority when explicitly requested. */
+            if (n_tokens == 1u && gate_iq2_aligned && up_iq2_aligned &&
+                cuda_moe_iq2_aligned_enabled() &&
+                !use_q8k_gate_in_vec && !use_q81_fused_moe && !use_pair_raw_vec) {
+                rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+                    gate_iq2_aligned, up_iq2_aligned,
+                    (const float *)x->ptr,
+                    (const int32_t *)selected->ptr,
+                    (const float *)weights->ptr,
+                    (float *)mid->ptr,
+                    (int)expert_mid_dim, (int)expert_in_dim,
+                    (int)n_tokens, (int)n_total_expert,
+                    (int)n_expert_used, clamp, moe_stream);
+                if (rc == 0) {
+                    gate_up_fused = 1;
+                } else {
+                    fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec returned %d; falling back\n", rc);
+                }
+            }
             /* 1. Gate + up + SwiGLU.  For V4 top_k=6, fuse the two
              *    canonical-Q8_1 matvecs and the clamp/SwiGLU/router-weight
              *    epilogue into mid directly.  This removes one activation
              *    quantize, one vector matmul sequence, and the separate
              *    swiglu launch while preserving the Q8_1 dot path. */
-            if (use_q8k_gate_in_vec) {
+            if (!gate_up_fused && use_q8k_gate_in_vec) {
                 const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
                 const uint64_t xq_bytes = (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
                 if (expert_in_dim % CUDA_QK_K == 0u && down->bytes >= xq_bytes) {

@@ -77,15 +77,22 @@ int main(int argc, char **argv) {
         memcpy(&ART[dq_bytes + (uint64_t)blk * 64u], &W[blk * 66 + 2], 64);
     }
 
-    uint8_t *dW, *dArt; float *dX, *dOutBase, *dOutAl; int32_t *dIds;
+    // dArt2: identical bytes at a DIFFERENT address, used as the "up" stream
+    // in the pair/fused entries.  Passing dArt twice lets the second stream's
+    // reads ride the L2 lines the first stream just fetched, inflating the
+    // effective rate past the DRAM ceiling; production gate/up are distinct
+    // 553 MB artifacts.
+    uint8_t *dW, *dArt, *dArt2; float *dX, *dOutBase, *dOutAl; int32_t *dIds;
     CK(cudaMalloc(&dW, W.size()));
     CK(cudaMalloc(&dArt, ART.size()));
+    CK(cudaMalloc(&dArt2, ART.size()));
     CK(cudaMalloc(&dX, sizeof(float) * K));
     CK(cudaMalloc(&dOutBase, sizeof(float) * n_slots * M));
     CK(cudaMalloc(&dOutAl, sizeof(float) * n_slots * M));
     CK(cudaMalloc(&dIds, sizeof(int32_t) * ids.size()));
     CK(cudaMemcpy(dW, W.data(), W.size(), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dArt, ART.data(), ART.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dArt2, dArt, ART.size(), cudaMemcpyDeviceToDevice));
     CK(cudaMemcpy(dX, X.data(), sizeof(float) * K, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dIds, ids.data(), sizeof(int32_t) * ids.size(), cudaMemcpyHostToDevice));
 
@@ -123,29 +130,113 @@ int main(int argc, char **argv) {
     float ms_al = 0.0f; CK(cudaEventElapsedTime(&ms_al, e0, e1));
     ms_al /= iters;
 
+    // ---- Inc2 variant P: pair (one quantize, one z=2 launch) ----------------
+    float *dOutUpP; CK(cudaMalloc(&dOutUpP, sizeof(float) * n_slots * M));
+    rc = ds4_mmq_iq2_xxs_aligned_moe_pair_vec(dArt, dArt2, dX, dIds, dOutAl, dOutUpP,
+                                              M, K, 1, n_experts, n_slots, stream);
+    if (rc != 0) { printf("pair entry rc=%d\n", rc); return 1; }
+    CK(cudaStreamSynchronize(stream));
+    CK(cudaEventRecord(e0, stream));
+    for (int i = 0; i < iters; i++)
+        (void)ds4_mmq_iq2_xxs_aligned_moe_pair_vec(dArt, dArt2, dX,
+                                                   dIds + (i % n_idsets) * n_slots,
+                                                   dOutAl, dOutUpP, M, K, 1, n_experts, n_slots, stream);
+    CK(cudaEventRecord(e1, stream));
+    CK(cudaStreamSynchronize(stream));
+    float ms_pair = 0.0f; CK(cudaEventElapsedTime(&ms_pair, e0, e1));
+    ms_pair /= iters;
+
+    // ---- Inc2 variant F: fused gate+up+swiglu -> mid ------------------------
+    float *dMid, *dSlotW; CK(cudaMalloc(&dMid, sizeof(float) * n_slots * M));
+    CK(cudaMalloc(&dSlotW, sizeof(float) * n_slots));
+    std::vector<float> slotw(n_slots);
+    for (int j = 0; j < n_slots; j++) slotw[j] = 0.5f + 0.1f * j;
+    CK(cudaMemcpy(dSlotW, slotw.data(), sizeof(float) * n_slots, cudaMemcpyHostToDevice));
+    const float clampv = 10.0f;
+    rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(dArt, dArt2, dX, dIds, dSlotW, dMid,
+                                                     M, K, 1, n_experts, n_slots, clampv, stream);
+    if (rc != 0) { printf("fused entry rc=%d\n", rc); return 1; }
+    CK(cudaStreamSynchronize(stream));
+    CK(cudaEventRecord(e0, stream));
+    for (int i = 0; i < iters; i++)
+        (void)ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(dArt, dArt2, dX,
+                                                          dIds + (i % n_idsets) * n_slots,
+                                                          dSlotW, dMid, M, K, 1, n_experts, n_slots,
+                                                          clampv, stream);
+    CK(cudaEventRecord(e1, stream));
+    CK(cudaStreamSynchronize(stream));
+    float ms_fused = 0.0f; CK(cudaEventElapsedTime(&ms_fused, e0, e1));
+    ms_fused /= iters;
+
+    // NOTE: pair/fused per-iter weight bytes are 2x slot_gb (gate + up); the
+    // baseline-equivalent cost of one iter is 2x the single-entry time.
+
     // ---- parity on idset 0 --------------------------------------------------
     (void)ds4_mmq_iq2_xxs_moe_vec(dW, dX, dIds, dOutBase, M, K, 1, n_experts, n_slots, stream);
     (void)ds4_mmq_iq2_xxs_aligned_moe_vec(dArt, dX, dIds, dOutAl, M, K, 1, n_experts, n_slots, stream);
+    float *dPairG; CK(cudaMalloc(&dPairG, sizeof(float) * n_slots * M));
+    (void)ds4_mmq_iq2_xxs_aligned_moe_pair_vec(dArt, dArt2, dX, dIds, dPairG, dOutUpP,
+                                               M, K, 1, n_experts, n_slots, stream);
+    (void)ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(dArt, dArt2, dX, dIds, dSlotW, dMid,
+                                                      M, K, 1, n_experts, n_slots, clampv, stream);
     CK(cudaStreamSynchronize(stream));
-    std::vector<float> ob(n_slots * M), oa(n_slots * M);
+    std::vector<float> ob(n_slots * M), oa(n_slots * M), opg(n_slots * M), opu(n_slots * M), om(n_slots * M);
     CK(cudaMemcpy(ob.data(), dOutBase, sizeof(float) * ob.size(), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(oa.data(), dOutAl, sizeof(float) * oa.size(), cudaMemcpyDeviceToHost));
-    double max_rel = 0.0, max_abs = 0.0; int bad = 0;
-    for (size_t i = 0; i < ob.size(); i++) {
-        const double a = ob[i], b = oa[i];
-        const double ad = fabs(a - b);
-        const double rd = ad / (fabs(a) > 1e-3 ? fabs(a) : 1e-3);
-        if (ad > max_abs) max_abs = ad;
-        if (rd > max_rel) max_rel = rd;
-        if (rd > 2e-2 && ad > 1e-2) bad++;
+    CK(cudaMemcpy(opg.data(), dPairG, sizeof(float) * opg.size(), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(opu.data(), dOutUpP, sizeof(float) * opu.size(), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(om.data(), dMid, sizeof(float) * om.size(), cudaMemcpyDeviceToHost));
+
+    auto count_bad = [](const std::vector<float> &ref, const std::vector<float> &got,
+                        double *mr, double *ma) {
+        double max_rel = 0.0, max_abs = 0.0; int bad = 0;
+        for (size_t i = 0; i < ref.size(); i++) {
+            const double a = ref[i], b = got[i];
+            const double ad = fabs(a - b);
+            const double rd = ad / (fabs(a) > 1e-3 ? fabs(a) : 1e-3);
+            if (ad > max_abs) max_abs = ad;
+            if (rd > max_rel) max_rel = rd;
+            if (rd > 2e-2 && ad > 1e-2) bad++;
+        }
+        if (mr) *mr = max_rel;
+        if (ma) *ma = max_abs;
+        return bad;
+    };
+    double max_rel = 0.0, max_abs = 0.0;
+    int bad = count_bad(ob, oa, &max_rel, &max_abs);
+    // pair: gate and up both computed from dArt, so both must match the
+    // aligned single-entry output exactly (same kernel math, same inputs).
+    int bad_pair = count_bad(ob, opg, nullptr, nullptr) + count_bad(ob, opu, nullptr, nullptr);
+    // fused: expected mid from the baseline outputs + the exact epilogue.
+    std::vector<float> em(n_slots * M);
+    for (int s = 0; s < n_slots; s++) {
+        for (int r = 0; r < M; r++) {
+            float g = ob[(size_t)s * M + r], u = g;
+            if (!std::isfinite(g)) g = 0.0f;
+            if (!std::isfinite(u)) u = 0.0f;
+            if (clampv > 1.0e-6f) {
+                if (g > clampv) g = clampv;
+                if (u > clampv) u = clampv;
+                if (u < -clampv) u = -clampv;
+            }
+            const float silu = g / (1.0f + expf(-g));
+            em[(size_t)s * M + r] = silu * u * slotw[s];
+        }
     }
+    int bad_mid = count_bad(em, om, nullptr, nullptr);
 
     printf("TEST_IQ2_ALIGNED_ENTRY  M=%d K=%d slots=%d experts=%d iters=%d (weights/iter %.1f MB)\n",
            M, K, n_slots, n_experts, iters, slot_gb * 1000.0);
-    printf("  baseline moe_vec : %.4f ms  -> %6.1f GB/s\n", ms_base, slot_gb / (ms_base / 1e3));
-    printf("  aligned  entry   : %.4f ms  -> %6.1f GB/s   (%+.1f%%)\n",
-           ms_al, slot_gb / (ms_al / 1e3), 100.0 * (ms_base / ms_al - 1.0));
-    printf("  parity: max_rel=%.3e max_abs=%.3e bad=%d -> %s\n",
-           max_rel, max_abs, bad, bad == 0 ? "PASS" : "FAIL");
-    return bad == 0 ? 0 : 2;
+    printf("  baseline moe_vec : %.4f ms  -> %6.1f GB/s   (x2 for gate+up: %.4f ms)\n",
+           ms_base, slot_gb / (ms_base / 1e3), 2.0f * ms_base);
+    printf("  aligned  entry   : %.4f ms  -> %6.1f GB/s   (%+.1f%%; x2: %.4f ms)\n",
+           ms_al, slot_gb / (ms_al / 1e3), 100.0 * (ms_base / ms_al - 1.0), 2.0f * ms_al);
+    printf("  pair     entry   : %.4f ms  -> %6.1f GB/s   (vs 2x aligned %+.1f%%)\n",
+           ms_pair, 2.0 * slot_gb / (ms_pair / 1e3), 100.0 * (2.0f * ms_al / ms_pair - 1.0));
+    printf("  fused    entry   : %.4f ms  -> %6.1f GB/s   (vs 2x aligned %+.1f%%)\n",
+           ms_fused, 2.0 * slot_gb / (ms_fused / 1e3), 100.0 * (2.0f * ms_al / ms_fused - 1.0));
+    printf("  parity: aligned max_rel=%.3e max_abs=%.3e bad=%d | pair bad=%d | fused-mid bad=%d -> %s\n",
+           max_rel, max_abs, bad, bad_pair, bad_mid,
+           (bad == 0 && bad_pair == 0 && bad_mid == 0) ? "PASS" : "FAIL");
+    return (bad == 0 && bad_pair == 0 && bad_mid == 0) ? 0 : 2;
 }

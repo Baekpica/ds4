@@ -310,6 +310,44 @@ int ds4_mmq_iq2_xxs_aligned_moe_vec(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// M1-Inc2 variants over the same aligned artifacts (n_tokens == 1 only).
+//
+// _pair_vec: one activation quantize + one launch computes both raw gate and
+// up outputs (nonfinite zeroed in-kernel; no sanitize pass needed).  The
+// caller still runs its clamp-aware SwiGLU.
+//
+// _gate_up_mid_vec: additionally folds the clamp/SwiGLU/router-weight
+// epilogue (identical semantics to ds4_mmq_moe_gate_up_mid_q8_1_qwarp32) and
+// writes mid[slot * M + row] directly.
+int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
+    const void    * W_gate_aligned,
+    const void    * W_up_aligned,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * gate_out,
+    float         * up_out,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+    const void    * W_gate_aligned,
+    const void    * W_up_aligned,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * weights,
+    float         * mid_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
 // Fused down+sum vector entries for routed MoE with top_k=6. These preserve
 // the canonical Q8_1 activation quantization used by the regular _moe_vec
 // path, but avoid materializing [token, slot, out_dim] down results and avoid

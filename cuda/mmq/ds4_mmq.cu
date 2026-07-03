@@ -1069,6 +1069,154 @@ __global__ void iq2_xxs_aligned_moe_vec_kernel(
     if (lane == 0) out[(long long)slot * M + row] = acc;
 }
 
+// M1-Inc2 variant P: one launch covers gate and up (blockIdx.z selects the
+// weight stream); nonfinite accs are zeroed in-kernel so no sanitize pass is
+// needed.  Same per-warp math as iq2_xxs_aligned_moe_vec_kernel.
+__global__ void iq2_xxs_aligned_moe_pair_vec_kernel(
+        float             *out_gate,   // [n_expert_used, M]
+        float             *out_up,     // [n_expert_used, M]
+        const uint2       *qs_gate,
+        const __half      *dq_gate,
+        const uint2       *qs_up,
+        const __half      *dq_up,
+        const block_q8_1  *x8,
+        const int32_t     *ids,
+        int                M,
+        int                nb)
+{
+    const int row  = blockIdx.x;
+    const int slot = blockIdx.y;
+    const int lane = threadIdx.x;
+    const uint2  *qs = blockIdx.z ? qs_up : qs_gate;
+    const __half *dq = blockIdx.z ? dq_up : dq_gate;
+    float        *out = blockIdx.z ? out_up : out_gate;
+    const long long rbase = ((long long)ids[slot] * M + row) * nb;
+
+    float acc = 0.0f;
+    for (int b0 = 0; b0 < nb; b0 += 4) {
+        const int b = b0 + (lane >> 3);
+        const int p = lane & 7;
+        const uint2 cw   = qs[(rbase + b) * 8 + p];
+        const uint32_t q2 = cw.x, aux32 = cw.y;
+        const uint8_t *aux8 = (const uint8_t *)&q2;
+
+        int sumi = 0;
+        const int q8i = (b * 256 + p * 32) / 32;
+        const int *u = (const int *)x8[q8i].qs;
+#pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8[k0 / 2]];
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+
+            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+            sumi = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi);
+
+            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+            sumi = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi);
+        }
+        const int ls = aux32 >> 27 | 1;
+        sumi = sumi * ls / 8;
+        const float d = __half2float(dq[rbase + b]) * __low2float(x8[q8i].ds);
+        acc += d * (float)sumi;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) {
+        if (!isfinite(acc)) acc = 0.0f;
+        out[(long long)slot * M + row] = acc;
+    }
+}
+
+// M1-Inc2 variant F: gate and up accumulated in the same warp (interleaved so
+// each q8 activation block is loaded once), clamp/SwiGLU/router-weight
+// epilogue folded in (semantics copied from
+// ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel) -> mid directly.  Replaces
+// quantize+gate+up+sanitize+swiglu with quantize+one launch.
+__global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
+        float             *mid,        // [n_expert_used, M]
+        const uint2       *qs_gate,
+        const __half      *dq_gate,
+        const uint2       *qs_up,
+        const __half      *dq_up,
+        const block_q8_1  *x8,
+        const int32_t     *ids,
+        const float       *weights,    // [n_expert_used] router weights (token 0)
+        int                M,
+        int                nb,
+        float              clamp)
+{
+    const int row  = blockIdx.x;
+    const int slot = blockIdx.y;
+    const int lane = threadIdx.x;
+    const long long rbase = ((long long)ids[slot] * M + row) * nb;
+
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+    for (int b0 = 0; b0 < nb; b0 += 4) {
+        const int b = b0 + (lane >> 3);
+        const int p = lane & 7;
+        const int q8i = (b * 256 + p * 32) / 32;
+        const int *u = (const int *)x8[q8i].qs;
+        const float d8 = __low2float(x8[q8i].ds);
+
+        const uint2 cwg = qs_gate[(rbase + b) * 8 + p];
+        const uint2 cwu = qs_up[(rbase + b) * 8 + p];
+        const uint8_t *aux8g = (const uint8_t *)&cwg.x;
+        const uint8_t *aux8u = (const uint8_t *)&cwu.x;
+
+        int sumi_g = 0;
+        int sumi_u = 0;
+#pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            {
+                const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8g[k0 / 2]];
+                const uint32_t signs = unpack_ksigns(cwg.y >> (7 * k0 / 2));
+                const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+                const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+                sumi_g = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi_g);
+                const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+                const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+                sumi_g = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi_g);
+            }
+            {
+                const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8u[k0 / 2]];
+                const uint32_t signs = unpack_ksigns(cwu.y >> (7 * k0 / 2));
+                const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+                const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+                sumi_u = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi_u);
+                const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+                const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+                sumi_u = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi_u);
+            }
+        }
+        const int ls_g = cwg.y >> 27 | 1;
+        const int ls_u = cwu.y >> 27 | 1;
+        acc_g += __half2float(dq_gate[rbase + b]) * d8 * (float)(sumi_g * ls_g / 8);
+        acc_u += __half2float(dq_up[rbase + b])   * d8 * (float)(sumi_u * ls_u / 8);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc_g += __shfl_down_sync(0xffffffffu, acc_g, off);
+        acc_u += __shfl_down_sync(0xffffffffu, acc_u, off);
+    }
+    if (lane == 0) {
+        float gate = acc_g;
+        float up = acc_u;
+        if (!isfinite(gate)) gate = 0.0f;
+        if (!isfinite(up)) up = 0.0f;
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        mid[(long long)slot * M + row] = silu * up * weights[slot];
+    }
+}
+
 template <ggml_type type>
 int ds4_mmq_moe_pair_raw_vec_impl(
         const char    * tag,
@@ -2042,6 +2190,116 @@ extern "C" uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts) {
     const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
     const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
     return dq_bytes + nblk * 64u;
+}
+
+// Shared single-token canonical-Q8_1 quantize for the aligned IQ2_XXS
+// entries.  Returns the device pointer (persistent scratch when enabled,
+// pool otherwise) or nullptr on failure; *pool must outlive the launches.
+static char *iq2_aligned_quantize_x1(
+        const char *tag, const float *X_f32, int K,
+        ggml_cuda_pool_alloc<char> *pool, cudaStream_t stream) {
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return nullptr;
+    }
+    ds4_pool_set_stream(stream);
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t  nbytes_q8_1 = (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+    char *ptr = nullptr;
+    if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
+        ptr = (char *)g_q81_scratch_ptr;
+    } else {
+        pool->alloc(ctx->pool(), nbytes_q8_1);
+        ptr = pool->get();
+    }
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)ptr,
+        GGML_TYPE_IQ2_XXS, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K,
+        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
+        stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+        return nullptr;
+    }
+    return ptr;
+}
+
+extern "C" int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
+        const void * W_gate_aligned, const void * W_up_aligned,
+        const float * X_f32, const int32_t * ids,
+        float * gate_out, float * up_out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    const char *tag = "ds4_mmq_iq2_xxs_aligned_moe_pair_vec";
+    if (!W_gate_aligned || !W_up_aligned || !X_f32 || !ids || !gate_out || !up_out) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (n_tokens != 1 || M <= 0 || K <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
+        n_expert_used > n_experts || K % 1024 != 0) {
+        return -1;
+    }
+    ggml_cuda_pool_alloc<char> q8_pool;
+    char *x8 = iq2_aligned_quantize_x1(tag, X_f32, K, &q8_pool, stream);
+    if (!x8) return -2;
+
+    const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
+    const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+    dim3 grid((unsigned)M, (unsigned)n_expert_used, 2);
+    iq2_xxs_aligned_moe_pair_vec_kernel<<<grid, 32, 0, stream>>>(
+        gate_out, up_out,
+        (const uint2 *)((const char *)W_gate_aligned + dq_bytes),
+        (const __half *)W_gate_aligned,
+        (const uint2 *)((const char *)W_up_aligned + dq_bytes),
+        (const __half *)W_up_aligned,
+        (const block_q8_1 *)x8, ids, M, K / 256);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+        const void * W_gate_aligned, const void * W_up_aligned,
+        const float * X_f32, const int32_t * ids, const float * weights,
+        float * mid_f32,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        float clamp, cudaStream_t stream) {
+    const char *tag = "ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec";
+    if (!W_gate_aligned || !W_up_aligned || !X_f32 || !ids || !weights || !mid_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (n_tokens != 1 || M <= 0 || K <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
+        n_expert_used > n_experts || K % 1024 != 0) {
+        return -1;
+    }
+    ggml_cuda_pool_alloc<char> q8_pool;
+    char *x8 = iq2_aligned_quantize_x1(tag, X_f32, K, &q8_pool, stream);
+    if (!x8) return -2;
+
+    const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
+    const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+    dim3 grid((unsigned)M, (unsigned)n_expert_used, 1);
+    iq2_xxs_aligned_moe_gate_up_mid_kernel<<<grid, 32, 0, stream>>>(
+        mid_f32,
+        (const uint2 *)((const char *)W_gate_aligned + dq_bytes),
+        (const __half *)W_gate_aligned,
+        (const uint2 *)((const char *)W_up_aligned + dq_bytes),
+        (const __half *)W_up_aligned,
+        (const block_q8_1 *)x8, ids, weights, M, K / 256, clamp);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
 }
 
 extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
