@@ -1454,7 +1454,9 @@ static bool tensor_is_q8_aligned_candidate(const tensor_record &t) {
     if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
     if (t.dims[0] == 0 || t.dims[1] == 0) return false;
     if (t.dims[0] % 1024u != 0) return false;
-    if (t.bytes < 4u * 1024u * 1024u || t.bytes % 34u != 0) return false;
+    /* 2 MiB floor: attn_kv (512 x 4096, 2.2 MiB) is an Inc4 pair-kernel
+     * consumer; anything smaller isn't worth an artifact. */
+    if (t.bytes < 2u * 1024u * 1024u || t.bytes % 34u != 0) return false;
     if (t.name.find("token_embd") != std::string::npos) return false;
     return true;
 }

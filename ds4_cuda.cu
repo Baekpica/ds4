@@ -4499,6 +4499,26 @@ __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const in
     return dot;
 }
 
+/* M1-Inc4: per-block dot against the aligned-SoA Q8_0 artifact (kind 5):
+ * qs32 is 16B-aligned (two int4 loads), xqb is the 16B-aligned prequant
+ * buffer.  Same integer result as dot_i8_block(n==32), so kernels that
+ * swap this in keep bit-identical accumulation. */
+__device__ __forceinline__ static int32_t dot_i8x32_aligned(const int8_t *qs32, const int8_t *xqb) {
+    const int4 w0 = *(const int4 *)qs32;
+    const int4 w1 = *(const int4 *)(qs32 + 16);
+    const int *u = (const int *)xqb;
+    int sumi = 0;
+    sumi = __dp4a(w0.x, u[0], sumi);
+    sumi = __dp4a(w0.y, u[1], sumi);
+    sumi = __dp4a(w0.z, u[2], sumi);
+    sumi = __dp4a(w0.w, u[3], sumi);
+    sumi = __dp4a(w1.x, u[4], sumi);
+    sumi = __dp4a(w1.y, u[5], sumi);
+    sumi = __dp4a(w1.z, u[6], sumi);
+    sumi = __dp4a(w1.w, u[7], sumi);
+    return sumi;
+}
+
 __global__ static DS4_CUDA_UNUSED void matmul_q8_0_kernel(
         float *out,
         const unsigned char *w,
@@ -4685,6 +4705,51 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     }
 }
 
+/* M1-Inc4: aligned-SoA variant of the pair kernel.  Weight reads go through
+ * the kind-5 artifact ([half dq[nblk]][pad64][int8 qs[nblk*32]]); loop and
+ * accumulation order identical to the raw kernel (bit-identical outputs;
+ * proto_q8_warp8: q_a+kv 190->211, shared gate+up 206->232 GB/s).
+ * Requires in_dim % 1024 == 0 (full 32-byte blocks). */
+__global__ static void matmul_q8_0_pair_preq_aligned_warp8_kernel(
+        float *out0,
+        float *out1,
+        const int8_t *qs0,
+        const __half *dq0,
+        const int8_t *qs1,
+        const __half *dq1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t blocks) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const uint64_t rbase = row * blocks;
+    const int in0 = row < out0_dim;
+    const int in1 = row < out1_dim;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const int8_t *xqb = xq + b * 32;
+        const float xs = xscale[b];
+        if (in0) {
+            const int dot = dot_i8x32_aligned(qs0 + (rbase + b) * 32u, xqb);
+            acc0 += __half2float(dq0[rbase + b]) * xs * (float)dot;
+        }
+        if (in1) {
+            const int dot = dot_i8x32_aligned(qs1 + (rbase + b) * 32u, xqb);
+            acc1 += __half2float(dq1[rbase + b]) * xs * (float)dot;
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0) {
+        if (row < out0_dim) out0[row] = acc0;
+        if (row < out1_dim) out1[row] = acc1;
+    }
+}
+
 __global__ static void matmul_q8_0_pair_preq_batch_warp8_kernel(
         float *out0,
         float *out1,
@@ -4764,6 +4829,53 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         const int8_t *xqb = xq + b * 32;
         int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
         acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        const uint32_t d = (uint32_t)row;
+        block_out[d] = acc;
+        float block_v = acc;
+        if (has_add) block_v += block_add[d];
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
+                const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
+                hc_acc += comb_v * res_v;
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
+    }
+}
+
+/* M1-Inc4: aligned-SoA variant of the hc-expand kernel (kind-5 artifact
+ * weight reads, identical epilogue and accumulation order; proto_q8_warp8:
+ * output_b 210->230, shared_down 197->216 GB/s).  in_dim % 1024 == 0. */
+__global__ static void matmul_q8_0_hc_expand_preq_aligned_warp8_kernel(
+        float *out_hc,
+        float *block_out,
+        const float *block_add,
+        const float *residual_hc,
+        const float *split,
+        const int8_t *qs_art,
+        const __half *dq_art,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint64_t blocks,
+        int has_add) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const uint64_t rbase = row * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const int dot = dot_i8x32_aligned(qs_art + (rbase + b) * 32u, xq + b * 32u);
+        acc += __half2float(dq_art[rbase + b]) * xscale[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) {
@@ -4986,6 +5098,40 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
         const int8_t *xqb = xqr + b * 32;
         int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
         acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) low[tok * low_dim + row] = acc;
+}
+
+/* M1-Inc4: aligned-SoA variant of the grouped output_a kernel (kind-5
+ * artifact over the whole tensor, row-linear blocks; proto_q8_warp8:
+ * 219->235 GB/s).  group_dim % 1024 == 0. */
+__global__ static void grouped_q8_0_a_preq_aligned_warp8_kernel(
+        float *low,
+        const int8_t *qs_art,
+        const __half *dq_art,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint32_t n_tokens,
+        uint64_t blocks) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row >= low_dim || tok >= n_tokens) return;
+
+    const uint64_t group = row / rank;
+    const uint64_t rbase = row * blocks;
+    const uint64_t xrow = tok * (uint64_t)n_groups + group;
+    const int8_t *xqr = xq + xrow * blocks * 32;
+    const float *xsr = xscale + xrow * blocks;
+    float acc = 0.0f;
+
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const int dot = dot_i8x32_aligned(qs_art + (rbase + b) * 32u, xqr + b * 32u);
+        acc += __half2float(dq_art[rbase + b]) * xsr[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) low[tok * low_dim + row] = acc;
@@ -13323,6 +13469,45 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     if (n_tok == 1) {
+        /* M1-Inc4: aligned-SoA artifacts for BOTH streams, else raw kernel
+         * (raw q8 stays served — additive artifacts, safe fallback). */
+        const char *w0_al = NULL;
+        const char *w1_al = NULL;
+        if (in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
+            const uint64_t b0 = ds4_mmq_q8_0_aligned_bytes((int)out0_dim, (int)in_dim);
+            const uint64_t b1 = ds4_mmq_q8_0_aligned_bytes((int)out1_dim, (int)in_dim);
+            if (b0 != 0 && b1 != 0) {
+                w0_al = cuda_derived_weight_ptr(model_map, weight0_offset, weight0_bytes,
+                                                CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+                                                in_dim, out0_dim, 1u, b0, "q8_pair0");
+                w1_al = w0_al
+                    ? cuda_derived_weight_ptr(model_map, weight1_offset, weight1_bytes,
+                                              CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+                                              in_dim, out1_dim, 1u, b1, "q8_pair1")
+                    : NULL;
+            }
+        }
+        if (w0_al && w1_al) {
+            const uint64_t dqb0 = (out0_dim * blocks * 2u + 63u) & ~63ull;
+            const uint64_t dqb1 = (out1_dim * blocks * 2u + 63u) & ~63ull;
+            matmul_q8_0_pair_preq_aligned_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
+                    (float *)out0->ptr,
+                    (float *)out1->ptr,
+                    (const int8_t *)(w0_al + dqb0),
+                    (const __half *)w0_al,
+                    (const int8_t *)(w1_al + dqb1),
+                    (const __half *)w1_al,
+                    xq,
+                    xscale,
+                    out0_dim,
+                    out1_dim,
+                    blocks);
+            static int logged_pair_al = 0;
+            if (!logged_pair_al) {
+                logged_pair_al = 1;
+                fprintf(stderr, "ds4: q8 pair decode using aligned Q8_0 artifacts (M1-Inc4)\n");
+            }
+        } else
         matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
                 (float *)out0->ptr,
                 (float *)out1->ptr,
@@ -13426,6 +13611,43 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled_body(
     const int use_dp4a = cuda_q8_use_dp4a();
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, ds4_current_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
+    /* M1-Inc4: aligned-SoA artifact path (weight server --repack-q8-aligned,
+     * additive).  Bit-identical accumulation to the raw kernel; raw stays
+     * served so the fallback is always a device read. */
+    const char *w_al = NULL;
+    if (in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
+        const uint64_t q8_al_bytes = ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
+        w_al = q8_al_bytes != 0
+            ? cuda_derived_weight_ptr(model_map, weight_offset, weight_bytes,
+                                      CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+                                      in_dim, out_dim, 1u, q8_al_bytes,
+                                      label ? label : "q8_hc_expand")
+            : NULL;
+    }
+    if (w_al) {
+        const uint64_t nblk = out_dim * blocks;
+        const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+        matmul_q8_0_hc_expand_preq_aligned_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
+                (float *)out_hc->ptr,
+                (float *)block_out->ptr,
+                block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                (const int8_t *)(w_al + dq_bytes),
+                (const __half *)w_al,
+                xq,
+                xscale,
+                out_dim,
+                n_embd,
+                n_hc,
+                blocks,
+                block_add ? 1 : 0);
+        static int logged_hc_al = 0;
+        if (!logged_hc_al) {
+            logged_hc_al = 1;
+            fprintf(stderr, "ds4: hc_expand decode using aligned Q8_0 artifacts (M1-Inc4)\n");
+        }
+    } else
     matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
@@ -15603,6 +15825,30 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                        n_comp, window, ratio, n_head, head_dim,
                                        comp_fp8, comp_scale);
 }
+/* M1-Inc4: kind-5 aligned artifact probe for the grouped output_a kernel
+ * (whole-tensor artifact, row-linear blocks).  NULL -> raw path (raw q8
+ * stays served; artifacts are additive). */
+static const char *cuda_grouped_out_a_aligned_probe(const void *model_map,
+                                                    uint64_t out_a_offset,
+                                                    uint64_t out_a_bytes,
+                                                    uint64_t group_dim,
+                                                    uint64_t low_dim) {
+    if (group_dim % 1024u != 0 || !cuda_q8_aligned_enabled()) return NULL;
+    const uint64_t b = ds4_mmq_q8_0_aligned_bytes((int)low_dim, (int)group_dim);
+    if (b == 0) return NULL;
+    const char *p = cuda_derived_weight_ptr((void *)model_map, out_a_offset, out_a_bytes,
+                                            CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+                                            group_dim, low_dim, 1u, b, "attn_out_a");
+    if (p) {
+        static int logged_grouped_al = 0;
+        if (!logged_grouped_al) {
+            logged_grouped_al = 1;
+            fprintf(stderr, "ds4: grouped output_a using aligned Q8_0 artifacts (M1-Inc4)\n");
+        }
+    }
+    return p;
+}
+
 static int cuda_attention_output_q8_batch_impl(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low, ds4_gpu_tensor *group_tmp,
         ds4_gpu_tensor *low_tmp, const void *model_map, uint64_t model_size,
@@ -15771,6 +16017,22 @@ static int cuda_attention_output_q8_batch_impl(
                                                  use_dp4a,
                                                  ds4_current_stream())) {
             dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
+            const char *oa_al = cuda_grouped_out_a_aligned_probe(model_map, out_a_offset,
+                                                                 out_a_bytes, group_dim, low_dim);
+            if (oa_al) {
+                const uint64_t nblk = low_dim * blocks_a;
+                const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+                grouped_q8_0_a_preq_aligned_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>(
+                        (float *)low->ptr,
+                        (const int8_t *)(oa_al + dq_bytes),
+                        (const __half *)oa_al,
+                        xq,
+                        xscale,
+                        rank,
+                        n_groups,
+                        n_tokens,
+                        blocks_a);
+            } else
             grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>((float *)low->ptr,
                                                               out_a,
                                                               xq,
@@ -15868,6 +16130,22 @@ static int cuda_attention_output_low_q8_impl(
                                             blocks_a);
     if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
+    const char *oa_al = cuda_grouped_out_a_aligned_probe(model_map, out_a_offset,
+                                                         out_a_bytes, group_dim, low_dim);
+    if (oa_al) {
+        const uint64_t nblk = low_dim * blocks_a;
+        const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+        grouped_q8_0_a_preq_aligned_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>(
+                (float *)low->ptr,
+                (const int8_t *)(oa_al + dq_bytes),
+                (const __half *)oa_al,
+                xq,
+                xscale,
+                rank,
+                n_groups,
+                1,
+                blocks_a);
+    } else
     grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>((float *)low->ptr,
                                                       out_a,
                                                       xq,
@@ -15925,6 +16203,22 @@ extern "C" int ds4_gpu_attention_output_low_q8_batch_tensor(
                                             blocks_a);
     if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8_batch prequant launch")) return 0;
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
+    const char *oa_al = cuda_grouped_out_a_aligned_probe(model_map, out_a_offset,
+                                                         out_a_bytes, group_dim, low_dim);
+    if (oa_al) {
+        const uint64_t nblk = low_dim * blocks_a;
+        const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
+        grouped_q8_0_a_preq_aligned_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>(
+                (float *)low->ptr,
+                (const int8_t *)(oa_al + dq_bytes),
+                (const __half *)oa_al,
+                xq,
+                xscale,
+                rank,
+                n_groups,
+                n_tokens,
+                blocks_a);
+    } else
     grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>((float *)low->ptr,
                                                       out_a,
                                                       xq,
