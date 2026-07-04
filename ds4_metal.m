@@ -15819,6 +15819,40 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
 /* Decode-only HC-pre plus the immediately following weighted RMSNorm.  This is
  * intentionally specialized for DS4's fixed HC=4, embd=4096 shape; larger
  * batched prefill keeps using the existing two-stage path. */
+/* M2-Inc1: Metal has no cooperative-launch fused HC stage; compose the
+ * unfused chain so the shared decode encoder can call one entry on both
+ * backends.  flat_scratch takes the rms-normed vector exactly as before. */
+int ds4_gpu_hc_stage_fused_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *flat_scratch,
+        const ds4_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                fn_weight_offset,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps) {
+    const uint64_t in_dim = (uint64_t)n_hc * n_embd;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (!flat_scratch) return 0;
+    if (!ds4_gpu_rms_norm_plain_tensor(flat_scratch, residual_hc, (uint32_t)in_dim, norm_eps)) return 0;
+    if (!ds4_gpu_matmul_f16_tensor(mix, model_map, model_size, fn_weight_offset,
+                                     in_dim, mix_hc, flat_scratch, 1)) return 0;
+    return ds4_gpu_hc_split_weighted_sum_norm_tensor(out, norm_out, split, mix,
+                                                       residual_hc, model_map, model_size,
+                                                       scale_offset, base_offset,
+                                                       norm_weight_offset, n_embd, n_hc,
+                                                       sinkhorn_iters, eps, norm_eps);
+}
+
 int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,

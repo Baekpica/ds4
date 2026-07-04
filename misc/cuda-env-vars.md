@@ -209,6 +209,22 @@ The bandwidth figure is informational; we don't tier on it.
   pays derepack refills on a repacked manifest — keep a raw manifest
   (`--no-repack-iq2-aligned`) for that regime until the gap is closed.
 
+- `DS4_CUDA_NO_HC_STAGE_FUSED=1`. Kill switch for the M2-Inc1 fused decode
+  HC stage. Default ON when preconditions hold (Flash n_hc=4, F16 hc fn
+  projections, decode single row, cooperative launch available): one
+  48-block cooperative kernel with three `grid.sync()`s replaces the
+  four-launch latency-floor chain `rms_norm_plain` -> f16 splitk matmul
+  (16384x24) -> splitk combine -> `hc_split_weighted_sum_norm`, twice per
+  layer (~40 us -> ~13.5 us per chain, proto_m2_hc.cu; ~-2.3 ms/tok
+  projected on GB10 serial decode). Runs the dot products on the RAW hc
+  input and applies the rms scale at combine time (mathematically exact,
+  not bit-identical to the unfused chain — double-ref parity in-family
+  with baseline). One-shot boot log: `M2-Inc1 fused HC stage active`.
+  Disabled implicitly under `DS4_METAL_DECODE_STAGE_PROFILE` so stage
+  spans keep their boundaries. Cooperative launches are captured into the
+  per-layer cudaGraphs and replay bit-identically (proto-proven on GB10 /
+  CUDA 13).
+
 - `DS4_CUDA_MMQ_X_MAX=N`. Clip `get_mmq_x_max_host` to N (rounded down to a
   multiple of 8) when sweeping tile widths. Diagnostic only; the vanilla
   128 wins on sm_120.

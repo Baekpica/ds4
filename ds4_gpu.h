@@ -1549,6 +1549,33 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         float                   eps,
         float                   norm_eps);
 
+/* M2-Inc1: fused decode HC stage.  Drop-in for the three-call chain
+ *   rms_norm_plain(flat_scratch, residual_hc) ->
+ *   matmul_f16(mix, fn_weight, flat_scratch) ->
+ *   hc_split_weighted_sum_norm(out, norm_out, split, mix, residual_hc).
+ * CUDA runs one cooperative kernel when preconditions hold (n_hc==4, F16 fn
+ * weights, decode single row); otherwise -- and always on Metal -- it
+ * executes the unfused chain.  flat_scratch is only written on the fallback
+ * path.  Kill switch: DS4_CUDA_NO_HC_STAGE_FUSED. */
+int ds4_gpu_hc_stage_fused_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *flat_scratch,
+        const ds4_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                fn_weight_offset,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps);
+
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *pre,

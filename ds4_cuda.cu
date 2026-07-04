@@ -3,6 +3,7 @@
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cooperative_groups.h>
 #include <cuda.h>
 
 #include <stdint.h>
@@ -503,6 +504,10 @@ static uint64_t g_cuda_tmp_bytes;
  * since ksplit scales inversely with out_dim to hit a fixed block target). */
 static float *g_f16_splitk_partials = NULL;
 static uint64_t g_f16_splitk_partials_bytes = 0;
+/* M2-Inc1: scratch for the fused cooperative HC-stage kernel (dot partials,
+ * input-sumsq partials, output-sumsq partials).  Eager-init like the split-K
+ * partials above so the captured decode graph bakes a stable pointer. */
+static float *g_hc_stage_scratch = NULL;
 /* SM count cached in ds4_gpu_init; gates the flash-decode attention split so it
  * only engages when the per-head attention grid (n_head blocks) under-fills the
  * machine (n_head < SM count). On small-SM integrated GPUs (GB10, 48 SMs, 64
@@ -2452,6 +2457,17 @@ extern "C" int ds4_gpu_init(void) {
             (void)cudaGetLastError();
         }
     }
+    /* M2-Inc1 fused HC-stage scratch (256 floats covers dots 24*2 + sumsq 32
+     * + out-sumsq 48).  A failure just disables the fused path (the entry
+     * falls back to the unfused chain). */
+    if (g_hc_stage_scratch == NULL) {
+        void *p = NULL;
+        if (cudaMalloc(&p, 256u * sizeof(float)) == cudaSuccess) {
+            g_hc_stage_scratch = (float *)p;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
     /* SM count for the flash-decode attention split gate. */
     (void)cudaDeviceGetAttribute(&g_cuda_sm_count, cudaDevAttrMultiProcessorCount, dev);
     /* Flash-decode attention partials scratch (eager init -> capture-stable
@@ -2527,6 +2543,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaFree(g_f16_splitk_partials);
         g_f16_splitk_partials = NULL;
         g_f16_splitk_partials_bytes = 0;
+    }
+    if (g_hc_stage_scratch) {
+        (void)cudaFree(g_hc_stage_scratch);
+        g_hc_stage_scratch = NULL;
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
@@ -8483,6 +8503,182 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         const float v = out[(uint64_t)t * n_embd + col];
         norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
+    }
+}
+
+/* M2-Inc1: fused decode HC stage.  One cooperative kernel replaces the
+ * four-launch chain rms_norm_plain -> f16 splitk matmul (16384x24) ->
+ * splitk combine -> hc_split_weighted_sum_norm.  The chain is pure latency
+ * floor (~40 us for ~800 KB of traffic); a fixed 48-block grid with three
+ * grid.sync()s runs it in ~13.5 us (proto_m2_hc.cu sweep, .33).
+ *
+ * Math note: the rms-normed vector was consumed ONLY by the mix matmul, and
+ * the rms scale is a scalar, so the dot products run on the RAW hc input and
+ * the scale is applied at combine time (dot(w, x*s) == s*dot(w, x)).  Not
+ * bit-identical to the unfused chain (different reduction orders) -- parity
+ * gated against a double reference in the proto (error in-family with the
+ * baseline's own), formal gate = oracle 3-leg + eval slice.
+ *
+ * Phases (blocks b, threads d, BLOCKS=48 = 1/SM on GB10):
+ *  P1: b -> dot partial (row b/2 of 24, half-segment b&1) on raw x; b<32
+ *      also sumsq partial of x over segment b.               grid.sync()
+ *  P2: block 0 warp 0: rms scale; mix[24] = scale * partial sums (fixed
+ *      ascending order); 16-lane warp-parallel sinkhorn -> split[24].
+ *                                                            grid.sync()
+ *  P3: all blocks: out[col] = sum_h x[h*n_embd+col]*split[h]; block sumsq
+ *      partials.                                             grid.sync()
+ *  P4: every block redundantly reduces the 48 sumsq partials (tiny L2
+ *      read; cheaper than another barrier), writes norm_out. */
+#define DS4_HC_STAGE_BLOCKS 48u
+#define DS4_HC_STAGE_SUBSEG 2u
+
+__device__ __forceinline__ static float hc16_sum_row(float v) { /* sum over col lanes (bits 0..1) */
+    v += __shfl_xor_sync(0xffffu, v, 1, 16);
+    v += __shfl_xor_sync(0xffffu, v, 2, 16);
+    return v;
+}
+__device__ __forceinline__ static float hc16_sum_col(float v) { /* sum over row lanes (bits 2..3) */
+    v += __shfl_xor_sync(0xffffu, v, 4, 16);
+    v += __shfl_xor_sync(0xffffu, v, 8, 16);
+    return v;
+}
+/* 16-lane port of hc4_split_one (lane = r*4+c).  Same operation sequence per
+ * element; row/col sums become shuffle butterflies (different summation
+ * order -- covered by the parity gate above). */
+__device__ static void hc4_split_warp16(float *out, const float *mix, const float *scale,
+                                        const float *base, uint32_t sinkhorn_iters, float epsv,
+                                        uint32_t lane) {
+    const float pre_scale = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+    if (lane < 8u) {
+        float z = mix[lane] * (lane < 4u ? pre_scale : post_scale) + base[lane];
+        out[lane] = lane < 4u ? 1.0f / (1.0f + expf(-z)) + epsv
+                              : 2.0f / (1.0f + expf(-z));
+    }
+    float v = mix[8u + lane] * comb_scale + base[8u + lane];
+    float m = v;
+    m = fmaxf(m, __shfl_xor_sync(0xffffu, m, 1, 16));
+    m = fmaxf(m, __shfl_xor_sync(0xffffu, m, 2, 16));
+    float c = expf(v - m);
+    float s = hc16_sum_row(c);
+    c = c / s + epsv;
+    s = hc16_sum_col(c) + epsv;
+    c /= s;
+    for (uint32_t it = 1; it < sinkhorn_iters; it++) {
+        s = hc16_sum_row(c) + epsv;
+        c /= s;
+        s = hc16_sum_col(c) + epsv;
+        c /= s;
+    }
+    out[8u + lane] = c;
+}
+
+__global__ static void hc_stage_fused_coop_kernel(
+        float *out,              /* [n_embd] combined sublayer input */
+        float *norm_out,         /* [n_embd] rms(out) * norm_w */
+        float *split,            /* [24] */
+        float *mix_out,          /* [24] */
+        float *scratch,          /* [24*SUBSEG dots | 32 sumsq | BLOCKS sumsq2] */
+        const __half *w,         /* [24, in_dim] hc fn projection */
+        const float *x,          /* [in_dim] raw hc input (rms source AND residual) */
+        const float *scale3, const float *base, const float *norm_w,
+        uint32_t n_embd, uint32_t in_dim,
+        uint32_t sinkhorn_iters, float epsv, float rms_eps, float norm_eps) {
+    cooperative_groups::grid_group hc_grid = cooperative_groups::this_grid();
+    const uint32_t mix_hc = 24u;
+    float *dots = scratch;                                      /* 24*SUBSEG */
+    float *ssq  = scratch + mix_hc * DS4_HC_STAGE_SUBSEG;       /* 32 */
+    float *ssq2 = ssq + 32u;                                    /* BLOCKS */
+    const uint32_t b = blockIdx.x;
+    const uint32_t d = threadIdx.x;
+    const uint32_t nt = blockDim.x;
+
+    /* P1: dot partials on raw x + input sumsq partials */
+    {
+        const uint32_t row = b / DS4_HC_STAGE_SUBSEG;
+        const uint32_t sub = b % DS4_HC_STAGE_SUBSEG;
+        const uint64_t seg_len = in_dim / DS4_HC_STAGE_SUBSEG;
+        if (row < mix_hc) {
+            const uint64_t k0 = (uint64_t)sub * seg_len;
+            const uint64_t k1 = k0 + seg_len;
+            const __half *wr = w + (uint64_t)row * in_dim;
+            float sum = 0.0f;
+            for (uint64_t i = k0 + (uint64_t)d * 8u; i < k1; i += (uint64_t)nt * 8u) {
+                const uint4 wv = *reinterpret_cast<const uint4 *>(wr + i);
+                const float4 xa = *reinterpret_cast<const float4 *>(x + i);
+                const float4 xb = *reinterpret_cast<const float4 *>(x + i + 4);
+                const __half2 *h = reinterpret_cast<const __half2 *>(&wv);
+                const float2 w0 = __half22float2(h[0]);
+                const float2 w1 = __half22float2(h[1]);
+                const float2 w2 = __half22float2(h[2]);
+                const float2 w3 = __half22float2(h[3]);
+                sum += w0.x * xa.x + w0.y * xa.y + w1.x * xa.z + w1.y * xa.w
+                     + w2.x * xb.x + w2.y * xb.y + w3.x * xb.z + w3.y * xb.w;
+            }
+            sum = block_reduce_sum_256(sum);
+            if (d == 0u) dots[(uint64_t)row * DS4_HC_STAGE_SUBSEG + sub] = sum;
+        }
+    }
+    if (b < 32u) {
+        const uint64_t seg32 = in_dim / 32u;
+        const uint64_t k0 = (uint64_t)b * seg32;
+        float ss = 0.0f;
+        for (uint64_t i = k0 + d; i < k0 + seg32; i += nt) { float v = x[i]; ss += v * v; }
+        ss = block_reduce_sum_256(ss);
+        if (d == 0u) ssq[b] = ss;
+    }
+    hc_grid.sync();
+
+    /* P2: block 0, warp 0: rms scale + mix + sinkhorn */
+    if (b == 0u && d < 32u) {
+        float rms_scale;
+        {
+            float ss = 0.0f;
+            for (uint32_t k = 0u; k < 32u; k++) ss += ssq[k];
+            rms_scale = rsqrtf(ss / (float)in_dim + rms_eps);
+        }
+        if (d < mix_hc) {
+            float s = 0.0f;
+            for (uint32_t k = 0u; k < DS4_HC_STAGE_SUBSEG; k++)
+                s += dots[(uint64_t)d * DS4_HC_STAGE_SUBSEG + k];
+            mix_out[d] = s * rms_scale;
+        }
+        __syncwarp();
+        if (d < 16u) hc4_split_warp16(split, mix_out, scale3, base, sinkhorn_iters, epsv, d);
+    }
+    hc_grid.sync();
+
+    /* P3: weighted residual sum + output sumsq partials */
+    {
+        float s0 = split[0], s1 = split[1], s2 = split[2], s3 = split[3];
+        float sum = 0.0f;
+        for (uint32_t col = b * nt + d; col < n_embd; col += DS4_HC_STAGE_BLOCKS * nt) {
+            float acc = x[col] * s0
+                      + x[n_embd + col] * s1
+                      + x[2u * n_embd + col] * s2
+                      + x[3u * n_embd + col] * s3;
+            out[col] = acc;
+            sum += acc * acc;
+        }
+        sum = block_reduce_sum_256(sum);
+        if (d == 0u) ssq2[b] = sum;
+    }
+    hc_grid.sync();
+
+    /* P4: redundant per-block reduce of ssq2 (48 floats from L2), norm_out */
+    {
+        __shared__ float ns_sh;
+        if (d == 0u) {
+            float ss = 0.0f;
+            for (uint32_t k = 0u; k < DS4_HC_STAGE_BLOCKS; k++) ss += ssq2[k];
+            ns_sh = rsqrtf(ss / (float)n_embd + norm_eps);
+        }
+        __syncthreads();
+        const float ns = ns_sh;
+        for (uint32_t col = b * nt + d; col < n_embd; col += DS4_HC_STAGE_BLOCKS * nt) {
+            norm_out[col] = out[col] * ns * norm_w[col];
+        }
     }
 }
 
@@ -20334,6 +20530,125 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
            ds4_gpu_rms_norm_weight_tensor(norm_out, out, model_map, model_size,
                                             norm_weight_offset, n_embd, norm_eps);
 }
+
+/* M2-Inc1: fused decode HC stage entry.  Covers the chain
+ *   rms_norm_plain(flat, residual) -> f16 matmul (in_dim x 24, splitk) ->
+ *   hc_split_weighted_sum_norm(out, norm_out, split, mix, residual)
+ * with one cooperative kernel (see hc_stage_fused_coop_kernel).  Any
+ * precondition miss falls back to the exact unfused chain below, so callers
+ * treat this as a drop-in for the three-call sequence.  Kill switch:
+ * DS4_CUDA_NO_HC_STAGE_FUSED=1. */
+extern "C" int ds4_gpu_hc_stage_fused_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *flat_scratch,
+        const ds4_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                fn_weight_offset,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps) {
+    const uint64_t in_dim = (uint64_t)n_hc * n_embd;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    static int no_fused = -1;
+    if (no_fused < 0) no_fused = getenv("DS4_CUDA_NO_HC_STAGE_FUSED") != NULL;
+    do {
+        if (no_fused || n_hc != 4u || n_embd == 0u ||
+            (in_dim % 256u) != 0u || g_hc_stage_scratch == NULL) break;
+        if (!out || !norm_out || !split || !mix || !residual_hc || !model_map) break;
+        const uint64_t mix_bytes = mix_hc * sizeof(float);
+        const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
+        const uint64_t weight_bytes = mix_hc * in_dim * sizeof(uint16_t);
+        if (out->bytes < out_row_bytes || norm_out->bytes < out_row_bytes ||
+            mix->bytes < mix_bytes || split->bytes < mix_bytes ||
+            residual_hc->bytes < in_dim * sizeof(float)) break;
+        if (out->bytes / out_row_bytes != 1u) break;  /* decode row only */
+        if (fn_weight_offset > model_size || weight_bytes > model_size - fn_weight_offset ||
+            scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
+            base_offset > model_size || mix_bytes > model_size - base_offset ||
+            norm_weight_offset > model_size ||
+            (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) break;
+        const char *wp = cuda_model_range_ptr(model_map, fn_weight_offset, weight_bytes, "hc_fn_f16");
+        const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset,
+                3ull * sizeof(float), "hc_scale");
+        const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset,
+                mix_bytes, "hc_base");
+        const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
+                (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
+        if (!wp || !scale || !base || !norm_w) break;
+        if (((uintptr_t)wp & 15u) != 0u || ((uintptr_t)residual_hc->ptr & 15u) != 0u) break;
+        /* Coop-launch capability probe.  Cached BEFORE the first layer-graph
+         * capture (the warmup pass runs eager), so a cooperative launch can
+         * never fail for residency reasons mid-capture. */
+        static int coop_ok = -1;
+        if (coop_ok < 0) {
+            int dev = 0, supported = 0, blocks_per_sm = 0, n_sm = 0;
+            (void)cudaGetDevice(&dev);
+            (void)cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, dev);
+            (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, hc_stage_fused_coop_kernel, 256, 0);
+            (void)cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
+            coop_ok = supported != 0 &&
+                      (uint64_t)blocks_per_sm * (uint64_t)n_sm >= DS4_HC_STAGE_BLOCKS;
+            if (coop_ok) {
+                fprintf(stderr, "ds4: M2-Inc1 fused HC stage active (coop %u-blk, in_dim %u)\n",
+                        DS4_HC_STAGE_BLOCKS, (uint32_t)in_dim);
+            } else {
+                fprintf(stderr, "ds4: M2-Inc1 fused HC stage unavailable (coop=%d, co-resident blocks=%d), unfused chain\n",
+                        supported, blocks_per_sm * n_sm);
+            }
+        }
+        if (!coop_ok) break;
+        float *out_p = (float *)out->ptr;
+        float *norm_out_p = (float *)norm_out->ptr;
+        float *split_p = (float *)split->ptr;
+        float *mix_p = (float *)mix->ptr;
+        const __half *w_p = (const __half *)wp;
+        const float *x_p = (const float *)residual_hc->ptr;
+        uint32_t in_dim32 = (uint32_t)in_dim;
+        void *args[] = {
+            (void *)&out_p, (void *)&norm_out_p, (void *)&split_p, (void *)&mix_p,
+            (void *)&g_hc_stage_scratch,
+            (void *)&w_p, (void *)&x_p,
+            (void *)&scale, (void *)&base, (void *)&norm_w,
+            (void *)&n_embd, (void *)&in_dim32,
+            (void *)&sinkhorn_iters, (void *)&eps, (void *)&norm_eps, (void *)&norm_eps };
+        cudaError_t err = cudaLaunchCooperativeKernel(
+                (void *)hc_stage_fused_coop_kernel,
+                dim3(DS4_HC_STAGE_BLOCKS, 1, 1), dim3(256, 1, 1),
+                args, 0, ds4_current_stream());
+        if (err != cudaSuccess) {
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "ds4: fused HC stage launch failed (%s), unfused chain\n",
+                        cudaGetErrorString(err));
+            }
+            (void)cudaGetLastError();
+            break;
+        }
+        return 1;
+    } while (0);
+    /* Unfused fallback: the exact original three-call chain. */
+    if (!flat_scratch) return 0;
+    if (!ds4_gpu_rms_norm_plain_tensor(flat_scratch, residual_hc, (uint32_t)in_dim, norm_eps)) return 0;
+    if (!ds4_gpu_matmul_f16_tensor(mix, model_map, model_size, fn_weight_offset,
+                                     in_dim, mix_hc, flat_scratch, 1)) return 0;
+    return ds4_gpu_hc_split_weighted_sum_norm_tensor(out, norm_out, split, mix,
+                                                       residual_hc, model_map, model_size,
+                                                       scale_offset, base_offset,
+                                                       norm_weight_offset, n_embd, n_hc,
+                                                       sinkhorn_iters, eps, norm_eps);
+}
+
 extern "C" int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *pre,
