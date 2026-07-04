@@ -11202,17 +11202,35 @@ static bool metal_graph_encode_decode_layer_impl(
             fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
             ok = false;
         }
+        /* M2-Inc5: one coop kernel for pair matmuls + combines + store; on
+         * any precondition miss fall through to the exact original chain
+         * (and then the full update below, which includes the store). */
+        bool comp_pair_fused = false;
         if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
-            ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                  g->comp_sc_cur,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_compressor_kv->abs_offset,
-                                                  layer->attn_compressor_gate->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  comp_width,
-                                                  g->attn_norm,
-                                                  1) != 0;
+            if (layer->attn_compressor_kv->type == DS4_TENSOR_F16 &&
+                layer->attn_compressor_gate->type == DS4_TENSOR_F16) {
+                comp_pair_fused = ds4_gpu_compressor_pair_store_fused_tensor(
+                        g->comp_kv_cur, g->comp_sc_cur,
+                        g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
+                        model->map, model->size,
+                        layer->attn_compressor_kv->abs_offset,
+                        layer->attn_compressor_gate->abs_offset,
+                        layer->attn_compressor_ape->abs_offset,
+                        layer->attn_compressor_ape->type,
+                        DS4_N_HEAD_DIM, ratio, pos,
+                        DS4_N_EMBD, g->attn_norm, 1, il) != 0;
+            }
+            if (!comp_pair_fused)
+                ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
+                                                      g->comp_sc_cur,
+                                                      model->map,
+                                                      model->size,
+                                                      layer->attn_compressor_kv->abs_offset,
+                                                      layer->attn_compressor_gate->abs_offset,
+                                                      DS4_N_EMBD,
+                                                      comp_width,
+                                                      g->attn_norm,
+                                                      1) != 0;
         } else {
             if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_cur, model->map, model->size,
                                                      layer->attn_compressor_kv->abs_offset,
@@ -11224,7 +11242,10 @@ static bool metal_graph_encode_decode_layer_impl(
                                                      g->attn_norm, 1) != 0;
         }
         const uint32_t comp_row = g->layer_n_comp[il];
-        if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
+        if (ok) ok = (comp_pair_fused
+                      /* store already done by the fused kernel */
+                      ? ds4_gpu_compressor_update_tail_tensor
+                      : ds4_gpu_compressor_update_tensor)(g->comp_kv_cur,
                                                         g->comp_sc_cur,
                                                         g->layer_attn_state_kv[il],
                                                         g->layer_attn_state_score[il],
@@ -11312,17 +11333,30 @@ static bool metal_graph_encode_decode_layer_impl(
                 fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
+            /* M2-Inc5: fused pair+store, indexer-compressor instance. */
+            bool index_pair_fused = false;
             if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
-                ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                      g->comp_sc_cur,
-                                                      model->map,
-                                                      model->size,
-                                                      layer->indexer_compressor_kv->abs_offset,
-                                                      layer->indexer_compressor_gate->abs_offset,
-                                                      DS4_N_EMBD,
-                                                      index_width,
-                                                      g->attn_norm,
-                                                      1) != 0;
+                index_pair_fused = ds4_gpu_compressor_pair_store_fused_tensor(
+                        g->comp_kv_cur, g->comp_sc_cur,
+                        g->layer_index_state_kv[il], g->layer_index_state_score[il],
+                        model->map, model->size,
+                        layer->indexer_compressor_kv->abs_offset,
+                        layer->indexer_compressor_gate->abs_offset,
+                        layer->indexer_compressor_ape->abs_offset,
+                        layer->indexer_compressor_ape->type,
+                        DS4_N_INDEXER_HEAD_DIM, ratio, pos,
+                        DS4_N_EMBD, g->attn_norm, 1, il) != 0;
+                if (!index_pair_fused)
+                    ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
+                                                          g->comp_sc_cur,
+                                                          model->map,
+                                                          model->size,
+                                                          layer->indexer_compressor_kv->abs_offset,
+                                                          layer->indexer_compressor_gate->abs_offset,
+                                                          DS4_N_EMBD,
+                                                          index_width,
+                                                          g->attn_norm,
+                                                          1) != 0;
             } else {
                 if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_cur, model->map, model->size,
                                                          layer->indexer_compressor_kv->abs_offset,
@@ -11334,7 +11368,10 @@ static bool metal_graph_encode_decode_layer_impl(
                                                          g->attn_norm, 1) != 0;
             }
             const uint32_t index_row = g->layer_n_index_comp[il];
-            if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
+            if (ok) ok = (index_pair_fused
+                          /* store already done by the fused kernel */
+                          ? ds4_gpu_compressor_update_tail_tensor
+                          : ds4_gpu_compressor_update_tensor)(g->comp_kv_cur,
                                                             g->comp_sc_cur,
                                                             g->layer_index_state_kv[il],
                                                             g->layer_index_state_score[il],

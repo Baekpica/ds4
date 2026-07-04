@@ -990,6 +990,34 @@ int ds4_gpu_store_raw_kv_batch_tensor(
 #define DS4_COMPRESSOR_ROW_COMP   0
 #define DS4_COMPRESSOR_ROW_INDEX  1
 
+/* M2-Inc5 (CUDA): one decode compressor event -- BOTH pair f16 matmuls
+ * (kv + gate, in_dim x width), their split-K combines, and the compressor
+ * store -- as one cooperative kernel, bit-identical to the unfused
+ * pair-matmul + store chain.  Returns 0 without touching any output when
+ * the shape/mode is unsupported, an f16 dispatch env knob is set, the
+ * cooperative launch is unavailable, or DS4_CUDA_NO_COMP_PAIR_FUSED=1; the
+ * caller then runs the unfused chain.  On success the caller must follow
+ * with ds4_gpu_compressor_update_tail_tensor (NOT the full update -- the
+ * store has already run). */
+int ds4_gpu_compressor_pair_store_fused_tensor(
+        ds4_gpu_tensor       *kv_cur,
+        ds4_gpu_tensor       *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                w_kv_offset,
+        uint64_t                w_sc_offset,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos,
+        uint64_t                in_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint32_t                il);
+
 int ds4_gpu_compressor_update_tensor(
         const ds4_gpu_tensor *kv_cur,
         const ds4_gpu_tensor *sc_cur,
@@ -1021,6 +1049,38 @@ int ds4_gpu_compressor_update_tensor(
          * callers pass il = UINT32_MAX to signal "no substrate"; kernels
          * fall back to inline comp_row and row_field is ignored.  See
          * plan doc sec 16 commit C2 / sec 15.8. */
+        uint32_t                il,
+        int                     row_field);
+
+/* M2-Inc5: emit tail of ds4_gpu_compressor_update_tensor only (pool + norm +
+ * rope + ratio4 shift; no store) -- the follow-up call after a successful
+ * ds4_gpu_compressor_pair_store_fused_tensor.  Same signature as the full
+ * update. */
+int ds4_gpu_compressor_update_tail_tensor(
+        const ds4_gpu_tensor *kv_cur,
+        const ds4_gpu_tensor *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        ds4_gpu_tensor       *comp_cache,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos,
+        uint32_t                comp_row,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps,
         uint32_t                il,
         int                     row_field);
 

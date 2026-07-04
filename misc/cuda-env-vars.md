@@ -269,6 +269,20 @@ The bandwidth figure is informational; we don't tier on it.
   `DS4_CUDA_NO_WARP_ROUTER_SELECT`, `DS4_CUDA_NO_PARALLEL_ROUTER_SELECT`) so
   each of those keeps selecting the kernel it names.
 
+- `DS4_CUDA_NO_COMP_PAIR_FUSED=1`. Kill switch for the M2-Inc5 fused decode
+  compressor event: both pair f16 matmuls (kv + gate, 4096 x width), their
+  split-K combines, and the compressor store run as ONE cooperative kernel
+  (`comp_pair_store_fused_kernel<KS>`, up to 128 blocks), replacing five
+  launches per compressor event at the three decode widths (1024 = primary
+  ratio-4, 512 = primary ratio-2, 256 = indexer ratio-4).  On the fused path
+  the emit tail runs via `ds4_gpu_compressor_update_tail_tensor` (the full
+  update would double-store).  Bit-exact vs the unfused chain
+  (proto_m2_comp.cu: 324/324 across widths x ape f16/f32 x pos sweep,
+  capture==eager).  One-shot boot log: `M2-Inc5 fused compressor pair+store
+  active (coop N-blk)`.  Also implicitly off under `DS4_CUDA_SERIAL_F16_MATMUL`
+  and `DS4_CUDA_ORDERED_F16_MATMUL` (each keeps selecting the kernel it
+  names).
+
 - `DS4_CUDA_MMQ_X_MAX=N`. Clip `get_mmq_x_max_host` to N (rounded down to a
   multiple of 8) when sweeping tile widths. Diagnostic only; the vanilla
   128 wins on sm_120.

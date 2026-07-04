@@ -521,6 +521,10 @@ static void cuda_q8_fold_reset(void);
  * 8 ksegs).  Dedicated static like the sidecar rings above -- never
  * cuda_tmp_alloc -- and eager-init for a capture-stable pointer. */
 static float *g_router_fused_partials = NULL;
+/* M2-Inc5: split-K partials for the fused compressor pair+store kernel.
+ * Both matmuls of a pair at every decode width satisfy width*ksplit == 2048,
+ * so 2*2048 floats cover all shapes.  Same dedicated-static discipline. */
+static float *g_comp_pair_partials = NULL;
 /* SM count cached in ds4_gpu_init; gates the flash-decode attention split so it
  * only engages when the per-head attention grid (n_head blocks) under-fills the
  * machine (n_head < SM count). On small-SM integrated GPUs (GB10, 48 SMs, 64
@@ -2492,6 +2496,16 @@ extern "C" int ds4_gpu_init(void) {
             (void)cudaGetLastError();
         }
     }
+    /* M2-Inc5 fused compressor pair+store partials (2 matmuls x 2048).  A
+     * failure just disables the fused compressor pair (unfused chain). */
+    if (g_comp_pair_partials == NULL) {
+        void *p = NULL;
+        if (cudaMalloc(&p, 2u * 2048u * sizeof(float)) == cudaSuccess) {
+            g_comp_pair_partials = (float *)p;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
     /* M2-Inc1b/2a q8 fold sidecars: DEDICATED double-buffered rings.
      * cuda_tmp_alloc is a single shared sticky scratch (every caller gets
      * the same pointer), so sidecars must NOT come from it: two sidecar
@@ -2602,6 +2616,10 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_router_fused_partials) {
         (void)cudaFree(g_router_fused_partials);
         g_router_fused_partials = NULL;
+    }
+    if (g_comp_pair_partials) {
+        (void)cudaFree(g_comp_pair_partials);
+        g_comp_pair_partials = NULL;
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
@@ -9085,6 +9103,108 @@ __global__ static void compressor_store_kernel(
         sc[(uint64_t)t * width + j] + model_scalar_dev(model_map, ape_offset, ape_type, (uint64_t)pos_mod * width + j);
 }
 
+/* M2-Inc5: one decode compressor event -- BOTH pair matmuls (kv + gate, f16,
+ * in 4096), their split-K combines, and the compressor store -- as ONE
+ * cooperative kernel, replacing five launches (2x matmul_f16_splitk +
+ * 2x combine + compressor_store) at the three decode widths
+ * (1024 = primary ratio-4, 512 = primary ratio-2, 256 = indexer ratio-4).
+ *
+ * Bit-exactness (gate: proto cuda/mmq/test/proto_m2_comp.cu, 324/324
+ * bit-identical + capture==eager): phase 1 replicates the ref split-K tile
+ * like the M2-Inc3 router fuse, generalized to seg = 4096/KS: a lane's
+ * A = seg/256 accumulators hold chunks lane+32a (identical values at
+ * identical lanes to ref warps a), each reduced by the verbatim
+ * warp_sum_f32; the ref block_reduce_sum_256 cross-warp shfl_down tree over
+ * [s0..s(A-1), 0-padded] fixes the parenthesization (A=2: s0+s1; A=4:
+ * (s0+s2)+(s1+s3); A=8: ((s0+s4)+(s2+s6))+((s1+s5)+(s3+s7))) -- identical
+ * up to x+0.0f==x on exact zeros.  Phase 2 combines partials in kseg order
+ * (verbatim combine kernel) and applies the verbatim compressor_store body
+ * to the just-combined values. */
+template <uint32_t KS>
+__global__ static void comp_pair_store_fused_kernel(
+        float *kv_cur,            /* [width] */
+        float *sc_cur,            /* [width] */
+        float *partials,          /* [2*width*KS] g_comp_pair_partials */
+        float *state_kv,
+        float *state_score,
+        const __half *w_kv,       /* [width][4096] */
+        const __half *w_sc,       /* [width][4096] */
+        const float *x,           /* [4096] */
+        const void *ape_map,
+        uint64_t ape_offset,
+        uint32_t ape_type,
+        uint32_t ratio,
+        uint32_t width,           /* == coff*head_dim */
+        uint32_t pos0,
+        const struct ds4_decode_scalars * __restrict__ s_override) {
+    constexpr uint32_t SEG = 4096u / KS;
+    constexpr uint32_t A = SEG / 256u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+
+    /* Phase 1: one warp per (matmul m, row, kseg) tile. */
+    const uint32_t tiles_per_m = width * KS;
+    const uint32_t nwarp = gridDim.x * (blockDim.x >> 5u);
+    for (uint32_t t = blockIdx.x * (blockDim.x >> 5u) + warp;
+         t < 2u * tiles_per_m; t += nwarp) {
+        const uint32_t m = t < tiles_per_m ? 0u : 1u;
+        const uint32_t tt = m ? t - tiles_per_m : t;
+        const uint32_t row = tt / KS;
+        const uint32_t kseg = tt % KS;
+        const uint64_t k0 = (uint64_t)kseg * SEG;
+        const __half *wr = (m ? w_sc : w_kv) + (uint64_t)row * 4096u;
+        float s[A];
+        #pragma unroll
+        for (uint32_t a = 0; a < A; a++) {
+            const uint64_t i = k0 + ((uint64_t)lane + 32u * a) * 8u;
+            const uint4 wv = *reinterpret_cast<const uint4 *>(wr + i);
+            const float4 xa = *reinterpret_cast<const float4 *>(x + i);
+            const float4 xb = *reinterpret_cast<const float4 *>(x + i + 4);
+            const __half2 *h = reinterpret_cast<const __half2 *>(&wv);
+            const float2 w0 = __half22float2(h[0]);
+            const float2 w1 = __half22float2(h[1]);
+            const float2 w2 = __half22float2(h[2]);
+            const float2 w3 = __half22float2(h[3]);
+            float sum = 0.0f;
+            sum += w0.x * xa.x + w0.y * xa.y + w1.x * xa.z + w1.y * xa.w
+                 + w2.x * xb.x + w2.y * xb.y + w3.x * xb.z + w3.y * xb.w;
+            s[a] = warp_sum_f32(sum);
+        }
+        float partial;
+        if (KS == 8u) {          /* A == 2 */
+            partial = s[0] + s[1 % A];
+        } else if (KS == 4u) {   /* A == 4 */
+            partial = (s[0] + s[2 % A]) + (s[1 % A] + s[3 % A]);
+        } else {                 /* KS == 2, A == 8 */
+            partial = ((s[0] + s[4 % A]) + (s[2 % A] + s[6 % A]))
+                    + ((s[1 % A] + s[5 % A]) + (s[3 % A] + s[7 % A]));
+        }
+        if (lane == 0u) partials[(uint64_t)m * tiles_per_m + (uint64_t)row * KS + kseg] = partial;
+    }
+
+    cooperative_groups::this_grid().sync();
+
+    /* Phase 2: combine (kseg ascending, verbatim) + verbatim store body. */
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= 2u * width) return;
+    const uint32_t m = gid < width ? 0u : 1u;
+    const uint32_t row = m ? gid - width : gid;
+    const float *p = partials + (uint64_t)m * tiles_per_m + (uint64_t)row * KS;
+    float s = 0.0f;
+    for (uint32_t k = 0u; k < KS; k++) s += p[k];
+    const uint32_t p0 = s_override ? s_override->pos0 : pos0;
+    const uint32_t pos_mod = p0 % ratio;
+    const uint32_t dst_row = ratio == 4u ? ratio + pos_mod : pos_mod;
+    if (m == 0u) {
+        kv_cur[row] = s;
+        state_kv[(uint64_t)dst_row * width + row] = s;
+    } else {
+        sc_cur[row] = s;
+        state_score[(uint64_t)dst_row * width + row] =
+            s + model_scalar_dev(ape_map, ape_offset, ape_type, (uint64_t)pos_mod * width + row);
+    }
+}
+
 __global__ static void compressor_set_rows_kernel(
         float *state_kv,
         float *state_score,
@@ -15193,6 +15313,147 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
             raw_cap, pos0, n_tokens, head_dim, pos_dev, seq_dev, NULL);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
+/* M2-Inc5: fused decode compressor event (pair f16 matmuls + combines +
+ * store) -- see comp_pair_store_fused_kernel.  Returns 0 (caller falls back
+ * to the unfused pair-matmul + update chain) whenever the shape is not a
+ * decode compressor shape, an f16 dispatch knob is set, the coop launch is
+ * unavailable, or DS4_CUDA_NO_COMP_PAIR_FUSED=1.  On success the caller
+ * must use ds4_gpu_compressor_update_tail_tensor (store already done). */
+extern "C" int ds4_gpu_compressor_pair_store_fused_tensor(
+        ds4_gpu_tensor       *kv_cur,
+        ds4_gpu_tensor       *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                w_kv_offset,
+        uint64_t                w_sc_offset,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos,
+        uint64_t                in_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint32_t                il) {
+    static int off = -1;
+    if (off < 0) {
+        /* The f16 dispatch knobs force the unfused chain so each keeps
+         * selecting the kernel it names. */
+        off = getenv("DS4_CUDA_NO_COMP_PAIR_FUSED") != NULL ||
+              getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+              getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
+    }
+    if (off) return 0;
+    if (!kv_cur || !sc_cur || !state_kv || !state_score || !x || !model_map) return 0;
+    if (n_tok != 1u || in_dim != 4096u || ratio == 0u ||
+        (ape_type != 0u && ape_type != 1u)) return 0;
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    if (width != 256u && width != 512u && width != 1024u) return 0;
+    const uint32_t ksplit = width == 1024u ? 2u : (width == 512u ? 4u : 8u);
+    if (g_comp_pair_partials == NULL) return 0;
+    /* The unfused chain must be the split-K vec path at these shapes for
+     * ON==OFF numerics (see cuda_matmul_f16_tensor_impl's dispatch). */
+    if (g_f16_splitk_partials == NULL || cuda_native_f16_max_tokens() < 1u) return 0;
+    const uint32_t state_rows = coff * ratio;
+    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
+    const uint64_t weight_bytes = (uint64_t)width * in_dim * sizeof(uint16_t);
+    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    if (w_kv_offset > model_size || weight_bytes > model_size - w_kv_offset ||
+        w_sc_offset > model_size || weight_bytes > model_size - w_sc_offset ||
+        ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        kv_cur->bytes < (uint64_t)width * sizeof(float) ||
+        sc_cur->bytes < (uint64_t)width * sizeof(float) ||
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes ||
+        x->bytes < in_dim * sizeof(float)) return 0;
+    const char *w_kv = cuda_model_range_ptr(model_map, w_kv_offset, weight_bytes, "comp_pair_kv_f16");
+    const char *w_sc = cuda_model_range_ptr(model_map, w_sc_offset, weight_bytes, "comp_pair_sc_f16");
+    const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
+    if (!w_kv || !w_sc || !ape) return 0;
+    if (((uintptr_t)w_kv & 15u) != 0u || ((uintptr_t)w_sc & 15u) != 0u ||
+        ((uintptr_t)x->ptr & 15u) != 0u) return 0;
+    void *kernel = ksplit == 2u ? (void *)comp_pair_store_fused_kernel<2u>
+                 : ksplit == 4u ? (void *)comp_pair_store_fused_kernel<4u>
+                                : (void *)comp_pair_store_fused_kernel<8u>;
+    /* Coop-launch capability probe per template instantiation, cached BEFORE
+     * the first layer-graph capture (the warmup pass runs eager). */
+    static int grid_blocks[3] = { -1, -1, -1 };
+    static int logged = 0;
+    const int ki = ksplit == 2u ? 0 : (ksplit == 4u ? 1 : 2);
+    if (grid_blocks[ki] < 0) {
+        int dev = 0, supported = 0, blocks_per_sm = 0, n_sm = 0;
+        (void)cudaGetDevice(&dev);
+        (void)cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, dev);
+        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm,
+                (const void *)kernel, 256, 0);
+        (void)cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
+        const uint64_t cap = (uint64_t)blocks_per_sm * (uint64_t)n_sm;
+        if (supported != 0 && cap >= 48u) {
+            grid_blocks[ki] = (int)(cap < 128u ? cap : 128u);
+            if (!logged) {
+                logged = 1;
+                fprintf(stderr, "ds4: M2-Inc5 fused compressor pair+store active (coop %d-blk)\n",
+                        grid_blocks[ki]);
+            }
+        } else {
+            grid_blocks[ki] = 0;
+            if (!logged) {
+                logged = 1;
+                fprintf(stderr, "ds4: M2-Inc5 fused compressor pair unavailable (coop=%d, co-resident blocks=%llu), unfused chain\n",
+                        supported, (unsigned long long)cap);
+            }
+        }
+    }
+    if (grid_blocks[ki] <= 0) return 0;
+    /* Store pos source: mirror ds4_gpu_compressor_update_tensor's substrate
+     * gating (batched/multiseq callers must NOT read g_decode_dev). */
+    const bool use_substrate = (g_layer_dev != NULL && il < DS4_LAYER_SCALARS_COUNT);
+    const struct ds4_decode_scalars *scalars = use_substrate
+        ? (const struct ds4_decode_scalars *)ds4_gpu_decode_scalars_device_ptr()
+        : NULL;
+    const uint32_t q8ps = q8p_begin_tagged("comp_fu", in_dim, width, 1,
+                                           2u * weight_bytes, ds4_current_stream());
+    float *kv_cur_p = (float *)kv_cur->ptr;
+    float *sc_cur_p = (float *)sc_cur->ptr;
+    float *partials_p = g_comp_pair_partials;
+    float *state_kv_p = (float *)state_kv->ptr;
+    float *state_score_p = (float *)state_score->ptr;
+    const __half *w_kv_p = (const __half *)w_kv;
+    const __half *w_sc_p = (const __half *)w_sc;
+    const float *x_p = (const float *)x->ptr;
+    const void *ape_p = (const void *)ape;
+    uint64_t ape_off0 = 0;
+    uint32_t ape_type_v = ape_type;
+    uint32_t ratio_v = ratio;
+    uint32_t width_v = width;
+    uint32_t pos_v = pos;
+    void *args[] = {
+        (void *)&kv_cur_p, (void *)&sc_cur_p, (void *)&partials_p,
+        (void *)&state_kv_p, (void *)&state_score_p,
+        (void *)&w_kv_p, (void *)&w_sc_p, (void *)&x_p,
+        (void *)&ape_p, (void *)&ape_off0, (void *)&ape_type_v,
+        (void *)&ratio_v, (void *)&width_v, (void *)&pos_v, (void *)&scalars };
+    cudaError_t err = cudaLaunchCooperativeKernel(
+            kernel, dim3((unsigned)grid_blocks[ki], 1, 1), dim3(256, 1, 1),
+            args, 0, ds4_current_stream());
+    if (err != cudaSuccess) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "ds4: fused compressor pair launch failed (%s), unfused chain\n",
+                    cudaGetErrorString(err));
+        }
+        (void)cudaGetLastError();
+        q8p_end(q8ps, ds4_current_stream());
+        return 0;
+    }
+    q8p_end(q8ps, ds4_current_stream());
+    return 1;
+}
+
 extern "C" int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
         const ds4_gpu_tensor *sc,
@@ -15249,7 +15510,11 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
     return cuda_ok(cudaGetLastError(), "compressor store launch");
 }
 
-extern "C" int ds4_gpu_compressor_update_tensor(
+/* M2-Inc5: shared body for ds4_gpu_compressor_update_tensor (store + emit
+ * tail) and ds4_gpu_compressor_update_tail_tensor (emit tail only, for the
+ * fused pair+store path which has already performed the store). */
+static int cuda_compressor_update_impl(
+        int                     skip_store,
         const ds4_gpu_tensor *kv_cur,
         const ds4_gpu_tensor *sc_cur,
         ds4_gpu_tensor       *state_kv,
@@ -15329,7 +15594,8 @@ extern "C" int ds4_gpu_compressor_update_tensor(
      * determinism gate's flip).  This mirrors the substrate gating that already
      * guards row_ptr_dev and the emit-row rope below. */
     const bool use_substrate = (g_layer_dev != NULL && il < DS4_LAYER_SCALARS_COUNT);
-    if (!ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
+    if (!skip_store &&
+        !ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
                                                  model_map, model_size, ape_offset, ape_type,
                                                  head_dim, ratio, pos, 1,
                                                  use_substrate ? ds4_gpu_decode_scalars_device_ptr() : NULL)) {
@@ -15424,6 +15690,74 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         ok = cuda_ok(cudaGetLastError(), "compressor ratio4 shift launch");
     }
     return ok;
+}
+extern "C" int ds4_gpu_compressor_update_tensor(
+        const ds4_gpu_tensor *kv_cur,
+        const ds4_gpu_tensor *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        ds4_gpu_tensor       *comp_cache,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos,
+        uint32_t                comp_row,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps,
+        uint32_t                il,
+        int                     row_field) {
+    return cuda_compressor_update_impl(0, kv_cur, sc_cur, state_kv, state_score, comp_cache,
+                                       model_map, model_size, ape_offset, ape_type,
+                                       norm_offset, norm_type, head_dim, ratio, pos, comp_row,
+                                       n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor,
+                                       attn_factor, beta_fast, beta_slow, rms_eps, il, row_field);
+}
+/* M2-Inc5: emit tail only -- for the fused compressor pair+store path, which
+ * has already written state_kv/state_score for this position. */
+extern "C" int ds4_gpu_compressor_update_tail_tensor(
+        const ds4_gpu_tensor *kv_cur,
+        const ds4_gpu_tensor *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        ds4_gpu_tensor       *comp_cache,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos,
+        uint32_t                comp_row,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps,
+        uint32_t                il,
+        int                     row_field) {
+    return cuda_compressor_update_impl(1, kv_cur, sc_cur, state_kv, state_score, comp_cache,
+                                       model_map, model_size, ape_offset, ape_type,
+                                       norm_offset, norm_type, head_dim, ratio, pos, comp_row,
+                                       n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor,
+                                       attn_factor, beta_fast, beta_slow, rms_eps, il, row_field);
 }
 extern "C" int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,

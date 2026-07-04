@@ -9270,6 +9270,71 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
     }
 }
 
+/* M2-Inc5 is CUDA-only: returning 0 sends ds4.c down the unfused
+ * pair-matmul + update chain. */
+int ds4_gpu_compressor_pair_store_fused_tensor(
+        ds4_gpu_tensor       *kv_cur,
+        ds4_gpu_tensor       *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                w_kv_offset,
+        uint64_t                w_sc_offset,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos,
+        uint64_t                in_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint32_t                il) {
+    (void)kv_cur; (void)sc_cur; (void)state_kv; (void)state_score;
+    (void)model_map; (void)model_size; (void)w_kv_offset; (void)w_sc_offset;
+    (void)ape_offset; (void)ape_type; (void)head_dim; (void)ratio; (void)pos;
+    (void)in_dim; (void)x; (void)n_tok; (void)il;
+    return 0;
+}
+
+/* M2-Inc5: emit-tail-only variant is never reached on Metal (the fused
+ * pair+store above always returns 0), but the symbol must exist. */
+int ds4_gpu_compressor_update_tail_tensor(
+        const ds4_gpu_tensor *kv_cur,
+        const ds4_gpu_tensor *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        ds4_gpu_tensor       *comp_cache,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos,
+        uint32_t                comp_row,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps,
+        uint32_t                il,
+        int                     row_field) {
+    (void)kv_cur; (void)sc_cur; (void)state_kv; (void)state_score;
+    (void)comp_cache; (void)model_map; (void)model_size; (void)ape_offset;
+    (void)ape_type; (void)norm_offset; (void)norm_type; (void)head_dim;
+    (void)ratio; (void)pos; (void)comp_row; (void)n_rot; (void)n_ctx_orig;
+    (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow; (void)rms_eps; (void)il; (void)row_field;
+    return 0;
+}
+
 int ds4_gpu_compressor_update_tensor(
         const ds4_gpu_tensor *kv_cur,
         const ds4_gpu_tensor *sc_cur,
