@@ -4779,6 +4779,45 @@ int ds4_gpu_argmax_rows_tensor(
     return 0;
 }
 
+int ds4_gpu_dspark_markov_step_tensor(
+        ds4_gpu_tensor       *cand_out,
+        const ds4_gpu_tensor *base_logits,
+        uint32_t                blk_pos,
+        uint32_t                B,
+        const ds4_gpu_tensor *bias,
+        uint32_t                vocab,
+        uint32_t                nb) {
+    (void)cand_out; (void)base_logits; (void)blk_pos; (void)B;
+    (void)bias; (void)vocab; (void)nb;
+    fprintf(stderr, "ds4: dspark_markov_step is CUDA-only (DSpark draft)\n");
+    return 0;
+}
+
+int ds4_gpu_dspark_gather_concat_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        const ds4_gpu_tensor *src_rows,
+        uint32_t                n_rows,
+        uint32_t                row_floats) {
+    (void)dst; (void)src; (void)src_rows; (void)n_rows; (void)row_floats;
+    fprintf(stderr, "ds4: dspark_gather_concat is CUDA-only (DSpark draft)\n");
+    return 0;
+}
+
+int ds4_gpu_dspark_capture_mean_tensor(
+        ds4_gpu_tensor       *concat,
+        const ds4_gpu_tensor *hc,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_tokens,
+        uint32_t                slot,
+        uint32_t                n_slots) {
+    (void)concat; (void)hc; (void)n_embd; (void)n_hc;
+    (void)n_tokens; (void)slot; (void)n_slots;
+    fprintf(stderr, "ds4: dspark_capture_mean is CUDA-only (DSpark draft)\n");
+    return 0;
+}
+
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
 
