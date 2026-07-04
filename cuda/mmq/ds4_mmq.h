@@ -311,6 +311,46 @@ int ds4_mmq_iq2_xxs_aligned_derepack(
     int             n_experts,
     cudaStream_t    stream);
 
+// M2 moe-down: aligned row-pair-SoA Q2_K routed-expert decode matvec.  Twin
+// of mul_mat_vec_q_moe<GGML_TYPE_Q2_K, 2> at the down-leg call shape
+// (n_expert_used == 1: each (token, slot) assignment is its own "token") with
+// bit-identical outputs; only the weight layout changes.  W_aligned is the
+// weight-server --repack-q2k-aligned artifact (DERIVED_Q2_K_ALIGNED_MOE,
+// REPLACES the raw range; byte-neutral):
+//
+//   npair = n_experts * (M/2) * (K/256)
+//   [ uint2 dm2[npair] ][ pad 64B ][ int4 sc4[npair*2] ][ pad 64B ]
+//   [ uint2 qs2[npair*16] ]
+//
+// keyed to the kernel's rows_per_block == 2 (see ds4_mmq.cu for the exact
+// field packing).  Use ds4_mmq_q2_k_aligned_bytes to size or validate an
+// artifact.  Unsupported shapes return non-zero so the caller can fall back.
+uint64_t ds4_mmq_q2_k_aligned_bytes(int M, int K, int n_experts);
+
+int ds4_mmq_q2_K_aligned_moe_vec(
+    const void    * W_aligned,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+// Exact inverse of the weight-server repack: fills raw_out (nblk * 84 bytes,
+// raw block_q2_K stream) from an aligned artifact, device->device on
+// `stream`, for the batched/mmq raw-layout consumers (same role as
+// ds4_mmq_iq2_xxs_aligned_derepack).
+int ds4_mmq_q2_K_aligned_derepack(
+    const void    * W_aligned,
+    void          * raw_out,
+    int             M,
+    int             K,
+    int             n_experts,
+    cudaStream_t    stream);
+
 // M1-Inc3: aligned-SoA Q8_0 dense decode matvec.  Artifact layout
 // [__half dq[nblk]][pad to 64B][int8 qs[nblk*32]], nblk = M * (K/32), block
 // order equal to the raw tensor byte order (weight server

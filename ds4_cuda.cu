@@ -406,6 +406,14 @@ enum cuda_derived_kind {
      * GEMV dispatches on the artifact (ds4_mmq_q8_0_aligned_dense_vec);
      * every other consumer reads raw as before. */
     CUDA_DERIVED_Q8_0_ALIGNED_DENSE = 5,
+    /* Aligned row-pair-SoA Q2_K expert repack (weight server
+     * --repack-q2k-aligned): the routed-expert down stacks.  Like the IQ2
+     * kind it REPLACES the raw range (byte-neutral, ~30 GiB would not fit
+     * twice); the decode vec tier dispatches ds4_mmq_q2_K_aligned_moe_vec,
+     * the batched/mmq tier de-repacks into a device scratch
+     * (cuda_moe_q2k_derepack_scratch), and any remaining raw consumer falls
+     * back to the client mmap. */
+    CUDA_DERIVED_Q2_K_ALIGNED_MOE = 6,
 };
 
 struct cuda_derived_range {
@@ -13383,6 +13391,22 @@ static uint32_t cuda_moe_iq2_aligned_enabled(void) {
     return v;
 }
 
+/* M2 moe-down: aligned row-pair-SoA Q2_K decode dispatch.  Active only when
+ * the weight server was started with --repack-q2k-aligned AND this kill
+ * switch is not set.  CAUTION: with a repacked manifest the raw down range is
+ * not served, so disabling this only drops the vec tier to the client-mmap
+ * raw path (~100x) — the real off switch is the weight server flag. */
+static uint32_t cuda_moe_q2k_aligned_enabled(void) {
+    static int init = 0;
+    static uint32_t v = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_MOE_NO_Q2K_ALIGNED");
+        if (s && *s && strcmp(s, "0") != 0) v = 0;
+    }
+    return v;
+}
+
 /* M1-Inc3: aligned-SoA Q8_0 dense decode dispatch.  Active only when the
  * weight server was started with --repack-q8-aligned AND this kill switch is
  * not set.  The artifacts are additive (raw stays served), so disabling just
@@ -13459,6 +13483,60 @@ static const char *cuda_moe_iq2_derepack_scratch(
         tag[which] = model_offset;
     }
     return (const char *)buf[which];
+}
+
+/* M2 moe-down: raw-layout device scratch for the batched/mmq down consumers
+ * when the raw Q2_K down span was excluded from the upload
+ * (--repack-q2k-aligned).  Same contract as cuda_moe_iq2_derepack_scratch:
+ * persistent buffer tagged by model offset, chunked-prefill refill per layer,
+ * NULL keeps the caller's mmap fallback.
+ * Kill switch: DS4_CUDA_MOE_NO_Q2K_DEREPACK=1. */
+static const char *cuda_moe_q2k_derepack_scratch(
+        const char *art,
+        uint64_t model_offset,
+        uint64_t raw_bytes,
+        uint32_t out_dim,
+        uint32_t expert_mid_dim,
+        uint32_t n_total_expert,
+        cudaStream_t stream) {
+    static int init = 0;
+    static uint32_t enabled = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_MOE_NO_Q2K_DEREPACK");
+        if (s && *s && strcmp(s, "0") != 0) enabled = 0;
+    }
+    if (!enabled || !art || raw_bytes == 0) return NULL;
+    if (ds4_capture_active()) return NULL;
+    static void    *buf       = NULL;
+    static uint64_t buf_bytes = 0;
+    static uint64_t tag       = UINT64_MAX;
+    if (buf_bytes < raw_bytes) {
+        if (buf) { (void)cudaFree(buf); buf = NULL; buf_bytes = 0; tag = UINT64_MAX; }
+        cudaError_t err = cudaMalloc(&buf, raw_bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: q2k derepack scratch alloc failed (%.1f MiB): %s; using mmap raw\n",
+                    (double)raw_bytes / (1024.0 * 1024.0), cudaGetErrorString(err));
+            buf = NULL;
+            enabled = 0;   /* don't retry the alloc every layer */
+            return NULL;
+        }
+        buf_bytes = raw_bytes;
+        tag = UINT64_MAX;
+        fprintf(stderr, "ds4: q2k derepack scratch active (down, %.1f MiB)\n",
+                (double)raw_bytes / (1024.0 * 1024.0));
+    }
+    if (tag != model_offset) {
+        if (ds4_mmq_q2_K_aligned_derepack(
+                art, buf,
+                (int)out_dim, (int)expert_mid_dim, (int)n_total_expert,
+                stream) != 0) {
+            tag = UINT64_MAX;
+            return NULL;
+        }
+        tag = model_offset;
+    }
+    return (const char *)buf;
 }
 
 /* FD Inc2b: attention output_a multi-column native ceiling.  n_tokens in
@@ -20060,13 +20138,33 @@ static int routed_moe_launch(
             up_iq2_aligned = NULL;
         }
     }
+    /* M2 moe-down: probe for the aligned row-pair-SoA Q2_K down artifact
+     * (weight server --repack-q2k-aligned).  Same replacement semantics as
+     * the iq2 gate/up artifacts: when present, the raw down range was
+     * EXCLUDED from the upload, so resolve it as a plain mmap pointer; the
+     * decode vec branch dispatches on the artifact and the batched/mmq path
+     * de-repacks into a device scratch. */
+    const char *down_q2k_aligned = NULL;
+    if (!q4k_path) {
+        const uint64_t q2k_al_bytes = ds4_mmq_q2_k_aligned_bytes(
+            (int)out_dim, (int)expert_mid_dim, (int)n_total_expert);
+        if (q2k_al_bytes != 0) {
+            down_q2k_aligned = cuda_derived_weight_ptr(
+                model_map, down_offset, down_bytes,
+                CUDA_DERIVED_Q2_K_ALIGNED_MOE,
+                expert_mid_dim, out_dim, n_total_expert,
+                q2k_al_bytes, "moe_down_q2k_aligned");
+        }
+    }
     const char *gate_w = gate_iq2_aligned
         ? cuda_model_ptr(model_map, gate_offset)
         : cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
     const char *up_w = up_iq2_aligned
         ? cuda_model_ptr(model_map, up_offset)
         : cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
-    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+    const char *down_w = down_q2k_aligned
+        ? cuda_model_ptr(model_map, down_offset)
+        : cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
     /* mmq routed-MoE fast path.  Gated on DS4_CUDA_USE_MMQ + n_tokens
@@ -20605,12 +20703,39 @@ static int routed_moe_launch(
                                               (int)n_assignments, (int)n_experts_total,
                                               /*n_expert_used=*/1, moe_stream);
                 } else {
-                    rc = ds4_mmq_q2_K_moe_vec(down_w, (const float *)mid->ptr,
-                                              (const int32_t *)selected->ptr,
-                                              (float *)down->ptr,
-                                              (int)out_dim, (int)expert_mid_dim,
-                                              (int)n_assignments, (int)n_experts_total,
-                                              /*n_expert_used=*/1, moe_stream);
+                    /* M2 moe-down: aligned row-pair-SoA twin of the raw vec
+                     * path, bit-identical outputs (proto_m2_q2k.cu 240/240 +
+                     * capture/replay; 214 GB/s vs 154 raw on the proto rig).
+                     * Any failure falls through to the raw vec entry, whose
+                     * down_w resolves to the plain mmap pointer when the raw
+                     * range was excluded from the upload. */
+                    rc = -1;
+                    if (down_q2k_aligned && cuda_moe_q2k_aligned_enabled()) {
+                        rc = ds4_mmq_q2_K_aligned_moe_vec(down_q2k_aligned,
+                                                          (const float *)mid->ptr,
+                                                          (const int32_t *)selected->ptr,
+                                                          (float *)down->ptr,
+                                                          (int)out_dim, (int)expert_mid_dim,
+                                                          (int)n_assignments, (int)n_total_expert,
+                                                          /*n_expert_used=*/1, moe_stream);
+                        if (rc == 0) {
+                            static int logged = 0;
+                            if (!logged) {
+                                logged = 1;
+                                fprintf(stderr, "ds4: M2 Q2K aligned moe-down active\n");
+                            }
+                        } else {
+                            fprintf(stderr, "ds4: ds4_mmq_q2_K_aligned_moe_vec returned %d; using raw vec path\n", rc);
+                        }
+                    }
+                    if (rc != 0) {
+                        rc = ds4_mmq_q2_K_moe_vec(down_w, (const float *)mid->ptr,
+                                                  (const int32_t *)selected->ptr,
+                                                  (float *)down->ptr,
+                                                  (int)out_dim, (int)expert_mid_dim,
+                                                  (int)n_assignments, (int)n_experts_total,
+                                                  /*n_expert_used=*/1, moe_stream);
+                    }
                 }
                 if (rc != 0) {
                     fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (down) returned %d; falling back\n", rc);
@@ -20811,7 +20936,20 @@ mmq_moe_path:
                 goto mmq_moe_fallback;
             }
         } else {
-            rc = ds4_mmq_q2_K_moe(down_w, (const float *)mid->ptr, (const int32_t *)selected->ptr,
+            /* M2 moe-down: when the raw down span was excluded from the
+             * upload (--repack-q2k-aligned), down_w points at the client
+             * mmap; de-repack the aligned artifact into the persistent
+             * device scratch instead (same pattern as the iq2 gate/up
+             * scratch above).  NULL keeps the mmap fallback. */
+            const char *down_mmq = down_w;
+            if (down_q2k_aligned && cuda_moe_q2k_aligned_enabled()) {
+                const char *d = cuda_moe_q2k_derepack_scratch(
+                    down_q2k_aligned, down_offset, down_bytes,
+                    out_dim, expert_mid_dim, n_total_expert,
+                    ds4_mmq_stream_for_call());
+                if (d) down_mmq = d;
+            }
+            rc = ds4_mmq_q2_K_moe(down_mmq, (const float *)mid->ptr, (const int32_t *)selected->ptr,
                                   (float *)down->ptr,
                                   (int)out_dim, (int)expert_mid_dim,
                                   (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1,

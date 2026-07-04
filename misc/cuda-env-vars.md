@@ -191,6 +191,26 @@ The bandwidth figure is informational; we don't tier on it.
   log: `iq2 derepack scratch active`. Disabling restores the mmap-raw
   behavior above; decode (`n_tokens=1`) is unaffected either way.
 
+- `DS4_CUDA_MOE_NO_Q2K_ALIGNED=1`. Kill switch for the row-pair-SoA Q2_K
+  moe-down decode path (megakernel program M2). The path activates
+  automatically at the vec-tier down leg when the weight server serves the
+  repacked artifact (`--repack-q2k-aligned`, opt-in, REPLACES the raw
+  `.ffn_down_exps` ranges at byte parity). Outputs are bit-identical to the
+  raw `mul_mat_vec_q_moe<Q2_K,2>` path (proto_m2_q2k.cu: 240/240 parity +
+  graph capture/replay); the twin reads at ~214 GB/s vs ~154 raw on the proto
+  rig. One-shot boot log: `M2 Q2K aligned moe-down active`. CAUTION: with a
+  repacked manifest the raw range is not served, so this switch drops the vec
+  tier to the client-mmap raw path (~100x) — the real off switch is
+  `--no-repack-q2k-aligned` on the weight server.
+
+- `DS4_CUDA_MOE_NO_Q2K_DEREPACK=1`. Kill switch for the moe-down raw-layout
+  device scratch (same contract as the IQ2 one above): with the q2k artifact
+  present, the prefill MMQ down path inverts the repack device->device
+  (`ds4_mmq_q2_K_aligned_derepack`) into one persistent ~672 MiB scratch,
+  refilled per layer, byte-exact. One-shot boot log:
+  `q2k derepack scratch active`. Disabling restores the mmap-raw prefill
+  behavior; the vec-tier decode path is unaffected either way.
+
 - `DS4_CUDA_NO_Q8_ALIGNED=1`. Kill switch for ALL aligned-SoA Q8_0 decode
   paths: the dense mmvq site (M1-Inc3) and the three custom warp8 kernels
   (M1-Inc4: hc_expand, q8 pair, grouped output_a). They activate
