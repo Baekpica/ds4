@@ -10812,7 +10812,9 @@ static bool metal_graph_matmul_plain_tensor(
  * falls back to this exact unfused chain when preconditions fail; callers
  * setting `fused` must have checked fn->type == DS4_TENSOR_F16.  When
  * !fuse_hc_norm the caller still runs its separate rms_norm_weight on
- * cur_out afterwards, exactly as before. */
+ * cur_out afterwards, exactly as before.  emit_q8 (M2-Inc1b): bit 0 when the
+ * next consumer of norm_out is a q8_0 GEMV prelude in this same encode (the
+ * decode-layer pair calls); 0 on the MTP/prefix paths. */
 static bool metal_graph_decode_hc_stage(
         ds4_gpu_graph        *g,
         const ds4_model      *model,
@@ -10824,7 +10826,8 @@ static bool metal_graph_decode_hc_stage(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *residual_hc,
         bool                  fuse_hc_norm,
-        bool                  fused) {
+        bool                  fused,
+        uint32_t              emit_q8) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     if (fused) {
@@ -10837,7 +10840,8 @@ static bool metal_graph_decode_hc_stage(
                                              norm_weight_offset,
                                              DS4_N_EMBD, DS4_N_HC,
                                              DS4_N_HC_SINKHORN_ITER,
-                                             DS4_HC_EPS, DS4_RMS_EPS) != 0;
+                                             DS4_HC_EPS, DS4_RMS_EPS,
+                                             emit_q8) != 0;
     }
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, residual_hc,
                                               (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
@@ -10938,7 +10942,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                              layer->hc_attn_base->abs_offset,
                                              layer->attn_norm->abs_offset,
                                              g->attn_cur, g->attn_norm, g->cur_hc,
-                                             fuse_hc_norm, hc_stage_fused);
+                                             fuse_hc_norm, hc_stage_fused,
+                                             1u /* q8_0: q_a+kv pair */);
     ds4_cuda_layer_graph_debug_peek("dbg:after-hc_stage");
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_pre");
     if (ok) {
@@ -11653,7 +11658,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                              layer->hc_ffn_base->abs_offset,
                                              layer->ffn_norm->abs_offset,
                                              g->ffn_cur, g->ffn_norm, g->after_attn_hc,
-                                             fuse_hc_norm, hc_stage_fused);
+                                             fuse_hc_norm, hc_stage_fused,
+                                             1u /* q8_0: shexp gate+up pair */);
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_pre");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
@@ -11887,7 +11893,7 @@ static bool metal_graph_encode_decode_ffn_half_exact(
                                              layer->hc_ffn_base->abs_offset,
                                              layer->ffn_norm->abs_offset,
                                              g->ffn_cur, g->ffn_norm, g->after_attn_hc,
-                                             fuse_hc_norm, hc_stage_fused);
+                                             fuse_hc_norm, hc_stage_fused, 0u);
     DS4_METAL_PROFILE_DECODE_FFN_STAGE("ffn_hc_pre");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
@@ -12075,7 +12081,7 @@ static bool metal_graph_encode_decode_ffn_prefix_exact(
                                           layer->hc_ffn_base->abs_offset,
                                           layer->ffn_norm->abs_offset,
                                           g->ffn_cur, g->ffn_norm, g->after_attn_hc,
-                                          fuse_hc_norm, hc_stage_fused);
+                                          fuse_hc_norm, hc_stage_fused, 0u);
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
         metal_graph_debug_dump_tensor("hc_ffn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);

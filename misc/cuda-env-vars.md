@@ -225,6 +225,17 @@ The bandwidth figure is informational; we don't tier on it.
   per-layer cudaGraphs and replay bit-identically (proto-proven on GB10 /
   CUDA 13).
 
+- `DS4_CUDA_NO_HC_Q8_FOLD=1`. Kill switch for the M2-Inc1b q8 activation
+  fold riding the fused HC stage: the cooperative kernel's final phase also
+  emits the q8_0 codes of `attn_norm`/`ffn_norm` (bit-exact vs
+  `quantize_q8_0_f32_kernel` — same butterfly reductions and rounding,
+  proto_m2_hc.cu V4), and the next q8_0 pair consumer (attn q_a+kv, shexp
+  gate+up) takes them instead of launching its quantize prelude — 2 fewer
+  launches/layer. Registry is encode-scoped, pointer+length keyed,
+  pop-on-lookup, reset at every fused-entry call. One-shot boot log:
+  `M2-Inc1b HC-stage q8 activation fold active (pair decode)`. Implicitly
+  off whenever the fused HC stage itself is off.
+
 - `DS4_CUDA_MMQ_X_MAX=N`. Clip `get_mmq_x_max_host` to N (rounded down to a
   multiple of 8) when sweeping tile widths. Diagnostic only; the vanilla
   128 wins on sm_120.

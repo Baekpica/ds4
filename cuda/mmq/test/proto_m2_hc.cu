@@ -607,6 +607,181 @@ __global__ static void hc_stage_coop3_kernel(
     }
 }
 
+/* ---------- V4: V3 + q8_0/q8_1 activation emission in the final phase ----
+ * (M2-Inc1b) The norm_out values are quantized in-register by the warp that
+ * writes them: each warp of the P5 col loop holds 32 consecutive columns =
+ * exactly one q8 block.  q8_0 mirrors quantize_q8_0_f32_kernel (d=max/127,
+ * lrintf, clamp); q8_1 mirrors the vendored quantize_q8_1 (roundf, ds=(d,sum),
+ * shfl_xor butterflies) so both are BIT-EXACT vs the standalone kernels. */
+typedef struct { __half2 ds; int8_t qs[32]; } block_q8_1_t;
+
+__global__ static void hc_stage_coop3_q8_kernel(
+        float *out, float *norm_out, float *split, float *mix_out,
+        float *scratch,
+        const __half *w, const float *x, const float *residual_hc,
+        const float *scale3, const float *base, const float *norm_w,
+        int8_t *q80_xq, float *q80_scale, block_q8_1_t *q81,
+        uint32_t n_embd, uint32_t in_dim,
+        uint32_t sinkhorn_iters, float epsv, float rms_eps, float norm_eps) {
+    cg::grid_group grid = cg::this_grid();
+    float *dots   = scratch;
+    float *ssq    = scratch + MIX_HC * SUBSEG;
+    float *ssq2   = ssq + 32u;
+    const uint32_t b = blockIdx.x;
+    const uint32_t d = threadIdx.x;
+    const uint32_t nt = blockDim.x;
+
+    /* P1 dots + sumsq (same as V3) */
+    {
+        const uint32_t row = b / SUBSEG;
+        const uint32_t sub = b % SUBSEG;
+        const uint64_t seg_len = in_dim / SUBSEG;
+        if (row < MIX_HC) {
+            const uint64_t k0 = (uint64_t)sub * seg_len;
+            const uint64_t k1 = k0 + seg_len;
+            const __half *wr = w + (uint64_t)row * in_dim;
+            float sum = 0.0f;
+            for (uint64_t i = k0 + (uint64_t)d * 8u; i < k1; i += (uint64_t)nt * 8u) {
+                const uint4 wv = *reinterpret_cast<const uint4 *>(wr + i);
+                const float4 xa = *reinterpret_cast<const float4 *>(x + i);
+                const float4 xb = *reinterpret_cast<const float4 *>(x + i + 4);
+                const __half2 *h = reinterpret_cast<const __half2 *>(&wv);
+                const float2 w0 = __half22float2(h[0]);
+                const float2 w1 = __half22float2(h[1]);
+                const float2 w2 = __half22float2(h[2]);
+                const float2 w3 = __half22float2(h[3]);
+                sum += w0.x * xa.x + w0.y * xa.y + w1.x * xa.z + w1.y * xa.w
+                     + w2.x * xb.x + w2.y * xb.y + w3.x * xb.z + w3.y * xb.w;
+            }
+            sum = block_reduce_sum_256(sum);
+            if (d == 0u) dots[(uint64_t)row * SUBSEG + sub] = sum;
+        }
+    }
+    if (b < 32u) {
+        const uint64_t seg32 = in_dim / 32u;
+        const uint64_t k0 = (uint64_t)b * seg32;
+        float ss = 0.0f;
+        for (uint64_t i = k0 + d; i < k0 + seg32; i += nt) { float v = x[i]; ss += v * v; }
+        ss = block_reduce_sum_256(ss);
+        if (d == 0u) ssq[b] = ss;
+    }
+    grid.sync();
+
+    /* P2 (same as V3) */
+    if (b == 0u && d < 32u) {
+        float rms_scale;
+        {
+            float ss = 0.0f;
+            for (uint32_t k = 0u; k < 32u; k++) ss += ssq[k];
+            rms_scale = rsqrtf(ss / (float)in_dim + rms_eps);
+        }
+        if (d < MIX_HC) {
+            float s = 0.0f;
+            for (uint32_t k = 0u; k < SUBSEG; k++) s += dots[(uint64_t)d * SUBSEG + k];
+            mix_out[d] = s * rms_scale;
+        }
+        __syncwarp();
+        if (d < 16u) hc4_split_warp16(split, mix_out, scale3, base, sinkhorn_iters, epsv, d);
+    }
+    grid.sync();
+
+    /* P3 (same as V3) */
+    {
+        float s0 = split[0], s1 = split[1], s2 = split[2], s3 = split[3];
+        float sum = 0.0f;
+        for (uint32_t col = b * nt + d; col < n_embd; col += COOP_BLOCKS * nt) {
+            float acc = residual_hc[col] * s0
+                      + residual_hc[n_embd + col] * s1
+                      + residual_hc[2u * n_embd + col] * s2
+                      + residual_hc[3u * n_embd + col] * s3;
+            out[col] = acc;
+            sum += acc * acc;
+        }
+        sum = block_reduce_sum_256(sum);
+        if (d == 0u) ssq2[b] = sum;
+    }
+    grid.sync();
+
+    /* P5 + q8 emission: warp lanes hold 32 consecutive cols (all strides are
+     * multiples of 32), so each warp emits exactly one q8 block per pass. */
+    {
+        __shared__ float ns_sh;
+        if (d == 0u) {
+            float ss = 0.0f;
+            for (uint32_t k = 0u; k < COOP_BLOCKS; k++) ss += ssq2[k];
+            ns_sh = rsqrtf(ss / (float)n_embd + norm_eps);
+        }
+        __syncthreads();
+        const float ns = ns_sh;
+        const uint32_t lane = d & 31u;
+        for (uint32_t col = b * nt + d; col < n_embd; col += COOP_BLOCKS * nt) {
+            const float v = out[col] * ns * norm_w[col];
+            norm_out[col] = v;
+            if (q80_xq || q81) {
+                const uint32_t qb = col >> 5u;
+                float amax = fabsf(v);
+                for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off, 32));
+                if (q80_xq) {
+                    const float d8 = amax / 127.0f;
+                    const float id8 = d8 != 0.0f ? 1.0f / d8 : 0.0f;
+                    int q = (int)lrintf(v * id8);
+                    q = q > 127 ? 127 : (q < -128 ? -128 : q);
+                    q80_xq[(uint64_t)qb * 32u + lane] = (int8_t)q;
+                    if (lane == 0u) q80_scale[qb] = d8;
+                }
+                if (q81) {
+                    float s = v;
+                    for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                        s += __shfl_xor_sync(0xffffffffu, s, off, 32);
+                    const float d1 = amax / 127.0f;
+                    const int8_t q = amax == 0.0f ? (int8_t)0 : (int8_t)roundf(v / d1);
+                    q81[qb].qs[lane] = q;
+                    if (lane == 0u) q81[qb].ds = __floats2half2_rn(d1, s);
+                }
+            }
+        }
+    }
+}
+
+/* reference quantizers (verbatim semantics of the production kernels) */
+__global__ static void ref_quantize_q8_0_kernel(
+        int8_t *xq, float *xscale, const float *x, uint32_t in_dim) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t i0 = b * 32u;
+    const float *xr = x + i0;
+    float a = threadIdx.x < 32u ? fabsf(xr[threadIdx.x]) : 0.0f;
+    __shared__ float vals[32];
+    vals[threadIdx.x] = a;
+    __syncthreads();
+    for (uint32_t stride = 16; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float d = vals[0] / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    if (threadIdx.x == 0) xscale[b] = d;
+    int v = (int)lrintf(xr[threadIdx.x] * id);
+    v = v > 127 ? 127 : (v < -128 ? -128 : v);
+    xq[b * 32u + threadIdx.x] = (int8_t)v;
+    (void)in_dim;
+}
+__global__ static void ref_quantize_q8_1_kernel(block_q8_1_t *y, const float *x, uint32_t n) {
+    const uint32_t i = blockIdx.x * 32u + threadIdx.x;
+    if (i >= n) return;
+    const float xi = x[i];
+    float amax = fabsf(xi);
+    float sum = xi;
+    for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off, 32));
+        sum += __shfl_xor_sync(0xffffffffu, sum, off, 32);
+    }
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? (int8_t)0 : (int8_t)roundf(xi / d);
+    y[blockIdx.x].qs[threadIdx.x] = q;
+    if (threadIdx.x == 0) y[blockIdx.x].ds = __floats2half2_rn(d, sum);
+}
+
 /* ---------- host reference (double) ---------- */
 static void ref_chain(double *out, double *norm_out, double *split24, double *mix24,
                       const float *x, const __half *w_h, const float *scale3,
@@ -692,6 +867,10 @@ struct Bufs {
     float *partial;               /* 24*32 */
     float *ssq;                   /* 32 */
     float *coop_scratch;          /* 24*4+32+96+2 */
+    int8_t *q80; float *q80s;     /* V4 emission: q8_0 codes + scales */
+    block_q8_1_t *q81;            /* V4 emission: q8_1 blocks */
+    int8_t *q80r; float *q80sr;   /* reference quantizer outputs */
+    block_q8_1_t *q81r;
 };
 
 static void launch_v0(const Bufs &B, int li, cudaStream_t st) {
@@ -732,6 +911,20 @@ static cudaError_t launch_v2(const Bufs &B, int li, cudaStream_t st) {
 static cudaError_t launch_v3(const Bufs &B, int li, cudaStream_t st) {
     return launch_coop(B, li, st, (void *)hc_stage_coop3_kernel);
 }
+static cudaError_t launch_v4(const Bufs &B, int li, cudaStream_t st) {
+    uint32_t n_embd = N_EMBD, in_dim = HC_DIM, sink = SINK_IT;
+    float epsv = HC_EPS, rms_eps = RMS_EPS, norm_eps = RMS_EPS;
+    void *args[] = {
+        (void *)&B.out, (void *)&B.norm_out, (void *)&B.split, (void *)&B.mix,
+        (void *)&B.coop_scratch,
+        (void *)&B.w[li], (void *)&B.x, (void *)&B.x,
+        (void *)&B.scale3, (void *)&B.base, (void *)&B.norm_w[li],
+        (void *)&B.q80, (void *)&B.q80s, (void *)&B.q81,
+        (void *)&n_embd, (void *)&in_dim, (void *)&sink,
+        (void *)&epsv, (void *)&rms_eps, (void *)&norm_eps };
+    return cudaLaunchCooperativeKernel((void *)hc_stage_coop3_q8_kernel,
+            dim3(COOP_BLOCKS, 1, 1), dim3(256, 1, 1), args, 0, st);
+}
 
 int main() {
     Bufs B;
@@ -763,6 +956,13 @@ int main() {
     CK(cudaMalloc(&B.partial, MIX_HC * KSPLIT * sizeof(float)));
     CK(cudaMalloc(&B.ssq, KSPLIT * sizeof(float)));
     CK(cudaMalloc(&B.coop_scratch, 512 * sizeof(float)));
+    const uint32_t qblocks = N_EMBD / 32u;
+    CK(cudaMalloc(&B.q80, qblocks * 32u));
+    CK(cudaMalloc(&B.q80s, qblocks * sizeof(float)));
+    CK(cudaMalloc(&B.q81, qblocks * sizeof(block_q8_1_t)));
+    CK(cudaMalloc(&B.q80r, qblocks * 32u));
+    CK(cudaMalloc(&B.q80sr, qblocks * sizeof(float)));
+    CK(cudaMalloc(&B.q81r, qblocks * sizeof(block_q8_1_t)));
     CK(cudaMemcpy(B.scale3, sc_host, 3 * sizeof(float), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(B.base, base_host, MIX_HC * sizeof(float), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(B.x, x_host, HC_DIM * sizeof(float), cudaMemcpyHostToDevice));
@@ -792,17 +992,37 @@ int main() {
     cudaStream_t st;
     CK(cudaStreamCreate(&st));
 
-    const char *names[4] = { "V0-baseline", "V1-fused2", "V2-coop1", "V3-coop3sync" };
-    for (int v = 0; v < 4; v++) {
+    const char *names[5] = { "V0-baseline", "V1-fused2", "V2-coop1", "V3-coop3sync", "V4-coop3+q8emit" };
+    for (int v = 0; v < 5; v++) {
         CK(cudaMemsetAsync(B.out, 0, N_EMBD * sizeof(float), st));
         CK(cudaMemsetAsync(B.norm_out, 0, N_EMBD * sizeof(float), st));
         if (v == 0) launch_v0(B, 0, st);
         else if (v == 1) launch_v1(B, 0, st);
         else {
-            cudaError_t e = v == 2 ? launch_v2(B, 0, st) : launch_v3(B, 0, st);
+            cudaError_t e = v == 2 ? launch_v2(B, 0, st) : (v == 3 ? launch_v3(B, 0, st) : launch_v4(B, 0, st));
             if (e != cudaSuccess) { printf("%s: coop launch FAILED: %s\n", names[v], cudaGetErrorString(e)); continue; }
         }
         CK(cudaStreamSynchronize(st));
+        if (v == 4) {
+            /* q8 emission bit-exactness vs the reference quantizers run on
+             * this very norm_out */
+            ref_quantize_q8_0_kernel<<<qblocks, 32, 0, st>>>(B.q80r, B.q80sr, B.norm_out, N_EMBD);
+            ref_quantize_q8_1_kernel<<<qblocks, 32, 0, st>>>(B.q81r, B.norm_out, N_EMBD);
+            CK(cudaStreamSynchronize(st));
+            int8_t hq[2][128 * 32]; float hs[2][128];
+            block_q8_1_t h1[2][128];
+            CK(cudaMemcpy(hq[0], B.q80, qblocks * 32u, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(hq[1], B.q80r, qblocks * 32u, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(hs[0], B.q80s, qblocks * sizeof(float), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(hs[1], B.q80sr, qblocks * sizeof(float), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(h1[0], B.q81, qblocks * sizeof(block_q8_1_t), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(h1[1], B.q81r, qblocks * sizeof(block_q8_1_t), cudaMemcpyDeviceToHost));
+            int bad80 = memcmp(hq[0], hq[1], qblocks * 32u) != 0 ||
+                        memcmp(hs[0], hs[1], qblocks * sizeof(float)) != 0;
+            int bad81 = memcmp(h1[0], h1[1], qblocks * sizeof(block_q8_1_t)) != 0;
+            printf("V4 q8 emission: q8_0 %s, q8_1 %s (vs reference quantizers, bit-exact)\n",
+                   bad80 ? "MISMATCH" : "OK", bad81 ? "MISMATCH" : "OK");
+        }
         CK(cudaMemcpy(h_out, B.out, N_EMBD * sizeof(float), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(h_norm, B.norm_out, N_EMBD * sizeof(float), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(h_split, B.split, 24 * sizeof(float), cudaMemcpyDeviceToHost));
@@ -822,13 +1042,14 @@ int main() {
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));
-    for (int v = 0; v < 4; v++) {
+    for (int v = 0; v < 5; v++) {
         /* warmup */
         bool bad = false;
         for (int l = 0; l < N_LAYERS && !bad; l++) {
             if (v == 0) launch_v0(B, l, st);
             else if (v == 1) launch_v1(B, l, st);
-            else if ((v == 2 ? launch_v2(B, l, st) : launch_v3(B, l, st)) != cudaSuccess) bad = true;
+            else if ((v == 2 ? launch_v2(B, l, st)
+                             : (v == 3 ? launch_v3(B, l, st) : launch_v4(B, l, st))) != cudaSuccess) bad = true;
         }
         if (bad) { printf("%s: skipped (launch failed)\n", names[v]); continue; }
         CK(cudaStreamSynchronize(st));
@@ -838,7 +1059,8 @@ int main() {
                 if (v == 0) launch_v0(B, l, st);
                 else if (v == 1) launch_v1(B, l, st);
                 else if (v == 2) (void)launch_v2(B, l, st);
-                else (void)launch_v3(B, l, st);
+                else if (v == 3) (void)launch_v3(B, l, st);
+                else (void)launch_v4(B, l, st);
             }
         CK(cudaEventRecord(e1, st));
         CK(cudaStreamSynchronize(st));
@@ -849,13 +1071,13 @@ int main() {
     }
 
     /* ---- graph capture/replay test ---- */
-    for (int v = 1; v < 4; v++) {
+    for (int v = 1; v < 5; v++) {
         cudaGraph_t graph;
         cudaError_t e = cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal);
         if (e != cudaSuccess) { printf("%s capture begin failed: %s\n", names[v], cudaGetErrorString(e)); continue; }
         if (v == 1) launch_v1(B, 0, st);
         else {
-            e = v == 2 ? launch_v2(B, 0, st) : launch_v3(B, 0, st);
+            e = v == 2 ? launch_v2(B, 0, st) : (v == 3 ? launch_v3(B, 0, st) : launch_v4(B, 0, st));
             if (e != cudaSuccess) {
                 printf("%s: coop launch UNDER CAPTURE failed: %s\n", names[v], cudaGetErrorString(e));
                 cudaStreamEndCapture(st, &graph);
@@ -869,7 +1091,8 @@ int main() {
         e = cudaGraphInstantiate(&gexec, graph, NULL, NULL, 0);
         if (e != cudaSuccess) { printf("%s graph instantiate failed: %s\n", names[v], cudaGetErrorString(e)); cudaGraphDestroy(graph); cudaGetLastError(); continue; }
         /* eager result */
-        if (v == 1) launch_v1(B, 0, st); else if (v == 2) (void)launch_v2(B, 0, st); else (void)launch_v3(B, 0, st);
+        if (v == 1) launch_v1(B, 0, st); else if (v == 2) (void)launch_v2(B, 0, st);
+        else if (v == 3) (void)launch_v3(B, 0, st); else (void)launch_v4(B, 0, st);
         CK(cudaStreamSynchronize(st));
         CK(cudaMemcpy(h_out, B.norm_out, N_EMBD * sizeof(float), cudaMemcpyDeviceToHost));
         /* replayed result */

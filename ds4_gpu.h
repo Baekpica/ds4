@@ -1556,7 +1556,11 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
  * CUDA runs one cooperative kernel when preconditions hold (n_hc==4, F16 fn
  * weights, decode single row); otherwise -- and always on Metal -- it
  * executes the unfused chain.  flat_scratch is only written on the fallback
- * path.  Kill switch: DS4_CUDA_NO_HC_STAGE_FUSED. */
+ * path.  Kill switch: DS4_CUDA_NO_HC_STAGE_FUSED.
+ * emit_q8 (M2-Inc1b, CUDA fused path only): bit 0 emits q8_0 codes of
+ * norm_out in-kernel and hands them to the next consumer entry, eliding its
+ * quantize prelude; pass 0 unless a q8_0 GEMV consumes norm_out next.  Fold
+ * kill switch: DS4_CUDA_NO_HC_Q8_FOLD. */
 int ds4_gpu_hc_stage_fused_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
@@ -1574,7 +1578,8 @@ int ds4_gpu_hc_stage_fused_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps,
-        float                   norm_eps);
+        float                   norm_eps,
+        uint32_t                emit_q8);
 
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,

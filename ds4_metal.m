@@ -15860,7 +15860,9 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
  * batched prefill keeps using the existing two-stage path. */
 /* M2-Inc1: Metal has no cooperative-launch fused HC stage; compose the
  * unfused chain so the shared decode encoder can call one entry on both
- * backends.  flat_scratch takes the rms-normed vector exactly as before. */
+ * backends.  flat_scratch takes the rms-normed vector exactly as before.
+ * emit_q8 (M2-Inc1b) is a CUDA-only fold hint — ignored here, consumers
+ * quantize their own inputs as always. */
 int ds4_gpu_hc_stage_fused_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
@@ -15878,9 +15880,11 @@ int ds4_gpu_hc_stage_fused_tensor(
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps,
-        float                   norm_eps) {
+        float                   norm_eps,
+        uint32_t                emit_q8) {
     const uint64_t in_dim = (uint64_t)n_hc * n_embd;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    (void)emit_q8;
     if (!flat_scratch) return 0;
     if (!ds4_gpu_rms_norm_plain_tensor(flat_scratch, residual_hc, (uint32_t)in_dim, norm_eps)) return 0;
     if (!ds4_gpu_matmul_f16_tensor(mix, model_map, model_size, fn_weight_offset,
