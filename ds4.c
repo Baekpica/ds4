@@ -10867,6 +10867,53 @@ static bool metal_graph_decode_hc_stage(
     return ok;
 }
 
+/* One decode router stage: f16 logits matmul (ffn_gate_inp on ffn_norm) +
+ * top-6 select/weights.  M2-Inc3 first attempts the fused cooperative kernel
+ * (bit-identical to the chain below; kill switch DS4_CUDA_NO_ROUTER_FUSED);
+ * on any precondition miss it runs the exact original two-call chain. */
+static bool metal_graph_decode_router(
+        ds4_gpu_graph           *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        int                      token) {
+    if (layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
+        ds4_gpu_router_fused_tensor(g->router_logits, g->router_selected,
+                                    g->router_weights, g->router_probs,
+                                    model->map, model->size,
+                                    layer->ffn_gate_inp->abs_offset,
+                                    layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                    layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                                    layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+                                    (uint32_t)token,
+                                    DS4_N_EXPERT,
+                                    DS4_N_EXPERT_USED,
+                                    DS4_EXPERT_WEIGHT_SCALE,
+                                    0,
+                                    0,
+                                    layer->ffn_exp_probs_b != NULL,
+                                    layer->ffn_gate_tid2eid != NULL,
+                                    g->ffn_norm, DS4_N_EMBD, 1) != 0) {
+        return true;
+    }
+    /* Unfused fallback: the exact original two-call chain. */
+    if (!metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
+                                         DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1)) return false;
+    return ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
+                                        model->map, model->size,
+                                        layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                        layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                                        layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+                                        (uint32_t)token,
+                                        DS4_N_EXPERT,
+                                        DS4_N_EXPERT_USED,
+                                        DS4_EXPERT_WEIGHT_SCALE,
+                                        0,
+                                        0,
+                                        layer->ffn_exp_probs_b != NULL,
+                                        layer->ffn_gate_tid2eid != NULL,
+                                        g->router_logits) != 0;
+}
+
 static bool metal_graph_encode_decode_layer_impl(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -11724,22 +11771,7 @@ static bool metal_graph_encode_decode_layer_impl(
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
-                                                 DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
-    if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
-                                                model->map, model->size,
-                                                layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
-                                                layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
-                                                layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
-                                                (uint32_t)token,
-                                                DS4_N_EXPERT,
-                                                DS4_N_EXPERT_USED,
-                                                DS4_EXPERT_WEIGHT_SCALE,
-                                                0,
-                                                0,
-                                                layer->ffn_exp_probs_b != NULL,
-                                                layer->ffn_gate_tid2eid != NULL,
-                                                g->router_logits) != 0;
+    if (ok) ok = metal_graph_decode_router(g, model, layer, token);
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
@@ -11958,22 +11990,7 @@ static bool metal_graph_encode_decode_ffn_half_exact(
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
-                                                 DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
-    if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
-                                                model->map, model->size,
-                                                layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
-                                                layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
-                                                layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
-                                                (uint32_t)token,
-                                                DS4_N_EXPERT,
-                                                DS4_N_EXPERT_USED,
-                                                DS4_EXPERT_WEIGHT_SCALE,
-                                                0,
-                                                0,
-                                                layer->ffn_exp_probs_b != NULL,
-                                                layer->ffn_gate_tid2eid != NULL,
-                                                g->router_logits) != 0;
+    if (ok) ok = metal_graph_decode_router(g, model, layer, token);
     DS4_METAL_PROFILE_DECODE_FFN_STAGE("router");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
@@ -12141,30 +12158,7 @@ static bool metal_graph_encode_decode_ffn_prefix_exact(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits,
-                                                 model,
-                                                 layer->ffn_gate_inp,
-                                                 DS4_N_EMBD,
-                                                 DS4_N_EXPERT,
-                                                 g->ffn_norm,
-                                                 1);
-    if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected,
-                                                g->router_weights,
-                                                g->router_probs,
-                                                model->map,
-                                                model->size,
-                                                layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
-                                                layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
-                                                layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
-                                                (uint32_t)token,
-                                                DS4_N_EXPERT,
-                                                DS4_N_EXPERT_USED,
-                                                DS4_EXPERT_WEIGHT_SCALE,
-                                                0,
-                                                0,
-                                                layer->ffn_exp_probs_b != NULL,
-                                                layer->ffn_gate_tid2eid != NULL,
-                                                g->router_logits) != 0;
+    if (ok) ok = metal_graph_decode_router(g, model, layer, token);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);

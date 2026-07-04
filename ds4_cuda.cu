@@ -517,6 +517,10 @@ static void   *g_q8_fold_q81_buf[2] = { NULL, NULL };
 static int     g_q8_fold_q80_idx = 0;
 static int     g_q8_fold_q81_idx = 0;
 static void cuda_q8_fold_reset(void);
+/* M2-Inc3: split-K partials scratch for the fused router kernel (256 rows x
+ * 8 ksegs).  Dedicated static like the sidecar rings above -- never
+ * cuda_tmp_alloc -- and eager-init for a capture-stable pointer. */
+static float *g_router_fused_partials = NULL;
 /* SM count cached in ds4_gpu_init; gates the flash-decode attention split so it
  * only engages when the per-head attention grid (n_head blocks) under-fills the
  * machine (n_head < SM count). On small-SM integrated GPUs (GB10, 48 SMs, 64
@@ -2477,6 +2481,17 @@ extern "C" int ds4_gpu_init(void) {
             (void)cudaGetLastError();
         }
     }
+    /* M2-Inc3 fused router split-K partials (256 rows x 8 ksegs).  A failure
+     * just disables the fused router (the entry falls back to the 3-kernel
+     * chain). */
+    if (g_router_fused_partials == NULL) {
+        void *p = NULL;
+        if (cudaMalloc(&p, 2048u * sizeof(float)) == cudaSuccess) {
+            g_router_fused_partials = (float *)p;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
     /* M2-Inc1b/2a q8 fold sidecars: DEDICATED double-buffered rings.
      * cuda_tmp_alloc is a single shared sticky scratch (every caller gets
      * the same pointer), so sidecars must NOT come from it: two sidecar
@@ -2584,6 +2599,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         if (g_q8_fold_q81_buf[i]) { (void)cudaFree(g_q8_fold_q81_buf[i]); g_q8_fold_q81_buf[i] = NULL; }
     }
     cuda_q8_fold_reset();
+    if (g_router_fused_partials) {
+        (void)cudaFree(g_router_fused_partials);
+        g_router_fused_partials = NULL;
+    }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -9467,6 +9486,209 @@ __global__ static void router_select_warp_topk_kernel(
         sum = fmaxf(sum, 6.103515625e-5f);
         #pragma unroll
         for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+    }
+}
+
+/* M2-Inc3: the whole decode router stage -- f16 logits matmul (in 4096, out
+ * 256 = n_expert), split-K combine, and top-6 select -- as ONE cooperative
+ * kernel, replacing the matmul_f16_splitk + combine + select_warp_topk chain
+ * (three launches, and a select whose small model-map reads sit exposed on
+ * the critical path).
+ *
+ * Bit-exactness (gate: proto cuda/mmq/test/proto_m2_router.cu, 240/240
+ * bit-identical + capture==eager): the ref splitk (row,kseg) block at this
+ * shape (seg 512, vec path) gives each thread tid<64 exactly one 8-half
+ * chunk, and its block_reduce_sum_256 reduces warp 0 (chunks 0..31) and
+ * warp 1 (chunks 32..63) with warp_sum_f32 before a cross-warp tree that
+ * only adds those two warp sums and exact zeros.  Phase 1 below computes the
+ * SAME chunk values at the SAME lanes with the SAME warp_sum_f32 trees and
+ * stores s0+s1 -- identical up to x+0.0f==x (breaks only for a partial that
+ * is exactly -0.0f, i.e. an all-zero activation segment: unreachable for
+ * rms-normed activations, and select-invariant even then).  Phases 2/3 are
+ * the combine and select-warp bodies verbatim (bias/hash reads swapped for
+ * smem copies prefetched in phase 0 so their model-map latency hides behind
+ * the matmul). */
+#define DS4_ROUTER_FUSE_IN     4096u
+#define DS4_ROUTER_FUSE_OUT    256u
+#define DS4_ROUTER_FUSE_KSPLIT 8u
+#define DS4_ROUTER_FUSE_SEG    512u
+#define DS4_ROUTER_FUSE_BLOCKS 128u
+
+__global__ static void router_fused_coop_kernel(
+        float *logits,            /* [256] */
+        float *partials,          /* [256*8] g_router_fused_partials */
+        int32_t *selected,        /* [6] */
+        float *weights,           /* [6] */
+        float *probs,             /* [256] */
+        const __half *w,          /* [256][4096] f16 gate_inp */
+        const float *x,           /* [4096] ffn_norm */
+        const float *bias,        /* [256] or NULL */
+        const int32_t *hash,      /* [hash_rows][6] or NULL */
+        const int32_t *tokens,    /* decode: NULL */
+        int32_t token_scalar,
+        uint32_t hash_rows,
+        int has_bias,
+        int hash_mode,
+        const struct ds4_decode_scalars *scalars) {
+    __shared__ float sbias[DS4_ROUTER_FUSE_OUT];
+    __shared__ float sprob[DS4_ROUTER_FUSE_OUT];
+    __shared__ int32_t shash[6];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+
+    /* Phase 0 (block 0): prefetch the tail's small model-map reads. */
+    if (blockIdx.x == 0u) {
+        if (has_bias) sbias[threadIdx.x] = bias[threadIdx.x];
+        if (hash_mode && threadIdx.x == 0u) {
+            int32_t tok = tokens ? tokens[0]
+                                 : (scalars ? (int32_t)scalars->token : token_scalar);
+            if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
+            const int32_t *row = hash + (uint64_t)tok * 6u;
+            #pragma unroll
+            for (uint32_t j = 0; j < 6u; j++) shash[j] = row[j];
+        }
+    }
+
+    /* Phase 1: split-K logits matmul, one warp per (row, kseg) tile. */
+    const uint32_t nwarp = gridDim.x * (blockDim.x >> 5u);
+    for (uint32_t t = blockIdx.x * (blockDim.x >> 5u) + warp;
+         t < DS4_ROUTER_FUSE_OUT * DS4_ROUTER_FUSE_KSPLIT; t += nwarp) {
+        const uint32_t row = t >> 3u;
+        const uint32_t kseg = t & 7u;
+        const uint64_t k0 = (uint64_t)kseg * DS4_ROUTER_FUSE_SEG;
+        const __half *wr = w + (uint64_t)row * DS4_ROUTER_FUSE_IN;
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        {
+            const uint64_t i = k0 + (uint64_t)lane * 8u;
+            const uint4 wv = *reinterpret_cast<const uint4 *>(wr + i);
+            const float4 xa = *reinterpret_cast<const float4 *>(x + i);
+            const float4 xb = *reinterpret_cast<const float4 *>(x + i + 4);
+            const __half2 *h = reinterpret_cast<const __half2 *>(&wv);
+            const float2 w0 = __half22float2(h[0]);
+            const float2 w1 = __half22float2(h[1]);
+            const float2 w2 = __half22float2(h[2]);
+            const float2 w3 = __half22float2(h[3]);
+            sum0 += w0.x * xa.x + w0.y * xa.y + w1.x * xa.z + w1.y * xa.w
+                  + w2.x * xb.x + w2.y * xb.y + w3.x * xb.z + w3.y * xb.w;
+        }
+        {
+            const uint64_t i = k0 + ((uint64_t)lane + 32u) * 8u;
+            const uint4 wv = *reinterpret_cast<const uint4 *>(wr + i);
+            const float4 xa = *reinterpret_cast<const float4 *>(x + i);
+            const float4 xb = *reinterpret_cast<const float4 *>(x + i + 4);
+            const __half2 *h = reinterpret_cast<const __half2 *>(&wv);
+            const float2 w0 = __half22float2(h[0]);
+            const float2 w1 = __half22float2(h[1]);
+            const float2 w2 = __half22float2(h[2]);
+            const float2 w3 = __half22float2(h[3]);
+            sum1 += w0.x * xa.x + w0.y * xa.y + w1.x * xa.z + w1.y * xa.w
+                  + w2.x * xb.x + w2.y * xb.y + w3.x * xb.z + w3.y * xb.w;
+        }
+        const float s0 = warp_sum_f32(sum0);
+        const float s1 = warp_sum_f32(sum1);
+        if (lane == 0u) partials[(uint64_t)row * DS4_ROUTER_FUSE_KSPLIT + kseg] = s0 + s1;
+    }
+
+    cooperative_groups::this_grid().sync();
+    if (blockIdx.x != 0u) return;
+
+    /* Phase 2: combine partials in fixed kseg order (verbatim combine kernel;
+     * out_dim 256 == one 256-thread block). */
+    {
+        const uint64_t row = (uint64_t)threadIdx.x;
+        const float *p = partials + row * DS4_ROUTER_FUSE_KSPLIT;
+        float s = 0.0f;
+        for (uint32_t k = 0u; k < DS4_ROUTER_FUSE_KSPLIT; k++) s += p[k];
+        logits[row] = s;
+    }
+    __syncthreads();
+
+    /* Phase 3: verbatim router_select_warp_topk_kernel warp body (t = 0,
+     * row_in_block = 0). */
+    if (warp != 0u) return;
+    const float *log = logits;
+    float local_prob[8];
+    float local_score[8];
+    #pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) {
+        const uint32_t e = lane + j * 32u;
+        const float p = sqrtf(softplus_dev(log[e]));
+        local_prob[j] = p;
+        local_score[j] = p + (has_bias ? sbias[e] : 0.0f);
+        sprob[e] = p;
+        probs[e] = p;
+    }
+    __syncwarp();
+
+    if (hash_mode) {
+        if (lane == 0u) {
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint32_t j = 0; j < 6u; j++) {
+                const int32_t e = shash[j];
+                selected[j] = e;
+                const float v = (e >= 0 && e < 256) ? sprob[(uint32_t)e] : 0.0f;
+                weights[j] = v;
+                sum += v;
+            }
+            sum = fmaxf(sum, 6.103515625e-5f);
+            #pragma unroll
+            for (uint32_t j = 0; j < 6u; j++) weights[j] = weights[j] / sum * 1.5f;
+        }
+        return;
+    }
+
+    float out_prob[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t out_idx[6] = {0, 0, 0, 0, 0, 0};
+    #pragma unroll
+    for (uint32_t k = 0; k < 6u; k++) {
+        float best_score = -INFINITY;
+        float best_prob = 0.0f;
+        uint32_t best_idx = UINT32_MAX;
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t e = lane + j * 32u;
+            const float s = local_score[j];
+            if (router_score_better(s, e, best_score, best_idx)) {
+                best_score = s;
+                best_prob = local_prob[j];
+                best_idx = e;
+            }
+        }
+        #pragma unroll
+        for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+            const float other_score = __shfl_xor_sync(0xffffffffu, best_score, mask);
+            const float other_prob = __shfl_xor_sync(0xffffffffu, best_prob, mask);
+            const uint32_t other_idx = __shfl_xor_sync(0xffffffffu, best_idx, mask);
+            if (router_score_better(other_score, other_idx, best_score, best_idx)) {
+                best_score = other_score;
+                best_prob = other_prob;
+                best_idx = other_idx;
+            }
+        }
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t e = lane + j * 32u;
+            if (e == best_idx) local_score[j] = -INFINITY;
+        }
+        if (lane == 0) {
+            out_idx[k] = best_idx;
+            out_prob[k] = best_prob;
+        }
+    }
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (uint32_t j = 0; j < 6u; j++) {
+            selected[j] = (int32_t)out_idx[j];
+            weights[j] = out_prob[j];
+            sum += out_prob[j];
+        }
+        sum = fmaxf(sum, 6.103515625e-5f);
+        #pragma unroll
+        for (uint32_t j = 0; j < 6u; j++) weights[j] = weights[j] / sum * 1.5f;
     }
 }
 
@@ -16883,6 +17105,111 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
             scale);
     return cuda_ok(cudaGetLastError(), "directional steering launch");
 }
+/* M2-Inc3: fused decode router stage (f16 logits matmul + split-K combine +
+ * top-6 select) -- see router_fused_coop_kernel.  Returns 0 (caller falls
+ * back to the unfused matmul+select chain) whenever the shape is not the
+ * decode router shape, any legacy router/f16 bisect knob is set, the coop
+ * launch is unavailable, or DS4_CUDA_NO_ROUTER_FUSED=1. */
+extern "C" int ds4_gpu_router_fused_tensor(ds4_gpu_tensor *logits, ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *x, uint64_t in_dim, uint64_t n_tok) {
+    static int off = -1;
+    if (off < 0) {
+        /* Any legacy router/f16 dispatch knob forces the unfused chain so
+         * that knob keeps selecting the kernel it names. */
+        off = getenv("DS4_CUDA_NO_ROUTER_FUSED") != NULL ||
+              getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+              getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
+              getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL ||
+              getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") != NULL ||
+              getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
+    }
+    if (off) return 0;
+    if (!logits || !selected || !weights || !probs || !x || !model_map) return 0;
+    if (n_tok != 1u || in_dim != DS4_ROUTER_FUSE_IN || n_expert != DS4_ROUTER_FUSE_OUT ||
+        n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f ||
+        n_expert_groups > 1u || n_group_used > 0u) return 0;
+    if (g_router_fused_partials == NULL) return 0;
+    /* The unfused chain must be the split-K vec path at this shape for
+     * ON==OFF numerics (see cuda_matmul_f16_tensor_impl's dispatch). */
+    if (g_f16_splitk_partials == NULL || cuda_native_f16_max_tokens() < 1u) return 0;
+    if (logits->bytes < 256u * sizeof(float) || probs->bytes < 256u * sizeof(float) ||
+        selected->bytes < 6u * sizeof(int32_t) || weights->bytes < 6u * sizeof(float) ||
+        x->bytes < (uint64_t)DS4_ROUTER_FUSE_IN * sizeof(float)) return 0;
+    const uint64_t weight_bytes = (uint64_t)DS4_ROUTER_FUSE_OUT * DS4_ROUTER_FUSE_IN * sizeof(uint16_t);
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "router_fn_f16");
+    if (!wptr) return 0;
+    if (((uintptr_t)wptr & 15u) != 0u || ((uintptr_t)x->ptr & 15u) != 0u) return 0;
+    const float *bias = NULL;
+    const int32_t *hash = NULL;
+    if (has_bias && !hash_mode) {
+        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) return 0;
+        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
+        if (!bias) return 0;
+    }
+    if (hash_mode) {
+        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+        if (hash_offset > model_size || hash_bytes > model_size - hash_offset) return 0;
+        hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
+        if (!hash) return 0;
+    }
+    /* Coop-launch capability probe, cached BEFORE the first layer-graph
+     * capture (the warmup pass runs eager) -- same discipline as the fused
+     * HC stage. */
+    static int grid_blocks = -1;
+    if (grid_blocks < 0) {
+        int dev = 0, supported = 0, blocks_per_sm = 0, n_sm = 0;
+        (void)cudaGetDevice(&dev);
+        (void)cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, dev);
+        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &blocks_per_sm, router_fused_coop_kernel, 256, 0);
+        (void)cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
+        const uint64_t cap = (uint64_t)blocks_per_sm * (uint64_t)n_sm;
+        if (supported != 0 && cap >= 48u) {
+            grid_blocks = (int)(cap < DS4_ROUTER_FUSE_BLOCKS ? cap : DS4_ROUTER_FUSE_BLOCKS);
+            fprintf(stderr, "ds4: M2-Inc3 fused router active (coop %d-blk)\n", grid_blocks);
+        } else {
+            grid_blocks = 0;
+            fprintf(stderr, "ds4: M2-Inc3 fused router unavailable (coop=%d, co-resident blocks=%llu), unfused chain\n",
+                    supported, (unsigned long long)cap);
+        }
+    }
+    if (grid_blocks <= 0) return 0;
+    const uint32_t q8ps = q8p_begin_tagged("router_fu", DS4_ROUTER_FUSE_IN, DS4_ROUTER_FUSE_OUT, 1,
+                                           weight_bytes, ds4_current_stream());
+    float *logits_p = (float *)logits->ptr;
+    float *partials_p = g_router_fused_partials;
+    int32_t *sel_p = (int32_t *)selected->ptr;
+    float *wgt_p = (float *)weights->ptr;
+    float *probs_p = (float *)probs->ptr;
+    const __half *w = (const __half *)wptr;
+    const float *x_p = (const float *)x->ptr;
+    const int32_t *tokens = NULL;
+    int32_t token_scalar = (int32_t)token;
+    int hb = has_bias && !hash_mode;
+    int hm = hash_mode;
+    const struct ds4_decode_scalars *scalars = g_decode_dev;
+    void *args[] = {
+        (void *)&logits_p, (void *)&partials_p, (void *)&sel_p, (void *)&wgt_p, (void *)&probs_p,
+        (void *)&w, (void *)&x_p, (void *)&bias, (void *)&hash, (void *)&tokens,
+        (void *)&token_scalar, (void *)&hash_rows, (void *)&hb, (void *)&hm, (void *)&scalars };
+    cudaError_t err = cudaLaunchCooperativeKernel(
+            (void *)router_fused_coop_kernel,
+            dim3((unsigned)grid_blocks, 1, 1), dim3(256, 1, 1), args, 0, ds4_current_stream());
+    if (err != cudaSuccess) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "ds4: fused router launch failed (%s), unfused chain\n",
+                    cudaGetErrorString(err));
+        }
+        (void)cudaGetLastError();
+        q8p_end(q8ps, ds4_current_stream());
+        return 0;
+    }
+    q8p_end(q8ps, ds4_current_stream());
+    return 1;
+}
+
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;

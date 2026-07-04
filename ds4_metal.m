@@ -14562,6 +14562,39 @@ static int ds4_gpu_encode_router_select(
     return 1;
 }
 
+/* M2-Inc3 is CUDA-only: returning 0 sends ds4.c down the unfused
+ * matmul + router_select chain. */
+int ds4_gpu_router_fused_tensor(
+        ds4_gpu_tensor       *logits,
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        uint32_t                token,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_expert_groups,
+        uint32_t                n_group_used,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const ds4_gpu_tensor *x,
+        uint64_t                in_dim,
+        uint64_t                n_tok) {
+    (void)logits; (void)selected; (void)weights; (void)probs;
+    (void)model_map; (void)model_size; (void)weight_offset;
+    (void)bias_offset; (void)hash_offset; (void)hash_rows; (void)token;
+    (void)n_expert; (void)n_expert_used; (void)expert_weight_scale;
+    (void)n_expert_groups; (void)n_group_used; (void)has_bias;
+    (void)hash_mode; (void)x; (void)in_dim; (void)n_tok;
+    return 0;
+}
+
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,

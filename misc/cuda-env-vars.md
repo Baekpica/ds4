@@ -256,6 +256,19 @@ The bandwidth figure is informational; we don't tier on it.
   is set (the fused paths lose the Qnorm/KVrope intermediate dump points)
   and in reference-kv mode.
 
+- `DS4_CUDA_NO_ROUTER_FUSED=1`. Kill switch for the M2-Inc3 fused decode
+  router stage: the f16 logits matmul (4096x256), split-K combine, and top-6
+  select run as ONE cooperative kernel (`router_fused_coop_kernel`, up to 128
+  blocks; select-side bias/hash model-map reads prefetched behind the
+  matmul), replacing three launches per MoE layer. Bit-exact vs the unfused
+  chain (proto_m2_router.cu: 240/240 across bias/no-bias/hash, exact-tie and
+  all-equal-logits cases, capture==eager). One-shot boot log: `M2-Inc3 fused
+  router active (coop N-blk)`. Also implicitly off under any legacy
+  router/f16 dispatch knob (`DS4_CUDA_SERIAL_F16_MATMUL`,
+  `DS4_CUDA_SERIAL_ROUTER`, `DS4_CUDA_ORDERED_F16_MATMUL`,
+  `DS4_CUDA_NO_WARP_ROUTER_SELECT`, `DS4_CUDA_NO_PARALLEL_ROUTER_SELECT`) so
+  each of those keeps selecting the kernel it names.
+
 - `DS4_CUDA_MMQ_X_MAX=N`. Clip `get_mmq_x_max_host` to N (rounded down to a
   multiple of 8) when sweeping tile widths. Diagnostic only; the vanilla
   128 wins on sm_120.
