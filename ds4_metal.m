@@ -15896,6 +15896,33 @@ int ds4_gpu_hc_stage_fused_tensor(
                                                        sinkhorn_iters, eps, norm_eps);
 }
 
+/* M2-Inc2: the fused QKV-post kernels are CUDA-only; returning 0 routes the
+ * shared decode encoder onto the separate (bit-exact) unfused chains. */
+int ds4_gpu_head_rms_norm_rope_tail_scalars_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, const void *scalars, int32_t pos_offset, uint32_t pos_stride,
+        uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast, float beta_slow,
+        float eps) {
+    (void)x; (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot;
+    (void)scalars; (void)pos_offset; (void)pos_stride; (void)n_ctx_orig;
+    (void)inverse; (void)freq_base; (void)freq_scale; (void)ext_factor;
+    (void)attn_factor; (void)beta_fast; (void)beta_slow; (void)eps;
+    return 0;
+}
+
+int ds4_gpu_kv_rope_fp8_store_scalars_tensor(
+        ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache, uint32_t raw_cap,
+        uint32_t head_dim, uint32_t n_rot, const void *scalars, int32_t pos_offset,
+        uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    (void)kv; (void)raw_cache; (void)raw_cap; (void)head_dim; (void)n_rot;
+    (void)scalars; (void)pos_offset; (void)n_ctx_orig; (void)inverse;
+    (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow;
+    return 0;
+}
+
 int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,

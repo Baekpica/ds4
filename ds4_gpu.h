@@ -1581,6 +1581,27 @@ int ds4_gpu_hc_stage_fused_tensor(
         float                   norm_eps,
         uint32_t                emit_q8);
 
+/* M2-Inc2b: fused head_rms_norm + q rope_tail with device-scalars pos
+ * (capture-safe).  Returns 0 on any precondition miss and ALWAYS on Metal;
+ * callers fall back to the separate head_rms_norm + rope_tail_scalars
+ * chain, which is bit-exact to this kernel. */
+int ds4_gpu_head_rms_norm_rope_tail_scalars_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, const void *scalars, int32_t pos_offset, uint32_t pos_stride,
+        uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast, float beta_slow,
+        float eps);
+
+/* M2-Inc2c: fused decode kv rope_tail + FP8 KV quantize + raw-cache store
+ * (single row; pos and raw_row from the device scalars substrate).  Returns
+ * 0 on any precondition miss and ALWAYS on Metal; callers fall back to the
+ * rope_tail_scalars + fp8_kv_quantize + store_raw_kv chain (bit-exact). */
+int ds4_gpu_kv_rope_fp8_store_scalars_tensor(
+        ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache, uint32_t raw_cap,
+        uint32_t head_dim, uint32_t n_rot, const void *scalars, int32_t pos_offset,
+        uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast, float beta_slow);
+
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *pre,

@@ -236,6 +236,19 @@ The bandwidth figure is informational; we don't tier on it.
   `M2-Inc1b HC-stage q8 activation fold active (pair decode)`. Implicitly
   off whenever the fused HC stage itself is off.
 
+- `DS4_CUDA_NO_QKV_POST_FUSED=1`. Kill switch for the M2-Inc2 fused
+  QKV-post kernels on the serial decode path: (2b) `head_rms_norm` + q
+  `rope_tail` as one per-head kernel (device-scalars pos — the capture-safe
+  twin of the long-dead host-pos fused kernel), and (2c) kv `rope_tail` +
+  FP8 KV quantize + raw-cache store as ONE 8-block kernel (rope only
+  touches the 64-float rotary tail, fp8 only the 448 nope elems — disjoint;
+  the production fp8 kernel's 7 sequential 64-elem groups become 7 parallel
+  blocks, bit-exact scales). Both fusions bit-exact vs their unfused chains
+  (proto_m2_qkv.cu, plain+yarn rope, multiple positions, f16-round-trip
+  store included). Also implicitly off when `DS4_METAL_GRAPH_DUMP_PREFIX`
+  is set (the fused paths lose the Qnorm/KVrope intermediate dump points)
+  and in reference-kv mode.
+
 - `DS4_CUDA_MMQ_X_MAX=N`. Clip `get_mmq_x_max_host` to N (rounded down to a
   multiple of 8) when sweeping tile widths. Diagnostic only; the vanilla
   128 wins on sm_120.

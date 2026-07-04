@@ -10902,6 +10902,15 @@ static bool metal_graph_encode_decode_layer_impl(
     }
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
     const bool decode_q8_pair = getenv("DS4_CUDA_NO_DECODE_Q8_PAIR") == NULL;
+    /* M2-Inc2: fused QKV-post kernels (head_rms + q-rope as one kernel;
+     * kv-rope + fp8 + raw-store as one kernel).  Both fusions stay inside
+     * their q_path/kv_path profile spans, so stage profiling needs no
+     * exclusion; tensor dumps do (the fused paths lose the Qnorm/KVrope
+     * intermediate dump points), hence the DUMP_PREFIX gate.  Bit-exact vs
+     * the unfused chains (proto_m2_qkv.cu). */
+    const bool qkv_post_fused =
+        getenv("DS4_CUDA_NO_QKV_POST_FUSED") == NULL &&
+        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
     /* PC5: decode_top_k is the indexer top-K both for the captured kernel
      * specialization (n_comp_max key) and for the substrate scoreboard.
      * Function-scope constant so each call site reuses the same value. */
@@ -11030,6 +11039,21 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
+    /* M2-Inc2b: head_rms + q-rope in one kernel (scalars pos source);
+     * unfused chain under the kill switch / dump gate / any entry
+     * precondition miss (the Metal entry always returns 0).  Bit-exact. */
+    if (ok && qkv_post_fused &&
+        ds4_gpu_head_rms_norm_rope_tail_scalars_tensor(g->q, 1, DS4_N_HEAD,
+                                            DS4_N_HEAD_DIM, DS4_N_ROT,
+                                            ds4_gpu_decode_scalars_device_ptr(),
+                                            0,   /* pos_offset */
+                                            1u,  /* pos_stride */
+                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                            false, freq_base, freq_scale, ext_factor, attn_factor,
+                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                                            DS4_RMS_EPS)) {
+        ds4_cuda_layer_graph_debug_peek("dbg:after-head_rms_rope_fused");
+    } else {
     if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-head_rms_norm");
     if (ok) {
@@ -11046,6 +11070,7 @@ static bool metal_graph_encode_decode_layer_impl(
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+    }
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
@@ -11066,6 +11091,20 @@ static bool metal_graph_encode_decode_layer_impl(
             metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
         }
     }
+    /* M2-Inc2c: kv-rope + fp8 quantize + raw store in ONE kernel (rope and
+     * fp8 touch disjoint regions; the fp8 groups parallelize block-per-group
+     * bit-exactly).  Unfused 3-launch chain under the kill switch / dump
+     * gate / reference-kv mode. */
+    if (ok && qkv_post_fused && !metal_graph_use_reference_kv_decode() &&
+        ds4_gpu_kv_rope_fp8_store_scalars_tensor(g->kv, raw_cache, raw_cap,
+                                            DS4_N_HEAD_DIM, DS4_N_ROT,
+                                            ds4_gpu_decode_scalars_device_ptr(),
+                                            0,   /* pos_offset */
+                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                            false, freq_base, freq_scale, ext_factor, attn_factor,
+                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW)) {
+        ds4_cuda_layer_graph_debug_peek("dbg:after-kv_rope_fp8_store_fused");
+    } else {
     /* Step 3 pilot: KV-rope migrated to device-scalars shim. */
     if (ok) ok = ds4_gpu_rope_tail_scalars_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
                                             DS4_N_ROT,
@@ -11082,6 +11121,7 @@ static bool metal_graph_encode_decode_layer_impl(
      * starts after that, where FP8 KV quantization and raw-cache storage can
      * share one pass without changing the trigonometric path. */
     if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+    }
     if (!ok && getenv("DS4_MTP_GATE_DEBUG")) fprintf(stderr, "ds4: decode_layer FAIL @qkv/rope/kv_store il=%u pos=%u raw_row=%u\n", il, pos, raw_row);
     DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {

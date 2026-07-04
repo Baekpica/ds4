@@ -5494,6 +5494,82 @@ __device__ static float rope_yarn_ramp_dev(float low, float high, int i0) {
     return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
 }
 
+/* M2-Inc2b: capture-safe twin of head_rms_norm_rope_tail_kernel above — the
+ * only difference is the pos0 source (device decode-scalars substrate, like
+ * rope_tail_scalars_kernel) so the fused kernel can live inside captured
+ * layer graphs.  Math is bit-exact vs the separate head_rms_norm +
+ * rope_tail_scalars pair (tail values get the rms scale applied inline as
+ * the same single multiply; proto_m2_qkv.cu). */
+__global__ static void head_rms_norm_rope_tail_scalars_kernel(
+        float *x,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        const struct ds4_decode_scalars * __restrict__ scalars,
+        int32_t pos_offset,
+        uint32_t pos_stride,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= n_tok * n_head) return;
+    uint32_t t = row / n_head;
+    float *xr = x + (uint64_t)row * head_dim;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const uint32_t n_nope = head_dim - n_rot;
+    for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
+        xr[i] *= scale;
+    }
+    const uint32_t pos0 = (uint32_t)((int32_t)scalars->pos0 + pos_offset);
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+    for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
+        uint32_t i = pair * 2u;
+        float theta_extrap = (float)(pos0 + t * pos_stride) * powf(freq_base, -((float)i) / (float)n_rot);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        float c = cosf(theta) * mscale;
+        float s = sinf(theta) * mscale;
+        if (inverse) s = -s;
+        float *tail = xr + n_nope;
+        float x0 = tail[i] * scale;
+        float x1 = tail[i + 1] * scale;
+        tail[i] = x0 * c - x1 * s;
+        tail[i + 1] = x0 * s + x1 * c;
+    }
+}
+
 __global__ static void rope_tail_kernel(
         float *x,
         uint32_t n_tok,
@@ -6307,6 +6383,93 @@ __global__ static void store_raw_kv_batch_kernel(
         row = seq_base + (pos % raw_cap);
     }
     raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[(uint64_t)t * head_dim + d]));
+}
+
+/* M2-Inc2c: fused decode KV tail — rope_tail(kv) + fp8_kv_quantize +
+ * store_raw_kv in ONE launch.  Rope touches only the n_rot rotary tail and
+ * fp8 covers only the n_nope prefix (disjoint regions), and the fp8
+ * kernel's per-64-group math is independent group to group, so the 7
+ * sequential groups of the single-block production kernel become parallel
+ * blocks: grid = (n_nope/64 + 1) x 64 threads, blocks [0, n_nope/64) each
+ * run one verbatim fp8 group (same 64-wide shared-tree reduce -> bit-exact
+ * scales/values) and store their post-quant region; the last block ropes
+ * the tail (verbatim rope_tail_scalars math at h=0/t=0) and stores it with
+ * the same f16 round-trip.  raw_row and pos0 both come from the decode
+ * scalars substrate — capture-safe.  Bit-exact vs the 3-launch chain
+ * (proto_m2_qkv.cu, plain+yarn, multiple positions). */
+__global__ static void kv_rope_fp8_store_scalars_kernel(
+        float *kv,
+        float *raw,
+        uint32_t raw_cap,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        const struct ds4_decode_scalars * __restrict__ scalars,
+        int32_t pos_offset,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t b = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    float *raw_row = raw + (uint64_t)(scalars->raw_row % raw_cap) * head_dim;
+    if (b < n_nope / 64u) {
+        const uint32_t off = b * 64u;
+        float v = 0.0f;
+        if (off + tid < n_nope) v = kv[off + tid];
+        __shared__ float scratch[64];
+        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
+        if (off + tid < n_nope) {
+            float clamp = fminf(448.0f, fmaxf(-448.0f, v / scale));
+            const float qv = dsv4_e4m3fn_dequant_dev(clamp) * scale;
+            kv[off + tid] = qv;
+            raw_row[off + tid] = __half2float(__float2half(qv));
+        }
+    } else {
+        const uint32_t pos0 = (uint32_t)((int32_t)scalars->pos0 + pos_offset);
+        float corr0 = 0.0f, corr1 = 0.0f;
+        if (ext_factor != 0.0f) {
+            float denom = 2.0f * logf(freq_base);
+            corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+            corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+            corr0 = fmaxf(0.0f, corr0);
+            corr1 = fminf((float)(n_rot - 1), corr1);
+        }
+        float *tail = kv + n_nope;
+        if (tid < n_rot / 2u) {
+            const uint32_t i = tid * 2u;
+            float theta_extrap = (float)pos0 * powf(freq_base, -((float)i) / (float)n_rot);
+            float theta_interp = freq_scale * theta_extrap;
+            float theta = theta_interp;
+            float mscale = attn_factor;
+            if (ext_factor != 0.0f) {
+                float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+                theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+            }
+            float c = cosf(theta) * mscale;
+            float s = sinf(theta) * mscale;
+            if (inverse) s = -s;
+            float x0 = tail[i];
+            float x1 = tail[i + 1];
+            const float r0 = x0 * c - x1 * s;
+            const float r1 = x0 * s + x1 * c;
+            tail[i] = r0;
+            tail[i + 1] = r1;
+            raw_row[n_nope + i] = __half2float(__float2half(r0));
+            raw_row[n_nope + i + 1] = __half2float(__float2half(r1));
+        }
+    }
 }
 
 __global__ static void attention_prefill_raw_kernel(
@@ -14413,6 +14576,22 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_
     head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
+/* M2-Inc2b: capture-safe fused head_rms + q-rope (device-scalars pos). */
+extern "C" int ds4_gpu_head_rms_norm_rope_tail_scalars_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, const void *scalars, int32_t pos_offset, uint32_t pos_stride,
+        uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast, float beta_slow,
+        float eps) {
+    if (!x || !scalars || n_rot > head_dim || (n_rot & 1u) ||
+        x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
+    head_rms_norm_rope_tail_scalars_kernel<<<n_tok * n_head, 256, 0, ds4_current_stream()>>>(
+            (float *)x->ptr, n_tok, n_head, head_dim, n_rot,
+            (const struct ds4_decode_scalars *)scalars, pos_offset, pos_stride,
+            n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail_scalars launch");
+}
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot,
         ds4_gpu_tensor *codes_mirror, ds4_gpu_tensor *scale_mirror) {
@@ -14640,6 +14819,27 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
     /* Opp C Phase 1A: raw KV is not packed in Phase 1; no mirror. */
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot, NULL, NULL) &&
            ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim, scalars);
+}
+/* M2-Inc2c: fused kv-rope + fp8 quantize + raw store (decode single row,
+ * scalars-substrate pos + raw_row).  Falls back to 0 on any precondition
+ * miss so the caller can run the unfused 3-launch chain. */
+extern "C" int ds4_gpu_kv_rope_fp8_store_scalars_tensor(
+        ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache, uint32_t raw_cap,
+        uint32_t head_dim, uint32_t n_rot, const void *scalars, int32_t pos_offset,
+        uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    if (!kv || !raw_cache || !scalars || raw_cap == 0 ||
+        n_rot == 0 || n_rot > head_dim || (n_rot & 1u) || n_rot > 128u ||
+        ((head_dim - n_rot) % 64u) != 0u ||
+        kv->bytes < (uint64_t)head_dim * sizeof(float) ||
+        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) return 0;
+    const uint32_t n_groups = (head_dim - n_rot) / 64u;
+    kv_rope_fp8_store_scalars_kernel<<<n_groups + 1u, 64, 0, ds4_current_stream()>>>(
+            (float *)kv->ptr, (float *)raw_cache->ptr, raw_cap, head_dim, n_rot,
+            (const struct ds4_decode_scalars *)scalars, pos_offset,
+            n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    return cuda_ok(cudaGetLastError(), "kv_rope_fp8_store_scalars launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, const void *scalars) {
     if (!raw_cache || !kv || raw_cap == 0 ||
