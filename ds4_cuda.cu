@@ -508,6 +508,15 @@ static uint64_t g_f16_splitk_partials_bytes = 0;
  * input-sumsq partials, output-sumsq partials).  Eager-init like the split-K
  * partials above so the captured decode graph bakes a stable pointer. */
 static float *g_hc_stage_scratch = NULL;
+/* M2-Inc1b/2a: dedicated q8 fold sidecar rings (see the ds4_gpu_init
+ * comment — cuda_tmp_alloc aliases every caller, so sidecars cannot live
+ * there).  Ring index advances per emitting call; 2-deep suffices because
+ * each sidecar is popped before the same slot comes around again. */
+static int8_t *g_q8_fold_q80_buf[2] = { NULL, NULL };
+static void   *g_q8_fold_q81_buf[2] = { NULL, NULL };
+static int     g_q8_fold_q80_idx = 0;
+static int     g_q8_fold_q81_idx = 0;
+static void cuda_q8_fold_reset(void);
 /* SM count cached in ds4_gpu_init; gates the flash-decode attention split so it
  * only engages when the per-head attention grid (n_head blocks) under-fills the
  * machine (n_head < SM count). On small-SM integrated GPUs (GB10, 48 SMs, 64
@@ -2468,6 +2477,28 @@ extern "C" int ds4_gpu_init(void) {
             (void)cudaGetLastError();
         }
     }
+    /* M2-Inc1b/2a q8 fold sidecars: DEDICATED double-buffered rings.
+     * cuda_tmp_alloc is a single shared sticky scratch (every caller gets
+     * the same pointer), so sidecars must NOT come from it: two sidecar
+     * allocations in one entry would alias and the emissions overwrite
+     * each other (the 2026-07-04 Inc2a gibberish regression).  A 2-deep
+     * ring per format is sufficient: each sidecar is consumed before the
+     * same-purpose buffer two emitting calls later is rewritten.  Sized
+     * for rows up to 8192 elems.  Failure just disables the folds. */
+    for (int i = 0; i < 2; i++) {
+        const uint64_t q80_bytes = 8192u + 16u + (8192u / 32u) * sizeof(float);
+        const uint64_t q81_bytes = (8192u / 32u) * 36u;
+        if (g_q8_fold_q80_buf[i] == NULL) {
+            void *p = NULL;
+            if (cudaMalloc(&p, (size_t)q80_bytes) == cudaSuccess) g_q8_fold_q80_buf[i] = (int8_t *)p;
+            else (void)cudaGetLastError();
+        }
+        if (g_q8_fold_q81_buf[i] == NULL) {
+            void *p = NULL;
+            if (cudaMalloc(&p, (size_t)q81_bytes) == cudaSuccess) g_q8_fold_q81_buf[i] = p;
+            else (void)cudaGetLastError();
+        }
+    }
     /* SM count for the flash-decode attention split gate. */
     (void)cudaDeviceGetAttribute(&g_cuda_sm_count, cudaDevAttrMultiProcessorCount, dev);
     /* Flash-decode attention partials scratch (eager init -> capture-stable
@@ -2548,6 +2579,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaFree(g_hc_stage_scratch);
         g_hc_stage_scratch = NULL;
     }
+    for (int i = 0; i < 2; i++) {
+        if (g_q8_fold_q80_buf[i]) { (void)cudaFree(g_q8_fold_q80_buf[i]); g_q8_fold_q80_buf[i] = NULL; }
+        if (g_q8_fold_q81_buf[i]) { (void)cudaFree(g_q8_fold_q81_buf[i]); g_q8_fold_q81_buf[i] = NULL; }
+    }
+    cuda_q8_fold_reset();
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -4626,11 +4662,17 @@ __global__ static void quantize_q8_0_f32_kernel(
  * consumer pop can never precede its producer within a layer), a lookup pops
  * the slot (single consumption), and hits require pointer AND length match.
  * Host-side state only — replayed graphs bake the folded dataflow. */
+/* block_q8_1 mirror of the vendored cuda/mmq layout ({half2 (d,sum);
+ * int8 qs[32]}, 36 B) so emitted blocks are byte-compatible with
+ * quantize_q8_1 consumers. */
+typedef struct { __half2 ds; int8_t qs[32]; } ds4_hc_block_q8_1;
+
 typedef struct {
     const void *src;
     uint64_t    in_dim;
-    int8_t     *xq;
+    int8_t     *xq;      /* q8_0 sidecar (codes + scales), or NULL */
     float      *xscale;
+    const void *q81;     /* q8_1 sidecar (block_q8_1 array), or NULL */
 } cuda_q8_fold_slot;
 #define CUDA_Q8_FOLD_SLOTS 4
 static cuda_q8_fold_slot g_q8_fold[CUDA_Q8_FOLD_SLOTS];
@@ -4639,24 +4681,43 @@ static void cuda_q8_fold_reset(void) {
     memset(g_q8_fold, 0, sizeof(g_q8_fold));
 }
 static void cuda_q8_fold_register(const void *src, uint64_t in_dim,
-                                  int8_t *xq, float *xscale) {
+                                  int8_t *xq, float *xscale, const void *q81) {
     for (int i = 0; i < CUDA_Q8_FOLD_SLOTS; i++) {
         if (g_q8_fold[i].src == src || g_q8_fold[i].src == NULL) {
             g_q8_fold[i].src = src;
             g_q8_fold[i].in_dim = in_dim;
             g_q8_fold[i].xq = xq;
             g_q8_fold[i].xscale = xscale;
+            g_q8_fold[i].q81 = q81;
             return;
         }
     }
 }
+/* Each format pops independently (ffn_norm has a q8_0 consumer — the shexp
+ * pair — AND a q8_1 consumer — the routed-MoE mmvq); the slot stays matched
+ * until both are taken or the next reset. */
 static int cuda_q8_fold_take(const void *src, uint64_t in_dim,
                              int8_t **xq, float **xscale) {
     for (int i = 0; i < CUDA_Q8_FOLD_SLOTS; i++) {
-        if (g_q8_fold[i].src == src && g_q8_fold[i].in_dim == in_dim) {
+        if (g_q8_fold[i].src == src && g_q8_fold[i].in_dim == in_dim &&
+            g_q8_fold[i].xq != NULL) {
             *xq = g_q8_fold[i].xq;
             *xscale = g_q8_fold[i].xscale;
-            memset(&g_q8_fold[i], 0, sizeof(g_q8_fold[i]));
+            g_q8_fold[i].xq = NULL;
+            g_q8_fold[i].xscale = NULL;
+            return 1;
+        }
+    }
+    return 0;
+}
+/* M2-Inc2a: q8_1 flavor, callable from the vendored ds4_mmq.cu entries. */
+extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
+                                         const void **q81) {
+    for (int i = 0; i < CUDA_Q8_FOLD_SLOTS; i++) {
+        if (g_q8_fold[i].src == src && g_q8_fold[i].in_dim == in_dim &&
+            g_q8_fold[i].q81 != NULL) {
+            *q81 = g_q8_fold[i].q81;
+            g_q8_fold[i].q81 = NULL;
             return 1;
         }
     }
@@ -5373,7 +5434,12 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         const float *kv_w,
         uint32_t kv_n,
         uint32_t rows,
-        float eps) {
+        float eps,
+        /* M2-Inc2a: optional q8_1 emission of the q row (decode row 0) —
+         * kills the q_b mmvq quantize prelude.  Bit-exact vs the vendored
+         * quantize_q8_1 (proto_m2_qkv.cu 2a): the emission pass re-reads the
+         * just-written orow values (identical bits) in warp granules. */
+        ds4_hc_block_q8_1 *q81) {
     const uint32_t row = blockIdx.x;
     const uint32_t which = blockIdx.y;
     if (row >= rows || which > 1u) return;
@@ -5396,6 +5462,25 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
     const float scale = rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
+    }
+    if (which == 0u && q81 != NULL && row == 0u && (n & 31u) == 0u) {
+        __syncthreads();
+        const uint32_t lane = threadIdx.x & 31u;
+        const uint32_t warp = threadIdx.x >> 5u;
+        const uint32_t nwarp = blockDim.x >> 5u;
+        for (uint32_t qb = warp; qb < n / 32u; qb += nwarp) {
+            const float v = orow[qb * 32u + lane];
+            float amax = fabsf(v);
+            float s = v;
+            for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off, 32));
+                s += __shfl_xor_sync(0xffffffffu, s, off, 32);
+            }
+            const float d1 = amax / 127.0f;
+            const int8_t qv = amax == 0.0f ? (int8_t)0 : (int8_t)roundf(v / d1);
+            q81[qb].qs[lane] = qv;
+            if (lane == 0u) q81[qb].ds = __floats2half2_rn(d1, s);
+        }
     }
 }
 
@@ -8782,11 +8867,6 @@ __device__ static void hc4_split_warp16(float *out, const float *mix, const floa
     }
     out[8u + lane] = c;
 }
-
-/* M2-Inc1b: q8 activation emission.  block_q8_1 mirror of the vendored
- * cuda/mmq layout ({half2 (d,sum); int8 qs[32]}, 36 B) so emitted blocks are
- * byte-compatible with quantize_q8_1 consumers. */
-typedef struct { __half2 ds; int8_t qs[32]; } ds4_hc_block_q8_1;
 
 __global__ static void hc_stage_fused_coop_kernel(
         float *out,              /* [n_embd] combined sublayer input */
@@ -14528,7 +14608,8 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint64_t                kv_weight_offset,
         uint32_t                kv_n,
         uint32_t                rows,
-        float                   eps) {
+        float                   eps,
+        uint32_t                emit_q81) {
     if (getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") == NULL) {
         if (!q_out || !q || !kv_out || !kv || !model_map ||
             q_weight_offset > model_size ||
@@ -14546,6 +14627,16 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         const float *kv_w = (const float *)cuda_model_range_ptr(model_map,
                 kv_weight_offset, (uint64_t)kv_n * sizeof(float), "kv_rms_weight");
         if (!q_w || !kv_w) return 0;
+        /* M2-Inc2a: q8_1 sidecar of the q row for the q_b mmvq consumer
+         * (decode rows==1 only; dedicated ring — see the fold-buffer
+         * comment in ds4_gpu_init). */
+        ds4_hc_block_q8_1 *q81 = NULL;
+        static int no_q8_fold = -1;
+        if (no_q8_fold < 0) no_q8_fold = getenv("DS4_CUDA_NO_HC_Q8_FOLD") != NULL;
+        if (emit_q81 && !no_q8_fold && rows == 1u && (q_n % 32u) == 0u && q_n <= 8192u) {
+            g_q8_fold_q81_idx ^= 1;
+            q81 = (ds4_hc_block_q8_1 *)g_q8_fold_q81_buf[g_q8_fold_q81_idx];
+        }
         dim3 grid(rows, 2u, 1u);
         dsv4_qkv_rms_norm_rows_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
                 (float *)q_out->ptr,
@@ -14557,8 +14648,11 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
                 kv_w,
                 kv_n,
                 rows,
-                eps);
-        return cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch");
+                eps,
+                q81);
+        if (!cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch")) return 0;
+        if (q81) cuda_q8_fold_register(q_out->ptr, q_n, NULL, NULL, q81);
+        return 1;
     }
     return ds4_gpu_rms_norm_weight_rows_tensor(q_out, q, model_map, model_size,
                                                  q_weight_offset, q_n, rows, eps) &&
@@ -20922,18 +21016,26 @@ extern "C" int ds4_gpu_hc_stage_fused_tensor(
         uint32_t in_dim32 = (uint32_t)in_dim;
         /* M2-Inc1b: q8_0 sidecar for norm_out (same [xq | xscale] layout the
          * consumer preludes allocate).  Alloc failure just skips the fold. */
+        /* Sidecars come from the DEDICATED rings — never cuda_tmp_alloc
+         * (single shared sticky scratch: two allocations alias and the
+         * emissions overwrite each other). */
         int8_t *q80_xq = NULL;
         float *q80_scale = NULL;
-        ds4_hc_block_q8_1 *q81 = NULL;   /* q8_1 consumers wire up in Inc2 */
-        if ((emit_q8 & 1u) && !no_q8_fold && (n_embd % 32u) == 0u) {
-            const uint64_t qblocks = n_embd / 32u;
-            const uint64_t xq_bytes = qblocks * 32u;
-            const uint64_t sc_off = (xq_bytes + 15u) & ~15ull;
-            void *sc = cuda_tmp_alloc(sc_off + qblocks * sizeof(float), "hc stage q8 fold");
-            if (sc) {
-                q80_xq = (int8_t *)sc;
-                q80_scale = (float *)((char *)sc + sc_off);
+        ds4_hc_block_q8_1 *q81 = NULL;
+        if ((emit_q8 & 1u) && !no_q8_fold && (n_embd % 32u) == 0u && n_embd <= 8192u) {
+            g_q8_fold_q80_idx ^= 1;
+            int8_t *buf = g_q8_fold_q80_buf[g_q8_fold_q80_idx];
+            if (buf) {
+                const uint64_t sc_off = ((uint64_t)n_embd + 15u) & ~15ull;
+                q80_xq = buf;
+                q80_scale = (float *)((char *)buf + sc_off);
             }
+        }
+        /* M2-Inc2a: q8_1 sidecar (block_q8_1 array) for the routed-MoE mmvq
+         * consumer of ffn_norm. */
+        if ((emit_q8 & 2u) && !no_q8_fold && (n_embd % 32u) == 0u && n_embd <= 8192u) {
+            g_q8_fold_q81_idx ^= 1;
+            q81 = (ds4_hc_block_q8_1 *)g_q8_fold_q81_buf[g_q8_fold_q81_idx];
         }
         void *args[] = {
             (void *)&out_p, (void *)&norm_out_p, (void *)&split_p, (void *)&mix_p,
@@ -20957,7 +21059,7 @@ extern "C" int ds4_gpu_hc_stage_fused_tensor(
             (void)cudaGetLastError();
             break;
         }
-        if (q80_xq) cuda_q8_fold_register(norm_out->ptr, n_embd, q80_xq, q80_scale);
+        if (q80_xq || q81) cuda_q8_fold_register(norm_out->ptr, n_embd, q80_xq, q80_scale, q81);
         return 1;
     } while (0);
     /* Unfused fallback: the exact original three-call chain. */

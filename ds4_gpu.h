@@ -756,6 +756,9 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+/* emit_q81 (M2-Inc2a, CUDA decode rows==1 only): nonzero additionally emits
+ * q8_1 codes of the q row in-kernel and hands them to the next mmvq consumer
+ * (q_b), eliding its quantize prelude; ignored elsewhere/on Metal. */
 int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,
@@ -768,7 +771,8 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint64_t                kv_weight_offset,
         uint32_t                kv_n,
         uint32_t                rows,
-        float                   eps);
+        float                   eps,
+        uint32_t                emit_q81);
 
 int ds4_gpu_head_rms_norm_tensor(
         ds4_gpu_tensor *x,

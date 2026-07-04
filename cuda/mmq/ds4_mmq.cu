@@ -60,6 +60,27 @@ extern "C" void *ds4_mmq_q81_scratch_ptr(void) {
     return g_q81_scratch_ptr;
 }
 
+// M2-Inc2a: registry of producer-emitted q8_1 activations (ds4_cuda.cu).
+// A hit returns canonical block_q8_1 codes for this exact activation
+// pointer (bit-exact vs quantize_row_q8_1_cuda), letting the caller skip
+// its quantize prelude.  Only valid for single-token unpadded rows
+// (ne10_padded == K); the registry itself guarantees freshness (slots are
+// reset by the producing entry every layer and pops are one-shot).
+extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
+                                         const void **q81);
+static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
+                                int64_t ne10_padded) {
+    if (n_tokens != 1 || ne10_padded != K) return nullptr;
+    const void *p = nullptr;
+    if (!ds4_cuda_q8_fold_take_q81((const void *)X_f32, (uint64_t)K, &p)) return nullptr;
+    static int logged = 0;
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "ds4: M2-Inc2a q8_1 activation fold active (mmvq decode)\n");
+    }
+    return (char *)(uintptr_t)p;
+}
+
 extern "C" size_t ds4_mmq_q81_scratch_bytes(void) {
     return g_q81_scratch_bytes;
 }
@@ -2143,7 +2164,11 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
                                sizeof(block_q8_1) / QK8_1;
 
     ggml_cuda_pool_alloc<char> src1_q8_1_pool;
-    char *src1_q8_1_ptr = nullptr;
+    // M2-Inc2a: the fused HC stage may have emitted this activation's q8_1
+    // codes already (ffn_norm) -- take them and skip the quantize prelude.
+    char *src1_q8_1_ptr = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
+    cudaError_t err;
+    if (!src1_q8_1_ptr) {
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
     } else {
@@ -2158,11 +2183,12 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
         stream);
 
-    cudaError_t err = cudaGetLastError();
+    err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
                 tag, cudaGetErrorString(err));
         return -2;
+    }
     }
 
     const int64_t blck = ggml_blck_size(type);
@@ -2353,7 +2379,11 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
     ggml_cuda_pool_alloc<char> q8_pool;
-    char *x8 = nullptr;
+    // M2-Inc2a: producer-emitted q8_1 codes (qr_norm from the qkv-rms
+    // kernel) -- take them and skip the quantize prelude.
+    char *x8 = ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded);
+    cudaError_t err;
+    if (!x8) {
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         x8 = (char *)g_q81_scratch_ptr;
     } else {
@@ -2366,10 +2396,11 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K,
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
         stream);
-    cudaError_t err = cudaGetLastError();
+    err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
         return -2;
+    }
     }
 
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
@@ -2409,6 +2440,10 @@ static char *iq2_aligned_quantize_xn(
     ds4_pool_set_stream(stream);
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
+    // M2-Inc2a: producer-emitted q8_1 codes (ffn_norm from the fused HC
+    // stage) -- take them and skip the quantize prelude.
+    char *folded = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
+    if (folded) return folded;
     char *ptr = nullptr;
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         ptr = (char *)g_q81_scratch_ptr;

@@ -11016,7 +11016,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                              layer->attn_kv_a_norm->abs_offset,
                                                              DS4_N_HEAD_DIM,
                                                              1,
-                                                             DS4_RMS_EPS) != 0;
+                                                             DS4_RMS_EPS,
+                                                             qkv_post_fused ? 1u : 0u /* M2-Inc2a: q8_1 for q_b */) != 0;
         ds4_cuda_layer_graph_debug_peek("dbg:after-qkv_rms_norm_rows");
     } else {
         if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->qr_norm, g->qr,
@@ -11699,7 +11700,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                              layer->ffn_norm->abs_offset,
                                              g->ffn_cur, g->ffn_norm, g->after_attn_hc,
                                              fuse_hc_norm, hc_stage_fused,
-                                             1u /* q8_0: shexp gate+up pair */);
+                                             1u | (qkv_post_fused ? 2u : 0u)
+                                             /* q8_0: shexp pair; q8_1: routed-MoE mmvq */);
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_pre");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
@@ -12624,7 +12626,7 @@ static bool metal_graph_decode2_q_batch_diff(
                                                    layer->attn_kv_a_norm->abs_offset,
                                                    DS4_N_HEAD_DIM,
                                                    2,
-                                                   DS4_RMS_EPS) != 0;
+                                                   DS4_RMS_EPS, 0u) != 0;
     } else if (ok) {
         ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_qr_norm,
                                                  g->batch_qr,
@@ -15618,7 +15620,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                              layer->attn_kv_a_norm->abs_offset,
                                                              DS4_N_HEAD_DIM,
                                                              n_tokens,
-                                                             DS4_RMS_EPS) != 0;
+                                                             DS4_RMS_EPS, 0u) != 0;
     } else {
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_qr_norm,
                                                            g->batch_qr,

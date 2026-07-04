@@ -225,16 +225,23 @@ The bandwidth figure is informational; we don't tier on it.
   per-layer cudaGraphs and replay bit-identically (proto-proven on GB10 /
   CUDA 13).
 
-- `DS4_CUDA_NO_HC_Q8_FOLD=1`. Kill switch for the M2-Inc1b q8 activation
-  fold riding the fused HC stage: the cooperative kernel's final phase also
+- `DS4_CUDA_NO_HC_Q8_FOLD=1`. Kill switch for ALL producer-emitted q8
+  activation folds. M2-Inc1b: the cooperative HC-stage kernel's final phase
   emits the q8_0 codes of `attn_norm`/`ffn_norm` (bit-exact vs
   `quantize_q8_0_f32_kernel` — same butterfly reductions and rounding,
   proto_m2_hc.cu V4), and the next q8_0 pair consumer (attn q_a+kv, shexp
   gate+up) takes them instead of launching its quantize prelude — 2 fewer
+  launches/layer. M2-Inc2a extends the registry with a q8_1 flavor
+  (canonical block_q8_1, bit-exact vs the vendored `quantize_q8_1`): the HC
+  stage emits ffn_norm's q8_1 blocks for the routed-MoE mmvq consumer and
+  the qkv-rms kernel emits qr_norm's for the q_b consumer (hooks in
+  ds4_mmq.cu skip `quantize_row_q8_1_cuda` on a registry hit) — 2 more
   launches/layer. Registry is encode-scoped, pointer+length keyed,
-  pop-on-lookup, reset at every fused-entry call. One-shot boot log:
-  `M2-Inc1b HC-stage q8 activation fold active (pair decode)`. Implicitly
-  off whenever the fused HC stage itself is off.
+  pop-on-lookup per format, reset at every fused-HC-entry call. One-shot
+  boot logs: `M2-Inc1b HC-stage q8 activation fold active (pair decode)` and
+  `M2-Inc2a q8_1 activation fold active (mmvq decode)`. The q8_0 fold is
+  implicitly off whenever the fused HC stage is off; the q8_1 folds are
+  additionally off under `DS4_CUDA_NO_QKV_POST_FUSED`.
 
 - `DS4_CUDA_NO_QKV_POST_FUSED=1`. Kill switch for the M2-Inc2 fused
   QKV-post kernels on the serial decode path: (2b) `head_rms_norm` + q

@@ -6896,7 +6896,9 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint64_t                kv_weight_offset,
         uint32_t                kv_n,
         uint32_t                rows,
-        float                   eps) {
+        float                   eps,
+        uint32_t                emit_q81) {
+    (void)emit_q81;  /* M2-Inc2a: CUDA-only q8_1 fold hint */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!q_out || !q || !kv_out || !kv || q_n == 0 || kv_n == 0 || rows == 0 ||
         (q_n & 3u) != 0 || (kv_n & 3u) != 0) {
