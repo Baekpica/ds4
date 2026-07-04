@@ -1263,6 +1263,45 @@ static void *expert_worker(void *arg) {
     return NULL;
 }
 
+/* GSQ external-quant backend (--external-quant DIR). When set, a routed-expert
+ * tensor whose pre-quantized blocks have been produced offline by the GSQ
+ * pipeline (learned per-block scales + closed-form lattice code re-snap) is
+ * spliced in verbatim instead of being re-quantized here with RTN + imatrix.
+ * The on-disk blocks are the SAME ggml layouts this tool emits, so the result
+ * is byte-compatible; only the expert payload differs. The artifact for the
+ * merged tensor `<gguf_name>` is `<DIR>/<gguf_name>.bin`, exactly
+ * n_experts * nrows * ds4q_row_size(target,ncols) bytes = experts concatenated
+ * in id order, each expert = its rows of blocks (matching generate_one_expert's
+ * `xid*per_expert` placement). A missing file falls back to RTN+imatrix, so a
+ * partial-coverage GSQ run still produces a complete GGUF. */
+static const char *g_external_quant_dir = NULL;
+
+static byte_buf external_blob_try(const char *gguf_name, size_t expected) {
+    byte_buf out = {0};
+    if (!g_external_quant_dir) return out;
+    char path[4096];
+    int k = snprintf(path, sizeof(path), "%s/%s.bin", g_external_quant_dir, gguf_name);
+    if (k <= 0 || (size_t)k >= sizeof(path)) die("external-quant path too long");
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return out;            /* miss -> caller quantizes (RTN + imatrix) */
+    if (fseeko(fp, 0, SEEK_END) != 0) die_errno("seek external-quant", path);
+    off_t sz = ftello(fp);
+    if (sz < 0) die_errno("tell external-quant", path);
+    if ((size_t)sz != expected) {
+        fprintf(stderr, "error: external-quant %s is %lld bytes, expected %zu\n",
+                path, (long long)sz, expected);
+        exit(1);
+    }
+    rewind(fp);
+    out.size = expected;
+    out.data = xmalloc(expected);
+    if (fread(out.data, 1, expected, fp) != expected) die_errno("read external-quant", path);
+    fclose(fp);
+    fprintf(stderr, "external-quant: spliced %s (%zu bytes, RTN+imatrix bypassed)\n",
+            gguf_name, expected);
+    return out;
+}
+
 static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
                                 const imatrix_store *imatrix) {
@@ -1273,7 +1312,10 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
     const size_t per_expert = (size_t)nrows * ds4q_row_size(target, ncols);
-    byte_buf out = { .size = per_expert * (size_t)n_experts, .data = xmalloc(per_expert * (size_t)n_experts) };
+    const size_t total = per_expert * (size_t)n_experts;
+    byte_buf ext = external_blob_try(gguf_name, total);
+    if (ext.data) return ext;       /* GSQ-supplied blocks: skip FP4 dequant + RTN */
+    byte_buf out = { .size = total, .data = xmalloc(total) };
     ds4q_quantize_init(target);
     int worker_count = n_threads > 0 ? n_threads : 8;
     if (worker_count < 1) worker_count = 1;
@@ -1719,6 +1761,9 @@ static void usage(const char *argv0) {
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
+    printf("  --external-quant DIR   splice GSQ-prequantized expert blocks from\n");
+    printf("                         DIR/<tensor>.bin in place of RTN+imatrix;\n");
+    printf("                         missing files fall back to RTN+imatrix\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs\n");
 }
 
@@ -1800,6 +1845,8 @@ static params parse_args(int argc, char **argv) {
             p.n_experts = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--threads") == 0) {
             p.n_threads = atoi(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--external-quant") == 0) {
+            g_external_quant_dir = need_value(argc, argv, &i, arg);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg);
             exit(1);
