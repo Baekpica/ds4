@@ -201,7 +201,10 @@ The bandwidth figure is informational; we don't tier on it.
   rig. One-shot boot log: `M2 Q2K aligned moe-down active`. CAUTION: with a
   repacked manifest the raw range is not served, so this switch drops the vec
   tier to the client-mmap raw path (~100x) — the real off switch is
-  `--no-repack-q2k-aligned` on the weight server.
+  `--no-repack-q2k-aligned` on the weight server. The WS flag is DEFAULT ON
+  since the 2026-07-05 quality gate (gsm8k 97.2 / HumanEval 91.5 / MBPP 88.5,
+  within boot noise of the iq2/q8-flip 97.4/92.1/89.0; the twin is
+  bit-identical). Needs clients >= `e221241`.
 
 - `DS4_CUDA_MOE_NO_Q2K_DEREPACK=1`. Kill switch for the moe-down raw-layout
   device scratch (same contract as the IQ2 one above): with the q2k artifact

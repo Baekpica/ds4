@@ -2277,7 +2277,7 @@ static void usage(FILE *fp) {
             "                    Default: ON. Disable with --no-repack-q8-aligned.\n"
             "  --repack-q2k-aligned Serve base Q2_K routed-expert down stacks in the row-pair\n"
             "                    SoA layout (replaces their raw ranges; byte-neutral).\n"
-            "                    Default: OFF (opt-in until quality-gated).\n"
+            "                    Default: ON. Disable with --no-repack-q2k-aligned.\n"
             "                    NOTE: needs clients with ds4_mmq_q2_K_aligned_moe_vec (M2\n"
             "                    moe-down commit); older clients read the down stacks through\n"
             "                    a catastrophic host-mmap tier on a repacked manifest.\n"
@@ -2309,9 +2309,14 @@ int main(int argc, char **argv) {
      * widths >=2 — pair a repacked manifest with current clients only. */
     bool repack_iq2_aligned = true;
     bool repack_q8_aligned = true;
-    /* M2 moe-down row-pair-SoA Q2_K repack: opt-in until its quality gate
-     * passes (the iq2/q8 repacks went default-ON only after theirs). */
-    bool repack_q2k_aligned = false;
+    /* M2 moe-down row-pair-SoA Q2_K repack.  Default ON since the 2026-07-05
+     * quality gate (gsm8k 486/500=97.2 / HumanEval 150/164=91.5 / MBPP
+     * 177/200=88.5, all within boot noise of the iq2/q8-flip 97.4/92.1/89.0;
+     * the moe-down twin is bit-identical to the raw path).  Like the iq2
+     * repack it REPLACES the raw .ffn_down_exps ranges, so it needs clients
+     * >= e221241 (older ones fall to a host-mmap down tier on a repacked
+     * manifest); disable with --no-repack-q2k-aligned. */
+    bool repack_q2k_aligned = true;
     bool repack_explicit = false;
     bool dry_run = false;
     for (int i = 1; i < argc; i++) {
