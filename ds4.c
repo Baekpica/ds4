@@ -31768,13 +31768,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     /* D4.5e concurrency auto-gate: spec-decode is a LOW-CONCURRENCY lever -- it wins
      * when decode is weight-bandwidth-bound (the wide verify forward is ~free over a
      * 1-wide decode), but once n_live banks make the verify forward N*BLOCK rows it goes
-     * compute-bound and the per-step cost outpaces the token savings (measured: net
-     * speedup >1 at n_live<=2-3, parity ~4, NET-NEGATIVE >=8).  So gate the per-step
-     * DSpark work (capture/inject/draft + verify width) on n_live <= DS4_DSPARK_MAX_NLIVE;
-     * above it the step degrades to plain batched decode (the D=0 lossless base case),
-     * matching base throughput.  Default 3 (env-overridable); 0 disables the gate (always
-     * spec).  Lossless either way -- the verify forward is the sole source of tokens. */
-    uint32_t dspark_max_nlive = 3u;
+     * compute-bound and the per-step cost outpaces the token savings.  So gate the
+     * per-step DSpark work (capture/inject/draft + verify width) on
+     * n_live <= DS4_DSPARK_MAX_NLIVE; above it the step degrades to plain batched
+     * decode (the D=0 lossless base case), matching base throughput.  Default 1
+     * (env-overridable; 0 disables the gate = always spec): with the WS-served
+     * drafter the eager multi-bank spec step still loses to plain batching --
+     * measured GB10 -c 4096 agg tok/s, DSpark-on vs off: N=2 18.6 vs 24.9 (+34%
+     * off), N=3 24.5 vs 31.4 (+28% off), N=1 DSpark wins (21.2 vs ~15 serial).
+     * Revisit after the spec-step graph-capture arc removes the eager verify tax.
+     * Lossless either way -- the verify forward is the sole source of tokens. */
+    uint32_t dspark_max_nlive = 1u;
     { const char *me = getenv("DS4_DSPARK_MAX_NLIVE"); if (me && me[0]) { long v = atol(me); if (v >= 0) dspark_max_nlive = (uint32_t)v; } }
     /* D4.5e: inject the cold/suffix PREFILL region's target hidden into the DSpark
      * rings (so the drafter attends real prefix KV from the first decode step instead
