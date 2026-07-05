@@ -724,21 +724,25 @@ static void build_range_plan(std::vector<tensor_span> &spans, uint64_t span_byte
         return a.end < b.end;
     });
 
+    /* Grow each range by WHOLE tensor spans up to span_bytes; a single tensor
+     * larger than span_bytes becomes its own oversized range.  Never cut
+     * inside a tensor: the client resolves a tensor with one whole-tensor
+     * containment lookup (cuda_model_range_ptr), so a mid-tensor split makes
+     * that tensor unresolvable against the import table and it silently falls
+     * back to the host-mmap tier (measured: the 10.7 GiB Q4_K drafter's
+     * 2.11 GiB expert stacks split at the old 1 GiB chunk boundary read at
+     * page-fault rate, ~1.7 s per DSpark block step vs ~11 ms served). */
     ranges.clear();
     for (size_t i = 0; i < spans.size();) {
         uint64_t off = spans[i].off;
         uint64_t end = spans[i].end;
         i++;
-        while (i < spans.size() && spans[i].off <= end + 65536u && spans[i].end - off <= span_bytes) {
+        while (i < spans.size() && spans[i].off <= end + 65536u &&
+               spans[i].end - off <= span_bytes) {
             if (spans[i].end > end) end = spans[i].end;
             i++;
         }
-        while (off < end) {
-            uint64_t chunk_end = end;
-            if (chunk_end - off > span_bytes) chunk_end = off + span_bytes;
-            ranges.push_back({off, chunk_end});
-            off = chunk_end;
-        }
+        ranges.push_back({off, end});
     }
 }
 
@@ -2249,9 +2253,11 @@ static void fd_broker_serve_once(fd_broker &broker, const std::vector<owned_rang
 
 static void usage(FILE *fp) {
     fprintf(fp,
-            "Usage: ds4_weight_server --base FILE [--mtp FILE] --manifest FILE [options]\n"
+            "Usage: ds4_weight_server --base FILE [--mtp FILE] [--drafter FILE] --manifest FILE [options]\n"
             "\n"
             "Options:\n"
+            "  --drafter FILE    Also serve a DSpark drafter GGUF (model id \"drafter\").\n"
+            "                    Independent of --scope; raw spans only, no repacks.\n"
             "  --device N        CUDA device ordinal. Default: 0\n"
             "  --backend B       Weight sharing backend: ipc or vmm. Default: ipc\n"
             "  --scope S         Models to upload: both, base, or mtp. Default: both\n"
@@ -2259,7 +2265,9 @@ static void usage(FILE *fp) {
             "  --exit-on-parent-pid N Exit if parent/orchestrator PID disappears\n"
             "  --lock-file FILE  Single-owner lock file. Default: /tmp/ds4_weight_server_cudaN.lock\n"
             "  --no-lock         Disable the single-owner lock\n"
-            "  --span-mb N       Maximum exported raw tensor span. Default: 1024\n"
+            "  --span-mb N       Raw range granularity target. Ranges grow by whole\n"
+            "                    tensors up to this size; a single larger tensor gets\n"
+            "                    its own oversized range (never split). Default: 1024\n"
             "  --copy-chunk-mb N Pinned staged upload chunk. Default: 256\n"
             "  --reserve-gb N    Free CUDA memory to keep unused. Default: 32\n"
             "  --derive-output-certifier Build base output Q8_0 row-group norms for exact verifier\n"
@@ -2287,6 +2295,7 @@ static void usage(FILE *fp) {
 int main(int argc, char **argv) {
     const char *base = nullptr;
     const char *mtp = nullptr;
+    const char *drafter = nullptr;
     const char *manifest = nullptr;
     const char *scope = "both";
     const char *backend_s = "ipc";
@@ -2322,6 +2331,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--base") && i + 1 < argc) base = argv[++i];
         else if (!strcmp(argv[i], "--mtp") && i + 1 < argc) mtp = argv[++i];
+        else if (!strcmp(argv[i], "--drafter") && i + 1 < argc) drafter = argv[++i];
         else if (!strcmp(argv[i], "--manifest") && i + 1 < argc) manifest = argv[++i];
         else if (!strcmp(argv[i], "--scope") && i + 1 < argc) scope = argv[++i];
         else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend_s = argv[++i];
@@ -2453,6 +2463,23 @@ int main(int argc, char **argv) {
         total_upload_bytes += mtp_bytes;
         total_alloc_bytes += backend == WEIGHT_BACKEND_VMM ? mtp_alloc_bytes : mtp_bytes;
     }
+    uint64_t drafter_model_size = 0;
+    if (drafter) {
+        uint64_t drafter_bytes = 0;
+        uint64_t drafter_alloc_bytes = 0;
+        if (!inspect_model_plan("drafter", drafter, span_bytes, &drafter_model_size, &drafter_bytes,
+                                nullptr, vmm_granularity, &drafter_alloc_bytes)) return 1;
+        if (UINT64_MAX - total_upload_bytes < drafter_bytes) {
+            fprintf(stderr, "ds4_weight_server: upload plan size overflow\n");
+            return 1;
+        }
+        if (UINT64_MAX - total_alloc_bytes < (backend == WEIGHT_BACKEND_VMM ? drafter_alloc_bytes : drafter_bytes)) {
+            fprintf(stderr, "ds4_weight_server: allocation plan size overflow\n");
+            return 1;
+        }
+        total_upload_bytes += drafter_bytes;
+        total_alloc_bytes += backend == WEIGHT_BACKEND_VMM ? drafter_alloc_bytes : drafter_bytes;
+    }
     fprintf(stderr,
             "ds4_weight_server: backend=%s logical_upload=%.2f GiB allocation_plan=%.2f GiB\n",
             backend_name(backend),
@@ -2473,6 +2500,9 @@ int main(int argc, char **argv) {
     if (want_mtp && !upload_model("mtp", mtp, span_bytes, copy_chunk_bytes, ranges,
                                   backend, device, vmm_granularity, &mtp_records,
                                   false, false)) return 1;
+    if (drafter && !upload_model("drafter", drafter, span_bytes, copy_chunk_bytes, ranges,
+                                 backend, device, vmm_granularity, nullptr,
+                                 false, false)) return 1;
     if (repack_q2k_aligned) {
         uint64_t q2k_repacked_bytes = 0;
         if (!build_q2k_aligned_expert_artifacts("base",
