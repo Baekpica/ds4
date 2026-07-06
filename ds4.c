@@ -19075,12 +19075,13 @@ static bool metal_graph_eval_dspark_block_ms(
         const ds4_dspark_weights *dw,
         ds4_gpu_tensor * const   *rings,
         uint32_t                 nb,
+        const uint32_t          *bankmap,   /* [nb] TRUE bank id per dense slot */
         const int32_t           *Pbank,
         const int32_t           *bonus,
         uint32_t                 window,
         ds4_gpu_tensor          *dst_logits) {
     const uint32_t B = DS4_DSPARK_BLOCK;
-    if (nb == 0 || nb > (uint32_t)DS4_MULTISEQ_MAX_SEQ || !dw->layer[0].attn_q_a || !rings) return false;
+    if (nb == 0 || nb > (uint32_t)DS4_MULTISEQ_MAX_SEQ || !dw->layer[0].attn_q_a || !rings || !bankmap) return false;
     const uint32_t R = nb * B;
     if (R > g->prefill_cap || 2u * R > g->prefill_cap) return false;   /* positions buffer holds true+unif */
     const uint64_t hc_dim   = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -19104,7 +19105,13 @@ static bool metal_graph_eval_dspark_block_ms(
             const uint32_t row = b * B + r;
             true_pos[row]  = Pbank[b] + (int32_t)r;
             unif_pos[row]  = (int32_t)qwin;
-            seq_id[row]    = (int32_t)b;
+            /* TASK #12 ROOT CAUSE: this was the dense slot index b, NOT the
+             * true bank id -- the ring store + window attention below address
+             * lane seq_id*raw_cap, so any live set whose ordinals != bank ids
+             * (e.g. a session surviving solo on bank 1 after its overlap
+             * partner died) drafted from ANOTHER BANK'S ring: accept 60%->15%
+             * on staggered solo tails, capture/gating-independent. */
+            seq_id[row]    = (int32_t)bankmap[b];
             blk_tokens[row] = (r == 0) ? bonus[b] : (int32_t)DS4_DSPARK_NOISE_TOKEN;
         }
     }
@@ -27031,8 +27038,9 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
                     if (winpos) ds4_gpu_tensor_free(winpos);
                 }
                 int32_t Pb = (int32_t)P, bn = bonus;
+                const uint32_t bm0 = 0u;   /* selftest slab: single lane 0 (inject above passes seq_id=NULL) */
                 iok = iok && metal_graph_eval_dspark_block_ms(g, base_model, base_weights, dspark_model, dw,
-                                ms_slab.multi_raw, 1u, &Pb, &bn, window, g->dspark_block_logits);
+                                ms_slab.multi_raw, 1u, &bm0, &Pb, &bn, window, g->dspark_block_logits);
                 if (!iok) { rc = 1; break; }
             } else if (!metal_graph_eval_dspark_block(g, base_model, base_weights, dspark_model, dw,
                                                inj_kv, P, bonus, window, g->dspark_block_logits)) { rc = 1; break; }
@@ -32933,9 +32941,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 g->batch_rollback_capture = can_rollback && !(dspark_mode && !dspark_now);
                 /* D4.5d/E5: tap the target hidden after layers 40/41/42 inline in this
                  * forward (zero extra forward) -> dspark_concat[0..K2).  Accept-rate-only;
-                 * off => bit-identical to the non-DSpark verify forward.  Gated off when
-                 * DSpark is concurrency-gated this step (no draft -> no need to capture). */
-                g->dspark_capture = dspark_now ? true : false;
+                 * off => bit-identical to the non-DSpark verify forward.  STAYS ON when
+                 * DSpark is concurrency-gated this step: the committed rows still feed
+                 * the drafter rings below, so a bank that decodes through an N>=2
+                 * overlap window keeps a hole-free drafter context and re-enters solo
+                 * spec at full accept (holes sat in the drafter window for the whole
+                 * solo tail: accept 61.7% -> 14.6%). */
+                g->dspark_capture = dspark_mode ? true : false;
                 ds4_gpu_set_mtp_verifier(1);
                 const double verify_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
                 ok = metal_graph_batch_eval_logits(g, model, weights, vqtok, vmaxpos, K2, vlogits);
@@ -33042,8 +33054,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * speculative positions [posv_new..posv_new+B-1] that the NEXT block-draft KV store
              * overwrites before they are ever read as a prefix (see design).  Pure accept-rate
              * side -- the verify forward already set every committed token.  vpos/vsid are the
-             * original pack arrays (untouched by the accept loop, which only advanced posv[]). */
-            if (dspark_now && K2 > 0u) {
+             * original pack arrays (untouched by the accept loop, which only advanced posv[]).
+             * Runs on NLIVE-gated steps too (each bank's single committed cur row): rings
+             * stay current through overlap windows -- see the dspark_capture note above. */
+            if (dspark_mode && K2 > 0u) {
                 const double pack_t0 = dspark_prof ? now_sec() : 0.0;
                 uint32_t I2 = K2;
                 ds4_gpu_tensor *inject_concat = g->dspark_concat;
@@ -33218,7 +33232,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     if (nl > 0u && nl * (uint32_t)DS4_DSPARK_BLOCK <= vcap_rows) {
                         const double block_t0 = dspark_prof ? now_sec() : 0.0;
                         ok = metal_graph_eval_dspark_block_ms(g, model, weights, dspark_model, dw,
-                                ctx->dsl.multi_raw, nl, Pbank, bonusv, DS4_N_SWA, mk_logits);
+                                ctx->dsl.multi_raw, nl, bankmap, Pbank, bonusv, DS4_N_SWA, mk_logits);
                         if (dspark_prof) dspark_t_draft_block_s += now_sec() - block_t0;
                         const double markov_t0 = dspark_prof ? now_sec() : 0.0;
                         if (ok) ok = metal_graph_dspark_markov_refine(g, dspark_model, dw, mk_logits,
