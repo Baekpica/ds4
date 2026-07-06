@@ -2631,11 +2631,13 @@ extern "C" int ds4_gpu_init(void) {
             (void)cudaGetLastError();
         }
     }
-    /* M2-Inc5 fused compressor pair+store partials (2 matmuls x 2048).  A
-     * failure just disables the fused compressor pair (unfused chain). */
+    /* M2-Inc5 fused compressor pair+store partials (2 matmuls x 2048 =
+     * width*ksplit), sized x8 tok rows for the C3-Inc2 batched variant
+     * (128 KiB).  A failure just disables the fused compressor pair
+     * (unfused chain). */
     if (g_comp_pair_partials == NULL) {
         void *p = NULL;
-        if (cudaMalloc(&p, 2u * 2048u * sizeof(float)) == cudaSuccess) {
+        if (cudaMalloc(&p, 8u * 2u * 2048u * sizeof(float)) == cudaSuccess) {
             g_comp_pair_partials = (float *)p;
         } else {
             (void)cudaGetLastError();
@@ -9400,6 +9402,127 @@ __global__ static void comp_pair_store_fused_kernel(
         sc_cur[row] = s;
         state_score[(uint64_t)dst_row * width + row] =
             s + model_scalar_dev(ape_map, ape_offset, ape_type, (uint64_t)pos_mod * width + row);
+    }
+}
+
+/* C3-Inc2: rows (n_tok <= 8) variant of comp_pair_store_fused_kernel for the
+ * batched decode step (cont width-1 + DSpark/MTP verify widths).  Bit-exact
+ * twin of the batch unfused chain: at n_tok <= native-f16 the two bulk
+ * matmuls loop rows through the EXACT n=1 split-K + combine sequence (FD
+ * Inc1), so phase 1/2 reproduce the per-(tok,m,row) split-K/kseg order
+ * verbatim over the x rows.  The store (verbatim compressor_store body,
+ * per-row pos/bank-lane from the device substrates -- NO g_decode_dev read)
+ * runs only when do_store != 0: the caller sets it ONLY on the single-row
+ * multiseq emit shape (n==1).  At n > 1 the per-row emit loop interleaves
+ * stores with pool reads (same-bank verify chains reuse ring slots inside
+ * one step), so hoisting the stores here would reorder them -- they stay in
+ * the loop and this kernel only replaces the matmul+combine launches. */
+template <uint32_t KS>
+__global__ static void comp_pair_store_rows_fused_kernel(
+        float *kv_cur,            /* [n,width] rows (batch_comp_kv) */
+        float *sc_cur,            /* [n,width] rows (batch_comp_sc) */
+        float *partials,          /* [n*2*width*KS] g_comp_pair_partials */
+        float *state_kv,          /* full multi-bank slabs (do_store) */
+        float *state_score,
+        const __half *w_kv,       /* [width][4096] */
+        const __half *w_sc,       /* [width][4096] */
+        const float *x,           /* [n,4096] rows (batch_attn_norm) */
+        const void *ape_map,
+        uint64_t ape_offset,
+        uint32_t ape_type,
+        uint32_t ratio,
+        uint32_t width,           /* == coff*head_dim */
+        uint32_t pos0,            /* inline fallback (pos_dev==NULL) */
+        const int32_t * __restrict__ pos_dev,
+        const int32_t * __restrict__ seq_dev,
+        uint32_t n_tok,
+        int do_store) {
+    constexpr uint32_t SEG = 4096u / KS;
+    constexpr uint32_t A = SEG / 256u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+
+    /* Phase 1: one warp per (tok, matmul m, row, kseg) tile; per-tok tile
+     * math verbatim from the serial kernel (and thus the unfused per-row
+     * split-K loop). */
+    const uint32_t tiles_per_m = width * KS;
+    const uint32_t tiles_per_tok = 2u * tiles_per_m;
+    const uint32_t nwarp = gridDim.x * (blockDim.x >> 5u);
+    for (uint32_t t = blockIdx.x * (blockDim.x >> 5u) + warp;
+         t < n_tok * tiles_per_tok; t += nwarp) {
+        const uint32_t tok = t / tiles_per_tok;
+        const uint32_t tr = t - tok * tiles_per_tok;
+        const uint32_t m = tr < tiles_per_m ? 0u : 1u;
+        const uint32_t tt = m ? tr - tiles_per_m : tr;
+        const uint32_t row = tt / KS;
+        const uint32_t kseg = tt % KS;
+        const uint64_t k0 = (uint64_t)kseg * SEG;
+        const __half *wr = (m ? w_sc : w_kv) + (uint64_t)row * 4096u;
+        const float *xr = x + (uint64_t)tok * 4096u;
+        float s[A];
+        #pragma unroll
+        for (uint32_t a = 0; a < A; a++) {
+            const uint64_t i = k0 + ((uint64_t)lane + 32u * a) * 8u;
+            const uint4 wv = *reinterpret_cast<const uint4 *>(wr + i);
+            const float4 xa = *reinterpret_cast<const float4 *>(xr + i);
+            const float4 xb = *reinterpret_cast<const float4 *>(xr + i + 4);
+            const __half2 *h = reinterpret_cast<const __half2 *>(&wv);
+            const float2 w0 = __half22float2(h[0]);
+            const float2 w1 = __half22float2(h[1]);
+            const float2 w2 = __half22float2(h[2]);
+            const float2 w3 = __half22float2(h[3]);
+            float sum = 0.0f;
+            sum += w0.x * xa.x + w0.y * xa.y + w1.x * xa.z + w1.y * xa.w
+                 + w2.x * xb.x + w2.y * xb.y + w3.x * xb.z + w3.y * xb.w;
+            s[a] = warp_sum_f32(sum);
+        }
+        float partial;
+        if (KS == 8u) {          /* A == 2 */
+            partial = s[0] + s[1 % A];
+        } else if (KS == 4u) {   /* A == 4 */
+            partial = (s[0] + s[2 % A]) + (s[1 % A] + s[3 % A]);
+        } else {                 /* KS == 2, A == 8 */
+            partial = ((s[0] + s[4 % A]) + (s[2 % A] + s[6 % A]))
+                    + ((s[1 % A] + s[5 % A]) + (s[3 % A] + s[7 % A]));
+        }
+        if (lane == 0u)
+            partials[(uint64_t)tok * tiles_per_tok + (uint64_t)m * tiles_per_m +
+                     (uint64_t)row * KS + kseg] = partial;
+    }
+
+    cooperative_groups::this_grid().sync();
+
+    /* Phase 2: per-row combine (kseg ascending, verbatim) + the verbatim
+     * store body when do_store (grid-stride: n*2*width outputs can exceed
+     * one grid pass at n=8 x width 1024). */
+    for (uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+         g < n_tok * 2u * width; g += gridDim.x * blockDim.x) {
+        const uint32_t tok = g / (2u * width);
+        const uint32_t gr = g - tok * 2u * width;
+        const uint32_t m = gr < width ? 0u : 1u;
+        const uint32_t row = m ? gr - width : gr;
+        const float *p = partials + (uint64_t)tok * tiles_per_tok +
+                         (uint64_t)m * tiles_per_m + (uint64_t)row * KS;
+        float s = 0.0f;
+        for (uint32_t k = 0u; k < KS; k++) s += p[k];
+        if (m == 0u) kv_cur[(uint64_t)tok * width + row] = s;
+        else         sc_cur[(uint64_t)tok * width + row] = s;
+        if (do_store) {
+            const uint32_t p0 = pos_dev ? (uint32_t)pos_dev[tok] : pos0;
+            const uint32_t pos_mod = p0 % ratio;
+            const uint32_t dst_row = ratio == 4u ? ratio + pos_mod : pos_mod;
+            const uint64_t lane_off = seq_dev
+                ? (uint64_t)(uint32_t)seq_dev[tok] *
+                  (uint64_t)((ratio == 4u ? 2u : 1u) * ratio) * width
+                : 0u;
+            if (m == 0u) {
+                state_kv[lane_off + (uint64_t)dst_row * width + row] = s;
+            } else {
+                state_score[lane_off + (uint64_t)dst_row * width + row] =
+                    s + model_scalar_dev(ape_map, ape_offset, ape_type,
+                                         (uint64_t)pos_mod * width + row);
+            }
+        }
     }
 }
 
@@ -16234,6 +16357,163 @@ extern "C" int ds4_gpu_compressor_pair_store_fused_tensor(
         if (!warned) {
             warned = 1;
             fprintf(stderr, "ds4: fused compressor pair launch failed (%s), unfused chain\n",
+                    cudaGetErrorString(err));
+        }
+        (void)cudaGetLastError();
+        q8p_end(q8ps, ds4_current_stream());
+        return 0;
+    }
+    q8p_end(q8ps, ds4_current_stream());
+    return 1;
+}
+
+/* C3-Inc2: batched fused compressor pair (n_tok <= 8 rows through one coop
+ * launch, + the store at n_tok == 1) -- see comp_pair_store_rows_fused_kernel.
+ * Bit-exact twin of the batch unfused chain (two bulk f16 matmuls at the
+ * split-K tier, + the per-row compressor_store at n==1); returns 0 to fall
+ * back to that exact chain on any precondition miss.  Same kill switches as
+ * the serial fused pair (+ SERIAL_ROUTER, whose shape overlaps the 256-wide
+ * indexer matmul at n==1).  do_store contract: the CALLER asserts the shape
+ * is the single-row multiseq emit (store-then-pool order is degenerate) and
+ * has validated the seq lane extent against the slabs; positions/seq_id are
+ * the per-step device substrates (bank-agnostic under capture). */
+extern "C" int ds4_gpu_compressor_pair_store_rows_fused_tensor(
+        ds4_gpu_tensor       *kv_cur,
+        ds4_gpu_tensor       *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                w_kv_offset,
+        uint64_t                w_sc_offset,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos0,
+        uint64_t                in_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                n_tok,
+        int                     do_store) {
+    static int off = -1;
+    if (off < 0) {
+        off = getenv("DS4_CUDA_NO_COMP_PAIR_FUSED") != NULL ||
+              getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+              getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
+              getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
+    }
+    if (off) return 0;
+    if (!kv_cur || !sc_cur || !x || !model_map) return 0;
+    /* Twin bound: the unfused chain is the per-row split-K path only while
+     * n_tok <= the native-f16 tier cap (cuda_matmul_f16_tensor_impl). */
+    if (n_tok < 1u || n_tok > 8u || n_tok > cuda_native_f16_max_tokens()) return 0;
+    if (in_dim != 4096u || ratio == 0u ||
+        (ape_type != 0u && ape_type != 1u)) return 0;
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    if (width != 256u && width != 512u && width != 1024u) return 0;
+    const uint32_t ksplit = width == 1024u ? 2u : (width == 512u ? 4u : 8u);
+    if (g_comp_pair_partials == NULL) return 0;
+    if ((uint64_t)n_tok * 2u * width * ksplit > 8u * 2u * 2048u) return 0;
+    if (g_f16_splitk_partials == NULL) return 0;
+    /* Store legs: single row only (see the kernel's ordering comment), full
+     * substrate addressing, APE + state slabs validated. */
+    if (do_store) {
+        if (n_tok != 1u || !state_kv || !state_score) return 0;
+        if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
+        if (seq_id && seq_id->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
+        const uint32_t state_rows = coff * ratio;
+        const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+        /* seq_id non-NULL = full slabs, lane extent validated by the caller;
+         * NULL = pre-offset bank views checked here. */
+        if (!seq_id &&
+            (state_kv->bytes < state_bytes || state_score->bytes < state_bytes)) return 0;
+    }
+    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
+    const uint64_t weight_bytes = (uint64_t)width * in_dim * sizeof(uint16_t);
+    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    if (w_kv_offset > model_size || weight_bytes > model_size - w_kv_offset ||
+        w_sc_offset > model_size || weight_bytes > model_size - w_sc_offset ||
+        ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        kv_cur->bytes < (uint64_t)n_tok * width * sizeof(float) ||
+        sc_cur->bytes < (uint64_t)n_tok * width * sizeof(float) ||
+        x->bytes < (uint64_t)n_tok * in_dim * sizeof(float)) return 0;
+    const char *w_kv = cuda_model_range_ptr(model_map, w_kv_offset, weight_bytes, "comp_pair_kv_f16");
+    const char *w_sc = cuda_model_range_ptr(model_map, w_sc_offset, weight_bytes, "comp_pair_sc_f16");
+    const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
+    if (!w_kv || !w_sc || !ape) return 0;
+    if (((uintptr_t)w_kv & 15u) != 0u || ((uintptr_t)w_sc & 15u) != 0u ||
+        ((uintptr_t)x->ptr & 15u) != 0u) return 0;
+    void *kernel = ksplit == 2u ? (void *)comp_pair_store_rows_fused_kernel<2u>
+                 : ksplit == 4u ? (void *)comp_pair_store_rows_fused_kernel<4u>
+                                : (void *)comp_pair_store_rows_fused_kernel<8u>;
+    /* Coop-launch capability probe per template instantiation, cached BEFORE
+     * the first layer-graph capture (the warmup pass runs eager). */
+    static int grid_blocks[3] = { -1, -1, -1 };
+    static int logged = 0;
+    const int ki = ksplit == 2u ? 0 : (ksplit == 4u ? 1 : 2);
+    if (grid_blocks[ki] < 0) {
+        int dev = 0, supported = 0, blocks_per_sm = 0, n_sm = 0;
+        (void)cudaGetDevice(&dev);
+        (void)cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, dev);
+        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm,
+                (const void *)kernel, 256, 0);
+        (void)cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
+        const uint64_t cap = (uint64_t)blocks_per_sm * (uint64_t)n_sm;
+        if (supported != 0 && cap >= 48u) {
+            grid_blocks[ki] = (int)(cap < 128u ? cap : 128u);
+            if (!logged) {
+                logged = 1;
+                fprintf(stderr, "ds4: C3-Inc2 batched fused compressor pair active (coop %d-blk)\n",
+                        grid_blocks[ki]);
+            }
+        } else {
+            grid_blocks[ki] = 0;
+            if (!logged) {
+                logged = 1;
+                fprintf(stderr, "ds4: C3-Inc2 batched fused compressor pair unavailable (coop=%d, co-resident blocks=%llu), unfused chain\n",
+                        supported, (unsigned long long)cap);
+            }
+        }
+    }
+    if (grid_blocks[ki] <= 0) return 0;
+    const uint32_t q8ps = q8p_begin_tagged("comp_frb", in_dim, width, n_tok,
+                                           2u * weight_bytes, ds4_current_stream());
+    float *kv_cur_p = (float *)kv_cur->ptr;
+    float *sc_cur_p = (float *)sc_cur->ptr;
+    float *partials_p = g_comp_pair_partials;
+    float *state_kv_p = do_store ? (float *)state_kv->ptr : NULL;
+    float *state_score_p = do_store ? (float *)state_score->ptr : NULL;
+    const __half *w_kv_p = (const __half *)w_kv;
+    const __half *w_sc_p = (const __half *)w_sc;
+    const float *x_p = (const float *)x->ptr;
+    const void *ape_p = (const void *)ape;
+    uint64_t ape_off0 = 0;
+    uint32_t ape_type_v = ape_type;
+    uint32_t ratio_v = ratio;
+    uint32_t width_v = width;
+    uint32_t pos_v = pos0;
+    const int32_t *pos_dev = (do_store && positions) ? (const int32_t *)positions->ptr : NULL;
+    const int32_t *seq_dev = (do_store && seq_id) ? (const int32_t *)seq_id->ptr : NULL;
+    uint32_t n_tok_v = n_tok;
+    int do_store_v = do_store ? 1 : 0;
+    void *args[] = {
+        (void *)&kv_cur_p, (void *)&sc_cur_p, (void *)&partials_p,
+        (void *)&state_kv_p, (void *)&state_score_p,
+        (void *)&w_kv_p, (void *)&w_sc_p, (void *)&x_p,
+        (void *)&ape_p, (void *)&ape_off0, (void *)&ape_type_v,
+        (void *)&ratio_v, (void *)&width_v, (void *)&pos_v,
+        (void *)&pos_dev, (void *)&seq_dev, (void *)&n_tok_v, (void *)&do_store_v };
+    cudaError_t err = cudaLaunchCooperativeKernel(
+            kernel, dim3((unsigned)grid_blocks[ki], 1, 1), dim3(256, 1, 1),
+            args, 0, ds4_current_stream());
+    if (err != cudaSuccess) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "ds4: batched fused compressor pair launch failed (%s), unfused chain\n",
                     cudaGetErrorString(err));
         }
         (void)cudaGetLastError();

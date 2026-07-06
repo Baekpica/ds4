@@ -15428,6 +15428,116 @@ static uint32_t metal_graph_cont_capture_band(uint32_t n_comp) {
     return 8192u;
 }
 
+/* C3-Inc2 twin selftest (DS4_COMP_PAIR_ROWS_SELFTEST=<call budget>, eager
+ * legs only -- reads sync inside the step): after a fused pair(+store) call,
+ * read the projected rows (+ the stored state bank when store_fused), re-run
+ * the exact unfused chain on the SAME inputs, and memcmp.  The only
+ * deterministic bit-exact instrument for this path (cont temp-0 is not
+ * run-to-run deterministic), covering every width as it occurs.  Leaves the
+ * device tensors holding the unfused chain's (identical-on-pass) values.
+ * Shared by the attn-compressor and indexer-compressor sites (one budget). */
+static void metal_graph_comp_pair_rows_selftest(
+        ds4_gpu_graph   *g,
+        const ds4_model   *model,
+        const ds4_tensor  *w_kv,
+        const ds4_tensor  *w_gate,
+        const ds4_tensor  *ape,
+        ds4_gpu_tensor  *state_kv,
+        ds4_gpu_tensor  *state_score,
+        uint32_t           head_dim,
+        uint32_t           ratio,
+        uint32_t           comp_width,
+        uint32_t           n_tokens,
+        uint32_t           il,
+        bool               store_fused,
+        const char        *site) {
+    static int budget = -1;
+    if (budget < 0) {
+        /* value = call budget ("1" gets enough steps to cover the verify
+         * widths that appear a few steps in). */
+        const char *st = getenv("DS4_COMP_PAIR_ROWS_SELFTEST");
+        budget = st && *st ? atoi(st) : 0;
+        if (st && *st && budget <= 1) budget = 512;
+    }
+    if (budget <= 0 || n_tokens > 8u || g->batch_capture_step) return;
+    budget--;
+    static float st_kv_rows[2][8 * 1024];
+    static float st_sc_rows[2][8 * 1024];
+    static float st_bkv[2][1024];
+    static float st_bsc[2][1024];
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint64_t rows_bytes = (uint64_t)n_tokens * comp_width * sizeof(float);
+    const uint64_t st_stride = (uint64_t)(coff * ratio) * comp_width * sizeof(float);
+    /* State compare = the ONE ring row this position's store writes (whole
+     * banks reach 256 KiB at ratio 128).  A wrong-row fused write still
+     * trips this: the expected row would hold stale bytes until the unfused
+     * re-run corrects it -> memcmp DIFF. */
+    const uint32_t pos_mod = store_fused ? (uint32_t)g->ms_positions[0] % ratio : 0u;
+    const uint32_t dst_row = ratio == 4u ? ratio + pos_mod : pos_mod;
+    const uint64_t row_bytes = (uint64_t)comp_width * sizeof(float);
+    const uint64_t st_off = store_fused
+        ? (uint64_t)(uint32_t)g->ms_seq_id[0] * st_stride : 0u;
+    const uint64_t st_row_off = st_off + (uint64_t)dst_row * row_bytes;
+    const char *stg = "buf";
+    bool st_ok = rows_bytes <= sizeof(st_kv_rows[0]) &&
+                 row_bytes <= sizeof(st_bkv[0]);
+    if (st_ok) { stg = "rd0kv"; st_ok = ds4_gpu_tensor_read(g->batch_comp_kv, 0, st_kv_rows[0], rows_bytes) != 0; }
+    if (st_ok) { stg = "rd0sc"; st_ok = ds4_gpu_tensor_read(g->batch_comp_sc, 0, st_sc_rows[0], rows_bytes) != 0; }
+    if (st_ok && store_fused) {
+        stg = "rd0st";
+        st_ok = ds4_gpu_tensor_read(state_kv, st_row_off, st_bkv[0], row_bytes) != 0 &&
+                ds4_gpu_tensor_read(state_score, st_row_off, st_bsc[0], row_bytes) != 0;
+    }
+    if (st_ok) { stg = "mmkv"; st_ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv, model->map, model->size,
+                         w_kv->abs_offset, DS4_N_EMBD, comp_width,
+                         g->batch_attn_norm, n_tokens) != 0; }
+    if (st_ok) { stg = "mmsc"; st_ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc, model->map, model->size,
+                         w_gate->abs_offset, DS4_N_EMBD, comp_width,
+                         g->batch_attn_norm, n_tokens) != 0; }
+    if (st_ok && store_fused) {
+        /* Re-run the exact unfused store (the eager per-row emit call:
+         * row-0 views + inline pos, no substrates). */
+        stg = "store";
+        ds4_gpu_tensor *kv_v = metal_graph_tensor_row_view(g->batch_comp_kv, 0, comp_width);
+        ds4_gpu_tensor *sc_v = metal_graph_tensor_row_view(g->batch_comp_sc, 0, comp_width);
+        ds4_gpu_tensor *bk_v = ds4_gpu_tensor_view(state_kv, st_off, st_stride);
+        ds4_gpu_tensor *bs_v = ds4_gpu_tensor_view(state_score, st_off, st_stride);
+        st_ok = kv_v && sc_v && bk_v && bs_v &&
+                ds4_gpu_compressor_store_batch_tensor(kv_v, sc_v, bk_v, bs_v,
+                    model->map, model->size,
+                    ape->abs_offset, ape->type,
+                    head_dim, ratio,
+                    (uint32_t)g->ms_positions[0], 1u,
+                    NULL, NULL, NULL, 0u) != 0;
+        ds4_gpu_tensor_free(bs_v);
+        ds4_gpu_tensor_free(bk_v);
+        ds4_gpu_tensor_free(sc_v);
+        ds4_gpu_tensor_free(kv_v);
+    }
+    if (st_ok) { stg = "rd1kv"; st_ok = ds4_gpu_tensor_read(g->batch_comp_kv, 0, st_kv_rows[1], rows_bytes) != 0; }
+    if (st_ok) { stg = "rd1sc"; st_ok = ds4_gpu_tensor_read(g->batch_comp_sc, 0, st_sc_rows[1], rows_bytes) != 0; }
+    if (st_ok && store_fused) {
+        stg = "rd1st";
+        st_ok = ds4_gpu_tensor_read(state_kv, st_row_off, st_bkv[1], row_bytes) != 0 &&
+                ds4_gpu_tensor_read(state_score, st_row_off, st_bsc[1], row_bytes) != 0;
+    }
+    if (st_ok) {
+        const int d_kv = memcmp(st_kv_rows[0], st_kv_rows[1], (size_t)rows_bytes);
+        const int d_sc = memcmp(st_sc_rows[0], st_sc_rows[1], (size_t)rows_bytes);
+        const int d_bk = store_fused ? memcmp(st_bkv[0], st_bkv[1], (size_t)row_bytes) : 0;
+        const int d_bs = store_fused ? memcmp(st_bsc[0], st_bsc[1], (size_t)row_bytes) : 0;
+        fprintf(stderr, "ds4: CPR-SELFTEST(%s) n=%u il=%u store=%d %s (kv=%s sc=%s stkv=%s stsc=%s)\n",
+                site, n_tokens, il, store_fused ? 1 : 0,
+                (!d_kv && !d_sc && !d_bk && !d_bs) ? "PASS" : "FAIL",
+                d_kv ? "DIFF" : "eq", d_sc ? "DIFF" : "eq",
+                store_fused ? (d_bk ? "DIFF" : "eq") : "-",
+                store_fused ? (d_bs ? "DIFF" : "eq") : "-");
+    } else {
+        fprintf(stderr, "ds4: CPR-SELFTEST(%s) n=%u il=%u SKIP (stage=%s failed)\n",
+                site, n_tokens, il, stg);
+    }
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15919,7 +16029,49 @@ static bool metal_graph_encode_layer_attention_batch(
             fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
             ok = false;
         }
-        if (ok) {
+        /* C3-Inc2: batched fused compressor pair -- one coop kernel for both
+         * bulk matmuls + combines at n <= 8, bit-exact twin of the two-call
+         * chain below (any precondition miss falls through to it).  The
+         * store is additionally fused ONLY on the single-row multiseq emit
+         * shape (n == 1), where store-then-pool ordering is degenerate and
+         * the semantics are exactly the serial pair+store; the per-row emit
+         * loop below then takes the tail update.  At n > 1 the loop
+         * interleaves stores with pool reads (same-bank verify chains reuse
+         * ring slots within one step), so stores stay in the loop. */
+        const bool comp_ms_row_emit = use_multiseq && !zero_prefix &&
+                                      g->batch_multiseq_emit &&
+                                      !g->batch_defer_comp_store;
+        bool comp_pair_rows_fused = false;
+        bool comp_store_rows_fused = false;
+        if (ok && !metal_graph_use_reference_compressor_pair_proj() &&
+            layer->attn_compressor_kv->type == DS4_TENSOR_F16 &&
+            layer->attn_compressor_gate->type == DS4_TENSOR_F16) {
+            const uint64_t comp_state_stride =
+                (uint64_t)(coff * ratio) * comp_width * sizeof(float);
+            const bool want_store = comp_ms_row_emit && n_tokens == 1u &&
+                f2_mid == 0u &&
+                (uint64_t)((uint32_t)g->ms_seq_id[0] + 1u) * comp_state_stride <=
+                    ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]) &&
+                (uint64_t)((uint32_t)g->ms_seq_id[0] + 1u) * comp_state_stride <=
+                    ds4_gpu_tensor_bytes(g->layer_attn_state_score[il]);
+            comp_pair_rows_fused = ds4_gpu_compressor_pair_store_rows_fused_tensor(
+                    g->batch_comp_kv, g->batch_comp_sc,
+                    want_store ? g->layer_attn_state_kv[il] : NULL,
+                    want_store ? g->layer_attn_state_score[il] : NULL,
+                    model->map, model->size,
+                    layer->attn_compressor_kv->abs_offset,
+                    layer->attn_compressor_gate->abs_offset,
+                    layer->attn_compressor_ape->abs_offset,
+                    layer->attn_compressor_ape->type,
+                    DS4_N_HEAD_DIM, ratio,
+                    want_store ? (uint32_t)g->ms_positions[0] : 0u,
+                    DS4_N_EMBD, g->batch_attn_norm,
+                    want_store ? g->batch_positions : NULL,
+                    want_store ? g->batch_seq_id : NULL,
+                    n_tokens, want_store ? 1 : 0) != 0;
+            comp_store_rows_fused = comp_pair_rows_fused && want_store;
+        }
+        if (ok && !comp_pair_rows_fused) {
             ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
                                              model->map,
                                              model->size,
@@ -15937,6 +16089,13 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      g->batch_attn_norm,
                                                      n_tokens) != 0;
         }
+        if (ok && comp_pair_rows_fused)
+            metal_graph_comp_pair_rows_selftest(g, model,
+                    layer->attn_compressor_kv, layer->attn_compressor_gate,
+                    layer->attn_compressor_ape,
+                    g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
+                    DS4_N_HEAD_DIM, ratio, comp_width, n_tokens, il,
+                    comp_store_rows_fused, "comp");
         if (ok) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
                                               g->batch_comp_kv,
                                               (uint64_t)comp_width * n_tokens,
@@ -16168,7 +16327,11 @@ static bool metal_graph_encode_layer_attention_batch(
                 const double cupd_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
                 const uint32_t sp_cupd = ds4_gpu_stage_prof_begin(DS4_SPROF_CUPD);
                 ok = ok && kv_view && sc_view && st_kv && st_sc &&
-                     ds4_gpu_compressor_update_tensor(kv_view,
+                     /* C3-Inc2: n==1 store already fused into the pair kernel
+                      * above -- emit tail only (same signature). */
+                     (comp_store_rows_fused
+                      ? ds4_gpu_compressor_update_tail_tensor
+                      : ds4_gpu_compressor_update_tensor)(kv_view,
                                                         sc_view,
                                                         st_kv,
                                                         st_sc,
@@ -16683,7 +16846,40 @@ static bool metal_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
                 ok = false;
             }
-            if (ok) {
+            /* C3-Inc2: indexer-compressor instance of the batched fused pair
+             * (+store at the single-row multiseq emit shape) -- see the attn
+             * site above for the ordering rationale. */
+            bool idx_pair_rows_fused = false;
+            bool idx_store_rows_fused = false;
+            if (ok && !metal_graph_use_reference_compressor_pair_proj() &&
+                layer->indexer_compressor_kv->type == DS4_TENSOR_F16 &&
+                layer->indexer_compressor_gate->type == DS4_TENSOR_F16) {
+                const uint64_t idx_state_stride =
+                    (uint64_t)(coff * ratio) * index_width * sizeof(float);
+                const bool want_store = comp_ms_row_emit && n_tokens == 1u &&
+                    f2_mid == 0u &&
+                    (uint64_t)((uint32_t)g->ms_seq_id[0] + 1u) * idx_state_stride <=
+                        ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]) &&
+                    (uint64_t)((uint32_t)g->ms_seq_id[0] + 1u) * idx_state_stride <=
+                        ds4_gpu_tensor_bytes(g->layer_index_state_score[il]);
+                idx_pair_rows_fused = ds4_gpu_compressor_pair_store_rows_fused_tensor(
+                        g->batch_comp_kv, g->batch_comp_sc,
+                        want_store ? g->layer_index_state_kv[il] : NULL,
+                        want_store ? g->layer_index_state_score[il] : NULL,
+                        model->map, model->size,
+                        layer->indexer_compressor_kv->abs_offset,
+                        layer->indexer_compressor_gate->abs_offset,
+                        layer->indexer_compressor_ape->abs_offset,
+                        layer->indexer_compressor_ape->type,
+                        DS4_N_INDEXER_HEAD_DIM, ratio,
+                        want_store ? (uint32_t)g->ms_positions[0] : 0u,
+                        DS4_N_EMBD, g->batch_attn_norm,
+                        want_store ? g->batch_positions : NULL,
+                        want_store ? g->batch_seq_id : NULL,
+                        n_tokens, want_store ? 1 : 0) != 0;
+                idx_store_rows_fused = idx_pair_rows_fused && want_store;
+            }
+            if (ok && !idx_pair_rows_fused) {
                 ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
                                                  model->map,
                                                  model->size,
@@ -16701,6 +16897,13 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          g->batch_attn_norm,
                                                          n_tokens) != 0;
             }
+            if (ok && idx_pair_rows_fused)
+                metal_graph_comp_pair_rows_selftest(g, model,
+                        layer->indexer_compressor_kv, layer->indexer_compressor_gate,
+                        layer->indexer_compressor_ape,
+                        g->layer_index_state_kv[il], g->layer_index_state_score[il],
+                        DS4_N_INDEXER_HEAD_DIM, ratio, index_width, n_tokens, il,
+                        idx_store_rows_fused, "idx");
             if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
                                                   g->batch_comp_kv,
                                                   (uint64_t)index_width * n_tokens,
@@ -16938,7 +17141,11 @@ static bool metal_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor *idx_ct = fp4_primary ? idx_emit : g->layer_index_comp_cache[il];
                     const uint32_t idx_wrow = fp4_primary ? 0u : index_row_global;
                     ok = kv_view && sc_view && st_kv && st_sc &&
-                         ds4_gpu_compressor_update_tensor(kv_view,
+                         /* C3-Inc2: n==1 store already fused into the pair
+                          * kernel above -- emit tail only (same signature). */
+                         (idx_store_rows_fused
+                          ? ds4_gpu_compressor_update_tail_tensor
+                          : ds4_gpu_compressor_update_tensor)(kv_view,
                                                             sc_view,
                                                             st_kv,
                                                             st_sc,

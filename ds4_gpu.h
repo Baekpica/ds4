@@ -1164,6 +1164,41 @@ int ds4_gpu_compressor_pair_store_fused_tensor(
         uint64_t                n_tok,
         uint32_t                il);
 
+/* C3-Inc2 (CUDA): batched-decode rows variant of the fused compressor pair --
+ * BOTH bulk f16 matmuls over n_tok <= 8 x rows and their split-K combines as
+ * one cooperative kernel, bit-identical to the two-bulk-matmul chain (at
+ * n_tok <= the native-f16 cap each row runs the exact n=1 split-K+combine).
+ * do_store != 0 additionally fuses the compressor store -- ONLY valid on the
+ * single-row (n_tok == 1) multiseq emit shape, because at n > 1 the per-row
+ * emit loop interleaves stores with pool reads (same-bank chains reuse ring
+ * slots) and hoisted stores would reorder them.  positions/seq_id are the
+ * per-step device substrates (per-row pos + bank lane on the FULL state
+ * slabs, resolved at execution time -- bank-agnostic under capture; the
+ * caller validates the lane extent).  Returns 0 without touching any output
+ * on any precondition miss; the caller then runs the unfused chain.  On a
+ * do_store success the caller must follow with
+ * ds4_gpu_compressor_update_tail_tensor (NOT the full update). */
+int ds4_gpu_compressor_pair_store_rows_fused_tensor(
+        ds4_gpu_tensor       *kv_cur,
+        ds4_gpu_tensor       *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                w_kv_offset,
+        uint64_t                w_sc_offset,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos0,
+        uint64_t                in_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                n_tok,
+        int                     do_store);
+
 int ds4_gpu_compressor_update_tensor(
         const ds4_gpu_tensor *kv_cur,
         const ds4_gpu_tensor *sc_cur,

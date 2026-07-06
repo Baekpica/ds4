@@ -9383,6 +9383,36 @@ int ds4_gpu_compressor_pair_store_fused_tensor(
     return 0;
 }
 
+/* C3-Inc2 is CUDA-only: returning 0 sends ds4.c down the unfused
+ * bulk-matmul + per-row update chain. */
+int ds4_gpu_compressor_pair_store_rows_fused_tensor(
+        ds4_gpu_tensor       *kv_cur,
+        ds4_gpu_tensor       *sc_cur,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                w_kv_offset,
+        uint64_t                w_sc_offset,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos0,
+        uint64_t                in_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                n_tok,
+        int                     do_store) {
+    (void)kv_cur; (void)sc_cur; (void)state_kv; (void)state_score;
+    (void)model_map; (void)model_size; (void)w_kv_offset; (void)w_sc_offset;
+    (void)ape_offset; (void)ape_type; (void)head_dim; (void)ratio; (void)pos0;
+    (void)in_dim; (void)x; (void)positions; (void)seq_id; (void)n_tok;
+    (void)do_store;
+    return 0;
+}
+
 /* M2-Inc5: emit-tail-only variant is never reached on Metal (the fused
  * pair+store above always returns 0), but the symbol must exist. */
 int ds4_gpu_compressor_update_tail_tensor(
