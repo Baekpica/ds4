@@ -11295,7 +11295,7 @@ static bool metal_graph_encode_decode_layer_impl(
                                                         DS4_RMS_EPS,
                                                         il,                          /* PC2: per-layer substrate index for emit-row */
                                                         DS4_COMPRESSOR_ROW_COMP,     /* PC2: primary compressor -> ls->comp_row */
-                                                        NULL, NULL, 0u, 0u           /* C2: no per-row substrate (serial width-1) */) != 0;
+                                                        NULL, NULL, 0u               /* C2: no per-row substrate (serial width-1) */) != 0;
         if (ok && emit) {
             /* Step 4c R1': read comp_row from g_layer_dev[il].comp_row in
              * the per-layer substrate (populated at top of token in
@@ -11311,11 +11311,11 @@ static bool metal_graph_encode_decode_layer_impl(
             ok = ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
                     g->layer_attn_comp_cache[il],
                     DS4_N_HEAD_DIM, DS4_N_ROT,
-                    il,
+                    0u, il, 0 /* C2: serial keeps the per-layer substrate row */,
                     g->layer_comp_cache_fp8[il],
                     g->layer_comp_scale[il],
                     /* C1: serial path keeps the in-cache row (no scratch src) */
-                    NULL, 0u) != 0;
+                    NULL) != 0;
             if (ok && metal_graph_debug_wants("KVcompress", il, pos)) {
                 /* Debug-only path (DS4_METAL_GRAPH_DUMP_PREFIX env-gated).
                  * The synchronize inside the dumper is incompatible with
@@ -11424,7 +11424,7 @@ static bool metal_graph_encode_decode_layer_impl(
                                                             DS4_RMS_EPS,
                                                             il,                          /* PC2: per-layer substrate index for emit-row */
                                                             DS4_COMPRESSOR_ROW_INDEX,    /* PC2: indexer compressor -> ls->index_row */
-                                                            NULL, NULL, 0u, 0u           /* C2: no per-row substrate (serial width-1) */) != 0;
+                                                            NULL, NULL, 0u               /* C2: no per-row substrate (serial width-1) */) != 0;
             /* TEMPORARY DIAGNOSTIC: state_kv AFTER compressor_update_tensor
              * returns (post compressor_store_batch + post update_pool +
              * shift).  Slot 230+il.  If this matches BE vs BC but the cache
@@ -11456,14 +11456,14 @@ static bool metal_graph_encode_decode_layer_impl(
                 ok = ds4_gpu_dsv4_indexer_qat_row_tensor(
                         g->layer_index_comp_cache[il],
                         DS4_N_INDEXER_HEAD_DIM,
-                        il,
+                        0u, il, 0 /* C2: serial keeps the per-layer substrate row */,
                         /* P2 Inc3a: whole-cache mirrors; the kernel indexes both
                          * F32 base and FP4 mirror at g_layer_dev[il].index_row.
                          * NULL when DS4_CUDA_FP4_INDEX is off. */
                         g->layer_index_comp_cache_fp4[il],
                         g->layer_index_comp_scale[il],
                         /* C1: serial path keeps the in-cache row */
-                        NULL, 0u) != 0;
+                        NULL) != 0;
             }
             /* Fixed-size post-qat cache hash, slot 60+il.  Same 3000 rows.
              * Comparing slot 0+il (post-update) vs 60+il (post-qat) tells
@@ -15976,10 +15976,6 @@ static bool metal_graph_encode_layer_attention_batch(
                 (uint64_t)(coff * ratio) * comp_width * sizeof(float);
             const double emit_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
             const uint32_t sp_emit = ds4_gpu_stage_prof_begin(DS4_SPROF_EMIT);
-            /* C1b: emits this layer already performed within THIS step --
-             * feeds the capture-mode row/pos deltas (key-stable: single-bank
-             * consecutive rows fix which rows emit). */
-            uint32_t cap_emits_before = 0;
             for (uint32_t t = 0; ok && t < n_tokens; t++) {
                 /* FB2: batched middle -- one aligned-chunk emit over f2_mid
                  * rows into bank seq's cache/state views, the multiseq mirror
@@ -16198,21 +16194,23 @@ static bool metal_graph_encode_layer_attention_batch(
                                                         DS4_ROPE_YARN_BETA_SLOW,
                                                         DS4_RMS_EPS,
                                                         cap_step ? il : UINT32_MAX,
-                                                        cap_step && ms_fp8_primary
+                                                        cap_step ? (ms_fp8_primary
                                                             ? DS4_COMPRESSOR_ROW_SCRATCH0
+                                                            : DS4_COMPRESSOR_ROW_TABLE_COMP)
                                                             : DS4_COMPRESSOR_ROW_COMP,
-                                                        /* C2 Inc1: per-row pos + state lane from the
-                                                         * per-step device arrays at baked row index t;
-                                                         * emits-before delta stays key-stable per shape. */
+                                                        /* C2: per-row pos + state lane + emit row from
+                                                         * the per-step device substrates at baked row
+                                                         * index t (emit ordering baked into the
+                                                         * published table value). */
                                                         cap_step ? g->batch_positions : NULL,
                                                         cap_step ? g->batch_seq_id : NULL,
-                                                        t,
-                                                        cap_emits_before) != 0;
+                                                        t) != 0;
                 ds4_gpu_stage_prof_end(sp_cupd);
                 if (g_cont_prof > 0) g_cont_lyr_cupd_s += now_sec() - cupd_t0;
                 if (ok && emit && cap_step) {
                     /* C1: capture-safe pack -- the row-variant kernel reads the
-                     * emit row live from g_layer_dev[il].comp_row (mirror rows)
+                     * emit row live from the per-ROW table entry (row t; C2
+                     * Inc2 -- value carries bank base + within-step ordering)
                      * and round-trips the F32 value on the scratch row 0
                      * (fp8-primary) or in the cache slab (F32-primary).  The
                      * mirror pages were demand-mapped in the input phase
@@ -16220,11 +16218,10 @@ static bool metal_graph_encode_layer_attention_batch(
                      * calls must stay outside the captured scope. */
                     ok = ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
                             ms_fp8_primary ? NULL : g->layer_attn_comp_cache[il],
-                            DS4_N_HEAD_DIM, DS4_N_ROT, il,
+                            DS4_N_HEAD_DIM, DS4_N_ROT, t, il, 1,
                             g->layer_comp_cache_fp8[il],
                             g->layer_comp_scale[il],
-                            ms_fp8_primary ? ms_row_scratch : NULL,
-                            cap_emits_before) != 0;
+                            ms_fp8_primary ? ms_row_scratch : NULL) != 0;
                 } else if (ok && emit) {
                     /* P2 Inc2a: E4M3 round-trip of the just-emitted row (model
                      * semantics -- see the block comment above) + the per-bank
@@ -16266,7 +16263,6 @@ static bool metal_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor_free(crow);
                 }
                 if (ok && emit) g->ms_n_comp[seq][il]++;
-                if (emit) cap_emits_before++;
                 if (ok && emit) ok = ms_emit_keep_restore(g, il, seq, ratio, comp_row_local, 1u, false);
                 /* S1.1 M2: snapshot bank seq's attn running-state + row counter after
                  * this row, so a partial accept can roll the bank back to its accepted
@@ -16618,7 +16614,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_RMS_EPS,
                                                             UINT32_MAX,                  /* PC2: decode2-exact, no substrate; inline comp_row */
                                                             DS4_COMPRESSOR_ROW_COMP,     /* PC2: row_field ignored when il==UINT32_MAX */
-                                                            NULL, NULL, 0u, 0u) != 0;
+                                                            NULL, NULL, 0u) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = row_fp8_primary
                             ? ds4_gpu_tensor_view(row_scratch, 0,
@@ -16760,7 +16756,6 @@ static bool metal_graph_encode_layer_attention_batch(
                  * on the same group-close, but tracked independently). */
                 const uint64_t istate_stride =
                     (uint64_t)(coff * ratio) * index_width * sizeof(float);
-                uint32_t icap_emits_before = 0;  /* C1b: see the attn emit loop */
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
                     /* FB2: batched middle, indexer flavor -- mirrors the
                      * single-seq aligned-chunk indexer branch below (replay +
@@ -16968,26 +16963,25 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS,
                                                             icap_step ? il : UINT32_MAX,
-                                                            icap_step && fp4_primary
+                                                            icap_step ? (fp4_primary
                                                                 ? DS4_COMPRESSOR_ROW_SCRATCH0
+                                                                : DS4_COMPRESSOR_ROW_TABLE_INDEX)
                                                                 : DS4_COMPRESSOR_ROW_INDEX,
                                                             icap_step ? g->batch_positions : NULL,
                                                             icap_step ? g->batch_seq_id : NULL,
-                                                            t,
-                                                            icap_emits_before) != 0;
+                                                            t) != 0;
                     if (ok && emit && icap_step) {
                         /* C1: capture-safe QAT -- row-variant reads the emit
-                         * row live from g_layer_dev[il].index_row (FP4 mirror)
-                         * and hadamard-quantises the scratch row 0
+                         * row live from the per-ROW table entry (row t; C2
+                         * Inc2) and hadamard-quantises the scratch row 0
                          * (fp4-primary) or the in-slab row.  Mirror pages
                          * demand-mapped in the input phase. */
                         ok = ds4_gpu_dsv4_indexer_qat_row_tensor(
                                 fp4_primary ? NULL : g->layer_index_comp_cache[il],
-                                DS4_N_INDEXER_HEAD_DIM, il,
+                                DS4_N_INDEXER_HEAD_DIM, t, il, 1,
                                 g->layer_index_comp_cache_fp4[il],
                                 g->layer_index_comp_scale[il],
-                                fp4_primary ? idx_emit : NULL,
-                                icap_emits_before) != 0;
+                                fp4_primary ? idx_emit : NULL) != 0;
                     } else if (ok && emit) {
                         ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(
                                 g->layer_index_comp_cache[il],
@@ -17029,7 +17023,6 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                     }
                     if (ok && emit) g->ms_n_index_comp[seq][il]++;
-                    if (emit) icap_emits_before++;
                     if (ok && emit) ok = ms_emit_keep_restore(g, il, seq, ratio, index_row_local, 1u, true);
                     /* S1.1 M3: indexer sibling of the attn rollback snapshot above. */
                     if (ok && g->batch_rollback_capture) {
@@ -17355,7 +17348,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_RMS_EPS,
                                                                 UINT32_MAX,                  /* PC2: decode2-exact indexer, no substrate */
                                                                 DS4_COMPRESSOR_ROW_INDEX,    /* PC2: row_field ignored when il==UINT32_MAX */
-                                                                NULL, NULL, 0u, 0u) != 0;
+                                                                NULL, NULL, 0u) != 0;
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                                     g->layer_index_comp_cache[il],
@@ -28696,17 +28689,27 @@ static int metal_graph_cont_capture_env_blocked(void) {
  * banks' counters, with THIS step's emits applied to the live bank).  Using
  * g->layer_n_comp[il] instead would go stale-high after a rollback and
  * break bit-parity with the eager body's recompute. */
+/* C2 Inc2: post-emit max-over-banks counts for this step's SHAPE -- each
+ * bank gains one emit per OWN row that closes a ratio group (exact, from
+ * the per-row positions/seq ids; replaces the C1 single-bank + inline
+ * emits estimate). */
 static void metal_graph_cont_capture_counts(
         const ds4_gpu_graph *g,
         uint32_t              il,
-        uint32_t              bank,
-        uint32_t              emits,
+        uint32_t              n,
         uint32_t             *out_n_comp_post,
         uint32_t             *out_n_index_post) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
     uint32_t mxc = 0, mxi = 0;
     for (uint32_t s2 = 0; s2 < g->batch_n_seq; s2++) {
-        uint32_t c = g->ms_n_comp[s2][il] + (s2 == bank ? emits : 0u);
-        uint32_t i = g->ms_n_index_comp[s2][il] + (s2 == bank ? emits : 0u);
+        uint32_t e = 0;
+        if (ratio != 0u) {
+            for (uint32_t t = 0; t < n; t++)
+                if ((uint32_t)g->ms_seq_id[t] == s2 &&
+                    (((uint32_t)g->ms_positions[t] + 1u) % ratio) == 0u) e++;
+        }
+        uint32_t c = g->ms_n_comp[s2][il] + e;
+        uint32_t i = g->ms_n_index_comp[s2][il] + e;
         if (c > mxc) mxc = c;
         if (i > mxi) mxi = i;
     }
@@ -28720,14 +28723,14 @@ static void metal_graph_cont_capture_counts(
  * will retry and report). */
 static bool metal_graph_cont_capture_prepare(
         ds4_gpu_graph *g,
-        uint32_t        bank,
         uint32_t        pos0,
         uint32_t        n,
         int             token0,
         uint32_t       *cap_ncomp,   /* [DS4_N_LAYER] post-emit attn counts */
         uint32_t       *cap_nidx) {  /* [DS4_N_LAYER] post-emit index counts */
     if (ds4_gpu_decode_scalars_init() == 0 ||
-        ds4_gpu_decode_layer_scalars_init() == 0) return false;
+        ds4_gpu_decode_layer_scalars_init() == 0 ||
+        ds4_gpu_decode_row_scalars_init() == 0) return false;
     /* 1. Token-stable window scalars -- SAME helper + arguments as the
      * multiseq attention body (raw_span_n=1, raw_span_last=pos0), so the
      * substrate reads reproduce the eager inline args bit-for-bit. */
@@ -28742,8 +28745,12 @@ static bool metal_graph_cont_capture_prepare(
                                      0u,
                                      (uint32_t)token0);
     if (ds4_gpu_decode_scalars_flush() == 0) return false;
-    /* 2 + 3. Per-layer scalars + demand-map this step's emit rows. */
-    const uint32_t first_pos = pos0 - (n - 1u);   /* rows are consecutive (eligibility) */
+    /* 2 + 3. Per-layer counts + per-ROW emit-row table + demand-map this
+     * step's emit rows.  C2 Inc2: each row t emits into ITS OWN bank
+     * (ms_seq_id[t]) at that bank's counter plus how many earlier rows of
+     * the SAME bank already emitted at this layer this step -- the host
+     * bakes bank base AND within-step ordering into the published value,
+     * so the captured kernels only ever dereference a table entry. */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0u) {
@@ -28752,22 +28759,47 @@ static bool metal_graph_cont_capture_prepare(
             ds4_gpu_decode_layer_scalars_set(il, 0u, 0u, 0u, 0u);
             continue;
         }
-        /* Rows [first_pos, first_pos+n) emit where they close a ratio group. */
-        uint32_t emits = 0u;
-        for (uint32_t t = 0; t < n; t++)
-            if (((first_pos + t + 1u) % ratio) == 0u) emits++;
-        const uint32_t pre_local = g->ms_n_comp[bank][il];
-        const uint32_t pre_idx   = g->ms_n_index_comp[bank][il];
-        const uint64_t row_g     = (uint64_t)bank * g->layer_comp_cap[il] + pre_local;
-        const uint64_t idx_row_g = (uint64_t)bank * g->layer_comp_cap[il] + pre_idx;
-        metal_graph_cont_capture_counts(g, il, bank, emits,
-                                        &cap_ncomp[il], &cap_nidx[il]);
+        metal_graph_cont_capture_counts(g, il, n, &cap_ncomp[il], &cap_nidx[il]);
+        /* Counts are what the read path consumes (attention clamp bound,
+         * topk live count); the per-layer emit-row fields are 0 on batch
+         * capture steps -- the emit kernels read the per-row table (a
+         * misuse of the layer fields would rope row 0 and fail the token-
+         * identity gates loudly). */
         ds4_gpu_decode_layer_scalars_set(il,
                                             cap_ncomp[il],
                                             ratio == 4u ? cap_nidx[il] : 0u,
-                                            (uint32_t)row_g,
-                                            ratio == 4u ? (uint32_t)idx_row_g : 0u);
-        if (emits) {
+                                            0u, 0u);
+        /* Per-bank running emit offsets for this step (n <= 8 rows). */
+        uint32_t emitted[DS4_ROW_SCALARS_MAX_ROWS];
+        uint32_t emitted_seq[DS4_ROW_SCALARS_MAX_ROWS];
+        uint32_t n_emitting_banks = 0;
+        for (uint32_t t = 0; t < n; t++) {
+            if ((((uint32_t)g->ms_positions[t] + 1u) % ratio) != 0u) continue;
+            const uint32_t seq = (uint32_t)g->ms_seq_id[t];
+            uint32_t b = 0;
+            while (b < n_emitting_banks && emitted_seq[b] != seq) b++;
+            if (b == n_emitting_banks) {
+                emitted_seq[b] = seq;
+                emitted[b] = 0u;
+                n_emitting_banks++;
+            }
+            const uint32_t row_g = seq * g->layer_comp_cap[il]
+                                 + g->ms_n_comp[seq][il] + emitted[b];
+            const uint32_t idx_row_g = seq * g->layer_comp_cap[il]
+                                     + g->ms_n_index_comp[seq][il] + emitted[b];
+            ds4_gpu_decode_row_scalars_set((uint32_t)t, il, row_g,
+                                           ratio == 4u ? idx_row_g : 0u);
+            emitted[b]++;
+        }
+        /* Demand-map per emitting bank: its emits are contiguous from the
+         * bank's pre-step counter. */
+        for (uint32_t b = 0; b < n_emitting_banks; b++) {
+            const uint32_t seq = emitted_seq[b];
+            const uint32_t emits = emitted[b];
+            const uint64_t row_g = (uint64_t)seq * g->layer_comp_cap[il]
+                                 + g->ms_n_comp[seq][il];
+            const uint64_t idx_row_g = (uint64_t)seq * g->layer_comp_cap[il]
+                                     + g->ms_n_index_comp[seq][il];
             /* Attn compressed rows: fp8-primary packs the mirror; F32-primary
              * writes the cache slab.  Map whichever the emits will touch. */
             if (g->layer_comp_cache_fp8[il]) {
@@ -28798,7 +28830,8 @@ static bool metal_graph_cont_capture_prepare(
             }
         }
     }
-    if (ds4_gpu_decode_layer_scalars_flush() == 0) return false;
+    if (ds4_gpu_decode_layer_scalars_flush() == 0 ||
+        ds4_gpu_decode_row_scalars_flush() == 0) return false;
     /* 4. Scratch prewarm: stable pointers before the first capture (the
      * cached fast path makes this free on every later step). */
     if (!DS4_GPU_ATTN_COMP_CACHE_F16) {
@@ -28872,43 +28905,72 @@ static bool metal_graph_batch_eval_logits(
      * is bit-identical to the scalar path; it exercises the array read so Step 3
      * can make positions per-seq independent. */
 
-    /* ---- C1 (cont capture) step eligibility -------------------------------
+    /* ---- C1/C2 (cont capture) step eligibility ----------------------------
      * See the helper block above metal_graph_batch_eval_logits.  When the
      * step qualifies, publish the substrates + map the emit rows, then wrap
      * each layer body in the cont graph cache's warm/capture/replay protocol.
-     * Any failure downgrades to the fully-eager step (bit-identical). */
+     * Any failure downgrades to the fully-eager step (bit-identical).
+     *
+     * C2 Inc2: TWO capturable shapes --
+     *   single-bank : ONE bank's consecutive positions, width 1..8 (plain
+     *                 width-1 cont + the DSpark/MTP verify step, incl.
+     *                 rollback checkpoints with canonical vdepth==t).
+     *   multi-plain : one row per DISTINCT bank (the production N=2..8
+     *                 plain batched decode step), no rollback.  Per-row
+     *                 pos/bank/emit-row all ride the device substrates
+     *                 (positions/seq_id arrays + per-ROW emit-row table),
+     *                 so the same graph serves any bank assignment.
+     * Mixed shapes (a bank with >1 row among others: multi-live verify
+     * segments) stay eager until Inc3. */
     uint32_t cap_ncomp[DS4_MAX_LAYER] = {0};
     uint32_t cap_nidx[DS4_MAX_LAYER] = {0};
     uint32_t cap_bank = 0;
     uint32_t cap_nraw = 0, cap_rawstart = 0;
+    uint32_t cap_bank_pattern = 0;
     g->batch_capture_step = false;
     if (ds4_cuda_cont_graphs_enabled() != 0 &&
         !metal_graph_cont_capture_env_blocked() &&
         !DS4_GPU_ATTN_COMP_CACHE_F16 &&
-        n <= 8u &&                    /* width 1 = plain cont; 1+D = DSpark/MTP verify */
+        n <= 8u &&
         pos0 != 0u && pos0 >= n - 1u &&
         g->batch_multiseq && g->batch_multiseq_prefilled && g->batch_multiseq_emit &&
         !g->batch_defer_comp_store &&
         !g->batch_admit_fast && !g->batch_head_last_only &&
-        g->batch_max_seq_len == 0u && g->batch_draft_n_raw == NULL &&
-        g->ms_seq_id[0] >= 0 && (uint32_t)g->ms_seq_id[0] < DS4_MULTISEQ_MAX_SEQ &&
-        (uint32_t)g->ms_positions[n - 1u] == pos0) {
+        g->batch_max_seq_len == 0u && g->batch_draft_n_raw == NULL) {
         cap_bank = (uint32_t)g->ms_seq_id[0];
-        bool elig = g->ms_emit_keep[cap_bank] == 0u;
-        /* C1b: multi-row steps must be ONE bank's consecutive positions (the
-         * DSpark/MTP verify shape: committed row + D drafts).  The per-row
-         * pos/emit-row deltas baked into the captured bodies are constants of
-         * that shape; anything else (multi-live plain steps) stays eager. */
-        for (uint32_t t = 0; elig && t < n; t++) {
-            if ((uint32_t)g->ms_seq_id[t] != cap_bank ||
-                g->ms_positions[t] != g->ms_positions[0] + (int32_t)t) elig = false;
+        bool banks_ok = true;      /* every row: valid bank + emit_keep==0 + pos>0 */
+        bool single_bank = true;   /* all rows one bank */
+        bool distinct = true;      /* no bank appears twice */
+        int32_t max_pos = 0;
+        for (uint32_t t = 0; banks_ok && t < n; t++) {
+            if (g->ms_seq_id[t] < 0 ||
+                (uint32_t)g->ms_seq_id[t] >= DS4_MULTISEQ_MAX_SEQ ||
+                g->ms_positions[t] <= 0 ||
+                g->ms_emit_keep[(uint32_t)g->ms_seq_id[t]] != 0u) banks_ok = false;
+            if ((uint32_t)g->ms_seq_id[t] != cap_bank) single_bank = false;
+            if (g->ms_positions[t] > max_pos) max_pos = g->ms_positions[t];
+            for (uint32_t t2 = 0; distinct && t2 < t; t2++)
+                if (g->ms_seq_id[t2] == g->ms_seq_id[t]) distinct = false;
         }
-        /* Rollback-capture steps checkpoint per row keyed on ms_vdepth; the
-         * captured D2D copy nodes bake (depth, bank) so vdepth must be the
-         * canonical single-bank layout (depth == row index). */
-        if (elig && g->batch_rollback_capture) {
+        /* pos0 is the step's published max position (the raw-window anchor);
+         * every capturable shape must agree with it. */
+        bool elig = banks_ok && (uint32_t)max_pos == pos0;
+        if (elig && single_bank) {
+            /* Single-bank rows must be consecutive positions ending at pos0
+             * (the verify shape: committed row + D drafts). */
+            if ((uint32_t)g->ms_positions[n - 1u] != pos0) elig = false;
             for (uint32_t t = 0; elig && t < n; t++)
-                if (g->ms_vdepth[t] != (int32_t)t) elig = false;
+                if (g->ms_positions[t] != g->ms_positions[0] + (int32_t)t) elig = false;
+            /* Rollback-capture steps checkpoint per row keyed on ms_vdepth;
+             * the captured lane-copy nodes bake (depth, row) so vdepth must
+             * be the canonical single-bank layout (depth == row index). */
+            if (elig && g->batch_rollback_capture) {
+                for (uint32_t t = 0; elig && t < n; t++)
+                    if (g->ms_vdepth[t] != (int32_t)t) elig = false;
+            }
+        } else if (elig) {
+            /* Multi-plain: one row per bank, no rollback. */
+            if (!distinct || n < 2u || g->batch_rollback_capture) elig = false;
         }
         if (elig) {
             /* The live-sized chunked topk tier (> 8192 compressed rows) has
@@ -28916,14 +28978,27 @@ static bool metal_graph_batch_eval_logits(
             for (uint32_t il = 0; elig && il < DS4_N_LAYER; il++) {
                 if (ds4_layer_compress_ratio(il) == 0u) continue;
                 uint32_t nc, ni;
-                metal_graph_cont_capture_counts(g, il, cap_bank, 2u, &nc, &ni);
+                metal_graph_cont_capture_counts(g, il, n, &nc, &ni);
                 if (nc > 8192u || ni > 8192u) elig = false;
             }
         }
-        if (elig && metal_graph_cont_capture_prepare(g, cap_bank, pos0, n,
+        if (elig && metal_graph_cont_capture_prepare(g, pos0, n,
                                                      tokens[0], cap_ncomp, cap_nidx)) {
             metal_graph_raw_window_for_batch(g, pos0, 1u, pos0,
                                              &cap_nraw, &cap_rawstart);
+            /* Key field: per-row bank ORDINALS (first-occurrence order,
+             * 4b/row).  Single-bank -> 0 (Inc1-compatible); multi-plain
+             * distinct rows -> 0,1,..,n-1; Inc3 segments will produce
+             * repeated ordinals.  The actual bank ids stay OUT of the key
+             * (resolved via the device substrates at replay). */
+            int32_t seen[DS4_ROW_SCALARS_MAX_ROWS];
+            uint32_t n_seen = 0;
+            for (uint32_t t = 0; t < n; t++) {
+                uint32_t o = 0;
+                while (o < n_seen && seen[o] != g->ms_seq_id[t]) o++;
+                if (o == n_seen) seen[n_seen++] = g->ms_seq_id[t];
+                cap_bank_pattern |= (o & 0xFu) << (4u * t);
+            }
             g->batch_capture_step = true;
             g->batch_capture_bank = cap_bank;
         }
@@ -28937,9 +29012,12 @@ static bool metal_graph_batch_eval_logits(
         const uint32_t il_ratio = ds4_layer_compress_ratio(il);
         uint32_t cap_emit_mask = 0u;
         if (g->batch_capture_step && il_ratio != 0u) {
-            const uint32_t first = pos0 - (n - 1u);
+            /* C2 Inc2: per-row emit from the row's OWN position (identical
+             * to the old first_pos+t formula for the consecutive single-
+             * bank shape; also correct for multi-plain arbitrary rows). */
             for (uint32_t t = 0; t < n; t++)
-                if (((first + t + 1u) % il_ratio) == 0u) cap_emit_mask |= (1u << t);
+                if ((((uint32_t)g->ms_positions[t] + 1u) % il_ratio) == 0u)
+                    cap_emit_mask |= (1u << t);
         }
         const bool cap_emit_il = cap_emit_mask != 0u;
         if (g->batch_capture_step) {
@@ -28947,11 +29025,12 @@ static bool metal_graph_batch_eval_logits(
             memset(&ck, 0, sizeof(ck));
             ck.il    = il;
             ck.width = n;
-            /* C2 Inc1: no bank in the key -- the captured bodies resolve the
+            /* C2: no bank IDS in the key -- the captured bodies resolve the
              * bank at replay time from the device seq_id array (state lanes,
-             * ckpt copies) and the per-step published layer scalars (emit
-             * rows), so ONE graph set serves every bank.
-             * row_bank_pattern stays 0 (memset) until Inc2 multi-live shapes. */
+             * ckpt copies) and the per-ROW emit-row table, so ONE graph set
+             * serves every bank assignment.  Only the bank-ordinal PATTERN
+             * (row-to-bank grouping shape) keys the topology. */
+            ck.row_bank_pattern = cap_bank_pattern;
             const bool cap_indexed = il_ratio == 4u &&
                                      cap_ncomp[il] > DS4_N_INDEXER_TOP_K;
             ck.flags = (cap_emit_il          ? 1u  : 0u)
@@ -28998,32 +29077,31 @@ static bool metal_graph_batch_eval_logits(
         } else {
             /* Replay served the whole layer body: advance the host state the
              * skipped body would have advanced, row by row in body order.
-             * Counter refresh mirrors the body's unconditional max-over-banks
-             * recompute (load-bearing after a rollback lowers a bank's
-             * counters).  On rollback-capture steps the body also records the
-             * per-depth checkpoint counters AFTER each row's emit; the D2D
-             * state copies themselves are inside the replayed graph. */
+             * C2 Inc2: per-row bank (multi-plain rows each advance their OWN
+             * bank's counters).  Counter refresh mirrors the body's
+             * unconditional max-over-banks recompute (load-bearing after a
+             * rollback lowers a bank's counters).  On rollback-capture steps
+             * (single-bank only) the body also records the per-depth
+             * checkpoint counters AFTER each row's emit; the lane-copy
+             * nodes themselves are inside the replayed graph. */
             if (il_ratio != 0u) {
-                uint32_t cnt  = g->ms_n_comp[cap_bank][il];
-                uint32_t icnt = g->ms_n_index_comp[cap_bank][il];
                 for (uint32_t t = 0; t < n; t++) {
+                    const uint32_t rs = (uint32_t)g->ms_seq_id[t];
                     if (cap_emit_mask & (1u << t)) {
-                        cnt++;
-                        if (il_ratio == 4u) icnt++;
+                        g->ms_n_comp[rs][il]++;
+                        if (il_ratio == 4u) g->ms_n_index_comp[rs][il]++;
                     }
                     if (g->batch_rollback_capture) {
                         const uint32_t depth = (uint32_t)g->ms_vdepth[t];
                         if (depth < DS4_MTP_RB_DEPTH) {
                             if (g->mtp_rb_askv[depth][il] && g->mtp_rb_assc[depth][il])
-                                g->mtp_rb_n_comp[depth][cap_bank][il] = cnt;
+                                g->mtp_rb_n_comp[depth][rs][il] = g->ms_n_comp[rs][il];
                             if (il_ratio == 4u &&
                                 g->mtp_rb_iskv[depth][il] && g->mtp_rb_issc[depth][il])
-                                g->mtp_rb_n_index_comp[depth][cap_bank][il] = icnt;
+                                g->mtp_rb_n_index_comp[depth][rs][il] = g->ms_n_index_comp[rs][il];
                         }
                     }
                 }
-                g->ms_n_comp[cap_bank][il] = cnt;
-                if (il_ratio == 4u) g->ms_n_index_comp[cap_bank][il] = icnt;
                 uint32_t mxc = 0, mxi = 0;
                 for (uint32_t s2 = 0; s2 < g->batch_n_seq; s2++) {
                     if (g->ms_n_comp[s2][il] > mxc) mxc = g->ms_n_comp[s2][il];

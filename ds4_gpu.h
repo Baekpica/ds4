@@ -272,6 +272,26 @@ void  ds4_gpu_decode_layer_scalars_set(
         uint32_t comp_row,
         uint32_t index_row);
 
+/* C2 Inc2: per-ROW emit-row table for cont capture steps (multi-live).
+ * One {comp_row, index_row} entry per (batch row 0..7, layer 0..42): the
+ * GLOBAL cache rows this row's emit writes, with the bank base AND the
+ * within-step emit ordering already applied by the host at publish time
+ * (this retired the C1b emit_row_delta scheme).  Published once per
+ * capture step (set per emitting row+layer, then one flush); captured
+ * kernels bake the table-entry ADDRESS and read the live value at
+ * replay.  Same double-buffered pinned discipline as the per-layer
+ * scalars above.  Metal stubs: init/flush return 0/1, set is a no-op.
+ * The row bound mirrors the same constant in ds4_cuda.cu (which keeps
+ * local decls; see the DS4_LAYER_SCALARS_COUNT precedent). */
+#define DS4_ROW_SCALARS_MAX_ROWS 8u
+int   ds4_gpu_decode_row_scalars_init(void);
+void  ds4_gpu_decode_row_scalars_set(
+        uint32_t row,
+        uint32_t il,
+        uint32_t comp_row,
+        uint32_t index_row);
+int   ds4_gpu_decode_row_scalars_flush(void);
+
 /* =========================================================================
  * Step 5/6: per-layer cudaGraph capture-and-replay.
  *
@@ -912,12 +932,17 @@ int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
         uint32_t          n_rot,
+        /* C2 Inc2: row source select.  row_table=0 -> the per-layer
+         * substrate row &g_layer_dev[il].comp_row (serial captured decode;
+         * row_idx ignored).  row_table=1 -> the per-ROW emit-row table
+         * entry (row_idx, il), whose published value carries bank base +
+         * within-step ordering (cont capture steps). */
+        uint32_t          row_idx,
         uint32_t          il,
+        int               row_table,
         ds4_gpu_tensor *codes_mirror,
         ds4_gpu_tensor *scale_mirror,
-        ds4_gpu_tensor *src,
-        /* C1b: key-stable offset from the substrate emit row. */
-        uint32_t          row_delta);
+        ds4_gpu_tensor *src);
 
 /* P2 Inc2b: expand packed FP8 rows back to FP32 -- the exact inverse of the
  * quantize encode (each lane reconstructs bit-identically to what the
@@ -947,19 +972,20 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *codes_mirror,
         ds4_gpu_tensor *scale_mirror);
 
-/* R1 row-variant (Step 4c R1'): writes one row of `base` at the index
- * taken from g_layer_dev[il].index_row.
+/* R1 row-variant (Step 4c R1' + C2 Inc2): writes one row of `base` at the
+ * index taken from the per-ROW emit-row table entry (row_idx, il).
  * C1 (cont capture): `src` override mirrors fp8_kv_quantize_row_tensor --
- * non-NULL src = F32 work on src row 0, packed mirror rows at
- * g_layer_dev[il].index_row, base may be NULL. */
+ * non-NULL src = F32 work on src row 0, packed mirror rows at the table
+ * row, base may be NULL. */
 int ds4_gpu_dsv4_indexer_qat_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
+        uint32_t          row_idx,
         uint32_t          il,
+        int               row_table,
         ds4_gpu_tensor *codes_mirror,
         ds4_gpu_tensor *scale_mirror,
-        ds4_gpu_tensor *src,
-        uint32_t          row_delta);
+        ds4_gpu_tensor *src);
 
 /* P2 Inc3: expand packed FP4 indexer rows back to F32 -- exact inverse of the
  * encode (bit-identical to indexer_fp4_read).  `codes`/`scale` are views at
@@ -1101,6 +1127,14 @@ int ds4_gpu_store_raw_kv_batch_tensor(
  * that follows (fp8/fp4 row-variant with `src`) is what lands at the
  * substrate row.  Requires il < layer count (fails loud otherwise). */
 #define DS4_COMPRESSOR_ROW_SCRATCH0 2
+/* C2 Inc2 (cont capture): emit-tail row read from the per-ROW emit-row
+ * table entry (row_idx, il) -- &g_row_dev[row_idx*COUNT+il].comp_row /
+ * .index_row.  The published value already carries the bank base and the
+ * within-step emit ordering, so ONE captured graph serves single-bank AND
+ * multi-live shapes.  Requires il < layer count + a published table
+ * (fails loud otherwise). */
+#define DS4_COMPRESSOR_ROW_TABLE_COMP  3
+#define DS4_COMPRESSOR_ROW_TABLE_INDEX 4
 
 /* M2-Inc5 (CUDA): one decode compressor event -- BOTH pair f16 matmuls
  * (kv + gate, in_dim x width), their split-K combines, and the compressor
@@ -1163,20 +1197,19 @@ int ds4_gpu_compressor_update_tensor(
          * plan doc sec 16 commit C2 / sec 15.8. */
         uint32_t                il,
         int                     row_field,
-        /* C2 Inc1 (bank-agnostic cont capture): per-row device substrate.
-         * positions non-NULL: store/rope position read at execution time
-         * from positions[row_idx] (per-step device array; replaced the C1b
-         * pos_delta scheme).  seq_id non-NULL: state_kv/state_score are
-         * FULL multi-bank slabs, kernels offset to lane seq_id[row_idx]
-         * (stride coff*ratio*width; the CALLER validates the lane extent
-         * against the slab).  emit_row_delta shifts the substrate-read
-         * emit row (the second emit of a layer within one step writes
-         * ls->row + 1).  NULL/NULL/0/0 for every serial / eager caller;
-         * Metal backend rejects seq_id != NULL. */
+        /* C2 (bank-agnostic + multi-live cont capture): per-row device
+         * substrate.  positions non-NULL: store/rope position read at
+         * execution time from positions[row_idx] (per-step device array).
+         * seq_id non-NULL: state_kv/state_score are FULL multi-bank slabs,
+         * kernels offset to lane seq_id[row_idx] (stride coff*ratio*width;
+         * the CALLER validates the lane extent against the slab).
+         * row_field TABLE_COMP/TABLE_INDEX read the emit row from the
+         * per-ROW table entry (row_idx, il) -- published value carries the
+         * bank base + within-step emit ordering.  NULL/NULL/0 for every
+         * serial / eager caller; Metal backend rejects seq_id != NULL. */
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx,
-        uint32_t                emit_row_delta);
+        uint32_t                row_idx);
 
 /* M2-Inc5: emit tail of ds4_gpu_compressor_update_tensor only (pool + norm +
  * rope + ratio4 shift; no store) -- the follow-up call after a successful
@@ -1211,8 +1244,7 @@ int ds4_gpu_compressor_update_tail_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx,
-        uint32_t                emit_row_delta);
+        uint32_t                row_idx);
 
 int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,

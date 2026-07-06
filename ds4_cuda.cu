@@ -286,6 +286,10 @@ static struct ds4_decode_scalars *g_decode_dev  = NULL;  /* cudaMalloc */
 #define DS4_COMPRESSOR_ROW_COMP     0
 #define DS4_COMPRESSOR_ROW_INDEX    1
 #define DS4_COMPRESSOR_ROW_SCRATCH0 2  /* C1: substrate pos, fixed row 0 (scratch) */
+/* C2 Inc2: emit row read from the per-ROW emit-row table entry (row_idx, il)
+ * -- see the g_row_dev block below.  Mirrors ds4_gpu.h. */
+#define DS4_COMPRESSOR_ROW_TABLE_COMP  3
+#define DS4_COMPRESSOR_ROW_TABLE_INDEX 4
 
 struct ds4_layer_scalars {
     uint32_t n_comp;       /* attention compressed count, post-emit */
@@ -319,6 +323,28 @@ static struct ds4_layer_scalars *g_layer_dev   = NULL;
  * N's buffer, token N+1's writes are landing in a different host page.
  * Index is never sent to the GPU. */
 static int g_layer_dev_idx = 0;
+
+/* C2 Inc2: per-ROW emit-row table for cont capture steps.  One entry per
+ * (batch row, layer): the GLOBAL cache rows (bank*cap + local + emits-
+ * before-this-row-in-this-bank) this row's emit writes -- comp_row for the
+ * attention compressor / fp8 mirror, index_row for the indexer / fp4
+ * mirror.  Published once per capture step by
+ * metal_graph_cont_capture_prepare (host computes everything, including
+ * multi-live per-row banks and within-step emit ordering, absorbing the
+ * retired C1b emit_row_delta scheme).  Same double-buffered pinned
+ * publish discipline as g_layer_dev above; the captured kernels bake
+ * &g_row_dev[row*DS4_LAYER_SCALARS_COUNT + il].{comp,index}_row and read
+ * the live value at replay. */
+#define DS4_ROW_SCALARS_MAX_ROWS 8u
+struct ds4_row_scalars {
+    uint32_t comp_row;
+    uint32_t index_row;
+};
+static_assert(sizeof(struct ds4_row_scalars) == 8u,
+              "ds4_row_scalars must be exactly 8 bytes");
+static struct ds4_row_scalars *g_row_host[2] = { NULL, NULL };
+static struct ds4_row_scalars *g_row_dev = NULL;
+static int g_row_dev_idx = 0;
 
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
@@ -1573,6 +1599,80 @@ extern "C" int ds4_gpu_decode_layer_scalars_flush(void) {
                                      ds4_current_stream()),
                      "layer scalars flush");
     if (ok) g_layer_dev_idx ^= 1;
+    return ok;
+}
+
+/* C2 Inc2: per-row emit-row table (see the struct block above).  Same
+ * init/set/flush discipline as the per-layer scalars; ~2.7 KB per flush. */
+extern "C" int ds4_gpu_decode_row_scalars_init(void) {
+    if (g_row_host[0] != NULL && g_row_host[1] != NULL && g_row_dev != NULL) {
+        return 1;
+    }
+    const size_t bytes = (size_t)DS4_ROW_SCALARS_MAX_ROWS *
+                         DS4_LAYER_SCALARS_COUNT * sizeof(struct ds4_row_scalars);
+    for (int b = 0; b < 2; ++b) {
+        if (g_row_host[b] == NULL) {
+            if (!cuda_ok(cudaHostAlloc((void **)&g_row_host[b], bytes,
+                                       cudaHostAllocDefault),
+                         "row scalars host alloc")) {
+                for (int c = 0; c < b; ++c) {
+                    if (g_row_host[c]) { cudaFreeHost(g_row_host[c]); g_row_host[c] = NULL; }
+                }
+                return 0;
+            }
+        }
+    }
+    if (g_row_dev == NULL) {
+        if (!cuda_ok(cudaMalloc((void **)&g_row_dev, bytes),
+                     "row scalars dev alloc")) {
+            for (int b = 0; b < 2; ++b) {
+                if (g_row_host[b]) { cudaFreeHost(g_row_host[b]); g_row_host[b] = NULL; }
+            }
+            g_row_dev = NULL;
+            return 0;
+        }
+    }
+    memset(g_row_host[0], 0, bytes);
+    memset(g_row_host[1], 0, bytes);
+    if (!cuda_ok(cudaMemcpy(g_row_dev, g_row_host[0], bytes,
+                            cudaMemcpyHostToDevice),
+                 "row scalars prime")) {
+        cudaFree(g_row_dev);
+        for (int b = 0; b < 2; ++b) {
+            cudaFreeHost(g_row_host[b]);
+            g_row_host[b] = NULL;
+        }
+        g_row_dev = NULL;
+        return 0;
+    }
+    g_row_dev_idx = 0;
+    return 1;
+}
+
+extern "C" void ds4_gpu_decode_row_scalars_set(
+        uint32_t row,
+        uint32_t il,
+        uint32_t comp_row,
+        uint32_t index_row) {
+    if (g_row_host[g_row_dev_idx] == NULL ||
+        row >= DS4_ROW_SCALARS_MAX_ROWS ||
+        il >= DS4_LAYER_SCALARS_COUNT) return;
+    struct ds4_row_scalars *e =
+        &g_row_host[g_row_dev_idx][row * DS4_LAYER_SCALARS_COUNT + il];
+    e->comp_row  = comp_row;
+    e->index_row = index_row;
+}
+
+extern "C" int ds4_gpu_decode_row_scalars_flush(void) {
+    if (g_row_host[g_row_dev_idx] == NULL || g_row_dev == NULL) return 1;
+    const size_t bytes = (size_t)DS4_ROW_SCALARS_MAX_ROWS *
+                         DS4_LAYER_SCALARS_COUNT * sizeof(struct ds4_row_scalars);
+    int ok = cuda_ok(cudaMemcpyAsync(g_row_dev, g_row_host[g_row_dev_idx],
+                                     bytes,
+                                     cudaMemcpyHostToDevice,
+                                     ds4_current_stream()),
+                     "row scalars flush");
+    if (ok) g_row_dev_idx ^= 1;
     return ok;
 }
 
@@ -5489,9 +5589,11 @@ __global__ static void rms_norm_weight_layer_row_kernel(
         const float *w,
         uint32_t n,
         const uint32_t * __restrict__ row_ptr_dev,
-        float eps,
-        uint32_t row_delta) {  /* C1b: substrate row + key-stable offset */
-    const uint32_t row = (row_ptr_dev ? *row_ptr_dev : 0u) + row_delta;  /* C1: NULL = fixed row 0 (scratch) */
+        float eps) {
+    /* C2: within-step emit ordering is baked into the published row value
+     * (per-row table), so the C1b row_delta arg is gone.  NULL = fixed
+     * row 0 (scratch). */
+    const uint32_t row = row_ptr_dev ? *row_ptr_dev : 0u;
     float *xr = base + (uint64_t)row * n;  /* in-place: dst == src */
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
@@ -5895,11 +5997,12 @@ __global__ static void rope_tail_layer_row_kernel(
         float attn_factor,
         float beta_fast,
         float beta_slow,
-        uint32_t row_delta,   /* C1b: substrate row + key-stable offset */
         /* C2 Inc1: non-NULL pos_dev reads the row's absolute position from
          * the per-step device positions array at the BAKED row index instead
          * of scalars->pos0 (bank-agnostic; multi-live-ready).  pos_offset
-         * still applies (+1-ratio for the emit-row rope). */
+         * still applies (+1-ratio for the emit-row rope).  C2 Inc2: the
+         * C1b row_delta arg is gone -- within-step emit ordering is baked
+         * into the published row value (per-row table). */
         const int32_t * __restrict__ pos_dev,
         uint32_t row_idx) {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -5910,7 +6013,7 @@ __global__ static void rope_tail_layer_row_kernel(
 
     const uint32_t pos0 = (uint32_t)((pos_dev ? pos_dev[row_idx]
                                               : (int32_t)scalars->pos0) + pos_offset);
-    const uint32_t row  = (row_ptr_dev ? *row_ptr_dev : 0u) + row_delta;  /* C1: NULL = fixed row 0 (scratch) */
+    const uint32_t row  = row_ptr_dev ? *row_ptr_dev : 0u;  /* C1: NULL = fixed row 0 (scratch) */
 
     float corr0 = 0.0f, corr1 = 0.0f;
     if (ext_factor != 0.0f) {
@@ -6353,20 +6456,21 @@ __global__ static void fp8_kv_quantize_row_kernel(
         float *base,
         uint32_t head_dim,
         uint32_t n_rot,
-        const struct ds4_layer_scalars * __restrict__ ls,
+        /* C2 Inc2: direct pointer at the published emit row (a per-ROW
+         * table entry -- bank base + within-step emit ordering baked into
+         * the value at publish time; replaces the C1 ls->comp_row +
+         * row_delta scheme). */
+        const uint32_t * __restrict__ row_ptr,
         unsigned char * __restrict__ codes_base,
         float * __restrict__ scale_base,
         /* C1 (cont capture): fp8-primary scratch source.  Non-NULL = the F32
          * round-trip works on src row 0 (the shared emit scratch; the bank's
          * F32 page is write-dead) while the packed mirror rows stay at
-         * ls->comp_row.  NULL = row addressed inside base (serial path). */
-        float * __restrict__ src,
-        /* C1b: key-stable offset from the substrate row (second emit of a
-         * layer within one multi-row step lands at ls->comp_row + 1). */
-        uint32_t row_delta) {
+         * *row_ptr.  NULL = row addressed inside base. */
+        float * __restrict__ src) {
     uint32_t tid = threadIdx.x;
     uint32_t n_nope = head_dim - n_rot;
-    const uint32_t emit_row = ls->comp_row + row_delta;
+    const uint32_t emit_row = *row_ptr;
     /* Opp C Phase 1A: packed-mirror row layout (only used when both base
      * pointers are non-null):
      *   codes_row[0 .. n_nope)               -- 1-byte E4M3 codes
@@ -6484,8 +6588,10 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
 __global__ static void indexer_hadamard_fp4_row_kernel(
         float *base,
         uint32_t head_dim,
-        const struct ds4_layer_scalars * __restrict__ ls,
-        /* P2 Inc3: optional packed FP4 mirror for the single row ls->index_row.
+        /* C2 Inc2: direct pointer at the published emit row (per-ROW table
+         * entry; see fp8_kv_quantize_row_kernel). */
+        const uint32_t * __restrict__ row_ptr,
+        /* P2 Inc3: optional packed FP4 mirror for the single row *row_ptr.
          * Same NULL-passthrough + pack layout as indexer_hadamard_fp4_kernel.
          * NB: this row variant does NOT apply the 1/sqrt(128) normalisation the
          * batch kernel does -- the pack stores whatever value this kernel
@@ -6493,13 +6599,11 @@ __global__ static void indexer_hadamard_fp4_row_kernel(
         unsigned char * __restrict__ codes_base,
         float         * __restrict__ scale_base,
         /* C1 (cont capture): fp4-primary scratch source; see
-         * fp8_kv_quantize_row_kernel.  Mirror rows stay at ls->index_row. */
-        float * __restrict__ src,
-        /* C1b: key-stable offset from the substrate row. */
-        uint32_t row_delta) {
+         * fp8_kv_quantize_row_kernel.  Mirror rows stay at *row_ptr. */
+        float * __restrict__ src) {
     uint32_t tid = threadIdx.x;
     if (head_dim != 128u || tid >= 128u) return;
-    const uint32_t emit_row = ls->index_row + row_delta;
+    const uint32_t emit_row = *row_ptr;
 
     __shared__ float vals[128];
     __shared__ float absbuf[128];
@@ -9416,16 +9520,16 @@ __global__ static void compressor_update_pool_kernel(
         uint32_t ratio,
         uint32_t comp_row_inline,
         const uint32_t * __restrict__ row_ptr_dev,
-        uint32_t row_delta,   /* C1b: substrate row + key-stable offset */
         /* C2 Inc1: state slab lane -- non-NULL seq_dev means state_kv/
          * state_score are FULL multi-bank slabs; offset to lane
          * seq_dev[row_idx] (stride coff*ratio*width).  NULL = pre-offset
-         * views (serial/eager), bit-exact. */
+         * views (serial/eager), bit-exact.  C2 Inc2: the C1b row_delta
+         * arg is gone -- emit ordering is baked into the published row. */
         const int32_t * __restrict__ seq_dev,
         uint32_t row_idx) {
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= head_dim) return;
-    const uint32_t comp_row = (row_ptr_dev ? *row_ptr_dev : comp_row_inline) + row_delta;
+    const uint32_t comp_row = row_ptr_dev ? *row_ptr_dev : comp_row_inline;
     float *row = base + (uint64_t)comp_row * head_dim;
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
@@ -15510,33 +15614,44 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
 
-/* R1 / Step-4c R1': row-variant for the decode-time emit path.  Takes
- * `base` (the full comp_cache tensor, not a transient view) plus a layer
- * index `il`.  The shim computes the per-layer baked pointer
- * &g_layer_dev[il] and passes it to the kernel; the kernel reads
- * `ls->comp_row` at execution time and writes only that row.
+/* R1 / Step-4c R1' + C2 Inc2: row-variant for the decode-time emit path.
+ * Takes `base` (the full comp_cache tensor, not a transient view) plus
+ * (row_idx, il).  The shim computes the baked pointer
+ * &g_row_dev[row_idx*COUNT+il].comp_row (per-ROW emit-row table,
+ * published each capture step with bank base + within-step ordering
+ * already applied); the kernel reads the row at execution time and
+ * writes only that row.
  *
- * Per-layer baked pointer is the §15.4 design preference: each call to
- * this shim (for a different layer) bakes a different ls pointer into the
- * captured kernel-node arg list.  Same shim across all layers, but each
- * per-layer cached cudaGraphExec_t holds its own &g_layer_dev[il].
- *
- * Caller no longer needs to call set_emit_rows / flush: the per-layer
- * substrate is populated en masse at top-of-token via
- * ds4_gpu_decode_layer_scalars_set + _flush.  See plan doc sec 15.5. */
+ * Per-(row,layer) baked pointer follows the §15.4 design preference:
+ * each per-layer cached cudaGraphExec_t holds its own table-entry
+ * pointer; the VALUE at that address is republished per step, so one
+ * graph serves every bank and every emit ordering. */
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t head_dim,
         uint32_t n_rot,
+        uint32_t row_idx,
         uint32_t il,
+        int row_table,
         ds4_gpu_tensor *codes_mirror,
         ds4_gpu_tensor *scale_mirror,
-        ds4_gpu_tensor *src,
-        uint32_t row_delta) {
-    if ((!base && !src) || g_layer_dev == NULL || n_rot > head_dim ||
+        ds4_gpu_tensor *src) {
+    if ((!base && !src) || n_rot > head_dim ||
         il >= DS4_LAYER_SCALARS_COUNT ||
         (base && base->bytes < (uint64_t)head_dim * sizeof(float)) ||
         (src && src->bytes < (uint64_t)head_dim * sizeof(float))) return 0;
+    /* C2 Inc2: row source select -- the serial captured decode keeps the
+     * per-layer substrate row (&g_layer_dev[il].comp_row); cont capture
+     * steps read the per-ROW table entry (bank base + within-step emit
+     * ordering baked into the published value). */
+    const uint32_t *row_ptr;
+    if (row_table) {
+        if (g_row_dev == NULL || row_idx >= DS4_ROW_SCALARS_MAX_ROWS) return 0;
+        row_ptr = &g_row_dev[row_idx * DS4_LAYER_SCALARS_COUNT + il].comp_row;
+    } else {
+        if (g_layer_dev == NULL) return 0;
+        row_ptr = &g_layer_dev[il].comp_row;
+    }
     /* Opp C Phase 1A: mirror buffers are NULL when DS4_CUDA_FP8_KV is off
      * (no allocation) and stable when on (one-shot allocation at session
      * create).  Pass through unconditionally; the kernel branches itself. */
@@ -15544,8 +15659,9 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
     float *scale_ptr = scale_mirror ? (float *)scale_mirror->ptr : (float *)0;
     fp8_kv_quantize_row_kernel<<<1, 64, 0, ds4_current_stream()>>>(
             base ? (float *)base->ptr : (float *)0, head_dim, n_rot,
-            g_layer_dev + il, codes_ptr, scale_ptr,
-            src ? (float *)src->ptr : (float *)0, row_delta);
+            row_ptr,
+            codes_ptr, scale_ptr,
+            src ? (float *)src->ptr : (float *)0);
     int ok_fp8 = cuda_ok(cudaGetLastError(), "fp8_kv_quantize_row launch");
     return ok_fp8;
 }
@@ -15633,30 +15749,42 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
 }
 
-/* R1 / Step-4c R1': row-variant for the indexer emit path.  Same shape
- * as fp8_kv_quantize_row_tensor above: takes `base` (the full
- * index_comp_cache tensor) + layer index `il`; shim computes
- * &g_layer_dev[il]; kernel reads `ls->index_row` at execution time. */
+/* R1 / Step-4c R1' + C2 Inc2: row-variant for the indexer emit path.
+ * Takes `base` (the full index_comp_cache tensor) + (row_idx, il); the
+ * shim computes &g_row_dev[row_idx*COUNT+il].index_row (per-ROW emit-row
+ * table, published each capture step); the kernel reads the row at
+ * execution time. */
 extern "C" int ds4_gpu_dsv4_indexer_qat_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t head_dim,
+        uint32_t row_idx,
         uint32_t il,
+        int row_table,
         ds4_gpu_tensor *codes_mirror,
         ds4_gpu_tensor *scale_mirror,
-        ds4_gpu_tensor *src,
-        uint32_t row_delta) {
-    if ((!base && !src) || g_layer_dev == NULL || head_dim != 128u ||
+        ds4_gpu_tensor *src) {
+    if ((!base && !src) || head_dim != 128u ||
         il >= DS4_LAYER_SCALARS_COUNT ||
         (base && base->bytes < (uint64_t)head_dim * sizeof(float)) ||
         (src && src->bytes < (uint64_t)head_dim * sizeof(float))) return 0;
+    /* C2 Inc2: row source select (see fp8_kv_quantize_row_tensor). */
+    const uint32_t *row_ptr;
+    if (row_table) {
+        if (g_row_dev == NULL || row_idx >= DS4_ROW_SCALARS_MAX_ROWS) return 0;
+        row_ptr = &g_row_dev[row_idx * DS4_LAYER_SCALARS_COUNT + il].index_row;
+    } else {
+        if (g_layer_dev == NULL) return 0;
+        row_ptr = &g_layer_dev[il].index_row;
+    }
     /* P2 Inc3: per-layer baked mirror pointers (g->layer_index_comp_cache_fp4
      * [il] / g->layer_index_comp_scale[il]); NULL when the feature is off. */
     unsigned char *codes_ptr = codes_mirror ? (unsigned char *)codes_mirror->ptr : (unsigned char *)0;
     float *scale_ptr = scale_mirror ? (float *)scale_mirror->ptr : (float *)0;
     indexer_hadamard_fp4_row_kernel<<<1, 128, 0, ds4_current_stream()>>>(
             base ? (float *)base->ptr : (float *)0, head_dim,
-            g_layer_dev + il, codes_ptr, scale_ptr,
-            src ? (float *)src->ptr : (float *)0, row_delta);
+            row_ptr,
+            codes_ptr, scale_ptr,
+            src ? (float *)src->ptr : (float *)0);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4_row launch");
 }
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, const ds4_gpu_tensor *positions, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
@@ -16051,14 +16179,13 @@ static int cuda_compressor_update_impl(
          *   seq_id    -- non-NULL: state_kv/state_score are FULL multi-bank
          *                slabs; kernels offset to lane seq_id[row_idx]
          *                (caller validates lane extent vs the slab).
-         *   emit_row_delta -- emit-tail row = substrate row + delta (the
-         *                SECOND emit of a layer within one step lands at
-         *                ls->comp_row + 1).  0/NULL for every serial /
-         *                eager caller (bit-exact). */
+         * C2 Inc2: row_field TABLE_COMP/TABLE_INDEX select the per-ROW
+         * emit-row table entry &g_row_dev[row_idx*COUNT+il] instead of the
+         * per-layer scalars (multi-live capture; the published value bakes
+         * bank base + within-step emit ordering, retiring emit_row_delta). */
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx,
-        uint32_t                emit_row_delta) {
+        uint32_t                row_idx) {
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -16134,17 +16261,22 @@ static int cuda_compressor_update_impl(
      * Requires the substrate (il < count) -- refuse an eager SCRATCH0 call
      * rather than silently rope with a stale pos. */
     const int scratch0 = (row_field == DS4_COMPRESSOR_ROW_SCRATCH0);
-    if (scratch0 && !use_substrate) return 0;
+    const int table_mode = (row_field == DS4_COMPRESSOR_ROW_TABLE_COMP ||
+                            row_field == DS4_COMPRESSOR_ROW_TABLE_INDEX);
+    if ((scratch0 || table_mode) && !use_substrate) return 0;
     const uint32_t *row_ptr_dev = NULL;
-    if (use_substrate && !scratch0) {
+    if (table_mode) {
+        /* C2 Inc2: per-row emit-row table.  Refuse rather than fall back --
+         * an eager fallback here would rope a stale row. */
+        if (g_row_dev == NULL || row_idx >= DS4_ROW_SCALARS_MAX_ROWS) return 0;
+        row_ptr_dev = (row_field == DS4_COMPRESSOR_ROW_TABLE_INDEX)
+            ? &g_row_dev[row_idx * DS4_LAYER_SCALARS_COUNT + il].index_row
+            : &g_row_dev[row_idx * DS4_LAYER_SCALARS_COUNT + il].comp_row;
+    } else if (use_substrate && !scratch0) {
         row_ptr_dev = (row_field == DS4_COMPRESSOR_ROW_INDEX)
             ? &g_layer_dev[il].index_row
             : &g_layer_dev[il].comp_row;
     }
-    /* C1b: the emit-row offset applies to CACHE-row targets only; the
-     * SCRATCH0 mode re-uses scratch row 0 for every emit of the step (the
-     * packed-mirror pack that follows carries the real row + delta). */
-    const uint32_t tail_row_delta = scratch0 ? 0u : emit_row_delta;
     compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)comp_cache->ptr,
             (const float *)state_kv->ptr,
@@ -16153,7 +16285,6 @@ static int cuda_compressor_update_impl(
             ratio,
             comp_row,
             row_ptr_dev,
-            tail_row_delta,
             seq_dev,
             row_idx);
     int ok = cuda_ok(cudaGetLastError(), "compressor update pool launch");
@@ -16171,8 +16302,7 @@ static int cuda_compressor_update_impl(
                         (const float *)w,
                         head_dim,
                         row_ptr_dev,
-                        rms_eps,
-                        tail_row_delta);
+                        rms_eps);
                 ok = cuda_ok(cudaGetLastError(), "compressor rms_norm row launch");
             }
         } else {
@@ -16209,7 +16339,6 @@ static int cuda_compressor_update_impl(
                     n_ctx_orig, 0,
                     freq_base, freq_scale, ext_factor, attn_factor,
                     beta_fast, beta_slow,
-                    tail_row_delta,
                     pos_dev,
                     row_idx);
             ok = cuda_ok(cudaGetLastError(), "compressor rope_tail row launch");
@@ -16253,14 +16382,13 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx,
-        uint32_t                emit_row_delta) {
+        uint32_t                row_idx) {
     return cuda_compressor_update_impl(0, kv_cur, sc_cur, state_kv, state_score, comp_cache,
                                        model_map, model_size, ape_offset, ape_type,
                                        norm_offset, norm_type, head_dim, ratio, pos, comp_row,
                                        n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor,
                                        attn_factor, beta_fast, beta_slow, rms_eps, il, row_field,
-                                       positions, seq_id, row_idx, emit_row_delta);
+                                       positions, seq_id, row_idx);
 }
 /* M2-Inc5: emit tail only -- for the fused compressor pair+store path, which
  * has already written state_kv/state_score for this position. */
@@ -16293,14 +16421,13 @@ extern "C" int ds4_gpu_compressor_update_tail_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx,
-        uint32_t                emit_row_delta) {
+        uint32_t                row_idx) {
     return cuda_compressor_update_impl(1, kv_cur, sc_cur, state_kv, state_score, comp_cache,
                                        model_map, model_size, ape_offset, ape_type,
                                        norm_offset, norm_type, head_dim, ratio, pos, comp_row,
                                        n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor,
                                        attn_factor, beta_fast, beta_slow, rms_eps, il, row_field,
-                                       positions, seq_id, row_idx, emit_row_delta);
+                                       positions, seq_id, row_idx);
 }
 /* C2 Inc1: rollback-checkpoint lane copy (see state_lane_copy_kernel).
  * dst/src are FULL multi-bank slabs; the lane is resolved on device from

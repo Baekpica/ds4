@@ -398,6 +398,15 @@ int ds4_gpu_decode_layer_scalars_init(void) {
 
 void ds4_gpu_decode_layer_scalars_cleanup(void) {}
 
+/* C2 Inc2: per-ROW emit-row table is CUDA-cont-capture-only.  init fails
+ * (capture never engages on Metal), set is a no-op, flush is a benign 1. */
+int ds4_gpu_decode_row_scalars_init(void) { return 0; }
+void ds4_gpu_decode_row_scalars_set(uint32_t row, uint32_t il,
+                                    uint32_t comp_row, uint32_t index_row) {
+    (void)row; (void)il; (void)comp_row; (void)index_row;
+}
+int ds4_gpu_decode_row_scalars_flush(void) { return 1; }
+
 const void *ds4_gpu_decode_layer_scalars_device_ptr(void) {
     return NULL;
 }
@@ -7236,21 +7245,24 @@ int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
         uint32_t          n_rot,
+        uint32_t          row_idx,
         uint32_t          il,
+        int               row_table,
         ds4_gpu_tensor *codes_mirror,
         ds4_gpu_tensor *scale_mirror,
-        ds4_gpu_tensor *src,
-        uint32_t row_delta) {
+        ds4_gpu_tensor *src) {
     /* Opp C Phase 1A: packed FP8 mirror is CUDA-only.  Metal keeps the
      * FP32 cache and ignores the mirror tensors (the callers in ds4.c pass
      * NULL on Metal builds because ds4_cuda_fp8_kv_enabled() returns 0).
-     * C1: the scratch `src` override is CUDA-cont-capture-only (Metal never
-     * sets batch_capture_step); reject it rather than mis-target. */
+     * C1/C2: the scratch `src` override and the per-ROW emit-row table are
+     * CUDA-cont-capture-only (Metal never sets batch_capture_step); reject
+     * rather than mis-target. */
     (void)codes_mirror;
     (void)scale_mirror;
-    if (src) return 0;
+    (void)row_idx;
+    if (src || row_table) return 0;
     if (!base || il >= DS4_METAL_LAYER_SCALARS_COUNT) return 0;
-    const uint32_t comp_row = g_metal_layer_scalars[il].comp_row + row_delta;
+    const uint32_t comp_row = g_metal_layer_scalars[il].comp_row;
     ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,
         (uint64_t)comp_row * head_dim * sizeof(float),
         (uint64_t)head_dim * sizeof(float));
@@ -7344,15 +7356,17 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
 int ds4_gpu_dsv4_indexer_qat_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
+        uint32_t          row_idx,
         uint32_t          il,
+        int               row_table,
         ds4_gpu_tensor *codes_mirror,
         ds4_gpu_tensor *scale_mirror,
-        ds4_gpu_tensor *src,
-        uint32_t row_delta) {
+        ds4_gpu_tensor *src) {
     (void)codes_mirror; (void)scale_mirror;  /* P2 Inc3: Metal never stores FP4 */
-    if (src) return 0;  /* C1: CUDA-cont-capture-only scratch override */
+    (void)row_idx;
+    if (src || row_table) return 0;  /* C1/C2: CUDA-cont-capture-only */
     if (!base || il >= DS4_METAL_LAYER_SCALARS_COUNT) return 0;
-    const uint32_t index_row = g_metal_layer_scalars[il].index_row + row_delta;
+    const uint32_t index_row = g_metal_layer_scalars[il].index_row;
     ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,
         (uint64_t)index_row * head_dim * sizeof(float),
         (uint64_t)head_dim * sizeof(float));
@@ -9400,15 +9414,14 @@ int ds4_gpu_compressor_update_tail_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx,
-        uint32_t                emit_row_delta) {
+        uint32_t                row_idx) {
     (void)kv_cur; (void)sc_cur; (void)state_kv; (void)state_score;
     (void)comp_cache; (void)model_map; (void)model_size; (void)ape_offset;
     (void)ape_type; (void)norm_offset; (void)norm_type; (void)head_dim;
     (void)ratio; (void)pos; (void)comp_row; (void)n_rot; (void)n_ctx_orig;
     (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
     (void)beta_fast; (void)beta_slow; (void)rms_eps; (void)il; (void)row_field;
-    (void)positions; (void)seq_id; (void)row_idx; (void)emit_row_delta;
+    (void)positions; (void)seq_id; (void)row_idx;
     return 0;
 }
 
@@ -9441,11 +9454,10 @@ int ds4_gpu_compressor_update_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx,
-        uint32_t                emit_row_delta) {
+        uint32_t                row_idx) {
     (void)il;         /* Metal kernels read inline args; no per-layer substrate. */
     (void)row_field;  /* PC2: substrate selector ignored on Metal. */
-    (void)positions; (void)row_idx; (void)emit_row_delta;  /* CUDA-only substrate. */
+    (void)positions; (void)row_idx;  /* CUDA-only substrate. */
     if (seq_id) return 0;  /* C2: slab-lane mode is CUDA-only. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
