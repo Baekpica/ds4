@@ -488,6 +488,22 @@ void ds4_gpu_invalidate_captured_graphs(const char *why) {
     (void)why;
 }
 
+/* C2 Inc1: rollback-ckpt lane copy is a cont-capture (CUDA-only) helper;
+ * the Metal batch path never runs capture steps (enabled() == 0 above). */
+int ds4_gpu_state_lane_copy_tensor(
+        ds4_gpu_tensor       *dst_kv,
+        ds4_gpu_tensor       *dst_sc,
+        const ds4_gpu_tensor *src_kv,
+        const ds4_gpu_tensor *src_sc,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
+        uint64_t                lane_bytes,
+        uint32_t                seq_check) {
+    (void)dst_kv; (void)dst_sc; (void)src_kv; (void)src_sc;
+    (void)seq_id; (void)row_idx; (void)lane_bytes; (void)seq_check;
+    return 0;
+}
+
 void ds4_cuda_layer_graph_debug_peek(const char *label) {
     (void)label;  /* Step 6 diagnostic; CUDA-only. */
 }
@@ -7929,10 +7945,14 @@ int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens,
         const void             *scalars,
-        int32_t                 pos_delta) {
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx) {
     (void)scalars;  /* Metal kernels read inline args; no device-scalars
                      * substrate on this backend. */
-    (void)pos_delta;  /* C1b: substrate-relative offset, CUDA-only. */
+    (void)positions; (void)row_idx;  /* C2: CUDA-only per-row substrate. */
+    if (seq_id) return 0;  /* C2: slab-lane mode is CUDA-only; refuse rather
+                            * than treat the full slab as one lane. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
@@ -9378,7 +9398,9 @@ int ds4_gpu_compressor_update_tail_tensor(
         float                   rms_eps,
         uint32_t                il,
         int                     row_field,
-        int32_t                 pos_delta,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
         uint32_t                emit_row_delta) {
     (void)kv_cur; (void)sc_cur; (void)state_kv; (void)state_score;
     (void)comp_cache; (void)model_map; (void)model_size; (void)ape_offset;
@@ -9386,7 +9408,7 @@ int ds4_gpu_compressor_update_tail_tensor(
     (void)ratio; (void)pos; (void)comp_row; (void)n_rot; (void)n_ctx_orig;
     (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
     (void)beta_fast; (void)beta_slow; (void)rms_eps; (void)il; (void)row_field;
-    (void)pos_delta; (void)emit_row_delta;
+    (void)positions; (void)seq_id; (void)row_idx; (void)emit_row_delta;
     return 0;
 }
 
@@ -9417,11 +9439,14 @@ int ds4_gpu_compressor_update_tensor(
         float                   rms_eps,
         uint32_t                il,
         int                     row_field,
-        int32_t                 pos_delta,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
         uint32_t                emit_row_delta) {
     (void)il;         /* Metal kernels read inline args; no per-layer substrate. */
     (void)row_field;  /* PC2: substrate selector ignored on Metal. */
-    (void)pos_delta; (void)emit_row_delta;  /* C1b: CUDA-only substrate offsets. */
+    (void)positions; (void)row_idx; (void)emit_row_delta;  /* CUDA-only substrate. */
+    if (seq_id) return 0;  /* C2: slab-lane mode is CUDA-only. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
@@ -9489,7 +9514,7 @@ int ds4_gpu_compressor_update_tensor(
                                                       pos,
                                                       1,
                                                       NULL /* scalars: Metal ignores */,
-                                                      0);
+                                                      NULL, NULL, 0u);
         if (!store_ok) {
             return 0;
         }

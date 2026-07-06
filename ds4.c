@@ -11295,7 +11295,7 @@ static bool metal_graph_encode_decode_layer_impl(
                                                         DS4_RMS_EPS,
                                                         il,                          /* PC2: per-layer substrate index for emit-row */
                                                         DS4_COMPRESSOR_ROW_COMP,     /* PC2: primary compressor -> ls->comp_row */
-                                                        0, 0u                        /* C1b deltas: serial width-1 */) != 0;
+                                                        NULL, NULL, 0u, 0u           /* C2: no per-row substrate (serial width-1) */) != 0;
         if (ok && emit) {
             /* Step 4c R1': read comp_row from g_layer_dev[il].comp_row in
              * the per-layer substrate (populated at top of token in
@@ -11424,7 +11424,7 @@ static bool metal_graph_encode_decode_layer_impl(
                                                             DS4_RMS_EPS,
                                                             il,                          /* PC2: per-layer substrate index for emit-row */
                                                             DS4_COMPRESSOR_ROW_INDEX,    /* PC2: indexer compressor -> ls->index_row */
-                                                            0, 0u                        /* C1b deltas: serial width-1 */) != 0;
+                                                            NULL, NULL, 0u, 0u           /* C2: no per-row substrate (serial width-1) */) != 0;
             /* TEMPORARY DIAGNOSTIC: state_kv AFTER compressor_update_tensor
              * returns (post compressor_store_batch + post update_pool +
              * shift).  Slot 230+il.  If this matches BE vs BC but the cache
@@ -16129,12 +16129,35 @@ static bool metal_graph_encode_layer_attention_batch(
                     ok = false;
                     break;
                 }
+                /* C1 (cont capture): on capture steps the store pos rides the
+                 * per-row positions array (read at the baked row index) and
+                 * the emit-row rides g_layer_dev[il].comp_row (GLOBAL row
+                 * published at top of step); fp8-primary keeps its fixed
+                 * scratch-row-0 target via ROW_SCRATCH0 (the packed-mirror
+                 * pack below carries the real row).  Inline pos/row stay as
+                 * the non-capture fallback.
+                 * C2 Inc1: capture steps pass the FULL state slabs + the
+                 * device seq_id array (lane resolved at replay time) so the
+                 * captured body is bank-agnostic; eager keeps the transient
+                 * bank views (bit-exact). */
+                const bool cap_step = g->batch_capture_step;
+                if (cap_step &&
+                    ((uint64_t)(seq + 1u) * state_stride >
+                         ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]) ||
+                     (uint64_t)(seq + 1u) * state_stride >
+                         ds4_gpu_tensor_bytes(g->layer_attn_state_score[il]))) {
+                    fprintf(stderr, "ds4: C2 attn state lane out of slab (layer %u seq %u)\n", il, seq);
+                    ok = false;
+                    break;
+                }
                 ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
                 ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
-                ds4_gpu_tensor *st_kv = ds4_gpu_tensor_view(g->layer_attn_state_kv[il],
-                                                            (uint64_t)seq * state_stride, state_stride);
-                ds4_gpu_tensor *st_sc = ds4_gpu_tensor_view(g->layer_attn_state_score[il],
-                                                            (uint64_t)seq * state_stride, state_stride);
+                ds4_gpu_tensor *st_kv = cap_step ? g->layer_attn_state_kv[il]
+                    : ds4_gpu_tensor_view(g->layer_attn_state_kv[il],
+                                          (uint64_t)seq * state_stride, state_stride);
+                ds4_gpu_tensor *st_sc = cap_step ? g->layer_attn_state_score[il]
+                    : ds4_gpu_tensor_view(g->layer_attn_state_score[il],
+                                          (uint64_t)seq * state_stride, state_stride);
                 /* CUDA writes the FP32 cache directly at comp_row; the cache
                  * pointer is the full N-bank slab, so seq*comp_cap+local lands
                  * in bank seq.  P2 Inc2b: fp8-primary writes the scratch row
@@ -16148,13 +16171,6 @@ static bool metal_graph_encode_layer_attention_batch(
                 if (ms_fp8_primary && !ms_row_scratch) ok = false;
                 const double cupd_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
                 const uint32_t sp_cupd = ds4_gpu_stage_prof_begin(DS4_SPROF_CUPD);
-                /* C1 (cont capture): on capture steps the store pos rides the
-                 * decode-scalars substrate and the emit-row rides
-                 * g_layer_dev[il].comp_row (GLOBAL row published at top of
-                 * step); fp8-primary keeps its fixed scratch-row-0 target via
-                 * ROW_SCRATCH0 (the packed-mirror pack below carries the real
-                 * row).  Inline pos/row stay as the non-capture fallback. */
-                const bool cap_step = g->batch_capture_step;
                 ok = ok && kv_view && sc_view && st_kv && st_sc &&
                      ds4_gpu_compressor_update_tensor(kv_view,
                                                         sc_view,
@@ -16185,10 +16201,12 @@ static bool metal_graph_encode_layer_attention_batch(
                                                         cap_step && ms_fp8_primary
                                                             ? DS4_COMPRESSOR_ROW_SCRATCH0
                                                             : DS4_COMPRESSOR_ROW_COMP,
-                                                        /* C1b: this row's position relative to the published
-                                                         * maxpos + how many emits this layer already did
-                                                         * this step (both key-stable per capture shape). */
-                                                        (int32_t)pos - (int32_t)pos0,
+                                                        /* C2 Inc1: per-row pos + state lane from the
+                                                         * per-step device arrays at baked row index t;
+                                                         * emits-before delta stays key-stable per shape. */
+                                                        cap_step ? g->batch_positions : NULL,
+                                                        cap_step ? g->batch_seq_id : NULL,
+                                                        t,
                                                         cap_emits_before) != 0;
                 ds4_gpu_stage_prof_end(sp_cupd);
                 if (g_cont_prof > 0) g_cont_lyr_cupd_s += now_sec() - cupd_t0;
@@ -16270,18 +16288,32 @@ static bool metal_graph_encode_layer_attention_batch(
                         ds4_gpu_tensor *dk = g->mtp_rb_askv[depth][il];
                         ds4_gpu_tensor *ds = g->mtp_rb_assc[depth][il];
                         if (dk && ds) {
-                            ok = ds4_gpu_tensor_copy(dk, (uint64_t)seq * state_stride, g->layer_attn_state_kv[il],
-                                                     (uint64_t)seq * state_stride, state_stride) != 0 &&
-                                 ds4_gpu_tensor_copy(ds, (uint64_t)seq * state_stride, g->layer_attn_state_score[il],
-                                                     (uint64_t)seq * state_stride, state_stride) != 0;
+                            /* C2 Inc1: on capture steps the copied lane is
+                             * resolved on DEVICE from seq_id[t], so the
+                             * captured copy nodes serve every bank; eager
+                             * keeps the baked-offset D2D pair (byte-equal). */
+                            if (cap_step) {
+                                ok = ds4_gpu_state_lane_copy_tensor(dk, ds,
+                                        g->layer_attn_state_kv[il],
+                                        g->layer_attn_state_score[il],
+                                        g->batch_seq_id, t, state_stride, seq) != 0;
+                            } else {
+                                ok = ds4_gpu_tensor_copy(dk, (uint64_t)seq * state_stride, g->layer_attn_state_kv[il],
+                                                         (uint64_t)seq * state_stride, state_stride) != 0 &&
+                                     ds4_gpu_tensor_copy(ds, (uint64_t)seq * state_stride, g->layer_attn_state_score[il],
+                                                         (uint64_t)seq * state_stride, state_stride) != 0;
+                            }
                             g->mtp_rb_n_comp[depth][seq][il] = g->ms_n_comp[seq][il];
                         }
                     }
                     ds4_gpu_stage_prof_end(sp_rbcp);
                     if (g_cont_prof > 0) g_cont_lyr_rbcp_s += now_sec() - rbcp_t0;
                 }
-                ds4_gpu_tensor_free(st_sc);
-                ds4_gpu_tensor_free(st_kv);
+                if (!cap_step) {
+                    /* capture steps pass the slabs themselves -- never free */
+                    ds4_gpu_tensor_free(st_sc);
+                    ds4_gpu_tensor_free(st_kv);
+                }
                 ds4_gpu_tensor_free(sc_view);
                 ds4_gpu_tensor_free(kv_view);
             }
@@ -16586,7 +16618,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_RMS_EPS,
                                                             UINT32_MAX,                  /* PC2: decode2-exact, no substrate; inline comp_row */
                                                             DS4_COMPRESSOR_ROW_COMP,     /* PC2: row_field ignored when il==UINT32_MAX */
-                                                            0, 0u) != 0;
+                                                            NULL, NULL, 0u, 0u) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = row_fp8_primary
                             ? ds4_gpu_tensor_view(row_scratch, 0,
@@ -16878,23 +16910,38 @@ static bool metal_graph_encode_layer_attention_batch(
                         ok = false;
                         break;
                     }
+                    /* C1 (cont capture): indexer sibling of the attn emit
+                     * above -- per-row pos from the positions array +
+                     * g_layer_dev[il].index_row (GLOBAL) on capture steps;
+                     * fp4-primary keeps its fixed scratch-row-0 target via
+                     * ROW_SCRATCH0.
+                     * C2 Inc1: capture steps pass the FULL indexer state
+                     * slabs + device seq_id (bank-agnostic lane at replay);
+                     * eager keeps the transient bank views (bit-exact). */
+                    const bool icap_step = g->batch_capture_step;
+                    if (icap_step &&
+                        ((uint64_t)(seq + 1u) * istate_stride >
+                             ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]) ||
+                         (uint64_t)(seq + 1u) * istate_stride >
+                             ds4_gpu_tensor_bytes(g->layer_index_state_score[il]))) {
+                        fprintf(stderr, "ds4: C2 index state lane out of slab (layer %u seq %u)\n", il, seq);
+                        ok = false;
+                        break;
+                    }
                     ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
                     ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
-                    ds4_gpu_tensor *st_kv = ds4_gpu_tensor_view(g->layer_index_state_kv[il],
-                                                                (uint64_t)seq * istate_stride, istate_stride);
-                    ds4_gpu_tensor *st_sc = ds4_gpu_tensor_view(g->layer_index_state_score[il],
-                                                                (uint64_t)seq * istate_stride, istate_stride);
+                    ds4_gpu_tensor *st_kv = icap_step ? g->layer_index_state_kv[il]
+                        : ds4_gpu_tensor_view(g->layer_index_state_kv[il],
+                                              (uint64_t)seq * istate_stride, istate_stride);
+                    ds4_gpu_tensor *st_sc = icap_step ? g->layer_index_state_score[il]
+                        : ds4_gpu_tensor_view(g->layer_index_state_score[il],
+                                              (uint64_t)seq * istate_stride, istate_stride);
                     const uint32_t index_row_global = seq * g->layer_comp_cap[il] + index_row_local;
                     /* P2 Inc3b: redirect the compressor's row write to the scratch
                      * (row 0) when fp4-primary; codes land at the absolute row via
                      * the FP4 mirror views below. */
                     ds4_gpu_tensor *idx_ct = fp4_primary ? idx_emit : g->layer_index_comp_cache[il];
                     const uint32_t idx_wrow = fp4_primary ? 0u : index_row_global;
-                    /* C1 (cont capture): indexer sibling of the attn emit
-                     * above -- substrate pos + g_layer_dev[il].index_row
-                     * (GLOBAL) on capture steps; fp4-primary keeps its fixed
-                     * scratch-row-0 target via ROW_SCRATCH0. */
-                    const bool icap_step = g->batch_capture_step;
                     ok = kv_view && sc_view && st_kv && st_sc &&
                          ds4_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
@@ -16924,7 +16971,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             icap_step && fp4_primary
                                                                 ? DS4_COMPRESSOR_ROW_SCRATCH0
                                                                 : DS4_COMPRESSOR_ROW_INDEX,
-                                                            (int32_t)pos - (int32_t)pos0,
+                                                            icap_step ? g->batch_positions : NULL,
+                                                            icap_step ? g->batch_seq_id : NULL,
+                                                            t,
                                                             icap_emits_before) != 0;
                     if (ok && emit && icap_step) {
                         /* C1: capture-safe QAT -- row-variant reads the emit
@@ -16989,16 +17038,28 @@ static bool metal_graph_encode_layer_attention_batch(
                             ds4_gpu_tensor *dk = g->mtp_rb_iskv[depth][il];
                             ds4_gpu_tensor *ds = g->mtp_rb_issc[depth][il];
                             if (dk && ds) {
-                                ok = ds4_gpu_tensor_copy(dk, (uint64_t)seq * istate_stride, g->layer_index_state_kv[il],
-                                                         (uint64_t)seq * istate_stride, istate_stride) != 0 &&
-                                     ds4_gpu_tensor_copy(ds, (uint64_t)seq * istate_stride, g->layer_index_state_score[il],
-                                                         (uint64_t)seq * istate_stride, istate_stride) != 0;
+                                /* C2 Inc1: bank-agnostic ckpt copy on capture
+                                 * steps (lane from device seq_id[t]). */
+                                if (icap_step) {
+                                    ok = ds4_gpu_state_lane_copy_tensor(dk, ds,
+                                            g->layer_index_state_kv[il],
+                                            g->layer_index_state_score[il],
+                                            g->batch_seq_id, t, istate_stride, seq) != 0;
+                                } else {
+                                    ok = ds4_gpu_tensor_copy(dk, (uint64_t)seq * istate_stride, g->layer_index_state_kv[il],
+                                                             (uint64_t)seq * istate_stride, istate_stride) != 0 &&
+                                         ds4_gpu_tensor_copy(ds, (uint64_t)seq * istate_stride, g->layer_index_state_score[il],
+                                                             (uint64_t)seq * istate_stride, istate_stride) != 0;
+                                }
                                 g->mtp_rb_n_index_comp[depth][seq][il] = g->ms_n_index_comp[seq][il];
                             }
                         }
                     }
-                    ds4_gpu_tensor_free(st_sc);
-                    ds4_gpu_tensor_free(st_kv);
+                    if (!icap_step) {
+                        /* capture steps pass the slabs themselves -- never free */
+                        ds4_gpu_tensor_free(st_sc);
+                        ds4_gpu_tensor_free(st_kv);
+                    }
                     ds4_gpu_tensor_free(sc_view);
                     ds4_gpu_tensor_free(kv_view);
                 }
@@ -17294,7 +17355,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_RMS_EPS,
                                                                 UINT32_MAX,                  /* PC2: decode2-exact indexer, no substrate */
                                                                 DS4_COMPRESSOR_ROW_INDEX,    /* PC2: row_field ignored when il==UINT32_MAX */
-                                                                0, 0u) != 0;
+                                                                NULL, NULL, 0u, 0u) != 0;
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                                     g->layer_index_comp_cache[il],
@@ -28886,7 +28947,11 @@ static bool metal_graph_batch_eval_logits(
             memset(&ck, 0, sizeof(ck));
             ck.il    = il;
             ck.width = n;
-            ck.bank  = cap_bank;
+            /* C2 Inc1: no bank in the key -- the captured bodies resolve the
+             * bank at replay time from the device seq_id array (state lanes,
+             * ckpt copies) and the per-step published layer scalars (emit
+             * rows), so ONE graph set serves every bank.
+             * row_bank_pattern stays 0 (memset) until Inc2 multi-live shapes. */
             const bool cap_indexed = il_ratio == 4u &&
                                      cap_ncomp[il] > DS4_N_INDEXER_TOP_K;
             ck.flags = (cap_emit_il          ? 1u  : 0u)

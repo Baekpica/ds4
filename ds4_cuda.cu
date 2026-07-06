@@ -5895,14 +5895,21 @@ __global__ static void rope_tail_layer_row_kernel(
         float attn_factor,
         float beta_fast,
         float beta_slow,
-        uint32_t row_delta) {  /* C1b: substrate row + key-stable offset */
+        uint32_t row_delta,   /* C1b: substrate row + key-stable offset */
+        /* C2 Inc1: non-NULL pos_dev reads the row's absolute position from
+         * the per-step device positions array at the BAKED row index instead
+         * of scalars->pos0 (bank-agnostic; multi-live-ready).  pos_offset
+         * still applies (+1-ratio for the emit-row rope). */
+        const int32_t * __restrict__ pos_dev,
+        uint32_t row_idx) {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t pairs = n_rot / 2;
     if (gid >= pairs) return;
     uint32_t i = gid * 2;
     uint32_t n_nope = head_dim - n_rot;
 
-    const uint32_t pos0 = (uint32_t)((int32_t)scalars->pos0 + pos_offset);
+    const uint32_t pos0 = (uint32_t)((pos_dev ? pos_dev[row_idx]
+                                              : (int32_t)scalars->pos0) + pos_offset);
     const uint32_t row  = (row_ptr_dev ? *row_ptr_dev : 0u) + row_delta;  /* C1: NULL = fixed row 0 (scratch) */
 
     float corr0 = 0.0f, corr1 = 0.0f;
@@ -9152,18 +9159,31 @@ __global__ static void compressor_store_kernel(
          * kernel-node arg list bakes a session-stable pointer rather than
          * a per-token literal. */
         const struct ds4_decode_scalars * __restrict__ s_override,
-        /* C1b (cont capture, width>1): per-ROW constant offset from
-         * s->pos0.  The multiseq per-row emit loop stores row t at
-         * absolute position pos0_step + (t - (K-1)) relative to the
-         * step's published maxpos; the offset is key-stable (single-bank
-         * consecutive rows), so it bakes as an inline literal while pos0
-         * stays live.  Ignored when s_override is NULL. */
-        int32_t pos_delta) {
-    if (s_override) {
-        pos0 = (uint32_t)((int32_t)s_override->pos0 + pos_delta);
-    }
+        /* C2 Inc1 (bank-agnostic cont capture): per-row substrate.  When
+         * pos_dev is non-NULL the row's absolute position is read from the
+         * per-step device positions array at the BAKED row index (replaces
+         * the C1b pos_delta-from-s->pos0 scheme; works for any bank and,
+         * later, any multi-live row mix).  When seq_dev is non-NULL,
+         * state_kv/state_score are FULL multi-bank slabs and the kernel
+         * offsets to lane seq_dev[row_idx] (lane stride = coff*ratio*width,
+         * derived from ratio/head_dim).  Both NULL = inline/serial paths,
+         * bit-exact. */
+        const int32_t * __restrict__ pos_dev,
+        const int32_t * __restrict__ seq_dev,
+        uint32_t row_idx) {
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
+    if (pos_dev) {
+        pos0 = (uint32_t)pos_dev[row_idx];
+    } else if (s_override) {
+        pos0 = s_override->pos0;
+    }
+    if (seq_dev) {
+        const uint64_t lane = (uint64_t)(uint32_t)seq_dev[row_idx] *
+                              (uint64_t)(coff * ratio) * width;
+        state_kv += lane;
+        state_score += lane;
+    }
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * width;
     if (gid >= n) return;
@@ -9396,13 +9416,25 @@ __global__ static void compressor_update_pool_kernel(
         uint32_t ratio,
         uint32_t comp_row_inline,
         const uint32_t * __restrict__ row_ptr_dev,
-        uint32_t row_delta) {  /* C1b: substrate row + key-stable offset */
+        uint32_t row_delta,   /* C1b: substrate row + key-stable offset */
+        /* C2 Inc1: state slab lane -- non-NULL seq_dev means state_kv/
+         * state_score are FULL multi-bank slabs; offset to lane
+         * seq_dev[row_idx] (stride coff*ratio*width).  NULL = pre-offset
+         * views (serial/eager), bit-exact. */
+        const int32_t * __restrict__ seq_dev,
+        uint32_t row_idx) {
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= head_dim) return;
     const uint32_t comp_row = (row_ptr_dev ? *row_ptr_dev : comp_row_inline) + row_delta;
     float *row = base + (uint64_t)comp_row * head_dim;
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
+    if (seq_dev) {
+        const uint64_t lane = (uint64_t)(uint32_t)seq_dev[row_idx] *
+                              (uint64_t)(coff * ratio) * width;
+        state_kv += lane;
+        state_score += lane;
+    }
     float vals[128];
     float scores[128];
     float max_s = -INFINITY;
@@ -9434,16 +9466,46 @@ __global__ static void compressor_update_pool_kernel(
     row[d] = den != 0.0f ? acc / den : 0.0f;
 }
 
-__global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *state_score, uint32_t width) {
+__global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *state_score, uint32_t width,
+                                                      /* C2 Inc1: optional slab lane (see pool kernel). */
+                                                      const int32_t * __restrict__ seq_dev,
+                                                      uint32_t row_idx) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t half = 4ull * width;
     if (i >= half) return;
+    if (seq_dev) {
+        const uint64_t lane = (uint64_t)(uint32_t)seq_dev[row_idx] * 2ull * half;
+        state_kv += lane;
+        state_score += lane;
+    }
     float v = state_kv[half + i];
     float s = state_score[half + i];
     state_kv[i] = v;
     state_score[i] = s;
     state_kv[half + i] = v;
     state_score[half + i] = s;
+}
+
+/* C2 Inc1: rollback-checkpoint lane copy with the bank resolved from the
+ * per-step device seq_id array at a BAKED row index.  Replaces the
+ * baked-address ds4_gpu_tensor_copy pair on cont capture steps so the
+ * captured D2D nodes are bank-agnostic (same graph serves every bank).
+ * Copies BOTH the kv and score lanes (identical stride). */
+__global__ static void state_lane_copy_kernel(
+        float *dst_kv,
+        float *dst_sc,
+        const float *src_kv,
+        const float *src_sc,
+        const int32_t * __restrict__ seq_dev,
+        uint32_t row_idx,
+        uint32_t lane_f32) {
+    const uint64_t base = (uint64_t)(uint32_t)seq_dev[row_idx] * lane_f32;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < lane_f32;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        dst_kv[base + i] = src_kv[base + i];
+        dst_sc[base + i] = src_sc[base + i];
+    }
 }
 
 __device__ static float softplus_dev(float x) {
@@ -13165,9 +13227,11 @@ extern "C" void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
  *
  * Same warm -> capture -> replay protocol and stream discipline as the
  * serial cache above, over a SEPARATE direct-mapped table keyed by
- * struct ds4_cont_graph_key (width/bank/emit-topology/band + baked
- * tensor bases; see ds4_gpu.h).  Kept separate so the two hot key
- * populations (serial n_tok=1/2 and cont width/bank/emit variants)
+ * struct ds4_cont_graph_key (width/emit-topology/band + baked tensor
+ * bases; see ds4_gpu.h).  C2 Inc1: graphs are BANK-AGNOSTIC (state-pool
+ * lanes + rollback ckpts resolve the bank from the per-step device
+ * seq_id array), so `bank` left the key.  Kept separate so the two hot
+ * key populations (serial n_tok=1/2 and cont width/emit variants)
  * never evict each other, and so the serial table's size/hash tuning
  * stays untouched.
  * ===================================================================== */
@@ -13176,7 +13240,7 @@ extern "C" void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
 struct ds4_cont_graph_key {
     uint32_t il;
     uint32_t width;
-    uint32_t bank;
+    uint32_t row_bank_pattern;
     uint32_t flags;
     uint32_t n_comp_band;
     uint32_t _pad;
@@ -15886,9 +15950,15 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
          * passes NULL (n_tokens > 1 prefill stays inline; C3 in &sect;16
          * is the deferred migration for that path). */
         const void           *scalars,
-        /* C1b: per-row offset from s->pos0 (see compressor_store_kernel);
-         * ignored when scalars is NULL. */
-        int32_t                pos_delta) {
+        /* C2 Inc1: per-row device substrate (batch capture path).  positions
+         * non-NULL reads the row's absolute position at positions[row_idx]
+         * (replaces the C1b pos_delta scheme); seq_id non-NULL means
+         * state_kv/state_score are FULL multi-bank slabs and the kernel
+         * offsets to lane seq_id[row_idx] (the caller validates the lane
+         * extent against the slab).  Both NULL = inline/serial, bit-exact. */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx) {
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
         (ape_type != 0u && ape_type != 1u)) {
@@ -15903,7 +15973,9 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
     const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         kv->bytes < kv_bytes || sc->bytes < kv_bytes ||
-        state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes ||
+        (positions && positions->bytes < ((uint64_t)row_idx + 1u) * sizeof(int32_t)) ||
+        (seq_id && seq_id->bytes < ((uint64_t)row_idx + 1u) * sizeof(int32_t))) {
         return 0;
     }
     const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
@@ -15922,7 +15994,9 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
             pos0,
             n_tokens,
             (const struct ds4_decode_scalars *)scalars,
-            pos_delta);
+            positions ? (const int32_t *)positions->ptr : NULL,
+            seq_id ? (const int32_t *)seq_id->ptr : NULL,
+            row_idx);
     return cuda_ok(cudaGetLastError(), "compressor store launch");
 }
 
@@ -15970,19 +16044,31 @@ static int cuda_compressor_update_impl(
          * case the high-bit packing. */
         uint32_t                il,
         int                     row_field,
-        /* C1b (cont capture, width>1): key-stable per-row offsets.
-         *   pos_delta      -- store/rope position = s->pos0 + pos_delta
-         *                     (row t of a K-row step is at maxpos + t-(K-1)).
+        /* C2 Inc1 (bank-agnostic cont capture): per-row device substrate.
+         *   positions -- non-NULL: store/rope position read at execution
+         *                time from positions[row_idx] (per-step device
+         *                array; replaces the C1b pos_delta scheme).
+         *   seq_id    -- non-NULL: state_kv/state_score are FULL multi-bank
+         *                slabs; kernels offset to lane seq_id[row_idx]
+         *                (caller validates lane extent vs the slab).
          *   emit_row_delta -- emit-tail row = substrate row + delta (the
-         *                     SECOND emit of a layer within one step lands
-         *                     at ls->comp_row + 1).
-         * Both 0 for every width-1 / serial / eager caller. */
-        int32_t                 pos_delta,
+         *                SECOND emit of a layer within one step lands at
+         *                ls->comp_row + 1).  0/NULL for every serial /
+         *                eager caller (bit-exact). */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
         uint32_t                emit_row_delta) {
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
         (ape_type != 0u && ape_type != 1u) || norm_type != 0u) {
+        return 0;
+    }
+    const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
+    const int32_t *seq_dev = seq_id ? (const int32_t *)seq_id->ptr : NULL;
+    if ((positions && positions->bytes < ((uint64_t)row_idx + 1u) * sizeof(int32_t)) ||
+        (seq_id && seq_id->bytes < ((uint64_t)row_idx + 1u) * sizeof(int32_t))) {
         return 0;
     }
     const uint32_t coff = ratio == 4u ? 2u : 1u;
@@ -16024,7 +16110,7 @@ static int cuda_compressor_update_impl(
                                                  model_map, model_size, ape_offset, ape_type,
                                                  head_dim, ratio, pos, 1,
                                                  use_substrate ? ds4_gpu_decode_scalars_device_ptr() : NULL,
-                                                 pos_delta)) {
+                                                 positions, seq_id, row_idx)) {
         return 0;
     }
     if (!emit) return 1;
@@ -16067,7 +16153,9 @@ static int cuda_compressor_update_impl(
             ratio,
             comp_row,
             row_ptr_dev,
-            tail_row_delta);
+            tail_row_delta,
+            seq_dev,
+            row_idx);
     int ok = cuda_ok(cudaGetLastError(), "compressor update pool launch");
     if (ok) {
         if (use_substrate) {
@@ -16117,18 +16205,21 @@ static int cuda_compressor_update_impl(
                     head_dim, n_rot,
                     (const struct ds4_decode_scalars *)dev_s,
                     row_ptr_dev,
-                    pos_delta + 1 - (int32_t)ratio, /* pos_offset: pos+1-ratio */
+                    1 - (int32_t)ratio, /* pos_offset: pos+1-ratio */
                     n_ctx_orig, 0,
                     freq_base, freq_scale, ext_factor, attn_factor,
                     beta_fast, beta_slow,
-                    tail_row_delta);
+                    tail_row_delta,
+                    pos_dev,
+                    row_idx);
             ok = cuda_ok(cudaGetLastError(), "compressor rope_tail row launch");
         }
     }
     if (ok && ratio == 4u) {
         uint64_t half = 4ull * width;
         compressor_shift_ratio4_kernel<<<(half + 255) / 256, 256, 0, ds4_current_stream()>>>(
-                (float *)state_kv->ptr, (float *)state_score->ptr, width);
+                (float *)state_kv->ptr, (float *)state_score->ptr, width,
+                seq_dev, row_idx);
         ok = cuda_ok(cudaGetLastError(), "compressor ratio4 shift launch");
     }
     return ok;
@@ -16160,14 +16251,16 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         float                   rms_eps,
         uint32_t                il,
         int                     row_field,
-        int32_t                 pos_delta,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
         uint32_t                emit_row_delta) {
     return cuda_compressor_update_impl(0, kv_cur, sc_cur, state_kv, state_score, comp_cache,
                                        model_map, model_size, ape_offset, ape_type,
                                        norm_offset, norm_type, head_dim, ratio, pos, comp_row,
                                        n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor,
                                        attn_factor, beta_fast, beta_slow, rms_eps, il, row_field,
-                                       pos_delta, emit_row_delta);
+                                       positions, seq_id, row_idx, emit_row_delta);
 }
 /* M2-Inc5: emit tail only -- for the fused compressor pair+store path, which
  * has already written state_kv/state_score for this position. */
@@ -16198,14 +16291,53 @@ extern "C" int ds4_gpu_compressor_update_tail_tensor(
         float                   rms_eps,
         uint32_t                il,
         int                     row_field,
-        int32_t                 pos_delta,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
         uint32_t                emit_row_delta) {
     return cuda_compressor_update_impl(1, kv_cur, sc_cur, state_kv, state_score, comp_cache,
                                        model_map, model_size, ape_offset, ape_type,
                                        norm_offset, norm_type, head_dim, ratio, pos, comp_row,
                                        n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor,
                                        attn_factor, beta_fast, beta_slow, rms_eps, il, row_field,
-                                       pos_delta, emit_row_delta);
+                                       positions, seq_id, row_idx, emit_row_delta);
+}
+/* C2 Inc1: rollback-checkpoint lane copy (see state_lane_copy_kernel).
+ * dst/src are FULL multi-bank slabs; the lane is resolved on device from
+ * seq_id[row_idx].  seq_check is the HOST's belief of the lane (validation
+ * only -- extent check against all four slabs; the kernel reads the device
+ * value, which the caller keeps equal by construction). */
+extern "C" int ds4_gpu_state_lane_copy_tensor(
+        ds4_gpu_tensor       *dst_kv,
+        ds4_gpu_tensor       *dst_sc,
+        const ds4_gpu_tensor *src_kv,
+        const ds4_gpu_tensor *src_sc,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
+        uint64_t                lane_bytes,
+        uint32_t                seq_check) {
+    if (!dst_kv || !dst_sc || !src_kv || !src_sc || !seq_id ||
+        lane_bytes == 0 || (lane_bytes & 3u) != 0) {
+        return 0;
+    }
+    const uint64_t need = ((uint64_t)seq_check + 1u) * lane_bytes;
+    if (dst_kv->bytes < need || dst_sc->bytes < need ||
+        src_kv->bytes < need || src_sc->bytes < need ||
+        seq_id->bytes < ((uint64_t)row_idx + 1u) * sizeof(int32_t)) {
+        return 0;
+    }
+    const uint32_t lane_f32 = (uint32_t)(lane_bytes / sizeof(float));
+    uint32_t blocks = (lane_f32 + 255u) / 256u;
+    if (blocks > 256u) blocks = 256u;
+    state_lane_copy_kernel<<<blocks, 256, 0, ds4_current_stream()>>>(
+            (float *)dst_kv->ptr,
+            (float *)dst_sc->ptr,
+            (const float *)src_kv->ptr,
+            (const float *)src_sc->ptr,
+            (const int32_t *)seq_id->ptr,
+            row_idx,
+            lane_f32);
+    return cuda_ok(cudaGetLastError(), "state lane copy launch");
 }
 extern "C" int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,

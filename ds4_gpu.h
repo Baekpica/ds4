@@ -367,8 +367,12 @@ void ds4_cuda_layer_graph_debug_peek(const char *label);
 struct ds4_cont_graph_key {
     uint32_t il;          /* layer index */
     uint32_t width;       /* batch rows (1 = cont decode, 5 = D=4 verify) */
-    uint32_t bank;        /* live bank id -- compressor/indexer state-pool and
-                           * rollback-checkpoint views bake seq*stride offsets */
+    uint32_t row_bank_pattern; /* C2: per-row bank ORDINALS (4b/row, first-
+                           * occurrence order).  Inc1: always 0 -- graphs are
+                           * bank-agnostic for single-bank steps (state lanes +
+                           * ckpts resolve the bank from the device seq_id
+                           * array at the baked row index).  Inc2 fills it for
+                           * multi-live shapes (segment boundaries implicit). */
     uint32_t flags;       /* bit 0: emit_this_step (any row crosses a ratio
                            *        boundary for this layer)
                            * bit 1: indexed_active (ratio4 && n_comp > top_k)
@@ -392,8 +396,9 @@ struct ds4_cont_graph_key {
     void    *comp_scale;
     void    *index_fp4;
     void    *index_scale;
-    void    *attn_state_kv;   /* slab bases; per-bank offsets are baked via
-                               * `bank`, so slab regrow OR bank switch rekeys */
+    void    *attn_state_kv;   /* slab bases (C2: lanes resolve from the device
+                               * seq_id array at replay -- bank-agnostic; only
+                               * slab regrow rekeys) */
     void    *attn_state_score;
     void    *index_state_kv;
     void    *index_state_score;
@@ -1158,14 +1163,19 @@ int ds4_gpu_compressor_update_tensor(
          * plan doc sec 16 commit C2 / sec 15.8. */
         uint32_t                il,
         int                     row_field,
-        /* C1b (cont capture, width>1): key-stable per-row offsets --
-         * pos_delta shifts the substrate-read store/rope position
-         * (s->pos0 + pos_delta = this row's absolute position);
-         * emit_row_delta shifts the substrate-read emit row (the second
-         * emit of a layer within one step writes ls->row + 1).  Both 0
-         * for every width-1 / serial / eager caller; ignored when
-         * il == UINT32_MAX. */
-        int32_t                 pos_delta,
+        /* C2 Inc1 (bank-agnostic cont capture): per-row device substrate.
+         * positions non-NULL: store/rope position read at execution time
+         * from positions[row_idx] (per-step device array; replaced the C1b
+         * pos_delta scheme).  seq_id non-NULL: state_kv/state_score are
+         * FULL multi-bank slabs, kernels offset to lane seq_id[row_idx]
+         * (stride coff*ratio*width; the CALLER validates the lane extent
+         * against the slab).  emit_row_delta shifts the substrate-read
+         * emit row (the second emit of a layer within one step writes
+         * ls->row + 1).  NULL/NULL/0/0 for every serial / eager caller;
+         * Metal backend rejects seq_id != NULL. */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
         uint32_t                emit_row_delta);
 
 /* M2-Inc5: emit tail of ds4_gpu_compressor_update_tensor only (pool + norm +
@@ -1199,7 +1209,9 @@ int ds4_gpu_compressor_update_tail_tensor(
         float                   rms_eps,
         uint32_t                il,
         int                     row_field,
-        int32_t                 pos_delta,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
         uint32_t                emit_row_delta);
 
 int ds4_gpu_compressor_store_batch_tensor(
@@ -1220,8 +1232,26 @@ int ds4_gpu_compressor_store_batch_tensor(
          * batch callers pass NULL (kernel uses inline pos0).  Metal
          * backend ignores the argument. */
         const void             *scalars,
-        /* C1b: per-row offset from s->pos0; 0 for every non-capture caller. */
-        int32_t                pos_delta);
+        /* C2 Inc1: per-row device substrate (see the update shim above);
+         * NULL/NULL/0 for every non-capture caller. */
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx);
+
+/* C2 Inc1: rollback-checkpoint lane copy for cont capture steps.  dst/src
+ * are FULL multi-bank state slabs; the copied lane is resolved on device
+ * from seq_id[row_idx] (so captured copy nodes are bank-agnostic).
+ * lane_bytes = one bank's state stride; seq_check = the host's lane belief
+ * (extent validation only).  Metal stub returns 0. */
+int ds4_gpu_state_lane_copy_tensor(
+        ds4_gpu_tensor       *dst_kv,
+        ds4_gpu_tensor       *dst_sc,
+        const ds4_gpu_tensor *src_kv,
+        const ds4_gpu_tensor *src_sc,
+        const ds4_gpu_tensor *seq_id,
+        uint32_t                row_idx,
+        uint64_t                lane_bytes,
+        uint32_t                seq_check);
 
 int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,
