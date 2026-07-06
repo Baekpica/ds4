@@ -432,6 +432,11 @@ struct ds4_cont_graph_key {
 };
 
 int  ds4_cuda_cont_graphs_enabled(void);
+/* C3-Inc5: 1 = the batched embed gather (ds4_gpu_embed_tokens_hc_tensor) is a
+ * cheap eager launch, so ds4.c uses it at EVERY batch width instead of the
+ * host f16-dequant + replicated-HC H2D build.  CUDA returns 1; Metal returns 0
+ * (a separate small command buffer costs more than the host write there). */
+int  ds4_cuda_embed_gather_all_widths(void);
 /* begin_or_replay: 1 = replayed (skip body; caller advances host counters),
  * 0 = capturing (encode body, then end_or_commit), -1 = eager. */
 int  ds4_cuda_cont_graph_begin_or_replay(uint32_t il,

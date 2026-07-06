@@ -15122,9 +15122,11 @@ static bool metal_graph_refresh_ratio4_compressor_state(
     return ok;
 }
 
-/* CPU fallback for seeding batched HC state from token embeddings.  It is still
- * useful for tiny speculative verifier batches where a separate GPU embedding
- * command buffer costs more than the small host write. */
+/* CPU fallback for seeding batched HC state from token embeddings.  On Metal
+ * it serves every small batch (a separate GPU embedding command buffer costs
+ * more than the host write); on CUDA (C3-Inc5) it is only the degrade path
+ * for a declined gather -- both builds are exact f16->f32 of the same table
+ * rows, so the two paths are bit-identical. */
 static bool metal_graph_upload_prompt_embeddings_hc_cpu(
         ds4_gpu_tensor   *out_hc,
         const ds4_model    *model,
@@ -15154,6 +15156,60 @@ static bool metal_graph_upload_prompt_embeddings_hc_cpu(
     return ok;
 }
 
+/* C3-Inc5 twin selftest (DS4_GPU_EMBED_SMALL_SELFTEST=<call budget>): after a
+ * GPU embed gather at a width the host build used to serve (n < 512), read
+ * out_hc back and memcmp against the host construction.  Both sides are exact
+ * f16->f32 conversions of the same table rows, so the conversion is bit-exact
+ * by construction -- what this actually proves per call site is the WINDOW
+ * INVARIANT: the gather reads tokens[0..n) from the device tensor while the
+ * host build reads prompt->v[pos0..pos0+n), so a caller that forgot to upload
+ * exactly that window (or uploaded a stale one) trips the memcmp.  Reads sync
+ * inside the step: gate legs only. */
+static void metal_graph_embed_gather_selftest(
+        ds4_gpu_tensor   *out_hc,
+        const ds4_model    *model,
+        const ds4_weights  *weights,
+        const token_vec    *prompt,
+        uint32_t            pos0,
+        uint32_t            n_tokens) {
+    static int budget = -1;
+    if (budget < 0) {
+        /* value = call budget ("1" gets enough steps to cover the decode,
+         * verify and remainder-chunk widths as they occur). */
+        const char *st = getenv("DS4_GPU_EMBED_SMALL_SELFTEST");
+        budget = st && *st ? atoi(st) : 0;
+        if (st && *st && budget <= 1) budget = 512;
+    }
+    if (budget <= 0 || n_tokens >= 512u) return;
+    budget--;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t total = (uint64_t)n_tokens * hc_dim;
+    float *got = xmalloc((size_t)total * sizeof(float));
+    float *want = xmalloc((size_t)total * sizeof(float));
+    float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    if (ds4_gpu_tensor_read(out_hc, 0, got, total * sizeof(float)) != 0) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            embed_token_f16(model, weights, prompt->v[pos0 + t], plain);
+            float *dst = want + (uint64_t)t * hc_dim;
+            for (uint32_t h = 0; h < DS4_N_HC; h++) {
+                memcpy(dst + (uint64_t)h * DS4_N_EMBD,
+                       plain,
+                       (size_t)DS4_N_EMBD * sizeof(plain[0]));
+            }
+        }
+        fprintf(stderr, "ds4: EMB-SELFTEST n=%u pos0=%u %s\n",
+                n_tokens, pos0,
+                memcmp(got, want, (size_t)(total * sizeof(float))) == 0
+                    ? "PASS" : "FAIL");
+    } else {
+        fprintf(stderr, "ds4: EMB-SELFTEST n=%u pos0=%u SKIP (read failed)\n",
+                n_tokens, pos0);
+    }
+    free(plain);
+    free(want);
+    free(got);
+}
+
 /* Seed the batched HC state from token ids: every HC stream starts as the same
  * 4096-wide embedding.  Long prefill chunks use the Metal get-rows/repeat
  * kernel so the CPU does not build and upload a large [token, HC, dim] tensor. */
@@ -15167,7 +15223,16 @@ static bool metal_graph_upload_prompt_embeddings_hc(
         uint32_t            n_tokens) {
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
 
-    uint32_t gpu_min = 512;
+    /* C3-Inc5: on CUDA the gather is one eager kernel on the current stream,
+     * so it wins at EVERY width -- the host build pays f16 dequant + n_hc
+     * replication + an [n x HC x n_embd] H2D per call (the cont step-start
+     * gap at decode widths, plus client mmap faults on the embed table in
+     * weight-server mode).  Metal keeps the 512 floor.  The gather reads
+     * tokens[0..n) from the device tensor: every caller uploads exactly the
+     * [pos0, pos0+n) window right before this call (the EMB selftest memcmps
+     * that invariant per site).  DS4_METAL_GPU_BATCH_EMBED_MIN=512 restores
+     * the old CUDA behavior. */
+    uint32_t gpu_min = ds4_cuda_embed_gather_all_widths() != 0 ? 1u : 512u;
     const char *gpu_min_env = getenv("DS4_METAL_GPU_BATCH_EMBED_MIN");
     if (gpu_min_env && gpu_min_env[0]) {
         char *end = NULL;
@@ -15176,15 +15241,28 @@ static bool metal_graph_upload_prompt_embeddings_hc(
     }
 
     if (tokens && n_tokens >= gpu_min) {
-        return ds4_gpu_embed_tokens_hc_tensor(out_hc,
-                                                tokens,
-                                                model->map,
-                                                model->size,
-                                                weights->token_embd->abs_offset,
-                                                (uint32_t)weights->token_embd->dim[1],
-                                                n_tokens,
-                                                DS4_N_EMBD,
-                                                DS4_N_HC) != 0;
+        if (ds4_gpu_embed_tokens_hc_tensor(out_hc,
+                                             tokens,
+                                             model->map,
+                                             model->size,
+                                             weights->token_embd->abs_offset,
+                                             (uint32_t)weights->token_embd->dim[1],
+                                             n_tokens,
+                                             DS4_N_EMBD,
+                                             DS4_N_HC) != 0) {
+            static int announced = 0;
+            if (!announced && n_tokens < 512u) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: C3-Inc5 GPU embed gather active at all widths (first small n=%u)\n",
+                        n_tokens);
+            }
+            metal_graph_embed_gather_selftest(out_hc, model, weights,
+                                              prompt, pos0, n_tokens);
+            return true;
+        }
+        /* declined (range/ptr validation miss): the host build below is
+         * bit-identical, so degrade instead of failing the step. */
     }
 
     return metal_graph_upload_prompt_embeddings_hc_cpu(out_hc,

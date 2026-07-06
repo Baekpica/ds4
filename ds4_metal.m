@@ -479,6 +479,13 @@ int ds4_cuda_cont_graphs_enabled(void) {
     return 0;
 }
 
+/* C3-Inc5: on Metal a separate small embed command buffer costs more than
+ * the host build, so the 512-token floor in
+ * metal_graph_upload_prompt_embeddings_hc stays. */
+int ds4_cuda_embed_gather_all_widths(void) {
+    return 0;
+}
+
 int ds4_cuda_cont_graph_begin_or_replay(uint32_t il,
                                           const struct ds4_cont_graph_key *key) {
     (void)il; (void)key;

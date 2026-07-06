@@ -13737,6 +13737,14 @@ extern "C" int ds4_cuda_cont_graphs_enabled(void) {
     return enabled;
 }
 
+/* C3-Inc5: the embed gather is one eager kernel on the current stream, so it
+ * beats the host f16-dequant + replicated-HC H2D build at every batch width
+ * (and never faults client mmap pages for the embed table in weight-server
+ * mode).  ds4.c's DS4_METAL_GPU_BATCH_EMBED_MIN=512 restores the old floor. */
+extern "C" int ds4_cuda_embed_gather_all_widths(void) {
+    return 1;
+}
+
 static struct cont_graph_entry *cont_graph_slot(const struct ds4_cont_graph_key *k) {
     /* FNV-1a over the key bytes (same recipe as moe_graph_hash). */
     uint64_t h = 0xcbf29ce484222325ULL;
