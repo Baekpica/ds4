@@ -15231,6 +15231,52 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             logged_fold = 1;
             fprintf(stderr, "ds4: M2-Inc1b HC-stage q8 activation fold active (pair decode)\n");
         }
+        /* C3-Inc4 fold twin selftest (DS4_Q8_FOLD_SELFTEST=<call budget>,
+         * eager legs only -- syncs the stream): the taken sidecar must be
+         * byte-identical to a fresh quantize of x enqueued right here.
+         * Proves per-site pointer wiring, freshness, and layout for both
+         * the serial and the batched producers.  Do NOT combine with
+         * DS4_HC_STAGE_BATCH_PARITY: that probe rewrites norm_out with the
+         * unfused values AFTER the sidecar was emitted, so the compare
+         * would see two quantizations of slightly different vectors. */
+        static int fold_st = -1;
+        if (fold_st < 0) {
+            const char *st = getenv("DS4_Q8_FOLD_SELFTEST");
+            fold_st = st && *st ? atoi(st) : 0;
+            if (st && *st && fold_st <= 1) fold_st = 512;
+        }
+        cudaStreamCaptureStatus fold_cs = cudaStreamCaptureStatusNone;
+        if (fold_st > 0) (void)cudaStreamIsCapturing(ds4_current_stream(), &fold_cs);
+        if (fold_st > 0 && fold_cs == cudaStreamCaptureStatusNone && blocks <= 256u) {
+            fold_st--;
+            static int8_t h_q[2][8192];
+            static float h_s[2][256];
+            const uint64_t st_xq_bytes = blocks * 32u;
+            const uint64_t st_sc_off = (st_xq_bytes + 15u) & ~15ull;
+            void *tmp = cuda_tmp_alloc(st_sc_off + blocks * sizeof(float), "q80 fold selftest");
+            int st_ok = tmp != NULL;
+            if (st_ok) {
+                int8_t *fq = (int8_t *)tmp;
+                float *fs = (float *)((char *)tmp + st_sc_off);
+                dim3 qgrid((unsigned)blocks, 1, 1);
+                quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_current_stream()>>>(fq, fs, (const float *)x->ptr, in_dim, blocks);
+                st_ok = cuda_ok(cudaGetLastError(), "q80 fold selftest quantize") &&
+                        cudaStreamSynchronize(ds4_current_stream()) == cudaSuccess &&
+                        cudaMemcpy(h_q[0], xq, st_xq_bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                        cudaMemcpy(h_q[1], fq, st_xq_bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                        cudaMemcpy(h_s[0], xscale, blocks * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess &&
+                        cudaMemcpy(h_s[1], fs, blocks * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+            }
+            if (st_ok) {
+                fprintf(stderr, "ds4: Q8F-SELFTEST(q80 pair) in_dim=%llu %s\n",
+                        (unsigned long long)in_dim,
+                        memcmp(h_q[0], h_q[1], (size_t)st_xq_bytes) == 0 &&
+                        memcmp(h_s[0], h_s[1], (size_t)(blocks * sizeof(float))) == 0
+                            ? "PASS" : "FAIL");
+            } else {
+                fprintf(stderr, "ds4: Q8F-SELFTEST(q80 pair) SKIP (setup failed)\n");
+            }
+        }
     }
     const int use_dp4a = cuda_q8_use_dp4a();
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
@@ -15860,11 +15906,23 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         if (!q_w || !kv_w) return 0;
         /* M2-Inc2a: q8_1 sidecar of the q row for the q_b mmvq consumer
          * (decode rows==1 only; dedicated ring — see the fold-buffer
-         * comment in ds4_gpu_init). */
+         * comment in ds4_gpu_init).
+         * C3-Inc4 SAFETY INVARIANT (shared with the HC-stage q8_1 emit): a
+         * q8_1 sidecar may only be emitted when its take either (a) bakes
+         * into the SAME outer captured graph as this emit (capture active:
+         * the consumer's inner graph cache is bypassed and its prelude runs
+         * host-side at capture), or (b) runs host-side on EVERY consuming
+         * step (inner MoE/dense graph caches disabled).  In eager mode with
+         * the inner caches on, the consumer's first call BAKES the taken
+         * ring pointer into its private graph while this producer keeps
+         * alternating ring parity per emit -> replays read a stale sidecar
+         * whenever the per-step emit count is odd.  (The serial path only
+         * survived eager because its q_b+ffn emits came in pairs.) */
         ds4_hc_block_q8_1 *q81 = NULL;
         static int no_q8_fold = -1;
         if (no_q8_fold < 0) no_q8_fold = getenv("DS4_CUDA_NO_HC_Q8_FOLD") != NULL;
-        if (emit_q81 && !no_q8_fold && rows == 1u && (q_n % 32u) == 0u && q_n <= 8192u) {
+        if (emit_q81 && !no_q8_fold && rows == 1u && (q_n % 32u) == 0u && q_n <= 8192u &&
+            (ds4_capture_active() || !ds4_cuda_moe_graphs_enabled())) {
             g_q8_fold_q81_idx ^= 1;
             q81 = (ds4_hc_block_q8_1 *)g_q8_fold_q81_buf[g_q8_fold_q81_idx];
         }
@@ -23058,8 +23116,15 @@ extern "C" int ds4_gpu_hc_stage_fused_tensor(
             }
         }
         /* M2-Inc2a: q8_1 sidecar (block_q8_1 array) for the routed-MoE mmvq
-         * consumer of ffn_norm. */
-        if ((emit_q8 & 2u) && !no_q8_fold && (n_embd % 32u) == 0u && n_embd <= 8192u) {
+         * consumer of ffn_norm.
+         * C3-Inc4 SAFETY INVARIANT (see the qkv-rms q8_1 emit for the full
+         * story): emit only when the take bakes into the same outer captured
+         * graph (capture active) or runs host-side every step (inner MoE
+         * graph cache disabled).  Eager + inner cache would bake ONE ring
+         * parity into the consumer's private graph while this emit keeps
+         * flipping it -> stale sidecar on replays. */
+        if ((emit_q8 & 2u) && !no_q8_fold && (n_embd % 32u) == 0u && n_embd <= 8192u &&
+            (ds4_capture_active() || !ds4_cuda_moe_graphs_enabled())) {
             g_q8_fold_q81_idx ^= 1;
             q81 = (ds4_hc_block_q8_1 *)g_q8_fold_q81_buf[g_q8_fold_q81_idx];
         }

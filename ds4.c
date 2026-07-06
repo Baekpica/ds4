@@ -15832,9 +15832,13 @@ static bool metal_graph_encode_layer_attention_batch(
      * the HCS-PARITY probe + eval slice + M3 + accept parity.  flat_scratch
      * = NULL disarms the wrapper's internal unfused fallback, so any
      * precondition miss (incl. DS4_CUDA_NO_HC_STAGE_FUSED) returns 0 without
-     * touching outputs and the exact original chain below runs.  emit_q8=0:
-     * the batch consumers keep their own quantizes.  No per-bank state ->
-     * capture-safe by construction (norm folded via norm_out). */
+     * touching outputs and the exact original chain below runs.  No per-bank
+     * state -> capture-safe by construction (norm folded via norm_out).
+     * C3-Inc4: emit_q8 bit 0 mirrors the consumer's own gate -- the q_a+kv
+     * pair (ds4_gpu_matmul_q8_0_pair_tensor) takes the sidecar keyed on
+     * batch_attn_norm's base pointer at n_tok==1, killing its quantize
+     * launch (bit-exact codes, M2-Inc1b; twin selftest
+     * DS4_Q8_FOLD_SELFTEST).  Kill switch DS4_CUDA_NO_HC_Q8_FOLD. */
     bool hc_attn_fused = false;
     if (ok && n_tokens == 1u && !metal_graph_use_reference_hc_decode() &&
         layer->hc_attn_fn->type == DS4_TENSOR_F16) {
@@ -15847,7 +15851,9 @@ static bool metal_graph_encode_layer_attention_batch(
                 layer->hc_attn_base->abs_offset,
                 layer->attn_norm->abs_offset,
                 DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
-                DS4_HC_EPS, DS4_RMS_EPS, 0u) != 0;
+                DS4_HC_EPS, DS4_RMS_EPS,
+                (qkv_rms_fused && batch_q8_pair) ? 1u : 0u
+                /* C3-Inc4: q8_0 -> q_a+kv pair */) != 0;
     }
     if (ok && !hc_attn_fused) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
@@ -18387,7 +18393,11 @@ static bool metal_graph_encode_layer_ffn_batch(
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
     /* C3-Inc3a: ffn instance of the n==1 fused HC stage -- see the attn site
      * for the rationale (not bit-exact; flat_scratch=NULL disarms the
-     * wrapper's internal fallback; trailing rms_norm_weight subsumed). */
+     * wrapper's internal fallback; trailing rms_norm_weight subsumed).
+     * C3-Inc4: emit_q8 mirrors the consumers of batch_ffn_norm -- bit 0 for
+     * the shexp pair (batch_q8_pair gate), bit 1 for the routed-MoE gate+up
+     * quantize prelude (fold-take at n_tokens==1 in every vec-tier entry;
+     * an unconsumed sidecar is wiped by the next HC-stage reset). */
     bool hc_ffn_fused = false;
     if (ok && n_tokens == 1u && !metal_graph_use_reference_hc_decode() &&
         layer->hc_ffn_fn->type == DS4_TENSOR_F16) {
@@ -18400,7 +18410,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                 layer->hc_ffn_base->abs_offset,
                 layer->ffn_norm->abs_offset,
                 DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
-                DS4_HC_EPS, DS4_RMS_EPS, 0u) != 0;
+                DS4_HC_EPS, DS4_RMS_EPS,
+                (batch_q8_pair ? 1u : 0u) | 2u) != 0;
     }
     if (ok && !hc_ffn_fused) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_after_attn_hc,

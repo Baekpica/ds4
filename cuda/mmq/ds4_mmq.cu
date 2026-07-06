@@ -2731,7 +2731,44 @@ static char *iq2_aligned_quantize_xn(
     // M2-Inc2a: producer-emitted q8_1 codes (ffn_norm from the fused HC
     // stage) -- take them and skip the quantize prelude.
     char *folded = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
-    if (folded) return folded;
+    if (folded) {
+        // C3-Inc4 fold twin selftest (DS4_Q8_FOLD_SELFTEST=<call budget>,
+        // eager legs only -- syncs the stream): the taken sidecar must be
+        // byte-identical to the fresh quantize this prelude would have run.
+        // Do NOT combine with DS4_HC_STAGE_BATCH_PARITY (the probe rewrites
+        // norm_out after the sidecar was emitted).
+        static int fold_st = -1;
+        if (fold_st < 0) {
+            const char *st = getenv("DS4_Q8_FOLD_SELFTEST");
+            fold_st = st && *st ? atoi(st) : 0;
+            if (st && *st && fold_st <= 1) fold_st = 512;
+        }
+        cudaStreamCaptureStatus fold_cs = cudaStreamCaptureStatusNone;
+        if (fold_st > 0) (void)cudaStreamIsCapturing(stream, &fold_cs);
+        if (fold_st > 0 && fold_cs == cudaStreamCaptureStatusNone &&
+            nbytes_q8_1 <= 16384u) {
+            fold_st--;
+            static char h[2][16384];
+            pool->alloc(ctx->pool(), nbytes_q8_1);
+            char *fresh = pool->get();
+            quantize_row_q8_1_cuda(
+                X_f32, /*ids=*/nullptr, (void *)fresh,
+                GGML_TYPE_IQ2_XXS, /*ne00=*/K,
+                /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
+                /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
+                stream);
+            if (cudaGetLastError() == cudaSuccess &&
+                cudaStreamSynchronize(stream) == cudaSuccess &&
+                cudaMemcpy(h[0], folded, nbytes_q8_1, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                cudaMemcpy(h[1], fresh, nbytes_q8_1, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                fprintf(stderr, "ds4: Q8F-SELFTEST(q81 moe) K=%d %s\n", K,
+                        memcmp(h[0], h[1], nbytes_q8_1) == 0 ? "PASS" : "FAIL");
+            } else {
+                fprintf(stderr, "ds4: Q8F-SELFTEST(q81 moe) SKIP (setup failed)\n");
+            }
+        }
+        return folded;
+    }
     char *ptr = nullptr;
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         ptr = (char *)g_q81_scratch_ptr;
