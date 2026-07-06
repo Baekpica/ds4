@@ -9307,10 +9307,10 @@ typedef struct {
      * (decode-scalars + per-layer scalars, published at top of step)
      * instead of inline kernel args, which is what makes the recorded
      * graphs replayable.  Always false when the env gate is off ->
-     * byte-identical legacy behavior.  batch_capture_bank = the single
-     * live bank all rows of the step belong to. */
+     * byte-identical legacy behavior.  (C2: the graphs are bank-agnostic;
+     * per-row banks ride the device seq_id array, nothing bank-specific
+     * is tracked here.) */
     bool            batch_capture_step;
-    uint32_t        batch_capture_bank;
     /* M4b Inc3: optional per-row raw-span override (device int32, n_rows entries)
      * threaded into the batched dense decode attention for the batched MTP draft.
      * NULL for every normal batched forward (bit-exact); set transiently by
@@ -28911,20 +28911,25 @@ static bool metal_graph_batch_eval_logits(
      * each layer body in the cont graph cache's warm/capture/replay protocol.
      * Any failure downgrades to the fully-eager step (bit-identical).
      *
-     * C2 Inc2: TWO capturable shapes --
-     *   single-bank : ONE bank's consecutive positions, width 1..8 (plain
-     *                 width-1 cont + the DSpark/MTP verify step, incl.
-     *                 rollback checkpoints with canonical vdepth==t).
-     *   multi-plain : one row per DISTINCT bank (the production N=2..8
-     *                 plain batched decode step), no rollback.  Per-row
-     *                 pos/bank/emit-row all ride the device substrates
-     *                 (positions/seq_id arrays + per-ROW emit-row table),
-     *                 so the same graph serves any bank assignment.
-     * Mixed shapes (a bank with >1 row among others: multi-live verify
-     * segments) stay eager until Inc3. */
+     * C2 Inc3: ONE capturable shape -- the SEGMENT step.  Rows group into
+     * contiguous runs (segments), at most one segment per bank, positions
+     * consecutive within each segment; on rollback-capture steps each
+     * row's verify depth must equal its within-segment index (the verify
+     * pack's canonical [cur, d0, d1..] layout, restarting per bank).
+     * This subsumes every production step <= 8 rows:
+     *   single-bank : one segment (plain width-1 cont + the single-live
+     *                 DSpark/MTP verify step, incl. rollback ckpts).
+     *   multi-plain : n length-1 segments (the N=2..8 plain batched
+     *                 decode step; also the all-cur rollback step when
+     *                 every live bank packed zero drafts).
+     *   multi-live verify : >=2 segments, some with drafts (NLIVE>=2
+     *                 spec; fits <=8 rows at D<=3 for 2 live banks --
+     *                 see DS4_DSPARK_VERIFY_FIT_ROWS).
+     * Per-row pos/bank/emit-row/ckpt-lane all ride the device substrates
+     * (positions/seq_id arrays + per-ROW emit-row table + lane-copy
+     * kernels), so the same graph serves any bank assignment. */
     uint32_t cap_ncomp[DS4_MAX_LAYER] = {0};
     uint32_t cap_nidx[DS4_MAX_LAYER] = {0};
-    uint32_t cap_bank = 0;
     uint32_t cap_nraw = 0, cap_rawstart = 0;
     uint32_t cap_bank_pattern = 0;
     g->batch_capture_step = false;
@@ -28937,40 +28942,37 @@ static bool metal_graph_batch_eval_logits(
         !g->batch_defer_comp_store &&
         !g->batch_admit_fast && !g->batch_head_last_only &&
         g->batch_max_seq_len == 0u && g->batch_draft_n_raw == NULL) {
-        cap_bank = (uint32_t)g->ms_seq_id[0];
         bool banks_ok = true;      /* every row: valid bank + emit_keep==0 + pos>0 */
-        bool single_bank = true;   /* all rows one bank */
-        bool distinct = true;      /* no bank appears twice */
         int32_t max_pos = 0;
         for (uint32_t t = 0; banks_ok && t < n; t++) {
             if (g->ms_seq_id[t] < 0 ||
                 (uint32_t)g->ms_seq_id[t] >= DS4_MULTISEQ_MAX_SEQ ||
                 g->ms_positions[t] <= 0 ||
                 g->ms_emit_keep[(uint32_t)g->ms_seq_id[t]] != 0u) banks_ok = false;
-            if ((uint32_t)g->ms_seq_id[t] != cap_bank) single_bank = false;
             if (g->ms_positions[t] > max_pos) max_pos = g->ms_positions[t];
-            for (uint32_t t2 = 0; distinct && t2 < t; t2++)
-                if (g->ms_seq_id[t2] == g->ms_seq_id[t]) distinct = false;
         }
         /* pos0 is the step's published max position (the raw-window anchor);
-         * every capturable shape must agree with it. */
+         * every capturable shape must agree with it (verify packs pass
+         * pos0 = max over banks; plain packs pass the row max). */
         bool elig = banks_ok && (uint32_t)max_pos == pos0;
-        if (elig && single_bank) {
-            /* Single-bank rows must be consecutive positions ending at pos0
-             * (the verify shape: committed row + D drafts). */
-            if ((uint32_t)g->ms_positions[n - 1u] != pos0) elig = false;
-            for (uint32_t t = 0; elig && t < n; t++)
-                if (g->ms_positions[t] != g->ms_positions[0] + (int32_t)t) elig = false;
-            /* Rollback-capture steps checkpoint per row keyed on ms_vdepth;
-             * the captured lane-copy nodes bake (depth, row) so vdepth must
-             * be the canonical single-bank layout (depth == row index). */
-            if (elig && g->batch_rollback_capture) {
-                for (uint32_t t = 0; elig && t < n; t++)
-                    if (g->ms_vdepth[t] != (int32_t)t) elig = false;
+        if (elig) {
+            /* Segment scan: contiguous same-bank runs, no bank in two runs,
+             * consecutive positions within a run; on rollback-capture steps
+             * the captured lane-copy nodes bake (depth, row), so each row's
+             * vdepth must equal its within-segment index (the verify pack's
+             * canonical [cur=0, d0=1, ..] layout, restarting per bank). */
+            uint32_t run_start = 0;
+            for (uint32_t t = 0; elig && t < n; t++) {
+                if (t > 0u && g->ms_seq_id[t] != g->ms_seq_id[t - 1u]) {
+                    for (uint32_t t2 = 0; elig && t2 < t; t2++)
+                        if (g->ms_seq_id[t2] == g->ms_seq_id[t]) elig = false;
+                    run_start = t;
+                }
+                if (g->ms_positions[t] !=
+                    g->ms_positions[run_start] + (int32_t)(t - run_start)) elig = false;
+                if (g->batch_rollback_capture &&
+                    g->ms_vdepth[t] != (int32_t)(t - run_start)) elig = false;
             }
-        } else if (elig) {
-            /* Multi-plain: one row per bank, no rollback. */
-            if (!distinct || n < 2u || g->batch_rollback_capture) elig = false;
         }
         if (elig) {
             /* The live-sized chunked topk tier (> 8192 compressed rows) has
@@ -28988,9 +28990,11 @@ static bool metal_graph_batch_eval_logits(
                                              &cap_nraw, &cap_rawstart);
             /* Key field: per-row bank ORDINALS (first-occurrence order,
              * 4b/row).  Single-bank -> 0 (Inc1-compatible); multi-plain
-             * distinct rows -> 0,1,..,n-1; Inc3 segments will produce
-             * repeated ordinals.  The actual bank ids stay OUT of the key
-             * (resolved via the device substrates at replay). */
+             * distinct rows -> 0,1,..,n-1; verify segments -> repeated
+             * ordinals (the repeats + rollback flag pin the per-row vdepth
+             * layout the eligibility scan proved).  The actual bank ids
+             * stay OUT of the key (resolved via the device substrates at
+             * replay). */
             int32_t seen[DS4_ROW_SCALARS_MAX_ROWS];
             uint32_t n_seen = 0;
             for (uint32_t t = 0; t < n; t++) {
@@ -29000,7 +29004,6 @@ static bool metal_graph_batch_eval_logits(
                 cap_bank_pattern |= (o & 0xFu) << (4u * t);
             }
             g->batch_capture_step = true;
-            g->batch_capture_bank = cap_bank;
         }
     }
 
@@ -29077,13 +29080,13 @@ static bool metal_graph_batch_eval_logits(
         } else {
             /* Replay served the whole layer body: advance the host state the
              * skipped body would have advanced, row by row in body order.
-             * C2 Inc2: per-row bank (multi-plain rows each advance their OWN
-             * bank's counters).  Counter refresh mirrors the body's
+             * C2: per-row bank (each row advances its OWN bank's counters,
+             * any segmentation).  Counter refresh mirrors the body's
              * unconditional max-over-banks recompute (load-bearing after a
              * rollback lowers a bank's counters).  On rollback-capture steps
-             * (single-bank only) the body also records the per-depth
-             * checkpoint counters AFTER each row's emit; the lane-copy
-             * nodes themselves are inside the replayed graph. */
+             * the body also records each row's (vdepth, bank) checkpoint
+             * counters AFTER that row's emit; the lane-copy nodes themselves
+             * are inside the replayed graph. */
             if (il_ratio != 0u) {
                 for (uint32_t t = 0; t < n; t++) {
                     const uint32_t rs = (uint32_t)g->ms_seq_id[t];
@@ -32373,6 +32376,14 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * Lossless either way -- the verify forward is the sole source of tokens. */
     uint32_t dspark_max_nlive = 1u;
     { const char *me = getenv("DS4_DSPARK_MAX_NLIVE"); if (me && me[0]) { long v = atol(me); if (v >= 0) dspark_max_nlive = (uint32_t)v; } }
+    /* C2 Inc3 A/B lever (scaffolding, default off): cap each live bank's
+     * verify drafts so the packed verify step fits this many rows total --
+     * cont capture serves steps <= 8 rows (the decode-tier surface), so
+     * =8 trades draft depth for CAPTURED multi-live verify at NLIVE>=2
+     * (2 live: D<=3 -> exactly 8 rows).  Composes with DS4_CONT_CAPTURE
+     * for the depth-vs-capture attribution legs. */
+    uint32_t dspark_fit_rows = 0u;
+    { const char *fe = getenv("DS4_DSPARK_VERIFY_FIT_ROWS"); if (fe && fe[0]) { long v = atol(fe); if (v >= 0) dspark_fit_rows = (uint32_t)v; } }
     /* D4.5e: inject the cold/suffix PREFILL region's target hidden into the DSpark
      * rings (so the drafter attends real prefix KV from the first decode step instead
      * of zero ring slots).  On by default when dspark_mode; DS4_DSPARK_NO_PREFILL_INJECT
@@ -32875,6 +32886,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * committed row only (drop any drafts from a prior low-concurrency step) ->
                  * 1 row/bank = plain batched decode width. */
                 if (dspark_mode && !dspark_now) nd = 0u;
+                /* C2 Inc3 fit lever: uniform per-bank row budget so the packed
+                 * step stays within the capturable width (see env read above). */
+                if (dspark_fit_rows != 0u && dspark_now && n_live != 0u) {
+                    const uint32_t budget = dspark_fit_rows / n_live;
+                    const uint32_t cap = budget > 0u ? budget - 1u : 0u;
+                    if (nd > cap) nd = cap;
+                }
                 /* keep every row inside the per-seq frontier bound and the forward's row cap. */
                 while (nd > 0u && (posv[b] + nd >= seq_cap || K2 + 1u + nd > vcap_rows)) nd--;
                 vfirst[b] = K2; vnr[b] = nd;
