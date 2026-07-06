@@ -15538,6 +15538,76 @@ static void metal_graph_comp_pair_rows_selftest(
     }
 }
 
+/* C3-Inc3a parity probe (DS4_HC_STAGE_BATCH_PARITY=<call budget>, eager legs
+ * only): the fused HC stage is NOT a bit-exact twin (the M2-Inc1 fusion
+ * changes reduction orders -- rms scale at combine time, butterfly sinkhorn),
+ * so this probe REPORTS the divergence magnitude instead of memcmp: read the
+ * fused out/norm_out row, re-run the exact original batch chain on the same
+ * inputs, and print max_abs/max_rel.  The gate reads the magnitudes (must be
+ * in-family with the serial fusion's own, ~1e-3 rel); pass/fail lives in the
+ * eval-slice + M3 + accept-parity gates.  Leaves the unfused values live. */
+static void metal_graph_hc_stage_batch_parity(
+        ds4_gpu_graph   *g,
+        const ds4_model   *model,
+        const ds4_tensor  *fn,
+        uint64_t           scale_offset,
+        uint64_t           base_offset,
+        uint64_t           norm_weight_offset,
+        ds4_gpu_tensor  *cur_out,        /* [1, n_embd] row view */
+        ds4_gpu_tensor  *norm_out,
+        ds4_gpu_tensor  *mix_view,
+        ds4_gpu_tensor  *split_view,
+        const ds4_gpu_tensor *residual_hc,
+        uint32_t           il,
+        const char        *site) {
+    static int budget = -1;
+    if (budget < 0) {
+        const char *st = getenv("DS4_HC_STAGE_BATCH_PARITY");
+        budget = st && *st ? atoi(st) : 0;
+        if (st && *st && budget <= 1) budget = 512;
+    }
+    if (budget <= 0 || g->batch_capture_step) return;
+    budget--;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    static float pb_out[2][4096];
+    static float pb_norm[2][4096];
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    bool st_ok = row_bytes <= sizeof(pb_out[0]);
+    st_ok = st_ok && ds4_gpu_tensor_read(cur_out, 0, pb_out[0], row_bytes) != 0;
+    st_ok = st_ok && ds4_gpu_tensor_read(norm_out, 0, pb_norm[0], row_bytes) != 0;
+    st_ok = st_ok && ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, residual_hc,
+                         (uint32_t)hc_dim, 1u, DS4_RMS_EPS) != 0;
+    st_ok = st_ok && metal_graph_matmul_plain_tensor(mix_view, model, fn,
+                         hc_dim, mix_hc, g->batch_flat_hc, 1u);
+    st_ok = st_ok && ds4_gpu_hc_split_weighted_sum_tensor(cur_out, split_view,
+                         mix_view, residual_hc, model->map, model->size,
+                         scale_offset, base_offset,
+                         DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) != 0;
+    st_ok = st_ok && ds4_gpu_rms_norm_weight_rows_tensor(norm_out, cur_out,
+                         model->map, model->size, norm_weight_offset,
+                         DS4_N_EMBD, 1u, DS4_RMS_EPS) != 0;
+    st_ok = st_ok && ds4_gpu_tensor_read(cur_out, 0, pb_out[1], row_bytes) != 0;
+    st_ok = st_ok && ds4_gpu_tensor_read(norm_out, 0, pb_norm[1], row_bytes) != 0;
+    if (st_ok) {
+        float amax_o = 0.0f, rmax_o = 0.0f, amax_n = 0.0f, rmax_n = 0.0f;
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+            const float da = fabsf(pb_out[0][i] - pb_out[1][i]);
+            const float dn = fabsf(pb_norm[0][i] - pb_norm[1][i]);
+            if (da > amax_o) amax_o = da;
+            if (dn > amax_n) amax_n = dn;
+            const float ra = da / fmaxf(fabsf(pb_out[1][i]), 1e-6f);
+            const float rn = dn / fmaxf(fabsf(pb_norm[1][i]), 1e-6f);
+            if (ra > rmax_o) rmax_o = ra;
+            if (rn > rmax_n) rmax_n = rn;
+        }
+        fprintf(stderr, "ds4: HCS-PARITY(%s) il=%u out max_abs=%.3e max_rel=%.3e | norm max_abs=%.3e max_rel=%.3e\n",
+                site, il, amax_o, rmax_o, amax_n, rmax_n);
+    } else {
+        fprintf(stderr, "ds4: HCS-PARITY(%s) il=%u SKIP (read/rerun failed)\n", site, il);
+    }
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15676,7 +15746,32 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
             g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
-    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+    /* C3-Inc3a: at n==1 the batch row views ARE the serial decode shapes, so
+     * the whole 4-call HC chain (rms_norm_plain -> hc fn matmul -> sinkhorn
+     * split + weighted sum -> rms_norm_weight) runs as the M2-Inc1 fused
+     * cooperative kernel.  NOT a bit-exact twin (the fusion changes reduction
+     * orders -- same accuracy class the serial flip shipped with); gated by
+     * the HCS-PARITY probe + eval slice + M3 + accept parity.  flat_scratch
+     * = NULL disarms the wrapper's internal unfused fallback, so any
+     * precondition miss (incl. DS4_CUDA_NO_HC_STAGE_FUSED) returns 0 without
+     * touching outputs and the exact original chain below runs.  emit_q8=0:
+     * the batch consumers keep their own quantizes.  No per-bank state ->
+     * capture-safe by construction (norm folded via norm_out). */
+    bool hc_attn_fused = false;
+    if (ok && n_tokens == 1u && !metal_graph_use_reference_hc_decode() &&
+        layer->hc_attn_fn->type == DS4_TENSOR_F16) {
+        hc_attn_fused = ds4_gpu_hc_stage_fused_tensor(attn_cur_view,
+                g->batch_attn_norm, hc_split_view, hc_mix_view,
+                NULL /* no internal fallback */, g->batch_cur_hc,
+                model->map, model->size,
+                layer->hc_attn_fn->abs_offset,
+                layer->hc_attn_scale->abs_offset,
+                layer->hc_attn_base->abs_offset,
+                layer->attn_norm->abs_offset,
+                DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
+                DS4_HC_EPS, DS4_RMS_EPS, 0u) != 0;
+    }
+    if (ok && !hc_attn_fused) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
@@ -15687,7 +15782,7 @@ static bool metal_graph_encode_layer_attention_batch(
      * ds4_gpu_matmul_f16_tensor (base path bit-exact); for the MTP F32 weight it
      * uses matmul_f32.  The hardcoded F16 here silently produced NaN hc_mix for
      * the MTP draft (it read F32 bytes as F16). */
-    if (ok) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
+    if (ok && !hc_attn_fused) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
                                                  model,
                                                  layer->hc_attn_fn,
                                                  hc_dim,
@@ -15709,7 +15804,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             hc_split_view,
                                                             DS4_N_EMBD,
                                                             DS4_N_HC) != 0;
-    } else {
+    } else if (!hc_attn_fused) {
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(attn_cur_view,
                                                             hc_split_view,
                                                             hc_mix_view,
@@ -15728,7 +15823,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_pre");
-    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
+    if (ok && !hc_attn_fused) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
                                                        g->batch_attn_cur,
                                                        model->map,
                                                        model->size,
@@ -15736,6 +15831,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                        DS4_N_EMBD,
                                                        n_tokens,
                                                        DS4_RMS_EPS) != 0;
+    if (ok && hc_attn_fused)
+        metal_graph_hc_stage_batch_parity(g, model, layer->hc_attn_fn,
+                layer->hc_attn_scale->abs_offset, layer->hc_attn_base->abs_offset,
+                layer->attn_norm->abs_offset, attn_cur_view, g->batch_attn_norm,
+                hc_mix_view, hc_split_view, g->batch_cur_hc, il, "attn");
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->batch_attn_norm,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
@@ -18207,7 +18307,24 @@ static bool metal_graph_encode_layer_ffn_batch(
     ds4_gpu_tensor *next_hc_view = ds4_gpu_tensor_view(
             g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
-    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+    /* C3-Inc3a: ffn instance of the n==1 fused HC stage -- see the attn site
+     * for the rationale (not bit-exact; flat_scratch=NULL disarms the
+     * wrapper's internal fallback; trailing rms_norm_weight subsumed). */
+    bool hc_ffn_fused = false;
+    if (ok && n_tokens == 1u && !metal_graph_use_reference_hc_decode() &&
+        layer->hc_ffn_fn->type == DS4_TENSOR_F16) {
+        hc_ffn_fused = ds4_gpu_hc_stage_fused_tensor(ffn_cur_view,
+                g->batch_ffn_norm, hc_split_view, hc_mix_view,
+                NULL /* no internal fallback */, g->batch_after_attn_hc,
+                model->map, model->size,
+                layer->hc_ffn_fn->abs_offset,
+                layer->hc_ffn_scale->abs_offset,
+                layer->hc_ffn_base->abs_offset,
+                layer->ffn_norm->abs_offset,
+                DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
+                DS4_HC_EPS, DS4_RMS_EPS, 0u) != 0;
+    }
+    if (ok && !hc_ffn_fused) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_after_attn_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
@@ -18215,7 +18332,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     /* M4b Inc3: dtype-aware (base hc_ffn_fn = F16, reused MTP block = F32; see the
      * matching hc_attn_fn fix in metal_graph_encode_layer_attention_batch).  F16
      * dispatches to the identical kernel (base bit-exact); F32 for the MTP draft. */
-    if (ok) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
+    if (ok && !hc_ffn_fused) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
                                                  model,
                                                  layer->hc_ffn_fn,
                                                  hc_dim,
@@ -18237,7 +18354,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                             hc_split_view,
                                                             DS4_N_EMBD,
                                                             DS4_N_HC) != 0;
-    } else {
+    } else if (!hc_ffn_fused) {
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(ffn_cur_view,
                                                             hc_split_view,
                                                             hc_mix_view,
@@ -18256,7 +18373,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("hc_pre");
-    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
+    if (ok && !hc_ffn_fused) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
                                                        g->batch_ffn_cur,
                                                        model->map,
                                                        model->size,
@@ -18264,6 +18381,11 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                        DS4_N_EMBD,
                                                        n_tokens,
                                                        DS4_RMS_EPS) != 0;
+    if (ok && hc_ffn_fused)
+        metal_graph_hc_stage_batch_parity(g, model, layer->hc_ffn_fn,
+                layer->hc_ffn_scale->abs_offset, layer->hc_ffn_base->abs_offset,
+                layer->ffn_norm->abs_offset, ffn_cur_view, g->batch_ffn_norm,
+                hc_mix_view, hc_split_view, g->batch_after_attn_hc, il, "ffn");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->batch_ffn_norm,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
