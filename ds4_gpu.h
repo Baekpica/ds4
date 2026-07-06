@@ -1662,6 +1662,33 @@ int ds4_gpu_router_fused_tensor(
         uint64_t                in_dim,
         uint64_t                n_tok);
 
+/* C3-Inc1: batched fused router (n_tok <= 8 rows, one coop launch).  Bit-
+ * exact twin of the batch unfused chain (per-row split-K matmul + combine +
+ * router_select_warp_topk); returns 0 to fall back on any precondition miss.
+ * tokens = device per-row token-id tensor (hash routing). */
+int ds4_gpu_router_fused_batch_tensor(
+        ds4_gpu_tensor       *logits,
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_expert_groups,
+        uint32_t                n_group_used,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *tokens,
+        uint64_t                in_dim,
+        uint64_t                n_tok);
+
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,

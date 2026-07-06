@@ -18064,8 +18064,97 @@ static bool metal_graph_encode_layer_ffn_batch(
     DS4_METAL_PROFILE_FFN_STAGE("norm");
     /* M4b Inc3: dtype-aware MoE router (base ffn_gate_inp = F16, reused MTP block
      * = F32; see hc_attn_fn/hc_ffn_fn fixes).  F16 dispatches to the identical
-     * kernel (base bit-exact); F32 for the MTP draft routing. */
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->batch_router_logits,
+     * kernel (base bit-exact); F32 for the MTP draft routing.
+     * C3-Inc1: F16 first attempts the batched fused router (logits matmul +
+     * combine + top-6 select, one coop launch; bit-exact twin of the chain
+     * below); any precondition miss falls through to the exact original
+     * two-call chain. */
+    bool router_fused_batch = false;
+    if (ok && layer->ffn_gate_inp->type == DS4_TENSOR_F16) {
+        router_fused_batch = ds4_gpu_router_fused_batch_tensor(
+                g->batch_router_logits,
+                g->batch_router_selected,
+                g->batch_router_weights,
+                g->batch_router_probs,
+                model->map, model->size,
+                layer->ffn_gate_inp->abs_offset,
+                layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+                DS4_N_EXPERT,
+                DS4_N_EXPERT_USED,
+                DS4_EXPERT_WEIGHT_SCALE,
+                0,
+                0,
+                layer->ffn_exp_probs_b != NULL,
+                layer->ffn_gate_tid2eid != NULL,
+                g->batch_ffn_norm,
+                g->prefill_tokens,
+                DS4_N_EMBD,
+                n_tokens) != 0;
+    }
+    /* C3-Inc1 twin selftest (DS4_ROUTER_FUSED_BATCH_SELFTEST=1, eager legs
+     * only -- reads sync inside the step): after a fused call, read all four
+     * outputs, re-run the exact unfused chain on the SAME inputs, and memcmp.
+     * The only deterministic bit-exact instrument for this path (cont temp-0
+     * is not run-to-run deterministic), covering every width as it occurs. */
+    static int rfb_selftest = -1;
+    if (rfb_selftest < 0) {
+        /* value = call budget (43 calls per step); "1" gets enough steps to
+         * cover the verify widths that appear a few steps in. */
+        const char *st = getenv("DS4_ROUTER_FUSED_BATCH_SELFTEST");
+        rfb_selftest = st && *st ? atoi(st) : 0;
+        if (st && *st && rfb_selftest <= 1) rfb_selftest = 512;
+    }
+    if (ok && router_fused_batch && rfb_selftest > 0 && n_tokens <= 8u &&
+        !g->batch_capture_step) {
+        rfb_selftest--;
+        static float  st_logits[2][8 * 256];
+        static float  st_probs[2][8 * 256];
+        static int32_t st_sel[2][8 * 6];
+        static float  st_wgt[2][8 * 6];
+        bool st_ok = true;
+        st_ok = st_ok && ds4_gpu_tensor_read(g->batch_router_logits, 0, st_logits[0], (uint64_t)n_tokens * 256u * sizeof(float)) != 0;
+        st_ok = st_ok && ds4_gpu_tensor_read(g->batch_router_probs, 0, st_probs[0], (uint64_t)n_tokens * 256u * sizeof(float)) != 0;
+        st_ok = st_ok && ds4_gpu_tensor_read(g->batch_router_selected, 0, st_sel[0], (uint64_t)n_tokens * 6u * sizeof(int32_t)) != 0;
+        st_ok = st_ok && ds4_gpu_tensor_read(g->batch_router_weights, 0, st_wgt[0], (uint64_t)n_tokens * 6u * sizeof(float)) != 0;
+        st_ok = st_ok && metal_graph_matmul_plain_tensor(g->batch_router_logits, model,
+                                                         layer->ffn_gate_inp, DS4_N_EMBD,
+                                                         DS4_N_EXPERT, g->batch_ffn_norm, n_tokens);
+        st_ok = st_ok && ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
+                          g->batch_router_weights, g->batch_router_probs,
+                          model->map, model->size,
+                          layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                          layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                          layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+                          0, 0,
+                          layer->ffn_exp_probs_b != NULL,
+                          layer->ffn_gate_tid2eid != NULL,
+                          g->batch_router_logits, g->prefill_tokens,
+                          DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                          DS4_EXPERT_WEIGHT_SCALE, n_tokens) != 0;
+        st_ok = st_ok && ds4_gpu_tensor_read(g->batch_router_logits, 0, st_logits[1], (uint64_t)n_tokens * 256u * sizeof(float)) != 0;
+        st_ok = st_ok && ds4_gpu_tensor_read(g->batch_router_probs, 0, st_probs[1], (uint64_t)n_tokens * 256u * sizeof(float)) != 0;
+        st_ok = st_ok && ds4_gpu_tensor_read(g->batch_router_selected, 0, st_sel[1], (uint64_t)n_tokens * 6u * sizeof(int32_t)) != 0;
+        st_ok = st_ok && ds4_gpu_tensor_read(g->batch_router_weights, 0, st_wgt[1], (uint64_t)n_tokens * 6u * sizeof(float)) != 0;
+        if (st_ok) {
+            const int d_log = memcmp(st_logits[0], st_logits[1], (size_t)n_tokens * 256u * sizeof(float));
+            const int d_prb = memcmp(st_probs[0], st_probs[1], (size_t)n_tokens * 256u * sizeof(float));
+            const int d_sel = memcmp(st_sel[0], st_sel[1], (size_t)n_tokens * 6u * sizeof(int32_t));
+            const int d_wgt = memcmp(st_wgt[0], st_wgt[1], (size_t)n_tokens * 6u * sizeof(float));
+            fprintf(stderr, "ds4: RFB-SELFTEST n=%u il=%u %s (logits=%s probs=%s sel=%s wgt=%s)\n",
+                    n_tokens, il,
+                    (!d_log && !d_prb && !d_sel && !d_wgt) ? "PASS" : "FAIL",
+                    d_log ? "DIFF" : "eq", d_prb ? "DIFF" : "eq",
+                    d_sel ? "DIFF" : "eq", d_wgt ? "DIFF" : "eq");
+        } else {
+            fprintf(stderr, "ds4: RFB-SELFTEST n=%u il=%u SKIP (read/rerun failed)\n", n_tokens, il);
+        }
+        /* Device tensors now hold the unfused chain's (identical-on-pass)
+         * values; the forward continues on them either way. */
+    }
+
+    if (ok && !router_fused_batch) ok = metal_graph_matmul_plain_tensor(g->batch_router_logits,
                                                  model,
                                                  layer->ffn_gate_inp,
                                                  DS4_N_EMBD,
@@ -18073,7 +18162,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                  g->batch_ffn_norm,
                                                  n_tokens);
 
-    if (ok) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
+    if (ok && !router_fused_batch) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
                                                       g->batch_router_probs,
                                                       model->map,
