@@ -158,6 +158,23 @@ void  ds4_gpu_decode_scalars_set(
  * failure. */
 int   ds4_gpu_decode_scalars_flush(void);
 
+/* C1 (cont capture): explicit-window variant of ds4_gpu_decode_scalars_set.
+ * The batched multiseq step derives its raw read-window on the host via
+ * metal_graph_raw_window_for_batch (ring-linearisation semantics that the
+ * plain setter's internal formula only matches when raw_window <= raw_cap),
+ * so the cont publish path passes the EXACT values the eager kernel args
+ * would carry instead of re-deriving them.  emit_phase/comp_row/index_row
+ * are left untouched (comp/index rows ride the per-layer substrate). */
+void  ds4_gpu_decode_scalars_set_ext(
+        uint32_t pos0,
+        uint32_t raw_row,
+        uint32_t raw_start,
+        uint32_t n_raw,
+        uint32_t n_comp,
+        uint32_t emit_phase,
+        uint32_t flags,
+        uint32_t token);
+
 /* UNSAFE pending removal in Step 4c (see plan doc sec 4.2 P1a).
  *
  * Per-emit setter for the row scalars used by the R1 row-variant shims.
@@ -335,6 +352,74 @@ void ds4_cuda_layer_graph_end_or_commit(uint32_t il);
  * DS4_CUDA_LAYER_GRAPHS_DEBUG=1 AND a layer-graph capture is in flight.
  * Used to bisect capture-mode incompatibilities by call site. */
 void ds4_cuda_layer_graph_debug_peek(const char *label);
+
+/* =========================================================================
+ * C1: continuous-batch per-layer cudaGraph capture-and-replay.
+ * =========================================================================
+ *
+ * Same warm -> capture -> replay protocol as the serial trio above, with a
+ * SEPARATE direct-mapped cache and a key shaped for the multiseq batched
+ * decode step (width, bank, emit topology, n_comp band, plus the tensor
+ * base pointers whose reallocation must invalidate cached execs).  Opt-in
+ * via DS4_CONT_CAPTURE=1 (default OFF); enabled() reports the env gate so
+ * ds4.c can skip key construction entirely when off.  Metal stubs: enabled
+ * returns 0, begin returns -1, end is a no-op. */
+struct ds4_cont_graph_key {
+    uint32_t il;          /* layer index */
+    uint32_t width;       /* batch rows (1 = cont decode, 5 = D=4 verify) */
+    uint32_t bank;        /* live bank id -- compressor/indexer state-pool and
+                           * rollback-checkpoint views bake seq*stride offsets */
+    uint32_t flags;       /* bit 0: emit_this_step (any row crosses a ratio
+                           *        boundary for this layer)
+                           * bit 1: indexed_active (ratio4 && n_comp > top_k)
+                           * bit 2: compressed_layer (ratio != 0)
+                           * bit 3: ratio4
+                           * bit 4: window_sliding (raw_start != 0 regime)
+                           * bit 5: rollback_capture (verify step checkpoints)
+                           * bits 8..15: emit row bitmask within the batch
+                           * bits 16..31: reserved */
+    uint32_t n_comp_band; /* indexer grid/stride ceiling (1024/2048/4096/8192);
+                           * kernels bound-check against the live substrate
+                           * counts, so only band CROSSINGS recapture */
+    uint32_t _pad;
+    /* Tensor base pointers baked into the captured bodies. */
+    void    *cur_hc;          /* batch_cur_hc (ping-pong parity) */
+    void    *next_hc;         /* batch_next_hc */
+    void    *raw_cache;
+    void    *comp_cache;
+    void    *index_comp_cache;
+    void    *comp_cache_fp8;
+    void    *comp_scale;
+    void    *index_fp4;
+    void    *index_scale;
+    void    *attn_state_kv;   /* slab bases; per-bank offsets are baked via
+                               * `bank`, so slab regrow OR bank switch rekeys */
+    void    *attn_state_score;
+    void    *index_state_kv;
+    void    *index_state_score;
+    void    *comp_emit_scratch;   /* sticky grow-realloc'd; grow must rekey */
+    void    *index_emit_scratch;
+    void    *positions;       /* batch_positions / batch_seq_id device arrays */
+    void    *seq_id;
+    void    *comp_selected;
+    void    *indexer_scores;
+    void    *batch_heads;
+};
+
+int  ds4_cuda_cont_graphs_enabled(void);
+/* begin_or_replay: 1 = replayed (skip body; caller advances host counters),
+ * 0 = capturing (encode body, then end_or_commit), -1 = eager. */
+int  ds4_cuda_cont_graph_begin_or_replay(uint32_t il,
+                                           const struct ds4_cont_graph_key *key);
+void ds4_cuda_cont_graph_end_or_commit(uint32_t il);
+/* One-line engagement stats (captures/replays/eager) under
+ * DS4_CONT_CAPTURE_STATS=1; printed every `every` replays. */
+void ds4_cuda_cont_graph_stats_maybe_print(uint32_t every);
+
+/* C1: public wrapper for the captured-graph invalidation used by the
+ * sticky-scratch growers that live in ds4.c (comp/index emit scratch).
+ * No-op on Metal. */
+void ds4_gpu_invalidate_captured_graphs(const char *why);
 
 /* Captured-decode per-kernel hash dump (DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1).
  * Permanent, env-gated, no-op-when-off diagnostic for localizing a
@@ -811,13 +896,23 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
  * those buffers in addition to its existing in-place FP32 quantisation of
  * `base`.  Pass NULL for both when the feature is disabled; the buffers
  * stay NULL through the layer-graph key for stable capture/replay. */
+/* C1 (cont capture): optional `src` override for the fp8/fp4-primary
+ * continuous path, where the F32 emit lands in a shared scratch row 0
+ * (the bank's F32 cache page is write-dead and never mapped).  When src
+ * is non-NULL the kernel does its in-place F32 round-trip on src row 0
+ * and writes the packed mirror rows at g_layer_dev[il].comp_row as
+ * before -- base may then be NULL.  NULL src = row addressed inside
+ * `base` (serial decode path, unchanged). */
 int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
         uint32_t          n_rot,
         uint32_t          il,
         ds4_gpu_tensor *codes_mirror,
-        ds4_gpu_tensor *scale_mirror);
+        ds4_gpu_tensor *scale_mirror,
+        ds4_gpu_tensor *src,
+        /* C1b: key-stable offset from the substrate emit row. */
+        uint32_t          row_delta);
 
 /* P2 Inc2b: expand packed FP8 rows back to FP32 -- the exact inverse of the
  * quantize encode (each lane reconstructs bit-identically to what the
@@ -848,13 +943,18 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *scale_mirror);
 
 /* R1 row-variant (Step 4c R1'): writes one row of `base` at the index
- * taken from g_layer_dev[il].index_row. */
+ * taken from g_layer_dev[il].index_row.
+ * C1 (cont capture): `src` override mirrors fp8_kv_quantize_row_tensor --
+ * non-NULL src = F32 work on src row 0, packed mirror rows at
+ * g_layer_dev[il].index_row, base may be NULL. */
 int ds4_gpu_dsv4_indexer_qat_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
         uint32_t          il,
         ds4_gpu_tensor *codes_mirror,
-        ds4_gpu_tensor *scale_mirror);
+        ds4_gpu_tensor *scale_mirror,
+        ds4_gpu_tensor *src,
+        uint32_t          row_delta);
 
 /* P2 Inc3: expand packed FP4 indexer rows back to F32 -- exact inverse of the
  * encode (bit-identical to indexer_fp4_read).  `codes`/`scale` are views at
@@ -989,6 +1089,13 @@ int ds4_gpu_store_raw_kv_batch_tensor(
  * il = UINT32_MAX -- row_field is then ignored. */
 #define DS4_COMPRESSOR_ROW_COMP   0
 #define DS4_COMPRESSOR_ROW_INDEX  1
+/* C1 (cont capture): fp8/fp4-primary emit into a shared scratch row 0.
+ * Substrate mode for the store pos (kernel reads s->pos0) but the emit-tail
+ * kernels write FIXED row 0 of the passed comp_cache (the scratch) instead
+ * of dereferencing g_layer_dev[il].comp_row -- the packed-mirror row pack
+ * that follows (fp8/fp4 row-variant with `src`) is what lands at the
+ * substrate row.  Requires il < layer count (fails loud otherwise). */
+#define DS4_COMPRESSOR_ROW_SCRATCH0 2
 
 /* M2-Inc5 (CUDA): one decode compressor event -- BOTH pair f16 matmuls
  * (kv + gate, in_dim x width), their split-K combines, and the compressor
@@ -1050,7 +1157,16 @@ int ds4_gpu_compressor_update_tensor(
          * fall back to inline comp_row and row_field is ignored.  See
          * plan doc sec 16 commit C2 / sec 15.8. */
         uint32_t                il,
-        int                     row_field);
+        int                     row_field,
+        /* C1b (cont capture, width>1): key-stable per-row offsets --
+         * pos_delta shifts the substrate-read store/rope position
+         * (s->pos0 + pos_delta = this row's absolute position);
+         * emit_row_delta shifts the substrate-read emit row (the second
+         * emit of a layer within one step writes ls->row + 1).  Both 0
+         * for every width-1 / serial / eager caller; ignored when
+         * il == UINT32_MAX. */
+        int32_t                 pos_delta,
+        uint32_t                emit_row_delta);
 
 /* M2-Inc5: emit tail of ds4_gpu_compressor_update_tensor only (pool + norm +
  * rope + ratio4 shift; no store) -- the follow-up call after a successful
@@ -1082,7 +1198,9 @@ int ds4_gpu_compressor_update_tail_tensor(
         float                   beta_slow,
         float                   rms_eps,
         uint32_t                il,
-        int                     row_field);
+        int                     row_field,
+        int32_t                 pos_delta,
+        uint32_t                emit_row_delta);
 
 int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
@@ -1101,7 +1219,9 @@ int ds4_gpu_compressor_store_batch_tensor(
          * caller passes ds4_gpu_decode_scalars_device_ptr(); prefill +
          * batch callers pass NULL (kernel uses inline pos0).  Metal
          * backend ignores the argument. */
-        const void             *scalars);
+        const void             *scalars,
+        /* C1b: per-row offset from s->pos0; 0 for every non-capture caller. */
+        int32_t                pos_delta);
 
 int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,
@@ -1244,7 +1364,14 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         const ds4_gpu_tensor *draft_n_raw,
         /* FE2: caller opt-in for the per-seq heads8-online fast path (the
          * admission-chunk forward); 0 = pre-FE2 dispatch, bit-exact. */
-        uint32_t                allow_mseq_heads8);
+        uint32_t                allow_mseq_heads8,
+        /* C1 (cont capture): optional decode-scalars substrate + per-layer
+         * index.  When scalars != NULL the kernel reads pos0/n_raw/raw_start
+         * live from the device struct at execution time (capture-safe); when
+         * il < layer count it reads n_comp from g_layer_dev[il] (raw layers
+         * publish 0).  (NULL, UINT32_MAX) = inline args, bit-exact legacy. */
+        const void             *scalars,
+        uint32_t                il_for_decode1);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -1281,7 +1408,12 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         /* FB1: caller opt-in for the per-seq heads8-online fast path (the
          * admission-chunk forward; wide single-bank batches).  0 keeps every
          * per-seq caller on the generic kernel (pre-FB1 dispatch, bit-exact). */
-        uint32_t                allow_mseq_heads8);
+        uint32_t                allow_mseq_heads8,
+        /* C1 (cont capture): see ds4_gpu_attention_decode_raw_batch_heads_
+         * tensor.  Substrate present forces the generic kernel (the heads8
+         * online tier bakes inline window scalars). */
+        const void             *scalars,
+        uint32_t                il_for_decode1);
 
 /* Decode-time indexed-attention shim.  See ds4_gpu_attention_decode_heads_
  * tensor for the `scalars` semantics.  Pass NULL for the batched/prefill

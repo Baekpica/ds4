@@ -9299,6 +9299,18 @@ typedef struct {
      * the legacy one-shot (DS4_CONT_PREFILL_CHUNK=0, bit-exact promise), the
      * ragged W1 driver -- leaves this false and keeps pre-FB1 kernels. */
     bool            batch_admit_fast;
+    /* C1 (cont capture, DS4_CONT_CAPTURE=1): set by metal_graph_batch_eval_
+     * logits for the steps that qualify for per-layer cudaGraph capture
+     * (single-bank multiseq decode shape; see the eligibility block there).
+     * The multiseq emit branches and the attention/indexer call sites then
+     * source their step-varying scalars from the device substrates
+     * (decode-scalars + per-layer scalars, published at top of step)
+     * instead of inline kernel args, which is what makes the recorded
+     * graphs replayable.  Always false when the env gate is off ->
+     * byte-identical legacy behavior.  batch_capture_bank = the single
+     * live bank all rows of the step belong to. */
+    bool            batch_capture_step;
+    uint32_t        batch_capture_bank;
     /* M4b Inc3: optional per-row raw-span override (device int32, n_rows entries)
      * threaded into the batched dense decode attention for the batched MTP draft.
      * NULL for every normal batched forward (bit-exact); set transiently by
@@ -10718,7 +10730,15 @@ static ds4_gpu_tensor *metal_graph_comp_emit_scratch(ds4_gpu_graph *g, uint64_t 
                 (unsigned long long)need);
         return NULL;
     }
-    if (g->comp_emit_scratch) ds4_gpu_tensor_free(g->comp_emit_scratch);
+    if (g->comp_emit_scratch) {
+        /* C1 (cont capture): the old scratch pointer may be baked into cached
+         * cont-graph execs (the emit-tail kernels write scratch row 0); drop
+         * every captured graph before the cudaFree so no replay dereferences
+         * freed memory (serial-mtp-conc-crash lesson).  The key also carries
+         * the scratch pointer, so the next sighting rekeys + recaptures. */
+        ds4_gpu_invalidate_captured_graphs("comp emit scratch grow");
+        ds4_gpu_tensor_free(g->comp_emit_scratch);
+    }
     g->comp_emit_scratch = nt;
     g->comp_emit_scratch_rows = need;
     return nt;
@@ -10740,7 +10760,11 @@ static ds4_gpu_tensor *metal_graph_index_emit_scratch(ds4_gpu_graph *g, uint64_t
                 (unsigned long long)need);
         return NULL;
     }
-    if (g->index_emit_scratch) ds4_gpu_tensor_free(g->index_emit_scratch);
+    if (g->index_emit_scratch) {
+        /* C1: see metal_graph_comp_emit_scratch. */
+        ds4_gpu_invalidate_captured_graphs("index emit scratch grow");
+        ds4_gpu_tensor_free(g->index_emit_scratch);
+    }
     g->index_emit_scratch = nt;
     g->index_emit_scratch_rows = need;
     return nt;
@@ -11270,7 +11294,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                         DS4_ROPE_YARN_BETA_SLOW,
                                                         DS4_RMS_EPS,
                                                         il,                          /* PC2: per-layer substrate index for emit-row */
-                                                        DS4_COMPRESSOR_ROW_COMP      /* PC2: primary compressor -> ls->comp_row */) != 0;
+                                                        DS4_COMPRESSOR_ROW_COMP,     /* PC2: primary compressor -> ls->comp_row */
+                                                        0, 0u                        /* C1b deltas: serial width-1 */) != 0;
         if (ok && emit) {
             /* Step 4c R1': read comp_row from g_layer_dev[il].comp_row in
              * the per-layer substrate (populated at top of token in
@@ -11288,7 +11313,9 @@ static bool metal_graph_encode_decode_layer_impl(
                     DS4_N_HEAD_DIM, DS4_N_ROT,
                     il,
                     g->layer_comp_cache_fp8[il],
-                    g->layer_comp_scale[il]) != 0;
+                    g->layer_comp_scale[il],
+                    /* C1: serial path keeps the in-cache row (no scratch src) */
+                    NULL, 0u) != 0;
             if (ok && metal_graph_debug_wants("KVcompress", il, pos)) {
                 /* Debug-only path (DS4_METAL_GRAPH_DUMP_PREFIX env-gated).
                  * The synchronize inside the dumper is incompatible with
@@ -11396,7 +11423,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS,
                                                             il,                          /* PC2: per-layer substrate index for emit-row */
-                                                            DS4_COMPRESSOR_ROW_INDEX     /* PC2: indexer compressor -> ls->index_row */) != 0;
+                                                            DS4_COMPRESSOR_ROW_INDEX,    /* PC2: indexer compressor -> ls->index_row */
+                                                            0, 0u                        /* C1b deltas: serial width-1 */) != 0;
             /* TEMPORARY DIAGNOSTIC: state_kv AFTER compressor_update_tensor
              * returns (post compressor_store_batch + post update_pool +
              * shift).  Slot 230+il.  If this matches BE vs BC but the cache
@@ -11433,7 +11461,9 @@ static bool metal_graph_encode_decode_layer_impl(
                          * F32 base and FP4 mirror at g_layer_dev[il].index_row.
                          * NULL when DS4_CUDA_FP4_INDEX is off. */
                         g->layer_index_comp_cache_fp4[il],
-                        g->layer_index_comp_scale[il]) != 0;
+                        g->layer_index_comp_scale[il],
+                        /* C1: serial path keeps the in-cache row */
+                        NULL, 0u) != 0;
             }
             /* Fixed-size post-qat cache hash, slot 60+il.  Same 3000 rows.
              * Comparing slot 0+il (post-update) vs 60+il (post-qat) tells
@@ -15385,6 +15415,19 @@ static double now_thread_cpu_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/* C1 (cont capture): indexer scores-grid / topk-tier band ceiling.  Tier
+ * edges MUST mirror the topk kernel specialisation thresholds in
+ * ds4_gpu_indexer_topk_tensor (1024/2048/4096/8192); a captured step's
+ * launch topology is pinned to the band and only band CROSSINGS rekey.
+ * Callers guarantee n_comp <= 8192 (capture eligibility excludes the
+ * live-sized chunked topk tier above that). */
+static uint32_t metal_graph_cont_capture_band(uint32_t n_comp) {
+    if (n_comp <= 1024u) return 1024u;
+    if (n_comp <= 2048u) return 2048u;
+    if (n_comp <= 4096u) return 4096u;
+    return 8192u;
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15859,7 +15902,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                    /* M4b Inc3: per-row MTP draft span (NULL except the batched draft) */
                                                                    g->batch_draft_n_raw,
                                                                    /* FE2: admission-chunk heads8 fast path (ratio==0 layers) */
-                                                                   g->batch_admit_fast ? 1u : 0u) != 0;
+                                                                   g->batch_admit_fast ? 1u : 0u,
+                                                                   /* C1: substrate window on capture steps; dense layers
+                                                                    * need no per-layer scalars (n_comp stays inline 0). */
+                                                                   g->batch_capture_step ? ds4_gpu_decode_scalars_device_ptr() : NULL,
+                                                                   UINT32_MAX) != 0;
             ds4_gpu_stage_prof_end(sp_core);
         }
         if (ok) batch_attention_done = true;
@@ -15929,6 +15976,10 @@ static bool metal_graph_encode_layer_attention_batch(
                 (uint64_t)(coff * ratio) * comp_width * sizeof(float);
             const double emit_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
             const uint32_t sp_emit = ds4_gpu_stage_prof_begin(DS4_SPROF_EMIT);
+            /* C1b: emits this layer already performed within THIS step --
+             * feeds the capture-mode row/pos deltas (key-stable: single-bank
+             * consecutive rows fix which rows emit). */
+            uint32_t cap_emits_before = 0;
             for (uint32_t t = 0; ok && t < n_tokens; t++) {
                 /* FB2: batched middle -- one aligned-chunk emit over f2_mid
                  * rows into bank seq's cache/state views, the multiseq mirror
@@ -16097,6 +16148,13 @@ static bool metal_graph_encode_layer_attention_batch(
                 if (ms_fp8_primary && !ms_row_scratch) ok = false;
                 const double cupd_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
                 const uint32_t sp_cupd = ds4_gpu_stage_prof_begin(DS4_SPROF_CUPD);
+                /* C1 (cont capture): on capture steps the store pos rides the
+                 * decode-scalars substrate and the emit-row rides
+                 * g_layer_dev[il].comp_row (GLOBAL row published at top of
+                 * step); fp8-primary keeps its fixed scratch-row-0 target via
+                 * ROW_SCRATCH0 (the packed-mirror pack below carries the real
+                 * row).  Inline pos/row stay as the non-capture fallback. */
+                const bool cap_step = g->batch_capture_step;
                 ok = ok && kv_view && sc_view && st_kv && st_sc &&
                      ds4_gpu_compressor_update_tensor(kv_view,
                                                         sc_view,
@@ -16123,11 +16181,33 @@ static bool metal_graph_encode_layer_attention_batch(
                                                         DS4_ROPE_YARN_BETA_FAST,
                                                         DS4_ROPE_YARN_BETA_SLOW,
                                                         DS4_RMS_EPS,
-                                                        UINT32_MAX,                  /* eager, inline comp_row */
-                                                        DS4_COMPRESSOR_ROW_COMP) != 0;
+                                                        cap_step ? il : UINT32_MAX,
+                                                        cap_step && ms_fp8_primary
+                                                            ? DS4_COMPRESSOR_ROW_SCRATCH0
+                                                            : DS4_COMPRESSOR_ROW_COMP,
+                                                        /* C1b: this row's position relative to the published
+                                                         * maxpos + how many emits this layer already did
+                                                         * this step (both key-stable per capture shape). */
+                                                        (int32_t)pos - (int32_t)pos0,
+                                                        cap_emits_before) != 0;
                 ds4_gpu_stage_prof_end(sp_cupd);
                 if (g_cont_prof > 0) g_cont_lyr_cupd_s += now_sec() - cupd_t0;
-                if (ok && emit) {
+                if (ok && emit && cap_step) {
+                    /* C1: capture-safe pack -- the row-variant kernel reads the
+                     * emit row live from g_layer_dev[il].comp_row (mirror rows)
+                     * and round-trips the F32 value on the scratch row 0
+                     * (fp8-primary) or in the cache slab (F32-primary).  The
+                     * mirror pages were demand-mapped in the input phase
+                     * (metal_graph_cont_capture_prepare), NOT here -- VMM map
+                     * calls must stay outside the captured scope. */
+                    ok = ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
+                            ms_fp8_primary ? NULL : g->layer_attn_comp_cache[il],
+                            DS4_N_HEAD_DIM, DS4_N_ROT, il,
+                            g->layer_comp_cache_fp8[il],
+                            g->layer_comp_scale[il],
+                            ms_fp8_primary ? ms_row_scratch : NULL,
+                            cap_emits_before) != 0;
+                } else if (ok && emit) {
                     /* P2 Inc2a: E4M3 round-trip of the just-emitted row (model
                      * semantics -- see the block comment above) + the per-bank
                      * FP8 mirror row when the mirror is on.  Eager path,
@@ -16168,6 +16248,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor_free(crow);
                 }
                 if (ok && emit) g->ms_n_comp[seq][il]++;
+                if (emit) cap_emits_before++;
                 if (ok && emit) ok = ms_emit_keep_restore(g, il, seq, ratio, comp_row_local, 1u, false);
                 /* S1.1 M2: snapshot bank seq's attn running-state + row counter after
                  * this row, so a partial accept can roll the bank back to its accepted
@@ -16504,7 +16585,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS,
                                                             UINT32_MAX,                  /* PC2: decode2-exact, no substrate; inline comp_row */
-                                                            DS4_COMPRESSOR_ROW_COMP      /* PC2: row_field ignored when il==UINT32_MAX */) != 0;
+                                                            DS4_COMPRESSOR_ROW_COMP,     /* PC2: row_field ignored when il==UINT32_MAX */
+                                                            0, 0u) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = row_fp8_primary
                             ? ds4_gpu_tensor_view(row_scratch, 0,
@@ -16646,6 +16728,7 @@ static bool metal_graph_encode_layer_attention_batch(
                  * on the same group-close, but tracked independently). */
                 const uint64_t istate_stride =
                     (uint64_t)(coff * ratio) * index_width * sizeof(float);
+                uint32_t icap_emits_before = 0;  /* C1b: see the attn emit loop */
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
                     /* FB2: batched middle, indexer flavor -- mirrors the
                      * single-seq aligned-chunk indexer branch below (replay +
@@ -16807,6 +16890,11 @@ static bool metal_graph_encode_layer_attention_batch(
                      * the FP4 mirror views below. */
                     ds4_gpu_tensor *idx_ct = fp4_primary ? idx_emit : g->layer_index_comp_cache[il];
                     const uint32_t idx_wrow = fp4_primary ? 0u : index_row_global;
+                    /* C1 (cont capture): indexer sibling of the attn emit
+                     * above -- substrate pos + g_layer_dev[il].index_row
+                     * (GLOBAL) on capture steps; fp4-primary keeps its fixed
+                     * scratch-row-0 target via ROW_SCRATCH0. */
+                    const bool icap_step = g->batch_capture_step;
                     ok = kv_view && sc_view && st_kv && st_sc &&
                          ds4_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
@@ -16832,9 +16920,26 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_FAST,
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS,
-                                                            UINT32_MAX,                  /* eager, inline row */
-                                                            DS4_COMPRESSOR_ROW_INDEX) != 0;
-                    if (ok && emit) {
+                                                            icap_step ? il : UINT32_MAX,
+                                                            icap_step && fp4_primary
+                                                                ? DS4_COMPRESSOR_ROW_SCRATCH0
+                                                                : DS4_COMPRESSOR_ROW_INDEX,
+                                                            (int32_t)pos - (int32_t)pos0,
+                                                            icap_emits_before) != 0;
+                    if (ok && emit && icap_step) {
+                        /* C1: capture-safe QAT -- row-variant reads the emit
+                         * row live from g_layer_dev[il].index_row (FP4 mirror)
+                         * and hadamard-quantises the scratch row 0
+                         * (fp4-primary) or the in-slab row.  Mirror pages
+                         * demand-mapped in the input phase. */
+                        ok = ds4_gpu_dsv4_indexer_qat_row_tensor(
+                                fp4_primary ? NULL : g->layer_index_comp_cache[il],
+                                DS4_N_INDEXER_HEAD_DIM, il,
+                                g->layer_index_comp_cache_fp4[il],
+                                g->layer_index_comp_scale[il],
+                                fp4_primary ? idx_emit : NULL,
+                                icap_emits_before) != 0;
+                    } else if (ok && emit) {
                         ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(
                                 g->layer_index_comp_cache[il],
                                 (uint64_t)index_row_global * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -16875,6 +16980,7 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                     }
                     if (ok && emit) g->ms_n_index_comp[seq][il]++;
+                    if (emit) icap_emits_before++;
                     if (ok && emit) ok = ms_emit_keep_restore(g, il, seq, ratio, index_row_local, 1u, true);
                     /* S1.1 M3: indexer sibling of the attn rollback snapshot above. */
                     if (ok && g->batch_rollback_capture) {
@@ -17187,7 +17293,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_ROPE_YARN_BETA_SLOW,
                                                                 DS4_RMS_EPS,
                                                                 UINT32_MAX,                  /* PC2: decode2-exact indexer, no substrate */
-                                                                DS4_COMPRESSOR_ROW_INDEX     /* PC2: row_field ignored when il==UINT32_MAX */) != 0;
+                                                                DS4_COMPRESSOR_ROW_INDEX,    /* PC2: row_field ignored when il==UINT32_MAX */
+                                                                0, 0u) != 0;
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                                     g->layer_index_comp_cache[il],
@@ -17278,11 +17385,20 @@ static bool metal_graph_encode_layer_attention_batch(
                  * caller-convention (bg admission passes the frontier), so the
                  * row-0 position comes from the host mirrors -- the same truth
                  * the per-row kernel reads from positions[]. */
+                /* C1 (cont capture): on capture steps the scores grid + row
+                 * stride and the topk tier are pinned to the BAND ceiling so
+                 * the captured launch topology survives n_comp growth; the
+                 * multiseq scores kernel's causal clamp is positions[]-derived
+                 * (device, live) and the topk kernel reads the live count from
+                 * g_layer_dev[il].n_index_comp, so only band CROSSINGS rekey.
+                 * Rows [visible, band) are written -INF and never scanned. */
+                const uint32_t idx_grid_n = g->batch_capture_step
+                    ? metal_graph_cont_capture_band(n_comp) : n_comp;
                 ok = ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
                                                                   g->batch_indexer_q,
                                                                   g->batch_indexer_weights,
                                                                   g->layer_index_comp_cache[il],
-                                                                  n_comp,
+                                                                  idx_grid_n,
                                                                   n_tokens,
                                                                   admit_single_run
                                                                       ? (uint32_t)g->ms_positions[0] : pos0,
@@ -17316,11 +17432,14 @@ static bool metal_graph_encode_layer_attention_batch(
                 if (ok) {
                     ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                                        g->indexer_scores,
-                                                       n_comp,
+                                                       idx_grid_n,
                                                        n_tokens,
                                                        DS4_N_INDEXER_TOP_K,
-                                                       0u,           /* PC5: prefill/batch, legacy n_comp grid */
-                                                       UINT32_MAX    /* PC5: no substrate */) != 0;
+                                                       /* PC5: capture steps pin the tier to the band and read
+                                                        * the live count from the per-layer substrate; legacy
+                                                        * (0, UINT32_MAX) everywhere else. */
+                                                       g->batch_capture_step ? idx_grid_n : 0u,
+                                                       g->batch_capture_step ? il : UINT32_MAX) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("topk",
                                                                         il,
@@ -17348,7 +17467,9 @@ static bool metal_graph_encode_layer_attention_batch(
                 if (use_indexed_comp) {
                     /* Out-of-decode-body caller (batch path): scalars=NULL
                      * keeps the kernel reading inline args, identical to
-                     * pre-Step-4 behavior. */
+                     * pre-Step-4 behavior.  C1 capture steps pass the
+                     * substrates so the captured node reads the live window
+                     * + count at replay time. */
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
                                                                               model->map,
                                                                               model->size,
@@ -17371,7 +17492,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
-                                                                              /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */,
+                                                                              /* scalars (batch path; substrate on C1 capture steps) */
+                                                                              g->batch_capture_step ? ds4_gpu_decode_scalars_device_ptr() : NULL,
+                                                                              g->batch_capture_step ? il : UINT32_MAX,
                                                                               /* Opp C Phase 1A.4: packed FP8 mirror.
                                                                                * Per-seq callers never read it -- the
                                                                                * wrapper nulls both pointers (single-bank
@@ -17419,7 +17542,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              g->layer_comp_scale[il],
                                                                              seq_positions, seq_id,
                                                                              /* FB1: admission-chunk fast path */
-                                                                             g->batch_admit_fast ? 1u : 0u) != 0;
+                                                                             g->batch_admit_fast ? 1u : 0u,
+                                                                             /* C1: substrate window + live n_comp on capture steps */
+                                                                             g->batch_capture_step ? ds4_gpu_decode_scalars_device_ptr() : NULL,
+                                                                             g->batch_capture_step ? il : UINT32_MAX) != 0;
                 }
             }
             ds4_gpu_stage_prof_end(sp_core);
@@ -18832,7 +18958,8 @@ static bool metal_graph_eval_dspark_block(
             ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads, dspark_model->map, dspark_model->size,
                                             lw->attn_sinks->abs_offset, g->batch_q, g->dspark_raw_cache[li],
                                             B, qpos_win, row_n_raw, g->raw_cap, raw_start, window,
-                                            DS4_N_HEAD, DS4_N_HEAD_DIM, unif_pos_t, NULL, NULL, 0u) != 0;
+                                            DS4_N_HEAD, DS4_N_HEAD_DIM, unif_pos_t, NULL, NULL, 0u,
+                                            /* C1: drafter block stays eager (inline args) */ NULL, UINT32_MAX) != 0;
         }
         /* inverse-rope heads at TRUE positions */
         if (ok) { stage = "inv_rope"; ok = ds4_gpu_rope_tail_tensor(g->batch_heads, B, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT,
@@ -18978,7 +19105,8 @@ static bool metal_graph_eval_dspark_block_ms(
          * attend [Pbank[b]+B-window, Pbank[b]+B-1] of bank b's ring (non-causal block). */
         if (ok) { stage = "attn"; ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads, dspark_model->map, dspark_model->size,
                                             lw->attn_sinks->abs_offset, g->batch_q, rings[li], R, vmaxpos, window, g->raw_cap, 0u, window,
-                                            DS4_N_HEAD, DS4_N_HEAD_DIM, unif_pos_t, seq_id_t, NULL, 0u) != 0; }
+                                            DS4_N_HEAD, DS4_N_HEAD_DIM, unif_pos_t, seq_id_t, NULL, 0u,
+                                            /* C1: drafter block stays eager (inline args) */ NULL, UINT32_MAX) != 0; }
         if (ok) { stage = "inv_rope"; ok = ds4_gpu_rope_tail_tensor(g->batch_heads, R, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, true_pos_t, 0, true, freq_base, freq_scale, 0.0f, 1.0f, DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0; }
         if (ok) { stage = "out_proj"; ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out, g->batch_attn_low, g->batch_group_tmp, g->batch_low_tmp,
                                             dspark_model->map, dspark_model->size, lw->attn_output_a->abs_offset, lw->attn_output_b->abs_offset,
@@ -28464,6 +28592,172 @@ static double   g_cont_be_emb_s   = 0.0;
 static double   g_cont_be_enc_s   = 0.0;
 static double   g_cont_be_syn_s   = 0.0;
 
+/* =========================================================================
+ * C1 (cont capture): step eligibility + substrate publish + VMM prepare.
+ *
+ * A step qualifies for per-layer graph capture when it has the SINGLE-BANK
+ * multiseq decode shape: every row belongs to one live bank, consecutive
+ * positions, emit-in-forward on, no deferral/rollback/admission/ragged
+ * modes, no fork boundary pending, and no diagnostic env that syncs or
+ * dumps inside the layer bodies.  C1a further restricts to width 1 (the
+ * plain cont decode step); the DSpark verify shape (width D+1, rollback
+ * capture) is C1b.
+ *
+ * For a qualifying step, BEFORE ds4_gpu_begin_commands:
+ *   1. publish the decode-scalars substrate with the EXACT window values
+ *      the eager kernel args would carry (same helper, same arguments);
+ *   2. publish the 43-entry per-layer scalars: post-emit visible counts
+ *      (the body's max-over-banks formula, verbatim) + pre-emit GLOBAL
+ *      emit rows (bank*comp_cap + local);
+ *   3. demand-map (ensure_rows) every cache/mirror row this step's emits
+ *      will write -- VMM driver calls cannot run inside a replayed graph;
+ *   4. pre-warm the fp8/fp4 emit scratches so their pointers are stable
+ *      before the first capture.
+ * ========================================================================= */
+static int metal_graph_cont_capture_env_blocked(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("DS4_LAYER_STAGE_SYNC") != NULL ||
+             getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL ||
+             getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL ||
+             getenv("DS4_METAL_Q_STAGE_PROFILE") != NULL ||
+             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
+             getenv("DS4_CUDA_LAYER_GRAPHS_HASH_DUMP") != NULL) ? 1 : 0;
+        if (v && ds4_cuda_cont_graphs_enabled()) {
+            fprintf(stderr, "ds4: DS4_CONT_CAPTURE disabled this run (a stage-sync/"
+                            "profile/dump diagnostic env is set)\n");
+        }
+    }
+    return v;
+}
+
+/* Post-emit visible-count maxes, the body's formula verbatim (max over ALL
+ * banks' counters, with THIS step's emits applied to the live bank).  Using
+ * g->layer_n_comp[il] instead would go stale-high after a rollback and
+ * break bit-parity with the eager body's recompute. */
+static void metal_graph_cont_capture_counts(
+        const ds4_gpu_graph *g,
+        uint32_t              il,
+        uint32_t              bank,
+        uint32_t              emits,
+        uint32_t             *out_n_comp_post,
+        uint32_t             *out_n_index_post) {
+    uint32_t mxc = 0, mxi = 0;
+    for (uint32_t s2 = 0; s2 < g->batch_n_seq; s2++) {
+        uint32_t c = g->ms_n_comp[s2][il] + (s2 == bank ? emits : 0u);
+        uint32_t i = g->ms_n_index_comp[s2][il] + (s2 == bank ? emits : 0u);
+        if (c > mxc) mxc = c;
+        if (i > mxi) mxi = i;
+    }
+    *out_n_comp_post = mxc;
+    *out_n_index_post = mxi;
+}
+
+/* Publish + prepare for a qualifying step.  Returns false on infrastructure
+ * failure (substrate init / VMM map); the caller then clears the capture
+ * flag and runs the step fully eager (the body's own ensure_rows calls
+ * will retry and report). */
+static bool metal_graph_cont_capture_prepare(
+        ds4_gpu_graph *g,
+        uint32_t        bank,
+        uint32_t        pos0,
+        uint32_t        n,
+        int             token0,
+        uint32_t       *cap_ncomp,   /* [DS4_N_LAYER] post-emit attn counts */
+        uint32_t       *cap_nidx) {  /* [DS4_N_LAYER] post-emit index counts */
+    if (ds4_gpu_decode_scalars_init() == 0 ||
+        ds4_gpu_decode_layer_scalars_init() == 0) return false;
+    /* 1. Token-stable window scalars -- SAME helper + arguments as the
+     * multiseq attention body (raw_span_n=1, raw_span_last=pos0), so the
+     * substrate reads reproduce the eager inline args bit-for-bit. */
+    uint32_t n_raw = 0, raw_start = 0;
+    metal_graph_raw_window_for_batch(g, pos0, 1u, pos0, &n_raw, &raw_start);
+    ds4_gpu_decode_scalars_set_ext(pos0,
+                                     g->raw_cap ? pos0 % g->raw_cap : 0u,
+                                     raw_start,
+                                     n_raw,
+                                     0u,                 /* n_comp: per-layer substrate */
+                                     pos0 % 4u,          /* emit_phase (ratio-4 cadence) */
+                                     0u,
+                                     (uint32_t)token0);
+    if (ds4_gpu_decode_scalars_flush() == 0) return false;
+    /* 2 + 3. Per-layer scalars + demand-map this step's emit rows. */
+    const uint32_t first_pos = pos0 - (n - 1u);   /* rows are consecutive (eligibility) */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0u) {
+            cap_ncomp[il] = 0u;
+            cap_nidx[il]  = 0u;
+            ds4_gpu_decode_layer_scalars_set(il, 0u, 0u, 0u, 0u);
+            continue;
+        }
+        /* Rows [first_pos, first_pos+n) emit where they close a ratio group. */
+        uint32_t emits = 0u;
+        for (uint32_t t = 0; t < n; t++)
+            if (((first_pos + t + 1u) % ratio) == 0u) emits++;
+        const uint32_t pre_local = g->ms_n_comp[bank][il];
+        const uint32_t pre_idx   = g->ms_n_index_comp[bank][il];
+        const uint64_t row_g     = (uint64_t)bank * g->layer_comp_cap[il] + pre_local;
+        const uint64_t idx_row_g = (uint64_t)bank * g->layer_comp_cap[il] + pre_idx;
+        metal_graph_cont_capture_counts(g, il, bank, emits,
+                                        &cap_ncomp[il], &cap_nidx[il]);
+        ds4_gpu_decode_layer_scalars_set(il,
+                                            cap_ncomp[il],
+                                            ratio == 4u ? cap_nidx[il] : 0u,
+                                            (uint32_t)row_g,
+                                            ratio == 4u ? (uint32_t)idx_row_g : 0u);
+        if (emits) {
+            /* Attn compressed rows: fp8-primary packs the mirror; F32-primary
+             * writes the cache slab.  Map whichever the emits will touch. */
+            if (g->layer_comp_cache_fp8[il]) {
+                if (!metal_graph_cache_ensure_rows(g->layer_comp_cache_fp8[il],
+                         row_g, emits, DS4_OPP_C_FP8_ROW_BYTES,
+                         "cont-capture fp8 emit", il) ||
+                    !metal_graph_cache_ensure_rows(g->layer_comp_scale[il],
+                         row_g, emits, DS4_OPP_C_FP8_SCALE_BYTES,
+                         "cont-capture fp8 scale emit", il)) return false;
+            } else if (!DS4_GPU_ATTN_COMP_CACHE_F16) {
+                if (!metal_graph_cache_ensure_rows(g->layer_attn_comp_cache[il],
+                         row_g, emits, (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                         "cont-capture comp emit", il)) return false;
+            }
+            if (ratio == 4u) {
+                if (g->layer_index_comp_cache_fp4[il]) {
+                    if (!metal_graph_cache_ensure_rows(g->layer_index_comp_cache_fp4[il],
+                             idx_row_g, emits, DS4_INDEXER_FP4_ROW_BYTES,
+                             "cont-capture fp4 index emit", il) ||
+                        !metal_graph_cache_ensure_rows(g->layer_index_comp_scale[il],
+                             idx_row_g, emits, DS4_INDEXER_FP4_SCALE_BYTES,
+                             "cont-capture fp4 scale emit", il)) return false;
+                } else {
+                    if (!metal_graph_cache_ensure_rows(g->layer_index_comp_cache[il],
+                             idx_row_g, emits, (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                             "cont-capture index emit", il)) return false;
+                }
+            }
+        }
+    }
+    if (ds4_gpu_decode_layer_scalars_flush() == 0) return false;
+    /* 4. Scratch prewarm: stable pointers before the first capture (the
+     * cached fast path makes this free on every later step). */
+    if (!DS4_GPU_ATTN_COMP_CACHE_F16) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (g->layer_comp_cache_fp8[il]) {
+                if (!metal_graph_comp_emit_scratch(g, 1u)) return false;
+                break;
+            }
+        }
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (g->layer_index_comp_cache_fp4[il]) {
+                if (!metal_graph_index_emit_scratch(g, 1u)) return false;
+                break;
+            }
+        }
+    }
+    (void)n;
+    return true;
+}
+
 static bool metal_graph_batch_eval_logits(
         ds4_gpu_graph     *g,
         const ds4_model   *model,
@@ -28516,16 +28810,168 @@ static bool metal_graph_batch_eval_logits(
      * il==0 inside the attention-batch fn).  At n=1 / consecutive positions this
      * is bit-identical to the scalar path; it exercises the array read so Step 3
      * can make positions per-seq independent. */
+
+    /* ---- C1 (cont capture) step eligibility -------------------------------
+     * See the helper block above metal_graph_batch_eval_logits.  When the
+     * step qualifies, publish the substrates + map the emit rows, then wrap
+     * each layer body in the cont graph cache's warm/capture/replay protocol.
+     * Any failure downgrades to the fully-eager step (bit-identical). */
+    uint32_t cap_ncomp[DS4_MAX_LAYER] = {0};
+    uint32_t cap_nidx[DS4_MAX_LAYER] = {0};
+    uint32_t cap_bank = 0;
+    uint32_t cap_nraw = 0, cap_rawstart = 0;
+    g->batch_capture_step = false;
+    if (ds4_cuda_cont_graphs_enabled() != 0 &&
+        !metal_graph_cont_capture_env_blocked() &&
+        !DS4_GPU_ATTN_COMP_CACHE_F16 &&
+        n <= 8u &&                    /* width 1 = plain cont; 1+D = DSpark/MTP verify */
+        pos0 != 0u && pos0 >= n - 1u &&
+        g->batch_multiseq && g->batch_multiseq_prefilled && g->batch_multiseq_emit &&
+        !g->batch_defer_comp_store &&
+        !g->batch_admit_fast && !g->batch_head_last_only &&
+        g->batch_max_seq_len == 0u && g->batch_draft_n_raw == NULL &&
+        g->ms_seq_id[0] >= 0 && (uint32_t)g->ms_seq_id[0] < DS4_MULTISEQ_MAX_SEQ &&
+        (uint32_t)g->ms_positions[n - 1u] == pos0) {
+        cap_bank = (uint32_t)g->ms_seq_id[0];
+        bool elig = g->ms_emit_keep[cap_bank] == 0u;
+        /* C1b: multi-row steps must be ONE bank's consecutive positions (the
+         * DSpark/MTP verify shape: committed row + D drafts).  The per-row
+         * pos/emit-row deltas baked into the captured bodies are constants of
+         * that shape; anything else (multi-live plain steps) stays eager. */
+        for (uint32_t t = 0; elig && t < n; t++) {
+            if ((uint32_t)g->ms_seq_id[t] != cap_bank ||
+                g->ms_positions[t] != g->ms_positions[0] + (int32_t)t) elig = false;
+        }
+        /* Rollback-capture steps checkpoint per row keyed on ms_vdepth; the
+         * captured D2D copy nodes bake (depth, bank) so vdepth must be the
+         * canonical single-bank layout (depth == row index). */
+        if (elig && g->batch_rollback_capture) {
+            for (uint32_t t = 0; elig && t < n; t++)
+                if (g->ms_vdepth[t] != (int32_t)t) elig = false;
+        }
+        if (elig) {
+            /* The live-sized chunked topk tier (> 8192 compressed rows) has
+             * no capture-stable grid; leave long-context steps eager. */
+            for (uint32_t il = 0; elig && il < DS4_N_LAYER; il++) {
+                if (ds4_layer_compress_ratio(il) == 0u) continue;
+                uint32_t nc, ni;
+                metal_graph_cont_capture_counts(g, il, cap_bank, 2u, &nc, &ni);
+                if (nc > 8192u || ni > 8192u) elig = false;
+            }
+        }
+        if (elig && metal_graph_cont_capture_prepare(g, cap_bank, pos0, n,
+                                                     tokens[0], cap_ncomp, cap_nidx)) {
+            metal_graph_raw_window_for_batch(g, pos0, 1u, pos0,
+                                             &cap_nraw, &cap_rawstart);
+            g->batch_capture_step = true;
+            g->batch_capture_bank = cap_bank;
+        }
+    }
+
     g->batch_use_positions = true;
     const uint32_t sp_fwd = ds4_gpu_stage_prof_begin(DS4_SPROF_FWD);
     ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        ok = metal_graph_encode_layer_batch(g,
-                                            model,
-                                            &weights->layer[il],
-                                            il,
-                                            pos0,
-                                            n);
+        int cap_rc = -1;
+        const uint32_t il_ratio = ds4_layer_compress_ratio(il);
+        uint32_t cap_emit_mask = 0u;
+        if (g->batch_capture_step && il_ratio != 0u) {
+            const uint32_t first = pos0 - (n - 1u);
+            for (uint32_t t = 0; t < n; t++)
+                if (((first + t + 1u) % il_ratio) == 0u) cap_emit_mask |= (1u << t);
+        }
+        const bool cap_emit_il = cap_emit_mask != 0u;
+        if (g->batch_capture_step) {
+            struct ds4_cont_graph_key ck;
+            memset(&ck, 0, sizeof(ck));
+            ck.il    = il;
+            ck.width = n;
+            ck.bank  = cap_bank;
+            const bool cap_indexed = il_ratio == 4u &&
+                                     cap_ncomp[il] > DS4_N_INDEXER_TOP_K;
+            ck.flags = (cap_emit_il          ? 1u  : 0u)
+                     | (cap_indexed          ? 2u  : 0u)
+                     | (il_ratio != 0u       ? 4u  : 0u)
+                     | (il_ratio == 4u       ? 8u  : 0u)
+                     | (cap_rawstart != 0u   ? 16u : 0u)
+                     | (g->batch_rollback_capture ? 32u : 0u)
+                     | (cap_emit_mask << 8);          /* per-row emit mask */
+            ck.n_comp_band = cap_indexed
+                ? metal_graph_cont_capture_band(cap_ncomp[il]) : 0u;
+            ck.cur_hc            = (void *)ds4_gpu_tensor_ptr(g->batch_cur_hc);
+            ck.next_hc           = (void *)ds4_gpu_tensor_ptr(g->batch_next_hc);
+            ck.raw_cache         = (void *)ds4_gpu_tensor_ptr(g->layer_raw_cache[il]);
+            ck.comp_cache        = (void *)ds4_gpu_tensor_ptr(g->layer_attn_comp_cache[il]);
+            ck.index_comp_cache  = (void *)ds4_gpu_tensor_ptr(g->layer_index_comp_cache[il]);
+            ck.comp_cache_fp8    = (void *)ds4_gpu_tensor_ptr(g->layer_comp_cache_fp8[il]);
+            ck.comp_scale        = (void *)ds4_gpu_tensor_ptr(g->layer_comp_scale[il]);
+            ck.index_fp4         = (void *)ds4_gpu_tensor_ptr(g->layer_index_comp_cache_fp4[il]);
+            ck.index_scale       = (void *)ds4_gpu_tensor_ptr(g->layer_index_comp_scale[il]);
+            ck.attn_state_kv     = (void *)ds4_gpu_tensor_ptr(g->layer_attn_state_kv[il]);
+            ck.attn_state_score  = (void *)ds4_gpu_tensor_ptr(g->layer_attn_state_score[il]);
+            ck.index_state_kv    = (void *)ds4_gpu_tensor_ptr(g->layer_index_state_kv[il]);
+            ck.index_state_score = (void *)ds4_gpu_tensor_ptr(g->layer_index_state_score[il]);
+            ck.comp_emit_scratch  = (void *)ds4_gpu_tensor_ptr(g->comp_emit_scratch);
+            ck.index_emit_scratch = (void *)ds4_gpu_tensor_ptr(g->index_emit_scratch);
+            ck.positions         = (void *)ds4_gpu_tensor_ptr(g->batch_positions);
+            ck.seq_id            = (void *)ds4_gpu_tensor_ptr(g->batch_seq_id);
+            ck.comp_selected     = (void *)ds4_gpu_tensor_ptr(g->comp_selected);
+            ck.indexer_scores    = (void *)ds4_gpu_tensor_ptr(g->indexer_scores);
+            ck.batch_heads       = (void *)ds4_gpu_tensor_ptr(g->batch_heads);
+            cap_rc = ds4_cuda_cont_graph_begin_or_replay(il, &ck);
+        }
+        if (cap_rc != 1) {
+            ok = metal_graph_encode_layer_batch(g,
+                                                model,
+                                                &weights->layer[il],
+                                                il,
+                                                pos0,
+                                                n);
+            /* Close the capture even on encode failure -- otherwise the next
+             * layer's begin refuses with "capture already in flight". */
+            if (cap_rc == 0) ds4_cuda_cont_graph_end_or_commit(il);
+        } else {
+            /* Replay served the whole layer body: advance the host state the
+             * skipped body would have advanced, row by row in body order.
+             * Counter refresh mirrors the body's unconditional max-over-banks
+             * recompute (load-bearing after a rollback lowers a bank's
+             * counters).  On rollback-capture steps the body also records the
+             * per-depth checkpoint counters AFTER each row's emit; the D2D
+             * state copies themselves are inside the replayed graph. */
+            if (il_ratio != 0u) {
+                uint32_t cnt  = g->ms_n_comp[cap_bank][il];
+                uint32_t icnt = g->ms_n_index_comp[cap_bank][il];
+                for (uint32_t t = 0; t < n; t++) {
+                    if (cap_emit_mask & (1u << t)) {
+                        cnt++;
+                        if (il_ratio == 4u) icnt++;
+                    }
+                    if (g->batch_rollback_capture) {
+                        const uint32_t depth = (uint32_t)g->ms_vdepth[t];
+                        if (depth < DS4_MTP_RB_DEPTH) {
+                            if (g->mtp_rb_askv[depth][il] && g->mtp_rb_assc[depth][il])
+                                g->mtp_rb_n_comp[depth][cap_bank][il] = cnt;
+                            if (il_ratio == 4u &&
+                                g->mtp_rb_iskv[depth][il] && g->mtp_rb_issc[depth][il])
+                                g->mtp_rb_n_index_comp[depth][cap_bank][il] = icnt;
+                        }
+                    }
+                }
+                g->ms_n_comp[cap_bank][il] = cnt;
+                if (il_ratio == 4u) g->ms_n_index_comp[cap_bank][il] = icnt;
+                uint32_t mxc = 0, mxi = 0;
+                for (uint32_t s2 = 0; s2 < g->batch_n_seq; s2++) {
+                    if (g->ms_n_comp[s2][il] > mxc) mxc = g->ms_n_comp[s2][il];
+                    if (g->ms_n_index_comp[s2][il] > mxi) mxi = g->ms_n_index_comp[s2][il];
+                }
+                g->layer_n_comp[il] = mxc;
+                if (il_ratio == 4u) g->layer_n_index_comp[il] = mxi;
+            }
+            /* The body's end-of-layer hc ping-pong swap. */
+            ds4_gpu_tensor *tmp = g->batch_cur_hc;
+            g->batch_cur_hc = g->batch_next_hc;
+            g->batch_next_hc = tmp;
+        }
         /* D4.5c inline target-hidden capture: after layers 40/41/42 snapshot the
          * mean-HC hidden into dspark_concat[*,slot*n_embd] (slot 0/1/2).  Stream-
          * ordered after this layer's encode, before the next overwrites batch_cur_hc.
@@ -28536,6 +28982,10 @@ static bool metal_graph_batch_eval_logits(
                                                     DS4_N_EMBD, DS4_N_HC, n,
                                                     il - DS4_DSPARK_CAP_LAYER0, DS4_DSPARK_N_LAYER) != 0;
         }
+    }
+    if (g->batch_capture_step) {
+        g->batch_capture_step = false;
+        ds4_cuda_cont_graph_stats_maybe_print(512u);
     }
     g->batch_use_positions = false;
     const double be_t_enc = g_cont_prof ? now_sec() : 0.0;

@@ -283,8 +283,9 @@ static struct ds4_decode_scalars *g_decode_dev  = NULL;  /* cudaMalloc */
 /* PC2: row-field selector for ds4_gpu_compressor_update_tensor.  Mirrors
  * the macros in ds4_gpu.h; defined locally because ds4_cuda.cu doesn't
  * include the header (carries its own extern "C" signatures inline). */
-#define DS4_COMPRESSOR_ROW_COMP   0
-#define DS4_COMPRESSOR_ROW_INDEX  1
+#define DS4_COMPRESSOR_ROW_COMP     0
+#define DS4_COMPRESSOR_ROW_INDEX    1
+#define DS4_COMPRESSOR_ROW_SCRATCH0 2  /* C1: substrate pos, fixed row 0 (scratch) */
 
 struct ds4_layer_scalars {
     uint32_t n_comp;       /* attention compressed count, post-emit */
@@ -1324,6 +1325,31 @@ extern "C" void ds4_gpu_decode_scalars_set(
     /* comp_row / index_row are NOT touched here -- they're set per-emit by
      * ds4_gpu_decode_scalars_set_emit_rows() and remain valid across the
      * non-emit per-layer steps too (kernels just won't read them). */
+    g_decode_host->flags      = flags;
+    g_decode_host->token      = token;
+}
+
+/* C1 (cont capture): explicit-window variant.  The batched multiseq step
+ * computes its raw read-window on the host (metal_graph_raw_window_for_batch
+ * semantics, including the raw_cap clamp) and publishes those EXACT values,
+ * so substrate-mode kernels reproduce the eager inline args bit-for-bit.
+ * comp_row/index_row stay untouched (per-layer substrate carries rows). */
+extern "C" void ds4_gpu_decode_scalars_set_ext(
+        uint32_t pos0,
+        uint32_t raw_row,
+        uint32_t raw_start,
+        uint32_t n_raw,
+        uint32_t n_comp,
+        uint32_t emit_phase,
+        uint32_t flags,
+        uint32_t token) {
+    if (g_decode_host == NULL) return;
+    g_decode_host->pos0       = pos0;
+    g_decode_host->raw_row    = raw_row;
+    g_decode_host->raw_start  = raw_start;
+    g_decode_host->n_raw      = n_raw;
+    g_decode_host->n_comp     = n_comp;
+    g_decode_host->emit_phase = emit_phase;
     g_decode_host->flags      = flags;
     g_decode_host->token      = token;
 }
@@ -2948,6 +2974,21 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         return 0;
     }
     if (bytes == 0) return 1;
+    /* C1 (cont capture): a synchronous cudaMemcpy is illegal inside stream
+     * capture (it would invalidate the capture).  Under an active capture
+     * (thread-local stream override set) record the copy as an async D2D
+     * node on the capture stream instead -- device-side consumers are
+     * stream-ordered either way, and no in-tree caller reads the
+     * destination from the host without an intervening end_commands sync.
+     * Outside capture the historical blocking copy is preserved. */
+    if (ds4_capture_active()) {
+        return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                       (const char *)src->ptr + src_offset,
+                                       (size_t)bytes,
+                                       cudaMemcpyDeviceToDevice,
+                                       ds4_current_stream()),
+                       "tensor copy (captured)");
+    }
     return cuda_ok(cudaMemcpy((char *)dst->ptr + dst_offset,
                               (const char *)src->ptr + src_offset,
                               (size_t)bytes,
@@ -5448,8 +5489,9 @@ __global__ static void rms_norm_weight_layer_row_kernel(
         const float *w,
         uint32_t n,
         const uint32_t * __restrict__ row_ptr_dev,
-        float eps) {
-    const uint32_t row = *row_ptr_dev;
+        float eps,
+        uint32_t row_delta) {  /* C1b: substrate row + key-stable offset */
+    const uint32_t row = (row_ptr_dev ? *row_ptr_dev : 0u) + row_delta;  /* C1: NULL = fixed row 0 (scratch) */
     float *xr = base + (uint64_t)row * n;  /* in-place: dst == src */
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
@@ -5852,7 +5894,8 @@ __global__ static void rope_tail_layer_row_kernel(
         float ext_factor,
         float attn_factor,
         float beta_fast,
-        float beta_slow) {
+        float beta_slow,
+        uint32_t row_delta) {  /* C1b: substrate row + key-stable offset */
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t pairs = n_rot / 2;
     if (gid >= pairs) return;
@@ -5860,7 +5903,7 @@ __global__ static void rope_tail_layer_row_kernel(
     uint32_t n_nope = head_dim - n_rot;
 
     const uint32_t pos0 = (uint32_t)((int32_t)scalars->pos0 + pos_offset);
-    const uint32_t row  = *row_ptr_dev;
+    const uint32_t row  = (row_ptr_dev ? *row_ptr_dev : 0u) + row_delta;  /* C1: NULL = fixed row 0 (scratch) */
 
     float corr0 = 0.0f, corr1 = 0.0f;
     if (ext_factor != 0.0f) {
@@ -6305,9 +6348,18 @@ __global__ static void fp8_kv_quantize_row_kernel(
         uint32_t n_rot,
         const struct ds4_layer_scalars * __restrict__ ls,
         unsigned char * __restrict__ codes_base,
-        float * __restrict__ scale_base) {
+        float * __restrict__ scale_base,
+        /* C1 (cont capture): fp8-primary scratch source.  Non-NULL = the F32
+         * round-trip works on src row 0 (the shared emit scratch; the bank's
+         * F32 page is write-dead) while the packed mirror rows stay at
+         * ls->comp_row.  NULL = row addressed inside base (serial path). */
+        float * __restrict__ src,
+        /* C1b: key-stable offset from the substrate row (second emit of a
+         * layer within one multi-row step lands at ls->comp_row + 1). */
+        uint32_t row_delta) {
     uint32_t tid = threadIdx.x;
     uint32_t n_nope = head_dim - n_rot;
+    const uint32_t emit_row = ls->comp_row + row_delta;
     /* Opp C Phase 1A: packed-mirror row layout (only used when both base
      * pointers are non-null):
      *   codes_row[0 .. n_nope)               -- 1-byte E4M3 codes
@@ -6318,12 +6370,12 @@ __global__ static void fp8_kv_quantize_row_kernel(
      * for the mirror in that case). */
     const uint64_t row_stride = (uint64_t)n_nope + (uint64_t)n_rot * sizeof(float);
     const uint64_t scale_stride = (uint64_t)(n_nope / 64u);
-    float *xr = base + (uint64_t)ls->comp_row * head_dim;
+    float *xr = src ? src : base + (uint64_t)emit_row * head_dim;
     unsigned char *codes_row = codes_base
-        ? codes_base + (uint64_t)ls->comp_row * row_stride
+        ? codes_base + (uint64_t)emit_row * row_stride
         : (unsigned char *)0;
     float *scale_row = scale_base
-        ? scale_base + (uint64_t)ls->comp_row * scale_stride
+        ? scale_base + (uint64_t)emit_row * scale_stride
         : (float *)0;
     __shared__ float scratch[64];
     for (uint32_t off = 0; off < n_nope; off += 64) {
@@ -6432,13 +6484,19 @@ __global__ static void indexer_hadamard_fp4_row_kernel(
          * batch kernel does -- the pack stores whatever value this kernel
          * writes, so the asymmetry is preserved by construction. */
         unsigned char * __restrict__ codes_base,
-        float         * __restrict__ scale_base) {
+        float         * __restrict__ scale_base,
+        /* C1 (cont capture): fp4-primary scratch source; see
+         * fp8_kv_quantize_row_kernel.  Mirror rows stay at ls->index_row. */
+        float * __restrict__ src,
+        /* C1b: key-stable offset from the substrate row. */
+        uint32_t row_delta) {
     uint32_t tid = threadIdx.x;
     if (head_dim != 128u || tid >= 128u) return;
+    const uint32_t emit_row = ls->index_row + row_delta;
 
     __shared__ float vals[128];
     __shared__ float absbuf[128];
-    float *xr = base + (uint64_t)ls->index_row * head_dim;
+    float *xr = src ? src : base + (uint64_t)emit_row * head_dim;
     vals[tid] = xr[tid];
     __syncthreads();
 
@@ -6478,8 +6536,8 @@ __global__ static void indexer_hadamard_fp4_row_kernel(
     if (codes_base) {
         uint32_t nib = (clamp < 0.0f ? 8u : 0u) | (uint32_t)level;
         uint32_t hi  = __shfl_down_sync(0xffffffffu, nib, 1u);
-        if ((tid & 1u) == 0u)  codes_base[(uint64_t)ls->index_row * 64u + (tid >> 1u)] = (unsigned char)(nib | (hi << 4u));
-        if ((tid & 31u) == 0u) scale_base[(uint64_t)ls->index_row * 4u + (tid >> 5u)] = scale;
+        if ((tid & 1u) == 0u)  codes_base[(uint64_t)emit_row * 64u + (tid >> 1u)] = (unsigned char)(nib | (hi << 4u));
+        if ((tid & 31u) == 0u) scale_base[(uint64_t)emit_row * 4u + (tid >> 5u)] = scale;
     }
 }
 
@@ -9093,9 +9151,16 @@ __global__ static void compressor_store_kernel(
          * arg path; the decode-time caller passes g_decode_dev so the
          * kernel-node arg list bakes a session-stable pointer rather than
          * a per-token literal. */
-        const struct ds4_decode_scalars * __restrict__ s_override) {
+        const struct ds4_decode_scalars * __restrict__ s_override,
+        /* C1b (cont capture, width>1): per-ROW constant offset from
+         * s->pos0.  The multiseq per-row emit loop stores row t at
+         * absolute position pos0_step + (t - (K-1)) relative to the
+         * step's published maxpos; the offset is key-stable (single-bank
+         * consecutive rows), so it bakes as an inline literal while pos0
+         * stays live.  Ignored when s_override is NULL. */
+        int32_t pos_delta) {
     if (s_override) {
-        pos0 = s_override->pos0;
+        pos0 = (uint32_t)((int32_t)s_override->pos0 + pos_delta);
     }
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
@@ -9330,10 +9395,11 @@ __global__ static void compressor_update_pool_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         uint32_t comp_row_inline,
-        const uint32_t * __restrict__ row_ptr_dev) {
+        const uint32_t * __restrict__ row_ptr_dev,
+        uint32_t row_delta) {  /* C1b: substrate row + key-stable offset */
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= head_dim) return;
-    const uint32_t comp_row = row_ptr_dev ? *row_ptr_dev : comp_row_inline;
+    const uint32_t comp_row = (row_ptr_dev ? *row_ptr_dev : comp_row_inline) + row_delta;
     float *row = base + (uint64_t)comp_row * head_dim;
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
@@ -12820,6 +12886,11 @@ static uint32_t                  g_layer_graph_capturing_il   = UINT32_MAX;
  * The layer slots keep `warmed`: the scratch only ever grows, so the
  * lazy-alloc sizing the warm pass established still holds and the next
  * sighting of each key recaptures directly against the new pointer. */
+/* C1: defined after the cont-graph table below; drops every valid cont
+ * exec and reports the count.  Forward decl so the shared invalidator
+ * (which predates the table in this TU) can reach it. */
+static int ds4_cuda_cont_graphs_drop(void);
+
 static void ds4_cuda_invalidate_captured_graphs(const char *why) {
     if (g_layer_graph_capturing_slot != NULL || ds4_capture_active()) {
         /* Should be unreachable (see header comment); refuse to destroy
@@ -12829,6 +12900,7 @@ static void ds4_cuda_invalidate_captured_graphs(const char *why) {
         return;
     }
     int n = 0;
+    n += ds4_cuda_cont_graphs_drop();
     for (uint32_t i = 0; i < DS4_LAYER_GRAPH_CACHE_SIZE; i++) {
         if (!g_layer_graphs[i].valid) continue;
         cudaGraphExecDestroy(g_layer_graphs[i].exec);
@@ -13086,6 +13158,260 @@ extern "C" void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
         return;
     }
     ds4_cuda_moe_stream_sync_post(s);
+}
+
+/* =====================================================================
+ * C1: continuous-batch per-layer graph cache.
+ *
+ * Same warm -> capture -> replay protocol and stream discipline as the
+ * serial cache above, over a SEPARATE direct-mapped table keyed by
+ * struct ds4_cont_graph_key (width/bank/emit-topology/band + baked
+ * tensor bases; see ds4_gpu.h).  Kept separate so the two hot key
+ * populations (serial n_tok=1/2 and cont width/bank/emit variants)
+ * never evict each other, and so the serial table's size/hash tuning
+ * stays untouched.
+ * ===================================================================== */
+
+/* Local mirror of the public decl (this TU doesn't include ds4_gpu.h). */
+struct ds4_cont_graph_key {
+    uint32_t il;
+    uint32_t width;
+    uint32_t bank;
+    uint32_t flags;
+    uint32_t n_comp_band;
+    uint32_t _pad;
+    void    *cur_hc;
+    void    *next_hc;
+    void    *raw_cache;
+    void    *comp_cache;
+    void    *index_comp_cache;
+    void    *comp_cache_fp8;
+    void    *comp_scale;
+    void    *index_fp4;
+    void    *index_scale;
+    void    *attn_state_kv;
+    void    *attn_state_score;
+    void    *index_state_kv;
+    void    *index_state_score;
+    void    *comp_emit_scratch;
+    void    *index_emit_scratch;
+    void    *positions;
+    void    *seq_id;
+    void    *comp_selected;
+    void    *indexer_scores;
+    void    *batch_heads;
+};
+static_assert(sizeof(struct ds4_cont_graph_key) == 184u,
+              "ds4_cont_graph_key must match ds4_gpu.h decl (24 B header + 20 ptrs)");
+
+struct cont_graph_entry {
+    struct ds4_cont_graph_key key;
+    cudaGraphExec_t             exec;
+    int                         valid;
+    int                         warmed;
+    uint64_t                    hits;
+};
+
+/* Hot population at steady state: 43 layers x 2 hc parities x emit/no-emit
+ * x live bands ~ 350 for width-1 + ~350 for the width-5 verify variants.
+ * 2048 direct-mapped slots keep the collision-eviction ping-pong risk low
+ * (a collision costs a recapture cycle, not correctness). */
+#define DS4_CONT_GRAPH_CACHE_SIZE 2048u
+static struct cont_graph_entry g_cont_graphs[DS4_CONT_GRAPH_CACHE_SIZE];
+
+static struct cont_graph_entry *g_cont_graph_capturing_slot = NULL;
+static uint32_t                 g_cont_graph_capturing_il   = UINT32_MAX;
+
+static uint64_t g_cont_graph_n_replay  = 0;
+static uint64_t g_cont_graph_n_capture = 0;
+static uint64_t g_cont_graph_n_warm    = 0;
+
+extern "C" int ds4_cuda_cont_graphs_enabled(void) {
+    /* Default ON as of 2026-07-06 (C1 capture arc).  Gates on GB10 sm_121:
+     *   - CONT_MTP_GATE deterministic token-identity PASS OFF and ON at
+     *     D=0/2/4 incl. the DS4_CONT_MTP_ACCEPT frontier/stream-invariance
+     *     + byte-exact rollback-restore arm (capm3gate15/capm3d15/capm3acc15);
+     *   - gsm8k 120 + mbpp 40 slices through the fully-captured plain cont
+     *     path in baseline band (capeval33);
+     *   - perf: plain cont width-1 58.3 -> 54.0 ms/tok; DSpark ship config
+     *     verify 114.9 -> 106.1 ms/step (45.1 -> ~41.6 ms/tok accept-
+     *     normalized, 37.8 observed) with zero fallbacks (capverify15).
+     * Ineligible shapes (multi-live banks, ragged/admission, fork boundary,
+     * >8192 compressed rows, diag envs) fall back to the eager encode per
+     * step by construction.  Opt-out for diagnostics: DS4_CONT_CAPTURE=0. */
+    static int init = 0;
+    static int enabled = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CONT_CAPTURE");
+        if (s && *s &&
+            (strcmp(s, "0") == 0 ||
+             strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+             strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+             strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0)) {
+            enabled = 0;
+            fprintf(stderr, "ds4: DS4_CONT_CAPTURE=%s -- continuous-batch "
+                            "graph capture disabled\n", s);
+        } else {
+            fprintf(stderr, "ds4: continuous-batch per-layer graph capture armed"
+                            " (default ON; DS4_CONT_CAPTURE=0 to disable)\n");
+        }
+    }
+    return enabled;
+}
+
+static struct cont_graph_entry *cont_graph_slot(const struct ds4_cont_graph_key *k) {
+    /* FNV-1a over the key bytes (same recipe as moe_graph_hash). */
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const uint8_t *p = (const uint8_t *)k;
+    for (size_t i = 0; i < sizeof(*k); i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return &g_cont_graphs[h % DS4_CONT_GRAPH_CACHE_SIZE];
+}
+
+extern "C" int ds4_cuda_cont_graph_begin_or_replay(
+        uint32_t il,
+        const struct ds4_cont_graph_key *key) {
+    if (!ds4_cuda_cont_graphs_enabled()) return -1;
+    if (il >= DS4_LAYER_SCALARS_COUNT || !key) return -1;
+    ds4_cuda_capture_warm_tmp_scratch();
+    if (g_cont_graph_capturing_slot != NULL || g_layer_graph_capturing_slot != NULL) {
+        fprintf(stderr, "ds4: cont_graph begin_or_replay with a capture already "
+                        "in flight (il=%u)\n", il);
+        return -1;
+    }
+    cudaStream_t s = ds4_cuda_moe_stream();
+    if (!s) return -1;
+
+    struct cont_graph_entry *slot = cont_graph_slot(key);
+    if (slot->valid && memcmp(&slot->key, key, sizeof(*key)) == 0) {
+        ds4_cuda_moe_stream_sync_pre(s);
+        cudaError_t ge = cudaGraphLaunch(slot->exec, s);
+        if (ge != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaGraphLaunch (cont layer %u) failed: %s; recapturing\n",
+                    il, cudaGetErrorString(ge));
+            cudaGraphExecDestroy(slot->exec);
+            slot->valid = 0;
+            slot->hits = 0;
+            /* fall through to warm/capture below */
+        } else {
+            ds4_cuda_moe_stream_sync_post(s);
+            slot->hits++;
+            g_cont_graph_n_replay++;
+            return 1;
+        }
+    }
+
+    /* Warm pass: first sighting of a key runs eagerly so lazy scratch
+     * (cuda_tmp, cublas workspace, emit scratch) reaches its high-water
+     * before anything is recorded.  Second sighting captures. */
+    if (!slot->warmed || memcmp(&slot->key, key, sizeof(*key)) != 0) {
+        if (slot->valid) {
+            cudaGraphExecDestroy(slot->exec);
+            slot->valid = 0;
+            slot->hits = 0;
+        }
+        memcpy(&slot->key, key, sizeof(*key));
+        slot->warmed = 1;
+        g_cont_graph_n_warm++;
+        return -1;
+    }
+    if (slot->valid) {
+        cudaGraphExecDestroy(slot->exec);
+        slot->valid = 0;
+        slot->hits = 0;
+    }
+    memcpy(&slot->key, key, sizeof(*key));
+    /* Global mode: the Step 7 determinism finding (009b1b2) applies here
+     * unchanged -- all GPU dispatch is single-threaded. */
+    cudaError_t ge = cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
+    if (ge != cudaSuccess) {
+        fprintf(stderr, "ds4: cudaStreamBeginCapture (cont layer %u) failed: %s\n",
+                il, cudaGetErrorString(ge));
+        return -1;
+    }
+    ds4_capture_set_stream(s);
+    g_cont_graph_capturing_slot = slot;
+    g_cont_graph_capturing_il   = il;
+    return 0;
+}
+
+extern "C" void ds4_cuda_cont_graph_end_or_commit(uint32_t il) {
+    struct cont_graph_entry *slot = g_cont_graph_capturing_slot;
+    if (slot == NULL || g_cont_graph_capturing_il != il) return;
+    g_cont_graph_capturing_slot = NULL;
+    g_cont_graph_capturing_il   = UINT32_MAX;
+
+    cudaStream_t s = ds4_cuda_moe_stream();
+    cudaGraph_t graph = NULL;
+    cudaError_t ge = cudaStreamEndCapture(s, &graph);
+    ds4_capture_set_stream((cudaStream_t)0);
+    if (ge != cudaSuccess) {
+        fprintf(stderr, "ds4: cudaStreamEndCapture (cont layer %u) failed: %s\n",
+                il, cudaGetErrorString(ge));
+        slot->valid = 0;
+        slot->hits = 0;
+        return;
+    }
+    cudaGraphExec_t exec = NULL;
+    ge = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    cudaGraphDestroy(graph);
+    if (ge != cudaSuccess) {
+        fprintf(stderr, "ds4: cudaGraphInstantiate (cont layer %u) failed: %s\n",
+                il, cudaGetErrorString(ge));
+        slot->valid = 0;
+        slot->hits = 0;
+        return;
+    }
+    slot->exec  = exec;
+    slot->valid = 1;
+    slot->hits  = 0;
+    g_cont_graph_n_capture++;
+
+    ds4_cuda_moe_stream_sync_pre(s);
+    ge = cudaGraphLaunch(exec, s);
+    if (ge != cudaSuccess) {
+        fprintf(stderr, "ds4: cudaGraphLaunch (cont layer %u, first replay) failed: %s\n",
+                il, cudaGetErrorString(ge));
+        cudaGraphExecDestroy(exec);
+        slot->valid = 0;
+        return;
+    }
+    ds4_cuda_moe_stream_sync_post(s);
+}
+
+static int ds4_cuda_cont_graphs_drop(void) {
+    int n = 0;
+    for (uint32_t i = 0; i < DS4_CONT_GRAPH_CACHE_SIZE; i++) {
+        if (!g_cont_graphs[i].valid) continue;
+        cudaGraphExecDestroy(g_cont_graphs[i].exec);
+        g_cont_graphs[i].valid = 0;
+        g_cont_graphs[i].hits = 0;
+        n++;
+    }
+    return n;
+}
+
+extern "C" void ds4_cuda_cont_graph_stats_maybe_print(uint32_t every) {
+    static int en = -1;
+    static uint64_t last = 0;
+    if (en < 0) en = getenv("DS4_CONT_CAPTURE_STATS") != NULL ? 1 : 0;
+    if (!en || every == 0) return;
+    /* Called once per captured step (~43 replays); print on the first step
+     * that crosses each `every` boundary. */
+    if (g_cont_graph_n_replay >= last + every) {
+        last = g_cont_graph_n_replay;
+        fprintf(stderr, "ds4: CONT_CAPTURE stats: replays=%llu captures=%llu warms=%llu\n",
+                (unsigned long long)g_cont_graph_n_replay,
+                (unsigned long long)g_cont_graph_n_capture,
+                (unsigned long long)g_cont_graph_n_warm);
+    }
+}
+
+extern "C" void ds4_gpu_invalidate_captured_graphs(const char *why) {
+    ds4_cuda_invalidate_captured_graphs(why);
 }
 
 /* MTP verifier Q8_0 kernel selection (formerly the "Bug 2 / Option D" gate).
@@ -15140,18 +15466,22 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         uint32_t n_rot,
         uint32_t il,
         ds4_gpu_tensor *codes_mirror,
-        ds4_gpu_tensor *scale_mirror) {
-    if (!base || g_layer_dev == NULL || n_rot > head_dim ||
+        ds4_gpu_tensor *scale_mirror,
+        ds4_gpu_tensor *src,
+        uint32_t row_delta) {
+    if ((!base && !src) || g_layer_dev == NULL || n_rot > head_dim ||
         il >= DS4_LAYER_SCALARS_COUNT ||
-        base->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+        (base && base->bytes < (uint64_t)head_dim * sizeof(float)) ||
+        (src && src->bytes < (uint64_t)head_dim * sizeof(float))) return 0;
     /* Opp C Phase 1A: mirror buffers are NULL when DS4_CUDA_FP8_KV is off
      * (no allocation) and stable when on (one-shot allocation at session
      * create).  Pass through unconditionally; the kernel branches itself. */
     unsigned char *codes_ptr = codes_mirror ? (unsigned char *)codes_mirror->ptr : (unsigned char *)0;
     float *scale_ptr = scale_mirror ? (float *)scale_mirror->ptr : (float *)0;
     fp8_kv_quantize_row_kernel<<<1, 64, 0, ds4_current_stream()>>>(
-            (float *)base->ptr, head_dim, n_rot,
-            g_layer_dev + il, codes_ptr, scale_ptr);
+            base ? (float *)base->ptr : (float *)0, head_dim, n_rot,
+            g_layer_dev + il, codes_ptr, scale_ptr,
+            src ? (float *)src->ptr : (float *)0, row_delta);
     int ok_fp8 = cuda_ok(cudaGetLastError(), "fp8_kv_quantize_row launch");
     return ok_fp8;
 }
@@ -15248,17 +15578,21 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_row_tensor(
         uint32_t head_dim,
         uint32_t il,
         ds4_gpu_tensor *codes_mirror,
-        ds4_gpu_tensor *scale_mirror) {
-    if (!base || g_layer_dev == NULL || head_dim != 128u ||
+        ds4_gpu_tensor *scale_mirror,
+        ds4_gpu_tensor *src,
+        uint32_t row_delta) {
+    if ((!base && !src) || g_layer_dev == NULL || head_dim != 128u ||
         il >= DS4_LAYER_SCALARS_COUNT ||
-        base->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+        (base && base->bytes < (uint64_t)head_dim * sizeof(float)) ||
+        (src && src->bytes < (uint64_t)head_dim * sizeof(float))) return 0;
     /* P2 Inc3: per-layer baked mirror pointers (g->layer_index_comp_cache_fp4
      * [il] / g->layer_index_comp_scale[il]); NULL when the feature is off. */
     unsigned char *codes_ptr = codes_mirror ? (unsigned char *)codes_mirror->ptr : (unsigned char *)0;
     float *scale_ptr = scale_mirror ? (float *)scale_mirror->ptr : (float *)0;
     indexer_hadamard_fp4_row_kernel<<<1, 128, 0, ds4_current_stream()>>>(
-            (float *)base->ptr, head_dim,
-            g_layer_dev + il, codes_ptr, scale_ptr);
+            base ? (float *)base->ptr : (float *)0, head_dim,
+            g_layer_dev + il, codes_ptr, scale_ptr,
+            src ? (float *)src->ptr : (float *)0, row_delta);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4_row launch");
 }
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, const ds4_gpu_tensor *positions, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
@@ -15551,7 +15885,10 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
          * passes ds4_gpu_decode_scalars_device_ptr(); prefill caller
          * passes NULL (n_tokens > 1 prefill stays inline; C3 in &sect;16
          * is the deferred migration for that path). */
-        const void           *scalars) {
+        const void           *scalars,
+        /* C1b: per-row offset from s->pos0 (see compressor_store_kernel);
+         * ignored when scalars is NULL. */
+        int32_t                pos_delta) {
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
         (ape_type != 0u && ape_type != 1u)) {
@@ -15584,7 +15921,8 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
             ratio,
             pos0,
             n_tokens,
-            (const struct ds4_decode_scalars *)scalars);
+            (const struct ds4_decode_scalars *)scalars,
+            pos_delta);
     return cuda_ok(cudaGetLastError(), "compressor store launch");
 }
 
@@ -15631,7 +15969,16 @@ static int cuda_compressor_update_impl(
          * Step 5's cache-key/validator logic doesn't have to special-
          * case the high-bit packing. */
         uint32_t                il,
-        int                     row_field) {
+        int                     row_field,
+        /* C1b (cont capture, width>1): key-stable per-row offsets.
+         *   pos_delta      -- store/rope position = s->pos0 + pos_delta
+         *                     (row t of a K-row step is at maxpos + t-(K-1)).
+         *   emit_row_delta -- emit-tail row = substrate row + delta (the
+         *                     SECOND emit of a layer within one step lands
+         *                     at ls->comp_row + 1).
+         * Both 0 for every width-1 / serial / eager caller. */
+        int32_t                 pos_delta,
+        uint32_t                emit_row_delta) {
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -15676,7 +16023,8 @@ static int cuda_compressor_update_impl(
         !ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
                                                  model_map, model_size, ape_offset, ape_type,
                                                  head_dim, ratio, pos, 1,
-                                                 use_substrate ? ds4_gpu_decode_scalars_device_ptr() : NULL)) {
+                                                 use_substrate ? ds4_gpu_decode_scalars_device_ptr() : NULL,
+                                                 pos_delta)) {
         return 0;
     }
     if (!emit) return 1;
@@ -15694,12 +16042,23 @@ static int cuda_compressor_update_impl(
      *
      * The R5 audit gate `git grep ds4_gpu_tensor_view ds4_cuda.cu` within
      * this function body returns 0 hits after this commit. */
+    /* C1: SCRATCH0 = substrate-pos store + fixed-row-0 emit tail (the
+     * fp8/fp4-primary continuous emit writes the shared scratch; the packed
+     * mirror pack that follows carries the real row via ls->comp_row).
+     * Requires the substrate (il < count) -- refuse an eager SCRATCH0 call
+     * rather than silently rope with a stale pos. */
+    const int scratch0 = (row_field == DS4_COMPRESSOR_ROW_SCRATCH0);
+    if (scratch0 && !use_substrate) return 0;
     const uint32_t *row_ptr_dev = NULL;
-    if (use_substrate) {
+    if (use_substrate && !scratch0) {
         row_ptr_dev = (row_field == DS4_COMPRESSOR_ROW_INDEX)
             ? &g_layer_dev[il].index_row
             : &g_layer_dev[il].comp_row;
     }
+    /* C1b: the emit-row offset applies to CACHE-row targets only; the
+     * SCRATCH0 mode re-uses scratch row 0 for every emit of the step (the
+     * packed-mirror pack that follows carries the real row + delta). */
+    const uint32_t tail_row_delta = scratch0 ? 0u : emit_row_delta;
     compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)comp_cache->ptr,
             (const float *)state_kv->ptr,
@@ -15707,10 +16066,13 @@ static int cuda_compressor_update_impl(
             head_dim,
             ratio,
             comp_row,
-            row_ptr_dev);
+            row_ptr_dev,
+            tail_row_delta);
     int ok = cuda_ok(cudaGetLastError(), "compressor update pool launch");
     if (ok) {
-        if (row_ptr_dev) {
+        if (use_substrate) {
+            /* row_ptr_dev may be NULL here (SCRATCH0): the row kernels fall
+             * back to fixed row 0, which is exactly the scratch target. */
             const char *w = cuda_model_range_ptr(model_map, norm_offset,
                                                   (uint64_t)head_dim * sizeof(float),
                                                   "compressor_norm");
@@ -15721,7 +16083,8 @@ static int cuda_compressor_update_impl(
                         (const float *)w,
                         head_dim,
                         row_ptr_dev,
-                        rms_eps);
+                        rms_eps,
+                        tail_row_delta);
                 ok = cuda_ok(cudaGetLastError(), "compressor rms_norm row launch");
             }
         } else {
@@ -15745,7 +16108,7 @@ static int cuda_compressor_update_impl(
             ds4_gpu_tensor_free(comp_row_view);
         }
     }
-    if (ok && row_ptr_dev) {
+    if (ok && use_substrate) {
         const void *dev_s = ds4_gpu_decode_scalars_device_ptr();
         if (dev_s == NULL) { ok = 0; }
         else {
@@ -15754,10 +16117,11 @@ static int cuda_compressor_update_impl(
                     head_dim, n_rot,
                     (const struct ds4_decode_scalars *)dev_s,
                     row_ptr_dev,
-                    1 - (int32_t)ratio, /* pos_offset: pos+1-ratio */
+                    pos_delta + 1 - (int32_t)ratio, /* pos_offset: pos+1-ratio */
                     n_ctx_orig, 0,
                     freq_base, freq_scale, ext_factor, attn_factor,
-                    beta_fast, beta_slow);
+                    beta_fast, beta_slow,
+                    tail_row_delta);
             ok = cuda_ok(cudaGetLastError(), "compressor rope_tail row launch");
         }
     }
@@ -15795,12 +16159,15 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         float                   beta_slow,
         float                   rms_eps,
         uint32_t                il,
-        int                     row_field) {
+        int                     row_field,
+        int32_t                 pos_delta,
+        uint32_t                emit_row_delta) {
     return cuda_compressor_update_impl(0, kv_cur, sc_cur, state_kv, state_score, comp_cache,
                                        model_map, model_size, ape_offset, ape_type,
                                        norm_offset, norm_type, head_dim, ratio, pos, comp_row,
                                        n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor,
-                                       attn_factor, beta_fast, beta_slow, rms_eps, il, row_field);
+                                       attn_factor, beta_fast, beta_slow, rms_eps, il, row_field,
+                                       pos_delta, emit_row_delta);
 }
 /* M2-Inc5: emit tail only -- for the fused compressor pair+store path, which
  * has already written state_kv/state_score for this position. */
@@ -15830,12 +16197,15 @@ extern "C" int ds4_gpu_compressor_update_tail_tensor(
         float                   beta_slow,
         float                   rms_eps,
         uint32_t                il,
-        int                     row_field) {
+        int                     row_field,
+        int32_t                 pos_delta,
+        uint32_t                emit_row_delta) {
     return cuda_compressor_update_impl(1, kv_cur, sc_cur, state_kv, state_score, comp_cache,
                                        model_map, model_size, ape_offset, ape_type,
                                        norm_offset, norm_type, head_dim, ratio, pos, comp_row,
                                        n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor,
-                                       attn_factor, beta_fast, beta_slow, rms_eps, il, row_field);
+                                       attn_factor, beta_fast, beta_slow, rms_eps, il, row_field,
+                                       pos_delta, emit_row_delta);
 }
 extern "C" int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,
@@ -16379,7 +16749,12 @@ static int attention_decode_batch_launch(
         /* FB1: caller opt-in for the per-seq heads8-online fast path (the
          * admission-chunk forward).  0 keeps every per-seq caller on the main
          * kernel (bit-exact pre-FB1); single-seq dispatch is unaffected. */
-        uint32_t                allow_mseq_heads8) {
+        uint32_t                allow_mseq_heads8,
+        /* C1 (cont capture): decode-scalars substrate + per-layer index.
+         * Substrate present forces the main kernel (the heads8-online tier
+         * would bake inline window scalars into a captured node). */
+        const void             *scalars,
+        uint32_t                il_for_decode1) {
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -16405,6 +16780,13 @@ static int attention_decode_batch_launch(
      * draft-span override and a wide batch so decode/MTP shapes keep their
      * exact pre-FB1 kernels. */
     const bool perseq = (pos_dev != NULL || seq_dev != NULL);
+    /* C1: resolve the substrate pointers once.  Substrate present forces
+     * the main kernel below (it is the only one that reads them). */
+    const struct ds4_decode_scalars *s_override =
+        (const struct ds4_decode_scalars *)scalars;
+    const struct ds4_layer_scalars *ls_override =
+        (g_layer_dev != NULL && il_for_decode1 < DS4_LAYER_SCALARS_COUNT)
+            ? g_layer_dev + il_for_decode1 : NULL;
     /* P2 Inc2a: the FP8 mirror is per-bank (slabs beside multi_comp, same
      * comp_cap row stride; multiseq emits write it) and fp8_kv_read callers
      * index it with comp_seq_base + row, so per-seq callers keep their
@@ -16412,8 +16794,10 @@ static int attention_decode_batch_launch(
      * (fp8_kv_read4 in the float4 staging loop); tier selection stays
      * independent of DS4_CUDA_FP8_KV. */
     const bool mseq_heads8 = perseq && allow_mseq_heads8 != 0u && n_tokens >= 128u &&
-                             draft_n_raw_dev == NULL;
-    const bool force_main_kernel = perseq && !mseq_heads8;
+                             draft_n_raw_dev == NULL &&
+                             s_override == NULL && ls_override == NULL;
+    const bool force_main_kernel = (perseq && !mseq_heads8) ||
+                                   s_override != NULL || ls_override != NULL;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -16483,7 +16867,7 @@ static int attention_decode_batch_launch(
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, comp_cap, window, ratio, n_head, head_dim,
                                                  pos_dev, seq_dev,
-                                                 /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL,
+                                                 s_override, ls_override,
                                                  fp8_codes,
                                                  fp8_sc,
                                                  draft_n_raw_dev);
@@ -16517,14 +16901,17 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
          * to 0, so wide per-seq raw-only chunks fell to the generic
          * 1-head/block kernel (~14x slower per pass; FE Inc0).  0 keeps every
          * per-seq caller on the main kernel, bit-exact pre-FE2. */
-        uint32_t                allow_mseq_heads8) {
+        uint32_t                allow_mseq_heads8,
+        /* C1 (cont capture): see ds4_gpu.h. */
+        const void             *scalars,
+        uint32_t                il_for_decode1) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, /*comp_cap=*/0u, window, 1,
                                       n_head, head_dim,
                                       /* comp_fp8 */ NULL, /* comp_scale */ NULL,
                                       positions, seq_id, draft_n_raw,
-                                      allow_mseq_heads8);
+                                      allow_mseq_heads8, scalars, il_for_decode1);
 }
 
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
@@ -16559,7 +16946,10 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *seq_id,
         /* FB1: caller opt-in for the per-seq heads8-online fast path (the
          * admission-chunk forward); 0 = pre-FB1 dispatch, bit-exact. */
-        uint32_t                allow_mseq_heads8) {
+        uint32_t                allow_mseq_heads8,
+        /* C1 (cont capture): see ds4_gpu.h. */
+        const void             *scalars,
+        uint32_t                il_for_decode1) {
     if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
@@ -16567,7 +16957,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                       n_comp, comp_cap, window, ratio, n_head, head_dim,
                                       comp_fp8, comp_scale,
                                       positions, seq_id, /*draft_n_raw=*/NULL,
-                                      allow_mseq_heads8);
+                                      allow_mseq_heads8, scalars, il_for_decode1);
 }
 
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(

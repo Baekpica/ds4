@@ -333,6 +333,23 @@ int ds4_gpu_decode_scalars_flush(void) {
     return 1;
 }
 
+/* C1 (cont capture): explicit-window variant.  Metal has no capture path
+ * (cont graphs are CUDA-only, see ds4_cuda_cont_graphs_enabled below), so
+ * only the pos0 mirror is kept, matching ds4_gpu_decode_scalars_set. */
+void ds4_gpu_decode_scalars_set_ext(
+        uint32_t pos0,
+        uint32_t raw_row,
+        uint32_t raw_start,
+        uint32_t n_raw,
+        uint32_t n_comp,
+        uint32_t emit_phase,
+        uint32_t flags,
+        uint32_t token) {
+    g_metal_decode_pos0 = pos0;
+    (void)raw_row; (void)raw_start; (void)n_raw;
+    (void)n_comp; (void)emit_phase; (void)flags; (void)token;
+}
+
 /* Per-layer scalars (Step 4b/4c): Metal mirrors the per-layer-array
  * substrate's host-side values so the R1 row-variant shims (which now
  * take `il` rather than a device pointer) can look up the correct
@@ -444,6 +461,31 @@ int ds4_cuda_layer_graph_begin_or_replay(uint32_t il,
 
 void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
     (void)il;
+}
+
+/* C1: continuous-batch per-layer graph capture is CUDA-only.  Metal
+ * reports it disabled; ds4.c then never sets batch_capture_step and every
+ * cont step keeps its eager encode. */
+int ds4_cuda_cont_graphs_enabled(void) {
+    return 0;
+}
+
+int ds4_cuda_cont_graph_begin_or_replay(uint32_t il,
+                                          const struct ds4_cont_graph_key *key) {
+    (void)il; (void)key;
+    return -1;
+}
+
+void ds4_cuda_cont_graph_end_or_commit(uint32_t il) {
+    (void)il;
+}
+
+void ds4_cuda_cont_graph_stats_maybe_print(uint32_t every) {
+    (void)every;
+}
+
+void ds4_gpu_invalidate_captured_graphs(const char *why) {
+    (void)why;
 }
 
 void ds4_cuda_layer_graph_debug_peek(const char *label) {
@@ -7180,14 +7222,19 @@ int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         uint32_t          n_rot,
         uint32_t          il,
         ds4_gpu_tensor *codes_mirror,
-        ds4_gpu_tensor *scale_mirror) {
+        ds4_gpu_tensor *scale_mirror,
+        ds4_gpu_tensor *src,
+        uint32_t row_delta) {
     /* Opp C Phase 1A: packed FP8 mirror is CUDA-only.  Metal keeps the
      * FP32 cache and ignores the mirror tensors (the callers in ds4.c pass
-     * NULL on Metal builds because ds4_cuda_fp8_kv_enabled() returns 0). */
+     * NULL on Metal builds because ds4_cuda_fp8_kv_enabled() returns 0).
+     * C1: the scratch `src` override is CUDA-cont-capture-only (Metal never
+     * sets batch_capture_step); reject it rather than mis-target. */
     (void)codes_mirror;
     (void)scale_mirror;
+    if (src) return 0;
     if (!base || il >= DS4_METAL_LAYER_SCALARS_COUNT) return 0;
-    const uint32_t comp_row = g_metal_layer_scalars[il].comp_row;
+    const uint32_t comp_row = g_metal_layer_scalars[il].comp_row + row_delta;
     ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,
         (uint64_t)comp_row * head_dim * sizeof(float),
         (uint64_t)head_dim * sizeof(float));
@@ -7283,10 +7330,13 @@ int ds4_gpu_dsv4_indexer_qat_row_tensor(
         uint32_t          head_dim,
         uint32_t          il,
         ds4_gpu_tensor *codes_mirror,
-        ds4_gpu_tensor *scale_mirror) {
+        ds4_gpu_tensor *scale_mirror,
+        ds4_gpu_tensor *src,
+        uint32_t row_delta) {
     (void)codes_mirror; (void)scale_mirror;  /* P2 Inc3: Metal never stores FP4 */
+    if (src) return 0;  /* C1: CUDA-cont-capture-only scratch override */
     if (!base || il >= DS4_METAL_LAYER_SCALARS_COUNT) return 0;
-    const uint32_t index_row = g_metal_layer_scalars[il].index_row;
+    const uint32_t index_row = g_metal_layer_scalars[il].index_row + row_delta;
     ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,
         (uint64_t)index_row * head_dim * sizeof(float),
         (uint64_t)head_dim * sizeof(float));
@@ -7878,9 +7928,11 @@ int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                ratio,
         uint32_t                pos0,
         uint32_t                n_tokens,
-        const void             *scalars) {
+        const void             *scalars,
+        int32_t                 pos_delta) {
     (void)scalars;  /* Metal kernels read inline args; no device-scalars
                      * substrate on this backend. */
+    (void)pos_delta;  /* C1b: substrate-relative offset, CUDA-only. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
@@ -9325,13 +9377,16 @@ int ds4_gpu_compressor_update_tail_tensor(
         float                   beta_slow,
         float                   rms_eps,
         uint32_t                il,
-        int                     row_field) {
+        int                     row_field,
+        int32_t                 pos_delta,
+        uint32_t                emit_row_delta) {
     (void)kv_cur; (void)sc_cur; (void)state_kv; (void)state_score;
     (void)comp_cache; (void)model_map; (void)model_size; (void)ape_offset;
     (void)ape_type; (void)norm_offset; (void)norm_type; (void)head_dim;
     (void)ratio; (void)pos; (void)comp_row; (void)n_rot; (void)n_ctx_orig;
     (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
     (void)beta_fast; (void)beta_slow; (void)rms_eps; (void)il; (void)row_field;
+    (void)pos_delta; (void)emit_row_delta;
     return 0;
 }
 
@@ -9361,9 +9416,12 @@ int ds4_gpu_compressor_update_tensor(
         float                   beta_slow,
         float                   rms_eps,
         uint32_t                il,
-        int                     row_field) {
+        int                     row_field,
+        int32_t                 pos_delta,
+        uint32_t                emit_row_delta) {
     (void)il;         /* Metal kernels read inline args; no per-layer substrate. */
     (void)row_field;  /* PC2: substrate selector ignored on Metal. */
+    (void)pos_delta; (void)emit_row_delta;  /* C1b: CUDA-only substrate offsets. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
@@ -9430,7 +9488,8 @@ int ds4_gpu_compressor_update_tensor(
                                                       ratio,
                                                       pos,
                                                       1,
-                                                      NULL /* scalars: Metal ignores */);
+                                                      NULL /* scalars: Metal ignores */,
+                                                      0);
         if (!store_ok) {
             return 0;
         }
@@ -12517,10 +12576,13 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
         const ds4_gpu_tensor *draft_n_raw,
-        uint32_t                allow_mseq_heads8) {
+        uint32_t                allow_mseq_heads8,
+        const void             *scalars,
+        uint32_t                il_for_decode1) {
     (void)positions; (void)seq_id;  /* Phase 2 Step 3: CUDA-only (see store stub). */
     (void)draft_n_raw;              /* M4b Inc3: CUDA-only per-row draft span. */
     (void)allow_mseq_heads8;        /* FE2: CUDA-only heads8 opt-in. */
+    (void)scalars; (void)il_for_decode1;  /* C1: CUDA-only cont-capture substrate. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap) {
@@ -12593,13 +12655,16 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *comp_scale,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                allow_mseq_heads8) {
+        uint32_t                allow_mseq_heads8,
+        const void             *scalars,
+        uint32_t                il_for_decode1) {
     /* Opp C Phase 1A.3: Metal mirror lives in CUDA only today; ignore. */
     (void)comp_fp8;
     (void)comp_scale;
     (void)comp_cap;  /* Phase 2 Step 4a: per-seq compressed bank is CUDA-only. */
     (void)positions; (void)seq_id;  /* Phase 2 Step 3: CUDA-only (see store stub). */
     (void)allow_mseq_heads8;  /* FB1: per-seq heads8 fast path is CUDA-only. */
+    (void)scalars; (void)il_for_decode1;  /* C1: CUDA-only cont-capture substrate. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
