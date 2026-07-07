@@ -12177,6 +12177,23 @@ static void generate_continuous_jobs(server *s, job *first) {
                    ds4_session_ctx(s->session), cs.served, fallback);
 }
 
+/* S6 default-flip (2026-07-07): default coalesced-group Σ-token cap, shared by
+ * the worker's gather bound and the persistent batch-ctx sizing (the two
+ * DS4_SERVER_COALESCE_MAX_TOKENS read sites must agree -- W4 sizes the ctx to
+ * the bounds the worker enforces).  The batch ctx sizes its ragged prefill
+ * scratch by THIS value, NOT by ctx (~7.8 GiB at the old 8192 default on
+ * GB10) -- headroom the default serving path never uses: continuous admission
+ * chunks at DS4_CONT_PREFILL_CHUNK and every chunk clamps to prefill_cap
+ * (bg_prefill_width_clamp), so prompts longer than the cap still admit, in
+ * cap-wide chunks.  2048 validated in the ship config (S6 ledger 2026-07-06):
+ * ~5.9 GiB freed -> bank capacity, decode untouched, -c 4096 long-prompt legs
+ * green.  Ctx-aware: contexts below 2048 size to ctx (the per-seq committed
+ * bound; wider groups just split).  The env knob is the kill switch
+ * (DS4_SERVER_COALESCE_MAX_TOKENS=8192 = pre-flip sizing). */
+static int coalesce_max_tokens_default(int ctx) {
+    return ctx > 0 && ctx < 2048 ? ctx : 2048;
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     /* Coalescing config (read once; single worker thread). */
@@ -12194,9 +12211,10 @@ static void *worker_main(void *arg) {
     int cwait = cw ? atoi(cw) : 0;
     if (cwait < 0) cwait = 0;
     /* Cap the combined prompt tokens of a coalesced group; ragged prefill's host
-     * logits buffer is Σlen * vocab * 4 bytes, so this bounds peak host memory. */
+     * logits buffer is Σlen * vocab * 4 bytes, so this bounds peak host memory.
+     * Default is the shared S6 value (see coalesce_max_tokens_default). */
     const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
-    int cmaxtok = ct ? atoi(ct) : 8192;
+    int cmaxtok = ct ? atoi(ct) : coalesce_max_tokens_default(ds4_session_ctx(s->session));
     if (cmaxtok < 0) cmaxtok = 0;
 
     for (;;) {
@@ -13124,8 +13142,9 @@ int main(int argc, char **argv) {
         if (cmax < 1) cmax = 1;
         if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
         const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
-        int cmaxtok = ct ? atoi(ct) : 8192;
-        if (cmaxtok <= 0) cmaxtok = 8192;          /* unbounded coalesce -> size ctx to default */
+        const int cmaxtok_dflt = coalesce_max_tokens_default(ds4_session_ctx(s.session));
+        int cmaxtok = ct ? atoi(ct) : cmaxtok_dflt;
+        if (cmaxtok <= 0) cmaxtok = cmaxtok_dflt;  /* unbounded coalesce -> size ctx to default */
         if (cmaxtok < cmax) cmaxtok = cmax;        /* need >=1 token per seq */
         if (coalesce_on && cmax > 1) {
             char cerr[256] = {0};
