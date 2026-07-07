@@ -166,6 +166,10 @@ int ds4_mmq_iq2_xxs_moe(
 // ds4_mmq_q2_k_aligned_bytes' comment) instead of the raw block stream.  The
 // tile loader reads the SoA sections directly -- bit-identical output to the
 // raw path, no derepack scratch.
+// CONTRACT DIFFERENCE (P3): unlike the raw entries, the output is NOT
+// nonfinite-sanitized; the routed-MoE consumers (moe_mmq_swiglu / moe_sum
+// with guard_nonfinite=1) sanitize at read, so the standalone whole-buffer
+// pass is skipped.  New callers must sanitize at consumption.
 int ds4_mmq_q2_K_moe_soa(
     const void    * W_soa,
     const float   * X_f32,

@@ -21219,6 +21219,12 @@ __global__ static void moe_mmq_swiglu_weighted_clamp_kernel(
     uint32_t slot = (uint32_t)(slot_pair - (uint64_t)tok * n_expert_used);
     float g = gate_buf[gid];
     float u = up_buf[gid];
+    /* P3: sanitize at read (nonfinite -> 0, exactly what the standalone
+     * ds4_mmq_sanitize_f32 pass wrote).  Lets the SoA mmq entries skip that
+     * whole-buffer pass; sanitized producers are unaffected (values already
+     * finite). */
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(u)) u = 0.0f;
     if (clamp > 1.0e-6f) {
         if (g > clamp) g = clamp;
         if (u > clamp) u = clamp;
@@ -21231,14 +21237,21 @@ __global__ static void moe_mmq_swiglu_weighted_clamp_kernel(
     mid_out[gid] = s * u * w;
 }
 
-__global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+/* P3: guard_nonfinite=1 sanitizes each slot at read (nonfinite -> dropped,
+ * exactly what summing the standalone-sanitized buffer produced) so the mmq
+ * pipeline can skip the whole-buffer ds4_mmq_sanitize_f32 pass.  The legacy
+ * f32/qwarp32 producers pass 0 to keep their historical propagation. */
+__global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t guard_nonfinite) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * out_dim;
     if (gid >= n) return;
     uint32_t tok = gid / out_dim;
     uint32_t row = gid - (uint64_t)tok * out_dim;
     float acc = 0.0f;
-    for (uint32_t e = 0; e < n_expert; e++) acc += down[((uint64_t)tok * n_expert + e) * out_dim + row];
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const float v = down[((uint64_t)tok * n_expert + e) * out_dim + row];
+        if (!guard_nonfinite || isfinite(v)) acc += v;
+    }
     out[gid] = acc;
 }
 
@@ -22134,7 +22147,7 @@ static int routed_moe_launch(
                     uint64_t n = (uint64_t)n_tokens * out_dim;
                     moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, ds4_current_stream()>>>(
                         (float *)out->ptr, (const float *)down->ptr,
-                        out_dim, n_expert_used, n_tokens);
+                        out_dim, n_expert_used, n_tokens, /*guard_nonfinite=*/1);
                     if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe sum launch")) goto mmvq_decode_bail;
                 }
                 if (mmvq_prof_ev[4]) (void)cudaEventRecord(mmvq_prof_ev[4], ds4_current_stream());
@@ -22415,7 +22428,7 @@ mmq_moe_path:
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, ds4_current_stream()>>>(
                 (float *)out->ptr, (const float *)down->ptr,
-                out_dim, n_expert_used, n_tokens);
+                out_dim, n_expert_used, n_tokens, /*guard_nonfinite=*/1);
             if (!cuda_ok(cudaGetLastError(), "mmq routed_moe sum launch")) goto mmq_moe_fallback;
         }
         return 1;
@@ -22938,7 +22951,7 @@ mmq_moe_fallback:
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         if (ok && !use_atomic_down && !use_direct_down_sum6) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            moe_sum_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            moe_sum_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens, /*guard_nonfinite=*/0);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (prof_ev[6]) {
@@ -22996,7 +23009,7 @@ mmq_moe_fallback:
     }
     if (ok) {
         uint64_t n = (uint64_t)n_tokens * out_dim;
-        moe_sum_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+        moe_sum_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens, /*guard_nonfinite=*/0);
         ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     return ok;

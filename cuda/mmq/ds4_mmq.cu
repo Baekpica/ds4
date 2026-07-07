@@ -443,7 +443,11 @@ int ds4_mmq_moe_impl(
         /* ds4 (P4 Inc3): optional aligned-SoA artifact; when non-null the mmq
          * kernel loads tiles from it directly and W is ignored (see mmq_args). */
         const char    * x_soa      = NULL,
-        int64_t         soa_blocks = 0) {
+        int64_t         soa_blocks = 0,
+        /* ds4 (P3): false skips the whole-buffer nonfinite pass; only valid
+         * when every consumer sanitizes at read (the routed-MoE swiglu/sum
+         * kernels do). */
+        bool            sanitize_out = true) {
 
     if (!W || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -622,7 +626,9 @@ int ds4_mmq_moe_impl(
         fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, cudaGetErrorString(err));
         return -4;
     }
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+    if (sanitize_out) {
+        ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+    }
     return 0;
 }
 
@@ -650,7 +656,9 @@ int ds4_mmq_moe_pair_impl(
          * shape, so one block count); see ds4_mmq_moe_impl. */
         const char    * xa_soa     = NULL,
         const char    * xb_soa     = NULL,
-        int64_t         soa_blocks = 0) {
+        int64_t         soa_blocks = 0,
+        /* ds4 (P3): see ds4_mmq_moe_impl. */
+        bool            sanitize_out = true) {
 
     if (!W_a || !W_b || !X_f32 || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -805,8 +813,10 @@ int ds4_mmq_moe_pair_impl(
         fprintf(stderr, "%s: mul_mat_q_case (pair b) launch failed: %s\n", tag, cudaGetErrorString(err));
         return -5;
     }
-    ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-    ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+    if (sanitize_out) {
+        ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+        ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+    }
     return 0;
 }
 
@@ -849,10 +859,13 @@ extern "C" int ds4_mmq_q2_K_moe_soa(
         return -1;
     }
     const int64_t npair = (int64_t)n_experts * (int64_t)(M/2) * (int64_t)(K/256);
-    /* W_soa doubles as the (unused) raw pointer so the impl's null checks hold. */
+    /* W_soa doubles as the (unused) raw pointer so the impl's null checks
+     * hold.  sanitize_out=false: the routed-MoE consumers (swiglu / moe_sum)
+     * sanitize at read, saving the whole-buffer pass (P3). */
     return ds4_mmq_moe_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_moe_soa", W_soa, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
-                                            (const char *)W_soa, npair);
+                                            (const char *)W_soa, npair,
+                                            /*sanitize_out=*/false);
 }
 
 extern "C" int ds4_mmq_q4_K_moe(
@@ -886,10 +899,12 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         return -1;
     }
     const int64_t nblk = (int64_t)n_experts * (int64_t)M * (int64_t)(K/256);
+    /* sanitize_out=false: see ds4_mmq_q2_K_moe_soa. */
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
-        (const char *)Wa_soa, (const char *)Wb_soa, nblk);
+        (const char *)Wa_soa, (const char *)Wb_soa, nblk,
+        /*sanitize_out=*/false);
 }
 
 extern "C" int ds4_mmq_q4_K_moe_pair(
