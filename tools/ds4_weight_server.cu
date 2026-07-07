@@ -3,8 +3,10 @@
 #include <cuda.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1498,6 +1500,134 @@ static bool build_q8_0_dequant_artifact(const char *model_id,
     return true;
 }
 
+/* ---- S5 parallel repack driver ------------------------------------------
+ * The serial builders moved ~79 GiB through a fully serialized pipeline
+ * (buffered pread -> sync H2D -> kernel -> device sync, one chunk at a time,
+ * ~1.25 GiB/s = 63 s of every WS boot).  The tax is pipeline serialization,
+ * not disk: per-TENSOR workers, each with its own non-blocking stream, pinned
+ * staging and device scratch, reading via the O_DIRECT read_stage path, run
+ * the NVMe at queue depth = nthreads while uploads/kernels overlap other
+ * workers' reads.  Allocation (VMM reservation order) and manifest push stay
+ * on the caller thread so range layout is thread-count-invariant; only the
+ * byte movement fans out.  --repack-threads N / DS4_WS_REPACK_THREADS
+ * overrides (1 = the old serial order through the new plumbing);
+ * --repack-hash prints a per-artifact FNV-1a for the bit-identity gate. */
+static int g_repack_threads = 0;   /* 0 = auto (min(6, hw)) */
+static bool g_repack_hash = false;
+
+static int repack_thread_count(size_t njobs) {
+    int n = g_repack_threads;
+    if (n <= 0) {
+        const char *e = getenv("DS4_WS_REPACK_THREADS");
+        n = e && e[0] ? atoi(e) : 0;
+    }
+    if (n <= 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        n = hw > 6u ? 6 : (hw ? (int)hw : 1);
+    }
+    if (n > 16) n = 16;
+    if ((size_t)n > njobs) n = (int)(njobs ? njobs : 1);
+    return n;
+}
+
+struct repack_job {
+    const tensor_record *t;
+    owned_range r;
+    uint64_t chunk;        /* kind-specific rounded chunk bytes */
+};
+
+static uint64_t repack_fnv1a(const unsigned char *p, uint64_t n, uint64_t h) {
+    for (uint64_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+/* Run fn(job, stream, stage, stage_bytes, scratch) for every job across the
+ * worker pool.  stage is pinned host (>= max chunk + 2*direct_align, aligned
+ * for O_DIRECT), scratch is device (>= max chunk).  Returns false if any job
+ * failed; caller releases the job ranges. */
+template <typename FN>
+static bool run_repack_jobs(const char *what, const mapped_file &m, int device,
+                            std::vector<repack_job> &jobs, FN fn) {
+    if (jobs.empty()) return true;
+    uint64_t max_chunk = 0;
+    for (const repack_job &j : jobs) if (j.chunk > max_chunk) max_chunk = j.chunk;
+    const uint64_t stage_align = (m.direct_fd >= 0 && m.direct_align > 1) ? m.direct_align : 1;
+    const uint64_t stage_bytes = max_chunk + 2u * stage_align;
+    const int nthreads = repack_thread_count(jobs.size());
+    std::atomic<size_t> next{0};
+    std::atomic<bool> fail{false};
+    auto worker = [&]() {
+        if (cudaSetDevice(device) != cudaSuccess) { fail = true; return; }
+        cudaStream_t stream = nullptr;
+        void *raw = nullptr;
+        unsigned char *scratch = nullptr;
+        cudaError_t err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (err == cudaSuccess) err = cudaMallocHost(&raw, (size_t)(stage_bytes + stage_align));
+        if (err == cudaSuccess) err = cudaMalloc((void **)&scratch, (size_t)max_chunk);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4_weight_server: %s repack worker alloc failed: %s\n",
+                    what, cudaGetErrorString(err));
+            fail = true;
+        } else {
+            unsigned char *stage = (unsigned char *)align_ptr(raw, stage_align);
+            while (!fail.load(std::memory_order_relaxed)) {
+                const size_t i = next.fetch_add(1u);
+                if (i >= jobs.size()) break;
+                if (!fn(jobs[i], stream, stage, stage_bytes, scratch)) { fail = true; break; }
+                if (g_repack_hash) {
+                    const owned_range &r = jobs[i].r;
+                    uint64_t h = 14695981039346656037ull;
+                    for (uint64_t off = 0; off < r.bytes && !fail; off += max_chunk) {
+                        const uint64_t nb = r.bytes - off < max_chunk ? r.bytes - off : max_chunk;
+                        cudaError_t herr = cudaMemcpyAsync(stage, (const char *)r.dev + off, (size_t)nb,
+                                                           cudaMemcpyDeviceToHost, stream);
+                        if (herr == cudaSuccess) herr = cudaStreamSynchronize(stream);
+                        if (herr != cudaSuccess) {
+                            fprintf(stderr, "ds4_weight_server: %s repack hash readback failed: %s\n",
+                                    what, cudaGetErrorString(herr));
+                            fail = true;
+                            break;
+                        }
+                        h = repack_fnv1a(stage, nb, h);
+                    }
+                    if (!fail)
+                        fprintf(stderr, "ds4_weight_server: repack-hash %s %s bytes=%llu fnv=%016llx\n",
+                                what, jobs[i].t->name.c_str(),
+                                (unsigned long long)r.bytes, (unsigned long long)h);
+                }
+            }
+        }
+        if (scratch) (void)cudaFree(scratch);
+        if (raw) (void)cudaFreeHost(raw);
+        if (stream) (void)cudaStreamDestroy(stream);
+    };
+    std::vector<std::thread> pool;
+    pool.reserve((size_t)nthreads);
+    for (int i = 0; i < nthreads; i++) pool.emplace_back(worker);
+    for (std::thread &th : pool) th.join();
+    return !fail;
+}
+
+/* One chunk of one tensor: O_DIRECT read into stage, async H2D into scratch on
+ * the worker stream; the caller launches its kind's kernel then stream-syncs. */
+static bool repack_read_upload(const mapped_file &m, const char *what, const tensor_record &t,
+                               unsigned char *stage, uint64_t stage_bytes, unsigned char *scratch,
+                               uint64_t done, uint64_t nb, cudaStream_t stream) {
+    const char *payload = nullptr;
+    if (!read_stage(m, stage, stage_bytes, t.off + done, nb, &payload)) {
+        fprintf(stderr, "ds4_weight_server: %s repack read failed for %s at off=%llu: %s\n",
+                what, t.name.c_str(), (unsigned long long)(t.off + done), strerror(errno));
+        return false;
+    }
+    cudaError_t err = cudaMemcpyAsync(scratch, payload, (size_t)nb, cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4_weight_server: %s repack upload failed for %s: %s\n",
+                what, t.name.c_str(), cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 /* --repack-iq2-aligned candidates: routed-expert gate/up stacks in IQ2_XXS.
  * dims[0] % 1024: the aligned decode kernel covers 4 blocks per warp pass. */
 static bool tensor_is_iq2_aligned_candidate(const tensor_record &t) {
@@ -1560,21 +1690,9 @@ static bool build_q8_aligned_dense_artifacts(const char *model_id,
     if (!map_file(path, m)) return false;
     uint64_t chunk = copy_chunk_bytes / 34u * 34u;
     if (chunk < 34u * 32768u) chunk = 34u * 32768u;
-    unsigned char *stage = nullptr;
-    unsigned char *scratch = nullptr;
-    cudaError_t err = cudaMallocHost((void **)&stage, (size_t)chunk);
-    if (err == cudaSuccess) err = cudaMalloc((void **)&scratch, (size_t)chunk);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4_weight_server: q8 repack staging alloc failed: %s\n",
-                cudaGetErrorString(err));
-        if (stage) (void)cudaFreeHost(stage);
-        unmap_file(m);
-        return false;
-    }
 
     const double t0 = now_sec();
-    uint64_t total_bytes = 0;
-    uint32_t count = 0;
+    std::vector<repack_job> jobs;
     bool ok = true;
     for (const tensor_record &t : records) {
         if (!tensor_is_q8_aligned_candidate(t)) continue;
@@ -1592,7 +1710,10 @@ static bool build_q8_aligned_dense_artifacts(const char *model_id,
         const uint64_t dq_bytes = align_up(nblk * 2u, 64u);
         const uint64_t art_bytes = dq_bytes + nblk * 32u;
 
-        owned_range r;
+        repack_job j;
+        j.t = &t;
+        j.chunk = chunk;
+        owned_range &r = j.r;
         r.backend = backend;
         r.derived = true;
         r.model_id = model_id;
@@ -1615,80 +1736,83 @@ static bool build_q8_aligned_dense_artifacts(const char *model_id,
             }
         } else {
             void *dev = nullptr;
-            err = cudaMalloc(&dev, (size_t)art_bytes);
-            if (err != cudaSuccess) {
+            cudaError_t aerr = cudaMalloc(&dev, (size_t)art_bytes);
+            if (aerr != cudaSuccess) {
                 fprintf(stderr, "ds4_weight_server: cudaMalloc failed for q8 repack %s %.2f MiB: %s\n",
-                        t.name.c_str(), (double)art_bytes / 1048576.0, cudaGetErrorString(err));
+                        t.name.c_str(), (double)art_bytes / 1048576.0, cudaGetErrorString(aerr));
                 ok = false;
                 break;
             }
             r.dev = dev;
         }
+        jobs.push_back(j);
+    }
 
-        __half *dq = (__half *)r.dev;
-        unsigned char *qs = (unsigned char *)r.dev + dq_bytes;
-        for (uint64_t done = 0; done < t.bytes; done += chunk) {
-            const uint64_t nb = t.bytes - done < chunk ? t.bytes - done : chunk;
-            if (!pread_full(m.fd, stage, nb, t.off + done)) {
-                fprintf(stderr, "ds4_weight_server: q8 repack read failed for %s at off=%llu: %s\n",
-                        t.name.c_str(), (unsigned long long)(t.off + done), strerror(errno));
-                ok = false;
-                break;
-            }
-            err = cudaMemcpy(scratch, stage, (size_t)nb, cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "ds4_weight_server: q8 repack upload failed for %s: %s\n",
-                        t.name.c_str(), cudaGetErrorString(err));
-                ok = false;
-                break;
-            }
+    const int nthreads = repack_thread_count(jobs.size());
+    if (ok)
+        ok = run_repack_jobs("q8", m, device, jobs,
+            [&m](const repack_job &j, cudaStream_t stream, unsigned char *stage,
+                 uint64_t stage_bytes, unsigned char *scratch) -> bool {
+        const tensor_record &t = *j.t;
+        const uint64_t nblk = t.bytes / 34u;
+        const uint64_t dq_bytes = align_up(nblk * 2u, 64u);
+        __half *dq = (__half *)j.r.dev;
+        unsigned char *qs = (unsigned char *)j.r.dev + dq_bytes;
+        for (uint64_t done = 0; done < t.bytes; done += j.chunk) {
+            const uint64_t nb = t.bytes - done < j.chunk ? t.bytes - done : j.chunk;
+            if (!repack_read_upload(m, "q8", t, stage, stage_bytes, scratch, done, nb, stream))
+                return false;
             const uint64_t cblk = nb / 34u;
             const uint64_t blk0 = done / 34u;
-            repack_q8_0_aligned_kernel<<<(unsigned)((cblk * 2u + 255u) / 256u), 256>>>(
+            repack_q8_0_aligned_kernel<<<(unsigned)((cblk * 2u + 255u) / 256u), 256, 0, stream>>>(
                 dq + blk0, qs + blk0 * 32u, scratch, cblk);
-            err = cudaGetLastError();
-            if (err == cudaSuccess) err = cudaDeviceSynchronize();
+            cudaError_t err = cudaGetLastError();
+            if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
             if (err != cudaSuccess) {
                 fprintf(stderr, "ds4_weight_server: q8 repack kernel failed for %s: %s\n",
                         t.name.c_str(), cudaGetErrorString(err));
-                ok = false;
-                break;
+                return false;
             }
         }
+        return true;
+    });
+
+    uint64_t total_bytes = 0;
+    uint32_t count = 0;
+    for (repack_job &j : jobs) {
         if (!ok) {
-            release_owned_range(r);
-            break;
+            release_owned_range(j.r);
+            continue;
         }
         if (backend == WEIGHT_BACKEND_IPC) {
             cudaIpcMemHandle_t handle;
-            err = cudaIpcGetMemHandle(&handle, r.dev);
+            cudaError_t err = cudaIpcGetMemHandle(&handle, j.r.dev);
             if (err != cudaSuccess) {
                 fprintf(stderr, "ds4_weight_server: cudaIpcGetMemHandle failed for q8 repack %s: %s\n",
-                        t.name.c_str(), cudaGetErrorString(err));
-                release_owned_range(r);
+                        j.t->name.c_str(), cudaGetErrorString(err));
+                release_owned_range(j.r);
                 ok = false;
-                break;
+                continue;
             }
-            r.handle = handle;
+            j.r.handle = handle;
         }
-        ranges.push_back(r);
-        total_bytes += art_bytes;
+        ranges.push_back(j.r);
+        total_bytes += j.r.bytes;
         count++;
     }
 
-    (void)cudaFreeHost(stage);
-    (void)cudaFree(scratch);
     unmap_file(m);
     if (ok && count == 0) {
         fprintf(stderr, "ds4_weight_server: --repack-q8-aligned found no candidate tensors in %s\n", model_id);
     }
     if (ok) {
         fprintf(stderr,
-                "ds4_weight_server: q8 aligned repack %s: %u tensors %.2f GiB in %.1fs\n",
+                "ds4_weight_server: q8 aligned repack %s: %u tensors %.2f GiB in %.1fs (threads=%d)\n",
                 model_id,
                 count,
                 (double)total_bytes / 1073741824.0,
-                now_sec() - t0);
+                now_sec() - t0,
+                nthreads);
     }
     if (repacked_bytes_out) *repacked_bytes_out = total_bytes;
     return ok;
@@ -1715,21 +1839,9 @@ static bool build_iq2_aligned_expert_artifacts(const char *model_id,
     if (!map_file(path, m)) return false;
     uint64_t chunk = copy_chunk_bytes / 66u * 66u;
     if (chunk < 66u * 16384u) chunk = 66u * 16384u;
-    unsigned char *stage = nullptr;
-    unsigned char *scratch = nullptr;
-    cudaError_t err = cudaMallocHost((void **)&stage, (size_t)chunk);
-    if (err == cudaSuccess) err = cudaMalloc((void **)&scratch, (size_t)chunk);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4_weight_server: iq2 repack staging alloc failed: %s\n",
-                cudaGetErrorString(err));
-        if (stage) (void)cudaFreeHost(stage);
-        unmap_file(m);
-        return false;
-    }
 
     const double t0 = now_sec();
-    uint64_t total_bytes = 0;
-    uint32_t count = 0;
+    std::vector<repack_job> jobs;
     bool ok = true;
     for (const tensor_record &t : records) {
         if (!tensor_is_iq2_aligned_candidate(t)) continue;
@@ -1747,7 +1859,10 @@ static bool build_iq2_aligned_expert_artifacts(const char *model_id,
         const uint64_t dq_bytes = align_up(nblk * 2u, 64u);
         const uint64_t art_bytes = dq_bytes + nblk * 64u;
 
-        owned_range r;
+        repack_job j;
+        j.t = &t;
+        j.chunk = chunk;
+        owned_range &r = j.r;
         r.backend = backend;
         r.derived = true;
         r.model_id = model_id;
@@ -1770,83 +1885,86 @@ static bool build_iq2_aligned_expert_artifacts(const char *model_id,
             }
         } else {
             void *dev = nullptr;
-            err = cudaMalloc(&dev, (size_t)art_bytes);
-            if (err != cudaSuccess) {
+            cudaError_t aerr = cudaMalloc(&dev, (size_t)art_bytes);
+            if (aerr != cudaSuccess) {
                 fprintf(stderr, "ds4_weight_server: cudaMalloc failed for iq2 repack %s %.2f MiB: %s\n",
-                        t.name.c_str(), (double)art_bytes / 1048576.0, cudaGetErrorString(err));
+                        t.name.c_str(), (double)art_bytes / 1048576.0, cudaGetErrorString(aerr));
                 ok = false;
                 break;
             }
             r.dev = dev;
         }
+        jobs.push_back(j);
+    }
 
-        __half *dq = (__half *)r.dev;
-        uint2 *qs = (uint2 *)((char *)r.dev + dq_bytes);
-        for (uint64_t done = 0; done < t.bytes; done += chunk) {
-            const uint64_t nb = t.bytes - done < chunk ? t.bytes - done : chunk;
-            if (!pread_full(m.fd, stage, nb, t.off + done)) {
-                fprintf(stderr, "ds4_weight_server: iq2 repack read failed for %s at off=%llu: %s\n",
-                        t.name.c_str(), (unsigned long long)(t.off + done), strerror(errno));
-                ok = false;
-                break;
-            }
-            err = cudaMemcpy(scratch, stage, (size_t)nb, cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "ds4_weight_server: iq2 repack upload failed for %s: %s\n",
-                        t.name.c_str(), cudaGetErrorString(err));
-                ok = false;
-                break;
-            }
+    const int nthreads = repack_thread_count(jobs.size());
+    if (ok)
+        ok = run_repack_jobs("iq2", m, device, jobs,
+            [&m](const repack_job &j, cudaStream_t stream, unsigned char *stage,
+                 uint64_t stage_bytes, unsigned char *scratch) -> bool {
+        const tensor_record &t = *j.t;
+        const uint64_t nblk = t.bytes / 66u;
+        const uint64_t dq_bytes = align_up(nblk * 2u, 64u);
+        __half *dq = (__half *)j.r.dev;
+        uint2 *qs = (uint2 *)((char *)j.r.dev + dq_bytes);
+        for (uint64_t done = 0; done < t.bytes; done += j.chunk) {
+            const uint64_t nb = t.bytes - done < j.chunk ? t.bytes - done : j.chunk;
+            if (!repack_read_upload(m, "iq2", t, stage, stage_bytes, scratch, done, nb, stream))
+                return false;
             const uint64_t cblk = nb / 66u;
             const uint64_t blk0 = done / 66u;
-            repack_iq2_xxs_aligned_kernel<<<(unsigned)((cblk * 8u + 255u) / 256u), 256>>>(
+            repack_iq2_xxs_aligned_kernel<<<(unsigned)((cblk * 8u + 255u) / 256u), 256, 0, stream>>>(
                 dq + blk0, qs + blk0 * 8u, scratch, cblk);
-            err = cudaGetLastError();
-            if (err == cudaSuccess) err = cudaDeviceSynchronize();
+            cudaError_t err = cudaGetLastError();
+            if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
             if (err != cudaSuccess) {
                 fprintf(stderr, "ds4_weight_server: iq2 repack kernel failed for %s: %s\n",
                         t.name.c_str(), cudaGetErrorString(err));
-                ok = false;
-                break;
+                return false;
             }
 #if defined(POSIX_FADV_DONTNEED)
             (void)posix_fadvise(m.fd, (off_t)(t.off + done), (off_t)nb, POSIX_FADV_DONTNEED);
 #endif
         }
+        return true;
+    });
+
+    uint64_t total_bytes = 0;
+    uint32_t count = 0;
+    for (repack_job &j : jobs) {
         if (!ok) {
-            release_owned_range(r);
-            break;
+            release_owned_range(j.r);
+            continue;
         }
         if (backend == WEIGHT_BACKEND_IPC) {
             cudaIpcMemHandle_t handle;
-            err = cudaIpcGetMemHandle(&handle, r.dev);
+            cudaError_t err = cudaIpcGetMemHandle(&handle, j.r.dev);
             if (err != cudaSuccess) {
                 fprintf(stderr, "ds4_weight_server: cudaIpcGetMemHandle failed for iq2 repack %s: %s\n",
-                        t.name.c_str(), cudaGetErrorString(err));
-                release_owned_range(r);
+                        j.t->name.c_str(), cudaGetErrorString(err));
+                release_owned_range(j.r);
                 ok = false;
-                break;
+                continue;
             }
-            r.handle = handle;
+            j.r.handle = handle;
         }
-        ranges.push_back(r);
-        total_bytes += art_bytes;
+        ranges.push_back(j.r);
+        total_bytes += j.r.bytes;
         count++;
     }
 
-    (void)cudaFreeHost(stage);
-    (void)cudaFree(scratch);
     unmap_file(m);
     if (ok && count == 0) {
         fprintf(stderr, "ds4_weight_server: --repack-iq2-aligned found no candidate tensors in %s\n", model_id);
     }
     if (ok) {
         fprintf(stderr,
-                "ds4_weight_server: iq2 aligned repack %s: %u tensors %.2f GiB in %.1fs\n",
+                "ds4_weight_server: iq2 aligned repack %s: %u tensors %.2f GiB in %.1fs (threads=%d)\n",
                 model_id,
                 count,
                 (double)total_bytes / 1073741824.0,
-                now_sec() - t0);
+                now_sec() - t0,
+                nthreads);
     }
     if (repacked_bytes_out) *repacked_bytes_out = total_bytes;
     return ok;
@@ -1870,13 +1988,9 @@ static bool build_q2k_aligned_expert_artifacts(const char *model_id,
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     mapped_file m;
     if (!map_file(path, m)) return false;
-    unsigned char *stage = nullptr;
-    unsigned char *scratch = nullptr;
-    uint64_t staged_cap = 0;
 
     const double t0 = now_sec();
-    uint64_t total_bytes = 0;
-    uint32_t count = 0;
+    std::vector<repack_job> jobs;
     bool ok = true;
     for (const tensor_record &t : records) {
         if (!tensor_is_q2k_aligned_candidate(t)) continue;
@@ -1896,28 +2010,15 @@ static bool build_q2k_aligned_expert_artifacts(const char *model_id,
         uint64_t chunk = copy_chunk_bytes / pair_bytes * pair_bytes;
         if (chunk < pair_bytes * 4096u) chunk = pair_bytes * 4096u;
         if (chunk > t.bytes) chunk = t.bytes;
-        if (staged_cap < chunk) {
-            if (stage) (void)cudaFreeHost(stage);
-            if (scratch) (void)cudaFree(scratch);
-            stage = nullptr;
-            scratch = nullptr;
-            cudaError_t aerr = cudaMallocHost((void **)&stage, (size_t)chunk);
-            if (aerr == cudaSuccess) aerr = cudaMalloc((void **)&scratch, (size_t)chunk);
-            if (aerr != cudaSuccess) {
-                fprintf(stderr, "ds4_weight_server: q2k repack staging alloc failed: %s\n",
-                        cudaGetErrorString(aerr));
-                if (stage) { (void)cudaFreeHost(stage); stage = nullptr; }
-                ok = false;
-                break;
-            }
-            staged_cap = chunk;
-        }
         const uint64_t npair = nblk / 2u;
         const uint64_t dm_bytes = (npair * 8u + 63u) & ~63ull;
         const uint64_t sc_bytes = (npair * 32u + 63u) & ~63ull;
         const uint64_t art_bytes = dm_bytes + sc_bytes + npair * 128u;
 
-        owned_range r;
+        repack_job j;
+        j.t = &t;
+        j.chunk = chunk;
+        owned_range &r = j.r;
         r.backend = backend;
         r.derived = true;
         r.model_id = model_id;
@@ -1949,77 +2050,82 @@ static bool build_q2k_aligned_expert_artifacts(const char *model_id,
             }
             r.dev = dev;
         }
+        jobs.push_back(j);
+    }
 
-        uint32_t *dm2 = (uint32_t *)r.dev;
-        uint32_t *sc4 = (uint32_t *)((char *)r.dev + dm_bytes);
-        uint32_t *qs2 = (uint32_t *)((char *)r.dev + dm_bytes + sc_bytes);
-        cudaError_t err = cudaSuccess;
-        for (uint64_t done = 0; done < t.bytes; done += chunk) {
-            const uint64_t nb = t.bytes - done < chunk ? t.bytes - done : chunk;
-            if (!pread_full(m.fd, stage, nb, t.off + done)) {
-                fprintf(stderr, "ds4_weight_server: q2k repack read failed for %s at off=%llu: %s\n",
-                        t.name.c_str(), (unsigned long long)(t.off + done), strerror(errno));
-                ok = false;
-                break;
-            }
-            err = cudaMemcpy(scratch, stage, (size_t)nb, cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "ds4_weight_server: q2k repack upload failed for %s: %s\n",
-                        t.name.c_str(), cudaGetErrorString(err));
-                ok = false;
-                break;
-            }
+    const int nthreads = repack_thread_count(jobs.size());
+    if (ok)
+        ok = run_repack_jobs("q2k", m, device, jobs,
+            [&m](const repack_job &j, cudaStream_t stream, unsigned char *stage,
+                 uint64_t stage_bytes, unsigned char *scratch) -> bool {
+        const tensor_record &t = *j.t;
+        const uint64_t nblk = t.bytes / 84u;
+        const uint64_t nb_row = t.dims[0] / 256u;
+        const uint64_t npair = nblk / 2u;
+        const uint64_t dm_bytes = (npair * 8u + 63u) & ~63ull;
+        const uint64_t sc_bytes = (npair * 32u + 63u) & ~63ull;
+        uint32_t *dm2 = (uint32_t *)j.r.dev;
+        uint32_t *sc4 = (uint32_t *)((char *)j.r.dev + dm_bytes);
+        uint32_t *qs2 = (uint32_t *)((char *)j.r.dev + dm_bytes + sc_bytes);
+        for (uint64_t done = 0; done < t.bytes; done += j.chunk) {
+            const uint64_t nb = t.bytes - done < j.chunk ? t.bytes - done : j.chunk;
+            if (!repack_read_upload(m, "q2k", t, stage, stage_bytes, scratch, done, nb, stream))
+                return false;
             const uint64_t cblk = nb / 84u;
             const uint64_t blk0 = done / 84u;
-            repack_q2_k_aligned_kernel<<<(unsigned)((cblk * 16u + 255u) / 256u), 256>>>(
+            repack_q2_k_aligned_kernel<<<(unsigned)((cblk * 16u + 255u) / 256u), 256, 0, stream>>>(
                 dm2, sc4, qs2, scratch, blk0, cblk,
                 (uint32_t)nb_row, (uint32_t)t.dims[1]);
-            err = cudaGetLastError();
-            if (err == cudaSuccess) err = cudaDeviceSynchronize();
+            cudaError_t err = cudaGetLastError();
+            if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
             if (err != cudaSuccess) {
                 fprintf(stderr, "ds4_weight_server: q2k repack kernel failed for %s: %s\n",
                         t.name.c_str(), cudaGetErrorString(err));
-                ok = false;
-                break;
+                return false;
             }
 #if defined(POSIX_FADV_DONTNEED)
             (void)posix_fadvise(m.fd, (off_t)(t.off + done), (off_t)nb, POSIX_FADV_DONTNEED);
 #endif
         }
+        return true;
+    });
+
+    uint64_t total_bytes = 0;
+    uint32_t count = 0;
+    for (repack_job &j : jobs) {
         if (!ok) {
-            release_owned_range(r);
-            break;
+            release_owned_range(j.r);
+            continue;
         }
         if (backend == WEIGHT_BACKEND_IPC) {
             cudaIpcMemHandle_t handle;
-            cudaError_t herr = cudaIpcGetMemHandle(&handle, r.dev);
+            cudaError_t herr = cudaIpcGetMemHandle(&handle, j.r.dev);
             if (herr != cudaSuccess) {
                 fprintf(stderr, "ds4_weight_server: cudaIpcGetMemHandle failed for q2k repack %s: %s\n",
-                        t.name.c_str(), cudaGetErrorString(herr));
-                release_owned_range(r);
+                        j.t->name.c_str(), cudaGetErrorString(herr));
+                release_owned_range(j.r);
                 ok = false;
-                break;
+                continue;
             }
-            r.handle = handle;
+            j.r.handle = handle;
         }
-        ranges.push_back(r);
-        total_bytes += art_bytes;
+        ranges.push_back(j.r);
+        total_bytes += j.r.bytes;
         count++;
     }
 
-    if (stage) (void)cudaFreeHost(stage);
-    if (scratch) (void)cudaFree(scratch);
     unmap_file(m);
     if (ok && count == 0) {
         fprintf(stderr, "ds4_weight_server: --repack-q2k-aligned found no candidate tensors in %s\n", model_id);
     }
     if (ok) {
         fprintf(stderr,
-                "ds4_weight_server: q2k aligned repack %s: %u tensors %.2f GiB in %.1fs\n",
+                "ds4_weight_server: q2k aligned repack %s: %u tensors %.2f GiB in %.1fs (threads=%d)\n",
                 model_id,
                 count,
                 (double)total_bytes / 1073741824.0,
-                now_sec() - t0);
+                now_sec() - t0,
+                nthreads);
     }
     if (repacked_bytes_out) *repacked_bytes_out = total_bytes;
     return ok;
@@ -2289,6 +2395,10 @@ static void usage(FILE *fp) {
             "                    NOTE: needs clients with ds4_mmq_q2_K_aligned_moe_vec (M2\n"
             "                    moe-down commit); older clients read the down stacks through\n"
             "                    a catastrophic host-mmap tier on a repacked manifest.\n"
+            "  --repack-threads N Worker threads for the aligned repack builds (S5).\n"
+            "                    Default: auto (min(6, cores)); DS4_WS_REPACK_THREADS also read.\n"
+            "  --repack-hash     Print a per-artifact FNV-1a after each repack build (the\n"
+            "                    thread-count bit-identity gate; costs a D2H pass).\n"
             "  --dry-run         Parse GGUFs, print upload plan, and exit before allocation\n");
 }
 
@@ -2358,6 +2468,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--repack-iq2-aligned")) { repack_iq2_aligned = true; repack_explicit = true; }
         else if (!strcmp(argv[i], "--repack-q8-aligned")) { repack_q8_aligned = true; repack_explicit = true; }
         else if (!strcmp(argv[i], "--repack-q2k-aligned")) { repack_q2k_aligned = true; repack_explicit = true; }
+        else if (!strcmp(argv[i], "--repack-threads") && i + 1 < argc) g_repack_threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--repack-hash")) g_repack_hash = true;
         else if (!strcmp(argv[i], "--no-repack-iq2-aligned")) repack_iq2_aligned = false;
         else if (!strcmp(argv[i], "--no-repack-q8-aligned")) repack_q8_aligned = false;
         else if (!strcmp(argv[i], "--no-repack-q2k-aligned")) repack_q2k_aligned = false;
@@ -2390,6 +2502,10 @@ int main(int argc, char **argv) {
     if (span_bytes > 4096ull * 1048576ull) span_bytes = 4096ull * 1048576ull;
     if (copy_chunk_bytes < 16ull * 1048576ull) copy_chunk_bytes = 16ull * 1048576ull;
     if (copy_chunk_bytes > 1024ull * 1048576ull) copy_chunk_bytes = 1024ull * 1048576ull;
+    if (!g_repack_hash) {
+        const char *rh = getenv("DS4_WS_REPACK_HASH");
+        g_repack_hash = rh && rh[0] == '1' && rh[1] == '\0';
+    }
     if (!want_base && (repack_iq2_aligned || repack_q8_aligned || repack_q2k_aligned)) {
         if (repack_explicit) {
             fprintf(stderr, "ds4_weight_server: derived artifacts currently require base scope\n");
