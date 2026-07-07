@@ -512,14 +512,15 @@ int ds4_mmq_moe_impl(
     const int si1  = n_expert_used;
     const int sis1 = 1;
 
-    // mm_ids_helper uses n_tokens * 4 bytes of dynamic shared memory and
-    // GGML_ASSERT-aborts past the device cap.  The down matmul reaches here
-    // with n_tokens = assignments (6x the forward width), so an unchunked
-    // >~4.1k-token forward would abort the process (seen: a serial warm-start
-    // suffix prefill of 4511 tokens -> 27066 assignments = 108 KB > smpbo).
-    // Refuse instead; the caller falls back to the legacy MoE path, which
-    // scales its grids by n_tokens.
-    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo) {
+    // The smem mm_ids_helper uses n_tokens * 4 bytes of dynamic shared memory;
+    // the down matmul reaches here with n_tokens = assignments (6x the forward
+    // width), so 8192-row prefill chunks pass 48384 "tokens" > cap.  P5: past
+    // the cap the launcher dispatches the bit-identical two-pass global
+    // variant instead (mmid.cu mm_ids_helper_global) — refusing here used to
+    // throw the WHOLE MoE block (including gate/up mmq work) onto the legacy
+    // expert-tile fallback, the W8192 prefill cliff.  DS4_MMID_LARGE=0
+    // restores the refusal.
+    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ds4_mmid_large_enabled()) {
         fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
                 tag, n_tokens);
         return -1;
@@ -711,10 +712,10 @@ int ds4_mmq_moe_pair_impl(
     const int si1  = n_expert_used;
     const int sis1 = 1;
 
-    // Same shared-mem cap guard as ds4_mmq_moe_impl: mm_ids_helper
-    // GGML_ASSERT-aborts at n_tokens * 4 > smpbo; refuse so the caller can
-    // fall back to the legacy MoE path.
-    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo) {
+    // Same cap guard as ds4_mmq_moe_impl (see comment there): past the smem
+    // cap the launcher takes the bit-identical global variant (P5); only
+    // refuse with DS4_MMID_LARGE=0.
+    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ds4_mmid_large_enabled()) {
         fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
                 tag, n_tokens);
         return -1;
