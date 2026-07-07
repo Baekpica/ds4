@@ -8257,8 +8257,12 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     }
 }
 
+/* min 2 blocks/SM caps ptxas at 64 regs/thread (512 thr x 64 x 2 = the full
+ * 64K regfile).  Native sm_121 ptxas otherwise picks 72 regs, which fits only
+ * ONE block/SM: occupancy halves and this kernel went 53 -> 85 ms/launch at
+ * W4096 prefill (sm_75-JIT ran at 64 regs / 2 blocks -- the proven point). */
 template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
-__global__ static void attention_indexed_mixed_heads8_online_kernel(
+__global__ static void __launch_bounds__(512, 2) attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
@@ -8609,7 +8613,10 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
-__global__ static void attention_decode_mixed_heads8_online_kernel(
+/* min 4 blocks/SM caps ptxas at 64 regs/thread (256 thr): native sm_121 ptxas
+ * picks 72 regs = 3 blocks/SM and long-ctx decode attention pays +18%
+ * (14.7 -> 17.4 ms at 12k KV).  Same 64-reg pin as the prefill twin above. */
+__global__ static void __launch_bounds__(256, 4) attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
