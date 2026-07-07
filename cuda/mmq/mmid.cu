@@ -144,10 +144,37 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
 }
 
+// ds4 local: kill switch for the case-1 fast path below (DS4_MMID_CASE1=0).
+static bool ds4_mmid_case1_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * env = getenv("DS4_MMID_CASE1");
+        cached = !(env && env[0] == '0');
+    }
+    return cached != 0;
+}
+
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
     switch (n_expert_used) {
+        case  1:
+            // ds4 local: the routed-MoE down matmul reinterprets (token, slot)
+            // assignment rows as single-expert "tokens" (ds4_mmq.cu
+            // ds4_mmq_moe_impl, n_expert_used=1).  Without this case it fell to
+            // the generic <0> template: one warp per expert scanning all
+            // assignment rows with a single active lane -> 22.5 ms/launch at
+            // W4096 prefill (2.90 s of a 12k admission).  The optimized template
+            // at neu_padded=1 covers 32 rows/iteration and emits bit-identical
+            // id maps (proto_mm_ids.cu: parity on uniform/skewed/2%-invalid/
+            // decode shapes, 20.4x at the W4096 shape).  DS4_MMID_CASE1=0
+            // reverts to the generic path.
+            if (ds4_mmid_case1_enabled()) {
+                launch_mm_ids_helper< 1>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
+            } else {
+                launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
+            }
+            break;
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
             break;
