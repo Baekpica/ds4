@@ -25869,12 +25869,19 @@ static uint32_t bg_prefill_chunk_tokens(void) {
          * window+chunk instead of a whole prompt.  Set to 0 for legacy one-shot. */
         v = (e && e[0]) ? atoi(e) : 4096;
         if (v < 0) v = 0;
-        /* P1 fence (roofline recon 2026-07-07): forwards wider than ~4k rows
-         * fall off a cliff (12k prompt at W8192 = 46 tok/s vs 302 at W4096,
-         * unattributed until P5), so chunk widths above 4096 are clamped.
-         * DS4_CONT_PREFILL_NOFENCE=1 is the P5-recon escape hatch. */
+        /* P5 (2026-07-08): the W8192 cliff was the mm_ids_helper smem cap
+         * throwing the whole MoE block onto expert-tile fallbacks -- fixed by
+         * mm_ids_helper_global (gate cmtp5a: forced-W8192 454 vs cliff 51
+         * tok/s @12k).  Post-fix A/B: W8192 = 454 vs W4096 = 445 (+2.0% wall)
+         * but GPU kernel time is FLAT (28.35 vs 28.00 s -- mmq runs less
+         * efficiently at 8192-row chunks, offsetting the chunk-tax savings;
+         * trace cmtp5w9) and a -c 16384 boot pays ~5.2 GiB more (raw ring
+         * 8192 vs 4352 + max_tokens scratch).  Default stays 4096 (best
+         * perf/GiB; re-evaluate after the mul_mat_q tile work); explicit
+         * chunk widths are honored up to 8192, the measured limit.
+         * DS4_CONT_PREFILL_NOFENCE=1 lifts the clamp for recon. */
         const char *nf = getenv("DS4_CONT_PREFILL_NOFENCE");
-        if (v > 4096 && !(nf && nf[0] == '1' && nf[1] == '\0')) v = 4096;
+        if (v > 8192 && !(nf && nf[0] == '1' && nf[1] == '\0')) v = 8192;
     }
     return (uint32_t)v;
 }

@@ -12189,7 +12189,9 @@ static void generate_continuous_jobs(server *s, job *first) {
  * cold-admit prefill 248->304 tok/s at 12k prompts vs the 2048 cap, for ~2 GiB
  * of scratch over 2048 (S6 ledger trade, affordable in the ship budget); wider
  * chunks also raise MoE rows/expert (96 vs 48), compounding the mmq tile work.
- * 8192-wide forwards CLIFF ~6x (see bg_prefill_chunk_tokens fence in ds4.c).
+ * 8192-wide forwards used to CLIFF ~6x on the mm_ids_helper smem cap; fixed
+ * (P5, mm_ids_helper_global) and re-A/B'd at +2.0% wall for ~5.2 GiB more
+ * boot budget -- not worth a default flip, see bg_prefill_chunk_tokens.
  * Ctx-aware: contexts below 4096 size to ctx (the per-seq committed bound;
  * wider groups just split).  The env knob is the kill switch
  * (DS4_SERVER_COALESCE_MAX_TOKENS=2048 = pre-P1 sizing). */
