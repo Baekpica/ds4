@@ -10547,6 +10547,11 @@ static bool metal_graph_use_reference_compressor_pair_proj(void) {
     return metal_graph_env_flag("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
 }
 
+static bool metal_graph_idx_gate_disabled(void) {
+    static int cache = -1;
+    return metal_graph_env_flag("DS4_NO_IDX_GATE", &cache);
+}
+
 static bool metal_graph_use_reference_hc_norm_decode(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_HC_NORM_FUSION", &cache);
@@ -15686,6 +15691,39 @@ static void metal_graph_hc_stage_batch_parity(
     }
 }
 
+/* C3-Inc6 gate-consistency selftest (DS4_IDX_GATE_SELFTEST=<PASS budget>):
+ * asserts at every sparse-indexer CONSUMER site that the producer block ran
+ * this layer/step.  The producer gate must imply every consumer's condition
+ * (including the per-token walk's mid-chunk threshold crossing), so a FAIL
+ * means the hoist condition is wrong for that step shape.  FAILs always
+ * print while enabled; PASSes are budgeted.  Gate legs only. */
+static void metal_graph_idx_gate_selftest(uint32_t     il,
+                                          uint32_t     n_comp_seen,
+                                          uint32_t     n_tokens,
+                                          bool         producers_ran,
+                                          const char  *site) {
+    static int enabled = -1;
+    static int budget = 0;
+    if (enabled < 0) {
+        const char *st = getenv("DS4_IDX_GATE_SELFTEST");
+        enabled = st && *st ? 1 : 0;
+        budget = enabled ? atoi(st) : 0;
+        if (enabled && budget <= 1) budget = 512;
+    }
+    if (!enabled) return;
+    if (!producers_ran) {
+        fprintf(stderr,
+                "ds4: IDXGATE-SELFTEST %s il=%u n_comp=%u n=%u FAIL (consumer without producers)\n",
+                site, il, n_comp_seen, n_tokens);
+        return;
+    }
+    if (budget > 0) {
+        budget--;
+        fprintf(stderr, "ds4: IDXGATE-SELFTEST %s il=%u n_comp=%u n=%u PASS\n",
+                site, il, n_comp_seen, n_tokens);
+    }
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15814,6 +15852,7 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     uint32_t *comp_counts = compressed ? xcalloc(n_tokens, sizeof(comp_counts[0])) : NULL;
     uint32_t *index_counts = ratio == 4 ? xcalloc(n_tokens, sizeof(index_counts[0])) : NULL;
+    bool idx_producers_ran = false;   /* C3-Inc6 gate witness (selftest) */
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
     ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
@@ -17098,42 +17137,59 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   (uint64_t)index_width * n_tokens,
                                                   il,
                                                   pos0);
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_q,
-                                                     model->map,
-                                                     model->size,
-                                                     layer->indexer_attn_q_b->abs_offset,
-                                                     q_rank,
-                                                     (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
-                                                     g->batch_qr_norm,
-                                                     n_tokens) != 0;
-            if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_indexer_q,
-                                                    n_tokens,
-                                                    DS4_N_INDEXER_HEAD,
-                                                    DS4_N_INDEXER_HEAD_DIM,
-                                                    DS4_N_ROT,
-                                                    pos0,
-                                                    positions,
-                                                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                    false,
-                                                    freq_base,
-                                                    freq_scale,
-                                                    ext_factor,
-                                                    attn_factor,
-                                                    DS4_ROPE_YARN_BETA_FAST,
-                                                    DS4_ROPE_YARN_BETA_SLOW) != 0;
-            if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
-                                                          n_tokens * DS4_N_INDEXER_HEAD,
-                                                          DS4_N_INDEXER_HEAD_DIM,
-                                                          /* indexer-Q QAT, not the comp cache: no mirror. */
-                                                          NULL, NULL) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
-                                                     model->map,
-                                                     model->size,
-                                                     layer->indexer_proj->abs_offset,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_INDEXER_HEAD,
-                                                     g->batch_attn_norm,
-                                                     n_tokens) != 0;
+            /* C3-Inc6: the indexer q/score producers feed ONLY the sparse
+             * top-k consumers below (scores/topk, all gated on the count
+             * exceeding DS4_N_INDEXER_TOP_K); under the threshold the
+             * attention is dense and both outputs are unread.  n_comp here
+             * is the END-of-step count on every path (multiseq bank max,
+             * zero-prefix total, single-seq walk) and the per-token walk's
+             * cur_comp never exceeds it, so this condition covers every
+             * consumer -- and it is exactly the cont-capture key's
+             * indexed_active flag, keeping gate-on/off layer bodies
+             * distinct graphs.  The indexer COMPRESSOR above stays
+             * unconditional: it maintains the index state banks + caches
+             * that make the gate flippable on any later step.
+             * DS4_NO_IDX_GATE=1 restores the unconditional producers. */
+            idx_producers_ran = n_comp > DS4_N_INDEXER_TOP_K ||
+                                metal_graph_idx_gate_disabled();
+            if (ok && idx_producers_ran) {
+                ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_q,
+                                                 model->map,
+                                                 model->size,
+                                                 layer->indexer_attn_q_b->abs_offset,
+                                                 q_rank,
+                                                 (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
+                                                 g->batch_qr_norm,
+                                                 n_tokens) != 0;
+                if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_indexer_q,
+                                                        n_tokens,
+                                                        DS4_N_INDEXER_HEAD,
+                                                        DS4_N_INDEXER_HEAD_DIM,
+                                                        DS4_N_ROT,
+                                                        pos0,
+                                                        positions,
+                                                        compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                        false,
+                                                        freq_base,
+                                                        freq_scale,
+                                                        ext_factor,
+                                                        attn_factor,
+                                                        DS4_ROPE_YARN_BETA_FAST,
+                                                        DS4_ROPE_YARN_BETA_SLOW) != 0;
+                if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
+                                                              n_tokens * DS4_N_INDEXER_HEAD,
+                                                              DS4_N_INDEXER_HEAD_DIM,
+                                                              /* indexer-Q QAT, not the comp cache: no mirror. */
+                                                              NULL, NULL) != 0;
+                if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->indexer_proj->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_INDEXER_HEAD,
+                                                         g->batch_attn_norm,
+                                                         n_tokens) != 0;
+            }
             if (use_multiseq && !zero_prefix && g->batch_multiseq_emit && !g->batch_defer_comp_store) {
                 /* Step 4d (Scope A): per-seq INDEXER compressor emit, the
                  * sibling of the attn emit above.  Same per-seq bank/counter
@@ -17814,6 +17870,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      DS4_N_HEAD_DIM,
                                                      seq_positions, seq_id) != 0;
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
+                metal_graph_idx_gate_selftest(il, n_comp, n_tokens,
+                                              idx_producers_ran, "ms-decode");
                 const uint32_t sp_idx = ds4_gpu_stage_prof_begin(DS4_SPROF_IDXSCORE);
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {
@@ -17999,6 +18057,8 @@ static bool metal_graph_encode_layer_attention_batch(
 
         const bool topk_prefill_needed = ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K;
         if (ok && zero_prefix && topk_prefill_needed && n_comp != 0) {
+            metal_graph_idx_gate_selftest(il, n_comp, n_tokens,
+                                          idx_producers_ran, "prefill");
             const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
             double index_stage_t0 = 0.0;
             if (index_stage_profile) {
@@ -18160,6 +18220,8 @@ static bool metal_graph_encode_layer_attention_batch(
                 ds4_gpu_tensor *comp_mask = NULL;
 
                 if (ratio == 4 && cur_comp > DS4_N_INDEXER_TOP_K) {
+                    metal_graph_idx_gate_selftest(il, cur_comp, n_tokens,
+                                                  idx_producers_ran, "walk");
                     const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                     ds4_gpu_tensor *indexer_q_view = metal_graph_tensor_row_view(
                             g->batch_indexer_q, t, (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM);
