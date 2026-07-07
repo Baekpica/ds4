@@ -9017,6 +9017,74 @@ __global__ static void hc_expand_add_split_n2_rows_kernel(
     out_hc[(uint64_t)dst_hc * n_embd + d] = acc;
 }
 
+/* P3-Inc2: batched hc_expand with the NEXT HC stage's rms_norm folded in.
+ * One block per token; per-element expand math is source-identical to
+ * hc_expand_kernel and the sumsq accumulation walks i = tid, tid+256, ...
+ * exactly like rms_norm_plain_kernel (blockDim MUST stay 256 for that).
+ * NOT bit-exact vs the unfused pair: ptxas contracts the unrolled
+ * compile-time-N_HC expression tree differently from the runtime-loop
+ * original (measured: 1-ulp f32 diffs on ~10% of elements) -- the same
+ * accuracy class the M2-Inc1/C3-Inc3a HC fusions shipped with.  Gated by
+ * the bounded-ulp selftest below + the full quality battery.  Kills the
+ * rms-fold kernel's full re-read of the expand output (64 KB/token). */
+template <uint32_t N_EMBD, uint32_t N_HC>
+__global__ static void __launch_bounds__(256) hc_expand_split_rmsf16_kernel(
+        float *out_hc,
+        __half *xh_out,
+        const float *block_out,
+        const float *block_add,
+        const float *residual_hc,
+        const float *post,
+        const float *comb,
+        uint32_t n_tokens,
+        uint32_t post_stride,
+        uint32_t comb_stride,
+        int has_add,
+        float eps) {
+    constexpr uint32_t N = N_EMBD * N_HC;
+    constexpr uint32_t NPT = N / 256u;
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const float *bo = block_out + (uint64_t)t * N_EMBD;
+    const float *ba = block_add + (uint64_t)t * N_EMBD;
+    const float *res = residual_hc + (uint64_t)t * N;
+    const float *po = post + (uint64_t)t * post_stride;
+    const float *co = comb + (uint64_t)t * comb_stride;
+    float *orow = out_hc + (uint64_t)t * N;
+    __half *hrow = xh_out + (uint64_t)t * N;
+
+    float v[NPT];
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < NPT; j++) {
+        const uint32_t i = threadIdx.x + j * 256u;
+        const uint32_t dst_hc = i / N_EMBD;
+        const uint32_t d = i % N_EMBD;
+        float block_v = bo[d];
+        if (has_add) block_v += ba[d];
+        float acc = block_v * po[dst_hc];
+        for (uint32_t src_hc = 0; src_hc < N_HC; src_hc++) {
+            acc += co[dst_hc + src_hc * N_HC] * res[(uint64_t)src_hc * N_EMBD + d];
+        }
+        orow[i] = acc;
+        v[j] = acc;
+        sum += acc * acc;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = 256u >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)N + eps);
+#pragma unroll
+    for (uint32_t j = 0; j < NPT; j++) {
+        const uint32_t i = threadIdx.x + j * 256u;
+        hrow[i] = __float2half(v[j] * scale);
+    }
+}
+
 __global__ static void hc_split_weighted_sum_fused_kernel(
         float *out,
         float *split,
@@ -15916,6 +15984,53 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(ds4_gpu_tensor *out, const voi
                                      CUDA_R_32F,
                                      CUBLAS_GEMM_DEFAULT);
     const int rc = cublas_ok(st, "f16 rms-fold matmul");
+    q8p_end(q8ps, ds4_current_stream());
+    return rc;
+}
+
+/* P3-Inc2: batched f16 matmul on PRE-CONVERTED f16 activations (emitted by
+ * ds4_gpu_hc_expand_rmsf16_split_tensor into the caller-owned buffer) -- the
+ * cublasGemmEx branch with no convert launch at all.  Returns 0 with `out`
+ * untouched on any precondition miss; the caller must then run one of the
+ * fallback chains (rms-fold or fully unfused). */
+extern "C" int ds4_gpu_matmul_f16_preconv_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *xh, uint64_t n_tok) {
+    if (!out || !xh || !model_map) return 0;
+    if (!g_cublas_ready || n_tok <= cuda_native_f16_max_tokens()) return 0;
+    if (getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    if (in_dim == 0 || in_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (xh->bytes < n_tok * in_dim * sizeof(__half) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16_preconv");
+    if (!wptr) return 0;
+    const __half *w = (const __half *)wptr;
+    const uint32_t q8ps = q8p_begin_tagged("f16_preconv", in_dim, out_dim, n_tok,
+                                           weight_bytes, ds4_current_stream());
+    if (g_cublas_ws) (void)cudaMemsetAsync(g_cublas_ws, 0, g_cublas_ws_bytes, ds4_current_stream());
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(g_cublas,
+                                     CUBLAS_OP_T,
+                                     CUBLAS_OP_N,
+                                     (int)out_dim,
+                                     (int)n_tok,
+                                     (int)in_dim,
+                                     &alpha,
+                                     w,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     (const __half *)xh->ptr,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     &beta,
+                                     out->ptr,
+                                     CUDA_R_32F,
+                                     (int)out_dim,
+                                     CUDA_R_32F,
+                                     CUBLAS_GEMM_DEFAULT);
+    const int rc = cublas_ok(st, "f16 preconv matmul");
     q8p_end(q8ps, ds4_current_stream());
     return rc;
 }
@@ -23564,6 +23679,134 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
                                                     mix_hc, mix_hc, 1);
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
 }
+/* P3-Inc2: fused batched hc_expand + next-stage rms_norm f16 emission (see
+ * hc_expand_split_rmsf16_kernel).  block_add == NULL -> plain expand (attn
+ * side); non-NULL -> add variant (ffn side).  xh_out receives the f16 GEMM
+ * activations for the NEXT HC mix (1-ulp contraction class vs the unfused
+ * pair -- see the kernel comment).  Returns 0 with all outputs untouched on
+ * any precondition miss; the caller must then run the unfused expand (and
+ * the next mix falls back on its own).
+ * Kill switch: DS4_CUDA_NO_HC_EXPAND_RMS_FOLD=1. */
+extern "C" int ds4_gpu_hc_expand_rmsf16_split_tensor(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *xh_out, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc, float norm_eps) {
+    static int no_fold = -1;
+    if (no_fold < 0) no_fold = getenv("DS4_CUDA_NO_HC_EXPAND_RMS_FOLD") != NULL;
+    if (no_fold) return 0;
+    if (!out_hc || !xh_out || !block_out || !residual_hc || !split) return 0;
+    if (n_embd != 4096u || n_hc != 4u) return 0;
+    const uint64_t n = (uint64_t)n_hc * n_embd;
+    const uint32_t n_tokens = (uint32_t)(out_hc->bytes / (n * sizeof(float)));
+    /* The f16 emission only pays off when the next mix takes the cublas
+     * batch path; at native-f16 widths the consumer reads f32 directly. */
+    if (n_tokens <= cuda_native_f16_max_tokens()) return 0;
+    if (xh_out->bytes < (uint64_t)n_tokens * n * sizeof(__half)) return 0;
+    const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    const float *base = (const float *)split->ptr;
+    const int has_add = block_add != NULL;
+    const float *badd = has_add ? (const float *)block_add->ptr : (const float *)block_out->ptr;
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "ds4: hc expand emitting rms-fold f16 activations (P3-Inc2)\n");
+    }
+    hc_expand_split_rmsf16_kernel<4096u, 4u><<<n_tokens, 256, 0, ds4_current_stream()>>>(
+            (float *)out_hc->ptr, (__half *)xh_out->ptr,
+            (const float *)block_out->ptr, badd,
+            (const float *)residual_hc->ptr,
+            base + n_hc, base + 2u * n_hc,
+            n_tokens, mix_hc, mix_hc, has_add, norm_eps);
+    if (!cuda_ok(cudaGetLastError(), "hc_expand_rmsf16 launch")) return 0;
+    /* One-shot bounded-error parity selftest at production shape
+     * (DS4_HC_EXPAND_RMS_FOLD_SELFTEST=1): run the unfused hc_expand_kernel +
+     * rms_norm_plain_f16_rows_kernel pair into private scratch and compare
+     * BOTH outputs.  The contraction variance is ~1 intermediate ulp, which
+     * cancellation can blow up to enormous ULP distances on near-zero
+     * elements while the ABSOLUTE error stays ~2^-24 of row scale -- so the
+     * f32 bound is per-row absolute-at-row-scale: max |fused-ref| <=
+     * rms(row) * 2^-19 (32x the measured class; a real indexing bug is
+     * O(row scale), ~500000x over).  f16 bound: max 4 ulp on <= 0.1% of
+     * elements.  Any non-finite disagreement is an automatic FAIL.
+     * Synchronous and off by default. */
+    static int selftest = -1;
+    if (selftest < 0) selftest = getenv("DS4_HC_EXPAND_RMS_FOLD_SELFTEST") != NULL;
+    if (selftest == 1) {
+        selftest = 2;
+        const uint64_t fbytes = (uint64_t)n_tokens * n * sizeof(float);
+        const uint64_t hbytes = (uint64_t)n_tokens * n * sizeof(__half);
+        float *out_ref = NULL;
+        __half *xh_ref = NULL;
+        void *ha = malloc(fbytes), *hb = malloc(fbytes);
+        void *hc = malloc(hbytes), *hd = malloc(hbytes);
+        if (cudaMalloc(&out_ref, fbytes) == cudaSuccess &&
+            cudaMalloc(&xh_ref, hbytes) == cudaSuccess && ha && hb && hc && hd) {
+            const uint64_t n_elem = (uint64_t)n_tokens * n;
+            hc_expand_kernel<<<(unsigned)((n_elem + 255) / 256), 256, 0, ds4_current_stream()>>>(
+                    out_ref, (const float *)block_out->ptr, badd,
+                    (const float *)residual_hc->ptr, base + n_hc, base + 2u * n_hc,
+                    n_embd, n_hc, n_tokens, mix_hc, mix_hc, has_add);
+            rms_norm_plain_f16_rows_kernel<<<n_tokens, 256, 0, ds4_current_stream()>>>(
+                    xh_ref, out_ref, (uint32_t)n, n_tokens, norm_eps);
+            cudaMemcpyAsync(ha, out_hc->ptr, fbytes, cudaMemcpyDeviceToHost, ds4_current_stream());
+            cudaMemcpyAsync(hb, out_ref, fbytes, cudaMemcpyDeviceToHost, ds4_current_stream());
+            cudaMemcpyAsync(hc, xh_out->ptr, hbytes, cudaMemcpyDeviceToHost, ds4_current_stream());
+            cudaMemcpyAsync(hd, xh_ref, hbytes, cudaMemcpyDeviceToHost, ds4_current_stream());
+            if (cudaStreamSynchronize(ds4_current_stream()) == cudaSuccess) {
+                const uint64_t total = (uint64_t)n_tokens * n;
+                const float *fa = (const float *)ha;
+                const float *fb = (const float *)hb;
+                const uint16_t *ga = (const uint16_t *)hc;
+                const uint16_t *gb = (const uint16_t *)hd;
+                double worst_ratio = 0.0;   /* max over rows of maxdiff / (rms * 2^-19) */
+                uint64_t f32_diff = 0;
+                uint64_t f16_ulp_max = 0, f16_diff = 0;
+                int nonfinite = 0;
+                for (uint32_t t = 0; t < n_tokens && !nonfinite; t++) {
+                    const float *ra = fa + (uint64_t)t * n;
+                    const float *rb = fb + (uint64_t)t * n;
+                    double ss = 0.0, maxd = 0.0;
+                    for (uint64_t i = 0; i < n; i++) {
+                        if (!isfinite(ra[i]) || !isfinite(rb[i])) {
+                            if (ra[i] != rb[i]) { nonfinite = 1; break; }
+                            continue;
+                        }
+                        ss += (double)rb[i] * (double)rb[i];
+                        const double d = fabs((double)ra[i] - (double)rb[i]);
+                        if (d > 0.0) f32_diff++;
+                        if (d > maxd) maxd = d;
+                    }
+                    const double scale = sqrt(ss / (double)n);
+                    const double bound = scale * 1.9073486328125e-06; /* 2^-19 */
+                    const double ratio = bound > 0.0 ? maxd / bound : (maxd > 0.0 ? 1e30 : 0.0);
+                    if (ratio > worst_ratio) worst_ratio = ratio;
+                }
+                for (uint64_t i = 0; i < total && !nonfinite; i++) {
+                    const int32_t ja = ga[i] & 0x8000 ? (int32_t)INT16_MIN - (int32_t)(int16_t)ga[i] : (int32_t)ga[i];
+                    const int32_t jb = gb[i] & 0x8000 ? (int32_t)INT16_MIN - (int32_t)(int16_t)gb[i] : (int32_t)gb[i];
+                    if (ja != jb) {
+                        const uint64_t d = (uint64_t)(ja > jb ? ja - jb : jb - ja);
+                        if (d > f16_ulp_max) f16_ulp_max = d;
+                        f16_diff++;
+                    }
+                }
+                const int pass = !nonfinite && worst_ratio <= 1.0 && f16_ulp_max <= 4 &&
+                                 f16_diff * 1000 <= total;
+                fprintf(stderr, "ds4: HC-EXPAND-RMS-FOLD SELFTEST %s (rows=%u f32 worst=%.3f of row-scale bound diffs=%llu, f16 max_ulp=%llu diffs=%llu/%llu%s)\n",
+                        pass ? "PASS" : "FAIL", (unsigned)n_tokens,
+                        worst_ratio, (unsigned long long)f32_diff,
+                        (unsigned long long)f16_ulp_max, (unsigned long long)f16_diff,
+                        (unsigned long long)total, nonfinite ? ", NONFINITE" : "");
+            } else {
+                fprintf(stderr, "ds4: HC-EXPAND-RMS-FOLD SELFTEST FAIL (sync error)\n");
+            }
+        } else {
+            fprintf(stderr, "ds4: HC-EXPAND-RMS-FOLD SELFTEST FAIL (alloc)\n");
+        }
+        if (out_ref) cudaFree(out_ref);
+        if (xh_ref) cudaFree(xh_ref);
+        free(ha); free(hb); free(hc); free(hd);
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_hc_expand_add_split_n2_rows_tensor(ds4_gpu_tensor *out0_hc, ds4_gpu_tensor *out1_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out0_hc || !out1_hc || !block_out || !block_add || !residual_hc || !split ||
         n_embd == 0 || n_hc == 0) return 0;

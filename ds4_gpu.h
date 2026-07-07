@@ -817,6 +817,19 @@ int ds4_gpu_matmul_f16_rms_fold_tensor(
         uint64_t                n_tok,
         float                   norm_eps);
 
+/* P3-Inc2: f16 matmul on pre-converted f16 activations (see
+ * ds4_gpu_hc_expand_rmsf16_split_tensor, which emits them).  Returns 0 with
+ * `out` untouched on any precondition miss. */
+int ds4_gpu_matmul_f16_preconv_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *xh,
+        uint64_t                n_tok);
+
 int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor       *out_a,
         ds4_gpu_tensor       *out_b,
@@ -2008,6 +2021,23 @@ int ds4_gpu_hc_expand_add_split_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* P3-Inc2: fused batched hc_expand + next-HC-stage rms_norm f16 emission
+ * (block_add == NULL -> plain expand, non-NULL -> add variant).  xh_out
+ * receives the next mix GEMM's f16 activations.  1-ulp FMA-contraction
+ * class vs the unfused expand + rms_norm_plain + f32_to_f16 chain (NOT
+ * bit-exact; bounded-ulp selftest + quality battery gate it).  Returns 0
+ * with all outputs untouched on any precondition miss. */
+int ds4_gpu_hc_expand_rmsf16_split_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *xh_out,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        float                   norm_eps);
 
 int ds4_gpu_hc_expand_add_split_n2_rows_tensor(
         ds4_gpu_tensor       *out0_hc,

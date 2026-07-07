@@ -9373,6 +9373,16 @@ typedef struct {
     ds4_gpu_tensor *batch_cur_hc;
     ds4_gpu_tensor *batch_next_hc;
     ds4_gpu_tensor *batch_flat_hc;
+    /* P3-Inc2: producer-fold handshake.  When the fused hc_expand emitted f16
+     * normed activations into batch_flat_hc for the f32 tensor X it wrote,
+     * batch_hc_f16_src holds X's ds4_gpu_tensor pointer (stable allocations;
+     * the cur/next swap moves the SAME struct pointer, carrying the match
+     * across the layer boundary) and batch_hc_f16_ntok the row count.  The
+     * next HC mix stage consumes it iff BOTH match its own input, and clears
+     * it unconditionally (one-shot); metal_graph_encode_layer_batch clears it
+     * at il==0 so no flag survives into a fresh chunk. */
+    const void *batch_hc_f16_src;
+    uint32_t batch_hc_f16_ntok;
     ds4_gpu_tensor *batch_hc_mix;
     ds4_gpu_tensor *batch_hc_split;
     ds4_gpu_tensor *batch_attn_cur;
@@ -10203,6 +10213,8 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_flat_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
+    g->batch_hc_f16_src = NULL;
+    g->batch_hc_f16_ntok = 0;
     g->batch_hc_mix = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_hc_split = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_attn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
@@ -15897,14 +15909,26 @@ static bool metal_graph_encode_layer_attention_batch(
     /* P3-Inc1: batched HC-stage norm fold -- rms_norm_plain + the GEMM's
      * f32_to_f16 activation convert collapse into one kernel with
      * bit-identical f16 activations (see ds4_gpu_matmul_f16_rms_fold_tensor).
-     * Precondition miss returns 0 with hc_mix untouched and the unfused
-     * chain below runs.  Kill switch DS4_CUDA_NO_RMS_F16_FOLD. */
+     * P3-Inc2: when the previous layer's fused hc_expand already emitted the
+     * f16 activations for THIS input (handshake matches ptr + rows), even
+     * that pass is skipped and the GEMM runs on batch_flat_hc directly.
+     * Precondition miss returns 0 with hc_mix untouched and the next
+     * fallback runs.  Kill switch DS4_CUDA_NO_RMS_F16_FOLD. */
+    const bool hc_f16_ready = g->batch_hc_f16_src != NULL &&
+        g->batch_hc_f16_src == (const void *)g->batch_cur_hc &&
+        g->batch_hc_f16_ntok == n_tokens;
+    g->batch_hc_f16_src = NULL;
     bool hc_norm_folded = false;
     if (ok && !hc_attn_fused && !metal_graph_use_reference_hc_decode() &&
         layer->hc_attn_fn->type == DS4_TENSOR_F16) {
-        hc_norm_folded = ds4_gpu_matmul_f16_rms_fold_tensor(hc_mix_view,
-                model->map, model->size, layer->hc_attn_fn->abs_offset,
-                hc_dim, mix_hc, g->batch_cur_hc, n_tokens, DS4_RMS_EPS) != 0;
+        if (hc_f16_ready)
+            hc_norm_folded = ds4_gpu_matmul_f16_preconv_tensor(hc_mix_view,
+                    model->map, model->size, layer->hc_attn_fn->abs_offset,
+                    hc_dim, mix_hc, g->batch_flat_hc, n_tokens) != 0;
+        if (!hc_norm_folded)
+            hc_norm_folded = ds4_gpu_matmul_f16_rms_fold_tensor(hc_mix_view,
+                    model->map, model->size, layer->hc_attn_fn->abs_offset,
+                    hc_dim, mix_hc, g->batch_cur_hc, n_tokens, DS4_RMS_EPS) != 0;
     }
     if (ok && !hc_attn_fused && !hc_norm_folded) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
@@ -18402,12 +18426,28 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
     }
-    if (ok) ok = ds4_gpu_hc_expand_split_tensor(after_attn_hc_view,
-                                                  g->batch_attn_out,
-                                                  g->batch_cur_hc,
-                                                  hc_split_view,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
+    /* P3-Inc2: fused expand also emits the FFN mix's f16 activations into
+     * batch_flat_hc (1-ulp contraction class; bounded-ulp selftest in the
+     * wrapper).  On success the handshake points the ffn HC stage at them;
+     * any miss falls back to the plain expand and the ffn stage's own fold
+     * chain. */
+    bool hc_expand_folded = false;
+    if (ok && !metal_graph_use_reference_hc_decode()) {
+        hc_expand_folded = ds4_gpu_hc_expand_rmsf16_split_tensor(after_attn_hc_view,
+                g->batch_flat_hc, g->batch_attn_out, NULL, g->batch_cur_hc,
+                hc_split_view, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS) != 0;
+        if (hc_expand_folded) {
+            g->batch_hc_f16_src = (const void *)g->batch_after_attn_hc;
+            g->batch_hc_f16_ntok = n_tokens;
+        }
+    }
+    if (ok && !hc_expand_folded)
+        ok = ds4_gpu_hc_expand_split_tensor(after_attn_hc_view,
+                                              g->batch_attn_out,
+                                              g->batch_cur_hc,
+                                              hc_split_view,
+                                              DS4_N_EMBD,
+                                              DS4_N_HC) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->batch_after_attn_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
@@ -18487,14 +18527,23 @@ static bool metal_graph_encode_layer_ffn_batch(
                 DS4_HC_EPS, DS4_RMS_EPS,
                 (batch_q8_pair ? 1u : 0u) | 2u) != 0;
     }
-    /* P3-Inc1: ffn instance of the batched HC-stage norm fold -- see the attn
-     * site.  Kill switch DS4_CUDA_NO_RMS_F16_FOLD. */
+    /* P3-Inc1 + P3-Inc2: ffn instance of the batched HC-stage norm fold --
+     * see the attn site.  Kill switch DS4_CUDA_NO_RMS_F16_FOLD. */
+    const bool hc_f16_ready = g->batch_hc_f16_src != NULL &&
+        g->batch_hc_f16_src == (const void *)g->batch_after_attn_hc &&
+        g->batch_hc_f16_ntok == n_tokens;
+    g->batch_hc_f16_src = NULL;
     bool hc_norm_folded = false;
     if (ok && !hc_ffn_fused && !metal_graph_use_reference_hc_decode() &&
         layer->hc_ffn_fn->type == DS4_TENSOR_F16) {
-        hc_norm_folded = ds4_gpu_matmul_f16_rms_fold_tensor(hc_mix_view,
-                model->map, model->size, layer->hc_ffn_fn->abs_offset,
-                hc_dim, mix_hc, g->batch_after_attn_hc, n_tokens, DS4_RMS_EPS) != 0;
+        if (hc_f16_ready)
+            hc_norm_folded = ds4_gpu_matmul_f16_preconv_tensor(hc_mix_view,
+                    model->map, model->size, layer->hc_ffn_fn->abs_offset,
+                    hc_dim, mix_hc, g->batch_flat_hc, n_tokens) != 0;
+        if (!hc_norm_folded)
+            hc_norm_folded = ds4_gpu_matmul_f16_rms_fold_tensor(hc_mix_view,
+                    model->map, model->size, layer->hc_ffn_fn->abs_offset,
+                    hc_dim, mix_hc, g->batch_after_attn_hc, n_tokens, DS4_RMS_EPS) != 0;
     }
     if (ok && !hc_ffn_fused && !hc_norm_folded) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_after_attn_hc,
@@ -18870,13 +18919,29 @@ static bool metal_graph_encode_layer_ffn_batch(
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
     } else if (ok) {
-        ok = ds4_gpu_hc_expand_add_split_tensor(next_hc_view,
-                                                  g->batch_routed_out,
-                                                  g->batch_shared_out,
-                                                  g->batch_after_attn_hc,
-                                                  hc_split_view,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
+        /* P3-Inc2: ffn instance of the fused expand -- emits the NEXT
+         * layer's attn-mix f16 activations (the cur/next swap below carries
+         * the handshake match across the layer boundary).  The last layer
+         * has no next mix, so it stays on the plain expand. */
+        bool hc_expand_folded = false;
+        if (il + 1u < DS4_N_LAYER && !metal_graph_use_reference_hc_decode()) {
+            hc_expand_folded = ds4_gpu_hc_expand_rmsf16_split_tensor(next_hc_view,
+                    g->batch_flat_hc, g->batch_routed_out, g->batch_shared_out,
+                    g->batch_after_attn_hc, hc_split_view,
+                    DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS) != 0;
+            if (hc_expand_folded) {
+                g->batch_hc_f16_src = (const void *)g->batch_next_hc;
+                g->batch_hc_f16_ntok = n_tokens;
+            }
+        }
+        if (!hc_expand_folded)
+            ok = ds4_gpu_hc_expand_add_split_tensor(next_hc_view,
+                                                      g->batch_routed_out,
+                                                      g->batch_shared_out,
+                                                      g->batch_after_attn_hc,
+                                                      hc_split_view,
+                                                      DS4_N_EMBD,
+                                                      DS4_N_HC) != 0;
     }
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->batch_next_hc,
@@ -18910,6 +18975,8 @@ static bool metal_graph_encode_layer_batch(
      * actor races the layer" (still crashes).  Print-only + env-gated. */
     const char *lsync_env = getenv("DS4_LAYER_STAGE_SYNC");
     const int lsync = lsync_env ? atoi(lsync_env) : 0;
+    /* P3-Inc2: no f16-activation handshake survives into a fresh chunk. */
+    if (il == 0) g->batch_hc_f16_src = NULL;
     const double lyr_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
     const uint32_t sp_attn = ds4_gpu_stage_prof_begin(DS4_SPROF_ATTN);
     bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
