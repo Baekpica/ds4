@@ -27086,7 +27086,18 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    /* S6 lazy session graph: graph alloc deferred to the first GPU-touching
+     * root API (ds4_session_ensure_graph).  Host state (checkpoint, ctx_size,
+     * prefill_cap, logits) is live from create; pos/ctx/tokens readers never
+     * touch the graph.  Always false for CPU and distributed-coordinator
+     * sessions and when DS4_SESSION_LAZY_GRAPH=0. */
+    bool graph_pending;
 };
+
+#ifndef DS4_NO_GPU
+/* S6 lazy session graph (definition above ds4_session_create). */
+static int ds4_session_ensure_graph(ds4_session *s, char *err, size_t errlen);
+#endif
 
 #ifndef DS4_NO_GPU
 /* D4.5a single-forward target-hidden capture: forward layers [0,42] over a
@@ -28586,6 +28597,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     payload_set_err(err, errlen, "graph backend support is not compiled in");
     return 1;
 #else
+    if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS; i++) {
@@ -30437,6 +30449,11 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return 1;
     }
     const uint32_t payload_version = h[1];
+#ifndef DS4_NO_GPU
+    /* S6 lazy graph: loading a disk KV checkpoint writes straight into the
+     * graph's rings (a fresh server session may load before any sync). */
+    if (!ds4_session_is_cpu(s) && ds4_session_ensure_graph(s, err, errlen) != 0) return 1;
+#endif
     if (ds4_session_is_cpu(s)) {
         const uint32_t saved_ctx = h[2];
         const uint32_t saved_prefill_cap = h[3];
@@ -35668,6 +35685,68 @@ void ds4_engine_close(ds4_engine *e) {
     free(e);
 }
 
+#ifndef DS4_NO_GPU
+/* S6 lazy session graph (2026-07-07): the single-session graph is a full
+ * second graph (own prefill scratch, KV rings, MTP/DSpark scaffolding) that
+ * sits idle whenever the persistent batch ctx is the serving path -- ~2 GiB
+ * at -c 2048, ~4 GiB at -c 4096, parked for a serial fallback that ships with
+ * fallbacks=0.  ds4_session_create defers the alloc (graph_pending) and every
+ * GPU-touching root API ensures it on first use, so serial deployments
+ * (DS4_SERVER_CONTINUOUS=0, ds4-bench/-eval/-agent) simply allocate at their
+ * first sync/eval.  Save-side payload APIs need no hook: they early-error on
+ * !checkpoint_valid, which can only be set by a (hooked) sync/eval.
+ * TRADE-OFF, deliberate: under bank starvation the lazy alloc can fail where
+ * the old boot-time alloc could not -- the root API then returns a normal
+ * error (job fails cleanly, server lives; same failure class as an admission
+ * reject).  Freed bytes go to banks (comp_map_budget is computed after
+ * session create, so the deferred graph's bytes land in the KV page budget).
+ * DS4_SESSION_LAZY_GRAPH=0 restores the eager boot alloc.  Distributed
+ * coordinator sessions stay eager (dist_session_create binds the session
+ * during create). */
+static bool ds4_session_lazy_graph_enabled(void) {
+    const char *e = getenv("DS4_SESSION_LAZY_GRAPH");
+    return !(e && e[0] == '0' && e[1] == '\0');   /* default ON */
+}
+
+/* One body for the eager (create) and lazy (ensure) alloc so the two cannot
+ * drift: sizing, quality/power adoption, directional steering. */
+static int ds4_session_alloc_graph(ds4_session *s) {
+    ds4_engine *e = s->engine;
+    const uint32_t raw_cap = metal_graph_raw_cap_for_context(s->ctx_size, s->prefill_cap);
+    if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
+                                   raw_cap, (uint32_t)s->ctx_size, s->prefill_cap,
+                                   e->mtp_ready, e->dspark_ready))
+        return 1;
+    s->graph.quality = e->quality;
+    s->graph.power_percent = (uint32_t)e->power_percent;
+    if (!metal_graph_load_directional_steering(&s->graph,
+                                               e->directional_steering_file,
+                                               e->directional_steering_attn_scale,
+                                               e->directional_steering_ffn_scale)) {
+        metal_graph_free(&s->graph);
+        memset(&s->graph, 0, sizeof(s->graph));
+        return 1;
+    }
+    return 0;
+}
+
+static int ds4_session_ensure_graph(ds4_session *s, char *err, size_t errlen) {
+    if (!s->graph_pending) return 0;
+    if (ds4_session_alloc_graph(s) != 0) {
+        if (err && errlen)
+            snprintf(err, errlen,
+                     "lazy session graph alloc failed (ctx=%d prefill_cap=%u); "
+                     "DS4_SESSION_LAZY_GRAPH=0 pre-allocates at boot",
+                     s->ctx_size, s->prefill_cap);
+        return 1;
+    }
+    s->graph_pending = false;
+    fprintf(stderr, "ds4: session graph allocated lazily (ctx=%d prefill_cap=%u)\n",
+            s->ctx_size, s->prefill_cap);
+    return 0;
+}
+#endif
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -35694,20 +35773,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->engine = e;
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
-    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
-    if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready, e->dspark_ready))
-    {
-        free(s);
-        return 1;
-    }
-    s->graph.quality = e->quality;
-    s->graph.power_percent = (uint32_t)e->power_percent;
-    if (!metal_graph_load_directional_steering(&s->graph,
-                                               e->directional_steering_file,
-                                               e->directional_steering_attn_scale,
-                                               e->directional_steering_ffn_scale)) {
-        metal_graph_free(&s->graph);
+    /* S6 lazy graph: defer the ~2-4 GiB graph alloc to first GPU use unless
+     * disabled or this is a distributed coordinator (whose dist session is
+     * bound below during create). */
+    if (ds4_session_lazy_graph_enabled() &&
+        e->distributed.role != DS4_DISTRIBUTED_COORDINATOR) {
+        s->graph_pending = true;
+    } else if (ds4_session_alloc_graph(s) != 0) {
         free(s);
         return 1;
     }
@@ -35815,6 +35887,7 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
     return 1;
 #else
+    if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         if (errlen) snprintf(err, errlen, "%s layer-slice state reset failed",
                              ds4_backend_name(s->engine->backend));
@@ -35849,6 +35922,7 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
     return 1;
 #else
+    if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_tensor_write(g->cur_hc,
                                    0,
@@ -35963,6 +36037,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     s->checkpoint_valid = false;
     return 1;
 #else
+    if (ds4_session_ensure_graph(s, err, errlen) != 0) {   /* S6 lazy graph */
+        s->checkpoint_valid = false;
+        return 1;
+    }
     if (n_tokens > s->prefill_cap) {
         if (errlen) snprintf(err, errlen, "layer-slice chunk %u exceeds prefill cap %u",
                              n_tokens, s->prefill_cap);
@@ -36275,6 +36353,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     snprintf(err, errlen, "GPU support is not compiled in");
     return 1;
 #else
+    if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
 
@@ -36582,6 +36661,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     snprintf(err, errlen, "GPU support is not compiled in");
     return 1;
 #else
+    if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
