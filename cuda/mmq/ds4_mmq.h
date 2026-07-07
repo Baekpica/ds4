@@ -161,6 +161,23 @@ int ds4_mmq_iq2_xxs_moe(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// ds4 (P4 Inc3): same contract as ds4_mmq_q2_K_moe but W_soa is the aligned
+// row-pair-SoA artifact (weight server --repack-q2k-aligned, layout in
+// ds4_mmq_q2_k_aligned_bytes' comment) instead of the raw block stream.  The
+// tile loader reads the SoA sections directly -- bit-identical output to the
+// raw path, no derepack scratch.
+int ds4_mmq_q2_K_moe_soa(
+    const void    * W_soa,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
 int ds4_mmq_q4_K_moe(
     const void    * W,
     const float   * X_f32,
@@ -186,6 +203,23 @@ int ds4_mmq_q4_K_moe(
 int ds4_mmq_iq2_xxs_moe_pair(
     const void    * W_a,
     const void    * W_b,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_a,
+    float         * out_b,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+// ds4 (P4 Inc3): same contract as ds4_mmq_iq2_xxs_moe_pair but over the
+// aligned-SoA artifacts (weight server --repack-iq2-aligned); see
+// ds4_mmq_q2_K_moe_soa.
+int ds4_mmq_iq2_xxs_moe_pair_soa(
+    const void    * Wa_soa,
+    const void    * Wb_soa,
     const float   * X_f32,
     const int32_t * ids,
     float         * out_a,

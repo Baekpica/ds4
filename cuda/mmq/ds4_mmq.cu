@@ -439,7 +439,11 @@ int ds4_mmq_moe_impl(
         int             n_tokens,
         int             n_experts,
         int             n_expert_used,
-        cudaStream_t    stream) {
+        cudaStream_t    stream,
+        /* ds4 (P4 Inc3): optional aligned-SoA artifact; when non-null the mmq
+         * kernel loads tiles from it directly and W is ignored (see mmq_args). */
+        const char    * x_soa      = NULL,
+        int64_t         soa_blocks = 0) {
 
     if (!W || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -607,6 +611,8 @@ int ds4_mmq_moe_impl(
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/ne_get_rows,
+        /*x_soa=*/x_soa,
+        /*soa_blocks=*/soa_blocks,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -639,7 +645,12 @@ int ds4_mmq_moe_pair_impl(
         int             n_tokens,
         int             n_experts,
         int             n_expert_used,
-        cudaStream_t    stream) {
+        cudaStream_t    stream,
+        /* ds4 (P4 Inc3): optional aligned-SoA artifacts for W_a / W_b (same
+         * shape, so one block count); see ds4_mmq_moe_impl. */
+        const char    * xa_soa     = NULL,
+        const char    * xb_soa     = NULL,
+        int64_t         soa_blocks = 0) {
 
     if (!W_a || !W_b || !X_f32 || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -773,6 +784,8 @@ int ds4_mmq_moe_pair_impl(
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/ne_get_rows,
+        /*x_soa=*/xa_soa,
+        /*soa_blocks=*/soa_blocks,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -783,8 +796,9 @@ int ds4_mmq_moe_pair_impl(
     }
 
     // Second matmul over the same activation buffer and same routing map.
-    args.x   = (const char *)W_b;
-    args.dst = out_b;
+    args.x     = (const char *)W_b;
+    args.dst   = out_b;
+    args.x_soa = xb_soa;
     mul_mat_q_case<type>(*ctx, args, stream);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -822,6 +836,25 @@ extern "C" int ds4_mmq_iq2_xxs_moe(
                                                n_tokens, n_experts, n_expert_used, stream);
 }
 
+/* ds4 (P4 Inc3): mmq MoE over the aligned row-pair-SoA Q2_K artifact
+ * (weight server --repack-q2k-aligned) -- no raw-layout weights and no
+ * derepack scratch involved; the mul_mat_q tile loader reads the SoA
+ * sections directly (load_tiles_q2_K_soa, bit-identical tiles). */
+extern "C" int ds4_mmq_q2_K_moe_soa(
+        const void * W_soa, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    if (M <= 0 || M % 2 != 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
+        fprintf(stderr, "ds4_mmq_q2_K_moe_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
+        return -1;
+    }
+    const int64_t npair = (int64_t)n_experts * (int64_t)(M/2) * (int64_t)(K/256);
+    /* W_soa doubles as the (unused) raw pointer so the impl's null checks hold. */
+    return ds4_mmq_moe_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_moe_soa", W_soa, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream,
+                                            (const char *)W_soa, npair);
+}
+
 extern "C" int ds4_mmq_q4_K_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
@@ -838,6 +871,25 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair(
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
+}
+
+/* ds4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up
+ * artifacts (weight server --repack-iq2-aligned); same contract as
+ * ds4_mmq_q2_K_moe_soa. */
+extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
+        const void * Wa_soa, const void * Wb_soa,
+        const float * X, const int32_t * ids, float * out_a, float * out_b,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    if (M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
+        fprintf(stderr, "ds4_mmq_iq2_xxs_moe_pair_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
+        return -1;
+    }
+    const int64_t nblk = (int64_t)n_experts * (int64_t)M * (int64_t)(K/256);
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
+        "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, X, ids, out_a, out_b,
+        M, K, n_tokens, n_experts, n_expert_used, stream,
+        (const char *)Wa_soa, (const char *)Wb_soa, nblk);
 }
 
 extern "C" int ds4_mmq_q4_K_moe_pair(

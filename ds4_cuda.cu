@@ -14263,6 +14263,22 @@ static uint32_t cuda_moe_q2k_aligned_enabled(void) {
     return v;
 }
 
+/* P4 Inc3: SoA-direct mmq tile loads over the aligned MoE artifacts
+ * (load_tiles_{q2_K,iq2_xxs}_soa) -- the batched/mmq consumers read the
+ * artifact directly instead of re-derepacking it into a raw-layout scratch
+ * on every layer switch, which also leaves the scratch VRAM unallocated.
+ * Kill switch DS4_MMQ_ALIGNED_TILES=0 restores the derepack-scratch path. */
+static uint32_t cuda_mmq_aligned_tiles_enabled(void) {
+    static int init = 0;
+    static uint32_t v = 1;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_MMQ_ALIGNED_TILES");
+        if (s && s[0] == '0') v = 0;
+    }
+    return v;
+}
+
 /* M1-Inc3: aligned-SoA Q8_0 dense decode dispatch.  Active only when the
  * weight server was started with --repack-q8-aligned AND this kill switch is
  * not set.  The artifacts are additive (raw stays served), so disabling just
@@ -22275,6 +22291,28 @@ mmq_moe_path:
                 goto mmq_moe_fallback;
             }
         } else {
+            /* P4 Inc3: with the aligned gate/up artifacts present, the mmq
+             * tile loader reads the SoA sections directly (bit-identical
+             * tiles, no per-layer derepack, no scratch VRAM).  On failure or
+             * DS4_MMQ_ALIGNED_TILES=0, the M1-Inc2b derepack-scratch path
+             * below remains the fallback. */
+            int pair_done = 0;
+            if (gate_iq2_aligned && up_iq2_aligned && cuda_moe_iq2_aligned_enabled() &&
+                cuda_mmq_aligned_tiles_enabled()) {
+                rc = ds4_mmq_iq2_xxs_moe_pair_soa(gate_iq2_aligned, up_iq2_aligned,
+                                                  (const float *)x->ptr,
+                                                  (const int32_t *)selected->ptr,
+                                                  (float *)gate->ptr, (float *)up->ptr,
+                                                  (int)expert_mid_dim, (int)expert_in_dim,
+                                                  (int)n_tokens, (int)n_experts_total,
+                                                  (int)n_expert_used,
+                                                  /*stream=*/ds4_mmq_stream_for_call());
+                pair_done = (rc == 0);
+                if (!pair_done) {
+                    fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_pair_soa (gate+up) returned %d; trying derepack path\n", rc);
+                }
+            }
+            if (!pair_done) {
             /* M1-Inc2b: when the raw gate/up spans were excluded from the
              * upload (--repack-iq2-aligned), gate_w/up_w point at the client
              * mmap; de-repack the aligned artifacts into the persistent
@@ -22304,6 +22342,7 @@ mmq_moe_path:
                 fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_pair (gate+up) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
             }
+            }
         }
         {
             const uint64_t mid_floats = n_assignments * expert_mid_dim;
@@ -22330,6 +22369,24 @@ mmq_moe_path:
                 goto mmq_moe_fallback;
             }
         } else {
+            /* P4 Inc3: SoA-direct tile loads from the aligned down artifact
+             * (see the gate/up branch above); the M2 derepack scratch stays
+             * as the fallback. */
+            int down_done = 0;
+            if (down_q2k_aligned && cuda_moe_q2k_aligned_enabled() &&
+                cuda_mmq_aligned_tiles_enabled()) {
+                rc = ds4_mmq_q2_K_moe_soa(down_q2k_aligned, (const float *)mid->ptr,
+                                          (const int32_t *)selected->ptr,
+                                          (float *)down->ptr,
+                                          (int)out_dim, (int)expert_mid_dim,
+                                          (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1,
+                                          /*stream=*/ds4_mmq_stream_for_call());
+                down_done = (rc == 0);
+                if (!down_done) {
+                    fprintf(stderr, "ds4: ds4_mmq_q2_K_moe_soa (down) returned %d; trying derepack path\n", rc);
+                }
+            }
+            if (!down_done) {
             /* M2 moe-down: when the raw down span was excluded from the
              * upload (--repack-q2k-aligned), down_w points at the client
              * mmap; de-repack the aligned artifact into the persistent
@@ -22351,6 +22408,7 @@ mmq_moe_path:
             if (rc != 0) {
                 fprintf(stderr, "ds4: ds4_mmq_q2_K_moe (down) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
+            }
             }
         }
         {

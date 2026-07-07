@@ -1702,6 +1702,103 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
+// ds4 (P4 Inc3): aligned row-pair-SoA twin of load_tiles_q2_K.  x points at
+// the weight-server artifact [uint2 dm2 | int4 sc4 | uint2 qs2] (row pairs
+// interleaved; q2_k_aligned_derepack_kernel in ds4_mmq.cu is the byte-level
+// spec this inverts) and soa_npair is the total pair count = nblk/2, from
+// which the section offsets derive.  Every tile_x element is the same value
+// the standard loader reads from the raw 84-byte block, moved through
+// integer selects only, so the output is bit-identical and vec_dot is
+// untouched.  No expert geometry is needed: rows per expert is even, so the
+// artifact's pair index ((e*(M/2))+r/2)*nb_row+b equals
+// (r_global/2)*nb_row+b for the flat row r_global = e*M+r.
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q2_K_soa(
+    const char * __restrict__ x, const int64_t soa_npair, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    half2 * x_dm = (half2 *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_K, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    half2 * x_dm = (half2 *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR2_K);
+    constexpr int nrows = ggml_cuda_get_physical_warp_size() / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+    const uint64_t dm_bytes = ((uint64_t)soa_npair *  8u + 63u) & ~63ull;
+    const uint64_t sc_bytes = ((uint64_t)soa_npair * 32u + 63u) & ~63ull;
+    const uint2 * dm2 = (const uint2 *)  x;
+    const int4  * sc4 = (const int4  *) (x + dm_bytes);
+    const uint2 * qs2 = (const uint2 *) (x + dm_bytes + sc_bytes);
+
+    // kbx0 = offset_x + kb0 is a multiple of stride (the row part; experts
+    // and row tiles are whole-row offsets) plus the block column kb0 <
+    // stride, so the (row, block-column) split hoists out of the row loop.
+    const int r0 = kbx0 / stride;
+    const int b  = kbx0 % stride;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const int      rg   = r0 + i;
+        // Element indices stay 32-bit: the largest artifact (V4-Pro down)
+        // has ~16.5M pairs -> qs2 index < 2^28.
+        const uint32_t pblk = (uint32_t)(rg >> 1)*(uint32_t)stride + (uint32_t)b;
+        const uint32_t par  = (uint32_t)rg & 1u;
+
+        const uint2 q = qs2[pblk*16u + kqsx];
+        const int x_ql_0 = (int)(par ? q.y : q.x);
+
+#pragma unroll
+        for (int l = 0; l < QR2_K; ++l) {
+            const int k = (kqsx/8)*32 + l*8 + kqsx % 8;
+
+            const int x_qs_k = (x_ql_0 >> (2*l)) & 0x03030303;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*MMQ_MMA_TILE_X_K_Q2_K + k] = x_qs_k;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k] = x_qs_k;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+
+        // scales byte kqsx of the raw block = word w = kqsx/4; the artifact
+        // packs scale words {row0_w0, row0_w1, row1_w0, row1_w1} as two int4
+        // per pair, so (w>>1) picks the int4 and (par, w&1) the component.
+        const int w = kqsx >> 2;
+        const int4 s = sc4[pblk*2u + (uint32_t)(w >> 1)];
+        const uint32_t sw = par ? ((w & 1) ? (uint32_t)s.w : (uint32_t)s.z)
+                                : ((w & 1) ? (uint32_t)s.y : (uint32_t)s.x);
+        const int sc_m = (int)((sw >> (8*(kqsx & 3))) & 0xFFu);
+
+        const uint2 dmp = dm2[pblk];
+        const uint32_t dm_bits = par ? dmp.y : dmp.x;
+        half2 dm;
+        *reinterpret_cast<uint32_t *>(&dm) = dm_bits;
+#ifdef FAST_FP16_AVAILABLE
+        const half2 x_dm_ik = __hmul2(dm, make_half2(sc_m & 0x0F, sc_m >> 4));
+#else
+        const float2 bxi_dmf = __half22float2(dm);
+        const half2 x_dm_ik = make_half2(bxi_dmf.x*(sc_m & 0x0F), bxi_dmf.y*(sc_m >> 4));
+#endif // FAST_FP16_AVAILABLE
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_dm[i*MMQ_MMA_TILE_X_K_Q2_K + kqsx] = x_dm_ik;
+#else
+        x_dm[i*(MMQ_TILE_NE_K + 1)   + kqsx] = x_dm_ik;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 template <int mmq_x, int mmq_y>
 static __device__ __forceinline__ void vec_dot_q2_K_q8_1_dp4a(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
@@ -2819,6 +2916,81 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
+// ds4 (P4 Inc3): aligned-SoA twin of load_tiles_iq2_xxs.  x points at the
+// weight-server artifact [__half dq | uint2 qs] (iq2_xxs_aligned_derepack_kernel
+// in ds4_mmq.cu is the byte-level spec) and soa_nblk is the total block
+// count.  Each lane's (q2, aux32) int pair is exactly one artifact uint2, so
+// the loads are 8-byte aligned and fully coalesced; the unpack math is the
+// standard loader's, making tile_x bit-identical.
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xxs_soa(
+    const char * __restrict__ x, const int64_t soa_nblk, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ2_XXS, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR2_XXS)) / 2;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+    const uint64_t dq_bytes = ((uint64_t)soa_nblk * 2u + 63u) & ~63ull;
+    const half  * dq = (const half  *)  x;
+    const uint2 * qs = (const uint2 *) (x + dq_bytes);
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * nrows) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        // Flat block index; < 2^25 for both model shapes, so 32-bit element
+        // indexing is safe.
+        const uint32_t blk = (uint32_t)(kbx0 + i*stride);
+
+        const uint2 v = qs[blk*8u + kqsx];
+        const int q2 = (int)v.x;
+        const uint8_t * aux8 = (const uint8_t *) &q2;
+        const uint32_t aux32 = v.y;
+
+#pragma unroll
+        for (int l = 0; l < QR2_XXS; ++l) {
+            const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[l]];
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
+
+            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+
+            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 8*kqsx + (2*l + 0)] = grid0;
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 8*kqsx + (2*l + 1)] = grid1;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l + 0)] = grid0;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l + 1)] = grid1;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+
+        const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
+        const float d = dq[blk];
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0   + kqsx] = d * ls / 8; // (d * scale + d / 2) / 4
+#else
+        x_df[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = d * ls / 8; // (d * scale + d / 2) / 4
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)  || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xs(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int nwarps = mmq_get_nwarps_device();
@@ -3469,7 +3641,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const char * __restrict__ x_soa, const int64_t soa_blocks) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
@@ -3504,7 +3677,27 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        // ds4 (P4 Inc3): when the caller supplies an aligned-SoA weight
+        // artifact, load tiles from it directly instead of the raw block
+        // stream (which, for repacked MoE tensors, would have to be
+        // re-derepacked into a scratch every layer switch).  x_soa is
+        // warp-uniform so this branch is free; tile_x contents are
+        // bit-identical between the two loaders.
+        if constexpr (type == GGML_TYPE_Q2_K) {
+            if (x_soa != nullptr) {
+                load_tiles_q2_K_soa<mmq_y, need_check>(x_soa, soa_blocks, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            } else {
+                load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            }
+        } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
+            if (x_soa != nullptr) {
+                load_tiles_iq2_xxs_soa<mmq_y, need_check>(x_soa, soa_blocks, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            } else {
+                load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            }
+        } else {
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        }
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
@@ -3566,7 +3759,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const char * __restrict__ x_soa, const int64_t soa_blocks) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3657,7 +3850,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks);
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -3743,7 +3936,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -3812,7 +4005,7 @@ static __global__ void mul_mat_q(
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks);
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
@@ -3964,6 +4157,11 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
+    // ds4 (P4 Inc3): optional aligned-SoA weight artifact.  When x_soa is
+    // non-null (Q2_K / IQ2_XXS only) the kernel loads tiles from it and x is
+    // ignored; soa_blocks = pair count (Q2_K) or block count (IQ2_XXS).
+    // Trailing fields so existing aggregate initializers value-init them.
+    const char * x_soa; int64_t soa_blocks;
 };
 
 template<ggml_type type>
@@ -4017,7 +4215,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd);
+                 ntx_fd, args.x_soa, args.soa_blocks);
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -4025,7 +4223,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd);
+                 ntx_fd, args.x_soa, args.soa_blocks);
         }
         return;
     }
@@ -4060,7 +4258,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.x_soa, args.soa_blocks);
 
         if (!fixup_needed) {
             return;
@@ -4078,7 +4276,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.x_soa, args.soa_blocks);
 
         if (!fixup_needed) {
             return;
