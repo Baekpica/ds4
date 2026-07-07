@@ -801,6 +801,22 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* P3-Inc1: f16 matmul with the input rms_norm folded into the activation
+ * convert (f16 activations bit-identical to the unfused rms_norm_plain +
+ * f32_to_f16 chain).  Returns 0 with `out` untouched on any precondition
+ * miss (fold disabled, cuBLAS unavailable, n_tok at or below the native-f16
+ * tier); the caller must then run the unfused chain. */
+int ds4_gpu_matmul_f16_rms_fold_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   norm_eps);
+
 int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor       *out_a,
         ds4_gpu_tensor       *out_b,

@@ -15894,7 +15894,19 @@ static bool metal_graph_encode_layer_attention_batch(
                 (qkv_rms_fused && batch_q8_pair) ? 1u : 0u
                 /* C3-Inc4: q8_0 -> q_a+kv pair */) != 0;
     }
-    if (ok && !hc_attn_fused) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+    /* P3-Inc1: batched HC-stage norm fold -- rms_norm_plain + the GEMM's
+     * f32_to_f16 activation convert collapse into one kernel with
+     * bit-identical f16 activations (see ds4_gpu_matmul_f16_rms_fold_tensor).
+     * Precondition miss returns 0 with hc_mix untouched and the unfused
+     * chain below runs.  Kill switch DS4_CUDA_NO_RMS_F16_FOLD. */
+    bool hc_norm_folded = false;
+    if (ok && !hc_attn_fused && !metal_graph_use_reference_hc_decode() &&
+        layer->hc_attn_fn->type == DS4_TENSOR_F16) {
+        hc_norm_folded = ds4_gpu_matmul_f16_rms_fold_tensor(hc_mix_view,
+                model->map, model->size, layer->hc_attn_fn->abs_offset,
+                hc_dim, mix_hc, g->batch_cur_hc, n_tokens, DS4_RMS_EPS) != 0;
+    }
+    if (ok && !hc_attn_fused && !hc_norm_folded) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
@@ -15905,7 +15917,7 @@ static bool metal_graph_encode_layer_attention_batch(
      * ds4_gpu_matmul_f16_tensor (base path bit-exact); for the MTP F32 weight it
      * uses matmul_f32.  The hardcoded F16 here silently produced NaN hc_mix for
      * the MTP draft (it read F32 bytes as F16). */
-    if (ok && !hc_attn_fused) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
+    if (ok && !hc_attn_fused && !hc_norm_folded) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
                                                  model,
                                                  layer->hc_attn_fn,
                                                  hc_dim,
@@ -18475,7 +18487,16 @@ static bool metal_graph_encode_layer_ffn_batch(
                 DS4_HC_EPS, DS4_RMS_EPS,
                 (batch_q8_pair ? 1u : 0u) | 2u) != 0;
     }
-    if (ok && !hc_ffn_fused) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+    /* P3-Inc1: ffn instance of the batched HC-stage norm fold -- see the attn
+     * site.  Kill switch DS4_CUDA_NO_RMS_F16_FOLD. */
+    bool hc_norm_folded = false;
+    if (ok && !hc_ffn_fused && !metal_graph_use_reference_hc_decode() &&
+        layer->hc_ffn_fn->type == DS4_TENSOR_F16) {
+        hc_norm_folded = ds4_gpu_matmul_f16_rms_fold_tensor(hc_mix_view,
+                model->map, model->size, layer->hc_ffn_fn->abs_offset,
+                hc_dim, mix_hc, g->batch_after_attn_hc, n_tokens, DS4_RMS_EPS) != 0;
+    }
+    if (ok && !hc_ffn_fused && !hc_norm_folded) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_after_attn_hc,
                                                       (uint32_t)hc_dim,
                                                       n_tokens,
@@ -18483,7 +18504,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     /* M4b Inc3: dtype-aware (base hc_ffn_fn = F16, reused MTP block = F32; see the
      * matching hc_attn_fn fix in metal_graph_encode_layer_attention_batch).  F16
      * dispatches to the identical kernel (base bit-exact); F32 for the MTP draft. */
-    if (ok && !hc_ffn_fused) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
+    if (ok && !hc_ffn_fused && !hc_norm_folded) ok = metal_graph_matmul_plain_tensor(hc_mix_view,
                                                  model,
                                                  layer->hc_ffn_fn,
                                                  hc_dim,
