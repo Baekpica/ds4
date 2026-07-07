@@ -12185,13 +12185,16 @@ static void generate_continuous_jobs(server *s, job *first) {
  * GB10) -- headroom the default serving path never uses: continuous admission
  * chunks at DS4_CONT_PREFILL_CHUNK and every chunk clamps to prefill_cap
  * (bg_prefill_width_clamp), so prompts longer than the cap still admit, in
- * cap-wide chunks.  2048 validated in the ship config (S6 ledger 2026-07-06):
- * ~5.9 GiB freed -> bank capacity, decode untouched, -c 4096 long-prompt legs
- * green.  Ctx-aware: contexts below 2048 size to ctx (the per-seq committed
- * bound; wider groups just split).  The env knob is the kill switch
- * (DS4_SERVER_COALESCE_MAX_TOKENS=8192 = pre-flip sizing). */
+ * cap-wide chunks.  4096 is the prefill-roofline pick (P1, recon 2026-07-07):
+ * cold-admit prefill 248->304 tok/s at 12k prompts vs the 2048 cap, for ~2 GiB
+ * of scratch over 2048 (S6 ledger trade, affordable in the ship budget); wider
+ * chunks also raise MoE rows/expert (96 vs 48), compounding the mmq tile work.
+ * 8192-wide forwards CLIFF ~6x (see bg_prefill_chunk_tokens fence in ds4.c).
+ * Ctx-aware: contexts below 4096 size to ctx (the per-seq committed bound;
+ * wider groups just split).  The env knob is the kill switch
+ * (DS4_SERVER_COALESCE_MAX_TOKENS=2048 = pre-P1 sizing). */
 static int coalesce_max_tokens_default(int ctx) {
-    return ctx > 0 && ctx < 2048 ? ctx : 2048;
+    return ctx > 0 && ctx < 4096 ? ctx : 4096;
 }
 
 static void *worker_main(void *arg) {

@@ -25781,6 +25781,12 @@ static uint32_t bg_prefill_chunk_tokens(void) {
          * window+chunk instead of a whole prompt.  Set to 0 for legacy one-shot. */
         v = (e && e[0]) ? atoi(e) : 4096;
         if (v < 0) v = 0;
+        /* P1 fence (roofline recon 2026-07-07): forwards wider than ~4k rows
+         * fall off a cliff (12k prompt at W8192 = 46 tok/s vs 302 at W4096,
+         * unattributed until P5), so chunk widths above 4096 are clamped.
+         * DS4_CONT_PREFILL_NOFENCE=1 is the P5-recon escape hatch. */
+        const char *nf = getenv("DS4_CONT_PREFILL_NOFENCE");
+        if (v > 4096 && !(nf && nf[0] == '1' && nf[1] == '\0')) v = 4096;
     }
     return (uint32_t)v;
 }
