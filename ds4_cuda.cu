@@ -21376,7 +21376,21 @@ static int routed_moe_launch(
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    /* Requant tiers (2026-07-07): gate/up and down kernel selection below
+     * dispatches on the two quant types INDEPENDENTLY, so beside the two
+     * original pairs (all-Q4_K MTP/drafter, IQ2_XXS+Q2_K base) the launch
+     * also serves Q4_K gate/up + Q2_K down and all-Q2_K expert stacks (the
+     * requantized DSpark drafters).  q4k_path keeps meaning "all-Q4_K" for
+     * the scope/stats helpers that use it as a model tag.  Q2_K gate/up has
+     * no fused pair kernels (yet): it rides the unfused vec tier and two
+     * single mmq launches; the legacy fallback rejects the new pairs (see
+     * mmq_moe_fallback entry). */
+    const int gate_is_q4k = gate_type == 12u;
+    const int gate_is_iq2 = gate_type == 16u;
+    const int gate_is_q2k = gate_type == 10u;
+    const int down_is_q2k = down_type == 10u;
+    if (!((gate_is_q4k && down_type == 12u) ||
+          ((gate_is_iq2 || gate_is_q4k || gate_is_q2k) && down_is_q2k))) return 0;
     /* Q4_K MoE: the LEGACY fallback (mmq_moe_fallback:) only handles the V4-Flash
      * decode shape (n_tokens=1, n_expert=6); wider Q4_K shapes are served by the
      * mmq block below (ds4_mmq_q4_K_moe_pair, n_tokens >= mmq_moe_min_tokens).
@@ -21403,7 +21417,7 @@ static int routed_moe_launch(
      * layout directly through HMM at mmap rates (prefill-amortized). */
     const char *gate_iq2_aligned = NULL;
     const char *up_iq2_aligned = NULL;
-    if (!q4k_path) {
+    if (gate_is_iq2) {
         const uint64_t iq2_al_bytes = ds4_mmq_iq2_xxs_aligned_bytes(
             (int)expert_mid_dim, (int)expert_in_dim, (int)n_total_expert);
         if (iq2_al_bytes != 0) {
@@ -21430,7 +21444,7 @@ static int routed_moe_launch(
      * decode vec branch dispatches on the artifact and the batched/mmq path
      * de-repacks into a device scratch. */
     const char *down_q2k_aligned = NULL;
-    if (!q4k_path) {
+    if (down_is_q2k) {
         const uint64_t q2k_al_bytes = ds4_mmq_q2_k_aligned_bytes(
             (int)out_dim, (int)expert_mid_dim, (int)n_total_expert);
         if (q2k_al_bytes != 0) {
@@ -21573,7 +21587,11 @@ static int routed_moe_launch(
                 key.up_offset       = up_offset;
                 key.down_offset     = down_offset;
                 key.n_tokens        = n_tokens;
-                key.q4k_path        = (uint32_t)q4k_path;
+                /* Requant tiers: the field predates the split dispatch; encode
+                 * BOTH quant types so distinct kernel selections never share a
+                 * captured graph (offsets already disambiguate models, this
+                 * makes it explicit). */
+                key.q4k_path        = (gate_type << 8) | down_type;
                 key.expert_in_dim   = expert_in_dim;
                 key.expert_mid_dim  = expert_mid_dim;
                 key.out_dim         = out_dim;
@@ -21702,7 +21720,7 @@ static int routed_moe_launch(
              *    epilogue into mid directly.  This removes one activation
              *    quantize, one vector matmul sequence, and the separate
              *    swiglu launch while preserving the Q8_1 dot path. */
-            if (!gate_up_fused && use_q8k_gate_in_vec) {
+            if (!gate_up_fused && use_q8k_gate_in_vec && !gate_is_q2k) {
                 const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
                 const uint64_t xq_bytes = (uint64_t)n_tokens * xq_blocks * sizeof(cuda_block_q8_K);
                 if (expert_in_dim % CUDA_QK_K == 0u && down->bytes >= xq_bytes) {
@@ -21713,7 +21731,7 @@ static int routed_moe_launch(
                     if (!cuda_ok(cudaGetLastError(), "mmvq q8k gate x quantize launch")) goto mmvq_decode_bail;
 
                     dim3 qgrid((expert_mid_dim + 127u) / 128u, n_assignments, 1);
-                    if (q4k_path) {
+                    if (gate_is_q4k) {
                         moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256, 0, ds4_current_stream()>>>(
                             (float *)gate->ptr,
                             (float *)up->ptr,
@@ -21753,8 +21771,8 @@ static int routed_moe_launch(
                 } else {
                     fprintf(stderr, "ds4: DS4_CUDA_MOE_Q8K_GATE_IN_VEC requested but scratch/shape invalid; falling back to Q8_1 gate/up\n");
                 }
-            } else if (use_q81_fused_moe && n_expert_used == 6u) {
-                if (q4k_path) {
+            } else if (use_q81_fused_moe && n_expert_used == 6u && !gate_is_q2k) {
+                if (gate_is_q4k) {
                     rc = ds4_mmq_q4_K_moe_gate_up_mid_vec(gate_w, up_w,
                                                           (const float *)x->ptr,
                                                           (const int32_t *)selected->ptr,
@@ -21785,8 +21803,8 @@ static int routed_moe_launch(
             }
             if (!gate_up_fused) {
                 int gate_up_pair_raw = 0;
-                if (use_pair_raw_vec) {
-                    if (q4k_path) {
+                if (use_pair_raw_vec && !gate_is_q2k) {
+                    if (gate_is_q4k) {
                         rc = ds4_mmq_q4_K_moe_pair_raw_vec(gate_w, up_w,
                                                            (const float *)x->ptr,
                                                            (const int32_t *)selected->ptr,
@@ -21810,7 +21828,7 @@ static int routed_moe_launch(
                     }
                 }
                 /* Two separate gate/up matmuls through mmvq. */
-                if (!gate_up_pair_raw && q4k_path) {
+                if (!gate_up_pair_raw && gate_is_q4k) {
                     rc = ds4_mmq_q4_K_moe_vec(gate_w, (const float *)x->ptr,
                                               (const int32_t *)selected->ptr,
                                               (float *)gate->ptr,
@@ -21822,6 +21840,27 @@ static int routed_moe_launch(
                         goto mmvq_decode_bail;
                     }
                     rc = ds4_mmq_q4_K_moe_vec(up_w, (const float *)x->ptr,
+                                              (const int32_t *)selected->ptr,
+                                              (float *)up->ptr,
+                                              (int)expert_mid_dim, (int)expert_in_dim,
+                                              (int)n_tokens, (int)n_experts_total,
+                                              (int)n_expert_used, moe_stream);
+                } else if (!gate_up_pair_raw && gate_is_q2k) {
+                    /* Requant tier: Q2_K gate/up rides the same raw vec entry
+                     * the base model's Q2_K down uses (no aligned artifacts:
+                     * the WS repack is name-gated to .ffn_down_exps and
+                     * base-scope only, so drafter gate/up ranges stay raw). */
+                    rc = ds4_mmq_q2_K_moe_vec(gate_w, (const float *)x->ptr,
+                                              (const int32_t *)selected->ptr,
+                                              (float *)gate->ptr,
+                                              (int)expert_mid_dim, (int)expert_in_dim,
+                                              (int)n_tokens, (int)n_experts_total,
+                                              (int)n_expert_used, moe_stream);
+                    if (rc != 0) {
+                        fprintf(stderr, "ds4: ds4_mmq_q2_K_moe_vec (gate) returned %d; falling back\n", rc);
+                        goto mmvq_decode_bail;
+                    }
+                    rc = ds4_mmq_q2_K_moe_vec(up_w, (const float *)x->ptr,
                                               (const int32_t *)selected->ptr,
                                               (float *)up->ptr,
                                               (int)expert_mid_dim, (int)expert_in_dim,
@@ -21921,7 +21960,7 @@ static int routed_moe_launch(
                     if (!cuda_ok(cudaGetLastError(), "mmvq q8k down mid quantize launch")) goto mmvq_decode_bail;
 
                     dim3 sgrid((out_dim + 31u) / 32u, n_tokens, 1);
-                    if (q4k_path) {
+                    if (!down_is_q2k) {
                         moe_down_q4K_sum6_nt_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
                             (float *)out->ptr,
                             down_w,
@@ -21950,7 +21989,7 @@ static int routed_moe_launch(
                     fprintf(stderr, "ds4: DS4_CUDA_MOE_Q8K_DOWN_IN_VEC requested but scratch/shape invalid; falling back to Q8_1 down\n");
                 }
             } else if (use_q81_fused_moe && n_expert_used == 6u) {
-                if (q4k_path) {
+                if (!down_is_q2k) {
                     rc = ds4_mmq_q4_K_moe_down_sum6_vec(down_w, (const float *)mid->ptr,
                                                         (const int32_t *)selected->ptr,
                                                         (float *)out->ptr,
@@ -21980,7 +22019,7 @@ static int routed_moe_launch(
                  * (token, slot) pair as a separate "token" with one expert.
                  * FD Inc2a: n_assignments may exceed one launch's column cap;
                  * ds4_mmq_moe_vec_impl splits the column dim internally. */
-                if (q4k_path) {
+                if (!down_is_q2k) {
                     rc = ds4_mmq_q4_K_moe_vec(down_w, (const float *)mid->ptr,
                                               (const int32_t *)selected->ptr,
                                               (float *)down->ptr,
@@ -22153,7 +22192,7 @@ mmq_moe_path:
          * once per MoE block (saves 1 quantize + 1 helper launch per
          * layer).  Step 3 of the optimization plan. */
         int rc = -1;
-        if (q4k_path) {
+        if (gate_is_q4k) {
             rc = ds4_mmq_q4_K_moe_pair(gate_w, up_w, (const float *)x->ptr,
                                        (const int32_t *)selected->ptr,
                                        (float *)gate->ptr, (float *)up->ptr,
@@ -22163,6 +22202,31 @@ mmq_moe_path:
                                        /*stream=*/ds4_mmq_stream_for_call());
             if (rc != 0) {
                 fprintf(stderr, "ds4: ds4_mmq_q4_K_moe_pair (gate+up) returned %d; falling back\n", rc);
+                goto mmq_moe_fallback;
+            }
+        } else if (gate_is_q2k) {
+            /* Requant tier: no Q2_K pair kernel yet -- two single launches
+             * (one extra X quantize per MoE block vs the fused pair; the
+             * drafter block step is ~14% of a spec step, measured before
+             * fusing further). */
+            rc = ds4_mmq_q2_K_moe(gate_w, (const float *)x->ptr,
+                                  (const int32_t *)selected->ptr,
+                                  (float *)gate->ptr,
+                                  (int)expert_mid_dim, (int)expert_in_dim,
+                                  (int)n_tokens, (int)n_experts_total,
+                                  (int)n_expert_used,
+                                  /*stream=*/ds4_mmq_stream_for_call());
+            if (rc == 0) {
+                rc = ds4_mmq_q2_K_moe(up_w, (const float *)x->ptr,
+                                      (const int32_t *)selected->ptr,
+                                      (float *)up->ptr,
+                                      (int)expert_mid_dim, (int)expert_in_dim,
+                                      (int)n_tokens, (int)n_experts_total,
+                                      (int)n_expert_used,
+                                      /*stream=*/ds4_mmq_stream_for_call());
+            }
+            if (rc != 0) {
+                fprintf(stderr, "ds4: ds4_mmq_q2_K_moe (gate/up) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
             }
         } else {
@@ -22210,7 +22274,7 @@ mmq_moe_path:
          * of length n_tokens * n_expert_used; reinterpreting it as
          * [n_assignments, 1] gives one expert id per row, which is exactly
          * what ds4_mmq_*_moe with n_expert_used=1 consumes. */
-        if (q4k_path) {
+        if (!down_is_q2k) {
             rc = ds4_mmq_q4_K_moe(down_w, (const float *)mid->ptr, (const int32_t *)selected->ptr,
                                   (float *)down->ptr,
                                   (int)out_dim, (int)expert_mid_dim,
@@ -22254,6 +22318,13 @@ mmq_moe_path:
         return 1;
     }
 mmq_moe_fallback:
+    /* Requant tiers: the legacy fallback's kernels are IQ2-LUT / all-Q4_K
+     * specific.  The new pairs (Q2_K gate/up; Q4_K gate + Q2_K down) are
+     * served by the vec/mmq paths above -- if those declined (MMQ disabled,
+     * or a shape they reject), reject the launch rather than run a
+     * wrong-layout kernel.  The (16,10) base and (12,12) pairs keep the
+     * fallback byte-identical. */
+    if (gate_is_q2k || (gate_is_q4k && down_is_q2k)) return 0;
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
