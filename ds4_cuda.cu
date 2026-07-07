@@ -472,6 +472,14 @@ static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static std::vector<cuda_derived_range> g_derived_ranges;
 static uint64_t g_model_range_bytes;
+/* S6 (2026-07-07): HBM-cache coverage dedup vs imported manifest ranges --
+ * bytes the startup walk SKIPPED because a device-resident range (WS VMM/IPC
+ * import, or an earlier populated copy) already fully covers the span.
+ * Surfaced in ds4_gpu_print_memory_report.  NOTE: in manifest configs the
+ * walk's byte-budget check usually short-circuits first (imports count
+ * against the same budget), so this fires only for sub-limit imports. */
+static uint64_t g_hbm_cache_dedup_bytes;
+static int g_hbm_cache_dedup_logged;
 static uint64_t g_derived_range_bytes;
 
 /* Pinned FILE-BACKED registration accounting.  cudaHostRegister pins the
@@ -3952,6 +3960,30 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
         const cuda_model_range &r = g_model_ranges[exact->second];
         if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 1;
     }
+    /* S6 (2026-07-07): coverage dedup vs imported manifest ranges.  WS
+     * VMM/IPC imports land in g_model_ranges as LARGE coalesced device
+     * ranges; the exact-offset check above misses any tensor INTERIOR to
+     * one.  A covered span already reads through the imported pointer at
+     * the same device-resident speed class (cuda_model_range_ptr's first
+     * pass prefers it), so a duplicate copy buys nothing.  In practice the
+     * byte-budget check above short-circuits for full-model manifests
+     * (imports count against the budget; cmthbm15 measured ZERO double-book
+     * in ship configs) -- this is the belt for sub-limit import scopes. */
+    const uint64_t span_end = offset + bytes;
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && !r.host_registered &&
+            offset >= r.offset && span_end >= offset && span_end <= r.offset + r.bytes) {
+            g_hbm_cache_dedup_bytes += bytes;
+            if (!g_hbm_cache_dedup_logged) {
+                g_hbm_cache_dedup_logged = 1;
+                fprintf(stderr,
+                        "ds4: HBM cache dedup: '%s' already covered by a device-resident "
+                        "range (imported manifest span); skipping duplicate copies\n",
+                        what);
+            }
+            return 1;
+        }
+    }
     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what) != NULL;
 #endif
 }
@@ -3979,6 +4011,12 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
     (void)cudaMemGetInfo(&free_b, &total_b);
     fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
             label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
+    if (g_hbm_cache_dedup_bytes != 0) {
+        fprintf(stderr,
+                "ds4: HBM cache dedup: %.2f GiB of startup-walk spans were already "
+                "covered by device-resident ranges (no duplicate copies made)\n",
+                (double)g_hbm_cache_dedup_bytes / 1073741824.0);
+    }
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
