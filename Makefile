@@ -27,7 +27,8 @@ CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
-NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math -std=c++17 $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+NVCC_EXTRA_FLAGS ?=
+NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math -std=c++17 $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread $(NVCC_EXTRA_FLAGS)
 CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
 # Include path so cuda/mmq/*.cu can find its sibling vendored headers and
 # the ds4_ggml_stubs shim. The redirected ggml.h / ggml-impl.h / ggml-cuda.h
@@ -94,8 +95,14 @@ help:
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
 
+# GB10 / DGX Spark is compute capability 12.1. Without an explicit -arch,
+# nvcc 13.0 emits compute_75 PTX that the driver JITs onto sm_121 with
+# Turing-era codepaths (no cp.async, no Blackwell MMA) — measurably slower
+# MMQ prefill. The arch must reach the sub-make as CUDA_ARCH (not inside a
+# pre-expanded NVCCFLAGS, where the parent's empty NVCC_ARCH_FLAGS would
+# erase it), so spark defines travel via NVCC_EXTRA_FLAGS instead.
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent $(CUDA_EXTRA_BINS) CUDA_ARCH= CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCCFLAGS="$(NVCCFLAGS) $(CUDA_SPARK_FLAGS)"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent $(CUDA_EXTRA_BINS) CUDA_ARCH=sm_121 CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCC_EXTRA_FLAGS="$(CUDA_SPARK_FLAGS)"
 
 cuda-generic:
 	$(MAKE) ds4 ds4-server ds4-bench ds4-eval ds4-agent $(CUDA_EXTRA_BINS) CUDA_ARCH=native
