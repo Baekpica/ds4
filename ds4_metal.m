@@ -6650,6 +6650,39 @@ int ds4_gpu_matmul_f16_tensor(
     return 1;
 }
 
+/* P3-Inc1/Inc2: the rms_norm/preconv activation folds are CUDA-only
+ * (cuBLAS) fast paths.  Returning 0 is the documented precondition-miss
+ * contract: ds4.c drops through to the unfused rms_norm_plain +
+ * ds4_gpu_matmul_f16_tensor chain, which Metal implements above. */
+int ds4_gpu_matmul_f16_rms_fold_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   norm_eps) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok; (void)norm_eps;
+    return 0;
+}
+
+int ds4_gpu_matmul_f16_preconv_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *xh,
+        uint64_t                n_tok) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)xh; (void)n_tok;
+    return 0;
+}
+
 int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor       *out_a,
         ds4_gpu_tensor       *out_b,
@@ -16788,6 +16821,26 @@ int ds4_gpu_hc_expand_add_split_tensor(
     }
 
     return 1;
+}
+
+/* P3-Inc2: fused hc_expand + next-stage rms_norm f16 emission is a
+ * CUDA-only fast path.  Returning 0 is the documented precondition-miss
+ * contract: ds4.c falls back to the unfused expand/add_split variants
+ * above, and the f16 handshake (batch_hc_f16_src) is never armed, so the
+ * preconv GEMM stub is never reached with live data. */
+int ds4_gpu_hc_expand_rmsf16_split_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *xh_out,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        float                   norm_eps) {
+    (void)out_hc; (void)xh_out; (void)block_out; (void)block_add;
+    (void)residual_hc; (void)split; (void)n_embd; (void)n_hc; (void)norm_eps;
+    return 0;
 }
 
 int ds4_gpu_hc_expand_add_split_n2_rows_tensor(
