@@ -1591,7 +1591,13 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *seq_id,
         /* FB1: caller opt-in for the per-seq heads8-online fast path; 0 =
          * pre-FB1 dispatch (per-seq always generic), bit-exact. */
-        uint32_t                allow_mseq_heads8);
+        uint32_t                allow_mseq_heads8,
+        /* Token-tile eligibility hint (2026-07-09): when the batch is one
+         * sequence's consecutive-position run, the position of row 0
+         * (host-verified against the ms_* mirrors); UINT32_MAX otherwise.
+         * Consumed only by the CUDA token-tile prefill branch; every other
+         * backend/branch ignores it. */
+        uint32_t                tt_run_pos0);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,

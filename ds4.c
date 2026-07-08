@@ -11700,7 +11700,8 @@ static bool metal_graph_encode_decode_layer_impl(
                     g->layer_comp_cache_fp8[il],
                     g->layer_comp_scale[il],
                     /*positions=*/NULL, /*seq_id=*/NULL,
-                    /* FB1: single-token decode, fast path n/a */ 0u) != 0;
+                    /* FB1: single-token decode, fast path n/a */ 0u,
+                    UINT32_MAX) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -15821,6 +15822,17 @@ static bool metal_graph_encode_layer_attention_batch(
                 g->ms_positions[t] != ar_p0 + (int32_t)t) { admit_single_run = false; break; }
         }
     }
+    bool tt_single_run = admit_single_run;
+    if (!tt_single_run && g->batch_admit_fast && use_multiseq &&
+        g->batch_multiseq_emit) {
+        tt_single_run = true;
+        const int32_t tt_p0 = g->ms_positions[0];
+        const int32_t tt_s0 = g->ms_seq_id[0];
+        for (uint32_t t = 1; t < n_tokens; t++) {
+            if (g->ms_seq_id[t] != tt_s0 ||
+                g->ms_positions[t] != tt_p0 + (int32_t)t) { tt_single_run = false; break; }
+        }
+    }
     /* FB2 (admission-chunk batched compressor emit): on a single-bank run the
      * per-row compressor/indexer emit loops below collapse to the single-seq
      * aligned-chunk batched kernels on bank-offset views: f2_head per-row rows
@@ -18044,7 +18056,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->layer_comp_scale[il],
                                                                               seq_positions, seq_id,
                                                                               /* FB1: admission-chunk fast path */
-                                                                              g->batch_admit_fast ? 1u : 0u) != 0;
+                                                                              g->batch_admit_fast ? 1u : 0u,
+                                                                              seq_positions ? (tt_single_run ? (uint32_t)g->ms_positions[0] : UINT32_MAX) : pos0) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -18185,7 +18198,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           g->layer_comp_cache_fp8[il],
                                                                           g->layer_comp_scale[il],
                                                                           /*positions=*/NULL, /*seq_id=*/NULL,
-                                                                          /* FB1: single-seq, fast path n/a */ 0u) != 0;
+                                                                          /* FB1: single-seq, fast path n/a */ 0u,
+                                                                          pos0) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                     il,
@@ -18339,7 +18353,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               cur_comp ? g->layer_comp_cache_fp8[il] : NULL,
                                                                               cur_comp ? g->layer_comp_scale[il]    : NULL,
                                                                               /*positions=*/NULL, /*seq_id=*/NULL,
-                                                                              /* FB1: single-row fallback, fast path n/a */ 0u) != 0;
+                                                                              /* FB1: single-row fallback, fast path n/a */ 0u,
+                                                                              UINT32_MAX) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,
