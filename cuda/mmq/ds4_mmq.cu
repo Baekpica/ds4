@@ -18,6 +18,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "ds4_mmq_d2r.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -79,6 +80,34 @@ static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
         fprintf(stderr, "ds4: M2-Inc2a q8_1 activation fold active (mmvq decode)\n");
     }
     return (char *)(uintptr_t)p;
+}
+
+// Default ON (2026-07-09 gated increment: same-boot ABBA 427->493 tok/s @12k,
+// gsm8k 97.5 / mbpp 90). DS4_MMQ_D2R=0 is the kill switch back to the
+// mul_mat_q SoA-tile down path.
+static bool d2r_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MMQ_D2R");
+        cached = (env && env[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static int64_t d2r_min_cols() {
+    static int64_t cached = -1;
+    if (cached < 0) {
+        cached = 1024;
+        const char *env = getenv("DS4_MMQ_D2R_MIN_COLS");
+        if (env && env[0] != '\0') {
+            char *end = nullptr;
+            const long v = strtol(env, &end, 10);
+            if (end != env && v > 0) {
+                cached = (int64_t)v;
+            }
+        }
+    }
+    return cached;
 }
 
 extern "C" size_t ds4_mmq_q81_scratch_bytes(void) {
@@ -590,6 +619,30 @@ int ds4_mmq_moe_impl(
         GGML_CUDA_CC_IS_CDNA(cc);
 
     cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+
+    if (type == GGML_TYPE_Q2_K && x_soa != nullptr && d2r_enabled() &&
+        K % 256 == 0 && M % 2 == 0 && ne_get_rows >= d2r_min_cols()) {
+        static int d2r_avail_cc = -1;
+        static int d2r_avail = 0;
+        if (d2r_avail_cc != cc) {
+            d2r_avail_cc = cc;
+            d2r_avail = ds4_mmq_q2_K_moe_d2r_available(cc) ? 1 : 0;
+        }
+        if (d2r_avail) {
+            const size_t d2r_work_bytes =
+                ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
+            if (d2r_work_bytes != 0) {
+                ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
+                const int d2r_rc = ds4_mmq_q2_K_moe_d2r_launch(
+                    x_soa, soa_blocks, src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
+                    out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), d2r_work_bytes,
+                    stream);
+                if (d2r_rc == 0) {
+                    return 0;
+                }
+            }
+        }
+    }
 
     const mmq_args args = {
         /*x=*/(const char *)W,

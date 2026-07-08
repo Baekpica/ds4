@@ -1,0 +1,1774 @@
+// SPDX-License-Identifier: MIT
+// ds4_mmq_d2r.cu - gated D2R Q2_K MoE down-GEMM production path.
+
+#include "ds4_mmq_d2r.cuh"
+
+#include <type_traits>
+
+#include "common.cuh"
+#include "mmq.cuh"
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+
+namespace {
+
+constexpr int kMTile      = 128;
+constexpr int kNTile      = 64;
+constexpr int kWarps      = 8;
+constexpr int kThreads    = 32 * kWarps;
+constexpr int kStages     = 2;
+constexpr int kNFrag      = kNTile / 8;
+constexpr int kRawStages  = 2;  // k256 raw slots; NT=64 stays under 48 KiB.
+constexpr int kRawPairsPerWarp = 8;
+constexpr int kRawHalves = 2;
+constexpr int kRawQSWordsPerHalf = 8;
+constexpr int kRawQSPairStride = 9;  // 8 uint2 payload + 1 uint2 pad to rotate banks.
+constexpr int kRawQSChunks = kRawHalves * kRawPairsPerWarp * kRawQSWordsPerHalf;
+constexpr int kRawSCChunks = kRawHalves * kRawPairsPerWarp;
+constexpr int kRawDMChunks = kRawPairsPerWarp;
+constexpr int kRawCopyChunks = kRawQSChunks + kRawSCChunks + kRawDMChunks;
+constexpr int kQ8PrefetchItems = kNFrag * 8 * 9;
+constexpr int kQ8PrefetchTrips = (kQ8PrefetchItems + kThreads - 1) / kThreads;
+constexpr int kRawCopyTrips = (kRawCopyChunks + 31) / 32;
+
+static_assert(kNTile == 64, "D2R production path is CFG1 NT64 only");
+static_assert(kStages == 2, "D2R raw-ring schedule expects exactly two q8 stages");
+static_assert(kThreads == 256, "D2R CTA is fixed at 256 threads");
+static_assert(kQ8PrefetchTrips == 3, "unexpected q8 issue trip count");
+static_assert(kRawCopyTrips == 5, "unexpected raw-ring issue trip count");
+
+struct alignas(16) SmemInvariants {
+    const char *w_base;
+    const char *q8_tile_base;
+    const int32_t *ids_dst;
+    float *out;
+    uint32_t sc_off_bytes;
+    uint32_t qs_off_bytes;
+    uint32_t q8_k128_stride_bytes;
+    int nb;
+    int k128_iters;
+    int M;
+    int cta_row0;
+    int col_lo;
+    int col_count;
+    uint32_t warp_pair0_blk[kWarps];
+};
+
+static_assert(sizeof(SmemInvariants) <= 128, "shared invariant table must stay small");
+
+__device__ __forceinline__ uint32_t q2k_dm_bits(const uint2 * __restrict__ dm2,
+                                                uint64_t pblk, int parity) {
+    const uint2 d = dm2[pblk];
+    return parity ? d.y : d.x;
+}
+
+__device__ __forceinline__ float2 half2_bits_to_float2(uint32_t bits) {
+    half2 h;
+    *reinterpret_cast<uint32_t *>(&h) = bits;
+    return __half22float2(h);
+}
+
+__device__ __forceinline__ uint8_t q2k_scale_byte(const int4 * __restrict__ sc4,
+                                                  uint64_t pblk, int parity, int sub16) {
+    const int w = sub16 >> 2;
+    const int4 s = sc4[pblk * 2ull + (uint64_t)(w >> 1)];
+    const uint32_t sw = parity ? ((w & 1) ? (uint32_t)s.w : (uint32_t)s.z)
+                               : ((w & 1) ? (uint32_t)s.y : (uint32_t)s.x);
+    return (uint8_t)((sw >> (8 * (sub16 & 3))) & 0xFFu);
+}
+
+__device__ __forceinline__ void q2k_scale_packs_for_half(
+        const int4 * __restrict__ sc4, uint64_t pblk, int parity, int half,
+        uint32_t &pack_lo4, uint32_t &pack_hi4) {
+    const int4 s = sc4[pblk * 2ull + (uint64_t)half];
+    if (parity) {
+        pack_lo4 = (uint32_t)s.z;
+        pack_hi4 = (uint32_t)s.w;
+    } else {
+        pack_lo4 = (uint32_t)s.x;
+        pack_hi4 = (uint32_t)s.y;
+    }
+}
+
+__device__ __forceinline__ void q2k_scale_packs_from_int4(
+        int4 s, int parity, uint32_t &pack_lo4, uint32_t &pack_hi4) {
+    if (parity) {
+        pack_lo4 = (uint32_t)s.z;
+        pack_hi4 = (uint32_t)s.w;
+    } else {
+        pack_lo4 = (uint32_t)s.x;
+        pack_hi4 = (uint32_t)s.y;
+    }
+}
+
+__device__ __forceinline__ uint8_t q2k_scale_from_packs(
+        uint32_t pack_lo4, uint32_t pack_hi4, int t, int sub_in_k32) {
+    const int sub = 2 * t + sub_in_k32;
+    const uint32_t pack = (sub < 4) ? pack_lo4 : pack_hi4;
+    return (uint8_t)((pack >> (8 * (sub & 3))) & 0xFFu);
+}
+
+template <int T, int SubInK32>
+__device__ __forceinline__ uint8_t q2k_scale_from_packs_t(uint32_t pack_lo4, uint32_t pack_hi4) {
+    constexpr int sub = 2 * T + SubInK32;
+    const uint32_t pack = (sub < 4) ? pack_lo4 : pack_hi4;
+    return (uint8_t)((pack >> (8 * (sub & 3))) & 0xFFu);
+}
+
+__device__ __forceinline__ uint32_t q2k_decode_scaled_reg(uint32_t word, int t, uint8_t scale_byte) {
+    const uint32_t q = (word >> (2 * t)) & 0x03030303u;
+    return q * (uint32_t)(scale_byte & 0x0Fu);
+}
+
+template <int T>
+__device__ __forceinline__ uint32_t q2k_decode_scaled_reg_t(uint32_t word, uint8_t scale_byte) {
+    const uint32_t q = (word >> (2 * T)) & 0x03030303u;
+    return q * (uint32_t)(scale_byte & 0x0Fu);
+}
+
+__device__ __forceinline__ int sum_i8x4(uint32_t v) {
+    return (int)(int8_t)(v >>  0) +
+           (int)(int8_t)(v >>  8) +
+           (int)(int8_t)(v >> 16) +
+           (int)(int8_t)(v >> 24);
+}
+
+__device__ __forceinline__ int q8_sum16_words(const block_q8_1_mmq &b, int k0) {
+    const uint32_t *p = reinterpret_cast<const uint32_t *>(b.qs + k0);
+    return sum_i8x4(p[0]) + sum_i8x4(p[1]) + sum_i8x4(p[2]) + sum_i8x4(p[3]);
+}
+
+__device__ __forceinline__ void zero_16B(void *dst) {
+    int4 z = make_int4(0, 0, 0, 0);
+    *reinterpret_cast<int4 *>(dst) = z;
+}
+
+__device__ __forceinline__ void zero_8B(void *dst) {
+    uint2 z = make_uint2(0, 0);
+    *reinterpret_cast<uint2 *>(dst) = z;
+}
+
+__device__ __forceinline__ void cp_async_16B(void *dst, const void *src, bool pred) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (pred) {
+        const unsigned smem = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                     :: "r"(smem), "l"(src));
+    } else {
+        zero_16B(dst);
+    }
+#else
+    if (pred) {
+        *reinterpret_cast<int4 *>(dst) = *reinterpret_cast<const int4 *>(src);
+    } else {
+        zero_16B(dst);
+    }
+#endif
+}
+
+__device__ __forceinline__ void cp_async_8B(void *dst, const void *src, bool pred) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (pred) {
+        const unsigned smem = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 8;"
+                     :: "r"(smem), "l"(src));
+    } else {
+        zero_8B(dst);
+    }
+#else
+    if (pred) {
+        *reinterpret_cast<uint2 *>(dst) = *reinterpret_cast<const uint2 *>(src);
+    } else {
+        zero_8B(dst);
+    }
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+
+template <int KeepGroups>
+__device__ __forceinline__ void cp_async_wait_group() {
+    static_assert(KeepGroups >= 0 && KeepGroups <= 7, "bad cp.async wait_group depth");
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;" :: "n"(KeepGroups));
+#endif
+}
+
+__device__ __forceinline__ void cp_async_wait_keep(int keep_groups) {
+    switch (keep_groups) {
+        case 0: cp_async_wait_group<0>(); break;
+        case 1: cp_async_wait_group<1>(); break;
+        case 2: cp_async_wait_group<2>(); break;
+        case 3: cp_async_wait_group<3>(); break;
+        default: cp_async_wait_group<4>(); break;
+    }
+}
+
+__device__ __forceinline__ int cp_async_keep_for_tile(int tile_iter, int k_iters) {
+    int keep = kStages - 1;
+    const int newer = k_iters - tile_iter - 1;
+    if (keep > newer) {
+        keep = newer;
+    }
+    return keep > 0 ? keep : 0;
+}
+
+__device__ __forceinline__ int d2r_lane() {
+#if defined(__CUDA_ARCH__)
+    uint32_t lane;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(lane));
+    return (int)lane;
+#else
+    return (int)threadIdx.x;
+#endif
+}
+
+__device__ __forceinline__ int d2r_warp() {
+#if defined(__CUDA_ARCH__)
+    uint32_t warp;
+    asm volatile("mov.u32 %0, %%tid.y;" : "=r"(warp));
+    return (int)warp;
+#else
+    return (int)threadIdx.y;
+#endif
+}
+
+__device__ __forceinline__ int d2r_tid() {
+    return (d2r_warp() << 5) | d2r_lane();
+}
+
+__device__ __forceinline__ int d2r_group() {
+    return d2r_lane() >> 2;
+}
+
+__device__ __forceinline__ int d2r_tig() {
+    return d2r_lane() & 3;
+}
+
+__device__ __forceinline__ int d2r_q8_stage(int k128_iter) {
+    return k128_iter & (kStages - 1);
+}
+
+__device__ __forceinline__ int d2r_raw_stage(int k256_iter) {
+    return k256_iter & (kRawStages - 1);
+}
+
+template <bool FullTile>
+__device__ __forceinline__ void issue_q8_prefetch_one(
+        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const char * __restrict__ q8_iter_base,
+        int col_count, int stage, int t) {
+    constexpr int cols = kNFrag * 8;
+    static_assert(cols == 64, "NT64 q8 prefetch mapping expects 64 columns");
+    const int col_local = t & (cols - 1);
+    const int chunk = t >> 6;
+    const int nf = col_local >> 3;
+    const int c = col_local & 7;
+    const bool valid = FullTile ? true : (col_local < col_count);
+    void *dst = (char *)&s_q8[stage][nf][c] + chunk * 16;
+    const void *src = q8_iter_base + (uint64_t)col_local * sizeof(block_q8_1_mmq) + chunk * 16;
+    cp_async_16B(dst, src, valid);
+}
+
+template <bool FullTile, int Iter>
+__device__ __forceinline__ void issue_q8_prefetch_unrolled(
+        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const char * __restrict__ q8_iter_base,
+        int col_count, int stage, int tid) {
+    if constexpr (Iter < kQ8PrefetchTrips) {
+        const int t = tid + Iter * kThreads;
+        if constexpr ((Iter + 1) * kThreads <= kQ8PrefetchItems) {
+            issue_q8_prefetch_one<FullTile>(s_q8, q8_iter_base, col_count, stage, t);
+        } else {
+            if (t < kQ8PrefetchItems) {
+                issue_q8_prefetch_one<FullTile>(s_q8, q8_iter_base, col_count, stage, t);
+            }
+        }
+        issue_q8_prefetch_unrolled<FullTile, Iter + 1>(
+            s_q8, q8_iter_base, col_count, stage, tid);
+    }
+}
+
+template <bool FullTile>
+__device__ __forceinline__ void issue_q8_prefetch(
+        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const volatile SmemInvariants &s_inv,
+        int stage, int k128_iter, int tid) {
+    const char *q8_tile_base = s_inv.q8_tile_base;
+    const uint32_t k128_stride = s_inv.q8_k128_stride_bytes;
+    int col_count = kNTile;
+    if constexpr (!FullTile) {
+        col_count = s_inv.col_count;
+    }
+    const char *q8_iter_base = q8_tile_base + (uint64_t)k128_iter * (uint64_t)k128_stride;
+    issue_q8_prefetch_unrolled<FullTile, 0>(s_q8, q8_iter_base, col_count, stage, tid);
+    cp_async_commit();
+}
+
+__device__ __forceinline__ void issue_q8_prefetch_one_fast(
+        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const char * __restrict__ q8_iter_base,
+        int stage, int t) {
+    constexpr int cols = kNFrag * 8;
+    static_assert(cols == 64, "NT64 q8 prefetch mapping expects 64 columns");
+    const int col_local = t & (cols - 1);
+    const int c = col_local & 7;
+    const int nf = col_local >> 3;
+    const int chunk = t >> 6;
+    void *dst = (char *)&s_q8[stage][nf][c] + chunk * 16;
+    const void *src = q8_iter_base + (uint64_t)col_local * sizeof(block_q8_1_mmq) + chunk * 16;
+    cp_async_16B(dst, src, true);
+}
+
+template <int Iter>
+__device__ __forceinline__ void issue_q8_prefetch_fast_unrolled(
+        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const char * __restrict__ q8_iter_base,
+        int stage, int tid) {
+    if constexpr (Iter < kQ8PrefetchTrips) {
+        const int t = tid + Iter * kThreads;
+        if constexpr ((Iter + 1) * kThreads <= kQ8PrefetchItems) {
+            issue_q8_prefetch_one_fast(s_q8, q8_iter_base, stage, t);
+        } else {
+            if (t < kQ8PrefetchItems) {
+                issue_q8_prefetch_one_fast(s_q8, q8_iter_base, stage, t);
+            }
+        }
+        issue_q8_prefetch_fast_unrolled<Iter + 1>(s_q8, q8_iter_base, stage, tid);
+    }
+}
+
+__device__ __forceinline__ void issue_q8_prefetch_fast(
+        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const volatile SmemInvariants &s_inv,
+        int stage, int k128_iter) {
+    const char *q8_iter_base =
+        s_inv.q8_tile_base + (uint64_t)k128_iter * (uint64_t)s_inv.q8_k128_stride_bytes;
+    issue_q8_prefetch_fast_unrolled<0>(s_q8, q8_iter_base, stage, d2r_tid());
+    cp_async_commit();
+}
+
+struct Q8ColFixF32 {
+    float d8[2];
+    float sum[8];
+};
+
+__device__ __forceinline__ void publish_q8_fix_f32(
+        Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        int stage, int tid) {
+    if (tid < kNFrag * 8) {
+        const int col_local = tid;
+        const int nf = col_local >> 3;
+        const int c = col_local & 7;
+        const block_q8_1_mmq &qb = s_q8[stage][nf][c];
+        const uint4 d2s6 = *reinterpret_cast<const uint4 *>(qb.d2s6);
+        const float2 d01 = half2_bits_to_float2(d2s6.x);
+        const float2 s01 = half2_bits_to_float2(d2s6.y);
+        const float2 s23 = half2_bits_to_float2(d2s6.z);
+        const float2 s45 = half2_bits_to_float2(d2s6.w);
+        Q8ColFixF32 &f = s_q8_fix[stage][nf][c];
+        f.d8[0] = d01.x;
+        f.d8[1] = d01.y;
+        f.sum[0] = s01.x;
+        f.sum[1] = s01.y;
+        f.sum[2] = s23.x;
+        f.sum[3] = s23.y;
+        f.sum[4] = s45.x;
+        f.sum[5] = s45.y;
+        f.sum[6] = d01.y * (float)q8_sum16_words(qb, 96);
+        f.sum[7] = d01.y * (float)q8_sum16_words(qb, 112);
+    }
+}
+
+__device__ __forceinline__ void publish_q8_fix_f32_guarded(
+        Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        int stage, int tid, int col_count) {
+    if (tid < col_count) {
+        const int col_local = tid;
+        const int nf = col_local >> 3;
+        const int c = col_local & 7;
+        const block_q8_1_mmq &qb = s_q8[stage][nf][c];
+        const uint4 d2s6 = *reinterpret_cast<const uint4 *>(qb.d2s6);
+        const float2 d01 = half2_bits_to_float2(d2s6.x);
+        const float2 s01 = half2_bits_to_float2(d2s6.y);
+        const float2 s23 = half2_bits_to_float2(d2s6.z);
+        const float2 s45 = half2_bits_to_float2(d2s6.w);
+        Q8ColFixF32 &f = s_q8_fix[stage][nf][c];
+        f.d8[0] = d01.x;
+        f.d8[1] = d01.y;
+        f.sum[0] = s01.x;
+        f.sum[1] = s01.y;
+        f.sum[2] = s23.x;
+        f.sum[3] = s23.y;
+        f.sum[4] = s45.x;
+        f.sum[5] = s45.y;
+        f.sum[6] = d01.y * (float)q8_sum16_words(qb, 96);
+        f.sum[7] = d01.y * (float)q8_sum16_words(qb, 112);
+    }
+}
+
+struct Q8Fix2 {
+    float d8;
+    float sum0;
+    float sum1;
+};
+
+struct Q8Fix4 {
+    float d8;
+    float sum0;
+    float sum1;
+    float sum2;
+    float sum3;
+};
+
+__device__ __forceinline__ Q8Fix2 load_q8_fix2(
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int nf, int c, int k_in_q8) {
+    const Q8ColFixF32 &sf = s_q8_fix[stage][nf][c];
+    const int d8_slot = (k_in_q8 >= 64) ? 1 : 0;
+    const int sub128 = k_in_q8 >> 4;
+    Q8Fix2 f;
+    f.d8 = sf.d8[d8_slot];
+    f.sum0 = sf.sum[sub128 + 0];
+    f.sum1 = sf.sum[sub128 + 1];
+    return f;
+}
+
+__device__ __forceinline__ Q8Fix4 load_q8_fix4(
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int nf, int c, int k_in_q8_pair) {
+    const Q8ColFixF32 &sf = s_q8_fix[stage][nf][c];
+    const int d8_slot = (k_in_q8_pair >= 64) ? 1 : 0;
+    const int sub128 = k_in_q8_pair >> 4;
+    Q8Fix4 f;
+    f.d8 = sf.d8[d8_slot];
+    f.sum0 = sf.sum[sub128 + 0];
+    f.sum1 = sf.sum[sub128 + 1];
+    f.sum2 = sf.sum[sub128 + 2];
+    f.sum3 = sf.sum[sub128 + 3];
+    return f;
+}
+
+struct Q2KWeightHalf {
+    uint32_t q_r0_c0;
+    uint32_t q_r1_c0;
+    uint32_t q_r0_c1;
+    uint32_t q_r1_c1;
+    uint32_t sc_r0_lo4;
+    uint32_t sc_r0_hi4;
+    uint32_t sc_r1_lo4;
+    uint32_t sc_r1_hi4;
+    uint32_t dm_r0;
+    uint32_t dm_r1;
+};
+
+struct alignas(16) Q2KRawWarpStage {
+    uint2 qs[kRawHalves][kRawPairsPerWarp][kRawQSPairStride];
+    int4 sc[kRawHalves][kRawPairsPerWarp];
+    uint2 dm[kRawPairsPerWarp];
+};
+
+static_assert(sizeof(Q2KRawWarpStage) ==
+              kRawHalves * kRawPairsPerWarp * kRawQSPairStride * sizeof(uint2) +
+              kRawHalves * kRawPairsPerWarp * sizeof(int4) +
+              kRawPairsPerWarp * sizeof(uint2),
+              "unexpected Q2K raw ring stage size");
+
+constexpr size_t kSmemQ8StageBytes = (size_t)kNFrag * 8 * sizeof(block_q8_1_mmq);
+constexpr size_t kSmemTailStageBytes = (size_t)kNFrag * 8 * sizeof(Q8ColFixF32);
+constexpr size_t kSmemRawBytes = (size_t)kWarps * kRawStages * sizeof(Q2KRawWarpStage);
+constexpr size_t kSmemInvBytes = sizeof(SmemInvariants);
+constexpr size_t kSmemStaticBytes = (size_t)kStages * (kSmemQ8StageBytes + kSmemTailStageBytes) +
+                                    kSmemRawBytes + kSmemInvBytes;
+static_assert(kSmemStaticBytes <= 48ull * 1024ull, "D2R static shared memory exceeds 48 KiB");
+
+__device__ __forceinline__ uint32_t q2k_select_parity(uint2 v, int parity) {
+    return parity ? v.y : v.x;
+}
+
+__device__ __forceinline__ bool q2k_raw_pair_valid(int warp_row0, int pair, int M) {
+    return warp_row0 + 2 * pair < M;
+}
+
+template <bool FullTile, int Iter>
+__device__ __forceinline__ void issue_q2k_raw_prefetch_iter(
+        Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const char * __restrict__ w_base,
+        uint32_t sc_off_bytes, uint32_t qs_off_bytes,
+        uint32_t warp_pair0_blk, int nb, int raw_stage, int k256_iter,
+        int warp_row0, int M, int warp, int lane) {
+    static_assert(kRawCopyTrips == 5, "raw prefetch iter specialization expects five trips");
+    if constexpr (Iter < 4) {
+        constexpr int chunks_per_half = kRawPairsPerWarp * kRawQSWordsPerHalf;
+        constexpr int half = (Iter * 32) / chunks_per_half;
+        const int t = lane + Iter * 32;
+        const int rem = t - half * chunks_per_half;
+        const int pair = rem / kRawQSWordsPerHalf;
+        const int word = rem & (kRawQSWordsPerHalf - 1);
+        const bool row_valid = FullTile ? true : q2k_raw_pair_valid(warp_row0, pair, M);
+        const bool valid = k256_iter < nb && row_valid;
+        const uint64_t pblk = valid ? ((uint64_t)warp_pair0_blk + (uint64_t)pair * (uint64_t)nb +
+                                       (uint64_t)k256_iter) : 0ull;
+        void *dst = &s_raw[warp][raw_stage].qs[half][pair][word];
+        const void *src = w_base + (uint64_t)qs_off_bytes +
+                          pblk * 16ull * sizeof(uint2) +
+                          (uint64_t)half * 8ull * sizeof(uint2) +
+                          (uint64_t)word * sizeof(uint2);
+        cp_async_8B(dst, src, valid);
+    } else {
+        if (lane < kRawSCChunks) {
+            const int half = lane / kRawPairsPerWarp;
+            const int pair = lane - half * kRawPairsPerWarp;
+            const bool row_valid = FullTile ? true : q2k_raw_pair_valid(warp_row0, pair, M);
+            const bool valid = k256_iter < nb && row_valid;
+            const uint64_t pblk = valid ? ((uint64_t)warp_pair0_blk + (uint64_t)pair * (uint64_t)nb +
+                                           (uint64_t)k256_iter) : 0ull;
+            void *dst = &s_raw[warp][raw_stage].sc[half][pair];
+            const void *src = w_base + (uint64_t)sc_off_bytes +
+                              pblk * 2ull * sizeof(int4) +
+                              (uint64_t)half * sizeof(int4);
+            cp_async_16B(dst, src, valid);
+        } else if (lane < kRawSCChunks + kRawDMChunks) {
+            const int pair = lane - kRawSCChunks;
+            const bool row_valid = FullTile ? true : q2k_raw_pair_valid(warp_row0, pair, M);
+            const bool valid = k256_iter < nb && row_valid;
+            const uint64_t pblk = valid ? ((uint64_t)warp_pair0_blk + (uint64_t)pair * (uint64_t)nb +
+                                           (uint64_t)k256_iter) : 0ull;
+            void *dst = &s_raw[warp][raw_stage].dm[pair];
+            const void *src = w_base + pblk * sizeof(uint2);
+            cp_async_8B(dst, src, valid);
+        }
+    }
+}
+
+template <bool FullTile, int Iter>
+__device__ __forceinline__ void issue_q2k_raw_prefetch_unrolled(
+        Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const char * __restrict__ w_base,
+        uint32_t sc_off_bytes, uint32_t qs_off_bytes,
+        uint32_t warp_pair0_blk, int nb, int raw_stage, int k256_iter,
+        int warp_row0, int M, int warp, int lane) {
+    if constexpr (Iter < kRawCopyTrips) {
+        issue_q2k_raw_prefetch_iter<FullTile, Iter>(
+            s_raw, w_base, sc_off_bytes, qs_off_bytes, warp_pair0_blk, nb, raw_stage, k256_iter,
+            warp_row0, M, warp, lane);
+        issue_q2k_raw_prefetch_unrolled<FullTile, Iter + 1>(
+            s_raw, w_base, sc_off_bytes, qs_off_bytes, warp_pair0_blk, nb, raw_stage, k256_iter,
+            warp_row0, M, warp, lane);
+    }
+}
+
+template <bool FullTile>
+__device__ __forceinline__ void issue_q2k_raw_prefetch(
+        Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const volatile SmemInvariants &s_inv,
+        int raw_stage, int k256_iter, int warp, int lane) {
+    const char *w_base = s_inv.w_base;
+    const uint32_t sc_off_bytes = s_inv.sc_off_bytes;
+    const uint32_t qs_off_bytes = s_inv.qs_off_bytes;
+    const uint32_t warp_pair0_blk = s_inv.warp_pair0_blk[warp];
+    const int nb = s_inv.nb;
+    int warp_row0 = 0;
+    int M = 0;
+    if constexpr (!FullTile) {
+        warp_row0 = s_inv.cta_row0 + (warp << 4);
+        M = s_inv.M;
+    }
+    issue_q2k_raw_prefetch_unrolled<FullTile, 0>(
+        s_raw, w_base, sc_off_bytes, qs_off_bytes, warp_pair0_blk, nb, raw_stage, k256_iter,
+        warp_row0, M, warp, lane);
+    cp_async_commit();
+}
+
+template <int Iter>
+__device__ __forceinline__ void issue_q2k_raw_prefetch_iter_fast(
+        Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const char * __restrict__ w_base,
+        uint32_t sc_off_bytes, uint32_t qs_off_bytes,
+        uint32_t warp_pair0_blk, int nb, int raw_stage, int k256_iter) {
+    static_assert(kRawCopyTrips == 5, "raw prefetch iter specialization expects five trips");
+    const int warp = d2r_warp();
+    const int lane = d2r_lane();
+    if constexpr (Iter < 4) {
+        constexpr int chunks_per_half = kRawPairsPerWarp * kRawQSWordsPerHalf;
+        constexpr int half = (Iter * 32) / chunks_per_half;
+        const int t = lane + Iter * 32;
+        const int rem = t - half * chunks_per_half;
+        const int pair = rem / kRawQSWordsPerHalf;
+        const int word = rem & (kRawQSWordsPerHalf - 1);
+        const bool valid = k256_iter < nb;
+        const uint64_t pblk = valid ? ((uint64_t)warp_pair0_blk + (uint64_t)pair * (uint64_t)nb +
+                                       (uint64_t)k256_iter) : 0ull;
+        void *dst = &s_raw[warp][raw_stage].qs[half][pair][word];
+        const void *src = w_base + (uint64_t)qs_off_bytes +
+                          pblk * 16ull * sizeof(uint2) +
+                          (uint64_t)half * 8ull * sizeof(uint2) +
+                          (uint64_t)word * sizeof(uint2);
+        cp_async_8B(dst, src, valid);
+    } else {
+        if (lane < kRawSCChunks) {
+            const int half = lane / kRawPairsPerWarp;
+            const int pair = lane - half * kRawPairsPerWarp;
+            const bool valid = k256_iter < nb;
+            const uint64_t pblk = valid ? ((uint64_t)warp_pair0_blk + (uint64_t)pair * (uint64_t)nb +
+                                           (uint64_t)k256_iter) : 0ull;
+            void *dst = &s_raw[warp][raw_stage].sc[half][pair];
+            const void *src = w_base + (uint64_t)sc_off_bytes +
+                              pblk * 2ull * sizeof(int4) +
+                              (uint64_t)half * sizeof(int4);
+            cp_async_16B(dst, src, valid);
+        } else if (lane < kRawSCChunks + kRawDMChunks) {
+            const int pair = lane - kRawSCChunks;
+            const bool valid = k256_iter < nb;
+            const uint64_t pblk = valid ? ((uint64_t)warp_pair0_blk + (uint64_t)pair * (uint64_t)nb +
+                                           (uint64_t)k256_iter) : 0ull;
+            void *dst = &s_raw[warp][raw_stage].dm[pair];
+            const void *src = w_base + pblk * sizeof(uint2);
+            cp_async_8B(dst, src, valid);
+        }
+    }
+}
+
+template <int Iter>
+__device__ __forceinline__ void issue_q2k_raw_prefetch_fast_unrolled(
+        Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const char * __restrict__ w_base,
+        uint32_t sc_off_bytes, uint32_t qs_off_bytes,
+        uint32_t warp_pair0_blk, int nb, int raw_stage, int k256_iter) {
+    if constexpr (Iter < kRawCopyTrips) {
+        issue_q2k_raw_prefetch_iter_fast<Iter>(
+            s_raw, w_base, sc_off_bytes, qs_off_bytes, warp_pair0_blk, nb, raw_stage, k256_iter);
+        issue_q2k_raw_prefetch_fast_unrolled<Iter + 1>(
+            s_raw, w_base, sc_off_bytes, qs_off_bytes, warp_pair0_blk, nb, raw_stage, k256_iter);
+    }
+}
+
+__device__ __forceinline__ void issue_q2k_raw_prefetch_fast(
+        Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const volatile SmemInvariants &s_inv,
+        int raw_stage, int k256_iter) {
+    const int warp = d2r_warp();
+    issue_q2k_raw_prefetch_fast_unrolled<0>(
+        s_raw, s_inv.w_base, s_inv.sc_off_bytes, s_inv.qs_off_bytes,
+        s_inv.warp_pair0_blk[warp], s_inv.nb, raw_stage, k256_iter);
+    cp_async_commit();
+}
+
+__device__ __forceinline__ void load_q2k_weight_half_raw(
+        Q2KWeightHalf &w,
+        const Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        int warp, int raw_stage, bool row0_ok, bool row1_ok,
+        int parity, int half, int group, int tig) {
+    const Q2KRawWarpStage &raw = s_raw[warp][raw_stage];
+    const int pair0 = group >> 1;
+    const int pair1 = pair0 + 4;
+    const int p_base = half * 8;
+    const int p0 = p_base + tig;
+    const int p1 = p_base + tig + 4;
+
+    if (row0_ok) {
+        const uint2 q0 = raw.qs[half][pair0][p0 - p_base];
+        const uint2 q1 = raw.qs[half][pair0][p1 - p_base];
+        w.q_r0_c0 = q2k_select_parity(q0, parity);
+        w.q_r0_c1 = q2k_select_parity(q1, parity);
+        q2k_scale_packs_from_int4(raw.sc[half][pair0], parity, w.sc_r0_lo4, w.sc_r0_hi4);
+        w.dm_r0 = q2k_select_parity(raw.dm[pair0], parity);
+    } else {
+        w.q_r0_c0 = 0;
+        w.q_r0_c1 = 0;
+        w.sc_r0_lo4 = 0;
+        w.sc_r0_hi4 = 0;
+        w.dm_r0 = 0;
+    }
+    if (row1_ok) {
+        const uint2 q0 = raw.qs[half][pair1][p0 - p_base];
+        const uint2 q1 = raw.qs[half][pair1][p1 - p_base];
+        w.q_r1_c0 = q2k_select_parity(q0, parity);
+        w.q_r1_c1 = q2k_select_parity(q1, parity);
+        q2k_scale_packs_from_int4(raw.sc[half][pair1], parity, w.sc_r1_lo4, w.sc_r1_hi4);
+        w.dm_r1 = q2k_select_parity(raw.dm[pair1], parity);
+    } else {
+        w.q_r1_c0 = 0;
+        w.q_r1_c1 = 0;
+        w.sc_r1_lo4 = 0;
+        w.sc_r1_hi4 = 0;
+        w.dm_r1 = 0;
+    }
+}
+
+__device__ __forceinline__ void load_q2k_weight_half_raw_fast(
+        Q2KWeightHalf &w,
+        const Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        int k128_iter) {
+    const int lane = d2r_lane();
+    const int group = lane >> 2;
+    load_q2k_weight_half_raw(
+        w, s_raw, d2r_warp(), d2r_raw_stage(k128_iter >> 1),
+        true, true, group & 1, k128_iter & 1, group, lane & 3);
+}
+
+template <int T, typename TileA>
+__device__ __forceinline__ void make_A_tile(TileA &A, const Q2KWeightHalf &w) {
+    const uint8_t sc00 = q2k_scale_from_packs_t<T, 0>(w.sc_r0_lo4, w.sc_r0_hi4);
+    const uint8_t sc01 = q2k_scale_from_packs_t<T, 1>(w.sc_r0_lo4, w.sc_r0_hi4);
+    const uint8_t sc10 = q2k_scale_from_packs_t<T, 0>(w.sc_r1_lo4, w.sc_r1_hi4);
+    const uint8_t sc11 = q2k_scale_from_packs_t<T, 1>(w.sc_r1_lo4, w.sc_r1_hi4);
+    A.x[0] = (int)q2k_decode_scaled_reg_t<T>(w.q_r0_c0, sc00);
+    A.x[1] = (int)q2k_decode_scaled_reg_t<T>(w.q_r1_c0, sc10);
+    A.x[2] = (int)q2k_decode_scaled_reg_t<T>(w.q_r0_c1, sc01);
+    A.x[3] = (int)q2k_decode_scaled_reg_t<T>(w.q_r1_c1, sc11);
+}
+
+template <int T>
+__device__ __forceinline__ uint16_t min_pack_for_t(uint32_t pack_lo4, uint32_t pack_hi4) {
+    const uint8_t sc0 = q2k_scale_from_packs_t<T, 0>(pack_lo4, pack_hi4);
+    const uint8_t sc1 = q2k_scale_from_packs_t<T, 1>(pack_lo4, pack_hi4);
+    return (uint16_t)((uint16_t)(sc0 >> 4) | ((uint16_t)(sc1 >> 4) << 8));
+}
+
+template <int T0, int T1>
+__device__ __forceinline__ uint32_t min_pack4_for_pair(uint32_t pack_lo4, uint32_t pack_hi4) {
+    const uint8_t sc0 = q2k_scale_from_packs_t<T0, 0>(pack_lo4, pack_hi4);
+    const uint8_t sc1 = q2k_scale_from_packs_t<T0, 1>(pack_lo4, pack_hi4);
+    const uint8_t sc2 = q2k_scale_from_packs_t<T1, 0>(pack_lo4, pack_hi4);
+    const uint8_t sc3 = q2k_scale_from_packs_t<T1, 1>(pack_lo4, pack_hi4);
+    return (uint32_t)(sc0 >> 4) |
+           ((uint32_t)(sc1 >> 4) << 8) |
+           ((uint32_t)(sc2 >> 4) << 16) |
+           ((uint32_t)(sc3 >> 4) << 24);
+}
+
+template <typename TileB>
+__device__ __forceinline__ void load_B_tile(
+        TileB &B,
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        int stage, int nf, int k_in_q8) {
+    const int *base = reinterpret_cast<const int *>(&s_q8[stage][nf][0].qs[k_in_q8]);
+    ggml_cuda_mma::load_ldmatrix(B, base, sizeof(block_q8_1_mmq) / sizeof(int));
+}
+
+__device__ __forceinline__ void fold_element_k32(
+        float &acc, int c, float2 dm, uint16_t min_pack, const Q8Fix2 &fix) {
+    acc += (float)c * dm.x * fix.d8;
+    acc -= dm.y * (float)(min_pack & 0xFFu) * fix.sum0;
+    acc -= dm.y * (float)((min_pack >> 8) & 0xFFu) * fix.sum1;
+}
+
+__device__ __forceinline__ void fold_element_k64(
+        float &acc, int c, float2 dm, uint32_t min_pack4, const Q8Fix4 &fix) {
+    acc += (float)c * dm.x * fix.d8;
+    acc -= dm.y * (float)(min_pack4 & 0xFFu) * fix.sum0;
+    acc -= dm.y * (float)((min_pack4 >> 8) & 0xFFu) * fix.sum1;
+    acc -= dm.y * (float)((min_pack4 >> 16) & 0xFFu) * fix.sum2;
+    acc -= dm.y * (float)((min_pack4 >> 24) & 0xFFu) * fix.sum3;
+}
+
+__device__ __forceinline__ float q2k_bias_k32(float dmin, uint16_t min_pack,
+                                               const Q8Fix2 &fix) {
+    const float min0 = (float)(min_pack & 0xFFu);
+    const float min1 = (float)((min_pack >> 8) & 0xFFu);
+    return dmin * (min0 * fix.sum0 + min1 * fix.sum1);
+}
+
+__device__ __forceinline__ float q2k_minsum4_f32(
+        uint32_t min_pack4, float sum0, float sum1, float sum2, float sum3) {
+    float s = fmaf((float)(min_pack4 & 0xFFu), sum0, 0.0f);
+    s = fmaf((float)((min_pack4 >> 8) & 0xFFu), sum1, s);
+    s = fmaf((float)((min_pack4 >> 16) & 0xFFu), sum2, s);
+    return fmaf((float)((min_pack4 >> 24) & 0xFFu), sum3, s);
+}
+
+template <int T0, int T1>
+__device__ __forceinline__ void fold_k64_col_fast(
+        float &acc0, float &acc1, int c0, int c1,
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int nf, int c, float2 dm0, float2 dm1,
+        uint32_t min0, uint32_t min1) {
+    static_assert((T0 == 0 && T1 == 1) || (T0 == 2 && T1 == 3), "expected adjacent k64 q8 window");
+    constexpr int d8_slot = (T0 >= 2) ? 1 : 0;
+    constexpr int sub128 = 2 * T0;
+    const Q8ColFixF32 &sf = s_q8_fix[stage][nf][c];
+    const float d8 = sf.d8[d8_slot];
+    const float sum0 = sf.sum[sub128 + 0];
+    const float sum1 = sf.sum[sub128 + 1];
+    const float sum2 = sf.sum[sub128 + 2];
+    const float sum3 = sf.sum[sub128 + 3];
+
+    const float minsum0 = q2k_minsum4_f32(min0, sum0, sum1, sum2, sum3);
+    acc0 = fmaf(-dm0.y, minsum0, fmaf((float)c0, dm0.x * d8, acc0));
+
+    const float minsum1 = q2k_minsum4_f32(min1, sum0, sum1, sum2, sum3);
+    acc1 = fmaf(-dm1.y, minsum1, fmaf((float)c1, dm1.x * d8, acc1));
+}
+
+template <int T0, int T1>
+__device__ __forceinline__ void fold_k64_col_guarded(
+        float &acc0, float &acc1, int c0, int c1,
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int nf, int c, float2 dm0, float2 dm1,
+        uint32_t min0, uint32_t min1, bool row0_ok, bool row1_ok, bool col_ok) {
+    static_assert((T0 == 0 && T1 == 1) || (T0 == 2 && T1 == 3), "expected adjacent k64 q8 window");
+    if (!col_ok || (!row0_ok && !row1_ok)) {
+        return;
+    }
+    constexpr int d8_slot = (T0 >= 2) ? 1 : 0;
+    constexpr int sub128 = 2 * T0;
+    const Q8ColFixF32 &sf = s_q8_fix[stage][nf][c];
+    const float d8 = sf.d8[d8_slot];
+    const float sum0 = sf.sum[sub128 + 0];
+    const float sum1 = sf.sum[sub128 + 1];
+    const float sum2 = sf.sum[sub128 + 2];
+    const float sum3 = sf.sum[sub128 + 3];
+
+    if (row0_ok) {
+        const float minsum0 = q2k_minsum4_f32(min0, sum0, sum1, sum2, sum3);
+        acc0 = fmaf(-dm0.y, minsum0, fmaf((float)c0, dm0.x * d8, acc0));
+    }
+    if (row1_ok) {
+        const float minsum1 = q2k_minsum4_f32(min1, sum0, sum1, sum2, sum3);
+        acc1 = fmaf(-dm1.y, minsum1, fmaf((float)c1, dm1.x * d8, acc1));
+    }
+}
+
+__device__ __forceinline__ void fold_fragment_k32_fast(
+        float (&acc)[kNFrag][4],
+        const ggml_cuda_mma::tile<16, 8, int> &C,
+        const Q8Fix2 &fix0, const Q8Fix2 &fix1, int nf,
+        float2 dm0, float2 dm1, uint16_t min0, uint16_t min1) {
+    const float d8c0 = fix0.d8;
+    const float d8c1 = fix1.d8;
+    const float scale00 = dm0.x * d8c0;
+    const float scale01 = dm0.x * d8c1;
+    const float scale10 = dm1.x * d8c0;
+    const float scale11 = dm1.x * d8c1;
+    const float bias00 = q2k_bias_k32(dm0.y, min0, fix0);
+    const float bias01 = q2k_bias_k32(dm0.y, min0, fix1);
+    const float bias10 = q2k_bias_k32(dm1.y, min1, fix0);
+    const float bias11 = q2k_bias_k32(dm1.y, min1, fix1);
+
+    acc[nf][0] = fmaf((float)C.x[0], scale00, acc[nf][0]) - bias00;
+    acc[nf][1] = fmaf((float)C.x[1], scale01, acc[nf][1]) - bias01;
+    acc[nf][2] = fmaf((float)C.x[2], scale10, acc[nf][2]) - bias10;
+    acc[nf][3] = fmaf((float)C.x[3], scale11, acc[nf][3]) - bias11;
+}
+
+__device__ __forceinline__ void fold_fragment_k32_guarded(
+        float (&acc)[kNFrag][4],
+        const ggml_cuda_mma::tile<16, 8, int> &C,
+        const Q8Fix2 &fix0, const Q8Fix2 &fix1, int nf,
+        float2 dm0, float2 dm1, uint16_t min0, uint16_t min1,
+        bool row0_ok, bool row1_ok, bool col0_ok, bool col1_ok) {
+    const float d8c0 = fix0.d8;
+    const float d8c1 = fix1.d8;
+    const float scale00 = dm0.x * d8c0;
+    const float scale01 = dm0.x * d8c1;
+    const float scale10 = dm1.x * d8c0;
+    const float scale11 = dm1.x * d8c1;
+    const float bias00 = q2k_bias_k32(dm0.y, min0, fix0);
+    const float bias01 = q2k_bias_k32(dm0.y, min0, fix1);
+    const float bias10 = q2k_bias_k32(dm1.y, min1, fix0);
+    const float bias11 = q2k_bias_k32(dm1.y, min1, fix1);
+
+    if (row0_ok && col0_ok) acc[nf][0] = fmaf((float)C.x[0], scale00, acc[nf][0]) - bias00;
+    if (row0_ok && col1_ok) acc[nf][1] = fmaf((float)C.x[1], scale01, acc[nf][1]) - bias01;
+    if (row1_ok && col0_ok) acc[nf][2] = fmaf((float)C.x[2], scale10, acc[nf][2]) - bias10;
+    if (row1_ok && col1_ok) acc[nf][3] = fmaf((float)C.x[3], scale11, acc[nf][3]) - bias11;
+}
+
+template <int T0, int T1>
+__device__ __forceinline__ void fold_fragment_k64_fast(
+        float (&acc)[kNFrag][4],
+        const ggml_cuda_mma::tile<16, 8, int> &C,
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int nf, int c0, int c1, float2 dm0, float2 dm1,
+        uint32_t min0, uint32_t min1) {
+    fold_k64_col_fast<T0, T1>(
+        acc[nf][0], acc[nf][2], C.x[0], C.x[2],
+        s_q8_fix, stage, nf, c0, dm0, dm1, min0, min1);
+    fold_k64_col_fast<T0, T1>(
+        acc[nf][1], acc[nf][3], C.x[1], C.x[3],
+        s_q8_fix, stage, nf, c1, dm0, dm1, min0, min1);
+}
+
+template <int T0, int T1>
+__device__ __forceinline__ void fold_fragment_k64_guarded(
+        float (&acc)[kNFrag][4],
+        const ggml_cuda_mma::tile<16, 8, int> &C,
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int nf, int c0, int c1, float2 dm0, float2 dm1,
+        uint32_t min0, uint32_t min1,
+        bool row0_ok, bool row1_ok, bool col0_ok, bool col1_ok) {
+    if (col0_ok && (row0_ok || row1_ok)) {
+        fold_k64_col_guarded<T0, T1>(
+            acc[nf][0], acc[nf][2], C.x[0], C.x[2],
+            s_q8_fix, stage, nf, c0, dm0, dm1, min0, min1,
+            row0_ok, row1_ok, col0_ok);
+    }
+    if (col1_ok && (row0_ok || row1_ok)) {
+        fold_k64_col_guarded<T0, T1>(
+            acc[nf][1], acc[nf][3], C.x[1], C.x[3],
+            s_q8_fix, stage, nf, c1, dm0, dm1, min0, min1,
+            row0_ok, row1_ok, col1_ok);
+    }
+}
+
+template <typename TileC>
+__device__ __forceinline__ void fold_fragment_k32(
+        float (&acc)[kNFrag][TileC::ne],
+        const TileC &C,
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int nf, int k_in_q8, int warp_row0, int M,
+        int col_lo, int col_hi, uint32_t dm0_bits, uint32_t dm1_bits,
+        uint16_t min0, uint16_t min1) {
+    static_assert(TileC::ne == 4, "expected m16n8 s32 accumulator fragment");
+    const int c0 = TileC::get_j(0);
+    const int c1 = TileC::get_j(1);
+    const int col0 = col_lo + nf * 8 + c0;
+    const int col1 = col_lo + nf * 8 + c1;
+    const bool col0_ok = col0 < col_hi;
+    const bool col1_ok = col1 < col_hi;
+    const Q8Fix2 fix0 = load_q8_fix2(s_q8_fix, stage, nf, c0, k_in_q8);
+    const Q8Fix2 fix1 = load_q8_fix2(s_q8_fix, stage, nf, c1, k_in_q8);
+
+    const float2 dm0 = half2_bits_to_float2(dm0_bits);
+    const float2 dm1 = half2_bits_to_float2(dm1_bits);
+    const int row0 = warp_row0 + TileC::get_i(0);
+    const int row1 = warp_row0 + TileC::get_i(2);
+    const bool row0_ok = row0 < M;
+    const bool row1_ok = row1 < M;
+
+    if (row0_ok && col0_ok) {
+        fold_element_k32(acc[nf][0], C.x[0], dm0, min0, fix0);
+    }
+    if (row0_ok && col1_ok) {
+        fold_element_k32(acc[nf][1], C.x[1], dm0, min0, fix1);
+    }
+    if (row1_ok && col0_ok) {
+        fold_element_k32(acc[nf][2], C.x[2], dm1, min1, fix0);
+    }
+    if (row1_ok && col1_ok) {
+        fold_element_k32(acc[nf][3], C.x[3], dm1, min1, fix1);
+    }
+}
+
+template <typename TileC>
+__device__ __forceinline__ void fold_fragment_k64(
+        float (&acc)[kNFrag][TileC::ne],
+        const TileC &C,
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int nf, int k_in_q8_pair, int warp_row0, int M,
+        int col_lo, int col_hi, uint32_t dm0_bits, uint32_t dm1_bits,
+        uint32_t min0, uint32_t min1) {
+    static_assert(TileC::ne == 4, "expected m16n8 s32 accumulator fragment");
+    const int c0 = TileC::get_j(0);
+    const int c1 = TileC::get_j(1);
+    const int col0 = col_lo + nf * 8 + c0;
+    const int col1 = col_lo + nf * 8 + c1;
+    const bool col0_ok = col0 < col_hi;
+    const bool col1_ok = col1 < col_hi;
+    const Q8Fix4 fix0 = load_q8_fix4(s_q8_fix, stage, nf, c0, k_in_q8_pair);
+    const Q8Fix4 fix1 = load_q8_fix4(s_q8_fix, stage, nf, c1, k_in_q8_pair);
+
+    const float2 dm0 = half2_bits_to_float2(dm0_bits);
+    const float2 dm1 = half2_bits_to_float2(dm1_bits);
+    const int row0 = warp_row0 + TileC::get_i(0);
+    const int row1 = warp_row0 + TileC::get_i(2);
+    const bool row0_ok = row0 < M;
+    const bool row1_ok = row1 < M;
+
+    if (row0_ok && col0_ok) {
+        fold_element_k64(acc[nf][0], C.x[0], dm0, min0, fix0);
+    }
+    if (row0_ok && col1_ok) {
+        fold_element_k64(acc[nf][1], C.x[1], dm0, min0, fix1);
+    }
+    if (row1_ok && col0_ok) {
+        fold_element_k64(acc[nf][2], C.x[2], dm1, min1, fix0);
+    }
+    if (row1_ok && col1_ok) {
+        fold_element_k64(acc[nf][3], C.x[3], dm1, min1, fix1);
+    }
+}
+
+template <typename TileA, typename TileB, typename TileC, bool FullTile>
+__device__ __forceinline__ void mma_fold_k128_k32(
+        float (&acc)[kNFrag][TileC::ne],
+        const Q2KWeightHalf &w,
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int warp_row0, int M, int col_lo, int col_hi, int nf_live) {
+    TileA A0;
+    TileA A1;
+    TileA A2;
+    TileA A3;
+    make_A_tile<0>(A0, w);
+    make_A_tile<1>(A1, w);
+    make_A_tile<2>(A2, w);
+    make_A_tile<3>(A3, w);
+
+    const uint32_t min0_p01 = min_pack4_for_pair<0, 1>(w.sc_r0_lo4, w.sc_r0_hi4);
+    const uint32_t min1_p01 = min_pack4_for_pair<0, 1>(w.sc_r1_lo4, w.sc_r1_hi4);
+    const uint32_t min0_p23 = min_pack4_for_pair<2, 3>(w.sc_r0_lo4, w.sc_r0_hi4);
+    const uint32_t min1_p23 = min_pack4_for_pair<2, 3>(w.sc_r1_lo4, w.sc_r1_hi4);
+    const float2 dm0 = half2_bits_to_float2(w.dm_r0);
+    const float2 dm1 = half2_bits_to_float2(w.dm_r1);
+    const int c0 = TileC::get_j(0);
+    const int c1 = TileC::get_j(1);
+    const bool row0_ok = FullTile ? true : ((warp_row0 + TileC::get_i(0)) < M);
+    const bool row1_ok = FullTile ? true : ((warp_row0 + TileC::get_i(2)) < M);
+
+#pragma unroll
+    for (int nf = 0; nf < kNFrag; ++nf) {
+        if constexpr (!FullTile) {
+            if (nf >= nf_live) {
+                break;
+            }
+        }
+        const int col_frag = col_lo + nf * 8;
+        const bool col0_ok = FullTile ? true : ((col_frag + c0) < col_hi);
+        const bool col1_ok = FullTile ? true : ((col_frag + c1) < col_hi);
+
+        TileB B0;
+        TileC C0;
+        const Q8Fix2 fix00 = load_q8_fix2(s_q8_fix, stage, nf, c0, 0);
+        const Q8Fix2 fix01 = load_q8_fix2(s_q8_fix, stage, nf, c1, 0);
+        load_B_tile(B0, s_q8, stage, nf, 0);
+        ggml_cuda_mma::mma(C0, A0, B0);
+        if constexpr (FullTile) {
+            fold_fragment_k32_fast(acc, C0, fix00, fix01, nf, dm0, dm1,
+                                   (uint16_t)min0_p01, (uint16_t)min1_p01);
+        } else {
+            fold_fragment_k32_guarded(acc, C0, fix00, fix01, nf, dm0, dm1,
+                                      (uint16_t)min0_p01, (uint16_t)min1_p01,
+                                      row0_ok, row1_ok, col0_ok, col1_ok);
+        }
+
+        TileB B1;
+        TileC C1;
+        const Q8Fix2 fix10 = load_q8_fix2(s_q8_fix, stage, nf, c0, 32);
+        const Q8Fix2 fix11 = load_q8_fix2(s_q8_fix, stage, nf, c1, 32);
+        load_B_tile(B1, s_q8, stage, nf, 32);
+        ggml_cuda_mma::mma(C1, A1, B1);
+        if constexpr (FullTile) {
+            fold_fragment_k32_fast(acc, C1, fix10, fix11, nf, dm0, dm1,
+                                   (uint16_t)(min0_p01 >> 16), (uint16_t)(min1_p01 >> 16));
+        } else {
+            fold_fragment_k32_guarded(acc, C1, fix10, fix11, nf, dm0, dm1,
+                                      (uint16_t)(min0_p01 >> 16), (uint16_t)(min1_p01 >> 16),
+                                      row0_ok, row1_ok, col0_ok, col1_ok);
+        }
+
+        TileB B2;
+        TileC C2;
+        const Q8Fix2 fix20 = load_q8_fix2(s_q8_fix, stage, nf, c0, 64);
+        const Q8Fix2 fix21 = load_q8_fix2(s_q8_fix, stage, nf, c1, 64);
+        load_B_tile(B2, s_q8, stage, nf, 64);
+        ggml_cuda_mma::mma(C2, A2, B2);
+        if constexpr (FullTile) {
+            fold_fragment_k32_fast(acc, C2, fix20, fix21, nf, dm0, dm1,
+                                   (uint16_t)min0_p23, (uint16_t)min1_p23);
+        } else {
+            fold_fragment_k32_guarded(acc, C2, fix20, fix21, nf, dm0, dm1,
+                                      (uint16_t)min0_p23, (uint16_t)min1_p23,
+                                      row0_ok, row1_ok, col0_ok, col1_ok);
+        }
+
+        TileB B3;
+        TileC C3;
+        const Q8Fix2 fix30 = load_q8_fix2(s_q8_fix, stage, nf, c0, 96);
+        const Q8Fix2 fix31 = load_q8_fix2(s_q8_fix, stage, nf, c1, 96);
+        load_B_tile(B3, s_q8, stage, nf, 96);
+        ggml_cuda_mma::mma(C3, A3, B3);
+        if constexpr (FullTile) {
+            fold_fragment_k32_fast(acc, C3, fix30, fix31, nf, dm0, dm1,
+                                   (uint16_t)(min0_p23 >> 16), (uint16_t)(min1_p23 >> 16));
+        } else {
+            fold_fragment_k32_guarded(acc, C3, fix30, fix31, nf, dm0, dm1,
+                                      (uint16_t)(min0_p23 >> 16), (uint16_t)(min1_p23 >> 16),
+                                      row0_ok, row1_ok, col0_ok, col1_ok);
+        }
+    }
+}
+
+template <typename TileA, typename TileB, typename TileC, bool FullTile>
+__device__ __forceinline__ void mma_fold_k128_k64(
+        float (&acc)[kNFrag][TileC::ne],
+        const Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int raw_stage, bool raw_row0_ok, bool raw_row1_ok, int parity, int raw_half,
+        int warp, int group, int tig, int stage, int warp_row0, int M, int col_lo, int col_hi,
+        int nf_live) {
+    const int c0 = TileC::get_j(0);
+    const int c1 = TileC::get_j(1);
+    const bool row0_ok = FullTile ? true : ((warp_row0 + TileC::get_i(0)) < M);
+    const bool row1_ok = FullTile ? true : ((warp_row0 + TileC::get_i(2)) < M);
+
+    {
+        TileA A0;
+        TileA A1;
+        uint32_t min0;
+        uint32_t min1;
+        float2 dm0;
+        float2 dm1;
+        {
+            Q2KWeightHalf w;
+            load_q2k_weight_half_raw(
+                w, s_raw, warp, raw_stage, raw_row0_ok, raw_row1_ok,
+                parity, raw_half, group, tig);
+            make_A_tile<0>(A0, w);
+            make_A_tile<1>(A1, w);
+            min0 = min_pack4_for_pair<0, 1>(w.sc_r0_lo4, w.sc_r0_hi4);
+            min1 = min_pack4_for_pair<0, 1>(w.sc_r1_lo4, w.sc_r1_hi4);
+            dm0 = half2_bits_to_float2(w.dm_r0);
+            dm1 = half2_bits_to_float2(w.dm_r1);
+        }
+#pragma unroll
+        for (int nf = 0; nf < kNFrag; ++nf) {
+            if constexpr (!FullTile) {
+                if (nf >= nf_live) {
+                    break;
+                }
+            }
+            const int col_frag = col_lo + nf * 8;
+            const bool col0_ok = FullTile ? true : ((col_frag + c0) < col_hi);
+            const bool col1_ok = FullTile ? true : ((col_frag + c1) < col_hi);
+            TileC C01;
+            TileB B;
+            load_B_tile(B, s_q8, stage, nf, 0);
+            ggml_cuda_mma::mma(C01, A0, B);
+            load_B_tile(B, s_q8, stage, nf, 32);
+            ggml_cuda_mma::mma(C01, A1, B);
+            if constexpr (FullTile) {
+                fold_fragment_k64_fast<0, 1>(
+                    acc, C01, s_q8_fix, stage, nf, c0, c1, dm0, dm1, min0, min1);
+            } else {
+                fold_fragment_k64_guarded<0, 1>(
+                    acc, C01, s_q8_fix, stage, nf, c0, c1, dm0, dm1, min0, min1,
+                    row0_ok, row1_ok, col0_ok, col1_ok);
+            }
+        }
+    }
+
+    {
+        TileA A2;
+        TileA A3;
+        uint32_t min0;
+        uint32_t min1;
+        float2 dm0;
+        float2 dm1;
+        {
+            Q2KWeightHalf w;
+            load_q2k_weight_half_raw(
+                w, s_raw, warp, raw_stage, raw_row0_ok, raw_row1_ok,
+                parity, raw_half, group, tig);
+            make_A_tile<2>(A2, w);
+            make_A_tile<3>(A3, w);
+            min0 = min_pack4_for_pair<2, 3>(w.sc_r0_lo4, w.sc_r0_hi4);
+            min1 = min_pack4_for_pair<2, 3>(w.sc_r1_lo4, w.sc_r1_hi4);
+            dm0 = half2_bits_to_float2(w.dm_r0);
+            dm1 = half2_bits_to_float2(w.dm_r1);
+        }
+#pragma unroll
+        for (int nf = 0; nf < kNFrag; ++nf) {
+            if constexpr (!FullTile) {
+                if (nf >= nf_live) {
+                    break;
+                }
+            }
+            const int col_frag = col_lo + nf * 8;
+            const bool col0_ok = FullTile ? true : ((col_frag + c0) < col_hi);
+            const bool col1_ok = FullTile ? true : ((col_frag + c1) < col_hi);
+            TileC C23;
+            TileB B;
+            load_B_tile(B, s_q8, stage, nf, 64);
+            ggml_cuda_mma::mma(C23, A2, B);
+            load_B_tile(B, s_q8, stage, nf, 96);
+            ggml_cuda_mma::mma(C23, A3, B);
+            if constexpr (FullTile) {
+                fold_fragment_k64_fast<2, 3>(
+                    acc, C23, s_q8_fix, stage, nf, c0, c1, dm0, dm1, min0, min1);
+            } else {
+                fold_fragment_k64_guarded<2, 3>(
+                    acc, C23, s_q8_fix, stage, nf, c0, c1, dm0, dm1, min0, min1,
+                    row0_ok, row1_ok, col0_ok, col1_ok);
+            }
+        }
+    }
+}
+
+template <typename TileA, typename TileB, typename TileC>
+__device__ __forceinline__ void mma_fold_k128_k32_fast(
+        float (&acc)[kNFrag][TileC::ne],
+        const Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int k128_iter) {
+    static_assert(TileC::ne == 4, "expected m16n8 s32 accumulator fragment");
+    Q2KWeightHalf w;
+    load_q2k_weight_half_raw_fast(w, s_raw, k128_iter);
+
+    TileA A0;
+    TileA A1;
+    TileA A2;
+    TileA A3;
+    make_A_tile<0>(A0, w);
+    make_A_tile<1>(A1, w);
+    make_A_tile<2>(A2, w);
+    make_A_tile<3>(A3, w);
+
+    const uint32_t min0_p01 = min_pack4_for_pair<0, 1>(w.sc_r0_lo4, w.sc_r0_hi4);
+    const uint32_t min1_p01 = min_pack4_for_pair<0, 1>(w.sc_r1_lo4, w.sc_r1_hi4);
+    const uint32_t min0_p23 = min_pack4_for_pair<2, 3>(w.sc_r0_lo4, w.sc_r0_hi4);
+    const uint32_t min1_p23 = min_pack4_for_pair<2, 3>(w.sc_r1_lo4, w.sc_r1_hi4);
+    const float2 dm0 = half2_bits_to_float2(w.dm_r0);
+    const float2 dm1 = half2_bits_to_float2(w.dm_r1);
+    const int c0 = TileC::get_j(0);
+    const int c1 = TileC::get_j(1);
+
+#pragma unroll
+    for (int nf = 0; nf < kNFrag; ++nf) {
+        TileB B0;
+        TileC C0;
+        const Q8Fix2 fix00 = load_q8_fix2(s_q8_fix, d2r_q8_stage(k128_iter), nf, c0, 0);
+        const Q8Fix2 fix01 = load_q8_fix2(s_q8_fix, d2r_q8_stage(k128_iter), nf, c1, 0);
+        load_B_tile(B0, s_q8, d2r_q8_stage(k128_iter), nf, 0);
+        ggml_cuda_mma::mma(C0, A0, B0);
+        fold_fragment_k32_fast(acc, C0, fix00, fix01, nf, dm0, dm1,
+                               (uint16_t)min0_p01, (uint16_t)min1_p01);
+
+        TileB B1;
+        TileC C1;
+        const Q8Fix2 fix10 = load_q8_fix2(s_q8_fix, d2r_q8_stage(k128_iter), nf, c0, 32);
+        const Q8Fix2 fix11 = load_q8_fix2(s_q8_fix, d2r_q8_stage(k128_iter), nf, c1, 32);
+        load_B_tile(B1, s_q8, d2r_q8_stage(k128_iter), nf, 32);
+        ggml_cuda_mma::mma(C1, A1, B1);
+        fold_fragment_k32_fast(acc, C1, fix10, fix11, nf, dm0, dm1,
+                               (uint16_t)(min0_p01 >> 16), (uint16_t)(min1_p01 >> 16));
+
+        TileB B2;
+        TileC C2;
+        const Q8Fix2 fix20 = load_q8_fix2(s_q8_fix, d2r_q8_stage(k128_iter), nf, c0, 64);
+        const Q8Fix2 fix21 = load_q8_fix2(s_q8_fix, d2r_q8_stage(k128_iter), nf, c1, 64);
+        load_B_tile(B2, s_q8, d2r_q8_stage(k128_iter), nf, 64);
+        ggml_cuda_mma::mma(C2, A2, B2);
+        fold_fragment_k32_fast(acc, C2, fix20, fix21, nf, dm0, dm1,
+                               (uint16_t)min0_p23, (uint16_t)min1_p23);
+
+        TileB B3;
+        TileC C3;
+        const Q8Fix2 fix30 = load_q8_fix2(s_q8_fix, d2r_q8_stage(k128_iter), nf, c0, 96);
+        const Q8Fix2 fix31 = load_q8_fix2(s_q8_fix, d2r_q8_stage(k128_iter), nf, c1, 96);
+        load_B_tile(B3, s_q8, d2r_q8_stage(k128_iter), nf, 96);
+        ggml_cuda_mma::mma(C3, A3, B3);
+        fold_fragment_k32_fast(acc, C3, fix30, fix31, nf, dm0, dm1,
+                               (uint16_t)(min0_p23 >> 16), (uint16_t)(min1_p23 >> 16));
+    }
+}
+
+template <typename TileA, typename TileB, typename TileC>
+__device__ __forceinline__ void mma_fold_k128_k64_fast(
+        float (&acc)[kNFrag][TileC::ne],
+        const Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int k128_iter) {
+    static_assert(TileC::ne == 4, "expected m16n8 s32 accumulator fragment");
+    const int c0 = TileC::get_j(0);
+    const int c1 = TileC::get_j(1);
+
+    {
+        TileA A0;
+        TileA A1;
+        uint32_t min0;
+        uint32_t min1;
+        float2 dm0;
+        float2 dm1;
+        {
+            Q2KWeightHalf w;
+            load_q2k_weight_half_raw_fast(w, s_raw, k128_iter);
+            make_A_tile<0>(A0, w);
+            make_A_tile<1>(A1, w);
+            min0 = min_pack4_for_pair<0, 1>(w.sc_r0_lo4, w.sc_r0_hi4);
+            min1 = min_pack4_for_pair<0, 1>(w.sc_r1_lo4, w.sc_r1_hi4);
+            dm0 = half2_bits_to_float2(w.dm_r0);
+            dm1 = half2_bits_to_float2(w.dm_r1);
+        }
+#pragma unroll
+        for (int nf = 0; nf < kNFrag; ++nf) {
+            TileC C01;
+            TileB B;
+            load_B_tile(B, s_q8, d2r_q8_stage(k128_iter), nf, 0);
+            ggml_cuda_mma::mma(C01, A0, B);
+            load_B_tile(B, s_q8, d2r_q8_stage(k128_iter), nf, 32);
+            ggml_cuda_mma::mma(C01, A1, B);
+            fold_fragment_k64_fast<0, 1>(
+                acc, C01, s_q8_fix, d2r_q8_stage(k128_iter), nf, c0, c1, dm0, dm1, min0, min1);
+        }
+    }
+
+    {
+        TileA A2;
+        TileA A3;
+        uint32_t min0;
+        uint32_t min1;
+        float2 dm0;
+        float2 dm1;
+        {
+            Q2KWeightHalf w;
+            load_q2k_weight_half_raw_fast(w, s_raw, k128_iter);
+            make_A_tile<2>(A2, w);
+            make_A_tile<3>(A3, w);
+            min0 = min_pack4_for_pair<2, 3>(w.sc_r0_lo4, w.sc_r0_hi4);
+            min1 = min_pack4_for_pair<2, 3>(w.sc_r1_lo4, w.sc_r1_hi4);
+            dm0 = half2_bits_to_float2(w.dm_r0);
+            dm1 = half2_bits_to_float2(w.dm_r1);
+        }
+#pragma unroll
+        for (int nf = 0; nf < kNFrag; ++nf) {
+            TileC C23;
+            TileB B;
+            load_B_tile(B, s_q8, d2r_q8_stage(k128_iter), nf, 64);
+            ggml_cuda_mma::mma(C23, A2, B);
+            load_B_tile(B, s_q8, d2r_q8_stage(k128_iter), nf, 96);
+            ggml_cuda_mma::mma(C23, A3, B);
+            fold_fragment_k64_fast<2, 3>(
+                acc, C23, s_q8_fix, d2r_q8_stage(k128_iter), nf, c0, c1, dm0, dm1, min0, min1);
+        }
+    }
+}
+
+template <typename TileA, typename TileB, typename TileC, int T>
+__device__ __forceinline__ void mma_fold_k32_t(
+        float (&acc)[kNFrag][TileC::ne],
+        const Q2KWeightHalf &w,
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int k_in_q8, int warp_row0, int M, int col_lo, int col_hi) {
+    TileA A;
+    make_A_tile<T>(A, w);
+    const uint16_t min0 = min_pack_for_t<T>(w.sc_r0_lo4, w.sc_r0_hi4);
+    const uint16_t min1 = min_pack_for_t<T>(w.sc_r1_lo4, w.sc_r1_hi4);
+
+#pragma unroll
+    for (int nf = 0; nf < kNFrag; ++nf) {
+        TileB B;
+        TileC C;
+        load_B_tile(B, s_q8, stage, nf, k_in_q8);
+        ggml_cuda_mma::mma(C, A, B);
+        fold_fragment_k32(acc, C, s_q8_fix, stage, nf, k_in_q8,
+                          warp_row0, M, col_lo, col_hi, w.dm_r0, w.dm_r1,
+                          min0, min1);
+    }
+}
+
+template <typename TileA, typename TileB, typename TileC, int T0, int T1>
+__device__ __forceinline__ void mma_fold_k64_pair_t(
+        float (&acc)[kNFrag][TileC::ne],
+        const Q2KWeightHalf &w,
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        const Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        int stage, int k_in_q8_pair, int warp_row0, int M, int col_lo, int col_hi) {
+    TileA A0;
+    TileA A1;
+    make_A_tile<T0>(A0, w);
+    make_A_tile<T1>(A1, w);
+    const uint32_t min0 = min_pack4_for_pair<T0, T1>(w.sc_r0_lo4, w.sc_r0_hi4);
+    const uint32_t min1 = min_pack4_for_pair<T0, T1>(w.sc_r1_lo4, w.sc_r1_hi4);
+
+#pragma unroll
+    for (int nf = 0; nf < kNFrag; ++nf) {
+        TileC C;
+        TileB B0;
+        TileB B1;
+        load_B_tile(B0, s_q8, stage, nf, k_in_q8_pair);
+        ggml_cuda_mma::mma(C, A0, B0);
+        load_B_tile(B1, s_q8, stage, nf, k_in_q8_pair + 32);
+        ggml_cuda_mma::mma(C, A1, B1);
+        fold_fragment_k64(acc, C, s_q8_fix, stage, nf, k_in_q8_pair,
+                          warp_row0, M, col_lo, col_hi, w.dm_r0, w.dm_r1,
+                          min0, min1);
+    }
+}
+
+template <bool FullTile, typename TileA, typename TileB, typename TileC>
+__device__ __forceinline__ void down_q2k_d2r_mainloop(
+        float (&acc)[kNFrag][TileC::ne],
+        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        Q8ColFixF32 (&s_q8_fix)[kStages][kNFrag][8],
+        Q2KRawWarpStage (&s_raw)[kWarps][kRawStages],
+        const volatile SmemInvariants &s_inv) {
+    int guarded_nf_live = 0;
+    if constexpr (!FullTile) {
+        const int guarded_col_count = s_inv.col_count;
+        guarded_nf_live = (guarded_col_count + 7) >> 3;
+    }
+
+#pragma unroll
+    for (int pf = 0; pf < kStages; ++pf) {
+        if (pf < s_inv.k128_iters) {
+            if constexpr (FullTile) {
+                issue_q8_prefetch_fast(s_q8, s_inv, d2r_q8_stage(pf), pf);
+            } else {
+                issue_q8_prefetch<false>(s_q8, s_inv, d2r_q8_stage(pf), pf, d2r_tid());
+            }
+        }
+    }
+
+#pragma unroll
+    for (int pf = 0; pf < kRawStages; ++pf) {
+        if (pf < s_inv.nb) {
+            if constexpr (FullTile) {
+                issue_q2k_raw_prefetch_fast(s_raw, s_inv, d2r_raw_stage(pf), pf);
+            } else {
+                issue_q2k_raw_prefetch<false>(
+                    s_raw, s_inv, d2r_raw_stage(pf), pf, d2r_warp(), d2r_lane());
+            }
+        }
+    }
+
+    for (int k128_iter = 0;; ++k128_iter) {
+        if (k128_iter >= s_inv.k128_iters) {
+            break;
+        }
+        if ((k128_iter & 1) == 0) {
+            int keep_raw = 0;
+            if constexpr (kRawStages > 1) {
+                keep_raw = ((k128_iter >> 1) + 1 < s_inv.nb) ? 1 : 0;
+            }
+            cp_async_wait_keep(keep_raw);
+        }
+        __syncthreads();
+        if constexpr (FullTile) {
+            publish_q8_fix_f32(s_q8_fix, s_q8, d2r_q8_stage(k128_iter), d2r_tid());
+        } else {
+            publish_q8_fix_f32_guarded(
+                s_q8_fix, s_q8, d2r_q8_stage(k128_iter), d2r_tid(), guarded_nf_live << 3);
+        }
+        __syncthreads();
+
+        if constexpr (FullTile) {
+            mma_fold_k128_k64_fast<TileA, TileB, TileC>(
+                acc, s_raw, s_q8, s_q8_fix, k128_iter);
+        } else {
+            const int fold_warp = d2r_warp();
+            const int fold_group = d2r_group();
+            const int fold_warp_row0 = s_inv.cta_row0 + (fold_warp << 4);
+            const int fold_M = s_inv.M;
+            const int fold_col_lo = s_inv.col_lo;
+            const int fold_col_hi = fold_col_lo + s_inv.col_count;
+            const bool fold_row0_ok = (fold_warp_row0 + fold_group) < fold_M;
+            const bool fold_row1_ok = (fold_warp_row0 + fold_group + 8) < fold_M;
+            const int raw_stage = d2r_raw_stage(k128_iter >> 1);
+            const int raw_half = k128_iter & 1;
+            const int parity = fold_group & 1;
+            mma_fold_k128_k64<TileA, TileB, TileC, false>(
+                acc, s_raw, s_q8, s_q8_fix, raw_stage,
+                fold_row0_ok, fold_row1_ok,
+                parity, raw_half, fold_warp, fold_group, d2r_tig(),
+                d2r_q8_stage(k128_iter), fold_warp_row0, fold_M, fold_col_lo, fold_col_hi,
+                guarded_nf_live);
+        }
+
+        __syncthreads();
+        const int pf_iter = k128_iter + kStages;
+        if (pf_iter < s_inv.k128_iters) {
+            if constexpr (FullTile) {
+                issue_q8_prefetch_fast(s_q8, s_inv, d2r_q8_stage(pf_iter), pf_iter);
+            } else {
+                issue_q8_prefetch<false>(s_q8, s_inv, d2r_q8_stage(pf_iter), pf_iter, d2r_tid());
+            }
+        }
+        if ((k128_iter & 1) != 0) {
+            const int raw_pf = (k128_iter >> 1) + kRawStages;
+            if (raw_pf < s_inv.nb) {
+                if constexpr (FullTile) {
+                    issue_q2k_raw_prefetch_fast(s_raw, s_inv, d2r_raw_stage(raw_pf), raw_pf);
+                } else {
+                    issue_q2k_raw_prefetch<false>(
+                        s_raw, s_inv, d2r_raw_stage(raw_pf), raw_pf, d2r_warp(), d2r_lane());
+                }
+            }
+        }
+    }
+}
+
+
+__global__ __launch_bounds__(kThreads, 2)
+void d2r_build_worklist_kernel(const int32_t * __restrict__ expert_bounds,
+                               int * __restrict__ work,
+                               int * __restrict__ n_items_out,
+                               int n_experts) {
+    __shared__ int scan[kThreads];
+    __shared__ int running;
+    __shared__ int chunk_base;
+
+    const int tid = (int)threadIdx.x;
+    if (tid == 0) {
+        running = 0;
+    }
+    __syncthreads();
+
+    for (int base = 0; base < n_experts; base += kThreads) {
+        const int expert = base + tid;
+        int tiles = 0;
+        if (expert < n_experts) {
+            const int count = expert_bounds[expert + 1] - expert_bounds[expert];
+            tiles = count > 0 ? ((count + kNTile - 1) / kNTile) : 0;
+        }
+        scan[tid] = tiles;
+        __syncthreads();
+
+#pragma unroll
+        for (int offset = 1; offset < kThreads; offset <<= 1) {
+            const int add = tid >= offset ? scan[tid - offset] : 0;
+            __syncthreads();
+            scan[tid] += add;
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            chunk_base = running;
+        }
+        __syncthreads();
+
+        if (expert < n_experts && tiles > 0) {
+            const int exclusive = tid == 0 ? 0 : scan[tid - 1];
+            const int out_base = chunk_base + exclusive;
+            for (int jt = 0; jt < tiles; ++jt) {
+                work[out_base + jt] = (expert << 16) | jt;
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            running += scan[kThreads - 1];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *n_items_out = running;
+    }
+}
+
+__global__ __launch_bounds__(kThreads, 2)
+void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
+                         const block_q8_1_mmq * __restrict__ q8,
+                         const int32_t * __restrict__ ids_dst,
+                         const int32_t * __restrict__ expert_bounds,
+                         const int * __restrict__ work,
+                         const int * __restrict__ n_items_ptr,
+                         float * __restrict__ out,
+                         int M, int K, int n_assign, int E) {
+#if defined(TURING_MMA_AVAILABLE)
+    const int n_items = *n_items_ptr;
+    if ((int)blockIdx.x >= n_items) {
+        return;
+    }
+
+    const int packed = work[blockIdx.x];
+    const int expert = packed >> 16;
+    const int jt = packed & 0xFFFF;
+    if (expert >= E) {
+        return;
+    }
+
+    using tile_A = ggml_cuda_mma::tile<16, 8, int>;
+    using tile_B = ggml_cuda_mma::tile<8, 8, int>;
+    using tile_C = ggml_cuda_mma::tile<16, 8, int>;
+
+    __shared__ __align__(16) block_q8_1_mmq s_q8[kStages][kNFrag][8];
+    __shared__ __align__(16) Q8ColFixF32 s_q8_fix[kStages][kNFrag][8];
+    // CFG1/NT64 static shared: q8 = 2*(8*8*144 + 8*8*40) = 23,552 B;
+    // raw = 8 warps*2*(2*8*9*8 qs + 2*8*16 scales + 8*8 dm) = 23,552 B;
+    // invariant table <= 128 B; total stays below the 48 KiB launch target. The
+    // qs stride pads one uint2 per row-pair half so each lane's four raw uint2
+    // reads rotate banks.
+    __shared__ __align__(16) Q2KRawWarpStage s_raw[kWarps][kRawStages];
+    __shared__ __align__(16) volatile SmemInvariants s_inv;
+
+    const int col_lo = expert_bounds[expert] + jt * kNTile;
+    const int col_hi_full = expert_bounds[expert + 1];
+    const int col_tile_hi = (col_hi_full < col_lo + kNTile) ? col_hi_full : (col_lo + kNTile);
+    if (col_lo >= col_tile_hi) {
+        return;
+    }
+
+    const int cta_row0 = (int)blockIdx.y * kMTile;
+    const int warp_row0 = cta_row0 + d2r_warp() * 16;
+    const int nb = K >> 8;
+
+    const bool full_warp_tile = (warp_row0 + 15 < M) && (col_lo + kNTile <= col_hi_full);
+
+    if (d2r_tid() == 0) {
+        const uint64_t npair = (uint64_t)E * (uint64_t)(M >> 1) * (uint64_t)nb;
+        const uint64_t dm_bytes = (npair * 8ull + 63ull) & ~63ull;
+        const uint64_t sc_bytes = (npair * 32ull + 63ull) & ~63ull;
+        s_inv.w_base = (const char *)W_soa;
+        s_inv.q8_tile_base = (const char *)q8 + (uint64_t)col_lo * sizeof(block_q8_1_mmq);
+        s_inv.ids_dst = ids_dst;
+        s_inv.out = out;
+        s_inv.sc_off_bytes = (uint32_t)dm_bytes;
+        s_inv.qs_off_bytes = (uint32_t)(dm_bytes + sc_bytes);
+        s_inv.q8_k128_stride_bytes = (uint32_t)((uint64_t)n_assign * sizeof(block_q8_1_mmq));
+        s_inv.nb = nb;
+        s_inv.k128_iters = K >> 7;
+        s_inv.M = M;
+        s_inv.cta_row0 = cta_row0;
+        s_inv.col_lo = col_lo;
+        s_inv.col_count = col_tile_hi - col_lo;
+    }
+    if (d2r_lane() == 0) {
+        const uint64_t expert_row_pair = (uint64_t)expert * (uint64_t)(M >> 1);
+        const uint64_t warp_pair0_base =
+            (expert_row_pair + (uint64_t)(warp_row0 >> 1)) * (uint64_t)nb;
+        s_inv.warp_pair0_blk[d2r_warp()] = (uint32_t)warp_pair0_base;
+    }
+    __syncthreads();
+
+    float acc[kNFrag][tile_C::ne] = {};
+
+    if (full_warp_tile) {
+        down_q2k_d2r_mainloop<true, tile_A, tile_B, tile_C>(
+            acc, s_q8, s_q8_fix, s_raw, s_inv);
+    } else {
+        down_q2k_d2r_mainloop<false, tile_A, tile_B, tile_C>(
+            acc, s_q8, s_q8_fix, s_raw, s_inv);
+    }
+
+    const int out_col_lo = s_inv.col_lo;
+    const int out_col_hi = out_col_lo + s_inv.col_count;
+    const int out_warp_row0 = s_inv.cta_row0 + (d2r_warp() << 4);
+    const int out_M = s_inv.M;
+    const int32_t *out_ids_dst = s_inv.ids_dst;
+    float *out_base = s_inv.out;
+#pragma unroll
+    for (int nf = 0; nf < kNFrag; ++nf) {
+        const int col_frag0 = out_col_lo + nf * 8;
+#pragma unroll
+        for (int l = 0; l < tile_C::ne; ++l) {
+            const int row = out_warp_row0 + tile_C::get_i(l);
+            const int col = col_frag0 + tile_C::get_j(l);
+            if (row < out_M && col < out_col_hi) {
+                const int out_col = out_ids_dst[col];
+                out_base[(uint64_t)out_col * (uint64_t)out_M + (uint64_t)row] = acc[nf][l];
+            }
+        }
+    }
+#else
+    (void)W_soa;
+    (void)q8;
+    (void)ids_dst;
+    (void)expert_bounds;
+    (void)work;
+    (void)n_items_ptr;
+    (void)out;
+    (void)M;
+    (void)K;
+    (void)n_assign;
+    (void)E;
+#endif
+}
+
+static int64_t d2r_work_capacity(int64_t ncols_max, int n_experts) {
+    if (ncols_max <= 0 || n_experts <= 0) {
+        return 0;
+    }
+    return (ncols_max + kNTile - 1) / kNTile + (int64_t)n_experts;
+}
+
+} // namespace
+
+bool ds4_mmq_q2_K_moe_d2r_available(int cc) {
+    static int cached_cc = -1;
+    static int cached = 0;
+    if (cached_cc != cc) {
+        cached_cc = cc;
+        cached = (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                  ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+size_t ds4_mmq_q2_K_moe_d2r_scratch_bytes(int64_t ncols_max, int n_experts) {
+    const int64_t capacity = d2r_work_capacity(ncols_max, n_experts);
+    if (capacity <= 0 || capacity > (int64_t)(INT_MAX - 1)) {
+        return 0;
+    }
+    return (size_t)capacity * sizeof(int) + sizeof(int);
+}
+
+int ds4_mmq_q2_K_moe_d2r_launch(const void *W_soa,
+                                int64_t soa_blocks,
+                                const void *q8,
+                                const int32_t *ids_dst,
+                                const int32_t *expert_bounds,
+                                float *out,
+                                int M,
+                                int K,
+                                int64_t ne_get_rows,
+                                int n_experts,
+                                void *worklist_scratch,
+                                size_t worklist_scratch_bytes,
+                                cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q2_K_moe_d2r_launch";
+    const int dev = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_q2_K_moe_d2r_available(cc)) {
+        return 1;
+    }
+    if (!W_soa || !q8 || !ids_dst || !expert_bounds || !out || !worklist_scratch ||
+        M <= 0 || (M & 1) != 0 || K <= 0 || K % 256 != 0 || ne_get_rows <= 0 ||
+        ne_get_rows > INT_MAX || n_experts <= 0) {
+        return -1;
+    }
+
+    const int64_t expected_soa_blocks = (int64_t)n_experts * (int64_t)(M >> 1) * (int64_t)(K >> 8);
+    if (soa_blocks < expected_soa_blocks) {
+        return -1;
+    }
+
+    const int64_t capacity64 = d2r_work_capacity(ne_get_rows, n_experts);
+    if (capacity64 <= 0 || capacity64 > (int64_t)(INT_MAX - 1)) {
+        return -1;
+    }
+    const size_t needed = (size_t)capacity64 * sizeof(int) + sizeof(int);
+    if (worklist_scratch_bytes < needed) {
+        return -1;
+    }
+
+    int *work = (int *)worklist_scratch;
+    int *n_items = work + capacity64;
+
+    d2r_build_worklist_kernel<<<1, kThreads, 0, stream>>>(expert_bounds, work, n_items, n_experts);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: worklist builder launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const dim3 grid((unsigned)capacity64, (unsigned)((M + kMTile - 1) / kMTile), 1);
+    const dim3 block(32, kWarps, 1);
+    down_q2k_d2r_kernel<<<grid, block, 0, stream>>>(
+        W_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items, out,
+        M, K, (int)ne_get_rows, n_experts);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
