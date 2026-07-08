@@ -94,6 +94,15 @@ static bool d2r_enabled() {
     return cached != 0;
 }
 
+static bool d2r_iq2_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MMQ_D2R_IQ2");
+        cached = (env && env[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static int64_t d2r_min_cols() {
     static int64_t cached = -1;
     if (cached < 0) {
@@ -820,6 +829,31 @@ int ds4_mmq_moe_pair_impl(
 
     cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
     cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+
+    if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
+        d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
+        ne_get_rows >= d2r_min_cols()) {
+        static int d2r_iq2_avail_cc = -1;
+        static int d2r_iq2_avail = 0;
+        if (d2r_iq2_avail_cc != cc) {
+            d2r_iq2_avail_cc = cc;
+            d2r_iq2_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
+        }
+        if (d2r_iq2_avail) {
+            const size_t d2r_work_bytes =
+                ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
+            if (d2r_work_bytes != 0) {
+                ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
+                const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
+                    xa_soa, xb_soa, soa_blocks, src1_q8_1.get(), ids_dst.get(),
+                    expert_bounds.get(), out_a, out_b, M, K, ne_get_rows, n_experts,
+                    d2r_work.get(), d2r_work_bytes, stream);
+                if (d2r_rc == 0) {
+                    return 0;
+                }
+            }
+        }
+    }
 
     mmq_args args = {
         /*x=*/(const char *)W_a,

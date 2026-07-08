@@ -33,6 +33,10 @@ constexpr int kRawQSChunks = kRawHalves * kRawPairsPerWarp * kRawQSWordsPerHalf;
 constexpr int kRawSCChunks = kRawHalves * kRawPairsPerWarp;
 constexpr int kRawDMChunks = kRawPairsPerWarp;
 constexpr int kRawCopyChunks = kRawQSChunks + kRawSCChunks + kRawDMChunks;
+constexpr int kIQ2RawRowsPerWarp = 16;
+constexpr int kIQ2RawPairsPerRow = 8;
+constexpr int kIQ2RawQCodeChunks = kIQ2RawRowsPerWarp * kIQ2RawPairsPerRow;
+constexpr int kIQ2RawQCodeTrips = (kIQ2RawQCodeChunks + 31) / 32;
 constexpr int kQ8PrefetchItems = kNFrag * 8 * 9;
 constexpr int kQ8PrefetchTrips = (kQ8PrefetchItems + kThreads - 1) / kThreads;
 constexpr int kRawCopyTrips = (kRawCopyChunks + 31) / 32;
@@ -42,9 +46,12 @@ static_assert(kStages == 2, "D2R raw-ring schedule expects exactly two q8 stages
 static_assert(kThreads == 256, "D2R CTA is fixed at 256 threads");
 static_assert(kQ8PrefetchTrips == 3, "unexpected q8 issue trip count");
 static_assert(kRawCopyTrips == 5, "unexpected raw-ring issue trip count");
+static_assert(kIQ2RawQCodeTrips == 4, "unexpected IQ2 raw-ring issue trip count");
 
 struct alignas(16) SmemInvariants {
     const char *w_base;
+    const half *iq2_dq_base;
+    const uint2 *iq2_qs_base;
     const char *q8_tile_base;
     const int32_t *ids_dst;
     float *out;
@@ -57,7 +64,10 @@ struct alignas(16) SmemInvariants {
     int cta_row0;
     int col_lo;
     int col_count;
-    uint32_t warp_pair0_blk[kWarps];
+    union {
+        uint32_t warp_pair0_blk[kWarps];
+        uint32_t warp_row0_blk[kWarps];
+    };
 };
 
 static_assert(sizeof(SmemInvariants) <= 128, "shared invariant table must stay small");
@@ -486,6 +496,16 @@ static_assert(sizeof(Q2KRawWarpStage) ==
               kRawPairsPerWarp * sizeof(uint2),
               "unexpected Q2K raw ring stage size");
 
+struct alignas(16) IQ2RawWarpStage {
+    uint2 qs[kIQ2RawRowsPerWarp][kIQ2RawPairsPerRow];
+    half dq[kIQ2RawRowsPerWarp];
+};
+
+static_assert(sizeof(IQ2RawWarpStage) ==
+              kIQ2RawRowsPerWarp * kIQ2RawPairsPerRow * sizeof(uint2) +
+              kIQ2RawRowsPerWarp * sizeof(half),
+              "unexpected IQ2 raw ring stage size");
+
 constexpr size_t kSmemQ8StageBytes = (size_t)kNFrag * 8 * sizeof(block_q8_1_mmq);
 constexpr size_t kSmemTailStageBytes = (size_t)kNFrag * 8 * sizeof(Q8ColFixF32);
 constexpr size_t kSmemRawBytes = (size_t)kWarps * kRawStages * sizeof(Q2KRawWarpStage);
@@ -493,6 +513,13 @@ constexpr size_t kSmemInvBytes = sizeof(SmemInvariants);
 constexpr size_t kSmemStaticBytes = (size_t)kStages * (kSmemQ8StageBytes + kSmemTailStageBytes) +
                                     kSmemRawBytes + kSmemInvBytes;
 static_assert(kSmemStaticBytes <= 48ull * 1024ull, "D2R static shared memory exceeds 48 KiB");
+constexpr size_t kSmemIQ2RawBytes = (size_t)kWarps * kRawStages * sizeof(IQ2RawWarpStage);
+constexpr size_t kSmemIQ2GridBytes = 256u * sizeof(uint2);
+constexpr size_t kSmemIQ2StaticBytes = (size_t)kStages * kSmemQ8StageBytes +
+                                       kSmemIQ2RawBytes + kSmemIQ2GridBytes + kSmemInvBytes;
+static_assert(kSmemIQ2StaticBytes <= 48ull * 1024ull,
+              "IQ2 D2R static shared memory exceeds 48 KiB");
+
 
 __device__ __forceinline__ uint32_t q2k_select_parity(uint2 v, int parity) {
     return parity ? v.y : v.x;
@@ -757,6 +784,391 @@ __device__ __forceinline__ void load_B_tile(
         int stage, int nf, int k_in_q8) {
     const int *base = reinterpret_cast<const int *>(&s_q8[stage][nf][0].qs[k_in_q8]);
     ggml_cuda_mma::load_ldmatrix(B, base, sizeof(block_q8_1_mmq) / sizeof(int));
+}
+
+struct Q8D4K64PairF32 {
+    float2 c0;
+    float2 c1;
+};
+
+template <int T0>
+__device__ __forceinline__ Q8D4K64PairF32 load_q8_d4_k64_pair(
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        int stage, int nf, int c0, int c1) {
+    static_assert((T0 & 1) == 0, "expected even k32 base for k64 d4 load");
+    constexpr int d4_base = T0 & 2;
+    Q8D4K64PairF32 d;
+    d.c0 = *reinterpret_cast<const float2 *>(&s_q8[stage][nf][c0].d4[d4_base]);
+    d.c1 = *reinterpret_cast<const float2 *>(&s_q8[stage][nf][c1].d4[d4_base]);
+    return d;
+}
+
+template <int T>
+__device__ __forceinline__ float q8_d4_k64_slot(const float2 &d) {
+    if constexpr ((T & 1) == 0) {
+        return d.x;
+    } else {
+        return d.y;
+    }
+}
+
+__device__ __forceinline__ bool iq2_raw_row_valid(int warp_row0, int row, int M) {
+    return warp_row0 + row < M;
+}
+
+template <bool FullTile, int Iter>
+__device__ __forceinline__ void issue_iq2_raw_codes_iter(
+        IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const uint2 * __restrict__ qs_base,
+        uint32_t warp_row0_blk, int nb, int raw_stage, int k256_iter,
+        int warp_row0, int M, int warp, int lane) {
+    if constexpr (Iter < kIQ2RawQCodeTrips) {
+        const int t = lane + Iter * 32;
+        if (t < kIQ2RawQCodeChunks) {
+            const int row = t >> 3;
+            const int pair = t & 7;
+            const bool row_valid = FullTile ? true : iq2_raw_row_valid(warp_row0, row, M);
+            const bool valid = k256_iter < nb && row_valid;
+            const uint64_t blk = valid ? ((uint64_t)warp_row0_blk + (uint64_t)row * (uint64_t)nb +
+                                           (uint64_t)k256_iter) : 0ull;
+            void *dst = &s_raw[warp][raw_stage].qs[row][pair];
+            const void *src = qs_base + blk * 8ull + (uint64_t)pair;
+            cp_async_8B(dst, src, valid);
+        }
+        issue_iq2_raw_codes_iter<FullTile, Iter + 1>(
+            s_raw, qs_base, warp_row0_blk, nb, raw_stage, k256_iter,
+            warp_row0, M, warp, lane);
+    }
+}
+
+template <bool FullTile>
+__device__ __forceinline__ void issue_iq2_raw_prefetch(
+        IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const volatile SmemInvariants &s_inv,
+        int raw_stage, int k256_iter, int warp, int lane) {
+    const uint2 *qs_base = s_inv.iq2_qs_base;
+    const half *dq_base = s_inv.iq2_dq_base;
+    const uint32_t warp_row0_blk = s_inv.warp_row0_blk[warp];
+    const int nb = s_inv.nb;
+    int warp_row0 = 0;
+    int M = 0;
+    if constexpr (!FullTile) {
+        warp_row0 = s_inv.cta_row0 + (warp << 4);
+        M = s_inv.M;
+    }
+    issue_iq2_raw_codes_iter<FullTile, 0>(
+        s_raw, qs_base, warp_row0_blk, nb, raw_stage, k256_iter,
+        warp_row0, M, warp, lane);
+    if (lane < kIQ2RawRowsPerWarp) {
+        const int row = lane;
+        const bool row_valid = FullTile ? true : iq2_raw_row_valid(warp_row0, row, M);
+        const bool valid = k256_iter < nb && row_valid;
+        const uint64_t blk = valid ? ((uint64_t)warp_row0_blk + (uint64_t)row * (uint64_t)nb +
+                                       (uint64_t)k256_iter) : 0ull;
+        s_raw[warp][raw_stage].dq[row] = valid ? dq_base[blk] : __float2half(0.0f);
+    }
+    cp_async_commit();
+}
+
+template <int Iter>
+__device__ __forceinline__ void issue_iq2_raw_codes_iter_fast(
+        IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const uint2 * __restrict__ qs_base,
+        uint32_t warp_row0_blk, int nb, int raw_stage, int k256_iter) {
+    if constexpr (Iter < kIQ2RawQCodeTrips) {
+        const int lane = d2r_lane();
+        const int t = lane + Iter * 32;
+        if (t < kIQ2RawQCodeChunks) {
+            const int row = t >> 3;
+            const int pair = t & 7;
+            const bool valid = k256_iter < nb;
+            const uint64_t blk = valid ? ((uint64_t)warp_row0_blk + (uint64_t)row * (uint64_t)nb +
+                                           (uint64_t)k256_iter) : 0ull;
+            void *dst = &s_raw[d2r_warp()][raw_stage].qs[row][pair];
+            const void *src = qs_base + blk * 8ull + (uint64_t)pair;
+            cp_async_8B(dst, src, valid);
+        }
+        issue_iq2_raw_codes_iter_fast<Iter + 1>(
+            s_raw, qs_base, warp_row0_blk, nb, raw_stage, k256_iter);
+    }
+}
+
+__device__ __forceinline__ void issue_iq2_raw_prefetch_fast(
+        IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const volatile SmemInvariants &s_inv,
+        int raw_stage, int k256_iter) {
+    const int warp = d2r_warp();
+    const int lane = d2r_lane();
+    const uint32_t warp_row0_blk = s_inv.warp_row0_blk[warp];
+    issue_iq2_raw_codes_iter_fast<0>(
+        s_raw, s_inv.iq2_qs_base, warp_row0_blk, s_inv.nb, raw_stage, k256_iter);
+    if (lane < kIQ2RawRowsPerWarp) {
+        const bool valid = k256_iter < s_inv.nb;
+        const uint64_t blk = valid ? ((uint64_t)warp_row0_blk + (uint64_t)lane * (uint64_t)s_inv.nb +
+                                       (uint64_t)k256_iter) : 0ull;
+        s_raw[warp][raw_stage].dq[lane] = valid ? s_inv.iq2_dq_base[blk] : __float2half(0.0f);
+    }
+    cp_async_commit();
+}
+
+__device__ __forceinline__ uint32_t iq2_decode_signed_half(
+        uint2 code, const uint2 * __restrict__ s_grid, int chunk) {
+    const int group = chunk >> 1;
+    const int hi = chunk & 1;
+    const uint8_t aux = (uint8_t)(code.x >> (8 * group));
+    const uint2 grid_pos = s_grid[aux];
+    const uint32_t signs8 = unpack_ksigns((uint8_t)(code.y >> (7 * group)));
+    const uint32_t sel = hi ? 0x80402010u : 0x08040201u;
+    const uint32_t s = __vcmpne4(signs8 & sel, 0);
+    const uint32_t grid_half = hi ? grid_pos.y : grid_pos.x;
+    return __vsub4(grid_half ^ s, s);
+}
+
+template <int T, typename TileA>
+__device__ __forceinline__ void make_iq2_A_tile(
+        TileA &A, float &dA0, float &dA1,
+        const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const uint2 * __restrict__ s_grid,
+        int warp, int raw_stage, bool row0_ok, bool row1_ok,
+        int group, int tig) {
+    const IQ2RawWarpStage &raw = s_raw[warp][raw_stage];
+    constexpr int pair = T;
+    const int row0 = group;
+    const int row1 = group + 8;
+    const uint2 code0 = row0_ok ? raw.qs[row0][pair] : make_uint2(0, 0);
+    const uint2 code1 = row1_ok ? raw.qs[row1][pair] : make_uint2(0, 0);
+
+    A.x[0] = row0_ok ? (int)iq2_decode_signed_half(code0, s_grid, tig) : 0;
+    A.x[1] = row1_ok ? (int)iq2_decode_signed_half(code1, s_grid, tig) : 0;
+    A.x[2] = row0_ok ? (int)iq2_decode_signed_half(code0, s_grid, tig + 4) : 0;
+    A.x[3] = row1_ok ? (int)iq2_decode_signed_half(code1, s_grid, tig + 4) : 0;
+
+    const float d0 = row0_ok ? __half2float(raw.dq[row0]) : 0.0f;
+    const float d1 = row1_ok ? __half2float(raw.dq[row1]) : 0.0f;
+    const int ls0 = (int)(code0.y >> 27) | 1;
+    const int ls1 = (int)(code1.y >> 27) | 1;
+    dA0 = d0 * (float)ls0 * 0.125f;
+    dA1 = d1 * (float)ls1 * 0.125f;
+}
+
+__device__ __forceinline__ void fold_iq2_fragment_fast(
+        float (&acc)[kNFrag][4],
+        const ggml_cuda_mma::tile<16, 8, int> &C,
+        int nf, float dA0, float dA1, float dB0, float dB1) {
+    const float s00 = dA0 * dB0;
+    const float s01 = dA0 * dB1;
+    const float s10 = dA1 * dB0;
+    const float s11 = dA1 * dB1;
+    acc[nf][0] = fmaf((float)C.x[0], s00, acc[nf][0]);
+    acc[nf][1] = fmaf((float)C.x[1], s01, acc[nf][1]);
+    acc[nf][2] = fmaf((float)C.x[2], s10, acc[nf][2]);
+    acc[nf][3] = fmaf((float)C.x[3], s11, acc[nf][3]);
+}
+
+__device__ __forceinline__ void fold_iq2_fragment_guarded(
+        float (&acc)[kNFrag][4],
+        const ggml_cuda_mma::tile<16, 8, int> &C,
+        int nf, float dA0, float dA1, float dB0, float dB1,
+        bool row0_ok, bool row1_ok, bool col0_ok, bool col1_ok) {
+    const float s00 = dA0 * dB0;
+    const float s01 = dA0 * dB1;
+    const float s10 = dA1 * dB0;
+    const float s11 = dA1 * dB1;
+    if (row0_ok && col0_ok) acc[nf][0] = fmaf((float)C.x[0], s00, acc[nf][0]);
+    if (row0_ok && col1_ok) acc[nf][1] = fmaf((float)C.x[1], s01, acc[nf][1]);
+    if (row1_ok && col0_ok) acc[nf][2] = fmaf((float)C.x[2], s10, acc[nf][2]);
+    if (row1_ok && col1_ok) acc[nf][3] = fmaf((float)C.x[3], s11, acc[nf][3]);
+}
+
+template <bool FullTile, typename TileA, typename TileB, typename TileC, int T0, int T1>
+__device__ __forceinline__ void mma_fold_iq2_k32_pair_t(
+        float (&acc)[kNFrag][TileC::ne],
+        const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const uint2 * __restrict__ s_grid,
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        int raw_stage, int q8_stage, bool raw_row0_ok, bool raw_row1_ok,
+        int warp, int group, int tig, const volatile SmemInvariants &s_inv) {
+    static_assert(T1 == T0 + 1, "expected adjacent k32 pair");
+    static_assert(TileC::ne == 4, "expected m16n8 s32 accumulator fragment");
+    TileA A0;
+    TileA A1;
+    float dA00;
+    float dA01;
+    float dA10;
+    float dA11;
+    make_iq2_A_tile<T0>(A0, dA00, dA01, s_raw, s_grid, warp, raw_stage,
+                        raw_row0_ok, raw_row1_ok, group, tig);
+    make_iq2_A_tile<T1>(A1, dA10, dA11, s_raw, s_grid, warp, raw_stage,
+                        raw_row0_ok, raw_row1_ok, group, tig);
+
+    constexpr int k_in_q8_0 = (T0 & 3) * 32;
+    constexpr int k_in_q8_1 = (T1 & 3) * 32;
+    const int c0 = TileC::get_j(0);
+    const int c1 = TileC::get_j(1);
+    int col_count = 0;
+    int nf_live = kNFrag;
+    if constexpr (!FullTile) {
+        col_count = s_inv.col_count;
+        nf_live = (col_count + 7) >> 3;
+    }
+
+#pragma unroll
+    for (int nf = 0; nf < kNFrag; ++nf) {
+        if constexpr (!FullTile) {
+            if (nf >= nf_live) {
+                break;
+            }
+        }
+        const int col_local = nf * 8;
+        bool col0_ok = true;
+        bool col1_ok = true;
+        if constexpr (!FullTile) {
+            col0_ok = (col_local + c0) < col_count;
+            col1_ok = (col_local + c1) < col_count;
+        }
+        const Q8D4K64PairF32 dB = load_q8_d4_k64_pair<T0>(s_q8, q8_stage, nf, c0, c1);
+
+        TileB B0;
+        TileC C0;
+        load_B_tile(B0, s_q8, q8_stage, nf, k_in_q8_0);
+        ggml_cuda_mma::mma(C0, A0, B0);
+        if constexpr (FullTile) {
+            fold_iq2_fragment_fast(acc, C0, nf, dA00, dA01,
+                                   q8_d4_k64_slot<T0>(dB.c0), q8_d4_k64_slot<T0>(dB.c1));
+        } else {
+            fold_iq2_fragment_guarded(acc, C0, nf, dA00, dA01,
+                                      q8_d4_k64_slot<T0>(dB.c0), q8_d4_k64_slot<T0>(dB.c1),
+                                      raw_row0_ok, raw_row1_ok, col0_ok, col1_ok);
+        }
+
+        TileB B1;
+        TileC C1;
+        load_B_tile(B1, s_q8, q8_stage, nf, k_in_q8_1);
+        ggml_cuda_mma::mma(C1, A1, B1);
+        if constexpr (FullTile) {
+            fold_iq2_fragment_fast(acc, C1, nf, dA10, dA11,
+                                   q8_d4_k64_slot<T1>(dB.c0), q8_d4_k64_slot<T1>(dB.c1));
+        } else {
+            fold_iq2_fragment_guarded(acc, C1, nf, dA10, dA11,
+                                      q8_d4_k64_slot<T1>(dB.c0), q8_d4_k64_slot<T1>(dB.c1),
+                                      raw_row0_ok, raw_row1_ok, col0_ok, col1_ok);
+        }
+    }
+}
+
+template <bool FullTile, typename TileA, typename TileB, typename TileC>
+__device__ __forceinline__ void mma_fold_iq2_k128(
+        float (&acc)[kNFrag][TileC::ne],
+        const IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const uint2 * __restrict__ s_grid,
+        const block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        int k128_iter, const volatile SmemInvariants &s_inv) {
+    const int warp = d2r_warp();
+    const int group = d2r_group();
+    int warp_row0 = 0;
+    if constexpr (!FullTile) {
+        warp_row0 = s_inv.cta_row0 + (warp << 4);
+    }
+    bool row0_ok = true;
+    bool row1_ok = true;
+    if constexpr (!FullTile) {
+        row0_ok = (warp_row0 + group) < s_inv.M;
+        row1_ok = (warp_row0 + group + 8) < s_inv.M;
+    }
+    const int tig = d2r_tig();
+    const int raw_stage = d2r_raw_stage(k128_iter >> 1);
+    const int q8_stage = d2r_q8_stage(k128_iter);
+    const int half_pair_base = (k128_iter & 1) ? 4 : 0;
+
+    if (half_pair_base == 0) {
+        mma_fold_iq2_k32_pair_t<FullTile, TileA, TileB, TileC, 0, 1>(
+            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            row0_ok, row1_ok, warp, group, tig, s_inv);
+        mma_fold_iq2_k32_pair_t<FullTile, TileA, TileB, TileC, 2, 3>(
+            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            row0_ok, row1_ok, warp, group, tig, s_inv);
+    } else {
+        mma_fold_iq2_k32_pair_t<FullTile, TileA, TileB, TileC, 4, 5>(
+            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            row0_ok, row1_ok, warp, group, tig, s_inv);
+        mma_fold_iq2_k32_pair_t<FullTile, TileA, TileB, TileC, 6, 7>(
+            acc, s_raw, s_grid, s_q8, raw_stage, q8_stage,
+            row0_ok, row1_ok, warp, group, tig, s_inv);
+    }
+}
+
+template <bool FullTile, typename TileA, typename TileB, typename TileC>
+__device__ __forceinline__ void iq2_d2r_mainloop(
+        float (&acc)[kNFrag][TileC::ne],
+        block_q8_1_mmq (&s_q8)[kStages][kNFrag][8],
+        IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
+        const uint2 * __restrict__ s_grid,
+        const volatile SmemInvariants &s_inv) {
+#pragma unroll
+    for (int pf = 0; pf < kStages; ++pf) {
+        if (pf < s_inv.k128_iters) {
+            if constexpr (FullTile) {
+                issue_q8_prefetch_fast(s_q8, s_inv, d2r_q8_stage(pf), pf);
+            } else {
+                issue_q8_prefetch<false>(s_q8, s_inv, d2r_q8_stage(pf), pf, d2r_tid());
+            }
+        }
+    }
+
+#pragma unroll
+    for (int pf = 0; pf < kRawStages; ++pf) {
+        if (pf < s_inv.nb) {
+            if constexpr (FullTile) {
+                issue_iq2_raw_prefetch_fast(s_raw, s_inv, d2r_raw_stage(pf), pf);
+            } else {
+                issue_iq2_raw_prefetch<false>(
+                    s_raw, s_inv, d2r_raw_stage(pf), pf, d2r_warp(), d2r_lane());
+            }
+        }
+    }
+
+    for (int k128_iter = 0;; ++k128_iter) {
+        if (k128_iter >= s_inv.k128_iters) {
+            break;
+        }
+        if ((k128_iter & 1) == 0) {
+            int keep_raw = 0;
+            if constexpr (kRawStages > 1) {
+                keep_raw = ((k128_iter >> 1) + 1 < s_inv.nb) ? 1 : 0;
+            }
+            cp_async_wait_keep(keep_raw);
+        }
+        __syncthreads();
+
+        if constexpr (FullTile) {
+            mma_fold_iq2_k128<true, TileA, TileB, TileC>(
+                acc, s_raw, s_grid, s_q8, k128_iter, s_inv);
+        } else {
+            mma_fold_iq2_k128<false, TileA, TileB, TileC>(
+                acc, s_raw, s_grid, s_q8, k128_iter, s_inv);
+        }
+
+        __syncthreads();
+        const int pf_iter = k128_iter + kStages;
+        if (pf_iter < s_inv.k128_iters) {
+            if constexpr (FullTile) {
+                issue_q8_prefetch_fast(s_q8, s_inv, d2r_q8_stage(pf_iter), pf_iter);
+            } else {
+                issue_q8_prefetch<false>(s_q8, s_inv, d2r_q8_stage(pf_iter), pf_iter, d2r_tid());
+            }
+        }
+        if ((k128_iter & 1) != 0) {
+            const int raw_pf = (k128_iter >> 1) + kRawStages;
+            if (raw_pf < s_inv.nb) {
+                if constexpr (FullTile) {
+                    issue_iq2_raw_prefetch_fast(s_raw, s_inv, d2r_raw_stage(raw_pf), raw_pf);
+                } else {
+                    issue_iq2_raw_prefetch<false>(
+                        s_raw, s_inv, d2r_raw_stage(raw_pf), raw_pf, d2r_warp(), d2r_lane());
+                }
+            }
+        }
+    }
 }
 
 __device__ __forceinline__ void fold_element_k32(
@@ -1683,6 +2095,131 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
 #endif
 }
 
+__global__ __launch_bounds__(kThreads, 2)
+void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
+                                const void * __restrict__ up_soa,
+                                const block_q8_1_mmq * __restrict__ q8,
+                                const int32_t * __restrict__ ids_dst,
+                                const int32_t * __restrict__ expert_bounds,
+                                const int * __restrict__ work,
+                                const int * __restrict__ n_items_ptr,
+                                float * __restrict__ out_gate,
+                                float * __restrict__ out_up,
+                                int M, int K, int n_assign, int E) {
+#if defined(TURING_MMA_AVAILABLE)
+    const int n_items = *n_items_ptr;
+    if ((int)blockIdx.x >= n_items) {
+        return;
+    }
+
+    const int packed = work[blockIdx.x];
+    const int expert = packed >> 16;
+    const int jt = packed & 0xFFFF;
+    const int leg = (int)blockIdx.z;
+    if (expert >= E || leg >= 2) {
+        return;
+    }
+
+    const int col_lo = expert_bounds[expert] + jt * kNTile;
+    const int col_hi_full = expert_bounds[expert + 1];
+    const int col_tile_hi = (col_hi_full < col_lo + kNTile) ? col_hi_full : (col_lo + kNTile);
+    if (col_lo >= col_tile_hi) {
+        return;
+    }
+
+    using tile_A = ggml_cuda_mma::tile<16, 8, int>;
+    using tile_B = ggml_cuda_mma::tile<8, 8, int>;
+    using tile_C = ggml_cuda_mma::tile<16, 8, int>;
+
+    __shared__ __align__(16) block_q8_1_mmq s_q8[kStages][kNFrag][8];
+    __shared__ __align__(16) IQ2RawWarpStage s_raw[kWarps][kRawStages];
+    __shared__ __align__(16) uint2 s_grid[256];
+    __shared__ __align__(16) volatile SmemInvariants s_inv;
+
+    const void *W_soa = leg == 0 ? gate_soa : up_soa;
+    float *out = leg == 0 ? out_gate : out_up;
+    const int cta_row0 = (int)blockIdx.y * kMTile;
+    const int warp_row0 = cta_row0 + d2r_warp() * 16;
+    const int nb = K >> 8;
+
+    const bool full_warp_tile = (warp_row0 + 15 < M) && (col_lo + kNTile <= col_hi_full);
+
+    for (int i = d2r_tid(); i < 256; i += kThreads) {
+        s_grid[i] = reinterpret_cast<const uint2 *>(iq2xxs_grid)[i];
+    }
+    if (d2r_tid() == 0) {
+        const uint64_t nblk = (uint64_t)E * (uint64_t)M * (uint64_t)nb;
+        const uint64_t dq_bytes = (nblk * 2ull + 63ull) & ~63ull;
+        s_inv.w_base = (const char *)W_soa;
+        s_inv.iq2_dq_base = reinterpret_cast<const half *>(W_soa);
+        s_inv.iq2_qs_base =
+            reinterpret_cast<const uint2 *>(reinterpret_cast<const char *>(W_soa) + dq_bytes);
+        s_inv.q8_tile_base = reinterpret_cast<const char *>(q8) + (uint64_t)col_lo * sizeof(block_q8_1_mmq);
+        s_inv.ids_dst = ids_dst;
+        s_inv.out = out;
+        s_inv.sc_off_bytes = 0;
+        s_inv.qs_off_bytes = 0;
+        s_inv.q8_k128_stride_bytes = (uint32_t)((uint64_t)n_assign * sizeof(block_q8_1_mmq));
+        s_inv.nb = nb;
+        s_inv.k128_iters = K >> 7;
+        s_inv.M = M;
+        s_inv.cta_row0 = cta_row0;
+        s_inv.col_lo = col_lo;
+        s_inv.col_count = col_tile_hi - col_lo;
+    }
+    if (d2r_lane() == 0) {
+        const uint64_t expert_row = (uint64_t)expert * (uint64_t)M;
+        const uint64_t warp_row0_base = (expert_row + (uint64_t)warp_row0) * (uint64_t)nb;
+        s_inv.warp_row0_blk[d2r_warp()] = (uint32_t)warp_row0_base;
+    }
+    __syncthreads();
+
+    float acc[kNFrag][tile_C::ne] = {};
+
+    if (full_warp_tile) {
+        iq2_d2r_mainloop<true, tile_A, tile_B, tile_C>(
+            acc, s_q8, s_raw, s_grid, s_inv);
+    } else {
+        iq2_d2r_mainloop<false, tile_A, tile_B, tile_C>(
+            acc, s_q8, s_raw, s_grid, s_inv);
+    }
+
+    const int out_col_lo = s_inv.col_lo;
+    const int out_col_hi = out_col_lo + s_inv.col_count;
+    const int out_warp_row0 = s_inv.cta_row0 + (d2r_warp() << 4);
+    const int out_M = s_inv.M;
+    const int32_t *out_ids_dst = s_inv.ids_dst;
+    float *out_base = s_inv.out;
+#pragma unroll
+    for (int nf = 0; nf < kNFrag; ++nf) {
+        const int col_frag0 = out_col_lo + nf * 8;
+#pragma unroll
+        for (int l = 0; l < tile_C::ne; ++l) {
+            const int row = out_warp_row0 + tile_C::get_i(l);
+            const int col = col_frag0 + tile_C::get_j(l);
+            if (row < out_M && col < out_col_hi) {
+                const int out_col = out_ids_dst[col];
+                out_base[(uint64_t)out_col * (uint64_t)out_M + (uint64_t)row] = acc[nf][l];
+            }
+        }
+    }
+#else
+    (void)gate_soa;
+    (void)up_soa;
+    (void)q8;
+    (void)ids_dst;
+    (void)expert_bounds;
+    (void)work;
+    (void)n_items_ptr;
+    (void)out_gate;
+    (void)out_up;
+    (void)M;
+    (void)K;
+    (void)n_assign;
+    (void)E;
+#endif
+}
+
 static int64_t d2r_work_capacity(int64_t ncols_max, int n_experts) {
     if (ncols_max <= 0 || n_experts <= 0) {
         return 0;
@@ -1703,7 +2240,26 @@ bool ds4_mmq_q2_K_moe_d2r_available(int cc) {
     return cached != 0;
 }
 
+bool ds4_mmq_iq2_xxs_moe_d2r_available(int cc) {
+    static int cached_cc = -1;
+    static int cached = 0;
+    if (cached_cc != cc) {
+        cached_cc = cc;
+        cached = (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                  ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 size_t ds4_mmq_q2_K_moe_d2r_scratch_bytes(int64_t ncols_max, int n_experts) {
+    const int64_t capacity = d2r_work_capacity(ncols_max, n_experts);
+    if (capacity <= 0 || capacity > (int64_t)(INT_MAX - 1)) {
+        return 0;
+    }
+    return (size_t)capacity * sizeof(int) + sizeof(int);
+}
+
+size_t ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(int64_t ncols_max, int n_experts) {
     const int64_t capacity = d2r_work_capacity(ncols_max, n_experts);
     if (capacity <= 0 || capacity > (int64_t)(INT_MAX - 1)) {
         return 0;
@@ -1765,6 +2321,71 @@ int ds4_mmq_q2_K_moe_d2r_launch(const void *W_soa,
     down_q2k_d2r_kernel<<<grid, block, 0, stream>>>(
         W_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items, out,
         M, K, (int)ne_get_rows, n_experts);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
+                                         const void *up_soa,
+                                         int64_t soa_blocks,
+                                         const void *q8,
+                                         const int32_t *ids_dst,
+                                         const int32_t *expert_bounds,
+                                         float *out_gate,
+                                         float *out_up,
+                                         int M,
+                                         int K,
+                                         int64_t ne_get_rows,
+                                         int n_experts,
+                                         void *worklist_scratch,
+                                         size_t worklist_scratch_bytes,
+                                         cudaStream_t stream) {
+    const char *tag = "ds4_mmq_iq2_xxs_moe_d2r_pair_launch";
+    const int dev = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc)) {
+        return 1;
+    }
+    if (!gate_soa || !up_soa || !q8 || !ids_dst || !expert_bounds || !out_gate || !out_up ||
+        !worklist_scratch || M <= 0 || K <= 0 || K % 256 != 0 || ne_get_rows <= 0 ||
+        ne_get_rows > INT_MAX || n_experts <= 0) {
+        return -1;
+    }
+
+    const int64_t expected_soa_blocks =
+        (int64_t)n_experts * (int64_t)M * (int64_t)(K >> 8);
+    if (soa_blocks < expected_soa_blocks) {
+        return -1;
+    }
+
+    const int64_t capacity64 = d2r_work_capacity(ne_get_rows, n_experts);
+    if (capacity64 <= 0 || capacity64 > (int64_t)(INT_MAX - 1)) {
+        return -1;
+    }
+    const size_t needed = (size_t)capacity64 * sizeof(int) + sizeof(int);
+    if (worklist_scratch_bytes < needed) {
+        return -1;
+    }
+
+    int *work = (int *)worklist_scratch;
+    int *n_items = work + capacity64;
+
+    d2r_build_worklist_kernel<<<1, kThreads, 0, stream>>>(expert_bounds, work, n_items, n_experts);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: worklist builder launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const dim3 grid((unsigned)capacity64, (unsigned)((M + kMTile - 1) / kMTile), 2);
+    const dim3 block(32, kWarps, 1);
+    gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
+        gate_soa, up_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items,
+        out_gate, out_up, M, K, (int)ne_get_rows, n_experts);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n", tag, cudaGetErrorString(err));
