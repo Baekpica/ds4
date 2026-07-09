@@ -95,7 +95,6 @@ struct alignas(16) SmemInvariants {
     const half *iq2_dq_base;
     const uint2 *iq2_qs_base;
     const char *q8_tile_base;
-    const int32_t *ids_dst;
     float *out;
     uint32_t sc_off_bytes;
     uint32_t qs_off_bytes;
@@ -887,9 +886,8 @@ template <bool FullTile>
 __device__ __forceinline__ void issue_iq2_raw_prefetch(
         IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const volatile SmemInvariants &s_inv,
-        int raw_stage, int k256_iter, int warp, int lane) {
+        int raw_stage, int k256_iter, int warp, int lane, half dq_val) {
     const uint2 *qs_base = s_inv.iq2_qs_base;
-    const half *dq_base = s_inv.iq2_dq_base;
     const uint32_t warp_row0_blk = s_inv.warp_row0_blk[warp];
     const int nb = s_inv.nb;
     int warp_row0 = 0;
@@ -902,14 +900,34 @@ __device__ __forceinline__ void issue_iq2_raw_prefetch(
         s_raw, qs_base, warp_row0_blk, nb, raw_stage, k256_iter,
         warp_row0, M, warp, lane);
     if (lane < kIQ2RawRowsPerWarp) {
-        const int row = lane;
-        const bool row_valid = FullTile ? true : iq2_raw_row_valid(warp_row0, row, M);
-        const bool valid = k256_iter < nb && row_valid;
-        const uint64_t blk = valid ? ((uint64_t)warp_row0_blk + (uint64_t)row * (uint64_t)nb +
-                                       (uint64_t)k256_iter) : 0ull;
-        s_raw[warp][raw_stage].dq[row] = valid ? dq_base[blk] : __float2half(0.0f);
+        s_raw[warp][raw_stage].dq[lane] = dq_val;
     }
     cp_async_commit();
+}
+
+/* The per-block dq halves cannot ride the cp.async ring (2-byte elements,
+ * nb-strided rows), so they go global->register->smem.  Issuing the LDG here
+ * and passing the value into issue_iq2_raw_prefetch* one k128 iteration later
+ * hides the load latency behind a fold; fused LDG.U16->STS.U16 was 52% of the
+ * kernel's long-scoreboard stalls (cmd2rncu15b PC sampling). */
+template <bool FullTile>
+__device__ __forceinline__ half iq2_raw_dq_preload(
+        const volatile SmemInvariants &s_inv, int k256_iter) {
+    const int lane = d2r_lane();
+    half dq = __float2half(0.0f);
+    if (lane < kIQ2RawRowsPerWarp) {
+        bool valid = k256_iter < s_inv.nb;
+        if constexpr (!FullTile) {
+            const int warp_row0 = s_inv.cta_row0 + (d2r_warp() << 4);
+            valid = valid && iq2_raw_row_valid(warp_row0, lane, s_inv.M);
+        }
+        if (valid) {
+            const uint64_t blk = (uint64_t)s_inv.warp_row0_blk[d2r_warp()] +
+                                 (uint64_t)lane * (uint64_t)s_inv.nb + (uint64_t)k256_iter;
+            dq = s_inv.iq2_dq_base[blk];
+        }
+    }
+    return dq;
 }
 
 template <int Iter>
@@ -938,17 +956,14 @@ __device__ __forceinline__ void issue_iq2_raw_codes_iter_fast(
 __device__ __forceinline__ void issue_iq2_raw_prefetch_fast(
         IQ2RawWarpStage (&s_raw)[kWarps][kRawStages],
         const volatile SmemInvariants &s_inv,
-        int raw_stage, int k256_iter) {
+        int raw_stage, int k256_iter, half dq_val) {
     const int warp = d2r_warp();
     const int lane = d2r_lane();
     const uint32_t warp_row0_blk = s_inv.warp_row0_blk[warp];
     issue_iq2_raw_codes_iter_fast<0>(
         s_raw, s_inv.iq2_qs_base, warp_row0_blk, s_inv.nb, raw_stage, k256_iter);
     if (lane < kIQ2RawRowsPerWarp) {
-        const bool valid = k256_iter < s_inv.nb;
-        const uint64_t blk = valid ? ((uint64_t)warp_row0_blk + (uint64_t)lane * (uint64_t)s_inv.nb +
-                                       (uint64_t)k256_iter) : 0ull;
-        s_raw[warp][raw_stage].dq[lane] = valid ? s_inv.iq2_dq_base[blk] : __float2half(0.0f);
+        s_raw[warp][raw_stage].dq[lane] = dq_val;
     }
     cp_async_commit();
 }
@@ -1160,15 +1175,17 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
 #pragma unroll
     for (int pf = 0; pf < kRawStages; ++pf) {
         if (pf < s_inv.nb) {
+            const half dq0 = iq2_raw_dq_preload<FullTile>(s_inv, pf);
             if constexpr (FullTile) {
-                issue_iq2_raw_prefetch_fast(s_raw, s_inv, d2r_raw_stage(pf), pf);
+                issue_iq2_raw_prefetch_fast(s_raw, s_inv, d2r_raw_stage(pf), pf, dq0);
             } else {
                 issue_iq2_raw_prefetch<false>(
-                    s_raw, s_inv, d2r_raw_stage(pf), pf, d2r_warp(), d2r_lane());
+                    s_raw, s_inv, d2r_raw_stage(pf), pf, d2r_warp(), d2r_lane(), dq0);
             }
         }
     }
 
+    half dq_pend = __float2half(0.0f);
     for (int k128_iter = 0;; ++k128_iter) {
         if (k128_iter >= s_inv.k128_iters) {
             break;
@@ -1181,6 +1198,14 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
             cp_async_wait_keep(keep_raw);
         }
         __syncthreads();
+        if ((k128_iter & 1) == 0) {
+            /* dq LDG for the raw prefetch issued at the NEXT (odd) iteration:
+             * a full fold of distance between the load and its smem store. */
+            const int raw_pf = (k128_iter >> 1) + kRawStages;
+            if (raw_pf < s_inv.nb) {
+                dq_pend = iq2_raw_dq_preload<FullTile>(s_inv, raw_pf);
+            }
+        }
 
         if constexpr (FullTile) {
             mma_fold_iq2_k128<true, TileA, TileB, TileC>(
@@ -1203,10 +1228,10 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
             const int raw_pf = (k128_iter >> 1) + kRawStages;
             if (raw_pf < s_inv.nb) {
                 if constexpr (FullTile) {
-                    issue_iq2_raw_prefetch_fast(s_raw, s_inv, d2r_raw_stage(raw_pf), raw_pf);
+                    issue_iq2_raw_prefetch_fast(s_raw, s_inv, d2r_raw_stage(raw_pf), raw_pf, dq_pend);
                 } else {
                     issue_iq2_raw_prefetch<false>(
-                        s_raw, s_inv, d2r_raw_stage(raw_pf), raw_pf, d2r_warp(), d2r_lane());
+                        s_raw, s_inv, d2r_raw_stage(raw_pf), raw_pf, d2r_warp(), d2r_lane(), dq_pend);
                 }
             }
         }
@@ -2053,6 +2078,10 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
     // reads rotate banks.
     __shared__ __align__(16) Q2KRawWarpStage s_raw[kWarps][kRawStages];
     __shared__ __align__(16) volatile SmemInvariants s_inv;
+    /* Scatter indices staged up front so the epilogue's dependent STG chain
+     * never waits on an ids_dst LDG (68% of this kernel's long-scoreboard
+     * stalls sat on that load, cmd2rncu15b PC sampling). */
+    __shared__ int s_out_cols[kNTile];
 
     const int col_lo = expert_bounds[expert] + jt * kNTile;
     const int col_hi_full = expert_bounds[expert + 1];
@@ -2073,7 +2102,6 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
         const uint64_t sc_bytes = (npair * 32ull + 63ull) & ~63ull;
         s_inv.w_base = (const char *)W_soa;
         s_inv.q8_tile_base = (const char *)q8 + (uint64_t)col_lo * sizeof(block_q8_1_mmq);
-        s_inv.ids_dst = ids_dst;
         s_inv.out = out;
         s_inv.sc_off_bytes = (uint32_t)dm_bytes;
         s_inv.qs_off_bytes = (uint32_t)(dm_bytes + sc_bytes);
@@ -2091,6 +2119,9 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
             (expert_row_pair + (uint64_t)(warp_row0 >> 1)) * (uint64_t)nb;
         s_inv.warp_pair0_blk[d2r_warp()] = (uint32_t)warp_pair0_base;
     }
+    if (d2r_tid() < col_tile_hi - col_lo) {
+        s_out_cols[d2r_tid()] = ids_dst[col_lo + d2r_tid()];
+    }
     __syncthreads();
 
     float acc[kNFrag][tile_C::ne] = {};
@@ -2107,7 +2138,6 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
     const int out_col_hi = out_col_lo + s_inv.col_count;
     const int out_warp_row0 = s_inv.cta_row0 + (d2r_warp() << 4);
     const int out_M = s_inv.M;
-    const int32_t *out_ids_dst = s_inv.ids_dst;
     float *out_base = s_inv.out;
 #pragma unroll
     for (int nf = 0; nf < kNFrag; ++nf) {
@@ -2117,7 +2147,7 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
             const int row = out_warp_row0 + tile_C::get_i(l);
             const int col = col_frag0 + tile_C::get_j(l);
             if (row < out_M && col < out_col_hi) {
-                const int out_col = out_ids_dst[col];
+                const int out_col = s_out_cols[col - out_col_lo];
                 out_base[(uint64_t)out_col * (uint64_t)out_M + (uint64_t)row] = acc[nf][l];
             }
         }
@@ -2177,6 +2207,8 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
     __shared__ __align__(16) IQ2RawWarpStage s_raw[kWarps][kRawStages];
     __shared__ __align__(16) uint2 s_grid[256];
     __shared__ __align__(16) volatile SmemInvariants s_inv;
+    /* Same scatter-index staging as down_q2k_d2r_kernel (see comment there). */
+    __shared__ int s_out_cols[kNTile];
 
     const void *W_soa = leg == 0 ? gate_soa : up_soa;
     float *out = leg == 0 ? out_gate : out_up;
@@ -2197,7 +2229,6 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
         s_inv.iq2_qs_base =
             reinterpret_cast<const uint2 *>(reinterpret_cast<const char *>(W_soa) + dq_bytes);
         s_inv.q8_tile_base = reinterpret_cast<const char *>(q8) + (uint64_t)col_lo * sizeof(block_q8_1_mmq);
-        s_inv.ids_dst = ids_dst;
         s_inv.out = out;
         s_inv.sc_off_bytes = 0;
         s_inv.qs_off_bytes = 0;
@@ -2213,6 +2244,9 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
         const uint64_t expert_row = (uint64_t)expert * (uint64_t)M;
         const uint64_t warp_row0_base = (expert_row + (uint64_t)warp_row0) * (uint64_t)nb;
         s_inv.warp_row0_blk[d2r_warp()] = (uint32_t)warp_row0_base;
+    }
+    if (d2r_tid() < col_tile_hi - col_lo) {
+        s_out_cols[d2r_tid()] = ids_dst[col_lo + d2r_tid()];
     }
     __syncthreads();
 
@@ -2230,7 +2264,6 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
     const int out_col_hi = out_col_lo + s_inv.col_count;
     const int out_warp_row0 = s_inv.cta_row0 + (d2r_warp() << 4);
     const int out_M = s_inv.M;
-    const int32_t *out_ids_dst = s_inv.ids_dst;
     float *out_base = s_inv.out;
 #pragma unroll
     for (int nf = 0; nf < kNFrag; ++nf) {
@@ -2240,7 +2273,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
             const int row = out_warp_row0 + tile_C::get_i(l);
             const int col = col_frag0 + tile_C::get_j(l);
             if (row < out_M && col < out_col_hi) {
-                const int out_col = out_ids_dst[col];
+                const int out_col = s_out_cols[col - out_col_lo];
                 out_base[(uint64_t)out_col * (uint64_t)out_M + (uint64_t)row] = acc[nf][l];
             }
         }
