@@ -16023,6 +16023,53 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
             fprintf(stderr, "ds4: dense-q8 shape label='%s' M=%d N=%d K=%d\n",
                     label ? label : "?", (int)out_dim, (int)n_tok, (int)in_dim);
         }
+        /* Dense-q8 D2R on the kind-5 aligned artifact (weight server
+         * --repack-q8-aligned; artifact presence is the opt-in).  Prefill-
+         * scale batches only; K=8192 (o_proj) stays on mmq which measured
+         * faster at deep K.  Kill switch DS4_MMQ_DENSE_D2R=0.  Fold order
+         * differs from mmq: value-parity, not bit-parity.  See the DENSE-Q8
+         * D2R PROTO ARC section of the D2R ledger. */
+        static int dense_d2r_en = -1;
+        static int dense_d2r_min_cols = 512;
+        if (dense_d2r_en < 0) {
+            const char *env = getenv("DS4_MMQ_DENSE_D2R");
+            dense_d2r_en = (env && env[0] == '0') ? 0 : 1;
+            /* Batch floor: prefill-scale only by default; eval harnesses
+             * lower it so short-prompt quality runs exercise the kernel
+             * (incl. the guarded last col tile). */
+            const char *mc = getenv("DS4_MMQ_DENSE_D2R_MIN_COLS");
+            if (mc && atoi(mc) > 0) dense_d2r_min_cols = atoi(mc);
+        }
+        if (dense_d2r_en && (int)n_tok >= dense_d2r_min_cols &&
+            (out_dim % 128u) == 0 && out_dim >= 2048 &&
+            in_dim <= 4096 && (in_dim % 1024u) == 0 &&
+            cuda_q8_aligned_enabled()) {
+            const uint64_t q8_al_bytes = ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
+            const char *w_al = q8_al_bytes != 0
+                ? cuda_derived_weight_ptr(model_map, weight_offset, weight_bytes,
+                                          CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+                                          in_dim, out_dim, 1u, q8_al_bytes,
+                                          label ? label : "q8_dense_d2r")
+                : NULL;
+            if (w_al) {
+                int rc = ds4_mmq_q8_0_dense_d2r(w_al, (const float *)x->ptr,
+                                                (float *)out->ptr,
+                                                (int)out_dim, (int)n_tok, (int)in_dim,
+                                                ds4_mmq_stream_for_call());
+                if (rc == 0) {
+                    static int logged_dense_d2r = 0;
+                    if (!logged_dense_d2r) {
+                        logged_dense_d2r = 1;
+                        fprintf(stderr, "ds4: dense q8 batched using D2R aligned path (first label='%s' M=%d N=%d K=%d)\n",
+                                label ? label : "?", (int)out_dim, (int)n_tok, (int)in_dim);
+                    }
+                    return 1;
+                }
+                fprintf(stderr, "ds4: ds4_mmq_q8_0_dense_d2r returned %d (label='%s' M=%llu N=%llu K=%llu); falling back to mmq\n",
+                        rc, label ? label : "", (unsigned long long)out_dim,
+                        (unsigned long long)n_tok, (unsigned long long)in_dim);
+            }
+        }
         int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
                                     (int)out_dim, (int)n_tok, (int)in_dim,
                                     /*stream=*/ds4_mmq_stream_for_call());

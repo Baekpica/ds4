@@ -452,6 +452,60 @@ extern "C" int ds4_mmq_q8_0_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_dense", W, X, out, M, N, K, stream);
 }
 
+// Dense Q8_0 D2R entry: same activation quantize + scratch treatment as
+// ds4_mmq_dense_impl (incl. the S1.1a zero for the never-written tail), then
+// the D2R kernel on the kind-5 aligned artifact instead of mul_mat_q_case.
+// No out-memset / trailing sanitize: the D2R epilogue writes every element
+// through an isfinite guard.  Caller (ds4_cuda.cu) resolves W_aligned and
+// gates on shape (M%128, K%1024, K<=4096) + n_tok.
+extern "C" int ds4_mmq_q8_0_dense_d2r(
+        const void * W_aligned, const float * X_f32, float * out_f32,
+        int M, int N, int K, cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q8_0_dense_d2r";
+    if (!W_aligned || !X_f32 || !out_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (M <= 0 || (M % 128) != 0 || N <= 0 || K <= 0 || (K % 1024) != 0) {
+        fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
+        return -1;
+    }
+    const int dev = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_q8_0_dense_d2r_available(cc)) {
+        return -1;
+    }
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return -1;
+    }
+    ds4_pool_set_stream(stream);
+
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    // Slack: the guarded last col tile reads up to 128 blocks past N*K/128.
+    const int64_t slack_blocks = std::max<int64_t>(get_mmq_x_max_host(cc), 128);
+    const size_t nbytes_src1_q8_1 =
+        (int64_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1 +
+        slack_blocks * sizeof(block_q8_1_mmq);
+
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+    cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream);
+
+    quantize_mmq_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        GGML_TYPE_Q8_0, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
+        /*ne0=*/ne10_padded, /*ne1=*/(int64_t)N, /*ne2=*/1, /*ne3=*/1,
+        stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize failed: %s\n", tag, cudaGetErrorString(err));
+        return -2;
+    }
+    return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, src1_q8_1.get(), out_f32,
+                                         M, N, K, stream);
+}
+
 extern "C" int ds4_mmq_q2_K_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {

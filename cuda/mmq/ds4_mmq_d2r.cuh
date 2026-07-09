@@ -29,6 +29,20 @@ int ds4_mmq_q2_K_moe_d2r_launch(
     size_t          worklist_scratch_bytes,
     cudaStream_t    stream);
 
+bool ds4_mmq_q8_0_dense_d2r_available(int cc);
+
+// Dense Q8_0 D2R on the kind-5 aligned artifact (--repack-q8-aligned).
+// q8 = block_q8_1_mmq D4 activation buffer ([k128][col], stride N cols,
+// over-allocated >= 128 blocks past N*K/128 for the guarded last col tile).
+int ds4_mmq_q8_0_dense_d2r_launch(
+    const void   * W_aligned,
+    const void   * q8,
+    float        * out,
+    int            M,
+    int            N,
+    int            K,
+    cudaStream_t   stream);
+
 int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
     const void    * gate_soa,
     const void    * up_soa,

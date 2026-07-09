@@ -70,6 +70,20 @@ int ds4_mmq_q8_0_dense(
     int           K,
     cudaStream_t  stream);
 
+// Dense Q8_0 D2R on the kind-5 aligned artifact (weight server
+// --repack-q8-aligned).  Same in/out contract as ds4_mmq_q8_0_dense but W is
+// the ALIGNED artifact base ([half dq[nblk]][pad64][int8 qs]), and the shape
+// must satisfy M % 128 == 0 && K % 1024 == 0.  Callers gate on n_tok scale
+// and K <= 4096 (o_proj's K=8192 measured faster on mmq).
+int ds4_mmq_q8_0_dense_d2r(
+    const void  * W_aligned,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 int ds4_mmq_q2_K_dense(
     const void  * W_q2_K,
     const float * X_f32,
