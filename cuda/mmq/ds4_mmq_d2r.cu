@@ -2054,11 +2054,11 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
                          int M, int K, int n_assign, int E) {
 #if defined(TURING_MMA_AVAILABLE)
     const int n_items = *n_items_ptr;
-    if ((int)blockIdx.x >= n_items) {
+    if ((int)blockIdx.y >= n_items) {
         return;
     }
 
-    const int packed = work[blockIdx.x];
+    const int packed = work[blockIdx.y];
     const int expert = packed >> 16;
     const int jt = packed & 0xFFFF;
     if (expert >= E) {
@@ -2090,7 +2090,7 @@ void down_q2k_d2r_kernel(const void * __restrict__ W_soa,
         return;
     }
 
-    const int cta_row0 = (int)blockIdx.y * kMTile;
+    const int cta_row0 = (int)blockIdx.x * kMTile;
     const int warp_row0 = cta_row0 + d2r_warp() * 16;
     const int nb = K >> 8;
 
@@ -2180,11 +2180,11 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
                                 int M, int K, int n_assign, int E) {
 #if defined(TURING_MMA_AVAILABLE)
     const int n_items = *n_items_ptr;
-    if ((int)blockIdx.x >= n_items) {
+    if ((int)blockIdx.y >= n_items) {
         return;
     }
 
-    const int packed = work[blockIdx.x];
+    const int packed = work[blockIdx.y];
     const int expert = packed >> 16;
     const int jt = packed & 0xFFFF;
     const int leg = (int)blockIdx.z;
@@ -2212,7 +2212,7 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
 
     const void *W_soa = leg == 0 ? gate_soa : up_soa;
     float *out = leg == 0 ? out_gate : out_up;
-    const int cta_row0 = (int)blockIdx.y * kMTile;
+    const int cta_row0 = (int)blockIdx.x * kMTile;
     const int warp_row0 = cta_row0 + d2r_warp() * 16;
     const int nb = K >> 8;
 
@@ -2395,7 +2395,13 @@ int ds4_mmq_q2_K_moe_d2r_launch(const void *W_soa,
         d2r_print_fill_stats(tag, expert_bounds, n_experts, ne_get_rows, stream);
     }
 
-    const dim3 grid((unsigned)capacity64, (unsigned)((M + kMTile - 1) / kMTile), 1);
+    /* Row tiles ride blockIdx.x (fastest) and the expert-ordered worklist
+     * rides blockIdx.y, so consecutive CTAs share one col-tile's q8 window
+     * and consecutive worklist items share one expert's weight slab -- the
+     * proto's expert-major L2 schedule.  The flat col-tile-fastest order
+     * re-read each q8 window through ~94 MB of intervening traffic (all
+     * misses, lts hit 55% vs proto 84%). */
+    const dim3 grid((unsigned)((M + kMTile - 1) / kMTile), (unsigned)capacity64, 1);
     const dim3 block(32, kWarps, 1);
     down_q2k_d2r_kernel<<<grid, block, 0, stream>>>(
         W_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items, out,
@@ -2460,7 +2466,8 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
         return -2;
     }
 
-    const dim3 grid((unsigned)capacity64, (unsigned)((M + kMTile - 1) / kMTile), 2);
+    /* Same expert-major schedule as the down launch (see comment there). */
+    const dim3 grid((unsigned)((M + kMTile - 1) / kMTile), (unsigned)capacity64, 2);
     const dim3 block(32, kWarps, 1);
     gateup_iq2_d2r_pair_kernel<<<grid, block, 0, stream>>>(
         gate_soa, up_soa, (const block_q8_1_mmq *)q8, ids_dst, expert_bounds, work, n_items,
