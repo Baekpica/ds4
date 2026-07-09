@@ -16016,6 +16016,13 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
      * Q8_0 weight in the model, but we check anyway and fall through
      * for any odd shapes. */
     if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok > 0) {
+        /* Shape census for the dense-q8 lever (debug-only, default off). */
+        static int shape_log = -1;
+        if (shape_log < 0) shape_log = getenv("DS4_MMQ_DENSE_SHAPES") != NULL;
+        if (shape_log) {
+            fprintf(stderr, "ds4: dense-q8 shape label='%s' M=%d N=%d K=%d\n",
+                    label ? label : "?", (int)out_dim, (int)n_tok, (int)in_dim);
+        }
         int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
                                     (int)out_dim, (int)n_tok, (int)in_dim,
                                     /*stream=*/ds4_mmq_stream_for_call());
