@@ -9092,6 +9092,55 @@ __global__ static void __launch_bounds__(256, 1) attention_tokentile_comp_mirror
     out[3] = __float2half(v.w);
 }
 
+/* Decode-mixed port: the non-indexed layers see comp rows as the causal
+ * RANGE [0, visible(tok)) -- floor(qpos/ratio) per-seq, floor((qpos+1)/ratio)
+ * single-seq, clamped to n_comp -- not a topk set, so the per-tile union is
+ * [0, max visible) and the per-token masks are arithmetic.  Emits the same
+ * ascending-id interleaved int2 {comp_id, mask} records the hmma kernel's
+ * record ring consumes; no bitmap, no scan. */
+__global__ static void __launch_bounds__(512, 1) attention_tokentile_dense_build_kernel(
+        int2 *records,
+        uint32_t *counts,
+        const int32_t *positions,
+        uint32_t pos0,
+        uint32_t n_tokens,
+        uint32_t ratio,
+        uint32_t n_comp,
+        uint32_t rec_stride) {
+    __shared__ uint32_t visible_s[kTTTileTokens];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t tile_base = blockIdx.x * kTTTileTokens;
+    if (tile_base >= n_tokens) {
+        if (tid == 0u) counts[blockIdx.x] = 0u;
+        return;
+    }
+    const uint32_t tile_count =
+        n_tokens - tile_base < kTTTileTokens ? n_tokens - tile_base : kTTTileTokens;
+    if (tid < kTTTileTokens) {
+        uint32_t visible = 0u;
+        if (tid < tile_count && n_comp != 0u && ratio != 0u) {
+            const uint32_t t = tile_base + tid;
+            const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+            visible = positions ? qpos / ratio : (qpos + 1u) / ratio;
+            if (visible > n_comp) visible = n_comp;
+        }
+        visible_s[tid] = visible;
+    }
+    __syncthreads();
+    uint32_t vmax = 0u;
+    for (uint32_t k = 0u; k < tile_count; k++) {
+        if (visible_s[k] > vmax) vmax = visible_s[k];
+    }
+    for (uint32_t c = tid; c < vmax; c += blockDim.x) {
+        uint32_t mask = 0u;
+        for (uint32_t k = 0u; k < tile_count; k++) {
+            if (c < visible_s[k]) mask |= 1u << k;
+        }
+        records[(uint64_t)blockIdx.x * rec_stride + c] = make_int2((int)c, (int)mask);
+    }
+    if (tid == 0u) counts[blockIdx.x] = vmax;
+}
+
 template <uint32_t TT_STAGE_ROWS>
 __device__ __forceinline__ void tt_issue_record_stage_cp_async(
         int2 * __restrict__ rec_plane,
@@ -14233,6 +14282,26 @@ static int ds4_cuda_attn_tokentile_arch_ok(void) {
     return ok;
 }
 
+/* Default ON (2026-07-09 gated increment: same-boot ABBA 621.5 -> 639.5 tok/s
+ * @12k cold admission, SM clocks flat; L0 single-kernel band attributed
+ * additive |d| <= 2.85e-3; gsm8k 119/120 / mbpp 36/40 / canary=[]; nsys
+ * kernels 17.00 -> 16.33 s).  DS4_ATTN_TOKENTILE_MIXED=0 is the kill switch
+ * back to the heads8-online scalar path; DS4_ATTN_TOKENTILE=0 kills the
+ * whole token-tile family. */
+static int ds4_cuda_attn_tokentile_mixed_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_ATTN_TOKENTILE_MIXED");
+        enabled = (s && s[0] == '0') ? 0 : 1;
+        if (!enabled) {
+            fprintf(stderr, "ds4: DS4_ATTN_TOKENTILE_MIXED=0 - token-tile HMMA decode-mixed attention disabled\n");
+        }
+    }
+    return enabled;
+}
+
 /* P2 Inc3: gate for packed FP4 (e2m1) indexer compressed-KV storage.  Same
  * truthy-env parsing as ds4_cuda_fp8_kv_enabled; default OFF. */
 extern "C" int ds4_cuda_fp4_index_enabled(void) {
@@ -18930,7 +18999,11 @@ static int attention_decode_batch_launch(
          * Substrate present forces the main kernel (the heads8-online tier
          * would bake inline window scalars into a captured node). */
         const void             *scalars,
-        uint32_t                il_for_decode1) {
+        uint32_t                il_for_decode1,
+        /* Token-tile eligibility hint: row 0's position when the batch is one
+         * sequence's consecutive-position run (host-verified); UINT32_MAX
+         * otherwise.  See ds4_gpu_attention_indexed_mixed_batch_heads_tensor. */
+        uint32_t                tt_run_pos0) {
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -18979,6 +19052,135 @@ static int attention_decode_batch_launch(
     if (!sinks) return 0;
     const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
     const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
+    /* Decode-mixed token-tile port: route wide consecutive-run chunks through
+     * the token-tile HMMA kernel.  The non-indexed layers' comp visibility is
+     * a causal range, so the union builder is the arithmetic dense variant;
+     * the raw window semantics, both KV mirrors, the record ring, and the
+     * hmma kernel itself are the indexed path's, unchanged.  Ineligible or
+     * scratch-starved calls fall through to the pre-existing dispatch. */
+    if (ds4_cuda_attn_tokentile_enabled() &&
+        ds4_cuda_attn_tokentile_mixed_enabled() &&
+        !force_main_kernel && !use_comp_mask && draft_n_raw_dev == NULL &&
+        n_tokens >= 128u && head_dim == kTTHeadDim && n_head == 64u &&
+        window == kTTRawWindow &&
+        n_comp <= 32768u &&
+        tt_run_pos0 != UINT32_MAX &&
+        (perseq
+             ? (mseq_heads8 && pos_dev != NULL && seq_dev != NULL &&
+                raw_cap >= n_tokens + (kTTRawWindow - 1u))
+             : ((getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL ||
+                 (!g_quality_mode && n_tokens >= 128u)) &&
+                n_raw >= n_tokens &&
+                (uint64_t)n_raw <= (uint64_t)pos0 + (uint64_t)n_tokens)) &&
+        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
+        ds4_cuda_attn_tokentile_arch_ok()) {
+        cudaStreamCaptureStatus tt_capture_status = cudaStreamCaptureStatusNone;
+        cudaError_t tt_capture_err =
+            cudaStreamIsCapturing(ds4_current_stream(), &tt_capture_status);
+        if (tt_capture_err == cudaSuccess &&
+            tt_capture_status == cudaStreamCaptureStatusNone) {
+            const uint32_t n_tiles = (n_tokens + kTTTileTokens - 1u) / kTTTileTokens;
+            const uint32_t rec_stride = n_comp;
+            const uint32_t n_mirror_rows = n_tokens + kTTRawWindow - 1u;
+            uint32_t available_before = 0u;
+            uint32_t first_raw_pos = 0u;
+            if (pos_dev) {
+                available_before = tt_run_pos0 < (kTTRawWindow - 1u)
+                    ? tt_run_pos0 : (kTTRawWindow - 1u);
+            } else {
+                const uint32_t raw_before = n_raw - n_tokens;
+                available_before = raw_before < pos0 ? raw_before : pos0;
+                first_raw_pos = (uint32_t)((uint64_t)pos0 + (uint64_t)n_tokens - (uint64_t)n_raw);
+            }
+            const uint32_t available_clamped = available_before < (kTTRawWindow - 1u)
+                ? available_before : (kTTRawWindow - 1u);
+            const uint32_t raw_row_min = (kTTRawWindow - 1u) - available_clamped;
+
+            uint64_t off = 0ull;
+            const uint64_t records_off = off;
+            /* raw-only layers (n_comp==0) still get one record slot per tile
+             * so the records/counts regions never alias. */
+            off = tt_align256_u64(off + (uint64_t)n_tiles *
+                                  (rec_stride ? rec_stride : 1u) * sizeof(int2));
+            const uint64_t counts_off = off;
+            off = tt_align256_u64(off + (uint64_t)n_tiles * sizeof(uint32_t));
+            const uint64_t raw_mirror_off = off;
+            off = tt_align256_u64(off + (uint64_t)n_mirror_rows * kTTHeadDim * sizeof(half));
+            const uint64_t comp_mirror_off = off;
+            off = tt_align256_u64(off + (uint64_t)n_comp * kTTHeadDim * sizeof(half));
+
+            unsigned char *scratch = (unsigned char *)tt_scratch_ensure(
+                    off, "attention tokentile mixed");
+            if (scratch != NULL) {
+                int2 *tt_records = (int2 *)(scratch + records_off);
+                uint32_t *tt_counts = (uint32_t *)(scratch + counts_off);
+                half *tt_raw_mirror = (half *)(scratch + raw_mirror_off);
+                half *tt_comp_mirror = (half *)(scratch + comp_mirror_off);
+                static int tt_hmma_smem_attr_set = 0;
+                if (!tt_hmma_smem_attr_set) {
+                    cudaError_t attr_err = cudaFuncSetAttribute(
+                            attention_tokentile_hmma_kernel,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            (int)tt_TokentileSmemBudget<kTTStageRows, kTTG>::total);
+                    if (!cuda_ok(attr_err, "attention tokentile hmma smem attribute")) return 0;
+                    tt_hmma_smem_attr_set = 1;
+                }
+
+                attention_tokentile_dense_build_kernel<<<n_tiles, kTTThreads, 0, ds4_current_stream()>>>(
+                        tt_records,
+                        tt_counts,
+                        pos_dev,
+                        pos0,
+                        n_tokens,
+                        ratio,
+                        n_comp,
+                        rec_stride);
+                if (!cuda_ok(cudaGetLastError(), "attention tokentile dense build launch")) return 0;
+                attention_tokentile_raw_mirror_kernel<<<n_mirror_rows, 256, 0, ds4_current_stream()>>>(
+                        tt_raw_mirror,
+                        (const float *)raw_kv->ptr,
+                        seq_dev,
+                        tt_run_pos0,
+                        n_tokens,
+                        raw_cap,
+                        raw_start,
+                        first_raw_pos,
+                        raw_row_min,
+                        head_dim);
+                if (!cuda_ok(cudaGetLastError(), "attention tokentile raw mirror launch")) return 0;
+                if (n_comp != 0u) {
+                    attention_tokentile_comp_mirror_kernel<<<n_comp, 256, 0, ds4_current_stream()>>>(
+                            tt_comp_mirror,
+                            (const float *)comp_kv->ptr,
+                            fp8_codes,
+                            fp8_sc,
+                            seq_dev,
+                            comp_cap,
+                            n_comp,
+                            head_dim);
+                    if (!cuda_ok(cudaGetLastError(), "attention tokentile comp mirror launch")) return 0;
+                }
+                dim3 tt_grid(n_tiles, n_head / kTTG, 1);
+                attention_tokentile_hmma_kernel<<<tt_grid, kTTThreads,
+                                                   tt_TokentileSmemBudget<kTTStageRows, kTTG>::total,
+                                                   ds4_current_stream()>>>(
+                        (float *)heads->ptr,
+                        sinks,
+                        (const float *)q->ptr,
+                        tt_raw_mirror,
+                        tt_comp_mirror,
+                        tt_records,
+                        tt_counts,
+                        rec_stride,
+                        n_tokens,
+                        n_head,
+                        raw_row_min);
+                return cuda_ok(cudaGetLastError(), "attention tokentile mixed hmma launch");
+            }
+        } else if (tt_capture_err != cudaSuccess) {
+            (void)cudaGetLastError();
+        }
+    }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!force_main_kernel && !use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
@@ -19080,14 +19282,17 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                allow_mseq_heads8,
         /* C1 (cont capture): see ds4_gpu.h. */
         const void             *scalars,
-        uint32_t                il_for_decode1) {
+        uint32_t                il_for_decode1,
+        /* Token-tile eligibility hint: see ds4_gpu.h. */
+        uint32_t                tt_run_pos0) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, /*comp_cap=*/0u, window, 1,
                                       n_head, head_dim,
                                       /* comp_fp8 */ NULL, /* comp_scale */ NULL,
                                       positions, seq_id, draft_n_raw,
-                                      allow_mseq_heads8, scalars, il_for_decode1);
+                                      allow_mseq_heads8, scalars, il_for_decode1,
+                                      tt_run_pos0);
 }
 
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
@@ -19125,7 +19330,9 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                allow_mseq_heads8,
         /* C1 (cont capture): see ds4_gpu.h. */
         const void             *scalars,
-        uint32_t                il_for_decode1) {
+        uint32_t                il_for_decode1,
+        /* Token-tile eligibility hint: see ds4_gpu.h. */
+        uint32_t                tt_run_pos0) {
     if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
@@ -19133,7 +19340,8 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                       n_comp, comp_cap, window, ratio, n_head, head_dim,
                                       comp_fp8, comp_scale,
                                       positions, seq_id, /*draft_n_raw=*/NULL,
-                                      allow_mseq_heads8, scalars, il_for_decode1);
+                                      allow_mseq_heads8, scalars, il_for_decode1,
+                                      tt_run_pos0);
 }
 
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(

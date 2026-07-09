@@ -16287,7 +16287,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                    /* C1: substrate window on capture steps; dense layers
                                                                     * need no per-layer scalars (n_comp stays inline 0). */
                                                                    g->batch_capture_step ? ds4_gpu_decode_scalars_device_ptr() : NULL,
-                                                                   UINT32_MAX) != 0;
+                                                                   UINT32_MAX,
+                                                                   seq_positions ? (tt_single_run ? (uint32_t)g->ms_positions[0] : UINT32_MAX) : pos0) != 0;
             ds4_gpu_stage_prof_end(sp_core);
         }
         if (ok) batch_attention_done = true;
@@ -18097,7 +18098,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              g->batch_admit_fast ? 1u : 0u,
                                                                              /* C1: substrate window + live n_comp on capture steps */
                                                                              g->batch_capture_step ? ds4_gpu_decode_scalars_device_ptr() : NULL,
-                                                                             g->batch_capture_step ? il : UINT32_MAX) != 0;
+                                                                             g->batch_capture_step ? il : UINT32_MAX,
+                                                                             seq_positions ? (tt_single_run ? (uint32_t)g->ms_positions[0] : UINT32_MAX) : pos0) != 0;
                 }
             }
             ds4_gpu_stage_prof_end(sp_core);
@@ -19685,7 +19687,8 @@ static bool metal_graph_eval_dspark_block(
                                             lw->attn_sinks->abs_offset, g->batch_q, g->dspark_raw_cache[li],
                                             B, qpos_win, row_n_raw, g->raw_cap, raw_start, window,
                                             DS4_N_HEAD, DS4_N_HEAD_DIM, unif_pos_t, NULL, NULL, 0u,
-                                            /* C1: drafter block stays eager (inline args) */ NULL, UINT32_MAX) != 0;
+                                            /* C1: drafter block stays eager (inline args) */ NULL, UINT32_MAX,
+                                            /* token-tile hint: uniform-position block, never a run */ UINT32_MAX) != 0;
         }
         /* inverse-rope heads at TRUE positions */
         if (ok) { stage = "inv_rope"; ok = ds4_gpu_rope_tail_tensor(g->batch_heads, B, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT,
@@ -19839,7 +19842,8 @@ static bool metal_graph_eval_dspark_block_ms(
         if (ok) { stage = "attn"; ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads, dspark_model->map, dspark_model->size,
                                             lw->attn_sinks->abs_offset, g->batch_q, rings[li], R, vmaxpos, window, g->raw_cap, 0u, window,
                                             DS4_N_HEAD, DS4_N_HEAD_DIM, unif_pos_t, seq_id_t, NULL, 0u,
-                                            /* C1: drafter block stays eager (inline args) */ NULL, UINT32_MAX) != 0; }
+                                            /* C1: drafter block stays eager (inline args) */ NULL, UINT32_MAX,
+                                            /* token-tile hint: uniform-position block, never a run */ UINT32_MAX) != 0; }
         if (ok) { stage = "inv_rope"; ok = ds4_gpu_rope_tail_tensor(g->batch_heads, R, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, true_pos_t, 0, true, freq_base, freq_scale, 0.0f, 1.0f, DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0; }
         if (ok) { stage = "out_proj"; ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out, g->batch_attn_low, g->batch_group_tmp, g->batch_low_tmp,
                                             dspark_model->map, dspark_model->size, lw->attn_output_a->abs_offset, lw->attn_output_b->abs_offset,

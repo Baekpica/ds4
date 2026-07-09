@@ -1502,7 +1502,10 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
          * il < layer count it reads n_comp from g_layer_dev[il] (raw layers
          * publish 0).  (NULL, UINT32_MAX) = inline args, bit-exact legacy. */
         const void             *scalars,
-        uint32_t                il_for_decode1);
+        uint32_t                il_for_decode1,
+        /* Token-tile eligibility hint: see
+         * ds4_gpu_attention_indexed_mixed_batch_heads_tensor. */
+        uint32_t                tt_run_pos0);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -1544,7 +1547,10 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
          * tensor.  Substrate present forces the generic kernel (the heads8
          * online tier bakes inline window scalars). */
         const void             *scalars,
-        uint32_t                il_for_decode1);
+        uint32_t                il_for_decode1,
+        /* Token-tile eligibility hint: see
+         * ds4_gpu_attention_indexed_mixed_batch_heads_tensor. */
+        uint32_t                tt_run_pos0);
 
 /* Decode-time indexed-attention shim.  See ds4_gpu_attention_decode_heads_
  * tensor for the `scalars` semantics.  Pass NULL for the batched/prefill

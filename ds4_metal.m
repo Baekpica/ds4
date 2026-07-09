@@ -12685,11 +12685,13 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         const ds4_gpu_tensor *draft_n_raw,
         uint32_t                allow_mseq_heads8,
         const void             *scalars,
-        uint32_t                il_for_decode1) {
+        uint32_t                il_for_decode1,
+        uint32_t                tt_run_pos0) {
     (void)positions; (void)seq_id;  /* Phase 2 Step 3: CUDA-only (see store stub). */
     (void)draft_n_raw;              /* M4b Inc3: CUDA-only per-row draft span. */
     (void)allow_mseq_heads8;        /* FE2: CUDA-only heads8 opt-in. */
     (void)scalars; (void)il_for_decode1;  /* C1: CUDA-only cont-capture substrate. */
+    (void)tt_run_pos0;              /* Token-tile hint: CUDA-only. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap) {
@@ -12764,7 +12766,8 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *seq_id,
         uint32_t                allow_mseq_heads8,
         const void             *scalars,
-        uint32_t                il_for_decode1) {
+        uint32_t                il_for_decode1,
+        uint32_t                tt_run_pos0) {
     /* Opp C Phase 1A.3: Metal mirror lives in CUDA only today; ignore. */
     (void)comp_fp8;
     (void)comp_scale;
@@ -12772,6 +12775,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
     (void)positions; (void)seq_id;  /* Phase 2 Step 3: CUDA-only (see store stub). */
     (void)allow_mseq_heads8;  /* FB1: per-seq heads8 fast path is CUDA-only. */
     (void)scalars; (void)il_for_decode1;  /* C1: CUDA-only cont-capture substrate. */
+    (void)tt_run_pos0;  /* Token-tile hint: CUDA-only. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
