@@ -31326,23 +31326,46 @@ int ds4_engine_batched_generate_ex(
 
     /* Ragged prefill is one un-chunked forward, so prefill_cap must cover Σlen. */
     const uint32_t prefill_cap = n_packed;
-    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
+
+    /* The graph's raw ring runs without wrap, so it must also cover every
+     * row's FINAL position (prompt + requested budget), not just the ragged
+     * prefill Σ.  Sizing from Σlen alone silently truncated coalesced short
+     * prompts with long outputs at 512-token ring boundaries (found by the
+     * v0.1.0 IFEval gate, 2026-07-10: strict 451 -> 423 vs the June baseline,
+     * every lost item finish=length with prompt+completion == raw_cap). */
+    uint32_t gen_horizon = 0;
+    for (int i = 0; i < n; i++) {
+        const uint32_t want = (max_new_tokens && max_new_tokens[i] > 0)
+                              ? (uint32_t)max_new_tokens[i] : 1u;
+        uint64_t need = (uint64_t)prompts[i].len + want;
+        if (need > (uint64_t)ctx_size) need = (uint64_t)ctx_size;
+        if ((uint32_t)need > gen_horizon) gen_horizon = (uint32_t)need;
+    }
+    const uint32_t ring_floor = gen_horizon > prefill_cap ? gen_horizon : prefill_cap;
+    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, ring_floor);
     if (max_len > raw_cap) { BG_API_ERR("batched_generate: longest prompt %u exceeds raw_cap %u", max_len, raw_cap); return 1; }
 
     /* Per-seq token budgets + EOS.  Cap each seq so its OWN positions stay inside
      * the SWA raw ring (no wrap): prompt_len[i] + max_new[i] <= raw_cap.  The gen
-     * buffer is row-major with stride = max over the per-seq budgets. */
+     * buffer is row-major with stride = max over the per-seq budgets.  With the
+     * horizon-aware ring above this only binds at the ring's architecture cap
+     * (min(ctx, 8192)) -- log when it does so a bound budget is never silent. */
     uint32_t mn[DS4_MULTISEQ_MAX_SEQ];
     int      ei[DS4_MULTISEQ_MAX_SEQ];
     uint32_t gen_stride = 1u;
+    int      n_clamped = 0;
     for (int i = 0; i < n; i++) {
         uint32_t m = (max_new_tokens && max_new_tokens[i] > 0) ? (uint32_t)max_new_tokens[i] : 1u;
         const uint32_t plen_i = (uint32_t)prompts[i].len;
         const uint32_t cap = raw_cap > plen_i ? raw_cap - plen_i : 1u;
-        if (m > cap) m = cap;
+        if (m > cap) { m = cap; n_clamped++; }
         mn[i] = m;
         if (m > gen_stride) gen_stride = m;
         ei[i] = (eos_ids && eos_ids[i] >= 0) ? eos_ids[i] : e->vocab.eos_id;
+    }
+    if (n_clamped) {
+        fprintf(stderr, "ds4: batched_generate: %d/%d seq budgets clamped to the raw ring (raw_cap=%u ctx=%d)\n",
+                n_clamped, n, raw_cap, ctx_size);
     }
 
     ds4_gpu_graph g;
@@ -32301,18 +32324,25 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
     if (max_len > ctx->raw_cap) {
         BCG_ERR("batched_generate_ctx: longest prompt %u exceeds ctx raw_cap %u", max_len, ctx->raw_cap); return 1; }
 
-    /* Per-seq budgets + EOS, capped to the raw ring (no wrap): prompt+budget <= raw_cap. */
+    /* Per-seq budgets + EOS, capped to the raw ring (no wrap): prompt+budget <= raw_cap.
+     * Log when the cap binds -- a silently shortened budget surfaces as an
+     * unexplained finish=length (the v0.1.0 IFEval truncation lesson). */
     uint32_t mn[DS4_MULTISEQ_MAX_SEQ];
     int      ei[DS4_MULTISEQ_MAX_SEQ];
     uint32_t gen_stride = 1u;
+    int      n_clamped = 0;
     for (int i = 0; i < n; i++) {
         uint32_t m = (max_new_tokens && max_new_tokens[i] > 0) ? (uint32_t)max_new_tokens[i] : 1u;
         const uint32_t plen_i = (uint32_t)prompts[i].len;
         const uint32_t cap = ctx->raw_cap > plen_i ? ctx->raw_cap - plen_i : 1u;
-        if (m > cap) m = cap;
+        if (m > cap) { m = cap; n_clamped++; }
         mn[i] = m;
         if (m > gen_stride) gen_stride = m;
         ei[i] = (eos_ids && eos_ids[i] >= 0) ? eos_ids[i] : e->vocab.eos_id;
+    }
+    if (n_clamped) {
+        fprintf(stderr, "ds4: batched_generate_ctx: %d/%d seq budgets clamped to the raw ring (raw_cap=%u)\n",
+                n_clamped, n, ctx->raw_cap);
     }
 
     const int   **ptok   = xmalloc((size_t)n * sizeof(int *));

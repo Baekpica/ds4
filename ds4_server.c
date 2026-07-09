@@ -11331,9 +11331,18 @@ static void run_job_single(server *s, job *j) {
  * queued for the next batch (the head job alone is always kept, even if large).
  * If the queue is momentarily empty and wait_ms>0, briefly wait for stragglers
  * (so a burst of concurrent clients coalesces even with slight arrival skew). */
+/* A coalesced row's token footprint is prompt + requested budget: the batched
+ * engine's no-wrap raw ring must hold each row's FINAL position, so bounding
+ * groups by prompt tokens alone lets short-prompt/long-output rows blow past
+ * the ring and get silently truncated (the v0.1.0 IFEval finding, 2026-07-10). */
+static long job_tok_footprint(const server *s, const job *j) {
+    const long budget = j->req.max_tokens > 0 ? j->req.max_tokens : s->default_tokens;
+    return (long)j->req.prompt.len + budget;
+}
+
 static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_tok_total) {
     int n = 1;
-    long tok_total = out[0]->req.prompt.len;
+    long tok_total = job_tok_footprint(s, out[0]);
     struct timespec deadline;
     bool have_deadline = false;
     pthread_mutex_lock(&s->mu);
@@ -11341,13 +11350,13 @@ static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_t
         /* Only gather jobs the static argmax path can serve (non-streaming,
          * temp<=0); a head that fails stops the gather, preserving FIFO. */
         if (s->head && job_is_static_batchable(&s->head->req)) {
-            if (max_tok_total > 0 && tok_total + s->head->req.prompt.len > max_tok_total)
+            if (max_tok_total > 0 && tok_total + job_tok_footprint(s, s->head) > max_tok_total)
                 break;                         /* token budget: split into another batch */
             job *g = s->head;
             s->head = g->next;
             if (!s->head) s->tail = NULL;
             g->next = NULL;
-            tok_total += g->req.prompt.len;
+            tok_total += job_tok_footprint(s, g);
             out[n++] = g;
             continue;
         }
@@ -12215,8 +12224,10 @@ static void *worker_main(void *arg) {
     const char *cw = getenv("DS4_SERVER_COALESCE_WAIT_MS");
     int cwait = cw ? atoi(cw) : 0;
     if (cwait < 0) cwait = 0;
-    /* Cap the combined prompt tokens of a coalesced group; ragged prefill's host
-     * logits buffer is Σlen * vocab * 4 bytes, so this bounds peak host memory.
+    /* Cap the combined token FOOTPRINT (prompt + requested budget) of a
+     * coalesced group: ragged prefill's host logits buffer is Σlen * vocab * 4
+     * bytes (prompt part), and the batched engine's no-wrap raw ring must hold
+     * every row's final position (budget part; see job_tok_footprint).
      * Default is the shared S6 value (see coalesce_max_tokens_default). */
     const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
     int cmaxtok = ct ? atoi(ct) : coalesce_max_tokens_default(ds4_session_ctx(s->session));
