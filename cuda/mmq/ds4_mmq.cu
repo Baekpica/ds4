@@ -103,6 +103,27 @@ static bool d2r_iq2_enabled() {
     return cached != 0;
 }
 
+// Blanket output zeroing on the dense/MoE-down/pair GEMM entries.  Added by
+// 82b2622 as belt-and-suspenders while root-causing the cont BOS spam; the
+// actual roots were fixed in the same commit (stream-K fixup write_back goes
+// dense + tmp_fixup zeroed + ncols_max=ne_get_rows), after which every
+// element a consumer reads is stored by the GEMM itself and the zeroing was
+// ~1.0 s/12k-admission of pure memset tax.  Default OFF (2026-07-09 gated
+// increment: L42 deep tensors BIT-IDENTICAL with/without, same-boot ABBA
+// 641.5 -> 678 tok/s @12k, gsm8k 119/120 / mbpp 36/40 / canary=[]).
+// DS4_MMQ_OUT_MEMSET=1 restores the zeroing.
+static bool out_memset_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MMQ_OUT_MEMSET");
+        cached = (env && env[0] == '1') ? 1 : 0;
+        if (cached) {
+            fprintf(stderr, "ds4: DS4_MMQ_OUT_MEMSET=1 - blanket GEMM output zeroing restored\n");
+        }
+    }
+    return cached != 0;
+}
+
 static int64_t d2r_min_cols() {
     static int64_t cached = -1;
     if (cached < 0) {
@@ -391,7 +412,9 @@ int ds4_mmq_dense_impl(
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+    }
 
     const mmq_args args = {
         /*x=*/(const char *)W,
@@ -627,7 +650,9 @@ int ds4_mmq_moe_impl(
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+    }
 
     if (type == GGML_TYPE_Q2_K && x_soa != nullptr && d2r_enabled() &&
         K % 256 == 0 && M % 2 == 0 && ne_get_rows >= d2r_min_cols()) {
@@ -827,8 +852,10 @@ int ds4_mmq_moe_pair_impl(
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
 
-    cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
-    cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+        cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+    }
 
     if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
         d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
