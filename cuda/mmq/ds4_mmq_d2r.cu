@@ -18,6 +18,18 @@
 
 namespace {
 
+// Debug-only fill telemetry for the partial-tile lever (DS4_MMQ_D2R_STATS=1):
+// per-launch column/tile fill summary from expert_bounds.  Synchronizes the
+// stream - never enable on perf legs.
+static bool d2r_stats_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MMQ_D2R_STATS");
+        cached = (env && env[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 constexpr int kMTile      = 128;
 constexpr int kNTile      = 64;
 constexpr int kWarps      = 8;
@@ -42,6 +54,36 @@ constexpr int kQ8PrefetchTrips = (kQ8PrefetchItems + kThreads - 1) / kThreads;
 constexpr int kRawCopyTrips = (kRawCopyChunks + 31) / 32;
 
 static_assert(kNTile == 64, "D2R production path is CFG1 NT64 only");
+
+static void d2r_print_fill_stats(const char *tag, const int32_t *expert_bounds_dev,
+                                 int n_experts, int64_t ne_get_rows,
+                                 cudaStream_t stream) {
+    enum { kMaxExperts = 1024 };
+    static int32_t bounds[kMaxExperts + 1];
+    if (n_experts > kMaxExperts) return;
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return;
+    if (cudaMemcpy(bounds, expert_bounds_dev, (size_t)(n_experts + 1) * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    int live = 0, tiles = 0, full = 0;
+    long long cols = 0;
+    int tail_hist[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // tail fill 1-8, 9-16, ..., 57-64
+    for (int e = 0; e < n_experts; e++) {
+        const int count = bounds[e + 1] - bounds[e];
+        if (count <= 0) continue;
+        live++;
+        cols += count;
+        tiles += (count + kNTile - 1) / kNTile;
+        full += count / kNTile;
+        const int tail = count % kNTile;
+        if (tail > 0) tail_hist[(tail - 1) / 8]++;
+    }
+    fprintf(stderr,
+            "ds4: D2R fill %s: rows=%lld cols=%lld live=%d/%d tiles=%d full=%d "
+            "tail_hist[1-8..57-64]=[%d %d %d %d %d %d %d %d]\n",
+            tag, (long long)ne_get_rows, cols, live, n_experts, tiles, full,
+            tail_hist[0], tail_hist[1], tail_hist[2], tail_hist[3],
+            tail_hist[4], tail_hist[5], tail_hist[6], tail_hist[7]);
+}
 static_assert(kStages == 2, "D2R raw-ring schedule expects exactly two q8 stages");
 static_assert(kThreads == 256, "D2R CTA is fixed at 256 threads");
 static_assert(kQ8PrefetchTrips == 3, "unexpected q8 issue trip count");
@@ -2314,6 +2356,10 @@ int ds4_mmq_q2_K_moe_d2r_launch(const void *W_soa,
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: worklist builder launch failed: %s\n", tag, cudaGetErrorString(err));
         return -2;
+    }
+
+    if (d2r_stats_enabled()) {
+        d2r_print_fill_stats(tag, expert_bounds, n_experts, ne_get_rows, stream);
     }
 
     const dim3 grid((unsigned)capacity64, (unsigned)((M + kMTile - 1) / kMTile), 1);
