@@ -86,8 +86,13 @@ constexpr int kRowWarps = 8;
 constexpr int kColWarps = 2;
 constexpr int kWarps   = kRowWarps * kColWarps;
 constexpr int kThreads = 32 * kWarps;
-constexpr int kStages  = 2;   // q8 qs ring (k64 halves) + header ring (k128)
-constexpr int kWStages = 2;   // weight ring, k64 granularity
+// 3-stage rings: issues happen at the TOP of each iter for stage i+2 (a
+// buffer no in-flight reader touches), so the post-compute __syncthreads of
+// the 2-stage schedule disappears -- one barrier per k64.  69 KiB total needs
+// the dynamic-smem opt-in (1 CTA/SM is already forced by the 512-thread
+// register budget, so no occupancy cost).
+constexpr int kStages  = 3;   // q8 qs ring (k64 halves) + header ring (k128)
+constexpr int kWStages = 3;   // weight ring, k64 granularity
 constexpr int kNFrag   = kNTile / 8;
 constexpr int kWRowPad = 80;  // 64 B payload + 16 B pad: 20-int ldmatrix stride rotates banks
 
@@ -247,9 +252,12 @@ constexpr size_t kSmemQ8HBytes = (size_t)kStages * kNTile * 16;        // header
 constexpr size_t kSmemQ8QBytes = (size_t)kStages * kNTile * kWRowPad;  // qs k64 halves
 constexpr size_t kSmemWQBytes  = (size_t)kWStages * kMTile * kWRowPad;
 constexpr size_t kSmemWDBytes  = (size_t)kWStages * kMTile * sizeof(uint32_t);
-constexpr size_t kSmemStaticBytes = kSmemQ8HBytes + kSmemQ8QBytes + kSmemWQBytes +
-                                    kSmemWDBytes;
-static_assert(kSmemStaticBytes <= 48ull * 1024ull, "static shared memory exceeds 48 KiB");
+constexpr size_t kSmemWQOff  = 0;
+constexpr size_t kSmemQ8QOff = kSmemWQOff + kSmemWQBytes;
+constexpr size_t kSmemQ8HOff = kSmemQ8QOff + kSmemQ8QBytes;
+constexpr size_t kSmemWDOff  = kSmemQ8HOff + kSmemQ8HBytes;
+constexpr size_t kSmemTotalBytes = kSmemWDOff + kSmemWDBytes;
+static_assert(kSmemTotalBytes <= 99ull * 1024ull, "dynamic shared memory exceeds sm_121 limit");
 
 // ---- q8 activation prefetch, split staging ----
 // qs k64 halves: 128 cols x 64 B (bytes 16 + (k64&1)*64 .. of each col's
@@ -264,7 +272,7 @@ __device__ __forceinline__ void issue_q8_qs_prefetch(
     const char *base = p.q8_tile +
                        (uint64_t)(k64_iter >> 1) * p.q8_k128_stride_bytes +
                        16u + (uint64_t)(k64_iter & 1) * 64u;
-    const int buf = k64_iter & 1;
+    const int buf = k64_iter % kStages;
 #pragma unroll
     for (int trip = 0; trip < kQ8QsTrips; ++trip) {
         const int chunk = d2r_tid() + trip * kThreads;
@@ -290,7 +298,7 @@ __device__ __forceinline__ void issue_q8_hdr_prefetch(
     const char *base = p.q8_tile +
                        (uint64_t)k128_iter * p.q8_k128_stride_bytes;
     const int col = d2r_tid();
-    void *dst = &s_q8h[k128_iter & 1][col][0];
+    void *dst = &s_q8h[k128_iter % kStages][col][0];
     const void *src = base + (uint64_t)col * sizeof(block_q8_1_mmq);
     cp_async_16B(dst, src, pred);
 }
@@ -303,7 +311,7 @@ __device__ __forceinline__ void issue_w_prefetch(
         const DenseQ8Params &p,
         int k64_iter) {
     const bool pred = k64_iter < p.k64_iters;
-    const int wst = k64_iter & 1;
+    const int wst = k64_iter % kWStages;
     // Row-major planes (see layout note at top: contiguous-stage tiling was
     // 27% slower from L2 slice camping).
     const char *wq = p.wq_row0 + (uint64_t)k64_iter * 64u;
@@ -346,10 +354,10 @@ __device__ __forceinline__ void dense_q8_d2r_mainloop(
     const int c0 = TileC::get_j(0);
     const int c1 = TileC::get_j(1);
 
-    // Prologue: two groups in flight, each = one weight k64 stage + one q8 qs
-    // k64 half + one header stage.  Steady state emits exactly one (possibly
-    // empty) commit per k64 iter, so wait_group(1) at the loop head always
-    // lands the stage the iter consumes.
+    // Prologue: stages 0 and 1 in flight as two groups.  Loop iters run
+    // wait -> barrier -> issue(i+2) -> compute: with 3 buffers the issue
+    // never aliases the two live stages, so the 2-stage schedule's
+    // post-compute barrier disappears (one barrier per k64).
     issue_w_prefetch(s_wq, s_wd, p, 0);
     issue_q8_qs_prefetch(s_q8q, p, 0);
     issue_q8_hdr_prefetch(s_q8h, p, 0);
@@ -360,12 +368,21 @@ __device__ __forceinline__ void dense_q8_d2r_mainloop(
     cp_async_commit();
 
     for (int i = 0; i < k64_iters; ++i) {
+        // wait -> barrier -> issue: the barrier both publishes stage i's
+        // copies CTA-wide and proves every warp finished reading stage i-1,
+        // whose buffer ((i-1)%3 == (i+2)%3) the issues below overwrite.
         cp_async_wait_group<1>();
         __syncthreads();
+        issue_w_prefetch(s_wq, s_wd, p, i + 2);
+        issue_q8_qs_prefetch(s_q8q, p, i + 2);
+        if ((i & 1) == 0) {
+            issue_q8_hdr_prefetch(s_q8h, p, (i >> 1) + 2);
+        }
+        cp_async_commit();
 
-        const int wst = i & 1;
-        const int qbuf = i & 1;          // qs halves ride the k64 cadence
-        const int hbuf = (i >> 1) & 1;   // headers ride the k128 cadence
+        const int wst = i % kWStages;
+        const int qbuf = i % kStages;          // qs halves ride the k64 cadence
+        const int hbuf = (i >> 1) % kStages;   // headers ride the k128 cadence
         const uint32_t dw0_bits = s_wd[wst][wrow + group];
         const uint32_t dw1_bits = s_wd[wst][wrow + group + 8];
         const float2 dw0 = __half22float2(*reinterpret_cast<const half2 *>(&dw0_bits));
@@ -400,13 +417,6 @@ __device__ __forceinline__ void dense_q8_d2r_mainloop(
             }
         }
 
-        __syncthreads();
-        issue_w_prefetch(s_wq, s_wd, p, i + 2);
-        issue_q8_qs_prefetch(s_q8q, p, i + 2);
-        if (i & 1) {
-            issue_q8_hdr_prefetch(s_q8h, p, (i >> 1) + 2);
-        }
-        cp_async_commit();
     }
 }
 
@@ -422,10 +432,11 @@ void dense_q8_d2r_kernel(const char * __restrict__ wd_plane,
     using tile_B = ggml_cuda_mma::tile<8, 8, int>;
     using tile_C = ggml_cuda_mma::tile<16, 8, int>;
 
-    __shared__ __align__(16) float s_q8h[kStages][kNTile][4];
-    __shared__ __align__(16) int8_t s_q8q[kStages][kNTile][kWRowPad];
-    __shared__ __align__(16) int8_t s_wq[kWStages][kMTile][kWRowPad];
-    __shared__ __align__(16) uint32_t s_wd[kWStages][kMTile];
+    extern __shared__ __align__(16) char smem_dyn[];
+    auto &s_wq  = *reinterpret_cast<int8_t (*)[kWStages][kMTile][kWRowPad]>(smem_dyn + kSmemWQOff);
+    auto &s_q8q = *reinterpret_cast<int8_t (*)[kStages][kNTile][kWRowPad]>(smem_dyn + kSmemQ8QOff);
+    auto &s_q8h = *reinterpret_cast<float (*)[kStages][kNTile][4]>(smem_dyn + kSmemQ8HOff);
+    auto &s_wd  = *reinterpret_cast<uint32_t (*)[kWStages][kMTile]>(smem_dyn + kSmemWDOff);
 
     // Triton-style grouped supertile order: group_m row-tiles stay L2-hot
     // while the col tiles stream past them.
@@ -505,9 +516,16 @@ int launch_dense_q8_d2r(const void *wd_plane, const void *wq_plane,
     }
     const int num_m = M / kMTile;
     const int num_n = (N + kNTile - 1) / kNTile;
+    static int smem_opted = 0;
+    if (!smem_opted) {
+        cudaFuncSetAttribute(dense_q8_d2r_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)kSmemTotalBytes);
+        smem_opted = 1;
+    }
     const dim3 grid((unsigned)(num_m * num_n), 1, 1);
     const dim3 block(32, kWarps, 1);
-    dense_q8_d2r_kernel<<<grid, block, 0, stream>>>(
+    dense_q8_d2r_kernel<<<grid, block, kSmemTotalBytes, stream>>>(
         (const char *)wd_plane, (const char *)wq_plane, q8, outf, outh, M, N, K, group_m);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -741,8 +759,8 @@ int main(int argc, char **argv) {
     const int N = (argc > 3) ? atoi(argv[3]) : 4096;
 
     printf("### proto_gemm_dense_q8_d2r reps=%d warmup=%d N=%d ###\n", reps, warmup, N);
-    printf("### CTA m%dn%d, warps=%d, q8 k128 x%d stages, weights k64 x%d stages, static smem %zu B ###\n",
-           kMTile, kNTile, kWarps, kStages, kWStages, kSmemStaticBytes);
+    printf("### CTA m%dn%d, warps=%d, q8 x%d stages, weights x%d stages, dyn smem %zu B ###\n",
+           kMTile, kNTile, kWarps, kStages, kWStages, kSmemTotalBytes);
     printf("### Lt-int8 ceilings at these shapes: gate/up 156, down 111, q_b 79-85, o_proj 145 TF ###\n");
 
     std::mt19937 rng(0xD84D8021u + 13u * (unsigned)N);
