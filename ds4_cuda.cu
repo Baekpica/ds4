@@ -19543,12 +19543,20 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 half *tt_comp_mirror = (half *)(scratch + comp_mirror_off);
                 const uint32_t bitmap_words = (n_comp + 1u) >> 1u;
                 const size_t bitmap_smem = (size_t)bitmap_words * sizeof(uint32_t);
-                if (bitmap_smem > 48ull * 1024ull) {
+                /* The launch limit binds on static + dynamic shared memory,
+                 * and the union builder carries ~2 KiB static (scan[513]),
+                 * so the no-opt-in 48 KiB ceiling is crossed from
+                 * n_comp > 23548 (kv ~94k) even while bitmap_smem alone is
+                 * under 48 KiB.  Opt in once to the largest bitmap the
+                 * n_comp <= 32768 engage gate admits. */
+                static int tt_union_smem_attr_set = 0;
+                if (!tt_union_smem_attr_set) {
                     cudaError_t attr_err = cudaFuncSetAttribute(
                             attention_tokentile_union_build_kernel,
                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)bitmap_smem);
+                            (int)(((32768u + 1u) >> 1u) * sizeof(uint32_t)));
                     if (!cuda_ok(attr_err, "attention tokentile union smem attribute")) return 0;
+                    tt_union_smem_attr_set = 1;
                 }
                 static int tt_hmma_smem_attr_set = 0;
                 if (!tt_hmma_smem_attr_set) {
