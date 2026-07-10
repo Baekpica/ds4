@@ -1,0 +1,118 @@
+# Changelog
+
+All notable fork-side changes to this project are documented here.
+Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
+[antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
+(2026-05-29). Upstream's own changes are not repeated here.
+
+## v0.1.0 — 2026-07-10
+
+384 fork commits on `batched-serving`, released as branch `release/v0.1.0`.
+Headline numbers measured on GB10 (DGX Spark class, sm_121),
+DeepSeek-V4-Flash IQ2XXS-mixed GGUF; methodology in the release notes.
+
+### Serving & API
+
+- **Continuous batching** (`DS4_SERVER_CONTINUOUS=1`, default): mid-flight admit/evict,
+  per-bank KV state, FCFS pending-prefill interleave (`DS4_CONT_PREFILL_CHUNK_LIVE`),
+  chunked cold admission (~1.9× admit, `DS4_CONT_PREFILL_CHUNK=4096`).
+- **Request coalescing** default-on for non-streaming groups (`b5c6a83`), budgeted by
+  prompt+output token footprint (`9339ab2`).
+- **Warm start & fork**: per-bank prefix warm start (TTFT ~7×), D2D bank-clone fork
+  fan-out (N=4 TTFT ~49×), partial-prefix fork (`8a929a1`); victim order
+  invalid > superseded > LRU.
+- Stops + tool calls ride the batched path (tools batch greedy-only); OpenAI tool-argument
+  streaming with incomplete-call rejection.
+- Budget-computed bank fit from MemAvailable (not cudaMemGetInfo); KV ≈ 9.46 KiB/token +
+  ~94 MiB bank floor; lazy single-session graph allocation (boot-time GPU footprint ~0).
+- Batched forward scales 6.2× from batch 1→128; batchable stops/tools/MTP all supported.
+
+### Prefill engine (CUDA) — 12k cold prefill 305 → ~800 tok/s
+
+Each landing independently gated (bit-parity or value-parity → same-boot ABBA → nsys →
+slice evals) and reversible by env switch:
+
+- sm_121 native arch build (`98c55ad`, `make cuda-spark`) — 306→339
+- mm_ids case-1 fast path + heads8 occupancy pin + SoA-direct mmq tile loaders
+  (`86c5d4d`/`2e519d0`/`42cf8ca`) — 339→420
+- Sanitize/rms_norm/hc_expand folds into GEMM activation converts (`6e415a7`/`a574241`/
+  `57e0821`) — 420→446
+- mm_ids W8192 smem-cliff kill, two-pass no-smem (`c9da2fa`; default chunk stays 4096)
+- **D2R (decode-to-registers) MoE GEMM family** — direct-to-register dequant kernels
+  reading the weight server's aligned SoA artifacts in place:
+  - Q2_K down-GEMM (`49329aa`) — 427→493
+  - IQ2_XXS gate/up pair GEMM (`e5668be`) — 493→557
+  - Expert-major CTA schedule, L2-reuse grid order (`2e68f52`) — 674→768
+  - Dense-Q8 16-warp m128n128 kernel on the kind-5 aligned artifact for shared-expert +
+    q_b projections (`154174e`) — 779→800
+- **Token-tile HMMA attention** (indexed prefill `47438d7` + decode-mixed `9de3044`),
+  replacing heads8_online — 557→640
+- Memset audit: blanket GEMM output zeroing dropped, bit-exact gated (`9adc3df`) — 640→678
+
+### Decode engine (CUDA) — plain cont+capture w1 48.9 ms/tok @HEAD (C1-era 54.0); DSpark ship 3.02 tok/step
+
+- M1/M2 fused decode kernels: aligned-SoA IQ2_XXS + Q8_0 decode paths, fused
+  gate+up+SwiGLU, fused HC stage, fused router (top-6), fused compressor pair+store,
+  fused QKV-post (head_rms+rope / kv-rope+fp8+store), q8 activation folds.
+- Q2K moe-down aligned row-pair-SoA repack, bit-exact decode twin (`e221241`, default ON).
+- **C1: per-layer CUDA-graph capture** of the batched decode step (`d8cf4f9`, default ON;
+  45.1→37.8 ms/tok ship).
+- C2: bank-agnostic cont graphs (state lanes, on-device bank resolve), multi-live
+  PLAIN + VERIFY capture (`749a1e4`/`23dcb1f`/`46ab301`).
+- C3: batched fused router/compressor/HC at small widths (`cd8ad1a`/`0a48aac`/`ee3da19`),
+  indexer-producer gating (`e82cbc7`).
+- Decode width tiers: NATIVE_F16 / MMVQ_DECODE_MAX_TOKENS=8 dispatch, expert-vec split
+  for all decode widths, multi-column output_a widths 2–8.
+
+### Speculative decoding
+
+- **MTP verifier paths** (top-2 verify, fused two-token MoE down); mode-2 batched
+  spec-decode opt-in (`DS4_CONT_MTP_MODE=2`).
+- **DSpark block-draft spec decode, lossless** (`82b2622` + Phase D chain): on-device
+  Markov refine, multi-seq inject with per-bank KV slabs, prefill-region injection,
+  auto verify-depth, concurrency auto-gate (nlive≤1); ~2.0 tok/step at 85.7% accept
+  on eval workloads.
+- **WS-served drafter** (`d8cc99d`): 58.8→44.3 ms/tok in DSpark ship config at 72.3%
+  accept; ships Q4K, with the Q2K drafter variant available (−4.2 GiB, 87% accept;
+  required for ~1M-token KV).
+
+### Weight server
+
+- CUDA weight-server lifecycle with VMM backend: allocate/upload model ranges, broker
+  fds to clients, direct-I/O uploads, scoped imports, manifest staleness rejection,
+  ownership locks, telemetry (`f2f424e`…`e7f7ce1` chain).
+- **Aligned-SoA repack artifacts** (iq2 + q8 default-on `6de508d`, q2k default-on
+  `6f44a5e`): the artifacts both decode-vec and D2R GEMM kernels read in place.
+- Parallel aligned-repack builders (WS boot tax 63→21 s, `802e4f3`).
+- Drafter serving with never-split range plan.
+
+### Long context & KV
+
+- Compressed-KV storage tiers: FP8 codes primary (`74a617a`), FP4 e2m1 indexer
+  primary (`e7c4826`) — bit-lossless vs F32 storage (caches hold model-quantized values).
+- VMM demand-mapped comp/index slabs; 128k contexts served correctly (~4.9 GB/bank at
+  139k ctx, max_seq fit-reduces); DSA prefill context-flat.
+- Needle 8k–128k: 70/70 at the June baseline; HEAD re-stamp 45/45 + 15/15 + 10/10
+  (128k tier at `63d9d5e`).
+
+### Fixed
+
+- **Token-tile attention launch failure at 94k+ context** (`63d9d5e`, found by the v0.1.0
+  needle gate): union-builder smem opt-in now budgets static+dynamic; prompts in the
+  ~94k-98k band no longer fail chunked prefill.
+- **Silent truncation of coalesced batched generation** (`9339ab2`, found by the v0.1.0
+  eval gate): batch ring now sized for the generation horizon; budget clamps log loudly;
+  coalesce groups bounded by footprint.
+- Cross-stream use-after-free of pool scratch (cont BOS-spam root, `66d6dc3`);
+  mm_ids_helper warp race + DS4_CUDA_DETERMINISTIC (`491f584`); quantizer unwritten-tail
+  nondeterminism; mmvq −1 router ids; ring-lane addressing by live-slot ordinal
+  (`cd00600`); MTP validator F32 ffn_gate_inp; free-on-grow graph-cache invalidation;
+  macOS Metal-stub link fixes (`26b8816`, `259075d`).
+
+### Method & infrastructure
+
+- Engine proof runner + weight-server proof flow; stdlib-only resumable eval harness
+  (GSM8K/MMLU/HumanEval/MBPP/IFEval/needle, inline scoring, watchdog-supervised).
+- Measurement discipline: same-boot ABBA with SM-clock medians for <5% deltas; proven
+  path engagement + finish-reason shape asserts in eval gates; ncu counter law
+  TF = 906·IPC/inst-per-MMA; negative results recorded in ledgers.

@@ -20,6 +20,76 @@ This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
+## About this fork: batched serving and a rebuilt CUDA engine
+
+This repository ([Entrpi/ds4](https://github.com/Entrpi/ds4)) is a fork of
+[antirez/ds4](https://github.com/antirez/ds4) focused on the question upstream
+deliberately leaves open: what does DwarfStar look like as a **multi-request
+serving engine on NVIDIA hardware**? Upstream's heart is a single-user
+CLI/agent engine, Metal first. This fork keeps all of that working and builds
+the CUDA/Linux side into a batched server — the reference machines are the
+DGX Spark (GB10, sm_121) and the RTX PRO 6000 Blackwell (sm_120). Everything
+below is default-on in `v0.1.0` (branch `release/v0.1.0`), each landing gated
+by value-parity checks, same-boot A/B timing, and the full eval suite, and
+each reversible with an env kill switch.
+
+**Continuous batched serving.** The HTTP server accepts concurrent requests
+into a continuously batched engine: mid-flight admission and eviction over
+per-request KV banks, chunked cold admission (~1.9× faster admit), pending
+prefills interleaved with live decode, and automatic coalescing of
+non-streaming request groups. Warm-starting from a cached prefix cuts TTFT
+~7×; forking a live session server-side (D2D bank clone) cuts TTFT ~49× for
+a 4-way fan-out. Stops, tool calls, and MTP all ride the batched path, and
+the batched forward scales 6.2× from batch 1 to 128 on a GB10.
+
+**A rebuilt CUDA prefill engine.** Cold prefill of a 12k-token prompt runs at
+**~800 tok/s on a GB10** — 2.6× where this fork started in early July, and
+~2× upstream main measured on the same box, GGUF, and harness (1.9–2.1×
+across the whole 2k–128k frontier; ~4× on an RTX PRO 6000).
+The core is a family of D2R (decode-to-registers) GEMM kernels that
+dequantize Q2_K / IQ2_XXS / Q8_0 expert weights directly from the weight
+server's aligned SoA artifacts into tensor-core fragments, plus token-tile
+HMMA attention (replacing the scalar online-softmax path) and an
+L2-reuse-aware expert-major CTA schedule. Decode gets the same treatment:
+per-layer CUDA-graph capture of the batched decode step brings plain width-1
+continuous decode to 48.9 ms/tok, and the DSpark lossless speculative decoder
+runs at 3.02 tokens per verify step (74.6% draft acceptance, zero fallbacks).
+
+**A weight server.** One resident process uploads the model once (VMM-backed,
+direct-I/O) and brokers it to any number of engine processes over IPC — server
+restarts and A/B runs stop paying the multi-minute reload. It also builds the
+aligned SoA repack artifacts the D2R and decode kernels read in place
+(parallel builders, ~21 s boot tax), serves the MTP head and the speculative
+drafter (shipped at Q4K; a Q2K variant saves 4.2 GiB and is required for
+~1M-token KV), and rejects stale-manifest imports.
+
+**Long context, verified.** 128k-token contexts are served correctly:
+needle-in-haystack 70/70 across the 8k–128k tiers at the release commit, with
+compressed-KV storage tiers (FP8 codes, FP4 e2m1 indexer) that are
+bit-lossless against F32 storage. KV costs ≈9.5 KiB/token, and DSA prefill
+throughput stays context-flat, so deep-context serving remains fast as the
+window fills.
+
+**Measured, gated, reversible.** Every performance claim comes from same-boot
+A/B runs with SM-clock logging; every default flip passed bit- or
+value-parity plus eval slices with proven engagement of the changed path; the
+full quality suite (GSM8K, MMLU, HumanEval, MBPP, IFEval, needle) is
+re-stamped at the release commit against the June baseline. Two of the fixes
+in v0.1.0 were found by this release's own gates — that is the point of them.
+
+The per-landing numbers and the full story are in `CHANGELOG.md` and the
+v0.1.0 release notes. The context-frontier sweep below compares this branch
+against upstream main on both reference machines, low band 2k–64k and high
+band 64k–128k:
+
+![v0.1.0 context-frontier sweep](speed-bench/v010_sweep_overlay.svg)
+
+What is *not* changed: the Metal/macOS path, the CLI, the agent, disk KV
+persistence, and the GGUF tooling are inherited from upstream and kept
+building and passing their vectors. Upstream credit for the engine this fork
+stands on is gladly given — everything in the sections below this one
+describes the shared foundation.
+
 ## Motivations
 
 Now, back at this project. Why do we believe DeepSeek V4 Flash deserves a
