@@ -33322,11 +33322,36 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * additionally skips ring injection (a row at position >= the threshold can
      * never be read by a spec-active drafter window, because spec-active requires
      * posv < the threshold and posv only grows).  One-way per request, lossless
-     * either way.  Default 40960 = the top of the measured prose crossover band;
-     * structured content (code/math) crosses deeper -- raise it for such serving.
+     * either way.  Default 65536, set by the 2026-07-11 default-decision probes
+     * (healthy-boot .33 data): spec still wins at 49k on BOTH prose (1.10-1.49x)
+     * and code (1.19x) -- the loss regime starts at ~64k+ (prose 0.90x, 0.75x at
+     * 64-112k in the .15 sweep; code hits breakeven 1.02x at 65k).  Structured
+     * content crosses latest -- raise further for code-heavy serving.
      * 0 disables the gate (= spec at any depth). */
-    uint32_t dspark_max_kv = 40960u;
+    uint32_t dspark_max_kv = 65536u;
     { const char *ke = getenv("DS4_DSPARK_MAX_KV"); if (ke && ke[0]) { long v = atol(ke); if (v >= 0) dspark_max_kv = (uint32_t)v; } }
+    /* D4.5g ADAPTIVE kv gate (opt-in, DS4_DSPARK_ADAPT_GATE=1): the static gate above
+     * is calibrated on PROSE (the weakest-acceptance content); structured content
+     * crosses over deeper, so a fixed threshold forgoes real spec wins there.  This
+     * mode replaces the hard cutoff with a per-request measure-and-switch controller:
+     * past DS4_DSPARK_ADAPT_START (default = DS4_DSPARK_MAX_KV) it times a RUN window
+     * in the current mode, briefly PROBES the other mode, and keeps whichever decodes
+     * faster (3% hysteresis), re-probing every cycle so content shifts mid-generation
+     * re-open the decision.  Solo-stream only (n_live==1 -- the production NLIVE=1
+     * regime; wall-per-step attribution is exact there).  Unlike the static one-way
+     * gate, spec can RE-ENTER, so ring injection and the capture tap stay ON during
+     * spec-off windows (a re-entry across ring holes collapses acceptance); the
+     * static gate's injection skip only applies when this mode is off. */
+    const int dspark_adapt_gate = dspark_mode && getenv("DS4_DSPARK_ADAPT_GATE") != NULL;
+    uint32_t dspark_adapt_start = dspark_max_kv;
+    { const char *ae = getenv("DS4_DSPARK_ADAPT_START"); if (ae && ae[0]) { long v = atol(ae); if (v >= 0) dspark_adapt_start = (uint32_t)v; } }
+    uint32_t dspark_adapt_win = 64u;   /* probe/first-estimate window, tokens */
+    { const char *we = getenv("DS4_DSPARK_ADAPT_WIN"); if (we && we[0]) { long v = atol(we); if (v > 0) dspark_adapt_win = (uint32_t)v; } }
+    uint32_t dspark_adapt_run = 512u;  /* settled-winner window between probes, tokens */
+    { const char *re = getenv("DS4_DSPARK_ADAPT_RUN"); if (re && re[0]) { long v = atol(re); if (v > 0) dspark_adapt_run = (uint32_t)v; } }
+    double dspark_adapt_margin = 0.03;
+    { const char *me2 = getenv("DS4_DSPARK_ADAPT_MARGIN_PCT"); if (me2 && me2[0]) { double v = atof(me2); if (v >= 0.0 && v < 50.0) dspark_adapt_margin = v / 100.0; } }
+    if (dspark_adapt_gate) dspark_max_kv = 0u;   /* the controller supersedes the hard gate */
     /* C2 Inc3 A/B lever (scaffolding, default off): cap each live bank's
      * verify drafts so the packed verify step fits this many rows total --
      * cont capture serves steps <= 8 rows (the decode-tier surface), so
@@ -33408,13 +33433,22 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     int32_t *dspark_step_inj_sid = dspark_mode ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
     int32_t *dspark_step_inj_src = dspark_mode ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
     uint32_t *dspark_depth_cap = dspark_mode ? xcalloc(MS, sizeof(uint32_t)) : NULL;
-    /* D4.5f: one-shot kv-gate crossing log per admitted request (reset at admit). */
+    /* D4.5f: one-shot kv-gate crossing log per admitted request (reset at admit).
+     * Under D4.5g it marks the adaptive controller's engagement log instead. */
     uint8_t  *dspark_kv_logged = dspark_mode ? xcalloc(MS, sizeof(uint8_t)) : NULL;
+    /* D4.5g adaptive-gate state (per bank; only the solo live bank is driven). */
+    uint8_t  *ad_mode   = dspark_adapt_gate ? xcalloc(MS, sizeof(uint8_t)) : NULL;  /* 1=spec */
+    uint8_t  *ad_probe  = dspark_adapt_gate ? xcalloc(MS, sizeof(uint8_t)) : NULL;  /* 1=probing !mode */
+    uint8_t  *ad_logn   = dspark_adapt_gate ? xcalloc(MS, sizeof(uint8_t)) : NULL;
+    uint32_t *ad_tok    = dspark_adapt_gate ? xcalloc(MS, sizeof(uint32_t)) : NULL;
+    double   *ad_wall   = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;
+    double   *ad_ms_cur = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;   /* 0 = no estimate yet */
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
     if (mtp_accept) ok = ok && dbuf && ndr && vqtok && vpos && vsid && vfirst && vnr && vlogits;
     if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits && pf_inj_pos && pf_inj_sid &&
                          dspark_step_inj_pos && dspark_step_inj_sid && dspark_step_inj_src && dspark_depth_cap &&
                          dspark_kv_logged;
+    if (dspark_adapt_gate) ok = ok && ad_mode && ad_probe && ad_logn && ad_tok && ad_wall && ad_ms_cur;
     /* M4b Inc5: batched cross-bank MTP draft chain (one depth-major forward over all
      * live banks, ~D+1 device syncs/step) instead of the per-bank serial
      * mtp_draft_chain_bank (N*(D+1) syncs).  Pure perf: the verify forward is the sole
@@ -33462,6 +33496,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint64_t dspark_prof_draft_rows = 0, dspark_prof_compact_saved = 0;
     uint64_t dspark_prof_auto_depth3_steps = 0, dspark_prof_adapt_saved_rows = 0;
     uint64_t dspark_prof_kv_gate_steps = 0, dspark_prof_kv_gate_saved_rows = 0;
+    uint64_t dspark_prof_ad_probes = 0, dspark_prof_ad_switches = 0, dspark_prof_ad_plain_steps = 0;
     while (ok) {
         /* ---- ADMIT: fill free banks from the waiting queue.  At most MS
          * placements per pass (the outer loop re-enters immediately when
@@ -33766,6 +33801,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         live[b] = 1u;
                         if (dspark_depth_cap) dspark_depth_cap[b] = Dspec;
                         if (dspark_kv_logged) dspark_kv_logged[b] = 0u;
+                        if (dspark_adapt_gate) {   /* fresh request -> fresh controller */
+                            ad_mode[b] = 1u; ad_probe[b] = 0u; ad_logn[b] = 0u;
+                            ad_tok[b] = 0u; ad_wall[b] = 0.0; ad_ms_cur[b] = 0.0;
+                        }
                     }
                     if (getenv("DS4_CONT_GEN_TIMING"))
                         fprintf(stderr, "ds4: cont admit bank=%u pos_base=%u suffix=%u wall=%.2fs%s\n",
@@ -33803,6 +33842,27 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         const int dspark_all_kv_gated = dspark_mode && dspark_kv_live == 0u;
         const int dspark_now = dspark_mode && (dspark_max_nlive == 0u || n_live <= dspark_max_nlive) &&
                                !dspark_all_kv_gated;
+        /* D4.5g: adaptive-gate effective mode for the solo live bank this step.
+         * Engages only solo (n_live==1) past the start depth; dspark_max_kv was
+         * zeroed at parse when the controller is on, so the static per-bank gate
+         * and its all-gated injection skip are inert here (rings must stay warm
+         * for re-entry).  eff_spec: RUN phase decodes in the settled mode, PROBE
+         * phase decodes in the opposite mode to time the alternative. */
+        int ad_active = 0, ad_eff_spec = 1;
+        uint32_t ad_b = 0;
+        if (dspark_adapt_gate && dspark_now && n_live == 1u) {
+            for (uint32_t b = 0; b < MS; b++) if (live[b]) { ad_b = b; break; }
+            if (posv[ad_b] >= dspark_adapt_start) {
+                ad_active = 1;
+                ad_eff_spec = ad_probe[ad_b] ? !ad_mode[ad_b] : ad_mode[ad_b];
+                if (!dspark_kv_logged[ad_b]) {
+                    fprintf(stderr, "ds4: cont-dspark adapt-gate ENGAGED bank=%u pos=%u start=%u (win=%u run=%u margin=%.0f%%)\n",
+                            ad_b, posv[ad_b], dspark_adapt_start, dspark_adapt_win,
+                            dspark_adapt_run, dspark_adapt_margin * 100.0);
+                    dspark_kv_logged[ad_b] = 1u;
+                }
+            }
+        }
 
         /* ---- refresh scalar read-counts = max over ALL banks (reset clobbers them,
          * and the just-admitted bank's emitted rows must be counted). ---- */
@@ -33831,6 +33891,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * draft the next chain off each live bank's last committed row.  Greedy/argmax --
              * mode 2 is gate-only in v1 (production enablement + temp>0 accept come later). */
             const double smp_t0 = g_cont_prof ? now_sec() : 0.0;
+            const double ad_t0 = ad_active ? now_sec() : 0.0;   /* D4.5g window wall */
             uint32_t committed_rows[DS4_MULTISEQ_MAX_SEQ];
             int      seedtok[DS4_MULTISEQ_MAX_SEQ];
             for (uint32_t b = 0; b < MS; b++) { committed_rows[b] = 0u; seedtok[b] = -1; }
@@ -33863,6 +33924,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     if (dspark_prof && nd > 0u) dspark_prof_kv_gate_saved_rows += (uint64_t)nd;
                     nd = 0u;
                 }
+                /* D4.5g adaptive gate: spec-off window (settled-plain or plain-probe)
+                 * for the solo bank -> verify the committed row only this step. */
+                if (ad_active && b == ad_b && !ad_eff_spec) nd = 0u;
                 /* D4.5e gate: when DSpark is concurrency-gated OFF this step, verify the
                  * committed row only (drop any drafts from a prior low-concurrency step) ->
                  * 1 row/bank = plain batched decode width. */
@@ -33911,7 +33975,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * this step -> skip the per-bank checkpoint capture (match base decode cost).
                  * can_rollback stays true so no_defer holds (in-forward emit); the rollback
                  * call below no-ops (M >= total for all banks). */
-                g->batch_rollback_capture = can_rollback && !(dspark_mode && !dspark_now);
+                g->batch_rollback_capture = can_rollback && !(dspark_mode && !dspark_now) &&
+                                            !(ad_active && !ad_eff_spec);   /* D4.5g: nd=0 -> no rollback; match true plain cost */
                 /* D4.5d/E5: tap the target hidden after layers 40/41/42 inline in this
                  * forward (zero extra forward) -> dspark_concat[0..K2).  Accept-rate-only;
                  * off => bit-identical to the non-DSpark verify forward.  STAYS ON when
@@ -34205,6 +34270,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         if (!live[b] || cfirst[b] == UINT32_MAX) continue;
                         /* D4.5f: kv-gated bank -> no drafts (its verify packs nd=0 anyway). */
                         if (dspark_max_kv != 0u && posv[b] >= dspark_max_kv) continue;
+                        /* D4.5g: spec-off window -> no drafts this step (re-entry pays a
+                         * 1-step ramp: the first spec step packs 0 drafts and re-seeds). */
+                        if (ad_active && b == ad_b && !ad_eff_spec) continue;
                         Pbank[nl]   = (int32_t)posv[b];
                         bonusv[nl]  = cur[b];
                         bankmap[nl] = b;
@@ -34326,6 +34394,38 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         steps, (int)mtp_batch_draft, n_live);
                 break;
             }
+            /* D4.5g controller update: attribute this step's wall to the effective
+             * mode's window; on window completion, RUN -> arm a probe of the other
+             * mode, PROBE -> adopt the faster mode (hysteresis) and settle. */
+            if (ad_active && ok && live[ad_b]) {
+                ad_tok[ad_b]  += committed_rows[ad_b];
+                ad_wall[ad_b] += now_sec() - ad_t0;
+                const uint32_t need = ad_probe[ad_b] ? dspark_adapt_win
+                                    : (ad_ms_cur[ad_b] == 0.0 ? dspark_adapt_win : dspark_adapt_run);
+                if (ad_tok[ad_b] >= need) {
+                    const double ms = ad_wall[ad_b] * 1e3 / (double)ad_tok[ad_b];
+                    if (!ad_probe[ad_b]) {
+                        ad_ms_cur[ad_b] = ms;      /* fresh estimate of the settled mode */
+                        ad_probe[ad_b] = 1u;
+                    } else {
+                        if (dspark_prof) dspark_prof_ad_probes++;
+                        if (ms < ad_ms_cur[ad_b] * (1.0 - dspark_adapt_margin)) {
+                            ad_mode[ad_b] = (uint8_t)!ad_mode[ad_b];
+                            if (ad_logn[ad_b] < 8u) {
+                                fprintf(stderr, "ds4: cont-dspark adapt-gate bank=%u pos=%u -> %s (ms/tok %.2f beats %.2f)\n",
+                                        ad_b, posv[ad_b], ad_mode[ad_b] ? "spec" : "plain",
+                                        ms, ad_ms_cur[ad_b]);
+                                ad_logn[ad_b]++;
+                            }
+                            ad_ms_cur[ad_b] = ms;
+                            if (dspark_prof) dspark_prof_ad_switches++;
+                        }
+                        ad_probe[ad_b] = 0u;
+                    }
+                    ad_tok[ad_b] = 0u; ad_wall[ad_b] = 0.0;
+                }
+                if (dspark_prof && !ad_eff_spec) dspark_prof_ad_plain_steps++;
+            }
             if (g_cont_prof) t_sample_s += now_sec() - smp_t0;
         } else {
         uint32_t maxpos = 0;
@@ -34429,7 +34529,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         fprintf(stderr,
                 "ds4: DSPARK_PROFILE compact_inject=%d steps=%llu verify_rows=%llu inject_rows=%llu "
                 "draft_rows=%llu compact_saved=%llu auto_d3_steps=%llu adapt_saved=%llu "
-                "kv_gate_steps=%llu kv_gate_saved=%llu avg_verify_rows=%.2f avg_inject_rows=%.2f | "
+                "kv_gate_steps=%llu kv_gate_saved=%llu ad_probes=%llu ad_switches=%llu ad_plain_steps=%llu "
+                "avg_verify_rows=%.2f avg_inject_rows=%.2f | "
                 "per-step ms: verify=%.3f accept=%.3f inj_pack=%.3f inj_proj=%.3f inj_store=%.3f "
                 "rollback=%.3f commit=%.3f block=%.3f markov=%.3f\n",
                 dspark_compact_inject,
@@ -34442,6 +34543,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 (unsigned long long)dspark_prof_adapt_saved_rows,
                 (unsigned long long)dspark_prof_kv_gate_steps,
                 (unsigned long long)dspark_prof_kv_gate_saved_rows,
+                (unsigned long long)dspark_prof_ad_probes,
+                (unsigned long long)dspark_prof_ad_switches,
+                (unsigned long long)dspark_prof_ad_plain_steps,
                 dspark_prof_steps ? (double)dspark_prof_verify_rows / (double)dspark_prof_steps : 0.0,
                 dspark_prof_steps ? (double)dspark_prof_inject_rows / (double)dspark_prof_steps : 0.0,
                 dspark_t_verify_s      * 1e3 / denom,
@@ -34510,6 +34614,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     free(pf_inj_pos); free(pf_inj_sid);
     free(dspark_step_inj_pos); free(dspark_step_inj_sid); free(dspark_step_inj_src); free(dspark_depth_cap);
     free(dspark_kv_logged);
+    free(ad_mode); free(ad_probe); free(ad_logn); free(ad_tok); free(ad_wall); free(ad_ms_cur);
     return ok ? 0 : 1;
 #undef CG_ERR
 }
