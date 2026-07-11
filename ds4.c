@@ -9937,6 +9937,172 @@ static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
  * Metal Release Graph Allocation.
  * ========================================================================= */
 
+/* Estimate the bytes metal_graph_alloc_raw_cap below will ask the GPU
+ * allocator for.  MUST mirror that function's sizing expressions -- the two
+ * are adjacent so a buffer added there is added here.  Buffers under ~1 MiB
+ * ride the fixed slack term.  Used by the session-graph fit gate
+ * (metal_graph_session_fit_ok): on unified-memory boxes a doomed multi-GiB
+ * alloc burst does not fail cleanly, it grinds the kernel into the OOM
+ * killer, so we refuse up front when the estimate cannot fit. */
+static uint64_t metal_graph_alloc_bytes_estimate(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_mtp,
+        bool                     enable_dspark) {
+    if (raw_cap == 0) raw_cap = 1;
+    if (ctx_size == 0) ctx_size = raw_cap;
+    if (prefill_cap == 0) prefill_cap = 1;
+    uint32_t raw_window = DS4_N_SWA;
+    if (raw_window > ctx_size) raw_window = ctx_size;
+    if (raw_window == 0) raw_window = 1;
+    if (raw_cap < raw_window) raw_cap = raw_window;
+    if (raw_cap > ctx_size) raw_cap = ctx_size;
+    if (raw_cap == 0) raw_cap = 1;
+    uint32_t min_ratio = UINT32_MAX;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
+    }
+    if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
+    uint64_t comp_cap = (uint64_t)(ctx_size / min_ratio + 2u);
+    if (comp_cap < 2u) comp_cap = 2u;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_rank = layer->attn_q_a->dim[1];
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
+    const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
+    const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t vocab_dim = weights->output->dim[1];
+    const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
+        ? DS4_N_HEAD_DIM
+        : DS4_N_INDEXER_HEAD_DIM);
+    const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t pc = prefill_cap;
+    const bool fp8_kv = ds4_cuda_fp8_kv_enabled() != 0;
+    const bool fp4_index = ds4_cuda_fp4_index_enabled() != 0;
+
+    uint64_t bytes = 0;
+    /* per-layer KV caches + attn/index state (the alloc's layer loop) */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        bytes += (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t layer_comp_cap = (uint64_t)(ctx_size / ratio + 2u) < 2u
+            ? 2u : (uint64_t)(ctx_size / ratio + 2u);
+        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint64_t attn_state = (uint64_t)coff * DS4_N_HEAD_DIM *
+                                    (uint64_t)coff * ratio * sizeof(float);
+        bytes += layer_comp_cap * DS4_N_HEAD_DIM *
+                 (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+        bytes += (2ull + (enable_mtp ? 6ull : 0ull)) * attn_state;
+        if (fp8_kv) bytes += layer_comp_cap *
+                             (DS4_OPP_C_FP8_ROW_BYTES + DS4_OPP_C_FP8_SCALE_BYTES);
+        if (ratio == 4) {
+            const uint64_t index_state = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM *
+                                         (uint64_t)coff * ratio * sizeof(float);
+            bytes += layer_comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            bytes += (2ull + (enable_mtp ? 6ull : 0ull)) * index_state;
+            if (fp4_index) bytes += layer_comp_cap *
+                                    (DS4_INDEXER_FP4_ROW_BYTES + DS4_INDEXER_FP4_SCALE_BYTES);
+        }
+    }
+    /* indexer score/mask scratch + selection */
+    bytes += 2ull * comp_cap * pc * sizeof(float);
+    bytes += (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) * pc * sizeof(uint32_t);
+    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        uint64_t stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
+        if (stage_cap < 2u) stage_cap = 2u;
+        bytes += stage_cap * DS4_N_HEAD_DIM * sizeof(float);
+    }
+    bytes += vocab_dim * sizeof(float);                         /* logits */
+    if (enable_mtp) {
+        bytes += 2ull * raw_cap * DS4_N_HEAD_DIM * sizeof(float);  /* mtp + spec rings */
+        bytes += 16ull * DS4_N_VOCAB * sizeof(float);              /* spec_logits */
+    }
+    if (enable_dspark) {
+        bytes += (uint64_t)DS4_DSPARK_N_LAYER * raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+        bytes += pc * (uint64_t)DS4_N_EMBD * sizeof(float);        /* dspark_main_x */
+        bytes += pc * 3ull * DS4_N_EMBD * sizeof(float);           /* dspark_concat */
+        bytes += pc * (uint64_t)DS4_N_HEAD_DIM * sizeof(float);    /* dspark_kv */
+        bytes += (uint64_t)DS4_DSPARK_BLOCK * DS4_N_VOCAB * sizeof(float);
+    }
+    /* batched prefill scratch (the pc-scaled group; dominates at pc=4096) */
+    bytes += 4ull * pc * hc_dim * sizeof(float);        /* cur/next/flat/after_attn hc */
+    bytes += 2ull * pc * mix_hc * sizeof(float);
+    bytes += 7ull * pc * DS4_N_EMBD * sizeof(float);    /* attn_cur/norm, attn_out,
+                                                           ffn_cur/norm, shared_out,
+                                                           routed_out */
+    bytes += 2ull * pc * q_rank * sizeof(float);
+    bytes += 2ull * pc * q_dim * sizeof(float);         /* q, heads */
+    bytes += 2ull * pc * DS4_N_HEAD_DIM * sizeof(float);
+    bytes += 2ull * pc * comp_width_max * sizeof(float);
+    bytes += pc * indexer_q_dim * sizeof(float);
+    bytes += pc * (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float);
+    bytes += pc * low_dim * sizeof(float);
+    bytes += pc * group_dim * sizeof(float);
+    bytes += pc * (uint64_t)DS4_N_LORA_O * sizeof(float);
+    bytes += 3ull * pc * shared_dim * sizeof(float);
+    bytes += 2ull * pc * DS4_N_EXPERT * sizeof(float);  /* router logits/probs */
+    bytes += 3ull * pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float);
+    bytes += pc * (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
+    bytes += (uint64_t)DS4_MULTISEQ_MAX_SEQ * DS4_N_VOCAB * sizeof(float);
+    bytes += 64ull << 20;   /* slack: the dozens of sub-MiB buffers above + views */
+    return bytes;
+}
+
+/* Session-graph fit gate.  cudaMalloc on an integrated/unified box does not
+ * fail cleanly when the ask exceeds MemAvailable -- the kernel reclaims and
+ * swaps for tens of seconds and then the global OOM killer shoots the largest
+ * processes (observed on GB10: a lazy serial-graph alloc at -c 69632 took down
+ * ds4-server AND ds4_weight_server).  So before the burst, compare the
+ * estimate against the allocator's own budget answer (ds4_gpu_mem_info is
+ * MemAvailable-aware on CUDA) and refuse cleanly when it cannot fit; callers
+ * surface the existing "session graph alloc failed" error and the server
+ * lives.  Fail-open when the backend has no budget answer (Metal).
+ * The estimate counts managed KV rings (huge-ctx demand-paged class) at full
+ * size even though they fault in lazily, so the gate is CONSERVATIVE for
+ * very large contexts on thin boxes -- the safe direction; kill switch below
+ * if a deployment needs the old try-and-hope behavior.
+ * DS4_SESSION_GRAPH_FIT=0 disables the gate; DS4_SESSION_GRAPH_HEADROOM_MB
+ * (default 1024) is the required slack on top of the estimate. */
+static bool metal_graph_session_fit_ok(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_mtp,
+        bool                     enable_dspark) {
+    const char *fe = getenv("DS4_SESSION_GRAPH_FIT");
+    if (fe && fe[0] == '0' && fe[1] == '\0') return true;
+    uint64_t free_b = 0, total_b = 0;
+    if (ds4_gpu_mem_info(&free_b, &total_b) != 0) return true;
+    const uint64_t need = metal_graph_alloc_bytes_estimate(weights, layer, raw_cap,
+                                                           ctx_size, prefill_cap,
+                                                           enable_mtp, enable_dspark);
+    uint64_t headroom = 1024ull << 20;
+    const char *he = getenv("DS4_SESSION_GRAPH_HEADROOM_MB");
+    if (he && he[0]) {
+        const long v = atol(he);
+        if (v >= 0) headroom = (uint64_t)v << 20;
+    }
+    if (free_b >= need + headroom) return true;
+    fprintf(stderr,
+            "ds4: session graph fit check FAILED: need ~%.0f MiB (+%.0f MiB headroom) "
+            "but only %.0f MiB allocatable (ctx=%u prefill_cap=%u mtp=%d dspark=%d); "
+            "refusing the alloc so the box survives (DS4_SESSION_GRAPH_FIT=0 overrides)\n",
+            (double)need / 1048576.0, (double)headroom / 1048576.0,
+            (double)free_b / 1048576.0,
+            ctx_size, prefill_cap, enable_mtp ? 1 : 0, enable_dspark ? 1 : 0);
+    return false;
+}
+
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
 static bool metal_graph_alloc_raw_cap(
@@ -10122,6 +10288,16 @@ static bool metal_graph_alloc_raw_cap(
                 }
             }
         }
+        /* Fail fast on the big per-layer caches: past the first failed alloc,
+         * every further attempt just digs a memory-starved unified box deeper
+         * toward the kernel OOM killer.  The full ok-check below still
+         * validates everything that did allocate. */
+        if (!g->layer_raw_cache[il] ||
+            (ratio != 0 && !g->layer_attn_comp_cache[il]) ||
+            (ratio == 4 && !g->layer_index_comp_cache[il])) {
+            metal_graph_free(g);
+            return false;
+        }
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
@@ -10209,6 +10385,15 @@ static bool metal_graph_alloc_raw_cap(
         g->dspark_n_raw = 0;
     }
 
+    /* Fail fast before the pc-scaled batch scratch group (the largest burst,
+     * ~4 GiB at pc=4096) when the groups above already lost an allocation. */
+    if (!g->logits ||
+        (enable_mtp && !g->spec_mtp_raw_cache) ||
+        (enable_dspark && !g->dspark_concat)) {
+        metal_graph_free(g);
+        return false;
+    }
+
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -10243,6 +10428,12 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_indexer_q = ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
     g->batch_indexer_weights = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
     g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    /* Fail fast mid-group: the hc/q/heads buffers above are the biggest
+     * single asks; if one failed, stop before the ~25 remaining allocs. */
+    if (!g->batch_cur_hc || !g->batch_q || !g->batch_heads) {
+        metal_graph_free(g);
+        return false;
+    }
     g->batch_positions = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));  /* Phase 2 Step 2 */
     g->batch_use_positions = false;
     g->batch_seq_id = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));     /* Phase 2 Step 3b */
@@ -35848,8 +36039,13 @@ void ds4_engine_close(ds4_engine *e) {
  * TRADE-OFF, deliberate: under bank starvation the lazy alloc can fail where
  * the old boot-time alloc could not -- the root API then returns a normal
  * error (job fails cleanly, server lives; same failure class as an admission
- * reject).  Freed bytes go to banks (comp_map_budget is computed after
- * session create, so the deferred graph's bytes land in the KV page budget).
+ * reject).  That promise is ENFORCED by metal_graph_session_fit_ok: without
+ * it, on unified-memory boxes the doomed multi-GiB alloc burst does not fail
+ * cleanly -- it grinds the kernel into the global OOM killer (observed on
+ * GB10 at -c 69632 with MTP+DSpark: the first serial-path request killed
+ * ds4-server AND ds4_weight_server).  Freed bytes go to banks
+ * (comp_map_budget is computed after session create, so the deferred graph's
+ * bytes land in the KV page budget).
  * DS4_SESSION_LAZY_GRAPH=0 restores the eager boot alloc.  Distributed
  * coordinator sessions stay eager (dist_session_create binds the session
  * during create). */
@@ -35863,6 +36059,10 @@ static bool ds4_session_lazy_graph_enabled(void) {
 static int ds4_session_alloc_graph(ds4_session *s) {
     ds4_engine *e = s->engine;
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(s->ctx_size, s->prefill_cap);
+    if (!metal_graph_session_fit_ok(&e->weights, &e->weights.layer[0],
+                                    raw_cap, (uint32_t)s->ctx_size, s->prefill_cap,
+                                    e->mtp_ready, e->dspark_ready))
+        return 1;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)s->ctx_size, s->prefill_cap,
                                    e->mtp_ready, e->dspark_ready))
