@@ -11247,7 +11247,9 @@ static job *dequeue(server *s) {
  * apply the override.)
  * W6: streaming IS batchable -- the continuous path streams each row's tokens as
  * produced (cont_on_token); only OpenAI chat/completion SSE is handled, which is
- * why anthropic/responses (api != API_OPENAI) and token-id echo stay excluded.
+ * why anthropic/responses (api != API_OPENAI) stay excluded.  Streaming chat
+ * token-id echo (return_token_ids) is batchable too -- cont_on_token records
+ * ids into the same OpenAI SSE machine the single path uses.
  * A1: STOP STRINGS and TOOL CALLS are batchable too -- the continuous path
  * scans both host-side per row (cont_on_token mirrors generate_job's per-token
  * scan) and finalizes with the same parse/response helpers.  Tools stay
@@ -11258,7 +11260,15 @@ static job *dequeue(server *s) {
 static bool job_is_batchable(const request *r) {
     if (r->api != API_OPENAI) return false;
     if (r->kind != REQ_CHAT && r->kind != REQ_COMPLETION) return false;
-    if (r->return_token_ids) return false;
+    /* Token-id echo rides the continuous path ONLY as streaming chat SSE
+     * (cont_on_token records each sampled id into the shared OpenAI stream
+     * machine, which drains token-aligned id arrays).  Non-streaming echo is a
+     * silent no-op on every path and completion-kind SSE never carried ids --
+     * both keep the serial route rather than change their wire shape here.
+     * Keeping echo requests OFF the serial path matters beyond throughput: on
+     * a bank-starved big-ctx boot the serial session's lazy graph alloc can
+     * exceed the box (see metal_graph_session_fit_ok). */
+    if (r->return_token_ids && !(r->stream && r->kind == REQ_CHAT)) return false;
     if (r->has_tools) {
         if (r->kind != REQ_CHAT) return false;
         if (r->temperature > 0.0f) return false;
@@ -11828,7 +11838,7 @@ struct cont_stream {
      * request streams reasoning_content vs content with the SAME <think>/</think>
      * split + hold-back logic.  A1: the machine's TOOL mode is now exercised too
      * (it detects DSML starts itself when r->has_tools and streams tool deltas);
-     * token_ids stays excluded. */
+     * streaming chat rows also record token ids into it (return_token_ids). */
     openai_stream ostream;
     int    prompt_tokens; /* for the usage chunk */
     int    completion;    /* visible (non-EOS) tokens produced */
@@ -12038,6 +12048,11 @@ static int cont_on_token(void *ud, void *user, int token) {
     char *piece = ds4_token_text(s->engine, token, &pl);
     if (piece) { buf_append(&st->text, piece, pl); free(piece); }
     st->completion++;
+    /* Token-id echo: the single path's openai_stream_record_token call site,
+     * ported.  Each sampled id is queued with its byte end so the shared SSE
+     * projection below drains token-aligned token_ids arrays.  No-op unless
+     * the request set return_token_ids. */
+    if (j->req.stream) openai_stream_record_token(&st->ostream, token, st->text.len);
 
     /* Stop scan + stream hold-back, the generate_job shape: never emit bytes
      * that could be a stop-string prefix; on a hit the text truncates to the
@@ -14086,6 +14101,74 @@ static void test_responses_usage_reports_cache_details(void) {
     close(sv[0]);
     close(sv[1]);
     request_free(&r);
+}
+
+static void test_streaming_chat_token_id_echo_is_batchable(void) {
+    /* return_token_ids used to knock STREAMING chat jobs off the continuous
+     * path onto the serial path.  On a bank-starved big-ctx boot the serial
+     * session's S6 lazy graph alloc (~6 GiB burst at -c 69632 with MTP+DSpark)
+     * then drove the whole box into the kernel OOM killer, taking ds4-server
+     * AND ds4_weight_server with it.  Streaming chat token-id echo now rides
+     * the continuous path (cont_on_token records ids into the shared OpenAI
+     * SSE machine); non-streaming echo (a silent no-op on every path) and
+     * completion-kind SSE (never carried ids) keep the serial route. */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.return_token_ids = true;
+    TEST_ASSERT(job_is_batchable(&r));
+    r.stream = false;
+    TEST_ASSERT(!job_is_batchable(&r));
+    request_free(&r);
+
+    request c;
+    request_init(&c, REQ_COMPLETION, 128);
+    c.api = API_OPENAI;
+    c.stream = true;
+    c.return_token_ids = true;
+    TEST_ASSERT(!job_is_batchable(&c));
+    request_free(&c);
+}
+
+static void test_openai_chat_stream_token_ids_cover_emitted_text(void) {
+    /* The choice-level token_ids contract llama-benchy reads
+     * (chunk.choices[0].token_ids): every content delta carries the ids of
+     * exactly the tokens whose bytes it emits.  This is the shared machine the
+     * continuous path records into via cont_on_token. */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.return_token_ids = true;
+    r.think_mode = DS4_THINK_NONE;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw = "Hello world";
+    openai_stream_record_token(&st, 101, 5);   /* "Hello" */
+    openai_stream_record_token(&st, 202, 11);  /* " world" */
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_ids", &st,
+                                         raw, strlen(raw), false));
+    tool_calls none = {0};
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_ids", &st,
+                                       raw, strlen(raw), &none, "stop", 3, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"content\":\"Hello world\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"token_ids\":[101,202]") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
 }
 
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
@@ -17153,6 +17236,8 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
+    test_streaming_chat_token_id_echo_is_batchable();
+    test_openai_chat_stream_token_ids_cover_emitted_text();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
