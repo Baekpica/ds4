@@ -33311,6 +33311,22 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * Lossless either way -- the verify forward is the sole source of tokens. */
     uint32_t dspark_max_nlive = 1u;
     { const char *me = getenv("DS4_DSPARK_MAX_NLIVE"); if (me && me[0]) { long v = atol(me); if (v >= 0) dspark_max_nlive = (uint32_t)v; } }
+    /* D4.5f kv-depth auto-gate: spec-decode's win also decays with CONTEXT DEPTH --
+     * acceptance drops as the sequence deepens while the (1+D)-row verify forward's
+     * attention cost grows with kv, so past a depth the spec step nets a LOSS vs
+     * plain decode (2026-07-11 frontier sweep, prose: 1.42x @2k, breakeven ~32-40k,
+     * 0.75x @64k+; tok/step 2.95 -> 1.72).  Gate per BANK on its kv frontier: a bank
+     * at posv >= DS4_DSPARK_MAX_KV packs no draft rows (verify = 1 row, plain decode
+     * width) and is excluded from the block draft; when EVERY live bank is gated the
+     * step degrades to plain batched decode exactly like the NLIVE gate above, and
+     * additionally skips ring injection (a row at position >= the threshold can
+     * never be read by a spec-active drafter window, because spec-active requires
+     * posv < the threshold and posv only grows).  One-way per request, lossless
+     * either way.  Default 40960 = the top of the measured prose crossover band;
+     * structured content (code/math) crosses deeper -- raise it for such serving.
+     * 0 disables the gate (= spec at any depth). */
+    uint32_t dspark_max_kv = 40960u;
+    { const char *ke = getenv("DS4_DSPARK_MAX_KV"); if (ke && ke[0]) { long v = atol(ke); if (v >= 0) dspark_max_kv = (uint32_t)v; } }
     /* C2 Inc3 A/B lever (scaffolding, default off): cap each live bank's
      * verify drafts so the packed verify step fits this many rows total --
      * cont capture serves steps <= 8 rows (the decode-tier surface), so
@@ -33392,10 +33408,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     int32_t *dspark_step_inj_sid = dspark_mode ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
     int32_t *dspark_step_inj_src = dspark_mode ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
     uint32_t *dspark_depth_cap = dspark_mode ? xcalloc(MS, sizeof(uint32_t)) : NULL;
+    /* D4.5f: one-shot kv-gate crossing log per admitted request (reset at admit). */
+    uint8_t  *dspark_kv_logged = dspark_mode ? xcalloc(MS, sizeof(uint8_t)) : NULL;
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
     if (mtp_accept) ok = ok && dbuf && ndr && vqtok && vpos && vsid && vfirst && vnr && vlogits;
     if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits && pf_inj_pos && pf_inj_sid &&
-                         dspark_step_inj_pos && dspark_step_inj_sid && dspark_step_inj_src && dspark_depth_cap;
+                         dspark_step_inj_pos && dspark_step_inj_sid && dspark_step_inj_src && dspark_depth_cap &&
+                         dspark_kv_logged;
     /* M4b Inc5: batched cross-bank MTP draft chain (one depth-major forward over all
      * live banks, ~D+1 device syncs/step) instead of the per-bank serial
      * mtp_draft_chain_bank (N*(D+1) syncs).  Pure perf: the verify forward is the sole
@@ -33442,6 +33461,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint64_t dspark_prof_steps = 0, dspark_prof_verify_rows = 0, dspark_prof_inject_rows = 0;
     uint64_t dspark_prof_draft_rows = 0, dspark_prof_compact_saved = 0;
     uint64_t dspark_prof_auto_depth3_steps = 0, dspark_prof_adapt_saved_rows = 0;
+    uint64_t dspark_prof_kv_gate_steps = 0, dspark_prof_kv_gate_saved_rows = 0;
     while (ok) {
         /* ---- ADMIT: fill free banks from the waiting queue.  At most MS
          * placements per pass (the outer loop re-enters immediately when
@@ -33745,6 +33765,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     } else {
                         live[b] = 1u;
                         if (dspark_depth_cap) dspark_depth_cap[b] = Dspec;
+                        if (dspark_kv_logged) dspark_kv_logged[b] = 0u;
                     }
                     if (getenv("DS4_CONT_GEN_TIMING"))
                         fprintf(stderr, "ds4: cont admit bank=%u pos_base=%u suffix=%u wall=%.2fs%s\n",
@@ -33769,7 +33790,19 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
          * skipped.  Transitions are lossless; a high->low concurrency flip resumes spec
          * with a brief accept ramp where the block window spans positions decoded while
          * gated off (their KV was not injected -- same self-healing class as prefill). */
-        const int dspark_now = dspark_mode && (dspark_max_nlive == 0u || n_live <= dspark_max_nlive);
+        /* D4.5f: live banks still under the kv-depth threshold (spec-eligible).
+         * Zero -> every live bank is past DS4_DSPARK_MAX_KV; the whole step drops
+         * to plain batched decode through the same lossless path as the NLIVE gate
+         * (mixed steps are handled per-bank in the verify pack below). */
+        uint32_t dspark_kv_live = n_live;
+        if (dspark_mode && dspark_max_kv != 0u) {
+            dspark_kv_live = 0u;
+            for (uint32_t b = 0; b < MS; b++)
+                if (live[b] && posv[b] < dspark_max_kv) dspark_kv_live++;
+        }
+        const int dspark_all_kv_gated = dspark_mode && dspark_kv_live == 0u;
+        const int dspark_now = dspark_mode && (dspark_max_nlive == 0u || n_live <= dspark_max_nlive) &&
+                               !dspark_all_kv_gated;
 
         /* ---- refresh scalar read-counts = max over ALL banks (reset clobbers them,
          * and the just-admitted bank's emitted rows must be counted). ---- */
@@ -33816,6 +33849,19 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         if (dspark_prof && dspark_now) dspark_prof_adapt_saved_rows += (uint64_t)(nd - cap);
                         nd = cap;
                     }
+                }
+                /* D4.5f kv gate: this bank's frontier crossed DS4_DSPARK_MAX_KV -- spec no
+                 * longer pays at its depth (acceptance decayed, verify rows cost kv-deep
+                 * attention).  Verify the committed row only; one-way for the request's
+                 * lifetime (posv only grows), so this bank never re-enters spec. */
+                if (dspark_mode && dspark_max_kv != 0u && posv[b] >= dspark_max_kv) {
+                    if (!dspark_kv_logged[b]) {
+                        fprintf(stderr, "ds4: cont-dspark kv-gate bank=%u pos=%u >= max_kv=%u -> spec off for this seq\n",
+                                b, posv[b], dspark_max_kv);
+                        dspark_kv_logged[b] = 1u;
+                    }
+                    if (dspark_prof && nd > 0u) dspark_prof_kv_gate_saved_rows += (uint64_t)nd;
+                    nd = 0u;
                 }
                 /* D4.5e gate: when DSpark is concurrency-gated OFF this step, verify the
                  * committed row only (drop any drafts from a prior low-concurrency step) ->
@@ -33899,6 +33945,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 dspark_prof_verify_rows += K2;
                 if (Dstep != Dspec) dspark_prof_auto_depth3_steps++;
             }
+            if (dspark_prof && dspark_all_kv_gated) dspark_prof_kv_gate_steps++;
             /* 3. ACCEPT + emit + evict (greedy argmax). */
             const double accept_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
             for (uint32_t b = 0; b < MS; b++) {
@@ -33983,8 +34030,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * side -- the verify forward already set every committed token.  vpos/vsid are the
              * original pack arrays (untouched by the accept loop, which only advanced posv[]).
              * Runs on NLIVE-gated steps too (each bank's single committed cur row): rings
-             * stay current through overlap windows -- see the dspark_capture note above. */
-            if (dspark_mode && K2 > 0u) {
+             * stay current through overlap windows -- see the dspark_capture note above.
+             * SKIPPED when every live bank is kv-gated (D4.5f): those rows sit at
+             * positions >= dspark_max_kv, which no spec-active drafter window can ever
+             * read (spec-active requires posv < the threshold and posv only grows) --
+             * the injection would be pure per-step overhead at exactly the depths the
+             * gate exists to protect. */
+            if (dspark_mode && !dspark_all_kv_gated && K2 > 0u) {
                 const double pack_t0 = dspark_prof ? now_sec() : 0.0;
                 uint32_t I2 = K2;
                 ds4_gpu_tensor *inject_concat = g->dspark_concat;
@@ -34151,6 +34203,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     for (uint32_t b = 0; b < MS; b++) {
                         ndr[b] = 0u;
                         if (!live[b] || cfirst[b] == UINT32_MAX) continue;
+                        /* D4.5f: kv-gated bank -> no drafts (its verify packs nd=0 anyway). */
+                        if (dspark_max_kv != 0u && posv[b] >= dspark_max_kv) continue;
                         Pbank[nl]   = (int32_t)posv[b];
                         bonusv[nl]  = cur[b];
                         bankmap[nl] = b;
@@ -34374,7 +34428,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         const double denom = dspark_prof_steps ? (double)dspark_prof_steps : 1.0;
         fprintf(stderr,
                 "ds4: DSPARK_PROFILE compact_inject=%d steps=%llu verify_rows=%llu inject_rows=%llu "
-                "draft_rows=%llu compact_saved=%llu auto_d3_steps=%llu adapt_saved=%llu avg_verify_rows=%.2f avg_inject_rows=%.2f | "
+                "draft_rows=%llu compact_saved=%llu auto_d3_steps=%llu adapt_saved=%llu "
+                "kv_gate_steps=%llu kv_gate_saved=%llu avg_verify_rows=%.2f avg_inject_rows=%.2f | "
                 "per-step ms: verify=%.3f accept=%.3f inj_pack=%.3f inj_proj=%.3f inj_store=%.3f "
                 "rollback=%.3f commit=%.3f block=%.3f markov=%.3f\n",
                 dspark_compact_inject,
@@ -34385,6 +34440,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 (unsigned long long)dspark_prof_compact_saved,
                 (unsigned long long)dspark_prof_auto_depth3_steps,
                 (unsigned long long)dspark_prof_adapt_saved_rows,
+                (unsigned long long)dspark_prof_kv_gate_steps,
+                (unsigned long long)dspark_prof_kv_gate_saved_rows,
                 dspark_prof_steps ? (double)dspark_prof_verify_rows / (double)dspark_prof_steps : 0.0,
                 dspark_prof_steps ? (double)dspark_prof_inject_rows / (double)dspark_prof_steps : 0.0,
                 dspark_t_verify_s      * 1e3 / denom,
@@ -34452,6 +34509,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (mk_logits) ds4_gpu_tensor_free(mk_logits);
     free(pf_inj_pos); free(pf_inj_sid);
     free(dspark_step_inj_pos); free(dspark_step_inj_sid); free(dspark_step_inj_src); free(dspark_depth_cap);
+    free(dspark_kv_logged);
     return ok ? 0 : 1;
 #undef CG_ERR
 }

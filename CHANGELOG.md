@@ -5,6 +5,19 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## Unreleased
+
+- **DSpark kv-depth auto-gate** (`DS4_DSPARK_MAX_KV`, default 40960, 0 = off):
+  speculative decoding is auto-disabled per sequence once its kv frontier crosses
+  the threshold — acceptance decays with depth while the multi-row verify forward's
+  cost grows with kv, netting a loss past ~32-40k on prose (0.75× at 64k+,
+  2026-07-11 frontier sweep). Gated banks decode plain (verify = 1 row, no
+  draft/injection); lossless by construction. Raise the threshold for structured
+  content (higher acceptance crosses over deeper). See `misc/cuda-env-vars.md`.
+- Fix serial-path lazy graph alloc OOM under bank starvation (`1da9467`): cont
+  token-id echo, session-graph fit gate (`DS4_SESSION_GRAPH_FIT`,
+  `DS4_SESSION_GRAPH_HEADROOM_MB`), allocation early-bail.
+
 ## v0.1.0 — 2026-07-10
 
 384 fork commits on `batched-serving`, released as branch `release/v0.1.0`.

@@ -363,6 +363,24 @@ The bandwidth figure is informational; we don't tier on it.
 
 ## DSpark / DFlash diagnostics
 
+- `DS4_DSPARK_MAX_KV=N` (default 40960; 0 disables the gate). Production
+  kv-depth auto-gate. Speculative decoding's advantage decays with context
+  depth: acceptance drops as the sequence deepens while the multi-row verify
+  forward's attention cost grows with kv (measured on prose: 1.42x over plain
+  at 2k depth, breakeven ~32-40k, 0.75x — a net loss — at 64k+). A bank whose
+  kv frontier reaches `N` stops packing draft rows (verify = 1 row, plain
+  decode width), is excluded from the block draft, and logs a one-shot
+  `cont-dspark kv-gate` line; when every live bank is gated the step degrades
+  to plain batched decode (no rollback capture, no draft, no ring injection),
+  the same lossless path as `DS4_DSPARK_MAX_NLIVE`. The gate is one-way per
+  request (positions only grow) and cannot affect output: the target verify
+  forward remains the sole source of committed tokens. The default sits at
+  the top of the measured prose crossover band; structured content (code,
+  math) keeps higher acceptance and crosses over deeper, so raise `N` for
+  such serving, or set 0 to always speculate. `DSPARK_PROFILE` reports
+  `kv_gate_steps` (fully gated steps) and `kv_gate_saved` (draft rows
+  suppressed by the per-bank gate on mixed steps).
+
 - `DS4_DSPARK_PROFILE=1` (default off). Print aggregate DSpark continuous
   decode timings split into verifier forward, accept loop, inject pack,
   inject projection, inject store, rollback, deferred commit, block draft,
