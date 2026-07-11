@@ -363,6 +363,45 @@ The bandwidth figure is informational; we don't tier on it.
 
 ## DSpark / DFlash diagnostics
 
+- `DS4_DSPARK_MAX_KV=N` (default 65536; 0 disables the gate). Production
+  kv-depth auto-gate. Speculative decoding's advantage decays with context
+  depth: acceptance drops as the sequence deepens while the multi-row verify
+  forward's attention cost grows with kv. A bank whose
+  kv frontier reaches `N` stops packing draft rows (verify = 1 row, plain
+  decode width), is excluded from the block draft, and logs a one-shot
+  `cont-dspark kv-gate` line; when every live bank is gated the step degrades
+  to plain batched decode (no rollback capture, no draft, no ring injection),
+  the same lossless path as `DS4_DSPARK_MAX_NLIVE`. The gate is one-way per
+  request (positions only grow) and cannot affect output: the target verify
+  forward remains the sole source of committed tokens. The default comes from
+  the 2026-07-11 default-decision probes: spec still wins at 49k depth on both
+  prose (1.10-1.49x) and code (1.19x), while the loss regime starts at ~64k+
+  (prose 0.90x, 0.75x at 64-112k in the release frontier sweep; code reaches
+  breakeven 1.02x at 65k). Structured content (code, math) keeps higher
+  acceptance and crosses over latest, so raise `N` for code-heavy serving, or
+  set 0 to always speculate. `DSPARK_PROFILE` reports `kv_gate_steps` (fully
+  gated steps) and `kv_gate_saved` (draft rows suppressed by the per-bank gate
+  on mixed steps).
+
+- `DS4_DSPARK_ADAPT_GATE=1` (default off, experimental). Replaces the static
+  `DS4_DSPARK_MAX_KV` cutoff with a runtime measure-and-switch controller.
+  The static threshold is calibrated on prose, the weakest-acceptance content;
+  structured/agentic content keeps acceptance deeper, so a fixed cutoff forgoes
+  real wins there. Past `DS4_DSPARK_ADAPT_START` (default = `DS4_DSPARK_MAX_KV`)
+  the solo-stream decode loop times a `DS4_DSPARK_ADAPT_RUN`-token window
+  (default 512) in the settled mode, probes the other mode for
+  `DS4_DSPARK_ADAPT_WIN` tokens (default 64), and keeps whichever decodes
+  faster with `DS4_DSPARK_ADAPT_MARGIN_PCT` (default 3) hysteresis, re-probing
+  every cycle so content shifts mid-generation re-open the decision. Below the
+  start depth it is dormant (pure spec, zero overhead). Engages only at
+  `n_live==1` (the production `DS4_DSPARK_MAX_NLIVE=1` regime). Unlike the
+  static gate, spec can re-enter, so ring injection and the capture tap stay on
+  during spec-off windows (re-entry across ring holes collapses acceptance);
+  the hard gate and its injection skip are inert while this mode is on.
+  Lossless either way — the verify forward remains the sole token source.
+  Logs `adapt-gate ENGAGED` once per request and each mode switch (first 8);
+  `DSPARK_PROFILE` reports `ad_probes`/`ad_switches`/`ad_plain_steps`.
+
 - `DS4_DSPARK_PROFILE=1` (default off). Print aggregate DSpark continuous
   decode timings split into verifier forward, accept loop, inject pack,
   inject projection, inject store, rollback, deferred commit, block draft,
