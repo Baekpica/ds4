@@ -33192,6 +33192,85 @@ static bool mtp_cont_rollback_restore_all(ds4_gpu_graph *g, uint32_t MS,
     return ok;
 }
 
+typedef struct {
+    uint16_t y;
+    uint16_t c;
+    uint16_t nd;
+    uint16_t live;
+    uint8_t  spec;
+    float    ms;
+} ds4_dspark_trace_step;
+
+typedef struct {
+    ds4_dspark_trace_step *step;
+    uint32_t pos0;
+    uint32_t cap;
+    uint8_t  active;
+    uint64_t n_steps;
+    uint64_t emit;
+    uint64_t drafts;
+    uint64_t hits;
+} ds4_dspark_trace_bank;
+
+static void ds4_dspark_trace_record(ds4_dspark_trace_bank *tb,
+                                    uint32_t y, uint32_t c, uint32_t nd,
+                                    uint32_t live, int spec, double ms) {
+    if (!tb || !tb->active) return;
+    const uint64_t i = tb->n_steps++;
+    tb->emit += y;
+    tb->drafts += c;
+    tb->hits += y > 0u ? y - 1u : 0u;
+    if (i >= tb->cap) return;
+    tb->step[i].y = (uint16_t)y;
+    tb->step[i].c = (uint16_t)c;
+    tb->step[i].nd = (uint16_t)nd;
+    tb->step[i].live = (uint16_t)live;
+    tb->step[i].spec = spec ? 1u : 0u;
+    tb->step[i].ms = (float)ms;
+}
+
+static void ds4_dspark_trace_flush(uint32_t bank, uint32_t D,
+                                   ds4_dspark_trace_bank *tb,
+                                   double guard, double alpha,
+                                   uint32_t minev, double budget) {
+    if (!tb || !tb->active) return;
+    const uint64_t nr = tb->n_steps < tb->cap ? tb->n_steps : tb->cap;
+    double yewma = guard, debt = 0.0, post_sum = 0.0;
+    uint64_t spec_steps = 0u, post_n = 0u;
+    int64_t quench_step = -1;
+    for (uint64_t i = 0; i < nr; i++) {
+        const ds4_dspark_trace_step *s = &tb->step[i];
+        if (!s->spec) continue;
+        if (quench_step >= 0) { post_sum += s->y; post_n++; }
+        yewma = (1.0 - alpha) * yewma + alpha * (double)s->y;
+        debt += guard - (double)s->y;
+        if (debt < 0.0) debt = 0.0;
+        spec_steps++;
+        if (quench_step < 0 && spec_steps >= minev && yewma < guard && debt > budget)
+            quench_step = (int64_t)spec_steps - 1;
+    }
+    fprintf(stderr,
+            "ds4: DSPARK_TRACE bank=%u pos0=%u D=%u steps=%llu emit=%llu drafts=%llu hits=%llu trace=",
+            bank, tb->pos0, D, (unsigned long long)tb->n_steps,
+            (unsigned long long)tb->emit, (unsigned long long)tb->drafts,
+            (unsigned long long)tb->hits);
+    for (uint64_t i = 0; i < nr; i++) {
+        const ds4_dspark_trace_step *s = &tb->step[i];
+        fprintf(stderr, "%s%u:%u:%u:%u:%u:%.2f", i ? " " : "",
+                (unsigned)s->y, (unsigned)s->c, (unsigned)s->nd,
+                (unsigned)s->live, (unsigned)s->spec, (double)s->ms);
+    }
+    fputc('\n', stderr);
+    fprintf(stderr,
+            "ds4: DSPARK_SHADOW bank=%u guard=%.3f alpha=%.3f minev=%u budget=%.1f "
+            "yewma=%.3f debt=%.3f quench_step=%lld post_quench_yield=%.3f\n",
+            bank, guard, alpha, minev, budget, yewma, debt,
+            (long long)quench_step,
+            quench_step >= 0 && post_n ? post_sum / (double)post_n : -1.0);
+    free(tb->step);
+    memset(tb, 0, sizeof(*tb));
+}
+
 /* W5: continuous batching (mid-flight admit/evict) over a persistent ctx.  Maintains
  * a rolling active set of up to ctx->max_seq banks: each iteration admits waiting
  * requests into free banks and evicts finished ones, so short requests don't wait
@@ -33486,6 +33565,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                        g_cont_be_enc_cpu_s = 0.0; }
     double t_sample_s = 0.0;
     const int dspark_prof = dspark_mode && getenv("DS4_DSPARK_PROFILE") != NULL;
+    const int dspark_trace = dspark_mode && getenv("DS4_DSPARK_TRACE") != NULL;
     const int dspark_compact_inject = dspark_mode && getenv("DS4_DSPARK_COMPACT_INJECT") != NULL;
     const int dspark_adapt_depth = dspark_mode && !dspark_verify_depth_forced &&
                                    getenv("DS4_DSPARK_ADAPT_DEPTH") != NULL;
@@ -33497,7 +33577,22 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint64_t dspark_prof_auto_depth3_steps = 0, dspark_prof_adapt_saved_rows = 0;
     uint64_t dspark_prof_kv_gate_steps = 0, dspark_prof_kv_gate_saved_rows = 0;
     uint64_t dspark_prof_ad_probes = 0, dspark_prof_ad_switches = 0, dspark_prof_ad_plain_steps = 0;
+    ds4_dspark_trace_bank *dspark_tb = dspark_trace ? xcalloc(MS, sizeof(*dspark_tb)) : NULL;
+    double dspark_shadow_guard = 2.285;
+    double dspark_shadow_alpha = 0.125;
+    uint32_t dspark_shadow_minev = 8u;
+    double dspark_shadow_budget = 4.0;
+    if (dspark_trace) {
+        const char *te;
+        te = getenv("DS4_DSPARK_SHADOW_GUARD");  if (te && te[0]) dspark_shadow_guard = atof(te);
+        te = getenv("DS4_DSPARK_SHADOW_ALPHA");  if (te && te[0]) dspark_shadow_alpha = atof(te);
+        te = getenv("DS4_DSPARK_SHADOW_MINEV");
+        if (te && te[0]) { const int v = atoi(te); if (v >= 0) dspark_shadow_minev = (uint32_t)v; }
+        te = getenv("DS4_DSPARK_SHADOW_BUDGET"); if (te && te[0]) dspark_shadow_budget = atof(te);
+        ok = ok && dspark_tb;
+    }
     while (ok) {
+        const double dspark_trace_t0 = dspark_trace ? now_sec() : 0.0;
         /* ---- ADMIT: fill free banks from the waiting queue.  At most MS
          * placements per pass (the outer loop re-enters immediately when
          * everything finished at seed, matching the old per-bank bound). ---- */
@@ -33674,6 +33769,15 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             beos[b] = req.eos >= 0 ? req.eos : dflt_eos;
             bmax[b] = mn;
             usr[b]  = req.user;
+            if (dspark_trace) {
+                ds4_dspark_trace_bank *tb = &dspark_tb[b];
+                memset(tb, 0, sizeof(*tb));
+                tb->step = xmalloc((size_t)mn * sizeof(*tb->step));
+                if (!tb->step) { ok = false; break; }
+                tb->pos0 = L;
+                tb->cap = mn;
+                tb->active = 1u;
+            }
         }
         if (!ok) break;
 
@@ -33797,6 +33901,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     if (hit_eos || glen[b] >= bmax[b] || aborted) {
                         on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                         free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
+                        if (dspark_trace)
+                            ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
+                                                   dspark_shadow_guard, dspark_shadow_alpha,
+                                                   dspark_shadow_minev, dspark_shadow_budget);
                     } else {
                         live[b] = 1u;
                         if (dspark_depth_cap) dspark_depth_cap[b] = Dspec;
@@ -33893,8 +34001,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             const double smp_t0 = g_cont_prof ? now_sec() : 0.0;
             const double ad_t0 = ad_active ? now_sec() : 0.0;   /* D4.5g window wall */
             uint32_t committed_rows[DS4_MULTISEQ_MAX_SEQ];
+            uint32_t trace_comp[DS4_MULTISEQ_MAX_SEQ];
             int      seedtok[DS4_MULTISEQ_MAX_SEQ];
             for (uint32_t b = 0; b < MS; b++) { committed_rows[b] = 0u; seedtok[b] = -1; }
+            if (dspark_trace) memset(trace_comp, 0, sizeof(trace_comp));
             /* 1. PACK verify rows. */
             uint32_t K2 = 0, vmaxpos = 0;
             const uint32_t Dstep = (dspark_mode && dspark_now && !dspark_verify_depth_forced &&
@@ -34037,6 +34147,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
                 for (uint32_t j = 0; !evicted && j < nd; j++) {
                     const int dft = dbuf[b * DS4_CONT_MTP_MAX_DEPTH + j];
+                    if (dspark_trace) trace_comp[b]++;
                     mtp_acc_drafts++;
                     if (dft != u) break;   /* draft mismatched the genuine token -> reject tail */
                     mtp_acc_hits++;
@@ -34085,6 +34196,18 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
             }
             if (dspark_prof && dspark_now) dspark_t_accept_s += now_sec() - accept_t0;
+            if (dspark_trace) {
+                const double step_ms = (now_sec() - dspark_trace_t0) * 1e3;
+                for (uint32_t b = 0; b < MS; b++) {
+                    if (committed_rows[b] == 0u) continue;
+                    ds4_dspark_trace_record(&dspark_tb[b], committed_rows[b], trace_comp[b],
+                                            vnr[b], n_live, dspark_now, step_ms);
+                    if (!live[b])
+                        ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
+                                               dspark_shadow_guard, dspark_shadow_alpha,
+                                               dspark_shadow_minev, dspark_shadow_budget);
+                }
+            }
             /* D4.5d/E6: FUSE + INJECT.  Build each verify row's drafter KV from the target
              * hidden captured this step (dspark_concat[0..K2)): main_x = main_norm(main_proj(
              * concat)), then wkv@main_x -> kv_a_norm -> rope -> store into each row's bank ring
@@ -34471,6 +34594,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
             }
         }
+        if (dspark_trace) {
+            const double step_ms = (now_sec() - dspark_trace_t0) * 1e3;
+            for (uint32_t r = 0; r < k; r++) {
+                const uint32_t b = rowbank[r];
+                ds4_dspark_trace_record(&dspark_tb[b], 1u, 0u, 0u, n_live, 0, step_ms);
+                if (!live[b])
+                    ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
+                                           dspark_shadow_guard, dspark_shadow_alpha,
+                                           dspark_shadow_minev, dspark_shadow_budget);
+            }
+        }
         if (g_cont_prof) t_sample_s += now_sec() - smp_t0;
         }
 
@@ -34509,6 +34643,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
 
     /* A2a: a failed run leaves bank GPU state mid-step -- nothing is reuse-trustworthy. */
     if (!ok) bank_hist_invalidate_all(ctx);
+
+    if (dspark_trace && dspark_tb) {
+        for (uint32_t b = 0; b < MS; b++)
+            ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
+                                   dspark_shadow_guard, dspark_shadow_alpha,
+                                   dspark_shadow_minev, dspark_shadow_budget);
+    }
 
     if (mtp_probe)
         fprintf(stderr, "ds4: CONT_MTP_PROBE drafts=%llu hits=%llu accept=%.1f%%\n",
@@ -34615,6 +34756,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     free(dspark_step_inj_pos); free(dspark_step_inj_sid); free(dspark_step_inj_src); free(dspark_depth_cap);
     free(dspark_kv_logged);
     free(ad_mode); free(ad_probe); free(ad_logn); free(ad_tok); free(ad_wall); free(ad_ms_cur);
+    free(dspark_tb);
     return ok ? 0 : 1;
 #undef CG_ERR
 }
