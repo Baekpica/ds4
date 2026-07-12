@@ -33232,7 +33232,8 @@ static void ds4_dspark_trace_record(ds4_dspark_trace_bank *tb,
 static void ds4_dspark_trace_flush(uint32_t bank, uint32_t D,
                                    ds4_dspark_trace_bank *tb,
                                    double guard, double alpha,
-                                   uint32_t minev, double budget) {
+                                   uint32_t minev, double budget,
+                                   double credit_cap) {
     if (!tb || !tb->active) return;
     const uint64_t nr = tb->n_steps < tb->cap ? tb->n_steps : tb->cap;
     double yewma = guard, debt = 0.0, post_sum = 0.0;
@@ -33244,7 +33245,7 @@ static void ds4_dspark_trace_flush(uint32_t bank, uint32_t D,
         if (quench_step >= 0) { post_sum += s->y; post_n++; }
         yewma = (1.0 - alpha) * yewma + alpha * (double)s->y;
         debt += guard - (double)s->y;
-        if (debt < 0.0) debt = 0.0;
+        if (debt < -credit_cap) debt = -credit_cap;
         spec_steps++;
         if (quench_step < 0 && spec_steps >= minev && yewma < guard && debt > budget)
             quench_step = (int64_t)spec_steps - 1;
@@ -33261,10 +33262,13 @@ static void ds4_dspark_trace_flush(uint32_t bank, uint32_t D,
                 (unsigned)s->live, (unsigned)s->spec, (double)s->ms);
     }
     fputc('\n', stderr);
+    char ccap[32];
+    if (credit_cap == HUGE_VAL) snprintf(ccap, sizeof(ccap), "inf");
+    else snprintf(ccap, sizeof(ccap), "%.1f", credit_cap);
     fprintf(stderr,
-            "ds4: DSPARK_SHADOW bank=%u guard=%.3f alpha=%.3f minev=%u budget=%.1f "
+            "ds4: DSPARK_SHADOW bank=%u guard=%.3f alpha=%.3f minev=%u budget=%.1f ccap=%s "
             "yewma=%.3f debt=%.3f quench_step=%lld post_quench_yield=%.3f\n",
-            bank, guard, alpha, minev, budget, yewma, debt,
+            bank, guard, alpha, minev, budget, ccap, yewma, debt,
             (long long)quench_step,
             quench_step >= 0 && post_n ? post_sum / (double)post_n : -1.0);
     free(tb->step);
@@ -33373,6 +33377,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     const int dspark_mode = (mtp_accept && ctx->e->dspark_ready &&
                              ctx->dsl.multi_raw[0] != NULL &&
                              getenv("DS4_CONT_DSPARK") != NULL) ? 1 : 0;
+    const int dspark_quench = dspark_mode && getenv("DS4_DSPARK_QUENCH") != NULL;
+    uint32_t dspark_quench_force_step = UINT32_MAX;
+    if (dspark_quench) {
+        const char *qe = getenv("DS4_DSPARK_QUENCH_FORCE_STEP");
+        if (qe && qe[0] && qe[0] != '-') {
+            char *end = NULL;
+            const unsigned long v = strtoul(qe, &end, 10);
+            if (end && end != qe && end[0] == '\0' && v <= UINT32_MAX)
+                dspark_quench_force_step = (uint32_t)v;
+        }
+    }
     const ds4_model          *dspark_model = &ctx->e->dspark_model;
     const ds4_dspark_weights *dw           = &ctx->e->dspark_weights;
     /* D4.5e concurrency auto-gate: spec-decode is a LOW-CONCURRENCY lever -- it wins
@@ -33421,7 +33436,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * gate, spec can RE-ENTER, so ring injection and the capture tap stay ON during
      * spec-off windows (a re-entry across ring holes collapses acceptance); the
      * static gate's injection skip only applies when this mode is off. */
-    const int dspark_adapt_gate = dspark_mode && getenv("DS4_DSPARK_ADAPT_GATE") != NULL;
+    int dspark_adapt_gate = dspark_mode && getenv("DS4_DSPARK_ADAPT_GATE") != NULL;
+    if (dspark_quench && dspark_adapt_gate) {
+        fprintf(stderr, "ds4: DS4_DSPARK_QUENCH supersedes DS4_DSPARK_ADAPT_GATE (mutually exclusive controllers)\n");
+        dspark_adapt_gate = 0;
+    }
     uint32_t dspark_adapt_start = dspark_max_kv;
     { const char *ae = getenv("DS4_DSPARK_ADAPT_START"); if (ae && ae[0]) { long v = atol(ae); if (v >= 0) dspark_adapt_start = (uint32_t)v; } }
     uint32_t dspark_adapt_win = 64u;   /* probe/first-estimate window, tokens */
@@ -33515,6 +33534,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     /* D4.5f: one-shot kv-gate crossing log per admitted request (reset at admit).
      * Under D4.5g it marks the adaptive controller's engagement log instead. */
     uint8_t  *dspark_kv_logged = dspark_mode ? xcalloc(MS, sizeof(uint8_t)) : NULL;
+    /* Phase 2: terminal per-request yield quench state. */
+    double   *qn_yewma     = dspark_quench ? xcalloc(MS, sizeof(double)) : NULL;
+    double   *qn_debt      = dspark_quench ? xcalloc(MS, sizeof(double)) : NULL;
+    uint32_t *qn_spec_steps = dspark_quench ? xcalloc(MS, sizeof(uint32_t)) : NULL;
+    uint8_t  *qn_quenched  = dspark_quench ? xcalloc(MS, sizeof(uint8_t)) : NULL;
     /* D4.5g adaptive-gate state (per bank; only the solo live bank is driven). */
     uint8_t  *ad_mode   = dspark_adapt_gate ? xcalloc(MS, sizeof(uint8_t)) : NULL;  /* 1=spec */
     uint8_t  *ad_probe  = dspark_adapt_gate ? xcalloc(MS, sizeof(uint8_t)) : NULL;  /* 1=probing !mode */
@@ -33527,6 +33551,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits && pf_inj_pos && pf_inj_sid &&
                          dspark_step_inj_pos && dspark_step_inj_sid && dspark_step_inj_src && dspark_depth_cap &&
                          dspark_kv_logged;
+    if (dspark_quench) ok = ok && qn_yewma && qn_debt && qn_spec_steps && qn_quenched;
     if (dspark_adapt_gate) ok = ok && ad_mode && ad_probe && ad_logn && ad_tok && ad_wall && ad_ms_cur;
     /* M4b Inc5: batched cross-bank MTP draft chain (one depth-major forward over all
      * live banks, ~D+1 device syncs/step) instead of the per-bank serial
@@ -33576,21 +33601,25 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint64_t dspark_prof_draft_rows = 0, dspark_prof_compact_saved = 0;
     uint64_t dspark_prof_auto_depth3_steps = 0, dspark_prof_adapt_saved_rows = 0;
     uint64_t dspark_prof_kv_gate_steps = 0, dspark_prof_kv_gate_saved_rows = 0;
+    uint64_t dspark_prof_quench_steps = 0, dspark_prof_quench_saved_rows = 0;
     uint64_t dspark_prof_ad_probes = 0, dspark_prof_ad_switches = 0, dspark_prof_ad_plain_steps = 0;
     ds4_dspark_trace_bank *dspark_tb = dspark_trace ? xcalloc(MS, sizeof(*dspark_tb)) : NULL;
-    double dspark_shadow_guard = 2.285;
+    double dspark_shadow_guard = 2.22;
     double dspark_shadow_alpha = 0.125;
-    uint32_t dspark_shadow_minev = 8u;
+    uint32_t dspark_shadow_minev = 4u;
     double dspark_shadow_budget = 4.0;
-    if (dspark_trace) {
+    double dspark_shadow_credit_cap = HUGE_VAL;
+    if (dspark_trace || dspark_quench) {
         const char *te;
         te = getenv("DS4_DSPARK_SHADOW_GUARD");  if (te && te[0]) dspark_shadow_guard = atof(te);
         te = getenv("DS4_DSPARK_SHADOW_ALPHA");  if (te && te[0]) dspark_shadow_alpha = atof(te);
         te = getenv("DS4_DSPARK_SHADOW_MINEV");
         if (te && te[0]) { const int v = atoi(te); if (v >= 0) dspark_shadow_minev = (uint32_t)v; }
         te = getenv("DS4_DSPARK_SHADOW_BUDGET"); if (te && te[0]) dspark_shadow_budget = atof(te);
-        ok = ok && dspark_tb;
+        te = getenv("DS4_DSPARK_SHADOW_CREDIT_CAP");
+        if (te && te[0]) { const double v = atof(te); if (v >= 0.0 && isfinite(v)) dspark_shadow_credit_cap = v; }
     }
+    if (dspark_trace) ok = ok && dspark_tb;
     while (ok) {
         const double dspark_trace_t0 = dspark_trace ? now_sec() : 0.0;
         /* ---- ADMIT: fill free banks from the waiting queue.  At most MS
@@ -33758,6 +33787,19 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
             }
             if (mtp_accept) ndr[b] = 0u;                /* S1.1: no drafts until first step */
+            if (dspark_quench) {                         /* fresh request -> fresh terminal controller */
+                qn_yewma[b] = dspark_shadow_guard;
+                qn_debt[b] = 0.0;
+                qn_spec_steps[b] = 0u;
+                qn_quenched[b] = 0u;
+                if (dspark_quench_force_step == 0u) {
+                    qn_quenched[b] = 1u;
+                    ndr[b] = 0u;
+                    fprintf(stderr,
+                            "ds4: cont-dspark yield-quench bank=%u pos=%u spec_steps=%u debt=%.2f yewma=%.2f -> spec off for this seq (terminal) (forced)\n",
+                            b, L, qn_spec_steps[b], qn_debt[b], qn_yewma[b]);
+                }
+            }
             /* W7: capture this seq's sampling params + RNG seed now; the seed
              * token is sampled at prefill completion (advance phase) from the
              * same stream the decode steps will continue. */
@@ -33904,7 +33946,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         if (dspark_trace)
                             ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
                                                    dspark_shadow_guard, dspark_shadow_alpha,
-                                                   dspark_shadow_minev, dspark_shadow_budget);
+                                                   dspark_shadow_minev, dspark_shadow_budget,
+                                                   dspark_shadow_credit_cap);
                     } else {
                         live[b] = 1u;
                         if (dspark_depth_cap) dspark_depth_cap[b] = Dspec;
@@ -33937,17 +33980,23 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
          * skipped.  Transitions are lossless; a high->low concurrency flip resumes spec
          * with a brief accept ramp where the block window spans positions decoded while
          * gated off (their KV was not injected -- same self-healing class as prefill). */
-        /* D4.5f: live banks still under the kv-depth threshold (spec-eligible).
-         * Zero -> every live bank is past DS4_DSPARK_MAX_KV; the whole step drops
-         * to plain batched decode through the same lossless path as the NLIVE gate
-         * (mixed steps are handled per-bank in the verify pack below). */
-        uint32_t dspark_kv_live = n_live;
-        if (dspark_mode && dspark_max_kv != 0u) {
-            dspark_kv_live = 0u;
-            for (uint32_t b = 0; b < MS; b++)
-                if (live[b] && posv[b] < dspark_max_kv) dspark_kv_live++;
+        /* D4.5f/P2: live banks still eligible under both terminal gates.  Zero ->
+         * every live bank is kv-gated or yield-quenched, so the whole step drops to
+         * the proven lossless plain path (mixed steps gate in the verify pack).  Keep
+         * this inert when only the adaptive controller zeroed max_kv: its rings must
+         * stay warm for speculative re-entry. */
+        uint32_t dspark_spec_live = n_live;
+        if (dspark_mode && (dspark_max_kv != 0u || dspark_quench)) {
+            dspark_spec_live = 0u;
+            for (uint32_t b = 0; b < MS; b++) {
+                if (!live[b]) continue;
+                if (dspark_max_kv != 0u && posv[b] >= dspark_max_kv) continue;
+                if (dspark_quench && qn_quenched[b]) continue;
+                dspark_spec_live++;
+            }
         }
-        const int dspark_all_kv_gated = dspark_mode && dspark_kv_live == 0u;
+        const int dspark_all_kv_gated = dspark_mode && dspark_spec_live == 0u &&
+                                        (dspark_max_kv != 0u || dspark_quench);
         const int dspark_now = dspark_mode && (dspark_max_nlive == 0u || n_live <= dspark_max_nlive) &&
                                !dspark_all_kv_gated;
         /* D4.5g: adaptive-gate effective mode for the solo live bank this step.
@@ -34002,9 +34051,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             const double ad_t0 = ad_active ? now_sec() : 0.0;   /* D4.5g window wall */
             uint32_t committed_rows[DS4_MULTISEQ_MAX_SEQ];
             uint32_t trace_comp[DS4_MULTISEQ_MAX_SEQ];
+            uint8_t  dspark_step_spec[DS4_MULTISEQ_MAX_SEQ];
             int      seedtok[DS4_MULTISEQ_MAX_SEQ];
             for (uint32_t b = 0; b < MS; b++) { committed_rows[b] = 0u; seedtok[b] = -1; }
             if (dspark_trace) memset(trace_comp, 0, sizeof(trace_comp));
+            if (dspark_trace || dspark_quench) memset(dspark_step_spec, 0, sizeof(dspark_step_spec));
             /* 1. PACK verify rows. */
             uint32_t K2 = 0, vmaxpos = 0;
             const uint32_t Dstep = (dspark_mode && dspark_now && !dspark_verify_depth_forced &&
@@ -34032,6 +34083,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         dspark_kv_logged[b] = 1u;
                     }
                     if (dspark_prof && nd > 0u) dspark_prof_kv_gate_saved_rows += (uint64_t)nd;
+                    nd = 0u;
+                }
+                /* Phase 2 terminal yield quench: use the same per-bank nd=0 path as
+                 * the static kv gate; no accept/commit/rollback token logic changes. */
+                if (dspark_quench && qn_quenched[b]) {
+                    if (dspark_prof && nd > 0u) dspark_prof_quench_saved_rows += (uint64_t)nd;
                     nd = 0u;
                 }
                 /* D4.5g adaptive gate: spec-off window (settled-plain or plain-probe)
@@ -34080,12 +34137,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             if (ok) {
                 g->batch_multiseq_emit = true;
                 g->batch_defer_comp_store = !no_defer;
-                /* D4.5e gate: when DSpark is concurrency-gated off every bank packs nd=0
-                 * (full accept of its single committed row), so no rollback is ever needed
-                 * this step -> skip the per-bank checkpoint capture (match base decode cost).
-                 * can_rollback stays true so no_defer holds (in-forward emit); the rollback
-                 * call below no-ops (M >= total for all banks). */
-                g->batch_rollback_capture = can_rollback && !(dspark_mode && !dspark_now) &&
+                /* Capture only when the packed step contains a draft row.  K2==n_live
+                 * means every bank packed nd=0, hence M==total==1 and restore_all skips
+                 * every bank; can_rollback remains true so in-forward emit stays lossless. */
+                g->batch_rollback_capture = can_rollback && K2 > n_live &&
+                                            !(dspark_mode && !dspark_now) &&
                                             !(ad_active && !ad_eff_spec);   /* D4.5g: nd=0 -> no rollback; match true plain cost */
                 /* D4.5d/E5: tap the target hidden after layers 40/41/42 inline in this
                  * forward (zero extra forward) -> dspark_concat[0..K2).  Accept-rate-only;
@@ -34120,7 +34176,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 dspark_prof_verify_rows += K2;
                 if (Dstep != Dspec) dspark_prof_auto_depth3_steps++;
             }
-            if (dspark_prof && dspark_all_kv_gated) dspark_prof_kv_gate_steps++;
+            if (dspark_prof && dspark_all_kv_gated) {
+                dspark_prof_kv_gate_steps++;
+                if (dspark_quench) dspark_prof_quench_steps++;
+            }
             /* 3. ACCEPT + emit + evict (greedy argmax). */
             const double accept_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
             for (uint32_t b = 0; b < MS; b++) {
@@ -34196,16 +34255,53 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
             }
             if (dspark_prof && dspark_now) dspark_t_accept_s += now_sec() - accept_t0;
+            if (dspark_trace || dspark_quench) {
+                for (uint32_t b = 0; b < MS; b++) {
+                    if (committed_rows[b] == 0u) continue;
+                    const uint32_t pack_pos = (uint32_t)vpos[vfirst[b]];
+                    const int spec_b = dspark_now &&
+                                       (dspark_max_kv == 0u || pack_pos < dspark_max_kv) &&
+                                       !(dspark_quench && qn_quenched[b]);
+                    dspark_step_spec[b] = spec_b ? 1u : 0u;
+                    if (!dspark_quench || !spec_b) continue;
+
+                    const double y = (double)committed_rows[b];
+                    qn_yewma[b] = (1.0 - dspark_shadow_alpha) * qn_yewma[b] +
+                                  dspark_shadow_alpha * y;
+                    qn_debt[b] += dspark_shadow_guard - y;
+                    if (qn_debt[b] < -dspark_shadow_credit_cap)
+                        qn_debt[b] = -dspark_shadow_credit_cap;
+                    qn_spec_steps[b]++;
+                    const int forced = dspark_quench_force_step != UINT32_MAX &&
+                                       qn_spec_steps[b] >= dspark_quench_force_step;
+                    const int policy_quench = dspark_quench_force_step == UINT32_MAX &&
+                                              qn_spec_steps[b] >= dspark_shadow_minev &&
+                                              qn_yewma[b] < dspark_shadow_guard &&
+                                              qn_debt[b] > dspark_shadow_budget;
+                    if (forced || policy_quench) {
+                        qn_quenched[b] = 1u;
+                        ndr[b] = 0u;
+                        fprintf(stderr,
+                                "ds4: cont-dspark yield-quench bank=%u pos=%u spec_steps=%u debt=%.2f yewma=%.2f -> spec off for this seq (terminal)%s\n",
+                                b, posv[b], qn_spec_steps[b], qn_debt[b], qn_yewma[b],
+                                forced ? " (forced)" : "");
+                    }
+                }
+            }
             if (dspark_trace) {
                 const double step_ms = (now_sec() - dspark_trace_t0) * 1e3;
                 for (uint32_t b = 0; b < MS; b++) {
                     if (committed_rows[b] == 0u) continue;
+                    /* Controller update precedes record, but spec_b was captured from
+                     * the packed state: the triggering step paid spec cost and remains
+                     * spec=1; only subsequent terminal-plain steps record spec=0. */
                     ds4_dspark_trace_record(&dspark_tb[b], committed_rows[b], trace_comp[b],
-                                            vnr[b], n_live, dspark_now, step_ms);
+                                            vnr[b], n_live, dspark_step_spec[b], step_ms);
                     if (!live[b])
                         ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
                                                dspark_shadow_guard, dspark_shadow_alpha,
-                                               dspark_shadow_minev, dspark_shadow_budget);
+                                               dspark_shadow_minev, dspark_shadow_budget,
+                                               dspark_shadow_credit_cap);
                 }
             }
             /* D4.5d/E6: FUSE + INJECT.  Build each verify row's drafter KV from the target
@@ -34393,6 +34489,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         if (!live[b] || cfirst[b] == UINT32_MAX) continue;
                         /* D4.5f: kv-gated bank -> no drafts (its verify packs nd=0 anyway). */
                         if (dspark_max_kv != 0u && posv[b] >= dspark_max_kv) continue;
+                        /* Phase 2: terminally quenched bank follows the same no-draft path. */
+                        if (dspark_quench && qn_quenched[b]) continue;
                         /* D4.5g: spec-off window -> no drafts this step (re-entry pays a
                          * 1-step ramp: the first spec step packs 0 drafts and re-seeds). */
                         if (ad_active && b == ad_b && !ad_eff_spec) continue;
@@ -34602,7 +34700,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 if (!live[b])
                     ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
                                            dspark_shadow_guard, dspark_shadow_alpha,
-                                           dspark_shadow_minev, dspark_shadow_budget);
+                                           dspark_shadow_minev, dspark_shadow_budget,
+                                           dspark_shadow_credit_cap);
             }
         }
         if (g_cont_prof) t_sample_s += now_sec() - smp_t0;
@@ -34648,7 +34747,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         for (uint32_t b = 0; b < MS; b++)
             ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
                                    dspark_shadow_guard, dspark_shadow_alpha,
-                                   dspark_shadow_minev, dspark_shadow_budget);
+                                   dspark_shadow_minev, dspark_shadow_budget,
+                                   dspark_shadow_credit_cap);
     }
 
     if (mtp_probe)
@@ -34670,7 +34770,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         fprintf(stderr,
                 "ds4: DSPARK_PROFILE compact_inject=%d steps=%llu verify_rows=%llu inject_rows=%llu "
                 "draft_rows=%llu compact_saved=%llu auto_d3_steps=%llu adapt_saved=%llu "
-                "kv_gate_steps=%llu kv_gate_saved=%llu ad_probes=%llu ad_switches=%llu ad_plain_steps=%llu "
+                "kv_gate_steps=%llu kv_gate_saved=%llu quench_steps=%llu quench_saved=%llu "
+                "ad_probes=%llu ad_switches=%llu ad_plain_steps=%llu "
                 "avg_verify_rows=%.2f avg_inject_rows=%.2f | "
                 "per-step ms: verify=%.3f accept=%.3f inj_pack=%.3f inj_proj=%.3f inj_store=%.3f "
                 "rollback=%.3f commit=%.3f block=%.3f markov=%.3f\n",
@@ -34684,6 +34785,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 (unsigned long long)dspark_prof_adapt_saved_rows,
                 (unsigned long long)dspark_prof_kv_gate_steps,
                 (unsigned long long)dspark_prof_kv_gate_saved_rows,
+                (unsigned long long)dspark_prof_quench_steps,
+                (unsigned long long)dspark_prof_quench_saved_rows,
                 (unsigned long long)dspark_prof_ad_probes,
                 (unsigned long long)dspark_prof_ad_switches,
                 (unsigned long long)dspark_prof_ad_plain_steps,
@@ -34755,6 +34858,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     free(pf_inj_pos); free(pf_inj_sid);
     free(dspark_step_inj_pos); free(dspark_step_inj_sid); free(dspark_step_inj_src); free(dspark_depth_cap);
     free(dspark_kv_logged);
+    free(qn_yewma); free(qn_debt); free(qn_spec_steps); free(qn_quenched);
     free(ad_mode); free(ad_probe); free(ad_logn); free(ad_tok); free(ad_wall); free(ad_ms_cur);
     free(dspark_tb);
     return ok ? 0 : 1;

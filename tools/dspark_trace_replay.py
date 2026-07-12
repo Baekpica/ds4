@@ -76,6 +76,7 @@ SHADOW_RE = re.compile(
     rf"ds4:\s+DSPARK_SHADOW\s+bank=(?P<bank>\d+)\s+"
     rf"guard=(?P<guard>{_FLOAT})\s+alpha=(?P<alpha>{_FLOAT})\s+"
     rf"minev=(?P<minev>\d+)\s+budget=(?P<budget>{_FLOAT})\s+"
+    rf"(?:ccap=(?P<ccap>inf|{_FLOAT})\s+)?"
     rf"yewma=(?P<yewma>{_FLOAT})\s+debt=(?P<debt>{_FLOAT})\s+"
     rf"quench_step=(?P<quench_step>-?\d+)\s+"
     rf"post_quench_yield=(?P<post_quench_yield>{_FLOAT})\s*$"
@@ -281,11 +282,21 @@ def parse_lines(source: str, lines: Iterable[str]) -> ParsedLog:
                 issues.append(ParseIssue(source, line_number, "malformed DSPARK_SHADOW line"))
                 continue
             try:
+                # ccap absent (pre-Phase-2 logs) = the engine's original
+                # zero-clamp; "inf" = pure cumulative regret (no debt floor).
+                ccap_text = match.group("ccap")
+                if ccap_text is None:
+                    credit_cap = 0.0
+                elif ccap_text == "inf":
+                    credit_cap = math.inf
+                else:
+                    credit_cap = _finite_float(ccap_text, "ccap")
                 params = PolicyParams(
                     guard=_finite_float(match.group("guard"), "guard"),
                     alpha=_finite_float(match.group("alpha"), "alpha"),
                     minev=int(match.group("minev")),
                     budget=_finite_float(match.group("budget"), "budget"),
+                    credit_cap=credit_cap,
                 )
                 shadow = ShadowRecord(
                     source=source,
