@@ -54,14 +54,19 @@ L2-reuse-aware expert-major CTA schedule. Decode gets the same treatment:
 per-layer CUDA-graph capture of the batched decode step brings plain width-1
 continuous decode to 48.9 ms/tok, and the DSpark lossless speculative decoder
 runs at 3.02 tokens per verify step (74.6% draft acceptance, zero fallbacks).
+A terminal yield-quench controller (default on) turns speculation off for the
+rest of any request whose realized acceptance cannot pay for its verify cost,
+bounding the worst case at ~0.96x plain decode on adversarial prose — where
+always-on speculation used to bottom out at 0.72x — while keeping the 1.2-1.7x
+wins on structured content.
 
 **A weight server.** One resident process uploads the model once (VMM-backed,
 direct-I/O) and brokers it to any number of engine processes over IPC — server
 restarts and A/B runs stop paying the multi-minute reload. It also builds the
 aligned SoA repack artifacts the D2R and decode kernels read in place
 (parallel builders, ~21 s boot tax), serves the MTP head and the speculative
-drafter (shipped at Q4K; a Q2K variant saves 4.2 GiB and is required for
-~1M-token KV), and rejects stale-manifest imports.
+drafter (shipped at Q2K — equal throughput and acceptance to Q4K, 4.2 GiB
+smaller, and required for ~1M-token KV), and rejects stale-manifest imports.
 
 **Long context, verified.** 128k-token contexts are served correctly:
 needle-in-haystack 70/70 across the 8k–128k tiers at the release commit, with

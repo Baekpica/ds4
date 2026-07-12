@@ -7,6 +7,33 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **DSpark terminal yield quench** (`DS4_DSPARK_QUENCH`, default ON; `=0` to
+  disable): per-request cumulative-regret controller — every verify step,
+  `debt += guard − tokens_committed` (guard 2.22 ≈ the measured 2.17
+  plain-step cost of one spec step); once debt exceeds a 4-plain-step budget
+  with the yield EWMA below guard, speculation turns off for the REST OF THAT
+  REQUEST (terminal, reset at admit), riding the kv-gate's lossless per-bank
+  nd=0 path. Calibrated offline on 60 traced requests; the naive zero-clamped
+  debt variant was measured to false-quench long bursty winners and rejected.
+  Gates: forced-quench identity 1.000× vs plain; gsm8k 117/120, mbpp 37/40
+  through the full serving path; W&P frontier floor 0.72× → 0.96× vs plain with
+  shallow wins (1.2–1.7× structured) intact; suite holds 0.99 of always-spec.
+  Tunables `DS4_DSPARK_SHADOW_{GUARD,ALPHA,MINEV,BUDGET,CREDIT_CAP}`;
+  `DS4_DSPARK_QUENCH_FORCE_STEP` for identity testing. Supersedes
+  `DS4_DSPARK_ADAPT_GATE` when both are set.
+- **DSpark per-step trace + offline policy replayer**
+  (`DS4_DSPARK_TRACE=1` + `tools/dspark_trace_replay.py`): per-request
+  per-step yield/comparisons/drafts/latency telemetry, validated to reproduce
+  `CONT_MTP_ACCEPT` aggregates exactly; the replayer calibrates quench
+  parameters against recorded traces (`validate` / `replay --grid` /
+  `inspect` / `selftest`).
+- **Q2K drafter is the ship default** (was Q4K): equal throughput and
+  acceptance in A/B (accept ±3pp, mean within noise), 6.49 vs 10.71 GiB in the
+  weight server — the freed 4.2 GiB removes the deep-context boot knife-edge —
+  and required for ~1M-token KV.
+- Rollback checkpoint capture now derives from actually-packed draft rows
+  (skipped when a step packs no drafts, e.g. every request's first MTP step);
+  the restore pass provably no-ops there, so no-draft steps match plain cost.
 - **DSpark kv-depth auto-gate** (`DS4_DSPARK_MAX_KV`, default 65536, 0 = off):
   speculative decoding is auto-disabled per sequence once its kv frontier crosses
   the threshold — acceptance decays with depth while the multi-row verify forward's

@@ -402,6 +402,32 @@ The bandwidth figure is informational; we don't tier on it.
   Logs `adapt-gate ENGAGED` once per request and each mode switch (first 8);
   `DSPARK_PROFILE` reports `ad_probes`/`ad_switches`/`ad_plain_steps`.
 
+- `DS4_DSPARK_QUENCH` (default ON; `=0` disables). Terminal per-request yield
+  quench: each verify step accumulates cumulative regret
+  `debt += guard − tokens_committed` per bank (no clamp — surplus from good
+  steps banks credit); once `spec_steps ≥ minev`, `yield_EWMA < guard`, and
+  `debt > budget`, speculation turns off for the rest of that request via the
+  kv-gate's lossless per-bank nd=0 path (reset at admit). Bounds low-accept
+  requests at ~0.96× plain (always-spec floor was 0.72× on deep prose) while
+  leaving winners untouched. Calibrated defaults guard 2.22 / alpha 0.125 /
+  minev 4 / budget 4.0 / credit cap ∞, overridable via
+  `DS4_DSPARK_SHADOW_{GUARD,ALPHA,MINEV,BUDGET,CREDIT_CAP}` (shared with the
+  trace shadow). Supersedes `DS4_DSPARK_ADAPT_GATE` when both are set. Logs
+  `yield-quench bank=... -> spec off for this seq (terminal)`; `DSPARK_PROFILE`
+  reports `quench_steps`/`quench_saved`.
+
+- `DS4_DSPARK_QUENCH_FORCE_STEP=N` (testing). With quench on, force-quench
+  every bank at its Nth spec step regardless of yield (0 = at admit — the
+  whole request runs the terminal-plain path; used for the plain-identity
+  gate). Disables the policy trigger.
+
+- `DS4_DSPARK_TRACE=1` (default off). Per-request per-step telemetry:
+  `DSPARK_TRACE` (yield/comparisons/packed-drafts/n_live/spec/step-ms records)
+  and `DSPARK_SHADOW` (the quench arithmetic replayed over the request).
+  Feeds `tools/dspark_trace_replay.py` (`validate` proves trace totals equal
+  `CONT_MTP_ACCEPT` exactly; `replay --grid` calibrates quench parameters
+  offline; `inspect`; `selftest`).
+
 - `DS4_DSPARK_PROFILE=1` (default off). Print aggregate DSpark continuous
   decode timings split into verifier forward, accept loop, inject pack,
   inject projection, inject store, rollback, deferred commit, block draft,

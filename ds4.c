@@ -33377,7 +33377,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     const int dspark_mode = (mtp_accept && ctx->e->dspark_ready &&
                              ctx->dsl.multi_raw[0] != NULL &&
                              getenv("DS4_CONT_DSPARK") != NULL) ? 1 : 0;
-    const int dspark_quench = dspark_mode && getenv("DS4_DSPARK_QUENCH") != NULL;
+    /* Phase 3 promotion: terminal yield quench defaults ON (gates: forced-quench
+     * identity 1.000 vs plain, gsm8k/mbpp in band, W&P floor 0.72->0.96 with wins
+     * held).  DS4_DSPARK_QUENCH=0 restores always-spec below the kv gate. */
+    const char *dspark_quench_env = getenv("DS4_DSPARK_QUENCH");
+    const int dspark_quench = dspark_mode &&
+        !(dspark_quench_env && dspark_quench_env[0] == '0' && dspark_quench_env[1] == '\0');
     uint32_t dspark_quench_force_step = UINT32_MAX;
     if (dspark_quench) {
         const char *qe = getenv("DS4_DSPARK_QUENCH_FORCE_STEP");
