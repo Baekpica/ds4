@@ -5,7 +5,13 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
-## Unreleased
+## v0.1.1 — 2026-07-13
+
+Decode is now net-positive by default across content and depth: the terminal
+yield quench floors low-acceptance requests at ~0.96× plain while the kv-depth
+gate handles >64k, so served decode ≈ max(speculative, plain) everywhere.
+Frontier chart: `speed-bench/v011_decode_overlay.svg` (W&P prose floor line +
+C-source favorable line, both at the ship config).
 
 - **DSpark terminal yield quench** (`DS4_DSPARK_QUENCH`, default ON; `=0` to
   disable): per-request cumulative-regret controller — every verify step,
