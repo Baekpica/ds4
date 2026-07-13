@@ -264,6 +264,18 @@ typedef struct {
     float      min_p;       /* relative floor; <0 => 0                         */
     uint64_t   seed;        /* per-seq RNG seed (caller resolves 0 if it wants */
                             /* distinct streams; 0 is a fixed, valid sequence) */
+    /* Per-token sampling override (NULL = none).  When set, the engine calls
+     * this immediately before sampling EACH of the row's tokens (seed token
+     * and every decode/accept step); a nonzero return forces that one token
+     * to greedy argmax (temperature 0) while the rest of the sampling block
+     * still applies to non-overridden tokens.  This is how a caller samples
+     * structural tool-call syntax deterministically while payload keeps the
+     * request's own params (the serial path's per-token DSML override).
+     * Argmax consumes NO RNG draw, and the caller's decision may depend only
+     * on tokens already reported via on_token -- so seeded streams stay
+     * aligned between the plain and speculative decode paths.  `ud`/`user`
+     * are the same handles on_token receives. */
+    int      (*sample_override)(void *ud, void *user);
     /* A2a warm start.  Zero-init = engine-managed cold admit (the W5..W7
      * behavior, unchanged).  place_bank is a bank id + 1 placement directive
      * (0 = engine picks the first free bank); it lets the caller route a

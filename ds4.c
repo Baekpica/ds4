@@ -33348,6 +33348,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     float    *btopp = xcalloc(MS, sizeof(float));
     float    *bminp = xcalloc(MS, sizeof(float));
     uint64_t *brng  = xcalloc(MS, sizeof(uint64_t));
+    /* Per-token sampling override (ds4_cont_request.sample_override): queried
+     * right before EVERY target sample of the row; nonzero => that one token
+     * is greedy argmax (no RNG draw).  NULL entries sample with the params
+     * above unconditionally. */
+    int     (**bsoc)(void *, void *) = xcalloc(MS, sizeof(*bsoc));
     float    *logits  = xmalloc((size_t)MS * DS4_N_VOCAB * sizeof(float));
     float    *seedlog = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     /* R4 (overlap-lite): per-bank pending admission prefill.  A bank mid-prefill
@@ -33837,6 +33842,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             btopp[b] = req.top_p;
             bminp[b] = req.min_p;
             brng[b]  = req.seed;
+            bsoc[b]  = req.sample_override;
             beos[b] = req.eos >= 0 ? req.eos : dflt_eos;
             bmax[b] = mn;
             usr[b]  = req.user;
@@ -33957,7 +33963,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     pfq_h = (pfq_h + 1u) % MS;
                     pfq_n--;
                     const int nt = sample_top_p_min_p(seedlog, DS4_N_VOCAB,
-                                                      btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
+                                                      (bsoc[b] && bsoc[b](ud, usr[b])) ? 0.0f : btemp[b],
+                                                      btopk[b], btopp[b], bminp[b], &brng[b]);
                     gbuf[b] = xmalloc((size_t)bmax[b] * sizeof(int));
                     if (!gbuf[b]) { ok = false; break; }
                     gbuf[b][0] = nt;
@@ -34068,14 +34075,18 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             /* ===== S1.1 speculative verify + ACCEPT step (pipelined, depth Dspec) =====
              * Per live bank, pack [cur, dbuf0..dbuf_{ndr-1}] = (1+ndr) rows at consecutive
              * positions into ONE verify forward with the compressor STORE DEFERRED.  Row j's
-             * base argmax is the genuine next token iff every earlier draft matched its row's
-             * argmax (the row's input token == the committed token), so we accept the longest
-             * such prefix: u0 (row 0) is always genuine; each accepted draft yields one more
-             * real token + extends the chain.  Then commit ONLY the accepted rows' compressor
-             * state via a re-forward over committed rows (Reframe 3 deferred-commit; S1.2 will
-             * replace the re-forward with an input replay for the actual speed-up).  Finally
-             * draft the next chain off each live bank's last committed row.  Greedy/argmax --
-             * mode 2 is gate-only in v1 (production enablement + temp>0 accept come later). */
+             * base sample is the genuine next token iff every earlier draft matched its row's
+             * committed token (the row's input token == the committed token), so we accept the
+             * longest such prefix: u0 (row 0) is always genuine; each accepted draft yields one
+             * more real token + extends the chain.  Then commit ONLY the accepted rows'
+             * compressor state via a re-forward over committed rows (Reframe 3 deferred-commit;
+             * S1.2 will replace the re-forward with an input replay for the actual speed-up).
+             * Finally draft the next chain off each live bank's last committed row.
+             * Acceptance is TARGET-SAMPLED exact-match: the genuine token is drawn with the
+             * bank's own sampler+RNG (any temperature) and a draft is accepted iff equal --
+             * lossless by construction, no rejection sampling needed.  Per-token
+             * sample_override (spec+tools DSML) composes transparently: it only changes how
+             * the genuine token is drawn. */
             const double smp_t0 = g_cont_prof ? now_sec() : 0.0;
             const double ad_t0 = ad_active ? now_sec() : 0.0;   /* D4.5g window wall */
             uint32_t committed_rows[DS4_MULTISEQ_MAX_SEQ];
@@ -34209,7 +34220,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 dspark_prof_kv_gate_steps++;
                 if (dspark_quench) dspark_prof_quench_steps++;
             }
-            /* 3. ACCEPT + emit + evict (greedy argmax). */
+            /* 3. ACCEPT + emit + evict.  Accepted-stream sampling is the bank's
+             * OWN sampler at every temperature (target-sampled exact-match keeps
+             * spec lossless); per-token sample_override forces structural DSML
+             * syntax to argmax exactly like the plain and serial paths. */
             const double accept_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
             for (uint32_t b = 0; b < MS; b++) {
                 if (!live[b]) continue;
@@ -34218,7 +34232,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 /* sample with the SAME function + per-bank params as the plain path so the
                  * accepted stream matches mode-0 tie-break-for-tie-break (greedy at temp 0). */
                 int u = sample_top_p_min_p(vlogits + (uint64_t)f * DS4_N_VOCAB, DS4_N_VOCAB,
-                                           btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
+                                           (bsoc[b] && bsoc[b](ud, usr[b])) ? 0.0f : btemp[b],
+                                           btopk[b], btopp[b], bminp[b], &brng[b]);
                 uint32_t M = 1u;
                 bool evicted = false;
                 /* u0 = genuine token after row f's input (cur) -- always committed. */
@@ -34239,9 +34254,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     mtp_acc_drafts++;
                     if (dft != u) break;   /* draft mismatched the genuine token -> reject tail */
                     mtp_acc_hits++;
-                    /* draft j accepted: its row (input == committed token) yields the next real token. */
+                    /* draft j accepted: its row (input == committed token) yields the next real token.
+                     * sample_override sees a scanner already advanced through the just-committed
+                     * u (on_token above ran synchronously), so its verdict is position-exact. */
                     u = sample_top_p_min_p(vlogits + (uint64_t)(f + j + 1u) * DS4_N_VOCAB, DS4_N_VOCAB,
-                                           btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
+                                           (bsoc[b] && bsoc[b](ud, usr[b])) ? 0.0f : btemp[b],
+                                           btopk[b], btopp[b], bminp[b], &brng[b]);
                     M++;
                     seedtok[b] = vqtok[f + j + 1u];
                     gbuf[b][glen[b]++] = u; cur[b] = u; posv[b]++; mtp_acc_emit++;
@@ -34706,7 +34724,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         for (uint32_t r = 0; r < k; r++) {
             const uint32_t b = rowbank[r];
             const int nt = sample_top_p_min_p(logits + (uint64_t)r * DS4_N_VOCAB, DS4_N_VOCAB,
-                                              btemp[b], btopk[b], btopp[b], bminp[b], &brng[b]);
+                                              (bsoc[b] && bsoc[b](ud, usr[b])) ? 0.0f : btemp[b],
+                                              btopk[b], btopp[b], bminp[b], &brng[b]);
             sampled[r] = nt;            /* S1.0b: probe compares draft0 against this */
             bank_hist_append(ctx, b, qtokens[r]);   /* A2a: the forwarded token is now committed */
             gbuf[b][glen[b]] = nt;
@@ -34876,7 +34895,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (gbuf) for (uint32_t b = 0; b < MS; b++) free(gbuf[b]);
     if (pftok) for (uint32_t b = 0; b < MS; b++) free(pftok[b]);
     free(live); free(usr); free(posv); free(cur); free(beos); free(bmax); free(glen); free(gbuf);
-    free(btemp); free(btopk); free(btopp); free(bminp); free(brng);
+    free(btemp); free(btopk); free(btopp); free(bminp); free(brng); free(bsoc);
     free(pftok); free(pflen); free(pfoff); free(pfbase); free(pft0);
     free(logits); free(seedlog);
     free(dbuf); free(ndr); free(vqtok); free(vpos); free(vsid); free(vfirst); free(vnr); free(vlogits);
@@ -34925,6 +34944,22 @@ static int ds4_mtp_gate_admit(void *ud, ds4_cont_request *req) {
     req->max_new = (int)gu->T;
     req->eos = -1;            /* no EOS -> decode the full budget deterministically */
     req->temperature = 0.0f;  /* greedy */
+    /* Spec+tools: DS4_CONT_MTP_GATE_TEMP > 0 runs every gate leg SEEDED at that
+     * temperature (full vocab, per-seq deterministic seed).  Read here (not in
+     * the driver) so the forced-draft losslessness runs inherit it too -- at
+     * temp > 0 their stream-invariance check (smis == 0) becomes the RNG
+     * alignment proof: two runs differing only in REJECTED draft values must
+     * consume identical per-committed-token RNG streams, or they diverge
+     * structurally, not by FP. */
+    const char *gt = getenv("DS4_CONT_MTP_GATE_TEMP");
+    const float gtemp = gt ? (float)atof(gt) : 0.0f;
+    if (gtemp > 0.0f) {
+        req->temperature = gtemp;
+        req->top_k = 0;         /* full vocab */
+        req->top_p = 1.0f;
+        req->min_p = 0.0f;
+        req->seed  = 1234567u + 2654435761u * (uint64_t)s;
+    }
     req->user = (void *)(uintptr_t)s;
     return 1;
 }
@@ -35101,6 +35136,11 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
         uint32_t mism = GATE_CMP("probe A-vs-C", out0, ol0, out1, ol1); /* probe */
         /* PASS iff the probe adds NO divergence beyond inherent nondeterminism. */
         rc = (mism <= ctrl) ? 0 : 1;
+        {
+            const char *gt = getenv("DS4_CONT_MTP_GATE_TEMP");
+            if (gt && atof(gt) > 0.0)
+                fprintf(stderr, "ds4: CONT_MTP_GATE seeded temp=%.2f (full vocab, per-seq seeds)\n", atof(gt));
+        }
         fprintf(stderr, "ds4: CONT_MTP_GATE N=%u T=%u ctrl(A!=B)=%u/%u probe(A!=C)=%u/%u -> %s%s\n",
                 N, T, ctrl, N, mism, N,
                 rc == 0 ? "PASS" : "FAIL",

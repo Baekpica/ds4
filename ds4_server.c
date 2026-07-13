@@ -745,9 +745,9 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
 }
 
 /* DS4_SERVER_DEFAULT_TEMP overrides the temperature a request gets when it
- * does not send one.  Agent frameworks routinely omit temperature; the 1.0
- * default then keeps their tool-calling requests off the batched/DSpark path,
- * which admits tools greedy-only (see job_is_batchable). */
+ * does not send one (agent frameworks routinely omit temperature).  Since
+ * spec+tools, tools are batchable at any temperature (job_is_batchable), so
+ * this is now a sampling-policy knob rather than a routing lever. */
 static float server_default_temperature(void) {
     const char *e = getenv("DS4_SERVER_DEFAULT_TEMP");
     return (e && *e) ? (float)atof(e) : DS4_DEFAULT_TEMPERATURE;
@@ -11261,11 +11261,12 @@ static job *dequeue(server *s) {
  * ids into the same OpenAI SSE machine the single path uses.
  * A1: STOP STRINGS and TOOL CALLS are batchable too -- the continuous path
  * scans both host-side per row (cont_on_token mirrors generate_job's per-token
- * scan) and finalizes with the same parse/response helpers.  Tools stay
- * greedy-only: generate_job's per-token DSML sampling override (structural
- * syntax at temp 0, payload at request temp) needs in-flight sampler swaps the
- * engine's fixed per-seq params can't express, and think-mode forces
- * stochastic sampling -- both keep falling back to the single path. */
+ * scan) and finalizes with the same parse/response helpers.
+ * Spec+tools (v0.2): tools ride the continuous path at ANY temperature and
+ * with thinking -- generate_job's per-token DSML sampling override is wired
+ * through ds4_cont_request.sample_override (cont_sample_override forces
+ * structural syntax to argmax; payload/reasoning keep the per-seq params the
+ * think-mode block below already mirrors). */
 static bool job_is_batchable(const request *r) {
     if (r->api != API_OPENAI) return false;
     if (r->kind != REQ_CHAT && r->kind != REQ_COMPLETION) return false;
@@ -11278,11 +11279,7 @@ static bool job_is_batchable(const request *r) {
      * a bank-starved big-ctx boot the serial session's lazy graph alloc can
      * exceed the box (see metal_graph_session_fit_ok). */
     if (r->return_token_ids && !(r->stream && r->kind == REQ_CHAT)) return false;
-    if (r->has_tools) {
-        if (r->kind != REQ_CHAT) return false;
-        if (r->temperature > 0.0f) return false;
-        if (ds4_think_mode_enabled(r->think_mode)) return false;
-    }
+    if (r->has_tools && r->kind != REQ_CHAT) return false;
     return true;
 }
 
@@ -11762,6 +11759,8 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
 }
 
 /* admit: hand the engine the next waiting request, or 0 to stop admitting now. */
+static int cont_sample_override(void *ud, void *user);
+
 static int cont_admit(void *ud, ds4_cont_request *req) {
     cont_sched *cs = ud;
     server *s = cs->s;
@@ -11812,10 +11811,8 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
      * W7-followup: when thinking is enabled, generate_job OVERRIDES the sampling
      * params (reasoning is sampled stochastically regardless of the requested
      * temperature) -- mirror that EXACTLY so a batched thinking request matches the
-     * single path.  (Tool-call per-token temp override is N/A: job_is_batchable
-     * admits tools only at temperature<=0, where the override is a no-op.)
-     * Otherwise pass the request's own params through (temperature<=0 =>
-     * the engine samples greedy argmax, matching the W5/W6 path). */
+     * single path.  Otherwise pass the request's own params through
+     * (temperature<=0 => the engine samples greedy argmax, matching W5/W6). */
     if (ds4_think_mode_enabled(j->req.think_mode)) {
         req->temperature = DS4_DEFAULT_TEMPERATURE;
         req->top_k       = 0;
@@ -11828,6 +11825,13 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
         req->min_p       = j->req.min_p;
     }
     req->seed        = resolve_job_seed(s, j);
+    /* Spec+tools: tools rows get generate_job's per-token DSML sampling
+     * override on the continuous path too -- the engine consults it before
+     * every target sample (plain AND speculative accept), so structural
+     * tool-call syntax is argmax'd at any request temperature while payload
+     * and reasoning keep the seq params above. */
+    req->sample_override = (j->req.kind == REQ_CHAT && j->req.has_tools) ?
+        cont_sample_override : NULL;
     return 1;
 }
 
@@ -11837,9 +11841,9 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
  * delta on that job's socket immediately, so a short request streams while long
  * ones keep decoding.  Writes happen on the worker thread under gen_mu, so a
  * stalled/closed client must not wedge the batch: a failed send marks the row
- * and returns 0, telling the engine to evict that sequence.  Greedy + non-thinking
- * + non-tool only (job_is_batchable), so this is the simple content-only stream --
- * no reasoning/content split, no tool deltas, no token_ids. */
+ * and returns 0, telling the engine to evict that sequence.  The shared OpenAI
+ * SSE machine handles the full projection -- reasoning/content split, tool
+ * deltas, token_ids -- so thinking and tools rows stream here too. */
 struct cont_stream {
     char   id[96];        /* minted chatcmpl-/cmpl-<seq> */
     buf    text;          /* cumulative detok'd output (the openai_stream "raw" buffer) */
@@ -11865,6 +11869,17 @@ struct cont_stream {
     bool   saw_orphan_tool_end;
     const char *finish_override; /* "stop"/"tool_calls": scan verdict; beats the
                                   * engine's eos/budget finish at finalize */
+    /* Spec+tools: the cont-path port of generate_job's per-token DSML sampling
+     * override.  The tracker follows the row's cumulative text exactly like the
+     * serial loop's dsml_tracker; cont_sample_override (registered per admit as
+     * ds4_cont_request.sample_override) reads its decode state to force
+     * structural syntax to argmax while payload keeps the seq params.
+     * `thinking` gates the tool-MARKER scan only (a DSML block inside <think>
+     * is not executable), mirroring tool_scan_waiting_for_think_close -- the
+     * sampler override itself is NOT think-gated, same as the serial path. */
+    dsml_decode_tracker dsml_tracker;
+    thinking_state      thinking;
+    bool tool_scan_waiting_for_think_close;
 };
 
 /* A1: does this row need host-side text (stream projection or stop/tool scan)? */
@@ -11878,8 +11893,30 @@ static cont_stream *cont_stream_ensure(job *j) {
     if (!j->cstream) {
         j->cstream = xmalloc(sizeof(*j->cstream));
         memset(j->cstream, 0, sizeof(*j->cstream));
+        dsml_decode_tracker_init(&j->cstream->dsml_tracker);
+        j->cstream->thinking = thinking_state_from_prompt(&j->req);
+        j->cstream->tool_scan_waiting_for_think_close =
+            ds4_think_mode_enabled(j->req.think_mode) && j->cstream->thinking.inside;
     }
     return j->cstream;
+}
+
+/* Spec+tools: ds4_cont_request.sample_override for tools rows (cont_admit
+ * registers it only when kind==REQ_CHAT && has_tools).  The engine consults it
+ * immediately before EVERY target sample of the row -- seed token, plain
+ * decode step, and both speculative accept-loop sites -- and a nonzero return
+ * forces that one token to greedy argmax.  The decision mirrors generate_job's
+ * per-token DSML override bit-for-bit: structural tool-call syntax -> argmax,
+ * payload string/JSON-string bodies (and everything outside a tool block) ->
+ * the seq params.  Before the first sampled token no cstream exists; that is
+ * the serial loop's freshly-init'd tracker (OUTSIDE) -> no override. */
+static int cont_sample_override(void *ud, void *user) {
+    (void)ud;
+    job *j = user;
+    if (!j->cstream) return 0;
+    const dsml_decode_state state = j->cstream->dsml_tracker.decode;
+    return dsml_decode_state_is_tool(state) &&
+           !dsml_decode_state_uses_payload_sampling(state);
 }
 
 /* Free the per-seq state without touching the socket (non-streaming rows, and
@@ -12055,8 +12092,18 @@ static int cont_on_token(void *ud, void *user, int token) {
     if (st->failed || j->client_gone) { t_emit_job = NULL; return 0; }
     size_t pl = 0;
     char *piece = ds4_token_text(s->engine, token, &pl);
-    if (piece) { buf_append(&st->text, piece, pl); free(piece); }
+    if (piece) {
+        buf_append(&st->text, piece, pl);
+        thinking_state_feed(&st->thinking, piece, pl);
+        free(piece);
+    }
     st->completion++;
+    /* Spec+tools: advance the DSML recognizer over the cumulative text (the
+     * serial loop's dsml_tracker_update site).  This runs synchronously inside
+     * the engine's accept/decode loop, so by the time the engine asks
+     * cont_sample_override about the NEXT token the state is position-exact. */
+    if (j->req.kind == REQ_CHAT && j->req.has_tools)
+        dsml_decode_tracker_update(&st->dsml_tracker, st->text.ptr, st->text.len);
     /* Token-id echo: the single path's openai_stream_record_token call site,
      * ported.  Each sampled id is queued with its byte end so the shared SSE
      * projection below drains token-aligned token_ids arrays.  No-op unless
@@ -12077,23 +12124,37 @@ static int cont_on_token(void *ud, void *user, int token) {
         st->stop_scan_from = st->text.len > hold ? st->text.len - hold : 0;
     }
 
-    /* Tool-marker observation (rolling window, generate_job's marker_hold).
-     * No think gating: thinking+tools is not batchable (job_is_batchable). */
+    /* Tool-marker observation (rolling window, generate_job's marker_hold),
+     * think-gated exactly like the serial loop: a DSML block inside reasoning
+     * is not executable, so markers are only observed after </think>. */
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-        if (st->tool_scan_from > st->text.len) st->tool_scan_from = st->text.len;
-        const char *tool_scan = st->text.ptr ? st->text.ptr + st->tool_scan_from : "";
-        bool orphan_end = false;
-        observe_tool_markers(tool_scan, &st->saw_tool_start, &st->saw_tool_end,
-                             &orphan_end);
-        if (orphan_end && !st->saw_orphan_tool_end) {
-            st->saw_orphan_tool_end = true;
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: cont chat ignored orphan tool-call end marker after %d generated tokens",
-                       st->completion);
+        if (ds4_think_mode_enabled(j->req.think_mode) && st->thinking.inside) {
+            st->tool_scan_waiting_for_think_close = true;
+            st->tool_scan_from = st->text.len;
+        } else {
+            if (st->tool_scan_waiting_for_think_close) {
+                const char *think_end = st->text.ptr ?
+                    find_last_substr(st->text.ptr, "</think>") : NULL;
+                st->tool_scan_from = think_end ?
+                    (size_t)((think_end + 8) - st->text.ptr) : st->text.len;
+                if (st->tool_scan_from > st->text.len) st->tool_scan_from = st->text.len;
+                st->tool_scan_waiting_for_think_close = false;
+            }
+            if (st->tool_scan_from > st->text.len) st->tool_scan_from = st->text.len;
+            const char *tool_scan = st->text.ptr ? st->text.ptr + st->tool_scan_from : "";
+            bool orphan_end = false;
+            observe_tool_markers(tool_scan, &st->saw_tool_start, &st->saw_tool_end,
+                                 &orphan_end);
+            if (orphan_end && !st->saw_orphan_tool_end) {
+                st->saw_orphan_tool_end = true;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: cont chat ignored orphan tool-call end marker after %d generated tokens",
+                           st->completion);
+            }
+            const size_t marker_hold = 80;
+            size_t hold_from = st->text.len > marker_hold ? st->text.len - marker_hold : 0;
+            if (hold_from > st->tool_scan_from) st->tool_scan_from = hold_from;
         }
-        const size_t marker_hold = 80;
-        size_t hold_from = st->text.len > marker_hold ? st->text.len - marker_hold : 0;
-        if (hold_from > st->tool_scan_from) st->tool_scan_from = hold_from;
     }
 
     /* Project the cumulative raw buffer into OpenAI SSE deltas: reasoning_content
@@ -14136,6 +14197,30 @@ static void test_streaming_chat_token_id_echo_is_batchable(void) {
     c.api = API_OPENAI;
     c.stream = true;
     c.return_token_ids = true;
+    TEST_ASSERT(!job_is_batchable(&c));
+    request_free(&c);
+}
+
+static void test_tools_batchable_at_any_temperature_and_thinking(void) {
+    /* Spec+tools (v0.2): the continuous path samples structural DSML at argmax
+     * per token via ds4_cont_request.sample_override, so tools no longer need
+     * the greedy-only / non-thinking fallback to the serial path.  Chat-kind
+     * is still required (completion requests carry no tool protocol). */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.has_tools = true;
+    TEST_ASSERT(job_is_batchable(&r));
+    r.temperature = 0.7f;
+    TEST_ASSERT(job_is_batchable(&r));
+    r.think_mode = DS4_THINK_HIGH;
+    TEST_ASSERT(job_is_batchable(&r));
+    request_free(&r);
+
+    request c;
+    request_init(&c, REQ_COMPLETION, 128);
+    c.api = API_OPENAI;
+    c.has_tools = true;
     TEST_ASSERT(!job_is_batchable(&c));
     request_free(&c);
 }
@@ -17246,6 +17331,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_streaming_chat_token_id_echo_is_batchable();
+    test_tools_batchable_at_any_temperature_and_thinking();
     test_openai_chat_stream_token_ids_cover_emitted_text();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();

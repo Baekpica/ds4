@@ -17,8 +17,9 @@
 #           class (fixed at f16820c). Health-gated; no score floor.
 #   fast  — fresh boot; FULL 69-scenario suite (includes category L);
 #           deepseek-chat = cont+DSpark ship path. Band 81-86; floor SCORE_MIN.
-#   think — fresh boot; full suite; deepseek-v4-flash = serial thinking path.
-#           Band 81-86; floor SCORE_MIN. ~2.7x the fast leg's wall time.
+#   think — fresh boot; full suite; deepseek-v4-flash = thinking. Since
+#           spec+tools, thinking+tools rides cont+DSpark (engagement gate =
+#           accept lines, not serial starts). Band 81-86; floor SCORE_MIN.
 #
 # Laws (earned 2026-07-13 — do not relax):
 #   * Crash legs MUST run at max_seq=4. Batch fit tracks MemAvailable, so the
@@ -27,9 +28,10 @@
 #   * Any warm-off control leg must include category L (TC-36..40): the
 #     64-scenario subset skips the deep trunks and proves nothing here.
 #   * Health gate per leg: 0 'illegal', 0 'continuous batch failed', rc=0.
-#     Engagement is part of the gate: chat legs must log CONT_MTP_ACCEPT(DSpark)
-#     and the think leg must log 'prompt start' (serial marker) — a leg that
-#     "passes" without engaging the path under test proved nothing.
+#     Engagement is part of the gate: every leg must log CONT_MTP_ACCEPT(DSpark)
+#     (thinking+tools is batchable since spec+tools; 'prompt start' = serial
+#     fallback marker, reported per leg) — a leg that "passes" without
+#     engaging the path under test proved nothing.
 #   * Full-suite temp-0 scores flip ±1 scenario run-to-run (band 81-86):
 #     don't chase single flips; SCORE_MIN catches real regressions.
 #
@@ -191,7 +193,7 @@ for legname in $LEGS; do
       ;;
     think)
       boot_server think
-      run_teb think "$THINK_MODEL" serial
+      run_teb think "$THINK_MODEL" accepts
       check_floor think
       ;;
     *) fail "unknown leg '$legname'" ;;
