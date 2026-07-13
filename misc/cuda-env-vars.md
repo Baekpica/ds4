@@ -122,6 +122,16 @@ The bandwidth figure is informational; we don't tier on it.
   serial path — the preload itself contributes nothing and is not a
   recommended knob.)
 
+- `DS4_SERVER_DEFAULT_TEMP=<float>` (2026-07-13): temperature applied to
+  requests that do not send one (default 1.0). Agent frameworks routinely
+  omit temperature, and tool-calling requests are batchable greedy-only
+  (`job_is_batchable`), so the 1.0 default silently routes them down the
+  serial path — no continuous batching, no DSpark. `DS4_SERVER_DEFAULT_TEMP=0`
+  makes omitted-temperature traffic greedy and therefore fast-path eligible.
+  Requests that DO send a temperature are untouched. Pair with the
+  `deepseek-chat` model alias (disables think mode) for agent clients:
+  thinking also forces tools serial.
+
 - `DS4_CUDA_PREFILL_PATH=mmq|cublas|warp8|auto` (default `auto` &rarr; mmq).
   Explicit override. `auto` and unset both resolve to mmq.
 

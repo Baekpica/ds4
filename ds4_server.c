@@ -744,6 +744,15 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
 
+/* DS4_SERVER_DEFAULT_TEMP overrides the temperature a request gets when it
+ * does not send one.  Agent frameworks routinely omit temperature; the 1.0
+ * default then keeps their tool-calling requests off the batched/DSpark path,
+ * which admits tools greedy-only (see job_is_batchable). */
+static float server_default_temperature(void) {
+    const char *e = getenv("DS4_SERVER_DEFAULT_TEMP");
+    return (e && *e) ? (float)atof(e) : DS4_DEFAULT_TEMPERATURE;
+}
+
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
@@ -751,7 +760,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
     r->top_k = 0;
-    r->temperature = DS4_DEFAULT_TEMPERATURE;
+    r->temperature = server_default_temperature();
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_HIGH;
