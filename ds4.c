@@ -16950,6 +16950,21 @@ static bool metal_graph_encode_layer_attention_batch(
                     if (g->ms_n_comp[s2][il] > mx) mx = g->ms_n_comp[s2][il];
                 g->layer_n_comp[il] = mx;
                 n_comp = mx;
+                /* Tokentile admission chunks (tt_single_run, >=128 rows) stage
+                 * the run bank's comp mirror rows [0, n_comp) EAGERLY
+                 * (attention_tokentile_comp_mirror_kernel has no per-row
+                 * visibility clamp), and the ratio-4 indexer scores scan the
+                 * same range of the FP4 index mirror.  The max-over-banks
+                 * scalar can exceed THIS bank's demand-mapped extent when a
+                 * sibling bank carries a deeper (warm-chained) trunk; reading
+                 * unmapped mirror pages is an illegal access that kills the
+                 * CUDA context (2026-07-13 warm-admit serving crash,
+                 * tool-eval-bench TC-36..38 + TC-01).  Every consumer of a
+                 * single-run batch is per-row clamped to the run bank's own
+                 * count, so the bank-true count is exact here -- and its rows
+                 * are written, hence mapped, by construction. */
+                if (tt_single_run && n_tokens != 0u)
+                    n_comp = g->ms_n_comp[(uint32_t)g->ms_seq_id[0]][il];
             }
         } else if (zero_prefix) {
             n_comp = n_tokens / ratio;
