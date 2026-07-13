@@ -631,6 +631,20 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes < floor_bytes) bytes = floor_bytes;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
     if (g_cuda_tmp) {
+        /* Free-while-in-flight hardening (2026-07-13 warm-admit crash
+         * audit; exonerated for that crash, kept as hardening): the
+         * graph invalidation below only protects captured REPLAYS.
+         * Eager work launched before this growth call -- the previous
+         * decode step's post-readback tail, earlier ops of the same
+         * admission chunk, moe-stream kernels -- may still hold the
+         * retiring pointer when cudaFree runs.  Drain the device first,
+         * same discipline as tt_scratch_ensure.  Growth is unreachable
+         * under capture (ds4_cuda_capture_warm_tmp_scratch pre-sizing);
+         * the guard makes an invariant break degrade to the
+         * invalidator's existing refusal path instead of a
+         * capture-poisoning device sync.  Cost is confined to rare
+         * sticky high-water growth events. */
+        if (!ds4_capture_active()) (void)cudaDeviceSynchronize();
         /* Growth frees a pointer that cached captured graphs may have
          * baked at capture time (decode-body consumers: indexer topk
          * tree scratch, topk sort, q8 prequant).  An EAGER prefill of a
@@ -7706,7 +7720,14 @@ static float *fp8_predecode_scratch_alloc(uint64_t bytes) {
     }
     if (g_fp8_predecode_scratch) {
         /* Same dangling-baked-pointer hazard as cuda_tmp_alloc: cached
-         * captured graphs may reference the buffer being retired. */
+         * captured graphs may reference the buffer being retired.  And
+         * the same free-while-in-flight hazard (2026-07-13 hardening):
+         * eager predecode launches from earlier in the same chunk may
+         * still read the old scratch when cudaFree runs -- drain first.
+         * The cudaMalloc above already keeps this path off-capture
+         * (allocation fails under capture before reaching here); the
+         * guard is symmetry with cuda_tmp_alloc. */
+        if (!ds4_capture_active()) (void)cudaDeviceSynchronize();
         ds4_cuda_invalidate_captured_graphs("fp8 predecode scratch resize");
         (void)cudaFree(g_fp8_predecode_scratch);
     }

@@ -10925,9 +10925,9 @@ static bool metal_graph_cache_ensure_rows(const ds4_gpu_tensor *cache,
 
 /* P2 Inc2b (fp8-primary): grow-only F32 working buffer for eager emits +
  * dequant staging.  Returns the cached tensor sized for at least `rows`
- * DS4_N_HEAD_DIM-wide rows.  Growth frees the old buffer (cudaFree
- * stream-syncs, and the scratch is never referenced by captured graphs --
- * eager paths only). */
+ * DS4_N_HEAD_DIM-wide rows.  Growth drains the device, drops captured
+ * graphs (C1: the emit tail bakes the pointer into cont execs), then
+ * frees the old buffer -- see the comments at the growth site. */
 static ds4_gpu_tensor *metal_graph_comp_emit_scratch(ds4_gpu_graph *g, uint64_t rows) {
     const uint64_t need = rows ? rows : 1u;
     if (g->comp_emit_scratch && g->comp_emit_scratch_rows >= need)
@@ -10939,6 +10939,14 @@ static ds4_gpu_tensor *metal_graph_comp_emit_scratch(ds4_gpu_graph *g, uint64_t 
         return NULL;
     }
     if (g->comp_emit_scratch) {
+        /* Free-while-in-flight hardening (2026-07-13 audit): invalidation
+         * only protects captured replays; eager emits launched earlier in
+         * the same chunk may still hold the retiring pointer when the free
+         * runs (cudaFree's implicit sync is not a documented guarantee and
+         * does not cover other streams).  Drain first, same discipline as
+         * the CUDA-side sticky allocators.  Off-capture by construction:
+         * the alloc above fails under capture before reaching here. */
+        (void)ds4_gpu_synchronize();
         /* C1 (cont capture): the old scratch pointer may be baked into cached
          * cont-graph execs (the emit-tail kernels write scratch row 0); drop
          * every captured graph before the cudaFree so no replay dereferences
@@ -10969,7 +10977,8 @@ static ds4_gpu_tensor *metal_graph_index_emit_scratch(ds4_gpu_graph *g, uint64_t
         return NULL;
     }
     if (g->index_emit_scratch) {
-        /* C1: see metal_graph_comp_emit_scratch. */
+        /* C1 + free-while-in-flight drain: see metal_graph_comp_emit_scratch. */
+        (void)ds4_gpu_synchronize();
         ds4_gpu_invalidate_captured_graphs("index emit scratch grow");
         ds4_gpu_tensor_free(g->index_emit_scratch);
     }
