@@ -25616,6 +25616,24 @@ static bool ds4_batch_slabs_alloc(ds4_batch_slabs *sl, ds4_gpu_graph *g, uint32_
                                     (uint64_t)(coff * DS4_N_INDEXER_HEAD_DIM) * sizeof(float);
     }
     bool ok = true;
+    /* KV-capacity audit (2026-07-13): every BYTE offset into the slabs below
+     * is computed in uint64_t, but the absolute-row ABI that names a bank row
+     * (comp_row_global = seq * layer_comp_cap + local; ds4_row_scalars, the
+     * captured row tables, and the CUDA seq_base/comp_seq_base params) is
+     * uint32_t end-to-end.  That is ample -- ~134M tokens/bank at 128 banks
+     * before the first wrap -- but nothing enforced it.  Reject the geometry
+     * at creation instead of overflowing silently at runtime; widening the
+     * row ABI (an 8-byte static_asserted struct) is the day-two fix if a
+     * config ever legitimately trips this. */
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint64_t abs_rows = (uint64_t)N * g->layer_comp_cap[il];
+        if (abs_rows > (uint64_t)UINT32_MAX + 1u) {
+            fprintf(stderr, "ds4: batch geometry rejected: %u banks x comp cap %u"
+                    " = %llu absolute rows exceeds the uint32 row ABI (layer %u)\n",
+                    N, g->layer_comp_cap[il], (unsigned long long)abs_rows, il);
+            ok = false;
+        }
+    }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         sl->multi_raw[il] = ds4_gpu_tensor_alloc((uint64_t)N * sl->raw_bank_bytes);
