@@ -31727,8 +31727,10 @@ struct ds4_batch_ctx {
                                       * src==dst = in-place truncate-reuse) */
     /* R5 Inc1b: page budget for the demand-mapped comp/index slabs (bytes;
      * 0 = no gating) + admits rejected because mapping the request's projected
-     * committed length would bust it. */
+     * committed length would bust it.  pinned = DS4_BATCH_VMM_BUDGET_MB set:
+     * the budget is an ops/gate constant, never refreshed from live memory. */
     uint64_t        comp_map_budget;
+    uint8_t         comp_map_budget_pinned;
     uint64_t        mem_rejects;
 };
 
@@ -32077,9 +32079,11 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         }
         /* Explicit override (MB): pins the page budget regardless of the
          * free-memory answer -- ops guardrail + the only way a gate can force
-         * the admission reject path deterministically. */
+         * the admission reject path deterministically (pinned also disables
+         * the admit-time live refresh below). */
         { const char *be = getenv("DS4_BATCH_VMM_BUDGET_MB");
-          if (be && be[0]) { const long bv = atol(be); if (bv > 0) ctx->comp_map_budget = (uint64_t)bv << 20; } }
+          if (be && be[0]) { const long bv = atol(be);
+            if (bv > 0) { ctx->comp_map_budget = (uint64_t)bv << 20; ctx->comp_map_budget_pinned = 1u; } } }
         fprintf(stderr,
                 "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB)\n",
                 (unsigned long long)(ds4_gpu_vmm_demand_page() >> 10),
@@ -33772,6 +33776,30 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 if (flen > seq_cap) flen = seq_cap;
                 const uint64_t mneed = ds4_batch_bank_map_projection(ctx, b, flen);
                 const uint64_t mres  = ds4_batch_slabs_cache_resident(&ctx->sl);
+                /* The boot-time budget is a snapshot and goes stale in both
+                 * directions (page cache settles and frees GiBs; WS
+                 * MemAvailable creep eats them).  Before rejecting on it,
+                 * re-derive from live free memory: the pages the caches may
+                 * hold = the pages they already hold + what is free beyond
+                 * the runtime headroom.  Grow-only -- shrink keeps the boot
+                 * answer, and genuine exhaustion is handled where it always
+                 * was (ensure() fails the stream gracefully). */
+                if (mneed != 0 && mres + mneed > ctx->comp_map_budget &&
+                    !ctx->comp_map_budget_pinned) {
+                    uint64_t lfree = 0, ltotal = 0;
+                    if (ds4_gpu_mem_info(&lfree, &ltotal) == 0) {
+                        const uint64_t headroom = ds4_batch_fit_headroom_bytes((int)ctx->ctx_size);
+                        const uint64_t live = mres + (lfree > headroom ? lfree - headroom : 0);
+                        if (live > ctx->comp_map_budget) {
+                            fprintf(stderr,
+                                    "ds4: comp-cache budget refreshed %.1f -> %.1f MiB (live free %.2f GiB)\n",
+                                    (double)ctx->comp_map_budget / 1048576.0,
+                                    (double)live / 1048576.0,
+                                    (double)lfree / 1073741824.0);
+                            ctx->comp_map_budget = live;
+                        }
+                    }
+                }
                 if (mneed != 0 && mres + mneed > ctx->comp_map_budget) {
                     ctx->mem_rejects++;
                     fprintf(stderr,

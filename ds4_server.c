@@ -7944,6 +7944,11 @@ struct server {
      * (also keeps template-header-only overlap from triggering reuse). */
     bool warm_fork_partial;
     int  warm_partial_min;
+    /* KV capacity (v0.2 ws4): plain-LRU eviction is depth-split -- a record
+     * with committed tokens >= warm_pin_min ("deep": an orchestrator trunk
+     * that would take tens of minutes to re-prefill) is only the cold-admit
+     * victim when every candidate is deep.  0 disables the tier. */
+    int  warm_pin_min;
     job *head;
     job *tail;
     bool stopping;
@@ -11606,21 +11611,32 @@ static bool warm_rec_superseded(const server *s, const bool *occ, int b) {
  * fork-into-LRU policy evicting live tenants' only records while superseded
  * trunks (clock-bumped at every match) survived: at 10 tenants on 14 banks
  * round-robin the warm hit rate was 50% where every alternative reaches 100%.
- * excl = a bank that must not be chosen (the fork trunk), or -1. */
+ * excl = a bank that must not be chosen (the fork trunk), or -1.
+ * v0.2 ws4: the plain-LRU tier is depth-split (see warm_pin_min): shallow
+ * records first, a DEEP record only when every candidate is deep.  Superseded
+ * records stay fair game at any depth -- their prefix survives in the
+ * superset bank. */
 static int warm_victim_pick(const server *s, const bool *occ, int excl, bool evict_lru) {
-    int sup = -1, lru = -1;
-    uint64_t sup_use = UINT64_MAX, lru_use = UINT64_MAX;
+    int sup = -1, lru = -1, deep_lru = -1;
+    uint64_t sup_use = UINT64_MAX, lru_use = UINT64_MAX, deep_use = UINT64_MAX;
     for (int b = 0; b < s->batch_ctx_max_seq; b++) {
         if (occ[b] || b == excl) continue;
         if (!s->warm[b].valid) return b;             /* no retained value */
-        if (s->warm[b].last_use < lru_use) { lru_use = s->warm[b].last_use; lru = b; }
+        const bool deep = s->warm_pin_min > 0 &&
+            ds4_batch_ctx_bank_committed(s->batch_ctx, b, NULL) >= s->warm_pin_min;
+        if (deep) {
+            if (s->warm[b].last_use < deep_use) { deep_use = s->warm[b].last_use; deep_lru = b; }
+        } else {
+            if (s->warm[b].last_use < lru_use) { lru_use = s->warm[b].last_use; lru = b; }
+        }
         if (s->warm[b].last_use < sup_use && warm_rec_superseded(s, occ, b)) {
             sup_use = s->warm[b].last_use;
             sup = b;
         }
     }
     if (sup >= 0) return sup;
-    return evict_lru ? lru : -1;
+    if (!evict_lru) return -1;
+    return lru >= 0 ? lru : deep_lru;
 }
 
 /* Placement (and warm-continuation) pick for job j's admit.  On a record match
@@ -11677,6 +11693,16 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                 int ft = -1;
                 if (s->warm_fork)
                     ft = warm_victim_pick(s, occ, best, false);
+                /* v0.2 ws4: fork-by-copy re-maps the trunk's WHOLE committed
+                 * extent on the destination bank (F32 primary: ~10 MiB per 1K
+                 * tokens), so forking a DEEP trunk routinely busts the
+                 * admission page budget and the engine rejects the job
+                 * outright (observed at 518K committed: fork dst projected
+                 * 6.8 GiB; in-place continuation rides the trunk's existing
+                 * pages for free).  Past the pin threshold, keep forking a
+                 * shallow-trunk luxury and continue deep trunks in place. */
+                if (ft >= 0 && s->warm_pin_min > 0 && hl >= s->warm_pin_min)
+                    ft = -1;
                 if (ft >= 0) {
                     req->place_bank = ft + 1;
                     req->fork_bank  = best + 1;
@@ -11753,6 +11779,11 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
     }
     const int target = warm_victim_pick(s, occ, -1, true);
     if (target >= 0) {
+        const int tc = ds4_batch_ctx_bank_committed(s->batch_ctx, target, NULL);
+        if (s->warm_pin_min > 0 && tc >= s->warm_pin_min)
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: cold admit evicting DEEP record bank=%d committed=%d (all candidates deep)",
+                       target, tc);
         req->place_bank = target + 1;                /* directed COLD admit */
         warm_rec_invalidate(s, target);
     }
@@ -13283,6 +13314,12 @@ int main(int argc, char **argv) {
                         s.warm_fork_partial = !(pe && pe[0] == '0' && pe[1] == '\0');
                         const char *pm = getenv("DS4_SERVER_FORK_PARTIAL_MIN");
                         s.warm_partial_min = (pm && pm[0]) ? atoi(pm) : 192;
+                        /* v0.2 ws4: deep-record pin threshold for cold-admit
+                         * eviction (tokens; 0 disables).  Default 65536 ~ the
+                         * depth where re-prefill cost crosses into minutes. */
+                        const char *pn = getenv("DS4_SERVER_PIN_MIN_TOKENS");
+                        s.warm_pin_min = (pn && pn[0]) ? atoi(pn) : 65536;
+                        if (s.warm_pin_min < 0) s.warm_pin_min = 0;
                         /* The engine's replay base aligns down to the largest
                          * compress ratio (128 on Flash) -- cuts below align+4
                          * degrade to cold, so don't bother issuing them. */
