@@ -12272,25 +12272,51 @@ static void generate_continuous_jobs(server *s, job *first) {
      * A job that already began streaming (cstream set) can't be restarted on the
      * single path (its SSE headers are on the wire) -- close it gracefully;
      * everything else runs on the single path now that gen_mu is released. */
-    int fallback = 0;
-    for (int i = 0; i < cs.max_seq; i++) {
-        job *jb = cs.inflight[i];
+    /* Deep-serial guard (v0.2): a cont-rejected job above this depth must not
+     * retry on the legacy serial path -- at deep ctx serial takes the
+     * managed-KV fallback (minutes of prefill, ~40x slower decode) and the
+     * reject that bounced it here is usually transient (comp budget read
+     * during a memory dip).  Fail fast with 503 so the client retries into a
+     * healthy admission instead of silently degrading.  0 disables. */
+    const char *sme = getenv("DS4_SERVER_SERIAL_MAX_TOKENS");
+    int serial_max = (sme && sme[0]) ? atoi(sme) : 65536;
+    if (serial_max < 0) serial_max = 0;
+    int fallback = 0, refused = 0;
+    for (int i = 0; i <= cs.max_seq; i++) {
+        job *jb = i < cs.max_seq ? cs.inflight[i] : cs.primed;
         if (!jb) continue;
-        ds4_tokens_free(&jb->warm_prompt);   /* A2a: engine no longer reads it */
-        memset(&jb->warm_prompt, 0, sizeof(jb->warm_prompt));
+        if (i < cs.max_seq) {
+            ds4_tokens_free(&jb->warm_prompt);   /* A2a: engine no longer reads it */
+            memset(&jb->warm_prompt, 0, sizeof(jb->warm_prompt));
+        }
         if (jb->cstream && jb->req.stream) { /* already streamed into jb->out -> finalize there too */
             t_emit_job = jb; cont_stream_finalize(s, jb, "length"); t_emit_job = NULL;
             job_finish(jb);
+            fallback++;
+        } else if (serial_max > 0 && jb->req.prompt.len > serial_max) {
+            cont_stream_discard(jb);
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "Server is temporarily at capacity for a %d-token prompt "
+                     "(deep prompts are not served on the serial fallback path); retry shortly",
+                     jb->req.prompt.len);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: deep-serial guard: refusing serial fallback for %d-token prompt (max %d)",
+                       jb->req.prompt.len, serial_max);
+            http_error(jb->fd, s->enable_cors, 503, msg);
+            job_finish(jb);
+            refused++;
         } else {
             /* A1: a NON-streaming row may carry scan state (cstream) without
              * having written a byte -- drop it and rerun cleanly. */
             cont_stream_discard(jb);
             run_job_single(s, jb);   /* never emitted (out empty) -> direct fd is fine */
+            fallback++;
         }
-        fallback++;
     }
-    if (cs.primed) { run_job_single(s, cs.primed); fallback++; }
     free(cs.inflight);
+    if (refused)
+        server_log(DS4_LOG_WARNING, "ds4-server: deep-serial guard refused %d job(s)", refused);
 
     if (rc != 0)
         server_log(DS4_LOG_WARNING,
