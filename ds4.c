@@ -31985,7 +31985,13 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
      * depth via DS4_CONT_MTP_DEPTH, batched drafter via DS4_CONT_MTP_BATCH_DRAFT).
      * Gate runs (DS4_CONT_MTP_GATE) set ctx->mtp_draft_mode explicitly per run and
      * restore it, so this default composes with the gate unchanged. */
-    if (ctx->mtp) {
+    /* MTP-droppable (v0.2): mode 2 no longer hard-requires the MTP support
+     * model -- with the DSpark drafter loaded, DSpark supplies every draft and
+     * the verify/accept/rollback machinery is draft-source agnostic, so the
+     * mode env must be honored on --mtp-less boots too.  Mode 1 (the MTP
+     * lockstep probe) still needs the MTP model; the decode-step predicates
+     * keep it gated on ctx->mtp. */
+    if (ctx->mtp || e->dspark_ready) {
         const char *me = getenv("DS4_CONT_MTP_MODE");
         if (me && me[0]) {
             const int mv = atoi(me);
@@ -33425,9 +33431,18 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * construction.  Requires the drafter loaded + its slab allocated.  N=1 first
      * (the cont loop's multiseq forward has an unfixed race; drafts are race-tolerant
      * but the verify path is gated single-seq first).  Off unless DS4_CONT_DSPARK. */
-    const int dspark_mode = (mtp_accept && ctx->e->dspark_ready &&
-                             ctx->dsl.multi_raw[0] != NULL &&
-                             getenv("DS4_CONT_DSPARK") != NULL) ? 1 : 0;
+    const int dspark_armed = (ctx->e->dspark_ready &&
+                              ctx->dsl.multi_raw[0] != NULL &&
+                              getenv("DS4_CONT_DSPARK") != NULL) ? 1 : 0;
+    /* MTP-droppable (v0.2): the mode-2 verify/accept/rollback machinery is
+     * draft-source agnostic -- its rollback state is BASE-model compressor
+     * checkpoints (ctx->sl.ckpt_* wired to g->mtp_rb_*, allocated for every
+     * batch ctx regardless of MTP), and in dspark_mode the draft dispatch
+     * below never touches ctx->msl / the MTP weights.  spec_accept arms the
+     * shared machinery when EITHER draft source can serve; MTP-chain drafting
+     * itself stays behind mtp_accept / ctx->mtp. */
+    const int spec_accept = (mtp_mode == 2 && (mtp_accept || dspark_armed)) ? 1 : 0;
+    const int dspark_mode = (spec_accept && dspark_armed) ? 1 : 0;
     /* Phase 3 promotion: terminal yield quench defaults ON (gates: forced-quench
      * identity 1.000 vs plain, gsm8k/mbpp in band, W&P floor 0.72->0.96 with wins
      * held).  DS4_DSPARK_QUENCH=0 restores always-spec below the kv gate. */
@@ -33557,14 +33572,14 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     const uint32_t vrows_per_bank = Dspec + 1u;                 /* committed + D drafts */
     uint32_t vcap_rows = MS * vrows_per_bank;
     if (vcap_rows > ctx->prefill_cap) vcap_rows = ctx->prefill_cap;  /* forward tensors sized for prefill_cap */
-    int      *dbuf   = mtp_accept ? xcalloc((size_t)MS * DS4_CONT_MTP_MAX_DEPTH, sizeof(int)) : NULL;
-    uint32_t *ndr    = mtp_accept ? xcalloc(MS, sizeof(uint32_t)) : NULL;
-    int      *vqtok  = mtp_accept ? xmalloc((size_t)vcap_rows * sizeof(int)) : NULL;
-    int32_t  *vpos   = mtp_accept ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
-    int32_t  *vsid   = mtp_accept ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
-    uint32_t *vfirst = mtp_accept ? xmalloc((size_t)MS * sizeof(uint32_t)) : NULL;
-    uint32_t *vnr    = mtp_accept ? xmalloc((size_t)MS * sizeof(uint32_t)) : NULL;  /* drafts packed for bank */
-    float    *vlogits= mtp_accept ? xmalloc((size_t)vcap_rows * DS4_N_VOCAB * sizeof(float)) : NULL;
+    int      *dbuf   = spec_accept ? xcalloc((size_t)MS * DS4_CONT_MTP_MAX_DEPTH, sizeof(int)) : NULL;
+    uint32_t *ndr    = spec_accept ? xcalloc(MS, sizeof(uint32_t)) : NULL;
+    int      *vqtok  = spec_accept ? xmalloc((size_t)vcap_rows * sizeof(int)) : NULL;
+    int32_t  *vpos   = spec_accept ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
+    int32_t  *vsid   = spec_accept ? xmalloc((size_t)vcap_rows * sizeof(int32_t)) : NULL;
+    uint32_t *vfirst = spec_accept ? xmalloc((size_t)MS * sizeof(uint32_t)) : NULL;
+    uint32_t *vnr    = spec_accept ? xmalloc((size_t)MS * sizeof(uint32_t)) : NULL;  /* drafts packed for bank */
+    float    *vlogits= spec_accept ? xmalloc((size_t)vcap_rows * DS4_N_VOCAB * sizeof(float)) : NULL;
     /* D4.5d: on-device Markov-refine scratch (DSpark draft step).  mk_cand holds the
      * [B*MS] candidate grid (row j = j-th cand of every bank), mk_prev the [MS*rank]
      * gathered markov_w1 rows, mk_bias the [MS*vocab] per-bank bias.  Allocated once;
@@ -33603,7 +33618,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     double   *ad_wall   = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;
     double   *ad_ms_cur = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;   /* 0 = no estimate yet */
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
-    if (mtp_accept) ok = ok && dbuf && ndr && vqtok && vpos && vsid && vfirst && vnr && vlogits;
+    if (spec_accept) ok = ok && dbuf && ndr && vqtok && vpos && vsid && vfirst && vnr && vlogits;
     if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits && pf_inj_pos && pf_inj_sid &&
                          dspark_step_inj_pos && dspark_step_inj_sid && dspark_step_inj_src && dspark_depth_cap &&
                          dspark_kv_logged;
@@ -33866,7 +33881,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     if (pv) { ds4_slab_poison_fill(pv); ds4_gpu_tensor_free(pv); }
                 }
             }
-            if (mtp_accept) ndr[b] = 0u;                /* S1.1: no drafts until first step */
+            if (spec_accept) ndr[b] = 0u;               /* S1.1: no drafts until first step */
             if (dspark_quench) {                         /* fresh request -> fresh terminal controller */
                 qn_yewma[b] = dspark_shadow_guard;
                 qn_debt[b] = 0.0;
@@ -34117,7 +34132,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
 
         /* ---- DECODE one step over live banks. ---- */
         uint32_t k = 0;   /* rows decoded by the plain path (0 in the spec branch -> probe skipped) */
-        if (mtp_accept) {
+        if (spec_accept) {
             /* ===== S1.1 speculative verify + ACCEPT step (pipelined, depth Dspec) =====
              * Per live bank, pack [cur, dbuf0..dbuf_{ndr-1}] = (1+ndr) rows at consecutive
              * positions into ONE verify forward with the compressor STORE DEFERRED.  Row j's
@@ -34664,6 +34679,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         }
                     }
                 } else {
+                /* Serial MTP-chain draft arm.  Reachable only with the MTP model
+                 * loaded: spec_accept && !dspark_mode implies mtp_accept (a
+                 * DSpark-only boot always takes the dspark_mode arm above). */
                 for (uint32_t b = 0; ok && b < MS; b++) {
                     ndr[b] = 0u;
                     if (!live[b] || cfirst[b] == UINT32_MAX) continue;
@@ -34850,7 +34868,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 (unsigned long long)mtp_probe_total, (unsigned long long)mtp_probe_hit,
                 mtp_probe_total ? 100.0 * (double)mtp_probe_hit / (double)mtp_probe_total : 0.0);
 
-    if (mtp_accept)
+    if (spec_accept)
         fprintf(stderr, "ds4: CONT_MTP_ACCEPT%s D=%u steps=%llu emit=%llu drafts=%llu hits=%llu "
                 "accept=%.1f%% tok/step=%.2f\n",
                 dspark_mode ? "(DSpark)" : "",
