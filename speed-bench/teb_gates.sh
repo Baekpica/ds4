@@ -21,6 +21,26 @@
 #           spec+tools, thinking+tools rides cont+DSpark (engagement gate =
 #           accept lines, not serial starts). Band 81-86; floor SCORE_MIN.
 #
+# Opt-in legs (NOT in default LEGS until banded twice — health+engagement
+# gated only, no score floor; record bands here once stamped):
+#   hard    — fresh boot; Hard Mode only (--hardmode-only, TC-70..84,
+#             15 adversarial/stateful/recovery scenarios).
+#             Stamp 1 (2026-07-14, 32e1dab): 73. Band: TBD (needs stamp 2).
+#   errrate — fresh boot; full suite with --error-rate $ERR_RATE injected
+#             tool failures (per-scenario RNG seeded from SEED+scenario
+#             digest → deterministic at fixed seed).
+#             Stamp 1 (2026-07-14, 32e1dab, rate 0.2): 82 — inside the
+#             normal 81-86 band. Band: TBD (needs stamp 2).
+#   passk   — fresh boot; full suite --trials $TRIALS on ONE boot; parses
+#             trial_statistics from the JSON (final_score_mean, pass@k,
+#             pass^k, reliability_gap). Bands: TBD.
+#             Stamp 1 (2026-07-14) INVALID for banding: the :$TUNNEL_PORT
+#             ssh tunnel died mid-trial-3 → 15 consecutive "All connection
+#             attempts failed" zeros (server healthy throughout). Valid
+#             signal: trials 1-2 scored 82/86 with only single-scenario
+#             flips. The conn-cascade guard below now fails the leg as
+#             ENVIRONMENT instead of recording a poisoned score.
+#
 # Laws (earned 2026-07-13 — do not relax):
 #   * Crash legs MUST run at max_seq=4. Batch fit tracks MemAvailable, so the
 #     boot pins DS4_SERVER_COALESCE_MAX and ASSERTS the booted max_seq: a
@@ -44,6 +64,10 @@
 #   MAXSEQ          (4)                    pinned+asserted bank count
 #   CTX (49152)  PORT (8000)  TUNNEL_PORT (18000)  HEADROOM_MB (6272)  SEED (7)
 #   BINDIR (/home/ent/code/ds4-phase0)     server tree on the host
+#   ERR_RATE (0.2)   injected tool-error rate for the errrate leg
+#   TRIALS (3)       trial count for the passk leg
+#   EXTRA_ENV ("")   extra server env spliced into every boot, e.g.
+#     EXTRA_ENV="DS4_CUDA_FP8_KV=1 DS4_CUDA_FP4_INDEX=1"
 set -uo pipefail
 
 R=${TEB_GATE_HOST:-sync-192_168_88_33}
@@ -60,12 +84,15 @@ SEED=${SEED:-7}
 BINDIR=${BINDIR:-/home/ent/code/ds4-phase0}
 GGUF=${GGUF:-/home/ent/gguf}
 BASE=$GGUF/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
-MTP=$GGUF/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+MTP=${MTP-$GGUF/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf}   # MTP="" boots --mtp-less (MTP-droppable legs)
 DRAFTER=$GGUF/DSpark-drafter-Q2K-Q8.gguf
 MAN=${MAN:-/tmp/ds4_weights_hermes.manifest}
 RWORK=/tmp/teb_gates
 FAST_MODEL=${FAST_MODEL:-deepseek-chat}
 THINK_MODEL=${THINK_MODEL:-deepseek-v4-flash}
+ERR_RATE=${ERR_RATE:-0.2}
+TRIALS=${TRIALS:-3}
+EXTRA_ENV=${EXTRA_ENV:-}
 
 mkdir -p "$OUT"
 DRV=$OUT/driver.log
@@ -102,12 +129,12 @@ boot_server(){
   else
     log "boot($leg): no weight server — self-load mode"
   fi
-  ssh "$R" ": > $SRV; cd $BINDIR; env $ipc \
+  ssh "$R" ": > $SRV; cd $BINDIR; env $ipc $EXTRA_ENV \
       DS4_CUDA_NO_HBM_CACHE=1 DS4_SESSION_LAZY_GRAPH=0 \
       DS4_BATCH_FIT_HEADROOM_MB=$HEADROOM_MB DS4_SERVER_COALESCE_MAX=$MAXSEQ \
       DS4_CONT_PREFILL_CHUNK=2048 DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1 \
       DS4_DSPARK_MODEL=$DRAFTER DS4_CONT_CAPTURE=1 DS4_SERVER_DEFAULT_TEMP=0 \
-      setsid nohup ./ds4-server -m $BASE --mtp $MTP --cuda -c $CTX --port $PORT \
+      setsid nohup ./ds4-server -m $BASE ${MTP:+--mtp $MTP} --cuda -c $CTX --port $PORT \
       > $SRV 2>&1 < /dev/null & exit 0"
   local n=0
   until ssh "$R" "grep -q 'listening on http' $SRV 2>/dev/null; exit \$?" 2>/dev/null; do
@@ -146,18 +173,23 @@ run_teb(){
   local rc=$?
   local seg=$OUT/teb_${name}_srv.log
   ssh "$R" "tail -n +$((off+1)) $SRV" > "$seg"
-  local ill fb acc ser rej score
+  local ill fb acc ser rej score conn
   ill=$(grep -c 'illegal' "$seg" || true)
   fb=$(grep -c 'continuous batch failed' "$seg" || true)
   acc=$(grep -c 'CONT_MTP_ACCEPT(DSpark)' "$seg" || true)
   ser=$(grep -c 'prompt start' "$seg" || true)
   rej=$(grep -c 'cont admit rejected' "$seg" || true)
+  # Environment guard (learned 2026-07-14): a mid-run tunnel death scores every
+  # remaining scenario 0 with connection errors while the server log stays
+  # clean — that must fail the leg as ENVIRONMENT, never band as a score.
+  conn=$(cat "$OUT/teb_${name}.json" 2>/dev/null "$OUT/teb_${name}.out" | grep -c 'All connection attempts failed' || true)
   score=$(grep -o '"final_score": *[0-9]*' "$OUT/teb_${name}.out" | tail -1 | grep -o '[0-9]*$'); score=${score:-none}
   log "$name: rc=$rc score=$score illegal=$ill fallbacks=$fb accepts=$acc serial_starts=$ser admit_rejects=$rej"
   SUMMARY="$SUMMARY
   $name: score=$score rc=$rc illegal=$ill fallbacks=$fb accepts=$acc serial_starts=$ser admit_rejects=$rej"
   [ "$ill" -eq 0 ] || fail "$name: illegal memory access in server log ($seg)"
   [ "$fb" -eq 0 ] || fail "$name: continuous-batch fallback in server log ($seg)"
+  [ "$conn" -eq 0 ] || fail "$name: $conn connection-failure scenario(s) — ENVIRONMENT (tunnel/:$TUNNEL_PORT died mid-run?), score invalid"
   [ $rc -eq 0 ] || fail "$name: bench rc=$rc (see $OUT/teb_${name}.out)"
   case $need in
     accepts) [ "$acc" -gt 0 ] || fail "$name: no CONT_MTP_ACCEPT(DSpark) lines — cont/DSpark path not engaged" ;;
@@ -195,6 +227,31 @@ for legname in $LEGS; do
       boot_server think
       run_teb think "$THINK_MODEL" accepts
       check_floor think
+      ;;
+    hard)
+      boot_server hard
+      run_teb hard "$FAST_MODEL" accepts --hardmode-only
+      log "hard: opt-in leg, no floor until banded (Hard Mode is ceiling-breaking by design)"
+      ;;
+    errrate)
+      boot_server errrate
+      run_teb errrate "$FAST_MODEL" accepts --error-rate "$ERR_RATE"
+      log "errrate: opt-in leg rate=$ERR_RATE, no floor until banded"
+      ;;
+    passk)
+      boot_server passk
+      run_teb passk "$FAST_MODEL" accepts --trials "$TRIALS"
+      PKSTATS=$(python3 - "$OUT/teb_passk.json" <<'PYEOF'
+import json, sys
+t = json.load(open(sys.argv[1])).get("trial_statistics", {})
+print(f"mean={t.get('final_score_mean')} stddev={t.get('final_score_stddev')} "
+      f"pass@k={t.get('pass_at_k')} pass^k={t.get('pass_hat_k')} "
+      f"gap={t.get('reliability_gap')}")
+PYEOF
+) || fail "passk: no trial_statistics in $OUT/teb_passk.json"
+      log "passk: trials=$TRIALS $PKSTATS (no floor until banded)"
+      SUMMARY="$SUMMARY
+  passk trials=$TRIALS: $PKSTATS"
       ;;
     *) fail "unknown leg '$legname'" ;;
   esac

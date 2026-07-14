@@ -32,6 +32,8 @@
 #   CTX (524288)  ORCH_TOK (500000)  SUB_TOK (250000)
 #   PORT (8000)  TUNNEL_PORT (18000)  HEADROOM_MB (6272)
 #   DC_GATE_OUT (/tmp/deep_ctx_gate_<ts>)  GGUF (/home/ent/gguf)
+#   EXTRA_ENV ("") — extra server env spliced into the boot, e.g.
+#     EXTRA_ENV="DS4_CUDA_FP8_KV=1 DS4_CUDA_FP4_INDEX=1" for the >1M levers
 set -uo pipefail
 
 R=${DC_GATE_HOST:-sync-192_168_88_33}
@@ -44,8 +46,9 @@ TUNNEL=${TUNNEL_PORT:-18000}
 HEADROOM_MB=${HEADROOM_MB:-6272}
 OUT=${DC_GATE_OUT:-/tmp/deep_ctx_gate_$(date +%Y%m%d_%H%M%S)}
 GGUF=${GGUF:-/home/ent/gguf}
+EXTRA_ENV=${EXTRA_ENV:-}
 BASE=$GGUF/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
-MTP=$GGUF/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+MTP=${MTP-$GGUF/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf}   # MTP="" boots --mtp-less (MTP-droppable legs)
 DRAFTER=$GGUF/DSpark-drafter-Q2K-Q8.gguf
 SRV=/tmp/deep_ctx_gate_srv.log
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -63,14 +66,23 @@ python3 "$HERE/needle_prompt.py" "$SUB_TOK"  "$OUT/sub.json"  0.70 "5517-SIGMA-N
 
 log "boot: killing old ds4-server on $R"
 ssh "$R" "pkill -x ds4-server; sleep 2; pkill -9 -x ds4-server; rm -f /tmp/ds4.lock; exit 0"
-sleep 8
-log "boot: ctx=$CTX coalesce_max=8, lazy serial graph, ship cont env"
-ssh "$R" ": > $SRV; cd $RT; env \
+# Boot-fit hygiene (law re-learned 2026-07-14): wait for MemAvailable to
+# stabilize after the kill -- a transient low reading shrinks the batch fit
+# AND silences the live budget refresh at admit (both read the same gauge).
+ssh "$R" "prev=\$(awk '/MemAvailable/{print \$2}' /proc/meminfo); i=0
+  while [ \$i -lt 24 ]; do sleep 5
+    cur=\$(awk '/MemAvailable/{print \$2}' /proc/meminfo)
+    d=\$((cur - prev)); [ \$d -lt 0 ] && d=\$((-d))
+    [ \$d -lt 512000 ] && { echo \"mem stable: \$((cur/1048576)) GiB\"; exit 0; }
+    prev=\$cur; i=\$((i+1)); done
+  echo \"mem NOT stable after 120s: \$((cur/1048576)) GiB (continuing)\"" | tee -a "$DRV"
+log "boot: ctx=$CTX coalesce_max=8, lazy serial graph, ship cont env${EXTRA_ENV:+ + $EXTRA_ENV}"
+ssh "$R" ": > $SRV; cd $RT; env $EXTRA_ENV \
     DS4_CUDA_NO_HBM_CACHE=1 \
     DS4_BATCH_FIT_HEADROOM_MB=$HEADROOM_MB DS4_SERVER_COALESCE_MAX=8 \
     DS4_CONT_PREFILL_CHUNK=2048 DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1 \
     DS4_DSPARK_MODEL=$DRAFTER DS4_CONT_CAPTURE=1 DS4_SERVER_DEFAULT_TEMP=0 \
-    setsid nohup ./ds4-server -m $BASE --mtp $MTP --cuda -c $CTX --port $PORT \
+    setsid nohup ./ds4-server -m $BASE ${MTP:+--mtp $MTP} --cuda -c $CTX --port $PORT \
     > $SRV 2>&1 < /dev/null & exit 0"
 n=0
 until ssh "$R" "grep -q 'listening on http' $SRV 2>/dev/null; exit \$?" 2>/dev/null; do
