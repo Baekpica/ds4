@@ -11757,7 +11757,16 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                 req->n_cached  = cut;                /* engine aligns + validates */
                 req->fork_bank = pb + 1;
                 s->warm[pb].last_use = ++s->warm_clock;
-                const int ft = warm_victim_pick(s, occ, pb, false);
+                /* v0.2 ws4: same deep-trunk rule as the full-match fork above,
+                 * keyed on CUT (the extent fork-by-copy re-maps).  Sequential
+                 * unique deep prompts sharing a long prefix otherwise stack a
+                 * fresh multi-GiB bank per request until a scratch alloc
+                 * aborts the process (observed: six ~130K banks under a
+                 * pinned page budget).  Past the pin threshold, truncate the
+                 * trunk in place instead of copying it. */
+                int ft = warm_victim_pick(s, occ, pb, false);
+                if (ft >= 0 && s->warm_pin_min > 0 && cut >= s->warm_pin_min)
+                    ft = -1;
                 if (ft >= 0) {
                     req->place_bank = ft + 1;
                     warm_rec_invalidate(s, ft);      /* target being overwritten */

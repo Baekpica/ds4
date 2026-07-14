@@ -136,12 +136,17 @@ deep_touch(){
   python3 "$HERE/sse_probe_client.py" "$OUT/touch.json" "$URL" TOUCH > "$OUT/touch.out" 2>&1
   local rc=$?
   ssh "$R" "tail -n +$((offt+1)) $SRV" > "$seg"
-  local warm forks
+  local warm forks trunc
   warm=$(grep -cE 'warm admit bank=[0-9]+ cached=[0-9]{6}' "$seg")
   forks=$(grep -c 'fork admit' "$seg")
-  if [ $rc -ne 0 ] || ! grep -q "$DEEP_CODE" "$OUT/touch.out" || [ "$warm" -lt 1 ] || [ "$forks" -ne 0 ]; then
+  # Steady-state touch path: after the first touch the record carries the
+  # generated answer, so an identical re-touch is a strict PREFIX of the
+  # record and the server serves it as an in-place partial truncate
+  # (cut = deep trunk, suffix ~1) -- warm-class, cheaper than a re-admit.
+  trunc=$(grep -cE 'partial truncate admit bank=[0-9]+ cut=[0-9]{6}' "$seg")
+  if [ $rc -ne 0 ] || ! grep -q "$DEEP_CODE" "$OUT/touch.out" || [ $((warm + trunc)) -lt 1 ] || [ "$forks" -ne 0 ]; then
     TOUCH_FAIL=$((TOUCH_FAIL+1))
-    log "DEEP TOUCH FAIL (round $ROUND): rc=$rc warm=$warm forks=$forks $(grep -m1 ttft "$OUT/touch.out")"
+    log "DEEP TOUCH FAIL (round $ROUND): rc=$rc warm=$warm trunc=$trunc forks=$forks $(grep -m1 ttft "$OUT/touch.out")"
     cp "$seg" "$OUT/touch_seg_fail_r$ROUND.log"
   else
     log "deep touch OK (round $ROUND): $(grep -m1 ttft "$OUT/touch.out" | cut -c1-80)"
