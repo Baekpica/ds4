@@ -13,9 +13,17 @@
 #
 # PASS = every probe answers its keystone code exactly, plus 0 illegal /
 # 0 'continuous batch failed' / 0 'prompt start' / 0 'cont admit rejected'
-# across the run. NOTE 'cold admit evicting DEEP record ... (all candidates
-# deep)' lines are EXPECTED here (every sweep bank is above the pin
-# threshold) and are reported but NOT gated.
+# across the run.
+#
+# The boot runs DS4_SERVER_WARM=0: this is a single-tenant COLD-retrieval
+# matrix, and warm retention breaks it (2026-07-15 run 1: retained deep
+# records keep their committed pages while placement steers new admits to
+# FREE banks — bank slots and the page budget are different currencies —
+# so probes 4+ hit 'cont admit rejected on comp-cache budget' with 90+ GiB
+# nominally free. Records only yield pages via bank REUSE, which the
+# free-bank preference avoids. Post-v0.2: budget-aware eviction retry.)
+# With warm off every probe rides the engine-default lowest-free-bank and
+# pays honest full prefill, which is exactly what the matrix measures.
 #
 # LAW: a release claim at ctx N needs a standing leg above the largest tested
 # ctx — that is speed-bench/deep_ctx_gate.sh (518K probe + 766K concurrent at
@@ -73,7 +81,7 @@ ssh "$R" "prev=\$(awk '/MemAvailable/{print \$2}' /proc/meminfo); i=0
   echo \"mem NOT stable after 120s: \$((cur/1048576)) GiB (continuing)\"" | tee -a "$DRV"
 log "boot: ctx=$CTX ship cont env${EXTRA_ENV:+ + $EXTRA_ENV}"
 ssh "$R" ": > $SRV; cd $RT; env $EXTRA_ENV \
-    DS4_CUDA_NO_HBM_CACHE=1 \
+    DS4_CUDA_NO_HBM_CACHE=1 DS4_SERVER_WARM=0 \
     DS4_BATCH_FIT_HEADROOM_MB=$HEADROOM_MB DS4_SERVER_COALESCE_MAX=8 \
     DS4_CONT_PREFILL_CHUNK=2048 DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1 \
     DS4_DSPARK_MODEL=$DRAFTER DS4_CONT_CAPTURE=1 DS4_SERVER_DEFAULT_TEMP=0 \
