@@ -101,6 +101,14 @@ rm -f "$SENT"; : > "$DRV"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$DRV"; }
 fail(){ log "FAIL: $*"; echo "RUN_DONE_tebgates exit=1" >> "$SENT"; exit 1; }
 
+# v0.2.x counter-based health (PRIMARY): per-leg /metrics deltas mirror the
+# stderr greps below, which stay as fallback for one release.  msnap fails on
+# an unreachable/empty endpoint — the endpoint ships with this release, so a
+# leg that cannot fetch it is itself a failure.
+msnap(){ curl -s -m 10 "http://127.0.0.1:$TUNNEL_PORT/metrics" > "$1" && [ -s "$1" ]; }
+mval(){ awk -v k="$2" '$1 == k {v=$2} END {printf "%.0f", v+0}' "$1" 2>/dev/null; }
+mdelta(){ echo $(( $(mval "$2" "$3") - $(mval "$1" "$3") )); }
+
 SRV=""          # remote server log of the current boot
 SUMMARY=""
 
@@ -164,6 +172,7 @@ run_teb(){
   local name=$1 model=$2 need=$3; shift 3
   local off
   off=$(ssh "$R" "wc -l < $SRV")
+  msnap "$OUT/m_${name}_pre.txt" || fail "$name: /metrics unreachable pre-run"
   log "$name: bench starting (model=$model, srv offset $off)"
   ( cd "$TEB" && .venv/bin/python -m tool_eval_bench \
       --model "$model" --backend vllm --base-url "http://127.0.0.1:$TUNNEL_PORT/v1" \
@@ -173,6 +182,14 @@ run_teb(){
   local rc=$?
   local seg=$OUT/teb_${name}_srv.log
   ssh "$R" "tail -n +$((off+1)) $SRV" > "$seg"
+  msnap "$OUT/m_${name}_post.txt" || fail "$name: /metrics unreachable post-run"
+  # PRIMARY health: registry counter deltas over this leg.
+  local mfb mser mrej mhits
+  mfb=$(mdelta "$OUT/m_${name}_pre.txt" "$OUT/m_${name}_post.txt" ds4_cont_batch_failures_total)
+  mser=$(mdelta "$OUT/m_${name}_pre.txt" "$OUT/m_${name}_post.txt" ds4_requests_serial_total)
+  mrej=$(mdelta "$OUT/m_${name}_pre.txt" "$OUT/m_${name}_post.txt" ds4_cont_admit_rejects_total)
+  mhits=$(mdelta "$OUT/m_${name}_pre.txt" "$OUT/m_${name}_post.txt" ds4_spec_hits_total)
+  # FALLBACK health (one release): the stderr grep twins of the counters.
   local ill fb acc ser rej score conn
   ill=$(grep -c 'illegal' "$seg" || true)
   fb=$(grep -c 'continuous batch failed' "$seg" || true)
@@ -184,16 +201,19 @@ run_teb(){
   # clean — that must fail the leg as ENVIRONMENT, never band as a score.
   conn=$(cat "$OUT/teb_${name}.json" 2>/dev/null "$OUT/teb_${name}.out" | grep -c 'All connection attempts failed' || true)
   score=$(grep -o '"final_score": *[0-9]*' "$OUT/teb_${name}.out" | tail -1 | grep -o '[0-9]*$'); score=${score:-none}
-  log "$name: rc=$rc score=$score illegal=$ill fallbacks=$fb accepts=$acc serial_starts=$ser admit_rejects=$rej"
+  log "$name: rc=$rc score=$score counters[fail=$mfb serial=$mser rejects=$mrej spec_hits=$mhits] greps[illegal=$ill fallbacks=$fb accepts=$acc serial_starts=$ser admit_rejects=$rej]"
   SUMMARY="$SUMMARY
-  $name: score=$score rc=$rc illegal=$ill fallbacks=$fb accepts=$acc serial_starts=$ser admit_rejects=$rej"
+  $name: score=$score rc=$rc cnt_fail=$mfb cnt_serial=$mser cnt_rejects=$mrej cnt_spec_hits=$mhits illegal=$ill fallbacks=$fb accepts=$acc serial_starts=$ser admit_rejects=$rej"
+  [ "$mfb" -eq 0 ] || fail "$name: ds4_cont_batch_failures_total +$mfb (counter)"
   [ "$ill" -eq 0 ] || fail "$name: illegal memory access in server log ($seg)"
   [ "$fb" -eq 0 ] || fail "$name: continuous-batch fallback in server log ($seg)"
   [ "$conn" -eq 0 ] || fail "$name: $conn connection-failure scenario(s) — ENVIRONMENT (tunnel/:$TUNNEL_PORT died mid-run?), score invalid"
   [ $rc -eq 0 ] || fail "$name: bench rc=$rc (see $OUT/teb_${name}.out)"
   case $need in
-    accepts) [ "$acc" -gt 0 ] || fail "$name: no CONT_MTP_ACCEPT(DSpark) lines — cont/DSpark path not engaged" ;;
-    serial)  [ "$ser" -gt 0 ] || fail "$name: no 'prompt start' lines — serial path not engaged" ;;
+    accepts) [ "$mhits" -gt 0 ] || fail "$name: ds4_spec_hits_total +0 — cont/DSpark path not engaged (counter)"
+             [ "$acc" -gt 0 ] || fail "$name: no CONT_MTP_ACCEPT(DSpark) lines — cont/DSpark path not engaged" ;;
+    serial)  [ "$mser" -gt 0 ] || fail "$name: ds4_requests_serial_total +0 — serial path not engaged (counter)"
+             [ "$ser" -gt 0 ] || fail "$name: no 'prompt start' lines — serial path not engaged" ;;
   esac
   LAST_SCORE=$score
 }

@@ -63,6 +63,12 @@ log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$DRV"; }
 fail(){ log "FAIL: $*"; echo "RUN_DONE_churnsoak exit=1" >> "$SENT"; exit 1; }
 mem_gib(){ ssh "$R" "awk '/MemAvailable/{printf \"%.1f\", \$2/1048576}' /proc/meminfo"; }
 
+# v0.2.x counter-based health (PRIMARY): /metrics snapshots + deltas mirror
+# the stderr greps below, which stay as fallback for one release.
+msnap(){ curl -s -m 10 "http://127.0.0.1:$TUNNEL/metrics" > "$1" && [ -s "$1" ]; }
+mval(){ awk -v k="$2" '$1 == k {v=$2} END {printf "%.0f", v+0}' "$1" 2>/dev/null; }
+mdelta(){ echo $(( $(mval "$2" "$3") - $(mval "$1" "$3") )); }
+
 log "build prompts: deep ~$DEEP_TOK @50% + $TENANTS tenants ~$TEN_TOK (rotated)"
 python3 "$HERE/needle_prompt.py" "$DEEP_TOK" "$OUT/deep.json" 0.50 "$DEEP_CODE" | tee -a "$DRV" || fail "deep prompt"
 for i in $(seq 1 "$TENANTS"); do
@@ -109,6 +115,7 @@ curl -s -m 5 "http://127.0.0.1:$TUNNEL/v1/models" >/dev/null 2>&1 || {
 }
 URL="http://127.0.0.1:$TUNNEL/v1/chat/completions"
 OFF0=$(ssh "$R" "wc -l < $SRV")
+msnap "$OUT/m0.txt" || fail "/metrics unreachable at boot"
 
 log "STAGE 1: admit deep trunk (cold ~${DEEP_TOK} tokens — several minutes)"
 python3 "$HERE/sse_probe_client.py" "$OUT/deep.json" "$URL" DEEP "$OUT/deep_result.json" > "$OUT/deep.out" 2>&1 \
@@ -133,10 +140,18 @@ TEN_MISS=0; TOUCH_FAIL=0; ROUND=0
 deep_touch(){
   local offt seg=$OUT/touch_seg.log
   offt=$(ssh "$R" "wc -l < $SRV")
+  msnap "$OUT/m_touch_pre.txt" || { TOUCH_FAIL=$((TOUCH_FAIL+1)); log "DEEP TOUCH FAIL (round $ROUND): /metrics unreachable"; return; }
   python3 "$HERE/sse_probe_client.py" "$OUT/touch.json" "$URL" TOUCH > "$OUT/touch.out" 2>&1
   local rc=$?
   ssh "$R" "tail -n +$((offt+1)) $SRV" > "$seg"
-  local warm forks trunc
+  msnap "$OUT/m_touch_post.txt" || { TOUCH_FAIL=$((TOUCH_FAIL+1)); log "DEEP TOUCH FAIL (round $ROUND): /metrics unreachable"; return; }
+  # PRIMARY: registry admit-class deltas over the touch; the stderr grep twins
+  # stay as fallback for one release.
+  local mwarm mtrunc mforks warm forks trunc
+  mwarm=$(mdelta "$OUT/m_touch_pre.txt" "$OUT/m_touch_post.txt" 'ds4_admits_total{kind="warm"}')
+  mtrunc=$(mdelta "$OUT/m_touch_pre.txt" "$OUT/m_touch_post.txt" 'ds4_admits_total{kind="partial_truncate"}')
+  mforks=$(( $(mdelta "$OUT/m_touch_pre.txt" "$OUT/m_touch_post.txt" 'ds4_admits_total{kind="fork"}') \
+           + $(mdelta "$OUT/m_touch_pre.txt" "$OUT/m_touch_post.txt" 'ds4_admits_total{kind="partial_fork"}') ))
   warm=$(grep -cE 'warm admit bank=[0-9]+ cached=[0-9]{6}' "$seg")
   forks=$(grep -c 'fork admit' "$seg")
   # Steady-state touch path: after the first touch the record carries the
@@ -144,12 +159,14 @@ deep_touch(){
   # record and the server serves it as an in-place partial truncate
   # (cut = deep trunk, suffix ~1) -- warm-class, cheaper than a re-admit.
   trunc=$(grep -cE 'partial truncate admit bank=[0-9]+ cut=[0-9]{6}' "$seg")
-  if [ $rc -ne 0 ] || ! grep -q "$DEEP_CODE" "$OUT/touch.out" || [ $((warm + trunc)) -lt 1 ] || [ "$forks" -ne 0 ]; then
+  if [ $rc -ne 0 ] || ! grep -q "$DEEP_CODE" "$OUT/touch.out" || \
+     [ $((mwarm + mtrunc)) -lt 1 ] || [ "$mforks" -ne 0 ] || \
+     [ $((warm + trunc)) -lt 1 ] || [ "$forks" -ne 0 ]; then
     TOUCH_FAIL=$((TOUCH_FAIL+1))
-    log "DEEP TOUCH FAIL (round $ROUND): rc=$rc warm=$warm trunc=$trunc forks=$forks $(grep -m1 ttft "$OUT/touch.out")"
+    log "DEEP TOUCH FAIL (round $ROUND): rc=$rc counters[warm=$mwarm trunc=$mtrunc forks=$mforks] greps[warm=$warm trunc=$trunc forks=$forks] $(grep -m1 ttft "$OUT/touch.out")"
     cp "$seg" "$OUT/touch_seg_fail_r$ROUND.log"
   else
-    log "deep touch OK (round $ROUND): $(grep -m1 ttft "$OUT/touch.out" | cut -c1-80)"
+    log "deep touch OK (round $ROUND): warm=+$mwarm trunc=+$mtrunc $(grep -m1 ttft "$OUT/touch.out" | cut -c1-80)"
   fi
 }
 
@@ -191,6 +208,17 @@ for pat in 'illegal' 'continuous batch failed' 'prompt start' 'cont admit reject
 done
 
 PASS=1
+# PRIMARY health: registry counter deltas over the whole soak.
+msnap "$OUT/m_end.txt" || { log "/metrics unreachable at end"; PASS=0; }
+MFB=$(mdelta "$OUT/m0.txt" "$OUT/m_end.txt" ds4_cont_batch_failures_total)
+MSER=$(mdelta "$OUT/m0.txt" "$OUT/m_end.txt" ds4_requests_serial_total)
+MREJ=$(mdelta "$OUT/m0.txt" "$OUT/m_end.txt" ds4_cont_admit_rejects_total)
+log "counters: fail=+$MFB serial=+$MSER rejects=+$MREJ"
+[ "$MFB" -eq 0 ]  || { log "CONT FAIL (counter +$MFB)"; PASS=0; }
+[ "$MSER" -eq 0 ] || { log "SERIAL FALLBACK (counter +$MSER)"; PASS=0; }
+[ "$MREJ" -eq 0 ] || { log "ADMIT REJECT (counter +$MREJ)"; PASS=0; }
+# FALLBACK health (one release): the stderr grep twins ('DEEP record evicted'
+# and 'illegal' have no counter twin and stay grep-gated).
 [ "$(grep -c 'cold admit evicting DEEP record' "$OUT/srv_seg.log")" -eq 0 ] || { log "DEEP RECORD EVICTED (pin tier failed)"; PASS=0; }
 [ "$TEN_MISS" -eq 0 ] || { log "TENANT MISSES=$TEN_MISS"; PASS=0; }
 [ "$TOUCH_FAIL" -eq 0 ] || { log "DEEP TOUCH FAILS=$TOUCH_FAIL"; PASS=0; }

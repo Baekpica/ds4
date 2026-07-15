@@ -60,6 +60,12 @@ rm -f "$SENT"; : > "$DRV"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$DRV"; }
 fail(){ log "FAIL: $*"; echo "RUN_DONE_deepctxgate exit=1" >> "$SENT"; exit 1; }
 
+# v0.2.x counter-based health (PRIMARY): /metrics snapshots + deltas mirror
+# the stderr greps in the PASS block, which stay as fallback for one release.
+msnap(){ curl -s -m 10 "http://127.0.0.1:$TUNNEL/metrics" > "$1" && [ -s "$1" ]; }
+mval(){ awk -v k="$2" '$1 == k {v=$2} END {printf "%.0f", v+0}' "$1" 2>/dev/null; }
+mdelta(){ echo $(( $(mval "$2" "$3") - $(mval "$1" "$3") )); }
+
 log "build needle prompts (orch ~$ORCH_TOK @35%, sub ~$SUB_TOK @70%)"
 python3 "$HERE/needle_prompt.py" "$ORCH_TOK" "$OUT/orch.json" 0.35 "8842-OMEGA-KILO" | tee -a "$DRV" || fail "orch prompt"
 python3 "$HERE/needle_prompt.py" "$SUB_TOK"  "$OUT/sub.json"  0.70 "5517-SIGMA-NOVA" | tee -a "$DRV" || fail "sub prompt"
@@ -103,6 +109,7 @@ curl -s -m 5 "http://127.0.0.1:$TUNNEL/v1/models" >/dev/null 2>&1 || {
 
 URL="http://127.0.0.1:$TUNNEL/v1/chat/completions"
 OFF=$(ssh "$R" "wc -l < $SRV")
+msnap "$OUT/m0.txt" || fail "/metrics unreachable at boot"
 
 log "STAGE 1: concurrent orchestrator + subagent needles (long: deep prefill)"
 python3 "$HERE/sse_probe_client.py" "$OUT/orch.json" "$URL" ORCH "$OUT/orch_result.json" > "$OUT/orch.out" 2>&1 &
@@ -128,9 +135,11 @@ b["max_tokens"] = 512
 json.dump(b, open(sys.argv[3], "w"))
 EOF
 OFF2=$(ssh "$R" "wc -l < $SRV")
+msnap "$OUT/m_turn2_pre.txt" || fail "/metrics unreachable before turn 2"
 python3 "$HERE/sse_probe_client.py" "$OUT/turn2.json" "$URL" TURN2 > "$OUT/turn2.out" 2>&1
 RC3=$?
 cat "$OUT/turn2.out" | tee -a "$DRV"
+msnap "$OUT/m_end.txt" || fail "/metrics unreachable after turn 2"
 
 ssh "$R" "tail -n +$((OFF+1)) $SRV" > "$OUT/srv_seg.log"
 ssh "$R" "tail -n +$((OFF2+1)) $SRV" > "$OUT/turn2_seg.log"
@@ -141,6 +150,20 @@ done
 grep -E 'warm admit|fork admit|cont admit bank|rejected|refreshed' "$OUT/srv_seg.log" | head -8 | tee -a "$DRV"
 
 PASS=1
+# PRIMARY health: registry counter deltas (whole run, and the turn-2 slice).
+MFB=$(mdelta "$OUT/m0.txt" "$OUT/m_end.txt" ds4_cont_batch_failures_total)
+MSER=$(mdelta "$OUT/m0.txt" "$OUT/m_end.txt" ds4_requests_serial_total)
+MREJ=$(mdelta "$OUT/m0.txt" "$OUT/m_end.txt" ds4_cont_admit_rejects_total)
+T2WARM=$(mdelta "$OUT/m_turn2_pre.txt" "$OUT/m_end.txt" 'ds4_admits_total{kind="warm"}')
+T2FORK=$(( $(mdelta "$OUT/m_turn2_pre.txt" "$OUT/m_end.txt" 'ds4_admits_total{kind="fork"}') \
+         + $(mdelta "$OUT/m_turn2_pre.txt" "$OUT/m_end.txt" 'ds4_admits_total{kind="partial_fork"}') ))
+log "counters: fail=+$MFB serial=+$MSER rejects=+$MREJ turn2[warm=+$T2WARM fork=+$T2FORK]"
+[ "$MFB" -eq 0 ]  || { log "CONT FAIL (counter +$MFB)"; PASS=0; }
+[ "$MSER" -eq 0 ] || { log "SERIAL FALLBACK (counter +$MSER)"; PASS=0; }
+[ "$MREJ" -eq 0 ] || { log "ADMIT REJECT (counter +$MREJ)"; PASS=0; }
+[ "$T2WARM" -ge 1 ] || { log "TURN2 NOT WARM (counter +$T2WARM)"; PASS=0; }
+[ "$T2FORK" -eq 0 ] || { log "TURN2 FORKED (counter +$T2FORK, deep fork guard failed)"; PASS=0; }
+# FALLBACK health (one release): the stderr grep twins.
 grep -q '8842-OMEGA-KILO' "$OUT/orch.out" || { log "ORCH NEEDLE MISS"; PASS=0; }
 grep -q '5517-SIGMA-NOVA' "$OUT/sub.out"  || { log "SUB NEEDLE MISS"; PASS=0; }
 [ $RC3 -eq 0 ] || { log "turn2 client rc=$RC3"; PASS=0; }

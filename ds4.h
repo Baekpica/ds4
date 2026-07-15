@@ -342,6 +342,96 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                                     const int *tokens, int n, int finish),
                                     void *ud, char *err, size_t errlen);
 
+/* =========================================================================
+ * Live serving metrics (v0.2.x observability): ONE registry, THREE porcelains.
+ *
+ * A single global registry of monotonic counters + gauges, incremented by the
+ * engine and the server at event sites and rendered by the server's three
+ * user-facing surfaces (per-response `timings`, GET /metrics, GET /v1/stats).
+ * No surface computes its own numbers -- everything reads this registry.
+ *
+ * Concurrency model: every hot writer runs under the server's gen_mu (the
+ * continuous loop, the serial path, the static batch path), so writes are
+ * effectively single-threaded; the cold writers (request accounting on client
+ * threads) and the readers (HTTP threads rendering /metrics -- which must
+ * NEVER block on generation: gen_mu is held for minutes at deep ctx) are
+ * cross-thread.  All accesses go through the relaxed-atomic helpers below --
+ * one relaxed add per decode step is free next to a multi-ms GPU step.
+ *
+ * The rolling window is DS4_METRICS_WIN_SECONDS of per-second buckets feeding
+ * the decode/prefill rate gauges; a reader racing a bucket reset can see one
+ * partially-cleared second, which is acceptable noise for a rate gauge. */
+#define DS4_METRICS_WIN_BUCKETS 64
+#define DS4_METRICS_WIN_SECONDS 60
+typedef struct {
+    uint64_t stamp;               /* monotonic second this bucket belongs to */
+    uint64_t dec_tok, dec_steps, pf_tok;
+} ds4_metrics_bucket;
+typedef struct {
+    /* requests (server-incremented; one increment per generation request) */
+    uint64_t requests_started;
+    uint64_t requests_completed;            /* a response was written */
+    uint64_t requests_failed;               /* a 5xx/prefill-failure was written */
+    uint64_t requests_refused_deep_serial;  /* deep-serial guard 503s */
+    uint64_t requests_serial;               /* served on the legacy serial path */
+    uint64_t requests_inflight;             /* gauge */
+    /* engine admission + refusals */
+    uint64_t graph_fit_refusals;            /* session-graph fit gate said no */
+    uint64_t cont_admit_rejects;            /* comp-cache budget rejects */
+    uint64_t cont_batch_failures;           /* continuous run ended in error */
+    uint64_t admits_cold, admits_warm, admits_fork;
+    uint64_t admits_partial_fork, admits_partial_truncate;
+    /* tokens */
+    uint64_t tokens_prefilled_computed;     /* prompt tokens actually forwarded */
+    uint64_t tokens_prefilled_cached;       /* prompt tokens reused from KV */
+    uint64_t tokens_decoded;                /* generated tokens (all paths) */
+    uint64_t decode_steps;                  /* batched forward steps */
+    /* speculation (DSpark / MTP accept path) */
+    uint64_t spec_drafts, spec_hits, spec_quench;
+    /* gauges */
+    uint64_t banks_live;                    /* banks decoding right now */
+    uint64_t banks_total;                   /* persistent ctx bank count */
+    uint64_t warm_records;                  /* valid warm-start records */
+    uint64_t kv_pages_resident;             /* demand-mapped comp/index pages */
+    uint64_t boot_stamp;                    /* monotonic second at server boot */
+    ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
+} ds4_metrics;
+ds4_metrics *ds4_metrics_get(void);
+static inline void ds4_metric_add(uint64_t *c, uint64_t v) {
+    __atomic_fetch_add(c, v, __ATOMIC_RELAXED);
+}
+static inline void ds4_metric_set(uint64_t *c, uint64_t v) {
+    __atomic_store_n(c, v, __ATOMIC_RELAXED);
+}
+static inline uint64_t ds4_metric_read(const uint64_t *c) {
+    return __atomic_load_n(c, __ATOMIC_RELAXED);
+}
+/* Record dec_tok/dec_steps/pf_tok into the current second's bucket. */
+void ds4_metrics_window_add(uint64_t dec_tok, uint64_t dec_steps, uint64_t pf_tok);
+/* Rates over the trailing window (clamped to time since boot_stamp):
+ * decode tok/s, prefill tok/s, and decoded tokens per step.  Any out
+ * pointer may be NULL. */
+void ds4_metrics_window_rates(double *dec_tok_s, double *pf_tok_s, double *tok_per_step);
+
+/* Per-sequence serving stats for the per-response `timings` porcelain.
+ * Valid ONLY while an on_done callback with real tokens is executing: the
+ * continuous loop fills the ctx's last-done slot immediately before each such
+ * callback (rejected admits -- on_done(NULL) -- leave it untouched).  All
+ * times are now_sec()-domain (CLOCK_MONOTONIC seconds). */
+typedef struct {
+    double   admit_sec;        /* admission install (prefill queue entry) */
+    double   first_token_sec;  /* seed token sampled = prefill complete */
+    double   done_sec;
+    uint32_t prefill_cached;   /* reused prefix (warm/fork/partial cut) */
+    uint32_t prefill_computed; /* suffix tokens actually forwarded */
+    uint32_t decode_tokens;    /* emitted tokens (seed + decode/accepts) */
+    uint32_t decode_steps;     /* steps this bank participated in */
+    uint64_t spec_drafts, spec_hits;   /* this sequence's draft rows / accepts */
+} ds4_cont_seq_stats;
+/* Copy the finishing sequence's stats; returns 1 when set (see above), 0
+ * when no completed-sequence stats are available. */
+int ds4_cont_last_done_stats(const ds4_batch_ctx *ctx, ds4_cont_seq_stats *out);
+
 /* Phase 2 S1.1: deterministic MTP gate.  Drives the continuous engine over a fixed
  * set of synthetic prompts (deterministic admission) and asserts the per-seq output
  * tokens are identical with the per-bank MTP draft path off vs on -- the clean

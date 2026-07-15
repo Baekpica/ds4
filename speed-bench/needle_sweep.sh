@@ -67,6 +67,12 @@ echo "size_est,depth,actual_prompt_tokens,ttft_s,decode_deltas,memavail_gib,pass
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$DRV"; }
 fail(){ log "FAIL: $*"; echo "RUN_DONE_needlesweep exit=1" >> "$SENT"; exit 1; }
 
+# v0.2.x counter-based health (PRIMARY): /metrics snapshots + deltas mirror
+# the stderr greps below, which stay as fallback for one release.
+msnap(){ curl -s -m 10 "http://127.0.0.1:$TUNNEL/metrics" > "$1" && [ -s "$1" ]; }
+mval(){ awk -v k="$2" '$1 == k {v=$2} END {printf "%.0f", v+0}' "$1" 2>/dev/null; }
+mdelta(){ echo $(( $(mval "$2" "$3") - $(mval "$1" "$3") )); }
+
 log "boot: killing old ds4-server on $R"
 ssh "$R" "pkill -x ds4-server; sleep 2; pkill -9 -x ds4-server; rm -f /tmp/ds4.lock; exit 0"
 # Boot-fit hygiene (law re-learned 2026-07-14): wait for MemAvailable to
@@ -105,6 +111,7 @@ curl -s -m 5 "http://127.0.0.1:$TUNNEL/v1/models" >/dev/null 2>&1 || {
 }
 URL="http://127.0.0.1:$TUNNEL/v1/chat/completions"
 OFF0=$(ssh "$R" "wc -l < $SRV")
+msnap "$OUT/m0.txt" || fail "/metrics unreachable at boot"
 
 MISS=0; NPROBE=0
 for SZ in $SIZES; do
@@ -147,6 +154,16 @@ for pat in 'illegal' 'continuous batch failed' 'prompt start' 'cont admit reject
 done
 
 PASS=1
+# PRIMARY health: registry counter deltas over the whole sweep.
+msnap "$OUT/m_end.txt" || { log "/metrics unreachable at end"; PASS=0; }
+MFB=$(mdelta "$OUT/m0.txt" "$OUT/m_end.txt" ds4_cont_batch_failures_total)
+MSER=$(mdelta "$OUT/m0.txt" "$OUT/m_end.txt" ds4_requests_serial_total)
+MREJ=$(mdelta "$OUT/m0.txt" "$OUT/m_end.txt" ds4_cont_admit_rejects_total)
+log "counters: fail=+$MFB serial=+$MSER rejects=+$MREJ"
+[ "$MFB" -eq 0 ]  || { log "CONT FAIL (counter +$MFB)"; PASS=0; }
+[ "$MSER" -eq 0 ] || { log "SERIAL FALLBACK (counter +$MSER)"; PASS=0; }
+[ "$MREJ" -eq 0 ] || { log "ADMIT REJECT (counter +$MREJ)"; PASS=0; }
+# FALLBACK health (one release): the stderr grep twins.
 [ "$MISS" -eq 0 ] || { log "PROBE MISSES=$MISS/$NPROBE"; PASS=0; }
 [ "$(grep -c 'illegal' "$OUT/srv_seg.log")" -eq 0 ] || { log "ILLEGAL"; PASS=0; }
 [ "$(grep -c 'continuous batch failed' "$OUT/srv_seg.log")" -eq 0 ] || { log "CONT FAIL"; PASS=0; }

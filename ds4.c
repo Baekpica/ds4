@@ -733,6 +733,52 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+/* ---- Live serving metrics registry (see ds4.h) --------------------------
+ * Zero-initialized global; the engine and the server increment it at event
+ * sites through the relaxed-atomic helpers, the server renders it.  Window
+ * buckets are keyed by monotonic second; a bucket is lazily reset when the
+ * writer first touches it in a new second (single hot writer under gen_mu,
+ * so the reset is not racy against other writers -- only against readers,
+ * which tolerate one partially-cleared second in a rate gauge). */
+static ds4_metrics g_metrics;
+
+ds4_metrics *ds4_metrics_get(void) { return &g_metrics; }
+
+void ds4_metrics_window_add(uint64_t dec_tok, uint64_t dec_steps, uint64_t pf_tok) {
+    ds4_metrics_bucket *bk;
+    const uint64_t now = (uint64_t)now_sec();
+    bk = &g_metrics.win[now % DS4_METRICS_WIN_BUCKETS];
+    if (ds4_metric_read(&bk->stamp) != now) {
+        ds4_metric_set(&bk->dec_tok, 0);
+        ds4_metric_set(&bk->dec_steps, 0);
+        ds4_metric_set(&bk->pf_tok, 0);
+        ds4_metric_set(&bk->stamp, now);
+    }
+    if (dec_tok)   ds4_metric_add(&bk->dec_tok, dec_tok);
+    if (dec_steps) ds4_metric_add(&bk->dec_steps, dec_steps);
+    if (pf_tok)    ds4_metric_add(&bk->pf_tok, pf_tok);
+}
+
+void ds4_metrics_window_rates(double *dec_tok_s, double *pf_tok_s, double *tok_per_step) {
+    const uint64_t now = (uint64_t)now_sec();
+    uint64_t tok = 0, steps = 0, pf = 0;
+    for (int i = 0; i < DS4_METRICS_WIN_BUCKETS; i++) {
+        const uint64_t st = ds4_metric_read(&g_metrics.win[i].stamp);
+        if (st == 0 || st + DS4_METRICS_WIN_SECONDS <= now) continue;
+        tok   += ds4_metric_read(&g_metrics.win[i].dec_tok);
+        steps += ds4_metric_read(&g_metrics.win[i].dec_steps);
+        pf    += ds4_metric_read(&g_metrics.win[i].pf_tok);
+    }
+    /* A young server has fewer than WIN seconds of history; divide by what
+     * actually elapsed so the gauges do not lowball the warm-up minute. */
+    uint64_t span = DS4_METRICS_WIN_SECONDS;
+    const uint64_t boot = ds4_metric_read(&g_metrics.boot_stamp);
+    if (boot != 0 && now >= boot && now - boot < span) span = now - boot + 1;
+    if (dec_tok_s)    *dec_tok_s    = (double)tok / (double)span;
+    if (pf_tok_s)     *pf_tok_s     = (double)pf  / (double)span;
+    if (tok_per_step) *tok_per_step = steps ? (double)tok / (double)steps : 0.0;
+}
+
 static void sleep_sec(double sec) {
     if (sec <= 0.0 || !isfinite(sec)) return;
     struct timespec req;
@@ -10093,6 +10139,7 @@ static bool metal_graph_session_fit_ok(
         if (v >= 0) headroom = (uint64_t)v << 20;
     }
     if (free_b >= need + headroom) return true;
+    ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
     fprintf(stderr,
             "ds4: session graph fit check FAILED: need ~%.0f MiB (+%.0f MiB headroom) "
             "but only %.0f MiB allocatable (ctx=%u prefill_cap=%u mtp=%d dspark=%d); "
@@ -31732,7 +31779,18 @@ struct ds4_batch_ctx {
     uint64_t        comp_map_budget;
     uint8_t         comp_map_budget_pinned;
     uint64_t        mem_rejects;
+    /* v0.2.x observability: the finishing sequence's serving stats, filled
+     * immediately before every on_done callback with real tokens (see
+     * ds4_cont_last_done_stats in ds4.h). */
+    ds4_cont_seq_stats last_done;
+    uint8_t            last_done_set;
 };
+
+int ds4_cont_last_done_stats(const ds4_batch_ctx *ctx, ds4_cont_seq_stats *out) {
+    if (!ctx || !ctx->last_done_set || !out) return 0;
+    *out = ctx->last_done;
+    return 1;
+}
 
 /* R5 Inc1b: first-touch page floor of ONE ACTIVE bank's demand-mapped cache
  * slabs -- any bank actually serving a conversation maps at least one page per
@@ -32131,6 +32189,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         ds4_batch_ctx_destroy(ctx);
         return 1;
     }
+    ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
     *out = ctx;
     return 0;
 #undef BC_ERR
@@ -33337,6 +33396,18 @@ static void ds4_dspark_trace_flush(uint32_t bank, uint32_t D,
  * whole admission.  The full slab is repointed [0,max_seq) for the whole run; banks
  * are addressed by absolute seq_id (idle banks have ms_n_comp=0 so they don't raise
  * the max read-count). */
+
+/* v0.2.x observability: publish the finishing sequence's stats so the server's
+ * on_done callback can query them (ds4_cont_last_done_stats).  Called
+ * immediately before every on_done with real tokens. */
+static void cont_stats_publish_done(ds4_batch_ctx *ctx, ds4_cont_seq_stats *sst,
+                                    uint32_t b, uint32_t emitted) {
+    sst[b].decode_tokens = emitted;
+    sst[b].done_sec = now_sec();
+    ctx->last_done = sst[b];
+    ctx->last_done_set = 1u;
+}
+
 int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                    int (*admit)(void *ud, ds4_cont_request *req),
                                    int (*on_token)(void *ud, void *user, int token),
@@ -33395,6 +33466,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint32_t *pfoff  = xcalloc(MS, sizeof(uint32_t));   /* tokens already committed */
     uint32_t *pfbase = xcalloc(MS, sizeof(uint32_t));   /* suffix start position    */
     double   *pft0   = xcalloc(MS, sizeof(double));     /* install time (timing log) */
+    /* v0.2.x observability: per-bank serving stats (registry + timings). */
+    ds4_cont_seq_stats *sst = xcalloc(MS, sizeof(ds4_cont_seq_stats));
     uint32_t  pfq[DS4_MULTISEQ_MAX_SEQ];                /* FCFS queue of pending banks */
     uint32_t  pfq_h = 0, pfq_n = 0;
     int      qtokens[DS4_MULTISEQ_MAX_SEQ];
@@ -33404,7 +33477,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     int      sampled[DS4_MULTISEQ_MAX_SEQ];   /* S1.0b: token the base model sampled per row */
     bool ok = live && usr && posv && cur && beos && bmax && glen && gbuf &&
               btemp && btopk && btopp && bminp && brng && logits && seedlog &&
-              pftok && pflen && pfoff && pfbase && pft0;
+              pftok && pflen && pfoff && pfbase && pft0 && sst;
 
     /* S1.0b: per-bank MTP draft probe (DS4_CONT_MTP_DRAFT_PROBE).  Runs the
      * per-bank drafter in lockstep with the real decode (depth 1), seeded from
@@ -33817,6 +33890,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
                 if (mneed != 0 && mres + mneed > ctx->comp_map_budget) {
                     ctx->mem_rejects++;
+                    ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
                     fprintf(stderr,
                             "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + need %.1f MiB > budget %.1f MiB)\n",
                             b, (double)mres / 1048576.0, (double)mneed / 1048576.0,
@@ -33868,6 +33942,26 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 pft0[b]   = now_sec();
                 pfq[(pfq_h + pfq_n) % MS] = b;
                 pfq_n++;
+                /* v0.2.x observability: stamp + classify this admission. */
+                {
+                    ds4_metrics *mreg = ds4_metrics_get();
+                    memset(&sst[b], 0, sizeof(sst[b]));
+                    sst[b].admit_sec = pft0[b];
+                    sst[b].prefill_cached = P;
+                    sst[b].prefill_computed = S;
+                    if (partial) ds4_metric_add(fsrc == b ? &mreg->admits_partial_truncate
+                                                          : &mreg->admits_partial_fork, 1);
+                    else if (fork) ds4_metric_add(&mreg->admits_fork, 1);
+                    else if (warm) ds4_metric_add(&mreg->admits_warm, 1);
+                    else           ds4_metric_add(&mreg->admits_cold, 1);
+                    if (P) ds4_metric_add(&mreg->tokens_prefilled_cached, P);
+                    if (ctx->sl.vmm) {
+                        const uint64_t page = ds4_gpu_vmm_demand_page();
+                        if (page)
+                            ds4_metric_set(&mreg->kv_pages_resident,
+                                           ds4_batch_slabs_cache_resident(&ctx->sl) / page);
+                    }
+                }
             }
             if (req.bank_used) *req.bank_used = (int)b;
             if (ctx->mtp) {
@@ -33890,6 +33984,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 if (dspark_quench_force_step == 0u) {
                     qn_quenched[b] = 1u;
                     ndr[b] = 0u;
+                    ds4_metric_add(&ds4_metrics_get()->spec_quench, 1);
                     fprintf(stderr,
                             "ds4: cont-dspark yield-quench bank=%u pos=%u spec_steps=%u debt=%.2f yewma=%.2f -> spec off for this seq (terminal) (forced)\n",
                             b, L, qn_spec_steps[b], qn_debt[b], qn_yewma[b]);
@@ -34014,6 +34109,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
                 bank_hist_append_n(ctx, b, pftok[b] + pfoff[b], n);
                 pfoff[b] += n;
+                ds4_metric_add(&ds4_metrics_get()->tokens_prefilled_computed, n);
+                ds4_metrics_window_add(0, 0, n);
                 if (final) {
                     /* prefill complete: release the pending state, sample the seed
                      * token, stream it, and make the bank live (or finish at seed). */
@@ -34032,12 +34129,16 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     glen[b] = 1u;
                     cur[b]  = nt;
                     posv[b] = Ltot;
+                    sst[b].first_token_sec = now_sec();
+                    ds4_metric_add(&ds4_metrics_get()->tokens_decoded, 1);
+                    ds4_metrics_window_add(1, 0, 0);
                     const bool hit_eos = (beos[b] >= 0 && nt == beos[b]);
                     /* Stream the seed token (skip EOS, which carries no visible text
                      * and is the stop signal); on_token returning 0 aborts this seq. */
                     bool aborted = false;
                     if (!hit_eos && on_token && !on_token(ud, usr[b], nt)) aborted = true;
                     if (hit_eos || glen[b] >= bmax[b] || aborted) {
+                        cont_stats_publish_done(ctx, sst, b, glen[b]);
                         on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                         free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
                         if (dspark_trace)
@@ -34066,6 +34167,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
 
         uint32_t n_live = 0;
         for (uint32_t b = 0; b < MS; b++) if (live[b]) n_live++;
+        ds4_metric_set(&ds4_metrics_get()->banks_live, n_live);
         if (n_live == 0u) {
             if (pfq_n) continue;        /* admissions still prefilling -> keep chunking */
             if (admit_drained) break;   /* queue empty and nothing in flight -> done */
@@ -34286,6 +34388,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * spec lossless); per-token sample_override forces structural DSML
              * syntax to argmax exactly like the plain and serial paths. */
             const double accept_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
+            const uint64_t acc_drafts0 = mtp_acc_drafts, acc_hits0 = mtp_acc_hits;
             for (uint32_t b = 0; b < MS; b++) {
                 if (!live[b]) continue;
                 const uint32_t f = vfirst[b];
@@ -34305,6 +34408,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     bool aborted = false;
                     if (!hit_eos && on_token && !on_token(ud, usr[b], u)) aborted = true;
                     if (hit_eos || glen[b] >= bmax[b] || aborted) {
+                        cont_stats_publish_done(ctx, sst, b, glen[b]);
                         on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                         free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; evicted = true;
                     }
@@ -34313,8 +34417,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     const int dft = dbuf[b * DS4_CONT_MTP_MAX_DEPTH + j];
                     if (dspark_trace) trace_comp[b]++;
                     mtp_acc_drafts++;
+                    sst[b].spec_drafts++;
                     if (dft != u) break;   /* draft mismatched the genuine token -> reject tail */
                     mtp_acc_hits++;
+                    sst[b].spec_hits++;
                     /* draft j accepted: its row (input == committed token) yields the next real token.
                      * sample_override sees a scanner already advanced through the just-committed
                      * u (on_token above ran synchronously), so its verdict is position-exact. */
@@ -34328,6 +34434,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     bool aborted = false;
                     if (!hit_eos && on_token && !on_token(ud, usr[b], u)) aborted = true;
                     if (hit_eos || glen[b] >= bmax[b] || aborted) {
+                        cont_stats_publish_done(ctx, sst, b, glen[b]);
                         on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                         free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; evicted = true;
                     }
@@ -34363,6 +34470,31 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
             }
             if (dspark_prof && dspark_now) dspark_t_accept_s += now_sec() - accept_t0;
+            /* v0.2.x observability: one registry update per accept step. */
+            {
+                ds4_metrics *mreg = ds4_metrics_get();
+                uint64_t step_emit = 0;
+                for (uint32_t b = 0; b < MS; b++) {
+                    if (committed_rows[b] == 0u) continue;
+                    sst[b].decode_steps++;
+                    step_emit += committed_rows[b];
+                }
+                if (step_emit) {
+                    ds4_metric_add(&mreg->tokens_decoded, step_emit);
+                    ds4_metric_add(&mreg->decode_steps, 1);
+                    ds4_metrics_window_add(step_emit, 1, 0);
+                }
+                if (mtp_acc_drafts != acc_drafts0)
+                    ds4_metric_add(&mreg->spec_drafts, mtp_acc_drafts - acc_drafts0);
+                if (mtp_acc_hits != acc_hits0)
+                    ds4_metric_add(&mreg->spec_hits, mtp_acc_hits - acc_hits0);
+                if (ctx->sl.vmm && (steps & 255u) == 0u) {
+                    const uint64_t page = ds4_gpu_vmm_demand_page();
+                    if (page)
+                        ds4_metric_set(&mreg->kv_pages_resident,
+                                       ds4_batch_slabs_cache_resident(&ctx->sl) / page);
+                }
+            }
             if (dspark_trace || dspark_quench) {
                 for (uint32_t b = 0; b < MS; b++) {
                     if (committed_rows[b] == 0u) continue;
@@ -34389,6 +34521,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     if (forced || policy_quench) {
                         qn_quenched[b] = 1u;
                         ndr[b] = 0u;
+                        ds4_metric_add(&ds4_metrics_get()->spec_quench, 1);
                         fprintf(stderr,
                                 "ds4: cont-dspark yield-quench bank=%u pos=%u spec_steps=%u debt=%.2f yewma=%.2f -> spec off for this seq (terminal)%s\n",
                                 b, posv[b], qn_spec_steps[b], qn_debt[b], qn_yewma[b],
@@ -34796,12 +34929,27 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             glen[b]++;
             cur[b] = nt;
             posv[b]++;
+            sst[b].decode_steps++;
             const bool hit_eos = (beos[b] >= 0 && nt == beos[b]);
             bool aborted = false;
             if (!hit_eos && on_token && !on_token(ud, usr[b], nt)) aborted = true;
             if (hit_eos || glen[b] >= bmax[b] || aborted) {
+                cont_stats_publish_done(ctx, sst, b, glen[b]);
                 on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                 free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u;
+            }
+        }
+        /* v0.2.x observability: one registry update per plain decode step. */
+        if (k > 0) {
+            ds4_metrics *mreg = ds4_metrics_get();
+            ds4_metric_add(&mreg->tokens_decoded, k);
+            ds4_metric_add(&mreg->decode_steps, 1);
+            ds4_metrics_window_add(k, 1, 0);
+            if (ctx->sl.vmm && (steps & 255u) == 0u) {
+                const uint64_t page = ds4_gpu_vmm_demand_page();
+                if (page)
+                    ds4_metric_set(&mreg->kv_pages_resident,
+                                   ds4_batch_slabs_cache_resident(&ctx->sl) / page);
             }
         }
         if (dspark_trace) {
@@ -34960,8 +35108,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (pftok) for (uint32_t b = 0; b < MS; b++) free(pftok[b]);
     free(live); free(usr); free(posv); free(cur); free(beos); free(bmax); free(glen); free(gbuf);
     free(btemp); free(btopk); free(btopp); free(bminp); free(brng); free(bsoc);
-    free(pftok); free(pflen); free(pfoff); free(pfbase); free(pft0);
+    free(pftok); free(pflen); free(pfoff); free(pfbase); free(pft0); free(sst);
     free(logits); free(seedlog);
+    ds4_metric_set(&ds4_metrics_get()->banks_live, 0);
     free(dbuf); free(ndr); free(vqtok); free(vpos); free(vsid); free(vfirst); free(vnr); free(vlogits);
     if (mk_cand)   ds4_gpu_tensor_free(mk_cand);
     if (mk_prev)   ds4_gpu_tensor_free(mk_prev);
@@ -35921,6 +36070,10 @@ int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
 int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int **toks) {
     (void)ctx; (void)bank;
     if (toks) *toks = NULL;
+    return 0;
+}
+int ds4_cont_last_done_stats(const ds4_batch_ctx *ctx, ds4_cont_seq_stats *out) {
+    (void)ctx; (void)out;
     return 0;
 }
 int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,

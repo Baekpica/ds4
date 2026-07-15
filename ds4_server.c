@@ -580,6 +580,25 @@ static void id_list_free(stop_list *ids);
 static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
 
+/* Per-request serving timings (v0.2.x observability): filled by the serving
+ * path just before the response is written and rendered next to `usage` by
+ * append_timings_json (llama.cpp-server precedent; OpenAI clients ignore
+ * unknown fields).  valid=false (request_init zeroes it) = omit the block;
+ * fields whose inputs are absent (no spec drafts, no steps) are omitted
+ * individually rather than emitted as nulls. */
+typedef struct {
+    bool   valid;
+    double ttft_ms;           /* request arrival -> first generated token */
+    double prefill_ms;        /* prefill start -> first token (0 = omit rate) */
+    double decode_ms;         /* first token -> completion */
+    int    prefill_tokens;    /* prompt tokens actually computed */
+    int    prefill_cached;    /* prompt tokens reused from KV */
+    int    decode_tokens;     /* generated tokens (seed included) */
+    int    decode_steps;      /* engine steps (0 = omit tok_per_step) */
+    long long spec_drafts;    /* 0 = omit spec_accept_rate */
+    long long spec_hits;
+} req_timings;
+
 typedef struct {
     req_kind kind;
     api_style api;
@@ -631,6 +650,7 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    req_timings timings;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -4990,6 +5010,32 @@ static void append_openai_usage_json(buf *b, const request *r,
                cached_tokens, cache_write_tokens);
 }
 
+/* v0.2.x observability: the per-request `timings` porcelain, emitted as a
+ * sibling of `usage` (leading comma included; emits nothing when the serving
+ * path did not fill timings -- e.g. an engine failure or the static batch
+ * path).  All numbers come from the request's stamped timings; no field is
+ * ever emitted as null. */
+static void append_timings_json(buf *b, const request *r) {
+    const req_timings *t = r ? &r->timings : NULL;
+    if (!t || !t->valid) return;
+    buf_printf(b, ",\"timings\":{\"ttft_ms\":%.1f,\"prefill_tokens\":%d,"
+                  "\"prefill_cached_tokens\":%d",
+               t->ttft_ms, t->prefill_tokens, t->prefill_cached);
+    if (t->prefill_tokens > 0 && t->prefill_ms > 0.0)
+        buf_printf(b, ",\"prefill_tok_s\":%.1f",
+                   (double)t->prefill_tokens / (t->prefill_ms / 1e3));
+    if (t->decode_tokens > 1 && t->decode_ms > 0.0)
+        buf_printf(b, ",\"decode_tok_s\":%.1f",
+                   (double)(t->decode_tokens - 1) / (t->decode_ms / 1e3));
+    if (t->spec_drafts > 0)
+        buf_printf(b, ",\"spec_accept_rate\":%.3f",
+                   (double)t->spec_hits / (double)t->spec_drafts);
+    if (t->decode_steps > 0)
+        buf_printf(b, ",\"tok_per_step\":%.2f",
+                   (double)t->decode_tokens / (double)t->decode_steps);
+    buf_putc(b, '}');
+}
+
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
@@ -5006,6 +5052,7 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_timings_json(&b, r);
     buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);
@@ -6685,6 +6732,7 @@ static bool responses_sse_completed(int fd, const request *r,
     buf_putc(&b, ']');
     buf_puts(&b, ",\"usage\":");
     append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_timings_json(&b, r);
     buf_puts(&b, "}}");
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     buf_free(&b);
@@ -6944,6 +6992,7 @@ static bool responses_final_response(int fd, bool enable_cors,
     buf_putc(&b, ']');
     buf_puts(&b, ",\"usage\":");
     append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_timings_json(&b, r);
     buf_putc(&b, '}');
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -6989,6 +7038,7 @@ static bool final_response(int fd, bool enable_cors,
         buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_timings_json(&b, r);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -7089,6 +7139,7 @@ static bool anthropic_final_response(int fd, bool enable_cors,
     json_escape(&b, anthropic_stop_reason(finish));
     buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
     append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_timings_json(&b, r);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -7991,7 +8042,14 @@ struct job {
      * the stranded sweep. */
     int cont_bank;
     ds4_tokens warm_prompt;
+    /* v0.2.x observability: arrival stamp (now_sec, for ttft) + how the
+     * request ended, consumed once by client_main for the requests_total
+     * registry counters after the worker signals done. */
+    double t_arrive;
+    uint8_t outcome;      /* JOB_OUT_* */
 };
+
+enum { JOB_OUT_COMPLETED = 0, JOB_OUT_FAILED, JOB_OUT_REFUSED_DEEP_SERIAL };
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -10388,6 +10446,9 @@ static void generate_job(server *s, job *j) {
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags);
+    /* v0.2.x observability: the counter twin of the "prompt start" serial
+     * marker the release gates grep for. */
+    ds4_metric_add(&ds4_metrics_get()->requests_serial, 1);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
 
@@ -10432,6 +10493,7 @@ static void generate_job(server *s, job *j) {
             kv_cache_discard_failed_disk_entry(s, disk_cache_path);
             free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
+            j->outcome = JOB_OUT_FAILED;
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
         }
@@ -10455,6 +10517,7 @@ static void generate_job(server *s, job *j) {
         kv_cache_discard_failed_disk_entry(s, disk_cache_path);
         free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
+        j->outcome = JOB_OUT_FAILED;
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
@@ -10474,6 +10537,17 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
+    /* v0.2.x observability: serial prefill token counts. */
+    {
+        ds4_metrics *mreg = ds4_metrics_get();
+        const int pf_computed = prompt_tokens > cached ? prompt_tokens - cached : 0;
+        if (pf_computed > 0) {
+            ds4_metric_add(&mreg->tokens_prefilled_computed, (uint64_t)pf_computed);
+            ds4_metrics_window_add(0, 0, (uint64_t)pf_computed);
+        }
+        if (cached > 0)
+            ds4_metric_add(&mreg->tokens_prefilled_cached, (uint64_t)cached);
+    }
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
@@ -10552,6 +10626,10 @@ static void generate_job(server *s, job *j) {
 
     bool dsml_recovery_attempted = false;
     uint64_t rng = resolve_job_seed(s, j);
+    /* v0.2.x observability: whole-request stamps (persist across the
+     * decode_again tool-recovery rerun; timings reflect the full request). */
+    double t_first_tok = 0.0;
+    int serial_decode_steps = 0;
 decode_again:
     ;
     buf text = {0};
@@ -10582,6 +10660,7 @@ decode_again:
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+        const int step_comp0 = completion;
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -10646,6 +10725,7 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+            if (t_first_tok == 0.0) t_first_tok = now_sec();
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -10794,6 +10874,14 @@ decode_again:
                 stop_decode = true;
                 break;
             }
+        }
+        /* v0.2.x observability: one registry update per serial decode step. */
+        if (completion > step_comp0) {
+            ds4_metric_add(&ds4_metrics_get()->tokens_decoded,
+                           (uint64_t)(completion - step_comp0));
+            ds4_metric_add(&ds4_metrics_get()->decode_steps, 1);
+            ds4_metrics_window_add((uint64_t)(completion - step_comp0), 1, 0);
+            serial_decode_steps++;
         }
         if (stop_decode) break;
     }
@@ -11072,6 +11160,21 @@ decode_again:
                                      parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
         thinking_live_clear(s);
+    }
+
+    /* v0.2.x observability: serial-path timings (per-request speculation
+     * detail is engine-internal on this path, so the spec fields stay 0 and
+     * append_timings_json omits them). */
+    if (completion > 0 && t_first_tok > 0.0) {
+        req_timings *t = &j->req.timings;
+        t->valid = true;
+        t->ttft_ms = j->t_arrive > 0.0 ? (t_first_tok - j->t_arrive) * 1e3 : 0.0;
+        t->prefill_ms = (decode_t0 - t0) * 1e3;
+        t->decode_ms = (now_sec() - t_first_tok) * 1e3;
+        t->prefill_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+        t->prefill_cached = cached;
+        t->decode_tokens = completion;
+        t->decode_steps = serial_decode_steps;
     }
 
     if (j->req.stream) {
@@ -11495,6 +11598,15 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
     } else {
         server_log(DS4_LOG_GENERATION, "ds4-server: coalesced batch n=%d ctx=%d path=%s",
                    n, ctx_size, use_ctx ? "ctx" : "percall");
+        /* v0.2.x observability: coarse counts for the static path (whole-run
+         * lump; no per-step attribution here). */
+        {
+            uint64_t toks = 0;
+            for (int i = 0; i < n; i++) toks += (uint64_t)(res[i].n_tokens > 0 ? res[i].n_tokens : 0);
+            ds4_metric_add(&ds4_metrics_get()->tokens_decoded, toks);
+            ds4_metric_add(&ds4_metrics_get()->tokens_prefilled_computed, (uint64_t)n_packed);
+            ds4_metrics_window_add(toks, 0, (uint64_t)n_packed);
+        }
         for (int i = 0; i < n; i++) {
             write_batch_completion(s, jobs[i], &res[i]);
             job_finish(jobs[i]);
@@ -11549,6 +11661,15 @@ typedef struct {
  * history (full-frontier memcmp) and degrades any mismatch to a cold reset, so
  * a stale or wrong record can cost a prefill but never correctness. ---- */
 
+/* v0.2.x observability: recount the warm-records gauge (max_seq is tiny). */
+static void warm_records_gauge_refresh(const server *s) {
+    uint64_t n = 0;
+    if (s->warm)
+        for (int b = 0; b < s->batch_ctx_max_seq; b++)
+            if (s->warm[b].valid) n++;
+    ds4_metric_set(&ds4_metrics_get()->warm_records, n);
+}
+
 /* Drop a bank's record (being overwritten, or its state is no longer known). */
 static void warm_rec_invalidate(server *s, int bank) {
     if (!s->warm || bank < 0 || bank >= s->batch_ctx_max_seq) return;
@@ -11556,6 +11677,7 @@ static void warm_rec_invalidate(server *s, int bank) {
     s->warm[bank].text = NULL;
     s->warm[bank].len = 0;
     s->warm[bank].valid = false;
+    warm_records_gauge_refresh(s);
 }
 
 /* Retire job j's bank at on_done: rebuild the record a follow-up request
@@ -11584,6 +11706,7 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n) {
     s->warm[bank].text = tb.ptr;
     s->warm[bank].len = tb.len;
     s->warm[bank].valid = true;
+    warm_records_gauge_refresh(s);
 }
 
 /* R5 Inc2: a free bank's record is SUPERSEDED when it is a byte-prefix of
@@ -12240,6 +12363,27 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
     cont_warm_retire(cs->s, j, tokens, n);
     ds4_tokens_free(&j->warm_prompt);
     memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));
+    /* v0.2.x observability: merge the engine's per-sequence stats (valid only
+     * during this callback) with the server's arrival stamp; the response
+     * writers below render them as the `timings` block. */
+    {
+        ds4_cont_seq_stats es;
+        if (ds4_cont_last_done_stats(cs->s->batch_ctx, &es) &&
+            es.first_token_sec > 0.0) {
+            req_timings *t = &j->req.timings;
+            t->valid = true;
+            t->ttft_ms = j->t_arrive > 0.0 ?
+                (es.first_token_sec - j->t_arrive) * 1e3 : 0.0;
+            t->prefill_ms = (es.first_token_sec - es.admit_sec) * 1e3;
+            t->decode_ms = (es.done_sec - es.first_token_sec) * 1e3;
+            t->prefill_tokens = (int)es.prefill_computed;
+            t->prefill_cached = (int)es.prefill_cached;
+            t->decode_tokens = (int)es.decode_tokens;
+            t->decode_steps = (int)es.decode_steps;
+            t->spec_drafts = (long long)es.spec_drafts;
+            t->spec_hits = (long long)es.spec_hits;
+        }
+    }
     t_emit_job = j;                            /* W8a: buffer the finalize/response into j->out */
     if (j->req.stream) {                       /* W6: close the live SSE stream. */
         cont_stream_finalize(cs->s, j, finish ? "stop" : "length");
@@ -12313,6 +12457,7 @@ static void generate_continuous_jobs(server *s, job *first) {
                        "ds4-server: deep-serial guard: refusing serial fallback for %d-token prompt (max %d)",
                        jb->req.prompt.len, serial_max);
             http_error(jb->fd, s->enable_cors, 503, msg);
+            jb->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
             job_finish(jb);
             refused++;
         } else {
@@ -12327,10 +12472,12 @@ static void generate_continuous_jobs(server *s, job *first) {
     if (refused)
         server_log(DS4_LOG_WARNING, "ds4-server: deep-serial guard refused %d job(s)", refused);
 
-    if (rc != 0)
+    if (rc != 0) {
+        ds4_metric_add(&ds4_metrics_get()->cont_batch_failures, 1);
         server_log(DS4_LOG_WARNING,
                    "ds4-server: continuous batch failed (%s); served=%d fallback=%d",
                    err[0] ? err : "error", cs.served, fallback);
+    }
     else
         server_log(DS4_LOG_GENERATION,
                    "ds4-server: continuous batch ctx=%d path=cont served=%d fallback=%d",
@@ -12423,6 +12570,7 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    bool accept_json;    /* request carried Accept: application/json */
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -12438,6 +12586,22 @@ static ssize_t header_end(const char *p, size_t n) {
         if (p[i - 1] == '\n' && p[i] == '\n') return (ssize_t)(i + 1);
     }
     return -1;
+}
+
+static bool header_accepts_json(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= 7 && strncasecmp(line, "Accept:", 7) == 0) {
+            for (size_t i = 7; i + 16 <= len; i++)
+                if (strncasecmp(line + i, "application/json", 16) == 0) return true;
+        }
+        if (p < end) p++;
+    }
+    return false;
 }
 
 static long content_length(const char *h, size_t n) {
@@ -12486,6 +12650,7 @@ static bool read_http_request(int fd, http_request *r) {
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
+    r->accept_json = header_accepts_json(b.ptr, (size_t)hend);
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
@@ -12708,6 +12873,242 @@ static void handle_batch(server *s, int fd, const char *body) {
     free(res); free(toks); free(model);
 }
 
+/* ---- v0.2.x observability porcelains: GET /metrics + GET /v1/stats --------
+ * Both render EXCLUSIVELY from the shared registry (plus boot-time constants
+ * like the model id and ctx size); neither takes gen_mu -- it can be held for
+ * minutes at deep ctx -- so they stay pollable while the box is saturated. */
+
+/* Prometheus text exposition (hand-rolled: it is just lines). */
+static void send_metrics(server *s, int fd) {
+    ds4_metrics *m = ds4_metrics_get();
+    double dec_tok_s = 0.0, pf_tok_s = 0.0, tok_step = 0.0;
+    ds4_metrics_window_rates(&dec_tok_s, &pf_tok_s, &tok_step);
+    const uint64_t drafts = ds4_metric_read(&m->spec_drafts);
+    const uint64_t hits   = ds4_metric_read(&m->spec_hits);
+    const uint64_t boot   = ds4_metric_read(&m->boot_stamp);
+    const uint64_t now    = (uint64_t)now_sec();
+    buf b = {0};
+    buf_printf(&b, "# TYPE ds4_uptime_seconds gauge\n"
+                   "ds4_uptime_seconds %llu\n",
+               (unsigned long long)(boot && now >= boot ? now - boot : 0));
+    buf_printf(&b, "# TYPE ds4_requests_started_total counter\n"
+                   "ds4_requests_started_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->requests_started));
+    buf_printf(&b, "# TYPE ds4_requests_total counter\n"
+                   "ds4_requests_total{outcome=\"completed\"} %llu\n"
+                   "ds4_requests_total{outcome=\"failed\"} %llu\n"
+                   "ds4_requests_total{outcome=\"refused_deep_serial\"} %llu\n",
+               (unsigned long long)ds4_metric_read(&m->requests_completed),
+               (unsigned long long)ds4_metric_read(&m->requests_failed),
+               (unsigned long long)ds4_metric_read(&m->requests_refused_deep_serial));
+    buf_printf(&b, "# TYPE ds4_requests_inflight gauge\n"
+                   "ds4_requests_inflight %llu\n",
+               (unsigned long long)ds4_metric_read(&m->requests_inflight));
+    buf_printf(&b, "# TYPE ds4_requests_serial_total counter\n"
+                   "ds4_requests_serial_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->requests_serial));
+    buf_printf(&b, "# TYPE ds4_cont_admit_rejects_total counter\n"
+                   "ds4_cont_admit_rejects_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->cont_admit_rejects));
+    buf_printf(&b, "# TYPE ds4_cont_batch_failures_total counter\n"
+                   "ds4_cont_batch_failures_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->cont_batch_failures));
+    buf_printf(&b, "# TYPE ds4_graph_fit_refusals_total counter\n"
+                   "ds4_graph_fit_refusals_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->graph_fit_refusals));
+    buf_printf(&b, "# TYPE ds4_admits_total counter\n"
+                   "ds4_admits_total{kind=\"cold\"} %llu\n"
+                   "ds4_admits_total{kind=\"warm\"} %llu\n"
+                   "ds4_admits_total{kind=\"fork\"} %llu\n"
+                   "ds4_admits_total{kind=\"partial_fork\"} %llu\n"
+                   "ds4_admits_total{kind=\"partial_truncate\"} %llu\n",
+               (unsigned long long)ds4_metric_read(&m->admits_cold),
+               (unsigned long long)ds4_metric_read(&m->admits_warm),
+               (unsigned long long)ds4_metric_read(&m->admits_fork),
+               (unsigned long long)ds4_metric_read(&m->admits_partial_fork),
+               (unsigned long long)ds4_metric_read(&m->admits_partial_truncate));
+    buf_printf(&b, "# TYPE ds4_tokens_prefilled_total counter\n"
+                   "ds4_tokens_prefilled_total{kind=\"computed\"} %llu\n"
+                   "ds4_tokens_prefilled_total{kind=\"cached\"} %llu\n",
+               (unsigned long long)ds4_metric_read(&m->tokens_prefilled_computed),
+               (unsigned long long)ds4_metric_read(&m->tokens_prefilled_cached));
+    buf_printf(&b, "# TYPE ds4_tokens_decoded_total counter\n"
+                   "ds4_tokens_decoded_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->tokens_decoded));
+    buf_printf(&b, "# TYPE ds4_decode_steps_total counter\n"
+                   "ds4_decode_steps_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->decode_steps));
+    buf_printf(&b, "# TYPE ds4_spec_drafts_total counter\n"
+                   "ds4_spec_drafts_total %llu\n"
+                   "# TYPE ds4_spec_hits_total counter\n"
+                   "ds4_spec_hits_total %llu\n"
+                   "# TYPE ds4_spec_quench_total counter\n"
+                   "ds4_spec_quench_total %llu\n",
+               (unsigned long long)drafts, (unsigned long long)hits,
+               (unsigned long long)ds4_metric_read(&m->spec_quench));
+    buf_printf(&b, "# TYPE ds4_spec_accept_ratio gauge\n"
+                   "ds4_spec_accept_ratio %.4f\n",
+               drafts ? (double)hits / (double)drafts : 0.0);
+    buf_printf(&b, "# TYPE ds4_decode_tok_s gauge\n"
+                   "ds4_decode_tok_s %.2f\n"
+                   "# TYPE ds4_prefill_tok_s gauge\n"
+                   "ds4_prefill_tok_s %.2f\n"
+                   "# TYPE ds4_tok_per_step gauge\n"
+                   "ds4_tok_per_step %.3f\n",
+               dec_tok_s, pf_tok_s, tok_step);
+    buf_printf(&b, "# TYPE ds4_banks_live gauge\n"
+                   "ds4_banks_live %llu\n"
+                   "# TYPE ds4_banks_total gauge\n"
+                   "ds4_banks_total %llu\n"
+                   "# TYPE ds4_warm_records gauge\n"
+                   "ds4_warm_records %llu\n"
+                   "# TYPE ds4_kv_pages_resident gauge\n"
+                   "ds4_kv_pages_resident %llu\n",
+               (unsigned long long)ds4_metric_read(&m->banks_live),
+               (unsigned long long)ds4_metric_read(&m->banks_total),
+               (unsigned long long)ds4_metric_read(&m->warm_records),
+               (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+    http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
+    buf_free(&b);
+}
+
+/* Sectioned key:value board (Redis INFO style); JSON on Accept: application/json.
+ * `watch -n2 curl -s :8000/v1/stats` should read like a status board. */
+static void send_stats(server *s, int fd, bool as_json) {
+    ds4_metrics *m = ds4_metrics_get();
+    double dec_tok_s = 0.0, pf_tok_s = 0.0, tok_step = 0.0;
+    ds4_metrics_window_rates(&dec_tok_s, &pf_tok_s, &tok_step);
+    const uint64_t drafts = ds4_metric_read(&m->spec_drafts);
+    const uint64_t hits   = ds4_metric_read(&m->spec_hits);
+    const uint64_t boot   = ds4_metric_read(&m->boot_stamp);
+    const uint64_t now    = (uint64_t)now_sec();
+    const uint64_t up     = boot && now >= boot ? now - boot : 0;
+    buf b = {0};
+    if (as_json) {
+        buf_puts(&b, "{\"server\":{\"model\":");
+        json_escape(&b, server_model_id_from_engine(s->engine));
+        buf_printf(&b, ",\"context\":%d,\"max_seq\":%d,\"uptime_seconds\":%llu,"
+                       "\"requests_inflight\":%llu}",
+                   ds4_session_ctx(s->session), s->batch_ctx_max_seq,
+                   (unsigned long long)up,
+                   (unsigned long long)ds4_metric_read(&m->requests_inflight));
+        buf_printf(&b, ",\"serving\":{\"requests_started\":%llu,"
+                       "\"requests_completed\":%llu,\"requests_failed\":%llu,"
+                       "\"requests_refused_deep_serial\":%llu,"
+                       "\"requests_serial\":%llu,\"cont_batch_failures\":%llu,"
+                       "\"tokens_decoded\":%llu,\"decode_steps\":%llu,"
+                       "\"decode_tok_s_60s\":%.2f,\"tok_per_step_60s\":%.3f}",
+                   (unsigned long long)ds4_metric_read(&m->requests_started),
+                   (unsigned long long)ds4_metric_read(&m->requests_completed),
+                   (unsigned long long)ds4_metric_read(&m->requests_failed),
+                   (unsigned long long)ds4_metric_read(&m->requests_refused_deep_serial),
+                   (unsigned long long)ds4_metric_read(&m->requests_serial),
+                   (unsigned long long)ds4_metric_read(&m->cont_batch_failures),
+                   (unsigned long long)ds4_metric_read(&m->tokens_decoded),
+                   (unsigned long long)ds4_metric_read(&m->decode_steps),
+                   dec_tok_s, tok_step);
+        buf_printf(&b, ",\"speculation\":{\"spec_drafts\":%llu,\"spec_hits\":%llu,"
+                       "\"spec_accept_ratio\":%.4f,\"spec_quench_events\":%llu}",
+                   (unsigned long long)drafts, (unsigned long long)hits,
+                   drafts ? (double)hits / (double)drafts : 0.0,
+                   (unsigned long long)ds4_metric_read(&m->spec_quench));
+        buf_printf(&b, ",\"cache\":{\"admits_cold\":%llu,\"admits_warm\":%llu,"
+                       "\"admits_fork\":%llu,\"admits_partial_fork\":%llu,"
+                       "\"admits_partial_truncate\":%llu,\"cont_admit_rejects\":%llu,"
+                       "\"graph_fit_refusals\":%llu,"
+                       "\"tokens_prefilled_computed\":%llu,"
+                       "\"tokens_prefilled_cached\":%llu,\"prefill_tok_s_60s\":%.2f,"
+                       "\"warm_records\":%llu,\"banks_live\":%llu,\"banks_total\":%llu,"
+                       "\"kv_pages_resident\":%llu}}\n",
+                   (unsigned long long)ds4_metric_read(&m->admits_cold),
+                   (unsigned long long)ds4_metric_read(&m->admits_warm),
+                   (unsigned long long)ds4_metric_read(&m->admits_fork),
+                   (unsigned long long)ds4_metric_read(&m->admits_partial_fork),
+                   (unsigned long long)ds4_metric_read(&m->admits_partial_truncate),
+                   (unsigned long long)ds4_metric_read(&m->cont_admit_rejects),
+                   (unsigned long long)ds4_metric_read(&m->graph_fit_refusals),
+                   (unsigned long long)ds4_metric_read(&m->tokens_prefilled_computed),
+                   (unsigned long long)ds4_metric_read(&m->tokens_prefilled_cached),
+                   pf_tok_s,
+                   (unsigned long long)ds4_metric_read(&m->warm_records),
+                   (unsigned long long)ds4_metric_read(&m->banks_live),
+                   (unsigned long long)ds4_metric_read(&m->banks_total),
+                   (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+        http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+        buf_free(&b);
+        return;
+    }
+    buf_printf(&b, "# Server\n"
+                   "model:%s\n"
+                   "context:%d\n"
+                   "max_seq:%d\n"
+                   "uptime_seconds:%llu\n"
+                   "requests_inflight:%llu\n\n",
+               server_model_id_from_engine(s->engine),
+               ds4_session_ctx(s->session), s->batch_ctx_max_seq,
+               (unsigned long long)up,
+               (unsigned long long)ds4_metric_read(&m->requests_inflight));
+    buf_printf(&b, "# Serving\n"
+                   "requests_started:%llu\n"
+                   "requests_completed:%llu\n"
+                   "requests_failed:%llu\n"
+                   "requests_refused_deep_serial:%llu\n"
+                   "requests_serial:%llu\n"
+                   "cont_batch_failures:%llu\n"
+                   "tokens_decoded:%llu\n"
+                   "decode_steps:%llu\n"
+                   "decode_tok_s_60s:%.2f\n"
+                   "tok_per_step_60s:%.3f\n\n",
+               (unsigned long long)ds4_metric_read(&m->requests_started),
+               (unsigned long long)ds4_metric_read(&m->requests_completed),
+               (unsigned long long)ds4_metric_read(&m->requests_failed),
+               (unsigned long long)ds4_metric_read(&m->requests_refused_deep_serial),
+               (unsigned long long)ds4_metric_read(&m->requests_serial),
+               (unsigned long long)ds4_metric_read(&m->cont_batch_failures),
+               (unsigned long long)ds4_metric_read(&m->tokens_decoded),
+               (unsigned long long)ds4_metric_read(&m->decode_steps),
+               dec_tok_s, tok_step);
+    buf_printf(&b, "# Speculation\n"
+                   "spec_drafts:%llu\n"
+                   "spec_hits:%llu\n"
+                   "spec_accept_ratio:%.4f\n"
+                   "spec_quench_events:%llu\n\n",
+               (unsigned long long)drafts, (unsigned long long)hits,
+               drafts ? (double)hits / (double)drafts : 0.0,
+               (unsigned long long)ds4_metric_read(&m->spec_quench));
+    buf_printf(&b, "# Cache\n"
+                   "admits_cold:%llu\n"
+                   "admits_warm:%llu\n"
+                   "admits_fork:%llu\n"
+                   "admits_partial_fork:%llu\n"
+                   "admits_partial_truncate:%llu\n"
+                   "cont_admit_rejects:%llu\n"
+                   "graph_fit_refusals:%llu\n"
+                   "tokens_prefilled_computed:%llu\n"
+                   "tokens_prefilled_cached:%llu\n"
+                   "prefill_tok_s_60s:%.2f\n"
+                   "warm_records:%llu\n"
+                   "banks_live:%llu\n"
+                   "banks_total:%llu\n"
+                   "kv_pages_resident:%llu\n",
+               (unsigned long long)ds4_metric_read(&m->admits_cold),
+               (unsigned long long)ds4_metric_read(&m->admits_warm),
+               (unsigned long long)ds4_metric_read(&m->admits_fork),
+               (unsigned long long)ds4_metric_read(&m->admits_partial_fork),
+               (unsigned long long)ds4_metric_read(&m->admits_partial_truncate),
+               (unsigned long long)ds4_metric_read(&m->cont_admit_rejects),
+               (unsigned long long)ds4_metric_read(&m->graph_fit_refusals),
+               (unsigned long long)ds4_metric_read(&m->tokens_prefilled_computed),
+               (unsigned long long)ds4_metric_read(&m->tokens_prefilled_cached),
+               pf_tok_s,
+               (unsigned long long)ds4_metric_read(&m->warm_records),
+               (unsigned long long)ds4_metric_read(&m->banks_live),
+               (unsigned long long)ds4_metric_read(&m->banks_total),
+               (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+    http_response(fd, s->enable_cors, 200, "text/plain", b.ptr);
+    buf_free(&b);
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -12719,9 +13120,21 @@ static void *client_main(void *arg) {
         http_error(fd, s->enable_cors, 400, "bad HTTP request");
         goto done;
     }
+    const double t_arrive = now_sec();   /* v0.2.x: pre-parse arrival, for ttft */
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics")) {
+        send_metrics(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/stats")) {
+        send_stats(s, fd, hr.accept_json);
         http_request_free(&hr);
         goto done;
     }
@@ -12790,6 +13203,7 @@ static void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
+    j.t_arrive = t_arrive;
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
@@ -12802,6 +13216,8 @@ static void *client_main(void *arg) {
         request_free(&j.req);
         goto done;
     }
+    ds4_metric_add(&ds4_metrics_get()->requests_started, 1);
+    ds4_metric_add(&ds4_metrics_get()->requests_inflight, 1);
     /* W8a: drain worker-produced output to the socket on THIS (client) thread, so a
      * slow client never blocks the GPU worker.  The continuous path appends bytes
      * via job_emit (under j.mu) and signals; we send whatever is buffered with j.mu
@@ -12824,6 +13240,18 @@ static void *client_main(void *arg) {
         if (j.done && j.out.len == 0) break;
     }
     pthread_mutex_unlock(&j.mu);
+
+    /* v0.2.x observability: settle this request's registry outcome. */
+    {
+        ds4_metrics *mreg = ds4_metrics_get();
+        ds4_metric_add(&mreg->requests_inflight, (uint64_t)-1);
+        if (j.outcome == JOB_OUT_FAILED)
+            ds4_metric_add(&mreg->requests_failed, 1);
+        else if (j.outcome == JOB_OUT_REFUSED_DEEP_SERIAL)
+            ds4_metric_add(&mreg->requests_refused_deep_serial, 1);
+        else
+            ds4_metric_add(&mreg->requests_completed, 1);
+    }
 
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
@@ -13430,6 +13858,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_listen_fd = lfd;
+    ds4_metric_set(&ds4_metrics_get()->boot_stamp, (uint64_t)now_sec());
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
     while (!g_stop_requested) {
@@ -14183,6 +14612,71 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
 
     free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_timings_block_renders_next_to_usage(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.stream_include_usage = true;
+    r.timings.valid = true;
+    r.timings.ttft_ms = 812.5;
+    r.timings.prefill_ms = 500.0;
+    r.timings.decode_ms = 2000.0;
+    r.timings.prefill_tokens = 1000;
+    r.timings.prefill_cached = 24;
+    r.timings.decode_tokens = 101;
+    r.timings.decode_steps = 50;
+    r.timings.spec_drafts = 100;
+    r.timings.spec_hits = 80;
+
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_timings", 1024, 101));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"timings\":{\"ttft_ms\":812.5") != NULL);
+    TEST_ASSERT(strstr(out, "\"prefill_tokens\":1000") != NULL);
+    TEST_ASSERT(strstr(out, "\"prefill_cached_tokens\":24") != NULL);
+    TEST_ASSERT(strstr(out, "\"prefill_tok_s\":2000.0") != NULL);
+    TEST_ASSERT(strstr(out, "\"decode_tok_s\":50.0") != NULL);
+    TEST_ASSERT(strstr(out, "\"spec_accept_rate\":0.800") != NULL);
+    TEST_ASSERT(strstr(out, "\"tok_per_step\":2.02") != NULL);
+    TEST_ASSERT(strstr(out, "null") == NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* Spec fields drop out when speculation never drafted; the block itself
+     * drops out when the serving path never filled timings. */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    r.timings.spec_drafts = 0;
+    r.timings.spec_hits = 0;
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_timings2", 1024, 101));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"timings\":{") != NULL);
+    TEST_ASSERT(strstr(out, "spec_accept_rate") == NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    memset(&r.timings, 0, sizeof(r.timings));
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_notimings", 1024, 101));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"usage\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"timings\":{") == NULL);
+    free(out);
+
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -17401,6 +17895,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_usage_reports_cache_details();
+    test_timings_block_renders_next_to_usage();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_streaming_chat_token_id_echo_is_batchable();
