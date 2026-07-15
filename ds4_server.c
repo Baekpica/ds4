@@ -12564,11 +12564,12 @@ static bool send_model(server *s, int fd, const char *id) {
 }
 
 static bool send_models(server *s, int fd) {
+    /* Only advertise the model this instance actually loaded -- listing
+     * both V4 ids regardless (the pre-v0.2 behavior) reads as two
+     * selectable models when the `model` field never switches weights. */
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-pro");
+    append_model_json(&b, s, server_model_id_from_engine(s->engine));
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
