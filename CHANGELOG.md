@@ -5,6 +5,75 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.2 — 2026-07-15
+
+The robust-serving release. v0.1.1 was held back when our own tool-calling
+gate exposed two ship-path CUDA crashes; v0.2 ships those fixes plus the two
+serving capabilities the agent workloads actually needed — speculation for
+thinking/tool traffic and deep-context capacity — behind standing release
+gates that run on every ship candidate.
+
+- **Crash class fixed: cont admission-chunk OOB mirror reads** (`f16820c`).
+  On ≥128-row admission chunks the token-tile comp-mirror kernel eagerly
+  decoded `[0, max-over-banks n_comp)` of a *shallow* bank's demand-mapped
+  mirror — an unmapped READ (dead ctx / zeroed-value corruption) that was
+  placement-deterministic, not a race. Fix: bank-true `n_comp` for the
+  single-run path. Warm + partial-prefix admission defaults re-enabled.
+  Companion hardening: in-flight work now drains before sticky-scratch
+  growth frees (`86a25e0`).
+- **Speculation for agents: DSML sampler override on the continuous path**
+  (`353c749`). Tools + thinking (or any temperature) no longer fall off to
+  the serial path: the per-token structural/payload sampler swap that
+  tool-call grammar needs now runs inside continuous batching, so agent
+  traffic rides cont+DSpark. Tool-eval-bench thinking leg: same score band,
+  all-batched, −27 % wall clock; Hermes agent end-to-end: every generate leg
+  speculative at 80–97 % accept, 3.4–4.5 tok/step, zero serial fallbacks.
+  Lossless at any temperature (delta-proposal speculative sampling — the
+  verify-row logits + the request's own sampler/RNG are the only token
+  source).
+- **`DS4_SERVER_DEFAULT_TEMP`** (`d32e9a6`): default temperature for requests
+  that omit one (agent frameworks usually do); explicit temperatures are
+  untouched.
+- **Deep-context capacity: 766K tokens served concurrently on one GB10**
+  (`010cc08`, `32e1dab`). Admission/placement fixes for the multi-agent deep
+  shape — a 518K-token orchestrator + 248K subagent concurrently at ctx
+  524288, needles exact to 518K, warm in-place turn-2 TTFT 1.2 s (vs ~41 min
+  cold prefill), deep decode 146–177 ms/tok at 248–519K:
+  - batch geometry now rejects configs exceeding the uint32 absolute-row ABI
+    instead of wrapping (`010cc08`);
+  - comp-cache page budget refreshes live at admission time when free memory
+    has grown since boot (pinned deterministic via `DS4_BATCH_VMM_BUDGET_MB`);
+  - `DS4_SERVER_PIN_MIN_TOKENS` (default 65536): warm records above the
+    threshold form a pinned LRU tier — a deep orchestrator trunk is never
+    evicted by short-lived tenants while shallow victims exist;
+  - deep-trunk fork guard: warm *fork* placement is refused above the pin
+    threshold (fork-by-copy re-maps the whole committed extent, ~10 MiB per
+    1K tokens at F32 — a 518K fork projected 6.8 GiB); the in-place warm path
+    rides existing pages instead. The same rule now covers *partial-prefix*
+    forks, keyed on the cut extent: sequential unique deep prompts sharing a
+    long prefix previously stacked a fresh multi-GiB bank per request until
+    a scratch allocation aborted the server (observed at six ~130K banks
+    under a pinned page budget); past the threshold the trunk is truncated
+    in place instead of copied.
+- **Standing release gates** (`749dada`, `83f3ae5`, plus this release's
+  additions in `speed-bench/`): `teb_gates.sh` (69-scenario tool-calling
+  crash/fast/think legs, band 81–86, health+engagement gated; opt-in
+  hardmode 73/100, error-injection @20 % 82/100 — both twice — and pass^k
+  trials: mean 84.7 ± 2.3, pass@k 81.2, pass^k 71.0), `deep_ctx_gate.sh` (the
+  766K/518K capacity gate above, one boot, three stages; re-passed on the
+  release binary: ~750K concurrent, needles exact, warm turn-2 TTFT 1.7 s),
+  `bank_churn_soak.sh` (pinned deep trunk + 12 cycling shallow tenants:
+  PASS, 41 rounds/61 min, needle miss 0, deep evictions 0, memory drift
+  1.0 GiB), `needle_sweep.sh` (formal retrieval matrix: **20/20 exact** —
+  10 depths × {248K, 519K actual tokens}, cold TTFT flat across depth at
+  843 s / 2434 s, memory flat across the 9-hour run). Quality restamp vs
+  the June baseline on the release binary: GSM8K 484/500, MMLU 364/570,
+  HumanEval 149/164, MBPP 178/200, IFEval strict 442/541 (a same-day
+  control build scored 443 — the engine moves 1 item of 541; June 451),
+  needle 45/45 inline + 64k 15/15 + 128k 10/10. Tool-eval-bench on the
+  release binary: fast 82 / think 83 (band 81–86), crash legs clean, and
+  `--mtp`-less fast 82 — exact parity, MTP is genuinely droppable.
+
 ## v0.1.1 — 2026-07-13
 
 Decode is now net-positive by default across content and depth: the terminal

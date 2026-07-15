@@ -29,9 +29,9 @@ serving engine on NVIDIA hardware**? Upstream's heart is a single-user
 CLI/agent engine, Metal first. This fork keeps all of that working and builds
 the CUDA/Linux side into a batched server — the reference machines are the
 DGX Spark (GB10, sm_121) and the RTX PRO 6000 Blackwell (sm_120). Everything
-below is default-on in `v0.1.0` (branch `release/v0.1.0`), each landing gated
-by value-parity checks, same-boot A/B timing, and the full eval suite, and
-each reversible with an env kill switch.
+below is default-on in `v0.2`, each landing gated by value-parity checks,
+same-boot A/B timing, and the full eval suite, and each reversible with an
+env kill switch.
 
 **Continuous batched serving.** The HTTP server accepts concurrent requests
 into a continuously batched engine: mid-flight admission and eviction over
@@ -39,8 +39,11 @@ per-request KV banks, chunked cold admission (~1.9× faster admit), pending
 prefills interleaved with live decode, and automatic coalescing of
 non-streaming request groups. Warm-starting from a cached prefix cuts TTFT
 ~7×; forking a live session server-side (D2D bank clone) cuts TTFT ~49× for
-a 4-way fan-out. Stops, tool calls, and MTP all ride the batched path, and
-the batched forward scales 6.2× from batch 1 to 128 on a GB10.
+a 4-way fan-out. Stops, tool calls, thinking, and MTP all ride the batched
+path — since v0.2 that includes tool calls at any temperature and with
+thinking enabled (the DSML sampler override runs inside the continuous
+path), so agent traffic gets speculation too. The batched forward scales
+6.2× from batch 1 to 128 on a GB10.
 
 **A rebuilt CUDA prefill engine.** Cold prefill of a 12k-token prompt runs at
 **~800 tok/s on a GB10** — 2.6× where this fork started in early July, and
@@ -68,22 +71,33 @@ aligned SoA repack artifacts the D2R and decode kernels read in place
 drafter (shipped at Q2K — equal throughput and acceptance to Q4K, 4.2 GiB
 smaller, and required for ~1M-token KV), and rejects stale-manifest imports.
 
-**Long context, verified.** 128k-token contexts are served correctly:
-needle-in-haystack 70/70 across the 8k–128k tiers at the release commit, with
-compressed-KV storage tiers (FP8 codes, FP4 e2m1 indexer) that are
-bit-lossless against F32 storage. KV costs ≈9.5 KiB/token, and DSA prefill
-throughput stays context-flat, so deep-context serving remains fast as the
-window fills.
+**Long context, verified.** v0.2 extends verified serving from the 128k tier
+to the multi-agent deep shape: **766K tokens served concurrently on one
+GB10** — a 518K-token orchestrator plus a 248K subagent, both live at ctx
+524288 — with needle retrieval exact at 195K/248K/518K and warm in-place
+turn-2 TTFT of 1.2 s on the 518K conversation (the cold admit is ~41 min of
+prefill, paid once; a pinned warm tier guarantees short-lived tenants never
+evict a deep trunk). Needle-in-haystack remains 70/70 across the 8k–128k
+tiers at the release commit, and compressed-KV storage tiers (FP8 codes,
+FP4 e2m1 indexer) are bit-lossless against F32 storage. KV costs
+≈9.5 KiB/token at the F32 default (~766K-token ceiling per box; the FP8/FP4
+tiers are the opt-in road past 1M). Honesty note: prefill is context-flat
+and decode is through ~128k, but deep decode is not — ~146 ms/tok at 248K
+and ~177 ms/tok at 519K. The deep-context win is capacity plus seconds-fast
+warm turn cycles, not raw decode speed.
 
 **Measured, gated, reversible.** Every performance claim comes from same-boot
 A/B runs with SM-clock logging; every default flip passed bit- or
 value-parity plus eval slices with proven engagement of the changed path; the
 full quality suite (GSM8K, MMLU, HumanEval, MBPP, IFEval, needle) is
-re-stamped at the release commit against the June baseline. Two of the fixes
-in v0.1.0 were found by this release's own gates — that is the point of them.
+re-stamped at the release commit against the June baseline. The release
+gates are standing scripts in `speed-bench/` (`teb_gates.sh` tool-calling
+legs, `deep_ctx_gate.sh` capacity, `bank_churn_soak.sh`, `needle_sweep.sh`)
+— v0.2 exists because those gates caught two ship-path CUDA crashes in what
+would have been v0.1.1; that is the point of them.
 
 The per-landing numbers and the full story are in `CHANGELOG.md` and the
-v0.1.0 release notes. The context-frontier sweep below compares this branch
+release notes. The context-frontier sweep below compares this branch
 against upstream main on both reference machines, low band 2k–64k and high
 band 64k–128k:
 
