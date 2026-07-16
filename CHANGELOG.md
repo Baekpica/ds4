@@ -5,6 +5,38 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.2.1 — 2026-07-16
+
+Serving observability plus a models-list fix, both requested by users on the
+v0.2 announcement thread within a day of posting. No kernel or placement
+changes; quality surfaces are untouched.
+
+- **Observability: one metrics core, three porcelains** (`118592e`). A single
+  `ds4_metrics` registry (relaxed-atomic counters plus a 60-second rolling
+  window) feeds every user-facing surface; readers never take the generation
+  lock, so metrics stay pollable even during a minutes-long deep-context
+  prefill. The surfaces:
+  - a **`timings` block next to `usage`** in every response (and on the final
+    streaming event with `stream_options.include_usage`): TTFT, prefill
+    tokens with the cached/computed split, prefill and decode tok/s, and
+    speculative acceptance + tokens-per-step when DSpark is active.
+    Inapplicable fields are omitted, not null.
+  - **`GET /metrics`**: Prometheus text exposition (hand-rolled, no
+    dependencies) — request outcomes, token totals, rolling decode tok/s,
+    live banks, KV pages, admission classes, speculation and quench counters.
+  - **`GET /v1/stats`**: human-readable sectioned status text (JSON with
+    `Accept: application/json`); `watch curl` works as a status board.
+  The release gates now assert health from `/metrics` counter deltas as
+  primary, with the stderr greps retained as fallback for one release.
+  Overhead gated at zero: fresh-boot A/B produced byte-identical accept
+  traces at 51.3 vs 51.4 ms/tok.
+- **`/v1/models` lists only the loaded model** (`74928f0`). The endpoint
+  hardcoded both `deepseek-v4-flash` and `deepseek-v4-pro`, so a Flash-only
+  box advertised two ids as if selectable when the `model` field never
+  switches weights (it is a label plus the `deepseek-chat` /
+  `deepseek-reasoner` thinking toggle). `GET /v1/models/{id}` stays
+  permissive for both known ids.
+
 ## v0.2 — 2026-07-15
 
 The robust-serving release. v0.1.1 was held back when our own tool-calling

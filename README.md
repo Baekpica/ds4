@@ -723,17 +723,26 @@ live graph/session.
 
 Supported endpoints:
 
-- `GET /v1/models`
+- `GET /v1/models` (lists the loaded model)
 - `GET /v1/models/deepseek-v4-flash`
 - `GET /v1/models/deepseek-v4-pro`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
+- `GET /metrics` (Prometheus text: request outcomes, token totals, rolling
+  decode tok/s, live banks, admission classes, speculation counters)
+- `GET /v1/stats` (human-readable status board; JSON with
+  `Accept: application/json` — `watch -n2 curl -s :8000/v1/stats` works)
 
 The Flash and PRO model endpoints are compatibility aliases. They both report
 the model currently loaded from the GGUF passed with `-m`; the endpoint name does
 not select a different model.
+
+Every response also carries a `timings` block next to `usage` (TTFT, prefill
+tokens with the cached split, prefill and decode tok/s, and speculative
+acceptance when DSpark is active); streaming responses include it on the
+final event when `stream_options.include_usage` is set.
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
