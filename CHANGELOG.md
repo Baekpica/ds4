@@ -5,7 +5,9 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
-## Unreleased
+## v0.2.3 — 2026-07-17
+
+One-command serving: the launch defaults move into the engine binary.
 
 - **Launch defaults: `ds4-server -c N` boots the full stack on a standard
   install.** With `-m` omitted the server resolves the base model from
@@ -23,10 +25,13 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
   presence-tested before, so `=0` counter-intuitively armed the drafter.
   Gate scripts pass `--no-mtp` on their `MTP=""` legs so MTP-droppable
   legs stay genuinely MTP-less; the serial-path repro boots `--no-spec`.
-  Release note: `ds4-on-spark`'s `ds4-serve` wrapper should forward
-  `--no-spec`/`--no-dspark` to the server when its pin reaches this
-  version (its wrapper-level downgrade flags currently rely on the
-  server not auto-detecting).
+  The `ds4-on-spark` v0.2.3 pin updates its `ds4-serve` wrapper to
+  forward `--no-spec`/`--no-dspark` to the server (its wrapper-level
+  downgrade flags previously relied on the server not auto-detecting).
+  Gated: `launch_defaults_gate.sh` (zero-config / `--no-spec` /
+  `--preset spark` legs) ALL PASS on GB10 sm_121 with live speculative
+  engagement, plus teb on the release binary — crash 83+100, fast 86,
+  think 83 (band 81–86), 0 serial starts, 0 admission rejects.
 
 ## v0.2.2 — 2026-07-16
 
