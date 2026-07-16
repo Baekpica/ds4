@@ -42,7 +42,7 @@ LOG=${LOG:-/tmp/serial_regrow_repro.log}
 rm -f "$LOG" /tmp/ds4.lock
 ENV=(DS4_SERVER_CONTINUOUS=0)
 [ -f "$MAN" ] && ENV+=(DS4_CUDA_WEIGHT_IPC_SCOPE=base DS4_CUDA_WEIGHT_IPC_MANIFEST="$MAN")
-env "${ENV[@]}" ./ds4-server -m "$GGUF" --cuda -c 4096 --port "$PORT" >"$LOG" 2>&1 &
+env "${ENV[@]}" ./ds4-server -m "$GGUF" --no-spec --cuda -c 4096 --port "$PORT" >"$LOG" 2>&1 &
 SPID=$!
 n=0
 until curl -sf -o /dev/null "http://127.0.0.1:$PORT/v1/models"; do

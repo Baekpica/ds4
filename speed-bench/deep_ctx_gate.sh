@@ -48,7 +48,7 @@ OUT=${DC_GATE_OUT:-/tmp/deep_ctx_gate_$(date +%Y%m%d_%H%M%S)}
 GGUF=${GGUF:-/home/ent/gguf}
 EXTRA_ENV=${EXTRA_ENV:-}
 BASE=$GGUF/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
-MTP=${MTP-$GGUF/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf}   # MTP="" boots --mtp-less (MTP-droppable legs)
+MTP=${MTP-$GGUF/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf}   # MTP="" boots --no-mtp (MTP-droppable legs; blocks launch-default auto-attach)
 DRAFTER=$GGUF/DSpark-drafter-Q2K-Q8.gguf
 SRV=/tmp/deep_ctx_gate_srv.log
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -88,7 +88,7 @@ ssh "$R" ": > $SRV; cd $RT; env $EXTRA_ENV \
     DS4_BATCH_FIT_HEADROOM_MB=$HEADROOM_MB DS4_SERVER_COALESCE_MAX=8 \
     DS4_CONT_PREFILL_CHUNK=2048 DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1 \
     DS4_DSPARK_MODEL=$DRAFTER DS4_CONT_CAPTURE=1 DS4_SERVER_DEFAULT_TEMP=0 \
-    setsid nohup ./ds4-server -m $BASE ${MTP:+--mtp $MTP} --cuda -c $CTX --port $PORT \
+    setsid nohup ./ds4-server -m $BASE ${MTP:+--mtp} ${MTP:---no-mtp} --cuda -c $CTX --port $PORT \
     > $SRV 2>&1 < /dev/null & exit 0"
 n=0
 until ssh "$R" "grep -q 'listening on http' $SRV 2>/dev/null; exit \$?" 2>/dev/null; do

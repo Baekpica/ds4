@@ -33504,9 +33504,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * construction.  Requires the drafter loaded + its slab allocated.  N=1 first
      * (the cont loop's multiseq forward has an unfixed race; drafts are race-tolerant
      * but the verify path is gated single-seq first).  Off unless DS4_CONT_DSPARK. */
+    const char *dspark_env = getenv("DS4_CONT_DSPARK");
     const int dspark_armed = (ctx->e->dspark_ready &&
                               ctx->dsl.multi_raw[0] != NULL &&
-                              getenv("DS4_CONT_DSPARK") != NULL) ? 1 : 0;
+                              dspark_env && dspark_env[0] &&
+                              strcmp(dspark_env, "0") != 0) ? 1 : 0;
     /* MTP-droppable (v0.2): the mode-2 verify/accept/rollback machinery is
      * draft-source agnostic -- its rollback state is BASE-model compressor
      * checkpoints (ctx->sl.ckpt_* wired to g->mtp_rb_*, allocated for every

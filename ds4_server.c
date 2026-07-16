@@ -13427,6 +13427,12 @@ static void usage(FILE *fp) {
         "      GGUF model path. Default: ds4flash.gguf\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
+        "  --dspark FILE\n"
+        "      Optional DSpark block-drafter GGUF for speculative decode (same as DS4_DSPARK_MODEL).\n"
+        "  --preset spark\n"
+        "      Require the full speculative stack from the standard install layout; fail if any piece is missing.\n"
+        "  --no-mtp | --no-dspark | --no-spec\n"
+        "      Disable launch-default auto-detection: skip the MTP, the drafter, or all speculation.\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
@@ -13500,6 +13506,16 @@ static void usage(FILE *fp) {
         "      evict      save the live conversation before another request replaces it\n"
         "      shutdown   save the live conversation when the server exits cleanly\n"
         "\n"
+        "Launch defaults (standard install layout):\n"
+        "  With -m omitted, the base model is looked up in $DS4_GGUF_DIR (default ~/gguf)\n"
+        "  using the installer's file name (override with GGUF_FILE).  When an MTP or\n"
+        "  DSpark drafter GGUF sits beside the base model (names via MTP_FILE/DSPARK_FILE)\n"
+        "  and --mtp/--dspark are not given, it is attached and MTP-2 + DSpark speculative\n"
+        "  decode is enabled.  Every auto choice is reported on one boot line; explicit\n"
+        "  flags and env (DS4_CONT_MTP_MODE, DS4_CONT_DSPARK, DS4_DSPARK_MODEL) win.\n"
+        "\n"
+        "  ds4-server -c 49152 --host 0.0.0.0    # full stack on a standard install\n"
+        "\n"
         "Normal server command:\n"
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
@@ -13533,6 +13549,187 @@ static ds4_backend default_server_backend(void) {
 #endif
 }
 
+/* ------------------------------------------------------------------------
+ * Launch defaults: resolve the standard install layout (ds4-on-spark) in
+ * the engine binary so `ds4-server -c N` boots the fully-optimized stack
+ * with no env or model args.  Explicit flags and env always win; every auto
+ * choice is reported on one boot line, never silently.  --preset spark makes
+ * the full stack a hard requirement; --no-mtp / --no-dspark / --no-spec opt
+ * out per component.  File-name env overrides (DS4_GGUF_DIR, GGUF_FILE,
+ * MTP_FILE, DSPARK_FILE) match the ds4-serve wrapper.
+ * ------------------------------------------------------------------------ */
+#define LAUNCH_BASE_GGUF   "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+#define LAUNCH_MTP_GGUF    "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
+#define LAUNCH_DSPARK_GGUF "DSpark-drafter-Q2K-Q8.gguf"
+
+static bool launch_file_ok(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static char *launch_join(const char *dir, const char *name) {
+    size_t n = strlen(dir) + strlen(name) + 2;
+    char *p = malloc(n);
+    if (p) snprintf(p, n, "%s/%s", dir, name);
+    return p;
+}
+
+static const char *launch_name(const char *env, const char *fallback) {
+    const char *v = getenv(env);
+    return (v && v[0]) ? v : fallback;
+}
+
+static void launch_append(char *buf, size_t cap, int *off, const char *fmt, ...) {
+    if (*off < 0 || (size_t)*off >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *off, cap - (size_t)*off, fmt, ap);
+    va_end(ap);
+    if (n > 0) *off += n;
+    if ((size_t)*off > cap - 1) *off = (int)cap - 1;
+}
+
+static void launch_resolve_defaults(server_config *c,
+                                    bool model_set, bool mtp_set,
+                                    bool preset_spark,
+                                    bool no_mtp, bool no_dspark, bool no_spec)
+{
+    if (c->engine.distributed.role != DS4_DISTRIBUTED_NONE) return;
+    if (preset_spark && (no_mtp || no_dspark || no_spec)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --preset spark conflicts with --no-mtp/--no-dspark/--no-spec");
+        exit(2);
+    }
+    bool auto_model = false, auto_mtp = false, auto_dspark = false;
+
+    if (!model_set) {
+        const char *dir = getenv("DS4_GGUF_DIR");
+        char *dirbuf = NULL;
+        if (!(dir && dir[0])) {
+            const char *home = getenv("HOME");
+            if (home && home[0]) dir = dirbuf = launch_join(home, "gguf");
+        }
+        char *cand = dir ? launch_join(dir, launch_name("GGUF_FILE", LAUNCH_BASE_GGUF)) : NULL;
+        if (launch_file_ok(cand)) {
+            c->engine.model_path = cand;   /* lives for the process */
+            auto_model = true;
+        } else {
+            if (preset_spark) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --preset spark: base model not found at %s "
+                           "(set DS4_GGUF_DIR/GGUF_FILE or pass -m)",
+                           cand ? cand : "$HOME/gguf/" LAUNCH_BASE_GGUF);
+                exit(2);
+            }
+            free(cand);
+        }
+        free(dirbuf);
+    }
+
+    /* Siblings are looked up beside the resolved base model.  A relative -m
+     * combined with --chdir would be stat'd against the launch cwd while the
+     * engine opens it after the chdir — skip auto-detection there. */
+    char *sib = NULL;
+    if (c->chdir_path && c->engine.model_path[0] != '/') {
+        no_mtp = true;
+        no_dspark = true;
+    }
+    {
+        const char *mp = c->engine.model_path;
+        const char *slash = strrchr(mp, '/');
+        if (slash && slash != mp) {
+            sib = malloc((size_t)(slash - mp) + 1);
+            if (sib) { memcpy(sib, mp, (size_t)(slash - mp)); sib[slash - mp] = 0; }
+        } else {
+            sib = strdup(slash == mp ? "/" : ".");
+        }
+    }
+
+    if (!no_spec && !no_mtp && !mtp_set && sib) {
+        char *cand = launch_join(sib, launch_name("MTP_FILE", LAUNCH_MTP_GGUF));
+        if (launch_file_ok(cand)) {
+            c->engine.mtp_path = cand;
+            auto_mtp = true;
+        } else {
+            if (preset_spark) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --preset spark: MTP model not found at %s "
+                           "(set MTP_FILE or pass --mtp)", cand ? cand : "?");
+                exit(2);
+            }
+            free(cand);
+        }
+    }
+
+    bool dspark_named = (c->engine.dspark_path && c->engine.dspark_path[0]);
+    {
+        const char *denv = getenv("DS4_DSPARK_MODEL");
+        if (denv && denv[0]) dspark_named = true;   /* env picks drafter + its own arming */
+    }
+    if (!no_spec && !no_dspark && !dspark_named && sib) {
+        char *cand = launch_join(sib, launch_name("DSPARK_FILE", LAUNCH_DSPARK_GGUF));
+        if (launch_file_ok(cand)) {
+            c->engine.dspark_path = cand;
+            auto_dspark = true;
+        } else {
+            if (preset_spark) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --preset spark: DSpark drafter not found at %s "
+                           "(set DSPARK_FILE or pass --dspark)", cand ? cand : "?");
+                exit(2);
+            }
+            free(cand);
+        }
+    }
+    free(sib);
+
+    if (preset_spark) {
+        const char *me = getenv("DS4_CONT_MTP_MODE");
+        const char *de = getenv("DS4_CONT_DSPARK");
+        if ((me && strcmp(me, "2") != 0) || (de && (!de[0] || !strcmp(de, "0")))) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --preset spark conflicts with DS4_CONT_MTP_MODE/"
+                       "DS4_CONT_DSPARK env overrides");
+            exit(2);
+        }
+    }
+
+    /* Arm the continuous-loop speculation defaults.  setenv(..., 0) never
+     * overwrites, so explicit env (including DS4_CONT_MTP_MODE=0 and
+     * DS4_CONT_DSPARK=0) always wins. */
+    bool armed_mode = false, armed_dspark = false;
+    bool have_source = (c->engine.mtp_path && c->engine.mtp_path[0]) ||
+                       (c->engine.dspark_path && c->engine.dspark_path[0]);
+    if (!no_spec && have_source && !getenv("DS4_CONT_MTP_MODE")) {
+        setenv("DS4_CONT_MTP_MODE", "2", 0);
+        armed_mode = true;
+    }
+    if (!no_spec && c->engine.dspark_path && c->engine.dspark_path[0] &&
+        !getenv("DS4_CONT_DSPARK")) {
+        setenv("DS4_CONT_DSPARK", "1", 0);
+        armed_dspark = true;
+    }
+
+    if (auto_model || auto_mtp || auto_dspark || armed_mode || armed_dspark) {
+        char line[2048];
+        int off = 0;
+        launch_append(line, sizeof(line), &off, "ds4-server: launch defaults:");
+        if (auto_model)
+            launch_append(line, sizeof(line), &off, " model=%s", c->engine.model_path);
+        if (auto_mtp)
+            launch_append(line, sizeof(line), &off, " mtp=%s", c->engine.mtp_path);
+        if (auto_dspark)
+            launch_append(line, sizeof(line), &off, " dspark=%s", c->engine.dspark_path);
+        if (armed_mode)
+            launch_append(line, sizeof(line), &off, " DS4_CONT_MTP_MODE=2");
+        if (armed_dspark)
+            launch_append(line, sizeof(line), &off, " DS4_CONT_DSPARK=1");
+        launch_append(line, sizeof(line), &off,
+                      " (flags/env override; --no-mtp/--no-dspark/--no-spec disable)");
+        server_log(DS4_LOG_DEFAULT, "%s", line);
+    }
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -13550,6 +13747,8 @@ static server_config parse_options(int argc, char **argv) {
     c.kv_cache = kv_cache_default_options();
 
     bool directional_steering_scale_set = false;
+    bool model_set = false, mtp_set = false;
+    bool preset_spark = false, no_mtp = false, no_dspark = false, no_spec = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -13575,8 +13774,26 @@ static server_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+            model_set = true;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+            mtp_set = true;
+        } else if (!strcmp(arg, "--dspark")) {
+            c.engine.dspark_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--preset")) {
+            const char *p = need_arg(&i, argc, argv, arg);
+            if (strcmp(p, "spark") != 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: unknown --preset: %s (valid: spark)", p);
+                exit(2);
+            }
+            preset_spark = true;
+        } else if (!strcmp(arg, "--no-mtp")) {
+            no_mtp = true;
+        } else if (!strcmp(arg, "--no-dspark")) {
+            no_dspark = true;
+        } else if (!strcmp(arg, "--no-spec")) {
+            no_spec = true;
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -13667,6 +13884,20 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
         exit(2);
     }
+    if (mtp_set && no_mtp) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --mtp conflicts with --no-mtp");
+        exit(2);
+    }
+    if (c.engine.dspark_path && no_dspark) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --dspark conflicts with --no-dspark");
+        exit(2);
+    }
+    if (no_spec && (mtp_set || c.engine.dspark_path)) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --no-spec conflicts with --mtp/--dspark");
+        exit(2);
+    }
+    launch_resolve_defaults(&c, model_set, mtp_set,
+                            preset_spark, no_mtp, no_dspark, no_spec);
     return c;
 }
 

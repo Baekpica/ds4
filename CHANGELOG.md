@@ -5,6 +5,29 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## Unreleased
+
+- **Launch defaults: `ds4-server -c N` boots the full stack on a standard
+  install.** With `-m` omitted the server resolves the base model from
+  `$DS4_GGUF_DIR` (default `~/gguf`); when the MTP head and/or DSpark
+  drafter GGUFs sit beside the base model and `--mtp`/`--dspark` are not
+  given, they are attached and MTP-2 + DSpark speculative decode is
+  enabled. Every auto choice is reported on one boot line — never silent.
+  Explicit flags and env (`DS4_CONT_MTP_MODE`, `DS4_CONT_DSPARK`,
+  `DS4_DSPARK_MODEL`) always win; file names follow the `ds4-serve`
+  wrapper's env (`GGUF_FILE`/`MTP_FILE`/`DSPARK_FILE`). New flags:
+  `--dspark FILE` (CLI form of `DS4_DSPARK_MODEL`), `--preset spark`
+  (require the full stack, fail loudly if any piece is missing),
+  `--no-mtp` / `--no-dspark` / `--no-spec` (per-component opt-outs).
+  `DS4_CONT_DSPARK=0` (or empty) now reads as OFF — it was
+  presence-tested before, so `=0` counter-intuitively armed the drafter.
+  Gate scripts pass `--no-mtp` on their `MTP=""` legs so MTP-droppable
+  legs stay genuinely MTP-less; the serial-path repro boots `--no-spec`.
+  Release note: `ds4-on-spark`'s `ds4-serve` wrapper should forward
+  `--no-spec`/`--no-dspark` to the server when its pin reaches this
+  version (its wrapper-level downgrade flags currently rely on the
+  server not auto-detecting).
+
 ## v0.2.2 — 2026-07-16
 
 Closes a silent performance-tier cliff between weight-server and standalone

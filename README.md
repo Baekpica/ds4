@@ -72,6 +72,16 @@ precedence when a manifest is present. The active tier is never silent —
 one boot line plus `ds4_derived_artifacts{source=…}` on `/metrics` and
 `artifact_source` in `/v1/stats`.
 
+**One command.** On a standard install (the `~/gguf` layout ds4-on-spark
+sets up), `ds4-server -c 49152 --host 0.0.0.0` is the whole launch: the
+base model is resolved automatically, the MTP head and DSpark drafter
+sitting beside it are attached, and MTP-2 + DSpark speculation is enabled —
+with one boot line stating exactly what was auto-enabled, never silently.
+Explicit flags and env override everything; `--no-spec` boots a plain
+server, `--no-mtp`/`--no-dspark` opt out per component, and
+`--preset spark` makes the full stack a hard requirement that fails loudly
+if any piece is missing.
+
 **A weight server.** One resident process uploads the model once (VMM-backed,
 direct-I/O) and brokers it to any number of engine processes over IPC — server
 restarts and A/B runs stop paying the multi-minute reload. It also builds the
