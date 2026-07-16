@@ -12881,6 +12881,10 @@ static void handle_batch(server *s, int fd, const char *body) {
  * like the model id and ctx size); neither takes gen_mu -- it can be held for
  * minutes at deep ctx -- so they stay pollable while the box is saturated. */
 
+static const char *server_artifact_source_name(uint64_t source) {
+    return source == 2 ? "built" : source == 1 ? "imported" : "none";
+}
+
 /* Prometheus text exposition (hand-rolled: it is just lines). */
 static void send_metrics(server *s, int fd) {
     ds4_metrics *m = ds4_metrics_get();
@@ -12971,6 +12975,15 @@ static void send_metrics(server *s, int fd) {
                (unsigned long long)ds4_metric_read(&m->banks_total),
                (unsigned long long)ds4_metric_read(&m->warm_records),
                (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+    /* Aligned-artifact perf tier: source label tells which producer put the
+     * fast-path repack artifacts on device (none = raw-layout dispatch). */
+    buf_printf(&b, "# TYPE ds4_derived_artifacts gauge\n"
+                   "ds4_derived_artifacts{source=\"%s\"} %llu\n"
+                   "# TYPE ds4_derived_artifact_bytes gauge\n"
+                   "ds4_derived_artifact_bytes %llu\n",
+               server_artifact_source_name(ds4_metric_read(&m->derived_artifact_source)),
+               (unsigned long long)ds4_metric_read(&m->derived_artifacts),
+               (unsigned long long)ds4_metric_read(&m->derived_artifact_bytes));
     http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);
 }
@@ -12991,10 +13004,13 @@ static void send_stats(server *s, int fd, bool as_json) {
         buf_puts(&b, "{\"server\":{\"model\":");
         json_escape(&b, server_model_id_from_engine(s->engine));
         buf_printf(&b, ",\"context\":%d,\"max_seq\":%d,\"uptime_seconds\":%llu,"
-                       "\"requests_inflight\":%llu}",
+                       "\"requests_inflight\":%llu,"
+                       "\"artifact_source\":\"%s\",\"derived_artifacts\":%llu}",
                    ds4_session_ctx(s->session), s->batch_ctx_max_seq,
                    (unsigned long long)up,
-                   (unsigned long long)ds4_metric_read(&m->requests_inflight));
+                   (unsigned long long)ds4_metric_read(&m->requests_inflight),
+                   server_artifact_source_name(ds4_metric_read(&m->derived_artifact_source)),
+                   (unsigned long long)ds4_metric_read(&m->derived_artifacts));
         buf_printf(&b, ",\"serving\":{\"requests_started\":%llu,"
                        "\"requests_completed\":%llu,\"requests_failed\":%llu,"
                        "\"requests_refused_deep_serial\":%llu,"
@@ -13046,11 +13062,15 @@ static void send_stats(server *s, int fd, bool as_json) {
                    "context:%d\n"
                    "max_seq:%d\n"
                    "uptime_seconds:%llu\n"
-                   "requests_inflight:%llu\n\n",
+                   "requests_inflight:%llu\n"
+                   "artifact_source:%s\n"
+                   "derived_artifacts:%llu\n\n",
                server_model_id_from_engine(s->engine),
                ds4_session_ctx(s->session), s->batch_ctx_max_seq,
                (unsigned long long)up,
-               (unsigned long long)ds4_metric_read(&m->requests_inflight));
+               (unsigned long long)ds4_metric_read(&m->requests_inflight),
+               server_artifact_source_name(ds4_metric_read(&m->derived_artifact_source)),
+               (unsigned long long)ds4_metric_read(&m->derived_artifacts));
     buf_printf(&b, "# Serving\n"
                    "requests_started:%llu\n"
                    "requests_completed:%llu\n"

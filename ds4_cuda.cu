@@ -25,6 +25,7 @@
 #include <new>
 
 #include "cuda/mmq/ds4_mmq.h"
+#include "cuda/mmq/ds4_repack.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -471,6 +472,28 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static std::vector<cuda_derived_range> g_derived_ranges;
+/* Aligned-artifact tier accounting (v0.2.2 self-load artifacts): which
+ * producer put the aligned repack artifacts on device — the weight-server
+ * manifest import or the in-process self-load build — plus its cost.  The
+ * absence of the fast tier used to be silent (installer self-load boots
+ * measured decode 13.9 vs ~17.8 tok/s with zero log tells); the boot banner
+ * (ds4_gpu_report_derived_artifacts) and the ds4_metrics artifact-source
+ * gauge both render from these. */
+enum {
+    CUDA_DERIVED_ARTIFACTS_NONE = 0,
+    CUDA_DERIVED_ARTIFACTS_IMPORTED = 1,
+    CUDA_DERIVED_ARTIFACTS_BUILT = 2,
+};
+static int g_derived_artifact_source = CUDA_DERIVED_ARTIFACTS_NONE;
+static uint64_t g_derived_artifact_count;
+static uint64_t g_derived_artifact_bytes;
+static double g_derived_artifact_build_secs;
+static const char *g_derived_artifact_none_reason;
+/* Set only when every iq2/q2k REPLACE-kind candidate in the base catalog got
+ * an in-process artifact: the whole-model host registration is skipped only
+ * then (a partial set would leave some expert raws on the pageable tier
+ * while still pinning ~90 GiB — the worst of both). */
+static int g_derived_replaces_complete;
 static uint64_t g_model_range_bytes;
 /* S6 (2026-07-07): HBM-cache coverage dedup vs imported manifest ranges --
  * bytes the startup walk SKIPPED because a device-resident range (WS VMM/IPC
@@ -2039,6 +2062,24 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     return 24ull * 1073741824ull;
 }
 
+/* True iff model_map's expert raws were REPLACED by complete in-process
+ * aligned artifacts (ds4_gpu_build_derived_artifacts).  Gates the self-load
+ * fast-tier memory shape: skip the whole-model host registration and uncap
+ * the device-copy budget for this map's remaining raw spans, so residency
+ * lands exactly where a weight-server import puts it (device artifacts +
+ * device copies of the non-expert raws; expert raws stay cold on disk). */
+static int cuda_model_map_replaces_complete(const void *model_map) {
+    if (!g_derived_replaces_complete || !model_map) return 0;
+    for (const cuda_derived_range &r : g_derived_ranges) {
+        if (r.host_base == model_map &&
+            (r.kind == CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE ||
+             r.kind == CUDA_DERIVED_Q2_K_ALIGNED_MOE)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     uint64_t mb = 1792;
     const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
@@ -2363,7 +2404,9 @@ static const char *cuda_model_range_ptr_from_fd(
     // `model_map + offset` directly, the correct host pointer for any
     // registered mmap).
     if (g_model_fd_host_base && model_map != g_model_fd_host_base) return NULL;
-    const uint64_t limit = cuda_model_cache_limit_bytes();
+    const uint64_t limit = cuda_model_map_replaces_complete(model_map)
+        ? UINT64_MAX
+        : cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
             fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
@@ -2558,10 +2601,18 @@ static void cuda_model_range_release_all(void) {
             }
         } else if (r.imported_ipc && r.device_ptr) {
             (void)cudaIpcCloseMemHandle(r.device_ptr);
+        } else if (r.device_ptr) {
+            /* In-process self-load artifact (plain cudaMalloc). */
+            (void)cudaFree(r.device_ptr);
         }
     }
     g_derived_ranges.clear();
     g_derived_range_bytes = 0;
+    g_derived_artifact_source = CUDA_DERIVED_ARTIFACTS_NONE;
+    g_derived_artifact_count = 0;
+    g_derived_artifact_bytes = 0;
+    g_derived_artifact_build_secs = 0.0;
+    g_derived_replaces_complete = 0;
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -3227,7 +3278,9 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
      * path on integrated (no server) is a separate, larger change -- it needs a
      * coalesced up-front loader to match the server's ~20 s load + ~19.64 t/s.
      * See local/docs/ds4_gb10_vmm_default_followup_2026-05-30.md. */
-    if (getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST") != NULL) {
+    if (getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST") != NULL ||
+        cuda_model_map_replaces_complete(model_map)) {
+        const int self_load_artifacts = cuda_model_map_replaces_complete(model_map);
         int integrated = 0;
         int reg_dev = 0;
         if (cudaGetDevice(&reg_dev) == cudaSuccess) {
@@ -3235,11 +3288,30 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
         if (integrated) {
             g_model_device_base = (const char *)model_map;
-            g_model_hmm_direct = 1;
-            fprintf(stderr,
-                    "ds4: CUDA integrated + VMM import: skipping full host registration "
-                    "(%.2f GiB mmap left unpinned; weights served from device VMM)\n",
-                    (double)model_size / 1073741824.0);
+            if (self_load_artifacts) {
+                /* In-process aligned artifacts replaced the expert raws:
+                 * pinning the full mmap here would double-residency the
+                 * ~73 GiB of expert weights against their device artifacts.
+                 * Unlike the manifest case, hmm_direct stays OFF: nothing
+                 * imported the non-expert raws, so cuda_model_range_ptr must
+                 * fall through to the fd cache / startup walk (both uncapped
+                 * for this map), which load them into device memory on
+                 * demand — the same residency a weight-server import gives
+                 * them.  Expert raws stay cold on disk; the raw mmap pointer
+                 * (g_model_device_base) still serves the aligned-consumer
+                 * fallback reads through HMM at mmap rates. */
+                fprintf(stderr,
+                        "ds4: CUDA integrated + in-process artifacts: skipping full host "
+                        "registration (%.2f GiB mmap left unpinned; expert weights served "
+                        "from device artifacts)\n",
+                        (double)model_size / 1073741824.0);
+            } else {
+                g_model_hmm_direct = 1;
+                fprintf(stderr,
+                        "ds4: CUDA integrated + VMM import: skipping full host registration "
+                        "(%.2f GiB mmap left unpinned; weights served from device VMM)\n",
+                        (double)model_size / 1073741824.0);
+            }
             return 1;
         }
     }
@@ -3981,9 +4053,210 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
                 " plus %.2f MiB across %llu derived artifacts",
                 (double)imported_derived_bytes / 1048576.0,
                 (unsigned long long)imported_derived_ranges);
+        g_derived_artifact_source = CUDA_DERIVED_ARTIFACTS_IMPORTED;
+        g_derived_artifact_count += imported_derived_ranges;
+        g_derived_artifact_bytes += imported_derived_bytes;
+    } else if (strcmp(model_id, "base") == 0 &&
+               g_derived_artifact_source == CUDA_DERIVED_ARTIFACTS_NONE) {
+        g_derived_artifact_none_reason =
+            "manifest has no derived artifacts; start ds4_weight_server with the "
+            "--repack-*-aligned defaults";
     }
     fprintf(stderr, "\n");
     return 1;
+}
+
+/* ---- self-load aligned artifacts (v0.2.2) ---------------------------------
+ * A boot with no DS4_CUDA_WEIGHT_IPC_MANIFEST used to run every dispatch on
+ * the raw-layout tier: the aligned-SoA fast paths were gated on
+ * weight-server-built derived artifacts, so installer self-load boots
+ * measured decode 13.9 vs ~17.8 tok/s (prefill ~488 vs ~800) with no log
+ * tell.  Build the SAME artifacts in-process at load — the builders, S5
+ * parallel driver, and byte layouts are shared with the weight server via
+ * cuda/mmq/ds4_repack.cu (FNV bit-identity gated) — and register them in
+ * g_derived_ranges so every cuda_derived_weight_ptr dispatch site is
+ * untouched.  Precedence: manifest import > in-process build > raw.
+ * DS4_CUDA_NO_DERIVED_WEIGHTS (existing kill switch) disables the build too;
+ * DS4_CUDA_BUILD_ARTIFACTS=0 opts out of just the boot-time build. */
+static uint32_t cuda_moe_iq2_aligned_enabled(void);
+static uint32_t cuda_moe_q2k_aligned_enabled(void);
+static uint32_t cuda_q8_aligned_enabled(void);
+
+extern "C" int ds4_gpu_build_derived_artifacts(
+        const void *model_map,
+        uint64_t model_size,
+        const char *model_path) {
+    if (!model_map || model_size == 0 || !model_path || !model_path[0]) return 0;
+    if (getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST") != NULL) return 0;
+    if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) {
+        g_derived_artifact_none_reason = "DS4_CUDA_NO_DERIVED_WEIGHTS is set";
+        return 0;
+    }
+    const char *knob = getenv("DS4_CUDA_BUILD_ARTIFACTS");
+    if (knob && knob[0] == '0' && knob[1] == '\0') {
+        g_derived_artifact_none_reason = "DS4_CUDA_BUILD_ARTIFACTS=0";
+        return 0;
+    }
+    int integrated = 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess ||
+        !integrated) {
+        /* Discrete VRAM cannot hold the ~79 GiB artifact set next to the
+         * streamed model; the weight-server repack route stays the fast
+         * tier there. */
+        g_derived_artifact_none_reason =
+            "discrete GPU (use ds4_weight_server --repack-*-aligned for the aligned tier)";
+        return 0;
+    }
+
+    ds4_repack_file m;
+    if (!ds4_repack_map_file("ds4", model_path, m)) {
+        g_derived_artifact_none_reason = "model reopen failed";
+        return 0;
+    }
+    if (m.size != model_size) {
+        ds4_repack_unmap_file(m);
+        g_derived_artifact_none_reason = "model size mismatch on reopen";
+        return 0;
+    }
+    std::vector<ds4_repack_tensor> records;
+    const bool catalog_ok = ds4_repack_collect_catalog("ds4", m, nullptr, &records);
+    ds4_repack_unmap_file(m);
+    if (!catalog_ok) {
+        g_derived_artifact_none_reason = "GGUF catalog parse failed";
+        return 0;
+    }
+
+    /* The iq2/q2k artifacts REPLACE their raw residency (the whole-model
+     * registration skip + walk uncap key on a COMPLETE replace set), so a
+     * kill switch on either MoE dispatch disables both MoE builds: a partial
+     * set would strand the other kind's ~30-45 GiB raws on the slow tier
+     * while its artifacts still hold device memory.  Q8 stays independent —
+     * it is additive. */
+    const bool build_moe = cuda_moe_iq2_aligned_enabled() != 0 &&
+                           cuda_moe_q2k_aligned_enabled() != 0;
+    const bool build_q8 = cuda_q8_aligned_enabled() != 0;
+    if (!build_moe && !build_q8) {
+        g_derived_artifact_none_reason = "aligned dispatches disabled by env";
+        return 0;
+    }
+
+    const double t0 = cuda_wall_sec();
+    ds4_repack_build_args a;
+    a.log_prefix = "ds4";
+    a.model_id = "base";
+    a.path = model_path;
+    a.records = &records;
+    a.device = dev;
+    a.copy_chunk_bytes = 256ull * 1048576ull; /* weight-server --copy-chunk-mb default */
+    std::vector<ds4_repack_artifact> arts;
+    uint64_t built_bytes = 0;
+    uint64_t part = 0;
+    bool ok = true;
+    /* Same build order as the weight server: q2k, iq2, q8. */
+    if (ok && build_moe) {
+        ok = ds4_repack_build_q2k_aligned(a, arts, &part);
+        built_bytes += part;
+    }
+    if (ok && build_moe) {
+        ok = ds4_repack_build_iq2_aligned(a, arts, &part);
+        built_bytes += part;
+    }
+    if (ok && build_q8) {
+        ok = ds4_repack_build_q8_aligned(a, arts, &part);
+        built_bytes += part;
+    }
+    if (!ok) {
+        for (ds4_repack_artifact &art : arts) {
+            if (art.dev) (void)cudaFree(art.dev);
+        }
+        g_derived_artifact_none_reason = "in-process build failed; raw fallback";
+        return 0;
+    }
+    if (arts.empty()) {
+        g_derived_artifact_none_reason = "no candidate tensors in this GGUF";
+        return 0;
+    }
+
+    for (const ds4_repack_artifact &art : arts) {
+        g_derived_ranges.push_back({
+            model_map,
+            art.t->off,
+            art.t->bytes,
+            art.kind,
+            art.in_dim,
+            art.out_dim,
+            art.group_count,
+            art.bytes,
+            (char *)art.dev,
+            0,
+            0,
+            0,
+            0,
+            0,
+        });
+        g_derived_range_bytes += art.bytes;
+    }
+
+    /* Replace-set completeness: the registration skip must only fire when
+     * every iq2/q2k candidate raw is actually replaced. */
+    int replaces_complete = build_moe ? 1 : 0;
+    if (build_moe) {
+        for (const ds4_repack_tensor &t : records) {
+            if (!ds4_repack_iq2_candidate(t) && !ds4_repack_q2k_candidate(t)) continue;
+            bool have = false;
+            for (const ds4_repack_artifact &art : arts) {
+                if (art.t == &t) { have = true; break; }
+            }
+            if (!have) { replaces_complete = 0; break; }
+        }
+    }
+    g_derived_replaces_complete = replaces_complete;
+
+    g_derived_artifact_source = CUDA_DERIVED_ARTIFACTS_BUILT;
+    g_derived_artifact_count = arts.size();
+    g_derived_artifact_bytes = built_bytes;
+    g_derived_artifact_build_secs = cuda_wall_sec() - t0;
+    return (int)arts.size();
+}
+
+extern "C" void ds4_gpu_derived_artifact_stats(
+        int *source,
+        uint64_t *count,
+        uint64_t *bytes,
+        double *build_secs) {
+    if (source) *source = g_derived_artifact_source;
+    if (count) *count = g_derived_artifact_count;
+    if (bytes) *bytes = g_derived_artifact_bytes;
+    if (build_secs) *build_secs = g_derived_artifact_build_secs;
+}
+
+/* One canonical boot line for the aligned-artifact perf tier — the absence
+ * of the fast path must never again be silent. */
+extern "C" void ds4_gpu_report_derived_artifacts(void) {
+    switch (g_derived_artifact_source) {
+    case CUDA_DERIVED_ARTIFACTS_BUILT:
+        fprintf(stderr,
+                "ds4: aligned artifacts built in-process (%llu artifacts, %.2f GiB, %.1fs)\n",
+                (unsigned long long)g_derived_artifact_count,
+                (double)g_derived_artifact_bytes / 1073741824.0,
+                g_derived_artifact_build_secs);
+        break;
+    case CUDA_DERIVED_ARTIFACTS_IMPORTED:
+        fprintf(stderr,
+                "ds4: aligned artifacts imported from weight server (%llu artifacts, %.2f GiB)\n",
+                (unsigned long long)g_derived_artifact_count,
+                (double)g_derived_artifact_bytes / 1073741824.0);
+        break;
+    default:
+        fprintf(stderr,
+                "ds4: aligned artifacts: none — raw-layout dispatch tier (%s)\n",
+                g_derived_artifact_none_reason
+                    ? g_derived_artifact_none_reason
+                    : "no aligned artifacts were imported or built");
+        break;
+    }
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
@@ -4003,7 +4276,14 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
      * works for any tensor we don't pre-cache. */
     if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 1;
     if (g_model_device_owned) return 1;
-    const uint64_t limit = cuda_model_cache_limit_bytes();
+    /* Self-load artifacts mode: this map's expert raws live in device
+     * artifacts and the whole-model registration was skipped, so the walk
+     * must device-copy ALL of its remaining (non-expert) spans — the same
+     * residency a weight-server import gives them.  The cap still applies
+     * to every other map (MTP / DSpark support models stay registered). */
+    const uint64_t limit = cuda_model_map_replaces_complete(model_map)
+        ? UINT64_MAX
+        : cuda_model_cache_limit_bytes();
     if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) return 1;
     const char *what = label ? label : "model_tensor";
     /* Skip if this span is already populated. */

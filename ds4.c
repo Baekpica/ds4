@@ -36453,6 +36453,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
+#ifndef __APPLE__
+        /* Self-load aligned artifacts: with no weight-server manifest, build
+         * the aligned-SoA repack artifacts in-process BEFORE the model map
+         * registers — ds4_gpu_set_model_map keys its residency shape (skip
+         * the whole-file pin) on the artifacts existing.  Failure or opt-out
+         * (DS4_CUDA_BUILD_ARTIFACTS=0) falls back to the raw tier; the
+         * manifest import below stays the preferred producer. */
+        {
+            const char *weight_manifest_probe = getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST");
+            if ((!weight_manifest_probe || !weight_manifest_probe[0]) && !load_slice) {
+                (void)ds4_gpu_build_derived_artifacts(e->model.map,
+                                                      e->model.size,
+                                                      opt->model_path);
+            }
+        }
+#endif
         int model_map_ok = 0;
         if (load_slice) {
             char load_end[32];
@@ -36604,6 +36620,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 fprintf(stderr, "ds4: CUDA shared drafter weight cache unavailable; "
                                 "DSpark drafter reads stay on the host mmap path\n");
             }
+        }
+        /* One canonical boot line for the aligned-artifact perf tier, plus
+         * the /metrics + /v1/stats gauges — the raw-dispatch tier used to be
+         * silent (decode 13.9 vs ~17.8 tok/s with no log tell). */
+        ds4_gpu_report_derived_artifacts();
+        {
+            int art_source = 0;
+            uint64_t art_count = 0;
+            uint64_t art_bytes = 0;
+            ds4_gpu_derived_artifact_stats(&art_source, &art_count, &art_bytes, NULL);
+            ds4_metric_set(&ds4_metrics_get()->derived_artifact_source, (uint64_t)art_source);
+            ds4_metric_set(&ds4_metrics_get()->derived_artifacts, art_count);
+            ds4_metric_set(&ds4_metrics_get()->derived_artifact_bytes, art_bytes);
         }
 #endif
         // Pre-cache main and support-model tensor spans into device memory at

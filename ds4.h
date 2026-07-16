@@ -394,6 +394,11 @@ typedef struct {
     uint64_t warm_records;                  /* valid warm-start records */
     uint64_t kv_pages_resident;             /* demand-mapped comp/index pages */
     uint64_t boot_stamp;                    /* monotonic second at server boot */
+    /* aligned-artifact perf tier (set once at boot): 0=none (raw-layout
+     * dispatch), 1=imported from ds4_weight_server, 2=built in-process */
+    uint64_t derived_artifact_source;
+    uint64_t derived_artifacts;             /* artifact count */
+    uint64_t derived_artifact_bytes;
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);

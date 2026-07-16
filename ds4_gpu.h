@@ -504,6 +504,18 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_import_model_ipc_manifest(const void *model_map, uint64_t model_size, const char *manifest_path, const char *model_id);
+/* Self-load aligned artifacts (v0.2.2): with no weight-server manifest, build
+ * the aligned-SoA repack artifacts in-process at load (shared layout library
+ * cuda/mmq/ds4_repack.cu) so self-load boots ride the same fast dispatches as
+ * manifest imports.  Call BEFORE ds4_gpu_set_model_map_range for the base
+ * model.  Returns the number of artifacts built (0 = raw tier; boot goes on).
+ * Opt-outs: DS4_CUDA_NO_DERIVED_WEIGHTS, DS4_CUDA_BUILD_ARTIFACTS=0. */
+int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size, const char *model_path);
+/* Aligned-artifact tier for observability: source 0=none 1=imported 2=built.
+ * Any out pointer may be NULL. */
+void ds4_gpu_derived_artifact_stats(int *source, uint64_t *count, uint64_t *bytes, double *build_secs);
+/* Print the canonical one-line boot banner for the artifact tier. */
+void ds4_gpu_report_derived_artifacts(void);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
