@@ -5,6 +5,41 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.2.2 — 2026-07-16
+
+Closes a silent performance-tier cliff between weight-server and standalone
+boots — found chasing a latency-table discrepancy, disclosed on the
+announcement thread the same day — plus a request-compatibility alias.
+
+- **Every boot now builds the aligned fast-path artifacts** (`73c9727`).
+  The fast decode and prefill dispatches (aligned-SoA D2R tiers) read
+  derived repack artifacts that only `ds4_weight_server` built, so a
+  standalone (self-load) boot silently fell to the raw-layout tier:
+  decode 13.9 vs 17.8 tok/s p50, prefill 488 vs 853 tok/s, TTFT roughly
+  doubled at the pp≈2048/tg=256 bench shape — with zero log tells. The
+  one-command installer boots exactly that way. The repack builders now
+  live in one shared library (`cuda/mmq/ds4_repack.{h,cu}`) compiled into
+  both the engine and the weight server; manifest-less boots build the
+  same artifacts in-process (78.7 GiB in ~22–26 s on GB10) and register
+  them through the same lookup the import path uses. Precedence: manifest
+  import > in-process build > raw fallback. `DS4_CUDA_BUILD_ARTIFACTS=0`
+  opts out of the boot-time build; `DS4_CUDA_NO_DERIVED_WEIGHTS` still
+  disables derived artifacts entirely. Gated: 474/474 FNV-1a artifact
+  bit-identity vs the weight-server build, byte-identical accept traces
+  per tier pair, and decode/prefill/TTFT parity with the weight-server
+  control (17.8 tok/s / 868 tok/s / 5.3 s) on a standalone boot. The
+  deep-context gate re-stamped on the release binary also improved:
+  deep decode 163 ms/tok at 517K (was ~177 on the raw tier) and the
+  cold half-million-token admit ~33 min (was ~41).
+- **The active perf tier is never silent again.** One canonical boot line
+  (`built in-process` / `imported from weight server` / `none` plus the
+  reason), `ds4_derived_artifacts{source=…}` and
+  `ds4_derived_artifact_bytes` gauges on `/metrics`, and
+  `artifact_source` in `/v1/stats`.
+- **`enable_thinking` is accepted as a `think` alias** (`f090ed2`) — the
+  Qwen/vLLM convention, honored at all three request-parse sites alongside
+  the existing `think` and `thinking.type` forms.
+
 ## v0.2.1 — 2026-07-16
 
 Serving observability plus a models-list fix, both requested by users on the

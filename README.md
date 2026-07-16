@@ -50,8 +50,8 @@ path), so agent traffic gets speculation too. The batched forward scales
 ~2× upstream main measured on the same box, GGUF, and harness (1.9–2.1×
 across the whole 2k–128k frontier; ~4× on an RTX PRO 6000).
 The core is a family of D2R (decode-to-registers) GEMM kernels that
-dequantize Q2_K / IQ2_XXS / Q8_0 expert weights directly from the weight
-server's aligned SoA artifacts into tensor-core fragments, plus token-tile
+dequantize Q2_K / IQ2_XXS / Q8_0 expert weights directly from aligned SoA
+repack artifacts into tensor-core fragments, plus token-tile
 HMMA attention (replacing the scalar online-softmax path) and an
 L2-reuse-aware expert-major CTA schedule. Decode gets the same treatment:
 per-layer CUDA-graph capture of the batched decode step brings plain width-1
@@ -63,13 +63,22 @@ bounding the worst case at ~0.96x plain decode on adversarial prose — where
 always-on speculation used to bottom out at 0.72x — while keeping the 1.2-1.7x
 wins on structured content.
 
+**Always on the fast path.** The aligned SoA repack artifacts the D2R and
+decode kernels read in place are built by whichever process loads the
+weights: standalone boots build them in-process at load (since v0.2.2;
+78.7 GiB in ~22 s on GB10, bit-identical to the weight-server build, opt
+out with `DS4_CUDA_BUILD_ARTIFACTS=0`), and weight-server imports take
+precedence when a manifest is present. The active tier is never silent —
+one boot line plus `ds4_derived_artifacts{source=…}` on `/metrics` and
+`artifact_source` in `/v1/stats`.
+
 **A weight server.** One resident process uploads the model once (VMM-backed,
 direct-I/O) and brokers it to any number of engine processes over IPC — server
 restarts and A/B runs stop paying the multi-minute reload. It also builds the
-aligned SoA repack artifacts the D2R and decode kernels read in place
-(parallel builders, ~21 s boot tax), serves the MTP head and the speculative
-drafter (shipped at Q2K — equal throughput and acceptance to Q4K, 4.2 GiB
-smaller, and required for ~1M-token KV), and rejects stale-manifest imports.
+same aligned repack artifacts (parallel builders, ~21 s boot tax), serves the
+MTP head and the speculative drafter (shipped at Q2K — equal throughput and
+acceptance to Q4K, 4.2 GiB smaller, and required for ~1M-token KV), and
+rejects stale-manifest imports.
 
 **Long context, verified.** v0.2 extends verified serving from the 128k tier
 to the multi-agent deep shape: **766K tokens served concurrently on one
@@ -83,7 +92,8 @@ FP4 e2m1 indexer) are bit-lossless against F32 storage. KV costs
 ≈9.5 KiB/token at the F32 default (~766K-token ceiling per box; the FP8/FP4
 tiers are the opt-in road past 1M). Honesty note: prefill is context-flat
 and decode is through ~128k, but deep decode is not — ~146 ms/tok at 248K
-and ~177 ms/tok at 519K. The deep-context win is capacity plus seconds-fast
+(v0.2 stamp) and ~163 ms/tok at 519K (re-stamped on v0.2.2's always-on fast
+tier; ~177 on v0.2). The deep-context win is capacity plus seconds-fast
 warm turn cycles, not raw decode speed.
 
 **Measured, gated, reversible.** Every performance claim comes from same-boot
