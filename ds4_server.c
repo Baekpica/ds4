@@ -2777,7 +2777,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "think")) {
+        } else if (!strcmp(key, "think") ||
+                   !strcmp(key, "enable_thinking")) {   /* Qwen/vLLM alias */
             if (!json_bool(&p, &thinking_enabled)) {
                 free(key);
                 goto bad;
@@ -4113,7 +4114,8 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "think")) {
+        } else if (!strcmp(key, "think") ||
+                   !strcmp(key, "enable_thinking")) {   /* Qwen/vLLM alias */
             if (!json_bool(&p, &thinking_enabled)) {
                 free(key);
                 goto bad;
@@ -12796,7 +12798,8 @@ static void handle_batch(server *s, int fd, const char *body) {
             if (!json_int(&p, &max_tokens)) parse_ok = false;
         } else if (!strcmp(key, "model")) {
             if (!json_string(&p, &model)) parse_ok = false;
-        } else if (!strcmp(key, "think")) {
+        } else if (!strcmp(key, "think") ||
+                   !strcmp(key, "enable_thinking")) {   /* Qwen/vLLM alias */
             if (!json_bool(&p, &think)) parse_ok = false;
         } else {
             if (!json_skip_value(&p)) parse_ok = false;
