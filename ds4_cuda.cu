@@ -8448,8 +8448,24 @@ __global__ static void attention_indexed_mixed_kernel(
                 }
                 float dot = 0.0f;
                 if (fp8_row) {
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) {
-                        dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, fp8_c, d);
+                    /* Hoisted fp8 row read (see attention_decode_mixed): row
+                     * base pointers once per row, per-element work reduced to
+                     * byte load + table + sign + FMA.  d order (qlane-strided)
+                     * and value math unchanged — shuffle-reduce order, and
+                     * thus spec-verify counter-identity, preserved. */
+                    const unsigned char *cp = comp_fp8 +
+                        (uint64_t)fp8_c * DS4_OPP_C_FP8_ROW_BYTES_DEV;
+                    const float *scp = comp_scale +
+                        (uint64_t)fp8_c * DS4_OPP_C_FP8_BLOCKS_DEV;
+                    const float *tail = (const float *)(cp + DS4_OPP_C_FP8_NOPE_DEV);
+                    uint32_t d = qlane;
+                    for (; d < DS4_OPP_C_FP8_NOPE_DEV; d += 8u) {
+                        const unsigned char code = cp[d];
+                        const float mag = dsv4_e4m3fn_decode_table[code & 0x7fu];
+                        dot += qh[d] * (((code & 0x80u) ? -mag : mag) * scp[d >> 6u]);
+                    }
+                    for (; d < head_dim; d += 8u) {
+                        dot += qh[d] * tail[d - DS4_OPP_C_FP8_NOPE_DEV];
                     }
                 } else {
                     for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
@@ -8489,8 +8505,11 @@ __global__ static void attention_indexed_mixed_kernel(
     __syncthreads();
     float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
     if (head_dim == 512u && blockDim.x == 256u) {
-        uint32_t d0 = threadIdx.x;
-        uint32_t d1 = d0 + 256u;
+        /* Pair lane layout (d0,d1 = 2t,2t+1) — see attention_decode_mixed:
+         * enables the uchar2 fp8 V read; per-d values unchanged under any
+         * lane mapping, raw/predec/F32 reads stay equally coalesced. */
+        uint32_t d0 = threadIdx.x * 2u;
+        uint32_t d1 = d0 + 1u;
         float acc0 = 0.0f;
         float acc1 = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) {
@@ -8507,11 +8526,34 @@ __global__ static void attention_indexed_mixed_kernel(
                 acc1 += kv[d1] * s;
             }
         } else if (use_fp8) {
-            for (uint32_t c = 0; c < comp_count; c++) {
-                float s = scores[raw_count + c];
-                const uint32_t cr = comp_seq_base + comp_rows[c];
-                acc0 += fp8_kv_read(comp_fp8, comp_scale, cr, d0) * s;
-                acc1 += fp8_kv_read(comp_fp8, comp_scale, cr, d1) * s;
+            /* Pair-lane fp8 V read (see attention_decode_mixed): one uchar2
+             * sharing one scale per pair; rows are top-k-scattered so the
+             * row base is computed per ROW (hoisted from per-element).
+             * Value math and per-d accumulation order unchanged. */
+            if (d0 < DS4_OPP_C_FP8_NOPE_DEV) {              /* uniform per warp */
+                const uint32_t blk = d0 >> 6u;
+                for (uint32_t c = 0; c < comp_count; c++) {
+                    const float s = scores[raw_count + c];
+                    const uint64_t cr = (uint64_t)(comp_seq_base + comp_rows[c]);
+                    const uchar2 k = *(const uchar2 *)(comp_fp8 +
+                        cr * DS4_OPP_C_FP8_ROW_BYTES_DEV + d0);
+                    const float sc = comp_scale[cr * DS4_OPP_C_FP8_BLOCKS_DEV + blk];
+                    const float m0 = dsv4_e4m3fn_decode_table[k.x & 0x7fu];
+                    const float m1 = dsv4_e4m3fn_decode_table[k.y & 0x7fu];
+                    acc0 += (((k.x & 0x80u) ? -m0 : m0) * sc) * s;
+                    acc1 += (((k.y & 0x80u) ? -m1 : m1) * sc) * s;
+                }
+            } else {
+                const uint32_t toff = DS4_OPP_C_FP8_NOPE_DEV +
+                    (d0 - DS4_OPP_C_FP8_NOPE_DEV) * (uint32_t)sizeof(float);
+                for (uint32_t c = 0; c < comp_count; c++) {
+                    const float s = scores[raw_count + c];
+                    const uint64_t cr = (uint64_t)(comp_seq_base + comp_rows[c]);
+                    const float2 v = *(const float2 *)(comp_fp8 +
+                        cr * DS4_OPP_C_FP8_ROW_BYTES_DEV + toff);
+                    acc0 += v.x * s;
+                    acc1 += v.y * s;
+                }
             }
         } else {
             for (uint32_t c = 0; c < comp_count; c++) {
