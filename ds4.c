@@ -30770,6 +30770,38 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                       DS4_SESSION_IO_CHUNK,
                                                       err,
                                                       errlen);
+        } else if (g->layer_comp_cache_fp8[il] && g->layer_n_comp[il] != 0u) {
+            /* P2 Inc2b / v0.2.4 flip: fp8-primary -- the F32 cache rows are
+             * unwritten (emits pack straight to codes); expand the packed
+             * rows into the scratch and persist that.  The file format stays
+             * F32 and the expansion is the exact value every reader
+             * reconstructs, so save/load round-trips bit-identically.  This
+             * mirrors ds4_session_save_layer_payload; the local serializer
+             * missed it and packed-primary servers checkpointed the
+             * unwritten F32 rows (caught by kv_crossmode_gate.sh). */
+            const uint32_t rows = g->layer_n_comp[il];
+            ds4_gpu_tensor *stg = metal_graph_comp_emit_scratch(g, rows);
+            ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(g->layer_comp_cache_fp8[il],
+                    0, (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES) : NULL;
+            ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(g->layer_comp_scale[il],
+                    0, (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES) : NULL;
+            if (!codes || !scale ||
+                ds4_gpu_dsv4_fp8_kv_dequant_tensor(stg, codes, scale,
+                                                   rows, DS4_N_HEAD_DIM) == 0) {
+                payload_set_err(err, errlen, "fp8 comp expand for save failed");
+                rc = 1;
+            } else {
+                rc = payload_write_tensor_span(fp,
+                                               stg,
+                                               0,
+                                               (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float),
+                                               buf,
+                                               DS4_SESSION_IO_CHUNK,
+                                               err,
+                                               errlen);
+            }
+            ds4_gpu_tensor_free(scale);
+            ds4_gpu_tensor_free(codes);
         } else {
             rc = payload_write_tensor_span(fp,
                                            g->layer_attn_comp_cache[il],
@@ -30797,6 +30829,28 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
+            if (g->layer_index_comp_cache_fp4[il] && g->layer_n_index_comp[il] != 0u) {
+                /* P2 Inc3b / v0.2.4 flip: fp4-primary indexer -- same
+                 * expansion as the attention rows above, same reason. */
+                const uint32_t irows = g->layer_n_index_comp[il];
+                ds4_gpu_tensor *stg = metal_graph_index_emit_scratch(g, irows);
+                ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
+                        0, (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES) : NULL;
+                ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
+                        0, (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES) : NULL;
+                if (!codes || !scale ||
+                    ds4_gpu_dsv4_indexer_fp4_dequant_tensor(stg, codes, scale,
+                                                       irows, DS4_N_INDEXER_HEAD_DIM) == 0) {
+                    payload_set_err(err, errlen, "fp4 index expand for save failed");
+                    rc = 1;
+                } else {
+                    rc = payload_write_tensor_span(fp, stg, 0,
+                                                   (uint64_t)irows * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                                   buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                }
+                ds4_gpu_tensor_free(scale);
+                ds4_gpu_tensor_free(codes);
+            } else {
             rc = payload_write_tensor_span(fp,
                                            g->layer_index_comp_cache[il],
                                            0,
@@ -30805,6 +30859,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                            DS4_SESSION_IO_CHUNK,
                                            err,
                                            errlen);
+            }
             if (rc == 0) rc = payload_write_tensor_span(fp,
                                                         g->layer_index_state_kv[il],
                                                         0,

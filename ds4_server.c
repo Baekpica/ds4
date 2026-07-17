@@ -9127,6 +9127,10 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 }
 #endif
 
+/* Local fwd-decls (ds4_gpu.h is not pulled in here; Metal stubs return 0). */
+int ds4_cuda_fp8_kv_enabled(void);
+int ds4_cuda_fp4_index_enabled(void);
+
 static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
@@ -9134,6 +9138,32 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   bool responses_protocol) {
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    /* v0.2.4: refuse disk-KV RESTORES while the packed FP8/FP4 primaries are
+     * engaged.  The restore path regenerates the packed mirrors from the
+     * file's F32 rows, and that re-encode is measurably not bit-exact yet
+     * (kv_crossmode_gate.sh: packed-mode restored continuations drift from
+     * the F32-mode ones, which are exact).  Until restore-time mirrors are
+     * exact (v0.3 work item: persist codes+scales, or prove/fix re-encode
+     * idempotence), a refused hit costs one full prefill; a drifting hit
+     * silently changes model output.  STORES stay enabled -- the file
+     * format is F32 (packed rows are expanded at save), so checkpoints
+     * written here restore exactly on F32-primary boots.
+     * DS4_KV_DISK_PACKED_RESTORE=1 overrides for investigation only. */
+    if (s->kv.enabled &&
+        (ds4_cuda_fp8_kv_enabled() || ds4_cuda_fp4_index_enabled())) {
+        const char *ov = getenv("DS4_KV_DISK_PACKED_RESTORE");
+        if (!(ov && ov[0] == '1')) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: disk-KV restore refused under packed FP8/FP4 primaries "
+                           "(restore-time mirror re-encode is not yet bit-exact; stores continue, "
+                           "DS4_CUDA_FP8_KV=0 DS4_CUDA_FP4_INDEX=0 restores loads)");
+            }
+            return 0;
+        }
+    }
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->session,

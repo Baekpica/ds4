@@ -43,6 +43,21 @@ and the change is bit-lossless.
   diagnostics). Eager F32+packed would be strictly worse than F32-only,
   so the server stays F32-primary there. A/B recipe note: an empty env is
   no longer the F32 control — pass explicit `=0`s.
+- **Disk-KV checkpoints are now safe across storage modes** (found by the
+  new `speed-bench/kv_crossmode_gate.sh`). The local session serializer
+  was missing the packed-row expansion its distributed sibling got in the
+  P2 era, so a packed-primary server checkpointed the write-dead F32 comp
+  rows — an F32 boot restoring such a file produced visibly deranged
+  output. Saves now expand the packed rows to their exact F32 values
+  (file format unchanged); gate-proven by F32 boots restoring
+  packed-written checkpoints byte-identically to F32-written ones.
+  Restores *into* a packed-primary server are refused with a loud
+  warning for now — the restore-time mirror re-encode is measurably not
+  bit-exact yet, and a refused hit costs one prefill where a drifting
+  hit silently changes output. Exact packed restore (persist
+  codes+scales, or prove re-encode idempotence) is queued for v0.3;
+  `DS4_KV_DISK_PACKED_RESTORE=1` overrides for investigation. Disk KV is
+  a serial-path feature — continuous-batch serving is unaffected.
 - **Counter-identity made structural.** The fp8-vs-F32 byte-equality of
   teb temp-0 speculative counters — the arc's losslessness tripwire —
   turned out to be a compiled-form coincidence: after the decode-kernel
