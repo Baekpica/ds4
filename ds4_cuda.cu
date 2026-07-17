@@ -7672,9 +7672,35 @@ __global__ static void attention_decode_mixed_kernel(
             if (add > -1.0e20f) {
                 float dot = 0.0f;
                 if (use_fp8) {
-                    for (uint32_t d = 0; d < head_dim; d++) {
-                        dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + c, d);
+                    /* Hoisted fp8 row read: the generic fp8_kv_read re-derives
+                     * the 64-bit row offset, codes-vs-tail branch, and scale
+                     * index PER ELEMENT — issue-bound over a context-scaling
+                     * row count.  Same value math (sign*mag*scale), same
+                     * accumulation order: numerically identical. */
+                    const unsigned char *cp = comp_fp8 +
+                        (uint64_t)(comp_seq_base + c) * DS4_OPP_C_FP8_ROW_BYTES_DEV;
+                    const float *scp = comp_scale +
+                        (uint64_t)(comp_seq_base + c) * DS4_OPP_C_FP8_BLOCKS_DEV;
+                    const float *tail = (const float *)(cp + DS4_OPP_C_FP8_NOPE_DEV);
+                    uint32_t d = 0;
+                    for (uint32_t b = 0; b < DS4_OPP_C_FP8_BLOCKS_DEV; b++) {
+                        const float sc = scp[b];
+                        for (uint32_t k = 0; k < 64u; k += 4u, d += 4u) {
+                            /* uchar4 quad (row base is 16-aligned, d%4==0);
+                             * lanes processed in ascending d — accumulation
+                             * order identical to the scalar loop. */
+                            const uchar4 q4 = *(const uchar4 *)(cp + d);
+                            const float m0 = dsv4_e4m3fn_decode_table[q4.x & 0x7fu];
+                            const float m1 = dsv4_e4m3fn_decode_table[q4.y & 0x7fu];
+                            const float m2 = dsv4_e4m3fn_decode_table[q4.z & 0x7fu];
+                            const float m3 = dsv4_e4m3fn_decode_table[q4.w & 0x7fu];
+                            dot += qh[d]      * (((q4.x & 0x80u) ? -m0 : m0) * sc);
+                            dot += qh[d + 1u] * (((q4.y & 0x80u) ? -m1 : m1) * sc);
+                            dot += qh[d + 2u] * (((q4.z & 0x80u) ? -m2 : m2) * sc);
+                            dot += qh[d + 3u] * (((q4.w & 0x80u) ? -m3 : m3) * sc);
+                        }
                     }
+                    for (uint32_t k = 0; d < head_dim; k++, d++) dot += qh[d] * tail[k];
                 } else {
                     const float *kvrow = comp_kv + (uint64_t)(comp_seq_base + c) * head_dim;
                     for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
@@ -7712,8 +7738,23 @@ __global__ static void attention_decode_mixed_kernel(
                 if (kvrow || fp8_row) {
                     float dot = 0.0f;
                     if (fp8_row) {
-                        for (uint32_t d = qlane; d < head_dim; d += 8u) {
-                            dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, fp8_c, d);
+                        /* Same hoist as the single-token branch: row base
+                         * pointers computed once, per-element work reduced to
+                         * byte load + table + sign + FMA.  Value math and
+                         * accumulation order unchanged. */
+                        const unsigned char *cp = comp_fp8 +
+                            (uint64_t)fp8_c * DS4_OPP_C_FP8_ROW_BYTES_DEV;
+                        const float *scp = comp_scale +
+                            (uint64_t)fp8_c * DS4_OPP_C_FP8_BLOCKS_DEV;
+                        const float *tail = (const float *)(cp + DS4_OPP_C_FP8_NOPE_DEV);
+                        uint32_t d = qlane;
+                        for (; d < DS4_OPP_C_FP8_NOPE_DEV; d += 8u) {
+                            const unsigned char code = cp[d];
+                            const float mag = dsv4_e4m3fn_decode_table[code & 0x7fu];
+                            dot += qh[d] * (((code & 0x80u) ? -mag : mag) * scp[d >> 6u]);
+                        }
+                        for (; d < head_dim; d += 8u) {
+                            dot += qh[d] * tail[d - DS4_OPP_C_FP8_NOPE_DEV];
                         }
                     } else {
                         for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
@@ -7755,8 +7796,15 @@ __global__ static void attention_decode_mixed_kernel(
     __syncthreads();
     float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
     if (head_dim == 512u && blockDim.x == 256u) {
-        uint32_t d0 = threadIdx.x;
-        uint32_t d1 = d0 + 256u;
+        /* Consecutive-pair lane layout (d0,d1 = 2t,2t+1) instead of the old
+         * split halves (t, t+256): the fp8 V loop reads its two codes as one
+         * uchar2 and shares one scale block per pair; tail threads read
+         * float2 — one stream instead of two.  Per-d values are unchanged
+         * (each d column keeps its c-order), so outputs are bit-identical
+         * under any lane mapping; F32/raw reads stay equally coalesced (a
+         * warp covers a contiguous 256 B either way). */
+        uint32_t d0 = threadIdx.x * 2u;
+        uint32_t d1 = d0 + 1u;
         float acc0 = 0.0f;
         float acc1 = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) {
@@ -7766,10 +7814,40 @@ __global__ static void attention_decode_mixed_kernel(
             acc1 += kv[d1] * s;
         }
         if (use_fp8) {
-            for (uint32_t c = 0; c < visible_comp; c++) {
-                float s = scores[raw_count + c];
-                acc0 += fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + c, d0) * s;
-                acc1 += fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + c, d1) * s;
+            /* Hottest loop of the deep-decode ledger: one sequential pass
+             * over EVERY visible comp row per thread.  With the pair lane
+             * layout the two lanes are one uchar2 (or one float2 in the
+             * rotary tail) sharing one scale block; all address math is
+             * loop-invariant and pointers advance by the row stride.
+             * Value math (sign*mag*scale) per lane unchanged.  Alignment:
+             * row stride 704 and the 448 tail offset are 8-byte multiples
+             * and d0 is even, so uchar2/float2 loads are aligned. */
+            const uint64_t rb = (uint64_t)comp_seq_base;
+            const unsigned char *row0 = comp_fp8 + rb * DS4_OPP_C_FP8_ROW_BYTES_DEV;
+            if (d0 < DS4_OPP_C_FP8_NOPE_DEV) {          /* uniform per warp */
+                const unsigned char *cp = row0 + d0;
+                const float *scp = comp_scale + rb * DS4_OPP_C_FP8_BLOCKS_DEV + (d0 >> 6u);
+                for (uint32_t c = 0; c < visible_comp; c++) {
+                    const float s = scores[raw_count + c];
+                    const uchar2 k = *(const uchar2 *)cp;
+                    const float sc = *scp;
+                    const float m0 = dsv4_e4m3fn_decode_table[k.x & 0x7fu];
+                    const float m1 = dsv4_e4m3fn_decode_table[k.y & 0x7fu];
+                    acc0 += (((k.x & 0x80u) ? -m0 : m0) * sc) * s;
+                    acc1 += (((k.y & 0x80u) ? -m1 : m1) * sc) * s;
+                    cp += DS4_OPP_C_FP8_ROW_BYTES_DEV;
+                    scp += DS4_OPP_C_FP8_BLOCKS_DEV;
+                }
+            } else {
+                const unsigned char *tp = row0 + DS4_OPP_C_FP8_NOPE_DEV +
+                    (d0 - DS4_OPP_C_FP8_NOPE_DEV) * (uint32_t)sizeof(float);
+                for (uint32_t c = 0; c < visible_comp; c++) {
+                    const float s = scores[raw_count + c];
+                    const float2 v = *(const float2 *)tp;
+                    acc0 += v.x * s;
+                    acc1 += v.y * s;
+                    tp += DS4_OPP_C_FP8_ROW_BYTES_DEV;
+                }
             }
         } else {
             for (uint32_t c = 0; c < visible_comp; c++) {
@@ -7786,8 +7864,27 @@ __global__ static void attention_decode_mixed_kernel(
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
             if (use_fp8) {
-                for (uint32_t c = 0; c < visible_comp; c++) {
-                    acc += fp8_kv_read(comp_fp8, comp_scale, comp_seq_base + c, d) * scores[raw_count + c];
+                /* Generic-width V path: d fixed per iteration of the outer
+                 * loop — hoist the row-invariant address math (same value
+                 * math and accumulation order as fp8_kv_read). */
+                const uint64_t rb = (uint64_t)comp_seq_base;
+                if (d < DS4_OPP_C_FP8_NOPE_DEV) {
+                    const unsigned char *cp = comp_fp8 + rb * DS4_OPP_C_FP8_ROW_BYTES_DEV + d;
+                    const float *scp = comp_scale + rb * DS4_OPP_C_FP8_BLOCKS_DEV + (d >> 6u);
+                    for (uint32_t c = 0; c < visible_comp; c++) {
+                        const unsigned char code = *cp;
+                        const float mag = dsv4_e4m3fn_decode_table[code & 0x7fu];
+                        acc += (((code & 0x80u) ? -mag : mag) * (*scp)) * scores[raw_count + c];
+                        cp += DS4_OPP_C_FP8_ROW_BYTES_DEV;
+                        scp += DS4_OPP_C_FP8_BLOCKS_DEV;
+                    }
+                } else {
+                    const unsigned char *tp = comp_fp8 + rb * DS4_OPP_C_FP8_ROW_BYTES_DEV +
+                        DS4_OPP_C_FP8_NOPE_DEV + (d - DS4_OPP_C_FP8_NOPE_DEV) * (uint32_t)sizeof(float);
+                    for (uint32_t c = 0; c < visible_comp; c++) {
+                        acc += *(const float *)tp * scores[raw_count + c];
+                        tp += DS4_OPP_C_FP8_ROW_BYTES_DEV;
+                    }
                 }
             } else {
                 for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)(comp_seq_base + c) * head_dim + d] * scores[raw_count + c];
