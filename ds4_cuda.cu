@@ -2814,7 +2814,7 @@ extern "C" void ds4_gpu_cleanup(void) {
      * proves indexer_score_one_direct consumed the packed mirror, so a matching
      * token-MD5 vs fp4-off reflects bit-identical reconstruction. */
     if (ds4_cuda_fp4_index_enabled() && ds4_cuda_fp8_kv_debug_enabled()) {
-        fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX path stats -- indexer_score_one_direct fp4 blocks: %llu\n",
+        fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX path stats -- indexer fp4 scorer launches: %llu\n",
                 ds4_cuda_fp4_index_read_path_blocks());
     }
     if (g_cublas_ready) {
@@ -6508,7 +6508,12 @@ __device__ static unsigned char dsv4_e4m3fn_encode_dev(float x) {
  * plus the decode helper / attention-side reads land in Phase 1A.4 with
  * their first caller.  An unreferenced __constant__ symbol emits no code,
  * so this is byte-identical to today's build. */
-__constant__ float dsv4_e4m3fn_decode_table[128];
+/* __device__ (global, L1-cached), NOT __constant__: decode indexes this
+ * table by the code byte, so the 32 lanes of a warp read 32 unrelated
+ * entries — constant memory serializes divergent reads into per-address
+ * replays (up to 32x on this instruction), and the dense fp8 comp read
+ * runs it on every element of a context-scaling range every decode step. */
+__device__ float dsv4_e4m3fn_decode_table[128];
 
 /* Opp C Phase 1A.3: populate dsv4_e4m3fn_decode_table on the device.
  * Host-side computation mirrors dsv4_e4m3fn_value_dev byte-for-byte
@@ -6553,8 +6558,10 @@ __device__ static unsigned long long g_fp8_kv_read_path_blocks = 0ull;
  * indexer-layer count grows linearly with context, the dense one does
  * not, and conflating them masks regressions in either branch. */
 __device__ static unsigned long long g_fp8_kv_indexed_read_path_blocks = 0ull;
-/* P2 Inc3: read-tripwire for the packed FP4 indexer mirror (one atomic per
- * scorer block that consumed the mirror). */
+/* P2 Inc3: read-tripwire for the packed FP4 indexer mirror.  One atomic per
+ * scorer LAUNCH (block 0 only): at deep ctx the scan runs >100K blocks per
+ * layer per step, and a per-block atomic serialized every one of them on
+ * this single address.  Nonzero still proves the packed path engaged. */
 __device__ static unsigned long long g_fp4_index_read_path_blocks = 0ull;
 
 /* Read one (row, dim) lane out of the packed FP8 mirror.  For d<448 the
@@ -11978,7 +11985,7 @@ __global__ static void indexer_scores_kernel(
         }
     }
     const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
-    if (use_fp4 && threadIdx.x == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
+    if (use_fp4 && threadIdx.x == 0 && blockIdx.x == 0u && blockIdx.y == 0u) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
     float total = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
         const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
@@ -12036,7 +12043,7 @@ __global__ static void indexer_score_one_direct_kernel(
     }
 
     const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
-    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
+    if (use_fp4 && tid == 0 && blockIdx.x == 0u && blockIdx.y == 0u) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
     __shared__ float krow[128];
     __shared__ float partial[4];
     if (tid < 128u) {
@@ -12112,7 +12119,7 @@ __global__ static void indexer_scores_multiseq_kernel(
     const float *qrow = q + (uint64_t)t * 64u * 128u;
     const float *wrow = weights + (uint64_t)t * 64u;
     const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
-    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
+    if (use_fp4 && tid == 0 && blockIdx.x == 0u && blockIdx.y == 0u) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     __shared__ float krow[128];
     __shared__ float partial[4];
@@ -12159,7 +12166,7 @@ __global__ static void indexer_scores_wmma_kernel(
     const uint32_t tid = threadIdx.x;
     if (tid >= 32u || head_dim != 128u) return;
     const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
-    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
+    if (use_fp4 && tid == 0 && blockIdx.x == 0u && blockIdx.y == 0u) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
@@ -12274,7 +12281,7 @@ __global__ static void indexer_scores_wmma32_kernel(
     const uint32_t warp = tid >> 5u;
     if (tid >= 64u || head_dim != 128u) return;
     const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
-    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
+    if (use_fp4 && tid == 0 && blockIdx.x == 0u && blockIdx.y == 0u) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
@@ -12396,7 +12403,7 @@ __global__ static void indexer_scores_wmma64_kernel(
     const uint32_t warp = tid >> 5u;
     if (tid >= 128u || head_dim != 128u) return;
     const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
-    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
+    if (use_fp4 && tid == 0 && blockIdx.x == 0u && blockIdx.y == 0u) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
@@ -12518,7 +12525,7 @@ __global__ static void indexer_scores_wmma128_kernel(
     const uint32_t warp = tid >> 5u;
     if (tid >= 256u || head_dim != 128u) return;
     const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
-    if (use_fp4 && tid == 0) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
+    if (use_fp4 && tid == 0 && blockIdx.x == 0u && blockIdx.y == 0u) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     if (causal) {
         const uint32_t last_token = min(tile_t + 16u, n_tokens);
