@@ -7675,8 +7675,9 @@ __global__ static void attention_decode_mixed_kernel(
                     /* Hoisted fp8 row read: the generic fp8_kv_read re-derives
                      * the 64-bit row offset, codes-vs-tail branch, and scale
                      * index PER ELEMENT — issue-bound over a context-scaling
-                     * row count.  Same value math (sign*mag*scale), same
-                     * accumulation order: numerically identical. */
+                     * row count.  Value math (sign*mag*scale) unchanged; the
+                     * accumulation chain is PINNED below (source-level order
+                     * alone is not enough under --use_fast_math). */
                     const unsigned char *cp = comp_fp8 +
                         (uint64_t)(comp_seq_base + c) * DS4_OPP_C_FP8_ROW_BYTES_DEV;
                     const float *scp = comp_scale +
@@ -7687,23 +7688,41 @@ __global__ static void attention_decode_mixed_kernel(
                         const float sc = scp[b];
                         for (uint32_t k = 0; k < 64u; k += 4u, d += 4u) {
                             /* uchar4 quad (row base is 16-aligned, d%4==0);
-                             * lanes processed in ascending d — accumulation
-                             * order identical to the scalar loop. */
+                             * lanes processed in ascending d.  Accumulation is
+                             * PINNED to the scalar chain (mul then in-order
+                             * FMA) with intrinsics: fast-math is otherwise
+                             * free to tree-reduce the manual unroll, and that
+                             * reassociation showed up as a +2 spec_hits drift
+                             * on the teb think leg (draft-margin ULPs; text
+                             * byte-identical).  Counter-identity with F32 is
+                             * a load-bearing gate — keep the chain exact. */
                             const uchar4 q4 = *(const uchar4 *)(cp + d);
                             const float m0 = dsv4_e4m3fn_decode_table[q4.x & 0x7fu];
                             const float m1 = dsv4_e4m3fn_decode_table[q4.y & 0x7fu];
                             const float m2 = dsv4_e4m3fn_decode_table[q4.z & 0x7fu];
                             const float m3 = dsv4_e4m3fn_decode_table[q4.w & 0x7fu];
-                            dot += qh[d]      * (((q4.x & 0x80u) ? -m0 : m0) * sc);
-                            dot += qh[d + 1u] * (((q4.y & 0x80u) ? -m1 : m1) * sc);
-                            dot += qh[d + 2u] * (((q4.z & 0x80u) ? -m2 : m2) * sc);
-                            dot += qh[d + 3u] * (((q4.w & 0x80u) ? -m3 : m3) * sc);
+                            dot = __fmaf_rn(qh[d],
+                                    __fmul_rn((q4.x & 0x80u) ? -m0 : m0, sc), dot);
+                            dot = __fmaf_rn(qh[d + 1u],
+                                    __fmul_rn((q4.y & 0x80u) ? -m1 : m1, sc), dot);
+                            dot = __fmaf_rn(qh[d + 2u],
+                                    __fmul_rn((q4.z & 0x80u) ? -m2 : m2, sc), dot);
+                            dot = __fmaf_rn(qh[d + 3u],
+                                    __fmul_rn((q4.w & 0x80u) ? -m3 : m3, sc), dot);
                         }
                     }
-                    for (uint32_t k = 0; d < head_dim; k++, d++) dot += qh[d] * tail[k];
+                    for (uint32_t k = 0; d < head_dim; k++, d++)
+                        dot = __fmaf_rn(qh[d], tail[k], dot);
                 } else {
+                    /* F32 comp dot — the fp8 branch's identity partner.  Both
+                     * sides are pinned to the same in-order FMA chain so
+                     * fp8-vs-F32 counter identity is structural, not a
+                     * compiled-form coincidence (an F32-only recompile of
+                     * this kernel moved teb think spec_hits by -1 with the
+                     * source untouched: fast-math re-scheduling). */
                     const float *kvrow = comp_kv + (uint64_t)(comp_seq_base + c) * head_dim;
-                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                    for (uint32_t d = 0; d < head_dim; d++)
+                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
                 }
                 s = dot * scale + add;
             }
@@ -7740,8 +7759,10 @@ __global__ static void attention_decode_mixed_kernel(
                     if (fp8_row) {
                         /* Same hoist as the single-token branch: row base
                          * pointers computed once, per-element work reduced to
-                         * byte load + table + sign + FMA.  Value math and
-                         * accumulation order unchanged. */
+                         * byte load + table + sign + FMA.  Accumulation
+                         * pinned with intrinsics (see the quad-dot comment):
+                         * this is the spec-verify dot — counter-identity
+                         * with F32 depends on the exact chain. */
                         const unsigned char *cp = comp_fp8 +
                             (uint64_t)fp8_c * DS4_OPP_C_FP8_ROW_BYTES_DEV;
                         const float *scp = comp_scale +
@@ -7751,13 +7772,17 @@ __global__ static void attention_decode_mixed_kernel(
                         for (; d < DS4_OPP_C_FP8_NOPE_DEV; d += 8u) {
                             const unsigned char code = cp[d];
                             const float mag = dsv4_e4m3fn_decode_table[code & 0x7fu];
-                            dot += qh[d] * (((code & 0x80u) ? -mag : mag) * scp[d >> 6u]);
+                            dot = __fmaf_rn(qh[d],
+                                    __fmul_rn((code & 0x80u) ? -mag : mag, scp[d >> 6u]), dot);
                         }
                         for (; d < head_dim; d += 8u) {
-                            dot += qh[d] * tail[d - DS4_OPP_C_FP8_NOPE_DEV];
+                            dot = __fmaf_rn(qh[d], tail[d - DS4_OPP_C_FP8_NOPE_DEV], dot);
                         }
                     } else {
-                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                        /* Pinned like its fp8 partner above (identity is
+                         * structural only if BOTH branches fix the chain). */
+                        for (uint32_t d = qlane; d < head_dim; d += 8u)
+                            dot = __fmaf_rn(qh[d], kvrow[d], dot);
                     }
                     const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
@@ -8451,8 +8476,9 @@ __global__ static void attention_indexed_mixed_kernel(
                     /* Hoisted fp8 row read (see attention_decode_mixed): row
                      * base pointers once per row, per-element work reduced to
                      * byte load + table + sign + FMA.  d order (qlane-strided)
-                     * and value math unchanged — shuffle-reduce order, and
-                     * thus spec-verify counter-identity, preserved. */
+                     * preserved and accumulation pinned with intrinsics (see
+                     * the quad-dot comment) — shuffle-reduce order, and thus
+                     * spec-verify counter-identity, preserved exactly. */
                     const unsigned char *cp = comp_fp8 +
                         (uint64_t)fp8_c * DS4_OPP_C_FP8_ROW_BYTES_DEV;
                     const float *scp = comp_scale +
@@ -8462,13 +8488,20 @@ __global__ static void attention_indexed_mixed_kernel(
                     for (; d < DS4_OPP_C_FP8_NOPE_DEV; d += 8u) {
                         const unsigned char code = cp[d];
                         const float mag = dsv4_e4m3fn_decode_table[code & 0x7fu];
-                        dot += qh[d] * (((code & 0x80u) ? -mag : mag) * scp[d >> 6u]);
+                        dot = __fmaf_rn(qh[d],
+                                __fmul_rn((code & 0x80u) ? -mag : mag, scp[d >> 6u]), dot);
                     }
                     for (; d < head_dim; d += 8u) {
-                        dot += qh[d] * tail[d - DS4_OPP_C_FP8_NOPE_DEV];
+                        dot = __fmaf_rn(qh[d], tail[d - DS4_OPP_C_FP8_NOPE_DEV], dot);
                     }
                 } else {
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                    /* Pinned like its fp8 partner above (identity is
+                     * structural only if BOTH branches fix the chain).
+                     * Also serves predecode-scratch reads: those hold
+                     * bit-exact decoded F32 values, so the same pinned
+                     * chain keeps them congruent too. */
+                    for (uint32_t d = qlane; d < head_dim; d += 8u)
+                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
                 }
                 const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
