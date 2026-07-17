@@ -13675,22 +13675,8 @@ static void launch_resolve_defaults(server_config *c,
         }
     }
 
-    if (!no_spec && !no_mtp && !mtp_set && sib) {
-        char *cand = launch_join(sib, launch_name("MTP_FILE", LAUNCH_MTP_GGUF));
-        if (launch_file_ok(cand)) {
-            c->engine.mtp_path = cand;
-            auto_mtp = true;
-        } else {
-            if (preset_spark) {
-                server_log(DS4_LOG_DEFAULT,
-                           "ds4-server: --preset spark: MTP model not found at %s "
-                           "(set MTP_FILE or pass --mtp)", cand ? cand : "?");
-                exit(2);
-            }
-            free(cand);
-        }
-    }
-
+    /* Drafter first: whether a DSpark drafter is armed decides the MTP
+     * auto-attach below (v0.2.4 MTP-droppable default). */
     bool dspark_named = (c->engine.dspark_path && c->engine.dspark_path[0]);
     {
         const char *denv = getenv("DS4_DSPARK_MODEL");
@@ -13709,6 +13695,41 @@ static void launch_resolve_defaults(server_config *c,
                 exit(2);
             }
             free(cand);
+        }
+    }
+
+    /* v0.2.4 MTP-droppable: when a DSpark drafter will be armed, the MTP
+     * head is dead weight — DSpark fully shadows it wherever the drafter
+     * serves (teb fast MTP-less: every spec counter byte-identical, wall
+     * slightly BETTER), and it costs ~3.55 GiB of weights plus spec
+     * scratch.  So the launch defaults no longer auto-attach MTP beside an
+     * armed drafter.  An explicit --mtp always wins, --preset spark still
+     * demands the full stack, and DS4_CONT_DSPARK=0/"" (drafter disarmed)
+     * restores the MTP auto-attach. */
+    bool drafter_armed = !no_spec && !no_dspark &&
+                         c->engine.dspark_path && c->engine.dspark_path[0];
+    if (drafter_armed) {
+        const char *de = getenv("DS4_CONT_DSPARK");
+        if (de && (!de[0] || !strcmp(de, "0"))) drafter_armed = false;
+    }
+    bool dropped_mtp = false;
+    if (!no_spec && !no_mtp && !mtp_set && sib) {
+        if (drafter_armed && !preset_spark) {
+            dropped_mtp = true;
+        } else {
+            char *cand = launch_join(sib, launch_name("MTP_FILE", LAUNCH_MTP_GGUF));
+            if (launch_file_ok(cand)) {
+                c->engine.mtp_path = cand;
+                auto_mtp = true;
+            } else {
+                if (preset_spark) {
+                    server_log(DS4_LOG_DEFAULT,
+                               "ds4-server: --preset spark: MTP model not found at %s "
+                               "(set MTP_FILE or pass --mtp)", cand ? cand : "?");
+                    exit(2);
+                }
+                free(cand);
+            }
         }
     }
     free(sib);
@@ -13740,7 +13761,8 @@ static void launch_resolve_defaults(server_config *c,
         armed_dspark = true;
     }
 
-    if (auto_model || auto_mtp || auto_dspark || armed_mode || armed_dspark) {
+    if (auto_model || auto_mtp || auto_dspark || armed_mode || armed_dspark ||
+        dropped_mtp) {
         char line[2048];
         int off = 0;
         launch_append(line, sizeof(line), &off, "ds4-server: launch defaults:");
@@ -13748,6 +13770,9 @@ static void launch_resolve_defaults(server_config *c,
             launch_append(line, sizeof(line), &off, " model=%s", c->engine.model_path);
         if (auto_mtp)
             launch_append(line, sizeof(line), &off, " mtp=%s", c->engine.mtp_path);
+        if (dropped_mtp)
+            launch_append(line, sizeof(line), &off,
+                          " mtp=dropped(drafter armed; --mtp overrides)");
         if (auto_dspark)
             launch_append(line, sizeof(line), &off, " dspark=%s", c->engine.dspark_path);
         if (armed_mode)

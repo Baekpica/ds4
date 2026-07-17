@@ -79,10 +79,14 @@ completion(){
 metric(){ curl -s -m 10 "http://127.0.0.1:$TUNNEL_PORT/metrics" | grep -oE "^$1 [0-9]+" | awk '{print $2}'; }
 
 # ---- leg 1: zero-config ---------------------------------------------------
+# v0.2.4 MTP-droppable default: with a drafter beside the base model the
+# launch defaults arm DSpark-only spec and DROP the MTP head (~3.55 GiB;
+# teb fast MTP-less is counter-identical and slightly faster, 240K deep
+# within noise). --mtp / --preset spark still load it (leg 3 covers that).
 boot zero_config
-srv_has zero_config 'launch defaults:.*model=.*mtp=.*dspark=.*DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1' \
-  || fail "zero_config: launch-defaults boot line missing/incomplete"
-srv_has zero_config 'MTP support model loaded'  || fail "zero_config: MTP not loaded"
+srv_has zero_config 'launch defaults:.*model=.*mtp=dropped.*dspark=.*DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1' \
+  || fail "zero_config: launch-defaults boot line missing/incomplete (want mtp=dropped)"
+srv_has zero_config 'MTP support model loaded'  && fail "zero_config: MTP loaded despite armed drafter (MTP-droppable default)"
 srv_has zero_config 'DSpark drafter loaded'     || fail "zero_config: drafter not loaded"
 [ "$(ssh "$R" "grep -c aligned $RWORK/srv_zero_config.log")" -gt 0 ] \
   || fail "zero_config: no aligned fast-path artifacts (perf-cliff tell)"

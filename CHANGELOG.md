@@ -5,11 +5,26 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
-## v0.2.4 — 2026-07-17
+## v0.2.4 — 2026-07-18
 
 Packed FP8/FP4 compressed KV becomes the primary storage. Deep-context
 decode gets 19–26% faster, every context size fits in ~3× less KV memory,
-and the change is bit-lossless.
+and the change is bit-lossless. The MTP head is no longer loaded when a
+DSpark drafter is armed.
+
+- **MTP-droppable is now the launch default.** With a DSpark drafter
+  armed, the MTP head is fully shadowed: teb fast MTP-less is
+  byte-identical in every speculative counter (13577/197) with a
+  slightly better wall, and back-to-back 240K-deep stamps read 86.9
+  (MTP-less) vs 87.2 ms/tok (full stack) — equal or better everywhere,
+  for ~3.55 GiB of weights plus spec scratch back. The launch defaults
+  therefore skip the MTP auto-attach beside an armed drafter and say so
+  on the boot line (`mtp=dropped`). An explicit `--mtp` always wins,
+  `--preset spark` still demands the full stack, and disarming the
+  drafter (`--no-dspark`, `DS4_CONT_DSPARK=0`) restores the MTP
+  auto-attach — MTP-2 remains the fallback speculation when no drafter
+  is present. The `ds4-on-spark` wrapper no longer passes `--mtp` in its
+  full-stack mode.
 
 - **FP8 comp-KV + FP4 indexer primaries default ON.** The attention
   compressed-KV row stores the model's own e4m3-quantized values as 448
