@@ -14676,6 +14676,28 @@ extern "C" unsigned long long ds4_cuda_fp4_index_read_path_blocks(void) {
     return v;
 }
 
+/* v0.2.4 flip guard.  The packed primaries only pay for themselves when the
+ * batch comp slabs are VMM demand-mapped (R5 Inc1b): primary packed storage
+ * leaves the F32 comp rows write-dead, so their pages never become resident.
+ * With EAGER slabs (device without VMM support, DS4_BATCH_VMM_COMP=0, or
+ * slab-poison diagnostics) the F32 slab is fully resident regardless, and
+ * engaging the primaries would ADD the packed mirrors on top -- strictly
+ * worse than F32-only.  The conditions here must mirror
+ * ds4_batch_vmm_comp_enabled() in ds4.c. */
+static int ds4_cuda_packed_kv_vmm_ok(void) {
+    static int init = 0;
+    static int ok = 0;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("DS4_BATCH_VMM_COMP");
+        const char *p = getenv("DS4_BATCH_SLAB_POISON");
+        if (e && e[0] == '0' && e[1] == '\0') ok = 0;
+        else if (p && atoi(p) >= 1)           ok = 0;
+        else ok = ds4_gpu_vmm_demand_page() != 0 ? 1 : 0;
+    }
+    return ok;
+}
+
 extern "C" int ds4_cuda_fp8_kv_enabled(void) {
     static int init = 0;
     static int enabled = 0;
@@ -14687,8 +14709,12 @@ extern "C" int ds4_cuda_fp8_kv_enabled(void) {
              strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
              strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
              strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
-            enabled = 1;
-            fprintf(stderr, "ds4: DS4_CUDA_FP8_KV=%s - packed FP8 compressed-KV mirror enabled (Opp C Phase 1A)\n", s);
+            if (ds4_cuda_packed_kv_vmm_ok()) {
+                enabled = 1;
+                fprintf(stderr, "ds4: DS4_CUDA_FP8_KV=%s - packed FP8 compressed-KV mirror enabled (Opp C Phase 1A)\n", s);
+            } else {
+                fprintf(stderr, "ds4: DS4_CUDA_FP8_KV=%s REFUSED - batch comp slabs are eager (no VMM demand mapping); packed primary would sit on top of a fully resident F32 slab, staying F32-only\n", s);
+            }
         }
     }
     return enabled;
@@ -14762,8 +14788,12 @@ extern "C" int ds4_cuda_fp4_index_enabled(void) {
              strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
              strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
              strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
-            enabled = 1;
-            fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX=%s - packed FP4 indexer compressed-KV mirror enabled (P2 Inc3)\n", s);
+            if (ds4_cuda_packed_kv_vmm_ok()) {
+                enabled = 1;
+                fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX=%s - packed FP4 indexer compressed-KV mirror enabled (P2 Inc3)\n", s);
+            } else {
+                fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX=%s REFUSED - batch comp slabs are eager (no VMM demand mapping); packed primary would sit on top of a fully resident F32 slab, staying F32-only\n", s);
+            }
         }
     }
     return enabled;
