@@ -353,9 +353,10 @@ struct ds4_layer_graph_key {
  * split-flush override. */
 int  ds4_cuda_layer_graphs_enabled(void);
 
-/* Opp C Phase 1A: returns 1 only when DS4_CUDA_FP8_KV is set to an enable
- * value (1/on/yes/true); default OFF.  Gates allocation of the packed FP8
- * compressed-KV mirror buffers and (in later sub-commits) the FP8 emit /
+/* Opp C Phase 1A: returns 1 unless DS4_CUDA_FP8_KV is set to a disable
+ * value (0/off/no/false); default ON since v0.2.4, and refused (0) when
+ * the batch comp slabs cannot be VMM demand-mapped.  Gates allocation of
+ * the packed FP8 compressed-KV mirror buffers and the FP8 emit /
  * attention-read paths.  Metal stub returns 0. */
 int  ds4_cuda_fp8_kv_enabled(void);
 
@@ -1056,7 +1057,8 @@ int ds4_gpu_dsv4_indexer_fp4_encode_tensor(
         uint32_t                n_rows,
         uint32_t                head_dim);
 
-/* P2 Inc3: 1 when DS4_CUDA_FP4_INDEX selects packed FP4 indexer storage. */
+/* P2 Inc3: 1 when packed FP4 indexer storage is engaged (default ON since
+ * v0.2.4; DS4_CUDA_FP4_INDEX=0 disables, VMM guard can refuse). */
 int ds4_cuda_fp4_index_enabled(void);
 
 int ds4_gpu_rope_tail_tensor(

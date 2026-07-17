@@ -9061,7 +9061,8 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * mirror packs each row as 128 e2m1 nibbles (2 codes/byte = 64 code bytes)
  * with one F32 block scale per 32-lane block (4 scales = 16 bytes).  Both
  * mirror buffers are allocated only when DS4_CUDA_FP4_INDEX is enabled
- * (default OFF) and only for ratio==4 layers; NULL otherwise. */
+ * (default ON since v0.2.4, VMM-guarded) and only for ratio==4 layers;
+ * NULL otherwise. */
 #define DS4_INDEXER_FP4_ROW_BYTES   ((uint64_t)(DS4_N_INDEXER_HEAD_DIM / 2u))            /* 64 */
 #define DS4_INDEXER_FP4_SCALE_BYTES ((uint64_t)(DS4_N_INDEXER_HEAD_DIM / 32u) * sizeof(float)) /* 16 */
 
@@ -9096,7 +9097,7 @@ typedef struct {
      * 1-byte E4M3 codes followed by a still-FP32 rotary tail;
      * layer_comp_scale holds the DS4_OPP_C_FP8_BLOCKS per-64-lane FP32
      * block scales.  Both are allocated only when DS4_CUDA_FP8_KV is
-     * enabled (default OFF) and are NULL otherwise.  Phase 1A.1 stands the
+     * enabled (default ON since v0.2.4, VMM-guarded) and are NULL otherwise.  Phase 1A.1 stands the
      * storage up structurally; emit (1A.2) and attention read (1A.3) wire
      * it.  See local/docs/ds4_opp_c_fp8_kv_plan.html.
      *
@@ -9110,7 +9111,7 @@ typedef struct {
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
     /* P2 Inc3a: packed FP4 mirror of the indexer-compressed cache, allocated
      * only for ratio==4 layers when DS4_CUDA_FP4_INDEX is enabled (default
-     * OFF -> NULL).  layer_index_comp_cache_fp4 holds DS4_INDEXER_FP4_ROW_BYTES
+     * ON since v0.2.4, VMM-guarded; NULL when off/refused).  layer_index_comp_cache_fp4 holds DS4_INDEXER_FP4_ROW_BYTES
      * (64) of e2m1 codes per compressed row; layer_index_comp_scale holds the
      * DS4_INDEXER_FP4_SCALE_BYTES (16) per-32-lane FP32 block scales.  Faithful
      * analog of the FP8 attention mirror (layer_comp_cache_fp8/layer_comp_scale);

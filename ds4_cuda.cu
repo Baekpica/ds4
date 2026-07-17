@@ -14731,23 +14731,31 @@ static int ds4_cuda_packed_kv_vmm_ok(void) {
     return ok;
 }
 
+/* Default ON since v0.2.4 (KV efficiency arc 2026-07-17: charter turn-2
+ * 120.9 vs 162.7 ms/tok F32 @516K, +5.6 GiB freed at charter shape, teb
+ * spec-counters byte-identical to F32 across all legs; ledgers in
+ * local/docs/briefs/brief-kv-efficiency-arc.md).  DS4_CUDA_FP8_KV=0 (or
+ * off/no/false) restores F32-primary; the VMM guard above refuses the
+ * packed primary on eager slabs either way.  NOTE for A/B recipes: an
+ * empty env is no longer the F32 control — pass an explicit =0. */
 extern "C" int ds4_cuda_fp8_kv_enabled(void) {
     static int init = 0;
     static int enabled = 0;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_FP8_KV");
-        if (s && *s &&
-            (strcmp(s, "1") == 0 ||
-             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
-             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
-             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
-            if (ds4_cuda_packed_kv_vmm_ok()) {
-                enabled = 1;
-                fprintf(stderr, "ds4: DS4_CUDA_FP8_KV=%s - packed FP8 compressed-KV mirror enabled (Opp C Phase 1A)\n", s);
-            } else {
-                fprintf(stderr, "ds4: DS4_CUDA_FP8_KV=%s REFUSED - batch comp slabs are eager (no VMM demand mapping); packed primary would sit on top of a fully resident F32 slab, staying F32-only\n", s);
-            }
+        const int off = s && *s &&
+            (s[0] == '0' ||
+             strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+             strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+             strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0);
+        if (off) {
+            fprintf(stderr, "ds4: DS4_CUDA_FP8_KV=%s - packed FP8 compressed-KV primary disabled (F32-primary)\n", s);
+        } else if (!ds4_cuda_packed_kv_vmm_ok()) {
+            fprintf(stderr, "ds4: packed FP8 compressed-KV primary REFUSED - batch comp slabs are eager (no VMM demand mapping); staying F32-only\n");
+        } else {
+            enabled = 1;
+            fprintf(stderr, "ds4: packed FP8 compressed-KV primary ACTIVE (default since v0.2.4; DS4_CUDA_FP8_KV=0 restores F32-primary)\n");
         }
     }
     return enabled;
@@ -14808,25 +14816,27 @@ static int ds4_cuda_attn_tokentile_mixed_enabled(void) {
     return enabled;
 }
 
-/* P2 Inc3: gate for packed FP4 (e2m1) indexer compressed-KV storage.  Same
- * truthy-env parsing as ds4_cuda_fp8_kv_enabled; default OFF. */
+/* P2 Inc3: gate for packed FP4 (e2m1) indexer compressed-KV storage.
+ * Default ON since v0.2.4, same off-parsing and VMM guard as
+ * ds4_cuda_fp8_kv_enabled above. */
 extern "C" int ds4_cuda_fp4_index_enabled(void) {
     static int init = 0;
     static int enabled = 0;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_FP4_INDEX");
-        if (s && *s &&
-            (strcmp(s, "1") == 0 ||
-             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
-             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
-             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
-            if (ds4_cuda_packed_kv_vmm_ok()) {
-                enabled = 1;
-                fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX=%s - packed FP4 indexer compressed-KV mirror enabled (P2 Inc3)\n", s);
-            } else {
-                fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX=%s REFUSED - batch comp slabs are eager (no VMM demand mapping); packed primary would sit on top of a fully resident F32 slab, staying F32-only\n", s);
-            }
+        const int off = s && *s &&
+            (s[0] == '0' ||
+             strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+             strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+             strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0);
+        if (off) {
+            fprintf(stderr, "ds4: DS4_CUDA_FP4_INDEX=%s - packed FP4 indexer compressed-KV primary disabled (F32-primary indexer)\n", s);
+        } else if (!ds4_cuda_packed_kv_vmm_ok()) {
+            fprintf(stderr, "ds4: packed FP4 indexer compressed-KV primary REFUSED - batch comp slabs are eager (no VMM demand mapping); staying F32-only\n");
+        } else {
+            enabled = 1;
+            fprintf(stderr, "ds4: packed FP4 indexer compressed-KV primary ACTIVE (default since v0.2.4; DS4_CUDA_FP4_INDEX=0 restores F32-primary)\n");
         }
     }
     return enabled;

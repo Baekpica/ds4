@@ -5,6 +5,58 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.2.4 — 2026-07-17
+
+Packed FP8/FP4 compressed KV becomes the primary storage. Deep-context
+decode gets 19–26% faster, every context size fits in ~3× less KV memory,
+and the change is bit-lossless.
+
+- **FP8 comp-KV + FP4 indexer primaries default ON.** The attention
+  compressed-KV row stores the model's own e4m3-quantized values as 448
+  1-byte codes + F32 rotary tail (704+28 B vs 2048 B F32); the indexer row
+  packs e2m1 nibbles with per-32-lane scales (64+16 B vs 512 B). Because
+  the F32 caches only ever held model-quantized values at F32 width, the
+  packed forms are bit-lossless: teb temp-0 seed-7 speculative counters
+  are byte-identical to F32 on every leg (crash/fast/think). The F32 rows
+  go write-dead inside the VMM demand-mapped slabs, so their pages never
+  become resident — that is where the memory comes back.
+  `DS4_CUDA_FP8_KV=0` / `DS4_CUDA_FP4_INDEX=0` restore F32-primary.
+- **Deep-context decode wins** (GB10 sm_121, 512-token turn-2 stamps,
+  fresh boots): 120.9 ms/tok at 516K depth vs 162.7 F32 (−26%); 87.6 vs
+  107.4 at 240K (−19%); +5.6 GiB MemAvailable after the 766K-token
+  charter gate (needles exact to 518K both configs). The same charter
+  shape at F32 now sits on a capacity cliff — on a degraded box it takes
+  a clean 503 budget reject where the packed primaries pass with >6 GiB
+  spare, so the flip is robustness as much as reach. Kernel levers that
+  paid for it: the e4m3 decode table moved off `__constant__` (divergent
+  per-code indexing serialized up to 32-way replays), address hoisting on
+  all FP8 read sites, and a pair-lane layout (uchar2 codes + shared scale
+  reads, quad dot) in both the dense and indexed decode-mixed kernels.
+- **Shallow contexts carry a ≤2% decode tax** (12k: ~+2% ABBA-clean; teb
+  mid-ctx wall +2.2%), the named floor being the in-kernel scalar FP8 dot
+  kept for spec-verify counter identity plus attribution noise; prefill
+  is flat at both ends. Ledgers and the elimination lever live in
+  `local/docs/briefs/brief-kv-efficiency-arc.md`.
+- **VMM-availability guard**: the primaries refuse to engage — loud boot
+  line — when the batch comp slabs cannot be VMM demand-mapped (device
+  without VMM support, `DS4_BATCH_VMM_COMP=0`, or slab-poison
+  diagnostics). Eager F32+packed would be strictly worse than F32-only,
+  so the server stays F32-primary there. A/B recipe note: an empty env is
+  no longer the F32 control — pass explicit `=0`s.
+- **Counter-identity made structural.** The fp8-vs-F32 byte-equality of
+  teb temp-0 speculative counters — the arc's losslessness tripwire —
+  turned out to be a compiled-form coincidence: after the decode-kernel
+  rewrites, think-leg `spec_hits` drifted by single digits in **both**
+  configs (F32 moved −1 with its source untouched; fast-math is free to
+  re-schedule the dot chains on any recompile) while every transcript
+  stayed byte-identical, i.e. the drift lives entirely at draft-accept
+  margins the verifier corrects. The config-branched comp dot chains in
+  the decode-mixed and indexed-mixed kernels (fp8 *and* F32 branches) are
+  now pinned to one in-order chain with `__fmaf_rn`/`__fmul_rn`, so
+  same-binary cross-config counter identity no longer depends on
+  compiler mood. Verified: fp8 and F32 think legs land identical
+  `spec_hits` on the pinned binary.
+
 ## v0.2.3 — 2026-07-17
 
 One-command serving: the launch defaults move into the engine binary.
