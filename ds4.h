@@ -597,8 +597,14 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(3)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+/* v3: one u32 of row-format flags follows the per-layer row-count arrays.
+ * Packed-primary writers serialize the mirror codes+scales verbatim
+ * (~3x smaller than the v2 F32 expansion; restore uploads them without
+ * re-encoding).  v2 payloads (F32 rows) remain readable forever. */
+#define DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED (UINT32_C(1) << 0)
+#define DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED (UINT32_C(1) << 1)
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u

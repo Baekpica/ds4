@@ -2787,10 +2787,16 @@ extern "C" int ds4_gpu_init(void) {
             (void)cudaGetLastError();
         }
     }
-    /* Opp C Phase 1A.3: populate the E4M3FN magnitude lookup table on the
-     * device when the FP8 KV mirror is enabled.  Definition lives next to
-     * the __constant__ table further down in this file. */
-    if (ds4_cuda_fp8_kv_enabled() && !ds4_cuda_fp8_kv_decode_table_init()) return 0;
+    /* Opp C Phase 1A.3 / v0.3: populate the E4M3FN magnitude lookup table
+     * on the device UNCONDITIONALLY (512 B once at init).  It was gated on
+     * ds4_cuda_fp8_kv_enabled(), which left fp8_kv_dequant readers with an
+     * all-zeros table in F32-primary boots -- an F32-primary server
+     * restoring a v3 packed-row disk-KV payload dequant-expanded every
+     * non-RoPE lane to 0.0 (caught by kv_crossmode_gate leg L2_f32; the
+     * fp4 path never had the trap because e2m1 decode is a pure function).
+     * Any entry point that can read packed codes must work regardless of
+     * which storage config is serving. */
+    if (!ds4_cuda_fp8_kv_decode_table_init()) return 0;
     return 1;
 }
 

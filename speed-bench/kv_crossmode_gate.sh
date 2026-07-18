@@ -151,6 +151,9 @@ for t in L1_pk L2_pk L2_f32; do
 done
 if [ $ok = 1 ]; then
   log "fresh identity and 4-way restored identity (incl. packed restores) hold"
+  # v3 receipt: DIR2 was written by a packed-primary server (packed-native
+  # rows) and should be ~2.8-3x smaller than DIR1's F32-row payloads.
+  log "payload sizes: DIR1(F32-written)=$(ssh $R "du -sh /home/ent/kvx_dir1 | cut -f1") DIR2(packed-written)=$(ssh $R "du -sh /home/ent/kvx_dir2 | cut -f1")"
 else
   for t in A_store L1_f32 L1_pk B_store L2_pk L2_f32; do
     log "--- $t: $(cat "$OUT/text_$t.txt")"

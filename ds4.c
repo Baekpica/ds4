@@ -28573,18 +28573,46 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
  * header and observability text.  This is deliberately based on live row counts
  * rather than capacities so the disk cache scales with saved tokens, not with
  * the maximum context size used to allocate the graph. */
+/* v3 row-format flags for a session payload: packed groups are serialized
+ * as mirror codes+scales, F32/F16 groups as F32 rows.  One scan, shared by
+ * the writer and the size estimator so they cannot disagree. */
+static uint32_t session_payload_row_flags(const ds4_gpu_graph *g) {
+    uint32_t flags = 0;
+    if (DS4_GPU_ATTN_COMP_CACHE_F16) return 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        if (g->layer_comp_cache_fp8[il] && g->layer_comp_scale[il])
+            flags |= DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED;
+        if (ratio == 4 && g->layer_index_comp_cache_fp4[il] && g->layer_index_comp_scale[il])
+            flags |= DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED;
+    }
+    return flags;
+}
+
 static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
+    const uint32_t row_flags = session_payload_row_flags(g);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
+        if (row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) {
+            bytes += (uint64_t)g->layer_n_comp[il] *
+                     (DS4_OPP_C_FP8_ROW_BYTES + DS4_OPP_C_FP8_SCALE_BYTES);
+        } else {
+            bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
+        }
         bytes += layer_attn_state_bytes(ratio);
         bytes += layer_attn_state_bytes(ratio);
         if (ratio == 4) {
-            bytes += (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            if (row_flags & DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED) {
+                bytes += (uint64_t)g->layer_n_index_comp[il] *
+                         (DS4_INDEXER_FP4_ROW_BYTES + DS4_INDEXER_FP4_SCALE_BYTES);
+            } else {
+                bytes += (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            }
             bytes += layer_index_state_bytes(ratio);
             bytes += layer_index_state_bytes(ratio);
         }
@@ -28885,6 +28913,14 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                                       err,
                                                       errlen);
         } else if (g->layer_comp_cache_fp8[il] && g->layer_n_comp[il] != 0u) {
+            /* NOTE (v3): the SERIAL session payload now stores packed
+             * codes+scales natively (DS4_SESSION_PAYLOAD_VERSION 3); this
+             * distributed LAYER payload deliberately keeps the F32
+             * expansion -- its consumers re-encode on load (bitwise exact
+             * since dsv4_pow2_ceil_scale) and the distributed path is not
+             * part of the disk-KV/pinned-bank story.  If you convert it,
+             * bump DS4_SESSION_LAYER_PAYLOAD_VERSION and mirror the serial
+             * reader's two-case logic. */
             /* P2 Inc2b: fp8-primary -- the F32 cache rows are unwritten
              * (emits pack straight to codes); expand the packed rows into
              * the scratch and persist that.  The file format stays F32,
@@ -30532,6 +30568,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
+        bytes += sizeof(uint32_t);   /* v3 row-format flags */
         bytes += session_cpu_payload_live_tensor_bytes(s);
         bytes += DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES;
         return bytes;
@@ -30545,6 +30582,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
+    bytes += sizeof(uint32_t);   /* v3 row-format flags */
     bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len);
     bytes += DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES;
     return bytes;
@@ -30673,6 +30711,8 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             if (payload_write_u32(fp, s->cpu_cache.layer[il].n_index_comp, err, errlen) != 0) return 1;
         }
+        /* v3 row-format flags: CPU sessions have no packed mirrors. */
+        if (payload_write_u32(fp, 0u, err, errlen) != 0) return 1;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const ds4_layer_cache *layer = &s->cpu_cache.layer[il];
             if (raw_live > layer->n_raw) {
@@ -30754,6 +30794,12 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (payload_write_u32(fp, g->layer_n_index_comp[il], err, errlen) != 0) return 1;
     }
+    /* v3: packed-primary sessions serialize the mirror codes+scales verbatim
+     * instead of dequant-expanding to F32 (~3x smaller, no expansion pass at
+     * save, no re-encode at load).  The flags word records which row groups
+     * are packed; F32-primary and F16-cache sessions keep F32 rows. */
+    const uint32_t row_flags = session_payload_row_flags(g);
+    if (payload_write_u32(fp, row_flags, err, errlen) != 0) return 1;
 
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
@@ -30787,38 +30833,29 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                       DS4_SESSION_IO_CHUNK,
                                                       err,
                                                       errlen);
-        } else if (g->layer_comp_cache_fp8[il] && g->layer_n_comp[il] != 0u) {
-            /* P2 Inc2b / v0.2.4 flip: fp8-primary -- the F32 cache rows are
-             * unwritten (emits pack straight to codes); expand the packed
-             * rows into the scratch and persist that.  The file format stays
-             * F32 and the expansion is the exact value every reader
-             * reconstructs, so save/load round-trips bit-identically.  This
-             * mirrors ds4_session_save_layer_payload; the local serializer
-             * missed it and packed-primary servers checkpointed the
-             * unwritten F32 rows (caught by kv_crossmode_gate.sh). */
+        } else if ((row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) &&
+                   g->layer_n_comp[il] != 0u) {
+            /* v3: fp8-primary -- the F32 cache rows are unwritten (emits
+             * pack straight to codes), so serialize the mirror codes+scales
+             * verbatim.  (v2 dequant-expanded to F32 here; the expansion
+             * pass is gone.)  The row-flags scan proved the mirrors exist;
+             * a per-layer NULL here is structural breakage, fail loudly. */
             const uint32_t rows = g->layer_n_comp[il];
-            ds4_gpu_tensor *stg = metal_graph_comp_emit_scratch(g, rows);
-            ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(g->layer_comp_cache_fp8[il],
-                    0, (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES) : NULL;
-            ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(g->layer_comp_scale[il],
-                    0, (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES) : NULL;
-            if (!codes || !scale ||
-                ds4_gpu_dsv4_fp8_kv_dequant_tensor(stg, codes, scale,
-                                                   rows, DS4_N_HEAD_DIM) == 0) {
-                payload_set_err(err, errlen, "fp8 comp expand for save failed");
+            if (!g->layer_comp_cache_fp8[il] || !g->layer_comp_scale[il]) {
+                payload_set_err(err, errlen, "fp8 mirror missing for packed save");
                 rc = 1;
             } else {
                 rc = payload_write_tensor_span(fp,
-                                               stg,
+                                               g->layer_comp_cache_fp8[il],
                                                0,
-                                               (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float),
-                                               buf,
-                                               DS4_SESSION_IO_CHUNK,
-                                               err,
-                                               errlen);
+                                               (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES,
+                                               buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp,
+                                               g->layer_comp_scale[il],
+                                               0,
+                                               (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES,
+                                               buf, DS4_SESSION_IO_CHUNK, err, errlen);
             }
-            ds4_gpu_tensor_free(scale);
-            ds4_gpu_tensor_free(codes);
         } else {
             rc = payload_write_tensor_span(fp,
                                            g->layer_attn_comp_cache[il],
@@ -30846,27 +30883,26 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
-            if (g->layer_index_comp_cache_fp4[il] && g->layer_n_index_comp[il] != 0u) {
-                /* P2 Inc3b / v0.2.4 flip: fp4-primary indexer -- same
-                 * expansion as the attention rows above, same reason. */
+            if ((row_flags & DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED) &&
+                g->layer_n_index_comp[il] != 0u) {
+                /* v3: fp4-primary indexer -- mirror codes+scales verbatim,
+                 * same rationale as the attention rows above. */
                 const uint32_t irows = g->layer_n_index_comp[il];
-                ds4_gpu_tensor *stg = metal_graph_index_emit_scratch(g, irows);
-                ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
-                        0, (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES) : NULL;
-                ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
-                        0, (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES) : NULL;
-                if (!codes || !scale ||
-                    ds4_gpu_dsv4_indexer_fp4_dequant_tensor(stg, codes, scale,
-                                                       irows, DS4_N_INDEXER_HEAD_DIM) == 0) {
-                    payload_set_err(err, errlen, "fp4 index expand for save failed");
+                if (!g->layer_index_comp_cache_fp4[il] || !g->layer_index_comp_scale[il]) {
+                    payload_set_err(err, errlen, "fp4 mirror missing for packed save");
                     rc = 1;
                 } else {
-                    rc = payload_write_tensor_span(fp, stg, 0,
-                                                   (uint64_t)irows * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                    rc = payload_write_tensor_span(fp,
+                                                   g->layer_index_comp_cache_fp4[il],
+                                                   0,
+                                                   (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES,
+                                                   buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                    if (rc == 0) rc = payload_write_tensor_span(fp,
+                                                   g->layer_index_comp_scale[il],
+                                                   0,
+                                                   (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES,
                                                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
                 }
-                ds4_gpu_tensor_free(scale);
-                ds4_gpu_tensor_free(codes);
             } else {
             rc = payload_write_tensor_span(fp,
                                            g->layer_index_comp_cache[il],
@@ -31004,6 +31040,19 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                 payload_set_err(err, errlen, "KV checkpoint has invalid indexer row count");
                 return 1;
             }
+        }
+        uint32_t row_flags = 0;
+        if (payload_version >= 3 &&
+            payload_read_u32(fp, &row_flags, &remaining, err, errlen) != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        if (row_flags != 0) {
+            /* Packed rows are mirror codes+scales; expanding them needs the
+             * graph backend's dequant kernels. */
+            token_vec_free(&new_checkpoint);
+            payload_set_err(err, errlen, "packed session payload requires the graph backend");
+            return 1;
         }
 
         s->checkpoint_valid = false;
@@ -31162,6 +31211,29 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             return 1;
         }
     }
+    /* v3 row-format flags (v2 files: all-F32 rows).  Packed groups carry
+     * mirror codes+scales; a packed reader uploads them verbatim (no
+     * re-encode, F32 pages stay write-dead), an F32 reader stages them
+     * through the emit scratch and dequant-expands (exact by
+     * read-identity).  The F16 comp-cache build has neither mirrors nor
+     * an F32 destination for the attention group -- refuse loudly. */
+    uint32_t row_flags = 0;
+    if (payload_version >= 3 &&
+        payload_read_u32(fp, &row_flags, &remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    if (row_flags & ~(DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED |
+                      DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED)) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "KV checkpoint has unsupported row-format flags");
+        return 1;
+    }
+    if ((row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) && DS4_GPU_ATTN_COMP_CACHE_F16) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "packed session payload requires a packed or F32 comp cache");
+        return 1;
+    }
 
     if (ds4_gpu_synchronize() == 0) {
         token_vec_free(&new_checkpoint);
@@ -31204,6 +31276,61 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                      &remaining,
                                                      err,
                                                      errlen);
+        } else if (row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) {
+            /* v3 packed rows.  Packed reader: upload codes+scales verbatim
+             * into the mirrors (the F32 pages stay write-dead, exactly as
+             * live packed emits leave them).  F32 reader: stage the packed
+             * spans through the emit scratch (rows*2048 B >= rows*732 B)
+             * and dequant-expand into the F32 cache. */
+            const uint32_t rows = n_comp[il];
+            if (rows != 0u && g->layer_comp_cache_fp8[il] && g->layer_comp_scale[il]) {
+                ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_comp_cache_fp8[il], 0,
+                        (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES);
+                ds4_gpu_tensor *scale = ds4_gpu_tensor_view(g->layer_comp_scale[il], 0,
+                        (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES);
+                if (!codes || !scale) {
+                    payload_set_err(err, errlen, "fp8 mirror view failed for packed restore");
+                    rc = 1;
+                } else {
+                    rc = payload_read_tensor_span(fp, codes, 0,
+                            (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES,
+                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                    if (rc == 0) rc = payload_read_tensor_span(fp, scale, 0,
+                            (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES,
+                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                }
+                ds4_gpu_tensor_free(scale);
+                ds4_gpu_tensor_free(codes);
+            } else if (rows != 0u) {
+                ds4_gpu_tensor *stg = metal_graph_comp_emit_scratch(g, rows);
+                ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(stg, 0,
+                        (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES) : NULL;
+                ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(stg,
+                        (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES,
+                        (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES) : NULL;
+                ds4_gpu_tensor *crows = ds4_gpu_tensor_view(g->layer_attn_comp_cache[il], 0,
+                        (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float));
+                if (!codes || !scale || !crows) {
+                    payload_set_err(err, errlen, "fp8 packed staging failed for restore");
+                    rc = 1;
+                } else {
+                    rc = payload_read_tensor_span(fp, codes, 0,
+                            (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES,
+                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                    if (rc == 0) rc = payload_read_tensor_span(fp, scale, 0,
+                            (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES,
+                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                    if (rc == 0 &&
+                        ds4_gpu_dsv4_fp8_kv_dequant_tensor(crows, codes, scale,
+                                                           rows, DS4_N_HEAD_DIM) == 0) {
+                        payload_set_err(err, errlen, "fp8 packed expand failed for restore");
+                        rc = 1;
+                    }
+                }
+                ds4_gpu_tensor_free(crows);
+                ds4_gpu_tensor_free(scale);
+                ds4_gpu_tensor_free(codes);
+            }
         } else {
             rc = payload_read_tensor_span(fp,
                                           g->layer_attn_comp_cache[il],
@@ -31215,10 +31342,12 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                           err,
                                           errlen);
         }
-        /* P2 Inc2a: regenerate the FP8 mirror from the restored rows (same
-         * rationale as the KV-shard load above -- idempotent re-encode of
-         * committed round-tripped values; the file stores F32 only). */
+        /* P2 Inc2a: F32-row files only -- regenerate the FP8 mirror from
+         * the restored rows (bitwise-idempotent re-encode since the
+         * dsv4_pow2_ceil_scale fix; packed-row files uploaded the mirror
+         * verbatim above and skip this). */
         if (rc == 0 && !DS4_GPU_ATTN_COMP_CACHE_F16 &&
+            !(row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) &&
             g->layer_comp_cache_fp8[il] && n_comp[il] != 0u) {
             ds4_gpu_tensor *crows = ds4_gpu_tensor_view(g->layer_attn_comp_cache[il], 0,
                     (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float));
@@ -31255,19 +31384,76 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                    err,
                                                    errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_index_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
-            /* P2 Inc3b: regenerate the FP4 mirror from the restored F32 rows
-             * (no-Hadamard encode of committed post-QAT values; the file stores
-             * F32 only and a stale mirror would serve pre-restore codes). */
-            if (rc == 0 && g->layer_index_comp_cache_fp4[il] && n_index_comp[il] != 0u) {
+            if (row_flags & DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED) {
+                /* v3 packed indexer rows -- same two-reader logic as the
+                 * fp8 attention rows above. */
+                const uint32_t irows = n_index_comp[il];
+                if (irows != 0u && g->layer_index_comp_cache_fp4[il] &&
+                    g->layer_index_comp_scale[il]) {
+                    ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il], 0,
+                            (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES);
+                    ds4_gpu_tensor *scale = ds4_gpu_tensor_view(g->layer_index_comp_scale[il], 0,
+                            (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES);
+                    if (!codes || !scale) {
+                        payload_set_err(err, errlen, "fp4 mirror view failed for packed restore");
+                        rc = 1;
+                    } else {
+                        rc = payload_read_tensor_span(fp, codes, 0,
+                                (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES,
+                                buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                        if (rc == 0) rc = payload_read_tensor_span(fp, scale, 0,
+                                (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES,
+                                buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                    }
+                    ds4_gpu_tensor_free(scale);
+                    ds4_gpu_tensor_free(codes);
+                } else if (irows != 0u) {
+                    ds4_gpu_tensor *stg = metal_graph_index_emit_scratch(g, irows);
+                    ds4_gpu_tensor *codes = stg ? ds4_gpu_tensor_view(stg, 0,
+                            (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES) : NULL;
+                    ds4_gpu_tensor *scale = stg ? ds4_gpu_tensor_view(stg,
+                            (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES,
+                            (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES) : NULL;
+                    ds4_gpu_tensor *irows_v = ds4_gpu_tensor_view(g->layer_index_comp_cache[il], 0,
+                            (uint64_t)irows * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                    if (!codes || !scale || !irows_v) {
+                        payload_set_err(err, errlen, "fp4 packed staging failed for restore");
+                        rc = 1;
+                    } else {
+                        rc = payload_read_tensor_span(fp, codes, 0,
+                                (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES,
+                                buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                        if (rc == 0) rc = payload_read_tensor_span(fp, scale, 0,
+                                (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES,
+                                buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                        if (rc == 0 &&
+                            ds4_gpu_dsv4_indexer_fp4_dequant_tensor(irows_v, codes, scale,
+                                    irows, DS4_N_INDEXER_HEAD_DIM) == 0) {
+                            payload_set_err(err, errlen, "fp4 packed expand failed for restore");
+                            rc = 1;
+                        }
+                    }
+                    ds4_gpu_tensor_free(irows_v);
+                    ds4_gpu_tensor_free(scale);
+                    ds4_gpu_tensor_free(codes);
+                }
+            } else {
+                rc = payload_read_tensor_span(fp,
+                                              g->layer_index_comp_cache[il],
+                                              0,
+                                              (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                              buf,
+                                              DS4_SESSION_IO_CHUNK,
+                                              &remaining,
+                                              err,
+                                              errlen);
+            }
+            /* P2 Inc3b: F32-row files only -- regenerate the FP4 mirror from
+             * the restored F32 rows (no-Hadamard encode of committed post-QAT
+             * values; bitwise-idempotent since the dsv4_pow2_ceil_scale fix.
+             * Packed-row files uploaded the mirror verbatim above). */
+            if (rc == 0 && !(row_flags & DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED) &&
+                g->layer_index_comp_cache_fp4[il] && n_index_comp[il] != 0u) {
                 ds4_gpu_tensor *irows_v = ds4_gpu_tensor_view(g->layer_index_comp_cache[il], 0,
                         (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il], 0,

@@ -7,6 +7,22 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased (v0.3)
 
+- **Disk-KV payloads store packed rows natively (format v3).** Packed-
+  primary sessions serialize the fp8/fp4 mirror codes+scales verbatim
+  instead of dequant-expanding to F32: checkpoints shrink ~2.3× at 16K
+  context (263→115 MB, growing toward ~3× at depth as compressed rows
+  dominate), saves drop the expansion pass, and a packed-primary restore
+  uploads the codes verbatim — no re-encode, and the write-dead F32
+  pages stay unmapped. Cross-config restores remain exact in every
+  direction (an F32-primary reader dequant-expands packed payloads
+  through the emit scratch; a packed reader of an F32-row payload
+  re-encodes as before), v2 payloads remain readable forever, and the
+  kv_crossmode gate proves the full 6-leg matrix byte-identical. Found
+  and fixed along the way: the e4m3 decode table was only initialized
+  when `DS4_CUDA_FP8_KV` was enabled, so an F32-primary server
+  dequanting packed codes read an all-zeros table (every non-RoPE lane
+  restored as 0.0) — it is now initialized unconditionally.
+
 - **Disk-KV restores into packed-primary servers are exact and enabled
   again.** v0.2.4 refused them because the restore-time mirror re-encode
   measurably drifted; the mechanism is now root-caused and fixed. The
