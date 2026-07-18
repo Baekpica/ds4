@@ -2041,7 +2041,9 @@ static float dsv4_e4m3fn_value_cpu(int i) {
 }
 
 static float dsv4_e4m3fn_dequant_cpu(float x) {
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    /* signbit, not x<0: -0.0 must keep its sign through a re-encode round
+     * trip (x<0 is false for -0.0).  Identical for all nonzero x. */
+    const float sign = signbit(x) ? -1.0f : 1.0f;
     const float ax = fminf(fabsf(x), 448.0f);
 
     int lo = 0;
@@ -2067,6 +2069,19 @@ static float dsv4_e4m3fn_dequant_cpu(float x) {
     return sign * dsv4_e4m3fn_value_cpu(best);
 }
 
+/* v0.3 exact-restore: smallest power of two >= r, EXACTLY, via frexpf bit
+ * ops.  ldexpf(1, ceilf(log2f(r))) is subtly wrong at the boundaries: a
+ * correctly-rounded log2f collapses one-ulp-above-2^k inputs onto k (true
+ * ceil is k+1), and the CUDA fast-math variant errs the other way at exact
+ * 2^-n inputs (scale doubles) -- the mechanism behind the v0.2.4 packed
+ * disk-KV restore drift (cuda/mmq/test/proto_kv_reencode_idem.cu).  Every
+ * QAT scale site (CUDA, CPU, Metal) must share this derivation or
+ * committed cache values diverge across backends. */
+static float dsv4_pow2_ceil_scale_cpu(float r) {
+    int e; const float m = frexpf(r, &e);    /* r = m * 2^e, m in [0.5, 1) */
+    return ldexpf(1.0f, m == 0.5f ? e - 1 : e);
+}
+
 /* DeepSeek V4 stores the non-RoPE part of compressed KV through an E4M3-style
  * round trip.  Keeping this in the CPU reference makes cache values comparable
  * to the Metal graph's compressed-cache behavior. */
@@ -2080,7 +2095,7 @@ static void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, ui
         }
 
         if (amax < 1.0e-4f) amax = 1.0e-4f;
-        const float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 448.0f)));
+        const float scale = dsv4_pow2_ceil_scale_cpu(amax / 448.0f);
         for (uint32_t i = 0; i < 64; i++) {
             float v = x[off + i] / scale;
             if (v > 448.0f) v = 448.0f;
@@ -2098,7 +2113,9 @@ static float dsv4_e2m1fn_value_cpu(int i) {
 }
 
 static float dsv4_e2m1fn_dequant_cpu(float x) {
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    /* signbit, not x<0: -0.0 must keep its sign through a re-encode round
+     * trip (x<0 is false for -0.0).  Identical for all nonzero x. */
+    const float sign = signbit(x) ? -1.0f : 1.0f;
     const float ax = fminf(fabsf(x), 6.0f);
     int best = 0;
     float best_diff = fabsf(ax - dsv4_e2m1fn_value_cpu(0));
@@ -2137,7 +2154,7 @@ static void dsv4_fp4_act_quantize_row_inplace_cpu(float *x, uint32_t n) {
         }
 
         if (amax < 7.052966104933725e-38f) amax = 7.052966104933725e-38f;
-        const float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 6.0f)));
+        const float scale = dsv4_pow2_ceil_scale_cpu(amax / 6.0f);
         for (uint32_t i = 0; i < 32; i++) {
             float v = x[off + i] / scale;
             if (v > 6.0f) v = 6.0f;

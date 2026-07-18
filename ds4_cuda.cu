@@ -6455,7 +6455,9 @@ __device__ static float dsv4_e4m3fn_value_dev(int i) {
 }
 
 __device__ static float dsv4_e4m3fn_dequant_dev(float x) {
-    float sign = x < 0.0f ? -1.0f : 1.0f;
+    /* signbit, not x<0: -0.0 must keep its sign through a re-encode round
+     * trip (x<0 is false for -0.0).  Identical for all nonzero x. */
+    float sign = signbit(x) ? -1.0f : 1.0f;
     float ax = fminf(fabsf(x), 448.0f);
     int lo = 0, hi = 126;
     while (lo < hi) {
@@ -6480,7 +6482,7 @@ __device__ static float dsv4_e4m3fn_dequant_dev(float x) {
  * the Phase 0 numerics test in local/docs/ds4_opp_c_phase0_measurements.html).
  * Used at compressor emit to populate the packed FP8 mirror. */
 __device__ static unsigned char dsv4_e4m3fn_encode_dev(float x) {
-    const unsigned int sign_bit = (x < 0.0f) ? 0x80u : 0x00u;
+    const unsigned int sign_bit = signbit(x) ? 0x80u : 0x00u;
     const float ax = fminf(fabsf(x), 448.0f);
     int lo = 0, hi = 126;
     while (lo < hi) {
@@ -6495,6 +6497,21 @@ __device__ static unsigned char dsv4_e4m3fn_encode_dev(float x) {
         if (nd < bd || (nd == bd && (((best + 1) & 1) == 0) && ((best & 1) != 0))) best++;
     }
     return (unsigned char)(sign_bit | (unsigned int)best);
+}
+
+/* v0.3 exact-restore: smallest power of two >= r, EXACTLY.  The former
+ * exp2f(ceilf(log2f(r))) is wrong under --use_fast_math: lg2.approx.f32
+ * returns 2^-n inputs a hair ABOVE -n, ceilf rounds the exact negative
+ * integer up, and the derived scale DOUBLES.  A live encode essentially
+ * never presents an exactly-pow2 ratio, but a RE-encode of committed
+ * values does routinely (committed block max = level * pow2 scale), which
+ * is how disk-KV restores into packed servers drifted (repro + fix proof:
+ * cuda/mmq/test/proto_kv_reencode_idem.cu).  frexpf/ldexpf are exact bit
+ * ops under any math mode; every QAT scale site (CUDA, CPU, Metal) must
+ * use this same derivation or committed values diverge across backends. */
+__device__ static float dsv4_pow2_ceil_scale(float r) {
+    int e; float m = frexpf(r, &e);          /* r = m * 2^e, m in [0.5, 1) */
+    return ldexpf(1.0f, m == 0.5f ? e - 1 : e);
 }
 
 /* Opp C Phase 1A: E4M3FN decode table.  A packed compressed-KV lane is a
@@ -6672,7 +6689,9 @@ __device__ static int dsv4_e2m1fn_level_dev(float ax) {
 }
 
 __device__ static DS4_CUDA_UNUSED float dsv4_e2m1fn_dequant_dev(float x) {
-    float sign = x < 0.0f ? -1.0f : 1.0f;
+    /* signbit, not x<0: -0.0 must keep its sign through a re-encode round
+     * trip (x<0 is false for -0.0).  Identical for all nonzero x. */
+    float sign = signbit(x) ? -1.0f : 1.0f;
     return sign * dsv4_e2m1fn_value_dev(dsv4_e2m1fn_level_dev(fabsf(x)));
 }
 
@@ -6681,7 +6700,7 @@ __device__ static DS4_CUDA_UNUSED float dsv4_e2m1fn_dequant_dev(float x) {
  * so (sign?-1:1)*value[level]*scale reproduces the F32 the QAT writes
  * bit-for-bit. */
 __device__ static DS4_CUDA_UNUSED unsigned char dsv4_e2m1fn_encode_dev(float x) {
-    unsigned int sign = (x < 0.0f) ? 8u : 0u;
+    unsigned int sign = signbit(x) ? 8u : 0u;
     return (unsigned char)(sign | (unsigned int)dsv4_e2m1fn_level_dev(fabsf(x)));
 }
 
@@ -6747,10 +6766,10 @@ __global__ static void indexer_fp4_encode_rows_kernel(
         __syncthreads();
     }
     float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
-    float scale = exp2f(ceilf(log2f(amax / 6.0f)));
+    float scale = dsv4_pow2_ceil_scale(amax / 6.0f);
     float clamp = fminf(6.0f, fmaxf(-6.0f, v / scale));
     int level = dsv4_e2m1fn_level_dev(fabsf(clamp));
-    xr[tid] = ((clamp < 0.0f ? -1.0f : 1.0f) * dsv4_e2m1fn_value_dev(level)) * scale;
+    xr[tid] = ((signbit(clamp) ? -1.0f : 1.0f) * dsv4_e2m1fn_value_dev(level)) * scale;
     uint32_t nib = (clamp < 0.0f ? 8u : 0u) | (uint32_t)level;
     uint32_t hi  = __shfl_down_sync(0xffffffffu, nib, 1u);
     if ((tid & 1u) == 0u)  codes_base[(uint64_t)row * 64u + (tid >> 1u)] = (unsigned char)(nib | (hi << 4u));
@@ -6825,7 +6844,7 @@ __global__ static void fp8_kv_quantize_kernel(
             if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
             __syncthreads();
         }
-        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
+        float scale = dsv4_pow2_ceil_scale(fmaxf(scratch[0], 1.0e-4f) / 448.0f);
         if (off + tid < n_nope) {
             float clamp = fminf(448.0f, fmaxf(-448.0f, v / scale));
             xr[off + tid] = dsv4_e4m3fn_dequant_dev(clamp) * scale;
@@ -6908,7 +6927,7 @@ __global__ static void fp8_kv_quantize_row_kernel(
             if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
             __syncthreads();
         }
-        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
+        float scale = dsv4_pow2_ceil_scale(fmaxf(scratch[0], 1.0e-4f) / 448.0f);
         if (off + tid < n_nope) {
             float clamp = fminf(448.0f, fmaxf(-448.0f, v / scale));
             xr[off + tid] = dsv4_e4m3fn_dequant_dev(clamp) * scale;
@@ -6972,7 +6991,7 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
     }
 
     float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
-    float scale = exp2f(ceilf(log2f(amax / 6.0f)));
+    float scale = dsv4_pow2_ceil_scale(amax / 6.0f);
     /* P2 Inc3: F32 write is bit-identical to the prior
      * dsv4_e2m1fn_dequant_dev(clamp)*scale (now factored through
      * dsv4_e2m1fn_level_dev), plus the optional packed-mirror emit.  The
@@ -6980,9 +6999,9 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
      * (warp shuffle); lane 0 of each 32-lane block writes the block scale. */
     float clamp = fminf(6.0f, fmaxf(-6.0f, v / scale));
     int level = dsv4_e2m1fn_level_dev(fabsf(clamp));
-    xr[tid] = ((clamp < 0.0f ? -1.0f : 1.0f) * dsv4_e2m1fn_value_dev(level)) * scale;
+    xr[tid] = ((signbit(clamp) ? -1.0f : 1.0f) * dsv4_e2m1fn_value_dev(level)) * scale;
     if (codes_base) {
-        uint32_t nib = (clamp < 0.0f ? 8u : 0u) | (uint32_t)level;
+        uint32_t nib = (signbit(clamp) ? 8u : 0u) | (uint32_t)level;
         uint32_t hi  = __shfl_down_sync(0xffffffffu, nib, 1u);
         if ((tid & 1u) == 0u)  codes_base[(uint64_t)row * 64u + (tid >> 1u)] = (unsigned char)(nib | (hi << 4u));
         if ((tid & 31u) == 0u) scale_base[(uint64_t)row * 4u + (tid >> 5u)] = scale;
@@ -7048,14 +7067,14 @@ __global__ static void indexer_hadamard_fp4_row_kernel(
     }
 
     float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
-    float scale = exp2f(ceilf(log2f(amax / 6.0f)));
+    float scale = dsv4_pow2_ceil_scale(amax / 6.0f);
     /* P2 Inc3: bit-identical F32 write + optional packed-mirror emit (see
      * indexer_hadamard_fp4_kernel for the packing rationale). */
     float clamp = fminf(6.0f, fmaxf(-6.0f, v / scale));
     int level = dsv4_e2m1fn_level_dev(fabsf(clamp));
-    xr[tid] = ((clamp < 0.0f ? -1.0f : 1.0f) * dsv4_e2m1fn_value_dev(level)) * scale;
+    xr[tid] = ((signbit(clamp) ? -1.0f : 1.0f) * dsv4_e2m1fn_value_dev(level)) * scale;
     if (codes_base) {
-        uint32_t nib = (clamp < 0.0f ? 8u : 0u) | (uint32_t)level;
+        uint32_t nib = (signbit(clamp) ? 8u : 0u) | (uint32_t)level;
         uint32_t hi  = __shfl_down_sync(0xffffffffu, nib, 1u);
         if ((tid & 1u) == 0u)  codes_base[(uint64_t)emit_row * 64u + (tid >> 1u)] = (unsigned char)(nib | (hi << 4u));
         if ((tid & 31u) == 0u) scale_base[(uint64_t)emit_row * 4u + (tid >> 5u)] = scale;
@@ -7137,7 +7156,7 @@ __global__ static void kv_rope_fp8_store_scalars_kernel(
             if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
             __syncthreads();
         }
-        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
+        float scale = dsv4_pow2_ceil_scale(fmaxf(scratch[0], 1.0e-4f) / 448.0f);
         if (off + tid < n_nope) {
             float clamp = fminf(448.0f, fmaxf(-448.0f, v / scale));
             const float qv = dsv4_e4m3fn_dequant_dev(clamp) * scale;

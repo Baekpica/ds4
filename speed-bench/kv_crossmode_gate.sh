@@ -9,21 +9,20 @@
 # armed with --kv-disk-dir:
 #   1. A_store : F32 primaries (explicit =0s), fresh DIR1, prompt P, gen 64.
 #   2. L1_f32  : F32 primaries,    DIR1 — disk hit, gen 64.
-#   3. L1_pk   : packed (default), DIR1 — restore REFUSED (loud line),
-#                full fresh recompute, gen 64.
+#   3. L1_pk   : packed (default), DIR1 — disk hit (packed restore of an
+#                F32-written checkpoint), gen 64.
 #   4. B_store : packed primaries, fresh DIR2, prompt P, gen 64.
-#   5. L2_pk   : packed (default), DIR2 — restore REFUSED, fresh recompute.
+#   5. L2_pk   : packed (default), DIR2 — disk hit (packed restore of a
+#                packed-written checkpoint), gen 64.
 #   6. L2_f32  : F32 primaries,    DIR2 — disk hit, gen 64 (cross-mode read
 #                of a packed-written checkpoint — the save-expansion proof).
-# PASS = both F32 load legs hit ("kv cache hit text") and their restored
-# continuations are byte-identical to each other; both packed legs REFUSE
-# (refusal line present, NO hit line) and their fresh recomputes are
-# byte-identical to the stores; the two STORE continuations are
-# byte-identical (fresh-compute cross-mode identity); zero corrupt/failed/
-# discarded kv lines anywhere.
-# (Packed-mode RESTORE is refused by design in v0.2.4: restore-time mirror
-# re-encode is not yet bit-exact — see the guard in kv_cache_try_load_text.
-# When the v0.3 exact-restore lands, flip legs 3/5 back to hit+identity.)
+# PASS = all four load legs hit ("kv cache hit text"); all four restored
+# continuations are byte-identical to each other (packed restores must
+# byte-match the F32 restores — the v0.3 exact-restore proof: restore-time
+# mirror re-encode is bitwise idempotent since the dsv4_pow2_ceil_scale
+# fix); the two STORE continuations are byte-identical (fresh-compute
+# cross-mode identity); zero corrupt/failed/discarded/refused kv lines
+# anywhere.
 #
 # ORACLE NOTE: restored continuations are compared ONLY against other
 # restored continuations, never against the fresh-compute text — a restore
@@ -119,32 +118,23 @@ check_load_hit() { # $1=tag
   log "$tag: disk hit OK"
 }
 
-check_load_refused() { # $1=tag
-  local tag=$1
-  ssh "$R" "grep -a 'disk-KV restore refused' /tmp/kvx_${tag}.log" >> "$OUT/kv_lines.txt" \
-    || fail "$tag: refusal line missing"
-  ssh "$R" "grep -a 'kv cache hit text' /tmp/kvx_${tag}.log" >/dev/null 2>&1 \
-    && fail "$tag: unexpected disk hit despite packed primaries"
-  log "$tag: restore refused as designed"
-}
-
 log "gate start host=$R ctx=$CTX out=$OUT"
 boot_and_ask A_store "$F32ENV" /home/ent/kvx_dir1 1
 stop_and_check_store A_store
 boot_and_ask L1_f32  "$F32ENV" /home/ent/kvx_dir1 0
 check_load_hit L1_f32
 boot_and_ask L1_pk   ""        /home/ent/kvx_dir1 0
-check_load_refused L1_pk
+check_load_hit L1_pk
 boot_and_ask B_store ""        /home/ent/kvx_dir2 1
 stop_and_check_store B_store
 boot_and_ask L2_pk   ""        /home/ent/kvx_dir2 0
-check_load_refused L2_pk
+check_load_hit L2_pk
 boot_and_ask L2_f32  "$F32ENV" /home/ent/kvx_dir2 0
 check_load_hit L2_f32
 ssh "$R" "pkill -x ds4-server; sleep 1; rm -f /tmp/ds4.lock" 2>/dev/null
 
 for t in A_store L1_f32 L1_pk B_store L2_pk L2_f32; do
-  for bad in "load failed" "discarded corrupt" "store failed" "failed to discard"; do
+  for bad in "load failed" "discarded corrupt" "store failed" "failed to discard" "restore refused"; do
     ssh "$R" "grep -a \"kv cache.*$bad\" /tmp/kvx_${t}.log" >/dev/null 2>&1 \
       && fail "$t: '$bad' in log"
   done
@@ -153,14 +143,14 @@ done
 ok=1
 cmp -s "$OUT/text_A_store.txt" "$OUT/text_B_store.txt" \
   || { ok=0; log "MISMATCH: fresh-compute A_store vs B_store"; }
-cmp -s "$OUT/text_L1_f32.txt" "$OUT/text_L2_f32.txt" \
-  || { ok=0; log "MISMATCH: restored L1_f32 vs L2_f32"; }
-for t in L1_pk L2_pk; do
-  cmp -s "$OUT/text_A_store.txt" "$OUT/text_$t.txt" \
-    || { ok=0; log "MISMATCH: fresh A_store vs refused-recompute $t"; }
+# Restore-vs-restore oracle, all four legs against one reference: the two
+# packed restores must byte-match the two F32 restores (exact-restore proof).
+for t in L1_pk L2_pk L2_f32; do
+  cmp -s "$OUT/text_L1_f32.txt" "$OUT/text_$t.txt" \
+    || { ok=0; log "MISMATCH: restored L1_f32 vs restored $t"; }
 done
 if [ $ok = 1 ]; then
-  log "fresh identity, F32 restore identity, and refused-recompute identity all hold"
+  log "fresh identity and 4-way restored identity (incl. packed restores) hold"
 else
   for t in A_store L1_f32 L1_pk B_store L2_pk L2_f32; do
     log "--- $t: $(cat "$OUT/text_$t.txt")"

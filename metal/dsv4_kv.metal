@@ -56,8 +56,21 @@ static inline float dsv4_e4m3fn_value(int i) {
         : (1.0f + float(mant) * 0.125f) * dsv4_e4m3fn_exp_scale[exp];
 }
 
+// v0.3 exact-restore: smallest power of two >= r, EXACTLY, via frexp bit
+// ops.  exp2(ceil(log2(r))) is wrong at the boundaries under fast math
+// (see dsv4_pow2_ceil_scale in ds4_cuda.cu -- the mechanism behind the
+// v0.2.4 packed disk-KV restore drift).  Every QAT scale site (CUDA, CPU,
+// Metal) must share this derivation or committed values diverge across
+// backends.
+static inline float dsv4_pow2_ceil_scale(float r) {
+    int e; const float m = frexp(r, e);      // r = m * 2^e, m in [0.5, 1)
+    return ldexp(1.0f, m == 0.5f ? e - 1 : e);
+}
+
 static inline float dsv4_e4m3fn_dequant(float x) {
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    // signbit, not x<0: -0.0 must keep its sign through a re-encode round
+    // trip (x<0 is false for -0.0).  Identical for all nonzero x.
+    const float sign = signbit(x) ? -1.0f : 1.0f;
     const float ax = min(abs(x), 448.0f);
 
     int lo = 0;
@@ -84,7 +97,7 @@ static inline float dsv4_e4m3fn_dequant(float x) {
 }
 
 static inline float dsv4_e2m1fn_dequant(float x) {
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float sign = signbit(x) ? -1.0f : 1.0f;
     const float ax = min(abs(x), 6.0f);
     int best = 0;
     float best_diff = abs(ax - dsv4_e2m1fn_values[0]);
@@ -138,7 +151,7 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
         }
 
         const float amax = max(scratch[0], 1.0e-4f);
-        const float scale = exp2(ceil(log2(amax / 448.0f)));
+        const float scale = dsv4_pow2_ceil_scale(amax / 448.0f);
         if (tid < 64) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;
             *((device float *) (dst_base + (off + tid)*args.nb0)) = q;
@@ -197,7 +210,7 @@ kernel void kernel_dsv4_indexer_hadamard_fp4_f32(
     }
 
     const float amax = max(absbuf[block_base], 7.052966104933725e-38f);
-    const float scale = exp2(ceil(log2(amax / 6.0f)));
+    const float scale = dsv4_pow2_ceil_scale(amax / 6.0f);
     xr[tid] = dsv4_e2m1fn_dequant(clamp(v / scale, -6.0f, 6.0f)) * scale;
 }
 
@@ -238,7 +251,7 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
         }
 
         const float amax = max(scratch[0], 1.0e-4f);
-        const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
+        const float fp8_scale = dsv4_pow2_ceil_scale(amax / 448.0f);
         if (off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
             kv[off + tid] = q;

@@ -5,6 +5,33 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## Unreleased (v0.3)
+
+- **Disk-KV restores into packed-primary servers are exact and enabled
+  again.** v0.2.4 refused them because the restore-time mirror re-encode
+  measurably drifted; the mechanism is now root-caused and fixed. The
+  quantizer scale derivation `exp2f(ceilf(log2f(amax/T)))` is wrong at
+  exact power-of-two ratios under `--use_fast_math`: `lg2.approx.f32`
+  errs one-sided above at `2^-n`, `ceilf` rounds the exact negative
+  integer up, and the derived scale doubles. A live encode essentially
+  never presents an exactly-pow2 ratio, but a re-encode of committed
+  values does routinely (a committed block max is codec level × pow2
+  scale) — with the doubled scale, bottom-of-grid values fell off
+  (measured: 10.5% of fp4 indexer lanes, including level-1 values
+  collapsing to zero; a thin deep-subnormal fp8 tail). All QAT scale
+  sites (six CUDA kernels, the CPU reference, three Metal kernels) now
+  share an exact frexpf/ldexpf derivation, and codec sign tests use
+  `signbit` so `-0.0` survives the round trip bitwise. Re-encode is now
+  bitwise idempotent for any on-grid committed input — including
+  checkpoints written by older binaries. Repro + fix proof:
+  `cuda/mmq/test/proto_kv_reencode_idem.cu` (0 value mismatches / 84M
+  lanes on the fixed path); end-to-end proof: `kv_crossmode_gate.sh`
+  legs 3/5 now assert packed restores hit and byte-match F32 restores.
+  The `DS4_KV_DISK_PACKED_RESTORE` investigation override is gone.
+  Note: absolute speculative-counter values shift vs older binaries
+  (committed values change in the boundary band where the old formula
+  was wrong); same-binary packed-vs-F32 identity is unchanged.
+
 ## v0.2.4 — 2026-07-18
 
 Packed FP8/FP4 compressed KV becomes the primary storage. Deep-context
