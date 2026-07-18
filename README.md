@@ -74,9 +74,13 @@ one boot line plus `ds4_derived_artifacts{source=…}` on `/metrics` and
 
 **One command.** On a standard install (the `~/gguf` layout ds4-on-spark
 sets up), `ds4-server -c 49152 --host 0.0.0.0` is the whole launch: the
-base model is resolved automatically, the MTP head and DSpark drafter
-sitting beside it are attached, and MTP-2 + DSpark speculation is enabled —
-with one boot line stating exactly what was auto-enabled, never silently.
+base model is resolved automatically, the DSpark drafter sitting beside it
+is attached and armed, and (since v0.2.4) the MTP head is *dropped* when a
+drafter is armed — it is fully shadowed by DSpark (byte-identical
+speculative counters, equal-or-better wall at every stamped depth) and
+costs ~3.55 GiB. MTP-2 remains the automatic fallback speculation when no
+drafter file is present, `--mtp` always loads it, and every auto decision
+is stated on one boot line, never silently.
 Explicit flags and env override everything; `--no-spec` boots a plain
 server, `--no-mtp`/`--no-dspark` opt out per component, and
 `--preset spark` makes the full stack a hard requirement that fails loudly
@@ -97,14 +101,19 @@ GB10** — a 518K-token orchestrator plus a 248K subagent, both live at ctx
 turn-2 TTFT of 1.2 s on the 518K conversation (the cold admit is ~41 min of
 prefill, paid once; a pinned warm tier guarantees short-lived tenants never
 evict a deep trunk). Needle-in-haystack remains 70/70 across the 8k–128k
-tiers at the release commit, and compressed-KV storage tiers (FP8 codes,
-FP4 e2m1 indexer) are bit-lossless against F32 storage. KV costs
-≈9.5 KiB/token at the F32 default (~766K-token ceiling per box; the FP8/FP4
-tiers are the opt-in road past 1M). Honesty note: prefill is context-flat
-and decode is through ~128k, but deep decode is not — ~146 ms/tok at 248K
-(v0.2 stamp) and ~163 ms/tok at 519K (re-stamped on v0.2.2's always-on fast
-tier; ~177 on v0.2). The deep-context win is capacity plus seconds-fast
-warm turn cycles, not raw decode speed.
+tiers at the release commit, and the packed compressed-KV tiers (FP8
+codes, FP4 e2m1 indexer) are bit-lossless against F32 storage — and are
+**the default since v0.2.4**. A packed compressed row is 704+28 B against
+2048 B at F32 (the F32 rows go write-dead inside demand-mapped slabs, so
+their pages never materialize), which returned +5.6 GiB at the 766K
+charter shape — the same shape that F32-primary now takes a clean 503 on
+when the box is fragmented. Packed primaries also made deep decode
+*faster*: 87 ms/tok at 240K and 121 ms/tok at 516K (−19% / −26% vs F32
+on the same binary; v0.2 shipped ~146/~163). Honesty note: prefill is
+context-flat and decode is through ~128k, but deep decode still is not —
+87–121 ms/tok deep against 44–48 shallow. The deep-context win is
+capacity, seconds-fast warm turn cycles, and a closing (not closed)
+decode gap.
 
 **Measured, gated, reversible.** Every performance claim comes from same-boot
 A/B runs with SM-clock logging; every default flip passed bit- or
