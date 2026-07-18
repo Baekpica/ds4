@@ -9030,7 +9030,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                               cache_text_override,
                                               cache_text_ext,
                                               cache_text_key,
-                                              &hooks, err, sizeof(err));
+                                              &hooks, NULL, err, sizeof(err));
 }
 
 static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
@@ -9078,6 +9078,47 @@ static void kv_cache_store_current(server *s, const char *reason) {
     } else {
         kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
     }
+}
+
+/* v0.3 durable pinned banks: persist one cont bank's state to the disk KV
+ * store before its warm record is destroyed (reason "bank-evict", pin tier
+ * only: min_committed = warm_pin_min) or at shutdown (reason
+ * "bank-shutdown", min_committed = 1: every valid record).  min_committed
+ * <= 0 disables the call site's tier.  The record's rendered text is the
+ * store key, so a later request byte-prefix-matches it exactly like a live
+ * warm record; the payload restores through
+ * ds4_kvstore_try_restore_bank_text at admission.  Runs on the worker
+ * thread under gen_mu (evict sites) or after client drain (shutdown) --
+ * the bank is idle by construction at both. */
+static void kv_cache_store_bank(server *s, int bank, const char *reason,
+                                int min_committed) {
+    if (min_committed <= 0) return;
+    if (!s->kv.enabled || !s->batch_ctx || !s->warm) return;
+    if (bank < 0 || bank >= s->batch_ctx_max_seq || !s->warm[bank].valid) return;
+    if (!s->warm[bank].text || s->warm[bank].len == 0) return;
+    const int *htok = NULL;
+    const int hl = ds4_batch_ctx_bank_committed(s->batch_ctx, bank, &htok);
+    if (!htok || hl < min_committed) return;
+    char err[160] = {0};
+    ds4_session_payload_file staged = {0};
+    if (ds4_cont_bank_stage_payload(s->batch_ctx, (uint32_t)bank, &staged,
+                                    err, sizeof(err)) != 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: bank persist skipped bank=%d reason=%s: %s",
+                   bank, reason, err);
+        return;
+    }
+    ds4_tokens tokens = { (int *)htok, (int)hl, (int)hl };
+    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    const bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
+                        s->session, &tokens, (int)hl, reason,
+                        s->warm[bank].text, 0, "bank",
+                        &hooks, &staged, err, sizeof(err));
+    ds4_session_payload_file_free(&staged);
+    if (ok)
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: bank persisted bank=%d tokens=%u reason=%s",
+                   bank, hl, reason);
 }
 
 static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
@@ -11802,6 +11843,55 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
             best_len = s->warm[b].len;
         }
     }
+    /* v0.3 durable pinned banks: no live record prefixes this request --
+     * try the disk tier before falling to partial/cold.  Restores prefer a
+     * NO-VALUE or superseded bank; a DEEP disk record (>= warm_pin_min
+     * tokens) may also displace a SHALLOW live record -- mirroring the
+     * depth-split evict tiers, and never a pin-tier record -- so bank
+     * churn cannot permanently lock deep trunks out of the disk tier.
+     * The restored text becomes the bank's warm record, so the normal
+     * placement below and the engine's frontier validation treat it
+     * exactly like a live retirement. */
+    if (best < 0 && plen && s->kv.enabled) {
+        int rb = -1;
+        const int didx = ds4_kvstore_find_text_prefix(&s->kv, ptext,
+                             ds4_engine_model_id(s->engine),
+                             ds4_engine_routed_quant_bits(s->engine),
+                             ds4_session_ctx(s->session));
+        if (didx >= 0) {
+            rb = warm_victim_pick(s, occ, -1, false);
+            if (rb < 0 && s->warm_pin_min > 0 &&
+                s->kv.entry[didx].tokens >= (uint32_t)s->warm_pin_min) {
+                rb = warm_victim_pick(s, occ, -1, true);
+                if (rb >= 0) {
+                    const int vc = ds4_batch_ctx_bank_committed(s->batch_ctx, rb, NULL);
+                    if (vc >= s->warm_pin_min) rb = -1;   /* never displace deep */
+                }
+            }
+        }
+        if (rb >= 0) {
+            char *rtext = NULL;
+            size_t rlen = 0;
+            if (ds4_kvstore_try_restore_bank_text(&s->kv, s->engine, s->session,
+                                                  s->batch_ctx, (uint32_t)rb,
+                                                  ptext, &rtext, &rlen) > 0) {
+                warm_rec_invalidate(s, rb);
+                s->warm[rb].text = rtext;
+                s->warm[rb].len = rlen;
+                s->warm[rb].valid = true;
+                s->warm[rb].last_use = ++s->warm_clock;
+                warm_records_gauge_refresh(s);
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: bank restore admit bank=%d bytes=%zu",
+                           rb, rlen);
+                if (rlen > 0 && rlen < plen &&
+                    byte_prefix_match(ptext, plen, rtext, rlen)) {
+                    best = rb;
+                    best_len = rlen;
+                }
+            }
+        }
+    }
     if (best >= 0) {
         const int *htok = NULL;
         const int hl = ds4_batch_ctx_bank_committed(s->batch_ctx, best, &htok);
@@ -11840,6 +11930,9 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                 if (ft >= 0) {
                     req->place_bank = ft + 1;
                     req->fork_bank  = best + 1;
+                    /* v0.3 durable banks: the fork target's foreign record is
+                     * being destroyed -- persist the pin tier to disk first. */
+                    kv_cache_store_bank(s, ft, "bank-evict", s->warm_pin_min);
                     warm_rec_invalidate(s, ft);      /* target being overwritten */
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: fork admit src=%d dst=%d cached=%d suffix=%d",
@@ -11903,6 +11996,9 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                     ft = -1;
                 if (ft >= 0) {
                     req->place_bank = ft + 1;
+                    /* v0.3 durable banks: foreign record destroyed (see the
+                     * full-match fork above). */
+                    kv_cache_store_bank(s, ft, "bank-evict", s->warm_pin_min);
                     warm_rec_invalidate(s, ft);      /* target being overwritten */
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: partial fork admit src=%d dst=%d cut=%d suffix=%d",
@@ -11911,6 +12007,11 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                     /* No free target: truncate the trunk in place (consumes the
                      * record; still strictly cheaper than a cold prefill). */
                     req->place_bank = pb + 1;
+                    /* v0.3 durable banks: the deep tail beyond the cut is
+                     * destroyed by the truncate -- persist the full trunk
+                     * first (this is exactly the deep-cut case, since the
+                     * pin rule forces ft = -1 past warm_pin_min). */
+                    kv_cache_store_bank(s, pb, "bank-evict", s->warm_pin_min);
                     warm_rec_invalidate(s, pb);
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: partial truncate admit bank=%d cut=%d suffix=%d",
@@ -11928,6 +12029,8 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                        "ds4-server: cold admit evicting DEEP record bank=%d committed=%d (all candidates deep)",
                        target, tc);
         req->place_bank = target + 1;                /* directed COLD admit */
+        /* v0.3 durable banks: cold-admit victim destroyed. */
+        kv_cache_store_bank(s, target, "bank-evict", s->warm_pin_min);
         warm_rec_invalidate(s, target);
     }
 }
@@ -14202,6 +14305,13 @@ int main(int argc, char **argv) {
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
         kv_cache_store_current(&s, "shutdown");
+    }
+    /* v0.3 durable pinned banks: every valid warm record persists at
+     * shutdown (the plain tier's only persist point; the pin tier also
+     * persists on evict).  Clients are drained, so the banks are idle. */
+    if (s.kv.enabled && s.batch_ctx && s.warm) {
+        for (int b = 0; b < s.batch_ctx_max_seq; b++)
+            kv_cache_store_bank(&s, b, "bank-shutdown", 1);
     }
     server_close_resources(&s);
     return 0;

@@ -179,6 +179,8 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "shutdown")) return DS4_KVSTORE_REASON_SHUTDOWN;
     if (!strcmp(reason, "agent-system")) return DS4_KVSTORE_REASON_AGENT_SYSTEM;
     if (!strcmp(reason, "agent-session")) return DS4_KVSTORE_REASON_AGENT_SESSION;
+    if (!strcmp(reason, "bank-evict")) return DS4_KVSTORE_REASON_BANK_EVICT;
+    if (!strcmp(reason, "bank-shutdown")) return DS4_KVSTORE_REASON_BANK_SHUTDOWN;
     return DS4_KVSTORE_REASON_UNKNOWN;
 }
 
@@ -930,6 +932,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
                                         const ds4_kvstore_trailer_hooks *hooks,
+                                        const ds4_session_payload_file *staged_in,
                                         char *err,
                                         size_t err_len) {
     if (!kc->enabled) return false;
@@ -947,19 +950,27 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     const int model_id = ds4_engine_model_id(engine);
 
     char save_err[160] = {0};
+    /* live_tokens also guards eviction below (a store never evicts the live
+     * conversation's own entries), so it stays hoisted for both paths. */
     const ds4_tokens *live_tokens = ds4_session_tokens(session);
-    if (!live_tokens ||
-        live_tokens->len != store_tokens.len ||
-        !ds4_tokens_starts_with(live_tokens, &store_tokens))
-    {
-        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache skipped tokens=%d reason=%s because live checkpoint is at %d",
-                kv_log_name(kc),
-                store_tokens.len,
-                reason,
-                live_tokens ? live_tokens->len : -1);
-        ds4_tokens_free(&store_tokens);
-        return false;
+    /* v0.3 durable banks: a pre-staged BANK payload describes a cont bank,
+     * not the serial session -- the live-checkpoint cross-check below is
+     * meaningless for it (the bank's own committed history was validated
+     * when the payload was staged). */
+    if (!staged_in) {
+        if (!live_tokens ||
+            live_tokens->len != store_tokens.len ||
+            !ds4_tokens_starts_with(live_tokens, &store_tokens))
+        {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache skipped tokens=%d reason=%s because live checkpoint is at %d",
+                    kv_log_name(kc),
+                    store_tokens.len,
+                    reason,
+                    live_tokens ? live_tokens->len : -1);
+            ds4_tokens_free(&store_tokens);
+            return false;
+        }
     }
 
     size_t text_len = 0;
@@ -1005,7 +1016,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     }
 
     ds4_session_payload_file staged = {0};
-    if (ds4_session_stage_payload(session, &staged,
+    const bool staged_borrowed = staged_in != NULL;
+    if (staged_borrowed) staged = *staged_in;   /* BORROWED: caller frees */
+    if (!staged_borrowed &&
+        ds4_session_stage_payload(session, &staged,
                                   save_err, sizeof(save_err)) != 0) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
@@ -1034,7 +1048,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 (double)est_file_bytes / (1024.0 * 1024.0),
                 (double)est_required_bytes / (1024.0 * 1024.0),
                 (double)kc->budget_bytes / (1024.0 * 1024.0));
-        ds4_session_payload_file_free(&staged);
+        if (!staged_borrowed) ds4_session_payload_file_free(&staged);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
@@ -1061,7 +1075,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 "%s: kv cache failed to create %s: %s save=%.1f ms",
                 kv_log_name(kc), tmp, strerror(errno),
                 (kv_now_sec() - save_t0) * 1000.0);
-        ds4_session_payload_file_free(&staged);
+        if (!staged_borrowed) ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         free(path);
@@ -1146,7 +1160,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
     }
-    ds4_session_payload_file_free(&staged);
+    if (!staged_borrowed) ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     free(path);
@@ -1165,7 +1179,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
                                               store_len, reason, NULL, 0, NULL,
-                                              hooks, err, err_len);
+                                              hooks, NULL, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
@@ -1210,6 +1224,116 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (!strcmp(sha, e->sha)) best = i;
     }
     return best;
+}
+
+/* v0.3 durable pinned banks: like ds4_kvstore_try_load_text, but the
+ * payload restores INTO a cont bank instead of the serial session, and no
+ * effective-prompt is built here -- the caller installs the returned text
+ * as the bank's warm record and the server's normal warm matcher +
+ * engine-side frontier validation take over.  Trailer hooks do not apply
+ * (bank records carry rendered warm-record text, never a tool map). */
+int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
+                                      ds4_engine *engine,
+                                      ds4_session *session,
+                                      ds4_batch_ctx *batch_ctx,
+                                      uint32_t bank,
+                                      const char *prompt_text,
+                                      char **record_text_out,
+                                      size_t *record_text_len_out) {
+    if (record_text_out) *record_text_out = NULL;
+    if (record_text_len_out) *record_text_len_out = 0;
+    if (!kc->enabled || !prompt_text || !batch_ctx || !record_text_out) return 0;
+    const int quant_bits = ds4_engine_routed_quant_bits(engine);
+    if (quant_bits != 2 && quant_bits != 4) return 0;
+    const int model_id = ds4_engine_model_id(engine);
+    const size_t prompt_bytes = strlen(prompt_text);
+    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
+                                           ds4_session_ctx(session));
+    if (idx < 0) return 0;
+
+    ds4_kvstore_entry e = kc->entry[idx];
+    char *path = kv_xstrdup(e.path);
+    const double load_t0 = kv_now_sec();
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        free(path);
+        return 0;
+    }
+    uint32_t text_bytes = 0;
+    ds4_kvstore_entry hdr = {0};
+    const char *fail_reason = "invalid header";
+    bool header_ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
+    char *cached_text = NULL;
+    if (header_ok) {
+        if (hdr.model_id != (uint8_t)model_id) {
+            header_ok = false;
+            fail_reason = "cached checkpoint was written for a different model";
+        } else if ((uint64_t)text_bytes > prompt_bytes) {
+            header_ok = false;
+            fail_reason = "cached text is longer than prompt";
+        } else {
+            cached_text = kv_xmalloc((size_t)text_bytes + 1);
+            if (fread(cached_text, 1, text_bytes, fp) != text_bytes) {
+                header_ok = false;
+                fail_reason = "truncated cached text";
+            } else {
+                cached_text[text_bytes] = '\0';
+                char text_sha[41];
+                ds4_kvstore_sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                if (strcmp(text_sha, e.sha)) {
+                    header_ok = false;
+                    fail_reason = "cached text hash mismatch";
+                } else if (!ds4_kvstore_byte_prefix_match(prompt_text, prompt_bytes,
+                                                          cached_text, text_bytes)) {
+                    header_ok = false;
+                    fail_reason = "cached text prefix mismatch";
+                }
+            }
+        }
+    }
+    char err[160] = {0};
+    int loaded = 0;
+    if (header_ok &&
+        ds4_cont_bank_restore_payload(batch_ctx, bank, fp, hdr.payload_bytes,
+                                      err, sizeof(err)) == 0)
+    {
+        const int *htok = NULL;
+        const int hl = ds4_batch_ctx_bank_committed(batch_ctx, (int)bank, &htok);
+        if (htok && (uint32_t)hl == hdr.tokens) {
+            loaded = (int)hdr.tokens;
+        } else {
+            /* restore claimed success but the bank disagrees -- structural
+             * breakage; drop the entry and leave the bank invalid. */
+            unlink(path);
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache discarded corrupt bank payload %s",
+                    kv_log_name(kc), path);
+        }
+    } else {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache bank restore failed %s: %s load=%.1f ms",
+                kv_log_name(kc), path,
+                header_ok ? err : fail_reason,
+                (kv_now_sec() - load_t0) * 1000.0);
+    }
+    fclose(fp);
+
+    if (loaded > 0) {
+        const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache bank restore hit tokens=%d bank=%u file=%s load=%.1f ms",
+                kv_log_name(kc), loaded, bank, path, load_ms);
+        e.hits++;
+        kc->entry[idx].hits = e.hits;
+        kc->entry[idx].last_used = (uint64_t)time(NULL);
+        ds4_kvstore_touch_file(path, e.hits);
+        *record_text_out = cached_text;
+        if (record_text_len_out) *record_text_len_out = (size_t)text_bytes;
+        cached_text = NULL;
+    }
+    free(cached_text);
+    free(path);
+    return loaded;
 }
 
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,

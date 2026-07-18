@@ -25,6 +25,12 @@ typedef enum {
     DS4_KVSTORE_REASON_SHUTDOWN  = 4,
     DS4_KVSTORE_REASON_AGENT_SYSTEM  = 5,
     DS4_KVSTORE_REASON_AGENT_SESSION = 6,
+    /* v0.3 durable pinned banks: a cont BANK payload persisted when its
+     * warm record was destroyed by a foreign admit (bank-evict) or at
+     * server shutdown (bank-shutdown).  The payload is wire-compatible
+     * with a serial session checkpoint. */
+    DS4_KVSTORE_REASON_BANK_EVICT    = 7,
+    DS4_KVSTORE_REASON_BANK_SHUTDOWN = 8,
 } ds4_kvstore_reason;
 
 typedef enum {
@@ -170,8 +176,30 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
                                         const ds4_kvstore_trailer_hooks *hooks,
+                                        /* v0.3 durable banks: pre-staged payload
+                                         * (BORROWED — caller frees; non-NULL also
+                                         * skips the live-session checkpoint
+                                         * cross-check, since the tokens describe a
+                                         * cont bank, not the serial session).
+                                         * NULL = stage from the session (serial). */
+                                        const ds4_session_payload_file *staged_in,
                                         char *err,
                                         size_t err_len);
+/* v0.3 durable banks: find a stored record whose text is a byte-prefix of
+ * prompt_text and restore its payload INTO cont bank `bank` (tensors +
+ * counters + committed history).  On success returns the record's token
+ * count and hands back a heap copy of the stored text (the server installs
+ * it as the bank's warm record so the normal matcher/validator take over).
+ * Corrupt entries are discarded like the serial loader does.  0 = no
+ * usable record (bank untouched or reset-invalid on partial failure). */
+int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
+                                      ds4_engine *engine,
+                                      ds4_session *session,
+                                      ds4_batch_ctx *batch_ctx,
+                                      uint32_t bank,
+                                      const char *prompt_text,
+                                      char **record_text_out,
+                                      size_t *record_text_len_out);
 bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    ds4_engine *engine,
                                    ds4_session *session,

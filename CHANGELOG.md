@@ -7,6 +7,38 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased (v0.3)
 
+- **Durable pinned banks: continuous-batching KV survives eviction and
+  restarts.** Until now only the serial session's KV could persist to
+  `--kv-disk-dir`; a continuous-batching bank (the per-conversation KV a
+  warm record points at) evaporated whenever its bank was recycled or
+  the server restarted, and a deep conversation paid its full prefill
+  again. Banks now serialize through the same walkers and the same wire
+  format as serial checkpoints (a bank record IS a valid serial
+  checkpoint — the payload-integrity gate leg restores one in
+  serial-only mode and byte-compares two fresh-boot continuations).
+  Policy, with no new knobs: deep records at or above the existing pin
+  threshold persist when a foreign admit destroys their bank
+  (`bank-evict`); every valid record persists at graceful shutdown
+  (`bank-shutdown`). At admission, a request no live record serves is
+  checked against the disk tier and restored directly into a free bank
+  — preferring no-value banks, with a deep-over-shallow displacement
+  rule mirroring the eviction tiers so churn can't lock deep trunks out
+  — after which the normal warm matching, engine-side frontier
+  validation, and suffix prefill proceed exactly as for a live record.
+  Restores honor the packed-native v3 format (packed primaries upload
+  mirrors verbatim; write-dead F32 pages stay unmapped). The
+  persist/restore runs synchronously in the admission path (seconds at
+  deep contexts, replacing minutes of re-prefill); asynchronous staging
+  is future work, as is carrying tool-call maps through bank restores
+  (a post-restart tool-turn re-render currently degrades to a cold
+  prefill, never to wrong output). New standing gate:
+  `speed-bench/bank_persist_gate.sh` — which also flushed out a latent
+  serial-mode bug on its first deep serial restore: the fp8 predecode
+  scratch resized in single-row steps as the compressed count grew,
+  eventually attempting an allocation inside an active capture window
+  and killing generation a few tokens in. It is now sized once by the
+  per-layer compressed cap (fixed in the preceding commit).
+
 - **Batched-decode indexer scoring rewritten on tensor cores — deep
   decode ~13% faster.** The multiseq scorer (every continuous-batching
   decode step, all widths including width 1) was a scalar

@@ -617,6 +617,29 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+
+/* Durable pinned banks (v0.3): serialize / restore one cont BANK of a
+ * batch ctx through the same wire format as a serial session payload (a
+ * bank record is a valid serial checkpoint; its logits block and MTP tail
+ * are zeros — restore is warm-admit + suffix prefill, which regenerates
+ * both).  Save reads the bank's committed token history (bank_hist);
+ * restore repopulates tensors + counters + bank_hist and marks the bank
+ * warm-valid, so a following admit validates exactly like a live warm
+ * bank.  Banks must be idle (evict/shutdown by construction); both calls
+ * run under the engine generation lock like every other cont entry. */
+uint64_t ds4_cont_bank_payload_bytes(ds4_batch_ctx *ctx, uint32_t bank);
+int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                               FILE *fp, char *err, size_t errlen);
+int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                  FILE *fp, uint64_t payload_bytes,
+                                  char *err, size_t errlen);
+/* (Committed token history reads through the existing
+ * ds4_batch_ctx_bank_committed accessor.) */
+/* Stage a bank payload into a temp file (bank twin of
+ * ds4_session_stage_payload); free with ds4_session_payload_file_free. */
+int ds4_cont_bank_stage_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                ds4_session_payload_file *out,
+                                char *err, size_t errlen);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);

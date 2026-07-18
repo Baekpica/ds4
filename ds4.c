@@ -28598,11 +28598,15 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
 typedef struct {
     const uint32_t *n_comp;        /* per-layer live comp rows */
     const uint32_t *n_index_comp;  /* per-layer live index rows */
-    uint64_t comp_row0;            /* first comp row (attn tensors) */
-    uint64_t index_row0;           /* first index row (indexer tensors) */
-    uint64_t raw_row0;             /* first raw-ring row */
-    uint64_t attn_state_off;       /* byte offset into attn state slabs */
-    uint64_t index_state_off;      /* byte offset into index state slabs */
+    /* Bank id: every per-bank slab offset is seq-strided with a PER-LAYER
+     * stride (layer_comp_cap and the state strides follow the layer's
+     * compress ratio, which alternates 4/128 on Flash), so the walkers
+     * derive each layer's offsets from this one field instead of taking
+     * baked scalar offsets that could only ever describe layer-uniform
+     * strides.  The serial session is seq 0 (all offsets identically 0,
+     * byte-identical to the pre-refactor writer -- kv_crossmode is the
+     * proof); cont banks pass their bank id. */
+    uint32_t seq;
     uint32_t tokens;               /* committed token count */
     uint32_t raw_live;             /* live raw rows serialized */
 } payload_region;
@@ -28879,6 +28883,7 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
                                         uint32_t row_flags, FILE *fp, uint8_t *buf,
                                         char *err, size_t errlen) {
     int rc = 0;
+    const uint64_t raw_row0 = (uint64_t)reg->seq * g->raw_cap;
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         /* Write the raw ring in logical position order.  The file does not care
          * where the rows happened to live physically in the source graph. */
@@ -28888,7 +28893,7 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_write_tensor_span(fp,
                                            g->layer_raw_cache[il],
-                                           (reg->raw_row0 + phys) * DS4_N_HEAD_DIM * sizeof(float),
+                                           (raw_row0 + phys) * DS4_N_HEAD_DIM * sizeof(float),
                                            (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
                                            buf,
                                            DS4_SESSION_IO_CHUNK,
@@ -28897,6 +28902,12 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
+        /* Per-layer bank offsets (comp/index rows stride by this layer's
+         * comp cap; state slabs stride by this layer's state bytes). */
+        const uint64_t comp_row0 = (uint64_t)reg->seq * g->layer_comp_cap[il];
+        const uint64_t index_row0 = comp_row0;
+        const uint64_t attn_state_off = (uint64_t)reg->seq * layer_attn_state_bytes(ratio);
+        const uint64_t index_state_off = (uint64_t)reg->seq * layer_index_state_bytes(ratio);
         const uint32_t rows = reg->n_comp[il];
         /* Compressed rows are append-only from row zero of the region, so the
          * live prefix is contiguous.  The two compressor state tensors hold
@@ -28904,7 +28915,7 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
         if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_write_tensor_span_f16_as_f32(fp,
                                                       g->layer_attn_comp_cache[il],
-                                                      reg->comp_row0 * DS4_N_HEAD_DIM * sizeof(uint16_t),
+                                                      comp_row0 * DS4_N_HEAD_DIM * sizeof(uint16_t),
                                                       (uint64_t)rows * DS4_N_HEAD_DIM,
                                                       buf,
                                                       DS4_SESSION_IO_CHUNK,
@@ -28921,19 +28932,19 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
             } else {
                 rc = payload_write_tensor_span(fp,
                                                g->layer_comp_cache_fp8[il],
-                                               reg->comp_row0 * DS4_OPP_C_FP8_ROW_BYTES,
+                                               comp_row0 * DS4_OPP_C_FP8_ROW_BYTES,
                                                (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES,
                                                buf, DS4_SESSION_IO_CHUNK, err, errlen);
                 if (rc == 0) rc = payload_write_tensor_span(fp,
                                                g->layer_comp_scale[il],
-                                               reg->comp_row0 * DS4_OPP_C_FP8_SCALE_BYTES,
+                                               comp_row0 * DS4_OPP_C_FP8_SCALE_BYTES,
                                                (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES,
                                                buf, DS4_SESSION_IO_CHUNK, err, errlen);
             }
         } else {
             rc = payload_write_tensor_span(fp,
                                            g->layer_attn_comp_cache[il],
-                                           reg->comp_row0 * DS4_N_HEAD_DIM * sizeof(float),
+                                           comp_row0 * DS4_N_HEAD_DIM * sizeof(float),
                                            (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float),
                                            buf,
                                            DS4_SESSION_IO_CHUNK,
@@ -28942,7 +28953,7 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
         }
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_kv[il],
-                                                    reg->attn_state_off,
+                                                    attn_state_off,
                                                     layer_attn_state_bytes(ratio),
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
@@ -28950,7 +28961,7 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
                                                     errlen);
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_score[il],
-                                                    reg->attn_state_off,
+                                                    attn_state_off,
                                                     layer_attn_state_bytes(ratio),
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
@@ -28967,19 +28978,19 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
                 } else {
                     rc = payload_write_tensor_span(fp,
                                                    g->layer_index_comp_cache_fp4[il],
-                                                   reg->index_row0 * DS4_INDEXER_FP4_ROW_BYTES,
+                                                   index_row0 * DS4_INDEXER_FP4_ROW_BYTES,
                                                    (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES,
                                                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
                     if (rc == 0) rc = payload_write_tensor_span(fp,
                                                    g->layer_index_comp_scale[il],
-                                                   reg->index_row0 * DS4_INDEXER_FP4_SCALE_BYTES,
+                                                   index_row0 * DS4_INDEXER_FP4_SCALE_BYTES,
                                                    (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES,
                                                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
                 }
             } else {
                 rc = payload_write_tensor_span(fp,
                                                g->layer_index_comp_cache[il],
-                                               reg->index_row0 * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                               index_row0 * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                                (uint64_t)irows * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                                buf,
                                                DS4_SESSION_IO_CHUNK,
@@ -28988,7 +28999,7 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
             }
             if (rc == 0) rc = payload_write_tensor_span(fp,
                                                         g->layer_index_state_kv[il],
-                                                        reg->index_state_off,
+                                                        index_state_off,
                                                         layer_index_state_bytes(ratio),
                                                         buf,
                                                         DS4_SESSION_IO_CHUNK,
@@ -28996,7 +29007,7 @@ static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *
                                                         errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp,
                                                         g->layer_index_state_score[il],
-                                                        reg->index_state_off,
+                                                        index_state_off,
                                                         layer_index_state_bytes(ratio),
                                                         buf,
                                                         DS4_SESSION_IO_CHUNK,
@@ -29017,6 +29028,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
                                        uint32_t row_flags, FILE *fp, uint8_t *buf,
                                        uint64_t *remaining, char *err, size_t errlen) {
     int rc = 0;
+    const uint64_t raw_row0 = (uint64_t)reg->seq * g->raw_cap;
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         /* Rebuild the physical raw ring expected by the current graph.  This is
          * why the file stores rows in logical order instead of dumping bytes from
@@ -29027,7 +29039,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_read_tensor_span(fp,
                                           g->layer_raw_cache[il],
-                                          (reg->raw_row0 + phys) * DS4_N_HEAD_DIM * sizeof(float),
+                                          (raw_row0 + phys) * DS4_N_HEAD_DIM * sizeof(float),
                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
                                           buf,
                                           DS4_SESSION_IO_CHUNK,
@@ -29037,11 +29049,16 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
+        /* Per-layer bank offsets -- see session_payload_write_region. */
+        const uint64_t comp_row0 = (uint64_t)reg->seq * g->layer_comp_cap[il];
+        const uint64_t index_row0 = comp_row0;
+        const uint64_t attn_state_off = (uint64_t)reg->seq * layer_attn_state_bytes(ratio);
+        const uint64_t index_state_off = (uint64_t)reg->seq * layer_index_state_bytes(ratio);
         const uint32_t rows = reg->n_comp[il];
         if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_read_tensor_span_f32_as_f16(fp,
                                                      g->layer_attn_comp_cache[il],
-                                                     reg->comp_row0 * DS4_N_HEAD_DIM * sizeof(uint16_t),
+                                                     comp_row0 * DS4_N_HEAD_DIM * sizeof(uint16_t),
                                                      (uint64_t)rows * DS4_N_HEAD_DIM,
                                                      buf,
                                                      DS4_SESSION_IO_CHUNK,
@@ -29056,10 +29073,10 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
              * and dequant-expand into the F32 cache. */
             if (rows != 0u && g->layer_comp_cache_fp8[il] && g->layer_comp_scale[il]) {
                 ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_comp_cache_fp8[il],
-                        reg->comp_row0 * DS4_OPP_C_FP8_ROW_BYTES,
+                        comp_row0 * DS4_OPP_C_FP8_ROW_BYTES,
                         (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES);
                 ds4_gpu_tensor *scale = ds4_gpu_tensor_view(g->layer_comp_scale[il],
-                        reg->comp_row0 * DS4_OPP_C_FP8_SCALE_BYTES,
+                        comp_row0 * DS4_OPP_C_FP8_SCALE_BYTES,
                         (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES);
                 if (!codes || !scale) {
                     payload_set_err(err, errlen, "fp8 mirror view failed for packed restore");
@@ -29082,7 +29099,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
                         (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES,
                         (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES) : NULL;
                 ds4_gpu_tensor *crows = ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
-                        reg->comp_row0 * DS4_N_HEAD_DIM * sizeof(float),
+                        comp_row0 * DS4_N_HEAD_DIM * sizeof(float),
                         (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float));
                 if (!codes || !scale || !crows) {
                     payload_set_err(err, errlen, "fp8 packed staging failed for restore");
@@ -29108,7 +29125,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
         } else {
             rc = payload_read_tensor_span(fp,
                                           g->layer_attn_comp_cache[il],
-                                          reg->comp_row0 * DS4_N_HEAD_DIM * sizeof(float),
+                                          comp_row0 * DS4_N_HEAD_DIM * sizeof(float),
                                           (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float),
                                           buf,
                                           DS4_SESSION_IO_CHUNK,
@@ -29124,13 +29141,13 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
             !(row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) &&
             g->layer_comp_cache_fp8[il] && rows != 0u) {
             ds4_gpu_tensor *crows = ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
-                    reg->comp_row0 * DS4_N_HEAD_DIM * sizeof(float),
+                    comp_row0 * DS4_N_HEAD_DIM * sizeof(float),
                     (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float));
             ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_comp_cache_fp8[il],
-                    reg->comp_row0 * DS4_OPP_C_FP8_ROW_BYTES,
+                    comp_row0 * DS4_OPP_C_FP8_ROW_BYTES,
                     (uint64_t)rows * DS4_OPP_C_FP8_ROW_BYTES);
             ds4_gpu_tensor *scale = ds4_gpu_tensor_view(g->layer_comp_scale[il],
-                    reg->comp_row0 * DS4_OPP_C_FP8_SCALE_BYTES,
+                    comp_row0 * DS4_OPP_C_FP8_SCALE_BYTES,
                     (uint64_t)rows * DS4_OPP_C_FP8_SCALE_BYTES);
             if (!crows || !codes || !scale ||
                 ds4_gpu_dsv4_fp8_kv_quantize_tensor(crows, rows, DS4_N_HEAD_DIM,
@@ -29144,7 +29161,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
         }
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_kv[il],
-                                                   reg->attn_state_off,
+                                                   attn_state_off,
                                                    layer_attn_state_bytes(ratio),
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
@@ -29153,7 +29170,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
                                                    errlen);
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_score[il],
-                                                   reg->attn_state_off,
+                                                   attn_state_off,
                                                    layer_attn_state_bytes(ratio),
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
@@ -29168,10 +29185,10 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
                 if (irows != 0u && g->layer_index_comp_cache_fp4[il] &&
                     g->layer_index_comp_scale[il]) {
                     ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
-                            reg->index_row0 * DS4_INDEXER_FP4_ROW_BYTES,
+                            index_row0 * DS4_INDEXER_FP4_ROW_BYTES,
                             (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES);
                     ds4_gpu_tensor *scale = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
-                            reg->index_row0 * DS4_INDEXER_FP4_SCALE_BYTES,
+                            index_row0 * DS4_INDEXER_FP4_SCALE_BYTES,
                             (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES);
                     if (!codes || !scale) {
                         payload_set_err(err, errlen, "fp4 mirror view failed for packed restore");
@@ -29194,7 +29211,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
                             (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES,
                             (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES) : NULL;
                     ds4_gpu_tensor *irows_v = ds4_gpu_tensor_view(g->layer_index_comp_cache[il],
-                            reg->index_row0 * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                            index_row0 * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                             (uint64_t)irows * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                     if (!codes || !scale || !irows_v) {
                         payload_set_err(err, errlen, "fp4 packed staging failed for restore");
@@ -29220,7 +29237,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
             } else {
                 rc = payload_read_tensor_span(fp,
                                               g->layer_index_comp_cache[il],
-                                              reg->index_row0 * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                              index_row0 * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                               (uint64_t)irows * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                               buf,
                                               DS4_SESSION_IO_CHUNK,
@@ -29235,13 +29252,13 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
             if (rc == 0 && !(row_flags & DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED) &&
                 g->layer_index_comp_cache_fp4[il] && irows != 0u) {
                 ds4_gpu_tensor *irows_v = ds4_gpu_tensor_view(g->layer_index_comp_cache[il],
-                        reg->index_row0 * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        index_row0 * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                         (uint64_t)irows * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 ds4_gpu_tensor *codes = ds4_gpu_tensor_view(g->layer_index_comp_cache_fp4[il],
-                        reg->index_row0 * DS4_INDEXER_FP4_ROW_BYTES,
+                        index_row0 * DS4_INDEXER_FP4_ROW_BYTES,
                         (uint64_t)irows * DS4_INDEXER_FP4_ROW_BYTES);
                 ds4_gpu_tensor *scale = ds4_gpu_tensor_view(g->layer_index_comp_scale[il],
-                        reg->index_row0 * DS4_INDEXER_FP4_SCALE_BYTES,
+                        index_row0 * DS4_INDEXER_FP4_SCALE_BYTES,
                         (uint64_t)irows * DS4_INDEXER_FP4_SCALE_BYTES);
                 if (!irows_v || !codes || !scale ||
                     ds4_gpu_dsv4_indexer_fp4_encode_tensor(irows_v, codes, scale,
@@ -29255,7 +29272,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
             }
             if (rc == 0) rc = payload_read_tensor_span(fp,
                                                        g->layer_index_state_kv[il],
-                                                       reg->index_state_off,
+                                                       index_state_off,
                                                        layer_index_state_bytes(ratio),
                                                        buf,
                                                        DS4_SESSION_IO_CHUNK,
@@ -29264,7 +29281,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
                                                        errlen);
             if (rc == 0) rc = payload_read_tensor_span(fp,
                                                        g->layer_index_state_score[il],
-                                                       reg->index_state_off,
+                                                       index_state_off,
                                                        layer_index_state_bytes(ratio),
                                                        buf,
                                                        DS4_SESSION_IO_CHUNK,
@@ -31246,8 +31263,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     payload_region reg = {
         g->layer_n_comp,
         g->layer_n_index_comp,
-        0, 0, 0,            /* comp/index/raw offsets: serial region */
-        0, 0,               /* state slab offsets */
+        0,                  /* seq 0: serial region */
         (uint32_t)s->checkpoint.len,
         raw_live,
     };
@@ -31570,8 +31586,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     payload_region reg = {
         n_comp,
         n_index_comp,
-        0, 0, 0,            /* comp/index/raw offsets: serial region */
-        0, 0,               /* state slab offsets */
+        0,                  /* seq 0: serial region */
         saved_tokens,
         saved_raw_live,
     };
@@ -32135,6 +32150,430 @@ int ds4_cont_last_done_stats(const ds4_batch_ctx *ctx, ds4_cont_seq_stats *out) 
     if (!ctx || !ctx->last_done_set || !out) return 0;
     *out = ctx->last_done;
     return 1;
+}
+
+/* ---- Durable pinned banks (v0.3 Increment B2): bank payload save/restore.
+ *
+ * One cont bank serializes through the same region walkers and the same
+ * wire format as a serial session payload, so a bank record is a valid
+ * serial checkpoint (debuggable with the existing loader) with two
+ * deliberate exceptions recorded in the bytes themselves: the logits
+ * block is zeros (a bank at evict/shutdown has streamed its completion;
+ * restore is warm-admit + suffix prefill, which regenerates logits before
+ * anything samples) and the MTP tail is zeros (per-bank MTP ring state
+ * rebuilds on the first post-restore step; the ship default drops the
+ * MTP head beside a drafter anyway).  The token list is the bank's
+ * committed history (bank_hist) -- save requires the bank warm-valid,
+ * restore repopulates hist + counters + tensors and marks the bank
+ * valid, so a following admit validates exactly like a live warm bank.
+ * Caller holds the generation lock and guarantees the bank is idle
+ * (evict/shutdown by construction). ---- */
+
+/* Bank walks must address the SLABS, never g->layer_*: those graph
+ * pointers are repointed views only inside a generate phase (and can be
+ * SINGLE-bank views during per-seq prefill), and between batches they are
+ * the graph's own single-seq tensors -- never written in cont mode, so a
+ * walk over them serializes ZEROS (bank_persist_gate run 1 caught exactly
+ * that: healthy counters, all-zero sections, model blind even to its own
+ * last turn).  A transient heap copy of the graph with layer_* aimed at
+ * the slab BASES is repoint-phase-independent, addresses the same memory
+ * every live view aliases, and never disturbs the driver's view state.
+ * The cross-config staging scratch may grow ON THE COPY (its grow path
+ * frees the old tensor after a drain), so the caller must copy the four
+ * scratch fields back into ctx->g afterwards -- ds4_cont_bank_walk_done
+ * does both. */
+static ds4_gpu_graph *ds4_cont_bank_walk_graph(ds4_batch_ctx *ctx) {
+    ds4_gpu_graph *wg = xmalloc(sizeof(*wg));
+    *wg = ctx->g;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        wg->layer_raw_cache[il]            = ctx->sl.multi_raw[il];
+        wg->layer_attn_comp_cache[il]      = ctx->sl.multi_comp[il];
+        wg->layer_attn_state_kv[il]        = ctx->sl.multi_askv[il];
+        wg->layer_attn_state_score[il]     = ctx->sl.multi_assc[il];
+        wg->layer_comp_cache_fp8[il]       = ctx->sl.multi_comp_fp8[il];
+        wg->layer_comp_scale[il]           = ctx->sl.multi_comp_scale[il];
+        wg->layer_index_comp_cache[il]     = ctx->sl.multi_index[il];
+        wg->layer_index_state_kv[il]       = ctx->sl.multi_iskv[il];
+        wg->layer_index_state_score[il]    = ctx->sl.multi_issc[il];
+        wg->layer_index_comp_cache_fp4[il] = ctx->sl.multi_index_fp4[il];
+        wg->layer_index_comp_scale[il]     = ctx->sl.multi_index_scale[il];
+    }
+    return wg;
+}
+
+static void ds4_cont_bank_walk_done(ds4_batch_ctx *ctx, ds4_gpu_graph *wg) {
+    if (!wg) return;
+    /* Adopt any staging scratch the walk grew (see ds4_cont_bank_walk_graph). */
+    ctx->g.comp_emit_scratch       = wg->comp_emit_scratch;
+    ctx->g.comp_emit_scratch_rows  = wg->comp_emit_scratch_rows;
+    ctx->g.index_emit_scratch      = wg->index_emit_scratch;
+    ctx->g.index_emit_scratch_rows = wg->index_emit_scratch_rows;
+    free(wg);
+}
+
+uint64_t ds4_cont_bank_payload_bytes(ds4_batch_ctx *ctx, uint32_t bank) {
+    if (!ctx || bank >= (uint32_t)ctx->max_seq || !ctx->bank_hist_valid[bank] ||
+        ctx->bank_hist_len[bank] == 0) return 0;
+    ds4_gpu_graph *g = &ctx->g;
+    ds4_gpu_graph *wg = ds4_cont_bank_walk_graph(ctx);
+    uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    bytes += (uint64_t)ctx->bank_hist_len[bank] * sizeof(uint32_t);
+    bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
+    bytes += 2ull * DS4_N_LAYER * sizeof(uint32_t);
+    bytes += sizeof(uint32_t);   /* v3 row-format flags */
+    const uint32_t raw_live = session_raw_live_rows(g, ctx->bank_hist_len[bank]);
+    const uint32_t row_flags = session_payload_row_flags(wg);
+    ds4_cont_bank_walk_done(ctx, wg);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        if (row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) {
+            bytes += (uint64_t)g->ms_n_comp[bank][il] *
+                     (DS4_OPP_C_FP8_ROW_BYTES + DS4_OPP_C_FP8_SCALE_BYTES);
+        } else {
+            bytes += (uint64_t)g->ms_n_comp[bank][il] * DS4_N_HEAD_DIM * sizeof(float);
+        }
+        bytes += 2ull * layer_attn_state_bytes(ratio);
+        if (ratio == 4) {
+            if (row_flags & DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED) {
+                bytes += (uint64_t)g->ms_n_index_comp[bank][il] *
+                         (DS4_INDEXER_FP4_ROW_BYTES + DS4_INDEXER_FP4_SCALE_BYTES);
+            } else {
+                bytes += (uint64_t)g->ms_n_index_comp[bank][il] *
+                         DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            }
+            bytes += 2ull * layer_index_state_bytes(ratio);
+        }
+    }
+    bytes += DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES;
+    return bytes;
+}
+
+int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                               FILE *fp, char *err, size_t errlen) {
+    if (!ctx || !fp || bank >= (uint32_t)ctx->max_seq) {
+        payload_set_err(err, errlen, "invalid bank payload save");
+        return 1;
+    }
+    if (!ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0) {
+        payload_set_err(err, errlen, "bank has no reuse-trustworthy committed history");
+        return 1;
+    }
+    ds4_gpu_graph *g = &ctx->g;
+    const int *tokens = ctx->bank_hist + (uint64_t)bank * ctx->seq_cap;
+    const uint32_t n_tokens = ctx->bank_hist_len[bank];
+    if (ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "failed to synchronize accelerator before bank snapshot");
+        return 1;
+    }
+    const uint32_t raw_live = session_raw_live_rows(g, n_tokens);
+    uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC,
+        DS4_SESSION_PAYLOAD_VERSION,
+        ctx->ctx_size,
+        ctx->prefill_cap,
+        g->raw_cap,
+        g->raw_window,
+        g->comp_cap,
+        n_tokens,
+        DS4_N_LAYER,
+        DS4_N_HEAD_DIM,
+        DS4_N_INDEXER_HEAD_DIM,
+        DS4_N_VOCAB,
+        raw_live,
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (payload_write_u32(fp, (uint32_t)tokens[i], err, errlen) != 0) return 1;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    /* Logits block: zeros (see the section comment). */
+    memset(buf, 0, DS4_SESSION_IO_CHUNK);
+    uint64_t zeros_left = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    int rc = 0;
+    while (rc == 0 && zeros_left != 0) {
+        const size_t n = zeros_left > DS4_SESSION_IO_CHUNK
+            ? DS4_SESSION_IO_CHUNK : (size_t)zeros_left;
+        rc = payload_write_bytes(fp, buf, n, err, errlen);
+        zeros_left -= n;
+    }
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        rc = payload_write_u32(fp, g->ms_n_comp[bank][il], err, errlen);
+    }
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        rc = payload_write_u32(fp, g->ms_n_index_comp[bank][il], err, errlen);
+    }
+    ds4_gpu_graph *wg = ds4_cont_bank_walk_graph(ctx);
+    const uint32_t row_flags = session_payload_row_flags(wg);
+    if (rc == 0) rc = payload_write_u32(fp, row_flags, err, errlen);
+    if (rc == 0) {
+        payload_region reg = {
+            g->ms_n_comp[bank],
+            g->ms_n_index_comp[bank],
+            bank,
+            n_tokens,
+            raw_live,
+        };
+        rc = session_payload_write_region(wg, &reg, row_flags, fp, buf, err, errlen);
+    }
+    ds4_cont_bank_walk_done(ctx, wg);
+    free(buf);
+    if (rc != 0) return rc;
+    /* MTP tail: zeros (see the section comment). */
+    if (payload_write_u32(fp, 0u, err, errlen) != 0) return 1;
+    double zero_ewma = 0.0;
+    if (payload_write_bytes(fp, &zero_ewma, sizeof(zero_ewma), err, errlen) != 0) return 1;
+    if (payload_write_u32(fp, 0u, err, errlen) != 0) return 1;
+    return 0;
+}
+
+int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                  FILE *fp, uint64_t payload_bytes,
+                                  char *err, size_t errlen) {
+    if (!ctx || !fp || bank >= (uint32_t)ctx->max_seq) {
+        payload_set_err(err, errlen, "invalid bank payload load");
+        return 1;
+    }
+    ds4_gpu_graph *g = &ctx->g;
+    uint64_t remaining = payload_bytes;
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
+    }
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] == 0 || h[1] > DS4_SESSION_PAYLOAD_VERSION) {
+        payload_set_err(err, errlen, "unsupported bank payload version");
+        return 1;
+    }
+    const uint32_t payload_version = h[1];
+    const uint32_t saved_raw_cap = h[4];
+    const uint32_t saved_raw_window = h[5];
+    const uint32_t saved_comp_cap = h[6];
+    const uint32_t saved_tokens = h[7];
+    const uint32_t saved_raw_live = h[12];
+    if (saved_tokens >= ctx->seq_cap) {
+        payload_set_err(err, errlen, "bank payload does not fit current per-bank token bound");
+        return 1;
+    }
+    if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
+        h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB) {
+        payload_set_err(err, errlen, "bank payload was written for a different DS4 layout");
+        return 1;
+    }
+    if (saved_raw_window != g->raw_window) {
+        payload_set_err(err, errlen, "bank payload graph chunk layout does not match current runtime");
+        return 1;
+    }
+    const uint32_t expected_raw_live =
+        saved_tokens < saved_raw_window ? saved_tokens : saved_raw_window;
+    if (saved_raw_cap == 0 || saved_raw_live != expected_raw_live ||
+        saved_raw_live > saved_raw_cap || saved_raw_live > g->raw_cap) {
+        payload_set_err(err, errlen, "bank payload raw ring layout does not match current context");
+        return 1;
+    }
+    if (saved_comp_cap > g->comp_cap) {
+        payload_set_err(err, errlen, "bank payload compressed cache is larger than current context");
+        return 1;
+    }
+    int *hist = ctx->bank_hist + (uint64_t)bank * ctx->seq_cap;
+    ctx->bank_hist_valid[bank] = 0;   /* not trustworthy until fully restored */
+    ctx->bank_hist_len[bank] = 0;
+    for (uint32_t i = 0; i < saved_tokens; i++) {
+        uint32_t tok = 0;
+        if (payload_read_u32(fp, &tok, &remaining, err, errlen) != 0) return 1;
+        hist[i] = (int)tok;
+    }
+    uint32_t n_comp[DS4_MAX_LAYER];
+    uint32_t n_index_comp[DS4_MAX_LAYER];
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    /* Consume the logits block (bank records carry zeros there). */
+    uint64_t skip_left = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    int rc = 0;
+    while (rc == 0 && skip_left != 0) {
+        const size_t n = skip_left > DS4_SESSION_IO_CHUNK
+            ? DS4_SESSION_IO_CHUNK : (size_t)skip_left;
+        rc = payload_read_bytes(fp, buf, n, &remaining, err, errlen);
+        skip_left -= n;
+    }
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        rc = payload_read_u32(fp, &n_comp[il], &remaining, err, errlen);
+        if (rc == 0 && (n_comp[il] > saved_comp_cap || n_comp[il] > g->layer_comp_cap[il])) {
+            payload_set_err(err, errlen, "bank payload has invalid compressed row count");
+            rc = 1;
+        }
+    }
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        rc = payload_read_u32(fp, &n_index_comp[il], &remaining, err, errlen);
+        if (rc == 0 && (n_index_comp[il] > saved_comp_cap || n_index_comp[il] > g->layer_comp_cap[il])) {
+            payload_set_err(err, errlen, "bank payload has invalid indexer row count");
+            rc = 1;
+        }
+    }
+    uint32_t row_flags = 0;
+    if (rc == 0 && payload_version >= 3) {
+        rc = payload_read_u32(fp, &row_flags, &remaining, err, errlen);
+    }
+    if (rc == 0 && (row_flags & ~(DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED |
+                                  DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED))) {
+        payload_set_err(err, errlen, "bank payload has unsupported row-format flags");
+        rc = 1;
+    }
+    if (rc == 0 && (row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) &&
+        DS4_GPU_ATTN_COMP_CACHE_F16) {
+        payload_set_err(err, errlen, "packed bank payload requires a packed or F32 comp cache");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "failed to synchronize accelerator before bank restore");
+        rc = 1;
+    }
+    ds4_gpu_graph *wg = ds4_cont_bank_walk_graph(ctx);
+    /* LAW (r5-inc1b / p2-inc3a): the cont comp/index slabs -- F32 caches AND
+     * packed mirrors -- are VMM demand-mapped, and a restored bank writes
+     * rows no live emit has touched.  Map exactly the tensors the walk
+     * below will write (branch-accurate: over-ensuring the F32 cache under
+     * packed primaries would map the write-dead pages the packed format
+     * exists to avoid).  Raw ring and state slabs are plain allocs. */
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t row0 = (uint64_t)bank * g->layer_comp_cap[il];
+        const uint32_t rows = n_comp[il];
+        const bool fp8_mirrors = !DS4_GPU_ATTN_COMP_CACHE_F16 &&
+                                 wg->layer_comp_cache_fp8[il] && wg->layer_comp_scale[il];
+        const bool file_fp8 = (row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) != 0;
+        const bool want_f32 = DS4_GPU_ATTN_COMP_CACHE_F16 ? true
+                            : (!file_fp8 || !fp8_mirrors);
+        if (want_f32 && !metal_graph_cache_ensure_rows(wg->layer_attn_comp_cache[il],
+                row0, rows,
+                DS4_GPU_ATTN_COMP_CACHE_F16
+                    ? (uint64_t)DS4_N_HEAD_DIM * sizeof(uint16_t)
+                    : (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                "bank restore comp cache", il)) rc = 1;
+        if (rc == 0 && fp8_mirrors) {
+            /* Mirrors are written on BOTH branches when present: verbatim
+             * upload (packed file) or post-restore regen (F32 file). */
+            if (!metal_graph_cache_ensure_rows(wg->layer_comp_cache_fp8[il],
+                    row0, rows, DS4_OPP_C_FP8_ROW_BYTES,
+                    "bank restore fp8 codes", il) ||
+                !metal_graph_cache_ensure_rows(wg->layer_comp_scale[il],
+                    row0, rows, DS4_OPP_C_FP8_SCALE_BYTES,
+                    "bank restore fp8 scales", il)) rc = 1;
+        }
+        if (rc == 0 && ratio == 4) {
+            const uint32_t irows = n_index_comp[il];
+            const bool fp4_mirrors = wg->layer_index_comp_cache_fp4[il] &&
+                                     wg->layer_index_comp_scale[il];
+            const bool file_fp4 = (row_flags & DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED) != 0;
+            const bool want_if32 = !file_fp4 || !fp4_mirrors;
+            if (want_if32 && !metal_graph_cache_ensure_rows(wg->layer_index_comp_cache[il],
+                    row0, irows,
+                    (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                    "bank restore index cache", il)) rc = 1;
+            if (rc == 0 && fp4_mirrors) {
+                if (!metal_graph_cache_ensure_rows(wg->layer_index_comp_cache_fp4[il],
+                        row0, irows, DS4_INDEXER_FP4_ROW_BYTES,
+                        "bank restore fp4 codes", il) ||
+                    !metal_graph_cache_ensure_rows(wg->layer_index_comp_scale[il],
+                        row0, irows, DS4_INDEXER_FP4_SCALE_BYTES,
+                        "bank restore fp4 scales", il)) rc = 1;
+            }
+        }
+    }
+    if (rc == 0) {
+        payload_region reg = {
+            n_comp,
+            n_index_comp,
+            bank,
+            saved_tokens,
+            saved_raw_live,
+        };
+        rc = session_payload_read_region(wg, &reg, row_flags, fp, buf, &remaining, err, errlen);
+    }
+    ds4_cont_bank_walk_done(ctx, wg);
+    free(buf);
+    if (rc != 0) return 1;
+    /* MTP tail: consume + discard (bank MTP ring state rebuilds live). */
+    if (payload_version >= 2) {
+        uint32_t u; double d;
+        if (payload_read_u32(fp, &u, &remaining, err, errlen) != 0 ||
+            payload_read_bytes(fp, &d, sizeof(d), &remaining, err, errlen) != 0 ||
+            payload_read_u32(fp, &u, &remaining, err, errlen) != 0) return 1;
+    }
+    if (remaining != 0) {
+        payload_set_err(err, errlen, "bank payload has trailing bytes");
+        return 1;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "failed to synchronize accelerator after bank restore");
+        return 1;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->ms_n_comp[bank][il] = n_comp[il];
+        g->ms_n_index_comp[bank][il] = n_index_comp[il];
+    }
+    g->ms_emit_keep[bank] = 0;   /* no partial-fork suppression on a restore */
+    ctx->bank_hist_len[bank] = saved_tokens;
+    ctx->bank_hist_valid[bank] = 1;
+    return 0;
+}
+
+/* Stage a bank payload into a temp file for the kvstore container writer --
+ * the bank twin of ds4_session_stage_payload. */
+int ds4_cont_bank_stage_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                ds4_session_payload_file *out,
+                                char *err, size_t errlen) {
+    if (!out) {
+        payload_set_err(err, errlen, "invalid bank payload staging request");
+        return 1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!ctx || bank >= (uint32_t)ctx->max_seq ||
+        !ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0) {
+        payload_set_err(err, errlen, "bank has no reuse-trustworthy state to stage");
+        return 1;
+    }
+    char tmpl[] = "/tmp/ds4-bank-payload.XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        payload_set_err(err, errlen, "failed to create staged bank payload");
+        return 1;
+    }
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) {
+        int saved = errno;
+        close(fd);
+        unlink(tmpl);
+        if (errlen) snprintf(err, errlen, "failed to open staged bank payload: %s",
+                             strerror(saved));
+        return 1;
+    }
+    int rc = ds4_cont_bank_save_payload(ctx, bank, fp, err, errlen);
+    if (rc == 0 && fflush(fp) != 0) {
+        payload_set_err(err, errlen, "failed to flush staged bank payload");
+        rc = 1;
+    }
+    off_t pos = -1;
+    if (rc == 0) {
+        pos = ftello(fp);
+        if (pos < 0) {
+            payload_set_err(err, errlen, "failed to measure staged bank payload");
+            rc = 1;
+        }
+    }
+    if (fclose(fp) != 0 && rc == 0) {
+        payload_set_err(err, errlen, "failed to close staged bank payload");
+        rc = 1;
+    }
+    if (rc != 0) {
+        unlink(tmpl);
+        return 1;
+    }
+    out->path = ds4_strdup(tmpl);
+    out->bytes = (uint64_t)pos;
+    return 0;
 }
 
 /* R5 Inc1b: first-touch page floor of ONE ACTIVE bank's demand-mapped cache
