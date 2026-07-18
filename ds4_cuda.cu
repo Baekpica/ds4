@@ -20535,7 +20535,18 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (fp8_codes != NULL && fp8_sc != NULL &&
         pos_dev == NULL && seq_dev == NULL &&
         ds4_cuda_fp8_kv_predecode_enabled()) {
-        const uint64_t scratch_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+        /* Size by the session-stable per-layer cap, not the live count.
+         * The scratch is comp-row-indexed and n_comp grows every ratio-th
+         * decode step, so live sizing resizes in single-row steps -- and a
+         * resize's cudaMalloc is forbidden once serial layer-graph capture
+         * is active (first hit: a deep serial restore decoding at 78K,
+         * bank_persist_gate P8 -- 'operation not permitted when stream is
+         * capturing', then the whole indexed launch cascades).  comp_cap is
+         * the same currency the PC5 max-grid path pins its topology with;
+         * 0 (legacy callers) keeps live sizing, which those callers only
+         * reach off-capture. */
+        const uint64_t scratch_rows = comp_cap != 0u ? comp_cap : n_comp;
+        const uint64_t scratch_bytes = scratch_rows * head_dim * sizeof(float);
         float *scratch = fp8_predecode_scratch_alloc(scratch_bytes);
         if (scratch != NULL) {
             dim3 pre_grid(n_tokens, top_k, 1);
