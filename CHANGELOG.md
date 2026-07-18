@@ -7,6 +7,31 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased (v0.3)
 
+- **Batched-decode indexer scoring rewritten on tensor cores — deep
+  decode ~13% faster.** The multiseq scorer (every continuous-batching
+  decode step, all widths including width 1) was a scalar
+  per-(row, token) kernel that was latency-bound, not bandwidth-bound:
+  33 block-wide barriers and a 32 KB q re-read per compressed row put
+  its cost at ~16 ms/step at 240K context, and the fp4 mirror's 6.4×
+  byte reduction moved nothing. The new kernel stages 32-row tiles of K
+  as unscaled e2m1 levels (always fp16-exact; the scaled values
+  underflow fp16 at deep-context block scales, which is what rules out
+  a naive half conversion) and MMAs them against per-warp q tiles,
+  folding the F32 block scales back per 32-wide chunk — chunk width
+  equals scale-block width, so the fold is exact. Q levels divide by
+  the exact commit scale via a new scale-only emit from the indexer-Q
+  QAT (1 KiB/token); the F32-primary config re-derives K block scales
+  in-kernel with the emit QAT's own derivation, so fp4-primary and
+  F32-primary configs stay bit-identical on the same binary. Measured:
+  scorer 744→188 µs/launch at the 240K shape (3.97×, .15 proto ladder,
+  top-k flips 0/2048 on every leg, 4-token batch ≡ single-token
+  launches bitwise), 240K turn-2 deep decode 87.6→76.3 ms/tok
+  (−12.9%), 12k turn-2 unchanged in its 44–48 band, needles exact at
+  12k/240K/250K/500K. Wins at every tested shape (43→21 µs even at 12k
+  context), so dispatch is unconditional. Serial (non-batched) decode
+  keeps the scalar kernel: serial refuses deep contexts by design, and
+  at shallow depths the scorer is under 1 ms/step.
+
 - **Disk-KV payloads store packed rows natively (format v3).** Packed-
   primary sessions serialize the fp8/fp4 mirror codes+scales verbatim
   instead of dequant-expanding to F32: checkpoints shrink ~2.3× at 16K

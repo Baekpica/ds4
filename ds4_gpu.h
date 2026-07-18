@@ -636,7 +636,13 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         /* P2 Inc3b: optional packed FP4 indexer mirror (NULL = F32; Metal
          * accepts + ignores).  multiseq + WMMA readers decode it. */
         ds4_gpu_tensor       *index_fp4,
-        ds4_gpu_tensor       *index_scale);
+        ds4_gpu_tensor       *index_scale,
+        /* v0.3 V5D: indexer-Q QAT block scales ([n_tokens, 64, 4] F32 --
+         * the scale-only emit of ds4_gpu_dsv4_indexer_qat_tensor).  Non-NULL
+         * routes the CUDA multiseq scores onto the WMMA V5D tile kernel
+         * (3.97x); NULL = legacy scalar per-row kernel.  Metal accepts +
+         * ignores. */
+        ds4_gpu_tensor       *q_block_scale);
 
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,

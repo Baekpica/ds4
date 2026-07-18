@@ -5764,10 +5764,12 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         const ds4_gpu_tensor *seq_id,
         uint32_t                single_bank,
         ds4_gpu_tensor       *index_fp4,
-        ds4_gpu_tensor       *index_scale) {
+        ds4_gpu_tensor       *index_scale,
+        ds4_gpu_tensor       *q_block_scale) {
     (void)comp_cap; (void)positions; (void)seq_id;  /* Phase 2 Step 4b: CUDA-only. */
     (void)single_bank;                              /* FE1: CUDA-only. */
     (void)index_fp4; (void)index_scale;             /* P2 Inc3b: FP4 mirror CUDA-only. */
+    (void)q_block_scale;                            /* v0.3 V5D: CUDA-only. */
     return ds4_gpu_indexer_scores_batch_tensor(scores,
                                                  q,
                                                  weights,
