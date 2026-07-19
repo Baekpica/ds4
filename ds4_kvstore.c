@@ -526,9 +526,17 @@ static bool kv_cache_incoming_supersedes_continued(
 }
 
 static bool kv_cache_reason_is_anchor(uint8_t reason) {
+    /* v0.3 durable banks: the bank reasons are anchors too — a bank-evict
+     * record exists precisely because a deep pin-tier trunk was destroyed
+     * under bank pressure (the strongest "will be revisited" signal the
+     * server produces), and bank-shutdown is the bank twin of the serial
+     * shutdown reason below.  Without these, the disk tier evicted the
+     * very records the persist policy exists to keep. */
     return reason == DS4_KVSTORE_REASON_COLD ||
            reason == DS4_KVSTORE_REASON_EVICT ||
-           reason == DS4_KVSTORE_REASON_SHUTDOWN;
+           reason == DS4_KVSTORE_REASON_SHUTDOWN ||
+           reason == DS4_KVSTORE_REASON_BANK_EVICT ||
+           reason == DS4_KVSTORE_REASON_BANK_SHUTDOWN;
 }
 
 double ds4_kvstore_entry_eviction_score(

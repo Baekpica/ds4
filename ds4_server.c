@@ -17250,6 +17250,37 @@ static void test_kv_cache_store_len_uses_configured_boundary(void) {
     TEST_ASSERT(kv_cache_store_len(&kc, 3500) == 3500);
 }
 
+static void test_kv_eviction_anchor_covers_bank_reasons(void) {
+    /* v0.3 durable banks: bank-evict / bank-shutdown records carry the same
+     * intentional-anchor eviction prior as their serial cousins — without
+     * it the disk tier evicted exactly the records the bank persist policy
+     * exists to keep (deep pin-tier trunks). */
+    ds4_kvstore_entry e = {0};
+    e.file_size = 1000;
+    e.tokens = 100;
+    e.hits = 0;
+    e.created_at = e.last_used = (uint64_t)time(NULL);
+    const uint64_t now = e.last_used;
+    e.reason = DS4_KVSTORE_REASON_CONTINUED;
+    const double base = ds4_kvstore_entry_eviction_score(&e, NULL, now, NULL);
+    TEST_ASSERT(base > 0.0);
+    const uint8_t anchors[] = {
+        DS4_KVSTORE_REASON_COLD,
+        DS4_KVSTORE_REASON_EVICT,
+        DS4_KVSTORE_REASON_SHUTDOWN,
+        DS4_KVSTORE_REASON_BANK_EVICT,
+        DS4_KVSTORE_REASON_BANK_SHUTDOWN,
+    };
+    for (size_t i = 0; i < sizeof(anchors) / sizeof(anchors[0]); i++) {
+        e.reason = anchors[i];
+        /* exact: the prior is a single multiply on the same base terms */
+        TEST_ASSERT(ds4_kvstore_entry_eviction_score(&e, NULL, now, NULL) ==
+                    base * 2.0);
+    }
+    e.reason = DS4_KVSTORE_REASON_UNKNOWN;
+    TEST_ASSERT(ds4_kvstore_entry_eviction_score(&e, NULL, now, NULL) == base);
+}
+
 static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     const int user = 9001;
     const int assistant = 9002;
@@ -18348,6 +18379,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
+    test_kv_eviction_anchor_covers_bank_reasons();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
