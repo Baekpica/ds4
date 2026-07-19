@@ -4861,10 +4861,47 @@ int ds4_gpu_dspark_markov_step_tensor(
         const ds4_gpu_tensor *bias,
         uint32_t                vocab,
         uint32_t                nb) {
-    (void)cand_out; (void)base_logits; (void)blk_pos; (void)B;
-    (void)bias; (void)vocab; (void)nb;
-    fprintf(stderr, "ds4: dspark_markov_step is CUDA-only (DSpark draft)\n");
-    return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!cand_out || !base_logits || !bias || vocab == 0 || nb == 0 || B == 0 || blk_pos >= B)
+        return 0;
+    if (ds4_gpu_tensor_bytes(cand_out) < (uint64_t)nb * sizeof(int32_t) ||
+        ds4_gpu_tensor_bytes(base_logits) < (uint64_t)nb * B * vocab * sizeof(float) ||
+        ds4_gpu_tensor_bytes(bias) < (uint64_t)nb * vocab * sizeof(float)) {
+        fprintf(stderr, "ds4: Metal dspark_markov_step received undersized buffers\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dspark_markov_step");
+        if (!pipeline) return 0;
+
+        /* The shader's reduction assumes a power-of-two thread count and its
+         * threadgroup arrays are sized for 1024. */
+        NSUInteger nth = pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 1024u) nth = 1024u;
+        NSUInteger pow2 = 1u;
+        while (pow2 * 2u <= nth) pow2 *= 2u;
+        nth = pow2;
+
+        struct { uint32_t blk_pos, B, vocab, nb; } args =
+            { blk_pos, B, vocab, nb };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(cand_out) offset:ds4_gpu_tensor_offset(cand_out) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(base_logits) offset:ds4_gpu_tensor_offset(base_logits) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(bias) offset:ds4_gpu_tensor_offset(bias) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nb, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "dspark markov step")) return 0;
+    }
+    return 1;
 }
 
 int ds4_gpu_dspark_gather_concat_tensor(
@@ -4873,9 +4910,39 @@ int ds4_gpu_dspark_gather_concat_tensor(
         const ds4_gpu_tensor *src_rows,
         uint32_t                n_rows,
         uint32_t                row_floats) {
-    (void)dst; (void)src; (void)src_rows; (void)n_rows; (void)row_floats;
-    fprintf(stderr, "ds4: dspark_gather_concat is CUDA-only (DSpark draft)\n");
-    return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!dst || !src || !src_rows || n_rows == 0 || row_floats == 0) return 0;
+    const uint64_t dst_bytes = (uint64_t)n_rows * row_floats * sizeof(float);
+    if (ds4_gpu_tensor_bytes(dst) < dst_bytes ||
+        ds4_gpu_tensor_bytes(src_rows) < (uint64_t)n_rows * sizeof(int32_t)) {
+        fprintf(stderr, "ds4: Metal dspark_gather_concat received undersized buffers\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dspark_gather_concat");
+        if (!pipeline) return 0;
+
+        struct { uint32_t n_rows, row_floats; } args = { n_rows, row_floats };
+        const uint64_t n = (uint64_t)n_rows * row_floats;
+        const NSUInteger groups = (NSUInteger)((n + 255u) / 256u);
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(dst) offset:ds4_gpu_tensor_offset(dst) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(src) offset:ds4_gpu_tensor_offset(src) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(src_rows) offset:ds4_gpu_tensor_offset(src_rows) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "dspark gather concat")) return 0;
+    }
+    return 1;
 }
 
 int ds4_gpu_dspark_capture_mean_tensor(
@@ -4886,10 +4953,39 @@ int ds4_gpu_dspark_capture_mean_tensor(
         uint32_t                n_tokens,
         uint32_t                slot,
         uint32_t                n_slots) {
-    (void)concat; (void)hc; (void)n_embd; (void)n_hc;
-    (void)n_tokens; (void)slot; (void)n_slots;
-    fprintf(stderr, "ds4: dspark_capture_mean is CUDA-only (DSpark draft)\n");
-    return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!concat || !hc || n_embd == 0 || n_hc == 0 || n_tokens == 0 || slot >= n_slots)
+        return 0;
+    if (ds4_gpu_tensor_bytes(concat) < (uint64_t)n_tokens * n_slots * n_embd * sizeof(float) ||
+        ds4_gpu_tensor_bytes(hc) < (uint64_t)n_tokens * n_hc * n_embd * sizeof(float)) {
+        fprintf(stderr, "ds4: Metal dspark_capture_mean received undersized buffers\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dspark_capture_mean");
+        if (!pipeline) return 0;
+
+        struct { uint32_t n_embd, n_hc, n_tokens, slot, n_slots; } args =
+            { n_embd, n_hc, n_tokens, slot, n_slots };
+        const uint64_t n = (uint64_t)n_embd * n_tokens;
+        const NSUInteger groups = (NSUInteger)((n + 255u) / 256u);
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(concat) offset:ds4_gpu_tensor_offset(concat) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(hc) offset:ds4_gpu_tensor_offset(hc) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "dspark capture mean")) return 0;
+    }
+    return 1;
 }
 
 void ds4_gpu_cleanup(void) {
