@@ -29,7 +29,7 @@ serving engine on NVIDIA hardware**? Upstream's heart is a single-user
 CLI/agent engine, Metal first. This fork keeps all of that working and builds
 the CUDA/Linux side into a batched server — the reference machines are the
 DGX Spark (GB10, sm_121) and the RTX PRO 6000 Blackwell (sm_120). Everything
-below is default-on in `v0.2`, each landing gated by value-parity checks,
+below is default-on in `v0.3`, each landing gated by value-parity checks,
 same-boot A/B timing, and the full eval suite, and each reversible with an
 env kill switch.
 
@@ -55,7 +55,11 @@ repack artifacts into tensor-core fragments, plus token-tile
 HMMA attention (replacing the scalar online-softmax path) and an
 L2-reuse-aware expert-major CTA schedule. Decode gets the same treatment:
 per-layer CUDA-graph capture of the batched decode step brings plain width-1
-continuous decode to 48.9 ms/tok, and the DSpark lossless speculative decoder
+continuous decode to 48.9 ms/tok, the sparse-attention indexer's score scan
+runs on tensor cores since v0.3 (a 32-row-tile WMMA kernel over unscaled
+e2m1 levels with exact per-block scale folds — 3.97× over the scalar scan at
+240K depth, zero top-k selection flips, bit-identical across packed and F32
+storage on the same binary), and the DSpark lossless speculative decoder
 runs at 3.02 tokens per verify step (74.6% draft acceptance, zero fallbacks).
 A terminal yield-quench controller (default on) turns speculation off for the
 rest of any request whose realized acceptance cannot pay for its verify cost,
@@ -107,13 +111,29 @@ codes, FP4 e2m1 indexer) are bit-lossless against F32 storage — and are
 2048 B at F32 (the F32 rows go write-dead inside demand-mapped slabs, so
 their pages never materialize), which returned +5.6 GiB at the 766K
 charter shape — the same shape that F32-primary now takes a clean 503 on
-when the box is fragmented. Packed primaries also made deep decode
-*faster*: 87 ms/tok at 240K and 121 ms/tok at 516K (−19% / −26% vs F32
-on the same binary; v0.2 shipped ~146/~163). Honesty note: prefill is
-context-flat and decode is through ~128k, but deep decode still is not —
-87–121 ms/tok deep against 44–48 shallow. The deep-context win is
+when the box is fragmented. Packed primaries made deep decode
+faster in v0.2.4 (87/121 ms/tok at 240K/516K), and the v0.3 tensor-core
+scorer moved it again: **76.3 ms/tok at 240K and 95.2 at 515K** (−13% /
+−21%, the win growing with depth because the score scan is the term that
+scales with context; v0.2 shipped ~146/~163). The 766K charter shape was
+re-stamped green on v0.3 with those decode numbers. Honesty note: prefill
+is context-flat and decode is through ~128k, but deep decode still is not
+— 76–95 ms/tok deep against 44–48 shallow. The deep-context win is
 capacity, seconds-fast warm turn cycles, and a closing (not closed)
 decode gap.
+
+**Deep conversations survive restarts.** Since v0.3 the per-request KV
+banks of the continuous server persist to the disk KV store: a deep
+record whose bank is claimed by another tenant is checkpointed before
+being overwritten, every live record is checkpointed at graceful
+shutdown, and an incoming request that matches a stored record restores
+straight into a bank and proceeds as a warm admit — measured at 3.1 s
+time-to-first-token for an 80K-token conversation whose cold prefill is
+~125 s, needle retrieval exact through the restored tensors. Bank
+records use the same wire format as serial checkpoints (packed-native
+since payload v3, ~2.3–3× smaller on disk), and the eight-phase
+`bank_persist_gate.sh` — including byte-identical restored continuations
+across independent boots — is a standing release gate.
 
 **Measured, gated, reversible.** Every performance claim comes from same-boot
 A/B runs with SM-clock logging; every default flip passed bit- or
@@ -121,20 +141,27 @@ value-parity plus eval slices with proven engagement of the changed path; the
 full quality suite (GSM8K, MMLU, HumanEval, MBPP, IFEval, needle) is
 re-stamped at the release commit against the June baseline. The release
 gates are standing scripts in `speed-bench/` (`teb_gates.sh` tool-calling
-legs, `deep_ctx_gate.sh` capacity, `bank_churn_soak.sh`, `needle_sweep.sh`)
+legs, `deep_ctx_gate.sh` capacity, `bank_churn_soak.sh`, `needle_sweep.sh`,
+`kv_crossmode_gate.sh` restore identity, `bank_persist_gate.sh` durable
+banks)
 — v0.2 exists because those gates caught two ship-path CUDA crashes in what
 would have been v0.1.1; that is the point of them.
 
 The per-landing numbers and the full story are in `CHANGELOG.md` and the
-release notes. The context-frontier sweep below compares this branch
-against upstream main on both reference machines, low band 2k–64k and high
-band 64k–128k:
+release notes. The v0.3 context-frontier sweep compares the ship defaults
+against the prior release lines on the GB10 (same instrument, low band
+2k–64k and high band 64k–128k); below it, the v0.1.0 chart against
+upstream main on both reference machines:
+
+![v0.3 context-frontier sweep](speed-bench/v030_sweep_overlay.svg)
 
 ![v0.1.0 context-frontier sweep](speed-bench/v010_sweep_overlay.svg)
 
-What is *not* changed: the Metal/macOS path, the CLI, the agent, disk KV
-persistence, and the GGUF tooling are inherited from upstream and kept
-building and passing their vectors. Upstream credit for the engine this fork
+What is *not* changed: the Metal/macOS path, the CLI, the agent, and the
+GGUF tooling are inherited from upstream and kept building and passing
+their vectors (disk KV persistence is inherited too, though the fork
+extends it — packed-native payloads and the continuous-bank tier above —
+while older checkpoints stay readable). Upstream credit for the engine this fork
 stands on is gladly given — everything in the sections below this one
 describes the shared foundation.
 

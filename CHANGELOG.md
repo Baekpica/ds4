@@ -5,7 +5,14 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
-## Unreleased (v0.3)
+## v0.3.0 — 2026-07-20
+
+Deep-context serving gets a tensor-core scorer and a durable KV tier.
+Batched deep decode is 13–21% faster (240K→515K context), deep
+conversations now survive bank eviction and server restarts (an
+80K-token resume takes ~3 s instead of ~2 minutes of re-prefill), and
+disk checkpoints store packed rows natively at ~2.3× smaller — with
+cross-config restores proven bitwise exact.
 
 - **Durable pinned banks: continuous-batching KV survives eviction and
   restarts.** Until now only the serial session's KV could persist to
