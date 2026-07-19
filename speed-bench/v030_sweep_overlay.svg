@@ -89,7 +89,7 @@
 <text class="legend" x="1008" y="138">v0.3 ship (6693aed)</text>
 <line class="line-old" x1="976" y1="152" x2="1002" y2="152"/>
 <text class="legend" x="1008" y="156">v0.1.1 DSpark ship (cadfe82)</text>
-<text class="note" x="78" y="442">Points at 2k-8k are single-run volatile on this instrument (2k across three runs: 593/648/712 prefill tok/s; standalone same-shape probes read 776-930 / 22-23.5 gen). Points at 10k+ repeat within 1% run to run. The low-end multiplier is therefore the 2k-32k geometric-mean ratio, not a single point; the deep multiplier is the single 128k point. Claims live at depth.</text>
-<text class="note" x="78" y="458">Gen lines are token_ids-exact benchy wall tok/s on the continuous+capture path, single stream. The v0.1.0 chart gen line (engine-truth, serial path) read 17.6 / 14.6 / 12.1 tok/s at 2k / 64k / 128k and is not drawn here (different instrument).</text>
-<text class="note" x="78" y="474">Engine-truth v0.3 deep-decode stamps (turn-2, 512 tok): 76.3 ms/tok @240K, 95.2 ms/tok @515K (v0.2.4: 87.6 / 120.9). GB10 = DGX Spark, sm_121, self-load boots. 2026-07-19.</text>
+<text class="note" x="78" y="478">Points at 2k-8k are single-run volatile on this instrument (2k across three runs: 593/648/712 prefill tok/s; standalone same-shape probes read 776-930 / 22-23.5 gen). Points at 10k+ repeat within 1% run to run. The low-end multiplier is therefore the 2k-32k geometric-mean ratio, not a single point; the deep multiplier is the single 128k point. Claims live at depth.</text>
+<text class="note" x="78" y="494">Gen lines are token_ids-exact benchy wall tok/s on the continuous+capture path, single stream. The v0.1.0 chart gen line (engine-truth, serial path) read 17.6 / 14.6 / 12.1 tok/s at 2k / 64k / 128k and is not drawn here (different instrument).</text>
+<text class="note" x="78" y="510">Engine-truth v0.3 deep-decode stamps (turn-2, 512 tok): 76.3 ms/tok @240K, 95.2 ms/tok @515K (v0.2.4: 87.6 / 120.9). GB10 = DGX Spark, sm_121, self-load boots. 2026-07-19.</text>
 </svg>
