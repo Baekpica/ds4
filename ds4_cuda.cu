@@ -13160,6 +13160,230 @@ __global__ static void __launch_bounds__(128, 8) indexer_scores_multiseq_v5d_ker
     }
 }
 
+/* v0.4 V5E: verify-width (multi-token) variant of V5D (proto:
+ * cuda/mmq/test/proto_indexer_score_mt.cu -- w5 897 -> 566 us FP4 at the
+ * 59082-row shape, 1933 -> 1213 at 128745, bitwise-identical scores and
+ * topk on every leg).  V5D launches one CTA per (32-row tile, TOKEN), so
+ * at DSpark verify width 5 five CTAs re-stage the same K tile, re-derive
+ * the same block scales, and pay the same barrier chain.  V5E drops the
+ * token grid dimension and loops tokens inside the CTA: the full 32x128
+ * K tile + scales stage ONCE per seq-run (restaged only when seq_id
+ * changes between consecutive tokens -- mixed multiseq batches degrade
+ * gracefully to per-token staging), and the per-token MMA chain is
+ * CTA-barrier-free (a_sh_all stable, b_sh/c_sh warp-private).
+ *
+ * Correctness structure inherited from V5D verbatim: per-token staged
+ * values, MMA fragment ops, fold order, and epilogue are IDENTICAL, so
+ * live-row scores are bitwise V5D's; the staging guard is the seq-run's
+ * MAX visible (VMM-safe: never past the seq's mapped band) and rows in
+ * [visible_t, vis_max) carry real K but are -INF-overwritten per token
+ * (MMA output rows are independent).  All intra-loop barriers are
+ * CTA-uniform (visible/seq are per-token constants, staged_seq evolves
+ * identically on every thread).
+ *
+ * Occupancy: static smem 17.4 KB + 96 regs both cap at 5 blocks/SM
+ * (ncu: 41.7% achieved, SM 52% / Mem 63%, latency-bound, no saturated
+ * pipe) -- the amortization wins 1.58-1.85x anyway; a smem/reg-diet V5F
+ * or HMMA-class restructure is BANKED (trigger: scorer back in the
+ * step-ledger top-3 post-V5E).  n_tokens 2..8 only; w1 keeps V5D's
+ * 8-block occupancy, wide batches keep the V5D token grid. */
+__global__ static void __launch_bounds__(128, 5) indexer_scores_multiseq_v5e_kernel(
+        float *scores, const float *q, const float *weights,
+        const float *index_comp, uint32_t n_comp, uint32_t n_tokens,
+        uint32_t pos0, uint32_t ratio, uint32_t comp_cap, float scale,
+        int causal, const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        const unsigned char * __restrict__ index_fp4,
+        const float * __restrict__ index_scale,
+        const float * __restrict__ q_block_scale) {
+    namespace wmma = nvcuda::wmma;
+    const uint32_t tile_c = blockIdx.x * 32u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 128u) return;
+
+    const bool use_fp4 = (index_fp4 != NULL) && (index_scale != NULL);
+    if (use_fp4 && tid == 0 && blockIdx.x == 0u)
+        atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
+    const uint32_t head0 = warp * 16u;
+
+    __shared__ __half a_sh_all[4 * 32 * 32];   /* [block][row][dim-in-block] */
+    __shared__ float k_scale_all[32 * 4];      /* [row][block] */
+    __shared__ __half b_sh[4 * 16 * 32];
+    __shared__ float c_sh[4 * 16 * 16];
+    __shared__ float warp_row_partial[4 * 32];
+
+    __half *warp_b_sh = b_sh + warp * 16u * 32u;
+    float *warp_c_sh = c_sh + warp * 16u * 16u;
+
+    uint32_t staged_seq = 0xFFFFFFFFu;
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        uint32_t visible = n_comp;
+        if (causal) {
+            const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0;
+            visible = ratio ? (qpos + 1u) / ratio : n_comp;
+            if (positions && ratio && visible > qpos / ratio) visible = qpos / ratio;
+            if (visible > n_comp) visible = n_comp;
+        }
+        if (tile_c >= visible) {
+            if (warp == 0u) {
+                const uint32_t comp = tile_c + lane;
+                if (comp < n_comp) scores[(uint64_t)t * n_comp + comp] = -INFINITY;
+            }
+            continue;
+        }
+
+        const uint32_t sid = seq_id ? (uint32_t)seq_id[t] : 0u;
+        const uint32_t seq_base = sid * comp_cap;
+
+        if (sid != staged_seq) {
+            uint32_t vis_max = visible;
+            for (uint32_t u = t + 1u; u < n_tokens; u++) {
+                if ((seq_id ? (uint32_t)seq_id[u] : 0u) != sid) break;
+                uint32_t vu = n_comp;
+                if (causal) {
+                    const uint32_t qp = positions ? (uint32_t)positions[u] : pos0;
+                    vu = ratio ? (qp + 1u) / ratio : n_comp;
+                    if (positions && ratio && vu > qp / ratio) vu = qp / ratio;
+                    if (vu > n_comp) vu = n_comp;
+                }
+                if (vu > vis_max) vis_max = vu;
+            }
+
+            __syncthreads();
+            #pragma unroll
+            for (uint32_t r0 = 0; r0 < 32u; r0 += 4u) {
+                const uint32_t r = r0 + warp;
+                const uint32_t comp = tile_c + r;
+                #pragma unroll
+                for (uint32_t block = 0; block < 4u; block++) {
+                    const uint32_t d = block * 32u + lane;
+                    float v = 0.0f;
+                    if (comp < vis_max) {
+                        v = use_fp4
+                            ? indexer_fp4_level_read(index_fp4, seq_base + comp, d)
+                            : index_comp[(uint64_t)(seq_base + comp) * 128u + d];
+                    }
+                    if (use_fp4) {
+                        if (lane == 0u) {
+                            k_scale_all[r * 4u + block] = comp < vis_max
+                                ? index_scale[(uint64_t)(seq_base + comp) * 4u + block]
+                                : 1.0f;
+                        }
+                    } else {
+                        float amax = fabsf(v);
+                        for (int offset = 16; offset > 0; offset >>= 1)
+                            amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, offset));
+                        if (lane == 0u) {
+                            k_scale_all[r * 4u + block] = comp < vis_max
+                                ? dsv4_pow2_ceil_scale(
+                                      fmaxf(amax, 7.052966104933725e-38f) / 6.0f)
+                                : 1.0f;
+                        }
+                    }
+                    __syncwarp();
+                    const float level = use_fp4 ? v : v / k_scale_all[r * 4u + block];
+                    a_sh_all[block * (32u * 32u) + r * 32u + lane] = __float2half(level);
+                }
+            }
+            __syncthreads();
+            staged_seq = sid;
+        }
+
+        const float *wrow = weights + (uint64_t)t * 64u;
+        float head_total[16];
+        #pragma unroll
+        for (uint32_t slot = 0; slot < 16u; slot++) head_total[slot] = 0.0f;
+
+        #pragma unroll
+        for (uint32_t block = 0; block < 4u; block++) {
+            for (uint32_t i = lane; i < 16u * 32u; i += 32u) {
+                const uint32_t h = i >> 5u;
+                const uint32_t block_d = i & 31u;
+                const uint32_t d = block * 32u + block_d;
+                const uint32_t head = head0 + h;
+                float v = q[((uint64_t)t * 64u + head) * 128u + d];
+                const float qs = q_block_scale[
+                    ((uint64_t)t * 64u + head) * 4u + (d >> 5u)];
+                warp_b_sh[i] = __float2half(v / qs);
+            }
+            __syncwarp();
+
+            #pragma unroll
+            for (uint32_t row_tile = 0; row_tile < 2u; row_tile++) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+                wmma::fill_fragment(c_frag, 0.0f);
+                #pragma unroll
+                for (uint32_t k = 0; k < 32u; k += 16u) {
+                    wmma::load_matrix_sync(
+                        a_frag,
+                        a_sh_all + block * (32u * 32u) + row_tile * 16u * 32u + k,
+                        32);
+                    wmma::load_matrix_sync(b_frag, warp_b_sh + k, 32);
+                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                }
+                wmma::store_matrix_sync(warp_c_sh, c_frag, 16, wmma::mem_row_major);
+                __syncwarp();
+
+                #pragma unroll
+                for (uint32_t slot = 0; slot < 8u; slot++) {
+                    const uint32_t i = lane + slot * 32u;
+                    const uint32_t r = row_tile * 16u + (i >> 4u);
+                    const uint32_t h = i & 15u;
+                    const uint32_t comp = tile_c + r;
+                    if (comp < n_comp) {
+                        float chunk = warp_c_sh[i];
+                        const float qs = q_block_scale[
+                            ((uint64_t)t * 64u + head0 + h) * 4u + block];
+                        chunk *= k_scale_all[r * 4u + block] * qs;
+                        head_total[row_tile * 8u + slot] += chunk;
+                    }
+                }
+                __syncwarp();
+            }
+        }
+
+        __syncthreads();
+        #pragma unroll
+        for (uint32_t row_tile = 0; row_tile < 2u; row_tile++) {
+            #pragma unroll
+            for (uint32_t slot = 0; slot < 8u; slot++)
+                warp_c_sh[lane + slot * 32u] =
+                    head_total[row_tile * 8u + slot];
+            __syncthreads();
+
+            if (lane < 16u) {
+                float warp_total = 0.0f;
+                #pragma unroll
+                for (uint32_t h = 0; h < 16u; h++) {
+                    const uint32_t head = head0 + h;
+                    warp_total += fmaxf(warp_c_sh[lane * 16u + h], 0.0f)
+                                * wrow[head] * scale;
+                }
+                warp_row_partial[
+                    warp * 32u + row_tile * 16u + lane] = warp_total;
+            }
+            __syncthreads();
+        }
+
+        if (warp == 0u && lane < 32u) {
+            const uint32_t comp = tile_c + lane;
+            if (comp < n_comp) {
+                float out = 0.0f;
+                #pragma unroll
+                for (uint32_t w = 0; w < 4u; w++)
+                    out += warp_row_partial[w * 32u + lane];
+                if (comp >= visible) out = -INFINITY;
+                scores[(uint64_t)t * n_comp + comp] = out;
+            }
+        }
+    }
+}
+
 __global__ static void indexer_scores_wmma_kernel(
         float *scores,
         const float *q,
@@ -14459,8 +14683,10 @@ static int indexer_scores_launch(
          * kernels across replays.  DS4_CUDA_IDX_V5D_OFF=1 is a DIAGNOSTIC
          * escape for same-binary A/B only -- the ship default is V5D. */
         static int v5d_off = -1;
+        static int v5e_off = -1;
         if (v5d_off < 0) {
             v5d_off = getenv("DS4_CUDA_IDX_V5D_OFF") != NULL ? 1 : 0;
+            v5e_off = getenv("DS4_CUDA_NO_IDX_V5E") != NULL ? 1 : 0;
             if (!v5d_off) {
                 /* Full smem carveout: 8 CTAs x 10880 B need >85 KB of the
                  * 100 KB SMs; the default carveout reserves too much L1.
@@ -14469,10 +14695,33 @@ static int indexer_scores_launch(
                 cudaFuncSetAttribute(
                     (const void *)indexer_scores_multiseq_v5d_kernel,
                     cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+                cudaFuncSetAttribute(
+                    (const void *)indexer_scores_multiseq_v5e_kernel,
+                    cudaFuncAttributePreferredSharedMemoryCarveout, 100);
             }
         }
         if (q_scale != NULL && !v5d_off &&
             q_scale->bytes >= (uint64_t)n_tokens * 64u * 4u * sizeof(float)) {
+            /* v0.4 V5E: verify widths 2..8 loop tokens inside the CTA so
+             * the K tile stages once per seq-run instead of once per
+             * token (proto_indexer_score_mt: w5 1.58x FP4, bitwise-equal
+             * scores).  Width choice is a launch arg, so captured graphs
+             * keep one kernel per (n_comp band, n_tokens); w1 keeps
+             * V5D's 8-block occupancy; wide batches keep the token grid.
+             * DS4_CUDA_NO_IDX_V5E = diagnostic escape. */
+            if (n_tokens >= 2u && n_tokens <= 8u && !v5e_off) {
+                dim3 grid((n_comp + 31u) / 32u, 1, 1);
+                indexer_scores_multiseq_v5e_kernel<<<grid, 128, 0, ds4_current_stream()>>>(
+                        (float *)scores->ptr,
+                        (const float *)q->ptr,
+                        (const float *)weights->ptr,
+                        (const float *)index_comp->ptr,
+                        n_comp, n_tokens, pos0, ratio, comp_cap, scale,
+                        causal ? 1 : 0, pos_dev, seq_dev,
+                        index_fp4_ptr, index_scale_ptr,
+                        (const float *)q_scale->ptr);
+                return cuda_ok(cudaGetLastError(), "indexer scores multiseq v5e launch");
+            }
             dim3 grid((n_comp + 31u) / 32u, n_tokens, 1);
             indexer_scores_multiseq_v5d_kernel<<<grid, 128, 0, ds4_current_stream()>>>(
                     (float *)scores->ptr,
