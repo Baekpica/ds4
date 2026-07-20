@@ -2774,11 +2774,13 @@ extern "C" int ds4_gpu_init(void) {
     /* SM count for the flash-decode attention split gate. */
     (void)cudaDeviceGetAttribute(&g_cuda_sm_count, cudaDevAttrMultiProcessorCount, dev);
     /* Flash-decode attention partials scratch (eager init -> capture-stable
-     * pointer). Sized for n_head*n_split*(head_dim+2) floats; 1M floats (4 MiB)
-     * covers e.g. 64 heads * 8 splits * 514 = 263K. A failure just disables the
-     * split (the single-block decode kernel remains the fallback). */
+     * pointer).  v0.4 HG sizing: n_tokens*n_head*n_split*(head_dim+2) floats
+     * at the dispatch caps (8 tokens * 64 heads * 16 splits * 514 = 4.21M
+     * floats, ~16.1 MiB).  Also serves the older per-head split path (64*8*
+     * 514 fits trivially).  A failure just disables both split paths (the
+     * single-block decode kernel remains the fallback). */
     if (g_attn_split_partials == NULL) {
-        const uint64_t bytes = (uint64_t)1024u * 1024u * sizeof(float); /* 4 MiB */
+        const uint64_t bytes = (uint64_t)8u * 64u * 16u * 514u * sizeof(float);
         void *p = NULL;
         if (cudaMalloc(&p, (size_t)bytes) == cudaSuccess) {
             g_attn_split_partials = (float *)p;
@@ -8143,6 +8145,311 @@ __global__ static void attention_decode_combine_kernel(
         for (uint32_t sp = 0; sp < n_split; sp++) acc += f_sh[sp] * base[(uint64_t)sp * stride + 2u + d];
         oh[d] = acc / denom;
     }
+}
+
+/* ---- v0.4 head-group flash-decode (HG) ----
+ * The per-head decode kernels above re-read and re-decode every visible
+ * compressed row once PER HEAD (64x), one block per head, with a 32 KB
+ * static score buffer capping residency at 2 blocks/SM -- ncu shows the
+ * result is latency exposure, not bandwidth (240K decode shape: 654 us for
+ * a 1.9 MB byte stream).  HG restructures the work: each block owns
+ * DS4_ATTN_HG_HEADS heads and a contiguous row chunk, loops it in
+ * DS4_ATTN_HG_ROWS-row tiles staged ONCE into f32 smem (fp8 decode shared
+ * across the block's heads), computes warp-per-head dots from smem with q
+ * held in registers, keeps an online-softmax partial {m, l, acc[]} per
+ * head, and a fixed-order combine merges the n_split partials (same
+ * deterministic numerics class as the flash-decode split above).  Proto
+ * ladder + floor ledger: local/docs/briefs/brief-v04-arc.md (2026-07-20);
+ * cuda/mmq/test/proto_attn_decode.cu is the isolated harness.
+ *
+ * fp8-vs-F32 config identity is STRUCTURAL here: both configs stage rows
+ * to the same f32 smem tile (the fp8 decode -- table magnitude x pow2
+ * block scale -- is exact), so the dot/V chains are shared instruction
+ * streams, not twinned branches.
+ *
+ * Capture safety: n_split is a pure function of device SM count + n_head
+ * (attention_decode_hg_n_split), the partials scratch is the eager
+ * capture-stable g_attn_split_partials allocation, and live n_comp arrives
+ * through ls_override exactly like the kernels above -- the in-kernel
+ * chunk math adapts at replay while the grid stays fixed. */
+#define DS4_ATTN_HG_HEADS 8u
+#define DS4_ATTN_HG_ROWS  8u
+
+__global__ static void __launch_bounds__(256, 4) attention_decode_hg_partial_kernel(
+        float *partials,        /* [((t*n_head+h)*n_split+sp)*(head_dim+2)] = {m, l, acc[]} */
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t comp_cap,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim,      /* dispatch-guarded == 512 */
+        uint32_t n_split,
+        const int32_t * __restrict__ positions,
+        const int32_t * __restrict__ seq_id,
+        const struct ds4_decode_scalars * __restrict__ s_override,
+        const struct ds4_layer_scalars  * __restrict__ ls_override,
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
+    __shared__ float kv_sm[DS4_ATTN_HG_ROWS][512 + 4];
+    __shared__ float P_sm[DS4_ATTN_HG_HEADS][DS4_ATTN_HG_ROWS];
+    __shared__ float m_sm[DS4_ATTN_HG_HEADS];
+    __shared__ float l_sm[DS4_ATTN_HG_HEADS];
+    __shared__ float f_sm[DS4_ATTN_HG_HEADS];
+    if (s_override) {
+        n_raw     = s_override->n_raw;
+        raw_start = s_override->raw_start;
+    }
+    if (ls_override) {
+        n_comp    = ls_override->n_comp;
+    }
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
+    if (use_fp8 && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_read_path_blocks, 1ull);
+    }
+    const uint32_t sp = blockIdx.x;
+    const uint32_t hg = blockIdx.y;
+    const uint32_t t  = blockIdx.z;
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const bool single_all = (n_tokens == 1u && ratio == 0u);
+    const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+    uint32_t row_n_raw     = n_raw;
+    uint32_t row_raw_start = raw_start;
+    if (positions) {
+        row_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+        if (row_n_raw > raw_cap) row_n_raw = raw_cap;
+        row_raw_start = (qpos + 1u - row_n_raw) % raw_cap;
+    }
+    const uint32_t first_raw_pos = positions ? (qpos + 1u - row_n_raw)
+                                             : (pos0 + n_tokens - n_raw);
+    const uint32_t seq_base      = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
+    const uint32_t comp_seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
+    /* raw span + visibility: exact port of attention_decode_mixed_kernel's
+     * derivation (computed per thread; scalar and cheap). */
+    uint32_t raw_count = 0;
+    uint32_t raw_first_idx = 0;
+    if (row_n_raw != 0) {
+        const uint32_t raw_last_pos = first_raw_pos + row_n_raw - 1u;
+        if (single_all) {
+            raw_count = row_n_raw > 256u ? 256u : row_n_raw;
+        } else if (qpos >= first_raw_pos) {
+            uint32_t lo_p = first_raw_pos;
+            if (window != 0 && qpos + 1u > window) {
+                const uint32_t wlo = qpos + 1u - window;
+                if (wlo > lo_p) lo_p = wlo;
+            }
+            const uint32_t hi_p = qpos < raw_last_pos ? qpos : raw_last_pos;
+            if (hi_p >= lo_p) {
+                raw_first_idx = lo_p - first_raw_pos;
+                raw_count = hi_p - lo_p + 1u;
+                if (raw_count > 256u) raw_count = 256u;
+            }
+        }
+    }
+    uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    if (positions && ratio != 0u && !single_all && visible_comp > qpos / ratio)
+        visible_comp = qpos / ratio;
+    if (visible_comp > n_comp) visible_comp = n_comp;
+    const uint32_t n_score = raw_count + visible_comp;
+    const uint32_t chunk = (n_score + n_split - 1u) / n_split;
+    const uint32_t lo = sp * chunk;
+    uint32_t hi = lo + chunk;
+    if (hi > n_score) hi = n_score;
+    const float scale = rsqrtf((float)head_dim);
+    /* q for this warp's head, in registers (head_dim 512 / 32 lanes). */
+    float q_reg[16];
+    {
+        const uint32_t h = hg * DS4_ATTN_HG_HEADS + warp;
+        const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+#pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) q_reg[k] = qh[lane + 32u * k];
+    }
+    if (tid < DS4_ATTN_HG_HEADS) { m_sm[tid] = -INFINITY; l_sm[tid] = 0.0f; }
+    __syncthreads();
+    const uint32_t d0 = (tid * 2u) & 511u;
+    const uint32_t d1 = d0 + 1u;
+    float O0[DS4_ATTN_HG_HEADS], O1[DS4_ATTN_HG_HEADS];
+#pragma unroll
+    for (uint32_t h = 0; h < DS4_ATTN_HG_HEADS; h++) { O0[h] = 0.0f; O1[h] = 0.0f; }
+
+    for (uint32_t tile = lo; tile < hi; tile += DS4_ATTN_HG_ROWS) {
+        const uint32_t nrows = (hi - tile) < DS4_ATTN_HG_ROWS ? (hi - tile) : DS4_ATTN_HG_ROWS;
+        /* Stage-decode the tile into f32 smem once for the whole head group.
+         * Pad rows are ZEROED (a stale-NaN smem row survives P=0: 0*NaN). */
+        for (uint32_t i4 = tid; i4 < DS4_ATTN_HG_ROWS * 128u; i4 += blockDim.x) {
+            const uint32_t r = i4 >> 7u;
+            const uint32_t d = (i4 & 127u) * 4u;
+            float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+            if (r < nrows) {
+                const uint32_t row = tile + r;
+                if (row < raw_count) {
+                    const uint32_t rr = seq_base +
+                        ((row_raw_start + raw_first_idx + row) % raw_cap);
+                    const float4 f4 = *(const float4 *)(raw_kv + (uint64_t)rr * head_dim + d);
+                    v0 = f4.x; v1 = f4.y; v2 = f4.z; v3 = f4.w;
+                } else if (use_fp8) {
+                    const uint32_t c = row - raw_count;
+                    const unsigned char *cp = comp_fp8 +
+                        (uint64_t)(comp_seq_base + c) * DS4_OPP_C_FP8_ROW_BYTES_DEV;
+                    if (d < DS4_OPP_C_FP8_NOPE_DEV) {
+                        const uchar4 q4 = *(const uchar4 *)(cp + d);
+                        const float sc = comp_scale[(uint64_t)(comp_seq_base + c) *
+                                                    DS4_OPP_C_FP8_BLOCKS_DEV + (d >> 6u)];
+                        const float m0 = dsv4_e4m3fn_decode_table[q4.x & 0x7fu];
+                        const float m1 = dsv4_e4m3fn_decode_table[q4.y & 0x7fu];
+                        const float m2 = dsv4_e4m3fn_decode_table[q4.z & 0x7fu];
+                        const float m3 = dsv4_e4m3fn_decode_table[q4.w & 0x7fu];
+                        v0 = ((q4.x & 0x80u) ? -m0 : m0) * sc;
+                        v1 = ((q4.y & 0x80u) ? -m1 : m1) * sc;
+                        v2 = ((q4.z & 0x80u) ? -m2 : m2) * sc;
+                        v3 = ((q4.w & 0x80u) ? -m3 : m3) * sc;
+                    } else {
+                        const float4 f4 = *(const float4 *)(cp + DS4_OPP_C_FP8_NOPE_DEV +
+                            (uint64_t)(d - DS4_OPP_C_FP8_NOPE_DEV) * sizeof(float));
+                        v0 = f4.x; v1 = f4.y; v2 = f4.z; v3 = f4.w;
+                    }
+                } else {
+                    const uint32_t c = row - raw_count;
+                    const float4 f4 = *(const float4 *)(comp_kv +
+                        (uint64_t)(comp_seq_base + c) * head_dim + d);
+                    v0 = f4.x; v1 = f4.y; v2 = f4.z; v3 = f4.w;
+                }
+            }
+            kv_sm[r][d]      = v0;
+            kv_sm[r][d + 1u] = v1;
+            kv_sm[r][d + 2u] = v2;
+            kv_sm[r][d + 3u] = v3;
+        }
+        __syncthreads();
+        /* warp-per-head dots from smem, q from registers */
+        float s_r[DS4_ATTN_HG_ROWS];
+#pragma unroll
+        for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) s_r[r] = 0.0f;
+#pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) {
+            const uint32_t d = lane + 32u * k;
+            const float qv = q_reg[k];
+#pragma unroll
+            for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++)
+                s_r[r] = __fmaf_rn(qv, kv_sm[r][d], s_r[r]);
+        }
+#pragma unroll
+        for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) {
+            for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                s_r[r] += __shfl_down_sync(0xffffffffu, s_r[r], off);
+        }
+        if (lane == 0) {
+            float m_new = m_sm[warp];
+            for (uint32_t r = 0; r < nrows; r++)
+                m_new = fmaxf(m_new, s_r[r] * scale);
+            const float f = expf(m_sm[warp] - m_new);
+            float l_add = 0.0f;
+            for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) {
+                const float p = r < nrows ? expf(s_r[r] * scale - m_new) : 0.0f;
+                P_sm[warp][r] = p;
+                l_add += p;
+            }
+            l_sm[warp] = l_sm[warp] * f + l_add;
+            m_sm[warp] = m_new;
+            f_sm[warp] = f;
+        }
+        __syncthreads();
+        /* V accumulate: preload the tile's kv at (d0, d1), run heads from regs */
+        float kv0[DS4_ATTN_HG_ROWS], kv1[DS4_ATTN_HG_ROWS];
+#pragma unroll
+        for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) {
+            kv0[r] = kv_sm[r][d0];
+            kv1[r] = kv_sm[r][d1];
+        }
+#pragma unroll
+        for (uint32_t h = 0; h < DS4_ATTN_HG_HEADS; h++) {
+            const float f = f_sm[h];
+            float o0 = O0[h] * f, o1 = O1[h] * f;
+#pragma unroll
+            for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) {
+                const float p = P_sm[h][r];
+                o0 = __fmaf_rn(p, kv0[r], o0);
+                o1 = __fmaf_rn(p, kv1[r], o1);
+            }
+            O0[h] = o0; O1[h] = o1;
+        }
+        __syncthreads();
+    }
+    for (uint32_t h = 0; h < DS4_ATTN_HG_HEADS; h++) {
+        const uint32_t gh = hg * DS4_ATTN_HG_HEADS + h;
+        float *out = partials +
+            (uint64_t)(((uint64_t)t * n_head + gh) * n_split + sp) * (head_dim + 2u);
+        if (tid == 0) {
+            out[0] = m_sm[h];
+            out[1] = l_sm[h];
+        }
+        out[2u + d0] = O0[h];
+        out[2u + d1] = O1[h];
+    }
+}
+
+/* HG combine: one block per (token, head); merges the n_split partials in
+ * fixed sp-ascending order and folds in the sink (deterministic,
+ * eager==captured). */
+__global__ static void attention_decode_hg_combine_kernel(
+        float *heads,
+        const float *sinks,
+        const float *partials,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_split) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    const float *base = partials +
+        (uint64_t)(((uint64_t)t * n_head + h) * n_split) * (head_dim + 2u);
+    const uint32_t stride = head_dim + 2u;
+    __shared__ float f_sh[16];
+    __shared__ float denom_sh;
+    if (threadIdx.x == 0) {
+        const float sink = sinks[h];
+        float gm = sink;
+        for (uint32_t sp = 0; sp < n_split; sp++) gm = fmaxf(gm, base[(uint64_t)sp * stride]);
+        float denom = expf(sink - gm);
+        for (uint32_t sp = 0; sp < n_split; sp++) {
+            const float m = base[(uint64_t)sp * stride];
+            const float l = base[(uint64_t)sp * stride + 1u];
+            const float f = (m == -INFINITY) ? 0.0f : expf(m - gm);
+            f_sh[sp] = f;
+            denom += f * l;
+        }
+        denom_sh = denom;
+    }
+    __syncthreads();
+    const float denom = denom_sh;
+    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t sp = 0; sp < n_split; sp++) acc += f_sh[sp] * base[(uint64_t)sp * stride + 2u + d];
+        oh[d] = acc / denom;
+    }
+}
+
+/* HG n_split: two waves of 256-thread blocks over the n_head/8 head-group
+ * grid columns -- a pure function of device SM count + n_head (capture-
+ * safe).  GB10 (48 SMs, 64 heads): 12; proto sweep showed 12 at-or-near
+ * best across decode widths 1/2/5 and 12-24 flat.  Clamped to the partials
+ * scratch sizing (<= 16). */
+static uint32_t attention_decode_hg_n_split(uint32_t n_head) {
+    const uint32_t groups = n_head / DS4_ATTN_HG_HEADS;
+    const uint32_t sm = g_cuda_sm_count > 0 ? (uint32_t)g_cuda_sm_count : 48u;
+    uint32_t ns = (2u * sm + groups - 1u) / groups;
+    if (ns < 4u) ns = 4u;
+    if (ns > 16u) ns = 16u;
+    return ns;
 }
 
 /* Opp C Phase 1A staged prototype: dedicated sticky scratch for
@@ -19675,6 +19982,41 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
+    /* v0.4 head-group flash-decode (HG): 8 heads/block share one staged f32
+     * row tile + online-softmax row splits.  Proto-proven 6.8x over the
+     * single-block kernel at the 240K decode shape on GB10 (48 SMs) -- the
+     * older per-head split below only re-partitions rows and still re-decodes
+     * per head, which is why its own gate stayed false on GB10.  Numerics:
+     * deterministic partition + fixed-order combine (the split path's allowed
+     * class); fp8-vs-F32 identity structural (shared staged-f32 chains).
+     * DS4_CUDA_NO_ATTN_HG = diagnostic escape (A/B only), not ship state. */
+    if (head_dim == 512u && (n_head % DS4_ATTN_HG_HEADS) == 0u && !use_mask &&
+        g_attn_split_partials != NULL &&
+        getenv("DS4_CUDA_NO_ATTN_HG") == NULL) {
+        const uint32_t hg_split = attention_decode_hg_n_split(n_head);
+        const uint64_t hg_need = (uint64_t)n_head * hg_split * (head_dim + 2u) * sizeof(float);
+        if (hg_need <= g_attn_split_partials_bytes) {
+            dim3 hg_grid(hg_split, n_head / DS4_ATTN_HG_HEADS, 1);
+            attention_decode_hg_partial_kernel<<<hg_grid, 256, 0, ds4_current_stream()>>>(
+                    g_attn_split_partials,
+                    (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                    1u, 0u, n_raw, raw_cap, raw_start, n_comp,
+                    /*comp_cap=*/0u, /*window=*/0u, /*ratio=*/0u,
+                    n_head, head_dim, hg_split,
+                    /*positions=*/NULL, /*seq_id=*/NULL,
+                    (const struct ds4_decode_scalars *)scalars,
+                    ls_override,
+                    fp8_codes, fp8_sc);
+            if (!cuda_ok(cudaGetLastError(), "attention decode hg partial launch")) return 0;
+            dim3 hgc_grid(1, n_head, 1);
+            attention_decode_hg_combine_kernel<<<hgc_grid, 256, 0, ds4_current_stream()>>>(
+                    (float *)heads->ptr, sinks, g_attn_split_partials,
+                    n_head, head_dim, hg_split);
+            return cuda_ok(cudaGetLastError(), "attention decode hg combine launch");
+        }
+    }
     /* Flash-decode split: when the per-head decode grid under-fills the machine
      * (n_head < SM count, e.g. 64 heads on the PRO 6000's 188 SMs), split each
      * head's KV reduction across n_split blocks + a fixed-order combine to fill
@@ -20118,6 +20460,39 @@ static int attention_decode_batch_launch(
                                                                    fp8_codes,
                                                                    fp8_sc);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
+    }
+    /* v0.4 head-group flash-decode (HG), batch/multiseq form -- see the
+     * single-seq site + kernel comment.  Decode/verify widths only
+     * (n_tokens <= 8: plain decode, DSpark/MTP verify, coalesce widths);
+     * wide admission chunks keep the tiers above.  Mask and draft-span
+     * callers stay on the main kernel (not ported; neither is on the
+     * deep-decode ledger). */
+    if (head_dim == 512u && (n_head % DS4_ATTN_HG_HEADS) == 0u &&
+        !use_comp_mask && draft_n_raw_dev == NULL && n_tokens <= 8u &&
+        g_attn_split_partials != NULL &&
+        getenv("DS4_CUDA_NO_ATTN_HG") == NULL) {
+        const uint32_t hg_split = attention_decode_hg_n_split(n_head);
+        const uint64_t hg_need = (uint64_t)n_tokens * n_head * hg_split *
+                                 (head_dim + 2u) * sizeof(float);
+        if (hg_need <= g_attn_split_partials_bytes) {
+            dim3 hg_grid(hg_split, n_head / DS4_ATTN_HG_HEADS, n_tokens);
+            attention_decode_hg_partial_kernel<<<hg_grid, 256, 0, ds4_current_stream()>>>(
+                    g_attn_split_partials,
+                    (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                    comp_cap, window, ratio, n_head, head_dim, hg_split,
+                    pos_dev, seq_dev,
+                    s_override, ls_override,
+                    fp8_codes, fp8_sc);
+            if (!cuda_ok(cudaGetLastError(), "attention decode hg batch partial launch")) return 0;
+            dim3 hgc_grid(n_tokens, n_head, 1);
+            attention_decode_hg_combine_kernel<<<hgc_grid, 256, 0, ds4_current_stream()>>>(
+                    (float *)heads->ptr, sinks, g_attn_split_partials,
+                    n_head, head_dim, hg_split);
+            return cuda_ok(cudaGetLastError(), "attention decode hg batch combine launch");
+        }
     }
     dim3 grid(n_tokens, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
