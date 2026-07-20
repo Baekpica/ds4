@@ -25,7 +25,8 @@
 #     ORCH_TOK + 6K + max_tokens under CTX.
 #   * Self-load pins the GGUF bytes (~90.8 GiB on the ship set): small
 #     batch-fit/budget numbers on a self-load box are physics, not staleness.
-#   * NOTE: each boot kills any running ds4-server on the host.
+#   * NOTE: each boot kills any running ds4-server on the host, and the run
+#     kills its own server again on exit (PASS or FAIL).
 #
 # Env overrides (defaults in parens):
 #   DC_GATE_HOST (sync-192_168_88_33)  BINDIR (/home/ent/code/ds4-phase0)
@@ -59,6 +60,12 @@ SENT=$OUT/sentinel.log
 rm -f "$SENT"; : > "$DRV"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$DRV"; }
 fail(){ log "FAIL: $*"; echo "RUN_DONE_deepctxgate exit=1" >> "$SENT"; exit 1; }
+
+# Every exit path must kill the server this run booted: an idle gate server
+# holds ~90 GiB and /tmp/ds4.lock, blocking later ds4-bench runs on the box.
+cleanup(){ log "cleanup: killing ds4-server on $R"
+  ssh "$R" "pkill -x ds4-server; sleep 2; pkill -9 -x ds4-server; rm -f /tmp/ds4.lock; exit 0" 2>/dev/null; }
+trap cleanup EXIT
 
 # v0.2.x counter-based health (PRIMARY): /metrics snapshots + deltas mirror
 # the stderr greps in the PASS block, which stay as fallback for one release.
