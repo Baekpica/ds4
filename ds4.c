@@ -15176,6 +15176,27 @@ static bool metal_graph_encode_token_raw_swa(
                       | (compressed     ? 4u  : 0u)
                       | (ratio4         ? 8u  : 0u)
                       | (window_sliding ? 16u : 0u);
+            /* forum-#65: key the n_comp BAND (the topk tier ladder, with the
+             * last band split at the attention score-buffer fits boundary,
+             * DS4_CUDA_ATTENTION_SCORE_CAP - raw cap = 7936).  Without it a
+             * graph captured just past the indexer turn-on (n_comp ~514)
+             * replayed for the entire session; once live n_comp crossed the
+             * fits boundary the baked dense-mixed kernel overflowed its
+             * score smem into raw_rows[] (sanitizer-verified wild reads in
+             * the raw V loop).  Band crossings are log2-rare, so the extra
+             * recaptures are noise; each recapture re-evaluates the
+             * capture-time tier/fits decisions at the new band. */
+            {
+                const uint32_t nc = g->layer_n_comp[il];
+                const uint32_t nc_band = nc == 0u    ? 0u
+                                       : nc <= 1024u ? 1u
+                                       : nc <= 2048u ? 2u
+                                       : nc <= 4096u ? 3u
+                                       : nc <= 7936u ? 4u
+                                       : nc <= 8192u ? 5u
+                                       : 6u;
+                key.flags |= nc_band << 5;
+            }
             /* ds4_gpu_tensor is opaque to ds4.c -- use the accessor. */
             key.cur_hc            = (void *)ds4_gpu_tensor_ptr(g->cur_hc);
             key.after_ffn_hc      = (void *)ds4_gpu_tensor_ptr(g->after_ffn_hc);

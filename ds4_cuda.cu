@@ -653,6 +653,17 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     }
     if (bytes < floor_bytes) bytes = floor_bytes;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
+    /* forum-#65: growth under capture is unservable -- the invalidator
+     * below would refuse (execs can't be destroyed mid-capture) yet the
+     * cudaFree/cudaMalloc pair would still run and poison the capture
+     * with sticky errors.  Refuse cleanly instead; callers already treat
+     * NULL as a failed (and reported) op.  Post the warmed-flag fix this
+     * is defense-in-depth: the re-run warm pass sizes us eagerly first. */
+    if (ds4_capture_active()) {
+        fprintf(stderr, "ds4: cuda_tmp growth refused under capture (%s, %.2f MiB)\n",
+                what ? what : "scratch", (double)bytes / 1048576.0);
+        return NULL;
+    }
     if (g_cuda_tmp) {
         /* Free-while-in-flight hardening (2026-07-13 warm-admit crash
          * audit; exonerated for that crash, kept as hardening): the
@@ -7668,6 +7679,18 @@ __global__ static void attention_decode_mixed_kernel(
     if (positions && ratio != 0u && !single_all && visible_comp > qpos / ratio)
         visible_comp = qpos / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
+    /* forum-#65 hardening: scores[] is DS4_CUDA_ATTENTION_SCORE_CAP entries
+     * and raw_count can reach 256 -- n_score past the cap clobbers
+     * raw_rows[] (the adjacent smem array) and the V pass then dereferences
+     * score bit-patterns as ring row ids (sanitizer: wild global reads in
+     * the raw V loop).  Healthy dispatch can't get here (the fits check
+     * gates the launch at n_comp <= CAP-256), but a REPLAYED graph whose
+     * live ls->n_comp crossed the boundary could -- seen via the serial
+     * layer-graph cache in the ds4-bench 131k-alloc sweep (NVIDIA forum
+     * #65).  The clamp only engages in states that would otherwise corrupt
+     * smem; the band-keyed graph cache makes those unreachable again. */
+    if (visible_comp > DS4_CUDA_ATTENTION_SCORE_CAP - 256u)
+        visible_comp = DS4_CUDA_ATTENTION_SCORE_CAP - 256u;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
@@ -8471,6 +8494,14 @@ static float *fp8_predecode_scratch_alloc(uint64_t bytes) {
     if (g_fp8_predecode_scratch_bytes >= bytes) {
         return (float *)g_fp8_predecode_scratch;
     }
+    /* forum-#65: growth is impossible under capture -- the cudaMalloc
+     * below would both fail AND stick a sticky error onto the in-flight
+     * capture ('operation failed due to a previous error during capture'
+     * cascade).  Refuse cleanly BEFORE touching the API: every caller
+     * treats NULL as 'fall back to the in-kernel fp8 read path', which is
+     * capture-safe and bit-identical.  With the warmed-flag fix in the
+     * invalidator this branch is defense-in-depth, not the primary path. */
+    if (ds4_capture_active()) return NULL;
     void *ptr = NULL;
     cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
     if (err != cudaSuccess) {
@@ -15805,6 +15836,14 @@ static void ds4_cuda_invalidate_captured_graphs(const char *why) {
         cudaGraphExecDestroy(g_layer_graphs[i].exec);
         g_layer_graphs[i].valid = 0;
         g_layer_graphs[i].hits = 0;
+        /* forum-#65: a recapture after invalidation must RE-RUN the eager
+         * warm pass -- the warm is what pre-sizes the lazy allocators
+         * (cuda_tmp, fp8 predecode) so no cudaMalloc lands inside the
+         * fresh capture.  Leaving warmed=1 skipped it, and the first
+         * post-invalidation capture at a larger shape aborted mid-capture
+         * on 'operation not permitted when stream is capturing'
+         * (ds4-bench --ctx-alloc 131201 sweep, NVIDIA forum #65). */
+        g_layer_graphs[i].warmed = 0;
         n++;
     }
     for (uint32_t i = 0; i < DS4_DENSE_GRAPH_CACHE_SIZE; i++) {
