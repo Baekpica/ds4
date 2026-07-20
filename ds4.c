@@ -34367,13 +34367,23 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * additionally skips ring injection (a row at position >= the threshold can
      * never be read by a spec-active drafter window, because spec-active requires
      * posv < the threshold and posv only grows).  One-way per request, lossless
-     * either way.  Default 65536, set by the 2026-07-11 default-decision probes
-     * (healthy-boot .33 data): spec still wins at 49k on BOTH prose (1.10-1.49x)
-     * and code (1.19x) -- the loss regime starts at ~64k+ (prose 0.90x, 0.75x at
-     * 64-112k in the .15 sweep; code hits breakeven 1.02x at 65k).  Structured
-     * content crosses latest -- raise further for code-heavy serving.
-     * 0 disables the gate (= spec at any depth). */
-    uint32_t dspark_max_kv = 65536u;
+     * either way.  0 disables the gate (= spec at any depth).
+     *
+     * DEFAULT 0 since 2026-07-20: the original 65536 was set by the
+     * 2026-07-11 probes (loss regime ~64k+, prose 0.75-0.90x) -- but that
+     * loss was the VERIFY TAX of the pre-HG attention kernels, not
+     * acceptance decay.  With head-group flash-decode (17a7d76) and the
+     * indexed gather variant (the width-5 verify launches that priced the
+     * deep spec step), re-measured on fresh boots: 240K prose A/B/B/A =
+     * exact parity (accept 64-65%, tok/step 2.56-2.61), 515K prose pair =
+     * spec WINS 67.6 vs 73.6 ms/tok (-8.2%, accept 74.1%, tok/step 3.04 at
+     * ~514K).  Prose is the documented accept floor, so deeper-crossing
+     * content only gains more.  QUENCH (default on) remains the runtime
+     * governor for pathological/decaying content -- per-request,
+     * re-entrant, content-adaptive -- which is exactly the job a static
+     * depth cutoff was approximating.  Set DS4_DSPARK_MAX_KV>0 to restore
+     * a hard cutoff. */
+    uint32_t dspark_max_kv = 0u;
     { const char *ke = getenv("DS4_DSPARK_MAX_KV"); if (ke && ke[0]) { long v = atol(ke); if (v >= 0) dspark_max_kv = (uint32_t)v; } }
     /* D4.5g ADAPTIVE kv gate (opt-in, DS4_DSPARK_ADAPT_GATE=1): the static gate above
      * is calibrated on PROSE (the weakest-acceptance content); structured content
@@ -34392,6 +34402,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         fprintf(stderr, "ds4: DS4_DSPARK_QUENCH supersedes DS4_DSPARK_ADAPT_GATE (mutually exclusive controllers)\n");
         dspark_adapt_gate = 0;
     }
+    /* COUPLING TRAP: ADAPT_START defaults to DS4_DSPARK_MAX_KV, and the
+     * max_kv default flipped to 0 (2026-07-20) -- so an opt-in adapt-gate
+     * run (quench disabled) now starts its measure-and-switch controller
+     * at depth 0 unless DS4_DSPARK_ADAPT_START is set explicitly.  That is
+     * coherent behavior (the controller simply governs from the first
+     * token), but it is NOT the pre-flip behavior of "hard spec until 64k,
+     * then adapt": set DS4_DSPARK_ADAPT_START=65536 to reproduce that. */
     uint32_t dspark_adapt_start = dspark_max_kv;
     { const char *ae = getenv("DS4_DSPARK_ADAPT_START"); if (ae && ae[0]) { long v = atol(ae); if (v >= 0) dspark_adapt_start = (uint32_t)v; } }
     uint32_t dspark_adapt_win = 64u;   /* probe/first-estimate window, tokens */
