@@ -2587,6 +2587,60 @@ __global__ void q8_0_aligned_dense_vec_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+// Verify-width variant (v0.4 dense chase, proto_q8_aligned_nc): same aligned
+// weight stream read ONCE per row, NC output columns accumulated per lane
+// against col-strided q8_1 activations (which L1/L2-broadcast across rows).
+// Bytes identical to the N=1 kernel, so it holds the aligned tier's rate at
+// the spec-verify widths where the raw-block mmvq fallback ran 90-200 GB/s
+// (proto: +17..+87% per shape, family within 4% of the weight-bytes floor).
+// out is column-major [NC][M], the engine's [n_tok, out_dim] flattening.
+template <int NC>
+__global__ void q8_0_aligned_dense_vec_nc_kernel(
+        float             *out,        // [NC * M]
+        const int4        *qs,         // aligned codes, 2 int4 per block
+        const __half      *dq,         // block scales
+        const block_q8_1  *x8,         // [NC * nb], col stride nb
+        int                M,
+        int                nb)         // blocks per row = K/32
+{
+    const int row  = blockIdx.x;
+    const int lane = threadIdx.x;
+    const long long rbase = (long long)row * nb;
+
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; c++) acc[c] = 0.0f;
+
+    for (int b0 = 0; b0 < nb; b0 += 32) {
+        const int b = b0 + lane;
+        const int4 w0 = qs[(rbase + b) * 2 + 0];   // aligned 16B, read once
+        const int4 w1 = qs[(rbase + b) * 2 + 1];
+        const float dw = __half2float(dq[rbase + b]);
+#pragma unroll
+        for (int c = 0; c < NC; c++) {
+            const block_q8_1 *xb = &x8[(size_t)c * nb + b];
+            const int *u = (const int *)xb->qs;
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
+            sumi = ggml_cuda_dp4a(w0.y, u[1], sumi);
+            sumi = ggml_cuda_dp4a(w0.z, u[2], sumi);
+            sumi = ggml_cuda_dp4a(w0.w, u[3], sumi);
+            sumi = ggml_cuda_dp4a(w1.x, u[4], sumi);
+            sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
+            sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
+            sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
+            acc[c] += dw * __low2float(xb->ds) * (float)sumi;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc[c] += __shfl_down_sync(0xffffffffu, acc[c], off);
+        if (lane == 0) out[(size_t)c * M + row] = acc[c];
+    }
+}
+
 extern "C" uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K) {
     if (M <= 0 || K <= 0 || K % 1024 != 0) return 0;
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
@@ -2603,7 +2657,9 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
         return -1;
     }
     // K % 1024: the kernel's 32-blocks-per-pass loop needs nb % 32 == 0.
-    if (N != 1 || M <= 0 || K <= 0 || K % 1024 != 0) return -1;
+    // N covers the decode/verify-width envelope (mmvq batch bound); K % 1024
+    // also guarantees ne10_padded == K, so the q8_1 col stride is exactly nb.
+    if (N < 1 || N > 8 || M <= 0 || K <= 0 || K % 1024 != 0) return -1;
 
     const int dev = ggml_cuda_get_device();
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
@@ -2613,11 +2669,12 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     }
     ds4_pool_set_stream(stream);
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
-    const size_t  nbytes_q8_1 = (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+    const size_t  nbytes_q8_1 = (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
     ggml_cuda_pool_alloc<char> q8_pool;
     // M2-Inc2a: producer-emitted q8_1 codes (qr_norm from the qkv-rms
-    // kernel) -- take them and skip the quantize prelude.
-    char *x8 = ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded);
+    // kernel) -- take them and skip the quantize prelude.  Single-column
+    // producers only; verify widths always quantize.
+    char *x8 = N == 1 ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded) : NULL;
     cudaError_t err;
     if (!x8) {
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
@@ -2629,8 +2686,8 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     quantize_row_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)x8,
         GGML_TYPE_Q8_0, /*ne00=*/K,
-        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K,
-        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
+        /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
         stream);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -2641,11 +2698,22 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
 
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
     const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
-    q8_0_aligned_dense_vec_kernel<<<(unsigned)M, 32, 0, stream>>>(
-        out_f32,
-        (const int4 *)((const char *)W_aligned + dq_bytes),
-        (const __half *)W_aligned,
-        (const block_q8_1 *)x8, M, K / 32);
+    const int4   *qsp = (const int4 *)((const char *)W_aligned + dq_bytes);
+    const __half *dqp = (const __half *)W_aligned;
+    const block_q8_1 *x8p = (const block_q8_1 *)x8;
+    switch (N) {
+    case 1:
+        q8_0_aligned_dense_vec_kernel<<<(unsigned)M, 32, 0, stream>>>(
+            out_f32, qsp, dqp, x8p, M, K / 32);
+        break;
+    case 2: q8_0_aligned_dense_vec_nc_kernel<2><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
+    case 3: q8_0_aligned_dense_vec_nc_kernel<3><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
+    case 4: q8_0_aligned_dense_vec_nc_kernel<4><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
+    case 5: q8_0_aligned_dense_vec_nc_kernel<5><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
+    case 6: q8_0_aligned_dense_vec_nc_kernel<6><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
+    case 7: q8_0_aligned_dense_vec_nc_kernel<7><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
+    case 8: q8_0_aligned_dense_vec_nc_kernel<8><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
+    }
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));

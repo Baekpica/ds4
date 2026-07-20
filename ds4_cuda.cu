@@ -17339,13 +17339,20 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
         }
 
         /* M1-Inc3: aligned-SoA Q8_0 artifact (weight server
-         * --repack-q8-aligned, additive — raw stays served).  Decode-width
-         * only; wider mmvq batches keep the raw entry.  proto_q8_aligned:
+         * --repack-q8-aligned, additive — raw stays served).  proto_q8_aligned:
          * attn_q_b 217->235, mid 172->218, out_a 199->230, head 224->243
          * GB/s, and the warp-per-row accumulation is closer to the double
-         * reference than the mmvq tile order. */
+         * reference than the mmvq tile order.  v0.4 dense chase: widths
+         * 2..8 (DSpark verify steps) ride the same artifacts via the NC
+         * kernel (proto_q8_aligned_nc: mmvq at w5 ran 90-200 GB/s, aligned
+         * NC holds the N=1 tier's rate); DS4_CUDA_NO_Q8_ALIGNED_NC restores
+         * the raw mmvq tier for N>1 as a diagnostic escape. */
+        static int q8_aligned_nc_en = -1;
+        if (q8_aligned_nc_en < 0)
+            q8_aligned_nc_en = getenv("DS4_CUDA_NO_Q8_ALIGNED_NC") == NULL;
         int rc = -1;
-        if (n_tok == 1u && in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
+        if ((n_tok == 1u || (n_tok <= 8u && q8_aligned_nc_en)) &&
+            in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
             const uint64_t q8_al_bytes = ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
             const char *w_aligned = q8_al_bytes != 0
                 ? cuda_derived_weight_ptr(model_map, weight_offset, weight_bytes,
@@ -17355,7 +17362,7 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
             if (w_aligned) {
                 rc = ds4_mmq_q8_0_aligned_dense_vec(w_aligned, (const float *)x->ptr,
                                                     (float *)out->ptr,
-                                                    (int)out_dim, 1, (int)in_dim,
+                                                    (int)out_dim, (int)n_tok, (int)in_dim,
                                                     moe_stream);
                 if (rc == 0) {
                     static int logged = 0;
