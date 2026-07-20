@@ -8475,6 +8475,250 @@ static uint32_t attention_decode_hg_n_split(uint32_t n_head) {
     return ns;
 }
 
+/* ---- v0.4 indexed-HG gather flash-decode ----
+ * attention_indexed_mixed_kernel has the same disease the HG rewrite above
+ * cured in the dense kernel: one block per (token, head), every head
+ * re-reading the same top_k-selected compressed rows (cont decode truth:
+ * tslot predecode + main kernel at ALL widths 1-8, 156-653 us isolated).
+ * Same HG skeleton, but the row domain is raw_count + top_k FIXED slots:
+ * an invalid topk entry (c < 0 or c >= visible) contributes p=0 exactly
+ * like a pad row past nrows, so there is no compaction scan and no
+ * atomics -- order is the topk slot order, deterministic by construction
+ * (the baseline's single-thread serial fill exists only to order
+ * comp_rows[]; a fixed domain needs no ordering pass).  fp8 rows decode
+ * once per head-group tile, which also retires the separate tslot
+ * predecode launch on this path.  Proto: cuda/mmq/test/proto_attn_gather.cu
+ * (2026-07-20): 240K w1 156.7 -> 43.5 us (split 12), verify w5 652.8 ->
+ * 158 us; sorted-vs-unsorted ids move nothing (locality lever dead);
+ * scalar-coop convergence ~4x above the ~10 us instruction floor, same
+ * class as the dense HG chase -- V3 HMMA stays the banked lever for both.
+ *
+ * Numerics: same online-softmax partials + fixed-order combine class as
+ * the dense HG kernel (attention_decode_hg_combine_kernel is reused
+ * verbatim); fp8-vs-F32 identity is structural (one staged-f32 chain).
+ * NaN law (proto-earned): a tile whose rows are ALL invalid leaves
+ * m_new == -INF and expf(m_sm - m_new) = expf(-INF - -INF) = NaN, which
+ * poisons l/O for the whole chunk -- the f=1 guard below is mandatory,
+ * and (harness law) plain max-loop oracles SWALLOW NaN (std::max(0,NaN)
+ * returns 0), so proto oracles must saturate non-finite errors. */
+__global__ static void __launch_bounds__(256, 4) attention_indexed_hg_partial_kernel(
+        float *partials,        /* [((t*n_head+h)*n_split+sp)*(head_dim+2)] = {m, l, acc[]} */
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const int32_t * __restrict__ topk,
+        uint32_t n_tokens,
+        uint32_t raw_cap,
+        uint32_t n_comp,
+        uint32_t comp_cap,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim,      /* dispatch-guarded == 512 */
+        uint32_t n_split,
+        const int32_t * __restrict__ positions,   /* dispatch-guarded != NULL */
+        const int32_t * __restrict__ seq_id,
+        /* C1 capture substrate.  The decode-scalars fields (n_raw/raw_start/
+         * pos0) are all SUPERSEDED by the per-row positions[] derivation in
+         * a positions-only kernel (same dead-under-positions property as the
+         * generic kernels), so s_override is accepted for call-site
+         * congruence but never read.  ls_override carries the LIVE n_comp --
+         * without it a captured node replays the bake-time visible clamp
+         * (the PC5 frozen-scalar class). */
+        const struct ds4_decode_scalars * __restrict__ s_override,
+        const struct ds4_layer_scalars  * __restrict__ ls_override,
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
+    __shared__ float kv_sm[DS4_ATTN_HG_ROWS][512 + 4];
+    __shared__ float P_sm[DS4_ATTN_HG_HEADS][DS4_ATTN_HG_ROWS];
+    __shared__ float m_sm[DS4_ATTN_HG_HEADS];
+    __shared__ float l_sm[DS4_ATTN_HG_HEADS];
+    __shared__ float f_sm[DS4_ATTN_HG_HEADS];
+    __shared__ int32_t rowc_sm[DS4_ATTN_HG_ROWS];   /* comp pool id, -1 = invalid */
+    (void)s_override;
+    if (ls_override) {
+        n_comp = ls_override->n_comp;
+    }
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
+    if (use_fp8 && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_indexed_read_path_blocks, 1ull);
+    }
+    const uint32_t sp = blockIdx.x;
+    const uint32_t hg = blockIdx.y;
+    const uint32_t t  = blockIdx.z;
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (t >= n_tokens || positions == NULL) return;
+    const uint32_t qpos = (uint32_t)positions[t];
+    uint32_t row_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+    if (row_n_raw > raw_cap) row_n_raw = raw_cap;
+    const uint32_t row_raw_start = (qpos + 1u - row_n_raw) % raw_cap;
+    const uint32_t raw_count = row_n_raw > 256u ? 256u : row_n_raw;
+    uint32_t visible = 0;
+    if (ratio != 0u && n_comp != 0u) {
+        visible = (qpos + 1u) / ratio;
+        if (visible > qpos / ratio) visible = qpos / ratio;
+        if (visible > n_comp) visible = n_comp;
+    }
+    const uint32_t seq_base      = seq_id ? (uint32_t)seq_id[t] * raw_cap : 0u;
+    const uint32_t comp_seq_base = seq_id ? (uint32_t)seq_id[t] * comp_cap : 0u;
+    const uint32_t n_dom = raw_count + top_k;
+    const uint32_t chunk = (n_dom + n_split - 1u) / n_split;
+    const uint32_t lo = sp * chunk;
+    uint32_t hi = lo + chunk;
+    if (hi > n_dom) hi = n_dom;
+    const float scale = rsqrtf((float)head_dim);
+    /* q for this warp's head, in registers (head_dim 512 / 32 lanes). */
+    float q_reg[16];
+    {
+        const uint32_t h = hg * DS4_ATTN_HG_HEADS + warp;
+        const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+#pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) q_reg[k] = qh[lane + 32u * k];
+    }
+    if (tid < DS4_ATTN_HG_HEADS) { m_sm[tid] = -INFINITY; l_sm[tid] = 0.0f; }
+    __syncthreads();
+    const uint32_t d0 = (tid * 2u) & 511u;
+    const uint32_t d1 = d0 + 1u;
+    float O0[DS4_ATTN_HG_HEADS], O1[DS4_ATTN_HG_HEADS];
+#pragma unroll
+    for (uint32_t h = 0; h < DS4_ATTN_HG_HEADS; h++) { O0[h] = 0.0f; O1[h] = 0.0f; }
+
+    for (uint32_t tile = lo; tile < hi; tile += DS4_ATTN_HG_ROWS) {
+        const uint32_t nrows = (hi - tile) < DS4_ATTN_HG_ROWS ? (hi - tile) : DS4_ATTN_HG_ROWS;
+        /* Resolve this tile's topk ids (one thread per row; broadcast reads). */
+        if (tid < DS4_ATTN_HG_ROWS) {
+            int32_t c = -1;
+            const uint32_t row = tile + tid;
+            if (tid < nrows && row >= raw_count) {
+                const int32_t ci = topk[(uint64_t)t * top_k + (row - raw_count)];
+                if (ci >= 0 && (uint32_t)ci < visible) c = ci;
+            }
+            rowc_sm[tid] = c;
+        }
+        __syncthreads();
+        /* Stage-decode the tile into f32 smem once for the whole head group.
+         * Pad AND invalid rows are ZEROED (a stale-NaN row survives P=0). */
+        for (uint32_t i4 = tid; i4 < DS4_ATTN_HG_ROWS * 128u; i4 += blockDim.x) {
+            const uint32_t r = i4 >> 7u;
+            const uint32_t d = (i4 & 127u) * 4u;
+            float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+            if (r < nrows) {
+                const uint32_t row = tile + r;
+                if (row < raw_count) {
+                    const uint32_t rr = seq_base + ((row_raw_start + row) % raw_cap);
+                    const float4 f4 = *(const float4 *)(raw_kv + (uint64_t)rr * head_dim + d);
+                    v0 = f4.x; v1 = f4.y; v2 = f4.z; v3 = f4.w;
+                } else if (rowc_sm[r] >= 0) {
+                    const uint32_t c = comp_seq_base + (uint32_t)rowc_sm[r];
+                    if (use_fp8) {
+                        const unsigned char *cp = comp_fp8 +
+                            (uint64_t)c * DS4_OPP_C_FP8_ROW_BYTES_DEV;
+                        if (d < DS4_OPP_C_FP8_NOPE_DEV) {
+                            const uchar4 q4 = *(const uchar4 *)(cp + d);
+                            const float sc = comp_scale[(uint64_t)c *
+                                                        DS4_OPP_C_FP8_BLOCKS_DEV + (d >> 6u)];
+                            const float m0 = dsv4_e4m3fn_decode_table[q4.x & 0x7fu];
+                            const float m1 = dsv4_e4m3fn_decode_table[q4.y & 0x7fu];
+                            const float m2 = dsv4_e4m3fn_decode_table[q4.z & 0x7fu];
+                            const float m3 = dsv4_e4m3fn_decode_table[q4.w & 0x7fu];
+                            v0 = ((q4.x & 0x80u) ? -m0 : m0) * sc;
+                            v1 = ((q4.y & 0x80u) ? -m1 : m1) * sc;
+                            v2 = ((q4.z & 0x80u) ? -m2 : m2) * sc;
+                            v3 = ((q4.w & 0x80u) ? -m3 : m3) * sc;
+                        } else {
+                            const float4 f4 = *(const float4 *)(cp + DS4_OPP_C_FP8_NOPE_DEV +
+                                (uint64_t)(d - DS4_OPP_C_FP8_NOPE_DEV) * sizeof(float));
+                            v0 = f4.x; v1 = f4.y; v2 = f4.z; v3 = f4.w;
+                        }
+                    } else {
+                        const float4 f4 = *(const float4 *)(comp_kv +
+                            (uint64_t)c * head_dim + d);
+                        v0 = f4.x; v1 = f4.y; v2 = f4.z; v3 = f4.w;
+                    }
+                }
+            }
+            kv_sm[r][d]      = v0;
+            kv_sm[r][d + 1u] = v1;
+            kv_sm[r][d + 2u] = v2;
+            kv_sm[r][d + 3u] = v3;
+        }
+        __syncthreads();
+        /* warp-per-head dots from smem, q from registers */
+        float s_r[DS4_ATTN_HG_ROWS];
+#pragma unroll
+        for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) s_r[r] = 0.0f;
+#pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) {
+            const uint32_t d = lane + 32u * k;
+            const float qv = q_reg[k];
+#pragma unroll
+            for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++)
+                s_r[r] = __fmaf_rn(qv, kv_sm[r][d], s_r[r]);
+        }
+#pragma unroll
+        for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) {
+            for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                s_r[r] += __shfl_down_sync(0xffffffffu, s_r[r], off);
+        }
+        if (lane == 0) {
+            float m_new = m_sm[warp];
+            for (uint32_t r = 0; r < nrows; r++) {
+                const bool valid = (tile + r < raw_count) || rowc_sm[r] >= 0;
+                if (valid) m_new = fmaxf(m_new, s_r[r] * scale);
+            }
+            /* All-invalid tile guard (see kernel comment): m_new can stay
+             * -INF here; f=1 is exact (l_add 0, O rescale must be no-op). */
+            const float f = (m_new == -INFINITY) ? 1.0f : expf(m_sm[warp] - m_new);
+            float l_add = 0.0f;
+            for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) {
+                const bool valid = r < nrows &&
+                    ((tile + r < raw_count) || rowc_sm[r] >= 0);
+                const float p = valid ? expf(s_r[r] * scale - m_new) : 0.0f;
+                P_sm[warp][r] = p;
+                l_add += p;
+            }
+            l_sm[warp] = l_sm[warp] * f + l_add;
+            m_sm[warp] = m_new;
+            f_sm[warp] = f;
+        }
+        __syncthreads();
+        /* V accumulate: preload the tile's kv at (d0, d1), run heads from regs */
+        float kv0[DS4_ATTN_HG_ROWS], kv1[DS4_ATTN_HG_ROWS];
+#pragma unroll
+        for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) {
+            kv0[r] = kv_sm[r][d0];
+            kv1[r] = kv_sm[r][d1];
+        }
+#pragma unroll
+        for (uint32_t h = 0; h < DS4_ATTN_HG_HEADS; h++) {
+            const float f = f_sm[h];
+            float o0 = O0[h] * f, o1 = O1[h] * f;
+#pragma unroll
+            for (uint32_t r = 0; r < DS4_ATTN_HG_ROWS; r++) {
+                const float p = P_sm[h][r];
+                o0 = __fmaf_rn(p, kv0[r], o0);
+                o1 = __fmaf_rn(p, kv1[r], o1);
+            }
+            O0[h] = o0; O1[h] = o1;
+        }
+        __syncthreads();
+    }
+    for (uint32_t h = 0; h < DS4_ATTN_HG_HEADS; h++) {
+        const uint32_t gh = hg * DS4_ATTN_HG_HEADS + h;
+        float *out = partials +
+            (uint64_t)(((uint64_t)t * n_head + gh) * n_split + sp) * (head_dim + 2u);
+        if (tid == 0) {
+            out[0] = m_sm[h];
+            out[1] = l_sm[h];
+        }
+        out[2u + d0] = O0[h];
+        out[2u + d1] = O1[h];
+    }
+}
+
 /* Opp C Phase 1A staged prototype: dedicated sticky scratch for
  * pre-decoded FP8 -> FP32 compressed rows.  Lifetime is the process;
  * grows monotonically with the largest n_comp seen.  Kept separate from
@@ -20734,6 +20978,45 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
     const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    /* v0.4 indexed-HG gather (see kernel comment): the cont serving path
+     * (per-seq, decode/verify widths <= 8) leaves the predecode+main pair
+     * below for the HG skeleton -- and needs neither the tslot predecode
+     * nor the n_tokens>1 id sort (order is fixed by the slot domain).
+     * C1 capture steps pass the substrates (scalars + il); the kernel
+     * takes ls_override for the live n_comp clamp and ignores the
+     * positions-superseded decode scalars, so captured and eager steps
+     * share this tier.  Serial callers (pos_dev == NULL) and wide chunks
+     * keep every tier below unchanged.  n_split/partials are the same
+     * capture-stable pair as the dense HG sites. */
+    if (head_dim == 512u && (n_head % DS4_ATTN_HG_HEADS) == 0u &&
+        n_tokens <= 8u && pos_dev != NULL &&
+        g_attn_split_partials != NULL &&
+        getenv("DS4_CUDA_NO_ATTN_HG") == NULL &&
+        getenv("DS4_CUDA_NO_ATTN_HG_GATHER") == NULL) {
+        const uint32_t hg_split = attention_decode_hg_n_split(n_head);
+        const uint64_t hg_need = (uint64_t)n_tokens * n_head * hg_split *
+                                 (head_dim + 2u) * sizeof(float);
+        if (hg_need <= g_attn_split_partials_bytes) {
+            dim3 hg_grid(hg_split, n_head / DS4_ATTN_HG_HEADS, n_tokens);
+            attention_indexed_hg_partial_kernel<<<hg_grid, 256, 0, ds4_current_stream()>>>(
+                    g_attn_split_partials,
+                    (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    (const float *)comp_kv->ptr,
+                    topk_ptr,
+                    n_tokens, raw_cap, n_comp, comp_cap, top_k,
+                    window, ratio, n_head, head_dim, hg_split,
+                    pos_dev, seq_dev,
+                    (const struct ds4_decode_scalars *)scalars, ls_override,
+                    fp8_codes, fp8_sc);
+            if (!cuda_ok(cudaGetLastError(), "attention indexed hg partial launch")) return 0;
+            dim3 hgc_grid(n_tokens, n_head, 1);
+            attention_decode_hg_combine_kernel<<<hgc_grid, 256, 0, ds4_current_stream()>>>(
+                    (float *)heads->ptr, sinks, g_attn_split_partials,
+                    n_head, head_dim, hg_split);
+            return cuda_ok(cudaGetLastError(), "attention indexed hg combine launch");
+        }
+    }
     if (ds4_cuda_attn_tokentile_enabled() &&
         n_tokens >= 128u && head_dim == kTTHeadDim && n_head == 64u &&
         top_k == 512u && window == kTTRawWindow && ratio != 0u &&
