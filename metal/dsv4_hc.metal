@@ -89,16 +89,16 @@ struct ds4_metal_args_dsv4_hc_expand {
 // logits on M5 Max, while the historical inline exp form remains finite and is
 // the decode throughput baseline.
 #ifdef DS4_METAL_HC_STABLE
-static inline float  ds4_hc_sigmoid(float  z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
-static inline float4 ds4_hc_sigmoid(float4 z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
+static inline float  ds4_hc_sigmoid(float  z)  { z = clamp(z, -30.0f, 30.0f); return 0.5f * tanh(0.5f * z) + 0.5f; }
+static inline float4 ds4_hc_sigmoid(float4 z)  { z = clamp(z, float4(-30.0f), float4(30.0f)); return 0.5f * tanh(0.5f * z) + 0.5f; }
 // 2 * sigmoid(z) == 1 + tanh(z/2).
-static inline float  ds4_hc_twice_sigmoid(float  z) { return 1.0f + tanh(0.5f * z); }
-static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 1.0f + tanh(0.5f * z); }
+static inline float  ds4_hc_twice_sigmoid(float  z) { z = clamp(z, -30.0f, 30.0f); return 1.0f + tanh(0.5f * z); }
+static inline float4 ds4_hc_twice_sigmoid(float4 z) { z = clamp(z, float4(-30.0f), float4(30.0f)); return 1.0f + tanh(0.5f * z); }
 #else
-static inline float  ds4_hc_sigmoid(float  z)  { return 1.0f / (1.0f + exp(-z)); }
-static inline float4 ds4_hc_sigmoid(float4 z)  { return 1.0f / (1.0f + exp(-z)); }
-static inline float  ds4_hc_twice_sigmoid(float  z) { return 2.0f / (1.0f + exp(-z)); }
-static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 2.0f / (1.0f + exp(-z)); }
+static inline float  ds4_hc_sigmoid(float  z)  { z = clamp(z, -30.0f, 30.0f); return 1.0f / (1.0f + exp(-z)); }
+static inline float4 ds4_hc_sigmoid(float4 z)  { z = clamp(z, float4(-30.0f), float4(30.0f)); return 1.0f / (1.0f + exp(-z)); }
+static inline float  ds4_hc_twice_sigmoid(float  z) { z = clamp(z, -30.0f, 30.0f); return 2.0f / (1.0f + exp(-z)); }
+static inline float4 ds4_hc_twice_sigmoid(float4 z) { z = clamp(z, float4(-30.0f), float4(30.0f)); return 2.0f / (1.0f + exp(-z)); }
 #endif
 
 // Splits an HC mixer row into pre weights, post gates, and the HC-to-HC

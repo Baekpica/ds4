@@ -6876,7 +6876,25 @@ int ds4_gpu_matmul_f32_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX || n_tok != 1) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX || n_tok == 0) return 0;
+
+    /* F32 plain matmul previously supported n_tok==1 only (GEMV); batched
+     * callers (e.g. the DSpark drafter block's F32 HC-mixer at n_tok=R)
+     * hit the n_tok!=1 early-return.  Run n_tok independent GEMVs over
+     * per-row views; byte-identical for n_tok==1. */
+    if (n_tok != 1) {
+        int ok_all = 1;
+        for (uint64_t t = 0; t < n_tok && ok_all; t++) {
+            ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, t * in_dim * sizeof(float), in_dim * sizeof(float));
+            ds4_gpu_tensor *outr = ds4_gpu_tensor_view(out, t * out_dim * sizeof(float), out_dim * sizeof(float));
+            ok_all = xr && outr &&
+                     ds4_gpu_matmul_f32_tensor(outr, model_map, model_size, weight_offset,
+                                               in_dim, out_dim, xr, 1);
+            if (xr) ds4_gpu_tensor_free(xr);
+            if (outr) ds4_gpu_tensor_free(outr);
+        }
+        return ok_all;
+    }
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
@@ -9582,7 +9600,9 @@ int ds4_gpu_compressor_update_tail_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx) {
+        uint32_t                row_idx,
+        int                     output_is_f16) {
+    (void)output_is_f16;
     (void)kv_cur; (void)sc_cur; (void)state_kv; (void)state_score;
     (void)comp_cache; (void)model_map; (void)model_size; (void)ape_offset;
     (void)ape_type; (void)norm_offset; (void)norm_type; (void)head_dim;
@@ -9622,7 +9642,8 @@ int ds4_gpu_compressor_update_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx) {
+        uint32_t                row_idx,
+        int                     output_is_f16) {
     (void)il;         /* Metal kernels read inline args; no per-layer substrate. */
     (void)row_field;  /* PC2: substrate selector ignored on Metal. */
     (void)positions; (void)row_idx;  /* CUDA-only substrate. */
@@ -9641,10 +9662,16 @@ int ds4_gpu_compressor_update_tensor(
         const uint32_t width = coff * head_dim;
         const uint32_t state_rows = coff * ratio;
         const uint32_t emit = ((pos + 1u) % ratio) == 0u ? 1u : 0u;
+        /* The banked attn emit passes an F16 comp cache; pool/rms/rope write
+         * device float*, so an f32-offset view into the F16 buffer corrupts
+         * the row.  When output_is_f16, emit into an F32 scratch then
+         * copy_f32_to_f16 into the cache row. */
+        const bool use_f16_fix = output_is_f16 != 0;
+        const uint64_t comp_elem = use_f16_fix ? sizeof(uint16_t) : sizeof(float);
         const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
         const uint64_t kv_bytes = (uint64_t)width * sizeof(float);
         const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
-        const uint64_t comp_bytes = (uint64_t)(comp_row + (emit ? 1u : 0u)) * head_dim * sizeof(float);
+        const uint64_t comp_bytes = (uint64_t)(comp_row + (emit ? 1u : 0u)) * head_dim * comp_elem;
         const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
         const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
 
@@ -9700,7 +9727,11 @@ int ds4_gpu_compressor_update_tensor(
         }
         if (!emit) return 1;
 
-        ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
+        /* F16 cache -> emit into an F32 scratch (converted below); else the
+         * original f32 view straight into the (F32) comp cache row. */
+        ds4_gpu_tensor *comp_row_view = use_f16_fix
+            ? ds4_gpu_tensor_alloc((uint64_t)head_dim * sizeof(float))
+            : ds4_gpu_tensor_view(
                 comp_cache,
                 (uint64_t)comp_row * head_dim * sizeof(float),
                 (uint64_t)head_dim * sizeof(float));
@@ -9743,6 +9774,13 @@ int ds4_gpu_compressor_update_tensor(
                                             attn_factor,
                                             beta_fast,
                                             beta_slow) != 0;
+        }
+        if (ok && use_f16_fix) {
+            /* Convert the F32 emit scratch into the distinct F16 cache row. */
+            ok = ds4_gpu_tensor_copy_f32_to_f16(
+                    comp_cache,
+                    (uint64_t)comp_row * head_dim * sizeof(uint16_t),
+                    comp_row_view, 0, head_dim) != 0;
         }
         if (ok && ratio == 4u) {
             cb = ds4_gpu_command_buffer(&owned);

@@ -1298,7 +1298,11 @@ int ds4_gpu_compressor_update_tensor(
          * serial / eager caller; Metal backend rejects seq_id != NULL. */
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx);
+        uint32_t                row_idx,
+        /* 1 => comp_cache is an F16 buffer (the banked attn emit passes
+         * layer_attn_comp_cache[il] direct): run pool/rms/rope in an F32
+         * scratch then copy_f32_to_f16 into the row.  0 => F32 cache. */
+        int                     output_is_f16);
 
 /* M2-Inc5: emit tail of ds4_gpu_compressor_update_tensor only (pool + norm +
  * rope + ratio4 shift; no store) -- the follow-up call after a successful
@@ -1333,7 +1337,8 @@ int ds4_gpu_compressor_update_tail_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx);
+        uint32_t                row_idx,
+        int                     output_is_f16);
 
 int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,

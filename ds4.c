@@ -11586,7 +11586,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                         DS4_RMS_EPS,
                                                         il,                          /* PC2: per-layer substrate index for emit-row */
                                                         DS4_COMPRESSOR_ROW_COMP,     /* PC2: primary compressor -> ls->comp_row */
-                                                        NULL, NULL, 0u               /* C2: no per-row substrate (serial width-1) */) != 0;
+                                                        NULL, NULL, 0u               /* C2: no per-row substrate (serial width-1) */,
+                                                        /*output_is_f16=*/0) != 0;
         if (ok && emit) {
             /* Step 4c R1': read comp_row from g_layer_dev[il].comp_row in
              * the per-layer substrate (populated at top of token in
@@ -11715,7 +11716,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                             DS4_RMS_EPS,
                                                             il,                          /* PC2: per-layer substrate index for emit-row */
                                                             DS4_COMPRESSOR_ROW_INDEX,    /* PC2: indexer compressor -> ls->index_row */
-                                                            NULL, NULL, 0u               /* C2: no per-row substrate (serial width-1) */) != 0;
+                                                            NULL, NULL, 0u               /* C2: no per-row substrate (serial width-1) */,
+                                                        /*output_is_f16=*/0) != 0;
             /* TEMPORARY DIAGNOSTIC: state_kv AFTER compressor_update_tensor
              * returns (post compressor_store_batch + post update_pool +
              * shift).  Slot 230+il.  If this matches BE vs BC but the cache
@@ -16913,7 +16915,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          * published table value). */
                                                         cap_step ? g->batch_positions : NULL,
                                                         cap_step ? g->batch_seq_id : NULL,
-                                                        t) != 0;
+                                                        t,
+                                                        /*output_is_f16=*/(!ms_fp8_primary && DS4_GPU_ATTN_COMP_CACHE_F16)) != 0;
                 ds4_gpu_stage_prof_end(sp_cupd);
                 if (g_cont_prof > 0) g_cont_lyr_cupd_s += now_sec() - cupd_t0;
                 if (ok && emit && cap_step) {
@@ -17338,7 +17341,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_RMS_EPS,
                                                             UINT32_MAX,                  /* PC2: decode2-exact, no substrate; inline comp_row */
                                                             DS4_COMPRESSOR_ROW_COMP,     /* PC2: row_field ignored when il==UINT32_MAX */
-                                                            NULL, NULL, 0u) != 0;
+                                                            NULL, NULL, 0u,
+                                                        /*output_is_f16=*/0) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = row_fp8_primary
                             ? ds4_gpu_tensor_view(row_scratch, 0,
@@ -17757,7 +17761,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 : DS4_COMPRESSOR_ROW_INDEX,
                                                             icap_step ? g->batch_positions : NULL,
                                                             icap_step ? g->batch_seq_id : NULL,
-                                                            t) != 0;
+                                                            t,
+                                                        /*output_is_f16=*/0) != 0;
                     if (ok && emit && icap_step) {
                         /* C1: capture-safe QAT -- row-variant reads the emit
                          * row live from the per-ROW table entry (row t; C2
@@ -18136,7 +18141,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_RMS_EPS,
                                                                 UINT32_MAX,                  /* PC2: decode2-exact indexer, no substrate */
                                                                 DS4_COMPRESSOR_ROW_INDEX,    /* PC2: row_field ignored when il==UINT32_MAX */
-                                                                NULL, NULL, 0u) != 0;
+                                                                NULL, NULL, 0u,
+                                                        /*output_is_f16=*/0) != 0;
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                                     g->layer_index_comp_cache[il],
@@ -35418,8 +35424,15 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * write).  The deferred commit-reforward below is skipped on this path (no_defer set). */
             if (can_rollback && !ctx->mtp_force_norollback) {
                 const double rb_t0 = dspark_prof && dspark_now ? now_sec() : 0.0;
+                /* mtp_cont_rollback_restore_all restores checkpoints with
+                 * ds4_gpu_tensor_copy, which blits into g_batch_cb and returns 0
+                 * when none is open.  The DSpark inject block above ends the batch
+                 * cb, so open one iff none is open (begin_commands returns 0 when
+                 * already open -> MTP path unchanged); close it after. */
+                const int rb_opened = ds4_gpu_begin_commands();
                 ok = mtp_cont_rollback_restore_all(g, MS, committed_rows, vnr,
                                                    ctx->rollback_verify, &ctx->rollback_verify_fails);
+                if (rb_opened) ok = (ds4_gpu_end_commands() != 0) && ok;
                 if (dspark_prof && dspark_now) dspark_t_rollback_s += now_sec() - rb_t0;
                 if (!ok) {
                     fprintf(stderr, "ds4: cont-mtp step %u FAIL @rollback (live=%u)\n",
