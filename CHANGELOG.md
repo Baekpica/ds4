@@ -5,7 +5,75 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
-## v0.3.0 — 2026-07-20
+## v0.4.0 — 2026-07-21
+
+The deep-decode substrate release. Serving decode over deep
+conversations drops 27–35% release-over-release (240K: 76.3 → **55.8
+ms/tok**, 515K: 95.2 → **62.1 ms/tok**, turn-2 512-token generations
+at 2.57/2.75 tokens per verify step; 12K stamps 36.6 ms/tok), the
+static 64K depth gate on speculative decode is gone, and a
+community-contributed server fix reaps queued requests whose client
+disconnected before any prefill is spent. Quality held at the release
+battery: evals band-exact vs v0.3.0 (HumanEval 149/164 identical,
+IFEval strict 453 vs 443, needles 70/70), tool-eval-bench 86 twice
+with bit-identical engine counters, tensor equivalence all-zero.
+
+- **Head-group flash-decode for dense mixed attention** (`17a7d76`).
+  The deep-decode depth tax was the ratio-128 mixed-attention family:
+  eight heads now share one f32-staged KV tile (fp8 decoded once per
+  head-group instead of once per head), with q held in registers,
+  warp-per-head dots, online-softmax partials over row chunks, and a
+  fixed-order combine. Isolated width-5 verify launches went 1876 →
+  391 µs. Escape: `DS4_CUDA_NO_ATTN_HG`.
+- **Indexed-path gather flash-decode at serving widths** (`e0ed742`).
+  The same head-group idea for indexed attention: 12k 42.6 → 37.7,
+  240K 66.2 → 64.4, 515K 73.5 → 71.5 ms/tok at landing time.
+- **Speculative decode armed at every depth** (`b5a9ab1`). The static
+  64K KV-depth gate defaults off; the terminal yield-quench
+  controller (v0.2) is now the only governor of when drafting pays.
+  240K 64.4 → 59.4, 515K 71.5 → 65.5 ms/tok at landing time. Setting
+  `DS4_DSPARK_MAX_KV>0` restores a hard cap.
+- **Dense verify tier: aligned Q8_0 at widths 1–8** (`7ffe821`). The
+  aligned SoA dense artifacts previously served only single-token
+  decode; verify steps fell back to raw mmvq (~90–200 GB/s). A
+  width-templated kernel reads the aligned stream once per row with
+  per-token accumulator columns: 240K 59.4 → 55.2 ms/tok. Escape:
+  `DS4_CUDA_NO_Q8_ALIGNED_NC`.
+- **Indexer scorer token-loop** (`18b40d7`). The WMMA scorer launched
+  one CTA per (row-tile, token), re-staging the same K tile per
+  verify token; one CTA now stages K once per sequence run and loops
+  the tokens in-CTA, bitwise-identical to the per-token kernel. 240K
+  55.2 → 50.6, 515K 66.1 → 61.7 ms/tok at landing time. Escape:
+  `DS4_CUDA_NO_IDX_V5E`.
+- **MoE gate_up first-owner expert dedup at verify widths**
+  (`6e27e1e`). Live routing shows ~40% expert overlap across a
+  width-5 verify's 30 slots and the 124 MB working set defeats L2;
+  the first CTA owning an expert now accumulates every matching slot
+  as extra q8_1 columns, so duplicate expert weights are read from
+  DRAM once. Bitwise-identical outputs; win is routing-dependent
+  (deeper on prose/code). The sibling dedup for the q2k down
+  projection was prototyped and measured net-negative (its 2.68
+  MB/expert distinct set is already L2-absorbed) — not integrated,
+  verdict recorded in the proto. Escape: `DS4_CUDA_NO_MOE_DEDUP`.
+- **Server: reap queued requests whose client disconnected before
+  admission** (`881bcca`, contributed — PR #3 by @guptaavi, from a
+  production GB10 report). A client that disconnects while its
+  request is still queued used to hold an admission slot invisibly
+  and then burn a full prefill into a dead socket; under continuous
+  batching the zombies compound while every metric reads healthy. A
+  zero-byte `MSG_PEEK` probe (peer-FIN only — a slow but connected
+  client can never be false-positived) now gates all three FIFO
+  exits, and dead jobs finish through the existing failure machinery
+  before any engine work: visible as `outcome=failed` in `/metrics`.
+- **ds4-bench: fixed illegal access sweeping past 32K at large
+  `--ctx-alloc`** (`9caaa50`, reported on the NVIDIA developer
+  forum). The release frontier sweep runs 2048–65536 clean at
+  `--ctx-alloc 131072`.
+- README GB10 leader assets refreshed from this release's runs:
+  frontier sweep CSV/chart (prefill peaks 817 t/s, 535 at 65K; gen
+  21.6 → 16.7 t/s across the band) and CLI speed-table rows.
+
+
 
 Deep-context serving gets a tensor-core scorer and a durable KV tier.
 Batched deep decode is 13–21% faster (240K→515K context), deep

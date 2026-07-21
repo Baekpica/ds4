@@ -29,7 +29,7 @@ serving engine on NVIDIA hardware**? Upstream's heart is a single-user
 CLI/agent engine, Metal first. This fork keeps all of that working and builds
 the CUDA/Linux side into a batched server — the reference machines are the
 DGX Spark (GB10, sm_121) and the RTX PRO 6000 Blackwell (sm_120). Everything
-below is default-on in `v0.3`, each landing gated by value-parity checks,
+below is default-on in `v0.4`, each landing gated by value-parity checks,
 same-boot A/B timing, and the full eval suite, and each reversible with an
 env kill switch.
 
@@ -65,7 +65,15 @@ A terminal yield-quench controller (default on) turns speculation off for the
 rest of any request whose realized acceptance cannot pay for its verify cost,
 bounding the worst case at ~0.96x plain decode on adversarial prose — where
 always-on speculation used to bottom out at 0.72x — while keeping the 1.2-1.7x
-wins on structured content.
+wins on structured content. v0.4 rewrites the decode-attention substrate
+itself: a head-group flash-decode shares one f32-staged KV tile across eight
+heads instead of re-decoding fp8 per head (dense and indexed paths both), the
+aligned Q8_0 dense tier serves every verify width, the indexer scorer stages
+its K tile once and loops the verify tokens in-CTA, and MoE gate_up
+deduplicates overlapping experts across verify slots. With the static 64K
+depth gate on speculation removed (the quench controller is now the only
+governor), single-stream serving decode stamps **36.6 ms/tok at 12K
+context** (27.3 tok/s, 2.95 tokens per verify step).
 
 **Always on the fast path.** The aligned SoA repack artifacts the D2R and
 decode kernels read in place are built by whichever process loads the
@@ -112,15 +120,18 @@ codes, FP4 e2m1 indexer) are bit-lossless against F32 storage — and are
 their pages never materialize), which returned +5.6 GiB at the 766K
 charter shape — the same shape that F32-primary now takes a clean 503 on
 when the box is fragmented. Packed primaries made deep decode
-faster in v0.2.4 (87/121 ms/tok at 240K/516K), and the v0.3 tensor-core
-scorer moved it again: **76.3 ms/tok at 240K and 95.2 at 515K** (−13% /
-−21%, the win growing with depth because the score scan is the term that
-scales with context; v0.2 shipped ~146/~163). The 766K charter shape was
-re-stamped green on v0.3 with those decode numbers. Honesty note: prefill
-is context-flat and decode is through ~128k, but deep decode still is not
-— 76–95 ms/tok deep against 44–48 shallow. The deep-context win is
-capacity, seconds-fast warm turn cycles, and a closing (not closed)
-decode gap.
+faster in v0.2.4 (87/121 ms/tok at 240K/516K), the v0.3 tensor-core
+scorer moved it (76.3/95.2), and v0.4's flash-decode rewrites with
+speculation armed at every depth moved it again: **55.8 ms/tok at 240K
+and 62.1 at 515K** (2.57/2.75 tokens per verify step; −27% / −35%
+against v0.3, the win growing with depth because the attention and
+score terms are what scale with context; v0.2 shipped ~146/~163). The
+deep charter shape was re-stamped green on v0.4: 762K tokens served
+concurrently, needles exact, warm turn-2 first token in ~1.5 s.
+Honesty note: prefill is context-flat and decode is through ~128k, but
+deep decode still is not — 56–62 ms/tok deep against 36.6 shallow. The
+deep-context win is capacity, seconds-fast warm turn cycles, and a
+closing (not closed) decode gap.
 
 **Deep conversations survive restarts.** Since v0.3 the per-request KV
 banks of the continuous server persist to the disk KV store: a deep
@@ -148,12 +159,13 @@ banks)
 would have been v0.1.1; that is the point of them.
 
 The per-landing numbers and the full story are in `CHANGELOG.md` and the
-release notes. The v0.3 context-frontier sweep compares the ship defaults
-against the prior release lines on the GB10 (same instrument, low band
-2k–64k and high band 64k–128k); below it, the v0.1.0 chart against
-upstream main on both reference machines:
+release notes. The v0.4 context-frontier sweep compares the ship defaults
+against the v0.3 line on the GB10 (same instrument, low band 2k–64k and
+high band 64k–128k; the 240K/515K stamps above live past this
+instrument's ceiling); below it, the v0.1.0 chart against upstream main
+on both reference machines:
 
-![v0.3 context-frontier sweep](speed-bench/v030_sweep_overlay.svg)
+![v0.4 context-frontier sweep](speed-bench/v040_sweep_overlay.svg)
 
 ![v0.1.0 context-frontier sweep](speed-bench/v010_sweep_overlay.svg)
 
@@ -353,8 +365,8 @@ larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | PRO q2 | 32768 tokens | 138.82 t/s | 9.56 t/s |
 | RTX PRO 6000 Blackwell, 96 GB | q2 | short | 85.21 t/s | 53.28 t/s |
 | RTX PRO 6000 Blackwell, 96 GB | q2 | 12461 tokens | 1920.66 t/s | 41.10 t/s |
-| DGX Spark GB10, 128 GB | q2 | short | 48.53 t/s | 15.81 t/s |
-| DGX Spark GB10, 128 GB | q2 | 12461 tokens | 403.57 t/s | 13.56 t/s |
+| DGX Spark GB10, 128 GB | q2 | short | 24.48 t/s | 22.03 t/s |
+| DGX Spark GB10, 128 GB | q2 | 13254 tokens | 773.56 t/s | 18.39 t/s |
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
 ![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)

@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520">
+<style>
+  text{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;fill:#222}
+  .title{font-size:20px;font-weight:600}
+  .subtitle{font-size:12px;fill:#555}
+  .panel-title{font-size:14px;font-weight:600}
+  .axis-label{font-size:11px;fill:#555}
+  .legend{font-size:11px;fill:#333}
+  .ratio{font-size:11px;font-weight:600;fill:#0a7d33}
+  .note{font-size:10.5px;fill:#666}
+  .grid{stroke:#e4e4e4;stroke-width:1}
+  .axis{stroke:#888;stroke-width:1.2}
+  .line-new{stroke:#0a7d33;stroke-width:2.4;fill:none}
+  .line-old{stroke:#8057c4;stroke-width:2;fill:none;stroke-dasharray:6 3}
+  .gain{fill:#0a7d33;fill-opacity:0.10}
+</style>
+<rect width="1200" height="520" fill="#ffffff"/>
+<text class="title" x="78" y="34">ds4 v0.4 — GB10 context frontier (llama-benchy, pp=2048 tg=128, 1 run/pt, no cache)</text>
+<text class="subtitle" x="78" y="54">v0.4 ship defaults (881bcca: head-group flash-decode dense+indexed, DSpark armed at every depth, aligned dense verify tier, scorer token-loop, gate_up expert dedup) vs v0.3 ship (6693aed), same instrument</text>
+<text class="panel-title" x="334" y="104" text-anchor="middle">prefill throughput — v0.4 vs v0.3 ship</text>
+<line class="grid" x1="78" y1="428.0" x2="590" y2="428.0"/>
+<text class="axis-label" x="70" y="431.0" text-anchor="end">0</text>
+<line class="grid" x1="78" y1="366.0" x2="590" y2="366.0"/>
+<text class="axis-label" x="70" y="369.0" text-anchor="end">300</text>
+<line class="grid" x1="78" y1="304.0" x2="590" y2="304.0"/>
+<text class="axis-label" x="70" y="307.0" text-anchor="end">600</text>
+<line class="grid" x1="78" y1="242.0" x2="590" y2="242.0"/>
+<text class="axis-label" x="70" y="245.0" text-anchor="end">900</text>
+<line class="grid" x1="78" y1="180.0" x2="590" y2="180.0"/>
+<text class="axis-label" x="70" y="183.0" text-anchor="end">1200</text>
+<line class="grid" x1="78" y1="118.0" x2="590" y2="118.0"/>
+<text class="axis-label" x="70" y="121.0" text-anchor="end">1500</text>
+<line class="grid" x1="78.0" y1="118" x2="78.0" y2="428"/>
+<text class="axis-label" x="78.0" y="444" text-anchor="middle">2k</text>
+<line class="grid" x1="199.9" y1="118" x2="199.9" y2="428"/>
+<text class="axis-label" x="199.9" y="444" text-anchor="middle">32k</text>
+<line class="grid" x1="329.9" y1="118" x2="329.9" y2="428"/>
+<text class="axis-label" x="329.9" y="444" text-anchor="middle">64k</text>
+<line class="grid" x1="460.0" y1="118" x2="460.0" y2="428"/>
+<text class="axis-label" x="460.0" y="444" text-anchor="middle">96k</text>
+<line class="grid" x1="590.0" y1="118" x2="590.0" y2="428"/>
+<text class="axis-label" x="590.0" y="444" text-anchor="middle">128k</text>
+<line class="axis" x1="78" y1="118" x2="78" y2="428"/>
+<line class="axis" x1="78" y1="428" x2="590" y2="428"/>
+<text class="axis-label" x="26" y="273.0" text-anchor="middle" transform="rotate(-90 26 273.0)">tok/s</text>
+<text class="axis-label" x="334" y="462" text-anchor="middle">context depth (tokens)</text>
+<polygon class="gain" points="78.0,299.7 86.1,236.0 94.3,250.4 102.4,262.6 110.5,261.8 118.6,245.9 126.8,249.5 134.9,249.2 143.0,252.1 151.1,252.5 159.3,255.2 167.4,255.2 175.5,257.6 183.7,258.4 191.8,260.6 199.9,261.2 208.0,263.7 216.2,264.9 224.3,267.3 232.4,268.4 240.5,269.7 248.7,270.8 256.8,272.8 264.9,273.8 273.0,275.3 281.2,276.3 289.3,278.0 297.4,278.4 305.6,280.3 313.7,281.1 321.8,282.3 329.9,283.0 362.4,287.9 395.0,291.5 427.5,295.3 460.0,298.5 492.5,302.2 525.0,304.8 557.5,308.3 590.0,311.6 590.0,311.0 557.5,307.4 525.0,304.8 492.5,301.7 460.0,298.7 427.5,295.2 395.0,291.7 362.4,287.8 329.9,284.4 321.8,283.3 313.7,282.1 305.6,281.3 297.4,280.1 289.3,279.4 281.2,277.7 273.0,276.9 264.9,275.1 256.8,274.1 248.7,272.3 240.5,271.1 232.4,269.2 224.3,268.5 216.2,266.0 208.0,264.9 199.9,262.6 191.8,261.8 183.7,259.8 175.5,259.0 167.4,256.6 159.3,256.7 151.1,253.8 143.0,253.8 134.9,250.6 126.8,251.2 118.6,247.8 110.5,253.3 102.4,243.0 94.3,245.1 86.1,238.1 78.0,280.9"/>
+<polyline class="line-old" points="78.0,280.9 86.1,238.1 94.3,245.1 102.4,243.0 110.5,253.3 118.6,247.8 126.8,251.2 134.9,250.6 143.0,253.8 151.1,253.8 159.3,256.7 167.4,256.6 175.5,259.0 183.7,259.8 191.8,261.8 199.9,262.6 208.0,264.9 216.2,266.0 224.3,268.5 232.4,269.2 240.5,271.1 248.7,272.3 256.8,274.1 264.9,275.1 273.0,276.9 281.2,277.7 289.3,279.4 297.4,280.1 305.6,281.3 313.7,282.1 321.8,283.3 329.9,284.4 362.4,287.8 395.0,291.7 427.5,295.2 460.0,298.7 492.5,301.7 525.0,304.8 557.5,307.4 590.0,311.0"/>
+<polyline class="line-new" points="78.0,299.7 86.1,236.0 94.3,250.4 102.4,262.6 110.5,261.8 118.6,245.9 126.8,249.5 134.9,249.2 143.0,252.1 151.1,252.5 159.3,255.2 167.4,255.2 175.5,257.6 183.7,258.4 191.8,260.6 199.9,261.2 208.0,263.7 216.2,264.9 224.3,267.3 232.4,268.4 240.5,269.7 248.7,270.8 256.8,272.8 264.9,273.8 273.0,275.3 281.2,276.3 289.3,278.0 297.4,278.4 305.6,280.3 313.7,281.1 321.8,282.3 329.9,283.0 362.4,287.9 395.0,291.5 427.5,295.3 460.0,298.5 492.5,302.2 525.0,304.8 557.5,308.3 590.0,311.6"/>
+<text class="ratio" x="82.0" y="226.0" text-anchor="start">0.99x avg 2k-32k</text>
+<text class="ratio" x="586.0" y="303.0" text-anchor="end">0.99x @128k</text>
+<line class="line-new" x1="394" y1="134" x2="420" y2="134"/>
+<text class="legend" x="426" y="138">v0.4 ship (881bcca)</text>
+<line class="line-old" x1="394" y1="152" x2="420" y2="152"/>
+<text class="legend" x="426" y="156">v0.3 ship (6693aed)</text>
+<text class="panel-title" x="916" y="104" text-anchor="middle">generation throughput — v0.4 vs v0.3 ship</text>
+<line class="grid" x1="660" y1="428.0" x2="1172" y2="428.0"/>
+<text class="axis-label" x="652" y="431.0" text-anchor="end">0</text>
+<line class="grid" x1="660" y1="366.0" x2="1172" y2="366.0"/>
+<text class="axis-label" x="652" y="369.0" text-anchor="end">6</text>
+<line class="grid" x1="660" y1="304.0" x2="1172" y2="304.0"/>
+<text class="axis-label" x="652" y="307.0" text-anchor="end">12</text>
+<line class="grid" x1="660" y1="242.0" x2="1172" y2="242.0"/>
+<text class="axis-label" x="652" y="245.0" text-anchor="end">18</text>
+<line class="grid" x1="660" y1="180.0" x2="1172" y2="180.0"/>
+<text class="axis-label" x="652" y="183.0" text-anchor="end">24</text>
+<line class="grid" x1="660" y1="118.0" x2="1172" y2="118.0"/>
+<text class="axis-label" x="652" y="121.0" text-anchor="end">30</text>
+<line class="grid" x1="660.0" y1="118" x2="660.0" y2="428"/>
+<text class="axis-label" x="660.0" y="444" text-anchor="middle">2k</text>
+<line class="grid" x1="781.9" y1="118" x2="781.9" y2="428"/>
+<text class="axis-label" x="781.9" y="444" text-anchor="middle">32k</text>
+<line class="grid" x1="911.9" y1="118" x2="911.9" y2="428"/>
+<text class="axis-label" x="911.9" y="444" text-anchor="middle">64k</text>
+<line class="grid" x1="1042.0" y1="118" x2="1042.0" y2="428"/>
+<text class="axis-label" x="1042.0" y="444" text-anchor="middle">96k</text>
+<line class="grid" x1="1172.0" y1="118" x2="1172.0" y2="428"/>
+<text class="axis-label" x="1172.0" y="444" text-anchor="middle">128k</text>
+<line class="axis" x1="660" y1="118" x2="660" y2="428"/>
+<line class="axis" x1="660" y1="428" x2="1172" y2="428"/>
+<text class="axis-label" x="608" y="273.0" text-anchor="middle" transform="rotate(-90 608 273.0)">tok/s</text>
+<text class="axis-label" x="916" y="462" text-anchor="middle">context depth (tokens)</text>
+<polygon class="gain" points="660.0,204.6 668.1,223.2 676.3,179.4 684.4,226.9 692.5,158.6 700.6,226.7 708.8,194.3 716.9,229.8 725.0,229.0 733.1,224.0 741.3,230.3 749.4,222.3 757.5,230.4 765.7,227.4 773.8,242.8 781.9,247.3 790.0,245.0 798.2,247.3 806.3,245.9 822.5,244.3 830.7,245.9 838.8,174.6 846.9,247.3 855.0,248.1 863.2,248.1 871.3,245.6 879.4,247.8 887.6,248.5 895.7,248.0 903.8,249.9 911.9,247.4 944.4,251.4 977.0,249.6 1009.5,254.6 1074.5,253.3 1107.0,256.9 1139.5,252.4 1172.0,257.9 1172.0,279.5 1139.5,274.1 1107.0,274.7 1074.5,273.8 1009.5,267.0 977.0,268.6 944.4,267.5 911.9,265.1 903.8,264.5 895.7,267.7 887.6,271.2 879.4,269.9 871.3,267.6 863.2,267.6 855.0,266.3 846.9,263.1 838.8,265.8 830.7,264.8 822.5,264.8 806.3,263.6 798.2,262.5 790.0,265.0 781.9,257.5 773.8,261.5 765.7,254.8 757.5,256.1 749.4,256.1 741.3,255.8 733.1,219.4 725.0,186.2 716.9,221.5 708.8,247.2 700.6,214.9 692.5,215.2 684.4,161.9 676.3,245.7 668.1,219.5 660.0,217.9"/>
+<polyline class="line-old" points="660.0,217.9 668.1,219.5 676.3,245.7 684.4,161.9 692.5,215.2 700.6,214.9 708.8,247.2 716.9,221.5 725.0,186.2 733.1,219.4 741.3,255.8 749.4,256.1 757.5,256.1 765.7,254.8 773.8,261.5 781.9,257.5 790.0,265.0 798.2,262.5 806.3,263.6 822.5,264.8 830.7,264.8 838.8,265.8 846.9,263.1 855.0,266.3 863.2,267.6 871.3,267.6 879.4,269.9 887.6,271.2 895.7,267.7 903.8,264.5 911.9,265.1 944.4,267.5 977.0,268.6 1009.5,267.0 1074.5,273.8 1107.0,274.7 1139.5,274.1 1172.0,279.5"/>
+<polyline class="line-new" points="660.0,204.6 668.1,223.2 676.3,179.4 684.4,226.9 692.5,158.6 700.6,226.7 708.8,194.3 716.9,229.8 725.0,229.0 733.1,224.0 741.3,230.3 749.4,222.3 757.5,230.4 765.7,227.4 773.8,242.8 781.9,247.3 790.0,245.0 798.2,247.3 806.3,245.9 814.4,245.7 822.5,244.3 830.7,245.9 838.8,174.6 846.9,247.3 855.0,248.1 863.2,248.1 871.3,245.6 879.4,247.8 887.6,248.5 895.7,248.0 903.8,249.9 911.9,247.4 944.4,251.4 977.0,249.6 1009.5,254.6 1042.0,252.4 1074.5,253.3 1107.0,256.9 1139.5,252.4 1172.0,257.9"/>
+<text class="ratio" x="664.0" y="148.6" text-anchor="start">1.07x avg 2k-32k</text>
+<text class="ratio" x="1168.0" y="249.9" text-anchor="end">1.14x @128k</text>
+<line class="line-new" x1="976" y1="134" x2="1002" y2="134"/>
+<text class="legend" x="1008" y="138">v0.4 ship (881bcca)</text>
+<line class="line-old" x1="976" y1="152" x2="1002" y2="152"/>
+<text class="legend" x="1008" y="156">v0.3 ship (6693aed)</text>
+<text class="note" x="78" y="478">Points at 2k-8k are single-run volatile on this instrument; points at 10k+ repeat within 1% run to run. The low-end multiplier is therefore the 2k-32k geometric-mean ratio, not a single point; the deep multiplier is the single 128k point. Claims live at depth.</text>
+<text class="note" x="78" y="494">Gen lines are token_ids-exact benchy wall tok/s on the continuous+capture path, single stream. v0.3 disarmed speculative decode past 64k (static depth gate); v0.4 keeps it armed at every depth with the quench controller governing — the 64k+ gen gap is that flip plus the flash-decode rewrites.</text>
+<text class="note" x="78" y="510">Engine-truth v0.4 deep-decode stamps (turn-2, 512 tok): 55.8 ms/tok @240K (tok/step 2.57), 62.1 @515K (2.75); v0.3: 76.3 / 95.2. GB10 = DGX Spark, sm_121, self-load boots. 2026-07-21.</text>
+</svg>
