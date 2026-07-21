@@ -1514,6 +1514,156 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
     }
 }
 
+// v0.4 V6: expert-overlap dedup for the gate_up mid kernel at DSpark
+// verify widths (proto_gemm_gateup_iq2xxs_dedup).  A live census measured
+// a mean of 18.2 DISTINCT experts per 30 assignment slots at w5 (~40%
+// overlap across the verify tokens); the per-slot kernel above re-reads
+// every duplicate's weights from DRAM.  First-owner dedup keeps the grid
+// at (M, n_slots) -- capture-safe (the decision replays from LIVE ids
+// content inside baked MoE graphs), sort-free, no host id knowledge:
+// each CTA exits unless it is the first slot bearing its expert id, and
+// otherwise accumulates ALL matching slots (<= n_tokens; top-k is
+// without replacement) as extra q8_1 columns.  Weight bytes and the iq2
+// grid/sign decode collapse to distinct experts.  Per-slot int dots are
+// exact and float folds stay block-major => outputs are BITWISE the
+// per-slot kernel's (proto: 0 mismatches on every leg incl. invalid-id
+// sign-zeros; timing D=18 1.53x, D=12 2.03x, D=30 0.93x -- the
+// no-overlap tail is ~9% of live launches and priced).
+template <int MAXM>
+__global__ void iq2_xxs_aligned_moe_gate_up_mid_dedup_kernel(
+        float             *mid,
+        const uint2       *qs_gate,
+        const __half      *dq_gate,
+        const uint2       *qs_up,
+        const __half      *dq_up,
+        const block_q8_1  *x8,
+        const int32_t     *ids,
+        const float       *weights,
+        int                M,
+        int                nb,
+        int                nyb,
+        int                n_expert_used,
+        int                n_slots,
+        float              clamp)
+{
+    const int row  = blockIdx.x;
+    const int slot = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int32_t id_raw = ids[slot];
+
+    if (id_raw < 0) {
+        /* The per-slot kernel's zero path runs the epilogue with acc 0:
+         * (+0)*(+0)*w = sign(w)*0 -- keep the sign bitwise. */
+        if (lane == 0) mid[(long long)slot * M + row] = 0.0f * weights[slot];
+        return;
+    }
+    for (int j = 0; j < slot; j++)
+        if (ids[j] == id_raw) return;
+
+    int msl[MAXM];
+    const block_q8_1 *xcol[MAXM];
+    int nm = 0;
+    for (int j = slot; j < n_slots && nm < MAXM; j++)
+        if (ids[j] == id_raw) {
+            msl[nm] = j;
+            xcol[nm] = x8 + (long long)(j / n_expert_used) * nyb;
+            nm++;
+        }
+
+    const long long rbase = ((long long)id_raw * M + row) * nb;
+
+    float acc_g[MAXM];
+    float acc_u[MAXM];
+#pragma unroll
+    for (int m = 0; m < MAXM; m++) { acc_g[m] = 0.0f; acc_u[m] = 0.0f; }
+
+    for (int b0 = 0; b0 < nb; b0 += 4) {
+        const int b = b0 + (lane >> 3);
+        const int p = lane & 7;
+        const int q8i = (b * 256 + p * 32) / 32;
+
+        const uint2 cwg = qs_gate[(rbase + b) * 8 + p];
+        const uint2 cwu = qs_up[(rbase + b) * 8 + p];
+        const uint8_t *aux8g = (const uint8_t *)&cwg.x;
+        const uint8_t *aux8u = (const uint8_t *)&cwu.x;
+
+        int sumi_g[MAXM];
+        int sumi_u[MAXM];
+#pragma unroll
+        for (int m = 0; m < MAXM; m++) { sumi_g[m] = 0; sumi_u[m] = 0; }
+
+#pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            int g0g, g1g, g0u, g1u;
+            {
+                const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8g[k0 / 2]];
+                const uint32_t signs = unpack_ksigns(cwg.y >> (7 * k0 / 2));
+                const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+                g0g = __vsub4(grid_pos.x ^ signs0, signs0);
+                const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+                g1g = __vsub4(grid_pos.y ^ signs1, signs1);
+            }
+            {
+                const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8u[k0 / 2]];
+                const uint32_t signs = unpack_ksigns(cwu.y >> (7 * k0 / 2));
+                const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+                g0u = __vsub4(grid_pos.x ^ signs0, signs0);
+                const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+                g1u = __vsub4(grid_pos.y ^ signs1, signs1);
+            }
+#pragma unroll
+            for (int m = 0; m < MAXM; m++) {
+                if (m < nm) {
+                    const int *u = (const int *)xcol[m][q8i].qs;
+                    sumi_g[m] = ggml_cuda_dp4a(g0g, u[k0 + 0], sumi_g[m]);
+                    sumi_g[m] = ggml_cuda_dp4a(g1g, u[k0 + 1], sumi_g[m]);
+                    sumi_u[m] = ggml_cuda_dp4a(g0u, u[k0 + 0], sumi_u[m]);
+                    sumi_u[m] = ggml_cuda_dp4a(g1u, u[k0 + 1], sumi_u[m]);
+                }
+            }
+        }
+        const int ls_g = cwg.y >> 27 | 1;
+        const int ls_u = cwu.y >> 27 | 1;
+        const float dg = __half2float(dq_gate[rbase + b]);
+        const float du = __half2float(dq_up[rbase + b]);
+#pragma unroll
+        for (int m = 0; m < MAXM; m++) {
+            if (m < nm) {
+                const float d8 = __low2float(xcol[m][q8i].ds);
+                acc_g[m] += dg * d8 * (float)(sumi_g[m] * ls_g / 8);
+                acc_u[m] += du * d8 * (float)(sumi_u[m] * ls_u / 8);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < MAXM; m++) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc_g[m] += __shfl_down_sync(0xffffffffu, acc_g[m], off);
+            acc_u[m] += __shfl_down_sync(0xffffffffu, acc_u[m], off);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int m = 0; m < MAXM; m++) {
+            if (m < nm) {
+                float gate = acc_g[m];
+                float up = acc_u[m];
+                if (!isfinite(gate)) gate = 0.0f;
+                if (!isfinite(up)) up = 0.0f;
+                if (clamp > 1.0e-6f) {
+                    if (gate > clamp) gate = clamp;
+                    if (up > clamp) up = clamp;
+                    if (up < -clamp) up = -clamp;
+                }
+                const float silu = gate / (1.0f + expf(-gate));
+                mid[(long long)msl[m] * M + row] = silu * up * weights[msl[m]];
+            }
+        }
+    }
+}
+
 template <ggml_type type>
 int ds4_mmq_moe_pair_raw_vec_impl(
         const char    * tag,
@@ -3153,13 +3303,40 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
     const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
     const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
     dim3 grid((unsigned)M, (unsigned)(n_tokens * n_expert_used), 1);
-    iq2_xxs_aligned_moe_gate_up_mid_kernel<<<grid, 32, 0, stream>>>(
-        mid_f32,
-        (const uint2 *)((const char *)W_gate_aligned + dq_bytes),
-        (const __half *)W_gate_aligned,
-        (const uint2 *)((const char *)W_up_aligned + dq_bytes),
-        (const __half *)W_up_aligned,
-        (const block_q8_1 *)x8, ids, weights, M, K / 256, K / 32, n_expert_used, clamp);
+    const uint2  *qs_g = (const uint2 *)((const char *)W_gate_aligned + dq_bytes);
+    const __half *dq_g = (const __half *)W_gate_aligned;
+    const uint2  *qs_u = (const uint2 *)((const char *)W_up_aligned + dq_bytes);
+    const __half *dq_u = (const __half *)W_up_aligned;
+    /* v0.4 V6: verify widths dedup expert overlap (see the dedup kernel's
+     * header comment).  n_tokens==1 has no cross-token overlap and keeps
+     * the per-slot kernel; widths beyond the verify envelope likewise.
+     * DS4_CUDA_NO_MOE_DEDUP restores the per-slot kernel (diagnostic). */
+    static int moe_dedup_en = -1;
+    if (moe_dedup_en < 0) moe_dedup_en = getenv("DS4_CUDA_NO_MOE_DEDUP") == NULL;
+    if (moe_dedup_en && n_tokens >= 2 && n_tokens <= 8) {
+        const int n_slots = n_tokens * n_expert_used;
+        switch (n_tokens) {
+#define DS4_GATEUP_DEDUP_CASE(NT) \
+        case NT: \
+            iq2_xxs_aligned_moe_gate_up_mid_dedup_kernel<NT><<<grid, 32, 0, stream>>>( \
+                mid_f32, qs_g, dq_g, qs_u, dq_u, \
+                (const block_q8_1 *)x8, ids, weights, M, K / 256, K / 32, \
+                n_expert_used, n_slots, clamp); \
+            break;
+        DS4_GATEUP_DEDUP_CASE(2)
+        DS4_GATEUP_DEDUP_CASE(3)
+        DS4_GATEUP_DEDUP_CASE(4)
+        DS4_GATEUP_DEDUP_CASE(5)
+        DS4_GATEUP_DEDUP_CASE(6)
+        DS4_GATEUP_DEDUP_CASE(7)
+        DS4_GATEUP_DEDUP_CASE(8)
+#undef DS4_GATEUP_DEDUP_CASE
+        }
+    } else {
+        iq2_xxs_aligned_moe_gate_up_mid_kernel<<<grid, 32, 0, stream>>>(
+            mid_f32, qs_g, dq_g, qs_u, dq_u,
+            (const block_q8_1 *)x8, ids, weights, M, K / 256, K / 32, n_expert_used, clamp);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
