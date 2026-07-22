@@ -34572,7 +34572,13 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     uint64_t dspark_prof_quench_steps = 0, dspark_prof_quench_saved_rows = 0;
     uint64_t dspark_prof_ad_probes = 0, dspark_prof_ad_switches = 0, dspark_prof_ad_plain_steps = 0;
     ds4_dspark_trace_bank *dspark_tb = dspark_trace ? xcalloc(MS, sizeof(*dspark_tb)) : NULL;
-    double dspark_shadow_guard = 2.22;
+    /* guard = break-even tokens/step (full spec cycle vs plain step) and
+     * must sit AT break-even, not above: false quenches cost more than
+     * late ones.  Recalibrate whenever verify or plain cost moves:
+     * DS4_DSPARK_TRACE + tools/dspark_trace_replay.py, C = geo(yield) /
+     * geo(measured speedup) per band.  2.10 = v0.4 verify cost (C
+     * 2.03-2.08 low band, 2.40 @240K). */
+    double dspark_shadow_guard = 2.10;
     double dspark_shadow_alpha = 0.125;
     uint32_t dspark_shadow_minev = 4u;
     double dspark_shadow_budget = 4.0;

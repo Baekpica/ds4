@@ -5,6 +5,48 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.4.1 — 2026-07-22
+
+The quench recalibration patch. The terminal yield-quench controller's
+break-even guard was still the v0.1.1 calibration (2.22, from a measured
+spec-step cost C=2.17); v0.4's substrate work cut the verify cost to a
+measured C of 2.03–2.08 on the 2k–64k band (2.40/2.38 at 240K/515K), so
+the shipped guard sat 8% above break-even and terminally quenched
+winners. One constant changes: `dspark_shadow_guard` 2.22 → **2.10**.
+
+- **Method** (tools tracked in-repo): `DS4_DSPARK_TRACE=1` always-spec
+  collections on four shapes (W&P and code low bands; 240K and 515K
+  turn-2 via `deep_ctx_gate.sh`, which gains a `SPEC=0` plain-reference
+  knob), replayed with `tools/dspark_trace_replay.py` (validate: 74/74
+  engine SHADOW lines bit-match the replayer). Break-even C is
+  identity-calibrated per band: C = geo(yield) / geo(measured same-run
+  speedup). Candidate families swept under per-request-cost economics:
+  flat guards, depth-ramped guard(pos0), non-terminal re-arm. Re-arm
+  LOSES even at an optimistic zero-cost bound (floor 0.926); the depth
+  ramp ties flat 2.10 at Δ2e-4 and is deferred (reopening trigger:
+  observed deep content yielding between the guard and C_deep ≈ 2.4).
+- **Measured** (GB10, fresh same-day plain reference both sides):
+  code-corpus band geomean vs plain 1.084 → **1.103**; adversarial W&P
+  band 1.02 → **1.044**; deep stamps 12K **36.6 ms/tok** at 2.95
+  tokens/verify-step (identical to v0.4.0), 240K **57.3** at 2.76,
+  515K **59.9** at 2.79 (v0.4.0: 62.1 at 2.75) — the deep gate corpora
+  yield 2.6–2.9, above either guard, so no deep behavior change;
+  forced-quench identity 1.0014 (12K ABBA) and 1.004 (41K); make test
+  tensor equivalence all-zero deltas.
+- **Floor honesty** (measured; replaces the "~0.96 floor" line): the
+  quench worst case is pre-quench learning debt — minev (4) speculative
+  steps times the window's yield deficit — which lands short (tg 128)
+  adversarial generations at 0.93–0.97x plain depending on the draw,
+  under ANY guard at or above break-even (the old guard 2.22 measured
+  0.932 on 2026-07-22 draws at the very point where v0.4.0's release
+  leg drew 0.97). Post-quench serving is identical to plain (the
+  identity above). The README now states the mechanism and the typical
+  range instead of a single draw.
+- tool-eval-bench fast ×2: score 88 both runs (previous band 81–86;
+  the pair is bit-identical — spec counters 14173/200 twice). Counters
+  legitimately move off v0.4.0's 13659/201: the recalibrated guard
+  retains more speculation.
+
 ## v0.4.0 — 2026-07-21
 
 The deep-decode substrate release. Serving decode over deep

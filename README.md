@@ -62,10 +62,16 @@ e2m1 levels with exact per-block scale folds — 3.97× over the scalar scan at
 storage on the same binary), and the DSpark lossless speculative decoder
 runs at 3.02 tokens per verify step (74.6% draft acceptance, zero fallbacks).
 A terminal yield-quench controller (default on) turns speculation off for the
-rest of any request whose realized acceptance cannot pay for its verify cost,
-bounding the worst case at ~0.96x plain decode on adversarial prose — where
-always-on speculation used to bottom out at 0.72x — while keeping the 1.2-1.7x
-wins on structured content. v0.4 rewrites the decode-attention substrate
+rest of any request whose realized acceptance cannot pay for its verify cost.
+Its worst case is a bounded learning cost: a few speculative steps of evidence
+(minev x the yield deficit) before the quench fires, which lands short
+adversarial generations at 0.95-0.97x plain on typical draws (post-quench
+serving measures identical to plain; forced-quench identity 1.000-1.004) —
+where always-on speculation used to bottom out at 0.72x — while keeping the
+1.2-1.7x wins on structured content. v0.4.1 recalibrates the quench break-even
+to v0.4's measured verify cost (guard 2.22 -> 2.10): the v0.1.1-era guard sat
+8% above the true low-band break-even and was terminally quenching winners
+(code-corpus band 1.084 -> 1.103x vs plain, adversarial prose 1.02 -> 1.044x). v0.4 rewrites the decode-attention substrate
 itself: a head-group flash-decode shares one f32-staged KV tile across eight
 heads instead of re-decoding fp8 per head (dense and indexed paths both), the
 aligned Q8_0 dense tier serves every verify width, the indexer scorer stages
