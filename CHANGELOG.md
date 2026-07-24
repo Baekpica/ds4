@@ -5,6 +5,49 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.4.2 — 2026-07-24
+
+Community fix: thinking-mode conversations now reuse KV on the
+continuous path. Contributed by [@fabiopili](https://github.com/fabiopili)
+in [#4](https://github.com/Entrpi/ds4/pull/4) — an excellent two-symptom
+diagnosis and a fix that mirrors the session path's own design.
+
+- **The bug**: `cont_warm_retire()` bailed on every thinking-mode row,
+  so thinking conversations never built warm records. Two symptoms:
+  every turn cold-re-prefilled the full history (measured 40 s vs 0.8 s
+  on turn 2 of a 29K-token thinking agent preamble), and thinking banks
+  never persisted to the disk KV tier (`kv_cache_store_bank` requires a
+  warm-valid bank) — the root cause of
+  [ds4-on-spark#4](https://github.com/Entrpi/ds4-on-spark/issues/4).
+- **The fix**: port the session path's visible-transcript checkpoint
+  key to the continuous path. The warm record keys on the rendered
+  visible transcript (`</think>` + content + end marker for toolless
+  turns; verbatim reasoning replay under tool context), which is
+  byte-identical to what the prompt renderer emits on the next turn.
+  Safety is by construction: a full record match reuses the bank's
+  exact committed tokens under the engine's prefix validation, and
+  partial cuts are token-LCP against committed history, so a cut can
+  never land inside hidden reasoning. Bonus (by design): a
+  `deepseek-chat` continuation of a `deepseek-reasoner` conversation
+  byte-matches the thinking bank's visible record and reuses it.
+- **Gates**: deep 240K all-stages pass, turn 2 **54.2 ms/tok** at 2.69
+  tokens/verify-step with a warm-in-place reuse of the full 240K prefix
+  (`warm admit cached=240156`; v0.4.1 stamp 57.3 at 2.76); deep 12K
+  36.9 ms/tok at 2.95 (v0.4.1: 36.6 at 2.95), reuse + needles exact,
+  counters clean. tool-eval-bench fast: score 88 ×5 runs, zero
+  failures/serial/rejects/illegal ×5, admit streams byte-identical
+  across runs and emit/draft totals conserved (19453/16206); spec-step
+  tiling wobbles ±1 counter with arrival timing — a same-day control
+  on the v0.4.1 binary bounded the class, and the non-thinking retire
+  path is byte-identical code to v0.4.1. Thinking gate on the merged
+  tree (DGX Spark, 4 legs): toolless turn-2 reuse (`fork admit
+  cached=4140`), preserved-reasoning reuse (cached=4473), non-thinking
+  control, and clean-SIGTERM persist (12 bank lines, 6 disk files,
+  previously always empty for thinking) with reboot restore (`bank
+  restore hit tokens=4232 load=159.5 ms`) and post-restore reuse —
+  plus a needle planted in the reused prefix answered exactly on every
+  leg. make test tensor equivalence: all-zero deltas.
+
 ## v0.4.1 — 2026-07-22
 
 The quench recalibration patch. The terminal yield-quench controller's
