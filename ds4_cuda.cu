@@ -12987,7 +12987,12 @@ __global__ static void indexer_scores_multiseq_kernel(
  * bounds-sweep interior optimum ((128,6) 200.1 / (128,8) 187.8 / (128,12)
  * 200.3 us regs-40 spill cliff; this shape compiles to 64 regs).  Needs the
  * full smem carveout (PreferredSharedMemoryCarveout = 100, set once at the
- * launch site) to reach 8 blocks/SM on GB10's 100 KB SMs. */
+ * launch site) to reach 8 blocks/SM on GB10's 100 KB SMs.
+ * The 32-half smem stride is 4-way bank-conflicted but deliberately KEPT:
+ * the smallest legal pad is 40 (wmma ldm must be a multiple of 8 halves --
+ * 36 faults "misaligned address") and its +1536 B/block costs 8->7
+ * blocks/SM, a measured wash (FP4 1.02x / F32 0.91x); see the V5E inc-2
+ * note and proto_indexer_score_mt.cu. */
 __global__ static void __launch_bounds__(128, 8) indexer_scores_multiseq_v5d_kernel(
         float *scores, const float *q, const float *weights,
         const float *index_comp, uint32_t n_comp, uint32_t n_tokens,
@@ -13181,12 +13186,26 @@ __global__ static void __launch_bounds__(128, 8) indexer_scores_multiseq_v5d_ker
  * CTA-uniform (visible/seq are per-token constants, staged_seq evolves
  * identically on every thread).
  *
- * Occupancy: static smem 17.4 KB + 96 regs both cap at 5 blocks/SM
- * (ncu: 41.7% achieved, SM 52% / Mem 63%, latency-bound, no saturated
+ * Occupancy: static smem 20,480 B (40-half stride) + 96 regs cap at
+ * 4 blocks/SM (was 17.4 KB / 5 at the conflicted 32-half stride; ncu
+ * then: 41.7% achieved, SM 52% / Mem 63%, latency-bound, no saturated
  * pipe) -- the amortization wins 1.58-1.85x anyway; a smem/reg-diet V5F
  * or HMMA-class restructure is BANKED (trigger: scorer back in the
  * step-ledger top-3 post-V5E).  n_tokens 2..8 only; w1 keeps V5D's
- * 8-block occupancy, wide batches keep the V5D token grid. */
+ * 8-block occupancy, wide batches keep the V5D token grid.
+ *
+ * v0.5 scorer diet inc-2: the ldmatrix-staged tiles (a_sh_all/b_sh) use a
+ * 40-half stride.  32 halves = 64 B put fragment rows on two bank quads
+ * (4-way conflicts); 40 = the smallest LEGAL pad -- wmma load_matrix_sync
+ * requires ldm % 8 == 0 for __half (every ldmatrix row 16-B aligned; the
+ * first attempt used 36 and FAULTED "misaligned address" at every decode
+ * step, proto_indexer_score_mt.cu --repro36-* reproduces) -- and 80 B
+ * starts the 8 phase rows at banks 20*i mod 32, a perfect partition of
+ * all 32 banks: zero conflicts.  Proto: bitwise + zero topk flips, FP4
+ * 1.11x / F32 1.05x at 59082 rows net of the 5->4 occupancy loss.
+ * V5D deliberately KEEPS the 32-half stride: its pad measured a wash
+ * (FP4 1.02x / F32 0.91x) because +1536 B/block drops it 8->7 blocks/SM,
+ * cancelling the conflict win. */
 __global__ static void __launch_bounds__(128, 5) indexer_scores_multiseq_v5e_kernel(
         float *scores, const float *q, const float *weights,
         const float *index_comp, uint32_t n_comp, uint32_t n_tokens,
@@ -13208,13 +13227,13 @@ __global__ static void __launch_bounds__(128, 5) indexer_scores_multiseq_v5e_ker
         atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
     const uint32_t head0 = warp * 16u;
 
-    __shared__ __half a_sh_all[4 * 32 * 32];   /* [block][row][dim-in-block] */
+    __shared__ __half a_sh_all[4 * 32 * 40];   /* [block][row][dim-in-block] */
     __shared__ float k_scale_all[32 * 4];      /* [row][block] */
-    __shared__ __half b_sh[4 * 16 * 32];
+    __shared__ __half b_sh[4 * 16 * 40];
     __shared__ float c_sh[4 * 16 * 16];
     __shared__ float warp_row_partial[4 * 32];
 
-    __half *warp_b_sh = b_sh + warp * 16u * 32u;
+    __half *warp_b_sh = b_sh + warp * 16u * 40u;
     float *warp_c_sh = c_sh + warp * 16u * 16u;
 
     uint32_t staged_seq = 0xFFFFFFFFu;
@@ -13285,7 +13304,7 @@ __global__ static void __launch_bounds__(128, 5) indexer_scores_multiseq_v5e_ker
                     }
                     __syncwarp();
                     const float level = use_fp4 ? v : v / k_scale_all[r * 4u + block];
-                    a_sh_all[block * (32u * 32u) + r * 32u + lane] = __float2half(level);
+                    a_sh_all[block * (32u * 40u) + r * 40u + lane] = __float2half(level);
                 }
             }
             __syncthreads();
@@ -13307,7 +13326,7 @@ __global__ static void __launch_bounds__(128, 5) indexer_scores_multiseq_v5e_ker
                 float v = q[((uint64_t)t * 64u + head) * 128u + d];
                 const float qs = q_block_scale[
                     ((uint64_t)t * 64u + head) * 4u + (d >> 5u)];
-                warp_b_sh[i] = __float2half(v / qs);
+                warp_b_sh[h * 40u + block_d] = __float2half(v / qs);
             }
             __syncwarp();
 
@@ -13321,9 +13340,9 @@ __global__ static void __launch_bounds__(128, 5) indexer_scores_multiseq_v5e_ker
                 for (uint32_t k = 0; k < 32u; k += 16u) {
                     wmma::load_matrix_sync(
                         a_frag,
-                        a_sh_all + block * (32u * 32u) + row_tile * 16u * 32u + k,
-                        32);
-                    wmma::load_matrix_sync(b_frag, warp_b_sh + k, 32);
+                        a_sh_all + block * (32u * 40u) + row_tile * 16u * 40u + k,
+                        40);
+                    wmma::load_matrix_sync(b_frag, warp_b_sh + k, 40);
                     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
                 }
                 wmma::store_matrix_sync(warp_c_sh, c_frag, 16, wmma::mem_row_major);
