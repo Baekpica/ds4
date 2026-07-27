@@ -13787,8 +13787,14 @@ __global__ static void indexer_scores_wmma128_kernel(
         }
     }
 
-    __shared__ __half a_sh[16 * 128];
-    __shared__ __half b_sh[128 * 128];
+    /* v0.5 scorer diet inc-1: 136-half smem stride.  The natural 128-half
+     * stride is 256 B, so every ldmatrix row of an a/b fragment lands in the
+     * same shared-memory bank group (~8-way conflicts): ncu measured Mem
+     * Busy 86% at 15% of bandwidth, and the padded A/B in
+     * proto_indexer_score_prefill.cu is 2.2x at every depth with
+     * bit-identical output (padding changes no arithmetic). */
+    __shared__ __half a_sh[16 * 136];
+    __shared__ __half b_sh[128 * 136];
     __shared__ float c_sh[8 * 16 * 16];
 
     float acc[8];
@@ -13802,7 +13808,7 @@ __global__ static void indexer_scores_wmma128_kernel(
         float v = 0.0f;
         if (comp < n_comp) v = use_fp4 ? indexer_fp4_read(index_fp4, index_scale, comp, d)
                                        : index_comp[(uint64_t)comp * head_dim + d];
-        b_sh[d + c * 128u] = __float2half(v);
+        b_sh[d + c * 136u] = __float2half(v);
     }
     __syncthreads();
 
@@ -13815,7 +13821,7 @@ __global__ static void indexer_scores_wmma128_kernel(
             if (token < n_tokens) {
                 v = q[((uint64_t)token * n_head + h) * head_dim + d];
             }
-            a_sh[i] = __float2half(v);
+            a_sh[r * 136u + d] = __float2half(v);
         }
         __syncthreads();
 
@@ -13825,8 +13831,8 @@ __global__ static void indexer_scores_wmma128_kernel(
         wmma::fill_fragment(c_frag, 0.0f);
         const uint32_t col0 = warp * 16u;
         for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
-            wmma::load_matrix_sync(a_frag, a_sh + k0, 128);
-            wmma::load_matrix_sync(b_frag, b_sh + col0 * 128u + k0, 128);
+            wmma::load_matrix_sync(a_frag, a_sh + k0, 136);
+            wmma::load_matrix_sync(b_frag, b_sh + col0 * 136u + k0, 136);
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
         wmma::store_matrix_sync(c_sh + warp * 16u * 16u, c_frag, 16, wmma::mem_row_major);
