@@ -13780,7 +13780,7 @@ __global__ static void indexer_scores_wmma128_kernel(
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 128u;
-    const uint32_t tile_t = blockIdx.y * 16u;
+    const uint32_t tile_t = blockIdx.y * 32u;  /* inc-3: 32-token tiles */
     const uint32_t tid = threadIdx.x;
     const uint32_t warp = tid >> 5u;
     if (tid >= 256u || head_dim != 128u) return;
@@ -13788,12 +13788,12 @@ __global__ static void indexer_scores_wmma128_kernel(
     if (use_fp4 && tid == 0 && blockIdx.x == 0u && blockIdx.y == 0u) atomicAdd(&g_fp4_index_read_path_blocks, 1ull);
 
     if (causal) {
-        const uint32_t last_token = min(tile_t + 16u, n_tokens);
+        const uint32_t last_token = min(tile_t + 32u, n_tokens);
         const uint32_t max_visible = last_token > tile_t
             ? min((pos0 + last_token) / ratio, n_comp)
             : 0u;
         if (tile_c >= max_visible) {
-            for (uint32_t i = tid; i < 16u * 128u; i += 256u) {
+            for (uint32_t i = tid; i < 32u * 128u; i += 256u) {
                 const uint32_t r = i >> 7u;
                 const uint32_t c = i & 127u;
                 const uint32_t token = tile_t + r;
@@ -13806,19 +13806,30 @@ __global__ static void indexer_scores_wmma128_kernel(
         }
     }
 
-    /* v0.5 scorer diet inc-1: 136-half smem stride.  The natural 128-half
-     * stride is 256 B, so every ldmatrix row of an a/b fragment lands in the
-     * same shared-memory bank group (~8-way conflicts): ncu measured Mem
-     * Busy 86% at 15% of bandwidth, and the padded A/B in
-     * proto_indexer_score_prefill.cu is 2.2x at every depth with
-     * bit-identical output (padding changes no arithmetic). */
-    __shared__ __half a_sh[16 * 136];
+    /* v0.5 scorer diet inc-1 + inc-3.  Inc-1: 136-half smem stride (the
+     * natural 128-half stride is 256 B = every ldmatrix row in one bank
+     * group, ~8-way conflicts; ncu Mem Busy 86% at 15% of bandwidth; pad =
+     * 2.2x bit-identical).  Inc-3: register blocking -- each warp keeps its
+     * accumulators in registers (ReLU*w folded per element via the
+     * runtime-verified m16n16k16 fragment mapping: quad = lane>>2,
+     * row = quad + ((i&2)?8:0), col = (lane&3)*2 + (i&1) + ((i&4)?8:0)),
+     * which deletes the per-head store_matrix_sync + 8-KB c_sh readback +
+     * one of three per-head barriers; and the CTA covers 32 TOKENS so two
+     * A fragments share every b_frag ldmatrix (3 loads per 2 MMAs) and the
+     * 34.8-KB b_sh stage amortizes over twice the output.  Proto
+     * (proto_indexer_score_prefill.cu k_rb2): 1.69-1.86x over the padded
+     * baseline at every depth, bit-identical scores.  Grid y is
+     * ceil(n_tokens/32) -- the launch site must match. */
+    __shared__ __half a_sh[32 * 136];
     __shared__ __half b_sh[128 * 136];
-    __shared__ float c_sh[8 * 16 * 16];
 
-    float acc[8];
+    const uint32_t lane = tid & 31u;
+    const uint32_t quad = lane >> 2u;
+    const uint32_t tcol = (lane & 3u) * 2u;
+
+    float acc0[8], acc1[8];
 #pragma unroll
-    for (uint32_t i = 0; i < 8u; i++) acc[i] = 0.0f;
+    for (uint32_t i = 0; i < 8u; i++) { acc0[i] = 0.0f; acc1[i] = 0.0f; }
 
     for (uint32_t i = tid; i < 128u * 128u; i += 256u) {
         const uint32_t c = i >> 7u;
@@ -13831,8 +13842,13 @@ __global__ static void indexer_scores_wmma128_kernel(
     }
     __syncthreads();
 
+    const uint32_t t0_lo = tile_t + quad;
+    const uint32_t t0_hi = tile_t + quad + 8u;
+    const uint32_t t1_lo = tile_t + 16u + quad;
+    const uint32_t t1_hi = tile_t + 24u + quad;
+
     for (uint32_t h = 0; h < n_head; h++) {
-        for (uint32_t i = tid; i < 16u * 128u; i += 256u) {
+        for (uint32_t i = tid; i < 32u * 128u; i += 256u) {
             const uint32_t r = i >> 7u;
             const uint32_t d = i & 127u;
             const uint32_t token = tile_t + r;
@@ -13844,52 +13860,50 @@ __global__ static void indexer_scores_wmma128_kernel(
         }
         __syncthreads();
 
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a0, a1;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c0, c1;
+        wmma::fill_fragment(c0, 0.0f);
+        wmma::fill_fragment(c1, 0.0f);
         const uint32_t col0 = warp * 16u;
         for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
-            wmma::load_matrix_sync(a_frag, a_sh + k0, 136);
+            wmma::load_matrix_sync(a0, a_sh + k0, 136);
+            wmma::load_matrix_sync(a1, a_sh + 16u * 136u + k0, 136);
             wmma::load_matrix_sync(b_frag, b_sh + col0 * 136u + k0, 136);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            wmma::mma_sync(c0, a0, b_frag, c0);
+            wmma::mma_sync(c1, a1, b_frag, c1);
         }
-        wmma::store_matrix_sync(c_sh + warp * 16u * 16u, c_frag, 16, wmma::mem_row_major);
-        __syncthreads();
 
-        const uint32_t local0 = tid & 255u;
-        const uint32_t token0 = tile_t + (local0 >> 4u);
-        const float w0 = token0 < n_tokens ? weights[(uint64_t)token0 * n_head + h] : 0.0f;
-        uint32_t slot = 0;
-        for (uint32_t i = tid; i < 8u * 16u * 16u; i += 256u, slot++) {
-            const uint32_t wtile = i >> 8u;
-            const uint32_t local = i & 255u;
-            const uint32_t r = local >> 4u;
-            const uint32_t c = local & 15u;
-            const uint32_t token = tile_t + r;
-            const uint32_t comp = tile_c + wtile * 16u + c;
-            if (token < n_tokens && comp < n_comp) {
-                acc[slot] += fmaxf(c_sh[i], 0.0f) * w0;
-            }
+        /* OOB rows staged 0 -> dot 0 -> fmax(0)*0 adds 0; OOB comps staged
+         * 0 likewise, and the write loop re-guards.  Bitwise-identical to
+         * the smem-epilogue chain: same per-element op order. */
+        const float w0_lo = t0_lo < n_tokens ? weights[(uint64_t)t0_lo * n_head + h] : 0.0f;
+        const float w0_hi = t0_hi < n_tokens ? weights[(uint64_t)t0_hi * n_head + h] : 0.0f;
+        const float w1_lo = t1_lo < n_tokens ? weights[(uint64_t)t1_lo * n_head + h] : 0.0f;
+        const float w1_hi = t1_hi < n_tokens ? weights[(uint64_t)t1_hi * n_head + h] : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            acc0[i] += fmaxf(c0.x[i], 0.0f) * ((i & 2) ? w0_hi : w0_lo);
+            acc1[i] += fmaxf(c1.x[i], 0.0f) * ((i & 2) ? w1_hi : w1_lo);
         }
         __syncthreads();
     }
 
-    uint32_t slot = 0;
-    for (uint32_t i = tid; i < 8u * 16u * 16u; i += 256u, slot++) {
-        const uint32_t wtile = i >> 8u;
-        const uint32_t local = i & 255u;
-        const uint32_t r = local >> 4u;
-        const uint32_t c = local & 15u;
-        const uint32_t token = tile_t + r;
-        const uint32_t comp = tile_c + wtile * 16u + c;
-        if (token < n_tokens && comp < n_comp) {
-            float out = acc[slot] * scale;
-            if (causal) {
-                const uint32_t visible = (pos0 + token + 1u) / ratio;
-                if (comp >= visible) out = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const uint32_t row = quad + ((i & 2) ? 8u : 0u);
+        const uint32_t col = tcol + (i & 1) + ((i & 4) ? 8u : 0u);
+        const uint32_t comp = tile_c + warp * 16u + col;
+        for (uint32_t rt = 0; rt < 2u; rt++) {
+            const uint32_t token = tile_t + rt * 16u + row;
+            if (token < n_tokens && comp < n_comp) {
+                float out = (rt ? acc1[i] : acc0[i]) * scale;
+                if (causal) {
+                    const uint32_t visible = (pos0 + token + 1u) / ratio;
+                    if (comp >= visible) out = -INFINITY;
+                }
+                scores[(uint64_t)token * n_comp + comp] = out;
             }
-            scores[(uint64_t)token * n_comp + comp] = out;
         }
     }
 #endif
@@ -14858,7 +14872,8 @@ static int indexer_scores_launch(
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
         if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
-            dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
+            /* inc-3: the register-blocked kernel covers 32 tokens per CTA. */
+            dim3 grid((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
             indexer_scores_wmma128_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
