@@ -6124,6 +6124,11 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         uint32_t head_dim,
         uint32_t n_rot,
         uint32_t pos0,
+        /* v0.5 inc-8: optional per-row absolute positions (n_tok entries),
+         * same source selection as rope_tail_kernel.  NULL -> scalar
+         * fast-path (pos0 + t*pos_stride), byte-identical math. */
+        const int32_t *positions,
+        uint32_t pos_stride,
         uint32_t n_ctx_orig,
         int inverse,
         float freq_base,
@@ -6163,9 +6168,11 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         corr0 = fmaxf(0.0f, corr0);
         corr1 = fminf((float)(n_rot - 1), corr1);
     }
+    const int32_t eff_pos = positions ? positions[t]
+                                      : (int32_t)(pos0 + t * pos_stride);
     for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
         uint32_t i = pair * 2u;
-        float theta_extrap = (float)(pos0 + t) * powf(freq_base, -((float)i) / (float)n_rot);
+        float theta_extrap = (float)eff_pos * powf(freq_base, -((float)i) / (float)n_rot);
         float theta_interp = freq_scale * theta_extrap;
         float theta = theta_interp;
         float mscale = attn_factor;
@@ -11353,7 +11360,14 @@ __global__ static void __launch_bounds__(256) hc_expand_split_rmsf16_kernel(
         uint32_t post_stride,
         uint32_t comb_stride,
         int has_add,
-        float eps) {
+        float eps,
+        /* v0.5 inc-8 F5: optional per-expert UNSUMMED MoE down output
+         * ([token][n_expert_used][N_EMBD]).  Non-NULL replaces block_out
+         * with the guarded expert sum (bit-identical to moe_sum_kernel:
+         * ascending e, isfinite-guarded), staged once per token in shared
+         * memory so the four dst_hc passes read it at smem cost. */
+        const float *moe_unsummed,
+        uint32_t n_expert_used) {
     constexpr uint32_t N = N_EMBD * N_HC;
     constexpr uint32_t NPT = N / 256u;
     const uint32_t t = blockIdx.x;
@@ -11366,6 +11380,27 @@ __global__ static void __launch_bounds__(256) hc_expand_split_rmsf16_kernel(
     float *orow = out_hc + (uint64_t)t * N;
     __half *hrow = xh_out + (uint64_t)t * N;
 
+    /* moe path: each thread's NPT unrolled elements revisit the same
+     * N_EMBD/256 unique d values once per dst_hc, so the guarded expert
+     * sum stages into registers (no smem, no occupancy change) and is
+     * reused across the four dst_hc passes. */
+    constexpr uint32_t NDU = N_EMBD / 256u;
+    float bsum[NDU];
+    if (moe_unsummed) {
+        const float *md = moe_unsummed + (uint64_t)t * n_expert_used * N_EMBD;
+#pragma unroll
+        for (uint32_t k = 0; k < NDU; k++) {
+            const uint32_t d = threadIdx.x + k * 256u;
+            float acc = 0.0f;
+            for (uint32_t e = 0; e < n_expert_used; e++) {
+                const float mv = md[(uint64_t)e * N_EMBD + d];
+                if (isfinite(mv)) acc += mv;
+            }
+            if (has_add) acc += ba[d];
+            bsum[k] = acc;
+        }
+    }
+
     float v[NPT];
     float sum = 0.0f;
 #pragma unroll
@@ -11373,8 +11408,13 @@ __global__ static void __launch_bounds__(256) hc_expand_split_rmsf16_kernel(
         const uint32_t i = threadIdx.x + j * 256u;
         const uint32_t dst_hc = i / N_EMBD;
         const uint32_t d = i % N_EMBD;
-        float block_v = bo[d];
-        if (has_add) block_v += ba[d];
+        float block_v;
+        if (moe_unsummed) {
+            block_v = bsum[j % NDU];
+        } else {
+            block_v = bo[d];
+            if (has_add) block_v += ba[d];
+        }
         float acc = block_v * po[dst_hc];
         for (uint32_t src_hc = 0; src_hc < N_HC; src_hc++) {
             acc += co[dst_hc + src_hc * N_HC] * res[(uint64_t)src_hc * N_EMBD + d];
@@ -20137,10 +20177,15 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, u
     head_rms_norm_kernel<<<n_tok * n_head, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm launch");
 }
-extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
+extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, const ds4_gpu_tensor *positions, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    const int32_t *pos_dev = NULL;
+    if (positions) {
+        if (positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
+        pos_dev = (const int32_t *)positions->ptr;
+    }
+    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, pos_dev, 1u, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 /* M2-Inc2b: capture-safe fused head_rms + q-rope (device-scalars pos). */
@@ -25984,7 +26029,14 @@ static int routed_moe_launch(
         uint32_t n_expert,
         float clamp,
         const ds4_gpu_tensor *x,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        /* v0.5 inc-8 F5: skip the prefill-path moe_sum and leave `down`
+         * per-expert unsummed (reported via *out_sum_deferred); the caller
+         * folds the guarded sum into the HC expand epilogue.  Branches that
+         * sum internally simply never set the flag. */
+        int defer_sum,
+        int *out_sum_deferred) {
+    if (out_sum_deferred) *out_sum_deferred = 0;
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -26974,7 +27026,12 @@ mmq_moe_path:
             }
             }
         }
-        {
+        if (defer_sum) {
+            /* v0.5 inc-8 (F5 defer-sum): leave down per-expert unsummed; the
+             * caller folds the guarded 6-sum into the HC expand epilogue
+             * (bit-exact: same ascending-e isfinite-guarded order). */
+            if (out_sum_deferred) *out_sum_deferred = 1;
+        } else {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, ds4_current_stream()>>>(
                 (float *)out->ptr, (const float *)down->ptr,
@@ -27572,7 +27629,8 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, 1);
+                             selected, weights, n_total_expert, n_expert, clamp, x, 1,
+                             /*defer_sum=*/0, NULL);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     (void)layer_index;
@@ -27583,7 +27641,38 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens,
+                             /*defer_sum=*/0, NULL);
+}
+/* v0.5 inc-8 F5: defer-sum sibling — identical to the batch entry but asks
+ * the prefill mmq path to leave `down` per-expert unsummed.  On any branch
+ * that sums internally, *out_sum_deferred stays 0 and `out` is valid as
+ * before; when it returns 1 with *out_sum_deferred=1 the caller MUST
+ * consume `down` (guarded-sum semantics) instead of `out`. */
+extern "C" int ds4_gpu_routed_moe_batch_defer_sum_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, int *out_sum_deferred) {
+    (void)layer_index;
+    if (mid_is_f16) *mid_is_f16 = false;
+    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                             gate_offset, up_offset, down_offset,
+                             gate_type, down_type,
+                             gate_expert_bytes, gate_row_bytes,
+                             down_expert_bytes, down_row_bytes,
+                             expert_in_dim, expert_mid_dim, out_dim,
+                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens,
+                             /*defer_sum=*/1, out_sum_deferred);
+}
+/* v0.5 inc-8 F5 fallback: standalone guarded expert sum (bit-identical to
+ * the prefill path's internal moe_sum) for when a deferred sum cannot be
+ * folded into the HC epilogue after all. */
+extern "C" int ds4_gpu_moe_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    if (!out || !down || out_dim == 0 || n_expert == 0 || n_tokens == 0 ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
+        down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float)) return 0;
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, ds4_current_stream()>>>(
+        (float *)out->ptr, (const float *)down->ptr,
+        out_dim, n_expert, n_tokens, /*guard_nonfinite=*/1);
+    return cuda_ok(cudaGetLastError(), "moe_sum fallback launch");
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
@@ -28014,7 +28103,8 @@ extern "C" int ds4_gpu_hc_expand_rmsf16_split_tensor(ds4_gpu_tensor *out_hc, ds4
             (const float *)block_out->ptr, badd,
             (const float *)residual_hc->ptr,
             base + n_hc, base + 2u * n_hc,
-            n_tokens, mix_hc, mix_hc, has_add, norm_eps);
+            n_tokens, mix_hc, mix_hc, has_add, norm_eps,
+            /*moe_unsummed=*/NULL, 0u);
     if (!cuda_ok(cudaGetLastError(), "hc_expand_rmsf16 launch")) return 0;
     /* One-shot bounded-error parity selftest at production shape
      * (DS4_HC_EXPAND_RMS_FOLD_SELFTEST=1): run the unfused hc_expand_kernel +
@@ -28106,6 +28196,41 @@ extern "C" int ds4_gpu_hc_expand_rmsf16_split_tensor(ds4_gpu_tensor *out_hc, ds4
         free(ha); free(hb); free(hc); free(hd);
     }
     return 1;
+}
+/* v0.5 inc-8 F5: moe-variant of the fused expand — reads the per-expert
+ * UNSUMMED routed down output and folds the guarded 6-sum (bit-identical
+ * to moe_sum_kernel) + shared-expert add + HC expand + RMS + f16 emit into
+ * the one kernel.  Same gates and return-0-fallback contract as the plain
+ * entry; the caller must run ds4_gpu_moe_sum_tensor + the unfused expand
+ * when this declines. */
+extern "C" int ds4_gpu_hc_expand_rmsf16_split_moe_tensor(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *xh_out, const ds4_gpu_tensor *moe_down_unsummed, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc, uint32_t n_expert_used, float norm_eps) {
+    static int no_fold = -1;
+    if (no_fold < 0) no_fold = getenv("DS4_CUDA_NO_HC_EXPAND_RMS_FOLD") != NULL;
+    if (no_fold) return 0;
+    if (!out_hc || !xh_out || !moe_down_unsummed || !block_add || !residual_hc || !split) return 0;
+    if (n_embd != 4096u || n_hc != 4u || n_expert_used == 0u) return 0;
+    const uint64_t n = (uint64_t)n_hc * n_embd;
+    const uint32_t n_tokens = (uint32_t)(out_hc->bytes / (n * sizeof(float)));
+    if (n_tokens <= cuda_native_f16_max_tokens()) return 0;
+    if (xh_out->bytes < (uint64_t)n_tokens * n * sizeof(__half)) return 0;
+    if (moe_down_unsummed->bytes < (uint64_t)n_tokens * n_expert_used * n_embd * sizeof(float)) return 0;
+    if (block_add->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) return 0;
+    const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    const float *base = (const float *)split->ptr;
+    static int announced_moe = 0;
+    if (!announced_moe) {
+        announced_moe = 1;
+        fprintf(stderr, "ds4: hc expand folding deferred MoE sum (inc-8 F5)\n");
+    }
+    hc_expand_split_rmsf16_kernel<4096u, 4u><<<n_tokens, 256, 0, ds4_current_stream()>>>(
+            (float *)out_hc->ptr, (__half *)xh_out->ptr,
+            /*block_out (unused in moe path)=*/(const float *)block_add->ptr,
+            (const float *)block_add->ptr,
+            (const float *)residual_hc->ptr,
+            base + n_hc, base + 2u * n_hc,
+            n_tokens, mix_hc, mix_hc, /*has_add=*/1, norm_eps,
+            (const float *)moe_down_unsummed->ptr, n_expert_used);
+    return cuda_ok(cudaGetLastError(), "hc_expand_rmsf16_moe launch");
 }
 
 extern "C" int ds4_gpu_hc_expand_add_split_n2_rows_tensor(ds4_gpu_tensor *out0_hc, ds4_gpu_tensor *out1_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {

@@ -16476,17 +16476,41 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_b");
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
+    /* v0.5 inc-8: fused head-RMS + rope tail (one row read/write instead of
+     * two; bit-exact math).  Not taken when the Qnorm debug dump wants the
+     * pre-rope intermediate, or on Metal (stub returns 0) — then the
+     * separate pair below runs unchanged. */
+    bool q_norm_rope_fused = false;
+    if (ok && !metal_graph_debug_wants("Qnorm", il, pos0)) {
+        q_norm_rope_fused = ds4_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
+                                            n_tokens,
+                                            DS4_N_HEAD,
+                                            DS4_N_HEAD_DIM,
+                                            DS4_N_ROT,
+                                            pos0,
+                                            positions,
+                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                            false,
+                                            freq_base,
+                                            freq_scale,
+                                            ext_factor,
+                                            attn_factor,
+                                            DS4_ROPE_YARN_BETA_FAST,
+                                            DS4_ROPE_YARN_BETA_SLOW,
+                                            DS4_RMS_EPS) != 0;
+    }
+    if (ok && !q_norm_rope_fused) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
                                                 n_tokens,
                                                 DS4_N_HEAD,
                                                 DS4_N_HEAD_DIM,
                                                 DS4_RMS_EPS) != 0;
-    if (ok) {
+    if (ok && !q_norm_rope_fused) {
         metal_graph_debug_dump_tensor("Qnorm", g->batch_q,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("head_norm");
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
+    if (ok && !q_norm_rope_fused)
+              ok = ds4_gpu_rope_tail_tensor(g->batch_q,
                                             n_tokens,
                                             DS4_N_HEAD,
                                             DS4_N_HEAD_DIM,
@@ -19271,7 +19295,49 @@ static bool metal_graph_encode_layer_ffn_batch(
 
     const double moe_t0 = g_cont_prof > 0 ? now_sec() : 0.0;
     const uint32_t sp_moe = ok ? ds4_gpu_stage_prof_begin(DS4_SPROF_MOE) : UINT32_MAX;
-    if (ok) {
+    /* v0.5 inc-8 F5: defer the routed expert sum into the HC expand
+     * epilogue when nothing needs the summed batch_routed_out (bit-exact:
+     * same guarded ascending-e sum).  Consumers that need it (ffn_out keep,
+     * steering, the ffn_moe_out dump, the last layer's plain expand) force
+     * the classic path. */
+    int routed_sum_deferred = 0;
+    const bool routed_defer_want =
+        il + 1u < DS4_N_LAYER &&
+        !metal_graph_use_reference_hc_decode() &&
+        !metal_graph_needs_ffn_out(g, il, pos0) &&
+        !metal_graph_directional_steering_ffn_enabled(g) &&
+        !metal_graph_debug_wants("ffn_moe_out", il, pos0);
+    if (ok && routed_defer_want) {
+        ok = ds4_gpu_routed_moe_batch_defer_sum_tensor(g->batch_routed_out,
+                                               g->batch_routed_gate,
+                                               g->batch_routed_up,
+                                               g->batch_routed_mid,
+                                               g->batch_routed_down,
+                                               model->map,
+                                               model->size,
+                                               layer->ffn_gate_exps->abs_offset,
+                                               layer->ffn_up_exps->abs_offset,
+                                               layer->ffn_down_exps->abs_offset,
+                                               layer->ffn_gate_exps->type,
+                                               layer->ffn_down_exps->type,
+                                               gate_expert_bytes,
+                                               gate_row_bytes,
+                                               down_expert_bytes,
+                                               down_row_bytes,
+                                               (uint32_t)expert_in_dim,
+                                               (uint32_t)down_in_dim,
+                                               (uint32_t)routed_out_dim,
+                                               g->batch_router_selected,
+                                               g->batch_router_weights,
+                                               DS4_N_EXPERT,
+                                               DS4_N_EXPERT_USED,
+                                               DS4_SWIGLU_CLAMP_EXP,
+                                               g->batch_ffn_norm,
+                                               il,
+                                               n_tokens,
+                                               &g->batch_routed_mid_is_f16,
+                                               &routed_sum_deferred) != 0;
+    } else if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_gate,
                                                g->batch_routed_up,
@@ -19323,7 +19389,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_moe_down", g->batch_routed_down,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos0);
     }
-    if (ok) {
+    if (ok && !routed_sum_deferred) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->batch_routed_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
@@ -19414,23 +19480,43 @@ static bool metal_graph_encode_layer_ffn_batch(
          * has no next mix, so it stays on the plain expand. */
         bool hc_expand_folded = false;
         if (il + 1u < DS4_N_LAYER && !metal_graph_use_reference_hc_decode()) {
-            hc_expand_folded = ds4_gpu_hc_expand_rmsf16_split_tensor(next_hc_view,
-                    g->batch_flat_hc, g->batch_routed_out, g->batch_shared_out,
-                    g->batch_after_attn_hc, hc_split_view,
-                    DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS) != 0;
+            if (routed_sum_deferred)
+                /* v0.5 inc-8 F5: guarded 6-sum + shared add + expand + RMS
+                 * + f16 in one kernel (batch_routed_out never written). */
+                hc_expand_folded = ds4_gpu_hc_expand_rmsf16_split_moe_tensor(next_hc_view,
+                        g->batch_flat_hc, g->batch_routed_down, g->batch_shared_out,
+                        g->batch_after_attn_hc, hc_split_view,
+                        DS4_N_EMBD, DS4_N_HC, DS4_N_EXPERT_USED, DS4_RMS_EPS) != 0;
+            else
+                hc_expand_folded = ds4_gpu_hc_expand_rmsf16_split_tensor(next_hc_view,
+                        g->batch_flat_hc, g->batch_routed_out, g->batch_shared_out,
+                        g->batch_after_attn_hc, hc_split_view,
+                        DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS) != 0;
             if (hc_expand_folded) {
                 g->batch_hc_f16_src = (const void *)g->batch_next_hc;
                 g->batch_hc_f16_ntok = n_tokens;
             }
         }
-        if (!hc_expand_folded)
-            ok = ds4_gpu_hc_expand_add_split_tensor(next_hc_view,
+        if (!hc_expand_folded) {
+            if (routed_sum_deferred) {
+                /* fold declined after a deferred sum: materialize it now
+                 * (bit-identical guarded sum), then the unfused expand. */
+                ok = ds4_gpu_moe_sum_tensor(g->batch_routed_out,
+                                              g->batch_routed_down,
+                                              DS4_N_EMBD,
+                                              DS4_N_EXPERT_USED,
+                                              n_tokens) != 0;
+                routed_sum_deferred = 0;
+            }
+            if (ok)
+                ok = ds4_gpu_hc_expand_add_split_tensor(next_hc_view,
                                                       g->batch_routed_out,
                                                       g->batch_shared_out,
                                                       g->batch_after_attn_hc,
                                                       hc_split_view,
                                                       DS4_N_EMBD,
                                                       DS4_N_HC) != 0;
+        }
     }
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->batch_next_hc,

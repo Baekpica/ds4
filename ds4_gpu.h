@@ -1915,6 +1915,41 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
 
+/* v0.5 inc-8 F5: defer-sum sibling of the batch entry.  When it returns 1
+ * with *out_sum_deferred = 1, `down` holds per-expert unsummed rows and
+ * `out` is NOT written — consume via the moe-variant fused expand or
+ * ds4_gpu_moe_sum_tensor.  Metal never defers (forwards + reports 0). */
+int ds4_gpu_routed_moe_batch_defer_sum_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16,
+        int                    *out_sum_deferred);
+
 /* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================
@@ -2030,6 +2065,30 @@ int ds4_gpu_hc_stage_fused_tensor(
  * (capture-safe).  Returns 0 on any precondition miss and ALWAYS on Metal;
  * callers fall back to the separate head_rms_norm + rope_tail_scalars
  * chain, which is bit-exact to this kernel. */
+/* v0.5 inc-8: fused per-head RMS-norm + q-rope tail for the eager batch
+ * path (one read/write of the head row instead of two; math bit-exact vs
+ * the head_rms_norm + rope_tail pair — the tail values get the rms scale
+ * applied inline before rotation).  positions: optional per-row absolute
+ * positions (n_tok int32), NULL = scalar pos0 + t.  Returns 0 when not
+ * taken (shape mismatch or Metal) — callers fall back to the pair. */
+int ds4_gpu_head_rms_norm_rope_tail_tensor(
+        ds4_gpu_tensor       *x,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        const ds4_gpu_tensor *positions,
+        uint32_t                n_ctx_orig,
+        bool                    inverse,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   eps);
+
 int ds4_gpu_head_rms_norm_rope_tail_scalars_tensor(
         ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
         uint32_t n_rot, const void *scalars, int32_t pos_offset, uint32_t pos_stride,
@@ -2099,6 +2158,32 @@ int ds4_gpu_hc_expand_rmsf16_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc,
         float                   norm_eps);
+
+/* v0.5 inc-8 F5: moe-variant of the fused expand — consumes the PER-EXPERT
+ * UNSUMMED routed down output (from the defer-sum MoE entry) and folds the
+ * guarded expert sum + shared add + HC expand + RMS + f16 emit into one
+ * kernel.  Returns 0 when not taken; callers then run
+ * ds4_gpu_moe_sum_tensor + the unfused expand. */
+int ds4_gpu_hc_expand_rmsf16_split_moe_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *xh_out,
+        const ds4_gpu_tensor *moe_down_unsummed,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_expert_used,
+        float                   norm_eps);
+
+/* v0.5 inc-8 F5: guarded standalone expert sum (bit-identical to the MoE
+ * path's internal sum) — the fallback consumer for a deferred sum. */
+int ds4_gpu_moe_sum_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *down,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens);
 
 int ds4_gpu_hc_expand_add_split_n2_rows_tensor(
         ds4_gpu_tensor       *out0_hc,

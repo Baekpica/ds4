@@ -15402,6 +15402,61 @@ int ds4_gpu_routed_moe_one_tensor(
     return 1;
 }
 
+/* v0.5 inc-8 F5: Metal never defers the MoE sum — forward to the normal
+ * entry and report not-deferred so callers consume `out` as usual. */
+int ds4_gpu_routed_moe_batch_defer_sum_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16,
+        int *out_sum_deferred) {
+    if (out_sum_deferred) *out_sum_deferred = 0;
+    return ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens, mid_is_f16);
+}
+
+/* v0.5 inc-8 F5: CUDA-only helpers; Metal returns 0 (callers fall back). */
+int ds4_gpu_moe_sum_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *down,
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    (void)out; (void)down; (void)out_dim; (void)n_expert; (void)n_tokens;
+    return 0;
+}
+
+int ds4_gpu_hc_expand_rmsf16_split_moe_tensor(
+        ds4_gpu_tensor *out_hc, ds4_gpu_tensor *xh_out,
+        const ds4_gpu_tensor *moe_down_unsummed, const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_expert_used, float norm_eps) {
+    (void)out_hc; (void)xh_out; (void)moe_down_unsummed; (void)block_add;
+    (void)residual_hc; (void)split; (void)n_embd; (void)n_hc;
+    (void)n_expert_used; (void)norm_eps;
+    return 0;
+}
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -16242,6 +16297,32 @@ int ds4_gpu_hc_stage_fused_tensor(
 
 /* M2-Inc2: the fused QKV-post kernels are CUDA-only; returning 0 routes the
  * shared decode encoder onto the separate (bit-exact) unfused chains. */
+/* v0.5 inc-8: CUDA-only fused head-RMS + rope tail; Metal returns 0 so
+ * callers fall back to the separate pair. */
+int ds4_gpu_head_rms_norm_rope_tail_tensor(
+        ds4_gpu_tensor       *x,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        const ds4_gpu_tensor *positions,
+        uint32_t                n_ctx_orig,
+        bool                    inverse,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   eps) {
+    (void)x; (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot;
+    (void)pos0; (void)positions; (void)n_ctx_orig; (void)inverse;
+    (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow; (void)eps;
+    return 0;
+}
+
 int ds4_gpu_head_rms_norm_rope_tail_scalars_tensor(
         ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
         uint32_t n_rot, const void *scalars, int32_t pos_offset, uint32_t pos_stride,
