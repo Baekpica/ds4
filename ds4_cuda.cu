@@ -10140,6 +10140,122 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_union_build
     if (tid == 0u) counts[blockIdx.x] = running_s;
 }
 
+/* v0.5 inc-6: n_comp-independent union builder for the deep engage regime.
+ * The bitmap builder above carries (n_comp+1)>>1 u32 words of dynamic smem
+ * (16-bit token mask per comp) -- 64 KiB at n_comp 32768, past the device
+ * ceiling beyond -- which was the whole n_comp <= 32768 engage gate
+ * (attention stepped 569 -> 1014 ms/chunk past 131k tokens).  A tile only
+ * ever holds kTTTileTokens * top_k = 8192 candidates, so instead: pack
+ * (comp_id << 4) | tok into u32 (top_k == 512 by dispatch gate; comp ids
+ * are far below 2^28), block-radix-sort ascending (33.8 KiB static temp,
+ * n_comp-independent, no opt-in attribute), dedup adjacent ids, OR token
+ * bits into the pre-zeroed record masks -- runs straddling thread
+ * boundaries land via atomicOr at scan[tid]-1, and ascending order makes
+ * the globally-first valid key always a start, so that rank exists.
+ * Emits BIT-IDENTICAL records/counts to the bitmap builder (proven across
+ * 72 shape-legs incl. both visibility branches, ragged tiles, -1 pads;
+ * proto_attn_union_sort.cu).  Dispatch keeps the bitmap builder for
+ * n_comp <= 32768 where it is faster (crossover ~40k; sort is flat
+ * ~0.17 ms/launch at every depth). */
+typedef cub::BlockRadixSort<uint32_t, 512, 16> tt_UnionSortT;
+
+__global__ static void __launch_bounds__(512, 1) attention_tokentile_union_sort_kernel(
+        int2 *records,
+        uint32_t *counts,
+        const int32_t *topk,
+        const int32_t *positions,
+        uint32_t pos0,
+        uint32_t n_tokens,
+        uint32_t top_k,
+        uint32_t ratio,
+        uint32_t n_comp,
+        uint32_t rec_stride) {
+    __shared__ typename tt_UnionSortT::TempStorage sort_tmp;
+    __shared__ uint32_t scan[513];
+    __shared__ uint32_t edge_uid[512];
+    const uint32_t kInvalid = 0xFFFFFFFFu;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t tile_base = blockIdx.x * kTTTileTokens;
+    if (tile_base >= n_tokens) {
+        if (tid == 0u) counts[blockIdx.x] = 0u;
+        return;
+    }
+    const uint32_t tile_count =
+        n_tokens - tile_base < kTTTileTokens ? n_tokens - tile_base : kTTTileTokens;
+
+    int2 *rec = records + (uint64_t)blockIdx.x * rec_stride;
+    for (uint32_t r = tid; r < rec_stride; r += blockDim.x)
+        ((int *)&rec[r])[1] = 0;
+
+    uint32_t keys[16];
+    const uint32_t total_slots = tile_count * top_k;
+#pragma unroll
+    for (uint32_t i = 0; i < 16u; i++) {
+        const uint32_t idx = tid * 16u + i;
+        uint32_t key = kInvalid;
+        if (idx < total_slots) {
+            const uint32_t tok = idx / top_k;
+            const uint32_t s = idx - tok * top_k;
+            const uint32_t t = tile_base + tok;
+            const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+            uint32_t visible = ratio
+                ? (positions ? qpos / ratio : (qpos + 1u) / ratio) : n_comp;
+            if (visible > n_comp) visible = n_comp;
+            const int32_t c = topk[(uint64_t)t * top_k + s];
+            if (c >= 0 && (uint32_t)c < visible)
+                key = ((uint32_t)c << 4u) | tok;
+        }
+        keys[i] = key;
+    }
+    __syncthreads();
+    tt_UnionSortT(sort_tmp).Sort(keys);
+    __syncthreads();
+
+    edge_uid[tid] = keys[15] >> 4u;
+    __syncthreads();
+    const uint32_t prev_edge = tid ? edge_uid[tid - 1u] : kInvalid;
+
+    uint32_t local_starts = 0;
+    uint32_t prev_uid = prev_edge;
+#pragma unroll
+    for (uint32_t i = 0; i < 16u; i++) {
+        const uint32_t uid = keys[i] >> 4u;
+        if (keys[i] != kInvalid && uid != prev_uid) local_starts++;
+        prev_uid = uid;
+    }
+    if (tid == 0u) scan[0] = 0u;
+    scan[tid + 1u] = local_starts;
+    __syncthreads();
+    for (uint32_t off = 1u; off < blockDim.x; off <<= 1u) {
+        uint32_t v = 0u;
+        if (tid >= off) v = scan[tid + 1u - off];
+        __syncthreads();
+        scan[tid + 1u] += v;
+        __syncthreads();
+    }
+    const uint32_t total = scan[blockDim.x];
+
+    uint32_t rank = scan[tid];
+    prev_uid = prev_edge;
+#pragma unroll
+    for (uint32_t i = 0; i < 16u; i++) {
+        const uint32_t key = keys[i];
+        if (key != kInvalid) {
+            const uint32_t uid = key >> 4u;
+            if (uid != prev_uid) {
+                ((int *)&rec[rank])[0] = (int)uid;
+                rank++;
+            }
+            atomicOr((unsigned int *)&((int *)&rec[rank - 1u])[1],
+                     1u << (key & 0xFu));
+        }
+        prev_uid = key >> 4u;
+    }
+    __syncthreads();
+    if (tid == 0u) counts[blockIdx.x] = total;
+}
+
 __global__ static void __launch_bounds__(256, 1) attention_tokentile_raw_mirror_kernel(
         half *dst,
         const float *raw_kv,
@@ -21457,7 +21573,13 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         top_k == 512u && window == kTTRawWindow && ratio != 0u &&
         scalars == NULL && ls_override == NULL &&
         tt_run_pos0 != UINT32_MAX &&
-        n_comp != 0u && n_comp <= 32768u &&
+        /* v0.5 inc-6: the n_comp <= 32768 engage gate is lifted -- the sort
+         * union builder below is n_comp-independent, and every other stage
+         * (records at rec_stride <= 8192, mirrors, hmma record walk) already
+         * scales.  DS4_CUDA_NO_ATTN_TT_DEEP restores the old disengage for
+         * forensics. */
+        n_comp != 0u &&
+        (n_comp <= 32768u || getenv("DS4_CUDA_NO_ATTN_TT_DEEP") == NULL) &&
         (pos_dev == NULL || allow_mseq_heads8 != 0u) &&
         ((pos_dev == NULL) == (seq_dev == NULL)) &&
         ds4_cuda_attn_tokentile_arch_ok()) {
@@ -21503,23 +21625,6 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 uint32_t *tt_counts = (uint32_t *)(scratch + counts_off);
                 half *tt_raw_mirror = (half *)(scratch + raw_mirror_off);
                 half *tt_comp_mirror = (half *)(scratch + comp_mirror_off);
-                const uint32_t bitmap_words = (n_comp + 1u) >> 1u;
-                const size_t bitmap_smem = (size_t)bitmap_words * sizeof(uint32_t);
-                /* The launch limit binds on static + dynamic shared memory,
-                 * and the union builder carries ~2 KiB static (scan[513]),
-                 * so the no-opt-in 48 KiB ceiling is crossed from
-                 * n_comp > 23548 (kv ~94k) even while bitmap_smem alone is
-                 * under 48 KiB.  Opt in once to the largest bitmap the
-                 * n_comp <= 32768 engage gate admits. */
-                static int tt_union_smem_attr_set = 0;
-                if (!tt_union_smem_attr_set) {
-                    cudaError_t attr_err = cudaFuncSetAttribute(
-                            attention_tokentile_union_build_kernel,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)(((32768u + 1u) >> 1u) * sizeof(uint32_t)));
-                    if (!cuda_ok(attr_err, "attention tokentile union smem attribute")) return 0;
-                    tt_union_smem_attr_set = 1;
-                }
                 static int tt_hmma_smem_attr_set = 0;
                 if (!tt_hmma_smem_attr_set) {
                     cudaError_t attr_err = cudaFuncSetAttribute(
@@ -21530,17 +21635,59 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     tt_hmma_smem_attr_set = 1;
                 }
 
-                attention_tokentile_union_build_kernel<<<n_tiles, kTTThreads, bitmap_smem, ds4_current_stream()>>>(
-                        tt_records,
-                        tt_counts,
-                        topk_ptr,
-                        pos_dev,
-                        pos0,
-                        n_tokens,
-                        top_k,
-                        ratio,
-                        n_comp,
-                        rec_stride);
+                /* v0.5 inc-6: builder choice is pure perf policy -- both emit
+                 * bit-identical records (proto_attn_union_sort.cu, 72 legs).
+                 * The bitmap builder wins below its smem reach (crossover
+                 * ~40k); the sort builder is n_comp-independent and carries
+                 * the lifted deep regime. */
+                if (n_comp <= 32768u) {
+                    const uint32_t bitmap_words = (n_comp + 1u) >> 1u;
+                    const size_t bitmap_smem = (size_t)bitmap_words * sizeof(uint32_t);
+                    /* The launch limit binds on static + dynamic shared
+                     * memory, and the union builder carries ~2 KiB static
+                     * (scan[513]), so the no-opt-in 48 KiB ceiling is crossed
+                     * from n_comp > 23548 (kv ~94k) even while bitmap_smem
+                     * alone is under 48 KiB.  Opt in once to the largest
+                     * bitmap this tier admits. */
+                    static int tt_union_smem_attr_set = 0;
+                    if (!tt_union_smem_attr_set) {
+                        cudaError_t attr_err = cudaFuncSetAttribute(
+                                attention_tokentile_union_build_kernel,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int)(((32768u + 1u) >> 1u) * sizeof(uint32_t)));
+                        if (!cuda_ok(attr_err, "attention tokentile union smem attribute")) return 0;
+                        tt_union_smem_attr_set = 1;
+                    }
+                    attention_tokentile_union_build_kernel<<<n_tiles, kTTThreads, bitmap_smem, ds4_current_stream()>>>(
+                            tt_records,
+                            tt_counts,
+                            topk_ptr,
+                            pos_dev,
+                            pos0,
+                            n_tokens,
+                            top_k,
+                            ratio,
+                            n_comp,
+                            rec_stride);
+                } else {
+                    static int logged_tt_deep = 0;
+                    if (!logged_tt_deep) {
+                        logged_tt_deep = 1;
+                        fprintf(stderr, "ds4: attention tokentile deep engage (first n_comp=%u n_tokens=%u)\n",
+                                n_comp, n_tokens);
+                    }
+                    attention_tokentile_union_sort_kernel<<<n_tiles, kTTThreads, 0, ds4_current_stream()>>>(
+                            tt_records,
+                            tt_counts,
+                            topk_ptr,
+                            pos_dev,
+                            pos0,
+                            n_tokens,
+                            top_k,
+                            ratio,
+                            n_comp,
+                            rec_stride);
+                }
                 if (!cuda_ok(cudaGetLastError(), "attention tokentile union build launch")) return 0;
                 attention_tokentile_raw_mirror_kernel<<<n_mirror_rows, 256, 0, ds4_current_stream()>>>(
                         tt_raw_mirror,
