@@ -18315,6 +18315,52 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
+                /* v0.5 inc-5: combined mxf4 score+select chain for deep
+                 * eager chunks (single-run admission or single-seq batch).
+                 * Engaged => comp_selected is written directly and the
+                 * classic scores+topk pair below is SKIPPED.  Capture
+                 * steps and multi-seq batches always fall through. */
+                int rr_engaged = 0;
+                if (ok && !g->batch_capture_step &&
+                    (admit_single_run || seq_positions == NULL)) {
+                    ok = ds4_gpu_indexer_score_select_prefill_tensor(
+                             g->comp_selected,
+                             g->indexer_scores,
+                             g->batch_indexer_q,
+                             g->batch_indexer_weights,
+                             n_comp,
+                             n_tokens,
+                             admit_single_run
+                                 ? (uint32_t)g->ms_positions[0] : pos0,
+                             DS4_N_INDEXER_HEAD,
+                             DS4_N_INDEXER_HEAD_DIM,
+                             ratio,
+                             DS4_N_INDEXER_TOP_K,
+                             index_scale,
+                             admit_single_run
+                                 ? (uint32_t)g->ms_seq_id[0] : UINT32_MAX,
+                             g->layer_comp_cap[il],
+                             g->layer_index_comp_cache_fp4[il],
+                             g->layer_index_comp_scale[il],
+                             &rr_engaged) != 0;
+                }
+                if (ok && rr_engaged) {
+                    if (index_stage_profile) {
+                        ok = metal_graph_indexer_stage_profile_boundary("score_select",
+                                                                        il,
+                                                                        pos0,
+                                                                        n_tokens,
+                                                                        n_comp,
+                                                                        &index_stage_t0);
+                    }
+                    if (ok) {
+                        metal_graph_debug_dump_i32_tensor("indexer_topk",
+                                                          g->comp_selected,
+                                                          (uint64_t)n_tokens * DS4_N_INDEXER_TOP_K,
+                                                          il,
+                                                          pos0);
+                    }
+                }
                 /* FE1: single-bank contiguous chunk -> serial WMMA scores on a
                  * bank-offset view.  The WMMA causal clamp is pos0-anchored
                  * (visible = (pos0+t+1)/ratio), and this function's pos0 arg is
@@ -18330,6 +18376,7 @@ static bool metal_graph_encode_layer_attention_batch(
                  * Rows [visible, band) are written -INF and never scanned. */
                 const uint32_t idx_grid_n = g->batch_capture_step
                     ? metal_graph_cont_capture_band(n_comp) : n_comp;
+                if (ok && !rr_engaged)
                 ok = ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
                                                                   g->batch_indexer_q,
                                                                   g->batch_indexer_weights,
@@ -18352,7 +18399,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                   g->layer_index_comp_scale[il],
                                                                   /* v0.3 V5D: indexer-Q QAT scales */
                                                                   g->batch_indexer_q_scale) != 0;
-                if (ok && index_stage_profile) {
+                if (ok && !rr_engaged && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                     il,
                                                                     pos0,
@@ -18360,14 +18407,14 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
-                if (ok) {
+                if (ok && !rr_engaged) {
                     metal_graph_debug_dump_tensor("indexer_scores",
                                                   g->indexer_scores,
                                                   (uint64_t)n_comp * n_tokens,
                                                   il,
                                                   pos0);
                 }
-                if (ok) {
+                if (ok && !rr_engaged) {
                     ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                                        g->indexer_scores,
                                                        idx_grid_n,
@@ -18506,6 +18553,45 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 n_comp,
                                                                 &index_stage_t0);
             }
+            /* v0.5 inc-5: combined mxf4 score+select chain (zero-prefix =>
+             * pos0 0, no bank view).  Engaged => skip the classic pair. */
+            int rr_engaged = 0;
+            ok = ds4_gpu_indexer_score_select_prefill_tensor(
+                     g->comp_selected,
+                     g->indexer_scores,
+                     g->batch_indexer_q,
+                     g->batch_indexer_weights,
+                     n_comp,
+                     n_tokens,
+                     0u,
+                     DS4_N_INDEXER_HEAD,
+                     DS4_N_INDEXER_HEAD_DIM,
+                     ratio,
+                     DS4_N_INDEXER_TOP_K,
+                     index_scale,
+                     UINT32_MAX,
+                     0u,
+                     g->layer_index_comp_cache_fp4[il],
+                     g->layer_index_comp_scale[il],
+                     &rr_engaged) != 0;
+            if (ok && rr_engaged) {
+                if (index_stage_profile) {
+                    ok = metal_graph_indexer_stage_profile_boundary("score_select",
+                                                                    il,
+                                                                    pos0,
+                                                                    n_tokens,
+                                                                    n_comp,
+                                                                    &index_stage_t0);
+                }
+                if (ok) {
+                    metal_graph_debug_dump_i32_tensor("indexer_topk",
+                                                      g->comp_selected,
+                                                      (uint64_t)n_tokens * DS4_N_INDEXER_TOP_K,
+                                                      il,
+                                                      pos0);
+                }
+            }
+            if (ok && !rr_engaged)
             ok = ds4_gpu_indexer_scores_prefill_tensor(g->indexer_scores,
                                                          g->batch_indexer_q,
                                                          g->batch_indexer_weights,
@@ -18519,7 +18605,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          /* P2 Inc3b: FP4 indexer mirror */
                                                          g->layer_index_comp_cache_fp4[il],
                                                          g->layer_index_comp_scale[il]) != 0;
-            if (ok && index_stage_profile) {
+            if (ok && !rr_engaged && index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                 il,
                                                                 pos0,
@@ -18527,14 +18613,14 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 n_comp,
                                                                 &index_stage_t0);
             }
-            if (ok) {
+            if (ok && !rr_engaged) {
                 metal_graph_debug_dump_tensor("indexer_scores",
                                               g->indexer_scores,
                                               (uint64_t)n_comp * n_tokens,
                                               il,
                                               pos0);
             }
-            if (ok) {
+            if (ok && !rr_engaged) {
                 ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                                    g->indexer_scores,
                                                    n_comp,

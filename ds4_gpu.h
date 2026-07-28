@@ -661,6 +661,35 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_comp_max,
         uint32_t                il_for_decode1);
 
+/* v0.5 inc-5: combined score+select for deep prefill chunks (CUDA mxf4
+ * retrieve-and-rerank chain).  When it engages it writes the top-512
+ * selected ids directly (stream-tier byte order, 0xFFFFFFFF sentinels) and
+ * sets *engaged = 1; the caller must then SKIP the classic scores+topk
+ * pair.  *engaged = 0 means fall through (scores scratch untouched).
+ * Returns 0 only on a launch error.  Never engages inside stream capture,
+ * without the FP4 indexer mirror, at n_comp <= 65536, or on non-sm_121a
+ * builds; escape hatch DS4_CUDA_NO_INDEXER_MXF4.  single_bank/comp_cap
+ * mirror the FE1 bank-view convention of the scores entry (UINT32_MAX/0 =
+ * no bank indirection).  Metal: stub, never engages. */
+int ds4_gpu_indexer_score_select_prefill_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                top_k,
+        float                   scale,
+        uint32_t                single_bank,
+        uint32_t                comp_cap,
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale,
+        int                    *engaged);
+
 /* GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
  * out_idx[0]. Tie-break: lower index wins (matches host sample_argmax). */
 int ds4_gpu_argmax_tensor(

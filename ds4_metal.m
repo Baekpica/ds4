@@ -5783,6 +5783,34 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
                                                  scale);
 }
 
+/* v0.5 inc-5: CUDA-only mxf4 retrieve-and-rerank chain; Metal never
+ * engages, the caller falls through to the classic scores+topk pair. */
+int ds4_gpu_indexer_score_select_prefill_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                top_k,
+        float                   scale,
+        uint32_t                single_bank,
+        uint32_t                comp_cap,
+        ds4_gpu_tensor       *index_fp4,
+        ds4_gpu_tensor       *index_scale,
+        int                    *engaged) {
+    (void)selected; (void)scores; (void)q; (void)weights; (void)n_comp;
+    (void)n_tokens; (void)pos0; (void)n_head; (void)head_dim; (void)ratio;
+    (void)top_k; (void)scale; (void)single_bank; (void)comp_cap;
+    (void)index_fp4; (void)index_scale;
+    if (engaged) *engaged = 0;
+    return 1;
+}
+
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,

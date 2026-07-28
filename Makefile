@@ -25,7 +25,16 @@ CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
+ifeq ($(strip $(CUDA_ARCH)),sm_121)
+# GB10: the v0.5 mxf4 block-scale MMA (indexer rr-selector) needs the
+# arch-SPECIFIC target.  -arch=sm_121a alone silently emits .target sm_121
+# and ptxas rejects the MMA, so the gencode pair is mandatory; sm_121a
+# SASS runs on every sm_121 device.  DS4_CUDA_HAVE_MXF4 gates the kernels
+# AND the host engage path so non-121a builds stay coherent.
+NVCC_ARCH_FLAGS := -gencode arch=compute_121a,code=sm_121a -DDS4_CUDA_HAVE_MXF4=1
+else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
+endif
 endif
 NVCC_EXTRA_FLAGS ?=
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math -std=c++17 $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread $(NVCC_EXTRA_FLAGS)
