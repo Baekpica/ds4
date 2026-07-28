@@ -14498,6 +14498,125 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
     }
 }
 
+/* inc-4 topk diet: single-pass streaming exact top-512 for the prefill
+ * chunked tier (n_comp > 8192, n_tokens >= 32).  One block per token
+ * streams the whole scores row once, keeping candidates above a rising
+ * exact threshold (the 512th-best-so-far after each buffer compaction; a
+ * prefix 512th-best key can only be <= the global one, so no true member
+ * is ever rejected).  Total order = topk_pack_key descending == the
+ * topk_score_better order used by the bitonic tiers (and already relied
+ * on by the 8192-cub tier), so the selected array is byte-identical to
+ * the chunked tree's, sentinel behavior included.  The rotated per-token
+ * start offset breaks globally monotone score trends (recency-shaped
+ * rows), the one measured adversarial accept-storm case; exactness is
+ * stream-order independent so the rotation cannot change the result.
+ * Replaces the chunk sorts, the merge tree, AND the per-launch candidate
+ * scratch on this tier (proto_topk_diet.cu: 372-check bitwise sweep vs
+ * the tree across shapes x adversarial patterns + CPU reference;
+ * memcheck-clean; compute-sanitizer racecheck flags on this kernel were
+ * adjudicated as a tool artifact of the load-fed-predicate pattern —
+ * elimination dossier in brief-v05-arc.md 2026-07-28). */
+__global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
+        uint32_t *selected,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t top_k) {
+    constexpr uint32_t STREAM_THREADS = 512u;
+    constexpr uint32_t STREAM_ITEMS = 4u;
+    constexpr uint32_t STREAM_CAP = STREAM_THREADS * STREAM_ITEMS;   /* 2048 */
+    using StreamSort = cub::BlockRadixSort<uint64_t, STREAM_THREADS, STREAM_ITEMS>;
+    /* buf and the cub scratch are deliberately SEPARATE regions: an earlier
+     * draft aliased them and persisted candidates across sorts, which
+     * violates the TempStorage reuse contract (racecheck-confirmed hazards,
+     * in-vivo illegal access).  Keys cross between the regions in registers
+     * only.  ~33 KB static smem total, 3 blocks/SM. */
+    __shared__ uint64_t buf[STREAM_CAP];
+    __shared__ typename StreamSort::TempStorage sort_tmp;
+    __shared__ uint32_t s_cnt;
+    __shared__ uint64_t s_thr;
+
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens) return;
+    const float *row = scores + (uint64_t)t * n_comp;
+    if (tid == 0) { s_cnt = 0; s_thr = 0; }
+    __syncthreads();
+
+    const uint32_t start = (uint32_t)(((uint64_t)(t + 1u) * 0x9E3779B9u) % n_comp);
+    /* tile = one read per thread: STREAM_CAP - tile = 1536 leaves 1024 keys
+     * of slack above the kept top_k, so a compact runs only when the buffer
+     * genuinely fills.  A wider tile with zero slack (CAP - tile == top_k)
+     * degenerates to a full sort per tile at depth — slack, not capacity,
+     * prices the compact cadence (proto receipt topk_diet_timing3 vs 4). */
+    const uint32_t tile = blockDim.x;
+    for (uint32_t base = 0; base < n_comp; base += tile) {
+        const uint64_t thr = s_thr;
+        {
+            const uint32_t i = base + tid;
+            uint64_t key = 0;
+            bool take = false;
+            if (i < n_comp) {
+                uint32_t c = start + i;
+                if (c >= n_comp) c -= n_comp;
+                key = topk_pack_key(row[c], c);
+                take = key > thr;   /* thr=0 accepts all real keys */
+            }
+            /* warp-aggregated append: one atomic per warp of accepts */
+            const uint32_t ball = __ballot_sync(0xffffffffu, take);
+            if (take) {
+                const uint32_t lane = tid & 31u;
+                const uint32_t rank = __popc(ball & ((1u << lane) - 1u));
+                uint32_t pos = 0;
+                if (rank == 0) pos = atomicAdd(&s_cnt, __popc(ball));
+                pos = __shfl_sync(ball, pos, __ffs(ball) - 1);
+                buf[pos + rank] = key;
+            }
+        }
+        __syncthreads();
+        if (s_cnt > STREAM_CAP - tile) {
+            /* compact: sort descending, keep top_k, raise the threshold */
+            const uint32_t cnt = s_cnt;
+            uint64_t keys[STREAM_ITEMS];
+            #pragma unroll
+            for (uint32_t k = 0; k < STREAM_ITEMS; k++) {
+                const uint32_t i = tid * STREAM_ITEMS + k;
+                keys[k] = (i < cnt) ? buf[i] : 0;
+            }
+            __syncthreads();
+            StreamSort(sort_tmp).SortDescending(keys);
+            __syncthreads();
+            if (tid < top_k / STREAM_ITEMS) {
+                #pragma unroll
+                for (uint32_t k = 0; k < STREAM_ITEMS; k++)
+                    buf[tid * STREAM_ITEMS + k] = keys[k];
+            }
+            if (tid == top_k / STREAM_ITEMS - 1) s_thr = keys[STREAM_ITEMS - 1];
+            if (tid == 0) s_cnt = top_k;
+            __syncthreads();
+        }
+    }
+    /* final: sort the survivors, emit the top_k ids in tree order */
+    {
+        const uint32_t cnt = s_cnt;
+        uint64_t keys[STREAM_ITEMS];
+        #pragma unroll
+        for (uint32_t k = 0; k < STREAM_ITEMS; k++) {
+            const uint32_t i = tid * STREAM_ITEMS + k;
+            keys[k] = (i < cnt) ? buf[i] : 0;
+        }
+        __syncthreads();
+        StreamSort(sort_tmp).SortDescending(keys);
+        __syncthreads();
+        if (tid < top_k / STREAM_ITEMS) {
+            #pragma unroll
+            for (uint32_t k = 0; k < STREAM_ITEMS; k++)
+                selected[(uint64_t)t * top_k + tid * STREAM_ITEMS + k] =
+                    0xffffffffu - (uint32_t)(keys[k] & 0xffffffffu);
+        }
+    }
+}
+
 __global__ static void indexed_topk_sort_512_asc_kernel(
         int32_t *dst,
         const int32_t *src,
@@ -15132,6 +15251,26 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                (const float *)scores->ptr,
                                                                n_comp, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
+    }
+    /* inc-4: streaming exact top-512 replaces the chunked tree for prefill
+     * widths (this point is only reached with n_spec > 8192).  Legacy
+     * fixed-n_comp callers only — prefill/batch pass (0, UINT32_MAX);
+     * captured decode keeps the specialized tiers (PC5 substrate semantics
+     * unchanged).  DS4_CUDA_NO_TOPK_STREAM is the forensic escape. */
+    if (top_k == 512u && n_tokens >= 32u && !pc5_active &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+        getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL) {
+        indexer_topk_stream512_kernel<<<n_tokens, 512, 0, ds4_current_stream()>>>(
+                (uint32_t *)selected->ptr,
+                (const float *)scores->ptr,
+                n_comp, n_tokens, top_k);
+        static int logged_topk_stream = 0;
+        if (!logged_topk_stream) {
+            logged_topk_stream = 1;
+            fprintf(stderr, "ds4: indexer topk stream active (first n_comp=%u n_tokens=%u)\n",
+                    n_comp, n_tokens);
+        }
+        return cuda_ok(cudaGetLastError(), "indexer topk stream launch");
     }
     if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
