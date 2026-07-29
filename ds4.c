@@ -18432,6 +18432,26 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
+                /* E3/E4 capture (inc-13): same three dumps as the
+                 * zero-prefix site — this is the path deep admit chunks
+                 * take.  Inert unless DS4_METAL_GRAPH_DUMP_* select them. */
+                metal_graph_debug_dump_tensor("batch_idx_q",
+                                              g->batch_indexer_q,
+                                              (uint64_t)n_tokens * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
+                                              il, pos0);
+                metal_graph_debug_dump_tensor("batch_idx_w",
+                                              g->batch_indexer_weights,
+                                              (uint64_t)n_tokens * DS4_N_INDEXER_HEAD,
+                                              il, pos0);
+                {
+                    /* F32-primary only; see the zero-prefix site. */
+                    const char *fp4e = getenv("DS4_CUDA_FP4_INDEX");
+                    if (fp4e && fp4e[0] == '0' && fp4e[1] == '\0')
+                        metal_graph_debug_dump_tensor("idx_comp_f32",
+                                                      g->layer_index_comp_cache[il],
+                                                      (uint64_t)n_comp * DS4_N_INDEXER_HEAD_DIM,
+                                                      il, pos0);
+                }
                 /* v0.5 inc-5: combined mxf4 score+select chain for deep
                  * eager chunks (single-run admission or single-seq batch).
                  * Engaged => comp_selected is written directly and the
@@ -18669,6 +18689,30 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 n_tokens,
                                                                 n_comp,
                                                                 &index_stage_t0);
+            }
+            /* E3/E4 capture (inc-13): real scorer inputs for the proto
+             * harness — q rows, per-(token,head) weights, and the F32 comp
+             * keys (the proto re-quantizes with the production-pinned
+             * semantics).  Inert unless DS4_METAL_GRAPH_DUMP_* select them. */
+            metal_graph_debug_dump_tensor("batch_idx_q",
+                                          g->batch_indexer_q,
+                                          (uint64_t)n_tokens * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
+                                          il, pos0);
+            metal_graph_debug_dump_tensor("batch_idx_w",
+                                          g->batch_indexer_weights,
+                                          (uint64_t)n_tokens * DS4_N_INDEXER_HEAD,
+                                          il, pos0);
+            /* idx_comp_f32 is defined ONLY under the F32-primary escape
+             * (DS4_CUDA_FP4_INDEX=0): with the packed-FP4 primary the F32
+             * cache handle exists but its slab rows are never materialized
+             * and the read faults the context. */
+            {
+                const char *fp4e = getenv("DS4_CUDA_FP4_INDEX");
+                if (fp4e && fp4e[0] == '0' && fp4e[1] == '\0')
+                    metal_graph_debug_dump_tensor("idx_comp_f32",
+                                                  g->layer_index_comp_cache[il],
+                                                  (uint64_t)n_comp * DS4_N_INDEXER_HEAD_DIM,
+                                                  il, pos0);
             }
             /* v0.5 inc-5: combined mxf4 score+select chain (zero-prefix =>
              * pos0 0, no bank view).  Engaged => skip the classic pair. */
