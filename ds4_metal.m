@@ -16323,6 +16323,43 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
     return 0;
 }
 
+/* v0.5 inc-10 F2: CUDA-only fused inverse-rope + f16 out_a pack; Metal
+ * returns 0 so callers fall back to the separate (bit-exact) pair. */
+int ds4_gpu_attention_output_q8_batch_inverse_rope_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        const ds4_gpu_tensor *positions,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow) {
+    (void)out; (void)low; (void)group_tmp; (void)low_tmp; (void)model_map;
+    (void)model_size; (void)out_a_offset; (void)out_b_offset; (void)group_dim;
+    (void)rank; (void)n_groups; (void)out_dim; (void)heads; (void)n_tokens;
+    (void)head_dim; (void)n_rot; (void)pos0; (void)positions; (void)n_ctx_orig;
+    (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow;
+    return 0;
+}
+
 int ds4_gpu_head_rms_norm_rope_tail_scalars_tensor(
         ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
         uint32_t n_rot, const void *scalars, int32_t pos_offset, uint32_t pos_stride,

@@ -7565,6 +7565,91 @@ __global__ static void attention_pack_group_heads_f16_kernel(
     dst[gid] = __float2half(heads[((uint64_t)t * n_groups + g) * group_dim + d]);
 }
 
+/* v0.5 inc-10 F2: attention-output inverse RoPE folded into the f16 group
+ * pack that feeds the strided-batched out_a GEMM -- one f32 read replaces
+ * rope_tail's full read+write round trip of batch_heads plus the pack's
+ * re-read.  Body is the composition of rope_tail_kernel (inverse branch:
+ * s = -sin) with attention_pack_group_heads_f16_kernel, pair-vectorized
+ * (the rope touches adjacent pairs, so the pack moves float2 -> __half2;
+ * __floats2half2_rn is two __float2half, both round-to-nearest) --
+ * bit-identical to the unfused pair.  Per-token absolute positions ride
+ * along exactly like rope_tail_kernel at pos_stride 1 (positions[t],
+ * NULL -> pos0 + t).  The f32 heads stay UN-rotated; nothing downstream
+ * of out_a reads them (verified over every batch_heads site).  Geometry
+ * guards (even dims, n_rot <= head_dim) live in the host entry, which
+ * declines to the classic pair. */
+__global__ static void attention_inverse_rope_pack_group_heads_f16_kernel(
+        __half *dst,
+        const float *heads,
+        uint32_t n_tokens,
+        uint32_t n_groups,
+        uint32_t group_dim,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        const int32_t *positions,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t half_group = group_dim / 2;
+    uint64_t n = (uint64_t)n_groups * n_tokens * half_group;
+    if (gid >= n) return;
+    /* Pack enumeration over element pairs (dst-major: coalesced
+     * group-major writes). */
+    uint32_t d = (gid % half_group) * 2;
+    uint64_t q = gid / half_group;
+    uint32_t t = q % n_tokens;
+    uint32_t g = q / n_tokens;
+    const float2 v = *reinterpret_cast<const float2 *>(
+            heads + ((uint64_t)t * n_groups + g) * group_dim + d);
+    float x0 = v.x;
+    float x1 = v.y;
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t hd = d % head_dim;
+    if (hd >= n_nope) {
+        uint32_t i = hd - n_nope;
+        float corr0 = 0.0f, corr1 = 0.0f;
+        if (ext_factor != 0.0f) {
+            float denom = 2.0f * logf(freq_base);
+            corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+            corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+            corr0 = fmaxf(0.0f, corr0);
+            corr1 = fminf((float)(n_rot - 1), corr1);
+        }
+        int32_t eff_pos = positions ? positions[t] : (int32_t)(pos0 + t);
+        float theta_extrap = (float)eff_pos * powf(freq_base, -((float)i) / (float)n_rot);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        float c = cosf(theta) * mscale;
+        float s = -sinf(theta) * mscale;
+        /* Contraction pinned to rope_tail_kernel's compiled shape (round
+         * the x1 products, keep the x0 products exact inside the FFMA):
+         * fast-math is free to pair the FMAs differently in a different
+         * kernel body and DID -- the naive x0*s + x1*c here compiled with
+         * the opposite product rounded, a 1-ulp f32 wobble that survives
+         * the f16 convert at half-ulp boundaries and shifted drafter
+         * accept trajectories in vivo (12k twins 173/475 -> 183/474).
+         * The classic pair stays the reference; only this kernel pins. */
+        float r0 = __fmaf_rn(c, x0, -__fmul_rn(s, x1));
+        x1 = __fmaf_rn(s, x0, __fmul_rn(c, x1));
+        x0 = r0;
+    }
+    *reinterpret_cast<__half2 *>(
+            dst + ((uint64_t)g * n_tokens + t) * group_dim + d) =
+        __floats2half2_rn(x0, x1);
+}
+
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -22911,7 +22996,11 @@ static int cuda_attention_output_q8_batch_impl(
         ds4_gpu_tensor *low_tmp, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t out_b_offset, uint64_t group_dim,
         uint64_t rank, uint32_t n_groups, uint64_t out_dim,
-        const ds4_gpu_tensor *heads, uint32_t n_tokens);
+        const ds4_gpu_tensor *heads, uint32_t n_tokens,
+        int fuse_inverse_rope, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, const int32_t *positions, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow);
 
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
@@ -22937,7 +23026,71 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                        model_map, model_size,
                                                        out_a_offset, out_b_offset,
                                                        group_dim, rank, n_groups,
-                                                       out_dim, heads, n_tokens);
+                                                       out_dim, heads, n_tokens,
+                                                       0, 0u, 0u, 0u, NULL, 0u,
+                                                       0.0f, 0.0f, 0.0f, 0.0f,
+                                                       0.0f, 0.0f);
+    q8p_end(q8ps, ds4_current_stream());
+    return rc;
+}
+
+/* v0.5 inc-10 F2: out_a batch entry with the attention-output inverse
+ * RoPE folded into the f16 group pack (fusion design per Palaferri's
+ * 264f8f0; body composed from our own kernels).  Returns 0 WITHOUT
+ * touching any output when the packed-f16 GEMM branch would not be taken
+ * (quality mode, mc widths, narrow batches, cublas off/unready, no f16
+ * artifact) or the rope geometry is off -- the caller must then run the
+ * classic rope_tail + batch pair.  On success the f32 heads tensor is
+ * left UN-rotated (the rotation lives only in the packed f16 scratch);
+ * no consumer downstream of out_a reads it. */
+extern "C" int ds4_gpu_attention_output_q8_batch_inverse_rope_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        const ds4_gpu_tensor *positions,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow) {
+    /* Geometry decline before the profiling wrap: pair-vectorized pack. */
+    if (head_dim == 0u || (head_dim & 1u) != 0u || (group_dim & 1u) != 0u ||
+        group_dim % head_dim != 0u || n_rot > head_dim || (n_rot & 1u) != 0u) {
+        return 0;
+    }
+    if (positions && positions->bytes < (uint64_t)n_tokens * sizeof(int32_t)) return 0;
+    const int32_t *pos_dev = positions ? (const int32_t *)positions->ptr : NULL;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t w_bytes = low_dim * ((group_dim + 31) / 32) * 34 +
+                             out_dim * ((low_dim + 31) / 32) * 34;
+    const uint32_t q8ps = q8p_begin_tagged("attn_out_ab", group_dim, out_dim,
+                                           n_tokens, w_bytes, ds4_current_stream());
+    const int rc = cuda_attention_output_q8_batch_impl(out, low, group_tmp, low_tmp,
+                                                       model_map, model_size,
+                                                       out_a_offset, out_b_offset,
+                                                       group_dim, rank, n_groups,
+                                                       out_dim, heads, n_tokens,
+                                                       1, head_dim, n_rot,
+                                                       pos0, pos_dev, n_ctx_orig,
+                                                       freq_base, freq_scale,
+                                                       ext_factor, attn_factor,
+                                                       beta_fast, beta_slow);
     q8p_end(q8ps, ds4_current_stream());
     return rc;
 }
@@ -22956,7 +23109,22 @@ static int cuda_attention_output_q8_batch_impl(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        /* v0.5 inc-10 F2: nonzero folds the inverse rope tail into the f16
+         * pack of the cublas branch; any call this branch would not serve
+         * declines (returns 0) with every output untouched. */
+        int                     fuse_inverse_rope,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        const int32_t          *positions,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow) {
     (void)group_tmp;
     (void)low_tmp;
     if (!out || !low || !heads || !model_map ||
@@ -23004,6 +23172,9 @@ static int cuda_attention_output_q8_batch_impl(
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
+    /* inc-10 F2 decline: the fused entry only replaces the classic
+     * rope_tail + pack pair when this call takes the packed-f16 branch. */
+    if (fuse_inverse_rope && !out_a_f16) return 0;
     if (out_a_f16) {
         const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
@@ -23011,12 +23182,38 @@ static int cuda_attention_output_q8_batch_impl(
         void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output a cublas");
         if (!tmp) return 0;
         __half *heads_h = (__half *)tmp;
-        attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256, 0, ds4_current_stream()>>>(
+        if (fuse_inverse_rope) {
+            static int logged_f2 = 0;
+            if (!logged_f2) {
+                logged_f2 = 1;
+                fprintf(stderr, "ds4: attention out_a inverse-rope+pack fused (inc-10 F2)\n");
+            }
+            attention_inverse_rope_pack_group_heads_f16_kernel<<<
+                    (heads_h_count / 2 + 255) / 256, 256, 0, ds4_current_stream()>>>(
+                    heads_h,
+                    (const float *)heads->ptr,
+                    n_tokens,
+                    n_groups,
+                    (uint32_t)group_dim,
+                    head_dim,
+                    n_rot,
+                    pos0,
+                    positions,
+                    n_ctx_orig,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    beta_fast,
+                    beta_slow);
+        } else {
+            attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256, 0, ds4_current_stream()>>>(
                 heads_h,
                 (const float *)heads->ptr,
                 n_tokens,
                 n_groups,
                 group_dim);
+        }
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a pack launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;

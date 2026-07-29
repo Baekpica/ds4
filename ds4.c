@@ -18889,7 +18889,43 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("kqv_out", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
+    /* v0.5 inc-10 F2: fused inverse-rope + f16 pack inside out_a (one f32
+     * read of batch_heads instead of rope's read+write plus the pack's
+     * re-read; bit-exact math).  Not taken when the kqv_back debug dump
+     * wants the rope'd f32 heads, when the packed-f16 out_a branch is not
+     * the one this call would take (the entry declines), or on Metal
+     * (stub returns 0) -- then the separate pair below runs unchanged. */
+    bool out_rope_fused = false;
+    if (ok && !metal_graph_debug_wants("kqv_back", il, pos0)) {
+        out_rope_fused = ds4_gpu_attention_output_q8_batch_inverse_rope_tensor(
+                                                        g->batch_attn_out,
+                                                        g->batch_attn_low,
+                                                        g->batch_group_tmp,
+                                                        g->batch_low_tmp,
+                                                        model->map,
+                                                        model->size,
+                                                        layer->attn_output_a->abs_offset,
+                                                        layer->attn_output_b->abs_offset,
+                                                        group_dim,
+                                                        rank,
+                                                        n_groups,
+                                                        DS4_N_EMBD,
+                                                        g->batch_heads,
+                                                        n_tokens,
+                                                        DS4_N_HEAD_DIM,
+                                                        DS4_N_ROT,
+                                                        pos0,
+                                                        positions,
+                                                        compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                        freq_base,
+                                                        freq_scale,
+                                                        ext_factor,
+                                                        attn_factor,
+                                                        DS4_ROPE_YARN_BETA_FAST,
+                                                        DS4_ROPE_YARN_BETA_SLOW) != 0;
+    }
+    if (ok && !out_rope_fused)
+              ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
                                             n_tokens,
                                             DS4_N_HEAD,
                                             DS4_N_HEAD_DIM,
@@ -18904,12 +18940,12 @@ static bool metal_graph_encode_layer_attention_batch(
                                             attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST,
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) {
+    if (ok && !out_rope_fused) {
         metal_graph_debug_dump_tensor("kqv_back", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
-    if (ok) {
+    if (ok && !out_rope_fused) {
         ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
                                                         g->batch_attn_low,
                                                         g->batch_group_tmp,
