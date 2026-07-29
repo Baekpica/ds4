@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: MIT
 // ds4_mmq_d2r.cu - gated D2R Q2_K MoE down-GEMM production path.
+//
+// The fused gate/up+SwiGLU+Q8 prefill pipeline (FusedGateUpSmem,
+// iq2_gateup_fused_mainloop, gateup_iq2_swiglu_q8_d2r_kernel and its
+// launcher) is Portions Copyright (c) 2026 Marco Palaferri (MIT), adapted
+// from xangel82/DS4-GB10-GX10-DSpark-CUDA commit 910501e (v0.5 inc-9; the
+// launch decomposition was re-derived for this fork's serving profile).
 
 #include "ds4_mmq_d2r.cuh"
 

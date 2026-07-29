@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MIT
 // ds4_mmq.cu - host wrapper around llama.cpp's vendored mul_mat_q kernels.
 //
+// The fused target-prefill MoE dispatcher (ds4_mmq_fused_down,
+// ds4_swiglu_weighted_f32, the fused_down branches of
+// ds4_mmq_moe_pair_impl, and the ds4_mmq_iq2_xxs_q2_K_moe_fused_* entry
+// points) is Portions Copyright (c) 2026 Marco Palaferri (MIT), adapted
+// from xangel82/DS4-GB10-GX10-DSpark-CUDA commit 910501e (v0.5 inc-9).
+//
 // Implements the public ds4_mmq_* entry points and explicitly instantiates
 // the mul_mat_q_case<T> template for each quant type the caller needs.
 //
