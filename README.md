@@ -244,6 +244,32 @@ quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
 reason, and because we are genuinely grateful, we keep the GGML authors copyright
 notice in our `LICENSE` file.
 
+## License and attribution
+
+This fork keeps upstream ds4's MIT license. The batched-serving fork
+modifications are Copyright (c) 2026 Entrpi <entrpi@proton.me>, MIT. Lineage
+of the code in this tree, so reusers know who built what:
+
+- The engine, CLI/agent, Metal path, and session serving are
+  [antirez/ds4](https://github.com/antirez/ds4) (upstream).
+- The quantized-matmul kernel family under `cuda/mmq/` is vendored from
+  llama.cpp (MIT); the exact upstream pin and per-file inventory are in
+  `cuda/mmq/VENDOR.md`.
+- The batched server, continuous-batching engine, KV banks, D2R/MMQ prefill
+  tiers, token-tile HMMA attention, indexer/scorer work, and DSpark
+  integration on the CUDA path are this fork's additions.
+- [xangel82/DS4-GB10-GX10-DSpark-CUDA](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA)
+  (Marco Palaferri, MIT) is a sibling fork built on both upstream ds4 and
+  this fork's kernel work, and we re-integrate select portions of his work
+  in return. Where a change follows his design it is credited in the commit
+  message, and where his code is adapted directly it also carries his
+  copyright notice in the source headers -- for example, the fused gate/up
+  prefill pipeline in `cuda/mmq/ds4_mmq_d2r.cu` and `cuda/mmq/ds4_mmq.cu`
+  (his `910501e`, our `da027a1`).
+
+If you reuse this fork's modifications, keep this notice together with the
+MIT license text, per upstream's terms.
+
 ## Status
 
 The code and GGUF files are to be considered of **beta quality** because
