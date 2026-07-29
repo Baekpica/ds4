@@ -959,6 +959,22 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+/* v0.5 inc-12c: dual-emit variant -- out gets the identical f32 result and
+ * out_f16 the __float2half of the same value (bit-identical to running the
+ * classic entry followed by a f32->f16 convert launch).  Returns 0 with both
+ * outputs untouched on decline (Metal declines always); the caller falls
+ * back to the classic entry + convert. */
+int ds4_gpu_rms_norm_weight_rows_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_f16,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
+
 /* emit_q81 (M2-Inc2a, CUDA decode rows==1 only): nonzero additionally emits
  * q8_1 codes of the q row in-kernel and hands them to the next mmvq consumer
  * (q_b), eliding its quantize prelude; ignored elsewhere/on Metal. */

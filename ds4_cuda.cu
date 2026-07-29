@@ -6044,6 +6044,43 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
 }
 
+/* v0.5 inc-12c: dual-emit twin of rms_norm_weight_kernel -- the f32 body is
+ * copied VERBATIM (the reference kernel above stays byte-untouched for every
+ * other caller) and each output value is additionally stored as
+ * __float2half(v), the same round-to-nearest conversion f32_to_f16_kernel
+ * applies.  Consumers that read the f16 mirror through the preconv GEMM see
+ * bit-identical activations to the convert-launch path this replaces
+ * (inc-11 mirror fill on attn_norm; the router's per-call convert on
+ * ffn_norm).  CONTRACTION-PIN LAW: the f32 store chain is mul-only
+ * (xr*scale*w -- no FMA candidates) but association is fast-math's choice;
+ * SASS-diffed against the reference on sm_121a and the 12k twin gate is the
+ * arbiter. */
+__global__ static void rms_norm_weight_f16pair_kernel(float *out, __half *out16, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    __half *o16row = out16 + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i] * scale * w[i];
+        orow[i] = v;
+        o16row[i] = __float2half(v);
+    }
+}
+
 /* Step 4c C2: row-variant of rms_norm_weight_kernel for the compressor
  * emit path.  Normalizes exactly one row of `base` at index *row_ptr_dev.
  * The shim selects whether the device pointer addresses comp_row or
@@ -20244,6 +20281,22 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const float *w = (const float *)wptr;
     rms_norm_weight_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
+}
+
+/* v0.5 inc-12c: rows entry for the dual-emit twin (see
+ * rms_norm_weight_f16pair_kernel).  Returns 0 with both outputs untouched on
+ * any precondition miss; the caller then runs the classic entry (and, for
+ * the attn_norm mirror, the inc-11 fill) instead. */
+extern "C" int ds4_gpu_rms_norm_weight_rows_f16_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *out_f16, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+    if (!out || !out_f16 || !x || !model_map || weight_offset > model_size ||
+        model_size - weight_offset < (uint64_t)n * sizeof(float) ||
+        out->bytes < (uint64_t)n * rows * sizeof(float) ||
+        out_f16->bytes < (uint64_t)n * rows * sizeof(__half) ||
+        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
+    if (!wptr) return 0;
+    rms_norm_weight_f16pair_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (__half *)out_f16->ptr, (const float *)x->ptr, (const float *)wptr, n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "rms_norm_weight f16pair launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,

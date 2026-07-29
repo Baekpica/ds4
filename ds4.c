@@ -9527,6 +9527,9 @@ typedef struct {
      * (comp pairs, indexer weights).  Valid only within the layer body
      * between the fill and the last consumer; never read across layers. */
     ds4_gpu_tensor *batch_attn_norm_f16;
+    /* inc-12c: same contract for ffn_norm (single consumer: the unfused
+     * prefill router logits GEMM via the preconv entry). */
+    ds4_gpu_tensor *batch_ffn_norm_f16;
     ds4_gpu_tensor *batch_qr;
     ds4_gpu_tensor *batch_qr_norm;
     ds4_gpu_tensor *batch_q;
@@ -9659,6 +9662,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_q);
     ds4_gpu_tensor_free(g->batch_qr_norm);
     ds4_gpu_tensor_free(g->batch_qr);
+    ds4_gpu_tensor_free(g->batch_ffn_norm_f16);
     ds4_gpu_tensor_free(g->batch_attn_norm_f16);
     ds4_gpu_tensor_free(g->batch_attn_norm);
     ds4_gpu_tensor_free(g->batch_attn_cur);
@@ -10552,6 +10556,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_attn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_attn_norm = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_attn_norm_f16 = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(uint16_t));
+    g->batch_ffn_norm_f16 = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(uint16_t));
     g->batch_qr = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_qr_norm = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_q = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
@@ -16394,7 +16399,34 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_pre");
-    if (ok && !hc_attn_fused) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
+    /* v0.5 inc-12c: when the inc-11 mirror will be wanted for this width,
+     * the producer dual-emits the f16 alongside the f32 (bit-identical to
+     * producer + separate fill launch: same expressions, same __float2half
+     * rounding).  Decline (Metal, bounds) falls back to the classic
+     * producer, and then the inc-11 fill below still serves the mirror. */
+    bool attn_norm_f16_ready = false;
+    const bool attn_norm_want_f16 = g->batch_attn_norm_f16 != NULL &&
+        ds4_gpu_matmul_f16_preconv_ready(n_tokens) != 0;
+    if (ok && !hc_attn_fused && attn_norm_want_f16) {
+        attn_norm_f16_ready = ds4_gpu_rms_norm_weight_rows_f16_tensor(g->batch_attn_norm,
+                                                       g->batch_attn_norm_f16,
+                                                       g->batch_attn_cur,
+                                                       model->map,
+                                                       model->size,
+                                                       layer->attn_norm->abs_offset,
+                                                       DS4_N_EMBD,
+                                                       n_tokens,
+                                                       DS4_RMS_EPS) != 0;
+        if (attn_norm_f16_ready) {
+            static int logged_f12c_attn = 0;
+            if (!logged_f12c_attn) {
+                logged_f12c_attn = 1;
+                fprintf(stderr, "ds4: attn_norm producer dual-emits the f16 mirror (inc-12c)\n");
+            }
+        }
+    }
+    if (ok && !hc_attn_fused && !attn_norm_f16_ready)
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
                                                        g->batch_attn_cur,
                                                        model->map,
                                                        model->size,
@@ -16418,17 +16450,16 @@ static bool metal_graph_encode_layer_attention_batch(
      * this width, and nothing writes batch_attn_norm again before the last
      * consumer (audited).  On failure or decline every consumer falls back to
      * the classic self-converting helper. */
-    bool attn_norm_f16_ready = false;
-    if (ok && g->batch_attn_norm_f16 && ds4_gpu_matmul_f16_preconv_ready(n_tokens)) {
+    if (ok && !attn_norm_f16_ready && attn_norm_want_f16) {
         attn_norm_f16_ready = ds4_gpu_f32_to_f16_tensor(g->batch_attn_norm_f16,
                                                         g->batch_attn_norm,
                                                         (uint64_t)n_tokens * DS4_N_EMBD) != 0;
-        if (attn_norm_f16_ready) {
-            static int logged_f1 = 0;
-            if (!logged_f1) {
-                logged_f1 = 1;
-                fprintf(stderr, "ds4: batch f16 activations shared across attn_norm consumers (inc-11 F1)\n");
-            }
+    }
+    if (attn_norm_f16_ready) {
+        static int logged_f1 = 0;
+        if (!logged_f1) {
+            logged_f1 = 1;
+            fprintf(stderr, "ds4: batch f16 activations shared across attn_norm consumers (inc-11 F1)\n");
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
@@ -19205,7 +19236,35 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("hc_pre");
-    if (ok && !hc_ffn_fused) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
+    /* v0.5 inc-12c: dual-emit the ffn_norm f16 mirror when the unfused
+     * router logits GEMM will take the cublas f16 tier at this width (the
+     * fused router is decode-only by design, n_tok > 8 declines), killing
+     * the router's per-call f32->f16 convert launch.  Same bit-exactness
+     * shape as the attn_norm site. */
+    bool ffn_norm_f16_ready = false;
+    const bool ffn_norm_want_f16 = g->batch_ffn_norm_f16 != NULL &&
+        layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
+        ds4_gpu_matmul_f16_preconv_ready(n_tokens) != 0;
+    if (ok && !hc_ffn_fused && ffn_norm_want_f16) {
+        ffn_norm_f16_ready = ds4_gpu_rms_norm_weight_rows_f16_tensor(g->batch_ffn_norm,
+                                                       g->batch_ffn_norm_f16,
+                                                       g->batch_ffn_cur,
+                                                       model->map,
+                                                       model->size,
+                                                       layer->ffn_norm->abs_offset,
+                                                       DS4_N_EMBD,
+                                                       n_tokens,
+                                                       DS4_RMS_EPS) != 0;
+        if (ffn_norm_f16_ready) {
+            static int logged_f12c_ffn = 0;
+            if (!logged_f12c_ffn) {
+                logged_f12c_ffn = 1;
+                fprintf(stderr, "ds4: ffn_norm producer dual-emits f16 for the router (inc-12c)\n");
+            }
+        }
+    }
+    if (ok && !hc_ffn_fused && !ffn_norm_f16_ready)
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
                                                        g->batch_ffn_cur,
                                                        model->map,
                                                        model->size,
@@ -19315,13 +19374,30 @@ static bool metal_graph_encode_layer_ffn_batch(
          * values; the forward continues on them either way. */
     }
 
-    if (ok && !router_fused_batch) ok = metal_graph_matmul_plain_tensor(g->batch_router_logits,
+    /* inc-12c: the F16 router rides the shared ffn_norm mirror when the
+     * producer filled it (identical cublasGemmEx via the preconv entry);
+     * otherwise -- and for the F32 MTP block -- the classic paths serve. */
+    if (ok && !router_fused_batch) {
+        if (layer->ffn_gate_inp->type == DS4_TENSOR_F16) {
+            ok = metal_graph_matmul_f16_shared_tensor(g->batch_router_logits,
+                                                 model,
+                                                 layer->ffn_gate_inp->abs_offset,
+                                                 DS4_N_EMBD,
+                                                 DS4_N_EXPERT,
+                                                 g->batch_ffn_norm,
+                                                 g->batch_ffn_norm_f16,
+                                                 ffn_norm_f16_ready,
+                                                 n_tokens);
+        } else {
+            ok = metal_graph_matmul_plain_tensor(g->batch_router_logits,
                                                  model,
                                                  layer->ffn_gate_inp,
                                                  DS4_N_EMBD,
                                                  DS4_N_EXPERT,
                                                  g->batch_ffn_norm,
                                                  n_tokens);
+        }
+    }
 
     if (ok && !router_fused_batch) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,

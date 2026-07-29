@@ -6966,6 +6966,23 @@ int ds4_gpu_rms_norm_weight_tensor(
     return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map, model_size, weight_offset, n, 1, eps);
 }
 
+/* v0.5 inc-12c: the dual-emit variant is CUDA-only; Metal declines and the
+ * caller keeps the classic entry (+ convert where a mirror is wanted). */
+int ds4_gpu_rms_norm_weight_rows_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_f16,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps) {
+    (void)out; (void)out_f16; (void)x; (void)model_map; (void)model_size;
+    (void)weight_offset; (void)n; (void)rows; (void)eps;
+    return 0;
+}
+
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
