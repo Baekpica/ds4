@@ -361,6 +361,34 @@ static int g_cublas_ready;
  * deterministic 0. */
 static void *g_cublas_ws = NULL;
 static size_t g_cublas_ws_bytes = 0;
+
+/* v0.5 inc-12 memset diet: the S1.1a per-call zero of the 32 MiB workspace
+ * cost 3.79 s of stream time per 180k-token leg (26,214 x 144 us, reslice9
+ * MEMSET table) while on GB10 no hot batch-f16 alg reads the workspace at
+ * all (Lt heuristic probe: best algs report ws=0; the only splitKreduce
+ * launches in a whole leg are 22 one-shot warmup-class calls).  The
+ * workspace SIZE must stay 32 MiB (alg selection keys on it -- shrinking it
+ * changes picks and therefore outputs), so the diet is on the zeroing:
+ *   DS4_CUDA_WS_MEMSET unset/0 -> no per-call memset (default; bit-exact
+ *     IFF nothing reads the workspace, proven by the poison gate below)
+ *   DS4_CUDA_WS_MEMSET=1      -> S1.1a always-zero (the old behavior)
+ *   DS4_CUDA_WS_MEMSET=poison -> fill 0xFF per call: the bit-exactness
+ *     instrument.  If poison twins the always-zero needles across the gate
+ *     battery, no picked alg reads the workspace and OFF is safe; if the
+ *     needles move, some alg DOES read it and OFF must not ship. */
+static void cuda_cublas_ws_prep(cudaStream_t stream) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *env = getenv("DS4_CUDA_WS_MEMSET");
+        mode = 0;
+        if (env && env[0] == '1') mode = 1;
+        else if (env && (env[0] == 'p' || env[0] == 'P')) mode = 2;
+    }
+    if (mode == 0 || !g_cublas_ws) return;
+    (void)cudaMemsetAsync(g_cublas_ws, mode == 1 ? 0 : 0xFF,
+                          g_cublas_ws_bytes, stream);
+}
+
 static int g_quality_mode;
 static int g_attention_output_b_n2_q8_override;
 
@@ -2694,11 +2722,25 @@ extern "C" int ds4_gpu_init(void) {
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
-        /* S1.1a: dedicated split-K workspace (see g_cublas_ws decl).  32 MiB is
-         * cuBLAS's recommended workspace on recent archs; on alloc failure we
-         * leave it NULL and cuBLAS falls back to its own (non-deterministic)
-         * workspace -- correctness of the GEMM is unaffected either way. */
-        const size_t cublas_ws_bytes = (size_t)32u * 1024u * 1024u;
+        /* S1.1a: dedicated split-K workspace (see g_cublas_ws decl).  On alloc
+         * failure we leave it NULL and cuBLAS falls back to its own (non-
+         * deterministic) workspace -- correctness of the GEMM is unaffected.
+         *
+         * v0.5 inc-12: the workspace SIZE stays 32 MiB -- cuBLAS keys alg
+         * selection on the available workspace, and the 12k twin gate showed
+         * ANY size change (1 MiB, 4 MiB tried) shifts alg picks -> ulp-level
+         * output changes -> spec-trajectory drift.  DS4_CUDA_WS_MB stays as a
+         * diagnostic override only.  The memset diet happens per-CALL instead:
+         * see cuda_cublas_ws_prep. */
+        size_t cublas_ws_mb = 32;
+        {
+            const char *env = getenv("DS4_CUDA_WS_MB");
+            if (env && env[0]) {
+                const long v = atol(env);
+                if (v >= 0 && v <= 1024) cublas_ws_mb = (size_t)v;
+            }
+        }
+        const size_t cublas_ws_bytes = cublas_ws_mb * 1024u * 1024u;
         if (cudaMalloc(&g_cublas_ws, cublas_ws_bytes) == cudaSuccess) {
             g_cublas_ws_bytes = cublas_ws_bytes;
             (void)cublasSetWorkspace(g_cublas, g_cublas_ws, g_cublas_ws_bytes);
@@ -18917,7 +18959,7 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
             /* S1.1a: zero cuBLAS's split-K workspace before the GemmEx (see
              * g_cublas_ws) so the split-K reduce reads deterministic 0 padding. */
-            if (g_cublas_ws) (void)cudaMemsetAsync(g_cublas_ws, 0, g_cublas_ws_bytes, ds4_current_stream());
+            cuda_cublas_ws_prep(ds4_current_stream());
             const float alpha = 1.0f;
             const float beta = 0.0f;
             cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -19798,11 +19840,9 @@ static int cuda_matmul_f16_tensor_impl(ds4_gpu_tensor *out, const void *model_ma
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256, 0, ds4_current_stream()>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
-        /* S1.1a: zero cuBLAS's split-K workspace so its split-K reduce reads a
-         * deterministic 0 for unwritten padding (see g_cublas_ws).  Same stream
-         * (default, == ds4_current_stream() off-capture) as the GemmEx, so it is
-         * ordered before the matmul reads it. */
-        if (g_cublas_ws) (void)cudaMemsetAsync(g_cublas_ws, 0, g_cublas_ws_bytes, ds4_current_stream());
+        /* S1.1a workspace prep (inc-12 memset diet: see cuda_cublas_ws_prep).
+         * Same stream as the GemmEx, so any fill is ordered before the matmul. */
+        cuda_cublas_ws_prep(ds4_current_stream());
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -19960,7 +20000,7 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(ds4_gpu_tensor *out, const voi
         free(host_a);
         free(host_b);
     }
-    if (g_cublas_ws) (void)cudaMemsetAsync(g_cublas_ws, 0, g_cublas_ws_bytes, ds4_current_stream());
+    cuda_cublas_ws_prep(ds4_current_stream());
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -20030,7 +20070,7 @@ extern "C" int ds4_gpu_matmul_f16_preconv_tensor(ds4_gpu_tensor *out, const void
     const __half *w = (const __half *)wptr;
     const uint32_t q8ps = q8p_begin_tagged("f16_preconv", in_dim, out_dim, n_tok,
                                            weight_bytes, ds4_current_stream());
-    if (g_cublas_ws) (void)cudaMemsetAsync(g_cublas_ws, 0, g_cublas_ws_bytes, ds4_current_stream());
+    cuda_cublas_ws_prep(ds4_current_stream());
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas,
