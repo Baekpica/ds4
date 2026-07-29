@@ -420,6 +420,26 @@ __global__ static void repack_q8_0_aligned_kernel(
     memcpy(qs + blk * 32ull + p * 16ull, src + 2u + p * 16ull, 16u);
 }
 
+/* One thread per dequantized element of the staged chunk.  Math is the
+ * engine's lazy dequant_q8_0_to_f16_kernel (ds4_cuda.cu) verbatim -- the
+ * first-touch cache and this prebuild must stay bit-identical.  The full
+ * tensor's f16 element order is exactly (raw block index)*32 + code index,
+ * so chunking at 34-byte block granularity preserves every element's
+ * inputs. */
+__global__ static void dequant_q8_0_f16_colmajor_kernel(
+        __half *out,
+        const unsigned char *raw,
+        uint64_t nblk) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= nblk * 32ull) return;
+    const uint64_t b = gid >> 5;
+    const uint64_t j = gid & 31u;
+    const unsigned char *blk = raw + b * 34ull;
+    const __half scale = *(const __half *)blk;
+    const int8_t q = *(const int8_t *)(blk + 2u + j);
+    out[gid] = __hmul(scale, __float2half((float)q));
+}
+
 /* ---- candidate predicates ------------------------------------------------ */
 
 /* --repack-iq2-aligned candidates: routed-expert gate/up stacks in IQ2_XXS.
@@ -467,6 +487,18 @@ bool ds4_repack_q8_candidate(const ds4_repack_tensor &t) {
     if (t.bytes < 2u * 1024u * 1024u || t.bytes % 34u != 0) return false;
     if (t.name.find("token_embd") != std::string::npos) return false;
     return true;
+}
+
+/* Q8_0 -> f16 colmajor dequant candidates (engine prebuild of the lazy
+ * cuda_q8_f16_ptr cache): the packed-out_a prefill weights.  The runtime
+ * admission gate admits more labels, but attn_output_a is the set the ship
+ * config actually first-touch-builds on the fast paths. */
+bool ds4_repack_q8_f16_candidate(const ds4_repack_tensor &t) {
+    if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
+    if (t.dims[0] == 0 || t.dims[1] == 0) return false;
+    if (t.dims[0] % 32u != 0) return false;
+    if (t.bytes == 0 || t.bytes % 34u != 0) return false;
+    return t.name.find("attn_output_a.weight") != std::string::npos;
 }
 
 /* ---- S5 parallel repack driver -------------------------------------------
@@ -739,6 +771,109 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
     }
     fprintf(stderr,
             "%s: q8 aligned repack %s: %u tensors %.2f GiB in %.1fs (threads=%d)\n",
+            a.log_prefix,
+            a.model_id,
+            count,
+            (double)total_bytes / 1073741824.0,
+            repack_now_sec() - t0,
+            nthreads);
+    if (repacked_bytes_out) *repacked_bytes_out = total_bytes;
+    return true;
+}
+
+/* Q8_0 -> f16 column-major dequant artifacts: in_dim*out_dim __half, element
+ * order (raw block index)*32 + code index.  Kind and layout shared with the
+ * weight server's --derive-q8-f16 (DERIVED_Q8_0_F16_COLMAJOR) and the
+ * engine's lazy cuda_q8_f16_ptr cache.  ADDITIVE: raw stays served. */
+bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
+                             std::vector<ds4_repack_artifact> &out,
+                             uint64_t *repacked_bytes_out) {
+    if (repacked_bytes_out) *repacked_bytes_out = 0;
+    ds4_repack_file m;
+    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    uint64_t chunk = a.copy_chunk_bytes / 34u * 34u;
+    if (chunk < 34u * 32768u) chunk = 34u * 32768u;
+
+    const double t0 = repack_now_sec();
+    std::vector<repack_job> jobs;
+    bool ok = true;
+    for (const ds4_repack_tensor &t : *a.records) {
+        if (!ds4_repack_q8_f16_candidate(t)) continue;
+        const uint64_t nblk = t.bytes / 34u;
+        const uint64_t expect_blk = (t.dims[0] / 32u) * t.dims[1];
+        if (nblk != expect_blk || t.off > m.size || t.bytes > m.size - t.off) {
+            fprintf(stderr,
+                    "%s: q8 f16 prebuild skipped %s: geometry mismatch (nblk=%llu expect=%llu)\n",
+                    a.log_prefix,
+                    t.name.c_str(),
+                    (unsigned long long)nblk,
+                    (unsigned long long)expect_blk);
+            ok = false;
+            break;
+        }
+
+        repack_job j;
+        j.chunk = chunk;
+        j.art.t = &t;
+        j.art.kind = DS4_REPACK_Q8_0_F16_COLMAJOR;
+        j.art.bytes = nblk * 64u; /* nblk*32 __half elements */
+        j.art.in_dim = t.dims[0];
+        j.art.out_dim = t.dims[1];
+        j.art.group_count = 0u;
+        if (!repack_alloc_artifact(a, "q8_f16", &j.art)) {
+            ok = false;
+            break;
+        }
+        jobs.push_back(j);
+    }
+
+    const int nthreads = repack_thread_count(jobs.size());
+    if (ok)
+        ok = run_repack_jobs(a.log_prefix, "q8_f16", m, a.device, jobs,
+            [&m, &a](const repack_job &j, cudaStream_t stream, unsigned char *stage,
+                     uint64_t stage_bytes, unsigned char *scratch) -> bool {
+        const ds4_repack_tensor &t = *j.art.t;
+        __half *dst = (__half *)j.art.dev;
+        for (uint64_t done = 0; done < t.bytes; done += j.chunk) {
+            const uint64_t nb = t.bytes - done < j.chunk ? t.bytes - done : j.chunk;
+            if (!repack_read_upload(a.log_prefix, m, "q8_f16", t, stage, stage_bytes, scratch, done, nb, stream))
+                return false;
+            const uint64_t cblk = nb / 34u;
+            const uint64_t blk0 = done / 34u;
+            dequant_q8_0_f16_colmajor_kernel<<<(unsigned)((cblk * 32u + 255u) / 256u), 256, 0, stream>>>(
+                dst + blk0 * 32u, scratch, cblk);
+            cudaError_t err = cudaGetLastError();
+            if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "%s: q8 f16 prebuild kernel failed for %s: %s\n",
+                        a.log_prefix, t.name.c_str(), cudaGetErrorString(err));
+                return false;
+            }
+        }
+        return true;
+    });
+
+    if (!ok) {
+        for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
+        ds4_repack_unmap_file(m);
+        return false;
+    }
+
+    uint64_t total_bytes = 0;
+    uint32_t count = 0;
+    for (repack_job &j : jobs) {
+        out.push_back(j.art);
+        total_bytes += j.art.bytes;
+        count++;
+    }
+
+    ds4_repack_unmap_file(m);
+    if (count == 0) {
+        fprintf(stderr, "%s: q8 f16 prebuild found no candidate tensors in %s\n",
+                a.log_prefix, a.model_id);
+    }
+    fprintf(stderr,
+            "%s: q8 f16 colmajor prebuild %s: %u tensors %.2f GiB in %.1fs (threads=%d)\n",
             a.log_prefix,
             a.model_id,
             count,

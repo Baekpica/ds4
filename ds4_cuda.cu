@@ -4198,7 +4198,19 @@ extern "C" int ds4_gpu_build_derived_artifacts(
     const bool build_moe = cuda_moe_iq2_aligned_enabled() != 0 &&
                            cuda_moe_q2k_aligned_enabled() != 0;
     const bool build_q8 = cuda_q8_aligned_enabled() != 0;
-    if (!build_moe && !build_q8) {
+    /* inc-12f: prebuild the q8->f16 colmajor out_a cache the packed prefill
+     * path otherwise first-touch-builds on the first admit per boot (41 x
+     * ~31 ms alloc+dequant stalls, ~1.3 s of cold TTFT).  Rides the existing
+     * derived-artifact contract (cuda_q8_f16_ptr consults the registry before
+     * lazily building), so dispatch sites are untouched and the bytes are
+     * identical by the shared kernel math.  Mirrors the runtime admission
+     * gate so the artifact never outlives its consumer.  Building here, ahead
+     * of the KV bank fit, also charges the ~2.9 GiB to MemAvailable BEFORE
+     * banks are sized -- the lazy build ate post-fit headroom instead. */
+    const char *f16_knob = getenv("DS4_CUDA_PREBUILD_F16");
+    const bool build_f16 = !(f16_knob && f16_knob[0] == '0' && f16_knob[1] == '\0') &&
+                           cuda_q8_f16_cache_allowed("attn_output_a", 0, 0) != 0;
+    if (!build_moe && !build_q8 && !build_f16) {
         g_derived_artifact_none_reason = "aligned dispatches disabled by env";
         return 0;
     }
@@ -4227,6 +4239,15 @@ extern "C" int ds4_gpu_build_derived_artifacts(
     if (ok && build_q8) {
         ok = ds4_repack_build_q8_aligned(a, arts, &part);
         built_bytes += part;
+    }
+    if (ok && build_f16) {
+        /* Optional acceleration tier: a failed prebuild keeps the lazy
+         * first-touch path and must not demote the aligned artifacts. */
+        if (ds4_repack_build_q8_f16(a, arts, &part)) {
+            built_bytes += part;
+        } else {
+            fprintf(stderr, "ds4: q8 f16 prebuild failed; keeping the lazy cache path\n");
+        }
     }
     if (!ok) {
         for (ds4_repack_artifact &art : arts) {

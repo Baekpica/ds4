@@ -40,6 +40,7 @@ struct ds4_repack_tensor {
  * manifest format and the engine's cuda_derived_kind (ds4_cuda.cu); the
  * layout comments live on the builders in ds4_repack.cu. */
 enum {
+    DS4_REPACK_Q8_0_F16_COLMAJOR = 2,
     DS4_REPACK_IQ2_XXS_ALIGNED_MOE = 4,
     DS4_REPACK_Q8_0_ALIGNED_DENSE = 5,
     DS4_REPACK_Q2_K_ALIGNED_MOE = 6,
@@ -51,7 +52,9 @@ struct ds4_repack_artifact {
     uint64_t bytes = 0;                   /* artifact byte size */
     uint64_t in_dim = 0;                  /* dims[0] */
     uint64_t out_dim = 0;                 /* dims[1] */
-    uint32_t group_count = 0;             /* dims[2] for MoE kinds, 1 for dense */
+    uint32_t group_count = 0;             /* dims[2] for MoE kinds, 1 for dense,
+                                             0 for f16 colmajor (the engine's
+                                             lazy-cache lookup passes 0) */
     void *dev = nullptr;                  /* device artifact buffer */
 };
 
@@ -94,6 +97,7 @@ bool ds4_repack_read_stage(const ds4_repack_file &m, void *stage, uint64_t stage
 bool ds4_repack_iq2_candidate(const ds4_repack_tensor &t);
 bool ds4_repack_q2k_candidate(const ds4_repack_tensor &t);
 bool ds4_repack_q8_candidate(const ds4_repack_tensor &t);
+bool ds4_repack_q8_f16_candidate(const ds4_repack_tensor &t);
 
 /* S5 driver configuration.  Unset (0 / false) defers to the env knobs
  * DS4_WS_REPACK_THREADS and DS4_WS_REPACK_HASH. */
@@ -115,5 +119,8 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
 bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
                                   std::vector<ds4_repack_artifact> &out,
                                   uint64_t *repacked_bytes_out);
+bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
+                             std::vector<ds4_repack_artifact> &out,
+                             uint64_t *repacked_bytes_out);
 
 #endif /* DS4_REPACK_H */
