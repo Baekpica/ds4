@@ -878,6 +878,17 @@ int ds4_gpu_matmul_f16_preconv_tensor(
         const ds4_gpu_tensor *xh,
         uint64_t                n_tok);
 
+/* v0.5 inc-11 F1: shared f16 activation mirror.  ..._preconv_ready says
+ * whether the cublas f16 tier (the only tier that converts) would serve
+ * n_tok -- fill a shared mirror only then.  ..._f32_to_f16_tensor fills it
+ * with the SAME kernel the f16 helper uses per call (bit-identical values).
+ * Both are CUDA-only; Metal returns 0 and callers keep the classic helper. */
+int ds4_gpu_matmul_f16_preconv_ready(uint64_t n_tok);
+int ds4_gpu_f32_to_f16_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t                count);
+
 int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor       *out_a,
         ds4_gpu_tensor       *out_b,

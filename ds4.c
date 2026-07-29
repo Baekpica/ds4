@@ -9522,6 +9522,11 @@ typedef struct {
     ds4_gpu_tensor *batch_hc_split;
     ds4_gpu_tensor *batch_attn_cur;
     ds4_gpu_tensor *batch_attn_norm;
+    /* v0.5 inc-11 F1: shared f16 mirror of batch_attn_norm, converted once
+     * per layer and consumed by every batch f16 GEMM whose x is attn_norm
+     * (comp pairs, indexer weights).  Valid only within the layer body
+     * between the fill and the last consumer; never read across layers. */
+    ds4_gpu_tensor *batch_attn_norm_f16;
     ds4_gpu_tensor *batch_qr;
     ds4_gpu_tensor *batch_qr_norm;
     ds4_gpu_tensor *batch_q;
@@ -9654,6 +9659,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_q);
     ds4_gpu_tensor_free(g->batch_qr_norm);
     ds4_gpu_tensor_free(g->batch_qr);
+    ds4_gpu_tensor_free(g->batch_attn_norm_f16);
     ds4_gpu_tensor_free(g->batch_attn_norm);
     ds4_gpu_tensor_free(g->batch_attn_cur);
     ds4_gpu_tensor_free(g->batch_hc_split);
@@ -10545,6 +10551,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_hc_split = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_attn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_attn_norm = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+    g->batch_attn_norm_f16 = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(uint16_t));
     g->batch_qr = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_qr_norm = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_q = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
@@ -14388,6 +14395,33 @@ static bool metal_graph_matmul_plain_tensor(
     return false;
 }
 
+/* v0.5 inc-11 F1: f16 GEMM with an optional shared pre-converted activation
+ * mirror.  When the caller has filled xh for this x (xh_ready), the preconv
+ * entry runs the identical cublas GEMM on it and the per-call f32->f16
+ * convert disappears -- bit-identical values (the mirror is made by the same
+ * kernel).  Preconv decline (narrow width, cublas off, Metal) or no mirror
+ * falls back to the classic helper, which converts for itself. */
+static bool metal_graph_matmul_f16_shared_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_model        *model,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *xh,
+        bool                    xh_ready,
+        uint64_t                n_tok) {
+    if (xh_ready && xh &&
+        ds4_gpu_matmul_f16_preconv_tensor(out, model->map, model->size,
+                                          weight_offset, in_dim, out_dim,
+                                          xh, n_tok) != 0) {
+        return true;
+    }
+    return ds4_gpu_matmul_f16_tensor(out, model->map, model->size,
+                                     weight_offset, in_dim, out_dim,
+                                     x, n_tok) != 0;
+}
+
 static bool metal_graph_matmul_q8_0_named_tensor(
         const char             *module,
         uint32_t                il,
@@ -16377,6 +16411,26 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("attn_norm", g->batch_attn_norm,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
+    /* v0.5 inc-11 F1: convert attn_norm to f16 ONCE for the layer's f16 GEMM
+     * consumers (attn comp pair, indexer comp pair, indexer weights) instead
+     * of once per GEMM inside the helper.  Bit-identical values (same convert
+     * kernel, same GEMM); only filled when the cublas f16 tier would serve
+     * this width, and nothing writes batch_attn_norm again before the last
+     * consumer (audited).  On failure or decline every consumer falls back to
+     * the classic self-converting helper. */
+    bool attn_norm_f16_ready = false;
+    if (ok && g->batch_attn_norm_f16 && ds4_gpu_matmul_f16_preconv_ready(n_tokens)) {
+        attn_norm_f16_ready = ds4_gpu_f32_to_f16_tensor(g->batch_attn_norm_f16,
+                                                        g->batch_attn_norm,
+                                                        (uint64_t)n_tokens * DS4_N_EMBD) != 0;
+        if (attn_norm_f16_ready) {
+            static int logged_f1 = 0;
+            if (!logged_f1) {
+                logged_f1 = 1;
+                fprintf(stderr, "ds4: batch f16 activations shared across attn_norm consumers (inc-11 F1)\n");
+            }
+        }
+    }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
     /* Our Q8 pair lift fuses attn_q_a + attn_kv into a single dispatch
@@ -16734,22 +16788,25 @@ static bool metal_graph_encode_layer_attention_batch(
             comp_store_rows_fused = comp_pair_rows_fused && want_store;
         }
         if (ok && !comp_pair_rows_fused) {
-            ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
-                                             model->map,
-                                             model->size,
+            /* inc-11 F1: shared attn_norm f16 mirror when available. */
+            ok = metal_graph_matmul_f16_shared_tensor(g->batch_comp_kv,
+                                             model,
                                              layer->attn_compressor_kv->abs_offset,
                                              DS4_N_EMBD,
                                              comp_width,
                                              g->batch_attn_norm,
-                                             n_tokens) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
-                                                     model->map,
-                                                     model->size,
+                                             g->batch_attn_norm_f16,
+                                             attn_norm_f16_ready,
+                                             n_tokens);
+            if (ok) ok = metal_graph_matmul_f16_shared_tensor(g->batch_comp_sc,
+                                                     model,
                                                      layer->attn_compressor_gate->abs_offset,
                                                      DS4_N_EMBD,
                                                      comp_width,
                                                      g->batch_attn_norm,
-                                                     n_tokens) != 0;
+                                                     g->batch_attn_norm_f16,
+                                                     attn_norm_f16_ready,
+                                                     n_tokens);
         }
         if (ok && comp_pair_rows_fused)
             metal_graph_comp_pair_rows_selftest(g, model,
@@ -17557,22 +17614,25 @@ static bool metal_graph_encode_layer_attention_batch(
                 idx_store_rows_fused = idx_pair_rows_fused && want_store;
             }
             if (ok && !idx_pair_rows_fused) {
-                ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
-                                                 model->map,
-                                                 model->size,
+                /* inc-11 F1: shared attn_norm f16 mirror when available. */
+                ok = metal_graph_matmul_f16_shared_tensor(g->batch_comp_kv,
+                                                 model,
                                                  layer->indexer_compressor_kv->abs_offset,
                                                  DS4_N_EMBD,
                                                  index_width,
                                                  g->batch_attn_norm,
-                                                 n_tokens) != 0;
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
-                                                         model->map,
-                                                         model->size,
+                                                 g->batch_attn_norm_f16,
+                                                 attn_norm_f16_ready,
+                                                 n_tokens);
+                if (ok) ok = metal_graph_matmul_f16_shared_tensor(g->batch_comp_sc,
+                                                         model,
                                                          layer->indexer_compressor_gate->abs_offset,
                                                          DS4_N_EMBD,
                                                          index_width,
                                                          g->batch_attn_norm,
-                                                         n_tokens) != 0;
+                                                         g->batch_attn_norm_f16,
+                                                         attn_norm_f16_ready,
+                                                         n_tokens);
             }
             if (ok && idx_pair_rows_fused)
                 metal_graph_comp_pair_rows_selftest(g, model,
@@ -17638,14 +17698,16 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                * commit scales, so emit scale-only (CUDA;
                                                                * Metal ignores both mirrors). */
                                                               NULL, g->batch_indexer_q_scale) != 0;
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
-                                                         model->map,
-                                                         model->size,
+                /* inc-11 F1: shared attn_norm f16 mirror when available. */
+                if (ok) ok = metal_graph_matmul_f16_shared_tensor(g->batch_indexer_weights,
+                                                         model,
                                                          layer->indexer_proj->abs_offset,
                                                          DS4_N_EMBD,
                                                          DS4_N_INDEXER_HEAD,
                                                          g->batch_attn_norm,
-                                                         n_tokens) != 0;
+                                                         g->batch_attn_norm_f16,
+                                                         attn_norm_f16_ready,
+                                                         n_tokens);
             }
             if (use_multiseq && !zero_prefix && g->batch_multiseq_emit && !g->batch_defer_comp_store) {
                 /* Step 4d (Scope A): per-seq INDEXER compressor emit, the

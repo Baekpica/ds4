@@ -19992,6 +19992,29 @@ extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(ds4_gpu_tensor *out, const voi
  * cublasGemmEx branch with no convert launch at all.  Returns 0 with `out`
  * untouched on any precondition miss; the caller must then run one of the
  * fallback chains (rms-fold or fully unfused). */
+/* v0.5 inc-11 F1: shared-activation plumbing.  Several batch f16 GEMMs per
+ * layer read the SAME f32 activation (batch_attn_norm) and each paid its own
+ * f32->f16 convert inside ds4_gpu_matmul_f16_tensor.  The caller now converts
+ * once into a persistent f16 mirror (ds4_gpu_f32_to_f16_tensor -- the SAME
+ * f32_to_f16_kernel the helper uses, so the mirror is bit-identical to every
+ * per-call convert it replaces) and feeds the consumers through the preconv
+ * entry below.  ds4_gpu_matmul_f16_preconv_ready is the tier predicate: the
+ * mirror is only worth filling when the cublas branch (the only one that
+ * converts) would serve the width. */
+extern "C" int ds4_gpu_matmul_f16_preconv_ready(uint64_t n_tok) {
+    if (!g_cublas_ready || n_tok <= cuda_native_f16_max_tokens()) return 0;
+    if (getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL) return 0;
+    return 1;
+}
+
+extern "C" int ds4_gpu_f32_to_f16_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t count) {
+    if (!dst || !src || count == 0) return 0;
+    if (src->bytes < count * sizeof(float) || dst->bytes < count * sizeof(__half)) return 0;
+    f32_to_f16_kernel<<<(count + 255) / 256, 256, 0, ds4_current_stream()>>>(
+            (__half *)dst->ptr, (const float *)src->ptr, count);
+    return cuda_ok(cudaGetLastError(), "f32_to_f16 tensor launch");
+}
+
 extern "C" int ds4_gpu_matmul_f16_preconv_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *xh, uint64_t n_tok) {
     if (!out || !xh || !model_map) return 0;
     if (!g_cublas_ready || n_tok <= cuda_native_f16_max_tokens()) return 0;

@@ -16323,6 +16323,21 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
     return 0;
 }
 
+/* v0.5 inc-11 F1: CUDA-only shared f16 activation mirror; Metal returns 0
+ * so every caller keeps the classic per-call helper. */
+int ds4_gpu_matmul_f16_preconv_ready(uint64_t n_tok) {
+    (void)n_tok;
+    return 0;
+}
+
+int ds4_gpu_f32_to_f16_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t                count) {
+    (void)dst; (void)src; (void)count;
+    return 0;
+}
+
 /* v0.5 inc-10 F2: CUDA-only fused inverse-rope + f16 out_a pack; Metal
  * returns 0 so callers fall back to the separate (bit-exact) pair. */
 int ds4_gpu_attention_output_q8_batch_inverse_rope_tensor(
