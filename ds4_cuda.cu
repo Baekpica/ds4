@@ -26868,6 +26868,7 @@ mmq_moe_path:
          * once per MoE block (saves 1 quantize + 1 helper launch per
          * layer).  Step 3 of the optimization plan. */
         int rc = -1;
+        int fused_done = 0;   /* v0.5 inc-9 F7: fused pipeline handled swiglu+down */
         if (gate_is_q4k) {
             rc = ds4_mmq_q4_K_moe_pair(gate_w, up_w, (const float *)x->ptr,
                                        (const int32_t *)selected->ptr,
@@ -26906,13 +26907,93 @@ mmq_moe_path:
                 goto mmq_moe_fallback;
             }
         } else {
+            /* v0.5 inc-9 (F7, derived from Marco Palaferri's GB10 fork,
+             * MIT `910501e`): complete fused MoE prefill over the aligned
+             * artifacts.  ONE expert-major schedule serves gate/up AND
+             * down; the direct tier keeps the gate/up accumulators in
+             * registers and quantizes clamp+SwiGLU+route-weight straight
+             * into the down Q8_1 D2S6 blocks - the gate/up/mid buffers
+             * this path no longer materializes become its caller-owned
+             * scratch (LOGICAL segment sizes only: an owning arena's
+             * capacity would let the overlap guard falsely cover the
+             * adjacent views).  Bit-exact vs the classic chain below:
+             * per-column MMA fold order is tile-width-invariant, the
+             * epilogue quantize replicates quantize_mmq_q8_1's D2S6
+             * reduction op-for-op, and the down column permutation only
+             * reorders independent dot products.  Falls back tier-by-tier
+             * (direct -> shared-schedule materialized -> classic).
+             * DS4_CUDA_NO_MOE_FUSED_PREFILL=1 escapes; dump runs
+             * (DS4_METAL_GRAPH_DUMP_PREFIX) materialize intermediates. */
+            static int fused_prefill_want = -1;
+            if (fused_prefill_want < 0) {
+                fused_prefill_want =
+                    getenv("DS4_CUDA_NO_MOE_FUSED_PREFILL") == NULL &&
+                    getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+            }
+            if (fused_prefill_want && down_is_q2k &&
+                gate_iq2_aligned && up_iq2_aligned && down_q2k_aligned &&
+                cuda_moe_iq2_aligned_enabled() &&
+                cuda_mmq_aligned_tiles_enabled() &&
+                cuda_moe_q2k_aligned_enabled()) {
+                const uint64_t seg_bytes =
+                    n_assignments * (uint64_t)expert_mid_dim * sizeof(float);
+                rc = -1;
+                if (up->bytes >= seg_bytes && gate->bytes >= seg_bytes &&
+                    mid->bytes >= seg_bytes) {
+                    rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
+                        gate_iq2_aligned, up_iq2_aligned, down_q2k_aligned,
+                        (const float *)x->ptr, (const int32_t *)selected->ptr,
+                        (const float *)weights->ptr,
+                        up->ptr, (size_t)seg_bytes,
+                        gate->ptr, (size_t)seg_bytes,
+                        mid->ptr, (size_t)seg_bytes,
+                        (float *)down->ptr,
+                        (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
+                        (int)n_tokens, (int)n_experts_total, (int)n_expert_used,
+                        clamp, ds4_mmq_stream_for_call());
+                }
+                if (rc == 0) {
+                    fused_done = 1;
+                    static int fused_direct_notice = 0;
+                    if (!fused_direct_notice) {
+                        fused_direct_notice = 1;
+                        fprintf(stderr, "ds4: fused MoE gateup+swiglu+q8 D2R prefill engaged (inc-9 F7 direct)\n");
+                    }
+                } else {
+                    const int direct_rc = rc;
+                    rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
+                        gate_iq2_aligned, up_iq2_aligned, down_q2k_aligned,
+                        (const float *)x->ptr, (const int32_t *)selected->ptr,
+                        (const float *)weights->ptr,
+                        (float *)gate->ptr, (float *)up->ptr,
+                        (float *)mid->ptr, (float *)down->ptr,
+                        (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
+                        (int)n_tokens, (int)n_experts_total, (int)n_expert_used,
+                        clamp, ds4_mmq_stream_for_call());
+                    if (rc == 0) {
+                        fused_done = 1;
+                        static int fused_tier1_notice = 0;
+                        if (!fused_tier1_notice) {
+                            fused_tier1_notice = 1;
+                            fprintf(stderr, "ds4: fused MoE prefill on the materialized tier (inc-9 F7 shared-schedule; direct rc=%d)\n", direct_rc);
+                        }
+                    } else {
+                        static int fused_fallback_notice = 0;
+                        if (!fused_fallback_notice) {
+                            fused_fallback_notice = 1;
+                            fprintf(stderr, "ds4: fused MoE prefill unavailable (direct rc=%d tier1 rc=%d tokens=%u); using the classic chain\n",
+                                    direct_rc, rc, n_tokens);
+                        }
+                    }
+                }
+            }
             /* P4 Inc3: with the aligned gate/up artifacts present, the mmq
              * tile loader reads the SoA sections directly (bit-identical
              * tiles, no per-layer derepack, no scratch VRAM).  On failure or
              * DS4_MMQ_ALIGNED_TILES=0, the M1-Inc2b derepack-scratch path
              * below remains the fallback. */
             int pair_done = 0;
-            if (gate_iq2_aligned && up_iq2_aligned && cuda_moe_iq2_aligned_enabled() &&
+            if (!fused_done && gate_iq2_aligned && up_iq2_aligned && cuda_moe_iq2_aligned_enabled() &&
                 cuda_mmq_aligned_tiles_enabled()) {
                 rc = ds4_mmq_iq2_xxs_moe_pair_soa(gate_iq2_aligned, up_iq2_aligned,
                                                   (const float *)x->ptr,
@@ -26927,7 +27008,7 @@ mmq_moe_path:
                     fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_pair_soa (gate+up) returned %d; trying derepack path\n", rc);
                 }
             }
-            if (!pair_done) {
+            if (!fused_done && !pair_done) {
             /* M1-Inc2b: when the raw gate/up spans were excluded from the
              * upload (--repack-iq2-aligned), gate_w/up_w point at the client
              * mmap; de-repack the aligned artifacts into the persistent
@@ -26959,7 +27040,7 @@ mmq_moe_path:
             }
             }
         }
-        {
+        if (!fused_done) {
             const uint64_t mid_floats = n_assignments * expert_mid_dim;
             moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256, 0, ds4_current_stream()>>>(
                 (float *)mid->ptr, /*gate_out_dbg=*/nullptr, /*up_out_dbg=*/nullptr,
@@ -26973,7 +27054,7 @@ mmq_moe_path:
          * of length n_tokens * n_expert_used; reinterpreting it as
          * [n_assignments, 1] gives one expert id per row, which is exactly
          * what ds4_mmq_*_moe with n_expert_used=1 consumes. */
-        if (!down_is_q2k) {
+        if (!fused_done && !down_is_q2k) {
             rc = ds4_mmq_q4_K_moe(down_w, (const float *)mid->ptr, (const int32_t *)selected->ptr,
                                   (float *)down->ptr,
                                   (int)out_dim, (int)expert_mid_dim,
@@ -26983,7 +27064,7 @@ mmq_moe_path:
                 fprintf(stderr, "ds4: ds4_mmq_q4_K_moe (down) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
             }
-        } else {
+        } else if (!fused_done) {
             /* P4 Inc3: SoA-direct tile loads from the aligned down artifact
              * (see the gate/up branch above); the M2 derepack scratch stays
              * as the fallback. */

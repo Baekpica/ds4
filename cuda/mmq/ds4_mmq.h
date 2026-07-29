@@ -249,6 +249,61 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     int             n_expert_used,
     cudaStream_t    stream);
 
+/* v0.5 inc-9 (F7): fused target-prefill pipeline over the aligned-SoA
+ * IQ2_XXS gate/up and Q2_K down artifacts.  Builds the expert-major
+ * assignment map once, runs the paired gate/up MMQs, computes clamp +
+ * SwiGLU + router weighting in mid_f32, then gathers and quantizes those
+ * rows for the Q2_K down MMQ through the same ids_dst/expert_bounds.  No
+ * second mm_ids_helper; gate/up/mid/down keep the pair-major layout. */
+int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
+    const void    * W_gate_soa,
+    const void    * W_up_soa,
+    const void    * W_down_soa,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    float         * gate_f32,
+    float         * up_f32,
+    float         * mid_f32,
+    float         * down_f32,
+    int             expert_mid_dim,
+    int             expert_in_dim,
+    int             out_dim,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
+/* Aligned-artifact production fast path: gate/up stay in registers, weighted
+ * SwiGLU is quantized directly into down_q8_scratch, and only the pair-major
+ * down output is materialized.  Caller-owned scratch keeps this hot path free
+ * of stream-ordered allocations; all three ranges must be distinct, remain
+ * live until return, and be sized to their LOGICAL segments (never an owning
+ * arena's capacity). */
+int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
+    const void    * W_gate_soa,
+    const void    * W_up_soa,
+    const void    * W_down_soa,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    void          * input_q8_scratch,
+    size_t          input_q8_scratch_bytes,
+    void          * down_q8_scratch,
+    size_t          down_q8_scratch_bytes,
+    void          * work_scratch,
+    size_t          work_scratch_bytes,
+    float         * down_f32,
+    int             expert_mid_dim,
+    int             expert_in_dim,
+    int             out_dim,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
 int ds4_mmq_q4_K_moe_pair(
     const void    * W_a,
     const void    * W_b,
