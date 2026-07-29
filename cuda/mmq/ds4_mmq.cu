@@ -191,6 +191,42 @@ static bool out_memset_enabled() {
     return cached != 0;
 }
 
+/* v0.5 inc-12 slice 2: Y-buffer (q8_1 activation) memset diet.  The S1.1a-era
+ * zero of every quantize staging buffer before quantize_mmq_q8_1 cost ~2.3
+ * s/180k of stream time (reslice10 MEMSET table: 56.6/28.3/18.9/9.45/4.7 MB
+ * classes = the gateup/down/o_proj/dense/shexp Y buffers).  quantize writes
+ * every valid column; only the never-written pad/slack tail is at stake, and
+ * the mmq write_back masks tail lanes out of the output (the D2R kernels
+ * guard their token loops outright).  Modes, same contract as the cublas ws
+ * knob:
+ *   DS4_MMQ_YBUF_MEMSET unset/0 -> no zero (default; bit-exact IFF no tail
+ *     byte can reach an output, proven by the poison gate)
+ *   =1      -> S1.1a always-zero (the old behavior)
+ *   =poison -> fill 0xFF: the bit-exactness instrument.  Exact twins vs
+ *     always-zero across the gate battery prove the masking claim; any
+ *     drift means some path DOES leak tail bytes and OFF must not ship. */
+static int ybuf_memset_mode() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MMQ_YBUF_MEMSET");
+        cached = 0;
+        if (env && env[0] == '1') cached = 1;
+        else if (env && (env[0] == 'p' || env[0] == 'P')) cached = 2;
+        if (cached) {
+            fprintf(stderr, "ds4: DS4_MMQ_YBUF_MEMSET=%s - q8_1 staging %s\n",
+                    cached == 1 ? "1" : "poison",
+                    cached == 1 ? "zeroing restored" : "poisoned (0xFF)");
+        }
+    }
+    return cached;
+}
+
+static void ybuf_memset(void *ptr, size_t bytes, cudaStream_t stream) {
+    const int mode = ybuf_memset_mode();
+    if (mode == 0 || ptr == NULL || bytes == 0) return;
+    (void)cudaMemsetAsync(ptr, mode == 1 ? 0 : 0xFF, bytes, stream);
+}
+
 static int64_t d2r_min_cols() {
     static int64_t cached = -1;
     if (cached < 0) {
@@ -452,7 +488,7 @@ int ds4_mmq_dense_impl(
     // The tail's dot-products are masked out by write_back, so only their
     // non-determinism matters; zero the buffer so the tail is a deterministic zero
     // (a zero q8_1 block contributes 0 to the dot product).
-    cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream);
+    ybuf_memset(src1_q8_1.get(), nbytes_src1_q8_1, stream);
 
     quantize_mmq_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
@@ -557,7 +593,7 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
         slack_blocks * sizeof(block_q8_1_mmq);
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
-    cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream);
+    ybuf_memset(src1_q8_1.get(), nbytes_src1_q8_1, stream);
 
     quantize_mmq_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
@@ -731,7 +767,7 @@ int ds4_mmq_moe_impl(
     // tail from stale pool memory -> allocator-perturbation-dependent garbage in the
     // (write_back-masked) tail lanes -> non-deterministic batched-forward output.
     // Zero it so the masked-out tail is a deterministic zero.
-    cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream);
+    ybuf_memset(src1_q8_1.get(), nbytes_src1_q8_1, stream);
 
     // src1 logical [K, ne11=1, ne12=n_tokens, ne13=1] - K innermost, then
     // one row per channel, channels = tokens.
@@ -1134,7 +1170,7 @@ int ds4_mmq_moe_pair_impl(
                 "ds4/prefill/moe/input_quant_q8_1",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
                 nvtx_prefill);
-        cudaMemsetAsync(src1_q8_1, 0, nbytes_src1_q8_1, stream);
+        ybuf_memset(src1_q8_1, nbytes_src1_q8_1, stream);
         quantize_mmq_q8_1_cuda(
             X_f32, ids_src1, (void *)src1_q8_1,
             type, /*ne00=*/K, s11_src, s12_src, s13_src,
@@ -1149,11 +1185,7 @@ int ds4_mmq_moe_pair_impl(
     }
 
     if (direct_gateup_q8) {
-        err = cudaMemsetAsync(
-            fused_down->q8_scratch, 0, direct_down_q8_bytes, stream);
-        if (err != cudaSuccess) {
-            return -9;
-        }
+        ybuf_memset(fused_down->q8_scratch, direct_down_q8_bytes, stream);
         const size_t gateup_work_bytes =
             ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
                 ne_get_rows, n_experts);
@@ -1323,7 +1355,7 @@ int ds4_mmq_moe_pair_impl(
                     "ds4/prefill/moe/swiglu_down_quant",
                     ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                     nvtx_prefill);
-            cudaMemsetAsync(down_q8_1.get(), 0, logical_q8_bytes + tail_q8_bytes, stream);
+            ybuf_memset(down_q8_1.get(), logical_q8_bytes + tail_q8_bytes, stream);
             ds4_swiglu_weighted_f32<<<
                 (uint32_t)((mid_values + 255u) / 256u), 256, 0, stream>>>(
                     out_a, out_b, fused_down->router_weights,
