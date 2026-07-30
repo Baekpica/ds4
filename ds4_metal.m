@@ -4539,6 +4539,11 @@ void ds4_gpu_boot_trim(void) {
     /* No graph-pool reserve concept on Metal. */
 }
 
+void ds4_gpu_unregister_model_map(const void *base) {
+    /* No host-registration concept on Metal (shared unified buffers). */
+    (void)base;
+}
+
 /* R5 Inc1b: Metal has no VMM reserve/map-on-demand; reserve() returns NULL so
  * callers allocate eagerly, ensure() is a mapped no-op, resident() reports the
  * range itself (eager tensors are always fully resident). */

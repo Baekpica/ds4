@@ -3413,6 +3413,41 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     return 1;
 }
 
+extern "C" void ds4_gpu_unregister_model_map(const void *base) {
+    /* Retire the host registration for ONE mapping whose owner is about to
+     * free it.  A cudaHostRegister pin outliving its allocation poisons
+     * unrelated cudaMemcpy calls whose host buffers land on the recycled
+     * pages ("invalid argument" with perfectly valid parameters).  Serving
+     * never hits this -- its maps live for the process; map-swapping callers
+     * (the kernel unit tests) must call this before free().  Touches only
+     * host-registration state: device artifacts and imported ranges of other
+     * maps are left alone. */
+    if (!base) return;
+    if (g_model_registered && g_model_host_base == base) {
+        (void)cudaHostUnregister((void *)base);
+        cuda_pinned_file_note_unregister(base);
+        g_model_registered = 0;
+        g_model_host_base = NULL;
+        g_model_device_base = NULL;
+        g_model_registered_size = 0;
+        return;
+    }
+    for (cuda_model_range &r : g_model_ranges) {
+        if (r.host_registered && r.registered_base == (void *)base) {
+            (void)cudaHostUnregister(r.registered_base);
+            cuda_pinned_file_note_unregister(r.registered_base);
+            /* Every range lookup keys on host_base equality; nulling it makes
+             * the entry inert without disturbing sibling range indices. */
+            r.host_registered = 0;
+            r.registered_base = NULL;
+            r.registered_device_base = NULL;
+            r.registered_bytes = 0;
+            r.host_base = NULL;
+            r.device_ptr = NULL;
+        }
+    }
+}
+
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;

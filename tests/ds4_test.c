@@ -189,6 +189,7 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     if (!x || !out) {
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
+        ds4_gpu_unregister_model_map(weights_raw);
         free(weights_raw);
         return;
     }
@@ -202,6 +203,7 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
         free(out_host);
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
+        ds4_gpu_unregister_model_map(weights_raw);
         free(weights_raw);
         return;
     }
@@ -233,6 +235,7 @@ static void test_metal_f16_matvec_fast_nr0_4(void) {
     free(out_host);
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(out);
+    ds4_gpu_unregister_model_map(weights_raw);
     free(weights_raw);
 }
 
@@ -265,6 +268,7 @@ static void test_metal_f16_prefill_matmul(void) {
     if (!x || !out) {
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
+        ds4_gpu_unregister_model_map(weights_raw);
         free(weights_raw);
         return;
     }
@@ -278,6 +282,7 @@ static void test_metal_f16_prefill_matmul(void) {
         free(out_host);
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
+        ds4_gpu_unregister_model_map(weights_raw);
         free(weights_raw);
         return;
     }
@@ -324,6 +329,7 @@ static void test_metal_f16_prefill_matmul(void) {
     free(out_host);
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(out);
+    ds4_gpu_unregister_model_map(weights_raw);
     free(weights_raw);
 }
 
@@ -352,6 +358,7 @@ static void test_metal_q8_0_prefill_matmul(void) {
     if (!x || !out) {
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
+        ds4_gpu_unregister_model_map(weights_raw);
         free(weights_raw);
         return;
     }
@@ -365,6 +372,7 @@ static void test_metal_q8_0_prefill_matmul(void) {
         free(out_host);
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
+        ds4_gpu_unregister_model_map(weights_raw);
         free(weights_raw);
         return;
     }
@@ -418,6 +426,7 @@ static void test_metal_q8_0_prefill_matmul(void) {
     free(out_host);
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(out);
+    ds4_gpu_unregister_model_map(weights_raw);
     free(weights_raw);
 }
 
@@ -805,6 +814,15 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
         if (!test_token_bytes_equal(engine, token, step->selected, step->selected_len)) {
             fprintf(stderr, "ds4-test: vector %s step %d selected token mismatch\n",
                     vc->id, i);
+            /* Adjudication data: the local top-4 with logprobs vs the
+             * fixture's expected leader -- a near-zero top-2 gap marks a
+             * knife-edge fixture step (exclusion candidate), a wide gap a
+             * real distribution shift. */
+            fprintf(stderr, "ds4-test:   expected '%.*s', local argmax id=%d\n",
+                    (int)step->selected_len, step->selected, token);
+            for (int j = 0; j < nscore && j < 4; j++)
+                fprintf(stderr, "ds4-test:   local top%d id=%d logprob=%.5f\n",
+                        j, scores[j].id, scores[j].logprob);
             TEST_ASSERT(false);
         }
 
