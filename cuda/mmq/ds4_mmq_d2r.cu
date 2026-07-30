@@ -2936,9 +2936,9 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
     int *work = (int *)worklist_scratch;
     int *n_items = work + capacity32;
 
-    /* Single guarded launch (see the down launch comment): the rival's
-     * tail-specialized 8/16/32 decomposition assumes big expert buckets
-     * (their 8k-token chunks -> ~192 cols/expert, full tiles dominate).
+    /* Single guarded launch (see the down launch comment): the upstream
+     * fork's tail-specialized 8/16/32 decomposition assumes big expert
+     * buckets (its 8k-token chunks -> ~192 cols/expert, full tiles dominate).
      * At OUR 2048-token serving chunks the mean bucket is ~48 cols, every
      * expert carries a ragged tail, and the three extra launches cost more
      * than the narrow-tile waste they avoid (reslice6: 22.6 of 47.5 s in

@@ -14959,23 +14959,33 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
 }
 
 #ifdef DS4_CUDA_HAVE_MXF4
-/* ================= v0.5 inc-5: mxf4 retrieve-and-rerank selector =========
- * Replaces the dense scores+topk pair on deep prefill chunks with a
- * four-stage chain: (1) e2m1-quantize the indexer Q rows, (2) mxf4
- * block-scale MMA coarse scores (e2m1 x e2m1 tensor cores ~2x the f16
- * rate on GB10) written as f16 into the scores scratch, (3) exact
- * streaming top-2048 candidate pool per token over the f16 row, (4) f16
- * WMMA rescore of the pool (rb2-grade fidelity: K decode is exact in f16)
- * + exact top-512 emit in topk_pack_key order (byte-compatible with the
- * stream512 tier's output, sentinel included).
+/* ================= v0.5 inc-13a: exact mxf4 score+select ==================
+ * Replaces the dense scores+topk pair on eager prefill chunks at ALL
+ * depths with the exact minimal chain: (1) e2m1-quantize the indexer Q
+ * rows, (2) mxf4 block-scale MMA coarse scores (F32 accumulate, F32 row
+ * emit), (3) the shipped exact top-512 select over the f32 rows.  No
+ * candidate pool, no rescore, no f16 anywhere in selection.
  *
- * Selection is rescore-grade, NOT bit-identical to the dense pair: proto
- * receipts (mxf4_diet/v5m_run7a/b, two seeds) show top512 flips vs the
- * F32 oracle equal to the dense kernel's own flips at every depth, with
- * miss256 = 0 everywhere.  Speed: 1.36x at n_comp 131072, 1.40-1.41x at
- * 198656; break-even ~44k -> engage gate 65536 sits in the measured
- * parity band.  Eager-only (never on capture steps); the classic pair
- * remains the fallback everywhere.
+ * Why exact: the model's DSA lightning indexer already quantizes q AND K
+ * onto the e2m1 x pow2 grid (byte-verified across 21 layers on real
+ * captures, rmse 0.00e+00 vs the F32 oracle), so the mxf4 coarse scores
+ * are LOSSLESS in vivo and the f32-key select is deterministic (idx-asc
+ * tie-break).  The retired inc-5/inc-7 pool+rescore chain was built
+ * against a synthetic-data artifact and measurably DEGRADED real
+ * selection (tie collapse in the f16 coarse row + f16-wmma reduction
+ * noise); receipts in mxf4_diet/proto_real_sweep_l2-42.txt.
+ *
+ * Coarse geometry: 16-token x 256-comp tiles, Q staged in shared memory
+ * with next-group cp.async prefetch.  The 16-token Q-staging tile shape
+ * is adapted from xangel82/DS4-GB10-GX10-DSpark-CUDA
+ * cuda/indexer/ds4_indexer_sm121.cu (MIT).
+ * Portions Copyright (c) 2026 Marco Palaferri.
+ * Our v3 evolution (receipts mxf4_diet/proto_rrv2_run5_v3.txt +
+ * ncu_v3hg16w16.txt): paired-line swizzled Q smem (a row's four A-words
+ * = one conflict-free LDS.128), 16-head cp.async staging groups (4
+ * barriers/CTA vs 64), 16 warps x 2 col-groups, F32 emit.  1.24x the
+ * imported geometry, 5.0x the shipped dense pair at n_comp 131072;
+ * bitwise-twin gates at every proto shape incl. 3 real capture layers.
  *
  * Requires the sm_121a build (kind::mxf4 block-scale MMA): the Makefile
  * maps CUDA_ARCH=sm_121 to -gencode arch=compute_121a,code=sm_121a and
@@ -14983,13 +14993,6 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
  * sm_121 and ptxas rejects the MMA. */
 #define RR_H 64u
 #define RR_D 128u
-#define RR_PAD 136u
-#define RR_POOL_K 2048u
-#define RR_POOL_CAP 6144u
-#define RR_ENGAGE_NCOMP 65536u
-
-typedef cub::BlockRadixSort<uint64_t, 512, RR_POOL_CAP / 512u> RrPoolSort;
-typedef cub::BlockRadixSort<uint64_t, 512, RR_POOL_K / 512u> RrFinalSort;
 
 /* nearest e2m1 magnitude level with ties toward the LOWER level (the host
  * quantizer's tie-break; proto-pinned so coarse scores match the receipts) */
@@ -15060,47 +15063,71 @@ __device__ static inline void rr_mma_mxf4(float d[4], const uint32_t a[4],
           "r"(sfa), "r"(sfb));
 }
 
-/* mxf4 coarse scorer: CTA = 32 tokens x 128 comps, warp owns 16 comp cols.
- * K fragments (mirror code words ARE the B operand) + ue8m0 exponents load
- * ONCE per warp and stay loop-invariant across all 64 heads; w*ReLU folds
- * on D fragments in registers.  No shared memory, no barriers.  Output is
- * __half at row stride out_stride ((n_comp+7)&~7 -> every row 16-B aligned
- * for the pool's uint4 scan; pad cells stay unwritten and the pool guards
- * them out). */
-__global__ static void __launch_bounds__(256) rr_coarse_mxf4_kernel(
-        __half *scores, const unsigned char * __restrict__ qc,
+/* cp.async helpers for the coarse Q staging (LDGSTS bypasses the RF; the
+ * pred=false form copies zero bytes and zero-fills the smem word) */
+__device__ __forceinline__ void idx_cp_async_u32(uint32_t *dst_smem,
+                                                 const void *src_gmem,
+                                                 bool pred) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(dst_smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
+                 :: "r"(s), "l"(src_gmem), "r"(pred ? 4u : 0u));
+}
+__device__ __forceinline__ void idx_cp_commit(void) {
+    asm volatile("cp.async.commit_group;\n");
+}
+__device__ __forceinline__ void idx_cp_wait0(void) {
+    asm volatile("cp.async.wait_group 0;\n");
+}
+
+/* mxf4 coarse scorer v3: CTA = 16 tokens x 256 comps, 16 warps, each warp
+ * owns 2 col-groups of 8 comps ((cg*16 + warp)*8).  K fragments (mirror
+ * code words ARE the B operand) + ue8m0 exponents load ONCE per warp and
+ * stay loop-invariant across all 64 heads.  Q rows stage into shared
+ * memory in 16-head groups with cp.async ping-pong (4 barriers/CTA);
+ * within a group buffer, two 17-word rows share one 128-B paired line
+ * with code words in slot(w) = (w%4)*4 + w/4 order, so a thread's four
+ * A-words for one row are ONE conflict-free LDS.128 (row scales live in a
+ * separate side array).  w*ReLU folds on D fragments in registers; output
+ * is F32 full rows (-INF past the causal clamp) at row stride out_stride,
+ * feeding the exact top-512 select directly. */
+__global__ static void __launch_bounds__(512) rr_coarse_mxf4_v3_kernel(
+        float *scores, const unsigned char * __restrict__ qc,
         const uint32_t * __restrict__ qsf, const float * __restrict__ weights,
         uint32_t n_comp, uint32_t n_tokens, uint32_t pos0, uint32_t ratio,
         float scale, const unsigned char * __restrict__ fp4,
         const float * __restrict__ fp4_sc, uint32_t out_stride) {
-    const uint32_t tile_c = blockIdx.x * 128u;
-    const uint32_t tile_t = blockIdx.y * 32u;
+    const uint32_t HG = 16u;   /* heads per staging group */
     const uint32_t tid = threadIdx.x;
     const uint32_t warp = tid >> 5u;
     const uint32_t lane = tid & 31u;
-    const uint32_t group = lane >> 2u, tig = lane & 3u;
+    const uint32_t tig = lane & 3u;
+    const uint32_t tile_t = blockIdx.y * 16u;
+    const uint32_t tile_c = blockIdx.x * 256u;
 
     {
-        const uint32_t last_token = min(tile_t + 32u, n_tokens);
+        const uint32_t last_token = min(tile_t + 16u, n_tokens);
         const uint32_t max_visible = last_token > tile_t
             ? min((pos0 + last_token) / ratio, n_comp) : 0u;
         if (tile_c >= max_visible) {
-            for (uint32_t i = tid; i < 32u * 128u; i += 256u) {
-                const uint32_t r = i >> 7u, c = i & 127u;
+            for (uint32_t i = tid; i < 16u * 256u; i += 512u) {
+                const uint32_t r = i >> 8u, c = i & 255u;
                 const uint32_t token = tile_t + r, comp = tile_c + c;
                 if (token < n_tokens && comp < n_comp)
-                    scores[(uint64_t)token * out_stride + comp] =
-                        __float2half(-INFINITY);
+                    scores[(uint64_t)token * out_stride + comp] = -INFINITY;
             }
             return;
         }
     }
 
+    __shared__ __align__(16) uint32_t q_sh[2][16][8][32];
+    __shared__ uint32_t sfa_sh[2][16][16];
+    __shared__ float w_sh[2][16][16];
+
     /* loop-invariant K fragments: cg col-group, regs {b0,b1} x k-halves */
     uint32_t bfrag[2][4], sfb[2][2];
 #pragma unroll
     for (uint32_t cg = 0; cg < 2u; cg++) {
-        const uint32_t col = tile_c + warp * 16u + cg * 8u + group;
+        const uint32_t col = tile_c + (cg * 16u + warp) * 8u + (lane >> 2u);
         if (col < n_comp) {
             const uint32_t *kw = (const uint32_t *)(fp4 + (uint64_t)col * 64u);
             bfrag[cg][0] = kw[tig];       bfrag[cg][1] = kw[4u + tig];
@@ -15114,387 +15141,108 @@ __global__ static void __launch_bounds__(256) rr_coarse_mxf4_kernel(
         }
     }
 
-    /* sfa source row for this lane (rows 16-31 of the lane space unused by
-     * the HW; mask to a valid tile row so the load stays in bounds) */
-    const uint32_t sfa_r = ((lane >> 2u) + 8u * (lane & 3u)) & 15u;
-
-    float acc[2][2][4];
-#pragma unroll
-    for (uint32_t tt = 0; tt < 2u; tt++)
-#pragma unroll
-        for (uint32_t cg = 0; cg < 2u; cg++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) acc[tt][cg][i] = 0.0f;
-
-    for (uint32_t h = 0; h < RR_H; h++) {
-#pragma unroll
-        for (uint32_t tt = 0; tt < 2u; tt++) {
-            const uint32_t t_base = tile_t + tt * 16u;
-            const uint32_t row_lo = t_base + group, row_hi = row_lo + 8u;
-            uint32_t afrag[2][4];
-            const uint32_t *qlo = (const uint32_t *)(qc
-                + ((uint64_t)row_lo * RR_H + h) * 64u);
-            const uint32_t *qhi = (const uint32_t *)(qc
-                + ((uint64_t)row_hi * RR_H + h) * 64u);
-#pragma unroll
-            for (uint32_t m = 0; m < 2u; m++) {
-                afrag[m][0] = row_lo < n_tokens ? qlo[(2u * m) * 4u + tig] : 0u;
-                afrag[m][1] = row_hi < n_tokens ? qhi[(2u * m) * 4u + tig] : 0u;
-                afrag[m][2] = row_lo < n_tokens ? qlo[(2u * m + 1u) * 4u + tig] : 0u;
-                afrag[m][3] = row_hi < n_tokens ? qhi[(2u * m + 1u) * 4u + tig] : 0u;
+    /* group stager: HG heads x 16 tokens, 16 code words + 1 scale word
+     * each; codes land permuted in the paired line, scales in the side
+     * array, weights alongside */
+    auto stage = [&](uint32_t h0, uint32_t buf) {
+        for (uint32_t i = tid; i < HG * 16u * 17u; i += 512u) {
+            const uint32_t hh = i / (16u * 17u);
+            const uint32_t rem = i - hh * (16u * 17u);
+            const uint32_t m = rem / 17u;
+            const uint32_t word = rem - m * 17u;
+            const uint32_t token = tile_t + m;
+            const bool ok = token < n_tokens;
+            const uint64_t row = (uint64_t)token * RR_H + h0 + hh;
+            const void *src;
+            uint32_t *dst;
+            if (word < 16u) {
+                src = ok ? (const void *)(qc + row * 64u + word * 4u)
+                         : (const void *)qc;
+                dst = &q_sh[buf][hh][m >> 1u]
+                           [(m & 1u) * 16u + (word & 3u) * 4u + (word >> 2u)];
+            } else {
+                src = ok ? (const void *)(qsf + row) : (const void *)qsf;
+                dst = &sfa_sh[buf][hh][m];
             }
-            const uint32_t t_sfa = t_base + sfa_r;
-            const uint32_t qs = t_sfa < n_tokens
-                ? qsf[(uint64_t)t_sfa * RR_H + h] : 0x7F7F7F7Fu;
-            const uint32_t sfa0 = qs & 0xFFFFu, sfa1 = qs >> 16u;
-            const float w_lo = row_lo < n_tokens
-                ? weights[(uint64_t)row_lo * RR_H + h] : 0.0f;
-            const float w_hi = row_hi < n_tokens
-                ? weights[(uint64_t)row_hi * RR_H + h] : 0.0f;
+            idx_cp_async_u32(dst, src, ok);
+        }
+        for (uint32_t i = tid; i < HG * 16u; i += 512u) {
+            const uint32_t hh = i >> 4u, m = i & 15u;
+            const uint32_t token = tile_t + m;
+            const bool ok = token < n_tokens;
+            const void *src = ok
+                ? (const void *)(weights + (uint64_t)token * RR_H + h0 + hh)
+                : (const void *)weights;
+            idx_cp_async_u32((uint32_t *)&w_sh[buf][hh][m], src, ok);
+        }
+    };
+
+    stage(0u, 0u);
+    idx_cp_commit();
+    idx_cp_wait0();
+    __syncthreads();
+
+    float acc[2][4];
+#pragma unroll
+    for (uint32_t cg = 0; cg < 2u; cg++)
+        acc[cg][0] = acc[cg][1] = acc[cg][2] = acc[cg][3] = 0.0f;
+
+    const uint32_t m0 = lane >> 2u;
+    const uint32_t scale_m = (lane & 1u) * 8u + m0;
+    for (uint32_t g = 0; g < RR_H / HG; g++) {
+        const uint32_t cur = g & 1u;
+        if (g + 1u < RR_H / HG) { stage((g + 1u) * HG, cur ^ 1u); idx_cp_commit(); }
+#pragma unroll
+        for (uint32_t hh = 0; hh < HG; hh++) {
+            const uint4 va0 = *reinterpret_cast<const uint4 *>(
+                &q_sh[cur][hh][m0 >> 1u][(m0 & 1u) * 16u + tig * 4u]);
+            const uint4 va1 = *reinterpret_cast<const uint4 *>(
+                &q_sh[cur][hh][(m0 + 8u) >> 1u][(m0 & 1u) * 16u + tig * 4u]);
+            const uint32_t qs = sfa_sh[cur][hh][scale_m];
+            const uint32_t sfa0 = qs & 0xFFFFu;
+            const uint32_t sfa1 = qs >> 16u;
+            const float w_lo = w_sh[cur][hh][m0];
+            const float w_hi = w_sh[cur][hh][m0 + 8u];
+            const uint32_t a_lo[4] = { va0.x, va1.x, va0.y, va1.y };
+            const uint32_t a_hi[4] = { va0.z, va1.z, va0.w, va1.w };
 #pragma unroll
             for (uint32_t cg = 0; cg < 2u; cg++) {
                 float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                rr_mma_mxf4(d, afrag[0], bfrag[cg][0], bfrag[cg][1], sfa0, sfb[cg][0]);
-                rr_mma_mxf4(d, afrag[1], bfrag[cg][2], bfrag[cg][3], sfa1, sfb[cg][1]);
-                acc[tt][cg][0] += fmaxf(d[0], 0.0f) * w_lo;
-                acc[tt][cg][1] += fmaxf(d[1], 0.0f) * w_lo;
-                acc[tt][cg][2] += fmaxf(d[2], 0.0f) * w_hi;
-                acc[tt][cg][3] += fmaxf(d[3], 0.0f) * w_hi;
+                rr_mma_mxf4(d, a_lo, bfrag[cg][0], bfrag[cg][1], sfa0, sfb[cg][0]);
+                rr_mma_mxf4(d, a_hi, bfrag[cg][2], bfrag[cg][3], sfa1, sfb[cg][1]);
+                acc[cg][0] += fmaxf(d[0], 0.0f) * w_lo;
+                acc[cg][1] += fmaxf(d[1], 0.0f) * w_lo;
+                acc[cg][2] += fmaxf(d[2], 0.0f) * w_hi;
+                acc[cg][3] += fmaxf(d[3], 0.0f) * w_hi;
             }
         }
+        if (g + 1u < RR_H / HG) { idx_cp_wait0(); __syncthreads(); }
     }
 
+    const uint32_t r0 = tile_t + m0;
+    const uint32_t r1 = r0 + 8u;
+    const uint32_t vis0 = (pos0 + r0 + 1u) / ratio;
+    const uint32_t vis1 = (pos0 + r1 + 1u) / ratio;
 #pragma unroll
-    for (uint32_t tt = 0; tt < 2u; tt++)
+    for (uint32_t cg = 0; cg < 2u; cg++) {
+        const uint32_t colb = tile_c + (cg * 16u + warp) * 8u + tig * 2u;
 #pragma unroll
-        for (uint32_t cg = 0; cg < 2u; cg++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const uint32_t token = tile_t + tt * 16u + group + ((i & 2) ? 8u : 0u);
-                const uint32_t comp = tile_c + warp * 16u + cg * 8u + tig * 2u + (i & 1);
-                if (token < n_tokens && comp < n_comp) {
-                    float out = acc[tt][cg][i] * scale;
-                    const uint32_t visible = (pos0 + token + 1u) / ratio;
-                    if (comp >= visible) out = -INFINITY;
-                    scores[(uint64_t)token * out_stride + comp] = __float2half(out);
-                }
-            }
-}
-
-/* exact streaming top-2048 pool over the f16 coarse row.  Keys are full
- * u64 (topk_pack_key: exact float order + ~idx tie-break) so the kept set
- * is deterministic regardless of atomic append order.  Tile = 4096 (8
- * halves per thread, one uint4 -- stride keeps rows 16-B aligned); CAP
- * 6144 leaves 4096 of accumulation slack above keep (SLACK law: zero
- * slack degenerates to a sort per tile).  The compact trigger is
- * two-phase and block-uniform: count the tile's pending takes first
- * (parity-buffered counter), compare against a FROZEN s_cnt (appends bump
- * a separate cursor; letting them bump s_cnt while slow warps still read
- * the trigger lets those warps diverge into compact()'s barriers alone).
- * launch_bounds minBlocks=1: occupancy is smem-capped at one block
- * (buf 48K + cub temp 49K), so a 2-block register target just spills the
- * hot-loop arrays (ncu receipt: 30M local spill requests). */
-__global__ static void __launch_bounds__(512, 1) rr_pool_kernel(
-        uint32_t *pool, const __half * __restrict__ scores,
-        uint32_t n_comp, uint32_t stride, uint32_t n_tokens) {
-    const uint32_t token = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    if (token >= n_tokens) return;
-    extern __shared__ unsigned char rr_sh[];
-    uint64_t *buf = (uint64_t *)rr_sh;
-    typename RrPoolSort::TempStorage *sort_tmp =
-        (typename RrPoolSort::TempStorage *)(rr_sh + (size_t)RR_POOL_CAP * 8u);
-    __shared__ uint32_t s_cnt;
-    __shared__ uint64_t s_thr;
-    __shared__ float s_thr_f;
-    __shared__ uint32_t s_pend[2];
-    __shared__ uint32_t s_apos;
-    if (tid == 0) {
-        s_cnt = 0; s_thr = 0; s_thr_f = -INFINITY;
-        s_pend[0] = 0; s_pend[1] = 0; s_apos = 0;
-    }
-    __syncthreads();
-
-    const __half *row = scores + (uint64_t)token * stride;
-    const uint32_t lane = tid & 31u;
-    const uint32_t nvec = stride >> 3u;
-    const uint32_t start = ((token + 1u) * 0x9E3779B9u) % nvec;
-
-    auto compact = [&](void) {
-        uint64_t keys[RR_POOL_CAP / 512u];
-#pragma unroll
-        for (uint32_t i = 0; i < RR_POOL_CAP / 512u; i++) {
-            const uint32_t r = tid * (RR_POOL_CAP / 512u) + i;
-            keys[i] = r < s_cnt ? buf[r] : 0ull;
-        }
-        __syncthreads();
-        RrPoolSort(*sort_tmp).SortDescending(keys);
-        __syncthreads();
-#pragma unroll
-        for (uint32_t i = 0; i < RR_POOL_CAP / 512u; i++) {
-            const uint32_t r = tid * (RR_POOL_CAP / 512u) + i;
-            if (r < RR_POOL_K) buf[r] = keys[i];
-            if (r == RR_POOL_K - 1u) {
-                s_thr = keys[i];
-                /* float prefilter mirror: coarse scores are exact halves,
-                 * so the unpacked threshold score is exact; the tie class
-                 * (v == thr_f) still goes through the full u64 compare. */
-                uint32_t fb = (uint32_t)(keys[i] >> 32);
-                fb = (fb & 0x80000000u) ? (fb & 0x7FFFFFFFu) : ~fb;
-                s_thr_f = __uint_as_float(fb);
-            }
-        }
-        if (tid == 0) s_cnt = RR_POOL_K;
-        __syncthreads();
-    };
-
-    uint32_t par = 0;
-    for (uint32_t base = 0; base < nvec; base += 512u, par ^= 1u) {
-        const uint32_t t = base + tid;
-        uint64_t key[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-        int take[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-        if (t < nvec) {
-            uint32_t vp = start + t;
-            if (vp >= nvec) vp -= nvec;
-            const uint4 raw = ((const uint4 *)row)[vp];
-            __half2 h2[4];
-            h2[0] = *(const __half2 *)&raw.x;
-            h2[1] = *(const __half2 *)&raw.y;
-            h2[2] = *(const __half2 *)&raw.z;
-            h2[3] = *(const __half2 *)&raw.w;
-            const uint32_t pos = vp * 8u;
-            const float thr_f = s_thr_f;
-            const uint64_t thr64 = s_thr; /* hoist: one MIO read, not eight */
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const float vlo = __half2float(__low2half(h2[j]));
-                const float vhi = __half2float(__high2half(h2[j]));
-                const uint32_t plo = pos + 2u * (uint32_t)j;
-                if (vlo >= thr_f && plo < n_comp) { /* prefilter + pad guard */
-                    key[2 * j] = topk_pack_key(vlo, plo);
-                    take[2 * j] = key[2 * j] > thr64;
-                }
-                if (vhi >= thr_f && plo + 1u < n_comp) {
-                    key[2 * j + 1] = topk_pack_key(vhi, plo + 1u);
-                    take[2 * j + 1] = key[2 * j + 1] > thr64;
-                }
-            }
-        }
-        uint32_t ball[8]; uint32_t nt = 0; uint32_t any = 0;
-#pragma unroll
-        for (int k = 0; k < 8; k++) {
-            ball[k] = __ballot_sync(0xffffffffu, take[k]);
-            any |= ball[k];
-            if (lane == 0) nt += __popc(ball[k]);
-        }
-        if (lane == 0 && nt) atomicAdd(&s_pend[par], nt);
-        __syncthreads();
-        const uint32_t cbase = s_cnt; /* frozen for the tile */
-        if (cbase + s_pend[par] > RR_POOL_CAP) compact(); /* block-uniform */
-        const uint32_t wbase = s_cnt; /* == cbase, or RR_POOL_K after compact */
-        if (any) { /* warp-uniform */
-#pragma unroll
-            for (int k = 0; k < 8; k++)
-                if (take[k]) {
-                    const uint32_t rank = __popc(ball[k] & ((1u << lane) - 1u));
-                    uint32_t posn = 0;
-                    if (rank == 0) posn = atomicAdd(&s_apos, __popc(ball[k]));
-                    posn = __shfl_sync(ball[k], posn, __ffs(ball[k]) - 1);
-                    buf[wbase + posn + rank] = key[k];
-                }
-        }
-        if (tid == 0) s_pend[par ^ 1u] = 0;
-        __syncthreads();
-        if (tid == 0) { s_cnt = wbase + s_apos; s_apos = 0; }
-    }
-
-    /* final compact + emit ids descending by key (invalid slots 0xFFFFFFFF,
-     * a strict suffix: -INF-scored comps sort below every finite key) */
-    {
-        uint64_t keys[RR_POOL_CAP / 512u];
-#pragma unroll
-        for (uint32_t i = 0; i < RR_POOL_CAP / 512u; i++) {
-            const uint32_t r = tid * (RR_POOL_CAP / 512u) + i;
-            keys[i] = r < s_cnt ? buf[r] : 0ull;
-        }
-        __syncthreads();
-        RrPoolSort(*sort_tmp).SortDescending(keys);
-        __syncthreads();
-#pragma unroll
-        for (uint32_t i = 0; i < RR_POOL_CAP / 512u; i++) {
-            const uint32_t r = tid * (RR_POOL_CAP / 512u) + i;
-            if (r < RR_POOL_K)
-                pool[(uint64_t)token * RR_POOL_K + r] = keys[i]
-                    ? 0xFFFFFFFFu - (uint32_t)(keys[i] & 0xFFFFFFFFu)
-                    : 0xFFFFFFFFu;
+        for (uint32_t j = 0; j < 2u; j++) {
+            const uint32_t col = colb + j;
+            if (col >= n_comp) continue;
+            if (r0 < n_tokens)
+                scores[(uint64_t)r0 * out_stride + col] =
+                    col >= vis0 ? -INFINITY : acc[cg][j] * scale;
+            if (r1 < n_tokens)
+                scores[(uint64_t)r1 * out_stride + col] =
+                    col >= vis1 ? -INFINITY : acc[cg][2u + j] * scale;
         }
     }
 }
 
-/* f16 WMMA rescore of the pool: one CTA per token.  A = the token's 64
- * heads x 128 dims (f16, staged once), B = 128-slot pool chunks gathered
- * from the fp4 mirror (f16, col-major, RR_PAD per the ldm%8 law), raw
- * codes for chunk k+1 prefetched into registers before chunk k's mmas.
- * Warp w owns cols [16w,16w+16) and loops all 4 head tiles so the w*ReLU
- * fold accumulates in registers with no cross-warp reduce.  Sorted-pool
- * early exit: invalid slots are a strict suffix, first all-invalid chunk
- * -INF-fills the rest.  K decode (e2m1 level x pow2 block scale) is exact
- * in f16 => rb2-grade fidelity (proto: flips == dense kernel's own). */
-__global__ static void __launch_bounds__(256) rr_rescore_kernel(
-        float * __restrict__ poolsc, const uint32_t * __restrict__ pool,
-        const float * __restrict__ q, const float * __restrict__ weights,
-        uint32_t n_comp, uint32_t n_tokens, uint32_t pos0, uint32_t ratio,
-        float scale, const unsigned char * __restrict__ fp4,
-        const float * __restrict__ fp4_sc) {
-    namespace wmma = nvcuda::wmma;
-    const uint32_t token = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t warp = tid >> 5u, lane = tid & 31u;
-    const uint32_t quad = lane >> 2u, tcol = (lane & 3u) * 2u;
-    if (token >= n_tokens) return;
-    const uint32_t visible = (pos0 + token + 1u) / ratio;
-    const uint32_t bc = tid >> 2u, sub = tid & 3u; /* comp slot / 32-dim block */
-
-    extern __shared__ unsigned char rrw_sh[];
-    __half *a_sh = (__half *)rrw_sh;               /* [64][RR_PAD] heads x dims */
-    __half *b_sh = a_sh + 64u * RR_PAD;            /* [128][RR_PAD] col-major */
-    __shared__ uint32_t comp_sh[128];
-    __shared__ float w_sh[64];
-
-    for (uint32_t i = tid; i < 64u * 32u; i += 256u) {
-        const uint32_t h = i >> 5u, d = (i & 31u) * 4u;
-        const float4 v = *(const float4 *)(q + ((uint64_t)token * RR_H + h) * RR_D + d);
-        a_sh[h * RR_PAD + d]      = __float2half(v.x);
-        a_sh[h * RR_PAD + d + 1u] = __float2half(v.y);
-        a_sh[h * RR_PAD + d + 2u] = __float2half(v.z);
-        a_sh[h * RR_PAD + d + 3u] = __float2half(v.w);
-    }
-    if (tid < 64u) w_sh[tid] = weights[(uint64_t)token * RR_H + tid];
-
-    /* per-thread chunk slice: slots bc and bc+64, dims 32*sub..32*sub+31 */
-    uint4 cw[2]; float csc[2]; uint32_t cid[2];
-    auto fetch = [&](uint32_t chunk) {
-#pragma unroll
-        for (int j = 0; j < 2; j++) {
-            const uint32_t slot = chunk * 128u + bc + 64u * (uint32_t)j;
-            const uint32_t comp = pool[(uint64_t)token * RR_POOL_K + slot];
-            cid[j] = comp;
-            if (comp < n_comp && comp < visible) {
-                cw[j] = ((const uint4 *)(fp4 + (uint64_t)comp * 64u))[sub];
-                csc[j] = fp4_sc[(uint64_t)comp * 4u + sub];
-            } else {
-                cw[j] = make_uint4(0, 0, 0, 0);
-                csc[j] = 0.0f;
-            }
-        }
-    };
-    auto store = [&](void) {
-#pragma unroll
-        for (int j = 0; j < 2; j++) {
-            const uint32_t c = bc + 64u * (uint32_t)j;
-            if (sub == 0) comp_sh[c] = cid[j];
-            __half *dst = b_sh + c * RR_PAD + sub * 32u;
-            const uint32_t wds[4] = { cw[j].x, cw[j].y, cw[j].z, cw[j].w };
-#pragma unroll
-            for (int wi = 0; wi < 4; wi++)
-#pragma unroll
-                for (int b = 0; b < 4; b++) {
-                    const uint32_t byte = (wds[wi] >> (8 * b)) & 0xFFu;
-                    const uint32_t nlo = byte & 0xFu, nhi = byte >> 4u;
-                    float vlo = dsv4_e2m1fn_value_dev((int)(nlo & 7u)) * csc[j];
-                    float vhi = dsv4_e2m1fn_value_dev((int)(nhi & 7u)) * csc[j];
-                    if (nlo & 8u) vlo = -vlo;
-                    if (nhi & 8u) vhi = -vhi;
-                    dst[(wi * 4 + b) * 2]      = __float2half(vlo);
-                    dst[(wi * 4 + b) * 2 + 1]  = __float2half(vhi);
-                }
-        }
-    };
-
-    fetch(0);
-    for (uint32_t chunk = 0; chunk < RR_POOL_K / 128u; chunk++) {
-        const int anyv = (cid[0] < n_comp && cid[0] < visible)
-                      || (cid[1] < n_comp && cid[1] < visible);
-        if (__syncthreads_count(anyv) == 0) {
-            /* sorted-pool suffix: everything from here on is invalid */
-            for (uint32_t i = chunk * 128u + tid; i < RR_POOL_K; i += 256u)
-                poolsc[(uint64_t)token * RR_POOL_K + i] = -INFINITY;
-            return;
-        }
-        store();
-        __syncthreads();
-        if (chunk + 1u < RR_POOL_K / 128u) fetch(chunk + 1u); /* LDGs hide under mma */
-
-        float facc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        const uint32_t col0 = warp * 16u;
-        for (uint32_t ht = 0; ht < 4u; ht++) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-            wmma::fill_fragment(c_frag, 0.0f);
-            for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
-                wmma::load_matrix_sync(a_frag, a_sh + ht * 16u * RR_PAD + k0, RR_PAD);
-                wmma::load_matrix_sync(b_frag, b_sh + col0 * RR_PAD + k0, RR_PAD);
-                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-            }
-#pragma unroll
-            for (int i = 0; i < 8; i++) {
-                const uint32_t hrow = ht * 16u + quad + ((i & 2) ? 8u : 0u);
-                facc[(i & 1) + ((i & 4) ? 2 : 0)] +=
-                    fmaxf(c_frag.x[i], 0.0f) * w_sh[hrow];
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < 4; j++)
-#pragma unroll
-            for (uint32_t off = 4; off < 32u; off <<= 1u)
-                facc[j] += __shfl_xor_sync(0xffffffffu, facc[j], off);
-        if (quad == 0) {
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const uint32_t col = tcol + (j & 1) + ((j & 2) ? 8u : 0u);
-                const uint32_t comp = comp_sh[col0 + col];
-                const int valid = comp < n_comp && comp < visible;
-                poolsc[(uint64_t)token * RR_POOL_K + chunk * 128u + col0 + col] =
-                    valid ? facc[j] * scale : -INFINITY;
-            }
-        }
-        __syncthreads(); /* b_sh/comp_sh reads done before next store */
-    }
-}
-
-/* exact top-512 of the rescored pool, emitted as selected ids in
- * topk_pack_key-descending order -- byte-compatible with the stream512
- * tier's output including the 0xFFFFFFFF sentinel for empty slots. */
-__global__ static void __launch_bounds__(512) rr_final512_kernel(
-        uint32_t *selected, const uint32_t * __restrict__ pool,
-        const float * __restrict__ poolsc, uint32_t n_tokens) {
-    __shared__ typename RrFinalSort::TempStorage tmp;
-    const uint32_t t = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-    uint64_t keys[RR_POOL_K / 512u];
-#pragma unroll
-    for (uint32_t i = 0; i < RR_POOL_K / 512u; i++) {
-        const uint32_t r = tid * (RR_POOL_K / 512u) + i;
-        const uint32_t id = pool[(uint64_t)t * RR_POOL_K + r];
-        const float v = poolsc[(uint64_t)t * RR_POOL_K + r];
-        keys[i] = (id != 0xFFFFFFFFu && isfinite(v)) ? topk_pack_key(v, id) : 0ull;
-    }
-    __syncthreads();
-    RrFinalSort(tmp).SortDescending(keys);
-    __syncthreads();
-    if (tid < 512u / (RR_POOL_K / 512u)) {
-#pragma unroll
-        for (uint32_t i = 0; i < RR_POOL_K / 512u; i++)
-            selected[(uint64_t)t * 512u + tid * (RR_POOL_K / 512u) + i] =
-                0xffffffffu - (uint32_t)(keys[i] & 0xffffffffu);
-    }
-}
-
-/* grow-only eager scratch for the chain (qc/qsf/pool/poolsc); the entry
- * never runs on capture steps, so the tt_scratch discipline (sync before
- * free) is trivially safe here. */
+/* grow-only eager scratch for the chain (qc/qsf); the entry never runs on
+ * capture steps, so the tt_scratch discipline (sync before free) is
+ * trivially safe here. */
 static void *g_rr_scratch = NULL;
 static uint64_t g_rr_scratch_bytes = 0;
 static void *rr_scratch_ensure(uint64_t bytes) {
@@ -16251,17 +15999,21 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
 }
 
-/* v0.5 inc-5: combined score+select entry for deep prefill chunks (the
- * mxf4 retrieve-and-rerank chain; see the kernel block above).  On engage
- * it writes the selected top-512 ids directly and the caller SKIPS the
+/* v0.5 inc-13a: combined score+select entry for eager prefill chunks at
+ * ALL depths (exact mxf4 coarse + the shipped exact top-512; see the
+ * kernel block above).  On engage it writes F32 score rows into the
+ * scores scratch and the selected top-512 ids, and the caller SKIPS the
  * classic scores+topk pair; otherwise *engaged stays 0 and the caller
  * falls through (the dense scores scratch is untouched in that case).
  * Return value is the usual ok/fail (a non-engage is ok).  Engage
  * conditions: sm_121a build, eager step (never inside stream capture),
  * FP4 indexer mirror present, 64x128 heads at ratio 4 / top_k 512,
- * n_comp > 65536 (proto crossover 44k; the gate sits above the measured
- * parity band), chunk-sized n_tokens (>= 32).  Escape:
- * DS4_CUDA_NO_INDEXER_MXF4. */
+ * n_comp >= 1024 (below that the dense pair is sub-launch-overhead),
+ * chunk-sized n_tokens (>= 32).  Selection below the 262144-token
+ * horizon is bit-identical to the classic pair on real activations
+ * (e2m1-grid losslessness; 21-layer capture receipts); above it the
+ * exact chain IMPROVES on the retired rescore selection.  Escape:
+ * DS4_CUDA_NO_INDEXER_MXF4 (classic pair everywhere). */
 extern "C" int ds4_gpu_indexer_score_select_prefill_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *scores,
@@ -16294,7 +16046,7 @@ extern "C" int ds4_gpu_indexer_score_select_prefill_tensor(
     if (!selected || !scores || !q || !weights || !engaged) return 1;
     if (n_head != RR_H || head_dim != RR_D || ratio != 4u || top_k != 512u)
         return 1;
-    if (n_comp <= RR_ENGAGE_NCOMP || n_tokens < 32u) return 1;
+    if (n_comp < 1024u || n_tokens < 32u) return 1;
     if (!index_fp4 || !index_scale || !index_fp4->ptr || !index_scale->ptr)
         return 1;
     /* eager only: the chain's engage decision and scratch are not
@@ -16304,8 +16056,7 @@ extern "C" int ds4_gpu_indexer_score_select_prefill_tensor(
         return 1;
     if (cap != cudaStreamCaptureStatusNone) return 1;
 
-    const uint32_t stride = (n_comp + 7u) & ~7u;
-    if (scores->bytes < (uint64_t)n_tokens * stride * sizeof(__half)) return 1;
+    if (scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) return 1;
     if (selected->bytes < (uint64_t)n_tokens * 512u * sizeof(uint32_t)) return 1;
     if (q->bytes < (uint64_t)n_tokens * RR_H * RR_D * sizeof(float)) return 1;
     if (weights->bytes < (uint64_t)n_tokens * RR_H * sizeof(float)) return 1;
@@ -16325,42 +16076,19 @@ extern "C" int ds4_gpu_indexer_score_select_prefill_tensor(
         if (index_scale->bytes < (uint64_t)n_comp * 4u * sizeof(float)) return 1;
     }
 
-    /* scratch: qc + qsf + pool + poolsc, 256-B aligned slices */
+    /* scratch: qc + qsf, 256-B aligned slices */
     const uint64_t qc_bytes = tt_align256_u64((uint64_t)n_tokens * RR_H * 64u);
     const uint64_t qsf_bytes = tt_align256_u64((uint64_t)n_tokens * RR_H * 4u);
-    const uint64_t pool_bytes = tt_align256_u64((uint64_t)n_tokens * RR_POOL_K * 4u);
-    const uint64_t poolsc_bytes = tt_align256_u64((uint64_t)n_tokens * RR_POOL_K * 4u);
     unsigned char *scratch = (unsigned char *)rr_scratch_ensure(
-        qc_bytes + qsf_bytes + pool_bytes + poolsc_bytes);
+        qc_bytes + qsf_bytes);
     if (!scratch) return 1; /* OOM -> classic pair */
     unsigned char *d_qc = scratch;
     uint32_t *d_qsf = (uint32_t *)(scratch + qc_bytes);
-    uint32_t *d_pool = (uint32_t *)(scratch + qc_bytes + qsf_bytes);
-    float *d_poolsc = (float *)(scratch + qc_bytes + qsf_bytes + pool_bytes);
-
-    static size_t rr_pool_smem = 0;
-    static size_t rr_rescore_smem = 0;
-    static int rr_attr_ok = -1;
-    if (rr_attr_ok < 0) {
-        rr_pool_smem = (size_t)RR_POOL_CAP * 8u
-            + sizeof(typename RrPoolSort::TempStorage);
-        rr_rescore_smem = (size_t)(64u + 128u) * RR_PAD * 2u;
-        rr_attr_ok =
-            cudaFuncSetAttribute(rr_pool_kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                (int)rr_pool_smem) == cudaSuccess &&
-            cudaFuncSetAttribute(rr_rescore_kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                (int)rr_rescore_smem) == cudaSuccess ? 1 : 0;
-        if (!rr_attr_ok)
-            fprintf(stderr, "ds4: rr-selector smem opt-in failed; classic pair stays\n");
-    }
-    if (!rr_attr_ok) return 1;
 
     static int rr_logged = 0;
     if (!rr_logged) {
         rr_logged = 1;
-        fprintf(stderr, "ds4: indexer score-select mxf4-rr engage (first n_comp=%u n_tokens=%u)\n",
+        fprintf(stderr, "ds4: indexer exact mxf4 score-select engage (first n_comp=%u n_tokens=%u)\n",
                 n_comp, n_tokens);
     }
 
@@ -16368,22 +16096,15 @@ extern "C" int ds4_gpu_indexer_score_select_prefill_tensor(
     rr_q_quant_kernel<<<(rows * 32u + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
             (const float *)q->ptr, d_qc, d_qsf, rows);
     if (!cuda_ok(cudaGetLastError(), "rr q-quant launch")) return 0;
-    dim3 cg((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
-    rr_coarse_mxf4_kernel<<<cg, 256, 0, ds4_current_stream()>>>(
-            (__half *)scores->ptr, d_qc, d_qsf, (const float *)weights->ptr,
-            n_comp, n_tokens, pos0, ratio, scale, fp4_ptr, fp4_sc_ptr, stride);
-    if (!cuda_ok(cudaGetLastError(), "rr coarse mxf4 launch")) return 0;
-    rr_pool_kernel<<<n_tokens, 512, rr_pool_smem, ds4_current_stream()>>>(
-            d_pool, (const __half *)scores->ptr, n_comp, stride, n_tokens);
-    if (!cuda_ok(cudaGetLastError(), "rr pool launch")) return 0;
-    rr_rescore_kernel<<<n_tokens, 256, rr_rescore_smem, ds4_current_stream()>>>(
-            d_poolsc, d_pool, (const float *)q->ptr,
-            (const float *)weights->ptr, n_comp, n_tokens, pos0, ratio,
-            scale, fp4_ptr, fp4_sc_ptr);
-    if (!cuda_ok(cudaGetLastError(), "rr rescore launch")) return 0;
-    rr_final512_kernel<<<n_tokens, 512, 0, ds4_current_stream()>>>(
-            (uint32_t *)selected->ptr, d_pool, d_poolsc, n_tokens);
-    if (!cuda_ok(cudaGetLastError(), "rr final512 launch")) return 0;
+    dim3 cg((n_comp + 255u) / 256u, (n_tokens + 15u) / 16u, 1);
+    rr_coarse_mxf4_v3_kernel<<<cg, 512, 0, ds4_current_stream()>>>(
+            (float *)scores->ptr, d_qc, d_qsf, (const float *)weights->ptr,
+            n_comp, n_tokens, pos0, ratio, scale, fp4_ptr, fp4_sc_ptr, n_comp);
+    if (!cuda_ok(cudaGetLastError(), "coarse mxf4 v3 launch")) return 0;
+    /* exact select over the f32 rows: same dispatcher as the classic pair
+     * (legacy fixed-n_comp semantics; stream512 above 8192, tiers below) */
+    if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens,
+                                     top_k, 0u, UINT32_MAX)) return 0;
     *engaged = 1;
     return 1;
 #endif /* DS4_CUDA_HAVE_MXF4 */

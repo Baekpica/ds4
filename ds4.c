@@ -18452,10 +18452,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                       (uint64_t)n_comp * DS4_N_INDEXER_HEAD_DIM,
                                                       il, pos0);
                 }
-                /* v0.5 inc-5: combined mxf4 score+select chain for deep
-                 * eager chunks (single-run admission or single-seq batch).
-                 * Engaged => comp_selected is written directly and the
-                 * classic scores+topk pair below is SKIPPED.  Capture
+                /* v0.5 inc-13a: exact mxf4 score+select chain for eager
+                 * chunks at all depths (single-run admission or single-seq
+                 * batch).  Engaged => comp_selected is written directly and
+                 * the classic scores+topk pair below is SKIPPED.  Capture
                  * steps and multi-seq batches always fall through. */
                 int rr_engaged = 0;
                 if (ok && !g->batch_capture_step &&
@@ -18714,7 +18714,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   (uint64_t)n_comp * DS4_N_INDEXER_HEAD_DIM,
                                                   il, pos0);
             }
-            /* v0.5 inc-5: combined mxf4 score+select chain (zero-prefix =>
+            /* v0.5 inc-13a: exact mxf4 score+select chain (zero-prefix =>
              * pos0 0, no bank view).  Engaged => skip the classic pair. */
             int rr_engaged = 0;
             ok = ds4_gpu_indexer_score_select_prefill_tensor(

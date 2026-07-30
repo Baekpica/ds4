@@ -661,13 +661,15 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_comp_max,
         uint32_t                il_for_decode1);
 
-/* v0.5 inc-5: combined score+select for deep prefill chunks (CUDA mxf4
- * retrieve-and-rerank chain).  When it engages it writes the top-512
- * selected ids directly (stream-tier byte order, 0xFFFFFFFF sentinels) and
- * sets *engaged = 1; the caller must then SKIP the classic scores+topk
- * pair.  *engaged = 0 means fall through (scores scratch untouched).
- * Returns 0 only on a launch error.  Never engages inside stream capture,
- * without the FP4 indexer mirror, at n_comp <= 65536, or on non-sm_121a
+/* v0.5 inc-13a: combined score+select for eager prefill chunks at all
+ * depths (exact CUDA mxf4 coarse + exact top-512 over f32 rows; the
+ * inc-5/inc-7 pool+rescore chain is retired).  When it engages it writes
+ * F32 score rows into the scores scratch plus the top-512 selected ids
+ * (stream-tier byte order, 0xFFFFFFFF sentinels) and sets *engaged = 1;
+ * the caller must then SKIP the classic scores+topk pair.  *engaged = 0
+ * means fall through (scores scratch untouched).  Returns 0 only on a
+ * launch error.  Never engages inside stream capture, without the FP4
+ * indexer mirror, at n_comp < 1024 or n_tokens < 32, or on non-sm_121a
  * builds; escape hatch DS4_CUDA_NO_INDEXER_MXF4.  single_bank/comp_cap
  * mirror the FE1 bank-view convention of the scores entry (UINT32_MAX/0 =
  * no bank indirection).  Metal: stub, never engages. */
