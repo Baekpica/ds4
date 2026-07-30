@@ -105,6 +105,13 @@ typedef struct {
     uint32_t load_layer_start;
     uint32_t load_layer_end;
     bool load_output;
+    /* inc-14b follow-up: skip the boot prewarm inside ds4_engine_open; the
+       caller runs it later via ds4_engine_boot_prewarm.  Servers that budget
+       bank placement from free memory must defer so the placement fit reads
+       memory BEFORE the prewarm consumes one-time driver costs out of the
+       fit's headroom (the prewarm's footprint is post-placement growth by
+       design, exactly like the lazy first-forward costs it replaces). */
+    bool defer_boot_prewarm;
     ds4_distributed_options distributed;
 } ds4_engine_options;
 
@@ -134,6 +141,13 @@ typedef struct {
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
+/* inc-14b boot prewarm: pay the process's one-time driver costs (graph
+   subsystem init, module loads, cuBLAS) with a throwaway two-chunk session
+   sync.  Runs inside ds4_engine_open unless opt->defer_boot_prewarm; deferred
+   callers invoke this after bank placement.  Idempotent; no-op for CPU
+   backends, distributed coordinators, capture-dump boots, and under
+   DS4_NO_BOOT_PREWARM=1. */
+void ds4_engine_boot_prewarm(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);

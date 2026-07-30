@@ -525,6 +525,10 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
    Returns 0 and writes the allocator's current free/total bytes; nonzero when
    the backend cannot answer (Metal) -- callers fall back to try-and-reduce. */
 int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes);
+/* inc-14b follow-up: release device reserves the boot prewarm accumulated but
+   nothing references anymore (graph-pool slack), keeping warmed content
+   resident.  No-op on backends without the concept. */
+void ds4_gpu_boot_trim(void);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
 void ds4_gpu_set_attention_output_b_n2_q8_override(int enabled);

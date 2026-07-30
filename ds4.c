@@ -22520,6 +22520,7 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
     bool dspark_ready;
+    bool boot_prewarm_done;   /* inc-14b: prewarm ran (or was attempted) */
 };
 
 static bool cpu_directional_steering_enabled(
@@ -37728,6 +37729,66 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+/* v0.5 inc-14b: boot prewarm.  The process's first forward pays ~1.15 s of
+ * one-time driver work that has nothing to do with the prompt: the first
+ * cudaGraphInstantiate initializes the driver's graph subsystem (~0.7 s, via
+ * the output-head micro-capture), every kernel family JIT-loads its module on
+ * first launch, and cuBLAS initializes lazily.  Pay all of it at boot with a
+ * throwaway two-chunk session sync (the second, non-zero-prefix chunk warms
+ * the ring/token-tile dispatcher the first cannot reach) -- same pattern as
+ * the inc-12f artifact prebuild: boot does the deterministic work once,
+ * serving never does.  Runs inside ds4_engine_open unless the caller set
+ * defer_boot_prewarm (servers run it AFTER bank placement so the placement
+ * fit never sees the prewarm's footprint -- it is headroom growth by design).
+ * Skipped for CPU backends, distributed coordinators (network), capture-dump
+ * boots (would pollute DS4_METAL_GRAPH_DUMP_* selections), and under
+ * DS4_NO_BOOT_PREWARM=1 (the A/B kill switch).  Idempotent. */
+void ds4_engine_boot_prewarm(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    if (!e || e->boot_prewarm_done || !e->metal_ready) return;
+    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
+        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
+        getenv("DS4_NO_BOOT_PREWARM") != NULL)
+        return;
+    e->boot_prewarm_done = true;
+    const double warm_t0 = now_sec();
+    const int warm_len = 512;
+    ds4_session *warm = NULL;
+    if (ds4_session_create(&warm, e, warm_len + 16) == 0 && warm) {
+        ds4_tokens toks = {0};
+        toks.v = xmalloc((size_t)warm_len * sizeof(toks.v[0]));
+        toks.cap = warm_len;
+        const int nv = e->vocab.n_vocab > 2000 ? 1000 : 1;
+        for (int i = 0; i < warm_len; i++)
+            toks.v[i] = nv + (i % 997);
+        char warm_err[128];
+        toks.len = warm_len / 2;
+        int warm_rc = ds4_session_sync(warm, &toks, warm_err, sizeof(warm_err));
+        if (warm_rc == 0) {
+            toks.len = warm_len;
+            warm_rc = ds4_session_sync(warm, &toks, warm_err, sizeof(warm_err));
+        }
+        if (warm_rc != 0)
+            fprintf(stderr, "ds4: boot prewarm sync failed (%s); first "
+                            "request pays the one-time driver costs\n",
+                    warm_err);
+        else
+            fprintf(stderr, "ds4: boot prewarm done (%d tokens, 2 chunks) in %.1fs\n",
+                    warm_len, now_sec() - warm_t0);
+        free(toks.v);
+        ds4_session_free(warm);
+        /* Return device reserves the warm session no longer backs (unused
+         * graph-pool slack); everything deliberately warmed stays resident. */
+        ds4_gpu_boot_trim();
+    } else {
+        fprintf(stderr, "ds4: boot prewarm session unavailable; first "
+                        "request pays the one-time driver costs\n");
+    }
+#else
+    (void)e;
+#endif
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -38058,53 +38119,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
-        /* v0.5 inc-14b: boot prewarm.  The process's first forward pays
-         * ~1.15 s of one-time driver work that has nothing to do with the
-         * prompt: the first cudaGraphInstantiate initializes the driver's
-         * graph subsystem (~0.7 s, via the output-head micro-capture),
-         * every kernel family JIT-loads its module on first launch, and
-         * cuBLAS initializes lazily.  Pay all of it here, at boot, with a
-         * throwaway two-chunk session sync (the second, non-zero-prefix
-         * chunk warms the ring/token-tile dispatcher the first cannot
-         * reach) -- same pattern as the inc-12f artifact prebuild: boot
-         * does the deterministic work once, serving never does.  Skipped
-         * for distributed coordinators (network), capture-dump boots
-         * (would pollute DS4_METAL_GRAPH_DUMP_* selections), and under
-         * DS4_NO_BOOT_PREWARM=1 (the A/B kill switch). */
-        if (e->distributed.role != DS4_DISTRIBUTED_COORDINATOR &&
-            getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL &&
-            getenv("DS4_NO_BOOT_PREWARM") == NULL) {
-            const double warm_t0 = now_sec();
-            const int warm_len = 512;
-            ds4_session *warm = NULL;
-            if (ds4_session_create(&warm, e, warm_len + 16) == 0 && warm) {
-                ds4_tokens toks = {0};
-                toks.v = xmalloc((size_t)warm_len * sizeof(toks.v[0]));
-                toks.cap = warm_len;
-                const int nv = e->vocab.n_vocab > 2000 ? 1000 : 1;
-                for (int i = 0; i < warm_len; i++)
-                    toks.v[i] = nv + (i % 997);
-                char warm_err[128];
-                toks.len = warm_len / 2;
-                int warm_rc = ds4_session_sync(warm, &toks, warm_err, sizeof(warm_err));
-                if (warm_rc == 0) {
-                    toks.len = warm_len;
-                    warm_rc = ds4_session_sync(warm, &toks, warm_err, sizeof(warm_err));
-                }
-                if (warm_rc != 0)
-                    fprintf(stderr, "ds4: boot prewarm sync failed (%s); first "
-                                    "request pays the one-time driver costs\n",
-                            warm_err);
-                else
-                    fprintf(stderr, "ds4: boot prewarm done (%d tokens, 2 chunks) in %.1fs\n",
-                            warm_len, now_sec() - warm_t0);
-                free(toks.v);
-                ds4_session_free(warm);
-            } else {
-                fprintf(stderr, "ds4: boot prewarm session unavailable; first "
-                                "request pays the one-time driver costs\n");
-            }
-        }
+        /* v0.5 inc-14b: boot prewarm (see ds4_engine_boot_prewarm).  Callers
+         * that budget bank placement from free memory defer it past the
+         * placement fit -- the prewarm's footprint is post-placement
+         * headroom growth by design, exactly like the lazy first-forward
+         * costs it replaces. */
+        if (!opt->defer_boot_prewarm) ds4_engine_boot_prewarm(e);
     }
 #else
     if (graph_backend) {

@@ -14139,6 +14139,11 @@ int main(int argc, char **argv) {
     }
 
     ds4_engine *engine = NULL;
+    /* inc-14b follow-up: the server budgets bank placement from free memory,
+     * so the boot prewarm runs AFTER the batch fit (below) -- placement must
+     * never see the prewarm's footprint (it is headroom growth by design,
+     * exactly like the lazy first-forward costs the prewarm replaces). */
+    cfg.engine.defer_boot_prewarm = true;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
@@ -14284,6 +14289,11 @@ int main(int argc, char **argv) {
             }
         }
     }
+
+    /* inc-14b: deferred boot prewarm -- bank placement above read free memory
+     * first, so the one-time driver costs land in the fit's headroom exactly
+     * as the lazy first-forward costs did pre-prewarm. */
+    ds4_engine_boot_prewarm(engine);
 
     /* S1.1: deterministic MTP gate -- run instead of serving when DS4_CONT_MTP_GATE
      * is set.  Drives the continuous engine over fixed synthetic prompts and asserts

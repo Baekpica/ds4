@@ -3086,6 +3086,16 @@ extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
     return 0;
 }
 
+extern "C" void ds4_gpu_boot_trim(void) {
+    /* Releases only UNUSED graph-pool reserve (bytes backing no live graph
+     * exec); everything the boot prewarm deliberately warmed -- module SASS,
+     * cuBLAS state, sticky scratch -- stays resident. */
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    (void)cudaDeviceGraphMemTrim(dev);
+    (void)cudaGetLastError();
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));

@@ -4535,6 +4535,10 @@ int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
     return 1;
 }
 
+void ds4_gpu_boot_trim(void) {
+    /* No graph-pool reserve concept on Metal. */
+}
+
 /* R5 Inc1b: Metal has no VMM reserve/map-on-demand; reserve() returns NULL so
  * callers allocate eagerly, ensure() is a mapped no-op, resident() reports the
  * range itself (eager tensors are always fully resident). */
