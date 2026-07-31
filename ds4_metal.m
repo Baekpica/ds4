@@ -5811,11 +5811,13 @@ int ds4_gpu_indexer_score_select_prefill_tensor(
         uint32_t                comp_cap,
         ds4_gpu_tensor       *index_fp4,
         ds4_gpu_tensor       *index_scale,
+        const ds4_gpu_tensor *q_codes,
+        const ds4_gpu_tensor *q_scale4,
         int                    *engaged) {
     (void)selected; (void)scores; (void)q; (void)weights; (void)n_comp;
     (void)n_tokens; (void)pos0; (void)n_head; (void)head_dim; (void)ratio;
     (void)top_k; (void)scale; (void)single_bank; (void)comp_cap;
-    (void)index_fp4; (void)index_scale;
+    (void)index_fp4; (void)index_scale; (void)q_codes; (void)q_scale4;
     if (engaged) *engaged = 0;
     return 1;
 }

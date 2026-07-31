@@ -15102,6 +15102,24 @@ __global__ static void rr_q_quant_kernel(const float * __restrict__ q,
         qsf[row] = e | (e1 << 8u) | (e2 << 16u) | (e3 << 24u);
 }
 
+/* 13a.2: mirror-path companion -- packs the producer QAT emit's four F32
+ * pow2 block scales per row into the coarse kernel's ue8m0 qsf word.  A
+ * 16-B read + 4-B write per row (the coarse kernel's qsf staging is
+ * untouched, so its cp.async pipeline -- and SASS -- stay exactly the
+ * 13a form; an ABBA showed a direct F32-scale read in the stager costs
+ * ~1% at the 64k window). */
+__global__ static void rr_q_scale_pack_kernel(const float * __restrict__ qs4,
+                                              uint32_t * __restrict__ qsf,
+                                              uint32_t rows) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const uint4 sb = *reinterpret_cast<const uint4 *>(qs4 + (uint64_t)row * 4u);
+    qsf[row] = ((sb.x >> 23u) & 0xFFu)
+             | (((sb.y >> 23u) & 0xFFu) << 8u)
+             | (((sb.z >> 23u) & 0xFFu) << 16u)
+             | (((sb.w >> 23u) & 0xFFu) << 24u);
+}
+
 __device__ static inline void rr_mma_mxf4(float d[4], const uint32_t a[4],
                                           uint32_t b0, uint32_t b1,
                                           uint32_t sfa, uint32_t sfb) {
@@ -15292,7 +15310,8 @@ __global__ static void __launch_bounds__(512) rr_coarse_mxf4_v3_kernel(
     }
 }
 
-/* grow-only eager scratch for the chain (qc/qsf); the entry never runs on
+/* grow-only eager scratch for the chain (mirror path: the 4-B/row packed
+ * qsf word; legacy re-quant path: qc + qsf); the entry never runs on
  * capture steps, so the tt_scratch discipline (sync before free) is
  * trivially safe here. */
 static void *g_rr_scratch = NULL;
@@ -16083,13 +16102,15 @@ extern "C" int ds4_gpu_indexer_score_select_prefill_tensor(
         uint32_t                comp_cap,
         ds4_gpu_tensor       *index_fp4,
         ds4_gpu_tensor       *index_scale,
+        const ds4_gpu_tensor *q_codes,
+        const ds4_gpu_tensor *q_scale4,
         int                    *engaged) {
     if (engaged) *engaged = 0;
 #ifndef DS4_CUDA_HAVE_MXF4
     (void)selected; (void)scores; (void)q; (void)weights; (void)n_comp;
     (void)n_tokens; (void)pos0; (void)n_head; (void)head_dim; (void)ratio;
     (void)top_k; (void)scale; (void)single_bank; (void)comp_cap;
-    (void)index_fp4; (void)index_scale;
+    (void)index_fp4; (void)index_scale; (void)q_codes; (void)q_scale4;
     return 1;
 #else
     static int rr_off = -1;
@@ -16128,14 +16149,22 @@ extern "C" int ds4_gpu_indexer_score_select_prefill_tensor(
         if (index_scale->bytes < (uint64_t)n_comp * 4u * sizeof(float)) return 1;
     }
 
-    /* scratch: qc + qsf, 256-B aligned slices */
-    const uint64_t qc_bytes = tt_align256_u64((uint64_t)n_tokens * RR_H * 64u);
-    const uint64_t qsf_bytes = tt_align256_u64((uint64_t)n_tokens * RR_H * 4u);
-    unsigned char *scratch = (unsigned char *)rr_scratch_ensure(
-        qc_bytes + qsf_bytes);
-    if (!scratch) return 1; /* OOM -> classic pair */
-    unsigned char *d_qc = scratch;
-    uint32_t *d_qsf = (uint32_t *)(scratch + qc_bytes);
+    /* 13a.2: producer-mirror Q -- when the caller hands the QAT emit mirror
+     * (codes 64 B + 4 F32 pow2 scales per (token, head) row, written by
+     * ds4_gpu_dsv4_indexer_qat_tensor while it rounded q in place), the
+     * coarse kernel stages straight from it: the re-quant launch and its
+     * full F32 re-read of q disappear.  Bit-identical coarse inputs by the
+     * QAT emit construction (receipts proto_rrv2_run7_qat.txt); escape
+     * hatch DS4_CUDA_NO_INDEXER_QMIRROR keeps the re-quant path for twin
+     * gates. */
+    static int qmir_off = -1;
+    if (qmir_off < 0)
+        qmir_off = getenv("DS4_CUDA_NO_INDEXER_QMIRROR") != NULL ? 1 : 0;
+    const uint32_t rows = n_tokens * RR_H;
+    const int use_mirror = !qmir_off && q_codes && q_scale4 &&
+        q_codes->ptr && q_scale4->ptr &&
+        q_codes->bytes >= (uint64_t)rows * 64u &&
+        q_scale4->bytes >= (uint64_t)rows * 4u * sizeof(float);
 
     static int rr_logged = 0;
     if (!rr_logged) {
@@ -16144,10 +16173,42 @@ extern "C" int ds4_gpu_indexer_score_select_prefill_tensor(
                 n_comp, n_tokens);
     }
 
-    const uint32_t rows = n_tokens * RR_H;
-    rr_q_quant_kernel<<<(rows * 32u + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
-            (const float *)q->ptr, d_qc, d_qsf, rows);
-    if (!cuda_ok(cudaGetLastError(), "rr q-quant launch")) return 0;
+    const unsigned char *d_qc;
+    const uint32_t *d_qsf;
+    if (use_mirror) {
+        static int qmir_logged = 0;
+        if (!qmir_logged) {
+            qmir_logged = 1;
+            fprintf(stderr, "ds4: indexer q producer-mirror engage (13a.2, first n_tokens=%u)\n",
+                    n_tokens);
+        }
+        /* codes come straight from the producer emit; the four F32 pow2
+         * block scales pack into the qsf word via the companion kernel
+         * (16 B read + 4 B write per row -- the coarse kernel and its
+         * cp.async pipeline stay exactly the 13a form). */
+        const uint64_t qsf_bytes = tt_align256_u64((uint64_t)rows * 4u);
+        uint32_t *w_qsf = (uint32_t *)rr_scratch_ensure(qsf_bytes);
+        if (!w_qsf) return 1; /* OOM -> classic pair */
+        rr_q_scale_pack_kernel<<<(rows + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
+                (const float *)q_scale4->ptr, w_qsf, rows);
+        if (!cuda_ok(cudaGetLastError(), "rr q-scale pack launch")) return 0;
+        d_qc = (const unsigned char *)q_codes->ptr;
+        d_qsf = w_qsf;
+    } else {
+        /* legacy re-quant: qc + qsf, 256-B aligned slices */
+        const uint64_t qc_bytes = tt_align256_u64((uint64_t)rows * 64u);
+        const uint64_t qsf_bytes = tt_align256_u64((uint64_t)rows * 4u);
+        unsigned char *scratch = (unsigned char *)rr_scratch_ensure(
+            qc_bytes + qsf_bytes);
+        if (!scratch) return 1; /* OOM -> classic pair */
+        unsigned char *w_qc = scratch;
+        uint32_t *w_qsf = (uint32_t *)(scratch + qc_bytes);
+        rr_q_quant_kernel<<<(rows * 32u + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
+                (const float *)q->ptr, w_qc, w_qsf, rows);
+        if (!cuda_ok(cudaGetLastError(), "rr q-quant launch")) return 0;
+        d_qc = w_qc;
+        d_qsf = w_qsf;
+    }
     dim3 cg((n_comp + 255u) / 256u, (n_tokens + 15u) / 16u, 1);
     rr_coarse_mxf4_v3_kernel<<<cg, 512, 0, ds4_current_stream()>>>(
             (float *)scores->ptr, d_qc, d_qsf, (const float *)weights->ptr,

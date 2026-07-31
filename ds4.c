@@ -9542,6 +9542,11 @@ typedef struct {
      * F32) -- the scale-only emit of the indexer-Q QAT, consumed by the
      * WMMA multiseq scorer to stage exact unscaled e2m1 levels. */
     ds4_gpu_tensor *batch_indexer_q_scale;
+    /* v0.5 inc-13a.2: packed e2m1 codes mirror of the indexer-Q QAT emit
+     * ([pc, 64] rows x 64 B nibbles) -- with the block scales above it lets
+     * the mxf4 score-select chain stage Q straight from the producer (its
+     * re-quant launch and full F32 re-read of q disappear). */
+    ds4_gpu_tensor *batch_indexer_qc;
     ds4_gpu_tensor *batch_indexer_weights;
     ds4_gpu_tensor *batch_heads;
     ds4_gpu_tensor *batch_attn_low;
@@ -9653,6 +9658,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     free(g->ms_vdepth);                            /* S1.1 M3: per-ROW verify depth */
     ds4_gpu_tensor_free(g->batch_heads);
     ds4_gpu_tensor_free(g->batch_indexer_weights);
+    ds4_gpu_tensor_free(g->batch_indexer_qc);
     ds4_gpu_tensor_free(g->batch_indexer_q_scale);
     ds4_gpu_tensor_free(g->batch_indexer_q);
     ds4_gpu_tensor_free(g->batch_comp_sc);
@@ -10582,6 +10588,9 @@ static bool metal_graph_alloc_raw_cap(
     /* v0.3 V5D: 4 block scales per (token, head) -- 1 KiB/token. */
     g->batch_indexer_q_scale = ds4_gpu_tensor_alloc(
         pc * DS4_N_INDEXER_HEAD * 4 * sizeof(float));
+    /* v0.5 inc-13a.2: 64 B codes per (token, head) -- 4 KiB/token. */
+    g->batch_indexer_qc = ds4_gpu_tensor_alloc(
+        pc * DS4_N_INDEXER_HEAD * 64);
     g->batch_indexer_weights = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
     g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
     /* Fail fast mid-group: the hc/q/heads buffers above are the biggest
@@ -10704,7 +10713,7 @@ static bool metal_graph_alloc_raw_cap(
                     g->batch_kv_raw && g->batch_kv &&
                     g->batch_comp_kv && g->batch_comp_sc &&
                     g->batch_indexer_q && g->batch_indexer_q_scale &&
-                    g->batch_indexer_weights &&
+                    g->batch_indexer_qc && g->batch_indexer_weights &&
                     g->batch_heads && g->batch_positions && g->batch_seq_id &&
                     g->batch_attn_low && g->batch_attn_out &&
                     g->batch_group_tmp && g->batch_low_tmp && g->batch_after_attn_hc &&
@@ -17770,11 +17779,14 @@ static bool metal_graph_encode_layer_attention_batch(
                 if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
                                                               n_tokens * DS4_N_INDEXER_HEAD,
                                                               DS4_N_INDEXER_HEAD_DIM,
-                                                              /* indexer-Q QAT, not the comp cache: no code
-                                                               * mirror -- but the V5D scorer needs the exact
-                                                               * commit scales, so emit scale-only (CUDA;
-                                                               * Metal ignores both mirrors). */
-                                                              NULL, g->batch_indexer_q_scale) != 0;
+                                                              /* indexer-Q QAT, not the comp cache: the V5D
+                                                               * scorer needs the exact commit scales, and
+                                                               * 13a.2 hands the codes mirror to the mxf4
+                                                               * score-select chain so it stages Q straight
+                                                               * from this emit (CUDA; Metal ignores both
+                                                               * mirrors). */
+                                                              g->batch_indexer_qc,
+                                                              g->batch_indexer_q_scale) != 0;
                 /* inc-11 F1: shared attn_norm f16 mirror when available. */
                 if (ok) ok = metal_graph_matmul_f16_shared_tensor(g->batch_indexer_weights,
                                                          model,
@@ -18525,6 +18537,8 @@ static bool metal_graph_encode_layer_attention_batch(
                              g->layer_comp_cap[il],
                              g->layer_index_comp_cache_fp4[il],
                              g->layer_index_comp_scale[il],
+                             g->batch_indexer_qc,
+                             g->batch_indexer_q_scale,
                              &rr_engaged) != 0;
                 }
                 if (ok && rr_engaged) {
@@ -18780,6 +18794,8 @@ static bool metal_graph_encode_layer_attention_batch(
                      0u,
                      g->layer_index_comp_cache_fp4[il],
                      g->layer_index_comp_scale[il],
+                     g->batch_indexer_qc,
+                     g->batch_indexer_q_scale,
                      &rr_engaged) != 0;
             if (ok && rr_engaged) {
                 if (index_stage_profile) {

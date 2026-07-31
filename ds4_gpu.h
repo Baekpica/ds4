@@ -681,7 +681,15 @@ int ds4_gpu_indexer_topk_tensor(
  * indexer mirror, at n_comp < 1024 or n_tokens < 32, or on non-sm_121a
  * builds; escape hatch DS4_CUDA_NO_INDEXER_MXF4.  single_bank/comp_cap
  * mirror the FE1 bank-view convention of the scores entry (UINT32_MAX/0 =
- * no bank indirection).  Metal: stub, never engages. */
+ * no bank indirection).  v0.5 inc-13a.2: q_codes/q_scale4 carry the
+ * producer-emitted QAT mirror of q (64 B nibble codes + 4 F32 pow2 block
+ * scales per (token, head) row, the ds4_gpu_dsv4_indexer_qat_tensor
+ * mirror layout); when both are present the chain stages Q straight from
+ * the mirror and the internal re-quant launch (plus its full F32 re-read
+ * of q) is skipped -- bit-identical coarse inputs by the QAT emit
+ * construction.  NULL/NULL = internal re-quant (legacy); escape hatch
+ * DS4_CUDA_NO_INDEXER_QMIRROR forces the legacy path for twin gates.
+ * Metal: stub, never engages. */
 int ds4_gpu_indexer_score_select_prefill_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *scores,
@@ -699,6 +707,8 @@ int ds4_gpu_indexer_score_select_prefill_tensor(
         uint32_t                comp_cap,
         ds4_gpu_tensor       *index_fp4,
         ds4_gpu_tensor       *index_scale,
+        const ds4_gpu_tensor *q_codes,
+        const ds4_gpu_tensor *q_scale4,
         int                    *engaged);
 
 /* GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
