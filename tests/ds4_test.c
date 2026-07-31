@@ -797,8 +797,11 @@ static bool test_logprob_vector_step_disabled(const test_vec_case *vc, int step_
      * mirrors) legitimately moves this one step's distribution -- the
      * engine now confidently prefers a different continuation (top-2 gap
      * ~1.9 nats, a distribution shift, not a knife-edge artifact) while
-     * the pre-14a path still matches the API.
+     * the pre-14a path still matches the API.  Re-adjudicated at the
+     * tile-aspect port (4tok x G8): same shift, same ~1.9-nat gap
+     * (DS4_TEST_NO_STEP_EXCLUSIONS=1 leg, 2026-07-31).
      */
+    if (getenv("DS4_TEST_NO_STEP_EXCLUSIONS")) return false;
     if (!strcmp(vc->id, "short_code_completion") && step_index == 1) return true;
     return false;
 }
@@ -1726,6 +1729,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
     puts("  DS4_TEST_LOCAL_GOLDEN_RECORD=FILE  Re-record the golden fixture to FILE instead of checking.");
+    puts("  DS4_TEST_NO_STEP_EXCLUSIONS=1  Check every official-vector step (adjudicate exclusions).");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
 }
 

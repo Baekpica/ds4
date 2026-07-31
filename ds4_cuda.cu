@@ -10028,11 +10028,15 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
 
 /* -------------------------------------------------------------------------
  * DS4_ATTN_TOKENTILE: token-tile HMMA indexed attention (opt-in).
- * Ported from the pass-12 standalone prototype with fixed STAGE_ROWS=32, G=2.
+ * Ported from the pass-12 standalone prototype with fixed STAGE_ROWS=32.
+ * v0.5 tile-aspect port: 4 tokens x G8 head groups (same M=32) -- MMA work
+ * scales with union-per-token and heads share a tile's union, so narrower
+ * tiles shrink the deep-selection union (4.99x -> 2.19x top_k) while G8
+ * keeps M full.
  */
 
-static constexpr uint32_t kTTTileTokens = 16u;
-static constexpr uint32_t kTTG = 2u;
+static constexpr uint32_t kTTTileTokens = 4u;
+static constexpr uint32_t kTTG = 8u;
 static constexpr uint32_t kTTM = 32u;
 static constexpr uint32_t kTTStageRows = 32u;
 static constexpr uint32_t kTTRawWindow = 128u;
@@ -10049,7 +10053,7 @@ static constexpr uint32_t kTTRingChunksPerRow =
     (kTTHeadDim * sizeof(half)) / kTTRingChunkBytes;
 static constexpr size_t kTTSmemHardCap = 90ull * 1024ull;
 
-static_assert(kTTM == kTTTileTokens * kTTG, "token-tile M must be 16 tokens x G2");
+static_assert(kTTM == kTTTileTokens * kTTG, "token-tile M must be 4 tokens x G8");
 static_assert(kTTProbStride == kTTStageRows + 8u, "token-tile prob stride changed");
 static_assert(kTTScoreKSliceDim % 16u == 0, "token-tile score K split changed");
 static_assert(kTTRingChunksPerRow == 64u, "token-tile KV ring expects 64 chunks");
@@ -10382,7 +10386,7 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_union_build
  * (16-bit token mask per comp) -- 64 KiB at n_comp 32768, past the device
  * ceiling beyond -- which was the whole n_comp <= 32768 engage gate
  * (attention stepped 569 -> 1014 ms/chunk past 131k tokens).  A tile only
- * ever holds kTTTileTokens * top_k = 8192 candidates, so instead: pack
+ * ever holds kTTTileTokens * top_k = 2048 candidates, so instead: pack
  * (comp_id << 4) | tok into u32 (top_k == 512 by dispatch gate; comp ids
  * are far below 2^28), block-radix-sort ascending (33.8 KiB static temp,
  * n_comp-independent, no opt-in attribute), dedup adjacent ids, OR token
@@ -10394,7 +10398,10 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_union_build
  * proto_attn_union_sort.cu).  Dispatch keeps the bitmap builder for
  * n_comp <= 32768 where it is faster (crossover ~40k; sort is flat
  * ~0.17 ms/launch at every depth). */
-typedef cub::BlockRadixSort<uint32_t, 512, 16> tt_UnionSortT;
+/* Items per thread = kTTTileTokens * top_k / 512 threads; top_k is pinned to
+ * 512 by the dispatch gate, so this reduces to kTTTileTokens. */
+static constexpr uint32_t kTTUnionItems = kTTTileTokens;
+typedef cub::BlockRadixSort<uint32_t, 512, kTTUnionItems> tt_UnionSortT;
 
 __global__ static void __launch_bounds__(512, 1) attention_tokentile_union_sort_kernel(
         int2 *records,
@@ -10425,11 +10432,11 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_union_sort_
     for (uint32_t r = tid; r < rec_stride; r += blockDim.x)
         ((int *)&rec[r])[1] = 0;
 
-    uint32_t keys[16];
+    uint32_t keys[kTTUnionItems];
     const uint32_t total_slots = tile_count * top_k;
 #pragma unroll
-    for (uint32_t i = 0; i < 16u; i++) {
-        const uint32_t idx = tid * 16u + i;
+    for (uint32_t i = 0; i < kTTUnionItems; i++) {
+        const uint32_t idx = tid * kTTUnionItems + i;
         uint32_t key = kInvalid;
         if (idx < total_slots) {
             const uint32_t tok = idx / top_k;
@@ -10449,14 +10456,14 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_union_sort_
     tt_UnionSortT(sort_tmp).Sort(keys);
     __syncthreads();
 
-    edge_uid[tid] = keys[15] >> 4u;
+    edge_uid[tid] = keys[kTTUnionItems - 1u] >> 4u;
     __syncthreads();
     const uint32_t prev_edge = tid ? edge_uid[tid - 1u] : kInvalid;
 
     uint32_t local_starts = 0;
     uint32_t prev_uid = prev_edge;
 #pragma unroll
-    for (uint32_t i = 0; i < 16u; i++) {
+    for (uint32_t i = 0; i < kTTUnionItems; i++) {
         const uint32_t uid = keys[i] >> 4u;
         if (keys[i] != kInvalid && uid != prev_uid) local_starts++;
         prev_uid = uid;
@@ -10476,7 +10483,7 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_union_sort_
     uint32_t rank = scan[tid];
     prev_uid = prev_edge;
 #pragma unroll
-    for (uint32_t i = 0; i < 16u; i++) {
+    for (uint32_t i = 0; i < kTTUnionItems; i++) {
         const uint32_t key = keys[i];
         if (key != kInvalid) {
             const uint32_t uid = key >> 4u;
@@ -11181,14 +11188,14 @@ struct tt_TokentileSmemBudget {
         partial_bytes) + stats_bytes) + record_bytes);
 };
 
-static_assert(tt_TokentileSmemBudget<32, 2>::p_bytes == 5120ull,
+static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::p_bytes == 5120ull,
               "M32/R32 P double-buffer must use R+8 stride");
 static_assert(sizeof(float4) == 16u, "score partial records must stay 16 bytes");
-static_assert(tt_TokentileSmemBudget<32, 2>::partial_bytes == 16ull * 1024ull,
+static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::partial_bytes == 16ull * 1024ull,
               "M32/R32 score partial records must be M*R float4");
-static_assert(tt_TokentileSmemBudget<32, 2>::record_bytes == 1024ull,
+static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::record_bytes == 1024ull,
               "M32/R32 record ring must be four R-row int2 planes");
-static_assert(tt_TokentileSmemBudget<32, 2>::total == 88576ull,
+static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total == 88576ull,
               "M32/R32 total dynamic shared memory changed unexpectedly");
 static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total <= kTTSmemHardCap,
               "token-tile dynamic shared memory must stay under the 90 KiB pass gate");
