@@ -24,6 +24,16 @@ CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
+# Persisted CUDA build configuration: the cuda-spark / cuda-generic / cuda
+# targets record their flags here and every invocation includes the record,
+# so a stale CUDA object (e.g. after a sync touches ds4_cuda.cu) can only be
+# recompiled with the configuration the rest of the tree was built with --
+# never silently with the bare nvcc defaults (compute_75 PTX, JIT'd onto the
+# device with older codepaths: slower, and a different numeric profile than
+# the arch-native SASS the tree's other objects carry). Command-line
+# variables still override; switch configurations by running a cuda-*
+# target; survives make clean deliberately.
+-include .ds4-cuda-config.mk
 ifneq ($(strip $(CUDA_ARCH)),)
 ifeq ($(strip $(CUDA_ARCH)),sm_121)
 # GB10: the v0.5 mxf4 block-scale MMA (indexer rr-selector) needs the
@@ -101,8 +111,8 @@ help:
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make test                Build and run tests"
-	@echo "  make clean               Remove build outputs"
+	@echo "  make test                Build and run tests (reuses the last cuda-* configuration)"
+	@echo "  make clean               Remove build outputs (keeps the recorded cuda configuration)"
 
 # GB10 / DGX Spark is compute capability 12.1. Without an explicit -arch,
 # nvcc 13.0 emits compute_75 PTX that the driver JITs onto sm_121 with
@@ -111,9 +121,11 @@ help:
 # pre-expanded NVCCFLAGS, where the parent's empty NVCC_ARCH_FLAGS would
 # erase it), so spark defines travel via NVCC_EXTRA_FLAGS instead.
 cuda-spark:
+	@printf '%s\n' '# written by make cuda-spark (see the config include note in Makefile)' 'CUDA_ARCH := sm_121' 'NVCC_EXTRA_FLAGS := $(CUDA_SPARK_FLAGS)' 'CFLAGS += $(CUDA_SPARK_FLAGS)' > .ds4-cuda-config.mk
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent $(CUDA_EXTRA_BINS) CUDA_ARCH=sm_121 CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCC_EXTRA_FLAGS="$(CUDA_SPARK_FLAGS)"
 
 cuda-generic:
+	@printf '%s\n' '# written by make cuda-generic (see the config include note in Makefile)' 'CUDA_ARCH := native' > .ds4-cuda-config.mk
 	$(MAKE) ds4 ds4-server ds4-bench ds4-eval ds4-agent $(CUDA_EXTRA_BINS) CUDA_ARCH=native
 
 cuda:
@@ -122,6 +134,7 @@ cuda:
 		echo "       or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
 	fi
+	@printf '%s\n' '# written by make cuda (see the config include note in Makefile)' 'CUDA_ARCH := $(strip $(CUDA_ARCH))' > .ds4-cuda-config.mk
 	$(MAKE) ds4 ds4-server ds4-bench ds4-eval ds4-agent $(CUDA_EXTRA_BINS) CUDA_ARCH="$(CUDA_ARCH)"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)

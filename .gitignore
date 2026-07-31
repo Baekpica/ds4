@@ -12,6 +12,7 @@
 /local/
 *.o
 *.dSYM/
+/.ds4-cuda-config.mk
 __pycache__/
 *.pyc
 /misc/
