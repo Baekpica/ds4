@@ -22700,6 +22700,54 @@ static int attention_prefill_mixed_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* v0.5 inc-14a: wide zero-prefix chunks ride the shared ring dispatcher
+     * so the token-tile HMMA tier serves them (5.3 vs 13.7 ms/layer at 2048
+     * tokens; shallow2k ledger).  The contiguous chunk IS a degenerate ring
+     * (raw_cap == n_raw == n_tokens, raw_start 0, pos0 0: ring row == pos),
+     * and the dense union builder's causal comp ranges ((pos0+t+1)/ratio,
+     * clamped to n_comp) are the same arithmetic as this entry's static and
+     * cublas visibility at pos0 == 0.  The gate below mirrors the token-tile
+     * mixed tier's eligibility so routing stays deterministic -- token-tile
+     * or the legacy tiers, never a silent third kernel; masked (selector)
+     * calls and quality mode keep the tiers below unchanged.
+     * DS4_CUDA_NO_ATTN_TT_ZEROPREFIX restores the legacy dispatch. */
+    if (!use_comp_mask && n_tokens >= 128u && head_dim == kTTHeadDim &&
+        n_head == 64u && window == kTTRawWindow && ratio != 0u &&
+        n_comp <= 32768u && !g_quality_mode &&
+        ds4_cuda_attn_tokentile_enabled() &&
+        ds4_cuda_attn_tokentile_mixed_enabled() &&
+        ds4_cuda_attn_tokentile_arch_ok() &&
+        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
+        getenv("DS4_CUDA_NO_ATTN_TT_ZEROPREFIX") == NULL) {
+        cudaStreamCaptureStatus zp_capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(ds4_current_stream(), &zp_capture) == cudaSuccess &&
+            zp_capture == cudaStreamCaptureStatusNone) {
+            static int logged_tt_zp = 0;
+            if (!logged_tt_zp) {
+                logged_tt_zp = 1;
+                fprintf(stderr,
+                        "ds4: attention tokentile zero-prefix engage (first n_tokens=%u n_comp=%u)\n",
+                        n_tokens, n_comp);
+            }
+            return attention_decode_batch_launch(heads, model_map, model_size,
+                                              sinks_offset, q, raw_kv, comp_kv,
+                                              /*comp_kv_f16=*/0,
+                                              /*comp_mask=*/NULL,
+                                              /*use_comp_mask=*/0,
+                                              n_tokens, /*pos0=*/0u,
+                                              /*n_raw=*/n_tokens,
+                                              /*raw_cap=*/n_tokens,
+                                              /*raw_start=*/0u,
+                                              n_comp, /*comp_cap=*/n_comp,
+                                              window, ratio, n_head, head_dim,
+                                              comp_fp8, comp_scale,
+                                              /*positions=*/NULL, /*seq_id=*/NULL,
+                                              /*draft_n_raw=*/NULL,
+                                              /*allow_mseq_heads8=*/0u,
+                                              /*scalars=*/NULL, UINT32_MAX,
+                                              /*tt_run_pos0=*/0u);
+        }
+    }
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {

@@ -16142,6 +16142,17 @@ static void metal_graph_idx_gate_selftest(uint32_t     il,
     }
 }
 
+/* v0.5 inc-14a: one-shot engage receipt for the zero-prefix token-tile
+ * routing (engagement proven by logs, never assumed). */
+static void metal_graph_log_zero_prefix_attn_engage(uint32_t n_tokens) {
+    static bool logged = false;
+    if (logged) return;
+    logged = true;
+    fprintf(stderr,
+            "ds4: attention tokentile zero-prefix engage (first n_tokens=%u)\n",
+            n_tokens);
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -16694,16 +16705,51 @@ static bool metal_graph_encode_layer_attention_batch(
     bool batch_attention_done = false;
 
     if (ok && raw_batch_attention) {
-        ok = ds4_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
-                                                          model->map,
-                                                          model->size,
-                                                          layer->attn_sinks->abs_offset,
-                                                          g->batch_q,
-                                                          g->batch_kv,
-                                                          n_tokens,
-                                                          g->raw_window,
-                                                          DS4_N_HEAD,
-                                                          DS4_N_HEAD_DIM) != 0;
+        /* v0.5 inc-14a: the zero-prefix chunk rides the same ring-based
+         * dispatcher as every later chunk -- the store above already put
+         * the whole chunk at ring slots [0, n_tokens) -- so wide first
+         * chunks engage the token-tile HMMA tier instead of the legacy
+         * per-token online kernel (13.7 -> 5.3 ms/layer at 2048 tokens;
+         * shallow2k ledger).  Ring-overflow or seq-addressed callers
+         * (which never pair with pos0==0 today) keep the contiguous
+         * legacy entry, as does DS4_CUDA_NO_ATTN_TT_ZEROPREFIX. */
+        if (n_tokens <= g->raw_cap && seq_positions == NULL &&
+            getenv("DS4_CUDA_NO_ATTN_TT_ZEROPREFIX") == NULL) {
+            metal_graph_log_zero_prefix_attn_engage(n_tokens);
+            const uint32_t sp_core = ds4_gpu_stage_prof_begin(DS4_SPROF_ATTNCORE);
+            ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
+                                                                   model->map,
+                                                                   model->size,
+                                                                   layer->attn_sinks->abs_offset,
+                                                                   g->batch_q,
+                                                                   g->layer_raw_cache[il],
+                                                                   n_tokens,
+                                                                   /*pos0=*/0u,
+                                                                   /*n_raw=*/n_tokens,
+                                                                   g->raw_cap,
+                                                                   /*raw_start=*/0u,
+                                                                   g->raw_window,
+                                                                   DS4_N_HEAD,
+                                                                   DS4_N_HEAD_DIM,
+                                                                   /*positions=*/NULL, /*seq_id=*/NULL,
+                                                                   /*draft_n_raw=*/NULL,
+                                                                   /*allow_mseq_heads8=*/0u,
+                                                                   /*scalars=*/NULL,
+                                                                   UINT32_MAX,
+                                                                   /*tt_run_pos0=*/0u) != 0;
+            ds4_gpu_stage_prof_end(sp_core);
+        } else {
+            ok = ds4_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
+                                                              model->map,
+                                                              model->size,
+                                                              layer->attn_sinks->abs_offset,
+                                                              g->batch_q,
+                                                              g->batch_kv,
+                                                              n_tokens,
+                                                              g->raw_window,
+                                                              DS4_N_HEAD,
+                                                              DS4_N_HEAD_DIM) != 0;
+        }
         if (ok) batch_attention_done = true;
     } else if (ok && !zero_prefix && ratio == 0 && raw_fit <= g->raw_cap) {
         /*
@@ -18883,16 +18929,48 @@ static bool metal_graph_encode_layer_attention_batch(
         }
 
         if (raw_prefix_tokens != 0) {
-            ok = ds4_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
-                                                              model->map,
-                                                              model->size,
-                                                              layer->attn_sinks->abs_offset,
-                                                              g->batch_q,
-                                                              g->batch_kv,
-                                                              raw_prefix_tokens,
-                                                              g->raw_window,
-                                                              DS4_N_HEAD,
-                                                              DS4_N_HEAD_DIM) != 0;
+            /* v0.5 inc-14a: zero committed comps == pure raw-window
+             * attention, which is exactly the ring dispatcher's n_comp==0
+             * contract -- route there so the token-tile tier engages for
+             * the wide zero-prefix bulk.  Same fallback rules as the
+             * ratio==0 site. */
+            if (raw_prefix_tokens <= g->raw_cap && seq_positions == NULL &&
+                getenv("DS4_CUDA_NO_ATTN_TT_ZEROPREFIX") == NULL) {
+                metal_graph_log_zero_prefix_attn_engage(raw_prefix_tokens);
+                const uint32_t sp_core = ds4_gpu_stage_prof_begin(DS4_SPROF_ATTNCORE);
+                ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
+                                                                       model->map,
+                                                                       model->size,
+                                                                       layer->attn_sinks->abs_offset,
+                                                                       g->batch_q,
+                                                                       g->layer_raw_cache[il],
+                                                                       raw_prefix_tokens,
+                                                                       /*pos0=*/0u,
+                                                                       /*n_raw=*/raw_prefix_tokens,
+                                                                       g->raw_cap,
+                                                                       /*raw_start=*/0u,
+                                                                       g->raw_window,
+                                                                       DS4_N_HEAD,
+                                                                       DS4_N_HEAD_DIM,
+                                                                       /*positions=*/NULL, /*seq_id=*/NULL,
+                                                                       /*draft_n_raw=*/NULL,
+                                                                       /*allow_mseq_heads8=*/0u,
+                                                                       /*scalars=*/NULL,
+                                                                       UINT32_MAX,
+                                                                       /*tt_run_pos0=*/0u) != 0;
+                ds4_gpu_stage_prof_end(sp_core);
+            } else {
+                ok = ds4_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
+                                                                  model->map,
+                                                                  model->size,
+                                                                  layer->attn_sinks->abs_offset,
+                                                                  g->batch_q,
+                                                                  g->batch_kv,
+                                                                  raw_prefix_tokens,
+                                                                  g->raw_window,
+                                                                  DS4_N_HEAD,
+                                                                  DS4_N_HEAD_DIM) != 0;
+            }
         }
         if (raw_prefix_tokens < n_tokens) {
             for (uint32_t t = raw_prefix_tokens; ok && t < n_tokens; t++) {
