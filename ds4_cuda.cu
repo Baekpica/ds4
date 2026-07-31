@@ -20594,10 +20594,17 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_f16_tensor(ds4_gpu_tensor *out, ds4_
         const size_t payload = (size_t)rows * nkseg * 144u;
         const size_t need = payload + 128u * 144u;  /* consumer slack ceiling */
         if (g_norm_q8_cap < need) {
+            /* Floor the allocation at the batch max chunk (4096 rows) so the
+             * buffer never regrows: the free+malloc pair stalls the stream
+             * ~33 ms (p4 re-receipt trace, 3 gaps totaling 98 ms/boot) and
+             * would recur in serving on the first larger chunk. */
+            const size_t floor_need =
+                (size_t)(rows > 4096u ? rows : 4096u) * nkseg * 144u +
+                128u * 144u;
             if (g_norm_q8_buf) { cudaFree(g_norm_q8_buf); g_norm_q8_buf = NULL; }
             g_norm_q8_cap = 0;
-            if (cudaMalloc(&g_norm_q8_buf, need) == cudaSuccess) {
-                g_norm_q8_cap = need;
+            if (cudaMalloc(&g_norm_q8_buf, floor_need) == cudaSuccess) {
+                g_norm_q8_cap = floor_need;
             }
         }
         if (g_norm_q8_buf) {
