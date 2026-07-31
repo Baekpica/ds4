@@ -1765,7 +1765,16 @@ int ds4_gpu_attention_output_q8_batch_tensor(
  * be taken -- the caller must then run the classic
  * ds4_gpu_rope_tail_tensor(inverse) + ds4_gpu_attention_output_q8_batch_
  * tensor pair.  On success `heads` is left UN-rotated in f32; callers must
- * not read it expecting post-rope values. */
+ * not read it expecting post-rope values.
+ *
+ * v0.5 flat-pool p1: on the wide batch path this entry now serves out_a
+ * with ONE fused own kernel (f32 heads read direct, rope via a (c,s)
+ * table companion, aligned-Q8_0 in-register dequant, interleaved f32 low
+ * write) -- the f16 pack + cublas pair and the q8->f16 out_a cache are
+ * retired on that path.  VALUE-parity vs the pair (HMMA k-order), staged
+ * f16 inputs bit-identical by construction.  Kill switch
+ * DS4_CUDA_NO_OUTA_OWN restores the pack+cublas pair (and the inc-12f
+ * f16-cache boot prebuild) exactly. */
 int ds4_gpu_attention_output_q8_batch_inverse_rope_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
