@@ -555,6 +555,112 @@ extern "C" int ds4_mmq_q8_0_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_dense", W, X, out, M, N, K, stream);
 }
 
+/* p5a verify instrument: run the REFERENCE quantizer (exact dense_impl
+ * parameters) into a caller buffer so producers can be diffed
+ * byte-for-byte against it (DS4_CUDA_OUTA_Q8EMIT_VERIFY). */
+extern "C" int ds4_mmq_q8_0_quantize_ref(
+        const float * X, void * y, size_t y_bytes, int N, int K,
+        cudaStream_t stream) {
+    if (!X || !y || N <= 0 || K <= 0 || K % 256 != 0) return -1;
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) return -1;
+    ds4_pool_set_stream(stream);
+    const size_t need = (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
+    if (y_bytes < need) return -1;
+    cudaMemsetAsync(y, 0, y_bytes, stream);
+    quantize_mmq_q8_1_cuda(
+        X, /*ids=*/nullptr, y, GGML_TYPE_Q8_0,
+        /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
+        /*ne0=*/ne10_padded, /*ne1=*/(int64_t)N, /*ne2=*/1, /*ne3=*/1, stream);
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+/* v0.5 flat-pool p5a: dense Q8_0 mmq consuming a PRODUCER-EMITTED
+ * block_q8_1_mmq activation buffer (the fused own out_a kernel dual-emits
+ * the q8_1 of `low` in its epilogue, op-for-op equal to
+ * quantize_mmq_q8_1<D4> -- the batched sibling of the M2-Inc2a
+ * producer-codes affordance on the vec entry).  The caller owns the
+ * buffer: all N*(K/128) blocks written by the producer, PLUS the
+ * mmq_x_max tail-tile slack which THIS entry zeroes (S1.1a determinism;
+ * the producer's sticky scratch may hold stale bytes).  Requires the
+ * padded row width to equal K so the producer's block addressing
+ * (ib = kseg*N + row) matches the quantizer's exactly. */
+extern "C" int ds4_mmq_q8_0_dense_preq(
+        const void * W, const void * Y_q8_mmq, size_t y_bytes, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q8_0_dense_preq";
+    if (!W || !Y_q8_mmq || !out) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (K <= 0 || M <= 0 || N <= 0 || K % 256 != 0) {
+        fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
+        return -1;
+    }
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    if (ne10_padded != (int64_t)K) return -1;  /* producer layout requires no row padding */
+
+    const int dev = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[dev].cc;
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return -1;
+    }
+    ds4_pool_set_stream(stream);
+
+    const size_t data_bytes =
+        (size_t)N * (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+    const size_t slack_bytes =
+        (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+    if (y_bytes < data_bytes + slack_bytes) {
+        fprintf(stderr, "%s: y buffer too small (%zu < %zu)\n", tag,
+                y_bytes, data_bytes + slack_bytes);
+        return -1;
+    }
+    /* Tail-tile slack: deterministic zeros (S1.1a).  ~18 KiB, stream-ordered
+     * after the producer's emit on the same stream. */
+    cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
+
+    const int64_t s01 = (int64_t)K / QK8_0;
+    const int64_t s12 = (int64_t)N * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+
+    const bool use_stream_k =
+        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
+
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+    }
+
+    const mmq_args args = {
+        /*x=*/(const char *)W,
+        /*type_x=*/GGML_TYPE_Q8_0,
+        /*y=*/(const int *)Y_q8_mmq,
+        /*ids_dst=*/nullptr,
+        /*expert_bounds=*/nullptr,
+        /*dst=*/out,
+        /*ncols_x=*/(int64_t)K, /*nrows_x=*/(int64_t)M, /*ncols_dst=*/(int64_t)N,
+        /*stride_row_x=*/s01,   /*ncols_y=*/(int64_t)N, /*nrows_dst=*/(int64_t)M,
+        /*nchannels_x=*/1,   /*nchannels_y=*/1,
+        /*stride_channel_x=*/0, /*stride_channel_y=*/s12, /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1,    /*nsamples_y=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/s12, /*stride_sample_dst=*/0,
+        /*use_stream_k=*/use_stream_k,
+        /*ncols_max=*/(int64_t)N,
+    };
+    mul_mat_q_case<GGML_TYPE_Q8_0>(*ctx, args, stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+    ds4_mmq_sanitize_f32(out, (uint64_t)M * (uint64_t)N, stream);
+    return 0;
+}
+
 // Dense Q8_0 D2R entry: same activation quantize + scratch treatment as
 // ds4_mmq_dense_impl (incl. the S1.1a zero for the never-written tail), then
 // the D2R kernel on the kind-5 aligned artifact instead of mul_mat_q_case.

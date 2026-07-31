@@ -7894,6 +7894,13 @@ attention_outa_fused_own_kernel(
         const float2 *tab,                /* [n_tokens][kOANRot/2]          */
         const __half *a_sc,               /* aligned q8: scales plane       */
         const int8_t *a_qs,               /* aligned q8: qs plane           */
+        /* p5a: optional block_q8_1_mmq D4 dual-emit of `low` for the out_b
+         * mmq (NULL = no emit).  One CTA tile = exactly one 128-element
+         * k-segment block per token row (ib = kseg*n_tokens + row); layout
+         * = 16 B d4[4] then qs[128] (144 B stride), math op-for-op equal
+         * to quantize_mmq_q8_1<D4> (amax is order-insensitive; d_inv and
+         * d replicate the reference's exact division expressions). */
+        char *y_q8,
         uint32_t n_tokens) {
     namespace wmma = nvcuda::wmma;
     extern __shared__ __half oa_smem[];
@@ -8013,6 +8020,57 @@ attention_outa_fused_own_kernel(
             if (gt < n_tokens)
                 wmma::store_matrix_sync(low + (uint64_t)gt * kOALow + gc,
                                         acc[i][j], kOALow, wmma::mem_row_major);
+        }
+    }
+
+    /* p5a q8_1 dual-emit: re-read this CTA's own just-stored C tile (L2-hot;
+     * __syncthreads makes the block's global stores visible block-wide) and
+     * write one 144-B block per token row.  512 (row, 32-col group) pairs
+     * over 256 threads. */
+    if (y_q8) {
+        __syncthreads();
+        const uint32_t kseg = (g * kOARank + col0) / 128u;
+#pragma unroll
+        for (uint32_t s = 0; s < 2u; s++) {
+            const uint32_t p = tid + s * 256u;
+            const uint32_t r = p / 4u;
+            const uint32_t grp = p % 4u;
+            const uint32_t gt = row0 + r;
+            if (gt >= n_tokens) continue;
+            const float *src = low + (uint64_t)gt * kOALow + g * kOARank + col0 + grp * 32u;
+            float v[32];
+            float amax = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 32; j += 4) {
+                const float4 x4 = *(const float4 *)(src + j);
+                v[j] = x4.x; v[j + 1] = x4.y; v[j + 2] = x4.z; v[j + 3] = x4.w;
+                amax = fmaxf(amax, fmaxf(fmaxf(fabsf(x4.x), fabsf(x4.y)),
+                                         fmaxf(fabsf(x4.z), fabsf(x4.w))));
+            }
+            /* SASS-pinned to quantize_mmq_q8_1's fast-math lowering (read
+             * from the compiled object, 12c method): d_inv = FMUL(MUFU.RCP
+             * (amax), 127) and the stored d = bare MUFU.RCP(d_inv).  The
+             * straight-line source form let the optimizer rewrite
+             * 1.0f/(127.0f/amax) algebraically -- an ulp-level scale
+             * divergence the golden tripped on (top20_max_abs 8.55). */
+            float rcp_amax;
+            asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp_amax) : "f"(amax));
+            const float d_inv = __fmul_rn(rcp_amax, 127.0f);
+            char *blk = y_q8 + ((uint64_t)kseg * n_tokens + gt) * 144u;
+            int4 qw[2];
+            /* int8_t, NOT char: aarch64 char is UNSIGNED -- a bare-char cast
+             * compiled to F2I.U32 and wrecked every negative quant (verify
+             * receipt: all d4 exact, qs diverging).  The reference's char4
+             * fields are signed char => signed F2I.TRUNC. */
+            int8_t *qb = (int8_t *)qw;
+#pragma unroll
+            for (int j = 0; j < 32; j++) qb[j] = (int8_t)roundf(__fmul_rn(v[j], d_inv));
+            int4 *dst_qs = (int4 *)(blk + 16u + grp * 32u);
+            dst_qs[0] = qw[0];
+            dst_qs[1] = qw[1];
+            float d_store;
+            asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(d_store) : "f"(d_inv));
+            ((float *)blk)[grp] = d_store;
         }
     }
 }
@@ -23414,6 +23472,8 @@ static int cuda_attention_output_q8_batch_impl(
      * docstring at attention_outa_fused_own_kernel.  Kill switch
      * DS4_CUDA_NO_OUTA_OWN restores the pack+cublas pair exactly. */
     int outa_own_served = 0;
+    char *oa_y_q8 = NULL;       /* p5a producer-emitted q8_1 of low */
+    uint64_t oa_y_bytes = 0;
     static int outa_own_off = -1;
     if (outa_own_off < 0) outa_own_off = getenv("DS4_CUDA_NO_OUTA_OWN") != NULL;
     if (fuse_inverse_rope && !outa_own_off && !out_a_use_mc && !g_quality_mode &&
@@ -23426,8 +23486,24 @@ static int cuda_attention_output_q8_batch_impl(
             const uint64_t nblk = (uint64_t)low_dim * (group_dim / 32u);
             const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
             const uint64_t tab_bytes = (uint64_t)n_tokens * (kOANRot / 2u) * sizeof(float2);
-            void *tab = cuda_tmp_alloc(tab_bytes, "attention outa rope table");
+            /* p5a: dual-emit the q8_1 of low when out_b will take the wide
+             * mmq path (mmvq widths and non-mmq builds keep the classic
+             * requantize).  One combined sticky-scratch block: rope table
+             * first (256-aligned), then N*(low_dim/128) 144-B q8 blocks +
+             * 256-block tail slack the preq consumer zeroes. */
+            static int oa_q8emit_off = -1;
+            if (oa_q8emit_off < 0) oa_q8emit_off = getenv("DS4_CUDA_NO_OUTA_Q8EMIT") != NULL;
+            const int oa_emit = !oa_q8emit_off && ds4_cuda_use_mmq() &&
+                                n_tokens > cuda_mmvq_decode_max_tokens();
+            const uint64_t tab_pad = (tab_bytes + 255u) & ~255ull;
+            const uint64_t y_data = (uint64_t)n_tokens * (low_dim / 128u) * 144u;
+            const uint64_t y_full = oa_emit ? y_data + 256u * 144u : 0u;
+            void *tab = cuda_tmp_alloc(tab_pad + y_full, "attention outa rope table");
             if (tab) {
+                if (oa_emit) {
+                    oa_y_q8 = (char *)tab + tab_pad;
+                    oa_y_bytes = y_full;
+                }
                 attention_outa_rope_cs_table_kernel<<<
                         (unsigned)((n_tokens * (kOANRot / 2u) + 255u) / 256u), 256, 0,
                         ds4_current_stream()>>>((float2 *)tab, n_tokens, pos0, positions,
@@ -23442,6 +23518,7 @@ static int cuda_attention_output_q8_batch_impl(
                                                 (const float2 *)tab,
                                                 (const __half *)oa_al,
                                                 (const int8_t *)(oa_al + dq_bytes),
+                                                oa_y_q8,
                                                 n_tokens);
                 if (!cuda_ok(cudaGetLastError(), "attention outa fused own launch")) return 0;
                 static int logged_outa_own = 0;
@@ -23594,6 +23671,68 @@ static int cuda_attention_output_q8_batch_impl(
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
     }
 
+    /* p5a: when the own out_a kernel dual-emitted the q8_1 of low, out_b
+     * consumes it directly and the standalone quantize launch (and its
+     * 64 MB/launch f32 re-read of low) dies.  Any decline falls back to
+     * the classic requantizing path below, bit-identically (the emit is
+     * op-for-op the reference quantizer). */
+    if (outa_own_served && oa_y_q8 && getenv("DS4_CUDA_OUTA_Q8EMIT_VERIFY")) {
+        /* diagnostic: byte-diff the emit against the reference quantizer,
+         * field-aware (144-B blocks: d4[4] floats then qs[128]) */
+        const uint64_t data_bytes = (uint64_t)n_tokens * (low_dim / 128u) * 144u;
+        void *ref = NULL;
+        if (cudaMalloc(&ref, data_bytes) == cudaSuccess &&
+            ds4_mmq_q8_0_quantize_ref((const float *)low->ptr, ref, data_bytes,
+                                      (int)n_tokens, (int)low_dim,
+                                      ds4_current_stream()) == 0) {
+            cudaStreamSynchronize(ds4_current_stream());
+            char *h_ref = (char *)malloc(data_bytes);
+            char *h_got = (char *)malloc(data_bytes);
+            cudaMemcpy(h_ref, ref, data_bytes, cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_got, oa_y_q8, data_bytes, cudaMemcpyDeviceToHost);
+            uint64_t bad_blocks = 0, shown = 0;
+            const uint64_t nblk_y = data_bytes / 144u;
+            for (uint64_t ib = 0; ib < nblk_y; ib++) {
+                if (memcmp(h_ref + ib * 144u, h_got + ib * 144u, 144u) == 0) continue;
+                bad_blocks++;
+                if (shown < 4) {
+                    shown++;
+                    const char *r = h_ref + ib * 144u, *m = h_got + ib * 144u;
+                    int fb = -1;
+                    for (int b = 0; b < 144; b++) if (r[b] != m[b]) { fb = b; break; }
+                    fprintf(stderr,
+                            "ds4: q8emit VERIFY diff ib=%llu kseg=%llu row=%llu first_byte=%d "
+                            "(%s) d4_ref=%.9g/%.9g/%.9g/%.9g d4_got=%.9g/%.9g/%.9g/%.9g\n",
+                            (unsigned long long)ib,
+                            (unsigned long long)(ib / n_tokens),
+                            (unsigned long long)(ib % n_tokens), fb,
+                            fb < 16 ? "d4" : "qs",
+                            ((const float *)r)[0], ((const float *)r)[1],
+                            ((const float *)r)[2], ((const float *)r)[3],
+                            ((const float *)m)[0], ((const float *)m)[1],
+                            ((const float *)m)[2], ((const float *)m)[3]);
+                }
+            }
+            fprintf(stderr, "ds4: q8emit VERIFY n_tokens=%u blocks=%llu bad=%llu\n",
+                    n_tokens, (unsigned long long)nblk_y, (unsigned long long)bad_blocks);
+            free(h_ref); free(h_got);
+        }
+        if (ref) cudaFree(ref);
+    }
+    if (outa_own_served && oa_y_q8) {
+        if (ds4_mmq_q8_0_dense_preq(out_b, oa_y_q8, (size_t)oa_y_bytes,
+                                    (float *)out->ptr, (int)out_dim,
+                                    (int)n_tokens, (int)low_dim,
+                                    ds4_current_stream()) == 0) {
+            static int logged_outb_preq = 0;
+            if (!logged_outb_preq) {
+                logged_outb_preq = 1;
+                fprintf(stderr, "ds4: attention out_b consuming producer q8 (flat-pool p5a, first n_tokens=%u)\n",
+                        n_tokens);
+            }
+            return 1;
+        }
+    }
     (void)out_b;
     return cuda_matmul_q8_0_tensor_labeled(out,
                                            model_map,
