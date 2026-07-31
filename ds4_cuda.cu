@@ -6156,6 +6156,72 @@ __global__ static void rms_norm_weight_f16pair_kernel(float *out, __half *out16,
     }
 }
 
+/* flat-pool p5c: triple-emit twin of rms_norm_weight_f16pair_kernel.  The
+ * f32/f16 body is copied VERBATIM (that kernel stays byte-untouched for the
+ * non-emitting callers); a third pass re-reads the just-written orow
+ * (block-wide visibility of the block's own global stores after
+ * __syncthreads — the p5a / M2-Inc2a re-read pattern, identical bits) and
+ * emits the block_q8_1_mmq D4 buffer the dense-q8 consumers take
+ * pre-quantized (ib = kseg*rows + row, 16 B d4[4] then qs[128]).  The emit
+ * replicates quantize_mmq_q8_1<D4> op-for-op with the p5a-pinned lowering:
+ * per-thread float4 over 4 contiguous values, 8-lane shfl_xor amax
+ * (offsets 4,2,1), rcp.approx.ftz for d_inv's reciprocal and the stored d,
+ * __fmul_rn products, int8_t casts (AARCH64-CHAR LAW: bare char is
+ * unsigned on sbsa). */
+__global__ static void rms_norm_weight_f16q8_kernel(float *out, __half *out16, char *y_q8, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    __half *o16row = out16 + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i] * scale * w[i];
+        orow[i] = v;
+        o16row[i] = __float2half(v);
+    }
+    __syncthreads();
+    const uint32_t lane = threadIdx.x & 31u;
+    for (uint32_t qb = threadIdx.x >> 5u; qb < (n >> 7u); qb += (blockDim.x >> 5u)) {
+        const float4 xi = *reinterpret_cast<const float4 *>(orow + (uint64_t)qb * 128u + lane * 4u);
+        float amax = fabsf(xi.x);
+        amax = fmaxf(amax, fabsf(xi.y));
+        amax = fmaxf(amax, fabsf(xi.z));
+        amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off, 32));
+        }
+        float rcp_amax;
+        asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp_amax) : "f"(amax));
+        const float d_inv = __fmul_rn(rcp_amax, 127.0f);
+        char4 q;
+        q.x = (int8_t)roundf(__fmul_rn(xi.x, d_inv));
+        q.y = (int8_t)roundf(__fmul_rn(xi.y, d_inv));
+        q.z = (int8_t)roundf(__fmul_rn(xi.z, d_inv));
+        q.w = (int8_t)roundf(__fmul_rn(xi.w, d_inv));
+        char *blk = y_q8 + ((uint64_t)qb * rows + row) * 144u;
+        *reinterpret_cast<char4 *>(blk + 16u + lane * 4u) = q;
+        if ((lane & 7u) == 0u) {
+            float d;
+            asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(d) : "f"(d_inv));
+            reinterpret_cast<float *>(blk)[lane >> 3u] = d;
+        }
+    }
+}
+
 /* Step 4c C2: row-variant of rms_norm_weight_kernel for the compressor
  * emit path.  Normalizes exactly one row of `base` at index *row_ptr_dev.
  * The shim selects whether the device pointer addresses comp_row or
@@ -18806,6 +18872,49 @@ static void q8p_end(uint32_t slot, cudaStream_t s) {
     (void)cudaEventRecord(g_q8p_ev1[slot], s);
 }
 
+/* flat-pool p5c: producer-quantized activation registry.  The norm
+ * triple-emit (rms_norm_weight_f16q8_kernel) registers its D4 q8 buffer
+ * keyed on the f32 output pointer; the dense-q8 dispatcher and the fused
+ * MoE launch consume it in place of their internal activation quantize.
+ * Validity window: from the emit to the next write of the f32 buffer.
+ * The only prefill-scale writers of the two normed activations
+ * (batch_attn_norm, batch_ffn_norm) are the rms rows entries, which
+ * re-stamp or invalidate below; decode-width writers (hc fused n_tok==1,
+ * serial graph rows) can never satisfy a rows>=64 lookup because a
+ * large-rows consumer always follows the large-rows producer that
+ * re-stamped the entry on the same stream. */
+static struct {
+    const void *src;
+    void       *y;
+    size_t      bytes;
+    uint32_t    rows;
+    uint32_t    n;
+} g_norm_q8_reg = {NULL, NULL, 0, 0u, 0u};
+static void  *g_norm_q8_buf = NULL;
+static size_t g_norm_q8_cap = 0;
+
+static int cuda_norm_q8emit_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_CUDA_NO_NORM_Q8EMIT") == NULL ? 1 : 0;
+        if (!cached) {
+            fprintf(stderr, "ds4: DS4_CUDA_NO_NORM_Q8EMIT - norm q8 triple-emit disabled\n");
+        }
+    }
+    return cached;
+}
+
+static void cuda_norm_q8_invalidate(const void *dst) {
+    if (g_norm_q8_reg.src == dst) g_norm_q8_reg.src = NULL;
+}
+
+static void *cuda_norm_q8_lookup(const void *x, uint64_t n_tok, uint64_t k, size_t *bytes_out) {
+    if (g_norm_q8_reg.src == NULL || g_norm_q8_reg.src != x) return NULL;
+    if ((uint64_t)g_norm_q8_reg.rows != n_tok || (uint64_t)g_norm_q8_reg.n != k) return NULL;
+    if (bytes_out) *bytes_out = g_norm_q8_reg.bytes;
+    return g_norm_q8_reg.y;
+}
+
 static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label);
 
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
@@ -19067,6 +19176,27 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
                                           label ? label : "q8_dense_d2r")
                 : NULL;
             if (w_al) {
+                /* p5c: producer-quantized activation, when registered for
+                 * this exact (buffer, rows, K), replaces the entry's
+                 * internal quantize; any decline falls through to the
+                 * classic quantizing entry bit-identically. */
+                size_t nq8_bytes = 0;
+                void *nq8 = cuda_norm_q8_lookup(x->ptr, n_tok, in_dim, &nq8_bytes);
+                if (nq8) {
+                    int prc = ds4_mmq_q8_0_dense_d2r_preq(
+                            w_al, nq8, nq8_bytes, (float *)out->ptr,
+                            (int)out_dim, (int)n_tok, (int)in_dim,
+                            ds4_mmq_stream_for_call());
+                    if (prc == 0) {
+                        static int logged_d2r_preq = 0;
+                        if (!logged_d2r_preq) {
+                            logged_d2r_preq = 1;
+                            fprintf(stderr, "ds4: dense q8 D2R consuming producer q8 (flat-pool p5c, first label='%s' n_tok=%u)\n",
+                                    label ? label : "?", (unsigned)n_tok);
+                        }
+                        return 1;
+                    }
+                }
                 int rc = ds4_mmq_q8_0_dense_d2r(w_al, (const float *)x->ptr,
                                                 (float *)out->ptr,
                                                 (int)out_dim, (int)n_tok, (int)in_dim,
@@ -19083,6 +19213,27 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
                 fprintf(stderr, "ds4: ds4_mmq_q8_0_dense_d2r returned %d (label='%s' M=%llu N=%llu K=%llu); falling back to mmq\n",
                         rc, label ? label : "", (unsigned long long)out_dim,
                         (unsigned long long)n_tok, (unsigned long long)in_dim);
+            }
+        }
+        /* p5c: same producer-q8 shortcut for the mmq tier (attn_q_a /
+         * attn_kv read the just-normed hidden). */
+        {
+            size_t nq8_bytes = 0;
+            void *nq8 = cuda_norm_q8_lookup(x->ptr, n_tok, in_dim, &nq8_bytes);
+            if (nq8) {
+                int prc = ds4_mmq_q8_0_dense_preq(
+                        wptr, nq8, nq8_bytes, (float *)out->ptr,
+                        (int)out_dim, (int)n_tok, (int)in_dim,
+                        ds4_mmq_stream_for_call());
+                if (prc == 0) {
+                    static int logged_mmq_preq = 0;
+                    if (!logged_mmq_preq) {
+                        logged_mmq_preq = 1;
+                        fprintf(stderr, "ds4: dense q8 mmq consuming producer q8 (flat-pool p5c, first label='%s' n_tok=%u)\n",
+                                label ? label : "?", (unsigned)n_tok);
+                    }
+                    return 1;
+                }
             }
         }
         int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
@@ -20414,6 +20565,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
+    cuda_norm_q8_invalidate(out->ptr);  /* p5c: this write has no q8 emit */
     rms_norm_weight_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
@@ -20430,6 +20582,70 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_f16_tensor(ds4_gpu_tensor *out, ds4_
         x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
     if (!wptr) return 0;
+    /* p5c: triple-emit at prefill scale — the q8 D4 mirror of the normed
+     * activation feeds the dense-q8 preq consumers and the fused MoE input
+     * (5 standalone quantize launches per layer at K=4096).  rows>=64
+     * keeps every decode/capture width on the untouched pair kernel; the
+     * grow-only scratch only ever (re)allocates on this eager prefill
+     * path (sticky-scratch law). */
+    cuda_norm_q8_invalidate(out->ptr);
+    if (cuda_norm_q8emit_enabled() && rows >= 64u && (n & 127u) == 0u) {
+        const uint32_t nkseg = n >> 7u;
+        const size_t payload = (size_t)rows * nkseg * 144u;
+        const size_t need = payload + 128u * 144u;  /* consumer slack ceiling */
+        if (g_norm_q8_cap < need) {
+            if (g_norm_q8_buf) { cudaFree(g_norm_q8_buf); g_norm_q8_buf = NULL; }
+            g_norm_q8_cap = 0;
+            if (cudaMalloc(&g_norm_q8_buf, need) == cudaSuccess) {
+                g_norm_q8_cap = need;
+            }
+        }
+        if (g_norm_q8_buf) {
+            rms_norm_weight_f16q8_kernel<<<rows, 256, 0, ds4_current_stream()>>>(
+                    (float *)out->ptr, (__half *)out_f16->ptr,
+                    (char *)g_norm_q8_buf, (const float *)x->ptr,
+                    (const float *)wptr, n, rows, eps);
+            if (!cuda_ok(cudaGetLastError(), "rms_norm_weight f16q8 launch")) return 0;
+            g_norm_q8_reg.src   = out->ptr;
+            g_norm_q8_reg.y     = g_norm_q8_buf;
+            g_norm_q8_reg.bytes = g_norm_q8_cap;
+            g_norm_q8_reg.rows  = rows;
+            g_norm_q8_reg.n     = n;
+            static int logged_norm_q8 = 0;
+            if (!logged_norm_q8) {
+                logged_norm_q8 = 1;
+                fprintf(stderr, "ds4: norm producer triple-emits q8 (flat-pool p5c, first rows=%u n=%u)\n",
+                        rows, n);
+            }
+            if (getenv("DS4_CUDA_NORM_Q8EMIT_VERIFY") != NULL) {
+                /* In-situ byte-diff vs the reference quantizer over the
+                 * just-written f32 rows (p5a instrument pattern). */
+                char *ref = NULL;
+                if (cudaMalloc((void **)&ref, payload) == cudaSuccess) {
+                    if (ds4_mmq_q8_0_quantize_ref((const float *)out->ptr, ref,
+                                                  payload, (int)rows, (int)n,
+                                                  ds4_current_stream()) == 0) {
+                        char *h_ref = (char *)malloc(payload);
+                        char *h_got = (char *)malloc(payload);
+                        if (h_ref && h_got) {
+                            cudaMemcpy(h_ref, ref, payload, cudaMemcpyDeviceToHost);
+                            cudaMemcpy(h_got, g_norm_q8_buf, payload, cudaMemcpyDeviceToHost);
+                            uint64_t bad = 0;
+                            const uint64_t nblk = payload / 144u;
+                            for (uint64_t ib = 0; ib < nblk; ib++) {
+                                if (memcmp(h_ref + ib * 144u, h_got + ib * 144u, 144u) != 0) bad++;
+                            }
+                            fprintf(stderr, "ds4: norm q8emit VERIFY rows=%u blocks=%llu bad=%llu\n",
+                                    rows, (unsigned long long)nblk, (unsigned long long)bad);
+                        }
+                        free(h_ref); free(h_got);
+                    }
+                    cudaFree(ref);
+                }
+            }
+            return 1;
+        }
+    }
     rms_norm_weight_f16pair_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (__half *)out_f16->ptr, (const float *)x->ptr, (const float *)wptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight f16pair launch");
 }
@@ -27569,6 +27785,12 @@ mmq_moe_path:
                 rc = -1;
                 if (up->bytes >= seg_bytes && gate->bytes >= seg_bytes &&
                     mid->bytes >= seg_bytes) {
+                    /* p5c: the producer-quantized ffn_norm q8, when
+                     * registered for this exact (buffer, rows, K), skips
+                     * the fused path's own compact input quantize. */
+                    size_t moe_q8_bytes = 0;
+                    const void *moe_q8 = cuda_norm_q8_lookup(
+                            x->ptr, n_tokens, expert_in_dim, &moe_q8_bytes);
                     rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
                         gate_iq2_aligned, up_iq2_aligned, down_q2k_aligned,
                         (const float *)x->ptr, (const int32_t *)selected->ptr,
@@ -27576,6 +27798,7 @@ mmq_moe_path:
                         up->ptr, (size_t)seg_bytes,
                         gate->ptr, (size_t)seg_bytes,
                         mid->ptr, (size_t)seg_bytes,
+                        moe_q8, moe_q8_bytes,
                         (float *)down->ptr,
                         (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
                         (int)n_tokens, (int)n_experts_total, (int)n_expert_used,

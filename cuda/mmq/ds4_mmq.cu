@@ -744,6 +744,40 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
                                          M, N, K, stream);
 }
 
+/* flat-pool p5c: D2R dense entry over a producer-quantized Y (token-major
+ * block_q8_1_mmq, ib = kseg*N + row, no row padding).  Same contract as
+ * ds4_mmq_q8_0_dense_d2r minus the activation quantize; the caller's
+ * buffer must carry the guarded-tail slack (zeroed here each call, S1.1a:
+ * the producer rewrites every payload byte, the slack region may hold a
+ * previous larger emit's bytes). */
+extern "C" int ds4_mmq_q8_0_dense_d2r_preq(
+        const void * W_aligned, const void * Y_q8_mmq, size_t y_bytes,
+        float * out_f32, int M, int N, int K, cudaStream_t stream) {
+    if (!W_aligned || !Y_q8_mmq || !out_f32) {
+        return -1;
+    }
+    if (M <= 0 || (M % 128) != 0 || N <= 0 || K <= 0 || (K % 1024) != 0) {
+        return -1;
+    }
+    const int dev = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_q8_0_dense_d2r_available(cc)) {
+        return -1;
+    }
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    if (ne10_padded != (int64_t)K) return -1;  /* producer layout requires no row padding */
+    const int64_t slack_blocks = std::max<int64_t>(get_mmq_x_max_host(cc), 128);
+    const size_t data_bytes =
+        (size_t)N * (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+    const size_t slack_bytes = (size_t)slack_blocks * sizeof(block_q8_1_mmq);
+    if (y_bytes < data_bytes + slack_bytes) {
+        return -1;
+    }
+    cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
+    return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, Y_q8_mmq, out_f32,
+                                         M, N, K, stream);
+}
+
 extern "C" int ds4_mmq_q2_K_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
@@ -1028,6 +1062,10 @@ struct ds4_mmq_fused_down {
     size_t        q8_scratch_bytes;
     void        * work_scratch;
     size_t        work_scratch_bytes;
+    /* flat-pool p5c: producer-emitted token-compact q8 of X (see the
+     * fused_direct_soa doc in ds4_mmq.h); NULL = quantize internally. */
+    const void  * input_q8_ext;
+    size_t        input_q8_ext_bytes;
 };
 
 static bool ds4_mmq_take_scratch(
@@ -1302,10 +1340,30 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s13_src = (int64_t)K * ne11 * ne12;
     /* p5b: token-compact input quantize on the direct fused path (the
      * materialized paths below keep the slot-gathered form: their pair/mmq
-     * consumers address Y by assignment slot). */
+     * consumers address Y by assignment slot).
+     * p5c: a producer-emitted token-compact buffer replaces even the
+     * compact quantize — same layout by construction (ib = kseg*n_tokens
+     * + row), so the p5b indirection consumes it unchanged. */
     const bool moe_yind = direct_gateup_q8 && moe_yind_enabled();
+    const void *input_q8_ext = nullptr;
+    if (moe_yind && fused_down && fused_down->input_q8_ext) {
+        const size_t ext_need =
+            (size_t)n_tokens * (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+        if (fused_down->input_q8_ext_bytes >= ext_need) {
+            input_q8_ext = fused_down->input_q8_ext;
+        }
+    }
+    if (input_q8_ext) {
+        src1_q8_1 = (char *)const_cast<void *>(input_q8_ext);
+        static bool ext_logged = false;
+        if (!ext_logged) {
+            ext_logged = true;
+            fprintf(stderr, "ds4: moe gateup consuming producer q8 "
+                    "(flat-pool p5c, first n_tokens=%d)\n", n_tokens);
+        }
+    }
     const int64_t quant_rows = moe_yind ? (int64_t)n_tokens : ne_get_rows;
-    {
+    if (!input_q8_ext) {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/input_quant_q8_1",
                 ds4_mmq_nvtx_payload((uint32_t)quant_rows, (uint32_t)K),
@@ -1793,6 +1851,8 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         0,
         nullptr,
         0,
+        nullptr,
+        0,
     };
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
         "ds4_mmq_iq2_xxs_q2_K_moe_fused_soa",
@@ -1815,7 +1875,9 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         const float * X, const int32_t * ids, const float * router_weights,
         void * input_q8_scratch, size_t input_q8_scratch_bytes,
         void * down_q8_scratch, size_t down_q8_scratch_bytes,
-        void * work_scratch, size_t work_scratch_bytes, float * down,
+        void * work_scratch, size_t work_scratch_bytes,
+        const void * input_q8_ext, size_t input_q8_ext_bytes,
+        float * down,
         int expert_mid_dim, int expert_in_dim, int out_dim,
         int n_tokens, int n_experts, int n_expert_used,
         float clamp, cudaStream_t stream) {
@@ -1868,6 +1930,8 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         down_q8_scratch_bytes,
         work_scratch,
         work_scratch_bytes,
+        input_q8_ext,
+        input_q8_ext_bytes,
     };
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
         "ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa",

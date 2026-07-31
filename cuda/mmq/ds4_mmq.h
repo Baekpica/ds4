@@ -112,6 +112,21 @@ int ds4_mmq_q8_0_dense_d2r(
     int           K,
     cudaStream_t  stream);
 
+// flat-pool p5c: D2R dense over a producer-quantized token-major Y
+// (block_q8_1_mmq D4, ib = kseg*N + row, requires GGML_PAD(K) == K).
+// y_bytes must cover the payload plus max(mmq_x_max, 128) slack blocks;
+// the slack is zeroed here each call (S1.1a).  Returns 0 on success;
+// callers fall back to the quantizing entry on any non-zero.
+int ds4_mmq_q8_0_dense_d2r_preq(
+    const void  * W_aligned,
+    const void  * Y_q8_mmq,
+    size_t        y_bytes,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 int ds4_mmq_q2_K_dense(
     const void  * W_q2_K,
     const float * X_f32,
@@ -309,6 +324,11 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
  * of stream-ordered allocations; all three ranges must be distinct, remain
  * live until return, and be sized to their LOGICAL segments (never an owning
  * arena's capacity). */
+/* flat-pool p5c: input_q8_ext, when non-NULL, is a producer-emitted
+ * TOKEN-COMPACT block_q8_1_mmq buffer of X (ib = kseg*n_tokens + row,
+ * n_tokens rows) and the internal activation quantize is skipped; the
+ * gate/up D2R kernel reads it through the p5b ids_src indirection.
+ * Ignored (classic gathered quantize) when DS4_MMQ_NO_YIND is set. */
 int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
     const void    * W_gate_soa,
     const void    * W_up_soa,
@@ -322,6 +342,8 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
     size_t          down_q8_scratch_bytes,
     void          * work_scratch,
     size_t          work_scratch_bytes,
+    const void    * input_q8_ext,
+    size_t          input_q8_ext_bytes,
     float         * down_f32,
     int             expert_mid_dim,
     int             expert_in_dim,
