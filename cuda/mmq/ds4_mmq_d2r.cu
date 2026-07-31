@@ -416,22 +416,31 @@ __device__ __forceinline__ void issue_q8_prefetch_fast(
     cp_async_commit();
 }
 
+/* flat-pool p5b: the column's Y row byte offset arrives as a per-thread
+ * scalar (y_off) instead of being derived from the column slot.  col_local
+ * is trip-invariant across the unrolled cp.async issue trips (kThreads is a
+ * multiple of every fused TileN), so one register carries the offset for
+ * the whole mainloop.  Identity staging (Y row == assignment slot) passes
+ * col_local * sizeof(block_q8_1_mmq) and compiles to the pre-p5b address
+ * math; indirect staging passes ids_src[col] * sizeof(block_q8_1_mmq)
+ * against a token-compact buffer. */
 template <bool FullTile, int NFrag>
 __device__ __forceinline__ void issue_fused_q8_prefetch_one(
         block_q8_1_mmq (&s_q8)[kStages][NFrag][8],
         const char * __restrict__ q8_iter_base,
-        int col_count, int stage, int t) {
+        uint32_t y_off, int col_count, int stage, int t) {
     constexpr int TileN = NFrag * 8;
     static_assert(TileN == 8 || TileN == 16 || TileN == 32,
                   "unsupported fused D2R tile width");
+    static_assert(kThreads % TileN == 0,
+                  "fused q8 y_off expects trip-invariant col_local");
     const int col_local = t & (TileN - 1);
     const int chunk = t / TileN;
     const int nf = col_local >> 3;
     const int c = col_local & 7;
     const bool valid = FullTile ? true : (col_local < col_count);
     void *dst = (char *)&s_q8[stage][nf][c] + chunk * 16;
-    const void *src = q8_iter_base +
-                      (uint64_t)col_local * sizeof(block_q8_1_mmq) + chunk * 16;
+    const void *src = q8_iter_base + (uint64_t)y_off + chunk * 16;
     cp_async_16B(dst, src, valid);
 }
 
@@ -439,20 +448,20 @@ template <bool FullTile, int NFrag, int Iter>
 __device__ __forceinline__ void issue_fused_q8_prefetch_unrolled(
         block_q8_1_mmq (&s_q8)[kStages][NFrag][8],
         const char * __restrict__ q8_iter_base,
-        int col_count, int stage, int tid) {
+        uint32_t y_off, int col_count, int stage, int tid) {
     constexpr int Items = NFrag * 8 * 9;
     constexpr int Trips = (Items + kThreads - 1) / kThreads;
     if constexpr (Iter < Trips) {
         const int t = tid + Iter * kThreads;
         if constexpr ((Iter + 1) * kThreads <= Items) {
             issue_fused_q8_prefetch_one<FullTile, NFrag>(
-                s_q8, q8_iter_base, col_count, stage, t);
+                s_q8, q8_iter_base, y_off, col_count, stage, t);
         } else if (t < Items) {
             issue_fused_q8_prefetch_one<FullTile, NFrag>(
-                s_q8, q8_iter_base, col_count, stage, t);
+                s_q8, q8_iter_base, y_off, col_count, stage, t);
         }
         issue_fused_q8_prefetch_unrolled<FullTile, NFrag, Iter + 1>(
-            s_q8, q8_iter_base, col_count, stage, tid);
+            s_q8, q8_iter_base, y_off, col_count, stage, tid);
     }
 }
 
@@ -460,15 +469,27 @@ template <bool FullTile, int NFrag>
 __device__ __forceinline__ void issue_fused_q8_prefetch(
         block_q8_1_mmq (&s_q8)[kStages][NFrag][8],
         const volatile SmemInvariants &s_inv,
-        int stage, int k128_iter) {
+        uint32_t y_off, int stage, int k128_iter) {
     constexpr int TileN = NFrag * 8;
     const char *q8_iter_base =
         s_inv.q8_tile_base +
         (uint64_t)k128_iter * (uint64_t)s_inv.q8_k128_stride_bytes;
     const int col_count = FullTile ? TileN : s_inv.col_count;
     issue_fused_q8_prefetch_unrolled<FullTile, NFrag, 0>(
-        s_q8, q8_iter_base, col_count, stage, d2r_tid());
+        s_q8, q8_iter_base, y_off, col_count, stage, d2r_tid());
     cp_async_commit();
+}
+
+/* Identity-staged entry (Q2_K down tail tiles keep slot == Y row). */
+template <bool FullTile, int NFrag>
+__device__ __forceinline__ void issue_fused_q8_prefetch(
+        block_q8_1_mmq (&s_q8)[kStages][NFrag][8],
+        const volatile SmemInvariants &s_inv,
+        int stage, int k128_iter) {
+    constexpr int TileN = NFrag * 8;
+    const uint32_t y_off = (uint32_t)(d2r_tid() & (TileN - 1)) *
+                           (uint32_t)sizeof(block_q8_1_mmq);
+    issue_fused_q8_prefetch<FullTile, NFrag>(s_q8, s_inv, y_off, stage, k128_iter);
 }
 
 struct Q8ColFixF32 {
@@ -1353,12 +1374,13 @@ template <bool FullTile, int TileN,
 __device__ __forceinline__ void iq2_gateup_fused_mainloop(
         float (&gate_acc)[TileN / 8][TileC::ne],
         float (&up_acc)[TileN / 8][TileC::ne],
-        FusedGateUpComputeSmem<TileN> &s) {
+        FusedGateUpComputeSmem<TileN> &s,
+        uint32_t y_off) {
     const int k128_iters = s.inv[0].k128_iters;
     const int k256_iters = s.inv[0].nb;
 
-    issue_fused_q8_prefetch<FullTile>(s.q8, s.inv[0], 0, 0);
-    issue_fused_q8_prefetch<FullTile>(s.q8, s.inv[0], 1, 1);
+    issue_fused_q8_prefetch<FullTile>(s.q8, s.inv[0], y_off, 0, 0);
+    issue_fused_q8_prefetch<FullTile>(s.q8, s.inv[0], y_off, 1, 1);
     issue_fused_iq2_raw_prefetch<FullTile>(s.raw[0], s.inv[0], 0, 0);
     issue_fused_iq2_raw_prefetch<FullTile>(s.raw[1], s.inv[1], 0, 0);
     cp_async_wait_keep(0);
@@ -1384,7 +1406,7 @@ __device__ __forceinline__ void iq2_gateup_fused_mainloop(
         const int next_even_k128 = even_k128 + 2;
         if (next_even_k128 < k128_iters) {
             issue_fused_q8_prefetch<FullTile>(
-                s.q8, s.inv[0], d2r_q8_stage(next_even_k128), next_even_k128);
+                s.q8, s.inv[0], y_off, d2r_q8_stage(next_even_k128), next_even_k128);
         }
 
         const int odd_k128 = even_k128 + 1;
@@ -1397,7 +1419,7 @@ __device__ __forceinline__ void iq2_gateup_fused_mainloop(
         const int next_odd_k128 = odd_k128 + 2;
         if (next_odd_k128 < k128_iters) {
             issue_fused_q8_prefetch<FullTile>(
-                s.q8, s.inv[0], d2r_q8_stage(next_odd_k128), next_odd_k128);
+                s.q8, s.inv[0], y_off, d2r_q8_stage(next_odd_k128), next_odd_k128);
         }
 
         if (next_k256 < k256_iters) {
@@ -2497,13 +2519,14 @@ void gateup_iq2_swiglu_q8_d2r_kernel(
         const void * __restrict__ gate_soa,
         const void * __restrict__ up_soa,
         const block_q8_1_mmq * __restrict__ input_q8,
+        const int32_t * __restrict__ ids_src,
         const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds,
         const float * __restrict__ router_weights,
         const int * __restrict__ work,
         const int * __restrict__ n_items_ptr,
         block_q8_1_mmq * __restrict__ down_q8,
-        int M, int K, int n_assign, int E, float clamp) {
+        int M, int K, int n_assign, int n_tokens, int E, float clamp) {
 #if defined(TURING_MMA_AVAILABLE)
     const int n_items = *n_items_ptr;
     if ((int)blockIdx.y >= n_items) {
@@ -2559,13 +2582,19 @@ void gateup_iq2_swiglu_q8_d2r_kernel(
             s.inv[leg].iq2_dq_base = reinterpret_cast<const half *>(weights[leg]);
             s.inv[leg].iq2_qs_base = reinterpret_cast<const uint2 *>(
                 reinterpret_cast<const char *>(weights[leg]) + dq_bytes);
+            /* p5b: with ids_src the input Q8 buffer is token-compact
+             * (quantized once per token, n_tokens row stride) and the
+             * column -> row map rides the per-thread y_off below; the
+             * slot-gathered form keeps the column offset in the base. */
             s.inv[leg].q8_tile_base = reinterpret_cast<const char *>(input_q8) +
-                                      (uint64_t)col_lo * sizeof(block_q8_1_mmq);
+                                      (ids_src ? 0ull
+                                               : (uint64_t)col_lo * sizeof(block_q8_1_mmq));
             s.inv[leg].out = nullptr;
             s.inv[leg].sc_off_bytes = 0;
             s.inv[leg].qs_off_bytes = 0;
             s.inv[leg].q8_k128_stride_bytes =
-                (uint32_t)((uint64_t)n_assign * sizeof(block_q8_1_mmq));
+                (uint32_t)((uint64_t)(ids_src ? n_tokens : n_assign) *
+                           sizeof(block_q8_1_mmq));
             s.inv[leg].nb = nb;
             s.inv[leg].k128_iters = K >> 7;
             s.inv[leg].M = M;
@@ -2585,16 +2614,29 @@ void gateup_iq2_swiglu_q8_d2r_kernel(
         const int pair = ids_dst[col_lo + tid];
         s_route_weight[tid] = router_weights[pair];
     }
+    /* p5b: per-thread Y row byte offset (see issue_fused_q8_prefetch_one).
+     * Out-of-segment columns are cp.async-predicated off, so their map
+     * entry is never read; clamp to 0 to keep the ids_src load in range. */
+    const int y_col_local = tid & (TileN - 1);
+    uint32_t y_off;
+    if (ids_src) {
+        y_off = (y_col_local < col_count)
+            ? (uint32_t)ids_src[col_lo + y_col_local] *
+              (uint32_t)sizeof(block_q8_1_mmq)
+            : 0u;
+    } else {
+        y_off = (uint32_t)y_col_local * (uint32_t)sizeof(block_q8_1_mmq);
+    }
     __syncthreads();
 
     float gate_acc[NFrag][tile_C::ne] = {};
     float up_acc[NFrag][tile_C::ne] = {};
     if (full_tile) {
         iq2_gateup_fused_mainloop<true, TileN, tile_A, tile_B, tile_C>(
-            gate_acc, up_acc, s);
+            gate_acc, up_acc, s, y_off);
     } else {
         iq2_gateup_fused_mainloop<false, TileN, tile_A, tile_B, tile_C>(
-            gate_acc, up_acc, s);
+            gate_acc, up_acc, s, y_off);
     }
 
     /* The MMA rings are dead now. Reuse the same shared allocation as a
@@ -2662,6 +2704,7 @@ void gateup_iq2_swiglu_q8_d2r_kernel(
     (void)gate_soa;
     (void)up_soa;
     (void)input_q8;
+    (void)ids_src;
     (void)ids_dst;
     (void)expert_bounds;
     (void)router_weights;
@@ -2671,6 +2714,7 @@ void gateup_iq2_swiglu_q8_d2r_kernel(
     (void)M;
     (void)K;
     (void)n_assign;
+    (void)n_tokens;
     (void)E;
     (void)clamp;
 #endif
@@ -2892,6 +2936,8 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         const void *up_soa,
         int64_t soa_blocks,
         const void *input_q8,
+        const int32_t *ids_src,
+        int n_tokens,
         const int32_t *ids_dst,
         const int32_t *expert_bounds,
         const float *router_weights,
@@ -2914,6 +2960,11 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
         !router_weights || !down_q8 || !worklist_scratch ||
         M <= 0 || M % kMTile != 0 || K <= 0 || K % 256 != 0 ||
         ne_get_rows <= 0 || ne_get_rows > INT_MAX || n_experts <= 0) {
+        return -1;
+    }
+    /* p5b: ids_src selects the token-compact input layout; the compact row
+     * count must cover every map entry (entries are token indices). */
+    if (ids_src && (n_tokens <= 0 || (int64_t)n_tokens > ne_get_rows)) {
         return -1;
     }
 
@@ -2962,9 +3013,9 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
     gateup_iq2_swiglu_q8_d2r_kernel<32, kFusedNTile><<<grid, block, 0, stream>>>(
         gate_soa, up_soa,
         (const block_q8_1_mmq *)input_q8,
-        ids_dst, expert_bounds, router_weights, work, n_items,
+        ids_src, ids_dst, expert_bounds, router_weights, work, n_items,
         (block_q8_1_mmq *)down_q8,
-        M, K, (int)ne_get_rows, n_experts, clamp);
+        M, K, (int)ne_get_rows, ids_src ? n_tokens : 0, n_experts, clamp);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: main kernel launch failed: %s\n",

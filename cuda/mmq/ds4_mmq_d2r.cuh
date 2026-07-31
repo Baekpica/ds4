@@ -65,11 +65,18 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
 // Complete target-prefill gate/up path: both IQ2_XXS projections share one
 // activation tile, then sanitize + clamp + SwiGLU + routing weight are folded
 // directly into the expert-major Q8_1 D2S6 input consumed by Q2_K down.
+//
+// flat-pool p5b: with ids_src != NULL, input_q8 is TOKEN-COMPACT (n_tokens
+// rows quantized once, no gather) and each assignment column stages its
+// token's row through ids_src[col]; with ids_src == NULL, input_q8 is the
+// classic slot-gathered buffer (ne_get_rows rows) and n_tokens is ignored.
 int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
     const void    * gate_soa,
     const void    * up_soa,
     int64_t         soa_blocks,
     const void    * input_q8,
+    const int32_t * ids_src,
+    int             n_tokens,
     const int32_t * ids_dst,
     const int32_t * expert_bounds,
     const float   * router_weights,

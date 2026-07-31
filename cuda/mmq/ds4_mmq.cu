@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstring>
 
 #if defined(__has_include)
 #if __has_include(<nvtx3/nvToolsExt.h>)
@@ -225,6 +226,34 @@ static void ybuf_memset(void *ptr, size_t bytes, cudaStream_t stream) {
     const int mode = ybuf_memset_mode();
     if (mode == 0 || ptr == NULL || bytes == 0) return;
     (void)cudaMemsetAsync(ptr, mode == 1 ? 0 : 0xFF, bytes, stream);
+}
+
+/* flat-pool p5b: the direct fused gate/up path stages its input Q8 through
+ * the ids_src1 column->token map inside the D2R kernel, so the activation
+ * quantize runs once per TOKEN (n_tokens rows) instead of once per
+ * assignment slot (n_tokens * top-k rows and bytes).  Bit-identical by
+ * construction: the quantize is row-local, so a gathered slot for token t
+ * holds exactly the bytes of compact row t; the kernel consumes the same
+ * blocks in the same tile order through the indirection.  DS4_MMQ_NO_YIND
+ * restores the slot-gathered quantize; DS4_MMQ_YIND_VERIFY byte-compares
+ * the two buffers in situ (expect bad=0). */
+static int moe_yind_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_MMQ_NO_YIND") == NULL ? 1 : 0;
+        if (!cached) {
+            fprintf(stderr, "ds4: DS4_MMQ_NO_YIND - moe gate/up y-indirect staging disabled\n");
+        }
+    }
+    return cached;
+}
+
+static int moe_yind_verify_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_MMQ_YIND_VERIFY") != NULL ? 1 : 0;
+    }
+    return cached;
 }
 
 static int64_t d2r_min_cols() {
@@ -1271,16 +1300,21 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s11_src = (int64_t)K;
     const int64_t s12_src = (int64_t)K * ne11;
     const int64_t s13_src = (int64_t)K * ne11 * ne12;
+    /* p5b: token-compact input quantize on the direct fused path (the
+     * materialized paths below keep the slot-gathered form: their pair/mmq
+     * consumers address Y by assignment slot). */
+    const bool moe_yind = direct_gateup_q8 && moe_yind_enabled();
+    const int64_t quant_rows = moe_yind ? (int64_t)n_tokens : ne_get_rows;
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/input_quant_q8_1",
-                ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
+                ds4_mmq_nvtx_payload((uint32_t)quant_rows, (uint32_t)K),
                 nvtx_prefill);
         ybuf_memset(src1_q8_1, nbytes_src1_q8_1, stream);
         quantize_mmq_q8_1_cuda(
-            X_f32, ids_src1, (void *)src1_q8_1,
+            X_f32, moe_yind ? nullptr : ids_src1, (void *)src1_q8_1,
             type, /*ne00=*/K, s11_src, s12_src, s13_src,
-            /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
+            /*ne0=*/ne10_padded, /*ne1=*/quant_rows, /*ne2=*/1, /*ne3=*/1,
             stream);
 
         err = cudaGetLastError();
@@ -1291,6 +1325,61 @@ int ds4_mmq_moe_pair_impl(
     }
 
     if (direct_gateup_q8) {
+        if (moe_yind) {
+            static bool yind_logged = false;
+            if (!yind_logged) {
+                yind_logged = true;
+                fprintf(stderr, "ds4: moe gateup y-indirect q8 staging engage "
+                        "(flat-pool p5b, first n_tokens=%d n_assign=%lld)\n",
+                        n_tokens, (long long)ne_get_rows);
+            }
+        }
+        if (moe_yind && moe_yind_verify_enabled()) {
+            /* In-situ byte-diff (p5a VERIFY pattern): run the slot-gathered
+             * reference quantize into a temp buffer and compare every
+             * assignment slot's blocks against the token-compact buffer
+             * through ids_src1.  Instrument only - synchronous. */
+            const size_t blk = sizeof(block_q8_1_mmq);
+            const int nkseg = (int)(ne10_padded / (4 * QK8_1));
+            const size_t ref_payload = (size_t)nkseg * (size_t)ne_get_rows * blk;
+            const size_t cmp_payload = (size_t)nkseg * (size_t)n_tokens * blk;
+            char *ref = nullptr;
+            if (cudaMalloc((void **)&ref, ref_payload) == cudaSuccess) {
+                quantize_mmq_q8_1_cuda(
+                    X_f32, ids_src1, (void *)ref,
+                    type, K, s11_src, s12_src, s13_src,
+                    ne10_padded, ne_get_rows, 1, 1, stream);
+                char *h_ref = (char *)malloc(ref_payload);
+                char *h_cmp = (char *)malloc(cmp_payload);
+                int32_t *h_ids = (int32_t *)malloc((size_t)ne_get_rows * sizeof(int32_t));
+                if (h_ref && h_cmp && h_ids) {
+                    cudaMemcpyAsync(h_ref, ref, ref_payload, cudaMemcpyDeviceToHost, stream);
+                    cudaMemcpyAsync(h_cmp, src1_q8_1, cmp_payload, cudaMemcpyDeviceToHost, stream);
+                    cudaMemcpyAsync(h_ids, ids_src1, (size_t)ne_get_rows * sizeof(int32_t),
+                                    cudaMemcpyDeviceToHost, stream);
+                    cudaStreamSynchronize(stream);
+                    long long bad = 0;
+                    long long first_slot = -1, first_kseg = -1;
+                    for (int ks = 0; ks < nkseg; ++ks) {
+                        for (int64_t slot = 0; slot < ne_get_rows; ++slot) {
+                            const char *a = h_ref + ((size_t)ks * (size_t)ne_get_rows + (size_t)slot) * blk;
+                            const char *b = h_cmp + ((size_t)ks * (size_t)n_tokens + (size_t)h_ids[slot]) * blk;
+                            if (memcmp(a, b, blk) != 0) {
+                                if (first_slot < 0) { first_slot = slot; first_kseg = ks; }
+                                ++bad;
+                            }
+                        }
+                    }
+                    fprintf(stderr, "ds4: moe yind VERIFY n_tokens=%d n_assign=%lld ksegs=%d "
+                            "bad=%lld/%lld first_slot=%lld first_kseg=%lld\n",
+                            n_tokens, (long long)ne_get_rows, nkseg,
+                            bad, (long long)nkseg * (long long)ne_get_rows,
+                            first_slot, first_kseg);
+                }
+                free(h_ref); free(h_cmp); free(h_ids);
+                cudaFree(ref);
+            }
+        }
         ybuf_memset(fused_down->q8_scratch, direct_down_q8_bytes, stream);
         const size_t gateup_work_bytes =
             ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
@@ -1305,7 +1394,10 @@ int ds4_mmq_moe_pair_impl(
                     nvtx_prefill);
             const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
                     xa_soa, xb_soa, soa_blocks,
-                    src1_q8_1, ids_dst, expert_bounds,
+                    src1_q8_1,
+                    moe_yind ? ids_src1 : nullptr,
+                    moe_yind ? n_tokens : 0,
+                    ids_dst, expert_bounds,
                     fused_down->router_weights, fused_down->q8_scratch,
                     M, K, ne_get_rows, n_experts, fused_down->clamp,
                     direct_work, gateup_work_bytes, stream);
