@@ -19,6 +19,19 @@
 #       BYTE-IDENTICAL (serial decode is deterministic; this is the
 #       payload-integrity leg -- cont generations are not run-to-run
 #       deterministic and are never byte-compared here).
+#   P9  (v0.5.1 inc3a) DIVERGENT cross-boot replay: turn 2 whose
+#       assistant turn is TRUNCATED (the field shape: a length-limited
+#       turn re-rendered with its close marker never byte-prefix-matches
+#       its record again).  Control boot (DS4_SERVER_DISK_PARTIAL=0)
+#       must silently cold-prefill (0 restore lines = the pre-fix
+#       behavior); the default boot must serve a PARTIAL disk restore
+#       ('bank restore admit ... partial=1' + partial fork/truncate
+#       admit), needle exact through the cut tensors.
+#   P10 (v0.5.1 inc3b) checkpoint-at-retire + crash durability: a fresh
+#       deep trunk's retire persists reason=bank-checkpoint WITHOUT any
+#       evict; a short turn 2 must NOT re-persist (pacing); kill -9 (no
+#       graceful persist) then reboot must disk-restore the checkpoint
+#       and answer the needle.
 #
 # PASS = all of the above + 0 illegal / 0 'continuous batch failed' /
 # 0 'prompt start' / 0 'cont admit rejected' across every cont segment.
@@ -58,6 +71,29 @@ kill_server(){
   ssh "$R" "pkill -x ds4-server; sleep 2; pkill -9 -x ds4-server 2>/dev/null; rm -f /tmp/ds4.lock; exit 0"
 }
 
+# SIGKILL only -- no SIGTERM first, so nothing gets a graceful shutdown
+# persist.  P9 uses it to keep control/fix legs from contaminating the store;
+# P10 uses it as the crash under test.
+kill9_server(){
+  ssh "$R" "pkill -9 -x ds4-server 2>/dev/null; sleep 1; rm -f /tmp/ds4.lock; exit 0"
+}
+
+# Boot-time memory guard (standing law).  Back-to-back boots race the dying
+# server's reclaim: the session-graph fit check at request time sees the
+# shortfall and refuses (observed twice as a "transient" P8 serial failure --
+# 8837 MiB allocatable vs ~9098 needed while the previous leg's pages
+# drained).  MemAvailable recovers within seconds of the old server's exit,
+# so waiting here removes the flake class entirely.
+wait_mem(){ # $1=min MemAvailable GiB
+  local n=0 got=0
+  while :; do
+    got=$(ssh "$R" "awk '/MemAvailable/{print int(\$2/1048576)}' /proc/meminfo" 2>/dev/null)
+    [ -n "$got" ] && [ "$got" -ge "$1" ] && return 0
+    n=$((n+1)); [ $n -ge 36 ] && fail "MemAvailable ${got:-?}G never reached ${1}G"
+    sleep 5
+  done
+}
+
 graceful_stop(){
   ssh "$R" "pkill -x ds4-server"          # SIGTERM: drains, then shutdown persists
   local n=0
@@ -67,13 +103,15 @@ graceful_stop(){
   done
 }
 
-boot_cont(){ # $1=fresh_kvdir(0/1)
+boot_cont(){ # $1=fresh_kvdir(0/1) $2=extra env assignments (optional)
   kill_server
+  wait_mem 100
   ssh "$R" "$([ "$1" = 1 ] && echo "rm -rf $KVDIR;") mkdir -p $KVDIR; : > $SRV; cd $RT; env \
       DS4_CUDA_NO_HBM_CACHE=1 \
       DS4_BATCH_FIT_HEADROOM_MB=$HEADROOM_MB DS4_SERVER_COALESCE_MAX=2 \
       DS4_CONT_PREFILL_CHUNK=2048 DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1 \
       DS4_DSPARK_MODEL=$DRAFTER DS4_CONT_CAPTURE=1 DS4_SERVER_DEFAULT_TEMP=0 \
+      ${2:-} \
       setsid nohup ./ds4-server -m $BASE ${MTP:+--mtp} ${MTP:---no-mtp} --cuda -c $CTX --port $PORT \
       --kv-disk-dir $KVDIR --kv-disk-space-mb 20000 \
       > $SRV 2>&1 < /dev/null & exit 0"
@@ -226,6 +264,7 @@ ssh "$R" "rm -rf ${KVDIR}.bak; cp -a $KVDIR ${KVDIR}.bak"
 for leg in s1 s2; do
   ssh "$R" "rm -rf $KVDIR; cp -a ${KVDIR}.bak $KVDIR"
   kill_server
+  wait_mem 100
   ssh "$R" ": > /tmp/bp_${leg}.log; cd $RT && (env DS4_SERVER_CONTINUOUS=0 DS4_SERVER_DEFAULT_TEMP=0 \
       setsid nohup ./ds4-server -m $BASE --no-mtp --cuda -c $CTX --port $PORT \
       --kv-disk-dir $KVDIR --kv-disk-space-mb 20000 \
@@ -253,6 +292,110 @@ done
 cmp -s "$OUT/serial_s1.txt" "$OUT/serial_s2.txt" \
   || fail "P8: serial restored continuations differ (payload integrity)"
 grep -q "$NEEDLE_CODE" "$OUT/serial_s1.txt" || fail "P8: serial needle miss"
+kill_server
+
+log "P9: divergent cross-boot replay (v0.5.1 inc3a)"
+# The field shape: the assistant turn is TRUNCATED mid-sentence, so the next
+# prompt's re-render (which closes the turn) diverges from every stored
+# record before its end -- the exact byte-prefix lookup can never hit.
+python3 - "$OUT/trunk.json" "$OUT/trunk_result.json" "$OUT/turn2_div.json" <<'EOF' || fail "P9 divergent payload build"
+import json, sys
+b = json.load(open(sys.argv[1]))
+r = json.load(open(sys.argv[2]))
+cutlen = max(1, (len(r["text"]) * 3) // 5)      # keep 60%, cut mid-sentence
+b["messages"].append({"role": "assistant", "content": r["text"][:cutlen]})
+b["messages"].append({"role": "user", "content":
+    "State the keystone code once more, exactly, then describe in one "
+    "sentence where in the archive it appeared."})
+b["max_tokens"] = 96
+json.dump(b, open(sys.argv[3], "w"))
+EOF
+
+# P9a CONTROL (DS4_SERVER_DISK_PARTIAL=0): must silently cold-prefill --
+# zero restore lines is exactly the pre-fix field behavior.
+ssh "$R" "rm -rf $KVDIR; cp -a ${KVDIR}.bak $KVDIR"
+boot_cont 0 "DS4_SERVER_DISK_PARTIAL=0"
+OFF=$(ssh "$R" "wc -l < $SRV")
+python3 "$HERE/sse_probe_client.py" "$OUT/turn2_div.json" "$URL" P9CTRL > "$OUT/p9ctrl.out" 2>&1 \
+  || fail "P9a client"
+cat "$OUT/p9ctrl.out" | tee -a "$DRV"
+ssh "$R" "tail -n +$((OFF+1)) $SRV" > "$OUT/seg_p9a.log"
+cont_health "$OUT/seg_p9a.log" "P9a"
+[ "$(grep -ac 'bank restore admit' "$OUT/seg_p9a.log")" -eq 0 ] \
+  || fail "P9a: control restored from disk with the kill switch set"
+grep -q "$NEEDLE_CODE" "$OUT/p9ctrl.out" || fail "P9a needle miss (cold control)"
+kill9_server
+
+# P9b FIX: partial disk restore + partial admit through the cut.
+ssh "$R" "rm -rf $KVDIR; cp -a ${KVDIR}.bak $KVDIR"
+boot_cont 0
+OFF=$(ssh "$R" "wc -l < $SRV")
+python3 "$HERE/sse_probe_client.py" "$OUT/turn2_div.json" "$URL" P9FIX > "$OUT/p9fix.out" 2>&1 \
+  || fail "P9b client"
+cat "$OUT/p9fix.out" | tee -a "$DRV"
+ssh "$R" "tail -n +$((OFF+1)) $SRV" > "$OUT/seg_p9b.log"
+cont_health "$OUT/seg_p9b.log" "P9b"
+grep -aq 'bank restore admit.*partial=1' "$OUT/seg_p9b.log" \
+  || fail "P9b: no partial disk restore line"
+grep -aqE 'partial (fork|truncate) admit' "$OUT/seg_p9b.log" \
+  || fail "P9b: restored record did not serve a partial admit"
+grep -q "$NEEDLE_CODE" "$OUT/p9fix.out" || fail "P9b needle miss THROUGH CUT TENSORS"
+TTFT=$(grep -oE 'ttft=[0-9.]+' "$OUT/p9fix.out" | head -1 | cut -d= -f2)
+python3 -c "import sys; sys.exit(0 if float('$TTFT') < 120.0 else 1)" \
+  || fail "P9b TTFT ${TTFT}s not restore-class"
+log "P9: control cold, fix partial-restored (ttft=${TTFT}s), needle exact both"
+kill9_server
+
+log "P10: checkpoint-at-retire + kill -9 crash durability (v0.5.1 inc3b)"
+boot_cont 1                              # clean store: nothing pre-persisted
+OFF=$(ssh "$R" "wc -l < $SRV")
+python3 "$HERE/sse_probe_client.py" "$OUT/trunk.json" "$URL" P10TRUNK "$OUT/p10_result.json" \
+  > "$OUT/p10trunk.out" 2>&1 || fail "P10 trunk client"
+grep -q "$NEEDLE_CODE" "$OUT/p10trunk.out" || fail "P10 trunk needle miss"
+ssh "$R" "tail -n +$((OFF+1)) $SRV" > "$OUT/seg_p10a.log"
+cont_health "$OUT/seg_p10a.log" "P10a"
+NCKPT=$(grep -ac 'bank persisted.*reason=bank-checkpoint' "$OUT/seg_p10a.log")
+[ "$NCKPT" -eq 1 ] || fail "P10: expected exactly 1 checkpoint persist at retire, got $NCKPT"
+# Short turn 2 (same conversation, from THIS run's answer -- cont decode is
+# not run-to-run deterministic): grows the bank by ~100 tokens, far below the
+# continued interval, so its retire must NOT re-persist.
+python3 - "$OUT/trunk.json" "$OUT/p10_result.json" "$OUT/p10_turn2.json" <<'EOF' || fail "P10 turn2 build"
+import json, sys
+b = json.load(open(sys.argv[1]))
+r = json.load(open(sys.argv[2]))
+b["messages"].append({"role": "assistant", "content": r["text"]})
+b["messages"].append({"role": "user", "content":
+    "State the keystone code once more, exactly, then describe in one "
+    "sentence where in the archive it appeared."})
+b["max_tokens"] = 96
+json.dump(b, open(sys.argv[3], "w"))
+EOF
+python3 "$HERE/sse_probe_client.py" "$OUT/p10_turn2.json" "$URL" P10T2 > "$OUT/p10t2.out" 2>&1 \
+  || fail "P10 turn2 client"
+grep -q "$NEEDLE_CODE" "$OUT/p10t2.out" || fail "P10 turn2 needle miss (pre-crash)"
+ssh "$R" "tail -n +$((OFF+1)) $SRV" > "$OUT/seg_p10b.log"
+cont_health "$OUT/seg_p10b.log" "P10b"
+NCKPT=$(grep -ac 'bank persisted.*reason=bank-checkpoint' "$OUT/seg_p10b.log")
+[ "$NCKPT" -eq 1 ] || fail "P10: pacing broken -- checkpoint count $NCKPT after short turn 2 (want 1)"
+
+log "P10: kill -9 (crash: no graceful persist) then reboot + replay"
+kill9_server
+boot_cont 0
+OFF=$(ssh "$R" "wc -l < $SRV")
+python3 "$HERE/sse_probe_client.py" "$OUT/p10_turn2.json" "$URL" P10CRASH > "$OUT/p10crash.out" 2>&1 \
+  || fail "P10 post-crash client"
+cat "$OUT/p10crash.out" | tee -a "$DRV"
+ssh "$R" "tail -n +$((OFF+1)) $SRV" > "$OUT/seg_p10c.log"
+cont_health "$OUT/seg_p10c.log" "P10c"
+grep -aq 'bank restore admit' "$OUT/seg_p10c.log" \
+  || fail "P10: crash checkpoint did not restore (retire never became durable)"
+grep -aqE 'warm admit bank=[0-9]+ cached=[0-9]{4,}' "$OUT/seg_p10c.log" \
+  || fail "P10: restored checkpoint did not serve a warm admit"
+grep -q "$NEEDLE_CODE" "$OUT/p10crash.out" || fail "P10 needle miss through crash-restored tensors"
+TTFT=$(grep -oE 'ttft=[0-9.]+' "$OUT/p10crash.out" | head -1 | cut -d= -f2)
+python3 -c "import sys; sys.exit(0 if float('$TTFT') < 120.0 else 1)" \
+  || fail "P10 TTFT ${TTFT}s not restore-class"
+log "P10: checkpoint survived kill -9, restored warm (ttft=${TTFT}s), needle exact"
 kill_server
 
 log "BANK-PERSIST GATE: ALL PHASES PASS"

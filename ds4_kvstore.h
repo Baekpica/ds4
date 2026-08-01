@@ -31,6 +31,12 @@ typedef enum {
      * with a serial session checkpoint. */
     DS4_KVSTORE_REASON_BANK_EVICT    = 7,
     DS4_KVSTORE_REASON_BANK_SHUTDOWN = 8,
+    /* v0.5.1 warm-admit checkpointing: a pin-tier bank's PACED periodic
+     * persist at retire (the bank keeps serving; nothing was destroyed).
+     * Without it the most-reused agentic trunks -- the ones that never
+     * evict -- were the least durable: a crash lost everything since the
+     * last foreign admit. */
+    DS4_KVSTORE_REASON_BANK_CHECKPOINT = 9,
 } ds4_kvstore_reason;
 
 typedef enum {
@@ -165,6 +171,18 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
+/* v0.5.1: the disk twin of the server's P1 partial ranking -- best stored
+ * record by byte-LCP against the prompt (>= min_lcp, and the salvage must
+ * cover at least 1/8 of the record so a near-useless deep record never pays
+ * a full payload restore).  Returns the entry index and the LCP, or -1. */
+int ds4_kvstore_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
+                              int model_id, int quant_bits, int ctx_size,
+                              size_t min_lcp, size_t *lcp_out);
+/* v0.5.1: paced bank re-persist decision -- true when committed history has
+ * grown one aligned continued-interval past the last stored length
+ * (stored_tokens = 0 means never stored). */
+int ds4_kvstore_bank_checkpoint_due(const ds4_kvstore *kc, int committed,
+                                    int stored_tokens);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
@@ -200,6 +218,17 @@ int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
                                       const char *prompt_text,
                                       char **record_text_out,
                                       size_t *record_text_len_out);
+/* v0.5.1: restore a SPECIFIC entry (from ds4_kvstore_find_text_lcp) with
+ * integrity checks only -- no prompt comparisons, the record deliberately
+ * does NOT byte-prefix the prompt.  The caller installs the returned text
+ * as the bank's warm record; the server's partial-cut machinery and the
+ * engine's frontier validation then treat it exactly like a live record. */
+int ds4_kvstore_try_restore_bank_entry(ds4_kvstore *kc,
+                                       ds4_batch_ctx *batch_ctx,
+                                       uint32_t bank,
+                                       int idx,
+                                       char **record_text_out,
+                                       size_t *record_text_len_out);
 bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    ds4_engine *engine,
                                    ds4_session *session,

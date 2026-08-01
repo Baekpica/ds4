@@ -181,6 +181,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "agent-session")) return DS4_KVSTORE_REASON_AGENT_SESSION;
     if (!strcmp(reason, "bank-evict")) return DS4_KVSTORE_REASON_BANK_EVICT;
     if (!strcmp(reason, "bank-shutdown")) return DS4_KVSTORE_REASON_BANK_SHUTDOWN;
+    if (!strcmp(reason, "bank-checkpoint")) return DS4_KVSTORE_REASON_BANK_CHECKPOINT;
     return DS4_KVSTORE_REASON_UNKNOWN;
 }
 
@@ -507,7 +508,11 @@ static bool kv_cache_incoming_supersedes_continued(
         const ds4_kvstore_entry *e,
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
-    if (e->reason != DS4_KVSTORE_REASON_CONTINUED) return false;
+    /* v0.5.1: paced bank checkpoints of a growing trunk supersede their
+     * predecessors exactly like serial continued stores do -- the newer
+     * record extends the older one's bytes. */
+    if (e->reason != DS4_KVSTORE_REASON_CONTINUED &&
+        e->reason != DS4_KVSTORE_REASON_BANK_CHECKPOINT) return false;
     if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
@@ -536,7 +541,8 @@ static bool kv_cache_reason_is_anchor(uint8_t reason) {
            reason == DS4_KVSTORE_REASON_EVICT ||
            reason == DS4_KVSTORE_REASON_SHUTDOWN ||
            reason == DS4_KVSTORE_REASON_BANK_EVICT ||
-           reason == DS4_KVSTORE_REASON_BANK_SHUTDOWN;
+           reason == DS4_KVSTORE_REASON_BANK_SHUTDOWN ||
+           reason == DS4_KVSTORE_REASON_BANK_CHECKPOINT;
 }
 
 double ds4_kvstore_entry_eviction_score(
@@ -761,6 +767,19 @@ void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {
     if (tokens > kc->continued_last_store_tokens) {
         kc->continued_last_store_tokens = tokens;
     }
+}
+
+/* v0.5.1 bank checkpointing: pace a bank's periodic persist the same way the
+ * serial continued tier paces its stores -- re-store only after committed
+ * history has grown one aligned interval past the last stored length.
+ * stored_tokens = 0 (never stored) makes the first tier crossing persist. */
+int ds4_kvstore_bank_checkpoint_due(const ds4_kvstore *kc, int committed,
+                                    int stored_tokens) {
+    const int step = kv_cache_continued_step(kc);
+    if (step <= 0) return 0;                  /* continued tier disabled */
+    if (committed < kc->opt.min_tokens) return 0;
+    if (committed < stored_tokens + step) return 0;
+    return 1;
 }
 
 int ds4_kvstore_suppress_continued_store(ds4_kvstore *kc, int tokens) {
@@ -1234,31 +1253,82 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     return best;
 }
 
-/* v0.3 durable pinned banks: like ds4_kvstore_try_load_text, but the
- * payload restores INTO a cont bank instead of the serial session, and no
- * effective-prompt is built here -- the caller installs the returned text
- * as the bank's warm record and the server's normal warm matcher +
- * engine-side frontier validation take over.  Trailer hooks do not apply
- * (bank records carry rendered warm-record text, never a tool map). */
-int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
-                                      ds4_engine *engine,
-                                      ds4_session *session,
-                                      ds4_batch_ctx *batch_ctx,
-                                      uint32_t bank,
-                                      const char *prompt_text,
-                                      char **record_text_out,
-                                      size_t *record_text_len_out) {
-    if (record_text_out) *record_text_out = NULL;
-    if (record_text_len_out) *record_text_len_out = 0;
-    if (!kc->enabled || !prompt_text || !batch_ctx || !record_text_out) return 0;
-    const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) return 0;
-    const int model_id = ds4_engine_model_id(engine);
+/* v0.5.1: the disk twin of the server's P1 partial ranking.  A record whose
+ * text DIVERGES from the prompt mid-way (e.g. a length-truncated turn whose
+ * next-turn re-render closes the turn) can never satisfy the exact lookup
+ * above, so cross-boot it silently cold-prefilled forever while a live bank
+ * would have served the shared prefix.  Rank stored records by byte-LCP
+ * against the prompt, reading each candidate's text region (never the
+ * payload).  The 8*lcp >= text_bytes guard keeps a near-useless deep record
+ * from paying a full payload restore for a token-trivial salvage: restore
+ * streams roughly an order of magnitude faster than prefill, so 1/8 is
+ * comfortably net-positive.  Ties prefer the smaller record (cheaper
+ * restore, same salvage). */
+int ds4_kvstore_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
+                              int model_id, int quant_bits, int ctx_size,
+                              size_t min_lcp, size_t *lcp_out) {
+    if (lcp_out) *lcp_out = 0;
+    if (!prompt_text || min_lcp == 0) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
-    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
-    if (idx < 0) return 0;
+    if (prompt_bytes < min_lcp) return -1;
+    kv_cache_refresh(kc);
+    int best = -1;
+    size_t best_lcp = 0;
+    uint64_t best_text = 0;
+    for (int i = 0; i < kc->len; i++) {
+        ds4_kvstore_entry *e = &kc->entry[i];
+        if ((int)e->tokens < kc->opt.min_tokens) continue;
+        if (e->model_id != (uint8_t)model_id) continue;
+        if ((uint32_t)ctx_size < e->ctx_size) continue;
+        if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
+        if (e->text_bytes < min_lcp) continue;             /* lcp <= text length */
+        if (e->text_bytes > 8u * (uint64_t)prompt_bytes) continue; /* salvage guard unreachable */
+        /* The LCP cannot extend past either string -- read only that much. */
+        const uint64_t want64 = e->text_bytes < (uint64_t)prompt_bytes
+                                    ? e->text_bytes : (uint64_t)prompt_bytes;
+        const size_t want = (size_t)want64;
+        FILE *fp = fopen(e->path, "rb");
+        if (!fp) continue;
+        ds4_kvstore_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        size_t lcp = 0;
+        if (ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
+            (uint64_t)text_bytes == e->text_bytes) {
+            char *buf = kv_xmalloc(want);
+            const size_t got = fread(buf, 1, want, fp);
+            while (lcp < got && buf[lcp] == prompt_text[lcp]) lcp++;
+            free(buf);
+        }
+        fclose(fp);
+        if (lcp < min_lcp) continue;
+        if (8u * (uint64_t)lcp < e->text_bytes) continue;  /* salvage too small */
+        if (lcp < best_lcp) continue;
+        if (lcp == best_lcp && best >= 0 && e->text_bytes >= best_text) continue;
+        best = i;
+        best_lcp = lcp;
+        best_text = e->text_bytes;
+    }
+    if (best >= 0 && lcp_out) *lcp_out = best_lcp;
+    return best;
+}
 
+/* v0.3 durable pinned banks: shared restore core.  The payload restores
+ * INTO a cont bank instead of the serial session, and no effective-prompt
+ * is built here -- the caller installs the returned text as the bank's warm
+ * record and the server's normal warm matcher + engine-side frontier
+ * validation take over.  Trailer hooks do not apply (bank records carry
+ * rendered warm-record text, never a tool map).  prompt_text non-NULL keeps
+ * the exact-path checks (record must byte-prefix the prompt); NULL is the
+ * v0.5.1 partial path, where the record deliberately diverges from the
+ * prompt and only integrity is verified here. */
+static int kv_restore_bank_entry(ds4_kvstore *kc,
+                                 ds4_batch_ctx *batch_ctx,
+                                 uint32_t bank,
+                                 int idx,
+                                 const char *prompt_text,
+                                 size_t prompt_bytes,
+                                 char **record_text_out,
+                                 size_t *record_text_len_out) {
     ds4_kvstore_entry e = kc->entry[idx];
     char *path = kv_xstrdup(e.path);
     const double load_t0 = kv_now_sec();
@@ -1273,10 +1343,10 @@ int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
     bool header_ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
     char *cached_text = NULL;
     if (header_ok) {
-        if (hdr.model_id != (uint8_t)model_id) {
+        if (hdr.model_id != e.model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
-        } else if ((uint64_t)text_bytes > prompt_bytes) {
+        } else if (prompt_text && (uint64_t)text_bytes > prompt_bytes) {
             header_ok = false;
             fail_reason = "cached text is longer than prompt";
         } else {
@@ -1291,7 +1361,8 @@ int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
                 if (strcmp(text_sha, e.sha)) {
                     header_ok = false;
                     fail_reason = "cached text hash mismatch";
-                } else if (!ds4_kvstore_byte_prefix_match(prompt_text, prompt_bytes,
+                } else if (prompt_text &&
+                           !ds4_kvstore_byte_prefix_match(prompt_text, prompt_bytes,
                                                           cached_text, text_bytes)) {
                     header_ok = false;
                     fail_reason = "cached text prefix mismatch";
@@ -1342,6 +1413,43 @@ int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
     free(cached_text);
     free(path);
     return loaded;
+}
+
+int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
+                                      ds4_engine *engine,
+                                      ds4_session *session,
+                                      ds4_batch_ctx *batch_ctx,
+                                      uint32_t bank,
+                                      const char *prompt_text,
+                                      char **record_text_out,
+                                      size_t *record_text_len_out) {
+    if (record_text_out) *record_text_out = NULL;
+    if (record_text_len_out) *record_text_len_out = 0;
+    if (!kc->enabled || !prompt_text || !batch_ctx || !record_text_out) return 0;
+    const int quant_bits = ds4_engine_routed_quant_bits(engine);
+    if (quant_bits != 2 && quant_bits != 4) return 0;
+    const int model_id = ds4_engine_model_id(engine);
+    const size_t prompt_bytes = strlen(prompt_text);
+    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
+                                           ds4_session_ctx(session));
+    if (idx < 0) return 0;
+    return kv_restore_bank_entry(kc, batch_ctx, bank, idx,
+                                 prompt_text, prompt_bytes,
+                                 record_text_out, record_text_len_out);
+}
+
+int ds4_kvstore_try_restore_bank_entry(ds4_kvstore *kc,
+                                       ds4_batch_ctx *batch_ctx,
+                                       uint32_t bank,
+                                       int idx,
+                                       char **record_text_out,
+                                       size_t *record_text_len_out) {
+    if (record_text_out) *record_text_out = NULL;
+    if (record_text_len_out) *record_text_len_out = 0;
+    if (!kc->enabled || !batch_ctx || !record_text_out) return 0;
+    if (idx < 0 || idx >= kc->len) return 0;
+    return kv_restore_bank_entry(kc, batch_ctx, bank, idx, NULL, 0,
+                                 record_text_out, record_text_len_out);
 }
 
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,

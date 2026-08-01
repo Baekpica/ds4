@@ -7983,6 +7983,11 @@ struct server {
         size_t   len;
         uint64_t last_use;
         bool     valid;
+        /* v0.5.1 inc3b: committed length at this bank lineage's last disk
+         * persist (0 = never stored).  Pacing marker ONLY -- a stale value
+         * delays or duplicates a checkpoint store, never corrupts one (the
+         * kvstore dedups identical records at the file level). */
+        int      stored_tokens;
     } *warm;
     uint64_t warm_clock;
     /* A2b: serve a warm match by FORKING the matched bank into a different free
@@ -7997,6 +8002,15 @@ struct server {
      * (also keeps template-header-only overlap from triggering reuse). */
     bool warm_fork_partial;
     int  warm_partial_min;
+    /* v0.5.1 inc3a: extend the P1 partial path to the DISK tier -- a
+     * cross-boot record that diverges mid-prompt (e.g. a length-truncated
+     * turn whose next-turn re-render closes the turn) can never
+     * full-prefix-match again; without this it silently cold-prefilled
+     * forever.  DS4_SERVER_DISK_PARTIAL=0 = exact disk matching only. */
+    bool warm_disk_partial;
+    /* v0.5.1 inc3b: paced pin-tier persist at retire (see stored_tokens).
+     * DS4_SERVER_BANK_CHECKPOINT=0 = evict/shutdown persists only. */
+    bool warm_checkpoint;
     /* KV capacity (v0.2 ws4): plain-LRU eviction is depth-split -- a record
      * with committed tokens >= warm_pin_min ("deep": an orchestrator trunk
      * that would take tens of minutes to re-prefill) is only the cold-admit
@@ -9115,10 +9129,12 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
                         s->warm[bank].text, 0, "bank",
                         &hooks, &staged, err, sizeof(err));
     ds4_session_payload_file_free(&staged);
-    if (ok)
+    if (ok) {
+        s->warm[bank].stored_tokens = hl;   /* v0.5.1 inc3b pacing marker */
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: bank persisted bank=%d tokens=%u reason=%s",
                    bank, hl, reason);
+    }
 }
 
 static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
@@ -11830,6 +11846,22 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
     s->warm[bank].len = tb.len;
     s->warm[bank].valid = true;
     warm_records_gauge_refresh(s);
+    /* v0.5.1 inc3b: warm banks extend committed history every retire but
+     * until now only persisted on evict/shutdown -- a crash lost everything
+     * since the last foreign admit, and the most-reused agentic trunks are
+     * exactly the ones that never evict.  Pace a pin-tier checkpoint store
+     * like the serial continued tier (same interval); shallow banks re-
+     * prefill in seconds and would thrash the disk, so the pin threshold
+     * gates the tier exactly like the evict-site stores. */
+    if (s->warm_checkpoint && s->kv.enabled && s->batch_ctx &&
+        s->warm_pin_min > 0) {
+        const int committed =
+            ds4_batch_ctx_bank_committed(s->batch_ctx, bank, NULL);
+        if (committed >= s->warm_pin_min &&
+            ds4_kvstore_bank_checkpoint_due(&s->kv, committed,
+                                            s->warm[bank].stored_tokens))
+            kv_cache_store_bank(s, bank, "bank-checkpoint", s->warm_pin_min);
+    }
 }
 
 /* R5 Inc2: a free bank's record is SUPERSEDED when it is a byte-prefix of
@@ -11885,6 +11917,26 @@ static int warm_victim_pick(const server *s, const bool *occ, int excl, bool evi
     return lru >= 0 ? lru : deep_lru;
 }
 
+/* v0.3 durable banks: victim pick for a DISK-tier restore.  Prefer a
+ * NO-VALUE or superseded bank; a DEEP disk record (>= warm_pin_min tokens)
+ * may also displace a SHALLOW live record -- mirroring the depth-split evict
+ * tiers, and never a pin-tier record -- so bank churn cannot permanently
+ * lock deep trunks out of the disk tier.  (Factored out of cont_warm_pick
+ * in v0.5.1 so the partial disk path shares the exact rules.) */
+static int cont_disk_victim_pick(const server *s, const bool *occ,
+                                 uint32_t rec_tokens) {
+    int rb = warm_victim_pick(s, occ, -1, false);
+    if (rb < 0 && s->warm_pin_min > 0 &&
+        rec_tokens >= (uint32_t)s->warm_pin_min) {
+        rb = warm_victim_pick(s, occ, -1, true);
+        if (rb >= 0) {
+            const int vc = ds4_batch_ctx_bank_committed(s->batch_ctx, rb, NULL);
+            if (vc >= s->warm_pin_min) rb = -1;   /* never displace deep */
+        }
+    }
+    return rb;
+}
+
 /* Placement (and warm-continuation) pick for job j's admit.  On a record match
  * the effective prompt = the bank's EXACT committed token history + the
  * tokenized text suffix (BPE can merge across the byte boundary, so canonical
@@ -11929,28 +11981,21 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                              ds4_engine_model_id(s->engine),
                              ds4_engine_routed_quant_bits(s->engine),
                              ds4_session_ctx(s->session));
-        if (didx >= 0) {
-            rb = warm_victim_pick(s, occ, -1, false);
-            if (rb < 0 && s->warm_pin_min > 0 &&
-                s->kv.entry[didx].tokens >= (uint32_t)s->warm_pin_min) {
-                rb = warm_victim_pick(s, occ, -1, true);
-                if (rb >= 0) {
-                    const int vc = ds4_batch_ctx_bank_committed(s->batch_ctx, rb, NULL);
-                    if (vc >= s->warm_pin_min) rb = -1;   /* never displace deep */
-                }
-            }
-        }
+        if (didx >= 0)
+            rb = cont_disk_victim_pick(s, occ, s->kv.entry[didx].tokens);
         if (rb >= 0) {
             char *rtext = NULL;
             size_t rlen = 0;
-            if (ds4_kvstore_try_restore_bank_text(&s->kv, s->engine, s->session,
-                                                  s->batch_ctx, (uint32_t)rb,
-                                                  ptext, &rtext, &rlen) > 0) {
+            const int rtok = ds4_kvstore_try_restore_bank_text(&s->kv,
+                                 s->engine, s->session, s->batch_ctx,
+                                 (uint32_t)rb, ptext, &rtext, &rlen);
+            if (rtok > 0) {
                 warm_rec_invalidate(s, rb);
                 s->warm[rb].text = rtext;
                 s->warm[rb].len = rlen;
                 s->warm[rb].valid = true;
                 s->warm[rb].last_use = ++s->warm_clock;
+                s->warm[rb].stored_tokens = rtok;   /* it IS the disk record */
                 warm_records_gauge_refresh(s);
                 server_log(DS4_LOG_GENERATION,
                            "ds4-server: bank restore admit bank=%d bytes=%zu",
@@ -12005,6 +12050,9 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                      * being destroyed -- persist the pin tier to disk first. */
                     kv_cache_store_bank(s, ft, "bank-evict", s->warm_pin_min);
                     warm_rec_invalidate(s, ft);      /* target being overwritten */
+                    /* v0.5.1 inc3b: dst holds a copy of the trunk, so the
+                     * trunk's disk coverage prefixes dst's history too. */
+                    s->warm[ft].stored_tokens = s->warm[best].stored_tokens;
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: fork admit src=%d dst=%d cached=%d suffix=%d",
                                best, ft, hl, req->n - hl);
@@ -12042,6 +12090,47 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                                                 s->warm[b2].text, s->warm[b2].len);
             if (l > plcp) { plcp = l; pb = b2; }
         }
+        /* v0.5.1 inc3a: the disk tier gets the same partial path.  Probe it
+         * only for a record that would BEAT the best live LCP -- then restore
+         * it into a victim bank, install the record, and let the cut below
+         * treat it exactly like a live retirement.  (The exact disk lookup
+         * above can never serve these: the record diverges mid-prompt, e.g.
+         * a length-truncated turn whose next-turn re-render closes the turn,
+         * so without this it silently cold-prefills forever after a boot.) */
+        if (s->warm_disk_partial && s->kv.enabled) {
+            const size_t dfloor = plcp + 1 > (size_t)s->warm_partial_min
+                                      ? plcp + 1 : (size_t)s->warm_partial_min;
+            size_t dlcp = 0;
+            const int didx = ds4_kvstore_find_text_lcp(&s->kv, ptext,
+                                 ds4_engine_model_id(s->engine),
+                                 ds4_engine_routed_quant_bits(s->engine),
+                                 ds4_session_ctx(s->session), dfloor, &dlcp);
+            if (didx >= 0) {
+                const int rb = cont_disk_victim_pick(s, occ,
+                                   s->kv.entry[didx].tokens);
+                if (rb >= 0) {
+                    char *rtext = NULL;
+                    size_t rlen = 0;
+                    const int rtok = ds4_kvstore_try_restore_bank_entry(&s->kv,
+                                         s->batch_ctx, (uint32_t)rb, didx,
+                                         &rtext, &rlen);
+                    if (rtok > 0) {
+                        warm_rec_invalidate(s, rb);
+                        s->warm[rb].text = rtext;
+                        s->warm[rb].len = rlen;
+                        s->warm[rb].valid = true;
+                        s->warm[rb].last_use = ++s->warm_clock;
+                        s->warm[rb].stored_tokens = rtok;
+                        warm_records_gauge_refresh(s);
+                        server_log(DS4_LOG_GENERATION,
+                                   "ds4-server: bank restore admit bank=%d bytes=%zu lcp=%zu partial=1",
+                                   rb, rlen, dlcp);
+                        pb = rb;
+                        plcp = dlcp;
+                    }
+                }
+            }
+        }
         /* Byte prefilter: a cut of warm_partial_min tokens spans at least that
          * many bytes, so a shorter byte-LCP can never reach the token floor. */
         if (pb >= 0 && plcp >= (size_t)s->warm_partial_min) {
@@ -12071,6 +12160,11 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                      * full-match fork above). */
                     kv_cache_store_bank(s, ft, "bank-evict", s->warm_pin_min);
                     warm_rec_invalidate(s, ft);      /* target being overwritten */
+                    /* v0.5.1 inc3b: dst = trunk cut at `cut`; the trunk's
+                     * disk coverage prefixes dst only up to the cut. */
+                    s->warm[ft].stored_tokens =
+                        s->warm[pb].stored_tokens < cut
+                            ? s->warm[pb].stored_tokens : cut;
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: partial fork admit src=%d dst=%d cut=%d suffix=%d",
                                pb, ft, cut, req->n - cut);
@@ -12084,6 +12178,10 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                      * pin rule forces ft = -1 past warm_pin_min). */
                     kv_cache_store_bank(s, pb, "bank-evict", s->warm_pin_min);
                     warm_rec_invalidate(s, pb);
+                    /* v0.5.1 inc3b: disk coverage past the cut no longer
+                     * prefixes this bank's post-truncate history. */
+                    if (s->warm[pb].stored_tokens > cut)
+                        s->warm[pb].stored_tokens = cut;
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: partial truncate admit bank=%d cut=%d suffix=%d",
                                pb, cut, req->n - cut);
@@ -12103,6 +12201,9 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
         /* v0.3 durable banks: cold-admit victim destroyed. */
         kv_cache_store_bank(s, target, "bank-evict", s->warm_pin_min);
         warm_rec_invalidate(s, target);
+        /* v0.5.1 inc3b: a fresh conversation takes the bank -- the old
+         * lineage's disk coverage means nothing to it. */
+        s->warm[target].stored_tokens = 0;
     }
 }
 
@@ -14267,6 +14368,12 @@ int main(int argc, char **argv) {
                          * compress ratio (128 on Flash) -- cuts below align+4
                          * degrade to cold, so don't bother issuing them. */
                         if (s.warm_partial_min < 136) s.warm_partial_min = 136;
+                        /* v0.5.1 inc3 kill switches (A/B): disk-tier partial
+                         * restore + pin-tier bank checkpointing. */
+                        const char *dp = getenv("DS4_SERVER_DISK_PARTIAL");
+                        s.warm_disk_partial = !(dp && dp[0] == '0' && dp[1] == '\0');
+                        const char *bc = getenv("DS4_SERVER_BANK_CHECKPOINT");
+                        s.warm_checkpoint = !(bc && bc[0] == '0' && bc[1] == '\0');
                     }
                     server_log(DS4_LOG_DEFAULT,
                                "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d seq_cap=%d)%s",
