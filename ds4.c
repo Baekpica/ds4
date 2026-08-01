@@ -31,7 +31,6 @@
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
@@ -1656,76 +1655,6 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_tensors(m, &c);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
-}
-
-/* Side models (MTP head, DSpark drafter) are the page-cache eviction victims
- * at memory-pressure shapes: their expert pages are sparsely touched (top-k
- * routing) while the target self-pins by constant verify re-touch, and the
- * refault lands inside the kernel at substrate speed (240K-ctx decode paid
- * ~20% ms/tok before this).  Lock side-model mappings resident at load; the
- * kernel accounts the attempt against RLIMIT_MEMLOCK, so a failed lock is
- * the budget check.  The target model must never be locked (it dwarfs any
- * sane memlock limit and does not need it).
- *
- * The lock is ADAPTIVE, not permanent: the same evictability this removes is
- * the box's shock absorber at deep-context shapes (a 121 GiB GB10 bottoms
- * ~7.4 GiB available at the 240K concurrent shape WITH the drafter evicted;
- * holding a 6.6 GiB lock there thrashed the box into userspace livelock).
- * ds4_side_locks_pressure_check releases every registered lock, one-way per
- * boot, when a prefill's remaining demand would push effective available
- * memory under the batch-fit headroom floor. */
-#if defined(__linux__)
-static struct { const void *addr; uint64_t len; } g_side_locks[4];
-static int g_side_lock_n = 0;
-static bool g_side_locks_released = false;   /* set once, after munlock */
-static char g_side_locks_claim = 0;          /* release claim (one winner) */
-static int g_side_lock_ctx_size = 0;         /* stashed by batch ctx create */
-static void *ds4_side_lock_watch_main(void *arg);
-#endif
-
-static void model_mlock_resident(const ds4_model *m, const char *what) {
-#if defined(__linux__)
-    if (getenv("DS4_NO_SIDE_MLOCK")) {
-        fprintf(stderr, "ds4: %s mlock: disabled by DS4_NO_SIDE_MLOCK\n", what);
-        return;
-    }
-    const double mib = (double)m->size / 1048576.0;
-    if (mlock(m->map, (size_t)m->size) == 0) {
-        const int n = __atomic_load_n(&g_side_lock_n, __ATOMIC_RELAXED);
-        if (n < (int)(sizeof(g_side_locks) / sizeof(g_side_locks[0]))) {
-            g_side_locks[n].addr = m->map;
-            g_side_locks[n].len = m->size;
-            /* entry published before the count: the watcher sums by count */
-            __atomic_store_n(&g_side_lock_n, n + 1, __ATOMIC_RELEASE);
-        }
-        if (n == 0) {
-            /* Release of last resort: in-loop checks share the worker thread
-             * and lose the race when a forward stalls in page faults (the
-             * second 240K wedge).  A detached watcher cannot be starved by
-             * the loop; it exits once the locks release. */
-            pthread_t th;
-            if (pthread_create(&th, NULL, ds4_side_lock_watch_main, NULL) == 0)
-                pthread_detach(th);
-            else
-                fprintf(stderr, "ds4: side-lock watch thread failed to start\n");
-        }
-        fprintf(stderr, "ds4: %s mlock: %.0f MiB resident\n", what, mib);
-    } else {
-        const int err = errno;
-        struct rlimit rl;
-        if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
-            fprintf(stderr,
-                    "ds4: %s mlock: skipped (%.0f MiB, limit %.0f MiB, errno %d)\n",
-                    what, mib, (double)rl.rlim_cur / 1048576.0, err);
-        } else {
-            fprintf(stderr, "ds4: %s mlock: skipped (%.0f MiB, errno %d)\n",
-                    what, mib, err);
-        }
-    }
-#else
-    (void)m;
-    (void)what;
-#endif
 }
 
 static void print_size(uint64_t bytes) {
@@ -33290,81 +33219,6 @@ static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     return headroom;
 }
 
-/* Adaptive side-model residency valve.  Resident side models are worth ~20%
- * decode ms/tok where memory slack exists (the refault law) but cost exactly
- * their size in capacity envelope where it does not, and the kernel gives no
- * graceful degradation -- just reclaim livelock.  Called with the remaining
- * demand of the prefill about to run; releases EVERY registered lock (they
- * are all eviction victims together) the first time effective available
- * memory cannot cover that demand plus the batch-fit headroom floor.
- *
- * MemAvailable counts freshly-locked page cache as reclaimable until the
- * kernel's lazy unevictable migration catches up (measured: global Mlocked
- * showed 0.45 GiB while the process VmLck held 6.52 GiB -- exactly how the
- * bank fit was blind to the pin when the naive version of this wedged the
- * box).  Correct by the still-unmigrated share of our own locks; as Mlocked
- * catches up the correction decays to zero.  Other processes' locks inflate
- * Mlocked and shrink the correction early -- conservative in the safe
- * direction only after migration, so the per-chunk call cadence is the real
- * guarantee: consumption materializes gradually and the valve fires chunks
- * before the edge, not at it. */
-static void ds4_side_locks_pressure_check(int ctx_size, uint64_t projected_bytes) {
-#if defined(__linux__)
-    const int nlocks = __atomic_load_n(&g_side_lock_n, __ATOMIC_ACQUIRE);
-    if (nlocks == 0 ||
-        __atomic_load_n(&g_side_locks_released, __ATOMIC_ACQUIRE)) return;
-    unsigned long long avail_kb = 0, mlocked_kb = 0;
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return;
-    char ln[160];
-    while (fgets(ln, sizeof ln, f)) {
-        if (avail_kb == 0 && sscanf(ln, "MemAvailable: %llu kB", &avail_kb) == 1) continue;
-        if (mlocked_kb == 0) sscanf(ln, "Mlocked: %llu kB", &mlocked_kb);
-        if (avail_kb != 0 && mlocked_kb != 0) break;
-    }
-    fclose(f);
-    if (avail_kb == 0) return;                  /* unknown: keep the lock */
-    uint64_t locked = 0;
-    for (int i = 0; i < nlocks; i++) locked += g_side_locks[i].len;
-    const uint64_t mlocked = (uint64_t)mlocked_kb * 1024ull;
-    const uint64_t lazy = locked > mlocked ? locked - mlocked : 0;
-    const uint64_t avail = (uint64_t)avail_kb * 1024ull;
-    const uint64_t eff = avail > lazy ? avail - lazy : 0;
-    const uint64_t floor = ds4_batch_fit_headroom_bytes(ctx_size);
-    if (eff >= floor + projected_bytes) return;
-    if (__atomic_test_and_set(&g_side_locks_claim, __ATOMIC_ACQ_REL)) return;
-    for (int i = 0; i < nlocks; i++)
-        munlock(g_side_locks[i].addr, (size_t)g_side_locks[i].len);
-    __atomic_store_n(&g_side_locks_released, true, __ATOMIC_RELEASE);
-    fprintf(stderr,
-            "ds4: side-model mlock released: %.0f MiB unlocked "
-            "(avail %.0f - lazy %.0f MiB < floor %.0f + projected %.0f MiB)\n",
-            (double)locked / 1048576.0, (double)avail / 1048576.0,
-            (double)lazy / 1048576.0, (double)floor / 1048576.0,
-            (double)projected_bytes / 1048576.0);
-#else
-    (void)ctx_size;
-    (void)projected_bytes;
-#endif
-}
-
-#if defined(__linux__)
-/* Detached side-lock watcher: 250 ms cadence vs a reclaim treadmill that
- * develops over seconds.  ctx_size reads 0 (deep-default 8 GiB floor) until
- * the batch ctx stashes the real one -- conservative in the safe direction. */
-static void *ds4_side_lock_watch_main(void *arg) {
-    (void)arg;
-    struct timespec ts = { 0, 250 * 1000 * 1000 };
-    for (;;) {
-        if (__atomic_load_n(&g_side_locks_released, __ATOMIC_ACQUIRE)) return NULL;
-        ds4_side_locks_pressure_check(
-            __atomic_load_n(&g_side_lock_ctx_size, __ATOMIC_RELAXED), 0);
-        (void)nanosleep(&ts, NULL);
-    }
-    return NULL;
-}
-#endif
-
 /* R5 Inc1b: resident bytes across the comp/index cache slabs (page multiples
  * for demand-mapped reservations; eager slabs report their full size, but
  * callers only budget when sl->vmm).  Host-side page-flag scan, no driver
@@ -33646,16 +33500,6 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         return 1;
     }
     ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
-    /* Adaptive residency, boot-completion check: every boot-scale allocation
-     * (banks, slabs, stashes, dspark rings) is in by now, so this is the
-     * earliest honest answer to "can this box afford resident side models at
-     * this ctx".  A deep-ctx boot that cannot releases HERE, before any
-     * client traffic -- the 240K gate showed the first prefill-chunk check
-     * otherwise only fires at ~0.3 GiB available. */
-#if defined(__linux__)
-    __atomic_store_n(&g_side_lock_ctx_size, ctx_size, __ATOMIC_RELAXED);
-#endif
-    ds4_side_locks_pressure_check(ctx_size, 0);
     *out = ctx;
     return 0;
 #undef BC_ERR
@@ -35260,12 +35104,6 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (dspark_trace) ok = ok && dspark_tb;
     while (ok) {
         const double dspark_trace_t0 = dspark_trace ? now_sec() : 0.0;
-        /* Adaptive residency pulse: decode-phase growth (comp-cache pages,
-         * capture workspaces, pool growth) never passes the admission chunk
-         * hook -- teb receipts showed avail collapsing 6.3 GiB -> 0.2 GiB
-         * between admission checks.  One meminfo read per loop pass while
-         * locks are held; no-op once released. */
-        ds4_side_locks_pressure_check((int)ctx->ctx_size, 0);
         /* ---- ADMIT: fill free banks from the waiting queue.  At most MS
          * placements per pass (the outer loop re-enters immediately when
          * everything finished at seed, matching the old per-bank bound). ---- */
@@ -35533,11 +35371,6 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 uint32_t n_live_now = 0;
                 for (uint32_t i = 0; i < MS; i++) if (live[i]) n_live_now++;
                 uint32_t n = pflen[b] - pfoff[b];
-                /* Adaptive residency valve, re-checked every chunk: this
-                 * admission's remaining KV+comp demand (~9.46 KiB/tok, s6
-                 * boot-alloc ledger, rounded up) against live slack. */
-                ds4_side_locks_pressure_check((int)ctx->ctx_size,
-                        (uint64_t)(pflen[b] - pfoff[b]) * (10ull << 10));
                 bool final = true;
                 /* D4.5e: tap the target hidden for THIS prefill chunk (layers 40/41/42 ->
                  * dspark_concat[0..n)) so the chunk's positions can be injected into bank b's
@@ -37972,7 +37805,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
                 opt->mtp_path,
                 e->mtp_draft_tokens);
-        model_mlock_resident(&e->mtp_model, "MTP");
     }
 
     /* DSpark/dflash block-drafter: a second support model (3 MoE layers + heads)
@@ -37988,7 +37820,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             e->dspark_ready = true;
             fprintf(stderr, "ds4: DSpark drafter loaded: %s (%u layers)\n",
                     dspark_path, (unsigned)DS4_DSPARK_N_LAYER);
-            model_mlock_resident(&e->dspark_model, "drafter");
         }
     }
 
