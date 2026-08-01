@@ -165,13 +165,14 @@ banks)
 would have been v0.1.1; that is the point of them.
 
 The per-landing numbers and the full story are in `CHANGELOG.md` and the
-release notes. The v0.4 context-frontier sweep compares the ship defaults
-against the v0.3 line on the GB10 (same instrument, low band 2k–64k and
-high band 64k–128k; the 240K/515K stamps above live past this
-instrument's ceiling); below it, the v0.1.0 chart against upstream main
-on both reference machines:
+release notes. The v0.5 context-frontier sweep compares the ship defaults
+against the v0.4.1 line on the GB10 — same instrument, both lines on the
+same 0731 gguf, 2k–128k at 2k steps (the 240K/515K stamps above live past
+this instrument's ceiling); below it, the v0.1.0 chart against upstream
+main on both reference machines (kept for history, as is
+`speed-bench/v040_sweep_overlay.svg`):
 
-![v0.4 context-frontier sweep](speed-bench/v040_sweep_overlay.svg)
+![v0.5 context-frontier sweep](speed-bench/v050_sweep_overlay.svg)
 
 ![v0.1.0 context-frontier sweep](speed-bench/v010_sweep_overlay.svg)
 
@@ -397,8 +398,8 @@ larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | PRO q2 | 32768 tokens | 138.82 t/s | 9.56 t/s |
 | RTX PRO 6000 Blackwell, 96 GB | q2 | short | 85.21 t/s | 53.28 t/s |
 | RTX PRO 6000 Blackwell, 96 GB | q2 | 12461 tokens | 1920.66 t/s | 41.10 t/s |
-| DGX Spark GB10, 128 GB | q2 | short | 24.48 t/s | 22.03 t/s |
-| DGX Spark GB10, 128 GB | q2 | 13254 tokens | 773.56 t/s | 18.39 t/s |
+| DGX Spark GB10, 128 GB | q2 | 2048 tokens | 989.95 t/s | 22.66 t/s |
+| DGX Spark GB10, 128 GB | q2 | 14336 tokens | 1008.01 t/s | 19.69 t/s |
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
 ![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)
@@ -1130,6 +1131,16 @@ Enable it with:
 ```sh
 ./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
+
+> **Long-running serving note (until v0.5.1).** The per-bank compressed
+> KV/indexer cache pool maps device pages on demand and is grow-only: under
+> long-running agentic serving at deep context, banks walk toward their
+> maximum extent and the pool may grow into all free memory, eventually
+> squeezing the page cache that holds the weights (throughput drops sharply
+> when that happens). Pin the pool with `DS4_BATCH_VMM_BUDGET_MB=<MB>` —
+> admissions that would bust the pinned budget are rejected cleanly (watch
+> the `cont admit rejected` counter) instead of mapped. v0.5.1 ships
+> trim-on-evict, which releases evicted banks' pages under memory pressure.
 
 The cache key is the SHA1 of the rendered byte prefix, and files are named
 `<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state

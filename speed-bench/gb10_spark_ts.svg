@@ -8,19 +8,17 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
 </style>
 <rect width="960" height="540" fill="#ffffff"/>
-<text class="title" x="480.0" y="34" text-anchor="middle">DGX Spark GB10 t/s</text>
+<text class="title" x="480.0" y="34" text-anchor="middle">V05 Full t/s</text>
 <line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
 <text class="tick" x="70" y="472.00" text-anchor="end">0</text>
-<line x1="82" y1="387.60" x2="878" y2="387.60" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="391.60" text-anchor="end">200</text>
-<line x1="82" y1="307.20" x2="878" y2="307.20" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="311.20" text-anchor="end">400</text>
-<line x1="82" y1="226.80" x2="878" y2="226.80" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="230.80" text-anchor="end">600</text>
-<line x1="82" y1="146.40" x2="878" y2="146.40" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="150.40" text-anchor="end">800</text>
+<line x1="82" y1="367.50" x2="878" y2="367.50" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="371.50" text-anchor="end">500</text>
+<line x1="82" y1="267.00" x2="878" y2="267.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="271.00" text-anchor="end">1k</text>
+<line x1="82" y1="166.50" x2="878" y2="166.50" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="170.50" text-anchor="end">1.5k</text>
 <line x1="82" y1="66.00" x2="878" y2="66.00" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="70.00" text-anchor="end">1k</text>
+<text class="tick" x="70" y="70.00" text-anchor="end">2k</text>
 <text class="tick" x="890" y="472.00" text-anchor="start">0</text>
 <text class="tick" x="890" y="391.60" text-anchor="start">5</text>
 <text class="tick" x="890" y="311.20" text-anchor="start">10</text>
@@ -29,20 +27,24 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 <text class="tick" x="890" y="70.00" text-anchor="start">25</text>
 <line x1="82.00" y1="66" x2="82.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
 <text class="tick" x="82.00" y="492" text-anchor="middle">0</text>
-<line x1="324.92" y1="66" x2="324.92" y2="468" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="324.92" y="492" text-anchor="middle">20k</text>
-<line x1="567.84" y1="66" x2="567.84" y2="468" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="567.84" y="492" text-anchor="middle">40k</text>
-<line x1="810.76" y1="66" x2="810.76" y2="468" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="810.76" y="492" text-anchor="middle">60k</text>
+<line x1="233.82" y1="66" x2="233.82" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="233.82" y="492" text-anchor="middle">25k</text>
+<line x1="385.65" y1="66" x2="385.65" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="385.65" y="492" text-anchor="middle">50k</text>
+<line x1="537.47" y1="66" x2="537.47" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="537.47" y="492" text-anchor="middle">75k</text>
+<line x1="689.30" y1="66" x2="689.30" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="689.30" y="492" text-anchor="middle">100k</text>
+<line x1="841.12" y1="66" x2="841.12" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="841.12" y="492" text-anchor="middle">125k</text>
 <line x1="82" y1="66" x2="82" y2="468" stroke="#334155" stroke-width="1.4"/>
 <line x1="878" y1="66" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
 <line x1="82" y1="468" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
 <text class="axis-label" x="480.0" y="520" text-anchor="middle">ctx size</text>
 <text class="axis-label" x="22" y="267.0" text-anchor="middle" transform="rotate(-90 22 267.0)">prefill t/s</text>
 <text class="axis-label" x="938" y="267.0" text-anchor="middle" transform="rotate(90 938 267.0)">generation t/s</text>
-<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,214.17 131.75,141.70 156.62,139.45 181.50,145.74 206.38,154.41 231.25,159.09 256.12,165.05 281.00,166.97 305.88,171.37 330.75,176.36 355.62,179.64 380.50,183.70 405.38,187.88 430.25,190.72 455.12,194.85 480.00,197.07 504.88,214.51 529.75,216.83 554.62,219.21 579.50,222.10 604.38,224.15 629.25,228.13 654.12,230.48 679.00,233.71 703.88,241.20 728.75,241.33 753.62,243.78 778.50,244.93 803.38,247.71 828.25,248.82 853.12,251.34 878.00,252.59"/>
-<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,120.35 131.75,171.00 156.62,173.09 181.50,175.50 206.38,177.27 231.25,178.56 256.12,179.20 281.00,180.81 305.88,181.45 330.75,182.26 355.62,183.06 380.50,183.87 405.38,184.67 430.25,185.47 455.12,186.28 480.00,187.24 504.88,188.21 529.75,188.69 554.62,189.49 579.50,189.98 604.38,190.78 629.25,191.75 654.12,192.87 679.00,193.19 703.88,194.48 728.75,195.28 753.62,196.09 778.50,196.57 803.38,197.70 828.25,198.66 853.12,199.14 878.00,199.62"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="94.44,269.02 106.88,257.65 119.31,259.70 131.75,261.55 144.19,263.46 156.62,264.90 169.06,265.39 181.50,264.28 193.94,264.44 206.38,264.43 218.81,265.48 231.25,266.16 243.69,266.71 256.12,267.91 268.56,268.32 281.00,268.30 293.44,270.14 305.88,269.47 318.31,270.45 330.75,270.49 343.19,271.91 355.62,272.35 368.06,272.72 380.50,273.15 392.94,273.35 405.38,273.77 417.81,274.70 430.25,275.42 442.69,276.52 455.12,276.10 467.56,277.01 480.00,277.30 492.44,278.67 504.88,279.75 517.31,279.55 529.75,279.41 542.19,280.83 554.62,280.63 567.06,280.79 579.50,280.94 591.94,281.88 604.38,282.34 616.81,282.64 629.25,282.62 641.69,283.46 654.12,283.86 666.56,283.75 679.00,283.99 691.44,284.74 703.88,285.12 716.31,285.83 728.75,285.90 741.19,286.77 753.62,287.22 766.06,287.00 778.50,287.71 790.94,288.24 803.38,288.90 815.81,288.93 828.25,289.35 840.69,290.21 853.12,290.06 865.56,289.65 878.00,290.76"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="94.44,103.63 106.88,142.54 119.31,146.08 131.75,147.85 144.19,149.46 156.62,150.58 169.06,151.38 181.50,152.99 193.94,154.60 206.38,155.24 218.81,156.85 231.25,157.98 243.69,159.10 256.12,160.39 268.56,161.03 281.00,162.48 293.44,163.77 305.88,164.57 318.31,165.54 330.75,166.18 343.19,167.30 355.62,168.59 368.06,169.88 380.50,170.68 392.94,171.65 405.38,172.77 417.81,174.22 430.25,175.18 442.69,175.99 455.12,177.11 467.56,178.08 480.00,178.88 492.44,182.10 504.88,182.90 517.31,183.87 529.75,184.99 542.19,185.64 554.62,185.47 567.06,187.24 579.50,188.21 591.94,189.01 604.38,189.66 616.81,191.10 629.25,191.75 641.69,191.26 654.12,192.71 666.56,194.32 679.00,194.64 691.44,195.44 703.88,195.93 716.31,197.53 728.75,197.70 741.19,198.82 753.62,199.62 766.06,200.43 778.50,201.39 790.94,201.72 803.38,201.23 815.81,203.32 828.25,203.97 840.69,204.93 853.12,205.25 865.56,206.22 878.00,206.70"/>
 <rect x="694" y="66" width="176" height="62" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
 <rect x="708" y="78" width="12" height="12" fill="#2563eb"/>
 <text class="legend" x="730" y="89">prefill</text>

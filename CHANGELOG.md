@@ -5,6 +5,119 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.5.0 — 2026-08-01
+
+The deep-prefill/decode substrate release, shipped together with the
+DeepSeek-V4-Flash-**0731** weights refresh. Two stories in one cut: the
+engine closes its flat-pool arc (every remaining per-layer activation
+requantize retired, bit-exactly) and unlocks CUDA-graph capture at every
+depth; the model refresh re-bases the quality baselines dramatically
+upward on the identical ship-recipe quant.
+
+**Engine — flat-pool arc (all bit-exact, each gated separately):**
+
+- **Fused own `out_a`** (`9339bf0`): attention out_a epilogue becomes one
+  fused kernel, retiring a pack + cuBLAS pair. 515K prefill record
+  679.3 s = 759.6 t/s (+2.3%) at its ship — since re-taken at the
+  v0.5 tip: **517,963 tokens / 667.1 s = 776.4 t/s** (+2.2% again, the
+  stream-topk tier working inside deep prefill selection); ABBA 2k
+  +4.4%, 64k +3.5%.
+- **q8_1 dual-emit** (`26662e0`): out_a epilogue dual-emits the q8_1 of
+  low, retiring out_b's input quantize (verify 0/16384 diffs).
+- **MoE gate/up Y-indirect staging** (`9c1c4cb`): quantize once per
+  token + ids_src map folded into one prologue register per thread
+  (trip-invariance; NT64 SASS byte-identical; verify 172/172 clean).
+- **Norm triple-emit** (`76f5266` + `507921d`): the RMS-norm producers
+  emit f32 + f16 + the q8 D4 activation in one pass behind a
+  pointer-keyed producer registry — all FIVE per-layer K=4096 input
+  quantizes retired, zero dispatch-site changes. Verify 344/344 +
+  172/172 clean; ABBA 64k +1.33% / 2k +2.77%, above the GPU-time bill
+  because 215 retired launches per window also relieve the CPU-bound
+  shallow window. Bench records: 2k 958–960, 64k ~933 t/s.
+- Eager-launch jitter is BANKED AS A NAMED FLOOR (13.8 ms/win at ~4,070
+  launches/win, launch-rate-insensitive; the lever is prefill capture,
+  future work).
+- Credit: parts of the prefill kernel line trace inspiration to Marco's
+  MIT-licensed GB10 fork
+  ([DS4-GB10-GX10-DSpark-CUDA](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA));
+  ported pieces carry commit credit and Portions-Copyright headers
+  in-tree.
+
+**Engine — deep substrate:**
+
+- **Exact mxf4 scorer select at all depths** (`3af807b` + follow-ups):
+  the indexer scorer's mxf4 selection chain is exact at every context
+  depth on the serving path.
+- **Streaming top-512 at every depth** (`9922a98`): the topk dispatcher
+  takes a capture-stable streaming tier for all widths and both regimes
+  above 8192 compressed rows; the >8192-row CUDA-graph capture
+  exclusion is LIFTED. Deep decode at 240K: **−4.7% per verify step**
+  (132.1 vs 138.5 ms), −10.9% ms/tok on the gated leg. The legacy
+  chunked tree survives only as a forensic escape
+  (`DS4_CUDA_NO_TOPK_STREAM`); an in-tree dual-run instrument
+  (`DS4_CUDA_TOPK_STREAM_VERIFY`) byte-compared stream vs tree across
+  ~5,600 live launches: zero diffs.
+- **Boot prewarm** (`d872609`) + **quality/test hardening** (`07dea00`):
+  goldens re-based cross-box (abs=0), per-step vector exclusion and a
+  golden record mode in the tests, build-config guard
+  (`.ds4-cuda-config.mk`).
+- **Quench recal for the 0731 identity**: `dspark_shadow_guard`
+  2.10 → **2.16** (same-day 12k pair, 166-step sample: plain 50.5
+  ms/step, spec 109.3 → C 2.165; spec worth 1.42× at 12k). The deep
+  break-even ramp (measured ~2.37 at 240K) remains open, tracked for
+  v0.6. Gates: teb fast 86 (top of band; score and spec-hit totals
+  identical to the 2.10 control) and think 83 in band, counters clean.
+
+**Model — DeepSeek-V4-Flash-0731 refresh:**
+
+- Ship quant: `...chat-v2-imatrix-0731.gguf` (86.7 GiB, published
+  upstream — same recipe the fork's baselines are stamped on). Perf
+  parity with the old quant confirmed by ABBA (+0.07%/+0.15%).
+- Quality re-base on the identical harness/corpus (2,248 items, zero
+  request errors; frozen caps, with the June cap-correction addendum
+  repeated — both bases quoted per the reporting convention):
+  **MMLU 79.5% vs 63.5** (the 2-bit-expert knowledge-recall weakness
+  largely closed) · GSM8K 96.4 frozen / 96.8 corrected (band) ·
+  HumanEval 88.4 frozen / **89.0 corrected** (above the old 88.4) ·
+  MBPP 90.0 (exact) · **needle 70/70** (baseline-exact through 130K) ·
+  think-GSM8K 39/40 · IFEval strict 74.3 frozen / **82.6 corrected**
+  vs the old 83.4/86.9. The IFEval frozen drop is mostly a cap
+  artifact: 0731 writes ~30% longer on open instructions and hit the
+  frozen 768-token cap 2× as often (177/541 vs 85); 143 of 180 capped
+  items pass strict when allowed to finish. The residual ~−4 pts
+  corrected-vs-corrected is a real 0731 style delta (longer, looser
+  instruction adherence), model-side, not engine.
+- **MTP retired for 0731**: the upstream checkpoint replaced the
+  single-block MTP module with the DSpark stages; there is no 0731 MTP
+  head. Speculation is DSpark-only; the ds4-on-spark launcher and
+  installer refuse the legacy-MTP × 0731 pairing and manage the weight
+  upgrade (optional old-weight removal, prompted).
+- **0731 DSpark drafter** re-extracted from the new checkpoint
+  (Q2K-Q8, 6.97 GB): accept 73.7% / 3.08 tok/step at 12k — parity
+  with the old pairing's band. Published at
+  `bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF` as
+  `DSpark-drafter-Q2K-Q8-0731.gguf` (the installer's default fetch).
+- Model-behavior notes: 0731 answers deep-context prompts tersely
+  (deep gates' long-generation samples shrank 512 → 8 tokens), and the
+  tool-eval safety surface moved (new advisory TC-58; the old model's
+  known TC-60 no longer fires).
+
+**Known issue (fix scheduled v0.5.1):** the demand-mapped comp/index
+cache pool is grow-only; long-running agentic serving at deep ctx can
+walk banks to their maximum extent and squeeze the weight page cache
+(field-reported throughput cliff). Workaround: pin the pool with
+`DS4_BATCH_VMM_BUDGET_MB` (admissions beyond it reject cleanly). The
+v0.5.1 trim-on-evict releases evicted banks' pages under pressure.
+
+Also in this release: **adaptive side-model residency** (`6f59a16`) —
+the server mlocks the drafter at load and a dedicated watchdog thread
+releases all locks one-way under memory pressure. Post-ship A/B
+measurement banked ZERO speed win (two ABBA nulls with bitwise-identical
+speculation counters; the hold zone and the refault-tax zone are
+disjoint on 121 GiB unified memory), so the mechanism is scheduled for
+removal in v0.5.1 alongside trim-on-evict — the wedge-forensics and
+capacity laws it produced are the keeper.
+
 ## v0.4.2 — 2026-07-24
 
 Community fix: thinking-mode conversations now reuse KV on the
