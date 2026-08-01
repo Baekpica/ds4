@@ -567,7 +567,7 @@ static agent_config parse_options(int argc, char **argv) {
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
-            .think_mode = DS4_THINK_HIGH,
+            .think_mode = DS4_THINK_LOW,
         },
     };
 
@@ -624,9 +624,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
-            c.gen.think_mode = DS4_THINK_HIGH;
+            c.gen.think_mode = DS4_THINK_LOW;
         } else if (!strcmp(arg, "--think-max")) {
-            c.gen.think_mode = DS4_THINK_MAX;
+            c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = DS4_THINK_NONE;
         } else if (!strcmp(arg, "--backend")) {
@@ -3847,9 +3847,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
 static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     ds4_chat_begin(w->engine, out);
-    if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
-        effective_think_mode(w->cfg) == DS4_THINK_MAX)
-        ds4_chat_append_max_effort_prefix(w->engine, out);
+    ds4_chat_append_effort_prefix(w->engine, out, effective_think_mode(w->cfg));
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
 }
 

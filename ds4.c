@@ -62,15 +62,27 @@
 #define DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE (160000.0f)
 #define DS4_DEFAULT_ROPE_ORIG_CTX       UINT64_C(65536)
 
-static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
+/* Reasoning-effort prefixes, verbatim from the DeepSeek-V4-Flash-0731 reference
+ * encoder (encoding/encoding_dsv4.py, REASONING_EFFORT_PROMPTS).  Upstream's
+ * "low" is the empty string, so it needs no constant here.  Both are injected
+ * at the very start of the conversation, ahead of the system message, which is
+ * where the reference encoder puts them (render_message: index == 0 and
+ * thinking_mode == "thinking"). */
+static const char DS4_REASONING_EFFORT_HIGH_PREFIX[] =
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
     "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
-/* DeepSeek recommends Think Max only with at least a 384K-token context window.
- * Below that size we keep ordinary thinking to avoid injecting a prompt that
- * asks for a reasoning budget the allocated context is not meant to hold. */
-#define DS4_THINK_MAX_MIN_CONTEXT 393216u
+static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+
+/* DeepSeek recommends a 384K-token output budget for BOTH the high and max
+ * effort levels, so below that context size we fall back to the prefix-free
+ * low level rather than injecting a prompt that asks for a reasoning budget
+ * the allocated context is not meant to hold. */
+#define DS4_THINK_EFFORT_MIN_CONTEXT 393216u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
@@ -23043,8 +23055,11 @@ static void encode_chat_prompt(
         ds4_think_mode   think_mode,
         token_vec       *out) {
     token_vec_push(out, vocab->bos_id);
-    if (think_mode == DS4_THINK_MAX) {
-        bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
+    {
+        /* Effort prefix ahead of the system message, matching the reference
+         * encoder's placement.  LOW and NONE contribute nothing. */
+        const char *effort = ds4_think_effort_prefix(think_mode);
+        if (effort[0]) bpe_tokenize_text(vocab, effort, out);
     }
     if (system && system[0]) {
         bpe_tokenize_text(vocab, system, out);
@@ -23135,8 +23150,9 @@ void ds4_encode_chat_prompt(
     encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
 }
 
-void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
-    bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
+void ds4_chat_append_effort_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
+    const char *effort = ds4_think_effort_prefix(mode);
+    if (effort[0]) bpe_tokenize_text(&e->vocab, effort, tokens);
 }
 
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
@@ -27959,29 +27975,48 @@ const char *ds4_backend_name(ds4_backend backend) {
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
-    return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
+    return mode != DS4_THINK_NONE;
 }
 
 const char *ds4_think_mode_name(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_NONE: return "none";
+    case DS4_THINK_LOW:  return "low";
     case DS4_THINK_HIGH: return "high";
     case DS4_THINK_MAX:  return "max";
     }
     return "unknown";
 }
 
+const char *ds4_think_high_prefix(void) {
+    return DS4_REASONING_EFFORT_HIGH_PREFIX;
+}
+
 const char *ds4_think_max_prefix(void) {
     return DS4_REASONING_EFFORT_MAX_PREFIX;
 }
 
-uint32_t ds4_think_max_min_context(void) {
-    return DS4_THINK_MAX_MIN_CONTEXT;
+const char *ds4_think_effort_prefix(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_HIGH: return DS4_REASONING_EFFORT_HIGH_PREFIX;
+    case DS4_THINK_MAX:  return DS4_REASONING_EFFORT_MAX_PREFIX;
+    case DS4_THINK_NONE:
+    case DS4_THINK_LOW:
+        break;
+    }
+    return "";
+}
+
+uint32_t ds4_think_effort_min_context(void) {
+    return DS4_THINK_EFFORT_MIN_CONTEXT;
 }
 
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
-    if (mode == DS4_THINK_MAX && (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
-        return DS4_THINK_HIGH;
+    const uint32_t ctx = (uint32_t)(ctx_size > 0 ? ctx_size : 0);
+    if ((mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX) &&
+        ctx < DS4_THINK_EFFORT_MIN_CONTEXT)
+    {
+        return DS4_THINK_LOW;
     }
     return mode;
 }

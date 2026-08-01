@@ -1545,7 +1545,7 @@ static eval_config parse_options(int argc, char **argv) {
         .soft_limit_reply_budget = 1024,
         .hard_limit_reply_budget = 512,
         .soft_limit_think_close_rank = 3,
-        .think_mode = DS4_THINK_HIGH,
+        .think_mode = DS4_THINK_LOW,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -1626,9 +1626,9 @@ static eval_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--think")) {
-            c.think_mode = DS4_THINK_HIGH;
+            c.think_mode = DS4_THINK_LOW;
         } else if (!strcmp(arg, "--think-max")) {
-            c.think_mode = DS4_THINK_MAX;
+            c.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--nothink")) {
             c.think_mode = DS4_THINK_NONE;
         } else if (!strcmp(arg, "--plain")) {
@@ -2434,8 +2434,8 @@ static int eval_auto_context_size(ds4_engine *engine,
     int ctx = EVAL_MAX_CONTEXT;
     int max_prompt = 0;
     int max_case = -1;
-    const int min_ctx = cfg->think_mode == DS4_THINK_MAX ?
-                        (int)ds4_think_max_min_context() : 1;
+    const int min_ctx = cfg->think_mode == DS4_THINK_HIGH ?
+                        (int)ds4_think_effort_min_context() : 1;
 
     /* Think Max downgrades to normal thinking under its minimum context.  Size
      * the prompts iteratively so the prompt tokenizer sees the same effective
@@ -2460,13 +2460,13 @@ static int eval_auto_context_size(ds4_engine *engine,
 }
 
 static void eval_warn_think_max_downgraded(const eval_config *cfg) {
-    if (cfg->think_mode != DS4_THINK_MAX ||
-        ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size) == DS4_THINK_MAX) {
+    if (cfg->think_mode != DS4_THINK_HIGH ||
+        ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size) == DS4_THINK_HIGH) {
         return;
     }
     fprintf(stderr,
             "ds4-eval: warning: --think-max needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
-            ds4_think_max_min_context(),
+            ds4_think_effort_min_context(),
             cfg->ctx_size);
 }
 
