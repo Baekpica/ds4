@@ -22551,7 +22551,24 @@ struct ds4_engine {
     bool mtp_ready;
     bool dspark_ready;
     bool boot_prewarm_done;   /* inc-14b: prewarm ran (or was attempted) */
+    /* v0.5.1 inc4: MTP accept guard -- a process-wide mismatch detector for
+     * the MTP draft arms (DSpark has its own calibrated yield quench; these
+     * arms had NO governance).  The fielded ggufs carry no generation
+     * metadata (the 0731 and legacy bases have byte-identical headers), so
+     * a wrong-generation support model can only be caught by MEASUREMENT:
+     * spec decode is lossless, so a mismatched MTP costs pure speed at
+     * accept ~0% -- vs 50-80% for any healthy pairing.  After the first
+     * DS4_MTP_GUARD_MIN_DRAFTS drafted tokens, cumulative accept below
+     * DS4_MTP_GUARD_MIN_ACCEPT trips a terminal process-wide disable with a
+     * loud line; decode continues plain.  DS4_MTP_ACCEPT_GUARD=0 disarms. */
+    bool mtp_guard_on;
+    bool mtp_spec_disabled;
+    uint64_t mtp_guard_drafts;
+    uint64_t mtp_guard_hits;
 };
+
+#define DS4_MTP_GUARD_MIN_DRAFTS 256u
+#define DS4_MTP_GUARD_MIN_ACCEPT 0.15
 
 static bool cpu_directional_steering_enabled(
         const float *dirs,
@@ -33455,6 +33472,14 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     ctx->max_seq = (uint32_t)max_seq;
     ctx->mtp_force_draft_tok = -1;          /* S1.1 gate hook: off in production */
     ctx->mtp_force_draft_from = 0;
+    /* v0.5.1 inc4 gate hook: arm the force-draft knob from a server boot so
+     * the accept-guard trip leg can drive accept ~0 through the REAL serving
+     * path (a genuinely-broken support model is not something we keep on
+     * disk).  Gate-only, exactly like the force knobs above. */
+    {
+        const char *fe = getenv("DS4_MTP_FORCE_DRAFT_TOK");
+        if (fe && fe[0]) ctx->mtp_force_draft_tok = atoi(fe);
+    }
     ctx->mtp_force_norollback = 0;          /* S1.1 M3 gate sensitivity knob: off in production */
     ctx->rollback_verify = 0;               /* S1.1 M3 gate rollback self-check: off in production */
     ctx->rollback_verify_fails = 0;
@@ -35134,6 +35159,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     double   *ad_wall   = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;
     double   *ad_ms_cur = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;   /* 0 = no estimate yet */
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
+    /* v0.5.1 inc4: were the drafts the accept loop is consuming produced by
+     * the MTP arms (vs DSpark)?  Set at each step's draft production; the
+     * accept guard only accounts MTP-sourced drafts. */
+    uint8_t   drafts_mtp_sourced = 0;
     if (spec_accept) ok = ok && dbuf && ndr && vqtok && vpos && vsid && vfirst && vnr && vlogits;
     if (dspark_mode) ok = ok && mk_cand && mk_prev && mk_bias && mk_logits && pf_inj_pos && pf_inj_sid &&
                          dspark_step_inj_pos && dspark_step_inj_sid && dspark_step_inj_src && dspark_depth_cap &&
@@ -35884,9 +35913,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     if (dspark_trace) trace_comp[b]++;
                     mtp_acc_drafts++;
                     sst[b].spec_drafts++;
+                    if (drafts_mtp_sourced) ctx->e->mtp_guard_drafts++;
                     if (dft != u) break;   /* draft mismatched the genuine token -> reject tail */
                     mtp_acc_hits++;
                     sst[b].spec_hits++;
+                    if (drafts_mtp_sourced) ctx->e->mtp_guard_hits++;
                     /* draft j accepted: its row (input == committed token) yields the next real token.
                      * sample_override sees a scanner already advanced through the just-committed
                      * u (on_token above ran synchronously), so its verdict is position-exact. */
@@ -35959,6 +35990,25 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     if (page)
                         ds4_metric_set(&mreg->kv_pages_resident,
                                        ds4_batch_slabs_cache_resident(&ctx->sl) / page);
+                }
+            }
+            /* v0.5.1 inc4: MTP accept guard evaluation (see the engine
+             * fields).  One comparison per accept step; trips at most once
+             * per process. */
+            if (ctx->e->mtp_guard_on && !ctx->e->mtp_spec_disabled &&
+                ctx->e->mtp_guard_drafts >= DS4_MTP_GUARD_MIN_DRAFTS) {
+                const double acc = (double)ctx->e->mtp_guard_hits /
+                                   (double)ctx->e->mtp_guard_drafts;
+                if (acc < DS4_MTP_GUARD_MIN_ACCEPT) {
+                    ctx->e->mtp_spec_disabled = true;
+                    fprintf(stderr,
+                            "ds4: MTP accept %.1f%% over the first %llu drafts -- far below any "
+                            "healthy pairing; the MTP support model likely mismatches the base "
+                            "checkpoint (wrong generation). Speculative MTP decode DISABLED for "
+                            "this process; decode continues plain and lossless. "
+                            "(DS4_MTP_ACCEPT_GUARD=0 disarms this guard)\n",
+                            100.0 * acc,
+                            (unsigned long long)ctx->e->mtp_guard_drafts);
                 }
             }
             if (dspark_trace || dspark_quench) {
@@ -36175,6 +36225,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                                                    scom, sbank, (int)Dspec);
                     for (uint32_t i = 0; i < nl; i++) ds4_gpu_tensor_free(srows[i]);
                 }
+                drafts_mtp_sourced = (!dspark_mode && !ctx->e->mtp_spec_disabled) ? 1u : 0u;
                 if (dspark_mode && !dspark_now) {
                     /* D4.5e gate: DSpark concurrency-gated OFF this step -> draft nothing, so
                      * the next step's verify is 1 row/bank (plain batched decode). */
@@ -36228,6 +36279,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                             }
                         }
                     }
+                } else if (ctx->e->mtp_spec_disabled) {
+                    /* v0.5.1 inc4: accept guard tripped -- the MTP arms draft
+                     * nothing from here on (plain decode; the DSpark arms
+                     * above are quench-governed and unaffected). */
+                    for (uint32_t b = 0; b < MS; b++) ndr[b] = 0u;
                 } else if (mtp_batch_draft) {
                     /* M4b Inc5: BATCHED draft chain.  Gather every live bank's last-committed-
                      * row carry into the N-row draft slab (draft_prev_hc), run ONE depth-major
@@ -37930,9 +37986,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
-        fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
+        /* v0.5.1 inc4: nothing in the gguf identifies which base checkpoint
+         * this module was extracted for (see the engine fields) -- arm the
+         * accept guard so a wrong-generation pairing announces and disables
+         * itself instead of silently halving decode speed forever. */
+        {
+            const char *ge = getenv("DS4_MTP_ACCEPT_GUARD");
+            e->mtp_guard_on = !(ge && ge[0] == '0' && ge[1] == '\0');
+        }
+        fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)%s\n",
                 opt->mtp_path,
-                e->mtp_draft_tokens);
+                e->mtp_draft_tokens,
+                e->mtp_guard_on ?
+                    " [accept guard armed: a mismatched pairing disables itself]" : "");
     }
 
     /* DSpark/dflash block-drafter: a second support model (3 MoE layers + heads)
