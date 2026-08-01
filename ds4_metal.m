@@ -4566,6 +4566,12 @@ uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64_t offset, 
     return bytes <= obj.bytes - offset ? bytes : obj.bytes - offset;
 }
 
+uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    /* Metal has no demand-mapped reservations; nothing is trimmable. */
+    (void)tensor; (void)offset; (void)bytes;
+    return 0;
+}
+
 uint64_t ds4_gpu_vmm_demand_page(void) {
     return 0;
 }

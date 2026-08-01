@@ -48,6 +48,7 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 ds4_gpu_tensor *ds4_gpu_tensor_reserve(uint64_t bytes);
 int ds4_gpu_tensor_ensure(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
+uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 uint64_t ds4_gpu_vmm_demand_page(void);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);

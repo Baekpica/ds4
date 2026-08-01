@@ -32665,6 +32665,13 @@ struct ds4_batch_ctx {
     uint64_t        comp_map_budget;
     uint8_t         comp_map_budget_pinned;
     uint64_t        mem_rejects;
+    /* v0.5.1 Inc2 (field #31): banks whose demand-mapped cache pages were
+     * released under budget pressure at admission, and the bytes returned.
+     * The pool is grow-only per bank, so long-running agentic churn walks
+     * every bank to its high-water extent; trim makes eviction give the
+     * pages back instead of squeezing the weight page cache. */
+    uint64_t        trim_banks;
+    uint64_t        trim_bytes;
     /* v0.2.x observability: the finishing sequence's serving stats, filled
      * immediately before every on_done callback with real tokens (see
      * ds4_cont_last_done_stats in ds4.h). */
@@ -33303,6 +33310,113 @@ static uint64_t ds4_batch_bank_map_projection(const ds4_batch_ctx *ctx, uint32_t
         }
     }
     return need;
+}
+
+/* v0.5.1 Inc2 (field #31): release ONE bank's demand-mapped cache pages
+ * across every slab family the projection above charges (same offsets, same
+ * strides).  Only pages entirely inside the bank's span come back -- strides
+ * are not page-aligned and edge pages are shared with neighbor banks.  The
+ * caller must have synced off-capture and must treat the bank's content as
+ * destroyed afterward.  Eager slabs (no VMM) trim to zero harmlessly. */
+static uint64_t ds4_batch_bank_trim_pages(ds4_batch_ctx *ctx, uint32_t b) {
+    ds4_batch_slabs *sl = &ctx->sl;
+    uint64_t freed = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (sl->multi_comp[il])
+            freed += ds4_gpu_tensor_trim(sl->multi_comp[il],
+                                         (uint64_t)b * sl->comp_bank_bytes[il],
+                                         sl->comp_bank_bytes[il]);
+        if (sl->multi_comp_fp8[il]) {
+            const uint64_t f8b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES;
+            freed += ds4_gpu_tensor_trim(sl->multi_comp_fp8[il], (uint64_t)b * f8b, f8b);
+        }
+        if (sl->multi_index[il])
+            freed += ds4_gpu_tensor_trim(sl->multi_index[il],
+                                         (uint64_t)b * sl->index_bank_bytes[il],
+                                         sl->index_bank_bytes[il]);
+        if (sl->multi_index_fp4[il]) {
+            const uint64_t f4b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
+            freed += ds4_gpu_tensor_trim(sl->multi_index_fp4[il], (uint64_t)b * f4b, f4b);
+            const uint64_t s4b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
+            freed += ds4_gpu_tensor_trim(sl->multi_index_scale[il], (uint64_t)b * s4b, s4b);
+        }
+    }
+    return freed;
+}
+
+/* v0.5.1 Inc2: shed FREE banks' cache pages under admission budget pressure,
+ * cheapest warm value first -- history-invalid banks, then valid banks by
+ * ascending committed prefix (rebuilding a short prefix costs least).  Live,
+ * pending-prefill, target, and fork/partial-source banks are never victims.
+ * One device sync before the first unmap: admission runs on the host between
+ * step launches, so the sync is provably off-capture (sticky-scratch law).
+ * A trimmed bank's history and comp counters are invalidated -- it becomes
+ * indistinguishable from a never-admitted bank (the boot state the mirror
+ * read guards are proven against), and its next tenant cold-resets and
+ * re-maps on the ensure-before-emit path.  DS4_BATCH_VMM_TRIM=0 disables
+ * (A/B and field forensics only, not a ship mode). */
+static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
+                                          const uint8_t *live, const uint32_t *pflen,
+                                          uint32_t target, int protect, uint64_t want) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_BATCH_VMM_TRIM");
+        enabled = !(e && e[0] == '0' && e[1] == '\0');
+    }
+    if (!enabled || want == 0) return 0;
+    const uint32_t MS = (uint32_t)ctx->max_seq;
+    uint32_t order[DS4_MULTISEQ_MAX_SEQ];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < MS; i++) {
+        if (i == target || (protect >= 0 && i == (uint32_t)protect)) continue;
+        if (live[i] || pflen[i]) continue;
+        order[n++] = i;
+    }
+    for (uint32_t a = 1; a < n; a++) {         /* insertion sort by victim cost */
+        const uint32_t x = order[a];
+        const uint64_t kx = ctx->bank_hist_valid[x]
+                          ? (1ull << 32) + ctx->bank_hist_len[x] : 0;
+        uint32_t j = a;
+        while (j > 0) {
+            const uint32_t y = order[j - 1];
+            const uint64_t ky = ctx->bank_hist_valid[y]
+                              ? (1ull << 32) + ctx->bank_hist_len[y] : 0;
+            if (ky <= kx) break;
+            order[j] = y;
+            j--;
+        }
+        order[j] = x;
+    }
+    uint64_t freed = 0;
+    uint32_t nb = 0;
+    bool synced = false;
+    for (uint32_t a = 0; a < n && freed < want; a++) {
+        const uint32_t v = order[a];
+        if (!synced) {
+            /* cuda_ok convention: nonzero = success */
+            if (!ds4_gpu_synchronize()) return freed;
+            synced = true;
+        }
+        const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
+        if (got == 0) continue;                /* floor-resident: content intact, keep it */
+        ctx->bank_hist_valid[v] = 0u;
+        ctx->bank_hist_len[v]   = 0u;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->ms_n_comp[v][il] = 0u;
+            g->ms_n_index_comp[v][il] = 0u;
+        }
+        g->ms_emit_keep[v] = 0u;
+        freed += got;
+        nb++;
+    }
+    if (nb) {
+        ctx->trim_banks += nb;
+        ctx->trim_bytes += freed;
+        fprintf(stderr,
+                "ds4: batch vmm: trimmed %u bank(s), %.1f MiB released under budget pressure\n",
+                nb, (double)freed / 1048576.0);
+    }
+    return freed;
 }
 
 static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
@@ -35201,7 +35315,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 uint64_t flen = (uint64_t)L + mn;
                 if (flen > seq_cap) flen = seq_cap;
                 const uint64_t mneed = ds4_batch_bank_map_projection(ctx, b, flen);
-                const uint64_t mres  = ds4_batch_slabs_cache_resident(&ctx->sl);
+                uint64_t mres = ds4_batch_slabs_cache_resident(&ctx->sl);
                 /* The boot-time budget is a snapshot and goes stale in both
                  * directions (page cache settles and frees GiBs; WS
                  * MemAvailable creep eats them).  Before rejecting on it,
@@ -35225,6 +35339,20 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                             ctx->comp_map_budget = live;
                         }
                     }
+                }
+                /* v0.5.1 Inc2 (field #31): before rejecting, shed FREE banks'
+                 * pages.  Per-bank mapping is grow-only, so churning agentic
+                 * serving walks every bank to its high-water extent and the
+                 * pool squeezes the weight page cache from under the model.
+                 * Eviction now gives pages back: victims carry the cheapest
+                 * warm value first, and a trimmed bank's next tenant
+                 * cold-resets and re-maps on the ensure-before-emit path. */
+                if (mneed != 0 && mres + mneed > ctx->comp_map_budget) {
+                    const uint64_t want = mres + mneed - ctx->comp_map_budget;
+                    if (ds4_batch_trim_free_banks(ctx, g, live, pflen, b,
+                                                  (fork || partial) ? (int)fsrc : -1,
+                                                  want) > 0)
+                        mres = ds4_batch_slabs_cache_resident(&ctx->sl);
                 }
                 if (mneed != 0 && mres + mneed > ctx->comp_map_budget) {
                     ctx->mem_rejects++;

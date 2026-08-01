@@ -3194,6 +3194,36 @@ extern "C" uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64
     return res;
 }
 
+extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    /* Unmap the demand-mapped pages lying ENTIRELY inside [offset, offset+bytes)
+     * of a ds4_gpu_tensor_reserve() tensor.  Interior pages only: the caller's
+     * spans (per-bank cache strides) are not page-aligned, so an edge page can
+     * back two neighboring spans and must survive a one-sided trim.  The VA
+     * reservation is untouched -- captured graph nodes keep valid pointers, and
+     * ds4_gpu_tensor_ensure() re-maps on the next tenant's first emit.  The
+     * caller owns the ordering guarantees: no in-flight GPU work may reference
+     * the range (sync off-capture first) and nothing may read it again before
+     * an ensure.  Returns bytes released; 0 for eager (non-reserved) tensors. */
+    if (!tensor || bytes == 0) return 0;
+    if (offset > tensor->bytes) return 0;
+    if (bytes > tensor->bytes - offset) bytes = tensor->bytes - offset;
+    cuda_vmm_demand *d = cuda_vmm_demand_find(tensor->ptr, offset, bytes);
+    if (!d) return 0;                          /* eager allocation: nothing to trim */
+    const uint64_t rel = ((uint64_t)(uintptr_t)tensor->ptr + offset) - (uint64_t)d->va;
+    const uint64_t p0  = (rel + d->page - 1u) / d->page;   /* first page fully inside */
+    const uint64_t p1x = (rel + bytes) / d->page;          /* exclusive end page */
+    uint64_t released = 0;
+    for (uint64_t p = p0; p < p1x; p++) {
+        if (!d->pages[(size_t)p]) continue;
+        (void)cuMemUnmap(d->va + (CUdeviceptr)(p * d->page), (size_t)d->page);
+        (void)cuMemRelease(d->pages[(size_t)p]);
+        d->pages[(size_t)p] = 0;
+        d->mapped -= d->page;
+        released += d->page;
+    }
+    return released;
+}
+
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     if (tensor->owner == 2) {
