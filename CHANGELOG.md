@@ -5,6 +5,48 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.5.2 — 2026-08-02
+
+Field-robustness follow-up, chartered from the v0.5.0 announcement
+thread's reports: three fixes for what deep-context and interrupt-heavy
+deployments actually hit. No performance re-bases — 12k serving twins
+byte-exact per increment and across the whole release.
+
+- **Serial requests at deep `-c` are served, not 500'd** (`f1712b5`):
+  the serial fallback session's lazy graph was sized by server `-c`, not
+  the request — on a bank-holding deep boot every serial-path request
+  (Anthropic/Responses APIs, non-streaming token-id echo, continuous
+  admission rejects) demanded a graph that could never fit beside the
+  banks (measured: an ~11 GiB ask for a 26-token `/v1/messages` job at
+  `-c 250000`) and died with `lazy session graph alloc failed`,
+  deterministically. The session is now re-created at the largest ctx
+  the fit gate passes, bounded by prompt + budget + continuation
+  headroom; a later, deeper serial request regrows it (the old graph is
+  freed before its replacement is probed). When even a minimal output
+  window cannot fit the answer is a clean, retryable 503 — never the
+  doomed alloc. Serial-only deployments (no batch ctx) keep the v0.5.1
+  contract untouched. `DS4_SERVER_SERIAL_RIGHTSIZE=0` opts out;
+  `speed-bench/serial_rightsize_gate.sh` is the standing gate.
+- **Armed speculation with no engine says so** (`4cb91f8`):
+  `DS4_SERVER_COALESCE_MAX=1` (or `DS4_SERVER_COALESCE=0`) skips the
+  persistent batch ctx at boot, and speculative decode only lives in
+  the continuous engine — so a server with MTP/DSpark proudly armed
+  silently decoded plain serial at roughly half speed. The boot now
+  prints a loud warning naming the cause and the fix
+  (`DS4_SERVER_COALESCE_MAX>=2`, or `--no-spec` to disarm instead).
+- **Dead clients stop costing GPU** (`19e5ed1`): a killed streaming
+  request already aborted within a step, but a killed **non-streaming**
+  request decoded to its full budget (default 384K tokens) for nobody,
+  and a client killed **mid-prefill** had its whole deep prompt
+  prefilled (~80 s at 45k) and then began decoding. The zombie-reap
+  socket probe now runs at every abort point: between admission prefill
+  chunks (a new engine liveness hook — the pending bank resets to free
+  at the next chunk boundary), at each continuous decode token, and at
+  each serial decode step. Measured: a mid-prefill kill now wastes one
+  chunk (14% of that prompt) instead of the full prefill plus a phantom
+  decode. `DS4_SERVER_DISCONNECT_ABORT=0` opts out;
+  `speed-bench/abort_paths_gate.sh` is the standing gate.
+
 ## v0.5.1 — 2026-08-02
 
 The agentic-serving robustness fast-follow: four field-driven fixes for
