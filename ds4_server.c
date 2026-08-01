@@ -14535,6 +14535,30 @@ int main(int argc, char **argv) {
                            cerr[0] ? cerr : "unknown error");
             }
         }
+        /* v0.5.2 inc2 (field: silent spec-off at DS4_SERVER_COALESCE_MAX=1).
+         * Speculative decode lives in the continuous batch engine; a boot
+         * whose serving shape cannot host it -- coalescing off, cmax=1, or
+         * batch-ctx creation failure -- silently decodes plain serial while
+         * the launch defaults proudly armed MTP/DSpark.  Same transparency
+         * philosophy as the v0.5.1 accept guard: say it loudly at boot. */
+        if (!s.batch_ctx) {
+            const char *me = getenv("DS4_CONT_MTP_MODE");
+            const char *de = getenv("DS4_CONT_DSPARK");
+            const bool spec_armed = (me && me[0] && strcmp(me, "0") != 0) ||
+                                    (de && de[0] && strcmp(de, "0") != 0);
+            if (spec_armed) {
+                const char *why = !coalesce_on ? "DS4_SERVER_COALESCE=0" :
+                                  cmax <= 1    ? "DS4_SERVER_COALESCE_MAX=1" :
+                                                 "batch ctx creation failed";
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: speculative decode is ARMED but has no engine to run on: "
+                           "the continuous batch path is disabled (%s), so every request decodes "
+                           "plain serial -- expect roughly half the decode speed. Speculation "
+                           "needs the continuous path (DS4_SERVER_COALESCE_MAX>=2; default 32); "
+                           "--no-spec silences this by disarming.",
+                           why);
+            }
+        }
     }
 
     /* inc-14b: deferred boot prewarm -- bank placement above read free memory

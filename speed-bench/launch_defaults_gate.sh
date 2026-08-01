@@ -39,6 +39,15 @@
 #   leg guard_off     forced-wrong drafts + DS4_MTP_ACCEPT_GUARD=0 (escape).
 #       asserts: NO trip line; drafts keep flowing past the guard window.
 #
+# v0.5.2 inc2 — serving-shape transparency legs (forum 378855 post 8:
+# DS4_SERVER_COALESCE_MAX=1 kills the continuous path at boot and spec
+# lives there; the server silently decoded plain serial with spec armed):
+#   leg spec_shape     COALESCE_MAX=1 zero-config.  asserts: the loud
+#       "ARMED but has no engine" line; no batch ctx; completion serves
+#       serially; ds4_spec_drafts_total stays 0.
+#   leg spec_shape_off COALESCE_MAX=1 + --no-spec (control).  asserts: NO
+#       shape line (disarmed = nothing to warn about); completion serves.
+#
 # Runs FROM the Mac over SSH like the other gates. NOTE: each boot kills any
 # running ds4-server on $R. End state: ds4-server killed, box left free.
 #
@@ -216,6 +225,30 @@ d=$(metric ds4_spec_drafts_total)
 [ -n "$d" ] && [ "$d" -ge 256 ] \
   || fail "guard_off: drafting stopped without the guard (drafts=${d:-absent})"
 log "guard_off PASS (drafts=$d kept flowing on forced-wrong drafts, no trip)"
+
+# ---- v0.5.2 inc2: serving-shape transparency ------------------------------
+# Field (forum 378855 post 8): DS4_SERVER_COALESCE_MAX=1 disables the
+# continuous batch path AT BOOT (the create block is gated on cmax>1), and
+# speculation only lives there -- the server silently decoded plain serial
+# with MTP/DSpark armed.  The fix is a loud boot line naming the shape.
+
+# ---- leg 7: cmax=1 with armed spec must SAY it ----------------------------
+BOOT_ENV="DS4_SERVER_COALESCE_MAX=1" boot spec_shape
+srv_has spec_shape 'speculative decode is ARMED but has no engine' \
+  || fail "spec_shape: loud shape line missing at COALESCE_MAX=1"
+srv_has spec_shape 'persistent batch ctx ready' \
+  && fail "spec_shape: batch ctx exists at COALESCE_MAX=1?"
+completion spec_shape
+d=$(metric ds4_spec_drafts_total); [ "${d:-0}" = 0 ] \
+  || fail "spec_shape: drafts=$d flowed without a batch ctx?"
+log "spec_shape PASS (loud line + serial completion + drafts=0)"
+
+# ---- leg 8: disarmed spec at cmax=1 stays QUIET (control) -----------------
+BOOT_ENV="DS4_SERVER_COALESCE_MAX=1" boot spec_shape_off --no-spec
+srv_has spec_shape_off 'speculative decode is ARMED but has no engine' \
+  && fail "spec_shape_off: shape line fired with spec disarmed (--no-spec)"
+completion spec_shape_off
+log "spec_shape_off PASS (quiet, serial completion)"
 
 ssh "$R" "pkill -x ds4-server; exit 0"
 log "ALL LEGS PASS — artifacts in $OUT (server killed, $R left free)"
