@@ -35237,9 +35237,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * must sit AT break-even, not above: false quenches cost more than
      * late ones.  Recalibrate whenever verify or plain cost moves:
      * DS4_DSPARK_TRACE + tools/dspark_trace_replay.py, C = geo(yield) /
-     * geo(measured speedup) per band.  2.10 = v0.4 verify cost (C
-     * 2.03-2.08 low band, 2.40 @240K). */
-    double dspark_shadow_guard = 2.10;
+     * geo(measured speedup) per band.  2.16 = v0.5 / 0731-identity
+     * calibration (same-day 12k pair, 166-step sample: plain 50.5
+     * ms/step, spec 35.5 x 3.08 = 109.3 -> C 2.165; prior 2.10 = v0.4
+     * verify cost, C 2.03-2.08 low band, 2.40 @240K -- the deep ramp
+     * stays open, v0.6). */
+    double dspark_shadow_guard = 2.16;
     double dspark_shadow_alpha = 0.125;
     uint32_t dspark_shadow_minev = 4u;
     double dspark_shadow_budget = 4.0;
