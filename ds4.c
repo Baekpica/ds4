@@ -15929,13 +15929,20 @@ static double now_thread_cpu_sec(void) {
  * edges MUST mirror the topk kernel specialisation thresholds in
  * ds4_gpu_indexer_topk_tensor (1024/2048/4096/8192); a captured step's
  * launch topology is pinned to the band and only band CROSSINGS rekey.
- * Callers guarantee n_comp <= 8192 (capture eligibility excludes the
- * live-sized chunked topk tier above that). */
+ * 13d-1: above 8192 the ladder keeps doubling — the streaming top-512
+ * tier is capture-stable at any band (it scans the live substrate count,
+ * not the band), and the scorers' band-stride writes stay far inside the
+ * prefill-sized scores buffer (<= 8 capture rows of band floats vs the
+ * comp_cap * pc allocation).  The <= 8192 tiers are BYTE-STABLE vs the
+ * pre-13d ladder: existing captured shapes keep their keys. */
 static uint32_t metal_graph_cont_capture_band(uint32_t n_comp) {
     if (n_comp <= 1024u) return 1024u;
     if (n_comp <= 2048u) return 2048u;
     if (n_comp <= 4096u) return 4096u;
-    return 8192u;
+    if (n_comp <= 8192u) return 8192u;
+    uint32_t band = 16384u;
+    while (band < n_comp) band <<= 1;
+    return band;
 }
 
 /* C3-Inc2 twin selftest (DS4_COMP_PAIR_ROWS_SELFTEST=<call budget>, eager
@@ -31052,13 +31059,26 @@ static bool metal_graph_batch_eval_logits(
             }
         }
         if (elig) {
-            /* The live-sized chunked topk tier (> 8192 compressed rows) has
-             * no capture-stable grid; leave long-context steps eager. */
-            for (uint32_t il = 0; elig && il < DS4_N_LAYER; il++) {
-                if (ds4_layer_compress_ratio(il) == 0u) continue;
-                uint32_t nc, ni;
-                metal_graph_cont_capture_counts(g, il, n, &nc, &ni);
-                if (nc > 8192u || ni > 8192u) elig = false;
+            /* 13d-1: the standing >8192-row exclusion is LIFTED — the
+             * streaming top-512 tier gives every depth a capture-stable
+             * topk (substrate scan bound, <<<n_tokens,512>>>, zero
+             * scratch), and the band ladder doubles past 8192.  The
+             * exclusion survives ONLY under DS4_CUDA_NO_TOPK_STREAM: that
+             * escape re-routes deep topk to the live-sized chunked tree,
+             * whose cuda_tmp_alloc refuses under an open capture — so the
+             * forensic leg keeps deep steps eager exactly as before. */
+            static int topk_stream_off = -1;
+            if (topk_stream_off < 0) {
+                topk_stream_off = getenv("DS4_CUDA_NO_TOPK_STREAM") != NULL ||
+                                  getenv("DS4_CUDA_NO_TOPK2048") != NULL;
+            }
+            if (topk_stream_off) {
+                for (uint32_t il = 0; elig && il < DS4_N_LAYER; il++) {
+                    if (ds4_layer_compress_ratio(il) == 0u) continue;
+                    uint32_t nc, ni;
+                    metal_graph_cont_capture_counts(g, il, n, &nc, &ni);
+                    if (nc > 8192u || ni > 8192u) elig = false;
+                }
             }
         }
         if (elig && metal_graph_cont_capture_prepare(g, pos0, n,

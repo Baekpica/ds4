@@ -15260,7 +15260,14 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
-        uint32_t top_k) {
+        uint32_t top_k,
+        /* 13d-1: nullable live substrate.  Under capture the caller passes
+         * &g_layer_dev[il]: n_comp stays the CAPTURED BAND (the scores row
+         * stride the producer wrote), while the scan bound and rotation
+         * modulo read n_index_comp at replay time.  Eager callers pass
+         * NULL and scan exactly n_comp; for equal live counts the walk is
+         * identical, so eager and captured selections are byte-identical. */
+        const struct ds4_layer_scalars *ls) {
     constexpr uint32_t STREAM_THREADS = 512u;
     constexpr uint32_t STREAM_ITEMS = 4u;
     constexpr uint32_t STREAM_CAP = STREAM_THREADS * STREAM_ITEMS;   /* 2048 */
@@ -15278,26 +15285,27 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
     const uint32_t t = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
-    const float *row = scores + (uint64_t)t * n_comp;
+    const float *row = scores + (uint64_t)t * n_comp;   /* stride = caller extent (band under capture) */
+    const uint32_t n = ls ? ls->n_index_comp : n_comp;  /* live scan bound */
     if (tid == 0) { s_cnt = 0; s_thr = 0; }
     __syncthreads();
 
-    const uint32_t start = (uint32_t)(((uint64_t)(t + 1u) * 0x9E3779B9u) % n_comp);
+    const uint32_t start = (uint32_t)(((uint64_t)(t + 1u) * 0x9E3779B9u) % n);
     /* tile = one read per thread: STREAM_CAP - tile = 1536 leaves 1024 keys
      * of slack above the kept top_k, so a compact runs only when the buffer
      * genuinely fills.  A wider tile with zero slack (CAP - tile == top_k)
      * degenerates to a full sort per tile at depth — slack, not capacity,
      * prices the compact cadence (proto receipt topk_diet_timing3 vs 4). */
     const uint32_t tile = blockDim.x;
-    for (uint32_t base = 0; base < n_comp; base += tile) {
+    for (uint32_t base = 0; base < n; base += tile) {
         const uint64_t thr = s_thr;
         {
             const uint32_t i = base + tid;
             uint64_t key = 0;
             bool take = false;
-            if (i < n_comp) {
+            if (i < n) {
                 uint32_t c = start + i;
-                if (c >= n_comp) c -= n_comp;
+                if (c >= n) c -= n;
                 key = topk_pack_key(row[c], c);
                 take = key > thr;   /* thr=0 accepts all real keys */
             }
@@ -16206,6 +16214,14 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
                                  index_fp4, index_scale, q_scale);
 }
 
+/* 13d-1 adjudication instrument state (DS4_CUDA_TOPK_STREAM_VERIFY):
+ * dual-run stream-vs-tree topk on eager legs, compare, restore. */
+static uint32_t *g_topk_verify_buf = NULL;
+static size_t    g_topk_verify_cap = 0;
+static int       g_topk_verify_pending = 0;
+static uint64_t  g_topk_verify_calls = 0;
+static uint64_t  g_topk_verify_bad = 0;
+
 extern "C" int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -16325,25 +16341,56 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                n_comp, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
-    /* inc-4: streaming exact top-512 replaces the chunked tree for prefill
-     * widths (this point is only reached with n_spec > 8192).  Legacy
-     * fixed-n_comp callers only — prefill/batch pass (0, UINT32_MAX);
-     * captured decode keeps the specialized tiers (PC5 substrate semantics
-     * unchanged).  DS4_CUDA_NO_TOPK_STREAM is the forensic escape. */
-    if (top_k == 512u && n_tokens >= 32u && !pc5_active &&
+    /* inc-4: streaming exact top-512 replaces the chunked tree at n_spec >
+     * 8192 (the only way to reach this point).  13d-1: ALL widths and BOTH
+     * regimes — captured decode passes the live substrate (the scan bound
+     * and rotation read n_index_comp at replay; the row stride stays the
+     * captured band the scorer wrote), eager callers keep the exact-n_comp
+     * scan.  Grid <<<n_tokens, 512>>> + static smem + zero scratch = the
+     * capture-stable shape that lifts the >8192-row cont-capture exclusion
+     * (ds4.c eligibility); the chunked tree below survives only as the
+     * DS4_CUDA_NO_TOPK_STREAM forensic escape. */
+    if (top_k == 512u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL) {
         indexer_topk_stream512_kernel<<<n_tokens, 512, 0, ds4_current_stream()>>>(
                 (uint32_t *)selected->ptr,
                 (const float *)scores->ptr,
-                n_comp, n_tokens, top_k);
+                n_comp, n_tokens, top_k, ls);
         static int logged_topk_stream = 0;
         if (!logged_topk_stream) {
             logged_topk_stream = 1;
-            fprintf(stderr, "ds4: indexer topk stream active (first n_comp=%u n_tokens=%u)\n",
-                    n_comp, n_tokens);
+            fprintf(stderr, "ds4: indexer topk stream active (first n_comp=%u n_tokens=%u %s)\n",
+                    n_comp, n_tokens, pc5_active ? "captured" : "eager");
         }
-        return cuda_ok(cudaGetLastError(), "indexer topk stream launch");
+        /* 13d-1 adjudication instrument: with DS4_CUDA_TOPK_STREAM_VERIFY on
+         * an EAGER leg, save the stream selection, fall through into the
+         * chunked tree below, byte-compare, then restore the stream result
+         * (stream stays authoritative).  Pinpoints the first in-vivo
+         * stream-vs-tree divergence on REAL scores — the synthetic proto
+         * sweep is memcmp-clean at these shapes, so any diff here is
+         * data-dependent. */
+        static int topk_verify_env = -1;
+        if (topk_verify_env < 0) {
+            topk_verify_env = getenv("DS4_CUDA_TOPK_STREAM_VERIFY") != NULL ? 1 : 0;
+        }
+        if (!topk_verify_env || pc5_active) {
+            return cuda_ok(cudaGetLastError(), "indexer topk stream launch");
+        }
+        if (!cuda_ok(cudaGetLastError(), "indexer topk stream launch")) return 0;
+        cudaStreamSynchronize(ds4_current_stream());
+        {
+            const size_t sel_bytes = (size_t)n_tokens * top_k * sizeof(uint32_t);
+            if (g_topk_verify_cap < sel_bytes) {
+                free(g_topk_verify_buf);
+                g_topk_verify_buf = (uint32_t *)malloc(sel_bytes * 2u);
+                g_topk_verify_cap = g_topk_verify_buf ? sel_bytes : 0;
+            }
+            if (!g_topk_verify_buf) return 1;
+            cudaMemcpy(g_topk_verify_buf, selected->ptr, sel_bytes, cudaMemcpyDeviceToHost);
+            g_topk_verify_pending = 1;
+        }
+        /* fall through into the chunked-tree tier */
     }
     if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
@@ -16408,7 +16455,42 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                  n_sets * top_k,
                                                                  cur_stride,
                                                                  ls);
-        return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
+        {
+            const int tree_rc = cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
+            if (tree_rc && g_topk_verify_pending) {
+                g_topk_verify_pending = 0;
+                cudaStreamSynchronize(ds4_current_stream());
+                const size_t sel_bytes = (size_t)n_tokens * top_k * sizeof(uint32_t);
+                const size_t sel_n = sel_bytes / sizeof(uint32_t);
+                uint32_t *h_stream = g_topk_verify_buf;
+                uint32_t *h_tree = g_topk_verify_buf + sel_n;
+                cudaMemcpy(h_tree, selected->ptr, sel_bytes, cudaMemcpyDeviceToHost);
+                g_topk_verify_calls++;
+                uint64_t diffs = 0;
+                int64_t first = -1;
+                for (size_t i = 0; i < sel_n; i++) {
+                    if (h_stream[i] != h_tree[i]) {
+                        if (first < 0) first = (int64_t)i;
+                        diffs++;
+                    }
+                }
+                if (diffs) {
+                    g_topk_verify_bad++;
+                    fprintf(stderr, "ds4: topk VERIFY DIFF call=%llu n_comp=%u n_tokens=%u "
+                            "diffs=%llu first=%lld (t=%lld slot=%lld) stream_id=%u tree_id=%u\n",
+                            (unsigned long long)g_topk_verify_calls, n_comp, n_tokens,
+                            (unsigned long long)diffs, (long long)first,
+                            (long long)(first / top_k), (long long)(first % top_k),
+                            h_stream[first], h_tree[first]);
+                } else if ((g_topk_verify_calls & 511u) == 1u) {
+                    fprintf(stderr, "ds4: topk VERIFY ok calls=%llu bad=%llu (last n_comp=%u n_tokens=%u)\n",
+                            (unsigned long long)g_topk_verify_calls,
+                            (unsigned long long)g_topk_verify_bad, n_comp, n_tokens);
+                }
+                cudaMemcpy(selected->ptr, h_stream, sel_bytes, cudaMemcpyHostToDevice);
+            }
+            return tree_rc;
+        }
     }
     indexer_topk_kernel<<<n_tokens, 1, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                          (const float *)scores->ptr,
@@ -18075,8 +18157,11 @@ extern "C" int ds4_cuda_cont_graphs_enabled(void) {
      *     verify 114.9 -> 106.1 ms/step (45.1 -> ~41.6 ms/tok accept-
      *     normalized, 37.8 observed) with zero fallbacks (capverify15).
      * Ineligible shapes (multi-live banks, ragged/admission, fork boundary,
-     * >8192 compressed rows, diag envs) fall back to the eager encode per
-     * step by construction.  Opt-out for diagnostics: DS4_CONT_CAPTURE=0. */
+     * diag envs) fall back to the eager encode per step by construction.
+     * 13d-1 lifted the historical >8192-compressed-rows exclusion (the
+     * streaming top-512 tier is capture-stable at any depth); it survives
+     * only under DS4_CUDA_NO_TOPK_STREAM/NO_TOPK2048 diag envs.  Opt-out
+     * for diagnostics: DS4_CONT_CAPTURE=0. */
     static int init = 0;
     static int enabled = 1;
     if (!init) {
