@@ -828,7 +828,12 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         *out = DS4_THINK_LOW;
         return true;
     }
-    if (!strcmp(s, "none")) {
+    /* "off" is what UIs actually send for the disabled state (Open WebUI 0.11
+     * does, measured 2026-08-01), and rejecting it is worse than it looks: an
+     * unknown effort value fails the whole request body parse, so the caller
+     * gets a 400 "invalid JSON request" for well-formed JSON and no hint which
+     * field was at fault. */
+    if (!strcmp(s, "none") || !strcmp(s, "off")) {
         *out = DS4_THINK_NONE;
         return true;
     }
@@ -16068,6 +16073,8 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == DS4_THINK_MAX);
     TEST_ASSERT(parse_reasoning_effort_name("none", &mode) && mode == DS4_THINK_NONE);
+    /* UIs spell the disabled state "off"; Open WebUI sends exactly this. */
+    TEST_ASSERT(parse_reasoning_effort_name("off", &mode) && mode == DS4_THINK_NONE);
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
 
     /* Each level injects exactly the reference encoder's string, and low
