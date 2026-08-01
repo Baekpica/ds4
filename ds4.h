@@ -580,6 +580,11 @@ void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
+/* v0.5.2 serial right-sizing: whether the session's lazy graph alloc is
+ * still deferred, and whether a session graph at ctx_size would pass the fit
+ * gate right now (quiet probe; fail-open like the gate itself). */
+int ds4_session_graph_pending(const ds4_session *s);
+int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);

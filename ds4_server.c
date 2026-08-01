@@ -8011,6 +8011,14 @@ struct server {
     /* v0.5.1 inc3b: paced pin-tier persist at retire (see stored_tokens).
      * DS4_SERVER_BANK_CHECKPOINT=0 = evict/shutdown persists only. */
     bool warm_checkpoint;
+    /* v0.5.2 inc1: right-size the serial session's lazy graph to the request
+     * when the full -c graph cannot fit beside the batch banks (field 500
+     * class: an 11 GiB graph demand for a 26-token job at -c 250000).
+     * serial_boot_ctx remembers the -c the server was launched with (the
+     * session's ctx changes when it is re-created right-sized).
+     * DS4_SERVER_SERIAL_RIGHTSIZE=0 restores the fail-at-full--c behavior. */
+    bool serial_rightsize;
+    int  serial_boot_ctx;
     /* KV capacity (v0.2 ws4): plain-LRU eviction is depth-split -- a record
      * with committed tokens >= warm_pin_min ("deep": an orchestrator trunk
      * that would take tens of minutes to re-prefill) is only the cold-admit
@@ -9039,7 +9047,12 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             const char *cache_text_key) {
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    /* Serial-tier record: keyed by the session's ACTUAL ctx (the payload's
+     * geometry) -- under v0.5.2 right-sizing this can be smaller than -c,
+     * and the store's <=-ctx restore filter keeps such records portable
+     * upward into any bigger later session. */
     return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
+                                              ds4_session_ctx(s->session),
                                               tokens, store_len, reason,
                                               cache_text_override,
                                               cache_text_ext,
@@ -9124,8 +9137,12 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
     }
     ds4_tokens tokens = { (int *)htok, (int)hl, (int)hl };
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    /* Bank-tier record: keyed by the SERVING ctx (the bank's geometry),
+     * never the serial session's -- v0.5.2 right-sizing can shrink that
+     * session, and a bank record must keep restoring across boots at -c. */
     const bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
-                        s->session, &tokens, (int)hl, reason,
+                        s->session, s->serial_boot_ctx,
+                        &tokens, (int)hl, reason,
                         s->warm[bank].text, 0, "bank",
                         &hooks, &staged, err, sizeof(err));
     ds4_session_payload_file_free(&staged);
@@ -11533,10 +11550,119 @@ static bool job_emit(struct job *j, const void *p, size_t n) {
     return !gone;
 }
 
+/* v0.5.2 inc1: make sure the serial session can actually allocate its graph
+ * before generate_job commits to it.  The session is created at server -c
+ * and its S6 lazy graph is sized by that ctx, NOT the request -- on a
+ * bank-holding deep boot the full graph can never fit and every serial-path
+ * request 500s at the fit gate (field: forum 378855; measured on .33 at
+ * -c 250000: an ~11 GiB graph demand for a 26-token /v1/messages job).  A
+ * serial request needs only prompt+budget positions, so when the full graph
+ * cannot fit, re-create the (still graphless) session at the LARGEST ctx the
+ * fit gate passes, bounded by what the request could use.  Binary search
+ * rather than a rounding rule because the default output budget is 384K --
+ * "prompt plus budget" degenerates to -c for budget-omitting clients.  When
+ * even a minimal output window cannot fit, refuse 503 (retryable capacity),
+ * never the doomed alloc.  A later serial request that outgrows a
+ * right-sized session re-runs this and re-creates bigger (cold; loud).
+ * Worker thread only, under gen_mu (the session swap must exclude the cont
+ * loop and the /v1/batch path).  Returns false after writing the refusal. */
+static bool serial_session_ensure_fit(server *s, job *j) {
+    if (!s->serial_rightsize) return true;
+    /* Scope: bank-holding boots only (the field 500 class).  On a
+     * serial-only deployment (no batch ctx) the full--c session IS the
+     * serving configuration: keep the v0.5.1 contract (alloc at -c, loud
+     * fit refusal when genuinely doomed).  Shrinking it would also blind
+     * the serial disk tier -- its payloads are ring-images at the stamped
+     * ctx and cannot load into a smaller session. */
+    if (!s->batch_ctx) return true;
+    long budget = j->req.max_tokens > 0 ? j->req.max_tokens : s->default_tokens;
+    if (budget < 1) budget = 1;
+    const int boot_ctx = s->serial_boot_ctx;
+    long need_full = (long)j->req.prompt.len + budget;
+    if (need_full > boot_ctx) need_full = boot_ctx;
+    /* Below a minimal output window a truncated completion is useless --
+     * refuse instead (the deep-serial guard upstream already 503s deep
+     * cont-rejects; this is the same capacity class). */
+    long need_min = (long)j->req.prompt.len + (budget < 1024 ? budget : 1024);
+    if (need_min > boot_ctx) need_min = boot_ctx;
+
+    const int cur_ctx = ds4_session_ctx(s->session);
+    const bool pending = ds4_session_graph_pending(s->session) != 0;
+    if (cur_ctx >= need_min &&
+        (!pending || ds4_engine_session_graph_fits(s->engine, cur_ctx)))
+        return true;   /* committed-and-big-enough, or pending-and-allocatable */
+
+    /* The current session cannot serve this request either way -- free it
+     * BEFORE probing so a committed right-sized graph's own GiBs count as
+     * available for its replacement (the regrow case: probing beside the old
+     * graph refuses requests the box can actually serve).  The live
+     * continuation records described that session's content. */
+    ds4_session_free(s->session);
+    s->session = NULL;
+    responses_live_clear(s);
+    anthropic_live_clear(s);
+    thinking_live_clear(s);
+
+    /* Freed graph bytes reach MemAvailable with driver-reclaim lag (the
+     * WAIT_MEM class); give the floor probe a bounded settle window. */
+    bool min_fits = false;
+    for (int tries = 0; tries < 20; tries++) {
+        if (ds4_engine_session_graph_fits(s->engine, (int)need_min)) {
+            min_fits = true;
+            break;
+        }
+        usleep(100 * 1000);
+    }
+    long target = 0;
+    if (min_fits) {
+        /* Search bound: what the request could use, plus continuation
+         * headroom so a serial conversation (agent loops on the anthropic/
+         * responses APIs live here) grows for many turns inside one session
+         * -- per-request-exact sizing would re-create every turn and
+         * cold-prefill each time. */
+        long hi = need_full + 32768;
+        if (hi > boot_ctx) hi = boot_ctx;
+        long lo = need_min;               /* invariant: lo fits */
+        while (hi - lo > 1024) {
+            const long mid = lo + (hi - lo) / 2;
+            if (ds4_engine_session_graph_fits(s->engine, (int)mid)) lo = mid;
+            else hi = mid;
+        }
+        target = lo;
+    }
+    ds4_session *ns = NULL;
+    if (target > 0 && ds4_session_create(&ns, s->engine, (int)target) == 0) {
+        s->session = ns;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: serial session right-sized ctx=%d -> %ld (boot -c %d graph "
+                   "does not fit beside the batch banks; prompt=%d budget=%ld)%s "
+                   "(DS4_SERVER_SERIAL_RIGHTSIZE=0 restores full--c alloc)",
+                   cur_ctx, target, boot_ctx, j->req.prompt.len, budget,
+                   pending ? "" : " [live serial state reset]");
+        return true;
+    }
+    /* Refusal: restore the boot-shape session (lazy graph -> holds nothing)
+     * so the server keeps its invariant and later requests re-probe fresh. */
+    if (ds4_session_create(&ns, s->engine, boot_ctx) == 0) s->session = ns;
+    else die("serial right-size: could not restore the boot session");
+    server_log(DS4_LOG_WARNING,
+               "ds4-server: serial right-size: no graph fits (prompt=%d need_min=%ld boot -c %d); refusing 503",
+               j->req.prompt.len, need_min, boot_ctx);
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "Server is temporarily at capacity for a %d-token serial request "
+             "(no session graph fits beside the batch banks); retry shortly",
+             j->req.prompt.len);
+    http_error(j->fd, s->enable_cors, 503, msg);
+    j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
+    return false;
+}
+
 /* The original single-request path: serialize the GPU, run, signal done. */
 static void run_job_single(server *s, job *j) {
     pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
-    generate_job(s, j);
+    if (serial_session_ensure_fit(s, j))
+        generate_job(s, j);
     pthread_mutex_unlock(&s->gen_mu);
     job_finish(j);
 }
@@ -11663,7 +11789,9 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
 /* Run a coalesced group (n>=2) as one batched call, then write+signal each job.
  * On batched failure, degrade gracefully to the single path per job. */
 static void generate_batch_jobs(server *s, job **jobs, int n) {
-    const int ctx_size = ds4_session_ctx(s->session);
+    const int ctx_size = s->serial_boot_ctx;   /* configured -c, not the
+                                                  (possibly right-sized)
+                                                  serial session's ctx */
     const int eos = ds4_token_eos(s->engine);
     ds4_tokens *prompts = xmalloc((size_t)n * sizeof(*prompts));
     int *max_new = xmalloc((size_t)n * sizeof(int));
@@ -11980,14 +12108,14 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
         const int didx = ds4_kvstore_find_text_prefix(&s->kv, ptext,
                              ds4_engine_model_id(s->engine),
                              ds4_engine_routed_quant_bits(s->engine),
-                             ds4_session_ctx(s->session));
+                             s->serial_boot_ctx);   /* bank tier: serving ctx */
         if (didx >= 0)
             rb = cont_disk_victim_pick(s, occ, s->kv.entry[didx].tokens);
         if (rb >= 0) {
             char *rtext = NULL;
             size_t rlen = 0;
             const int rtok = ds4_kvstore_try_restore_bank_text(&s->kv,
-                                 s->engine, s->session, s->batch_ctx,
+                                 s->engine, s->serial_boot_ctx, s->batch_ctx,
                                  (uint32_t)rb, ptext, &rtext, &rlen);
             if (rtok > 0) {
                 warm_rec_invalidate(s, rb);
@@ -12104,7 +12232,7 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
             const int didx = ds4_kvstore_find_text_lcp(&s->kv, ptext,
                                  ds4_engine_model_id(s->engine),
                                  ds4_engine_routed_quant_bits(s->engine),
-                                 ds4_session_ctx(s->session), dfloor, &dlcp);
+                                 s->serial_boot_ctx, dfloor, &dlcp);
             if (didx >= 0) {
                 const int rb = cont_disk_victim_pick(s, occ,
                                    s->kv.entry[didx].tokens);
@@ -12779,7 +12907,7 @@ static void generate_continuous_jobs(server *s, job *first) {
     else
         server_log(DS4_LOG_GENERATION,
                    "ds4-server: continuous batch ctx=%d path=cont served=%d fallback=%d",
-                   ds4_session_ctx(s->session), cs.served, fallback);
+                   s->serial_boot_ctx, cs.served, fallback);
 }
 
 /* S6 default-flip (2026-07-07): default coalesced-group Σ-token cap, shared by
@@ -12826,7 +12954,7 @@ static void *worker_main(void *arg) {
      * every row's final position (budget part; see job_tok_footprint).
      * Default is the shared S6 value (see coalesce_max_tokens_default). */
     const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
-    int cmaxtok = ct ? atoi(ct) : coalesce_max_tokens_default(ds4_session_ctx(s->session));
+    int cmaxtok = ct ? atoi(ct) : coalesce_max_tokens_default(s->serial_boot_ctx);
     if (cmaxtok < 0) cmaxtok = 0;
 
     for (;;) {
@@ -13117,7 +13245,8 @@ static void handle_batch(server *s, int fd, const char *body) {
         return;
     }
 
-    const int ctx_size = ds4_session_ctx(s->session);
+    const int ctx_size = s->serial_boot_ctx;   /* client thread: must not read
+                                                  the swap-able serial session */
     const ds4_think_mode tm = think ? ds4_think_mode_for_context(DS4_THINK_HIGH, ctx_size)
                                     : DS4_THINK_NONE;
     ds4_tokens *toks = calloc((size_t)n, sizeof(*toks));
@@ -13302,7 +13431,7 @@ static void send_stats(server *s, int fd, bool as_json) {
         buf_printf(&b, ",\"context\":%d,\"max_seq\":%d,\"uptime_seconds\":%llu,"
                        "\"requests_inflight\":%llu,"
                        "\"artifact_source\":\"%s\",\"derived_artifacts\":%llu}",
-                   ds4_session_ctx(s->session), s->batch_ctx_max_seq,
+                   s->serial_boot_ctx, s->batch_ctx_max_seq,
                    (unsigned long long)up,
                    (unsigned long long)ds4_metric_read(&m->requests_inflight),
                    server_artifact_source_name(ds4_metric_read(&m->derived_artifact_source)),
@@ -13362,7 +13491,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                    "artifact_source:%s\n"
                    "derived_artifacts:%llu\n\n",
                server_model_id_from_engine(s->engine),
-               ds4_session_ctx(s->session), s->batch_ctx_max_seq,
+               s->serial_boot_ctx, s->batch_ctx_max_seq,
                (unsigned long long)up,
                (unsigned long long)ds4_metric_read(&m->requests_inflight),
                server_artifact_source_name(ds4_metric_read(&m->derived_artifact_source)),
@@ -13483,7 +13612,12 @@ static void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
-    const int ctx_size = ds4_session_ctx(s->session);
+    /* v0.5.2: the CONFIGURED context (parse bound + reporting), never
+     * ds4_session_ctx(s->session) here -- client threads must not read the
+     * serial session (right-sizing swaps it under gen_mu), and a request
+     * valid at -c must not be rejected because the serial session is
+     * currently smaller (the cont path serves the full -c regardless). */
+    const int ctx_size = s->serial_boot_ctx;
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -14270,6 +14404,12 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
+    /* v0.5.2 inc1: serial right-sizing (see serial_session_ensure_fit). */
+    s.serial_boot_ctx = cfg.ctx_size;
+    {
+        const char *sr = getenv("DS4_SERVER_SERIAL_RIGHTSIZE");
+        s.serial_rightsize = !(sr && sr[0] == '0' && sr[1] == '\0');
+    }
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;

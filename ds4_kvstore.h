@@ -187,6 +187,13 @@ int ds4_kvstore_bank_checkpoint_due(const ds4_kvstore *kc, int committed,
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
                                         ds4_session *session,
+                                        /* v0.5.2: record keying/geometry ctx.
+                                         * Serial records: the session's actual
+                                         * ctx (payload geometry).  Bank records:
+                                         * the SERVING ctx (bank geometry) --
+                                         * never the serial session's, which
+                                         * right-sizing can shrink. */
+                                        int ctx_size,
                                         const ds4_tokens *tokens,
                                         int store_len,
                                         const char *reason,
@@ -212,7 +219,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
  * usable record (bank untouched or reset-invalid on partial failure). */
 int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
                                       ds4_engine *engine,
-                                      ds4_session *session,
+                                      int ctx_size,   /* v0.5.2: serving ctx
+                                                         (bank geometry filter) */
                                       ds4_batch_ctx *batch_ctx,
                                       uint32_t bank,
                                       const char *prompt_text,

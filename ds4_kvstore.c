@@ -952,6 +952,7 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
                                         ds4_session *session,
+                                        int ctx_size,
                                         const ds4_tokens *tokens,
                                         int store_len,
                                         const char *reason,
@@ -1034,7 +1035,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
 
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
-                                     quant_bits, ds4_session_ctx(session))) {
+                                     quant_bits, ctx_size)) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
         free(text);
         free(path);
@@ -1087,7 +1088,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .text_len = text_len,
         .model_id = (uint8_t)model_id,
         .quant_bits = (uint8_t)quant_bits,
-        .ctx_size = (uint32_t)ds4_session_ctx(session),
+        .ctx_size = (uint32_t)ctx_size,
         .reject_different_quant = kc->reject_different_quant,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
@@ -1117,7 +1118,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
-                            (uint32_t)ds4_session_ctx(session),
+                            (uint32_t)ctx_size,
                             now, now, payload_bytes);
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
@@ -1204,7 +1205,8 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    const ds4_kvstore_trailer_hooks *hooks,
                                    char *err,
                                    size_t err_len) {
-    return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
+    return ds4_kvstore_store_live_prefix_text(kc, engine, session,
+                                              ds4_session_ctx(session), tokens,
                                               store_len, reason, NULL, 0, NULL,
                                               hooks, NULL, err, err_len);
 }
@@ -1417,7 +1419,7 @@ static int kv_restore_bank_entry(ds4_kvstore *kc,
 
 int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
                                       ds4_engine *engine,
-                                      ds4_session *session,
+                                      int ctx_size,
                                       ds4_batch_ctx *batch_ctx,
                                       uint32_t bank,
                                       const char *prompt_text,
@@ -1431,7 +1433,7 @@ int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
+                                           ctx_size);
     if (idx < 0) return 0;
     return kv_restore_bank_entry(kc, batch_ctx, bank, idx,
                                  prompt_text, prompt_bytes,
@@ -1467,6 +1469,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (quant_bits != 2 && quant_bits != 4) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
+    /* v0.5.2: the SESSION ctx stays the serial-tier filter ceiling
+     * deliberately -- serial payloads are ring-images at their stamped ctx
+     * and can only load into a session at least that big, so the ceiling is
+     * a LOADABILITY bound (a right-sized smaller session skips records it
+     * could not load anyway; the bank tier filters by serving ctx instead). */
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
                                            ds4_session_ctx(session));
     if (idx < 0) return 0;

@@ -265,7 +265,13 @@ for leg in s1 s2; do
   ssh "$R" "rm -rf $KVDIR; cp -a ${KVDIR}.bak $KVDIR"
   kill_server
   wait_mem 100
-  ssh "$R" ": > /tmp/bp_${leg}.log; cd $RT && (env DS4_SERVER_CONTINUOUS=0 DS4_SERVER_DEFAULT_TEMP=0 \
+  # v0.5.2: DS4_SERVER_COALESCE=0 makes these boots TRULY serial-only (no
+  # batch ctx, no banks).  CONTINUOUS=0 alone still builds banks that eat the
+  # box for nothing here -- the P8 memory-marginality flake class, and under
+  # serial right-sizing (bank-holding boots only) the shrunken session would
+  # skip the deep ring-image record this leg exists to restore.  The leg's
+  # subject is serial-tier restore semantics; banks were never part of it.
+  ssh "$R" ": > /tmp/bp_${leg}.log; cd $RT && (env DS4_SERVER_CONTINUOUS=0 DS4_SERVER_COALESCE=0 DS4_SERVER_DEFAULT_TEMP=0 \
       setsid nohup ./ds4-server -m $BASE --no-mtp --cuda -c $CTX --port $PORT \
       --kv-disk-dir $KVDIR --kv-disk-space-mb 20000 \
       > /tmp/bp_${leg}.log 2>&1 < /dev/null &) ; exit 0"

@@ -10156,14 +10156,15 @@ static uint64_t metal_graph_alloc_bytes_estimate(
  * if a deployment needs the old try-and-hope behavior.
  * DS4_SESSION_GRAPH_FIT=0 disables the gate; DS4_SESSION_GRAPH_HEADROOM_MB
  * (default 1024) is the required slack on top of the estimate. */
-static bool metal_graph_session_fit_ok(
+static bool metal_graph_session_fit_check(
         const ds4_weights       *weights,
         const ds4_layer_weights *layer,
         uint32_t                 raw_cap,
         uint32_t                 ctx_size,
         uint32_t                 prefill_cap,
         bool                     enable_mtp,
-        bool                     enable_dspark) {
+        bool                     enable_dspark,
+        bool                     loud) {
     const char *fe = getenv("DS4_SESSION_GRAPH_FIT");
     if (fe && fe[0] == '0' && fe[1] == '\0') return true;
     uint64_t free_b = 0, total_b = 0;
@@ -10178,15 +10179,30 @@ static bool metal_graph_session_fit_ok(
         if (v >= 0) headroom = (uint64_t)v << 20;
     }
     if (free_b >= need + headroom) return true;
-    ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
-    fprintf(stderr,
-            "ds4: session graph fit check FAILED: need ~%.0f MiB (+%.0f MiB headroom) "
-            "but only %.0f MiB allocatable (ctx=%u prefill_cap=%u mtp=%d dspark=%d); "
-            "refusing the alloc so the box survives (DS4_SESSION_GRAPH_FIT=0 overrides)\n",
-            (double)need / 1048576.0, (double)headroom / 1048576.0,
-            (double)free_b / 1048576.0,
-            ctx_size, prefill_cap, enable_mtp ? 1 : 0, enable_dspark ? 1 : 0);
+    if (loud) {
+        ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
+        fprintf(stderr,
+                "ds4: session graph fit check FAILED: need ~%.0f MiB (+%.0f MiB headroom) "
+                "but only %.0f MiB allocatable (ctx=%u prefill_cap=%u mtp=%d dspark=%d); "
+                "refusing the alloc so the box survives (DS4_SESSION_GRAPH_FIT=0 overrides)\n",
+                (double)need / 1048576.0, (double)headroom / 1048576.0,
+                (double)free_b / 1048576.0,
+                ctx_size, prefill_cap, enable_mtp ? 1 : 0, enable_dspark ? 1 : 0);
+    }
     return false;
+}
+
+static bool metal_graph_session_fit_ok(
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap,
+        bool                     enable_mtp,
+        bool                     enable_dspark) {
+    return metal_graph_session_fit_check(weights, layer, raw_cap, ctx_size,
+                                         prefill_cap, enable_mtp, enable_dspark,
+                                         /*loud=*/true);
 }
 
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
@@ -38418,6 +38434,39 @@ static int ds4_session_ensure_graph(ds4_session *s, char *err, size_t errlen) {
     return 0;
 }
 #endif
+
+/* v0.5.2: whether this session's graph alloc is still deferred (S6 lazy
+ * graph).  A pending session can still be re-created at a different ctx for
+ * free; once the graph exists its capacity is committed. */
+int ds4_session_graph_pending(const ds4_session *s) {
+#ifndef DS4_NO_GPU
+    return s && s->graph_pending ? 1 : 0;
+#else
+    (void)s;
+    return 0;
+#endif
+}
+
+/* v0.5.2: would a session graph at this ctx pass the fit gate right now?
+ * Sizing MIRROR of ds4_session_alloc_graph above -- same prefill_cap/raw_cap
+ * recipe, same mtp/dspark flags -- the two are adjacent so they cannot
+ * drift.  Callers (the server's serial right-sizing) use this to pick a
+ * session ctx that can actually allocate instead of letting a full--c lazy
+ * alloc fail on a bank-holding box.  Fail-open exactly like the gate. */
+int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size) {
+    if (!e || ctx_size <= 0) return 0;
+#ifndef DS4_NO_GPU
+    if (e->backend == DS4_BACKEND_CPU) return 1;
+    const uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
+    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    return metal_graph_session_fit_check(&e->weights, &e->weights.layer[0],
+                                         raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                         e->mtp_ready, e->dspark_ready,
+                                         /*loud=*/false) ? 1 : 0;
+#else
+    return 1;
+#endif
+}
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
