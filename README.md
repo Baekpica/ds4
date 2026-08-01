@@ -1132,15 +1132,15 @@ Enable it with:
 ./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-> **Long-running serving note (until v0.5.1).** The per-bank compressed
-> KV/indexer cache pool maps device pages on demand and is grow-only: under
-> long-running agentic serving at deep context, banks walk toward their
-> maximum extent and the pool may grow into all free memory, eventually
-> squeezing the page cache that holds the weights (throughput drops sharply
-> when that happens). Pin the pool with `DS4_BATCH_VMM_BUDGET_MB=<MB>` —
-> admissions that would bust the pinned budget are rejected cleanly (watch
-> the `cont admit rejected` counter) instead of mapped. v0.5.1 ships
-> trim-on-evict, which releases evicted banks' pages under memory pressure.
+> **Long-running serving note.** The per-bank compressed KV/indexer cache
+> pool maps device pages on demand. Since v0.5.1, evicting a bank under
+> budget pressure releases the pages inside its extent back to the device
+> (trim-on-evict), so long-running agentic serving at deep context no
+> longer walks the pool into the weights' page cache. You can still pin
+> the pool with `DS4_BATCH_VMM_BUDGET_MB=<MB>`: admissions beyond the pin
+> first trim evicted banks, then reject cleanly (watch the
+> `cont admit rejected` counter). Shallow-context servers were never
+> exposed — at 16k a bank's whole extent is its floor page.
 
 The cache key is the SHA1 of the rendered byte prefix, and files are named
 `<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state

@@ -5,6 +5,76 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.5.1 — 2026-08-02
+
+The agentic-serving robustness fast-follow: four field-driven fixes for
+the population running long-lived servers with disk KV, plus the removal
+pre-announced in v0.5.0. No performance re-bases — every increment
+shipped with byte-exact 12k serving twins against its kill switch.
+
+- **Adaptive side-model residency removed** (`b8702cd`): the v0.5.0
+  mlock/watchdog mechanism measured zero speed win twice (bitwise
+  identical speculation counters; the hold zone and the refault-tax
+  zone are disjoint on 121 GiB unified memory), so it is gone — exact
+  inverse of `6f59a16`, byte-exact twins against the v0.5.0 binary.
+- **Trim-on-evict for the demand-mapped KV pool** (`23eab49`): the
+  v0.5.0 known issue. Evicting a bank under comp-cache budget pressure
+  now unmaps the pages that lie entirely inside its extent (VA
+  reservations stay, so captured graphs stay valid; the next tenant
+  re-maps on first emit), preferring hist-invalid then cheapest-warm
+  victims. Engagement gate: pinned budget that previously bounced 7
+  admissions to the serial path now trims 7 banks (~168-210 MiB each)
+  with zero rejects, needles exact; a control boot with
+  `DS4_BATCH_VMM_TRIM=0` reproduces the old rejects. Corollary from
+  gate development: at 16k ctx a bank's whole extent is its floor page,
+  so shallow-context servers were never exposed — the creep is
+  depth-proportional (the field report was at 131k).
+  `speed-bench/vmm_trim_gate.sh` is the standing gate.
+- **Disk-KV cross-boot replay survives divergence** (`6874572`): a
+  stored record had to byte-prefix the incoming prompt exactly, so a
+  length-truncated turn — whose next-turn re-render closes the turn —
+  made its record permanently unmatchable: silent cold re-prefill
+  forever, zero log lines (the deep-probe field shape). The disk tier
+  now gets the same partial path live banks have had since P1: records
+  rank by byte-LCP against the prompt (salvage must cover ≥1/8 of the
+  record; restore streams ~10× faster than prefill), restore into a
+  victim bank under the existing depth rules, and the normal token-LCP
+  cut takes over. Gate: divergent replay went 89.9 s cold → 1.3 s
+  partial restore, needle exact through the cut tensors; a control
+  boot (`DS4_SERVER_DISK_PARTIAL=0`) reproduces the silent cold prefill.
+- **Warm-admit checkpointing** (`6874572`): banks only persisted on
+  evict/shutdown, so the most-reused agentic trunks — the ones that
+  never evict — were the least durable; a crash lost everything since
+  the last foreign admit. Pin-tier retires now persist
+  (`reason=bank-checkpoint`), paced by the continued-store interval;
+  checkpoints supersede their predecessors at budget eviction. Gate:
+  exactly one checkpoint at a deep trunk's retire, a short turn 2 does
+  not re-persist, and kill -9 → reboot restores the checkpoint warm
+  (ttft 0.6 s, needle exact). `DS4_SERVER_BANK_CHECKPOINT=0` opts out.
+- **MTP accept guard** (`18b0c98`): the MTP-2 draft arms had no yield
+  governance (DSpark has the calibrated quench). Measurement refuted
+  the feared failure mode first: a cross-generation pairing (0731 base
+  + legacy MTP) drafts at 51.9% accept — right at the D=1 break-even —
+  and decodes at 22.3 tok/s vs 21.9 plain and 24.4 matched, because
+  same-lineage checkpoints transfer and the ggufs carry no generation
+  metadata to refuse by. What ships is a floor: after 256 drafts,
+  cumulative accept under 15% (~random = genuinely foreign or corrupt
+  support model) trips a terminal process-wide disable with a loud
+  line; decode continues plain and lossless. The MTP load line now
+  announces the armed guard; `DS4_MTP_ACCEPT_GUARD=0` disarms.
+  `launch_defaults_gate.sh` grew four legs, including a benign-verdict
+  tripwire that flips if a future refresh makes cross-pairing harmful.
+- **Gate hardening**: `bank_persist_gate.sh` + `launch_defaults_gate.sh`
+  boots now wait for memory reclaim (the recurring "transient" serial
+  failure was the gate racing its own dying server: 8.8 GiB allocatable
+  vs ~9.1 needed while pages drained), and the persist gate grew the
+  divergent-replay and crash legs above.
+- DSML-markup-in-reasoning (field report, legacy era): does not
+  reproduce on 0731 under natural tool use (0/5 probes; reasoning is
+  terse and clean). It appears only when the prompt explicitly asks the
+  model to discuss its invocation syntax — where stripping would
+  corrupt requested content — so no filter ships.
+
 ## v0.5.0 — 2026-08-01
 
 The deep-prefill/decode substrate release, shipped together with the
