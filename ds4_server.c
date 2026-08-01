@@ -7941,6 +7941,7 @@ typedef struct {
 
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
+static bool client_disconnected(int fd);   /* zombie-reap probe (defined below) */
 
 struct server {
     ds4_engine *engine;
@@ -8019,6 +8020,15 @@ struct server {
      * DS4_SERVER_SERIAL_RIGHTSIZE=0 restores the fail-at-full--c behavior. */
     bool serial_rightsize;
     int  serial_boot_ctx;
+    /* v0.5.2 inc3: abort work for dead clients (field: "memory never
+     * released after interruption").  Streaming rows already aborted via
+     * failed sends; non-streaming rows decoded to their full budget and
+     * admission prefills ran to completion for clients long gone.  With
+     * this ON (default) the worker probes the job's socket (the zombie-reap
+     * MSG_PEEK, never consumes) at every abort point: admission-prefill
+     * chunks (engine alive callback), each cont decode token, each serial
+     * decode step.  DS4_SERVER_DISCONNECT_ABORT=0 restores v0.5.1. */
+    bool disconnect_abort;
     /* KV capacity (v0.2 ws4): plain-LRU eviction is depth-split -- a record
      * with committed tokens >= warm_pin_min ("deep": an orchestrator trunk
      * that would take tens of minutes to re-prefill) is only the cold-admit
@@ -10745,6 +10755,17 @@ decode_again:
 
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+        /* v0.5.2 inc3: a dead client's serial job must not decode to its full
+         * budget (non-streaming never writes the fd until done, so a failed
+         * send can't tell us).  Zombie-reap probe per step (~1us / ~25ms). */
+        if (s->disconnect_abort &&
+            (j->client_gone || client_disconnected(j->fd))) {
+            j->client_gone = true;
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: serial decode aborted at %d tokens: client disconnected",
+                       completion);
+            break;
+        }
         const int step_comp0 = completion;
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
@@ -12338,6 +12359,20 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
 /* admit: hand the engine the next waiting request, or 0 to stop admitting now. */
 static int cont_sample_override(void *ud, void *user);
 
+/* v0.5.2 inc3: engine liveness probe for a pending admission prefill.
+ * Runs on the worker thread between prefill chunks; the MSG_PEEK probe
+ * never consumes request bytes.  Marks the job so every later path agrees. */
+static int cont_alive(void *ud, void *user) {
+    (void)ud;
+    job *j = user;
+    if (j->client_gone) return 0;
+    if (client_disconnected(j->fd)) {
+        j->client_gone = true;
+        return 0;
+    }
+    return 1;
+}
+
 static int cont_admit(void *ud, ds4_cont_request *req) {
     cont_sched *cs = ud;
     server *s = cs->s;
@@ -12421,6 +12456,9 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
      * and reasoning keep the seq params above. */
     req->sample_override = (j->req.kind == REQ_CHAT && j->req.has_tools) ?
         cont_sample_override : NULL;
+    /* v0.5.2 inc3: let the engine drop this admission mid-prefill if the
+     * client dies (the zombie-reap probe, engine-polled between chunks). */
+    req->alive = s->disconnect_abort ? cont_alive : NULL;
     return 1;
 }
 
@@ -12674,6 +12712,15 @@ static int cont_on_token(void *ud, void *user, int token) {
     cont_sched *cs = ud;
     server *s = cs->s;
     job *j = user;
+    /* v0.5.2 inc3: dead-client abort BEFORE the non-streaming early-return --
+     * plain buffered rows otherwise decode to their full budget (default
+     * 384K) for a client that hung up.  The MSG_PEEK probe is ~1us next to a
+     * multi-ms decode step. */
+    if (j->client_gone) return 0;
+    if (s->disconnect_abort && client_disconnected(j->fd)) {
+        j->client_gone = true;
+        return 0;
+    }
     if (!cont_needs_text(&j->req)) return 1;   /* plain non-streaming: engine buffers -> on_done */
     cont_stream *st = cont_stream_ensure(j);
     t_emit_job = j;                            /* W8a: send_all -> j->out (off the GPU path) */
@@ -14409,6 +14456,9 @@ int main(int argc, char **argv) {
     {
         const char *sr = getenv("DS4_SERVER_SERIAL_RIGHTSIZE");
         s.serial_rightsize = !(sr && sr[0] == '0' && sr[1] == '\0');
+        /* v0.5.2 inc3: dead-client abort (see the server struct comment). */
+        const char *da = getenv("DS4_SERVER_DISCONNECT_ABORT");
+        s.disconnect_abort = !(da && da[0] == '0' && da[1] == '\0');
     }
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;

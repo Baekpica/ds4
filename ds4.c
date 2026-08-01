@@ -34917,6 +34917,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * is greedy argmax (no RNG draw).  NULL entries sample with the params
      * above unconditionally. */
     int     (**bsoc)(void *, void *) = xcalloc(MS, sizeof(*bsoc));
+    /* v0.5.2: per-bank admission-prefill liveness probe (ds4_cont_request.alive). */
+    int     (**balive)(void *, void *) = xcalloc(MS, sizeof(*balive));
     float    *logits  = xmalloc((size_t)MS * DS4_N_VOCAB * sizeof(float));
     float    *seedlog = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     /* R4 (overlap-lite): per-bank pending admission prefill.  A bank mid-prefill
@@ -35510,6 +35512,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             bminp[b] = req.min_p;
             brng[b]  = req.seed;
             bsoc[b]  = req.sample_override;
+            balive[b] = req.alive;
             beos[b] = req.eos >= 0 ? req.eos : dflt_eos;
             bmax[b] = mn;
             usr[b]  = req.user;
@@ -35541,6 +35544,36 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             const bool interleave = W_boot != 0u && W_live != 0u;
             while (ok && pfq_n) {
                 const uint32_t b = pfq[pfq_h];
+                /* v0.5.2: a dead client's admission must not keep burning
+                 * prefill (measured: a killed curl's 45k prompt ran its full
+                 * ~80 s prefill and then STARTED its decode).  Abandon the
+                 * pending admission between chunks: reset the bank to free
+                 * and finish the job as an abort (n=0, finish=0 -- non-NULL
+                 * tokens so the server does NOT route it to the serial
+                 * fallback like a reject). */
+                if (balive[b] && !balive[b](ud, usr[b])) {
+                    fprintf(stderr,
+                            "ds4: cont pending admission aborted (bank %u, client gone, %u/%u prefilled)\n",
+                            b, pfoff[b], pflen[b]);
+                    free(pftok[b]); pftok[b] = NULL;
+                    pflen[b] = pfoff[b] = 0u;
+                    pfq_h = (pfq_h + 1u) % MS;
+                    pfq_n--;
+                    if (!bg_reset_bank(&ctx->sl, g, b) ||
+                        !ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) {
+                        ok = false;
+                        break;
+                    }
+                    bank_hist_reset(ctx, b);
+                    cont_stats_publish_done(ctx, sst, b, 0u);
+                    {
+                        const int none = 0;
+                        on_done(ud, usr[b], &none, 0, 0);
+                    }
+                    usr[b] = NULL;
+                    live[b] = 0u;
+                    continue;
+                }
                 uint32_t n_live_now = 0;
                 for (uint32_t i = 0; i < MS; i++) if (live[i]) n_live_now++;
                 uint32_t n = pflen[b] - pfoff[b];
@@ -36646,6 +36679,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (pftok) for (uint32_t b = 0; b < MS; b++) free(pftok[b]);
     free(live); free(usr); free(posv); free(cur); free(beos); free(bmax); free(glen); free(gbuf);
     free(btemp); free(btopk); free(btopp); free(bminp); free(brng); free(bsoc);
+    free(balive);
     free(pftok); free(pflen); free(pfoff); free(pfbase); free(pft0); free(sst);
     free(logits); free(seedlog);
     ds4_metric_set(&ds4_metrics_get()->banks_live, 0);

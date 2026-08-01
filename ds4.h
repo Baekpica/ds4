@@ -290,6 +290,13 @@ typedef struct {
      * aligned between the plain and speculative decode paths.  `ud`/`user`
      * are the same handles on_token receives. */
     int      (*sample_override)(void *ud, void *user);
+    /* v0.5.2: liveness probe for the ADMISSION PREFILL phase (may be NULL).
+     * Polled between prefill chunks; return 0 when the request's client is
+     * gone -- the engine abandons the pending admission (bank reset to free)
+     * and calls on_done(user, tokens, 0, 0) with a non-NULL empty tokens
+     * array (aborted, NOT rejected: the slot must not fall to the serial
+     * path).  Decode-phase aborts stay on_token's business. */
+    int      (*alive)(void *ud, void *user);
     /* A2a warm start.  Zero-init = engine-managed cold admit (the W5..W7
      * behavior, unchanged).  place_bank is a bank id + 1 placement directive
      * (0 = engine picks the first free bank); it lets the caller route a
