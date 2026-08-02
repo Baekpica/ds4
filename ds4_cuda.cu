@@ -3064,14 +3064,25 @@ extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
             while (fgets(line, sizeof line, f)) {
                 unsigned long long kb = 0;
                 if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-                    /* MemAvailable still counts GPU-pinned page-cache pages as
-                     * reclaimable; they cannot actually be claimed, and budgets
-                     * that spend them evict the model's residency (NVMe thrash
-                     * mid-decode).  Subtract the registered file-backed weight
-                     * mappings; anon (DS4_MODEL_ANON_HUGE) copies are already
-                     * excluded by the kernel. */
+                    /* MemAvailable is the kernel's own "allocatable before OOM"
+                     * estimate and, on GB10's HMM path, is accurate as-is:
+                     * cudaHostRegisterMapped does NOT mlock the model mapping
+                     * (measured Unevictable/Mlocked stay ~26 MiB while
+                     * g_pinned_file_bytes is ~6.5 GiB), so those file pages
+                     * remain genuinely reclaimable and MemAvailable already
+                     * counts them.
+                     *
+                     * A former `avail -= g_pinned_file_bytes` correction here
+                     * assumed discrete-GPU-style pinning (pages counted
+                     * reclaimable but actually unreclaimable).  That assumption
+                     * is false on this box: it double-penalized by the entire
+                     * registered model, drove free_out below the session-graph
+                     * need, and 503'd every serial request even though the
+                     * alloc fits -- the weights are served from the anon
+                     * DS4_MODEL_ANON_HUGE artifacts, so reclaiming the fallback
+                     * mapping's page cache does not thrash decode.  Trust
+                     * MemAvailable; the caller's own headroom is the margin. */
                     uint64_t avail = kb * 1024ull;
-                    avail = avail > g_pinned_file_bytes ? avail - g_pinned_file_bytes : 0;
                     if (avail > free_out) free_out = avail;
                     break;
                 }
