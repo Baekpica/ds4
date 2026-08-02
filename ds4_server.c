@@ -808,6 +808,14 @@ static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effor
     return effort;
 }
 
+/* v0.5.4: server-wide default effort for requests that do not send one
+ * (--reasoning-effort).  Most agent clients never emit the field, so on a
+ * generic OpenAI-compatible provider the server default is the only
+ * reasoning setting they can reach (378855/30).  File-scope because
+ * parse_completion_request has no server pointer; written once during
+ * option parsing, read-only after. */
+static ds4_think_mode g_default_reasoning_effort = DS4_THINK_LOW;
+
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     if (!s) return false;
     /* The three levels the 0731 checkpoint defines, plus the OpenAI-style
@@ -2670,7 +2678,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_LOW;
+    ds4_think_mode reasoning_effort = g_default_reasoning_effort;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -2818,8 +2826,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -2848,7 +2855,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_LOW;
+    ds4_think_mode reasoning_effort = g_default_reasoning_effort;
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -3017,8 +3024,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
@@ -3738,7 +3744,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_LOW;
+    ds4_think_mode reasoning_effort = g_default_reasoning_effort;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -3956,8 +3962,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -4031,7 +4036,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_LOW;
+    ds4_think_mode reasoning_effort = g_default_reasoning_effort;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -4152,8 +4157,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     buf rendered = {0};
     buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
     buf_puts(&rendered, ds4_think_effort_prefix(r->think_mode));
@@ -13332,8 +13336,7 @@ static void handle_batch(server *s, int fd, const char *body) {
 
     const int ctx_size = s->serial_boot_ctx;   /* client thread: must not read
                                                   the swap-able serial session */
-    const ds4_think_mode tm = think ? ds4_think_mode_for_context(DS4_THINK_LOW, ctx_size)
-                                    : DS4_THINK_NONE;
+    const ds4_think_mode tm = think ? DS4_THINK_LOW : DS4_THINK_NONE;
     ds4_tokens *toks = calloc((size_t)n, sizeof(*toks));
     ds4_batch_gen_result *res = calloc((size_t)n, sizeof(*res));
     bool oom = (!toks || !res);
@@ -13989,11 +13992,15 @@ static void usage(FILE *fp) {
         "      Add Access-Control-Allow-* headers for browser JS clients. Does not change --host.\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
+        "  --reasoning-effort LEVEL\n"
+        "      Default reasoning effort for requests that do not send one: low (default),\n"
+        "      high, max, or off. Explicit request values always win.\n"
         "\n"
         "Thinking and sampling:\n"
-        "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
-        "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
-        "  Think Max is applied only when --ctx is at least 393216 tokens; smaller contexts use high.\n"
+        "  DeepSeek-compatible chat requests default to thinking mode; reasoning_effort\n"
+        "  (or output_config.effort) selects low, high, or max and is honored at any --ctx.\n"
+        "  DeepSeek recommends a 384K-token output budget for high and max; on smaller\n"
+        "  contexts long deliberations can end with finish_reason=length.\n"
         "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
         "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
         "  In thinking mode, client sampling knobs are ignored like the official API.\n"
@@ -14471,6 +14478,13 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--reasoning-effort")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!parse_reasoning_effort_name(v, &g_default_reasoning_effort)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: unknown --reasoning-effort '%s' (low, high, max, off)", v);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -14573,6 +14587,16 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
                    cfg.chdir_path, strerror(errno));
         return 1;
+    }
+    if (g_default_reasoning_effort != DS4_THINK_LOW) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: default reasoning effort: %s",
+                   ds4_think_mode_name(g_default_reasoning_effort));
+        if ((g_default_reasoning_effort == DS4_THINK_HIGH ||
+             g_default_reasoning_effort == DS4_THINK_MAX) && cfg.ctx_size < 393216)
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: note: %s effort below the 384K-token output budget DeepSeek "
+                       "recommends for it; long deliberations can hit the context limit",
+                       ds4_think_mode_name(g_default_reasoning_effort));
     }
 
     ds4_engine *engine = NULL;
@@ -16235,15 +16259,12 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(!strncmp(ds4_think_max_prefix(),
                          "Reasoning Effort: Beyond maximum", 32));
 
-    /* The context gate governs BOTH prefixed levels and falls back to low. */
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_HIGH, 32768) == DS4_THINK_LOW);
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_LOW);
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_LOW, 32768) == DS4_THINK_LOW);
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_NONE, 32768) == DS4_THINK_NONE);
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_HIGH,
-                                           (int)ds4_think_effort_min_context()) == DS4_THINK_HIGH);
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
-                                           (int)ds4_think_effort_min_context()) == DS4_THINK_MAX);
+    /* v0.5.4: the server no longer applies the 393216 floor -- the prefix
+     * is just tokens, and the floor silently downgraded explicitly chosen
+     * levels (378855/30).  Efforts are honored at any context; the
+     * server-wide default for field-less requests stays prefix-free low
+     * unless --reasoning-effort. */
+    TEST_ASSERT(g_default_reasoning_effort == DS4_THINK_LOW);
 
     /* Names round-trip the wire vocabulary. */
     TEST_ASSERT(!strcmp(ds4_think_mode_name(DS4_THINK_NONE), "none"));

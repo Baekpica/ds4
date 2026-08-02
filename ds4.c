@@ -78,12 +78,6 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
     "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
     "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
-/* DeepSeek recommends a 384K-token output budget for BOTH the high and max
- * effort levels, so below that context size we fall back to the prefix-free
- * low level rather than injecting a prompt that asks for a reasoning budget
- * the allocated context is not meant to hold. */
-#define DS4_THINK_EFFORT_MIN_CONTEXT 393216u
-
 static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
 }
@@ -27988,6 +27982,28 @@ const char *ds4_think_mode_name(ds4_think_mode mode) {
     return "unknown";
 }
 
+/* DeepSeek recommends a 384K-token output budget for the prefixed effort
+ * levels.  The interactive CLI/agent/eval binaries use this floor for their
+ * own loud downgrade UX and for eval-condition ctx sizing.  The SERVER does
+ * not call it (v0.5.4): a server request's effort is either the operator's
+ * --reasoning-effort default or the client's explicit field, and explicitly
+ * chosen levels are honored at any context. */
+#define DS4_THINK_EFFORT_MIN_CONTEXT 393216u
+
+uint32_t ds4_think_effort_min_context(void) {
+    return DS4_THINK_EFFORT_MIN_CONTEXT;
+}
+
+ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
+    const uint32_t ctx = (uint32_t)(ctx_size > 0 ? ctx_size : 0);
+    if ((mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX) &&
+        ctx < DS4_THINK_EFFORT_MIN_CONTEXT)
+    {
+        return DS4_THINK_LOW;
+    }
+    return mode;
+}
+
 const char *ds4_think_high_prefix(void) {
     return DS4_REASONING_EFFORT_HIGH_PREFIX;
 }
@@ -28005,20 +28021,6 @@ const char *ds4_think_effort_prefix(ds4_think_mode mode) {
         break;
     }
     return "";
-}
-
-uint32_t ds4_think_effort_min_context(void) {
-    return DS4_THINK_EFFORT_MIN_CONTEXT;
-}
-
-ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
-    const uint32_t ctx = (uint32_t)(ctx_size > 0 ? ctx_size : 0);
-    if ((mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX) &&
-        ctx < DS4_THINK_EFFORT_MIN_CONTEXT)
-    {
-        return DS4_THINK_LOW;
-    }
-    return mode;
 }
 
 static void ds4_release_instance_lock(void) {
