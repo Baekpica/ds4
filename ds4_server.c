@@ -13937,6 +13937,11 @@ static void usage(FILE *fp) {
     fprintf(fp,
         "Usage: ds4-server [options]\n"
         "\n"
+        "  --version | --check-update | --upgrade | --no-update-check\n"
+        "      Build version; query the latest release (once-daily on boot,\n"
+        "      opt-out with the flag or DS4_NO_UPDATE_CHECK=1); print the\n"
+        "      installer one-liner.\n"
+        "\n"
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
@@ -14270,6 +14275,99 @@ static void launch_resolve_defaults(server_config *c,
     }
 }
 
+/* ---- v0.5.3 inc4: version + once-daily update check ------------------- */
+/* DS4_BUILD_VERSION comes from the Makefile (git describe, falling back to
+ * the repo VERSION file for tarball builds).  The update check is a plain
+ * GET of a one-line static file, at most once per day, in a detached
+ * thread after the server is listening -- it can never block or fail boot.
+ * Opt-out: --no-update-check / DS4_NO_UPDATE_CHECK=1.  DS4_UPDATE_URL
+ * overrides the source (gates use file:// URLs). */
+#ifndef DS4_BUILD_VERSION
+#define DS4_BUILD_VERSION "unknown"
+#endif
+#define DS4_UPDATE_URL_DEFAULT \
+    "https://raw.githubusercontent.com/Entrpi/ds4-on-spark/main/LATEST"
+#define DS4_UPGRADE_CMD \
+    "curl -fsSL https://raw.githubusercontent.com/Entrpi/ds4-on-spark/main/install.sh | bash"
+
+static bool version_parse3(const char *v, int *a, int *b, int *c) {
+    if (!v) return false;
+    if (*v == 'v' || *v == 'V') v++;
+    return sscanf(v, "%d.%d.%d", a, b, c) == 3;
+}
+
+/* True only when remote is a well-formed release tag strictly ahead of the
+ * local build (or the local version is unknown/unparseable). */
+static bool version_newer(const char *remote, const char *local) {
+    int ra, rb, rc, la, lb, lc;
+    if (!version_parse3(remote, &ra, &rb, &rc)) return false;
+    if (!version_parse3(local, &la, &lb, &lc)) return true;
+    if (ra != la) return ra > la;
+    if (rb != lb) return rb > lb;
+    return rc > lc;
+}
+
+static char *update_fetch_latest(void) {
+    const char *url = getenv("DS4_UPDATE_URL");
+    if (!url || !url[0]) url = DS4_UPDATE_URL_DEFAULT;
+    if (strchr(url, '\'') != NULL) return NULL;
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "curl -fsS --max-time 3 '%s' 2>/dev/null", url);
+    FILE *p = popen(cmd, "r");
+    if (!p) return NULL;
+    char line[128] = {0};
+    const bool got = fgets(line, sizeof(line), p) != NULL;
+    pclose(p);
+    if (!got) return NULL;
+    line[strcspn(line, "\r\n")] = 0;
+    return line[0] ? strdup(line) : NULL;
+}
+
+/* Stamp file mtime rate-limits the boot-path check to once per day. */
+static bool update_check_due(void) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return false;
+    char dir[512], stamp[512];
+    snprintf(dir, sizeof(dir), "%s/.cache", home);
+    (void)mkdir(dir, 0755);
+    snprintf(dir, sizeof(dir), "%s/.cache/ds4", home);
+    (void)mkdir(dir, 0755);
+    snprintf(stamp, sizeof(stamp), "%s/update-check", dir);
+    struct stat st;
+    if (stat(stamp, &st) == 0 && time(NULL) - st.st_mtime < 24 * 3600) return false;
+    FILE *f = fopen(stamp, "w");
+    if (f) fclose(f);
+    return true;
+}
+
+static void update_check_report(const char *latest) {
+    if (!latest) return;
+    if (version_newer(latest, DS4_BUILD_VERSION))
+        fprintf(stderr,
+                "ds4-server: update available: %s (running %s) -- upgrade with:\n"
+                "ds4-server:   %s\n"
+                "ds4-server: (disable this once-daily check with --no-update-check "
+                "or DS4_NO_UPDATE_CHECK=1)\n",
+                latest, DS4_BUILD_VERSION, DS4_UPGRADE_CMD);
+}
+
+static void *update_check_thread(void *arg) {
+    (void)arg;
+    char *latest = update_fetch_latest();
+    update_check_report(latest);
+    free(latest);
+    return NULL;
+}
+
+static void update_check_start(void) {
+    const char *e = getenv("DS4_NO_UPDATE_CHECK");
+    if (e && e[0] && !(e[0] == '0' && e[1] == 0)) return;
+    if (!update_check_due()) return;
+    pthread_t t;
+    if (pthread_create(&t, NULL, update_check_thread, NULL) == 0)
+        pthread_detach(t);
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -14312,7 +14410,26 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
-        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        if (!strcmp(arg, "--version")) {
+            printf("ds4-server %s\n", DS4_BUILD_VERSION);
+            exit(0);
+        } else if (!strcmp(arg, "--check-update")) {
+            char *latest = update_fetch_latest();
+            printf("ds4-server %s\n", DS4_BUILD_VERSION);
+            if (!latest) { printf("update check failed (network?)\n"); exit(1); }
+            if (version_newer(latest, DS4_BUILD_VERSION))
+                printf("update available: %s\nupgrade with:\n  %s\n",
+                       latest, DS4_UPGRADE_CMD);
+            else
+                printf("latest is %s -- up to date\n", latest);
+            free(latest);
+            exit(0);
+        } else if (!strcmp(arg, "--upgrade")) {
+            printf("%s\n", DS4_UPGRADE_CMD);
+            exit(0);
+        } else if (!strcmp(arg, "--no-update-check")) {
+            setenv("DS4_NO_UPDATE_CHECK", "1", 1);
+        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
             model_set = true;
         } else if (!strcmp(arg, "--mtp")) {
@@ -14703,6 +14820,7 @@ int main(int argc, char **argv) {
     g_listen_fd = lfd;
     ds4_metric_set(&ds4_metrics_get()->boot_stamp, (uint64_t)now_sec());
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    update_check_start();
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
@@ -18815,7 +18933,19 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_version_newer_comparisons(void) {
+    TEST_ASSERT(version_newer("v0.5.3", "v0.5.2"));
+    TEST_ASSERT(version_newer("v1.0.0", "v0.9.9"));
+    TEST_ASSERT(!version_newer("v0.5.2", "v0.5.2"));
+    TEST_ASSERT(!version_newer("v0.4.9", "v0.5.2"));
+    TEST_ASSERT(!version_newer("garbage", "v0.5.2"));
+    TEST_ASSERT(version_newer("v0.5.3", "unknown"));
+    TEST_ASSERT(!version_newer("v0.5.2", "v0.5.2-14-gabc123"));  /* dev past tag */
+    TEST_ASSERT(version_newer("v0.5.3", "v0.5.2-14-gabc123"));
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();

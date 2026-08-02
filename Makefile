@@ -200,8 +200,13 @@ ds4_cli.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
 ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
 
+# Version stamp: git describe in a checkout; the committed VERSION file
+# (bumped at each release cut) covers gitless trees and shallow upgrades
+# where the tag ref is absent.
+DS4_BUILD_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || cat VERSION 2>/dev/null || echo unknown)
+
 ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h rax.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
+	$(CC) $(CFLAGS) -DDS4_BUILD_VERSION='"$(DS4_BUILD_VERSION)"' -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
