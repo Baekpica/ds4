@@ -1,3 +1,29 @@
+# v0.5.3 (2026-08-02)
+
+Field-robustness and interface release: three engine increments plus two
+community PRs.
+
+- Deep partial-truncate regression gate (forum 376884 posts 113+122): the
+  in-place truncate-reuse envelope is now pinned by speed-bench/
+  truncate_gate.sh — seven sequential truncates of one bank ending at the
+  reported crash geometry (cut < ctx/2 < committed), with a needle inside
+  the replayed suffix and a FORK_PARTIAL=0 control. The reported v0.5.0
+  crash did not reproduce across 18 attempts on v0.5.0 or v0.5.2; the
+  remaining suspect is v0.5.0's adaptive drafter residency, removed in
+  v0.5.1 — if you are on v0.5.0, upgrade.
+- Responses API usage now counts reasoning tokens (forum 376884 post 115):
+  output_tokens_details.reasoning_tokens was hardcoded 0.
+- --version, --check-update, --upgrade, and a once-daily update check: a
+  plain GET of the one-line LATEST file in ds4-on-spark shortly after the
+  server starts listening; no payload, never blocks or fails boot; disable
+  with --no-update-check or DS4_NO_UPDATE_CHECK=1.
+- PR #5 (Fabio Pili): the three reasoning_effort levels the 0731 model
+  card documents (low/high/max), reachable and distinct; "off" accepted;
+  default rendering byte-identical.
+- PR #6 (a-huk): the GB10 graph-fit gate trusts MemAvailable; the former
+  pinned-file subtraction starved the fit estimate on tight boxes and
+  503'd the serial lane.
+
 # Changelog
 
 All notable fork-side changes to this project are documented here.
