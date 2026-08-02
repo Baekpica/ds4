@@ -6659,18 +6659,34 @@ static const char *responses_status_for_finish(const char *finish) {
     return "completed";
 }
 
+/* v0.5.3 inc3 (forum 376884 post 115): the reasoning trace emitted as a
+ * Responses item must be counted in usage, not reported as 0.  Callers
+ * retokenize the parsed reasoning text -- the generation-side token index
+ * of the think region is not threaded to the API layer, and retokenized
+ * model output deviates from the generated ids only at segment boundaries. */
+static int reasoning_token_count(ds4_engine *e, const char *reasoning) {
+    if (!e || !reasoning || !reasoning[0]) return 0;
+    ds4_tokens t = {0};
+    ds4_tokenize_rendered_chat(e, reasoning, &t);
+    const int n = t.len;
+    ds4_tokens_free(&t);
+    return n;
+}
+
 static void append_responses_usage_json(buf *b, const request *r,
-                                        int input_tokens, int output_tokens) {
+                                        int input_tokens, int output_tokens,
+                                        int reasoning_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
     int cache_write_tokens = r ? r->cache_write_tokens : 0;
     cached_tokens = clamp_usage_tokens(cached_tokens, input_tokens);
     cache_write_tokens = clamp_usage_tokens(cache_write_tokens, input_tokens - cached_tokens);
+    reasoning_tokens = clamp_usage_tokens(reasoning_tokens, output_tokens);
     buf_printf(b,
         "{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d},"
-        "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
+        "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":%d},"
         "\"total_tokens\":%d}",
         input_tokens, cached_tokens, cache_write_tokens,
-        output_tokens, input_tokens + output_tokens);
+        output_tokens, reasoning_tokens, input_tokens + output_tokens);
 }
 
 static bool responses_sse_completed(int fd, const request *r,
@@ -6679,6 +6695,7 @@ static bool responses_sse_completed(int fd, const request *r,
                                     const responses_tool_item *tool_items,
                                     const char *finish,
                                     int prompt_tokens, int completion_tokens,
+                                    int reasoning_tokens,
                                     long created_at) {
     /* Codex routes terminal behaviour off the event type, not response.status.
      * Decide here so clients see response.failed / response.incomplete instead
@@ -6742,7 +6759,8 @@ static bool responses_sse_completed(int fd, const request *r,
     }
     buf_putc(&b, ']');
     buf_puts(&b, ",\"usage\":");
-    append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_responses_usage_json(&b, r, prompt_tokens, completion_tokens,
+                                reasoning_tokens);
     append_timings_json(&b, r);
     buf_puts(&b, "}}");
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
@@ -6873,6 +6891,7 @@ static bool responses_sse_finish_live(int fd, const request *r,
                                       const tool_calls *calls,
                                       const char *finish,
                                       int prompt_tokens, int completion_tokens,
+                                      int reasoning_tokens,
                                       long created_at) {
     if (!responses_sse_stream_update(fd, r, st, raw, raw_len, true)) return false;
 
@@ -6927,7 +6946,8 @@ static bool responses_sse_finish_live(int fd, const request *r,
         }
     }
     if (ok) ok = responses_sse_completed(fd, r, st, calls, items, finish,
-                                         prompt_tokens, completion_tokens, created_at);
+                                         prompt_tokens, completion_tokens,
+                                         reasoning_tokens, created_at);
     free(items);
     return ok;
 }
@@ -6936,7 +6956,8 @@ static bool responses_final_response(int fd, bool enable_cors,
                                      const request *r, const char *id,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
-                                     int prompt_tokens, int completion_tokens) {
+                                     int prompt_tokens, int completion_tokens,
+                                     int reasoning_tokens) {
     (void)id;
     char *text_t = utf8_trim_tail_dup(text);
     char *reasoning_t = utf8_trim_tail_dup(reasoning);
@@ -7002,7 +7023,8 @@ static bool responses_final_response(int fd, bool enable_cors,
     }
     buf_putc(&b, ']');
     buf_puts(&b, ",\"usage\":");
-    append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_responses_usage_json(&b, r, prompt_tokens, completion_tokens,
+                                reasoning_tokens);
     append_timings_json(&b, r);
     buf_putc(&b, '}');
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
@@ -11319,6 +11341,8 @@ decode_again:
                                                     recover,
                                                     &parsed_calls, final_finish,
                                                     prompt_tokens, completion,
+                                                    reasoning_token_count(
+                                                        s->engine, parsed_reasoning),
                                                     responses_created_at);
         } else if (structured_stream) {
             response_ok = sse_chat_finish(j->fd, &j->req, id,
@@ -11349,7 +11373,8 @@ decode_again:
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
+                                 prompt_tokens, completion,
+                                 reasoning_token_count(s->engine, parsed_reasoning));
     } else {
         final_response(j->fd, s->enable_cors, &j->req, id,
                        parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
@@ -15522,7 +15547,7 @@ static void test_responses_usage_reports_cache_details(void) {
     }
 
     TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_usage", "OK", NULL, NULL,
-                                         "stop", 10, 2));
+                                         "stop", 10, 2, 5));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -15531,6 +15556,7 @@ static void test_responses_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
     TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_tokens\":2") != NULL);   /* 5 clamps to output */
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
 
     free(out);
@@ -15546,7 +15572,7 @@ static void test_responses_usage_reports_cache_details(void) {
     responses_stream st;
     responses_stream_init(&r, &st);
     TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
-                                        "stop", 10, 2, 1234));
+                                        "stop", 10, 2, 1, 1234));
     shutdown(sv[0], SHUT_WR);
     out = read_socket_text(sv[1]);
 
@@ -15556,6 +15582,7 @@ static void test_responses_usage_reports_cache_details(void) {
     TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
     TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
     TEST_ASSERT(strstr(out, "\"output_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_tokens\":1") != NULL);
     TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
 
     free(out);
