@@ -783,7 +783,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = server_default_temperature();
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
-    r->think_mode = DS4_THINK_HIGH;
+    r->think_mode = DS4_THINK_LOW;
 }
 
 static void request_free(request *r) {
@@ -805,26 +805,35 @@ static void request_free(request *r) {
 
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
     if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
-    return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
+    return effort;
 }
 
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     if (!s) return false;
+    /* The three levels the 0731 checkpoint defines, plus the OpenAI-style
+     * aliases agent frameworks send.  Aliases map to the nearest level that
+     * exists rather than being rejected: "minimal"/"medium" have no upstream
+     * counterpart, so they round to the level below, and "xhigh" rounds to
+     * "high" rather than escalating to "max" -- rounding down never spends a
+     * caller's context on deliberation they did not ask for. */
     if (!strcmp(s, "max")) {
         *out = DS4_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
-        !strcmp(s, "medium") || !strcmp(s, "low") ||
-        !strcmp(s, "minimal"))
-    {
-        /* DS4 only exposes HIGH and MAX above zero, so "minimal" collapses to
-         * the smallest non-zero level (HIGH). Callers that need *no* reasoning
-         * must use "none" instead. */
+    if (!strcmp(s, "high") || !strcmp(s, "xhigh")) {
         *out = DS4_THINK_HIGH;
         return true;
     }
-    if (!strcmp(s, "none")) {
+    if (!strcmp(s, "low") || !strcmp(s, "medium") || !strcmp(s, "minimal")) {
+        *out = DS4_THINK_LOW;
+        return true;
+    }
+    /* "off" is what UIs actually send for the disabled state (Open WebUI 0.11
+     * does, measured 2026-08-01), and rejecting it is worse than it looks: an
+     * unknown effort value fails the whole request body parse, so the caller
+     * gets a 400 "invalid JSON request" for well-formed JSON and no hint which
+     * field was at fault. */
+    if (!strcmp(s, "none") || !strcmp(s, "off")) {
         *out = DS4_THINK_NONE;
         return true;
     }
@@ -2331,7 +2340,7 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
 
     buf out = {0};
     buf_puts(&out, "<｜begin▁of▁sentence｜>");
-    if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
+    buf_puts(&out, ds4_think_effort_prefix(think_mode));
     buf_puts(&out, system.ptr ? system.ptr : "");
 
     bool pending_assistant = false;
@@ -2661,7 +2670,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    ds4_think_mode reasoning_effort = DS4_THINK_LOW;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -2839,7 +2848,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    ds4_think_mode reasoning_effort = DS4_THINK_LOW;
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -3729,7 +3738,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    ds4_think_mode reasoning_effort = DS4_THINK_LOW;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -4022,7 +4031,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    ds4_think_mode reasoning_effort = DS4_THINK_LOW;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -4147,7 +4156,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     buf rendered = {0};
     buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
-    if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
+    buf_puts(&rendered, ds4_think_effort_prefix(r->think_mode));
     buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
     buf_puts(&rendered, prompt);
     buf_puts(&rendered, "<｜Assistant｜>");
@@ -9838,10 +9847,14 @@ static char *rendered_chat_system_region(const char *prompt_text) {
     const char *bos = "<｜begin▁of▁sentence｜>";
     const size_t bos_len = strlen(bos);
     if (!strncmp(p, bos, bos_len)) p += bos_len;
-    const char *max_prefix = ds4_think_max_prefix();
-    const size_t max_prefix_len = strlen(max_prefix);
-    if (max_prefix_len && !strncmp(p, max_prefix, max_prefix_len)) {
-        p += max_prefix_len;
+    /* Skip whichever effort prefix this prompt was rendered with, if any. */
+    const char *effort_prefixes[] = { ds4_think_high_prefix(), ds4_think_max_prefix() };
+    for (size_t i = 0; i < sizeof(effort_prefixes) / sizeof(effort_prefixes[0]); i++) {
+        const size_t plen = strlen(effort_prefixes[i]);
+        if (plen && !strncmp(p, effort_prefixes[i], plen)) {
+            p += plen;
+            break;
+        }
     }
     while (*p && isspace((unsigned char)*p)) p++;
 
@@ -13294,7 +13307,7 @@ static void handle_batch(server *s, int fd, const char *body) {
 
     const int ctx_size = s->serial_boot_ctx;   /* client thread: must not read
                                                   the swap-able serial session */
-    const ds4_think_mode tm = think ? ds4_think_mode_for_context(DS4_THINK_HIGH, ctx_size)
+    const ds4_think_mode tm = think ? ds4_think_mode_for_context(DS4_THINK_LOW, ctx_size)
                                     : DS4_THINK_NONE;
     ds4_tokens *toks = calloc((size_t)n, sizeof(*toks));
     ds4_batch_gen_result *res = calloc((size_t)n, sizeof(*res));
@@ -14960,7 +14973,7 @@ static void test_responses_input_function_call_namespace_round_trips_to_dsml(voi
     TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name,
                         "mcp__perplexity__perplexity_search"));
 
-    char *prompt = render_chat_prompt_text(&msgs, schemas, &orders, DS4_THINK_HIGH);
+    char *prompt = render_chat_prompt_text(&msgs, schemas, &orders, DS4_THINK_LOW);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt,
         "<｜DSML｜invoke name=\"mcp__perplexity__perplexity_search\">") != NULL);
@@ -15155,7 +15168,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     r.stream = true;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.has_tools = true;
     r.tool_orders = make_bash_order();
 
@@ -15349,7 +15362,7 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.has_tools = true;
     r.tool_orders = make_bash_order();
 
@@ -15592,7 +15605,7 @@ static void test_tools_batchable_at_any_temperature_and_thinking(void) {
     TEST_ASSERT(job_is_batchable(&r));
     r.temperature = 0.7f;
     TEST_ASSERT(job_is_batchable(&r));
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     TEST_ASSERT(job_is_batchable(&r));
     request_free(&r);
 
@@ -15653,7 +15666,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.has_tools = false;
 
     TEST_ASSERT(request_uses_structured_stream(&r));
@@ -16042,7 +16055,7 @@ static void test_streaming_holds_partial_utf8(void) {
 static void test_request_defaults_use_min_p_filtering(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    TEST_ASSERT(r.think_mode == DS4_THINK_HIGH);
+    TEST_ASSERT(r.think_mode == DS4_THINK_LOW);
     TEST_ASSERT(r.temperature == DS4_DEFAULT_TEMPERATURE);
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
@@ -16052,15 +16065,53 @@ static void test_request_defaults_use_min_p_filtering(void) {
 
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
-    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_HIGH);
+    /* The three levels are distinct now; aliases round DOWN to the nearest. */
+    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == DS4_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_LOW);
     TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == DS4_THINK_MAX);
+    TEST_ASSERT(parse_reasoning_effort_name("none", &mode) && mode == DS4_THINK_NONE);
+    /* UIs spell the disabled state "off"; Open WebUI sends exactly this. */
+    TEST_ASSERT(parse_reasoning_effort_name("off", &mode) && mode == DS4_THINK_NONE);
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
+
+    /* Each level injects exactly the reference encoder's string, and low
+     * injects nothing at all -- the property that keeps the default byte
+     * identical to the pre-change engine. */
+    TEST_ASSERT(ds4_think_effort_prefix(DS4_THINK_NONE)[0] == '\0');
+    TEST_ASSERT(ds4_think_effort_prefix(DS4_THINK_LOW)[0] == '\0');
+    TEST_ASSERT(!strcmp(ds4_think_effort_prefix(DS4_THINK_HIGH), ds4_think_high_prefix()));
+    TEST_ASSERT(!strcmp(ds4_think_effort_prefix(DS4_THINK_MAX), ds4_think_max_prefix()));
+    TEST_ASSERT(strcmp(ds4_think_high_prefix(), ds4_think_max_prefix()) != 0);
+    TEST_ASSERT(!strncmp(ds4_think_high_prefix(),
+                         "Reasoning Effort: Absolute maximum", 33));
+    TEST_ASSERT(!strncmp(ds4_think_max_prefix(),
+                         "Reasoning Effort: Beyond maximum", 32));
+
+    /* The context gate governs BOTH prefixed levels and falls back to low. */
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_HIGH, 32768) == DS4_THINK_LOW);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_LOW);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_LOW, 32768) == DS4_THINK_LOW);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_NONE, 32768) == DS4_THINK_NONE);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_HIGH,
+                                           (int)ds4_think_effort_min_context()) == DS4_THINK_HIGH);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
-                                           (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
+                                           (int)ds4_think_effort_min_context()) == DS4_THINK_MAX);
+
+    /* Names round-trip the wire vocabulary. */
+    TEST_ASSERT(!strcmp(ds4_think_mode_name(DS4_THINK_NONE), "none"));
+    TEST_ASSERT(!strcmp(ds4_think_mode_name(DS4_THINK_LOW), "low"));
+    TEST_ASSERT(!strcmp(ds4_think_mode_name(DS4_THINK_HIGH), "high"));
+    TEST_ASSERT(!strcmp(ds4_think_mode_name(DS4_THINK_MAX), "max"));
+
+    /* think_mode_from_enabled preserves the tier instead of flattening it. */
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_MAX) == DS4_THINK_MAX);
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_HIGH) == DS4_THINK_HIGH);
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_LOW) == DS4_THINK_LOW);
+    TEST_ASSERT(think_mode_from_enabled(false, DS4_THINK_MAX) == DS4_THINK_NONE);
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_NONE) == DS4_THINK_NONE);
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -16072,13 +16123,13 @@ static void test_api_thinking_controls_parse(void) {
     TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
     TEST_ASSERT(enabled);
 
-    ds4_think_mode mode = DS4_THINK_HIGH;
+    ds4_think_mode mode = DS4_THINK_LOW;
     const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
     TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode));
     TEST_ASSERT(mode == DS4_THINK_MAX);
 
     const char *openai_effort = "\"xhigh\"";
-    mode = DS4_THINK_HIGH;
+    mode = DS4_THINK_LOW;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
     TEST_ASSERT(mode == DS4_THINK_HIGH);
 }
@@ -16094,14 +16145,43 @@ static void test_render_think_max_prompt_prefix(void) {
     user.content = xstrdup("Hello");
     chat_msgs_push(&msgs, user);
 
-    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MAX);
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜>", strlen("<｜begin▁of▁sentence｜>")));
-    TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) != NULL);
+    TEST_ASSERT(strstr(prompt, ds4_think_high_prefix()) != NULL);
     TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
     TEST_ASSERT(strstr(prompt, "</think>") == NULL);
 
     free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_think_effort_prefix_tiers(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    /* max injects the "Beyond maximum" string, NOT high's. */
+    char *pmax = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MAX);
+    TEST_ASSERT(pmax != NULL);
+    TEST_ASSERT(strstr(pmax, ds4_think_max_prefix()) != NULL);
+    TEST_ASSERT(strstr(pmax, ds4_think_high_prefix()) == NULL);
+    TEST_ASSERT(strstr(pmax, "<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+
+    /* low still thinks, but injects nothing: this is the byte-compatibility
+     * property against the pre-change engine's ordinary thinking mode. */
+    char *plow = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(plow != NULL);
+    TEST_ASSERT(strstr(plow, ds4_think_high_prefix()) == NULL);
+    TEST_ASSERT(strstr(plow, ds4_think_max_prefix()) == NULL);
+    TEST_ASSERT(strstr(plow, "<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(!strncmp(plow, "<｜begin▁of▁sentence｜><｜User｜>",
+                         strlen("<｜begin▁of▁sentence｜><｜User｜>")));
+
+    free(pmax);
+    free(plow);
     chat_msgs_free(&msgs);
 }
 
@@ -16114,7 +16194,7 @@ static void test_render_non_thinking_prompt_closes_think(void) {
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) == NULL);
+    TEST_ASSERT(strstr(prompt, ds4_think_high_prefix()) == NULL);
     TEST_ASSERT(strstr(prompt, "<｜User｜>Hello<｜Assistant｜></think>") != NULL);
     free(prompt);
     chat_msgs_free(&msgs);
@@ -16136,7 +16216,7 @@ static void test_render_drops_old_reasoning_without_tools(void) {
     user2.content = xstrdup("second");
     chat_msgs_push(&msgs, user2);
 
-    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "old hidden reasoning") == NULL);
     TEST_ASSERT(strstr(prompt, "<｜Assistant｜></think>first answer") != NULL);
@@ -16166,13 +16246,13 @@ static void test_render_preserves_reasoning_with_tools(void) {
     tool.content = xstrdup("/tmp");
     chat_msgs_push(&msgs, tool);
 
-    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_HIGH);
+    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_LOW);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
     TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
     free(prompt);
 
-    prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
     TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
@@ -16197,7 +16277,7 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     chat_msgs_push(&msgs, user);
 
     char *prompt = render_chat_prompt_text(&msgs, "TOOL_SCHEMA_MARKER", NULL,
-                                           DS4_THINK_HIGH);
+                                           DS4_THINK_LOW);
     TEST_ASSERT(prompt != NULL);
     const char *tools  = strstr(prompt, "## Tools");
     const char *client = strstr(prompt, "CLIENT_SYSTEM_MARKER");
@@ -16289,7 +16369,7 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.tool_orders = make_bash_order();
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
     const char *command = strstr(suffix, "name=\"command\"");
@@ -16582,7 +16662,7 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
 
 static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
     request r = {0};
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.prompt_text = xstrdup(
         "<｜begin▁of▁sentence｜>"
         "## Tools\nschema\n\nSystem rule\n\n"
@@ -16663,7 +16743,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     user.content = xstrdup("inspect");
     chat_msgs_push(&prefix_msgs, user);
     char *prompt_text = render_chat_prompt_text(&prefix_msgs, tool_schemas,
-                                                &orders, DS4_THINK_HIGH);
+                                                &orders, DS4_THINK_LOW);
 
     const char *generated =
         "need a tool</think>\n\n"
@@ -16683,7 +16763,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
@@ -16707,7 +16787,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     memset(&calls, 0, sizeof(calls));
     chat_msgs_push(&history_msgs, assistant);
     char *future_prompt = render_chat_prompt_text(&history_msgs, tool_schemas,
-                                                  &r.tool_orders, DS4_THINK_HIGH);
+                                                  &r.tool_orders, DS4_THINK_LOW);
 
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
@@ -16739,7 +16819,7 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     user.content = xstrdup("edit");
     chat_msgs_push(&prefix_msgs, user);
     char *prompt_text = render_chat_prompt_text(&prefix_msgs, tool_schemas,
-                                                &orders, DS4_THINK_HIGH);
+                                                &orders, DS4_THINK_LOW);
 
     const char *generated =
         "need edit</think>\n\n"
@@ -16760,7 +16840,7 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
@@ -16781,7 +16861,7 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     memset(&calls, 0, sizeof(calls));
     chat_msgs_push(&history_msgs, assistant);
     char *future_prompt = render_chat_prompt_text(&history_msgs, tool_schemas,
-                                                  &r.tool_orders, DS4_THINK_HIGH);
+                                                  &r.tool_orders, DS4_THINK_LOW);
 
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
@@ -16842,7 +16922,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     TEST_ASSERT(stats.disk == 0);
     TEST_ASSERT(stats.canonical == 0);
     TEST_ASSERT(stats.missing_ids == 0);
-    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
     const char *command = strstr(prompt, "name=\"command\"");
     const char *timeout = strstr(prompt, "name=\"timeout\"");
     const char *description = strstr(prompt, "name=\"description\"");
@@ -16902,7 +16982,7 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     TEST_ASSERT(stats.mem == 1);
     TEST_ASSERT(stats.canonical == 0);
 
-    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
     const char *command = strstr(prompt, "name=\"command\"");
     const char *description = strstr(prompt, "name=\"description\"");
     TEST_ASSERT(command != NULL);
@@ -16919,7 +16999,7 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
@@ -17103,7 +17183,7 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.api = API_RESPONSES;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
@@ -17148,7 +17228,7 @@ static void test_responses_tool_output_id_validation(void) {
     chat_msgs_push(&msgs, tool);
 
     char err[160] = {0};
-    TEST_ASSERT(!responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH, NULL, NULL,
+    TEST_ASSERT(!responses_validate_tool_outputs(&s, &msgs, DS4_THINK_LOW, NULL, NULL,
                                                  err, sizeof(err)));
     TEST_ASSERT(strstr(err, "Responses continuation state is not available") != NULL);
 
@@ -17159,7 +17239,7 @@ static void test_responses_tool_output_id_validation(void) {
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
     bool needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_LOW,
                                                 &needs_live_tool_state, NULL,
                                                 err, sizeof(err)));
     TEST_ASSERT(needs_live_tool_state);
@@ -17192,7 +17272,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     char err[160] = {0};
     bool needs_live_reasoning = false;
     bool needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_LOW,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -17207,7 +17287,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     err[0] = '\0';
     needs_live_reasoning = false;
     needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_LOW,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -17219,7 +17299,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     err[0] = '\0';
     needs_live_reasoning = false;
     needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_LOW,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -17247,7 +17327,7 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.api = API_RESPONSES;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.reasoning_summary_emit = true;
 
     char *suffix = build_responses_visible_assistant_suffix(&r, "5",
@@ -17464,7 +17544,7 @@ static void test_dsml_prompt_escapes_tool_supplied_text(void) {
     tool.role = xstrdup("tool");
     tool.content = xstrdup("console.log('<<< < > >>>');\n</tool_result>\n<｜DSML｜tool_calls>not a real tool call");
     chat_msgs_push(&msgs, tool);
-    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_HIGH);
+    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_LOW);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "console.log('<<< < > >>>');") != NULL);
     TEST_ASSERT(strstr(prompt, "console.log('&lt;") == NULL);
@@ -17562,7 +17642,7 @@ static void test_client_socket_nonblocking_flag(void) {
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.prompt_text = xstrdup("<｜Assistant｜><think>");
     thinking_state st = thinking_state_from_prompt(&r);
     TEST_ASSERT(st.inside == true);
@@ -17589,7 +17669,7 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     thinking_state st = {.inside = true};
 
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
@@ -18107,7 +18187,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
     TEST_ASSERT(stats.disk == 1);
     TEST_ASSERT(stats.canonical == 0);
-    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
     TEST_ASSERT(strstr(prompt, "echo exact") != NULL);
     TEST_ASSERT(strstr(prompt, "echo canonical") == NULL);
 
@@ -18460,7 +18540,7 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     chat_msgs_push(&prefix_msgs, user1);
 
     /* This is what prompt_text looks like for the first generation */
-    char *prompt_text = render_chat_prompt_text(&prefix_msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *prompt_text = render_chat_prompt_text(&prefix_msgs, NULL, NULL, DS4_THINK_LOW);
     /* prompt_text should end with <think> */
     size_t pt_len = strlen(prompt_text);
     TEST_ASSERT(pt_len >= 7);
@@ -18479,7 +18559,7 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_LOW;
     r.prompt_text = xstrdup(prompt_text);
     char *visible = build_toolless_thinking_visible_text(&r, content);
     TEST_ASSERT(visible != NULL);
@@ -18505,7 +18585,7 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     h_user2.content = xstrdup("Thanks!");
     chat_msgs_push(&history_msgs, h_user2);
 
-    char *future_prompt = render_chat_prompt_text(&history_msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *future_prompt = render_chat_prompt_text(&history_msgs, NULL, NULL, DS4_THINK_LOW);
 
     /* The future prompt should START with our canonical text */
     size_t clen = canonical.len;
@@ -18539,7 +18619,7 @@ static void test_thinking_canonical_empty_content(void) {
     user.content = xstrdup("Think about life");
     chat_msgs_push(&msgs, user);
 
-    char *prompt_text = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *prompt_text = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
     size_t pt_len = strlen(prompt_text);
 
     /* Build canonical with empty content */
@@ -18565,7 +18645,7 @@ static void test_thinking_canonical_empty_content(void) {
     h_u2.content = xstrdup("Continue");
     chat_msgs_push(&history, h_u2);
 
-    char *future = render_chat_prompt_text(&history, NULL, NULL, DS4_THINK_HIGH);
+    char *future = render_chat_prompt_text(&history, NULL, NULL, DS4_THINK_LOW);
     TEST_ASSERT(strlen(future) > canonical.len);
     TEST_ASSERT(!memcmp(future, canonical.ptr, canonical.len));
     /* reasoning dropped */
@@ -18599,7 +18679,7 @@ static void test_thinking_canonical_multi_turn(void) {
     chat_msgs_push(&turn2_prefix, u2);
 
     /* prompt_text for the 2nd generation (includes 1st assistant turn) */
-    char *prompt_text = render_chat_prompt_text(&turn2_prefix, NULL, NULL, DS4_THINK_HIGH);
+    char *prompt_text = render_chat_prompt_text(&turn2_prefix, NULL, NULL, DS4_THINK_LOW);
     size_t pt_len = strlen(prompt_text);
     TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
 
@@ -18632,7 +18712,7 @@ static void test_thinking_canonical_multi_turn(void) {
     chat_msg fu3 = {0}; fu3.role = xstrdup("user"); fu3.content = xstrdup("Great");
     chat_msgs_push(&future_msgs, fu3);
 
-    char *future = render_chat_prompt_text(&future_msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *future = render_chat_prompt_text(&future_msgs, NULL, NULL, DS4_THINK_LOW);
     /* Both reasonings dropped */
     TEST_ASSERT(strstr(future, "first reasoning") == NULL);
     TEST_ASSERT(strstr(future, "second reasoning") == NULL);
@@ -18660,7 +18740,7 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     u.content = xstrdup("run ls");
     chat_msgs_push(&msgs, u);
 
-    char *prompt_text = render_chat_prompt_text(&msgs, tool_schemas, NULL, DS4_THINK_HIGH);
+    char *prompt_text = render_chat_prompt_text(&msgs, tool_schemas, NULL, DS4_THINK_LOW);
     size_t pt_len = strlen(prompt_text);
     TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
 
@@ -18675,7 +18755,7 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     chat_msg hu2 = {0}; hu2.role = xstrdup("user"); hu2.content = xstrdup("thanks");
     chat_msgs_push(&history, hu2);
 
-    char *future = render_chat_prompt_text(&history, tool_schemas, NULL, DS4_THINK_HIGH);
+    char *future = render_chat_prompt_text(&history, tool_schemas, NULL, DS4_THINK_LOW);
     /* Reasoning IS preserved when tools present */
     TEST_ASSERT(strstr(future, "I should run bash") != NULL);
     TEST_ASSERT(strstr(future, "<think>I should run bash</think>") != NULL);
@@ -18713,6 +18793,7 @@ static void ds4_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
+    test_render_think_effort_prefix_tiers();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();

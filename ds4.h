@@ -20,8 +20,22 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+/* Reasoning effort, mirroring the three levels the DeepSeek-V4-Flash-0731 model
+ * card and its reference encoder (encoding/encoding_dsv4.py) define.  All three
+ * are PROMPT PREFIXES prepended at the very start of the conversation in
+ * thinking mode -- the checkpoint carries no per-level control token, and its
+ * embedded chat template has no reasoning_effort at all, so this is the whole
+ * mechanism, not an approximation of one.
+ *   DS4_THINK_LOW   upstream "low"  -- adds nothing.  The reference encoder's
+ *                                      DEFAULT_REASONING_EFFORT, and ours.
+ *   DS4_THINK_HIGH  upstream "high" -- the "Absolute maximum" prefix.
+ *   DS4_THINK_MAX   upstream "max"  -- the "Beyond maximum" prefix.
+ * Before this change the engine exposed only two non-zero levels and labelled
+ * them one tier too low: what it called MAX emitted upstream's *high* string,
+ * and upstream's max had no representation at all. */
 typedef enum {
     DS4_THINK_NONE,
+    DS4_THINK_LOW,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
 } ds4_think_mode;
@@ -165,8 +179,11 @@ int ds4_engine_model_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
+const char *ds4_think_high_prefix(void);
 const char *ds4_think_max_prefix(void);
-uint32_t ds4_think_max_min_context(void);
+/* The prefix a mode injects, or "" for NONE/LOW.  Never NULL. */
+const char *ds4_think_effort_prefix(ds4_think_mode mode);
+uint32_t ds4_think_effort_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
  * the GGUF so Flash/Pro dimensions are known. */
@@ -528,7 +545,7 @@ void ds4_encode_chat_prompt(
         const char *prompt,
         ds4_think_mode think_mode,
         ds4_tokens *out);
-void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
+void ds4_chat_append_effort_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
 
