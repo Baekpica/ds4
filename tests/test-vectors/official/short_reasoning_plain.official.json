@@ -1,42 +1,63 @@
 {
   "schema": "ds4-official-logprobs-v1",
-  "source": "deepseek-official-api",
-  "model": "deepseek-v4-flash",
-  "endpoint": "https://api.deepseek.com/chat/completions",
-  "created_at": "2026-05-06T22:09:34Z",
+  "source": "openrouter-deepseek",
+  "model": "deepseek/deepseek-v4-flash-0731",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "created_at": "2026-08-03T02:14:35Z",
   "id": "short_reasoning_plain",
   "kind": "short",
   "prompt": "Answer with only the number: 2048 divided by 128 is",
   "request": {
-    "model": "deepseek-v4-flash",
-    "temperature": 0,
-    "max_tokens": 4,
-    "logprobs": true,
-    "top_logprobs": 20,
-    "thinking": {
-      "type": "disabled"
-    },
+    "model": "deepseek/deepseek-v4-flash-0731",
     "messages": [
       {
         "role": "user",
         "content": "Answer with only the number: 2048 divided by 128 is"
       }
-    ]
+    ],
+    "temperature": 0,
+    "max_tokens": 4,
+    "logprobs": true,
+    "top_logprobs": 20,
+    "stream": false,
+    "reasoning": {
+      "enabled": false
+    },
+    "provider": {
+      "only": [
+        "deepseek"
+      ]
+    }
   },
   "usage": {
     "prompt_tokens": 18,
     "completion_tokens": 1,
     "total_tokens": 19,
+    "cost": 2.8e-06,
+    "is_byok": false,
     "prompt_tokens_details": {
-      "cached_tokens": 0
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
     },
-    "prompt_cache_hit_tokens": 0,
-    "prompt_cache_miss_tokens": 18
+    "cost_details": {
+      "upstream_inference_cost": 2.8e-06,
+      "upstream_inference_prompt_cost": 2.52e-06,
+      "upstream_inference_completions_cost": 2.8e-07
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
   },
   "finish_reason": "stop",
   "message": {
     "role": "assistant",
-    "content": "16"
+    "content": "16",
+    "refusal": null,
+    "reasoning": null
   },
   "logits_available": false,
   "steps": [
@@ -49,7 +70,7 @@
           54
         ]
       },
-      "logprob": 0.0,
+      "logprob": 0,
       "top_logprobs": [
         {
           "token": {
@@ -59,7 +80,7 @@
               54
             ]
           },
-          "logprob": 0.0
+          "logprob": 0
         },
         {
           "token": {
@@ -70,7 +91,27 @@
               52
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " ",
+            "bytes": [
+              32
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "164",
+            "bytes": [
+              49,
+              54,
+              52
+            ]
+          },
+          "logprob": -9999
         },
         {
           "token": {
@@ -111,38 +152,18 @@
               62
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "To",
-            "bytes": [
-              84,
-              111
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "15",
+            "text": "161",
             "bytes": [
               49,
-              53
+              54,
+              49
             ]
           },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "Let",
-            "bytes": [
-              76,
-              101,
-              116
-            ]
-          },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
@@ -153,104 +174,7 @@
               101
             ]
           },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "14",
-            "bytes": [
-              49,
-              52
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "We",
-            "bytes": [
-              87,
-              101
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "1",
-            "bytes": [
-              49
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "\n",
-            "bytes": [
-              10
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "64",
-            "bytes": [
-              54,
-              52
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "8",
-            "bytes": [
-              56
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "4",
-            "bytes": [
-              52
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "Since",
-            "bytes": [
-              83,
-              105,
-              110,
-              99,
-              101
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "0",
-            "bytes": [
-              48
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "I",
-            "bytes": [
-              73
-            ]
-          },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
@@ -260,17 +184,98 @@
               56
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "10",
+            "text": "15",
             "bytes": [
               49,
+              53
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "64",
+            "bytes": [
+              54,
+              52
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "1",
+            "bytes": [
+              49
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "To",
+            "bytes": [
+              84,
+              111
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "160",
+            "bytes": [
+              49,
+              54,
               48
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "17",
+            "bytes": [
+              49,
+              55
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "162",
+            "bytes": [
+              49,
+              54,
+              50
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "20",
+            "bytes": [
+              50,
+              48
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "32",
+            "bytes": [
+              51,
+              50
+            ]
+          },
+          "logprob": -9999
         },
         {
           "token": {
@@ -279,7 +284,27 @@
               54
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "2",
+            "bytes": [
+              50
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "163",
+            "bytes": [
+              49,
+              54,
+              51
+            ]
+          },
+          "logprob": -9999
         }
       ]
     }

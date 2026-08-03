@@ -790,19 +790,16 @@ static bool test_fill_vector_case(FILE *fp, test_vec_case *vc) {
 static bool test_logprob_vector_step_disabled(const test_vec_case *vc, int step_index) {
     /*
      * Excluded steps are skipped but teacher-forced to the official token
-     * so the remaining steps still check the API trajectory.  Same
-     * adjudication family as the long_memory_archive exclusion below.
-     *
-     * short_code_completion step 1: inc-14a (chunk-1 f16 activation
-     * mirrors) legitimately moves this one step's distribution -- the
-     * engine now confidently prefers a different continuation (top-2 gap
-     * ~1.9 nats, a distribution shift, not a knife-edge artifact) while
-     * the pre-14a path still matches the API.  Re-adjudicated at the
-     * tile-aspect port (4tok x G8): same shift, same ~1.9-nat gap
-     * (DS4_TEST_NO_STEP_EXCLUSIONS=1 leg, 2026-07-31).
+     * so the remaining steps still check the API trajectory.  No active
+     * step exclusions against the 2026-08-03 fixtures: the former
+     * short_code_completion step-1 exclusion (inc-14a distribution shift,
+     * last re-adjudicated 2026-07-31) died with the pre-0731 fixture --
+     * that case now records a single step.  Future adjudications add
+     * (vc->id, step) pairs here; DS4_TEST_NO_STEP_EXCLUSIONS=1 runs the
+     * unexcluded battery for re-adjudication legs.
      */
+    (void)vc; (void)step_index;
     if (getenv("DS4_TEST_NO_STEP_EXCLUSIONS")) return false;
-    if (!strcmp(vc->id, "short_code_completion") && step_index == 1) return true;
     return false;
 }
 
@@ -901,13 +898,14 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
 
 static bool test_logprob_vector_case_disabled(const test_vec_case *vc) {
     /*
-     * This one long-context vector currently matches the public DeepSeek API less
-     * after adding the official Hadamard+FP4 indexer path.  The public official
-     * implementation and the API appear to disagree here; the official graph has
-     * slightly lower local perplexity on the A/B check we ran, so DS4 keeps that
-     * implementation and only excludes this brittle API fixture for now.
+     * No active case exclusions against the 2026-08-03 fixtures (official
+     * DeepSeek provider via OpenRouter, 0731 model -- provenance in
+     * tests/test-vectors/manifest.json).  The former long_memory_archive
+     * exclusion (Hadamard+FP4 indexer divergence vs the pre-0731 API) was
+     * re-adjudicated against the fresh fixture and passes.
      */
-    return !strcmp(vc->id, "long_memory_archive");
+    (void)vc;
+    return false;
 }
 
 static void test_official_logprob_vectors(void) {

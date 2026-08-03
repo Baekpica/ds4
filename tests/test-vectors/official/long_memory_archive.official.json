@@ -1,42 +1,63 @@
 {
   "schema": "ds4-official-logprobs-v1",
-  "source": "deepseek-official-api",
-  "model": "deepseek-v4-flash",
-  "endpoint": "https://api.deepseek.com/chat/completions",
-  "created_at": "2026-05-06T22:09:35Z",
+  "source": "openrouter-deepseek",
+  "model": "deepseek/deepseek-v4-flash-0731",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "created_at": "2026-08-03T02:14:36Z",
   "id": "long_memory_archive",
   "kind": "long",
   "prompt": "You are checking a long technical archive. Read the repeated records and answer only the final question with one short sentence.\n\nRecord 000: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 001: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 002: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 003: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 004: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 005: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 006: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 007: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 008: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 009: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 010: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 011: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 012: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 013: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 014: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 015: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 016: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 017: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 018: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 019: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 020: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 021: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 022: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 023: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 024: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 025: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 026: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 027: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 028: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 029: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 030: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 031: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 032: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 033: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 034: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 035: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 036: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 037: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 038: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 039: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 040: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 041: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 042: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 043: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 044: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 045: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 046: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 047: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 048: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 049: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 050: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 051: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 052: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 053: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 054: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 055: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 056: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 057: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 058: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 059: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 060: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 061: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 062: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 063: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 064: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 065: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 066: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 067: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 068: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 069: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 070: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 071: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\n\nFinal question: which component reports anomalies after the checksum phrase appears?",
   "request": {
-    "model": "deepseek-v4-flash",
-    "temperature": 0,
-    "max_tokens": 4,
-    "logprobs": true,
-    "top_logprobs": 20,
-    "thinking": {
-      "type": "disabled"
-    },
+    "model": "deepseek/deepseek-v4-flash-0731",
     "messages": [
       {
         "role": "user",
         "content": "You are checking a long technical archive. Read the repeated records and answer only the final question with one short sentence.\n\nRecord 000: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 001: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 002: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 003: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 004: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 005: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 006: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 007: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 008: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 009: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 010: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 011: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 012: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 013: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 014: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 015: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 016: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 017: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 018: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 019: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 020: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 021: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 022: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 023: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 024: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 025: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 026: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 027: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 028: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 029: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 030: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 031: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 032: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 033: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 034: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 035: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 036: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 037: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 038: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 039: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 040: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 041: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 042: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 043: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 044: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 045: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 046: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 047: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 048: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 049: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 050: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 051: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 052: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 053: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 054: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 055: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 056: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 057: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 058: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 059: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 060: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 061: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 062: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 063: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 064: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 065: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 066: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 067: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 068: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 069: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 070: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\nRecord 071: the archive entry says that component alpha keeps a compressed index, component beta keeps raw observations, and component gamma reports anomalies only after the checksum phrase appears. Do not summarize yet; retain the exact final question.\n\nFinal question: which component reports anomalies after the checksum phrase appears?"
       }
-    ]
+    ],
+    "temperature": 0,
+    "max_tokens": 4,
+    "logprobs": true,
+    "top_logprobs": 20,
+    "stream": false,
+    "reasoning": {
+      "enabled": false
+    },
+    "provider": {
+      "only": [
+        "deepseek"
+      ]
+    }
   },
   "usage": {
     "prompt_tokens": 3353,
     "completion_tokens": 4,
     "total_tokens": 3357,
+    "cost": 0.00047054,
+    "is_byok": false,
     "prompt_tokens_details": {
-      "cached_tokens": 3328
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
     },
-    "prompt_cache_hit_tokens": 3328,
-    "prompt_cache_miss_tokens": 25
+    "cost_details": {
+      "upstream_inference_cost": 0.00047054,
+      "upstream_inference_prompt_cost": 0.00046942,
+      "upstream_inference_completions_cost": 1.12e-06
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
   },
   "finish_reason": "length",
   "message": {
     "role": "assistant",
-    "content": "Component gamma reports anomalies"
+    "content": "Component gamma reports anomalies",
+    "refusal": null,
+    "reasoning": null
   },
   "logits_available": false,
   "steps": [
@@ -56,7 +77,7 @@
           116
         ]
       },
-      "logprob": 0.0,
+      "logprob": 0,
       "top_logprobs": [
         {
           "token": {
@@ -73,93 +94,200 @@
               116
             ]
           },
-          "logprob": 0.0
+          "logprob": 0
         },
         {
           "token": {
-            "text": "<｜｜end▁of▁sentence｜｜>",
+            "text": "Gamma",
             "bytes": [
-              60,
-              239,
-              189,
-              156,
-              239,
-              189,
-              156,
-              101,
-              110,
-              100,
-              226,
-              150,
-              129,
-              111,
-              102,
-              226,
-              150,
-              129,
-              115,
-              101,
-              110,
-              116,
-              101,
-              110,
+              71,
+              97,
+              109,
+              109,
+              97
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "component",
+            "bytes": [
               99,
+              111,
+              109,
+              112,
+              111,
+              110,
               101,
-              239,
-              189,
-              156,
-              239,
-              189,
-              156,
-              62
+              110,
+              116
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "\"",
+            "text": "The",
             "bytes": [
-              34
+              84,
+              104,
+              101
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "#",
+            "text": "**",
             "bytes": [
-              35
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "'",
-            "bytes": [
-              39
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "(",
-            "bytes": [
-              40
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "*",
-            "bytes": [
+              42,
               42
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "gamma",
+            "bytes": [
+              103,
+              97,
+              109,
+              109,
+              97
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "Which",
+            "bytes": [
+              87,
+              104,
+              105,
+              99,
+              104
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " Component",
+            "bytes": [
+              32,
+              67,
+              111,
+              109,
+              112,
+              111,
+              110,
+              101,
+              110,
+              116
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " component",
+            "bytes": [
+              32,
+              99,
+              111,
+              109,
+              112,
+              111,
+              110,
+              101,
+              110,
+              116
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "Record",
+            "bytes": [
+              82,
+              101,
+              99,
+              111,
+              114,
+              100
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "Alpha",
+            "bytes": [
+              65,
+              108,
+              112,
+              104,
+              97
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "Final",
+            "bytes": [
+              70,
+              105,
+              110,
+              97,
+              108
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "which",
+            "bytes": [
+              119,
+              104,
+              105,
+              99,
+              104
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "alpha",
+            "bytes": [
+              97,
+              108,
+              112,
+              104,
+              97
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " gamma",
+            "bytes": [
+              32,
+              103,
+              97,
+              109,
+              109,
+              97
+            ]
+          },
+          "logprob": -9999
         },
         {
           "token": {
@@ -168,82 +296,20 @@
               45
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "What",
+            "text": "Based",
             "bytes": [
-              87,
-              104,
+              66,
               97,
-              116
+              115,
+              101,
+              100
             ]
           },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": ".",
-            "bytes": [
-              46
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "/",
-            "bytes": [
-              47
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "0",
-            "bytes": [
-              48
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "1",
-            "bytes": [
-              49
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "2",
-            "bytes": [
-              50
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "3",
-            "bytes": [
-              51
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "7",
-            "bytes": [
-              55
-            ]
-          },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
@@ -252,35 +318,29 @@
               58
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "<",
+            "text": "the",
             "bytes": [
-              60
+              116,
+              104,
+              101
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "ga",
+            "text": "com",
             "bytes": [
-              103,
-              97
+              99,
+              111,
+              109
             ]
           },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": ">",
-            "bytes": [
-              62
-            ]
-          },
-          "logprob": -9999.0
+          "logprob": -9999
         }
       ]
     },
@@ -297,7 +357,7 @@
           97
         ]
       },
-      "logprob": 0.0,
+      "logprob": 0,
       "top_logprobs": [
         {
           "token": {
@@ -311,7 +371,70 @@
               97
             ]
           },
-          "logprob": 0.0
+          "logprob": 0
+        },
+        {
+          "token": {
+            "text": " alpha",
+            "bytes": [
+              32,
+              97,
+              108,
+              112,
+              104,
+              97
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " **",
+            "bytes": [
+              32,
+              42,
+              42
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " beta",
+            "bytes": [
+              32,
+              98,
+              101,
+              116,
+              97
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " γ",
+            "bytes": [
+              32,
+              206,
+              179
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " Gamma",
+            "bytes": [
+              32,
+              71,
+              97,
+              109,
+              109,
+              97
+            ]
+          },
+          "logprob": -9999
         },
         {
           "token": {
@@ -352,123 +475,45 @@
               62
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "!",
-            "bytes": [
-              33
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " my",
+            "text": " reports",
             "bytes": [
               32,
-              109,
-              121
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " am",
-            "bytes": [
-              32,
-              97,
-              109
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " key",
-            "bytes": [
-              32,
-              107,
-              101,
-              121
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " area",
-            "bytes": [
-              32,
-              97,
               114,
               101,
-              97
+              112,
+              111,
+              114,
+              116,
+              115
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "'",
+            "text": " ",
             "bytes": [
-              39
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": ")",
-            "bytes": [
-              41
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "                ",
-            "bytes": [
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
-              32,
               32
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": ",",
+            "text": "gamma",
             "bytes": [
-              44
+              103,
+              97,
+              109,
+              109,
+              97
             ]
           },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "-",
-            "bytes": [
-              45
-            ]
-          },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
@@ -477,41 +522,100 @@
               46
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "/",
-            "bytes": [
-              47
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " &",
+            "text": " g",
             "bytes": [
               32,
-              38
+              103
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": " family",
+            "text": " ",
+            "bytes": [
+              194,
+              160
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " gam",
             "bytes": [
               32,
-              102,
+              103,
+              97,
+              109
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " `",
+            "bytes": [
+              32,
+              96
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": "**",
+            "bytes": [
+              42,
+              42
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " gem",
+            "bytes": [
+              32,
+              103,
+              101,
+              109
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " delta",
+            "bytes": [
+              32,
+              100,
+              101,
+              108,
+              116,
+              97
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " lambda",
+            "bytes": [
+              32,
+              108,
               97,
               109,
-              105,
-              108,
-              121
+              98,
+              100,
+              97
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
@@ -520,34 +624,7 @@
               58
             ]
           },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": ";",
-            "bytes": [
-              59
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "<",
-            "bytes": [
-              60
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "?",
-            "bytes": [
-              63
-            ]
-          },
-          "logprob": -9999.0
+          "logprob": -9999
         }
       ]
     },
@@ -566,7 +643,7 @@
           115
         ]
       },
-      "logprob": 0.0,
+      "logprob": 0,
       "top_logprobs": [
         {
           "token": {
@@ -582,7 +659,16 @@
               115
             ]
           },
-          "logprob": 0.0
+          "logprob": 0
+        },
+        {
+          "token": {
+            "text": ".",
+            "bytes": [
+              46
+            ]
+          },
+          "logprob": -9999
         },
         {
           "token": {
@@ -623,70 +709,46 @@
               62
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "!",
+            "text": ".\n\n",
             "bytes": [
-              33
+              46,
+              10,
+              10
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": " am",
+            "text": " is",
             "bytes": [
               32,
-              97,
-              109
+              105,
+              115
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "'",
-            "bytes": [
-              39
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "(",
-            "bytes": [
-              40
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": ")",
-            "bytes": [
-              41
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " results",
+            "text": " reported",
             "bytes": [
               32,
               114,
               101,
-              115,
-              117,
-              108,
+              112,
+              111,
+              114,
               116,
-              115
+              101,
+              100
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
@@ -695,62 +757,104 @@
               44
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "-",
+            "text": " report",
             "bytes": [
-              45
+              32,
+              114,
+              101,
+              112,
+              111,
+              114,
+              116
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": ".",
+            "text": " does",
             "bytes": [
-              46
+              32,
+              100,
+              111,
+              101,
+              115
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "/",
+            "text": " (",
             "bytes": [
-              47
+              32,
+              40
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "1",
+            "text": " records",
             "bytes": [
-              49
+              32,
+              114,
+              101,
+              99,
+              111,
+              114,
+              100,
+              115
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": ".,",
+            "text": " keeps",
             "bytes": [
-              46,
-              44
+              32,
+              107,
+              101,
+              101,
+              112,
+              115
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": ":",
+            "text": " returns",
             "bytes": [
-              58
+              32,
+              114,
+              101,
+              116,
+              117,
+              114,
+              110,
+              115
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " will",
+            "bytes": [
+              32,
+              119,
+              105,
+              108,
+              108
+            ]
+          },
+          "logprob": -9999
         },
         {
           "token": {
@@ -759,47 +863,87 @@
               59
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "<",
-            "bytes": [
-              60
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": ">",
-            "bytes": [
-              62
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "?",
-            "bytes": [
-              63
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " over",
+            "text": " reporting",
             "bytes": [
               32,
-              111,
-              118,
+              114,
               101,
-              114
+              112,
+              111,
+              114,
+              116,
+              105,
+              110,
+              103
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " reviews",
+            "bytes": [
+              32,
+              114,
+              101,
+              118,
+              105,
+              101,
+              119,
+              115
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " answers",
+            "bytes": [
+              32,
+              97,
+              110,
+              115,
+              119,
+              101,
+              114,
+              115
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " replies",
+            "bytes": [
+              32,
+              114,
+              101,
+              112,
+              108,
+              105,
+              101,
+              115
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " reads",
+            "bytes": [
+              32,
+              114,
+              101,
+              97,
+              100,
+              115
+            ]
+          },
+          "logprob": -9999
         }
       ]
     },
@@ -820,7 +964,7 @@
           115
         ]
       },
-      "logprob": 0.0,
+      "logprob": 0,
       "top_logprobs": [
         {
           "token": {
@@ -838,7 +982,79 @@
               115
             ]
           },
-          "logprob": 0.0
+          "logprob": 0
+        },
+        {
+          "token": {
+            "text": " abnormalities",
+            "bytes": [
+              32,
+              97,
+              98,
+              110,
+              111,
+              114,
+              109,
+              97,
+              108,
+              105,
+              116,
+              105,
+              101,
+              115
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " the",
+            "bytes": [
+              32,
+              116,
+              104,
+              101
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " anomalous",
+            "bytes": [
+              32,
+              97,
+              110,
+              111,
+              109,
+              97,
+              108,
+              111,
+              117,
+              115
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": ".",
+            "bytes": [
+              46
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " an",
+            "bytes": [
+              32,
+              97,
+              110
+            ]
+          },
+          "logprob": -9999
         },
         {
           "token": {
@@ -879,195 +1095,201 @@
               62
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "!",
-            "bytes": [
-              33
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " my",
-            "bytes": [
-              32,
-              109,
-              121
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " old",
-            "bytes": [
-              32,
-              111,
-              108,
-              100
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " am",
-            "bytes": [
-              32,
-              97,
-              109
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " there",
+            "text": " them",
             "bytes": [
               32,
               116,
               104,
               101,
-              114,
-              101
+              109
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": " key",
-            "bytes": [
-              32,
-              107,
-              101,
-              121
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "'",
-            "bytes": [
-              39
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": ")",
-            "bytes": [
-              41
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " results",
-            "bytes": [
-              32,
-              114,
-              101,
-              115,
-              117,
-              108,
-              116,
-              115
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": ",",
-            "bytes": [
-              44
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": "-",
-            "bytes": [
-              45
-            ]
-          },
-          "logprob": -9999.0
-        },
-        {
-          "token": {
-            "text": " anal",
+            "text": " anomal",
             "bytes": [
               32,
               97,
               110,
+              111,
+              109,
               97,
               108
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": ".",
+            "text": " exceptions",
             "bytes": [
-              46
+              32,
+              101,
+              120,
+              99,
+              101,
+              112,
+              116,
+              105,
+              111,
+              110,
+              115
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "/",
+            "text": " those",
             "bytes": [
-              47
+              32,
+              116,
+              104,
+              111,
+              115,
+              101
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": ":",
+            "text": " after",
             "bytes": [
-              58
+              32,
+              97,
+              102,
+              116,
+              101,
+              114
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": ";",
+            "text": " only",
             "bytes": [
-              59
+              32,
+              111,
+              110,
+              108,
+              121
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "<",
+            "text": " anomaly",
             "bytes": [
-              60
+              32,
+              97,
+              110,
+              111,
+              109,
+              97,
+              108,
+              121
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
         },
         {
           "token": {
-            "text": "?",
+            "text": " irregularities",
             "bytes": [
-              63
+              32,
+              105,
+              114,
+              114,
+              101,
+              103,
+              117,
+              108,
+              97,
+              114,
+              105,
+              116,
+              105,
+              101,
+              115
             ]
           },
-          "logprob": -9999.0
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " any",
+            "bytes": [
+              32,
+              97,
+              110,
+              121
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " that",
+            "bytes": [
+              32,
+              116,
+              104,
+              97,
+              116
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " errors",
+            "bytes": [
+              32,
+              101,
+              114,
+              114,
+              111,
+              114,
+              115
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " issues",
+            "bytes": [
+              32,
+              105,
+              115,
+              115,
+              117,
+              101,
+              115
+            ]
+          },
+          "logprob": -9999
+        },
+        {
+          "token": {
+            "text": " all",
+            "bytes": [
+              32,
+              97,
+              108,
+              108
+            ]
+          },
+          "logprob": -9999
         }
       ]
     }

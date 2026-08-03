@@ -20,6 +20,11 @@ from pathlib import Path
 
 MODEL = "deepseek-v4-flash"
 ENDPOINT = "https://api.deepseek.com/chat/completions"
+# OpenRouter alternative (same official model, DeepSeek provider pinned so
+# the fixture never measures a third-party requant):
+#   --endpoint https://openrouter.ai/api/v1/chat/completions \
+#   --model deepseek/deepseek-v4-flash --provider-order DeepSeek
+# with the key in OPENROUTER_API_KEY (or DEEPSEEK_API_KEY).
 TOP_LOGPROBS = 20
 MAX_TOKENS = 4
 CTX_BY_ID = {
@@ -98,19 +103,34 @@ def token_bytes(token: str, value) -> list[int]:
     return list(token.encode("utf-8"))
 
 
-def request_vector(api_key: str, prompt: str) -> dict:
+def build_payload(prompt: str, endpoint: str, model: str,
+                  provider_order: list[str] | None) -> dict:
     payload = {
-        "model": MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": MAX_TOKENS,
         "logprobs": True,
         "top_logprobs": TOP_LOGPROBS,
-        "thinking": {"type": "disabled"},
         "stream": False,
     }
+    if "openrouter" in endpoint:
+        # OpenRouter's unified reasoning field; the native DeepSeek
+        # "thinking" field is silently dropped there and the tiny
+        # max_tokens budget then dies inside the reasoning trace.
+        payload["reasoning"] = {"enabled": False}
+    else:
+        payload["thinking"] = {"type": "disabled"}
+    if provider_order:
+        # "only" is a hard pin: no fallback host can ever substitute, so the
+        # fixture provably measures the named provider(s).
+        payload["provider"] = {"only": provider_order}
+    return payload
+
+
+def request_vector(api_key: str, payload: dict, endpoint: str) -> dict:
     req = urllib.request.Request(
-        ENDPOINT,
+        endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -126,9 +146,14 @@ def request_vector(api_key: str, prompt: str) -> dict:
         raise RuntimeError(f"DeepSeek API HTTP {e.code}: {body}") from e
 
 
-def normalize_record(prompt_spec: dict, response: dict) -> dict:
+def normalize_record(prompt_spec: dict, response: dict, endpoint: str, model: str,
+                     payload: dict) -> dict:
     choice = response["choices"][0]
-    logprob_items = choice.get("logprobs", {}).get("content", []) or []
+    logprob_items = (choice.get("logprobs") or {}).get("content") or []
+    if not logprob_items:
+        raise RuntimeError(
+            f"no logprobs in response for {prompt_spec['id']} "
+            "(reasoning not disabled, or provider ignored logprobs?)")
     steps = []
     for step, item in enumerate(logprob_items):
         top = []
@@ -158,22 +183,14 @@ def normalize_record(prompt_spec: dict, response: dict) -> dict:
 
     return {
         "schema": "ds4-official-logprobs-v1",
-        "source": "deepseek-official-api",
-        "model": MODEL,
-        "endpoint": ENDPOINT,
+        "source": "openrouter-deepseek" if "openrouter" in endpoint else "deepseek-official-api",
+        "model": model,
+        "endpoint": endpoint,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "id": prompt_spec["id"],
         "kind": prompt_spec["kind"],
         "prompt": prompt_spec["prompt"],
-        "request": {
-            "model": MODEL,
-            "temperature": 0,
-            "max_tokens": MAX_TOKENS,
-            "logprobs": True,
-            "top_logprobs": TOP_LOGPROBS,
-            "thinking": {"type": "disabled"},
-            "messages": [{"role": "user", "content": prompt_spec["prompt"]}],
-        },
+        "request": payload,
         "usage": response.get("usage"),
         "finish_reason": choice.get("finish_reason"),
         "message": choice.get("message", {}),
@@ -221,11 +238,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="tests/test-vectors", help="output directory")
     parser.add_argument("--only", action="append", help="fetch only the named prompt id")
+    parser.add_argument("--endpoint", default=ENDPOINT, help="chat/completions URL")
+    parser.add_argument("--model", default=MODEL, help="model slug for the endpoint")
+    parser.add_argument("--provider-order", action="append",
+                        help="OpenRouter provider pin (repeatable; disables fallbacks)")
     args = parser.parse_args()
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        print("DEEPSEEK_API_KEY is required", file=sys.stderr)
+        print("DEEPSEEK_API_KEY or OPENROUTER_API_KEY is required", file=sys.stderr)
         return 2
 
     root = Path(args.out)
@@ -237,9 +258,9 @@ def main() -> int:
     wanted = set(args.only or [])
     manifest = {
         "schema": "ds4-test-vector-manifest-v1",
-        "source": "deepseek-official-api",
-        "model": MODEL,
-        "endpoint": ENDPOINT,
+        "source": "openrouter-deepseek" if "openrouter" in args.endpoint else "deepseek-official-api",
+        "model": args.model,
+        "endpoint": args.endpoint,
         "top_logprobs": TOP_LOGPROBS,
         "max_tokens": MAX_TOKENS,
         "prompts": [],
@@ -251,8 +272,10 @@ def main() -> int:
         prompt_path = prompt_dir / f"{spec['id']}.txt"
         prompt_path.write_text(spec["prompt"], encoding="utf-8")
 
-        response = request_vector(api_key, spec["prompt"])
-        record = normalize_record(spec, response)
+        payload = build_payload(spec["prompt"], args.endpoint, args.model,
+                                args.provider_order)
+        response = request_vector(api_key, payload, args.endpoint)
+        record = normalize_record(spec, response, args.endpoint, args.model, payload)
         out_path = official_dir / f"{spec['id']}.official.json"
         out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         manifest["prompts"].append(

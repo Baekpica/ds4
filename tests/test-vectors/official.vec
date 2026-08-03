@@ -14,14 +14,8 @@ step 3 616365 1
 top 616365 0
 end
 
-case short_code_completion 4096 4 tests/test-vectors/prompts/short_code_completion.txt
-step 0 606060 1
-top 606060 0
-step 1 63 1
-top 63 0
-step 2 0a 1
-top 0a 0
-step 3 72657475726e 1
+case short_code_completion 4096 1 tests/test-vectors/prompts/short_code_completion.txt
+step 0 72657475726e 1
 top 72657475726e 0
 end
 

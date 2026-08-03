@@ -1,8 +1,8 @@
 {
   "schema": "ds4-test-vector-manifest-v1",
-  "source": "deepseek-official-api",
-  "model": "deepseek-v4-flash",
-  "endpoint": "https://api.deepseek.com/chat/completions",
+  "source": "openrouter-deepseek",
+  "model": "deepseek/deepseek-v4-flash-0731",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
   "top_logprobs": 20,
   "max_tokens": 4,
   "prompts": [
@@ -20,7 +20,7 @@
       "prompt_file": "prompts/short_code_completion.txt",
       "official_file": "official/short_code_completion.official.json",
       "prompt_chars": 102,
-      "steps": 4
+      "steps": 1
     },
     {
       "id": "short_reasoning_plain",
