@@ -63,7 +63,7 @@ CUDA_EXTRA_BINS := ds4_weight_server
 endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression \
-        proof-cuda-smoke proof-cuda-long proof-cuda-opp-c
+        proof-cuda-smoke proof-cuda-long proof-cuda-opp-c print-version
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -201,11 +201,16 @@ ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
 
 # Version stamp: git describe in a checkout; the committed VERSION file
-# (bumped at each release cut) covers gitless trees and shallow upgrades
-# where the tag ref is absent.
-DS4_BUILD_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || cat VERSION 2>/dev/null || echo unknown)
+# (bumped at each release cut) covers gitless trees and tag-less clones.
+# No --always in the describe tier: on an installer clone without tags it
+# "succeeds" with a bare hash, VERSION is never read, and the update check
+# treats the unparseable local as older -> daily self-nag on release builds.
+DS4_BUILD_VERSION := $(shell git describe --tags --dirty 2>/dev/null || cat VERSION 2>/dev/null || echo unknown)
 
-ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h rax.h
+print-version:
+	@echo $(DS4_BUILD_VERSION)
+
+ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h rax.h Makefile VERSION
 	$(CC) $(CFLAGS) -DDS4_BUILD_VERSION='"$(DS4_BUILD_VERSION)"' -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h

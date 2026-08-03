@@ -1,6 +1,10 @@
 #!/bin/bash
 # update_check_gate.sh — v0.5.3 inc4: version + once-daily update check.
 #
+#   leg stamp   (local, seconds): the Makefile version derivation yields a
+#       parseable release version in every distribution tree shape — most
+#       importantly an installer clone WITHOUT tags, where a bare-hash stamp
+#       made the update check nag release builds daily (378855 post 30).
 #   leg flags   (seconds, no model): --version prints the build version and
 #       exits 0; --check-update against a file:// LATEST reports "update
 #       available" for a newer tag and "up to date" for an older one;
@@ -23,9 +27,29 @@ log(){ echo "[$(date +%H:%M:%S)] $*"; }
 kill_all(){ ssh "$R" "pkill -x ds4-server; sleep 2; pkill -9 -x ds4-server 2>/dev/null; rm -f /tmp/ds4.lock; exit 0" 2>/dev/null; }
 fail(){ log "FAIL: $*"; kill_all; exit 1; }
 
+log "== leg stamp (local Makefile derivation) =="
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+VER=$(cat "$REPO/VERSION")
+T=$(mktemp -d)
+cp "$REPO/Makefile" "$REPO/VERSION" "$T/"
+( cd "$T" && git init -q && git add -A \
+  && git -c user.email=g@g -c user.name=g commit -qm x )
+s=$(make -s -C "$T" print-version)
+[[ "$s" == "$VER" ]] || fail "tag-less clone stamp: got '$s', want '$VER' (bare-hash regression)"
+( cd "$T" && git tag v9.9.9 )
+s=$(make -s -C "$T" print-version)
+[[ "$s" == v9.9.9 ]] || fail "tagged stamp: got '$s', want v9.9.9"
+rm -rf "$T/.git"
+s=$(make -s -C "$T" print-version)
+[[ "$s" == "$VER" ]] || fail "gitless tree stamp: got '$s', want '$VER'"
+rm -rf "$T"
+s=$(make -s -C "$REPO" print-version)
+[[ "$s" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || fail "checkout stamp unparseable: '$s'"
+log "stamp PASS (clone=$VER checkout=$s)"
+
 log "== leg flags =="
 v=$(ssh "$R" "cd $BINDIR && ./$BIN --version")
-[[ "$v" == ds4-server\ * && "$v" != *unknown* ]] || fail "--version output: $v"
+[[ "$v" =~ ^ds4-server\ v[0-9]+\.[0-9]+\.[0-9]+ ]] || fail "--version not a release version (bare hash?): $v"
 ssh "$R" "printf 'v9.9.9\n' > /tmp/LATEST_hi; printf 'v0.0.1\n' > /tmp/LATEST_lo"
 hi=$(ssh "$R" "cd $BINDIR && DS4_UPDATE_URL=file:///tmp/LATEST_hi ./$BIN --check-update")
 grep -q "update available: v9.9.9" <<<"$hi" || fail "newer LATEST not reported: $hi"
