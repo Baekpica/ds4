@@ -11483,7 +11483,13 @@ static void job_finish(job *j);   /* defined below; needed by the reap sites */
 static bool client_disconnected(int fd) {
     char b;
     ssize_t r = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
-    return r == 0;
+    if (r == 0) return true;                    /* orderly FIN */
+    /* v0.5.4: a client that closes with UNREAD stream bytes in its socket
+     * (a mid-stream timeout, a proxy reset) sends RST, not FIN -- recv errors
+     * instead of returning 0, and the probe called that "alive" until a
+     * failed write caught it much later.  Measured: a mid-decode close kept
+     * the row decoding past the retry that should have reused its bank. */
+    return r < 0 && (errno == ECONNRESET || errno == ENOTCONN);
 }
 
 static job *dequeue(server *s) {
@@ -12009,9 +12015,49 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
                              int finish) {
     if (!s->warm || j->cont_bank < 0 || j->cont_bank >= s->batch_ctx_max_seq) return;
     const int bank = j->cont_bank;
+    if (!tokens || n <= 0) {
+        /* v0.5.4 (376884 posts 126-127): an aborted/failed admission leaves
+         * the bank at its chunk watermark -- a valid, SHORTER committed
+         * sequence.  A fork/partial dst bank has no record of its own
+         * (records install at retire), so keeping engine state is not
+         * enough: the matcher routes by records, and an invisible watermark
+         * is re-paid on retry (measured: retry re-forked the trunk and
+         * replayed 8192 tokens the bank already held).  INSTALL a record
+         * for the retained prefix: the detokenized committed history,
+         * accepted only when it byte-prefixes this request's rendered
+         * prompt -- self-validating, installed exactly when a re-sent
+         * request would match it (the engine's frontier memcmp stays the
+         * authority).  A bank with nothing committed drops its record, the
+         * old behavior. */
+        s->warm[bank].last_use = ++s->warm_clock;
+        const int *btoks = NULL;
+        const int bl = s->batch_ctx ?
+            ds4_batch_ctx_bank_committed(s->batch_ctx, bank, &btoks) : 0;
+        if (bl > 0 && btoks && j->req.prompt_text && j->req.prompt_text[0]) {
+            buf tb = {0};
+            cont_append_committed_text(s, &tb, btoks, bl);
+            if (tb.len &&
+                byte_prefix_match(j->req.prompt_text, strlen(j->req.prompt_text),
+                                  tb.ptr, tb.len)) {
+                warm_rec_invalidate(s, bank);
+                s->warm[bank].text = tb.ptr;
+                s->warm[bank].len = tb.len;
+                s->warm[bank].valid = true;
+                if (s->warm[bank].stored_tokens > bl)
+                    s->warm[bank].stored_tokens = bl;
+                warm_records_gauge_refresh(s);
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: aborted admission bank=%d keeps %d committed tokens as warm record",
+                           bank, bl);
+                return;
+            }
+            buf_free(&tb);
+        }
+        warm_rec_invalidate(s, bank);
+        return;
+    }
     warm_rec_invalidate(s, bank);
     s->warm[bank].last_use = ++s->warm_clock;
-    if (!tokens || n <= 0) return;
     if (!j->req.prompt_text || !j->req.prompt_text[0]) return;
 
     buf tb = {0};
@@ -12020,8 +12066,26 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
     {
         buf_puts(&tb, j->req.prompt_text);
         cont_append_committed_text(s, &tb, tokens, n);
+    } else if (!finish) {
+        /* v0.5.4 (378855/41): an ABORTED thinking row (dead client, budget)
+         * retired without a record, so an identical retry re-paid the whole
+         * prefill -- observed in the field as three consecutive 300s client
+         * timeouts on a ~96k compression request, each re-prefilling for
+         * minutes.  The bank's committed history begins with exactly the
+         * admitted prompt tokens (frontier discipline), so the PROMPT text
+         * alone is a sound record: the retry partial-matches it at the full
+         * prompt and resumes.  The generated reasoning tail is deliberately
+         * NOT recorded (the next re-render drops reasoning); the partial
+         * cut truncates it on reuse. */
+        if (!(s->batch_ctx &&
+              ds4_batch_ctx_bank_committed(s->batch_ctx, bank, NULL) > 0))
+            return;
+        buf_puts(&tb, j->req.prompt_text);
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: aborted decode bank=%d keeps %d-token prompt as warm record",
+                   bank, j->req.prompt.len);
     } else {
-        if (j->req.kind != REQ_CHAT || j->req.has_tools || !finish) return;
+        if (j->req.kind != REQ_CHAT || j->req.has_tools) return;
         buf gen = {0};
         cont_append_committed_text(s, &gen, tokens, n);
         const char *close = gen.ptr ? strstr(gen.ptr, "</think>") : NULL;
@@ -12470,6 +12534,15 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     j->cont_bank   = -1;
     req->bank_used = &j->cont_bank;
     cont_warm_pick(s, cs, j, req);
+    /* v0.5.4: OpenAI usage details for the cont path (the serial path sets
+     * these at session sync; cont responses reported cached_tokens=0 for
+     * every admit shape).  The reusable prefix is a cache read, the replayed
+     * suffix a cache write.  n_cached is the server's proposal: the engine's
+     * frontier memcmp honors it exactly on full matches, aligns a partial
+     * cut down by at most one boundary group, and degrades to cold loudly
+     * (warm_rejects) on mismatch. */
+    j->req.cache_read_tokens  = req->n_cached;
+    j->req.cache_write_tokens = req->n > req->n_cached ? req->n - req->n_cached : 0;
     /* W7: per-seq sampling.  resolve_job_seed gives an unseeded request the same
      * distinct, non-repeating stream the single path would (shared helper, so the two
      * paths can't desync).  s->seq is read here on the single worker thread only (no

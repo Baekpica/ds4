@@ -35669,19 +35669,34 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * tokens so the server does NOT route it to the serial
                  * fallback like a reject). */
                 if (balive[b] && !balive[b](ud, usr[b])) {
+                    /* v0.5.4 (376884 posts 126-127): the interrupted mutation
+                     * is NOT discarded.  bank_hist advances only at COMPLETED
+                     * chunk boundaries (the A2a invariant), every boundary is
+                     * a consistent bank state ("each chunk commits exactly
+                     * like a warm suffix prefill"), and enqueued chunks drain
+                     * in stream order before any later tenant's work -- so
+                     * the bank is simply a valid, SHORTER sequence at its
+                     * watermark.  Keeping it deletes the class where every
+                     * abort path must reconstruct consistency by hand, and
+                     * turns an aborted replay into a warm prefix for the
+                     * retry.  wm==0 (nothing completed) keeps the old
+                     * cold-reset behavior exactly. */
+                    const uint32_t wm = pfbase[b] + pfoff[b];
                     fprintf(stderr,
-                            "ds4: cont pending admission aborted (bank %u, client gone, %u/%u prefilled)\n",
-                            b, pfoff[b], pflen[b]);
+                            "ds4: cont pending admission aborted (bank %u, client gone, %u/%u prefilled; bank retains %u committed tokens)\n",
+                            b, pfoff[b], pflen[b], ctx->bank_hist_valid[b] ? wm : 0u);
                     free(pftok[b]); pftok[b] = NULL;
                     pflen[b] = pfoff[b] = 0u;
                     pfq_h = (pfq_h + 1u) % MS;
                     pfq_n--;
-                    if (!bg_reset_bank(&ctx->sl, g, b) ||
-                        !ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) {
-                        ok = false;
-                        break;
+                    if (wm == 0u) {
+                        if (!bg_reset_bank(&ctx->sl, g, b) ||
+                            !ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) {
+                            ok = false;
+                            break;
+                        }
+                        bank_hist_reset(ctx, b);
                     }
-                    bank_hist_reset(ctx, b);
                     cont_stats_publish_done(ctx, sst, b, 0u);
                     {
                         const int none = 0;
@@ -35695,6 +35710,18 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 for (uint32_t i = 0; i < MS; i++) if (live[i]) n_live_now++;
                 uint32_t n = pflen[b] - pfoff[b];
                 bool final = true;
+                /* v0.5.4: pre-chunk emit-counter snapshot.  A chunk build
+                 * submits ONE command buffer, so a mid-build failure reaches
+                 * the device not at all -- but it may have advanced the host
+                 * counters.  Restoring this snapshot (plus bank_hist's
+                 * append-after-success discipline) makes any chunk failure
+                 * roll back to the previous chunk boundary exactly.  ~500 B
+                 * of host memcpy per chunk, nothing on the token path. */
+                uint32_t snap_comp[DS4_MAX_LAYER], snap_icomp[DS4_MAX_LAYER];
+                uint32_t snap_keep = g->ms_emit_keep[b];
+                bool bank_unknown = false;
+                memcpy(snap_comp,  g->ms_n_comp[b],       sizeof snap_comp);
+                memcpy(snap_icomp, g->ms_n_index_comp[b], sizeof snap_icomp);
                 /* D4.5e: tap the target hidden for THIS prefill chunk (layers 40/41/42 ->
                  * dspark_concat[0..n)) so the chunk's positions can be injected into bank b's
                  * DSpark ring below.  Zero extra forward; off => bit-identical prefill. */
@@ -35713,11 +35740,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                          final ? seedlog : NULL);
                 }
                 g->dspark_capture = false;
-                if (!ok) {
-                    ctx->bank_hist_valid[b] = 0u;       /* partial prefill: state unknown */
-                    break;
-                }
-                if (final && pfbase[b] == 0u && pfoff[b] == 0u &&
+                if (ok && final && pfbase[b] == 0u && pfoff[b] == 0u &&
                     logits_have_nonfinite(seedlog, DS4_N_VOCAB)) {
                     /* Validate before DSpark prefix injection.  If the cold
                      * target prefill poisoned the seed row, discard the bank
@@ -35727,17 +35750,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                             b, n);
                     if (!bg_reset_bank(&ctx->sl, g, b) ||
                         !ds4_batch_slabs_repoint(&ctx->sl, g, 0u, MS)) {
+                        bank_unknown = true;            /* reset died mid-flight */
                         ok = false;
-                        break;
-                    }
-                    bank_hist_reset(ctx, b);
-                    g->dspark_capture = dspark_prefill_inject ? true : false;
-                    ok = bg_prefill_oneshot(g, model, weights, b, pftok[b], n, 0u, seedlog);
-                    g->dspark_capture = false;
-                    if (!ok || logits_have_nonfinite(seedlog, DS4_N_VOCAB)) {
-                        fprintf(stderr, "ds4: cont prefill retry failed (bank %u n=%u)\n", b, n);
-                        ok = false;
-                        break;
+                    } else {
+                        bank_hist_reset(ctx, b);
+                        g->dspark_capture = dspark_prefill_inject ? true : false;
+                        ok = bg_prefill_oneshot(g, model, weights, b, pftok[b], n, 0u, seedlog);
+                        g->dspark_capture = false;
+                        if (!ok || logits_have_nonfinite(seedlog, DS4_N_VOCAB)) {
+                            fprintf(stderr, "ds4: cont prefill retry failed (bank %u n=%u)\n", b, n);
+                            ok = false;
+                        }
                     }
                 }
                 /* D4.5e: fuse main_x for this chunk's captured hidden and inject it into bank b's
@@ -35746,7 +35769,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * instead of zero ring slots (accept-rate only; never affects committed tokens).
                  * Warm/fork admits inject only the re-prefilled SUFFIX; the reused prefix's DSpark
                  * KV is absent (its window contribution slides out after ~SWA decode steps). */
-                if (dspark_prefill_inject && n > 0u) {
+                if (ok && dspark_prefill_inject && n > 0u) {
                     const uint32_t pbase = pfbase[b] + pfoff[b];
                     for (uint32_t i = 0; i < n; i++) { pf_inj_pos[i] = (int32_t)(pbase + i); pf_inj_sid[i] = (int32_t)b; }
                     bool iok = ds4_gpu_tensor_write(g->batch_positions, 0, pf_inj_pos, (uint64_t)n * sizeof(int32_t)) != 0;
@@ -35766,7 +35789,42 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         if (ip) ds4_gpu_tensor_free(ip);
                         if (is) ds4_gpu_tensor_free(is);
                     }
-                    if (!iok) { fprintf(stderr, "ds4: cont-dspark prefill inject FAIL (bank %u pbase=%u n=%u)\n", b, pbase, n); ok = false; break; }
+                    if (!iok) { fprintf(stderr, "ds4: cont-dspark prefill inject FAIL (bank %u pbase=%u n=%u)\n", b, pbase, n); ok = false; }
+                }
+                if (!ok) {
+                    /* v0.5.4 (376884 posts 126-127): a failed admission chunk
+                     * aborts ONE job, never the batch.  Restore the pre-chunk
+                     * counter snapshot (the failed build may have advanced
+                     * host counters; nothing partial reached the device);
+                     * bank_hist appended only for COMPLETED chunks, so the
+                     * bank stays a valid shorter sequence at its watermark.
+                     * bank_unknown (a reset died mid-flight) quarantines the
+                     * bank instead: history invalid, next install resets. */
+                    if (bank_unknown) {
+                        ctx->bank_hist_valid[b] = 0u;
+                    } else {
+                        memcpy(g->ms_n_comp[b],       snap_comp,  sizeof snap_comp);
+                        memcpy(g->ms_n_index_comp[b], snap_icomp, sizeof snap_icomp);
+                        g->ms_emit_keep[b] = snap_keep;
+                    }
+                    fprintf(stderr,
+                            "ds4: cont admission chunk FAILED (bank %u, %u/%u prefilled) -- "
+                            "admission aborted, bank retains %u committed tokens, batch continues\n",
+                            b, pfoff[b], pflen[b],
+                            ctx->bank_hist_valid[b] ? pfbase[b] + pfoff[b] : 0u);
+                    free(pftok[b]); pftok[b] = NULL;
+                    pflen[b] = pfoff[b] = 0u;
+                    pfq_h = (pfq_h + 1u) % MS;
+                    pfq_n--;
+                    cont_stats_publish_done(ctx, sst, b, 0u);
+                    {
+                        const int none = 0;
+                        on_done(ud, usr[b], &none, 0, 0);
+                    }
+                    usr[b] = NULL;
+                    live[b] = 0u;
+                    ok = true;
+                    continue;
                 }
                 bank_hist_append_n(ctx, b, pftok[b] + pfoff[b], n);
                 pfoff[b] += n;
