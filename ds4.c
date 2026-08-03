@@ -22585,6 +22585,13 @@ struct ds4_engine {
      * loud line; decode continues plain.  DS4_MTP_ACCEPT_GUARD=0 disarms. */
     bool mtp_guard_on;
     bool mtp_spec_disabled;
+    /* v0.5.4: any DRAFT-PHASE failure (MTP chain or DSpark block) disarms
+     * every draft arm process-wide.  Committed tokens come only from the
+     * base verify forward, so drafting is best-effort: losing the drafter
+     * costs speed, never correctness -- the batch degrades to plain decode
+     * instead of dying (field: cublas-q8 downgrade killed deep cont batches
+     * via "cont-mtp step 1 FAIL @draft" -> "continuous batch failed"). */
+    bool spec_draft_disabled;
     uint64_t mtp_guard_drafts;
     uint64_t mtp_guard_hits;
 };
@@ -32687,6 +32694,10 @@ struct ds4_batch_ctx {
      * byte-identical committed-cache fingerprint.  -1 = off (production). */
     int             mtp_force_draft_tok;
     int             mtp_force_draft_from;
+    /* v0.5.4 gate hook: when >0, report a draft-phase failure at this cont
+     * step so the disarm path (spec_draft_disabled) can be gated without a
+     * genuinely broken drafter on disk.  0 = off (production). */
+    int             mtp_draft_fail_step;
     /* S1.1 M3 gate sensitivity knob: when set, the in-forward verify SKIPS the per-bank rollback
      * so rejected drafts contaminate the committed cache.  The gate runs the forced-draft pair
      * once with rollback ON (expect identical fingerprints) and once OFF (expect DIFFERENT) to
@@ -33532,6 +33543,11 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     {
         const char *fe = getenv("DS4_MTP_FORCE_DRAFT_TOK");
         if (fe && fe[0]) ctx->mtp_force_draft_tok = atoi(fe);
+    }
+    ctx->mtp_draft_fail_step = 0;           /* v0.5.4 gate hook: off in production */
+    {
+        const char *fe = getenv("DS4_MTP_DRAFT_FAIL_STEP");
+        if (fe && fe[0]) ctx->mtp_draft_fail_step = atoi(fe);
     }
     ctx->mtp_force_norollback = 0;          /* S1.1 M3 gate sensitivity knob: off in production */
     ctx->rollback_verify = 0;               /* S1.1 M3 gate rollback self-check: off in production */
@@ -36312,7 +36328,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     for (uint32_t i = 0; i < nl; i++) ds4_gpu_tensor_free(srows[i]);
                 }
                 drafts_mtp_sourced = (!dspark_mode && !ctx->e->mtp_spec_disabled) ? 1u : 0u;
-                if (dspark_mode && !dspark_now) {
+                if (ctx->e->spec_draft_disabled) {
+                    /* v0.5.4: a prior draft-phase failure disarmed ALL draft
+                     * arms (MTP and DSpark) -- every step decodes plain. */
+                    for (uint32_t b = 0; b < MS; b++) ndr[b] = 0u;
+                } else if (dspark_mode && !dspark_now) {
                     /* D4.5e gate: DSpark concurrency-gated OFF this step -> draft nothing, so
                      * the next step's verify is 1 row/bank (plain batched decode). */
                     for (uint32_t b = 0; b < MS; b++) ndr[b] = 0u;
@@ -36462,10 +36482,23 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
                 g->batch_multiseq = sav_ms; g->batch_multiseq_emit = sav_em; g->batch_multiseq_prefilled = sav_pf;
             }
+            if (ctx->mtp_draft_fail_step > 0 && !ctx->e->spec_draft_disabled &&
+                steps == (uint32_t)ctx->mtp_draft_fail_step)
+                ok = false;                 /* v0.5.4 gate hook: injected drafter failure */
             if (!ok) {
-                fprintf(stderr, "ds4: cont-mtp step %u FAIL @draft (batch=%d live=%u)\n",
+                /* Draft production is best-effort: the base verify forward is
+                 * the sole source of committed tokens and this step's commits
+                 * are already final (the @commit check above), so a drafter
+                 * failure disarms spec instead of killing the batch.
+                 * Terminal for the process, loud once. */
+                ctx->e->spec_draft_disabled = true;
+                for (uint32_t b = 0; b < MS; b++) ndr[b] = 0u;
+                ok = true;
+                fprintf(stderr,
+                        "ds4: drafter forward FAILED at cont step %u (batch=%d live=%u) -- "
+                        "speculative decode DISABLED for this process; decode continues "
+                        "plain and lossless\n",
                         steps, (int)mtp_batch_draft, n_live);
-                break;
             }
             /* D4.5g controller update: attribute this step's wall to the effective
              * mode's window; on window completion, RUN -> arm a probe of the other
