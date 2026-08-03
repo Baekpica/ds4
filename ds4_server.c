@@ -13995,6 +13995,10 @@ static void usage(FILE *fp) {
         "  --reasoning-effort LEVEL\n"
         "      Default reasoning effort for requests that do not send one: low (default),\n"
         "      high, max, or off. Explicit request values always win.\n"
+        "  --mem-floor-gb N\n"
+        "      System memory admissions must always leave free, in GiB. Default: 4.\n"
+        "      KV-cache growth is trimmed or rejected before free memory drops below\n"
+        "      this line, whatever the boot-time budget says. 0 disables the floor.\n"
         "\n"
         "Thinking and sampling:\n"
         "  DeepSeek-compatible chat requests default to thinking mode; reasoning_effort\n"
@@ -14485,6 +14489,16 @@ static server_config parse_options(int argc, char **argv) {
                            "ds4-server: unknown --reasoning-effort '%s' (low, high, max, off)", v);
                 exit(2);
             }
+        } else if (!strcmp(arg, "--mem-floor-gb")) {
+            /* v0.5.4 governance inc1: operator memory floor.  The engine
+             * reads it via DS4_MEM_FLOOR_GB (set before engine boot). */
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (v[0] < '0' || v[0] > '9') {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --mem-floor-gb wants a non-negative integer in GiB (got '%s')", v);
+                exit(2);
+            }
+            setenv("DS4_MEM_FLOOR_GB", v, 1);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -14597,6 +14611,14 @@ int main(int argc, char **argv) {
                        "ds4-server: note: %s effort below the 384K-token output budget DeepSeek "
                        "recommends for it; long deliberations can hit the context limit",
                        ds4_think_mode_name(g_default_reasoning_effort));
+    }
+    {   /* v0.5.4 governance inc1: announce a non-default memory floor (the
+         * default 4 GiB rides the engine's batch-vmm boot line). */
+        const char *fe = getenv("DS4_MEM_FLOOR_GB");
+        if (fe && fe[0])
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: memory floor: %s GiB (admissions leave at least this much "
+                       "system memory free; --mem-floor-gb)", fe);
     }
 
     ds4_engine *engine = NULL;

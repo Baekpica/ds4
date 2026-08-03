@@ -33307,6 +33307,40 @@ static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     return headroom;
 }
 
+/* v0.5.4 governance inc1 (item 16): the OPERATOR memory floor -- system
+ * memory every admission spend must leave untouched no matter what any
+ * boot-time budget says.  Default 4 GiB; ds4-server --mem-floor-gb is the
+ * operator surface (it transports here via DS4_MEM_FLOOR_GB, which also
+ * serves as the A/B kill switch at 0).  Distinct from the fit headroom
+ * above: headroom is a boot PLANNING margin, the floor is a LIVE line. */
+static uint64_t ds4_mem_floor_bytes(void) {
+    static uint64_t floor_b = UINT64_MAX;
+    if (floor_b == UINT64_MAX) {
+        uint64_t f = 4ull << 30;
+        const char *fe = getenv("DS4_MEM_FLOOR_GB");
+        if (fe && fe[0]) {
+            const long fv = atol(fe);
+            if (fv >= 0) f = (uint64_t)fv << 30;
+        }
+        floor_b = f;
+    }
+    return floor_b;
+}
+
+/* v0.5.4 governance inc1: THE spend question -- live free memory beyond
+ * the operator floor.  Boot-time plans (fit, comp budget) remain class
+ * budgets; an actual spend must also fit this live answer, because the
+ * plan cannot see memory the box lost since boot (another process, the
+ * serial lane, page-cache churn -- the ceiling probe drove the box to
+ * 0.3 GiB free with zero engine pushback).  UINT64_MAX = no live answer
+ * (gate fails open, exactly like the budget refresh path). */
+static uint64_t ds4_mem_usable(void) {
+    uint64_t lfree = 0, ltotal = 0;
+    if (ds4_gpu_mem_info(&lfree, &ltotal) != 0) return UINT64_MAX;
+    const uint64_t fl = ds4_mem_floor_bytes();
+    return lfree > fl ? lfree - fl : 0;
+}
+
 /* R5 Inc1b: resident bytes across the comp/index cache slabs (page multiples
  * for demand-mapped reservations; eager slabs report their full size, but
  * callers only budget when sl->vmm).  Host-side page-flag scan, no driver
@@ -33667,10 +33701,11 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
           if (be && be[0]) { const long bv = atol(be);
             if (bv > 0) { ctx->comp_map_budget = (uint64_t)bv << 20; ctx->comp_map_budget_pinned = 1u; } } }
         fprintf(stderr,
-                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB)\n",
+                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB, mem floor=%.1f GiB)\n",
                 (unsigned long long)(ds4_gpu_vmm_demand_page() >> 10),
                 (double)cache_per_bank / 1048576.0, (double)floor_pb / 1048576.0,
-                ctx->max_seq, (double)ctx->comp_map_budget / 1073741824.0);
+                ctx->max_seq, (double)ctx->comp_map_budget / 1073741824.0,
+                (double)ds4_mem_floor_bytes() / 1073741824.0);
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
      * R2: sized by seq_cap (the committed-token bound), not the raw ring. */
@@ -35411,7 +35446,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
              * fitting an already-grown bank pass.  Trim + eviction-aware
              * placement are Inc2; the warm/fork match counters above count
              * VALIDATION, so a budget-rejected match still ticks them. */
-            if (ctx->sl.vmm && ctx->comp_map_budget != 0) {
+            if (ctx->sl.vmm) {
                 uint64_t flen = (uint64_t)L + mn;
                 if (flen > seq_cap) flen = seq_cap;
                 const uint64_t mneed = ds4_batch_bank_map_projection(ctx, b, flen);
@@ -35424,7 +35459,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * the runtime headroom.  Grow-only -- shrink keeps the boot
                  * answer, and genuine exhaustion is handled where it always
                  * was (ensure() fails the stream gracefully). */
-                if (mneed != 0 && mres + mneed > ctx->comp_map_budget &&
+                if (ctx->comp_map_budget != 0 && mneed != 0 &&
+                    mres + mneed > ctx->comp_map_budget &&
                     !ctx->comp_map_budget_pinned) {
                     uint64_t lfree = 0, ltotal = 0;
                     if (ds4_gpu_mem_info(&lfree, &ltotal) == 0) {
@@ -35447,14 +35483,16 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * Eviction now gives pages back: victims carry the cheapest
                  * warm value first, and a trimmed bank's next tenant
                  * cold-resets and re-maps on the ensure-before-emit path. */
-                if (mneed != 0 && mres + mneed > ctx->comp_map_budget) {
+                if (ctx->comp_map_budget != 0 && mneed != 0 &&
+                    mres + mneed > ctx->comp_map_budget) {
                     const uint64_t want = mres + mneed - ctx->comp_map_budget;
                     if (ds4_batch_trim_free_banks(ctx, g, live, pflen, b,
                                                   (fork || partial) ? (int)fsrc : -1,
                                                   want) > 0)
                         mres = ds4_batch_slabs_cache_resident(&ctx->sl);
                 }
-                if (mneed != 0 && mres + mneed > ctx->comp_map_budget) {
+                if (ctx->comp_map_budget != 0 && mneed != 0 &&
+                    mres + mneed > ctx->comp_map_budget) {
                     ctx->mem_rejects++;
                     ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
                     fprintf(stderr,
@@ -35463,6 +35501,32 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                             (double)ctx->comp_map_budget / 1048576.0);
                     on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
                     continue;
+                }
+                /* v0.5.4 governance inc1 (item 16): the budget above is a
+                 * boot-time PLAN and cannot see memory the box lost since
+                 * boot.  Every admission spend must ALSO fit live free
+                 * memory beyond the operator floor.  Trim can hand pages
+                 * back (unmap is exact and immediate), so it runs before
+                 * the verdict; in-flight banks stay inviolable. */
+                if (mneed != 0) {
+                    uint64_t usable = ds4_mem_usable();
+                    if (mneed > usable) {
+                        if (ds4_batch_trim_free_banks(ctx, g, live, pflen, b,
+                                                      (fork || partial) ? (int)fsrc : -1,
+                                                      mneed - usable) > 0)
+                            usable = ds4_mem_usable();
+                    }
+                    if (mneed > usable) {
+                        ctx->mem_rejects++;
+                        ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
+                        fprintf(stderr,
+                                "ds4: cont admit rejected on memory floor (bank %u: need %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor -- the box lost memory since boot; --mem-floor-gb governs)\n",
+                                b, (double)mneed / 1048576.0,
+                                (double)usable / 1048576.0,
+                                (double)ds4_mem_floor_bytes() / 1073741824.0);
+                        on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
+                        continue;
+                    }
                 }
             }
             /* R4: ADMISSION = INSTALL ONLY.  Bank state is prepared here (reset /
