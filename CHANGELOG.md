@@ -1,4 +1,70 @@
-# v0.5.3 (2026-08-02)
+# v0.5.4 (2026-08-03)
+
+Field-report release: every change traces to a report in the NVIDIA
+developer forum threads. Thanks to GaelicThndr for the disk-restore
+report and the single-Spark reasoning-effort question that drove two of
+these.
+
+- reasoning_effort reachable on every box (forum 378855 post 30): the
+  server no longer silently downgrades high/max below 384K context —
+  explicit request values are honored at any --ctx (a boot advisory
+  replaces the downgrade), and --reasoning-effort low|high|max|off sets
+  the default for requests that do not send the field.
+- --version prints the release version on installer builds (forum
+  378855 post 30's log): a tag-less installer clone made git describe
+  return a bare commit hash, which the update check treated as older
+  than any release — a daily spurious "update available" self-nag on
+  up-to-date boxes. The VERSION file now takes over whenever tags are
+  absent.
+- A drafter failure disarms speculative decode instead of killing the
+  continuous batch (found while chasing forum 376884 post 113): one
+  loud line, then plain lossless decode for the rest of the process.
+  Committed tokens only ever come from the base verify forward, so
+  draft production is best-effort by construction.
+- Operator memory floor --mem-floor-gb (default 4 GiB): admissions now
+  gate against live free memory, not just the boot-time budget plan.
+  KV-cache growth is trimmed or rejected before free memory drops below
+  the floor, whatever the box has lost since boot (other processes,
+  page-cache churn). The boot line reports the floor; 0 disables.
+- Interrupted work now leaves checkpoints, not cold banks (forum 376884
+  posts 126-127, forum 378855 post 41): an aborted or failed admission
+  keeps the bank's committed chunk watermark and re-announces it as a
+  warm record, so a retry resumes where the interruption landed instead
+  of re-prefilling from zero (measured: a retry after a mid-replay
+  disconnect reused 34,402 tokens that v0.5.3 threw away). Aborted or
+  budget-exhausted reasoning requests likewise keep a prompt record —
+  previously each retry of a timed-out ~96k summarization re-paid the
+  full prefill.
+- A failed admission chunk aborts one job, never the batch: the
+  admission loop restores its pre-chunk counter snapshot, logs one loud
+  line, and keeps serving the other tenants (previously any chunk
+  failure killed the whole continuous batch).
+- Client-disconnect detection now recognizes reset-style closes: a
+  client that quits mid-stream with unread bytes sends RST, not a clean
+  close, and the liveness probe treated that as alive until a failed
+  write caught it much later.
+- Continuous-batch responses report true cached_tokens: warm, fork, and
+  partial admits reported 0 in usage.prompt_tokens_details for every
+  admit shape (the serial path was already honest).
+- Official logprob vectors refreshed against the 0731 model via the
+  official DeepSeek provider (hard-pinned through OpenRouter): the unit
+  battery runs all five vector cases with zero exclusions again.
+- New release gates: update_check stamp leg, drafter_disarm_gate,
+  mem_floor_gate (external-loss hog + deep ceiling-replay legs),
+  restore_reject_gate covering the forum 378855 post 30 shape
+  (restore -> budget-reject -> serial, clean across 11 cycles on two
+  releases), and bank_mutation_gate (interrupted warm/truncate replays
+  + mid-decode disconnects of reasoning rows, with watermark-reuse and
+  usage-honesty receipts per cycle).
+
+# Changelog
+
+All notable fork-side changes to this project are documented here.
+Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
+[antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
+(2026-05-29). Upstream's own changes are not repeated here.
+
+## v0.5.3 — 2026-08-02
 
 Field-robustness and interface release: three engine increments plus two
 community PRs.
@@ -23,13 +89,6 @@ community PRs.
 - PR #6 (a-huk): the GB10 graph-fit gate trusts MemAvailable; the former
   pinned-file subtraction starved the fit estimate on tight boxes and
   503'd the serial lane.
-
-# Changelog
-
-All notable fork-side changes to this project are documented here.
-Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
-[antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
-(2026-05-29). Upstream's own changes are not repeated here.
 
 ## v0.5.2 — 2026-08-02
 
