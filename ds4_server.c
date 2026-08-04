@@ -12240,6 +12240,50 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
             best_len = s->warm[b].len;
         }
     }
+    /* #10 (2026-08-04): an equal-length record can never win the full scan
+     * above (it needs len < plen strictly: the warm path must prefill at
+     * least one suffix token), so a retry whose prompt EQUALS a record --
+     * the aborted-thinking prompt-as-record shape installs exactly this --
+     * would reuse a SHORTER full-prefix trunk instead and re-prefill the
+     * whole tail.  Rank by DELIVERED TOKENS, never bytes (gate-earned
+     * 2026-08-05): the full path splices the record's EXACT sampled
+     * tokens (reuse = hl), while the partial path reuses only the
+     * canonical token-LCP, which sampled-vs-canonical BPE drift can end
+     * partway into the trunk -- a byte-LCP comparison over-promises and
+     * measurably LOST 160 tokens on a small-delta shape.  So: byte LCP is
+     * only the cheap prefilter; the verdict compares the partial
+     * candidate's actual token cut against the full record's committed
+     * length, and defers the full match only when the partial strictly
+     * delivers more.  If the partial path cannot take it after all, fall
+     * back to the full match below. */
+    bool full_deferred = false;
+    if (s->warm_fork_partial && plen && best >= 0) {
+        size_t plcp_max = 0;
+        int pb0 = -1;
+        for (int b2 = 0; b2 < s->batch_ctx_max_seq; b2++) {
+            if (occ[b2] || !s->warm[b2].valid || s->warm[b2].len == 0) continue;
+            const size_t l = byte_common_prefix(ptext, plen,
+                                                s->warm[b2].text, s->warm[b2].len);
+            if (l > plcp_max) { plcp_max = l; pb0 = b2; }
+        }
+        if (pb0 >= 0 && plcp_max > best_len &&
+            plcp_max >= (size_t)s->warm_partial_min) {
+            const int hl_full = ds4_batch_ctx_bank_committed(s->batch_ctx, best, NULL);
+            const int *ptok2 = NULL;
+            const int hl_part = ds4_batch_ctx_bank_committed(s->batch_ctx, pb0, &ptok2);
+            const int pcap2 = j->req.prompt.len - 1 < hl_part ? j->req.prompt.len - 1
+                                                              : hl_part;
+            int cut2 = 0;
+            if (ptok2)
+                while (cut2 < pcap2 && ptok2[cut2] == j->req.prompt.v[cut2]) cut2++;
+            if (cut2 > hl_full && cut2 >= s->warm_partial_min) {
+                full_deferred = true;
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: warm pick prefers partial trunk (full match %d tok < partial cut %d tok)",
+                           hl_full, cut2);
+            }
+        }
+    }
     /* v0.3 durable pinned banks: no live record prefixes this request --
      * try the disk tier before falling to partial/cold.  Restores prefer a
      * NO-VALUE or superseded bank; a DEEP disk record (>= warm_pin_min
@@ -12282,7 +12326,8 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
             }
         }
     }
-    if (best >= 0) {
+full_commit:
+    if (best >= 0 && !full_deferred) {
         const int *htok = NULL;
         const int hl = ds4_batch_ctx_bank_committed(s->batch_ctx, best, &htok);
         if (hl > 0 && htok) {
@@ -12463,6 +12508,15 @@ static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                 return;
             }
         }
+    }
+    /* #10: the preferred partial trunk could not take the job (cut below
+     * the token floor / untrustworthy committed state) -- serve the full
+     * match after all rather than falling to cold. */
+    if (full_deferred && best >= 0) {
+        full_deferred = false;
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: partial preference fell through; taking the full match");
+        goto full_commit;
     }
     const int target = warm_victim_pick(s, occ, -1, true);
     if (target >= 0) {
