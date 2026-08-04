@@ -11071,7 +11071,23 @@ decode_again:
             tool_calls_free(&test_calls);
         }
         if (!completed_truncation) {
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (strcmp(finish, "length") == 0) {
+                /* #13 (2026-08-04): the call is unterminated because the
+                 * token budget cut it mid-emission.  Reporting "error" here
+                 * sent agent harnesses into retry loops; the honest finish
+                 * is "length" (client raises max_tokens or continues).  The
+                 * parse fallback below returns the partial call as assistant
+                 * text and tool_parse_failure_recovery_finish preserves the
+                 * length stop.  Recovery is deliberately skipped: continuing
+                 * past an exhausted budget would violate max_tokens. */
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s tool call cut by token budget; reporting finish=length",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags);
+                trace_event(s, trace_id,
+                            "tool call cut by token budget; reporting finish=length");
+            } else if (!j->req.stream && !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
@@ -11152,8 +11168,11 @@ decode_again:
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
              * execute the block, feed the model a tool error and the protocol
-             * reminder so it owns the corrected next action. */
-            if (!j->req.stream && !dsml_recovery_attempted) {
+             * reminder so it owns the corrected next action.  #13: a length
+             * finish means the budget cut the call; recovery would decode
+             * past max_tokens, so fall through to the raw-text fallback. */
+            if (!j->req.stream && !dsml_recovery_attempted &&
+                strcmp(final_finish, "length") != 0) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 const char *detail = err[0] ? err : "invalid tool call";
