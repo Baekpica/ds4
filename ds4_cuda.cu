@@ -3359,6 +3359,21 @@ extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchroni
 __device__ unsigned int g_topk_bound_viol_count  = 0u;
 __device__ unsigned int g_topk_bound_viol_n      = 0u;
 __device__ unsigned int g_topk_bound_viol_stride = 0u;
+#ifdef DS4_S512_APPEND_GUARD
+/* #9 mechanism probe (2026-08-04, harness-only define): stream512 append
+ * overflow telemetry -- see the guard at the buf append site. */
+__device__ unsigned int g_s512_append_ovf_count = 0u;
+__device__ unsigned int g_s512_append_ovf_max   = 0u;
+#endif
+#ifdef DS4_S512_TRACE
+/* #9 post-mortem breadcrumbs (2026-08-04, harness-only define): per-WARP
+ * phase markers written through host-mapped memory so they survive a
+ * device fault.  Slot layout: [(block*16 + warp)*2] = (iter << 8) | phase,
+ * [(block*16 + warp)*2 + 1] = s_cnt observed by the warp leader at the
+ * marker.  Any intra-block phase/iteration skew at death = the barrier
+ * phase-slip class; the max-phase warp localizes the faulting region. */
+__device__ volatile unsigned int *g_s512_trace = NULL;
+#endif
 
 extern "C" int ds4_gpu_end_commands(void) {
     int ok = cuda_ok(cudaDeviceSynchronize(), "end commands");
@@ -15349,9 +15364,22 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
  * Replaces the chunk sorts, the merge tree, AND the per-launch candidate
  * scratch on this tier (proto_topk_diet.cu: 372-check bitwise sweep vs
  * the tree across shapes x adversarial patterns + CPU reference;
- * memcheck-clean; compute-sanitizer racecheck flags on this kernel were
- * adjudicated as a tool artifact of the load-fed-predicate pattern —
- * elimination dossier in brief-v05-arc.md 2026-07-28). */
+ * memcheck-clean; the 2026-07-28 racecheck "tool artifact" ruling was
+ * re-adjudicated 2026-08-04: the tools DO over-report this pattern class
+ * (condbar-control receipt), but a real compact-verdict race hid beneath
+ * the noise — see the #9 ROOT CAUSE comment at the verdict snapshot). */
+#ifdef DS4_S512_TRACE
+#define S512_MARK(itv, ph) do { \
+    if ((tid & 31u) == 0u && g_s512_trace != NULL) { \
+        const uint32_t s_ = ((uint32_t)t * 16u + (tid >> 5u)) * 2u; \
+        g_s512_trace[s_] = ((uint32_t)(itv) << 8) | (uint32_t)(ph); \
+        g_s512_trace[s_ + 1u] = s_cnt; \
+        __threadfence_system(); \
+    } \
+} while (0)
+#else
+#define S512_MARK(itv, ph) do { } while (0)
+#endif
 __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
         uint32_t *selected,
         const float *scores,
@@ -15377,6 +15405,7 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
     __shared__ uint64_t buf[STREAM_CAP];
     __shared__ typename StreamSort::TempStorage sort_tmp;
     __shared__ uint32_t s_cnt;
+    __shared__ uint32_t s_vcnt;   /* frozen compact verdict, see loop */
     __shared__ uint64_t s_thr;
 
     const uint32_t t = blockIdx.x;
@@ -15401,6 +15430,7 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
     }
     if (tid == 0) { s_cnt = 0; s_thr = 0; }
     __syncthreads();
+    S512_MARK(0u, 1u);
 
     const uint32_t start = (uint32_t)(((uint64_t)(t + 1u) * 0x9E3779B9u) % n);
     /* tile = one read per thread: STREAM_CAP - tile = 1536 leaves 1024 keys
@@ -15429,13 +15459,46 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
                 uint32_t pos = 0;
                 if (rank == 0) pos = atomicAdd(&s_cnt, __popc(ball));
                 pos = __shfl_sync(ball, pos, __ffs(ball) - 1);
+#ifdef DS4_S512_APPEND_GUARD
+                /* #9 harness-only probe: bound the append and count
+                 * overflow attempts instead of faulting (adjudicated
+                 * 2026-08-04: overflow here was NOT the fault site). */
+                {
+                    const uint32_t bidx = pos + rank;
+                    if (bidx >= STREAM_CAP) {
+                        atomicAdd(&g_s512_append_ovf_count, 1u);
+                        atomicMax(&g_s512_append_ovf_max, bidx);
+                    } else {
+                        buf[bidx] = key;
+                    }
+                }
+#else
                 buf[pos + rank] = key;
+#endif
             }
         }
         __syncthreads();
-        if (s_cnt > STREAM_CAP - tile) {
+        /* #9 ROOT CAUSE (2026-08-04): the compact verdict must be read
+         * from a value FROZEN under barriers.  Reading s_cnt directly
+         * here races with the NEXT iteration's append atomicAdd on the
+         * skip path (no barrier in between): a fast warp that reads
+         * "skip" can loop around and bump s_cnt before a slow sibling
+         * has read it, the sibling then crosses the threshold and enters
+         * the compact alone.  Warps split across iterations, arrivals at
+         * the single hardware barrier conflate, cub's rank state
+         * corrupts, and a garbage rank scatters outside the smem window
+         * (illegal access / field Xid 13 OOR).  Observed live via the
+         * DS4_S512_TRACE breadcrumbs: sibling warps frozen in iter-k and
+         * iter-k+1 compacts simultaneously (ledger 08-04).  The snapshot
+         * barrier below closes the window by construction: no iter-k+1
+         * append can start until every warp has passed it, so s_vcnt is
+         * the exact completed-append count and the verdict is uniform. */
+        if (tid == 0) s_vcnt = s_cnt;
+        __syncthreads();
+        S512_MARK(base / tile, 2u);
+        if (s_vcnt > STREAM_CAP - tile) {
             /* compact: sort descending, keep top_k, raise the threshold */
-            const uint32_t cnt = s_cnt;
+            const uint32_t cnt = s_vcnt;
             uint64_t keys[STREAM_ITEMS];
             #pragma unroll
             for (uint32_t k = 0; k < STREAM_ITEMS; k++) {
@@ -15443,8 +15506,10 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
                 keys[k] = (i < cnt) ? buf[i] : 0;
             }
             __syncthreads();
+            S512_MARK(base / tile, 3u);
             StreamSort(sort_tmp).SortDescending(keys);
             __syncthreads();
+            S512_MARK(base / tile, 4u);
             if (tid < top_k / STREAM_ITEMS) {
                 #pragma unroll
                 for (uint32_t k = 0; k < STREAM_ITEMS; k++)
@@ -15453,6 +15518,7 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
             if (tid == top_k / STREAM_ITEMS - 1) s_thr = keys[STREAM_ITEMS - 1];
             if (tid == 0) s_cnt = top_k;
             __syncthreads();
+            S512_MARK(base / tile, 5u);
         }
     }
     /* final: sort the survivors, emit the top_k ids in tree order */
@@ -15465,16 +15531,20 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
             keys[k] = (i < cnt) ? buf[i] : 0;
         }
         __syncthreads();
+        S512_MARK(0xFFFu, 6u);
         StreamSort(sort_tmp).SortDescending(keys);
         __syncthreads();
+        S512_MARK(0xFFFu, 7u);
         if (tid < top_k / STREAM_ITEMS) {
             #pragma unroll
             for (uint32_t k = 0; k < STREAM_ITEMS; k++)
                 selected[(uint64_t)t * top_k + tid * STREAM_ITEMS + k] =
                     0xffffffffu - (uint32_t)(keys[k] & 0xffffffffu);
         }
+        S512_MARK(0xFFFu, 8u);
     }
 }
+#undef S512_MARK
 
 #ifdef DS4_CUDA_HAVE_MXF4
 /* ================= v0.5 inc-13a: exact mxf4 score+select ==================
