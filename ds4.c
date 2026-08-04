@@ -33739,27 +33739,72 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
      * floor and the smallest right-sized serial graph no longer fits
      * (need + 1 GiB fit headroom > free) -- the field "serial right-size:
      * no graph fits ... refusing 503" class at deep -c.
-     * GUARD/RESERVATION AGREEMENT (memory-governance design 2026-08-03):
-     * the deep-serial guard PROMISES serving up to ctx/2, so the default
-     * entitlement is ctx/2 -- the reservation funds exactly the promise
-     * and the "temporarily at capacity (deep prompts not served)" outage
-     * shape dissolves.  DS4_SERIAL_RESERVE_CTX resizes the entitlement
-     * (policy, e.g. down when serial traffic is known-shallow; 0 = off).
-     * Every growth verdict below treats the reserve as already spent. */
+     *
+     * GUARD/RESERVATION AGREEMENT, corrected 2026-08-05 by the deep gate:
+     * the promise to fund is the SERVER's deep-serial guard, which refuses
+     * serial fallback above a FLAT DS4_SERVER_SERIAL_MAX_TOKENS (default
+     * 65536) -- not ctx/2.  (The governance design said ctx/2 because the
+     * shape it was written from booted -c 131072, where ctx/2 happens to
+     * equal 65536.)  Sizing to ctx/2 over-reserved 4x at -c 524288: 12.16
+     * GiB for a 65536-token promise, which consumed every usable byte and
+     * made the batch path reject admissions as small as one bank floor --
+     * the exact inversion of the bug this fixes.  Read the same env the
+     * guard reads so the two cannot drift.
+     *
+     * DEFAULT OFF, and the measurement that decided it (2026-08-05, the
+     * 240k deep gate caught this as a regression): a right-sized serial
+     * session graph costs ~7.3 GiB, while deep batch serving at -c 524288
+     * leaves ~6.8 GiB free on a 128 GiB box.  The two lanes genuinely
+     * cannot both be funded at depth -- so a STATIC reservation does not
+     * resolve the scarcity, it only decides who loses, and reserving made
+     * the batch path (the primary one) reject admissions as small as a
+     * single bank floor while the reserved graph sat unused.  emX0r's
+     * outage and that failure are the SAME scarcity seen from the two
+     * lanes.  The real fix is reclaim: when the serial lane cannot fit,
+     * shed bank cache pages for it (the trim ladder already gives pages
+     * back) instead of pre-paying at the batch path's expense -- v0.5.6,
+     * see the memory-governance design.  Until then this is an OPS LEVER,
+     * not a default: DS4_SERIAL_RESERVE_CTX=<tokens> carves a reservation
+     * for deployments whose serial lane matters more than batch depth
+     * (set it to the deepest serial prompt you need served).
+     *
+     * NEVER STARVE THE COMMONS: even when opted in, the reservation may
+     * only claim what the box can spare beyond the bank plan's own floor
+     * (max_seq x floor/bank); it yields and says so otherwise.  Every
+     * growth verdict below treats the (clamped) reserve as already spent. */
     ctx->serial_reserve = 0;
     {
-        long ent = ctx_size / 2;   /* the deep-serial guard's own promise */
+        long ent = 0;   /* OFF unless the operator opts in (see above) */
         const char *se = getenv("DS4_SERIAL_RESERVE_CTX");
         if (se && se[0]) { const long v = atol(se); if (v >= 0) ent = v; }
         if (ent > ctx_size) ent = ctx_size;
         if (ent > 0) {
             const uint32_t spc = metal_graph_prefill_cap_for_prompt((int)ent);
             const uint32_t src = metal_graph_raw_cap_for_context((int)ent, spc);
-            ctx->serial_reserve =
+            uint64_t want =
                 metal_graph_alloc_bytes_estimate(&e->weights, &e->weights.layer[0],
                                                  src, (uint32_t)ent, spc,
                                                  e->mtp_ready, e->dspark_ready) +
                 (1024ull << 20);
+            /* Clamp to what remains after the commons keeps its own floor. */
+            const uint64_t commons_floor =
+                (uint64_t)ctx->max_seq * ds4_batch_vmm_floor_per_bank(&ctx->g);
+            const uint64_t usable = ds4_mem_usable();   /* live free beyond the operator floor */
+            if (usable != UINT64_MAX) {
+                const uint64_t sparable = usable > commons_floor ? usable - commons_floor : 0;
+                if (want > sparable) {
+                    fprintf(stderr,
+                            "ds4: serial reserve CLAMPED %.2f -> %.2f GiB (entitlement %ld tok needs "
+                            "more than the box can spare beside the bank floor %.2f GiB; serial "
+                            "requests above ~%s may refuse -- lower -c, raise --mem-floor-gb headroom, "
+                            "or set DS4_SERIAL_RESERVE_CTX)\n",
+                            (double)want / 1073741824.0, (double)sparable / 1073741824.0,
+                            ent, (double)commons_floor / 1073741824.0,
+                            sparable ? "the funded depth" : "any depth");
+                    want = sparable;
+                }
+            }
+            ctx->serial_reserve = want;
         }
     }
     if (ctx->sl.vmm) {

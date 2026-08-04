@@ -3,28 +3,38 @@
 # reservation (field 378855 post 49 emX0r: serial 503s above ~90k on
 # v0.5.4 because bank growth eats the lazy serial graph's room).
 #
-# The fix carves ctx->serial_reserve (entitlement-ctx session graph
-# estimate + 1 GiB fit headroom; DS4_SERIAL_RESERVE_CTX overrides,
-# 0 = off) out of every bank-growth verdict: boot comp budget, admit
-# refresh, and the mem-floor verdict.
+# DS4_SERIAL_RESERVE_CTX=<tokens> carves a serial-lane reservation
+# (session-graph estimate at that depth + 1 GiB fit headroom, clamped to
+# what the box can spare beside the bank floor) out of every bank-growth
+# verdict: boot comp budget and the mem-floor verdict.
+#
+# DEFAULT OFF since 08-05, and this gate documents why: a right-sized
+# serial graph costs ~7.3 GiB while deep batch serving at -c 524288
+# leaves ~6.8 GiB free, so a STATIC carve cannot fund both lanes -- it
+# only picks a loser, and on default boots it must not be the batch
+# path (the 240k deep gate caught exactly that regression).  This gate
+# therefore proves the LEVER works for deployments that opt in, not a
+# default behavior.  The general fix is reclaim (serial sheds bank cache
+# pages when it cannot fit) -- see the memory-governance design.
 #
 # Legs (deterministic; the floor is tuned so the reserve TERM alone
 # decides the verdict -- binary-controlled by the env kill switch):
-#   1 boot     -c 130000 (the field ctx): boot ledger prints
-#              "serial reserve=R GiB", R > 0.  Record R and free F.
-#   2 engage   --mem-floor-gb ceil(F-R) (usable beyond floor+reserve
-#              ~= 0): a fresh streaming cont admission REJECTS on the
+#   1 boot     -c 130000 (the field ctx), reserve opted in at ENT tokens
+#              (default 65536 = the serial fallback guard's own depth
+#              limit): boot ledger prints "serial reserve=R GiB", R > 0,
+#              and the #15 plan-budget arithmetic holds.  Record R, F.
+#   2 engage   --mem-floor-gb ceil(F-R)+1 (usable beyond floor+reserve
+#              < 0): a fresh streaming cont admission REJECTS on the
 #              floor line WITH the "serial reserve" term in the message;
 #              a 15k /v1/messages serial request then SERVES (200,
 #              'prompt start' marker) -- the lane the reserve protects.
 #   3 control  same floor, DS4_SERIAL_RESERVE_CTX=0: boot prints
 #              reserve=0.00; the SAME admission is ACCEPTED and serves
 #              -- the reserve term alone flipped the verdict.
+#   4 promise  commons pinned tiny + reserve on: a request just under
+#              the guard depth SERVES (the opted-in deployment's win).
 #
-# The field's end-state 503 itself (free < smallest graph + headroom)
-# is the serial right-size machinery's existing behavior; this gate
-# proves the governance that PREVENTS reaching that state via the
-# server's own growth.  Runs FROM the Mac over SSH; end state: box free.
+# Runs FROM the Mac over SSH; end state: box free.
 set -uo pipefail
 
 R=${R:-sync-192_168_88_33}
@@ -96,8 +106,13 @@ print(json.dumps({"messages": [{"role": "user", "content":
 PY
 }
 
-log "== leg 1: boot receipt (-c $CTX, default reserve = ctx/2 promise) =="
-boot "DS4_NOOP=0" ""
+# The reservation is DEFAULT OFF since 08-05 (a static carve cannot be
+# funded beside deep batch serving -- see the ds4.c comment and the
+# governance design's reclaim section). Every leg that wants it opts in
+# explicitly at the entitlement the serial fallback guard accepts.
+ENT=${ENT:-65536}
+log "== leg 1: boot receipt (-c $CTX, reserve opted in at $ENT tok) =="
+boot "DS4_SERIAL_RESERVE_CTX=$ENT" ""
 BOOTLINE=$(ssh "$R" "grep 'batch vmm' $SRV | head -1")
 log "boot: $BOOTLINE"
 RES=$(echo "$BOOTLINE" | grep -oE 'serial reserve=[0-9.]+' | cut -d= -f2)
@@ -123,14 +138,14 @@ log "== leg 2 prep: re-measure free under the leg 2/3 config (2 banks) =="
 # the floor must be computed from THAT config's own settled free, and
 # +1 GiB over the carve line so post-boot page-cache settling cannot
 # drift usable back above zero.
-boot "DS4_SERVER_COALESCE_MAX=2" ""
+boot "DS4_SERVER_COALESCE_MAX=2 DS4_SERIAL_RESERVE_CTX=$ENT" ""
 F=$(settle_free)
 log "reserve R=$RES GiB, settled free (2-bank config) F=$F GiB"
 FLOOR=$(python3 -c "import math; print(max(1, math.ceil($F - $RES) + 1))")
 log "leg 2/3 floor: --mem-floor-gb $FLOOR (usable beyond floor+reserve < 0)"
 
 log "== leg 2: verdict engagement (reserve ON, floor $FLOOR) =="
-boot "DS4_SERVER_COALESCE_MAX=2" "--mem-floor-gb $FLOOR"
+boot "DS4_SERVER_COALESCE_MAX=2 DS4_SERIAL_RESERVE_CTX=$ENT" "--mem-floor-gb $FLOOR"
 REJ0=$(srv_count "rejected on memory floor")
 cont_body > "$OUT/cont.json"
 curl -s -N -m 240 "http://127.0.0.1:$TUNNEL/v1/chat/completions" \
@@ -162,12 +177,13 @@ REJ1=$(srv_count "rejected on memory floor")
 grep -q "data:" "$OUT/leg3_cont.out" || fail "leg 3: cont request produced no stream output"
 log "leg 3: same admission ACCEPTED with the reserve off (term is decisive)"
 
-log "== leg 4: the ctx/2 PROMISE (design step-2 gate: commons pinned tiny, deep serial serves) =="
-# The guard/reservation agreement: the deep-serial guard admits up to
-# ctx/2, so a just-under-ctx/2 serial request must SERVE even with the
-# commons budget pinned to a token amount (the outage shape dissolves).
-boot "DS4_BATCH_VMM_BUDGET_MB=256" ""
-DEEP_TOK=$(( CTX / 2 - 4000 ))   # just under the promise, margin for template
+log "== leg 4: the FUNDED PROMISE (commons pinned tiny, serial serves at the guard depth) =="
+# Guard/reservation agreement: the serial fallback guard admits up to
+# DS4_SERVER_SERIAL_MAX_TOKENS (65536 default), so a just-under-that
+# request must SERVE with the reservation opted in and the commons
+# budget pinned tiny (the outage shape dissolves for that deployment).
+boot "DS4_BATCH_VMM_BUDGET_MB=256 DS4_SERIAL_RESERVE_CTX=$ENT" ""
+DEEP_TOK=$(( ENT - 4000 ))   # just under the guard depth, margin for template
 python3 - "$DEEP_TOK" > "$OUT/leg4_serial.json" <<'PY'
 import json, sys
 n = int(sys.argv[1])
@@ -180,8 +196,8 @@ HTTP=$(curl -s -o "$OUT/leg4_serial.out" -w '%{http_code}' -m 1800 \
   "http://127.0.0.1:$TUNNEL/v1/messages" \
   -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' \
   -d @"$OUT/leg4_serial.json")
-[ "$HTTP" = "200" ] || fail "leg 4: ~ctx/2 serial request got $HTTP (the promise is unfunded): $(head -c 200 "$OUT/leg4_serial.out")"
-log "leg 4: ~ctx/2 serial request SERVED with the commons pinned (promise funded)"
+[ "$HTTP" = "200" ] || fail "leg 4: ~${ENT}-tok serial request got $HTTP (the promise is unfunded): $(head -c 200 "$OUT/leg4_serial.out")"
+log "leg 4: ~${ENT}-tok serial request SERVED with the commons pinned (promise funded)"
 
 kill_all
-log "SERIAL-RESERVE-GATE PASS (R=$RES GiB, F=$F, floor=$FLOOR; verdict binary-controlled; serial served under pressure incl. the ctx/2 promise)"
+log "SERIAL-RESERVE-GATE PASS (R=$RES GiB, F=$F, floor=$FLOOR; verdict binary-controlled; serial served under pressure incl. the funded guard-depth promise)"
