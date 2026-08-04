@@ -375,6 +375,12 @@ make cpu              # CPU-only diagnostics build
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
 
+Building in a container? Use [docker/Dockerfile](docker/Dockerfile) as the
+reference: it builds with `make cuda-spark` (on a GB10 a generic
+`make cuda CUDA_ARCH=...` build serves at a fraction of the speed) and its
+header documents the run flags — in particular, never give the container a
+memory limit, because the mmap'd weights live in the host page cache.
+
 ## Speed
 
 These are single-run CLI numbers with `--ctx 32768`, `--nothink`, greedy

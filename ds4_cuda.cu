@@ -2707,6 +2707,33 @@ extern "C" unsigned long long ds4_cuda_fp8_kv_read_path_blocks(void);
 extern "C" unsigned long long ds4_cuda_fp8_kv_indexed_read_path_blocks(void);
 extern "C" unsigned long long ds4_cuda_fp4_index_read_path_blocks(void);  /* P2 Inc3 */
 
+/* Field report (NVIDIA forum 378855 post 48): a GB10 binary made with a
+ * generic `make cuda CUDA_ARCH=...` boots and serves, but at a fraction of
+ * the cuda-spark speed (370 vs ~1000 tok/s prefill, 15 vs 30+ decode) --
+ * weights stream over the UVA map instead of the Spark HBM cache, and the
+ * sm_121-native kernels (Blackwell MMA, mxf4 indexer) are compiled out or
+ * JIT'd from generic PTX.  The build configuration is invisible at runtime,
+ * so the mis-built server looks healthy while serving at a third of the
+ * speed.  Returns 1 iff the active CUDA device is GB10-class (sm_121) while
+ * this ds4_cuda.o was compiled without the full cuda-spark configuration
+ * (CUDA_ARCH=sm_121 supplies DS4_CUDA_HAVE_MXF4, the cuda-spark target adds
+ * DS4_CUDA_SPARK_HBM_CACHE); the server turns that into a boot advisory. */
+extern "C" int ds4_cuda_spark_build_mismatch(void) {
+    int spark_build = 0;
+#if defined(DS4_CUDA_HAVE_MXF4) && defined(DS4_CUDA_SPARK_HBM_CACHE)
+    spark_build = 1;
+#endif
+    if (spark_build) return 0;
+    int dev = 0;
+    cudaDeviceProp prop;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return (prop.major == 12 && prop.minor == 1) ? 1 : 0;
+}
+
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
