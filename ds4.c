@@ -15779,7 +15779,33 @@ static bool metal_graph_q_stage_profile_boundary(
 static bool ms_emit_keep_restore(ds4_gpu_graph *g, uint32_t il, uint32_t seq,
                                  uint32_t ratio, uint32_t row0,
                                  uint32_t rows_emitted, bool indexer) {
-    if (ratio != 4u || rows_emitted == 0u || row0 >= g->ms_emit_keep[seq]) return true;
+    if (ratio != 4u || rows_emitted == 0u) return true;
+    const uint32_t keep = g->ms_emit_keep[seq];
+    if (row0 >= keep) {
+        /* v0.5.5 (task #14): the suppression is SPENT once the counters pass
+         * the threshold -- ratio-4 layers advance in lockstep, so the first
+         * layer to arrive here proves the boundary row was already restored.
+         * Clearing re-opens cont-graph capture for this bank: a nonzero
+         * ms_emit_keep excludes every step containing the bank from the
+         * capture eligibility scan, and it previously stayed set for the
+         * bank's remaining lifetime (eager-decode tax that accumulated with
+         * partial-fork history). */
+        if (keep != 0u) g->ms_emit_keep[seq] = 0u;
+        return true;
+    }
+    if (!indexer) {
+        /* One greppable line per firing chunk (first ratio-4 layer only):
+         * the emit_keep_gate asserts this fires on a legit partial-fork
+         * replay and does NOT fire on a full fork into a reused bank. */
+        static int log_il = -1;
+        if (log_il < 0) {
+            for (uint32_t i = 0; i < DS4_N_LAYER; i++)
+                if (ds4_layer_compress_ratio(i) == 4u) { log_il = (int)i; break; }
+        }
+        if ((int)il == log_il)
+            fprintf(stderr, "ds4: partial-fork boundary restore bank=%u row=%u keep=%u\n",
+                    seq, row0, keep);
+    }
     const uint64_t hd = indexer ? DS4_N_INDEXER_HEAD_DIM : DS4_N_HEAD_DIM;
     ds4_gpu_tensor *stash = indexer ? g->emit_stash_index : g->emit_stash_comp;
     ds4_gpu_tensor *cache = indexer ? g->layer_index_comp_cache[il] : g->layer_attn_comp_cache[il];
@@ -33902,6 +33928,44 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
            ctx->bank_hist + (size_t)src * ctx->seq_cap, (size_t)P * sizeof(int));
     ctx->bank_hist_len[dst]   = (uint32_t)P;
     ctx->bank_hist_valid[dst] = 1u;
+    /* v0.5.5 (task #14): the boundary-row suppression travels with the
+     * CONTENT, never with the bank.  dst's prior life may have left a stale
+     * ms_emit_keep (set by the partial-fork rewind, cleared only by cold
+     * admit / disk restore / trim), and a stale threshold makes
+     * ms_emit_keep_restore overwrite this fork's freshly-replayed rows with
+     * the PRIOR tenant's stash.  Inherit src's state exactly: an ACTIVE
+     * suppression on src (fork taken between a partial admit and its first
+     * emits) moves here with its stash rows; otherwise the fork starts
+     * clean. */
+    g->ms_emit_keep[dst] = g->ms_emit_keep[src];
+    if (g->ms_emit_keep[src] != 0u) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (ds4_layer_compress_ratio(il) != 4u) continue;
+            if (g->emit_stash_comp &&
+                ds4_gpu_tensor_copy(g->emit_stash_comp,
+                        ((uint64_t)dst * DS4_N_LAYER + il) * DS4_N_HEAD_DIM * sizeof(float),
+                        g->emit_stash_comp,
+                        ((uint64_t)src * DS4_N_LAYER + il) * DS4_N_HEAD_DIM * sizeof(float),
+                        (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) == 0) return false;
+            if (g->emit_stash_index &&
+                ds4_gpu_tensor_copy(g->emit_stash_index,
+                        ((uint64_t)dst * DS4_N_LAYER + il) * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        g->emit_stash_index,
+                        ((uint64_t)src * DS4_N_LAYER + il) * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float)) == 0) return false;
+            if (g->emit_stash_index_fp4 &&
+                (ds4_gpu_tensor_copy(g->emit_stash_index_fp4,
+                        ((uint64_t)dst * DS4_N_LAYER + il) * DS4_INDEXER_FP4_ROW_BYTES,
+                        g->emit_stash_index_fp4,
+                        ((uint64_t)src * DS4_N_LAYER + il) * DS4_INDEXER_FP4_ROW_BYTES,
+                        (uint64_t)DS4_INDEXER_FP4_ROW_BYTES) == 0 ||
+                 ds4_gpu_tensor_copy(g->emit_stash_index_scale,
+                        ((uint64_t)dst * DS4_N_LAYER + il) * DS4_INDEXER_FP4_SCALE_BYTES,
+                        g->emit_stash_index_scale,
+                        ((uint64_t)src * DS4_N_LAYER + il) * DS4_INDEXER_FP4_SCALE_BYTES,
+                        (uint64_t)DS4_INDEXER_FP4_SCALE_BYTES) == 0)) return false;
+        }
+    }
     return true;
 }
 
