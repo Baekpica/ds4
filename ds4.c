@@ -26249,10 +26249,22 @@ static bool ds4_batch_vmm_comp_enabled(void) {
     if (ds4_slab_poison_level("DS4_BATCH_SLAB_POISON") >= 1) return false;
     return ds4_gpu_vmm_demand_page() != 0;
 }
+/* Governance Inc0 (review P0): a failed VMM reserve used to fall through to
+ * a FULL eager allocation silently, with sl->vmm still true -- gigabytes of
+ * surprise boot-time spend plus budget arithmetic that believes the slab is
+ * demand-mapped.  The fallback stays (a reserve failure at boot should not
+ * kill the server) but it is LOUD and counted; the boot budget line reports
+ * the count so a misbehaving boot is diagnosable from one log line. */
+static uint32_t g_slab_vmm_fallbacks = 0;
 static ds4_gpu_tensor *ds4_batch_cache_slab_alloc(uint64_t bytes, bool vmm) {
     if (vmm) {
         ds4_gpu_tensor *t = ds4_gpu_tensor_reserve(bytes);
         if (t) return t;
+        g_slab_vmm_fallbacks++;
+        fprintf(stderr,
+                "ds4: batch vmm: reserve FAILED for a %.1f MiB slab -- falling back to EAGER "
+                "allocation (boot spends these bytes now; budget treats them as resident)\n",
+                (double)bytes / 1048576.0);
     }
     return ds4_gpu_tensor_alloc(bytes);
 }
@@ -33442,12 +33454,12 @@ static uint64_t ds4_batch_bank_map_projection(const ds4_batch_ctx *ctx, uint32_t
             const uint64_t span = ((off + len - 1u) / page - off / page + 1u) * page;
             const uint64_t res = ds4_gpu_tensor_resident(sl->multi_index_fp4[il], off, len);
             need += span > res ? span - res : 0;
-            const uint64_t s4b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
-            const uint64_t soff = (uint64_t)b * s4b;
-            const uint64_t slen = rows * DS4_INDEXER_FP4_SCALE_BYTES;
-            const uint64_t sspan = ((soff + slen - 1u) / page - soff / page + 1u) * page;
-            const uint64_t sres = ds4_gpu_tensor_resident(sl->multi_index_scale[il], soff, slen);
-            need += sspan > sres ? sspan - sres : 0;
+            /* Governance Inc0 (review P1): the fp4 SCALE slab is always
+             * EAGER (ds4_batch_slabs_alloc allocates it with tensor_alloc,
+             * never reserve) -- resident() returns its exact byte length
+             * while the old span math page-rounded it, charging phantom
+             * sub-page padding for a slab that needs zero mapping.  Eager
+             * slabs are fully paid at boot: project nothing. */
         }
     }
     return need;
@@ -33713,9 +33725,19 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         if (ds4_gpu_mem_info(&vfree, &vtotal) == 0) {
             const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
             const uint64_t res = ds4_batch_slabs_cache_resident(&ctx->sl);
-            /* The fit already charged every bank its first-touch floor, so the
-             * budget grants those floors back on top of what is free beyond
-             * the headroom -- fit and page budget split the same memory. */
+            /* Governance Inc0 adjudication (2026-08-04): the grant-back
+             * below double-counts the unspent floor bytes when vfree samples
+             * HIGH (they already sit inside free-beyond-headroom; review
+             * P0), but vfree here is a mid-boot transient -- on a post-load
+             * box it can sample ~1 GiB over headroom, and WITHOUT the grant
+             * the budget lands below the fit's own floor plan: every growth
+             * admission then trims warm records to obey a noise-derived
+             * number (bank_mutation_gate c3 regression, ledger 08-04
+             * 19:02, budget 1.24 GiB vs ~1.4 GiB working set).  The grant
+             * stays until the budget is re-derived from the fit plan
+             * rather than a vfree snapshot (#15 later increment); high-
+             * sample overspend is bounded by max_seq*floor_pb and
+             * backstopped by the live mem floor (governance inc1). */
             ctx->comp_map_budget = res + (vfree > headroom ? vfree - headroom : 0) +
                                    (uint64_t)ctx->max_seq * floor_pb;
         }
@@ -33727,11 +33749,12 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
           if (be && be[0]) { const long bv = atol(be);
             if (bv > 0) { ctx->comp_map_budget = (uint64_t)bv << 20; ctx->comp_map_budget_pinned = 1u; } } }
         fprintf(stderr,
-                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB, mem floor=%.1f GiB)\n",
+                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB, mem floor=%.1f GiB%s)\n",
                 (unsigned long long)(ds4_gpu_vmm_demand_page() >> 10),
                 (double)cache_per_bank / 1048576.0, (double)floor_pb / 1048576.0,
                 ctx->max_seq, (double)ctx->comp_map_budget / 1073741824.0,
-                (double)ds4_mem_floor_bytes() / 1073741824.0);
+                (double)ds4_mem_floor_bytes() / 1073741824.0,
+                g_slab_vmm_fallbacks ? " -- WITH EAGER FALLBACKS, see above" : "");
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
      * R2: sized by seq_cap (the committed-token bound), not the raw ring. */
@@ -35514,7 +35537,27 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 uint64_t flen = (uint64_t)L + mn;
                 if (flen > seq_cap) flen = seq_cap;
                 const uint64_t mneed = ds4_batch_bank_map_projection(ctx, b, flen);
-                uint64_t mres = ds4_batch_slabs_cache_resident(&ctx->sl);
+                /* Governance Inc0 + field 376884/129 (OllieOllie): an
+                 * admission's growth materializes chunk-by-chunk AFTER this
+                 * check, so resident pages alone under-count every other
+                 * in-flight admission's committed target -- N banks each
+                 * individually under budget jointly overrun it and the
+                 * compressor store writes past the mapped extent (field
+                 * crash, same-pass AND cross-pass variants).  Charge each
+                 * other occupied bank's still-outstanding admission-time
+                 * projection: pfbase+pflen is fixed at admit and only
+                 * cleared once that bank's prefill fully lands, and the
+                 * projection already subtracts whatever that bank has
+                 * mapped so far, so this converges to zero as it lands. */
+                uint64_t outstanding = 0;
+                for (uint32_t oi = 0; oi < MS; oi++) {
+                    if (oi == b || pflen[oi] == 0u) continue;
+                    uint64_t ti = (uint64_t)pfbase[oi] + pflen[oi];
+                    if (ti > seq_cap) ti = seq_cap;
+                    outstanding += ds4_batch_bank_map_projection(ctx, oi, ti);
+                }
+                const uint64_t mres_raw = ds4_batch_slabs_cache_resident(&ctx->sl);
+                uint64_t mres = mres_raw + outstanding;
                 /* The boot-time budget is a snapshot and goes stale in both
                  * directions (page cache settles and frees GiBs; WS
                  * MemAvailable creep eats them).  Before rejecting on it,
@@ -35529,7 +35572,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     uint64_t lfree = 0, ltotal = 0;
                     if (ds4_gpu_mem_info(&lfree, &ltotal) == 0) {
                         const uint64_t headroom = ds4_batch_fit_headroom_bytes((int)ctx->ctx_size);
-                        const uint64_t live = mres + (lfree > headroom ? lfree - headroom : 0);
+                        /* Inc0: derive from RAW resident -- the outstanding
+                         * projections charged into mres are unspent bytes
+                         * that lfree still contains; using the charged value
+                         * here would grant them back (the boot double-grant
+                         * in miniature). */
+                        const uint64_t live = mres_raw + (lfree > headroom ? lfree - headroom : 0);
                         if (live > ctx->comp_map_budget) {
                             fprintf(stderr,
                                     "ds4: comp-cache budget refreshed %.1f -> %.1f MiB (live free %.2f GiB)\n",
@@ -35553,15 +35601,20 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     if (ds4_batch_trim_free_banks(ctx, g, live, pflen, b,
                                                   (fork || partial) ? (int)fsrc : -1,
                                                   want) > 0)
-                        mres = ds4_batch_slabs_cache_resident(&ctx->sl);
+                        /* Inc0: trim only touches FREE banks, so the other
+                         * banks' outstanding projections are unchanged --
+                         * re-add them to the fresh resident answer. */
+                        mres = ds4_batch_slabs_cache_resident(&ctx->sl) + outstanding;
                 }
                 if (ctx->comp_map_budget != 0 && mneed != 0 &&
                     mres + mneed > ctx->comp_map_budget) {
                     ctx->mem_rejects++;
                     ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
                     fprintf(stderr,
-                            "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + need %.1f MiB > budget %.1f MiB)\n",
-                            b, (double)mres / 1048576.0, (double)mneed / 1048576.0,
+                            "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + outstanding %.1f MiB + need %.1f MiB > budget %.1f MiB)\n",
+                            b, (double)mres_raw / 1048576.0,
+                            (double)outstanding / 1048576.0,
+                            (double)mneed / 1048576.0,
                             (double)ctx->comp_map_budget / 1048576.0);
                     on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
                     continue;
@@ -35573,19 +35626,25 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * back (unmap is exact and immediate), so it runs before
                  * the verdict; in-flight banks stay inviolable. */
                 if (mneed != 0) {
+                    /* Inc0: other banks' outstanding projections will spend
+                     * from this same live free pool as their chunks land, so
+                     * the floor verdict must charge them too -- the floor
+                     * variant of the same double-booking. */
+                    const uint64_t fneed = mneed + outstanding;
                     uint64_t usable = ds4_mem_usable();
-                    if (mneed > usable) {
+                    if (fneed > usable) {
                         if (ds4_batch_trim_free_banks(ctx, g, live, pflen, b,
                                                       (fork || partial) ? (int)fsrc : -1,
-                                                      mneed - usable) > 0)
+                                                      fneed - usable) > 0)
                             usable = ds4_mem_usable();
                     }
-                    if (mneed > usable) {
+                    if (fneed > usable) {
                         ctx->mem_rejects++;
                         ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
                         fprintf(stderr,
-                                "ds4: cont admit rejected on memory floor (bank %u: need %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor -- the box lost memory since boot; --mem-floor-gb governs)\n",
+                                "ds4: cont admit rejected on memory floor (bank %u: need %.1f MiB + outstanding %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor -- the box lost memory since boot; --mem-floor-gb governs)\n",
                                 b, (double)mneed / 1048576.0,
+                                (double)outstanding / 1048576.0,
                                 (double)usable / 1048576.0,
                                 (double)ds4_mem_floor_bytes() / 1073741824.0);
                         on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
