@@ -14702,6 +14702,25 @@ int main(int argc, char **argv) {
     cfg.engine.defer_boot_prewarm = true;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    /* Field (forum 378855 post 48): a GB10 served by a `make cuda
+     * CUDA_ARCH=...` binary runs at ~1/3 prefill and ~1/2 decode speed --
+     * no Spark HBM weight cache, no sm_121-native kernels -- and nothing
+     * in the boot log says why.  Same transparency philosophy as the
+     * spec-armed line below: say it loudly at boot. */
+    if (cfg.engine.backend == DS4_BACKEND_CUDA) {
+        int ds4_cuda_spark_build_mismatch(void);
+        if (ds4_cuda_spark_build_mismatch()) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: this CUDA device is a GB10 (DGX Spark class, sm_121) but the "
+                       "binary was built without the DGX Spark configuration -- some or all of "
+                       "the Spark fast paths (HBM weight cache, sm_121a-native kernels) are "
+                       "compiled out. In the field this serves at roughly a THIRD of the prefill "
+                       "speed and HALF the decode speed. Rebuild with `make cuda-spark`.");
+        }
+    }
+#endif
+
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {

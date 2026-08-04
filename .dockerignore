@@ -1,0 +1,15 @@
+# Keep the docker build context small: a ds4 checkout usually has 100+ GiB
+# of GGUF weights sitting next to the sources (./ds4flash.gguf, ./gguf/).
+# Models are bind-mounted at run time (see docker/Dockerfile), never copied
+# into the image.
+**/*.gguf
+gguf/
+.git/
+local/
+**/*.o
+ds4
+ds4-server
+ds4-bench
+ds4-eval
+ds4-agent
+ds4_weight_server
