@@ -32783,6 +32783,13 @@ struct ds4_batch_ctx {
      * the budget is an ops/gate constant, never refreshed from live memory. */
     uint64_t        comp_map_budget;
     uint8_t         comp_map_budget_pinned;
+    /* Governance inc2 (#8, field 378855/49): bytes carved out of every
+     * bank-growth verdict so the serial lane always has room for a
+     * right-sized session graph (entitlement ctx, default 32768 tokens,
+     * DS4_SERIAL_RESERVE_CTX overrides; 0 = off).  Without it the banks
+     * grow until live free < the smallest serial graph + fit headroom and
+     * every serial request 503s ("serial lane unusable at deep -c"). */
+    uint64_t        serial_reserve;
     uint64_t        mem_rejects;
     /* v0.5.1 Inc2 (field #31): banks whose demand-mapped cache pages were
      * released under budget pressure at admission, and the bytes returned.
@@ -33379,6 +33386,14 @@ static uint64_t ds4_mem_usable(void) {
     return lfree > fl ? lfree - fl : 0;
 }
 
+/* Governance inc2 (#8): the usable answer minus a caller-held reservation
+ * (the serial-lane carve-out).  Preserves the fail-open UINT64_MAX. */
+static uint64_t ds4_mem_usable_beyond(uint64_t reserve) {
+    const uint64_t u = ds4_mem_usable();
+    if (u == UINT64_MAX) return u;
+    return u > reserve ? u - reserve : 0;
+}
+
 /* R5 Inc1b: resident bytes across the comp/index cache slabs (page multiples
  * for demand-mapped reservations; eager slabs report their full size, but
  * callers only budget when sl->vmm).  Host-side page-flag scan, no driver
@@ -33717,43 +33732,69 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
      * but rejecting at ADMIT beats burning a long prefill that is doomed.
      * 0 = no gating (eager slabs, or no memory answer from the backend). */
     ctx->comp_map_budget = 0;
+    /* Governance inc2 (#8, field 378855/49 emX0r): size the serial-lane
+     * reservation.  The serial session graph is allocated lazily at request
+     * time from the SAME free pool the bank caches grow into; without a
+     * carve-out, growth verdicts let the banks eat down to the operator
+     * floor and the smallest right-sized serial graph no longer fits
+     * (need + 1 GiB fit headroom > free) -- the field "serial right-size:
+     * no graph fits ... refusing 503" class at deep -c.
+     * GUARD/RESERVATION AGREEMENT (memory-governance design 2026-08-03):
+     * the deep-serial guard PROMISES serving up to ctx/2, so the default
+     * entitlement is ctx/2 -- the reservation funds exactly the promise
+     * and the "temporarily at capacity (deep prompts not served)" outage
+     * shape dissolves.  DS4_SERIAL_RESERVE_CTX resizes the entitlement
+     * (policy, e.g. down when serial traffic is known-shallow; 0 = off).
+     * Every growth verdict below treats the reserve as already spent. */
+    ctx->serial_reserve = 0;
+    {
+        long ent = ctx_size / 2;   /* the deep-serial guard's own promise */
+        const char *se = getenv("DS4_SERIAL_RESERVE_CTX");
+        if (se && se[0]) { const long v = atol(se); if (v >= 0) ent = v; }
+        if (ent > ctx_size) ent = ctx_size;
+        if (ent > 0) {
+            const uint32_t spc = metal_graph_prefill_cap_for_prompt((int)ent);
+            const uint32_t src = metal_graph_raw_cap_for_context((int)ent, spc);
+            ctx->serial_reserve =
+                metal_graph_alloc_bytes_estimate(&e->weights, &e->weights.layer[0],
+                                                 src, (uint32_t)ent, spc,
+                                                 e->mtp_ready, e->dspark_ready) +
+                (1024ull << 20);
+        }
+    }
     if (ctx->sl.vmm) {
-        uint64_t vfree = 0, vtotal = 0;
         const uint64_t floor_pb = ds4_batch_vmm_floor_per_bank(&ctx->g);
         const uint64_t cache_per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, false, false) -
                                         ds4_batch_slabs_bank_bytes(&ctx->g, false, true) + floor_pb;
-        if (ds4_gpu_mem_info(&vfree, &vtotal) == 0) {
-            const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
-            const uint64_t res = ds4_batch_slabs_cache_resident(&ctx->sl);
-            /* Governance Inc0 adjudication (2026-08-04): the grant-back
-             * below double-counts the unspent floor bytes when vfree samples
-             * HIGH (they already sit inside free-beyond-headroom; review
-             * P0), but vfree here is a mid-boot transient -- on a post-load
-             * box it can sample ~1 GiB over headroom, and WITHOUT the grant
-             * the budget lands below the fit's own floor plan: every growth
-             * admission then trims warm records to obey a noise-derived
-             * number (bank_mutation_gate c3 regression, ledger 08-04
-             * 19:02, budget 1.24 GiB vs ~1.4 GiB working set).  The grant
-             * stays until the budget is re-derived from the fit plan
-             * rather than a vfree snapshot (#15 later increment); high-
-             * sample overspend is bounded by max_seq*floor_pb and
-             * backstopped by the live mem floor (governance inc1). */
-            ctx->comp_map_budget = res + (vfree > headroom ? vfree - headroom : 0) +
-                                   (uint64_t)ctx->max_seq * floor_pb;
-        }
-        /* Explicit override (MB): pins the page budget regardless of the
-         * free-memory answer -- ops guardrail + the only way a gate can force
-         * the admission reject path deterministically (pinned also disables
-         * the admit-time live refresh below). */
+        /* #15 governance (2026-08-04, resolves the Inc0 adjudication): the
+         * budget is the FIT PLAN's own allowance -- max_seq banks at their
+         * full per-bank cache extent -- never a boot-time vfree snapshot.
+         * The snapshot formula sampled a mid-boot transient (bank_mutation
+         * c3: budget 1.24 GiB vs a 1.4 GiB working set -> pressure trims
+         * ate every warm record) and needed both a floor grant-back
+         * (double-counting at high samples) and a grow-only live refresh
+         * to paper over its noise; all three delete with it.  Resident
+         * cache pages can never exceed the plan allowance, so this class
+         * gate is exact by construction; the LIVE spend question -- has
+         * the box lost memory since boot -- is the mem-floor verdict's job
+         * (inc1 + the inc2 serial reserve + Inc0 outstanding projections),
+         * which runs in the same admission block.  DS4_BATCH_VMM_BUDGET_MB
+         * survives as the explicit ops/gate override (pinned budgets are
+         * how gates force deterministic rejects). */
+        ctx->comp_map_budget = (uint64_t)ctx->max_seq * cache_per_bank;
+        /* Explicit override (MB): pins the page budget below the plan
+         * allowance -- ops guardrail + the only way a gate can force the
+         * admission reject path deterministically. */
         { const char *be = getenv("DS4_BATCH_VMM_BUDGET_MB");
           if (be && be[0]) { const long bv = atol(be);
             if (bv > 0) { ctx->comp_map_budget = (uint64_t)bv << 20; ctx->comp_map_budget_pinned = 1u; } } }
         fprintf(stderr,
-                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB, mem floor=%.1f GiB%s)\n",
+                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB, mem floor=%.1f GiB, serial reserve=%.2f GiB%s)\n",
                 (unsigned long long)(ds4_gpu_vmm_demand_page() >> 10),
                 (double)cache_per_bank / 1048576.0, (double)floor_pb / 1048576.0,
                 ctx->max_seq, (double)ctx->comp_map_budget / 1073741824.0,
                 (double)ds4_mem_floor_bytes() / 1073741824.0,
+                (double)ctx->serial_reserve / 1073741824.0,
                 g_slab_vmm_fallbacks ? " -- WITH EAGER FALLBACKS, see above" : "");
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
@@ -35558,36 +35599,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
                 const uint64_t mres_raw = ds4_batch_slabs_cache_resident(&ctx->sl);
                 uint64_t mres = mres_raw + outstanding;
-                /* The boot-time budget is a snapshot and goes stale in both
-                 * directions (page cache settles and frees GiBs; WS
-                 * MemAvailable creep eats them).  Before rejecting on it,
-                 * re-derive from live free memory: the pages the caches may
-                 * hold = the pages they already hold + what is free beyond
-                 * the runtime headroom.  Grow-only -- shrink keeps the boot
-                 * answer, and genuine exhaustion is handled where it always
-                 * was (ensure() fails the stream gracefully). */
-                if (ctx->comp_map_budget != 0 && mneed != 0 &&
-                    mres + mneed > ctx->comp_map_budget &&
-                    !ctx->comp_map_budget_pinned) {
-                    uint64_t lfree = 0, ltotal = 0;
-                    if (ds4_gpu_mem_info(&lfree, &ltotal) == 0) {
-                        const uint64_t headroom = ds4_batch_fit_headroom_bytes((int)ctx->ctx_size);
-                        /* Inc0: derive from RAW resident -- the outstanding
-                         * projections charged into mres are unspent bytes
-                         * that lfree still contains; using the charged value
-                         * here would grant them back (the boot double-grant
-                         * in miniature). */
-                        const uint64_t live = mres_raw + (lfree > headroom ? lfree - headroom : 0);
-                        if (live > ctx->comp_map_budget) {
-                            fprintf(stderr,
-                                    "ds4: comp-cache budget refreshed %.1f -> %.1f MiB (live free %.2f GiB)\n",
-                                    (double)ctx->comp_map_budget / 1048576.0,
-                                    (double)live / 1048576.0,
-                                    (double)lfree / 1073741824.0);
-                            ctx->comp_map_budget = live;
-                        }
-                    }
-                }
+                /* #15 governance (2026-08-04): the live-refresh block that
+                 * lived here deleted with the vfree-snapshot budget it
+                 * existed to repair -- the plan-derived budget (max_seq x
+                 * full cache extent) cannot be stale.  Live-memory truth
+                 * is the mem-floor verdict below. */
                 /* v0.5.1 Inc2 (field #31): before rejecting, shed FREE banks'
                  * pages.  Per-bank mapping is grow-only, so churning agentic
                  * serving walks every bank to its high-water extent and the
@@ -35631,22 +35647,26 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                      * the floor verdict must charge them too -- the floor
                      * variant of the same double-booking. */
                     const uint64_t fneed = mneed + outstanding;
-                    uint64_t usable = ds4_mem_usable();
+                    /* inc2: the serial reserve is spoken for -- growth may
+                     * not spend it (the serial lane's lazy graph draws from
+                     * this same pool at request time). */
+                    uint64_t usable = ds4_mem_usable_beyond(ctx->serial_reserve);
                     if (fneed > usable) {
                         if (ds4_batch_trim_free_banks(ctx, g, live, pflen, b,
                                                       (fork || partial) ? (int)fsrc : -1,
                                                       fneed - usable) > 0)
-                            usable = ds4_mem_usable();
+                            usable = ds4_mem_usable_beyond(ctx->serial_reserve);
                     }
                     if (fneed > usable) {
                         ctx->mem_rejects++;
                         ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
                         fprintf(stderr,
-                                "ds4: cont admit rejected on memory floor (bank %u: need %.1f MiB + outstanding %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor -- the box lost memory since boot; --mem-floor-gb governs)\n",
+                                "ds4: cont admit rejected on memory floor (bank %u: need %.1f MiB + outstanding %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor + %.2f GiB serial reserve -- the box lost memory since boot; --mem-floor-gb and DS4_SERIAL_RESERVE_CTX govern)\n",
                                 b, (double)mneed / 1048576.0,
                                 (double)outstanding / 1048576.0,
                                 (double)usable / 1048576.0,
-                                (double)ds4_mem_floor_bytes() / 1073741824.0);
+                                (double)ds4_mem_floor_bytes() / 1073741824.0,
+                                (double)ctx->serial_reserve / 1073741824.0);
                         on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
                         continue;
                     }
