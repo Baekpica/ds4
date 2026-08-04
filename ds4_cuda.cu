@@ -3324,7 +3324,36 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
+/* #9 diagnosis (2026-08-04): captured-topk live-bound violation counter.
+ * Written by indexer_topk_stream512_kernel's guard when the live scan
+ * bound read from the per-layer substrate is zero or exceeds the baked
+ * row stride (either would have been the illegal-access / %0 fault this
+ * instruments).  Polled after every command batch below. */
+__device__ unsigned int g_topk_bound_viol_count  = 0u;
+__device__ unsigned int g_topk_bound_viol_n      = 0u;
+__device__ unsigned int g_topk_bound_viol_stride = 0u;
+
+extern "C" int ds4_gpu_end_commands(void) {
+    int ok = cuda_ok(cudaDeviceSynchronize(), "end commands");
+    static unsigned int seen = 0u;
+    unsigned int cnt = 0u;
+    cudaError_t perr = cudaMemcpyFromSymbol(&cnt, g_topk_bound_viol_count, sizeof cnt);
+    if (perr == cudaSuccess && cnt != seen) {
+        unsigned int vn = 0u, vs = 0u;
+        (void)cudaMemcpyFromSymbol(&vn, g_topk_bound_viol_n, sizeof vn);
+        (void)cudaMemcpyFromSymbol(&vs, g_topk_bound_viol_stride, sizeof vs);
+        fprintf(stderr, "ds4: TOPK-BOUND-VIOL count=%u live_n=%u baked_stride=%u\n",
+                cnt, vn, vs);
+        seen = cnt;
+    } else if (perr != cudaSuccess && !ok) {
+        /* Poisoned context: the counter is unreadable, so a crash-step
+         * violation cannot be ruled in or out from the log -- say so
+         * instead of silently printing nothing (run-2 ambiguity, 08-04). */
+        fprintf(stderr, "ds4: TOPK-BOUND-VIOL poll unreadable (context poisoned)\n");
+        (void)cudaGetLastError();
+    }
+    return ok;
+}
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 /* Task #22 diag: legacy-stream-only sync.  Unlike ds4_gpu_synchronize it does
  * NOT drain non-blocking streams, so it discriminates "all actors are
@@ -15327,7 +15356,22 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
     const float *row = scores + (uint64_t)t * n_comp;   /* stride = caller extent (band under capture) */
-    const uint32_t n = ls ? ls->n_index_comp : n_comp;  /* live scan bound */
+    uint32_t n = ls ? ls->n_index_comp : n_comp;        /* live scan bound */
+    /* #9 diagnosis (2026-08-04): the live bound must stay within (0,
+     * n_comp] -- the scorer wrote rows at n_comp stride with [visible,
+     * band) = -INF, and the rotation below takes % n.  A replay that
+     * observes live > band (band-crossing race) or live == 0 (bank
+     * reset mid-flight) is the suspected illegal-access class: record
+     * it loudly and clamp instead of faulting. */
+    if (ls != NULL && (n == 0u || n > n_comp)) {
+        if (tid == 0u) {
+            atomicAdd(&g_topk_bound_viol_count, 1u);
+            g_topk_bound_viol_n = n;
+            g_topk_bound_viol_stride = n_comp;
+        }
+        if (n == 0u) return;
+        n = n_comp;
+    }
     if (tid == 0) { s_cnt = 0; s_thr = 0; }
     __syncthreads();
 
