@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 // ----------------------------------------------------------------------------
 // Device info singleton.
@@ -119,21 +120,51 @@ extern "C" cudaStream_t ds4_pool_get_stream(void) {
 
 struct ds4_naive_pool : public ggml_cuda_pool {
     int device;
+    /* Free must be stream-ordered AFTER the kernels that consume the
+     * allocation.  Those kernels run on the stream that was current at
+     * alloc time; the RAII destructor can run after ds4_pool_set_stream()
+     * retargeted the thread-local, and a free on the NEW stream is
+     * unordered against the consumers on the old one (use-after-free
+     * window once the new stream drains first).  Snapshot the stream per
+     * live pointer at alloc and free on the snapshot. */
+    std::mutex mu;
+    std::unordered_map<void *, cudaStream_t> alloc_stream;
 
     explicit ds4_naive_pool(int device) : device(device) {}
 
     void * alloc(size_t size, size_t * actual_size) override {
         ggml_cuda_set_device(device);
         void * ptr = nullptr;
-        CUDA_CHECK(cudaMallocAsync(&ptr, size, t_ds4_pool_stream));
+        cudaStream_t s = t_ds4_pool_stream;
+        CUDA_CHECK(cudaMallocAsync(&ptr, size, s));
         if (actual_size) *actual_size = size;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            alloc_stream[ptr] = s;
+        }
         return ptr;
     }
 
     void free(void * ptr, size_t /*size*/) override {
         if (!ptr) return;
         ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaFreeAsync(ptr, t_ds4_pool_stream));
+        cudaStream_t s = t_ds4_pool_stream;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            auto it = alloc_stream.find(ptr);
+            if (it != alloc_stream.end()) {
+                s = it->second;
+                alloc_stream.erase(it);
+            }
+        }
+        if (s != t_ds4_pool_stream) {
+            static std::once_flag once;
+            std::call_once(once, [] {
+                fprintf(stderr, "ds4: pool free re-routed to alloc-time stream "
+                                "(thread-local was retargeted since alloc)\n");
+            });
+        }
+        CUDA_CHECK(cudaFreeAsync(ptr, s));
     }
 };
 
