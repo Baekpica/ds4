@@ -610,6 +610,10 @@ typedef struct {
     char *prompt_text;
     tool_schema_orders tool_orders;
     int max_tokens;
+    /* Inc 0b: did the CLIENT send a budget?  Parsers preload max_tokens with
+     * the server default, so presence must be tracked separately for the
+     * omitted/zero/positive distinction request_decode_budget implements. */
+    bool max_tokens_set;
     int top_k;
     float temperature;
     float top_p;
@@ -801,6 +805,25 @@ static void request_free(request *r) {
     free(r->anthropic_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
+}
+
+/* Inc 0b: route-invariant decode budget -- three states, one meaning on
+ * every lane:
+ *   OMITTED       -> the server default (parsers preload it into max_tokens);
+ *   EXPLICIT <= 0 -> zero decode tokens (prefill-only): the serial lane's
+ *                    long-standing clamp semantics and Anthropic's documented
+ *                    cache-prewarm contract;
+ *   POSITIVE      -> the requested budget (per-surface range enforcement is
+ *                    Inc 2 work, after endpoint-native errors exist).
+ * Before this helper the batched lanes replaced ANY <= 0 with the server
+ * default, so a route change could turn a zero-token request into a
+ * ~384K-token decode.  The batched engine floors max_new at 1 (it cannot
+ * retire an admission without sampling a seed token), so a zero budget that
+ * reaches a batched lane decodes exactly one token; true zero-decode stays a
+ * serial capability until prefill-only routing lands (plan Inc 3). */
+static int request_decode_budget(const request *r, int server_default) {
+    if (r->max_tokens_set && r->max_tokens <= 0) return 0;
+    return r->max_tokens > 0 ? r->max_tokens : server_default;
 }
 
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
@@ -2735,6 +2758,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+            r->max_tokens_set = true;
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -2951,6 +2975,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+            r->max_tokens_set = true;
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3852,6 +3877,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+            r->max_tokens_set = true;
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4069,6 +4095,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+            r->max_tokens_set = true;
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -10805,7 +10832,7 @@ decode_again:
     size_t stop_scan_from = 0;
     const char *finish = "length";
     int completion = 0;
-    int max_tokens = j->req.max_tokens;
+    int max_tokens = request_decode_budget(&j->req, s->default_tokens);
     int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
@@ -10813,8 +10840,7 @@ decode_again:
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
-    if (max_tokens < 0) max_tokens = 0;
-    if (max_tokens > room) max_tokens = room;
+    if (max_tokens > room) max_tokens = room;   /* helper never returns < 0 */
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
@@ -11697,7 +11723,7 @@ static bool serial_session_ensure_fit(server *s, job *j) {
      * the serial disk tier -- its payloads are ring-images at the stamped
      * ctx and cannot load into a smaller session. */
     if (!s->batch_ctx) return true;
-    long budget = j->req.max_tokens > 0 ? j->req.max_tokens : s->default_tokens;
+    long budget = request_decode_budget(&j->req, s->default_tokens);
     if (budget < 1) budget = 1;
     const int boot_ctx = s->serial_boot_ctx;
     long need_full = (long)j->req.prompt.len + budget;
@@ -11804,7 +11830,7 @@ static void run_job_single(server *s, job *j) {
  * groups by prompt tokens alone lets short-prompt/long-output rows blow past
  * the ring and get silently truncated (the v0.1.0 IFEval finding, 2026-07-10). */
 static long job_tok_footprint(const server *s, const job *j) {
-    const long budget = j->req.max_tokens > 0 ? j->req.max_tokens : s->default_tokens;
+    const long budget = request_decode_budget(&j->req, s->default_tokens);
     return (long)j->req.prompt.len + budget;
 }
 
@@ -11922,7 +11948,7 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
     int n_packed = 0;
     for (int i = 0; i < n; i++) {
         prompts[i] = jobs[i]->req.prompt;   /* shallow read-only view */
-        max_new[i] = jobs[i]->req.max_tokens > 0 ? jobs[i]->req.max_tokens : s->default_tokens;
+        max_new[i] = request_decode_budget(&jobs[i]->req, s->default_tokens);
         eos_ids[i] = eos;
         n_packed += prompts[i].len;
         route_metrics_record(&jobs[i]->req, ROUTE_LANE_STATIC);
@@ -12634,7 +12660,7 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     cs->inflight[slot] = j;
     req->tokens  = j->req.prompt.v;
     req->n       = j->req.prompt.len;
-    req->max_new = j->req.max_tokens > 0 ? j->req.max_tokens : s->default_tokens;
+    req->max_new = request_decode_budget(&j->req, s->default_tokens);
     req->eos     = ds4_token_eos(s->engine);
     req->user    = j;
     /* A2a: engine-reported placement + warm-continuation matching (may swap
@@ -19822,6 +19848,25 @@ static void test_cont_completion_stream_matches_serial_oracle(void) {
     close(sv[1]);
 }
 
+/* Inc 0b: the three-state decode-budget contract shared by every lane site
+ * (serial decode loop, serial fit, footprint, static pack, cont admit).
+ * Before the helper, the batched lanes replaced ANY <= 0 with the server
+ * default while serial honored it as zero decode -- the route-divergence
+ * the plan's normalization step removes. */
+static void test_request_decode_budget_three_states(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 393216);          /* parser-preloaded default */
+    TEST_ASSERT(request_decode_budget(&r, 393216) == 393216);   /* OMITTED */
+    r.max_tokens = 4096;
+    r.max_tokens_set = true;
+    TEST_ASSERT(request_decode_budget(&r, 393216) == 4096);     /* POSITIVE */
+    r.max_tokens = 0;
+    TEST_ASSERT(request_decode_budget(&r, 393216) == 0);        /* EXPLICIT 0 */
+    r.max_tokens = -5;
+    TEST_ASSERT(request_decode_budget(&r, 393216) == 0);        /* EXPLICIT <0 */
+    request_free(&r);
+}
+
 /* Inc 0b (#13 twin): an unrepairable mid-toolcall budget cut on the cont
  * lane keeps the honest "length" finish and returns the partial call as
  * assistant text, mirroring the serial dcc2623 behavior; a non-budget
@@ -20089,6 +20134,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tape_buffered_final_responses();
     test_cont_completion_stream_matches_serial_oracle();
     test_cont_budget_cut_toolcall_keeps_length();
+    test_request_decode_budget_three_states();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_record_current_shapes();

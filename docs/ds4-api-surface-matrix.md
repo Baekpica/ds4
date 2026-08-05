@@ -50,21 +50,24 @@ Within OpenAI, `job_is_batchable` also keeps on serial: non-streaming
 
 ## Output-budget (`max_tokens`) semantics today
 
-All four parsers accept any integer without range validation. An omitted
-budget becomes the server default (`--tokens`, default 393216). The lanes
-then disagree on `<= 0`:
+All four parsers accept any integer without range validation (per-surface
+range enforcement is Inc 2 work, after endpoint-native errors exist).
+Since Inc 0b, every lane interprets the budget through one helper
+(`request_decode_budget`) with three states:
 
-- **serial** honors it: negative clamps to 0, and 0 runs prefill with zero
-  decode tokens (finish `length`; Anthropic projects `stop_reason:
-  "max_tokens"` with empty content).
-- **continuous and static** replace any `<= 0` with the server default,
-  turning a zero-token request into a full-budget decode.
+- **omitted** — the server default (`--tokens`, default 393216);
+- **explicit `<= 0`** — zero decode tokens (prefill-only): the serial
+  lane's long-standing semantics and Anthropic's documented
+  cache-prewarm contract (`stop_reason: "max_tokens"`, empty content);
+- **positive** — the requested budget.
 
-Because Anthropic always routes serial today, an Anthropic
-`max_tokens: 0` request currently behaves like upstream's documented
-cache-prewarm (prefill, empty content, `stop_reason: "max_tokens"`).
-That behavior must survive route promotion: budget normalization becomes
-route-invariant in Inc 0b before any routing changes.
+Residual, documented: the batched engine floors `max_new` at 1 (it
+cannot retire an admission without sampling a seed token), so an
+explicit zero that reaches a batched lane decodes exactly one token
+instead of the pre-0b behavior of substituting the full server default.
+No supported surface routes zero-budget work to a batched lane today
+(Anthropic is serial by the API gate); true zero-decode stays a serial
+capability until prefill-only routing lands (plan Inc 3).
 
 The Anthropic parser requires `messages` but does not require
 `max_tokens` (upstream requires it); an omitted value gets the server
