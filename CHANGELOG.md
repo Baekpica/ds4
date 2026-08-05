@@ -1,3 +1,72 @@
+# v0.5.5 (2026-08-05)
+
+The illegal-access release: the intermittent CUDA crash that several
+GB10 boxes hit under sustained agentic load is root-caused and fixed,
+alongside four serving-honesty fixes from the same field docket.
+Thanks to OllieOllie for the budget double-booking analysis and the
+capture/topk bisect that pointed at the right kernel family, and to
+emX0r for the serial-lane report that drove the reservation work.
+
+- The illegal-access crash class is fixed (Xid 13 "Out Of Range
+  Address"; forum 378855 post 30, forum 376884 posts 113-129): the
+  deep-context top-512 selector's buffer-compaction decision read a
+  shared counter that the next tile's append could still move on the
+  skip path — a nanoseconds-wide race that let sibling warps disagree
+  about compacting, corrupt the block's sort state, and write outside
+  the shared-memory window. The decision value is now frozen under a
+  barrier before it is read (selections are byte-identical; one extra
+  barrier per tile). On the deterministic reproducer: 16 interleaved
+  fresh-boot pairs, 5 crashes on the unfixed binary, 0 on the fix.
+  The window explains every field trait — rare and intermittent,
+  worse on hot or long-running boxes, and vanishing under every
+  debugging mode that was tried.
+- New DS4_SERIAL_RESERVE_CTX lever for deployments whose single-request
+  lane matters more than batch depth (forum 378855 post 49): set it to
+  the deepest serial prompt you need served and the server carves that
+  much memory aside at boot, so cache growth can never leave the lane
+  unable to allocate. It is off by default, and the measurement is
+  worth stating plainly: a right-sized serial session graph costs about
+  7.3 GiB, while deep batch serving at -c 524288 leaves about 6.8 GiB
+  free on a 128 GiB box. The two lanes cannot both be funded at depth,
+  so reserving statically does not remove the shortage, it only chooses
+  who loses it, and on a default boot that must not be the batch path.
+  The general fix is for the serial lane to reclaim cache pages when it
+  needs them, which is the next release's work. When the lever is on,
+  the reservation is still capped so it cannot take what the batch path
+  needs to function, and the boot line reports the carve-out.
+- The KV-cache page budget is now the bank plan itself (banks x full
+  per-bank extent), not a boot-time free-memory sample. The sampled
+  budget needed a grant-back and a live refresh to survive its own
+  noise and could still trim warm records to a noise-derived number;
+  all three are gone. Live-memory truth stays where v0.5.4 put it:
+  the admission-time floor verdict, which now also charges other
+  in-flight admissions' outstanding projections (the joint-admission
+  overrun class analyzed by OllieOllie, forum 376884 post 129) and
+  the serial reserve.
+- A max_tokens cut that lands inside a tool-call emission now reports
+  finish_reason "length" instead of "error" (agent harnesses treated
+  "error" as retryable failure), returns the partial call as
+  assistant text, and never decodes past the stated budget on the
+  recovery path.
+- The warm-record matcher ranks reuse candidates by the tokens they
+  actually deliver, with an explicit guard: exact-token reuse of a
+  committed prefix structurally beats re-deriving alignment from
+  text, so byte-length comparisons no longer decide picks.
+- Interrupted-work checkpoints (v0.5.4) extended: a bank's emit-keep
+  state now follows fork copies and re-arms after being spent, fixing
+  a slow accumulation where partial-fork history could block
+  continuous-graph capture for the bank's life (the "gradual
+  slowdown" field reports).
+- GB10 build-target advisory + a reference Dockerfile (forum 378855
+  post 48): a generic `make cuda` on GB10 silently drops the Spark
+  weight-read cache — the boot log now names the faster target once;
+  the Dockerfile builds the right one.
+- Diagnostics that stay: a permanent bound tripwire in the top-512
+  selector, fault-surviving instrumentation modes in the kernel
+  microstress, and measurement gates for the serial reservation,
+  finish-reason honesty, matcher picks, and tool-turn re-render
+  alignment (measured: 1-token asymmetry on the hot path).
+
 # v0.5.4 (2026-08-03)
 
 Field-report release: every change traces to a report in the NVIDIA
