@@ -34,7 +34,7 @@ Routing today (`job_is_batchable`, `job_is_static_batchable`,
 | Surface | serial | continuous | static |
 |---|---|---|---|
 | OpenAI Chat | fallback | yes (prompt fits one bank) | buffered + greedy + non-thinking + no stops/tools |
-| OpenAI Completion | fallback | yes, but streaming projection is WRONG (defect 1) | same conditions as Chat |
+| OpenAI Completion | fallback | yes | same conditions as Chat |
 | Anthropic Messages | always | never | never |
 | OpenAI Responses | always | never | never |
 
@@ -85,13 +85,15 @@ default like every other surface.
 
 ## Known defects recorded as fixtures (fixed in later increments)
 
-1. **Continuous legacy-Completion streaming emits chat deltas.**
-   `cont_on_token` projects every streaming row through
-   `openai_sse_stream_update`, so a `text_completion` client receives
-   `chat.completion.chunk` objects. Recorded as a NEGATIVE fixture
-   (`test_cont_completion_stream_negative_fixture`); the serial projector
-   (`sse_chunk`'s completion branch) is the oracle. Do not treat the
-   continuous bytes as compatibility goldens.
+1. **FIXED (Inc 0b): continuous legacy-Completion streaming emitted chat
+   deltas.** `cont_on_token` projected every streaming row through the
+   chat delta machine, so a `text_completion` client received
+   `chat.completion.chunk` objects. Completion rows now stream the
+   serial oracle's plain `text_completion` chunks
+   (`cont_stream_emit_plain`); the Inc 0a negative fixture is inverted
+   (`test_cont_completion_stream_matches_serial_oracle`) and
+   `speed-bench/completion_stream_gate.sh` holds the live schema +
+   cont-engagement line.
 2. **Engine-failure stranding finalizes live streams as `length`**
    (continuous lane), conflating a failure with a budget stop.
 3. **`http_error` sends the OpenAI envelope to every surface** for parse,
@@ -148,8 +150,9 @@ block/item, contiguous Responses `sequence_number`, UTF-8 hold-back):
 - `test_tape_responses_stream_projection`
 - `test_tape_buffered_final_responses` (all four buffered objects +
   finish mapping, including Anthropic `length -> max_tokens`)
-- `test_cont_completion_stream_negative_fixture` (defect 1, recorded wrong
-  on purpose; invert when fixed, do not delete)
+- `test_cont_completion_stream_matches_serial_oracle` (the inverted
+  Inc 0a negative fixture for defect 1 — cont and serial now share the
+  legacy-Completion stream shape)
 - `test_route_decisions_record_current_dispatch`
 - `test_idempotency_key_header_is_ignored`
 - `test_responses_durable_references_rejected_at_parse`

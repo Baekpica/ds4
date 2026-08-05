@@ -12708,6 +12708,10 @@ struct cont_stream {
     int    completion;    /* visible (non-EOS) tokens produced */
     bool   started;       /* SSE headers (+ chat role preamble) sent */
     bool   failed;        /* a socket write failed -> stop writing, just finalize */
+    /* Inc 0b: legacy-Completion rows stream the serial oracle's plain
+     * text_completion chunks (generate_job's plain_stream_pos), NOT the chat
+     * delta machine -- this is the emitted-bytes cursor for that path. */
+    size_t plain_stream_pos;
     /* A1: host-side stop/tool scan state -- the cont-path port of
      * generate_job's per-token scan, so stop-string and tool-call requests ride
      * the batched path.  `text` is also accumulated for NON-streaming rows that
@@ -12795,6 +12799,21 @@ static void cont_stream_start(server *s, job *j) {
         st->failed = true;                     /* {"delta":{"role":"assistant"}} */
 }
 
+/* Inc 0b: stream a legacy-Completion row's newly-safe bytes as the serial
+ * oracle does -- text_completion chunks via sse_chunk with the same UTF-8
+ * hold-back call (generate_job's plain-stream branch).  `limit` is the
+ * stop-safe stream length the caller already computed. */
+static bool cont_stream_emit_plain(job *j, cont_stream *st, size_t limit) {
+    const char *raw = st->text.ptr ? st->text.ptr : "";
+    size_t safe = utf8_stream_safe_len(raw, st->plain_stream_pos, limit, false);
+    if (safe <= st->plain_stream_pos) return true;
+    char *delta = xstrndup(raw + st->plain_stream_pos, safe - st->plain_stream_pos);
+    bool ok = sse_chunk(j->fd, &j->req, st->id, delta, NULL);
+    free(delta);
+    if (ok) st->plain_stream_pos = safe;
+    return ok;
+}
+
 /* A1: resolve a finished chat row's accumulated text into content/reasoning/
  * tool calls -- the generate_job tail (truncation repair + parse + id
  * assignment + tool memory), MINUS the serial session-recovery loop the
@@ -12867,13 +12886,29 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
     char *content = NULL, *reasoning = NULL;
     if (j->req.kind == REQ_CHAT && j->req.has_tools)
         cont_resolve_chat(s, j, st, &fin, &content, &reasoning, &calls);
-    /* Flush any held-back reasoning/content tail, emit the finish chunk + usage +
-     * [DONE] -- the exact single-path finalize. */
+    /* Flush any held-back tail, emit the finish chunk + usage + [DONE] -- the
+     * exact single-path finalize for each kind.  Inc 0b: completion rows use
+     * the serial plain branch (raw-tail flush + text_completion finish),
+     * never the chat finish machine. */
     if (!st->failed) {
-        if (!openai_sse_finish_live(j->fd, s, &j->req, st->id, &st->ostream,
-                                    st->text.ptr ? st->text.ptr : "", st->text.len,
-                                    &calls, fin, st->prompt_tokens, st->completion))
-            st->failed = true;
+        if (j->req.kind == REQ_CHAT) {
+            if (!openai_sse_finish_live(j->fd, s, &j->req, st->id, &st->ostream,
+                                        st->text.ptr ? st->text.ptr : "", st->text.len,
+                                        &calls, fin, st->prompt_tokens, st->completion))
+                st->failed = true;
+        } else {
+            bool ok = true;
+            if (st->text.len > st->plain_stream_pos) {
+                char *tail = xstrndup(st->text.ptr + st->plain_stream_pos,
+                                      st->text.len - st->plain_stream_pos);
+                ok = sse_chunk(j->fd, &j->req, st->id, tail, NULL);
+                free(tail);
+            }
+            if (ok) ok = sse_chunk(j->fd, &j->req, st->id, NULL, fin) &&
+                         sse_done(j->fd, &j->req, st->id, st->prompt_tokens,
+                                  st->completion);
+            if (!ok) st->failed = true;
+        }
     }
     free(content);
     free(reasoning);
@@ -12967,8 +13002,10 @@ static int cont_on_token(void *ud, void *user, int token) {
     /* Token-id echo: the single path's openai_stream_record_token call site,
      * ported.  Each sampled id is queued with its byte end so the shared SSE
      * projection below drains token-aligned token_ids arrays.  No-op unless
-     * the request set return_token_ids. */
-    if (j->req.stream) openai_stream_record_token(&st->ostream, token, st->text.len);
+     * the request set return_token_ids (chat-only: completion-kind echo never
+     * rides the cont path, and completion rows do not use the chat machine). */
+    if (j->req.stream && j->req.kind == REQ_CHAT)
+        openai_stream_record_token(&st->ostream, token, st->text.len);
 
     /* Stop scan + stream hold-back, the generate_job shape: never emit bytes
      * that could be a stop-string prefix; on a hit the text truncates to the
@@ -13017,16 +13054,21 @@ static int cont_on_token(void *ud, void *user, int token) {
         }
     }
 
-    /* Project the cumulative raw buffer into OpenAI SSE deltas: reasoning_content
-     * while inside <think>...</think> (thinking requests), content after, tool
-     * deltas inside a DSML block (the machine detects starts itself); the
-     * machine handles UTF-8 + close-tag hold-back, and the stop-safe stream_len
-     * clamp keeps potential stop prefixes off the wire.  Writes redirect into
-     * j->out (W8a t_emit_job); a false return means the client is gone -> evict. */
-    if (j->req.stream &&
-        !openai_sse_stream_update(j->fd, s, &j->req, st->id, &st->ostream,
-                                  st->text.ptr ? st->text.ptr : "", stream_len, false)) {
-        st->failed = true; t_emit_job = NULL; return 0;
+    /* Project the cumulative raw buffer.  Chat rows use the shared OpenAI SSE
+     * machine (reasoning_content inside <think>, content after, tool deltas
+     * inside a DSML block; UTF-8 + close-tag hold-back).  Inc 0b:
+     * legacy-Completion rows use the serial oracle's plain text_completion
+     * chunks instead -- the chat delta machine emitted chat.completion.chunk
+     * objects on a text_completion route (the Inc 0a negative fixture).  The
+     * stop-safe stream_len clamp keeps potential stop prefixes off the wire
+     * on both shapes.  Writes redirect into j->out (W8a t_emit_job); a false
+     * return means the client is gone -> evict. */
+    if (j->req.stream) {
+        bool ok = j->req.kind == REQ_CHAT ?
+            openai_sse_stream_update(j->fd, s, &j->req, st->id, &st->ostream,
+                                     st->text.ptr ? st->text.ptr : "", stream_len, false) :
+            cont_stream_emit_plain(j, st, stream_len);
+        if (!ok) { st->failed = true; t_emit_job = NULL; return 0; }
     }
     t_emit_job = NULL;
 
@@ -19709,18 +19751,16 @@ static void test_tape_buffered_final_responses(void) {
     close(sv[1]);
 }
 
-/* NEGATIVE FIXTURE (plan Inc 0a; fixed in Inc 0b).  The continuous lane
- * projects a streaming legacy /v1/completions row through the CHAT delta
- * machine: cont_on_token calls openai_sse_stream_update for ANY streaming
- * row, and cont_stream_finalize closes with openai_sse_finish_live -- so a
- * text_completion client receives chat.completion.chunk objects.  This test
+/* INVERTED Inc 0a negative fixture (fixed in Inc 0b).  The continuous lane
+ * used to project streaming legacy /v1/completions rows through the CHAT
+ * delta machine (chat.completion.chunk objects on a text_completion route);
+ * cont_on_token now routes completion rows through cont_stream_emit_plain
+ * and cont_stream_finalize closes with the serial plain branch.  This test
  * calls the REAL cont projection entry points (cont_stream_start /
- * cont_stream_finalize) and mirrors cont_on_token's per-token projection
- * calls exactly (cont_on_token itself needs a live engine for detok).  The
- * asserted bytes are RECORDED WRONG on purpose -- the serial projector
- * (test_tape_openai_completion_stream_projection) is the oracle, and this
- * test must be inverted, not deleted, when Inc 0b fixes the projection. */
-static void test_cont_completion_stream_negative_fixture(void) {
+ * cont_stream_emit_plain / cont_stream_finalize; cont_on_token itself needs
+ * a live engine for detok) and asserts the serial oracle's shape --
+ * byte-comparable with test_tape_openai_completion_stream_projection. */
+static void test_cont_completion_stream_matches_serial_oracle(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
@@ -19739,27 +19779,24 @@ static void test_cont_completion_stream_negative_fixture(void) {
     cont_stream_start(&s, &j);
     TEST_ASSERT(st->started);
     TEST_ASSERT(!st->failed);
-    TEST_ASSERT(!strncmp(st->id, "cmpl-", 5));   /* the id prefix is already right */
+    TEST_ASSERT(!strncmp(st->id, "cmpl-", 5));
     for (size_t i = 0; i < sizeof(tape_plain) / sizeof(tape_plain[0]); i++) {
         const char *piece = tape_plain[i].piece;
         buf_append(&st->text, piece, strlen(piece));
         st->completion++;
-        openai_stream_record_token(&st->ostream, tape_plain[i].token_id, st->text.len);
-        TEST_ASSERT(openai_sse_stream_update(j.fd, &s, &j.req, st->id, &st->ostream,
-                                             st->text.ptr, st->text.len, false));
+        TEST_ASSERT(cont_stream_emit_plain(&j, st, st->text.len));
     }
     cont_stream_finalize(&s, &j, "stop");
     TEST_ASSERT(j.cstream == NULL);
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
-    /* No role preamble for completion kind (cont_stream_start gets this right). */
-    TEST_ASSERT(strstr(out, "\"delta\":{\"role\":\"assistant\"}") == NULL);
-    /* THE DEFECT: chat deltas on a text_completion stream. */
-    TEST_ASSERT(strstr(out, "\"object\":\"chat.completion.chunk\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"object\":\"text_completion\"") == NULL);
-    TEST_ASSERT(strstr(out, "\"delta\":{\"content\":") != NULL);
-    TEST_ASSERT(strstr(out, "\"choices\":[{\"text\":") == NULL);
+    /* The serial oracle's shape: text_completion everywhere, no chat objects,
+     * no role preamble, no delta framing. */
+    sse_assert_every_data_object(out, "\"object\":\"text_completion\"",
+                                 "chat.completion.chunk");
+    TEST_ASSERT(strstr(out, "\"delta\"") == NULL);
+    TEST_ASSERT(strstr(out, "\"choices\":[{\"text\":\"Hel\"") != NULL);
     TEST_ASSERT(strstr(out, "\"finish_reason\":\"stop\"") != NULL);
     TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
 
@@ -19985,7 +20022,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tape_anthropic_stream_projection();
     test_tape_responses_stream_projection();
     test_tape_buffered_final_responses();
-    test_cont_completion_stream_negative_fixture();
+    test_cont_completion_stream_matches_serial_oracle();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_record_current_shapes();
