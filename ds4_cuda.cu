@@ -2718,12 +2718,26 @@ extern "C" unsigned long long ds4_cuda_fp4_index_read_path_blocks(void);  /* P2 
  * this ds4_cuda.o was compiled without the full cuda-spark configuration
  * (CUDA_ARCH=sm_121 supplies DS4_CUDA_HAVE_MXF4, the cuda-spark target adds
  * DS4_CUDA_SPARK_HBM_CACHE); the server turns that into a boot advisory. */
+/* 0 = no mismatch (full Spark build, or not a GB10).
+ * 1 = fully generic build on a GB10: no sm_121a-native kernels, no MXF4
+ *     indexer, no HBM weight cache (e.g. `make cuda CUDA_ARCH=sm_120`,
+ *     `make cuda-generic`, or a portable Docker build).
+ * 2 = sm_121-arch build missing ONLY the Spark HBM weight cache
+ *     (`make cuda CUDA_ARCH=sm_121`: the Makefile's sm_121 branch adds
+ *     the sm_121a gencode pair + MXF4 for any target, so the single
+ *     define `cuda-spark` adds on top is the whole difference).
+ * The split exists because the two shapes have very different costs and
+ * the field advisory must not quote the fully-generic penalty at a
+ * cache-only build (forum 378855 post 65). */
 extern "C" int ds4_cuda_spark_build_mismatch(void) {
-    int spark_build = 0;
-#if defined(DS4_CUDA_HAVE_MXF4) && defined(DS4_CUDA_SPARK_HBM_CACHE)
-    spark_build = 1;
+    int have_mxf4 = 0, have_hbm_cache = 0;
+#if defined(DS4_CUDA_HAVE_MXF4)
+    have_mxf4 = 1;
 #endif
-    if (spark_build) return 0;
+#if defined(DS4_CUDA_SPARK_HBM_CACHE)
+    have_hbm_cache = 1;
+#endif
+    if (have_mxf4 && have_hbm_cache) return 0;
     int dev = 0;
     cudaDeviceProp prop;
     if (cudaGetDevice(&dev) != cudaSuccess ||
@@ -2731,7 +2745,8 @@ extern "C" int ds4_cuda_spark_build_mismatch(void) {
         (void)cudaGetLastError();
         return 0;
     }
-    return (prop.major == 12 && prop.minor == 1) ? 1 : 0;
+    if (!(prop.major == 12 && prop.minor == 1)) return 0;
+    return have_mxf4 ? 2 : 1;
 }
 
 extern "C" int ds4_gpu_init(void) {

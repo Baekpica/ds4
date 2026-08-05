@@ -14776,20 +14776,51 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__)
-    /* Field (forum 378855 post 48): a GB10 served by a `make cuda
-     * CUDA_ARCH=...` binary runs at ~1/3 prefill and ~1/2 decode speed --
-     * no Spark HBM weight cache, no sm_121-native kernels -- and nothing
-     * in the boot log says why.  Same transparency philosophy as the
-     * spec-armed line below: say it loudly at boot. */
+    /* Field (forum 378855 posts 48 + 65): a GB10 served by a non-Spark
+     * binary is quietly slow, and nothing in the boot log says why.  Same
+     * transparency philosophy as the spec-armed line below: say it loudly
+     * at boot -- and say WHICH configuration is missing, with the penalty
+     * measured for THAT shape.  Post 65 (sword_fish) hit the cache-only
+     * case and the old single message over-claimed at it (it named
+     * sm_121a kernels his binary in fact had). */
     if (cfg.engine.backend == DS4_BACKEND_CUDA) {
         int ds4_cuda_spark_build_mismatch(void);
-        if (ds4_cuda_spark_build_mismatch()) {
+        const int mismatch = ds4_cuda_spark_build_mismatch();
+        if (mismatch == 1) {
+            /* Fully generic: no sm_121a SASS, no MXF4 indexer, no HBM
+             * weight cache.  Penalty measured in the field (post 48
+             * Docker case): ~1/3 prefill, ~1/2 decode. */
             server_log(DS4_LOG_WARNING,
                        "ds4-server: this CUDA device is a GB10 (DGX Spark class, sm_121) but the "
-                       "binary was built without the DGX Spark configuration -- some or all of "
-                       "the Spark fast paths (HBM weight cache, sm_121a-native kernels) are "
-                       "compiled out. In the field this serves at roughly a THIRD of the prefill "
-                       "speed and HALF the decode speed. Rebuild with `make cuda-spark`.");
+                       "binary is a generic CUDA build -- the Spark fast paths (sm_121a-native "
+                       "kernels, MXF4 indexer, HBM weight cache) are all compiled out. In the "
+                       "field this serves at roughly a THIRD of the prefill speed and HALF the "
+                       "decode speed. Rebuild with `make cuda-spark`.");
+        } else if (mismatch == 2) {
+            /* sm_121-arch build (sm_121a SASS + MXF4 present) missing only
+             * -DDS4_CUDA_SPARK_HBM_CACHE=1 -- the shape every
+             * `make cuda CUDA_ARCH=sm_121` produces (and every ds4-on-spark
+             * install before 2026-08-05 shipped, forum 378855 post 65).
+             * ABBA-measured on GB10 2026-08-05 at MATCHED bank plans
+             * (COALESCE_MAX=8, v0.5.5): kernel speed is IDENTICAL --
+             * prefill +0.65%/decode -0.25%, sign-inconsistent noise.  The
+             * real harm is accounting: without the startup span cache
+             * (~8.2 GiB, charged before the bank plan on spark builds) the
+             * planner sees that much extra free memory and spends it on
+             * banks (29 vs 13 at -c 32768); the same spans then fault in
+             * during serving, the mem floor gate finds usable=0, EVERY cont
+             * admission is refused, and prompts too deep for the
+             * right-sized serial graph 503.  Slower is wrong; broken at
+             * depth is right. */
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: this CUDA device is a GB10 (DGX Spark class, sm_121) and the "
+                       "binary has the sm_121a-native kernels, but the Spark HBM weight cache is "
+                       "compiled out (built with `make cuda CUDA_ARCH=sm_121` instead of "
+                       "`make cuda-spark`). Kernel speed is unaffected, but the boot memory plan "
+                       "cannot charge the cache's ~8 GiB up front: it overcommits the cache-bank "
+                       "budget by that amount, and once the model weights fault in, admissions "
+                       "can be refused outright (503s on deep prompts). Rebuild with "
+                       "`make cuda-spark`.");
         }
     }
 #endif
