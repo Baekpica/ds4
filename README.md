@@ -1147,6 +1147,21 @@ Enable it with:
 > first trim evicted banks, then reject cleanly (watch the
 > `cont admit rejected` counter). Shallow-context servers were never
 > exposed — at 16k a bank's whole extent is its floor page.
+>
+> Two operator controls govern that growth. `--mem-floor-gb` (v0.5.4,
+> default 4 GiB) is the inviolable line: every admission must fit live
+> free memory beyond it, so cache growth is trimmed or rejected before
+> the box is squeezed, whatever it has lost since boot to other
+> processes or page-cache churn. `DS4_SERIAL_RESERVE_CTX=<tokens>`
+> (v0.5.5, off by default) reserves memory at boot for the
+> single-request serial lane, for deployments where that lane matters
+> more than batch depth — it is off by default because a serial session
+> graph and deep batch serving cannot both be funded at large `--ctx` on
+> a 128 GiB box, and the batch path should win that tie; the boot line
+> reports the carve-out when you turn it on. Since v0.5.5 the pool's own
+> budget is derived from the bank plan (banks × per-bank extent) rather
+> than a boot-time free-memory sample, so it no longer drifts with the
+> memory weather at startup.
 
 The cache key is the SHA1 of the rendered byte prefix, and files are named
 `<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state
