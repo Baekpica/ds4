@@ -401,6 +401,13 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
  * partially-cleared second, which is acceptable noise for a rate gauge. */
 #define DS4_METRICS_WIN_BUCKETS 64
 #define DS4_METRICS_WIN_SECONDS 60
+/* Route observation matrix (v0.5.6 Inc 0a): requests by wire surface x
+ * serving lane.  Storage only -- the SERVER owns both index sets and their
+ * label names (the engine stays protocol-blind); one increment per job at
+ * the moment a lane takes it, so a batched attempt that falls back re-enters
+ * serial and increments both lanes (lane entries, not final outcomes). */
+#define DS4_METRICS_ROUTE_SURFACES 4
+#define DS4_METRICS_ROUTE_LANES 3
 typedef struct {
     uint64_t stamp;               /* monotonic second this bucket belongs to */
     uint64_t dec_tok, dec_steps, pf_tok;
@@ -437,6 +444,8 @@ typedef struct {
     uint64_t derived_artifact_source;
     uint64_t derived_artifacts;             /* artifact count */
     uint64_t derived_artifact_bytes;
+    /* route observation (see DS4_METRICS_ROUTE_* above) */
+    uint64_t route_requests[DS4_METRICS_ROUTE_SURFACES][DS4_METRICS_ROUTE_LANES];
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);

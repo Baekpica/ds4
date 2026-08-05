@@ -8120,6 +8120,39 @@ struct job {
 
 enum { JOB_OUT_COMPLETED = 0, JOB_OUT_FAILED, JOB_OUT_REFUSED_DEEP_SERIAL };
 
+/* v0.5.6 Inc 0a: route observation -- record which serving lane took each
+ * request, keyed by WIRE SURFACE (not API vendor: OpenAI Chat and legacy
+ * Completion project different stream objects, so they must stay
+ * distinguishable).  Observation only; dispatch is unchanged.  Increments
+ * happen where a lane actually takes the job (generate_job entry, cont_admit
+ * success, generate_batch_jobs pack), so a failed batched attempt that falls
+ * back also increments serial -- these count lane entries, not outcomes. */
+enum {
+    ROUTE_SURFACE_OPENAI_CHAT = 0,
+    ROUTE_SURFACE_OPENAI_COMPLETION,
+    ROUTE_SURFACE_ANTHROPIC_MESSAGES,
+    ROUTE_SURFACE_OPENAI_RESPONSES,
+};
+enum { ROUTE_LANE_SERIAL = 0, ROUTE_LANE_CONTINUOUS, ROUTE_LANE_STATIC };
+
+static const char *route_surface_names[DS4_METRICS_ROUTE_SURFACES] = {
+    "openai_chat", "openai_completion", "anthropic_messages", "openai_responses",
+};
+static const char *route_lane_names[DS4_METRICS_ROUTE_LANES] = {
+    "serial", "continuous", "static",
+};
+
+static int route_metrics_surface(const request *r) {
+    if (r->api == API_ANTHROPIC) return ROUTE_SURFACE_ANTHROPIC_MESSAGES;
+    if (r->api == API_RESPONSES) return ROUTE_SURFACE_OPENAI_RESPONSES;
+    return r->kind == REQ_COMPLETION ? ROUTE_SURFACE_OPENAI_COMPLETION
+                                     : ROUTE_SURFACE_OPENAI_CHAT;
+}
+
+static void route_metrics_record(const request *r, int lane) {
+    ds4_metric_add(&ds4_metrics_get()->route_requests[route_metrics_surface(r)][lane], 1);
+}
+
 /* =========================================================================
  * Tool Call Text Memory.
  * =========================================================================
@@ -10583,6 +10616,7 @@ static void generate_job(server *s, job *j) {
     /* v0.2.x observability: the counter twin of the "prompt start" serial
      * marker the release gates grep for. */
     ds4_metric_add(&ds4_metrics_get()->requests_serial, 1);
+    route_metrics_record(&j->req, ROUTE_LANE_SERIAL);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
 
@@ -11891,6 +11925,7 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
         max_new[i] = jobs[i]->req.max_tokens > 0 ? jobs[i]->req.max_tokens : s->default_tokens;
         eos_ids[i] = eos;
         n_packed += prompts[i].len;
+        route_metrics_record(&jobs[i]->req, ROUTE_LANE_STATIC);
     }
 
     /* W4: use the persistent ctx when the group fits its sizing; else fall back to
@@ -12647,6 +12682,7 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     /* v0.5.2 inc3: let the engine drop this admission mid-prefill if the
      * client dies (the zombie-reap probe, engine-polled between chunks). */
     req->alive = s->disconnect_abort ? cont_alive : NULL;
+    route_metrics_record(&j->req, ROUTE_LANE_CONTINUOUS);
     return 1;
 }
 
@@ -13573,6 +13609,16 @@ static void send_metrics(server *s, int fd) {
     buf_printf(&b, "# TYPE ds4_requests_serial_total counter\n"
                    "ds4_requests_serial_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->requests_serial));
+    /* v0.5.6 Inc 0a: route observation, fixed cardinality (4 surfaces x 3
+     * lanes, all cells always emitted). */
+    buf_puts(&b, "# TYPE ds4_route_requests_total counter\n");
+    for (int si = 0; si < DS4_METRICS_ROUTE_SURFACES; si++) {
+        for (int li = 0; li < DS4_METRICS_ROUTE_LANES; li++) {
+            buf_printf(&b, "ds4_route_requests_total{surface=\"%s\",lane=\"%s\"} %llu\n",
+                       route_surface_names[si], route_lane_names[li],
+                       (unsigned long long)ds4_metric_read(&m->route_requests[si][li]));
+        }
+    }
     buf_printf(&b, "# TYPE ds4_cont_admit_rejects_total counter\n"
                    "ds4_cont_admit_rejects_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_admit_rejects));
@@ -13685,6 +13731,16 @@ static void send_stats(server *s, int fd, bool as_json) {
                    (unsigned long long)ds4_metric_read(&m->tokens_decoded),
                    (unsigned long long)ds4_metric_read(&m->decode_steps),
                    dec_tok_s, tok_step);
+        buf_puts(&b, ",\"routes\":{");
+        for (int si = 0; si < DS4_METRICS_ROUTE_SURFACES; si++) {
+            for (int li = 0; li < DS4_METRICS_ROUTE_LANES; li++) {
+                buf_printf(&b, "%s\"%s_%s\":%llu",
+                           si || li ? "," : "",
+                           route_surface_names[si], route_lane_names[li],
+                           (unsigned long long)ds4_metric_read(&m->route_requests[si][li]));
+            }
+        }
+        buf_putc(&b, '}');
         buf_printf(&b, ",\"speculation\":{\"spec_drafts\":%llu,\"spec_hits\":%llu,"
                        "\"spec_accept_ratio\":%.4f,\"spec_quench_events\":%llu}",
                    (unsigned long long)drafts, (unsigned long long)hits,
@@ -13750,6 +13806,15 @@ static void send_stats(server *s, int fd, bool as_json) {
                (unsigned long long)ds4_metric_read(&m->tokens_decoded),
                (unsigned long long)ds4_metric_read(&m->decode_steps),
                dec_tok_s, tok_step);
+    buf_puts(&b, "# Routes\n");
+    for (int si = 0; si < DS4_METRICS_ROUTE_SURFACES; si++) {
+        for (int li = 0; li < DS4_METRICS_ROUTE_LANES; li++) {
+            buf_printf(&b, "%s.%s:%llu\n",
+                       route_surface_names[si], route_lane_names[li],
+                       (unsigned long long)ds4_metric_read(&m->route_requests[si][li]));
+        }
+    }
+    buf_putc(&b, '\n');
     buf_printf(&b, "# Speculation\n"
                    "spec_drafts:%llu\n"
                    "spec_hits:%llu\n"
@@ -19183,6 +19248,630 @@ static void test_version_newer_comparisons(void) {
     TEST_ASSERT(version_newer("v0.5.3", "v0.5.2-14-gabc123"));
 }
 
+/* =========================================================================
+ * v0.5.6 Inc 0a: frozen projection oracle.
+ *
+ * A deterministic token/text TAPE is replayed through each wire surface's
+ * CURRENT projector, and the emitted bytes are checked by protocol EVENT
+ * VALIDATORS.  These fixtures freeze today's projection behavior so the
+ * later typed extraction can prove "old and new projectors consume the same
+ * captured tape and emit the same bytes".  They are NOT live-sampled
+ * goldens: continuous temp-0 output jitters run-to-run, so live bytes can
+ * never be a byte oracle (see local/docs/ds4-api-surface-matrix reference in
+ * docs/).  One fixture is deliberately NEGATIVE: the continuous lane
+ * projects legacy-Completion streams with the CHAT delta machine; those
+ * bytes are recorded as the defect, with the serial projector as the oracle.
+ * ========================================================================= */
+
+typedef struct { int token_id; const char *piece; } tape_step;
+
+/* Shared tapes.  The thinking tape starts INSIDE reasoning (the serving
+ * prompt ends with the assistant "<think>" primer, so generated text never
+ * begins with the open tag).  The UTF-8 tape splits e-acute (0xC3 0xA9)
+ * across two steps to freeze the hold-back behavior. */
+static const tape_step tape_plain[] = {
+    {11, "Hel"}, {12, "lo"}, {13, " wor"}, {14, "ld."},
+};
+static const tape_step tape_thinking[] = {
+    {21, "plan"}, {22, "</think>"}, {23, "Answer"}, {24, " done."},
+};
+static const tape_step tape_utf8[] = {
+    {31, "caf"}, {32, "\xC3"}, {33, "\xA9"}, {34, " ok"},
+};
+
+static int test_count_substr(const char *hay, const char *needle) {
+    int n = 0;
+    const size_t step = strlen(needle);
+    while ((hay = strstr(hay, needle)) != NULL) { n++; hay += step; }
+    return n;
+}
+
+/* Every "data: " record except [DONE] must contain `must_contain` (and not
+ * `must_not_contain`); [DONE] must exist and be the last record. */
+static void sse_assert_every_data_object(const char *out, const char *must_contain,
+                                         const char *must_not_contain) {
+    const char *p = out;
+    bool saw_done = false;
+    int records = 0;
+    while ((p = strstr(p, "data: ")) != NULL) {
+        p += 6;
+        const char *end = strstr(p, "\n\n");
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char *rec = xstrndup(p, len);
+        if (!strcmp(rec, "[DONE]")) {
+            saw_done = true;
+            TEST_ASSERT(strstr(p + len, "data: ") == NULL);
+        } else {
+            records++;
+            TEST_ASSERT(strstr(rec, must_contain) != NULL);
+            if (must_not_contain)
+                TEST_ASSERT(strstr(rec, must_not_contain) == NULL);
+        }
+        free(rec);
+        p = end ? end + 2 : p + len;
+    }
+    TEST_ASSERT(records > 0);
+    TEST_ASSERT(saw_done);
+}
+
+/* Anthropic streams: every "event: NAME" line's data record must declare
+ * "type":"NAME", message_start comes first, message_stop last, and block
+ * opens/closes balance. */
+static void sse_validate_anthropic_stream(const char *out) {
+    const char *start = strstr(out, "event: message_start");
+    const char *stop = strstr(out, "event: message_stop");
+    TEST_ASSERT(start != NULL);
+    TEST_ASSERT(stop != NULL);
+    TEST_ASSERT(start < stop);
+    TEST_ASSERT(test_count_substr(out, "event: content_block_start") ==
+                test_count_substr(out, "event: content_block_stop"));
+    const char *mdelta = strstr(out, "event: message_delta");
+    TEST_ASSERT(mdelta != NULL);
+    TEST_ASSERT(mdelta < stop);
+    const char *p = out;
+    while ((p = strstr(p, "event: ")) != NULL) {
+        char name[48] = {0};
+        p += 7;
+        size_t n = strcspn(p, "\r\n");
+        if (n >= sizeof(name)) n = sizeof(name) - 1;
+        memcpy(name, p, n);
+        const char *data = strstr(p, "data: ");
+        TEST_ASSERT(data != NULL);
+        const char *rec_end = strstr(data, "\n\n");
+        char *rec = xstrndup(data, rec_end ? (size_t)(rec_end - data) : strlen(data));
+        char typekey[64];
+        snprintf(typekey, sizeof(typekey), "\"type\":\"%s\"", name);
+        TEST_ASSERT(strstr(rec, typekey) != NULL);
+        free(rec);
+    }
+}
+
+/* Responses streams: response.created first, response.completed last,
+ * item added/done balanced, and the per-event sequence_number Codex
+ * consumes is contiguous from 0. */
+static void sse_validate_responses_stream(const char *out) {
+    const char *created = strstr(out, "\"type\":\"response.created\"");
+    const char *completed = strstr(out, "\"type\":\"response.completed\"");
+    TEST_ASSERT(created != NULL);
+    TEST_ASSERT(completed != NULL);
+    TEST_ASSERT(created < completed);
+    TEST_ASSERT(strstr(out, "\"type\":\"response.") < completed);
+    TEST_ASSERT(test_count_substr(out, "\"type\":\"response.output_item.added\"") ==
+                test_count_substr(out, "\"type\":\"response.output_item.done\""));
+    int expect = 0;
+    const char *p = out;
+    while ((p = strstr(p, "\"sequence_number\":")) != NULL) {
+        p += strlen("\"sequence_number\":");
+        TEST_ASSERT(atoi(p) == expect);
+        expect++;
+    }
+    TEST_ASSERT(expect > 0);
+}
+
+/* Route decisions AT THIS TIP, recorded exactly (plan Inc 0a: "record
+ * current route decisions").  The load-bearing fact: job_is_batchable
+ * excludes Anthropic and Responses by API identity alone, so every request
+ * on those surfaces runs serial today regardless of shape.  The surface
+ * classifier must also keep OpenAI Chat and legacy Completion apart -- they
+ * project different stream objects (review gap G1). */
+static void test_route_decisions_record_current_dispatch(void) {
+    request r;
+
+    /* Anthropic: never batchable, never static -- by API identity alone. */
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.temperature = 0.0f;
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(!job_is_batchable(&r));
+    TEST_ASSERT(!job_is_static_batchable(&r));
+    r.stream = true;
+    TEST_ASSERT(!job_is_batchable(&r));
+    TEST_ASSERT(route_metrics_surface(&r) == ROUTE_SURFACE_ANTHROPIC_MESSAGES);
+    request_free(&r);
+
+    /* Responses: same exclusion, same line. */
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.temperature = 0.0f;
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(!job_is_batchable(&r));
+    TEST_ASSERT(!job_is_static_batchable(&r));
+    TEST_ASSERT(route_metrics_surface(&r) == ROUTE_SURFACE_OPENAI_RESPONSES);
+    request_free(&r);
+
+    /* OpenAI chat: batchable; static only when buffered+greedy+non-thinking
+     * with no stops/tools. */
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.temperature = 0.0f;
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(job_is_batchable(&r));
+    TEST_ASSERT(job_is_static_batchable(&r));
+    TEST_ASSERT(route_metrics_surface(&r) == ROUTE_SURFACE_OPENAI_CHAT);
+    r.stream = true;
+    TEST_ASSERT(job_is_batchable(&r));
+    TEST_ASSERT(!job_is_static_batchable(&r));
+    r.stream = false;
+    r.temperature = 0.7f;
+    TEST_ASSERT(!job_is_static_batchable(&r));
+    r.temperature = 0.0f;
+    r.think_mode = DS4_THINK_LOW;
+    TEST_ASSERT(!job_is_static_batchable(&r));
+    request_free(&r);
+
+    /* OpenAI legacy completion: batchable (that is what makes the negative
+     * fixture below reachable on the continuous lane); distinct surface. */
+    request_init(&r, REQ_COMPLETION, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    TEST_ASSERT(job_is_batchable(&r));
+    TEST_ASSERT(route_metrics_surface(&r) == ROUTE_SURFACE_OPENAI_COMPLETION);
+    request_free(&r);
+}
+
+/* Tape -> serial OpenAI Chat stream projector (role preamble + live SSE
+ * machine + finish), the generate_job call shape. */
+static void test_tape_openai_chat_stream_projection(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_LOW;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    TEST_ASSERT(sse_headers(sv[0], false));
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_tape", NULL, NULL));
+    buf raw = {0};
+    for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+        buf_append(&raw, tape_thinking[i].piece, strlen(tape_thinking[i].piece));
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_tape", &st,
+                                             raw.ptr, raw.len, false));
+    }
+    tool_calls empty = {0};
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_tape", &st,
+                                       raw.ptr, raw.len, &empty, "stop", 7, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    sse_assert_every_data_object(out, "\"object\":\"chat.completion.chunk\"", NULL);
+    const char *reason = strstr(out, "\"reasoning_content\":");
+    const char *content = strstr(out, "\"content\":\"Answer");
+    TEST_ASSERT(strstr(out, "\"delta\":{\"role\":\"assistant\"}") != NULL);
+    TEST_ASSERT(reason != NULL);
+    TEST_ASSERT(content != NULL);
+    TEST_ASSERT(reason < content);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"stop\"") != NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    buf_free(&raw);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* UTF-8 tape: the split e-acute must never emit as a dangling byte. */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    openai_stream st2;
+    openai_stream_start(&r, &st2);
+    TEST_ASSERT(sse_headers(sv[0], false));
+    buf raw2 = {0};
+    for (size_t i = 0; i < sizeof(tape_utf8) / sizeof(tape_utf8[0]); i++) {
+        buf_append(&raw2, tape_utf8[i].piece, strlen(tape_utf8[i].piece));
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_tape8", &st2,
+                                             raw2.ptr, raw2.len, false));
+    }
+    tool_calls empty2 = {0};
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_tape8", &st2,
+                                       raw2.ptr, raw2.len, &empty2, "stop", 4, 4));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    /* The held-back lead byte may flush in a LATER delta than "caf" -- what
+     * must hold is that the two e-acute bytes stay contiguous inside one
+     * delta and a dangling lead byte never ends a delta string. */
+    TEST_ASSERT(strstr(out, "\xC3\xA9") != NULL);
+    TEST_ASSERT(strstr(out, "\xC3\"") == NULL);
+    free(out);
+    buf_free(&raw2);
+    openai_stream_free(&st2);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Tape -> serial legacy Completion stream projector.  THIS is the protocol
+ * oracle the negative continuous fixture is judged against: text_completion
+ * objects with choices[].text, never chat deltas. */
+static void test_tape_openai_completion_stream_projection(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_COMPLETION, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+
+    TEST_ASSERT(sse_headers(sv[0], false));
+    for (size_t i = 0; i < sizeof(tape_plain) / sizeof(tape_plain[0]); i++) {
+        TEST_ASSERT(sse_chunk(sv[0], &r, "cmpl_tape", tape_plain[i].piece, NULL));
+    }
+    TEST_ASSERT(sse_chunk(sv[0], &r, "cmpl_tape", NULL, "stop"));
+    TEST_ASSERT(sse_done(sv[0], &r, "cmpl_tape", 4, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    sse_assert_every_data_object(out, "\"object\":\"text_completion\"",
+                                 "chat.completion.chunk");
+    TEST_ASSERT(strstr(out, "\"choices\":[{\"text\":\"Hel\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"stop\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"delta\"") == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Tape -> serial Anthropic Messages stream projector. */
+static void test_tape_anthropic_stream_projection(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_LOW;
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_tape", 7, &st));
+    buf raw = {0};
+    for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+        buf_append(&raw, tape_thinking[i].piece, strlen(tape_thinking[i].piece));
+        TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_tape", &st,
+                                                raw.ptr, raw.len, false));
+    }
+    tool_calls empty = {0};
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tape", &st,
+                                          raw.ptr, raw.len, &empty, "stop", 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    sse_validate_anthropic_stream(out);
+    const char *thinking = strstr(out, "\"thinking\":\"plan\"");
+    const char *signature = strstr(out, "\"type\":\"signature_delta\"");
+    const char *text = strstr(out, "\"text\":\"Answer");
+    TEST_ASSERT(thinking != NULL);
+    TEST_ASSERT(signature != NULL);
+    TEST_ASSERT(text != NULL);
+    TEST_ASSERT(thinking < signature);
+    TEST_ASSERT(signature < text);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"end_turn\"") != NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    buf_free(&raw);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Tape -> serial Responses stream projector (created + reasoning summary +
+ * message + completed), the generate_job call shape. */
+static void test_tape_responses_stream_projection(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_LOW;
+    r.reasoning_summary_emit = true;
+
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    st.active = true;
+    TEST_ASSERT(responses_sse_created(sv[0], &r, &st, 1234));
+    buf raw = {0};
+    for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+        buf_append(&raw, tape_thinking[i].piece, strlen(tape_thinking[i].piece));
+        TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st,
+                                                raw.ptr, raw.len, false));
+    }
+    tool_calls empty = {0};
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, &st, raw.ptr, raw.len,
+                                          NULL, &empty, "stop", 7, 4, 1, 1234));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    sse_validate_responses_stream(out);
+    const char *summary = strstr(out, "\"type\":\"response.reasoning_summary_text.delta\"");
+    const char *text = strstr(out, "\"type\":\"response.output_text.delta\"");
+    TEST_ASSERT(summary != NULL);
+    TEST_ASSERT(text != NULL);
+    TEST_ASSERT(summary < text);
+    TEST_ASSERT(strstr(out, "\"status\":\"completed\"") != NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    buf_free(&raw);
+    responses_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Tape terminal text -> the four buffered finals.  Freezes each surface's
+ * response object and finish mapping, including Anthropic's
+ * length->max_tokens / stop->end_turn stop_reason mapping. */
+static void test_tape_buffered_final_responses(void) {
+    int sv[2];
+    request r;
+    tool_calls empty = {0};
+    char *out;
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    TEST_ASSERT(final_response(sv[0], false, &r, "chatcmpl_buf", "Hello world.",
+                               NULL, &empty, "stop", 4, 4));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"object\":\"chat.completion\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"role\":\"assistant\",\"content\":\"Hello world.\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"stop\"") != NULL);
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    request_init(&r, REQ_COMPLETION, 128);
+    r.api = API_OPENAI;
+    TEST_ASSERT(final_response(sv[0], false, &r, "cmpl_buf", "Hello world.",
+                               NULL, &empty, "length", 4, 4));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"object\":\"text_completion\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"choices\":[{\"text\":\"Hello world.\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"length\"") != NULL);
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_buf", "Hello world.",
+                                         NULL, &empty, "length", 4, 4));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"type\":\"message\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"max_tokens\"") != NULL);
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_buf", "Hello world.",
+                                         NULL, &empty, "stop", 4, 4, 0));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"object\":\"response\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"status\":\"completed\"") != NULL);
+    TEST_ASSERT(strstr(out, "Hello world.") != NULL);
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* NEGATIVE FIXTURE (plan Inc 0a; fixed in Inc 0b).  The continuous lane
+ * projects a streaming legacy /v1/completions row through the CHAT delta
+ * machine: cont_on_token calls openai_sse_stream_update for ANY streaming
+ * row, and cont_stream_finalize closes with openai_sse_finish_live -- so a
+ * text_completion client receives chat.completion.chunk objects.  This test
+ * calls the REAL cont projection entry points (cont_stream_start /
+ * cont_stream_finalize) and mirrors cont_on_token's per-token projection
+ * calls exactly (cont_on_token itself needs a live engine for detok).  The
+ * asserted bytes are RECORDED WRONG on purpose -- the serial projector
+ * (test_tape_openai_completion_stream_projection) is the oracle, and this
+ * test must be inverted, not deleted, when Inc 0b fixes the projection. */
+static void test_cont_completion_stream_negative_fixture(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+    request_init(&j.req, REQ_COMPLETION, 128);
+    j.req.api = API_OPENAI;
+    j.req.stream = true;
+    j.req.think_mode = DS4_THINK_NONE;
+
+    cont_stream *st = cont_stream_ensure(&j);
+    cont_stream_start(&s, &j);
+    TEST_ASSERT(st->started);
+    TEST_ASSERT(!st->failed);
+    TEST_ASSERT(!strncmp(st->id, "cmpl-", 5));   /* the id prefix is already right */
+    for (size_t i = 0; i < sizeof(tape_plain) / sizeof(tape_plain[0]); i++) {
+        const char *piece = tape_plain[i].piece;
+        buf_append(&st->text, piece, strlen(piece));
+        st->completion++;
+        openai_stream_record_token(&st->ostream, tape_plain[i].token_id, st->text.len);
+        TEST_ASSERT(openai_sse_stream_update(j.fd, &s, &j.req, st->id, &st->ostream,
+                                             st->text.ptr, st->text.len, false));
+    }
+    cont_stream_finalize(&s, &j, "stop");
+    TEST_ASSERT(j.cstream == NULL);
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    /* No role preamble for completion kind (cont_stream_start gets this right). */
+    TEST_ASSERT(strstr(out, "\"delta\":{\"role\":\"assistant\"}") == NULL);
+    /* THE DEFECT: chat deltas on a text_completion stream. */
+    TEST_ASSERT(strstr(out, "\"object\":\"chat.completion.chunk\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"object\":\"text_completion\"") == NULL);
+    TEST_ASSERT(strstr(out, "\"delta\":{\"content\":") != NULL);
+    TEST_ASSERT(strstr(out, "\"choices\":[{\"text\":") == NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"stop\"") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+
+    free(out);
+    request_free(&j.req);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Contract record: the HTTP reader parses only Content-Length and Accept;
+ * an Idempotency-Key header is accepted and silently discarded, so a retry
+ * is a NEW generation with new IDs.  Documented unsupported in
+ * docs/ds4-api-surface-matrix.md. */
+static void test_idempotency_key_header_is_ignored(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    const char *req =
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Content-Length: 2\r\n"
+        "Idempotency-Key: retry-me-42\r\n"
+        "Accept: application/json\r\n"
+        "\r\n"
+        "{}";
+    TEST_ASSERT(send(sv[0], req, strlen(req), 0) == (ssize_t)strlen(req));
+    shutdown(sv[0], SHUT_WR);
+
+    http_request hr;
+    memset(&hr, 0, sizeof(hr));
+    TEST_ASSERT(read_http_request(sv[1], &hr));
+    TEST_ASSERT(!strcmp(hr.method, "POST"));
+    TEST_ASSERT(!strcmp(hr.path, "/v1/messages"));
+    TEST_ASSERT(hr.body_len == 2 && !strcmp(hr.body, "{}"));
+    TEST_ASSERT(hr.accept_json);
+    /* http_request has no field for the key: dropped by omission. */
+    http_request_free(&hr);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Contract record: non-null Responses previous_response_id / conversation
+ * reject at parse time with a replay-full-input message (DS4 serves a
+ * stateless Responses subset; a durable response store is out of scope for
+ * this arc).  Only the reject branch runs here -- it fires before the
+ * parser needs an engine or server. */
+static void test_responses_durable_references_rejected_at_parse(void) {
+    request r;
+    char err[200] = {0};
+    TEST_ASSERT(!parse_responses_request(NULL, NULL,
+        "{\"previous_response_id\":\"resp_123\"}", 128, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "not supported") != NULL);
+    TEST_ASSERT(strstr(err, "previous_response_id") != NULL);
+
+    err[0] = '\0';
+    TEST_ASSERT(!parse_responses_request(NULL, NULL,
+        "{\"conversation\":\"conv_1\"}", 128, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "not supported") != NULL);
+    TEST_ASSERT(strstr(err, "conversation") != NULL);
+}
+
+/* Error-envelope record (KNOWN GAP, plan Inc 2): http_error takes no
+ * request, so parse/409/503/shutdown failures send the OpenAI envelope to
+ * every surface; only sse_error_event branches for Anthropic, and Responses
+ * streams get the generic OpenAI error event. */
+static void test_error_envelopes_record_current_shapes(void) {
+    int sv[2];
+    char *out;
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    TEST_ASSERT(http_error(sv[0], false, 503, "server is shutting down"));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 503") != NULL);
+    TEST_ASSERT(strstr(out, "\"error\":{\"message\":") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    request a;
+    request_init(&a, REQ_CHAT, 128);
+    a.api = API_ANTHROPIC;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) { request_free(&a); return; }
+    TEST_ASSERT(sse_error_event(sv[0], &a, "boom"));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "event: error") != NULL);
+    TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\":{\"type\":\"api_error\"") != NULL);
+    free(out);
+    request_free(&a);
+    close(sv[0]);
+    close(sv[1]);
+
+    request rr;
+    request_init(&rr, REQ_CHAT, 128);
+    rr.api = API_RESPONSES;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) { request_free(&rr); return; }
+    TEST_ASSERT(sse_error_event(sv[0], &rr, "boom"));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "event: error") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"server_error\"") != NULL);   /* OpenAI shape */
+    free(out);
+    request_free(&rr);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -19289,6 +19978,17 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    /* v0.5.6 Inc 0a: frozen projection oracle + route observation. */
+    test_route_decisions_record_current_dispatch();
+    test_tape_openai_chat_stream_projection();
+    test_tape_openai_completion_stream_projection();
+    test_tape_anthropic_stream_projection();
+    test_tape_responses_stream_projection();
+    test_tape_buffered_final_responses();
+    test_cont_completion_stream_negative_fixture();
+    test_idempotency_key_header_is_ignored();
+    test_responses_durable_references_rejected_at_parse();
+    test_error_envelopes_record_current_shapes();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
