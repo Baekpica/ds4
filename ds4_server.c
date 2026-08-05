@@ -12850,7 +12850,23 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
         } else {
             buf_free(&repaired);
         }
-        if (!st->saw_tool_end) *fin_io = "error";
+        if (!st->saw_tool_end) {
+            if (strcmp(*fin_io, "length") == 0) {
+                /* #13 twin (Inc 0b): the token budget cut the call
+                 * mid-emission and repair could not complete it.  Keep the
+                 * honest "length" -- the parse fallback below returns the
+                 * partial call as assistant text and
+                 * tool_parse_failure_recovery_finish preserves the length
+                 * stop, exactly the serial dcc2623 behavior.  Same marker
+                 * substring as the serial log line: finish_reason_gate's
+                 * engagement oracle greps it, and until now it could never
+                 * fire on the lane that actually serves chat+tools. */
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: cont chat tool call cut by token budget; reporting finish=length");
+            } else {
+                *fin_io = "error";
+            }
+        }
     }
     char perr[160] = {0};
     bool recovered = false;
@@ -19806,6 +19822,55 @@ static void test_cont_completion_stream_matches_serial_oracle(void) {
     close(sv[1]);
 }
 
+/* Inc 0b (#13 twin): an unrepairable mid-toolcall budget cut on the cont
+ * lane keeps the honest "length" finish and returns the partial call as
+ * assistant text, mirroring the serial dcc2623 behavior; a non-budget
+ * unterminated block (EOS mid-call) still reports "error".  The live twin
+ * is finish_reason_gate.sh, whose engagement oracle can now fire on the
+ * lane that actually serves chat+tools. */
+static void test_cont_budget_cut_toolcall_keeps_length(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+    job j;
+    memset(&j, 0, sizeof(j));
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.api = API_OPENAI;
+    j.req.has_tools = true;
+    j.req.think_mode = DS4_THINK_NONE;
+
+    cont_stream *st = cont_stream_ensure(&j);
+    const char *cut = "I will check the weather.\n\n" DS4_TOOL_CALLS_START
+                      "\nprose the budget cut before any invoke tag";
+    buf_append(&st->text, cut, strlen(cut));
+    st->saw_tool_start = true;
+
+    const char *fin = "length";
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    cont_resolve_chat(&s, &j, st, &fin, &content, &reasoning, &calls);
+    TEST_ASSERT(!strcmp(fin, "length"));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(content && content[0]);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    content = NULL;
+    reasoning = NULL;
+
+    /* EOS inside an unterminated block is not a budget cut: still "error". */
+    fin = "stop";
+    cont_resolve_chat(&s, &j, st, &fin, &content, &reasoning, &calls);
+    TEST_ASSERT(!strcmp(fin, "error"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    cont_stream_discard(&j);
+    request_free(&j.req);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 /* Contract record: the HTTP reader parses only Content-Length and Accept;
  * an Idempotency-Key header is accepted and silently discarded, so a retry
  * is a NEW generation with new IDs.  Documented unsupported in
@@ -20023,6 +20088,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tape_responses_stream_projection();
     test_tape_buffered_final_responses();
     test_cont_completion_stream_matches_serial_oracle();
+    test_cont_budget_cut_toolcall_keeps_length();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_record_current_shapes();

@@ -103,18 +103,19 @@ default like every other surface.
 4. **Admission accounting drops decode-growth commitments** once a bank's
    prefill lands (the `outstanding` charge covers pending prompt targets
    only); lifetime admission credits land before eligibility broadens.
-5. **The v0.5.5 budget-cut honesty fix (#13) is serial-only.** On the
-   continuous lane — where chat+tools actually routes — a `max_tokens`
-   cut landing inside a tool call either silently repairs to a full
-   `finish="tool_calls"` success or, when unrepairable, reports
-   `finish="error"`; the serial lane reports the honest `length` with
-   the partial call as content and logs
-   "tool call cut by token budget". The two lanes therefore disagree on
-   the same cut, and `finish_reason_gate.sh`'s engagement oracle (that
-   serial log line) cannot fire on a cont-routed run — the gate as
-   written only proves the serial fix. Found by the Inc 0a baseline
-   battery (deterministic fail, reproduced on the tip-parent binary);
-   the cont-side honesty fix and a lane-aware gate oracle belong to the
+5. **FIXED (Inc 0b): the v0.5.5 budget-cut honesty fix (#13) was
+   serial-only.** On the continuous lane — where chat+tools actually
+   routes — an unrepairable `max_tokens` cut inside a tool call
+   reported `finish="error"` (and a repairable one still silently
+   completes to `tool_calls`, matching serial's repair tier). The cont
+   lane now mirrors serial: the finish stays the honest `length`, the
+   partial call returns as assistant content, and the same
+   "tool call cut by token budget" marker is logged — so
+   `finish_reason_gate.sh`'s engagement oracle finally fires on the
+   lane it actually exercises. Found by the Inc 0a baseline battery
+   (deterministic fail, reproduced byte-identical on the tip-parent
+   binary — the gate had never actually proven the cont lane). The
+   full failure-cause taxonomy (stranding, aborts) remains Inc 2
    typed-outcome work.
 
 ## Recorded quirks (current behavior, not upstream-shaped)
