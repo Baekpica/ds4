@@ -2715,29 +2715,24 @@ extern "C" unsigned long long ds4_cuda_fp4_index_read_path_blocks(void);  /* P2 
  * JIT'd from generic PTX.  The build configuration is invisible at runtime,
  * so the mis-built server looks healthy while serving at a third of the
  * speed.  Returns 1 iff the active CUDA device is GB10-class (sm_121) while
- * this ds4_cuda.o was compiled without the full cuda-spark configuration
- * (CUDA_ARCH=sm_121 supplies DS4_CUDA_HAVE_MXF4, the cuda-spark target adds
- * DS4_CUDA_SPARK_HBM_CACHE); the server turns that into a boot advisory. */
-/* 0 = no mismatch (full Spark build, or not a GB10).
+ * this ds4_cuda.o was compiled without the sm_121 arch configuration
+ * (CUDA_ARCH=sm_121 supplies DS4_CUDA_HAVE_MXF4); the server turns that
+ * into a boot advisory. */
+/* 0 = no mismatch (sm_121-arch build, or not a GB10).
  * 1 = fully generic build on a GB10: no sm_121a-native kernels, no MXF4
- *     indexer, no HBM weight cache (e.g. `make cuda CUDA_ARCH=sm_120`,
- *     `make cuda-generic`, or a portable Docker build).
- * 2 = sm_121-arch build missing ONLY the Spark HBM weight cache
- *     (`make cuda CUDA_ARCH=sm_121`: the Makefile's sm_121 branch adds
- *     the sm_121a gencode pair + MXF4 for any target, so the single
- *     define `cuda-spark` adds on top is the whole difference).
- * The split exists because the two shapes have very different costs and
- * the field advisory must not quote the fully-generic penalty at a
- * cache-only build (forum 378855 post 65). */
+ *     indexer (e.g. `make cuda CUDA_ARCH=sm_120`, `make cuda-generic`,
+ *     or a portable Docker build).
+ * The old code 2 (sm_121-arch build missing only the Spark HBM weight
+ * cache, forum 378855 post 65) is EXTINCT as of deepmem lite-2: the
+ * startup span walk is compiled unconditionally and gated at runtime
+ * (integrated device + DS4_CUDA_NO_HBM_CACHE), so `make cuda
+ * CUDA_ARCH=sm_121` and `make cuda-spark` produce the same behavior. */
 extern "C" int ds4_cuda_spark_build_mismatch(void) {
-    int have_mxf4 = 0, have_hbm_cache = 0;
+    int have_mxf4 = 0;
 #if defined(DS4_CUDA_HAVE_MXF4)
     have_mxf4 = 1;
 #endif
-#if defined(DS4_CUDA_SPARK_HBM_CACHE)
-    have_hbm_cache = 1;
-#endif
-    if (have_mxf4 && have_hbm_cache) return 0;
+    if (have_mxf4) return 0;
     int dev = 0;
     cudaDeviceProp prop;
     if (cudaGetDevice(&dev) != cudaSuccess ||
@@ -2746,7 +2741,7 @@ extern "C" int ds4_cuda_spark_build_mismatch(void) {
         return 0;
     }
     if (!(prop.major == 12 && prop.minor == 1)) return 0;
-    return have_mxf4 ? 2 : 1;
+    return 1;
 }
 
 extern "C" int ds4_gpu_init(void) {
@@ -4532,23 +4527,33 @@ extern "C" void ds4_gpu_report_derived_artifacts(void) {
     }
 }
 
+/* Returns 0 = allocation/copy FAILURE, 1 = span POPULATED into a device
+ * copy, 2 = SKIPPED by policy (opt-out, discrete device, budget, already
+ * covered).  deepmem lite-2: compiled unconditionally (the
+ * DS4_CUDA_SPARK_HBM_CACHE compile fork is retired) and defaults ON for
+ * INTEGRATED devices only.  On GB10-class unified memory the deferred
+ * device promotions this pre-pays are exactly the bytes the bank planner
+ * otherwise cannot see (hbm_cache_ab_2026-08-05.md: 29-vs-13-bank
+ * overcommit, admission collapse at depth); on discrete devices the
+ * historical shape is preserved (no startup walk; the lazy fd-cache tier
+ * still promotes on demand).  Callers reporting "prepared" bytes must
+ * count rc==1 only -- the old success/no-op boolean let the boot line
+ * overstate residency by the full attempted total. */
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
-#ifndef DS4_CUDA_SPARK_HBM_CACHE
-    (void)model_map;
-    (void)model_size;
-    (void)offset;
-    (void)bytes;
-    (void)label;
-    return 1;
-#else
-    if (!model_map || bytes == 0) return 1;
+    if (!model_map || bytes == 0) return 2;
     if (offset > model_size || bytes > model_size - offset) return 0;
+    {
+        int dev = 0, integrated = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess)
+            (void)cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
+        if (!integrated) return 2;
+    }
     /* Startup walk: force-populate the device-resident HBM cache so hot
      * tensors hit cudaMalloc copies rather than the UVA-mapped fallback.
      * Skip silently if over budget or opted out — the mapped pointer still
      * works for any tensor we don't pre-cache. */
-    if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 1;
-    if (g_model_device_owned) return 1;
+    if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 2;
+    if (g_model_device_owned) return 2;
     /* Self-load artifacts mode: this map's expert raws live in device
      * artifacts and the whole-model registration was skipped, so the walk
      * must device-copy ALL of its remaining (non-expert) spans — the same
@@ -4557,13 +4562,13 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     const uint64_t limit = cuda_model_map_replaces_complete(model_map)
         ? UINT64_MAX
         : cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) return 1;
+    if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) return 2;
     const char *what = label ? label : "model_tensor";
     /* Skip if this span is already populated. */
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 1;
+        if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 2;
     }
     /* S6 (2026-07-07): coverage dedup vs imported manifest ranges.  WS
      * VMM/IPC imports land in g_model_ranges as LARGE coalesced device
@@ -4586,11 +4591,10 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
                         "range (imported manifest span); skipping duplicate copies\n",
                         what);
             }
-            return 1;
+            return 2;
         }
     }
     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what) != NULL;
-#endif
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {

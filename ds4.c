@@ -1766,7 +1766,12 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
+/* deepmem lite-2: the startup span walk is compiled UNCONDITIONALLY (the
+ * DS4_CUDA_SPARK_HBM_CACHE compile fork is retired); runtime policy lives
+ * in ds4_gpu_cache_model_range (integrated devices only, opt-out
+ * DS4_CUDA_NO_HBM_CACHE).  Eager-before-the-plan is the accounting fix:
+ * these promotions land before the bank fit samples free memory, so any
+ * build plans honestly (the 08-05 29-vs-13-bank divergence class). */
 typedef struct {
     uint64_t off;
     uint64_t end;
@@ -1840,7 +1845,9 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             if (chunk_end - off > max_span) chunk_end = off + max_span;
             char label[96];
             snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-            if (ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
+            const int rc = ds4_gpu_cache_model_range(m->map, m->size, off,
+                                                     chunk_end - off, label);
+            if (rc == 0) {
                 fprintf(stderr,
                         "ds4: accelerator failed to cache model tensor span %" PRIu64
                         " at offset %" PRIu64 "\n",
@@ -1848,7 +1855,11 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
                 free(spans);
                 return false;
             }
-            cached += chunk_end - off;
+            /* Honesty (deepmem lite-2): count only bytes actually POPULATED
+             * (rc==1).  Policy skips (rc==2: opt-out, discrete, budget,
+             * dedup) used to be counted as "prepared", letting the boot
+             * line overstate residency by the whole attempted total. */
+            if (rc == 1) cached += chunk_end - off;
             merged++;
             off = chunk_end;
         }
@@ -1857,7 +1868,6 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     if (cached_out) *cached_out = cached;
     return true;
 }
-#endif
 
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (backend != DS4_BACKEND_CUDA) return true;
@@ -1866,13 +1876,9 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
         return true;
     }
 
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
     const double t0 = now_sec();
     uint64_t cached = 0;
     if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
-#else
-    uint64_t cached = 0;
-#endif
     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -1889,7 +1895,6 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
             }
         }
     }
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
     if (cached != 0) {
         const double t1 = now_sec();
         if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
@@ -1898,9 +1903,6 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
                 (double)cached / 1073741824.0,
                 t1 - t0);
     }
-#else
-    (void)cached;
-#endif
     return true;
 }
 #else

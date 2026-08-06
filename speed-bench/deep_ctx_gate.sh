@@ -97,7 +97,6 @@ SPECARG=""
 [ "$SPEC" = 0 ] && { SPECENV=""; SPECARG="--no-spec"; MTP=""; }
 log "boot: ctx=$CTX coalesce_max=8, lazy serial graph, $([ "$SPEC" = 0 ] && echo plain || echo ship) cont env${EXTRA_ENV:+ + $EXTRA_ENV}"
 ssh "$R" ": > $SRV; cd $RT; env $EXTRA_ENV \
-    DS4_CUDA_NO_HBM_CACHE=1 \
     DS4_BATCH_FIT_HEADROOM_MB=$HEADROOM_MB DS4_SERVER_COALESCE_MAX=8 \
     DS4_CONT_PREFILL_CHUNK=2048 $SPECENV \
     DS4_CONT_CAPTURE=1 DS4_SERVER_DEFAULT_TEMP=0 \

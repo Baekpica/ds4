@@ -14936,40 +14936,20 @@ int main(int argc, char **argv) {
         int ds4_cuda_spark_build_mismatch(void);
         const int mismatch = ds4_cuda_spark_build_mismatch();
         if (mismatch == 1) {
-            /* Fully generic: no sm_121a SASS, no MXF4 indexer, no HBM
-             * weight cache.  Penalty measured in the field (post 48
-             * Docker case): ~1/3 prefill, ~1/2 decode. */
+            /* Fully generic: no sm_121a SASS, no MXF4 indexer.  Penalty
+             * measured in the field (post 48 Docker case): ~1/3 prefill,
+             * ~1/2 decode.  The old mismatch code 2 (sm_121 arch missing
+             * only the HBM weight cache, forum 378855 post 65) is extinct:
+             * deepmem lite-2 compiles the startup span cache
+             * unconditionally and gates it at runtime, so `make cuda
+             * CUDA_ARCH=sm_121` and `make cuda-spark` behave identically
+             * and the 08-05 plan-overcommit class cannot be built. */
             server_log(DS4_LOG_WARNING,
                        "ds4-server: this CUDA device is a GB10 (DGX Spark class, sm_121) but the "
                        "binary is a generic CUDA build -- the Spark fast paths (sm_121a-native "
-                       "kernels, MXF4 indexer, HBM weight cache) are all compiled out. In the "
-                       "field this serves at roughly a THIRD of the prefill speed and HALF the "
-                       "decode speed. Rebuild with `make cuda-spark`.");
-        } else if (mismatch == 2) {
-            /* sm_121-arch build (sm_121a SASS + MXF4 present) missing only
-             * -DDS4_CUDA_SPARK_HBM_CACHE=1 -- the shape every
-             * `make cuda CUDA_ARCH=sm_121` produces (and every ds4-on-spark
-             * install before 2026-08-05 shipped, forum 378855 post 65).
-             * ABBA-measured on GB10 2026-08-05 at MATCHED bank plans
-             * (COALESCE_MAX=8, v0.5.5): kernel speed is IDENTICAL --
-             * prefill +0.65%/decode -0.25%, sign-inconsistent noise.  The
-             * real harm is accounting: without the startup span cache
-             * (~8.2 GiB, charged before the bank plan on spark builds) the
-             * planner sees that much extra free memory and spends it on
-             * banks (29 vs 13 at -c 32768); the same spans then fault in
-             * during serving, the mem floor gate finds usable=0, EVERY cont
-             * admission is refused, and prompts too deep for the
-             * right-sized serial graph 503.  Slower is wrong; broken at
-             * depth is right. */
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: this CUDA device is a GB10 (DGX Spark class, sm_121) and the "
-                       "binary has the sm_121a-native kernels, but the Spark HBM weight cache is "
-                       "compiled out (built with `make cuda CUDA_ARCH=sm_121` instead of "
-                       "`make cuda-spark`). Kernel speed is unaffected, but the boot memory plan "
-                       "cannot charge the cache's ~8 GiB up front: it overcommits the cache-bank "
-                       "budget by that amount, and once the model weights fault in, admissions "
-                       "can be refused outright (503s on deep prompts). Rebuild with "
-                       "`make cuda-spark`.");
+                       "kernels, MXF4 indexer) are compiled out. In the field this serves at "
+                       "roughly a THIRD of the prefill speed and HALF the decode speed. Rebuild "
+                       "with `make cuda-spark`.");
         }
     }
 #endif

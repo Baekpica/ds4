@@ -48,7 +48,12 @@ endif
 endif
 NVCC_EXTRA_FLAGS ?=
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math -std=c++17 $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread $(NVCC_EXTRA_FLAGS)
-CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
+# deepmem lite-2: DS4_CUDA_SPARK_HBM_CACHE is retired.  The startup span
+# cache is compiled unconditionally and gated at runtime (integrated
+# devices only; opt-out DS4_CUDA_NO_HBM_CACHE), so cuda-spark is now purely
+# an arch-selection alias for CUDA_ARCH=sm_121 and the 08-05 installer
+# plan-overcommit class (forum 378855/65) cannot be built.
+CUDA_SPARK_FLAGS :=
 # Include path so cuda/mmq/*.cu can find its sibling vendored headers and
 # the ds4_ggml_stubs shim. The redirected ggml.h / ggml-impl.h / ggml-cuda.h
 # live alongside the vendored common.cuh.
