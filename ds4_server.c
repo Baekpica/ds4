@@ -11761,6 +11761,31 @@ static bool serial_session_ensure_fit(server *s, job *j) {
         }
         usleep(100 * 1000);
     }
+    /* deepmem lite-4 (minimal reclaim): before refusing, let the serial
+     * lane COLLECT from the commons -- free banks' demand-mapped pages
+     * return exactly via trim and their worst case is a re-prefill
+     * (governance LEARNING 7: when two classes contend, fund the
+     * reversible one last).  Minimal form: the fit probe reports no exact
+     * deficit yet (the structured quote is chartered D4), so trim
+     * everything free -- the alternative on this path is a user-visible
+     * 503, and a bank is only free here because no batch row wanted it.
+     * Then re-run the same settle window; a still-unfittable request
+     * refuses exactly as before. */
+    if (!min_fits && s->batch_ctx) {
+        const uint64_t freed = ds4_batch_ctx_trim_free(s->batch_ctx, UINT64_MAX);
+        if (freed) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: serial fit reclaim: trimmed %.1f MiB of free-bank cache "
+                       "for a %d-token serial request",
+                       (double)freed / 1048576.0, j->req.prompt.len);
+            for (int tries = 0; tries < 20 && !min_fits; tries++) {
+                if (ds4_engine_session_graph_fits(s->engine, (int)need_min))
+                    min_fits = true;
+                else
+                    usleep(100 * 1000);
+            }
+        }
+    }
     long target = 0;
     if (min_fits) {
         /* Search bound: what the request could use, plus continuation

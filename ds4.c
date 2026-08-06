@@ -33385,19 +33385,20 @@ static uint64_t ds4_mem_floor_bytes(void) {
  * plan cannot see memory the box lost since boot (another process, the
  * serial lane, page-cache churn -- the ceiling probe drove the box to
  * 0.3 GiB free with zero engine pushback).  UINT64_MAX = no live answer
- * (gate fails open, exactly like the budget refresh path). */
+ * (gate fails open, exactly like the budget refresh path).
+ * deepmem lite-3 (tripwire): the live answer also charges the engine's OWN
+ * certain future -- substrate promotions not yet materialized
+ * (ds4_gpu_substrate_outstanding: ~0 on eager boots, ~8 GiB under the
+ * DS4_CUDA_NO_HBM_CACHE lever).  live-minus-floor is honest about the
+ * PRESENT; without this term it lies about bytes the lazy fd-cache tier is
+ * certain to cudaMalloc mid-serving, which is the deep-503 race
+ * (inc0b_receipt_2026-08-06.md).  One term, one place: every usable()
+ * consumer (floor verdict, serial-reserve clamp, reject prints) inherits. */
 static uint64_t ds4_mem_usable(void) {
     uint64_t lfree = 0, ltotal = 0;
     if (ds4_gpu_mem_info(&lfree, &ltotal) != 0) return UINT64_MAX;
     const uint64_t fl = ds4_mem_floor_bytes();
     uint64_t u = lfree > fl ? lfree - fl : 0;
-    /* deepmem lite-3 (tripwire): also charge the engine's OWN certain
-     * future -- substrate promotions not yet materialized (~0 on eager
-     * boots, ~8 GiB under the DS4_CUDA_NO_HBM_CACHE lever).  Without this
-     * term the live answer lies about bytes the lazy fd-cache tier is
-     * certain to cudaMalloc mid-serving -- the deep-503 race
-     * (inc0b_receipt_2026-08-06.md).  One term, one place: every usable()
-     * consumer (floor verdict, serial-reserve clamp, rejects) inherits. */
     const uint64_t sub = ds4_gpu_substrate_outstanding();
     return u > sub ? u - sub : 0;
 }
@@ -33558,7 +33559,8 @@ static uint64_t ds4_batch_bank_trim_pages(ds4_batch_ctx *ctx, uint32_t b) {
 static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
                                           const uint8_t *live, const uint32_t *pflen,
                                           const uint64_t *credit,
-                                          uint32_t target, int protect, uint64_t want) {
+                                          uint32_t target, int protect, uint64_t want,
+                                          const char *why) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *e = getenv("DS4_BATCH_VMM_TRIM");
@@ -33571,8 +33573,10 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     for (uint32_t i = 0; i < MS; i++) {
         if (i == target || (protect >= 0 && i == (uint32_t)protect)) continue;
         /* Inc 0b: a credited bank's row is committed (pending prefill, live,
-         * or in the pending->live seed window) -- never a trim victim. */
-        if (live[i] || pflen[i] || (credit && credit[i])) continue;
+         * or in the pending->live seed window) -- never a trim victim.
+         * lite-4: NULL arrays = no continuous pass is running (the reclaim
+         * caller), so no bank is live/pending/credited by construction. */
+        if ((live && live[i]) || (pflen && pflen[i]) || (credit && credit[i])) continue;
         order[n++] = i;
     }
     for (uint32_t a = 1; a < n; a++) {         /* insertion sort by victim cost */
@@ -33616,10 +33620,31 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         ctx->trim_banks += nb;
         ctx->trim_bytes += freed;
         fprintf(stderr,
-                "ds4: batch vmm: trimmed %u bank(s), %.1f MiB released under budget pressure\n",
-                nb, (double)freed / 1048576.0);
+                "ds4: batch vmm: trimmed %u bank(s), %.1f MiB released %s\n",
+                nb, (double)freed / 1048576.0,
+                why ? why : "under budget pressure");
     }
     return freed;
+}
+
+/* deepmem lite-4 (minimal reclaim): public context-owned trim for a
+ * non-batch consumer -- the serial lane COLLECTS from the commons instead
+ * of pre-paying for it (governance LEARNING 7: the commons is a cache
+ * whose worst case is a re-prefill and whose pages return exactly).  The
+ * CALLER owns exclusion: the server calls under gen_mu with no continuous
+ * pass running, so no live/pflen/credit arrays exist and every bank is
+ * either floor-resident or a warm record (the cache this spends).  Victim
+ * order and history invalidation are the proven budget-pressure trim's;
+ * server-side warm metadata needs no cleanup because the engine validates
+ * every warm admit against bank history (advisory-matching law).  The
+ * exact-deficit / server-ranked prepare-commit protocol is chartered D4
+ * (revised plan §10); this is the ladder's step 2 pointed at the right
+ * class, nothing more. */
+uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
+    if (!ctx || want_bytes == 0) return 0;
+    return ds4_batch_trim_free_banks(ctx, &ctx->g, NULL, NULL, NULL,
+                                     (uint32_t)ctx->max_seq, -1, want_bytes,
+                                     "for the serial lane (reclaim)");
 }
 
 static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
@@ -35713,7 +35738,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     const uint64_t want = mres + mneed - ctx->comp_map_budget;
                     if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
                                                   (fork || partial) ? (int)fsrc : -1,
-                                                  want) > 0)
+                                                  want, NULL) > 0)
                         mres = ds4_batch_slabs_cache_resident(&ctx->sl);
                 }
                 if (ctx->comp_map_budget != 0 && mneed != 0 &&
@@ -35744,7 +35769,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     if (mneed > usable) {
                         if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
                                                       (fork || partial) ? (int)fsrc : -1,
-                                                      mneed - usable) > 0)
+                                                      mneed - usable, NULL) > 0)
                             usable = ds4_mem_usable_beyond(ctx->serial_reserve);
                     }
                     if (mneed > usable) {

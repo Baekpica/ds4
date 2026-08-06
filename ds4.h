@@ -252,6 +252,16 @@ int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_tota
 int  ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                               ds4_batch_ctx **out, char *err, size_t errlen);
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx);
+/* deepmem lite-4 (minimal reclaim): trim FREE banks' demand-mapped cache
+   pages to recover up to want_bytes for a non-batch consumer (the serial
+   lane).  Context-owned mechanics; the CALLER owns exclusion (the server
+   calls under gen_mu with no continuous pass running).  Victim order:
+   invalid history first, then shortest committed history; a trimmed bank's
+   history is invalidated, so warm admits cannot reuse it (its next tenant
+   cold-resets).  Returns bytes released (also counted in the ctx trim
+   counters and the "batch vmm: trimmed" log line); 0 when nothing is
+   trimmable or DS4_BATCH_VMM_TRIM=0. */
+uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes);
 
 /* deepmem D-1c: page-interval union across per-bank credited spans -- the
  * pure arithmetic under the continuous-admission credit projection
