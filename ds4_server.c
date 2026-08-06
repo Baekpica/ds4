@@ -8214,9 +8214,11 @@ struct server {
     double max_queue_age;        /* seconds a request may wait queued (503 shed) */
     int    queued;
     size_t inflight_body_bytes;
-    /* Inc 3a: Anthropic-buffered-on-continuous kill switch (plan §7; env
-     * DS4_SERVER_CONT_ANTHROPIC, default ON, kept one release). */
+    /* Inc 3a/3b: buffered-promotion kill switches (plan §7; env
+     * DS4_SERVER_CONT_ANTHROPIC / DS4_SERVER_CONT_RESPONSES, default ON,
+     * kept one release). */
     bool   cont_anthropic;
+    bool   cont_responses;
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
@@ -12082,10 +12084,11 @@ static const char *route_reason_names[DS4_METRICS_ROUTE_REASONS] = {
 typedef struct {
     bool coalesce;     /* DS4_SERVER_COALESCE on AND coalesce max > 1 */
     bool have_cont;    /* DS4_SERVER_CONTINUOUS on AND persistent batch ctx exists */
-    /* Inc 3a: Anthropic buffered on the continuous lane -- the plan §7
-     * per-surface kill switch (DS4_SERVER_CONT_ANTHROPIC, default ON, kept
-     * one release). */
+    /* Inc 3a/3b: buffered surface promotions onto the continuous lane --
+     * the plan §7 per-surface kill switches (DS4_SERVER_CONT_ANTHROPIC /
+     * DS4_SERVER_CONT_RESPONSES, default ON, kept one release). */
     bool cont_anthropic;
+    bool cont_responses;
     int  seq_cap;      /* per-bank prompt bound (valid when have_cont) */
     int  prompt_len;
 } ds4_route_env;
@@ -12129,17 +12132,19 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
         d.reason = ROUTE_REASON_CONT_UNAVAILABLE; return d;
     }
     /* 2. Configured lane.  The continuous writer projects OpenAI
-     * chat+completion, and since Inc 3a Anthropic BUFFERED:
+     * chat+completion, and since Inc 3a/3b Anthropic + Responses BUFFERED:
      * write_cont_completion has dispatched through the surface-typed
-     * wire_finish_buffered since Inc 1, rendering the native Anthropic
-     * shape with stop honesty (2c) and engine-verdict usage (2d) -- the
-     * promotion is this routing row, not new projection code.  Anthropic
-     * STREAMING waits for Inc 4 (no cont Anthropic SSE machine);
-     * Responses waits for 3b (identity minting still in the renderer). */
-    const bool cont_anthropic_buffered = env->cont_anthropic &&
-        surf == DS4_WIRE_ANTHROPIC && !(needs & DS4_NEED_STREAMING);
+     * wire_finish_buffered since Inc 1, rendering the native shapes with
+     * stop honesty (2c), client-frame usage (2d/3a), and -- for Responses
+     * -- the same finalize-time reasoning retokenize the serial path does
+     * (3b).  The promotions are these routing rows, not new projection
+     * code.  STREAMING on both surfaces waits for Inc 4 (no cont SSE
+     * machines for them). */
+    const bool cont_promoted_buffered = !(needs & DS4_NEED_STREAMING) &&
+        ((env->cont_anthropic && surf == DS4_WIRE_ANTHROPIC) ||
+         (env->cont_responses && surf == DS4_WIRE_RESPONSES));
     if (surf != DS4_WIRE_OPENAI_CHAT && surf != DS4_WIRE_OPENAI_COMPLETION &&
-        !cont_anthropic_buffered) {
+        !cont_promoted_buffered) {
         d.reason = ROUTE_REASON_SURFACE; return d;
     }
     if (!env->coalesce) { d.reason = ROUTE_REASON_COALESCE_OFF; return d; }
@@ -12710,6 +12715,15 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
         res.recovered = recovered;
         res.prompt_tokens = prompt_tokens;
         res.completion_tokens = emitted;
+        /* Inc 3b: PLAIN buffered rows land here (cont_needs_text rows go
+         * through write_cont_completion, which has the same line) -- the
+         * serial path's finalize retokenize, or a cont-served Responses
+         * response reports reasoning_tokens=0.  Found the hard way: the
+         * first fix patched only the cstream writer, and serial-fallback
+         * contamination on floor-rejecting boots made it look green (the
+         * lane-entry counter counts the failed cont attempt too). */
+        if (ws.surface == DS4_WIRE_RESPONSES)
+            res.reasoning_tokens = reasoning_token_count(s->engine, reasoning);
         wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
         wire_free(&ws);
         free(content);
@@ -13455,6 +13469,7 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
                 ds4_route_env renv = {
                     .coalesce = true, .have_cont = true,
                     .cont_anthropic = s->cont_anthropic,
+                    .cont_responses = s->cont_responses,
                     .seq_cap = cs->seq_cap, .prompt_len = s->head->req.prompt.len,
                 };
                 rd = route_decide(s->head->req.needs,
@@ -13851,6 +13866,11 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         res.calls = &calls;
         res.prompt_tokens = prompt_tokens;
         res.completion_tokens = st->completion;
+        /* Inc 3b: the Responses usage detail the serial path computes at
+         * finalize (generate_job does the same retokenize) -- without it a
+         * cont-served Responses response would report reasoning_tokens=0. */
+        if (ws.surface == DS4_WIRE_RESPONSES)
+            res.reasoning_tokens = reasoning_token_count(s->engine, reasoning);
         wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
         wire_free(&ws);
         free(content);
@@ -14229,6 +14249,7 @@ static void *worker_main(void *arg) {
             .coalesce   = coalesce && cmax > 1,
             .have_cont  = continuous && s->batch_ctx != NULL,
             .cont_anthropic = s->cont_anthropic,
+            .cont_responses = s->cont_responses,
             .seq_cap    = s->batch_ctx ? ds4_batch_ctx_seq_cap(s->batch_ctx) : 0,
             .prompt_len = j->req.prompt.len,
         };
@@ -16114,9 +16135,11 @@ int main(int argc, char **argv) {
         /* v0.5.2 inc3: dead-client abort (see the server struct comment). */
         const char *da = getenv("DS4_SERVER_DISCONNECT_ABORT");
         s.disconnect_abort = !(da && da[0] == '0' && da[1] == '\0');
-        /* Inc 3a: Anthropic buffered on continuous (plan §7 kill switch). */
+        /* Inc 3a/3b: buffered promotions (plan §7 kill switches). */
         const char *ca = getenv("DS4_SERVER_CONT_ANTHROPIC");
         s.cont_anthropic = !(ca && ca[0] == '0' && ca[1] == '\0');
+        const char *cr = getenv("DS4_SERVER_CONT_RESPONSES");
+        s.cont_responses = !(cr && cr[0] == '0' && cr[1] == '\0');
     }
     {
         /* Inc 2e admission bounds (plan §4.8 + §5); 0 disables a bound.
@@ -20752,16 +20775,16 @@ static int route_legacy_oracle(const request *r, bool coalesce_on,
     return ROUTE_LANE_SERIAL;
 }
 
-/* Inc 3a: the expected table is the LEGACY tree plus EXACTLY ONE promotion
- * -- Anthropic buffered non-tool rides continuous when it fits (no static
- * fallback until 3c; token-id echo keeps its streaming-chat-only projection
- * constraint).  Everything else must stay bit-identical to the legacy
- * oracle, which is the strongest statement of "no other request changed
- * lane". */
+/* Inc 3a/3b: the expected table is the LEGACY tree plus EXACTLY the two
+ * buffered promotions -- Anthropic (3a) and Responses (3b) non-tool
+ * buffered ride continuous when they fit (no static fallback until 3c;
+ * token-id echo keeps its streaming-chat-only projection constraint).
+ * Everything else must stay bit-identical to the legacy oracle, which is
+ * the strongest statement of "no other request changed lane". */
 static int route_expected_oracle(const request *r, bool coalesce_on,
                                  bool have_cont, int seq_cap) {
     const uint32_t needs = request_compute_needs(r);
-    if (coalesce_on && r->api == API_ANTHROPIC &&
+    if (coalesce_on && (r->api == API_ANTHROPIC || r->api == API_RESPONSES) &&
         (needs & ~ROUTE_CONT_MASK) == 0 &&
         !(needs & (DS4_NEED_STREAMING | DS4_NEED_TOKEN_IDS)) &&
         have_cont && r->prompt.len > 0 && r->prompt.len <= seq_cap)
@@ -20812,15 +20835,16 @@ static void test_route_decide_matches_legacy_exhaustive(void) {
             for (size_t ei = 0; ei < sizeof(envs) / sizeof(envs[0]); ei++) {
                 ds4_route_env env = {
                     .coalesce = envs[ei].coalesce, .have_cont = envs[ei].have_cont,
-                    .cont_anthropic = true,
+                    .cont_anthropic = true, .cont_responses = true,
                     .seq_cap = 4096, .prompt_len = lens[li],
                 };
                 ds4_route_decision d = route_decide(needs, wire_surface_for(&r), &env);
                 TEST_ASSERT(d.lane != ROUTE_LANE_NONE);
                 TEST_ASSERT(d.lane == route_expected_oracle(&r, envs[ei].coalesce,
                                                             envs[ei].have_cont, 4096));
-                /* The §7 kill switch restores the LEGACY table exactly. */
+                /* The §7 kill switches restore the LEGACY table exactly. */
                 env.cont_anthropic = false;
+                env.cont_responses = false;
                 d = route_decide(needs, wire_surface_for(&r), &env);
                 TEST_ASSERT(d.lane == route_legacy_oracle(&r, envs[ei].coalesce,
                                                           envs[ei].have_cont, 4096));
@@ -20836,12 +20860,13 @@ static void test_route_decide_matches_legacy_exhaustive(void) {
 /* Inc 2a, plan §6.2: exact {lane, first-reason} rows for the canonical
  * shapes -- the refusal/fallback reason is contract now, not just the lane. */
 static void test_route_decide_reason_table(void) {
-    const ds4_route_env on     = { .coalesce = true,  .have_cont = true,  .cont_anthropic = true, .seq_cap = 4096, .prompt_len = 16 };
-    const ds4_route_env no_ctx = { .coalesce = true,  .have_cont = false, .cont_anthropic = true, .seq_cap = 0,    .prompt_len = 16 };
-    const ds4_route_env off    = { .coalesce = false, .have_cont = true,  .cont_anthropic = true, .seq_cap = 4096, .prompt_len = 16 };
+    const ds4_route_env on     = { .coalesce = true,  .have_cont = true,  .cont_anthropic = true, .cont_responses = true, .seq_cap = 4096, .prompt_len = 16 };
+    const ds4_route_env no_ctx = { .coalesce = true,  .have_cont = false, .cont_anthropic = true, .cont_responses = true, .seq_cap = 0,    .prompt_len = 16 };
+    const ds4_route_env off    = { .coalesce = false, .have_cont = true,  .cont_anthropic = true, .cont_responses = true, .seq_cap = 4096, .prompt_len = 16 };
     ds4_route_env big = on;   big.prompt_len = 4097;
     ds4_route_env empty = on; empty.prompt_len = 0;
     ds4_route_env anth_off = on; anth_off.cont_anthropic = false;
+    ds4_route_env resp_off = on; resp_off.cont_responses = false;
     ds4_route_decision d;
 
     d = route_decide(0, DS4_WIRE_OPENAI_CHAT, &on);
@@ -20878,10 +20903,20 @@ static void test_route_decide_reason_table(void) {
     TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
     d = route_decide(0, DS4_WIRE_ANTHROPIC, &anth_off);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
-    /* Anthropic STREAMING = the Inc 4 gap; Responses = the 3b gap. */
-    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_ANTHROPIC, &on);
-    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
+    /* Inc 3b: Responses BUFFERED rides continuous; its kill switch is
+     * independent of Anthropic's. */
     d = route_decide(0, DS4_WIRE_RESPONSES, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_THINKING | DS4_NEED_PER_ROW_SAMPLING, DS4_WIRE_RESPONSES, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(0, DS4_WIRE_RESPONSES, &resp_off);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
+    d = route_decide(0, DS4_WIRE_ANTHROPIC, &resp_off);   /* switches are per-surface */
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(0, DS4_WIRE_RESPONSES, &anth_off);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    /* STREAMING on both promoted surfaces = the Inc 4 gap. */
+    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_ANTHROPIC, &on);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
     d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_RESPONSES, &on);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
@@ -20890,6 +20925,8 @@ static void test_route_decide_reason_table(void) {
     d = route_decide(0, DS4_WIRE_ANTHROPIC, &big);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
     d = route_decide(0, DS4_WIRE_ANTHROPIC, &no_ctx);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+    d = route_decide(0, DS4_WIRE_RESPONSES, &big);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
     /* semantic requirements fire before the surface gap, lowest bit first */
     d = route_decide(DS4_NEED_TOOL_SCAN | DS4_NEED_CONTINUATION_PUBLISH |
