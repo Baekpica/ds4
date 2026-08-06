@@ -37,6 +37,10 @@
 #     EXTRA_ENV="DS4_CUDA_FP8_KV=1 DS4_CUDA_FP4_INDEX=1" for the >1M levers
 #   SPEC (1) — SPEC=0 boots plain (--no-spec --no-mtp, no DSpark env): the
 #     plain-decode cost reference at depth; PASS criteria are unchanged
+#   ZEROCONF (0) — ZEROCONF=1 drops the HEADROOM_MB/COALESCE_MAX pins so the
+#     boot fits banks with the SHIPPED defaults (deepmem lite charter:
+#     "default tested as shipped").  The unpinned fit is the thing under
+#     test; PASS criteria are unchanged.  Default 0 = ship-env control.
 set -uo pipefail
 
 R=${DC_GATE_HOST:-sync-192_168_88_33}
@@ -51,6 +55,7 @@ OUT=${DC_GATE_OUT:-/tmp/deep_ctx_gate_$(date +%Y%m%d_%H%M%S)}
 GGUF=${GGUF:-/home/ent/gguf}
 EXTRA_ENV=${EXTRA_ENV:-}
 SPEC=${SPEC:-1}
+ZEROCONF=${ZEROCONF:-0}
 BASE=$GGUF/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
 MTP=${MTP-$GGUF/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf}   # MTP="" boots --no-mtp (MTP-droppable legs; blocks launch-default auto-attach)
 DRAFTER=$GGUF/DSpark-drafter-Q2K-Q8.gguf
@@ -95,9 +100,11 @@ ssh "$R" "prev=\$(awk '/MemAvailable/{print \$2}' /proc/meminfo); i=0
 SPECENV="DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1 DS4_DSPARK_MODEL=$DRAFTER"
 SPECARG=""
 [ "$SPEC" = 0 ] && { SPECENV=""; SPECARG="--no-spec"; MTP=""; }
-log "boot: ctx=$CTX coalesce_max=8, lazy serial graph, $([ "$SPEC" = 0 ] && echo plain || echo ship) cont env${EXTRA_ENV:+ + $EXTRA_ENV}"
+PINS="DS4_BATCH_FIT_HEADROOM_MB=$HEADROOM_MB DS4_SERVER_COALESCE_MAX=8"
+[ "$ZEROCONF" = 1 ] && PINS=""
+log "boot: ctx=$CTX $([ "$ZEROCONF" = 1 ] && echo 'ZEROCONF (shipped-default fit)' || echo coalesce_max=8), lazy serial graph, $([ "$SPEC" = 0 ] && echo plain || echo ship) cont env${EXTRA_ENV:+ + $EXTRA_ENV}"
 ssh "$R" ": > $SRV; cd $RT; env $EXTRA_ENV \
-    DS4_BATCH_FIT_HEADROOM_MB=$HEADROOM_MB DS4_SERVER_COALESCE_MAX=8 \
+    $PINS \
     DS4_CONT_PREFILL_CHUNK=2048 $SPECENV \
     DS4_CONT_CAPTURE=1 DS4_SERVER_DEFAULT_TEMP=0 \
     setsid nohup ./ds4-server -m $BASE $SPECARG ${MTP:+--mtp} ${MTP:---no-mtp} --cuda -c $CTX --port $PORT \
