@@ -561,6 +561,21 @@ typedef struct {
 } block_q4_K;
 
 typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qh[QK_K / 8];
+    uint8_t  qs[QK_K / 2];
+} block_q5_K;
+
+typedef struct {
+    uint8_t ql[QK_K / 2];
+    uint8_t qh[QK_K / 4];
+    int8_t  scales[QK_K / 16];
+    uint16_t d;
+} block_q6_K;
+
+typedef struct {
     float   d;
     int8_t  qs[QK_K];
     int16_t bsums[QK_K / 16];
@@ -575,6 +590,8 @@ typedef struct {
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q3_k_size, sizeof(block_q3_K) == 110);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
+DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
+DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 
@@ -2987,6 +3004,28 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
 #endif
 }
 
+static inline float q2_k_value_f32(const block_q2_K *blocks, uint32_t k) {
+    const uint32_t block = k / QK_K;
+    const uint32_t idx = k - block * QK_K;
+    const block_q2_K *xb = blocks + block;
+    const uint32_t group = idx / 16u;
+    const uint32_t l = idx - group * 16u;
+    const uint32_t q_base = 32u * (group / 8u) + 16u * (group & 1u);
+    const uint32_t shift = ((group / 2u) & 3u) * 2u;
+    const uint32_t q = ((uint32_t)xb->qs[q_base + l] >> shift) & 0x03u;
+    const uint32_t sc = xb->scales[group];
+    return f16_to_f32(xb->d) * (float)(sc & 0x0fu) * (float)q -
+           f16_to_f32(xb->dmin) * (float)(sc >> 4u);
+}
+
+static float ds4_vec_dot_q2_K_f32(int n, const block_q2_K *x, const float *y) {
+    float sum = 0.0f;
+    for (int k = 0; k < n; k++) {
+        sum += q2_k_value_f32(x, (uint32_t)k) * y[k];
+    }
+    return sum;
+}
+
 /* Q3_K stores sixteen signed six-bit sub-block scales across 12 bytes. */
 static inline void q3_k_unpack_scales(const block_q3_K *xb, int8_t out[16]) {
     const uint32_t kmask1 = 0x03030303u;
@@ -3028,6 +3067,133 @@ static float ds4_vec_dot_q3_K_f32(int n, const block_q3_K *x, const float *y) {
         sum += q3_k_value_f32(x, (uint32_t)k) * y[k];
     }
     return sum;
+}
+
+static inline void q4_k_get_scale_min(
+        int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+static float ds4_vec_dot_q4_K_f32(int n, const block_q4_K *x, const float *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const float dmin = f16_to_f32(x[i].dmin);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *scales = x[i].scales;
+        const float *yb = y + (uint64_t)i * QK_K;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, scales, &sc_val, &m_val);
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+            const float scale = d * (float)sc_val;
+            const float minv = dmin * (float)m_val;
+            for (int l = 0; l < 32; l++) {
+                const int q = (qs[byte_off + l] >> shift) & 0x0f;
+                sumf += (scale * (float)q - minv) * yb[j * 32 + l];
+            }
+        }
+    }
+    return sumf;
+}
+
+static float ds4_vec_dot_q5_K_f32(int n, const block_q5_K *x, const float *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const float dmin = f16_to_f32(x[i].dmin);
+        const uint8_t *ql = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *scales = x[i].scales;
+        const float *yb = y + (uint64_t)i * QK_K;
+        for (int group = 0; group < QK_K / 32; group++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(group, scales, &sc_val, &m_val);
+            const int ql_base = (group >> 1) * 32;
+            const int shift = (group & 1) * 4;
+            const uint8_t hmask = (uint8_t)(1u << group);
+            const float scale = d * (float)sc_val;
+            const float minv = dmin * (float)m_val;
+            for (int l = 0; l < 32; l++) {
+                const int q = ((ql[ql_base + l] >> shift) & 0x0f) +
+                              ((qh[l] & hmask) ? 16 : 0);
+                sumf += (scale * (float)q - minv) * yb[group * 32 + l];
+            }
+        }
+    }
+    return sumf;
+}
+
+static float ds4_vec_dot_q6_K_f32(int n, const block_q6_K *x, const float *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *scales = x[i].scales;
+        const float *yb = y + (uint64_t)i * QK_K;
+        for (int n128 = 0; n128 < QK_K; n128 += 128) {
+            for (int l = 0; l < 32; l++) {
+                const int is = l / 16;
+                const int q1 = ((int)(ql[l] & 0x0f) |
+                                (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = ((int)(ql[l + 32] & 0x0f) |
+                                (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = ((int)(ql[l] >> 4) |
+                                (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = ((int)(ql[l + 32] >> 4) |
+                                (((qh[l] >> 6) & 3) << 4)) - 32;
+                sumf += d * (float)scales[is] * (float)q1 * yb[n128 + l];
+                sumf += d * (float)scales[is + 2] * (float)q2 * yb[n128 + l + 32];
+                sumf += d * (float)scales[is + 4] * (float)q3 * yb[n128 + l + 64];
+                sumf += d * (float)scales[is + 6] * (float)q4 * yb[n128 + l + 96];
+            }
+            ql += 64;
+            qh += 32;
+            scales += 8;
+        }
+    }
+    return sumf;
+}
+
+static float ds4_vec_dot_iq2_xxs_f32(
+        int n, const block_iq2_xxs *x, const float *y) {
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    uint32_t aux32[2];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint16_t *q2 = x[i].qs;
+        const float *yb = y + (uint64_t)i * QK_K;
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+            q2 += 4;
+            const float scale = 0.125f * d *
+                                (float)(2u * (aux32[1] >> 28) + 1u);
+            const uint32_t base = (uint32_t)ib32 * 32u;
+            for (int l = 0; l < 4; l++) {
+                const uint32_t sign_idx = (aux32[1] >> (7 * l)) & 127u;
+                const int8_t *grid = iq2xxs_signed_grid[aux8[l]][sign_idx];
+                const float *yf = yb + base + (uint32_t)l * 8u;
+                for (int j = 0; j < 8; j++) {
+                    sumf += scale * (float)grid[j] * yf[j];
+                }
+            }
+        }
+    }
+    return sumf;
 }
 
 static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const block_q8_K *y) {
@@ -3626,8 +3792,10 @@ static void tensor_expect_routed_expert(
     }
 }
 
+/* Only DeepSeek4 has the hyper-connection output head; GLM and K-EXAONE carry
+ * a plain norm + projection. */
 static bool weights_have_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         return w && w->output_norm && w->output;
     }
     return w &&
@@ -3639,7 +3807,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 }
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         return w && (w->output_norm || w->output);
     }
     return w &&
@@ -10876,6 +11044,415 @@ static void output_logits_one_decode_scratch(
         const ds4_weights      * weights,
         const float            * inp_hc,
         ds4_cpu_decode_scratch * scratch);
+
+/* =========================================================================
+ * K-EXAONE (exaone-moe) CPU reference forward
+ * =========================================================================
+ *
+ * Deliberately separate from the DeepSeek4/GLM path above: that one is built
+ * around MLA (LoRA-compressed Q/KV, a sparse indexer, hyper-connections and
+ * FP8 KV rows), none of which K-EXAONE has. This is plain GQA with per-head
+ * QK-norm, so sharing the code would mean threading "is this MLA?" through
+ * every step. Correctness first -- this path is the oracle the Blackwell
+ * kernels get checked against, so it is written for clarity, not speed.
+ *
+ * Three details are easy to get wrong and produce plausible-looking garbage:
+ *
+ *   1. RoPE is applied on sliding-window layers ONLY. Every fourth layer is
+ *      full-attention *and* has no positional encoding at all (NoPE). The
+ *      "LLLG" schedule is local+RoPE / global+NoPE, not just a window change.
+ *   2. RoPE is NeoX-style: element i pairs with i + n_rot/2, not with i+1.
+ *   3. QK-norm runs before RoPE, per head, over head_dim -- not over n_embd.
+ *
+ * All three are taken from llama.cpp's exaone-moe graph, which is the
+ * reference implementation for this architecture.
+ */
+
+/* Dot one weight row with an f32 activation vector, for the quant types the
+ * exaone-moe recipe can emit. */
+static inline float dot_q8_0_row_f32_ref(
+        const uint8_t *row,
+        const float   *x,
+        uint64_t       in_dim,
+        uint64_t       blocks) {
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; b++) {
+        uint16_t scale_bits;
+        memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
+        const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
+        const float d = f16_to_f32(scale_bits);
+        const uint64_t i0 = b * 32;
+        const uint64_t n = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        for (uint64_t i = 0; i < n; i++) {
+            acc += d * (float)qs[i] * x[i0 + i];
+        }
+    }
+    return acc;
+}
+
+static float exaone_row_dot(const ds4_model *m, const ds4_tensor *w,
+                            uint64_t row, const float *x) {
+    const uint64_t n = w->dim[0];
+    const gguf_type_info *ti = &gguf_types[w->type];
+    if (ti->block_elems == 0) ds4_die("exaone reference: unknown tensor type");
+    const uint64_t row_bytes = n / ti->block_elems * ti->block_bytes;
+    const uint8_t *p = (const uint8_t *)tensor_data(m, w) + row * row_bytes;
+
+    switch (w->type) {
+        case DS4_TENSOR_F32: {
+            const float *f = (const float *)p;
+            float s = 0.0f;
+            for (uint64_t i = 0; i < n; i++) s += f[i] * x[i];
+            return s;
+        }
+        case DS4_TENSOR_Q8_0:
+            return dot_q8_0_row_f32_ref(p, x, n, (n + 31) / 32);
+        case DS4_TENSOR_Q2_K:
+            return ds4_vec_dot_q2_K_f32((int)n, (const block_q2_K *)p, x);
+        case DS4_TENSOR_Q3_K:
+            return ds4_vec_dot_q3_K_f32((int)n, (const block_q3_K *)p, x);
+        case DS4_TENSOR_Q4_K:
+            return ds4_vec_dot_q4_K_f32((int)n, (const block_q4_K *)p, x);
+        case DS4_TENSOR_Q5_K:
+            return ds4_vec_dot_q5_K_f32((int)n, (const block_q5_K *)p, x);
+        case DS4_TENSOR_Q6_K:
+            return ds4_vec_dot_q6_K_f32((int)n, (const block_q6_K *)p, x);
+        case DS4_TENSOR_IQ2_XXS:
+            return ds4_vec_dot_iq2_xxs_f32((int)n, (const block_iq2_xxs *)p, x);
+        default:
+            ds4_die("exaone reference: tensor type not supported by the recipe");
+            return 0.0f;
+    }
+}
+
+static void exaone_linear(float *out, const ds4_model *m, const ds4_tensor *w,
+                          const float *x) {
+    for (uint64_t r = 0; r < w->dim[1]; r++) out[r] = exaone_row_dot(m, w, r, x);
+}
+
+/* Expert tensors are 3-D [in, out, n_expert]; expert e owns rows
+ * [e*out, (e+1)*out). */
+static void exaone_linear_expert(float *out, const ds4_model *m,
+                                 const ds4_tensor *w, uint32_t e, const float *x) {
+    const uint64_t n_out = w->dim[1];
+    for (uint64_t r = 0; r < n_out; r++) {
+        out[r] = exaone_row_dot(m, w, (uint64_t)e * n_out + r, x);
+    }
+}
+
+static void exaone_rmsnorm(float *out, const float *x, const ds4_model *m,
+                           const ds4_tensor *w, uint64_t n) {
+    rms_norm_weight(out, x, (const float *)tensor_data(m, w), n, DS4_RMS_EPS);
+}
+
+/* NeoX rotary: the head is split in half and element i is rotated against
+ * i + half, unlike the "normal" variant that pairs adjacent elements. */
+static void exaone_rope_neox(float *v, uint32_t n_heads, uint32_t head_dim,
+                             uint32_t n_rot, uint32_t pos, float freq_base) {
+    const uint32_t half = n_rot / 2;
+    for (uint32_t h = 0; h < n_heads; h++) {
+        float *p = v + (size_t)h * head_dim;
+        for (uint32_t i = 0; i < half; i++) {
+            const float theta = (float)pos *
+                powf(freq_base, -2.0f * (float)i / (float)n_rot);
+            const float c = cosf(theta), s = sinf(theta);
+            const float a = p[i], b = p[i + half];
+            p[i]        = a * c - b * s;
+            p[i + half] = a * s + b * c;
+        }
+    }
+}
+
+/* Per-head RMSNorm over head_dim. The QK-norm weights are head_dim long, not
+ * n_embd, so the same vector is reused across every head. */
+static void exaone_qk_norm(float *v, uint32_t n_heads, uint32_t head_dim,
+                           const ds4_model *m, const ds4_tensor *w) {
+    const float *g = (const float *)tensor_data(m, w);
+    for (uint32_t h = 0; h < n_heads; h++) {
+        float *p = v + (size_t)h * head_dim;
+        rms_norm_weight(p, p, g, head_dim, DS4_RMS_EPS);
+    }
+}
+
+/* Plain GQA KV cache: contiguous K and V rows of n_head_kv * head_dim. */
+typedef struct {
+    float   *k;
+    float   *v;
+    uint32_t n;
+    uint32_t cap;
+} exaone_kv_layer;
+
+typedef struct {
+    exaone_kv_layer layer[DS4_MAX_LAYER];
+    uint32_t        cap;
+} exaone_kv_cache;
+
+static void exaone_kv_cache_init(exaone_kv_cache *c, uint32_t cap) {
+    memset(c, 0, sizeof(*c));
+    c->cap = cap;
+    const size_t row = (size_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        c->layer[il].cap = cap;
+        c->layer[il].k = xcalloc((size_t)cap * row, sizeof(float));
+        c->layer[il].v = xcalloc((size_t)cap * row, sizeof(float));
+    }
+}
+
+static void exaone_kv_cache_free(exaone_kv_cache *c) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        free(c->layer[il].k);
+        free(c->layer[il].v);
+    }
+    memset(c, 0, sizeof(*c));
+}
+
+static bool exaone_layer_is_sliding(uint32_t il) {
+    /* LLLG: full attention on every n_swa_period-th layer. */
+    return (il % DS4_N_SWA_PERIOD) != DS4_N_SWA_PERIOD - 1u;
+}
+
+static void exaone_attn_one(float *out, const ds4_model *m,
+                            const ds4_layer_weights *l, exaone_kv_layer *kv,
+                            const float *x_norm, uint32_t il, uint32_t pos) {
+    const uint32_t hd     = DS4_N_HEAD_DIM;
+    const uint32_t n_h    = DS4_N_HEAD;
+    const uint32_t n_kv_h = DS4_N_HEAD_KV;
+    const uint32_t q_dim  = n_h * hd;
+    const uint32_t kv_dim = n_kv_h * hd;
+
+    float *q = xmalloc((size_t)q_dim * sizeof(float));
+    float *k = xmalloc((size_t)kv_dim * sizeof(float));
+    float *v = xmalloc((size_t)kv_dim * sizeof(float));
+
+    exaone_linear(q, m, l->attn_q, x_norm);
+    exaone_linear(k, m, l->attn_k, x_norm);
+    exaone_linear(v, m, l->attn_v, x_norm);
+
+    if (DS4_USE_QK_NORM) {
+        exaone_qk_norm(q, n_h,    hd, m, l->attn_q_norm);
+        exaone_qk_norm(k, n_kv_h, hd, m, l->attn_k_norm);
+    }
+
+    const bool sliding = exaone_layer_is_sliding(il);
+    if (sliding) {
+        exaone_rope_neox(q, n_h,    hd, DS4_N_ROT, pos, DS4_ROPE_FREQ_BASE);
+        exaone_rope_neox(k, n_kv_h, hd, DS4_N_ROT, pos, DS4_ROPE_FREQ_BASE);
+    }
+
+    if (kv->n >= kv->cap) ds4_die("exaone reference: KV cache overflow");
+    memcpy(kv->k + (size_t)kv->n * kv_dim, k, kv_dim * sizeof(float));
+    memcpy(kv->v + (size_t)kv->n * kv_dim, v, kv_dim * sizeof(float));
+    kv->n++;
+
+    /* llama.cpp masks when p1 - p0 >= n_swa, so the window is the most recent
+     * n_swa positions including the current one. */
+    uint32_t first = 0;
+    if (sliding && pos + 1u > DS4_N_SWA) first = pos + 1u - DS4_N_SWA;
+
+    const float scale = 1.0f / sqrtf((float)hd);
+    const uint32_t group = n_h / n_kv_h;   /* query heads per KV head */
+    float *heads = xcalloc((size_t)q_dim, sizeof(float));
+    float *score = xmalloc((size_t)kv->n * sizeof(float));
+
+    for (uint32_t h = 0; h < n_h; h++) {
+        const float *qh = q + (size_t)h * hd;
+        const uint32_t kvh = h / group;
+        float maxv = -INFINITY;
+        for (uint32_t t = first; t < kv->n; t++) {
+            const float *kh = kv->k + (size_t)t * kv_dim + (size_t)kvh * hd;
+            float s = 0.0f;
+            for (uint32_t i = 0; i < hd; i++) s += qh[i] * kh[i];
+            s *= scale;
+            score[t] = s;
+            if (s > maxv) maxv = s;
+        }
+        float sum = 0.0f;
+        for (uint32_t t = first; t < kv->n; t++) {
+            score[t] = expf(score[t] - maxv);
+            sum += score[t];
+        }
+        const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+        float *oh = heads + (size_t)h * hd;
+        for (uint32_t t = first; t < kv->n; t++) {
+            const float w = score[t] * inv;
+            const float *vh = kv->v + (size_t)t * kv_dim + (size_t)kvh * hd;
+            for (uint32_t i = 0; i < hd; i++) oh[i] += w * vh[i];
+        }
+    }
+
+    exaone_linear(out, m, l->attn_output, heads);
+
+    free(score); free(heads); free(v); free(k); free(q);
+}
+
+static void exaone_swiglu(float *out, const ds4_model *m,
+                          const ds4_tensor *w_gate, const ds4_tensor *w_up,
+                          const ds4_tensor *w_down, const float *x) {
+    const uint64_t n_ff = w_gate->dim[1];
+    float *g = xmalloc((size_t)n_ff * sizeof(float));
+    float *u = xmalloc((size_t)n_ff * sizeof(float));
+    exaone_linear(g, m, w_gate, x);
+    exaone_linear(u, m, w_up, x);
+    for (uint64_t i = 0; i < n_ff; i++) g[i] = silu(g[i]) * u[i];
+    exaone_linear(out, m, w_down, g);
+    free(u); free(g);
+}
+
+/* Router semantics, matching llama.cpp's build_moe_ffn exactly:
+ *   probs      = sigmoid(gate_inp @ x)
+ *   selection  = top_k(probs + exp_probs_b)      <- bias steers selection only
+ *   weights    = probs[selection]                <- taken UNBIASED
+ *   weights   /= max(sum(weights), 6.103515625e-5)
+ *   weights   *= routed_scaling_factor
+ * Folding the bias into the weights instead would keep the same experts and
+ * still change every output, which is why it is spelled out here. */
+/* Diagnostic capture of router decisions. When these point at buffers sized
+ * [n_layer][n_expert_used], every MoE layer records what it selected and with
+ * what weight, which is what the reference fixture compares against. Null in
+ * the release path. */
+static uint32_t *g_exaone_router_sel = NULL;
+static float    *g_exaone_router_w   = NULL;
+
+static void exaone_moe_ffn_one(float *out, const ds4_model *m,
+                               const ds4_layer_weights *l, const float *x,
+                               uint32_t il) {
+    const uint32_t n_exp  = DS4_N_EXPERT;
+    const uint32_t n_used = DS4_N_EXPERT_USED;
+    const uint64_t n_embd = DS4_N_EMBD;
+
+    float *probs = xmalloc((size_t)n_exp * sizeof(float));
+    exaone_linear(probs, m, l->ffn_gate_inp, x);
+    for (uint32_t e = 0; e < n_exp; e++) probs[e] = sigmoid_stable(probs[e]);
+
+    const float *bias = l->ffn_exp_probs_b
+        ? (const float *)tensor_data(m, l->ffn_exp_probs_b) : NULL;
+
+    uint32_t *sel = xmalloc((size_t)n_used * sizeof(uint32_t));
+    bool *taken = xcalloc(n_exp, sizeof(bool));
+    for (uint32_t i = 0; i < n_used; i++) {
+        int best = -1;
+        float best_v = -INFINITY;
+        for (uint32_t e = 0; e < n_exp; e++) {
+            if (taken[e]) continue;
+            const float v = bias ? probs[e] + bias[e] : probs[e];
+            if (v > best_v) { best_v = v; best = (int)e; }
+        }
+        sel[i] = (uint32_t)best;
+        taken[best] = true;
+    }
+    free(taken);
+
+    float *w = xmalloc((size_t)n_used * sizeof(float));
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_used; i++) { w[i] = probs[sel[i]]; sum += w[i]; }
+    /* norm_topk_prob is unconditional here: config_validate_exaone_moe_model
+     * rejects a GGUF whose expert_weights_norm is not true, so reaching this
+     * point means it is. The clamp matches llama.cpp's, which guards against a
+     * zero sum. */
+    {
+        const float denom = sum > 6.103515625e-5f ? sum : 6.103515625e-5f;
+        for (uint32_t i = 0; i < n_used; i++) w[i] /= denom;
+    }
+    if (g_exaone_router_sel) {
+        /* recorded before the 2.5 scaling so it lines up with llama.cpp's
+         * ffn_moe_weights_norm, which is dumped at the same point */
+        for (uint32_t i = 0; i < n_used; i++) {
+            g_exaone_router_sel[(size_t)il * n_used + i] = sel[i];
+            g_exaone_router_w[(size_t)il * n_used + i] = w[i];
+        }
+    }
+    for (uint32_t i = 0; i < n_used; i++) w[i] *= DS4_EXPERT_WEIGHT_SCALE;
+
+    const uint64_t n_ff_exp = l->ffn_gate_exps->dim[1];
+    float *g = xmalloc((size_t)n_ff_exp * sizeof(float));
+    float *u = xmalloc((size_t)n_ff_exp * sizeof(float));
+    float *e_out = xmalloc((size_t)n_embd * sizeof(float));
+
+    memset(out, 0, (size_t)n_embd * sizeof(float));
+    for (uint32_t i = 0; i < n_used; i++) {
+        const uint32_t e = sel[i];
+        exaone_linear_expert(g, m, l->ffn_gate_exps, e, x);
+        exaone_linear_expert(u, m, l->ffn_up_exps,   e, x);
+        for (uint64_t j = 0; j < n_ff_exp; j++) g[j] = silu(g[j]) * u[j];
+        exaone_linear_expert(e_out, m, l->ffn_down_exps, e, g);
+        for (uint64_t j = 0; j < n_embd; j++) out[j] += w[i] * e_out[j];
+    }
+
+    /* the shared expert runs for every token and is added unweighted */
+    exaone_swiglu(e_out, m, l->ffn_gate_shexp, l->ffn_up_shexp, l->ffn_down_shexp, x);
+    for (uint64_t j = 0; j < n_embd; j++) out[j] += e_out[j];
+
+    free(e_out); free(u); free(g); free(w); free(sel); free(probs);
+}
+
+static void exaone_layer_one(float *x, const ds4_model *m,
+                             const ds4_layer_weights *l, exaone_kv_layer *kv,
+                             uint32_t il, uint32_t pos) {
+    const uint64_t n_embd = DS4_N_EMBD;
+    float *norm = xmalloc((size_t)n_embd * sizeof(float));
+    float *tmp  = xmalloc((size_t)n_embd * sizeof(float));
+
+    exaone_rmsnorm(norm, x, m, l->attn_norm, n_embd);
+    exaone_attn_one(tmp, m, l, kv, norm, il, pos);
+    for (uint64_t i = 0; i < n_embd; i++) x[i] += tmp[i];
+
+    exaone_rmsnorm(norm, x, m, l->ffn_norm, n_embd);
+    if (l->ffn_gate_exps) {
+        exaone_moe_ffn_one(tmp, m, l, norm, il);
+    } else {
+        exaone_swiglu(tmp, m, l->ffn_gate, l->ffn_up, l->ffn_down, norm);
+    }
+    for (uint64_t i = 0; i < n_embd; i++) x[i] += tmp[i];
+
+    free(tmp); free(norm);
+}
+
+/* One token through the 48 transformer layers. The MTP block at blk.48 is not
+ * part of this pass -- it is bound but only the speculative path runs it. */
+static void exaone_forward_token_cpu(float *logits, const ds4_model *m,
+                                     const ds4_weights *w, exaone_kv_cache *cache,
+                                     int token, uint32_t pos) {
+    const uint64_t n_embd = DS4_N_EMBD;
+    float *x = xmalloc((size_t)n_embd * sizeof(float));
+
+    /* token_embd rows are the embedding vectors; read one directly. */
+    {
+        const ds4_tensor *te = w->token_embd;
+        const gguf_type_info *ti = &gguf_types[te->type];
+        const uint64_t row_bytes = te->dim[0] / ti->block_elems * ti->block_bytes;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, te) +
+                           (uint64_t)token * row_bytes;
+        if (te->type == DS4_TENSOR_F32) {
+            memcpy(x, p, (size_t)n_embd * sizeof(float));
+        } else if (te->type == DS4_TENSOR_F16) {
+            const uint16_t *h = (const uint16_t *)p;
+            for (uint64_t i = 0; i < n_embd; i++) x[i] = f16_to_f32(h[i]);
+        } else {
+            /* quantized embedding: dequantize by dotting against basis vectors
+             * would be wasteful, so pull values through the row accessor */
+            float *e = xcalloc((size_t)n_embd, sizeof(float));
+            for (uint64_t i = 0; i < n_embd; i++) {
+                e[i] = 1.0f;
+                x[i] = exaone_row_dot(m, te, (uint64_t)token, e);
+                e[i] = 0.0f;
+            }
+            free(e);
+        }
+    }
+
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        exaone_layer_one(x, m, &w->layer[il], &cache->layer[il], il, pos);
+    }
+
+    if (logits) {
+        float *norm = xmalloc((size_t)n_embd * sizeof(float));
+        exaone_rmsnorm(norm, x, m, w->output_norm, n_embd);
+        exaone_linear(logits, m, w->output, norm);
+        free(norm);
+    }
+    free(x);
+}
 
 /* CPU decode for one token through all 43 layers.  The caller owns scratch and
  * cache lifetimes so no per-token allocations are needed. */
