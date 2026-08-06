@@ -144,6 +144,7 @@ typedef enum {
     DS4_MODEL_FAMILY_DEEPSEEK4   = 0,
     DS4_MODEL_FAMILY_SOLAR_OPEN2 = 1,
     DS4_MODEL_FAMILY_MOTIF3      = 2,
+    DS4_MODEL_FAMILY_EXAONE_MOE  = 3,
 } ds4_model_family;
 
 typedef enum {
@@ -151,6 +152,7 @@ typedef enum {
     DS4_VARIANT_PRO             = 1,
     DS4_VARIANT_SOLAR_OPEN2_250B = 2,
     DS4_VARIANT_MOTIF3          = 3,
+    DS4_VARIANT_KEXAONE_236B    = 4,
 } ds4_variant;
 
 typedef struct {
@@ -191,6 +193,7 @@ typedef struct {
     uint32_t n_kda_head_dim;
     uint32_t n_ssm_conv;
     bool use_rope;
+    bool use_qk_norm;         /* per-head RMSNorm on Q and K before RoPE */
     float rms_eps;
     float kda_l2_eps;
     float kda_gate_clamp_min;
@@ -366,6 +369,62 @@ static const ds4_shape DS4_SHAPE_SOLAR_OPEN2_250B = {
     .rope_orig_ctx = UINT64_C(1048576),
 };
 
+/* K-EXAONE 236B A23B. Values are the GGUF exaone-moe.* metadata, not the HF
+ * config: n_layer is block_count (49), which counts the MTP block as blk.48 on
+ * top of the 48 real layers -- same convention GLM 5.2 uses for its NextN block.
+ *
+ * Unlike DeepSeek4 and GLM this model has no MLA and no sparse indexer: it is
+ * plain GQA, 64 query heads over 8 KV heads at head_dim 128, with a per-head
+ * RMSNorm on Q and K. All the MLA/LoRA/indexer/hyper-connection fields are
+ * therefore zero, and the attention path cannot be shared with the other two
+ * families. */
+static const ds4_shape DS4_SHAPE_KEXAONE_236B = {
+    .name = "K-EXAONE 236B A23B",
+    .family = DS4_MODEL_FAMILY_EXAONE_MOE,
+    .variant = DS4_VARIANT_KEXAONE_236B,
+    .n_layer = 49,                /* 48 transformer layers + 1 MTP block */
+    .n_embd = 6144,
+    .n_vocab = 153600,
+    .n_head = 64,
+    .n_head_kv = 8,               /* GQA, not MLA */
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 128,                 /* no rope.dimension_count in the GGUF; full head_dim */
+    .n_out_group = 0,
+    .n_lora_q = 0,
+    .n_lora_o = 0,
+    .n_expert = 128,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 2048,
+    .n_ff_shexp = 2048,
+    .n_ff_dense = 18432,          /* dense layer 0 and the MTP block's MLP */
+    .n_hash_layer = 0,
+    .n_swa = 128,
+    .n_swa_period = 4,            /* LLLG */
+    .use_qk_norm = true,
+    .n_indexer_head = 0,
+    .n_indexer_head_dim = 0,
+    .n_indexer_top_k = 0,
+    .n_hc = 0,
+    .n_hc_sinkhorn_iter = 0,
+    .n_nextn_predict = 1,
+    .n_leading_dense = 1,
+    .n_kv_lora = 0,
+    .n_key_mla = 0,
+    .n_value_mla = 0,
+    .rms_eps = 1.0e-5f,
+    .hc_eps = 0.0f,
+    .expert_weight_scale = 2.5f,
+    .swiglu_clamp_exp = 0.0f,
+    .rope_freq_base = 1000000.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_yarn_beta_fast = 0.0f,
+    .rope_yarn_beta_slow = 0.0f,
+    .compress_rope_freq_base = 0.0f,
+    .rope_orig_ctx = 262144,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -444,6 +503,7 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_KDA_HEAD_DIM            (g_ds4_shape.n_kda_head_dim)
 #define DS4_N_SSM_CONV                (g_ds4_shape.n_ssm_conv)
 #define DS4_USE_ROPE                  (g_ds4_shape.use_rope)
+#define DS4_USE_QK_NORM               (g_ds4_shape.use_qk_norm)
 #define DS4_RMS_EPS                   (g_ds4_shape.rms_eps)
 #define DS4_KDA_L2_EPS                (g_ds4_shape.kda_l2_eps)
 #define DS4_KDA_GATE_CLAMP_MIN        (g_ds4_shape.kda_gate_clamp_min)
@@ -4615,11 +4675,106 @@ static void config_validate_solar_open2_model(const ds4_model *m) {
                       DS4_KDA_GATE_CLAMP_MIN, -5.0f);
 }
 
+/* K-EXAONE carries no MLA, indexer or hyper-connection metadata, so this reads
+ * a strictly smaller key set than the DeepSeek4/GLM validators. The keys it
+ * does read are the standard llama.cpp ones under the exaone-moe. prefix.
+ *
+ * The sliding-window schedule arrives as a per-layer bool array rather than a
+ * scalar period, so it is checked element by element against LLLG: layer il is
+ * full attention iff (il % 4) == 3. Silently accepting a different schedule
+ * would put every fourth layer's KV cache on the wrong policy, which no output
+ * check would catch until long contexts. */
+static void config_validate_exaone_moe_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_KEXAONE_236B;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_layer = required_u32(m, "exaone-moe.block_count");
+    const uint64_t n_ctx = required_u64_compat(m, "exaone-moe.context_length");
+    const uint32_t n_embd = required_u32(m, "exaone-moe.embedding_length");
+    const uint32_t n_vocab = required_u32(m, "exaone-moe.vocab_size");
+    const uint32_t n_ff_dense = required_u32(m, "exaone-moe.feed_forward_length");
+    const uint32_t n_head = required_u32(m, "exaone-moe.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "exaone-moe.attention.head_count_kv");
+    const uint32_t n_head_dim = required_u32(m, "exaone-moe.attention.key_length");
+    const uint32_t n_value_dim = required_u32(m, "exaone-moe.attention.value_length");
+    const uint32_t n_expert = required_u32(m, "exaone-moe.expert_count");
+    const uint32_t n_expert_used = required_u32(m, "exaone-moe.expert_used_count");
+    const uint32_t n_ff_exp = required_u32(m, "exaone-moe.expert_feed_forward_length");
+    const uint32_t n_ff_shexp = required_u32(m, "exaone-moe.expert_shared_feed_forward_length");
+    const uint32_t n_expert_shared = required_u32(m, "exaone-moe.expert_shared_count");
+    const uint32_t n_expert_group = required_u32(m, "exaone-moe.expert_group_count");
+    const uint32_t n_expert_group_used = required_u32(m, "exaone-moe.expert_group_used_count");
+    const uint32_t expert_gating_func = required_u32(m, "exaone-moe.expert_gating_func");
+    const uint32_t n_leading_dense = required_u32(m, "exaone-moe.leading_dense_block_count");
+    const uint32_t n_nextn = required_u32(m, "exaone-moe.nextn_predict_layers");
+    const uint32_t n_swa = required_u32(m, "exaone-moe.attention.sliding_window");
+
+    config_expect_u32("block_count", n_layer, DS4_N_LAYER);
+    config_expect_u64("context_length", n_ctx, DS4_ROPE_ORIG_CTX);
+    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
+    config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
+    config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv", n_head_kv, DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length", n_value_dim, DS4_N_VALUE_DIM);
+    config_expect_u32("expert_count", n_expert, DS4_N_EXPERT);
+    config_expect_u32("expert_used_count", n_expert_used, DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length", n_ff_exp, DS4_N_FF_EXP);
+    config_expect_u32("expert_shared_feed_forward_length", n_ff_shexp, DS4_N_FF_SHEXP);
+    config_expect_u32("expert_shared_count", n_expert_shared, DS4_N_EXPERT_SHARED);
+    config_expect_u32("expert_group_count", n_expert_group, 1);
+    config_expect_u32("expert_group_used_count", n_expert_group_used, 1);
+    config_expect_u32("expert_gating_func", expert_gating_func, 2); /* 2 = sigmoid */
+    config_expect_u32("leading_dense_block_count", n_leading_dense, DS4_N_LEADING_DENSE);
+    config_expect_u32("nextn_predict_layers", n_nextn, DS4_N_NEXTN_PREDICT);
+    config_expect_u32("attention.sliding_window", n_swa, DS4_N_SWA);
+
+    const float rope_freq_base = required_f32(m, "exaone-moe.rope.freq_base");
+    config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
+    const float rms_eps = required_f32(m, "exaone-moe.attention.layer_norm_rms_epsilon");
+    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
+    const float expert_weight_scale = required_f32(m, "exaone-moe.expert_weights_scale");
+    config_expect_f32("expert_weights_scale", expert_weight_scale, DS4_EXPERT_WEIGHT_SCALE);
+    const bool expert_weight_norm = required_bool(m, "exaone-moe.expert_weights_norm");
+    config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+
+    /* sliding_window_pattern: one bool per block, true = sliding attention. */
+    const char *swa_key = "exaone-moe.attention.sliding_window_pattern";
+    ds4_array_ref arr;
+    if (!model_get_array(m, swa_key, &arr) || arr.type != GGUF_VALUE_BOOL) {
+        fprintf(stderr, "ds4: required bool array metadata key is missing: %s\n", swa_key);
+        exit(1);
+    }
+    if (arr.len != n_layer) {
+        fprintf(stderr, "ds4: %s has %llu entries, expected %u\n",
+                swa_key, (unsigned long long)arr.len, n_layer);
+        exit(1);
+    }
+    ds4_cursor swa_c = cursor_at(m, arr.data_pos);
+    for (uint32_t il = 0; il < n_layer; il++) {
+        uint8_t got = 0;
+        if (!cursor_read(&swa_c, &got, sizeof(got))) ds4_die(swa_c.error);
+        const bool want = ((il % DS4_N_SWA_PERIOD) != DS4_N_SWA_PERIOD - 1);
+        if ((got != 0) != want) {
+            fprintf(stderr,
+                    "ds4: %s[%u] = %d, expected %d (LLLG: full attention on "
+                    "every %u-th layer)\n",
+                    swa_key, il, (int)(got != 0), (int)want, DS4_N_SWA_PERIOD);
+            exit(1);
+        }
+    }
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
         ds4_streq(arch, "deepseek4")) {
         config_validate_deepseek4_model(m);
+        return;
+    }
+    if (ds4_streq(arch, "exaone-moe")) {
+        config_validate_exaone_moe_model(m);
         return;
     }
     if (ds4_streq(arch, "solar-open2")) {
