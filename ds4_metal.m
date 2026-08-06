@@ -4535,6 +4535,12 @@ int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
     return 1;
 }
 
+uint64_t ds4_gpu_substrate_outstanding(void) {
+    /* deepmem lite-3: no lazy device-promotion tier on Metal -- nothing the
+     * planner cannot already see. */
+    return 0;
+}
+
 void ds4_gpu_boot_trim(void) {
     /* No graph-pool reserve concept on Metal. */
 }

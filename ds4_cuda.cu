@@ -109,6 +109,27 @@ static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
+/* deepmem lite-3 (tripwire): base-map promotable-span accounting.  `total`
+ * is declared by the startup walk's ds4_gpu_cache_model_range calls (every
+ * non-expert span chunk flows through it on EVERY boot, integrated devices
+ * only); `covered` grows as spans become device-resident or provably never
+ * will (walk populate, fd-cache promotion, dup/dedup/limit/device-owned
+ * skips).  The DS4_CUDA_NO_HBM_CACHE lever skip deliberately does NOT
+ * cover -- those bytes are the deferred device promotions the boot plan
+ * and the live verdicts must charge (outstanding = total - covered: ~0 on
+ * eager boots, ~8 GiB under the lever).  Scope is the fd-owner base map
+ * only: support models (MTP/DSpark) never promote lazily (the fd cache is
+ * base-map-only and their maps stay host-registered), so declaring them
+ * would overcharge lever boots.  Single-writer under the server's gen_mu
+ * serialization; a racy reader sees a stale-HIGH outstanding (covered
+ * lags), the conservative direction. */
+static uint64_t g_substrate_promotable_total;
+static uint64_t g_substrate_promotable_covered;
+
+static void cuda_substrate_cover(const void *model_map, uint64_t bytes) {
+    if (g_model_fd_host_base && model_map == g_model_fd_host_base)
+        g_substrate_promotable_covered += bytes;
+}
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 
@@ -886,6 +907,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
+    cuda_substrate_cover(model_map, bytes);   /* tripwire: promotion materialized */
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "weights",
@@ -2531,6 +2553,7 @@ static const char *cuda_model_range_ptr_from_fd(
     g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
+    cuda_substrate_cover(model_map, bytes);   /* tripwire: fd promotion materialized */
     cuda_model_load_progress_note(g_model_range_bytes);
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA fd-cached %s %.2f MiB (total %.2f GiB)\n",
@@ -2682,7 +2705,21 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
+    g_substrate_promotable_total = 0;     /* tripwire: census dies with the ranges */
+    g_substrate_promotable_covered = 0;
     cuda_model_load_progress_reset();
+}
+
+/* deepmem lite-3: bytes of base-map promotable weight spans still certain
+ * to be device-promoted (declared by the startup walk, covered as they
+ * materialize or become provably unnecessary).  ~0 on eager boots -- the
+ * standing assertion that eager completed; ~8 GiB under the
+ * DS4_CUDA_NO_HBM_CACHE lever.  Saturating; stale reads err HIGH
+ * (conservative). */
+extern "C" uint64_t ds4_gpu_substrate_outstanding(void) {
+    const uint64_t t = g_substrate_promotable_total;
+    const uint64_t c = g_substrate_promotable_covered;
+    return t > c ? t - c : 0;
 }
 
 static int cublas_ok(cublasStatus_t st, const char *what) {
@@ -4548,12 +4585,19 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
             (void)cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
         if (!integrated) return 2;
     }
+    /* Tripwire declaration: every promotable base-map chunk is declared
+     * here (the walk feeds all of them through on every boot).  The skip
+     * branches below cover bytes that will never promote lazily; the
+     * NO_HBM_CACHE lever skip does NOT -- it merely defers the promotion
+     * to the fd-cache tier, which covers on materialization. */
+    if (g_model_fd_host_base && model_map == g_model_fd_host_base)
+        g_substrate_promotable_total += bytes;
     /* Startup walk: force-populate the device-resident HBM cache so hot
      * tensors hit cudaMalloc copies rather than the UVA-mapped fallback.
      * Skip silently if over budget or opted out — the mapped pointer still
      * works for any tensor we don't pre-cache. */
     if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 2;
-    if (g_model_device_owned) return 2;
+    if (g_model_device_owned) { cuda_substrate_cover(model_map, bytes); return 2; }
     /* Self-load artifacts mode: this map's expert raws live in device
      * artifacts and the whole-model registration was skipped, so the walk
      * must device-copy ALL of its remaining (non-expert) spans — the same
@@ -4562,13 +4606,19 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     const uint64_t limit = cuda_model_map_replaces_complete(model_map)
         ? UINT64_MAX
         : cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) return 2;
+    if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) {
+        cuda_substrate_cover(model_map, bytes);   /* budget-capped: will not promote */
+        return 2;
+    }
     const char *what = label ? label : "model_tensor";
     /* Skip if this span is already populated. */
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 2;
+        if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) {
+            cuda_substrate_cover(model_map, bytes);   /* already device-resident */
+            return 2;
+        }
     }
     /* S6 (2026-07-07): coverage dedup vs imported manifest ranges.  WS
      * VMM/IPC imports land in g_model_ranges as LARGE coalesced device
@@ -4591,9 +4641,11 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
                         "range (imported manifest span); skipping duplicate copies\n",
                         what);
             }
+            cuda_substrate_cover(model_map, bytes);   /* import-covered */
             return 2;
         }
     }
+    /* populate credits coverage itself at the range-registration funnel */
     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what) != NULL;
 }
 

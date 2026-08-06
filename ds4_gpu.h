@@ -531,6 +531,15 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
    Returns 0 and writes the allocator's current free/total bytes; nonzero when
    the backend cannot answer (Metal) -- callers fall back to try-and-reduce. */
 int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes);
+/* deepmem lite-3 (tripwire): bytes of base-map promotable weight spans the
+   engine is still certain to device-promote after boot (the lazy fd-cache
+   tier), i.e. walk-declared minus covered.  ~0 on eager boots (the standing
+   assertion that eager promotion completed); ~8 GiB under
+   DS4_CUDA_NO_HBM_CACHE.  Subtracted by the bank fit, ds4_mem_usable(), and
+   the serial graph fit so plans and live verdicts charge deferred
+   promotions before they land.  Always 0 on Metal / discrete CUDA /
+   DS4_CUDA_DIRECT_MODEL. */
+uint64_t ds4_gpu_substrate_outstanding(void);
 /* inc-14b follow-up: release device reserves the boot prewarm accumulated but
    nothing references anymore (graph-pool slack), keeping warmed content
    resident.  No-op on backends without the concept. */

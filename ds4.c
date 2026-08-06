@@ -10177,6 +10177,11 @@ static bool metal_graph_session_fit_check(
     if (fe && fe[0] == '0' && fe[1] == '\0') return true;
     uint64_t free_b = 0, total_b = 0;
     if (ds4_gpu_mem_info(&free_b, &total_b) != 0) return true;
+    /* deepmem lite-3: pending substrate promotions (lazy fd-cache tier) will
+     * take this much of "free" back mid-serving; the serial graph must fit
+     * beside them, not instead of them. */
+    const uint64_t sub_out = ds4_gpu_substrate_outstanding();
+    free_b = free_b > sub_out ? free_b - sub_out : 0;
     const uint64_t need = metal_graph_alloc_bytes_estimate(weights, layer, raw_cap,
                                                            ctx_size, prefill_cap,
                                                            enable_mtp, enable_dspark);
@@ -33385,7 +33390,16 @@ static uint64_t ds4_mem_usable(void) {
     uint64_t lfree = 0, ltotal = 0;
     if (ds4_gpu_mem_info(&lfree, &ltotal) != 0) return UINT64_MAX;
     const uint64_t fl = ds4_mem_floor_bytes();
-    return lfree > fl ? lfree - fl : 0;
+    uint64_t u = lfree > fl ? lfree - fl : 0;
+    /* deepmem lite-3 (tripwire): also charge the engine's OWN certain
+     * future -- substrate promotions not yet materialized (~0 on eager
+     * boots, ~8 GiB under the DS4_CUDA_NO_HBM_CACHE lever).  Without this
+     * term the live answer lies about bytes the lazy fd-cache tier is
+     * certain to cudaMalloc mid-serving -- the deep-503 race
+     * (inc0b_receipt_2026-08-06.md).  One term, one place: every usable()
+     * consumer (floor verdict, serial-reserve clamp, rejects) inherits. */
+    const uint64_t sub = ds4_gpu_substrate_outstanding();
+    return u > sub ? u - sub : 0;
 }
 
 /* Governance inc2 (#8): the usable answer minus a caller-held reservation
@@ -33711,14 +33725,23 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         if (!(fe && fe[0] == '0' && fe[1] == '\0') &&
             per_bank != 0 && ds4_gpu_mem_info(&free_b, &total_b) == 0) {
             const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
-            const uint64_t budget = free_b > headroom ? free_b - headroom : 0;
+            /* deepmem lite-3: charge substrate promotions not yet
+             * materialized (lazy fd-cache tier).  ~0 on eager boots; under
+             * DS4_CUDA_NO_HBM_CACHE this is what stops the plan from
+             * spending ~8 GiB the promotions will take back mid-serving
+             * (the 08-05 29-vs-13-bank overcommit class, now closed on the
+             * lever path too -- boots plan identically in any mode). */
+            const uint64_t sub_out = ds4_gpu_substrate_outstanding();
+            uint64_t budget = free_b > headroom ? free_b - headroom : 0;
+            budget = budget > sub_out ? budget - sub_out : 0;
             uint32_t n = (uint32_t)(budget / per_bank);
             if (n < 2u) n = 2u;   /* still try the floor: a failing 2-bank slab
                                    * alloc is a ~2-GB poke, not a 20-GB one */
             if (n < ctx->max_seq) {
                 fprintf(stderr,
-                        "ds4: batch fit: free=%.2f GiB headroom=%.2f GiB per_bank=%.1f MiB -> max_seq %u (requested %u)\n",
+                        "ds4: batch fit: free=%.2f GiB headroom=%.2f GiB substrate outstanding=%.2f GiB per_bank=%.1f MiB -> max_seq %u (requested %u)\n",
                         (double)free_b / 1073741824.0, (double)headroom / 1073741824.0,
+                        (double)sub_out / 1073741824.0,
                         (double)per_bank / 1048576.0, n, ctx->max_seq);
                 ctx->max_seq = n;
             }
@@ -33855,12 +33878,13 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
           if (be && be[0]) { const long bv = atol(be);
             if (bv > 0) { ctx->comp_map_budget = (uint64_t)bv << 20; ctx->comp_map_budget_pinned = 1u; } } }
         fprintf(stderr,
-                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB, mem floor=%.1f GiB, serial reserve=%.2f GiB%s)\n",
+                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB, mem floor=%.1f GiB, serial reserve=%.2f GiB, substrate outstanding=%.2f GiB%s)\n",
                 (unsigned long long)(ds4_gpu_vmm_demand_page() >> 10),
                 (double)cache_per_bank / 1048576.0, (double)floor_pb / 1048576.0,
                 ctx->max_seq, (double)ctx->comp_map_budget / 1073741824.0,
                 (double)ds4_mem_floor_bytes() / 1073741824.0,
                 (double)ctx->serial_reserve / 1073741824.0,
+                (double)ds4_gpu_substrate_outstanding() / 1073741824.0,
                 g_slab_vmm_fallbacks ? " -- WITH EAGER FALLBACKS, see above" : "");
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
@@ -35667,10 +35691,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * silently under-charges. */
                 if (getenv("DS4_ADMIT_DEBUG")) {
                     fprintf(stderr,
-                            "ds4: admit debug bank=%u flen=%llu mneed=%.1f MiB mres=%.1f MiB budget=%.1f MiB credits=",
+                            "ds4: admit debug bank=%u flen=%llu mneed=%.1f MiB mres=%.1f MiB budget=%.1f MiB sub_out=%.1f MiB credits=",
                             b, (unsigned long long)flen,
                             (double)mneed / 1048576.0, (double)mres / 1048576.0,
-                            (double)ctx->comp_map_budget / 1048576.0);
+                            (double)ctx->comp_map_budget / 1048576.0,
+                            (double)ds4_gpu_substrate_outstanding() / 1048576.0);
                     for (uint32_t ci = 0; ci < MS; ci++)
                         fprintf(stderr, "%s%llu", ci ? "," : "",
                                 (unsigned long long)credit[ci]);
@@ -35726,11 +35751,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         ctx->mem_rejects++;
                         ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
                         fprintf(stderr,
-                                "ds4: cont admit rejected on memory floor (bank %u: projected credits %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor + %.2f GiB serial reserve -- the box lost memory since boot; --mem-floor-gb and DS4_SERIAL_RESERVE_CTX govern)\n",
+                                "ds4: cont admit rejected on memory floor (bank %u: projected credits %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor + %.2f GiB serial reserve + %.1f MiB substrate outstanding -- the box cannot fund this admission; --mem-floor-gb and DS4_SERIAL_RESERVE_CTX govern)\n",
                                 b, (double)mneed / 1048576.0,
                                 (double)usable / 1048576.0,
                                 (double)ds4_mem_floor_bytes() / 1073741824.0,
-                                (double)ctx->serial_reserve / 1073741824.0);
+                                (double)ctx->serial_reserve / 1073741824.0,
+                                (double)ds4_gpu_substrate_outstanding() / 1048576.0);
                         on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
                         continue;
                     }
