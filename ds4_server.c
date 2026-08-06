@@ -4942,13 +4942,19 @@ static void append_cors_headers(buf *h) {
         "Access-Control-Allow-Headers: *\r\n");
 }
 
-static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+/* Inc 2e: `extra_headers` (may be NULL) is a raw CRLF-terminated header block
+ * spliced verbatim into the response head -- the admission-bound sheds use it
+ * for Retry-After. */
+static bool http_response_ex(int fd, bool enable_cors, int code, const char *type,
+                             const char *extra_headers, const char *body) {
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
-                         code == 500 ? "Internal Server Error" : "Error";
+                         code == 429 ? "Too Many Requests" :
+                         code == 500 ? "Internal Server Error" :
+                         code == 503 ? "Service Unavailable" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
@@ -4960,6 +4966,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
         buf_puts(&h, type);
         buf_puts(&h, "\r\n");
     }
+    if (extra_headers && extra_headers[0]) buf_puts(&h, extra_headers);
     if (enable_cors) append_cors_headers(&h);
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
@@ -4968,18 +4975,30 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     return ok;
 }
 
-static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
+static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+    return http_response_ex(fd, enable_cors, code, type, NULL, body);
+}
+
+static bool http_error_ex(int fd, bool enable_cors, int code,
+                          const char *extra_headers, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
     /* Inc 2c: a server-side failure is "server_error" in OpenAI's own
      * vocabulary; every status used to claim invalid_request_error, blaming
-     * the client for 5xx refusals and failures. */
-    buf_puts(&b, code >= 500 ? ",\"type\":\"server_error\"}}\n"
+     * the client for 5xx refusals and failures.  Inc 2e adds 429 =
+     * rate_limit_error (the OpenAI family's own backpressure type). */
+    buf_puts(&b, code == 429 ? ",\"type\":\"rate_limit_error\"}}\n"
+               : code >= 500 ? ",\"type\":\"server_error\"}}\n"
                              : ",\"type\":\"invalid_request_error\"}}\n");
-    bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
+    bool ok = http_response_ex(fd, enable_cors, code, "application/json",
+                               extra_headers, b.ptr);
     buf_free(&b);
     return ok;
+}
+
+static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
+    return http_error_ex(fd, enable_cors, code, NULL, msg);
 }
 
 static const char *context_length_error_param(const request *r) {
@@ -8183,6 +8202,18 @@ struct server {
     job *tail;
     bool stopping;
     int clients;
+    /* Inc 2e admission bounds (all under `mu`; 0 disables a bound).
+     * queued/inflight_body_bytes are the live accounting the bounds check:
+     * queued counts FIFO entries (enqueue -> unlink); inflight_body_bytes
+     * counts request-body bytes HELD by live jobs (enqueue -> settle --
+     * raw_body lives until request_free, so the queue-only sum would
+     * understate what the server is actually holding). */
+    int    max_clients;          /* concurrent connections (503 shed) */
+    int    max_queue;            /* queued requests (429 shed) */
+    size_t max_queue_bytes;      /* aggregate in-flight body bytes (429 shed) */
+    double max_queue_age;        /* seconds a request may wait queued (503 shed) */
+    int    queued;
+    size_t inflight_body_bytes;
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
@@ -8226,6 +8257,9 @@ struct job {
      * registry counters after the worker signals done. */
     double t_arrive;
     uint8_t outcome;      /* JOB_OUT_* */
+    /* Inc 2e: this request's HTTP body size, charged against the server's
+     * inflight_body_bytes bound from enqueue until settle. */
+    size_t body_bytes;
 };
 
 /* Inc 2c: CANCELED = the CLIENT ended the request (disconnected while
@@ -8233,9 +8267,12 @@ struct job {
  * distinct from FAILED (the server could not serve).  Set explicitly at the
  * zombie-reap sites; every mid-flight cancel is caught at the settle site
  * via job.client_gone, so a delivered-then-failed-write response never
- * counts completed. */
+ * counts completed.
+ * Inc 2e: SHED = an ADMISSION BOUND refused the request after it was
+ * enqueued (today: queue age) -- the client got an honest 503+Retry-After,
+ * so it is neither completed, failed, nor canceled. */
 enum { JOB_OUT_COMPLETED = 0, JOB_OUT_FAILED, JOB_OUT_REFUSED_DEEP_SERIAL,
-       JOB_OUT_CANCELED };
+       JOB_OUT_CANCELED, JOB_OUT_SHED };
 
 /* v0.5.6 Inc 0a: route observation -- record which serving lane took each
  * request, keyed by WIRE SURFACE (not API vendor: OpenAI Chat and legacy
@@ -8987,6 +9024,29 @@ static bool wire_http_error(int fd, bool enable_cors, ds4_wire_surface surface,
         return ok;
     }
     return http_error(fd, enable_cors, code, msg);
+}
+
+/* Inc 2e: admission-bound shed responses -- the endpoint-native envelope of
+ * wire_http_error plus a Retry-After header, so SDK backoff loops get the
+ * standard signal on both families (Anthropic maps 429 -> rate_limit_error
+ * and 503 -> overloaded_error, both retryable; the OpenAI envelope says
+ * rate_limit_error / server_error). */
+static bool wire_http_error_retry(int fd, bool enable_cors, ds4_wire_surface surface,
+                                  int code, int retry_after_sec, const char *msg) {
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "Retry-After: %d\r\n", retry_after_sec);
+    if (surface == DS4_WIRE_ANTHROPIC) {
+        buf b = {0};
+        buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"");
+        buf_puts(&b, anthropic_error_type_for_status(code));
+        buf_puts(&b, "\",\"message\":");
+        json_escape(&b, msg);
+        buf_puts(&b, "}}\n");
+        bool ok = http_response_ex(fd, enable_cors, code, "application/json", hdr, b.ptr);
+        buf_free(&b);
+        return ok;
+    }
+    return http_error_ex(fd, enable_cors, code, hdr, msg);
 }
 
 static bool wire_stream_error(int fd, const request *r, ds4_wire_session *ws,
@@ -12086,20 +12146,73 @@ static void route_decision_record(ds4_route_decision d) {
         ds4_metric_add(&ds4_metrics_get()->route_decisions[d.reason], 1);
 }
 
-static bool enqueue(server *s, job *j) {
+/* ---- Inc 2e: admission bounds and shedding (plan §4.8 + §5) ---------------
+ * Every explicit server bound refuses with an endpoint-native 429/503 plus
+ * Retry-After, counted once per shed in ds4_requests_shed_total{reason}.
+ * The cheap bounds (clients, queue depth, in-flight body bytes) are checked
+ * pre-parse in client_main -- BEFORE tokenization -- and re-checked
+ * authoritatively under s->mu at enqueue.  Queue age is enforced at the
+ * queue-pull sites (the last moment before engine work).  Slow-reader
+ * eviction (per-job cap or the aggregate backlog cap) marks client_gone,
+ * which settles CANCELED per Inc 2c; the reason counter is its observer. */
+enum { DS4_SHED_CLIENTS = 0, DS4_SHED_QUEUE_DEPTH, DS4_SHED_QUEUE_BYTES,
+       DS4_SHED_QUEUE_AGE, DS4_SHED_SLOW_READER };
+static const char *shed_reason_names[DS4_METRICS_SHED_REASONS] = {
+    "clients", "queue_depth", "queue_bytes", "queue_age", "slow_reader",
+};
+
+static void shed_record(int reason) {
+    if (reason >= 0 && reason < DS4_METRICS_SHED_REASONS)
+        ds4_metric_add(&ds4_metrics_get()->requests_shed[reason], 1);
+}
+
+typedef enum {
+    ENQ_OK = 0,
+    ENQ_STOPPING,
+    ENQ_SHED_QUEUE_DEPTH,
+    ENQ_SHED_QUEUE_BYTES,
+} enq_verdict;
+
+static enq_verdict enqueue(server *s, job *j) {
     /* Inc 2a: requirements are computed at the single post-parse choke point
      * and immutable afterward. */
     j->req.needs = request_compute_needs(&j->req);
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
         pthread_mutex_unlock(&s->mu);
-        return false;
+        return ENQ_STOPPING;
+    }
+    /* Inc 2e: authoritative bound checks -- the pre-parse checks in
+     * client_main are advisory fast paths; only this one is atomic with the
+     * queue state, so only this one can actually enforce the bound. */
+    if (s->max_queue > 0 && s->queued >= s->max_queue) {
+        pthread_mutex_unlock(&s->mu);
+        return ENQ_SHED_QUEUE_DEPTH;
+    }
+    if (s->max_queue_bytes > 0 &&
+        s->inflight_body_bytes + j->body_bytes > s->max_queue_bytes) {
+        pthread_mutex_unlock(&s->mu);
+        return ENQ_SHED_QUEUE_BYTES;
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
+    s->queued++;
+    s->inflight_body_bytes += j->body_bytes;
     pthread_cond_signal(&s->cv);
     pthread_mutex_unlock(&s->mu);
-    return true;
+    return ENQ_OK;
+}
+
+/* Unlink the FIFO head.  Callers hold s->mu; head must be non-NULL.  The
+ * single decrement site for the queue-depth accounting, shared by all three
+ * pull paths (dequeue, coalesce_gather, cont_admit) so they cannot drift. */
+static job *queue_unlink_head_locked(server *s) {
+    job *j = s->head;
+    s->head = j->next;
+    if (!s->head) s->tail = NULL;
+    j->next = NULL;
+    s->queued--;
+    return j;
 }
 
 /* ZOMBIE REAP (2026-07-20): a client that disconnects while its request is still
@@ -12126,6 +12239,39 @@ static bool client_disconnected(int fd) {
     return r < 0 && (errno == ECONNRESET || errno == ENOTCONN);
 }
 
+/* Inc 2e: true when the queue-age bound is on and this queued job has
+ * outwaited it.  Callers decide the shed site; the check is just arithmetic
+ * so it can run under s->mu. */
+static bool job_queue_aged(const server *s, const job *j) {
+    return s->max_queue_age > 0 && now_sec() - j->t_arrive > s->max_queue_age;
+}
+
+/* Inc 2e: shed an over-age job pulled from the queue.  Callers must NOT hold
+ * s->mu (the refusal writes the socket).  A client that already left gets
+ * the Inc 2c zombie treatment instead -- CANCELED, nothing written -- so a
+ * dead peer never inflates the shed counters. */
+static void job_shed_aged(server *s, job *j, const char *site) {
+    if (client_disconnected(j->fd)) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: reaped queued request: client disconnected before %s "
+                   "(prompt=%d tokens never prefilled)", site, j->req.prompt.len);
+        j->outcome = JOB_OUT_CANCELED;
+        job_finish(j);
+        return;
+    }
+    const double waited = now_sec() - j->t_arrive;
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "request waited %.1fs in queue, over the %.0fs limit; server overloaded, retry later",
+             waited, s->max_queue_age);
+    server_log(DS4_LOG_WARNING,
+               "ds4-server: shed queued request at %s: aged %.1fs > %.0fs limit (prompt=%d tokens)",
+               site, waited, s->max_queue_age, j->req.prompt.len);
+    wire_http_error_retry(j->fd, s->enable_cors, wire_surface_for(&j->req), 503, 30, msg);
+    j->outcome = JOB_OUT_SHED;   /* settle counts it under shed{queue_age} */
+    job_finish(j);
+}
+
 static job *dequeue(server *s) {
     for (;;) {
         pthread_mutex_lock(&s->mu);
@@ -12134,17 +12280,18 @@ static job *dequeue(server *s) {
             pthread_mutex_unlock(&s->mu);
             return NULL;
         }
-        job *j = s->head;
-        s->head = j->next;
-        if (!s->head) s->tail = NULL;
+        job *j = queue_unlink_head_locked(s);
         pthread_mutex_unlock(&s->mu);
-        j->next = NULL;
         if (client_disconnected(j->fd)) {
             server_log(DS4_LOG_WARNING,
                        "ds4-server: reaped queued request: client disconnected before admission "
                        "(prompt=%d tokens never prefilled)", j->req.prompt.len);
             j->outcome = JOB_OUT_CANCELED;   /* Inc 2c: the client left; the server did not fail */
             job_finish(j);
+            continue;
+        }
+        if (job_queue_aged(s, j)) {          /* Inc 2e: last moment before engine work */
+            job_shed_aged(s, j, "admission");
             continue;
         }
         return j;
@@ -12243,6 +12390,20 @@ static void job_finish(job *j) {
  * by more than this, evict the row rather than grow the buffer without limit. */
 #define DS4_JOB_OUT_CAP (16u * 1024u * 1024u)
 
+/* Inc 2e: the AGGREGATE slow-reader bound.  DS4_JOB_OUT_CAP bounds one job;
+ * N slow readers could still hold N x 16 MiB, so the out_backlog_bytes gauge
+ * (ds4_metrics; atomic -- job_emit runs under per-job mutexes, drains on many
+ * client threads) tracks the total and job_emit evicts any emitter whose own
+ * backlog is at least g_out_agg_evict_min while the total is over
+ * g_out_agg_cap.  The biggest laggard self-selects: every live stream passes
+ * through job_emit each decode step, so the worst backlog hits its own check
+ * within a step.  Worst-case residency stays bounded by
+ * max(cap, max_clients x evict_min).  File-scope (job_emit has no server*);
+ * set once at boot from DS4_SERVER_OUT_AGG_CAP / DS4_SERVER_OUT_AGG_EVICT_MIN,
+ * 0 = off. */
+static uint64_t g_out_agg_cap = 64u * 1024u * 1024u;
+static uint64_t g_out_agg_evict_min = 256u * 1024u;
+
 /* W8a: append worker-produced response bytes to the job's async `out` buffer and
  * wake client_main to drain them.  Returns false once the client is gone (its send
  * failed) or the buffer hit its cap, so the continuous producer stops emitting and
@@ -12252,8 +12413,19 @@ static void job_finish(job *j) {
 static bool job_emit(struct job *j, const void *p, size_t n) {
     pthread_mutex_lock(&j->mu);
     if (!j->client_gone) {
-        if (j->out.len + n > DS4_JOB_OUT_CAP) j->client_gone = true;   /* too slow -> evict */
-        else buf_append(&j->out, p, n);
+        ds4_metrics *m = ds4_metrics_get();
+        if (j->out.len + n > DS4_JOB_OUT_CAP) {
+            j->client_gone = true;   /* too slow -> evict */
+            shed_record(DS4_SHED_SLOW_READER);
+        } else if (g_out_agg_cap > 0 &&
+                   ds4_metric_read(&m->out_backlog_bytes) + n > g_out_agg_cap &&
+                   j->out.len + n >= g_out_agg_evict_min) {
+            j->client_gone = true;   /* Inc 2e: aggregate backlog over cap */
+            shed_record(DS4_SHED_SLOW_READER);
+        } else {
+            buf_append(&j->out, p, n);
+            ds4_metric_add(&m->out_backlog_bytes, n);
+        }
     }
     bool gone = j->client_gone;
     pthread_cond_signal(&j->cv);
@@ -12434,10 +12606,11 @@ static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_t
         if (s->head && job_is_static_batchable(&s->head->req)) {
             if (max_tok_total > 0 && tok_total + job_tok_footprint(s, s->head) > max_tok_total)
                 break;                         /* token budget: split into another batch */
-            job *g = s->head;
-            s->head = g->next;
-            if (!s->head) s->tail = NULL;
-            g->next = NULL;
+            /* Inc 2e: an over-age head stays queued -- shedding writes a
+             * socket, which must not happen under s->mu.  dequeue() sheds it
+             * on the worker's next dispatch, one static batch later. */
+            if (job_queue_aged(s, s->head)) break;
+            job *g = queue_unlink_head_locked(s);
             if (client_disconnected(g->fd)) {   /* zombie reap — same gate as dequeue() */
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: reaped queued request: client disconnected before batch gather "
@@ -13245,6 +13418,18 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
          * job's decision was already recorded at worker_main dispatch. */
         pthread_mutex_lock(&s->mu);
         for (;;) {
+            /* Inc 2e: an over-age head must be shed HERE, not left queued --
+             * a nonempty continuous epoch can run for minutes, and a stuck
+             * head blocks every FIFO follower behind it for all of them.
+             * The refusal writes a socket, so drop s->mu around it (the
+             * zombie-check-inside-shed keeps dead peers CANCELED). */
+            if (s->head && job_queue_aged(s, s->head)) {
+                job *aged = queue_unlink_head_locked(s);
+                pthread_mutex_unlock(&s->mu);
+                job_shed_aged(s, aged, "cont admit");
+                pthread_mutex_lock(&s->mu);
+                continue;                           /* re-evaluate the new head */
+            }
             ds4_route_decision rd = { ROUTE_LANE_NONE, 0 };
             if (s->head) {
                 ds4_route_env renv = {
@@ -13256,10 +13441,7 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
             }
             if (rd.lane == ROUTE_LANE_CONTINUOUS) {
                 route_decision_record(rd);
-                j = s->head;
-                s->head = j->next;
-                if (!s->head) s->tail = NULL;
-                j->next = NULL;
+                j = queue_unlink_head_locked(s);
                 if (client_disconnected(j->fd)) {   /* zombie reap — same gate as dequeue() */
                     server_log(DS4_LOG_WARNING,
                                "ds4-server: reaped queued request: client disconnected before cont admit "
@@ -14148,6 +14330,17 @@ typedef struct {
     int fd;
 } client_arg;
 
+/* Inc 2e: URL-derived surface for pre-parse shed responses -- the endpoint is
+ * certain from the path even before anything is parsed (the same certainty
+ * Inc 1c uses for parse-failure errors).  False = not an enqueue endpoint. */
+static bool shed_surface_for_path(const char *path, ds4_wire_surface *out) {
+    if (!strcmp(path, "/v1/messages"))         { *out = DS4_WIRE_ANTHROPIC;         return true; }
+    if (!strcmp(path, "/v1/chat/completions")) { *out = DS4_WIRE_OPENAI_CHAT;       return true; }
+    if (!strcmp(path, "/v1/responses"))        { *out = DS4_WIRE_RESPONSES;         return true; }
+    if (!strcmp(path, "/v1/completions"))      { *out = DS4_WIRE_OPENAI_COMPLETION; return true; }
+    return false;
+}
+
 static void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
@@ -14404,6 +14597,32 @@ static void send_metrics(server *s, int fd) {
                    route_reason_names[ri],
                    (unsigned long long)ds4_metric_read(&m->route_decisions[ri]));
     }
+    /* v0.5.6 Inc 2e: admission-bound sheds + live backpressure gauges (the
+     * gauges read under s->mu -- the QUEUE lock, held only for list ops,
+     * never gen_mu -- so the no-stall property above holds). */
+    buf_puts(&b, "# TYPE ds4_requests_shed_total counter\n");
+    for (int ri = 0; ri < DS4_METRICS_SHED_REASONS; ri++) {
+        buf_printf(&b, "ds4_requests_shed_total{reason=\"%s\"} %llu\n",
+                   shed_reason_names[ri],
+                   (unsigned long long)ds4_metric_read(&m->requests_shed[ri]));
+    }
+    {
+        pthread_mutex_lock(&s->mu);
+        const int    nclients = s->clients;
+        const int    nqueued  = s->queued;
+        const size_t nbytes   = s->inflight_body_bytes;
+        pthread_mutex_unlock(&s->mu);
+        buf_printf(&b, "# TYPE ds4_clients_connected gauge\n"
+                       "ds4_clients_connected %d\n"
+                       "# TYPE ds4_queue_depth gauge\n"
+                       "ds4_queue_depth %d\n"
+                       "# TYPE ds4_inflight_body_bytes gauge\n"
+                       "ds4_inflight_body_bytes %zu\n",
+                   nclients, nqueued, nbytes);
+    }
+    buf_printf(&b, "# TYPE ds4_out_backlog_bytes gauge\n"
+                   "ds4_out_backlog_bytes %llu\n",
+               (unsigned long long)ds4_metric_read(&m->out_backlog_bytes));
     buf_printf(&b, "# TYPE ds4_cont_admit_rejects_total counter\n"
                    "ds4_cont_admit_rejects_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_admit_rejects));
@@ -14535,6 +14754,26 @@ static void send_stats(server *s, int fd, bool as_json) {
                        (unsigned long long)ds4_metric_read(&m->route_decisions[ri]));
         }
         buf_putc(&b, '}');
+        /* Inc 2e: sheds + live backpressure (s->mu = queue lock, not gen_mu). */
+        buf_puts(&b, ",\"sheds\":{");
+        for (int ri = 0; ri < DS4_METRICS_SHED_REASONS; ri++) {
+            buf_printf(&b, "%s\"%s\":%llu",
+                       ri ? "," : "", shed_reason_names[ri],
+                       (unsigned long long)ds4_metric_read(&m->requests_shed[ri]));
+        }
+        buf_putc(&b, '}');
+        {
+            pthread_mutex_lock(&s->mu);
+            const int    nclients = s->clients;
+            const int    nqueued  = s->queued;
+            const size_t nbytes   = s->inflight_body_bytes;
+            pthread_mutex_unlock(&s->mu);
+            buf_printf(&b, ",\"backpressure\":{\"clients_connected\":%d,"
+                           "\"queue_depth\":%d,\"inflight_body_bytes\":%zu,"
+                           "\"out_backlog_bytes\":%llu}",
+                       nclients, nqueued, nbytes,
+                       (unsigned long long)ds4_metric_read(&m->out_backlog_bytes));
+        }
         buf_printf(&b, ",\"speculation\":{\"spec_drafts\":%llu,\"spec_hits\":%llu,"
                        "\"spec_accept_ratio\":%.4f,\"spec_quench_events\":%llu}",
                    (unsigned long long)drafts, (unsigned long long)hits,
@@ -14617,6 +14856,25 @@ static void send_stats(server *s, int fd, bool as_json) {
                    (unsigned long long)ds4_metric_read(&m->route_decisions[ri]));
     }
     buf_putc(&b, '\n');
+    /* Inc 2e: sheds + live backpressure (s->mu = queue lock, not gen_mu). */
+    buf_puts(&b, "# Sheds\n");
+    for (int ri = 0; ri < DS4_METRICS_SHED_REASONS; ri++) {
+        buf_printf(&b, "shed_%s:%llu\n", shed_reason_names[ri],
+                   (unsigned long long)ds4_metric_read(&m->requests_shed[ri]));
+    }
+    {
+        pthread_mutex_lock(&s->mu);
+        const int    nclients = s->clients;
+        const int    nqueued  = s->queued;
+        const size_t nbytes   = s->inflight_body_bytes;
+        pthread_mutex_unlock(&s->mu);
+        buf_printf(&b, "clients_connected:%d\n"
+                       "queue_depth:%d\n"
+                       "inflight_body_bytes:%zu\n"
+                       "out_backlog_bytes:%llu\n\n",
+                   nclients, nqueued, nbytes,
+                   (unsigned long long)ds4_metric_read(&m->out_backlog_bytes));
+    }
     buf_printf(&b, "# Speculation\n"
                    "spec_drafts:%llu\n"
                    "spec_hits:%llu\n"
@@ -14704,6 +14962,57 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    /* Inc 2e: cheap admission bounds BEFORE tokenization (plan §5).  The
+     * connection bound covers every generation endpoint (including
+     * /v1/batch); the queue bounds cover the four enqueue endpoints.  These
+     * pre-parse checks shed obvious overloads without spending a parse;
+     * enqueue() re-checks the queue bounds atomically with the queue state.
+     * GET endpoints (metrics/stats/models) are exempt on purpose:
+     * observability must survive overload. */
+    if (!strcmp(hr.method, "POST")) {
+        ds4_wire_surface ssurf;
+        const bool inference = shed_surface_for_path(hr.path, &ssurf);
+        const bool generation = inference || !strcmp(hr.path, "/v1/batch");
+        if (!inference) ssurf = DS4_WIRE_OPENAI_CHAT;   /* pre-parse convention */
+        pthread_mutex_lock(&s->mu);
+        const int    nclients = s->clients;
+        const int    nqueued  = s->queued;
+        const size_t nbytes   = s->inflight_body_bytes;
+        pthread_mutex_unlock(&s->mu);
+        if (generation && s->max_clients > 0 && nclients > s->max_clients) {
+            shed_record(DS4_SHED_CLIENTS);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: shed %s: %d connected clients over the %d limit",
+                       hr.path, nclients, s->max_clients);
+            wire_http_error_retry(fd, s->enable_cors, ssurf, 503, 10,
+                                  "server connection capacity reached; retry later");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (inference && s->max_queue > 0 && nqueued >= s->max_queue) {
+            shed_record(DS4_SHED_QUEUE_DEPTH);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: shed %s pre-parse: %d queued requests at the %d limit",
+                       hr.path, nqueued, s->max_queue);
+            wire_http_error_retry(fd, s->enable_cors, ssurf, 429, 5,
+                                  "request queue is full; retry later");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (inference && s->max_queue_bytes > 0 &&
+            nbytes + hr.body_len > s->max_queue_bytes) {
+            shed_record(DS4_SHED_QUEUE_BYTES);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: shed %s pre-parse: %zu in-flight body bytes "
+                       "+ %zu incoming over the %zu limit",
+                       hr.path, nbytes, hr.body_len, s->max_queue_bytes);
+            wire_http_error_retry(fd, s->enable_cors, ssurf, 429, 5,
+                                  "server request-body budget exhausted; retry later");
+            http_request_free(&hr);
+            goto done;
+        }
+    }
+
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/batch")) {
         handle_batch(s, fd, hr.body);
         http_request_free(&hr);
@@ -14744,6 +15053,7 @@ static void *client_main(void *arg) {
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    const size_t body_bytes = hr.body_len;   /* Inc 2e: charged until settle */
     http_request_free(&hr);
     if (!ok) {
         wire_http_error(fd, s->enable_cors, parse_surface, 400, err);
@@ -14765,13 +15075,34 @@ static void *client_main(void *arg) {
     j.fd = fd;
     j.req = req;
     j.t_arrive = t_arrive;
+    j.body_bytes = body_bytes;
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
     pthread_mutex_lock(&j.mu);
-    if (!enqueue(s, &j)) {
+    const enq_verdict ev = enqueue(s, &j);
+    if (ev != ENQ_OK) {
         pthread_mutex_unlock(&j.mu);
-        wire_http_error(fd, s->enable_cors, DS4_WIRE_OPENAI_CHAT, 503, "server shutting down");
+        if (ev == ENQ_SHED_QUEUE_DEPTH) {
+            /* Inc 2e: the authoritative queue bounds (the pre-parse checks
+             * above are advisory; only enqueue is atomic with the queue).
+             * Surface-native here: the request parsed, so the real surface
+             * is known. */
+            shed_record(DS4_SHED_QUEUE_DEPTH);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: shed at enqueue: request queue at the %d limit", s->max_queue);
+            wire_http_error_retry(fd, s->enable_cors, wire_surface_for(&j.req), 429, 5,
+                                  "request queue is full; retry later");
+        } else if (ev == ENQ_SHED_QUEUE_BYTES) {
+            shed_record(DS4_SHED_QUEUE_BYTES);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: shed at enqueue: in-flight body bytes over the %zu limit",
+                       s->max_queue_bytes);
+            wire_http_error_retry(fd, s->enable_cors, wire_surface_for(&j.req), 429, 5,
+                                  "server request-body budget exhausted; retry later");
+        } else {
+            wire_http_error(fd, s->enable_cors, DS4_WIRE_OPENAI_CHAT, 503, "server shutting down");
+        }
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
@@ -14793,6 +15124,10 @@ static void *client_main(void *arg) {
             j.out = (buf){0};
             bool gone = j.client_gone;
             pthread_mutex_unlock(&j.mu);
+            /* Inc 2e: these bytes leave the slow-reader backlog whether the
+             * send succeeds or not -- the buffer is freed either way. */
+            ds4_metric_add(&ds4_metrics_get()->out_backlog_bytes,
+                           (uint64_t)-(uint64_t)pending.len);
             if (!gone && !send_all(fd, pending.ptr, pending.len)) gone = true;
             buf_free(&pending);
             pthread_mutex_lock(&j.mu);
@@ -14802,6 +15137,12 @@ static void *client_main(void *arg) {
     }
     pthread_mutex_unlock(&j.mu);
 
+    /* Inc 2e: the request body leaves the in-flight byte bound at settle
+     * (raw_body is freed just below in request_free). */
+    pthread_mutex_lock(&s->mu);
+    s->inflight_body_bytes -= j.body_bytes;
+    pthread_mutex_unlock(&s->mu);
+
     /* v0.2.x observability: settle this request's registry outcome. */
     {
         ds4_metrics *mreg = ds4_metrics_get();
@@ -14810,6 +15151,13 @@ static void *client_main(void *arg) {
             ds4_metric_add(&mreg->requests_failed, 1);
         else if (j.outcome == JOB_OUT_REFUSED_DEEP_SERIAL)
             ds4_metric_add(&mreg->requests_refused_deep_serial, 1);
+        else if (j.outcome == JOB_OUT_SHED)
+            /* Inc 2e: an enqueued request an admission bound later refused
+             * (queue age is the only post-enqueue bound today).  Counted at
+             * settle so started = completed+failed+canceled+refused+shed;
+             * the intake bounds shed BEFORE enqueue and count only in
+             * requests_shed[] at their refusal sites. */
+            ds4_metric_add(&mreg->requests_shed[DS4_SHED_QUEUE_AGE], 1);
         else if (j.outcome == JOB_OUT_CANCELED || j.client_gone)
             /* Inc 2c: the client left (queued reap, mid-generation vanish,
              * output-cap eviction, or a failed final drain).  Whatever the
@@ -14858,12 +15206,24 @@ static int listen_on(const char *host, int port) {
     return fd;
 }
 
+/* Inc 2e: optional per-connection send-buffer bound (0 = OS default).  The
+ * kernel sndbuf is ALSO queued wire bytes (plan §4.8): measured on GB10
+ * loopback it autotunes to ~2.6 MiB per connection (ss skmem tb), which a
+ * stalled reader holds for the connection's lifetime -- ~660 MiB across the
+ * default 256-client bound, invisible to every heap-side cap (a gate-sized
+ * stalled stream fit ENTIRELY in the sndbuf and the drain never blocked).
+ * Operators can pin it (DS4_SERVER_CLIENT_SNDBUF); the slow-reader gate leg
+ * pins it small so the eviction machinery is actually reachable. */
+static int g_client_sndbuf = 0;
+
 static void configure_client_socket(int fd) {
     struct timeval tv;
     tv.tv_sec = DS4_SERVER_IO_TIMEOUT_SEC;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (g_client_sndbuf > 0)
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &g_client_sndbuf, sizeof(g_client_sndbuf));
 }
 
 static void set_client_socket_nonblocking(int fd) {
@@ -15717,6 +16077,32 @@ int main(int argc, char **argv) {
         /* v0.5.2 inc3: dead-client abort (see the server struct comment). */
         const char *da = getenv("DS4_SERVER_DISCONNECT_ABORT");
         s.disconnect_abort = !(da && da[0] == '0' && da[1] == '\0');
+    }
+    {
+        /* Inc 2e admission bounds (plan §4.8 + §5); 0 disables a bound.
+         * Defaults are deliberately generous -- they exist to make overload
+         * BOUNDED and honestly refused (429/503 + Retry-After), not to
+         * throttle healthy load (measured record: 59 concurrent agents). */
+        const char *e;
+        s.max_clients = (e = getenv("DS4_SERVER_MAX_CLIENTS")) ? atoi(e) : 256;
+        s.max_queue   = (e = getenv("DS4_SERVER_MAX_QUEUE"))   ? atoi(e) : 256;
+        s.max_queue_bytes = (e = getenv("DS4_SERVER_MAX_QUEUE_BYTES"))
+            ? (size_t)strtoull(e, NULL, 10) : (size_t)256u * 1024u * 1024u;
+        s.max_queue_age = (e = getenv("DS4_SERVER_MAX_QUEUE_AGE_S")) ? atof(e) : 600.0;
+        if (s.max_clients < 0) s.max_clients = 0;
+        if (s.max_queue < 0) s.max_queue = 0;
+        if (s.max_queue_age < 0) s.max_queue_age = 0;
+        if ((e = getenv("DS4_SERVER_OUT_AGG_CAP")))
+            g_out_agg_cap = strtoull(e, NULL, 10);
+        if ((e = getenv("DS4_SERVER_OUT_AGG_EVICT_MIN")))
+            g_out_agg_evict_min = strtoull(e, NULL, 10);
+        if ((e = getenv("DS4_SERVER_CLIENT_SNDBUF")))
+            g_client_sndbuf = atoi(e);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: admission bounds: clients<=%d queued<=%d body_bytes<=%zu "
+                   "queue_age<=%.0fs out_backlog<=%llu sndbuf=%d (0 = unbounded/OS default)",
+                   s.max_clients, s.max_queue, s.max_queue_bytes, s.max_queue_age,
+                   (unsigned long long)g_out_agg_cap, g_client_sndbuf);
     }
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
@@ -21662,6 +22048,191 @@ static void test_anthropic_stop_sequence_native_shape(void) {
     request_free(&r);
 }
 
+/* v0.5.6 Inc 2e: admission bounds shed with endpoint-native 429/503 plus
+ * Retry-After; the queue bounds enforce atomically at enqueue and the age
+ * bound sheds at the pull sites. */
+static void test_admission_bounds_shed(void) {
+    int sv[2];
+    char *out;
+
+    /* Retry-After + native envelope, both families, both shed codes. */
+    static const struct {
+        ds4_wire_surface surf; int code; const char *reason; const char *type;
+    } smap[] = {
+        { DS4_WIRE_ANTHROPIC,   429, "429 Too Many Requests", "\"type\":\"rate_limit_error\"" },
+        { DS4_WIRE_ANTHROPIC,   503, "503 Service Unavailable", "\"type\":\"overloaded_error\"" },
+        { DS4_WIRE_OPENAI_CHAT, 429, "429 Too Many Requests", "\"type\":\"rate_limit_error\"" },
+        { DS4_WIRE_OPENAI_CHAT, 503, "503 Service Unavailable", "\"type\":\"server_error\"" },
+    };
+    for (size_t i = 0; i < sizeof(smap) / sizeof(smap[0]); i++) {
+        char head[64];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        TEST_ASSERT(wire_http_error_retry(sv[0], false, smap[i].surf,
+                                          smap[i].code, 7, "busy"));
+        shutdown(sv[0], SHUT_WR);
+        out = read_socket_text(sv[1]);
+        snprintf(head, sizeof(head), "HTTP/1.1 %s", smap[i].reason);
+        TEST_ASSERT(strstr(out, head) != NULL);
+        TEST_ASSERT(strstr(out, "Retry-After: 7\r\n") != NULL);
+        TEST_ASSERT(strstr(out, smap[i].type) != NULL);
+        if (smap[i].surf == DS4_WIRE_ANTHROPIC) {
+            TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\":{") != NULL);
+            TEST_ASSERT(strstr(out, "\"error\":{\"message\":") == NULL);
+        } else {
+            TEST_ASSERT(strstr(out, "\"error\":{\"message\":") != NULL);
+        }
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    /* enqueue: the authoritative queue bounds, atomic with the queue state.
+     * Minimal server -- only what enqueue/dequeue touch. */
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    s.max_queue = 1;
+    s.max_queue_bytes = 100;
+
+    job j1, j2, j3;
+    memset(&j1, 0, sizeof(j1)); memset(&j2, 0, sizeof(j2)); memset(&j3, 0, sizeof(j3));
+    request_init(&j1.req, REQ_CHAT, 128);
+    request_init(&j2.req, REQ_CHAT, 128);
+    request_init(&j3.req, REQ_CHAT, 128);
+    j1.body_bytes = 40; j2.body_bytes = 40; j3.body_bytes = 70;
+
+    TEST_ASSERT(enqueue(&s, &j1) == ENQ_OK);
+    TEST_ASSERT(s.queued == 1 && s.inflight_body_bytes == 40);
+    TEST_ASSERT(enqueue(&s, &j2) == ENQ_SHED_QUEUE_DEPTH);    /* depth checks first */
+    s.max_queue = 8;
+    TEST_ASSERT(enqueue(&s, &j3) == ENQ_SHED_QUEUE_BYTES);    /* 40 + 70 > 100 */
+    TEST_ASSERT(enqueue(&s, &j2) == ENQ_OK);                  /* 40 + 40 fits */
+    TEST_ASSERT(s.queued == 2 && s.inflight_body_bytes == 80);
+    s.stopping = true;
+    TEST_ASSERT(enqueue(&s, &j3) == ENQ_STOPPING);
+    s.stopping = false;
+
+    /* dequeue: an over-age head is shed 503+Retry-After with outcome SHED,
+     * and the pull returns the next (fresh) job.  Both jobs need live peer
+     * sockets so the zombie probe says alive (a dead peer must stay the Inc
+     * 2c CANCELED reap, also asserted). */
+    int aged_sv[2], fresh_sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, aged_sv) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fresh_sv) == 0);
+    s.max_queue_age = 1.0;
+    /* j1 is the queue head from above; age it and give it a live socket. */
+    j1.fd = aged_sv[0];
+    j1.t_arrive = now_sec() - 5.0;
+    j2.fd = fresh_sv[0];
+    j2.t_arrive = now_sec();
+    job *got = dequeue(&s);
+    TEST_ASSERT(got == &j2);
+    TEST_ASSERT(j1.done && j1.outcome == JOB_OUT_SHED);
+    TEST_ASSERT(s.queued == 0);
+    shutdown(aged_sv[0], SHUT_WR);
+    out = read_socket_text(aged_sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 503 Service Unavailable") != NULL);
+    TEST_ASSERT(strstr(out, "Retry-After: 30\r\n") != NULL);
+    TEST_ASSERT(strstr(out, "over the 1s limit") != NULL);
+    free(out);
+
+    /* Dead peer + aged: the zombie reap wins -- CANCELED, nothing written.
+     * Byte bound off here: nothing settles in a unit, so the earlier
+     * charges never leave inflight_body_bytes. */
+    s.max_queue_bytes = 0;
+    int dead_sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, dead_sv) == 0);
+    close(dead_sv[1]);                          /* peer gone: FIN pending */
+    memset(&j3, 0, sizeof(j3));
+    request_init(&j3.req, REQ_CHAT, 128);
+    j3.fd = dead_sv[0];
+    j3.t_arrive = now_sec() - 5.0;
+    TEST_ASSERT(enqueue(&s, &j3) == ENQ_OK);
+    j2.next = NULL;                             /* re-queue the fresh job behind it */
+    j2.t_arrive = now_sec();
+    TEST_ASSERT(enqueue(&s, &j2) == ENQ_OK);
+    got = dequeue(&s);
+    TEST_ASSERT(got == &j2);
+    TEST_ASSERT(j3.done && j3.outcome == JOB_OUT_CANCELED);
+
+    close(aged_sv[0]); close(aged_sv[1]);
+    close(fresh_sv[0]); close(fresh_sv[1]);
+    close(dead_sv[0]);
+    request_free(&j1.req); request_free(&j2.req); request_free(&j3.req);
+    pthread_mutex_destroy(&s.mu);
+    pthread_cond_destroy(&s.cv);
+}
+
+/* Inc 2e: job_emit's two slow-reader eviction branches -- the per-job cap
+ * and the aggregate backlog cap -- plus the backlog gauge accounting.  The
+ * live gate pins DS4_SERVER_CLIENT_SNDBUF to make the aggregate branch
+ * reachable through a real socket (loopback sndbuf autotune otherwise
+ * absorbs a gate-sized stream); this unit locks the branch logic itself. */
+static void test_job_emit_backlog_eviction(void) {
+    ds4_metrics *m = ds4_metrics_get();
+    const uint64_t cap0 = g_out_agg_cap, min0 = g_out_agg_evict_min;
+    const uint64_t shed0 = ds4_metric_read(&m->requests_shed[DS4_SHED_SLOW_READER]);
+    const uint64_t back0 = ds4_metric_read(&m->out_backlog_bytes);
+    char chunk[512];
+    memset(chunk, 'x', sizeof(chunk));
+
+    job j;
+    memset(&j, 0, sizeof(j));
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+
+    /* Healthy appends under the caps: the backlog gauge tracks exactly.
+     * Caps are set RELATIVE to the current gauge -- the registry is
+     * process-global and earlier units may have left stream residue. */
+    g_out_agg_cap = back0 + 4096; g_out_agg_evict_min = 1024;
+    TEST_ASSERT(job_emit(&j, chunk, sizeof(chunk)));
+    TEST_ASSERT(job_emit(&j, chunk, sizeof(chunk)));
+    TEST_ASSERT(!j.client_gone && j.out.len == 2 * sizeof(chunk));
+    TEST_ASSERT(ds4_metric_read(&m->out_backlog_bytes) - back0 == 2 * sizeof(chunk));
+
+    /* Aggregate cap: an emitter whose own backlog >= evict_min is evicted
+     * (nothing appended, gauge unchanged), counted shed{slow_reader}. */
+    g_out_agg_cap = back0 + 1200;
+    TEST_ASSERT(!job_emit(&j, chunk, sizeof(chunk)));
+    TEST_ASSERT(j.client_gone && j.out.len == 2 * sizeof(chunk));
+    TEST_ASSERT(ds4_metric_read(&m->out_backlog_bytes) - back0 == 2 * sizeof(chunk));
+    TEST_ASSERT(ds4_metric_read(&m->requests_shed[DS4_SHED_SLOW_READER]) - shed0 == 1);
+
+    /* Aggregate over cap but a small own backlog stays: the biggest laggard
+     * self-selects; tiny emitters are never evicted for someone else's
+     * backlog (worst case stays bounded by clients x evict_min). */
+    job j3;
+    memset(&j3, 0, sizeof(j3));
+    pthread_mutex_init(&j3.mu, NULL);
+    pthread_cond_init(&j3.cv, NULL);
+    g_out_agg_cap = back0 + 512;               /* agg already over via j */
+    g_out_agg_evict_min = 4096;
+    TEST_ASSERT(job_emit(&j3, chunk, sizeof(chunk)));
+    TEST_ASSERT(!j3.client_gone && j3.out.len == sizeof(chunk));
+
+    /* Per-job cap (W8a), now counted: out.len faked at the cap, so the next
+     * append would cross it -- evicted without touching memory. */
+    job j2;
+    memset(&j2, 0, sizeof(j2));
+    pthread_mutex_init(&j2.mu, NULL);
+    pthread_cond_init(&j2.cv, NULL);
+    g_out_agg_cap = 0;                         /* isolate the per-job branch */
+    j2.out.len = DS4_JOB_OUT_CAP;              /* no backing store needed: eviction never reads it */
+    TEST_ASSERT(!job_emit(&j2, chunk, sizeof(chunk)));
+    TEST_ASSERT(j2.client_gone);
+    TEST_ASSERT(ds4_metric_read(&m->requests_shed[DS4_SHED_SLOW_READER]) - shed0 == 2);
+
+    /* Restore the registry and caps (units share the process registry). */
+    ds4_metric_add(&m->out_backlog_bytes,
+                   (uint64_t)-(uint64_t)(j.out.len + j3.out.len));
+    g_out_agg_cap = cap0; g_out_agg_evict_min = min0;
+    buf_free(&j.out); buf_free(&j3.out);
+    pthread_mutex_destroy(&j.mu); pthread_cond_destroy(&j.cv);
+    pthread_mutex_destroy(&j2.mu); pthread_cond_destroy(&j2.cv);
+    pthread_mutex_destroy(&j3.mu); pthread_cond_destroy(&j3.cv);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -21792,6 +22363,9 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();
     test_anthropic_stop_sequence_native_shape();
+    /* v0.5.6 API Inc 2e: admission bounds + shed. */
+    test_admission_bounds_shed();
+    test_job_emit_backlog_eviction();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

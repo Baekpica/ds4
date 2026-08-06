@@ -61,6 +61,25 @@
 #     oa_clamped   chat max_tokens:10000000 -> 200, finish "stop" (a huge
 #                  budget must serve; EOS ends it long before the bound)
 #
+#   admission bounds (Inc 2e; two more boots with tiny bounds)
+#     bytes_shed   serial-only boot, MAX_QUEUE_BYTES=5000: an ~8 KB body is
+#                  shed PRE-PARSE -> 429 + Retry-After + the native
+#                  rate_limit_error envelope + shed{queue_bytes}
+#     age_shed     MAX_QUEUE_AGE_S=6: a request queued behind a long serial
+#                  generation ages out -> 503 + Retry-After + native
+#                  overloaded_error + shed{queue_age}; the head still 200s
+#     depth_shed   MAX_QUEUE=3: a 6-way blast -> at least one 429 with
+#                  Retry-After + shed{queue_depth}; the head still 200s
+#     clients_shed cont boot, MAX_CLIENTS=2: two parked admission streams +
+#                  a probe -> 503 + Retry-After + overloaded_error +
+#                  shed{clients}
+#     slow_reader  OUT_AGG_CAP=2048/EVICT_MIN=1024/CLIENT_SNDBUF=8192: an
+#                  on-box client that stops reading its stream is EVICTED
+#                  once the aggregate backlog passes the cap ->
+#                  shed{slow_reader} + canceled (Inc 2c bucket), server
+#                  healthy after.  The sndbuf pin is what makes the heap
+#                  backlog reachable (loopback autotune = ~2.6 MiB/conn)
+#
 # Runs FROM the Mac over SSH like the other gates.  NOTE: the boot kills any
 # running ds4-server on $R.  End state: ds4-server killed, box left free.
 #
@@ -123,6 +142,12 @@ post(){
   curl -s -m 180 -o "$OUT/$1.json" -w '%{http_code}' "$BASE$2" \
        -H 'Content-Type: application/json' -d "$3"
 }
+# hpost <leg> <path> <json>  -> also captures response HEADERS in $OUT/<leg>.hdr
+hpost(){
+  curl -s -m 180 -o "$OUT/$1.json" -D "$OUT/$1.hdr" -w '%{http_code}' "$BASE$2" \
+       -H 'Content-Type: application/json' -d "$3"
+}
+hdr_has(){ grep -qi "$2" "$OUT/$1.hdr" || fail "$1: missing header [$2] in $(tr -d '\r' < "$OUT/$1.hdr" | tr '\n' ' ')"; }
 has(){ grep -q "$2" "$OUT/$1.json" || fail "$1: missing [$2] in $(head -c 300 "$OUT/$1.json")"; }
 lacks(){ grep -q "$2" "$OUT/$1.json" && fail "$1: unexpected [$2] in $(head -c 300 "$OUT/$1.json")"; true; }
 code_is(){ [ "$2" = "$3" ] || fail "$1: HTTP $2, want $3 ($(head -c 300 "$OUT/$1.json"))"; }
@@ -315,6 +340,159 @@ scomp1=$(lmetric 'ds4_requests_total{outcome="completed"}')
 [ "${scomp1:-0}" -gt "${scomp0:-0}" ] || fail "strand_buffered: not counted completed ($scomp0 -> $scomp1)"
 [ "${sfail1:-0}" -eq "${sfail0:-0}" ] || fail "strand_buffered: counted FAILED ($sfail0 -> $sfail1) despite full serial re-serve"
 log "strand_buffered PASS (before-headers failure re-served serially, counted completed)"
+
+# ============================================================================
+# Inc 2e: admission bounds + shed (429/503 + Retry-After, endpoint-native)
+# ============================================================================
+
+# ---- boot C: serial-only, tiny queue bounds --------------------------------
+# CONTINUOUS=0 COALESCE=0 makes dispatch strictly serial FIFO, so the queue
+# actually FILLS (the cont lane would admit everything instantly).
+BOOT_ENV="DS4_SERVER_CONTINUOUS=0 DS4_SERVER_COALESCE=0 DS4_SERVER_MAX_QUEUE=3 DS4_SERVER_MAX_QUEUE_BYTES=5000 DS4_SERVER_MAX_QUEUE_AGE_S=6" boot
+ssh "$R" "grep -q 'admission bounds: clients<=' $SRV" \
+  || fail "bounds boot: admission-bounds boot line missing from srv.log"
+
+# bytes_shed: an oversized body sheds PRE-PARSE (0 in flight + 8000 > 5000).
+qb0=$(lmetric 'ds4_requests_shed_total{reason="queue_bytes"}')
+python3 - > "$OUT/bytes_shed_req.json" <<'PY'
+import json
+print(json.dumps({"model": "m", "max_tokens": 16,
+                  "messages": [{"role": "user", "content": "pad " * 2000}]}))
+PY
+c=$(curl -s -m 30 -o "$OUT/bytes_shed.json" -D "$OUT/bytes_shed.hdr" -w '%{http_code}' \
+     "$BASE/v1/messages" -H 'Content-Type: application/json' -d @"$OUT/bytes_shed_req.json")
+code_is bytes_shed "$c" 429
+has bytes_shed '"type":"error","error":{"type":"rate_limit_error"'
+lacks bytes_shed '"error":{"message":'
+hdr_has bytes_shed 'Retry-After:'
+qb1=$(lmetric 'ds4_requests_shed_total{reason="queue_bytes"}')
+[ "${qb1:-0}" -gt "${qb0:-0}" ] || fail "bytes_shed: shed{queue_bytes} never incremented (${qb0:-?} -> ${qb1:-?})"
+log "bytes_shed PASS (pre-parse 429 + Retry-After, native envelope, counter ${qb0:-0} -> $qb1)"
+
+# age_shed: t2 queues behind a long serial generation, outwaits the 6s bound,
+# and is shed 503 at dequeue -- while the head still completes normally.
+qa0=$(lmetric 'ds4_requests_shed_total{reason="queue_age"}')
+curl -s -m 180 -o "$OUT/age_head.json" -w '%{http_code}' "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' \
+     -d '{"max_tokens":300,"temperature":0,"messages":[{"role":"user","content":"Write a paragraph about tides."}]}' \
+     > "$OUT/age_head.code" &
+AGE_HEAD_PID=$!
+sleep 2
+c=$(hpost age_shed /v1/messages '{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"quick question"}]}')
+code_is age_shed "$c" 503
+has age_shed '"type":"error","error":{"type":"overloaded_error"'
+has age_shed 'over the 6s limit'
+hdr_has age_shed 'Retry-After:'
+qa1=$(lmetric 'ds4_requests_shed_total{reason="queue_age"}')
+[ "${qa1:-0}" -gt "${qa0:-0}" ] || fail "age_shed: shed{queue_age} never incremented (${qa0:-?} -> ${qa1:-?})"
+wait "$AGE_HEAD_PID" || true
+[ "$(cat "$OUT/age_head.code")" = 200 ] || fail "age_shed: head request got $(cat "$OUT/age_head.code"), want 200"
+log "age_shed PASS (queued 503 + Retry-After after the head's 200; counter ${qa0:-0} -> $qa1)"
+
+# depth_shed: 6-way blast against MAX_QUEUE=3 -- late arrivals 429, the head
+# still serves.  (Queued survivors may ALSO age out 503 under the 6s bound;
+# only the depth counter and the 429/200 presence are asserted.)
+qd0=$(lmetric 'ds4_requests_shed_total{reason="queue_depth"}')
+BLAST_PIDS=""
+for i in 1 2 3 4 5 6; do
+  curl -s -m 180 -o "$OUT/depth_$i.json" -D "$OUT/depth_$i.hdr" -w '%{http_code}' \
+       "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+       -d '{"max_tokens":150,"temperature":0,"messages":[{"role":"user","content":"Briefly define entropy."}]}' \
+       > "$OUT/depth_$i.code" &
+  BLAST_PIDS="$BLAST_PIDS $!"
+  sleep 0.3
+done
+for p in $BLAST_PIDS; do wait "$p" || true; done
+codes=$(cat "$OUT"/depth_?.code | tr '\n' ' ')
+echo "$codes" | grep -q 429 || fail "depth_shed: no 429 in blast codes [$codes]"
+echo "$codes" | grep -q 200 || fail "depth_shed: no 200 in blast codes [$codes]"
+for i in 1 2 3 4 5 6; do
+  if [ "$(cat "$OUT/depth_$i.code")" = 429 ]; then
+    grep -qi 'Retry-After:' "$OUT/depth_$i.hdr" || fail "depth_shed: 429 #$i missing Retry-After"
+    grep -q 'rate_limit_error' "$OUT/depth_$i.json" || fail "depth_shed: 429 #$i not the native envelope"
+  fi
+done
+qd1=$(lmetric 'ds4_requests_shed_total{reason="queue_depth"}')
+[ "${qd1:-0}" -gt "${qd0:-0}" ] || fail "depth_shed: shed{queue_depth} never incremented (${qd0:-?} -> ${qd1:-?})"
+log "depth_shed PASS (blast codes [$codes]; counter ${qd0:-0} -> $qd1)"
+
+# ---- boot D: cont, tiny client + slow-reader bounds ------------------------
+# CLIENT_SNDBUF is pinned small: on GB10 loopback the kernel send buffer
+# autotunes to ~2.6 MiB per connection (measured: ss skmem tb=2626560), so an
+# unpinned socket swallows a gate-sized stalled stream whole and the drain
+# never blocks -- the heap-side backlog machinery would be unreachable.
+BOOT_ENV="DS4_SERVER_MAX_CLIENTS=2 DS4_SERVER_OUT_AGG_CAP=2048 DS4_SERVER_OUT_AGG_EVICT_MIN=1024 DS4_SERVER_CLIENT_SNDBUF=8192" boot
+
+# clients_shed: two parked admission-heavy streams (long prompts prefill for
+# tens of seconds and emit NOTHING, so they hold connections without touching
+# the tiny backlog cap) + a probe = 3 > 2.
+cs0=$(lmetric 'ds4_requests_shed_total{reason="clients"}')
+python3 - > "$OUT/park_req.json" <<'PY'
+import json
+body = "The quick brown fox jumps over the lazy dog. " * 900
+print(json.dumps({"stream": True, "max_tokens": 32, "temperature": 0,
+                  "messages": [{"role": "user", "content": body}]}))
+PY
+curl -s -m 150 -o /dev/null "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' -d @"$OUT/park_req.json" &
+PARK1=$!
+curl -s -m 150 -o /dev/null "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' -d @"$OUT/park_req.json" &
+PARK2=$!
+sleep 3
+c=$(hpost clients_shed /v1/messages '{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}')
+code_is clients_shed "$c" 503
+has clients_shed '"type":"error","error":{"type":"overloaded_error"'
+hdr_has clients_shed 'Retry-After:'
+cs1=$(lmetric 'ds4_requests_shed_total{reason="clients"}')
+[ "${cs1:-0}" -gt "${cs0:-0}" ] || fail "clients_shed: shed{clients} never incremented (${cs0:-?} -> ${cs1:-?})"
+kill "$PARK1" "$PARK2" 2>/dev/null || true
+n=0
+while :; do
+  cc=$(metric ds4_clients_connected)
+  [ -n "$cc" ] && [ "$cc" -le 1 ] && break
+  n=$((n+1)); [ $n -ge 24 ] && fail "clients_shed: clients gauge stuck at ${cc:-?} after killing parked streams"
+  sleep 5
+done
+log "clients_shed PASS (503 + Retry-After at 3 connections; counter ${cs0:-0} -> $cs1)"
+
+# slow_reader: an ON-BOX client (no tunnel buffering) opens a stream, reads
+# the headers, then stops reading.  Kernel buffers fill, client_main's drain
+# stalls, the worker's job_emit backlog passes the 2048 aggregate cap, and
+# the emitter is evicted: shed{slow_reader} + the Inc 2c canceled bucket.
+sr0=$(lmetric 'ds4_requests_shed_total{reason="slow_reader"}')
+scan0=$(lmetric 'ds4_requests_total{outcome="canceled"}')
+ssh "$R" "cat > /tmp/stall_reader.py" <<PY
+import json, socket, time
+body = json.dumps({"stream": True, "max_tokens": 3000, "temperature": 0,
+                   "messages": [{"role": "user", "content": "Tell a very long story about rivers."}]})
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+s.connect(("127.0.0.1", $PORT))
+req = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body)
+s.sendall(req.encode())
+s.recv(256)          # response started
+time.sleep(240)      # never read again; the server must evict us
+PY
+STALL_PID=$(ssh "$R" "cd /tmp && setsid nohup python3 /tmp/stall_reader.py > /tmp/stall_reader.log 2>&1 & echo \$!")
+n=0
+while :; do
+  sr1=$(lmetric 'ds4_requests_shed_total{reason="slow_reader"}')
+  [ "${sr1:-0}" -gt "${sr0:-0}" ] && break
+  n=$((n+1)); [ $n -ge 30 ] && fail "slow_reader: shed{slow_reader} never incremented (${sr0:-?} -> ${sr1:-?})"
+  sleep 5
+done
+n=0
+while :; do
+  scan1=$(lmetric 'ds4_requests_total{outcome="canceled"}')
+  [ "${scan1:-0}" -gt "${scan0:-0}" ] && break
+  n=$((n+1)); [ $n -ge 24 ] && fail "slow_reader: eviction never settled canceled (${scan0:-?} -> ${scan1:-?})"
+  sleep 5
+done
+ssh "$R" "kill $STALL_PID 2>/dev/null; exit 0"
+c=$(post slow_reader_after /v1/chat/completions '{"max_tokens":16,"temperature":0,"messages":[{"role":"user","content":"still healthy?"}]}')
+code_is slow_reader_after "$c" 200
+log "slow_reader PASS (aggregate backlog eviction counted shed{slow_reader}=$sr1 + canceled; server healthy after)"
 
 ssh "$R" "pkill -x ds4-server; exit 0"
 log "ALL LEGS PASS — artifacts in $OUT (server killed, $R left free)"

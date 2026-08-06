@@ -471,6 +471,10 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
  * (a failed batched attempt re-enters serial and counts twice); this vector
  * counts each request's single dispatch decision. */
 #define DS4_METRICS_ROUTE_REASONS 13
+/* Admission-bound sheds (v0.5.6 Inc 2e): one increment per request refused
+ * (or slow-reader evicted) by an explicit server bound.  Bounded label set
+ * owned by the server (shed_reason_names); storage only here. */
+#define DS4_METRICS_SHED_REASONS 5
 typedef struct {
     uint64_t stamp;               /* monotonic second this bucket belongs to */
     uint64_t dec_tok, dec_steps, pf_tok;
@@ -511,6 +515,9 @@ typedef struct {
     /* route observation (see DS4_METRICS_ROUTE_* above) */
     uint64_t route_requests[DS4_METRICS_ROUTE_SURFACES][DS4_METRICS_ROUTE_LANES];
     uint64_t route_decisions[DS4_METRICS_ROUTE_REASONS];
+    /* admission-bound sheds (v0.5.6 Inc 2e; see DS4_METRICS_SHED_REASONS) */
+    uint64_t requests_shed[DS4_METRICS_SHED_REASONS];
+    uint64_t out_backlog_bytes;   /* gauge: stream bytes buffered for slow readers */
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);
