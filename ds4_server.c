@@ -8711,11 +8711,14 @@ typedef enum {
 typedef struct {
     ds4_generation_status status;
     ds4_stop_cause stop_cause;
+    const char *raw;            /* cumulative sampled text (stream machines re-scan it) */
+    size_t raw_len;
     const char *content;        /* visible assistant text (parsed when available) */
     const char *reasoning;      /* NULL when absent */
     const tool_calls *calls;    /* borrowed; may be an empty set, never NULL */
     const char *matched_stop;   /* stop-sequence text when stop_cause==SEQUENCE */
     bool recovered;             /* malformed tool block recovered to plain text */
+    const char *recovered_content; /* recovered visible text (Responses tail flush) */
     int prompt_tokens;
     int completion_tokens;
     int reasoning_tokens;       /* consumed by the Responses surface only */
@@ -8733,6 +8736,12 @@ typedef struct {
     bool http_started;
     bool protocol_started;      /* per-surface stream state in .state is live */
     bool terminal;
+    /* Serial/cont routing hints recorded at init: the stream-finish wrapper
+     * reproduces the writers' historical dispatch from these, so routing
+     * stays owned by the writer and only the projection moved (Inc 1). */
+    bool live_openai;           /* request_uses_openai_live_stream() */
+    bool live_responses;        /* request_uses_responses_live_stream() */
+    bool structured;            /* request_uses_structured_stream() */
     long created_at;
     char id[96];
     union {
@@ -8798,6 +8807,56 @@ static void wire_result_set_finish(ds4_wire_result *res, const char *finish) {
     if (!strcmp(finish, "tool_calls"))  res->stop_cause = DS4_STOP_TOOL_COMPLETE;
     else if (!strcmp(finish, "length")) res->stop_cause = DS4_STOP_TOKEN_LIMIT;
     else if (!strcmp(finish, "error"))  res->status = DS4_STATUS_ENGINE_FAILED;
+}
+
+/* Streamed tool ids: parsed calls inherit the ids the SSE machine already
+ * exposed (OpenAI chat / Anthropic; never-started machines are no-ops). */
+static void wire_assign_tool_ids(tool_calls *calls, ds4_wire_session *ws) {
+    switch (ws->surface) {
+    case DS4_WIRE_OPENAI_CHAT:
+        apply_openai_stream_tool_ids(calls, &ws->state.oa_chat);
+        break;
+    case DS4_WIRE_ANTHROPIC:
+        apply_anthropic_stream_tool_ids(calls, &ws->state.anthropic);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Stream terminal: the serial writer's historical five-way dispatch, keyed
+ * off the session's surface + routing hints.  Exact current bytes. */
+static bool wire_finish_stream(int fd, server *s, const request *r,
+                               ds4_wire_session *ws, const ds4_wire_result *res) {
+    const char *finish = wire_canonical_finish(res);
+    bool ok;
+    if (ws->surface == DS4_WIRE_ANTHROPIC) {
+        ok = anthropic_sse_finish_live(fd, s, r, ws->id, &ws->state.anthropic,
+                                       res->raw ? res->raw : "", res->raw_len,
+                                       res->calls, finish,
+                                       res->completion_tokens);
+    } else if (ws->live_openai) {
+        ok = openai_sse_finish_live(fd, s, r, ws->id, &ws->state.oa_chat,
+                                    res->raw ? res->raw : "", res->raw_len,
+                                    res->calls, finish,
+                                    res->prompt_tokens, res->completion_tokens);
+    } else if (ws->live_responses) {
+        ok = responses_sse_finish_live(fd, r, &ws->state.responses,
+                                       res->raw ? res->raw : "", res->raw_len,
+                                       res->recovered_content,
+                                       res->calls, finish,
+                                       res->prompt_tokens, res->completion_tokens,
+                                       res->reasoning_tokens, ws->created_at);
+    } else if (ws->structured) {
+        ok = sse_chat_finish(fd, r, ws->id, res->content, res->reasoning,
+                             res->calls, finish,
+                             res->prompt_tokens, res->completion_tokens);
+    } else {
+        ok = sse_chunk(fd, r, ws->id, NULL, finish) &&
+             sse_done(fd, r, ws->id, res->prompt_tokens, res->completion_tokens);
+    }
+    ws->terminal = true;
+    return ok;
 }
 
 /* Buffered terminal: one call per surface, exact current bytes. */
@@ -10928,12 +10987,15 @@ static void generate_job(server *s, job *j) {
              (unsigned long long)++s->seq);
 
     bool structured_stream = request_uses_structured_stream(&j->req);
-    anthropic_stream anthropic_live = {0};
-    openai_stream openai_live = {0};
-    responses_stream responses_live = {0};
     const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
-    long responses_created_at = (long)time(NULL);
+    /* Inc 1: the request's wire session owns the per-surface SSE machine
+     * state and identity for both terminals (stream + buffered). */
+    ds4_wire_session wsess;
+    wire_init(&wsess, wire_surface_for(&j->req), id);
+    wsess.live_openai = openai_live_chat;
+    wsess.live_responses = responses_live_chat;
+    wsess.structured = structured_stream;
     if (j->req.stream) {
         if (progress.stream_failed) {
             server_log(DS4_LOG_GENERATION,
@@ -10959,12 +11021,14 @@ static void generate_job(server *s, job *j) {
             return;
         }
         progress.headers_sent = true;
-        if (j->req.api == API_ANTHROPIC &&
-            !anthropic_sse_start_live(j->fd, &j->req, id,
-                                      prompt_tokens, &anthropic_live)) {
-            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
-            ds4_tokens_free(&effective_prompt);
-            return;
+        if (j->req.api == API_ANTHROPIC) {
+            wsess.protocol_started = true;
+            if (!anthropic_sse_start_live(j->fd, &j->req, id,
+                                          prompt_tokens, &wsess.state.anthropic)) {
+                server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+                ds4_tokens_free(&effective_prompt);
+                return;
+            }
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
@@ -10972,17 +11036,21 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&effective_prompt);
             return;
         }
-        if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
+        if (openai_live_chat) {
+            openai_stream_start(&j->req, &wsess.state.oa_chat);
+            wsess.protocol_started = true;
+        }
         if (responses_live_chat) {
-            responses_stream_init(&j->req, &responses_live);
-            responses_live.active = true;
-            if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
+            responses_stream_init(&j->req, &wsess.state.responses);
+            wsess.state.responses.active = true;
+            wsess.protocol_started = true;
+            if (!responses_sse_created(j->fd, &j->req, &wsess.state.responses, wsess.created_at)) {
                 server_log(DS4_LOG_GENERATION,
                            "ds4-server: chat ctx=%s%s%s responses created event failed",
                            ctx_span,
                            req_flags[0] ? " " : "",
                            req_flags);
-                responses_stream_free(&responses_live);
+                wire_free(&wsess);
                 ds4_tokens_free(&effective_prompt);
                 return;
             }
@@ -11105,7 +11173,7 @@ decode_again:
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
             if (openai_live_chat) {
-                openai_stream_record_token(&openai_live, token, text.len);
+                openai_stream_record_token(&wsess.state.oa_chat, token, text.len);
             }
             thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
@@ -11141,7 +11209,7 @@ decode_again:
             }
             if (j->req.stream && j->req.api == API_ANTHROPIC &&
                 !anthropic_sse_stream_update(j->fd, s, &j->req, id,
-                                             &anthropic_live, text.ptr, stream_len,
+                                             &wsess.state.anthropic, text.ptr, stream_len,
                                              false)) {
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
@@ -11151,7 +11219,7 @@ decode_again:
             }
             if (openai_live_chat &&
                 !openai_sse_stream_update(j->fd, s, &j->req, id,
-                                          &openai_live, text.ptr, stream_len,
+                                          &wsess.state.oa_chat, text.ptr, stream_len,
                                           false)) {
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
@@ -11161,7 +11229,7 @@ decode_again:
             }
             if (responses_live_chat &&
                 !responses_sse_stream_update(j->fd, &j->req,
-                                             &responses_live, text.ptr, stream_len,
+                                             &wsess.state.responses, text.ptr, stream_len,
                                              false)) {
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
@@ -11482,9 +11550,7 @@ decode_again:
             }
         }
         if (parsed_calls.len) {
-            if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
-            if (j->req.api == API_ANTHROPIC && j->req.stream)
-                apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
+            if (j->req.stream) wire_assign_tool_ids(&parsed_calls, &wsess);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
@@ -11571,66 +11637,38 @@ decode_again:
         t->decode_steps = serial_decode_steps;
     }
 
-    if (j->req.stream) {
-        bool response_ok = true;
-        if (j->req.api == API_ANTHROPIC) {
-            response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
-                                                    text.ptr ? text.ptr : "", text.len,
-                                                    &parsed_calls, final_finish, completion);
-        } else if (openai_live_chat) {
-            response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
-                                                 text.ptr ? text.ptr : "", text.len,
-                                                 &parsed_calls, final_finish,
-                                                 prompt_tokens, completion);
-        } else if (responses_live_chat) {
-            /* If parse recovered a malformed tool call back to plain text,
-             * pass parsed_content so the streaming tail can be flushed; in
-             * the normal path parsed_content is the assistant text we already
-             * streamed and the diff is empty. */
-            const char *recover =
-                recovered_tool_parse_failure ? parsed_content : NULL;
-            response_ok = responses_sse_finish_live(j->fd, &j->req, &responses_live,
-                                                    text.ptr ? text.ptr : "", text.len,
-                                                    recover,
-                                                    &parsed_calls, final_finish,
-                                                    prompt_tokens, completion,
-                                                    reasoning_token_count(
-                                                        s->engine, parsed_reasoning),
-                                                    responses_created_at);
-        } else if (structured_stream) {
-            response_ok = sse_chat_finish(j->fd, &j->req, id,
-                                          parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                          parsed_reasoning,
-                                          &parsed_calls, final_finish,
-                                          prompt_tokens, completion);
-        } else {
-            response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
-                          sse_done(j->fd, &j->req, id, prompt_tokens, completion);
-        }
-        if (!response_ok) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s ctx=%s%s%s final stream failed",
-                       j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags);
-        }
-    } else {
-        /* Inc 1: typed buffered terminal -- surface dispatch lives in the
-         * wire wrapper, bytes and ids unchanged. */
-        ds4_wire_session ws;
+    {
+        /* Inc 1: both terminals go through the typed wire surface; dispatch
+         * and bytes unchanged (the wrapper calls the same per-surface
+         * finish).  If parse recovered a malformed tool call back to plain
+         * text, recovered_content lets the Responses tail flush it; in the
+         * normal path parsed_content is the text already streamed and the
+         * diff is empty. */
         ds4_wire_result res = {0};
-        wire_init(&ws, wire_surface_for(&j->req), id);
         wire_result_set_finish(&res, final_finish);
+        res.raw = text.ptr ? text.ptr : "";
+        res.raw_len = text.len;
         res.content = parsed_content ? parsed_content : (text.ptr ? text.ptr : "");
         res.reasoning = parsed_reasoning;
+        res.recovered = recovered_tool_parse_failure;
+        res.recovered_content = recovered_tool_parse_failure ? parsed_content : NULL;
         res.calls = &parsed_calls;
         res.prompt_tokens = prompt_tokens;
         res.completion_tokens = completion;
-        if (ws.surface == DS4_WIRE_RESPONSES)
+        if (wsess.surface == DS4_WIRE_RESPONSES)
             res.reasoning_tokens = reasoning_token_count(s->engine, parsed_reasoning);
-        wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
-        wire_free(&ws);
+        if (j->req.stream) {
+            if (!wire_finish_stream(j->fd, s, &j->req, &wsess, &res)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: %s ctx=%s%s%s final stream failed",
+                           j->req.kind == REQ_CHAT ? "chat" : "completion",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags);
+            }
+        } else {
+            wire_finish_buffered(j->fd, s->enable_cors, &j->req, &wsess, &res);
+        }
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -11694,9 +11732,7 @@ decode_again:
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
-    anthropic_stream_free(&anthropic_live);
-    openai_stream_free(&openai_live);
-    responses_stream_free(&responses_live);
+    wire_free(&wsess);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
 }
@@ -11787,7 +11823,7 @@ static job *dequeue(server *s) {
  * W7-followup: THINKING is batchable too -- cont_admit mirrors generate_job's
  * think-mode sampling override (temp/top-k/top-p/min-p -> defaults), and the
  * continuous stream reuses the single path's openai_stream projection to split
- * reasoning_content vs content (cont_stream.ostream).  (The argmax-only STATIC
+ * reasoning_content vs content (cont_stream.wsess.state.oa_chat).  (The argmax-only STATIC
  * path still excludes thinking -- see job_is_static_batchable -- because it can't
  * apply the override.)
  * W6: streaming IS batchable -- the continuous path streams each row's tokens as
@@ -12937,7 +12973,7 @@ struct cont_stream {
      * split + hold-back logic.  A1: the machine's TOOL mode is now exercised too
      * (it detects DSML starts itself when r->has_tools and streams tool deltas);
      * streaming chat rows also record token ids into it (return_token_ids). */
-    openai_stream ostream;
+    ds4_wire_session wsess;   /* Inc 1: owns the machine + identity for the stream terminal */
     int    prompt_tokens; /* for the usage chunk */
     int    completion;    /* visible (non-EOS) tokens produced */
     bool   started;       /* SSE headers (+ chat role preamble) sent */
@@ -13012,7 +13048,7 @@ static int cont_sample_override(void *ud, void *user) {
  * the stranded-job fallback before a single-path rerun). */
 static void cont_stream_discard(job *j) {
     if (!j->cstream) return;
-    openai_stream_free(&j->cstream->ostream);
+    wire_free(&j->cstream->wsess);
     buf_free(&j->cstream->text);
     free(j->cstream);
     j->cstream = NULL;
@@ -13027,7 +13063,12 @@ static void cont_stream_start(server *s, job *j) {
              (unsigned long long)++s->seq);
     st->prompt_tokens = j->req.prompt.len;
     st->started = true;
-    openai_stream_start(&j->req, &st->ostream); /* THINKING if think enabled, else TEXT */
+    wire_init(&st->wsess, wire_surface_for(&j->req), st->id);
+    st->wsess.live_openai = j->req.kind == REQ_CHAT;   /* cont chat rows use the chat delta machine */
+    if (st->wsess.live_openai) {
+        openai_stream_start(&j->req, &st->wsess.state.oa_chat); /* THINKING if think enabled, else TEXT */
+        st->wsess.protocol_started = true;
+    }
     if (!sse_headers(j->fd, s->enable_cors)) { st->failed = true; return; }
     if (j->req.kind == REQ_CHAT && !sse_chunk(j->fd, &j->req, st->id, NULL, NULL))
         st->failed = true;                     /* {"delta":{"role":"assistant"}} */
@@ -13114,7 +13155,7 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
                    "ds4-server: cont chat invalid tool call returned as assistant text finish=%s",
                    *fin_io);
     if (calls->len) {
-        if (j->req.stream) apply_openai_stream_tool_ids(calls, &st->ostream);
+        if (j->req.stream) wire_assign_tool_ids(calls, &st->wsess);
         assign_tool_call_ids(s, calls, j->req.api);
         tool_memory_remember(s, calls);
         *fin_io = "tool_calls";
@@ -13141,29 +13182,32 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
      * the serial plain branch (raw-tail flush + text_completion finish),
      * never the chat finish machine. */
     if (!st->failed) {
-        if (j->req.kind == REQ_CHAT) {
-            if (!openai_sse_finish_live(j->fd, s, &j->req, st->id, &st->ostream,
-                                        st->text.ptr ? st->text.ptr : "", st->text.len,
-                                        &calls, fin, st->prompt_tokens, st->completion))
-                st->failed = true;
-        } else {
-            bool ok = true;
-            if (st->text.len > st->plain_stream_pos) {
-                char *tail = xstrndup(st->text.ptr + st->plain_stream_pos,
-                                      st->text.len - st->plain_stream_pos);
-                ok = sse_chunk(j->fd, &j->req, st->id, tail, NULL);
-                free(tail);
-            }
-            if (ok) ok = sse_chunk(j->fd, &j->req, st->id, NULL, fin) &&
-                         sse_done(j->fd, &j->req, st->id, st->prompt_tokens,
-                                  st->completion);
-            if (!ok) st->failed = true;
+        /* Inc 1: chat rows finish through the chat delta machine, completion
+         * rows flush the plain tail (an update, kept here) and then take the
+         * wrapper's plain chunk+done branch -- same dispatch, same bytes. */
+        bool ok = true;
+        if (j->req.kind != REQ_CHAT && st->text.len > st->plain_stream_pos) {
+            char *tail = xstrndup(st->text.ptr + st->plain_stream_pos,
+                                  st->text.len - st->plain_stream_pos);
+            ok = sse_chunk(j->fd, &j->req, st->id, tail, NULL);
+            free(tail);
         }
+        if (ok) {
+            ds4_wire_result res = {0};
+            wire_result_set_finish(&res, fin);
+            res.raw = st->text.ptr ? st->text.ptr : "";
+            res.raw_len = st->text.len;
+            res.calls = &calls;
+            res.prompt_tokens = st->prompt_tokens;
+            res.completion_tokens = st->completion;
+            ok = wire_finish_stream(j->fd, s, &j->req, &st->wsess, &res);
+        }
+        if (!ok) st->failed = true;
     }
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
-    openai_stream_free(&st->ostream);
+    wire_free(&st->wsess);
     buf_free(&st->text);
     free(st);
     j->cstream = NULL;
@@ -13270,7 +13314,7 @@ static int cont_on_token(void *ud, void *user, int token) {
      * the request set return_token_ids (chat-only: completion-kind echo never
      * rides the cont path, and completion rows do not use the chat machine). */
     if (j->req.stream && j->req.kind == REQ_CHAT)
-        openai_stream_record_token(&st->ostream, token, st->text.len);
+        openai_stream_record_token(&st->wsess.state.oa_chat, token, st->text.len);
 
     /* Stop scan + stream hold-back, the generate_job shape: never emit bytes
      * that could be a stop-string prefix; on a hit the text truncates to the
@@ -13330,7 +13374,7 @@ static int cont_on_token(void *ud, void *user, int token) {
      * return means the client is gone -> evict. */
     if (j->req.stream) {
         bool ok = j->req.kind == REQ_CHAT ?
-            openai_sse_stream_update(j->fd, s, &j->req, st->id, &st->ostream,
+            openai_sse_stream_update(j->fd, s, &j->req, st->id, &st->wsess.state.oa_chat,
                                      st->text.ptr ? st->text.ptr : "", stream_len, false) :
             cont_stream_emit_plain(j, st, stream_len);
         if (!ok) { st->failed = true; t_emit_job = NULL; return 0; }
@@ -20196,6 +20240,258 @@ static void test_wire_finish_buffered_matches_direct_emitters(void) {
     }
 }
 
+/* Inc 1b gate: wire_finish_stream reproduces the serial writer's historical
+ * five-way dispatch byte-for-byte.  Each live branch feeds the SAME tape
+ * through two independent machines (direct vs session-embedded) and diverges
+ * only at the finish call; stateless branches compare end-to-end. */
+static void test_wire_finish_stream_matches_direct_dispatch(void) {
+    tool_calls empty = {0};
+    int sv[2];
+    char *direct, *wrapped, *dt, *wt, *dn, *wn;
+
+    /* -- Anthropic live -- */
+    {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_ANTHROPIC;
+        r.stream = true;
+        r.think_mode = DS4_THINK_LOW;
+        buf raw = {0};
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        anthropic_stream st;
+        TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_wire_st", 7, &st));
+        for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+            buf_append(&raw, tape_thinking[i].piece, strlen(tape_thinking[i].piece));
+            TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_wire_st", &st,
+                                                    raw.ptr, raw.len, false));
+        }
+        TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_wire_st", &st,
+                                              raw.ptr, raw.len, &empty, "stop", 4));
+        shutdown(sv[0], SHUT_WR);
+        direct = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        ds4_wire_session ws;
+        wire_init(&ws, DS4_WIRE_ANTHROPIC, "msg_wire_st");
+        ws.protocol_started = true;
+        TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_wire_st", 7, &ws.state.anthropic));
+        buf raw2 = {0};
+        for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+            buf_append(&raw2, tape_thinking[i].piece, strlen(tape_thinking[i].piece));
+            TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_wire_st",
+                                                    &ws.state.anthropic,
+                                                    raw2.ptr, raw2.len, false));
+        }
+        ds4_wire_result res = {0};
+        wire_result_set_finish(&res, "stop");
+        res.raw = raw2.ptr; res.raw_len = raw2.len;
+        res.calls = &empty;
+        res.completion_tokens = 4;
+        TEST_ASSERT(wire_finish_stream(sv[0], NULL, &r, &ws, &res));
+        TEST_ASSERT(ws.terminal);
+        wire_free(&ws);
+        shutdown(sv[0], SHUT_WR);
+        wrapped = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+
+        TEST_ASSERT(!strcmp(direct, wrapped));
+        free(direct); free(wrapped);
+        buf_free(&raw); buf_free(&raw2);
+        request_free(&r);
+    }
+
+    /* -- OpenAI chat live -- */
+    {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_OPENAI;
+        r.stream = true;
+        r.think_mode = DS4_THINK_LOW;
+        buf raw = {0};
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        openai_stream st;
+        openai_stream_start(&r, &st);
+        for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+            buf_append(&raw, tape_thinking[i].piece, strlen(tape_thinking[i].piece));
+            TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_wire_st", &st,
+                                                 raw.ptr, raw.len, false));
+        }
+        TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_wire_st", &st,
+                                           raw.ptr, raw.len, &empty, "stop", 4, 4));
+        shutdown(sv[0], SHUT_WR);
+        direct = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+        openai_stream_free(&st);
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        ds4_wire_session ws;
+        wire_init(&ws, DS4_WIRE_OPENAI_CHAT, "chatcmpl_wire_st");
+        ws.live_openai = true;
+        ws.protocol_started = true;
+        openai_stream_start(&r, &ws.state.oa_chat);
+        buf raw2 = {0};
+        for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+            buf_append(&raw2, tape_thinking[i].piece, strlen(tape_thinking[i].piece));
+            TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_wire_st",
+                                                 &ws.state.oa_chat,
+                                                 raw2.ptr, raw2.len, false));
+        }
+        ds4_wire_result res = {0};
+        wire_result_set_finish(&res, "stop");
+        res.raw = raw2.ptr; res.raw_len = raw2.len;
+        res.calls = &empty;
+        res.prompt_tokens = 4;
+        res.completion_tokens = 4;
+        TEST_ASSERT(wire_finish_stream(sv[0], NULL, &r, &ws, &res));
+        wire_free(&ws);
+        shutdown(sv[0], SHUT_WR);
+        wrapped = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+
+        dt = wire_test_normalize_created(direct);
+        wt = wire_test_normalize_created(wrapped);
+        TEST_ASSERT(!strcmp(dt, wt));
+        free(direct); free(wrapped); free(dt); free(wt);
+        buf_free(&raw); buf_free(&raw2);
+        request_free(&r);
+    }
+
+    /* -- Responses live (random ids canonicalized, created_at pinned) -- */
+    {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.stream = true;
+        r.think_mode = DS4_THINK_LOW;
+        buf raw = {0};
+
+        ds4_wire_session ws;
+        wire_init(&ws, DS4_WIRE_RESPONSES, "resp_wire_st");
+        ws.live_responses = true;
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        responses_stream st;
+        responses_stream_init(&r, &st);
+        st.active = true;
+        TEST_ASSERT(responses_sse_created(sv[0], &r, &st, ws.created_at));
+        for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+            buf_append(&raw, tape_thinking[i].piece, strlen(tape_thinking[i].piece));
+            TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st,
+                                                    raw.ptr, raw.len, false));
+        }
+        TEST_ASSERT(responses_sse_finish_live(sv[0], &r, &st, raw.ptr, raw.len,
+                                              NULL, &empty, "stop", 4, 4, 0,
+                                              ws.created_at));
+        shutdown(sv[0], SHUT_WR);
+        direct = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+        responses_stream_free(&st);
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        responses_stream_init(&r, &ws.state.responses);
+        ws.state.responses.active = true;
+        ws.protocol_started = true;
+        TEST_ASSERT(responses_sse_created(sv[0], &r, &ws.state.responses, ws.created_at));
+        buf raw2 = {0};
+        for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+            buf_append(&raw2, tape_thinking[i].piece, strlen(tape_thinking[i].piece));
+            TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &ws.state.responses,
+                                                    raw2.ptr, raw2.len, false));
+        }
+        ds4_wire_result res = {0};
+        wire_result_set_finish(&res, "stop");
+        res.raw = raw2.ptr; res.raw_len = raw2.len;
+        res.calls = &empty;
+        res.prompt_tokens = 4;
+        res.completion_tokens = 4;
+        TEST_ASSERT(wire_finish_stream(sv[0], NULL, &r, &ws, &res));
+        wire_free(&ws);
+        shutdown(sv[0], SHUT_WR);
+        wrapped = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+
+        dt = wire_test_normalize_created(direct);
+        wt = wire_test_normalize_created(wrapped);
+        dn = wire_test_canonicalize_ids(dt);
+        wn = wire_test_canonicalize_ids(wt);
+        TEST_ASSERT(!strcmp(dn, wn));
+        free(direct); free(wrapped); free(dt); free(wt); free(dn); free(wn);
+        buf_free(&raw); buf_free(&raw2);
+        request_free(&r);
+    }
+
+    /* -- structured + plain (stateless dispatch plumbing) -- */
+    {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_OPENAI;
+        r.stream = true;
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        TEST_ASSERT(sse_chat_finish(sv[0], &r, "chatcmpl_wire_sf", "Hi.", NULL,
+                                    &empty, "stop", 4, 4));
+        shutdown(sv[0], SHUT_WR);
+        direct = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        ds4_wire_session ws;
+        wire_init(&ws, DS4_WIRE_OPENAI_CHAT, "chatcmpl_wire_sf");
+        ws.structured = true;   /* live_openai false: force the structured branch */
+        ds4_wire_result res = {0};
+        wire_result_set_finish(&res, "stop");
+        res.content = "Hi.";
+        res.calls = &empty;
+        res.prompt_tokens = 4;
+        res.completion_tokens = 4;
+        TEST_ASSERT(wire_finish_stream(sv[0], NULL, &r, &ws, &res));
+        wire_free(&ws);
+        shutdown(sv[0], SHUT_WR);
+        wrapped = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+
+        dt = wire_test_normalize_created(direct);
+        wt = wire_test_normalize_created(wrapped);
+        TEST_ASSERT(!strcmp(dt, wt));
+        free(direct); free(wrapped); free(dt); free(wt);
+        request_free(&r);
+
+        request_init(&r, REQ_COMPLETION, 128);
+        r.api = API_OPENAI;
+        r.stream = true;
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        TEST_ASSERT(sse_chunk(sv[0], &r, "cmpl_wire_pl", NULL, "length") &&
+                    sse_done(sv[0], &r, "cmpl_wire_pl", 4, 4));
+        shutdown(sv[0], SHUT_WR);
+        direct = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        ds4_wire_session ws2;
+        wire_init(&ws2, DS4_WIRE_OPENAI_COMPLETION, "cmpl_wire_pl");
+        ds4_wire_result res2 = {0};
+        wire_result_set_finish(&res2, "length");
+        res2.calls = &empty;
+        res2.prompt_tokens = 4;
+        res2.completion_tokens = 4;
+        TEST_ASSERT(wire_finish_stream(sv[0], NULL, &r, &ws2, &res2));
+        wire_free(&ws2);
+        shutdown(sv[0], SHUT_WR);
+        wrapped = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+
+        dt = wire_test_normalize_created(direct);
+        wt = wire_test_normalize_created(wrapped);
+        TEST_ASSERT(!strcmp(dt, wt));
+        free(direct); free(wrapped); free(dt); free(wt);
+        request_free(&r);
+    }
+}
+
 /* INVERTED Inc 0a negative fixture (fixed in Inc 0b).  The continuous lane
  * used to project streaming legacy /v1/completions rows through the CHAT
  * delta machine (chat.completion.chunk objects on a text_completion route);
@@ -20629,6 +20925,7 @@ static void ds4_server_unit_tests_run(void) {
     /* v0.5.6 API Inc 1: typed wire surface. */
     test_wire_session_identity_and_free();
     test_wire_finish_buffered_matches_direct_emitters();
+    test_wire_finish_stream_matches_direct_dispatch();
     test_cont_completion_stream_matches_serial_oracle();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
