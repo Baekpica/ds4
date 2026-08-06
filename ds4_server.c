@@ -19867,6 +19867,97 @@ static void test_request_decode_budget_three_states(void) {
     request_free(&r);
 }
 
+/* deepmem D-1c: pure-arithmetic tests for ds4_credit_union_runs (ds4.h),
+ * the page-interval merge under the continuous-admission credit projection.
+ * Production (credit_union_family, ds4.c) binds the resident subtraction
+ * over these exact runs, so these shapes pin the union semantics the
+ * admission verdicts charge: page-sharing neighbor banks merge into one
+ * run (union < sum of per-bank rounded spans), nonadjacent banks stay
+ * separate runs, the candidate slot overrides its credit, rows clamp at
+ * cap, and empty credit sets contribute nothing.
+ * Geometry: page 4096, row_bytes 64, cap_rows 100 (full bank 6400 B),
+ * stride 6500 (> full bank, NOT a page multiple -- neighbor banks share an
+ * edge page exactly like the 2 MiB VMM slabs on GB10). */
+#define CU_TEST_MAX_RUNS 8
+typedef struct {
+    uint64_t off[CU_TEST_MAX_RUNS], span[CU_TEST_MAX_RUNS];
+    int n;
+} cu_test_runs;
+static uint64_t test_cu_record_run(void *user, uint64_t off, uint64_t span) {
+    cu_test_runs *r = (cu_test_runs *)user;
+    TEST_ASSERT(r->n < CU_TEST_MAX_RUNS);
+    r->off[r->n] = off;
+    r->span[r->n] = span;
+    r->n++;
+    return span;   /* zero resident: need == span */
+}
+static void test_credit_union_merge_shapes(void) {
+    const uint64_t page = 4096, rowb = 64, cap = 100, stride = 6500;
+    const uint32_t ratio = 4, nb = 4;
+    cu_test_runs r;
+
+    /* nonadjacent banks 0+2 -> two runs at their own page spans */
+    memset(&r, 0, sizeof(r));
+    uint64_t credit_a[4] = {2000, 0, 2000, 0};
+    uint64_t need = ds4_credit_union_runs(stride, rowb, cap, ratio, page,
+                                          credit_a, nb, nb, 0,
+                                          test_cu_record_run, &r);
+    TEST_ASSERT(r.n == 2);
+    TEST_ASSERT(r.off[0] == 0 && r.span[0] == 2 * page);        /* pages 0-1 */
+    TEST_ASSERT(r.off[1] == 3 * page && r.span[1] == 2 * page); /* pages 3-4 */
+    TEST_ASSERT(need == 4 * page);
+
+    /* adjacent banks 0+1 share the edge page -> ONE merged run, and the
+     * union (4 pages) beats independent per-bank rounding (2 + 3 pages) */
+    memset(&r, 0, sizeof(r));
+    uint64_t credit_b[4] = {2000, 2000, 0, 0};
+    need = ds4_credit_union_runs(stride, rowb, cap, ratio, page,
+                                 credit_b, nb, nb, 0,
+                                 test_cu_record_run, &r);
+    TEST_ASSERT(r.n == 1);
+    TEST_ASSERT(r.off[0] == 0 && r.span[0] == 4 * page);        /* pages 0-3 */
+    TEST_ASSERT(need == 4 * page && need < 5 * page);
+
+    /* candidate slot overrides its credit entry: a huge stale credit[1]
+     * must not leak in when the candidate's own target is tiny */
+    memset(&r, 0, sizeof(r));
+    uint64_t credit_c[4] = {2000, 999999, 0, 0};
+    need = ds4_credit_union_runs(stride, rowb, cap, ratio, page,
+                                 credit_c, nb, 1, 4,
+                                 test_cu_record_run, &r);
+    TEST_ASSERT(r.n == 1);
+    TEST_ASSERT(r.span[0] == 2 * page);   /* tiny cand merges into pages 0-1 */
+    TEST_ASSERT(need == 2 * page);
+
+    /* rows clamp at cap_rows: an absurd credit still costs one full bank */
+    memset(&r, 0, sizeof(r));
+    uint64_t credit_d[4] = {1000000000ull, 0, 0, 0};
+    need = ds4_credit_union_runs(stride, rowb, cap, ratio, page,
+                                 credit_d, nb, nb, 0,
+                                 test_cu_record_run, &r);
+    TEST_ASSERT(r.n == 1 && r.span[0] == 2 * page && need == 2 * page);
+
+    /* nothing credited, no candidate -> zero runs, zero need */
+    memset(&r, 0, sizeof(r));
+    uint64_t credit_e[4] = {0, 0, 0, 0};
+    need = ds4_credit_union_runs(stride, rowb, cap, ratio, page,
+                                 credit_e, nb, nb, 0,
+                                 test_cu_record_run, &r);
+    TEST_ASSERT(r.n == 0 && need == 0);
+}
+static uint64_t test_cu_first_run_free(void *user, uint64_t off, uint64_t span) {
+    (void)user;
+    return off == 0 ? 0 : span;   /* fully-resident first run charges nothing */
+}
+static void test_credit_union_sums_per_run_need(void) {
+    const uint64_t page = 4096, rowb = 64, cap = 100, stride = 6500;
+    uint64_t credit[4] = {2000, 0, 2000, 0};   /* the nonadjacent shape */
+    uint64_t need = ds4_credit_union_runs(stride, rowb, cap, 4u, page,
+                                          credit, 4, 4, 0,
+                                          test_cu_first_run_free, NULL);
+    TEST_ASSERT(need == 2 * page);   /* only the second run still charges */
+}
+
 /* Inc 0b (#13 twin): an unrepairable mid-toolcall budget cut on the cont
  * lane keeps the honest "length" finish and returns the partial call as
  * assistant text, mirroring the serial dcc2623 behavior; a non-budget
@@ -20135,6 +20226,8 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_completion_stream_matches_serial_oracle();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
+    test_credit_union_merge_shapes();
+    test_credit_union_sums_per_run_need();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_record_current_shapes();

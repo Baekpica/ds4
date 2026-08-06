@@ -33433,41 +33433,22 @@ static uint64_t ds4_batch_slabs_cache_resident(const ds4_batch_slabs *sl) {
  * would double-charge those shared pages and needlessly shrink live width;
  * ds4_gpu_tensor_resident counts whole flagged pages, so one call per MERGED
  * page-aligned run makes both sides of the subtraction exact. */
+static uint64_t credit_union_run_need(void *user, uint64_t off, uint64_t span) {
+    const ds4_gpu_tensor *t = (const ds4_gpu_tensor *)user;
+    const uint64_t res = ds4_gpu_tensor_resident(t, off, span);
+    return span > res ? span - res : 0;
+}
+
+/* deepmem D-1c: the merge arithmetic lives in ds4_credit_union_runs (ds4.h,
+ * unit-tested on CPU); this wrapper binds the resident subtraction. */
 static uint64_t credit_union_family(const ds4_gpu_tensor *t, uint64_t stride,
                                     uint64_t row_bytes, uint64_t cap_rows,
                                     uint32_t ratio, uint64_t page,
                                     const uint64_t *credit, uint32_t nbanks,
                                     uint32_t cand, uint64_t cand_len) {
-    uint64_t need = 0, run_p0 = 0, run_p1 = 0;
-    bool run_open = false;
-    for (uint32_t b = 0; b < nbanks; b++) {
-        const uint64_t tlen = b == cand ? cand_len : credit[b];
-        if (tlen == 0) continue;
-        uint64_t rows = tlen / ratio + 2u;
-        if (rows > cap_rows) rows = cap_rows;
-        if (rows == 0) continue;
-        const uint64_t off = (uint64_t)b * stride;
-        const uint64_t len = rows * row_bytes;
-        const uint64_t p0 = off / page, p1 = (off + len - 1u) / page;
-        if (run_open && p0 <= run_p1) {
-            if (p1 > run_p1) run_p1 = p1;
-        } else {
-            if (run_open) {
-                const uint64_t span = (run_p1 - run_p0 + 1u) * page;
-                const uint64_t res = ds4_gpu_tensor_resident(t, run_p0 * page, span);
-                need += span > res ? span - res : 0;
-            }
-            run_p0 = p0;
-            run_p1 = p1;
-            run_open = true;
-        }
-    }
-    if (run_open) {
-        const uint64_t span = (run_p1 - run_p0 + 1u) * page;
-        const uint64_t res = ds4_gpu_tensor_resident(t, run_p0 * page, span);
-        need += span > res ? span - res : 0;
-    }
-    return need;
+    return ds4_credit_union_runs(stride, row_bytes, cap_rows, ratio, page,
+                                 credit, nbanks, cand, cand_len,
+                                 credit_union_run_need, (void *)(uintptr_t)t);
 }
 
 /* Inc 0b (governance, review 2.2): page-union LIFETIME projection.  Every

@@ -252,6 +252,52 @@ int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_tota
 int  ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                               ds4_batch_ctx **out, char *err, size_t errlen);
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx);
+
+/* deepmem D-1c: page-interval union across per-bank credited spans -- the
+ * pure arithmetic under the continuous-admission credit projection
+ * (credit_union_family in ds4.c), extracted header-inline so unit tests can
+ * drive it without a GPU and production cannot drift from the tested code.
+ * Walks banks in index order (offsets b*stride are monotonic), rounds each
+ * credited span to whole pages, merges runs that touch (neighbor banks can
+ * share an edge page because strides are not page-aligned), and calls
+ * run_need(user, run_off_bytes, run_span_bytes) once per merged page-aligned
+ * run, summing its returns.  run_need reports the bytes of the run still to
+ * be charged (production: span - resident, floored at 0).  Bank `cand`
+ * contributes cand_len instead of credit[cand]; a zero-length span
+ * contributes nothing. */
+static inline uint64_t ds4_credit_union_runs(
+        uint64_t stride, uint64_t row_bytes, uint64_t cap_rows, uint32_t ratio,
+        uint64_t page, const uint64_t *credit, uint32_t nbanks,
+        uint32_t cand, uint64_t cand_len,
+        uint64_t (*run_need)(void *user, uint64_t off, uint64_t span),
+        void *user) {
+    if (page == 0 || ratio == 0 || row_bytes == 0 || !run_need) return 0;
+    uint64_t need = 0, run_p0 = 0, run_p1 = 0;
+    bool run_open = false;
+    for (uint32_t b = 0; b < nbanks; b++) {
+        const uint64_t tlen = b == cand ? cand_len : credit[b];
+        if (tlen == 0) continue;
+        uint64_t rows = tlen / ratio + 2u;
+        if (rows > cap_rows) rows = cap_rows;
+        if (rows == 0) continue;
+        const uint64_t off = (uint64_t)b * stride;
+        const uint64_t len = rows * row_bytes;
+        const uint64_t p0 = off / page, p1 = (off + len - 1u) / page;
+        if (run_open && p0 <= run_p1) {
+            if (p1 > run_p1) run_p1 = p1;
+        } else {
+            if (run_open)
+                need += run_need(user, run_p0 * page,
+                                 (run_p1 - run_p0 + 1u) * page);
+            run_p0 = p0;
+            run_p1 = p1;
+            run_open = true;
+        }
+    }
+    if (run_open)
+        need += run_need(user, run_p0 * page, (run_p1 - run_p0 + 1u) * page);
+    return need;
+}
 /* Bank count of the persistent ctx (create_fit may size it below the
  * requested cap).  Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx);
