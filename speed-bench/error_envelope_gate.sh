@@ -250,6 +250,31 @@ ccomp1=$(lmetric 'ds4_requests_total{outcome="completed"}')
 [ "${ccomp1:-0}" -eq "${ccomp0:-0}" ] || fail "cancel: canceled stream counted COMPLETED ($ccomp0 -> $ccomp1)"
 log "cancel PASS (mid-stream disconnect counted canceled, not completed)"
 
+# ---- admission-callback cancellation (§5 Inc 2 gate item) -------------------
+# The client dies DURING its admission prefill (a ~10k-token prompt takes
+# tens of seconds cold; curl -m 2 leaves long before the first token).
+# cont_alive's MSG_PEEK probe reaps the row between prefill chunks; the
+# request must count CANCELED, and the server must keep serving.
+python3 - > "$OUT/admit_cancel_req.json" <<'PY'
+import json
+body = "The quick brown fox jumps over the lazy dog. " * 900
+print(json.dumps({"max_tokens": 32, "temperature": 0,
+                  "messages": [{"role": "user", "content": body}]}))
+PY
+acan0=$(lmetric 'ds4_requests_total{outcome="canceled"}')
+curl -s -m 2 -o /dev/null "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' -d @"$OUT/admit_cancel_req.json" || true
+n=0
+while :; do
+  acan1=$(lmetric 'ds4_requests_total{outcome="canceled"}')
+  [ "${acan1:-0}" -gt "${acan0:-0}" ] && break
+  n=$((n+1)); [ $n -ge 24 ] && fail "admit_cancel: canceled never incremented (${acan0:-?} -> ${acan1:-?})"
+  sleep 5
+done
+c=$(post admit_cancel_after /v1/chat/completions '{"max_tokens":24,"temperature":0,"messages":[{"role":"user","content":"still alive?"}]}')
+code_is admit_cancel_after "$c" 200
+log "admit_cancel PASS (mid-admission disconnect counted canceled; server healthy after)"
+
 # ---- failure injection: engine-stranded live stream (Inc 2c) ---------------
 BOOT_ENV="DS4_GATE_CONT_FAIL_AFTER_STEPS=8" boot
 comp0=$(lmetric 'ds4_requests_total{outcome="completed"}')
@@ -275,6 +300,21 @@ cbf=$(metric ds4_cont_batch_failures_total)
 [ "${comp1:-0}" -eq "${comp0:-0}" ] || fail "strand: stranded stream counted COMPLETED ($comp0 -> $comp1)"
 [ -n "$cbf" ] && [ "$cbf" -ge 1 ] || fail "strand: cont_batch_failures=${cbf:-absent}"
 log "strand PASS (deltas -> native error event, counted failed not completed, cont_batch_failures=$cbf)"
+
+# ---- failure BEFORE headers (§5 Inc 2 gate item) ----------------------------
+# Same forced-failure boot, BUFFERED request: the stranded row has nothing
+# on the wire, so the sweep re-serves it on the single path -- the client
+# gets a full 200 and the request counts COMPLETED (failed unchanged).
+sfail0=$(lmetric 'ds4_requests_total{outcome="failed"}')
+scomp0=$(lmetric 'ds4_requests_total{outcome="completed"}')
+c=$(post strand_buffered /v1/chat/completions '{"temperature":0,"max_tokens":64,"messages":[{"role":"user","content":"Reply with exactly: strand buffered ok"}]}')
+code_is strand_buffered "$c" 200
+has strand_buffered '"finish_reason"'
+sfail1=$(lmetric 'ds4_requests_total{outcome="failed"}')
+scomp1=$(lmetric 'ds4_requests_total{outcome="completed"}')
+[ "${scomp1:-0}" -gt "${scomp0:-0}" ] || fail "strand_buffered: not counted completed ($scomp0 -> $scomp1)"
+[ "${sfail1:-0}" -eq "${sfail0:-0}" ] || fail "strand_buffered: counted FAILED ($sfail0 -> $sfail1) despite full serial re-serve"
+log "strand_buffered PASS (before-headers failure re-served serially, counted completed)"
 
 ssh "$R" "pkill -x ds4-server; exit 0"
 log "ALL LEGS PASS — artifacts in $OUT (server killed, $R left free)"
