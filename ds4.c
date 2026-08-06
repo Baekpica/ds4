@@ -839,6 +839,17 @@ typedef struct {
     uint16_t dmin;
 } block_q2_K;
 
+/* Q3_K: 3 bits per weight in 16-element sub-blocks. The low two bits live in
+ * qs, the third (inverted) bit in hmask, and the sixteen 6-bit sub-block scales
+ * are packed across 12 bytes. Needed because the exaone-moe recipe puts routed
+ * expert down projections here. */
+typedef struct {
+    uint8_t  hmask[QK_K / 8];
+    uint8_t  qs[QK_K / 4];
+    uint8_t  scales[12];
+    uint16_t d;
+} block_q3_K;
+
 typedef struct {
     uint16_t d;
     uint16_t dmin;
@@ -3580,6 +3591,59 @@ static float ds4_vec_dot_q2_K_f32(int n, const block_q2_K *x, const float *y) {
     float sum = 0.0f;
     for (int k = 0; k < n; k++) {
         sum += q2_k_value_f32(x, (uint32_t)k) * y[k];
+    }
+    return sum;
+}
+
+/* Unpack the sixteen 6-bit sub-block scales. The low nibbles sit in bytes 0-7
+ * and the high 2 bits are distributed across bytes 8-11, which is why this is
+ * done as four 32-bit shuffles rather than per-scale bit picking. */
+static inline void q3_k_unpack_scales(const block_q3_K *xb, int8_t out[16]) {
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    memcpy(aux, xb->scales, 12);
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = ((aux[0]     ) & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = ((aux[1]     ) & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    memcpy(out, aux, 16);
+}
+
+static inline float q3_k_value_f32(const block_q3_K *blocks, uint32_t k) {
+    const uint32_t block = k / QK_K;
+    const uint32_t idx   = k - block * QK_K;
+    const block_q3_K *xb = blocks + block;
+
+    /* Layout mirrors ggml's dequantize_row_q3_K: two halves of 128, each split
+     * into four shift groups of 32, each of those into two runs of 16. */
+    const uint32_t half = idx / 128u;
+    const uint32_t r    = idx - half * 128u;
+    const uint32_t j    = r / 32u;            /* shift group 0..3 */
+    const uint32_t sub  = (r - j * 32u) / 16u;/* run 0..1         */
+    const uint32_t l    = r & 15u;
+
+    int8_t sc[16];
+    q3_k_unpack_scales(xb, sc);
+
+    const uint32_t shift = j * 2u;
+    const uint32_t m     = 1u << (half * 4u + j);
+    const uint32_t qi    = half * 32u + sub * 16u + l;
+    const uint32_t hi    = sub * 16u + l;
+
+    const int32_t lo = (int32_t)((xb->qs[qi] >> shift) & 3u);
+    /* the hmask bit is inverted: set means "no -4 offset" */
+    const int32_t v  = lo - ((xb->hmask[hi] & m) ? 0 : 4);
+    const int32_t s  = (int32_t)sc[half * 8u + j * 2u + sub] - 32;
+
+    return f16_to_f32(xb->d) * (float)s * (float)v;
+}
+
+static float ds4_vec_dot_q3_K_f32(int n, const block_q3_K *x, const float *y) {
+    float sum = 0.0f;
+    for (int k = 0; k < n; k++) {
+        sum += q3_k_value_f32(x, (uint32_t)k) * y[k];
     }
     return sum;
 }
