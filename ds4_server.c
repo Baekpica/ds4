@@ -4972,7 +4972,11 @@ static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
-    buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
+    /* Inc 2c: a server-side failure is "server_error" in OpenAI's own
+     * vocabulary; every status used to claim invalid_request_error, blaming
+     * the client for 5xx refusals and failures. */
+    buf_puts(&b, code >= 500 ? ",\"type\":\"server_error\"}}\n"
+                             : ",\"type\":\"invalid_request_error\"}}\n");
     bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -7171,10 +7175,26 @@ static bool final_response(int fd, bool enable_cors,
     return ok;
 }
 
-static const char *anthropic_stop_reason(const char *finish) {
+/* Inc 2c: a canonical "stop" that came from a MATCHED STOP SEQUENCE is
+ * "stop_sequence" on this surface (with the matched text in the top-level
+ * stop_sequence field); collapsing it to end_turn told Anthropic clients
+ * the model chose to stop.  EOS keeps end_turn. */
+static const char *anthropic_stop_reason(const char *finish, const char *matched_stop) {
     if (finish && !strcmp(finish, "tool_calls")) return "tool_use";
     if (finish && !strcmp(finish, "length")) return "max_tokens";
+    if (matched_stop && matched_stop[0] && finish && !strcmp(finish, "stop"))
+        return "stop_sequence";
     return "end_turn";
+}
+
+static void append_anthropic_stop_fields(buf *b, const char *finish,
+                                         const char *matched_stop) {
+    const char *reason = anthropic_stop_reason(finish, matched_stop);
+    buf_puts(b, "\"stop_reason\":");
+    json_escape(b, reason);
+    buf_puts(b, ",\"stop_sequence\":");
+    if (!strcmp(reason, "stop_sequence")) json_escape(b, matched_stop);
+    else buf_puts(b, "null");
 }
 
 static void append_anthropic_tool_use(buf *b, const tool_call *tc, const char *id_prefix, int i,
@@ -7249,6 +7269,7 @@ static void append_anthropic_usage_json(buf *b, const request *r,
 static bool anthropic_final_response(int fd, bool enable_cors,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
+                                     const char *matched_stop,
                                      int prompt_tokens, int completion_tokens) {
     char *text_t = utf8_trim_tail_dup(text);
     char *reasoning_t = utf8_trim_tail_dup(reasoning);
@@ -7259,9 +7280,9 @@ static bool anthropic_final_response(int fd, bool enable_cors,
     json_escape(&b, r->model);
     buf_puts(&b, ",\"content\":");
     append_anthropic_content(&b, text, reasoning, calls, id, &r->tool_orders);
-    buf_puts(&b, ",\"stop_reason\":");
-    json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
+    buf_putc(&b, ',');
+    append_anthropic_stop_fields(&b, finish, matched_stop);
+    buf_puts(&b, ",\"usage\":");
     append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
     append_timings_json(&b, r);
     buf_puts(&b, "}\n");
@@ -7926,11 +7947,12 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
 }
 
 static bool anthropic_sse_stop_live(int fd, const char *finish,
+                                    const char *matched_stop,
                                     int completion_tokens) {
     buf b = {0};
-    buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
-    json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null},\"usage\":{\"output_tokens\":");
+    buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{");
+    append_anthropic_stop_fields(&b, finish, matched_stop);
+    buf_puts(&b, "},\"usage\":{\"output_tokens\":");
     buf_printf(&b, "%d}}", completion_tokens);
     bool ok = sse_event(fd, "message_delta", b.ptr);
     buf_free(&b);
@@ -7941,7 +7963,8 @@ static bool anthropic_sse_stop_live(int fd, const char *finish,
 static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                       anthropic_stream *st, const char *raw,
                                       size_t raw_len, const tool_calls *calls,
-                                      const char *finish, int completion_tokens) {
+                                      const char *finish, const char *matched_stop,
+                                      int completion_tokens) {
     if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
@@ -7950,7 +7973,7 @@ static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const
     }
 
     if (!anthropic_sse_tool_blocks_live(fd, r, id, st, calls)) return false;
-    return anthropic_sse_stop_live(fd, finish, completion_tokens);
+    return anthropic_sse_stop_live(fd, finish, matched_stop, completion_tokens);
 }
 
 static double now_sec(void) {
@@ -8900,7 +8923,7 @@ static bool wire_finish_stream(int fd, server *s, const request *r,
     if (ws->surface == DS4_WIRE_ANTHROPIC) {
         ok = anthropic_sse_finish_live(fd, s, r, ws->id, &ws->state.anthropic,
                                        res->raw ? res->raw : "", res->raw_len,
-                                       res->calls, finish,
+                                       res->calls, finish, res->matched_stop,
                                        res->completion_tokens);
     } else if (ws->live_openai) {
         ok = openai_sse_finish_live(fd, s, r, ws->id, &ws->state.oa_chat,
@@ -9001,7 +9024,8 @@ static bool wire_finish_buffered(int fd, bool enable_cors, const request *r,
     case DS4_WIRE_ANTHROPIC:
         ok = anthropic_final_response(fd, enable_cors, r, ws->id,
                                       res->content, res->reasoning, res->calls,
-                                      finish, res->prompt_tokens,
+                                      finish, res->matched_stop,
+                                      res->prompt_tokens,
                                       res->completion_tokens);
         break;
     case DS4_WIRE_RESPONSES:
@@ -11202,6 +11226,7 @@ decode_again:
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
     const char *finish = "length";
+    char *matched_stop = NULL;   /* Inc 2c: the stop-sequence text a scan hit */
     int completion = 0;
     int max_tokens = request_decode_budget(&j->req, s->default_tokens);
     int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
@@ -11436,8 +11461,9 @@ decode_again:
             }
 
             if (hit_stop) {
-                (void)stop_len;
                 finish = "stop";
+                free(matched_stop);   /* Inc 2c: capture before truncation */
+                matched_stop = xstrndup(text.ptr + stop_pos, stop_len);
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
                 ds4_session_invalidate(s->session);
@@ -11546,6 +11572,7 @@ decode_again:
                                 recovery_tokens);
                     buf_free(&repaired);
                     buf_free(&text);
+                    free(matched_stop);
                     goto decode_again;
                 }
                 finish = "error";
@@ -11634,6 +11661,7 @@ decode_again:
                     free(parsed_reasoning);
                     tool_calls_free(&parsed_calls);
                     buf_free(&text);
+                    free(matched_stop);
                     goto decode_again;
                 }
                 final_finish = "error";
@@ -11779,6 +11807,9 @@ decode_again:
          * diff is empty. */
         ds4_wire_result res = {0};
         wire_result_set_finish(&res, final_finish);
+        res.matched_stop = matched_stop;
+        if (matched_stop && res.stop_cause == DS4_STOP_EOS)
+            res.stop_cause = DS4_STOP_SEQUENCE;   /* Inc 2c: EOS vs stop hit */
         res.raw = text.ptr ? text.ptr : "";
         res.raw_len = text.len;
         res.content = parsed_content ? parsed_content : (text.ptr ? text.ptr : "");
@@ -11867,6 +11898,7 @@ decode_again:
     tool_calls_free(&parsed_calls);
     wire_free(&wsess);
     buf_free(&text);
+    free(matched_stop);
     ds4_tokens_free(&effective_prompt);
 }
 
@@ -13336,6 +13368,8 @@ struct cont_stream {
     bool   saw_orphan_tool_end;
     const char *finish_override; /* "stop"/"tool_calls": scan verdict; beats the
                                   * engine's eos/budget finish at finalize */
+    char *matched_stop;          /* Inc 2c: the stop-sequence text the scan hit
+                                  * (owned; captured before truncation) */
     /* Spec+tools: the cont-path port of generate_job's per-token DSML sampling
      * override.  The tracker follows the row's cumulative text exactly like the
      * serial loop's dsml_tracker; cont_sample_override (registered per admit as
@@ -13392,6 +13426,7 @@ static void cont_stream_discard(job *j) {
     if (!j->cstream) return;
     wire_free(&j->cstream->wsess);
     buf_free(&j->cstream->text);
+    free(j->cstream->matched_stop);
     free(j->cstream);
     j->cstream = NULL;
 }
@@ -13551,6 +13586,9 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
         if (ok) {
             ds4_wire_result res = {0};
             wire_result_set_finish(&res, fin);
+            res.matched_stop = st->matched_stop;
+            if (st->matched_stop && res.stop_cause == DS4_STOP_EOS)
+                res.stop_cause = DS4_STOP_SEQUENCE;
             res.raw = st->text.ptr ? st->text.ptr : "";
             res.raw_len = st->text.len;
             res.calls = &calls;
@@ -13565,6 +13603,7 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
     tool_calls_free(&calls);
     wire_free(&st->wsess);
     buf_free(&st->text);
+    free(st->matched_stop);
     free(st);
     j->cstream = NULL;
 }
@@ -13601,6 +13640,9 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         ds4_wire_result res = {0};
         wire_init(&ws, wire_surface_for(&j->req), id);
         wire_result_set_finish(&res, fin);
+        res.matched_stop = st->matched_stop;
+        if (st->matched_stop && res.stop_cause == DS4_STOP_EOS)
+            res.stop_cause = DS4_STOP_SEQUENCE;
         res.content = content ? content : (st->text.ptr ? st->text.ptr : "");
         res.reasoning = reasoning;
         res.calls = &calls;
@@ -13617,6 +13659,9 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         ds4_wire_result res = {0};
         wire_init(&ws, wire_surface_for(&j->req), id);
         wire_result_set_finish(&res, fin);
+        res.matched_stop = st->matched_stop;
+        if (st->matched_stop && res.stop_cause == DS4_STOP_EOS)
+            res.stop_cause = DS4_STOP_SEQUENCE;
         res.content = st->text.ptr ? st->text.ptr : "";
         res.calls = &empty;
         res.prompt_tokens = prompt_tokens;
@@ -13738,7 +13783,9 @@ static int cont_on_token(void *ud, void *user, int token) {
     t_emit_job = NULL;
 
     if (hit_stop) {
-        (void)stop_len;
+        free(st->matched_stop);   /* Inc 2c: capture before truncation */
+        st->matched_stop = st->text.ptr ? xstrndup(st->text.ptr + stop_pos, stop_len)
+                                        : NULL;
         st->text.len = stop_pos;
         if (st->text.ptr) st->text.ptr[st->text.len] = '\0';
         st->finish_override = "stop";
@@ -16377,7 +16424,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     tool_calls calls = make_swapped_bash_call();
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_test", &st,
                                           raw, strlen(raw), &calls,
-                                          "tool_calls", 8));
+                                          "tool_calls", NULL, 8));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -16453,7 +16500,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     TEST_ASSERT(!strncmp(calls.v[0].id, "toolu_", 6));
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tool", &st,
                                           raw_complete, strlen(raw_complete),
-                                          &calls, "tool_calls", 5));
+                                          &calls, "tool_calls", NULL, 5));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -16507,7 +16554,7 @@ static void test_anthropic_usage_reports_cache_details(void) {
         return;
     }
 
-    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2));
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_usage", "OK", NULL, NULL, "stop", NULL, 10, 2));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -20513,7 +20560,7 @@ static void test_tape_anthropic_stream_projection(void) {
     }
     tool_calls empty = {0};
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tape", &st,
-                                          raw.ptr, raw.len, &empty, "stop", 4));
+                                          raw.ptr, raw.len, &empty, "stop", NULL, 4));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -20630,7 +20677,7 @@ static void test_tape_buffered_final_responses(void) {
     request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_buf", "Hello world.",
-                                         NULL, &empty, "length", 4, 4));
+                                         NULL, &empty, "length", NULL, 4, 4));
     shutdown(sv[0], SHUT_WR);
     out = read_socket_text(sv[1]);
     TEST_ASSERT(strstr(out, "\"type\":\"message\"") != NULL);
@@ -20847,7 +20894,7 @@ static void test_wire_finish_buffered_matches_direct_emitters(void) {
             if (r.api == API_ANTHROPIC) {
                 TEST_ASSERT(anthropic_final_response(sv[0], false, &r, surfaces[si].id,
                                                      "Hello world.", NULL, &empty,
-                                                     finishes[fi], 4, 4));
+                                                     finishes[fi], NULL, 4, 4));
             } else if (r.api == API_RESPONSES) {
                 TEST_ASSERT(responses_final_response(sv[0], false, &r, surfaces[si].id,
                                                      "Hello world.", NULL, &empty,
@@ -20930,7 +20977,7 @@ static void test_wire_finish_stream_matches_direct_dispatch(void) {
                                                     raw.ptr, raw.len, false));
         }
         TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_wire_st", &st,
-                                              raw.ptr, raw.len, &empty, "stop", 4));
+                                              raw.ptr, raw.len, &empty, "stop", NULL, 4));
         shutdown(sv[0], SHUT_WR);
         direct = read_socket_text(sv[1]);
         close(sv[0]); close(sv[1]);
@@ -21439,7 +21486,7 @@ static void test_error_envelopes_native_shapes(void) {
     out = read_socket_text(sv[1]);
     TEST_ASSERT(strstr(out, "HTTP/1.1 503") != NULL);
     TEST_ASSERT(strstr(out, "\"error\":{\"message\":") != NULL);
-    TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"server_error\"") != NULL);   /* Inc 2c: 5xx is the server's fault */
     free(out);
     close(sv[0]);
     close(sv[1]);
@@ -21551,6 +21598,59 @@ static void test_error_envelopes_native_shapes(void) {
     request_free(&rr);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* Inc 2c: a matched stop sequence is "stop_sequence" + the matched text on
+ * the Anthropic surface (buffered + stream message_delta); EOS keeps
+ * end_turn with a null stop_sequence; length still beats a match (the
+ * budget cut is the reason).  OpenAI/Responses bytes carry no stop text. */
+static void test_anthropic_stop_sequence_native_shape(void) {
+    int sv[2];
+    char *out;
+    request r;
+    tool_calls empty = {0};
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC; r.temperature = 0.0f; r.think_mode = DS4_THINK_NONE;
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) { request_free(&r); return; }
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_stop", "before",
+                                         NULL, &empty, "stop", "STOPWORD", 4, 2));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"stop_sequence\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"stop_sequence\":\"STOPWORD\"") != NULL);
+    free(out);
+    close(sv[0]); close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_eos", "hi",
+                                         NULL, &empty, "stop", NULL, 4, 2));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"end_turn\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"stop_sequence\":null") != NULL);
+    free(out);
+    close(sv[0]); close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_sse_stop_live(sv[0], "stop", "\n\nHuman:", 7));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"stop_sequence\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"stop_sequence\":\"\\n\\nHuman:\"") != NULL);
+    free(out);
+    close(sv[0]); close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_sse_stop_live(sv[0], "length", "X", 7));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"max_tokens\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"stop_sequence\":null") != NULL);
+    free(out);
+    close(sv[0]); close(sv[1]);
+    request_free(&r);
 }
 
 static void ds4_server_unit_tests_run(void) {
@@ -21682,6 +21782,7 @@ static void ds4_server_unit_tests_run(void) {
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();
+    test_anthropic_stop_sequence_native_shape();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

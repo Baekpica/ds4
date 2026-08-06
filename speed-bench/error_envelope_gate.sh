@@ -17,6 +17,12 @@
 #     resp_neg     /v1/responses max_output_tokens:-3 -> 400 names the field
 #     not_found    GET /nope -> 404 OpenAI envelope (historical owner)
 #
+#   stop honesty (Inc 2c)
+#     anth_stop    /v1/messages with stop_sequences:["beta"] on an echo
+#                  prompt -> 200 with "stop_reason":"stop_sequence" AND
+#                  "stop_sequence":"beta" (the matched text; collapsing to
+#                  end_turn told Anthropic clients the model chose to stop).
+#
 #   client cancel (Inc 2c)
 #     cancel       a live stream whose client disconnects mid-decode (curl
 #                  -m 4 on a 3000-token stream) must count
@@ -154,6 +160,13 @@ c=$(curl -s -m 20 -o "$OUT/not_found.json" -w '%{http_code}' "$BASE/nope")
 code_is not_found "$c" 404
 has not_found '"error":{"message":'
 log "not_found PASS (historical-owner envelope)"
+
+# ---- stop honesty (Inc 2c): a matched stop is stop_sequence, not end_turn --
+c=$(post anth_stop /v1/messages '{"model":"m","max_tokens":128,"stop_sequences":["beta"],"messages":[{"role":"user","content":"Repeat exactly: alpha beta gamma"}]}')
+code_is anth_stop "$c" 200
+has anth_stop '"stop_reason":"stop_sequence"'
+has anth_stop '"stop_sequence":"beta"'
+log "anth_stop PASS (matched stop surfaced natively)"
 
 # ---- budget matrix ----------------------------------------------------------
 c=$(post anth_zero /v1/messages '{"model":"m","max_tokens":0,"messages":[{"role":"user","content":"prewarm this prompt"}]}')
