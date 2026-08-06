@@ -35600,7 +35600,25 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         if (te && te[0]) { const double v = atof(te); if (v >= 0.0 && isfinite(v)) dspark_shadow_credit_cap = v; }
     }
     if (dspark_trace) ok = ok && dspark_tb;
+    /* v0.5.6 Inc 2c gate-teeth: DS4_GATE_CONT_FAIL_AFTER_STEPS=N forces a
+     * mid-loop failure after N passes with live rows -- every live bank is
+     * stranded exactly as a real engine failure strands it (no on_done, rc
+     * nonzero, err set), so the server's honest-outcome sweep can be
+     * exercised end to end through the REAL serving path.  Off by default. */
+    const char *gate_fail_env = getenv("DS4_GATE_CONT_FAIL_AFTER_STEPS");
+    const long  gate_fail_after = (gate_fail_env && gate_fail_env[0]) ? atol(gate_fail_env) : -1;
+    long gate_live_passes = 0;
     while (ok) {
+        if (gate_fail_after >= 0) {
+            bool gate_any_live = false;
+            for (uint32_t i = 0; i < MS; i++) if (live[i]) { gate_any_live = true; break; }
+            if (gate_any_live && gate_live_passes++ >= gate_fail_after) {
+                CG_ERR("gate-forced continuous failure (DS4_GATE_CONT_FAIL_AFTER_STEPS=%ld)",
+                       gate_fail_after);
+                ok = false;
+                break;
+            }
+        }
         const double dspark_trace_t0 = dspark_trace ? now_sec() : 0.0;
         /* ---- ADMIT: fill free banks from the waiting queue.  At most MS
          * placements per pass (the outer loop re-enters immediately when

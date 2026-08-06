@@ -8205,7 +8205,14 @@ struct job {
     uint8_t outcome;      /* JOB_OUT_* */
 };
 
-enum { JOB_OUT_COMPLETED = 0, JOB_OUT_FAILED, JOB_OUT_REFUSED_DEEP_SERIAL };
+/* Inc 2c: CANCELED = the CLIENT ended the request (disconnected while
+ * queued, vanished mid-generation, or fell behind the output cap) --
+ * distinct from FAILED (the server could not serve).  Set explicitly at the
+ * zombie-reap sites; every mid-flight cancel is caught at the settle site
+ * via job.client_gone, so a delivered-then-failed-write response never
+ * counts completed. */
+enum { JOB_OUT_COMPLETED = 0, JOB_OUT_FAILED, JOB_OUT_REFUSED_DEEP_SERIAL,
+       JOB_OUT_CANCELED };
 
 /* v0.5.6 Inc 0a: route observation -- record which serving lane took each
  * request, keyed by WIRE SURFACE (not API vendor: OpenAI Chat and legacy
@@ -12104,7 +12111,7 @@ static job *dequeue(server *s) {
             server_log(DS4_LOG_WARNING,
                        "ds4-server: reaped queued request: client disconnected before admission "
                        "(prompt=%d tokens never prefilled)", j->req.prompt.len);
-            j->outcome = JOB_OUT_FAILED;
+            j->outcome = JOB_OUT_CANCELED;   /* Inc 2c: the client left; the server did not fail */
             job_finish(j);
             continue;
         }
@@ -12403,7 +12410,7 @@ static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_t
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: reaped queued request: client disconnected before batch gather "
                            "(prompt=%d tokens never prefilled)", g->req.prompt.len);
-                g->outcome = JOB_OUT_FAILED;
+                g->outcome = JOB_OUT_CANCELED;   /* Inc 2c */
                 job_finish(g);
                 continue;
             }
@@ -13225,7 +13232,7 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
                     server_log(DS4_LOG_WARNING,
                                "ds4-server: reaped queued request: client disconnected before cont admit "
                                "(prompt=%d tokens never prefilled)", j->req.prompt.len);
-                    j->outcome = JOB_OUT_FAILED;
+                    j->outcome = JOB_OUT_CANCELED;   /* Inc 2c */
                     job_finish(j);
                     j = NULL;
                     continue;                       /* zombie freed a spot — try the next head */
@@ -13387,6 +13394,20 @@ static void cont_stream_discard(job *j) {
     buf_free(&j->cstream->text);
     free(j->cstream);
     j->cstream = NULL;
+}
+
+/* Inc 2c: terminal for a live stream the ENGINE stranded (mid-loop failure).
+ * The old path fabricated finish="length" -- a successful budget stop -- for
+ * what is an engine failure (plan §2.1, matrix defect 2), and counted the
+ * job completed.  Emit the surface's native stream-error shape instead (the
+ * transport is still writable here: the failure was the engine's, not the
+ * socket's) and leave outcome marking to the caller.  Frees the stream
+ * state. */
+static void cont_stream_error_abort(job *j, const char *msg) {
+    cont_stream *st = j->cstream;
+    if (st && st->started && !st->failed)
+        wire_stream_error(j->fd, &j->req, &st->wsess, msg);
+    cont_stream_discard(j);
 }
 
 /* Send SSE headers + (chat) role preamble and mint the completion id.  Sets
@@ -13825,8 +13846,16 @@ static void generate_continuous_jobs(server *s, job *first) {
             ds4_tokens_free(&jb->warm_prompt);   /* A2a: engine no longer reads it */
             memset(&jb->warm_prompt, 0, sizeof(jb->warm_prompt));
         }
-        if (jb->cstream && jb->req.stream) { /* already streamed into jb->out -> finalize there too */
-            t_emit_job = jb; cont_stream_finalize(s, jb, "length"); t_emit_job = NULL;
+        if (jb->cstream && jb->req.stream && jb->cstream->started) {
+            /* Inc 2c: bytes are on the wire, so this stream cannot restart --
+             * and it FAILED, so it must not close as a fabricated
+             * finish="length" (the pre-2c behavior counted it completed).
+             * Native stream-error event + failed accounting. */
+            t_emit_job = jb;
+            cont_stream_error_abort(jb, err[0] ? err
+                                               : "engine failure stranded this stream");
+            t_emit_job = NULL;
+            jb->outcome = JOB_OUT_FAILED;
             job_finish(jb);
             fallback++;
         } else if (serial_max > 0 && jb->req.prompt.len > serial_max) {
@@ -14290,9 +14319,11 @@ static void send_metrics(server *s, int fd) {
     buf_printf(&b, "# TYPE ds4_requests_total counter\n"
                    "ds4_requests_total{outcome=\"completed\"} %llu\n"
                    "ds4_requests_total{outcome=\"failed\"} %llu\n"
+                   "ds4_requests_total{outcome=\"canceled\"} %llu\n"
                    "ds4_requests_total{outcome=\"refused_deep_serial\"} %llu\n",
                (unsigned long long)ds4_metric_read(&m->requests_completed),
                (unsigned long long)ds4_metric_read(&m->requests_failed),
+               (unsigned long long)ds4_metric_read(&m->requests_canceled),
                (unsigned long long)ds4_metric_read(&m->requests_refused_deep_serial));
     buf_printf(&b, "# TYPE ds4_requests_inflight gauge\n"
                    "ds4_requests_inflight %llu\n",
@@ -14416,6 +14447,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                    (unsigned long long)ds4_metric_read(&m->derived_artifacts));
         buf_printf(&b, ",\"serving\":{\"requests_started\":%llu,"
                        "\"requests_completed\":%llu,\"requests_failed\":%llu,"
+                       "\"requests_canceled\":%llu,"
                        "\"requests_refused_deep_serial\":%llu,"
                        "\"requests_serial\":%llu,\"cont_batch_failures\":%llu,"
                        "\"tokens_decoded\":%llu,\"decode_steps\":%llu,"
@@ -14423,6 +14455,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                    (unsigned long long)ds4_metric_read(&m->requests_started),
                    (unsigned long long)ds4_metric_read(&m->requests_completed),
                    (unsigned long long)ds4_metric_read(&m->requests_failed),
+                   (unsigned long long)ds4_metric_read(&m->requests_canceled),
                    (unsigned long long)ds4_metric_read(&m->requests_refused_deep_serial),
                    (unsigned long long)ds4_metric_read(&m->requests_serial),
                    (unsigned long long)ds4_metric_read(&m->cont_batch_failures),
@@ -14495,6 +14528,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                    "requests_started:%llu\n"
                    "requests_completed:%llu\n"
                    "requests_failed:%llu\n"
+                   "requests_canceled:%llu\n"
                    "requests_refused_deep_serial:%llu\n"
                    "requests_serial:%llu\n"
                    "cont_batch_failures:%llu\n"
@@ -14505,6 +14539,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                (unsigned long long)ds4_metric_read(&m->requests_started),
                (unsigned long long)ds4_metric_read(&m->requests_completed),
                (unsigned long long)ds4_metric_read(&m->requests_failed),
+               (unsigned long long)ds4_metric_read(&m->requests_canceled),
                (unsigned long long)ds4_metric_read(&m->requests_refused_deep_serial),
                (unsigned long long)ds4_metric_read(&m->requests_serial),
                (unsigned long long)ds4_metric_read(&m->cont_batch_failures),
@@ -14719,6 +14754,13 @@ static void *client_main(void *arg) {
             ds4_metric_add(&mreg->requests_failed, 1);
         else if (j.outcome == JOB_OUT_REFUSED_DEEP_SERIAL)
             ds4_metric_add(&mreg->requests_refused_deep_serial, 1);
+        else if (j.outcome == JOB_OUT_CANCELED || j.client_gone)
+            /* Inc 2c: the client left (queued reap, mid-generation vanish,
+             * output-cap eviction, or a failed final drain).  Whatever the
+             * writers produced was never delivered -- honest outcomes never
+             * count it completed.  Server faults above take precedence: a
+             * flaky client must not mask a real failure. */
+            ds4_metric_add(&mreg->requests_canceled, 1);
         else
             ds4_metric_add(&mreg->requests_completed, 1);
     }

@@ -17,6 +17,23 @@
 #     resp_neg     /v1/responses max_output_tokens:-3 -> 400 names the field
 #     not_found    GET /nope -> 404 OpenAI envelope (historical owner)
 #
+#   client cancel (Inc 2c)
+#     cancel       a live stream whose client disconnects mid-decode (curl
+#                  -m 4 on a 3000-token stream) must count
+#                  requests_total{outcome="canceled"} -- never completed
+#                  (the pre-2c behavior counted every mid-flight cancel as
+#                  a completed request).
+#
+#   failure injection (Inc 2c)
+#     strand       reboot with DS4_GATE_CONT_FAIL_AFTER_STEPS=8 (engine
+#                  gate-teeth: strands every live bank mid-decode exactly as
+#                  a real engine failure).  A live chat stream must get real
+#                  deltas, then the NATIVE stream-error event carrying the
+#                  forced-failure message -- and NO fabricated
+#                  finish="length" / [DONE] (the pre-2c dishonesty, plan
+#                  §2.1 / matrix defect 2).  Counters: the request counts
+#                  FAILED, never completed; cont_batch_failures increments.
+#
 #   budget matrix (omitted is every other gate's default; negative above)
 #     anth_zero    anthropic max_tokens:0 (prewarm contract) -> 200 +
 #                  "output_tokens":0
@@ -72,7 +89,7 @@ boot(){
   log "boot: killing old ds4-server on $R"
   ssh "$R" "pkill -x ds4-server; sleep 2; pkill -9 -x ds4-server; mkdir -p $RWORK; rm -f /tmp/ds4.lock; exit 0"
   wait_mem 100
-  ssh "$R" ": > $SRV; cd $BINDIR; setsid nohup ./ds4-server -c $CTX --port $PORT \
+  ssh "$R" ": > $SRV; cd $BINDIR; env ${BOOT_ENV:-} setsid nohup ./ds4-server -c $CTX --port $PORT \
       > $SRV 2>&1 < /dev/null & exit 0"
   local n=0
   until ssh "$R" "grep -q 'listening on http' $SRV 2>/dev/null; exit \$?" 2>/dev/null; do
@@ -95,6 +112,8 @@ post(){
 has(){ grep -q "$2" "$OUT/$1.json" || fail "$1: missing [$2] in $(head -c 300 "$OUT/$1.json")"; }
 lacks(){ grep -q "$2" "$OUT/$1.json" && fail "$1: unexpected [$2] in $(head -c 300 "$OUT/$1.json")"; true; }
 code_is(){ [ "$2" = "$3" ] || fail "$1: HTTP $2, want $3 ($(head -c 300 "$OUT/$1.json"))"; }
+metric(){ curl -s -m 10 "$BASE/metrics" | grep -oE "^$1 [0-9]+" | awk '{print $2}'; }
+lmetric(){ curl -s -m 10 "$BASE/metrics" | grep -F "$1" | grep -oE '[0-9]+$'; }
 
 boot
 
@@ -162,6 +181,49 @@ c=$(post oa_clamped /v1/chat/completions '{"max_tokens":10000000,"temperature":0
 code_is oa_clamped "$c" 200
 has oa_clamped '"finish_reason":"stop"'
 log "oa_clamped PASS (huge budget served, EOS ended it)"
+
+# ---- client cancel (Inc 2c): a mid-stream disconnect counts CANCELED -------
+can0=$(lmetric 'ds4_requests_total{outcome="canceled"}')
+ccomp0=$(lmetric 'ds4_requests_total{outcome="completed"}')
+curl -s -m 4 -o "$OUT/cancel.sse" "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' \
+     -d '{"stream":true,"temperature":0,"max_tokens":3000,"messages":[{"role":"user","content":"Write a very long story about the sea."}]}' || true
+n=0
+while :; do
+  can1=$(lmetric 'ds4_requests_total{outcome="canceled"}')
+  [ "${can1:-0}" -gt "${can0:-0}" ] && break
+  n=$((n+1)); [ $n -ge 24 ] && fail "cancel: canceled counter never incremented (${can0:-?} -> ${can1:-?})"
+  sleep 5
+done
+ccomp1=$(lmetric 'ds4_requests_total{outcome="completed"}')
+[ "${ccomp1:-0}" -eq "${ccomp0:-0}" ] || fail "cancel: canceled stream counted COMPLETED ($ccomp0 -> $ccomp1)"
+log "cancel PASS (mid-stream disconnect counted canceled, not completed)"
+
+# ---- failure injection: engine-stranded live stream (Inc 2c) ---------------
+BOOT_ENV="DS4_GATE_CONT_FAIL_AFTER_STEPS=8" boot
+comp0=$(lmetric 'ds4_requests_total{outcome="completed"}')
+fail0=$(lmetric 'ds4_requests_total{outcome="failed"}')
+c=$(curl -s -m 90 -o "$OUT/strand.sse" -w '%{http_code}' "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' \
+     -d '{"stream":true,"temperature":0,"max_tokens":400,"messages":[{"role":"user","content":"Count slowly from one to fifty in words."}]}')
+code_is strand "$c" 200   # headers + deltas went out before the failure
+grep -qE '"delta":\{"(content|reasoning_content)":' "$OUT/strand.sse" \
+  || fail "strand: no deltas before the failure"
+grep -q 'event: error' "$OUT/strand.sse" || fail "strand: native stream-error event missing"
+grep -q '"type":"server_error"' "$OUT/strand.sse" || fail "strand: error payload missing"
+grep -q 'gate-forced continuous failure' "$OUT/strand.sse" \
+  || fail "strand: forced-failure cause not surfaced"
+grep -q '"finish_reason":"length"' "$OUT/strand.sse" \
+  && fail "strand: fabricated length finish still present"
+grep -q 'data: \[DONE\]' "$OUT/strand.sse" \
+  && fail "strand: fabricated DONE after failure"
+comp1=$(lmetric 'ds4_requests_total{outcome="completed"}')
+fail1=$(lmetric 'ds4_requests_total{outcome="failed"}')
+cbf=$(metric ds4_cont_batch_failures_total)
+[ "${fail1:-0}" -gt "${fail0:-0}" ] || fail "strand: requests failed counter did not increment ($fail0 -> ${fail1:-?})"
+[ "${comp1:-0}" -eq "${comp0:-0}" ] || fail "strand: stranded stream counted COMPLETED ($comp0 -> $comp1)"
+[ -n "$cbf" ] && [ "$cbf" -ge 1 ] || fail "strand: cont_batch_failures=${cbf:-absent}"
+log "strand PASS (deltas -> native error event, counted failed not completed, cont_batch_failures=$cbf)"
 
 ssh "$R" "pkill -x ds4-server; exit 0"
 log "ALL LEGS PASS — artifacts in $OUT (server killed, $R left free)"

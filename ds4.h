@@ -480,6 +480,7 @@ typedef struct {
     uint64_t requests_started;
     uint64_t requests_completed;            /* a response was written */
     uint64_t requests_failed;               /* a 5xx/prefill-failure was written */
+    uint64_t requests_canceled;             /* client left before delivery (Inc 2c) */
     uint64_t requests_refused_deep_serial;  /* deep-serial guard 503s */
     uint64_t requests_serial;               /* served on the legacy serial path */
     uint64_t requests_inflight;             /* gauge */
