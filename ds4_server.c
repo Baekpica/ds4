@@ -8859,6 +8859,26 @@ static bool wire_finish_stream(int fd, server *s, const request *r,
     return ok;
 }
 
+/* Error projection (Inc 1c).  Every surface keeps today's envelopes --
+ * http_error's OpenAI shape for all surfaces, sse_error_event's
+ * anthropic/generic split -- but the SURFACE is now explicit at every error
+ * exit, so the endpoint-native serializers (Inc 2) flip inside these two
+ * functions without touching call sites.  Pre-parse and endpoint-level
+ * errors pass DS4_WIRE_OPENAI_CHAT: the historical owner of the shared
+ * envelope, not a claim about the client. */
+static bool wire_http_error(int fd, bool enable_cors, ds4_wire_surface surface,
+                            int code, const char *msg) {
+    (void)surface;
+    return http_error(fd, enable_cors, code, msg);
+}
+
+static bool wire_stream_error(int fd, const request *r, ds4_wire_session *ws,
+                              const char *msg) {
+    bool ok = sse_error_event(fd, r, msg);
+    if (ws) ws->terminal = true;
+    return ok;
+}
+
 /* Buffered terminal: one call per surface, exact current bytes. */
 static bool wire_finish_buffered(int fd, bool enable_cors, const request *r,
                                  ds4_wire_session *ws, const ds4_wire_result *res) {
@@ -10381,7 +10401,7 @@ static void send_prefill_failure_response(server *s, const job *j,
                        flags && flags[0] ? flags : "", err);
             return;
         }
-        if (!sse_error_event(j->fd, &j->req, err)) {
+        if (!wire_stream_error(j->fd, &j->req, NULL, err)) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s prefill SSE error failed: %s",
                        kind, ctx, flags && flags[0] ? " " : "",
@@ -10389,7 +10409,7 @@ static void send_prefill_failure_response(server *s, const job *j,
         }
         return;
     }
-    http_error(j->fd, s->enable_cors, 500, err);
+    wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 500, err);
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -10729,15 +10749,15 @@ static void generate_job(server *s, job *j) {
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
         ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Responses continuation state is not available; retry by replaying the full input history");
+        wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 409,
+                        "Responses continuation state is not available; retry by replaying the full input history");
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
     {
         ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Anthropic continuation state is not available; retry by replaying the full messages history");
+        wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 409,
+                        "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0) {
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
@@ -12029,7 +12049,7 @@ static bool serial_session_ensure_fit(server *s, job *j) {
              "Server is temporarily at capacity for a %d-token serial request "
              "(no session graph fits beside the batch banks); retry shortly",
              j->req.prompt.len);
-    http_error(j->fd, s->enable_cors, 503, msg);
+    wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 503, msg);
     j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
     return false;
 }
@@ -13504,7 +13524,7 @@ static void generate_continuous_jobs(server *s, job *first) {
             server_log(DS4_LOG_WARNING,
                        "ds4-server: deep-serial guard: refusing serial fallback for %d-token prompt (max %d)",
                        jb->req.prompt.len, serial_max);
-            http_error(jb->fd, s->enable_cors, 503, msg);
+            wire_http_error(jb->fd, s->enable_cors, wire_surface_for(&jb->req), 503, msg);
             jb->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
             job_finish(jb);
             refused++;
@@ -13819,7 +13839,7 @@ static void handle_batch(server *s, int fd, const char *body) {
     bool parse_ok = true;
 
     json_ws(&p);
-    if (*p != '{') { http_error(fd, s->enable_cors, 400, "batch: body must be a JSON object"); return; }
+    if (*p != '{') { wire_http_error(fd, s->enable_cors, DS4_WIRE_OPENAI_CHAT, 400, "batch: body must be a JSON object"); return; }
     p++;
     json_ws(&p);
     while (*p && *p != '}') {
@@ -13861,9 +13881,9 @@ static void handle_batch(server *s, int fd, const char *body) {
     if (!parse_ok || n == 0) {
         for (int i = 0; i < n; i++) free(prompts[i]);
         free(model);
-        http_error(fd, s->enable_cors, 400,
-                   parse_ok ? "batch: 'prompts' must be a non-empty array of strings"
-                            : "batch: malformed JSON body");
+        wire_http_error(fd, s->enable_cors, DS4_WIRE_OPENAI_CHAT, 400,
+                        parse_ok ? "batch: 'prompts' must be a non-empty array of strings"
+                                 : "batch: malformed JSON body");
         return;
     }
 
@@ -13890,9 +13910,9 @@ static void handle_batch(server *s, int fd, const char *body) {
     }
 
     if (oom) {
-        http_error(fd, s->enable_cors, 500, "batch: out of memory");
+        wire_http_error(fd, s->enable_cors, DS4_WIRE_OPENAI_CHAT, 500, "batch: out of memory");
     } else if (rc != 0) {
-        http_error(fd, s->enable_cors, 500, err[0] ? err : "batch generation failed");
+        wire_http_error(fd, s->enable_cors, DS4_WIRE_OPENAI_CHAT, 500, err[0] ? err : "batch generation failed");
     } else {
         const int eos = ds4_token_eos(s->engine);
         buf b = {0};
@@ -14215,7 +14235,7 @@ static void *client_main(void *arg) {
 
     http_request hr = {0};
     if (!read_http_request(fd, &hr)) {
-        http_error(fd, s->enable_cors, 400, "bad HTTP request");
+        wire_http_error(fd, s->enable_cors, DS4_WIRE_OPENAI_CHAT, 400, "bad HTTP request");
         goto done;
     }
     const double t_arrive = now_sec();   /* v0.2.x: pre-parse arrival, for ttft */
@@ -14268,27 +14288,33 @@ static void *client_main(void *arg) {
      * valid at -c must not be rejected because the serial session is
      * currently smaller (the cont path serves the full -c regardless). */
     const int ctx_size = s->serial_boot_ctx;
+    /* Inc 1c: the parse-failure error exit reports the URL-derived surface;
+     * a failed parse leaves req unreliable, but the endpoint is certain. */
+    ds4_wire_surface parse_surface = DS4_WIRE_OPENAI_CHAT;
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+        parse_surface = DS4_WIRE_ANTHROPIC;
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
+        parse_surface = DS4_WIRE_RESPONSES;
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
+        parse_surface = DS4_WIRE_OPENAI_COMPLETION;
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
     } else {
-        http_error(fd, s->enable_cors, 404, "unknown endpoint");
+        wire_http_error(fd, s->enable_cors, DS4_WIRE_OPENAI_CHAT, 404, "unknown endpoint");
         http_request_free(&hr);
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
-        http_error(fd, s->enable_cors, 400, err);
+        wire_http_error(fd, s->enable_cors, parse_surface, 400, err);
         goto done;
     }
     if (!req.model_from_request) {
@@ -14313,7 +14339,7 @@ static void *client_main(void *arg) {
     pthread_mutex_lock(&j.mu);
     if (!enqueue(s, &j)) {
         pthread_mutex_unlock(&j.mu);
-        http_error(fd, s->enable_cors, 503, "server shutting down");
+        wire_http_error(fd, s->enable_cors, DS4_WIRE_OPENAI_CHAT, 503, "server shutting down");
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
@@ -20154,6 +20180,48 @@ static void test_wire_session_identity_and_free(void) {
         ds4_wire_result res = {0};
         wire_result_set_finish(&res, finishes[i]);
         TEST_ASSERT(!strcmp(wire_canonical_finish(&res), finishes[i]));
+    }
+
+    /* Inc 1c: the error wrappers are byte-exact passthroughs on every
+     * surface (the OpenAI envelope + the anthropic/generic stream split). */
+    for (int api = 0; api < 2; api++) {
+        int sv[2];
+        char *direct, *wrapped;
+
+        request_init(&r, REQ_CHAT, 128);
+        r.api = api == 0 ? API_OPENAI : API_ANTHROPIC;
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        TEST_ASSERT(http_error(sv[0], false, 503, "wire error parity"));
+        shutdown(sv[0], SHUT_WR);
+        direct = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        TEST_ASSERT(wire_http_error(sv[0], false, wire_surface_for(&r), 503,
+                                    "wire error parity"));
+        shutdown(sv[0], SHUT_WR);
+        wrapped = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+        TEST_ASSERT(!strcmp(direct, wrapped));
+        free(direct); free(wrapped);
+
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        TEST_ASSERT(sse_error_event(sv[0], &r, "boom"));
+        shutdown(sv[0], SHUT_WR);
+        direct = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        ds4_wire_session es;
+        wire_init(&es, wire_surface_for(&r), "err_wire");
+        TEST_ASSERT(wire_stream_error(sv[0], &r, &es, "boom"));
+        TEST_ASSERT(es.terminal);
+        wire_free(&es);
+        shutdown(sv[0], SHUT_WR);
+        wrapped = read_socket_text(sv[1]);
+        close(sv[0]); close(sv[1]);
+        TEST_ASSERT(!strcmp(direct, wrapped));
+        free(direct); free(wrapped);
+        request_free(&r);
     }
 }
 
