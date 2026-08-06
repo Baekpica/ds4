@@ -824,9 +824,11 @@ static void request_free(request *r) {
  * Before this helper the batched lanes replaced ANY <= 0 with the server
  * default, so a route change could turn a zero-token request into a
  * ~384K-token decode.  The batched engine floors max_new at 1 (it cannot
- * retire an admission without sampling a seed token), so a zero budget that
- * reaches a batched lane decodes exactly one token; true zero-decode stays a
- * serial capability until prefill-only routing lands (plan Inc 3). */
+ * retire an admission without sampling a seed token), but the WIRE result
+ * still honors the zero budget: empty content, completion_tokens 0, finish
+ * "length" (measured live -- error_envelope_gate oa_zero leg).  True
+ * zero-decode ADMISSION stays a serial capability until prefill-only
+ * routing lands (plan Inc 3). */
 static int request_decode_budget(const request *r, int server_default) {
     if (r->max_tokens_set && r->max_tokens <= 0) return 0;
     return r->max_tokens > 0 ? r->max_tokens : server_default;
@@ -2760,10 +2762,23 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            /* Inc 2b: parse the budget as a raw number -- json_int silently
+             * clamps negatives to 0, which turned a typo'd negative budget
+             * into a prefill-only request.  Negative rejects with the
+             * client's own field name; explicit ZERO stays supported on
+             * every surface (Inc 0b route-invariant prefill-only, the
+             * Anthropic prewarm contract). */
+            double budget = 0.0;
+            if (!json_number(&p, &budget)) {
                 free(key);
                 goto bad;
             }
+            if (budget < 0) {
+                snprintf(err, errlen, "%s must be >= 0", key);
+                free(key);
+                goto bad;
+            }
+            r->max_tokens = budget > (double)INT_MAX ? INT_MAX : (int)budget;
             r->max_tokens_set = true;
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
@@ -2871,7 +2886,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
 bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
     return false;
 }
@@ -2977,10 +2992,23 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            /* Inc 2b: parse the budget as a raw number -- json_int silently
+             * clamps negatives to 0, which turned a typo'd negative budget
+             * into a prefill-only request.  Negative rejects with the
+             * client's own field name; explicit ZERO stays supported on
+             * every surface (Inc 0b route-invariant prefill-only, the
+             * Anthropic prewarm contract). */
+            double budget = 0.0;
+            if (!json_number(&p, &budget)) {
                 free(key);
                 goto bad;
             }
+            if (budget < 0) {
+                snprintf(err, errlen, "%s must be >= 0", key);
+                free(key);
+                goto bad;
+            }
+            r->max_tokens = budget > (double)INT_MAX ? INT_MAX : (int)budget;
             r->max_tokens_set = true;
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
@@ -3083,7 +3111,7 @@ bad:
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
     return false;
 }
@@ -3879,10 +3907,23 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            /* Inc 2b: parse the budget as a raw number -- json_int silently
+             * clamps negatives to 0, which turned a typo'd negative budget
+             * into a prefill-only request.  Negative rejects with the
+             * client's own field name; explicit ZERO stays supported on
+             * every surface (Inc 0b route-invariant prefill-only, the
+             * Anthropic prewarm contract). */
+            double budget = 0.0;
+            if (!json_number(&p, &budget)) {
                 free(key);
                 goto bad;
             }
+            if (budget < 0) {
+                snprintf(err, errlen, "%s must be >= 0", key);
+                free(key);
+                goto bad;
+            }
+            r->max_tokens = budget > (double)INT_MAX ? INT_MAX : (int)budget;
             r->max_tokens_set = true;
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
@@ -4026,7 +4067,7 @@ bad:
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
     return false;
 }
@@ -4097,10 +4138,23 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            /* Inc 2b: parse the budget as a raw number -- json_int silently
+             * clamps negatives to 0, which turned a typo'd negative budget
+             * into a prefill-only request.  Negative rejects with the
+             * client's own field name; explicit ZERO stays supported on
+             * every surface (Inc 0b route-invariant prefill-only, the
+             * Anthropic prewarm contract). */
+            double budget = 0.0;
+            if (!json_number(&p, &budget)) {
                 free(key);
                 goto bad;
             }
+            if (budget < 0) {
+                snprintf(err, errlen, "%s must be >= 0", key);
+                free(key);
+                goto bad;
+            }
+            r->max_tokens = budget > (double)INT_MAX ? INT_MAX : (int)budget;
             r->max_tokens_set = true;
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
@@ -4204,7 +4258,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     return true;
 bad:
     free(prompt);
-    snprintf(err, errlen, "invalid JSON request");
+    if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
     return false;
 }
@@ -8865,22 +8919,68 @@ static bool wire_finish_stream(int fd, server *s, const request *r,
     return ok;
 }
 
-/* Error projection (Inc 1c).  Every surface keeps today's envelopes --
- * http_error's OpenAI shape for all surfaces, sse_error_event's
- * anthropic/generic split -- but the SURFACE is now explicit at every error
- * exit, so the endpoint-native serializers (Inc 2) flip inside these two
- * functions without touching call sites.  Pre-parse and endpoint-level
- * errors pass DS4_WIRE_OPENAI_CHAT: the historical owner of the shared
- * envelope, not a claim about the client. */
+/* Error projection (Inc 1c wrappers, Inc 2b endpoint-native interiors).
+ * The SURFACE is explicit at every error exit (Inc 1c), and the serializers
+ * now honor it: Anthropic gets its documented {"type":"error",...} envelope
+ * with a status-mapped error type; Responses streams get the protocol's own
+ * `data:` error event with a spliced sequence_number.  OpenAI chat /
+ * completions / Responses BUFFERED errors keep the OpenAI envelope -- it IS
+ * the native family shape there.  Pre-parse and endpoint-level errors pass
+ * DS4_WIRE_OPENAI_CHAT: the historical owner of the shared envelope, not a
+ * claim about the client. */
+
+/* Anthropic error-type vocabulary by HTTP status (the taxonomy native SDKs
+ * switch on).  The two 409 continuation-state refusals carry
+ * invalid_request_error: the request references live state that no longer
+ * exists, and Anthropic defines no conflict type.  503 = overloaded_error,
+ * which SDKs treat as retryable -- exactly what the admission/memory-floor
+ * refusals want. */
+static const char *anthropic_error_type_for_status(int code) {
+    if (code == 429) return "rate_limit_error";
+    if (code == 404) return "not_found_error";
+    if (code == 503) return "overloaded_error";
+    if (code >= 500) return "api_error";
+    return "invalid_request_error";
+}
+
 static bool wire_http_error(int fd, bool enable_cors, ds4_wire_surface surface,
                             int code, const char *msg) {
-    (void)surface;
+    if (surface == DS4_WIRE_ANTHROPIC) {
+        buf b = {0};
+        buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"");
+        buf_puts(&b, anthropic_error_type_for_status(code));
+        buf_puts(&b, "\",\"message\":");
+        json_escape(&b, msg);
+        buf_puts(&b, "}}\n");
+        bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
+        buf_free(&b);
+        return ok;
+    }
     return http_error(fd, enable_cors, code, msg);
 }
 
 static bool wire_stream_error(int fd, const request *r, ds4_wire_session *ws,
                               const char *msg) {
-    bool ok = sse_error_event(fd, r, msg);
+    bool ok;
+    if (r && r->api == API_RESPONSES) {
+        /* Native Responses stream error: a `data:` event like every other
+         * Responses event (no `event:` line -- consumers switch on the JSON
+         * type), sequence_number continuing the live machine's counter when
+         * one exists so contiguity holds across the failure; a stream that
+         * failed before its machine started counts from 0. */
+        buf body = {0};
+        buf_puts(&body, "{\"type\":\"error\",\"code\":\"server_error\",\"message\":");
+        json_escape(&body, msg && msg[0] ? msg : "internal server error");
+        buf_puts(&body, ",\"param\":null}");
+        responses_stream pre_start = {0};
+        responses_stream *st = (ws && ws->protocol_started &&
+                                ws->surface == DS4_WIRE_RESPONSES)
+                             ? &ws->state.responses : &pre_start;
+        ok = responses_sse_emit_event(fd, st, body.ptr);
+        buf_free(&body);
+    } else {
+        ok = sse_error_event(fd, r, msg);
+    }
     if (ws) ws->terminal = true;
     return ok;
 }
@@ -14521,6 +14621,7 @@ static void *client_main(void *arg) {
 
     request req;
     char err[160];
+    err[0] = '\0';   /* Inc 2b: parsers preserve a pre-set specific message at bad: */
     bool ok = false;
     /* v0.5.2: the CONFIGURED context (parse bound + reporting), never
      * ds4_session_ctx(s->session) here -- client threads must not read the
@@ -20630,8 +20731,10 @@ static void test_wire_session_identity_and_free(void) {
         TEST_ASSERT(!strcmp(wire_canonical_finish(&res), finishes[i]));
     }
 
-    /* Inc 1c: the error wrappers are byte-exact passthroughs on every
-     * surface (the OpenAI envelope + the anthropic/generic stream split). */
+    /* Inc 1c/2b: the error wrappers are byte-exact passthroughs where the
+     * shared envelope IS native (OpenAI http, OpenAI + Anthropic stream);
+     * Anthropic http and Responses stream shapes are asserted natively in
+     * test_error_envelopes_native_shapes. */
     for (int api = 0; api < 2; api++) {
         int sv[2];
         char *direct, *wrapped;
@@ -20639,19 +20742,21 @@ static void test_wire_session_identity_and_free(void) {
         request_init(&r, REQ_CHAT, 128);
         r.api = api == 0 ? API_OPENAI : API_ANTHROPIC;
 
-        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-        TEST_ASSERT(http_error(sv[0], false, 503, "wire error parity"));
-        shutdown(sv[0], SHUT_WR);
-        direct = read_socket_text(sv[1]);
-        close(sv[0]); close(sv[1]);
-        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-        TEST_ASSERT(wire_http_error(sv[0], false, wire_surface_for(&r), 503,
-                                    "wire error parity"));
-        shutdown(sv[0], SHUT_WR);
-        wrapped = read_socket_text(sv[1]);
-        close(sv[0]); close(sv[1]);
-        TEST_ASSERT(!strcmp(direct, wrapped));
-        free(direct); free(wrapped);
+        if (r.api == API_OPENAI) {
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            TEST_ASSERT(http_error(sv[0], false, 503, "wire error parity"));
+            shutdown(sv[0], SHUT_WR);
+            direct = read_socket_text(sv[1]);
+            close(sv[0]); close(sv[1]);
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            TEST_ASSERT(wire_http_error(sv[0], false, wire_surface_for(&r), 503,
+                                        "wire error parity"));
+            shutdown(sv[0], SHUT_WR);
+            wrapped = read_socket_text(sv[1]);
+            close(sv[0]); close(sv[1]);
+            TEST_ASSERT(!strcmp(direct, wrapped));
+            free(direct); free(wrapped);
+        }
 
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
         TEST_ASSERT(sse_error_event(sv[0], &r, "boom"));
@@ -21274,17 +21379,20 @@ static void test_responses_durable_references_rejected_at_parse(void) {
     TEST_ASSERT(strstr(err, "conversation") != NULL);
 }
 
-/* Error-envelope record (KNOWN GAP, plan Inc 2): http_error takes no
- * request, so parse/409/503/shutdown failures send the OpenAI envelope to
- * every surface; only sse_error_event branches for Anthropic, and Responses
- * streams get the generic OpenAI error event. */
-static void test_error_envelopes_record_current_shapes(void) {
+/* Inc 2b: endpoint-native error envelopes (surface-matrix defect 3 FIXED).
+ * OpenAI keeps the shared envelope (it is native there); Anthropic buffered
+ * errors carry the documented {"type":"error",...} envelope with a
+ * status-mapped type; Responses stream errors are protocol events with a
+ * spliced sequence_number that continues a live machine's counter. */
+static void test_error_envelopes_native_shapes(void) {
     int sv[2];
     char *out;
 
+    /* OpenAI: unchanged shared envelope through the wrapper. */
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
-    TEST_ASSERT(http_error(sv[0], false, 503, "server is shutting down"));
+    TEST_ASSERT(wire_http_error(sv[0], false, DS4_WIRE_OPENAI_CHAT, 503,
+                                "server is shutting down"));
     shutdown(sv[0], SHUT_WR);
     out = read_socket_text(sv[1]);
     TEST_ASSERT(strstr(out, "HTTP/1.1 503") != NULL);
@@ -21294,6 +21402,33 @@ static void test_error_envelopes_record_current_shapes(void) {
     close(sv[0]);
     close(sv[1]);
 
+    /* Anthropic buffered: native envelope, full status->type map. */
+    static const struct { int code; const char *type; } amap[] = {
+        { 400, "invalid_request_error" }, { 404, "not_found_error" },
+        { 409, "invalid_request_error" }, { 429, "rate_limit_error" },
+        { 500, "api_error" },             { 503, "overloaded_error" },
+    };
+    for (size_t i = 0; i < sizeof(amap) / sizeof(amap[0]); i++) {
+        char head[96], expect[96];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        TEST_ASSERT(wire_http_error(sv[0], false, DS4_WIRE_ANTHROPIC,
+                                    amap[i].code, "boom"));
+        shutdown(sv[0], SHUT_WR);
+        out = read_socket_text(sv[1]);
+        snprintf(head, sizeof(head), "HTTP/1.1 %d", amap[i].code);
+        snprintf(expect, sizeof(expect),
+                 "{\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":\"boom\"}}",
+                 amap[i].type);
+        TEST_ASSERT(strstr(out, head) != NULL);
+        TEST_ASSERT(strstr(out, expect) != NULL);
+        TEST_ASSERT(strstr(out, "\"error\":{\"message\":") == NULL);   /* no OpenAI shape */
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    /* Anthropic stream: the native event (unchanged bytes, still through
+     * sse_error_event's branch). */
     request a;
     request_init(&a, REQ_CHAT, 128);
     a.api = API_ANTHROPIC;
@@ -21309,17 +21444,68 @@ static void test_error_envelopes_record_current_shapes(void) {
     close(sv[0]);
     close(sv[1]);
 
+    /* Inc 2b: negative budgets reject at parse with the client's own field
+     * name; the specific message survives the shared bad: epilogue.  NULL
+     * engine/server is safe -- the check fires before anything needs them
+     * (the durable-reference contract test set the precedent). */
+    {
+        char err[160];
+        request pr;
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL, "{\"max_tokens\":-1}",
+                                        128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "max_tokens must be >= 0") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+                                        "{\"max_completion_tokens\":-2}",
+                                        128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "max_completion_tokens must be >= 0") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_anthropic_request(NULL, NULL, "{\"max_tokens\":-1}",
+                                             128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "max_tokens must be >= 0") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_responses_request(NULL, NULL,
+                                             "{\"max_output_tokens\":-3}",
+                                             128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "max_output_tokens must be >= 0") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_completion_request(NULL, "{\"max_tokens\":-1}",
+                                              128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "max_tokens must be >= 0") != NULL);
+    }
+
+    /* Responses stream, no machine yet: protocol event, sequence 0. */
     request rr;
     request_init(&rr, REQ_CHAT, 128);
     rr.api = API_RESPONSES;
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) { request_free(&rr); return; }
-    TEST_ASSERT(sse_error_event(sv[0], &rr, "boom"));
+    TEST_ASSERT(wire_stream_error(sv[0], &rr, NULL, "boom"));
     shutdown(sv[0], SHUT_WR);
     out = read_socket_text(sv[1]);
-    TEST_ASSERT(strstr(out, "event: error") != NULL);
-    TEST_ASSERT(strstr(out, "\"type\":\"server_error\"") != NULL);   /* OpenAI shape */
+    TEST_ASSERT(strstr(out, "data: {\"type\":\"error\",\"sequence_number\":0,"
+                            "\"code\":\"server_error\",\"message\":\"boom\","
+                            "\"param\":null}") != NULL);
+    TEST_ASSERT(strstr(out, "event: error") == NULL);   /* data-only, like every Responses event */
     free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* Responses stream, live machine: the counter continues and advances. */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    ds4_wire_session ws;
+    wire_init(&ws, DS4_WIRE_RESPONSES, "resp_err");
+    ws.protocol_started = true;
+    ws.state.responses.sequence = 7;
+    TEST_ASSERT(wire_stream_error(sv[0], &rr, &ws, "late failure"));
+    TEST_ASSERT(ws.terminal);
+    TEST_ASSERT(ws.state.responses.sequence == 8);
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"sequence_number\":7,\"code\":\"server_error\"") != NULL);
+    free(out);
+    wire_free(&ws);   /* zeroed machine bufs -> the responses free path is a no-op */
     request_free(&rr);
     close(sv[0]);
     close(sv[1]);
@@ -21453,7 +21639,7 @@ static void ds4_server_unit_tests_run(void) {
     test_credit_union_sums_per_run_need();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
-    test_error_envelopes_record_current_shapes();
+    test_error_envelopes_native_shapes();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

@@ -99,10 +99,21 @@ default like every other surface.
    cont-engagement line.
 2. **Engine-failure stranding finalizes live streams as `length`**
    (continuous lane), conflating a failure with a budget stop.
-3. **`http_error` sends the OpenAI envelope to every surface** for parse,
-   409, 503, and shutdown failures. Only context-length errors and stream
-   errors partially branch per protocol
-   (`http_error_context_length_exceeded`, `sse_error_event`).
+3. **FIXED (Inc 2b): error envelopes are endpoint-native.** Anthropic
+   buffered errors carry the documented `{"type":"error","error":{...}}`
+   envelope with a status-mapped type (400/409 `invalid_request_error`,
+   404 `not_found_error`, 429 `rate_limit_error`, 500 `api_error`,
+   503 `overloaded_error` — retryable in the native SDKs); Responses
+   stream errors are protocol `data:` events (`{"type":"error",...}`)
+   whose spliced `sequence_number` continues a live machine's counter.
+   OpenAI chat/completions and Responses buffered errors keep the OpenAI
+   envelope — it is the native family shape there. The flip happened
+   inside `wire_http_error`/`wire_stream_error` (Inc 1c made the surface
+   explicit at every call site, including the two 409 continuation-state
+   refusals). Negative decode budgets now reject at parse with the
+   client's own field name (`max_tokens` / `max_completion_tokens` /
+   `max_output_tokens`); explicit ZERO stays supported on every surface
+   (Inc 0b route-invariant prefill-only, the Anthropic prewarm contract).
 4. **FIXED (Inc 0b): admission accounting dropped decode-growth
    commitments** once a bank's prefill landed (the old `outstanding`
    charge covered pending prompt targets only). Every continuous
@@ -173,7 +184,8 @@ block/item, contiguous Responses `sequence_number`, UTF-8 hold-back):
 - `test_route_decisions_record_current_dispatch`
 - `test_idempotency_key_header_is_ignored`
 - `test_responses_durable_references_rejected_at_parse`
-- `test_error_envelopes_record_current_shapes` (defect 3)
+- `test_error_envelopes_native_shapes` (defect 3, now asserting the
+  native shapes + the negative-budget parse rejections)
 
 Existing per-feature streaming tests (`test_openai_tool_stream_*`,
 `test_anthropic_tool_stream_*`, `test_responses_*`) cover tool-call
