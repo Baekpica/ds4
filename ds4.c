@@ -33395,9 +33395,15 @@ static uint64_t ds4_mem_usable_beyond(uint64_t reserve) {
 }
 
 /* R5 Inc1b: resident bytes across the comp/index cache slabs (page multiples
- * for demand-mapped reservations; eager slabs report their full size, but
- * callers only budget when sl->vmm).  Host-side page-flag scan, no driver
- * calls. */
+ * for demand-mapped reservations).  Host-side page-flag scan, no driver
+ * calls.  CONTRACT (deepmem D-1a): this sum feeds the comp_map_budget
+ * verdict (mres), so it must cover EXACTLY the demand-mapped families the
+ * budget allowance covers -- cache_per_bank = full - floor cancels the
+ * always-eager scale slabs (comp_scale, index_scale) out of the allowance,
+ * so charging them here overstated mres by a fixed, untrimmable constant
+ * (N x sum(cap x 16 B) for the index scale: ~5 MiB at -c 16384 x 4 banks,
+ * ~336 MiB at -c 524288 x 8) and could reject admissions the budget had
+ * room for.  Eager slabs are bank-fit boot cost, not budgeted growth. */
 static uint64_t ds4_batch_slabs_cache_resident(const ds4_batch_slabs *sl) {
     uint64_t r = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -33410,12 +33416,11 @@ static uint64_t ds4_batch_slabs_cache_resident(const ds4_batch_slabs *sl) {
         if (sl->multi_index[il])
             r += ds4_gpu_tensor_resident(sl->multi_index[il], 0,
                                          (uint64_t)sl->N * sl->index_bank_bytes[il]);
-        if (sl->multi_index_fp4[il]) {   /* P2 Inc3b: demand-mapped index codes+scales */
+        if (sl->multi_index_fp4[il])   /* P2 Inc3b: demand-mapped index codes
+                                        * (the eager scale slab is NOT summed;
+                                        * neither is multi_comp_scale) */
             r += ds4_gpu_tensor_resident(sl->multi_index_fp4[il], 0,
                                          ds4_gpu_tensor_bytes(sl->multi_index_fp4[il]));
-            r += ds4_gpu_tensor_resident(sl->multi_index_scale[il], 0,
-                                         ds4_gpu_tensor_bytes(sl->multi_index_scale[il]));
-        }
     }
     return r;
 }
