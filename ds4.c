@@ -2126,6 +2126,7 @@ enum {
     DS4_TENSOR_Q4_0     = 2,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_Q5_K     = 13,
     DS4_TENSOR_Q6_K     = 14,
@@ -4173,6 +4174,13 @@ typedef struct {
     ds4_tensor *hc_attn_scale;
     ds4_tensor *hc_attn_base;
     ds4_tensor *attn_norm;
+    /* Plain GQA projections (exaone-moe). DeepSeek4/GLM reach Q, K and V
+     * through the MLA LoRA pair below instead, and leave these null. */
+    ds4_tensor *attn_q;
+    ds4_tensor *attn_k;
+    ds4_tensor *attn_v;
+    ds4_tensor *attn_q_norm;   /* per-head RMSNorm, applied before RoPE */
+    ds4_tensor *attn_k_norm;
     ds4_tensor *attn_q_a;
     ds4_tensor *attn_q_a_norm;
     ds4_tensor *attn_q_b;
@@ -5077,12 +5085,123 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+/* A mixed-quant artifact deliberately carries a different type per tensor role,
+ * so the layout check validates shape strictly and type by category: norms and
+ * the router must be F32, and everything quantizable must be one of the types
+ * the recipe can emit. Pinning an exact type per tensor here would make the
+ * engine reject any future recipe revision. */
+static bool tensor_type_is_exaone_quant(uint32_t type) {
+    return type == DS4_TENSOR_Q8_0 ||
+           type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_Q5_K ||
+           type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q3_K ||
+           type == DS4_TENSOR_Q2_K ||
+           type == DS4_TENSOR_IQ2_XXS ||
+           type == DS4_TENSOR_F16 ||
+           type == DS4_TENSOR_F32;
+}
+
+static void tensor_expect_exaone_quant_layout(
+        const ds4_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating exaone layout");
+    if (!tensor_type_is_exaone_quant(t->type)) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type %s, which the exaone-moe recipe does "
+                "not emit (expected one of q8_0, q6_K, q5_K, q4_K, q3_K, q2_K, "
+                "iq2_xxs, f16, f32)\n",
+                (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
+}
+
+static void weights_validate_exaone_moe_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    const uint64_t q_dim  = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;      /* 8192 */
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;   /* 1024 */
+
+    if (!w) ds4_die("internal error: missing weights while validating exaone layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in exaone weight layout validation");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in exaone weight layout validation");
+    }
+
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) {
+        tensor_expect_exaone_quant_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_exaone_quant_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_exaone_quant_layout(l->attn_q,      2, DS4_N_EMBD, q_dim, 0);
+        tensor_expect_exaone_quant_layout(l->attn_k,      2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_exaone_quant_layout(l->attn_v,      2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_exaone_quant_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
+        if (DS4_USE_QK_NORM) {
+            /* per-head, so head_dim long -- not n_embd */
+            tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+            tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        }
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+
+        const bool is_nextn = DS4_N_NEXTN_PREDICT != 0 &&
+                              il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+        if (il < DS4_N_LEADING_DENSE || is_nextn) {
+            tensor_expect_exaone_quant_layout(l->ffn_gate, 2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+            tensor_expect_exaone_quant_layout(l->ffn_up,   2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+            tensor_expect_exaone_quant_layout(l->ffn_down, 2, DS4_N_FF_DENSE, DS4_N_EMBD, 0);
+        } else {
+            tensor_expect_layout(l->ffn_gate_inp,    DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+            tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+            tensor_expect_exaone_quant_layout(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_exaone_quant_layout(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_exaone_quant_layout(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+            tensor_expect_exaone_quant_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_SHEXP, 0);
+            tensor_expect_exaone_quant_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_SHEXP, 0);
+            tensor_expect_exaone_quant_layout(l->ffn_down_shexp, 2, DS4_N_FF_SHEXP, DS4_N_EMBD, 0);
+        }
+
+        if (is_nextn) {
+            /* eh_proj consumes [embedding ; hidden] concatenated, hence 2*n_embd */
+            tensor_expect_exaone_quant_layout(l->nextn_eh_proj, 2, 2u * (uint64_t)DS4_N_EMBD,
+                                              DS4_N_EMBD, 0);
+            tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_shared_head_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        }
+    }
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
         uint32_t           layer_end,
         bool               require_token_embd,
         bool               require_output) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+        weights_validate_exaone_moe_layout(w, layer_start, layer_end,
+                                           require_token_embd, require_output);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_validate_glm_dsa_layout(w,
                                         layer_start,
@@ -5985,7 +6104,10 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    /* Only DeepSeek4 carries the hyper-connection output head; GLM and
+     * K-EXAONE have a plain norm + projection. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
             w->output      = required_tensor(m, "output.weight");
@@ -6056,7 +6178,61 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
     }
 }
 
+/* K-EXAONE layout. Two differences from the GLM binder worth stating:
+ *
+ *  - Attention is plain GQA, so Q/K/V are single projections rather than an
+ *    MLA LoRA pair, and each carries a per-head RMSNorm.
+ *  - The MTP block is *dense*. GLM routes every non-leading block to the MoE
+ *    tensors; here the trailing NextN block has ffn_gate/up/down like layer 0,
+ *    which is what llama.cpp's exaone-moe loader does with its `i >= n_layer`
+ *    branch. Binding it as MoE would fail on tensors that do not exist.
+ */
+static void weights_bind_exaone_moe_layer(ds4_layer_weights *l, const ds4_model *m,
+                                          uint32_t il) {
+    l->attn_norm   = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    if (DS4_USE_QK_NORM) {
+        l->attn_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+        l->attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    }
+    l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+
+    const bool is_nextn = DS4_N_NEXTN_PREDICT != 0 &&
+                          il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+    if (il < DS4_N_LEADING_DENSE || is_nextn) {
+        l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_up   = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+        l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+    } else {
+        l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+        l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+        l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+        l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+        l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+        l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+        l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+        l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+    }
+
+    if (is_nextn) {
+        l->nextn_eh_proj = required_tensorf(m, "blk.%u.nextn.eh_proj.weight", il);
+        l->nextn_enorm   = required_tensorf(m, "blk.%u.nextn.enorm.weight", il);
+        l->nextn_hnorm   = required_tensorf(m, "blk.%u.nextn.hnorm.weight", il);
+        l->nextn_shared_head_norm =
+            required_tensorf(m, "blk.%u.nextn.shared_head_norm.weight", il);
+        /* No nextn.embed_tokens / nextn.shared_head_head: K-EXAONE's MTP block
+         * reuses the base model's token embedding and LM head. */
+    }
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+        weights_bind_exaone_moe_layer(l, m, il);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_bind_glm_dsa_layer(l, m, il);
         return;
@@ -6120,9 +6296,14 @@ static void weights_bind(
         bool             optional_output) {
     memset(w, 0, sizeof(*w));
 
+    /* Families that store NextN/MTP blocks inside block_count keep them out of
+     * the executable pass; they are bound separately below so the drafter can
+     * run them. */
+    const bool has_nextn_blocks =
+        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
+         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE);
     uint32_t executable_layers = DS4_N_LAYER;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
-        DS4_N_LAYER > DS4_N_NEXTN_PREDICT) {
+    if (has_nextn_blocks && DS4_N_LAYER > DS4_N_NEXTN_PREDICT) {
         executable_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     }
     uint32_t start = 0;
@@ -6149,10 +6330,9 @@ static void weights_bind(
     for (uint32_t il = start; il <= end; il++) {
         weights_bind_layer(&w->layer[il], m, il);
     }
-    /* GLM nextn/MTP block(s): excluded from the executable pass but bound
+    /* nextn/MTP block(s): excluded from the executable pass but bound
      * so the drafter can run them. Only when the full model is loaded. */
-    if (!load_slice &&
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+    if (!load_slice && has_nextn_blocks &&
         start == 0 && end == executable_layers - 1u) {
         for (uint32_t il = executable_layers; il < DS4_N_LAYER; il++) {
             weights_bind_layer(&w->layer[il], m, il);
