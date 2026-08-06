@@ -8661,6 +8661,176 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 }
 
 /* =========================================================================
+ * Typed wire surface (v0.5.6 API Inc 1).
+ * =========================================================================
+ *
+ * The four wire surfaces the server speaks (OpenAI chat, legacy OpenAI
+ * Completion, Anthropic Messages, Responses) each own a framer above.  These
+ * types centralize the TERMINAL projection -- which surface, which typed
+ * outcome, which authoritative usage -- so the writers stop dispatching
+ * by hand on (api, kind) at every exit.  Inc 1 contract: the wrappers call
+ * the existing emitters and preserve their exact bytes and IDs; framers
+ * stay intact; no request changes lane.
+ *
+ * The canonical internal finish vocabulary is exactly four strings
+ * ("stop", "length", "tool_calls", "error"); wire_canonical_finish() and
+ * wire_result_set_finish() round-trip it losslessly, so routing a writer
+ * through the typed result cannot change bytes.  Distinctions the strings
+ * cannot carry (EOS vs matched stop sequence, engine vs repair failure)
+ * are representable here but collapse back to today's strings until the
+ * per-surface honest mappings land (Inc 2).
+ */
+
+typedef enum {
+    DS4_WIRE_OPENAI_CHAT,
+    DS4_WIRE_OPENAI_COMPLETION,
+    DS4_WIRE_ANTHROPIC,
+    DS4_WIRE_RESPONSES,
+} ds4_wire_surface;
+
+typedef enum {
+    DS4_STOP_EOS,
+    DS4_STOP_SEQUENCE,
+    DS4_STOP_TOOL_COMPLETE,
+    DS4_STOP_TOKEN_LIMIT,
+    DS4_STOP_CONTEXT_LIMIT,
+} ds4_stop_cause;
+
+typedef enum {
+    DS4_STATUS_SUCCEEDED,
+    DS4_STATUS_CLIENT_CANCELED,
+    DS4_STATUS_ADMISSION_REJECTED,
+    DS4_STATUS_RESOURCE_EXHAUSTED,
+    DS4_STATUS_ENGINE_FAILED,
+    DS4_STATUS_WIRE_FAILED,
+    DS4_STATUS_REPAIR_FAILED,
+} ds4_generation_status;
+
+/* One terminal outcome.  Views are borrowed from the writer; the result owns
+ * nothing.  Usage counts are the authoritative post-generation numbers. */
+typedef struct {
+    ds4_generation_status status;
+    ds4_stop_cause stop_cause;
+    const char *content;        /* visible assistant text (parsed when available) */
+    const char *reasoning;      /* NULL when absent */
+    const tool_calls *calls;    /* borrowed; may be an empty set, never NULL */
+    const char *matched_stop;   /* stop-sequence text when stop_cause==SEQUENCE */
+    bool recovered;             /* malformed tool block recovered to plain text */
+    int prompt_tokens;
+    int completion_tokens;
+    int reasoning_tokens;       /* consumed by the Responses surface only */
+} ds4_wire_result;
+
+/* Legacy completion streaming keeps no machine state today (plain sse_chunk
+ * with a flush position); this placeholder gives the surface a slot in the
+ * session union so the stream routing increment can move that position here. */
+typedef struct {
+    size_t plain_pos;
+} completion_stream;
+
+typedef struct {
+    ds4_wire_surface surface;
+    bool http_started;
+    bool protocol_started;      /* per-surface stream state in .state is live */
+    bool terminal;
+    long created_at;
+    char id[96];
+    union {
+        openai_stream oa_chat;
+        completion_stream oa_completion;
+        anthropic_stream anthropic;
+        responses_stream responses;
+    } state;
+} ds4_wire_session;
+
+static ds4_wire_surface wire_surface_for(const request *r) {
+    if (r->api == API_ANTHROPIC) return DS4_WIRE_ANTHROPIC;
+    if (r->api == API_RESPONSES) return DS4_WIRE_RESPONSES;
+    return r->kind == REQ_COMPLETION ? DS4_WIRE_OPENAI_COMPLETION
+                                     : DS4_WIRE_OPENAI_CHAT;
+}
+
+/* Identity lives on the session: callers mint the id exactly where they do
+ * today and hand it over once; every wrapper reads ws->id from then on. */
+static void wire_init(ds4_wire_session *ws, ds4_wire_surface surface, const char *id) {
+    memset(ws, 0, sizeof(*ws));
+    ws->surface = surface;
+    ws->created_at = (long)time(NULL);
+    if (id) snprintf(ws->id, sizeof(ws->id), "%s", id);
+}
+
+/* Idempotent: frees live per-surface stream state once, then every later
+ * call is a no-op (the union is zeroed and protocol_started cleared). */
+static void wire_free(ds4_wire_session *ws) {
+    if (!ws) return;
+    if (ws->protocol_started) {
+        switch (ws->surface) {
+        case DS4_WIRE_OPENAI_CHAT:  openai_stream_free(&ws->state.oa_chat); break;
+        case DS4_WIRE_ANTHROPIC:    anthropic_stream_free(&ws->state.anthropic); break;
+        case DS4_WIRE_RESPONSES:    responses_stream_free(&ws->state.responses); break;
+        case DS4_WIRE_OPENAI_COMPLETION: break;
+        }
+    }
+    memset(&ws->state, 0, sizeof(ws->state));
+    ws->protocol_started = false;
+}
+
+/* status/stop_cause -> today's canonical finish string (total, injective on
+ * the string side: every writer string maps back to itself). */
+static const char *wire_canonical_finish(const ds4_wire_result *res) {
+    if (res->status != DS4_STATUS_SUCCEEDED) return "error";
+    switch (res->stop_cause) {
+    case DS4_STOP_TOOL_COMPLETE: return "tool_calls";
+    case DS4_STOP_TOKEN_LIMIT:
+    case DS4_STOP_CONTEXT_LIMIT: return "length";
+    default:                     return "stop";
+    }
+}
+
+/* Inverse for writers that still carry the string: picks the coarse enum
+ * pair whose canonical projection is byte-identical to `finish`.  "stop"
+ * becomes EOS (a matched stop sequence is not distinguishable here yet) and
+ * "error" becomes ENGINE_FAILED (repair/wire causes refine in Inc 2). */
+static void wire_result_set_finish(ds4_wire_result *res, const char *finish) {
+    res->status = DS4_STATUS_SUCCEEDED;
+    res->stop_cause = DS4_STOP_EOS;
+    if (!finish) return;
+    if (!strcmp(finish, "tool_calls"))  res->stop_cause = DS4_STOP_TOOL_COMPLETE;
+    else if (!strcmp(finish, "length")) res->stop_cause = DS4_STOP_TOKEN_LIMIT;
+    else if (!strcmp(finish, "error"))  res->status = DS4_STATUS_ENGINE_FAILED;
+}
+
+/* Buffered terminal: one call per surface, exact current bytes. */
+static bool wire_finish_buffered(int fd, bool enable_cors, const request *r,
+                                 ds4_wire_session *ws, const ds4_wire_result *res) {
+    const char *finish = wire_canonical_finish(res);
+    bool ok;
+    switch (ws->surface) {
+    case DS4_WIRE_ANTHROPIC:
+        ok = anthropic_final_response(fd, enable_cors, r, ws->id,
+                                      res->content, res->reasoning, res->calls,
+                                      finish, res->prompt_tokens,
+                                      res->completion_tokens);
+        break;
+    case DS4_WIRE_RESPONSES:
+        ok = responses_final_response(fd, enable_cors, r, ws->id,
+                                      res->content, res->reasoning, res->calls,
+                                      finish, res->prompt_tokens,
+                                      res->completion_tokens,
+                                      res->reasoning_tokens);
+        break;
+    default:
+        ok = final_response(fd, enable_cors, r, ws->id,
+                            res->content, res->reasoning, res->calls,
+                            finish, res->prompt_tokens,
+                            res->completion_tokens);
+        break;
+    }
+    ws->terminal = true;
+    return ok;
+}
+
+/* =========================================================================
  * KV Cache.
  * =========================================================================
  *
@@ -11445,25 +11615,22 @@ decode_again:
                        req_flags[0] ? " " : "",
                        req_flags);
         }
-    } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
-    } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion,
-                                 reasoning_token_count(s->engine, parsed_reasoning));
     } else {
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                       parsed_reasoning,
-                       &parsed_calls, final_finish,
-                       prompt_tokens, completion);
+        /* Inc 1: typed buffered terminal -- surface dispatch lives in the
+         * wire wrapper, bytes and ids unchanged. */
+        ds4_wire_session ws;
+        ds4_wire_result res = {0};
+        wire_init(&ws, wire_surface_for(&j->req), id);
+        wire_result_set_finish(&res, final_finish);
+        res.content = parsed_content ? parsed_content : (text.ptr ? text.ptr : "");
+        res.reasoning = parsed_reasoning;
+        res.calls = &parsed_calls;
+        res.prompt_tokens = prompt_tokens;
+        res.completion_tokens = completion;
+        if (ws.surface == DS4_WIRE_RESPONSES)
+            res.reasoning_tokens = reasoning_token_count(s->engine, parsed_reasoning);
+        wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
+        wire_free(&ws);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -11944,17 +12111,33 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
                                              ds4_think_mode_enabled(j->req.think_mode),
                                              &fin, perr, sizeof(perr),
                                              &content, &reasoning, &calls, &recovered);
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       content ? content : (text.ptr ? text.ptr : ""),
-                       reasoning, &calls, fin, prompt_tokens, emitted);
+        ds4_wire_session ws;
+        ds4_wire_result res = {0};
+        wire_init(&ws, wire_surface_for(&j->req), id);
+        wire_result_set_finish(&res, fin);
+        res.content = content ? content : (text.ptr ? text.ptr : "");
+        res.reasoning = reasoning;
+        res.calls = &calls;
+        res.recovered = recovered;
+        res.prompt_tokens = prompt_tokens;
+        res.completion_tokens = emitted;
+        wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
+        wire_free(&ws);
         free(content);
         free(reasoning);
         tool_calls_free(&calls);
     } else {
         tool_calls empty = {0};
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       text.ptr ? text.ptr : "", NULL, &empty, finish,
-                       prompt_tokens, emitted);
+        ds4_wire_session ws;
+        ds4_wire_result res = {0};
+        wire_init(&ws, wire_surface_for(&j->req), id);
+        wire_result_set_finish(&res, finish);
+        res.content = text.ptr ? text.ptr : "";
+        res.calls = &empty;
+        res.prompt_tokens = prompt_tokens;
+        res.completion_tokens = emitted;
+        wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
+        wire_free(&ws);
     }
     buf_free(&text);
 }
@@ -13014,17 +13197,32 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
                                                  &fin, perr, sizeof(perr),
                                                  &content, &reasoning, &calls, &recovered);
         }
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       content ? content : (st->text.ptr ? st->text.ptr : ""),
-                       reasoning, &calls, fin, prompt_tokens, st->completion);
+        ds4_wire_session ws;
+        ds4_wire_result res = {0};
+        wire_init(&ws, wire_surface_for(&j->req), id);
+        wire_result_set_finish(&res, fin);
+        res.content = content ? content : (st->text.ptr ? st->text.ptr : "");
+        res.reasoning = reasoning;
+        res.calls = &calls;
+        res.prompt_tokens = prompt_tokens;
+        res.completion_tokens = st->completion;
+        wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
+        wire_free(&ws);
         free(content);
         free(reasoning);
         tool_calls_free(&calls);
     } else {
         tool_calls empty = {0};
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       st->text.ptr ? st->text.ptr : "", NULL, &empty, fin,
-                       prompt_tokens, st->completion);
+        ds4_wire_session ws;
+        ds4_wire_result res = {0};
+        wire_init(&ws, wire_surface_for(&j->req), id);
+        wire_result_set_finish(&res, fin);
+        res.content = st->text.ptr ? st->text.ptr : "";
+        res.calls = &empty;
+        res.prompt_tokens = prompt_tokens;
+        res.completion_tokens = st->completion;
+        wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
+        wire_free(&ws);
     }
     cont_stream_discard(j);
 }
@@ -19798,6 +19996,206 @@ static void test_tape_buffered_final_responses(void) {
     close(sv[1]);
 }
 
+/* Inc 1 equivalence normalizer: only the "created"/"created_at" epoch digits
+ * may differ between two renders that straddle a second boundary; everything
+ * else must be byte-identical, so IDs, ordering, and structure stay asserted. */
+static char *wire_test_normalize_created(const char *in) {
+    size_t n = strlen(in);
+    char *out = xmalloc(n + 2);
+    size_t o = 0;
+    for (size_t i = 0; i < n; ) {
+        const char *k1 = "\"created\":";
+        const char *k2 = "\"created_at\":";
+        size_t l = 0;
+        if (!strncmp(in + i, k1, strlen(k1))) l = strlen(k1);
+        else if (!strncmp(in + i, k2, strlen(k2))) l = strlen(k2);
+        if (l) {
+            memcpy(out + o, in + i, l); o += l; i += l;
+            while (in[i] >= '0' && in[i] <= '9') i++;
+            out[o++] = '0';
+        } else {
+            out[o++] = in[i++];
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
+/* §6.1: canonicalize first-seen opaque ids (letters-only prefix, >=12 hex
+ * digits) to prefix#N in first-seen order.  The Responses surface mints
+ * fresh resp_/msg_/rs_/fc_ ids per render, so equivalence must compare
+ * their PREFIX and reference structure, not the random bytes; repeated
+ * references keep the same placeholder, so relationships stay asserted. */
+static char *wire_test_canonicalize_ids(const char *in) {
+    char *seen[64];
+    size_t nseen = 0;
+    size_t n = strlen(in);
+    buf b = {0};
+    size_t i = 0;
+    while (i < n) {
+        size_t j = i;
+        while (j < n && ((in[j] >= 'a' && in[j] <= 'z') ||
+                         (in[j] >= '0' && in[j] <= '9') || in[j] == '_')) j++;
+        size_t len = j - i;
+        const char *us = NULL;
+        for (size_t k = j; k > i; k--) if (in[k - 1] == '_') { us = in + k - 1; break; }
+        bool match = false;
+        if (len >= 14 && us && us > in + i && (size_t)(in + j - us) - 1 >= 12) {
+            match = true;
+            for (const char *p = in + i; p < us; p++)
+                if (!((*p >= 'a' && *p <= 'z'))) { match = false; break; }
+            for (const char *p = us + 1; p < in + j; p++)
+                if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) { match = false; break; }
+        }
+        if (match) {
+            size_t idx = nseen;
+            for (size_t k = 0; k < nseen; k++)
+                if (!strncmp(seen[k], in + i, len) && seen[k][len] == 0) { idx = k; break; }
+            if (idx == nseen && nseen < 64) seen[nseen++] = xstrndup(in + i, len);
+            buf_append(&b, in + i, (size_t)(us - (in + i)) + 1);
+            buf_printf(&b, "#%zu", idx);
+            i = j;
+        } else if (len) {
+            buf_append(&b, in + i, len);
+            i = j;
+        } else {
+            buf_putc(&b, in[i]);
+            i++;
+        }
+    }
+    for (size_t k = 0; k < nseen; k++) free(seen[k]);
+    char *out = b.ptr ? b.ptr : xstrdup("");
+    return out;
+}
+
+/* Inc 1: the session owns surface mapping and identity; free is idempotent. */
+static void test_wire_session_identity_and_free(void) {
+    request r;
+    ds4_wire_session ws;
+
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    TEST_ASSERT(wire_surface_for(&r) == DS4_WIRE_OPENAI_CHAT);
+    r.api = API_ANTHROPIC;
+    TEST_ASSERT(wire_surface_for(&r) == DS4_WIRE_ANTHROPIC);
+    r.api = API_RESPONSES;
+    TEST_ASSERT(wire_surface_for(&r) == DS4_WIRE_RESPONSES);
+    request_free(&r);
+    request_init(&r, REQ_COMPLETION, 128);
+    r.api = API_OPENAI;
+    TEST_ASSERT(wire_surface_for(&r) == DS4_WIRE_OPENAI_COMPLETION);
+    request_free(&r);
+
+    wire_init(&ws, DS4_WIRE_OPENAI_CHAT, "chatcmpl_wire_id");
+    TEST_ASSERT(ws.surface == DS4_WIRE_OPENAI_CHAT);
+    TEST_ASSERT(!strcmp(ws.id, "chatcmpl_wire_id"));
+    TEST_ASSERT(!ws.terminal && !ws.http_started && !ws.protocol_started);
+    /* Live per-surface state frees once; the second free is a no-op. */
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    openai_stream_start(&r, &ws.state.oa_chat);
+    ws.state.oa_chat.pending_token_ids = xmalloc(4 * sizeof(int));
+    ws.state.oa_chat.pending_token_byte_ends = xmalloc(4 * sizeof(size_t));
+    ws.state.oa_chat.pending_cap = 4;
+    ws.protocol_started = true;
+    wire_free(&ws);
+    TEST_ASSERT(!ws.protocol_started);
+    TEST_ASSERT(ws.state.oa_chat.pending_token_ids == NULL);
+    wire_free(&ws);
+    request_free(&r);
+
+    /* The canonical finish round-trip is total over the writer vocabulary. */
+    static const char *finishes[] = { "stop", "length", "tool_calls", "error" };
+    for (size_t i = 0; i < sizeof(finishes) / sizeof(finishes[0]); i++) {
+        ds4_wire_result res = {0};
+        wire_result_set_finish(&res, finishes[i]);
+        TEST_ASSERT(!strcmp(wire_canonical_finish(&res), finishes[i]));
+    }
+}
+
+/* Inc 1 gate: the typed wrapper and the direct emitter consume the same
+ * terminal and must produce byte-identical responses (normalized only for
+ * the created epoch) on every surface x finish combination. */
+static void test_wire_finish_buffered_matches_direct_emitters(void) {
+    static const struct { int api; int kind; const char *id; } surfaces[] = {
+        { API_OPENAI,    REQ_CHAT,       "chatcmpl_wire_eq" },
+        { API_OPENAI,    REQ_COMPLETION, "cmpl_wire_eq" },
+        { API_ANTHROPIC, REQ_CHAT,       "msg_wire_eq" },
+        { API_RESPONSES, REQ_CHAT,       "resp_wire_eq" },
+    };
+    static const char *finishes[] = { "stop", "length", "tool_calls", "error" };
+
+    for (size_t si = 0; si < sizeof(surfaces) / sizeof(surfaces[0]); si++) {
+        for (size_t fi = 0; fi < sizeof(finishes) / sizeof(finishes[0]); fi++) {
+            request r;
+            tool_calls empty = {0};
+            int sv[2];
+            char *direct, *wrapped, *dn, *wn;
+
+            request_init(&r, surfaces[si].kind, 128);
+            r.api = surfaces[si].api;
+
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            if (sv[0] < 0 || sv[1] < 0) return;
+            if (r.api == API_ANTHROPIC) {
+                TEST_ASSERT(anthropic_final_response(sv[0], false, &r, surfaces[si].id,
+                                                     "Hello world.", NULL, &empty,
+                                                     finishes[fi], 4, 4));
+            } else if (r.api == API_RESPONSES) {
+                TEST_ASSERT(responses_final_response(sv[0], false, &r, surfaces[si].id,
+                                                     "Hello world.", NULL, &empty,
+                                                     finishes[fi], 4, 4, 0));
+            } else {
+                TEST_ASSERT(final_response(sv[0], false, &r, surfaces[si].id,
+                                           "Hello world.", NULL, &empty,
+                                           finishes[fi], 4, 4));
+            }
+            shutdown(sv[0], SHUT_WR);
+            direct = read_socket_text(sv[1]);
+            close(sv[0]);
+            close(sv[1]);
+
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+            if (sv[0] < 0 || sv[1] < 0) return;
+            ds4_wire_session ws;
+            ds4_wire_result res = {0};
+            wire_init(&ws, wire_surface_for(&r), surfaces[si].id);
+            wire_result_set_finish(&res, finishes[fi]);
+            res.content = "Hello world.";
+            res.calls = &empty;
+            res.prompt_tokens = 4;
+            res.completion_tokens = 4;
+            TEST_ASSERT(wire_finish_buffered(sv[0], false, &r, &ws, &res));
+            TEST_ASSERT(ws.terminal);
+            wire_free(&ws);
+            shutdown(sv[0], SHUT_WR);
+            wrapped = read_socket_text(sv[1]);
+            close(sv[0]);
+            close(sv[1]);
+
+            char *dt = wire_test_normalize_created(direct);
+            char *wt = wire_test_normalize_created(wrapped);
+            dn = wire_test_canonicalize_ids(dt);
+            wn = wire_test_canonicalize_ids(wt);
+            free(dt);
+            free(wt);
+            if (strcmp(dn, wn)) {
+                size_t d = 0;
+                while (dn[d] && wn[d] && dn[d] == wn[d]) d++;
+                fprintf(stderr, "WIREDIFF api=%d kind=%d finish=%s at=%zu\n  direct:  %.160s\n  wrapped: %.160s\n",
+                        surfaces[si].api, surfaces[si].kind, finishes[fi], d,
+                        dn + (d > 60 ? d - 60 : 0), wn + (d > 60 ? d - 60 : 0));
+            }
+            TEST_ASSERT(!strcmp(dn, wn));
+            free(direct);
+            free(wrapped);
+            free(dn);
+            free(wn);
+            request_free(&r);
+        }
+    }
+}
+
 /* INVERTED Inc 0a negative fixture (fixed in Inc 0b).  The continuous lane
  * used to project streaming legacy /v1/completions rows through the CHAT
  * delta machine (chat.completion.chunk objects on a text_completion route);
@@ -20228,6 +20626,9 @@ static void ds4_server_unit_tests_run(void) {
     test_tape_anthropic_stream_projection();
     test_tape_responses_stream_projection();
     test_tape_buffered_final_responses();
+    /* v0.5.6 API Inc 1: typed wire surface. */
+    test_wire_session_identity_and_free();
+    test_wire_finish_buffered_matches_direct_emitters();
     test_cont_completion_stream_matches_serial_oracle();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
