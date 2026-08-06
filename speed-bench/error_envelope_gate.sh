@@ -251,12 +251,20 @@ PY
 c=$(curl -s -m 180 -o "$OUT/usage_warm.json" -w '%{http_code}' "$BASE/v1/chat/completions" \
      -H 'Content-Type: application/json' -d @"$OUT/usage_t2_req.json")
 code_is usage_warm "$c" 200
+# Inc 3a frame law: usage lives in the CLIENT's token frame; the engine
+# verdict can count a LARGER effective prompt on thinking-warm admits.  The
+# structural invariant is: the client's uncached prompt portion equals what
+# the engine computed fresh -- prompt_tokens - cached == timings
+# prefill_tokens (and cache engagement stays visible: cached > 0).
 uc=$(grep -oE '"cached_tokens":[0-9]+' "$OUT/usage_warm.json" | head -1 | cut -d: -f2)
-tc=$(grep -oE '"prefill_cached_tokens":[0-9]+' "$OUT/usage_warm.json" | head -1 | cut -d: -f2)
-[ -n "$uc" ] && [ -n "$tc" ] && [ "$uc" -eq "$tc" ] \
-  || fail "usage_warm: usage cached=${uc:-absent} != engine verdict=${tc:-absent}"
+pt=$(grep -oE '"prompt_tokens":[0-9]+' "$OUT/usage_warm.json" | head -1 | cut -d: -f2)
+pf=$(grep -oE '"prefill_tokens":[0-9]+' "$OUT/usage_warm.json" | head -1 | cut -d: -f2)
+[ -n "$uc" ] && [ -n "$pt" ] && [ -n "$pf" ] \
+  || fail "usage_warm: usage/timings fields missing (cached=${uc:-?} prompt=${pt:-?} prefill=${pf:-?})"
+[ $((pt - uc)) -eq "$pf" ] \
+  || fail "usage_warm: uncached prompt $((pt - uc)) != engine computed $pf (cached=$uc prompt=$pt)"
 [ "${uc:-0}" -gt 0 ] || fail "usage_warm: t2 continuation reported zero cache (no warm engagement)"
-log "usage_warm PASS (t2 usage cached_tokens=$uc == engine prefill_cached verdict)"
+log "usage_warm PASS (client frame: prompt=$pt cached=$uc uncached==computed=$pf)"
 
 # ---- client cancel (Inc 2c): a mid-stream disconnect counts CANCELED -------
 can0=$(lmetric 'ds4_requests_total{outcome="canceled"}')
