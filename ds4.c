@@ -11125,9 +11125,92 @@ static float exaone_row_dot(const ds4_model *m, const ds4_tensor *w,
     }
 }
 
+/* Diagnostic: quantize activations to 8 bits before each matmul, the way
+ * llama.cpp and ds4's own fast path do, instead of keeping them f32. Set via
+ * DS4_EXAONE_QUANT_ACT=1. Exists to answer whether a residual difference
+ * against llama.cpp is this path being more precise or this path being wrong --
+ * "unexplained logits drift" is not something to leave standing. */
+static bool exaone_quant_act(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *s = getenv("DS4_EXAONE_QUANT_ACT");
+        on = (s && *s && *s != '0') ? 1 : 0;
+    }
+    return on == 1;
+}
+
+/* rows of `w` dotted with an activation pre-quantized to q8_K blocks */
+static void exaone_linear_rows_q8K(float *out, const ds4_model *m,
+                                   const ds4_tensor *w, uint64_t row0,
+                                   uint64_t n_rows, const block_q8_K *xq) {
+    const uint64_t n = w->dim[0];
+    const gguf_type_info *ti = &gguf_types[w->type];
+    const uint64_t row_bytes = n / ti->block_elems * ti->block_bytes;
+    const uint8_t *base = (const uint8_t *)tensor_data(m, w) + row0 * row_bytes;
+    for (uint64_t r = 0; r < n_rows; r++) {
+        const uint8_t *p = base + r * row_bytes;
+        float s = 0.0f;
+        switch (w->type) {
+            case DS4_TENSOR_Q2_K: ds4_vec_dot_q2_K_q8_K((int)n, &s, (const block_q2_K *)p, xq); break;
+            case DS4_TENSOR_Q4_K: ds4_vec_dot_q4_K_q8_K((int)n, &s, (const block_q4_K *)p, xq); break;
+            case DS4_TENSOR_Q5_K: ds4_vec_dot_q5_K_q8_K((int)n, &s, (const block_q5_K *)p, xq); break;
+            case DS4_TENSOR_Q6_K: ds4_vec_dot_q6_K_q8_K((int)n, &s, (const block_q6_K *)p, xq); break;
+            case DS4_TENSOR_IQ2_XXS: ds4_vec_dot_iq2_xxs_q8_K((int)n, &s, (const block_iq2_xxs *)p, xq); break;
+            default: ds4_die("exaone quant-act: no q8_K dot for this type");
+        }
+        out[r] = s;
+    }
+}
+
+static void exaone_linear_range(float *out, const ds4_model *m,
+                                const ds4_tensor *w, uint64_t row0,
+                                uint64_t n_rows, const float *x) {
+    if (exaone_quant_act()) {
+        const uint64_t n = w->dim[0];
+        switch (w->type) {
+            case DS4_TENSOR_Q2_K: case DS4_TENSOR_Q4_K: case DS4_TENSOR_Q5_K:
+            case DS4_TENSOR_Q6_K: case DS4_TENSOR_IQ2_XXS: {
+                block_q8_K *xq = xmalloc((size_t)(n / QK_K) * sizeof(block_q8_K));
+                ds4_quantize_row_q8_K(x, xq, (int64_t)n);
+                exaone_linear_rows_q8K(out, m, w, row0, n_rows, xq);
+                free(xq);
+                return;
+            }
+            case DS4_TENSOR_Q8_0: {
+                /* Q8_0 weights are the bulk of this recipe, so skipping them
+                 * here is what made the first attempt at this comparison show
+                 * no difference at all. */
+                const uint64_t nb = (n + 31) / 32;
+                int8_t *xq = xmalloc((size_t)nb * 32);
+                float  *xs = xmalloc((size_t)nb * sizeof(float));
+                quantize_q8_0_activation(x, xq, xs, n);
+                const uint64_t row_bytes = nb * 34;
+                const uint8_t *base = (const uint8_t *)tensor_data(m, w) + row0 * row_bytes;
+                for (uint64_t r = 0; r < n_rows; r++) {
+                    const uint8_t *p = base + r * row_bytes;
+                    float acc = 0.0f;
+                    for (uint64_t b = 0; b < nb; b++) {
+                        uint16_t sb; memcpy(&sb, p + b * 34, sizeof(sb));
+                        const int8_t *wq = (const int8_t *)(p + b * 34 + 2);
+                        const int8_t *aq = xq + b * 32;
+                        int32_t s = 0;
+                        for (int i = 0; i < 32; i++) s += (int32_t)wq[i] * aq[i];
+                        acc += f16_to_f32(sb) * xs[b] * (float)s;
+                    }
+                    out[r] = acc;
+                }
+                free(xs); free(xq);
+                return;
+            }
+            default: break;   /* Q3_K has no q8 activation dot here */
+        }
+    }
+    for (uint64_t r = 0; r < n_rows; r++) out[r] = exaone_row_dot(m, w, row0 + r, x);
+}
+
 static void exaone_linear(float *out, const ds4_model *m, const ds4_tensor *w,
                           const float *x) {
-    for (uint64_t r = 0; r < w->dim[1]; r++) out[r] = exaone_row_dot(m, w, r, x);
+    exaone_linear_range(out, m, w, 0, w->dim[1], x);
 }
 
 /* Expert tensors are 3-D [in, out, n_expert]; expert e owns rows
@@ -11135,9 +11218,7 @@ static void exaone_linear(float *out, const ds4_model *m, const ds4_tensor *w,
 static void exaone_linear_expert(float *out, const ds4_model *m,
                                  const ds4_tensor *w, uint32_t e, const float *x) {
     const uint64_t n_out = w->dim[1];
-    for (uint64_t r = 0; r < n_out; r++) {
-        out[r] = exaone_row_dot(m, w, (uint64_t)e * n_out + r, x);
-    }
+    exaone_linear_range(out, m, w, (uint64_t)e * n_out, n_out, x);
 }
 
 static void exaone_rmsnorm(float *out, const float *x, const ds4_model *m,
@@ -11240,8 +11321,29 @@ static void exaone_attn_one(float *out, const ds4_model *m,
     }
 
     if (kv->n >= kv->cap) ds4_die("exaone reference: KV cache overflow");
-    memcpy(kv->k + (size_t)kv->n * kv_dim, k, kv_dim * sizeof(float));
-    memcpy(kv->v + (size_t)kv->n * kv_dim, v, kv_dim * sizeof(float));
+    /* Store through f16, which is what llama.cpp's cache does by default and
+     * what serving will do. Keeping f32 here makes this path *more* precise
+     * than the engine it is supposed to be a reference for, and the difference
+     * is large enough to flip near-tied expert selections a few layers later.
+     * DS4_EXAONE_KV_F32=1 keeps full precision for precision studies. */
+    {
+        static int kv_f32 = -1;
+        if (kv_f32 < 0) {
+            const char *s = getenv("DS4_EXAONE_KV_F32");
+            kv_f32 = (s && *s && *s != '0') ? 1 : 0;
+        }
+        float *kdst = kv->k + (size_t)kv->n * kv_dim;
+        float *vdst = kv->v + (size_t)kv->n * kv_dim;
+        if (kv_f32) {
+            memcpy(kdst, k, kv_dim * sizeof(float));
+            memcpy(vdst, v, kv_dim * sizeof(float));
+        } else {
+            for (uint32_t i = 0; i < kv_dim; i++) {
+                kdst[i] = f16_to_f32(f32_to_f16(k[i]));
+                vdst[i] = f16_to_f32(f32_to_f16(v[i]));
+            }
+        }
+    }
     kv->n++;
 
     /* llama.cpp masks when p1 - p0 >= n_swa, so the window is the most recent
@@ -11385,6 +11487,20 @@ static void exaone_moe_ffn_one(float *out, const ds4_model *m,
     free(e_out); free(u); free(g); free(w); free(sel); free(probs);
 }
 
+/* Diagnostic: print the head and tail of an intermediate vector so it can be
+ * lined up against llama.cpp's tensor dump, which elides the middle the same
+ * way. Enabled with DS4_EXAONE_TRACE=<n_layers>. */
+static void exaone_trace(const char *tag, uint32_t il, const float *v, uint64_t n) {
+    static int trace = -1;
+    if (trace < 0) {
+        const char *s = getenv("DS4_EXAONE_TRACE");
+        trace = s ? atoi(s) : 0;
+    }
+    if ((int)il >= trace) return;
+    fprintf(stderr, "trace %-12s-%-2u = [%12.6f %12.6f %12.6f ... %12.6f %12.6f %12.6f]\n",
+            tag, il, v[0], v[1], v[2], v[n-3], v[n-2], v[n-1]);
+}
+
 static void exaone_layer_one(float *x, const ds4_model *m,
                              const ds4_layer_weights *l, exaone_kv_layer *kv,
                              uint32_t il, uint32_t pos) {
@@ -11392,17 +11508,24 @@ static void exaone_layer_one(float *x, const ds4_model *m,
     float *norm = xmalloc((size_t)n_embd * sizeof(float));
     float *tmp  = xmalloc((size_t)n_embd * sizeof(float));
 
+    exaone_trace("inp", il, x, n_embd);
     exaone_rmsnorm(norm, x, m, l->attn_norm, n_embd);
+    exaone_trace("attn_norm", il, norm, n_embd);
     exaone_attn_one(tmp, m, l, kv, norm, il, pos);
+    exaone_trace("attn_out", il, tmp, n_embd);
     for (uint64_t i = 0; i < n_embd; i++) x[i] += tmp[i];
+    exaone_trace("ffn_inp", il, x, n_embd);
 
     exaone_rmsnorm(norm, x, m, l->ffn_norm, n_embd);
+    exaone_trace("ffn_norm", il, norm, n_embd);
     if (l->ffn_gate_exps) {
         exaone_moe_ffn_one(tmp, m, l, norm, il);
     } else {
         exaone_swiglu(tmp, m, l->ffn_gate, l->ffn_up, l->ffn_down, norm);
     }
+    exaone_trace("ffn_out", il, tmp, n_embd);
     for (uint64_t i = 0; i < n_embd; i++) x[i] += tmp[i];
+    exaone_trace("l_out", il, x, n_embd);
 
     free(tmp); free(norm);
 }
