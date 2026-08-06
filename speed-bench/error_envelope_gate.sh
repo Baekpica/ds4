@@ -50,12 +50,14 @@
 #
 #   budget matrix (omitted is every other gate's default; negative above)
 #     anth_zero    anthropic max_tokens:0 (prewarm contract) -> 200 +
-#                  "output_tokens":0
-#     resp_zero    responses max_output_tokens:0 -> 200 (serial zero-decode)
-#     oa_zero      chat max_tokens:0 -> 200, completion_tokens <= 1 (batched
-#                  lanes floor the seed token -- documented at
-#                  request_decode_budget until Inc 3 prefill-only routing;
-#                  the gate RECORDS the observed value)
+#                  "output_tokens":0 (serial: NEED_PREFILL_ONLY)
+#     resp_zero    responses max_output_tokens:0 -> 200, incomplete +
+#                  output_tokens 0 + output [] (rides CONT since 3b; Inc 3c
+#                  trims the engine's seed-floor token at every wire site)
+#     oa_zero      chat max_tokens:0 -> 200, completion_tokens == 0, empty
+#                  content, finish "length" (Inc 3c: pre-fix the cont lane
+#                  leaked the seed token -- measured completion_tokens=1,
+#                  content "Okay"; the old <= 1 tolerance was covering it)
 #     oa_one       chat max_tokens:1 -> 200, completion_tokens == 1, finish
 #                  "length"
 #     oa_clamped   chat max_tokens:10000000 -> 200, finish "stop" (a huge
@@ -209,13 +211,17 @@ log "anth_zero PASS (prewarm contract, zero decode)"
 
 c=$(post resp_zero /v1/responses '{"max_output_tokens":0,"input":"prewarm this too"}')
 code_is resp_zero "$c" 200
-log "resp_zero PASS"
+has resp_zero '"status":"incomplete"'
+has resp_zero '"output_tokens":0'
+has resp_zero '"output":\[\]'
+log "resp_zero PASS (incomplete, zero output, empty output array on the cont lane)"
 
 c=$(post oa_zero /v1/chat/completions '{"max_tokens":0,"temperature":0,"messages":[{"role":"user","content":"hi"}]}')
 code_is oa_zero "$c" 200
-ct=$(grep -oE '"completion_tokens":[0-9]+' "$OUT/oa_zero.json" | head -1 | cut -d: -f2)
-[ -n "$ct" ] && [ "$ct" -le 1 ] || fail "oa_zero: completion_tokens=${ct:-absent}, want <= 1"
-log "oa_zero PASS (completion_tokens=$ct; batched seed floor documented)"
+has oa_zero '"completion_tokens":0'
+has oa_zero '"content":""'
+has oa_zero '"finish_reason":"length"'
+log "oa_zero PASS (completion_tokens=0, empty content, finish length -- seed trimmed)"
 
 c=$(post oa_one /v1/chat/completions '{"max_tokens":1,"temperature":0,"messages":[{"role":"user","content":"hi"}]}')
 code_is oa_one "$c" 200

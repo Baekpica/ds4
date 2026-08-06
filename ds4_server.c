@@ -823,12 +823,23 @@ static void request_free(request *r) {
  *                    Inc 2 work, after endpoint-native errors exist).
  * Before this helper the batched lanes replaced ANY <= 0 with the server
  * default, so a route change could turn a zero-token request into a
- * ~384K-token decode.  The batched engine floors max_new at 1 (it cannot
- * retire an admission without sampling a seed token), but the WIRE result
- * still honors the zero budget: empty content, completion_tokens 0, finish
- * "length" (measured live -- error_envelope_gate oa_zero leg).  True
- * zero-decode ADMISSION stays a serial capability until prefill-only
- * routing lands (plan Inc 3). */
+ * ~384K-token decode.
+ *
+ * Inc 3c adjudication (2026-08-07, measured live): the batched engine still
+ * cannot retire an admission without sampling -- the cont loop floors
+ * max_new at 1 (ds4.c seed-floor) and the batch-gen API documents
+ * "entry <=0 => 1".  That seed token is ENGINE-INTERNAL: every wire site
+ * trims it (cont_on_token / cont_on_done / write_batch_completion), so all
+ * lanes now answer a zero budget identically to the serial loop, which
+ * never samples: empty content, completion_tokens 0, finish "length" even
+ * when the seed happened to be EOS.  Bank content and timings keep the
+ * engine truth (the seed IS committed history; the 3a frame law applied to
+ * output).  Zero-budget OpenAI/Responses requests stay ROUTABLE: serial
+ * would charge a session rightsize + gen_mu for a throwaway prefill, and
+ * neither lane yields prewarm value today (measured: a zero-admit bank's
+ * interior prefix does not warm-match the prompt+question t2 shape).
+ * Anthropic explicit-zero remains NEED_PREFILL_ONLY -> serial per plan §5
+ * Inc 3 (the documented prewarm contract). */
 static int request_decode_budget(const request *r, int server_default) {
     if (r->max_tokens_set && r->max_tokens <= 0) return 0;
     return r->max_tokens > 0 ? r->max_tokens : server_default;
@@ -6829,7 +6840,7 @@ static bool responses_sse_completed(int fd, const request *r,
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (!strcmp(event_type, "response.incomplete")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
     const char *item_status = responses_item_status_for_finish(finish);
     buf_puts(&b, ",\"output\":[");
@@ -7098,7 +7109,7 @@ static bool responses_final_response(int fd, bool enable_cors,
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (finish && !strcmp(finish, "length")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
     buf_puts(&b, ",\"output\":[");
     bool wrote = false;
@@ -12006,9 +12017,11 @@ enum ds4_req_need {
  *     requests have ridden the continuous path without it since v0.2 (A1 /
  *     spec+tools) -- shipped behavior, re-adjudicated at Inc 6.
  *   - PREFILL_ONLY marks the documented Anthropic cache-prewarm contract
- *     (explicit max_tokens <= 0).  An OpenAI explicit-zero budget stays
- *     routable today and decodes one floor token on a batched lane (see
- *     request_decode_budget); true zero-decode routing lands at Inc 3.
+ *     (explicit max_tokens <= 0) and ONLY that contract: the Inc 3c
+ *     adjudication keeps OpenAI/Responses explicit-zero routable -- the
+ *     engine's internal seed-floor token is trimmed at every wire site, so
+ *     the batched lanes answer zero exactly like serial (see
+ *     request_decode_budget for the full verdict).
  * DURABLE_RESPONSE is never set here: the Responses parser rejects
  * previous_response_id / conversation at parse (contract test
  * test_responses_durable_references_rejected_at_parse), so the bit exists
@@ -12152,7 +12165,7 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
     if (env->have_cont && env->prompt_len > 0 && env->prompt_len <= env->seq_cap) {
         d.lane = ROUTE_LANE_CONTINUOUS; d.reason = ROUTE_REASON_CONT; return d;
     }
-    /* Static fallback: the coalesced writer formats OpenAI only until Inc 3c
+    /* Static fallback: the coalesced writer formats OpenAI only until Inc 3d
      * scopes it to its exact capabilities -- a promoted surface that cannot
      * ride cont goes serial, never mis-projected static. */
     if ((needs & ~ROUTE_STATIC_MASK) == 0 &&
@@ -12689,9 +12702,20 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
 
-    buf text = {0};
-    int emitted = detok_result_until_eos(s, r->tokens, r->n_tokens, eos, &text);
+    /* Inc 3c: the static path's rows arrive here unclamped (only cont rows
+     * pass cont_on_done) and ds4_generate_batch floors max_new the same way
+     * ("entry <=0 => 1") -- trim the seed token and force "length" so every
+     * buffered lane answers a zero budget exactly like serial.  Idempotent
+     * for cont rows, invariant-cheap for everything else (the engine honors
+     * positive budgets exactly). */
+    int n_tokens = r->n_tokens;
     const char *finish = r->finish ? "stop" : "length";
+    {
+        const int budget = request_decode_budget(&j->req, s->default_tokens);
+        if (n_tokens > budget) { n_tokens = budget; finish = "length"; }
+    }
+    buf text = {0};
+    int emitted = detok_result_until_eos(s, r->tokens, n_tokens, eos, &text);
     const int prompt_tokens = j->req.prompt.len;
 
     if (j->req.kind == REQ_CHAT) {
@@ -13913,6 +13937,14 @@ static int cont_on_token(void *ud, void *user, int token) {
         j->client_gone = true;
         return 0;
     }
+    /* Inc 3c: a zero-budget row exists only for its prefill.  The token
+     * arriving here is the engine's seed floor (the cont loop cannot retire
+     * a row without sampling) -- engine-internal, never wire content.  Skip
+     * every host-side sink: no text accumulation, no SSE delta (measured
+     * pre-fix: the seed streamed out as a reasoning_content delta), no
+     * token-id echo.  The row retires at this same seed sample and
+     * finalizes empty (cont_on_done clamps n and finish). */
+    if (request_decode_budget(&j->req, s->default_tokens) == 0) return 1;
     if (!cont_needs_text(&j->req)) return 1;   /* plain non-streaming: engine buffers -> on_done */
     cont_stream *st = cont_stream_ensure(j);
     t_emit_job = j;                            /* W8a: send_all -> j->out (off the GPU path) */
@@ -14081,6 +14113,17 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
                 j->req.cache_read_tokens  = p - j->req.cache_write_tokens;
             }
         }
+    }
+    /* Inc 3c: wire honors the client's zero budget exactly like the serial
+     * loop, which never samples -- trim the engine's seed-floor token and
+     * force the budget's own finish ("length"), even when the seed happened
+     * to be EOS.  AFTER cont_warm_retire (the seed IS committed bank
+     * content; trimming the record would corrupt warm matching) and AFTER
+     * the timings merge (timings keep the engine frame -- the 3a frame law
+     * applied to output). */
+    if (request_decode_budget(&j->req, cs->s->default_tokens) == 0) {
+        n = 0;
+        finish = 0;
     }
     t_emit_job = j;                            /* W8a: buffer the finalize/response into j->out */
     if (j->req.stream) {                       /* W6: close the live SSE stream. */

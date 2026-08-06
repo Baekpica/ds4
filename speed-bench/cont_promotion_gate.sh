@@ -27,6 +27,18 @@
 #   resp_tools_serial  Responses tool gen stays serial (continuation
 #                  publish)
 #
+# Inc 3c legs (boot C = fresh zero-config boot; the seed-floor trim):
+#   oa_zero_cont   chat max_tokens:0 SERVED on cont: completion_tokens 0,
+#                  empty content, finish length.  Pre-fix (measured
+#                  2026-08-07) the cont lane leaked the engine's seed-floor
+#                  token: completion_tokens=1, content "Okay", where serial
+#                  answered 0/"" for the same request.
+#   resp_zero_cont responses max_output_tokens:0 SERVED on cont:
+#                  incomplete + output_tokens 0 + output []
+#   oa_stream_zero streaming zero on cont: role preamble + finish length +
+#                  [DONE] and NO content/reasoning delta (pre-fix the seed
+#                  streamed out as a reasoning_content delta)
+#
 # Kill switches (boot B = both DS4_SERVER_CONT_ANTHROPIC=0 and
 # DS4_SERVER_CONT_RESPONSES=0, plan §7; the reason-table unit proves they
 # are per-surface independent):
@@ -301,6 +313,51 @@ code_is resp_tools_serial "$c" 200
 rt1=$(decision need_continuation_publish)
 [ "${rt1:-0}" -gt "${rt0:-0}" ] || fail "resp_tools_serial: need_continuation_publish decision missing (${rt0:-?} -> ${rt1:-?})"
 log "resp_tools_serial PASS (tool gen stays serial with the continuation-publish reason)"
+
+# ===================== boot C: the Inc 3c zero-budget block ================
+# A zero-budget request is the ONLY shape where the engine emits a token the
+# wire must not show (the cont loop cannot retire a row without sampling --
+# the ds4.c seed floor).  These legs hold the trimmed contract on the plain
+# buffered path, the promoted Responses path, and the stream path, each with
+# the LANE-ENTRY-TRAP guards: a serial fallback would ALSO answer 0/"" (the
+# serial loop never samples at zero), so only the lane + serial counters
+# prove the CONT lane produced the honored shape.
+BOOT_ENV="DS4_MEM_FLOOR_GB=2" boot
+
+oc0=$(lane openai_chat continuous); sl0=$(serials)
+c=$(post oa_zero_cont /v1/chat/completions '{"max_tokens":0,"temperature":0,"messages":[{"role":"user","content":"hi"}]}')
+code_is oa_zero_cont "$c" 200
+has oa_zero_cont '"completion_tokens":0'
+has oa_zero_cont '"content":""'
+has oa_zero_cont '"finish_reason":"length"'
+oc1=$(lane openai_chat continuous); sl1=$(serials)
+[ "${oc1:-0}" -gt "${oc0:-0}" ] || fail "oa_zero_cont: no continuous lane entry (${oc0:-?} -> ${oc1:-?})"
+[ "${sl1:-0}" -eq "${sl0:-0}" ] || fail "oa_zero_cont: fell back to serial (${sl0:-?} -> ${sl1:-?})"
+log "oa_zero_cont PASS (seed trimmed: 0 tokens, empty content, length; SERVED on cont)"
+
+rc0=$(lane openai_responses continuous); sl0=$(serials)
+c=$(post resp_zero_cont /v1/responses '{"max_output_tokens":0,"temperature":0,"input":"prewarm this prompt"}')
+code_is resp_zero_cont "$c" 200
+has resp_zero_cont '"status":"incomplete"'
+has resp_zero_cont '"output_tokens":0'
+has resp_zero_cont '"output":\[\]'
+rc1=$(lane openai_responses continuous); sl1=$(serials)
+[ "${rc1:-0}" -gt "${rc0:-0}" ] || fail "resp_zero_cont: no continuous lane entry (${rc0:-?} -> ${rc1:-?})"
+[ "${sl1:-0}" -eq "${sl0:-0}" ] || fail "resp_zero_cont: fell back to serial (${sl0:-?} -> ${sl1:-?})"
+log "resp_zero_cont PASS (incomplete, zero output, empty output array; SERVED on cont)"
+
+oc0=$(lane openai_chat continuous); sl0=$(serials)
+curl -s -N -m 60 -o "$OUT/oa_stream_zero.sse" "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' \
+     -d '{"max_tokens":0,"temperature":0,"stream":true,"messages":[{"role":"user","content":"hi"}]}'
+grep -q '"finish_reason":"length"' "$OUT/oa_stream_zero.sse" || fail "oa_stream_zero: no length finish chunk"
+grep -q 'data: \[DONE\]' "$OUT/oa_stream_zero.sse" || fail "oa_stream_zero: no [DONE]"
+! grep -q '"reasoning_content"' "$OUT/oa_stream_zero.sse" || fail "oa_stream_zero: seed token leaked as a reasoning delta"
+! grep -qE '"content":"[^"]' "$OUT/oa_stream_zero.sse" || fail "oa_stream_zero: seed token leaked as a content delta"
+oc1=$(lane openai_chat continuous); sl1=$(serials)
+[ "${oc1:-0}" -gt "${oc0:-0}" ] || fail "oa_stream_zero: no continuous lane entry (${oc0:-?} -> ${oc1:-?})"
+[ "${sl1:-0}" -eq "${sl0:-0}" ] || fail "oa_stream_zero: fell back to serial (${sl0:-?} -> ${sl1:-?})"
+log "oa_stream_zero PASS (no delta leak; length + [DONE]; SERVED on cont)"
 
 # ===================== boot B: the §7 kill switches ========================
 BOOT_ENV="DS4_SERVER_CONT_ANTHROPIC=0 DS4_SERVER_CONT_RESPONSES=0 DS4_MEM_FLOOR_GB=2" boot
