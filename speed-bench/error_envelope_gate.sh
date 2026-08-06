@@ -23,6 +23,14 @@
 #                  "stop_sequence":"beta" (the matched text; collapsing to
 #                  end_turn told Anthropic clients the model chose to stop).
 #
+#   authoritative usage (Inc 2d)
+#     usage_t1 /    turn-2 continuation built from the SERVED t1 answer;
+#     usage_warm    the thinking t1's committed reasoning forces the engine
+#                   to align the text-record proposal DOWN, and usage must
+#                   report that verdict: cached_tokens > 0 AND equal to
+#                   timings prefill_cached (the admit-time proposal is no
+#                   longer what usage reports).
+#
 #   client cancel (Inc 2c)
 #     cancel       a live stream whose client disconnects mid-decode (curl
 #                  -m 4 on a 3000-token stream) must count
@@ -194,6 +202,36 @@ c=$(post oa_clamped /v1/chat/completions '{"max_tokens":10000000,"temperature":0
 code_is oa_clamped "$c" 200
 has oa_clamped '"finish_reason":"stop"'
 log "oa_clamped PASS (huge budget served, EOS ended it)"
+
+# ---- authoritative usage (Inc 2d): usage == the engine's cache verdict -----
+# Turn-2 continuation built from the SERVED t1 answer (the a2a warm-gate
+# recipe; a turn-1 repeat does NOT warm-match -- the record outruns the
+# request and fork-always placement is off by design).  For a thinking t1
+# the committed history holds reasoning the t2 re-render drops, so the
+# engine ALIGNS the text-record proposal DOWN to the true shared token
+# prefix -- exactly the proposal-vs-verdict window Inc 2d closes: usage
+# must report the verdict (== timings prefill_cached) and still show
+# engagement (> 0).
+c=$(post usage_t1 /v1/chat/completions '{"max_tokens":400,"temperature":0,"messages":[{"role":"user","content":"Name one planet."}]}')
+code_is usage_t1 "$c" 200
+python3 - "$OUT/usage_t1.json" > "$OUT/usage_t2_req.json" <<'PY' || fail "usage_warm: t2 build failed"
+import json, sys
+t1 = json.load(open(sys.argv[1]))
+ans = t1["choices"][0]["message"]["content"]
+msgs = [{"role": "user", "content": "Name one planet."},
+        {"role": "assistant", "content": ans},
+        {"role": "user", "content": "Name another."}]
+print(json.dumps({"max_tokens": 48, "temperature": 0, "messages": msgs}))
+PY
+c=$(curl -s -m 180 -o "$OUT/usage_warm.json" -w '%{http_code}' "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' -d @"$OUT/usage_t2_req.json")
+code_is usage_warm "$c" 200
+uc=$(grep -oE '"cached_tokens":[0-9]+' "$OUT/usage_warm.json" | head -1 | cut -d: -f2)
+tc=$(grep -oE '"prefill_cached_tokens":[0-9]+' "$OUT/usage_warm.json" | head -1 | cut -d: -f2)
+[ -n "$uc" ] && [ -n "$tc" ] && [ "$uc" -eq "$tc" ] \
+  || fail "usage_warm: usage cached=${uc:-absent} != engine verdict=${tc:-absent}"
+[ "${uc:-0}" -gt 0 ] || fail "usage_warm: t2 continuation reported zero cache (no warm engagement)"
+log "usage_warm PASS (t2 usage cached_tokens=$uc == engine prefill_cached verdict)"
 
 # ---- client cancel (Inc 2c): a mid-stream disconnect counts CANCELED -------
 can0=$(lmetric 'ds4_requests_total{outcome="canceled"}')

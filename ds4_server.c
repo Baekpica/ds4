@@ -13833,6 +13833,15 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
             t->decode_steps = (int)es.decode_steps;
             t->spec_drafts = (long long)es.spec_drafts;
             t->spec_hits = (long long)es.spec_hits;
+            /* Inc 2d: usage reports the ENGINE's admission verdict, never
+             * the server's warm-match proposal (plan §4.4).  A partial
+             * align-down or a cold reject after the admit-time proposal
+             * (cont_admit sets read=n_cached, write=n-n_cached) silently
+             * misreported cache usage; the frontier memcmp's actual
+             * cached/computed split is authoritative and makes
+             * usage.cached_tokens == timings.prefill_cached structural. */
+            j->req.cache_read_tokens  = (int)es.prefill_cached;
+            j->req.cache_write_tokens = (int)es.prefill_computed;
         }
     }
     t_emit_job = j;                            /* W8a: buffer the finalize/response into j->out */
