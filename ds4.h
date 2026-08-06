@@ -464,6 +464,13 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
  * serial and increments both lanes (lane entries, not final outcomes). */
 #define DS4_METRICS_ROUTE_SURFACES 4
 #define DS4_METRICS_ROUTE_LANES 3
+/* Route decisions (v0.5.6 Inc 2a): one increment per dispatch-time
+ * route_decide() outcome, keyed by the FIRST blocking reason (or the chosen
+ * batched lane).  Bounded label set owned by the server; storage only here.
+ * Decisions differ from route_requests: that matrix counts LANE ENTRIES
+ * (a failed batched attempt re-enters serial and counts twice); this vector
+ * counts each request's single dispatch decision. */
+#define DS4_METRICS_ROUTE_REASONS 13
 typedef struct {
     uint64_t stamp;               /* monotonic second this bucket belongs to */
     uint64_t dec_tok, dec_steps, pf_tok;
@@ -502,6 +509,7 @@ typedef struct {
     uint64_t derived_artifact_bytes;
     /* route observation (see DS4_METRICS_ROUTE_* above) */
     uint64_t route_requests[DS4_METRICS_ROUTE_SURFACES][DS4_METRICS_ROUTE_LANES];
+    uint64_t route_decisions[DS4_METRICS_ROUTE_REASONS];
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);

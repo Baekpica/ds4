@@ -655,6 +655,12 @@ typedef struct {
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
     req_timings timings;
+    /* v0.5.6 Inc 2a: immutable route requirements (ds4_req_need bits),
+     * computed ONCE at enqueue() -- the single post-parse choke point -- and
+     * read-only afterward.  Every dispatch-time routing decision consumes
+     * this mask (route_decide), never the raw feature fields, so the two
+     * dispatch sites cannot re-derive requirements differently. */
+    uint32_t needs;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -11757,7 +11763,194 @@ decode_again:
     ds4_tokens_free(&effective_prompt);
 }
 
+/* ---- Route requirements and decision (v0.5.6 API Inc 2a) -------------------
+ * Plan §4.2: replace the boolean batchable predicates with immutable request
+ * REQUIREMENTS computed once at enqueue, fixed per-lane capability masks, and
+ * ONE pure route-decision function shared by both dispatch sites (worker_main
+ * head jobs, cont_admit FIFO followers) so they cannot drift.  Inc 2a swaps
+ * the decision MECHANISM only: the chosen lane is proven equal to the legacy
+ * job_is_batchable / job_is_static_batchable tree over the exhaustive feature
+ * cross-product (test_route_decide_matches_legacy_exhaustive); no request
+ * changes lane.  The legacy predicates remain as that gate's oracle (and
+ * job_is_static_batchable stays live as coalesce_gather's peer-join
+ * compatibility check -- group formation, not a lane decision).
+ *
+ * Every decision records ONE bounded first-reason counter
+ * (ds4_route_decisions_total{reason}).  Lane-entry counters (route_requests)
+ * are unchanged and still count entries, not decisions. */
+
+enum ds4_req_need {
+    DS4_NEED_STREAMING            = 1u << 0,
+    DS4_NEED_PER_ROW_SAMPLING     = 1u << 1,   /* temp > 0: per-seq sampler state */
+    DS4_NEED_THINKING             = 1u << 2,
+    DS4_NEED_STOP_SCAN            = 1u << 3,
+    DS4_NEED_TOOL_SCAN            = 1u << 4,
+    DS4_NEED_TOKEN_IDS            = 1u << 5,   /* token-id echo in the reply */
+    DS4_NEED_LIVE_FRONTIER        = 1u << 6,   /* tool-result turn resuming live KV */
+    DS4_NEED_CONTINUATION_PUBLISH = 1u << 7,   /* next native tool-result turn must stay valid */
+    DS4_NEED_CORRECTIVE_RECOVERY  = 1u << 8,   /* serial buffered tool-retry contract */
+    DS4_NEED_DURABLE_RESPONSE     = 1u << 9,   /* previous_response_id/conversation store */
+    DS4_NEED_PREFILL_ONLY         = 1u << 10,  /* retire without sampling a seed token */
+};
+
+/* Requirements from a parsed request.  Two scoping decisions are deliberate
+ * fits to TODAY'S routing (Inc 2 is "no route promotion"), both revisited at
+ * their owning increment:
+ *   - CORRECTIVE_RECOVERY marks only non-OpenAI non-streaming tool
+ *     generation: the serial lane's model-visible corrective retry is a
+ *     contract only for surfaces that never left serial.  OpenAI tool
+ *     requests have ridden the continuous path without it since v0.2 (A1 /
+ *     spec+tools) -- shipped behavior, re-adjudicated at Inc 6.
+ *   - PREFILL_ONLY marks the documented Anthropic cache-prewarm contract
+ *     (explicit max_tokens <= 0).  An OpenAI explicit-zero budget stays
+ *     routable today and decodes one floor token on a batched lane (see
+ *     request_decode_budget); true zero-decode routing lands at Inc 3.
+ * DURABLE_RESPONSE is never set here: the Responses parser rejects
+ * previous_response_id / conversation at parse (contract test
+ * test_responses_durable_references_rejected_at_parse), so the bit exists
+ * for the route table and a future durable store. */
+static uint32_t request_compute_needs(const request *r) {
+    uint32_t n = 0;
+    if (r->stream)                              n |= DS4_NEED_STREAMING;
+    if (r->temperature > 0.0f)                  n |= DS4_NEED_PER_ROW_SAMPLING;
+    if (ds4_think_mode_enabled(r->think_mode))  n |= DS4_NEED_THINKING;
+    if (r->stops.len > 0)                       n |= DS4_NEED_STOP_SCAN;
+    if (r->has_tools)                           n |= DS4_NEED_TOOL_SCAN;
+    if (r->return_token_ids)                    n |= DS4_NEED_TOKEN_IDS;
+    if (r->responses_requires_live_tool_state || r->responses_requires_live_reasoning ||
+        r->anthropic_requires_live_tool_state)
+        n |= DS4_NEED_LIVE_FRONTIER;
+    if (r->has_tools && r->api != API_OPENAI) {
+        n |= DS4_NEED_CONTINUATION_PUBLISH;
+        if (!r->stream) n |= DS4_NEED_CORRECTIVE_RECOVERY;
+    }
+    if (r->api == API_ANTHROPIC && r->max_tokens_set && r->max_tokens <= 0)
+        n |= DS4_NEED_PREFILL_ONLY;
+    return n;
+}
+
+/* Per-lane semantic capability masks (plan §4.2).  The continuous lane has
+ * two per-surface projection constraints a flat mask cannot express -- token-id
+ * echo drains only through the streaming CHAT machine, and tool scan finalizes
+ * only through the chat parse helpers -- checked in route_decide.  The static
+ * lane is buffered argmax with no scanning at all.  Serial serves every need
+ * except durable references, which the parse layer rejects. */
+#define ROUTE_CONT_MASK  (DS4_NEED_STREAMING | DS4_NEED_PER_ROW_SAMPLING | \
+                          DS4_NEED_THINKING | DS4_NEED_STOP_SCAN |         \
+                          DS4_NEED_TOOL_SCAN | DS4_NEED_TOKEN_IDS)
+#define ROUTE_STATIC_MASK ((uint32_t)0)
+#define ROUTE_SERIAL_MASK (~(uint32_t)DS4_NEED_DURABLE_RESPONSE)
+
+/* "No lane may serve this": produced only for DURABLE_RESPONSE, which the
+ * parse layer already rejected -- never silently routed (plan §4.2). */
+#define ROUTE_LANE_NONE 0xFF
+
+/* First-reason vocabulary, bounded (DS4_METRICS_ROUTE_REASONS cells).  The
+ * first three name the batched lanes' accept paths; the rest name the first
+ * blocking condition in plan §4.2 pipeline order:
+ *   semantic eligibility -> configured lane -> prompt/seq bounds.
+ * Memory admission stays downstream (cont_admit slot/bank fit, batch fit)
+ * and is observed by its own counters. */
+enum {
+    ROUTE_REASON_CONT = 0,              /* continuous took it */
+    ROUTE_REASON_STATIC_NO_CONT,        /* cont off/absent -> static buffered */
+    ROUTE_REASON_STATIC_PROMPT_BOUNDS,  /* empty or bank-oversize prompt -> static */
+    ROUTE_REASON_COALESCE_OFF,          /* DS4_SERVER_COALESCE=0 or max<=1 */
+    ROUTE_REASON_SURFACE,               /* batched writers not configured for surface (Inc 3) */
+    ROUTE_REASON_NEED_LIVE_FRONTIER,
+    ROUTE_REASON_NEED_CONTINUATION_PUBLISH,
+    ROUTE_REASON_NEED_CORRECTIVE_RECOVERY,
+    ROUTE_REASON_NEED_DURABLE,          /* parse-rejected; table completeness */
+    ROUTE_REASON_NEED_PREFILL_ONLY,
+    ROUTE_REASON_TOKEN_IDS_PROJECTION,  /* echo shape isn't streaming chat */
+    ROUTE_REASON_TOOLS_COMPLETION,      /* tool scan on completion kind */
+    ROUTE_REASON_CONT_UNAVAILABLE,      /* cont-only semantics; cont off/absent/unfit */
+};
+
+static const char *route_reason_names[DS4_METRICS_ROUTE_REASONS] = {
+    "continuous", "static_no_cont", "static_prompt_bounds", "coalesce_off",
+    "surface", "need_live_frontier", "need_continuation_publish",
+    "need_corrective_recovery", "need_durable_response", "need_prefill_only",
+    "token_ids_projection", "tools_completion_kind", "cont_unavailable",
+};
+
+/* Dispatch-time runtime availability.  Loop-invariant at worker_main (env
+ * flags and the persistent ctx are read once); constant-true cont fields at
+ * cont_admit (a running continuous group implies them). */
+typedef struct {
+    bool coalesce;     /* DS4_SERVER_COALESCE on AND coalesce max > 1 */
+    bool have_cont;    /* DS4_SERVER_CONTINUOUS on AND persistent batch ctx exists */
+    int  seq_cap;      /* per-bank prompt bound (valid when have_cont) */
+    int  prompt_len;
+} ds4_route_env;
+
+typedef struct { uint8_t lane; uint8_t reason; } ds4_route_decision;
+
+static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
+                                       const ds4_route_env *env) {
+    ds4_route_decision d = { ROUTE_LANE_SERIAL, 0 };
+    /* 1. Semantic eligibility.  Reject-class needs first, then serial-only
+     * needs lowest-bit-first, so the recorded reason is the FIRST unmet
+     * requirement (plan §4.2: every refusal/fallback records the first
+     * reason). */
+    if (needs & DS4_NEED_DURABLE_RESPONSE) {
+        d.lane = ROUTE_LANE_NONE; d.reason = ROUTE_REASON_NEED_DURABLE; return d;
+    }
+    if (needs & DS4_NEED_LIVE_FRONTIER) {
+        d.reason = ROUTE_REASON_NEED_LIVE_FRONTIER; return d;
+    }
+    if (needs & DS4_NEED_CONTINUATION_PUBLISH) {
+        d.reason = ROUTE_REASON_NEED_CONTINUATION_PUBLISH; return d;
+    }
+    if (needs & DS4_NEED_CORRECTIVE_RECOVERY) {
+        d.reason = ROUTE_REASON_NEED_CORRECTIVE_RECOVERY; return d;
+    }
+    if (needs & DS4_NEED_PREFILL_ONLY) {
+        d.reason = ROUTE_REASON_NEED_PREFILL_ONLY; return d;
+    }
+    /* Per-surface projection constraints the flat mask cannot express. */
+    if ((needs & DS4_NEED_TOKEN_IDS) &&
+        !((needs & DS4_NEED_STREAMING) && surf == DS4_WIRE_OPENAI_CHAT)) {
+        d.reason = ROUTE_REASON_TOKEN_IDS_PROJECTION; return d;
+    }
+    if ((needs & DS4_NEED_TOOL_SCAN) && surf == DS4_WIRE_OPENAI_COMPLETION) {
+        d.reason = ROUTE_REASON_TOOLS_COMPLETION; return d;
+    }
+    if (needs & ~ROUTE_CONT_MASK) {
+        /* Future-bit tripwire: a need added without a branch above must never
+         * silently batch.  Unreachable today -- every non-cont bit is handled
+         * before this check. */
+        d.reason = ROUTE_REASON_CONT_UNAVAILABLE; return d;
+    }
+    /* 2. Configured lane: the continuous/static writers project OpenAI
+     * chat+completion only until Inc 3 promotes the other surfaces. */
+    if (surf != DS4_WIRE_OPENAI_CHAT && surf != DS4_WIRE_OPENAI_COMPLETION) {
+        d.reason = ROUTE_REASON_SURFACE; return d;
+    }
+    if (!env->coalesce) { d.reason = ROUTE_REASON_COALESCE_OFF; return d; }
+    /* 3. Prompt/seq bounds + runtime availability. */
+    if (env->have_cont && env->prompt_len > 0 && env->prompt_len <= env->seq_cap) {
+        d.lane = ROUTE_LANE_CONTINUOUS; d.reason = ROUTE_REASON_CONT; return d;
+    }
+    if ((needs & ~ROUTE_STATIC_MASK) == 0) {
+        d.lane = ROUTE_LANE_STATIC;
+        d.reason = env->have_cont ? ROUTE_REASON_STATIC_PROMPT_BOUNDS
+                                  : ROUTE_REASON_STATIC_NO_CONT;
+        return d;
+    }
+    d.reason = ROUTE_REASON_CONT_UNAVAILABLE;
+    return d;
+}
+
+static void route_decision_record(ds4_route_decision d) {
+    if (d.reason < DS4_METRICS_ROUTE_REASONS)
+        ds4_metric_add(&ds4_metrics_get()->route_decisions[d.reason], 1);
+}
+
 static bool enqueue(server *s, job *j) {
+    /* Inc 2a: requirements are computed at the single post-parse choke point
+     * and immutable afterward. */
+    j->req.needs = request_compute_needs(&j->req);
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
         pthread_mutex_unlock(&s->mu);
@@ -11858,7 +12051,12 @@ static job *dequeue(server *s) {
  * with thinking -- generate_job's per-token DSML sampling override is wired
  * through ds4_cont_request.sample_override (cont_sample_override forces
  * structural syntax to argmax; payload/reasoning keep the per-seq params the
- * think-mode block below already mirrors). */
+ * think-mode block below already mirrors).
+ *
+ * Inc 2a: NO PRODUCTION CALLERS.  Dispatch now goes through route_decide
+ * (requirements + lane capabilities, above); this predicate is retained as
+ * the exhaustive route-table gate's ORACLE -- the two must stay lane-
+ * equivalent until the predicate is deleted at a promotion increment. */
 static bool job_is_batchable(const request *r) {
     if (r->api != API_OPENAI) return false;
     if (r->kind != REQ_CHAT && r->kind != REQ_COMPLETION) return false;
@@ -11881,8 +12079,11 @@ static bool job_is_batchable(const request *r) {
  * NON-streaming, temperature<=0, AND non-thinking.  Streaming goes to the
  * continuous/single path (W6); temp>0 and thinking go to the continuous path
  * (per-seq sampler + think override) or the single path (generate_job) -- never
- * here, or temperature/seed/reasoning would be silently wrong.  ONE predicate so
- * the two callers (coalesce_gather peers + worker_main dispatch) cannot drift. */
+ * here, or temperature/seed/reasoning would be silently wrong.
+ * Inc 2a: worker_main dispatch now goes through route_decide; the remaining
+ * production caller is coalesce_gather's PEER-JOIN check (may this queued job
+ * join an already-decided static group -- group compatibility, not a lane
+ * decision).  Also the route-table gate's static-lane oracle. */
 static bool job_is_static_batchable(const request *r) {
     return job_is_batchable(r) && !r->stream && r->temperature <= 0.0f
         && !ds4_think_mode_enabled(r->think_mode)
@@ -12894,14 +13095,28 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
         j = cs->primed;          /* the worker's first job (pre-checked to fit). */
         cs->primed = NULL;
     } else {
-        /* Pull one job from the FIFO head iff it is batchable AND its prompt fits
-         * a single bank.  A non-batchable head, or one too long to fit, stops
-         * admits (return 0) so it stays at the head and is served next -- the
-         * same FIFO discipline coalesce_gather uses, so nothing is starved. */
+        /* Pull one job from the FIFO head iff route_decide says CONTINUOUS
+         * (Inc 2a: same semantics as the old job_is_batchable + prompt-fit
+         * check, now the shared decision function).  A non-continuous head
+         * stops admits (return 0) so it stays at the head and is served next
+         * -- the same FIFO discipline coalesce_gather uses, so nothing is
+         * starved.  A running continuous group implies coalesce+cont are on,
+         * hence the constant-true env fields.  This is each follower's ONLY
+         * decision point, so the reason counter increments here; the head
+         * job's decision was already recorded at worker_main dispatch. */
         pthread_mutex_lock(&s->mu);
         for (;;) {
-            if (s->head && job_is_batchable(&s->head->req) &&
-                s->head->req.prompt.len > 0 && s->head->req.prompt.len <= cs->seq_cap) {
+            ds4_route_decision rd = { ROUTE_LANE_NONE, 0 };
+            if (s->head) {
+                ds4_route_env renv = {
+                    .coalesce = true, .have_cont = true,
+                    .seq_cap = cs->seq_cap, .prompt_len = s->head->req.prompt.len,
+                };
+                rd = route_decide(s->head->req.needs,
+                                  wire_surface_for(&s->head->req), &renv);
+            }
+            if (rd.lane == ROUTE_LANE_CONTINUOUS) {
+                route_decision_record(rd);
                 j = s->head;
                 s->head = j->next;
                 if (!s->head) s->tail = NULL;
@@ -13602,31 +13817,36 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        if (coalesce && cmax > 1 && job_is_batchable(&j->req)) {
-            /* W5: continuous path when a ctx exists and the first prompt fits a
-             * single bank (it streams W6 jobs and buffers the rest).  Else fall
-             * back: the static W3/W4 batched path can only carry NON-streaming
-             * jobs (it writes one buffered response each), so a streaming job with
-             * no continuous ctx goes to the single generate_job() stream path. */
-            if (continuous && s->batch_ctx && j->req.prompt.len > 0 &&
-                j->req.prompt.len <= ds4_batch_ctx_seq_cap(s->batch_ctx)) {
-                generate_continuous_jobs(s, j);
-            } else if (job_is_static_batchable(&j->req)) {
-                /* Static batched path: argmax-only + buffered, so temp>0 and
-                 * streaming are excluded (they would lose temperature/seed or get a
-                 * non-streamed reply) -- those went to the continuous path above, or
-                 * fall to the single path below. */
-                job *batch[DS4_COALESCE_HARD_MAX];
-                batch[0] = j;
-                int n = coalesce_gather(s, batch, cmax, cwait, cmaxtok);
-                if (n == 1) run_job_single(s, j);
-                else        generate_batch_jobs(s, batch, n);
-            } else {
-                /* streaming, OR temp>0 without a continuous ctx -> single path
-                 * (generate_job samples per-request and streams correctly). */
-                run_job_single(s, j);
-            }
+        /* Inc 2a: ONE route decision per head job (the shared pure function;
+         * cont_admit uses the same one for FIFO followers).  Lane outcomes are
+         * proven equal to the old job_is_batchable/job_is_static_batchable
+         * tree by the exhaustive route table gate; the W5/W6 fallback story
+         * lives in route_decide's pipeline comments now. */
+        ds4_route_env renv = {
+            .coalesce   = coalesce && cmax > 1,
+            .have_cont  = continuous && s->batch_ctx != NULL,
+            .seq_cap    = s->batch_ctx ? ds4_batch_ctx_seq_cap(s->batch_ctx) : 0,
+            .prompt_len = j->req.prompt.len,
+        };
+        ds4_route_decision rd = route_decide(j->req.needs,
+                                             wire_surface_for(&j->req), &renv);
+        route_decision_record(rd);
+        if (rd.lane == ROUTE_LANE_CONTINUOUS) {
+            generate_continuous_jobs(s, j);
+        } else if (rd.lane == ROUTE_LANE_STATIC) {
+            /* Static batched path: argmax-only + buffered (route_decide sends
+             * temp>0 / streaming / scanning elsewhere).  A single-member
+             * gather collapses to the serial runner, so lane-entry counters
+             * can record serial for a static DECISION -- decisions and
+             * entries are different metric families by design. */
+            job *batch[DS4_COALESCE_HARD_MAX];
+            batch[0] = j;
+            int n = coalesce_gather(s, batch, cmax, cwait, cmaxtok);
+            if (n == 1) run_job_single(s, j);
+            else        generate_batch_jobs(s, batch, n);
         } else {
+            /* ROUTE_LANE_SERIAL -- and defensively ROUTE_LANE_NONE, which the
+             * parse layer's durable-reference rejection makes unreachable. */
             run_job_single(s, j);
         }
     }
@@ -13990,6 +14210,13 @@ static void send_metrics(server *s, int fd) {
                        (unsigned long long)ds4_metric_read(&m->route_requests[si][li]));
         }
     }
+    /* v0.5.6 Inc 2a: dispatch decisions by first reason, fixed cardinality. */
+    buf_puts(&b, "# TYPE ds4_route_decisions_total counter\n");
+    for (int ri = 0; ri < DS4_METRICS_ROUTE_REASONS; ri++) {
+        buf_printf(&b, "ds4_route_decisions_total{reason=\"%s\"} %llu\n",
+                   route_reason_names[ri],
+                   (unsigned long long)ds4_metric_read(&m->route_decisions[ri]));
+    }
     buf_printf(&b, "# TYPE ds4_cont_admit_rejects_total counter\n"
                    "ds4_cont_admit_rejects_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_admit_rejects));
@@ -14112,6 +14339,13 @@ static void send_stats(server *s, int fd, bool as_json) {
             }
         }
         buf_putc(&b, '}');
+        buf_puts(&b, ",\"route_decisions\":{");
+        for (int ri = 0; ri < DS4_METRICS_ROUTE_REASONS; ri++) {
+            buf_printf(&b, "%s\"%s\":%llu",
+                       ri ? "," : "", route_reason_names[ri],
+                       (unsigned long long)ds4_metric_read(&m->route_decisions[ri]));
+        }
+        buf_putc(&b, '}');
         buf_printf(&b, ",\"speculation\":{\"spec_drafts\":%llu,\"spec_hits\":%llu,"
                        "\"spec_accept_ratio\":%.4f,\"spec_quench_events\":%llu}",
                    (unsigned long long)drafts, (unsigned long long)hits,
@@ -14184,6 +14418,12 @@ static void send_stats(server *s, int fd, bool as_json) {
                        route_surface_names[si], route_lane_names[li],
                        (unsigned long long)ds4_metric_read(&m->route_requests[si][li]));
         }
+    }
+    buf_putc(&b, '\n');
+    buf_puts(&b, "# Route decisions\n");
+    for (int ri = 0; ri < DS4_METRICS_ROUTE_REASONS; ri++) {
+        buf_printf(&b, "%s:%llu\n", route_reason_names[ri],
+                   (unsigned long long)ds4_metric_read(&m->route_decisions[ri]));
     }
     buf_putc(&b, '\n');
     buf_printf(&b, "# Speculation\n"
@@ -19786,6 +20026,214 @@ static void test_route_decisions_record_current_dispatch(void) {
     request_free(&r);
 }
 
+/* Inc 2a: the two surface classifiers (Inc 0a metrics enum, Inc 1 wire enum)
+ * are the same (api, kind) mapping -- their index orders were aligned by
+ * construction, and routing now consumes both interchangeably. */
+static void test_route_surface_mapping_agrees(void) {
+    static const api_style apis[] = { API_OPENAI, API_ANTHROPIC, API_RESPONSES };
+    static const req_kind kinds[] = { REQ_CHAT, REQ_COMPLETION };
+    for (size_t a = 0; a < sizeof(apis) / sizeof(apis[0]); a++) {
+        for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+            request r;
+            request_init(&r, kinds[k], 128);
+            r.api = apis[a];
+            TEST_ASSERT(route_metrics_surface(&r) == (int)wire_surface_for(&r));
+            request_free(&r);
+        }
+    }
+}
+
+/* Inc 2a: request_compute_needs bit by bit, including the two documented
+ * scoping decisions (CORRECTIVE_RECOVERY non-OpenAI-only, PREFILL_ONLY
+ * Anthropic-only) and the never-computed DURABLE bit. */
+static void test_request_compute_needs_matrix(void) {
+    request r;
+
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI; r.temperature = 0.0f; r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(request_compute_needs(&r) == 0);
+    r.stream = true;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_STREAMING);
+    r.temperature = 0.7f;
+    TEST_ASSERT(request_compute_needs(&r) ==
+                (DS4_NEED_STREAMING | DS4_NEED_PER_ROW_SAMPLING));
+    r.stream = false; r.temperature = 0.0f;
+    r.think_mode = DS4_THINK_LOW;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_THINKING);
+    r.think_mode = DS4_THINK_NONE;
+    id_list_push_unique(&r.stops, "STOP");
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_STOP_SCAN);
+    stop_list_clear(&r.stops);
+    r.return_token_ids = true;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_TOKEN_IDS);
+    r.return_token_ids = false;
+    /* OpenAI tools: TOOL_SCAN alone -- no continuation/corrective bits (the
+     * v0.2 shipped continuous-tools scoping). */
+    r.has_tools = true;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_TOOL_SCAN);
+    r.has_tools = false;
+    /* OpenAI explicit-zero budget is NOT the Anthropic prewarm contract. */
+    r.max_tokens_set = true; r.max_tokens = 0;
+    TEST_ASSERT(request_compute_needs(&r) == 0);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC; r.temperature = 0.0f; r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    TEST_ASSERT(request_compute_needs(&r) ==
+                (DS4_NEED_TOOL_SCAN | DS4_NEED_CONTINUATION_PUBLISH |
+                 DS4_NEED_CORRECTIVE_RECOVERY));
+    r.stream = true;   /* streaming tool gen: no buffered corrective retry */
+    TEST_ASSERT(request_compute_needs(&r) ==
+                (DS4_NEED_STREAMING | DS4_NEED_TOOL_SCAN |
+                 DS4_NEED_CONTINUATION_PUBLISH));
+    r.stream = false; r.has_tools = false;
+    r.anthropic_requires_live_tool_state = true;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_LIVE_FRONTIER);
+    r.anthropic_requires_live_tool_state = false;
+    /* Anthropic cache-prewarm: explicit zero = prefill-only; the omitted
+     * default (parser preloads max_tokens) is not. */
+    r.max_tokens_set = true; r.max_tokens = 0;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_PREFILL_ONLY);
+    r.max_tokens_set = false; r.max_tokens = 128;
+    TEST_ASSERT(request_compute_needs(&r) == 0);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES; r.temperature = 0.0f; r.think_mode = DS4_THINK_NONE;
+    r.responses_requires_live_tool_state = true;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_LIVE_FRONTIER);
+    r.responses_requires_live_tool_state = false;
+    r.responses_requires_live_reasoning = true;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_LIVE_FRONTIER);
+    request_free(&r);
+}
+
+/* Inc 2a, plan §6.2: route_decide's LANE equals the legacy worker_main tree
+ * over the exhaustive coherent feature cross-product and every availability
+ * scenario.  The oracle reproduces the old dispatch verbatim from the
+ * retained predicates -- if either side drifts, a row names the shape. */
+static int route_legacy_oracle(const request *r, bool coalesce_on,
+                               bool have_cont, int seq_cap) {
+    if (coalesce_on && job_is_batchable(r)) {
+        if (have_cont && r->prompt.len > 0 && r->prompt.len <= seq_cap)
+            return ROUTE_LANE_CONTINUOUS;
+        if (job_is_static_batchable(r)) return ROUTE_LANE_STATIC;
+        return ROUTE_LANE_SERIAL;
+    }
+    return ROUTE_LANE_SERIAL;
+}
+
+static void test_route_decide_matches_legacy_exhaustive(void) {
+    static const struct { api_style api; req_kind kind; } surfs[] = {
+        { API_OPENAI, REQ_CHAT }, { API_OPENAI, REQ_COMPLETION },
+        { API_ANTHROPIC, REQ_CHAT }, { API_RESPONSES, REQ_CHAT },
+    };
+    static const int lens[] = { 0, 16, 4096, 4097 };
+    static const struct { bool coalesce, have_cont; } envs[] = {
+        { true, true }, { true, false }, { false, true }, { false, false },
+    };
+    int rows = 0;
+    for (size_t sf = 0; sf < sizeof(surfs) / sizeof(surfs[0]); sf++)
+    for (int stream = 0; stream < 2; stream++)
+    for (int hot = 0; hot < 2; hot++)
+    for (int think = 0; think < 2; think++)
+    for (int stops = 0; stops < 2; stops++)
+    for (int tools = 0; tools < 2; tools++)
+    for (int echo = 0; echo < 2; echo++)
+    for (int live = 0; live < 2; live++)
+    for (int zero = 0; zero < 2; zero++) {
+        /* Field coherence: live-continuation evidence exists only on the
+         * surfaces whose parsers produce it. */
+        if (live && surfs[sf].api == API_OPENAI) continue;
+        request r;
+        request_init(&r, surfs[sf].kind, 128);
+        r.api = surfs[sf].api;
+        r.stream = stream != 0;
+        r.temperature = hot ? 0.7f : 0.0f;
+        r.think_mode = think ? DS4_THINK_LOW : DS4_THINK_NONE;
+        if (stops) id_list_push_unique(&r.stops, "STOP");
+        r.has_tools = tools != 0;
+        r.return_token_ids = echo != 0;
+        if (live) {
+            if (r.api == API_ANTHROPIC) r.anthropic_requires_live_tool_state = true;
+            else                        r.responses_requires_live_tool_state = true;
+        }
+        if (zero) { r.max_tokens_set = true; r.max_tokens = 0; }
+        const uint32_t needs = request_compute_needs(&r);
+        TEST_ASSERT((needs & DS4_NEED_DURABLE_RESPONSE) == 0);
+        for (size_t li = 0; li < sizeof(lens) / sizeof(lens[0]); li++) {
+            r.prompt.len = lens[li];   /* length drives routing; tokens never do */
+            for (size_t ei = 0; ei < sizeof(envs) / sizeof(envs[0]); ei++) {
+                ds4_route_env env = {
+                    .coalesce = envs[ei].coalesce, .have_cont = envs[ei].have_cont,
+                    .seq_cap = 4096, .prompt_len = lens[li],
+                };
+                ds4_route_decision d = route_decide(needs, wire_surface_for(&r), &env);
+                TEST_ASSERT(d.lane != ROUTE_LANE_NONE);
+                TEST_ASSERT(d.lane == route_legacy_oracle(&r, envs[ei].coalesce,
+                                                          envs[ei].have_cont, 4096));
+                rows++;
+            }
+        }
+        r.prompt.len = 0;
+        request_free(&r);
+    }
+    TEST_ASSERT(rows == (2 * 128 + 2 * 256) * 16);
+}
+
+/* Inc 2a, plan §6.2: exact {lane, first-reason} rows for the canonical
+ * shapes -- the refusal/fallback reason is contract now, not just the lane. */
+static void test_route_decide_reason_table(void) {
+    const ds4_route_env on     = { .coalesce = true,  .have_cont = true,  .seq_cap = 4096, .prompt_len = 16 };
+    const ds4_route_env no_ctx = { .coalesce = true,  .have_cont = false, .seq_cap = 0,    .prompt_len = 16 };
+    const ds4_route_env off    = { .coalesce = false, .have_cont = true,  .seq_cap = 4096, .prompt_len = 16 };
+    ds4_route_env big = on;   big.prompt_len = 4097;
+    ds4_route_env empty = on; empty.prompt_len = 0;
+    ds4_route_decision d;
+
+    d = route_decide(0, DS4_WIRE_OPENAI_CHAT, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_OPENAI_CHAT, &no_ctx);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+    d = route_decide(0, DS4_WIRE_OPENAI_CHAT, &no_ctx);
+    TEST_ASSERT(d.lane == ROUTE_LANE_STATIC && d.reason == ROUTE_REASON_STATIC_NO_CONT);
+    d = route_decide(0, DS4_WIRE_OPENAI_CHAT, &big);
+    TEST_ASSERT(d.lane == ROUTE_LANE_STATIC && d.reason == ROUTE_REASON_STATIC_PROMPT_BOUNDS);
+    d = route_decide(0, DS4_WIRE_OPENAI_CHAT, &empty);
+    TEST_ASSERT(d.lane == ROUTE_LANE_STATIC && d.reason == ROUTE_REASON_STATIC_PROMPT_BOUNDS);
+    d = route_decide(0, DS4_WIRE_OPENAI_CHAT, &off);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_COALESCE_OFF);
+    /* token-id echo: continuous only as streaming chat */
+    d = route_decide(DS4_NEED_TOKEN_IDS | DS4_NEED_STREAMING, DS4_WIRE_OPENAI_CHAT, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_TOKEN_IDS, DS4_WIRE_OPENAI_CHAT, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_TOKEN_IDS_PROJECTION);
+    d = route_decide(DS4_NEED_TOKEN_IDS | DS4_NEED_STREAMING, DS4_WIRE_OPENAI_COMPLETION, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_TOKEN_IDS_PROJECTION);
+    /* tools: chat rides continuous (v0.2 shipped); completion kind stays serial */
+    d = route_decide(DS4_NEED_TOOL_SCAN, DS4_WIRE_OPENAI_CHAT, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_TOOL_SCAN, DS4_WIRE_OPENAI_COMPLETION, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_TOOLS_COMPLETION);
+    /* plain Anthropic/Responses: the Inc 3 surface gap, named as such */
+    d = route_decide(0, DS4_WIRE_ANTHROPIC, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
+    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_RESPONSES, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
+    /* semantic requirements fire before the surface gap, lowest bit first */
+    d = route_decide(DS4_NEED_TOOL_SCAN | DS4_NEED_CONTINUATION_PUBLISH |
+                     DS4_NEED_CORRECTIVE_RECOVERY, DS4_WIRE_ANTHROPIC, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_CONTINUATION_PUBLISH);
+    d = route_decide(DS4_NEED_LIVE_FRONTIER | DS4_NEED_TOOL_SCAN, DS4_WIRE_RESPONSES, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_LIVE_FRONTIER);
+    d = route_decide(DS4_NEED_PREFILL_ONLY, DS4_WIRE_ANTHROPIC, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_PREFILL_ONLY);
+    /* durable references: rejected, never silently routed */
+    d = route_decide(DS4_NEED_DURABLE_RESPONSE, DS4_WIRE_RESPONSES, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_NONE && d.reason == ROUTE_REASON_NEED_DURABLE);
+}
+
 /* Tape -> serial OpenAI Chat stream projector (role preamble + live SSE
  * machine + finish), the generate_job call shape. */
 static void test_tape_openai_chat_stream_projection(void) {
@@ -20985,6 +21433,10 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
     /* v0.5.6 Inc 0a: frozen projection oracle + route observation. */
     test_route_decisions_record_current_dispatch();
+    test_route_surface_mapping_agrees();
+    test_request_compute_needs_matrix();
+    test_route_decide_matches_legacy_exhaustive();
+    test_route_decide_reason_table();
     test_tape_openai_chat_stream_projection();
     test_tape_openai_completion_stream_projection();
     test_tape_anthropic_stream_projection();
