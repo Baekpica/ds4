@@ -103,9 +103,22 @@ default like every other surface.
    409, 503, and shutdown failures. Only context-length errors and stream
    errors partially branch per protocol
    (`http_error_context_length_exceeded`, `sse_error_event`).
-4. **Admission accounting drops decode-growth commitments** once a bank's
-   prefill lands (the `outstanding` charge covers pending prompt targets
-   only); lifetime admission credits land before eligibility broadens.
+4. **FIXED (Inc 0b): admission accounting dropped decode-growth
+   commitments** once a bank's prefill landed (the old `outstanding`
+   charge covered pending prompt targets only). Every continuous
+   admission now holds a lifetime credit — its full normalized target
+   `min(prompt + decode budget, seq_cap)` — from install until the row
+   ends, and both admission verdicts (comp-cache budget and live
+   memory floor) charge the page UNION of all live credits plus the
+   candidate. The union matters: per-layer bank strides are narrower
+   than VMM pages are wide, so neighbor banks share edge pages and the
+   true union of k full banks is far below `k x virtual/bank` — summing
+   per-bank rounded projections would silently shrink live width. The
+   verdict total (resident + projected credits) is timing-independent:
+   the promise holds no matter how much of a row's growth has faulted
+   in. Gate: `speed-bench/admission_credit_gate.sh` (achieved width at
+   the default budget, pinned-budget hard-promise reject with serial
+   fallback, credit release on row death and on mid-prefill abort).
 5. **FIXED (Inc 0b): the v0.5.5 budget-cut honesty fix (#13) was
    serial-only.** On the continuous lane — where chat+tools actually
    routes — an unrepairable `max_tokens` cut inside a tool call

@@ -37,7 +37,12 @@ CTX=${CTX:-16384}
 TENANTS=${TENANTS:-10}
 ROUNDS=${ROUNDS:-2}
 TEN_TOK=${TEN_TOK:-3000}
-BUDGET_MB=${BUDGET_MB:-700}
+# Inc 0b (union credits): 700 was sized for the pre-credit per-bank
+# projections, which overcharged ~2x (neighbor banks share VMM edge pages;
+# measured union(4 full banks) = 339 MiB at this shape vs 4 x 280 virtual).
+# 450 binds the union truth: measured 6 trims / 0 rejects / 0 serial at
+# 10x2 tenants; 700 never binds (0 trims), 250 starves (16 serial bounces).
+BUDGET_MB=${BUDGET_MB:-450}
 CONTROL=${CONTROL:-0}
 PORT=${PORT:-8000}
 TUNNEL=${TUNNEL_PORT:-18000}
