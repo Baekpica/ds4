@@ -3268,11 +3268,21 @@ extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t o
     uint64_t released = 0;
     for (uint64_t p = p0; p < p1x; p++) {
         if (!d->pages[(size_t)p]) continue;
-        (void)cuMemUnmap(d->va + (CUdeviceptr)(p * d->page), (size_t)d->page);
-        (void)cuMemRelease(d->pages[(size_t)p]);
+        /* deepmem D-1b: a failed driver call must not orphan the page.
+         * Unmap failure keeps the handle AND the accounting (the page is
+         * still mapped, still owned, still resident).  Release failure
+         * after a successful unmap is a physical leak: accounting follows
+         * the mapping (the VA no longer reads it), but the bytes were NOT
+         * returned to the system, so they are not counted as released. */
+        if (!driver_ok(cuMemUnmap(d->va + (CUdeviceptr)(p * d->page),
+                                  (size_t)d->page),
+                       "VMM trim page unmap"))
+            continue;
+        const int rel_ok = driver_ok(cuMemRelease(d->pages[(size_t)p]),
+                                     "VMM trim page release");
         d->pages[(size_t)p] = 0;
         d->mapped -= d->page;
-        released += d->page;
+        if (rel_ok) released += d->page;
     }
     return released;
 }
