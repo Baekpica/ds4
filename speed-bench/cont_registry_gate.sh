@@ -45,7 +45,15 @@
 # session -- under default grace it would shed instead (which is boot B's
 # grace_shed leg proving exactly that).
 #
-# Boot B legs (Inc 5b, DS4_CONT_GRACE_S=6 DS4_CONT_TTL_S=45, default pin):
+# Boot B legs (Inc 5b, DS4_CONT_GRACE_S=6 DS4_CONT_TTL_S=45, default pin;
+# pin_wins runs FIRST -- it needs the boot's funded cont admission, see the
+# FUNDED-WINDOW note at the leg):
+#   pin_wins          a cont request occupies the worker; an unrelated
+#                     serial blocker queues; the T2 parses AFTER it (FIFO
+#                     behind it) and pins the record -- at admission the
+#                     blocker sheds on the PIN (grace long over) and the T2
+#                     resolves 200: the plan's "admission ... sheds instead
+#                     of violating a pin", live
 #   grace_shed        an unrelated SERIAL request inside the grace window
 #                     sheds 503+Retry-After with shed{continuation_hold} +1
 #                     and the record STAYS LIVE; the T2 then resolves 200
@@ -54,12 +62,6 @@
 #                     proceeds (200) and demotes; the T2 refuses natively
 #   ttl_expire        an unclaimed record lazily demotes after the soft TTL (45s)
 #                     (records_live 1 -> 0, output-only T2 refused)
-#   pin_wins          a cont request occupies the worker; an unrelated
-#                     serial blocker queues; the T2 parses AFTER it (FIFO
-#                     behind it) and pins the record -- at admission the
-#                     blocker sheds on the PIN (grace long over) and the T2
-#                     resolves 200: the plan's "admission ... sheds instead
-#                     of violating a pin", live
 #
 # Boot C legs (Inc 5c, policy-zero again -- the terminal transaction):
 #   bank_dormant      an OpenAI chat TOOL turn served on the CONT lane
@@ -100,12 +102,21 @@
 # returns the published generation, a bumped live generation refuses); the
 # serial ABA twin runs live as anth_t2_race409.
 #
+# Inc 6a NOTE: every boot here pins DS4_SERVER_CONT_TOOLS_ANTHROPIC=0
+# DS4_SERVER_CONT_TOOLS_RESPONSES=0 -- since Inc 6 promoted STREAMING tool
+# turns onto the cont lane, this gate IS the kill-switch oracle: with the
+# tool switches off, every leg must behave exactly as it did at the Inc 5
+# close (tools serial by needs, serial registry semantics intact).  The
+# promoted-path twin legs live in inc6_tool_gate.sh.
+#
 # Runs FROM the Mac over SSH like the other gates.  Boots kill any running
 # ds4-server on $R.  End state: ds4-server killed, box left free.
 #
 # Env overrides: R (sync-192_168_88_33) BINDIR (/home/ent/code/ds4-phase0)
 #                PORT (8000) TUNNEL_PORT (18000) CTX (16384)
 set -uo pipefail
+# Inc 6a: the switch-off pin every boot composes in (see the NOTE above).
+TOOLS_OFF="DS4_SERVER_CONT_TOOLS_ANTHROPIC=0 DS4_SERVER_CONT_TOOLS_RESPONSES=0"
 
 R=${R:-sync-192_168_88_33}
 BINDIR=${BINDIR:-/home/ent/code/ds4-phase0}
@@ -175,7 +186,7 @@ srv_count(){ ssh "$R" "grep -cF \"$1\" $RWORK/srv.log" 2>/dev/null; }
 TOOLS_ANTH='[{"name":"list_files","description":"List the files in a directory","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]'
 TOOLS_RESP='[{"type":"function","name":"list_files","description":"List the files in a directory","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]'
 
-BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0" boot
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0 $TOOLS_OFF" boot
 
 # ==================== boot A: anthropic block (5a semantics) ================
 pub0=$(m ds4_continuation_records_published_total)
@@ -334,7 +345,15 @@ log "metrics_final PASS (published=$pubF resolved=$resF missed=$misF demoted=$de
 # pinned record mid-leg on the first run, found live 17:30), pin deadline
 # default 60s.  All traffic below is serial by needs except the cont
 # occupier in pin_wins.
-BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=6 DS4_CONT_TTL_S=45" boot
+# DS4_MEM_FLOOR_GB=0 (boot B ONLY): pin_wins is the one leg anywhere that
+# needs a cont admission AFTER serial traffic, and the serial session's
+# resident working set reliably collapses MemAvailable below a 2 GiB floor
+# on a cache-sagged box (two runs, 2026-08-07 21:45 + 21:55: "cont admit
+# rejected on memory floor ... usable 0.0 MiB", occupier silently fell back
+# to serial and its win demoted the pin record).  The leg tests PIN
+# semantics; the floor has its own gate (mem_floor_gate).  The admission
+# it unblocks costs ~124 MiB against ~1.7 GiB available -- safe.
+BOOT_ENV="DS4_MEM_FLOOR_GB=0 DS4_CONT_GRACE_S=6 DS4_CONT_TTL_S=45 $TOOLS_OFF" boot
 
 t1(){ # $1=name $2=user text -> publishes a tool turn; sets T1_ID.
       # Precondition: no leftover LIVE record (a prior T2 may have chained).
@@ -366,6 +385,47 @@ drain_frontier(){
          -H 'Content-Type: application/json' -d "$BLOCKER_BODY" >/dev/null
   done
 }
+
+# pin_wins: FIFO order blocker-before-T2, but the T2 parses while queued and
+# pins the record -- the blocker's admission sheds on the pin (grace long
+# over), the T2 resolves.  A cont request occupies the worker to create the
+# queue window; grace is waited out first so ONLY the pin can explain the
+# shed.
+# FUNDED-WINDOW: this is the boot's ONLY leg needing a funded cont
+# admission, so it runs FIRST and the boot pins DS4_MEM_FLOOR_GB=0 (see
+# the boot comment) -- two runs found the occupier rejected on the memory
+# floor (even as the boot's first cont admission: the serial pin_t1 alone
+# collapses MemAvailable), silently falling back to SERIAL, whose
+# non-continuing win demoted the record before the T2 could pin it.
+# ENGAGEMENT: lane-entry counters CANNOT prove the occupier was served
+# (a floor-rejected admission still counts an entry, then re-enters
+# serial -- the documented decisions-vs-entries split), so the oracle is
+# the floor-rejection log line itself staying quiet.
+t1 pin_t1 "Use the list_files tool to list the files in /usr. Call the tool."
+sleep 7   # grace (6s) fully elapsed; record still LIVE
+[ "$(m ds4_continuation_records_live)" -eq 1 ] || fail "pin_wins: record not LIVE after grace wait"
+floorrej0=$(srv_count 'cont admit rejected on memory floor'); floorrej0=${floorrej0:-0}
+curl -s -m 240 -o "$OUT/pin_occupier.json" "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"m","max_tokens":900,"temperature":0,"messages":[{"role":"user","content":"Count from 1 to 200, one number per line."}]}' &
+OCC_PID=$!
+sleep 1
+shedp0=$(m 'ds4_requests_shed_total{reason="continuation_hold"}')
+curl -s -m 240 -o "$OUT/pin_blocker.json" -w '%{http_code}' "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' -d "$BLOCKER_BODY" > "$OUT/pin_blocker.code" &
+BLK_PID=$!
+sleep 0.5
+c=$(post pin_t2 /v1/messages "$(t2_body "$T1_ID")")
+wait "$BLK_PID" 2>/dev/null
+wait "$OCC_PID" 2>/dev/null
+floorrej1=$(srv_count 'cont admit rejected on memory floor'); floorrej1=${floorrej1:-0}
+[ "$floorrej1" -eq "$floorrej0" ] || fail "pin_wins: occupier was floor-rejected off the cont lane (fell back to serial and demoted the record)"
+code_is pin_t2 "$c" 200
+bcode=$(cat "$OUT/pin_blocker.code")
+[ "$bcode" = 503 ] || fail "pin_wins: blocker got HTTP $bcode, want 503 (pin should shed it)"
+shedp1=$(m 'ds4_requests_shed_total{reason="continuation_hold"}')
+[ "${shedp1:-0}" -gt "${shedp0:-0}" ] || fail "pin_wins: continuation_hold counter never moved (${shedp0:-?} -> ${shedp1:-?})"
+log "pin_wins PASS (queued T2's pin shed the FIFO-earlier blocker; T2 resolved 200)"
 
 # grace_shed: unrelated serial work inside the grace window sheds and the
 # frontier survives for its continuation.
@@ -411,39 +471,11 @@ demt1=$(m ds4_continuation_demoted_total)
 [ "$(m ds4_continuation_records_live)" -eq 0 ] || fail "ttl_expire: record still LIVE past ttl"
 log "ttl_expire PASS (soft TTL lazily demoted the unclaimed record; T2 refused $c)"
 
-# pin_wins: FIFO order blocker-before-T2, but the T2 parses while queued and
-# pins the record -- the blocker's admission sheds on the pin (grace long
-# over), the T2 resolves.  A cont request occupies the worker to create the
-# queue window; grace is waited out first so ONLY the pin can explain the
-# shed.
-t1 pin_t1 "Use the list_files tool to list the files in /usr. Call the tool."
-sleep 7   # grace (6s) fully elapsed; record still LIVE
-[ "$(m ds4_continuation_records_live)" -eq 1 ] || fail "pin_wins: record not LIVE after grace wait"
-curl -s -m 240 -o "$OUT/pin_occupier.json" "$BASE/v1/chat/completions" \
-     -H 'Content-Type: application/json' \
-     -d '{"model":"m","max_tokens":900,"temperature":0,"messages":[{"role":"user","content":"Count from 1 to 200, one number per line."}]}' &
-OCC_PID=$!
-sleep 1
-shedp0=$(m 'ds4_requests_shed_total{reason="continuation_hold"}')
-curl -s -m 240 -o "$OUT/pin_blocker.json" -w '%{http_code}' "$BASE/v1/chat/completions" \
-     -H 'Content-Type: application/json' -d "$BLOCKER_BODY" > "$OUT/pin_blocker.code" &
-BLK_PID=$!
-sleep 0.5
-c=$(post pin_t2 /v1/messages "$(t2_body "$T1_ID")")
-wait "$BLK_PID" 2>/dev/null
-wait "$OCC_PID" 2>/dev/null
-code_is pin_t2 "$c" 200
-bcode=$(cat "$OUT/pin_blocker.code")
-[ "$bcode" = 503 ] || fail "pin_wins: blocker got HTTP $bcode, want 503 (pin should shed it)"
-shedp1=$(m 'ds4_requests_shed_total{reason="continuation_hold"}')
-[ "${shedp1:-0}" -gt "${shedp0:-0}" ] || fail "pin_wins: continuation_hold counter never moved (${shedp0:-?} -> ${shedp1:-?})"
-log "pin_wins PASS (queued T2's pin shed the FIFO-earlier blocker; T2 resolved 200)"
-
 # ==================== boot C: Inc 5c terminal transaction ===================
 # Policy-zero like boot A: nothing sheds, so every T1 is a clean
 # non-continuing serial win (demoting any record a prior T2's answer may
 # have chained) and every T2 resolution is pure registry semantics.
-BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0" boot
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0 $TOOLS_OFF" boot
 
 # bank_dormant: an OpenAI cont TOOL turn must not publish (the BATCH_BANK
 # publish site is scoped to Anthropic/Responses, which stay serial for
@@ -518,7 +550,7 @@ log "strand_norecord PASS (no successful terminal -> no record; live=0)"
 # reservation fail while leaving all non-publishing traffic untouched
 # (job_emit's eviction branch additionally needs a >=256KiB laggard, which
 # nothing here produces).
-BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0 DS4_SERVER_OUT_AGG_CAP=64" boot
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0 DS4_SERVER_OUT_AGG_CAP=64 $TOOLS_OFF" boot
 
 pubd0=$(m ds4_continuation_records_published_total)
 shedd0=$(m 'ds4_requests_shed_total{reason="slow_reader"}')

@@ -28,25 +28,32 @@ Three lanes serve generation requests:
   per-row sampling, streaming, stops, and tools.
 - **static** (`generate_batch_jobs`): coalesced buffered greedy batches.
 
-Routing today (`job_is_batchable`, `job_is_static_batchable`,
-`worker_main`):
+Routing since Inc 2 is the single pure decision function `route_decide`
+over the request's computed needs word; as of Inc 6 the table is:
 
 | Surface | serial | continuous | static |
 |---|---|---|---|
 | OpenAI Chat | fallback | yes (prompt fits one bank) | buffered + greedy + non-thinking + no stops/tools |
-| OpenAI Completion | fallback | yes | same conditions as Chat |
-| Anthropic Messages | always | never | never |
-| OpenAI Responses | always | never | never |
+| OpenAI Completion | fallback | yes (no tools/echo) | same conditions as Chat |
+| Anthropic Messages | buffered tools, prefill-only zero, serial-owned live frontiers, fallback | yes — incl. STREAMING tools (Inc 6a) and bank-owned output-only continuations (Inc 6b) | needs-free buffered (Inc 3d) |
+| OpenAI Responses | buffered tools, live reasoning state, serial-owned live frontiers, fallback | same as Anthropic | needs-free buffered (Inc 3d) |
 
-The Anthropic/Responses exclusion is by API identity alone: the first line
-of `job_is_batchable` returns false for `r->api != API_OPENAI`. It is a
-projection scoping choice, not an engine capability limit — the engine is
-protocol-blind. Promoting these surfaces onto the batched lanes is the
-goal of this arc.
+Buffered tool generation deliberately keeps the serial lane: its
+model-visible corrective retry has no row-local batched equivalent (plan §5
+Inc 6 allows keeping it serial; the scoping comment sits at
+`request_compute_needs`). Streaming tool turns publish BANK-owned
+continuation records at the cont finalize; their output-only follow-ups
+claim the bank back under generation/frontier equality
+(`cont_bank_continuation_admit`), and victim placement never destroys a
+bank inside its record's grace/pin window (Inc 6c). Kill switches, kept
+one release: `DS4_SERVER_CONT_ANTHROPIC` / `DS4_SERVER_CONT_RESPONSES`
+(stateless promotion, Inc 3) and `DS4_SERVER_CONT_TOOLS_ANTHROPIC` /
+`DS4_SERVER_CONT_TOOLS_RESPONSES` (tool promotion, Inc 6 — effective only
+while the surface's stateless switch is on).
 
-Within OpenAI, `job_is_batchable` also keeps on serial: non-streaming
-`return_token_ids` chat, completion-kind requests with
-`return_token_ids`, and completion-kind requests carrying tools.
+Within OpenAI, still serial: non-streaming `return_token_ids` chat,
+completion-kind requests with `return_token_ids`, and completion-kind
+requests carrying tools.
 
 ## Output-budget (`max_tokens`) semantics today
 
@@ -80,8 +87,10 @@ Anthropic/Responses tool-call turn, keyed `(protocol, call_id)`) and exact-DSML
 tool memory are global — there is no tenant or auth namespace, so the
 `trust_namespace` component of the plan's registry key is a constant.
 Knowledge of a tool-call ID is knowledge of the conversation: an output-only
-continuation for that ID resumes the owning engine state, and a queued
-continuation's grace/pin windows can shed other clients' serial work. IDs are
+continuation for that ID resumes the owning engine state — a batch BANK as
+of Inc 6, not just the serial session — and a queued continuation's
+grace/pin windows can shed other clients' serial work or hold batch victim
+placement (bounded at the grace/pin deadline). IDs are
 minted unguessable but travel in responses. Deployments serving mutually
 untrusted tenants need an authenticating proxy or one server per tenant until
 an authenticated namespace lands (documented restriction; also at the

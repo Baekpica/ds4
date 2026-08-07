@@ -496,7 +496,7 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
  * Decisions differ from route_requests: that matrix counts LANE ENTRIES
  * (a failed batched attempt re-enters serial and counts twice); this vector
  * counts each request's single dispatch decision. */
-#define DS4_METRICS_ROUTE_REASONS 13
+#define DS4_METRICS_ROUTE_REASONS 14
 /* Admission-bound sheds (v0.5.6 Inc 2e): one increment per request refused
  * (or slow-reader evicted) by an explicit server bound.  Bounded label set
  * owned by the server (shed_reason_names); storage only here.

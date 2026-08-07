@@ -665,6 +665,14 @@ typedef struct {
      * FIFO cannot destroy the frontier it is about to consume. */
     void *cont_pin;
     server *cont_pin_srv;
+    /* Inc 6b: captured at pin time -- the pinned record's owner is a batch
+     * bank (CONT_OWNER_BATCH_BANK).  A record's owner is immutable for its
+     * lifetime, so the flag cannot go stale even though the record's STATE
+     * can (a demoted record simply fails the claim at admission -> native
+     * 409).  Routing consumes this through request_compute_needs
+     * (BANK_FRONTIER vs LIVE_FRONTIER); unpinned requests leave it false
+     * and keep the serial live-frontier path. */
+    bool live_state_bank_owned;
     tool_replay_stats tool_replay;
     req_timings timings;
     /* v0.5.6 Inc 2a: immutable route requirements (ds4_req_need bits),
@@ -8350,6 +8358,14 @@ struct server {
      * kept one release). */
     bool   cont_anthropic;
     bool   cont_responses;
+    /* Inc 6a: tool-capable promotion kill switches (plan §5 Inc 6 + §7; env
+     * DS4_SERVER_CONT_TOOLS_ANTHROPIC / DS4_SERVER_CONT_TOOLS_RESPONSES,
+     * default ON, kept one release).  Deliberately SEPARATE from the
+     * stateless switches above: reverting the tool promotion must not also
+     * revert the proven Inc 3/4 stateless promotion.  A tools switch is
+     * effective only while its surface's stateless switch is also on. */
+    bool   cont_tools_anthropic;
+    bool   cont_tools_responses;
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
@@ -8966,6 +8982,9 @@ static void request_acquire_cont_pin(server *s, request *r) {
     if (pin) {
         r->cont_pin = pin;
         r->cont_pin_srv = s;
+        /* Inc 6b: owner is immutable per record -- safe to read unlocked. */
+        r->live_state_bank_owned =
+            ((cont_record *)pin)->owner == CONT_OWNER_BATCH_BANK;
     }
 }
 
@@ -9094,6 +9113,62 @@ static bool cont_registry_bank_claim(server *s, api_style proto,
     }
     pthread_mutex_unlock(&s->tool_mu);
     return ok;
+}
+
+/* Inc 6c: is this bank's frontier retention-protected right now?  True
+ * while a LIVE bank-owned record naming the bank is inside its grace
+ * window or validly hard-pinned by a queued continuation -- the
+ * bank-owner analog of cont_registry_serial_hold (plan §4.6: "new work
+ * sheds rather than reusing an owner in the grace period" / "admission
+ * waits or sheds ... instead of violating a pin").  Victim placement
+ * consults this so a batched admission cannot destroy a frontier the
+ * agent loop is about to consume.  GRACE-scoped, deliberately NOT
+ * TTL-scoped: a record older than its grace stops protecting, so
+ * over-protection from a loop that ended without a follow-up turn is
+ * bounded at grace_s, and protection is time-bounded even under queue
+ * pressure (job_queue_aged still sheds a stuck head).  Read-only probe:
+ * a TTL-stale record cannot protect (in_grace false; a pin can only be
+ * acquired on a record that was LIVE at pin time), so no expire walk. */
+static bool cont_registry_bank_protected(server *s, int bank, double now) {
+    if (!s || bank < 0) return false;
+    bool prot = false;
+    pthread_mutex_lock(&s->tool_mu);
+    for (cont_record *rec = s->creg.head; rec && !prot; rec = rec->next) {
+        if (rec->owner != CONT_OWNER_BATCH_BANK || rec->owner_id != bank ||
+            rec->state != CONT_REC_LIVE_FRONTIER) continue;
+        const bool in_grace = s->creg.grace_s > 0 &&
+            now - rec->publish_time < s->creg.grace_s;
+        const bool pinned = rec->hard_refs > 0 &&
+            s->creg.pin_deadline_s > 0 && now < rec->pin_expiry;
+        prot = in_grace || pinned;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return prot;
+}
+
+/* Inc 6c: honest Retry-After for a fully protected bank set -- the SOONEST
+ * moment any live bank record's protection (grace or pin) lapses, i.e. when
+ * the first victim bank frees up.  Mirrors cont_registry_serial_hold's
+ * retry arithmetic on the bank-owner side. */
+static int cont_registry_bank_hold_retry(server *s, double now) {
+    double left_min = -1.0;
+    pthread_mutex_lock(&s->tool_mu);
+    for (cont_record *rec = s->creg.head; rec; rec = rec->next) {
+        if (rec->owner != CONT_OWNER_BATCH_BANK ||
+            rec->state != CONT_REC_LIVE_FRONTIER) continue;
+        const double grace_left = s->creg.grace_s > 0 ?
+            s->creg.grace_s - (now - rec->publish_time) : 0.0;
+        const double pin_left = (rec->hard_refs > 0 &&
+                                 s->creg.pin_deadline_s > 0 &&
+                                 now < rec->pin_expiry) ?
+            rec->pin_expiry - now : 0.0;
+        const double left = grace_left > pin_left ? grace_left : pin_left;
+        if (left > 0 && (left_min < 0 || left < left_min)) left_min = left;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    if (left_min <= 0) return 1;
+    const int ra = (int)(left_min + 0.999);
+    return ra < 1 ? 1 : ra;
 }
 
 /* Mint uniqueness: an id is in use while ANY record (any protocol, any
@@ -12673,6 +12748,7 @@ enum ds4_req_need {
     DS4_NEED_CORRECTIVE_RECOVERY  = 1u << 8,   /* serial buffered tool-retry contract */
     DS4_NEED_DURABLE_RESPONSE     = 1u << 9,   /* previous_response_id/conversation store */
     DS4_NEED_PREFILL_ONLY         = 1u << 10,  /* retire without sampling a seed token */
+    DS4_NEED_BANK_FRONTIER        = 1u << 11,  /* Inc 6b: tool-result turn resuming a BANK's live KV */
 };
 
 /* Requirements from a parsed request.  Two scoping decisions are deliberate
@@ -12682,7 +12758,13 @@ enum ds4_req_need {
  *     generation: the serial lane's model-visible corrective retry is a
  *     contract only for surfaces that never left serial.  OpenAI tool
  *     requests have ridden the continuous path without it since v0.2 (A1 /
- *     spec+tools) -- shipped behavior, re-adjudicated at Inc 6.
+ *     spec+tools) -- shipped behavior.  Inc 6 adjudication: the contract
+ *     STANDS -- buffered anth/resp tool generation keeps the serial
+ *     corrective retry (a semantic failure discovered after generation
+ *     cannot be predicted by a parse-time boolean, and the cont loop has
+ *     no row-local decode_again; plan §5 explicitly allows keeping them
+ *     serial), while STREAMING tool generation rides cont (partial bytes
+ *     already visible = no corrective contract to lose).
  *   - PREFILL_ONLY marks the documented Anthropic cache-prewarm contract
  *     (explicit max_tokens <= 0) and ONLY that contract: the Inc 3c
  *     adjudication keeps OpenAI/Responses explicit-zero routable -- the
@@ -12702,8 +12784,16 @@ static uint32_t request_compute_needs(const request *r) {
     if (r->has_tools)                           n |= DS4_NEED_TOOL_SCAN;
     if (r->return_token_ids)                    n |= DS4_NEED_TOKEN_IDS;
     if (r->responses_requires_live_tool_state || r->responses_requires_live_reasoning ||
-        r->anthropic_requires_live_tool_state)
-        n |= DS4_NEED_LIVE_FRONTIER;
+        r->anthropic_requires_live_tool_state) {
+        /* Inc 6b: a live continuation whose pinned record is BANK-owned is
+         * the continuous lane's to serve (claim + generation equality at
+         * admit).  Everything else keeps the serial bit: serial-owned
+         * records, unresolved ids (the honest serial 409), and live
+         * REASONING state (visible-state machinery is serial-only). */
+        const bool bank = r->live_state_bank_owned &&
+                          !r->responses_requires_live_reasoning;
+        n |= bank ? DS4_NEED_BANK_FRONTIER : DS4_NEED_LIVE_FRONTIER;
+    }
     if (r->has_tools && r->api != API_OPENAI) {
         n |= DS4_NEED_CONTINUATION_PUBLISH;
         if (!r->stream) n |= DS4_NEED_CORRECTIVE_RECOVERY;
@@ -12749,6 +12839,7 @@ enum {
     ROUTE_REASON_TOKEN_IDS_PROJECTION,  /* echo shape isn't streaming chat */
     ROUTE_REASON_TOOLS_COMPLETION,      /* tool scan on completion kind */
     ROUTE_REASON_CONT_UNAVAILABLE,      /* cont-only semantics; cont off/absent/unfit */
+    ROUTE_REASON_CONT_BANK,             /* Inc 6b: cont took a bank continuation */
 };
 
 static const char *route_reason_names[DS4_METRICS_ROUTE_REASONS] = {
@@ -12756,6 +12847,7 @@ static const char *route_reason_names[DS4_METRICS_ROUTE_REASONS] = {
     "surface", "need_live_frontier", "need_continuation_publish",
     "need_corrective_recovery", "need_durable_response", "need_prefill_only",
     "token_ids_projection", "tools_completion_kind", "cont_unavailable",
+    "continuous_bank_continuation",
 };
 
 /* Dispatch-time runtime availability.  Loop-invariant at worker_main (env
@@ -12769,6 +12861,11 @@ typedef struct {
      * DS4_SERVER_CONT_RESPONSES, default ON, kept one release). */
     bool cont_anthropic;
     bool cont_responses;
+    /* Inc 6a: per-surface TOOL promotion switches (DS4_SERVER_CONT_TOOLS_*,
+     * default ON).  Raw values; route_decide ANDs each with its surface's
+     * stateless switch so a switched-off surface never tool-promotes. */
+    bool cont_tools_anthropic;
+    bool cont_tools_responses;
     int  seq_cap;      /* per-bank prompt bound (valid when have_cont) */
     int  prompt_len;
 } ds4_route_env;
@@ -12785,11 +12882,38 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
     if (needs & DS4_NEED_DURABLE_RESPONSE) {
         d.lane = ROUTE_LANE_NONE; d.reason = ROUTE_REASON_NEED_DURABLE; return d;
     }
+    /* Inc 6a: tool-capable promotion (plan §5 Inc 6).  A surface is
+     * tool-promoted only when BOTH its stateless switch (Inc 3) and its
+     * tool switch are on -- reverting either restores the serial hold. */
+    const bool tools_promoted =
+        (env->cont_anthropic && env->cont_tools_anthropic &&
+         surf == DS4_WIRE_ANTHROPIC) ||
+        (env->cont_responses && env->cont_tools_responses &&
+         surf == DS4_WIRE_RESPONSES);
     if (needs & DS4_NEED_LIVE_FRONTIER) {
         d.reason = ROUTE_REASON_NEED_LIVE_FRONTIER; return d;
     }
+    if ((needs & DS4_NEED_BANK_FRONTIER) && !tools_promoted) {
+        /* Inc 6b: a BANK-owned continuation is cont-only; with the surface
+         * not tool-promoted it degrades to the serial lane, whose resolve
+         * cannot match a bank record and answers the honest native 409
+         * (retry by replaying the full history).  Same first-reason as the
+         * serial live-frontier hold: it IS one. */
+        d.reason = ROUTE_REASON_NEED_LIVE_FRONTIER; return d;
+    }
     if (needs & DS4_NEED_CONTINUATION_PUBLISH) {
-        d.reason = ROUTE_REASON_NEED_CONTINUATION_PUBLISH; return d;
+        /* Inc 6a: a STREAMING tool turn on a tool-promoted surface rides
+         * cont -- the Inc 5c bank publication at cont_resolve_chat is its
+         * §4.6 record, and "serial streaming already cannot model-correct
+         * after partial bytes are visible" (plan §5 Inc 6), so streaming
+         * loses nothing by promotion.  Buffered tool turns keep the serial
+         * hold via the CORRECTIVE_RECOVERY branch below: the serial
+         * decode_again corrective retry has no row-local cont equivalent,
+         * and the plan explicitly allows keeping them serial (Inc 6 scope
+         * decision, revisit post-Inc 6). */
+        if (!((needs & DS4_NEED_STREAMING) && tools_promoted)) {
+            d.reason = ROUTE_REASON_NEED_CONTINUATION_PUBLISH; return d;
+        }
     }
     if (needs & DS4_NEED_CORRECTIVE_RECOVERY) {
         d.reason = ROUTE_REASON_NEED_CORRECTIVE_RECOVERY; return d;
@@ -12805,7 +12929,18 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
     if ((needs & DS4_NEED_TOOL_SCAN) && surf == DS4_WIRE_OPENAI_COMPLETION) {
         d.reason = ROUTE_REASON_TOOLS_COMPLETION; return d;
     }
-    if (needs & ~ROUTE_CONT_MASK) {
+    /* Inc 6a/6b: the flat cont mask grows exactly the bits whose branches
+     * above chose to fall through -- CONTINUATION_PUBLISH for a promoted
+     * streaming tool turn (the 5c bank publish at cont_resolve_chat is the
+     * capability) and BANK_FRONTIER for a promoted bank continuation (the
+     * claim + generation-equality admission is the capability). */
+    uint32_t cont_mask = ROUTE_CONT_MASK;
+    if (tools_promoted) {
+        if (needs & DS4_NEED_STREAMING)
+            cont_mask |= DS4_NEED_CONTINUATION_PUBLISH;
+        cont_mask |= DS4_NEED_BANK_FRONTIER;
+    }
+    if (needs & ~cont_mask) {
         /* Future-bit tripwire: a need added without a branch above must never
          * silently batch.  Unreachable today -- every non-cont bit is handled
          * before this check. */
@@ -12831,9 +12966,15 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
         d.reason = ROUTE_REASON_SURFACE; return d;
     }
     if (!env->coalesce) { d.reason = ROUTE_REASON_COALESCE_OFF; return d; }
-    /* 3. Prompt/seq bounds + runtime availability. */
+    /* 3. Prompt/seq bounds + runtime availability.  A bank continuation's
+     * prompt here is only the rendered SUFFIX (output-only shape); the real
+     * fit check -- bank committed length + tokenized suffix vs seq_cap --
+     * runs at the claim admission and refuses with the native 409. */
     if (env->have_cont && env->prompt_len > 0 && env->prompt_len <= env->seq_cap) {
-        d.lane = ROUTE_LANE_CONTINUOUS; d.reason = ROUTE_REASON_CONT; return d;
+        d.lane = ROUTE_LANE_CONTINUOUS;
+        d.reason = (needs & DS4_NEED_BANK_FRONTIER) ? ROUTE_REASON_CONT_BANK
+                                                    : ROUTE_REASON_CONT;
+        return d;
     }
     /* Static fallback, scoped to its exact capabilities (plan §5 Inc 3
      * bullet 3).  CAPABILITY scoping is the needs word: ROUTE_STATIC_MASK
@@ -13846,12 +13987,20 @@ static bool warm_rec_superseded(const server *s, const bool *occ, int b) {
  * v0.2 ws4: the plain-LRU tier is depth-split (see warm_pin_min): shallow
  * records first, a DEEP record only when every candidate is deep.  Superseded
  * records stay fair game at any depth -- their prefix survives in the
- * superset bank. */
-static int warm_victim_pick(const server *s, const bool *occ, int excl, bool evict_lru) {
+ * superset bank.
+ * Inc 6c: a retention-protected bank (LIVE in-grace or hard-pinned tool
+ * continuation record -- cont_registry_bank_protected) is never a victim
+ * at ANY tier, including the no-value fast path: destroying it would break
+ * the output-only continuation the record promises.  Protection is
+ * grace/pin-bounded, so a fully protected scan (return -1) resolves within
+ * seconds and cold admits simply wait an admit poll. */
+static int warm_victim_pick(server *s, const bool *occ, int excl, bool evict_lru) {
     int sup = -1, lru = -1, deep_lru = -1;
     uint64_t sup_use = UINT64_MAX, lru_use = UINT64_MAX, deep_use = UINT64_MAX;
+    const double now = now_sec();
     for (int b = 0; b < s->batch_ctx_max_seq; b++) {
         if (occ[b] || b == excl) continue;
+        if (cont_registry_bank_protected(s, b, now)) continue;   /* Inc 6c */
         if (!s->warm[b].valid) return b;             /* no retained value */
         const bool deep = s->warm_pin_min > 0 &&
             ds4_batch_ctx_bank_committed(s->batch_ctx, b, NULL) >= s->warm_pin_min;
@@ -13876,7 +14025,7 @@ static int warm_victim_pick(const server *s, const bool *occ, int excl, bool evi
  * tiers, and never a pin-tier record -- so bank churn cannot permanently
  * lock deep trunks out of the disk tier.  (Factored out of cont_warm_pick
  * in v0.5.1 so the partial disk path shares the exact rules.) */
-static int cont_disk_victim_pick(const server *s, const bool *occ,
+static int cont_disk_victim_pick(server *s, const bool *occ,
                                  uint32_t rec_tokens) {
     int rb = warm_victim_pick(s, occ, -1, false);
     if (rb < 0 && s->warm_pin_min > 0 &&
@@ -13897,9 +14046,16 @@ static int cont_disk_victim_pick(const server *s, const bool *occ,
  * j->warm_prompt (job-owned; freed at on_done / the stranded sweep).  With no
  * match, direct the cold admit to a victim bank (warm_victim_pick): the
  * engine's default is the LOWEST free bank, which would constantly reset
- * the most-recently-retired (most valuable) state. */
-static void cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *req) {
-    if (!s->warm || !s->batch_ctx) return;
+ * the most-recently-retired (most valuable) state.
+ * Inc 6c: returns false when NO placement is possible without violating a
+ * bank's continuation protection (every victim candidate in grace/pinned) --
+ * the caller sheds instead of admitting undirected. */
+static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *req) {
+    /* Warm records off: no placement smarts AND no protection enforcement
+     * (the victim scans below are how protection binds placement) -- bank
+     * records still publish and claim, but their retention guarantees
+     * assume the default warm-record mode. */
+    if (!s->warm || !s->batch_ctx) return true;
     bool occ[DS4_COALESCE_HARD_MAX] = {false};
     for (int i = 0; i < cs->max_seq; i++) {
         const job *o = cs->inflight[i];
@@ -14016,10 +14172,6 @@ full_commit:
                                                            &j->warm_prompt);
             if (j->warm_prompt.len > hl &&
                 j->warm_prompt.len <= ds4_batch_ctx_seq_cap(s->batch_ctx)) {
-                req->tokens     = j->warm_prompt.v;
-                req->n          = j->warm_prompt.len;
-                req->n_cached   = hl;
-                s->warm[best].last_use = ++s->warm_clock;
                 /* A2b: prefer serving the match as a FORK into a different free
                  * bank -- the trunk record survives, so siblings sharing the
                  * prefix (fan-out) and later turns keep matching it.  Target =
@@ -14041,6 +14193,27 @@ full_commit:
                  * shallow-trunk luxury and continue deep trunks in place. */
                 if (ft >= 0 && s->warm_pin_min > 0 && hl >= s->warm_pin_min)
                     ft = -1;
+                /* Inc 6c: no fork target and the trunk's frontier is inside
+                 * its grace/pin protection -- an in-place continuation would
+                 * EXTEND the bank past the published frontier, which breaks
+                 * the output-only continuation exactly like an eviction
+                 * (equality fails at the claim).  Skip the match; the
+                 * partial/cold paths below skip protected banks too, so this
+                 * request pays at worst a cold prefill during the bounded
+                 * window rather than destroying the promised frontier. */
+                if (ft < 0 &&
+                    cont_registry_bank_protected(s, best, now_sec())) {
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: warm admit skipped: bank %d frontier is continuation-protected",
+                               best);
+                    ds4_tokens_free(&j->warm_prompt);
+                    memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));
+                    goto warm_full_skipped;
+                }
+                req->tokens     = j->warm_prompt.v;
+                req->n          = j->warm_prompt.len;
+                req->n_cached   = hl;
+                s->warm[best].last_use = ++s->warm_clock;
                 if (ft >= 0) {
                     req->place_bank = ft + 1;
                     req->fork_bank  = best + 1;
@@ -14061,12 +14234,13 @@ full_commit:
                                "ds4-server: warm admit bank=%d cached=%d suffix=%d",
                                best, hl, req->n - hl);
                 }
-                return;
+                return true;
             }
             ds4_tokens_free(&j->warm_prompt);
             memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));
         }
     }
+warm_full_skipped:
     /* P1: no record is a full byte-prefix of this request.  The dominant
      * single-turn shape (shared system prompt / few-shot block, divergent
      * tail -- 0/2137 admissions warmed on the eval corpus) DIVERGES from a
@@ -14139,9 +14313,6 @@ full_commit:
             if (htok)
                 while (cut < pcap && htok[cut] == j->req.prompt.v[cut]) cut++;
             if (cut >= s->warm_partial_min) {
-                req->n_cached  = cut;                /* engine aligns + validates */
-                req->fork_bank = pb + 1;
-                s->warm[pb].last_use = ++s->warm_clock;
                 /* v0.2 ws4: same deep-trunk rule as the full-match fork above,
                  * keyed on CUT (the extent fork-by-copy re-maps).  Sequential
                  * unique deep prompts sharing a long prefix otherwise stack a
@@ -14152,6 +14323,20 @@ full_commit:
                 int ft = warm_victim_pick(s, occ, pb, false);
                 if (ft >= 0 && s->warm_pin_min > 0 && cut >= s->warm_pin_min)
                     ft = -1;
+                /* Inc 6c: truncating a protected trunk in place destroys the
+                 * published frontier's tail -- never do it inside the
+                 * grace/pin window.  (A fork keeps the trunk intact, so
+                 * ft >= 0 stays allowed.)  Fall through to the deferred-full
+                 * retry / cold tail, which respect protection themselves. */
+                if (ft < 0 && cont_registry_bank_protected(s, pb, now_sec())) {
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: partial admit skipped: trunk bank %d frontier is continuation-protected",
+                               pb);
+                    goto warm_partial_skipped;
+                }
+                req->n_cached  = cut;                /* engine aligns + validates */
+                req->fork_bank = pb + 1;
+                s->warm[pb].last_use = ++s->warm_clock;
                 if (ft >= 0) {
                     req->place_bank = ft + 1;
                     /* v0.3 durable banks: foreign record destroyed (see the
@@ -14184,10 +14369,11 @@ full_commit:
                                "ds4-server: partial truncate admit bank=%d cut=%d suffix=%d",
                                pb, cut, req->n - cut);
                 }
-                return;
+                return true;
             }
         }
     }
+warm_partial_skipped:
     /* #10: the preferred partial trunk could not take the job (cut below
      * the token floor / untrustworthy committed state) -- serve the full
      * match after all rather than falling to cold. */
@@ -14211,7 +14397,105 @@ full_commit:
         /* v0.5.1 inc3b: a fresh conversation takes the bank -- the old
          * lineage's disk coverage means nothing to it. */
         s->warm[target].stored_tokens = 0;
+    } else {
+        /* Inc 6c: with protection in play, target < 0 now means every free
+         * bank is inside a grace/pin window (pre-6c it was unreachable: a
+         * free slot implies a free bank).  An UNDIRECTED admit would let
+         * the engine default onto a protected bank, so refuse placement --
+         * the caller sheds 503+Retry-After (the serial continuation_hold
+         * idiom; plan §4.6 "admission waits or sheds ... instead of
+         * violating a pin"). */
+        return false;
     }
+    return true;
+}
+
+/* Inc 6b: directed admission for a BANK-owned tool continuation (plan §5
+ * Inc 6; the consumer the cont_registry_bank_claim comment promises).  The
+ * claim returns the record's execution reference (bank, generation,
+ * frontier); this runs on the SAME worker thread that mutates bank state,
+ * so comparing the claim against the live bank right here IS the
+ * queued-eviction/ABA check -- a bank evicted, trimmed, restored, or
+ * reused since publication has a bumped generation (engine Inc 5a) and
+ * fails equality, and the claim-to-admission TOCTOU window closes because
+ * nothing can move a bank between the two reads.  On success the effective
+ * prompt is the bank's EXACT committed token history plus the tokenized
+ * tool-result suffix (the serial continuation idiom: canonical tokens are
+ * never sliced, BPE can merge across the byte boundary) and the row is
+ * placed IN PLACE on its own bank -- an extension of the same lineage, so
+ * the generation must NOT bump and a follow-up turn's record stays honest.
+ * The engine's frontier memcmp re-validates the exact-prefix claim.
+ * Any failure answers the protocol-native 409 (the registry-miss surface,
+ * creg_missed): an output-only continuation has no stateless prefix to
+ * cold-prefill, exactly like the serial path's miss. */
+static bool cont_bank_continuation_admit(server *s, cont_sched *cs, job *j,
+                                         ds4_cont_request *req) {
+    const stop_list *ids = j->req.api == API_RESPONSES ?
+        &j->req.responses_live_call_ids : &j->req.anthropic_live_call_ids;
+    const char *suffix = j->req.api == API_RESPONSES ?
+        j->req.responses_live_suffix_text : j->req.anthropic_live_suffix_text;
+    int bank = -1, frontier = 0;
+    uint64_t gen = 0;
+    const char *why = NULL;
+    if (!suffix || !s->batch_ctx)
+        why = "no suffix text or batch ctx";
+    if (!why && !cont_registry_bank_claim(s, j->req.api, ids, &bank, &gen,
+                                          &frontier))
+        why = "record no longer live";
+    if (!why)
+        for (int i = 0; i < cs->max_seq; i++)
+            if (cs->inflight[i] && cs->inflight[i] != j &&
+                cs->inflight[i]->cont_bank == bank)
+                why = "bank occupied by an in-flight row";
+    const int *htok = NULL;
+    uint64_t live_gen = 0;
+    int live_committed = -1;
+    if (!why) {
+        live_committed = ds4_batch_ctx_bank_committed(s->batch_ctx, bank,
+                                                      &htok);
+        live_gen = ds4_batch_ctx_bank_generation(s->batch_ctx, bank);
+        if (live_gen != gen || live_committed != frontier || !htok ||
+            frontier <= 0)
+            why = "generation/frontier moved since publication";
+    }
+    if (!why) {
+        ds4_tokens exact = { (int *)htok, frontier, frontier };
+        build_prompt_from_exact_prefix_and_text_suffix(s->engine, &exact,
+                                                       suffix,
+                                                       &j->warm_prompt);
+        if (j->warm_prompt.len <= frontier ||
+            j->warm_prompt.len > ds4_batch_ctx_seq_cap(s->batch_ctx)) {
+            ds4_tokens_free(&j->warm_prompt);
+            memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));
+            why = "empty suffix or over the seq cap";
+        }
+    }
+    if (why) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: cont bank continuation refused (%s) bank=%d "
+                   "rec gen=%llu frontier=%d live gen=%llu committed=%d; answering 409",
+                   why, bank, (unsigned long long)gen, frontier,
+                   (unsigned long long)live_gen, live_committed);
+        ds4_metric_add(&ds4_metrics_get()->creg_missed, 1);
+        wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 409,
+                        j->req.api == API_RESPONSES ?
+                        "Responses continuation state is not available; retry by replaying the full input history" :
+                        "Anthropic continuation state is not available; retry by replaying the full messages history");
+        return false;
+    }
+    req->tokens   = j->warm_prompt.v;
+    req->n        = j->warm_prompt.len;
+    req->n_cached = frontier;
+    req->place_bank = bank + 1;   /* in-place: same lineage, never a fork */
+    /* Record consumed by its own continuation; retire re-records.  As with
+     * the full-match in-place admit, stored_tokens survives: an extension
+     * keeps every disk-covered prefix valid (v0.5.1 inc3b). */
+    warm_rec_invalidate(s, bank);
+    ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: cont bank continuation admit bank=%d cached=%d suffix=%d",
+               bank, frontier, req->n - frontier);
+    return true;
 }
 
 /* admit: hand the engine the next waiting request, or 0 to stop admitting now. */
@@ -14286,6 +14570,8 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
                     .coalesce = true, .have_cont = true,
                     .cont_anthropic = s->cont_anthropic,
                     .cont_responses = s->cont_responses,
+                    .cont_tools_anthropic = s->cont_tools_anthropic,
+                    .cont_tools_responses = s->cont_tools_responses,
                     .seq_cap = cs->seq_cap, .prompt_len = s->head->req.prompt.len,
                 };
                 rd = route_decide(s->head->req.needs,
@@ -14316,10 +14602,39 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     req->eos     = ds4_token_eos(s->engine);
     req->user    = j;
     /* A2a: engine-reported placement + warm-continuation matching (may swap
-     * req->tokens for the bank-exact effective prompt in j->warm_prompt). */
+     * req->tokens for the bank-exact effective prompt in j->warm_prompt).
+     * Inc 6b: a bank continuation takes its DIRECTED claim admission
+     * instead; a failed claim already answered the native 409 (the job is
+     * finished), so just release the slot and stop this admit poll -- the
+     * engine polls again and the next head is served. */
     j->cont_bank   = -1;
     req->bank_used = &j->cont_bank;
-    cont_warm_pick(s, cs, j, req);
+    if (j->req.needs & DS4_NEED_BANK_FRONTIER) {
+        if (!cont_bank_continuation_admit(s, cs, j, req)) {
+            cs->inflight[slot] = NULL;
+            job_finish(j);
+            return 0;
+        }
+    } else if (!cont_warm_pick(s, cs, j, req)) {
+        /* Inc 6c: every victim candidate is reserved for a live tool
+         * continuation (grace/pin) and an undirected admit would let the
+         * engine default onto one -- shed with the serial lane's
+         * continuation_hold idiom rather than destroy a promised frontier.
+         * Streaming included: transport has not started (Inc 4a starts it
+         * at successful admission). */
+        const int ra = cont_registry_bank_hold_retry(s, now_sec());
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: cont admission hold shed: every victim bank is "
+                   "reserved for a live tool continuation (retry in %ds, prompt=%d tokens)",
+                   ra, j->req.prompt.len);
+        wire_http_error_retry(j->fd, s->enable_cors, wire_surface_for(&j->req),
+                              503, ra,
+                              "batch capacity is reserved for live tool continuations; retry shortly");
+        j->outcome = JOB_OUT_SHED_CONT_HOLD;
+        cs->inflight[slot] = NULL;
+        job_finish(j);
+        return 0;
+    }
     /* v0.5.4: OpenAI usage details for the cont path (the serial path sets
      * these at session sync; cont responses reported cached_tokens=0 for
      * every admit shape).  The reusable prefix is a cache read, the replayed
@@ -14666,10 +14981,11 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
          * cont_warm_retire (the bank's generation and committed length are
          * post-retire) and BEFORE either finalize writer appends terminal
          * bytes to j->out -- publication precedes terminal visibility, the
-         * same §4.6 ordering the serial transaction enforces.  Dormant in
-         * live traffic until Inc 6 routes tool-capable Anthropic/Responses
-         * onto this lane; OpenAI chat keeps tool_memory + full-replay
-         * canonicalize (no record, no 409 surface -- the 5a scoping). */
+         * same §4.6 ordering the serial transaction enforces.  LIVE since
+         * Inc 6a: streaming anth/resp tool turns ride this lane and their
+         * T2 consumes the record via cont_bank_continuation_admit; OpenAI
+         * chat keeps tool_memory + full-replay canonicalize (no record, no
+         * 409 surface -- the 5a scoping). */
         if ((j->req.api == API_ANTHROPIC || j->req.api == API_RESPONSES) &&
             s->batch_ctx && j->cont_bank >= 0) {
             cont_registry_publish_bank(s, j->req.api, calls, j->cont_bank,
@@ -15202,6 +15518,8 @@ static void *worker_main(void *arg) {
             .have_cont  = continuous && s->batch_ctx != NULL,
             .cont_anthropic = s->cont_anthropic,
             .cont_responses = s->cont_responses,
+            .cont_tools_anthropic = s->cont_tools_anthropic,
+            .cont_tools_responses = s->cont_tools_responses,
             .seq_cap    = s->batch_ctx ? ds4_batch_ctx_seq_cap(s->batch_ctx) : 0,
             .prompt_len = j->req.prompt.len,
         };
@@ -17114,6 +17432,11 @@ int main(int argc, char **argv) {
         s.cont_anthropic = !(ca && ca[0] == '0' && ca[1] == '\0');
         const char *cr = getenv("DS4_SERVER_CONT_RESPONSES");
         s.cont_responses = !(cr && cr[0] == '0' && cr[1] == '\0');
+        /* Inc 6a: tool-capable promotion (plan §5 Inc 6 + §7). */
+        const char *ta = getenv("DS4_SERVER_CONT_TOOLS_ANTHROPIC");
+        s.cont_tools_anthropic = !(ta && ta[0] == '0' && ta[1] == '\0');
+        const char *tr = getenv("DS4_SERVER_CONT_TOOLS_RESPONSES");
+        s.cont_tools_responses = !(tr && tr[0] == '0' && tr[1] == '\0');
     }
     {
         /* Inc 2e admission bounds (plan §4.8 + §5); 0 disables a bound.
@@ -20338,6 +20661,59 @@ static void test_cont_registry_bank_publish_claim(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* Inc 6c: bank retention protection -- LIVE-only, grace-scoped, extended by
+ * a valid hard pin, never by a demoted record; the hold Retry-After answers
+ * the soonest protection lapse. */
+static void test_cont_registry_bank_protection(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.creg.grace_s = 60.0;
+    s.creg.ttl_s = 300.0;
+    s.creg.pin_deadline_s = 60.0;
+
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_prot1");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 5, 3, 200);
+        tool_calls_free(&calls);
+    }
+    const double now = now_sec();
+    /* In grace: the record's bank is protected; other banks are not. */
+    TEST_ASSERT(cont_registry_bank_protected(&s, 5, now));
+    TEST_ASSERT(!cont_registry_bank_protected(&s, 4, now));
+    /* Honest Retry-After: bounded by the grace remaining. */
+    const int ra = cont_registry_bank_hold_retry(&s, now);
+    TEST_ASSERT(ra >= 1 && ra <= 61);
+    /* Grace lapsed, no pin: unprotected (still LIVE until TTL -- the claim
+     * keeps working; only VICTIM protection ends with grace). */
+    pthread_mutex_lock(&s.tool_mu);
+    for (cont_record *rec = s.creg.head; rec; rec = rec->next)
+        rec->publish_time -= 61.0;
+    pthread_mutex_unlock(&s.tool_mu);
+    TEST_ASSERT(!cont_registry_bank_protected(&s, 5, now));
+    /* A queued T2's hard pin re-protects past grace until its deadline. */
+    void *pin = cont_registry_pin_live(&s, API_ANTHROPIC, "toolu_prot1");
+    TEST_ASSERT(pin != NULL);
+    TEST_ASSERT(cont_registry_bank_protected(&s, 5, now));
+    cont_registry_unpin(&s, pin);
+    TEST_ASSERT(!cont_registry_bank_protected(&s, 5, now));
+    /* A demoted record never protects, pinned or not (state gate first). */
+    pin = cont_registry_pin_live(&s, API_ANTHROPIC, "toolu_prot1");
+    TEST_ASSERT(pin != NULL);
+    pthread_mutex_lock(&s.tool_mu);
+    for (cont_record *rec = s.creg.head; rec; rec = rec->next)
+        if (rec->state == CONT_REC_LIVE_FRONTIER)
+            cont_registry_demote_locked(&s, rec);
+    pthread_mutex_unlock(&s.tool_mu);
+    TEST_ASSERT(!cont_registry_bank_protected(&s, 5, now));
+    cont_registry_unpin(&s, pin);
+
+    cont_registry_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
     server s;
     memset(&s, 0, sizeof(s));
@@ -22243,6 +22619,10 @@ static void test_request_compute_needs_matrix(void) {
     r.stream = false; r.has_tools = false;
     r.anthropic_requires_live_tool_state = true;
     TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_LIVE_FRONTIER);
+    /* Inc 6b: a BANK-owned pin flips the bit to the cont lane's frontier. */
+    r.live_state_bank_owned = true;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_BANK_FRONTIER);
+    r.live_state_bank_owned = false;
     r.anthropic_requires_live_tool_state = false;
     /* Anthropic cache-prewarm: explicit zero = prefill-only; the omitted
      * default (parser preloads max_tokens) is not. */
@@ -22256,6 +22636,15 @@ static void test_request_compute_needs_matrix(void) {
     r.api = API_RESPONSES; r.temperature = 0.0f; r.think_mode = DS4_THINK_NONE;
     r.responses_requires_live_tool_state = true;
     TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_LIVE_FRONTIER);
+    /* Inc 6b: bank-owned -> the cont frontier bit ... */
+    r.live_state_bank_owned = true;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_BANK_FRONTIER);
+    /* ... but live REASONING state is serial-only visible-state machinery,
+     * so it keeps the serial bit even alongside a bank-owned pin. */
+    r.responses_requires_live_reasoning = true;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_LIVE_FRONTIER);
+    r.responses_requires_live_reasoning = false;
+    r.live_state_bank_owned = false;
     r.responses_requires_live_tool_state = false;
     r.responses_requires_live_reasoning = true;
     TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_LIVE_FRONTIER);
@@ -22284,12 +22673,34 @@ static int route_legacy_oracle(const request *r, bool coalesce_on,
  * static writer is surface-typed).  Token-id echo keeps its
  * streaming-chat-only projection constraint on every surface.  Everything
  * else must stay bit-identical to the legacy oracle, which is the
- * strongest statement of "no other request changed lane". */
-static int route_expected_oracle(const request *r, bool coalesce_on,
-                                 bool have_cont, int seq_cap) {
+ * strongest statement of "no other request changed lane".
+ * Inc 6a: this is now the table the TOOL switches alone must restore. */
+static int route_inc5_oracle(const request *r, bool coalesce_on,
+                             bool have_cont, int seq_cap) {
     const uint32_t needs = request_compute_needs(r);
     if (coalesce_on && (r->api == API_ANTHROPIC || r->api == API_RESPONSES) &&
         (needs & ~ROUTE_CONT_MASK) == 0 &&
+        !(needs & DS4_NEED_TOKEN_IDS)) {
+        if (have_cont && r->prompt.len > 0 && r->prompt.len <= seq_cap)
+            return ROUTE_LANE_CONTINUOUS;
+        if (needs == 0) return ROUTE_LANE_STATIC;   /* Inc 3d */
+    }
+    return route_legacy_oracle(r, coalesce_on, have_cont, seq_cap);
+}
+
+/* Inc 6a/6b: the Inc 5 table plus EXACTLY two promotions -- a STREAMING
+ * tool turn on a promoted surface rides continuous (publication is the 5c
+ * bank publish at the cont finalize), and a BANK-owned continuation rides
+ * continuous (the claim admission is its consumer).  Buffered tool turns
+ * keep the serial corrective hold; serial-owned live frontiers stay
+ * serial. */
+static int route_expected_oracle(const request *r, bool coalesce_on,
+                                 bool have_cont, int seq_cap) {
+    const uint32_t needs = request_compute_needs(r);
+    uint32_t mask = ROUTE_CONT_MASK | DS4_NEED_BANK_FRONTIER;
+    if (r->stream) mask |= DS4_NEED_CONTINUATION_PUBLISH;
+    if (coalesce_on && (r->api == API_ANTHROPIC || r->api == API_RESPONSES) &&
+        (needs & ~mask) == 0 &&
         !(needs & DS4_NEED_TOKEN_IDS)) {
         if (have_cont && r->prompt.len > 0 && r->prompt.len <= seq_cap)
             return ROUTE_LANE_CONTINUOUS;
@@ -22316,10 +22727,13 @@ static void test_route_decide_matches_legacy_exhaustive(void) {
     for (int tools = 0; tools < 2; tools++)
     for (int echo = 0; echo < 2; echo++)
     for (int live = 0; live < 2; live++)
+    for (int bankown = 0; bankown < 2; bankown++)
     for (int zero = 0; zero < 2; zero++) {
         /* Field coherence: live-continuation evidence exists only on the
-         * surfaces whose parsers produce it. */
+         * surfaces whose parsers produce it; a bank-owned pin (Inc 6b)
+         * exists only alongside that evidence. */
         if (live && surfs[sf].api == API_OPENAI) continue;
+        if (bankown && !live) continue;
         request r;
         request_init(&r, surfs[sf].kind, 128);
         r.api = surfs[sf].api;
@@ -22332,6 +22746,7 @@ static void test_route_decide_matches_legacy_exhaustive(void) {
         if (live) {
             if (r.api == API_ANTHROPIC) r.anthropic_requires_live_tool_state = true;
             else                        r.responses_requires_live_tool_state = true;
+            r.live_state_bank_owned = bankown != 0;
         }
         if (zero) { r.max_tokens_set = true; r.max_tokens = 0; }
         const uint32_t needs = request_compute_needs(&r);
@@ -22342,15 +22757,25 @@ static void test_route_decide_matches_legacy_exhaustive(void) {
                 ds4_route_env env = {
                     .coalesce = envs[ei].coalesce, .have_cont = envs[ei].have_cont,
                     .cont_anthropic = true, .cont_responses = true,
+                    .cont_tools_anthropic = true, .cont_tools_responses = true,
                     .seq_cap = 4096, .prompt_len = lens[li],
                 };
                 ds4_route_decision d = route_decide(needs, wire_surface_for(&r), &env);
                 TEST_ASSERT(d.lane != ROUTE_LANE_NONE);
                 TEST_ASSERT(d.lane == route_expected_oracle(&r, envs[ei].coalesce,
                                                             envs[ei].have_cont, 4096));
-                /* The §7 kill switches restore the LEGACY table exactly. */
+                /* Inc 6a: the TOOL switches alone restore the Inc 5 table. */
+                env.cont_tools_anthropic = false;
+                env.cont_tools_responses = false;
+                d = route_decide(needs, wire_surface_for(&r), &env);
+                TEST_ASSERT(d.lane == route_inc5_oracle(&r, envs[ei].coalesce,
+                                                        envs[ei].have_cont, 4096));
+                /* The §7 kill switches restore the LEGACY table exactly
+                 * (tool switches without their base do nothing). */
                 env.cont_anthropic = false;
                 env.cont_responses = false;
+                env.cont_tools_anthropic = true;
+                env.cont_tools_responses = true;
                 d = route_decide(needs, wire_surface_for(&r), &env);
                 TEST_ASSERT(d.lane == route_legacy_oracle(&r, envs[ei].coalesce,
                                                           envs[ei].have_cont, 4096));
@@ -22360,15 +22785,17 @@ static void test_route_decide_matches_legacy_exhaustive(void) {
         r.prompt.len = 0;
         request_free(&r);
     }
-    TEST_ASSERT(rows == (2 * 128 + 2 * 256) * 16);
+    /* Inc 6b: the bankown dimension (coherent only alongside live) grows
+     * the promoted surfaces from 256 to 384 coherent shapes each. */
+    TEST_ASSERT(rows == (2 * 128 + 2 * 384) * 16);
 }
 
 /* Inc 2a, plan §6.2: exact {lane, first-reason} rows for the canonical
  * shapes -- the refusal/fallback reason is contract now, not just the lane. */
 static void test_route_decide_reason_table(void) {
-    const ds4_route_env on     = { .coalesce = true,  .have_cont = true,  .cont_anthropic = true, .cont_responses = true, .seq_cap = 4096, .prompt_len = 16 };
-    const ds4_route_env no_ctx = { .coalesce = true,  .have_cont = false, .cont_anthropic = true, .cont_responses = true, .seq_cap = 0,    .prompt_len = 16 };
-    const ds4_route_env off    = { .coalesce = false, .have_cont = true,  .cont_anthropic = true, .cont_responses = true, .seq_cap = 4096, .prompt_len = 16 };
+    const ds4_route_env on     = { .coalesce = true,  .have_cont = true,  .cont_anthropic = true, .cont_responses = true, .cont_tools_anthropic = true, .cont_tools_responses = true, .seq_cap = 4096, .prompt_len = 16 };
+    const ds4_route_env no_ctx = { .coalesce = true,  .have_cont = false, .cont_anthropic = true, .cont_responses = true, .cont_tools_anthropic = true, .cont_tools_responses = true, .seq_cap = 0,    .prompt_len = 16 };
+    const ds4_route_env off    = { .coalesce = false, .have_cont = true,  .cont_anthropic = true, .cont_responses = true, .cont_tools_anthropic = true, .cont_tools_responses = true, .seq_cap = 4096, .prompt_len = 16 };
     ds4_route_env big = on;   big.prompt_len = 4097;
     ds4_route_env empty = on; empty.prompt_len = 0;
     ds4_route_env anth_off = on; anth_off.cont_anthropic = false;
@@ -22470,6 +22897,60 @@ static void test_route_decide_reason_table(void) {
         ds4_route_env resp_off_noctx = no_ctx; resp_off_noctx.cont_responses = false;
         d = route_decide(0, DS4_WIRE_RESPONSES, &resp_off_noctx);
         TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
+    }
+    /* Inc 6a: a STREAMING tool turn on a tool-promoted surface rides cont;
+     * the per-feature switch, the base surface switch, and missing/unfit
+     * cont each restore the hold (semantic reason when a switch holds it,
+     * cont_unavailable when the lane itself cannot take it).  BUFFERED tool
+     * turns stay serial even fully switched on (the corrective contract). */
+    {
+        const uint32_t stream_tools = DS4_NEED_STREAMING | DS4_NEED_TOOL_SCAN |
+                                      DS4_NEED_CONTINUATION_PUBLISH;
+        d = route_decide(stream_tools, DS4_WIRE_ANTHROPIC, &on);
+        TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+        d = route_decide(stream_tools | DS4_NEED_THINKING | DS4_NEED_PER_ROW_SAMPLING |
+                         DS4_NEED_STOP_SCAN, DS4_WIRE_ANTHROPIC, &on);
+        TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+        d = route_decide(stream_tools, DS4_WIRE_RESPONSES, &on);
+        TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+        ds4_route_env tools_off_a = on; tools_off_a.cont_tools_anthropic = false;
+        d = route_decide(stream_tools, DS4_WIRE_ANTHROPIC, &tools_off_a);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_CONTINUATION_PUBLISH);
+        d = route_decide(stream_tools, DS4_WIRE_RESPONSES, &tools_off_a);   /* per-surface */
+        TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+        ds4_route_env tools_off_r = on; tools_off_r.cont_tools_responses = false;
+        d = route_decide(stream_tools, DS4_WIRE_RESPONSES, &tools_off_r);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_CONTINUATION_PUBLISH);
+        d = route_decide(stream_tools, DS4_WIRE_ANTHROPIC, &anth_off);   /* base off wins */
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_CONTINUATION_PUBLISH);
+        d = route_decide(stream_tools, DS4_WIRE_ANTHROPIC, &no_ctx);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+        d = route_decide(stream_tools, DS4_WIRE_ANTHROPIC, &big);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+        d = route_decide(stream_tools, DS4_WIRE_ANTHROPIC, &off);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_COALESCE_OFF);
+        /* Inc 6b: BANK-owned continuations ride cont when tool-promoted,
+         * with a DISTINCT accept reason (the gate's engagement oracle);
+         * switched off (or no cont) they degrade to the serial lane, whose
+         * resolve answers the honest 409.  A buffered T2 that redeclares
+         * tools keeps the buffered corrective hold (documented mixed-shape
+         * degrade: 409 -> full replay). */
+        d = route_decide(DS4_NEED_BANK_FRONTIER, DS4_WIRE_ANTHROPIC, &on);
+        TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT_BANK);
+        d = route_decide(DS4_NEED_BANK_FRONTIER | stream_tools, DS4_WIRE_RESPONSES, &on);
+        TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT_BANK);
+        d = route_decide(DS4_NEED_BANK_FRONTIER | DS4_NEED_TOOL_SCAN |
+                         DS4_NEED_CONTINUATION_PUBLISH | DS4_NEED_CORRECTIVE_RECOVERY,
+                         DS4_WIRE_ANTHROPIC, &on);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_CONTINUATION_PUBLISH);
+        d = route_decide(DS4_NEED_BANK_FRONTIER, DS4_WIRE_ANTHROPIC, &tools_off_a);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_LIVE_FRONTIER);
+        d = route_decide(DS4_NEED_BANK_FRONTIER, DS4_WIRE_ANTHROPIC, &anth_off);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_LIVE_FRONTIER);
+        d = route_decide(DS4_NEED_BANK_FRONTIER, DS4_WIRE_ANTHROPIC, &no_ctx);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+        d = route_decide(DS4_NEED_BANK_FRONTIER, DS4_WIRE_OPENAI_CHAT, &on);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_NEED_LIVE_FRONTIER);
     }
     /* semantic requirements fire before the surface gap, lowest bit first */
     d = route_decide(DS4_NEED_TOOL_SCAN | DS4_NEED_CONTINUATION_PUBLISH |
@@ -24306,6 +24787,7 @@ static void ds4_server_unit_tests_run(void) {
     test_send_all_capture_redirect();
     test_serial_terminal_commit_ladder();
     test_cont_registry_bank_publish_claim();
+    test_cont_registry_bank_protection();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();

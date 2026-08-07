@@ -36454,6 +36454,16 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                            btopk[b], btopp[b], bminp[b], &brng[b]);
                 uint32_t M = 1u;
                 bool evicted = false;
+                /* v0.5.6 Inc 6: a row retiring mid-accept-step must NOT fire
+                 * on_done before this step's committed-history appends below
+                 * -- the server's continuation publish (and warm retire) read
+                 * bank generation/committed inside on_done and are promised
+                 * POST-step-commit state (the plain path already appends the
+                 * forwarded token before its on_done).  Live-measured: the
+                 * old order published a frontier short by the final step's M
+                 * and every output-only bank continuation 409'd.  So detect
+                 * retirement here, run the appends, THEN call on_done. */
+                int done_eos = 0;
                 /* u0 = genuine token after row f's input (cur) -- always committed. */
                 seedtok[b] = vqtok[f];
                 gbuf[b][glen[b]++] = u; cur[b] = u; posv[b]++; mtp_acc_emit++;
@@ -36462,9 +36472,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     bool aborted = false;
                     if (!hit_eos && on_token && !on_token(ud, usr[b], u)) aborted = true;
                     if (hit_eos || glen[b] >= bmax[b] || aborted) {
-                        cont_stats_publish_done(ctx, sst, b, glen[b]);
-                        on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
-                        free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; credit[b] = 0u; evicted = true;
+                        done_eos = hit_eos ? 1 : 0;
+                        evicted = true;
                     }
                 }
                 for (uint32_t j = 0; !evicted && j < nd; j++) {
@@ -36490,9 +36499,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     bool aborted = false;
                     if (!hit_eos && on_token && !on_token(ud, usr[b], u)) aborted = true;
                     if (hit_eos || glen[b] >= bmax[b] || aborted) {
-                        cont_stats_publish_done(ctx, sst, b, glen[b]);
-                        on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
-                        free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; credit[b] = 0u; evicted = true;
+                        done_eos = hit_eos ? 1 : 0;
+                        evicted = true;   /* on_done deferred past the appends below */
                     }
                 }
                 committed_rows[b] = M;
@@ -36524,6 +36532,18 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 } else {
                     ctx->bank_gen[b]++;   /* Inc 5a: deferred-commit invalidate */
                     ctx->bank_hist_valid[b] = 0u;
+                }
+                /* v0.5.6 Inc 6: the deferred retirement -- the bank's
+                 * committed history now reflects this step, so on_done's
+                 * readers (continuation publish, warm retire) see the final
+                 * generation + frontier.  On the invalidate branch above the
+                 * publish sees gen bumped / no committed history and honestly
+                 * refuses to publish -- an output-only follow-up then gets
+                 * the native 409 instead of a wrong-frontier record. */
+                if (evicted) {
+                    cont_stats_publish_done(ctx, sst, b, glen[b]);
+                    on_done(ud, usr[b], gbuf[b], (int)glen[b], done_eos);
+                    free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; credit[b] = 0u;
                 }
             }
             if (dspark_prof && dspark_now) dspark_t_accept_s += now_sec() - accept_t0;

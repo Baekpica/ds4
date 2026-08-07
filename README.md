@@ -946,6 +946,20 @@ and short grace/TTL windows (`DS4_CONT_GRACE_S`, `DS4_CONT_TTL_S`,
 `DS4_CONT_PIN_DEADLINE_S`) protect a just-published turn from being evicted
 before its follow-up arrives.
 
+**Streaming tool turns ride the batched lane.** Anthropic and Responses
+STREAMING tool requests are served on the continuous-batching lane: the tool
+turn's registry record is owned by its KV bank, and an output-only follow-up
+continues that bank in place after the same generation/frontier equality
+check. Buffered tool requests deliberately stay on the serial lane — its
+model-visible corrective retry (feeding a malformed tool call back to the
+model as a tool error) has no per-row equivalent in the batched loop, and a
+parse-time boolean cannot predict a semantic failure discovered after
+generation. A mixed client that streams the tool turn but sends the follow-up
+buffered gets the honest `409` + full-replay path. Per-surface kill switches
+`DS4_SERVER_CONT_TOOLS_ANTHROPIC=0` / `DS4_SERVER_CONT_TOOLS_RESPONSES=0`
+restore the previous all-serial tool behavior (kept for one release, like the
+Inc 3 stateless switches they compose with).
+
 **The whole server is one trust domain.** There is no tenant or auth
 namespace: tool memory and the continuation registry are global, and any
 client that knows (or guesses) a tool-call ID may continue that conversation
