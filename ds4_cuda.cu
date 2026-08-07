@@ -31761,13 +31761,12 @@ extern "C" int ds4_gpu_exaone_moe_combine_tensor(
     return cuda_ok(cudaGetLastError(), "exaone moe combine");
 }
 
-/* Aligned fused gate+up+SwiGLU+router-weight, the reference fork's decode
- * tier for IQ2_XXS routed experts. Both weight stacks must have aligned-SoA
- * artifacts (built at boot from the merged tensor table); the kernel is
- * runtime-parameterized on n_expert_used, so K-EXAONE's top-8 works where the
- * raw fused kernel's constexpr top_k = 6 does not. Falls back (returns 0)
- * when artifacts are missing or n_tokens > 16, and the caller then takes the
- * separate-matmul route -- same math, more launches. */
+/* Aligned fused gate+up+SwiGLU+router-weight for IQ2_XXS routed experts. Both
+ * weight stacks must have aligned-SoA artifacts (built at boot from the
+ * merged tensor table); the helper internally chunks prefill widths above
+ * the native 16-row vec envelope. It is runtime-parameterized on
+ * n_expert_used, so K-EXAONE's top-8 works where the raw fused kernel's
+ * constexpr top_k = 6 does not. */
 extern "C" int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
         ds4_gpu_tensor       *mid,
         const ds4_gpu_tensor *x,
@@ -31787,7 +31786,7 @@ extern "C" int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
         uint32_t                n_expert_used) {
     if (!mid || !x || !ids || !weights || !model_map ||
         weight_type != 16u /* IQ2_XXS */ ||
-        n_tokens == 0u || n_tokens > 16u ||
+        n_tokens == 0u ||
         in_dim == 0u || in_dim % 1024u != 0u || mid_dim == 0u ||
         n_expert == 0u || n_expert_used == 0u ||
         gate_offset > model_size || gate_bytes > model_size - gate_offset ||

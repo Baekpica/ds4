@@ -4296,9 +4296,28 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
-    if (n_tokens < 1 || n_tokens > 16 || M <= 0 || K <= 0 || n_experts <= 0 ||
+    if (n_tokens < 1 || M <= 0 || K <= 0 || n_experts <= 0 ||
         n_expert_used <= 0 || n_expert_used > n_experts || K % 1024 != 0) {
         return -1;
+    }
+    /* The vec kernel and its Q8_1 prelude operate on at most 16 activation
+     * rows. Prefill batches are normally wider, but their flat output layout
+     * is token-major, so contiguous 16-row slices can be submitted on the
+     * same stream without changing numerics or materializing raw weights. */
+    if (n_tokens > 16) {
+        for (int done = 0; done < n_tokens; done += 16) {
+            const int chunk = n_tokens - done < 16 ? n_tokens - done : 16;
+            const size_t assignment0 = (size_t)done * (size_t)n_expert_used;
+            const int rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+                    W_gate_aligned, W_up_aligned,
+                    X_f32 + (size_t)done * (size_t)K,
+                    ids + assignment0,
+                    weights + assignment0,
+                    mid_f32 + assignment0 * (size_t)M,
+                    M, K, chunk, n_experts, n_expert_used, clamp, stream);
+            if (rc != 0) return rc;
+        }
+        return 0;
     }
     ggml_cuda_pool_alloc<char> q8_pool;
     char *x8 = iq2_aligned_quantize_xn(tag, X_f32, K, n_tokens, &q8_pool, stream);

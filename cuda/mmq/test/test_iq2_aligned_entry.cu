@@ -35,7 +35,8 @@ int main(int argc, char **argv) {
     const int n_experts = 256;
     const int n_slots = 6;
     const int n_idsets = 32;
-    const int iters = 2000;
+    const char *iters_env = getenv("DS4_TEST_ITERS");
+    const int iters = iters_env && atoi(iters_env) > 0 ? atoi(iters_env) : 2000;
     const int nb = K / 256;
     const long long row_bytes = (long long)nb * 66;
     const double slot_gb = (double)n_slots * M * row_bytes / 1e9;
@@ -114,7 +115,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         CK(cudaEventRecord(e0, stream));
-        const int dr_iters = 50;
+        const int dr_iters = iters < 50 ? iters : 50;
         for (int i = 0; i < dr_iters; i++)
             (void)ds4_mmq_iq2_xxs_aligned_derepack(dArt, dRaw2, M, K, n_experts, stream);
         CK(cudaEventRecord(e1, stream));
@@ -311,6 +312,58 @@ int main(int argc, char **argv) {
         CK(cudaFree(dMid4)); CK(cudaFree(dW4)); CK(cudaFree(dIds4));
     }
 
+    // ---- prompt-width parity: production prefill commonly exceeds the
+    // native 16-row vec envelope. The fused helper must internally chunk a
+    // 26-token call without changing the flat [token, slot, row] layout.
+    int bad26_mid = 0;
+    {
+        const int n_tok = 26, n_asg = n_tok * n_slots;
+        std::vector<float> X26((size_t)n_tok * K);
+        for (auto &v : X26) v = ((float)(rng() % 2000) - 1000.0f) / 500.0f;
+        std::vector<int32_t> ids26(n_asg);
+        std::vector<float> w26(n_asg);
+        for (int a = 0; a < n_asg; a++) {
+            ids26[a] = (a * 11 + 5) % n_experts;
+            w26[a] = 0.2f + 0.001f * a;
+        }
+        ids26[17] = -1;
+        float *dX26, *dMid26, *dMid26Ref, *dW26; int32_t *dIds26;
+        CK(cudaMalloc(&dX26, sizeof(float) * X26.size()));
+        CK(cudaMalloc(&dMid26, sizeof(float) * n_asg * M));
+        CK(cudaMalloc(&dMid26Ref, sizeof(float) * n_asg * M));
+        CK(cudaMalloc(&dW26, sizeof(float) * n_asg));
+        CK(cudaMalloc(&dIds26, sizeof(int32_t) * n_asg));
+        CK(cudaMemcpy(dX26, X26.data(), sizeof(float) * X26.size(), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dW26, w26.data(), sizeof(float) * n_asg, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dIds26, ids26.data(), sizeof(int32_t) * n_asg, cudaMemcpyHostToDevice));
+
+        const int r_full = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+                dArt, dArt2, dX26, dIds26, dW26, dMid26,
+                M, K, n_tok, n_experts, n_slots, clampv, stream);
+        const int r0 = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+                dArt, dArt2, dX26, dIds26, dW26, dMid26Ref,
+                M, K, 16, n_experts, n_slots, clampv, stream);
+        const int r1 = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+                dArt, dArt2,
+                dX26 + (size_t)16 * K,
+                dIds26 + 16 * n_slots,
+                dW26 + 16 * n_slots,
+                dMid26Ref + (size_t)16 * n_slots * M,
+                M, K, n_tok - 16, n_experts, n_slots, clampv, stream);
+        if (r_full != 0 || r0 != 0 || r1 != 0) {
+            printf("prompt-width fused entries rc=%d/%d/%d\n", r_full, r0, r1);
+            bad26_mid = 1;
+        } else {
+            CK(cudaStreamSynchronize(stream));
+            std::vector<float> full((size_t)n_asg * M), ref((size_t)n_asg * M);
+            CK(cudaMemcpy(full.data(), dMid26, sizeof(float) * full.size(), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(ref.data(), dMid26Ref, sizeof(float) * ref.size(), cudaMemcpyDeviceToHost));
+            bad26_mid = count_bad(ref, full, nullptr, nullptr);
+        }
+        CK(cudaFree(dX26)); CK(cudaFree(dMid26)); CK(cudaFree(dMid26Ref));
+        CK(cudaFree(dW26)); CK(cudaFree(dIds26));
+    }
+
     printf("TEST_IQ2_ALIGNED_ENTRY  M=%d K=%d slots=%d experts=%d iters=%d (weights/iter %.1f MB)\n",
            M, K, n_slots, n_experts, iters, slot_gb * 1000.0);
     printf("  baseline moe_vec : %.4f ms  -> %6.1f GB/s   (x2 for gate+up: %.4f ms)\n",
@@ -322,8 +375,10 @@ int main(int argc, char **argv) {
     printf("  fused    entry   : %.4f ms  -> %6.1f GB/s   (vs 2x aligned %+.1f%%)\n",
            ms_fused, 2.0 * slot_gb / (ms_fused / 1e3), 100.0 * (2.0f * ms_al / ms_fused - 1.0));
     printf("  parity: aligned max_rel=%.3e max_abs=%.3e bad=%d | pair bad=%d | fused-mid bad=%d"
-           " | ntok4 bad=%d ntok4-mid bad=%d -> %s\n",
-           max_rel, max_abs, bad, bad_pair, bad_mid, bad4, bad4_mid,
-           (bad == 0 && bad_pair == 0 && bad_mid == 0 && bad4 == 0 && bad4_mid == 0) ? "PASS" : "FAIL");
-    return (bad == 0 && bad_pair == 0 && bad_mid == 0 && bad4 == 0 && bad4_mid == 0) ? 0 : 2;
+           " | ntok4 bad=%d ntok4-mid bad=%d | ntok26-mid bad=%d -> %s\n",
+           max_rel, max_abs, bad, bad_pair, bad_mid, bad4, bad4_mid, bad26_mid,
+           (bad == 0 && bad_pair == 0 && bad_mid == 0 && bad4 == 0 &&
+            bad4_mid == 0 && bad26_mid == 0) ? "PASS" : "FAIL");
+    return (bad == 0 && bad_pair == 0 && bad_mid == 0 && bad4 == 0 &&
+            bad4_mid == 0 && bad26_mid == 0) ? 0 : 2;
 }

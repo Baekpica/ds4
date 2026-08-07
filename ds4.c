@@ -50140,9 +50140,9 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
     /* Every route below leaves rm holding the ALREADY router-weighted mid, so
      * the combine at the end is a plain sum for all of them. The aligned
      * fused kernel folds gate+up+SwiGLU+weight into one launch and reads the
-     * boot-built SoA artifacts; it declines (returns 0) off its envelope --
-     * no artifacts for this tensor, or more than 16 rows -- and the
-     * separate-matmul route takes over. */
+     * boot-built SoA artifacts and internally slices wider prefill batches
+     * into its 16-row kernel envelope. It declines only when artifacts do not
+     * exist for this tensor, then the separate-matmul route takes over. */
     if (!ds4_gpu_exaone_aligned_gate_up_mid_tensor(
                 rm, norm, sel, rw, m->map, m->size,
                 l->ffn_gate_exps->abs_offset, l->ffn_gate_exps->bytes,

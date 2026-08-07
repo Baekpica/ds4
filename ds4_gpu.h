@@ -2800,8 +2800,9 @@ int ds4_gpu_exaone_moe_combine_tensor(
         uint32_t                n_tokens);
 
 /* Fused routed gate+up+SwiGLU+router-weight into mid, from the aligned
- * IQ2_XXS artifacts. Returns 1 when the aligned path ran; 0 when it does not
- * apply (no artifacts, wrong type, or too many tokens) and the caller must
+ * IQ2_XXS artifacts. Prefill widths above the native 16-row kernel envelope
+ * are submitted as contiguous slices. Returns 1 when the aligned path ran;
+ * 0 when it does not apply (no artifacts or wrong type) and the caller must
  * take the separate-matmul route. mid comes out ALREADY weighted, so the
  * combine step must not apply weights again. */
 int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
