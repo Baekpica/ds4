@@ -822,6 +822,12 @@ extern "C" int ds4_mmq_iq2_xxs_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_dense", W, X, out, M, N, K, stream);
 }
 
+extern "C" int ds4_mmq_q3_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q3_K>("ds4_mmq_q3_K_dense", W, X, out, M, N, K, stream);
+}
+
 extern "C" int ds4_mmq_q4_K_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
@@ -1844,6 +1850,14 @@ extern "C" int ds4_mmq_q2_K_moe_soa(
                                             n_tokens, n_experts, n_expert_used, stream,
                                             (const char *)W_soa, npair,
                                             /*sanitize_out=*/false);
+}
+
+extern "C" int ds4_mmq_q3_K_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q3_K>("ds4_mmq_q3_K_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
 }
 
 extern "C" int ds4_mmq_q4_K_moe(
@@ -2990,6 +3004,7 @@ int ds4_mmq_dense_vec_impl(
 template <ggml_type type> struct ds4_mmq_vdr_mmvq_value;
 template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_IQ2_XXS> { static constexpr int value = VDR_IQ2_XXS_Q8_1_MMVQ; };
 template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q2_K>    { static constexpr int value = VDR_Q2_K_Q8_1_MMVQ; };
+template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q3_K>    { static constexpr int value = VDR_Q3_K_Q8_1_MMVQ; };
 template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q4_K>    { static constexpr int value = VDR_Q4_K_Q8_1_MMVQ; };
 template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_MXFP4>   { static constexpr int value = VDR_MXFP4_Q8_1_MMVQ; };
 
@@ -3003,6 +3018,8 @@ static __device__ __forceinline__ float ds4_mmq_vec_dot_q8_1(
         return vec_dot_iq2_xxs_q8_1(W, X_q8, kbx, iqs);
     } else if constexpr (type == GGML_TYPE_Q2_K) {
         return vec_dot_q2_K_q8_1(W, X_q8, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q3_K) {
+        return vec_dot_q3_K_q8_1(W, X_q8, kbx, iqs);
     } else if constexpr (type == GGML_TYPE_Q4_K) {
         return vec_dot_q4_K_q8_1(W, X_q8, kbx, iqs);
     } else {
@@ -3586,6 +3603,15 @@ extern "C" int ds4_mmq_iq2_xxs_moe_vec(
         cudaStream_t stream) {
     return ds4_mmq_moe_vec_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q3_K_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q3_K>(
+        "ds4_mmq_q3_K_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
@@ -4505,6 +4531,8 @@ template void mul_mat_q_case<GGML_TYPE_Q8_0>(
 template void mul_mat_q_case<GGML_TYPE_Q2_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q3_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);

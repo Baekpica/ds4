@@ -14266,16 +14266,26 @@ static void exaone_rmsnorm(float *out, const float *x, const ds4_model *m,
 }
 
 /* NeoX rotary: the head is split in half and element i is rotated against
- * i + half, unlike the "normal" variant that pairs adjacent elements. */
+ * i + half, unlike the "normal" variant that pairs adjacent elements.
+ *
+ * The frequency is computed in double and rounded once. It looks like an
+ * overreaction for a table of 64 constants, but the position multiplies it:
+ * this model's context reaches 262143, where the last bit of a float
+ * frequency is worth 0.013 radians of rotation. Two implementations that
+ * differ by one ulp there disagree on the attention scores by more than the
+ * quantization does, so the CUDA kernel computes the frequency exactly this
+ * way and neither path is allowed to drift into powf's ulp budget. */
 static void exaone_rope_neox(float *v, uint32_t n_heads, uint32_t head_dim,
                              uint32_t n_rot, uint32_t pos, float freq_base) {
     const uint32_t half = n_rot / 2;
     for (uint32_t h = 0; h < n_heads; h++) {
         float *p = v + (size_t)h * head_dim;
         for (uint32_t i = 0; i < half; i++) {
-            const float theta = (float)pos *
-                powf(freq_base, -2.0f * (float)i / (float)n_rot);
-            const float c = cosf(theta), s = sinf(theta);
+            const float freq = (float)pow((double)freq_base,
+                                          -2.0 * (double)i / (double)n_rot);
+            const float theta = (float)pos * freq;
+            const double tr = fmod((double)theta, 2.0 * M_PI);
+            const float c = (float)cos(tr), s = (float)sin(tr);
             const float a = p[i], b = p[i + half];
             p[i]        = a * c - b * s;
             p[i + half] = a * s + b * c;

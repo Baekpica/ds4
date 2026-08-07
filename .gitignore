@@ -37,3 +37,5 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/tests/test_exaone_ref
+/tests/test_exaone_kernels

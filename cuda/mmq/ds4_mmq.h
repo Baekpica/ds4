@@ -146,6 +146,18 @@ int ds4_mmq_iq2_xxs_dense(
     int           K,
     cudaStream_t  stream);
 
+// Q3_K is the K-EXAONE mixed-quant recipe's routed-expert `down` type on the
+// 39 interior MoE layers. The mmq/mmvq templates for it were already vendored;
+// only the C entry points were missing.
+int ds4_mmq_q3_K_dense(
+    const void  * W_q3_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 int ds4_mmq_q4_K_dense(
     const void  * W_q4_K,
     const float * X_f32,
@@ -239,6 +251,18 @@ int ds4_mmq_iq2_xxs_moe(
 // pass is skipped.  New callers must sanitize at consumption.
 int ds4_mmq_q2_K_moe_soa(
     const void    * W_soa,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q3_K_moe(
+    const void    * W,
     const float   * X_f32,
     const int32_t * ids,
     float         * out_f32,
@@ -449,6 +473,18 @@ int ds4_mmq_q2_K_moe_vec(
     cudaStream_t    stream);
 
 int ds4_mmq_iq2_xxs_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q3_K_moe_vec(
     const void    * W,
     const float   * X_f32,
     const int32_t * ids,

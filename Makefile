@@ -399,6 +399,23 @@ tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o
 
 test-cuda-mixed-batch: tests/test_cuda_mixed_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_mixed_batch
+
+# The exaone harness #includes ds4.c so it can reach the reference forward and
+# the graph builders directly; it therefore links everything except ds4.o.
+tests/test_exaone_ref.o: tests/test_exaone_ref.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_exaone_ref: tests/test_exaone_ref.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_exaone_kernels.o: tests/test_exaone_kernels.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_exaone_kernels: tests/test_exaone_kernels.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-exaone-kernels: tests/test_exaone_kernels
+	./tests/test_exaone_kernels $(DS4_EXAONE_MODEL)
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)

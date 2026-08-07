@@ -30795,3 +30795,751 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     return 0;
 }
 #pragma GCC diagnostic pop
+
+/* =========================================================================
+ * K-EXAONE (exaone-moe) CUDA path
+ * =========================================================================
+ *
+ * Separate from the DeepSeek4/GLM kernels above for the same reason the CPU
+ * reference in ds4.c is separate: this model has no MLA, no sparse indexer,
+ * no hyper-connections and no attention sinks. It is plain GQA -- 64 query
+ * heads over 8 KV heads at head_dim 128 -- with a per-head QK-norm. Threading
+ * "is this MLA?" through the existing attention kernels would cost more than
+ * it saves.
+ *
+ * Four architecture details are not in the GGUF metadata and each one
+ * produces plausible-looking garbage if missed. They are reproduced here
+ * exactly as the CPU reference has them:
+ *
+ *   1. RoPE runs on sliding-window layers ONLY. Every n_swa_period-th layer
+ *      is full attention *and* has no positional encoding (NoPE). "LLLG" is
+ *      local+RoPE / global+NoPE, not a window change.
+ *   2. RoPE is NeoX-style: element i pairs with i + n_rot/2, not i+1.
+ *   3. QK-norm runs before RoPE, per head over head_dim, with a weight vector
+ *      that is head_dim long and reused across every head.
+ *   4. exp_probs_b steers top-k selection only. The expert weights are read
+ *      from the UNBIASED sigmoid probabilities.
+ *
+ * KV cache layout. One row per position, f16, K and V adjacent:
+ *
+ *     row = [ K: n_head_kv * head_dim ][ V: n_head_kv * head_dim ]
+ *
+ * so a row is 2 * 8 * 128 = 2048 halfs = 4 KiB. Position p occupies slot
+ * p % kv_cap. Sliding layers set kv_cap = n_swa (128), which makes the
+ * modulo a ring; full-attention layers set kv_cap >= n_ctx, which makes it
+ * the identity. That is the whole difference between the two layer types on
+ * the storage side, and it is why 256K context is affordable: only the 12
+ * full-attention layers grow with context, the other 36 stay at 18 MiB in
+ * total.
+ *
+ * This tier is the generic correctness path. It is written to be obviously
+ * right, is what the fast tier gets diffed against, and must not be deleted
+ * when the fast tier lands.
+ */
+
+#define DS4_EXAONE_ROUTER_WEIGHT_FLOOR 6.103515625e-5f
+
+/* Per-head RMSNorm over head_dim followed by NeoX rotary, in place.
+ * One block per head; blockDim.x must be >= head_dim.
+ *
+ * The two steps are fused because they read and write the same head-sized
+ * slice and RoPE must see the normalized value -- separating them would
+ * double the traffic for no gain and invites getting the order wrong. */
+__global__ static void exaone_qk_norm_rope_kernel(
+        float *v,
+        const float *norm_w,
+        uint32_t n_heads,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        float freq_base,
+        float eps,
+        int do_rope) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (h >= n_heads) return;
+    const uint32_t pos = pos0 + t;
+    float *p = v + ((size_t)t * n_heads + h) * head_dim;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    __shared__ float sh[32];
+
+    float sumsq = 0.0f;
+    for (uint32_t i = tid; i < head_dim; i += nth) sumsq += p[i] * p[i];
+    for (int off = 16; off > 0; off >>= 1) sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+    if ((tid & 31u) == 0u) sh[tid >> 5] = sumsq;
+    __syncthreads();
+    if (tid < 32u) {
+        sumsq = (tid < (nth + 31u) / 32u) ? sh[tid] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+        if (tid == 0u) sh[0] = sumsq;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(sh[0] / (float)head_dim + eps);
+    for (uint32_t i = tid; i < head_dim; i += nth) p[i] = (p[i] * scale) * norm_w[i];
+    __syncthreads();
+
+    if (!do_rope) return;
+    const uint32_t half = n_rot / 2u;
+    for (uint32_t i = tid; i < half; i += nth) {
+        /* Both trig steps go through double on purpose.
+         *
+         * The file is compiled with --use_fast_math, which redirects powf to
+         * __powf (8 ulp) and sinf/cosf to the SFU intrinsics. The SFU is
+         * specified only for |x| < 8192*pi ~= 25736; this model's positions
+         * reach 262143, and at i == 0 the angle IS the position, so the
+         * intrinsic would return essentially noise on a long context. The
+         * double-precision reduction below costs nothing at 64 heads x 64
+         * pairs per token and keeps the rotation identical to the CPU
+         * reference at every position the 262144-token window allows.
+         *
+         * The frequency is computed in double and rounded to float, then
+         * multiplied by the position in float, because that is what the CPU
+         * reference's powf-then-multiply produces -- matching it matters more
+         * than being marginally more precise than it. */
+        const float freq  = (float)pow((double)freq_base,
+                                       -2.0 * (double)i / (double)n_rot);
+        const float theta = (float)pos * freq;
+        const double tr = fmod((double)theta, 2.0 * 3.14159265358979323846);
+        const float c = (float)cos(tr), s = (float)sin(tr);
+        const float a = p[i], b = p[i + half];
+        p[i]        = a * c - b * s;
+        p[i + half] = a * s + b * c;
+    }
+}
+
+/* Append n_tokens rows of K and V to the layer ring as f16, starting at
+ * absolute position pos0.  f16 is not an optimization here: it is what the
+ * reference and llama.cpp both store, and keeping f32 would make this path
+ * disagree with the oracle it is checked against on near-tied expert
+ * selections a few layers later. */
+__global__ static void exaone_kv_store_batch_kernel(
+        __half *kv,
+        const float *k,
+        const float *v,
+        uint32_t kv_dim,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t kv_cap) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = kv_dim * n_tokens;
+    if (idx >= total) return;
+    const uint32_t t = idx / kv_dim;
+    const uint32_t i = idx - t * kv_dim;
+    const uint32_t slot = (pos0 + t) % kv_cap;
+    __half *row = kv + (size_t)slot * (size_t)kv_dim * 2u;
+    row[i]          = __float2half(k[(size_t)t * kv_dim + i]);
+    row[kv_dim + i] = __float2half(v[(size_t)t * kv_dim + i]);
+}
+
+/* GQA attention, generic tier.
+ *
+ * Online softmax held in warp registers: nothing proportional to the key
+ * count is materialized (at 256K context a score array alone would be 1 MiB
+ * per head), and the key loop contains no block-wide barrier.
+ *
+ * Layout: blockDim.x == head_dim, so the block is head_dim/32 warps and each
+ * lane owns DPL = head_dim/32 dimensions, strided by 32.  Warp w walks keys
+ * first+w, first+w+nwarps, ...  A key's score needs one warp reduction and no
+ * __syncthreads(); the four partial (m, l, acc) triples are combined once at
+ * the end.  DPL is a template parameter so the accumulator stays in
+ * registers.
+ *
+ * first/last are inclusive absolute positions.  The caller derives them from
+ * the layer type -- sliding layers take the most recent n_swa positions
+ * including the current one, matching llama.cpp's `p1 - p0 >= n_swa` mask;
+ * full-attention layers take everything.  Slot is position % kv_cap, which is
+ * a ring for sliding layers (kv_cap == n_swa) and the identity for full ones.
+ */
+template <int DPL>
+__device__ __forceinline__ void exaone_attn_head(
+        float *out,
+        const float *q,
+        const __half *kv,
+        uint32_t kvh,
+        uint32_t kv_dim,
+        uint32_t head_dim,
+        uint32_t kv_cap,
+        uint32_t first,
+        uint32_t last,
+        float scale) {
+    const uint32_t lane   = threadIdx.x & 31u;
+    const uint32_t warp   = threadIdx.x >> 5;
+    const uint32_t nwarps = blockDim.x >> 5;
+
+    float qv[DPL], acc[DPL];
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        qv[d]  = q[lane + (uint32_t)d * 32u];
+        acc[d] = 0.0f;
+    }
+    float m = -INFINITY, l = 0.0f;
+
+    for (uint32_t t = first + warp; t <= last; t += nwarps) {
+        const __half *krow = kv + (size_t)(t % kv_cap) * (size_t)kv_dim * 2u
+                                + (size_t)kvh * head_dim;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) dot += qv[d] * __half2float(krow[lane + d * 32]);
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+
+        const float s  = dot * scale;
+        const float mn = fmaxf(m, s);
+        const float re = (m == -INFINITY) ? 0.0f : __expf(m - mn);
+        const float w  = __expf(s - mn);
+        const __half *vrow = krow + kv_dim;
+#pragma unroll
+        for (int d = 0; d < DPL; d++)
+            acc[d] = acc[d] * re + w * __half2float(vrow[lane + d * 32]);
+        l = l * re + w;
+        m = mn;
+    }
+
+    /* Combine the per-warp partials.  Sized for the largest block this path
+     * launches: head_dim 128 gives 4 warps, and 8 slots leaves room for a
+     * 256-wide block without revisiting this. */
+    __shared__ float s_m[8], s_l[8];
+    extern __shared__ float s_acc[];    /* nwarps * head_dim */
+    if (lane == 0u) { s_m[warp] = m; s_l[warp] = l; }
+#pragma unroll
+    for (int d = 0; d < DPL; d++) s_acc[warp * head_dim + lane + d * 32] = acc[d];
+    __syncthreads();
+
+    if (warp == 0u) {
+        float gm = -INFINITY;
+        for (uint32_t w = 0; w < nwarps; w++) gm = fmaxf(gm, s_m[w]);
+        float gl = 0.0f;
+        for (uint32_t w = 0; w < nwarps; w++)
+            gl += (s_m[w] == -INFINITY) ? 0.0f : s_l[w] * __expf(s_m[w] - gm);
+        const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t i = lane + (uint32_t)d * 32u;
+            float v = 0.0f;
+            for (uint32_t w = 0; w < nwarps; w++) {
+                if (s_m[w] == -INFINITY) continue;
+                v += s_acc[w * head_dim + i] * __expf(s_m[w] - gm);
+            }
+            out[i] = v * inv;
+        }
+    }
+}
+
+template <int DPL>
+__global__ static void exaone_attn_decode_kernel(
+        float *heads,
+        const float *q,
+        const __half *kv,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t kv_cap,
+        uint32_t first,
+        uint32_t last,
+        float scale) {
+    const uint32_t h = blockIdx.x;
+    if (h >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    exaone_attn_head<DPL>(heads + (size_t)h * head_dim,
+                          q + (size_t)h * head_dim,
+                          kv, h / group, n_head_kv * head_dim, head_dim,
+                          kv_cap, first, last, scale);
+}
+
+/* Prefill: one block per (token, head).  Queries carry absolute positions
+ * pos0 + t, so the causal bound and the window bound are the decode ones
+ * evaluated per row.  window == 0 means full attention. */
+template <int DPL>
+__global__ static void exaone_attn_prefill_kernel(
+        float *heads,
+        const float *q,
+        const __half *kv,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t kv_cap,
+        uint32_t window,
+        float scale) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (t >= n_tokens || h >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t pos   = pos0 + t;
+    const uint32_t first = (window && pos + 1u > window) ? pos + 1u - window : 0u;
+    const size_t   base  = ((size_t)t * n_head + h) * head_dim;
+    exaone_attn_head<DPL>(heads + base, q + base,
+                          kv, h / group, n_head_kv * head_dim, head_dim,
+                          kv_cap, first, pos, scale);
+}
+
+/* Router: sigmoid over the gate logits, top-k on probs + exp_probs_b, weights
+ * read back from the UNBIASED probs, normalized then scaled.  One block, one
+ * token per blockIdx.x.  n_expert is 128 here so a single-thread selection
+ * loop after a parallel sigmoid is not worth splitting further, and it keeps
+ * the tie-break identical to the reference (first index wins). */
+__global__ static void exaone_router_kernel(
+        int32_t *selected,
+        float *weights,
+        const float *logits,
+        const float *bias,
+        uint32_t n_expert,
+        uint32_t n_used,
+        float weight_scale) {
+    const uint32_t tok = blockIdx.x;
+    extern __shared__ float sprob[];
+    const uint32_t tid = threadIdx.x;
+    const float *lg = logits + (size_t)tok * n_expert;
+
+    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
+        const float x = lg[e];
+        sprob[e] = x >= 0.0f ? 1.0f / (1.0f + __expf(-x))
+                             : __expf(x) / (1.0f + __expf(x));
+        sprob[n_expert + e] = bias ? sprob[e] + bias[e] : sprob[e];
+    }
+    __syncthreads();
+
+    if (tid == 0u) {
+        int32_t *sel = selected + (size_t)tok * n_used;
+        float   *w   = weights  + (size_t)tok * n_used;
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n_used; i++) {
+            int best = -1;
+            float best_v = -INFINITY;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                const float v = sprob[n_expert + e];
+                if (v > best_v) { best_v = v; best = (int)e; }
+            }
+            sel[i] = best;
+            w[i]   = sprob[best];
+            sum   += w[i];
+            sprob[n_expert + best] = -INFINITY;
+        }
+        const float denom = sum > DS4_EXAONE_ROUTER_WEIGHT_FLOOR
+                          ? sum : DS4_EXAONE_ROUTER_WEIGHT_FLOOR;
+        for (uint32_t i = 0; i < n_used; i++) w[i] = (w[i] / denom) * weight_scale;
+    }
+}
+
+/* silu(gate) * up over every routed slot of every token. */
+__global__ static void exaone_swiglu_kernel(
+        float *mid,
+        const float *gate,
+        const float *up,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float g = gate[i];
+    mid[i] = (g / (1.0f + __expf(-g))) * up[i];
+}
+
+/* Weighted sum of the routed expert outputs into out, then add the shared
+ * expert unweighted.  `down` is the MoE matmul output in the mmq column-major
+ * convention: column = token * n_used + slot. */
+__global__ static void exaone_moe_combine_kernel(
+        float *out,
+        const float *down,
+        const float *weights,
+        const float *shared,
+        uint32_t n_embd,
+        uint32_t n_used,
+        uint32_t n_tokens) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = n_embd * n_tokens;
+    if (idx >= total) return;
+    const uint32_t t = idx / n_embd;
+    const uint32_t d = idx - t * n_embd;
+    float acc = 0.0f;
+    for (uint32_t s = 0; s < n_used; s++) {
+        const size_t col = (size_t)t * n_used + s;
+        acc += weights[col] * down[col * n_embd + d];
+    }
+    if (shared) acc += shared[(size_t)t * n_embd + d];
+    out[idx] = acc;
+}
+
+/* Plain RMSNorm with weight, no residual add.  The fused add form above
+ * covers every layer boundary; this one is for the first norm of a block,
+ * where there is nothing to add yet. */
+__global__ static void exaone_rms_norm_kernel(
+        float *out,
+        const float *x,
+        const float *w,
+        uint32_t n,
+        uint32_t n_tokens,
+        float eps) {
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const float *src = x + (size_t)t * n;
+    float *dst = out + (size_t)t * n;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    __shared__ float sh[32];
+    float sumsq = 0.0f;
+    for (uint32_t i = tid; i < n; i += nth) sumsq += src[i] * src[i];
+    for (int off = 16; off > 0; off >>= 1) sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+    if ((tid & 31u) == 0u) sh[tid >> 5] = sumsq;
+    __syncthreads();
+    if (tid < 32u) {
+        sumsq = (tid < (nth + 31u) / 32u) ? sh[tid] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+        if (tid == 0u) sh[0] = sumsq;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(sh[0] / (float)n + eps);
+    for (uint32_t i = tid; i < n; i += nth) dst[i] = (src[i] * scale) * w[i];
+}
+
+/* Elementwise residual add over n_tokens rows. */
+__global__ static void exaone_add_kernel(float *x, const float *y, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) x[i] += y[i];
+}
+
+/* ---- exaone entry points ------------------------------------------------ */
+
+extern "C" int ds4_gpu_exaone_rms_norm_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                n_tokens,
+        float                   eps) {
+    if (!out || !x || !model_map || n == 0u || n_tokens == 0u ||
+        out->bytes < (uint64_t)n * n_tokens * sizeof(float) ||
+        x->bytes < (uint64_t)n * n_tokens * sizeof(float) ||
+        weight_offset > model_size ||
+        (uint64_t)n * sizeof(float) > model_size - weight_offset) {
+        return 0;
+    }
+    const float *w = (const float *)cuda_resolve_weight_ptr(
+            model_map, weight_offset, (uint64_t)n * sizeof(float),
+            cuda_current_tier(), "exaone_norm");
+    if (!w) return 0;
+    exaone_rms_norm_kernel<<<n_tokens, 1024, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr, w, n, n_tokens, eps);
+    return cuda_ok(cudaGetLastError(), "exaone rms norm");
+}
+
+extern "C" int ds4_gpu_exaone_add_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *y,
+        uint64_t                count) {
+    if (!x || !y || count == 0u ||
+        x->bytes < count * sizeof(float) || y->bytes < count * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t threads = 256u;
+    const uint64_t blocks = (count + threads - 1u) / threads;
+    exaone_add_kernel<<<(unsigned)blocks, threads, 0, cuda_decode_stream()>>>(
+            (float *)x->ptr, (const float *)y->ptr, count);
+    return cuda_ok(cudaGetLastError(), "exaone add");
+}
+
+extern "C" int ds4_gpu_exaone_qk_norm_rope_tensor(
+        ds4_gpu_tensor       *v,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_heads,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos,
+        uint32_t                n_tokens,
+        float                   freq_base,
+        float                   eps,
+        int                     do_rope) {
+    if (!v || !model_map || n_heads == 0u || head_dim == 0u || n_tokens == 0u ||
+        v->bytes < (uint64_t)n_heads * head_dim * n_tokens * sizeof(float) ||
+        norm_weight_offset > model_size ||
+        (uint64_t)head_dim * sizeof(float) > model_size - norm_weight_offset) {
+        return 0;
+    }
+    const float *w = (const float *)cuda_resolve_weight_ptr(
+            model_map, norm_weight_offset, (uint64_t)head_dim * sizeof(float),
+            cuda_current_tier(), "exaone_qk_norm");
+    if (!w) return 0;
+    /* One block per (token, head); each token carries its own RoPE position. */
+    dim3 grid(n_heads, n_tokens, 1u);
+    exaone_qk_norm_rope_kernel<<<grid, 128, 0, cuda_decode_stream()>>>(
+            (float *)v->ptr, w, n_heads, head_dim, n_rot, pos,
+            freq_base, eps, do_rope);
+    return cuda_ok(cudaGetLastError(), "exaone qk norm rope");
+}
+
+extern "C" int ds4_gpu_exaone_kv_store_tensor(
+        ds4_gpu_tensor       *kv,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                kv_dim,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                kv_cap) {
+    if (!kv || !k || !v || kv_dim == 0u || n_tokens == 0u || kv_cap == 0u ||
+        k->bytes < (uint64_t)kv_dim * n_tokens * sizeof(float) ||
+        v->bytes < (uint64_t)kv_dim * n_tokens * sizeof(float) ||
+        kv->bytes < (uint64_t)kv_cap * kv_dim * 2u * sizeof(__half)) {
+        return 0;
+    }
+    const uint64_t total = (uint64_t)kv_dim * n_tokens;
+    const uint32_t threads = 256u;
+    exaone_kv_store_batch_kernel<<<(unsigned)((total + threads - 1u) / threads),
+                                   threads, 0, cuda_decode_stream()>>>(
+            (__half *)kv->ptr, (const float *)k->ptr, (const float *)v->ptr,
+            kv_dim, n_tokens, pos0, kv_cap);
+    return cuda_ok(cudaGetLastError(), "exaone kv store");
+}
+
+/* head_dim is 128 for every K-EXAONE build, so DPL is 4.  The dispatch keeps
+ * other multiples of 32 reachable rather than silently producing wrong output
+ * if a future shape lands here. */
+#define DS4_EXAONE_ATTN_DISPATCH(KERNEL, GRID, SHMEM, ...)                    \
+    do {                                                                       \
+        switch (head_dim / 32u) {                                              \
+        case 2u: KERNEL<2><<<GRID, head_dim, SHMEM, cuda_decode_stream()>>>(__VA_ARGS__); break; \
+        case 4u: KERNEL<4><<<GRID, head_dim, SHMEM, cuda_decode_stream()>>>(__VA_ARGS__); break; \
+        case 8u: KERNEL<8><<<GRID, head_dim, SHMEM, cuda_decode_stream()>>>(__VA_ARGS__); break; \
+        default:                                                               \
+            fprintf(stderr, "ds4: exaone attention: unsupported head_dim %u\n", \
+                    head_dim);                                                 \
+            return 0;                                                          \
+        }                                                                      \
+    } while (0)
+
+extern "C" int ds4_gpu_exaone_attention_decode_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window) {
+    if (!heads || !q || !kv || n_head == 0u || n_head_kv == 0u ||
+        head_dim == 0u || head_dim % 32u != 0u || n_head % n_head_kv != 0u ||
+        kv_cap == 0u ||
+        heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_head * head_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t first = (window && pos + 1u > window) ? pos + 1u - window : 0u;
+    const uint32_t shmem = (head_dim / 32u) * head_dim * (uint32_t)sizeof(float);
+    const float scale = rsqrtf((float)head_dim);
+    DS4_EXAONE_ATTN_DISPATCH(exaone_attn_decode_kernel, n_head, shmem,
+                             (float *)heads->ptr, (const float *)q->ptr,
+                             (const __half *)kv->ptr, n_head, n_head_kv,
+                             head_dim, kv_cap, first, pos, scale);
+    return cuda_ok(cudaGetLastError(), "exaone attention decode");
+}
+
+extern "C" int ds4_gpu_exaone_attention_prefill_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                window) {
+    if (!heads || !q || !kv || n_tokens == 0u || n_head == 0u ||
+        n_head_kv == 0u || head_dim == 0u || head_dim % 32u != 0u ||
+        n_head % n_head_kv != 0u || kv_cap == 0u ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t shmem = (head_dim / 32u) * head_dim * (uint32_t)sizeof(float);
+    const float scale = rsqrtf((float)head_dim);
+    dim3 grid(n_tokens, n_head, 1u);
+    DS4_EXAONE_ATTN_DISPATCH(exaone_attn_prefill_kernel, grid, shmem,
+                             (float *)heads->ptr, (const float *)q->ptr,
+                             (const __half *)kv->ptr, n_tokens, pos0, n_head,
+                             n_head_kv, head_dim, kv_cap, window, scale);
+    return cuda_ok(cudaGetLastError(), "exaone attention prefill");
+}
+
+#undef DS4_EXAONE_ATTN_DISPATCH
+
+extern "C" int ds4_gpu_exaone_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        int                     have_bias,
+        uint32_t                n_expert,
+        uint32_t                n_used,
+        uint32_t                n_tokens,
+        float                   weight_scale) {
+    if (!selected || !weights || !logits || n_expert == 0u || n_used == 0u ||
+        n_used > n_expert || n_tokens == 0u ||
+        selected->bytes < (uint64_t)n_used * n_tokens * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_used * n_tokens * sizeof(float) ||
+        logits->bytes < (uint64_t)n_expert * n_tokens * sizeof(float)) {
+        return 0;
+    }
+    const float *bias = NULL;
+    if (have_bias) {
+        if (bias_offset > model_size ||
+            (uint64_t)n_expert * sizeof(float) > model_size - bias_offset) {
+            return 0;
+        }
+        bias = (const float *)cuda_resolve_weight_ptr(
+                model_map, bias_offset, (uint64_t)n_expert * sizeof(float),
+                cuda_current_tier(), "exaone_exp_probs_b");
+        if (!bias) return 0;
+    }
+    const uint32_t shmem = 2u * n_expert * (uint32_t)sizeof(float);
+    exaone_router_kernel<<<n_tokens, 128, shmem, cuda_decode_stream()>>>(
+            (int32_t *)selected->ptr, (float *)weights->ptr,
+            (const float *)logits->ptr, bias, n_expert, n_used, weight_scale);
+    return cuda_ok(cudaGetLastError(), "exaone router");
+}
+
+extern "C" int ds4_gpu_exaone_swiglu_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint64_t                count) {
+    if (!mid || !gate || !up || count == 0u ||
+        mid->bytes < count * sizeof(float) ||
+        gate->bytes < count * sizeof(float) ||
+        up->bytes < count * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t threads = 256u;
+    exaone_swiglu_kernel<<<(unsigned)((count + threads - 1u) / threads),
+                           threads, 0, cuda_decode_stream()>>>(
+            (float *)mid->ptr, (const float *)gate->ptr,
+            (const float *)up->ptr, count);
+    return cuda_ok(cudaGetLastError(), "exaone swiglu");
+}
+
+extern "C" int ds4_gpu_exaone_moe_combine_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *down,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *shared,
+        uint32_t                n_embd,
+        uint32_t                n_used,
+        uint32_t                n_tokens) {
+    if (!out || !down || !weights || n_embd == 0u || n_used == 0u ||
+        n_tokens == 0u ||
+        out->bytes < (uint64_t)n_embd * n_tokens * sizeof(float) ||
+        down->bytes < (uint64_t)n_embd * n_used * n_tokens * sizeof(float) ||
+        weights->bytes < (uint64_t)n_used * n_tokens * sizeof(float) ||
+        (shared && shared->bytes < (uint64_t)n_embd * n_tokens * sizeof(float))) {
+        return 0;
+    }
+    const uint64_t total = (uint64_t)n_embd * n_tokens;
+    const uint32_t threads = 256u;
+    exaone_moe_combine_kernel<<<(unsigned)((total + threads - 1u) / threads),
+                                threads, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)down->ptr,
+            (const float *)weights->ptr,
+            shared ? (const float *)shared->ptr : NULL,
+            n_embd, n_used, n_tokens);
+    return cuda_ok(cudaGetLastError(), "exaone moe combine");
+}
+
+/* Routed-expert matmul.  Thin dispatch over the quant types the K-EXAONE
+ * recipe emits: IQ2_XXS gate/up and Q3_K down on the 39 interior MoE layers,
+ * Q4_K throughout on the 8 protected edge layers.  Q2_K is here because the
+ * pilot artifact uses it for down and the two artifacts have to stay
+ * interchangeable.
+ *
+ * mmq's MoE contract: out is column-major with column = token * n_used +
+ * slot, and ids is [n_tokens, n_used].  The down pass reuses that by
+ * treating each (token, slot) assignment as its own single-slot row --
+ * n_tokens becomes n_tokens*n_used and n_used becomes 1 -- which is why the
+ * caller can pass the same `selected` buffer to both passes.
+ *
+ * mmq is the vector tier for one token and the tile tier above that; the
+ * split is where mmq's own heuristic puts it. */
+extern "C" int ds4_gpu_exaone_moe_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used) {
+    if (!out || !x || !ids || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_expert == 0u || n_tokens == 0u || n_expert_used == 0u ||
+        in_dim % 256u != 0u ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        out->bytes < (uint64_t)out_dim * n_tokens * n_expert_used * sizeof(float) ||
+        x->bytes < (uint64_t)in_dim * n_tokens * sizeof(float) ||
+        ids->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t)) {
+        return 0;
+    }
+    if (!cuda_use_mmq()) {
+        fprintf(stderr, "ds4: exaone routed MoE needs the mmq tier "
+                        "(DS4_CUDA_MMQ=0 or quality mode disables it)\n");
+        return 0;
+    }
+    const char *w = cuda_resolve_weight_ptr(model_map, weight_offset,
+                                            weight_bytes,
+                                            ds4_tensor_device_idx(out),
+                                            "exaone_moe_experts");
+    if (!w) return 0;
+
+    const float   *xp  = (const float *)x->ptr;
+    const int32_t *idp = (const int32_t *)ids->ptr;
+    float         *op  = (float *)out->ptr;
+    const int M = (int)out_dim, K = (int)in_dim;
+    const int NT = (int)n_tokens, NE = (int)n_expert, NU = (int)n_expert_used;
+    cudaStream_t st = cuda_decode_stream();
+    /* mmq's vector tier is the one-column-per-expert path; above that its
+     * tile tier wins.  ds4_mmq_should_use answers for the tile tier only, so
+     * the vector entry is the explicit choice for a single token. */
+    const int vec = (n_tokens * n_expert_used) <= 8;
+    int rc;
+    switch (weight_type) {
+    case 16u: /* IQ2_XXS */
+        rc = vec ? ds4_mmq_iq2_xxs_moe_vec(w, xp, idp, op, M, K, NT, NE, NU, st)
+                 : ds4_mmq_iq2_xxs_moe(w, xp, idp, op, M, K, NT, NE, NU, st);
+        break;
+    case 11u: /* Q3_K */
+        rc = vec ? ds4_mmq_q3_K_moe_vec(w, xp, idp, op, M, K, NT, NE, NU, st)
+                 : ds4_mmq_q3_K_moe(w, xp, idp, op, M, K, NT, NE, NU, st);
+        break;
+    case 12u: /* Q4_K */
+        rc = vec ? ds4_mmq_q4_K_moe_vec(w, xp, idp, op, M, K, NT, NE, NU, st)
+                 : ds4_mmq_q4_K_moe(w, xp, idp, op, M, K, NT, NE, NU, st);
+        break;
+    case 10u: /* Q2_K */
+        rc = vec ? ds4_mmq_q2_K_moe_vec(w, xp, idp, op, M, K, NT, NE, NU, st)
+                 : ds4_mmq_q2_K_moe(w, xp, idp, op, M, K, NT, NE, NU, st);
+        break;
+    case 8u:  /* Q8_0 */
+        rc = vec ? ds4_mmq_q8_0_moe_vec(w, xp, idp, op, M, K, NT, NE, NU, st)
+                 : ds4_mmq_q8_0_moe(w, xp, idp, op, M, K, NT, NE, NU, st);
+        break;
+    default:
+        fprintf(stderr, "ds4: exaone routed MoE: unsupported expert type %u\n",
+                weight_type);
+        return 0;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "ds4: exaone routed MoE type=%u rc=%d "
+                        "(M=%d K=%d tokens=%d used=%d)\n",
+                weight_type, rc, M, K, NT, NU);
+        return 0;
+    }
+    return cuda_ok(cudaGetLastError(), "exaone moe matmul");
+}
