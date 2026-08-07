@@ -97,11 +97,13 @@ next sections.
 
 ## Model Weights
 
-This implementation only works with the DeepSeek V4 and GLM 5.2 GGUFs listed
-below. It is not a general GGUF loader, and arbitrary GGUF files will not have
-the tensor layout, quantization mix, metadata, or optional MTP state expected by
-the engine. The 2 bit quantizations provided here are verified to be actually
-high quality: they behave well, work under coding agents, call tools in a reliable way.
+This implementation works with the DeepSeek V4 and GLM 5.2 GGUFs listed below,
+and — on this branch only — with **K-EXAONE-236B-A23B** (see
+[K-EXAONE](#k-exaone-236b-a23b-exaone-moe) further down). It is not a general
+GGUF loader, and arbitrary GGUF files will not have the tensor layout,
+quantization mix, metadata, or optional MTP state expected by the engine. The 2
+bit quantizations provided here are verified to be actually high quality: they
+behave well, work under coding agents, call tools in a reliable way.
 
 The 2 bit quants use a very asymmetrical quantization: only the routed MoE
 experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
@@ -178,6 +180,63 @@ and timing counters:
 GLM inference uses the Metal, CUDA, or ROCm graph backend. Directional steering,
 `--power` below 100, an explicit `--prefill-chunk`, and the external `--mtp`
 file are not supported for GLM yet.
+
+### K-EXAONE-236B-A23B (`exaone-moe`)
+
+This branch adds a third model family, `exaone-moe`, for
+[LGAI-EXAONE/K-EXAONE-236B-A23B](https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B).
+It is a different architecture from the other two: standard **GQA** (64 query
+heads over 8 KV heads, head_dim 128) with per-head RMSNorm on Q and K, on an
+LLLG sliding-window schedule — window 128, every fourth layer full attention.
+ds4 was MLA-only before this, so that attention path is new. The MoE side reuses
+the GLM 5.2 shape: `n_ff_exp` 2048, 128 routed experts, top-8, sigmoid gating,
+`routed_scaling_factor` 2.5, one shared expert. Layer 0 is dense; `blk.48` is
+the MTP block.
+
+Tested against the mixed-quant build, which keeps every routed expert and fits
+a 128 GB device:
+
+```sh
+# 85.56 GiB, three shards; point -m at the first one
+hf download Baekpica/K-EXAONE-236B-A23B-Mixed-Quant-GGUF \
+  --include 'K-EXAONE-236B-A23B-MXQ-IQ2XXS-Q3K-Q4Edge-Q8Dense-MTPQ8-v1-*.gguf' \
+  --local-dir ./gguf
+
+make cuda-spark
+
+./ds4-server -m ./gguf/K-EXAONE-236B-A23B-MXQ-IQ2XXS-Q3K-Q4Edge-Q8Dense-MTPQ8-v1-00001-of-00003.gguf \
+  --cuda -c 262144 --host 0.0.0.0 --port 8001
+```
+
+On a DGX Spark (GB10, `sm_121`, 121.6 GiB unified) the full 262 144-token
+context fits with the model resident: 84.48 GiB of weights on device, 12.02 GiB
+of KV, 1.60 GiB of workspace, **103.62 GiB total** as reported by
+`nvtop -s`. `nvidia-smi` reports `memory.used` as `N/A` on this part, so use
+`nvtop`. Cold start is about 3 min 45 s, dominated by the one-time aligned
+repack of the `IQ2`/`Q8` tensors.
+
+The KV budget is what makes 256K affordable: only the 12 full-attention layers
+hold the whole context, so KV costs 48 KiB/token rather than the 192 KiB/token
+a fully global GQA stack would need.
+
+K-EXAONE's MTP block is part of the same GGUF; no separate draft model is
+loaded. `--exaone-mtp` enables greedy speculation, `--exaone-mtp-timing` also
+prints per-cycle acceptance and timing:
+
+```sh
+./ds4 -m ./gguf/K-EXAONE-...-00001-of-00003.gguf --exaone-mtp-timing --temp 0
+```
+
+Every draft is verified against the target model's own argmax and committed
+only on an exact token-ID match, so speculation cannot change greedy output.
+**It is off by default because it is slower on GB10** — even at 100 % draft
+acceptance the verifier/draft work costs more than it saves — and an automatic
+loss quench disables it after 12 verifier cycles when measured MTP work runs
+more than 3 % slower. `DS4_EXAONE_MTP_NO_QUENCH=1` defeats the quench for
+measurement. Speculation is greedy-only and is disabled entirely while
+`--batched-session` is active.
+
+Keep K-EXAONE on in-memory KV; the disk KV cache is not validated for it.
 
 Then build:
 
