@@ -9021,6 +9021,14 @@ static bool wire_begin(int fd, const request *r, ds4_wire_session *ws,
         openai_stream_start(r, &ws->state.oa_chat); /* THINKING if think enabled, else TEXT */
         ws->protocol_started = true;
         return sse_chunk(fd, r, ws->id, NULL, NULL); /* {"delta":{"role":"assistant"}} */
+    case DS4_WIRE_RESPONSES:
+        /* Inc 4c: identity (resp_/rs_/msg_ ids, sequence numbers) lives in
+         * the MACHINE, minted once at init and stable across every event --
+         * the serial path's shape since the machine existed. */
+        responses_stream_init(r, &ws->state.responses);
+        ws->state.responses.active = true;
+        ws->protocol_started = true;
+        return responses_sse_created(fd, r, &ws->state.responses, ws->created_at);
     default:
         return true;
     }
@@ -9036,6 +9044,9 @@ static bool wire_update(int fd, server *s, const request *r,
     case DS4_WIRE_OPENAI_CHAT:
         return openai_sse_stream_update(fd, s, r, ws->id, &ws->state.oa_chat,
                                         raw, raw_len, false);
+    case DS4_WIRE_RESPONSES:
+        return responses_sse_stream_update(fd, r, &ws->state.responses,
+                                           raw, raw_len, false);
     default:
         return true;
     }
@@ -12190,15 +12201,14 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
      * stop honesty (2c), client-frame usage (2d/3a), and -- for Responses
      * -- the same finalize-time reasoning retokenize the serial path does
      * (3b).  The promotions are these routing rows, not new projection
-     * code.  Inc 4b: Anthropic STREAMING rides too -- cont_stream_start /
-     * cont_on_token / wire_finish_stream now speak its SSE machine
-     * (wire_begin/wire_update), transport starts at admission (4a) and the
-     * prefill heartbeat is the native ping.  Responses streaming waits for
-     * 4c (no cont created/delta adoption yet). */
+     * code.  Inc 4b/4c: STREAMING rides too on both surfaces --
+     * cont_stream_start / cont_on_token / wire_finish_stream speak each
+     * machine (wire_begin/wire_update), transport starts at admission (4a),
+     * and the prefill heartbeat is the native ping (Anthropic) or the
+     * serial keepalive comment (Responses/OpenAI). */
     const bool cont_promoted =
         (env->cont_anthropic && surf == DS4_WIRE_ANTHROPIC) ||
-        (env->cont_responses && surf == DS4_WIRE_RESPONSES &&
-         !(needs & DS4_NEED_STREAMING));
+        (env->cont_responses && surf == DS4_WIRE_RESPONSES);
     if (surf != DS4_WIRE_OPENAI_CHAT && surf != DS4_WIRE_OPENAI_COMPLETION &&
         !cont_promoted) {
         d.reason = ROUTE_REASON_SURFACE; return d;
@@ -13792,8 +13802,12 @@ static void cont_stream_start(server *s, job *j) {
     wire_init(&st->wsess, wire_surface_for(&j->req), st->id);
     /* Inc 4a: the chat delta machine belongs to the OPENAI chat surface only
      * (the old kind==REQ_CHAT test was equivalent while OpenAI was the sole
-     * streaming tenant; the promoted surfaces bring their own machines). */
+     * streaming tenant; the promoted surfaces bring their own machines).
+     * Inc 4c: the Responses hint mirrors the serial writer's
+     * request_uses_responses_live_stream (stream is true on every
+     * cont_stream_start path that reaches the terminal dispatch). */
     st->wsess.live_openai = j->req.api == API_OPENAI && j->req.kind == REQ_CHAT;
+    st->wsess.live_responses = j->req.api == API_RESPONSES && j->req.kind == REQ_CHAT;
     if (!sse_headers(j->fd, s->enable_cors)) { st->failed = true; return; }
     /* Inc 4b: headers first, then the surface's protocol start through the
      * typed wrapper -- Anthropic message_start renders the admission-verdict
@@ -13962,8 +13976,23 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
      * only emits the tool_calls delta when none were streamed. */
     tool_calls calls = {0};
     char *content = NULL, *reasoning = NULL;
+    int reasoning_tokens = 0;
     if (j->req.kind == REQ_CHAT && j->req.has_tools)
         cont_resolve_chat(s, j, st, &fin, &content, &reasoning, &calls);
+    else if (st->wsess.live_responses && j->req.kind == REQ_CHAT) {
+        /* Inc 4c: the Responses stream terminal reports reasoning_tokens the
+         * way the serial finalize does -- the same plain parse + retokenize
+         * the buffered twin (write_cont_completion) has carried since 3b.
+         * Two-writers law: surface finalize work lands in BOTH. */
+        char perr[160] = {0};
+        bool recovered = false;
+        parse_generated_message_for_response(st->text.ptr ? st->text.ptr : "",
+                                             false /*has_tools*/, false /*saw_tool_start*/,
+                                             ds4_think_mode_enabled(j->req.think_mode),
+                                             &fin, perr, sizeof(perr),
+                                             &content, &reasoning, &calls, &recovered);
+        reasoning_tokens = reasoning_token_count(s->engine, reasoning);
+    }
     /* Flush any held-back tail, emit the finish chunk + usage + [DONE] -- the
      * exact single-path finalize for each kind.  Inc 0b: completion rows use
      * the serial plain branch (raw-tail flush + text_completion finish),
@@ -13990,6 +14019,7 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
             res.calls = &calls;
             res.prompt_tokens = st->prompt_tokens;
             res.completion_tokens = st->completion;
+            res.reasoning_tokens = reasoning_tokens;   /* Inc 4c: Responses usage detail */
             ok = wire_finish_stream(j->fd, s, &j->req, &st->wsess, &res);
         }
         if (!ok) st->failed = true;
@@ -20980,22 +21010,20 @@ static int route_legacy_oracle(const request *r, bool coalesce_on,
     return ROUTE_LANE_SERIAL;
 }
 
-/* Inc 3a/3b/3d/4b: the expected table is the LEGACY tree plus EXACTLY the
- * promoted-surface rows -- Anthropic (3a) and Responses (3b) non-tool
- * buffered ride continuous when they fit, Anthropic non-tool STREAMING
- * rides too (4b; Responses streaming waits for 4c), and their NEEDS-FREE
- * shapes take the same static fallbacks (3d; the static writer is
- * surface-typed).  Token-id echo keeps its streaming-chat-only projection
- * constraint on every surface.  Everything else must stay bit-identical to
- * the legacy oracle, which is the strongest statement of "no other request
- * changed lane". */
+/* Inc 3a/3b/3d/4b/4c: the expected table is the LEGACY tree plus EXACTLY
+ * the promoted-surface rows -- Anthropic and Responses non-tool shapes,
+ * buffered (3a/3b) AND streaming (4b/4c), ride continuous when they fit,
+ * and their NEEDS-FREE shapes take the same static fallbacks (3d; the
+ * static writer is surface-typed).  Token-id echo keeps its
+ * streaming-chat-only projection constraint on every surface.  Everything
+ * else must stay bit-identical to the legacy oracle, which is the
+ * strongest statement of "no other request changed lane". */
 static int route_expected_oracle(const request *r, bool coalesce_on,
                                  bool have_cont, int seq_cap) {
     const uint32_t needs = request_compute_needs(r);
     if (coalesce_on && (r->api == API_ANTHROPIC || r->api == API_RESPONSES) &&
         (needs & ~ROUTE_CONT_MASK) == 0 &&
-        !(needs & DS4_NEED_TOKEN_IDS) &&
-        (r->api == API_ANTHROPIC || !(needs & DS4_NEED_STREAMING))) {
+        !(needs & DS4_NEED_TOKEN_IDS)) {
         if (have_cont && r->prompt.len > 0 && r->prompt.len <= seq_cap)
             return ROUTE_LANE_CONTINUOUS;
         if (needs == 0) return ROUTE_LANE_STATIC;   /* Inc 3d */
@@ -21141,9 +21169,18 @@ static void test_route_decide_reason_table(void) {
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
     d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_ANTHROPIC, &big);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
-    /* Responses STREAMING = the remaining Inc 4c gap. */
+    /* Inc 4c: Responses no-tool STREAMING rides continuous under its own
+     * switch; unfit streaming shapes go SERIAL, never static. */
     d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_RESPONSES, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_STREAMING | DS4_NEED_THINKING, DS4_WIRE_RESPONSES, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_RESPONSES, &resp_off);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
+    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_RESPONSES, &no_ctx);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_RESPONSES, &big);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
     /* Inc 3d: a promoted surface that cannot ride cont takes the same
      * static fallbacks for NEEDS-FREE shapes (the static writer has been
      * surface-typed since Inc 1); any cont-mask need still means SERIAL
@@ -22262,6 +22299,96 @@ static void test_cont_anthropic_stream_matches_serial_oracle(void) {
     request_free(&r);
 }
 
+/* Inc 4c: same proof for a promoted Responses stream -- identical tape
+ * through the real cont entry points vs the direct serial machine.  The
+ * machine mints random resp_/rs_/msg_ ids at init, so equality holds after
+ * the Inc 1 first-seen id canonicalization; created_at is pinned by reusing
+ * the cont session's value on the direct leg. */
+static void test_cont_responses_stream_matches_serial_oracle(void) {
+    int sv[2];
+    server s;
+    memset(&s, 0, sizeof(s));
+
+    /* cont path */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.api = API_RESPONSES;
+    j.req.stream = true;
+    j.req.think_mode = DS4_THINK_LOW;
+    j.req.prompt.len = 7;
+    cont_stream *st = cont_stream_ensure(&j);
+    cont_stream_start(&s, &j);      /* headers + response.created (wire_begin) */
+    TEST_ASSERT(st->started && !st->failed);
+    TEST_ASSERT(st->wsess.protocol_started);
+    TEST_ASSERT(st->wsess.surface == DS4_WIRE_RESPONSES);
+    TEST_ASSERT(st->wsess.live_responses && !st->wsess.live_openai);
+    const long pinned_created = st->wsess.created_at;
+    int completion = 0;
+    for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+        const char *piece = tape_thinking[i].piece;
+        buf_append(&st->text, piece, strlen(piece));
+        st->completion = ++completion;
+        TEST_ASSERT(wire_update(j.fd, &s, &j.req, &st->wsess,
+                                st->text.ptr, st->text.len));
+    }
+    cont_stream_finalize(&s, &j, "stop");
+    TEST_ASSERT(j.cstream == NULL);
+    shutdown(sv[0], SHUT_WR);
+    char *cont_out = read_socket_text(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&j.req);
+
+    /* direct serial machine, same tape/counts, pinned created_at */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) { free(cont_out); return; }
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_LOW;
+    r.prompt.len = 7;
+    TEST_ASSERT(sse_headers(sv[0], false));
+    responses_stream rst;
+    responses_stream_init(&r, &rst);
+    rst.active = true;
+    TEST_ASSERT(responses_sse_created(sv[0], &r, &rst, pinned_created));
+    buf raw = {0};
+    for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+        const char *piece = tape_thinking[i].piece;
+        buf_append(&raw, piece, strlen(piece));
+        TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &rst,
+                                                raw.ptr, raw.len, false));
+    }
+    tool_calls empty = {0};
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, &rst, raw.ptr, raw.len,
+                                          NULL, &empty, "stop", 7, completion,
+                                          0 /* NULL-engine retokenize */,
+                                          pinned_created));
+    shutdown(sv[0], SHUT_WR);
+    char *ser_out = read_socket_text(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
+
+    char *cn = wire_test_canonicalize_ids(cont_out);
+    char *sn = wire_test_canonicalize_ids(ser_out);
+    TEST_ASSERT(strstr(cn, "\"type\":\"response.created\"") != NULL);
+    TEST_ASSERT(strstr(cn, "\"type\":\"response.completed\"") != NULL);
+    TEST_ASSERT(strcmp(cn, sn) == 0);
+
+    responses_stream_free(&rst);
+    buf_free(&raw);
+    free(cn);
+    free(sn);
+    free(cont_out);
+    free(ser_out);
+    request_free(&r);
+}
+
 /* Inc 0b: the three-state decode-budget contract shared by every lane site
  * (serial decode loop, serial fit, footprint, static pack, cont admit).
  * Before the helper, the batched lanes replaced ANY <= 0 with the server
@@ -22968,6 +23095,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_completion_stream_matches_serial_oracle();
     test_cont_admission_transport_and_heartbeat();
     test_cont_anthropic_stream_matches_serial_oracle();
+    test_cont_responses_stream_matches_serial_oracle();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
     test_credit_union_merge_shapes();
