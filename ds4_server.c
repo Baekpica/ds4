@@ -12165,11 +12165,19 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
     if (env->have_cont && env->prompt_len > 0 && env->prompt_len <= env->seq_cap) {
         d.lane = ROUTE_LANE_CONTINUOUS; d.reason = ROUTE_REASON_CONT; return d;
     }
-    /* Static fallback: the coalesced writer formats OpenAI only until Inc 3d
-     * scopes it to its exact capabilities -- a promoted surface that cannot
-     * ride cont goes serial, never mis-projected static. */
+    /* Static fallback, scoped to its exact capabilities (plan §5 Inc 3
+     * bullet 3).  CAPABILITY scoping is the needs word: ROUTE_STATIC_MASK
+     * is empty, so only needs-free shapes qualify -- buffered, greedy,
+     * non-thinking, no stops/tools/echo, no live/durable/prefill-only
+     * state.  SURFACE scoping (Inc 3d): write_batch_completion has been
+     * surface-typed since Inc 1 (wire_finish_buffered) and carries the 3b
+     * Responses retokenize, so the promoted surfaces take the same static
+     * fallbacks under the same §7 kill switches -- a switched-off surface
+     * must restore the legacy table bit-exactly, so the switch gates BOTH
+     * batched lanes. */
     if ((needs & ~ROUTE_STATIC_MASK) == 0 &&
-        (surf == DS4_WIRE_OPENAI_CHAT || surf == DS4_WIRE_OPENAI_COMPLETION)) {
+        (surf == DS4_WIRE_OPENAI_CHAT || surf == DS4_WIRE_OPENAI_COMPLETION ||
+         cont_promoted_buffered)) {
         d.lane = ROUTE_LANE_STATIC;
         d.reason = env->have_cont ? ROUTE_REASON_STATIC_PROMPT_BOUNDS
                                   : ROUTE_REASON_STATIC_NO_CONT;
@@ -12417,6 +12425,24 @@ static bool job_is_static_batchable(const request *r) {
         && !r->has_tools && r->stops.len == 0;
 }
 
+/* Inc 3d: coalesce_gather's peer-join, surface-scoped like route_decide's
+ * static row.  The static writer has been surface-typed since Inc 1
+ * (write_batch_completion -> wire_finish_buffered, with the 3b Responses
+ * retokenize), so a needs-free Anthropic/Responses buffered job may join a
+ * static group whenever its §7 kill switch is on.  The needs word IS the
+ * capability contract (route_decide's static row admits needs==0 only);
+ * recomputed here rather than read from r->needs so the check cannot go
+ * stale against a caller that never stamped the field (units).  Anthropic
+ * explicit-zero carries NEED_PREFILL_ONLY and stays out by construction.
+ * job_is_static_batchable survives unchanged as the LEGACY oracle row. */
+static bool job_static_peer_ok(const server *s, const request *r) {
+    if (job_is_static_batchable(r)) return true;
+    if (r->kind != REQ_CHAT) return false;
+    if (!((s->cont_anthropic && r->api == API_ANTHROPIC) ||
+          (s->cont_responses && r->api == API_RESPONSES))) return false;
+    return request_compute_needs(r) == 0;
+}
+
 static void job_finish(job *j) {
     pthread_mutex_lock(&j->mu);
     j->done = true;
@@ -12639,9 +12665,11 @@ static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_t
     bool have_deadline = false;
     pthread_mutex_lock(&s->mu);
     while (n < cap) {
-        /* Only gather jobs the static argmax path can serve (non-streaming,
-         * temp<=0); a head that fails stops the gather, preserving FIFO. */
-        if (s->head && job_is_static_batchable(&s->head->req)) {
+        /* Only gather jobs the static argmax path can serve -- needs-free
+         * shapes on a servable surface (job_static_peer_ok mirrors
+         * route_decide's static row, Inc 3d); a head that fails stops the
+         * gather, preserving FIFO. */
+        if (s->head && job_static_peer_ok(s, &s->head->req)) {
             if (max_tok_total > 0 && tok_total + job_tok_footprint(s, s->head) > max_tok_total)
                 break;                         /* token budget: split into another batch */
             /* Inc 2e: an over-age head stays queued -- shedding writes a
@@ -20818,10 +20846,11 @@ static int route_legacy_oracle(const request *r, bool coalesce_on,
     return ROUTE_LANE_SERIAL;
 }
 
-/* Inc 3a/3b: the expected table is the LEGACY tree plus EXACTLY the two
- * buffered promotions -- Anthropic (3a) and Responses (3b) non-tool
- * buffered ride continuous when they fit (no static fallback until 3c;
- * token-id echo keeps its streaming-chat-only projection constraint).
+/* Inc 3a/3b/3d: the expected table is the LEGACY tree plus EXACTLY the
+ * promoted-surface rows -- Anthropic (3a) and Responses (3b) non-tool
+ * buffered ride continuous when they fit, and their NEEDS-FREE shapes take
+ * the same static fallbacks (3d; the static writer is surface-typed).
+ * Token-id echo keeps its streaming-chat-only projection constraint.
  * Everything else must stay bit-identical to the legacy oracle, which is
  * the strongest statement of "no other request changed lane". */
 static int route_expected_oracle(const request *r, bool coalesce_on,
@@ -20829,9 +20858,11 @@ static int route_expected_oracle(const request *r, bool coalesce_on,
     const uint32_t needs = request_compute_needs(r);
     if (coalesce_on && (r->api == API_ANTHROPIC || r->api == API_RESPONSES) &&
         (needs & ~ROUTE_CONT_MASK) == 0 &&
-        !(needs & (DS4_NEED_STREAMING | DS4_NEED_TOKEN_IDS)) &&
-        have_cont && r->prompt.len > 0 && r->prompt.len <= seq_cap)
-        return ROUTE_LANE_CONTINUOUS;
+        !(needs & (DS4_NEED_STREAMING | DS4_NEED_TOKEN_IDS))) {
+        if (have_cont && r->prompt.len > 0 && r->prompt.len <= seq_cap)
+            return ROUTE_LANE_CONTINUOUS;
+        if (needs == 0) return ROUTE_LANE_STATIC;   /* Inc 3d */
+    }
     return route_legacy_oracle(r, coalesce_on, have_cont, seq_cap);
 }
 
@@ -20963,14 +20994,29 @@ static void test_route_decide_reason_table(void) {
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
     d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_RESPONSES, &on);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
-    /* A promoted surface that cannot ride cont goes SERIAL, never static
-     * (the coalesced writer stays OpenAI-only until 3c). */
+    /* Inc 3d: a promoted surface that cannot ride cont takes the same
+     * static fallbacks for NEEDS-FREE shapes (the static writer has been
+     * surface-typed since Inc 1); any cont-mask need still means SERIAL
+     * (CONT_UNAVAILABLE -- static is argmax-only with no scanning), and a
+     * switched-off surface drops out of BOTH batched lanes (legacy). */
     d = route_decide(0, DS4_WIRE_ANTHROPIC, &big);
-    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+    TEST_ASSERT(d.lane == ROUTE_LANE_STATIC && d.reason == ROUTE_REASON_STATIC_PROMPT_BOUNDS);
     d = route_decide(0, DS4_WIRE_ANTHROPIC, &no_ctx);
-    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+    TEST_ASSERT(d.lane == ROUTE_LANE_STATIC && d.reason == ROUTE_REASON_STATIC_NO_CONT);
     d = route_decide(0, DS4_WIRE_RESPONSES, &big);
+    TEST_ASSERT(d.lane == ROUTE_LANE_STATIC && d.reason == ROUTE_REASON_STATIC_PROMPT_BOUNDS);
+    d = route_decide(DS4_NEED_STOP_SCAN, DS4_WIRE_ANTHROPIC, &no_ctx);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+    d = route_decide(DS4_NEED_THINKING, DS4_WIRE_RESPONSES, &big);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+    {
+        ds4_route_env anth_off_noctx = no_ctx; anth_off_noctx.cont_anthropic = false;
+        d = route_decide(0, DS4_WIRE_ANTHROPIC, &anth_off_noctx);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
+        ds4_route_env resp_off_noctx = no_ctx; resp_off_noctx.cont_responses = false;
+        d = route_decide(0, DS4_WIRE_RESPONSES, &resp_off_noctx);
+        TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
+    }
     /* semantic requirements fire before the surface gap, lowest bit first */
     d = route_decide(DS4_NEED_TOOL_SCAN | DS4_NEED_CONTINUATION_PUBLISH |
                      DS4_NEED_CORRECTIVE_RECOVERY, DS4_WIRE_ANTHROPIC, &on);
@@ -20982,6 +21028,58 @@ static void test_route_decide_reason_table(void) {
     /* durable references: rejected, never silently routed */
     d = route_decide(DS4_NEED_DURABLE_RESPONSE, DS4_WIRE_RESPONSES, &on);
     TEST_ASSERT(d.lane == ROUTE_LANE_NONE && d.reason == ROUTE_REASON_NEED_DURABLE);
+}
+
+/* Inc 3d: coalesce_gather's peer-join mirrors route_decide's static row --
+ * needs-free promoted-surface jobs join a static group only while their §7
+ * kill switch is on; every need (including Anthropic's PREFILL_ONLY zero)
+ * keeps a job out; the OpenAI oracle row is untouched by the switches. */
+static void test_static_peer_join(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    s.cont_anthropic = true;
+    s.cont_responses = true;
+    request r;
+
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC; r.temperature = 0.0f; r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(job_static_peer_ok(&s, &r));           /* needs-free promoted */
+    r.temperature = 0.7f;
+    TEST_ASSERT(!job_static_peer_ok(&s, &r));          /* per-row sampling */
+    r.temperature = 0.0f;
+    r.think_mode = DS4_THINK_LOW;
+    TEST_ASSERT(!job_static_peer_ok(&s, &r));          /* thinking */
+    r.think_mode = DS4_THINK_NONE;
+    id_list_push_unique(&r.stops, "STOP");
+    TEST_ASSERT(!job_static_peer_ok(&s, &r));          /* stop scan */
+    stop_list_clear(&r.stops);
+    r.max_tokens_set = true; r.max_tokens = 0;
+    TEST_ASSERT(!job_static_peer_ok(&s, &r));          /* prewarm: PREFILL_ONLY */
+    r.max_tokens_set = false; r.max_tokens = 128;
+    s.cont_anthropic = false;
+    TEST_ASSERT(!job_static_peer_ok(&s, &r));          /* kill switch gates joins */
+    s.cont_anthropic = true;
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES; r.temperature = 0.0f; r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(job_static_peer_ok(&s, &r));
+    /* Responses explicit-zero carries NO need bit (3c: the wire trims the
+     * seed floor) -- it may join and retires empty. */
+    r.max_tokens_set = true; r.max_tokens = 0;
+    TEST_ASSERT(job_static_peer_ok(&s, &r));
+    s.cont_responses = false;
+    TEST_ASSERT(!job_static_peer_ok(&s, &r));          /* independent switch */
+    s.cont_responses = true;
+    request_free(&r);
+
+    /* The OpenAI row is the legacy oracle and ignores the switches. */
+    s.cont_anthropic = false;
+    s.cont_responses = false;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI; r.temperature = 0.0f; r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(job_static_peer_ok(&s, &r));
+    request_free(&r);
 }
 
 /* Tape -> serial OpenAI Chat stream projector (role preamble + live SSE
@@ -22510,6 +22608,7 @@ static void ds4_server_unit_tests_run(void) {
     test_request_compute_needs_matrix();
     test_route_decide_matches_legacy_exhaustive();
     test_route_decide_reason_table();
+    test_static_peer_join();
     test_tape_openai_chat_stream_projection();
     test_tape_openai_completion_stream_projection();
     test_tape_anthropic_stream_projection();

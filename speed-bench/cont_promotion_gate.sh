@@ -39,6 +39,16 @@
 #                  [DONE] and NO content/reasoning delta (pre-fix the seed
 #                  streamed out as a reasoning_content delta)
 #
+# Inc 3d legs (boot D = DS4_SERVER_CONTINUOUS=0, the static-coalescing lane):
+#   anth_static    a thinking-disabled buffered Anthropic request is WRITTEN
+#                  BY THE STATIC BATCH (lane cell +1 exact -- a single-member
+#                  collapse records serial and fails the leg) with the
+#                  native message shape
+#   resp_static    same for Responses (reasoning effort none)
+#   oa_static      the same blast forms ONE mixed three-surface batch
+#                  (blocker occupies the worker; gather takes the queued
+#                  trio) -- static_no_cont decisions recorded
+#
 # Kill switches (boot B = both DS4_SERVER_CONT_ANTHROPIC=0 and
 # DS4_SERVER_CONT_RESPONSES=0, plan §7; the reason-table unit proves they
 # are per-surface independent):
@@ -358,6 +368,54 @@ oc1=$(lane openai_chat continuous); sl1=$(serials)
 [ "${oc1:-0}" -gt "${oc0:-0}" ] || fail "oa_stream_zero: no continuous lane entry (${oc0:-?} -> ${oc1:-?})"
 [ "${sl1:-0}" -eq "${sl0:-0}" ] || fail "oa_stream_zero: fell back to serial (${sl0:-?} -> ${sl1:-?})"
 log "oa_stream_zero PASS (no delta leak; length + [DONE]; SERVED on cont)"
+
+# ===================== boot D: the Inc 3d static scoping ===================
+# DS4_SERVER_CONTINUOUS=0 reverts to W3/W4 static coalescing -- the lane the
+# 3d row opens to the promoted surfaces.  The static lane serves only
+# needs-free shapes, so every target request disables thinking explicitly
+# (the server default effort is LOW = NEED_THINKING = cont/serial only).
+# Determinism: COALESCE_WAIT defaults to 0 (gather takes only already-queued
+# jobs), so a serial blocker occupies the worker while the three targets
+# queue; the worker then gathers them into ONE mixed three-surface batch.
+# generate_batch_jobs records a static lane entry PER JOB -- the exact +1 on
+# the anth/resp static cells is the engagement proof (a single-member
+# collapse records serial instead, and would fail those asserts).
+BOOT_ENV="DS4_SERVER_CONTINUOUS=0" boot
+
+as0=$(lane anthropic_messages static)
+rs0=$(lane openai_responses static)
+os0=$(lane openai_chat static)
+dsc0=$(decision static_no_cont)
+curl -s -m 180 -o "$OUT/static_blocker.json" "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' \
+     -d '{"max_tokens":96,"temperature":0,"thinking":false,"messages":[{"role":"user","content":"Count from 1 to 40, comma separated."}]}' &
+sleep 1
+curl -s -m 180 -o "$OUT/anth_static.json" "$BASE/v1/messages" \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"m","max_tokens":32,"temperature":0,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"Name one ocean."}]}' &
+curl -s -m 180 -o "$OUT/resp_static.json" "$BASE/v1/responses" \
+     -H 'Content-Type: application/json' \
+     -d '{"max_output_tokens":32,"temperature":0,"reasoning":{"effort":"none"},"input":"Name one river."}' &
+curl -s -m 180 -o "$OUT/oa_static.json" "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' \
+     -d '{"max_tokens":32,"temperature":0,"thinking":false,"messages":[{"role":"user","content":"Name one mountain."}]}' &
+wait
+grep -q '"type":"message"' "$OUT/anth_static.json" || fail "anth_static: no native message shape ($(head -c 200 "$OUT/anth_static.json"))"
+grep -q '"stop_reason"' "$OUT/anth_static.json" || fail "anth_static: no stop_reason"
+grep -q '"object":"response"' "$OUT/resp_static.json" || fail "resp_static: no native response shape ($(head -c 200 "$OUT/resp_static.json"))"
+grep -q '"status":"' "$OUT/resp_static.json" || fail "resp_static: no status field"
+grep -q '"object":"chat.completion"' "$OUT/oa_static.json" || fail "oa_static: no chat.completion shape"
+as1=$(lane anthropic_messages static)
+rs1=$(lane openai_responses static)
+os1=$(lane openai_chat static)
+dsc1=$(decision static_no_cont)
+[ "${as1:-0}" -eq $(( ${as0:-0} + 1 )) ] || fail "anth_static: static lane entry missing (${as0:-?} -> ${as1:-?}; single-member collapse ran it serial -- the mixed batch never formed)"
+[ "${rs1:-0}" -eq $(( ${rs0:-0} + 1 )) ] || fail "resp_static: static lane entry missing (${rs0:-?} -> ${rs1:-?})"
+[ "${os1:-0}" -ge $(( ${os0:-0} + 1 )) ] || fail "oa_static: static lane entry missing (${os0:-?} -> ${os1:-?})"
+[ "${dsc1:-0}" -ge $(( ${dsc0:-0} + 2 )) ] || fail "static block: static_no_cont decisions did not record (${dsc0:-?} -> ${dsc1:-?})"
+log "anth_static PASS (native message written by the STATIC batch; lane ${as0:-0} -> $as1)"
+log "resp_static PASS (native response written by the STATIC batch; lane ${rs0:-0} -> $rs1)"
+log "oa_static PASS (mixed three-surface static batch; static_no_cont ${dsc0:-0} -> $dsc1)"
 
 # ===================== boot B: the §7 kill switches ========================
 BOOT_ENV="DS4_SERVER_CONT_ANTHROPIC=0 DS4_SERVER_CONT_RESPONSES=0 DS4_MEM_FLOOR_GB=2" boot
