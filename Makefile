@@ -416,6 +416,12 @@ tests/test_exaone_kernels: tests/test_exaone_kernels.o ds4_gpu_args.o ds4_kvstor
 
 test-exaone-kernels: tests/test_exaone_kernels
 	./tests/test_exaone_kernels $(DS4_EXAONE_MODEL)
+
+tests/test_exaone_forward.o: tests/test_exaone_forward.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_exaone_forward: tests/test_exaone_forward.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 endif
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)

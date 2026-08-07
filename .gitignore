@@ -39,3 +39,4 @@ __pycache__/
 .DS_Store
 /tests/test_exaone_ref
 /tests/test_exaone_kernels
+/tests/test_exaone_forward
