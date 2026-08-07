@@ -3136,6 +3136,130 @@ int ds4_gpu_solar_attention_prefill_tensor(
         uint32_t                window,
         ds4_solar_kv_format     format);
 
+/* =========================================================================
+ * K-EXAONE (exaone-moe).
+ * =========================================================================
+ *
+ * Plain GQA with per-head QK-norm and no attention sinks, so none of the
+ * MLA/indexer entries above apply. See the block comment at the head of the
+ * exaone section in ds4_cuda.cu for the KV row layout and the four
+ * architecture details that are not in the GGUF metadata.
+ */
+
+int ds4_gpu_exaone_rms_norm_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                n_tokens,
+        float                   eps);
+
+int ds4_gpu_exaone_add_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *y,
+        uint64_t                count);
+
+/* Per-head RMSNorm over head_dim then NeoX rotary, in place, for n_tokens
+ * rows at absolute positions pos0 + t. do_rope is false on full-attention
+ * layers: they carry no positional encoding at all. */
+int ds4_gpu_exaone_qk_norm_rope_tensor(
+        ds4_gpu_tensor       *v,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_heads,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
+        float                   freq_base,
+        float                   eps,
+        int                     do_rope);
+
+/* Append n_tokens rows of K and V to the layer cache as f16. Slot is
+ * position % kv_cap: a ring on sliding layers, the identity on full ones. */
+int ds4_gpu_exaone_kv_store_tensor(
+        ds4_gpu_tensor       *kv,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                kv_dim,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                kv_cap);
+
+/* window == 0 means full attention. */
+int ds4_gpu_exaone_attention_decode_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window);
+
+int ds4_gpu_exaone_attention_prefill_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                window);
+
+/* sigmoid over the router logits, top-k on probs + exp_probs_b, weights read
+ * back UNBIASED, normalized, then scaled by routed_scaling_factor. */
+int ds4_gpu_exaone_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        int                     have_bias,
+        uint32_t                n_expert,
+        uint32_t                n_used,
+        uint32_t                n_tokens,
+        float                   weight_scale);
+
+int ds4_gpu_exaone_swiglu_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint64_t                count);
+
+/* Weighted sum over the routed slots plus the unweighted shared expert.
+ * shared may be NULL. */
+int ds4_gpu_exaone_moe_combine_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *down,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *shared,
+        uint32_t                n_embd,
+        uint32_t                n_used,
+        uint32_t                n_tokens);
+
+int ds4_gpu_exaone_moe_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used);
+
 #ifdef __cplusplus
 }
 #endif

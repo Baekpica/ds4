@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         ds4_weights weights;
-        weights_bind(&weights, &model);
+        weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
         printf("DeepSeek metadata and tensor layout: valid (%s)\n",
                DS4_MODEL_SHAPE_NAME);
         model_close(&model);
@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
     }
 
     ds4_weights weights;
-    weights_bind(&weights, &model);
+    weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
     if (weights.output_hc_base || weights.output_hc_fn ||
         weights.output_hc_scale) {
         fprintf(stderr, "Solar unexpectedly bound a hyper-connection output head\n");

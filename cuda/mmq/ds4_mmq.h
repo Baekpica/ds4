@@ -172,9 +172,9 @@ int ds4_mmq_iq2_xxs_dense(
     int           K,
     cudaStream_t  stream);
 
-// Q3_K is the Solar Open 2 mixed-quant recipe's routed-expert down type on
-// the interior MoE layers. The vendored mmq/mmvq templates already support
-// it; these entries expose the same contracts as the neighboring K-quants.
+// Q3_K is used by the Solar Open 2 and K-EXAONE mixed-quant recipes. The
+// vendored mmq/mmvq templates already support it; expose the same contracts
+// as the neighboring K-quants.
 int ds4_mmq_q3_K_dense(
     const void  * W_q3_K,
     const float * X_f32,
@@ -298,6 +298,18 @@ int ds4_mmq_q3_K_moe_bounded(
 // pass is skipped.  New callers must sanitize at consumption.
 int ds4_mmq_q2_K_moe_soa(
     const void    * W_soa,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q3_K_moe(
+    const void    * W,
     const float   * X_f32,
     const int32_t * ids,
     float         * out_f32,

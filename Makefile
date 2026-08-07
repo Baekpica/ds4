@@ -15,6 +15,7 @@ LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 DS4_MOTIF3_MODEL ?=
 DS4_MOTIF3_FIXTURES ?= ../motif-3-mixed-ds4/fixtures/official-final
+DS4_EXAONE_MODEL ?=
 CUDA_EXTRA_BINS :=
 
 ifeq ($(UNAME_S),Darwin)
@@ -77,7 +78,8 @@ endif
         test-solar-loader test-solar-kda test-solar-kda-prefill \
         test-solar-kda-chunk \
         test-solar-gates test-solar-kv test-solar-tokenizer \
-        test-solar-forward test-solar-session
+        test-solar-forward test-solar-session \
+        test-exaone-ref test-exaone-kernels
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -411,6 +413,30 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
+ifneq ($(UNAME_S),Darwin)
+# EXAONE harnesses include ds4.c to reach the reference and graph builders, so
+# link the external distributed/CUDA implementation without a second ds4.o.
+tests/test_exaone_ref.o: tests/test_exaone_ref.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_exaone_ref: tests/test_exaone_ref.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-exaone-ref: tests/test_exaone_ref
+	@test -n "$(DS4_EXAONE_MODEL)" || \
+		{ echo "set DS4_EXAONE_MODEL to the EXAONE GGUF" >&2; exit 2; }
+	./tests/test_exaone_ref "$(DS4_EXAONE_MODEL)" 0
+
+tests/test_exaone_kernels.o: tests/test_exaone_kernels.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_exaone_kernels: tests/test_exaone_kernels.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-exaone-kernels: tests/test_exaone_kernels
+	./tests/test_exaone_kernels $(DS4_EXAONE_MODEL)
+endif
+
 tests/test_split_gguf: tests/test_split_gguf.c ds4.c ds4.h
 	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
 		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
@@ -490,4 +516,4 @@ tests/test_motif3_long: tests/test_motif3_long.o ds4_kvstore.o rax.o $(CORE_OBJS
 endif
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_long.o *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_long.o tests/test_exaone_ref tests/test_exaone_kernels tests/test_exaone_ref.o tests/test_exaone_kernels.o *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o

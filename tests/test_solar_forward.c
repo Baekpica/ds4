@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     ds4_weights weights;
-    weights_bind(&weights, &model);
+    weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
     if (!ds4_gpu_set_model_map(model.map, model.size)) {
         fprintf(stderr, "model map registration failed\n");
         model_close(&model);

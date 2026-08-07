@@ -29,3 +29,5 @@ __pycache__/
 .*.swp
 .DS_Store
 /.antigravitycli/
+/tests/test_exaone_ref
+/tests/test_exaone_kernels

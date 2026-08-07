@@ -3080,6 +3080,115 @@ static inline void q4_k_get_scale_min(
     }
 }
 
+static void ds4_vec_dot_q4_K_q8_K(
+        int n, float *s, const block_q4_K *x, const block_q8_K *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d * f16_to_f32(x[i].d);
+        const float dm = -y[i].d * f16_to_f32(x[i].dmin);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t *q8 = y[i].qs;
+        int summs = 0;
+        int isum = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, sc, &sc_val, &m_val);
+            summs += (int)m_val * ((int)y[i].bsums[j * 2] +
+                                   (int)y[i].bsums[j * 2 + 1]);
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+            for (int l = 0; l < 32; l++) {
+                isum += ((qs[byte_off + l] >> shift) & 0x0f) *
+                        (int)q8[j * 32 + l] * (int)sc_val;
+            }
+        }
+        sumf += d * (float)isum + dm * (float)summs;
+    }
+    *s = sumf;
+}
+
+static void ds4_vec_dot_q5_K_q8_K(
+        int n, float *s, const block_q5_K *x, const block_q8_K *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d * f16_to_f32(x[i].d);
+        const float dmin = y[i].d * f16_to_f32(x[i].dmin);
+        const uint8_t *ql = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *q8 = y[i].qs;
+        const uint8_t *scales = x[i].scales;
+        int64_t isum = 0;
+        int64_t summs = 0;
+        int is = 0;
+        uint8_t u1 = 1;
+        uint8_t u2 = 2;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(is, scales, &sc_val, &m_val);
+            summs += (int64_t)m_val * ((int)y[i].bsums[2 * is] +
+                                       (int)y[i].bsums[2 * is + 1]);
+            for (int l = 0; l < 32; l++) {
+                const int q = (int)(ql[l] & 0x0f) +
+                              ((qh[l] & u1) ? 16 : 0);
+                isum += (int64_t)sc_val * q * (int)q8[j + l];
+            }
+            q4_k_get_scale_min(is + 1, scales, &sc_val, &m_val);
+            summs += (int64_t)m_val * ((int)y[i].bsums[2 * (is + 1)] +
+                                       (int)y[i].bsums[2 * (is + 1) + 1]);
+            for (int l = 0; l < 32; l++) {
+                const int q = (int)(ql[l] >> 4) +
+                              ((qh[l] & u2) ? 16 : 0);
+                isum += (int64_t)sc_val * q * (int)q8[j + 32 + l];
+            }
+            ql += 32;
+            is += 2;
+            u1 = (uint8_t)(u1 << 2);
+            u2 = (uint8_t)(u2 << 2);
+        }
+        sumf += d * (float)isum - dmin * (float)summs;
+    }
+    *s = sumf;
+}
+
+static void ds4_vec_dot_q6_K_q8_K(
+        int n, float *s, const block_q6_K *x, const block_q8_K *y) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d * f16_to_f32(x[i].d);
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *scales = x[i].scales;
+        const int8_t *q8 = y[i].qs;
+        int64_t isum = 0;
+        for (int n128 = 0; n128 < QK_K; n128 += 128) {
+            for (int l = 0; l < 32; l++) {
+                const int is = l / 16;
+                const int q1 = ((int)(ql[l] & 0x0f) |
+                                (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = ((int)(ql[l + 32] & 0x0f) |
+                                (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = ((int)(ql[l] >> 4) |
+                                (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = ((int)(ql[l + 32] >> 4) |
+                                (((qh[l] >> 6) & 3) << 4)) - 32;
+                isum += (int64_t)scales[is] * q1 * (int)q8[n128 + l];
+                isum += (int64_t)scales[is + 2] * q2 * (int)q8[n128 + l + 32];
+                isum += (int64_t)scales[is + 4] * q3 * (int)q8[n128 + l + 64];
+                isum += (int64_t)scales[is + 6] * q4 * (int)q8[n128 + l + 96];
+            }
+            ql += 64;
+            qh += 32;
+            scales += 8;
+        }
+        sumf += d * (float)isum;
+    }
+    *s = sumf;
+}
+
 static float ds4_vec_dot_q4_K_f32(int n, const block_q4_K *x, const float *y) {
     const int nb = n / QK_K;
     float sumf = 0.0f;
@@ -5310,7 +5419,22 @@ static void weights_bind_solar_open2_layer(
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
 }
 
-static void weights_bind(ds4_weights *w, const ds4_model *m) {
+static void weights_bind(
+        ds4_weights     *w,
+        const ds4_model *m,
+        bool             load_slice,
+        uint32_t         load_layer_start,
+        uint32_t         load_layer_end,
+        bool             require_output,
+        bool             optional_output) {
+    /* v0.5.6.3 binds the complete descriptor table before selecting mapped
+     * spans.  Keep that behavior for every family while sharing the newer
+     * call surface required by EXAONE's split-GGUF follow-up. */
+    (void)load_slice;
+    (void)load_layer_start;
+    (void)load_layer_end;
+    (void)require_output;
+    (void)optional_output;
     memset(w, 0, sizeof(*w));
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
@@ -11227,16 +11351,26 @@ static void exaone_rmsnorm(float *out, const float *x, const ds4_model *m,
 }
 
 /* NeoX rotary: the head is split in half and element i is rotated against
- * i + half, unlike the "normal" variant that pairs adjacent elements. */
+ * i + half, unlike the "normal" variant that pairs adjacent elements.
+ *
+ * The frequency is computed in double and rounded once. It looks like an
+ * overreaction for a table of 64 constants, but the position multiplies it:
+ * this model's context reaches 262143, where the last bit of a float
+ * frequency is worth 0.013 radians of rotation. Two implementations that
+ * differ by one ulp there disagree on the attention scores by more than the
+ * quantization does, so the CUDA kernel computes the frequency exactly this
+ * way and neither path is allowed to drift into powf's ulp budget. */
 static void exaone_rope_neox(float *v, uint32_t n_heads, uint32_t head_dim,
                              uint32_t n_rot, uint32_t pos, float freq_base) {
     const uint32_t half = n_rot / 2;
     for (uint32_t h = 0; h < n_heads; h++) {
         float *p = v + (size_t)h * head_dim;
         for (uint32_t i = 0; i < half; i++) {
-            const float theta = (float)pos *
-                powf(freq_base, -2.0f * (float)i / (float)n_rot);
-            const float c = cosf(theta), s = sinf(theta);
+            const float freq = (float)pow((double)freq_base,
+                                          -2.0 * (double)i / (double)n_rot);
+            const float theta = (float)pos * freq;
+            const double tr = fmod((double)theta, 2.0 * M_PI);
+            const float c = (float)cos(tr), s = (float)sin(tr);
             const float a = p[i], b = p[i + half];
             p[i]        = a * c - b * s;
             p[i + half] = a * s + b * c;
@@ -47464,7 +47598,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
-    weights_bind(&e->weights, &e->model);
+    weights_bind(&e->weights,
+                 &e->model,
+                 load_slice,
+                 load_layer_start,
+                 load_layer_end,
+                 load_output,
+                 false);
     if (opt->inspect_only) {
         *out = e;
         return 0;

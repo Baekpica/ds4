@@ -3805,6 +3805,7 @@ int ds4_mmq_dense_vec_impl(
 template <ggml_type type> struct ds4_mmq_vdr_mmvq_value;
 template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_IQ2_XXS> { static constexpr int value = VDR_IQ2_XXS_Q8_1_MMVQ; };
 template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q2_K>    { static constexpr int value = VDR_Q2_K_Q8_1_MMVQ; };
+template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q3_K>    { static constexpr int value = VDR_Q3_K_Q8_1_MMVQ; };
 template <> struct ds4_mmq_vdr_mmvq_value<GGML_TYPE_Q4_K>    { static constexpr int value = VDR_Q4_K_Q8_1_MMVQ; };
 
 template <ggml_type type>
@@ -3817,6 +3818,8 @@ static __device__ __forceinline__ float ds4_mmq_vec_dot_q8_1(
         return vec_dot_iq2_xxs_q8_1(W, X_q8, kbx, iqs);
     } else if constexpr (type == GGML_TYPE_Q2_K) {
         return vec_dot_q2_K_q8_1(W, X_q8, kbx, iqs);
+    } else if constexpr (type == GGML_TYPE_Q3_K) {
+        return vec_dot_q3_K_q8_1(W, X_q8, kbx, iqs);
     } else {
         static_assert(type == GGML_TYPE_Q4_K, "unsupported fused vector type");
         return vec_dot_q4_K_q8_1(W, X_q8, kbx, iqs);

@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
     }
 
     ds4_weights weights;
-    weights_bind(&weights, &model);
+    weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
     if (weights.layer[2].ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
         weights.layer[2].ffn_down_exps->type != DS4_TENSOR_Q2_K ||
         weights.layer[2].ffn_gate_inp->type != DS4_TENSOR_F32 ||
