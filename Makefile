@@ -435,6 +435,12 @@ tests/test_exaone_kernels: tests/test_exaone_kernels.o ds4_distributed.o ds4_cud
 
 test-exaone-kernels: tests/test_exaone_kernels
 	./tests/test_exaone_kernels $(DS4_EXAONE_MODEL)
+
+tests/test_exaone_forward.o: tests/test_exaone_forward.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_exaone_forward: tests/test_exaone_forward.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 endif
 
 tests/test_split_gguf: tests/test_split_gguf.c ds4.c ds4.h

@@ -31,3 +31,4 @@ __pycache__/
 /.antigravitycli/
 /tests/test_exaone_ref
 /tests/test_exaone_kernels
+/tests/test_exaone_forward
