@@ -288,6 +288,23 @@ bool ds4_repack_collect_catalog(const char *log_prefix,
 
 /* ---- staged file reads --------------------------------------------------- */
 
+/* Builders read through one of two sources: the file at args.path (mapped
+ * per builder, the weight-server arrangement) or a premapped merged image
+ * (args.source_data, the engine's split-GGUF arrangement). */
+static bool repack_open_source(const ds4_repack_build_args &a, ds4_repack_file &m) {
+    if (a.source_data) {
+        m = ds4_repack_file();
+        m.data = a.source_data;
+        m.size = a.source_size;
+        return m.data != nullptr && m.size != 0;
+    }
+    return ds4_repack_map_file(a.log_prefix, a.path, m);
+}
+
+static void repack_close_source(const ds4_repack_build_args &a, ds4_repack_file &m) {
+    if (!a.source_data) ds4_repack_unmap_file(m);
+}
+
 bool ds4_repack_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     uint64_t done = 0;
     while (done < bytes) {
@@ -306,6 +323,14 @@ bool ds4_repack_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
 bool ds4_repack_read_stage(const ds4_repack_file &m, void *stage, uint64_t stage_bytes,
                            uint64_t file_off, uint64_t bytes, const char **payload) {
     *payload = (const char *)stage;
+    /* Premapped source (split GGUF): the bytes are already addressable, so
+     * point the payload straight at the mapping -- no staging copy. The H2D
+     * copy that follows reads pageable memory, which CUDA handles. */
+    if (m.fd < 0 && m.data) {
+        if (file_off > m.size || bytes > m.size - file_off) return false;
+        *payload = (const char *)m.data + file_off;
+        return true;
+    }
 #if defined(__linux__) && defined(O_DIRECT)
     if (m.direct_fd >= 0 && m.direct_align > 1 && m.size != 0) {
         const uint64_t aligned_off = repack_align_down(file_off, m.direct_align);
@@ -682,7 +707,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
                                  uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    if (!repack_open_source(a, m)) return false;
     uint64_t chunk = a.copy_chunk_bytes / 34u * 34u;
     if (chunk < 34u * 32768u) chunk = 34u * 32768u;
 
@@ -752,7 +777,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        repack_close_source(a, m);
         return false;
     }
 
@@ -764,7 +789,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    repack_close_source(a, m);
     if (count == 0) {
         fprintf(stderr, "%s: --repack-q8-aligned found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);
@@ -790,7 +815,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
                              uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    if (!repack_open_source(a, m)) return false;
     uint64_t chunk = a.copy_chunk_bytes / 34u * 34u;
     if (chunk < 34u * 32768u) chunk = 34u * 32768u;
 
@@ -855,7 +880,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        repack_close_source(a, m);
         return false;
     }
 
@@ -867,7 +892,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    repack_close_source(a, m);
     if (count == 0) {
         fprintf(stderr, "%s: q8 f16 prebuild found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);
@@ -895,7 +920,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
                                   uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    if (!repack_open_source(a, m)) return false;
     uint64_t chunk = a.copy_chunk_bytes / 66u * 66u;
     if (chunk < 66u * 16384u) chunk = 66u * 16384u;
 
@@ -968,7 +993,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        repack_close_source(a, m);
         return false;
     }
 
@@ -980,7 +1005,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    repack_close_source(a, m);
     if (count == 0) {
         fprintf(stderr, "%s: --repack-iq2-aligned found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);
@@ -1009,7 +1034,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
                                   uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    if (!repack_open_source(a, m)) return false;
 
     const double t0 = repack_now_sec();
     std::vector<repack_job> jobs;
@@ -1092,7 +1117,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        repack_close_source(a, m);
         return false;
     }
 
@@ -1104,7 +1129,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    repack_close_source(a, m);
     if (count == 0) {
         fprintf(stderr, "%s: --repack-q2k-aligned found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);

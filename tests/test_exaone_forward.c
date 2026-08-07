@@ -80,6 +80,28 @@ int main(int argc, char **argv) {
         fprintf(stderr, "model map registration failed\n");
         return 1;
     }
+    /* DS4_TEST_DERIVED=1 builds the aligned artifacts the way engine startup
+     * does, so the aligned fused decode tier gets compared against the CPU
+     * reference too -- without it this test only ever exercises the raw
+     * fallback and an aligned-path bug would ride to production unseen. */
+    if (getenv("DS4_TEST_DERIVED")) {
+        ds4_gpu_tensor_record *recs = xcalloc(model.n_tensors, sizeof(*recs));
+        for (uint64_t i = 0; i < model.n_tensors; i++) {
+            const ds4_tensor *t = &model.tensors[i];
+            recs[i].name = t->name.ptr;
+            recs[i].name_len = (uint32_t)t->name.len;
+            recs[i].type = t->type;
+            recs[i].ndim = t->ndim;
+            for (uint32_t d = 0; d < t->ndim && d < 4u; d++)
+                recs[i].dims[d] = t->dim[d];
+            recs[i].offset = t->abs_offset;
+            recs[i].bytes = t->bytes;
+        }
+        const int n = ds4_gpu_build_derived_artifacts_from_records(
+                model.map, model.size, recs, (uint32_t)model.n_tensors);
+        free(recs);
+        fprintf(stderr, "derived artifacts: %d built\n", n);
+    }
     fprintf(stderr, "shape: %s  layers=%u embd=%u heads=%u/%u experts=%u/%u\n",
             DS4_MODEL_SHAPE_NAME, DS4_N_LAYER, DS4_N_EMBD, DS4_N_HEAD,
             DS4_N_HEAD_KV, DS4_N_EXPERT_USED, DS4_N_EXPERT);

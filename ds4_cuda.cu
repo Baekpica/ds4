@@ -96,6 +96,8 @@ static int g_model_hmm_direct;
 /* Set at init when every device is an integrated, pageable-memory-access
  * part: the model mapping is then read in place instead of copied. */
 static int g_model_direct_addressable;
+/* Set by the engine when it has decided a device-resident copy fits. */
+static int g_model_prefer_device_copy;
 static int g_model_fd = -1;
 static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
@@ -3806,11 +3808,25 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_register_model_map_no_copy(model_map, model_size)) return 0;
-    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
+    if ((getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL || g_model_prefer_device_copy) &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
     }
     return 1;
+}
+
+/* Ask for a device-resident copy of the weights instead of reading the model
+ * mapping in place.
+ *
+ * Both land in the same physical DRAM on a coherent SoC, so this looks
+ * pointless -- but measured on GB10 a kernel streaming a file mapping reaches
+ * 162.9 GB/s against 234.4 GB/s for a cudaMalloc'd buffer, and end to end that
+ * is 3.96 tok/s versus 9.45. The ATS path costs about 30% of bandwidth.
+ *
+ * The copy is chunked and releases each source chunk's page cache as it goes,
+ * so the two copies are never simultaneously resident. */
+extern "C" void ds4_gpu_model_prefer_device_copy(int enable) {
+    g_model_prefer_device_copy = enable ? 1 : 0;
 }
 
 /* Register the mmap'd host model pointer for selective-cache lookups WITHOUT
@@ -4371,6 +4387,160 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 #endif
     }
     return 1;
+}
+
+extern "C" uint64_t ds4_gpu_derived_artifact_bytes(void) {
+    return g_derived_artifact_bytes;
+}
+
+/* Mirrors the public ds4_gpu_tensor_record in ds4_gpu.h -- this file does not
+ * include that header (pre-existing project convention; see the note above
+ * ds4_tensor_range). Keep the two in lockstep. */
+typedef struct {
+    const char *name;
+    uint32_t    name_len;
+    uint32_t    type;
+    uint32_t    ndim;
+    uint64_t    dims[4];
+    uint64_t    offset;
+    uint64_t    bytes;
+} ds4_gpu_tensor_record;
+
+/* Records-driven twin of ds4_gpu_build_derived_artifacts below. Same builds,
+ * same registration, two differences forced by split GGUFs: the catalog comes
+ * from the engine's merged tensor table instead of re-parsing one file, and
+ * the source bytes are read from the merged mapping (args.source_data), which
+ * is the only place a split model's bytes are contiguous. */
+extern "C" int ds4_gpu_build_derived_artifacts_from_records(
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_tensor_record *records_in,
+        uint32_t count) {
+    if (!model_map || model_size == 0 || !records_in || count == 0) return 0;
+    if (!g_derived_ranges.empty()) return (int)g_derived_ranges.size();
+    if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) return 0;
+    const char *build = getenv("DS4_CUDA_BUILD_ARTIFACTS");
+    if (build && strcmp(build, "0") == 0) return 0;
+
+    int device = 0;
+    int integrated = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) != cudaSuccess ||
+        !integrated) {
+        return 0;
+    }
+
+    std::vector<ds4_repack_tensor> records;
+    records.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        const ds4_gpu_tensor_record &r = records_in[i];
+        ds4_repack_tensor t;
+        t.name.assign(r.name, r.name_len);
+        t.type = r.type;
+        t.ndim = r.ndim;
+        for (uint32_t d = 0; d < r.ndim && d < 4u; d++) t.dims[d] = r.dims[d];
+        t.elements = 1;
+        for (uint32_t d = 0; d < r.ndim && d < 4u; d++) t.elements *= r.dims[d];
+        t.off = r.offset;
+        t.bytes = r.bytes;
+        records.push_back(std::move(t));
+    }
+
+    const bool build_moe =
+        cuda_aligned_iq2_enabled() && cuda_aligned_q2k_enabled();
+    const bool build_q8 = cuda_aligned_q8_enabled();
+    if (!build_moe && !build_q8) return 0;
+
+    ds4_repack_build_args args;
+    args.log_prefix = "ds4";
+    args.model_id = "base";
+    args.path = NULL;
+    args.records = &records;
+    args.device = device;
+    args.copy_chunk_bytes = 256ull * 1048576ull;
+    args.source_data = (const uint8_t *)model_map;
+    args.source_size = model_size;
+
+    const double t0 = cuda_wall_sec();
+    std::vector<ds4_repack_artifact> artifacts;
+    uint64_t built_bytes = 0;
+    uint64_t part_bytes = 0;
+    bool ok = true;
+    if (build_moe) {
+        ok = ds4_repack_build_q2k_aligned(args, artifacts, &part_bytes);
+        built_bytes += part_bytes;
+    }
+    if (ok && build_moe) {
+        ok = ds4_repack_build_iq2_aligned(args, artifacts, &part_bytes);
+        built_bytes += part_bytes;
+    }
+    if (ok && build_q8) {
+        ok = ds4_repack_build_q8_aligned(args, artifacts, &part_bytes);
+        built_bytes += part_bytes;
+    }
+    if (!ok || artifacts.empty()) {
+        for (ds4_repack_artifact &artifact : artifacts) {
+            if (artifact.dev) (void)cudaFree(artifact.dev);
+        }
+        fprintf(stderr, "ds4: aligned artifact build (records) %s; using raw weights\n",
+                ok ? "found no candidates" : "failed");
+        return 0;
+    }
+
+    for (const ds4_repack_artifact &artifact : artifacts) {
+        g_derived_ranges.push_back({
+            model_map,
+            artifact.t->off,
+            artifact.t->bytes,
+            artifact.kind,
+            artifact.in_dim,
+            artifact.out_dim,
+            artifact.group_count,
+            artifact.bytes,
+            (char *)artifact.dev,
+        });
+    }
+
+    int replaces_complete = build_moe ? 1 : 0;
+    uint64_t replace_candidates = 0;
+    for (const ds4_repack_tensor &tensor : records) {
+        if (!ds4_repack_iq2_candidate(tensor) &&
+            !ds4_repack_q2k_candidate(tensor)) {
+            continue;
+        }
+        replace_candidates++;
+        bool found = false;
+        for (const ds4_repack_artifact &artifact : artifacts) {
+            if (artifact.t == &tensor) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) replaces_complete = 0;
+    }
+    if (replace_candidates == 0) replaces_complete = 0;
+
+    g_derived_replace_map = model_map;
+    g_derived_replaces_complete = replaces_complete;
+    g_derived_artifact_bytes = built_bytes;
+    g_derived_artifact_build_secs = cuda_wall_sec() - t0;
+    if (!g_aligned_q81_scratch) {
+        cudaError_t scratch_err = cudaMalloc(&g_aligned_q81_scratch, 256u * 1024u);
+        if (scratch_err == cudaSuccess) {
+            ds4_mmq_set_aligned_q81_scratch(g_aligned_q81_scratch,
+                                             256u * 1024u);
+        } else {
+            g_aligned_q81_scratch = NULL;
+            (void)cudaGetLastError();
+        }
+    }
+    fprintf(stderr,
+            "ds4: aligned artifacts (records): %zu built, %.2f GiB device, "
+            "%.1fs, expert replaces %s\n",
+            g_derived_ranges.size(), (double)built_bytes / 1073741824.0,
+            g_derived_artifact_build_secs,
+            replaces_complete ? "complete" : "partial");
+    return (int)g_derived_ranges.size();
 }
 
 extern "C" int ds4_gpu_build_derived_artifacts(
@@ -31150,16 +31320,24 @@ __global__ static void exaone_router_kernel(
     }
 }
 
-/* silu(gate) * up over every routed slot of every token. */
+/* silu(gate) * up over every routed slot of every token, optionally scaled
+ * by that slot's router weight (weights != NULL, slot = i / n_ff). Folding
+ * the weight here instead of at the combine keeps every gate/up path --
+ * aligned fused, separate vec, and the tile prefill -- producing the same
+ * thing: an already-weighted mid. */
 __global__ static void exaone_swiglu_kernel(
         float *mid,
         const float *gate,
         const float *up,
+        const float *weights,
+        uint32_t n_ff,
         uint64_t count) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float g = gate[i];
-    mid[i] = (g / (1.0f + __expf(-g))) * up[i];
+    float v = (g / (1.0f + __expf(-g))) * up[i];
+    if (weights) v *= weights[i / n_ff];
+    mid[i] = v;
 }
 
 /* Weighted sum of the routed expert outputs into out, then add the shared
@@ -31181,9 +31359,14 @@ __global__ static void exaone_moe_combine_kernel(
     float acc = 0.0f;
     for (uint32_t s = 0; s < n_used; s++) {
         const size_t col = (size_t)t * n_used + s;
-        acc += weights[col] * down[col * n_embd + d];
+        const float v = down[col * n_embd + d];
+        acc += weights ? weights[col] * v : v;
     }
     if (shared) acc += shared[(size_t)t * n_embd + d];
+    /* The routed slots come out of quantized matmuls; a non-finite value in
+     * one slot must not poison the residual stream. Mirrors the guard in the
+     * reference moe_mmq_sum_kernel. */
+    if (!isfinite(acc)) acc = 0.0f;
     out[idx] = acc;
 }
 
@@ -31446,8 +31629,32 @@ extern "C" int ds4_gpu_exaone_swiglu_tensor(
     exaone_swiglu_kernel<<<(unsigned)((count + threads - 1u) / threads),
                            threads, 0, cuda_decode_stream()>>>(
             (float *)mid->ptr, (const float *)gate->ptr,
-            (const float *)up->ptr, count);
+            (const float *)up->ptr, NULL, 1u, count);
     return cuda_ok(cudaGetLastError(), "exaone swiglu");
+}
+
+extern "C" int ds4_gpu_exaone_swiglu_weighted_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_ff,
+        uint64_t                count) {
+    if (!mid || !gate || !up || count == 0u || n_ff == 0u ||
+        count % n_ff != 0u ||
+        mid->bytes < count * sizeof(float) ||
+        gate->bytes < count * sizeof(float) ||
+        up->bytes < count * sizeof(float) ||
+        (weights && weights->bytes < (count / n_ff) * sizeof(float))) {
+        return 0;
+    }
+    const uint32_t threads = 256u;
+    exaone_swiglu_kernel<<<(unsigned)((count + threads - 1u) / threads),
+                           threads, 0, cuda_decode_stream()>>>(
+            (float *)mid->ptr, (const float *)gate->ptr,
+            (const float *)up->ptr,
+            weights ? (const float *)weights->ptr : NULL, n_ff, count);
+    return cuda_ok(cudaGetLastError(), "exaone swiglu weighted");
 }
 
 extern "C" int ds4_gpu_exaone_moe_combine_tensor(
@@ -31458,11 +31665,11 @@ extern "C" int ds4_gpu_exaone_moe_combine_tensor(
         uint32_t                n_embd,
         uint32_t                n_used,
         uint32_t                n_tokens) {
-    if (!out || !down || !weights || n_embd == 0u || n_used == 0u ||
+    if (!out || !down || n_embd == 0u || n_used == 0u ||
         n_tokens == 0u ||
         out->bytes < (uint64_t)n_embd * n_tokens * sizeof(float) ||
         down->bytes < (uint64_t)n_embd * n_used * n_tokens * sizeof(float) ||
-        weights->bytes < (uint64_t)n_used * n_tokens * sizeof(float) ||
+        (weights && weights->bytes < (uint64_t)n_used * n_tokens * sizeof(float)) ||
         (shared && shared->bytes < (uint64_t)n_embd * n_tokens * sizeof(float))) {
         return 0;
     }
@@ -31471,10 +31678,83 @@ extern "C" int ds4_gpu_exaone_moe_combine_tensor(
     exaone_moe_combine_kernel<<<(unsigned)((total + threads - 1u) / threads),
                                 threads, 0, cuda_decode_stream()>>>(
             (float *)out->ptr, (const float *)down->ptr,
-            (const float *)weights->ptr,
+            weights ? (const float *)weights->ptr : NULL,
             shared ? (const float *)shared->ptr : NULL,
             n_embd, n_used, n_tokens);
     return cuda_ok(cudaGetLastError(), "exaone moe combine");
+}
+
+/* Aligned fused gate+up+SwiGLU+router-weight, the reference fork's decode
+ * tier for IQ2_XXS routed experts. Both weight stacks must have aligned-SoA
+ * artifacts (built at boot from the merged tensor table); the kernel is
+ * runtime-parameterized on n_expert_used, so K-EXAONE's top-8 works where the
+ * raw fused kernel's constexpr top_k = 6 does not. Falls back (returns 0)
+ * when artifacts are missing or n_tokens > 16, and the caller then takes the
+ * separate-matmul route -- same math, more launches. */
+extern "C" int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *weights,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                gate_bytes,
+        uint64_t                up_offset,
+        uint64_t                up_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                mid_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used) {
+    if (!mid || !x || !ids || !weights || !model_map ||
+        weight_type != 16u /* IQ2_XXS */ ||
+        n_tokens == 0u || n_tokens > 16u ||
+        in_dim == 0u || in_dim % 1024u != 0u || mid_dim == 0u ||
+        n_expert == 0u || n_expert_used == 0u ||
+        gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+        up_offset > model_size || up_bytes > model_size - up_offset ||
+        mid->bytes < (uint64_t)mid_dim * n_tokens * n_expert_used * sizeof(float) ||
+        x->bytes < (uint64_t)in_dim * n_tokens * sizeof(float) ||
+        ids->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t aligned_bytes = ds4_mmq_iq2_xxs_aligned_bytes(
+            (int)mid_dim, (int)in_dim, (int)n_expert);
+    const char *gate_aligned = cuda_derived_weight_ptr(
+            model_map, gate_offset, gate_bytes,
+            CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+            in_dim, mid_dim, n_expert, aligned_bytes);
+    const char *up_aligned = cuda_derived_weight_ptr(
+            model_map, up_offset, up_bytes,
+            CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+            in_dim, mid_dim, n_expert, aligned_bytes);
+    if (!gate_aligned || !up_aligned) return 0;
+
+    const cudaStream_t stream =
+        n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
+    const int rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+            gate_aligned, up_aligned,
+            (const float *)x->ptr,
+            (const int32_t *)ids->ptr,
+            (const float *)weights->ptr,
+            (float *)mid->ptr,
+            (int)mid_dim, (int)in_dim,
+            (int)n_tokens, (int)n_expert, (int)n_expert_used,
+            /*clamp=*/0.0f, stream);
+    if (rc != 0) {
+        fprintf(stderr, "ds4: exaone aligned gate_up_mid rc=%d "
+                        "(tokens=%u used=%u)\n", rc, n_tokens, n_expert_used);
+        return 0;
+    }
+    static int logged = 0;
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "ds4: exaone routed MoE using aligned CUDA artifacts\n");
+    }
+    return cuda_ok(cudaGetLastError(), "exaone aligned gate_up_mid");
 }
 
 /* Routed-expert matmul.  Thin dispatch over the quant types the K-EXAONE

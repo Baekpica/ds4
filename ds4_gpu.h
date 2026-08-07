@@ -95,6 +95,31 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+/* One GGUF tensor, described by the engine's merged tensor table. This is how
+ * a split model reaches the aligned-artifact builder: the repack library's own
+ * catalog walk parses a single file, which for a split model holds only the
+ * first shard, while the engine's table spans all of them with offsets in the
+ * merged mapping. */
+typedef struct {
+    const char *name;
+    uint32_t    name_len;
+    uint32_t    type;
+    uint32_t    ndim;
+    uint64_t    dims[4];
+    uint64_t    offset;   /* into the merged mapping */
+    uint64_t    bytes;
+} ds4_gpu_tensor_record;
+
+/* Build the aligned fast-path artifacts from the engine's tensor table,
+ * reading source bytes from the (possibly shard-merged) mapping itself.
+ * Returns the number of artifacts built, 0 when skipped or failed. */
+int ds4_gpu_build_derived_artifacts_from_records(
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_tensor_record *records, uint32_t count);
+
+/* Total device bytes held by derived (aligned) artifacts; 0 when none. */
+uint64_t ds4_gpu_derived_artifact_bytes(void);
+
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
                                     const char *model_path);
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
@@ -2667,6 +2692,11 @@ void ds4_gpu_decode_graphs_invalidate(void);
  * on a coherent SoC that allocates a second copy out of the same pool. */
 int ds4_gpu_model_map_is_direct(void);
 
+/* Request a device-resident copy of the weights rather than reading the model
+ * mapping in place. Must be called before the model map is registered. See the
+ * implementation for the measurements that justify it. */
+void ds4_gpu_model_prefer_device_copy(int enable);
+
 int ds4_gpu_exaone_rms_norm_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
@@ -2765,6 +2795,39 @@ int ds4_gpu_exaone_moe_combine_tensor(
         uint32_t                n_embd,
         uint32_t                n_used,
         uint32_t                n_tokens);
+
+/* Fused routed gate+up+SwiGLU+router-weight into mid, from the aligned
+ * IQ2_XXS artifacts. Returns 1 when the aligned path ran; 0 when it does not
+ * apply (no artifacts, wrong type, or too many tokens) and the caller must
+ * take the separate-matmul route. mid comes out ALREADY weighted, so the
+ * combine step must not apply weights again. */
+int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *weights,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                gate_bytes,
+        uint64_t                up_offset,
+        uint64_t                up_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                mid_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used);
+
+/* silu(gate) * up * weights[slot], where slot = flat_index / n_ff. weights
+ * may be NULL for the unweighted form. */
+int ds4_gpu_exaone_swiglu_weighted_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_ff,
+        uint64_t                count);
 
 int ds4_gpu_exaone_moe_matmul_tensor(
         ds4_gpu_tensor       *out,

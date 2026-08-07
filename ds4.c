@@ -49865,7 +49865,7 @@ static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
     g->n_embd   = DS4_N_EMBD;
     g->q_dim    = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     g->kv_dim   = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-    g->prefill_cap = prefill_chunk ? prefill_chunk : 512u;
+    g->prefill_cap = prefill_chunk ? prefill_chunk : 2048u;
     if (g->prefill_cap > ctx_size) g->prefill_cap = ctx_size;
 
     const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
@@ -50089,21 +50089,36 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
     ds4_gpu_tensor *ru = batch ? g->b_routed_up   : g->routed_up;
     ds4_gpu_tensor *rm = batch ? g->b_routed_mid  : g->routed_mid;
     ds4_gpu_tensor *rd = batch ? g->b_routed_down : g->routed_down;
-    if (!ds4_gpu_exaone_moe_matmul_tensor(rg, norm, sel, m->map, m->size,
-                                          l->ffn_gate_exps->abs_offset,
-                                          l->ffn_gate_exps->bytes,
-                                          l->ffn_gate_exps->type,
-                                          (uint32_t)n_embd, (uint32_t)n_ff_exp,
-                                          DS4_N_EXPERT, n_tok, n_used) ||
-        !ds4_gpu_exaone_moe_matmul_tensor(ru, norm, sel, m->map, m->size,
-                                          l->ffn_up_exps->abs_offset,
-                                          l->ffn_up_exps->bytes,
-                                          l->ffn_up_exps->type,
-                                          (uint32_t)n_embd, (uint32_t)n_ff_exp,
-                                          DS4_N_EXPERT, n_tok, n_used) ||
-        !ds4_gpu_exaone_swiglu_tensor(rm, rg, ru,
-                                      (uint64_t)n_tok * n_used * n_ff_exp))
-        return false;
+    /* Every route below leaves rm holding the ALREADY router-weighted mid, so
+     * the combine at the end is a plain sum for all of them. The aligned
+     * fused kernel folds gate+up+SwiGLU+weight into one launch and reads the
+     * boot-built SoA artifacts; it declines (returns 0) off its envelope --
+     * no artifacts for this tensor, or more than 16 rows -- and the
+     * separate-matmul route takes over. */
+    if (!ds4_gpu_exaone_aligned_gate_up_mid_tensor(
+                rm, norm, sel, rw, m->map, m->size,
+                l->ffn_gate_exps->abs_offset, l->ffn_gate_exps->bytes,
+                l->ffn_up_exps->abs_offset, l->ffn_up_exps->bytes,
+                l->ffn_gate_exps->type,
+                (uint32_t)n_embd, (uint32_t)n_ff_exp,
+                DS4_N_EXPERT, n_tok, n_used)) {
+        if (!ds4_gpu_exaone_moe_matmul_tensor(rg, norm, sel, m->map, m->size,
+                                              l->ffn_gate_exps->abs_offset,
+                                              l->ffn_gate_exps->bytes,
+                                              l->ffn_gate_exps->type,
+                                              (uint32_t)n_embd, (uint32_t)n_ff_exp,
+                                              DS4_N_EXPERT, n_tok, n_used) ||
+            !ds4_gpu_exaone_moe_matmul_tensor(ru, norm, sel, m->map, m->size,
+                                              l->ffn_up_exps->abs_offset,
+                                              l->ffn_up_exps->bytes,
+                                              l->ffn_up_exps->type,
+                                              (uint32_t)n_embd, (uint32_t)n_ff_exp,
+                                              DS4_N_EXPERT, n_tok, n_used) ||
+            !ds4_gpu_exaone_swiglu_weighted_tensor(rm, rg, ru, rw,
+                                                   (uint32_t)n_ff_exp,
+                                                   (uint64_t)n_tok * n_used * n_ff_exp))
+            return false;
+    }
     /* The down pass treats each (token, slot) assignment as its own
      * single-slot row, which is mmq's MoE contract for a gathered second
      * stage; `sel` is reused unchanged as the id array. */
@@ -50126,7 +50141,7 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
         !metal_graph_matmul_plain_tensor(so, m, l->ffn_down_shexp, n_ff_shexp, n_embd, sm, n_tok))
         return false;
 
-    if (!ds4_gpu_exaone_moe_combine_tensor(ffn_out, rd, rw, so,
+    if (!ds4_gpu_exaone_moe_combine_tensor(ffn_out, rd, NULL, so,
                                            (uint32_t)n_embd, n_used, n_tok))
         return false;
     return ds4_gpu_exaone_add_tensor(x, ffn_out, (uint64_t)n_tok * n_embd);
@@ -58095,6 +58110,103 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg);
 
+
+#ifndef DS4_NO_GPU
+/* KV bytes this model will hold at ctx_size, from the layer schedule rather
+ * than a uniform worst case. K-EXAONE's LLLG puts full attention on every
+ * n_swa_period-th layer and a fixed window on the rest, so only a quarter of
+ * the layers grow with context. */
+static uint64_t ds4_engine_kv_estimate_bytes(const ds4_engine *e, uint32_t ctx_size) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_EXAONE_MOE) return 0;
+    const uint64_t row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u * sizeof(uint16_t);
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    uint64_t total = 0;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        if (!e->weights.layer[il].attn_q) continue;
+        total += (uint64_t)exaone_graph_layer_kv_cap(il, ctx_size) * row;
+    }
+    return total;
+}
+
+/* Decide between a device-resident copy of the weights and reading the model
+ * mapping in place.
+ *
+ * On a coherent unified-memory device both land in the same DRAM, so this
+ * reads like a no-op -- it is not. Measured on GB10, a kernel streaming a file
+ * mapping reaches 162.9 GB/s where a cudaMalloc'd buffer reaches 234.4, and
+ * the model generates 3.96 tok/s in place against 9.45 resident. The ATS
+ * translation path costs roughly 30% of memory bandwidth, and this model is
+ * bandwidth-bound.
+ *
+ * The copy is only worth taking if it still leaves room for the KV cache and
+ * an operator floor; otherwise reading in place is what makes the context fit
+ * at all. Whichever way it goes is logged with the numbers behind it -- an
+ * engine that silently picks one is impossible to reason about later. */
+static void ds4_engine_choose_weight_residency(ds4_engine *e, uint32_t ctx_size) {
+    if (e->backend != DS4_BACKEND_CUDA) return;
+    if (!ds4_gpu_model_map_is_direct()) return;   /* discrete GPU: already copies */
+    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+        fprintf(stderr, "ds4: DS4_CUDA_DIRECT_MODEL set; reading weights in place\n");
+        return;
+    }
+    const uint64_t artifacts = ds4_gpu_derived_artifact_bytes();
+    if (artifacts != 0) {
+        /* The aligned artifacts already hold the decode-critical weights in
+         * device memory; a whole-image copy on top would duplicate them and
+         * cannot fit beside the KV cache. Tensors without an aligned format
+         * read from the mapping. */
+        fprintf(stderr,
+                "ds4: unified memory: %.2f GiB of aligned artifacts resident; "
+                "remaining weights read from the model mapping\n",
+                (double)artifacts / 1073741824.0);
+        return;
+    }
+    const uint64_t model = e->model.size;
+    const uint64_t kv = ds4_engine_kv_estimate_bytes(e, ctx_size);
+    const uint64_t floor = 8ull << 30;   /* OS, driver, workspace, page cache */
+    uint64_t mem_avail = 0;
+    {
+        FILE *f = fopen("/proc/meminfo", "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                unsigned long long kb = 0;
+                if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                    mem_avail = (uint64_t)kb * 1024ull;
+                    break;
+                }
+            }
+            fclose(f);
+        }
+    }
+    if (mem_avail == 0) return;
+    /* MemAvailable, not MemTotal: on a box where a previous load's memory has
+     * not been returned (a known driver behaviour on this platform), MemTotal
+     * says the copy fits and the OOM killer says otherwise. The chunked copy
+     * releases the source page cache as it goes, so MemAvailable -- which
+     * already counts that cache as reclaimable -- is the honest budget. */
+    const uint64_t need = model + kv + floor;
+    if (need <= mem_avail) {
+        fprintf(stderr,
+                "ds4: unified memory: copying %.2f GiB of weights to device "
+                "(KV %.2f GiB + %.0f GiB floor fits in %.2f GiB available); "
+                "the mapping path costs ~30%% of read bandwidth on this part\n",
+                (double)model / 1073741824.0, (double)kv / 1073741824.0,
+                (double)floor / 1073741824.0, (double)mem_avail / 1073741824.0);
+        ds4_gpu_model_prefer_device_copy(1);
+    } else {
+        fprintf(stderr,
+                "ds4: unified memory: reading weights in place -- a device copy "
+                "would need %.2f GiB (model %.2f + KV %.2f + floor %.0f) but "
+                "only %.2f GiB is available. Expect roughly 30%% less read "
+                "bandwidth\n",
+                (double)need / 1073741824.0, (double)model / 1073741824.0,
+                (double)kv / 1073741824.0, (double)floor / 1073741824.0,
+                (double)mem_avail / 1073741824.0);
+    }
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
 }
@@ -58749,16 +58861,39 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         (void)ds4_gpu_set_model_fd(e->model.fd);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-        /* K-EXAONE is excluded from the derived (repacked) artifact on
-         * purpose. The DGX Spark budget has no room for a second copy of the
-         * weights next to an 85 GiB model plus a 12 GiB KV cache, and the
-         * repack tier is built for DeepSeek/GLM expert layouts anyway. */
         if (e->backend == DS4_BACKEND_CUDA &&
-            DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_EXAONE_MOE &&
             !load_slice && !tp_shard && !e->ssd_streaming) {
-            (void)ds4_gpu_build_derived_artifacts(e->model.map,
-                                                  e->model.size,
-                                                  opt->model_path);
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+                /* The repack library's own catalog walk parses one file, which
+                 * for a split GGUF holds only the first shard. The engine's
+                 * merged tensor table spans all shards with offsets into the
+                 * merged mapping, so hand it over directly. The candidate
+                 * predicates then pick up what applies to this recipe:
+                 * IQ2_XXS gate/up (replace) and 2D Q8_0 dense (additive);
+                 * Q3_K down and Q4_K edge layers have no aligned format and
+                 * keep reading raw. */
+                ds4_gpu_tensor_record *recs =
+                    xcalloc(e->model.n_tensors, sizeof(*recs));
+                for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+                    const ds4_tensor *t = &e->model.tensors[i];
+                    recs[i].name = t->name.ptr;
+                    recs[i].name_len = (uint32_t)t->name.len;
+                    recs[i].type = t->type;
+                    recs[i].ndim = t->ndim;
+                    for (uint32_t d = 0; d < t->ndim && d < 4u; d++)
+                        recs[i].dims[d] = t->dim[d];
+                    recs[i].offset = t->abs_offset;
+                    recs[i].bytes = t->bytes;
+                }
+                (void)ds4_gpu_build_derived_artifacts_from_records(
+                        e->model.map, e->model.size, recs,
+                        (uint32_t)e->model.n_tensors);
+                free(recs);
+            } else {
+                (void)ds4_gpu_build_derived_artifacts(e->model.map,
+                                                      e->model.size,
+                                                      opt->model_path);
+            }
         }
 #endif
         int model_map_ok = 0;
@@ -58924,6 +59059,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
                 e->model.size - e->model.tensor_data_pos : 0;
+            ds4_engine_choose_weight_residency(
+                    e, opt->context_size > 0 ? (uint32_t)opt->context_size : 4096u);
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
                                                        e->model.size,
                                                        e->model.tensor_data_pos,
@@ -66649,6 +66786,63 @@ static bool metal_graph_eval_mixed_prefill_decode(
 }
 #endif
 
+/* Batched decode for K-EXAONE.
+ *
+ * Each session owns its graph, its workspace and its KV, so the batch is not
+ * a fused GEMM: it is N independent decodes encoded back to back on one
+ * stream, synchronized once, then read back. That is the whole win here --
+ * a single token costs roughly 2400 kernel launches, and paying one
+ * device synchronization and one readback round trip per session instead of
+ * N of them is what the concurrency numbers actually turn on.
+ *
+ * Sessions are advanced only after every encode succeeded, so a failure
+ * leaves the batch logically untouched rather than half-committed. */
+static int ds4_sessions_eval_batch_exaone(ds4_decode_item *items, int count,
+                                          char *err, size_t errlen) {
+    ds4_engine *e = items[0].session->engine;
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s->exaone_graph_ready || !s->checkpoint_valid) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "decode batch item %d has no usable exaone state", i);
+            }
+            return 1;
+        }
+        if ((uint32_t)s->checkpoint.len >= s->exaone_graph.ctx_size) {
+            if (err && errlen) {
+                snprintf(err, errlen, "decode batch item %d reached its context limit", i);
+            }
+            return 1;
+        }
+    }
+
+    bool ok = true;
+    for (int i = 0; ok && i < count; i++) {
+        ds4_session *s = items[i].session;
+        ok = exaone_graph_decode(&s->exaone_graph, &e->model, &e->weights,
+                                 items[i].token, (uint32_t)s->checkpoint.len);
+    }
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+    for (int i = 0; ok && i < count; i++) {
+        ds4_session *s = items[i].session;
+        ok = ds4_gpu_tensor_read(s->exaone_graph.logits, 0, s->logits,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (!ok) {
+        for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+        if (err && errlen) snprintf(err, errlen, "exaone batched decode failed");
+        return 1;
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        token_vec_push(&s->checkpoint, items[i].token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+    }
+    return 0;
+}
+
 static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
     if (!items || count <= 0) {
@@ -66698,6 +66892,11 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
      * cross-device events.  Encoding several independent graphs before the
      * final synchronization lets their packets fill different pipeline stages
      * while preserving the exact one-token kernels and per-session KV order. */
+    /* K-EXAONE has its own batched path below; this one encodes the DeepSeek
+     * graph, which an exaone session does not have. */
+    if (ds4_session_is_exaone(first)) {
+        return ds4_sessions_eval_batch_exaone(items, count, err, errlen);
+    }
     if (e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(first) &&
         e->support_kind == DS4_SUPPORT_NONE) {

@@ -69,6 +69,13 @@ struct ds4_repack_build_args {
     const char *log_prefix = "ds4";  /* stderr line prefix ("ds4_weight_server" | "ds4") */
     const char *model_id = "base";   /* log label */
     const char *path = nullptr;      /* GGUF path (each builder re-maps it) */
+    /* Split-GGUF source: when set, builders read tensor bytes from this
+     * already-merged mapping instead of re-mapping `path`. A split model's
+     * record offsets live in the merged address space, which no single file
+     * on disk has -- the engine's shard-aware mapping is the only place the
+     * bytes exist contiguously. */
+    const uint8_t *source_data = nullptr;
+    uint64_t source_size = 0;
     const std::vector<ds4_repack_tensor> *records = nullptr;
     int device = 0;
     uint64_t copy_chunk_bytes = 0;   /* staged read chunk (weight server --copy-chunk-mb) */
