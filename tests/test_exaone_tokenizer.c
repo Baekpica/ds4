@@ -36,7 +36,23 @@ int main(int argc, char **argv) {
             vocab.n_vocab, vocab.bos_id, vocab.eos_id, vocab.user_id,
             vocab.assistant_id, vocab.system_id);
 
-    if (argc >= 4 && strcmp(argv[2], "--file") == 0) {
+    if (argc >= 4 && strcmp(argv[2], "--chat") == 0) {
+        /* Whole-prompt assembly, for diffing against llama-tokenize run on
+         * the template rendered by hand. Args: --chat <prompt> [system] */
+        token_vec out;
+        memset(&out, 0, sizeof(out));
+        encode_chat_prompt(&vocab, argc >= 5 ? argv[4] : NULL, argv[3],
+                           DS4_THINK_HIGH, &out);
+        for (int i = 0; i < out.len; i++) printf("%s%d", i ? " " : "", out.v[i]);
+        printf("\n");
+        free(out.v);
+        memset(&out, 0, sizeof(out));
+        encode_chat_prompt(&vocab, argc >= 5 ? argv[4] : NULL, argv[3],
+                           DS4_THINK_NONE, &out);
+        for (int i = 0; i < out.len; i++) printf("%s%d", i ? " " : "", out.v[i]);
+        printf("\n");
+        free(out.v);
+    } else if (argc >= 4 && strcmp(argv[2], "--file") == 0) {
         FILE *f = fopen(argv[3], "r");
         if (!f) { perror(argv[3]); return 1; }
         char *line = NULL;

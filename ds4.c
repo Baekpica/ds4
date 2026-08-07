@@ -28527,12 +28527,61 @@ static void encode_chat_prompt_solar(
 static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
     token_vec_push(out, vocab->bos_id);
 }
+/* K-EXAONE chat assembly, from the GGUF chat template:
+ *
+ *   <|system|>\n{system}<|endofturn|>\n     (only when a system message exists)
+ *   <|user|>\n{prompt}<|endofturn|>\n
+ *   <|assistant|>\n<think>\n                (thinking)
+ *   <|assistant|>\n<think>\n\n</think>\n\n  (not thinking)
+ *
+ * No BOS: the template does not emit one and the GGUF sets no
+ * add_bos_token, which was checked against llama-tokenize rather than
+ * assumed -- it returns the same ids with and without --no-bos. */
+static void encode_chat_prompt_exaone(
+        const ds4_vocab *vocab,
+        const char      *system,
+        const char      *prompt,
+        ds4_think_mode   think_mode,
+        token_vec       *out) {
+    if (vocab->user_id < 0 || vocab->assistant_id < 0 || vocab->eos_id < 0 ||
+        vocab->think_start_id < 0 || vocab->think_end_id < 0) {
+        ds4_die("this tokenizer does not provide the K-EXAONE chat markers");
+    }
+    if (system && system[0]) {
+        if (vocab->system_id < 0) ds4_die("K-EXAONE tokenizer has no <|system|>");
+        token_vec_push(out, vocab->system_id);
+        chat_push_fragment(vocab, "\n", system, out);
+        token_vec_push(out, vocab->eos_id);
+        chat_push_fragment(vocab, "\n", NULL, out);
+    }
+    token_vec_push(out, vocab->user_id);
+    chat_push_fragment(vocab, "\n", prompt, out);
+    token_vec_push(out, vocab->eos_id);
+    chat_push_fragment(vocab, "\n", NULL, out);
+    token_vec_push(out, vocab->assistant_id);
+    chat_push_fragment(vocab, "\n", NULL, out);
+    token_vec_push(out, vocab->think_start_id);
+    if (ds4_think_mode_enabled(think_mode)) {
+        chat_push_fragment(vocab, "\n", NULL, out);
+    } else {
+        /* The template closes the thinking block immediately rather than
+         * omitting it, so the model still enters through <think>. */
+        chat_push_fragment(vocab, "\n\n", NULL, out);
+        token_vec_push(out, vocab->think_end_id);
+        chat_push_fragment(vocab, "\n\n", NULL, out);
+    }
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+        encode_chat_prompt_exaone(vocab, system, prompt, think_mode, out);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
         if (vocab->bos_id < 0 || vocab->system_id < 0 || vocab->user_id < 0 ||
             vocab->assistant_id < 0 || vocab->start_of_turn_id < 0 ||
