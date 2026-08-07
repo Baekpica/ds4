@@ -28151,6 +28151,11 @@ struct ds4_session {
     void *display_progress_ud;
     uint32_t prefill_cap;
     int ctx_size;
+    /* Inc 5a: content generation (see ds4_session_generation in ds4.h).
+     * Bumped at create/invalidate/rewind-below/rebuild/payload-load; pure
+     * extension leaves it alone so (generation, checkpoint.len) identifies
+     * exact committed content. */
+    uint64_t generation;
     bool checkpoint_valid;
     bool mtp_draft_valid;
     /* S6 lazy session graph: graph alloc deferred to the first GPU-touching
@@ -31930,6 +31935,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
+    s->generation++;   /* Inc 5a: content replaced from disk (even on failure
+                        * the old checkpoint is no longer trustworthy) */
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
@@ -32777,6 +32784,10 @@ struct ds4_batch_ctx {
     int            *bank_hist;       /* max_seq * raw_cap */
     uint32_t       *bank_hist_len;   /* committed tokens per bank */
     uint8_t        *bank_hist_valid;
+    /* Inc 5a: per-bank lineage generation (see ds4_batch_ctx_bank_generation
+     * in ds4.h).  Bumped at every site that replaces or invalidates a bank's
+     * committed content; never on pure extension. */
+    uint64_t       *bank_gen;
     uint64_t        warm_admits;     /* observability + gate hooks */
     uint64_t        warm_rejects;    /* n_cached>0 admits that degraded to cold */
     uint64_t        fork_admits;     /* A2b: fork_bank>0 admits served by copy (or */
@@ -33044,6 +33055,7 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
         return 1;
     }
     int *hist = ctx->bank_hist + (uint64_t)bank * ctx->seq_cap;
+    ctx->bank_gen[bank]++;            /* Inc 5a: restore replaces content */
     ctx->bank_hist_valid[bank] = 0;   /* not trustworthy until fully restored */
     ctx->bank_hist_len[bank] = 0;
     for (uint32_t i = 0; i < saved_tokens; i++) {
@@ -33181,6 +33193,7 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
         g->ms_n_index_comp[bank][il] = n_index_comp[il];
     }
     g->ms_emit_keep[bank] = 0;   /* no partial-fork suppression on a restore */
+    ctx->bank_gen[bank]++;   /* Inc 5a: restored content is a new lineage */
     ctx->bank_hist_len[bank] = saved_tokens;
     ctx->bank_hist_valid[bank] = 1;
     return 0;
@@ -33606,6 +33619,7 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         }
         const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
         if (got == 0) continue;                /* floor-resident: content intact, keep it */
+        ctx->bank_gen[v]++;                    /* Inc 5a: trim destroys content */
         ctx->bank_hist_valid[v] = 0u;
         ctx->bank_hist_len[v]   = 0u;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -33917,6 +33931,9 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     ctx->bank_hist       = xmalloc((size_t)ctx->max_seq * ctx->seq_cap * sizeof(int));
     ctx->bank_hist_len   = xcalloc(ctx->max_seq, sizeof(uint32_t));
     ctx->bank_hist_valid = xcalloc(ctx->max_seq, sizeof(uint8_t));
+    /* Inc 5a: generations start at 1 (0 = "no bank" to registry readers). */
+    ctx->bank_gen        = xmalloc((size_t)ctx->max_seq * sizeof(uint64_t));
+    for (uint32_t bg = 0; bg < ctx->max_seq; bg++) ctx->bank_gen[bg] = 1u;
     /* P1: one stashed compressed row per (bank, layer) for the partial-fork
      * boundary-row restore (see ms_emit_keep).  Tiny vs the slabs
      * (max_seq x n_layer x head_dim floats); allocated unconditionally so the
@@ -33976,6 +33993,7 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     free(ctx->bank_hist);
     free(ctx->bank_hist_len);
     free(ctx->bank_hist_valid);
+    free(ctx->bank_gen);
     free(ctx);
 }
 
@@ -33984,15 +34002,21 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
  * Appends happen exactly where the cache commits; anything that touches the
  * bank slabs without this bookkeeping must invalidate. */
 static void bank_hist_reset(ds4_batch_ctx *ctx, uint32_t b) {
+    ctx->bank_gen[b]++;   /* Inc 5a: lineage replacement */
     ctx->bank_hist_len[b] = 0u;
     ctx->bank_hist_valid[b] = 1u;
 }
 static void bank_hist_invalidate_all(ds4_batch_ctx *ctx) {
+    for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b]++;   /* Inc 5a */
     memset(ctx->bank_hist_valid, 0, (size_t)ctx->max_seq);
 }
 static void bank_hist_append(ds4_batch_ctx *ctx, uint32_t b, int tok) {
     if (!ctx->bank_hist_valid[b]) return;
-    if (ctx->bank_hist_len[b] >= ctx->seq_cap) { ctx->bank_hist_valid[b] = 0u; return; }
+    if (ctx->bank_hist_len[b] >= ctx->seq_cap) {
+        ctx->bank_gen[b]++;   /* Inc 5a: capacity overflow invalidates */
+        ctx->bank_hist_valid[b] = 0u;
+        return;
+    }
     ctx->bank_hist[(size_t)b * ctx->seq_cap + ctx->bank_hist_len[b]++] = tok;
 }
 static void bank_hist_append_n(ds4_batch_ctx *ctx, uint32_t b, const int *tok, uint32_t n) {
@@ -34105,6 +34129,7 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
     }
     memcpy(ctx->bank_hist + (size_t)dst * ctx->seq_cap,
            ctx->bank_hist + (size_t)src * ctx->seq_cap, (size_t)P * sizeof(int));
+    ctx->bank_gen[dst]++;   /* Inc 5a: fork-by-copy replaces dst's lineage */
     ctx->bank_hist_len[dst]   = (uint32_t)P;
     ctx->bank_hist_valid[dst] = 1u;
     /* v0.5.5 (task #14): the boundary-row suppression travels with the
@@ -34365,6 +34390,9 @@ static bool bank_fork_copy_cut(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst, u
     if (dst != src)
         memcpy(ctx->bank_hist + (size_t)dst * ctx->seq_cap,
                ctx->bank_hist + (size_t)src * ctx->seq_cap, (size_t)R * sizeof(int));
+    /* Inc 5a: partial fork replaces dst's lineage; the src==dst in-place
+     * truncate-reuse is the textbook regrow-to-old-length ABA -- bump both. */
+    ctx->bank_gen[dst]++;
     ctx->bank_hist_len[dst]   = R;
     ctx->bank_hist_valid[dst] = 1u;
     g->ms_emit_keep[dst] = R / 4u + 1u;            /* ratio-4 row threshold only */
@@ -34377,6 +34405,12 @@ int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int *
     if (!ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0u) return 0;
     if (toks) *toks = ctx->bank_hist + (size_t)bank * ctx->seq_cap;
     return (int)ctx->bank_hist_len[bank];
+}
+
+uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) {
+    if (!ctx || bank < 0 || (uint32_t)bank >= ctx->max_seq || !ctx->bank_gen)
+        return 0u;
+    return ctx->bank_gen[bank];
 }
 
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) {
@@ -36100,6 +36134,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                      * bank_unknown (a reset died mid-flight) quarantines the
                      * bank instead: history invalid, next install resets. */
                     if (bank_unknown) {
+                        ctx->bank_gen[b]++;   /* Inc 5a: quarantine */
                         ctx->bank_hist_valid[b] = 0u;
                     } else {
                         memcpy(g->ms_n_comp[b],       snap_comp,  sizeof snap_comp);
@@ -36487,6 +36522,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     for (uint32_t j = 0; j < M; j++)
                         bank_hist_append(ctx, b, vqtok[f + j]);
                 } else {
+                    ctx->bank_gen[b]++;   /* Inc 5a: deferred-commit invalidate */
                     ctx->bank_hist_valid[b] = 0u;
                 }
             }
@@ -38154,6 +38190,7 @@ int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_t
 }
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) { (void)ctx; }
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) { (void)ctx; (void)bank; return 0u; }
 int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
@@ -39005,6 +39042,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;
         s->ctx_size = ctx_size;
+        s->generation = 1u;   /* Inc 5a: 0 is reserved for "no session" */
         s->prefill_cap = ds4_default_prefill_cap_for_prompt(ctx_size);
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
@@ -39020,6 +39058,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
+    s->generation = 1u;   /* Inc 5a: 0 is reserved for "no session" */
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     /* S6 lazy graph: defer the ~2-4 GiB graph alloc to first GPU use unless
      * disabled or this is a distributed coordinator (whose dist session is
@@ -39547,6 +39586,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
+        /* Inc 5a: the distributed path manages the checkpoint internally, so
+         * the generation cannot distinguish extend from rebuild here.  Bump
+         * conservatively: readers degrade to full replay, never to a stale
+         * frontier.  (Serving on the GB10 boxes is single-GPU; this path is
+         * not gated.) */
+        s->generation++;
         return ds4_dist_session_sync(s->distributed,
                                      s,
                                      checkpoint,
@@ -39580,6 +39625,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return 0;
         }
 
+        s->generation++;   /* Inc 5a: non-extending sync rebuilds content */
         session_cpu_reset_cache(s);
         prefill_layer_major_cpu(s->logits,
                                 &e->model,
@@ -39660,6 +39706,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 
     bool ok;
+    s->generation++;   /* Inc 5a: non-extending sync rebuilds content */
     s->checkpoint_valid = false;
     s->mtp_draft_valid = false;
     if (!metal_graph_reset_prefill_state(&s->graph)) {
@@ -41412,6 +41459,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+    s->generation++;   /* Inc 5a: committed content discarded */
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
@@ -41420,12 +41468,20 @@ void ds4_session_invalidate(ds4_session *s) {
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    /* Inc 5a: a strict truncation lets a later extension regrow to an old
+     * position with different content -- the exact ABA the generation
+     * exists to catch. */
+    if (pos < s->checkpoint.len) s->generation++;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
 }
 
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
+}
+
+uint64_t ds4_session_generation(const ds4_session *s) {
+    return s ? s->generation : 0u;
 }
 
 int ds4_session_ctx(ds4_session *s) {

@@ -564,6 +564,9 @@ typedef struct {
 static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats);
 static bool tool_memory_has_id(server *s, const char *id);
+/* Inc 5a: id-mint uniqueness = tool memory OR any continuation-registry
+ * record (a REPLAY_ONLY record's ids can outlive their memory entries). */
+static bool tool_id_in_use(server *s, const char *id);
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
 
 typedef struct {
@@ -5416,7 +5419,7 @@ static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
         for (;;) {
             random_tool_id(id, sizeof(id), API_OPENAI);
             if (!openai_tool_stream_has_id(ts, id, index) &&
-                !tool_memory_has_id(s, id)) break;
+                !tool_id_in_use(s, id)) break;
         }
         ts->ids[index] = xstrdup(id);
     }
@@ -7441,7 +7444,7 @@ static const char *anthropic_tool_stream_id(server *s, anthropic_tool_stream *ts
         for (;;) {
             random_tool_id(id, sizeof(id), API_ANTHROPIC);
             if (!anthropic_tool_stream_has_id(ts, id, index) &&
-                !tool_memory_has_id(s, id)) break;
+                !tool_id_in_use(s, id)) break;
         }
         ts->ids[index] = xstrdup(id);
     }
@@ -8068,6 +8071,11 @@ struct tool_memory_entry {
     size_t bytes;
     uint64_t stamp;
     tool_memory_source source;
+    /* Inc 5a (plan §4.6): strong-reference count from LIVE_FRONTIER
+     * continuation records.  While pinned the LRU prune walks past this
+     * entry -- the exact DSML for a live tool frontier must never be
+     * independently evicted.  Records unpin on LIVE -> REPLAY_ONLY. */
+    int pins;
     tool_memory_entry *prev;
     tool_memory_entry *next;
     tool_memory_entry *block_next;
@@ -8114,6 +8122,68 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+/* =========================================================================
+ * Continuation registry (v0.5.6 API Inc 5a, plan §4.6).
+ * =========================================================================
+ *
+ * One record per tool-call turn, owning the turn's execution reference
+ * (owner + engine generation + committed frontier) and strong references to
+ * its exact sampled DSML in tool memory.  All call IDs minted by the turn
+ * point at the record through by_call_id, keyed (protocol, call_id) --
+ * knowledge of an id in one protocol namespace never resolves another's
+ * (plan §4.6 collision/bleed).  The whole server is ONE trust domain: there
+ * is no tenant/auth namespace, so the trust_namespace component of the plan's
+ * key is a constant (documented restriction until an authenticated namespace
+ * exists).
+ *
+ * States: LIVE_FRONTIER holds a usable execution reference and pins its DSML
+ * entries against LRU pruning; REPLAY_ONLY keeps only the id index + normal
+ * (unpinned) DSML references so a full-history replay stays exact while the
+ * live continuation honestly 409s.
+ *
+ * The execution reference is revalidated at worker admission under gen_mu
+ * with pure equality: owner generation (engine-authoritative, Inc 5a) and
+ * committed frontier.  The old singletons compared only the frontier
+ * position -- a session rebuilt to the same pos revalidated a dead binding
+ * (ABA); the generation closes that.
+ *
+ * Locking: records and index live under tool_mu -- the same lock as tool
+ * memory, REQUIRED for atomic DSML pin/unpin, and deliberately separate from
+ * the engine/queue locks (gen_mu, s->mu): parser threads validate ids
+ * without ever contending GPU work.  Nothing here scans server.warm. */
+
+typedef enum {
+    CONT_REC_LIVE_FRONTIER = 0,
+    CONT_REC_REPLAY_ONLY   = 1,
+} cont_record_state;
+
+typedef enum {
+    CONT_OWNER_SERIAL_SESSION = 0,
+    CONT_OWNER_BATCH_BANK     = 1,   /* published by the cont path (Inc 5c) */
+} cont_record_owner;
+
+typedef struct cont_record {
+    uint8_t  state;       /* cont_record_state */
+    uint8_t  owner;       /* cont_record_owner */
+    uint8_t  protocol;    /* api_style: the call-id namespace */
+    int      owner_id;    /* bank index for BATCH_BANK; 0 for the session */
+    uint64_t owner_gen;   /* engine generation at publication */
+    int      frontier;    /* committed tokens at publication */
+    stop_list call_ids;   /* ids minted by this turn */
+    double   publish_time;
+    int      hard_refs;   /* Inc 5b: queued T2 pins (always 0 in 5a) */
+    struct cont_record *prev, *next;   /* publication order, newest at head */
+} cont_record;
+
+typedef struct {
+    rax *by_call_id;            /* "<proto>\x1f<id>" -> cont_record* */
+    cont_record *head, *tail;   /* newest at head */
+    int n_records;
+    int n_live;
+    int max_records;            /* DS4_CONT_REGISTRY_MAX, default 64 */
+    cont_record *serial_live;   /* at most one LIVE serial record */
+} cont_registry;
+
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 static bool client_disconnected(int fd);   /* zombie-reap probe (defined below) */
@@ -8124,8 +8194,11 @@ struct server {
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
+    /* Inc 5a: generation-checked continuation records (under tool_mu).  The
+     * registry owns call-id resolution; the live singletons below keep only
+     * their VISIBLE-prefix cache-hint roles (advisory, no protocol binding). */
+    cont_registry creg;
     live_tool_state responses_live;
-    live_tool_state anthropic_live;
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
@@ -8448,10 +8521,19 @@ static void tool_memory_remove_entry_locked(tool_memory *m, tool_memory_entry *e
 }
 
 static void tool_memory_prune_locked(tool_memory *m) {
+    /* Inc 5a: pinned entries (strong refs from LIVE continuation records)
+     * are skipped, not evicted -- the walk continues toward the head so the
+     * budget still shrinks via older unpinned entries.  If every remaining
+     * entry is pinned the prune stops over budget; pins are bounded by the
+     * registry's LIVE record set (at most one serial record today), so this
+     * cannot grow unboundedly. */
+    tool_memory_entry *e = m->tail;
     while ((m->entries > tool_memory_max_entries(m) ||
-            m->bytes > tool_memory_max_bytes(m)) && m->tail)
+            m->bytes > tool_memory_max_bytes(m)) && e)
     {
-        tool_memory_remove_entry_locked(m, m->tail);
+        tool_memory_entry *prev = e->prev;
+        if (e->pins <= 0) tool_memory_remove_entry_locked(m, e);
+        e = prev;
     }
 }
 
@@ -8509,6 +8591,236 @@ static void tool_memory_free(tool_memory *m) {
     if (m->by_id) raxFree(m->by_id);
     if (m->by_block) raxFree(m->by_block);
     memset(m, 0, sizeof(*m));
+}
+
+/* -------------------------------------------------------------------------
+ * Continuation registry implementation (Inc 5a; see the typedef block above
+ * for the design).  Every _locked function runs under s->tool_mu. */
+
+#define CONT_REGISTRY_MAX_DEFAULT 64
+
+/* (protocol, call_id) index key.  The 0x1f separator cannot appear in a
+ * minted or client-supplied printable id, so namespaces cannot alias. */
+static size_t cont_registry_key(char *buf, size_t cap, uint8_t proto,
+                                const char *id) {
+    size_t idlen = strlen(id);
+    if (idlen > cap - 2) idlen = cap - 2;
+    buf[0] = (char)('0' + proto);
+    buf[1] = 0x1f;
+    memcpy(buf + 2, id, idlen);
+    return idlen + 2;
+}
+
+static void cont_registry_init_locked(cont_registry *r) {
+    if (r->by_call_id) return;
+    r->by_call_id = raxNew();
+    if (r->max_records <= 0) r->max_records = CONT_REGISTRY_MAX_DEFAULT;
+}
+
+static void cont_registry_gauge_locked(const cont_registry *r) {
+    ds4_metric_set(&ds4_metrics_get()->creg_records_live, (uint64_t)r->n_live);
+}
+
+static cont_record *cont_registry_find_locked(cont_registry *r, uint8_t proto,
+                                              const char *id) {
+    if (!r->by_call_id || !id || !id[0]) return NULL;
+    char key[96];
+    const size_t klen = cont_registry_key(key, sizeof(key), proto, id);
+    void *v = raxFind(r->by_call_id, (unsigned char *)key, klen);
+    return v == raxNotFound ? NULL : v;
+}
+
+/* Remove rec's rows from the id index.  A row is dropped only when it still
+ * points at rec: a later record that legitimately re-bound an id (mint
+ * uniqueness makes this near-impossible, but the index must stay correct
+ * regardless) keeps its row. */
+static void cont_registry_drop_index_locked(cont_registry *r,
+                                            const cont_record *rec) {
+    if (!r->by_call_id) return;
+    for (int i = 0; i < rec->call_ids.len; i++) {
+        char key[96];
+        const size_t klen = cont_registry_key(key, sizeof(key), rec->protocol,
+                                              rec->call_ids.v[i]);
+        void *v = raxFind(r->by_call_id, (unsigned char *)key, klen);
+        if (v != raxNotFound && v == (const void *)rec) {
+            void *old = NULL;
+            (void)raxRemove(r->by_call_id, (unsigned char *)key, klen, &old);
+        }
+    }
+}
+
+/* LIVE_FRONTIER -> REPLAY_ONLY: the execution reference is gone; the id
+ * index and (now unpinned) DSML references stay for exact full replay. */
+static void cont_registry_demote_locked(server *s, cont_record *rec) {
+    if (!rec || rec->state != CONT_REC_LIVE_FRONTIER) return;
+    rec->state = CONT_REC_REPLAY_ONLY;
+    for (int i = 0; i < rec->call_ids.len; i++) {
+        tool_memory_entry *e =
+            tool_memory_find_entry_locked(&s->tool_mem, rec->call_ids.v[i]);
+        if (e && e->pins > 0) e->pins--;
+    }
+    if (s->creg.serial_live == rec) s->creg.serial_live = NULL;
+    if (s->creg.n_live > 0) s->creg.n_live--;
+    ds4_metric_add(&ds4_metrics_get()->creg_demoted, 1);
+    cont_registry_gauge_locked(&s->creg);
+}
+
+static void cont_registry_remove_locked(server *s, cont_record *rec) {
+    cont_registry *r = &s->creg;
+    cont_registry_demote_locked(s, rec);   /* unpin if somehow still LIVE */
+    cont_registry_drop_index_locked(r, rec);
+    if (rec->prev) rec->prev->next = rec->next; else r->head = rec->next;
+    if (rec->next) rec->next->prev = rec->prev; else r->tail = rec->prev;
+    if (r->n_records > 0) r->n_records--;
+    stop_list_clear(&rec->call_ids);
+    free(rec->call_ids.v);
+    free(rec);
+}
+
+/* Bounded store: beyond the cap evict oldest REPLAY_ONLY records first.
+ * LIVE records and hard-pinned records (Inc 5b) are never cap-evicted. */
+static void cont_registry_prune_locked(server *s) {
+    cont_registry *r = &s->creg;
+    cont_record *rec = r->tail;
+    while (r->n_records > r->max_records && rec) {
+        cont_record *prev = rec->prev;
+        if (rec->state == CONT_REC_REPLAY_ONLY && rec->hard_refs <= 0)
+            cont_registry_remove_locked(s, rec);
+        rec = prev;
+    }
+}
+
+/* Publish one record for a serial tool-call turn.  Caller runs this AFTER
+ * assign_tool_call_ids + tool_memory_remember (the DSML entries must exist
+ * to take the strong references) with the engine's post-turn generation and
+ * frontier.  The serial session has exactly one tip, so a new publication
+ * supersedes the previous serial LIVE record (plan §4.6: one record per
+ * turn). */
+static void cont_registry_publish_serial(server *s, api_style proto,
+                                         const tool_calls *calls,
+                                         uint64_t gen, int frontier) {
+    if (!s || !calls || calls->len == 0 || gen == 0 || frontier <= 0) return;
+    pthread_mutex_lock(&s->tool_mu);
+    cont_registry *r = &s->creg;
+    cont_registry_init_locked(r);
+    if (r->serial_live) cont_registry_demote_locked(s, r->serial_live);
+
+    cont_record *rec = xmalloc(sizeof(*rec));
+    memset(rec, 0, sizeof(*rec));
+    rec->state = CONT_REC_LIVE_FRONTIER;
+    rec->owner = CONT_OWNER_SERIAL_SESSION;
+    rec->protocol = (uint8_t)proto;
+    rec->owner_gen = gen;
+    rec->frontier = frontier;
+    rec->publish_time = now_sec();
+    for (int i = 0; i < calls->len; i++) {
+        if (calls->v[i].id && calls->v[i].id[0])
+            id_list_push_unique(&rec->call_ids, calls->v[i].id);
+    }
+    if (rec->call_ids.len == 0) {
+        free(rec->call_ids.v);
+        free(rec);
+        pthread_mutex_unlock(&s->tool_mu);
+        return;
+    }
+    for (int i = 0; i < rec->call_ids.len; i++) {
+        char key[96];
+        const size_t klen = cont_registry_key(key, sizeof(key), rec->protocol,
+                                              rec->call_ids.v[i]);
+        void *displaced = NULL;
+        (void)raxInsert(r->by_call_id, (unsigned char *)key, klen, rec,
+                        &displaced);
+        tool_memory_entry *e =
+            tool_memory_find_entry_locked(&s->tool_mem, rec->call_ids.v[i]);
+        if (e) e->pins++;   /* strong DSML reference while LIVE */
+    }
+    rec->next = r->head;
+    rec->prev = NULL;
+    if (r->head) r->head->prev = rec; else r->tail = rec;
+    r->head = rec;
+    r->n_records++;
+    r->n_live++;
+    r->serial_live = rec;
+    cont_registry_prune_locked(s);
+    ds4_metric_add(&ds4_metrics_get()->creg_published, 1);
+    cont_registry_gauge_locked(r);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+/* The serial session's tip no longer matches its LIVE record (a
+ * non-continuation request won the session, the turn errored, or the
+ * session was freed).  Eager honesty: the generation check would also catch
+ * it at resolve time, but LIVE must mean "usable now" for 5b's grace/pin
+ * policy to be meaningful. */
+static void cont_registry_demote_serial(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->tool_mu);
+    if (s->creg.serial_live)
+        cont_registry_demote_locked(s, s->creg.serial_live);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+/* Parser-side validation: is this id bound to a LIVE frontier right now?
+ * Advisory (the worker revalidates at admission); protocol-scoped so an id
+ * leaked across surfaces never validates (plan §4.6 collision/bleed). */
+static bool cont_registry_live_has_id(server *s, api_style proto,
+                                      const char *id) {
+    if (!s || !id || !id[0]) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto, id);
+    const bool ok = rec && rec->state == CONT_REC_LIVE_FRONTIER;
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+/* Worker admission resolve: exact set-equality on the turn's ids plus
+ * equality on the engine execution reference (owner generation + committed
+ * frontier).  Runs under gen_mu (worker thread), so the session cannot move
+ * between this check and the continuation prefill. */
+static bool cont_registry_resolve_serial(server *s, api_style proto,
+                                         const stop_list *ids,
+                                         uint64_t session_gen, int live_pos) {
+    if (!s || !ids || ids->len == 0 || session_gen == 0) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto,
+                                                 ids->v[0]);
+    bool ok = rec &&
+              rec->state == CONT_REC_LIVE_FRONTIER &&
+              rec->owner == CONT_OWNER_SERIAL_SESSION &&
+              rec->protocol == (uint8_t)proto &&
+              rec->call_ids.len == ids->len &&
+              rec->owner_gen == session_gen &&
+              rec->frontier == live_pos;
+    for (int i = 0; ok && i < ids->len; i++)
+        ok = id_list_contains(&rec->call_ids, ids->v[i]);
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+/* Mint uniqueness: an id is in use while ANY record (any protocol, any
+ * state) still references it -- a REPLAY_ONLY record's ids can outlive
+ * their tool-memory entries, and re-minting one would corrupt the index. */
+static bool cont_registry_id_known(server *s, const char *id) {
+    if (!s || !id || !id[0]) return false;
+    static const uint8_t protos[] = { API_OPENAI, API_ANTHROPIC, API_RESPONSES };
+    pthread_mutex_lock(&s->tool_mu);
+    bool found = false;
+    for (size_t i = 0; !found && i < sizeof(protos) / sizeof(protos[0]); i++)
+        found = cont_registry_find_locked(&s->creg, protos[i], id) != NULL;
+    pthread_mutex_unlock(&s->tool_mu);
+    return found;
+}
+
+static bool tool_id_in_use(server *s, const char *id) {
+    return tool_memory_has_id(s, id) || cont_registry_id_known(s, id);
+}
+
+static void cont_registry_free(server *s) {
+    pthread_mutex_lock(&s->tool_mu);
+    while (s->creg.head) cont_registry_remove_locked(s, s->creg.head);
+    if (s->creg.by_call_id) raxFree(s->creg.by_call_id);
+    memset(&s->creg, 0, sizeof(s->creg));
+    pthread_mutex_unlock(&s->tool_mu);
 }
 
 /* Single live protocol-tool state.
@@ -8585,18 +8897,6 @@ static void responses_live_remember(server *s, const char *visible_text,
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void anthropic_live_remember(server *s, const tool_calls *calls) {
-    if (!s || !calls || calls->len == 0) return;
-    pthread_mutex_lock(&s->tool_mu);
-    live_tool_state_clear_locked(&s->anthropic_live);
-    for (int i = 0; i < calls->len; i++) {
-        id_list_push_unique(&s->anthropic_live.call_ids, calls->v[i].id);
-    }
-    s->anthropic_live.live_tokens = ds4_session_pos(s->session);
-    s->anthropic_live.valid = s->anthropic_live.call_ids.len > 0;
-    pthread_mutex_unlock(&s->tool_mu);
-}
-
 static void responses_live_clear(server *s) {
     if (!s) return;
     pthread_mutex_lock(&s->tool_mu);
@@ -8604,57 +8904,16 @@ static void responses_live_clear(server *s) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void anthropic_live_clear(server *s) {
-    if (!s) return;
-    pthread_mutex_lock(&s->tool_mu);
-    live_tool_state_clear_locked(&s->anthropic_live);
-    pthread_mutex_unlock(&s->tool_mu);
-}
-
+/* Inc 5a: call-id resolution migrated to the continuation registry (the
+ * singletons' call_ids are write-only debug state until the 5c cleanup;
+ * the anthropic singleton -- which had ONLY the call-id role -- is gone).
+ * Names kept: parsers still ask the same two questions. */
 static bool responses_live_has_call_id(server *s, const char *id) {
-    if (!s || !id || !id[0]) return false;
-    pthread_mutex_lock(&s->tool_mu);
-    bool found = s->responses_live.valid &&
-                 id_list_contains(&s->responses_live.call_ids, id);
-    pthread_mutex_unlock(&s->tool_mu);
-    return found;
+    return cont_registry_live_has_id(s, API_RESPONSES, id);
 }
 
 static bool anthropic_live_has_call_id(server *s, const char *id) {
-    if (!s || !id || !id[0]) return false;
-    pthread_mutex_lock(&s->tool_mu);
-    bool found = s->anthropic_live.valid &&
-                 id_list_contains(&s->anthropic_live.call_ids, id);
-    pthread_mutex_unlock(&s->tool_mu);
-    return found;
-}
-
-static bool responses_live_matches_request(server *s, const stop_list *ids,
-                                           int live_tokens) {
-    if (!s || !ids || ids->len == 0) return false;
-    pthread_mutex_lock(&s->tool_mu);
-    bool ok = s->responses_live.valid &&
-              s->responses_live.live_tokens == live_tokens &&
-              s->responses_live.call_ids.len == ids->len;
-    for (int i = 0; ok && i < ids->len; i++) {
-        ok = id_list_contains(&s->responses_live.call_ids, ids->v[i]);
-    }
-    pthread_mutex_unlock(&s->tool_mu);
-    return ok;
-}
-
-static bool anthropic_live_matches_request(server *s, const stop_list *ids,
-                                           int live_tokens) {
-    if (!s || !ids || ids->len == 0) return false;
-    pthread_mutex_lock(&s->tool_mu);
-    bool ok = s->anthropic_live.valid &&
-              s->anthropic_live.live_tokens == live_tokens &&
-              s->anthropic_live.call_ids.len == ids->len;
-    for (int i = 0; ok && i < ids->len; i++) {
-        ok = id_list_contains(&s->anthropic_live.call_ids, ids->v[i]);
-    }
-    pthread_mutex_unlock(&s->tool_mu);
-    return ok;
+    return cont_registry_live_has_id(s, API_ANTHROPIC, id);
 }
 
 static bool tool_memory_has_id(server *s, const char *id) {
@@ -8773,7 +9032,7 @@ static void assign_tool_call_ids(server *s, tool_calls *calls, api_style api) {
         char id[64];
         for (;;) {
             random_tool_id(id, sizeof(id), api);
-            if (!tool_calls_contains_id(calls, id, i) && !tool_memory_has_id(s, id)) break;
+            if (!tool_calls_contains_id(calls, id, i) && !tool_id_in_use(s, id)) break;
         }
         calls->v[i].id = xstrdup(id);
     }
@@ -9889,8 +10148,10 @@ static int live_text_prefix_prompt(server *s, const request *req,
  *
  * Some clients send just the new tool outputs after a tool call.  There is no
  * long visible prefix to match in that shape; the call_id itself is the
- * protocol binding to the previous live assistant output.  Use it only when the
- * remembered live frontier and call-id set match exactly. */
+ * protocol binding to the previous live assistant output.  Use it only when
+ * the registry record's execution reference (engine generation + committed
+ * frontier, Inc 5a) and call-id set match exactly -- a session rebuilt to
+ * the same position no longer revalidates a dead binding. */
 static int responses_live_continuation_prompt(server *s, const request *req,
                                               int live_pos,
                                               ds4_tokens *effective_prompt,
@@ -9898,8 +10159,10 @@ static int responses_live_continuation_prompt(server *s, const request *req,
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_RESPONSES || !req->responses_live_suffix_text) return 0;
     if (req->responses_live_call_ids.len == 0) return 0;
-    if (!responses_live_matches_request(s, &req->responses_live_call_ids,
-                                        live_pos)) return 0;
+    if (!cont_registry_resolve_serial(s, API_RESPONSES,
+                                      &req->responses_live_call_ids,
+                                      ds4_session_generation(s->session),
+                                      live_pos)) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
@@ -9908,15 +10171,17 @@ static int responses_live_continuation_prompt(server *s, const request *req,
         s->engine, live_tokens, req->responses_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
+    ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
     return live_tokens->len;
 }
 
 /* Tool-result Anthropic continuation.
  *
  * /v1/messages has no server-side response object like the OpenAI Responses
- * API, but its tool_use_id is still a precise continuation handle inside a live
- * local agent loop.  When the IDs and live token frontier match, continue from
- * the sampled DSML state and append only the user tool_result suffix. */
+ * API, but its tool_use_id is still a precise continuation handle inside a
+ * live local agent loop.  When the registry record's ids and execution
+ * reference (generation + frontier, Inc 5a) match, continue from the sampled
+ * DSML state and append only the user tool_result suffix. */
 static int anthropic_live_continuation_prompt(server *s, const request *req,
                                               int live_pos,
                                               ds4_tokens *effective_prompt,
@@ -9924,8 +10189,10 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
     if (req->anthropic_live_call_ids.len == 0) return 0;
-    if (!anthropic_live_matches_request(s, &req->anthropic_live_call_ids,
-                                        live_pos)) return 0;
+    if (!cont_registry_resolve_serial(s, API_ANTHROPIC,
+                                      &req->anthropic_live_call_ids,
+                                      ds4_session_generation(s->session),
+                                      live_pos)) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
@@ -9934,6 +10201,7 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
         s->engine, live_tokens, req->anthropic_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
+    ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
     return live_tokens->len;
 }
 
@@ -10978,8 +11246,10 @@ static void generate_job(server *s, job *j) {
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
     if (cached > 0) {
         responses_live_match = "visible-prefix";
-        if (responses_live_matches_request(s, &j->req.responses_live_call_ids,
-                                           old_pos))
+        if (cont_registry_resolve_serial(s, API_RESPONSES,
+                                         &j->req.responses_live_call_ids,
+                                         ds4_session_generation(s->session),
+                                         old_pos))
         {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
@@ -11007,11 +11277,13 @@ static void generate_job(server *s, job *j) {
     if (cached == 0 && responses_protocol &&
         j->req.responses_requires_live_tool_state)
     {
-        /* The parser saw a valid live call_id, but by worker execution time the
-         * live frontier no longer matches.  Since the request did not replay
-         * the prior assistant call, there is no stateless prefix to match and
-         * no disk key to search by. */
+        /* The parser saw a valid live call_id, but by worker execution time
+         * the registry no longer resolves it (demoted, superseded, or the
+         * generation/frontier moved).  Since the request did not replay the
+         * prior assistant call, there is no stateless prefix to match and no
+         * disk key to search by.  Inc 5a: this IS the registry miss. */
         ds4_tokens_free(&effective_prompt);
+        ds4_metric_add(&ds4_metrics_get()->creg_missed, 1);
         wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 409,
                         "Responses continuation state is not available; retry by replaying the full input history");
         return;
@@ -11019,6 +11291,7 @@ static void generate_job(server *s, job *j) {
                j->req.anthropic_requires_live_tool_state)
     {
         ds4_tokens_free(&effective_prompt);
+        ds4_metric_add(&ds4_metrics_get()->creg_missed, 1);
         wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 409,
                         "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
@@ -11232,8 +11505,12 @@ static void generate_job(server *s, job *j) {
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s);
-    if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
+    /* Inc 5a: a request that won the session without continuing the live
+     * record has rewritten (or is about to extend past) its frontier -- the
+     * binding is stale the moment this prefill committed. */
+    if (!responses_live_continuation && !anthropic_live_continuation)
+        cont_registry_demote_serial(s);
     ds4_session_set_progress(s->session, NULL, NULL);
     ds4_session_set_display_progress(s->session, NULL, NULL);
     kv_cache_maybe_store_continued(s);
@@ -11871,17 +12148,33 @@ decode_again:
                                     parsed_calls.len ? &parsed_calls : NULL);
             buf_free(&visible);
             free(visible_suffix);
+            /* Inc 5a: tool turns publish a continuation record binding this
+             * turn's call ids to the engine execution reference; a plain
+             * turn extended the session past any old frontier, so the
+             * previous serial record is demoted instead. */
+            if (parsed_calls.len) {
+                cont_registry_publish_serial(s, API_RESPONSES, &parsed_calls,
+                                             ds4_session_generation(s->session),
+                                             ds4_session_pos(s->session));
+            } else {
+                cont_registry_demote_serial(s);
+            }
         } else {
             responses_live_clear(s);
+            cont_registry_demote_serial(s);
         }
     }
     if (j->req.api == API_ANTHROPIC) {
         if (parsed_calls.len && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
-            anthropic_live_remember(s, &parsed_calls);
+            /* Inc 5a: the registry record replaces the anthropic_live
+             * singleton (call ids were its only role). */
+            cont_registry_publish_serial(s, API_ANTHROPIC, &parsed_calls,
+                                         ds4_session_generation(s->session),
+                                         ds4_session_pos(s->session));
         } else {
-            anthropic_live_clear(s);
+            cont_registry_demote_serial(s);
         }
     }
 
@@ -12600,8 +12893,8 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     ds4_session_free(s->session);
     s->session = NULL;
     responses_live_clear(s);
-    anthropic_live_clear(s);
     thinking_live_clear(s);
+    cont_registry_demote_serial(s);   /* Inc 5a: session gone, frontier gone */
 
     /* Freed graph bytes reach MemAvailable with driver-reclaim lag (the
      * WAIT_MEM class); give the floor probe a bounded settle window. */
@@ -14977,6 +15270,24 @@ static void send_metrics(server *s, int fd) {
                (unsigned long long)ds4_metric_read(&m->banks_total),
                (unsigned long long)ds4_metric_read(&m->warm_records),
                (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+    /* Inc 5a: continuation registry (plan §4.6).  published counts records,
+     * resolved counts T2 admissions served from a LIVE record, missed counts
+     * the native 409 refusals, demoted counts LIVE -> REPLAY_ONLY. */
+    buf_printf(&b, "# TYPE ds4_continuation_records_published_total counter\n"
+                   "ds4_continuation_records_published_total %llu\n"
+                   "# TYPE ds4_continuation_resolved_total counter\n"
+                   "ds4_continuation_resolved_total %llu\n"
+                   "# TYPE ds4_continuation_missed_total counter\n"
+                   "ds4_continuation_missed_total %llu\n"
+                   "# TYPE ds4_continuation_demoted_total counter\n"
+                   "ds4_continuation_demoted_total %llu\n"
+                   "# TYPE ds4_continuation_records_live gauge\n"
+                   "ds4_continuation_records_live %llu\n",
+               (unsigned long long)ds4_metric_read(&m->creg_published),
+               (unsigned long long)ds4_metric_read(&m->creg_resolved),
+               (unsigned long long)ds4_metric_read(&m->creg_missed),
+               (unsigned long long)ds4_metric_read(&m->creg_demoted),
+               (unsigned long long)ds4_metric_read(&m->creg_records_live));
     /* Aligned-artifact perf tier: source label tells which producer put the
      * fast-path repack artifacts on device (none = raw-layout dispatch). */
     buf_printf(&b, "# TYPE ds4_derived_artifacts gauge\n"
@@ -15600,9 +15911,9 @@ static void server_close_resources(server *s) {
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    cont_registry_free(s);   /* Inc 5a: before tool memory (it unpins entries) */
     tool_memory_free(&s->tool_mem);
     live_tool_state_free(&s->responses_live);
-    live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
@@ -16404,6 +16715,11 @@ int main(int argc, char **argv) {
     }
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
+    /* Inc 5a: continuation-record cap (bounded resource policy, plan §4.6). */
+    {
+        const char *cr = getenv("DS4_CONT_REGISTRY_MAX");
+        s.creg.max_records = cr ? atoi(cr) : 0;   /* <=0 -> default at init */
+    }
     s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
@@ -18985,11 +19301,15 @@ static void test_anthropic_tool_result_id_validation(void) {
                                                  err, sizeof(err)));
     TEST_ASSERT(strstr(err, "Anthropic continuation state is not available") != NULL);
 
-    pthread_mutex_lock(&s.tool_mu);
-    s.anthropic_live.valid = true;
-    s.anthropic_live.live_tokens = 10;
-    id_list_push_unique(&s.anthropic_live.call_ids, "toolu_missing");
-    pthread_mutex_unlock(&s.tool_mu);
+    /* Inc 5a: a LIVE binding now lives in the continuation registry. */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_missing");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 7, 10);
+        tool_calls_free(&calls);
+    }
     bool needs_live_tool_state = false;
     err[0] = '\0';
     TEST_ASSERT(anthropic_validate_tool_results(&s, &msgs,
@@ -18998,7 +19318,7 @@ static void test_anthropic_tool_result_id_validation(void) {
     TEST_ASSERT(needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.anthropic_live);
+    cont_registry_free(&s);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -19042,11 +19362,15 @@ static void test_anthropic_tool_use_parses_before_role(void) {
      * must still remember prior assistant tool_use ids, otherwise old
      * tool_result blocks are mistaken for live-only continuations and rejected
      * once the live frontier has moved on to newer tool calls. */
-    pthread_mutex_lock(&s.tool_mu);
-    s.anthropic_live.valid = true;
-    s.anthropic_live.live_tokens = 100;
-    id_list_push_unique(&s.anthropic_live.call_ids, "toolu_current");
-    pthread_mutex_unlock(&s.tool_mu);
+    /* Inc 5a: a LIVE binding now lives in the continuation registry. */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_current");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 5, 100);
+        tool_calls_free(&calls);
+    }
 
     const char *json =
         "["
@@ -19075,7 +19399,145 @@ static void test_anthropic_tool_use_parses_before_role(void) {
     TEST_ASSERT(!needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.anthropic_live);
+    cont_registry_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* Inc 5a: registry core semantics -- publish/resolve with exact execution
+ * reference equality (generation + frontier), protocol namespace isolation,
+ * set-equality on ids, and the LIVE -> REPLAY_ONLY demotion. */
+static void test_cont_registry_publish_resolve_demote(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    tool_calls calls = {0};
+    tool_call a = {0};
+    a.id = xstrdup("toolu_regA");
+    tool_calls_push(&calls, a);
+    tool_call b = {0};
+    b.id = xstrdup("toolu_regB");
+    tool_calls_push(&calls, b);
+    cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 7, 100);
+    tool_calls_free(&calls);
+
+    /* LIVE visibility is protocol-scoped (plan §4.6 collision/bleed). */
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_regA"));
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_regB"));
+    TEST_ASSERT(!responses_live_has_call_id(&s, "toolu_regA"));
+
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "toolu_regA");
+    id_list_push_unique(&ids, "toolu_regB");
+    TEST_ASSERT(cont_registry_resolve_serial(&s, API_ANTHROPIC, &ids, 7, 100));
+    /* The ABA the singletons could not catch: same position, new content
+     * generation.  And the frontier check both ways. */
+    TEST_ASSERT(!cont_registry_resolve_serial(&s, API_ANTHROPIC, &ids, 8, 100));
+    TEST_ASSERT(!cont_registry_resolve_serial(&s, API_ANTHROPIC, &ids, 7, 101));
+    TEST_ASSERT(!cont_registry_resolve_serial(&s, API_RESPONSES, &ids, 7, 100));
+    /* Exact set equality: subset and superset both refuse. */
+    stop_list sub = {0};
+    id_list_push_unique(&sub, "toolu_regA");
+    TEST_ASSERT(!cont_registry_resolve_serial(&s, API_ANTHROPIC, &sub, 7, 100));
+    stop_list sup = {0};
+    id_list_push_unique(&sup, "toolu_regA");
+    id_list_push_unique(&sup, "toolu_regB");
+    id_list_push_unique(&sup, "toolu_regC");
+    TEST_ASSERT(!cont_registry_resolve_serial(&s, API_ANTHROPIC, &sup, 7, 100));
+
+    /* Demote: LIVE lookups and resolve refuse; the ids stay reserved for
+     * mint uniqueness (a REPLAY_ONLY record's ids must never be re-minted). */
+    cont_registry_demote_serial(&s);
+    TEST_ASSERT(!anthropic_live_has_call_id(&s, "toolu_regA"));
+    TEST_ASSERT(!cont_registry_resolve_serial(&s, API_ANTHROPIC, &ids, 7, 100));
+    TEST_ASSERT(cont_registry_id_known(&s, "toolu_regA"));
+    TEST_ASSERT(tool_id_in_use(&s, "toolu_regA"));
+
+    id_list_free(&ids);
+    id_list_free(&sub);
+    id_list_free(&sup);
+    cont_registry_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* Inc 5a: one record per serial turn (a new publication supersedes the old
+ * LIVE record) and the bounded store's oldest-REPLAY_ONLY-first cap. */
+static void test_cont_registry_supersede_and_cap(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.creg.max_records = 4;
+
+    char idbuf[32];
+    for (int t = 1; t <= 2; t++) {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        snprintf(idbuf, sizeof(idbuf), "toolu_turn%d", t);
+        tc.id = xstrdup(idbuf);
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls,
+                                     3, 50 * t);
+        tool_calls_free(&calls);
+    }
+    /* Turn 2 superseded turn 1: exactly one LIVE record. */
+    TEST_ASSERT(!anthropic_live_has_call_id(&s, "toolu_turn1"));
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_turn2"));
+    TEST_ASSERT(s.creg.n_live == 1);
+    TEST_ASSERT(s.creg.n_records == 2);
+
+    /* Push past the cap: oldest REPLAY_ONLY records evict (their ids drop
+     * from the index atomically); the LIVE tip always survives. */
+    for (int t = 3; t <= 8; t++) {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        snprintf(idbuf, sizeof(idbuf), "toolu_turn%d", t);
+        tc.id = xstrdup(idbuf);
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls,
+                                     3, 50 * t);
+        tool_calls_free(&calls);
+    }
+    TEST_ASSERT(s.creg.n_records <= 4);
+    TEST_ASSERT(!cont_registry_id_known(&s, "toolu_turn1"));
+    TEST_ASSERT(!cont_registry_id_known(&s, "toolu_turn2"));
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_turn8"));
+    TEST_ASSERT(s.creg.n_live == 1);
+
+    cont_registry_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* Inc 5a: while LIVE_FRONTIER a record's strong references keep its exact
+ * DSML out of the tool-memory LRU's reach; demotion releases them. */
+static void test_cont_registry_pins_exact_dsml(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.tool_mem.max_entries = 2;
+
+    tool_memory_put(&s, "toolu_pinned", "<dsml sampled live bytes>");
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_pinned");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 9, 40);
+        tool_calls_free(&calls);
+    }
+    /* Flood the tiny LRU: the pinned entry is the tail yet survives; the
+     * prune walks past it and evicts the next-oldest unpinned entry. */
+    tool_memory_put(&s, "toolu_fill2", "<dsml 2>");
+    tool_memory_put(&s, "toolu_fill3", "<dsml 3>");
+    TEST_ASSERT(tool_memory_has_id(&s, "toolu_pinned"));
+    TEST_ASSERT(!tool_memory_has_id(&s, "toolu_fill2"));
+    TEST_ASSERT(tool_memory_has_id(&s, "toolu_fill3"));
+
+    /* Demote unpins: the next prune reclaims the old frontier's bytes. */
+    cont_registry_demote_serial(&s);
+    tool_memory_put(&s, "toolu_fill4", "<dsml 4>");
+    TEST_ASSERT(!tool_memory_has_id(&s, "toolu_pinned"));
+    TEST_ASSERT(tool_memory_has_id(&s, "toolu_fill3"));
+    TEST_ASSERT(tool_memory_has_id(&s, "toolu_fill4"));
+
+    cont_registry_free(&s);
+    tool_memory_free(&s.tool_mem);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -19161,11 +19623,15 @@ static void test_responses_tool_output_id_validation(void) {
                                                  err, sizeof(err)));
     TEST_ASSERT(strstr(err, "Responses continuation state is not available") != NULL);
 
-    pthread_mutex_lock(&s.tool_mu);
-    s.responses_live.valid = true;
-    s.responses_live.live_tokens = 10;
-    id_list_push_unique(&s.responses_live.call_ids, "call_missing");
-    pthread_mutex_unlock(&s.tool_mu);
+    /* Inc 5a: a LIVE binding now lives in the continuation registry. */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("call_missing");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_RESPONSES, &calls, 7, 10);
+        tool_calls_free(&calls);
+    }
     err[0] = '\0';
     bool needs_live_tool_state = false;
     TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_LOW,
@@ -19174,7 +19640,7 @@ static void test_responses_tool_output_id_validation(void) {
     TEST_ASSERT(needs_live_tool_state);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.responses_live);
+    cont_registry_free(&s);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -19208,11 +19674,15 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(!needs_live_tool_state);
     TEST_ASSERT(needs_live_reasoning);
 
-    pthread_mutex_lock(&s.tool_mu);
-    s.responses_live.valid = true;
-    s.responses_live.live_tokens = 123;
-    id_list_push_unique(&s.responses_live.call_ids, "call_replay");
-    pthread_mutex_unlock(&s.tool_mu);
+    /* Inc 5a: a LIVE binding now lives in the continuation registry. */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("call_replay");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_RESPONSES, &calls, 7, 123);
+        tool_calls_free(&calls);
+    }
     err[0] = '\0';
     needs_live_reasoning = false;
     needs_live_tool_state = false;
@@ -19248,7 +19718,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(!needs_live_reasoning);
 
     chat_msgs_free(&msgs);
-    live_tool_state_free(&s.responses_live);
+    cont_registry_free(&s);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -23030,6 +23500,9 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
     test_anthropic_tool_use_parses_before_role();
+    test_cont_registry_publish_resolve_demote();
+    test_cont_registry_supersede_and_cap();
+    test_cont_registry_pins_exact_dsml();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();

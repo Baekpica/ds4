@@ -434,6 +434,16 @@ typedef struct {
  * static-path reuse of the slabs, deferred-commit MTP path). */
 int  ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank,
                                   const int **toks);
+/* v0.5.6 Inc 5a (continuation registry, plan §4.6): engine-authoritative bank
+ * lineage generation.  Advances on every event after which previously
+ * committed bank content may no longer be what a past reader saw: lineage
+ * replacement (new admission reset), fork-by-copy into the bank, payload
+ * restore, trim/reclaim, quarantine, history-capacity overflow, and the
+ * deferred-commit invalidate.  Pure committed extension does NOT advance.
+ * A reader that recorded (generation, committed length) revalidates the
+ * exact content with equality checks alone -- no memcmp, no ABA.  Returns 0
+ * for NULL ctx or out-of-range bank (0 is never a live generation). */
+uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank);
 /* admit: fill *req for the next waiting request and return 1; return 0 when none is
  *   available right now (the loop keeps decoding the active set and ends once the
  *   active set is empty AND admit returns 0).
@@ -534,6 +544,12 @@ typedef struct {
     /* admission-bound sheds (v0.5.6 Inc 2e; see DS4_METRICS_SHED_REASONS) */
     uint64_t requests_shed[DS4_METRICS_SHED_REASONS];
     uint64_t out_backlog_bytes;   /* gauge: stream bytes buffered for slow readers */
+    /* continuation registry (v0.5.6 Inc 5a; server-owned semantics) */
+    uint64_t creg_published;      /* records published at tool-turn terminals */
+    uint64_t creg_resolved;       /* T2 admissions served from a LIVE record */
+    uint64_t creg_missed;         /* T2 live-state requests refused 409 */
+    uint64_t creg_demoted;        /* LIVE -> REPLAY_ONLY transitions */
+    uint64_t creg_records_live;   /* gauge: LIVE_FRONTIER records right now */
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);
@@ -699,6 +715,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
+/* v0.5.6 Inc 5a (continuation registry, plan §4.6): engine-authoritative
+ * session content generation.  Advances whenever previously committed
+ * checkpoint content may change: create, invalidate, rewind below the live
+ * position, a non-extending sync (rebuild), and payload load.  Pure
+ * extension does NOT advance, so (generation, pos) identifies exact
+ * committed content and a reader that recorded both revalidates with
+ * equality checks alone.  Returns 0 for NULL (never a live generation). */
+uint64_t ds4_session_generation(const ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 /* v0.5.2 serial right-sizing: whether the session's lazy graph alloc is
