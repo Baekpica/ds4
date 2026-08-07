@@ -930,6 +930,30 @@ values, including file contents and edit text, use the request's normal sampling
 settings. That separation is important: deterministic decoding is helpful for
 syntax, but can create repeated text when applied to long code or file bodies.
 
+### Continuation registry and trust domain
+
+For the Anthropic and Responses endpoints — whose protocols let a client send
+an output-only follow-up (just the `tool_result` / `function_call_output`)
+instead of replaying the whole conversation — the server keeps a continuation
+registry: one record per tool-call turn, binding the turn's tool-call IDs to
+the engine state that produced them (an engine-authoritative content
+generation plus committed token frontier). A follow-up that references those
+IDs is revalidated by pure equality at admission; if the state has moved on,
+the server answers a native `409` asking for a full-history replay rather than
+silently continuing from the wrong frontier. Records that lose their live
+state remain replayable (exact sampled DSML is retained under a bounded LRU),
+and short grace/TTL windows (`DS4_CONT_GRACE_S`, `DS4_CONT_TTL_S`,
+`DS4_CONT_PIN_DEADLINE_S`) protect a just-published turn from being evicted
+before its follow-up arrives.
+
+**The whole server is one trust domain.** There is no tenant or auth
+namespace: tool memory and the continuation registry are global, and any
+client that knows (or guesses) a tool-call ID may continue that conversation
+or shed other clients' work through the grace window. Tool-call IDs are minted
+unguessable, but they travel in responses — do not expose one `ds4-server` to
+mutually untrusted clients expecting isolation. Put an authenticating proxy in
+front, or run one server per tenant, until an authenticated namespace exists.
+
 Minimal OpenAI example:
 
 ```sh

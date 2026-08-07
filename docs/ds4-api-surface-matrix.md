@@ -73,6 +73,21 @@ The Anthropic parser requires `messages` but does not require
 `max_tokens` (upstream requires it); an omitted value gets the server
 default like every other surface.
 
+## Trust domain (Inc 5)
+
+The server is ONE trust domain. The continuation registry (one record per
+Anthropic/Responses tool-call turn, keyed `(protocol, call_id)`) and exact-DSML
+tool memory are global — there is no tenant or auth namespace, so the
+`trust_namespace` component of the plan's registry key is a constant.
+Knowledge of a tool-call ID is knowledge of the conversation: an output-only
+continuation for that ID resumes the owning engine state, and a queued
+continuation's grace/pin windows can shed other clients' serial work. IDs are
+minted unguessable but travel in responses. Deployments serving mutually
+untrusted tenants need an authenticating proxy or one server per tenant until
+an authenticated namespace lands (documented restriction; also at the
+`cont_registry` typedef block in `ds4_server.c` and in README "Continuation
+registry and trust domain").
+
 ## Explicitly unsupported
 
 - **Responses durable references**: non-null `previous_response_id` or
