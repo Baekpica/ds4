@@ -38673,9 +38673,24 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     size_t n = 0;
     uint64_t pos = 0;
     while (pos < s.len) {
+        const uint64_t at = pos;
         uint32_t cp = utf8_decode_one(s.ptr, s.len, &pos);
         int b = gpt2_codepoint_to_byte(cp);
-        if (b >= 0) out[n++] = (char)b;
+        if (b >= 0) {
+            out[n++] = (char)b;
+        } else {
+            /* Not part of the GPT-2 byte alphabet, so it is literal text, not
+             * an encoded byte. K-EXAONE's USER_DEFINED tokens are exactly
+             * this: '    ' (id 31) holds four real spaces, and U+0020 has no
+             * place in the byte map. Dropping the character -- which is what
+             * happened before -- deleted every indent and some ordinary
+             * spaces from the output. Copy the source bytes through.
+             *
+             * A mapped codepoint yields one byte from at least one source
+             * byte, and a passthrough copies its own bytes, so s.len + 1
+             * remains a sufficient bound. */
+            for (uint64_t i = at; i < pos; i++) out[n++] = s.ptr[i];
+        }
     }
     out[n] = '\0';
     if (len) *len = n;
@@ -51126,6 +51141,9 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
     if (ds4_session_is_cpu(s)) return 0;
+    /* Disk KV persistence is not wired for K-EXAONE yet. Report zero rather
+     * than fall through to the DeepSeek graph, whose state is zeroed here. */
+    if (ds4_session_is_exaone(s)) return 0;
     if (ds4_session_is_glm(s)) {
 #ifdef DS4_NO_GPU
         (void)layer_start;
@@ -52054,6 +52072,9 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+    /* Disk KV persistence is not wired for K-EXAONE yet. Report zero rather
+     * than fall through to the DeepSeek graph, whose state is zeroed here. */
+    if (ds4_session_is_exaone(s)) return 0;
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
     if (ds4_session_is_cpu(s)) {
@@ -52181,6 +52202,11 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 }
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (ds4_session_is_exaone(s)) {
+        payload_set_err(err, errlen,
+                        "disk KV payloads are not implemented for K-EXAONE");
+        return 1;
+    }
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -52490,6 +52516,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (ds4_session_is_exaone(s)) {
+        payload_set_err(err, errlen,
+                        "disk KV payloads are not implemented for K-EXAONE");
+        return 1;
+    }
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -53545,7 +53576,10 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+    /* The fused greedy path below is built on the DeepSeek graph's split-KV
+     * and anchor machinery. K-EXAONE, like CPU and GLM sessions, takes the
+     * plain eval-then-argmax route. */
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_exaone(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
