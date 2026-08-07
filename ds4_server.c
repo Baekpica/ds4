@@ -6397,8 +6397,21 @@ typedef struct {
     bool message_item_closed;
     bool reasoning_emitted_any;
     bool message_emitted_any;
-    buf reasoning_text;
-    buf message_text;
+    /* Inc 7b: the reasoning/message item text is a contiguous SPAN of the
+     * caller's cumulative raw buffer (every append site advanced through raw
+     * in order), so the machine records [start,end) offsets instead of
+     * keeping duplicate cumulative copies -- the .done emitters and the
+     * terminal slice raw at render.  finish_live clamps the spans to the
+     * final raw_len before any reader runs (stop truncation can only
+     * SHORTEN raw after the stop-safe emits; repair only APPENDS past the
+     * message prefix). */
+    size_t reasoning_start, reasoning_end;
+    size_t message_start, message_end;
+    /* Inc 7b: the tool-parse RECOVERY tail is a second, non-contiguous
+     * message span -- emission trims the separator whitespace before a tool
+     * marker, so the tail resumes at the marker, past a gap the old
+     * cumulative buffer also dropped.  Rendered as primary + tail concat. */
+    size_t message_tail_start, message_tail_end;
     char response_id[40];
     char reasoning_id[40];
     char message_id[40];
@@ -6419,9 +6432,9 @@ static void responses_stream_init(const request *r, responses_stream *st) {
 }
 
 static void responses_stream_free(responses_stream *st) {
-    if (!st) return;
-    buf_free(&st->reasoning_text);
-    buf_free(&st->message_text);
+    /* Inc 7b: the machine no longer owns buffers (item text is spans into
+     * the caller's raw); kept so the session teardown stays uniform. */
+    (void)st;
 }
 
 /* Codex parses an explicit sequence_number on every Responses event for
@@ -6520,6 +6533,7 @@ static const char *responses_item_status_for_finish(const char *finish) {
 }
 
 static bool responses_sse_reasoning_done(int fd, responses_stream *st,
+                                         const char *raw,
                                          const char *finish) {
     /* If the stream terminates before `</think>` was actually observed the
      * reasoning item is partial — regardless of why generation stopped (EOS,
@@ -6529,6 +6543,10 @@ static bool responses_sse_reasoning_done(int fd, responses_stream *st,
     (void)finish;
     const char *item_status =
         st->reasoning_closed_naturally ? "completed" : "incomplete";
+    /* Inc 7b: the item text is a span of the caller's raw buffer. */
+    const char *rtext = raw ? raw + st->reasoning_start : "";
+    const size_t rlen = st->reasoning_end > st->reasoning_start ?
+                        st->reasoning_end - st->reasoning_start : 0;
     /* Mirror the message-item close sequence: emit summary_text.done +
      * summary_part.done before the output_item.done so clients that key off
      * part lifecycle don't see a dangling open summary part. */
@@ -6537,8 +6555,7 @@ static bool responses_sse_reasoning_done(int fd, responses_stream *st,
         "{\"type\":\"response.reasoning_summary_text.done\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,\"text\":",
         st->reasoning_id, st->reasoning_index);
-    json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
-                  st->reasoning_text.len);
+    json_escape_n(&b, rtext, rlen);
     buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     if (!ok) {
@@ -6553,8 +6570,7 @@ static bool responses_sse_reasoning_done(int fd, responses_stream *st,
             "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,"
             "\"part\":{\"type\":\"summary_text\",\"text\":",
             st->reasoning_id, st->reasoning_index);
-        json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
-                      st->reasoning_text.len);
+        json_escape_n(&b, rtext, rlen);
         buf_puts(&b, "}}");
         ok = responses_sse_emit_event(fd, st, b.ptr);
         if (!ok) {
@@ -6568,9 +6584,9 @@ static bool responses_sse_reasoning_done(int fd, responses_stream *st,
         "{\"type\":\"response.output_item.done\",\"output_index\":%d,"
         "\"item\":{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\",\"summary\":[",
         st->reasoning_index, st->reasoning_id, item_status);
-    if (st->reasoning_text.len) {
+    if (rlen) {
         buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
-        json_escape_n(&b, st->reasoning_text.ptr, st->reasoning_text.len);
+        json_escape_n(&b, rtext, rlen);
         buf_putc(&b, '}');
     }
     buf_puts(&b, "]}}");
@@ -6618,7 +6634,25 @@ static bool responses_sse_output_text_delta(int fd, responses_stream *st,
     return ok;
 }
 
+/* Inc 7b: render the message item text as one JSON string -- the primary
+ * span plus the recovery-tail span of the caller's raw buffer (the exact
+ * bytes the old cumulative copy held). */
+static void responses_message_text_escape(buf *b, const responses_stream *st,
+                                          const char *raw) {
+    buf_putc(b, '"');
+    if (raw) {
+        if (st->message_end > st->message_start)
+            json_escape_fragment_n(b, raw + st->message_start,
+                                   st->message_end - st->message_start);
+        if (st->message_tail_end > st->message_tail_start)
+            json_escape_fragment_n(b, raw + st->message_tail_start,
+                                   st->message_tail_end - st->message_tail_start);
+    }
+    buf_putc(b, '"');
+}
+
 static bool responses_sse_message_done(int fd, responses_stream *st,
+                                       const char *raw,
                                        const char *finish) {
     const char *item_status = responses_item_status_for_finish(finish);
     buf b = {0};
@@ -6626,8 +6660,7 @@ static bool responses_sse_message_done(int fd, responses_stream *st,
         "{\"type\":\"response.output_text.done\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,\"text\":",
         st->message_id, st->message_index);
-    json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
-                  st->message_text.len);
+    responses_message_text_escape(&b, st, raw);
     buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     if (!ok) {
@@ -6641,8 +6674,7 @@ static bool responses_sse_message_done(int fd, responses_stream *st,
         "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,"
         "\"part\":{\"type\":\"output_text\",\"text\":",
         st->message_id, st->message_index);
-    json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
-                  st->message_text.len);
+    responses_message_text_escape(&b, st, raw);
     buf_puts(&b, ",\"annotations\":[]}}");
     ok = responses_sse_emit_event(fd, st, b.ptr);
     if (!ok) {
@@ -6656,8 +6688,7 @@ static bool responses_sse_message_done(int fd, responses_stream *st,
         "\"item\":{\"id\":\"%s\",\"type\":\"message\",\"status\":\"%s\","
         "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":",
         st->message_index, st->message_id, item_status);
-    json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
-                  st->message_text.len);
+    responses_message_text_escape(&b, st, raw);
     buf_puts(&b, ",\"annotations\":[]}]}}");
     ok = responses_sse_emit_event(fd, st, b.ptr);
     buf_free(&b);
@@ -6821,19 +6852,13 @@ static const char *responses_status_for_finish(const char *finish) {
 }
 
 /* v0.5.3 inc3 (forum 376884 post 115): the reasoning trace emitted as a
- * Responses item must be counted in usage, not reported as 0.  Callers
- * retokenize the parsed reasoning text -- the generation-side token index
- * of the think region is not threaded to the API layer, and retokenized
- * model output deviates from the generated ids only at segment boundaries. */
-static int reasoning_token_count(ds4_engine *e, const char *reasoning) {
-    if (!e || !reasoning || !reasoning[0]) return 0;
-    ds4_tokens t = {0};
-    ds4_tokenize_rendered_chat(e, reasoning, &t);
-    const int n = t.len;
-    ds4_tokens_free(&t);
-    return n;
-}
-
+ * Responses item must be counted in usage, not reported as 0.  Inc 7b: the
+ * count is now GENERATION-side -- sem_accum counts tokens fed while inside
+ * <think> (the old finalize retokenize of the parsed reasoning text is
+ * gone; it deviated from the generated ids at segment boundaries anyway,
+ * and cost a full-tail tokenize per Responses terminal).  The one lane
+ * with no per-token host feed (plain engine-buffered rows) counts during
+ * its detok walk, still token-aligned. */
 static void append_responses_usage_json(buf *b, const request *r,
                                         int input_tokens, int output_tokens,
                                         int reasoning_tokens) {
@@ -6852,6 +6877,7 @@ static void append_responses_usage_json(buf *b, const request *r,
 
 static bool responses_sse_completed(int fd, const request *r,
                                     responses_stream *st,
+                                    const char *raw,
                                     const tool_calls *calls,
                                     const responses_tool_item *tool_items,
                                     const char *finish,
@@ -6887,12 +6913,14 @@ static bool responses_sse_completed(int fd, const request *r,
          * response-level finish status, so replay must reject it. */
         const char *reasoning_status =
             st->reasoning_closed_naturally ? "completed" : "incomplete";
+        const size_t rlen = st->reasoning_end > st->reasoning_start ?
+                            st->reasoning_end - st->reasoning_start : 0;
         buf_printf(&b,
             "{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\",\"summary\":[",
             st->reasoning_id, reasoning_status);
-        if (st->reasoning_text.len) {
+        if (rlen && raw) {
             buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
-            json_escape_n(&b, st->reasoning_text.ptr, st->reasoning_text.len);
+            json_escape_n(&b, raw + st->reasoning_start, rlen);
             buf_putc(&b, '}');
         }
         buf_puts(&b, "]}");
@@ -6904,8 +6932,7 @@ static bool responses_sse_completed(int fd, const request *r,
             "{\"id\":\"%s\",\"type\":\"message\",\"status\":\"%s\","
             "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":",
             st->message_id, item_status);
-        json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
-                      st->message_text.len);
+        responses_message_text_escape(&b, st, raw);
         buf_puts(&b, ",\"annotations\":[]}]}");
         wrote = true;
     }
@@ -6994,7 +7021,9 @@ static bool responses_sse_stream_update(int fd, const request *r,
                 if (!responses_sse_reasoning_delta(fd, st,
                                                    raw + st->emit_pos,
                                                    limit - st->emit_pos)) return false;
-                buf_append(&st->reasoning_text, raw + st->emit_pos, limit - st->emit_pos);
+                /* Inc 7b: record the span instead of copying the bytes. */
+                if (!st->reasoning_emitted_any) st->reasoning_start = st->emit_pos;
+                st->reasoning_end = limit;
                 st->reasoning_emitted_any = true;
             }
             st->emit_pos = limit;
@@ -7030,7 +7059,9 @@ static bool responses_sse_stream_update(int fd, const request *r,
             if (!responses_sse_output_text_delta(fd, st,
                                                  raw + st->emit_pos,
                                                  limit - st->emit_pos)) return false;
-            buf_append(&st->message_text, raw + st->emit_pos, limit - st->emit_pos);
+            /* Inc 7b: record the span instead of copying the bytes. */
+            if (!st->message_emitted_any) st->message_start = st->emit_pos;
+            st->message_end = limit;
             st->message_emitted_any = true;
             st->emit_pos = limit;
         }
@@ -7056,10 +7087,20 @@ static bool responses_sse_finish_live(int fd, const request *r,
                                       long created_at) {
     if (!responses_sse_stream_update(fd, r, st, raw, raw_len, true)) return false;
 
+    /* Inc 7b: the item spans index the raw buffer every update saw; clamp
+     * them to the FINAL raw_len once before any .done/terminal reader slices
+     * (stop truncation can only shorten raw after the stop-safe emits, and
+     * tool-parse repair only appends past the message prefix -- both keep
+     * span bytes identical, this is the belt-and-braces bound). */
+    if (st->reasoning_end > raw_len) st->reasoning_end = raw_len;
+    if (st->reasoning_start > st->reasoning_end) st->reasoning_start = st->reasoning_end;
+    if (st->message_end > raw_len) st->message_end = raw_len;
+    if (st->message_start > st->message_end) st->message_start = st->message_end;
+
     /* Close any half-open reasoning summary so the TUI knows the part ended
      * before we slot in any tool calls or completion. */
     if (st->reasoning_item_opened && !st->reasoning_item_closed) {
-        if (!responses_sse_reasoning_done(fd, st, finish)) return false;
+        if (!responses_sse_reasoning_done(fd, st, raw, finish)) return false;
         st->reasoning_item_closed = true;
     }
     /* Recovery path: when DSML tool parsing fails the worker promotes the entire
@@ -7083,12 +7124,16 @@ static bool responses_sse_finish_live(int fd, const request *r,
             st->message_text_part_open = true;
         }
         if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
-        buf_append(&st->message_text, tail, tail_len);
+        /* Inc 7b: record the tail as the SECOND message span (see the struct
+         * comment: the suppress cursor sits past the trimmed separator
+         * whitespace, so this is not contiguous with the primary span). */
+        st->message_tail_start = st->emit_pos;
+        st->message_tail_end = raw_len;
         st->message_emitted_any = true;
         st->emit_pos = raw_len;
     }
     if (st->message_item_opened && !st->message_item_closed) {
-        if (!responses_sse_message_done(fd, st, finish)) return false;
+        if (!responses_sse_message_done(fd, st, raw, finish)) return false;
         st->message_item_closed = true;
     }
     responses_tool_item *items = NULL;
@@ -7106,7 +7151,7 @@ static bool responses_sse_finish_live(int fd, const request *r,
                                                            &r->tool_orders, finish, true);
         }
     }
-    if (ok) ok = responses_sse_completed(fd, r, st, calls, items, finish,
+    if (ok) ok = responses_sse_completed(fd, r, st, raw, calls, items, finish,
                                          prompt_tokens, completion_tokens,
                                          reasoning_tokens, created_at);
     free(items);
@@ -12707,8 +12752,10 @@ decode_again:
         res.calls = &parsed_calls;
         res.prompt_tokens = prompt_tokens;
         res.completion_tokens = acc.completion;
+        /* Inc 7b: generation-side reasoning count (tokens fed inside
+         * <think>), replacing the finalize retokenize of parsed_reasoning. */
         if (wsess.surface == DS4_WIRE_RESPONSES)
-            res.reasoning_tokens = reasoning_token_count(s->engine, parsed_reasoning);
+            res.reasoning_tokens = acc.reasoning_tokens;
         if (pub_pending) {
             /* Inc 5c (plan §4.6 steps 5-7): a tool-turn terminal that
              * publishes a continuation record couples the record and the
@@ -13042,8 +13089,9 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
      * write_cont_completion has dispatched through the surface-typed
      * wire_finish_buffered since Inc 1, rendering the native shapes with
      * stop honesty (2c), client-frame usage (2d/3a), and -- for Responses
-     * -- the same finalize-time reasoning retokenize the serial path does
-     * (3b).  The promotions are these routing rows, not new projection
+     * -- the same reasoning usage detail the serial path reports (3b;
+     * generation-side count since 7b).  The promotions are these routing
+     * rows, not new projection
      * code.  Inc 4b/4c: STREAMING rides too on both surfaces --
      * cont_stream_start / cont_on_token / wire_finish_stream speak each
      * machine (wire_begin/wire_update), transport starts at admission (4a),
@@ -13073,7 +13121,7 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
      * non-thinking, no stops/tools/echo, no live/durable/prefill-only
      * state.  SURFACE scoping (Inc 3d): write_batch_completion has been
      * surface-typed since Inc 1 (wire_finish_buffered) and carries the 3b
-     * Responses retokenize, so the promoted surfaces take the same static
+     * Responses reasoning detail, so the promoted surfaces take the same static
      * fallbacks under the same §7 kill switches -- a switched-off surface
      * must restore the legacy table bit-exactly, so the switch gates BOTH
      * batched lanes. */
@@ -13694,16 +13742,32 @@ static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_t
 /* Detokenize a batched result's tokens into `out` (NUL-terminated), stopping
  * before the first EOS; returns the count emitted (EOS excluded).  Shared by the
  * coalesced path and the /v1/batch handler so the two cannot drift. */
-static int detok_result_until_eos(server *s, const int *tokens, int n_tokens, int eos, buf *out) {
+/* Inc 7b: `r`/`reasoning_tokens` (both nullable) let the one lane with no
+ * per-token host feed -- plain engine-buffered rows -- count reasoning
+ * tokens during its detok walk, token-aligned like sem_accum's feed count
+ * (a token counts when the model was inside <think> before producing it;
+ * gated on think mode exactly like sem_accum's count_reasoning). */
+static int detok_result_until_eos(server *s, const int *tokens, int n_tokens, int eos, buf *out,
+                                  const request *r, int *reasoning_tokens) {
     int emitted = 0;
+    int n_reason = 0;
+    thinking_state th = {0};
+    const bool count = r && reasoning_tokens && ds4_think_mode_enabled(r->think_mode);
+    if (count) th = thinking_state_from_prompt(r);
     for (int k = 0; k < n_tokens; k++) {
         if (tokens[k] == eos) break;
         size_t pl = 0;
         char *piece = ds4_token_text(s->engine, tokens[k], &pl);
-        if (piece) { buf_append(out, piece, pl); free(piece); }
+        if (count && th.inside) n_reason++;
+        if (piece) {
+            if (count) thinking_state_feed(&th, piece, pl);
+            buf_append(out, piece, pl);
+            free(piece);
+        }
         emitted++;
     }
     buf_putc(out, '\0');
+    if (reasoning_tokens) *reasoning_tokens = n_reason;
     return emitted;
 }
 
@@ -13730,7 +13794,9 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
         if (n_tokens > budget) { n_tokens = budget; finish = "length"; }
     }
     buf text = {0};
-    int emitted = detok_result_until_eos(s, r->tokens, n_tokens, eos, &text);
+    int reasoning_tokens = 0;
+    int emitted = detok_result_until_eos(s, r->tokens, n_tokens, eos, &text,
+                                         &j->req, &reasoning_tokens);
     const int prompt_tokens = j->req.prompt.len;
 
     if (j->req.kind == REQ_CHAT) {
@@ -13755,14 +13821,15 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
         res.prompt_tokens = prompt_tokens;
         res.completion_tokens = emitted;
         /* Inc 3b: PLAIN buffered rows land here (cont_needs_text rows go
-         * through write_cont_completion, which has the same line) -- the
-         * serial path's finalize retokenize, or a cont-served Responses
-         * response reports reasoning_tokens=0.  Found the hard way: the
-         * first fix patched only the cstream writer, and serial-fallback
-         * contamination on floor-rejecting boots made it look green (the
-         * lane-entry counter counts the failed cont attempt too). */
+         * through write_cont_completion, which has the same line) -- without
+         * this a cont-served Responses response reports reasoning_tokens=0.
+         * Found the hard way: the first fix patched only the cstream writer,
+         * and serial-fallback contamination on floor-rejecting boots made it
+         * look green (the lane-entry counter counts the failed cont attempt
+         * too).  Inc 7b: counted during the detok walk (token-aligned), no
+         * finalize retokenize. */
         if (ws.surface == DS4_WIRE_RESPONSES)
-            res.reasoning_tokens = reasoning_token_count(s->engine, reasoning);
+            res.reasoning_tokens = reasoning_tokens;
         wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
         wire_free(&ws);
         free(content);
@@ -15077,23 +15144,13 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
      * only emits the tool_calls delta when none were streamed. */
     tool_calls calls = {0};
     char *content = NULL, *reasoning = NULL;
-    int reasoning_tokens = 0;
     if (j->req.kind == REQ_CHAT && j->req.has_tools)
         cont_resolve_chat(s, j, st, &fin, &content, &reasoning, &calls);
-    else if (st->wsess.live_responses && j->req.kind == REQ_CHAT) {
-        /* Inc 4c: the Responses stream terminal reports reasoning_tokens the
-         * way the serial finalize does -- the same plain parse + retokenize
-         * the buffered twin (write_cont_completion) has carried since 3b.
-         * Two-writers law: surface finalize work lands in BOTH. */
-        char perr[160] = {0};
-        bool recovered = false;
-        parse_generated_message_for_response(st->acc.text.ptr ? st->acc.text.ptr : "",
-                                             false /*has_tools*/, false /*saw_tool_start*/,
-                                             ds4_think_mode_enabled(j->req.think_mode),
-                                             &fin, perr, sizeof(perr),
-                                             &content, &reasoning, &calls, &recovered);
-        reasoning_tokens = reasoning_token_count(s->engine, reasoning);
-    }
+    /* Inc 7b: the Responses reasoning_tokens usage detail comes from the
+     * shared accumulator's generation-side count -- the Inc 4c plain parse
+     * that existed here only to feed the finalize retokenize is gone (and
+     * the tools path, which never got the detail on this terminal, now
+     * reports it too: the serial twin always did). */
     /* Flush any held-back tail, emit the finish chunk + usage + [DONE] -- the
      * exact single-path finalize for each kind.  Inc 0b: completion rows use
      * the serial plain branch (raw-tail flush + text_completion finish),
@@ -15120,7 +15177,8 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
             res.calls = &calls;
             res.prompt_tokens = st->prompt_tokens;
             res.completion_tokens = st->acc.completion;
-            res.reasoning_tokens = reasoning_tokens;   /* Inc 4c: Responses usage detail */
+            if (st->wsess.live_responses)
+                res.reasoning_tokens = st->acc.reasoning_tokens;
             ok = wire_finish_stream(j->fd, s, &j->req, &st->wsess, &res);
         }
         if (!ok) st->failed = true;
@@ -15174,11 +15232,12 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         res.calls = &calls;
         res.prompt_tokens = prompt_tokens;
         res.completion_tokens = st->acc.completion;
-        /* Inc 3b: the Responses usage detail the serial path computes at
-         * finalize (generate_job does the same retokenize) -- without it a
-         * cont-served Responses response would report reasoning_tokens=0. */
+        /* Inc 3b/7b: the Responses usage detail, now the accumulator's
+         * generation-side count (the serial twin reads the same field) --
+         * without it a cont-served Responses response would report
+         * reasoning_tokens=0. */
         if (ws.surface == DS4_WIRE_RESPONSES)
-            res.reasoning_tokens = reasoning_token_count(s->engine, reasoning);
+            res.reasoning_tokens = st->acc.reasoning_tokens;
         wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
         wire_free(&ws);
         free(content);
@@ -15859,7 +15918,8 @@ static void handle_batch(server *s, int fd, const char *body) {
         for (int i = 0; i < n; i++) {
             if (i) buf_putc(&b, ',');
             buf txt = {0};
-            int emitted = detok_result_until_eos(s, res[i].tokens, res[i].n_tokens, eos, &txt);
+            int emitted = detok_result_until_eos(s, res[i].tokens, res[i].n_tokens, eos, &txt,
+                                                 NULL, NULL);
             buf_printf(&b, "{\"index\":%d,\"text\":", i);
             json_escape(&b, txt.ptr ? txt.ptr : "");
             buf_printf(&b, ",\"finish_reason\":\"%s\",\"n_tokens\":%d}",
@@ -18570,7 +18630,7 @@ static void test_responses_usage_reports_cache_details(void) {
 
     responses_stream st;
     responses_stream_init(&r, &st);
-    TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
+    TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL /*raw*/, NULL, NULL,
                                         "stop", 10, 2, 1, 1234));
     shutdown(sv[0], SHUT_WR);
     out = read_socket_text(sv[1]);
@@ -24098,6 +24158,11 @@ static void test_cont_responses_stream_matches_serial_oracle(void) {
                                 st->acc.text.ptr, fr.emit_limit));
     }
     TEST_ASSERT(st->acc.completion == completion);
+    /* Inc 7b: the cont terminal reports the accumulator's generation-side
+     * reasoning count; the direct serial leg below must render the same
+     * number for byte equality (production serial reads the same field). */
+    const int pinned_reasoning = st->acc.reasoning_tokens;
+    TEST_ASSERT(pinned_reasoning > 0);   /* the thinking tape counts */
     cont_stream_finalize(&s, &j, "stop");
     TEST_ASSERT(j.cstream == NULL);
     shutdown(sv[0], SHUT_WR);
@@ -24130,7 +24195,7 @@ static void test_cont_responses_stream_matches_serial_oracle(void) {
     tool_calls empty = {0};
     TEST_ASSERT(responses_sse_finish_live(sv[0], &r, &rst, raw.ptr, raw.len,
                                           NULL, &empty, "stop", 7, completion,
-                                          0 /* NULL-engine retokenize */,
+                                          pinned_reasoning /* Inc 7b: acc count */,
                                           pinned_created));
     shutdown(sv[0], SHUT_WR);
     char *ser_out = read_socket_text(sv[1]);
@@ -24286,6 +24351,7 @@ static void test_sem_accum_feed_verdicts(void) {
     TEST_ASSERT(f.emit_limit == a.text.len);
     TEST_ASSERT(!strcmp(a.text.ptr, "hello world "));
     TEST_ASSERT(a.completion == 2);
+    TEST_ASSERT(a.reasoning_tokens == 0);   /* Inc 7b: think off -> no count */
     sem_accum_free(&a);
     request_free(&r);
 
@@ -24340,6 +24406,9 @@ static void test_sem_accum_feed_verdicts(void) {
     TEST_ASSERT(!d.saw_tool_start && !d.tool_scan_waiting_for_think_close);
     f = sem_accum_feed(&d, &rk, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START));
     TEST_ASSERT(f.entered_tool_block && d.saw_tool_start);
+    /* Inc 7b: generation-side reasoning count -- the two feeds made while
+     * inside <think> (the closer's feed counts; post-close feeds do not). */
+    TEST_ASSERT(d.reasoning_tokens == 2);
     sem_accum_free(&d);
     request_free(&rk);
 }
