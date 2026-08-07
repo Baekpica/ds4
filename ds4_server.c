@@ -8093,6 +8093,14 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/* Inc 7c: integer-exact stamps for the projection-cost and gen_mu-wait
+ * counters (a double would lose ns precision over a long uptime). */
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
@@ -15262,6 +15270,14 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
     cont_stream_discard(j);
 }
 
+/* Inc 7c: one sample of the projection-cost counters (ns spent + one token
+ * of host work) -- called at every cont_on_token exit past the cheap gates. */
+static void cont_ontoken_stamp(uint64_t t0) {
+    ds4_metrics *m = ds4_metrics_get();
+    ds4_metric_add(&m->cont_ontoken_ns, now_ns() - t0);
+    ds4_metric_add(&m->cont_ontoken_tokens, 1);
+}
+
 /* on_token: accumulate one non-EOS token, run the host-side stop/tool scan
  * (A1: the cont-path port of generate_job's per-token scan), and stream a
  * content delta when the row is streaming.  Returns 0 to tell the engine to
@@ -15293,6 +15309,10 @@ static int cont_on_token(void *ud, void *user, int token) {
     t_emit_job = j;                            /* W8a: send_all -> j->out (off the GPU path) */
     if (j->req.stream && !st->started) cont_stream_start(s, j); /* first token: headers + role preamble */
     if (st->failed || j->client_gone) { t_emit_job = NULL; return 0; }
+    /* Inc 7c: measure the host-side per-token cost this callback spends
+     * inside the engine's decode loop (under gen_mu) -- detok + accumulator
+     * + wire projection.  The plan's offload decision reads the quotient. */
+    const uint64_t ontoken_t0 = now_ns();
     size_t pl = 0;
     char *piece = ds4_token_text(s->engine, token, &pl);
     /* Inc 7a: the shared accumulator does append/thinking/DSML/stop/marker
@@ -15337,9 +15357,15 @@ static int cont_on_token(void *ud, void *user, int token) {
             wire_update(j->fd, s, &j->req, &st->wsess,
                         st->acc.text.ptr ? st->acc.text.ptr : "", fr.emit_limit) :
             cont_stream_emit_plain(j, st, fr.emit_limit);
-        if (!ok) { st->failed = true; t_emit_job = NULL; return 0; }
+        if (!ok) {
+            st->failed = true;
+            t_emit_job = NULL;
+            cont_ontoken_stamp(ontoken_t0);
+            return 0;
+        }
     }
     t_emit_job = NULL;
+    cont_ontoken_stamp(ontoken_t0);
 
     /* Scan verdicts abort the row (the engine evicts it); acc.verdict beats
      * the engine's finish at finalize. */
@@ -15900,7 +15926,16 @@ static void handle_batch(server *s, int fd, const char *body) {
     char err[256] = {0};
     int rc = 1;
     if (!oom) {
+        /* Inc 7c: fairness observation -- the continuous epoch holds gen_mu
+         * across its whole rolling loop, so this wait IS the /v1/batch
+         * starvation signal the cut-list check reads. */
+        const uint64_t w0 = now_ns();
         pthread_mutex_lock(&s->gen_mu);
+        {
+            ds4_metrics *m = ds4_metrics_get();
+            ds4_metric_add(&m->batch_genmu_wait_ns, now_ns() - w0);
+            ds4_metric_add(&m->batch_genmu_waits, 1);
+        }
         rc = ds4_engine_batched_generate(s->engine, toks, n, ctx_size, &opts, res, err, sizeof(err));
         pthread_mutex_unlock(&s->gen_mu);
     }
@@ -16083,6 +16118,21 @@ static void send_metrics(server *s, int fd) {
                (unsigned long long)ds4_metric_read(&m->banks_total),
                (unsigned long long)ds4_metric_read(&m->warm_records),
                (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+    /* Inc 7c: projection-cost + /v1/batch fairness observation.  The gate
+     * (and the offload decision) computes ns/token and mean wait from the
+     * quotients; both counters are exact integers. */
+    buf_printf(&b, "# TYPE ds4_cont_ontoken_ns_total counter\n"
+                   "ds4_cont_ontoken_ns_total %llu\n"
+                   "# TYPE ds4_cont_ontoken_tokens_total counter\n"
+                   "ds4_cont_ontoken_tokens_total %llu\n"
+                   "# TYPE ds4_batch_genmu_wait_ns_total counter\n"
+                   "ds4_batch_genmu_wait_ns_total %llu\n"
+                   "# TYPE ds4_batch_genmu_waits_total counter\n"
+                   "ds4_batch_genmu_waits_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->cont_ontoken_ns),
+               (unsigned long long)ds4_metric_read(&m->cont_ontoken_tokens),
+               (unsigned long long)ds4_metric_read(&m->batch_genmu_wait_ns),
+               (unsigned long long)ds4_metric_read(&m->batch_genmu_waits));
     /* Inc 5a: continuation registry (plan §4.6).  published counts records,
      * resolved counts T2 admissions served from a LIVE record, missed counts
      * the native 409 refusals, demoted counts LIVE -> REPLAY_ONLY. */

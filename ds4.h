@@ -552,6 +552,20 @@ typedef struct {
     uint64_t creg_missed;         /* T2 live-state requests refused 409 */
     uint64_t creg_demoted;        /* LIVE -> REPLAY_ONLY transitions */
     uint64_t creg_records_live;   /* gauge: LIVE_FRONTIER records right now */
+    /* v0.5.6 Inc 7c: host-side projection cost inside the engine's per-token
+     * callback (cont_on_token runs under gen_mu on the worker thread -- detok,
+     * semantic accumulator, wire projection into j->out).  Nanoseconds so the
+     * per-token quotient stays integer-exact; tokens counts only callbacks
+     * that did host work (needs-text rows).  The plan's "measure projection
+     * under gen_mu" gate reads these to decide whether offload is warranted. */
+    uint64_t cont_ontoken_ns;
+    uint64_t cont_ontoken_tokens;
+    /* v0.5.6 Inc 7c: /v1/batch fairness observation -- how long the endpoint
+     * waited on gen_mu before its turn (the continuous epoch holds gen_mu
+     * across its whole rolling loop, so this is the starvation signal the
+     * cut-list check reads). */
+    uint64_t batch_genmu_wait_ns;
+    uint64_t batch_genmu_waits;
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);
