@@ -35250,6 +35250,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     int     (**bsoc)(void *, void *) = xcalloc(MS, sizeof(*bsoc));
     /* v0.5.2: per-bank admission-prefill liveness probe (ds4_cont_request.alive). */
     int     (**balive)(void *, void *) = xcalloc(MS, sizeof(*balive));
+    /* v0.5.6 Inc 4a: on_admitted returned cancel -- consumed by the pending-
+     * prefill drain, which unwinds the install exactly like an alive() abort
+     * (before the bank's first chunk: the drain checks this ahead of alive). */
+    uint8_t  *bcancel = xcalloc(MS, sizeof(uint8_t));
     float    *logits  = xmalloc((size_t)MS * DS4_N_VOCAB * sizeof(float));
     float    *seedlog = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     /* R4 (overlap-lite): per-bank pending admission prefill.  A bank mid-prefill
@@ -35919,6 +35923,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 tb->cap = mn;
                 tb->active = 1u;
             }
+            /* Inc 4a: the install is complete and every reject exit is behind
+             * us -- the one moment transport may start (plan §4.7).  The split
+             * reported is the ENGINE's verdict (sst was stamped above), not
+             * the caller's proposal.  A cancel return parks the flag; the
+             * pending-prefill drain below unwinds it via the alive-abort path
+             * before this bank's first chunk runs. */
+            bcancel[b] = 0u;
+            if (req.on_admitted &&
+                !req.on_admitted(ud, req.user, (int)sst[b].prefill_cached,
+                                 (int)sst[b].prefill_computed, (int)b))
+                bcancel[b] = 1u;
         }
         if (!ok) break;
 
@@ -35945,7 +35960,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * and finish the job as an abort (n=0, finish=0 -- non-NULL
                  * tokens so the server does NOT route it to the serial
                  * fallback like a reject). */
-                if (balive[b] && !balive[b](ud, usr[b])) {
+                if (bcancel[b] || (balive[b] && !balive[b](ud, usr[b]))) {
                     /* v0.5.4 (376884 posts 126-127): the interrupted mutation
                      * is NOT discarded.  bank_hist advances only at COMPLETED
                      * chunk boundaries (the A2a invariant), every boundary is
@@ -35957,11 +35972,17 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                      * abort path must reconstruct consistency by hand, and
                      * turns an aborted replay into a warm prefix for the
                      * retry.  wm==0 (nothing completed) keeps the old
-                     * cold-reset behavior exactly. */
+                     * cold-reset behavior exactly.
+                     * Inc 4a: an on_admitted cancel (bcancel) takes the same
+                     * unwind, checked FIRST so it always lands before the
+                     * bank's first chunk -- pfoff is 0, so a warm bank keeps
+                     * its committed prefix and a cold install resets. */
                     const uint32_t wm = pfbase[b] + pfoff[b];
                     fprintf(stderr,
-                            "ds4: cont pending admission aborted (bank %u, client gone, %u/%u prefilled; bank retains %u committed tokens)\n",
-                            b, pfoff[b], pflen[b], ctx->bank_hist_valid[b] ? wm : 0u);
+                            "ds4: cont pending admission aborted (bank %u, %s, %u/%u prefilled; bank retains %u committed tokens)\n",
+                            b, bcancel[b] ? "caller canceled at admission" : "client gone",
+                            pfoff[b], pflen[b], ctx->bank_hist_valid[b] ? wm : 0u);
+                    bcancel[b] = 0u;
                     free(pftok[b]); pftok[b] = NULL;
                     pflen[b] = pfoff[b] = 0u;
                     pfq_h = (pfq_h + 1u) % MS;
@@ -37151,6 +37172,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     free(live); free(usr); free(posv); free(cur); free(beos); free(bmax); free(glen); free(gbuf);
     free(btemp); free(btopk); free(btopp); free(bminp); free(brng); free(bsoc);
     free(balive);
+    free(bcancel);
     free(pftok); free(pflen); free(pfoff); free(pfbase); free(credit); free(pft0); free(sst);
     free(logits); free(seedlog);
     ds4_metric_set(&ds4_metrics_get()->banks_live, 0);

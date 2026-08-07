@@ -370,6 +370,22 @@ typedef struct {
      * array (aborted, NOT rejected: the slot must not fall to the serial
      * path).  Decode-phase aborts stay on_token's business. */
     int      (*alive)(void *ud, void *user);
+    /* v0.5.6 Inc 4a: transport-after-admission signal (may be NULL).  Called
+     * EXACTLY ONCE, on the generate thread, after this request's bank install
+     * fully succeeded -- placement final, warm/fork validation resolved,
+     * lifetime credit installed, bank state mutated -- and BEFORE any of its
+     * prefill chunks run.  n_cached/n_computed are the engine's authoritative
+     * split of the prompt (n_cached + n_computed == n; a degraded warm admit
+     * reports n_cached = 0), bank is the placement.  This is the earliest
+     * moment a caller may commit client-visible transport (SSE headers /
+     * protocol start events): a request the engine REJECTS never gets this
+     * call, so rejection fallback paths stay transport-clean.  Return 1 to
+     * proceed; 0 to cancel the admission before any prefill is spent -- the
+     * bank unwinds exactly like an alive() abort (a warm bank keeps its
+     * committed prefix, a cold install resets to free) and on_done reports an
+     * abort (non-NULL empty tokens, n=0, finish=0), never a reject. */
+    int      (*on_admitted)(void *ud, void *user, int n_cached,
+                            int n_computed, int bank);
     /* A2a warm start.  Zero-init = engine-managed cold admit (the W5..W7
      * behavior, unchanged).  place_bank is a bank id + 1 placement directive
      * (0 = engine picks the first free bank); it lets the caller route a

@@ -13461,19 +13461,28 @@ full_commit:
 
 /* admit: hand the engine the next waiting request, or 0 to stop admitting now. */
 static int cont_sample_override(void *ud, void *user);
+static int cont_on_admitted(void *ud, void *user, int n_cached,
+                            int n_computed, int bank);
+static void cont_prefill_heartbeat(cont_sched *cs, job *j);
 
 /* v0.5.2 inc3: engine liveness probe for a pending admission prefill.
  * Runs on the worker thread between prefill chunks; the MSG_PEEK probe
- * never consumes request bytes.  Marks the job so every later path agrees. */
+ * never consumes request bytes.  Marks the job so every later path agrees.
+ * Inc 4a: doubles as the prefill-phase transport clock for streaming rows --
+ * the poll cadence is the chunk boundary, the same granularity the serial
+ * path's progress-callback keepalive runs at.  The disconnect probe stays
+ * gated on its own knob; the heartbeat rides whichever registration reason
+ * put us here. */
 static int cont_alive(void *ud, void *user) {
-    (void)ud;
+    cont_sched *cs = ud;
     job *j = user;
     if (j->client_gone) return 0;
-    if (client_disconnected(j->fd)) {
+    if (cs->s->disconnect_abort && client_disconnected(j->fd)) {
         j->client_gone = true;
         return 0;
     }
-    return 1;
+    if (j->req.stream) cont_prefill_heartbeat(cs, j);
+    return j->client_gone ? 0 : 1;
 }
 
 static int cont_admit(void *ud, ds4_cont_request *req) {
@@ -13594,8 +13603,16 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     req->sample_override = (j->req.kind == REQ_CHAT && j->req.has_tools) ?
         cont_sample_override : NULL;
     /* v0.5.2 inc3: let the engine drop this admission mid-prefill if the
-     * client dies (the zombie-reap probe, engine-polled between chunks). */
-    req->alive = s->disconnect_abort ? cont_alive : NULL;
+     * client dies (the zombie-reap probe, engine-polled between chunks).
+     * Inc 4a: streaming rows register it unconditionally -- the same poll is
+     * their prefill heartbeat clock (cont_alive gates the disconnect probe on
+     * s->disconnect_abort itself). */
+    req->alive = (s->disconnect_abort || j->req.stream) ? cont_alive : NULL;
+    /* Inc 4a (plan §4.7): transport starts at successful admission, not at
+     * first token -- headers + the protocol start event reach the client
+     * before prefill spends a single chunk, and the engine's split verdict
+     * tightens the warm-match usage proposal above. */
+    req->on_admitted = cont_on_admitted;
     route_metrics_record(&j->req, ROUTE_LANE_CONTINUOUS);
     return 1;
 }
@@ -13622,6 +13639,7 @@ struct cont_stream {
     int    completion;    /* visible (non-EOS) tokens produced */
     bool   started;       /* SSE headers (+ chat role preamble) sent */
     bool   failed;        /* a socket write failed -> stop writing, just finalize */
+    double last_keepalive; /* Inc 4a: last transport byte during prefill (heartbeat clock) */
     /* Inc 0b: legacy-Completion rows stream the serial oracle's plain
      * text_completion chunks (generate_job's plain_stream_pos), NOT the chat
      * delta machine -- this is the emitted-bytes cursor for that path. */
@@ -13715,8 +13733,11 @@ static void cont_stream_error_abort(job *j, const char *msg) {
     cont_stream_discard(j);
 }
 
-/* Send SSE headers + (chat) role preamble and mint the completion id.  Sets
- * failed (not started=false) on a write error so callers stop touching the fd. */
+/* Send SSE headers + the surface's protocol start and mint the completion id.
+ * Sets failed (not started=false) on a write error so callers stop touching
+ * the fd.  Inc 4a: normally called from cont_on_admitted (transport starts at
+ * admission, before prefill); the first-token and finalize call sites remain
+ * as safety nets and are byte-identical when they fire. */
 static void cont_stream_start(server *s, job *j) {
     cont_stream *st = j->cstream;
     snprintf(st->id, sizeof(st->id), "%s-%llu",
@@ -13724,15 +13745,78 @@ static void cont_stream_start(server *s, job *j) {
              (unsigned long long)++s->seq);
     st->prompt_tokens = j->req.prompt.len;
     st->started = true;
+    st->last_keepalive = now_sec();
     wire_init(&st->wsess, wire_surface_for(&j->req), st->id);
-    st->wsess.live_openai = j->req.kind == REQ_CHAT;   /* cont chat rows use the chat delta machine */
+    /* Inc 4a: the chat delta machine belongs to the OPENAI chat surface only
+     * (the old kind==REQ_CHAT test was equivalent while OpenAI was the sole
+     * streaming tenant; the promoted surfaces bring their own machines). */
+    st->wsess.live_openai = j->req.api == API_OPENAI && j->req.kind == REQ_CHAT;
     if (st->wsess.live_openai) {
         openai_stream_start(&j->req, &st->wsess.state.oa_chat); /* THINKING if think enabled, else TEXT */
         st->wsess.protocol_started = true;
     }
     if (!sse_headers(j->fd, s->enable_cors)) { st->failed = true; return; }
-    if (j->req.kind == REQ_CHAT && !sse_chunk(j->fd, &j->req, st->id, NULL, NULL))
+    if (st->wsess.live_openai && !sse_chunk(j->fd, &j->req, st->id, NULL, NULL))
         st->failed = true;                     /* {"delta":{"role":"assistant"}} */
+}
+
+/* Inc 4a (plan §4.7): the engine's install for this request fully succeeded
+ * -- the one moment client-visible transport may begin.  Rejected requests
+ * never reach this callback, so the oversized->serial fallback stays
+ * transport-clean; once this returns 1 a later failure must settle on the
+ * stream (native stream error / CANCELED), never rerun serially.  Also
+ * tightens the warm-match usage PROPOSAL (set at cont_admit) to the engine's
+ * validated split, mapped into the client frame -- the same 3a law
+ * cont_on_done applies to the done stats, so a degraded warm admit stops
+ * reporting phantom cache reads on early events.  Runs on the worker thread;
+ * writes ride the W8a redirect into j->out. */
+static int cont_on_admitted(void *ud, void *user, int n_cached,
+                            int n_computed, int bank) {
+    cont_sched *cs = ud;
+    job *j = user;
+    (void)n_cached;
+    (void)bank;
+    {
+        const int p = j->req.prompt.len;
+        j->req.cache_write_tokens = n_computed > p ? p : n_computed;
+        j->req.cache_read_tokens  = p - j->req.cache_write_tokens;
+    }
+    if (!j->req.stream) return 1;
+    cont_stream *st = cont_stream_ensure(j);
+    if (st->started) return j->client_gone ? 0 : 1;
+    t_emit_job = j;
+    cont_stream_start(cs->s, j);
+    t_emit_job = NULL;
+    if (st->failed || j->client_gone) {
+        j->client_gone = true;   /* cancel: unwind before any prefill spend */
+        return 0;
+    }
+    return 1;
+}
+
+/* Inc 4a: transport heartbeat between a pending admission's prefill chunks
+ * (called from cont_alive, the engine's per-chunk poll).  Anthropic clients
+ * get the protocol's own ping event; the OpenAI-family surfaces get the
+ * SSE comment line the serial path's prefill keepalive already sends.  A
+ * failed emit marks the stream failed; job_emit flags client_gone on its own
+ * caps, and cont_alive re-checks it right after this returns. */
+static void cont_prefill_heartbeat(cont_sched *cs, job *j) {
+    (void)cs;
+    cont_stream *st = j->cstream;
+    if (!st || !st->started || st->failed || j->client_gone) return;
+    const double now = now_sec();
+    if (now - st->last_keepalive < 5.0) return;
+    t_emit_job = j;
+    bool ok;
+    if (j->req.api == API_ANTHROPIC) {
+        ok = sse_event(j->fd, "ping", "{\"type\": \"ping\"}");
+    } else {
+        static const char ka[] = ": prefill\n\n";
+        ok = send_all(j->fd, ka, sizeof(ka) - 1);
+    }
+    t_emit_job = NULL;
+    if (ok) st->last_keepalive = now;
+    else    st->failed = true;
 }
 
 /* Inc 0b: stream a legacy-Completion row's newly-safe bytes as the serial
@@ -21915,6 +21999,120 @@ static void test_cont_completion_stream_matches_serial_oracle(void) {
     close(sv[1]);
 }
 
+/* Inc 4a: transport starts at successful admission (cont_on_admitted) and the
+ * prefill heartbeat emits the surface's native keepalive between chunks.
+ * Production sends ride the W8a t_emit_job redirect into j->out, so the
+ * asserts read the job buffer, exactly what a client thread would drain. */
+static char *job_out_text(job *j) {
+    return xstrndup(j->out.ptr ? j->out.ptr : "", j->out.len);
+}
+static void test_cont_admission_transport_and_heartbeat(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    cont_sched cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.s = &s;
+
+    /* OpenAI chat stream: admission starts headers + role preamble and
+     * tightens the usage proposal to the engine's split (client frame). */
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.api = API_OPENAI;
+    j.req.stream = true;
+    j.req.think_mode = DS4_THINK_NONE;
+    j.req.prompt.len = 10;
+    j.req.cache_read_tokens = 10;   /* stale warm proposal the verdict corrects */
+    j.req.cache_write_tokens = 0;
+    TEST_ASSERT(cont_on_admitted(&cs, &j, 3, 7, 0) == 1);
+    TEST_ASSERT(j.req.cache_write_tokens == 7 && j.req.cache_read_tokens == 3);
+    TEST_ASSERT(j.cstream && j.cstream->started && !j.cstream->failed);
+    TEST_ASSERT(j.cstream->wsess.live_openai);
+    {
+        char *out = job_out_text(&j);
+        TEST_ASSERT(strstr(out, "text/event-stream") != NULL);
+        TEST_ASSERT(strstr(out, "\"delta\":{\"role\":\"assistant\"}") != NULL);
+        free(out);
+    }
+    /* Heartbeat: OpenAI-family rows get the serial keepalive comment; the
+     * 5s cadence gate holds back an immediate second tick. */
+    j.cstream->last_keepalive = now_sec() - 10.0;
+    size_t before = j.out.len;
+    cont_prefill_heartbeat(&cs, &j);
+    {
+        char *out = job_out_text(&j);
+        TEST_ASSERT(j.out.len > before);
+        TEST_ASSERT(strstr(out, ": prefill\n\n") != NULL);
+        TEST_ASSERT(strstr(out, "event: ping") == NULL);
+        free(out);
+    }
+    before = j.out.len;
+    cont_prefill_heartbeat(&cs, &j);
+    TEST_ASSERT(j.out.len == before);   /* inside the cadence window */
+    cont_stream_discard(&j);
+    buf_free(&j.out);
+    request_free(&j.req);
+
+    /* Anthropic chat stream: headers only (its protocol start event is the
+     * 4b machine's business), NEVER the OpenAI role preamble, and the
+     * heartbeat is the protocol's own ping event. */
+    job j2;
+    memset(&j2, 0, sizeof(j2));
+    j2.fd = sv[0];
+    pthread_mutex_init(&j2.mu, NULL);
+    pthread_cond_init(&j2.cv, NULL);
+    request_init(&j2.req, REQ_CHAT, 128);
+    j2.req.api = API_ANTHROPIC;
+    j2.req.stream = true;
+    j2.req.think_mode = DS4_THINK_NONE;
+    j2.req.prompt.len = 4;
+    TEST_ASSERT(cont_on_admitted(&cs, &j2, 0, 4, 1) == 1);
+    TEST_ASSERT(j2.req.cache_write_tokens == 4 && j2.req.cache_read_tokens == 0);
+    TEST_ASSERT(j2.cstream && j2.cstream->started);
+    TEST_ASSERT(!j2.cstream->wsess.live_openai);
+    TEST_ASSERT(j2.cstream->wsess.surface == DS4_WIRE_ANTHROPIC);
+    j2.cstream->last_keepalive = now_sec() - 10.0;
+    cont_prefill_heartbeat(&cs, &j2);
+    {
+        char *out = job_out_text(&j2);
+        TEST_ASSERT(strstr(out, "text/event-stream") != NULL);
+        TEST_ASSERT(strstr(out, "\"delta\":{\"role\":\"assistant\"}") == NULL);
+        TEST_ASSERT(strstr(out, "event: ping") != NULL);
+        TEST_ASSERT(strstr(out, "data: {\"type\": \"ping\"}") != NULL);
+        TEST_ASSERT(strstr(out, ": prefill\n\n") == NULL);
+        free(out);
+    }
+    cont_stream_discard(&j2);
+    buf_free(&j2.out);
+    request_free(&j2.req);
+
+    /* Non-streaming row: usage tightening only -- no transport, no stream
+     * state (the buffered writers own its bytes at on_done). */
+    job j3;
+    memset(&j3, 0, sizeof(j3));
+    j3.fd = sv[0];
+    pthread_mutex_init(&j3.mu, NULL);
+    pthread_cond_init(&j3.cv, NULL);
+    request_init(&j3.req, REQ_CHAT, 128);
+    j3.req.api = API_OPENAI;
+    j3.req.stream = false;
+    j3.req.prompt.len = 6;
+    TEST_ASSERT(cont_on_admitted(&cs, &j3, 6, 9, 2) == 1);
+    TEST_ASSERT(j3.req.cache_write_tokens == 6 && j3.req.cache_read_tokens == 0);
+    TEST_ASSERT(j3.cstream == NULL && j3.out.len == 0);
+    request_free(&j3.req);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
 /* Inc 0b: the three-state decode-budget contract shared by every lane site
  * (serial decode loop, serial fit, footprint, static pack, cont admit).
  * Before the helper, the batched lanes replaced ANY <= 0 with the server
@@ -22619,6 +22817,7 @@ static void ds4_server_unit_tests_run(void) {
     test_wire_finish_buffered_matches_direct_emitters();
     test_wire_finish_stream_matches_direct_dispatch();
     test_cont_completion_stream_matches_serial_oracle();
+    test_cont_admission_transport_and_heartbeat();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
     test_credit_union_merge_shapes();
