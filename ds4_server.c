@@ -11074,6 +11074,157 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+/* ---- Inc 7a: route-neutral semantic accumulator ---------------------------
+ * ONE per-token semantic state machine for generated output, shared by the
+ * serial loop (generate_job) and the continuous on_token callback.  It owns
+ * everything both twins used to duplicate: cumulative text, thinking state,
+ * the DSML sampling tracker, the stop-string scan with its stream hold-back
+ * window, the tool-marker scan with its think gating, the matched-stop
+ * capture, and the finish verdict.  Emission stays with each driver (the
+ * serial writers and the cont wire machines keep their exact bytes); the
+ * drivers feed pieces and act on the returned transitions.
+ *
+ * Ordering contract (both twins agreed on it before the merge): append ->
+ * thinking -> DSML tracker -> stop scan -> tool-marker scan on the still
+ * UNTRUNCATED text -> then apply the stop hit (capture + truncate).  A stop
+ * verdict beats a tool_calls verdict, exactly like both loops' break order.
+ * Truncating inside feed is byte-equivalent to the old truncate-after-emit:
+ * emit_limit == the stop match start == the truncated length, and no writer
+ * reads past its limit. */
+typedef struct {
+    buf text;                    /* cumulative detok'd output */
+    thinking_state thinking;
+    dsml_decode_tracker dsml;    /* advanced only when track_tools */
+    bool track_tools;            /* kind==REQ_CHAT && has_tools */
+    bool think_gates_markers;    /* ds4_think_mode_enabled(think_mode) */
+    bool count_reasoning;        /* Inc 7b: count generated reasoning tokens */
+    bool tool_scan_waiting_for_think_close;
+    size_t stop_scan_from;       /* rolling stop-window start */
+    size_t tool_scan_from;       /* rolling marker-window start */
+    bool saw_tool_start;
+    bool saw_tool_end;
+    bool saw_orphan_tool_end;
+    char *matched_stop;          /* owned; the stop text a scan hit (captured
+                                  * before truncation) */
+    const char *verdict;         /* NULL | "stop" | "tool_calls" -- beats the
+                                  * engine's eos/budget finish at finalize */
+    int completion;              /* visible (non-EOS) tokens fed */
+    int reasoning_tokens;        /* Inc 7b: tokens fed while inside <think> */
+} sem_accum;
+
+/* Per-feed transitions the drivers act on (log lines, trace events, break /
+ * evict decisions).  emit_limit is the stop-safe CUMULATIVE emit boundary --
+ * writers must not put bytes at or beyond it on the wire this feed. */
+typedef struct {
+    size_t emit_limit;
+    bool hit_stop;           /* verdict became "stop" on this feed */
+    bool tool_block_closed;  /* verdict became "tool_calls" on this feed */
+    bool entered_tool_block; /* first tool-call start marker observed */
+    bool orphan_tool_end;    /* first orphan end marker observed */
+} sem_feed;
+
+static void sem_accum_init(sem_accum *a, const request *r) {
+    memset(a, 0, sizeof(*a));
+    dsml_decode_tracker_init(&a->dsml);
+    a->thinking = thinking_state_from_prompt(r);
+    a->track_tools = r->kind == REQ_CHAT && r->has_tools;
+    a->think_gates_markers = ds4_think_mode_enabled(r->think_mode);
+    a->count_reasoning = a->think_gates_markers;
+    a->tool_scan_waiting_for_think_close =
+        a->think_gates_markers && a->thinking.inside;
+}
+
+static void sem_accum_free(sem_accum *a) {
+    buf_free(&a->text);
+    free(a->matched_stop);
+    a->matched_stop = NULL;
+}
+
+/* The serial loop's per-token DSML sampling decision, shared verbatim with
+ * cont_sample_override: structural tool-call syntax forces greedy argmax,
+ * payload bodies (and everything outside a tool block) keep the request's
+ * sampling params. */
+static dsml_decode_state sem_accum_dsml_state(const sem_accum *a) {
+    return a->track_tools ? a->dsml.decode : DSML_DECODE_OUTSIDE;
+}
+
+static sem_feed sem_accum_feed(sem_accum *a, const request *r,
+                               const char *piece, size_t piece_len) {
+    sem_feed f = {0};
+    /* Inc 7b: a generated token is a reasoning token when the model was
+     * inside <think> before producing it (the closer counts; boundary
+     * deviation vs the old finalize retokenize is the documented segment
+     * jitter, clamped by output_tokens at render). */
+    if (a->count_reasoning && a->thinking.inside) a->reasoning_tokens++;
+    buf_append(&a->text, piece, piece_len);
+    thinking_state_feed(&a->thinking, piece, piece_len);
+    if (a->track_tools)
+        dsml_decode_tracker_update(&a->dsml, a->text.ptr, a->text.len);
+    a->completion++;
+
+    /* Stop scan + stream hold-back: never emit bytes that could be a stop
+     * prefix; on a hit the emit boundary is the match start. */
+    size_t stop_pos = 0, stop_len = 0;
+    bool hit_stop = stop_list_find_from(&r->stops, a->text.ptr,
+                                        a->stop_scan_from, &stop_pos, &stop_len);
+    f.emit_limit = hit_stop ?
+        stop_pos : stop_list_stream_safe_len(&r->stops, a->text.len);
+    if (f.emit_limit > a->text.len) f.emit_limit = a->text.len;
+    if (!hit_stop && r->stops.max_len > 1) {
+        const size_t hold = r->stops.max_len - 1;
+        a->stop_scan_from = a->text.len > hold ? a->text.len - hold : 0;
+    }
+
+    /* Tool-marker scan (rolling window), think-gated: a DSML block inside
+     * reasoning is not executable, so markers are only observed after
+     * </think>.  Runs on the UNTRUNCATED text, before the stop hit lands --
+     * both twins ordered it this way. */
+    if (a->track_tools) {
+        if (a->think_gates_markers && a->thinking.inside) {
+            a->tool_scan_waiting_for_think_close = true;
+            a->tool_scan_from = a->text.len;
+        } else {
+            if (a->tool_scan_waiting_for_think_close) {
+                const char *think_end = a->text.ptr ?
+                    find_last_substr(a->text.ptr, "</think>") : NULL;
+                a->tool_scan_from = think_end ?
+                    (size_t)((think_end + 8) - a->text.ptr) : a->text.len;
+                if (a->tool_scan_from > a->text.len) a->tool_scan_from = a->text.len;
+                a->tool_scan_waiting_for_think_close = false;
+            }
+            if (a->tool_scan_from > a->text.len) a->tool_scan_from = a->text.len;
+            const char *tool_scan = a->text.ptr ? a->text.ptr + a->tool_scan_from : "";
+            bool orphan_end = false;
+            const bool old_start = a->saw_tool_start;
+            const bool old_end = a->saw_tool_end;
+            observe_tool_markers(tool_scan, &a->saw_tool_start, &a->saw_tool_end,
+                                 &orphan_end);
+            if (orphan_end && !a->saw_orphan_tool_end) {
+                a->saw_orphan_tool_end = true;
+                f.orphan_tool_end = true;
+            }
+            f.entered_tool_block = a->saw_tool_start && !old_start;
+            f.tool_block_closed = a->saw_tool_end && !old_end;
+            const size_t marker_hold = 80;
+            size_t hold_from = a->text.len > marker_hold ? a->text.len - marker_hold : 0;
+            if (hold_from > a->tool_scan_from) a->tool_scan_from = hold_from;
+        }
+    }
+
+    if (hit_stop) {
+        free(a->matched_stop);   /* Inc 2c: capture before truncation */
+        a->matched_stop = a->text.ptr ? xstrndup(a->text.ptr + stop_pos, stop_len)
+                                      : NULL;
+        a->text.len = stop_pos;
+        if (a->text.ptr) a->text.ptr[a->text.len] = '\0';
+        a->verdict = "stop";
+        f.hit_stop = true;
+    } else if (a->track_tools && a->saw_tool_end && !a->verdict) {
+        a->verdict = "tool_calls";
+    }
+    return f;
+}
+
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
     const char *p = prompt_text;
@@ -11992,18 +12143,15 @@ static void generate_job(server *s, job *j) {
     int serial_decode_steps = 0;
 decode_again:
     ;
-    buf text = {0};
+    /* Inc 7a: ALL per-token semantic state lives in the shared accumulator;
+     * this loop is now the serial DRIVER -- sampling, engine eval, emission,
+     * logging, and session bookkeeping around sem_accum_feed. */
+    sem_accum acc;
+    sem_accum_init(&acc, &j->req);
     size_t plain_stream_pos = 0;
-    size_t stop_scan_from = 0;
     const char *finish = "length";
-    char *matched_stop = NULL;   /* Inc 2c: the stop-sequence text a scan hit */
-    int completion = 0;
     int max_tokens = request_decode_budget(&j->req, s->default_tokens);
     int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
-    bool saw_tool_start = false;
-    bool saw_tool_end = false;
-    bool saw_orphan_tool_end = false;
-    size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
     if (max_tokens > room) max_tokens = room;   /* helper never returns < 0 */
@@ -12011,14 +12159,8 @@ decode_again:
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
-    thinking_state thinking = thinking_state_from_prompt(&j->req);
-    const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
-    bool tool_scan_waiting_for_think_close =
-        thinking_gates_tool_markers && thinking.inside;
-    dsml_decode_tracker dsml_tracker;
-    dsml_decode_tracker_init(&dsml_tracker);
 
-    while (!g_stop_requested && completion < max_tokens &&
+    while (!g_stop_requested && acc.completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         /* v0.5.2 inc3: a dead client's serial job must not decode to its full
          * budget (non-streaming never writes the fd until done, so a failed
@@ -12028,14 +12170,13 @@ decode_again:
             j->client_gone = true;
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: serial decode aborted at %d tokens: client disconnected",
-                       completion);
+                       acc.completion);
             break;
         }
-        const int step_comp0 = completion;
-        dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
-            dsml_tracker.decode : DSML_DECODE_OUTSIDE;
+        const int step_comp0 = acc.completion;
+        const dsml_decode_state dsml_state = sem_accum_dsml_state(&acc);
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
+        if (!(acc.track_tools && (acc.saw_tool_start || in_tool_call))) {
             kv_cache_maybe_store_continued(s);
         }
         float temperature = j->req.temperature;
@@ -12065,7 +12206,7 @@ decode_again:
         {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
-                                                       max_tokens - completion,
+                                                       max_tokens - acc.completion,
                                                        ds4_token_eos(s->engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
@@ -12085,7 +12226,7 @@ decode_again:
         }
 
         bool stop_decode = false;
-        for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
+        for (int ti = 0; ti < ntok && acc.completion < max_tokens; ti++) {
             token = toks[ti];
             if (token == ds4_token_eos(s->engine)) {
                 finish = "stop";
@@ -12095,41 +12236,27 @@ decode_again:
 
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
-            completion++;
             if (t_first_tok == 0.0) t_first_tok = now_sec();
 
             trace_piece(s, trace_id, piece, piece_len);
-            buf_append(&text, piece, piece_len);
+            /* Inc 7a: the shared accumulator does append/thinking/DSML/stop/
+             * marker work; the serial driver keeps its exact emission (incl.
+             * the plain path's UTF-8 clamp) and session bookkeeping. */
+            const sem_feed fr = sem_accum_feed(&acc, &j->req, piece, piece_len);
+            free(piece);
             if (openai_live_chat) {
-                openai_stream_record_token(&wsess.state.oa_chat, token, text.len);
+                openai_stream_record_token(&wsess.state.oa_chat, token, acc.text.len);
             }
-            thinking_state_feed(&thinking, piece, piece_len);
-            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-                dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
-            }
-
-            size_t stop_pos = 0, stop_len = 0;
-            bool hit_stop = stop_list_find_from(&j->req.stops, text.ptr,
-                                                stop_scan_from,
-                                                &stop_pos, &stop_len);
-            size_t stream_len = hit_stop ?
-                stop_pos : stop_list_stream_safe_len(&j->req.stops, text.len);
-            if (stream_len > text.len) stream_len = text.len;
-            stream_len = utf8_stream_safe_len(text.ptr, plain_stream_pos,
-                                              stream_len, hit_stop);
-            if (!hit_stop && j->req.stops.max_len > 1) {
-                const size_t hold = j->req.stops.max_len - 1;
-                stop_scan_from = text.len > hold ? text.len - hold : 0;
-            }
+            size_t stream_len = utf8_stream_safe_len(acc.text.ptr, plain_stream_pos,
+                                                     fr.emit_limit, fr.hit_stop);
 
             if (j->req.stream && !structured_stream && stream_len > plain_stream_pos) {
-                char *delta = xstrndup(text.ptr + plain_stream_pos, stream_len - plain_stream_pos);
+                char *delta = xstrndup(acc.text.ptr + plain_stream_pos, stream_len - plain_stream_pos);
                 bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
                 free(delta);
                 if (!ok) {
                     finish = "error";
                     snprintf(err, sizeof(err), "client stream write failed");
-                    free(piece);
                     stop_decode = true;
                     break;
                 }
@@ -12137,122 +12264,89 @@ decode_again:
             }
             if (j->req.stream && j->req.api == API_ANTHROPIC &&
                 !anthropic_sse_stream_update(j->fd, s, &j->req, id,
-                                             &wsess.state.anthropic, text.ptr, stream_len,
+                                             &wsess.state.anthropic, acc.text.ptr, stream_len,
                                              false)) {
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
-                free(piece);
                 stop_decode = true;
                 break;
             }
             if (openai_live_chat &&
                 !openai_sse_stream_update(j->fd, s, &j->req, id,
-                                          &wsess.state.oa_chat, text.ptr, stream_len,
+                                          &wsess.state.oa_chat, acc.text.ptr, stream_len,
                                           false)) {
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
-                free(piece);
                 stop_decode = true;
                 break;
             }
             if (responses_live_chat &&
                 !responses_sse_stream_update(j->fd, &j->req,
-                                             &wsess.state.responses, text.ptr, stream_len,
+                                             &wsess.state.responses, acc.text.ptr, stream_len,
                                              false)) {
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
-                free(piece);
                 stop_decode = true;
                 break;
             }
-            free(piece);
 
-            if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-                if (thinking_gates_tool_markers && thinking.inside) {
-                    /* A DSML block inside reasoning is not executable.  This is
-                     * the live guard: do not let a quoted or mistaken marker in
-                     * <think> stop decoding as a real tool call. */
-                    tool_scan_waiting_for_think_close = true;
-                    tool_scan_from = text.len;
-                } else {
-                    if (tool_scan_waiting_for_think_close) {
-                        const char *think_end = find_last_substr(text.ptr, "</think>");
-                        tool_scan_from = think_end ? (size_t)((think_end + 8) - text.ptr) : text.len;
-                        if (tool_scan_from > text.len) tool_scan_from = text.len;
-                        tool_scan_waiting_for_think_close = false;
-                    }
-                    if (tool_scan_from > text.len) tool_scan_from = text.len;
-                    const char *tool_scan = text.ptr ? text.ptr + tool_scan_from : "";
-                    bool orphan_end = false;
-                    bool old_start = saw_tool_start;
-                    bool old_end = saw_tool_end;
-                    observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
-                    if (orphan_end && !saw_orphan_tool_end) {
-                        saw_orphan_tool_end = true;
-                        server_log(DS4_LOG_WARNING,
-                                   "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
-                                   ctx_span,
-                                   req_flags[0] ? " " : "",
-                                   req_flags,
-                                   completion);
-                        trace_event(s, trace_id,
-                                    "ignored orphan tool-call end marker after %d generated tokens",
-                                    completion);
-                    }
-                    if (saw_tool_start && !old_start) {
-                        trace_event(s, trace_id, "entered tool-call block after %d generated tokens", completion);
-                    }
-                    if (saw_tool_end && !old_end) {
-                        trace_event(s, trace_id, "closed tool-call block after %d generated tokens", completion);
-                    }
-                    const size_t marker_hold = 80;
-                    size_t hold_from = text.len > marker_hold ? text.len - marker_hold : 0;
-                    if (hold_from > tool_scan_from) tool_scan_from = hold_from;
-                    if (s->trace && completion >= next_tool_progress) {
-                        trace_event(s, trace_id,
-                                    "progress gen=%d dsml_start=%d dsml_end=%d",
-                                    completion, saw_tool_start ? 1 : 0, saw_tool_end ? 1 : 0);
-                        next_tool_progress += 128;
-                    }
-                }
+            if (fr.orphan_tool_end) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           acc.completion);
+                trace_event(s, trace_id,
+                            "ignored orphan tool-call end marker after %d generated tokens",
+                            acc.completion);
+            }
+            if (fr.entered_tool_block) {
+                trace_event(s, trace_id, "entered tool-call block after %d generated tokens", acc.completion);
+            }
+            if (fr.tool_block_closed) {
+                trace_event(s, trace_id, "closed tool-call block after %d generated tokens", acc.completion);
+            }
+            if (acc.track_tools && s->trace && acc.completion >= next_tool_progress &&
+                !(acc.think_gates_markers && acc.thinking.inside)) {
+                trace_event(s, trace_id,
+                            "progress gen=%d dsml_start=%d dsml_end=%d",
+                            acc.completion, acc.saw_tool_start ? 1 : 0, acc.saw_tool_end ? 1 : 0);
+                next_tool_progress += 128;
             }
 
-            if (completion >= next_decode_log) {
-                log_decode_progress(j->req.kind, prompt_tokens, completion,
+            if (acc.completion >= next_decode_log) {
+                log_decode_progress(j->req.kind, prompt_tokens, acc.completion,
                                     responses_protocol,
                                     j->req.has_tools,
-                                    thinking.inside,
-                                    saw_tool_start,
-                                    saw_tool_end,
+                                    acc.thinking.inside,
+                                    acc.saw_tool_start,
+                                    acc.saw_tool_end,
                                     decode_t0,
                                     &last_decode_log_t,
                                     &last_decode_log_completion);
                 next_decode_log += 50;
             }
 
-            if (hit_stop) {
+            if (fr.hit_stop) {
                 finish = "stop";
-                free(matched_stop);   /* Inc 2c: capture before truncation */
-                matched_stop = xstrndup(text.ptr + stop_pos, stop_len);
-                text.len = stop_pos;
-                text.ptr[text.len] = '\0';
                 ds4_session_invalidate(s->session);
                 stop_decode = true;
                 break;
             }
 
-            if (j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_end) {
+            if (acc.track_tools && acc.saw_tool_end) {
                 finish = "tool_calls";
                 stop_decode = true;
                 break;
             }
         }
         /* v0.2.x observability: one registry update per serial decode step. */
-        if (completion > step_comp0) {
+        if (acc.completion > step_comp0) {
             ds4_metric_add(&ds4_metrics_get()->tokens_decoded,
-                           (uint64_t)(completion - step_comp0));
+                           (uint64_t)(acc.completion - step_comp0));
             ds4_metric_add(&ds4_metrics_get()->decode_steps, 1);
-            ds4_metrics_window_add((uint64_t)(completion - step_comp0), 1, 0);
+            ds4_metrics_window_add((uint64_t)(acc.completion - step_comp0), 1, 0);
             serial_decode_steps++;
         }
         if (stop_decode) break;
@@ -12264,7 +12358,7 @@ decode_again:
     }
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
-        saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
+        acc.saw_tool_start && !acc.saw_tool_end && strcmp(finish, "error") != 0)
     {
         /* Deterministically complete a simple truncation.  Anything more than
          * missing closing tags stays model-owned: for non-streaming requests,
@@ -12272,7 +12366,7 @@ decode_again:
          * the model issue a fresh call. */
         bool completed_truncation = false;
         buf repaired = {0};
-        if (try_repair_dsml(text.ptr, text.len, &repaired)) {
+        if (try_repair_dsml(acc.text.ptr, acc.text.len, &repaired)) {
             /* Parse repaired text to verify it produces valid tool calls */
             tool_calls test_calls = {0};
             char *test_content = NULL;
@@ -12282,10 +12376,10 @@ decode_again:
             free(test_reasoning);
             if (repair_ok && test_calls.len > 0) {
                 /* Repair succeeded - replace text with repaired version */
-                free(text.ptr);
-                text.ptr = buf_take(&repaired);
-                text.len = strlen(text.ptr);
-                saw_tool_end = true;
+                free(acc.text.ptr);
+                acc.text.ptr = buf_take(&repaired);
+                acc.text.len = strlen(acc.text.ptr);
+                acc.saw_tool_end = true;
                 completed_truncation = true;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
@@ -12324,7 +12418,7 @@ decode_again:
                            req_flags);
                 trace_event(s, trace_id,
                             "unterminated tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, &j->req, &thinking,
+                if (continue_after_invalid_dsml(s, &j->req, &acc.thinking,
                                                 "unterminated tool call",
                                                 &recovery_tokens,
                                                 recovery_err,
@@ -12341,8 +12435,7 @@ decode_again:
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
                     buf_free(&repaired);
-                    buf_free(&text);
-                    free(matched_stop);
+                    sem_accum_free(&acc);
                     goto decode_again;
                 }
                 finish = "error";
@@ -12356,20 +12449,20 @@ decode_again:
         buf_free(&repaired);
     }
 
-    if (completion > last_decode_log_completion) {
-        log_decode_progress(j->req.kind, prompt_tokens, completion,
+    if (acc.completion > last_decode_log_completion) {
+        log_decode_progress(j->req.kind, prompt_tokens, acc.completion,
                             responses_protocol,
                             j->req.has_tools,
-                            thinking.inside,
-                            saw_tool_start,
-                            saw_tool_end,
+                            acc.thinking.inside,
+                            acc.saw_tool_start,
+                            acc.saw_tool_end,
                             decode_t0,
                             &last_decode_log_t,
                             &last_decode_log_completion);
     }
 
-    if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
-        char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
+    if (j->req.stream && !structured_stream && acc.text.len > plain_stream_pos) {
+        char *tail = xstrndup(acc.text.ptr + plain_stream_pos, acc.text.len - plain_stream_pos);
         if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
         free(tail);
     }
@@ -12381,9 +12474,9 @@ decode_again:
     bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
         bool parsed_ok = parse_generated_message_for_response(
-            text.ptr ? text.ptr : "",
+            acc.text.ptr ? acc.text.ptr : "",
             j->req.has_tools,
-            saw_tool_start,
+            acc.saw_tool_start,
             ds4_think_mode_enabled(j->req.think_mode),
             &final_finish,
             err,
@@ -12392,7 +12485,7 @@ decode_again:
             &parsed_reasoning,
             &parsed_calls,
             &recovered_tool_parse_failure);
-        if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
+        if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && acc.saw_tool_start) {
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
              * execute the block, feed the model a tool error and the protocol
@@ -12411,7 +12504,7 @@ decode_again:
                            req_flags);
                 trace_event(s, trace_id,
                             "invalid tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, &j->req, &thinking,
+                if (continue_after_invalid_dsml(s, &j->req, &acc.thinking,
                                                 detail,
                                                 &recovery_tokens,
                                                 recovery_err,
@@ -12430,8 +12523,7 @@ decode_again:
                     free(parsed_content);
                     free(parsed_reasoning);
                     tool_calls_free(&parsed_calls);
-                    buf_free(&text);
-                    free(matched_stop);
+                    sem_accum_free(&acc);
                     goto decode_again;
                 }
                 final_finish = "error";
@@ -12443,7 +12535,7 @@ decode_again:
                 size_t dsml_snippet_len = 0;
                 const char *dsml_start = NULL;
                 const char *p;
-                for (p = text.ptr; p && (size_t)(p - text.ptr) < text.len - 20; p++) {
+                for (p = acc.text.ptr; p && (size_t)(p - acc.text.ptr) < acc.text.len - 20; p++) {
                     if ((strncmp(p, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START)) == 0) ||
                         (strncmp(p, DS4_TOOL_CALLS_START_SHORT, strlen(DS4_TOOL_CALLS_START_SHORT)) == 0) ||
                         (strncmp(p, "<tool_calls>", 12) == 0)) {
@@ -12452,22 +12544,22 @@ decode_again:
                     }
                 }
                 if (dsml_start) {
-                    dsml_snippet_len = text.len - (dsml_start - text.ptr);
+                    dsml_snippet_len = acc.text.len - (dsml_start - acc.text.ptr);
                     if (dsml_snippet_len > 500) dsml_snippet_len = 500;
                 }
                 /* Also log a snippet of the full text to see what the model output */
-                size_t text_snippet_len = text.len > 300 ? 300 : text.len;
+                size_t text_snippet_len = acc.text.len > 300 ? 300 : acc.text.len;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
                            ctx_span,
                            req_flags[0] ? " " : "",
                            req_flags,
                            final_finish,
-                           text.len,
-                           saw_tool_start,
-                           saw_tool_end,
+                           acc.text.len,
+                           acc.saw_tool_start,
+                           acc.saw_tool_end,
                            (int)text_snippet_len,
-                           text.ptr ? text.ptr : "(null)");
+                           acc.text.ptr ? acc.text.ptr : "(null)");
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
                            ctx_span,
@@ -12492,9 +12584,9 @@ decode_again:
     log_tool_calls_summary(ctx_span, &parsed_calls,
                            responses_protocol);
 
-    trace_finish(s, trace_id, &j->req, final_finish, completion,
-                 saw_tool_start, saw_tool_end,
-                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+    trace_finish(s, trace_id, &j->req, final_finish, acc.completion,
+                 acc.saw_tool_start, acc.saw_tool_end,
+                 parsed_content ? parsed_content : (acc.text.ptr ? acc.text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
     /* Inc 5a: tool turns publish a continuation record binding this turn's
@@ -12572,7 +12664,7 @@ decode_again:
     } else if (parsed_calls.len) {
         thinking_live_clear(s);
     } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
+               should_remember_thinking_checkpoint(&j->req, &acc.thinking, final_finish)) {
         remember_thinking_checkpoint(s, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
@@ -12582,7 +12674,7 @@ decode_again:
     /* v0.2.x observability: serial-path timings (per-request speculation
      * detail is engine-internal on this path, so the spec fields stay 0 and
      * append_timings_json omits them). */
-    if (completion > 0 && t_first_tok > 0.0) {
+    if (acc.completion > 0 && t_first_tok > 0.0) {
         req_timings *t = &j->req.timings;
         t->valid = true;
         t->ttft_ms = j->t_arrive > 0.0 ? (t_first_tok - j->t_arrive) * 1e3 : 0.0;
@@ -12590,7 +12682,7 @@ decode_again:
         t->decode_ms = (now_sec() - t_first_tok) * 1e3;
         t->prefill_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
         t->prefill_cached = cached;
-        t->decode_tokens = completion;
+        t->decode_tokens = acc.completion;
         t->decode_steps = serial_decode_steps;
     }
 
@@ -12603,18 +12695,18 @@ decode_again:
          * diff is empty. */
         ds4_wire_result res = {0};
         wire_result_set_finish(&res, final_finish);
-        res.matched_stop = matched_stop;
-        if (matched_stop && res.stop_cause == DS4_STOP_EOS)
+        res.matched_stop = acc.matched_stop;
+        if (acc.matched_stop && res.stop_cause == DS4_STOP_EOS)
             res.stop_cause = DS4_STOP_SEQUENCE;   /* Inc 2c: EOS vs stop hit */
-        res.raw = text.ptr ? text.ptr : "";
-        res.raw_len = text.len;
-        res.content = parsed_content ? parsed_content : (text.ptr ? text.ptr : "");
+        res.raw = acc.text.ptr ? acc.text.ptr : "";
+        res.raw_len = acc.text.len;
+        res.content = parsed_content ? parsed_content : (acc.text.ptr ? acc.text.ptr : "");
         res.reasoning = parsed_reasoning;
         res.recovered = recovered_tool_parse_failure;
         res.recovered_content = recovered_tool_parse_failure ? parsed_content : NULL;
         res.calls = &parsed_calls;
         res.prompt_tokens = prompt_tokens;
-        res.completion_tokens = completion;
+        res.completion_tokens = acc.completion;
         if (wsess.surface == DS4_WIRE_RESPONSES)
             res.reasoning_tokens = reasoning_token_count(s->engine, parsed_reasoning);
         if (pub_pending) {
@@ -12657,14 +12749,14 @@ decode_again:
         log_flags(flags, sizeof(flags),
                   responses_protocol,
                   true,
-                  thinking.inside,
-                  saw_tool_start,
-                  saw_tool_end);
+                  acc.thinking.inside,
+                  acc.saw_tool_start,
+                  acc.saw_tool_end);
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        ctx_span,
-                       completion,
+                       acc.completion,
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -12674,7 +12766,7 @@ decode_again:
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
                        ctx_span,
-                       completion,
+                       acc.completion,
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -12685,7 +12777,7 @@ decode_again:
         log_flags(flags, sizeof(flags),
                   responses_protocol,
                   j->req.has_tools,
-                  thinking.inside,
+                  acc.thinking.inside,
                   false,
                   false);
         if (!strcmp(final_finish, "error") && err[0]) {
@@ -12693,7 +12785,7 @@ decode_again:
                        "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
-                       completion,
+                       acc.completion,
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -12704,7 +12796,7 @@ decode_again:
                        "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
-                       completion,
+                       acc.completion,
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -12715,8 +12807,7 @@ decode_again:
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
     wire_free(&wsess);
-    buf_free(&text);
-    free(matched_stop);
+    sem_accum_free(&acc);
     ds4_tokens_free(&effective_prompt);
 }
 
@@ -14698,7 +14789,14 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
  * deltas, token_ids -- so thinking and tools rows stream here too. */
 struct cont_stream {
     char   id[96];        /* minted chatcmpl-/cmpl-<seq> */
-    buf    text;          /* cumulative detok'd output (the openai_stream "raw" buffer) */
+    /* Inc 7a: ALL per-token semantic state (cumulative text, thinking, DSML
+     * sampling tracker, stop scan + hold-back, tool-marker scan, matched
+     * stop, finish verdict) lives in the SHARED accumulator -- the same
+     * machine generate_job's loop feeds.  acc.text is also accumulated for
+     * NON-streaming rows that need scanning (cont_needs_text); plain
+     * non-streaming rows still skip detok entirely.  acc.verdict beats the
+     * engine's eos/budget finish at finalize. */
+    sem_accum acc;
     /* W7-followup: reuse the single path's OpenAI SSE projection so a thinking
      * request streams reasoning_content vs content with the SAME <think>/</think>
      * split + hold-back logic.  A1: the machine's TOOL mode is now exercised too
@@ -14706,7 +14804,6 @@ struct cont_stream {
      * streaming chat rows also record token ids into it (return_token_ids). */
     ds4_wire_session wsess;   /* Inc 1: owns the machine + identity for the stream terminal */
     int    prompt_tokens; /* for the usage chunk */
-    int    completion;    /* visible (non-EOS) tokens produced */
     bool   started;       /* SSE headers (+ chat role preamble) sent */
     bool   failed;        /* a socket write failed -> stop writing, just finalize */
     double last_keepalive; /* Inc 4a: last transport byte during prefill (heartbeat clock) */
@@ -14714,31 +14811,6 @@ struct cont_stream {
      * text_completion chunks (generate_job's plain_stream_pos), NOT the chat
      * delta machine -- this is the emitted-bytes cursor for that path. */
     size_t plain_stream_pos;
-    /* A1: host-side stop/tool scan state -- the cont-path port of
-     * generate_job's per-token scan, so stop-string and tool-call requests ride
-     * the batched path.  `text` is also accumulated for NON-streaming rows that
-     * need scanning (cont_needs_text); plain non-streaming rows still skip
-     * detok entirely. */
-    size_t stop_scan_from;     /* rolling stop-window start */
-    size_t tool_scan_from;     /* rolling marker-window start */
-    bool   saw_tool_start;
-    bool   saw_tool_end;
-    bool   saw_orphan_tool_end;
-    const char *finish_override; /* "stop"/"tool_calls": scan verdict; beats the
-                                  * engine's eos/budget finish at finalize */
-    char *matched_stop;          /* Inc 2c: the stop-sequence text the scan hit
-                                  * (owned; captured before truncation) */
-    /* Spec+tools: the cont-path port of generate_job's per-token DSML sampling
-     * override.  The tracker follows the row's cumulative text exactly like the
-     * serial loop's dsml_tracker; cont_sample_override (registered per admit as
-     * ds4_cont_request.sample_override) reads its decode state to force
-     * structural syntax to argmax while payload keeps the seq params.
-     * `thinking` gates the tool-MARKER scan only (a DSML block inside <think>
-     * is not executable), mirroring tool_scan_waiting_for_think_close -- the
-     * sampler override itself is NOT think-gated, same as the serial path. */
-    dsml_decode_tracker dsml_tracker;
-    thinking_state      thinking;
-    bool tool_scan_waiting_for_think_close;
 };
 
 /* A1: does this row need host-side text (stream projection or stop/tool scan)? */
@@ -14752,10 +14824,7 @@ static cont_stream *cont_stream_ensure(job *j) {
     if (!j->cstream) {
         j->cstream = xmalloc(sizeof(*j->cstream));
         memset(j->cstream, 0, sizeof(*j->cstream));
-        dsml_decode_tracker_init(&j->cstream->dsml_tracker);
-        j->cstream->thinking = thinking_state_from_prompt(&j->req);
-        j->cstream->tool_scan_waiting_for_think_close =
-            ds4_think_mode_enabled(j->req.think_mode) && j->cstream->thinking.inside;
+        sem_accum_init(&j->cstream->acc, &j->req);
     }
     return j->cstream;
 }
@@ -14773,7 +14842,7 @@ static int cont_sample_override(void *ud, void *user) {
     (void)ud;
     job *j = user;
     if (!j->cstream) return 0;
-    const dsml_decode_state state = j->cstream->dsml_tracker.decode;
+    const dsml_decode_state state = sem_accum_dsml_state(&j->cstream->acc);
     return dsml_decode_state_is_tool(state) &&
            !dsml_decode_state_uses_payload_sampling(state);
 }
@@ -14783,8 +14852,7 @@ static int cont_sample_override(void *ud, void *user) {
 static void cont_stream_discard(job *j) {
     if (!j->cstream) return;
     wire_free(&j->cstream->wsess);
-    buf_free(&j->cstream->text);
-    free(j->cstream->matched_stop);
+    sem_accum_free(&j->cstream->acc);
     free(j->cstream);
     j->cstream = NULL;
 }
@@ -14897,7 +14965,7 @@ static void cont_prefill_heartbeat(cont_sched *cs, job *j) {
  * hold-back call (generate_job's plain-stream branch).  `limit` is the
  * stop-safe stream length the caller already computed. */
 static bool cont_stream_emit_plain(job *j, cont_stream *st, size_t limit) {
-    const char *raw = st->text.ptr ? st->text.ptr : "";
+    const char *raw = st->acc.text.ptr ? st->acc.text.ptr : "";
     size_t safe = utf8_stream_safe_len(raw, st->plain_stream_pos, limit, false);
     if (safe <= st->plain_stream_pos) return true;
     char *delta = xstrndup(raw + st->plain_stream_pos, safe - st->plain_stream_pos);
@@ -14913,24 +14981,24 @@ static bool cont_stream_emit_plain(job *j, cont_stream *st, size_t limit) {
  * batched path cannot run: an unrepairable/unparsable block lands exactly
  * where the serial STREAMING branch lands (raw text fallback / "error"
  * finish), it just can't feed the model a corrective tool error mid-flight.
- * May replace st->text with the repaired block (the serial buf_take pattern). */
+ * May replace st->acc.text with the repaired block (the serial buf_take pattern). */
 static void cont_resolve_chat(server *s, job *j, cont_stream *st,
                               const char **fin_io,
                               char **content, char **reasoning,
                               tool_calls *calls) {
-    if (j->req.has_tools && st->saw_tool_start && !st->saw_tool_end) {
+    if (j->req.has_tools && st->acc.saw_tool_start && !st->acc.saw_tool_end) {
         /* Budget/eviction cut the block: deterministically complete a simple
          * truncation (verify the repaired text actually parses to calls). */
         buf repaired = {0};
-        if (try_repair_dsml(st->text.ptr, st->text.len, &repaired)) {
+        if (try_repair_dsml(st->acc.text.ptr, st->acc.text.len, &repaired)) {
             tool_calls tc = {0};
             char *c2 = NULL, *r2 = NULL;
             if (parse_generated_message_ex(repaired.ptr, false, &c2, &r2, &tc) &&
                 tc.len > 0) {
-                free(st->text.ptr);
-                st->text.ptr = buf_take(&repaired);
-                st->text.len = strlen(st->text.ptr);
-                st->saw_tool_end = true;
+                free(st->acc.text.ptr);
+                st->acc.text.ptr = buf_take(&repaired);
+                st->acc.text.len = strlen(st->acc.text.ptr);
+                st->acc.saw_tool_end = true;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: cont chat repaired unterminated tool call (%d calls recovered)",
                            tc.len);
@@ -14943,7 +15011,7 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
         } else {
             buf_free(&repaired);
         }
-        if (!st->saw_tool_end) {
+        if (!st->acc.saw_tool_end) {
             if (strcmp(*fin_io, "length") == 0) {
                 /* #13 twin (Inc 0b): the token budget cut the call
                  * mid-emission and repair could not complete it.  Keep the
@@ -14963,8 +15031,8 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
     }
     char perr[160] = {0};
     bool recovered = false;
-    parse_generated_message_for_response(st->text.ptr ? st->text.ptr : "",
-                                         j->req.has_tools, st->saw_tool_start,
+    parse_generated_message_for_response(st->acc.text.ptr ? st->acc.text.ptr : "",
+                                         j->req.has_tools, st->acc.saw_tool_start,
                                          ds4_think_mode_enabled(j->req.think_mode),
                                          fin_io, perr, sizeof(perr),
                                          content, reasoning, calls, &recovered);
@@ -15003,7 +15071,7 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
 static void cont_stream_finalize(server *s, job *j, const char *fin) {
     cont_stream *st = cont_stream_ensure(j);   /* empty completion (EOS at seed) still closes cleanly */
     if (!st->started) cont_stream_start(s, j);
-    if (st->finish_override) fin = st->finish_override;
+    if (st->acc.verdict) fin = st->acc.verdict;
     /* A1: chat rows resolve tool calls/reasoning exactly like the single path;
      * the SSE machine already streamed tool deltas (TOOL mode), so finish_live
      * only emits the tool_calls delta when none were streamed. */
@@ -15019,7 +15087,7 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
          * Two-writers law: surface finalize work lands in BOTH. */
         char perr[160] = {0};
         bool recovered = false;
-        parse_generated_message_for_response(st->text.ptr ? st->text.ptr : "",
+        parse_generated_message_for_response(st->acc.text.ptr ? st->acc.text.ptr : "",
                                              false /*has_tools*/, false /*saw_tool_start*/,
                                              ds4_think_mode_enabled(j->req.think_mode),
                                              &fin, perr, sizeof(perr),
@@ -15035,23 +15103,23 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
          * rows flush the plain tail (an update, kept here) and then take the
          * wrapper's plain chunk+done branch -- same dispatch, same bytes. */
         bool ok = true;
-        if (j->req.kind != REQ_CHAT && st->text.len > st->plain_stream_pos) {
-            char *tail = xstrndup(st->text.ptr + st->plain_stream_pos,
-                                  st->text.len - st->plain_stream_pos);
+        if (j->req.kind != REQ_CHAT && st->acc.text.len > st->plain_stream_pos) {
+            char *tail = xstrndup(st->acc.text.ptr + st->plain_stream_pos,
+                                  st->acc.text.len - st->plain_stream_pos);
             ok = sse_chunk(j->fd, &j->req, st->id, tail, NULL);
             free(tail);
         }
         if (ok) {
             ds4_wire_result res = {0};
             wire_result_set_finish(&res, fin);
-            res.matched_stop = st->matched_stop;
-            if (st->matched_stop && res.stop_cause == DS4_STOP_EOS)
+            res.matched_stop = st->acc.matched_stop;
+            if (st->acc.matched_stop && res.stop_cause == DS4_STOP_EOS)
                 res.stop_cause = DS4_STOP_SEQUENCE;
-            res.raw = st->text.ptr ? st->text.ptr : "";
-            res.raw_len = st->text.len;
+            res.raw = st->acc.text.ptr ? st->acc.text.ptr : "";
+            res.raw_len = st->acc.text.len;
             res.calls = &calls;
             res.prompt_tokens = st->prompt_tokens;
-            res.completion_tokens = st->completion;
+            res.completion_tokens = st->acc.completion;
             res.reasoning_tokens = reasoning_tokens;   /* Inc 4c: Responses usage detail */
             ok = wire_finish_stream(j->fd, s, &j->req, &st->wsess, &res);
         }
@@ -15061,15 +15129,14 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
     free(reasoning);
     tool_calls_free(&calls);
     wire_free(&st->wsess);
-    buf_free(&st->text);
-    free(st->matched_stop);
+    sem_accum_free(&st->acc);
     free(st);
     j->cstream = NULL;
 }
 
 /* A1: format a NON-streaming continuous row's response from its host-side
  * accumulated text (stop-truncated / tool-scanned) -- write_batch_completion's
- * shape, but from st->text instead of a re-detok, with scan-verdict finish
+ * shape, but from st->acc.text instead of a re-detok, with scan-verdict finish
  * semantics and real tool parsing.  Frees the cont_stream state. */
 static void write_cont_completion(server *s, job *j, int engine_finish) {
     cont_stream *st = j->cstream;
@@ -15077,8 +15144,8 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
     snprintf(id, sizeof(id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
-    const char *fin = st->finish_override ? st->finish_override
-                                          : (engine_finish ? "stop" : "length");
+    const char *fin = st->acc.verdict ? st->acc.verdict
+                                      : (engine_finish ? "stop" : "length");
     const int prompt_tokens = j->req.prompt.len;
 
     if (j->req.kind == REQ_CHAT) {
@@ -15089,7 +15156,7 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         } else {
             char perr[160] = {0};
             bool recovered = false;
-            parse_generated_message_for_response(st->text.ptr ? st->text.ptr : "",
+            parse_generated_message_for_response(st->acc.text.ptr ? st->acc.text.ptr : "",
                                                  false /*has_tools*/, false /*saw_tool_start*/,
                                                  ds4_think_mode_enabled(j->req.think_mode),
                                                  &fin, perr, sizeof(perr),
@@ -15099,14 +15166,14 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         ds4_wire_result res = {0};
         wire_init(&ws, wire_surface_for(&j->req), id);
         wire_result_set_finish(&res, fin);
-        res.matched_stop = st->matched_stop;
-        if (st->matched_stop && res.stop_cause == DS4_STOP_EOS)
+        res.matched_stop = st->acc.matched_stop;
+        if (st->acc.matched_stop && res.stop_cause == DS4_STOP_EOS)
             res.stop_cause = DS4_STOP_SEQUENCE;
-        res.content = content ? content : (st->text.ptr ? st->text.ptr : "");
+        res.content = content ? content : (st->acc.text.ptr ? st->acc.text.ptr : "");
         res.reasoning = reasoning;
         res.calls = &calls;
         res.prompt_tokens = prompt_tokens;
-        res.completion_tokens = st->completion;
+        res.completion_tokens = st->acc.completion;
         /* Inc 3b: the Responses usage detail the serial path computes at
          * finalize (generate_job does the same retokenize) -- without it a
          * cont-served Responses response would report reasoning_tokens=0. */
@@ -15123,13 +15190,13 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         ds4_wire_result res = {0};
         wire_init(&ws, wire_surface_for(&j->req), id);
         wire_result_set_finish(&res, fin);
-        res.matched_stop = st->matched_stop;
-        if (st->matched_stop && res.stop_cause == DS4_STOP_EOS)
+        res.matched_stop = st->acc.matched_stop;
+        if (st->acc.matched_stop && res.stop_cause == DS4_STOP_EOS)
             res.stop_cause = DS4_STOP_SEQUENCE;
-        res.content = st->text.ptr ? st->text.ptr : "";
+        res.content = st->acc.text.ptr ? st->acc.text.ptr : "";
         res.calls = &empty;
         res.prompt_tokens = prompt_tokens;
-        res.completion_tokens = st->completion;
+        res.completion_tokens = st->acc.completion;
         wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
         wire_free(&ws);
     }
@@ -15140,7 +15207,7 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
  * (A1: the cont-path port of generate_job's per-token scan), and stream a
  * content delta when the row is streaming.  Returns 0 to tell the engine to
  * ABORT this sequence (client gone / write stalled / stop hit / tool block
- * closed -- the scan verdict lands in st->finish_override), 1 to continue. */
+ * closed -- the scan verdict lands in st->acc.verdict), 1 to continue. */
 static int cont_on_token(void *ud, void *user, int token) {
     cont_sched *cs = ud;
     server *s = cs->s;
@@ -15169,18 +15236,18 @@ static int cont_on_token(void *ud, void *user, int token) {
     if (st->failed || j->client_gone) { t_emit_job = NULL; return 0; }
     size_t pl = 0;
     char *piece = ds4_token_text(s->engine, token, &pl);
-    if (piece) {
-        buf_append(&st->text, piece, pl);
-        thinking_state_feed(&st->thinking, piece, pl);
-        free(piece);
+    /* Inc 7a: the shared accumulator does append/thinking/DSML/stop/marker
+     * work (position-exact before the engine asks cont_sample_override about
+     * the NEXT token -- this runs synchronously inside the accept/decode
+     * loop); this callback is now the cont DRIVER: transport, projection,
+     * and the evict verdicts. */
+    const sem_feed fr = sem_accum_feed(&st->acc, &j->req, piece, piece ? pl : 0);
+    free(piece);
+    if (fr.orphan_tool_end) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: cont chat ignored orphan tool-call end marker after %d generated tokens",
+                   st->acc.completion);
     }
-    st->completion++;
-    /* Spec+tools: advance the DSML recognizer over the cumulative text (the
-     * serial loop's dsml_tracker_update site).  This runs synchronously inside
-     * the engine's accept/decode loop, so by the time the engine asks
-     * cont_sample_override about the NEXT token the state is position-exact. */
-    if (j->req.kind == REQ_CHAT && j->req.has_tools)
-        dsml_decode_tracker_update(&st->dsml_tracker, st->text.ptr, st->text.len);
     /* Token-id echo: the single path's openai_stream_record_token call site,
      * ported.  Each sampled id is queued with its byte end so the shared SSE
      * projection below drains token-aligned token_ids arrays.  No-op unless
@@ -15191,54 +15258,7 @@ static int cont_on_token(void *ud, void *user, int token) {
      * oa_chat fields there is type confusion (echo on the promoted surfaces
      * is already serial via the TOKEN_IDS projection row). */
     if (j->req.stream && st->wsess.live_openai)
-        openai_stream_record_token(&st->wsess.state.oa_chat, token, st->text.len);
-
-    /* Stop scan + stream hold-back, the generate_job shape: never emit bytes
-     * that could be a stop-string prefix; on a hit the text truncates to the
-     * match start (stop string excluded from output) and the row aborts. */
-    size_t stop_pos = 0, stop_len = 0;
-    bool hit_stop = stop_list_find_from(&j->req.stops, st->text.ptr,
-                                        st->stop_scan_from, &stop_pos, &stop_len);
-    size_t stream_len = hit_stop ?
-        stop_pos : stop_list_stream_safe_len(&j->req.stops, st->text.len);
-    if (stream_len > st->text.len) stream_len = st->text.len;
-    if (!hit_stop && j->req.stops.max_len > 1) {
-        const size_t hold = j->req.stops.max_len - 1;
-        st->stop_scan_from = st->text.len > hold ? st->text.len - hold : 0;
-    }
-
-    /* Tool-marker observation (rolling window, generate_job's marker_hold),
-     * think-gated exactly like the serial loop: a DSML block inside reasoning
-     * is not executable, so markers are only observed after </think>. */
-    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-        if (ds4_think_mode_enabled(j->req.think_mode) && st->thinking.inside) {
-            st->tool_scan_waiting_for_think_close = true;
-            st->tool_scan_from = st->text.len;
-        } else {
-            if (st->tool_scan_waiting_for_think_close) {
-                const char *think_end = st->text.ptr ?
-                    find_last_substr(st->text.ptr, "</think>") : NULL;
-                st->tool_scan_from = think_end ?
-                    (size_t)((think_end + 8) - st->text.ptr) : st->text.len;
-                if (st->tool_scan_from > st->text.len) st->tool_scan_from = st->text.len;
-                st->tool_scan_waiting_for_think_close = false;
-            }
-            if (st->tool_scan_from > st->text.len) st->tool_scan_from = st->text.len;
-            const char *tool_scan = st->text.ptr ? st->text.ptr + st->tool_scan_from : "";
-            bool orphan_end = false;
-            observe_tool_markers(tool_scan, &st->saw_tool_start, &st->saw_tool_end,
-                                 &orphan_end);
-            if (orphan_end && !st->saw_orphan_tool_end) {
-                st->saw_orphan_tool_end = true;
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: cont chat ignored orphan tool-call end marker after %d generated tokens",
-                           st->completion);
-            }
-            const size_t marker_hold = 80;
-            size_t hold_from = st->text.len > marker_hold ? st->text.len - marker_hold : 0;
-            if (hold_from > st->tool_scan_from) st->tool_scan_from = hold_from;
-        }
-    }
+        openai_stream_record_token(&st->wsess.state.oa_chat, token, st->acc.text.len);
 
     /* Project the cumulative raw buffer.  Chat rows use the shared OpenAI SSE
      * machine (reasoning_content inside <think>, content after, tool deltas
@@ -15246,7 +15266,7 @@ static int cont_on_token(void *ud, void *user, int token) {
      * legacy-Completion rows use the serial oracle's plain text_completion
      * chunks instead -- the chat delta machine emitted chat.completion.chunk
      * objects on a text_completion route (the Inc 0a negative fixture).  The
-     * stop-safe stream_len clamp keeps potential stop prefixes off the wire
+     * stop-safe emit_limit clamp keeps potential stop prefixes off the wire
      * on both shapes.  Writes redirect into j->out (W8a t_emit_job); a false
      * return means the client is gone -> evict. */
     if (j->req.stream) {
@@ -15256,25 +15276,16 @@ static int cont_on_token(void *ud, void *user, int token) {
          * cursor stays its own branch. */
         bool ok = j->req.kind == REQ_CHAT ?
             wire_update(j->fd, s, &j->req, &st->wsess,
-                        st->text.ptr ? st->text.ptr : "", stream_len) :
-            cont_stream_emit_plain(j, st, stream_len);
+                        st->acc.text.ptr ? st->acc.text.ptr : "", fr.emit_limit) :
+            cont_stream_emit_plain(j, st, fr.emit_limit);
         if (!ok) { st->failed = true; t_emit_job = NULL; return 0; }
     }
     t_emit_job = NULL;
 
-    if (hit_stop) {
-        free(st->matched_stop);   /* Inc 2c: capture before truncation */
-        st->matched_stop = st->text.ptr ? xstrndup(st->text.ptr + stop_pos, stop_len)
-                                        : NULL;
-        st->text.len = stop_pos;
-        if (st->text.ptr) st->text.ptr[st->text.len] = '\0';
-        st->finish_override = "stop";
-        return 0;
-    }
-    if (j->req.kind == REQ_CHAT && j->req.has_tools && st->saw_tool_end) {
-        st->finish_override = "tool_calls";
-        return 0;
-    }
+    /* Scan verdicts abort the row (the engine evicts it); acc.verdict beats
+     * the engine's finish at finalize. */
+    if (fr.hit_stop) return 0;
+    if (st->acc.verdict && !strcmp(st->acc.verdict, "tool_calls")) return 0;
     return 1;
 }
 
@@ -23826,9 +23837,9 @@ static void test_cont_completion_stream_matches_serial_oracle(void) {
     TEST_ASSERT(!strncmp(st->id, "cmpl-", 5));
     for (size_t i = 0; i < sizeof(tape_plain) / sizeof(tape_plain[0]); i++) {
         const char *piece = tape_plain[i].piece;
-        buf_append(&st->text, piece, strlen(piece));
-        st->completion++;
-        TEST_ASSERT(cont_stream_emit_plain(&j, st, st->text.len));
+        /* Inc 7a: drive the SHARED accumulator, the real cont feed path. */
+        const sem_feed fr = sem_accum_feed(&st->acc, &j.req, piece, strlen(piece));
+        TEST_ASSERT(cont_stream_emit_plain(&j, st, fr.emit_limit));
     }
     cont_stream_finalize(&s, &j, "stop");
     TEST_ASSERT(j.cstream == NULL);
@@ -23996,11 +24007,13 @@ static void test_cont_anthropic_stream_matches_serial_oracle(void) {
     int completion = 0;
     for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
         const char *piece = tape_thinking[i].piece;
-        buf_append(&st->text, piece, strlen(piece));
-        st->completion = ++completion;
+        /* Inc 7a: drive the SHARED accumulator, the real cont feed path. */
+        const sem_feed fr = sem_accum_feed(&st->acc, &j.req, piece, strlen(piece));
+        completion++;
         TEST_ASSERT(wire_update(j.fd, &s, &j.req, &st->wsess,
-                                st->text.ptr, st->text.len));
+                                st->acc.text.ptr, fr.emit_limit));
     }
+    TEST_ASSERT(st->acc.completion == completion);
     cont_stream_finalize(&s, &j, "stop");
     TEST_ASSERT(j.cstream == NULL);
     shutdown(sv[0], SHUT_WR);
@@ -24078,11 +24091,13 @@ static void test_cont_responses_stream_matches_serial_oracle(void) {
     int completion = 0;
     for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
         const char *piece = tape_thinking[i].piece;
-        buf_append(&st->text, piece, strlen(piece));
-        st->completion = ++completion;
+        /* Inc 7a: drive the SHARED accumulator, the real cont feed path. */
+        const sem_feed fr = sem_accum_feed(&st->acc, &j.req, piece, strlen(piece));
+        completion++;
         TEST_ASSERT(wire_update(j.fd, &s, &j.req, &st->wsess,
-                                st->text.ptr, st->text.len));
+                                st->acc.text.ptr, fr.emit_limit));
     }
+    TEST_ASSERT(st->acc.completion == completion);
     cont_stream_finalize(&s, &j, "stop");
     TEST_ASSERT(j.cstream == NULL);
     shutdown(sv[0], SHUT_WR);
@@ -24247,6 +24262,88 @@ static void test_credit_union_sums_per_run_need(void) {
     TEST_ASSERT(need == 2 * page);   /* only the second run still charges */
 }
 
+/* Inc 7a: the extracted accumulator's own contract -- verdict precedence,
+ * stop capture + truncation, one-shot transitions, think-gated markers.
+ * The serial/cont byte equivalence is pinned by the oracle tests above;
+ * this pins the machine the two drivers now share. */
+static void test_sem_accum_feed_verdicts(void) {
+    /* 1) stop hit: emit_limit == match start, matched_stop captured, text
+     * truncated (stop excluded), verdict "stop". */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_NONE;
+    stop_list_push(&r.stops, xstrdup("END"));
+    sem_accum a;
+    sem_accum_init(&a, &r);
+    sem_feed f = sem_accum_feed(&a, &r, "hello ", 6);
+    TEST_ASSERT(!f.hit_stop && !a.verdict);
+    TEST_ASSERT(f.emit_limit == 4);   /* len 6 minus the 2-byte stop hold */
+    f = sem_accum_feed(&a, &r, "world END tail", 14);
+    TEST_ASSERT(f.hit_stop);
+    TEST_ASSERT(a.verdict && !strcmp(a.verdict, "stop"));
+    TEST_ASSERT(a.matched_stop && !strcmp(a.matched_stop, "END"));
+    TEST_ASSERT(f.emit_limit == a.text.len);
+    TEST_ASSERT(!strcmp(a.text.ptr, "hello world "));
+    TEST_ASSERT(a.completion == 2);
+    sem_accum_free(&a);
+    request_free(&r);
+
+    /* 2) tool block close: one-shot enter/close transitions, verdict
+     * "tool_calls"; a stop hit on the SAME feed would win (both twins break
+     * on stop first) -- proven by feeding stop+close together in (3). */
+    request rt;
+    request_init(&rt, REQ_CHAT, 128);
+    rt.api = API_OPENAI;
+    rt.has_tools = true;
+    rt.think_mode = DS4_THINK_NONE;
+    sem_accum b;
+    sem_accum_init(&b, &rt);
+    f = sem_accum_feed(&b, &rt, "calling.\n" DS4_TOOL_CALLS_START,
+                       strlen("calling.\n") + strlen(DS4_TOOL_CALLS_START));
+    TEST_ASSERT(f.entered_tool_block && b.saw_tool_start && !b.saw_tool_end);
+    f = sem_accum_feed(&b, &rt, DS4_TOOL_CALLS_END, strlen(DS4_TOOL_CALLS_END));
+    TEST_ASSERT(f.tool_block_closed && b.saw_tool_end);
+    TEST_ASSERT(b.verdict && !strcmp(b.verdict, "tool_calls"));
+    sem_accum_free(&b);
+
+    /* 3) stop beats tool close when one feed carries both. */
+    stop_list_push(&rt.stops, xstrdup("XSTOPX"));
+    sem_accum c;
+    sem_accum_init(&c, &rt);
+    buf both = {0};
+    buf_puts(&both, DS4_TOOL_CALLS_START);
+    buf_puts(&both, DS4_TOOL_CALLS_END);
+    buf_puts(&both, "XSTOPX");
+    f = sem_accum_feed(&c, &rt, both.ptr, both.len);
+    TEST_ASSERT(f.hit_stop && c.saw_tool_end);
+    TEST_ASSERT(c.verdict && !strcmp(c.verdict, "stop"));
+    buf_free(&both);
+    sem_accum_free(&c);
+    request_free(&rt);
+
+    /* 4) think gating: a marker inside <think> is not observed; after
+     * </think> the scan resumes past the close. */
+    request rk;
+    request_init(&rk, REQ_CHAT, 128);
+    rk.api = API_OPENAI;
+    rk.has_tools = true;
+    rk.think_mode = DS4_THINK_LOW;
+    free(rk.prompt_text);
+    rk.prompt_text = xstrdup("<think>");   /* generation starts inside */
+    sem_accum d;
+    sem_accum_init(&d, &rk);
+    TEST_ASSERT(d.thinking.inside && d.tool_scan_waiting_for_think_close);
+    f = sem_accum_feed(&d, &rk, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START));
+    TEST_ASSERT(!d.saw_tool_start);        /* quoted in reasoning: inert */
+    f = sem_accum_feed(&d, &rk, "</think>ok ", 11);
+    TEST_ASSERT(!d.saw_tool_start && !d.tool_scan_waiting_for_think_close);
+    f = sem_accum_feed(&d, &rk, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START));
+    TEST_ASSERT(f.entered_tool_block && d.saw_tool_start);
+    sem_accum_free(&d);
+    request_free(&rk);
+}
+
 /* Inc 0b (#13 twin): an unrepairable mid-toolcall budget cut on the cont
  * lane keeps the honest "length" finish and returns the partial call as
  * assistant text, mirroring the serial dcc2623 behavior; a non-budget
@@ -24267,8 +24364,9 @@ static void test_cont_budget_cut_toolcall_keeps_length(void) {
     cont_stream *st = cont_stream_ensure(&j);
     const char *cut = "I will check the weather.\n\n" DS4_TOOL_CALLS_START
                       "\nprose the budget cut before any invoke tag";
-    buf_append(&st->text, cut, strlen(cut));
-    st->saw_tool_start = true;
+    /* Inc 7a: the shared accumulator's own marker scan observes the start. */
+    (void)sem_accum_feed(&st->acc, &j.req, cut, strlen(cut));
+    TEST_ASSERT(st->acc.saw_tool_start && !st->acc.saw_tool_end);
 
     const char *fin = "length";
     char *content = NULL, *reasoning = NULL;
@@ -24854,6 +24952,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_admission_transport_and_heartbeat();
     test_cont_anthropic_stream_matches_serial_oracle();
     test_cont_responses_stream_matches_serial_oracle();
+    test_sem_accum_feed_verdicts();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
     test_credit_union_merge_shapes();
