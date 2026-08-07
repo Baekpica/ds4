@@ -1,3 +1,105 @@
+# v0.5.6 (2026-08-08)
+
+The first-class API release: Anthropic Messages and OpenAI Responses
+are now first-class surfaces of the batched engine, served in the
+continuous batch alongside OpenAI chat and completions instead of
+being translated on the way out of the serial lane. The OpenAI-only
+batched path was a deliberate first-version scoping choice; this
+release retires it. Tool-call continuations become a first-class
+engine object with an honest replay contract, and the serving
+internals the promotion depended on were converged and measured.
+Thanks again to OllieOllie and emX0r, whose v0.5.5-era reports shaped
+several of the honesty fixes that shipped along the way.
+
+- Anthropic and Responses ride the continuous batching lane: buffered
+  and streaming, thinking (with signatures), stop sequences, and
+  streaming tool calls all batch. Transport starts at admission, so
+  time-to-first-byte no longer waits on a batch slot, and prefill
+  keepalives use each protocol's native ping. Buffered tool turns
+  deliberately stay serial: that lane can feed the model a corrective
+  tool error after a failed parse, and the batch cannot yet, so
+  correctness keeps the lane until an equivalent exists.
+- Tool-call continuations are a first-class engine object. A completed
+  tool turn publishes a continuation record binding its call ids to
+  the exact engine state that produced them (serial session or batch
+  bank); an output-only follow-up claims that state in place with a
+  strict generation-and-frontier equality check, and anything stale
+  answers a native 409 telling the client to replay full history.
+  Retention is honest and bounded: a grace window after each turn, a
+  soft TTL, a queued-continuation hard pin, and victim placement that
+  never destroys a bank a live continuation is about to claim (a
+  fully protected set sheds 503 with a truthful Retry-After).
+- Serving honesty across every surface: engine-stranded streams end
+  with the protocol's native stream-error event instead of a
+  fabricated success finish; stop-sequence hits report the matched
+  text (Anthropic stop_sequence was previously end_turn with a null
+  match on the serial lane); an explicit max_tokens of 0 answers with
+  zero tokens on every lane; negative token budgets are a 400 naming
+  the client's own field instead of a silent zero; errors are native
+  envelopes on all four surfaces with Retry-After on refusals.
+- Usage is client-frame everywhere: cache read/write token details
+  reflect the client's prompt even when a warm engine admission
+  evaluates a longer effective prompt, and usage always matches the
+  timings block. Responses reasoning_tokens is now counted from the
+  generated tokens themselves rather than re-tokenizing the parsed
+  reasoning text at finalize, and the streaming terminal reports it
+  on tool turns too.
+- Explicit admission bounds with native shedding: connection, queue
+  depth, queue bytes, queue age, and slow-reader output caps each
+  refuse with the endpoint's own envelope plus Retry-After, and every
+  shed is counted by reason. A stalled reader can no longer park its
+  stream in kernel socket memory beyond the server's accounting
+  (DS4_SERVER_CLIENT_SNDBUF caps per-connection send buffering).
+- One route decision: request requirements are computed once at
+  enqueue and a single pure function decides the lane at every
+  dispatch site, proven equal to the legacy predicate tree over an
+  exhaustive table and observable via per-surface, per-lane, and
+  per-reason counters.
+- The serving internals converged: one semantic accumulator now feeds
+  both the serial loop and the continuous per-token callback (text,
+  thinking, tool-marker and stop scanning, sampling overrides), so a
+  fix lands once instead of twice; the Responses stream machine
+  renders from spans of the row's single text buffer, halving
+  per-stream memory. Projection cost inside the batch loop was
+  measured at ~70 microseconds per token (well under one percent of a
+  decode step), so no offload machinery was added.
+- Engine fix: the speculative accept path could retire a finishing row
+  before committing its final accepted tokens to bank history, which
+  made the published continuation frontier one step short and refused
+  every bank continuation; retirement now happens strictly after the
+  step commits.
+- Memory governance groundwork (the "lite" arc): resident-set
+  accounting no longer overcharges scale slabs (a false-reject
+  vector), page-trim keeps ownership when the driver fails an unmap,
+  the admission credit projection's page-interval union is extracted
+  and unit-pinned, and the serial-fit reclaim path has its own gate.
+  The 240k deep gate now also runs a zero-config leg, validating
+  shipped defaults rather than a tuned environment.
+- The new batched routing is the DEFAULT on every surface; nothing
+  needs to be configured. Transitional escape hatches, kept for
+  exactly one release then removed: setting
+  DS4_SERVER_CONT_ANTHROPIC=0, DS4_SERVER_CONT_RESPONSES=0,
+  DS4_SERVER_CONT_TOOLS_ANTHROPIC=0 or
+  DS4_SERVER_CONT_TOOLS_RESPONSES=0 restores that surface's previous
+  serial routing exactly, for comparison. Continuation retention
+  knobs: DS4_CONT_GRACE_S / DS4_CONT_TTL_S / DS4_CONT_PIN_DEADLINE_S
+  (defaults 60/300/60).
+- Observability: continuation registry counters (published, resolved,
+  missed, demoted, live), route decision and shed-reason vectors,
+  queue and backlog gauges, projection-cost and /v1/batch wait
+  counters. /v1/batch keeps its own contract (documented): it is a
+  synchronous bench endpoint and waits out a live batch epoch; the
+  measured wait equals the epoch's remaining drain, the same as
+  behind a long serial request.
+- Measured and published, per the acceptance list: with max_tokens
+  omitted (the 384K default budget) a deep -c 524288 boot admits two
+  concurrent batch rows, because admission promises every row its
+  full output budget; further requests are refused honestly and served
+  serially. Requests that state a realistic max_tokens admit at the
+  width their budget funds. A renewable credit policy that would widen
+  the omitted-budget case is designed but deliberately not shipped
+  until real traffic asks for it.
+
 # v0.5.5 (2026-08-05)
 
 The illegal-access release: the intermittent CUDA crash that several
