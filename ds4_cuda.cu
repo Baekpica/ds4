@@ -93,6 +93,9 @@ static thread_local bool g_glm_mtp_verify_mode;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
+/* Set at init when every device is an integrated, pageable-memory-access
+ * part: the model mapping is then read in place instead of copied. */
+static int g_model_direct_addressable;
 static int g_model_fd = -1;
 static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
@@ -710,6 +713,10 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
     if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
+    /* Unified-memory SoC: the mapping is already device-addressable, and the
+     * fallbacks below this point would each allocate a second copy of the
+     * weights out of the one pool the model is already sitting in. */
+    if (g_model_direct_addressable) return cuda_model_ptr(model_map, offset);
 
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
@@ -2601,6 +2608,26 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
+            /* Coherent unified-memory SoCs (GB10 / DGX Spark) can dereference
+             * an ordinary host mapping from a kernel. Copying weights to
+             * "device" memory there does not move them closer to anything --
+             * it allocates a second copy out of the same physical pool. For an
+             * 86 GiB model on a 121.6 GiB part that is the difference between
+             * fitting and not, so the mapping is used in place.
+             *
+             * Requires every device to qualify: a mixed set would leave the
+             * discrete ones reading host memory over PCIe. */
+            const int direct = prop.integrated && prop.pageableMemoryAccess;
+            g_model_direct_addressable = (i == 0) ? direct
+                                                  : (g_model_direct_addressable && direct);
+            if (direct && i == 0) {
+                fprintf(stderr,
+                        "ds4: %s is a coherent unified-memory device; weights "
+                        "will be read from the model mapping in place\n",
+                        prop.name);
+            }
+        } else {
+            g_model_direct_addressable = 0;
         }
         /* Per-device stream. */
         cudaStream_t s = NULL;
@@ -31542,4 +31569,8 @@ extern "C" int ds4_gpu_exaone_moe_matmul_tensor(
         return 0;
     }
     return cuda_ok(cudaGetLastError(), "exaone moe matmul");
+}
+
+extern "C" int ds4_gpu_model_map_is_direct(void) {
+    return g_model_direct_addressable;
 }

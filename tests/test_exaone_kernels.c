@@ -41,6 +41,39 @@ static void diff_f32(const char *what, const float *a, const float *b, size_t n,
     report(what, max_abs, max_rel, tol_abs, tol_rel);
 }
 
+/* Vector-level agreement, for comparing a quantized-activation GEMM against an
+ * f32 reference.
+ *
+ * Per-element max-relative error is the wrong instrument there: one output
+ * near zero that lands on the other side of zero gives a relative error above
+ * 1 while the vector as a whole is fine, and it would report the same number
+ * whether the kernel is correct or transposed. What matters is whether the
+ * error looks like quantization noise:
+ *
+ *   rel_rms  = ||gpu - cpu|| / ||cpu||   -- noise floor relative to signal
+ *   1 - cos  = directional disagreement  -- catches a wrong layout, which
+ *                                           moves the vector rather than
+ *                                           adding noise to it
+ *
+ * A transposed or misindexed expert scores near 1 on both. Quantization noise
+ * scores small on both. */
+static void diff_quant_gemm(const char *what, const float *got, const float *ref,
+                            size_t n, double tol_rel_rms) {
+    double se = 0.0, sr = 0.0, sg = 0.0, dot = 0.0, max_abs = 0.0, max_ref = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        const double g = got[i], r = ref[i], d = g - r;
+        se += d * d; sr += r * r; sg += g * g; dot += g * r;
+        if (fabs(d) > max_abs) max_abs = fabs(d);
+        if (fabs(r) > max_ref) max_ref = fabs(r);
+    }
+    const double rel_rms = sr > 0.0 ? sqrt(se / sr) : (se > 0.0 ? INFINITY : 0.0);
+    const double cos = (sg > 0.0 && sr > 0.0) ? dot / sqrt(sg * sr) : 0.0;
+    const int ok = rel_rms <= tol_rel_rms && (1.0 - cos) <= tol_rel_rms;
+    if (!ok) g_fail++;
+    printf("%-38s rel_rms=%.3e 1-cos=%.3e max_abs=%.2e (|ref|max=%.2e)  %s\n",
+           what, rel_rms, 1.0 - cos, max_abs, max_ref, ok ? "ok" : "FAIL");
+}
+
 static float frand(uint64_t *s) {
     *s = *s * 6364136223846793005ULL + 1442695040888963407ULL;
     return (float)((int32_t)(*s >> 33) % 20000 - 10000) / 10000.0f;
@@ -451,9 +484,11 @@ static void test_moe_matmul(const ds4_model *m, const ds4_weights *wts) {
                 char label[96];
                 snprintf(label, sizeof(label), "moe matmul %s [%u x %u] L%u",
                          tensor_type_name(ty), in_dim, out_dim, il);
-                /* mmq quantizes the activation to Q8_1; the CPU side keeps
-                 * f32. 2e-2 relative is that difference, not slack. */
-                diff_f32(label, got, want, out_dim, 5e-3, 2e-2);
+                /* mmq quantizes the activation to Q8_1 and the CPU side keeps
+                 * f32, so the two cannot agree to f32 precision. 2e-2 is the
+                 * size of that quantization noise relative to the signal;
+                 * a wrong expert index or a transposed weight lands near 1. */
+                diff_quant_gemm(label, got, want, out_dim, 2e-2);
                 free(want); free(got);
             }
             ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(gid); ds4_gpu_tensor_free(gx);

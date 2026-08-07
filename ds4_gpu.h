@@ -2661,6 +2661,12 @@ void ds4_gpu_decode_graphs_invalidate(void);
  * architecture details that are not in the GGUF metadata.
  */
 
+/* Non-zero when every CUDA device is an integrated, pageable-memory-access
+ * part (GB10 / DGX Spark). The model mapping is then already addressable from
+ * a kernel, so callers must not stage or copy weights into device memory:
+ * on a coherent SoC that allocates a second copy out of the same pool. */
+int ds4_gpu_model_map_is_direct(void);
+
 int ds4_gpu_exaone_rms_norm_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
