@@ -12,10 +12,13 @@
 #include "ds4_gpu.h"
 
 #include <cuda_runtime.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define CHECK(cond, msg)                                                \
     do {                                                                \
@@ -37,13 +40,62 @@ int main(void) {
 
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
 
-    /* Build a synthetic 1-MiB "model" in host memory. */
+    /* Build a synthetic 1-MiB file-mapping-like model. Temporarily protect
+     * one page so the initial whole-map cudaHostRegister is rejected, matching
+     * the aligned-artifact startup path which deliberately leaves the full
+     * GGUF mmap unpinned. Individual promotion ranges remain registerable. */
     const size_t total = 1024 * 1024;
-    void *host = NULL;
-    CHECK(cudaMallocHost(&host, total) == cudaSuccess, "cudaMallocHost");
+    char model_path[] = "/tmp/ds4-model-map-XXXXXX";
+    int model_fd = mkstemp(model_path);
+    CHECK(model_fd >= 0, "mkstemp synthetic model");
+    (void)unlink(model_path);
+    CHECK(ftruncate(model_fd, (off_t)total) == 0,
+          "truncate synthetic model");
+    void *host = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, model_fd, 0);
+    CHECK(host != MAP_FAILED, "mmap synthetic model");
     unsigned char *bytes = (unsigned char *)host;
     for (size_t i = 0; i < total; i++) bytes[i] = (unsigned char)(i & 0xff);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    CHECK(page_size > 0, "page size");
+    CHECK(mprotect(host, (size_t)page_size, PROT_NONE) == 0,
+          "protect page during whole-map registration");
     CHECK(ds4_gpu_set_model_map(host, total), "set_model_map");
+    CHECK(mprotect(host, (size_t)page_size, PROT_READ | PROT_WRITE) == 0,
+          "restore page after whole-map registration");
+
+    /* A split GGUF is one virtual mapping backed by several files. The
+     * legacy single-FD fast path only describes shard 0, so an offset beyond
+     * that FD must fall back before allocating an arena or staging pool. */
+    char split_fd_path[] = "/tmp/ds4-split-fd-XXXXXX";
+    int split_fd = mkstemp(split_fd_path);
+    CHECK(split_fd >= 0, "mkstemp split fd");
+    (void)unlink(split_fd_path);
+    CHECK(ftruncate(split_fd, (off_t)(total / 2)) == 0, "truncate split fd");
+    CHECK(ds4_gpu_set_model_fd_for_map(split_fd, host), "set short shard fd");
+    (void)unsetenv("DS4_CUDA_NO_FD_CACHE");
+    CHECK(setenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB", "256", 1) == 0,
+          "set minimum arena chunk");
+
+    size_t free_before = 0, free_after = 0, total_mem = 0;
+    CHECK(cudaMemGetInfo(&free_before, &total_mem) == cudaSuccess,
+          "mem info before split fallback");
+    const uint64_t cached_before = ds4_gpu_model_range_cached_bytes();
+    CHECK(ds4_gpu_cache_model_range(host, total, 3 * total / 4, 64 * 1024,
+                                    "split_fd_fallback"),
+          "range beyond shard fd is promoted from the mapping");
+    CHECK(cudaDeviceSynchronize() == cudaSuccess, "sync split fallback");
+    const uint64_t cached_after = ds4_gpu_model_range_cached_bytes();
+    CHECK(cached_after - cached_before == 64 * 1024,
+          "explicit split-shard promotion owns device-cache payload");
+    CHECK(cudaMemGetInfo(&free_after, &total_mem) == cudaSuccess,
+          "mem info after split fallback");
+    CHECK(free_before >= free_after, "split fallback memory accounting");
+    CHECK(free_before - free_after < 128ull * 1024ull * 1024ull,
+          "split fallback does not leak a model arena");
+    CHECK(ds4_gpu_set_model_fd(-1), "clear short shard fd");
+    (void)close(split_fd);
+    (void)unsetenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
 
     /* Three disjoint ranges on device 0. */
     ds4_tensor_range ranges[3];
@@ -128,7 +180,8 @@ int main(void) {
     }
 
     ds4_gpu_cleanup();
-    (void)cudaFreeHost(host);
+    (void)munmap(host, total);
+    (void)close(model_fd);
     fprintf(stderr, "test_gpu_model_cache PASS (devs=%d)\n", dev_count);
     return 0;
 }

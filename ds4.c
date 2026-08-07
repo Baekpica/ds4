@@ -2436,6 +2436,54 @@ static void model_close(ds4_model *m) {
     m->fd = -1;
 }
 
+/* Return the model's clean page cache to the pool: madvise the mapping and
+ * fadvise every shard fd. Tensors still served from the mapping re-fault on
+ * demand; the working set that stays mapping-backed after artifact promotion
+ * (embeddings row-gathers, norms, router) is around a GiB. */
+static void model_release_mapping_cache(const ds4_model *m) {
+    if (!m || !m->map || m->size == 0) return;
+    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL) return;
+#if defined(MADV_DONTNEED)
+    if (madvise((void *)(uintptr_t)m->map, (size_t)m->size,
+                MADV_DONTNEED) != 0) {
+        fprintf(stderr, "ds4: model mapping cache release failed: %s\n",
+                strerror(errno));
+    }
+#elif defined(POSIX_MADV_DONTNEED)
+    {
+        const int rc = posix_madvise((void *)(uintptr_t)m->map,
+                                     (size_t)m->size,
+                                     POSIX_MADV_DONTNEED);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: model mapping cache release failed: %s\n",
+                    strerror(rc));
+        }
+    }
+#endif
+#if defined(POSIX_FADV_DONTNEED)
+    if (m->fd >= 0) {
+        const int rc = posix_fadvise(m->fd, 0, 0, POSIX_FADV_DONTNEED);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: model shard cache release failed: %s\n",
+                    strerror(rc));
+        }
+    }
+    if (m->split_fds) {
+        for (uint32_t i = 0; i + 1 < m->split_count; i++) {
+            if (m->split_fds[i] >= 0) {
+                const int rc = posix_fadvise(m->split_fds[i], 0, 0,
+                                             POSIX_FADV_DONTNEED);
+                if (rc != 0) {
+                    fprintf(stderr,
+                            "ds4: model shard cache release failed: %s\n",
+                            strerror(rc));
+                }
+            }
+        }
+    }
+#endif
+}
+
 static void model_prefetch_cpu_mapping(const ds4_model *m) {
     if (!m || !m->map || m->size == 0) return;
 
@@ -58151,13 +58199,13 @@ static void ds4_engine_choose_weight_residency(ds4_engine *e, uint32_t ctx_size)
     }
     const uint64_t artifacts = ds4_gpu_derived_artifact_bytes();
     if (artifacts != 0) {
-        /* The aligned artifacts already hold the decode-critical weights in
-         * device memory; a whole-image copy on top would duplicate them and
-         * cannot fit beside the KV cache. Tensors without an aligned format
-         * read from the mapping. */
+        /* A whole-image copy on top of the aligned artifacts would duplicate
+         * them and cannot fit beside the KV cache. The EXAONE startup path
+         * selectively promotes the raw expert remainder after model-map
+         * installation; other tensors keep using the mapping. */
         fprintf(stderr,
                 "ds4: unified memory: %.2f GiB of aligned artifacts resident; "
-                "remaining weights read from the model mapping\n",
+                "raw expert remainder will be promoted after model-map setup\n",
                 (double)artifacts / 1073741824.0);
         return;
     }
@@ -58205,6 +58253,63 @@ static void ds4_engine_choose_weight_residency(ds4_engine *e, uint32_t ctx_size)
                 (double)mem_avail / 1073741824.0);
     }
 }
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* Install the raw expert stacks that have no aligned representation. This
+ * must run after ds4_gpu_set_model_map_*: model-map installation deliberately
+ * resets all range caches, so promoting before it appears to succeed and is
+ * then silently discarded before the first graph evaluation. */
+static uint64_t ds4_engine_promote_exaone_expert_stacks(ds4_engine *e) {
+    uint64_t requested = 0, replaced = 0, failed = 0;
+    const uint64_t cached_before = ds4_gpu_model_range_cached_bytes();
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        const ds4_tensor *stacks[3] = {
+            l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps,
+        };
+        for (int k = 0; k < 3; k++) {
+            const ds4_tensor *t = stacks[k];
+            if (!t) continue;
+            if (ds4_gpu_model_range_replaced(e->model.map,
+                                              t->abs_offset,
+                                              t->bytes)) {
+                replaced += t->bytes;
+                continue;
+            }
+            requested += t->bytes;
+            if (ds4_gpu_cache_model_range(e->model.map,
+                                          e->model.size,
+                                          t->abs_offset,
+                                          t->bytes,
+                                          "exaone_expert_stack") == 0) {
+                failed += t->bytes;
+            }
+        }
+    }
+    const uint64_t cached_after = ds4_gpu_model_range_cached_bytes();
+    const uint64_t added = cached_after >= cached_before
+        ? cached_after - cached_before : 0;
+    fprintf(stderr,
+            "ds4: exaone expert residency: %.2f GiB raw requested, "
+            "%.2f GiB CUDA-owned payload added (%.2f GiB total); "
+            "%.2f GiB replaced by aligned artifacts%s\n",
+            (double)requested / 1073741824.0,
+            (double)added / 1073741824.0,
+            (double)cached_after / 1073741824.0,
+            (double)replaced / 1073741824.0,
+            failed ? "; some raw spans stayed on the mapping" : "");
+    if (added + failed < requested) {
+        fprintf(stderr,
+                "ds4: WARNING: %.2f GiB of successful expert promotion is "
+                "mapped rather than CUDA-owned\n",
+                (double)(requested - failed - added) / 1073741824.0);
+    }
+    if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
+        ds4_gpu_print_memory_report("after EXAONE raw expert promotion");
+    }
+    return cached_after;
+}
+#endif
 #endif
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
@@ -58889,6 +58994,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         e->model.map, e->model.size, recs,
                         (uint32_t)e->model.n_tensors);
                 free(recs);
+                if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
+                    ds4_gpu_print_memory_report("after EXAONE aligned artifacts");
+                }
+                /* The artifact build just streamed ~40 GiB of source through
+                 * the page cache. Drop it before the later post-map promotion
+                 * stacks its own device copies on top. Promotion cannot happen
+                 * here: ds4_gpu_set_model_map_* below resets range caches. */
+                model_release_mapping_cache(&e->model);
             } else {
                 (void)ds4_gpu_build_derived_artifacts(e->model.map,
                                                       e->model.size,
@@ -58897,6 +59010,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
 #endif
         int model_map_ok = 0;
+        uint64_t exaone_raw_cache_expected = 0;
         uint64_t *load_offsets = NULL;
         uint64_t *load_sizes = NULL;
         uint32_t load_span_count = 0;
@@ -59078,6 +59192,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (e->backend == DS4_BACKEND_CUDA &&
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE &&
+            !load_slice && !tp_shard && !e->ssd_streaming) {
+            /* The aligned gate/up artifacts survive model-map installation;
+             * raw range caches do not. Install the Q3_K/Q4_K remainder only
+             * now, then discard source pages before graph allocation. */
+            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+            exaone_raw_cache_expected =
+                ds4_engine_promote_exaone_expert_stacks(e);
+            model_release_mapping_cache(&e->model);
+        }
+#endif
         if (tp_shard) {
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
@@ -59140,6 +59267,28 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (exaone_raw_cache_expected != 0) {
+            const uint64_t final_raw_cache =
+                ds4_gpu_model_range_cached_bytes();
+            fprintf(stderr,
+                    "ds4: exaone final CUDA residency: %.2f GiB aligned "
+                    "artifacts + %.2f GiB raw cache payload\n",
+                    (double)ds4_gpu_derived_artifact_bytes() / 1073741824.0,
+                    (double)final_raw_cache / 1073741824.0);
+            if (final_raw_cache < exaone_raw_cache_expected) {
+                fprintf(stderr,
+                        "ds4: EXAONE raw expert cache was reset after "
+                        "promotion (%.2f -> %.2f GiB); aborting instead of "
+                        "serving through the slower mapping path\n",
+                        (double)exaone_raw_cache_expected / 1073741824.0,
+                        (double)final_raw_cache / 1073741824.0);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        }
+#endif
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }

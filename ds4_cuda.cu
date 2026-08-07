@@ -456,6 +456,10 @@ static cudaStream_t g_stream_selected_upload_stream;
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
+static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset,
+                                        uint64_t bytes, const char *what);
+static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size,
+                                            uint64_t offset, uint64_t bytes);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -705,7 +709,7 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
-static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+static const char *cuda_model_range_ptr_impl(const void *model_map, uint64_t offset, uint64_t bytes, const char *what, int populate) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
@@ -715,10 +719,6 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
     if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
-    /* Unified-memory SoC: the mapping is already device-addressable, and the
-     * fallbacks below this point would each allocate a second copy of the
-     * weights out of the one pool the model is already sitting in. */
-    if (g_model_direct_addressable) return cuda_model_ptr(model_map, offset);
 
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
@@ -737,6 +737,18 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             const uintptr_t r1 = r0 + r.registered_bytes;
             if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
         }
+    }
+
+    /* Unified-memory SoC: the mapping is device-addressable, so an ordinary
+     * resolve that missed the caches above returns it directly -- the
+     * fallbacks below each allocate a second copy of the span, and letting
+     * every miss do that would sneak the whole model into device memory one
+     * tensor at a time. An explicit populate request (ds4_gpu_cache_model_range)
+     * is the one caller allowed to fall through: promoting a span that has no
+     * aligned artifact is the point of that call, and on this part it buys
+     * back the ~30% read-bandwidth cost of the ATS path. */
+    if (g_model_direct_addressable && !populate) {
+        return cuda_model_ptr(model_map, offset);
     }
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
@@ -793,6 +805,16 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     for (uint64_t done = 0; done < bytes; done += chunk) {
         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
         err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        /* Populate promotes multi-GiB spans on a unified-memory part: the
+         * device copy and the source page cache come out of one pool, so the
+         * source pages must be released as they are consumed or the transient
+         * doubles the span. This is the same discipline the whole-image
+         * chunked copy applies, and skipping it here is what OOM-killed the
+         * first promotion boot. */
+        if (populate && err == cudaSuccess) {
+            cuda_model_discard_source_pages(model_map, g_model_registered_size,
+                                            offset + done, n);
+        }
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
                     what ? what : "weights",
@@ -1312,6 +1334,10 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
         (unsigned long long)offset, (unsigned long long)bytes,
         logical_tier, physical_device, cur_dev, label ? label : "?");
     return NULL;
+}
+
+static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+    return cuda_model_range_ptr_impl(model_map, offset, bytes, what, 0);
 }
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
@@ -2361,6 +2387,35 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     return (char *)dev;
 }
 
+/* Range uploads are serialized during startup, so a failed upload can return
+ * the just-reserved tail to its arena. If this reservation created an otherwise
+ * empty final arena, release the CUDA allocation too; otherwise repeated read
+ * failures can consume the whole unified-memory pool without caching a byte. */
+static void cuda_model_arena_rollback(char *ptr) {
+    if (!ptr) return;
+    const uintptr_t p = (uintptr_t)ptr;
+    for (size_t i = 0; i < g_model_arenas.size(); i++) {
+        cuda_model_arena &a = g_model_arenas[i];
+        const uintptr_t base = (uintptr_t)a.device_ptr;
+        if (p < base || p - base >= a.bytes) continue;
+        const uint64_t prior_used = (uint64_t)(p - base);
+        if (prior_used <= a.used) a.used = prior_used;
+        if (a.used == 0 && i + 1u == g_model_arenas.size()) {
+            (void)cudaFree(a.device_ptr);
+            g_model_arenas.pop_back();
+        }
+        return;
+    }
+}
+
+static void cuda_model_range_upload_abort(char *ptr) {
+    if (g_model_upload_stream) {
+        (void)cudaStreamSynchronize(g_model_upload_stream);
+        (void)cudaGetLastError();
+    }
+    cuda_model_arena_rollback(ptr);
+}
+
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -2368,6 +2423,14 @@ static const char *cuda_model_range_ptr_from_fd(
         const char *what) {
     if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
+    /* Split GGUFs share one virtual mapping, while this legacy fast path owns
+     * only shard 0's fd. Offsets outside that file must use the mapping path;
+     * attempting pread on shard 0 both returns EOF and used to leak the arena
+     * reserved below on every failed tensor. */
+    if (g_model_file_size != 0 &&
+        (offset > g_model_file_size || bytes > g_model_file_size - offset)) {
+        return NULL;
+    }
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -2388,7 +2451,10 @@ static const char *cuda_model_range_ptr_from_fd(
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) {
+        cuda_model_arena_rollback(dev);
+        return NULL;
+    }
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
@@ -2401,6 +2467,7 @@ static const char *cuda_model_range_ptr_from_fd(
                 fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(err));
                 (void)cudaGetLastError();
+                cuda_model_range_upload_abort(dev);
                 return NULL;
             }
         }
@@ -2411,6 +2478,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     strerror(errno));
+            cuda_model_range_upload_abort(dev);
             return NULL;
         }
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
@@ -2421,6 +2489,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
+            cuda_model_range_upload_abort(dev);
             return NULL;
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
@@ -2428,6 +2497,7 @@ static const char *cuda_model_range_ptr_from_fd(
             fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
             (void)cudaGetLastError();
+            cuda_model_range_upload_abort(dev);
             return NULL;
         }
         cuda_model_drop_file_pages(offset + copied, n);
@@ -2441,6 +2511,7 @@ static const char *cuda_model_range_ptr_from_fd(
         fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
         (void)cudaGetLastError();
+        cuda_model_range_upload_abort(dev);
         return NULL;
     }
 
@@ -3778,7 +3849,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 
     if (cuda_integrated_artifact_map(model_map)) {
         fprintf(stderr,
-                "ds4: CUDA aligned artifacts replace expert residency; "
+                "ds4: CUDA aligned artifacts installed; "
                 "leaving the %.2f GiB model mmap unpinned\n",
                 (double)model_size / 1073741824.0);
         return 1;
@@ -3874,7 +3945,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
 
     if (cuda_integrated_artifact_map(model_map)) {
         fprintf(stderr,
-                "ds4: CUDA aligned artifacts replace expert residency; "
+                "ds4: CUDA aligned artifacts installed; "
                 "leaving the %.2f GiB model mmap unpinned\n",
                 (double)model_size / 1073741824.0);
         return 1;
@@ -4688,11 +4759,17 @@ extern "C" int ds4_gpu_model_range_replaced(
     return 0;
 }
 
+extern "C" uint64_t ds4_gpu_model_range_cached_bytes(void) {
+    return g_model_range_bytes;
+}
+
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (cuda_span_fully_replaced(model_map, offset, bytes)) return 1;
-    if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
+    if (!cuda_model_range_ptr_impl(model_map, offset, bytes,
+                                   label ? label : "model_tensor",
+                                   /*populate=*/1)) return 0;
     return cuda_model_range_is_cached(model_map, offset, bytes);
 }
 
