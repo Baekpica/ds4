@@ -183,6 +183,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
+            opt(fp, c, "--exaone-mtp", "Enable target-verified greedy K-EXAONE MTP with automatic loss quenching.");
+            opt(fp, c, "--exaone-mtp-timing", "Enable K-EXAONE MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: 0.7");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");

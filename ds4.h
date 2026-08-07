@@ -148,6 +148,8 @@ typedef struct {
     bool quality;
     bool glm_mtp;
     bool glm_mtp_timing;
+    bool exaone_mtp;
+    bool exaone_mtp_timing;
     bool dspark;
     bool dspark_strict;
     bool dspark_confidence_threshold_set;
@@ -369,6 +371,16 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
+bool ds4_test_exaone_mtp_should_quench(uint32_t verify_cycles,
+                                      uint32_t accepted_drafts,
+                                      double baseline_decode_ms,
+                                      double speculative_ms,
+                                      double seed_ms);
+uint32_t ds4_test_exaone_mtp_position_after_hidden(uint32_t hidden_pos);
+int ds4_test_exaone_mtp_stats(const ds4_session *s,
+                              uint32_t *verify_cycles,
+                              uint32_t *accepted_drafts,
+                              bool *quenched);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,

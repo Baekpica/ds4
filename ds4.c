@@ -37162,6 +37162,8 @@ struct ds4_engine {
     bool quality;
     bool glm_mtp;
     bool glm_mtp_timing;
+    bool exaone_mtp;
+    bool exaone_mtp_timing;
     bool dspark;
     bool dspark_strict;
     bool cuda_tensor_parallel;
@@ -49777,6 +49779,15 @@ typedef struct ds4_dspark_spec_stats {
 #endif
 
 
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
+/* The trained MTP decoder consumes (h[p], x[p+1]) at decoder position p+1.
+ * Keep that shift explicit: using p rotates Q/K one position too early and
+ * also puts every private-KV row in the wrong ring slot. */
+static uint32_t exaone_mtp_position_after_hidden(uint32_t hidden_pos) {
+    return hidden_pos + 1u;
+}
+#endif
+
 #ifndef DS4_NO_GPU
 /* =========================================================================
  * K-EXAONE GPU graph
@@ -49856,6 +49867,13 @@ typedef struct {
     ds4_gpu_tensor *b_routed_mid;
     ds4_gpu_tensor *b_routed_down;
 
+    /* Integrated blk.48 MTP state. The target model never writes this KV:
+     * it is a private sliding-window ring populated only by accepted-prefix
+     * hidden/token pairs. `mtp_concat` holds [enorm(embed); hnorm(hidden)]. */
+    ds4_gpu_tensor *mtp_concat;
+    float          *mtp_logits_host;
+    bool            mtp_ready;
+
     ds4_gpu_tensor *layer_kv[DS4_MAX_LAYER];
     uint32_t        layer_kv_cap[DS4_MAX_LAYER];
     uint64_t        kv_bytes;
@@ -49886,7 +49904,7 @@ static void exaone_graph_free(ds4_exaone_gpu_graph *g) {
         &g->b_dense_mid, &g->b_shared_gate, &g->b_shared_up, &g->b_shared_mid,
         &g->b_shared_out, &g->b_router_logits, &g->b_router_selected,
         &g->b_router_weights, &g->b_routed_gate, &g->b_routed_up,
-        &g->b_routed_mid, &g->b_routed_down,
+        &g->b_routed_mid, &g->b_routed_down, &g->mtp_concat,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         ds4_gpu_tensor_free(*all[i]);
@@ -49896,6 +49914,8 @@ static void exaone_graph_free(ds4_exaone_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_kv[il]);
         g->layer_kv[il] = NULL;
     }
+    free(g->mtp_logits_host);
+    g->mtp_logits_host = NULL;
     memset(g, 0, sizeof(*g));
 }
 
@@ -50029,7 +50049,8 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
                                uint32_t il,
                                uint32_t n_tok,
                                uint32_t pos0,
-                               ds4_gpu_tensor *x) {
+                               ds4_gpu_tensor *x,
+                               uint32_t window_limit) {
     const ds4_layer_weights *l = &w->layer[il];
     const bool batch = n_tok > 1u;
     const uint64_t n_embd = g->n_embd;
@@ -50077,7 +50098,8 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
                                         (uint32_t)g->kv_dim, n_tok, pos0, kv_cap))
         return false;
 
-    const uint32_t window = sliding ? DS4_N_SWA : 0u;
+    uint32_t window = sliding ? DS4_N_SWA : 0u;
+    if (window_limit != 0u && window_limit < window) window = window_limit;
     if (batch) {
         if (!ds4_gpu_exaone_attention_prefill_tensor(
                 heads, q, g->layer_kv[il], n_tok, pos0, DS4_N_HEAD,
@@ -50239,7 +50261,7 @@ static bool exaone_graph_prefill_chunk(ds4_exaone_gpu_graph *g,
         if (!ok) return false;
     }
     for (uint32_t il = 0; il < n_exec; il++) {
-        if (!exaone_graph_layer(g, m, w, il, n_tok, pos0, g->b_cur)) {
+        if (!exaone_graph_layer(g, m, w, il, n_tok, pos0, g->b_cur, 0u)) {
             fprintf(stderr, "ds4: exaone prefill failed at layer %u\n", il);
             return false;
         }
@@ -50262,12 +50284,141 @@ static bool exaone_graph_decode(ds4_exaone_gpu_graph *g,
                                           (uint32_t)token, (uint32_t)g->n_embd))
         return false;
     for (uint32_t il = 0; il < n_exec; il++) {
-        if (!exaone_graph_layer(g, m, w, il, 1u, pos, g->cur)) {
+        if (!exaone_graph_layer(g, m, w, il, 1u, pos, g->cur, 0u)) {
             fprintf(stderr, "ds4: exaone decode failed at layer %u\n", il);
             return false;
         }
     }
     return exaone_graph_output_head(g, m, w, g->cur, 0);
+}
+
+/* Allocate the tiny runtime part of the integrated MTP block lazily. The
+ * Q8_0 blk.48 weights are already in the main GGUF; only a 128-row private KV
+ * ring, one concat row, and a host logits row are additional state. */
+static bool exaone_graph_mtp_ensure(ds4_exaone_gpu_graph *g) {
+    if (!g) return false;
+    if (g->mtp_ready) return true;
+    if (DS4_N_NEXTN_PREDICT == 0u) return false;
+
+    const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint32_t cap = exaone_graph_layer_kv_cap(il, g->ctx_size);
+    const uint64_t kv_bytes =
+        (uint64_t)cap * g->kv_dim * 2u * sizeof(uint16_t);
+    ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc(kv_bytes);
+    ds4_gpu_tensor *concat = ds4_gpu_tensor_alloc(
+        2ull * g->n_embd * sizeof(float));
+    float *logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!kv || !concat || !logits) {
+        ds4_gpu_tensor_free(kv);
+        ds4_gpu_tensor_free(concat);
+        free(logits);
+        return false;
+    }
+    g->layer_kv[il] = kv;
+    g->layer_kv_cap[il] = cap;
+    g->mtp_concat = concat;
+    g->mtp_logits_host = logits;
+    g->kv_bytes += kv_bytes;
+    g->workspace_bytes += 2ull * g->n_embd * sizeof(float);
+    g->mtp_ready = true;
+    ds4_log(stderr, DS4_LOG_TIMING,
+            "ds4: exaone MTP graph: blk.%u private KV %.2f MiB (cap %u)\n",
+            il, (double)kv_bytes / 1048576.0, cap);
+    return true;
+}
+
+static int exaone_logits_argmax(const float *logits) {
+    int best = 0;
+    float best_value = logits[0];
+    for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+        if (logits[i] > best_value) {
+            best = (int)i;
+            best_value = logits[i];
+        }
+    }
+    return best;
+}
+
+/* Run one trained NextN step. `hidden` is the target trunk state h[p],
+ * next_token is x[p+1], and mtp_pos is p+1; blk.48 predicts x[p+2]. Only
+ * entries at or after min_pos exist in the private MTP ring, so the effective
+ * attention window is clipped until enough decode steps have populated the
+ * 128-token history. */
+static bool exaone_graph_mtp_step(ds4_exaone_gpu_graph *g,
+                                  const ds4_model *m,
+                                  const ds4_weights *w,
+                                  ds4_gpu_tensor *hidden,
+                                  int next_token,
+                                  uint32_t mtp_pos,
+                                  uint32_t min_pos,
+                                  int *draft_out) {
+    if (!g || !m || !w || !hidden || !draft_out || min_pos > mtp_pos ||
+        mtp_pos >= g->ctx_size || !exaone_graph_mtp_ensure(g)) {
+        return false;
+    }
+    const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const ds4_layer_weights *l = &w->layer[il];
+    if (!l->nextn_eh_proj || !l->nextn_enorm || !l->nextn_hnorm ||
+        !l->nextn_shared_head_norm || !l->ffn_gate || !l->ffn_up ||
+        !l->ffn_down) {
+        return false;
+    }
+
+    ds4_gpu_tensor *enorm = ds4_gpu_tensor_view(
+        g->mtp_concat, 0, g->n_embd * sizeof(float));
+    ds4_gpu_tensor *hnorm = ds4_gpu_tensor_view(
+        g->mtp_concat, g->n_embd * sizeof(float),
+        g->n_embd * sizeof(float));
+    if (!enorm || !hnorm) {
+        ds4_gpu_tensor_free(enorm);
+        ds4_gpu_tensor_free(hnorm);
+        return false;
+    }
+
+    bool ok = ds4_gpu_exaone_rms_norm_tensor(
+        hnorm, hidden, m->map, m->size, l->nextn_hnorm->abs_offset,
+        (uint32_t)g->n_embd, 1u, DS4_RMS_EPS) != 0;
+    if (ok) {
+        ok = ds4_gpu_embed_token_quant_tensor(
+            g->cur, m->map, m->size, w->token_embd->abs_offset,
+            w->token_embd->type, DS4_N_VOCAB, (uint32_t)next_token,
+            (uint32_t)g->n_embd) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_exaone_rms_norm_tensor(
+            enorm, g->cur, m->map, m->size, l->nextn_enorm->abs_offset,
+            (uint32_t)g->n_embd, 1u, DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        ok = metal_graph_matmul_plain_tensor(
+            g->cur, m, l->nextn_eh_proj, 2ull * g->n_embd, g->n_embd,
+            g->mtp_concat, 1u);
+    }
+    const uint32_t written = mtp_pos - min_pos + 1u;
+    if (ok) {
+        ok = exaone_graph_layer(g, m, w, il, 1u, mtp_pos, g->cur,
+                                written < DS4_N_SWA ? written : DS4_N_SWA);
+    }
+    if (ok) {
+        ok = ds4_gpu_exaone_rms_norm_tensor(
+            g->norm, g->cur, m->map, m->size,
+            l->nextn_shared_head_norm->abs_offset,
+            (uint32_t)g->n_embd, 1u, DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        ok = metal_graph_matmul_plain_tensor(
+            g->logits, m, w->output, g->n_embd, DS4_N_VOCAB,
+            g->norm, 1u);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(g->logits, 0, g->mtp_logits_host,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    ds4_gpu_tensor_free(enorm);
+    ds4_gpu_tensor_free(hnorm);
+    if (!ok) return false;
+    *draft_out = exaone_logits_argmax(g->mtp_logits_host);
+    return true;
 }
 #endif /* DS4_NO_GPU */
 
@@ -50289,6 +50440,16 @@ struct ds4_session {
     uint32_t glm_mtp_min_pos;
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
+    /* K-EXAONE integrated blk.48 MTP state (--exaone-mtp, greedy only). */
+    int exaone_mtp_draft;
+    int exaone_mtp_have;
+    int exaone_mtp_quenched;
+    uint32_t exaone_mtp_min_pos;
+    uint32_t exaone_mtp_verify_cycles;
+    uint32_t exaone_mtp_accepted_drafts;
+    double exaone_mtp_baseline_decode_ms;
+    double exaone_mtp_speculative_ms;
+    double exaone_mtp_seed_ms;
     ds4_spec_frontier greedy_splitkv_anchor;
 #endif
     ds4_kv_cache cpu_cache;
@@ -51962,6 +52123,43 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     return 0;
 }
 
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
+/* A speculative cycle is useful only when its measured wall time per
+ * committed target token beats ordinary greedy decode. Keep a short warm-up
+ * so CUDA graph/materialization noise cannot switch MTP off on its first
+ * cycle, then require a 3% loss before quenching to avoid flapping on timer
+ * noise. `speculative_ms` includes target verification and subsequent draft
+ * updates; `seed_ms` is the one-time draft-head work after the initial plain
+ * target step. */
+static bool exaone_mtp_should_quench(uint32_t verify_cycles,
+                                     uint32_t accepted_drafts,
+                                     double baseline_decode_ms,
+                                     double speculative_ms,
+                                     double seed_ms) {
+    if (verify_cycles < 12u || baseline_decode_ms <= 0.0) return false;
+    const double baseline_ms = baseline_decode_ms *
+        (double)(verify_cycles + accepted_drafts);
+    const double actual_ms = speculative_ms + seed_ms;
+    return actual_ms > baseline_ms * 1.03;
+}
+#endif
+
+#ifdef DS4_TEST_HOOKS
+bool ds4_test_exaone_mtp_should_quench(uint32_t verify_cycles,
+                                      uint32_t accepted_drafts,
+                                      double baseline_decode_ms,
+                                      double speculative_ms,
+                                      double seed_ms) {
+    return exaone_mtp_should_quench(verify_cycles, accepted_drafts,
+                                    baseline_decode_ms, speculative_ms,
+                                    seed_ms);
+}
+
+uint32_t ds4_test_exaone_mtp_position_after_hidden(uint32_t hidden_pos) {
+    return exaone_mtp_position_after_hidden(hidden_pos);
+}
+#endif
+
 bool ds4_engine_has_output_head(ds4_engine *e) {
     return e && weights_have_output_head(&e->weights);
 }
@@ -51975,14 +52173,25 @@ static bool ds4_engine_glm_mtp_spec_enabled(const ds4_engine *e) {
 #endif
 
 bool ds4_engine_has_mtp(ds4_engine *e) {
-    return e && e->backend != DS4_BACKEND_CPU &&
-           e->distributed.role == DS4_DISTRIBUTED_NONE &&
-           e->mtp_ready;
+    if (!e || e->backend == DS4_BACKEND_CPU ||
+        e->distributed.role != DS4_DISTRIBUTED_NONE) {
+        return false;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+        return e->exaone_mtp && DS4_N_NEXTN_PREDICT != 0;
+    }
+    return e->mtp_ready;
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
+    }
+    if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+        return ds4_engine_has_mtp(e) ? 2 : 0;
     }
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
 #ifndef DS4_NO_GPU
@@ -58332,6 +58541,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->quality = opt->quality;
     e->glm_mtp = opt->glm_mtp;
     e->glm_mtp_timing = opt->glm_mtp_timing;
+    e->exaone_mtp = opt->exaone_mtp;
+    e->exaone_mtp_timing = opt->exaone_mtp_timing;
     e->dspark = opt->dspark;
     e->dspark_strict = opt->dspark_strict;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
@@ -58423,6 +58634,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
+    if (e->exaone_mtp && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_EXAONE_MOE) {
+        fprintf(stderr, "ds4: --exaone-mtp requires an exaone-moe model\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     if (load_slice && load_layer_end == UINT32_MAX) {
         const uint32_t normal_layers = ds4_model_normal_layer_count();
         if (normal_layers == 0) {
@@ -59716,6 +59933,61 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             draft_hist,
             accept_hist);
 }
+
+static void ds4_session_exaone_mtp_reset(ds4_session *s) {
+    if (!s) return;
+    s->exaone_mtp_draft = -1;
+    s->exaone_mtp_have = 0;
+    s->exaone_mtp_quenched = 0;
+    s->exaone_mtp_min_pos = UINT32_MAX;
+    s->exaone_mtp_verify_cycles = 0;
+    s->exaone_mtp_accepted_drafts = 0;
+    s->exaone_mtp_baseline_decode_ms = 0.0;
+    s->exaone_mtp_speculative_ms = 0.0;
+    s->exaone_mtp_seed_ms = 0.0;
+}
+
+static void ds4_session_print_exaone_mtp_stats(const ds4_session *s) {
+    if (!s || !s->engine || !s->engine->exaone_mtp ||
+        (s->exaone_mtp_verify_cycles == 0 && s->exaone_mtp_seed_ms == 0.0)) {
+        return;
+    }
+    const uint32_t committed = s->exaone_mtp_verify_cycles +
+                               s->exaone_mtp_accepted_drafts;
+    const double expected_ms = s->exaone_mtp_baseline_decode_ms * committed;
+    const double actual_ms = s->exaone_mtp_seed_ms +
+                             s->exaone_mtp_speculative_ms;
+    const double accept_rate = s->exaone_mtp_verify_cycles
+        ? 100.0 * (double)s->exaone_mtp_accepted_drafts /
+          (double)s->exaone_mtp_verify_cycles
+        : 0.0;
+    fprintf(stderr,
+            "ds4: exaone MTP stats cycles=%u accepted_draft=%u "
+            "accept_rate=%.2f%% committed=%u baseline_decode_ms=%.3f "
+            "seed_ms=%.3f spec_ms=%.3f net_saved_ms=%.3f quenched=%d\n",
+            s->exaone_mtp_verify_cycles,
+            s->exaone_mtp_accepted_drafts,
+            accept_rate,
+            committed,
+            s->exaone_mtp_baseline_decode_ms,
+            s->exaone_mtp_seed_ms,
+            s->exaone_mtp_speculative_ms,
+            expected_ms - actual_ms,
+            s->exaone_mtp_quenched);
+}
+
+#ifdef DS4_TEST_HOOKS
+int ds4_test_exaone_mtp_stats(const ds4_session *s,
+                              uint32_t *verify_cycles,
+                              uint32_t *accepted_drafts,
+                              bool *quenched) {
+    if (!s || !s->engine || !ds4_session_is_exaone(s)) return 1;
+    if (verify_cycles) *verify_cycles = s->exaone_mtp_verify_cycles;
+    if (accepted_drafts) *accepted_drafts = s->exaone_mtp_accepted_drafts;
+    if (quenched) *quenched = s->exaone_mtp_quenched != 0;
+    return 0;
+}
+#endif
 #endif
 
 static bool ds4_session_tp_leader(const ds4_session *s) {
@@ -59782,6 +60054,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->prefill_cap = s->exaone_graph.prefill_cap;
         s->exaone_graph_ready = true;
+        ds4_session_exaone_mtp_reset(s);
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         if (!ds4_session_tp_register(s)) {
@@ -60068,6 +60341,7 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     ds4_session_print_dspark_stats(s);
+    ds4_session_print_exaone_mtp_stats(s);
 #endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
@@ -60441,6 +60715,201 @@ static int ds4_session_glm_spec_cycle(ds4_session *s, int first_token,
         free(nt);
     }
     return n_committed;
+}
+
+/* One K-EXAONE greedy speculative cycle. blk.48 is only a proposer: every
+ * drafted token is compared with the corresponding target-model row before
+ * it reaches the checkpoint. The two-row target pass may leave a rejected
+ * draft in the KV slot immediately beyond the checkpoint; the next ordinary
+ * decode writes that exact slot again, so no rejected state becomes visible. */
+static int ds4_session_exaone_spec_cycle(ds4_session *s,
+                                         int first_token,
+                                         int *accepted,
+                                         int accepted_cap,
+                                         char *err,
+                                         size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds4_exaone_gpu_graph *g = &s->exaone_graph;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    const bool timing = e->exaone_mtp_timing;
+
+    if (s->exaone_mtp_quenched || accepted_cap < 2 ||
+        g->prefill_cap < 2u || pos + 2u > g->ctx_size) {
+        const double t0 = now_sec();
+        if (ds4_session_eval_internal(s, first_token, false, err, errlen) != 0) {
+            return -1;
+        }
+        const double decode_ms = (now_sec() - t0) * 1000.0;
+        if (s->exaone_mtp_baseline_decode_ms == 0.0) {
+            s->exaone_mtp_baseline_decode_ms = decode_ms;
+        } else {
+            s->exaone_mtp_baseline_decode_ms =
+                0.8 * s->exaone_mtp_baseline_decode_ms + 0.2 * decode_ms;
+        }
+        s->exaone_mtp_have = 0;
+        accepted[0] = first_token;
+        return 1;
+    }
+
+    if (!s->exaone_mtp_have) {
+        /* Establish a target-only decode baseline and seed the first proposal
+         * from the resulting trunk hidden state. */
+        const double target_t0 = now_sec();
+        if (ds4_session_eval_internal(s, first_token, false, err, errlen) != 0) {
+            return -1;
+        }
+        const double target_ms = (now_sec() - target_t0) * 1000.0;
+        if (s->exaone_mtp_baseline_decode_ms == 0.0) {
+            s->exaone_mtp_baseline_decode_ms = target_ms;
+        } else {
+            s->exaone_mtp_baseline_decode_ms =
+                0.8 * s->exaone_mtp_baseline_decode_ms + 0.2 * target_ms;
+        }
+
+        const int next = exaone_logits_argmax(s->logits);
+        const uint32_t mtp_pos = exaone_mtp_position_after_hidden(pos);
+        if (s->exaone_mtp_min_pos == UINT32_MAX ||
+            s->exaone_mtp_min_pos > mtp_pos) {
+            s->exaone_mtp_min_pos = mtp_pos;
+        }
+        const double seed_t0 = now_sec();
+        int draft = -1;
+        if (exaone_graph_mtp_step(g, &e->model, &e->weights, g->cur,
+                                  next, mtp_pos, s->exaone_mtp_min_pos,
+                                  &draft)) {
+            s->exaone_mtp_draft = draft;
+            s->exaone_mtp_have = 1;
+        }
+        const double seed_ms = (now_sec() - seed_t0) * 1000.0;
+        s->exaone_mtp_seed_ms += seed_ms;
+        if (timing) {
+            fprintf(stderr,
+                    "ds4: exaone MTP seed target=%.3f ms draft=%.3f ms "
+                    "ready=%d pos=%u\n",
+                    target_ms, seed_ms, s->exaone_mtp_have, mtp_pos);
+        }
+        accepted[0] = first_token;
+        return 1;
+    }
+
+    const double cycle_t0 = now_sec();
+    const int draft = s->exaone_mtp_draft;
+    const int toks[2] = { first_token, draft };
+    s->exaone_mtp_have = 0;
+
+    /* Run the target over both positions, preserve row1 logits, then apply
+     * the shared target head to row0 for the exact accept/reject decision. */
+    bool ok = exaone_graph_prefill_chunk(g, &e->model, &e->weights,
+                                         toks, 2u, pos, true);
+    if (ok) {
+        ok = ds4_gpu_tensor_read(g->logits, 0, s->logits,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok) {
+        ok = exaone_graph_output_head(g, &e->model, &e->weights,
+                                      g->b_cur, 0u);
+    }
+    if (ok) {
+        ok = exaone_graph_mtp_ensure(g) &&
+             ds4_gpu_tensor_read(g->logits, 0, g->mtp_logits_host,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "exaone MTP target verification failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+
+    const int target_next = exaone_logits_argmax(g->mtp_logits_host);
+    const bool accept = target_next == draft;
+    token_vec_push(&s->checkpoint, first_token);
+    s->checkpoint_valid = true;
+    int committed = 1;
+    if (accept) {
+        token_vec_push(&s->checkpoint, draft);
+        committed = 2;
+    } else {
+        /* Row0 is now the last committed target state. */
+        memcpy(s->logits, g->mtp_logits_host,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+
+    int next_draft = -1;
+    if (accept) {
+        const int after_draft = exaone_logits_argmax(s->logits);
+        ds4_gpu_tensor *h0 = ds4_gpu_tensor_view(
+            g->b_cur, 0, g->n_embd * sizeof(float));
+        ds4_gpu_tensor *h1 = ds4_gpu_tensor_view(
+            g->b_cur, g->n_embd * sizeof(float),
+            g->n_embd * sizeof(float));
+        const uint32_t mtp_pos0 = exaone_mtp_position_after_hidden(pos);
+        const uint32_t mtp_pos1 = exaone_mtp_position_after_hidden(pos + 1u);
+        int unused = -1;
+        const bool updated = h0 && h1 &&
+            exaone_graph_mtp_step(g, &e->model, &e->weights, h0,
+                                  draft, mtp_pos0, s->exaone_mtp_min_pos,
+                                  &unused) &&
+            exaone_graph_mtp_step(g, &e->model, &e->weights, h1,
+                                  after_draft, mtp_pos1,
+                                  s->exaone_mtp_min_pos, &next_draft);
+        ds4_gpu_tensor_free(h0);
+        ds4_gpu_tensor_free(h1);
+        if (updated) {
+            s->exaone_mtp_draft = next_draft;
+            s->exaone_mtp_have = 1;
+        }
+    } else {
+        ds4_gpu_tensor *h0 = ds4_gpu_tensor_view(
+            g->b_cur, 0, g->n_embd * sizeof(float));
+        const uint32_t mtp_pos = exaone_mtp_position_after_hidden(pos);
+        const bool updated = h0 &&
+            exaone_graph_mtp_step(g, &e->model, &e->weights, h0,
+                                  target_next, mtp_pos,
+                                  s->exaone_mtp_min_pos, &next_draft);
+        ds4_gpu_tensor_free(h0);
+        if (updated) {
+            s->exaone_mtp_draft = next_draft;
+            s->exaone_mtp_have = 1;
+        }
+    }
+
+    const double cycle_ms = (now_sec() - cycle_t0) * 1000.0;
+    s->exaone_mtp_verify_cycles++;
+    if (accept) s->exaone_mtp_accepted_drafts++;
+    s->exaone_mtp_speculative_ms += cycle_ms;
+
+    if (getenv("DS4_EXAONE_MTP_NO_QUENCH") == NULL &&
+        exaone_mtp_should_quench(s->exaone_mtp_verify_cycles,
+                                 s->exaone_mtp_accepted_drafts,
+                                 s->exaone_mtp_baseline_decode_ms,
+                                 s->exaone_mtp_speculative_ms,
+                                 s->exaone_mtp_seed_ms)) {
+        s->exaone_mtp_quenched = 1;
+        s->exaone_mtp_have = 0;
+        const uint32_t total = s->exaone_mtp_verify_cycles +
+                               s->exaone_mtp_accepted_drafts;
+        const double baseline_ms = s->exaone_mtp_baseline_decode_ms * total;
+        const double actual_ms = s->exaone_mtp_seed_ms +
+                                 s->exaone_mtp_speculative_ms;
+        fprintf(stderr,
+                "ds4: exaone MTP auto-quench after %u cycles: "
+                "accepted=%u, measured %.3f ms vs target-only %.3f ms\n",
+                s->exaone_mtp_verify_cycles,
+                s->exaone_mtp_accepted_drafts,
+                actual_ms,
+                baseline_ms);
+    }
+
+    if (timing) {
+        fprintf(stderr,
+                "ds4: exaone MTP cycle %.3f ms %s draft=%d target=%d "
+                "committed=%d ready=%d\n",
+                cycle_ms, accept ? "ACCEPT" : "reject", draft,
+                target_next, committed, s->exaone_mtp_have);
+    }
+    accepted[0] = first_token;
+    if (accept) accepted[1] = draft;
+    return committed;
 }
 #endif
 
@@ -61228,6 +61697,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
+        ds4_session_exaone_mtp_reset(s);
         return 0;
     }
     if (ds4_session_is_glm(s)) {
@@ -66946,6 +67416,7 @@ static bool metal_graph_eval_mixed_prefill_decode(
  *
  * Sessions are advanced only after every encode succeeded, so a failure
  * leaves the batch logically untouched rather than half-committed. */
+#ifndef DS4_NO_GPU
 static int ds4_sessions_eval_batch_exaone(ds4_decode_item *items, int count,
                                           char *err, size_t errlen) {
     ds4_engine *e = items[0].session->engine;
@@ -66991,6 +67462,7 @@ static int ds4_sessions_eval_batch_exaone(ds4_decode_item *items, int count,
     }
     return 0;
 }
+#endif
 
 static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
@@ -67251,6 +67723,23 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    if (ds4_session_is_exaone(s)) {
+        (void)eos_token;
+        if (!accepted || accepted_cap <= 0) return 0;
+#ifndef DS4_NO_GPU
+        if (s->engine->exaone_mtp && DS4_N_NEXTN_PREDICT != 0 &&
+            s->exaone_graph_ready) {
+            int cycle_cap = accepted_cap;
+            if (cycle_cap > max_tokens) cycle_cap = max_tokens;
+            return ds4_session_exaone_spec_cycle(s, first_token,
+                                                  accepted, cycle_cap,
+                                                  err, errlen);
+        }
+#endif
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
@@ -67983,6 +68472,7 @@ void ds4_session_invalidate(ds4_session *s) {
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
+    ds4_session_exaone_mtp_reset(s);
 #endif
 }
 
@@ -67998,6 +68488,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_cap_dense_cache(s);
+    ds4_session_exaone_mtp_reset(s);
 #endif
 }
 

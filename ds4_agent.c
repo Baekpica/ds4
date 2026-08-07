@@ -630,6 +630,11 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--glm-mtp-timing")) {
             c.engine.glm_mtp = true;
             c.engine.glm_mtp_timing = true;
+        } else if (!strcmp(arg, "--exaone-mtp")) {
+            c.engine.exaone_mtp = true;
+        } else if (!strcmp(arg, "--exaone-mtp-timing")) {
+            c.engine.exaone_mtp = true;
+            c.engine.exaone_mtp_timing = true;
         } else if (!strcmp(arg, "--dspark")) {
             c.engine.dspark = true;
         } else if (!strcmp(arg, "--dspark-confidence")) {
