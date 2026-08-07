@@ -441,6 +441,13 @@ tests/test_exaone_forward.o: tests/test_exaone_forward.c ds4.c ds4.h ds4_gpu.h
 
 tests/test_exaone_forward: tests/test_exaone_forward.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_exaone_tokenizer.o: tests/test_exaone_tokenizer.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -c -o $@ $<
+
+tests/test_exaone_tokenizer: tests/test_exaone_tokenizer.o
+	$(CC) $(CFLAGS) -O0 -o $@ $^ -Wl,--gc-sections $(LDLIBS)
 endif
 
 tests/test_split_gguf: tests/test_split_gguf.c ds4.c ds4.h
