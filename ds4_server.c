@@ -9002,6 +9002,45 @@ static bool wire_finish_stream(int fd, server *s, const request *r,
     return ok;
 }
 
+/* Inc 4b (plan §4.5): the typed stream START and cumulative UPDATE wrappers
+ * Inc 1b explicitly deferred to the streaming promotion.  wire_begin arms
+ * the surface's machine in the session union and emits its protocol start
+ * events (the caller has already sent the SSE headers); wire_update projects
+ * the row's CUMULATIVE text through the machine (every machine keeps its own
+ * emit cursor).  The legacy-Completion plain stream is a positional cursor,
+ * not a machine -- its emit stays with the caller (cont_stream_emit_plain /
+ * generate_job's plain branch).  Responses adoption lands in 4c. */
+static bool wire_begin(int fd, const request *r, ds4_wire_session *ws,
+                       int prompt_tokens) {
+    switch (ws->surface) {
+    case DS4_WIRE_ANTHROPIC:
+        ws->protocol_started = true;
+        return anthropic_sse_start_live(fd, r, ws->id, prompt_tokens,
+                                        &ws->state.anthropic);
+    case DS4_WIRE_OPENAI_CHAT:
+        openai_stream_start(r, &ws->state.oa_chat); /* THINKING if think enabled, else TEXT */
+        ws->protocol_started = true;
+        return sse_chunk(fd, r, ws->id, NULL, NULL); /* {"delta":{"role":"assistant"}} */
+    default:
+        return true;
+    }
+}
+
+static bool wire_update(int fd, server *s, const request *r,
+                        ds4_wire_session *ws, const char *raw, size_t raw_len) {
+    switch (ws->surface) {
+    case DS4_WIRE_ANTHROPIC:
+        return anthropic_sse_stream_update(fd, s, r, ws->id,
+                                           &ws->state.anthropic,
+                                           raw, raw_len, false);
+    case DS4_WIRE_OPENAI_CHAT:
+        return openai_sse_stream_update(fd, s, r, ws->id, &ws->state.oa_chat,
+                                        raw, raw_len, false);
+    default:
+        return true;
+    }
+}
+
 /* Error projection (Inc 1c wrappers, Inc 2b endpoint-native interiors).
  * The SURFACE is explicit at every error exit (Inc 1c), and the serializers
  * now honor it: Anthropic gets its documented {"type":"error",...} envelope
@@ -12151,13 +12190,17 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
      * stop honesty (2c), client-frame usage (2d/3a), and -- for Responses
      * -- the same finalize-time reasoning retokenize the serial path does
      * (3b).  The promotions are these routing rows, not new projection
-     * code.  STREAMING on both surfaces waits for Inc 4 (no cont SSE
-     * machines for them). */
-    const bool cont_promoted_buffered = !(needs & DS4_NEED_STREAMING) &&
-        ((env->cont_anthropic && surf == DS4_WIRE_ANTHROPIC) ||
-         (env->cont_responses && surf == DS4_WIRE_RESPONSES));
+     * code.  Inc 4b: Anthropic STREAMING rides too -- cont_stream_start /
+     * cont_on_token / wire_finish_stream now speak its SSE machine
+     * (wire_begin/wire_update), transport starts at admission (4a) and the
+     * prefill heartbeat is the native ping.  Responses streaming waits for
+     * 4c (no cont created/delta adoption yet). */
+    const bool cont_promoted =
+        (env->cont_anthropic && surf == DS4_WIRE_ANTHROPIC) ||
+        (env->cont_responses && surf == DS4_WIRE_RESPONSES &&
+         !(needs & DS4_NEED_STREAMING));
     if (surf != DS4_WIRE_OPENAI_CHAT && surf != DS4_WIRE_OPENAI_COMPLETION &&
-        !cont_promoted_buffered) {
+        !cont_promoted) {
         d.reason = ROUTE_REASON_SURFACE; return d;
     }
     if (!env->coalesce) { d.reason = ROUTE_REASON_COALESCE_OFF; return d; }
@@ -12177,7 +12220,7 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
      * batched lanes. */
     if ((needs & ~ROUTE_STATIC_MASK) == 0 &&
         (surf == DS4_WIRE_OPENAI_CHAT || surf == DS4_WIRE_OPENAI_COMPLETION ||
-         cont_promoted_buffered)) {
+         cont_promoted)) {
         d.lane = ROUTE_LANE_STATIC;
         d.reason = env->have_cont ? ROUTE_REASON_STATIC_PROMPT_BOUNDS
                                   : ROUTE_REASON_STATIC_NO_CONT;
@@ -13751,13 +13794,12 @@ static void cont_stream_start(server *s, job *j) {
      * (the old kind==REQ_CHAT test was equivalent while OpenAI was the sole
      * streaming tenant; the promoted surfaces bring their own machines). */
     st->wsess.live_openai = j->req.api == API_OPENAI && j->req.kind == REQ_CHAT;
-    if (st->wsess.live_openai) {
-        openai_stream_start(&j->req, &st->wsess.state.oa_chat); /* THINKING if think enabled, else TEXT */
-        st->wsess.protocol_started = true;
-    }
     if (!sse_headers(j->fd, s->enable_cors)) { st->failed = true; return; }
-    if (st->wsess.live_openai && !sse_chunk(j->fd, &j->req, st->id, NULL, NULL))
-        st->failed = true;                     /* {"delta":{"role":"assistant"}} */
+    /* Inc 4b: headers first, then the surface's protocol start through the
+     * typed wrapper -- Anthropic message_start renders the admission-verdict
+     * usage cont_on_admitted installed just before this call. */
+    if (!wire_begin(j->fd, &j->req, &st->wsess, st->prompt_tokens))
+        st->failed = true;
 }
 
 /* Inc 4a (plan §4.7): the engine's install for this request fully succeeded
@@ -14080,8 +14122,12 @@ static int cont_on_token(void *ud, void *user, int token) {
      * ported.  Each sampled id is queued with its byte end so the shared SSE
      * projection below drains token-aligned token_ids arrays.  No-op unless
      * the request set return_token_ids (chat-only: completion-kind echo never
-     * rides the cont path, and completion rows do not use the chat machine). */
-    if (j->req.stream && j->req.kind == REQ_CHAT)
+     * rides the cont path, and completion rows do not use the chat machine).
+     * Inc 4b: gated on the CHAT MACHINE, not the kind -- a promoted Anthropic
+     * chat row holds anthropic_stream in the session union, and poking
+     * oa_chat fields there is type confusion (echo on the promoted surfaces
+     * is already serial via the TOKEN_IDS projection row). */
+    if (j->req.stream && st->wsess.live_openai)
         openai_stream_record_token(&st->wsess.state.oa_chat, token, st->text.len);
 
     /* Stop scan + stream hold-back, the generate_job shape: never emit bytes
@@ -14141,9 +14187,13 @@ static int cont_on_token(void *ud, void *user, int token) {
      * on both shapes.  Writes redirect into j->out (W8a t_emit_job); a false
      * return means the client is gone -> evict. */
     if (j->req.stream) {
+        /* Inc 4b: chat-kind rows project through the session's typed machine
+         * (OpenAI delta machine or Anthropic event machine -- wire_update
+         * dispatches on the surface); the legacy-Completion positional
+         * cursor stays its own branch. */
         bool ok = j->req.kind == REQ_CHAT ?
-            openai_sse_stream_update(j->fd, s, &j->req, st->id, &st->wsess.state.oa_chat,
-                                     st->text.ptr ? st->text.ptr : "", stream_len, false) :
+            wire_update(j->fd, s, &j->req, &st->wsess,
+                        st->text.ptr ? st->text.ptr : "", stream_len) :
             cont_stream_emit_plain(j, st, stream_len);
         if (!ok) { st->failed = true; t_emit_job = NULL; return 0; }
     }
@@ -20930,19 +20980,22 @@ static int route_legacy_oracle(const request *r, bool coalesce_on,
     return ROUTE_LANE_SERIAL;
 }
 
-/* Inc 3a/3b/3d: the expected table is the LEGACY tree plus EXACTLY the
+/* Inc 3a/3b/3d/4b: the expected table is the LEGACY tree plus EXACTLY the
  * promoted-surface rows -- Anthropic (3a) and Responses (3b) non-tool
- * buffered ride continuous when they fit, and their NEEDS-FREE shapes take
- * the same static fallbacks (3d; the static writer is surface-typed).
- * Token-id echo keeps its streaming-chat-only projection constraint.
- * Everything else must stay bit-identical to the legacy oracle, which is
- * the strongest statement of "no other request changed lane". */
+ * buffered ride continuous when they fit, Anthropic non-tool STREAMING
+ * rides too (4b; Responses streaming waits for 4c), and their NEEDS-FREE
+ * shapes take the same static fallbacks (3d; the static writer is
+ * surface-typed).  Token-id echo keeps its streaming-chat-only projection
+ * constraint on every surface.  Everything else must stay bit-identical to
+ * the legacy oracle, which is the strongest statement of "no other request
+ * changed lane". */
 static int route_expected_oracle(const request *r, bool coalesce_on,
                                  bool have_cont, int seq_cap) {
     const uint32_t needs = request_compute_needs(r);
     if (coalesce_on && (r->api == API_ANTHROPIC || r->api == API_RESPONSES) &&
         (needs & ~ROUTE_CONT_MASK) == 0 &&
-        !(needs & (DS4_NEED_STREAMING | DS4_NEED_TOKEN_IDS))) {
+        !(needs & DS4_NEED_TOKEN_IDS) &&
+        (r->api == API_ANTHROPIC || !(needs & DS4_NEED_STREAMING))) {
         if (have_cont && r->prompt.len > 0 && r->prompt.len <= seq_cap)
             return ROUTE_LANE_CONTINUOUS;
         if (needs == 0) return ROUTE_LANE_STATIC;   /* Inc 3d */
@@ -21073,9 +21126,22 @@ static void test_route_decide_reason_table(void) {
     TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
     d = route_decide(0, DS4_WIRE_RESPONSES, &anth_off);
     TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
-    /* STREAMING on both promoted surfaces = the Inc 4 gap. */
+    /* Inc 4b: Anthropic no-tool STREAMING rides continuous (thinking/stops
+     * inside the cont mask ride with it); the kill switch still restores
+     * the legacy refusal, and a streaming shape that cannot ride cont goes
+     * SERIAL (never static -- STREAMING is outside the static mask). */
     d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_ANTHROPIC, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_STREAMING | DS4_NEED_THINKING | DS4_NEED_STOP_SCAN,
+                     DS4_WIRE_ANTHROPIC, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_ANTHROPIC, &anth_off);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
+    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_ANTHROPIC, &no_ctx);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+    d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_ANTHROPIC, &big);
+    TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
+    /* Responses STREAMING = the remaining Inc 4c gap. */
     d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_RESPONSES, &on);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_SURFACE);
     /* Inc 3d: a promoted surface that cannot ride cont takes the same
@@ -22113,6 +22179,89 @@ static void test_cont_admission_transport_and_heartbeat(void) {
     close(sv[1]);
 }
 
+/* Inc 4b: a promoted Anthropic stream on the CONT path projects through the
+ * SAME machine the serial path uses -- the identical tape driven through the
+ * real cont entry points (cont_stream_start / wire_update /
+ * cont_stream_finalize) and through the direct serial calls must produce
+ * byte-identical SSE when the id is pinned.  The automata validator runs on
+ * the cont bytes too. */
+static void test_cont_anthropic_stream_matches_serial_oracle(void) {
+    int sv[2];
+    server s;
+    memset(&s, 0, sizeof(s));
+
+    /* cont path */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.api = API_ANTHROPIC;
+    j.req.stream = true;
+    j.req.think_mode = DS4_THINK_LOW;
+    j.req.prompt.len = 7;
+    cont_stream *st = cont_stream_ensure(&j);
+    cont_stream_start(&s, &j);        /* headers + message_start (wire_begin) */
+    TEST_ASSERT(st->started && !st->failed);
+    TEST_ASSERT(st->wsess.protocol_started);
+    TEST_ASSERT(st->wsess.surface == DS4_WIRE_ANTHROPIC);
+    char id[96];
+    snprintf(id, sizeof(id), "%s", st->id);
+    int completion = 0;
+    for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+        const char *piece = tape_thinking[i].piece;
+        buf_append(&st->text, piece, strlen(piece));
+        st->completion = ++completion;
+        TEST_ASSERT(wire_update(j.fd, &s, &j.req, &st->wsess,
+                                st->text.ptr, st->text.len));
+    }
+    cont_stream_finalize(&s, &j, "stop");
+    TEST_ASSERT(j.cstream == NULL);
+    shutdown(sv[0], SHUT_WR);
+    char *cont_out = read_socket_text(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&j.req);
+
+    /* direct serial machine, same id + tape + counts */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) { free(cont_out); return; }
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_LOW;
+    r.prompt.len = 7;
+    TEST_ASSERT(sse_headers(sv[0], false));
+    anthropic_stream ast;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, id, 7, &ast));
+    buf raw = {0};
+    for (size_t i = 0; i < sizeof(tape_thinking) / sizeof(tape_thinking[0]); i++) {
+        const char *piece = tape_thinking[i].piece;
+        buf_append(&raw, piece, strlen(piece));
+        TEST_ASSERT(anthropic_sse_stream_update(sv[0], &s, &r, id, &ast,
+                                                raw.ptr, raw.len, false));
+    }
+    tool_calls empty = {0};
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], &s, &r, id, &ast,
+                                          raw.ptr, raw.len, &empty, "stop",
+                                          NULL, completion));
+    shutdown(sv[0], SHUT_WR);
+    char *ser_out = read_socket_text(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
+
+    sse_validate_anthropic_stream(cont_out);
+    TEST_ASSERT(strcmp(cont_out, ser_out) == 0);
+
+    anthropic_stream_free(&ast);
+    buf_free(&raw);
+    free(cont_out);
+    free(ser_out);
+    request_free(&r);
+}
+
 /* Inc 0b: the three-state decode-budget contract shared by every lane site
  * (serial decode loop, serial fit, footprint, static pack, cont admit).
  * Before the helper, the batched lanes replaced ANY <= 0 with the server
@@ -22818,6 +22967,7 @@ static void ds4_server_unit_tests_run(void) {
     test_wire_finish_stream_matches_direct_dispatch();
     test_cont_completion_stream_matches_serial_oracle();
     test_cont_admission_transport_and_heartbeat();
+    test_cont_anthropic_stream_matches_serial_oracle();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
     test_credit_union_merge_shapes();
