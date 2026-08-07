@@ -499,8 +499,10 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
 #define DS4_METRICS_ROUTE_REASONS 13
 /* Admission-bound sheds (v0.5.6 Inc 2e): one increment per request refused
  * (or slow-reader evicted) by an explicit server bound.  Bounded label set
- * owned by the server (shed_reason_names); storage only here. */
-#define DS4_METRICS_SHED_REASONS 5
+ * owned by the server (shed_reason_names); storage only here.
+ * Inc 5b adds continuation_hold: serial work refused because the session is
+ * reserved for a live tool continuation (grace window or queued hard pin). */
+#define DS4_METRICS_SHED_REASONS 6
 typedef struct {
     uint64_t stamp;               /* monotonic second this bucket belongs to */
     uint64_t dec_tok, dec_steps, pf_tok;

@@ -567,6 +567,9 @@ static bool tool_memory_has_id(server *s, const char *id);
 /* Inc 5a: id-mint uniqueness = tool memory OR any continuation-registry
  * record (a REPLAY_ONLY record's ids can outlive their memory entries). */
 static bool tool_id_in_use(server *s, const char *id);
+/* Inc 5b: queued T2 hard-pin release (request_free is the single release
+ * site -- it covers admission consumption, cancel, disconnect, and shed). */
+static void cont_registry_unpin(server *s, void *pin);
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
 
 typedef struct {
@@ -656,6 +659,12 @@ typedef struct {
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
+    /* Inc 5b: a live-continuation request holds a hard pin on its registry
+     * record from parse until request teardown (plan §4.6 bounded queued
+     * pins) so an unrelated serial request admitted while it waits in the
+     * FIFO cannot destroy the frontier it is about to consume. */
+    void *cont_pin;
+    server *cont_pin_srv;
     tool_replay_stats tool_replay;
     req_timings timings;
     /* v0.5.6 Inc 2a: immutable route requirements (ds4_req_need bits),
@@ -665,6 +674,9 @@ typedef struct {
      * dispatch sites cannot re-derive requirements differently. */
     uint32_t needs;
 } request;
+
+/* Inc 5b: parse-time hard-pin acquisition (defined with the registry). */
+static void request_acquire_cont_pin(server *s, request *r);
 
 static void tool_call_free(tool_call *tc) {
     free(tc->id);
@@ -800,6 +812,9 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
 }
 
 static void request_free(request *r) {
+    /* Inc 5b: single hard-pin release site (idempotent via the memset). */
+    if (r->cont_pin && r->cont_pin_srv)
+        cont_registry_unpin(r->cont_pin_srv, r->cont_pin);
     ds4_tokens_free(&r->prompt);
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
@@ -3111,6 +3126,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     anthropic_prepare_live_continuation(r, &msgs);
+    request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -4067,6 +4083,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
+    request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
@@ -8055,6 +8072,7 @@ typedef enum {
 } tool_memory_source;
 
 typedef struct tool_memory_entry tool_memory_entry;
+typedef struct cont_record cont_record;   /* Inc 5b: entry -> record backref */
 
 typedef struct {
     char *dsml;
@@ -8076,6 +8094,12 @@ struct tool_memory_entry {
      * entry -- the exact DSML for a live tool frontier must never be
      * independently evicted.  Records unpin on LIVE -> REPLAY_ONLY. */
     int pins;
+    /* Inc 5b (plan §4.6 ownership unification): the continuation record
+     * this entry's turn published, if any.  A REPLAY_ONLY record
+     * participates in this LRU as a UNIT: when the prune reaches one of
+     * its entries, the whole record is evicted -- all its call-id index
+     * rows and DSML references drop atomically. */
+    cont_record *rec;
     tool_memory_entry *prev;
     tool_memory_entry *next;
     tool_memory_entry *block_next;
@@ -8092,6 +8116,10 @@ typedef struct {
     size_t max_bytes;
     uint64_t clock;
     uint64_t scan_clock;
+    /* Inc 5b: owning server, set at the first registry publication (the
+     * only producer of entry->rec backrefs), so the prune can evict a
+     * REPLAY_ONLY record as a unit.  NULL until then = no backrefs exist. */
+    struct server *srv;
 } tool_memory;
 
 typedef struct {
@@ -8162,7 +8190,7 @@ typedef enum {
     CONT_OWNER_BATCH_BANK     = 1,   /* published by the cont path (Inc 5c) */
 } cont_record_owner;
 
-typedef struct cont_record {
+struct cont_record {   /* typedef'd cont_record above the tool_memory structs */
     uint8_t  state;       /* cont_record_state */
     uint8_t  owner;       /* cont_record_owner */
     uint8_t  protocol;    /* api_style: the call-id namespace */
@@ -8171,9 +8199,14 @@ typedef struct cont_record {
     int      frontier;    /* committed tokens at publication */
     stop_list call_ids;   /* ids minted by this turn */
     double   publish_time;
-    int      hard_refs;   /* Inc 5b: queued T2 pins (always 0 in 5a) */
+    /* Inc 5b: queued T2 hard pins (parse-time acquisition, released at job
+     * teardown).  pin_expiry bounds the pins' HOLD power in time (the plan's
+     * queue deadline): an expired pin no longer sheds new work, but still
+     * protects the record's memory until released. */
+    int      hard_refs;
+    double   pin_expiry;
     struct cont_record *prev, *next;   /* publication order, newest at head */
-} cont_record;
+};
 
 typedef struct {
     rax *by_call_id;            /* "<proto>\x1f<id>" -> cont_record* */
@@ -8182,6 +8215,15 @@ typedef struct {
     int n_live;
     int max_records;            /* DS4_CONT_REGISTRY_MAX, default 64 */
     cont_record *serial_live;   /* at most one LIVE serial record */
+    /* Inc 5b retention policy (plan §4.6, bounded resource-policy settings,
+     * env-tunable): grace = non-evictable window after publication where
+     * non-continuing serial work SHEDS instead of destroying the frontier;
+     * ttl = soft retention after which an unclaimed LIVE record lazily
+     * demotes to REPLAY_ONLY; pin_deadline = how long a queued T2's hard
+     * pin can hold off other serial work.  0 disables each. */
+    double grace_s;             /* DS4_CONT_GRACE_S, default 60 */
+    double ttl_s;               /* DS4_CONT_TTL_S, default 300 */
+    double pin_deadline_s;      /* DS4_CONT_PIN_DEADLINE_S, default 60 */
 } cont_registry;
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -8359,9 +8401,12 @@ struct job {
  * counts completed.
  * Inc 2e: SHED = an ADMISSION BOUND refused the request after it was
  * enqueued (today: queue age) -- the client got an honest 503+Retry-After,
- * so it is neither completed, failed, nor canceled. */
+ * so it is neither completed, failed, nor canceled.
+ * Inc 5b: SHED_CONT_HOLD = the serial session is reserved for a live tool
+ * continuation (grace window or queued hard pin, plan §4.6) -- same honest
+ * 503+Retry-After class, its own settle reason. */
 enum { JOB_OUT_COMPLETED = 0, JOB_OUT_FAILED, JOB_OUT_REFUSED_DEEP_SERIAL,
-       JOB_OUT_CANCELED, JOB_OUT_SHED };
+       JOB_OUT_CANCELED, JOB_OUT_SHED, JOB_OUT_SHED_CONT_HOLD };
 
 /* v0.5.6 Inc 0a: route observation -- record which serving lane took each
  * request, keyed by WIRE SURFACE (not API vendor: OpenAI Chat and legacy
@@ -8520,20 +8565,38 @@ static void tool_memory_remove_entry_locked(tool_memory *m, tool_memory_entry *e
     free(e);
 }
 
+static void cont_registry_remove_locked(struct server *s, cont_record *rec);
+
 static void tool_memory_prune_locked(tool_memory *m) {
     /* Inc 5a: pinned entries (strong refs from LIVE continuation records)
      * are skipped, not evicted -- the walk continues toward the head so the
      * budget still shrinks via older unpinned entries.  If every remaining
      * entry is pinned the prune stops over budget; pins are bounded by the
      * registry's LIVE record set (at most one serial record today), so this
-     * cannot grow unboundedly. */
+     * cannot grow unboundedly.
+     * Inc 5b: an entry owned by a REPLAY_ONLY record evicts the RECORD as a
+     * unit (all its entries + call-id index rows drop atomically, plan
+     * §4.6); the walk restarts from the tail because sibling entries may
+     * have been unlinked.  Each restart removed at least one entry, so the
+     * loop is bounded. */
     tool_memory_entry *e = m->tail;
     while ((m->entries > tool_memory_max_entries(m) ||
             m->bytes > tool_memory_max_bytes(m)) && e)
     {
         tool_memory_entry *prev = e->prev;
-        if (e->pins <= 0) tool_memory_remove_entry_locked(m, e);
-        e = prev;
+        if (e->pins > 0) {
+            e = prev;                      /* LIVE-pinned: never evicted */
+        } else if (e->rec && m->srv) {
+            if (e->rec->state == CONT_REC_REPLAY_ONLY && e->rec->hard_refs <= 0) {
+                cont_registry_remove_locked(m->srv, e->rec);
+                e = m->tail;               /* siblings unlinked: restart */
+            } else {
+                e = prev;                  /* record still protected */
+            }
+        } else {
+            tool_memory_remove_entry_locked(m, e);
+            e = prev;
+        }
     }
 }
 
@@ -8669,6 +8732,17 @@ static void cont_registry_remove_locked(server *s, cont_record *rec) {
     cont_registry *r = &s->creg;
     cont_registry_demote_locked(s, rec);   /* unpin if somehow still LIVE */
     cont_registry_drop_index_locked(r, rec);
+    /* Inc 5b (plan §4.6): eviction drops the record's call-id index rows AND
+     * its DSML references atomically -- member tool-memory entries go with
+     * the record (their blocks free once unreferenced). */
+    for (int i = 0; i < rec->call_ids.len; i++) {
+        tool_memory_entry *e =
+            tool_memory_find_entry_locked(&s->tool_mem, rec->call_ids.v[i]);
+        if (e && e->rec == rec) {
+            e->rec = NULL;
+            tool_memory_remove_entry_locked(&s->tool_mem, e);
+        }
+    }
     if (rec->prev) rec->prev->next = rec->next; else r->head = rec->next;
     if (rec->next) rec->next->prev = rec->prev; else r->tail = rec->prev;
     if (r->n_records > 0) r->n_records--;
@@ -8732,8 +8806,12 @@ static void cont_registry_publish_serial(server *s, api_style proto,
                         &displaced);
         tool_memory_entry *e =
             tool_memory_find_entry_locked(&s->tool_mem, rec->call_ids.v[i]);
-        if (e) e->pins++;   /* strong DSML reference while LIVE */
+        if (e) {
+            e->pins++;      /* strong DSML reference while LIVE */
+            e->rec = rec;   /* Inc 5b: the record owns this entry as a unit */
+        }
     }
+    s->tool_mem.srv = s;   /* Inc 5b: backrefs exist -> prune can reach us */
     rec->next = r->head;
     rec->prev = NULL;
     if (r->head) r->head->prev = rec; else r->tail = rec;
@@ -8760,6 +8838,126 @@ static void cont_registry_demote_serial(server *s) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+/* Inc 5b: lazy soft-TTL (plan §4.6 five-minute soft retention).  Called at
+ * every read/decision point; no timer thread.  An expired LIVE record
+ * demotes to REPLAY_ONLY -- the later output-only turn gets the honest
+ * refusal while a full replay can still use exact DSML. */
+static void cont_registry_expire_serial_locked(server *s, double now) {
+    cont_record *rec = s->creg.serial_live;
+    if (!rec || s->creg.ttl_s <= 0) return;
+    if (now - rec->publish_time <= s->creg.ttl_s) return;
+    server_log(DS4_LOG_WARNING,
+               "ds4-server: continuation record expired (ttl %.0fs, unclaimed %.0fs)",
+               s->creg.ttl_s, now - rec->publish_time);
+    cont_registry_demote_locked(s, rec);
+}
+
+/* Inc 5b: queued T2 hard pin (plan §4.6 bounded queued pins).  Acquired at
+ * parse time when a request's tool results resolve a LIVE record; released
+ * exactly once at request teardown (request_free -- covers admission
+ * consumption, cancellation, disconnect, and shed alike).  pin_expiry
+ * implements the queue deadline: past it the pin stops holding off other
+ * serial work, but the record's memory stays protected until release. */
+static void *cont_registry_pin_live(server *s, api_style proto,
+                                    const char *id) {
+    if (!s || !id || !id[0]) return NULL;
+    const double now = now_sec();
+    pthread_mutex_lock(&s->tool_mu);
+    cont_registry_expire_serial_locked(s, now);
+    cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto, id);
+    if (!rec || rec->state != CONT_REC_LIVE_FRONTIER) {
+        pthread_mutex_unlock(&s->tool_mu);
+        return NULL;
+    }
+    rec->hard_refs++;
+    if (s->creg.pin_deadline_s > 0) {
+        const double expiry = now + s->creg.pin_deadline_s;
+        if (expiry > rec->pin_expiry) rec->pin_expiry = expiry;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return rec;
+}
+
+static void cont_registry_unpin(server *s, void *pin) {
+    if (!s || !pin) return;
+    cont_record *rec = pin;
+    pthread_mutex_lock(&s->tool_mu);
+    if (rec->hard_refs > 0) rec->hard_refs--;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+/* Inc 5b: called by the Anthropic/Responses parsers right after
+ * *_prepare_live_continuation collected the request's live-continuation
+ * candidate ids.  If the first id resolves a LIVE record, the request pins
+ * it until teardown (plan §4.6: "when a bounded queued T2 request resolves
+ * a live call ID, it acquires a hard record reference"). */
+static void request_acquire_cont_pin(server *s, request *r) {
+    if (!s || !r || r->cont_pin) return;
+    const stop_list *ids =
+        r->api == API_RESPONSES ? &r->responses_live_call_ids :
+        r->api == API_ANTHROPIC ? &r->anthropic_live_call_ids : NULL;
+    if (!ids || ids->len == 0) return;
+    void *pin = cont_registry_pin_live(s, r->api, ids->v[0]);
+    if (pin) {
+        r->cont_pin = pin;
+        r->cont_pin_srv = s;
+    }
+}
+
+/* Inc 5b: the serial-admission hold decision (plan §4.6 "new work sheds
+ * rather than reusing an owner in the grace period" + "admission waits or
+ * sheds ... instead of violating a pin").  A serial request that does not
+ * continue the LIVE record sheds 503+Retry-After while the record is inside
+ * its grace window or validly hard-pinned by a queued T2.  Continuations
+ * pass (the full resolve still runs in generate_job); everything passes
+ * once neither protection is active (and then demotes the record exactly
+ * as before).  Continuous/static-lane work never reaches this: only the
+ * serial session is the owner being protected. */
+static bool cont_registry_serial_hold(server *s, const request *req,
+                                      double now, int *retry_after) {
+    if (retry_after) *retry_after = 1;
+    if (!s || !req) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    cont_registry_expire_serial_locked(s, now);
+    cont_record *rec = s->creg.serial_live;
+    if (!rec) {
+        pthread_mutex_unlock(&s->tool_mu);
+        return false;
+    }
+    /* Is this request the record's continuation?  Same protocol + the same
+     * id set the record published.  (The authoritative gen/frontier resolve
+     * runs at generate_job admission; a stale continuation that fails there
+     * gets the native 409, never a shed.) */
+    const stop_list *ids =
+        rec->protocol == API_RESPONSES ? &req->responses_live_call_ids :
+        rec->protocol == API_ANTHROPIC ? &req->anthropic_live_call_ids : NULL;
+    if (ids && ids->len == rec->call_ids.len && ids->len > 0) {
+        bool cont = true;
+        for (int i = 0; cont && i < ids->len; i++)
+            cont = id_list_contains(&rec->call_ids, ids->v[i]);
+        if (cont) {
+            pthread_mutex_unlock(&s->tool_mu);
+            return false;
+        }
+    }
+    const double grace_left = s->creg.grace_s > 0 ?
+        s->creg.grace_s - (now - rec->publish_time) : 0.0;
+    const bool pinned = rec->hard_refs > 0 &&
+        s->creg.pin_deadline_s > 0 && now < rec->pin_expiry;
+    if (grace_left <= 0 && !pinned) {
+        pthread_mutex_unlock(&s->tool_mu);
+        return false;
+    }
+    double left = grace_left;
+    if (pinned && rec->pin_expiry - now > left) left = rec->pin_expiry - now;
+    if (retry_after) {
+        *retry_after = (int)(left + 0.999);
+        if (*retry_after < 1) *retry_after = 1;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return true;
+}
+
 /* Parser-side validation: is this id bound to a LIVE frontier right now?
  * Advisory (the worker revalidates at admission); protocol-scoped so an id
  * leaked across surfaces never validates (plan §4.6 collision/bleed). */
@@ -8767,6 +8965,7 @@ static bool cont_registry_live_has_id(server *s, api_style proto,
                                       const char *id) {
     if (!s || !id || !id[0]) return false;
     pthread_mutex_lock(&s->tool_mu);
+    cont_registry_expire_serial_locked(s, now_sec());   /* Inc 5b lazy TTL */
     cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto, id);
     const bool ok = rec && rec->state == CONT_REC_LIVE_FRONTIER;
     pthread_mutex_unlock(&s->tool_mu);
@@ -8782,6 +8981,7 @@ static bool cont_registry_resolve_serial(server *s, api_style proto,
                                          uint64_t session_gen, int live_pos) {
     if (!s || !ids || ids->len == 0 || session_gen == 0) return false;
     pthread_mutex_lock(&s->tool_mu);
+    cont_registry_expire_serial_locked(s, now_sec());   /* Inc 5b lazy TTL */
     cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto,
                                                  ids->v[0]);
     bool ok = rec &&
@@ -12548,9 +12748,10 @@ static void route_decision_record(ds4_route_decision d) {
  * eviction (per-job cap or the aggregate backlog cap) marks client_gone,
  * which settles CANCELED per Inc 2c; the reason counter is its observer. */
 enum { DS4_SHED_CLIENTS = 0, DS4_SHED_QUEUE_DEPTH, DS4_SHED_QUEUE_BYTES,
-       DS4_SHED_QUEUE_AGE, DS4_SHED_SLOW_READER };
+       DS4_SHED_QUEUE_AGE, DS4_SHED_SLOW_READER, DS4_SHED_CONT_HOLD };
 static const char *shed_reason_names[DS4_METRICS_SHED_REASONS] = {
     "clients", "queue_depth", "queue_bytes", "queue_age", "slow_reader",
+    "continuation_hold",   /* Inc 5b: serial session reserved (grace/pin) */
 };
 
 static void shed_record(int reason) {
@@ -12979,7 +13180,22 @@ static bool serial_session_ensure_fit(server *s, job *j) {
 /* The original single-request path: serialize the GPU, run, signal done. */
 static void run_job_single(server *s, job *j) {
     pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
-    if (serial_session_ensure_fit(s, j))
+    int hold_retry = 0;
+    if (cont_registry_serial_hold(s, &j->req, now_sec(), &hold_retry)) {
+        /* Inc 5b (plan §4.6): the serial session is reserved for a live tool
+         * continuation (grace window or a queued T2's hard pin).  Shed with
+         * the endpoint-native 503+Retry-After instead of destroying the
+         * frontier; the guard runs BEFORE ensure_fit so right-sizing cannot
+         * free the reserved session either. */
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: continuation hold shed: serial session reserved "
+                   "for a live tool continuation (retry in %ds, prompt=%d tokens)",
+                   hold_retry, j->req.prompt.len);
+        wire_http_error_retry(j->fd, s->enable_cors, wire_surface_for(&j->req),
+                              503, hold_retry,
+                              "serial capacity is reserved for a live tool continuation; retry shortly");
+        j->outcome = JOB_OUT_SHED_CONT_HOLD;
+    } else if (serial_session_ensure_fit(s, j))
         generate_job(s, j);
     pthread_mutex_unlock(&s->gen_mu);
     job_finish(j);
@@ -15762,6 +15978,10 @@ static void *client_main(void *arg) {
              * the intake bounds shed BEFORE enqueue and count only in
              * requests_shed[] at their refusal sites. */
             ds4_metric_add(&mreg->requests_shed[DS4_SHED_QUEUE_AGE], 1);
+        else if (j.outcome == JOB_OUT_SHED_CONT_HOLD)
+            /* Inc 5b: refused at serial admission because the session is
+             * reserved for a live continuation (grace/pin). */
+            ds4_metric_add(&mreg->requests_shed[DS4_SHED_CONT_HOLD], 1);
         else if (j.outcome == JOB_OUT_CANCELED || j.client_gone)
             /* Inc 2c: the client left (queued reap, mid-generation vanish,
              * output-cap eviction, or a failed final drain).  Whatever the
@@ -16715,10 +16935,26 @@ int main(int argc, char **argv) {
     }
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
-    /* Inc 5a: continuation-record cap (bounded resource policy, plan §4.6). */
+    /* Inc 5a/5b: continuation-registry resource policy (plan §4.6: bounded
+     * policy settings, not protocol state).  grace = non-evictable window
+     * after a tool-turn publication (non-continuing serial work sheds 503);
+     * ttl = soft retention before an unclaimed LIVE record demotes;
+     * pin_deadline = how long a queued T2's hard pin holds off other serial
+     * work.  0 disables each. */
     {
         const char *cr = getenv("DS4_CONT_REGISTRY_MAX");
         s.creg.max_records = cr ? atoi(cr) : 0;   /* <=0 -> default at init */
+        const char *gg = getenv("DS4_CONT_GRACE_S");
+        s.creg.grace_s = gg ? atof(gg) : 60.0;
+        const char *tt = getenv("DS4_CONT_TTL_S");
+        s.creg.ttl_s = tt ? atof(tt) : 300.0;
+        const char *pd = getenv("DS4_CONT_PIN_DEADLINE_S");
+        s.creg.pin_deadline_s = pd ? atof(pd) : 60.0;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: continuation retention: grace=%.0fs ttl=%.0fs "
+                   "pin_deadline=%.0fs records<=%d (0 = off/default)",
+                   s.creg.grace_s, s.creg.ttl_s, s.creg.pin_deadline_s,
+                   s.creg.max_records);
     }
     s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir) {
@@ -19535,6 +19771,139 @@ static void test_cont_registry_pins_exact_dsml(void) {
     TEST_ASSERT(!tool_memory_has_id(&s, "toolu_pinned"));
     TEST_ASSERT(tool_memory_has_id(&s, "toolu_fill3"));
     TEST_ASSERT(tool_memory_has_id(&s, "toolu_fill4"));
+
+    cont_registry_free(&s);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* Inc 5b: the serial-admission hold matrix -- grace sheds non-continuing
+ * work, continuations pass, expiry ends the grace, a queued T2's hard pin
+ * holds beyond grace, the pin deadline bounds it, and teardown releases. */
+static void test_cont_registry_grace_and_pin_hold(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.creg.grace_s = 60.0;
+    s.creg.ttl_s = 300.0;
+    s.creg.pin_deadline_s = 60.0;
+
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_hold");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 4, 70);
+        tool_calls_free(&calls);
+    }
+
+    request unrelated;
+    request_init(&unrelated, REQ_CHAT, 64);
+    int retry = 0;
+    /* Inside grace: non-continuing serial work sheds, honest Retry-After. */
+    TEST_ASSERT(cont_registry_serial_hold(&s, &unrelated, now_sec(), &retry));
+    TEST_ASSERT(retry >= 1 && retry <= 60);
+
+    /* The continuation itself passes the hold. */
+    request t2;
+    request_init(&t2, REQ_CHAT, 64);
+    t2.api = API_ANTHROPIC;
+    id_list_push_unique(&t2.anthropic_live_call_ids, "toolu_hold");
+    TEST_ASSERT(!cont_registry_serial_hold(&s, &t2, now_sec(), &retry));
+
+    /* Grace over, no pin: unrelated work passes (and would demote). */
+    pthread_mutex_lock(&s.tool_mu);
+    s.creg.serial_live->publish_time -= 120.0;
+    pthread_mutex_unlock(&s.tool_mu);
+    TEST_ASSERT(!cont_registry_serial_hold(&s, &unrelated, now_sec(), &retry));
+
+    /* A queued T2's hard pin holds past grace. */
+    request_acquire_cont_pin(&s, &t2);
+    TEST_ASSERT(t2.cont_pin != NULL && t2.cont_pin_srv == &s);
+    TEST_ASSERT(cont_registry_serial_hold(&s, &unrelated, now_sec(), &retry));
+    TEST_ASSERT(retry >= 1);
+
+    /* The queue deadline bounds the pin's hold power. */
+    pthread_mutex_lock(&s.tool_mu);
+    s.creg.serial_live->pin_expiry = now_sec() - 1.0;
+    pthread_mutex_unlock(&s.tool_mu);
+    TEST_ASSERT(!cont_registry_serial_hold(&s, &unrelated, now_sec(), &retry));
+
+    /* Teardown releases exactly once. */
+    request_free(&t2);
+    pthread_mutex_lock(&s.tool_mu);
+    TEST_ASSERT(s.creg.serial_live->hard_refs == 0);
+    pthread_mutex_unlock(&s.tool_mu);
+
+    request_free(&unrelated);
+    cont_registry_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* Inc 5b: lazy soft-TTL -- an unclaimed LIVE record demotes at the next
+ * read; the ids stay reserved for mint uniqueness. */
+static void test_cont_registry_ttl_expire(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.creg.ttl_s = 300.0;
+
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_ttl");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 4, 70);
+        tool_calls_free(&calls);
+    }
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_ttl"));
+
+    pthread_mutex_lock(&s.tool_mu);
+    s.creg.serial_live->publish_time -= 301.0;
+    pthread_mutex_unlock(&s.tool_mu);
+
+    TEST_ASSERT(!anthropic_live_has_call_id(&s, "toolu_ttl"));
+    TEST_ASSERT(s.creg.n_live == 0);
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "toolu_ttl");
+    TEST_ASSERT(!cont_registry_resolve_serial(&s, API_ANTHROPIC, &ids, 4, 70));
+    TEST_ASSERT(cont_registry_id_known(&s, "toolu_ttl"));
+
+    id_list_free(&ids);
+    cont_registry_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* Inc 5b: a REPLAY_ONLY record participates in the tool-memory LRU as a
+ * UNIT -- when the prune reaches one member entry, the whole record (all
+ * entries + all call-id index rows) drops atomically. */
+static void test_cont_registry_record_unit_eviction(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.tool_mem.max_entries = 2;
+
+    tool_memory_put(&s, "toolu_u1", "<dsml unit turn>");
+    tool_memory_put(&s, "toolu_u2", "<dsml unit turn>");
+    {
+        tool_calls calls = {0};
+        tool_call a = {0};
+        a.id = xstrdup("toolu_u1");
+        tool_calls_push(&calls, a);
+        tool_call b = {0};
+        b.id = xstrdup("toolu_u2");
+        tool_calls_push(&calls, b);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 6, 90);
+        tool_calls_free(&calls);
+    }
+    cont_registry_demote_serial(&s);   /* REPLAY_ONLY, unpinned */
+
+    /* One over budget: the tail entry belongs to the record, so the WHOLE
+     * record evicts -- both entries and both index rows, atomically. */
+    tool_memory_put(&s, "toolu_u3", "<dsml 3>");
+    TEST_ASSERT(!tool_memory_has_id(&s, "toolu_u1"));
+    TEST_ASSERT(!tool_memory_has_id(&s, "toolu_u2"));
+    TEST_ASSERT(tool_memory_has_id(&s, "toolu_u3"));
+    TEST_ASSERT(!cont_registry_id_known(&s, "toolu_u1"));
+    TEST_ASSERT(!cont_registry_id_known(&s, "toolu_u2"));
+    TEST_ASSERT(s.creg.n_records == 0);
 
     cont_registry_free(&s);
     tool_memory_free(&s.tool_mem);
@@ -23503,6 +23872,9 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_registry_publish_resolve_demote();
     test_cont_registry_supersede_and_cap();
     test_cont_registry_pins_exact_dsml();
+    test_cont_registry_grace_and_pin_hold();
+    test_cont_registry_ttl_expire();
+    test_cont_registry_record_unit_eviction();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();

@@ -1,7 +1,7 @@
 #!/bin/bash
-# cont_registry_gate.sh — v0.5.6 API Inc 5a live gate: generation-checked
-# continuation registry (plan §4.6 record shape + §5 Inc 5 gate line, the
-# serial-owner slice; bank owners and retention policy land in 5b/5c).
+# cont_registry_gate.sh — v0.5.6 API Inc 5a+5b live gate: generation-checked
+# continuation registry (plan §4.6 record shape + retention policy + §5
+# Inc 5 gate line, the serial-owner slice; bank owners land in 5c).
 #
 # What 5a changed: serial tool turns publish ONE continuation record binding
 # the turn's call ids to the engine execution reference (session generation +
@@ -38,6 +38,28 @@
 #   metrics_final     all five ds4_continuation_* series present and the
 #                     ledger adds up (published >= 3, resolved == 2,
 #                     missed == 1)
+#
+# Boot A runs with the retention policy ZEROED (DS4_CONT_GRACE_S=0,
+# DS4_CONT_PIN_DEADLINE_S=0): the 5a legs prove the registry's resolution
+# semantics, and the race409 leg NEEDS the unrelated blocker to win the
+# session -- under default grace it would shed instead (which is boot B's
+# grace_shed leg proving exactly that).
+#
+# Boot B legs (Inc 5b, DS4_CONT_GRACE_S=6 DS4_CONT_TTL_S=45, default pin):
+#   grace_shed        an unrelated SERIAL request inside the grace window
+#                     sheds 503+Retry-After with shed{continuation_hold} +1
+#                     and the record STAYS LIVE; the T2 then resolves 200
+#                     (grace protected the frontier for its owner)
+#   postgrace_demote  after the grace window the same unrelated request
+#                     proceeds (200) and demotes; the T2 refuses natively
+#   ttl_expire        an unclaimed record lazily demotes after the soft TTL (45s)
+#                     (records_live 1 -> 0, output-only T2 refused)
+#   pin_wins          a cont request occupies the worker; an unrelated
+#                     serial blocker queues; the T2 parses AFTER it (FIFO
+#                     behind it) and pins the record -- at admission the
+#                     blocker sheds on the PIN (grace long over) and the T2
+#                     resolves 200: the plan's "admission ... sheds instead
+#                     of violating a pin", live
 #
 # Runs FROM the Mac over SSH like the other gates.  Boots kill any running
 # ds4-server on $R.  End state: ds4-server killed, box left free.
@@ -114,9 +136,9 @@ srv_count(){ ssh "$R" "grep -cF \"$1\" $RWORK/srv.log" 2>/dev/null; }
 TOOLS_ANTH='[{"name":"list_files","description":"List the files in a directory","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]'
 TOOLS_RESP='[{"type":"function","name":"list_files","description":"List the files in a directory","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]'
 
-BOOT_ENV="DS4_MEM_FLOOR_GB=2" boot
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0" boot
 
-# ==================== anthropic block =======================================
+# ==================== boot A: anthropic block (5a semantics) ================
 pub0=$(m ds4_continuation_records_published_total)
 res0=$(m ds4_continuation_resolved_total)
 c=$(post anth_t1 /v1/messages '{"model":"m","max_tokens":1200,"temperature":0,"messages":[{"role":"user","content":"Use the list_files tool to list the files in /tmp. Call the tool."}],"tools":'"$TOOLS_ANTH"'}')
@@ -250,7 +272,7 @@ code_is resp_t2_replay "$c" 200
 has resp_t2_replay '"status":"completed"'
 log "resp_t2_replay PASS (full-history replay serves after demotion)"
 
-# ==================== ledger ================================================
+# ==================== boot A ledger =========================================
 pubF=$(m ds4_continuation_records_published_total)
 resF=$(m ds4_continuation_resolved_total)
 misF=$(m ds4_continuation_missed_total)
@@ -266,6 +288,117 @@ livF=$(m ds4_continuation_records_live)
 [ "$livF" -eq $((pubF - demF)) ] || \
   fail "metrics_final: ledger identity broken: live $livF != published $pubF - demoted $demF"
 log "metrics_final PASS (published=$pubF resolved=$resF missed=$misF demoted=$demF live=$livF)"
+
+# ==================== boot B: Inc 5b retention policy =======================
+# grace 6s (short enough to wait out in a leg), soft TTL 45s (LONGER than
+# the pin leg's grace-wait + occupier window ~27s -- a 20s TTL demoted the
+# pinned record mid-leg on the first run, found live 17:30), pin deadline
+# default 60s.  All traffic below is serial by needs except the cont
+# occupier in pin_wins.
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=6 DS4_CONT_TTL_S=45" boot
+
+t1(){ # $1=name $2=user text -> publishes a tool turn; sets T1_ID.
+      # Precondition: no leftover LIVE record (a prior T2 may have chained).
+  drain_frontier
+  local c
+  c=$(post "$1" /v1/messages '{"model":"m","max_tokens":1200,"temperature":0,"messages":[{"role":"user","content":"'"$2"'"}],"tools":'"$TOOLS_ANTH"'}')
+  code_is "$1" "$c" 200
+  has "$1" '"type":"tool_use"'
+  T1_ID=$(python3 -c 'import json,sys; t=json.load(open(sys.argv[1])); print(next(b["id"] for b in t["content"] if b.get("type")=="tool_use"))' "$OUT/$1.json") || fail "$1: no tool_use id"
+}
+t2_body(){ # $1=id  (a MEANINGFUL result: "ok" invites the model to retry
+           # the tool, chaining a new call -> a fresh record -> a fresh
+           # grace window that sheds the NEXT leg's T1; found live 17:24)
+  echo '{"model":"m","max_tokens":1200,"temperature":0,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"'"$1"'","content":"file1.txt\nfile2.txt"}]}],"tools":'"$TOOLS_ANTH"'}'
+}
+BLOCKER_BODY=$(python3 -c 'import json; print(json.dumps({"model":"m","max_tokens":16,"temperature":0,"return_token_ids":True,"messages":[{"role":"user","content":"Say hello."}]}))')
+
+# A T2 answer may still legally end in ANOTHER tool call (the model's
+# choice), leaving a fresh LIVE record + grace window behind a leg.  Drain
+# deterministically: outwait the grace and let an unrelated serial win
+# demote, bounded at 3 rounds.
+drain_frontier(){
+  local n=0
+  while [ "$(m ds4_continuation_records_live)" -gt 0 ]; do
+    n=$((n+1))
+    [ $n -gt 3 ] && fail "drain_frontier: records_live stuck > 0 after 3 rounds"
+    sleep 7
+    curl -s -m 240 -o "$OUT/drain_$n.json" "$BASE/v1/chat/completions" \
+         -H 'Content-Type: application/json' -d "$BLOCKER_BODY" >/dev/null
+  done
+}
+
+# grace_shed: unrelated serial work inside the grace window sheds and the
+# frontier survives for its continuation.
+t1 grace_t1 "Use the list_files tool to list the files in /var. Call the tool."
+shed0=$(m 'ds4_requests_shed_total{reason="continuation_hold"}')
+c=$(post grace_blocked /v1/chat/completions "$BLOCKER_BODY")
+code_is grace_blocked "$c" 503
+grep -qi "reserved for a live tool continuation" "$OUT/grace_blocked.json" || \
+  fail "grace_blocked: shed message missing ($(head -c 200 "$OUT/grace_blocked.json"))"
+shed1=$(m 'ds4_requests_shed_total{reason="continuation_hold"}')
+[ "${shed1:-0}" -gt "${shed0:-0}" ] || fail "grace_shed: continuation_hold counter never moved (${shed0:-?} -> ${shed1:-?})"
+[ "$(m ds4_continuation_records_live)" -eq 1 ] || fail "grace_shed: record did not stay LIVE"
+resg0=$(m ds4_continuation_resolved_total)
+c=$(post grace_t2 /v1/messages "$(t2_body "$T1_ID")")
+code_is grace_t2 "$c" 200
+resg1=$(m ds4_continuation_resolved_total)
+[ "${resg1:-0}" -gt "${resg0:-0}" ] || fail "grace_shed: T2 did not resolve after the shed (${resg0:-?} -> ${resg1:-?})"
+log "grace_shed PASS (unrelated serial shed 503 inside grace; T2 then resolved; shed ${shed0:-0} -> $shed1)"
+drain_frontier
+
+# postgrace_demote: after the window the same unrelated work proceeds and
+# demotes; the output-only T2 refuses natively.
+t1 pg_t1 "Use the list_files tool to list the files in /etc. Call the tool."
+sleep 7
+c=$(post pg_blocker /v1/chat/completions "$BLOCKER_BODY")
+code_is pg_blocker "$c" 200
+[ "$(m ds4_continuation_records_live)" -eq 0 ] || fail "postgrace_demote: record still LIVE after an unrelated serial win"
+c=$(post pg_t2 /v1/messages "$(t2_body "$T1_ID")")
+[ "$c" = 400 ] || [ "$c" = 409 ] || fail "postgrace_demote: T2 got HTTP $c, want 400/409"
+has pg_t2 'continuation state is not available'
+log "postgrace_demote PASS (post-grace serial win demoted; T2 refused $c)"
+
+# ttl_expire: unclaimed LIVE record lazily demotes after the soft TTL.
+t1 ttl_t1 "Use the list_files tool to list the files in /opt. Call the tool."
+[ "$(m ds4_continuation_records_live)" -eq 1 ] || fail "ttl_expire: no LIVE record after t1"
+demt0=$(m ds4_continuation_demoted_total)
+sleep 46
+c=$(post ttl_t2 /v1/messages "$(t2_body "$T1_ID")")
+[ "$c" = 400 ] || [ "$c" = 409 ] || fail "ttl_expire: T2 got HTTP $c, want 400/409 after ttl"
+has ttl_t2 'continuation state is not available'
+demt1=$(m ds4_continuation_demoted_total)
+[ "${demt1:-0}" -gt "${demt0:-0}" ] || fail "ttl_expire: demoted counter never moved (${demt0:-?} -> ${demt1:-?})"
+[ "$(m ds4_continuation_records_live)" -eq 0 ] || fail "ttl_expire: record still LIVE past ttl"
+log "ttl_expire PASS (soft TTL lazily demoted the unclaimed record; T2 refused $c)"
+
+# pin_wins: FIFO order blocker-before-T2, but the T2 parses while queued and
+# pins the record -- the blocker's admission sheds on the pin (grace long
+# over), the T2 resolves.  A cont request occupies the worker to create the
+# queue window; grace is waited out first so ONLY the pin can explain the
+# shed.
+t1 pin_t1 "Use the list_files tool to list the files in /usr. Call the tool."
+sleep 7   # grace (6s) fully elapsed; record still LIVE
+[ "$(m ds4_continuation_records_live)" -eq 1 ] || fail "pin_wins: record not LIVE after grace wait"
+curl -s -m 240 -o "$OUT/pin_occupier.json" "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"m","max_tokens":900,"temperature":0,"messages":[{"role":"user","content":"Count from 1 to 200, one number per line."}]}' &
+OCC_PID=$!
+sleep 1
+shedp0=$(m 'ds4_requests_shed_total{reason="continuation_hold"}')
+curl -s -m 240 -o "$OUT/pin_blocker.json" -w '%{http_code}' "$BASE/v1/chat/completions" \
+     -H 'Content-Type: application/json' -d "$BLOCKER_BODY" > "$OUT/pin_blocker.code" &
+BLK_PID=$!
+sleep 0.5
+c=$(post pin_t2 /v1/messages "$(t2_body "$T1_ID")")
+wait "$BLK_PID" 2>/dev/null
+wait "$OCC_PID" 2>/dev/null
+code_is pin_t2 "$c" 200
+bcode=$(cat "$OUT/pin_blocker.code")
+[ "$bcode" = 503 ] || fail "pin_wins: blocker got HTTP $bcode, want 503 (pin should shed it)"
+shedp1=$(m 'ds4_requests_shed_total{reason="continuation_hold"}')
+[ "${shedp1:-0}" -gt "${shedp0:-0}" ] || fail "pin_wins: continuation_hold counter never moved (${shedp0:-?} -> ${shedp1:-?})"
+log "pin_wins PASS (queued T2's pin shed the FIFO-earlier blocker; T2 resolved 200)"
 
 ssh "$R" "pkill -x ds4-server; exit 0"
 log "ALL LEGS PASS — artifacts in $OUT"

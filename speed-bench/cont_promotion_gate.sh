@@ -137,7 +137,11 @@ decision(){ curl -s -m 10 "$BASE/metrics" | grep -F "ds4_route_decisions_total{r
 # (mem_floor_gate.sh).  The reject-delta guards below keep the distinction
 # loud if the floor still engages, and each surface block runs on its own
 # fresh boot (see boot A2) so no decisive leg lands on an exhausted boot.
-BOOT_ENV="DS4_MEM_FLOOR_GB=2" boot
+# Inc 5b LAW: this gate proves ROUTING; the continuation-retention policy
+# (grace/pin sheds after a tool-turn publication, plan 4.6) has its own gate
+# (cont_registry_gate.sh boot B).  Zero it here so the tools-serial legs'
+# published records cannot shed the later serial legs.
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0" boot
 rejects(){ curl -s -m 10 "$BASE/metrics" | grep -F "ds4_cont_admit_rejects_total" | grep -oE '[0-9]+$'; }
 serials(){ curl -s -m 10 "$BASE/metrics" | grep -F "ds4_requests_serial_total" | grep -oE '[0-9]+$'; }
 # LANE-ENTRY TRAP (found 2026-08-07): route_requests counts lane ENTRIES --
@@ -247,7 +251,7 @@ log "oa_cont_sanity PASS"
 # 121 GB the moment the server exits -- this is per-boot decline, not box
 # state).  Each surface block gets a fresh funded window so its decisive
 # warm leg is never adjudicated on an exhausted boot.
-BOOT_ENV="DS4_MEM_FLOOR_GB=2" boot
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0" boot
 
 # resp_cont: promotion + the reasoning_tokens gap fix (cont now does the
 # same finalize retokenize serial does; 0 would be the old gap WHEN the
@@ -332,7 +336,7 @@ log "resp_tools_serial PASS (tool gen stays serial with the continuation-publish
 # the LANE-ENTRY-TRAP guards: a serial fallback would ALSO answer 0/"" (the
 # serial loop never samples at zero), so only the lane + serial counters
 # prove the CONT lane produced the honored shape.
-BOOT_ENV="DS4_MEM_FLOOR_GB=2" boot
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0" boot
 
 oc0=$(lane openai_chat continuous); sl0=$(serials)
 c=$(post oa_zero_cont /v1/chat/completions '{"max_tokens":0,"temperature":0,"messages":[{"role":"user","content":"hi"}]}')
@@ -380,7 +384,7 @@ log "oa_stream_zero PASS (no delta leak; length + [DONE]; SERVED on cont)"
 # generate_batch_jobs records a static lane entry PER JOB -- the exact +1 on
 # the anth/resp static cells is the engagement proof (a single-member
 # collapse records serial instead, and would fail those asserts).
-BOOT_ENV="DS4_SERVER_CONTINUOUS=0" boot
+BOOT_ENV="DS4_SERVER_CONTINUOUS=0 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0" boot
 
 as0=$(lane anthropic_messages static)
 rs0=$(lane openai_responses static)
@@ -418,7 +422,7 @@ log "resp_static PASS (native response written by the STATIC batch; lane ${rs0:-
 log "oa_static PASS (mixed three-surface static batch; static_no_cont ${dsc0:-0} -> $dsc1)"
 
 # ===================== boot B: the §7 kill switches ========================
-BOOT_ENV="DS4_SERVER_CONT_ANTHROPIC=0 DS4_SERVER_CONT_RESPONSES=0 DS4_MEM_FLOOR_GB=2" boot
+BOOT_ENV="DS4_SERVER_CONT_ANTHROPIC=0 DS4_SERVER_CONT_RESPONSES=0 DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0" boot
 ks0=$(decision surface)
 kc0=$(lane anthropic_messages continuous)
 c=$(post anth_kill /v1/messages '{"model":"m","max_tokens":400,"temperature":0,"messages":[{"role":"user","content":"Name one ocean."}]}')
