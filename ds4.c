@@ -37053,6 +37053,16 @@ struct ds4_vocab {
     int dsml_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
+
+    /* USER_DEFINED tokens, matched as literal text before the regex split.
+     * K-EXAONE's vocabulary carries runs of 2..31 spaces, 2..9 tabs and 2..9
+     * newlines as tokens of this kind, alongside the ordinary byte-encoded
+     * forms ('Ġ' for one space). Byte-level BPE alone can never reach them,
+     * so without this scan an indented line tokenizes differently here than
+     * in the reference implementation. */
+    str_i32_table user_defined;
+    uint32_t user_defined_max_len;
+    bool user_defined_first[256];
 };
 
 /* Engine-side tensor-parallel state.  The transport context is owned by the
@@ -37799,6 +37809,191 @@ static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, tok
     }
 }
 
+/* K-EXAONE pre-tokenization.  The GGUF declares tokenizer.ggml.pre =
+ * "exaone-moe", whose regex is (from llama.cpp's LLAMA_VOCAB_PRE_TYPE_EXAONE_MOE,
+ * which in turn carries it over from tokenizer.json):
+ *
+ *   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+ *   |[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+
+ *   |\p{N}
+ *   | ?[^\s\p{L}\p{N}]+[\r\n/]?
+ *   |\s*[\r\n]
+ *   |\s+(?!\S)
+ *   |\s+
+ *
+ * Two branches behave unlike the GPT-2-shaped splits the other families use,
+ * and both change the token stream rather than merely the piece boundaries:
+ *
+ *   - The letter branch admits a single space *inside* a run, so "hello world"
+ *     is one pre-token, not two. Korean prose therefore arrives as whole
+ *     phrases rather than space-prefixed words.
+ *   - Numbers are \p{N}, one digit at a time -- not the {1,3} grouping used
+ *     elsewhere.
+ *
+ * Alternation is ordered: at each position the first branch that matches wins,
+ * and each branch is greedy. The code below is that order, one branch per
+ * block, so it can be read against the regex line by line.
+ */
+static bool exaone_contraction_len(const char *s, uint64_t len, uint64_t pos,
+                                   uint64_t *out_len) {
+    if (pos >= len || s[pos] != '\'') return false;
+    const uint64_t rem = len - pos - 1u;
+    const char *p = s + pos + 1;
+    static const char *two[] = { "re", "ve", "ll" };
+    for (size_t i = 0; i < sizeof(two) / sizeof(two[0]); i++) {
+        if (rem >= 2 &&
+            ascii_tolower_cp((uint8_t)p[0]) == (uint32_t)two[i][0] &&
+            ascii_tolower_cp((uint8_t)p[1]) == (uint32_t)two[i][1]) {
+            *out_len = 3;
+            return true;
+        }
+    }
+    if (rem >= 1) {
+        const uint32_t c = ascii_tolower_cp((uint8_t)p[0]);
+        if (c == 's' || c == 't' || c == 'm' || c == 'd') {
+            *out_len = 2;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* End of the maximal whitespace run starting at pos. */
+static uint64_t exaone_ws_run_end(const char *s, uint64_t len, uint64_t pos) {
+    uint64_t p = pos;
+    for (;;) {
+        glm4_char_info c = glm4_char_at(s, len, p);
+        if (!c.valid || !c.is_whitespace) break;
+        p = c.next;
+    }
+    return p;
+}
+
+static void bpe_tokenize_text_exaone(const ds4_vocab *vocab, const char *text,
+                                     token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+
+    while (pos < len) {
+        const uint64_t start = pos;
+        glm4_char_info cur = glm4_char_at(text, len, pos);
+        if (!cur.valid) { pos = next_utf8_char(text, len, pos); continue; }
+
+        /* 0. USER_DEFINED tokens, longest match first, ahead of the regex.
+         * This is what turns four spaces into the single '    ' token instead
+         * of a byte-encoded run -- the reference implementation partitions
+         * these out before pre-tokenizing, and the vocabulary holds both
+         * forms, so skipping the scan silently changes the id stream on every
+         * indented line. The first-byte table keeps the cost off ordinary
+         * text. */
+        if (vocab->user_defined_max_len &&
+            vocab->user_defined_first[(uint8_t)text[pos]]) {
+            uint64_t want = len - pos;
+            if (want > vocab->user_defined_max_len) want = vocab->user_defined_max_len;
+            int id = -1;
+            uint64_t hit = 0;
+            for (uint64_t l = want; l >= 1; l--) {
+                if (table_get(&vocab->user_defined, text + pos, l, &id)) { hit = l; break; }
+            }
+            if (hit) {
+                token_vec_push(out, id);
+                pos += hit;
+                continue;
+            }
+        }
+
+        /* 1. contractions */
+        uint64_t clen = 0;
+        if (exaone_contraction_len(text, len, pos, &clen)) {
+            pos += clen;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        /* 2. [^\r\n\p{L}\p{N}]? (\p{L}\p{M}* ( \p{L}\p{M}*)*)+
+         *    The optional leading character is what attaches a leading space
+         *    or an opening bracket to the word that follows. */
+        {
+            uint64_t p = pos;
+            const bool lead_ok = !(cur.cp == '\r' || cur.cp == '\n' ||
+                                   cur.is_letter || cur.is_number);
+            if (lead_ok) p = cur.next;
+            glm4_char_info first = glm4_char_at(text, len, p);
+            if (first.valid && first.is_letter) {
+                for (;;) {
+                    glm4_char_info c = glm4_char_at(text, len, p);
+                    if (c.valid && c.is_letter) { p = c.next; continue; }
+                    /* a single space continues the run only when a letter
+                     * follows it */
+                    if (c.valid && c.cp == ' ') {
+                        glm4_char_info n = glm4_char_at(text, len, c.next);
+                        if (n.valid && n.is_letter) { p = c.next; continue; }
+                    }
+                    break;
+                }
+                pos = p;
+                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                continue;
+            }
+        }
+
+        /* 3. \p{N} -- one digit */
+        if (cur.is_number) {
+            pos = cur.next;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        /* 4.  ? [^\s\p{L}\p{N}]+ [\r\n/]? */
+        {
+            uint64_t p = pos;
+            if (cur.cp == ' ') p = cur.next;
+            uint64_t run = p;
+            for (;;) {
+                glm4_char_info c = glm4_char_at(text, len, run);
+                if (!c.valid || c.is_whitespace || c.is_letter || c.is_number) break;
+                run = c.next;
+            }
+            if (run > p) {
+                glm4_char_info c = glm4_char_at(text, len, run);
+                if (c.valid && (c.cp == '\r' || c.cp == '\n' || c.cp == '/')) {
+                    run = c.next;
+                }
+                pos = run;
+                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                continue;
+            }
+        }
+
+        if (cur.is_whitespace) {
+            const uint64_t ws_end = exaone_ws_run_end(text, len, pos);
+            /* 5. \s*[\r\n] -- greedy \s* backtracks to the LAST newline in
+             *    the run, so the piece ends there and any trailing spaces
+             *    start the next one. */
+            uint64_t last_nl_end = 0;
+            for (uint64_t p = pos; p < ws_end; ) {
+                glm4_char_info c = glm4_char_at(text, len, p);
+                if (!c.valid) break;
+                if (c.cp == '\r' || c.cp == '\n') last_nl_end = c.next;
+                p = c.next;
+            }
+            if (last_nl_end) {
+                pos = last_nl_end;
+            } else {
+                /* 6. \s+(?!\S) and 7. \s+ agree whenever there is no newline:
+                 *    a greedy \s+ already ends where the run does. */
+                pos = ws_end;
+            }
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        /* No branch matched (only reachable for a malformed byte). */
+        pos = next_utf8_char(text, len, pos);
+        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+    }
+}
+
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -37820,6 +38015,10 @@ static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, tok
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         bpe_tokenize_text_glm4(vocab, text, out);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+        bpe_tokenize_text_exaone(vocab, text, out);
         return;
     }
 
@@ -37934,6 +38133,29 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->token_to_id, vocab->token[i], i);
     }
 
+    /* Index the USER_DEFINED entries. CONTROL tokens (<|user|>, <|assistant|>)
+     * are deliberately left out: prompts are assembled from ids here, so a
+     * role marker appearing in user text is text, not a turn boundary. */
+    table_init(&vocab->user_defined, 64);
+    {
+        ds4_array_ref types;
+        if (model_get_array(model, "tokenizer.ggml.token_type", &types) &&
+            types.len == tokens.len) {
+            ds4_cursor tc = cursor_at(model, types.data_pos);
+            for (int i = 0; i < vocab->n_vocab; i++) {
+                uint32_t ty = 0;
+                if (!cursor_u32(&tc, &ty)) break;
+                if (ty != 4u /* USER_DEFINED */) continue;
+                const ds4_str t = vocab->token[i];
+                if (t.len == 0) continue;
+                table_put(&vocab->user_defined, t, i);
+                if (t.len > vocab->user_defined_max_len)
+                    vocab->user_defined_max_len = (uint32_t)t.len;
+                vocab->user_defined_first[(uint8_t)t.ptr[0]] = true;
+            }
+        }
+    }
+
     table_init(&vocab->merge_rank, merges.len);
     c = cursor_at(model, merges.data_pos);
     for (uint64_t i = 0; i < merges.len; i++) {
@@ -37968,6 +38190,36 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         return;
     }
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+        /* K-EXAONE's ids come from the GGUF where it declares them and from
+         * the token table otherwise. The chat template's role indicators are
+         * <|system|> / <|user|> / <|assistant|> and every turn is closed by
+         * <|endofturn|>, which is also the EOS. */
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
+            vocab->bos_id = vocab_lookup_optional(vocab, "[BOS]");
+        }
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+            vocab->eos_id = vocab_lookup_optional(vocab, "<|endofturn|>");
+        }
+        vocab->system_id    = vocab_lookup_optional(vocab, "<|system|>");
+        vocab->user_id      = vocab_lookup_optional(vocab, "<|user|>");
+        vocab->assistant_id = vocab_lookup_optional(vocab, "<|assistant|>");
+        vocab->observation_id = vocab_lookup_optional(vocab, "<|tool|>");
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
+        vocab->think_end_id   = vocab_lookup_optional(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<tool_call>");
+        vocab->tool_call_end_id   = vocab_lookup_optional(vocab, "</tool_call>");
+        vocab->tool_response_start_id = vocab_lookup_optional(vocab, "<tool_result>");
+        vocab->tool_response_end_id   = vocab_lookup_optional(vocab, "</tool_result>");
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
+
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
     vocab->system_id    = -1;
@@ -37992,6 +38244,7 @@ static void vocab_free(ds4_vocab *vocab) {
     free(vocab->token);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
+    table_free(&vocab->user_defined);
     memset(vocab, 0, sizeof(*vocab));
 }
 

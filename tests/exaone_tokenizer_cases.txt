@@ -1,0 +1,14 @@
+대한민국의 수도는 서울이다.
+hello world
+Hello, World! How are you?
+The answer is 42 and 12345 items.
+def add(a, b):\n    return a + b\n
+It's John's book, they're here, we've done, I'd go, can't
+한국어와 English가 섞인 문장입니다. 숫자 2026년도 포함.
+    indented    spaces\n\nand blank lines
+{"key": "value", "n": 3.14}
+https://example.com/path?a=1&b=2
+   
+tab\tseparated\tvalues
+안녕하세요! 반갑습니다 :) 이모지 😀 도 있어요
+a b c d e
