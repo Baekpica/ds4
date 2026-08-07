@@ -4307,7 +4307,15 @@ struct job;
 static __thread struct job *t_emit_job;
 static bool job_emit(struct job *j, const void *p, size_t n);
 
+/* Inc 5c: when set, send_all() CAPTURES into a private buffer instead of
+ * touching any sink -- the terminal visibility transaction (plan §4.6 steps
+ * 5-7) builds a tool-turn terminal's exact bytes through the unmodified
+ * per-surface emitters, then reserves/publishes/commits them as one step.
+ * Checked before t_emit_job so a capture can never leak into a job buffer. */
+static __thread buf *t_capture_buf;
+
 static bool send_all(int fd, const void *p, size_t n) {
+    if (t_capture_buf) { buf_append(t_capture_buf, p, n); return true; }
     if (t_emit_job) return job_emit(t_emit_job, p, n);   /* W8a: redirect to job buffer */
     const char *s = p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
@@ -8130,13 +8138,10 @@ typedef struct {
     int live_tokens;
     /* Optional rendered conversation text that the client is expected to replay.
      * Responses uses this because visible replay can omit hidden reasoning.
-     * Anthropic currently uses only the call-id side of the state. */
+     * Call-id state lives in the continuation registry (Inc 5a); this struct
+     * keeps only the visible-prefix cache-hint role. */
     char *visible_text;
     size_t visible_len;
-    /* Tool-call ids generated at the same live frontier. A following tool
-     * result for these ids is a direct protocol continuation and should not
-     * trigger prompt-prefix matching or checkpoint canonicalization. */
-    stop_list call_ids;
 } live_tool_state;
 
 typedef struct {
@@ -8407,6 +8412,17 @@ struct job {
  * 503+Retry-After class, its own settle reason. */
 enum { JOB_OUT_COMPLETED = 0, JOB_OUT_FAILED, JOB_OUT_REFUSED_DEEP_SERIAL,
        JOB_OUT_CANCELED, JOB_OUT_SHED, JOB_OUT_SHED_CONT_HOLD };
+
+/* Inc 5c: the terminal visibility transaction (plan §4.6 steps 5-7).
+ * Reservation rides the Inc 2e bounded-sink accounting; both are defined
+ * with the out-sink machinery below and used by generate_job's tool-turn
+ * terminal. */
+static bool terminal_sink_reserve(size_t n);
+static void terminal_sink_release(size_t n);
+static void serial_terminal_commit(server *s, job *j, api_style proto,
+                                   const tool_calls *calls,
+                                   uint64_t gen, int frontier,
+                                   const buf *tb, const char *ctx_span);
 
 /* v0.5.6 Inc 0a: route observation -- record which serving lane took each
  * request, keyed by WIRE SURFACE (not API vendor: OpenAI Chat and legacy
@@ -8764,25 +8780,40 @@ static void cont_registry_prune_locked(server *s) {
     }
 }
 
-/* Publish one record for a serial tool-call turn.  Caller runs this AFTER
+/* Publish one record for a tool-call turn.  Caller runs this AFTER
  * assign_tool_call_ids + tool_memory_remember (the DSML entries must exist
  * to take the strong references) with the engine's post-turn generation and
- * frontier.  The serial session has exactly one tip, so a new publication
- * supersedes the previous serial LIVE record (plan §4.6: one record per
- * turn). */
-static void cont_registry_publish_serial(server *s, api_style proto,
-                                         const tool_calls *calls,
-                                         uint64_t gen, int frontier) {
+ * frontier.  Every owner has exactly one tip -- the serial session, or one
+ * bank -- so a new publication supersedes that owner's previous LIVE record
+ * (plan §4.6: one record per turn). */
+static void cont_registry_publish(server *s, api_style proto,
+                                  const tool_calls *calls,
+                                  cont_record_owner owner, int owner_id,
+                                  uint64_t gen, int frontier) {
     if (!s || !calls || calls->len == 0 || gen == 0 || frontier <= 0) return;
     pthread_mutex_lock(&s->tool_mu);
     cont_registry *r = &s->creg;
     cont_registry_init_locked(r);
-    if (r->serial_live) cont_registry_demote_locked(s, r->serial_live);
+    if (owner == CONT_OWNER_SERIAL_SESSION) {
+        if (r->serial_live) cont_registry_demote_locked(s, r->serial_live);
+    } else {
+        /* Inc 5c: a bank's previous LIVE record dies with its lineage --
+         * bounded walk (n_records <= max_records). */
+        for (cont_record *old = r->head; old; old = old->next) {
+            if (old->state == CONT_REC_LIVE_FRONTIER &&
+                old->owner == CONT_OWNER_BATCH_BANK &&
+                old->owner_id == owner_id) {
+                cont_registry_demote_locked(s, old);
+                break;
+            }
+        }
+    }
 
     cont_record *rec = xmalloc(sizeof(*rec));
     memset(rec, 0, sizeof(*rec));
     rec->state = CONT_REC_LIVE_FRONTIER;
-    rec->owner = CONT_OWNER_SERIAL_SESSION;
+    rec->owner = (uint8_t)owner;
+    rec->owner_id = owner == CONT_OWNER_BATCH_BANK ? owner_id : 0;
     rec->protocol = (uint8_t)proto;
     rec->owner_gen = gen;
     rec->frontier = frontier;
@@ -8818,11 +8849,36 @@ static void cont_registry_publish_serial(server *s, api_style proto,
     r->head = rec;
     r->n_records++;
     r->n_live++;
-    r->serial_live = rec;
+    if (owner == CONT_OWNER_SERIAL_SESSION) r->serial_live = rec;
     cont_registry_prune_locked(s);
     ds4_metric_add(&ds4_metrics_get()->creg_published, 1);
     cont_registry_gauge_locked(r);
     pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void cont_registry_publish_serial(server *s, api_style proto,
+                                         const tool_calls *calls,
+                                         uint64_t gen, int frontier) {
+    cont_registry_publish(s, proto, calls, CONT_OWNER_SERIAL_SESSION, 0,
+                          gen, frontier);
+}
+
+/* Inc 5c: publish one record for a CONTINUOUS tool-call turn -- the bank
+ * the row retired on is the owner (plan §4.6 BATCH_BANK).  owner_gen is
+ * the bank's post-retire lineage generation (ds4_batch_ctx_bank_generation,
+ * Inc 5a: bumped at every lineage-destroying site including the src==dst
+ * truncate-reuse ABA) and frontier its committed length, so admission
+ * revalidates by pure equality without any eager engine->registry callback:
+ * a bank evicted or reused after publication simply stops matching.  No
+ * resolver consumes these until Inc 6 promotes tool-capable Anthropic/
+ * Responses onto the continuous lane -- publication and revalidation land
+ * first, unit-gated, so the consumer arrives against a proven registry. */
+static void cont_registry_publish_bank(server *s, api_style proto,
+                                       const tool_calls *calls,
+                                       int bank, uint64_t gen, int frontier) {
+    if (bank < 0) return;
+    cont_registry_publish(s, proto, calls, CONT_OWNER_BATCH_BANK, bank,
+                          gen, frontier);
 }
 
 /* The serial session's tip no longer matches its LIVE record (a
@@ -8841,15 +8897,24 @@ static void cont_registry_demote_serial(server *s) {
 /* Inc 5b: lazy soft-TTL (plan §4.6 five-minute soft retention).  Called at
  * every read/decision point; no timer thread.  An expired LIVE record
  * demotes to REPLAY_ONLY -- the later output-only turn gets the honest
- * refusal while a full replay can still use exact DSML. */
-static void cont_registry_expire_serial_locked(server *s, double now) {
-    cont_record *rec = s->creg.serial_live;
-    if (!rec || s->creg.ttl_s <= 0) return;
-    if (now - rec->publish_time <= s->creg.ttl_s) return;
-    server_log(DS4_LOG_WARNING,
-               "ds4-server: continuation record expired (ttl %.0fs, unclaimed %.0fs)",
-               s->creg.ttl_s, now - rec->publish_time);
-    cont_registry_demote_locked(s, rec);
+ * refusal while a full replay can still use exact DSML.  Inc 5c: the walk
+ * covers EVERY live record (serial + bank owners) -- bank records have no
+ * eager demote sites (the generation check is their honesty), so lazy TTL
+ * is what unpins their DSML.  Bounded: n_records <= max_records. */
+static void cont_registry_expire_locked(server *s, double now) {
+    if (s->creg.ttl_s <= 0 || s->creg.n_live == 0) return;
+    for (cont_record *rec = s->creg.head; rec; ) {
+        cont_record *next = rec->next;   /* demote keeps list membership */
+        if (rec->state == CONT_REC_LIVE_FRONTIER &&
+            now - rec->publish_time > s->creg.ttl_s) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: continuation record expired (owner=%s ttl %.0fs, unclaimed %.0fs)",
+                       rec->owner == CONT_OWNER_SERIAL_SESSION ? "session" : "bank",
+                       s->creg.ttl_s, now - rec->publish_time);
+            cont_registry_demote_locked(s, rec);
+        }
+        rec = next;
+    }
 }
 
 /* Inc 5b: queued T2 hard pin (plan §4.6 bounded queued pins).  Acquired at
@@ -8863,7 +8928,7 @@ static void *cont_registry_pin_live(server *s, api_style proto,
     if (!s || !id || !id[0]) return NULL;
     const double now = now_sec();
     pthread_mutex_lock(&s->tool_mu);
-    cont_registry_expire_serial_locked(s, now);
+    cont_registry_expire_locked(s, now);
     cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto, id);
     if (!rec || rec->state != CONT_REC_LIVE_FRONTIER) {
         pthread_mutex_unlock(&s->tool_mu);
@@ -8918,7 +8983,7 @@ static bool cont_registry_serial_hold(server *s, const request *req,
     if (retry_after) *retry_after = 1;
     if (!s || !req) return false;
     pthread_mutex_lock(&s->tool_mu);
-    cont_registry_expire_serial_locked(s, now);
+    cont_registry_expire_locked(s, now);
     cont_record *rec = s->creg.serial_live;
     if (!rec) {
         pthread_mutex_unlock(&s->tool_mu);
@@ -8965,7 +9030,7 @@ static bool cont_registry_live_has_id(server *s, api_style proto,
                                       const char *id) {
     if (!s || !id || !id[0]) return false;
     pthread_mutex_lock(&s->tool_mu);
-    cont_registry_expire_serial_locked(s, now_sec());   /* Inc 5b lazy TTL */
+    cont_registry_expire_locked(s, now_sec());   /* Inc 5b lazy TTL */
     cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto, id);
     const bool ok = rec && rec->state == CONT_REC_LIVE_FRONTIER;
     pthread_mutex_unlock(&s->tool_mu);
@@ -8981,7 +9046,7 @@ static bool cont_registry_resolve_serial(server *s, api_style proto,
                                          uint64_t session_gen, int live_pos) {
     if (!s || !ids || ids->len == 0 || session_gen == 0) return false;
     pthread_mutex_lock(&s->tool_mu);
-    cont_registry_expire_serial_locked(s, now_sec());   /* Inc 5b lazy TTL */
+    cont_registry_expire_locked(s, now_sec());   /* Inc 5b lazy TTL */
     cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto,
                                                  ids->v[0]);
     bool ok = rec &&
@@ -8993,6 +9058,40 @@ static bool cont_registry_resolve_serial(server *s, api_style proto,
               rec->frontier == live_pos;
     for (int i = 0; ok && i < ids->len; i++)
         ok = id_list_contains(&rec->call_ids, ids->v[i]);
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+/* Inc 5c: worker admission lookup for a BATCH_BANK record.  The serial
+ * resolve can take the live reference as arguments because there is one
+ * session; a bank claim must first name WHICH bank, so this returns the
+ * record's claimed execution reference (bank, generation, frontier) after
+ * the same LIVE + protocol + exact id-set-equality checks.  The caller (the
+ * Inc 6 tool-continuation admission) then reads that bank's live generation
+ * and committed length under gen_mu and admits only on pure equality -- a
+ * bank evicted, trimmed, or reused since publication (the queued-eviction
+ * ABA) fails the comparison and refuses with the native 409.  Until Inc 6
+ * the only callers are the unit gates. */
+static bool cont_registry_bank_claim(server *s, api_style proto,
+                                     const stop_list *ids, int *bank,
+                                     uint64_t *gen, int *frontier) {
+    if (!s || !ids || ids->len == 0) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    cont_registry_expire_locked(s, now_sec());   /* Inc 5b lazy TTL */
+    cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto,
+                                                 ids->v[0]);
+    bool ok = rec &&
+              rec->state == CONT_REC_LIVE_FRONTIER &&
+              rec->owner == CONT_OWNER_BATCH_BANK &&
+              rec->protocol == (uint8_t)proto &&
+              rec->call_ids.len == ids->len;
+    for (int i = 0; ok && i < ids->len; i++)
+        ok = id_list_contains(&rec->call_ids, ids->v[i]);
+    if (ok) {
+        if (bank) *bank = rec->owner_id;
+        if (gen) *gen = rec->owner_gen;
+        if (frontier) *frontier = rec->frontier;
+    }
     pthread_mutex_unlock(&s->tool_mu);
     return ok;
 }
@@ -9032,7 +9131,6 @@ static void cont_registry_free(server *s) {
  * tool-result-only requests that have no replayable prefix. */
 static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
-    stop_list_clear(&st->call_ids);
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
@@ -9043,7 +9141,6 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
 static void live_tool_state_free(live_tool_state *st) {
     if (!st) return;
     live_tool_state_clear_locked(st);
-    free(st->call_ids.v);
     memset(st, 0, sizeof(*st));
 }
 
@@ -9080,18 +9177,12 @@ static void thinking_live_remember(server *s, const char *visible_text) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void responses_live_remember(server *s, const char *visible_text,
-                                    const tool_calls *calls) {
+static void responses_live_remember(server *s, const char *visible_text) {
     if (!s || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&s->responses_live);
     s->responses_live.visible_text = xstrdup(visible_text);
     s->responses_live.visible_len = strlen(visible_text);
-    if (calls) {
-        for (int i = 0; i < calls->len; i++) {
-            id_list_push_unique(&s->responses_live.call_ids, calls->v[i].id);
-        }
-    }
     s->responses_live.live_tokens = ds4_session_pos(s->session);
     s->responses_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
@@ -9105,9 +9196,10 @@ static void responses_live_clear(server *s) {
 }
 
 /* Inc 5a: call-id resolution migrated to the continuation registry (the
- * singletons' call_ids are write-only debug state until the 5c cleanup;
- * the anthropic singleton -- which had ONLY the call-id role -- is gone).
- * Names kept: parsers still ask the same two questions. */
+ * anthropic singleton -- which had ONLY the call-id role -- is gone; Inc 5c
+ * dropped the responses singleton's write-only call_ids storage, leaving it
+ * the visible-prefix hint alone).  Names kept: parsers still ask the same
+ * two questions. */
 static bool responses_live_has_call_id(server *s, const char *id) {
     return cont_registry_live_has_id(s, API_RESPONSES, id);
 }
@@ -12330,6 +12422,19 @@ decode_again:
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
+    /* Inc 5a: tool turns publish a continuation record binding this turn's
+     * call ids to the engine execution reference; a plain turn extended the
+     * session past any old frontier, so the previous serial record is
+     * demoted instead.  Inc 5c: publication is DEFERRED into the terminal
+     * visibility transaction (plan §4.6 steps 5-7, below with the wire
+     * write) -- the execution reference is still snapshotted HERE, before
+     * the canonicalize block can rebuild the session, so a turn that takes
+     * the missing-raw-DSML repair path keeps its 5a semantics (publishes
+     * the pre-canonicalize reference and honestly 409s on output-only T2). */
+    bool pub_pending = false;
+    api_style pub_proto = API_OPENAI;
+    uint64_t pub_gen = 0;
+    int pub_frontier = 0;
     if (j->req.api == API_RESPONSES) {
         if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
@@ -12344,18 +12449,14 @@ decode_again:
             buf visible = {0};
             buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, visible.ptr ? visible.ptr : "",
-                                    parsed_calls.len ? &parsed_calls : NULL);
+            responses_live_remember(s, visible.ptr ? visible.ptr : "");
             buf_free(&visible);
             free(visible_suffix);
-            /* Inc 5a: tool turns publish a continuation record binding this
-             * turn's call ids to the engine execution reference; a plain
-             * turn extended the session past any old frontier, so the
-             * previous serial record is demoted instead. */
             if (parsed_calls.len) {
-                cont_registry_publish_serial(s, API_RESPONSES, &parsed_calls,
-                                             ds4_session_generation(s->session),
-                                             ds4_session_pos(s->session));
+                pub_pending = true;
+                pub_proto = API_RESPONSES;
+                pub_gen = ds4_session_generation(s->session);
+                pub_frontier = ds4_session_pos(s->session);
             } else {
                 cont_registry_demote_serial(s);
             }
@@ -12370,9 +12471,10 @@ decode_again:
         {
             /* Inc 5a: the registry record replaces the anthropic_live
              * singleton (call ids were its only role). */
-            cont_registry_publish_serial(s, API_ANTHROPIC, &parsed_calls,
-                                         ds4_session_generation(s->session),
-                                         ds4_session_pos(s->session));
+            pub_pending = true;
+            pub_proto = API_ANTHROPIC;
+            pub_gen = ds4_session_generation(s->session);
+            pub_frontier = ds4_session_pos(s->session);
         } else {
             cont_registry_demote_serial(s);
         }
@@ -12440,7 +12542,29 @@ decode_again:
         res.completion_tokens = completion;
         if (wsess.surface == DS4_WIRE_RESPONSES)
             res.reasoning_tokens = reasoning_token_count(s->engine, parsed_reasoning);
-        if (j->req.stream) {
+        if (pub_pending) {
+            /* Inc 5c (plan §4.6 steps 5-7): a tool-turn terminal that
+             * publishes a continuation record couples the record and the
+             * terminal bytes as ONE visibility transaction: build the bytes
+             * privately (the capture redirect below routes every emitter's
+             * send_all into a buffer -- machines untouched), reserve their
+             * exact bounded-sink space, publish, then commit with a single
+             * send.  Publication-before-visibility means a client that
+             * received the completed tool call can ALWAYS immediately
+             * continue output-only; the failure ladder is in
+             * serial_terminal_commit. */
+            buf tb = {0};
+            t_capture_buf = &tb;
+            if (j->req.stream)
+                (void)wire_finish_stream(j->fd, s, &j->req, &wsess, &res);
+            else
+                (void)wire_finish_buffered(j->fd, s->enable_cors, &j->req,
+                                           &wsess, &res);
+            t_capture_buf = NULL;
+            serial_terminal_commit(s, j, pub_proto, &parsed_calls,
+                                   pub_gen, pub_frontier, &tb, ctx_span);
+            buf_free(&tb);
+        } else if (j->req.stream) {
             if (!wire_finish_stream(j->fd, s, &j->req, &wsess, &res)) {
                 server_log(DS4_LOG_DEFAULT,
                            "ds4-server: %s ctx=%s%s%s final stream failed",
@@ -13042,6 +13166,75 @@ static bool job_emit(struct job *j, const void *p, size_t n) {
     pthread_cond_signal(&j->cv);
     pthread_mutex_unlock(&j->mu);
     return !gone;
+}
+
+/* Inc 5c (plan §4.6 step 5): reserve exact bounded-sink space for a
+ * tool-turn terminal BEFORE its continuation record publishes, so the
+ * commit cannot fail on a capacity check after the record is visible.  The
+ * bounds are the Inc 2e slow-reader machinery's own: the per-job 16 MiB
+ * cap and the aggregate out-backlog cap, charged to the same gauge so a
+ * burst of reserved terminals is visible to job_emit's eviction exactly
+ * like queued stream bytes.  Reservation failure is the slow-reader shed
+ * class. */
+static bool terminal_sink_reserve(size_t n) {
+    ds4_metrics *m = ds4_metrics_get();
+    if (n > DS4_JOB_OUT_CAP ||
+        (g_out_agg_cap > 0 &&
+         ds4_metric_read(&m->out_backlog_bytes) + n > g_out_agg_cap)) {
+        shed_record(DS4_SHED_SLOW_READER);
+        return false;
+    }
+    ds4_metric_add(&m->out_backlog_bytes, n);
+    return true;
+}
+
+static void terminal_sink_release(size_t n) {
+    ds4_metric_add(&ds4_metrics_get()->out_backlog_bytes,
+                   (uint64_t)-(uint64_t)n);
+}
+
+/* Inc 5c: steps 5-7 of the §4.6 ordered terminal transaction, after the
+ * terminal bytes were built privately (the t_capture_buf redirect).  The
+ * failure ladder, exactly as the plan orders it:
+ *   - reservation failure publishes NOTHING: the client loses this response
+ *     to the output-sink bound (slow-reader class) and retries into a
+ *     session whose registry never saw the turn;
+ *   - a transport death detected between publish and commit rolls the
+ *     record to REPLAY_ONLY -- the client cannot have seen this turn's tool
+ *     identity, so an output-only follow-up must not bind to it;
+ *   - once the commit send STARTS, the record stays LIVE until TTL even if
+ *     the send fails: the client may have observed tool identity before the
+ *     failure (plan: "after bytes become drainable or a direct socket send
+ *     starts, retain the live record until TTL"). */
+static void serial_terminal_commit(server *s, job *j, api_style proto,
+                                   const tool_calls *calls,
+                                   uint64_t gen, int frontier,
+                                   const buf *tb, const char *ctx_span) {
+    if (!terminal_sink_reserve(tb->len)) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: chat ctx=%s terminal reservation failed "
+                   "(%zu bytes over the output-sink bound); tool turn NOT "
+                   "published, closing without a terminal",
+                   ctx_span, tb->len);
+        j->client_gone = true;
+        j->outcome = JOB_OUT_SHED;
+        return;
+    }
+    cont_registry_publish_serial(s, proto, calls, gen, frontier);
+    if (j->client_gone || client_disconnected(j->fd)) {
+        cont_registry_demote_serial(s);
+        j->client_gone = true;   /* settle counts CANCELED, never completed */
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: chat ctx=%s client gone before terminal "
+                   "commit; tool-turn record demoted to replay-only",
+                   ctx_span);
+    } else if (!send_all(j->fd, tb->ptr, tb->len)) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: chat ctx=%s terminal commit send failed "
+                   "after start; tool-turn record retained live until TTL",
+                   ctx_span);
+    }
+    terminal_sink_release(tb->len);
 }
 
 /* v0.5.2 inc1: make sure the serial session can actually allocate its graph
@@ -14468,6 +14661,21 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
         if (j->req.stream) wire_assign_tool_ids(calls, &st->wsess);
         assign_tool_call_ids(s, calls, j->req.api);
         tool_memory_remember(s, calls);
+        /* Inc 5c: a promoted-surface tool turn publishes a BANK-owned
+         * continuation record.  Runs inside cont_on_done AFTER
+         * cont_warm_retire (the bank's generation and committed length are
+         * post-retire) and BEFORE either finalize writer appends terminal
+         * bytes to j->out -- publication precedes terminal visibility, the
+         * same §4.6 ordering the serial transaction enforces.  Dormant in
+         * live traffic until Inc 6 routes tool-capable Anthropic/Responses
+         * onto this lane; OpenAI chat keeps tool_memory + full-replay
+         * canonicalize (no record, no 409 surface -- the 5a scoping). */
+        if ((j->req.api == API_ANTHROPIC || j->req.api == API_RESPONSES) &&
+            s->batch_ctx && j->cont_bank >= 0) {
+            cont_registry_publish_bank(s, j->req.api, calls, j->cont_bank,
+                ds4_batch_ctx_bank_generation(s->batch_ctx, j->cont_bank),
+                ds4_batch_ctx_bank_committed(s->batch_ctx, j->cont_bank, NULL));
+        }
         *fin_io = "tool_calls";
     }
 }
@@ -19910,6 +20118,226 @@ static void test_cont_registry_record_unit_eviction(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* Inc 5c: send_all's capture redirect -- when t_capture_buf is set every
+ * emitter byte lands in the private buffer and NOTHING touches the socket;
+ * cleared, the same call writes the fd.  This is what lets the terminal
+ * transaction build exact terminal bytes through unmodified emitters. */
+static void test_send_all_capture_redirect(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    buf cap = {0};
+    t_capture_buf = &cap;
+    TEST_ASSERT(send_all(sv[0], "abc", 3));
+    t_capture_buf = NULL;
+    TEST_ASSERT(cap.len == 3 && memcmp(cap.ptr, "abc", 3) == 0);
+    char rb[8];
+    TEST_ASSERT(recv(sv[1], rb, sizeof(rb), MSG_DONTWAIT) < 0);   /* socket untouched */
+
+    TEST_ASSERT(send_all(sv[0], "de", 2));
+    TEST_ASSERT(recv(sv[1], rb, sizeof(rb), MSG_DONTWAIT) == 2 &&
+                memcmp(rb, "de", 2) == 0);
+
+    buf_free(&cap);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Inc 5c: the §4.6 terminal transaction failure ladder --
+ * reserve -> publish -> commit as one visibility step;
+ * reservation failure publishes NOTHING; a transport death detected
+ * between publish and commit demotes to REPLAY_ONLY; a clean commit
+ * leaves the record LIVE with the exact bytes on the wire. */
+static void test_serial_terminal_commit_ladder(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    ds4_metrics *m = ds4_metrics_get();
+    const uint64_t backlog0 = ds4_metric_read(&m->out_backlog_bytes);
+    const uint64_t shed0 =
+        ds4_metric_read(&m->requests_shed[DS4_SHED_SLOW_READER]);
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    job j = {0};
+    j.fd = sv[0];
+
+    buf tb = {0};
+    buf_puts(&tb, "HTTP/1.1 200 OK\r\n\r\n{\"terminal\":1}");
+
+    /* Leg A -- clean commit: record LIVE, exact bytes delivered, the
+     * reservation charge fully released. */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_txnA");
+        tool_calls_push(&calls, tc);
+        serial_terminal_commit(&s, &j, API_ANTHROPIC, &calls, 3, 50, &tb, "t");
+        tool_calls_free(&calls);
+    }
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_txnA"));
+    TEST_ASSERT(!j.client_gone && j.outcome == JOB_OUT_COMPLETED);
+    TEST_ASSERT(ds4_metric_read(&m->out_backlog_bytes) == backlog0);
+    {
+        char rb[128];
+        ssize_t n = recv(sv[1], rb, sizeof(rb), MSG_DONTWAIT);
+        TEST_ASSERT(n == (ssize_t)tb.len && memcmp(rb, tb.ptr, tb.len) == 0);
+    }
+
+    /* Leg B -- reservation failure publishes NOTHING: no record, no bytes,
+     * slow-reader shed accounting, job marked gone + SHED. */
+    {
+        const uint64_t cap_save = g_out_agg_cap;
+        g_out_agg_cap = 4;   /* tb.len is far over: reservation must refuse */
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_txnB");
+        tool_calls_push(&calls, tc);
+        serial_terminal_commit(&s, &j, API_ANTHROPIC, &calls, 4, 60, &tb, "t");
+        tool_calls_free(&calls);
+        g_out_agg_cap = cap_save;
+    }
+    TEST_ASSERT(!cont_registry_id_known(&s, "toolu_txnB"));
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_txnA"));   /* prior tip untouched */
+    TEST_ASSERT(j.client_gone && j.outcome == JOB_OUT_SHED);
+    TEST_ASSERT(ds4_metric_read(&m->requests_shed[DS4_SHED_SLOW_READER]) ==
+                shed0 + 1);
+    TEST_ASSERT(ds4_metric_read(&m->out_backlog_bytes) == backlog0);
+    {
+        char rb[8];
+        TEST_ASSERT(recv(sv[1], rb, sizeof(rb), MSG_DONTWAIT) < 0);
+    }
+
+    /* Leg C -- transport dead between publish and commit: the record
+     * publishes, the pre-commit probe finds the peer gone, and the record
+     * rolls to REPLAY_ONLY (ids stay reserved for mint uniqueness). */
+    j.client_gone = false;
+    j.outcome = JOB_OUT_COMPLETED;
+    close(sv[1]);   /* orderly FIN: client_disconnected() sees it */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_txnC");
+        tool_calls_push(&calls, tc);
+        serial_terminal_commit(&s, &j, API_ANTHROPIC, &calls, 5, 70, &tb, "t");
+        tool_calls_free(&calls);
+    }
+    TEST_ASSERT(!anthropic_live_has_call_id(&s, "toolu_txnC"));
+    TEST_ASSERT(cont_registry_id_known(&s, "toolu_txnC"));
+    TEST_ASSERT(s.creg.n_live == 0);   /* leg C's publish superseded leg A */
+    TEST_ASSERT(j.client_gone);        /* Inc 2c law: settle counts CANCELED */
+    TEST_ASSERT(ds4_metric_read(&m->out_backlog_bytes) == backlog0);
+
+    buf_free(&tb);
+    close(sv[0]);
+    cont_registry_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* Inc 5c: BATCH_BANK publication + claim -- per-bank supersession, owner
+ * isolation from the serial tip, the caller-side generation/frontier
+ * equality that refuses the queued-eviction ABA, and lazy TTL covering
+ * bank records. */
+static void test_cont_registry_bank_publish_claim(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_bk1");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 2, 7, 100);
+        tool_calls_free(&calls);
+    }
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_bk1"));
+    TEST_ASSERT(!responses_live_has_call_id(&s, "toolu_bk1"));
+    TEST_ASSERT(s.creg.serial_live == NULL);   /* bank tips never claim the serial slot */
+
+    /* Claim returns the record's exact execution reference; the Inc 6
+     * caller admits only on equality with the LIVE bank state -- a bumped
+     * generation (bank evicted/reused since publication: the ABA) or a
+     * moved frontier refuses. */
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "toolu_bk1");
+    int bank = -1;
+    uint64_t gen = 0;
+    int frontier = 0;
+    TEST_ASSERT(cont_registry_bank_claim(&s, API_ANTHROPIC, &ids,
+                                         &bank, &gen, &frontier));
+    TEST_ASSERT(bank == 2 && gen == 7 && frontier == 100);
+    TEST_ASSERT(!(gen == 8 && frontier == 100));    /* evicted bank: refuse */
+    TEST_ASSERT(!(gen == 7 && frontier == 101));    /* moved frontier: refuse */
+    TEST_ASSERT(!cont_registry_bank_claim(&s, API_RESPONSES, &ids,
+                                          NULL, NULL, NULL));
+    /* The serial resolve never matches a bank record (owner check). */
+    TEST_ASSERT(!cont_registry_resolve_serial(&s, API_ANTHROPIC, &ids, 7, 100));
+
+    /* A serial publication coexists with the bank tip; demoting the serial
+     * tip leaves the bank record LIVE. */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_ser1");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 9, 40);
+        tool_calls_free(&calls);
+    }
+    TEST_ASSERT(s.creg.n_live == 2);
+    cont_registry_demote_serial(&s);
+    TEST_ASSERT(s.creg.n_live == 1);
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_bk1"));
+
+    /* Per-bank supersession: a new turn on bank 2 demotes its old tip; a
+     * turn on bank 3 lives beside it. */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_bk2");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 2, 8, 120);
+        tool_calls_free(&calls);
+    }
+    TEST_ASSERT(!anthropic_live_has_call_id(&s, "toolu_bk1"));
+    TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_bk2"));
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_bk3");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_bank(&s, API_RESPONSES, &calls, 3, 2, 80);
+        tool_calls_free(&calls);
+    }
+    TEST_ASSERT(s.creg.n_live == 2);
+
+    /* Publish refuses a dead reference (gen 0 = no live generation, the
+     * no-graph stub; frontier 0 = nothing committed). */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_bk_dead");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 4, 0, 100);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 4, 5, 0);
+        tool_calls_free(&calls);
+    }
+    TEST_ASSERT(!cont_registry_id_known(&s, "toolu_bk_dead"));
+
+    /* Lazy TTL walks bank records too (they have no eager demote sites). */
+    s.creg.ttl_s = 300.0;
+    pthread_mutex_lock(&s.tool_mu);
+    for (cont_record *rec = s.creg.head; rec; rec = rec->next)
+        if (rec->state == CONT_REC_LIVE_FRONTIER)
+            rec->publish_time -= 301.0;
+    pthread_mutex_unlock(&s.tool_mu);
+    TEST_ASSERT(!anthropic_live_has_call_id(&s, "toolu_bk2"));
+    TEST_ASSERT(s.creg.n_live == 0);
+    TEST_ASSERT(cont_registry_id_known(&s, "toolu_bk2"));
+
+    id_list_free(&ids);
+    cont_registry_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
     server s;
     memset(&s, 0, sizeof(s));
@@ -23875,6 +24303,9 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_registry_grace_and_pin_hold();
     test_cont_registry_ttl_expire();
     test_cont_registry_record_unit_eviction();
+    test_send_all_capture_redirect();
+    test_serial_terminal_commit_ladder();
+    test_cont_registry_bank_publish_claim();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();

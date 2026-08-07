@@ -1,7 +1,7 @@
 #!/bin/bash
-# cont_registry_gate.sh — v0.5.6 API Inc 5a+5b live gate: generation-checked
-# continuation registry (plan §4.6 record shape + retention policy + §5
-# Inc 5 gate line, the serial-owner slice; bank owners land in 5c).
+# cont_registry_gate.sh — v0.5.6 API Inc 5a+5b+5c live gate: generation-checked
+# continuation registry (plan §4.6 record shape + retention policy + the
+# ordered terminal visibility transaction; §5 Inc 5 gate line).
 #
 # What 5a changed: serial tool turns publish ONE continuation record binding
 # the turn's call ids to the engine execution reference (session generation +
@@ -60,6 +60,45 @@
 #                     blocker sheds on the PIN (grace long over) and the T2
 #                     resolves 200: the plan's "admission ... sheds instead
 #                     of violating a pin", live
+#
+# Boot C legs (Inc 5c, policy-zero again -- the terminal transaction):
+#   bank_dormant      an OpenAI chat TOOL turn served on the CONT lane
+#                     publishes NO record (published unmoved, lane counter
+#                     +1, serial unmoved): the BATCH_BANK publish site is
+#                     scoped to the promoted surfaces, which cannot reach
+#                     cont tools until Inc 6 -- the 5a protocol scoping,
+#                     engagement-negative
+#   pbt_immediate     publication-before-terminal: 3 rounds of T1 tool turn
+#                     -> IMMEDIATE output-only T2 with zero client delay,
+#                     every T2 200 -- a client that has the terminal can
+#                     ALWAYS continue, because the record publishes before
+#                     the terminal bytes commit
+#   pbt_stream        the same coupling on a STREAMING T1 (the captured
+#                     wire_finish_stream cluster commits as one write):
+#                     tool id from the SSE events -> immediate T2 200
+#   strand_norecord   a T1 whose budget cuts mid-toolcall finishes length
+#                     with NO calls -> publishes nothing (published
+#                     unmoved, records_live 0); the failure ladder's
+#                     "no successful terminal -> no record"
+#
+# Boot D legs (Inc 5c reservation rollback, DS4_SERVER_OUT_AGG_CAP=64):
+#   reserve_fail      the tool-turn terminal cannot reserve bounded-sink
+#                     space -> publishes NOTHING (plan: "reservation
+#                     failure publishes nothing"): connection closes with
+#                     no terminal (curl 000), published stays 0,
+#                     shed{slow_reader} +1, srv.log "terminal reservation
+#                     failed"
+#   reserve_healthy   the same boot still serves non-publishing traffic
+#                     (plain chat 200 -- only publishing tool terminals
+#                     reserve)
+#
+# The remaining §4.6 ladder rung -- transport death between publish and
+# commit -> REPLAY_ONLY -- is deterministically unit-gated
+# (test_serial_terminal_commit_ladder leg C; a live client death cannot be
+# timed into that window reliably).  The queued-eviction/ABA for BANK
+# records is unit-gated (test_cont_registry_bank_publish_claim: claim
+# returns the published generation, a bumped live generation refuses); the
+# serial ABA twin runs live as anth_t2_race409.
 #
 # Runs FROM the Mac over SSH like the other gates.  Boots kill any running
 # ds4-server on $R.  End state: ds4-server killed, box left free.
@@ -399,6 +438,104 @@ bcode=$(cat "$OUT/pin_blocker.code")
 shedp1=$(m 'ds4_requests_shed_total{reason="continuation_hold"}')
 [ "${shedp1:-0}" -gt "${shedp0:-0}" ] || fail "pin_wins: continuation_hold counter never moved (${shedp0:-?} -> ${shedp1:-?})"
 log "pin_wins PASS (queued T2's pin shed the FIFO-earlier blocker; T2 resolved 200)"
+
+# ==================== boot C: Inc 5c terminal transaction ===================
+# Policy-zero like boot A: nothing sheds, so every T1 is a clean
+# non-continuing serial win (demoting any record a prior T2's answer may
+# have chained) and every T2 resolution is pure registry semantics.
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0" boot
+
+# bank_dormant: an OpenAI cont TOOL turn must not publish (the BATCH_BANK
+# publish site is scoped to Anthropic/Responses, which stay serial for
+# tools until Inc 6).  First leg on the fresh boot: published must be 0
+# before AND after.  LANE-ENTRY TRAP: assert the cont entry AND that serial
+# never moved -- a floor-rejected cont attempt re-enters serial.
+TOOLS_OA='[{"type":"function","function":{"name":"list_files","description":"List the files in a directory","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]'
+pubc0=$(m ds4_continuation_records_published_total)
+lanec0=$(m 'ds4_route_requests_total{surface="openai_chat",lane="continuous"}')
+serc0=$(m ds4_requests_serial_total)
+c=$(post bank_dormant /v1/chat/completions '{"model":"m","max_tokens":1200,"temperature":0,"messages":[{"role":"user","content":"Use the list_files tool to list the files in /tmp. Call the tool."}],"tools":'"$TOOLS_OA"'}')
+code_is bank_dormant "$c" 200
+has bank_dormant '"finish_reason":"tool_calls"'
+pubc1=$(m ds4_continuation_records_published_total)
+lanec1=$(m 'ds4_route_requests_total{surface="openai_chat",lane="continuous"}')
+serc1=$(m ds4_requests_serial_total)
+[ "${pubc1:-0}" -eq "${pubc0:-0}" ] || fail "bank_dormant: OpenAI cont tool turn published a record (${pubc0:-?} -> ${pubc1:-?})"
+[ "${lanec1:-0}" -gt "${lanec0:-0}" ] || fail "bank_dormant: tool turn never entered the cont lane (${lanec0:-?} -> ${lanec1:-?})"
+[ "${serc1:-0}" -eq "${serc0:-0}" ] || fail "bank_dormant: serial entries moved (${serc0:-?} -> ${serc1:-?}) -- cont attempt fell back"
+log "bank_dormant PASS (OpenAI cont tool turn: lane cont ${lanec0:-0} -> $lanec1, published unmoved at ${pubc1:-0})"
+
+# pbt_immediate: 3 rounds T1 -> ZERO-DELAY output-only T2.  Publication
+# precedes terminal visibility, so a client acting on the terminal it just
+# received can always continue; each round's T1 (non-continuing) demotes
+# whatever record the previous T2's answer may have chained.
+for rnd in 1 2 3; do
+  c=$(post "pbt_r${rnd}_t1" /v1/messages '{"model":"m","max_tokens":1200,"temperature":0,"messages":[{"role":"user","content":"Use the list_files tool to list the files in /tmp. Call the tool."}],"tools":'"$TOOLS_ANTH"'}')
+  code_is "pbt_r${rnd}_t1" "$c" 200
+  has "pbt_r${rnd}_t1" '"type":"tool_use"'
+  PBT_ID=$(python3 -c 'import json,sys; t=json.load(open(sys.argv[1])); print(next(b["id"] for b in t["content"] if b.get("type")=="tool_use"))' "$OUT/pbt_r${rnd}_t1.json") || fail "pbt_r${rnd}_t1: no tool_use id"
+  resp0=$(m ds4_continuation_resolved_total)
+  c=$(post "pbt_r${rnd}_t2" /v1/messages '{"model":"m","max_tokens":1200,"temperature":0,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"'"$PBT_ID"'","content":"file1.txt\nfile2.txt"}]}],"tools":'"$TOOLS_ANTH"'}')
+  code_is "pbt_r${rnd}_t2" "$c" 200
+  resp1=$(m ds4_continuation_resolved_total)
+  [ "${resp1:-0}" -gt "${resp0:-0}" ] || fail "pbt_r${rnd}_t2: immediate T2 did not resolve (${resp0:-?} -> ${resp1:-?})"
+done
+log "pbt_immediate PASS (3 rounds of zero-delay output-only T2, all resolved)"
+
+# pbt_stream: the captured wire_finish_stream terminal cluster commits as
+# one write AFTER publication -- same coupling, streaming surface.  Tools
+# keep the serial lane (CONTINUATION_PUBLISH), so this is exactly the
+# serial stream transaction.
+curl -s -m 240 --no-buffer -o "$OUT/pbt_stream_t1.sse" "$BASE/v1/messages" \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"m","max_tokens":1200,"temperature":0,"stream":true,"messages":[{"role":"user","content":"Use the list_files tool to list the files in /tmp. Call the tool."}],"tools":'"$TOOLS_ANTH"'}' \
+  || fail "pbt_stream_t1: stream curl failed"
+grep -q 'event: message_stop' "$OUT/pbt_stream_t1.sse" || fail "pbt_stream_t1: no message_stop terminal"
+grep -q '"stop_reason":"tool_use"' "$OUT/pbt_stream_t1.sse" || fail "pbt_stream_t1: stream did not finish tool_use"
+STREAM_ID=$(grep -o '"id":"toolu_[^"]*"' "$OUT/pbt_stream_t1.sse" | head -1 | cut -d'"' -f4)
+[ -n "$STREAM_ID" ] || fail "pbt_stream_t1: no toolu_ id in the stream"
+resps0=$(m ds4_continuation_resolved_total)
+c=$(post pbt_stream_t2 /v1/messages '{"model":"m","max_tokens":1200,"temperature":0,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"'"$STREAM_ID"'","content":"file1.txt\nfile2.txt"}]}],"tools":'"$TOOLS_ANTH"'}')
+code_is pbt_stream_t2 "$c" 200
+resps1=$(m ds4_continuation_resolved_total)
+[ "${resps1:-0}" -gt "${resps0:-0}" ] || fail "pbt_stream_t2: T2 after streamed T1 did not resolve (${resps0:-?} -> ${resps1:-?})"
+log "pbt_stream PASS (streamed tool turn's record was live at the terminal; T2 resolved)"
+
+# strand_norecord: a budget-cut tool call (finish=length, no calls parsed)
+# publishes nothing -- and, being a non-continuing serial win, demotes any
+# record the pbt_stream T2's answer chained: records_live must be 0.
+pubs0=$(m ds4_continuation_records_published_total)
+c=$(post strand_t1 /v1/messages '{"model":"m","max_tokens":24,"temperature":0,"messages":[{"role":"user","content":"Use the list_files tool to list the files in /tmp. Call the tool."}],"tools":'"$TOOLS_ANTH"'}')
+code_is strand_t1 "$c" 200
+has strand_t1 '"stop_reason":"max_tokens"'
+pubs1=$(m ds4_continuation_records_published_total)
+[ "${pubs1:-0}" -eq "${pubs0:-0}" ] || fail "strand_norecord: cut turn published (${pubs0:-?} -> ${pubs1:-?})"
+[ "$(m ds4_continuation_records_live)" -eq 0 ] || fail "strand_norecord: records_live not 0 after the cut turn"
+log "strand_norecord PASS (no successful terminal -> no record; live=0)"
+
+# ==================== boot D: Inc 5c reservation rollback ===================
+# A 64-byte aggregate output cap makes every publishing terminal's
+# reservation fail while leaving all non-publishing traffic untouched
+# (job_emit's eviction branch additionally needs a >=256KiB laggard, which
+# nothing here produces).
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 DS4_CONT_GRACE_S=0 DS4_CONT_PIN_DEADLINE_S=0 DS4_SERVER_OUT_AGG_CAP=64" boot
+
+pubd0=$(m ds4_continuation_records_published_total)
+shedd0=$(m 'ds4_requests_shed_total{reason="slow_reader"}')
+c=$(post reserve_fail /v1/messages '{"model":"m","max_tokens":1200,"temperature":0,"messages":[{"role":"user","content":"Use the list_files tool to list the files in /tmp. Call the tool."}],"tools":'"$TOOLS_ANTH"'}')
+[ "$c" = "000" ] || fail "reserve_fail: got HTTP $c, want 000 (connection closed with no terminal)"
+pubd1=$(m ds4_continuation_records_published_total)
+shedd1=$(m 'ds4_requests_shed_total{reason="slow_reader"}')
+[ "${pubd1:-0}" -eq "${pubd0:-0}" ] || fail "reserve_fail: reservation failure still published (${pubd0:-?} -> ${pubd1:-?})"
+[ "${shedd1:-0}" -gt "${shedd0:-0}" ] || fail "reserve_fail: slow_reader shed never counted (${shedd0:-?} -> ${shedd1:-?})"
+[ "$(srv_count 'terminal reservation failed')" -ge 1 ] || fail "reserve_fail: reservation log line missing"
+[ "$(m ds4_continuation_records_live)" -eq 0 ] || fail "reserve_fail: a record is live after a failed reservation"
+log "reserve_fail PASS (reservation failure published nothing; shed ${shedd0:-0} -> $shedd1)"
+
+c=$(post reserve_healthy /v1/chat/completions '{"model":"m","max_tokens":32,"temperature":0,"messages":[{"role":"user","content":"Say hello."}]}')
+code_is reserve_healthy "$c" 200
+has reserve_healthy '"content"'
+log "reserve_healthy PASS (non-publishing traffic unaffected by the tiny cap)"
 
 ssh "$R" "pkill -x ds4-server; exit 0"
 log "ALL LEGS PASS — artifacts in $OUT"
