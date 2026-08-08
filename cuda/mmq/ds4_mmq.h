@@ -62,6 +62,14 @@ int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
+// exaone prefill attention on tensor cores (flash-attention style; see
+// ds4_fattn.cu).  head_dim must be 128.  Returns 0 on success, -1 when the
+// shape or architecture is unsupported (caller falls back to the anchor).
+int ds4_mmq_exaone_prefill_attn_hmma(
+        float *heads, const float *q, const void *kv,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
+        int kv_cap, int window, float scale, cudaStream_t stream);
+
 int ds4_mmq_q8_0_dense(
     const void  * W_q8_0,
     const float * X_f32,

@@ -32006,6 +32006,22 @@ extern "C" int ds4_gpu_exaone_attention_prefill_tensor(
     }
     const uint32_t shmem = (head_dim / 32u) * head_dim * (uint32_t)sizeof(float);
     const float scale = rsqrtf((float)head_dim);
+    /* Tensor-core path: Q·K^T and P·V as m16n8k16 HMMA with flash-attention
+     * online softmax between them (cuda/mmq/ds4_fattn.cu).  This is where the
+     * quadratic prefill term goes to stop being shuffle-bound; the anchor
+     * remains for small chunks, non-128 head_dim, pre-Ampere parts, and
+     * DS4_EXAONE_NO_PREFILL_HMMA=1 (diagnostic). */
+    static int hmma_en = -1;
+    if (hmma_en < 0) hmma_en = getenv("DS4_EXAONE_NO_PREFILL_HMMA") == NULL;
+    if (hmma_en && head_dim == 128u && n_tokens >= 64u) {
+        const int rc = ds4_mmq_exaone_prefill_attn_hmma(
+                (float *)heads->ptr, (const float *)q->ptr, kv->ptr,
+                (int)n_tokens, (int)pos0, (int)n_head, (int)n_head_kv,
+                (int)head_dim, (int)kv_cap, (int)window, scale,
+                cuda_decode_stream());
+        if (rc == 0) return 1;
+        /* -1: shape/arch unsupported -- fall through to the anchor. */
+    }
     /* Tiled path: a K/V tile staged once serves EXAONE_PF_TQ query rows,
      * cutting KV traffic by TQ -- and measured a WASH end to end on GB10
      * (32K cold prefill 32.2 t/s tiled vs 33.9 anchor; 8K 47.3 vs 47.9).

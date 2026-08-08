@@ -283,6 +283,115 @@ static void test_attention_decode_split(void) {
     free(v); free(k); free(q);
 }
 
+/* The HMMA prefill path vs the CPU reference, plus a wall-clock A/B against
+ * the anchor on a deep span -- the reason the kernel exists.  f16 scores mean
+ * a looser tolerance than the f32 anchor's; 2e-2 relative is the quant-noise
+ * class the routed matmuls already use. */
+static void test_attention_prefill_hmma(int sliding) {
+    const uint32_t n_tok  = 512;
+    const uint32_t pos0   = 4096;
+    const uint32_t window = sliding ? 128u : 0u;
+    const uint32_t kv_cap = pos0 + n_tok + 64u;
+    const uint32_t kv_dim = T_HEAD_KV * T_HEAD_DIM;
+
+    uint64_t s = 777777;
+    const size_t qn  = (size_t)n_tok * T_HEAD * T_HEAD_DIM;
+    const size_t kvn = (size_t)(pos0 + n_tok) * kv_dim;
+    float *q = xmalloc(qn * sizeof(float));
+    float *k = xmalloc(kvn * sizeof(float));
+    float *v = xmalloc(kvn * sizeof(float));
+    for (size_t i = 0; i < qn; i++)  q[i] = frand(&s);
+    for (size_t i = 0; i < kvn; i++) { k[i] = frand(&s) * 0.5f; v[i] = frand(&s) * 0.5f; }
+
+    ds4_gpu_tensor *gq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * sizeof(float));
+    ds4_gpu_tensor *gv = ds4_gpu_tensor_alloc(kvn * sizeof(float));
+    ds4_gpu_tensor *ring = ds4_gpu_tensor_alloc((size_t)kv_cap * kv_dim * 2u * sizeof(uint16_t));
+    ds4_gpu_tensor *go = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor_write(gq, 0, q, qn * sizeof(float));
+    ds4_gpu_tensor_write(gk, 0, k, kvn * sizeof(float));
+    ds4_gpu_tensor_write(gv, 0, v, kvn * sizeof(float));
+    if (!ds4_gpu_exaone_kv_store_tensor(ring, gk, gv, kv_dim, pos0 + n_tok, 0, kv_cap) ||
+        !ds4_gpu_exaone_attention_prefill_tensor(go, gq, ring, n_tok, pos0,
+                                                 T_HEAD, T_HEAD_KV, T_HEAD_DIM,
+                                                 kv_cap, window)) {
+        printf("hmma prefill launch failed\n"); g_fail++; return;
+    }
+    float *got = xmalloc(qn * sizeof(float));
+    ds4_gpu_tensor_read(go, 0, got, qn * sizeof(float));
+
+    /* CPU reference over the stored f16 ring. */
+    uint16_t *ringh = xmalloc((size_t)kv_cap * kv_dim * 2u * sizeof(uint16_t));
+    ds4_gpu_tensor_read(ring, 0, ringh, (size_t)kv_cap * kv_dim * 2u * sizeof(uint16_t));
+    float *want = xmalloc(qn * sizeof(float));
+    for (uint32_t t = 0; t < n_tok; t += 37) {   /* sampled rows keep it fast */
+        const uint32_t p = pos0 + t;
+        const uint32_t first = (window && p + 1u > window) ? p + 1u - window : 0u;
+        cpu_attn(want + (size_t)t * T_HEAD * T_HEAD_DIM,
+                 q + (size_t)t * T_HEAD * T_HEAD_DIM,
+                 ringh, T_HEAD, T_HEAD_KV, T_HEAD_DIM, kv_cap, first, p);
+    }
+    double mabs = 0.0, mrel = 0.0;
+    for (uint32_t t = 0; t < n_tok; t += 37) {
+        for (size_t i = 0; i < (size_t)T_HEAD * T_HEAD_DIM; i++) {
+            const size_t off = (size_t)t * T_HEAD * T_HEAD_DIM + i;
+            const double d = fabs((double)got[off] - (double)want[off]);
+            const double m = fmax(fabs((double)got[off]), fabs((double)want[off]));
+            if (d > mabs) mabs = d;
+            if (m > 1e-3 && d / m > mrel) mrel = d / m;
+        }
+    }
+    report(sliding ? "hmma prefill vs cpu (window 128)"
+                   : "hmma prefill vs cpu (full, deep)", mabs, mrel, 5e-3, 2e-2);
+
+    /* Wall-clock A/B on the same span. */
+    {
+        struct timespec t0, t1;
+        const int reps = 5;
+        ds4_gpu_synchronize();
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int r = 0; r < reps; r++)
+            ds4_gpu_exaone_attention_prefill_tensor(go, gq, ring, n_tok, pos0,
+                                                    T_HEAD, T_HEAD_KV, T_HEAD_DIM,
+                                                    kv_cap, window);
+        ds4_gpu_synchronize();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double hmma_ms = ((t1.tv_sec - t0.tv_sec) * 1e3 +
+                                (t1.tv_nsec - t0.tv_nsec) / 1e6) / reps;
+        /* Anchor timing: the entry's env gate latches on first use, so run
+         * the anchor by staying under the HMMA path's 64-row threshold --
+         * 8-row slices do the same total (query, key) scans the anchor would
+         * in one launch, plus 64x the launch overhead, which only flatters
+         * the anchor's number. */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int r = 0; r < reps; r++)
+            for (uint32_t t = 0; t < n_tok; t += 8) {
+                ds4_gpu_tensor *qv2 = ds4_gpu_tensor_view(gq,
+                        (uint64_t)t * T_HEAD * T_HEAD_DIM * sizeof(float),
+                        (uint64_t)8 * T_HEAD * T_HEAD_DIM * sizeof(float));
+                ds4_gpu_tensor *ov2 = ds4_gpu_tensor_view(go,
+                        (uint64_t)t * T_HEAD * T_HEAD_DIM * sizeof(float),
+                        (uint64_t)8 * T_HEAD * T_HEAD_DIM * sizeof(float));
+                ds4_gpu_exaone_attention_prefill_tensor(ov2, qv2, ring, 8,
+                        pos0 + t, T_HEAD, T_HEAD_KV, T_HEAD_DIM, kv_cap, window);
+                ds4_gpu_tensor_free(qv2);
+                ds4_gpu_tensor_free(ov2);
+            }
+        ds4_gpu_synchronize();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double anchor_ms = ((t1.tv_sec - t0.tv_sec) * 1e3 +
+                                  (t1.tv_nsec - t0.tv_nsec) / 1e6) / reps;
+        printf("%-38s hmma %.1f ms vs anchor %.1f ms (%.2fx)\n",
+               sliding ? "hmma prefill speed (window)" : "hmma prefill speed (deep)",
+               hmma_ms, anchor_ms, anchor_ms / hmma_ms);
+    }
+
+    free(want); free(ringh); free(got);
+    ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(ring);
+    ds4_gpu_tensor_free(gv); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gq);
+    free(v); free(k); free(q);
+}
+
 static void test_attention(int sliding) {
     const uint32_t window = sliding ? 128u : 0u;
     const uint32_t pos    = sliding ? 300u : 300u;
@@ -393,11 +502,15 @@ static void test_attention_prefill(int sliding) {
                  q + (size_t)t * T_HEAD * T_HEAD_DIM,
                  kv, T_HEAD, T_HEAD_KV, T_HEAD_DIM, kv_cap, first, t);
     }
+    /* The ship path computes scores in f16 (HMMA), so the entry's agreement
+     * with the f32 mirror is the f16 class, not 2e-5; the tight f32 bound
+     * still applies to the anchor through the decode tests and the shallow
+     * dispatch.  Residual errors from a wrong mask or slot are O(0.1). */
     diff_f32(sliding ? "attention prefill (window 128)"
                      : "attention prefill (full, NoPE)",
              got + (size_t)t0 * T_HEAD * T_HEAD_DIM,
              want + (size_t)t0 * T_HEAD * T_HEAD_DIM,
-             (size_t)(n_tok - t0) * T_HEAD * T_HEAD_DIM, 2e-5, 2e-5);
+             (size_t)(n_tok - t0) * T_HEAD * T_HEAD_DIM, 5e-3, 2e-2);
 
     free(want); free(got);
     ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(gq);
@@ -490,7 +603,8 @@ static uint32_t prefill_vs_incremental_bad_rows(uint32_t kv_cap, uint32_t n_tok,
                 const double d = fabs((double)a[t * row + i] - (double)b[t * row + i]);
                 if (d > worst) worst = d;
             }
-            if (worst > 2e-5) bad++;
+            if (worst > 5e-3) bad++;   /* f16-score class passes; a missing
+                                        * or stale window is O(0.1). */
         }
         free(a); free(b);
     }
@@ -733,6 +847,8 @@ int main(int argc, char **argv) {
     test_attention_decode_split();
     test_attention_prefill(1);
     test_attention_prefill(0);
+    test_attention_prefill_hmma(0);
+    test_attention_prefill_hmma(1);
     test_prefill_chunk_residency();
     test_router(map, map_size, bias_off);
     test_swiglu_and_combine();
