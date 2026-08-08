@@ -975,6 +975,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
+    if (ds4_engine_is_exaone_moe(engine)) return "k-exaone-236b-a23b";
     return ds4_engine_model_id(engine) == 1 ?
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
@@ -983,6 +984,8 @@ static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4-pro") ||
+            !strcmp(id, "k-exaone-236b-a23b") ||
+            !strcmp(id, "K-EXAONE-236B-A23B") ||
             !strcmp(id, "glm-5.2") ||
             !strcmp(id, "glm-5.2-chat") ||
             !strcmp(id, "glm-5.2-no-think") ||
@@ -12592,6 +12595,12 @@ static bool send_models(server *s, int fd) {
         append_model_json(&b, s, "glm-5.2-chat");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-reasoner");
+    } else if (ds4_engine_is_exaone_moe(s->engine)) {
+        /* One id, the loaded model's own.  Any client-sent id still serves
+         * the loaded GGUF; this is what pickers display. */
+        append_model_json(&b, s, "k-exaone-236b-a23b");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "K-EXAONE-236B-A23B");
     } else {
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
