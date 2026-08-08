@@ -353,7 +353,7 @@ log "metrics_final PASS (published=$pubF resolved=$resF missed=$misF demoted=$de
 # to serial and its win demoted the pin record).  The leg tests PIN
 # semantics; the floor has its own gate (mem_floor_gate).  The admission
 # it unblocks costs ~124 MiB against ~1.7 GiB available -- safe.
-BOOT_ENV="DS4_MEM_FLOOR_GB=0 DS4_CONT_GRACE_S=6 DS4_CONT_TTL_S=45 $TOOLS_OFF" boot
+BOOT_ENV="DS4_MEM_FLOOR_GB=0 DS4_CONT_GRACE_S=6 DS4_CONT_TTL_S=45 DS4_CONT_HOLD_SHED_S=6 $TOOLS_OFF" boot
 
 t1(){ # $1=name $2=user text -> publishes a tool turn; sets T1_ID.
       # Precondition: no leftover LIVE record (a prior T2 may have chained).

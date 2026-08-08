@@ -8290,6 +8290,11 @@ typedef struct {
     double grace_s;             /* DS4_CONT_GRACE_S, default 60 */
     double ttl_s;               /* DS4_CONT_TTL_S, default 300 */
     double pin_deadline_s;      /* DS4_CONT_PIN_DEADLINE_S, default 60 */
+    double hold_shed_s;         /* DS4_CONT_HOLD_SHED_S, default 5: how long
+                                 * the serial SEAT sheds non-continuing work
+                                 * after a tool turn (v0.5.6.1).  Bounded by
+                                 * grace; 0 = never shed (always yield).
+                                 * grace/ttl keep governing the RECORD. */
 } cont_registry;
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -9045,11 +9050,13 @@ static void request_acquire_cont_pin(server *s, request *r) {
  * rather than reusing an owner in the grace period" + "admission waits or
  * sheds ... instead of violating a pin").  A serial request that does not
  * continue the LIVE record sheds 503+Retry-After while the record is inside
- * its grace window or validly hard-pinned by a queued T2.  Continuations
- * pass (the full resolve still runs in generate_job); everything passes
- * once neither protection is active (and then demotes the record exactly
- * as before).  Continuous/static-lane work never reaches this: only the
- * serial session is the owner being protected. */
+ * its SEAT-SHED window (v0.5.6.1: DS4_CONT_HOLD_SHED_S, default 5 s -- NOT
+ * the whole grace; see the window comment below for why) or validly
+ * hard-pinned by a queued T2.  Continuations pass (the full resolve still
+ * runs in generate_job); everything passes once neither protection is
+ * active (and then demotes the record exactly as before).
+ * Continuous/static-lane work never reaches this: only the serial session
+ * is the owner being protected. */
 static bool cont_registry_serial_hold(server *s, const request *req,
                                       double now, int *retry_after) {
     if (retry_after) *retry_after = 1;
@@ -9077,15 +9084,31 @@ static bool cont_registry_serial_hold(server *s, const request *req,
             return false;
         }
     }
-    const double grace_left = s->creg.grace_s > 0 ?
-        s->creg.grace_s - (now - rec->publish_time) : 0.0;
+    /* v0.5.6.1: the SEAT sheds for DS4_CONT_HOLD_SHED_S (default 5 s,
+     * bounded by grace), not for the whole grace period.  A client that
+     * COMPACTS its transcript after a tool turn presents no live call ids
+     * (the round is folded into the summary) and under the old rule shed
+     * for the full 60 s -- longer than any real client's retry budget, a
+     * hard session kill (the 08-08 codex compaction e2e: 30 sheds, client
+     * dead).  Shedding-when-wrong kills the shed client; yielding-when-
+     * wrong only degrades the true continuation to the native 409 +
+     * corrective replay (interruption checkpoints make that cheap).  So
+     * the seat protection covers fast tool round trips only; after the
+     * window non-continuing work takes the seat and the record survives
+     * on ids alone (grace/TTL semantics unchanged).  A queued T2's hard
+     * pin still holds to its deadline: a pin means the continuation HAS
+     * arrived, so shedding others is correct for as long as it waits. */
+    const double shed_w = s->creg.hold_shed_s < s->creg.grace_s
+                        ? s->creg.hold_shed_s : s->creg.grace_s;
+    const double shed_left = shed_w > 0 ?
+        shed_w - (now - rec->publish_time) : 0.0;
     const bool pinned = rec->hard_refs > 0 &&
         s->creg.pin_deadline_s > 0 && now < rec->pin_expiry;
-    if (grace_left <= 0 && !pinned) {
+    if (shed_left <= 0 && !pinned) {
         pthread_mutex_unlock(&s->tool_mu);
         return false;
     }
-    double left = grace_left;
+    double left = shed_left;
     if (pinned && rec->pin_expiry - now > left) left = rec->pin_expiry - now;
     if (retry_after) {
         *retry_after = (int)(left + 0.999);
@@ -17602,11 +17625,14 @@ int main(int argc, char **argv) {
         s.creg.ttl_s = tt ? atof(tt) : 300.0;
         const char *pd = getenv("DS4_CONT_PIN_DEADLINE_S");
         s.creg.pin_deadline_s = pd ? atof(pd) : 60.0;
+        const char *hs = getenv("DS4_CONT_HOLD_SHED_S");
+        s.creg.hold_shed_s = hs ? atof(hs) : 5.0;
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: continuation retention: grace=%.0fs ttl=%.0fs "
-                   "pin_deadline=%.0fs records<=%d (0 = off/default)",
+                   "pin_deadline=%.0fs hold_shed=%.0fs records<=%d "
+                   "(0 = off/default)",
                    s.creg.grace_s, s.creg.ttl_s, s.creg.pin_deadline_s,
-                   s.creg.max_records);
+                   s.creg.hold_shed_s, s.creg.max_records);
     }
     s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir) {
@@ -20438,6 +20464,7 @@ static void test_cont_registry_grace_and_pin_hold(void) {
     s.creg.grace_s = 60.0;
     s.creg.ttl_s = 300.0;
     s.creg.pin_deadline_s = 60.0;
+    s.creg.hold_shed_s = 5.0;   /* v0.5.6.1 seat-shed window */
 
     {
         tool_calls calls = {0};
@@ -20451,9 +20478,10 @@ static void test_cont_registry_grace_and_pin_hold(void) {
     request unrelated;
     request_init(&unrelated, REQ_CHAT, 64);
     int retry = 0;
-    /* Inside grace: non-continuing serial work sheds, honest Retry-After. */
+    /* Inside the seat-shed window: non-continuing serial work sheds, and
+     * Retry-After is the WINDOW remainder (<= 5), never the grace. */
     TEST_ASSERT(cont_registry_serial_hold(&s, &unrelated, now_sec(), &retry));
-    TEST_ASSERT(retry >= 1 && retry <= 60);
+    TEST_ASSERT(retry >= 1 && retry <= 5);
 
     /* The continuation itself passes the hold. */
     request t2;
@@ -20461,6 +20489,18 @@ static void test_cont_registry_grace_and_pin_hold(void) {
     t2.api = API_ANTHROPIC;
     id_list_push_unique(&t2.anthropic_live_call_ids, "toolu_hold");
     TEST_ASSERT(!cont_registry_serial_hold(&s, &t2, now_sec(), &retry));
+
+    /* v0.5.6.1 (codex compaction kill): past the seat window but INSIDE
+     * grace, a non-continuing request takes the seat instead of shedding
+     * -- the record itself stays LIVE for id resolution. */
+    pthread_mutex_lock(&s.tool_mu);
+    s.creg.serial_live->publish_time -= 10.0;
+    pthread_mutex_unlock(&s.tool_mu);
+    TEST_ASSERT(!cont_registry_serial_hold(&s, &unrelated, now_sec(), &retry));
+    pthread_mutex_lock(&s.tool_mu);
+    TEST_ASSERT(s.creg.serial_live != NULL &&
+                s.creg.serial_live->state == CONT_REC_LIVE_FRONTIER);
+    pthread_mutex_unlock(&s.tool_mu);
 
     /* Grace over, no pin: unrelated work passes (and would demote). */
     pthread_mutex_lock(&s.tool_mu);
