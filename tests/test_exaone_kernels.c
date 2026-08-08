@@ -334,6 +334,138 @@ static void test_attention_prefill(int sliding) {
     free(v); free(k); free(q); free(kv);
 }
 
+/* Prefill a chunk in one call, and the same tokens one at a time, and count
+ * the rows where the two disagree.
+ *
+ * The parity checks above compare the GPU against a CPU mirror of the *same*
+ * ring, so a ring that has already dropped a position agrees with itself and
+ * the check passes.  The engine's actual contract is stronger: a prompt
+ * prefilled in one n_tok chunk must produce what those tokens produce fed one
+ * at a time.  Token-at-a-time is the ground truth here because each step only
+ * ever reads the window it just finished writing, which any ring at least
+ * `window` wide still holds.
+ *
+ * For a sliding layer that contract holds only when the ring is wide enough
+ * for the chunk *on top of* the window -- a row at position p reads back to
+ * p-window+1, and the chunk's later positions have meanwhile taken those
+ * slots.  Returns the disagreeing row count so the caller can assert the
+ * boundary instead of just "somewhere". */
+static uint32_t prefill_vs_incremental_bad_rows(uint32_t kv_cap, uint32_t n_tok,
+                                                uint32_t window) {
+    const uint32_t kv_dim = T_HEAD_KV * T_HEAD_DIM;
+    const size_t   row    = (size_t)T_HEAD * T_HEAD_DIM;
+    const size_t   qn     = (size_t)n_tok * row;
+    const size_t   kvn    = (size_t)n_tok * kv_dim;
+
+    uint64_t s = 90210;
+    float *q = xmalloc(qn * sizeof(float));
+    float *k = xmalloc(kvn * sizeof(float));
+    float *v = xmalloc(kvn * sizeof(float));
+    for (size_t i = 0; i < qn; i++) q[i] = frand(&s);
+    for (size_t i = 0; i < kvn; i++) { k[i] = frand(&s) * 0.5f; v[i] = frand(&s) * 0.5f; }
+
+    ds4_gpu_tensor *gq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * sizeof(float));
+    ds4_gpu_tensor *gv = ds4_gpu_tensor_alloc(kvn * sizeof(float));
+    ds4_gpu_tensor_write(gq, 0, q, qn * sizeof(float));
+    ds4_gpu_tensor_write(gk, 0, k, kvn * sizeof(float));
+    ds4_gpu_tensor_write(gv, 0, v, kvn * sizeof(float));
+
+    const size_t ring_floats = (size_t)kv_cap * kv_dim;
+    ds4_gpu_tensor *ring_chunk = ds4_gpu_tensor_alloc(ring_floats * 2u * sizeof(uint16_t));
+    ds4_gpu_tensor *ring_incr  = ds4_gpu_tensor_alloc(ring_floats * 2u * sizeof(uint16_t));
+    ds4_gpu_tensor *out_chunk  = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *out_incr   = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor_fill_f32(ring_chunk, 0.0f, ring_floats);
+    ds4_gpu_tensor_fill_f32(ring_incr, 0.0f, ring_floats);
+
+    uint32_t bad = UINT32_MAX;
+    if (!ds4_gpu_exaone_kv_store_tensor(ring_chunk, gk, gv, kv_dim, n_tok, 0, kv_cap) ||
+        !ds4_gpu_exaone_attention_prefill_tensor(out_chunk, gq, ring_chunk, n_tok, 0,
+                                                 T_HEAD, T_HEAD_KV, T_HEAD_DIM,
+                                                 kv_cap, window)) {
+        printf("chunked prefill launch failed\n");
+        goto done;
+    }
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        ds4_gpu_tensor *kr = ds4_gpu_tensor_view(gk, (uint64_t)t * kv_dim * sizeof(float),
+                                                 kv_dim * sizeof(float));
+        ds4_gpu_tensor *vr = ds4_gpu_tensor_view(gv, (uint64_t)t * kv_dim * sizeof(float),
+                                                 kv_dim * sizeof(float));
+        ds4_gpu_tensor *qr = ds4_gpu_tensor_view(gq, (uint64_t)t * row * sizeof(float),
+                                                 row * sizeof(float));
+        ds4_gpu_tensor *orow = ds4_gpu_tensor_view(out_incr, (uint64_t)t * row * sizeof(float),
+                                                   row * sizeof(float));
+        const int ok = kr && vr && qr && orow &&
+            ds4_gpu_exaone_kv_store_tensor(ring_incr, kr, vr, kv_dim, 1u, t, kv_cap) &&
+            ds4_gpu_exaone_attention_decode_tensor(orow, qr, ring_incr, T_HEAD,
+                                                   T_HEAD_KV, T_HEAD_DIM,
+                                                   kv_cap, t, window);
+        ds4_gpu_tensor_free(kr); ds4_gpu_tensor_free(vr);
+        ds4_gpu_tensor_free(qr); ds4_gpu_tensor_free(orow);
+        if (!ok) { printf("incremental prefill launch failed at %u\n", t); goto done; }
+    }
+
+    {
+        float *a = xmalloc(qn * sizeof(float));
+        float *b = xmalloc(qn * sizeof(float));
+        ds4_gpu_tensor_read(out_chunk, 0, a, qn * sizeof(float));
+        ds4_gpu_tensor_read(out_incr, 0, b, qn * sizeof(float));
+        bad = 0;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            double worst = 0.0;
+            for (size_t i = 0; i < row; i++) {
+                const double d = fabs((double)a[t * row + i] - (double)b[t * row + i]);
+                if (d > worst) worst = d;
+            }
+            if (worst > 2e-5) bad++;
+        }
+        free(a); free(b);
+    }
+
+done:
+    ds4_gpu_tensor_free(out_incr); ds4_gpu_tensor_free(out_chunk);
+    ds4_gpu_tensor_free(ring_incr); ds4_gpu_tensor_free(ring_chunk);
+    ds4_gpu_tensor_free(gv); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gq);
+    free(v); free(k); free(q);
+    return bad;
+}
+
+/* How many leading rows an undersized ring must get wrong.
+ *
+ * The whole chunk is stored before any row's attention runs, so a ring of
+ * `cap` is left holding positions [n_tok-cap, n_tok).  Row t is right only if
+ * its entire window sits inside that.  Note where this lands at cap ==
+ * window: first_good == n_tok-1, the chunk's LAST row and nothing else.  An
+ * undersized ring is not a tail-quality issue, it is a near-total one. */
+static uint32_t expected_bad_rows(uint32_t cap, uint32_t n_tok, uint32_t window) {
+    const uint32_t resident_from = n_tok > cap ? n_tok - cap : 0u;
+    if (resident_from == 0u) return 0u;
+    const uint32_t first_good = resident_from + window - 1u;
+    return first_good < n_tok ? first_good : n_tok;
+}
+
+/* The sliding ring must cover the window plus one prefill chunk -- the rule
+ * metal_graph_raw_cap_for_context already applies on the DeepSeek/GLM side. */
+static void test_prefill_chunk_residency(void) {
+    const uint32_t n_tok = 200, window = 128;
+
+    const uint32_t tight = prefill_vs_incremental_bad_rows(window, n_tok, window);
+    const uint32_t sized = prefill_vs_incremental_bad_rows(window + n_tok, n_tok, window);
+
+    printf("%-38s bad_rows=%u expected=%u  %s\n",
+           "sliding ring == window (undersized)", tight,
+           expected_bad_rows(window, n_tok, window),
+           tight == expected_bad_rows(window, n_tok, window) ? "ok" : "FAIL");
+    if (tight != expected_bad_rows(window, n_tok, window)) g_fail++;
+
+    printf("%-38s bad_rows=%u  %s\n",
+           "sliding ring == window + chunk", sized,
+           sized == 0u ? "ok" : "FAIL");
+    if (sized != 0u) g_fail++;
+}
+
 static void test_router(void *map, uint64_t map_size, uint64_t bias_off) {
     const uint32_t n_tok = 4;
     uint64_t s = 7;
@@ -529,6 +661,7 @@ int main(int argc, char **argv) {
     test_attention(0);
     test_attention_prefill(1);
     test_attention_prefill(0);
+    test_prefill_chunk_residency();
     test_router(map, map_size, bias_off);
     test_swiglu_and_combine();
 

@@ -11183,6 +11183,17 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
                        old_pos, rewind_to);
+        } else if (common > 0 &&
+                   old_pos - common <= ds4_session_exaone_rewind_span(slot->session)) {
+            /* exaone resumes a diverged prompt from the shared prefix inside
+             * ds4_session_sync, so the prefix really is reused and the fallback
+             * searches below (text prefix, disk KV) would only re-find what the
+             * live session already holds.  Ask the engine for the bound rather
+             * than restating it here; a span of 0 means it cannot, and this
+             * arm does not fire. */
+            cached = common == j->req.prompt.len ? common - 1 : common;
+            cache_source = "memory-prefix";
+            cache_diag.rewind_to = cached;
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
             cache_source = cached > 0 ? "memory-token" : "none";

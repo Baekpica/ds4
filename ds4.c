@@ -49886,8 +49886,43 @@ static bool exaone_graph_layer_is_sliding(uint32_t il) {
     return exaone_layer_is_sliding(il);
 }
 
-static uint32_t exaone_graph_layer_kv_cap(uint32_t il, uint32_t ctx_size) {
-    return exaone_graph_layer_is_sliding(il) ? DS4_N_SWA : ctx_size;
+/* The prefill chunk actually used, so the KV estimate and the allocation
+ * cannot disagree about it. */
+static uint32_t exaone_graph_prefill_cap_for(uint32_t prefill_chunk,
+                                             uint32_t ctx_size) {
+    uint32_t cap = prefill_chunk ? prefill_chunk : 2048u;
+    if (cap > ctx_size) cap = ctx_size;
+    return cap;
+}
+
+/* Ring capacity for one layer's KV.
+ *
+ * Full-attention layers keep the whole context, so `position % kv_cap` in the
+ * store and attention kernels is the identity and this is just ctx_size.
+ *
+ * Sliding layers keep a ring, and it has to be wider than the window.  A
+ * prefill chunk stores all of its rows before any of them attends, so a ring
+ * of exactly DS4_N_SWA is left holding only the chunk's last DS4_N_SWA
+ * positions -- and then every earlier row in the chunk reads slots that a
+ * later position has already taken.  At chunk 2048 that is all but the final
+ * row.  Covering window + chunk is the rule the DeepSeek/GLM path already
+ * states in metal_graph_raw_cap_for_context ("must cover the previous window
+ * plus the current ubatch"); the exaone port did not carry it over.
+ *
+ * The spare width is also what makes a partial-prefix rewind possible: a
+ * resumed prefill still needs the window that preceded its restart point,
+ * which survives only while the rewind stays inside cap - window.
+ * ds4_session_exaone_rewind_span() states that bound and reads it back from
+ * here, so widening this widens the rewind and narrowing it narrows both.
+ *
+ * `prefill_cap` is 0 for a ring only ever written a row at a time, which is
+ * what the MTP block's private KV is. */
+static uint32_t exaone_graph_layer_kv_cap(uint32_t il, uint32_t ctx_size,
+                                          uint32_t prefill_cap) {
+    if (!exaone_graph_layer_is_sliding(il)) return ctx_size;
+    uint64_t cap = (uint64_t)DS4_N_SWA + prefill_cap;
+    if (cap > ctx_size) cap = ctx_size;
+    return (uint32_t)cap;
 }
 
 static void exaone_graph_free(ds4_exaone_gpu_graph *g) {
@@ -49933,8 +49968,7 @@ static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
     g->n_embd   = DS4_N_EMBD;
     g->q_dim    = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     g->kv_dim   = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-    g->prefill_cap = prefill_chunk ? prefill_chunk : 2048u;
-    if (g->prefill_cap > ctx_size) g->prefill_cap = ctx_size;
+    g->prefill_cap = exaone_graph_prefill_cap_for(prefill_chunk, ctx_size);
 
     const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const uint32_t n_used = DS4_N_EXPERT_USED;
@@ -50009,7 +50043,7 @@ static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
     uint64_t kv_bytes = 0;
     for (uint32_t il = 0; il < n_exec; il++) {
         if (!weights->layer[il].attn_q) continue;
-        const uint32_t cap = exaone_graph_layer_kv_cap(il, ctx_size);
+        const uint32_t cap = exaone_graph_layer_kv_cap(il, ctx_size, g->prefill_cap);
         const uint64_t bytes = (uint64_t)cap * g->kv_dim * 2u * sizeof(uint16_t);
         g->layer_kv[il] = ds4_gpu_tensor_alloc(bytes);
         if (!g->layer_kv[il]) {
@@ -50301,7 +50335,9 @@ static bool exaone_graph_mtp_ensure(ds4_exaone_gpu_graph *g) {
     if (DS4_N_NEXTN_PREDICT == 0u) return false;
 
     const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
-    const uint32_t cap = exaone_graph_layer_kv_cap(il, g->ctx_size);
+    /* Chunk 0: this ring is stepped one accepted position at a time, so it
+     * needs the window and nothing more. */
+    const uint32_t cap = exaone_graph_layer_kv_cap(il, g->ctx_size, 0u);
     const uint64_t kv_bytes =
         (uint64_t)cap * g->kv_dim * 2u * sizeof(uint16_t);
     ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc(kv_bytes);
@@ -58377,10 +58413,12 @@ static uint64_t ds4_engine_kv_estimate_bytes(const ds4_engine *e, uint32_t ctx_s
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_EXAONE_MOE) return 0;
     const uint64_t row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u * sizeof(uint16_t);
     const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint32_t prefill_cap =
+        exaone_graph_prefill_cap_for(e->prefill_chunk, ctx_size);
     uint64_t total = 0;
     for (uint32_t il = 0; il < n_exec; il++) {
         if (!e->weights.layer[il].attn_q) continue;
-        total += (uint64_t)exaone_graph_layer_kv_cap(il, ctx_size) * row;
+        total += (uint64_t)exaone_graph_layer_kv_cap(il, ctx_size, prefill_cap) * row;
     }
     return total;
 }
@@ -59989,6 +60027,49 @@ int ds4_test_exaone_mtp_stats(const ds4_session *s,
 }
 #endif
 #endif
+
+/* How far back this session's KV can be rewound and still be resumable.
+ *
+ * A prefill resuming at position p reads the sliding layers' window
+ * [p-DS4_N_SWA+1, p], and those rings hold only the last kv_cap positions
+ * that were written.  Rewinding from `live` to p is therefore safe exactly
+ * while live - p <= kv_cap - DS4_N_SWA + 1.  Full-attention layers are indexed
+ * by position and never evict, so they do not bound this -- the narrowest
+ * sliding ring does, and it is read back from the graph rather than recomputed
+ * so the bound cannot drift from the allocation.
+ *
+ * Once kv_cap reaches ctx_size the modulo is the identity, nothing is ever
+ * evicted, and the whole context is rewindable.
+ *
+ * 0 for anything that is not a live exaone GPU session, which makes callers'
+ * `live - start > span` test fall through to a cold prefill. */
+int ds4_session_exaone_rewind_span(ds4_session *s) {
+#ifdef DS4_NO_GPU
+    (void)s;
+    return 0;
+#else
+    if (!s || !ds4_session_is_exaone(s) || !s->exaone_graph_ready) return 0;
+    const ds4_exaone_gpu_graph *g = &s->exaone_graph;
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    uint32_t narrowest = 0;
+    bool bounded = false;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        if (!g->layer_kv[il] || !exaone_graph_layer_is_sliding(il)) continue;
+        if (!bounded || g->layer_kv_cap[il] < narrowest) {
+            narrowest = g->layer_kv_cap[il];
+            bounded = true;
+        }
+    }
+    if (!bounded) return (int)g->ctx_size;
+    /* While the session is shorter than the ring nothing has been evicted
+     * yet, so all of it is still rewindable -- and a short chat, which is
+     * where multi-turn reuse matters most, lives entirely in that case. */
+    const int live = s->checkpoint_valid ? s->checkpoint.len : 0;
+    if ((uint32_t)live <= narrowest) return live;
+    if (narrowest <= DS4_N_SWA) return 0;
+    return (int)(narrowest - DS4_N_SWA + 1u);
+#endif
+}
 
 static bool ds4_session_tp_leader(const ds4_session *s) {
     return s && s->engine && s->engine->tp.active && s->engine->tp.rank == 0;
@@ -61656,17 +61737,36 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
 
         /* Prefix reuse. The KV caches already hold every position of the
-         * common prefix, so only the tail needs computing. The sliding
-         * layers' rings are valid for the last DS4_N_SWA positions of what
-         * was written, which is exactly what their attention will read. */
+         * common prefix, so only the tail needs computing.
+         *
+         * The shared prefix is used even when the prompt DIVERGES from what
+         * the session holds, not only when it extends it. That distinction is
+         * the whole cost of multi-turn chat: a client that replays the
+         * assistant's own reply as text re-tokenizes it, so a continuation
+         * sharing 6984 of 7086 tokens misses an is-a-prefix test by the last
+         * hundred and pays a full cold prefill for all seven thousand.
+         * Resuming at the divergence point pays for the tail only.
+         *
+         * How far back that can reach is a property of the sliding ring, not
+         * a policy: a resumed prefill at `start` reads the window that
+         * precedes it, and the ring holds only the last kv_cap positions
+         * written. ds4_session_exaone_rewind_span() is that bound. Beyond it
+         * the shared prefix is genuinely gone and a cold prefill is the
+         * honest answer. Full-attention layers are position-indexed and keep
+         * everything, so they never bound this. */
         int start = 0;
-        if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
-            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
-            start = s->checkpoint.len;
-            if (start == prompt->len) start = prompt->len - 1;
-        } else {
-            s->checkpoint.len = 0;
+        if (s->checkpoint_valid) {
+            /* Both read the checkpoint as it stands now, before the rewind
+             * below truncates it. */
+            const int live = s->checkpoint.len;
+            const int span = ds4_session_exaone_rewind_span(s);
+            start = ds4_session_common_prefix(s, prompt);
+            /* Nothing new to evaluate: back up one so the forward pass below
+             * still produces logits for the final token. */
+            if (start > 0 && start == prompt->len) start = prompt->len - 1;
+            if (live - start > span) start = 0;
         }
+        s->checkpoint.len = start;
         s->mtp_draft_valid = false;
 
         for (int done = start; done < prompt->len; ) {
