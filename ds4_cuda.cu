@@ -3406,6 +3406,12 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+/* CUDA submits stream-ordered: there is no command scope to open, so the
+ * begin/end pair are compatibility stubs (begin always "succeeds"; end is a
+ * heavyweight device sync + diag readback).  Callers doing OPTIONAL
+ * bracketing (open-iff-closed, e.g. the cont-MTP rollback restore) gate on
+ * commands_scoped() == 0 and skip the pair entirely -- see ds4_gpu.h. */
+extern "C" int ds4_gpu_commands_scoped(void) { return 0; }
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 /* #9 diagnosis (2026-08-04): captured-topk live-bound violation counter.
@@ -22050,7 +22056,15 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx) {
+        uint32_t                row_idx,
+        int                     output_is_f16) {
+    /* PR #2 (Metal DSpark): mirrors the ds4_gpu.h prototype (this file
+     * carries its own extern "C" signatures).  The flag exists for the
+     * Metal backend, whose banked caller must route pool/rms/rope through
+     * an F32 scratch before an F16 comp cache; the CUDA impl resolves the
+     * cache element tier internally (FP8-primary / F16 paths), so the flag
+     * is accepted and unused here. */
+    (void)output_is_f16;
     return cuda_compressor_update_impl(0, kv_cur, sc_cur, state_kv, state_score, comp_cache,
                                        model_map, model_size, ape_offset, ape_type,
                                        norm_offset, norm_type, head_dim, ratio, pos, comp_row,
@@ -22089,7 +22103,9 @@ extern "C" int ds4_gpu_compressor_update_tail_tensor(
         int                     row_field,
         const ds4_gpu_tensor *positions,
         const ds4_gpu_tensor *seq_id,
-        uint32_t                row_idx) {
+        uint32_t                row_idx,
+        int                     output_is_f16) {
+    (void)output_is_f16;   /* see ds4_gpu_compressor_update_tensor above */
     return cuda_compressor_update_impl(1, kv_cur, sc_cur, state_kv, state_score, comp_cache,
                                        model_map, model_size, ape_offset, ape_type,
                                        norm_offset, norm_type, head_dim, ratio, pos, comp_row,

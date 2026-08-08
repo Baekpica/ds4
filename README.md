@@ -176,11 +176,16 @@ main on both reference machines (kept for history, as is
 
 ![v0.1.0 context-frontier sweep](speed-bench/v010_sweep_overlay.svg)
 
-What is *not* changed: the Metal/macOS path, the CLI, the agent, and the
-GGUF tooling are inherited from upstream and kept building and passing
-their vectors (disk KV persistence is inherited too, though the fork
-extends it — packed-native payloads and the continuous-bank tier above —
-while older checkpoints stay readable). Upstream credit for the engine this fork
+What is *not* an optimization target: the Metal/macOS path, the CLI, the
+agent, and the GGUF tooling are inherited from upstream and kept building
+and passing their vectors (disk KV persistence is inherited too, though
+the fork extends it — packed-native payloads and the continuous-bank tier
+above — while older checkpoints stay readable). Metal correctness on the
+fork's serving paths is **community-maintained**: contributions are
+welcome (see `METAL_DSPARK.md` for the community-contributed DSpark
+drafter port), gated here by compile plus the isolated Metal kernel
+regressions; end-to-end Metal measurements are the contributors' own, as
+no high-memory Metal machine is on the fork's test bench. Upstream credit for the engine this fork
 stands on is gladly given — everything in the sections below this one
 describes the shared foundation.
 

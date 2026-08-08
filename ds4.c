@@ -36738,8 +36738,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                  * ds4_gpu_tensor_copy, which blits into g_batch_cb and returns 0
                  * when none is open.  The DSpark inject block above ends the batch
                  * cb, so open one iff none is open (begin_commands returns 0 when
-                 * already open -> MTP path unchanged); close it after. */
-                const int rb_opened = ds4_gpu_begin_commands();
+                 * already open -> MTP path unchanged); close it after.  Scoped
+                 * backends only: on CUDA the copies are stream-ordered and the
+                 * begin/end pair are stubs (end = device-wide sync), so
+                 * commands_scoped() skips the bracket there entirely. */
+                const int rb_opened = ds4_gpu_commands_scoped() ? ds4_gpu_begin_commands() : 0;
                 ok = mtp_cont_rollback_restore_all(g, MS, committed_rows, vnr,
                                                    ctx->rollback_verify, &ctx->rollback_verify_fails);
                 if (rb_opened) ok = (ds4_gpu_end_commands() != 0) && ok;

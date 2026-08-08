@@ -4742,6 +4742,8 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
     }
 }
 
+int ds4_gpu_commands_scoped(void) { return 1; }
+
 int ds4_gpu_begin_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return 0;

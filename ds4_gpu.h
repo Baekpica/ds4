@@ -71,6 +71,14 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
+/* 1 iff the backend batches GPU work into explicit command scopes, i.e.
+ * begin/end_commands bracket real submission and begin returns 1 only when
+ * THIS call opened the scope (Metal).  0 when submission is stream-ordered
+ * and begin/end are compatibility stubs whose returns don't mean ownership
+ * (CUDA: begin always 1, end is a heavyweight sync).  OPTIONAL bracketing
+ * -- "open a scope iff none is open, close it iff I opened it" -- must be
+ * gated on this; unconditional top-of-scope brackets need not check. */
+int ds4_gpu_commands_scoped(void);
 int ds4_gpu_synchronize(void);
 int ds4_gpu_stream_synchronize(void);   /* task #22 diag: legacy-stream-only sync */
 
