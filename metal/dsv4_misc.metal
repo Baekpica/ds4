@@ -1325,3 +1325,99 @@ kernel void kernel_dsv4_softmax_pool(
 
     *((device float *) (dst + id*args.nb0 + ic*args.nb1)) = acc/sum;
 }
+
+/* ---------------------------------------------------------------------------
+ * DSpark drafter support kernels (Metal ports of the CUDA originals in
+ * ds4_cuda.cu: dspark_capture_mean_kernel, dspark_gather_concat_kernel,
+ * dspark_markov_step_kernel).
+ * ------------------------------------------------------------------------ */
+
+typedef struct {
+    uint n_embd;
+    uint n_hc;
+    uint n_tokens;
+    uint slot;
+    uint n_slots;
+} ds4_dspark_capture_mean_args;
+
+kernel void kernel_dspark_capture_mean(
+        constant ds4_dspark_capture_mean_args &args [[buffer(0)]],
+        device float                          *concat [[buffer(1)]],
+        const device float                    *hc     [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = args.n_embd * args.n_tokens;
+    if (gid >= n) return;
+    const uint d = gid % args.n_embd;
+    const uint t = gid / args.n_embd;
+    float acc = 0.0f;
+    for (uint h = 0; h < args.n_hc; h++)
+        acc += hc[(ulong)t * args.n_hc * args.n_embd + (ulong)h * args.n_embd + d];
+    concat[(ulong)t * args.n_slots * args.n_embd + (ulong)args.slot * args.n_embd + d] =
+        acc / (float)args.n_hc;
+}
+
+typedef struct {
+    uint n_rows;
+    uint row_floats;
+} ds4_dspark_gather_concat_args;
+
+kernel void kernel_dspark_gather_concat(
+        constant ds4_dspark_gather_concat_args &args [[buffer(0)]],
+        device float                           *dst      [[buffer(1)]],
+        const device float                     *src      [[buffer(2)]],
+        const device int                       *src_rows [[buffer(3)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = args.n_rows * args.row_floats;
+    if (gid >= n) return;
+    const uint d = gid % args.row_floats;
+    const uint r = gid / args.row_floats;
+    const int sr = src_rows[r];
+    if (sr < 0) return;
+    dst[(ulong)r * args.row_floats + d] = src[(ulong)(uint)sr * args.row_floats + d];
+}
+
+typedef struct {
+    uint blk_pos;
+    uint B;
+    uint vocab;
+    uint nb;
+} ds4_dspark_markov_step_args;
+
+/* One threadgroup per bank; parallel argmax over vocab of
+ * base_logits[(b*B+blk_pos)*vocab + v] + bias[b*vocab + v].
+ * Tie -> lowest index, matching the CUDA kernel and the host refine's
+ * strict-greater scan.  nth is a power of two (enforced host-side). */
+kernel void kernel_dspark_markov_step(
+        constant ds4_dspark_markov_step_args &args [[buffer(0)]],
+        device int                           *cand_out    [[buffer(1)]],
+        const device float                   *base_logits [[buffer(2)]],
+        const device float                   *bias        [[buffer(3)]],
+        uint  b   [[threadgroup_position_in_grid]],
+        uint  tid [[thread_position_in_threadgroup]],
+        uint  nth [[threads_per_threadgroup]]) {
+    threadgroup float sm_val[1024];
+    threadgroup int   sm_idx[1024];
+    if (b >= args.nb) return;
+    const device float *blog = base_logits + (ulong)(b * args.B + args.blk_pos) * args.vocab;
+    const device float *brow = bias + (ulong)b * args.vocab;
+    float local_v = -INFINITY;
+    int   local_i = 0;
+    for (uint v = tid; v < args.vocab; v += nth) {
+        const float s = blog[v] + brow[v];
+        if (s > local_v) { local_v = s; local_i = (int)v; }
+    }
+    sm_val[tid] = local_v;
+    sm_idx[tid] = local_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nth / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            const float vr = sm_val[tid + s];
+            const int   ir = sm_idx[tid + s];
+            const float vl = sm_val[tid];
+            const int   il = sm_idx[tid];
+            if ((vr > vl) || (vr == vl && ir < il)) { sm_val[tid] = vr; sm_idx[tid] = ir; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) cand_out[b] = sm_idx[0];
+}
