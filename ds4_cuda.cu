@@ -14745,8 +14745,23 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             (int)out_dim, (int)n_tok, (int)in_dim, cuda_decode_stream());
         if (rc == 0) return 1;
     }
+    /* The K ceiling is a measured cliff, not a capability: the D2R epilogue
+     * loses to raw mmq at deep K (o_proj 4096x8192 ran 0.81x upstream), so
+     * the default keeps D2R to the shapes where it won.  For exaone that is
+     * the K=2048 shared-expert down; its deep-K shapes (6144/8192/18432)
+     * stay on raw mmq unless DS4_MMQ_D2R_MAX_K raises the ceiling for an
+     * A/B on this hardware. */
+    uint64_t d2r_max_k = 4096u;
+    {
+        static long override_k = -2;
+        if (override_k == -2) {
+            const char *s = getenv("DS4_MMQ_D2R_MAX_K");
+            override_k = s && s[0] ? strtol(s, NULL, 10) : -1;
+        }
+        if (override_k >= 0) d2r_max_k = (uint64_t)override_k;
+    }
     if (aligned && n_tok >= 512u && out_dim >= 2048u &&
-        in_dim <= 4096u && cuda_use_mmq()) {
+        in_dim <= d2r_max_k && (in_dim % 1024u) == 0u && cuda_use_mmq()) {
         const char *d2r = getenv("DS4_MMQ_DENSE_D2R");
         if (!d2r || strcmp(d2r, "0") != 0) {
             const int rc = ds4_mmq_q8_0_dense_d2r(
@@ -16191,7 +16206,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
         return cublas_ok(st, "f32 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_f32_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+    matmul_f32_kernel<<<grid, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }
 
@@ -31334,6 +31349,150 @@ __global__ static void exaone_attn_decode_kernel(
                           kv_cap, first, last, scale);
 }
 
+/* ---- exaone split-KV decode (flash-decode) --------------------------------
+ *
+ * The plain decode kernel launches one block per head -- 64 blocks on this
+ * model -- so at depth the whole GPU waits on 64 partially-filled SMs walking
+ * the KV stream, and the measured effective bandwidth of the depth term was
+ * ~3% of the device.  This is the exaone counterpart of the DeepSeek
+ * splitkv/flash-decode tier: grid (S chunks x heads) computes per-chunk
+ * partial online-softmax states, one tiny combine pass merges them.
+ *
+ * Same partials layout as the DeepSeek tier: stride = head_dim + 2 floats of
+ * [m_j, l_j, acc_j[head_dim]] per (head, chunk), acc unnormalized.  exaone
+ * has no attention sinks, so the combine is the pure flash-attention merge.
+ * The math is algebraically identical to exaone_attn_head; FP32 grouping
+ * differs, so deep decode is not bit-identical to the one-block kernel.  The
+ * one-block kernel remains the anchor: spans below one chunk take it
+ * unchanged, and DS4_EXAONE_NO_SPLITKV=1 forces it at any depth (diagnostic).
+ */
+template <int DPL>
+__global__ static void exaone_attn_decode_split_kernel(
+        float *partials,          /* [n_head, S] x (head_dim + 2) */
+        const float *q,
+        const __half *kv,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t kv_cap,
+        uint32_t first,
+        uint32_t last,
+        uint32_t chunk_len,
+        uint32_t S,
+        float scale) {
+    const uint32_t j = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (j >= S || h >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t kvh = h / group;
+    const uint32_t kv_dim = n_head_kv * head_dim;
+    const float *qh = q + (size_t)h * head_dim;
+
+    const uint32_t c_first = first + j * chunk_len;
+    uint32_t c_last = c_first + chunk_len - 1u;
+    if (c_last > last) c_last = last;
+
+    const uint32_t lane   = threadIdx.x & 31u;
+    const uint32_t warp   = threadIdx.x >> 5;
+    const uint32_t nwarps = blockDim.x >> 5;
+
+    float qv[DPL], acc[DPL];
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        qv[d]  = qh[lane + (uint32_t)d * 32u];
+        acc[d] = 0.0f;
+    }
+    float m = -INFINITY, l = 0.0f;
+
+    for (uint32_t t = c_first + warp; t <= c_last; t += nwarps) {
+        const __half *krow = kv + (size_t)(t % kv_cap) * (size_t)kv_dim * 2u
+                                + (size_t)kvh * head_dim;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) dot += qv[d] * __half2float(krow[lane + d * 32]);
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+
+        const float s  = dot * scale;
+        const float mn = fmaxf(m, s);
+        const float re = (m == -INFINITY) ? 0.0f : __expf(m - mn);
+        const float w  = __expf(s - mn);
+        const __half *vrow = krow + kv_dim;
+#pragma unroll
+        for (int d = 0; d < DPL; d++)
+            acc[d] = acc[d] * re + w * __half2float(vrow[lane + d * 32]);
+        l = l * re + w;
+        m = mn;
+    }
+
+    /* Merge the block's warps exactly as exaone_attn_head does, but leave the
+     * accumulator unnormalized and store the (m, l, acc) partial. */
+    __shared__ float s_m[8], s_l[8];
+    extern __shared__ float s_acc[];    /* nwarps * head_dim */
+    if (lane == 0u) { s_m[warp] = m; s_l[warp] = l; }
+#pragma unroll
+    for (int d = 0; d < DPL; d++) s_acc[warp * head_dim + lane + d * 32] = acc[d];
+    __syncthreads();
+
+    if (warp == 0u) {
+        float gm = -INFINITY;
+        for (uint32_t w = 0; w < nwarps; w++) gm = fmaxf(gm, s_m[w]);
+        float gl = 0.0f;
+        for (uint32_t w = 0; w < nwarps; w++)
+            gl += (s_m[w] == -INFINITY) ? 0.0f : s_l[w] * __expf(s_m[w] - gm);
+        float *p = partials + ((size_t)h * S + j) * (head_dim + 2u);
+        if (lane == 0u) { p[0] = gm; p[1] = gl; }
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t i = lane + (uint32_t)d * 32u;
+            float v = 0.0f;
+            for (uint32_t w = 0; w < nwarps; w++) {
+                if (s_m[w] == -INFINITY) continue;
+                v += s_acc[w * head_dim + i] * __expf(s_m[w] - gm);
+            }
+            p[2u + i] = v;
+        }
+    }
+}
+
+__global__ static void exaone_attn_decode_split_combine_kernel(
+        float *heads,
+        const float *partials,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t S) {
+    const uint32_t h = blockIdx.x;
+    if (h >= n_head) return;
+    const float *base = partials + (size_t)h * S * (head_dim + 2u);
+    const uint32_t stride = head_dim + 2u;
+    __shared__ float M_s, L_s;
+    if (threadIdx.x == 0u) {
+        float M = -INFINITY;
+        for (uint32_t j = 0; j < S; j++) M = fmaxf(M, base[(size_t)j * stride]);
+        float L = 0.0f;
+        for (uint32_t j = 0; j < S; j++) {
+            const float m_j = base[(size_t)j * stride];
+            const float l_j = base[(size_t)j * stride + 1u];
+            if (l_j != 0.0f && isfinite(m_j)) L += expf(m_j - M) * l_j;
+        }
+        M_s = M;
+        L_s = L;
+    }
+    __syncthreads();
+    const float M = M_s;
+    const float inv = L_s > 0.0f ? 1.0f / L_s : 0.0f;
+    float *oh = heads + (size_t)h * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float A = 0.0f;
+        for (uint32_t j = 0; j < S; j++) {
+            const float m_j = base[(size_t)j * stride];
+            const float l_j = base[(size_t)j * stride + 1u];
+            if (l_j != 0.0f && isfinite(m_j))
+                A += expf(m_j - M) * base[(size_t)j * stride + 2u + d];
+        }
+        oh[d] = A * inv;
+    }
+}
+
 /* Prefill: one block per (token, head).  Queries carry absolute positions
  * pos0 + t, so the causal bound and the window bound are the decode ones
  * evaluated per row.  window == 0 means full attention. */
@@ -31360,6 +31519,150 @@ __global__ static void exaone_attn_prefill_kernel(
     exaone_attn_head<DPL>(heads + base, q + base,
                           kv, h / group, n_head_kv * head_dim, head_dim,
                           kv_cap, first, pos, scale);
+}
+
+/* ---- exaone tiled prefill attention ---------------------------------------
+ *
+ * The one-block-per-(token, head) prefill kernel re-reads the whole KV
+ * history for every query row -- N^2 KV traffic with no reuse, measured at
+ * ~70 GB/s effective, and the quadratic term is most of a deep cold prefill.
+ * This is the counterpart of the flash-style blocking the Metal path's raw
+ * cache is padded for: stage one K/V tile in shared memory and let a tile of
+ * TQ queries consume it, cutting KV traffic by TQ.
+ *
+ * Layout per block (TQ=16, TK=32, head_dim<=128 at DPL<=4):
+ *   grid (ceil(n_tok/TQ), n_head), blockDim = 128 (4 warps).
+ *   Warp w owns queries w*4..w*4+3 of the tile; every warp shares the staged
+ *   K/V tile.  Each lane holds the same dim slice {lane, lane+32, ...} it
+ *   holds in the one-block kernel, so the per-key dot is one warp reduction
+ *   and the online-softmax update is the same algebra in the same order per
+ *   query.  Not bit-identical to the anchor kernel (keys arrive tile-major),
+ *   so small prompts and the MTP verify keep the anchor path.
+ */
+enum { EXAONE_PF_TQ = 16, EXAONE_PF_TK = 32, EXAONE_PF_QW = 4 };
+
+template <int DPL>
+__global__ static void exaone_attn_prefill_tiled_kernel(
+        float *heads,
+        const float *q,
+        const __half *kv,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t kv_cap,
+        uint32_t window,
+        float scale) {
+    const uint32_t tq0 = blockIdx.x * EXAONE_PF_TQ;
+    const uint32_t h   = blockIdx.y;
+    if (tq0 >= n_tokens || h >= n_head) return;
+    const uint32_t group  = n_head / n_head_kv;
+    const uint32_t kvh    = h / group;
+    const uint32_t kv_dim = n_head_kv * head_dim;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+
+    /* This warp's queries: tile row = warp*QW + i. */
+    float qv[EXAONE_PF_QW][DPL], acc[EXAONE_PF_QW][DPL];
+    float m[EXAONE_PF_QW], lsum[EXAONE_PF_QW];
+    uint32_t qpos[EXAONE_PF_QW], qfirst[EXAONE_PF_QW];
+    bool alive[EXAONE_PF_QW];
+#pragma unroll
+    for (int i = 0; i < EXAONE_PF_QW; i++) {
+        const uint32_t t = tq0 + warp * EXAONE_PF_QW + (uint32_t)i;
+        alive[i] = t < n_tokens;
+        const uint32_t p = pos0 + (alive[i] ? t : 0u);
+        qpos[i]   = p;
+        qfirst[i] = (window && p + 1u > window) ? p + 1u - window : 0u;
+        m[i] = -INFINITY;
+        lsum[i] = 0.0f;
+        const float *qp = q + ((size_t)(alive[i] ? t : 0u) * n_head + h) * head_dim;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            qv[i][d]  = qp[lane + (uint32_t)d * 32u];
+            acc[i][d] = 0.0f;
+        }
+    }
+
+    /* Key range any query in the block can see. */
+    uint32_t blk_first = 0xffffffffu, blk_last = 0u;
+#pragma unroll
+    for (int i = 0; i < EXAONE_PF_QW; i++) {
+        if (!alive[i]) continue;
+        if (qfirst[i] < blk_first) blk_first = qfirst[i];
+        if (qpos[i]   > blk_last)  blk_last  = qpos[i];
+    }
+    /* Warps can differ in their query rows' bounds; take the block-wide hull
+     * through shared memory once. */
+    __shared__ uint32_t s_first, s_last;
+    if (threadIdx.x == 0u) { s_first = 0xffffffffu; s_last = 0u; }
+    __syncthreads();
+    if (lane == 0u) {
+        atomicMin(&s_first, blk_first);
+        atomicMax(&s_last, blk_last);
+    }
+    __syncthreads();
+    blk_first = s_first;
+    blk_last  = s_last;
+
+    __shared__ __half s_k[EXAONE_PF_TK][128];
+    __shared__ __half s_v[EXAONE_PF_TK][128];
+
+    for (uint32_t tk0 = blk_first; tk0 <= blk_last; tk0 += EXAONE_PF_TK) {
+        const uint32_t tk_len = (blk_last - tk0 + 1u < EXAONE_PF_TK)
+                              ? blk_last - tk0 + 1u : EXAONE_PF_TK;
+        /* Stage the tile: 128 threads, one row per 4 threads at DPL=4
+         * (each thread copies head_dim/32 half2... keep it simple: thread j
+         * copies elements j, j+128, ... of the flattened tile). */
+        for (uint32_t idx = threadIdx.x; idx < tk_len * head_dim;
+             idx += blockDim.x) {
+            const uint32_t r = idx / head_dim;
+            const uint32_t c = idx - r * head_dim;
+            const __half *row = kv + (size_t)((tk0 + r) % kv_cap) * kv_dim * 2u
+                                   + (size_t)kvh * head_dim;
+            s_k[r][c] = row[c];
+            s_v[r][c] = row[kv_dim + c];
+        }
+        __syncthreads();
+
+        for (uint32_t r = 0; r < tk_len; r++) {
+            const uint32_t p = tk0 + r;
+#pragma unroll
+            for (int i = 0; i < EXAONE_PF_QW; i++) {
+                if (!alive[i] || p < qfirst[i] || p > qpos[i]) continue;
+                float dot = 0.0f;
+#pragma unroll
+                for (int d = 0; d < DPL; d++)
+                    dot += qv[i][d] * __half2float(s_k[r][lane + d * 32]);
+                for (int off = 16; off > 0; off >>= 1)
+                    dot += __shfl_xor_sync(0xffffffffu, dot, off);
+                const float sc = dot * scale;
+                const float mn = fmaxf(m[i], sc);
+                const float re = (m[i] == -INFINITY) ? 0.0f : __expf(m[i] - mn);
+                const float wv = __expf(sc - mn);
+#pragma unroll
+                for (int d = 0; d < DPL; d++)
+                    acc[i][d] = acc[i][d] * re +
+                                wv * __half2float(s_v[r][lane + d * 32]);
+                lsum[i] = lsum[i] * re + wv;
+                m[i] = mn;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < EXAONE_PF_QW; i++) {
+        if (!alive[i]) continue;
+        const uint32_t t = tq0 + warp * EXAONE_PF_QW + (uint32_t)i;
+        const float inv = lsum[i] > 0.0f ? 1.0f / lsum[i] : 0.0f;
+        float *oh = heads + ((size_t)t * n_head + h) * head_dim;
+#pragma unroll
+        for (int d = 0; d < DPL; d++)
+            oh[lane + (uint32_t)d * 32u] = acc[i][d] * inv;
+    }
 }
 
 /* Router: sigmoid over the gate logits, top-k on probs + exp_probs_b, weights
@@ -31637,6 +31940,52 @@ extern "C" int ds4_gpu_exaone_attention_decode_tensor(
     return cuda_ok(cudaGetLastError(), "exaone attention decode");
 }
 
+extern "C" int ds4_gpu_exaone_attention_decode_split_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        ds4_gpu_tensor       *partials,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        uint32_t                chunk_len) {
+    if (!heads || !q || !kv || !partials || n_head == 0u || n_head_kv == 0u ||
+        head_dim == 0u || head_dim % 32u != 0u || n_head % n_head_kv != 0u ||
+        kv_cap == 0u || chunk_len == 0u ||
+        heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_head * head_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t first = (window && pos + 1u > window) ? pos + 1u - window : 0u;
+    const uint32_t span = pos - first + 1u;
+    const uint32_t S = (span + chunk_len - 1u) / chunk_len;
+    if (S <= 1u) {
+        /* One chunk is the plain kernel's exact case; take the anchor. */
+        return ds4_gpu_exaone_attention_decode_tensor(heads, q, kv, n_head,
+                                                      n_head_kv, head_dim,
+                                                      kv_cap, pos, window);
+    }
+    if (partials->bytes <
+        (uint64_t)n_head * S * (head_dim + 2u) * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t shmem = (head_dim / 32u) * head_dim * (uint32_t)sizeof(float);
+    const float scale = rsqrtf((float)head_dim);
+    dim3 grid(S, n_head, 1u);
+    DS4_EXAONE_ATTN_DISPATCH(exaone_attn_decode_split_kernel, grid, shmem,
+                             (float *)partials->ptr, (const float *)q->ptr,
+                             (const __half *)kv->ptr, n_head, n_head_kv,
+                             head_dim, kv_cap, first, pos, chunk_len, S, scale);
+    exaone_attn_decode_split_combine_kernel<<<n_head, head_dim, 0,
+                                              cuda_decode_stream()>>>(
+            (float *)heads->ptr, (const float *)partials->ptr,
+            n_head, head_dim, S);
+    return cuda_ok(cudaGetLastError(), "exaone attention decode split");
+}
+
 extern "C" int ds4_gpu_exaone_attention_prefill_tensor(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
@@ -31657,6 +32006,29 @@ extern "C" int ds4_gpu_exaone_attention_prefill_tensor(
     }
     const uint32_t shmem = (head_dim / 32u) * head_dim * (uint32_t)sizeof(float);
     const float scale = rsqrtf((float)head_dim);
+    /* Tiled path: a K/V tile staged once serves EXAONE_PF_TQ query rows,
+     * cutting KV traffic by TQ -- and measured a WASH end to end on GB10
+     * (32K cold prefill 32.2 t/s tiled vs 33.9 anchor; 8K 47.3 vs 47.9).
+     * The reduction the tile buys is spent in its per-(query, key) warp
+     * reductions: the kernel leaves bandwidth-bound for shuffle-bound.  So
+     * the anchor stays the default and the tile is the opt-in
+     * (DS4_EXAONE_PREFILL_TILE=1) starting point for a future revision --
+     * per-lane key ownership with a butterfly transpose is the known next
+     * step.  head_dim 128 is the shape the shared staging is sized for. */
+    static int tile_en = -1;
+    if (tile_en < 0) {
+        const char *t = getenv("DS4_EXAONE_PREFILL_TILE");
+        tile_en = t && t[0] && t[0] != '0' ? 1 : 0;
+    }
+    if (tile_en && head_dim == 128u && n_tokens >= (uint32_t)EXAONE_PF_TQ) {
+        dim3 tgrid((n_tokens + EXAONE_PF_TQ - 1u) / EXAONE_PF_TQ, n_head, 1u);
+        exaone_attn_prefill_tiled_kernel<4><<<tgrid, 128, 0,
+                                              cuda_decode_stream()>>>(
+                (float *)heads->ptr, (const float *)q->ptr,
+                (const __half *)kv->ptr, n_tokens, pos0, n_head, n_head_kv,
+                head_dim, kv_cap, window, scale);
+        return cuda_ok(cudaGetLastError(), "exaone attention prefill tiled");
+    }
     dim3 grid(n_tokens, n_head, 1u);
     DS4_EXAONE_ATTN_DISPATCH(exaone_attn_prefill_kernel, grid, shmem,
                              (float *)heads->ptr, (const float *)q->ptr,
@@ -31822,8 +32194,10 @@ extern "C" int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
             in_dim, mid_dim, n_expert, aligned_bytes);
     if (!gate_aligned || !up_aligned) return 0;
 
-    const cudaStream_t stream =
-        n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
+    /* cuda_decode_stream() is the legacy NULL stream in eager mode and the
+     * capture stream during decode-graph capture; a hardcoded NULL here
+     * would abort any capture that includes a batched MoE stage. */
+    const cudaStream_t stream = cuda_decode_stream();
     const int rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
             gate_aligned, up_aligned,
             (const float *)x->ptr,
@@ -31898,11 +32272,45 @@ extern "C" int ds4_gpu_exaone_moe_matmul_tensor(
     const int32_t *idp = (const int32_t *)ids->ptr;
     float         *op  = (float *)out->ptr;
     const int M = (int)out_dim, K = (int)in_dim;
-    const int NT = (int)n_tokens, NE = (int)n_expert, NU = (int)n_expert_used;
+    int NT = (int)n_tokens;
+    const int NE = (int)n_expert, NU = (int)n_expert_used;
     cudaStream_t st = cuda_decode_stream();
     /* mmq's vector tier is the one-column-per-expert path; above that its
      * tile tier wins.  ds4_mmq_should_use answers for the tile tier only, so
-     * the vector entry is the explicit choice for a single token. */
+     * the vector entry is the explicit choice for a single token.
+     *
+     * Decode widths land between the two tiers: a width-8 batched step's down
+     * leg is 64 (row, slot) columns over a ~49-expert union, about 1.3 rows
+     * per expert -- mmq pads every expert to a full tile and ran 2x slower
+     * than the same columns through the vector tier (5.0 vs 2.6 ms per layer,
+     * nsys, width 8).  So above the vector envelope but below real tile
+     * occupancy, slice the call into vector-envelope chunks along the token
+     * axis.  Chunking by whole tokens keeps each slice's ids/x/out contiguous
+     * views of the caller's buffers.  32 tokens x used <= 256 is well past
+     * where mmq's tiles are dense enough to win; leave those to the tile
+     * tier. */
+    if (n_tokens * n_expert_used > 8u && n_expert_used <= 8u &&
+        n_tokens * n_expert_used <= 256u) {
+        const uint32_t step_tokens = 8u / n_expert_used ? 8u / n_expert_used : 1u;
+        for (uint32_t t0 = 0; t0 < n_tokens; t0 += step_tokens) {
+            const uint32_t nt = (n_tokens - t0 < step_tokens)
+                              ? n_tokens - t0 : step_tokens;
+            ds4_gpu_tensor xs = *x, os = *out, is = *ids;
+            xs.ptr = (void *)(xp + (size_t)t0 * in_dim);
+            xs.bytes = (uint64_t)nt * in_dim * sizeof(float);
+            os.ptr = (void *)(op + (size_t)t0 * n_expert_used * out_dim);
+            os.bytes = (uint64_t)nt * n_expert_used * out_dim * sizeof(float);
+            is.ptr = (void *)(idp + (size_t)t0 * n_expert_used);
+            is.bytes = (uint64_t)nt * n_expert_used * sizeof(int32_t);
+            if (!ds4_gpu_exaone_moe_matmul_tensor(&os, &xs, &is, model_map,
+                                                  model_size, weight_offset,
+                                                  weight_bytes, weight_type,
+                                                  in_dim, out_dim, n_expert,
+                                                  nt, n_expert_used))
+                return 0;
+        }
+        return 1;
+    }
     const int vec = (n_tokens * n_expert_used) <= 8;
     int rc;
     switch (weight_type) {

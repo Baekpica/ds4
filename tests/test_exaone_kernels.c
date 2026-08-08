@@ -212,6 +212,77 @@ static void test_qk_norm_rope(void *map, uint64_t map_size, uint64_t w_off,
     free(want); free(host);
 }
 
+/* Flash-decode split vs the one-block kernel over the same ring.  The split
+ * is algebraically the same softmax, so the two must agree to fp tolerance on
+ * a deep span; a span inside one chunk must take the fallback and match the
+ * plain kernel bitwise. */
+static void test_attention_decode_split(void) {
+    const uint32_t kv_cap = 8192u, pos = 8000u, chunk = 2048u;
+    const uint32_t kv_dim = T_HEAD_KV * T_HEAD_DIM;
+    const size_t   hn     = (size_t)T_HEAD * T_HEAD_DIM;
+
+    uint64_t s = 515151;
+    float *q = xmalloc(hn * sizeof(float));
+    for (size_t i = 0; i < hn; i++) q[i] = frand(&s);
+    const size_t kvn = (size_t)(pos + 1) * kv_dim;
+    float *k = xmalloc(kvn * sizeof(float));
+    float *v = xmalloc(kvn * sizeof(float));
+    for (size_t i = 0; i < kvn; i++) { k[i] = frand(&s) * 0.5f; v[i] = frand(&s) * 0.5f; }
+
+    ds4_gpu_tensor *gq = ds4_gpu_tensor_alloc(hn * sizeof(float));
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * sizeof(float));
+    ds4_gpu_tensor *gv = ds4_gpu_tensor_alloc(kvn * sizeof(float));
+    ds4_gpu_tensor *ring = ds4_gpu_tensor_alloc((size_t)kv_cap * kv_dim * 2u * sizeof(uint16_t));
+    const uint32_t S = (pos + chunk) / chunk;
+    ds4_gpu_tensor *parts = ds4_gpu_tensor_alloc(
+            (size_t)T_HEAD * S * (T_HEAD_DIM + 2u) * sizeof(float));
+    ds4_gpu_tensor *o_ref = ds4_gpu_tensor_alloc(hn * sizeof(float));
+    ds4_gpu_tensor *o_spl = ds4_gpu_tensor_alloc(hn * sizeof(float));
+    ds4_gpu_tensor_write(gq, 0, q, hn * sizeof(float));
+    ds4_gpu_tensor_write(gk, 0, k, kvn * sizeof(float));
+    ds4_gpu_tensor_write(gv, 0, v, kvn * sizeof(float));
+    if (!ds4_gpu_exaone_kv_store_tensor(ring, gk, gv, kv_dim, pos + 1u, 0, kv_cap) ||
+        !ds4_gpu_exaone_attention_decode_tensor(o_ref, gq, ring, T_HEAD,
+                                                T_HEAD_KV, T_HEAD_DIM,
+                                                kv_cap, pos, 0u) ||
+        !ds4_gpu_exaone_attention_decode_split_tensor(o_spl, gq, ring, parts,
+                                                      T_HEAD, T_HEAD_KV,
+                                                      T_HEAD_DIM, kv_cap, pos,
+                                                      0u, chunk)) {
+        printf("decode split launch failed\n"); g_fail++; return;
+    }
+    float *ref = xmalloc(hn * sizeof(float));
+    float *spl = xmalloc(hn * sizeof(float));
+    ds4_gpu_tensor_read(o_ref, 0, ref, hn * sizeof(float));
+    ds4_gpu_tensor_read(o_spl, 0, spl, hn * sizeof(float));
+    diff_f32("decode split vs one-block (S=4)", spl, ref, hn, 2e-5, 2e-5);
+
+    /* Shallow span: the split entry must take the fallback, so the outputs
+     * are the SAME kernel and must match bit for bit. */
+    if (!ds4_gpu_exaone_attention_decode_tensor(o_ref, gq, ring, T_HEAD,
+                                                T_HEAD_KV, T_HEAD_DIM,
+                                                kv_cap, chunk - 2u, 0u) ||
+        !ds4_gpu_exaone_attention_decode_split_tensor(o_spl, gq, ring, parts,
+                                                      T_HEAD, T_HEAD_KV,
+                                                      T_HEAD_DIM, kv_cap,
+                                                      chunk - 2u, 0u, chunk)) {
+        printf("decode split shallow launch failed\n"); g_fail++; return;
+    }
+    ds4_gpu_tensor_read(o_ref, 0, ref, hn * sizeof(float));
+    ds4_gpu_tensor_read(o_spl, 0, spl, hn * sizeof(float));
+    size_t bad = 0;
+    for (size_t i = 0; i < hn; i++) if (ref[i] != spl[i]) bad++;
+    printf("%-38s mismatches=%zu  %s\n", "decode split shallow fallback", bad,
+           bad ? "FAIL" : "ok");
+    if (bad) g_fail++;
+
+    free(spl); free(ref);
+    ds4_gpu_tensor_free(o_spl); ds4_gpu_tensor_free(o_ref);
+    ds4_gpu_tensor_free(parts); ds4_gpu_tensor_free(ring);
+    ds4_gpu_tensor_free(gv); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gq);
+    free(v); free(k); free(q);
+}
+
 static void test_attention(int sliding) {
     const uint32_t window = sliding ? 128u : 0u;
     const uint32_t pos    = sliding ? 300u : 300u;
@@ -659,6 +730,7 @@ int main(int argc, char **argv) {
     test_qk_norm_rope(map, map_size, w_off, 262143);
     test_attention(1);
     test_attention(0);
+    test_attention_decode_split();
     test_attention_prefill(1);
     test_attention_prefill(0);
     test_prefill_chunk_residency();

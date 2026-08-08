@@ -8465,6 +8465,16 @@ struct server {
     int active_generations;
     int mixed_prefill_quantum;
     int last_prefill_slot;
+    /* A prefill quantum posted for the decode dispatcher to fuse into its
+     * next batch (ds4_sessions_eval_batch_with_prefill), so decode rows ride
+     * the prefill's weight sweep instead of alternating with it.  Owned by
+     * model_mu; the posting thread's prompt outlives the post because it
+     * waits on model_cv for MIXED_PF_DONE/FAILED before returning. */
+    enum { MIXED_PF_NONE = 0, MIXED_PF_POSTED, MIXED_PF_RUNNING,
+           MIXED_PF_DONE, MIXED_PF_FAILED } mixed_pf_state;
+    server_slot *mixed_pf_slot;
+    const ds4_tokens *mixed_pf_prompt;
+    char mixed_pf_err[160];
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -10427,6 +10437,59 @@ static int server_prefill_quantum(server *s) {
     return server_prefill_quantum_for(s, generation_active);
 }
 
+/* Offer one prefill quantum to the decode dispatcher.
+ *
+ * Returns 1 when a decode batch executed it fused (the session advanced to
+ * the prefix), 0 when not taken (no decodes in flight, dispatcher busy with
+ * another offer, or conditions changed -- caller runs the normal path), -1
+ * on a fused execution error (err filled).
+ *
+ * Only warm extensions are offered: ds4_sessions_eval_batch_with_prefill
+ * demands the prompt extend the live checkpoint, and pre-validating here is
+ * what keeps a rejected offer from failing the decode rows it rode with.
+ * The 50 ms timedwait re-checks the withdrawal condition, so a missed
+ * broadcast cannot strand the prefill thread. */
+static int server_mixed_prefill_offer(server *s, server_slot *slot,
+                                      const ds4_tokens *prefix,
+                                      char *err, size_t errlen) {
+    int result = 0;
+    pthread_mutex_lock(&s->model_mu);
+    if (s->mixed_pf_state != MIXED_PF_NONE || s->active_generations <= 0) {
+        pthread_mutex_unlock(&s->model_mu);
+        return 0;
+    }
+    s->mixed_pf_state = MIXED_PF_POSTED;
+    s->mixed_pf_slot = slot;
+    s->mixed_pf_prompt = prefix;
+    s->mixed_pf_err[0] = 0;
+    pthread_cond_broadcast(&s->model_cv);
+    for (;;) {
+        if (s->mixed_pf_state == MIXED_PF_DONE) { result = 1; break; }
+        if (s->mixed_pf_state == MIXED_PF_FAILED) {
+            if (err && errlen) snprintf(err, errlen, "%s", s->mixed_pf_err);
+            result = -1;
+            break;
+        }
+        if (s->mixed_pf_state == MIXED_PF_POSTED &&
+            (g_stop_requested || s->model_stopping ||
+             s->active_generations <= 0)) {
+            /* Withdraw: nobody is decoding, so riding along has no host. */
+            result = 0;
+            break;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 50 * 1000 * 1000;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        (void)pthread_cond_timedwait(&s->model_cv, &s->model_mu, &ts);
+    }
+    s->mixed_pf_state = MIXED_PF_NONE;
+    s->mixed_pf_slot = NULL;
+    s->mixed_pf_prompt = NULL;
+    pthread_mutex_unlock(&s->model_mu);
+    return result;
+}
+
 /* Synchronize one resident slot without monopolizing the model executor.  A
  * non-matching prompt is first rebuilt to one quantum; a matching checkpoint
  * advances from its current frontier. Absolute positions remain session-local,
@@ -10457,6 +10520,18 @@ static int server_session_sync(server *s, server_slot *slot,
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
+        if (ds4_engine_is_exaone_moe(s->engine) && done > 0 &&
+            ds4_session_pos(slot->session) == done) {
+            const int mrc = server_mixed_prefill_offer(s, slot, &prefix,
+                                                       err, errlen);
+            if (mrc > 0) {
+                done = ds4_session_pos(slot->session);
+                called = true;
+                if (done >= prompt->len) return 0;
+                continue;
+            }
+            if (mrc < 0) return 1;
+        }
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
@@ -11041,23 +11116,44 @@ static void *decode_worker_main(void *arg) {
             count++;
         }
         if (count == 0) continue;
+        /* A posted prefill quantum rides this batch: its rows join the
+         * decode rows' weight sweep in one engine pass. */
+        server_slot *pf_slot = NULL;
+        const ds4_tokens *pf_prompt = NULL;
+        if (s->mixed_pf_state == MIXED_PF_POSTED) {
+            s->mixed_pf_state = MIXED_PF_RUNNING;
+            pf_slot = s->mixed_pf_slot;
+            pf_prompt = s->mixed_pf_prompt;
+        }
         s->model_busy = true;
         pthread_mutex_unlock(&s->model_mu);
 
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
-        int rc = ds4_sessions_eval_batch(items, count,
-                                         batch_err, sizeof(batch_err));
+        int rc = pf_slot
+            ? ds4_sessions_eval_batch_with_prefill(items, count,
+                                                   pf_slot->session, pf_prompt,
+                                                   batch_err, sizeof(batch_err))
+            : ds4_sessions_eval_batch(items, count,
+                                      batch_err, sizeof(batch_err));
         pthread_mutex_unlock(&s->inference_mu);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: decode batch count=%d elapsed=%.3f ms status=%s",
-                       count, (now_sec() - batch_t0) * 1000.0,
+                       "ds4-server: decode batch count=%d%s elapsed=%.3f ms status=%s",
+                       count, pf_slot ? " +prefill" : "",
+                       (now_sec() - batch_t0) * 1000.0,
                        rc == 0 ? "ok" : "error");
         }
 
         pthread_mutex_lock(&s->model_mu);
+        if (pf_slot) {
+            s->mixed_pf_state = rc == 0 ? MIXED_PF_DONE : MIXED_PF_FAILED;
+            if (rc != 0) {
+                snprintf(s->mixed_pf_err, sizeof(s->mixed_pf_err), "%s",
+                         batch_err[0] ? batch_err : "mixed batch failed");
+            }
+        }
         s->model_busy = false;
         for (int i = 0; i < count; i++) {
             server_slot *slot = members[i];

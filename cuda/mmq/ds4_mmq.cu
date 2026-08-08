@@ -4336,7 +4336,12 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
      * DS4_CUDA_NO_MOE_DEDUP restores the per-slot kernel (diagnostic). */
     static int moe_dedup_en = -1;
     if (moe_dedup_en < 0) moe_dedup_en = getenv("DS4_CUDA_NO_MOE_DEDUP") == NULL;
-    if (moe_dedup_en && n_tokens >= 2 && n_tokens <= 8) {
+    /* Width cap: dedup was built and measured for the 2-row verify.  At a
+     * width-8 cross-session decode step it runs SLOWER than the per-slot
+     * kernel (450 -> 395 ms/step with it off, GB10, 39 iq2 layers) -- the
+     * dedup bookkeeping costs more than the expert reads it saves once the
+     * expert union is wide.  Keep it where it wins. */
+    if (moe_dedup_en && n_tokens >= 2 && n_tokens <= 2) {
         const int n_slots = n_tokens * n_expert_used;
         switch (n_tokens) {
 #define DS4_GATEUP_DEDUP_CASE(NT) \

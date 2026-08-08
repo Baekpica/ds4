@@ -2755,6 +2755,23 @@ int ds4_gpu_exaone_attention_decode_tensor(
         uint32_t                pos,
         uint32_t                window);
 
+/* Flash-decode variant for deep spans: per-chunk partial softmax states in
+ * `partials` (n_head x ceil(span/chunk_len) x (head_dim+2) floats) merged by
+ * a combine pass.  Falls back to the one-block kernel when the span fits one
+ * chunk, so shallow decode stays bit-identical to the anchor. */
+int ds4_gpu_exaone_attention_decode_split_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        ds4_gpu_tensor       *partials,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        uint32_t                chunk_len);
+
 int ds4_gpu_exaone_attention_prefill_tensor(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
