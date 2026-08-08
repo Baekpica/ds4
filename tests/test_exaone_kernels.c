@@ -176,9 +176,78 @@ enum {
     T_USED     = 8,
 };
 
+/* The EXAONE prefill graph seeds every row from the same Q8_0 embedding
+ * table.  Keep the wide batch entry bit-identical to the one-row anchor:
+ * there is no reduction here, so even a one-bit mismatch is a layout bug. */
+static void test_embedding_batch(void *map, uint64_t map_size,
+                                 uint64_t embed_off) {
+    enum { N_VOCAB = 17, N_EMBD = 128, N_TOK = 64 };
+    int32_t tokens[N_TOK];
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        tokens[t] = (int32_t)((t * 7u + 3u) % N_VOCAB);
+    }
+
+    const size_t out_n = (size_t)N_TOK * N_EMBD;
+    ds4_gpu_tensor *gt = ds4_gpu_tensor_alloc(sizeof(tokens));
+    ds4_gpu_tensor *one = ds4_gpu_tensor_alloc(out_n * sizeof(float));
+    ds4_gpu_tensor *bat = ds4_gpu_tensor_alloc(out_n * sizeof(float));
+    int ok = gt && one && bat &&
+        ds4_gpu_tensor_write(gt, 0, tokens, sizeof(tokens));
+    for (uint32_t t = 0; ok && t < N_TOK; t++) {
+        ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+                one, (uint64_t)t * N_EMBD * sizeof(float),
+                (uint64_t)N_EMBD * sizeof(float));
+        ok = row && ds4_gpu_embed_token_quant_tensor(
+                row, map, map_size, embed_off, DS4_TENSOR_Q8_0,
+                N_VOCAB, (uint32_t)tokens[t], N_EMBD);
+        ds4_gpu_tensor_free(row);
+    }
+    if (ok) {
+        ok = ds4_gpu_embed_tokens_quant_tensor(
+                bat, gt, map, map_size, embed_off, DS4_TENSOR_Q8_0,
+                N_VOCAB, N_TOK, N_EMBD);
+    }
+    if (!ok) {
+        printf("embedding batch launch failed\n");
+        g_fail++;
+    } else {
+        float *one_h = xmalloc(out_n * sizeof(float));
+        float *bat_h = xmalloc(out_n * sizeof(float));
+        ds4_gpu_tensor_read(one, 0, one_h, out_n * sizeof(float));
+        ds4_gpu_tensor_read(bat, 0, bat_h, out_n * sizeof(float));
+        size_t bad = 0;
+        for (size_t i = 0; i < out_n; i++) {
+            if (memcmp(&one_h[i], &bat_h[i], sizeof(float)) != 0) bad++;
+        }
+        printf("%-38s mismatches=%zu  %s\n", "Q8 embedding batch vs rows",
+               bad, bad ? "FAIL" : "ok");
+        if (bad) g_fail++;
+
+        tokens[N_TOK - 1] = -1;
+        ok = ds4_gpu_tensor_write(gt, 0, tokens, sizeof(tokens)) &&
+             ds4_gpu_embed_tokens_quant_tensor(
+                    bat, gt, map, map_size, embed_off, DS4_TENSOR_Q8_0,
+                    N_VOCAB, N_TOK, N_EMBD) &&
+             ds4_gpu_tensor_read(
+                    bat, (uint64_t)(N_TOK - 1) * N_EMBD * sizeof(float),
+                    bat_h, (uint64_t)N_EMBD * sizeof(float));
+        size_t nonzero = 0;
+        for (size_t i = 0; ok && i < N_EMBD; i++) {
+            if (bat_h[i] != 0.0f) nonzero++;
+        }
+        printf("%-38s nonzero=%zu  %s\n", "Q8 embedding invalid-token guard",
+               nonzero, ok && !nonzero ? "ok" : "FAIL");
+        if (!ok || nonzero) g_fail++;
+        free(bat_h);
+        free(one_h);
+    }
+    ds4_gpu_tensor_free(bat);
+    ds4_gpu_tensor_free(one);
+    ds4_gpu_tensor_free(gt);
+}
+
 static void test_qk_norm_rope(void *map, uint64_t map_size, uint64_t w_off,
-                              uint32_t pos0) {
-    const uint32_t n_tok = 3;
+                              uint32_t pos0, uint32_t n_tok) {
     const size_t n = (size_t)T_HEAD * T_HEAD_DIM * n_tok;
     float *host = xmalloc(n * sizeof(float));
     float *want = xmalloc(n * sizeof(float));
@@ -203,8 +272,10 @@ static void test_qk_norm_rope(void *map, uint64_t map_size, uint64_t w_off,
                              (const float *)((char *)map + w_off), T_HEAD,
                              T_HEAD_DIM, T_HEAD_DIM, pos0 + tk, 1000000.0f, rope);
         char label[64];
-        snprintf(label, sizeof(label), rope ? "qk_norm + neox rope @pos %u"
-                                            : "qk_norm only @pos %u", pos0);
+        snprintf(label, sizeof(label),
+                 rope ? "qk_norm + rope p%u n%u"
+                      : "qk_norm only p%u n%u",
+                 pos0, n_tok);
         diff_f32(label, got, want, n, 3e-5, 3e-5);
         free(got);
         ds4_gpu_tensor_free(t);
@@ -790,7 +861,7 @@ static void test_moe_matmul(const ds4_model *m, const ds4_weights *wts) {
             if (!ds4_gpu_exaone_moe_matmul_tensor(go, gx, gid, m->map, m->size,
                                                   w->abs_offset, w->bytes, ty,
                                                   in_dim, out_dim, DS4_N_EXPERT,
-                                                  1, 1)) {
+                                                  1, 1, 1)) {
                 printf("moe matmul %s launch failed\n", tensor_type_name(ty));
                 g_fail++;
             } else {
@@ -820,8 +891,12 @@ int main(int argc, char **argv) {
     /* Synthetic "model map": a QK-norm weight vector followed by a router
      * bias, at 256-byte-aligned offsets, registered the same way a real
      * mapping is so the weight-pointer resolution is under test too. */
+    enum { E_VOCAB = 17, E_EMBD = 128 };
     const uint64_t w_off = 256, bias_off = 256 + 4096;
-    const uint64_t map_size = bias_off + 4096;
+    const uint64_t embed_off = bias_off + 4096;
+    const uint64_t embed_bytes =
+        (uint64_t)E_VOCAB * (E_EMBD / 32u) * 34u;
+    const uint64_t map_size = embed_off + embed_bytes;
     void *map = NULL;
     if (posix_memalign(&map, 4096, (size_t)map_size) != 0) return 1;
     memset(map, 0, (size_t)map_size);
@@ -831,17 +906,35 @@ int main(int argc, char **argv) {
         for (int i = 0; i < T_HEAD_DIM; i++) nw[i] = 1.0f + 0.1f * frand(&s);
         float *b = (float *)((char *)map + bias_off);
         for (int i = 0; i < T_EXPERT; i++) b[i] = 0.2f * frand(&s);
+        unsigned char *ew = (unsigned char *)map + embed_off;
+        for (uint32_t tok = 0; tok < E_VOCAB; tok++) {
+            for (uint32_t q = 0; q < E_EMBD / 32u; q++) {
+                unsigned char *blk = ew + ((uint64_t)tok * (E_EMBD / 32u) + q) * 34u;
+                const uint16_t d = f32_to_f16(0.125f * (float)(1u + (tok + q) % 7u));
+                memcpy(blk, &d, sizeof(d));
+                for (uint32_t i = 0; i < 32u; i++) {
+                    ((int8_t *)(blk + 2))[i] =
+                        (int8_t)((int)((tok * 29u + q * 11u + i * 3u) % 255u) -
+                                 127);
+                }
+            }
+        }
     }
     if (!ds4_gpu_set_model_map(map, map_size)) {
         fprintf(stderr, "ds4_gpu_set_model_map failed\n"); return 1;
     }
 
     printf("== exaone CUDA kernels vs CPU reference ==\n");
-    test_qk_norm_rope(map, map_size, w_off, 40);
+    test_qk_norm_rope(map, map_size, w_off, 40, 3);
+    /* Exercises the token-blocked wide-prefill kernel (threshold 32) while
+     * retaining the three-row anchor case above. */
+    test_qk_norm_rope(map, map_size, w_off, 40, 64);
     /* The far end of the 262144-token window: at i == 0 the rotation angle is
      * the position itself, which is where a fast-math trig intrinsic stops
      * meaning anything. */
-    test_qk_norm_rope(map, map_size, w_off, 262143);
+    test_qk_norm_rope(map, map_size, w_off, 262143, 3);
+    test_qk_norm_rope(map, map_size, w_off, 262080, 64);
+    test_embedding_batch(map, map_size, embed_off);
     test_attention(1);
     test_attention(0);
     test_attention_decode_split();

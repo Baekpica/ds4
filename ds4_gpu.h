@@ -2817,13 +2817,15 @@ int ds4_gpu_exaone_moe_combine_tensor(
         uint32_t                n_tokens);
 
 /* Fused routed gate+up+SwiGLU+router-weight into mid, from the aligned
- * IQ2_XXS artifacts. Prefill widths above the native 16-row kernel envelope
- * are submitted as contiguous slices. Returns 1 when the aligned path ran;
- * 0 when it does not apply (no artifacts or wrong type) and the caller must
- * take the separate-matmul route. mid comes out ALREADY weighted, so the
- * combine step must not apply weights again. */
+ * IQ2_XXS artifacts. Wide prefill uses the paired D2R tensor-core entry and
+ * gate_tmp/up_tmp; small batches retain the 16-row vector tier. Returns 1
+ * when the aligned path ran; 0 when it does not apply (no artifacts or wrong
+ * type) and the caller must take the separate-matmul route. mid comes out
+ * ALREADY weighted, so the combine step must not apply weights again. */
 int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
         ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *gate_tmp,
+        ds4_gpu_tensor       *up_tmp,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *ids,
         const ds4_gpu_tensor *weights,
@@ -2863,7 +2865,11 @@ int ds4_gpu_exaone_moe_matmul_tensor(
         uint32_t                out_dim,
         uint32_t                n_expert,
         uint32_t                n_tokens,
-        uint32_t                n_expert_used);
+        uint32_t                n_expert_used,
+        /* 0 keeps generic MMQ geometry.  Otherwise this is a caller-proven
+         * upper bound on rows owned by any expert; K-EXAONE passes the
+         * unflattened forward-token count for its unique top-k router. */
+        uint32_t                max_rows_per_expert);
 
 #ifdef __cplusplus
 }

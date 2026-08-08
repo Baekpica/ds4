@@ -281,6 +281,25 @@ int ds4_mmq_q3_K_moe(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// Same result/layout as the corresponding unbounded MoE entry, but the
+// caller supplies a proven upper bound on the number of rows routed to any
+// one expert.  This only tightens MMQ's launch geometry; expert_bounds still
+// controls every read and write.  The bound must cover the actual largest
+// expert bucket.  K-EXAONE can prove forward_tokens because router top-k is
+// sampled without replacement, including after its down rows are flattened.
+int ds4_mmq_q3_K_moe_bounded(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
+    cudaStream_t    stream);
+
 int ds4_mmq_q4_K_moe(
     const void    * W,
     const float   * X_f32,
@@ -291,6 +310,19 @@ int ds4_mmq_q4_K_moe(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q4_K_moe_bounded(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
     cudaStream_t    stream);
 
 int ds4_mmq_mxfp4_moe(
@@ -658,6 +690,28 @@ int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
     const float   * X_f32,
     const int32_t * ids,
     const float   * weights,
+    float         * mid_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
+// Width-selecting aligned gate/up entry.  Small batches retain the fused
+// vector kernel above.  Once token*slot rows reach the D2R occupancy floor,
+// the paired SoA tensor-core kernel writes gate_tmp/up_tmp and one epilogue
+// produces the same weighted SwiGLU mid layout.  gate_tmp/up_tmp may be NULL
+// only when the call remains below the D2R threshold.
+int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid(
+    const void    * W_gate_aligned,
+    const void    * W_up_aligned,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * weights,
+    float         * gate_tmp,
+    float         * up_tmp,
     float         * mid_f32,
     int             M,
     int             K,

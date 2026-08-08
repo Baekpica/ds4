@@ -26698,6 +26698,7 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
         float *out,
         const int32_t *tokens,
         const unsigned char *w,
+        uint32_t n_vocab,
         uint32_t n_tokens,
         uint32_t n_embd) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -26706,6 +26707,10 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
     uint32_t t = gid / n_embd;
     uint32_t d = gid - (uint64_t)t * n_embd;
     int32_t tok = tokens[t];
+    if (tok < 0 || (uint32_t)tok >= n_vocab) {
+        out[gid] = 0.0f;
+        return;
+    }
     const uint64_t row_blocks = n_embd / 32u;
     const unsigned char *blk = w + ((uint64_t)tok * row_blocks + (d >> 5)) * 34u;
     const float scale = __half2float(*(const __half *)blk);
@@ -26747,7 +26752,7 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
     glm_embed_tokens_q8_0_kernel<<<(n + 255) / 256, 256>>>(
             (float *)out->ptr,
             (const int32_t *)tokens->ptr,
-            w, n_tokens, n_embd);
+            w, n_vocab, n_tokens, n_embd);
     return cuda_ok(cudaGetLastError(), "glm embed tokens launch");
 }
 
@@ -31205,6 +31210,74 @@ __global__ static void exaone_qk_norm_rope_kernel(
     }
 }
 
+/* Wide-prefill variant for K-EXAONE's fixed 128-wide heads.  One block owns
+ * one token and walks its heads serially, preserving the anchor's exact
+ * 128-thread RMS reduction order for every head.  The NeoX angles depend on
+ * (token, rotary-pair), not on head, so computing them once into shared
+ * memory removes 64x redundant double-precision trig for Q and 8x for K.
+ * With thousands of token blocks there is still ample device parallelism.
+ * The extra end-of-head barrier prevents threads outside the rotary half
+ * from overwriting the RMS scratch while rotary stores are still in flight. */
+__global__ static void exaone_qk_norm_rope_token_kernel(
+        float *v,
+        const float *norm_w,
+        uint32_t n_heads,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        float freq_base,
+        float eps) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t pos = pos0 + t;
+    const uint32_t half = n_rot / 2u;
+    __shared__ float sh[32];
+    __shared__ float rope_c[64];
+    __shared__ float rope_s[64];
+
+    if (tid < half) {
+        const float freq = (float)pow((double)freq_base,
+                                      -2.0 * (double)tid / (double)n_rot);
+        const float theta = (float)pos * freq;
+        const double tr = fmod((double)theta,
+                               2.0 * 3.14159265358979323846);
+        rope_c[tid] = (float)cos(tr);
+        rope_s[tid] = (float)sin(tr);
+    }
+    __syncthreads();
+
+    float *row = v + (size_t)t * n_heads * head_dim;
+    for (uint32_t h = 0; h < n_heads; h++) {
+        float *p = row + (size_t)h * head_dim;
+        float sumsq = 0.0f;
+        sumsq += p[tid] * p[tid];
+        for (int off = 16; off > 0; off >>= 1) {
+            sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+        }
+        if ((tid & 31u) == 0u) sh[tid >> 5] = sumsq;
+        __syncthreads();
+        if (tid < 32u) {
+            sumsq = tid < 4u ? sh[tid] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) {
+                sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+            }
+            if (tid == 0u) sh[0] = sumsq;
+        }
+        __syncthreads();
+        const float scale = rsqrtf(sh[0] / (float)head_dim + eps);
+        p[tid] = (p[tid] * scale) * norm_w[tid];
+        __syncthreads();
+
+        if (tid < half) {
+            const float a = p[tid], b = p[tid + half];
+            const float c = rope_c[tid], s = rope_s[tid];
+            p[tid]        = a * c - b * s;
+            p[tid + half] = a * s + b * c;
+        }
+        __syncthreads();
+    }
+}
+
 /* Append n_tokens rows of K and V to the layer ring as f16, starting at
  * absolute position pos0.  f16 is not an optimization here: it is what the
  * reference and llama.cpp both store, and keeping f32 would make this path
@@ -31866,6 +31939,22 @@ extern "C" int ds4_gpu_exaone_qk_norm_rope_tensor(
             model_map, norm_weight_offset, (uint64_t)head_dim * sizeof(float),
             cuda_current_tier(), "exaone_qk_norm");
     if (!w) return 0;
+    /* The token-blocked kernel crosses over for both Q and K by 32 rows and
+     * is bit-identical to the per-head anchor, including at the 262144-token
+     * boundary.  Keep the anchor for decode/small batches, norm-only calls,
+     * and future non-128 shapes. */
+    const char *token_block_env = getenv("DS4_EXAONE_QK_TOKEN_BLOCK");
+    const bool token_block =
+        !(token_block_env && token_block_env[0] == '0') &&
+        do_rope && n_tokens >= 32u && head_dim == 128u && n_rot == 128u;
+    if (token_block) {
+        exaone_qk_norm_rope_token_kernel<<<n_tokens, 128, 0,
+                                            cuda_decode_stream()>>>(
+                (float *)v->ptr, w, n_heads, head_dim, n_rot, pos,
+                freq_base, eps);
+        return cuda_ok(cudaGetLastError(),
+                       "exaone token-block qk norm rope");
+    }
     /* One block per (token, head); each token carries its own RoPE position. */
     dim3 grid(n_heads, n_tokens, 1u);
     exaone_qk_norm_rope_kernel<<<grid, 128, 0, cuda_decode_stream()>>>(
@@ -32162,14 +32251,16 @@ extern "C" int ds4_gpu_exaone_moe_combine_tensor(
     return cuda_ok(cudaGetLastError(), "exaone moe combine");
 }
 
-/* Aligned fused gate+up+SwiGLU+router-weight for IQ2_XXS routed experts. Both
+/* Aligned gate+up+SwiGLU+router-weight for IQ2_XXS routed experts. Both
  * weight stacks must have aligned-SoA artifacts (built at boot from the
- * merged tensor table); the helper internally chunks prefill widths above
- * the native 16-row vec envelope. It is runtime-parameterized on
- * n_expert_used, so K-EXAONE's top-8 works where the raw fused kernel's
- * constexpr top_k = 6 does not. */
+ * merged tensor table). Wide prefill takes the paired D2R tensor-core path
+ * into caller-owned gate/up scratch; small batches retain the fused vector
+ * tier. It is runtime-parameterized on n_expert_used, so K-EXAONE's top-8
+ * works where the older raw fused kernel's constexpr top_k = 6 does not. */
 extern "C" int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
         ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *gate_tmp,
+        ds4_gpu_tensor       *up_tmp,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *ids,
         const ds4_gpu_tensor *weights,
@@ -32185,7 +32276,7 @@ extern "C" int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
         uint32_t                n_expert,
         uint32_t                n_tokens,
         uint32_t                n_expert_used) {
-    if (!mid || !x || !ids || !weights || !model_map ||
+    if (!mid || !gate_tmp || !up_tmp || !x || !ids || !weights || !model_map ||
         weight_type != 16u /* IQ2_XXS */ ||
         n_tokens == 0u ||
         in_dim == 0u || in_dim % 1024u != 0u || mid_dim == 0u ||
@@ -32193,6 +32284,8 @@ extern "C" int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
         gate_offset > model_size || gate_bytes > model_size - gate_offset ||
         up_offset > model_size || up_bytes > model_size - up_offset ||
         mid->bytes < (uint64_t)mid_dim * n_tokens * n_expert_used * sizeof(float) ||
+        gate_tmp->bytes < (uint64_t)mid_dim * n_tokens * n_expert_used * sizeof(float) ||
+        up_tmp->bytes < (uint64_t)mid_dim * n_tokens * n_expert_used * sizeof(float) ||
         x->bytes < (uint64_t)in_dim * n_tokens * sizeof(float) ||
         ids->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
         weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
@@ -32214,11 +32307,13 @@ extern "C" int ds4_gpu_exaone_aligned_gate_up_mid_tensor(
      * capture stream during decode-graph capture; a hardcoded NULL here
      * would abort any capture that includes a batched MoE stage. */
     const cudaStream_t stream = cuda_decode_stream();
-    const int rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+    const int rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid(
             gate_aligned, up_aligned,
             (const float *)x->ptr,
             (const int32_t *)ids->ptr,
             (const float *)weights->ptr,
+            (float *)gate_tmp->ptr,
+            (float *)up_tmp->ptr,
             (float *)mid->ptr,
             (int)mid_dim, (int)in_dim,
             (int)n_tokens, (int)n_expert, (int)n_expert_used,
@@ -32263,9 +32358,11 @@ extern "C" int ds4_gpu_exaone_moe_matmul_tensor(
         uint32_t                out_dim,
         uint32_t                n_expert,
         uint32_t                n_tokens,
-        uint32_t                n_expert_used) {
+        uint32_t                n_expert_used,
+        uint32_t                max_rows_per_expert) {
     if (!out || !x || !ids || !model_map || in_dim == 0u || out_dim == 0u ||
         n_expert == 0u || n_tokens == 0u || n_expert_used == 0u ||
+        max_rows_per_expert > (uint64_t)n_tokens * n_expert_used ||
         in_dim % 256u != 0u ||
         weight_offset > model_size || weight_bytes > model_size - weight_offset ||
         out->bytes < (uint64_t)out_dim * n_tokens * n_expert_used * sizeof(float) ||
@@ -32322,12 +32419,21 @@ extern "C" int ds4_gpu_exaone_moe_matmul_tensor(
                                                   model_size, weight_offset,
                                                   weight_bytes, weight_type,
                                                   in_dim, out_dim, n_expert,
-                                                  nt, n_expert_used))
+                                                  nt, n_expert_used,
+                                                  max_rows_per_expert ? nt : 0u))
                 return 0;
         }
         return 1;
     }
     const int vec = (n_tokens * n_expert_used) <= 8;
+    const char *bound_global = getenv("DS4_MMQ_EXPERT_BOUND");
+    const char *bound_type = weight_type == 11u
+        ? getenv("DS4_MMQ_Q3_BOUND")
+        : weight_type == 12u ? getenv("DS4_MMQ_Q4_BOUND") : NULL;
+    const bool use_bucket_bound =
+        !vec && max_rows_per_expert > 0u &&
+        !(bound_global && bound_global[0] == '0') &&
+        !(bound_type && bound_type[0] == '0');
     int rc;
     switch (weight_type) {
     case 16u: /* IQ2_XXS */
@@ -32336,11 +32442,41 @@ extern "C" int ds4_gpu_exaone_moe_matmul_tensor(
         break;
     case 11u: /* Q3_K */
         rc = vec ? ds4_mmq_q3_K_moe_vec(w, xp, idp, op, M, K, NT, NE, NU, st)
-                 : ds4_mmq_q3_K_moe(w, xp, idp, op, M, K, NT, NE, NU, st);
+                 : use_bucket_bound
+                     ? ds4_mmq_q3_K_moe_bounded(
+                           w, xp, idp, op, M, K, NT, NE, NU,
+                           (int)max_rows_per_expert, st)
+                     : ds4_mmq_q3_K_moe(
+                           w, xp, idp, op, M, K, NT, NE, NU, st);
+        if (use_bucket_bound) {
+            static bool logged_q3_bound = false;
+            if (!logged_q3_bound) {
+                logged_q3_bound = true;
+                fprintf(stderr,
+                        "ds4: Q3_K routed MMQ expert-bucket bound active "
+                        "(rows=%u bound=%u)\n",
+                        n_tokens * n_expert_used, max_rows_per_expert);
+            }
+        }
         break;
     case 12u: /* Q4_K */
         rc = vec ? ds4_mmq_q4_K_moe_vec(w, xp, idp, op, M, K, NT, NE, NU, st)
-                 : ds4_mmq_q4_K_moe(w, xp, idp, op, M, K, NT, NE, NU, st);
+                 : use_bucket_bound
+                     ? ds4_mmq_q4_K_moe_bounded(
+                           w, xp, idp, op, M, K, NT, NE, NU,
+                           (int)max_rows_per_expert, st)
+                     : ds4_mmq_q4_K_moe(
+                           w, xp, idp, op, M, K, NT, NE, NU, st);
+        if (use_bucket_bound) {
+            static bool logged_q4_bound = false;
+            if (!logged_q4_bound) {
+                logged_q4_bound = true;
+                fprintf(stderr,
+                        "ds4: Q4_K routed MMQ expert-bucket bound active "
+                        "(rows=%u bound=%u)\n",
+                        n_tokens * n_expert_used, max_rows_per_expert);
+            }
+        }
         break;
     case 10u: /* Q2_K */
         rc = vec ? ds4_mmq_q2_K_moe_vec(w, xp, idp, op, M, K, NT, NE, NU, st)

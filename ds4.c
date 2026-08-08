@@ -49837,6 +49837,7 @@ static uint32_t exaone_mtp_position_after_hidden(uint32_t hidden_pos) {
  * of it, and paying N x 1.60 GiB is what was capping how much context a
  * concurrent server could offer. */
 struct ds4_exaone_batch_ws {
+    ds4_gpu_tensor *b_tokens;
     ds4_gpu_tensor *b_cur;
     ds4_gpu_tensor *b_norm;
     ds4_gpu_tensor *b_q;
@@ -49972,7 +49973,8 @@ static uint32_t exaone_graph_layer_kv_cap(uint32_t il, uint32_t ctx_size,
 static void exaone_batch_ws_free(ds4_exaone_batch_ws *w) {
     if (!w) return;
     ds4_gpu_tensor **all[] = {
-        &w->b_cur, &w->b_norm, &w->b_q, &w->b_k, &w->b_v, &w->b_heads,
+        &w->b_tokens, &w->b_cur, &w->b_norm, &w->b_q, &w->b_k, &w->b_v,
+        &w->b_heads,
         &w->b_attn_out, &w->b_ffn_out, &w->b_dense_gate, &w->b_dense_up,
         &w->b_dense_mid, &w->b_shared_gate, &w->b_shared_up, &w->b_shared_mid,
         &w->b_shared_out, &w->b_router_logits, &w->b_router_selected,
@@ -50045,6 +50047,10 @@ static bool exaone_batch_ws_alloc(ds4_exaone_batch_ws *w, uint32_t prefill_cap,
         bytes += _b;                                                           \
     } while (0)
 
+    /* int32 tokens are the same four-byte allocation unit as the float
+     * scratch below.  Keeping them in the shared workspace lets wide prefill
+     * replace one embedding launch per prompt token with one batch launch. */
+    EX_WS_ALLOC(b_tokens,          P,                                      "b_tokens");
     EX_WS_ALLOC(b_cur,             (uint64_t)P * n_embd,                  "b_cur");
     EX_WS_ALLOC(b_norm,            (uint64_t)P * n_embd,                  "b_norm");
     EX_WS_ALLOC(b_q,               (uint64_t)P * q_dim,                   "b_q");
@@ -50314,13 +50320,13 @@ static bool exaone_layer_tail(ds4_exaone_gpu_graph *g,
     ds4_gpu_tensor *rm = batch ? g->ws->b_routed_mid  : g->routed_mid;
     ds4_gpu_tensor *rd = batch ? g->ws->b_routed_down : g->routed_down;
     /* Every route below leaves rm holding the ALREADY router-weighted mid, so
-     * the combine at the end is a plain sum for all of them. The aligned
-     * fused kernel folds gate+up+SwiGLU+weight into one launch and reads the
-     * boot-built SoA artifacts and internally slices wider prefill batches
-     * into its 16-row kernel envelope. It declines only when artifacts do not
-     * exist for this tensor, then the separate-matmul route takes over. */
+     * the combine at the end is a plain sum for all of them. The aligned path
+     * reads the boot-built SoA artifacts: wide prefill uses paired D2R into
+     * rg/ru, while small batches retain the fused vector kernel. It declines
+     * only when artifacts do not exist for this tensor, then the
+     * separate-matmul route takes over. */
     if (!ds4_gpu_exaone_aligned_gate_up_mid_tensor(
-                rm, norm, sel, rw, m->map, m->size,
+                rm, rg, ru, norm, sel, rw, m->map, m->size,
                 l->ffn_gate_exps->abs_offset, l->ffn_gate_exps->bytes,
                 l->ffn_up_exps->abs_offset, l->ffn_up_exps->bytes,
                 l->ffn_gate_exps->type,
@@ -50331,13 +50337,15 @@ static bool exaone_layer_tail(ds4_exaone_gpu_graph *g,
                                               l->ffn_gate_exps->bytes,
                                               l->ffn_gate_exps->type,
                                               (uint32_t)n_embd, (uint32_t)n_ff_exp,
-                                              DS4_N_EXPERT, n_tok, n_used) ||
+                                              DS4_N_EXPERT, n_tok, n_used,
+                                              n_tok) ||
             !ds4_gpu_exaone_moe_matmul_tensor(ru, norm, sel, m->map, m->size,
                                               l->ffn_up_exps->abs_offset,
                                               l->ffn_up_exps->bytes,
                                               l->ffn_up_exps->type,
                                               (uint32_t)n_embd, (uint32_t)n_ff_exp,
-                                              DS4_N_EXPERT, n_tok, n_used) ||
+                                              DS4_N_EXPERT, n_tok, n_used,
+                                              n_tok) ||
             !ds4_gpu_exaone_swiglu_weighted_tensor(rm, rg, ru, rw,
                                                    (uint32_t)n_ff_exp,
                                                    (uint64_t)n_tok * n_used * n_ff_exp))
@@ -50351,7 +50359,8 @@ static bool exaone_layer_tail(ds4_exaone_gpu_graph *g,
                                           l->ffn_down_exps->bytes,
                                           l->ffn_down_exps->type,
                                           (uint32_t)n_ff_exp, (uint32_t)n_embd,
-                                          DS4_N_EXPERT, n_tok * n_used, 1u))
+                                          DS4_N_EXPERT, n_tok * n_used, 1u,
+                                          n_tok))
         return false;
 
     const uint64_t n_ff_shexp = l->ffn_gate_shexp->dim[1];
@@ -50755,17 +50764,40 @@ static bool exaone_graph_prefill_chunk(ds4_exaone_gpu_graph *g,
     if (n_tok == 0u || n_tok > g->prefill_cap) return false;
     const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
 
-    for (uint32_t t = 0; t < n_tok; t++) {
-        ds4_gpu_tensor *row = ds4_gpu_tensor_view(
-                g->ws->b_cur, (uint64_t)t * g->n_embd * sizeof(float),
-                g->n_embd * sizeof(float));
-        if (!row) return false;
-        const int ok = ds4_gpu_embed_token_quant_tensor(
-                row, m->map, m->size, w->token_embd->abs_offset,
-                w->token_embd->type, DS4_N_VOCAB, (uint32_t)tokens[t],
-                (uint32_t)g->n_embd);
-        ds4_gpu_tensor_free(row);
-        if (!ok) return false;
+    const char *batch_embed_env = getenv("DS4_EXAONE_BATCH_EMBED");
+    const bool batch_embed =
+        n_tok >= 32u && g->ws && g->ws->b_tokens &&
+        !(batch_embed_env && batch_embed_env[0] == '0');
+    if (batch_embed) {
+        if (!ds4_gpu_tensor_write(g->ws->b_tokens, 0, tokens,
+                                  (uint64_t)n_tok * sizeof(int32_t)) ||
+            !ds4_gpu_embed_tokens_quant_tensor(
+                    g->ws->b_cur, g->ws->b_tokens,
+                    m->map, m->size, w->token_embd->abs_offset,
+                    w->token_embd->type, DS4_N_VOCAB, n_tok,
+                    (uint32_t)g->n_embd)) {
+            return false;
+        }
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr,
+                    "ds4: exaone wide prefill using batched Q8 embeddings "
+                    "(tokens=%u)\n", n_tok);
+        }
+    } else {
+        for (uint32_t t = 0; t < n_tok; t++) {
+            ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+                    g->ws->b_cur, (uint64_t)t * g->n_embd * sizeof(float),
+                    g->n_embd * sizeof(float));
+            if (!row) return false;
+            const int ok = ds4_gpu_embed_token_quant_tensor(
+                    row, m->map, m->size, w->token_embd->abs_offset,
+                    w->token_embd->type, DS4_N_VOCAB, (uint32_t)tokens[t],
+                    (uint32_t)g->n_embd);
+            ds4_gpu_tensor_free(row);
+            if (!ok) return false;
+        }
     }
     for (uint32_t il = 0; il < n_exec; il++) {
         if (!exaone_graph_layer(g, m, w, il, n_tok, pos0, g->ws->b_cur, 0u, NULL, NULL)) {

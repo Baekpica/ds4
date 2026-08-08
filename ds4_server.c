@@ -958,6 +958,7 @@ static bool model_alias_disables_thinking(const char *model) {
             !strcmp(model, "glm-5.2-chat") ||
             !strcmp(model, "glm-5.2-no-think") ||
             !strcmp(model, "glm-5.2-nothink") ||
+            !strcmp(model, "k-exaone-236b-a23b-chat") ||
             !strcmp(model, "zai/glm-5.2-chat"));
 }
 
@@ -985,6 +986,7 @@ static bool server_model_alias_known(const char *id) {
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4-pro") ||
             !strcmp(id, "k-exaone-236b-a23b") ||
+            !strcmp(id, "k-exaone-236b-a23b-chat") ||
             !strcmp(id, "K-EXAONE-236B-A23B") ||
             !strcmp(id, "glm-5.2") ||
             !strcmp(id, "glm-5.2-chat") ||
@@ -12596,11 +12598,14 @@ static bool send_models(server *s, int fd) {
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-reasoner");
     } else if (ds4_engine_is_exaone_moe(s->engine)) {
-        /* One id, the loaded model's own.  Any client-sent id still serves
-         * the loaded GGUF; this is what pickers display. */
+        /* The loaded model's own id, twice over the same GLM convention:
+         * the bare id keeps the default (thinking on), -chat answers
+         * directly.  A picker is often the only control surface a client
+         * exposes, and this model thinks for thousands of tokens on a
+         * greeting when nothing turns it off. */
         append_model_json(&b, s, "k-exaone-236b-a23b");
         buf_putc(&b, ',');
-        append_model_json(&b, s, "K-EXAONE-236B-A23B");
+        append_model_json(&b, s, "k-exaone-236b-a23b-chat");
     } else {
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
@@ -14791,6 +14796,7 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_disables_thinking("deepseek-chat"));
     TEST_ASSERT(model_alias_disables_thinking("glm-5.2-chat"));
     TEST_ASSERT(model_alias_disables_thinking("glm-5.2-no-think"));
+    TEST_ASSERT(model_alias_disables_thinking("k-exaone-236b-a23b-chat"));
     TEST_ASSERT(model_alias_disables_thinking("zai/glm-5.2-chat"));
     TEST_ASSERT(!model_alias_disables_thinking("glm-5.2"));
     TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
@@ -14798,6 +14804,8 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+    TEST_ASSERT(server_model_alias_known("k-exaone-236b-a23b"));
+    TEST_ASSERT(server_model_alias_known("k-exaone-236b-a23b-chat"));
 }
 
 static void test_api_thinking_controls_parse(void) {
