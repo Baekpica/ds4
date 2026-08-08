@@ -37186,6 +37186,11 @@ struct ds4_engine {
      * session.  Separate because that graph is its own object, not a
      * ds4_gpu_graph.  NULL until a session asks for it. */
     ds4_exaone_batch_ws *exaone_shared_ws;
+    /* Logits rows for the cross-session batched decode step.  Lazily sized to
+     * the largest batch seen; the per-session graphs keep their own single
+     * logits row for everything else. */
+    ds4_gpu_tensor *exaone_batch_logits;
+    uint32_t exaone_batch_logits_rows;
 #endif
 
     /* Wave-2 multi-GPU placement scaffolding: optional multi-GPU placement
@@ -50174,11 +50179,33 @@ static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
     return true;
 }
 
+/* One row of a cross-session batched decode step: whose KV ring the row
+ * belongs to, and at what absolute position.  The rest of the layer body is
+ * row-independent, which is the whole point of batching it. */
+typedef struct {
+    ds4_exaone_gpu_graph *g;
+    uint32_t              pos;
+} ds4_exaone_decode_row;
+
+/* Rows a batched decode step will take at once.  Above this the step falls
+ * back to the sequential loop rather than growing stack arrays -- a server
+ * with more resident sessions than this is already mis-sized for the device. */
+enum { DS4_EXAONE_DECODE_BATCH_MAX = 64 };
+
 /* One transformer layer, prefill and decode sharing the body.
  *
  * `n_tok` is 1 for decode; the only other differences are which workspace
  * slots are used and which attention entry runs, both selected here rather
  * than duplicated into two near-identical functions.
+ *
+ * `rows`, when non-NULL, turns the batch path into a cross-session decode
+ * step: n_tok rows that belong to n_tok different sessions, one new token
+ * each.  The weight-bound stages (projections, dense/shared MLP, router,
+ * routed experts) run batched exactly as prefill does -- that is where the
+ * time goes, and it is what lets N concurrent sessions read the active
+ * weights once instead of N times.  Only RoPE, the KV store and attention
+ * are per-row, because each row has its own ring and absolute position;
+ * those are the depth-dependent stages that could never amortise anyway.
  *
  * x is updated in place: it enters as the residual stream and leaves as the
  * residual stream after both sublayers.
@@ -50190,7 +50217,8 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
                                uint32_t n_tok,
                                uint32_t pos0,
                                ds4_gpu_tensor *x,
-                               uint32_t window_limit) {
+                               uint32_t window_limit,
+                               const ds4_exaone_decode_row *rows) {
     const ds4_layer_weights *l = &w->layer[il];
     const bool batch = n_tok > 1u;
     const uint64_t n_embd = g->n_embd;
@@ -50216,40 +50244,86 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
         !metal_graph_matmul_plain_tensor(v, m, l->attn_v, n_embd, g->kv_dim, norm, n_tok))
         return false;
 
-    /* QK-norm before RoPE, per head over head_dim; RoPE only on the sliding
-     * layers -- the full-attention ones carry no positional encoding. */
-    if (DS4_USE_QK_NORM) {
-        if (!ds4_gpu_exaone_qk_norm_rope_tensor(q, m->map, m->size,
-                                                l->attn_q_norm->abs_offset,
-                                                DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                                DS4_N_ROT, pos0, n_tok,
-                                                DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
-                                                sliding) ||
-            !ds4_gpu_exaone_qk_norm_rope_tensor(k, m->map, m->size,
-                                                l->attn_k_norm->abs_offset,
-                                                DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-                                                DS4_N_ROT, pos0, n_tok,
-                                                DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
-                                                sliding))
-            return false;
-    }
-
-    if (!ds4_gpu_exaone_kv_store_tensor(g->layer_kv[il], k, v,
-                                        (uint32_t)g->kv_dim, n_tok, pos0, kv_cap))
-        return false;
-
     uint32_t window = sliding ? DS4_N_SWA : 0u;
     if (window_limit != 0u && window_limit < window) window = window_limit;
-    if (batch) {
-        if (!ds4_gpu_exaone_attention_prefill_tensor(
-                heads, q, g->layer_kv[il], n_tok, pos0, DS4_N_HEAD,
-                DS4_N_HEAD_KV, DS4_N_HEAD_DIM, kv_cap, window))
-            return false;
+
+    if (rows) {
+        /* Cross-session rows: each has its own absolute position and ring, so
+         * RoPE, the store and attention go row by row on views.  All three are
+         * cheap next to the batched projections around them. */
+        for (uint32_t t = 0; t < n_tok; t++) {
+            const ds4_exaone_gpu_graph *rg = rows[t].g;
+            const uint32_t pos = rows[t].pos;
+            ds4_gpu_tensor *qr = ds4_gpu_tensor_view(
+                    q, (uint64_t)t * g->q_dim * sizeof(float),
+                    g->q_dim * sizeof(float));
+            ds4_gpu_tensor *kr = ds4_gpu_tensor_view(
+                    k, (uint64_t)t * g->kv_dim * sizeof(float),
+                    g->kv_dim * sizeof(float));
+            ds4_gpu_tensor *vr = ds4_gpu_tensor_view(
+                    v, (uint64_t)t * g->kv_dim * sizeof(float),
+                    g->kv_dim * sizeof(float));
+            ds4_gpu_tensor *hr = ds4_gpu_tensor_view(
+                    heads, (uint64_t)t * g->q_dim * sizeof(float),
+                    g->q_dim * sizeof(float));
+            bool ok = qr && kr && vr && hr;
+            if (ok && DS4_USE_QK_NORM) {
+                ok = ds4_gpu_exaone_qk_norm_rope_tensor(qr, m->map, m->size,
+                        l->attn_q_norm->abs_offset, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                        DS4_N_ROT, pos, 1u, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
+                        sliding) &&
+                     ds4_gpu_exaone_qk_norm_rope_tensor(kr, m->map, m->size,
+                        l->attn_k_norm->abs_offset, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                        DS4_N_ROT, pos, 1u, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
+                        sliding);
+            }
+            if (ok) {
+                ok = ds4_gpu_exaone_kv_store_tensor(rg->layer_kv[il], kr, vr,
+                        (uint32_t)g->kv_dim, 1u, pos, rg->layer_kv_cap[il]) &&
+                     ds4_gpu_exaone_attention_decode_tensor(hr, qr,
+                        rg->layer_kv[il], DS4_N_HEAD, DS4_N_HEAD_KV,
+                        DS4_N_HEAD_DIM, rg->layer_kv_cap[il], pos, window);
+            }
+            ds4_gpu_tensor_free(qr);
+            ds4_gpu_tensor_free(kr);
+            ds4_gpu_tensor_free(vr);
+            ds4_gpu_tensor_free(hr);
+            if (!ok) return false;
+        }
     } else {
-        if (!ds4_gpu_exaone_attention_decode_tensor(
-                heads, q, g->layer_kv[il], DS4_N_HEAD, DS4_N_HEAD_KV,
-                DS4_N_HEAD_DIM, kv_cap, pos0, window))
+        /* QK-norm before RoPE, per head over head_dim; RoPE only on the sliding
+         * layers -- the full-attention ones carry no positional encoding. */
+        if (DS4_USE_QK_NORM) {
+            if (!ds4_gpu_exaone_qk_norm_rope_tensor(q, m->map, m->size,
+                                                    l->attn_q_norm->abs_offset,
+                                                    DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                    DS4_N_ROT, pos0, n_tok,
+                                                    DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
+                                                    sliding) ||
+                !ds4_gpu_exaone_qk_norm_rope_tensor(k, m->map, m->size,
+                                                    l->attn_k_norm->abs_offset,
+                                                    DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                                                    DS4_N_ROT, pos0, n_tok,
+                                                    DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
+                                                    sliding))
+                return false;
+        }
+
+        if (!ds4_gpu_exaone_kv_store_tensor(g->layer_kv[il], k, v,
+                                            (uint32_t)g->kv_dim, n_tok, pos0, kv_cap))
             return false;
+
+        if (batch) {
+            if (!ds4_gpu_exaone_attention_prefill_tensor(
+                    heads, q, g->layer_kv[il], n_tok, pos0, DS4_N_HEAD,
+                    DS4_N_HEAD_KV, DS4_N_HEAD_DIM, kv_cap, window))
+                return false;
+        } else {
+            if (!ds4_gpu_exaone_attention_decode_tensor(
+                    heads, q, g->layer_kv[il], DS4_N_HEAD, DS4_N_HEAD_KV,
+                    DS4_N_HEAD_DIM, kv_cap, pos0, window))
+                return false;
+        }
     }
     if (!metal_graph_matmul_plain_tensor(attn_out, m, l->attn_output,
                                          g->q_dim, n_embd, heads, n_tok))
@@ -50376,6 +50450,24 @@ static bool exaone_graph_output_head(ds4_exaone_gpu_graph *g,
     return ok;
 }
 
+/* Final norm and the output head over n_tok rows at once, into `logits`
+ * (n_tok x DS4_N_VOCAB).  The LM head is the single largest weight read of a
+ * decode step, so this is where a batched step earns most of its keep. */
+static bool exaone_graph_output_head_batch(ds4_exaone_gpu_graph *g,
+                                           const ds4_model *m,
+                                           const ds4_weights *w,
+                                           ds4_gpu_tensor *x,
+                                           uint32_t n_tok,
+                                           ds4_gpu_tensor *logits) {
+    return ds4_gpu_exaone_rms_norm_tensor(g->ws->b_norm, x, m->map, m->size,
+                                          w->output_norm->abs_offset,
+                                          (uint32_t)g->n_embd, n_tok,
+                                          DS4_RMS_EPS) &&
+           metal_graph_matmul_plain_tensor(logits, m, w->output,
+                                           g->n_embd, DS4_N_VOCAB,
+                                           g->ws->b_norm, n_tok);
+}
+
 /* Prefill one chunk. Only the final token's logits are produced -- the rest
  * of the chunk exists to fill the KV caches. */
 static bool exaone_graph_prefill_chunk(ds4_exaone_gpu_graph *g,
@@ -50401,7 +50493,7 @@ static bool exaone_graph_prefill_chunk(ds4_exaone_gpu_graph *g,
         if (!ok) return false;
     }
     for (uint32_t il = 0; il < n_exec; il++) {
-        if (!exaone_graph_layer(g, m, w, il, n_tok, pos0, g->ws->b_cur, 0u)) {
+        if (!exaone_graph_layer(g, m, w, il, n_tok, pos0, g->ws->b_cur, 0u, NULL)) {
             fprintf(stderr, "ds4: exaone prefill failed at layer %u\n", il);
             return false;
         }
@@ -50424,7 +50516,7 @@ static bool exaone_graph_decode(ds4_exaone_gpu_graph *g,
                                           (uint32_t)token, (uint32_t)g->n_embd))
         return false;
     for (uint32_t il = 0; il < n_exec; il++) {
-        if (!exaone_graph_layer(g, m, w, il, 1u, pos, g->cur, 0u)) {
+        if (!exaone_graph_layer(g, m, w, il, 1u, pos, g->cur, 0u, NULL)) {
             fprintf(stderr, "ds4: exaone decode failed at layer %u\n", il);
             return false;
         }
@@ -50539,7 +50631,8 @@ static bool exaone_graph_mtp_step(ds4_exaone_gpu_graph *g,
     const uint32_t written = mtp_pos - min_pos + 1u;
     if (ok) {
         ok = exaone_graph_layer(g, m, w, il, 1u, mtp_pos, g->cur,
-                                written < DS4_N_SWA ? written : DS4_N_SWA);
+                                written < DS4_N_SWA ? written : DS4_N_SWA,
+                                NULL);
     }
     if (ok) {
         ok = ds4_gpu_exaone_rms_norm_tensor(
@@ -59968,6 +60061,9 @@ void ds4_engine_close(ds4_engine *e) {
         free(e->exaone_shared_ws);
         e->exaone_shared_ws = NULL;
     }
+    ds4_gpu_tensor_free(e->exaone_batch_logits);
+    e->exaone_batch_logits = NULL;
+    e->exaone_batch_logits_rows = 0;
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
@@ -67647,6 +67743,69 @@ static bool metal_graph_eval_mixed_prefill_decode(
  * Sessions are advanced only after every encode succeeded, so a failure
  * leaves the batch logically untouched rather than half-committed. */
 #ifndef DS4_NO_GPU
+/* Decode one token for each of `count` sessions in a single pass.
+ *
+ * The carrier graph supplies the shared scratch and the batched stages; each
+ * row's ring and position come from its own session's graph via `rows`.  The
+ * result is one read of the non-routed active weights for all `count` rows
+ * where the sequential loop paid `count` reads -- which is why aggregate
+ * decode throughput was flat from 1 to 8 streams before this existed.
+ *
+ * Logits land in `logits` (count x DS4_N_VOCAB), row i belonging to items[i].
+ * The caller reads them back after a device sync.
+ *
+ * Numerics: the batched projections take the same kernels prefill and the
+ * two-row MTP verify take, which reduce in a different order than the
+ * single-row kernels.  Greedy output is expected identical -- the MTP
+ * identity run already held over long generations on exactly this pairing --
+ * but bitwise logits equality with the sequential path is not the contract. */
+static bool exaone_engine_batch_logits_ensure(ds4_engine *e, uint32_t rows) {
+    if (e->exaone_batch_logits && e->exaone_batch_logits_rows >= rows)
+        return true;
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(
+            (uint64_t)rows * DS4_N_VOCAB * sizeof(float));
+    if (!t) return false;
+    ds4_gpu_tensor_free(e->exaone_batch_logits);
+    e->exaone_batch_logits = t;
+    e->exaone_batch_logits_rows = rows;
+    return true;
+}
+
+static bool exaone_graph_decode_batch(ds4_engine *e,
+                                      const ds4_decode_item *items,
+                                      int count,
+                                      ds4_gpu_tensor *logits) {
+    ds4_exaone_gpu_graph *g = &items[0].session->exaone_graph;
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    ds4_exaone_decode_row rows[DS4_EXAONE_DECODE_BATCH_MAX];
+
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        rows[i].g = &s->exaone_graph;
+        rows[i].pos = (uint32_t)s->checkpoint.len;
+        ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+                g->ws->b_cur, (uint64_t)i * g->n_embd * sizeof(float),
+                g->n_embd * sizeof(float));
+        if (!row) return false;
+        const int ok = ds4_gpu_embed_token_quant_tensor(
+                row, e->model.map, e->model.size,
+                e->weights.token_embd->abs_offset,
+                e->weights.token_embd->type, DS4_N_VOCAB,
+                (uint32_t)items[i].token, (uint32_t)g->n_embd);
+        ds4_gpu_tensor_free(row);
+        if (!ok) return false;
+    }
+    for (uint32_t il = 0; il < n_exec; il++) {
+        if (!exaone_graph_layer(g, &e->model, &e->weights, il,
+                                (uint32_t)count, 0u, g->ws->b_cur, 0u, rows)) {
+            fprintf(stderr, "ds4: exaone batched decode failed at layer %u\n", il);
+            return false;
+        }
+    }
+    return exaone_graph_output_head_batch(g, &e->model, &e->weights,
+                                          g->ws->b_cur, (uint32_t)count, logits);
+}
+
 static int ds4_sessions_eval_batch_exaone(ds4_decode_item *items, int count,
                                           char *err, size_t errlen) {
     ds4_engine *e = items[0].session->engine;
@@ -67667,17 +67826,35 @@ static int ds4_sessions_eval_batch_exaone(ds4_decode_item *items, int count,
         }
     }
 
+    /* One batched pass when the shapes allow it; the sequential loop stays as
+     * the single-row case and the fallback.  The batched-logits rows live on
+     * the engine, so growing them is once per high-water mark, not per step. */
+    ds4_exaone_gpu_graph *carrier = &items[0].session->exaone_graph;
+    const bool rowbatch =
+        count > 1 && count <= DS4_EXAONE_DECODE_BATCH_MAX &&
+        carrier->ws && (uint32_t)count <= carrier->ws->prefill_cap &&
+        exaone_engine_batch_logits_ensure(e, (uint32_t)count);
+
     bool ok = true;
-    for (int i = 0; ok && i < count; i++) {
-        ds4_session *s = items[i].session;
-        ok = exaone_graph_decode(&s->exaone_graph, &e->model, &e->weights,
-                                 items[i].token, (uint32_t)s->checkpoint.len);
+    if (rowbatch) {
+        ok = exaone_graph_decode_batch(e, items, count, e->exaone_batch_logits);
+    } else {
+        for (int i = 0; ok && i < count; i++) {
+            ds4_session *s = items[i].session;
+            ok = exaone_graph_decode(&s->exaone_graph, &e->model, &e->weights,
+                                     items[i].token, (uint32_t)s->checkpoint.len);
+        }
     }
     if (ok) ok = ds4_gpu_synchronize() != 0;
     for (int i = 0; ok && i < count; i++) {
         ds4_session *s = items[i].session;
-        ok = ds4_gpu_tensor_read(s->exaone_graph.logits, 0, s->logits,
-                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        ok = rowbatch
+            ? ds4_gpu_tensor_read(e->exaone_batch_logits,
+                                  (uint64_t)i * DS4_N_VOCAB * sizeof(float),
+                                  s->logits,
+                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0
+            : ds4_gpu_tensor_read(s->exaone_graph.logits, 0, s->logits,
+                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (!ok) {
         for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);

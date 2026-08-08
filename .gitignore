@@ -43,3 +43,4 @@ __pycache__/
 /tests/test_exaone_tokenizer
 /tests/test_exaone_mtp_policy
 /tests/test_exaone_mtp_identity
+/tests/test_exaone_decode_batch

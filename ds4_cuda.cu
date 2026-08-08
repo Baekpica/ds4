@@ -14732,10 +14732,17 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
               CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
               in_dim, out_dim, 1u, aligned_bytes)
         : NULL;
-    if (aligned && n_tok == 1u) {
+    /* The aligned vec kernel amortizes one weight read over up to 8
+     * activation columns (its own documented "decode/verify-width envelope"),
+     * and the artifact it reads is resident.  2..8-row calls used to fall
+     * through to raw-pointer mmq, which re-read the Q8 weights per call from
+     * a non-artifact pointer -- so a cross-session batched decode step cost
+     * nearly as much as N sequential steps and the MTP two-row verify paid
+     * k~2 at shallow depth.  Small batches belong here. */
+    if (aligned && n_tok >= 1u && n_tok <= 8u) {
         const int rc = ds4_mmq_q8_0_aligned_dense_vec(
             aligned, (const float *)x->ptr, (float *)out->ptr,
-            (int)out_dim, 1, (int)in_dim, cuda_decode_stream());
+            (int)out_dim, (int)n_tok, (int)in_dim, cuda_decode_stream());
         if (rc == 0) return 1;
     }
     if (aligned && n_tok >= 512u && out_dim >= 2048u &&
@@ -31201,6 +31208,12 @@ __global__ static void exaone_kv_store_batch_kernel(
     if (idx >= total) return;
     const uint32_t t = idx / kv_dim;
     const uint32_t i = idx - t * kv_dim;
+    /* If a later token in this launch maps to the same slot, this write would
+     * be dead under sequential semantics -- and a data race under concurrent
+     * ones, since block order is not defined.  The engine sizes rings so a
+     * launch never wraps (cap >= window + chunk), so this guard costs one
+     * compare and only ever fires for callers exercising wrap deliberately. */
+    if (t + kv_cap < n_tokens) return;
     const uint32_t slot = (pos0 + t) % kv_cap;
     __half *row = kv + (size_t)slot * (size_t)kv_dim * 2u;
     row[i]          = __float2half(k[(size_t)t * kv_dim + i]);
