@@ -44,3 +44,11 @@ __pycache__/
 /tests/test_exaone_mtp_policy
 /tests/test_exaone_mtp_identity
 /tests/test_exaone_decode_batch
+/tests/test_solar_kda
+/tests/test_solar_kda_prefill
+/tests/test_solar_kda_fla
+/tests/test_solar_gates
+/tests/test_solar_kv
+/tests/test_solar_loader
+/tests/test_solar_tokenizer
+/tests/test_solar_session

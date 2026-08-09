@@ -172,7 +172,9 @@ enum {
     T_HEAD     = 64,
     T_HEAD_KV  = 8,
     T_HEAD_DIM = 128,
-    T_EXPERT   = 128,
+    /* Exercise the generic router at Solar Open 2's full routed-expert
+     * width.  The kernel also serves the 128E EXAONE profile. */
+    T_EXPERT   = 320,
     T_USED     = 8,
 };
 

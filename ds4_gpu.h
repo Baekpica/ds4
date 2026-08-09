@@ -2680,6 +2680,100 @@ void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
 
 /* =========================================================================
+ * Solar Open 2 KDA.
+ * =========================================================================
+ *
+ * One recurrent decode step after the Q/K/V, forget-gate and beta
+ * projections. All tensors are f32 and device-resident. The three depthwise
+ * convolution states use [head, dim, conv_kernel] with the newest raw
+ * projection value in the last slot. recurrent_state uses
+ * [head, key_dim, value_dim]; Solar has key_dim == value_dim == head_dim.
+ *
+ * decay_scale is the GGUF-converted -exp(A_log), one value per head. The
+ * kernel computes
+ *
+ *   g = max(decay_scale * softplus(g_raw + dt_bias), gate_lower_bound)
+ *
+ * then applies official Q/K L2 normalization (eps 1e-6), beta=2*sigmoid,
+ * per-key-row state decay, delta update, and 1/sqrt(head_dim) query scale.
+ * Q/K/V convolution includes the official SiLU activation.
+ *
+ * State reset is tensor_fill_f32(..., 0). Fork/clone is tensor_copy of all
+ * four state tensors. A rewind cannot be inverted: callers must restore a
+ * snapshot containing recurrent + all three convolution states, or invalidate
+ * and replay from an earlier checkpoint.
+ */
+int ds4_gpu_solar_kda_decode_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound);
+
+/* Same equations and persistent state as decode, but consumes token-major
+ * [n_tokens, n_head * head_dim] Q/K/V/g projections in one CUDA launch.
+ * beta_logits is [n_tokens, n_head], and out is token-major. Sequence order is
+ * processed inside each per-head block, avoiding a host/kernel launch loop at
+ * 1M context while preserving arbitrary chunk-boundary continuation. */
+int ds4_gpu_solar_kda_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound);
+
+/* Solar's softmax/GQA branch gates the flattened attention output before the
+ * output projection. `x` and `out` may alias; all tensors are f32. */
+int ds4_gpu_solar_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        uint64_t                count);
+
+/* Solar's KDA output normalization is per head, not across the flattened
+ * projection: RMSNorm(x[head, :]) * weight[:] * sigmoid(gate[head, :]).
+ * The head_dim-long f32 weight is reused for every head and token. `x` and
+ * `out` may alias. */
+int ds4_gpu_solar_head_rms_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *weight,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   eps);
+
+/* =========================================================================
  * K-EXAONE (exaone-moe).
  * =========================================================================
  *
@@ -2742,6 +2836,75 @@ int ds4_gpu_exaone_kv_store_tensor(
         uint32_t                n_tokens,
         uint32_t                pos0,
         uint32_t                kv_cap);
+
+/* Solar Open 2 full-attention KV formats.  BF16 is the small-context oracle;
+ * the compressed formats keep one f16 scale per (position, K/V, KV head).
+ * FP8 stores E4M3FN codes, FP4 stores packed E2M1 codes, and the hybrid keeps
+ * keys in FP8 while packing values to FP4. */
+#ifndef DS4_SOLAR_KV_FORMAT_DEFINED
+#define DS4_SOLAR_KV_FORMAT_DEFINED
+typedef enum {
+    DS4_SOLAR_KV_BF16       = 0,
+    DS4_SOLAR_KV_FP8        = 1,
+    DS4_SOLAR_KV_FP4        = 2,
+    DS4_SOLAR_KV_KFP8_VFP4 = 3,
+} ds4_solar_kv_format;
+#endif
+
+uint64_t ds4_gpu_solar_kv_row_bytes(
+        ds4_solar_kv_format format,
+        uint32_t            n_head_kv,
+        uint32_t            head_dim);
+
+int ds4_gpu_solar_kv_store_tensor(
+        ds4_gpu_tensor       *kv,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                kv_cap,
+        ds4_solar_kv_format     format);
+
+int ds4_gpu_solar_attention_decode_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        ds4_solar_kv_format     format);
+
+int ds4_gpu_solar_attention_decode_split_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        ds4_gpu_tensor       *partials,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        uint32_t                chunk_len,
+        ds4_solar_kv_format     format);
+
+int ds4_gpu_solar_attention_prefill_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                window,
+        ds4_solar_kv_format     format);
 
 /* window == 0 means full attention. */
 int ds4_gpu_exaone_attention_decode_tensor(

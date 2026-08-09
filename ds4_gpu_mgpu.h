@@ -66,6 +66,16 @@ typedef struct {
 } ds4_gpu_attention_decode_row;
 #endif
 
+#ifndef DS4_SOLAR_KV_FORMAT_DEFINED
+#define DS4_SOLAR_KV_FORMAT_DEFINED
+typedef enum {
+    DS4_SOLAR_KV_BF16       = 0,
+    DS4_SOLAR_KV_FP8        = 1,
+    DS4_SOLAR_KV_FP4        = 2,
+    DS4_SOLAR_KV_KFP8_VFP4 = 3,
+} ds4_solar_kv_format;
+#endif
+
 /* Tagged so headers (notably ds4.h) can forward-declare `struct
  * ds4_gpu_config` without dragging in this entire header. */
 typedef struct ds4_gpu_config {

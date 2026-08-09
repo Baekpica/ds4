@@ -31740,9 +31740,10 @@ __global__ static void exaone_attn_prefill_tiled_kernel(
 
 /* Router: sigmoid over the gate logits, top-k on probs + exp_probs_b, weights
  * read back from the UNBIASED probs, normalized then scaled.  One block, one
- * token per blockIdx.x.  n_expert is 128 here so a single-thread selection
- * loop after a parallel sigmoid is not worth splitting further, and it keeps
- * the tie-break identical to the reference (first index wins). */
+ * token per blockIdx.x.  The supported profiles currently have up to 384
+ * experts (Solar uses 320), so a single-thread selection loop after a
+ * parallel sigmoid is still small and keeps the tie-break identical to the
+ * reference (first index wins). */
 __global__ static void exaone_router_kernel(
         int32_t *selected,
         float *weights,
@@ -31874,6 +31875,456 @@ __global__ static void exaone_add_kernel(float *x, const float *y, uint64_t coun
     if (i < count) x[i] += y[i];
 }
 
+/* ---- Solar Open 2 compressed GQA KV ------------------------------------
+ *
+ * A cache row is self-contained so snapshots can copy live rows verbatim:
+ *
+ *   BF16       [K f16][V f16]
+ *   FP8        [K e4m3][V e4m3][K scale f16 per head][V scale f16 per head]
+ *   FP4        [K e2m1 packed][V e2m1 packed][K scales][V scales]
+ *   K8/V4      [K e4m3][V e2m1 packed][K scales][V scales]
+ *
+ * Scales are per (position, K/V, KV head), not per whole row.  This keeps an
+ * outlier in one of Solar's eight KV heads from spending the dynamic range of
+ * all the others.  The scale itself is rounded to f16 before codes are made,
+ * so the store and attention paths use exactly the same value.
+ */
+static uint64_t solar_kv_row_bytes_impl(
+        uint32_t format,
+        uint32_t n_head_kv,
+        uint32_t head_dim) {
+    if (n_head_kv == 0u || head_dim == 0u) return 0u;
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    switch (format) {
+    case DS4_SOLAR_KV_BF16:
+        return kv_dim * 2u * sizeof(__half);
+    case DS4_SOLAR_KV_FP8:
+        return kv_dim * 2u + (uint64_t)n_head_kv * 2u * sizeof(__half);
+    case DS4_SOLAR_KV_FP4:
+        if ((head_dim & 1u) != 0u) return 0u;
+        return kv_dim + (uint64_t)n_head_kv * 2u * sizeof(__half);
+    case DS4_SOLAR_KV_KFP8_VFP4:
+        if ((head_dim & 1u) != 0u) return 0u;
+        return kv_dim + kv_dim / 2u +
+               (uint64_t)n_head_kv * 2u * sizeof(__half);
+    default:
+        return 0u;
+    }
+}
+
+__device__ static uint8_t solar_e4m3fn_encode_dev(float x) {
+    if (!isfinite(x) || x == 0.0f) return 0u;
+    const uint8_t sign = x < 0.0f ? 0x80u : 0u;
+    const float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value_dev(mid) <= ax) lo = mid;
+        else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        const float bd = fabsf(ax - dsv4_e4m3fn_value_dev(best));
+        const float nd = fabsf(ax - dsv4_e4m3fn_value_dev(best + 1));
+        if (nd < bd ||
+            (nd == bd && (((best + 1) & 1) == 0) && ((best & 1) != 0))) {
+            best++;
+        }
+    }
+    return sign | (uint8_t)best;
+}
+
+__device__ static float solar_e4m3fn_decode_dev(uint8_t code) {
+    const float v = dsv4_e4m3fn_value_dev((int)(code & 0x7fu));
+    return (code & 0x80u) ? -v : v;
+}
+
+__device__ static uint8_t solar_e2m1_encode_dev(float x) {
+    if (!isfinite(x) || x == 0.0f) return 0u;
+    const uint8_t sign = x < 0.0f ? 0x8u : 0u;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float bd = fabsf(ax - dsv4_e2m1fn_value_dev(0));
+    for (int i = 1; i < 8; i++) {
+        const float nd = fabsf(ax - dsv4_e2m1fn_value_dev(i));
+        if (nd < bd ||
+            (nd == bd && ((i & 1) == 0) && ((best & 1) != 0))) {
+            best = i;
+            bd = nd;
+        }
+    }
+    return sign | (uint8_t)best;
+}
+
+__device__ static float solar_e2m1_decode_dev(uint8_t code) {
+    const float v = dsv4_e2m1fn_value_dev((int)(code & 0x7u));
+    return (code & 0x8u) ? -v : v;
+}
+
+__device__ static float solar_scale_to_f16_dev(float amax, float qmax,
+                                                __half *stored) {
+    float scale = (isfinite(amax) && amax > 0.0f) ? amax / qmax : 1.0f;
+    if (scale > 65504.0f) scale = 65504.0f;
+    __half hs = __float2half(scale);
+    float rounded = __half2float(hs);
+    if (!(rounded > 0.0f) || !isfinite(rounded)) {
+        /* Smallest positive f16 subnormal. Neural KV scales are many orders
+         * larger, but the fallback makes an all-finite contract explicit. */
+        hs = __float2half(5.960464477539063e-8f);
+        rounded = __half2float(hs);
+    }
+    *stored = hs;
+    return rounded;
+}
+
+__global__ static void solar_kv_store_compressed_kernel(
+        uint8_t *kv,
+        const float *k,
+        const float *v,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t kv_cap,
+        uint32_t format,
+        uint64_t row_bytes) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (t >= n_tokens || h >= n_head_kv) return;
+    if (t + kv_cap < n_tokens) return;
+
+    const uint32_t tid = threadIdx.x;
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    const uint64_t vec0 = ((uint64_t)t * n_head_kv + h) * head_dim;
+    const uint32_t slot = (pos0 + t) % kv_cap;
+    uint8_t *row = kv + (uint64_t)slot * row_bytes;
+
+    __shared__ float k_abs[256];
+    __shared__ float v_abs[256];
+    float km = 0.0f, vm = 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        const float kx = k[vec0 + d];
+        const float vx = v[vec0 + d];
+        if (isfinite(kx)) km = fmaxf(km, fabsf(kx));
+        if (isfinite(vx)) vm = fmaxf(vm, fabsf(vx));
+    }
+    k_abs[tid] = km;
+    v_abs[tid] = vm;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            k_abs[tid] = fmaxf(k_abs[tid], k_abs[tid + stride]);
+            v_abs[tid] = fmaxf(v_abs[tid], v_abs[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    const uint64_t k_bytes =
+        format == DS4_SOLAR_KV_FP4 ? kv_dim / 2u : kv_dim;
+    const uint64_t v_bytes =
+        format == DS4_SOLAR_KV_FP8 ? kv_dim : kv_dim / 2u;
+    __half *scales = (__half *)(row + k_bytes + v_bytes);
+    __shared__ float ks, vs;
+    if (tid == 0u) {
+        ks = solar_scale_to_f16_dev(
+                k_abs[0], format == DS4_SOLAR_KV_FP4 ? 6.0f : 448.0f,
+                &scales[h]);
+        vs = solar_scale_to_f16_dev(
+                v_abs[0], format == DS4_SOLAR_KV_FP8 ? 448.0f : 6.0f,
+                &scales[n_head_kv + h]);
+    }
+    __syncthreads();
+
+    const uint64_t head0 = (uint64_t)h * head_dim;
+    if (format == DS4_SOLAR_KV_FP8 ||
+        format == DS4_SOLAR_KV_KFP8_VFP4) {
+        for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+            row[head0 + d] = solar_e4m3fn_encode_dev(k[vec0 + d] / ks);
+        }
+    } else {
+        for (uint32_t pair = tid; pair < head_dim / 2u; pair += blockDim.x) {
+            const uint32_t d0 = pair * 2u;
+            const uint8_t lo = solar_e2m1_encode_dev(k[vec0 + d0] / ks);
+            const uint8_t hi = solar_e2m1_encode_dev(k[vec0 + d0 + 1u] / ks);
+            row[head0 / 2u + pair] = lo | (uint8_t)(hi << 4u);
+        }
+    }
+
+    uint8_t *vdata = row + k_bytes;
+    if (format == DS4_SOLAR_KV_FP8) {
+        for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+            vdata[head0 + d] = solar_e4m3fn_encode_dev(v[vec0 + d] / vs);
+        }
+    } else {
+        for (uint32_t pair = tid; pair < head_dim / 2u; pair += blockDim.x) {
+            const uint32_t d0 = pair * 2u;
+            const uint8_t lo = solar_e2m1_encode_dev(v[vec0 + d0] / vs);
+            const uint8_t hi = solar_e2m1_encode_dev(v[vec0 + d0 + 1u] / vs);
+            vdata[head0 / 2u + pair] = lo | (uint8_t)(hi << 4u);
+        }
+    }
+}
+
+__device__ __forceinline__ float solar_kv_load_dev(
+        const uint8_t *row,
+        uint32_t format,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t kvh,
+        uint32_t d,
+        bool value) {
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    const uint64_t elem = (uint64_t)kvh * head_dim + d;
+    const uint64_t k_bytes =
+        format == DS4_SOLAR_KV_FP4 ? kv_dim / 2u : kv_dim;
+    const uint64_t v_bytes =
+        format == DS4_SOLAR_KV_FP8 ? kv_dim : kv_dim / 2u;
+    const __half *scales = (const __half *)(row + k_bytes + v_bytes);
+    const float scale = __half2float(scales[(value ? n_head_kv : 0u) + kvh]);
+    const uint8_t *data = value ? row + k_bytes : row;
+    const bool fp8 = value ? format == DS4_SOLAR_KV_FP8
+                           : format != DS4_SOLAR_KV_FP4;
+    if (fp8) return solar_e4m3fn_decode_dev(data[elem]) * scale;
+    const uint8_t packed = data[elem >> 1u];
+    const uint8_t code = (elem & 1u) ? packed >> 4u : packed & 0x0fu;
+    return solar_e2m1_decode_dev(code) * scale;
+}
+
+template <int DPL>
+__device__ __forceinline__ void solar_attn_head(
+        float *out,
+        const float *q,
+        const uint8_t *kv,
+        uint32_t format,
+        uint64_t row_bytes,
+        uint32_t kvh,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t kv_cap,
+        uint32_t first,
+        uint32_t last,
+        float scale) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t nwarps = blockDim.x >> 5;
+    float qv[DPL], acc[DPL];
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        qv[d] = q[lane + (uint32_t)d * 32u];
+        acc[d] = 0.0f;
+    }
+    float m = -INFINITY, l = 0.0f;
+    for (uint32_t t = first + warp; t <= last; t += nwarps) {
+        const uint8_t *row = kv + (uint64_t)(t % kv_cap) * row_bytes;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t i = lane + (uint32_t)d * 32u;
+            dot += qv[d] * solar_kv_load_dev(
+                    row, format, n_head_kv, head_dim, kvh, i, false);
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        }
+        const float s = dot * scale;
+        const float mn = fmaxf(m, s);
+        const float re = m == -INFINITY ? 0.0f : __expf(m - mn);
+        const float w = __expf(s - mn);
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t i = lane + (uint32_t)d * 32u;
+            acc[d] = acc[d] * re + w * solar_kv_load_dev(
+                    row, format, n_head_kv, head_dim, kvh, i, true);
+        }
+        l = l * re + w;
+        m = mn;
+    }
+
+    __shared__ float s_m[8], s_l[8];
+    extern __shared__ float s_acc[];
+    if (lane == 0u) {
+        s_m[warp] = m;
+        s_l[warp] = l;
+    }
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        s_acc[warp * head_dim + lane + (uint32_t)d * 32u] = acc[d];
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        float gm = -INFINITY;
+        for (uint32_t w = 0; w < nwarps; w++) gm = fmaxf(gm, s_m[w]);
+        float gl = 0.0f;
+        for (uint32_t w = 0; w < nwarps; w++) {
+            gl += s_m[w] == -INFINITY ? 0.0f
+                                      : s_l[w] * __expf(s_m[w] - gm);
+        }
+        const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t i = lane + (uint32_t)d * 32u;
+            float a = 0.0f;
+            for (uint32_t w = 0; w < nwarps; w++) {
+                if (s_m[w] != -INFINITY) {
+                    a += s_acc[w * head_dim + i] * __expf(s_m[w] - gm);
+                }
+            }
+            out[i] = a * inv;
+        }
+    }
+}
+
+template <int DPL>
+__global__ static void solar_attn_decode_kernel(
+        float *heads,
+        const float *q,
+        const uint8_t *kv,
+        uint32_t format,
+        uint64_t row_bytes,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t kv_cap,
+        uint32_t first,
+        uint32_t last,
+        float scale) {
+    const uint32_t h = blockIdx.x;
+    if (h >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    solar_attn_head<DPL>(heads + (uint64_t)h * head_dim,
+                         q + (uint64_t)h * head_dim, kv, format, row_bytes,
+                         h / group, n_head_kv, head_dim, kv_cap, first, last,
+                         scale);
+}
+
+template <int DPL>
+__global__ static void solar_attn_decode_split_kernel(
+        float *partials,
+        const float *q,
+        const uint8_t *kv,
+        uint32_t format,
+        uint64_t row_bytes,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t kv_cap,
+        uint32_t first,
+        uint32_t last,
+        uint32_t chunk_len,
+        uint32_t S,
+        float scale) {
+    const uint32_t j = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (j >= S || h >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t kvh = h / group;
+    const float *qh = q + (uint64_t)h * head_dim;
+    const uint32_t c_first = first + j * chunk_len;
+    uint32_t c_last = c_first + chunk_len - 1u;
+    if (c_last > last) c_last = last;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t nwarps = blockDim.x >> 5;
+    float qv[DPL], acc[DPL];
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        qv[d] = qh[lane + (uint32_t)d * 32u];
+        acc[d] = 0.0f;
+    }
+    float m = -INFINITY, l = 0.0f;
+    for (uint32_t t = c_first + warp; t <= c_last; t += nwarps) {
+        const uint8_t *row = kv + (uint64_t)(t % kv_cap) * row_bytes;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t i = lane + (uint32_t)d * 32u;
+            dot += qv[d] * solar_kv_load_dev(
+                    row, format, n_head_kv, head_dim, kvh, i, false);
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        }
+        const float s = dot * scale;
+        const float mn = fmaxf(m, s);
+        const float re = m == -INFINITY ? 0.0f : __expf(m - mn);
+        const float w = __expf(s - mn);
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t i = lane + (uint32_t)d * 32u;
+            acc[d] = acc[d] * re + w * solar_kv_load_dev(
+                    row, format, n_head_kv, head_dim, kvh, i, true);
+        }
+        l = l * re + w;
+        m = mn;
+    }
+
+    __shared__ float s_m[8], s_l[8];
+    extern __shared__ float s_acc[];
+    if (lane == 0u) {
+        s_m[warp] = m;
+        s_l[warp] = l;
+    }
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        s_acc[warp * head_dim + lane + (uint32_t)d * 32u] = acc[d];
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        float gm = -INFINITY;
+        for (uint32_t w = 0; w < nwarps; w++) gm = fmaxf(gm, s_m[w]);
+        float gl = 0.0f;
+        for (uint32_t w = 0; w < nwarps; w++) {
+            gl += s_m[w] == -INFINITY ? 0.0f
+                                      : s_l[w] * __expf(s_m[w] - gm);
+        }
+        float *p = partials + ((uint64_t)h * S + j) * (head_dim + 2u);
+        if (lane == 0u) {
+            p[0] = gm;
+            p[1] = gl;
+        }
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t i = lane + (uint32_t)d * 32u;
+            float a = 0.0f;
+            for (uint32_t w = 0; w < nwarps; w++) {
+                if (s_m[w] != -INFINITY) {
+                    a += s_acc[w * head_dim + i] * __expf(s_m[w] - gm);
+                }
+            }
+            p[2u + i] = a;
+        }
+    }
+}
+
+template <int DPL>
+__global__ static void solar_attn_prefill_kernel(
+        float *heads,
+        const float *q,
+        const uint8_t *kv,
+        uint32_t format,
+        uint64_t row_bytes,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t kv_cap,
+        uint32_t window,
+        float scale) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (t >= n_tokens || h >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t pos = pos0 + t;
+    const uint32_t first =
+        window && pos + 1u > window ? pos + 1u - window : 0u;
+    const uint64_t base = ((uint64_t)t * n_head + h) * head_dim;
+    solar_attn_head<DPL>(heads + base, q + base, kv, format, row_bytes,
+                         h / group, n_head_kv, head_dim, kv_cap, first, pos,
+                         scale);
+}
+
 /* ---- exaone entry points ------------------------------------------------ */
 
 extern "C" int ds4_gpu_exaone_rms_norm_tensor(
@@ -31984,6 +32435,47 @@ extern "C" int ds4_gpu_exaone_kv_store_tensor(
             (__half *)kv->ptr, (const float *)k->ptr, (const float *)v->ptr,
             kv_dim, n_tokens, pos0, kv_cap);
     return cuda_ok(cudaGetLastError(), "exaone kv store");
+}
+
+extern "C" uint64_t ds4_gpu_solar_kv_row_bytes(
+        ds4_solar_kv_format format,
+        uint32_t            n_head_kv,
+        uint32_t            head_dim) {
+    return solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+}
+
+extern "C" int ds4_gpu_solar_kv_store_tensor(
+        ds4_gpu_tensor       *kv,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                kv_cap,
+        ds4_solar_kv_format     format) {
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    if (!kv || !k || !v || n_head_kv == 0u || head_dim == 0u ||
+        head_dim > 256u || n_tokens == 0u || kv_cap == 0u ||
+        row_bytes == 0u ||
+        k->bytes < kv_dim * n_tokens * sizeof(float) ||
+        v->bytes < kv_dim * n_tokens * sizeof(float) ||
+        kv->bytes < (uint64_t)kv_cap * row_bytes) {
+        return 0;
+    }
+    if (format == DS4_SOLAR_KV_BF16) {
+        return ds4_gpu_exaone_kv_store_tensor(
+                kv, k, v, (uint32_t)kv_dim, n_tokens, pos0, kv_cap);
+    }
+    dim3 grid(n_tokens, n_head_kv, 1u);
+    solar_kv_store_compressed_kernel<<<grid, 256, 0,
+                                         cuda_decode_stream()>>>(
+            (uint8_t *)kv->ptr, (const float *)k->ptr,
+            (const float *)v->ptr, n_head_kv, head_dim, n_tokens, pos0,
+            kv_cap, (uint32_t)format, row_bytes);
+    return cuda_ok(cudaGetLastError(), "solar compressed kv store");
 }
 
 /* head_dim is 128 for every K-EXAONE build, so DPL is 4.  The dispatch keeps
@@ -32140,6 +32632,147 @@ extern "C" int ds4_gpu_exaone_attention_prefill_tensor(
                              (const __half *)kv->ptr, n_tokens, pos0, n_head,
                              n_head_kv, head_dim, kv_cap, window, scale);
     return cuda_ok(cudaGetLastError(), "exaone attention prefill");
+}
+
+extern "C" int ds4_gpu_solar_attention_decode_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        ds4_solar_kv_format     format) {
+    if (format == DS4_SOLAR_KV_BF16) {
+        return ds4_gpu_exaone_attention_decode_tensor(
+                heads, q, kv, n_head, n_head_kv, head_dim, kv_cap, pos,
+                window);
+    }
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    if (!heads || !q || !kv || n_head == 0u || n_head_kv == 0u ||
+        head_dim == 0u || head_dim % 32u != 0u ||
+        n_head % n_head_kv != 0u || kv_cap == 0u || row_bytes == 0u ||
+        pos >= kv_cap ||
+        heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        kv->bytes < (uint64_t)kv_cap * row_bytes) {
+        return 0;
+    }
+    const uint32_t first =
+        window && pos + 1u > window ? pos + 1u - window : 0u;
+    const uint32_t shmem =
+        (head_dim / 32u) * head_dim * (uint32_t)sizeof(float);
+    const float scale = rsqrtf((float)head_dim);
+    DS4_EXAONE_ATTN_DISPATCH(
+            solar_attn_decode_kernel, n_head, shmem,
+            (float *)heads->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
+            n_head_kv, head_dim, kv_cap, first, pos, scale);
+    return cuda_ok(cudaGetLastError(), "solar compressed attention decode");
+}
+
+extern "C" int ds4_gpu_solar_attention_decode_split_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        ds4_gpu_tensor       *partials,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        uint32_t                chunk_len,
+        ds4_solar_kv_format     format) {
+    if (format == DS4_SOLAR_KV_BF16) {
+        return ds4_gpu_exaone_attention_decode_split_tensor(
+                heads, q, kv, partials, n_head, n_head_kv, head_dim, kv_cap,
+                pos, window, chunk_len);
+    }
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    if (!heads || !q || !kv || !partials || n_head == 0u ||
+        n_head_kv == 0u || head_dim == 0u || head_dim % 32u != 0u ||
+        n_head % n_head_kv != 0u || kv_cap == 0u || pos >= kv_cap ||
+        chunk_len == 0u || row_bytes == 0u ||
+        heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        kv->bytes < (uint64_t)kv_cap * row_bytes) {
+        return 0;
+    }
+    const uint32_t first =
+        window && pos + 1u > window ? pos + 1u - window : 0u;
+    const uint32_t span = pos - first + 1u;
+    const uint32_t S = (span + chunk_len - 1u) / chunk_len;
+    if (S <= 1u) {
+        return ds4_gpu_solar_attention_decode_tensor(
+                heads, q, kv, n_head, n_head_kv, head_dim, kv_cap, pos,
+                window, format);
+    }
+    if (partials->bytes <
+        (uint64_t)n_head * S * (head_dim + 2u) * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t shmem =
+        (head_dim / 32u) * head_dim * (uint32_t)sizeof(float);
+    const float scale = rsqrtf((float)head_dim);
+    dim3 grid(S, n_head, 1u);
+    DS4_EXAONE_ATTN_DISPATCH(
+            solar_attn_decode_split_kernel, grid, shmem,
+            (float *)partials->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
+            n_head_kv, head_dim, kv_cap, first, pos, chunk_len, S, scale);
+    exaone_attn_decode_split_combine_kernel<<<n_head, head_dim, 0,
+                                              cuda_decode_stream()>>>(
+            (float *)heads->ptr, (const float *)partials->ptr,
+            n_head, head_dim, S);
+    return cuda_ok(cudaGetLastError(),
+                   "solar compressed attention decode split");
+}
+
+extern "C" int ds4_gpu_solar_attention_prefill_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                window,
+        ds4_solar_kv_format     format) {
+    if (format == DS4_SOLAR_KV_BF16) {
+        return ds4_gpu_exaone_attention_prefill_tensor(
+                heads, q, kv, n_tokens, pos0, n_head, n_head_kv, head_dim,
+                kv_cap, window);
+    }
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    if (!heads || !q || !kv || n_tokens == 0u || n_head == 0u ||
+        n_head_kv == 0u || head_dim == 0u || head_dim % 32u != 0u ||
+        n_head % n_head_kv != 0u || kv_cap == 0u || row_bytes == 0u ||
+        (uint64_t)pos0 + n_tokens > kv_cap ||
+        heads->bytes <
+            (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes <
+            (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        kv->bytes < (uint64_t)kv_cap * row_bytes) {
+        return 0;
+    }
+    const uint32_t shmem =
+        (head_dim / 32u) * head_dim * (uint32_t)sizeof(float);
+    const float scale = rsqrtf((float)head_dim);
+    dim3 grid(n_tokens, n_head, 1u);
+    DS4_EXAONE_ATTN_DISPATCH(
+            solar_attn_prefill_kernel, grid, shmem,
+            (float *)heads->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_tokens,
+            pos0, n_head, n_head_kv, head_dim, kv_cap, window, scale);
+    return cuda_ok(cudaGetLastError(), "solar compressed attention prefill");
 }
 
 #undef DS4_EXAONE_ATTN_DISPATCH
@@ -32498,6 +33131,405 @@ extern "C" int ds4_gpu_exaone_moe_matmul_tensor(
         return 0;
     }
     return cuda_ok(cudaGetLastError(), "exaone moe matmul");
+}
+
+/* Solar Open 2 single-token KDA recurrence. One block owns one head and one
+ * thread owns a value-state column. That makes both state passes race-free:
+ * each thread decays and updates state[:, value_dim] while all threads share
+ * the normalized Q/K vectors. The generic path deliberately uses only
+ * ordinary CUDA math and shared memory; Hopper-specific tuning comes after
+ * official-fixture parity and must retain this fallback for sm_121. */
+static __device__ __forceinline__ float solar_kda_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+static __device__ __forceinline__ float solar_kda_silu(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+static __global__ void solar_kda_sequence_kernel(
+        float       *out,
+        float       *state,
+        float       *q_conv_state,
+        float       *k_conv_state,
+        float       *v_conv_state,
+        const float *q_raw,
+        const float *k_raw,
+        const float *v_raw,
+        const float *g_raw,
+        const float *beta_logits,
+        const float *q_conv_weight,
+        const float *k_conv_weight,
+        const float *v_conv_weight,
+        const float *decay_scale,
+        const float *dt_bias,
+        uint32_t     n_tokens,
+        uint32_t     n_head,
+        uint32_t     head_dim,
+        uint32_t     conv_kernel,
+        float        gate_lower_bound) {
+    __shared__ float q_vec[256];
+    __shared__ float k_vec[256];
+    __shared__ float v_vec[256];
+    __shared__ float q_sq[256];
+    __shared__ float k_sq[256];
+
+    const uint32_t head = blockIdx.x;
+    const uint32_t dim = threadIdx.x;
+    const uint64_t channel = (uint64_t)head * head_dim + dim;
+    const uint64_t vector_count = (uint64_t)n_head * head_dim;
+    const uint64_t state_head = (uint64_t)head * head_dim * head_dim;
+
+    /* One launch consumes an entire chunk. KDA is recurrent in sequence order,
+     * but the loop lives inside 64 concurrently resident head blocks rather
+     * than launching a PyTorch-style kernel for every token. */
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        float q = 0.0f;
+        float k = 0.0f;
+        float v = 0.0f;
+        if (dim < head_dim) {
+            float *qcs = q_conv_state + channel * conv_kernel;
+            float *kcs = k_conv_state + channel * conv_kernel;
+            float *vcs = v_conv_state + channel * conv_kernel;
+            for (uint32_t tap = 0; tap + 1u < conv_kernel; tap++) {
+                qcs[tap] = qcs[tap + 1u];
+                kcs[tap] = kcs[tap + 1u];
+                vcs[tap] = vcs[tap + 1u];
+            }
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            qcs[conv_kernel - 1u] = q_raw[token_base + channel];
+            kcs[conv_kernel - 1u] = k_raw[token_base + channel];
+            vcs[conv_kernel - 1u] = v_raw[token_base + channel];
+
+            const uint64_t weight_base = channel * conv_kernel;
+            for (uint32_t tap = 0; tap < conv_kernel; tap++) {
+                q += qcs[tap] * q_conv_weight[weight_base + tap];
+                k += kcs[tap] * k_conv_weight[weight_base + tap];
+                v += vcs[tap] * v_conv_weight[weight_base + tap];
+            }
+            q = solar_kda_silu(q);
+            k = solar_kda_silu(k);
+            v = solar_kda_silu(v);
+        }
+
+        q_vec[dim] = q;
+        k_vec[dim] = k;
+        v_vec[dim] = v;
+        q_sq[dim] = q * q;
+        k_sq[dim] = k * k;
+        __syncthreads();
+
+        for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+            if (dim < stride) {
+                q_sq[dim] += q_sq[dim + stride];
+                k_sq[dim] += k_sq[dim + stride];
+            }
+            __syncthreads();
+        }
+
+        if (dim < head_dim) {
+            const float q_inv = rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)head_dim);
+            const float k_inv = rsqrtf(k_sq[0] + 1.0e-6f);
+            q_vec[dim] *= q_inv;
+            k_vec[dim] *= k_inv;
+        }
+        __syncthreads();
+
+        if (dim < head_dim) {
+            const float beta = 2.0f /
+                (1.0f + expf(-beta_logits[(uint64_t)token * n_head + head]));
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            float memory = 0.0f;
+            for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
+                float gate = decay_scale[head] *
+                    solar_kda_softplus(g_raw[token_base +
+                                             (uint64_t)head * head_dim + key_dim] +
+                                       dt_bias[(uint64_t)head * head_dim + key_dim]);
+                if (gate < gate_lower_bound) gate = gate_lower_bound;
+                const uint64_t index =
+                    state_head + (uint64_t)key_dim * head_dim + dim;
+                const float decayed = state[index] * expf(gate);
+                state[index] = decayed;
+                memory += decayed * k_vec[key_dim];
+            }
+
+            const float delta = (v_vec[dim] - memory) * beta;
+            float result = 0.0f;
+            for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
+                const uint64_t index =
+                    state_head + (uint64_t)key_dim * head_dim + dim;
+                const float updated = state[index] + k_vec[key_dim] * delta;
+                state[index] = updated;
+                result += updated * q_vec[key_dim];
+            }
+            out[token_base + (uint64_t)head * head_dim + dim] = result;
+        }
+        __syncthreads();
+    }
+}
+
+static int solar_kda_sequence_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound,
+        const char             *what) {
+    if (!out || !recurrent_state || !q_conv_state || !k_conv_state ||
+        !v_conv_state || !q_raw || !k_raw || !v_raw || !g_raw ||
+        !beta_logits || !q_conv_weight || !k_conv_weight ||
+        !v_conv_weight || !decay_scale || !dt_bias ||
+        n_tokens == 0u || n_head == 0u || head_dim == 0u || head_dim > 256u ||
+        conv_kernel == 0u || conv_kernel > 16u || gate_lower_bound > 0.0f) {
+        return 0;
+    }
+
+    const uint64_t vector_count = (uint64_t)n_head * head_dim;
+    const uint64_t vector_bytes = vector_count * sizeof(float);
+    const uint64_t sequence_vector_bytes = (uint64_t)n_tokens * vector_bytes;
+    const uint64_t conv_bytes = vector_count * conv_kernel * sizeof(float);
+    const uint64_t state_bytes = vector_count * head_dim * sizeof(float);
+    const uint64_t head_bytes = (uint64_t)n_head * sizeof(float);
+    const uint64_t sequence_head_bytes = (uint64_t)n_tokens * head_bytes;
+    if (out->bytes < sequence_vector_bytes || recurrent_state->bytes < state_bytes ||
+        q_conv_state->bytes < conv_bytes || k_conv_state->bytes < conv_bytes ||
+        v_conv_state->bytes < conv_bytes || q_raw->bytes < sequence_vector_bytes ||
+        k_raw->bytes < sequence_vector_bytes || v_raw->bytes < sequence_vector_bytes ||
+        g_raw->bytes < sequence_vector_bytes || beta_logits->bytes < sequence_head_bytes ||
+        q_conv_weight->bytes < conv_bytes || k_conv_weight->bytes < conv_bytes ||
+        v_conv_weight->bytes < conv_bytes || decay_scale->bytes < head_bytes ||
+        dt_bias->bytes < vector_bytes) {
+        return 0;
+    }
+
+    const int device = ds4_tensor_device_idx(out);
+    const ds4_gpu_tensor *all[] = {
+        recurrent_state, q_conv_state, k_conv_state, v_conv_state,
+        q_raw, k_raw, v_raw, g_raw, beta_logits,
+        q_conv_weight, k_conv_weight, v_conv_weight, decay_scale, dt_bias,
+    };
+    for (const ds4_gpu_tensor *tensor : all) {
+        if (ds4_tensor_device_idx(tensor) != device) return 0;
+    }
+
+    uint32_t threads = 1u;
+    while (threads < head_dim) threads <<= 1u;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[device].device_id) {
+        solar_kda_sequence_kernel<<<n_head, threads, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr,
+                (float *)recurrent_state->ptr,
+                (float *)q_conv_state->ptr,
+                (float *)k_conv_state->ptr,
+                (float *)v_conv_state->ptr,
+                (const float *)q_raw->ptr,
+                (const float *)k_raw->ptr,
+                (const float *)v_raw->ptr,
+                (const float *)g_raw->ptr,
+                (const float *)beta_logits->ptr,
+                (const float *)q_conv_weight->ptr,
+                (const float *)k_conv_weight->ptr,
+                (const float *)v_conv_weight->ptr,
+                (const float *)decay_scale->ptr,
+                (const float *)dt_bias->ptr,
+                n_tokens, n_head, head_dim, conv_kernel, gate_lower_bound);
+        ok = cuda_ok(cudaGetLastError(), what);
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_solar_kda_decode_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound) {
+    return solar_kda_sequence_tensor(
+        out, recurrent_state, q_conv_state, k_conv_state, v_conv_state,
+        q_raw, k_raw, v_raw, g_raw, beta_logits,
+        q_conv_weight, k_conv_weight, v_conv_weight, decay_scale, dt_bias,
+        1u, n_head, head_dim, conv_kernel, gate_lower_bound,
+        "solar-open2 KDA decode");
+}
+
+extern "C" int ds4_gpu_solar_kda_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound) {
+    return solar_kda_sequence_tensor(
+        out, recurrent_state, q_conv_state, k_conv_state, v_conv_state,
+        q_raw, k_raw, v_raw, g_raw, beta_logits,
+        q_conv_weight, k_conv_weight, v_conv_weight, decay_scale, dt_bias,
+        n_tokens, n_head, head_dim, conv_kernel, gate_lower_bound,
+        "solar-open2 KDA chunked prefill");
+}
+
+/* Solar output gates. Keeping these separate from the KDA recurrence makes
+ * the recurrence fixture useful on its own and gives the GQA branch the same
+ * elementwise sigmoid implementation. */
+static __global__ void solar_sigmoid_gate_kernel(
+        float *out, const float *x, const float *gate, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = x[i] / (1.0f + expf(-gate[i]));
+}
+
+static __global__ void solar_head_rms_sigmoid_gate_kernel(
+        float       *out,
+        const float *x,
+        const float *gate,
+        const float *weight,
+        uint32_t     n_head,
+        uint32_t     head_dim,
+        float        eps) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    const uint64_t base = (uint64_t)row * head_dim;
+    (void)n_head;
+
+    __shared__ float warp_sum[32];
+    float sumsq = 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += nth) {
+        const float v = x[base + d];
+        sumsq += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+    }
+    if ((tid & 31u) == 0u) warp_sum[tid >> 5] = sumsq;
+    __syncthreads();
+    if (tid < 32u) {
+        sumsq = tid < (nth + 31u) / 32u ? warp_sum[tid] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+        }
+        if (tid == 0u) warp_sum[0] = sumsq;
+    }
+    __syncthreads();
+
+    const float scale = rsqrtf(warp_sum[0] / (float)head_dim + eps);
+    for (uint32_t d = tid; d < head_dim; d += nth) {
+        const float sigmoid = 1.0f / (1.0f + expf(-gate[base + d]));
+        out[base + d] = x[base + d] * scale * weight[d] * sigmoid;
+    }
+}
+
+extern "C" int ds4_gpu_solar_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        uint64_t                count) {
+    const uint64_t bytes = count * sizeof(float);
+    if (!out || !x || !gate || count == 0u ||
+        out->bytes < bytes || x->bytes < bytes || gate->bytes < bytes) {
+        return 0;
+    }
+    const int device = ds4_tensor_device_idx(out);
+    if (ds4_tensor_device_idx(x) != device ||
+        ds4_tensor_device_idx(gate) != device) {
+        return 0;
+    }
+    const uint32_t threads = 256u;
+    const uint64_t blocks = (count + threads - 1u) / threads;
+    if (blocks > UINT32_MAX) return 0;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[device].device_id) {
+        solar_sigmoid_gate_kernel<<<(uint32_t)blocks, threads, 0,
+                                    cuda_decode_stream()>>>(
+                (float *)out->ptr, (const float *)x->ptr,
+                (const float *)gate->ptr, count);
+        ok = cuda_ok(cudaGetLastError(), "solar-open2 GQA sigmoid gate");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_solar_head_rms_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *weight,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   eps) {
+    if (!out || !x || !gate || !weight || n_tokens == 0u || n_head == 0u ||
+        head_dim == 0u || head_dim > 1024u || !(eps > 0.0f)) {
+        return 0;
+    }
+    const uint64_t count = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t bytes = count * sizeof(float);
+    if (out->bytes < bytes || x->bytes < bytes || gate->bytes < bytes ||
+        weight->bytes < (uint64_t)head_dim * sizeof(float)) {
+        return 0;
+    }
+    const int device = ds4_tensor_device_idx(out);
+    const ds4_gpu_tensor *all[] = {x, gate, weight};
+    for (const ds4_gpu_tensor *tensor : all) {
+        if (ds4_tensor_device_idx(tensor) != device) return 0;
+    }
+    uint32_t threads = 32u;
+    while (threads < head_dim && threads < 1024u) threads <<= 1u;
+    const uint64_t rows = (uint64_t)n_tokens * n_head;
+    if (rows > UINT32_MAX) return 0;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[device].device_id) {
+        solar_head_rms_sigmoid_gate_kernel<<<(uint32_t)rows, threads, 0,
+                                             cuda_decode_stream()>>>(
+                (float *)out->ptr, (const float *)x->ptr,
+                (const float *)gate->ptr, (const float *)weight->ptr,
+                n_head, head_dim, eps);
+        ok = cuda_ok(cudaGetLastError(),
+                     "solar-open2 KDA gated head RMS norm");
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_model_map_is_direct(void) {
