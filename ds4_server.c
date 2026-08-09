@@ -11099,6 +11099,19 @@ static void log_flags(char *buf, size_t len, bool responses_protocol,
 #undef ADD_FLAG
 }
 
+/* v0.5.7 C3 (#34): one transport heartbeat for every silent stream stretch,
+ * prefill AND decode.  Anthropic clients get the protocol's own ping event
+ * (legal at any point in the stream); the OpenAI-family surfaces get an SSE
+ * comment line (ignored by SSE parsers).  Decode needs this because the
+ * Responses machine writes ZERO bytes while the model is inside <think>
+ * with no reasoning summaries requested -- codex 0.144.1's ~300 s
+ * stream_idle_timeout killed exactly such turns (five aborts at 300.0 s,
+ * run6, receipt local/docs/v057/codexfix_c12_receipt_2026-08-09.md). */
+static bool stream_heartbeat_emit(int fd, api_style api, const char *comment) {
+    if (api == API_ANTHROPIC) return sse_event(fd, "ping", "{\"type\": \"ping\"}");
+    return send_all(fd, comment, strlen(comment));
+}
+
 static void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                                 bool responses_protocol,
                                 bool tools, bool thinking,
@@ -12313,6 +12326,7 @@ decode_again:
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
+    double decode_keepalive = decode_t0;   /* v0.5.7 C3: stream heartbeat */
     int last_decode_log_completion = 0;
 
     while (!g_stop_requested && acc.completion < max_tokens &&
@@ -12443,6 +12457,23 @@ decode_again:
                 snprintf(err, sizeof(err), "client stream write failed");
                 stop_decode = true;
                 break;
+            }
+            /* v0.5.7 C3: decode heartbeat.  The stream machines can write
+             * ZERO bytes for minutes (thinking with no reasoning deltas on
+             * the wire); a fixed 5 s cadence keeps client idle timers from
+             * killing an otherwise healthy turn.  Headers are always out by
+             * decode time (the prefill keepalive sent them). */
+            if (j->req.stream) {
+                const double know = now_sec();
+                if (know - decode_keepalive >= 5.0) {
+                    if (!stream_heartbeat_emit(j->fd, j->req.api, ": decode\n\n")) {
+                        finish = "error";
+                        snprintf(err, sizeof(err), "client stream write failed");
+                        stop_decode = true;
+                        break;
+                    }
+                    decode_keepalive = know;
+                }
             }
 
             if (fr.orphan_tool_end) {
@@ -15133,13 +15164,7 @@ static void cont_prefill_heartbeat(cont_sched *cs, job *j) {
     const double now = now_sec();
     if (now - st->last_keepalive < 5.0) return;
     t_emit_job = j;
-    bool ok;
-    if (j->req.api == API_ANTHROPIC) {
-        ok = sse_event(j->fd, "ping", "{\"type\": \"ping\"}");
-    } else {
-        static const char ka[] = ": prefill\n\n";
-        ok = send_all(j->fd, ka, sizeof(ka) - 1);
-    }
+    const bool ok = stream_heartbeat_emit(j->fd, j->req.api, ": prefill\n\n");
     t_emit_job = NULL;
     if (ok) st->last_keepalive = now;
     else    st->failed = true;
@@ -15472,6 +15497,16 @@ static int cont_on_token(void *ud, void *user, int token) {
             wire_update(j->fd, s, &j->req, &st->wsess,
                         st->acc.text.ptr ? st->acc.text.ptr : "", fr.emit_limit) :
             cont_stream_emit_plain(j, st, fr.emit_limit);
+        /* v0.5.7 C3: decode heartbeat, same 5 s cadence as the prefill
+         * heartbeat above -- the machines can write zero bytes for minutes
+         * during thinking and client idle timers kill the turn. */
+        if (ok && st->started && !st->failed) {
+            const double know = now_sec();
+            if (know - st->last_keepalive >= 5.0) {
+                ok = stream_heartbeat_emit(j->fd, j->req.api, ": decode\n\n");
+                if (ok) st->last_keepalive = know;
+            }
+        }
         if (!ok) {
             st->failed = true;
             t_emit_job = NULL;
@@ -24787,6 +24822,31 @@ static void test_sem_accum_no_tools_dsml_cut(void) {
     buf_free(&t);
 }
 
+/* v0.5.7 C3: the shared stream heartbeat speaks each protocol -- Anthropic
+ * gets the native ping event, the OpenAI family gets an ignorable SSE
+ * comment.  (The 5 s cadence itself is wall-clock-gated in the drivers and
+ * deliberately cannot fire inside fast unit fixtures.) */
+static void test_stream_heartbeat_emit(void) {
+    int p[2];   /* send() needs a socket, not a pipe (ENOTSOCK) */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, p) == 0);
+    char out[256];
+
+    TEST_ASSERT(stream_heartbeat_emit(p[1], API_ANTHROPIC, ": decode\n\n"));
+    ssize_t n = read(p[0], out, sizeof(out) - 1);
+    TEST_ASSERT(n > 0);
+    out[n] = '\0';
+    TEST_ASSERT(strstr(out, "event: ping") && strstr(out, "\"type\": \"ping\""));
+
+    TEST_ASSERT(stream_heartbeat_emit(p[1], API_RESPONSES, ": decode\n\n"));
+    n = read(p[0], out, sizeof(out) - 1);
+    TEST_ASSERT(n > 0);
+    out[n] = '\0';
+    TEST_ASSERT(!strcmp(out, ": decode\n\n"));   /* comment only, no event */
+
+    close(p[0]);
+    close(p[1]);
+}
+
 /* v0.5.7 C2: the /v1/models codex-splice array extractor -- string-aware
  * bracket matching over operator-provided catalog JSON. */
 static void test_json_models_array_dup(void) {
@@ -25426,6 +25486,7 @@ static void ds4_server_unit_tests_run(void) {
     test_sem_accum_feed_verdicts();
     test_sem_accum_no_tools_dsml_cut();
     test_json_models_array_dup();
+    test_stream_heartbeat_emit();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
     test_credit_union_merge_shapes();
