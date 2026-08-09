@@ -4907,6 +4907,16 @@ static bool parse_generated_message_for_response(const char *text,
                                                  bool *recovered_out) {
     if (recovered_out) *recovered_out = false;
 
+    /* No tools declared: tool-call syntax is not executable on this request,
+     * so nothing is extracted as a call and finish can never become
+     * tool_calls.  The accumulator's cut keeps DSML out of visible text
+     * upstream; this gate makes the invariant structural for every caller. */
+    if (!has_tools) {
+        split_reasoning_content(text ? text : "", text ? strlen(text) : 0,
+                                content_out, reasoning_out);
+        return true;
+    }
+
     bool parsed_ok = parse_generated_message_ex(text ? text : "",
                                                 require_thinking_closed,
                                                 content_out, reasoning_out,
@@ -11172,6 +11182,13 @@ typedef struct {
     thinking_state thinking;
     dsml_decode_tracker dsml;    /* advanced only when track_tools */
     bool track_tools;            /* kind==REQ_CHAT && has_tools */
+    bool cut_tool_syntax;        /* kind==REQ_CHAT && !has_tools: DSML
+                                  * tool-call syntax in the VISIBLE channel is
+                                  * terminal (finish=stop, cut at the marker).
+                                  * A no-tools client can never execute a tool
+                                  * call, so leaking the raw control syntax as
+                                  * text corrupts transcript consumers -- the
+                                  * codex compact-summary poisoning, 08-09. */
     bool think_gates_markers;    /* ds4_think_mode_enabled(think_mode) */
     bool count_reasoning;        /* Inc 7b: count generated reasoning tokens */
     bool tool_scan_waiting_for_think_close;
@@ -11197,6 +11214,8 @@ typedef struct {
     bool tool_block_closed;  /* verdict became "tool_calls" on this feed */
     bool entered_tool_block; /* first tool-call start marker observed */
     bool orphan_tool_end;    /* first orphan end marker observed */
+    bool tool_syntax_cut;    /* no-tools cut applied on this feed (hit_stop
+                              * is also set; drivers may log the cause) */
 } sem_feed;
 
 static void sem_accum_init(sem_accum *a, const request *r) {
@@ -11204,6 +11223,7 @@ static void sem_accum_init(sem_accum *a, const request *r) {
     dsml_decode_tracker_init(&a->dsml);
     a->thinking = thinking_state_from_prompt(r);
     a->track_tools = r->kind == REQ_CHAT && r->has_tools;
+    a->cut_tool_syntax = r->kind == REQ_CHAT && !r->has_tools;
     a->think_gates_markers = ds4_think_mode_enabled(r->think_mode);
     a->count_reasoning = a->think_gates_markers;
     a->tool_scan_waiting_for_think_close =
@@ -11222,6 +11242,28 @@ static void sem_accum_free(sem_accum *a) {
  * sampling params. */
 static dsml_decode_state sem_accum_dsml_state(const sem_accum *a) {
     return a->track_tools ? a->dsml.decode : DSML_DECODE_OUTSIDE;
+}
+
+/* Cut-mode stream hold-back: never emit a text tail that could be the start
+ * of a DSML tool-call start marker -- the no-tools cut must be able to keep
+ * the whole marker off the wire, and bytes already sent cannot be unsent.
+ * Same contract as stop_list_stream_safe_len, for the two marker spellings. */
+static size_t tool_marker_stream_safe_len(const char *text, size_t len) {
+    static const char *const marks[2] =
+        { DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT };
+    if (!text || !len) return len;
+    size_t safe = len;
+    for (int m = 0; m < 2; m++) {
+        const size_t ml = strlen(marks[m]);
+        size_t k = ml - 1 < len ? ml - 1 : len;
+        for (; k >= 1; k--) {
+            if (!memcmp(text + len - k, marks[m], k)) {
+                if (len - k < safe) safe = len - k;
+                break;
+            }
+        }
+    }
+    return safe;
 }
 
 static sem_feed sem_accum_feed(sem_accum *a, const request *r,
@@ -11250,12 +11292,22 @@ static sem_feed sem_accum_feed(sem_accum *a, const request *r,
         const size_t hold = r->stops.max_len - 1;
         a->stop_scan_from = a->text.len > hold ? a->text.len - hold : 0;
     }
+    /* No-tools cut hold-back: a partial start marker at the tail must not
+     * reach the wire (delays at most strlen(marker)-1 bytes until the tail
+     * disambiguates). */
+    if (a->cut_tool_syntax) {
+        const size_t safe = tool_marker_stream_safe_len(a->text.ptr, a->text.len);
+        if (f.emit_limit > safe) f.emit_limit = safe;
+    }
 
     /* Tool-marker scan (rolling window), think-gated: a DSML block inside
      * reasoning is not executable, so markers are only observed after
      * </think>.  Runs on the UNTRUNCATED text, before the stop hit lands --
-     * both twins ordered it this way. */
-    if (a->track_tools) {
+     * both twins ordered it this way.  cut_tool_syntax arms the same gated
+     * scan so a no-tools request can terminate at the marker instead of
+     * leaking control syntax as text. */
+    size_t cut_pos = (size_t)-1;
+    if (a->track_tools || a->cut_tool_syntax) {
         if (a->think_gates_markers && a->thinking.inside) {
             a->tool_scan_waiting_for_think_close = true;
             a->tool_scan_from = a->text.len;
@@ -11281,6 +11333,13 @@ static sem_feed sem_accum_feed(sem_accum *a, const request *r,
             }
             f.entered_tool_block = a->saw_tool_start && !old_start;
             f.tool_block_closed = a->saw_tool_end && !old_end;
+            if (f.entered_tool_block && a->cut_tool_syntax) {
+                /* Position captured HERE, on the think-gated scan pointer --
+                 * a suffix re-search could land on non-executable DSML inside
+                 * a closed think block. */
+                const char *m = find_any_tool_start(tool_scan);
+                if (m) cut_pos = (size_t)(m - a->text.ptr);
+            }
             const size_t marker_hold = 80;
             size_t hold_from = a->text.len > marker_hold ? a->text.len - marker_hold : 0;
             if (hold_from > a->tool_scan_from) a->tool_scan_from = hold_from;
@@ -11295,6 +11354,20 @@ static sem_feed sem_accum_feed(sem_accum *a, const request *r,
         if (a->text.ptr) a->text.ptr[a->text.len] = '\0';
         a->verdict = "stop";
         f.hit_stop = true;
+    } else if (a->cut_tool_syntax && cut_pos != (size_t)-1 && !a->verdict) {
+        /* No-tools cut: the visible channel opened a DSML tool-call block on
+         * a request that declared no tools.  The syntax is not executable and
+         * must not reach the wire as text (codex compact-summary poisoning);
+         * terminate the message at the marker.  Truncation is exactly at the
+         * marker start so streamed bytes and the buffered text agree; a user
+         * stop hit in the same feed wins (the branch above).  matched_stop
+         * stays NULL -- no client-visible stop_sequence is invented. */
+        a->text.len = cut_pos;
+        if (a->text.ptr) a->text.ptr[a->text.len] = '\0';
+        a->verdict = "stop";
+        f.hit_stop = true;
+        f.tool_syntax_cut = true;
+        if (f.emit_limit > cut_pos) f.emit_limit = cut_pos;
     } else if (a->track_tools && a->saw_tool_end && !a->verdict) {
         a->verdict = "tool_calls";
     }
@@ -12382,6 +12455,14 @@ decode_again:
             }
             if (fr.tool_block_closed) {
                 trace_event(s, trace_id, "closed tool-call block after %d generated tokens", acc.completion);
+            }
+            if (fr.tool_syntax_cut) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: chat ctx=%s no-tools DSML tool-call syntax cut at %d generated tokens (finish=stop)",
+                           ctx_span, acc.completion);
+                trace_event(s, trace_id,
+                            "no-tools DSML tool-call syntax cut at %d generated tokens",
+                            acc.completion);
             }
             if (acc.track_tools && s->trace && acc.completion >= next_tool_progress &&
                 !(acc.think_gates_markers && acc.thinking.inside)) {
@@ -15348,6 +15429,11 @@ static int cont_on_token(void *ud, void *user, int token) {
     if (fr.orphan_tool_end) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: cont chat ignored orphan tool-call end marker after %d generated tokens",
+                   st->acc.completion);
+    }
+    if (fr.tool_syntax_cut) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: cont chat no-tools DSML tool-call syntax cut at %d generated tokens (finish=stop)",
                    st->acc.completion);
     }
     /* Token-id echo: the single path's openai_stream_record_token call site,
@@ -24503,6 +24589,97 @@ static void test_sem_accum_feed_verdicts(void) {
     request_free(&rk);
 }
 
+/* v0.5.7 C1: DSML tool-call syntax is TERMINAL on no-tools chat requests --
+ * the visible channel cuts at the marker (finish=stop, nothing invented in
+ * matched_stop), partial markers are held off the wire, and think-quoted
+ * DSML stays inert.  Field receipt: codex compact-summary poisoning
+ * (local/docs/v0561/cut_receipt_2026-08-09.md). */
+static void test_sem_accum_no_tools_dsml_cut(void) {
+    /* 1) visible marker cuts exactly at the marker start. */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(!r.has_tools);
+    sem_accum a;
+    sem_accum_init(&a, &r);
+    TEST_ASSERT(a.cut_tool_syntax && !a.track_tools);
+    sem_feed f = sem_accum_feed(&a, &r, "Summary line.\n\n", 15);
+    TEST_ASSERT(!f.hit_stop && !a.verdict);
+    f = sem_accum_feed(&a, &r, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START));
+    TEST_ASSERT(f.tool_syntax_cut && f.hit_stop);
+    TEST_ASSERT(a.verdict && !strcmp(a.verdict, "stop"));
+    TEST_ASSERT(!a.matched_stop);            /* no stop_sequence invented */
+    TEST_ASSERT(!strcmp(a.text.ptr, "Summary line.\n\n"));
+    TEST_ASSERT(f.emit_limit == a.text.len); /* streamed == buffered */
+    sem_accum_free(&a);
+    request_free(&r);
+
+    /* 2) hold-back: a tail that could begin a marker stays off the wire
+     * until it disambiguates. */
+    request r2;
+    request_init(&r2, REQ_CHAT, 128);
+    r2.api = API_OPENAI;
+    r2.think_mode = DS4_THINK_NONE;
+    sem_accum b;
+    sem_accum_init(&b, &r2);
+    f = sem_accum_feed(&b, &r2, "ok ", 3);
+    TEST_ASSERT(f.emit_limit == 3);
+    f = sem_accum_feed(&b, &r2, "<", 1);
+    TEST_ASSERT(f.emit_limit == 3);          /* "<" held back */
+    TEST_ASSERT(!f.hit_stop && !b.verdict);
+    f = sem_accum_feed(&b, &r2, "b", 1);
+    TEST_ASSERT(f.emit_limit == 5);          /* "<b" diverged: released */
+    sem_accum_free(&b);
+    request_free(&r2);
+
+    /* 3) think gating carries over: DSML quoted in reasoning is inert; the
+     * first VISIBLE marker after </think> cuts. */
+    request rk;
+    request_init(&rk, REQ_CHAT, 128);
+    rk.api = API_OPENAI;
+    rk.think_mode = DS4_THINK_LOW;
+    free(rk.prompt_text);
+    rk.prompt_text = xstrdup("<think>");
+    sem_accum d;
+    sem_accum_init(&d, &rk);
+    TEST_ASSERT(d.cut_tool_syntax);
+    f = sem_accum_feed(&d, &rk, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START));
+    TEST_ASSERT(!f.tool_syntax_cut && !d.verdict);   /* reasoning: inert */
+    f = sem_accum_feed(&d, &rk, "</think>done ", 13);
+    TEST_ASSERT(!f.tool_syntax_cut && !d.verdict);
+    const size_t visible_len = d.text.len;
+    f = sem_accum_feed(&d, &rk, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START));
+    TEST_ASSERT(f.tool_syntax_cut && f.hit_stop);
+    TEST_ASSERT(d.verdict && !strcmp(d.verdict, "stop"));
+    TEST_ASSERT(d.text.len == visible_len);  /* cut at the visible marker */
+    sem_accum_free(&d);
+    request_free(&rk);
+
+    /* 4) finalize gate: without tools nothing is ever extracted as a call
+     * and finish cannot become tool_calls, whatever the text contains. */
+    tool_calls calls = {0};
+    char *content = NULL, *reasoning = NULL;
+    char err[64] = {0};
+    const char *finish = "stop";
+    bool recovered = false;
+    buf t = {0};
+    buf_puts(&t, "summary text\n\n");
+    buf_puts(&t, DS4_TOOL_CALLS_START);
+    buf_puts(&t, DS4_TOOL_CALLS_END);
+    bool ok = parse_generated_message_for_response(t.ptr, false, true, false,
+                                                   &finish, err, sizeof(err),
+                                                   &content, &reasoning, &calls,
+                                                   &recovered);
+    TEST_ASSERT(ok && calls.len == 0 && !recovered);
+    TEST_ASSERT(!strcmp(finish, "stop"));
+    TEST_ASSERT(content && strstr(content, "summary text"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    buf_free(&t);
+}
+
 /* Inc 0b (#13 twin): an unrepairable mid-toolcall budget cut on the cont
  * lane keeps the honest "length" finish and returns the partial call as
  * assistant text, mirroring the serial dcc2623 behavior; a non-budget
@@ -25112,6 +25289,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_anthropic_stream_matches_serial_oracle();
     test_cont_responses_stream_matches_serial_oracle();
     test_sem_accum_feed_verdicts();
+    test_sem_accum_no_tools_dsml_cut();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
     test_credit_union_merge_shapes();
