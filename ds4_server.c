@@ -8315,6 +8315,12 @@ struct server {
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
+    char *codex_models_json;    /* v0.5.7: optional ModelInfo array text
+                                 * (DS4_CODEX_MODELS_FILE) spliced into
+                                 * GET /v1/models as a top-level "models"
+                                 * field so OpenAI Codex self-configures
+                                 * (its manager needs that schema); NULL =
+                                 * plain OpenAI list only. */
     kv_disk_cache kv;
     tool_memory tool_mem;
     /* Inc 5a: generation-checked continuation records (under tool_mu).  The
@@ -15927,6 +15933,101 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
+/* v0.5.7 (#34): OpenAI Codex self-configuration.  Codex's models manager
+ * GETs /v1/models expecting a top-level "models" array in its own ModelInfo
+ * schema ("missing field `models`" against the plain OpenAI list), and it
+ * needs the model's real context window before its LOCAL auto-compaction
+ * works against a custom provider at all (its own overrides are broken
+ * upstream, openai/codex #16068/#19185).  DS4_CODEX_MODELS_FILE names a
+ * catalog file (ds4-on-spark ships codex/ds4-codex-catalog.json); its
+ * "models" array is spliced verbatim into GET /v1/models next to the OpenAI
+ * "data" field.  Codex tolerates the extra fields (validated live 08-09:
+ * cache written, no fallback-metadata warning) and OpenAI clients ignore
+ * "models".  The array is operator config parsed just enough to splice --
+ * a string-aware bracket matcher, no schema opinions server-side. */
+static char *json_models_array_dup(const char *text) {
+    const char *p = text;
+    while ((p = strstr(p, "\"models\"")) != NULL) {
+        const char *q = p + strlen("\"models\"");
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (*q != ':') { p = q; continue; }
+        q++;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (*q != '[') { p = q; continue; }
+        const char *start = q;
+        int depth = 0;
+        bool in_str = false, esc = false;
+        for (; *q; q++) {
+            const char c = *q;
+            if (in_str) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') in_str = false;
+                continue;
+            }
+            if (c == '"') in_str = true;
+            else if (c == '[') depth++;
+            else if (c == ']' && --depth == 0)
+                return xstrndup(start, (size_t)(q + 1 - start));
+        }
+        return NULL;   /* unterminated array */
+    }
+    return NULL;
+}
+
+static void server_load_codex_models(server *s) {
+    const char *path = getenv("DS4_CODEX_MODELS_FILE");
+    if (!path || !path[0]) return;
+    char *text = NULL;
+    FILE *fp = fopen(path, "rb");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        const long len = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        if (len > 0 && len < 4L * 1024 * 1024) {
+            text = xmalloc((size_t)len + 1);
+            if (fread(text, 1, (size_t)len, fp) == (size_t)len) {
+                text[len] = '\0';
+            } else {
+                free(text);
+                text = NULL;
+            }
+        }
+        fclose(fp);
+    }
+    if (!text) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: DS4_CODEX_MODELS_FILE unreadable (or empty/oversized), "
+                   "/v1/models stays plain OpenAI: %s", path);
+        return;
+    }
+    char *arr = json_models_array_dup(text);
+    free(text);
+    if (!arr) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: DS4_CODEX_MODELS_FILE has no top-level \"models\" "
+                   "array, ignored: %s", path);
+        return;
+    }
+    /* Operator drift check: codex plans its compaction against the file's
+     * context_window; a number that disagrees with the booted context makes
+     * that plan silently wrong in whichever direction. */
+    const char *cw = strstr(arr, "\"context_window\"");
+    const char *cwv = cw ? strchr(cw, ':') : NULL;
+    const long file_ctx = cwv ? strtol(cwv + 1, NULL, 10) : 0;
+    const int live_ctx = ds4_session_ctx(s->session);
+    if (file_ctx > 0 && file_ctx != live_ctx)
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: codex models file declares context_window=%ld but "
+                   "this boot is -c %d -- edit %s to match",
+                   file_ctx, live_ctx, path);
+    s->codex_models_json = arr;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: codex models catalog spliced into /v1/models "
+               "(%zu bytes, context_window=%ld): %s",
+               strlen(arr), file_ctx, path);
+}
+
 static bool send_models(server *s, int fd) {
     /* Only advertise the model this instance actually loaded -- listing
      * both V4 ids regardless (the pre-v0.2 behavior) reads as two
@@ -15934,7 +16035,12 @@ static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     append_model_json(&b, s, server_model_id_from_engine(s->engine));
-    buf_puts(&b, "]}\n");
+    buf_puts(&b, "]");
+    if (s->codex_models_json) {
+        buf_puts(&b, ",\"models\":");
+        buf_puts(&b, s->codex_models_json);
+    }
+    buf_puts(&b, "}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -17720,6 +17826,7 @@ int main(int argc, char **argv) {
                    s.creg.grace_s, s.creg.ttl_s, s.creg.pin_deadline_s,
                    s.creg.hold_shed_s, s.creg.max_records);
     }
+    server_load_codex_models(&s);
     s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
@@ -24680,6 +24787,34 @@ static void test_sem_accum_no_tools_dsml_cut(void) {
     buf_free(&t);
 }
 
+/* v0.5.7 C2: the /v1/models codex-splice array extractor -- string-aware
+ * bracket matching over operator-provided catalog JSON. */
+static void test_json_models_array_dup(void) {
+    /* Well-formed catalog: the array comes back verbatim, brackets included. */
+    char *a = json_models_array_dup(
+        "{\"models\": [{\"slug\":\"x\",\"nested\":[1,2]}] }");
+    TEST_ASSERT(a && !strcmp(a, "[{\"slug\":\"x\",\"nested\":[1,2]}]"));
+    free(a);
+
+    /* A "models" decoy inside a string value must not satisfy the search;
+     * the real key after it still does. */
+    a = json_models_array_dup(
+        "{\"desc\":\"\\\"models\\\": fake\",\"models\":[{\"s\":\"]\"}]}");
+    TEST_ASSERT(a && !strcmp(a, "[{\"s\":\"]\"}]"));
+    free(a);
+
+    /* Escaped quotes and brackets inside strings do not move the depth. */
+    a = json_models_array_dup(
+        "{\"models\":[{\"i\":\"a\\\\\\\"[\",\"j\":\"]\"}]}");
+    TEST_ASSERT(a && a[0] == '[' && a[strlen(a) - 1] == ']');
+    free(a);
+
+    /* Unterminated array / missing key / non-array value: NULL, no crash. */
+    TEST_ASSERT(!json_models_array_dup("{\"models\":[{\"s\":1}"));
+    TEST_ASSERT(!json_models_array_dup("{\"data\":[1]}"));
+    TEST_ASSERT(!json_models_array_dup("{\"models\":{\"s\":1}}"));
+}
+
 /* Inc 0b (#13 twin): an unrepairable mid-toolcall budget cut on the cont
  * lane keeps the honest "length" finish and returns the partial call as
  * assistant text, mirroring the serial dcc2623 behavior; a non-budget
@@ -25290,6 +25425,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_responses_stream_matches_serial_oracle();
     test_sem_accum_feed_verdicts();
     test_sem_accum_no_tools_dsml_cut();
+    test_json_models_array_dup();
     test_cont_budget_cut_toolcall_keeps_length();
     test_request_decode_budget_three_states();
     test_credit_union_merge_shapes();
