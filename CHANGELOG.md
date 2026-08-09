@@ -1,4 +1,57 @@
-# v0.5.6 (2026-08-08)
+# Changelog
+
+All notable fork-side changes to this project are documented here.
+Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
+[antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
+(2026-05-29). Upstream's own changes are not repeated here.
+
+## v0.5.6.1 — 2026-08-09
+
+Fast-follow fix for a session-killing interaction found while testing
+agent harnesses against v0.5.6, plus the first community Metal
+contribution.
+
+- Long agent sessions no longer die after a stream reconnect. After a
+  tool turn, the serial session briefly reserves itself for that turn's
+  continuation; in v0.5.6 the reservation refused any other request
+  from the same client for the full 60-second grace window — longer
+  than real clients keep retrying, so one dropped stream during a long
+  thinking turn could end the whole session (Codex hit this in about
+  25 seconds). The reservation now sheds competing work only for a
+  short seat window (DS4_CONT_HOLD_SHED_S, default 5 s, with an honest
+  Retry-After); after it, the newcomer is served and a late
+  continuation falls back to the documented 409-and-replay contract,
+  which interruption checkpoints keep cheap. A queued continuation's
+  hard pin still protects its turn exactly as before. Gated by the full
+  continuation-registry battery plus a live replay of the failing
+  session: the identical run that died in 25 seconds served 2.57M
+  cumulative tokens to its honest completion.
+- Metal: the DSpark block drafter now runs end-to-end on Apple Silicon
+  — three previously-stubbed ops plus four correctness fixes on the
+  continuous/drafter path, contributed by robotnursenyc (PR #2) with
+  measurements on their own hardware. Metal correctness on this fork's
+  serving paths is community-maintained: gated here by compile and the
+  isolated Metal kernel regressions; see METAL_DSPARK.md. Two CUDA-side
+  amendments rode the landing (a mirrored signature and a
+  scoped-commands capability) so GB10 serving is byte-identical.
+- Known, documented for transparency: OpenAI Codex (0.144.x) never
+  auto-compacts its transcript against custom providers (upstream
+  issues #16068/#19185), so very long Codex sessions grow until they
+  hit this server's honest capacity refusals. Not a server bug, and
+  Claude Code compaction is unaffected. A partial local workaround
+  ships with ds4-on-spark: a `model_catalog_json` catalog file that
+  teaches Codex the real context window, validated live to make
+  Codex's own compaction fire instead of the session dying at the
+  capacity wall (see "Pointing OpenAI Codex at the box" in the
+  ds4-on-spark README). Honest caveat from the same validation:
+  post-compaction task retention depends on the transcript summary the
+  model writes, and DeepSeek can leak DSML tool-call markup into those
+  summaries, which degrades later turns. Suppressing that leak
+  server-side, plus serving Codex's /v1/models schema so no catalog
+  file is needed, is chartered for v0.5.7. For long agent sessions
+  today, Claude Code remains the recommended harness.
+
+## v0.5.6 — 2026-08-08
 
 The first-class API release: Anthropic Messages and OpenAI Responses
 are now first-class surfaces of the batched engine, served in the
@@ -100,7 +153,7 @@ several of the honesty fixes that shipped along the way.
   the omitted-budget case is designed but deliberately not shipped
   until real traffic asks for it.
 
-# v0.5.5 (2026-08-05)
+## v0.5.5 — 2026-08-05
 
 The illegal-access release: the intermittent CUDA crash that several
 GB10 boxes hit under sustained agentic load is root-caused and fixed,
@@ -169,7 +222,7 @@ emX0r for the serial-lane report that drove the reservation work.
   finish-reason honesty, matcher picks, and tool-turn re-render
   alignment (measured: 1-token asymmetry on the hot path).
 
-# v0.5.4 (2026-08-03)
+## v0.5.4 — 2026-08-03
 
 Field-report release: every change traces to a report in the NVIDIA
 developer forum threads. Thanks to GaelicThndr for the disk-restore
@@ -227,13 +280,6 @@ these.
   releases), and bank_mutation_gate (interrupted warm/truncate replays
   + mid-decode disconnects of reasoning rows, with watermark-reuse and
   usage-honesty receipts per cycle).
-
-# Changelog
-
-All notable fork-side changes to this project are documented here.
-Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
-[antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
-(2026-05-29). Upstream's own changes are not repeated here.
 
 ## v0.5.3 — 2026-08-02
 
