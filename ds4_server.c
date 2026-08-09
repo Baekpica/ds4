@@ -6429,6 +6429,8 @@ typedef struct {
     int message_index;     /* output_index of the assistant message item */
     int next_output_index; /* monotonic counter for upcoming output items */
     int sequence;          /* monotonic per-event sequence_number Codex consumes */
+    long created_at;       /* v0.5.7 C3: snapshot for in_progress heartbeats
+                            * (0 until response.created went out) */
 } responses_stream;
 
 static void responses_stream_init(const request *r, responses_stream *st) {
@@ -6491,6 +6493,27 @@ static bool responses_sse_created(int fd, const request *r, responses_stream *st
         "{\"type\":\"response.created\",\"response\":{\"id\":\"%s\","
         "\"object\":\"response\",\"created_at\":%ld,\"status\":\"in_progress\","
         "\"model\":", st->response_id, created_at);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"output\":[]}}");
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    if (ok) st->created_at = created_at;
+    return ok;
+}
+
+/* v0.5.7 C3: the Responses heartbeat is a REAL event -- codex's SSE idle
+ * timer counts parsed events, not bytes (`: comment` keepalives provably on
+ * the wire every 5 s did not reset it: "idle timeout waiting for SSE",
+ * run10).  response.in_progress is the API's own "still working" event; it
+ * repeats the created snapshot (codex reads the type and the
+ * sequence_number, which continues the live machine's counter). */
+static bool responses_sse_in_progress(int fd, const request *r,
+                                      responses_stream *st) {
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.in_progress\",\"response\":{\"id\":\"%s\","
+        "\"object\":\"response\",\"created_at\":%ld,\"status\":\"in_progress\","
+        "\"model\":", st->response_id, st->created_at);
     json_escape(&b, r->model);
     buf_puts(&b, ",\"output\":[]}}");
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
@@ -11100,15 +11123,23 @@ static void log_flags(char *buf, size_t len, bool responses_protocol,
 }
 
 /* v0.5.7 C3 (#34): one transport heartbeat for every silent stream stretch,
- * prefill AND decode.  Anthropic clients get the protocol's own ping event
- * (legal at any point in the stream); the OpenAI-family surfaces get an SSE
- * comment line (ignored by SSE parsers).  Decode needs this because the
- * Responses machine writes ZERO bytes while the model is inside <think>
- * with no reasoning summaries requested -- codex 0.144.1's ~300 s
- * stream_idle_timeout killed exactly such turns (five aborts at 300.0 s,
- * run6, receipt local/docs/v057/codexfix_c12_receipt_2026-08-09.md). */
-static bool stream_heartbeat_emit(int fd, api_style api, const char *comment) {
-    if (api == API_ANTHROPIC) return sse_event(fd, "ping", "{\"type\": \"ping\"}");
+ * prefill AND decode.  Decode needs this because the stream machines write
+ * ZERO bytes while the model is inside <think> with no reasoning deltas on
+ * the wire -- codex 0.144.1's ~300 s stream_idle_timeout killed exactly
+ * such turns (five aborts at 300.0 s, run6; receipt
+ * local/docs/v057/codexfix_c12_receipt_2026-08-09.md).  Per protocol:
+ * Anthropic gets its native ping event; a LIVE Responses machine (resp_st,
+ * created already out) gets a real response.in_progress event, because
+ * codex's idle timer counts parsed events and ignores comments (run10);
+ * everything else gets an SSE comment line (ignored by SSE parsers, still
+ * resets byte-level TCP/proxy timers). */
+static bool stream_heartbeat_emit(int fd, const request *r,
+                                  responses_stream *resp_st,
+                                  const char *comment) {
+    if (r->api == API_ANTHROPIC)
+        return sse_event(fd, "ping", "{\"type\": \"ping\"}");
+    if (resp_st && resp_st->created_at)
+        return responses_sse_in_progress(fd, r, resp_st);
     return send_all(fd, comment, strlen(comment));
 }
 
@@ -12466,7 +12497,9 @@ decode_again:
             if (j->req.stream) {
                 const double know = now_sec();
                 if (know - decode_keepalive >= 5.0) {
-                    if (!stream_heartbeat_emit(j->fd, j->req.api, ": decode\n\n")) {
+                    if (!stream_heartbeat_emit(j->fd, &j->req,
+                                               responses_live_chat ? &wsess.state.responses : NULL,
+                                               ": decode\n\n")) {
                         finish = "error";
                         snprintf(err, sizeof(err), "client stream write failed");
                         stop_decode = true;
@@ -15164,7 +15197,10 @@ static void cont_prefill_heartbeat(cont_sched *cs, job *j) {
     const double now = now_sec();
     if (now - st->last_keepalive < 5.0) return;
     t_emit_job = j;
-    const bool ok = stream_heartbeat_emit(j->fd, j->req.api, ": prefill\n\n");
+    responses_stream *rs =
+        (j->req.kind == REQ_CHAT && j->req.api == API_RESPONSES) ?
+        &st->wsess.state.responses : NULL;
+    const bool ok = stream_heartbeat_emit(j->fd, &j->req, rs, ": prefill\n\n");
     t_emit_job = NULL;
     if (ok) st->last_keepalive = now;
     else    st->failed = true;
@@ -15503,7 +15539,10 @@ static int cont_on_token(void *ud, void *user, int token) {
         if (ok && st->started && !st->failed) {
             const double know = now_sec();
             if (know - st->last_keepalive >= 5.0) {
-                ok = stream_heartbeat_emit(j->fd, j->req.api, ": decode\n\n");
+                responses_stream *rs =
+                    (j->req.kind == REQ_CHAT && j->req.api == API_RESPONSES) ?
+                    &st->wsess.state.responses : NULL;
+                ok = stream_heartbeat_emit(j->fd, &j->req, rs, ": decode\n\n");
                 if (ok) st->last_keepalive = know;
             }
         }
@@ -24829,20 +24868,55 @@ static void test_sem_accum_no_tools_dsml_cut(void) {
 static void test_stream_heartbeat_emit(void) {
     int p[2];   /* send() needs a socket, not a pipe (ENOTSOCK) */
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, p) == 0);
-    char out[256];
+    char out[512];
+    ssize_t n;
+    request r;
+    request_init(&r, REQ_CHAT, 128);
 
-    TEST_ASSERT(stream_heartbeat_emit(p[1], API_ANTHROPIC, ": decode\n\n"));
-    ssize_t n = read(p[0], out, sizeof(out) - 1);
+    /* Anthropic: the native ping event. */
+    r.api = API_ANTHROPIC;
+    TEST_ASSERT(stream_heartbeat_emit(p[1], &r, NULL, ": decode\n\n"));
+    n = read(p[0], out, sizeof(out) - 1);
     TEST_ASSERT(n > 0);
     out[n] = '\0';
     TEST_ASSERT(strstr(out, "event: ping") && strstr(out, "\"type\": \"ping\""));
 
-    TEST_ASSERT(stream_heartbeat_emit(p[1], API_RESPONSES, ": decode\n\n"));
+    /* OpenAI family without a live Responses machine: comment only. */
+    r.api = API_RESPONSES;
+    TEST_ASSERT(stream_heartbeat_emit(p[1], &r, NULL, ": decode\n\n"));
     n = read(p[0], out, sizeof(out) - 1);
     TEST_ASSERT(n > 0);
     out[n] = '\0';
-    TEST_ASSERT(!strcmp(out, ": decode\n\n"));   /* comment only, no event */
+    TEST_ASSERT(!strcmp(out, ": decode\n\n"));
 
+    /* Live Responses machine: a REAL response.in_progress event continuing
+     * the machine's sequence counter (codex's idle timer only sees parsed
+     * events, run10). */
+    responses_stream rs;
+    responses_stream_init(&r, &rs);
+    rs.created_at = 1786316295;
+    rs.sequence = 7;
+    TEST_ASSERT(stream_heartbeat_emit(p[1], &r, &rs, ": decode\n\n"));
+    n = read(p[0], out, sizeof(out) - 1);
+    TEST_ASSERT(n > 0);
+    out[n] = '\0';
+    TEST_ASSERT(strstr(out, "\"type\":\"response.in_progress\""));
+    TEST_ASSERT(strstr(out, "\"sequence_number\":7"));
+    TEST_ASSERT(strstr(out, "\"status\":\"in_progress\""));
+    TEST_ASSERT(rs.sequence == 8);
+
+    /* created not yet on the wire: ordering safety, stays a comment. */
+    responses_stream rs2;
+    responses_stream_init(&r, &rs2);
+    TEST_ASSERT(stream_heartbeat_emit(p[1], &r, &rs2, ": decode\n\n"));
+    n = read(p[0], out, sizeof(out) - 1);
+    TEST_ASSERT(n > 0);
+    out[n] = '\0';
+    TEST_ASSERT(!strcmp(out, ": decode\n\n"));
+
+    responses_stream_free(&rs);
+    responses_stream_free(&rs2);
+    request_free(&r);
     close(p[0]);
     close(p[1]);
 }
