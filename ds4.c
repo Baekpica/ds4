@@ -83,7 +83,7 @@ static bool ds4_backend_uses_graph(ds4_backend backend) {
 }
 
 /* =========================================================================
- * DeepSeek V4 Shape Profiles.
+ * Model Shape Profiles.
  * =========================================================================
  *
  * The weight binder and metadata validator select one of the known model
@@ -106,9 +106,9 @@ enum {
      * lossless in-forward-emit+rollback path needs 4 checkpoint depths. */
     DS4_MTP_RB_DEPTH         = 4,
     DS4_MAX_EMBD             = 7168,
-    DS4_MAX_VOCAB            = 129280,
+    DS4_MAX_VOCAB            = 196608,
     DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 1,
+    DS4_MAX_HEAD_KV          = 8,
     DS4_MAX_HEAD_DIM         = 512,
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
@@ -116,7 +116,7 @@ enum {
     DS4_MAX_LORA_Q           = 1536,
     DS4_MAX_LORA_O           = 1024,
     DS4_MAX_EXPERT           = 384,
-    DS4_MAX_EXPERT_USED      = 6,
+    DS4_MAX_EXPERT_USED      = 8,
     DS4_MAX_EXPERT_SHARED    = 1,
     DS4_MAX_FF_EXP           = 3072,
     DS4_MAX_HASH_LAYER       = 3,
@@ -129,12 +129,19 @@ enum {
 };
 
 typedef enum {
-    DS4_VARIANT_FLASH = 0,
-    DS4_VARIANT_PRO   = 1,
+    DS4_MODEL_FAMILY_DEEPSEEK4   = 0,
+    DS4_MODEL_FAMILY_SOLAR_OPEN2 = 1,
+} ds4_model_family;
+
+typedef enum {
+    DS4_VARIANT_FLASH           = 0,
+    DS4_VARIANT_PRO             = 1,
+    DS4_VARIANT_SOLAR_OPEN2_250B = 2,
 } ds4_variant;
 
 typedef struct {
     const char *name;
+    ds4_model_family family;
     ds4_variant variant;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -151,6 +158,8 @@ typedef struct {
     uint32_t n_expert_used;
     uint32_t n_expert_shared;
     uint32_t n_ff_exp;
+    uint32_t n_ff_dense;
+    uint32_t n_ff_shexp;
     uint32_t n_hash_layer;
     uint32_t n_swa;
     uint32_t n_indexer_head;
@@ -158,7 +167,12 @@ typedef struct {
     uint32_t n_indexer_top_k;
     uint32_t n_hc;
     uint32_t n_hc_sinkhorn_iter;
+    uint32_t n_kda_head_dim;
+    uint32_t n_ssm_conv;
+    bool use_rope;
     float rms_eps;
+    float kda_l2_eps;
+    float kda_gate_clamp_min;
     float hc_eps;
     float expert_weight_scale;
     float swiglu_clamp_exp;
@@ -172,6 +186,7 @@ typedef struct {
 
 static const ds4_shape DS4_SHAPE_FLASH = {
     .name = "DeepSeek V4 Flash",
+    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
     .variant = DS4_VARIANT_FLASH,
     .n_layer = 43,
     .n_embd = 4096,
@@ -195,6 +210,7 @@ static const ds4_shape DS4_SHAPE_FLASH = {
     .n_indexer_top_k = 512,
     .n_hc = 4,
     .n_hc_sinkhorn_iter = 20,
+    .use_rope = true,
     .rms_eps = DS4_DEFAULT_RMS_EPS,
     .hc_eps = DS4_DEFAULT_HC_EPS,
     .expert_weight_scale = 1.5f,
@@ -209,6 +225,7 @@ static const ds4_shape DS4_SHAPE_FLASH = {
 
 static const ds4_shape DS4_SHAPE_PRO = {
     .name = "DeepSeek V4 Pro",
+    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
     .variant = DS4_VARIANT_PRO,
     .n_layer = 61,
     .n_embd = 7168,
@@ -232,6 +249,7 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .n_indexer_top_k = 1024,
     .n_hc = 4,
     .n_hc_sinkhorn_iter = 20,
+    .use_rope = true,
     .rms_eps = DS4_DEFAULT_RMS_EPS,
     .hc_eps = DS4_DEFAULT_HC_EPS,
     .expert_weight_scale = 2.5f,
@@ -244,8 +262,43 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+/* Solar Open2 250B alternates one GQA layer with three recurrent KDA layers.
+ * The GGUF carries this as a per-layer head_count_kv array; n_head_kv here is
+ * the width of the GQA layers.  Solar attention is NoPE even though the
+ * converted metadata retains a vestigial rope.freq_base value. */
+static const ds4_shape DS4_SHAPE_SOLAR_OPEN2_250B = {
+    .name = "Solar Open2 250B",
+    .family = DS4_MODEL_FAMILY_SOLAR_OPEN2,
+    .variant = DS4_VARIANT_SOLAR_OPEN2_250B,
+    .n_layer = 48,
+    .n_embd = 4096,
+    .n_vocab = 196608,
+    .n_head = 64,
+    .n_head_kv = 8,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 0,
+    .n_expert = 320,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 1280,
+    .n_ff_dense = 10240,
+    .n_ff_shexp = 1280,
+    .n_kda_head_dim = 128,
+    .n_ssm_conv = 4,
+    .use_rope = false,
+    .rms_eps = 1.0e-5f,
+    .kda_l2_eps = 1.0e-6f,
+    .kda_gate_clamp_min = -5.0f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+    .rope_scale_factor = 1.0f,
+    .rope_orig_ctx = UINT64_C(1048576),
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
+    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
     .variant = DS4_VARIANT_FLASH,
     .n_layer = 43,
     .n_embd = 4096,
@@ -269,6 +322,7 @@ static ds4_shape g_ds4_shape = {
     .n_indexer_top_k = 512,
     .n_hc = 4,
     .n_hc_sinkhorn_iter = 20,
+    .use_rope = true,
     .rms_eps = DS4_DEFAULT_RMS_EPS,
     .hc_eps = DS4_DEFAULT_HC_EPS,
     .expert_weight_scale = 1.5f,
@@ -284,6 +338,7 @@ static ds4_shape g_ds4_shape = {
 static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 
 #define DS4_MODEL_SHAPE_NAME          (g_ds4_shape.name)
+#define DS4_MODEL_FAMILY              (g_ds4_shape.family)
 #define DS4_MODEL_VARIANT             (g_ds4_shape.variant)
 #define DS4_N_LAYER                   (g_ds4_shape.n_layer)
 #define DS4_N_EMBD                    (g_ds4_shape.n_embd)
@@ -300,6 +355,8 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_EXPERT_USED             (g_ds4_shape.n_expert_used)
 #define DS4_N_EXPERT_SHARED           (g_ds4_shape.n_expert_shared)
 #define DS4_N_FF_EXP                  (g_ds4_shape.n_ff_exp)
+#define DS4_N_FF_DENSE                (g_ds4_shape.n_ff_dense)
+#define DS4_N_FF_SHEXP                (g_ds4_shape.n_ff_shexp ? g_ds4_shape.n_ff_shexp : g_ds4_shape.n_ff_exp)
 #define DS4_N_HASH_LAYER              (g_ds4_shape.n_hash_layer)
 #define DS4_N_SWA                     (g_ds4_shape.n_swa)
 #define DS4_N_INDEXER_HEAD            (g_ds4_shape.n_indexer_head)
@@ -307,7 +364,12 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_INDEXER_TOP_K           (g_ds4_shape.n_indexer_top_k)
 #define DS4_N_HC                      (g_ds4_shape.n_hc)
 #define DS4_N_HC_SINKHORN_ITER        (g_ds4_shape.n_hc_sinkhorn_iter)
+#define DS4_N_KDA_HEAD_DIM            (g_ds4_shape.n_kda_head_dim)
+#define DS4_N_SSM_CONV                (g_ds4_shape.n_ssm_conv)
+#define DS4_USE_ROPE                  (g_ds4_shape.use_rope)
 #define DS4_RMS_EPS                   (g_ds4_shape.rms_eps)
+#define DS4_KDA_L2_EPS                (g_ds4_shape.kda_l2_eps)
+#define DS4_KDA_GATE_CLAMP_MIN        (g_ds4_shape.kda_gate_clamp_min)
 #define DS4_HC_EPS                    (g_ds4_shape.hc_eps)
 #define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
 #define DS4_SWIGLU_CLAMP_EXP          (g_ds4_shape.swiglu_clamp_exp)
@@ -619,8 +681,14 @@ static void ds4_die(const char *msg) {
 /* Attention compression is read from GGUF metadata after validating that it
  * matches the exact layout expected for the loaded model shape. */
 static uint32_t ds4_layer_compress_ratio(uint32_t il) {
-    if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
+    if (il >= DS4_N_LAYER) ds4_die("layer index is outside the loaded model layout");
     return g_ds4_compress_ratios[il];
+}
+
+static bool ds4_solar_layer_is_gqa(uint32_t il) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_SOLAR_OPEN2) return false;
+    if (il >= DS4_N_LAYER) ds4_die("Solar layer index is outside the loaded model layout");
+    return (il % 4u) == 0u;
 }
 
 static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
@@ -2871,6 +2939,15 @@ static uint32_t required_u32(const ds4_model *m, const char *key) {
     return v;
 }
 
+static uint64_t required_u64_compat(const ds4_model *m, const char *key) {
+    uint64_t v = 0;
+    if (!model_get_u64_compat(m, key, &v)) {
+        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
+        exit(1);
+    }
+    return v;
+}
+
 static float required_f32(const ds4_model *m, const char *key) {
     float v = 0.0f;
     if (!model_get_f32_compat(m, key, &v)) {
@@ -3339,6 +3416,13 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
     exit(1);
 }
 
+static void config_expect_u64(const char *name, uint64_t got, uint64_t expected) {
+    if (got == expected) return;
+    fprintf(stderr, "ds4: expected %s=%" PRIu64 " for %s, got %" PRIu64 "\n",
+            name, expected, DS4_MODEL_SHAPE_NAME, got);
+    exit(1);
+}
+
 static void config_expect_f32(const char *name, float got, float expected) {
     const float scale = fabsf(expected) > 1.0f ? fabsf(expected) : 1.0f;
     if (fabsf(got - expected) <= scale * 1.0e-6f) return;
@@ -3360,7 +3444,7 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
 
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
-static void config_validate_model(const ds4_model *m) {
+static void config_validate_deepseek4_model(const ds4_model *m) {
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
     const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
     const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
@@ -3470,6 +3554,130 @@ static void config_validate_model(const ds4_model *m) {
     config_expect_f32("hyper_connection.epsilon", hc_eps, DS4_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+}
+
+static void config_validate_solar_open2_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_SOLAR_OPEN2_250B;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_layer = required_u32(m, "solar-open2.block_count");
+    const uint64_t n_ctx = required_u64_compat(m, "solar-open2.context_length");
+    const uint32_t n_embd = required_u32(m, "solar-open2.embedding_length");
+    const uint32_t n_vocab = required_u32(m, "solar-open2.vocab_size");
+    const uint32_t n_ff_dense = required_u32(m, "solar-open2.feed_forward_length");
+    const uint32_t n_head = required_u32(m, "solar-open2.attention.head_count");
+    const uint32_t n_head_dim = required_u32(m, "solar-open2.attention.key_length");
+    const uint32_t n_value_dim = required_u32(m, "solar-open2.attention.value_length");
+    const uint32_t n_expert = required_u32(m, "solar-open2.expert_count");
+    const uint32_t n_expert_used = required_u32(m, "solar-open2.expert_used_count");
+    const uint32_t n_ff_exp = required_u32(m, "solar-open2.expert_feed_forward_length");
+    const uint32_t n_expert_shared = required_u32(m, "solar-open2.expert_shared_count");
+    const uint32_t n_leading_dense = required_u32(m, "solar-open2.leading_dense_block_count");
+    const uint32_t n_ssm_conv = required_u32(m, "solar-open2.ssm.conv_kernel");
+    const uint32_t n_kda_head_dim = required_u32(m, "solar-open2.kda.head_dim");
+    const uint32_t expert_gating_func = required_u32(m, "solar-open2.expert_gating_func");
+
+    config_expect_u32("block_count", n_layer, DS4_N_LAYER);
+    config_expect_u64("context_length", n_ctx, DS4_ROPE_ORIG_CTX);
+    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
+    config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
+    config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
+    config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length", n_value_dim, DS4_N_VALUE_DIM);
+    config_expect_u32("expert_count", n_expert, DS4_N_EXPERT);
+    config_expect_u32("expert_used_count", n_expert_used, DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length", n_ff_exp, DS4_N_FF_EXP);
+    config_expect_u32("expert_shared_count", n_expert_shared, DS4_N_EXPERT_SHARED);
+    config_expect_u32("leading_dense_block_count", n_leading_dense, 0);
+    config_expect_u32("ssm.conv_kernel", n_ssm_conv, DS4_N_SSM_CONV);
+    config_expect_u32("kda.head_dim", n_kda_head_dim, DS4_N_KDA_HEAD_DIM);
+    config_expect_u32("expert_gating_func", expert_gating_func, 2);
+
+    const float rms_eps = required_f32(
+        m, "solar-open2.attention.layer_norm_rms_epsilon");
+    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
+    const float expert_weight_scale = required_f32(
+        m, "solar-open2.expert_weights_scale");
+    config_expect_f32("expert_weights_scale", expert_weight_scale,
+                      DS4_EXPERT_WEIGHT_SCALE);
+    const bool expert_weight_norm = required_bool(
+        m, "solar-open2.expert_weights_norm");
+    config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+
+    /* The converter retains rope.freq_base for HF compatibility, but Solar's
+     * attention is NoPE.  Reject a non-zero dimension_count if one appears. */
+    const float rope_freq_base = required_f32(m, "solar-open2.rope.freq_base");
+    config_expect_f32("rope.freq_base (vestigial)", rope_freq_base,
+                      DS4_ROPE_FREQ_BASE);
+    uint32_t rope_dim = 0;
+    if (model_get_u32(m, "solar-open2.rope.dimension_count", &rope_dim)) {
+        config_expect_u32("rope.dimension_count (NoPE)", rope_dim, 0);
+    }
+    config_expect_bool("internal use_rope", DS4_USE_ROPE, false);
+
+    const char *schedule_key = "solar-open2.attention.head_count_kv";
+    ds4_array_ref schedule_arr;
+    if (!model_get_array(m, schedule_key, &schedule_arr) ||
+        (schedule_arr.type != GGUF_VALUE_INT32 &&
+         schedule_arr.type != GGUF_VALUE_UINT32)) {
+        fprintf(stderr,
+                "ds4: required integer array metadata key is missing: %s\n",
+                schedule_key);
+        exit(1);
+    }
+    if (schedule_arr.len != n_layer) {
+        fprintf(stderr, "ds4: %s has %" PRIu64 " entries, expected %u\n",
+                schedule_key, schedule_arr.len, n_layer);
+        exit(1);
+    }
+
+    ds4_cursor schedule = cursor_at(m, schedule_arr.data_pos);
+    for (uint32_t il = 0; il < n_layer; il++) {
+        uint32_t got = 0;
+        if (schedule_arr.type == GGUF_VALUE_UINT32) {
+            if (!cursor_u32(&schedule, &got)) ds4_die(schedule.error);
+        } else {
+            int32_t signed_got = 0;
+            if (!cursor_read(&schedule, &signed_got, sizeof(signed_got))) {
+                ds4_die(schedule.error);
+            }
+            if (signed_got < 0) {
+                fprintf(stderr, "ds4: %s[%u] is negative: %d\n",
+                        schedule_key, il, signed_got);
+                exit(1);
+            }
+            got = (uint32_t)signed_got;
+        }
+        const uint32_t want = ds4_solar_layer_is_gqa(il) ? DS4_N_HEAD_KV : 0u;
+        if (got != want) {
+            fprintf(stderr,
+                    "ds4: %s[%u]=%u, expected %u for the S-L-L-L schedule\n",
+                    schedule_key, il, got, want);
+            exit(1);
+        }
+    }
+
+    config_expect_f32("internal KDA q/k l2 epsilon", DS4_KDA_L2_EPS,
+                      1.0e-6f);
+    config_expect_f32("internal KDA gate clamp minimum",
+                      DS4_KDA_GATE_CLAMP_MIN, -5.0f);
+}
+
+static void config_validate_model(const ds4_model *m) {
+    ds4_str arch = {0};
+    if (!model_get_string(m, "general.architecture", &arch) ||
+        ds4_streq(arch, "deepseek4")) {
+        config_validate_deepseek4_model(m);
+        return;
+    }
+    if (ds4_streq(arch, "solar-open2")) {
+        config_validate_solar_open2_model(m);
+        return;
+    }
+    fprintf(stderr, "ds4: unsupported GGUF architecture: %.*s\n",
+            (int)arch.len, arch.ptr);
+    exit(1);
 }
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
