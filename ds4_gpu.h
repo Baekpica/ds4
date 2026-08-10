@@ -2459,6 +2459,36 @@ int ds4_gpu_solar_kda_decode_tensor(
         uint32_t                conv_kernel,
         float                   gate_lower_bound);
 
+/* Independent single-token rows backed by a bank-major Solar state slab.
+ * Offsets are byte offsets inside one bank; bank_ids selects the bank owned
+ * by each token row.  This is the continuous-batching decode primitive: unlike
+ * prefill, rows do not share or advance one recurrent state in sequence. */
+int ds4_gpu_solar_kda_decode_banks_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state_slab,
+        uint64_t                state_bank_stride,
+        uint64_t                recurrent_offset,
+        uint64_t                q_conv_offset,
+        uint64_t                k_conv_offset,
+        uint64_t                v_conv_offset,
+        const ds4_gpu_tensor *bank_ids,
+        uint32_t                n_tokens,
+        uint32_t                max_banks,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound);
+
 /* Token-major KDA continuation. The generic kernel preserves exact sequence
  * order inside each head block and carries state across arbitrary chunks. */
 int ds4_gpu_solar_kda_prefill_tensor(
@@ -2527,6 +2557,22 @@ int ds4_gpu_solar_kv_store_tensor(
         uint32_t                kv_cap,
         ds4_solar_kv_format     format);
 
+/* One KV row per independent decode row.  kv_slab is bank-major, and each
+ * row selects both its bank and absolute position through device u32 arrays. */
+int ds4_gpu_solar_kv_store_banks_tensor(
+        ds4_gpu_tensor       *kv_slab,
+        const ds4_gpu_tensor *bank_ids,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                n_tokens,
+        uint32_t                max_banks,
+        uint64_t                bank_stride,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        ds4_solar_kv_format     format);
+
 int ds4_gpu_solar_attention_decode_tensor(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
@@ -2549,6 +2595,27 @@ int ds4_gpu_solar_attention_decode_split_tensor(
         uint32_t                head_dim,
         uint32_t                kv_cap,
         uint32_t                pos,
+        uint32_t                window,
+        uint32_t                chunk_len,
+        ds4_solar_kv_format     format);
+
+/* Split-KV decode for independent bank rows.  max_position is the largest
+ * inclusive position in positions and bounds the launched split grid. */
+int ds4_gpu_solar_attention_decode_banks_split_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv_slab,
+        ds4_gpu_tensor       *partials,
+        const ds4_gpu_tensor *bank_ids,
+        const ds4_gpu_tensor *positions,
+        uint32_t                n_tokens,
+        uint32_t                max_banks,
+        uint64_t                bank_stride,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                max_position,
         uint32_t                window,
         uint32_t                chunk_len,
         ds4_solar_kv_format     format);

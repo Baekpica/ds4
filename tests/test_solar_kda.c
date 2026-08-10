@@ -280,6 +280,143 @@ static int gpu_reset_state(gpu_kda_state *state) {
     return 1;
 }
 
+static void test_banked_decode(
+        const gpu_kda_inputs *fixed,
+        const float *q_weight,
+        const float *k_weight,
+        const float *v_weight,
+        const float *decay,
+        const float *dt) {
+    enum { T_BANKS = 2 };
+    const uint64_t recurrent_bytes = (uint64_t)T_STATE * sizeof(float);
+    const uint64_t conv_bytes = (uint64_t)T_CONV_STATE * sizeof(float);
+    const uint64_t q_offset = recurrent_bytes;
+    const uint64_t k_offset = q_offset + conv_bytes;
+    const uint64_t v_offset = k_offset + conv_bytes;
+    const uint64_t bank_stride = v_offset + conv_bytes;
+    const uint64_t vector_bytes = (uint64_t)T_VECTOR * sizeof(float);
+    const uint32_t bank_ids[T_BANKS] = {1u, 0u};
+
+    float *q = calloc((size_t)T_BANKS * T_VECTOR, sizeof(*q));
+    float *k = calloc((size_t)T_BANKS * T_VECTOR, sizeof(*k));
+    float *v = calloc((size_t)T_BANKS * T_VECTOR, sizeof(*v));
+    float *g = calloc((size_t)T_BANKS * T_VECTOR, sizeof(*g));
+    float *beta = calloc((size_t)T_BANKS * T_HEAD, sizeof(*beta));
+    float *gpu_out = calloc((size_t)T_BANKS * T_VECTOR, sizeof(*gpu_out));
+    float *want_out = calloc((size_t)T_BANKS * T_VECTOR, sizeof(*want_out));
+    float *bank_data = malloc((size_t)bank_stride);
+    cpu_kda_state *cpu = calloc(T_BANKS, sizeof(*cpu));
+    REQUIRE(q && k && v && g && beta && gpu_out && want_out && bank_data && cpu,
+            "banked KDA host allocation");
+
+    for (uint32_t row = 0; row < T_BANKS; row++) {
+        const uint32_t token = row == 0u ? 3u : 5u;
+        make_token(token,
+                   q + (size_t)row * T_VECTOR,
+                   k + (size_t)row * T_VECTOR,
+                   v + (size_t)row * T_VECTOR,
+                   g + (size_t)row * T_VECTOR,
+                   beta + (size_t)row * T_HEAD);
+        cpu_step(want_out + (size_t)row * T_VECTOR,
+                 &cpu[bank_ids[row]],
+                 q + (size_t)row * T_VECTOR,
+                 k + (size_t)row * T_VECTOR,
+                 v + (size_t)row * T_VECTOR,
+                 g + (size_t)row * T_VECTOR,
+                 beta + (size_t)row * T_HEAD,
+                 q_weight, k_weight, v_weight, decay, dt);
+    }
+
+    ds4_gpu_tensor *state_slab = ds4_gpu_tensor_alloc(
+        (uint64_t)T_BANKS * bank_stride);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+        (uint64_t)T_BANKS * vector_bytes);
+    ds4_gpu_tensor *dq = ds4_gpu_tensor_alloc(
+        (uint64_t)T_BANKS * vector_bytes);
+    ds4_gpu_tensor *dk = ds4_gpu_tensor_alloc(
+        (uint64_t)T_BANKS * vector_bytes);
+    ds4_gpu_tensor *dv = ds4_gpu_tensor_alloc(
+        (uint64_t)T_BANKS * vector_bytes);
+    ds4_gpu_tensor *dg = ds4_gpu_tensor_alloc(
+        (uint64_t)T_BANKS * vector_bytes);
+    ds4_gpu_tensor *dbeta = ds4_gpu_tensor_alloc(
+        (uint64_t)T_BANKS * T_HEAD * sizeof(float));
+    ds4_gpu_tensor *dbanks = ds4_gpu_tensor_alloc(sizeof(bank_ids));
+    REQUIRE(state_slab && out && dq && dk && dv && dg && dbeta && dbanks,
+            "banked KDA device allocation");
+    REQUIRE(ds4_gpu_tensor_fill_f32(
+                state_slab, 0.0f,
+                (uint64_t)T_BANKS * bank_stride / sizeof(float)),
+            "banked KDA state reset");
+    REQUIRE(ds4_gpu_tensor_write(dq, 0, q,
+                (uint64_t)T_BANKS * vector_bytes), "banked write q");
+    REQUIRE(ds4_gpu_tensor_write(dk, 0, k,
+                (uint64_t)T_BANKS * vector_bytes), "banked write k");
+    REQUIRE(ds4_gpu_tensor_write(dv, 0, v,
+                (uint64_t)T_BANKS * vector_bytes), "banked write v");
+    REQUIRE(ds4_gpu_tensor_write(dg, 0, g,
+                (uint64_t)T_BANKS * vector_bytes), "banked write gate");
+    REQUIRE(ds4_gpu_tensor_write(dbeta, 0, beta,
+                (uint64_t)T_BANKS * T_HEAD * sizeof(float)),
+            "banked write beta");
+    REQUIRE(ds4_gpu_tensor_write(dbanks, 0, bank_ids, sizeof(bank_ids)),
+            "banked write ids");
+    REQUIRE(ds4_gpu_solar_kda_decode_banks_tensor(
+                out, state_slab, bank_stride, 0u, q_offset, k_offset,
+                v_offset, dbanks, T_BANKS, T_BANKS,
+                dq, dk, dv, dg, dbeta,
+                fixed->q_weight, fixed->k_weight, fixed->v_weight,
+                fixed->decay, fixed->dt,
+                T_HEAD, T_DIM, T_CONV, -5.0f),
+            "banked KDA kernel launch");
+    REQUIRE(ds4_gpu_tensor_read(
+                out, 0, gpu_out,
+                (uint64_t)T_BANKS * vector_bytes),
+            "read banked KDA output");
+    compare("banked decode row 0", gpu_out, want_out,
+            T_VECTOR, 3.0e-5, 3.0e-4);
+    compare("banked decode row 1", gpu_out + T_VECTOR,
+            want_out + T_VECTOR, T_VECTOR, 3.0e-5, 3.0e-4);
+
+    for (uint32_t bank = 0; bank < T_BANKS; bank++) {
+        REQUIRE(ds4_gpu_tensor_read(
+                    state_slab, (uint64_t)bank * bank_stride,
+                    bank_data, bank_stride),
+                "read banked KDA state");
+        char label[64];
+        snprintf(label, sizeof(label), "bank %u recurrent state", bank);
+        compare(label, bank_data, cpu[bank].state,
+                T_STATE, 5.0e-5, 5.0e-4);
+        snprintf(label, sizeof(label), "bank %u q conv state", bank);
+        compare(label, bank_data + q_offset / sizeof(float),
+                cpu[bank].q_conv, T_CONV_STATE, 1.0e-7, 1.0e-6);
+        snprintf(label, sizeof(label), "bank %u k conv state", bank);
+        compare(label, bank_data + k_offset / sizeof(float),
+                cpu[bank].k_conv, T_CONV_STATE, 1.0e-7, 1.0e-6);
+        snprintf(label, sizeof(label), "bank %u v conv state", bank);
+        compare(label, bank_data + v_offset / sizeof(float),
+                cpu[bank].v_conv, T_CONV_STATE, 1.0e-7, 1.0e-6);
+    }
+
+    ds4_gpu_tensor_free(dbanks);
+    ds4_gpu_tensor_free(dbeta);
+    ds4_gpu_tensor_free(dg);
+    ds4_gpu_tensor_free(dv);
+    ds4_gpu_tensor_free(dk);
+    ds4_gpu_tensor_free(dq);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(state_slab);
+    free(cpu);
+    free(bank_data);
+    free(want_out);
+    free(gpu_out);
+    free(beta);
+    free(g);
+    free(v);
+    free(k);
+    free(q);
+}
+
 int main(void) {
     if (!ds4_gpu_init()) {
         fprintf(stderr, "ds4_gpu_init failed\n");
@@ -350,6 +487,9 @@ int main(void) {
     REQUIRE(ds4_gpu_tensor_read(forked.state, 0, cpu_cache.state, sizeof(cpu_cache.state)),
             "read copied fork state");
     compare("fork state identity", gpu_recurrent, cpu_cache.state, T_STATE, 1.0e-7, 1.0e-6);
+
+    puts("== Solar Open 2 banked CUDA KDA decode ==");
+    test_banked_decode(&inputs, q_weight, k_weight, v_weight, decay, dt);
 
     gpu_state_free(&forked);
     gpu_state_free(&primary);

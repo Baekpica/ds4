@@ -15951,6 +15951,26 @@ static bool plain_graph_output_head(ds4_plain_gpu_graph *g,
     return ok;
 }
 
+static bool plain_graph_output_head_rows(
+        ds4_plain_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        ds4_gpu_tensor *logits) {
+    if (!g || !model || !weights || !x || !logits || !g->batch ||
+        n_tokens < 2u || n_tokens > g->batch->prefill_cap) {
+        return false;
+    }
+    return ds4_gpu_rms_norm_weight_rows_tensor(
+               g->batch->norm, x, model->map, model->size,
+               weights->output_norm->abs_offset, (uint32_t)g->n_embd,
+               n_tokens, DS4_RMS_EPS) != 0 &&
+           plain_graph_matmul_tensor(
+               logits, model, weights->output,
+               g->n_embd, DS4_N_VOCAB, g->batch->norm, n_tokens);
+}
+
 static bool solar_graph_attention_decode(ds4_plain_gpu_graph *g,
                                          uint32_t il,
                                          uint32_t pos,
@@ -35588,6 +35608,10 @@ typedef struct ds4_solar_batch_runtime {
     ds4_gpu_tensor *q_conv_state[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
     ds4_gpu_tensor *k_conv_state[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
     ds4_gpu_tensor *v_conv_state[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    uint64_t recurrent_offset[DS4_MAX_LAYER];
+    uint64_t q_conv_offset[DS4_MAX_LAYER];
+    uint64_t k_conv_offset[DS4_MAX_LAYER];
+    uint64_t v_conv_offset[DS4_MAX_LAYER];
 
     ds4_gpu_tensor *kv_slab[DS4_MAX_LAYER];
     ds4_gpu_tensor *kv[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
@@ -35598,6 +35622,15 @@ typedef struct ds4_solar_batch_runtime {
      * mutate/replay recurrent state merely to recover logits. */
     float   *bank_logits;
     uint8_t *bank_logits_valid;
+
+    /* Packed active rows for the fused decode seam.  Activations live in the
+     * common plain batch workspace; these tensors only carry bank metadata,
+     * split-KV partials, and the batched output head. */
+    ds4_gpu_tensor *decode_bank_ids;
+    ds4_gpu_tensor *decode_positions;
+    ds4_gpu_tensor *decode_logits;
+    ds4_gpu_tensor *decode_attn_split;
+    float *decode_logits_host;
 } ds4_solar_batch_runtime;
 
 static void solar_batch_runtime_unborrow(ds4_solar_batch_runtime *rt) {
@@ -35630,6 +35663,11 @@ static void solar_batch_runtime_free(ds4_solar_batch_runtime *rt) {
         ds4_gpu_tensor_free(rt->kv_slab[il]);
     }
     ds4_gpu_tensor_free(rt->state_slab);
+    ds4_gpu_tensor_free(rt->decode_attn_split);
+    ds4_gpu_tensor_free(rt->decode_logits);
+    ds4_gpu_tensor_free(rt->decode_positions);
+    ds4_gpu_tensor_free(rt->decode_bank_ids);
+    free(rt->decode_logits_host);
     free(rt->bank_logits);
     free(rt->bank_logits_valid);
     solar_graph_free(&rt->graph);
@@ -35791,6 +35829,218 @@ static bool solar_batch_runtime_read_logits(ds4_solar_batch_runtime *rt,
     return true;
 }
 
+static bool solar_batch_runtime_gqa_decode_layer(
+        ds4_solar_batch_runtime *rt,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        uint32_t il,
+        uint32_t n_tokens,
+        uint32_t max_position,
+        ds4_gpu_tensor *x) {
+    ds4_solar_gpu_graph *solar = &rt->graph;
+    ds4_plain_gpu_graph *g = &solar->base;
+    struct ds4_plain_batch_ws *ws = g->batch;
+    const ds4_layer_weights *layer = &weights->layer[il];
+    if (!ws || !rt->kv_slab[il] || n_tokens < 2u) return false;
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+                ws->norm, x, model->map, model->size,
+                layer->attn_norm->abs_offset, (uint32_t)g->n_embd,
+                n_tokens, DS4_RMS_EPS) ||
+        !plain_graph_matmul_tensor(
+                ws->q, model, layer->attn_q,
+                g->n_embd, g->q_dim, ws->norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                ws->k, model, layer->attn_k,
+                g->n_embd, g->kv_dim, ws->norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                ws->v, model, layer->attn_v,
+                g->n_embd, g->kv_dim, ws->norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                solar->batch_gate, model, layer->attn_gate,
+                g->n_embd, g->q_dim, ws->norm, n_tokens) ||
+        !ds4_gpu_solar_kv_store_banks_tensor(
+                rt->kv_slab[il], rt->decode_bank_ids,
+                rt->decode_positions, ws->k, ws->v,
+                n_tokens, rt->max_seq, rt->kv_bank_bytes[il],
+                DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                g->layer_kv_cap[il], g->kv_format) ||
+        !ds4_gpu_solar_attention_decode_banks_split_tensor(
+                ws->heads, ws->q, rt->kv_slab[il],
+                rt->decode_attn_split, rt->decode_bank_ids,
+                rt->decode_positions, n_tokens, rt->max_seq,
+                rt->kv_bank_bytes[il], DS4_N_HEAD, DS4_N_HEAD_KV,
+                DS4_N_HEAD_DIM, g->layer_kv_cap[il], max_position,
+                0u, DS4_PLAIN_SPLITKV_CHUNK, g->kv_format) ||
+        !ds4_gpu_solar_sigmoid_gate_tensor(
+                ws->heads, ws->heads, solar->batch_gate,
+                (uint64_t)n_tokens * g->q_dim)) {
+        return false;
+    }
+    return plain_graph_layer_tail(
+        g, model, weights, il, n_tokens, x, ws->norm, ws->heads,
+        ws->attn_out, ws->ffn_out);
+}
+
+static bool solar_batch_runtime_kda_decode_layer(
+        ds4_solar_batch_runtime *rt,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        uint32_t il,
+        uint32_t n_tokens,
+        ds4_gpu_tensor *x) {
+    ds4_solar_gpu_graph *solar = &rt->graph;
+    ds4_plain_gpu_graph *g = &solar->base;
+    struct ds4_plain_batch_ws *ws = g->batch;
+    const ds4_layer_weights *layer = &weights->layer[il];
+    const uint64_t kda_dim =
+        (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM;
+    if (!ws || n_tokens < 2u) return false;
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+                ws->norm, x, model->map, model->size,
+                layer->attn_norm->abs_offset, (uint32_t)g->n_embd,
+                n_tokens, DS4_RMS_EPS) ||
+        !plain_graph_matmul_tensor(
+                ws->q, model, layer->attn_q,
+                g->n_embd, kda_dim, ws->norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                solar->batch_kda_k, model, layer->attn_k,
+                g->n_embd, kda_dim, ws->norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                solar->batch_kda_v, model, layer->attn_v,
+                g->n_embd, kda_dim, ws->norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                solar->batch_low_rank, model, layer->ssm_f_a,
+                g->n_embd, DS4_N_KDA_HEAD_DIM, ws->norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                solar->batch_gate, model, layer->ssm_f_b,
+                DS4_N_KDA_HEAD_DIM, kda_dim,
+                solar->batch_low_rank, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                solar->batch_beta, model, layer->ssm_beta,
+                g->n_embd, DS4_N_HEAD, ws->norm, n_tokens) ||
+        !ds4_gpu_solar_kda_decode_banks_tensor(
+                ws->heads, rt->state_slab, solar->state_bytes,
+                rt->recurrent_offset[il], rt->q_conv_offset[il],
+                rt->k_conv_offset[il], rt->v_conv_offset[il],
+                rt->decode_bank_ids, n_tokens, rt->max_seq,
+                ws->q, solar->batch_kda_k, solar->batch_kda_v,
+                solar->batch_gate, solar->batch_beta,
+                solar->q_conv_weight[il], solar->k_conv_weight[il],
+                solar->v_conv_weight[il], solar->decay_scale[il],
+                solar->dt_bias[il], DS4_N_HEAD, DS4_N_KDA_HEAD_DIM,
+                DS4_N_SSM_CONV, DS4_KDA_GATE_CLAMP_MIN) ||
+        !plain_graph_matmul_tensor(
+                solar->batch_low_rank, model, layer->ssm_g_a,
+                g->n_embd, DS4_N_KDA_HEAD_DIM, ws->norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                solar->batch_gate, model, layer->ssm_g_b,
+                DS4_N_KDA_HEAD_DIM, kda_dim,
+                solar->batch_low_rank, n_tokens) ||
+        !ds4_gpu_solar_head_rms_sigmoid_gate_tensor(
+                ws->heads, ws->heads, solar->batch_gate,
+                solar->o_norm[il], n_tokens, DS4_N_HEAD,
+                DS4_N_KDA_HEAD_DIM, DS4_RMS_EPS)) {
+        return false;
+    }
+    return plain_graph_layer_tail(
+        g, model, weights, il, n_tokens, x, ws->norm, ws->heads,
+        ws->attn_out, ws->ffn_out);
+}
+
+static bool solar_batch_runtime_decode(
+        ds4_solar_batch_runtime *rt,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        const int *tokens,
+        const uint32_t *banks,
+        const uint32_t *positions,
+        uint32_t n_tokens) {
+    if (!rt || !model || !weights || !tokens || !banks || !positions ||
+        n_tokens == 0u || n_tokens > rt->max_seq) {
+        return false;
+    }
+    const bool timing = getenv("DS4_SOLAR_BATCH_TIMING") != NULL;
+    const double timing_t0 = timing ? now_sec() : 0.0;
+    if (n_tokens == 1u) {
+        const uint32_t bank = banks[0];
+        const bool ok = bank < rt->max_seq &&
+                        solar_batch_runtime_bind(rt, bank) &&
+                        solar_graph_decode(
+                            &rt->graph, model, weights,
+                            tokens[0], positions[0]) &&
+                        solar_batch_runtime_read_logits(rt, bank);
+        if (timing) {
+            const double elapsed = now_sec() - timing_t0;
+            fprintf(stderr,
+                    "ds4: Solar batch decode rows=1 pos=%u %.3f ms "
+                    "aggregate=%.3f tok/s ok=%d\n",
+                    positions[0], elapsed * 1000.0,
+                    elapsed > 0.0 ? 1.0 / elapsed : 0.0, ok ? 1 : 0);
+        }
+        return ok;
+    }
+    ds4_plain_gpu_graph *g = &rt->graph.base;
+    if (!g->batch || n_tokens > g->batch->prefill_cap) return false;
+    uint32_t max_position = 0u;
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        if (banks[row] >= rt->max_seq || positions[row] >= g->ctx_size) {
+            return false;
+        }
+        for (uint32_t prev = 0; prev < row; prev++) {
+            if (banks[prev] == banks[row]) return false;
+        }
+        if (positions[row] > max_position) max_position = positions[row];
+    }
+    if (!ds4_gpu_tensor_write(
+                rt->decode_bank_ids, 0, banks,
+                (uint64_t)n_tokens * sizeof(*banks)) ||
+        !ds4_gpu_tensor_write(
+                rt->decode_positions, 0, positions,
+                (uint64_t)n_tokens * sizeof(*positions)) ||
+        !solar_graph_embed_batch(g, model, weights, tokens, n_tokens)) {
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const bool layer_ok = ds4_solar_layer_is_gqa(il)
+            ? solar_batch_runtime_gqa_decode_layer(
+                  rt, model, weights, il, n_tokens, max_position,
+                  g->batch->cur)
+            : solar_batch_runtime_kda_decode_layer(
+                  rt, model, weights, il, n_tokens, g->batch->cur);
+        if (!layer_ok) {
+            fprintf(stderr,
+                    "ds4: Solar banked decode failed at layer %u\n", il);
+            return false;
+        }
+    }
+    const uint64_t logits_bytes =
+        (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float);
+    if (!plain_graph_output_head_rows(
+                g, model, weights, g->batch->cur,
+                n_tokens, rt->decode_logits) ||
+        !ds4_gpu_tensor_read(
+                rt->decode_logits, 0, rt->decode_logits_host,
+                logits_bytes)) {
+        return false;
+    }
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        const uint32_t bank = banks[row];
+        memcpy(rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+               rt->decode_logits_host + (size_t)row * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->bank_logits_valid[bank] = 1u;
+    }
+    if (timing) {
+        const double elapsed = now_sec() - timing_t0;
+        fprintf(stderr,
+                "ds4: Solar batch decode rows=%u pos=%u %.3f ms "
+                "aggregate=%.3f tok/s ok=1\n",
+                n_tokens, max_position, elapsed * 1000.0,
+                elapsed > 0.0 ? (double)n_tokens / elapsed : 0.0);
+    }
+    return true;
+}
+
 static ds4_solar_batch_runtime *solar_batch_runtime_create(
         ds4_engine *e, uint32_t ctx_size, uint32_t max_seq,
         uint32_t prefill_cap) {
@@ -35851,14 +36101,22 @@ static ds4_solar_batch_runtime *solar_batch_runtime_create(
         bool ok = rt->state_pool[b] != NULL;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             if (ds4_solar_layer_is_gqa(il)) continue;
-            ok = solar_pool_take(&rt->recurrent[b][il], rt->state_pool[b],
-                                 &cursor, recurrent_bytes) &&
-                 solar_pool_take(&rt->q_conv_state[b][il], rt->state_pool[b],
-                                 &cursor, conv_bytes) &&
-                 solar_pool_take(&rt->k_conv_state[b][il], rt->state_pool[b],
-                                 &cursor, conv_bytes) &&
-                 solar_pool_take(&rt->v_conv_state[b][il], rt->state_pool[b],
-                                 &cursor, conv_bytes);
+            if (b == 0u) rt->recurrent_offset[il] = cursor;
+            ok = solar_pool_take(
+                &rt->recurrent[b][il], rt->state_pool[b],
+                &cursor, recurrent_bytes);
+            if (b == 0u) rt->q_conv_offset[il] = cursor;
+            ok = ok && solar_pool_take(
+                &rt->q_conv_state[b][il], rt->state_pool[b],
+                &cursor, conv_bytes);
+            if (b == 0u) rt->k_conv_offset[il] = cursor;
+            ok = ok && solar_pool_take(
+                &rt->k_conv_state[b][il], rt->state_pool[b],
+                &cursor, conv_bytes);
+            if (b == 0u) rt->v_conv_offset[il] = cursor;
+            ok = ok && solar_pool_take(
+                &rt->v_conv_state[b][il], rt->state_pool[b],
+                &cursor, conv_bytes);
         }
         if (!ok || cursor != rt->graph.state_bytes) {
             solar_batch_runtime_free(rt);
@@ -35892,7 +36150,25 @@ static ds4_solar_batch_runtime *solar_batch_runtime_create(
     rt->bank_logits = xcalloc((size_t)max_seq * DS4_N_VOCAB,
                               sizeof(*rt->bank_logits));
     rt->bank_logits_valid = xcalloc(max_seq, sizeof(*rt->bank_logits_valid));
+    const uint64_t logits_bytes =
+        (uint64_t)max_seq * DS4_N_VOCAB * sizeof(float);
+    const uint64_t one_split_bytes =
+        ds4_gpu_tensor_bytes(rt->graph.base.attn_split);
+    rt->decode_bank_ids = ds4_gpu_tensor_alloc(
+        (uint64_t)max_seq * sizeof(uint32_t));
+    rt->decode_positions = ds4_gpu_tensor_alloc(
+        (uint64_t)max_seq * sizeof(uint32_t));
+    rt->decode_logits = ds4_gpu_tensor_alloc(logits_bytes);
+    rt->decode_attn_split = one_split_bytes != 0u &&
+                            one_split_bytes <= UINT64_MAX / max_seq
+        ? ds4_gpu_tensor_alloc(one_split_bytes * max_seq) : NULL;
+    rt->decode_logits_host = xcalloc(
+        (size_t)max_seq * DS4_N_VOCAB,
+        sizeof(*rt->decode_logits_host));
     if (!rt->bank_logits || !rt->bank_logits_valid ||
+        !rt->decode_bank_ids || !rt->decode_positions ||
+        !rt->decode_logits || !rt->decode_attn_split ||
+        !rt->decode_logits_host ||
         !solar_batch_runtime_bind(rt, 0u)) {
         solar_batch_runtime_free(rt);
         return NULL;
@@ -38870,12 +39146,11 @@ static void solar_cont_publish_generated(
     free(generated);
 }
 
-/* Correctness-first Solar scheduler.  Admission/prefill/decode all use the
- * same public continuous contract as upstream ds4, while each forward binds
- * one independent KDA+KV bank into the shared plain graph.  This first tier
- * removes per-request graph allocation and gives the server safe rolling
- * admission.  A later bank-aware CUDA forward fuses the serial bank loop for
- * throughput; the state/lifecycle contract below remains its oracle. */
+/* Solar scheduler on the common continuous contract.  Admission/prefill bind
+ * one independent KDA+KV bank, while simultaneous decode rows share the plain
+ * residual/MoE graph and select mutable state through bank-aware CUDA kernels.
+ * The scalar one-bank path remains the correctness and low-concurrency fast
+ * path; lifecycle, history, sampling, and callbacks are identical on both. */
 static int solar_engine_continuous_generate(
         ds4_batch_ctx *ctx,
         int (*admit)(void *ud, ds4_cont_request *req),
@@ -39178,27 +39453,56 @@ static int solar_engine_continuous_generate(
         }
         if (!ok) break;
 
-        /* Correctness oracle: one bank-bound decode forward per live row.
-         * The upcoming CUDA multi-bank primitive replaces this loop without
-         * changing admission, history, sampling, or callback behavior. */
+        /* Gather independent decode rows, then run as many together as the
+         * common plain batch workspace can hold.  A single live row stays on
+         * the original bank-bound graph; 2+ rows share every weight matmul and
+         * use bank-aware KDA/GQA CUDA primitives for mutable state. */
+        uint32_t decode_banks[DS4_MULTISEQ_MAX_SEQ];
+        uint32_t decode_positions[DS4_MULTISEQ_MAX_SEQ];
+        int decode_tokens[DS4_MULTISEQ_MAX_SEQ];
+        uint32_t decode_count = 0u;
         for (uint32_t b = 0; ok && b < MS; b++) {
             ds4_solar_cont_bank *sb = &bank[b];
             if (sb->phase != SOLAR_CONT_DECODE) continue;
             const uint32_t pos = ctx->bank_hist_len[b];
             if (pos >= ctx->seq_cap ||
-                !solar_batch_runtime_ensure_kv(rt, b, pos + 1u) ||
-                !solar_batch_runtime_bind(rt, b) ||
-                !solar_graph_decode(
-                    &rt->graph, &ctx->e->model, &ctx->e->weights,
-                    sb->current, pos) ||
-                !solar_batch_runtime_read_logits(rt, b)) {
+                !solar_batch_runtime_ensure_kv(rt, b, pos + 1u)) {
                 ctx->bank_gen[b]++;
                 ctx->bank_hist_valid[b] = 0u;
-                SCG_ERR("continuous_generate: Solar decode failed "
+                SCG_ERR("continuous_generate: Solar decode mapping failed "
                         "bank=%u pos=%u", b, pos);
                 ok = false;
                 break;
             }
+            decode_banks[decode_count] = b;
+            decode_positions[decode_count] = pos;
+            decode_tokens[decode_count] = sb->current;
+            decode_count++;
+        }
+        const uint32_t decode_cap =
+            rt->graph.base.prefill_cap < MS
+                ? rt->graph.base.prefill_cap : MS;
+        for (uint32_t off = 0u; ok && off < decode_count;) {
+            uint32_t n = decode_count - off;
+            if (n > decode_cap) n = decode_cap;
+            if (n == 0u || !solar_batch_runtime_decode(
+                    rt, &ctx->e->model, &ctx->e->weights,
+                    decode_tokens + off, decode_banks + off,
+                    decode_positions + off, n)) {
+                const uint32_t b = decode_banks[off];
+                ctx->bank_gen[b]++;
+                ctx->bank_hist_valid[b] = 0u;
+                SCG_ERR("continuous_generate: Solar decode failed "
+                        "rows=%u first_bank=%u pos=%u", n, b,
+                        decode_positions[off]);
+                ok = false;
+                break;
+            }
+            off += n;
+        }
+        for (uint32_t row = 0u; ok && row < decode_count; row++) {
+            const uint32_t b = decode_banks[row];
+            ds4_solar_cont_bank *sb = &bank[b];
             bank_hist_append(ctx, b, sb->current);
             sb->stats.decode_steps++;
             ds4_metric_add(&ds4_metrics_get()->decode_steps, 1u);

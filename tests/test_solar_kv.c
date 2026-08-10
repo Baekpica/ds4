@@ -315,6 +315,170 @@ int main(void) {
         ds4_gpu_tensor_free(cache);
     }
 
+    puts("== Solar Open2 banked GQA decode ==");
+    float *k_alt = malloc(kv_count * sizeof(*k_alt));
+    float *v_alt = malloc(kv_count * sizeof(*v_alt));
+    float *q_banks = malloc(2u * row_count * sizeof(*q_banks));
+    float *banked_out = malloc(2u * row_count * sizeof(*banked_out));
+    float *base_decode_bank = malloc(row_count * sizeof(*base_decode_bank));
+    float *alt_decode = malloc(row_count * sizeof(*alt_decode));
+    uint32_t *store_banks = malloc((size_t)T_TOKENS * sizeof(*store_banks));
+    uint32_t *store_positions = malloc(
+        (size_t)T_TOKENS * sizeof(*store_positions));
+    CHECK(k_alt && v_alt && q_banks && banked_out && base_decode_bank &&
+          alt_decode &&
+          store_banks && store_positions, "banked GQA host allocation");
+    for (size_t i = 0; i < kv_count; i++) {
+        const float x = (float)(i + 1u);
+        k_alt[i] = -0.41f * k[i] + 0.07f * sinf(0.003f * x);
+        v_alt[i] = 0.53f * v[i] + 0.09f * cosf(0.005f * x);
+    }
+    memcpy(q_banks, q + (T_TOKENS - 1u) * row_count,
+           row_count * sizeof(*q_banks));
+    memcpy(q_banks + row_count, q_banks,
+           row_count * sizeof(*q_banks));
+    for (uint32_t i = 0; i < T_TOKENS; i++) {
+        store_banks[i] = 1u;
+        store_positions[i] = i;
+    }
+    const uint32_t decode_banks[2] = {0u, 1u};
+    const uint32_t decode_positions[2] = {
+        T_TOKENS - 1u, T_TOKENS - 1u,
+    };
+    const ds4_solar_kv_format bank_format =
+        DS4_SOLAR_KV_KFP8_VFP4;
+    const uint64_t bank_row = ds4_gpu_solar_kv_row_bytes(
+        bank_format, T_HEAD_KV, T_DIM);
+    const uint64_t bank_stride = (uint64_t)T_CAP * bank_row;
+    ds4_gpu_tensor *dk_alt = ds4_gpu_tensor_alloc(
+        kv_count * sizeof(float));
+    ds4_gpu_tensor *dv_alt = ds4_gpu_tensor_alloc(
+        kv_count * sizeof(float));
+    ds4_gpu_tensor *base_cache = ds4_gpu_tensor_alloc(bank_stride);
+    ds4_gpu_tensor *base_heads = ds4_gpu_tensor_alloc(
+        row_count * sizeof(float));
+    ds4_gpu_tensor *alt_cache = ds4_gpu_tensor_alloc(bank_stride);
+    ds4_gpu_tensor *alt_heads = ds4_gpu_tensor_alloc(
+        row_count * sizeof(float));
+    ds4_gpu_tensor *bank_slab = ds4_gpu_tensor_alloc(2u * bank_stride);
+    ds4_gpu_tensor *dstore_banks = ds4_gpu_tensor_alloc(
+        (uint64_t)T_TOKENS * sizeof(uint32_t));
+    ds4_gpu_tensor *dstore_positions = ds4_gpu_tensor_alloc(
+        (uint64_t)T_TOKENS * sizeof(uint32_t));
+    ds4_gpu_tensor *ddecode_banks = ds4_gpu_tensor_alloc(
+        sizeof(decode_banks));
+    ds4_gpu_tensor *ddecode_positions = ds4_gpu_tensor_alloc(
+        sizeof(decode_positions));
+    ds4_gpu_tensor *dq_banks = ds4_gpu_tensor_alloc(
+        2u * row_count * sizeof(float));
+    ds4_gpu_tensor *bank_heads = ds4_gpu_tensor_alloc(
+        2u * row_count * sizeof(float));
+    ds4_gpu_tensor *bank_partials = ds4_gpu_tensor_alloc(
+        2ull * T_HEAD * parts_n * (T_DIM + 2u) * sizeof(float));
+    CHECK(dk_alt && dv_alt && base_cache && base_heads && alt_cache &&
+          alt_heads && bank_slab &&
+          dstore_banks && dstore_positions && ddecode_banks &&
+          ddecode_positions && dq_banks && bank_heads && bank_partials,
+          "banked GQA device allocation");
+    CHECK(ds4_gpu_tensor_write(
+              dk_alt, 0, k_alt, kv_count * sizeof(float)),
+          "write alternate K");
+    CHECK(ds4_gpu_tensor_write(
+              dv_alt, 0, v_alt, kv_count * sizeof(float)),
+          "write alternate V");
+    CHECK(ds4_gpu_tensor_write(
+              dstore_banks, 0, store_banks,
+              (uint64_t)T_TOKENS * sizeof(uint32_t)),
+          "write banked store ids");
+    CHECK(ds4_gpu_tensor_write(
+              dstore_positions, 0, store_positions,
+              (uint64_t)T_TOKENS * sizeof(uint32_t)),
+          "write banked store positions");
+    CHECK(ds4_gpu_tensor_write(
+              ddecode_banks, 0, decode_banks, sizeof(decode_banks)),
+          "write banked decode ids");
+    CHECK(ds4_gpu_tensor_write(
+              ddecode_positions, 0, decode_positions,
+              sizeof(decode_positions)),
+          "write banked decode positions");
+    CHECK(ds4_gpu_tensor_write(
+              dq_banks, 0, q_banks,
+              2u * row_count * sizeof(float)),
+          "write banked queries");
+
+    CHECK(ds4_gpu_solar_kv_store_tensor(
+              base_cache, dk, dv, T_HEAD_KV, T_DIM, T_TOKENS,
+              0u, T_CAP, bank_format),
+          "base serial cache store");
+    CHECK(ds4_gpu_solar_attention_decode_tensor(
+              base_heads, last_q, base_cache,
+              T_HEAD, T_HEAD_KV, T_DIM, T_CAP, T_TOKENS - 1u,
+              0u, bank_format),
+          "base serial decode");
+    CHECK(ds4_gpu_tensor_read(
+              base_heads, 0, base_decode_bank,
+              row_count * sizeof(float)),
+          "read base serial decode");
+    CHECK(ds4_gpu_solar_kv_store_tensor(
+              alt_cache, dk_alt, dv_alt, T_HEAD_KV, T_DIM, T_TOKENS,
+              0u, T_CAP, bank_format),
+          "alternate serial cache store");
+    CHECK(ds4_gpu_solar_attention_decode_tensor(
+              alt_heads, last_q, alt_cache,
+              T_HEAD, T_HEAD_KV, T_DIM, T_CAP, T_TOKENS - 1u,
+              0u, bank_format),
+          "alternate serial decode");
+    CHECK(ds4_gpu_tensor_read(
+              alt_heads, 0, alt_decode,
+              row_count * sizeof(float)),
+          "read alternate serial decode");
+
+    CHECK(ds4_gpu_tensor_copy(
+              bank_slab, 0u, base_cache, 0u, bank_stride),
+          "copy serial cache into bank zero");
+    CHECK(ds4_gpu_solar_kv_store_banks_tensor(
+              bank_slab, dstore_banks, dstore_positions,
+              dk_alt, dv_alt, T_TOKENS, 2u, bank_stride,
+              T_HEAD_KV, T_DIM, T_CAP, bank_format),
+          "banked cache store");
+    CHECK(ds4_gpu_solar_attention_decode_banks_split_tensor(
+              bank_heads, dq_banks, bank_slab, bank_partials,
+              ddecode_banks, ddecode_positions, 2u, 2u, bank_stride,
+              T_HEAD, T_HEAD_KV, T_DIM, T_CAP, T_TOKENS - 1u,
+              0u, T_CHUNK, bank_format),
+          "banked split decode");
+    CHECK(ds4_gpu_tensor_read(
+              bank_heads, 0, banked_out,
+              2u * row_count * sizeof(float)),
+          "read banked decode");
+    compare_vector("bank 0 split vs serial", banked_out,
+                   base_decode_bank, row_count, 2.0e-5, 2.0e-5);
+    compare_vector("bank 1 split vs serial", banked_out + row_count,
+                   alt_decode, row_count, 2.0e-5, 2.0e-5);
+
+    ds4_gpu_tensor_free(bank_partials);
+    ds4_gpu_tensor_free(bank_heads);
+    ds4_gpu_tensor_free(dq_banks);
+    ds4_gpu_tensor_free(ddecode_positions);
+    ds4_gpu_tensor_free(ddecode_banks);
+    ds4_gpu_tensor_free(dstore_positions);
+    ds4_gpu_tensor_free(dstore_banks);
+    ds4_gpu_tensor_free(bank_slab);
+    ds4_gpu_tensor_free(alt_heads);
+    ds4_gpu_tensor_free(alt_cache);
+    ds4_gpu_tensor_free(base_heads);
+    ds4_gpu_tensor_free(base_cache);
+    ds4_gpu_tensor_free(dv_alt);
+    ds4_gpu_tensor_free(dk_alt);
+    free(store_positions);
+    free(store_banks);
+    free(alt_decode);
+    free(base_decode_bank);
+    free(banked_out);
+    free(q_banks);
+    free(v_alt);
+    free(k_alt);
+
     const uint64_t ctx = 1048576u;
     puts("== 1M / 12 GQA-layer KV projection ==");
     for (int f = DS4_SOLAR_KV_BF16; f <= DS4_SOLAR_KV_KFP8_VFP4; f++) {

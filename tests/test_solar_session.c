@@ -454,8 +454,8 @@ int main(int argc, char **argv) {
     ds4_batch_ctx *batch_ctx = NULL;
     err[0] = '\0';
     if (ds4_batch_ctx_create_fit(
-            engine, 128, 2, 8, &batch_ctx, err, sizeof(err)) != 0 ||
-        batch_ctx == NULL || ds4_batch_ctx_max_seq(batch_ctx) != 2 ||
+            engine, 128, 4, 16, &batch_ctx, err, sizeof(err)) != 0 ||
+        batch_ctx == NULL || ds4_batch_ctx_max_seq(batch_ctx) != 4 ||
         ds4_batch_ctx_seq_cap(batch_ctx) != 128) {
         fprintf(stderr, "Solar batch context creation failed: %s\n", err);
         failed = 1;
@@ -621,6 +621,49 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "Solar bank persistence: bytes=%llu cached=6 computed=1 next=%d\n",
             (unsigned long long)bank_bytes, fourth_next);
+
+    /* Ramp through 2/3/4-row decode passes.  Chunked admission staggers the
+     * four identical banks by one step; every final sequence must still be
+     * identical, with its known prefix matching the scalar trajectory. */
+    ds4_tokens fused_prompts[4] = { prompt, prompt, prompt, prompt };
+    ds4_batch_gen_result fused_results[4] = {0};
+    const int six_tokens[4] = {6, 6, 6, 6};
+    const int fused_eos[4] = {
+        ds4_token_eos(engine), ds4_token_eos(engine),
+        ds4_token_eos(engine), ds4_token_eos(engine),
+    };
+    err[0] = '\0';
+    const int fused_rc = ds4_engine_batched_generate_ctx(
+        batch_ctx, fused_prompts, 4, six_tokens, fused_eos,
+        fused_results, err, sizeof(err));
+    int fused_ok = fused_rc == 0;
+    for (int i = 0; fused_ok && i < 4; i++) {
+        fused_ok = fused_results[i].n_tokens == 6 &&
+                   fused_results[i].tokens[0] == next &&
+                   fused_results[i].tokens[1] == decoded_argmax &&
+                   fused_results[i].tokens[2] == third_next &&
+                   (i == 0 || memcmp(
+                       fused_results[0].tokens, fused_results[i].tokens,
+                       6u * sizeof(int)) == 0);
+    }
+    if (!fused_ok) {
+        fprintf(stderr,
+                "Solar fused four-bank decode failed: %s "
+                "n=%d/%d/%d/%d first=%d,%d,%d\n",
+                err, fused_results[0].n_tokens, fused_results[1].n_tokens,
+                fused_results[2].n_tokens, fused_results[3].n_tokens,
+                fused_results[0].n_tokens > 0 ? fused_results[0].tokens[0] : -1,
+                fused_results[0].n_tokens > 1 ? fused_results[0].tokens[1] : -1,
+                fused_results[0].n_tokens > 2 ? fused_results[0].tokens[2] : -1);
+        for (int i = 0; i < 4; i++) free(fused_results[i].tokens);
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "Solar fused decode: banks=4 tokens=%d,%d,%d,...\n",
+            next, decoded_argmax, third_next);
+    for (int i = 0; i < 4; i++) free(fused_results[i].tokens);
     ds4_batch_ctx_destroy(batch_ctx);
 
     ds4_batch_gen_result batch_result = {0};
