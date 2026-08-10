@@ -556,6 +556,11 @@ bool run_q8_0_dense_d2r(int M, int N, int K, uint32_t seed) {
 }
 
 bool run_q8_0_dense_d2r_floor_policy() {
+    if (DS4_MMQ_Q8_0_D2R_DEFAULT_MIN_COLS != 512 ||
+        DS4_MMQ_Q8_0_D2R_K128_DEFAULT_MIN_COLS != 4) {
+        fprintf(stderr, "D2R default floor policy changed unexpectedly\n");
+        return false;
+    }
     struct floor_case {
         int K;
         int general_min_cols;
@@ -563,8 +568,10 @@ bool run_q8_0_dense_d2r_floor_policy() {
         int expected;
     };
     const floor_case cases[] = {
-        {128,  512,  256,  256},
-        {4096, 512,  256,  512},
+        {128,  DS4_MMQ_Q8_0_D2R_DEFAULT_MIN_COLS,
+               DS4_MMQ_Q8_0_D2R_K128_DEFAULT_MIN_COLS, 4},
+        {4096, DS4_MMQ_Q8_0_D2R_DEFAULT_MIN_COLS,
+               DS4_MMQ_Q8_0_D2R_K128_DEFAULT_MIN_COLS, 512},
         {128, 1024, 1024, 1024},
         {128,  512,  128,  128},
     };
@@ -1460,6 +1467,8 @@ int main(int argc, char ** argv) {
     // shallow K=128 shape and the guarded final N tile.
     all_ok &= run_q8_0_dense_d2r(
         /*M=*/128, /*N=*/129, /*K=*/128, 0xD2A00128);
+    all_ok &= run_q8_0_dense_d2r(
+        /*M=*/128, /*N=*/4, /*K=*/128, 0xD2A00004);
 
     // Q2_K - V4 Flash ffn_down_exps per-expert shape is (K=2048, N=4096).
     all_ok &= run_q2_K(/*M=*/64,   /*N=*/4,   /*K=*/256,  0x02C0FFEE);
