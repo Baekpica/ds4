@@ -44,16 +44,71 @@ enum {
     FA_TK      = 16,    /* key rows per staged tile                     */
     FA_PAD     = 8,     /* half padding per smem row against bank camp  */
     FA_ROW     = FA_HD + FA_PAD,
+    SOLAR_KV_BF16 = 0,
+    SOLAR_KV_FP8 = 1,
+    SOLAR_KV_FP4 = 2,
+    SOLAR_KV_KFP8_VFP4 = 3,
 };
 
 typedef tile<16, 8, half2> tile_a;      /* Q rows / P rows              */
 typedef tile< 8, 8, half2> tile_b;      /* K keys / V columns           */
 typedef tile<16, 8, float> tile_c;      /* scores / output accumulators */
 
+__device__ __forceinline__ float solar_fattn_e4m3(uint8_t code) {
+    const uint8_t mag = code & 0x7fu;
+    const int exp = (mag >> 3u) & 15;
+    const int mant = mag & 7;
+    const float value = exp == 0
+        ? (float)mant * 0.001953125f
+        : (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
+    return (code & 0x80u) ? -value : value;
+}
+
+__device__ __forceinline__ float solar_fattn_e2m1(uint8_t code) {
+    float value;
+    switch (code & 7u) {
+    case 0u: value = 0.0f; break;
+    case 1u: value = 0.5f; break;
+    case 2u: value = 1.0f; break;
+    case 3u: value = 1.5f; break;
+    case 4u: value = 2.0f; break;
+    case 5u: value = 3.0f; break;
+    case 6u: value = 4.0f; break;
+    default: value = 6.0f; break;
+    }
+    return (code & 8u) ? -value : value;
+}
+
+template <int FORMAT, bool VALUE>
+__device__ __forceinline__ float solar_fattn_kv_load(
+        const uint8_t *row,
+        uint32_t       n_head_kv,
+        uint32_t       kvh,
+        uint32_t       dim) {
+    const uint64_t kv_dim = (uint64_t)n_head_kv * FA_HD;
+    const uint64_t elem = (uint64_t)kvh * FA_HD + dim;
+    const uint64_t k_bytes = FORMAT == SOLAR_KV_FP4 ? kv_dim / 2u : kv_dim;
+    const uint64_t v_bytes = FORMAT == SOLAR_KV_FP8 ? kv_dim : kv_dim / 2u;
+    const __half *scales = (const __half *)(row + k_bytes + v_bytes);
+    const float scale = __half2float(
+        scales[(VALUE ? n_head_kv : 0u) + kvh]);
+    const uint8_t *data = VALUE ? row + k_bytes : row;
+    if constexpr ((VALUE && FORMAT == SOLAR_KV_FP8) ||
+                  (!VALUE && FORMAT != SOLAR_KV_FP4)) {
+        return solar_fattn_e4m3(data[elem]) * scale;
+    } else {
+        const uint8_t packed = data[elem >> 1u];
+        const uint8_t code = (elem & 1u) ? packed >> 4u : packed & 0x0fu;
+        return solar_fattn_e2m1(code) * scale;
+    }
+}
+
+template <int KV_FORMAT>
 __global__ void exaone_fattn_hmma_kernel(
         float * __restrict__ heads,
         const float * __restrict__ q,
-        const __half * __restrict__ kv,
+        const void * __restrict__ kv,
+        const uint64_t row_bytes,
         const uint32_t n_tokens,
         const uint32_t pos0,
         const uint32_t n_head,
@@ -155,10 +210,22 @@ __global__ void exaone_fattn_hmma_kernel(
         for (uint32_t idx = threadIdx.x; idx < FA_TK * FA_HD; idx += blockDim.x) {
             const uint32_t r = idx / FA_HD, c = idx - r * FA_HD;
             const uint32_t src = r < tk_len ? kt0 + r : kt0;   /* clamp */
-            const __half *row = kv + (size_t)(src % kv_cap) * kv_dim * 2u
-                                   + (size_t)kvh * FA_HD;
-            s_k[r][c] = row[c];
-            s_v[r][c] = row[kv_dim + c];
+            if constexpr (KV_FORMAT == SOLAR_KV_BF16) {
+                const __half *row = (const __half *)kv +
+                    (size_t)(src % kv_cap) * kv_dim * 2u +
+                    (size_t)kvh * FA_HD;
+                s_k[r][c] = row[c];
+                s_v[r][c] = row[kv_dim + c];
+            } else {
+                const uint8_t *row = (const uint8_t *)kv +
+                    (uint64_t)(src % kv_cap) * row_bytes;
+                s_k[r][c] = __float2half(
+                    solar_fattn_kv_load<KV_FORMAT, false>(
+                        row, n_head_kv, kvh, c));
+                s_v[r][c] = __float2half(
+                    solar_fattn_kv_load<KV_FORMAT, true>(
+                        row, n_head_kv, kvh, c));
+            }
         }
         __syncthreads();
 
@@ -285,9 +352,48 @@ extern "C" int ds4_mmq_exaone_prefill_attn_hmma(
     const int dev = ggml_cuda_get_device();
     if (ggml_cuda_info().devices[dev].cc < GGML_CUDA_CC_AMPERE) return -1;
     dim3 grid((n_tokens + FA_TQ - 1) / FA_TQ, n_head, 1);
-    exaone_fattn_hmma_kernel<<<grid, FA_WARPS * 32, 0, stream>>>(
-            heads, q, (const __half *)kv,
+    exaone_fattn_hmma_kernel<SOLAR_KV_BF16>
+        <<<grid, FA_WARPS * 32, 0, stream>>>(
+            heads, q, kv, 0u,
             (uint32_t)n_tokens, (uint32_t)pos0, (uint32_t)n_head,
             (uint32_t)n_head_kv, (uint32_t)kv_cap, (uint32_t)window, scale);
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+extern "C" int ds4_mmq_solar_prefill_attn_hmma(
+        float *heads, const float *q, const void *kv,
+        int format, size_t row_bytes,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
+        int kv_cap, int window, float scale, cudaStream_t stream) {
+    if (!heads || !q || !kv || format < SOLAR_KV_FP8 ||
+        format > SOLAR_KV_KFP8_VFP4 || row_bytes == 0u ||
+        n_tokens <= 0 || pos0 < 0 || n_head <= 0 || n_head_kv <= 0 ||
+        head_dim != FA_HD || kv_cap <= 0 || n_head % n_head_kv != 0) {
+        return -1;
+    }
+    const int dev = ggml_cuda_get_device();
+    if (ggml_cuda_info().devices[dev].cc < GGML_CUDA_CC_AMPERE) return -1;
+
+    const dim3 grid((n_tokens + FA_TQ - 1) / FA_TQ, n_head, 1);
+#define DS4_SOLAR_FATTN_LAUNCH(FORMAT)                                      \
+    exaone_fattn_hmma_kernel<FORMAT>                                        \
+        <<<grid, FA_WARPS * 32, 0, stream>>>(                               \
+            heads, q, kv, (uint64_t)row_bytes,                              \
+            (uint32_t)n_tokens, (uint32_t)pos0, (uint32_t)n_head,           \
+            (uint32_t)n_head_kv, (uint32_t)kv_cap, (uint32_t)window, scale)
+    switch (format) {
+    case SOLAR_KV_FP8:
+        DS4_SOLAR_FATTN_LAUNCH(SOLAR_KV_FP8);
+        break;
+    case SOLAR_KV_FP4:
+        DS4_SOLAR_FATTN_LAUNCH(SOLAR_KV_FP4);
+        break;
+    case SOLAR_KV_KFP8_VFP4:
+        DS4_SOLAR_FATTN_LAUNCH(SOLAR_KV_KFP8_VFP4);
+        break;
+    default:
+        return -1;
+    }
+#undef DS4_SOLAR_FATTN_LAUNCH
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }

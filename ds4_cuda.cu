@@ -32766,6 +32766,32 @@ extern "C" int ds4_gpu_solar_attention_prefill_tensor(
     const uint32_t shmem =
         (head_dim / 32u) * head_dim * (uint32_t)sizeof(float);
     const float scale = rsqrtf((float)head_dim);
+    /* Opt-in while full-model semantic gates are collected.  Compressed K/V
+     * is decoded once per 16-key shared-memory tile, which then serves 64
+     * query rows through the existing QK/PV tensor-core path. */
+    static int hmma_en = -1;
+    if (hmma_en < 0) {
+        const char *value = getenv("DS4_SOLAR_KV_PREFILL_HMMA");
+        hmma_en = value && value[0] && value[0] != '0' ? 1 : 0;
+    }
+    if (hmma_en && head_dim == 128u && n_tokens >= 64u) {
+        const int rc = ds4_mmq_solar_prefill_attn_hmma(
+                (float *)heads->ptr, (const float *)q->ptr, kv->ptr,
+                (int)format, (size_t)row_bytes,
+                (int)n_tokens, (int)pos0, (int)n_head, (int)n_head_kv,
+                (int)head_dim, (int)kv_cap, (int)window, scale,
+                cuda_decode_stream());
+        if (rc == 0) {
+            static int logged = 0;
+            if (!logged) {
+                fprintf(stderr,
+                        "ds4: Solar compressed KV prefill using HMMA tiles\n");
+                logged = 1;
+            }
+            return 1;
+        }
+        /* Unsupported shape/arch or launch refusal: preserve scalar anchor. */
+    }
     dim3 grid(n_tokens, n_head, 1u);
     DS4_EXAONE_ATTN_DISPATCH(
             solar_attn_prefill_kernel, grid, shmem,

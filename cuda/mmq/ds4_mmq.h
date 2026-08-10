@@ -70,6 +70,16 @@ int ds4_mmq_exaone_prefill_attn_hmma(
         int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
         int kv_cap, int window, float scale, cudaStream_t stream);
 
+// Solar variant of the same tensor-core prefill. Compressed K/V rows are
+// decoded into the shared-memory tiles consumed by HMMA, so one dequantized
+// tile serves 64 query rows. format uses ds4_solar_kv_format numeric values
+// 1..3; BF16 continues through the EXAONE entry above.
+int ds4_mmq_solar_prefill_attn_hmma(
+        float *heads, const float *q, const void *kv,
+        int format, size_t row_bytes,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
+        int kv_cap, int window, float scale, cudaStream_t stream);
+
 int ds4_mmq_q8_0_dense(
     const void  * W_q8_0,
     const float * X_f32,
