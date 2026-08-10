@@ -36,6 +36,18 @@ Do not rebuild, merge, requantize, or silently replace these weights during
 Spark runtime work. A README-only Hub update does not change the fixed weight
 revision or any shard bytes.
 
+## Publication completed at pause
+
+- The ds4 optimization branch was pushed to
+  `origin/feature/solar-open2-model-loader`.
+- The model card was updated on Hugging Face in README-only commit
+  `b2669f2e6464f3cc1b38953d290b12100d975c55`.
+- The published `README.md` SHA-256 is
+  `aaaecd4711f38e06569ef42951d5d2c75609f73b29be089f504e0c56d54f5021`.
+- Re-downloading that exact Hub revision matched the upload byte-for-byte.
+- A shallow Git audit of the Hub commit reported only `M README.md`; no GGUF,
+  manifest, hash, recipe, license, or other repository file changed.
+
 ## Checkout and host
 
 | Item | Value |
