@@ -2,12 +2,12 @@
  *
  *   ./tests/test_solar_session <first-model-shard.gguf>
  *
- * Snapshot persistence is intentionally covered by a separate test: this one
- * pins the public live-session contract while the Solar graph is integrated
- * into the v0.5.6.2 session skeleton.
+ * It pins both the live-session contract and exact persistence of Solar's
+ * recurrent KDA state plus live GQA KV rows.
  */
 #include "../ds4.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +28,21 @@ static int expect_same_logits(const float *want, const float *got,
         return 1;
     }
     return 0;
+}
+
+static double max_abs_diff(const float *a, const float *b, int n,
+                           int *nonfinite) {
+    double worst = 0.0;
+    *nonfinite = 0;
+    for (int i = 0; i < n; i++) {
+        if (!isfinite(a[i]) || !isfinite(b[i])) {
+            *nonfinite = 1;
+            continue;
+        }
+        const double d = fabs((double)a[i] - (double)b[i]);
+        if (d > worst) worst = d;
+    }
+    return worst;
 }
 
 int main(int argc, char **argv) {
@@ -53,7 +68,11 @@ int main(int argc, char **argv) {
     ds4_session *session = NULL;
     ds4_tokens prompt = {0};
     float *initial = NULL;
+    float *decoded = NULL;
+    float *warm = NULL;
     float *replayed = NULL;
+    ds4_session_snapshot snapshot = {0};
+    ds4_session_snapshot restored_snapshot = {0};
     char err[256] = "";
     int failed = 0;
 
@@ -91,8 +110,10 @@ int main(int argc, char **argv) {
 
     const int n_vocab = ds4_engine_vocab_size(engine);
     initial = calloc((size_t)n_vocab, sizeof(*initial));
+    decoded = calloc((size_t)n_vocab, sizeof(*decoded));
+    warm = calloc((size_t)n_vocab, sizeof(*warm));
     replayed = calloc((size_t)n_vocab, sizeof(*replayed));
-    if (!initial || !replayed) {
+    if (!initial || !decoded || !warm || !replayed) {
         fprintf(stderr, "host logits allocation failed\n");
         failed = 1;
         goto cleanup;
@@ -110,6 +131,18 @@ int main(int argc, char **argv) {
         failed = 1;
         goto cleanup;
     }
+    if (ds4_session_save_snapshot(session, &snapshot,
+                                  err, sizeof(err)) != 0 ||
+        snapshot.len != ds4_session_payload_bytes(session)) {
+        fprintf(stderr, "Solar snapshot save failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "Solar snapshot: bytes=%llu MiB=%.2f tokens=%d\n",
+            (unsigned long long)snapshot.len,
+            (double)snapshot.len / 1048576.0,
+            prompt.len);
 
     const uint64_t stable_generation = ds4_session_generation(session);
     if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0 ||
@@ -124,11 +157,13 @@ int main(int argc, char **argv) {
 
     const int next = ds4_session_argmax(session);
     if (ds4_session_eval(session, next, err, sizeof(err)) != 0 ||
-        ds4_session_pos(session) != prompt.len + 1) {
+        ds4_session_pos(session) != prompt.len + 1 ||
+        copy_logits(session, decoded, n_vocab, "first decode")) {
         fprintf(stderr, "Solar decode failed: %s\n", err);
         failed = 1;
         goto cleanup;
     }
+    const int decoded_argmax = ds4_session_argmax(session);
 
     ds4_session_rewind(session, prompt.len);
     err[0] = '\0';
@@ -138,10 +173,101 @@ int main(int argc, char **argv) {
         failed = 1;
         goto cleanup;
     }
-    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0 ||
-        copy_logits(session, replayed, n_vocab, "rewind resync") ||
-        expect_same_logits(initial, replayed, n_vocab, "rewind resync")) {
-        fprintf(stderr, "Solar rewind resync failed: %s\n", err);
+
+    if (ds4_session_load_snapshot(session, &snapshot,
+                                  err, sizeof(err)) != 0 ||
+        ds4_session_pos(session) != prompt.len ||
+        ds4_session_argmax(session) != next ||
+        copy_logits(session, replayed, n_vocab, "snapshot restore") ||
+        expect_same_logits(initial, replayed, n_vocab, "snapshot restore")) {
+        fprintf(stderr, "Solar snapshot restore failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+    if (ds4_session_save_snapshot(session, &restored_snapshot,
+                                  err, sizeof(err)) != 0 ||
+        restored_snapshot.len != snapshot.len ||
+        memcmp(restored_snapshot.ptr, snapshot.ptr,
+               (size_t)snapshot.len) != 0) {
+        fprintf(stderr, "Solar restored snapshot bytes differ: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+
+    /* A malformed layout must be rejected before touching GPU state.  Loading
+     * failures deliberately invalidate the old logical checkpoint. */
+    const size_t layout_magic_offset = 5u * sizeof(uint32_t);
+    if (restored_snapshot.len <= layout_magic_offset) {
+        fprintf(stderr, "Solar snapshot is shorter than its fixed header\n");
+        failed = 1;
+        goto cleanup;
+    }
+    const uint8_t layout_byte = restored_snapshot.ptr[layout_magic_offset];
+    restored_snapshot.ptr[layout_magic_offset] ^= UINT8_C(1);
+    err[0] = '\0';
+    const int corrupt_rc = ds4_session_load_snapshot(
+        session, &restored_snapshot, err, sizeof(err));
+    restored_snapshot.ptr[layout_magic_offset] = layout_byte;
+    if (corrupt_rc == 0 || ds4_session_pos(session) != 0 || err[0] == '\0') {
+        fprintf(stderr,
+                "Solar corrupted snapshot was not rejected cleanly: %s\n",
+                err);
+        failed = 1;
+        goto cleanup;
+    }
+    err[0] = '\0';
+    if (ds4_session_load_snapshot(session, &snapshot,
+                                  err, sizeof(err)) != 0) {
+        fprintf(stderr, "Solar recovery after rejected snapshot failed: %s\n",
+                err);
+        failed = 1;
+        goto cleanup;
+    }
+
+    err[0] = '\0';
+    if (ds4_session_eval(session, next, err, sizeof(err)) != 0 ||
+        copy_logits(session, warm, n_vocab, "snapshot warm decode")) {
+        fprintf(stderr, "Solar snapshot warm decode failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+    const int warm_argmax = ds4_session_argmax(session);
+    int nonfinite = 0;
+    const double cold_warm_diff =
+        max_abs_diff(decoded, warm, n_vocab, &nonfinite);
+    fprintf(stderr,
+            "Solar snapshot cold/warm decode: max_abs=%.9g argmax=%d/%d\n",
+            cold_warm_diff, decoded_argmax, warm_argmax);
+    if (nonfinite || cold_warm_diff > 0.25 ||
+        warm_argmax != decoded_argmax) {
+        fprintf(stderr,
+                "Solar cold/warm snapshot decode drift exceeded its bound\n");
+        failed = 1;
+        goto cleanup;
+    }
+
+    if (ds4_session_load_snapshot(session, &snapshot,
+                                  err, sizeof(err)) != 0) {
+        fprintf(stderr, "Solar second snapshot restore failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+    err[0] = '\0';
+    if (ds4_session_eval(session, next, err, sizeof(err)) != 0 ||
+        copy_logits(session, replayed, n_vocab,
+                    "snapshot deterministic replay")) {
+        fprintf(stderr, "Solar snapshot replay decode failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+    const double warm_replay_diff =
+        max_abs_diff(warm, replayed, n_vocab, &nonfinite);
+    fprintf(stderr,
+            "Solar snapshot warm/replay decode: max_abs=%.9g argmax=%d/%d\n",
+            warm_replay_diff, warm_argmax, ds4_session_argmax(session));
+    if (nonfinite || warm_replay_diff > 1.0e-5 ||
+        ds4_session_argmax(session) != warm_argmax) {
+        fprintf(stderr, "Solar restored decode is not deterministic\n");
         failed = 1;
         goto cleanup;
     }
@@ -156,7 +282,11 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
+    ds4_session_snapshot_free(&restored_snapshot);
+    ds4_session_snapshot_free(&snapshot);
     free(replayed);
+    free(warm);
+    free(decoded);
     free(initial);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);

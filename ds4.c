@@ -31572,6 +31572,10 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
  * compressed row counts, raw SWA rows in logical order, compressed attention
  * rows, and the compressor/indexer frontiers.  That is the minimum state needed
  * for the next token to match a session that had just prefetched the prefix.
+ * Solar uses the same outer payload API with its own tagged layout: checkpoint
+ * tokens, last logits, the complete mutable KDA state pool, and only the live
+ * prefix rows from the twelve GQA layers.  Immutable KDA controls are rebuilt
+ * from model weights when the graph is allocated and are not serialized.
  */
 
 /* MAGIC / VERSION / U32_FIELDS moved to ds4.h (upstream relocated them so the
@@ -31581,9 +31585,16 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
  * payloads still load; the fields default to zero. */
 #define DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES (uint64_t)(sizeof(uint32_t) + sizeof(double) + sizeof(uint32_t))
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
+#define DS4_SESSION_SOLAR_LAYOUT_MAGIC UINT32_C(0x33524c53) /* "SLR3" */
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
+}
+
+static bool payload_u64_add(uint64_t *value, uint64_t add) {
+    if (!value || add > UINT64_MAX - *value) return false;
+    *value += add;
+    return true;
 }
 
 static void payload_put_u32(uint8_t out[4], uint32_t v) {
@@ -34164,7 +34175,43 @@ static int ds4_session_eval_speculative_batch_first3(
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
-    if (ds4_session_is_solar(s)) return 0;
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_solar(s)) {
+        if (!s->solar_graph_ready || !s->solar_state_valid) return 0;
+        const ds4_solar_gpu_graph *sg = &s->solar_graph;
+        const ds4_plain_gpu_graph *g = &sg->base;
+        if (s->checkpoint.len <= 0 || s->ctx_size <= 0 ||
+            s->checkpoint.len >= s->ctx_size ||
+            g->ctx_size != (uint32_t)s->ctx_size ||
+            !sg->state_pool || sg->state_bytes == 0u ||
+            sg->state_bytes > UINT32_MAX ||
+            g->kv_row_bytes == 0u || g->kv_row_bytes > UINT32_MAX) {
+            return 0;
+        }
+        const uint64_t live = (uint64_t)s->checkpoint.len;
+        if (live > UINT64_MAX / g->kv_row_bytes) {
+            return 0;
+        }
+        uint64_t bytes =
+            (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+        if (!payload_u64_add(&bytes, live * sizeof(uint32_t)) ||
+            !payload_u64_add(
+                &bytes, (uint64_t)DS4_N_VOCAB * sizeof(float)) ||
+            !payload_u64_add(&bytes, sg->state_bytes)) {
+            return 0;
+        }
+        const uint64_t live_kv_bytes = live * g->kv_row_bytes;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (!ds4_solar_layer_is_gqa(il)) continue;
+            if (!g->layer_kv[il] ||
+                live > g->layer_kv_cap[il] ||
+                !payload_u64_add(&bytes, live_kv_bytes)) {
+                return 0;
+            }
+        }
+        return bytes;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -34283,9 +34330,85 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
     if (ds4_session_is_solar(s)) {
+#ifdef DS4_NO_GPU
         payload_set_err(err, errlen,
-                        "Solar session snapshots are not implemented yet");
+                        "graph backend support is not compiled in");
         return 1;
+#else
+        if (!s->solar_graph_ready || !s->solar_state_valid) {
+            payload_set_err(
+                err, errlen,
+                "Solar graph has no valid recurrent state to snapshot");
+            return 1;
+        }
+        ds4_solar_gpu_graph *sg = &s->solar_graph;
+        ds4_plain_gpu_graph *g = &sg->base;
+        if (sg->state_bytes == 0u || sg->state_bytes > UINT32_MAX ||
+            g->kv_row_bytes == 0u || g->kv_row_bytes > UINT32_MAX ||
+            ds4_session_payload_bytes(s) == 0u) {
+            payload_set_err(err, errlen,
+                            "Solar session payload layout is too large or invalid");
+            return 1;
+        }
+        if (ds4_gpu_synchronize() == 0) {
+            payload_set_err(
+                err, errlen,
+                "failed to synchronize accelerator before Solar snapshot");
+            return 1;
+        }
+
+        const uint32_t live = (uint32_t)s->checkpoint.len;
+        uint32_t n_gqa = 0u;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (ds4_solar_layer_is_gqa(il)) n_gqa++;
+        }
+        uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+            DS4_SESSION_PAYLOAD_MAGIC,
+            DS4_SESSION_PAYLOAD_VERSION,
+            (uint32_t)s->ctx_size,
+            (uint32_t)g->kv_format,
+            g->ctx_size,
+            DS4_SESSION_SOLAR_LAYOUT_MAGIC,
+            (uint32_t)sg->state_bytes,
+            live,
+            DS4_N_LAYER,
+            (uint32_t)g->kv_row_bytes,
+            n_gqa,
+            DS4_N_VOCAB,
+            live,
+        };
+        for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+            if (payload_write_u32(fp, header[i], err, errlen) != 0) {
+                return 1;
+            }
+        }
+        for (int i = 0; i < s->checkpoint.len; i++) {
+            if (payload_write_u32(
+                    fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) {
+                return 1;
+            }
+        }
+        if (payload_write_bytes(
+                fp, s->logits,
+                (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) {
+            return 1;
+        }
+
+        uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+        int rc = payload_write_tensor_span(
+            fp, sg->state_pool, 0, sg->state_bytes, buf,
+            DS4_SESSION_IO_CHUNK, err, errlen);
+        const uint64_t live_kv_bytes =
+            (uint64_t)live * g->kv_row_bytes;
+        for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+            if (!ds4_solar_layer_is_gqa(il)) continue;
+            rc = payload_write_tensor_span(
+                fp, g->layer_kv[il], 0, live_kv_bytes, buf,
+                DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+        free(buf);
+        return rc;
+#endif
     }
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
@@ -34428,18 +34551,196 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #endif
 }
 
+#ifndef DS4_NO_GPU
+static int session_solar_load_payload(ds4_session *s,
+                                      FILE *fp,
+                                      uint64_t *remaining,
+                                      const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS],
+                                      char *err,
+                                      size_t errlen) {
+    if (h[1] != DS4_SESSION_PAYLOAD_VERSION ||
+        h[5] != DS4_SESSION_SOLAR_LAYOUT_MAGIC) {
+        payload_set_err(err, errlen,
+                        "unsupported Solar session payload layout");
+        return 1;
+    }
+    const uint32_t saved_ctx = h[2];
+    const uint32_t saved_graph_ctx = h[4];
+    const uint32_t saved_tokens = h[7];
+    const uint32_t saved_live = h[12];
+    uint32_t n_gqa = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_solar_layer_is_gqa(il)) n_gqa++;
+    }
+    if (h[8] != DS4_N_LAYER || h[10] != n_gqa ||
+        h[11] != DS4_N_VOCAB || h[6] == 0u || h[9] == 0u) {
+        payload_set_err(
+            err, errlen,
+            "session payload was written for a different Solar layout");
+        return 1;
+    }
+    if (saved_ctx == 0u || saved_graph_ctx != saved_ctx ||
+        saved_ctx > (uint32_t)s->ctx_size ||
+        saved_tokens == 0u || saved_tokens >= saved_ctx ||
+        saved_live != saved_tokens) {
+        payload_set_err(
+            err, errlen,
+            "Solar session payload does not fit the current context");
+        return 1;
+    }
+
+    const uint64_t live_kv_bytes =
+        (uint64_t)saved_live * h[9];
+    uint64_t expected_body =
+        (uint64_t)saved_tokens * sizeof(uint32_t);
+    if (!payload_u64_add(
+            &expected_body, (uint64_t)DS4_N_VOCAB * sizeof(float)) ||
+        !payload_u64_add(&expected_body, h[6])) {
+        payload_set_err(err, errlen, "Solar session payload size overflow");
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_gqa; i++) {
+        if (!payload_u64_add(&expected_body, live_kv_bytes)) {
+            payload_set_err(err, errlen,
+                            "Solar session payload size overflow");
+            return 1;
+        }
+    }
+    if (*remaining != expected_body) {
+        payload_set_err(err, errlen,
+                        "Solar session payload byte count does not match its header");
+        return 1;
+    }
+
+    /* Validate the self-contained header before a lazy graph allocation.  The
+     * allocator initializes a fresh KDA state, so explicitly mark it invalid
+     * again until every serialized byte has been restored successfully. */
+    if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;
+    s->solar_state_valid = false;
+    if (!s->solar_graph_ready) {
+        payload_set_err(err, errlen,
+                        "Solar graph is not ready for recurrent-state restore");
+        return 1;
+    }
+
+    ds4_solar_gpu_graph *sg = &s->solar_graph;
+    ds4_plain_gpu_graph *g = &sg->base;
+    if (h[3] != (uint32_t)g->kv_format ||
+        h[6] != sg->state_bytes || h[9] != g->kv_row_bytes) {
+        payload_set_err(
+            err, errlen,
+            "session payload was written for a different Solar layout");
+        return 1;
+    }
+    if (saved_graph_ctx > g->ctx_size) {
+        payload_set_err(
+            err, errlen,
+            "Solar session payload does not fit the current context");
+        return 1;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_solar_layer_is_gqa(il) &&
+            (!g->layer_kv[il] || saved_live > g->layer_kv_cap[il])) {
+            payload_set_err(err, errlen,
+                            "Solar payload GQA KV exceeds the current cache");
+            return 1;
+        }
+    }
+
+    token_vec new_checkpoint = {0};
+    for (uint32_t i = 0; i < saved_tokens; i++) {
+        uint32_t tok = 0u;
+        if (payload_read_u32(fp, &tok, remaining, err, errlen) != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        if (tok >= DS4_N_VOCAB) {
+            token_vec_free(&new_checkpoint);
+            payload_set_err(err, errlen,
+                            "Solar session payload contains an invalid token");
+            return 1;
+        }
+        token_vec_push(&new_checkpoint, (int)tok);
+    }
+    float *new_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (payload_read_bytes(
+            fp, new_logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
+            remaining, err, errlen) != 0) {
+        free(new_logits);
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        free(new_logits);
+        token_vec_free(&new_checkpoint);
+        payload_set_err(
+            err, errlen,
+            "failed to synchronize accelerator before Solar restore");
+        return 1;
+    }
+
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = payload_read_tensor_span(
+        fp, sg->state_pool, 0, sg->state_bytes, buf,
+        DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        if (!ds4_solar_layer_is_gqa(il)) continue;
+        rc = payload_read_tensor_span(
+            fp, g->layer_kv[il], 0, live_kv_bytes, buf,
+            DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    }
+    free(buf);
+    if (rc == 0 && *remaining != 0u) {
+        payload_set_err(err, errlen,
+                        "Solar session payload has trailing bytes");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        payload_set_err(
+            err, errlen,
+            "failed to synchronize accelerator after Solar restore");
+        rc = 1;
+    }
+    if (rc != 0) {
+        free(new_logits);
+        token_vec_free(&new_checkpoint);
+        (void)solar_graph_reset_state(sg);
+        s->checkpoint.len = 0;
+        s->checkpoint_valid = false;
+        s->solar_state_valid = false;
+        return 1;
+    }
+
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = new_checkpoint;
+    memcpy(s->logits, new_logits,
+           (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    free(new_logits);
+    s->checkpoint_valid = true;
+    s->solar_state_valid = true;
+    s->mtp_draft_valid = false;
+    s->mtp_accept_gate_skip = 0u;
+    s->mtp_accept_ewma = 0.0;
+    s->mtp_accept_samples = 0u;
+    return 0;
+}
+#endif
+
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
-    if (ds4_session_is_solar(s)) {
-        payload_set_err(err, errlen,
-                        "Solar session snapshots are not implemented yet");
-        return 1;
-    }
     s->generation++;   /* Inc 5a: content replaced from disk (even on failure
                         * the old checkpoint is no longer trustworthy) */
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_solar(s)) {
+        s->checkpoint_valid = false;
+        s->checkpoint.len = 0;
+        s->mtp_draft_valid = false;
+        s->solar_state_valid = false;
+    }
+#endif
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
@@ -34453,6 +34754,12 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return 1;
     }
     const uint32_t payload_version = h[1];
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_solar(s)) {
+        return session_solar_load_payload(
+            s, fp, &remaining, h, err, errlen);
+    }
+#endif
 #ifndef DS4_NO_GPU
     /* S6 lazy graph: loading a disk KV checkpoint writes straight into the
      * graph's rings (a fresh server session may load before any sync). */
