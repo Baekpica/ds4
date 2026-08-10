@@ -5,6 +5,42 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.5.6.2 — 2026-08-10
+
+The proper Codex fix. v0.5.6.1 documented two caveats around OpenAI
+Codex on custom providers: compaction summaries could be poisoned by
+leaked tool-call markup, and Codex needed a hand-installed catalog
+file to learn the context window at all. Both are now fixed
+server-side, plus the stream-timeout failure behind long thinking
+turns. Validated end-to-end: the codex compaction task that failed on
+every earlier run now completes through multiple compactions, and a
+ten-minute single thinking turn survives at Codex's stock timeouts.
+
+- Tool-call syntax is terminal on requests that declare no tools. The
+  model can open a DSML tool-call block after plain text (it did so on
+  every observed compaction summary); previously that raw control
+  syntax streamed to the client as text and the finish still flipped
+  to tool_calls. Now the visible message ends exactly at the marker
+  with an honest finish=stop, partial markers are held off the wire,
+  and DSML quoted inside thinking stays inert. A no-tools client can
+  never receive tool syntax, so transcript consumers (Codex compaction
+  summaries included) stay clean.
+- GET /v1/models can teach Codex the model directly: point
+  DS4_CODEX_MODELS_FILE at the catalog file shipped with ds4-on-spark
+  and the response carries Codex's ModelInfo schema alongside the
+  OpenAI list (Codex tolerates the combined body; OpenAI clients
+  ignore the extra field). Codex then self-configures — real context
+  window, working auto-compaction, correct agent instructions — with
+  nothing but the provider block in its config. The boot log warns if
+  the file's context_window disagrees with the booted -c.
+- Streams now heartbeat during silent decode stretches. A thinking
+  turn with no reasoning deltas on the wire is minutes of silence, and
+  Codex's ~300 s idle timer killed such turns (it counts parsed SSE
+  events — comment keepalives do not reset it). A live Responses
+  stream heartbeats with the API's own response.in_progress event
+  every 5 s; Anthropic streams use the protocol's native ping;
+  other surfaces get an SSE comment. Prefill keepalives unchanged.
+
 ## v0.5.6.1 — 2026-08-09
 
 Fast-follow fix for a session-killing interaction found while testing
