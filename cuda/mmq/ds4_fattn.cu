@@ -32,6 +32,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_fp4.h>
 
 using namespace ggml_cuda_mma;
 
@@ -62,18 +63,9 @@ __device__ __forceinline__ float solar_fattn_e4m3(uint8_t code) {
 }
 
 __device__ __forceinline__ float solar_fattn_e2m1(uint8_t code) {
-    float value;
-    switch (code & 7u) {
-    case 0u: value = 0.0f; break;
-    case 1u: value = 0.5f; break;
-    case 2u: value = 1.0f; break;
-    case 3u: value = 1.5f; break;
-    case 4u: value = 2.0f; break;
-    case 5u: value = 3.0f; break;
-    case 6u: value = 4.0f; break;
-    default: value = 6.0f; break;
-    }
-    return (code & 8u) ? -value : value;
+    __nv_fp4_e2m1 value;
+    value.__x = code & 0x0fu;
+    return (float)value;
 }
 
 template <int FORMAT, bool VALUE>
