@@ -516,6 +516,12 @@ test-solar-lifecycle: tests/test_solar_lifecycle
 	DS4_SOLAR_KV_FORMAT=fp8 ./tests/test_solar_lifecycle \
 		"$(DS4_SOLAR_MODEL)" "$(DS4_SOLAR_LONG_TEXT)" 65536
 
+tests/test_solar_longctx.o: tests/test_solar_longctx.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_longctx: tests/test_solar_longctx.o ds4_gpu_args.o ds4_kvstore.o rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/test_solar_kv_formats.o: tests/test_solar_kv_formats.c ds4.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
