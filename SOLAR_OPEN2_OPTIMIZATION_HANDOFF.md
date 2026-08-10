@@ -209,11 +209,33 @@ L2, 100 KiB shared/SM):
   [64x128]@[128x128] GEMMs take 17.25 ms (launch-latency-bound); the same
   math as one parallel batched GEMM takes 0.086 ms (~20 TFLOPS f32).
 
-Remaining KDA headroom (~3x of the 111 ms, not yet worth blocking on): the
-factor kernel (48 ms) and scan (37 ms) still issue one scalar LDS per
-element; the documented next step is a register-tiled GEMM rewrite (state in
-shared, 4x4 micro-tiles, float4 segments) and, in the factor kernel, the
-same treatment for the sub-block dots.
+## Register-tiled chunk kernels (landed 2026-08-10, `ce34634`)
+
+The documented register-tiling rewrite landed the same day. The scan keeps
+its 128x64 state slice in shared memory and runs O_inter, the U rewrite and
+the state fold as register-tiled GEMMs (16x16 thread grid, 4x4/8x4
+micro-tiles, float4 operands); the factor kernel's triangular T-products
+and the intra output use the same 4-row x 8-column tiling, and the
+sub-block dots read 132-float padded tiles as float4. An 8-token prep batch
+was tried and reverted (serialized reduction trees cost more than the grid
+saved).
+
+8K production-shape microbenchmark, cumulative:
+
+| Path | wall | vs generic |
+|---|---:|---:|
+| generic sequence kernel | 727.0 ms | 1.00x |
+| chunked v1 (landed `0b58219`) | 111.2 ms | 6.69x |
+| + register tiling (`ce34634`) | **61.8 ms** | **11.77x** |
+
+Per kernel: scan 37.3 -> 23.0 ms (operand-streaming bound now), factor
+48.0 -> 24.9 ms, intra 14.9 -> 4.4 ms, prep 9.7 ms unchanged. Output
+max_abs vs generic 5.1e-10; FLA fixture unchanged; memcheck and racecheck
+clean. Full-model note: a 2K rerun accidentally measured a stale
+`test_solar_kv_formats` binary (identical pre-tiling numbers); the
+register-tiled full-model figure was not separately measured before the
+session moved to the 1M serving gate — the lifecycle rates below already
+include the tiled kernels.
 
 ## Compressed GQA KV optimization result
 
@@ -317,6 +339,54 @@ FP8 nsys profile:
 
 SHA-256:
 `88828e7a1c729449655ef07614521d23b67e809bdac1f4b87be76fa1fdfdf37f`
+
+## 32K/64K lifecycle gates on the release path (2026-08-10)
+
+`tests/test_solar_lifecycle` ran the full staged regression with the fixed
+model, FP8 runtime KV, HMMA compressed prefill, aligned artifacts, chunked
+KDA prefill, recurrent decode, and the register-tiled chunk kernels — the
+exact release configuration. Every stage passed with bit-stable replay
+(`warm_replay=0`), snapshot/restore equality, fork identity, cancellation
+and cold-resync checks green:
+
+| Stage | Common prefix | Extension sync | Rate | Snapshot |
+|---:|---:|---:|---:|---:|
+| 2,048 | 0 | 11.953 s | 171.3 tok/s | 207 MiB / 0.126 s |
+| 8,192 | 2,048 | 17.762 s | 345.9 tok/s | 353 MiB / 0.220 s |
+| 32,768 | 8,192 | 90.907 s | 270.3 tok/s | 938 MiB / 0.522 s |
+| 65,536 | 32,768 | 172.307 s | 190.2 tok/s | 1.678 GiB / 1.047 s |
+
+The rate falls with depth because the 12 full-attention GQA layers pay the
+quadratic term; the KDA side is depth-invariant. The 32K/64K lifecycle
+frontier required by the resume plan is closed.
+
+## Long-context ladder (2026-08-10, `tests/test_solar_longctx`)
+
+The new gate prefills a rendered needle fixture end to end on the release
+configuration (hybrid runtime KV) and requires the marker strings in the
+greedy completion. First 131K attempt taught the budget lesson: the
+fixtures end in `<|think:start|>`, and the model spent the manifest's
+reserved 256 tokens entirely inside a well-formed thinking block that
+correctly analyzed the needle structure — treat that as a fixture-budget
+constraint, not a retrieval failure; reruns use a 1,536-token budget.
+
+Measured at 131,072 (130,800 prompt tokens, hybrid KV, chunk 2048):
+
+- Cold prefill 816.6 s (160.2 tok/s TTFT at depth); decode 4.17 tok/s
+  (240 ms/token — the 12 GQA layers walking 131K rows); context pools
+  3.709 GiB; MemAvailable 23.95 GiB at exit; no OOM, no non-finite logits.
+- Needle results at the 1,536-token budget: see
+  `solar-longctx-131k-hybrid2.log` beside the other run logs.
+
+512K and exact-1M full-depth retrieval remain future work (multi-hour
+prefills); the 1M gate below is the serving-admission demonstration.
+
+Log:
+
+`/home/sunghoon/workspace/ds4-exaone/scratch/solar-open2-spark/solar-lifecycle-64k.log`
+
+SHA-256:
+`560fea55fe908b7a5fc7e0f688b90abd1a1540c3aaff1cb5c32cbf53ea11c497`
 
 ## Full-model run with chunked KDA + aligned artifacts (2026-08-10)
 
