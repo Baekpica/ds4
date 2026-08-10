@@ -27,8 +27,10 @@ enum {
     T_MOE_IN = 256,
     T_MOE_OUT = 64,
     T_IQ2_IN = 1024,
-    T_IQ2_OUT = 64,
-    T_IQ2_TOKENS = 4,
+    /* 128 * top-8 reaches the production D2R threshold and exercises the
+     * aligned routed gate/up pair path, including ragged expert buckets. */
+    T_IQ2_OUT = 128,
+    T_IQ2_TOKENS = 128,
 };
 
 typedef struct {
