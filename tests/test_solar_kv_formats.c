@@ -185,7 +185,10 @@ int main(int argc, char **argv) {
            profile_format && profile_format[0] ? profile_format : "none");
     fflush(stdout);
 
-    setenv("DS4_SOLAR_KDA_STATE_PARTS", "1", 1);
+    /* KDA rides the release path (chunked prefill, recurrent decode) so the
+     * KV formats are compared on the configuration a server would run;
+     * export DS4_SOLAR_KDA_STATE_PARTS before launch to pin a sequence
+     * variant instead. */
     setenv("DS4_SOLAR_KV_FORMAT", "bf16", 1);
 
     ds4_engine_options opt = {0};
