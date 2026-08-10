@@ -109,8 +109,8 @@ static const char *format_name(ds4_solar_kv_format format) {
     }
 }
 
-static uint32_t prefill_repeat_count(void) {
-    const char *value = getenv("DS4_SOLAR_KV_PREFILL_REPEATS");
+static uint32_t repeat_count_from_env(const char *name) {
+    const char *value = getenv(name);
     if (!value || !value[0]) return 1u;
     char *end = NULL;
     const unsigned long count = strtoul(value, &end, 10);
@@ -169,9 +169,14 @@ static void make_fixture(float *q, float *k, float *v) {
 
 int main(void) {
     setenv("DS4_EXAONE_NO_PREFILL_HMMA", "1", 1);
-    const uint32_t prefill_repeats = prefill_repeat_count();
+    const uint32_t prefill_repeats =
+        repeat_count_from_env("DS4_SOLAR_KV_PREFILL_REPEATS");
+    const uint32_t decode_repeats =
+        repeat_count_from_env("DS4_SOLAR_KV_DECODE_REPEATS");
     CHECK(prefill_repeats != 0u,
           "DS4_SOLAR_KV_PREFILL_REPEATS must be in [1, 10000]");
+    CHECK(decode_repeats != 0u,
+          "DS4_SOLAR_KV_DECODE_REPEATS must be in [1, 10000]");
     CHECK(ds4_gpu_init(), "CUDA init");
 
     const size_t q_count = (size_t)T_TOKENS * T_HEAD * T_DIM;
@@ -235,6 +240,9 @@ int main(void) {
     if (prefill_repeats > 1u) {
         printf("compressed prefill repeats=%u\n", prefill_repeats);
     }
+    if (decode_repeats > 1u) {
+        printf("compressed decode repeats=%u\n", decode_repeats);
+    }
     const ds4_solar_kv_format formats[] = {
         DS4_SOLAR_KV_FP8,
         DS4_SOLAR_KV_FP4,
@@ -295,10 +303,12 @@ int main(void) {
         snprintf(label, sizeof(label), "%s prefill vs BF16", format_name(format));
         compare_vector(label, got, baseline_prefill, q_count, attn_limit, 0.04);
 
-        CHECK(ds4_gpu_solar_attention_decode_tensor(
-                  decode, last_q, cache, T_HEAD, T_HEAD_KV, T_DIM, T_CAP,
-                  T_TOKENS - 1u, 0u, format),
-              "compressed decode");
+        for (uint32_t repeat = 0; repeat < decode_repeats; repeat++) {
+            CHECK(ds4_gpu_solar_attention_decode_tensor(
+                      decode, last_q, cache, T_HEAD, T_HEAD_KV, T_DIM, T_CAP,
+                      T_TOKENS - 1u, 0u, format),
+                  "compressed decode");
+        }
         CHECK(ds4_gpu_tensor_read(
                   decode, 0, got_decode, row_count * sizeof(float)),
               "read compressed decode");
