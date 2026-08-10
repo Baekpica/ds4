@@ -31237,6 +31237,142 @@ static __global__ void solar_attention_split_warp_kernel(
         part, part + 1u);
 }
 
+/* Solar production GQA is 64 query heads over 8 KV heads.  The per-head
+ * split kernel above therefore dequantizes and reads the same packed K/V row
+ * eight times.  This grouped kernel assigns one block to a KV head and two
+ * query heads to each warp.  A small key tile is decoded once into shared
+ * memory, then all query heads reuse it.  The online-softmax state remains
+ * independent per query head and the partial layout is unchanged, so the
+ * existing combine kernel remains the oracle/fallback seam. */
+template <int KEY_TILE>
+static __global__ void solar_attention_gqa_grouped_split_kernel(
+        float         *partials,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        uint32_t       chunk_len,
+        uint32_t       split_count,
+        float          scale) {
+    constexpr uint32_t HEAD_DIM = 128u;
+    constexpr uint32_t DPL = HEAD_DIM / 32u;
+    const uint32_t split = blockIdx.x;
+    const uint32_t kv_head = blockIdx.y;
+    if (split >= split_count || kv_head >= n_head_kv) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head[2] = {
+        kv_head * group + warp * 2u,
+        kv_head * group + warp * 2u + 1u,
+    };
+    const bool active[2] = {
+        warp * 2u < group,
+        warp * 2u + 1u < group,
+    };
+
+    float qv[2][DPL];
+    float acc[2][DPL];
+    float running_max[2] = {-INFINITY, -INFINITY};
+    float running_sum[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+#pragma unroll
+        for (int d = 0; d < (int)DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            qv[h][d] = active[h]
+                ? q[(uint64_t)head[h] * HEAD_DIM + dim] : 0.0f;
+            acc[h][d] = 0.0f;
+        }
+    }
+
+    __shared__ float shared_k[KEY_TILE][HEAD_DIM];
+    __shared__ float shared_v[KEY_TILE][HEAD_DIM];
+    const uint32_t chunk_first = first + split * chunk_len;
+    uint32_t chunk_last = chunk_first + chunk_len - 1u;
+    if (chunk_last > last) chunk_last = last;
+    for (uint32_t tile_first = chunk_first; tile_first <= chunk_last;
+         tile_first += KEY_TILE) {
+        const uint32_t tile_count =
+            chunk_last - tile_first + 1u < (uint32_t)KEY_TILE
+                ? chunk_last - tile_first + 1u : (uint32_t)KEY_TILE;
+        const uint32_t tile_values = tile_count * HEAD_DIM * 2u;
+        for (uint32_t idx = threadIdx.x; idx < tile_values;
+             idx += blockDim.x) {
+            const uint32_t key = idx / (HEAD_DIM * 2u);
+            const uint32_t rem = idx - key * HEAD_DIM * 2u;
+            const bool value = rem >= HEAD_DIM;
+            const uint32_t dim = value ? rem - HEAD_DIM : rem;
+            const uint8_t *row = kv +
+                (uint64_t)((tile_first + key) % kv_cap) * row_bytes;
+            const float decoded = solar_kv_load(
+                row, format, n_head_kv, HEAD_DIM, kv_head, dim, value);
+            if (value) shared_v[key][dim] = decoded;
+            else shared_k[key][dim] = decoded;
+        }
+        __syncthreads();
+
+        if (warp * 2u < group) {
+            for (uint32_t key = 0u; key < tile_count; key++) {
+                float dot[2] = {0.0f, 0.0f};
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    if (!active[h]) continue;
+#pragma unroll
+                    for (int d = 0; d < (int)DPL; d++) {
+                        const uint32_t dim = lane + (uint32_t)d * 32u;
+                        dot[h] += qv[h][d] * shared_k[key][dim];
+                    }
+                }
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    dot[0] += __shfl_xor_sync(0xffffffffu, dot[0], offset);
+                    dot[1] += __shfl_xor_sync(0xffffffffu, dot[1], offset);
+                }
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    if (!active[h]) continue;
+                    const float score = dot[h] * scale;
+                    const float next_max = fmaxf(running_max[h], score);
+                    const float rescale = running_max[h] == -INFINITY
+                        ? 0.0f : __expf(running_max[h] - next_max);
+                    const float weight = __expf(score - next_max);
+#pragma unroll
+                    for (int d = 0; d < (int)DPL; d++) {
+                        const uint32_t dim = lane + (uint32_t)d * 32u;
+                        acc[h][d] = acc[h][d] * rescale +
+                                    weight * shared_v[key][dim];
+                    }
+                    running_sum[h] = running_sum[h] * rescale + weight;
+                    running_max[h] = next_max;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+        if (!active[h]) continue;
+        float *part = partials +
+            ((uint64_t)head[h] * split_count + split) * (HEAD_DIM + 2u);
+        if (lane == 0u) {
+            part[0] = running_max[h];
+            part[1] = running_sum[h];
+        }
+#pragma unroll
+        for (int d = 0; d < (int)DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            part[2u + dim] = acc[h][d];
+        }
+    }
+}
+
 static __global__ void solar_attention_decode_kernel(
         float         *heads,
         const float   *q,
@@ -31718,6 +31854,35 @@ extern "C" int ds4_gpu_solar_attention_decode_split_tensor(
     const uint64_t row_bytes =
         solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
     const uint32_t threads = solar_attention_threads(head_dim);
+    static int grouped_enabled = -1;
+    if (grouped_enabled < 0) {
+        const char *value = getenv("DS4_CUDA_SOLAR_GQA_GROUPED");
+        grouped_enabled = !(value && value[0] == '0' && value[1] == '\0');
+    }
+    const uint32_t group = n_head / n_head_kv;
+    if (grouped_enabled && head_dim == 128u && group >= 2u && group <= 8u) {
+        dim3 grouped_grid(split_count, n_head_kv, 1u);
+        solar_attention_gqa_grouped_split_kernel<8><<<
+            grouped_grid, 128u, 0u, ds4_current_stream()>>>(
+            (float *)partials->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
+            n_head_kv, kv_cap, first, pos, chunk_len, split_count,
+            rsqrtf((float)head_dim));
+        static int logged_grouped = 0;
+        if (!logged_grouped) {
+            logged_grouped = 1;
+            fprintf(stderr,
+                    "ds4: Solar grouped GQA split decode active "
+                    "(group=%u chunk=%u)\n",
+                    group, chunk_len);
+        }
+        solar_attention_split_combine_kernel<<<
+            n_head, threads, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, (const float *)partials->ptr,
+            head_dim, split_count);
+        return cuda_ok(cudaGetLastError(),
+                       "solar-open2 grouped split attention decode");
+    }
     const uint32_t shmem =
         (threads / 32u) * head_dim * (uint32_t)sizeof(float);
     dim3 grid(split_count, n_head, 1u);

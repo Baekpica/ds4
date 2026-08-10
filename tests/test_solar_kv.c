@@ -13,7 +13,9 @@
 #include <string.h>
 
 enum {
-    T_HEAD = 8,
+    /* Production Solar uses group-8 GQA (64 query / 8 KV heads).  Keep the
+     * test smaller while exercising the same sharing ratio. */
+    T_HEAD = 16,
     T_HEAD_KV = 2,
     T_DIM = 128,
     T_TOKENS = 257,

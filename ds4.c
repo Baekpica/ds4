@@ -15335,6 +15335,7 @@ struct ds4_plain_batch_ws {
 typedef struct {
     uint32_t ctx_size;
     uint32_t prefill_cap;
+    uint32_t attn_split_chunk;
     uint64_t n_embd;
     uint64_t q_dim;
     uint64_t kv_dim;
@@ -15405,7 +15406,39 @@ typedef struct {
     uint64_t scratch_bytes;
 } ds4_solar_gpu_graph;
 
-enum { DS4_PLAIN_SPLITKV_CHUNK = 2048 };
+enum {
+    DS4_PLAIN_SPLITKV_CHUNK_BASELINE = 2048,
+    DS4_PLAIN_SPLITKV_CHUNK_GROUPED = 64,
+};
+
+static uint32_t solar_graph_splitkv_chunk(ds4_backend backend) {
+    /* The grouped kernel is CUDA-only.  Preserve Metal's established split
+     * geometry instead of silently retuning another backend. */
+    if (backend != DS4_BACKEND_CUDA) {
+        return DS4_PLAIN_SPLITKV_CHUNK_BASELINE;
+    }
+    const char *grouped = getenv("DS4_CUDA_SOLAR_GQA_GROUPED");
+    if (grouped && grouped[0] == '0' && grouped[1] == '\0') {
+        return DS4_PLAIN_SPLITKV_CHUNK_BASELINE;
+    }
+    uint32_t chunk = DS4_PLAIN_SPLITKV_CHUNK_GROUPED;
+    const char *value = getenv("DS4_CUDA_SOLAR_GQA_CHUNK");
+    if (value && value[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(value, &end, 10);
+        if (end && *end == '\0' &&
+            (parsed == 64ul || parsed == 128ul || parsed == 256ul ||
+             parsed == 512ul || parsed == 1024ul || parsed == 2048ul)) {
+            chunk = (uint32_t)parsed;
+        } else {
+            fprintf(stderr,
+                    "ds4: ignoring invalid DS4_CUDA_SOLAR_GQA_CHUNK='%s' "
+                    "(expected 64/128/256/512/1024/2048)\n",
+                    value);
+        }
+    }
+    return chunk;
+}
 
 static uint32_t solar_graph_prefill_cap_for_context(uint32_t ctx);
 
@@ -15535,10 +15568,14 @@ static bool plain_graph_layer_uses_kv(uint32_t il) {
 static bool plain_graph_alloc(ds4_plain_gpu_graph *g,
                               const ds4_weights *weights,
                               uint32_t ctx_size,
-                              uint32_t prefill_chunk) {
-    if (!g || !weights || ctx_size == 0u) return false;
+                              uint32_t prefill_chunk,
+                              uint32_t attn_split_chunk) {
+    if (!g || !weights || ctx_size == 0u || attn_split_chunk == 0u) {
+        return false;
+    }
     memset(g, 0, sizeof(*g));
     g->ctx_size = ctx_size;
+    g->attn_split_chunk = attn_split_chunk;
     g->n_embd = DS4_N_EMBD;
     g->q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     g->kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
@@ -15597,9 +15634,9 @@ static bool plain_graph_alloc(ds4_plain_gpu_graph *g,
     PLAIN_ALLOC(routed_down,     n_used * g->n_embd);
     PLAIN_ALLOC(logits,          DS4_N_VOCAB);
     {
+        const uint32_t split_chunk = g->attn_split_chunk;
         const uint32_t chunks =
-            (ctx_size + DS4_PLAIN_SPLITKV_CHUNK - 1u) /
-            DS4_PLAIN_SPLITKV_CHUNK;
+            (ctx_size + split_chunk - 1u) / split_chunk;
         PLAIN_ALLOC(attn_split,
                     (uint64_t)DS4_N_HEAD * chunks *
                     (DS4_N_HEAD_DIM + 2u));
@@ -15716,6 +15753,7 @@ static bool solar_graph_reset_state(ds4_solar_gpu_graph *g) {
 static bool solar_graph_alloc(ds4_solar_gpu_graph *g,
                               const ds4_model *model,
                               const ds4_weights *weights,
+                              ds4_backend backend,
                               uint32_t ctx_size,
                               uint32_t prefill_chunk) {
     if (!g || !model || !weights ||
@@ -15723,7 +15761,8 @@ static bool solar_graph_alloc(ds4_solar_gpu_graph *g,
         return false;
     }
     memset(g, 0, sizeof(*g));
-    if (!plain_graph_alloc(&g->base, weights, ctx_size, prefill_chunk)) {
+    if (!plain_graph_alloc(&g->base, weights, ctx_size, prefill_chunk,
+                           solar_graph_splitkv_chunk(backend))) {
         return false;
     }
 
@@ -16060,7 +16099,7 @@ static bool solar_graph_attention_decode(ds4_plain_gpu_graph *g,
                 heads, q, g->layer_kv[il], g->attn_split,
                 DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
                 g->layer_kv_cap[il], pos, 0u,
-                DS4_PLAIN_SPLITKV_CHUNK, g->kv_format) != 0;
+                g->attn_split_chunk, g->kv_format) != 0;
     }
     return ds4_gpu_solar_attention_decode_tensor(
             heads, q, g->layer_kv[il],
@@ -24170,7 +24209,8 @@ static uint32_t solar_graph_prefill_cap_for_context(uint32_t ctx) {
  * own recurrent KDA state and immutable f32 controls.  Scratch mirrors the
  * decode tensors, one P-row prefill workspace, KDA extras, and split-KV
  * partial reductions that the runtime allocator consumes. */
-static ds4_context_memory solar_graph_context_memory_estimate(uint32_t ctx) {
+static ds4_context_memory solar_graph_context_memory_estimate(
+        ds4_backend backend, uint32_t ctx) {
     ds4_context_memory m = {0};
     ds4_solar_kv_format format;
     if (!solar_kv_format_from_env(&format)) return m;
@@ -24222,7 +24262,9 @@ static ds4_context_memory solar_graph_context_memory_estimate(uint32_t ctx) {
         3u * n_ff_dense + 3u * n_ff_shared +
         DS4_N_EXPERT + 2u * n_used +
         3u * n_used * n_ff_exp + n_used * n_embd;
-    const uint64_t split_chunks = (ctx + 2047u) / 2048u;
+    const uint64_t split_chunk = solar_graph_splitkv_chunk(backend);
+    const uint64_t split_chunks =
+        ((uint64_t)ctx + split_chunk - 1u) / split_chunk;
     const uint64_t split_elems =
         (uint64_t)DS4_N_HEAD * split_chunks * (DS4_N_HEAD_DIM + 2u);
     const uint64_t kda_decode_elems =
@@ -24243,7 +24285,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
 
     if (ds4_backend_uses_graph(backend)) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
-            return solar_graph_context_memory_estimate(ctx);
+            return solar_graph_context_memory_estimate(backend, ctx);
         }
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
@@ -35952,7 +35994,7 @@ static bool solar_batch_runtime_gqa_decode_layer(
                 rt->decode_positions, n_tokens, rt->max_seq,
                 rt->kv_bank_bytes[il], DS4_N_HEAD, DS4_N_HEAD_KV,
                 DS4_N_HEAD_DIM, g->layer_kv_cap[il], max_position,
-                0u, DS4_PLAIN_SPLITKV_CHUNK, g->kv_format) ||
+                0u, g->attn_split_chunk, g->kv_format) ||
         !ds4_gpu_solar_sigmoid_gate_tensor(
                 ws->heads, ws->heads, solar->batch_gate,
                 (uint64_t)n_tokens * g->q_dim)) {
@@ -36130,7 +36172,7 @@ static ds4_solar_batch_runtime *solar_batch_runtime_create(
     ds4_solar_batch_runtime *rt = xcalloc(1, sizeof(*rt));
     rt->max_seq = max_seq;
     rt->bound_bank = -1;
-    if (!solar_graph_alloc(&rt->graph, &e->model, &e->weights,
+    if (!solar_graph_alloc(&rt->graph, &e->model, &e->weights, e->backend,
                            ctx_size, prefill_cap)) {
         solar_batch_runtime_free(rt);
         return NULL;
@@ -43652,14 +43694,15 @@ static bool ds4_session_lazy_graph_enabled(void) {
  * but its exact allocation plan is the plain-residual graph's 12 GQA KV
  * rings plus 36 recurrent KDA states.  Keep this family branch adjacent to
  * allocation so lazy and eager sessions cannot drift. */
-static bool solar_graph_session_fit_check(uint32_t ctx_size,
+static bool solar_graph_session_fit_check(ds4_backend backend,
+                                          uint32_t ctx_size,
                                           uint32_t prefill_cap,
                                           bool loud) {
     const char *fe = getenv("DS4_SESSION_GRAPH_FIT");
     if (fe && fe[0] == '0' && fe[1] == '\0') return true;
 
     const ds4_context_memory plan =
-        solar_graph_context_memory_estimate(ctx_size);
+        solar_graph_context_memory_estimate(backend, ctx_size);
     if (plan.total_bytes == 0u || plan.prefill_cap != prefill_cap) {
         if (loud) {
             ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
@@ -43705,12 +43748,14 @@ static bool solar_graph_session_fit_check(uint32_t ctx_size,
 static int ds4_session_alloc_graph(ds4_session *s) {
     ds4_engine *e = s->engine;
     if (ds4_session_is_solar(s)) {
-        if (!solar_graph_session_fit_check((uint32_t)s->ctx_size,
+        if (!solar_graph_session_fit_check(e->backend,
+                                           (uint32_t)s->ctx_size,
                                            s->prefill_cap,
                                            /*loud=*/true) ||
             !solar_graph_alloc(&s->solar_graph,
                                &e->model,
                                &e->weights,
+                               e->backend,
                                (uint32_t)s->ctx_size,
                                s->prefill_cap)) {
             s->solar_graph_ready = false;
@@ -43785,7 +43830,8 @@ int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
         const uint32_t prefill_cap =
             solar_graph_prefill_cap_for_context((uint32_t)ctx_size);
-        return solar_graph_session_fit_check((uint32_t)ctx_size,
+        return solar_graph_session_fit_check(e->backend,
+                                             (uint32_t)ctx_size,
                                              prefill_cap,
                                              /*loud=*/false) ? 1 : 0;
     }
