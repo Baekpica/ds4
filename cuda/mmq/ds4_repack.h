@@ -13,12 +13,23 @@
 #include <string>
 #include <vector>
 
+struct ds4_repack_shard {
+    int fd = -1;
+    int direct_fd = -1;
+    uint64_t base = 0;          /* logical merged-model offset */
+    uint64_t size = 0;          /* bytes in this GGUF shard */
+    uint64_t direct_align = 1;
+};
+
 struct ds4_repack_file {
     int fd = -1;
     int direct_fd = -1;
     const uint8_t *data = nullptr;
     uint64_t size = 0;
     uint64_t direct_align = 1;
+    /* Empty for a single GGUF.  Split models reserve one page-aligned virtual
+     * range and retain every backing fd for shard-aware direct I/O. */
+    std::vector<ds4_repack_shard> shards;
 };
 
 struct ds4_repack_span {

@@ -12,16 +12,116 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#include <unistd.h>
 
 static int fail(const char *what) {
     std::fprintf(stderr, "test_repack_premapped: %s\n", what);
     return 1;
 }
 
+static bool write_all(std::FILE *f, const void *p, size_t n) {
+    return std::fwrite(p, 1, n, f) == n;
+}
+
+static bool write_u16(std::FILE *f, uint16_t v) {
+    return write_all(f, &v, sizeof(v));
+}
+
+static bool write_u32(std::FILE *f, uint32_t v) {
+    return write_all(f, &v, sizeof(v));
+}
+
+static bool write_u64(std::FILE *f, uint64_t v) {
+    return write_all(f, &v, sizeof(v));
+}
+
+static bool write_string(std::FILE *f, const char *s) {
+    const uint64_t n = std::strlen(s);
+    return write_u64(f, n) && write_all(f, s, (size_t)n);
+}
+
+static bool write_split_shard(const char *path, const char *name,
+                              float value, bool first) {
+    std::FILE *f = std::fopen(path, "wb");
+    if (!f) return false;
+    bool ok = write_u32(f, 0x46554747u) && write_u32(f, 3u) &&
+              write_u64(f, 1u) && write_u64(f, first ? 1u : 0u);
+    if (ok && first) {
+        ok = write_string(f, "split.count") && write_u32(f, 2u) &&
+             write_u16(f, 2u);
+    }
+    if (ok) {
+        ok = write_string(f, name) && write_u32(f, 1u) &&
+             write_u64(f, 1u) && write_u32(f, 0u) && write_u64(f, 0u);
+    }
+    long pos = ok ? std::ftell(f) : -1;
+    while (ok && pos >= 0 && (pos % 32) != 0) {
+        ok = std::fputc(0, f) != EOF;
+        pos++;
+    }
+    if (ok) ok = write_all(f, &value, sizeof(value));
+    if (std::fclose(f) != 0) ok = false;
+    return ok;
+}
+
+static int test_split_source() {
+    char dir[] = "/tmp/ds4-repack-split-XXXXXX";
+    if (!mkdtemp(dir)) return fail("mkdtemp failed");
+    char first[PATH_MAX];
+    char second[PATH_MAX];
+    if (std::snprintf(first, sizeof(first),
+                      "%s/fixture-00001-of-00002.gguf", dir) <= 0 ||
+        std::snprintf(second, sizeof(second),
+                      "%s/fixture-00002-of-00002.gguf", dir) <= 0) {
+        return fail("split fixture path failed");
+    }
+    if (!write_split_shard(first, "first.weight", 1.25f, true) ||
+        !write_split_shard(second, "second.weight", -2.5f, false)) {
+        return fail("split fixture write failed");
+    }
+
+    ds4_repack_file model;
+    if (!ds4_repack_map_file("test_repack_premapped", first, model)) {
+        return fail("split model map failed");
+    }
+    if (model.shards.size() != 2u) return fail("split shard count mismatch");
+    std::vector<ds4_repack_span> spans;
+    std::vector<ds4_repack_tensor> records;
+    if (!ds4_repack_collect_catalog(
+            "test_repack_premapped", model, &spans, &records)) {
+        return fail("split catalog failed");
+    }
+    if (records.size() != 2u || spans.size() != 2u ||
+        records[0].name != "first.weight" ||
+        records[1].name != "second.weight" ||
+        records[1].off <= records[0].off) {
+        return fail("split catalog merge mismatch");
+    }
+    alignas(4096) unsigned char stage[4096] = {};
+    const char *payload = nullptr;
+    if (!ds4_repack_read_stage(model, stage, sizeof(stage),
+                               records[1].off, records[1].bytes, &payload)) {
+        return fail("second shard staged read failed");
+    }
+    float got = 0.0f;
+    std::memcpy(&got, payload, sizeof(got));
+    if (got != -2.5f) return fail("second shard payload mismatch");
+    ds4_repack_unmap_file(model);
+    if (unlink(first) != 0 || unlink(second) != 0 || rmdir(dir) != 0) {
+        return fail("split fixture cleanup failed");
+    }
+    std::puts("split repack source: ok");
+    return 0;
+}
+
 int main() {
+    if (test_split_source() != 0) return 1;
     constexpr uint64_t kOffset = 4096;
     constexpr uint64_t kIn = 1024;
     constexpr uint64_t kOut = 2048;

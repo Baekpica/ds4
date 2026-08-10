@@ -1431,14 +1431,18 @@ static bool send_status_fd(int client_fd, const char *status, int fd_to_send) {
     return sendmsg(client_fd, &msg, 0) >= 0;
 }
 
-static void fd_broker_serve_once(fd_broker &broker, const std::vector<owned_range> &ranges) {
+static void fd_broker_serve_once(fd_broker &broker,
+                                 const std::vector<owned_range> &ranges,
+                                 long wait_usec) {
     if (broker.listen_fd < 0) return;
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(broker.listen_fd, &rfds);
     timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 0;
+    if (wait_usec < 0) wait_usec = 0;
+    tv.tv_sec = wait_usec / 1000000;
+    tv.tv_usec = wait_usec % 1000000;
     int ready = select(broker.listen_fd + 1, &rfds, nullptr, nullptr, &tv);
     if (ready <= 0 || !FD_ISSET(broker.listen_fd, &rfds)) return;
     int client = accept(broker.listen_fd, nullptr, nullptr);
@@ -1464,10 +1468,14 @@ static void fd_broker_serve_once(fd_broker &broker, const std::vector<owned_rang
              (unsigned long long)r.alloc_bytes);
     if (send_status_fd(client, status, r.exported_fd)) {
         broker.requests++;
-        fprintf(stderr, "ds4_weight_server: broker served alloc=%llu bytes=%llu requests=%llu\n",
-                alloc_id,
-                (unsigned long long)r.alloc_bytes,
-                (unsigned long long)broker.requests);
+        if (broker.requests == 1u || (broker.requests & 63u) == 0u ||
+            alloc_id + 1u == ranges.size()) {
+            fprintf(stderr,
+                    "ds4_weight_server: broker served alloc=%llu bytes=%llu requests=%llu\n",
+                    alloc_id,
+                    (unsigned long long)r.alloc_bytes,
+                    (unsigned long long)broker.requests);
+        }
     }
     close(client);
 }
@@ -1853,10 +1861,11 @@ int main(int argc, char **argv) {
             break;
         }
         if (backend == WEIGHT_BACKEND_VMM) {
-            for (int i = 0; i < 10 && !g_stop; i++) {
-                fd_broker_serve_once(broker, ranges);
-                usleep(100000);
-            }
+            /* Wait on the socket instead of polling then sleeping.  Workers
+             * import hundreds of VMM allocations sequentially; the old
+             * unconditional 100 ms sleep charged almost 45 seconds to a
+             * 454-allocation Solar worker restart. */
+            fd_broker_serve_once(broker, ranges, 100000);
         } else {
             sleep(1);
         }
