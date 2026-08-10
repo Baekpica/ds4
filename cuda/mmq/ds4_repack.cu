@@ -820,17 +820,24 @@ bool ds4_repack_q2k_candidate(const ds4_repack_tensor &t) {
 }
 
 /* Aligned-SoA Q8_0 dense candidates (--repack-q8-aligned): every 2D Q8_0
- * tensor big enough to matter whose row length satisfies the decode kernel's
- * K % 1024 constraint.  token_embd is excluded: it is consumed by row-gather,
- * never by the dense GEMV.  Unlike the IQ2 expert repack these artifacts are
- * ADDITIVE (raw stays served). */
+ * tensor big enough to matter whose row length satisfies either the decode
+ * kernel's K % 1024 contract or the tensor-core D2R kernel's wide K=128
+ * shallow-GEMM contract.  The latter is intentionally shape-gated at M>=8192
+ * so small Q8 tensors do not consume resident artifact memory.  token_embd is
+ * excluded: it is consumed by row-gather, never by a dense projection.
+ * Unlike the IQ2 expert repack these artifacts are ADDITIVE (raw stays
+ * served). */
 bool ds4_repack_q8_candidate(const ds4_repack_tensor &t) {
     if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
     if (t.dims[0] == 0 || t.dims[1] == 0) return false;
-    if (t.dims[0] % 1024u != 0) return false;
+    const bool decode_shape = t.dims[0] % 1024u == 0;
+    const bool shallow_d2r_shape = t.dims[0] == 128u && t.dims[1] >= 8192u;
+    if (!decode_shape && !shallow_d2r_shape) return false;
     /* 2 MiB floor: attn_kv (512 x 4096, 2.2 MiB) is an Inc4 pair-kernel
-     * consumer; anything smaller isn't worth an artifact. */
-    if (t.bytes < 2u * 1024u * 1024u || t.bytes % 34u != 0) return false;
+     * consumer.  K=128 D2R weights are only ~1.06 MiB each, but their wide
+     * prefill GEMM is precisely the admitted shallow shape above. */
+    if ((!shallow_d2r_shape && t.bytes < 2u * 1024u * 1024u) ||
+        t.bytes % 34u != 0) return false;
     if (t.name.find("token_embd") != std::string::npos) return false;
     return true;
 }

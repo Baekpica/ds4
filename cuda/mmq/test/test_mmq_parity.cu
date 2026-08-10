@@ -477,6 +477,84 @@ bool run_q8_0(int M, int N, int K, uint32_t seed, float abs_scale = 0.05f) {
     return ok;
 }
 
+bool run_q8_0_dense_d2r(int M, int N, int K, uint32_t seed) {
+    fprintf(stderr, "=== Q8_0/DENSE_D2R M=%d N=%d K=%d seed=%u ===\n",
+            M, N, K, seed);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    const int blocks_per_row = K / QK8_0;
+    const size_t nblocks = (size_t)M * blocks_per_row;
+    std::vector<float> W_src((size_t)M * K);
+    std::vector<cpu_block_q8_0> W_blk(nblocks);
+    std::vector<float> W_deq((size_t)M * K);
+    for (auto &v : W_src) v = nd(rng);
+    for (int row = 0; row < M; row++) {
+        quantize_row_q8_0_cpu(&W_src[(size_t)row * K],
+                              &W_blk[(size_t)row * blocks_per_row], K);
+        for (int b = 0; b < blocks_per_row; b++) {
+            const cpu_block_q8_0 &blk =
+                W_blk[(size_t)row * blocks_per_row + b];
+            const float d = fp16_to_float(blk.d);
+            for (int j = 0; j < QK8_0; j++) {
+                W_deq[(size_t)row * K + b * QK8_0 + j] = d * blk.qs[j];
+            }
+        }
+    }
+
+    const size_t dq_bytes = (nblocks * sizeof(uint16_t) + 63u) & ~63u;
+    std::vector<uint8_t> W_aligned(dq_bytes + nblocks * QK8_0, 0u);
+    for (size_t b = 0; b < nblocks; b++) {
+        std::memcpy(W_aligned.data() + b * sizeof(uint16_t),
+                    &W_blk[b].d, sizeof(uint16_t));
+        std::memcpy(W_aligned.data() + dq_bytes + b * QK8_0,
+                    W_blk[b].qs, QK8_0);
+    }
+
+    std::vector<float> X((size_t)N * K);
+    for (auto &v : X) v = nd(rng);
+    std::vector<float> ref((size_t)M * N, 0.0f);
+    ref_matmul_f32(W_deq.data(), X.data(), ref.data(), M, N, K);
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    void *dW = nullptr;
+    float *dX = nullptr;
+    float *dY = nullptr;
+    cudaMalloc(&dW, W_aligned.size());
+    cudaMalloc(&dX, X.size() * sizeof(float));
+    cudaMalloc(&dY, ref.size() * sizeof(float));
+    cudaMemcpyAsync(dW, W_aligned.data(), W_aligned.size(),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemsetAsync(dY, 0, ref.size() * sizeof(float), stream);
+
+    const int rc = ds4_mmq_q8_0_dense_d2r(dW, dX, dY, M, N, K, stream);
+    if (rc != 0) {
+        fprintf(stderr, "ds4_mmq_q8_0_dense_d2r returned %d\n", rc);
+        cudaFree(dW);
+        cudaFree(dX);
+        cudaFree(dY);
+        cudaStreamDestroy(stream);
+        return false;
+    }
+
+    std::vector<float> got(ref.size(), 0.0f);
+    cudaMemcpyAsync(got.data(), dY, got.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    cudaFree(dW);
+    cudaFree(dX);
+    cudaFree(dY);
+    cudaStreamDestroy(stream);
+
+    const float abs_tol = 0.05f * std::sqrt((float)K);
+    const bool ok = check_close(got, ref, abs_tol, 0.05f);
+    fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 bool run_q2_K(int M, int N, int K, uint32_t seed, float abs_scale = 0.05f) {
     fprintf(stderr, "=== Q2_K   M=%d N=%d K=%d  seed=%u ===\n", M, N, K, seed);
     std::mt19937 rng(seed);
@@ -1350,6 +1428,10 @@ int main(int argc, char ** argv) {
     all_ok &= run_q8_0(/*M=*/128,  /*N=*/8,   /*K=*/512,  0xDEADBEE);
     all_ok &= run_q8_0(/*M=*/64,   /*N=*/1,   /*K=*/256,  0x12345);
     all_ok &= run_q8_0(/*M=*/1024, /*N=*/16,  /*K=*/4096, 0xBAD7E11);
+    // Solar Open2 KDA f_b/g_b projection: generic aligned D2R must cover the
+    // shallow K=128 shape and the guarded final N tile.
+    all_ok &= run_q8_0_dense_d2r(
+        /*M=*/128, /*N=*/129, /*K=*/128, 0xD2A00128);
 
     // Q2_K - V4 Flash ffn_down_exps per-expert shape is (K=2048, N=4096).
     all_ok &= run_q2_K(/*M=*/64,   /*N=*/4,   /*K=*/256,  0x02C0FFEE);

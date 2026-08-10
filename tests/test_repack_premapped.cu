@@ -120,8 +120,34 @@ static int test_split_source() {
     return 0;
 }
 
+static int test_q8_candidate_shapes() {
+    ds4_repack_tensor kda;
+    kda.name = "blk.1.ssm_f_b.weight";
+    kda.type = 8u;
+    kda.ndim = 2u;
+    kda.dims[0] = 128u;
+    kda.dims[1] = 8192u;
+    kda.elements = kda.dims[0] * kda.dims[1];
+    kda.bytes = (kda.dims[0] / 32u) * kda.dims[1] * 34u;
+    if (!ds4_repack_q8_candidate(kda)) {
+        return fail("K=128 wide Q8 tensor was not an aligned candidate");
+    }
+
+    ds4_repack_tensor tiny = kda;
+    tiny.name = "tiny.weight";
+    tiny.dims[1] = 1024u;
+    tiny.elements = tiny.dims[0] * tiny.dims[1];
+    tiny.bytes = (tiny.dims[0] / 32u) * tiny.dims[1] * 34u;
+    if (ds4_repack_q8_candidate(tiny)) {
+        return fail("tiny K=128 Q8 tensor should not allocate an artifact");
+    }
+    std::puts("q8 aligned candidate shapes: ok");
+    return 0;
+}
+
 int main() {
     if (test_split_source() != 0) return 1;
+    if (test_q8_candidate_shapes() != 0) return 1;
     constexpr uint64_t kOffset = 4096;
     constexpr uint64_t kIn = 1024;
     constexpr uint64_t kOut = 2048;

@@ -19776,11 +19776,10 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
      * column-major output flattens to [n_tok, out_dim] row-major, which
      * is exactly what ds4 stores in out->ptr.  Q8_0 weight is already in
      * mmq's expected [out_dim rows, in_dim cols] row-major-of-blocks
-     * layout (the GGUF on-disk format).  mmq requires K (= in_dim) to
-     * be a multiple of QK_K = 256; V4 Flash satisfies this for every
-     * Q8_0 weight in the model, but we check anyway and fall through
-     * for any odd shapes. */
-    if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok > 0) {
+     * layout (the GGUF on-disk format).  Generic mmq requires K (= in_dim)
+     * to be a multiple of QK_K = 256.  The aligned D2R tier also covers
+     * K=128 shallow GEMMs, so enter at K % 128 and gate generic mmq below. */
+    if (ds4_cuda_use_mmq() && (in_dim % 128u == 0) && n_tok > 0) {
         /* Shape census for the dense-q8 lever (debug-only, default off). */
         static int shape_log = -1;
         if (shape_log < 0) shape_log = getenv("DS4_MMQ_DENSE_SHAPES") != NULL;
@@ -19807,7 +19806,7 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
         }
         if (dense_d2r_en && (int)n_tok >= dense_d2r_min_cols &&
             (out_dim % 128u) == 0 && out_dim >= 2048 &&
-            in_dim <= 4096 && (in_dim % 1024u) == 0 &&
+            in_dim <= 4096 && (in_dim % 128u) == 0 &&
             cuda_q8_aligned_enabled()) {
             const uint64_t q8_al_bytes = ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
             const char *w_al = q8_al_bytes != 0
@@ -19856,34 +19855,40 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
                         (unsigned long long)n_tok, (unsigned long long)in_dim);
             }
         }
-        /* p5c: same producer-q8 shortcut for the mmq tier (attn_q_a /
-         * attn_kv read the just-normed hidden). */
-        {
-            size_t nq8_bytes = 0;
-            void *nq8 = cuda_norm_q8_lookup(x->ptr, n_tok, in_dim, &nq8_bytes);
-            if (nq8) {
-                int prc = ds4_mmq_q8_0_dense_preq(
-                        wptr, nq8, nq8_bytes, (float *)out->ptr,
-                        (int)out_dim, (int)n_tok, (int)in_dim,
-                        ds4_mmq_stream_for_call());
-                if (prc == 0) {
-                    static int logged_mmq_preq = 0;
-                    if (!logged_mmq_preq) {
-                        logged_mmq_preq = 1;
-                        fprintf(stderr, "ds4: dense q8 mmq consuming producer q8 (flat-pool p5c, first label='%s' n_tok=%u)\n",
-                                label ? label : "?", (unsigned)n_tok);
+        if ((in_dim % 256u) == 0) {
+            /* p5c: same producer-q8 shortcut for the mmq tier (attn_q_a /
+             * attn_kv read the just-normed hidden). */
+            {
+                size_t nq8_bytes = 0;
+                void *nq8 = cuda_norm_q8_lookup(
+                        x->ptr, n_tok, in_dim, &nq8_bytes);
+                if (nq8) {
+                    int prc = ds4_mmq_q8_0_dense_preq(
+                            wptr, nq8, nq8_bytes, (float *)out->ptr,
+                            (int)out_dim, (int)n_tok, (int)in_dim,
+                            ds4_mmq_stream_for_call());
+                    if (prc == 0) {
+                        static int logged_mmq_preq = 0;
+                        if (!logged_mmq_preq) {
+                            logged_mmq_preq = 1;
+                            fprintf(stderr, "ds4: dense q8 mmq consuming producer q8 (flat-pool p5c, first label='%s' n_tok=%u)\n",
+                                    label ? label : "?", (unsigned)n_tok);
+                        }
+                        return 1;
                     }
-                    return 1;
                 }
             }
+            int rc = ds4_mmq_q8_0_dense(
+                    wptr, (const float *)x->ptr, (float *)out->ptr,
+                    (int)out_dim, (int)n_tok, (int)in_dim,
+                    /*stream=*/ds4_mmq_stream_for_call());
+            if (rc == 0) return 1;
+            /* On failure, fall through to the legacy paths below. */
+            fprintf(stderr, "ds4: ds4_mmq_q8_0_dense returned %d (label='%s' in=%llu out=%llu n_tok=%llu); falling back\n",
+                    rc, label ? label : "", (unsigned long long)in_dim,
+                    (unsigned long long)out_dim,
+                    (unsigned long long)n_tok);
         }
-        int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
-                                    (int)out_dim, (int)n_tok, (int)in_dim,
-                                    /*stream=*/ds4_mmq_stream_for_call());
-        if (rc == 0) return 1;
-        /* On failure, fall through to the legacy paths below. */
-        fprintf(stderr, "ds4: ds4_mmq_q8_0_dense returned %d (label='%s' in=%llu out=%llu n_tok=%llu); falling back\n",
-                rc, label ? label : "", (unsigned long long)in_dim, (unsigned long long)out_dim, (unsigned long long)n_tok);
     }
 
     const int force_native_attention_output_b =

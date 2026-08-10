@@ -716,7 +716,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
 // the D2R kernel on the kind-5 aligned artifact instead of mul_mat_q_case.
 // No out-memset / trailing sanitize: the D2R epilogue writes every element
 // through an isfinite guard.  Caller (ds4_cuda.cu) resolves W_aligned and
-// gates on shape (M%128, K%1024, K<=4096) + n_tok.
+// gates on shape (M%128, K%128, K<=4096) + n_tok.
 extern "C" int ds4_mmq_q8_0_dense_d2r(
         const void * W_aligned, const float * X_f32, float * out_f32,
         int M, int N, int K, cudaStream_t stream) {
@@ -725,7 +725,7 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
-    if (M <= 0 || (M % 128) != 0 || N <= 0 || K <= 0 || (K % 1024) != 0) {
+    if (M <= 0 || (M % 128) != 0 || N <= 0 || K <= 0 || (K % 128) != 0) {
         fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
         return -1;
     }
@@ -3983,7 +3983,7 @@ __global__ void q8_0_aligned_dense_vec_nc_kernel(
 }
 
 extern "C" uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K) {
-    if (M <= 0 || K <= 0 || K % 1024 != 0) return 0;
+    if (M <= 0 || K <= 0 || K % 128 != 0) return 0;
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
     const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;
     return dq_bytes + nblk * 32u;
