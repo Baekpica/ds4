@@ -1,8 +1,9 @@
 # Solar Open2 DGX Spark optimization handoff
 
-Status: **optimization paused at the operator's request on 2026-08-10 KST**.
-The model process has exited. Do not start another large-model run until the
-operator explicitly resumes this work.
+Status: **resumed and advanced on 2026-08-10 KST; no model process running at
+capture.** The chunked-KDA prefill landed as the default production path,
+removed KDA from the top of the kernel profile, and moved the first-order
+bottleneck to IQ2_XXS `mul_mat_q` as the previous capture predicted.
 
 ## Goal
 
@@ -91,6 +92,9 @@ profiling gate:
 | `a3b2f19` | use native FP4 conversion in compressed attention |
 | `f30ecb9` | overlap exact-order KDA state updates |
 | `c36e3f2` | add the one-engine full-model KV format harness |
+| `0b58219` | chunk KDA prefill through the delta-rule UT transform |
+| `def87d4` | cover chunked KDA prefill at production width |
+| `7eb5bec` | compare KV formats on the release KDA path |
 
 ## Established correctness and capacity
 
@@ -155,6 +159,57 @@ Profile:
 
 SHA-256:
 `e84769265877e92d3c92aad5e5947177b3757e4b0dc1589be6e88bc462d2096b`
+
+## Chunked KDA prefill (landed 2026-08-10)
+
+Multi-token production-shape prefill now runs the recurrence 64 tokens per
+chunk through the delta-rule UT transform (`0b58219`); decode stays on the
+recurrent kernel and `DS4_SOLAR_KDA_STATE_PARTS` still pins the sequence
+variants for isolation. Every pairwise decay exponent is factored around its
+16-row sub-block start so the -5 gate clamp at chunk depth (B down to -320)
+stays inside f32 range. Five launches per prefill call: prep (bit-identical
+conv/SiLU/L2/gate math into head-major planes), conv tail, chunk-parallel
+factorization (Mq, the triangular inverse, U_loc = T beta V, W = T beta K~),
+a persistent per-head scan whose 128x64 state slice lives in registers, and
+the chunk-parallel intra output.
+
+On the 8,192-token production shape:
+
+| KDA path | wall time | Versus generic | Numerical result |
+|---|---:|---:|---|
+| generic `<1,false>` | 744.6 ms | 1.000x | reference |
+| exact two-part `<2,true>` | 504.7 ms | 1.475x | bitwise identical |
+| chunked (default) | 111.2 ms | **6.69x** | out max_abs 5.5e-10 vs generic |
+
+Against the official FLA fixture the chunked path scores abs 5.290650e-04 —
+the generic path's own 5.290651e-04, i.e. the fixture reference's precision,
+not the reorder, dominates. Conv states stay bit-exact. Memcheck and
+racecheck: zero errors, zero warnings. Coverage lives in
+`tests/test_solar_kda_chunk` (scalar mirror at head_dim 128, ragged and
+split-launch continuation) plus a chunked leg in the FLA fixture test.
+
+Tuning ground truth this work established for GB10 (`sm_121`, 48 SMs, 24 MiB
+L2, 100 KiB shared/SM):
+
+- Sustained SM clock under compute load is ~942 MHz (idle 208, max 3003);
+  budget cycles at ~1 GHz.
+- Nsight Compute is blocked (`RmProfilingAdminOnly: 1`, no passwordless
+  sudo); localize cost with template-mode ablations of the real kernel
+  (`scratch/solar-open2-spark/bench-gb10-kda-micro.cu`) plus nsys.
+- A per-iteration walk over rows 512 B apart in UMA memory exposes a full
+  memory latency per step and can dominate a kernel 3x; bulk-stage such rows
+  through shared and keep per-(chunk, head) data in contiguous 32 KiB spans.
+- The two-blocks-per-SM boundary sits at ~50,176 B dynamic shared per
+  256-thread block; crossing it can cost more than a staged tile saves.
+- cuBLAS on the scan shapes: 128 sequential steps of 3 batched
+  [64x128]@[128x128] GEMMs take 17.25 ms (launch-latency-bound); the same
+  math as one parallel batched GEMM takes 0.086 ms (~20 TFLOPS f32).
+
+Remaining KDA headroom (~3x of the 111 ms, not yet worth blocking on): the
+factor kernel (48 ms) and scan (37 ms) still issue one scalar LDS per
+element; the documented next step is a register-tiled GEMM rewrite (state in
+shared, 4x4 micro-tiles, float4 segments) and, in the factor kernel, the
+same treatment for the sub-block dots.
 
 ## Compressed GQA KV optimization result
 
@@ -223,25 +278,66 @@ FP8 nsys profile:
 SHA-256:
 `73ac060dd77bd1ae7d9f493f9e1fc80894dfe0a9879af0911456944c8314e4ae`
 
+## Full-model run with chunked KDA (2026-08-10)
+
+The same one-engine four-format comparison, rerun with the chunked KDA
+default (`7eb5bec` removed the harness pin that had held KDA on the generic
+path — an intermediate rerun with that pin still in place reproduced the
+pre-pause numbers, so the surrounding code carries no regression; that log
+is preserved as `solar-kv-full2k-generic-rerun.log`). All four formats still
+select prefill token 11047 and decode token 27294, and the run passed with
+no non-finite logit.
+
+| KV | Prefill | Prefill rate | Prefill vs generic rerun | Decode |
+|---|---:|---:|---:|---:|
+| BF16 | 10.989448 s | 186.361 tok/s | 13.786961 s | 142.015 ms |
+| FP8 | 7.594036 s | **269.685 tok/s** | 12.925570 s | 112.200 ms |
+| hybrid | 7.998880 s | 256.036 tok/s | 12.615811 s | 112.189 ms |
+| FP4 | 9.003993 s | 227.455 tok/s | 13.737557 s | 111.312 ms |
+
+FP8 prefill drops 12.93 s to 7.59 s (1.70x, +70% throughput); the ~5.3 s
+saved matches the microbenchmark's prediction for the KDA share. Decode is
+unchanged, as designed — the recurrent decode kernel was not touched. BF16
+improves least because the first leg still carries the one-time warmup.
+
+Log:
+
+`/home/sunghoon/workspace/ds4-exaone/scratch/solar-open2-spark/solar-kv-full2k-kdachunk.log`
+
+SHA-256:
+`abecc853ee91aa1c840be16af4031d357c537b550f8700397a208117ac0beb6c`
+
+FP8 nsys profile:
+
+`/home/sunghoon/workspace/ds4-exaone/scratch/solar-open2-spark/nsys-solar-kv-full2k-fp8-hmma-kdachunk-sm121.nsys-rep`
+
+SHA-256:
+`88828e7a1c729449655ef07614521d23b67e809bdac1f4b87be76fa1fdfdf37f`
+
 ## Current bottleneck from the final nsys capture
 
-The HMMA change removed compressed attention as a first-order prefill
-bottleneck. The previous scalar full-model capture spent about 3.246 seconds
-(19.6% of GPU time) in compressed GQA prefill. The final FP8 HMMA capture
-spent 92.532 ms (0.7%) in `exaone_fattn_hmma_kernel`.
+The chunked prefill removed KDA from the top of the profile. In the
+2026-08-10 FP8 full-model capture (7.697 s of GPU time, chunked KDA
+default), the KDA family costs 1.287 s (16.7%) against the generic path's
+7.245 s (55.8%) in the previous capture — a 5.63x full-model reduction:
 
 | Rank | Kernel family | GPU time | Share |
 |---:|---|---:|---:|
-| 1 | generic Solar KDA recurrence | 7.244934 s | **55.8%** |
-| 2 | IQ2_XXS `mul_mat_q` | 2.857154 s | **22.0%** |
-| 3 | Q8_0 `mul_mat_q` | 0.982395 s | 7.6% |
-| 4 | Q3_K routed worklist MMQ | 0.618961 s | 4.8% |
-| 5 | Q4_K routed worklist MMQ | 0.271613 s | 2.1% |
-| - | compressed GQA HMMA prefill | 0.092532 s | 0.7% |
+| 1 | IQ2_XXS `mul_mat_q` | 3.261140 s | **42.4%** |
+| 2 | Q8_0 `mul_mat_q` | 1.078688 s | **14.0%** |
+| 3 | Q3_K routed worklist MMQ | 0.692650 s | 9.0% |
+| 4 | KDA chunk factor | 0.576321 s | 7.5% |
+| 5 | KDA chunk scan | 0.442324 s | 5.7% |
+| 6 | Q4_K routed worklist MMQ | 0.312230 s | 4.1% |
+| 7 | `quantize_mmq_q8_1` | 0.164003 s | 2.1% |
+| 8 | KDA chunk intra | 0.161572 s | 2.1% |
+| - | KDA chunk prep | 0.106621 s | 1.4% |
+| - | compressed GQA HMMA prefill | 0.090710 s | 1.2% |
 
-The next optimization order is therefore KDA first, IQ2_XXS tensor-core
-matmul second. Do not spend the next session retuning compressed attention
-without a new profile showing it has regressed.
+The next optimization order is therefore IQ2_XXS `mul_mat_q` first (the
+routed-expert weight format, 42.4%), Q8_0 second, then either the Q3_K
+worklist or the documented KDA register-tiling rewrite. Do not retune
+compressed attention without a new profile showing it has regressed.
 
 ## Experiments intentionally rejected
 
@@ -255,6 +351,12 @@ These were measured, reverted, and never committed:
 - A warp-normalization KDA rewrite preserved output but improved the 8K
   generic path by only 0.15% and the two-part path by 0.69%, below the bar for
   added complexity.
+- Token-major chunked-KDA workspace planes ([token][head*dim]) ran the whole
+  chunked path 1.4x slower than head-major: every per-chunk row sat 32 KiB
+  from the next and fell out of L1.
+- Staging the factor kernel's V rows through shared cost more than it saved:
+  the extra 1 KiB pushed the block across the two-blocks-per-SM boundary
+  (48 ms to 60 ms). Reverted to streaming V from global.
 
 Do not recreate these experiments unless a later kernel changes the premise.
 
@@ -306,10 +408,12 @@ Keep correctness before capacity and capacity before performance.
 
 1. Confirm no `ds4`, `ds4-server`, or full-model test process is alive. Ask the
    operator for `clear_cache` if a new cold load needs recovered UMA.
-2. Rebuild `sm_121a` from the pinned branch and rerun the KDA unit/FLA suite.
-3. Run production KDA lifecycle gates at 32K and 64K with
-   `DS4_SOLAR_KDA_STATE_PARTS=2-exact`. Compare snapshots, replay, fork,
-   cancellation, resync, continuation, and final state against generic.
+2. Rebuild `sm_121a` from the pinned branch and rerun the KDA unit/FLA suite,
+   now including `tests/test_solar_kda_chunk`.
+3. Run production KDA lifecycle gates at 32K and 64K on the release path
+   (chunked prefill + recurrent decode). Compare snapshots, replay, fork,
+   cancellation, resync, continuation, and final state against the sequence
+   path pinned with `DS4_SOLAR_KDA_STATE_PARTS=1`.
 4. Run multiple full-model prompts through BF16/FP8/hybrid/FP4. Require finite
    logits, greedy identity where margins are not ties, retrieval correctness,
    and post-prefill continuation. The single 2K top-1 match is only a smoke
@@ -327,7 +431,8 @@ Keep correctness before capacity and capacity before performance.
    `0.0.0.0:8001` and validate `/v1/models`, streaming and non-streaming chat,
    long prompts, reuse, cancellation, and malformed requests.
 9. Capture nsys at every frontier where the top kernel changes materially.
-   The current reference order is KDA, IQ2_XXS, Q8_0, Q3_K, Q4_K.
+   The current reference order is IQ2_XXS, Q8_0, Q3_K, then either the Q4_K
+   worklist or the KDA register-tiling rewrite.
 
 ## Useful commands
 
@@ -338,14 +443,22 @@ cd /home/sunghoon/workspace/ds4-exaone/ds4-solar-open2
 make -j2 CUDA_ARCH=sm_121 \
   tests/test_solar_kda \
   tests/test_solar_kda_prefill \
+  tests/test_solar_kda_chunk \
   tests/test_solar_kda_fla \
   tests/test_solar_kv_formats
 
 ./tests/test_solar_kda
 ./tests/test_solar_kda_prefill
+./tests/test_solar_kda_chunk
 ./tests/test_solar_kda_fla \
   /home/sunghoon/workspace/ds4-exaone/solar-open2-spark-handoff/fixtures/kda/synthetic-fla.bin
 ```
+
+The KDA A/B microbenchmark (generic vs parts vs chunked, 8K production
+shape) lives at
+`/home/sunghoon/workspace/ds4-exaone/scratch/solar-open2-spark/bench-solar-kda-ab.cu`;
+the ablation probe used to localize kernel cost without Nsight Compute is
+`bench-gb10-kda-micro.cu` beside it.
 
 Full-model KV comparison without nsys:
 
@@ -385,6 +498,9 @@ current statement is:
 
 > The fixed 88.97 GiB Solar Open2 mixed-quant GGUF loads as a native
 > `sm_121a` CUDA-KDA family with resident weights on one GB10. Short-context
-> CUDA correctness, 8K KDA lifecycle behavior, exact-order KDA acceleration,
-> and a 2K four-format KV comparison pass. Exact-1M resident admission,
-> long-context semantics, and API serving remain unverified.
+> CUDA correctness, 8K KDA lifecycle behavior, and a 2K four-format KV
+> comparison pass. The chunked-KDA prefill is the default production path,
+> validated against the official FLA fixture at the generic path's error and
+> raising 2K FP8 prefill from 159 to 270 tok/s. Exact-1M resident admission,
+> long-context semantics, the 32K/64K lifecycle gates on the chunked path,
+> and API serving remain unverified.
