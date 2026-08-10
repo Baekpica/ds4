@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_fp4.h>
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
@@ -31959,8 +31960,9 @@ __device__ static uint8_t solar_e2m1_encode_dev(float x) {
 }
 
 __device__ static float solar_e2m1_decode_dev(uint8_t code) {
-    const float v = dsv4_e2m1fn_value_dev((int)(code & 0x7u));
-    return (code & 0x8u) ? -v : v;
+    __nv_fp4_e2m1 value;
+    value.__x = code & 0x0fu;
+    return (float)value;
 }
 
 __device__ static float solar_scale_to_f16_dev(float amax, float qmax,
