@@ -15324,6 +15324,7 @@ typedef struct {
     ds4_gpu_tensor *batch_gate;
     ds4_gpu_tensor *batch_low_rank;
     ds4_gpu_tensor *batch_beta;
+    ds4_gpu_tensor *kda_chunk_scratch;
 
     ds4_gpu_tensor *state_pool;
     ds4_gpu_tensor *control_pool;
@@ -15602,6 +15603,7 @@ static void solar_graph_free(ds4_solar_gpu_graph *g) {
         &g->kda_k, &g->kda_v, &g->gate, &g->low_rank, &g->beta,
         &g->batch_kda_k, &g->batch_kda_v, &g->batch_gate,
         &g->batch_low_rank, &g->batch_beta,
+        &g->kda_chunk_scratch,
         &g->state_pool, &g->control_pool,
     };
     for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) {
@@ -15693,6 +15695,21 @@ static bool solar_graph_alloc(ds4_solar_gpu_graph *g,
     SOLAR_ALLOC(batch_low_rank, P * low_dim);
     SOLAR_ALLOC(batch_beta,     P * beta_dim);
 #undef SOLAR_ALLOC
+    {
+        const uint64_t bytes = ds4_gpu_solar_kda_prefill_scratch_bytes(
+                (uint32_t)P, DS4_N_HEAD, DS4_N_KDA_HEAD_DIM);
+        if (bytes) {
+            g->kda_chunk_scratch = ds4_gpu_tensor_alloc(bytes);
+            if (!g->kda_chunk_scratch) {
+                fprintf(stderr,
+                        "ds4: Solar graph: KDA chunk workspace allocation "
+                        "failed (%.1f MiB)\n", (double)bytes / 1048576.0);
+                solar_graph_free(g);
+                return false;
+            }
+            scratch += bytes;
+        }
+    }
     g->scratch_bytes = scratch;
 
     const uint64_t recurrent_bytes =
@@ -16101,7 +16118,8 @@ static bool solar_graph_kda_layer(ds4_solar_gpu_graph *solar,
 
     const int kda_ok = batch
         ? ds4_gpu_solar_kda_prefill_tensor(
-              heads, solar->recurrent[il], solar->q_conv_state[il],
+              heads, solar->kda_chunk_scratch,
+              solar->recurrent[il], solar->q_conv_state[il],
               solar->k_conv_state[il], solar->v_conv_state[il],
               q, k, v, gate, beta,
               solar->q_conv_weight[il], solar->k_conv_weight[il],
@@ -24150,7 +24168,9 @@ static ds4_context_memory solar_graph_context_memory_estimate(uint32_t ctx) {
     m.scratch_bytes =
         (decode_elems + (uint64_t)P * prefill_elems + split_elems +
          kda_decode_elems + (uint64_t)P * kda_decode_elems) * sizeof(float) +
-        (uint64_t)P * sizeof(int32_t);
+        (uint64_t)P * sizeof(int32_t) +
+        ds4_gpu_solar_kda_prefill_scratch_bytes(
+            P, DS4_N_HEAD, DS4_N_KDA_HEAD_DIM);
     m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
     return m;
 }

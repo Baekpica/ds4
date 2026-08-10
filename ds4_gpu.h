@@ -2489,10 +2489,42 @@ int ds4_gpu_solar_kda_decode_banks_tensor(
         uint32_t                conv_kernel,
         float                   gate_lower_bound);
 
-/* Token-major KDA continuation. The generic kernel preserves exact sequence
- * order inside each head block and carries state across arbitrary chunks. */
+/* Bytes needed by the production-width chunked prefill path.  Zero means the
+ * shape or a sub-64-token short append uses the generic sequence path.  The
+ * caller owns this workspace, so independent graphs/sessions never share
+ * mutable CUDA scratch. */
+static inline uint64_t ds4_gpu_solar_kda_prefill_scratch_bytes(
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    enum { chunk = 64u, dim = 128u };
+    if (n_tokens < chunk || n_head == 0u || head_dim != dim) return 0u;
+    const uint64_t vector_count = (uint64_t)n_head * dim;
+    if (vector_count > UINT64_MAX / n_tokens / sizeof(float)) return 0u;
+    const uint64_t plane_raw =
+        (uint64_t)n_tokens * vector_count * sizeof(float);
+    if (plane_raw > UINT64_MAX - 255u) return 0u;
+    const uint64_t plane = (plane_raw + 255u) & ~UINT64_C(255);
+    const uint64_t n_chunks = ((uint64_t)n_tokens - 1u) / chunk + 1u;
+    const uint64_t mq_per =
+        (uint64_t)chunk * chunk * sizeof(float);
+    if (n_chunks > UINT64_MAX / n_head ||
+        n_chunks * n_head > UINT64_MAX / mq_per) {
+        return 0u;
+    }
+    const uint64_t mq_raw = n_chunks * n_head * mq_per;
+    if (mq_raw > UINT64_MAX - 255u) return 0u;
+    const uint64_t mq = (mq_raw + 255u) & ~UINT64_C(255);
+    return plane <= (UINT64_MAX - mq) / 6u ? 6u * plane + mq : 0u;
+}
+
+/* Token-major KDA continuation.  At Solar's 128-wide production shape,
+ * scratch selects the 64-token delta-rule transform; a NULL scratch retains
+ * the exact-order sequence fallback.  Both paths carry recurrent and
+ * convolution state across arbitrary caller chunks. */
 int ds4_gpu_solar_kda_prefill_tensor(
         ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *scratch,
         ds4_gpu_tensor       *recurrent_state,
         ds4_gpu_tensor       *q_conv_state,
         ds4_gpu_tensor       *k_conv_state,

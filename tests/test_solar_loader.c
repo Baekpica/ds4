@@ -89,7 +89,8 @@ int main(int argc, char **argv) {
     /* The serving admission estimate must price the actual Solar runtime,
      * not DeepSeek's compressed-attention rings.  These constants are the
      * independent 262144-context calculation for hybrid K-FP8/V-FP4 KV and
-     * a 2048-row prefill workspace. */
+     * a 2048-row prefill workspace, including the caller-owned KDA chunk
+     * transform planes and pairwise matrix. */
     if (setenv("DS4_SOLAR_KV_FORMAT", "hybrid", 1) != 0 ||
         setenv("DS4_METAL_PREFILL_CHUNK", "2048", 1) != 0) {
         perror("setenv");
@@ -98,12 +99,15 @@ int main(int argc, char **argv) {
     }
     const ds4_context_memory memory =
         ds4_context_memory_estimate(DS4_BACKEND_CUDA, 262144);
+    const uint64_t kda_chunk_scratch =
+        ds4_gpu_solar_kda_prefill_scratch_bytes(2048u, 64u, 128u);
     if (memory.prefill_cap != 2048u ||
         memory.raw_cap != 262144u ||
         memory.raw_bytes != UINT64_C(4932501504) ||
         memory.compressed_bytes != UINT64_C(180513792) ||
-        memory.scratch_bytes != UINT64_C(1333331008) ||
-        memory.total_bytes != UINT64_C(6446346304)) {
+        kda_chunk_scratch != UINT64_C(436207616) ||
+        memory.scratch_bytes != UINT64_C(1769538624) ||
+        memory.total_bytes != UINT64_C(6882553920)) {
         fprintf(stderr,
                 "Solar 262144-context memory plan regressed: "
                 "prefill=%u raw_cap=%u raw=%" PRIu64
@@ -121,9 +125,9 @@ int main(int argc, char **argv) {
         uint64_t raw_bytes;
         uint64_t total_bytes;
     } formats[] = {
-        {"bf16", UINT64_C(12884901888), UINT64_C(14398746688)},
-        {"fp8",  UINT64_C(6543114240),  UINT64_C(8056959040)},
-        {"fp4",  UINT64_C(3321888768),  UINT64_C(4835733568)},
+        {"bf16", UINT64_C(12884901888), UINT64_C(14834954304)},
+        {"fp8",  UINT64_C(6543114240),  UINT64_C(8493166656)},
+        {"fp4",  UINT64_C(3321888768),  UINT64_C(5271941184)},
     };
     for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
         if (setenv("DS4_SOLAR_KV_FORMAT", formats[i].name, 1) != 0) {

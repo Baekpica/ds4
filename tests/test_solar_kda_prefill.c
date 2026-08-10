@@ -209,7 +209,7 @@ int main(void) {
             CHECK(ds4_gpu_tensor_write(dg, 0, g + (size_t)done * T_VECTOR, vb), "write g chunk");
             CHECK(ds4_gpu_tensor_write(db, 0, beta + (size_t)done * T_HEAD, bb), "write beta chunk");
             CHECK(ds4_gpu_solar_kda_prefill_tensor(
-                      dout, dstate, dqc, dkc, dvc, dq, dk, dv, dg, db,
+                      dout, NULL, dstate, dqc, dkc, dvc, dq, dk, dv, dg, db,
                       dqw, dkw, dvw, dda, ddt, n, T_HEAD, T_DIM, T_CONV, -5.0f),
                   "prefill launch");
             CHECK(ds4_gpu_tensor_read(dout, 0, got + (size_t)done * T_VECTOR, vb),
