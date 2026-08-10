@@ -86,9 +86,82 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* The serving admission estimate must price the actual Solar runtime,
+     * not DeepSeek's compressed-attention rings.  These constants are the
+     * independent 262144-context calculation for hybrid K-FP8/V-FP4 KV and
+     * a 2048-row prefill workspace. */
+    if (setenv("DS4_SOLAR_KV_FORMAT", "hybrid", 1) != 0 ||
+        setenv("DS4_METAL_PREFILL_CHUNK", "2048", 1) != 0) {
+        perror("setenv");
+        model_close(&model);
+        return 1;
+    }
+    const ds4_context_memory memory =
+        ds4_context_memory_estimate(DS4_BACKEND_CUDA, 262144);
+    if (memory.prefill_cap != 2048u ||
+        memory.raw_cap != 262144u ||
+        memory.raw_bytes != UINT64_C(4932501504) ||
+        memory.compressed_bytes != UINT64_C(180513792) ||
+        memory.scratch_bytes != UINT64_C(1333331008) ||
+        memory.total_bytes != UINT64_C(6446346304)) {
+        fprintf(stderr,
+                "Solar 262144-context memory plan regressed: "
+                "prefill=%u raw_cap=%u raw=%" PRIu64
+                " state=%" PRIu64 " scratch=%" PRIu64
+                " total=%" PRIu64 "\n",
+                memory.prefill_cap, memory.raw_cap, memory.raw_bytes,
+                memory.compressed_bytes, memory.scratch_bytes,
+                memory.total_bytes);
+        model_close(&model);
+        return 1;
+    }
+
+    static const struct {
+        const char *name;
+        uint64_t raw_bytes;
+        uint64_t total_bytes;
+    } formats[] = {
+        {"bf16", UINT64_C(12884901888), UINT64_C(14398746688)},
+        {"fp8",  UINT64_C(6543114240),  UINT64_C(8056959040)},
+        {"fp4",  UINT64_C(3321888768),  UINT64_C(4835733568)},
+    };
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        if (setenv("DS4_SOLAR_KV_FORMAT", formats[i].name, 1) != 0) {
+            perror("setenv");
+            model_close(&model);
+            return 1;
+        }
+        const ds4_context_memory variant =
+            ds4_context_memory_estimate(DS4_BACKEND_CUDA, 262144);
+        if (variant.raw_bytes != formats[i].raw_bytes ||
+            variant.compressed_bytes != memory.compressed_bytes ||
+            variant.scratch_bytes != memory.scratch_bytes ||
+            variant.total_bytes != formats[i].total_bytes) {
+            fprintf(stderr, "Solar %s KV memory plan regressed\n",
+                    formats[i].name);
+            model_close(&model);
+            return 1;
+        }
+    }
+    if (unsetenv("DS4_SOLAR_KV_FORMAT") != 0) {
+        perror("unsetenv");
+        model_close(&model);
+        return 1;
+    }
+    const ds4_context_memory defaults =
+        ds4_context_memory_estimate(DS4_BACKEND_CUDA, 262144);
+    if (defaults.raw_bytes != memory.raw_bytes ||
+        defaults.total_bytes != memory.total_bytes) {
+        fprintf(stderr, "Solar default KV format is not hybrid\n");
+        model_close(&model);
+        return 1;
+    }
+
     printf("Solar metadata and tensor layout: valid "
-           "(%u shards, 48 layers, 12 GQA, 36 KDA, NoPE)\n",
-           model.split_count);
+           "(%u shards, 48 layers, 12 GQA, 36 KDA, NoPE, "
+           "262144 ctx %.2f GiB)\n",
+           model.split_count,
+           (double)memory.total_bytes / 1073741824.0);
     model_close(&model);
     return 0;
 }

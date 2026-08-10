@@ -42,6 +42,18 @@
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
+
+/* Keep the runtime-KV selection available to CPU-only placement/accounting
+ * builds too.  ds4_gpu.h owns the same ABI enum in accelerator builds. */
+#ifndef DS4_SOLAR_KV_FORMAT_DEFINED
+#define DS4_SOLAR_KV_FORMAT_DEFINED
+typedef enum {
+    DS4_SOLAR_KV_BF16       = 0,
+    DS4_SOLAR_KV_FP8        = 1,
+    DS4_SOLAR_KV_FP4        = 2,
+    DS4_SOLAR_KV_KFP8_VFP4 = 3,
+} ds4_solar_kv_format;
+#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -689,6 +701,58 @@ static bool ds4_solar_layer_is_gqa(uint32_t il) {
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_SOLAR_OPEN2) return false;
     if (il >= DS4_N_LAYER) ds4_die("Solar layer index is outside the loaded model layout");
     return (il % 4u) == 0u;
+}
+
+static uint64_t solar_kv_row_bytes(ds4_solar_kv_format format,
+                                   uint32_t n_head_kv,
+                                   uint32_t head_dim) {
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    if (n_head_kv == 0u || head_dim == 0u) return 0u;
+    switch (format) {
+    case DS4_SOLAR_KV_BF16:
+        return kv_dim * 2u * sizeof(uint16_t);
+    case DS4_SOLAR_KV_FP8:
+        return kv_dim * 2u +
+               (uint64_t)n_head_kv * 2u * sizeof(uint16_t);
+    case DS4_SOLAR_KV_FP4:
+        return (head_dim & 1u) == 0u
+            ? kv_dim + (uint64_t)n_head_kv * 2u * sizeof(uint16_t) : 0u;
+    case DS4_SOLAR_KV_KFP8_VFP4:
+        return (head_dim & 1u) == 0u
+            ? kv_dim + kv_dim / 2u +
+              (uint64_t)n_head_kv * 2u * sizeof(uint16_t) : 0u;
+    }
+    return 0u;
+}
+
+static bool solar_kv_format_from_env(ds4_solar_kv_format *out) {
+    if (!out) return false;
+    const char *value = getenv("DS4_SOLAR_KV_FORMAT");
+    /* The validated long-context serving configuration keeps K at FP8 and
+     * compresses V to FP4; explicit env values retain every comparison mode. */
+    if (!value || !value[0] || !strcmp(value, "hybrid") ||
+        !strcmp(value, "kfp8-vfp4") || !strcmp(value, "k-fp8/v-fp4")) {
+        *out = DS4_SOLAR_KV_KFP8_VFP4;
+        return true;
+    }
+    if (!strcmp(value, "bf16") || !strcmp(value, "raw") ||
+        !strcmp(value, "f16")) {
+        *out = DS4_SOLAR_KV_BF16;
+        return true;
+    }
+    if (!strcmp(value, "fp8") || !strcmp(value, "e4m3")) {
+        *out = DS4_SOLAR_KV_FP8;
+        return true;
+    }
+    if (!strcmp(value, "fp4") || !strcmp(value, "e2m1")) {
+        *out = DS4_SOLAR_KV_FP4;
+        return true;
+    }
+    fprintf(stderr,
+            "ds4: invalid DS4_SOLAR_KV_FORMAT=%s "
+            "(expected bf16, fp8, fp4, or hybrid)\n",
+            value);
+    return false;
 }
 
 static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
@@ -22992,11 +23056,98 @@ static uint32_t metal_graph_resume_prefill_min_tokens(void) {
     return 4u;
 }
 
+static uint32_t solar_graph_prefill_cap_for_context(uint32_t ctx) {
+    uint32_t cap = ctx < 2048u ? ctx : 2048u;
+    const char *env = getenv("DS4_METAL_PREFILL_CHUNK");
+    if (env && env[0]) {
+        char *endp = NULL;
+        const long value = strtol(env, &endp, 10);
+        if (endp != env) {
+            cap = value <= 0 ? ctx : (uint32_t)value;
+            if (cap > ctx) cap = ctx;
+        }
+    }
+    return cap ? cap : 1u;
+}
+
+/* Exact single-session projection for the plain-residual model-family graph.
+ * Solar owns full-context KV only on its 12 GQA layers; the other 36 layers
+ * own recurrent KDA state and immutable f32 controls.  Scratch mirrors the
+ * decode tensors, one P-row prefill workspace, KDA extras, and split-KV
+ * partial reductions that the runtime allocator consumes. */
+static ds4_context_memory solar_graph_context_memory_estimate(uint32_t ctx) {
+    ds4_context_memory m = {0};
+    ds4_solar_kv_format format;
+    if (!solar_kv_format_from_env(&format)) return m;
+
+    const uint32_t P = solar_graph_prefill_cap_for_context(ctx);
+    const uint64_t n_embd = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t kda_dim =
+        (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint64_t n_used = DS4_N_EXPERT_USED;
+    const uint64_t n_ff_exp = DS4_N_FF_EXP;
+    const uint64_t n_ff_shared = DS4_N_FF_SHEXP;
+    const uint64_t n_ff_dense = DS4_N_FF_DENSE;
+    const uint64_t row_bytes =
+        solar_kv_row_bytes(format, DS4_N_HEAD_KV, DS4_N_HEAD_DIM);
+    uint32_t n_gqa = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_solar_layer_is_gqa(il)) n_gqa++;
+    }
+    const uint32_t n_kda = DS4_N_LAYER - n_gqa;
+    if (row_bytes == 0u || n_gqa == 0u || n_kda == 0u) return m;
+
+    m.prefill_cap = P;
+    m.raw_cap = ctx;
+    m.raw_bytes = (uint64_t)n_gqa * ctx * row_bytes;
+
+    const uint64_t recurrent_bytes =
+        (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM *
+        DS4_N_KDA_HEAD_DIM * sizeof(float);
+    const uint64_t conv_bytes =
+        kda_dim * DS4_N_SSM_CONV * sizeof(float);
+    const uint64_t state_per_layer = recurrent_bytes + 3u * conv_bytes;
+    const uint64_t control_per_layer =
+        3u * conv_bytes +
+        (uint64_t)DS4_N_HEAD * sizeof(float) +
+        kda_dim * sizeof(float) +
+        (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float);
+    m.compressed_bytes =
+        (uint64_t)n_kda * (state_per_layer + control_per_layer);
+
+    const uint64_t decode_elems =
+        5u * n_embd + 2u * q_dim + 2u * kv_dim +
+        3u * n_ff_dense + 3u * n_ff_shared +
+        DS4_N_EXPERT + 2u * n_used +
+        3u * n_used * n_ff_exp + n_used * n_embd + DS4_N_VOCAB;
+    const uint64_t prefill_elems =
+        5u * n_embd + 2u * q_dim + 2u * kv_dim +
+        3u * n_ff_dense + 3u * n_ff_shared +
+        DS4_N_EXPERT + 2u * n_used +
+        3u * n_used * n_ff_exp + n_used * n_embd;
+    const uint64_t split_chunks = (ctx + 2047u) / 2048u;
+    const uint64_t split_elems =
+        (uint64_t)DS4_N_HEAD * split_chunks * (DS4_N_HEAD_DIM + 2u);
+    const uint64_t kda_decode_elems =
+        3u * kda_dim + DS4_N_KDA_HEAD_DIM + DS4_N_HEAD;
+    m.scratch_bytes =
+        (decode_elems + (uint64_t)P * prefill_elems + split_elems +
+         kda_decode_elems + (uint64_t)P * kda_decode_elems) * sizeof(float) +
+        (uint64_t)P * sizeof(int32_t);
+    m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+    return m;
+}
+
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
     if (ds4_backend_uses_graph(backend)) {
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+            return solar_graph_context_memory_estimate(ctx);
+        }
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
 
