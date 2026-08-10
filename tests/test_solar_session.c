@@ -9,6 +9,9 @@
  */
 #include "../ds4.h"
 
+#include <cuda_profiler_api.h>
+#include <cuda_runtime_api.h>
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,9 +81,33 @@ int main(int argc, char **argv) {
 
     ds4_session *session = NULL;
     char err[256] = "";
-    if (ds4_session_create(&session, engine, opt.context_size) != 0 ||
-        ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+    const char *capture_env = getenv("DS4_TEST_CUDA_PROFILER_CAPTURE");
+    const int capture_requested =
+        capture_env && capture_env[0] != '\0' && strcmp(capture_env, "0") != 0;
+    int capture_active = 0;
+
+    if (ds4_session_create(&session, engine, opt.context_size) != 0) {
+        fprintf(stderr, "Solar session creation failed\n");
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    if (capture_requested) {
+        const cudaError_t capture_rc = cudaProfilerStart();
+        if (capture_rc != cudaSuccess) {
+            fprintf(stderr, "cudaProfilerStart failed: %s\n",
+                    cudaGetErrorString(capture_rc));
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        capture_active = 1;
+    }
+    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
         fprintf(stderr, "Solar session setup failed: %s\n", err);
+        if (capture_active) cudaProfilerStop();
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
         ds4_engine_close(engine);
@@ -95,6 +122,7 @@ int main(int argc, char **argv) {
     if (!prefill_logits || !cold_decode_logits || !warm_decode_logits ||
         !replay_logits) {
         fprintf(stderr, "host logits allocation failed\n");
+        if (capture_active) cudaProfilerStop();
         free(prefill_logits);
         free(cold_decode_logits);
         free(warm_decode_logits);
@@ -245,6 +273,15 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (capture_active) {
+        const cudaError_t sync_rc = cudaDeviceSynchronize();
+        if (sync_rc != cudaSuccess) {
+            fprintf(stderr, "cudaDeviceSynchronize before profiler stop failed: %s\n",
+                    cudaGetErrorString(sync_rc));
+            fail = 1;
+        }
+    }
+
     printf("Solar session state: prompt=%d snapshot=%llu bytes "
            "snapshot-bytes-equal=%d first=%d second-cold=%d second-warm=%d\n",
            prompt.len, (unsigned long long)snapshot.len, snapshot_bytes_equal,
@@ -254,6 +291,17 @@ int main(int argc, char **argv) {
            restored_prefill_diff, cold_warm_decode_diff,
            warm_replay_decode_diff, cold_prefill_diff);
     printf("Solar session state regression: %s\n", fail ? "FAILED" : "passed");
+    fflush(stdout);
+
+    if (capture_active) {
+        const cudaError_t capture_rc = cudaProfilerStop();
+        capture_active = 0;
+        if (capture_rc != cudaSuccess) {
+            fprintf(stderr, "cudaProfilerStop failed: %s\n",
+                    cudaGetErrorString(capture_rc));
+            fail = 1;
+        }
+    }
 
     ds4_session_snapshot_free(&snapshot);
     ds4_session_snapshot_free(&restored_snapshot);
