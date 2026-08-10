@@ -61501,15 +61501,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         if (e->backend == DS4_BACKEND_CUDA &&
             !load_slice && !tp_shard && !e->ssd_streaming) {
-            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE ||
+                DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
                 /* The repack library's own catalog walk parses one file, which
                  * for a split GGUF holds only the first shard. The engine's
                  * merged tensor table spans all shards with offsets into the
                  * merged mapping, so hand it over directly. The candidate
-                 * predicates then pick up what applies to this recipe:
+                 * predicates then pick up what applies to each recipe:
                  * IQ2_XXS gate/up (replace) and 2D Q8_0 dense (additive);
-                 * Q3_K down and Q4_K edge layers have no aligned format and
-                 * keep reading raw. */
+                 * Q3_K/Q2_K down and Q4_K edge layers have no aligned format
+                 * for Solar and keep reading raw. Without this branch Solar's
+                 * 11-shard GGUF fell to the single-file builder, which bails
+                 * on split models, and 32 GiB of IQ2_XXS gate/up prefill ran
+                 * the rectangular stream-K fallback. */
                 ds4_gpu_tensor_record *recs =
                     xcalloc(e->model.n_tensors, sizeof(*recs));
                 for (uint64_t i = 0; i < e->model.n_tensors; i++) {
@@ -61727,11 +61731,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         if (e->backend == DS4_BACKEND_CUDA &&
-            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE &&
+            (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE ||
+             (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 &&
+              ds4_gpu_derived_artifact_bytes() != 0)) &&
             !load_slice && !tp_shard && !e->ssd_streaming) {
             /* The aligned gate/up artifacts survive model-map installation;
              * raw range caches do not. Install the Q3_K/Q4_K remainder only
-             * now, then discard source pages before graph allocation. */
+             * now, then discard source pages before graph allocation. Solar
+             * follows the same flow whenever its artifacts built (the
+             * residency chooser skips the whole-image copy in that case);
+             * without artifacts Solar keeps its resident whole-image copy
+             * and per-range promotion would be redundant. */
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
             exaone_raw_cache_expected =
                 ds4_engine_promote_exaone_expert_stacks(e);
