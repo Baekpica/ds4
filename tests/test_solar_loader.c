@@ -27,7 +27,10 @@ int main(int argc, char **argv) {
             model_close(&model);
             return 1;
         }
-        printf("DeepSeek metadata: valid (%s)\n", DS4_MODEL_SHAPE_NAME);
+        ds4_weights weights;
+        weights_bind(&weights, &model);
+        printf("DeepSeek metadata and tensor layout: valid (%s)\n",
+               DS4_MODEL_SHAPE_NAME);
         model_close(&model);
         return 0;
     }
@@ -50,6 +53,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    ds4_weights weights;
+    weights_bind(&weights, &model);
+    if (weights.output_hc_base || weights.output_hc_fn ||
+        weights.output_hc_scale) {
+        fprintf(stderr, "Solar unexpectedly bound a hyper-connection output head\n");
+        model_close(&model);
+        return 1;
+    }
+
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const bool want_gqa = (il % 4u) == 0u;
         if (ds4_solar_layer_is_gqa(il) != want_gqa) {
@@ -57,10 +69,26 @@ int main(int argc, char **argv) {
             model_close(&model);
             return 1;
         }
+        const ds4_layer_weights *layer = &weights.layer[il];
+        if (!layer->attn_q || !layer->attn_k || !layer->attn_v ||
+            !layer->attn_output ||
+            (want_gqa && !layer->attn_gate) ||
+            (!want_gqa && (!layer->ssm_q_conv || !layer->ssm_k_conv ||
+                           !layer->ssm_v_conv || !layer->ssm_f_a ||
+                           !layer->ssm_f_b || !layer->ssm_beta ||
+                           !layer->ssm_a || !layer->ssm_dt_bias ||
+                           !layer->ssm_g_a || !layer->ssm_g_b ||
+                           !layer->ssm_o_norm))) {
+            fprintf(stderr, "Solar layer %u did not bind its complete %s branch\n",
+                    il, want_gqa ? "GQA" : "KDA");
+            model_close(&model);
+            return 1;
+        }
     }
 
-    printf("Solar metadata: valid (%u shards, 48 layers, 12 GQA, 36 KDA, "
-           "NoPE)\n", model.split_count);
+    printf("Solar metadata and tensor layout: valid "
+           "(%u shards, 48 layers, 12 GQA, 36 KDA, NoPE)\n",
+           model.split_count);
     model_close(&model);
     return 0;
 }

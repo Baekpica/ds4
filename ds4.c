@@ -1243,6 +1243,7 @@ enum {
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
@@ -2835,6 +2836,24 @@ typedef struct {
     ds4_tensor *hc_attn_scale;
     ds4_tensor *hc_attn_base;
     ds4_tensor *attn_norm;
+    /* Plain projections used by Solar Open2's GQA and recurrent KDA layers. */
+    ds4_tensor *attn_q;
+    ds4_tensor *attn_k;
+    ds4_tensor *attn_v;
+    ds4_tensor *attn_gate;
+    ds4_tensor *attn_output;
+    /* Solar KDA recurrent-attention controls; null on GQA layers. */
+    ds4_tensor *ssm_q_conv;
+    ds4_tensor *ssm_k_conv;
+    ds4_tensor *ssm_v_conv;
+    ds4_tensor *ssm_f_a;
+    ds4_tensor *ssm_f_b;
+    ds4_tensor *ssm_beta;
+    ds4_tensor *ssm_a;
+    ds4_tensor *ssm_dt_bias;
+    ds4_tensor *ssm_g_a;
+    ds4_tensor *ssm_g_b;
+    ds4_tensor *ssm_o_norm;
     ds4_tensor *attn_q_a;
     ds4_tensor *attn_q_a_norm;
     ds4_tensor *attn_q_b;
@@ -3030,6 +3049,41 @@ static void tensor_expect_layout(
     }
 }
 
+static void tensor_expect_layout4(
+        const ds4_tensor *t,
+        uint32_t          type,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2,
+        uint64_t          d3) {
+    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (ndim > 4u) ds4_die("internal error: tensor rank exceeds four");
+    if (t->type != type) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type %s, expected %s\n",
+                (int)t->name.len, t->name.ptr,
+                tensor_type_name(t->type), tensor_type_name(type));
+        exit(1);
+    }
+    if (t->ndim != ndim) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has %u dimensions, expected %u\n",
+                (int)t->name.len, t->name.ptr, t->ndim, ndim);
+        exit(1);
+    }
+
+    const uint64_t want[4] = {d0, d1, d2, d3};
+    for (uint32_t i = 0; i < ndim; i++) {
+        if (t->dim[i] == want[i]) continue;
+        fprintf(stderr,
+                "ds4: tensor %.*s has dim[%u]=%" PRIu64
+                ", expected %" PRIu64 "\n",
+                (int)t->name.len, t->name.ptr, i, t->dim[i], want[i]);
+        exit(1);
+    }
+}
+
 static void tensor_expect_optional(
         const ds4_tensor *t,
         uint32_t          type,
@@ -3118,9 +3172,197 @@ static void tensor_expect_routed_expert(
     }
 }
 
+static bool weights_solar_open2_layer_has_required(
+        const ds4_layer_weights *l,
+        uint32_t                 il) {
+    if (!l ||
+        !l->attn_norm ||
+        !l->attn_q ||
+        !l->attn_k ||
+        !l->attn_v ||
+        !l->attn_output ||
+        !l->ffn_norm ||
+        !l->ffn_gate_inp ||
+        !l->ffn_exp_probs_b ||
+        !l->ffn_gate_exps ||
+        !l->ffn_up_exps ||
+        !l->ffn_down_exps ||
+        !l->ffn_gate_shexp ||
+        !l->ffn_up_shexp ||
+        !l->ffn_down_shexp) {
+        return false;
+    }
+
+    if (ds4_solar_layer_is_gqa(il)) return l->attn_gate != NULL;
+    return l->ssm_q_conv &&
+           l->ssm_k_conv &&
+           l->ssm_v_conv &&
+           l->ssm_f_a &&
+           l->ssm_f_b &&
+           l->ssm_beta &&
+           l->ssm_a &&
+           l->ssm_dt_bias &&
+           l->ssm_g_a &&
+           l->ssm_g_b &&
+           l->ssm_o_norm;
+}
+
+static bool tensor_type_is_solar_gate_up(uint32_t type) {
+    return type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q2_K ||
+           type == DS4_TENSOR_IQ2_XXS;
+}
+
+static bool tensor_type_is_solar_down(uint32_t type) {
+    return type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q3_K ||
+           type == DS4_TENSOR_Q2_K;
+}
+
+static void tensor_expect_solar_routed(
+        const ds4_tensor *t,
+        bool              gate_or_up,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing Solar routed-expert tensor");
+    const bool type_ok = gate_or_up
+        ? tensor_type_is_solar_gate_up(t->type)
+        : tensor_type_is_solar_down(t->type);
+    if (!type_ok) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type %s, expected a Solar mixed-recipe "
+                "%s type\n",
+                (int)t->name.len, t->name.ptr, tensor_type_name(t->type),
+                gate_or_up ? "gate/up" : "down");
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, 3, d0, d1, d2);
+}
+
+static void tensor_expect_solar_conv(const ds4_tensor *t) {
+    const uint64_t d_inner = (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM;
+    if (!t) ds4_die("internal error: missing Solar KDA convolution tensor");
+    if (t->ndim == 4u) {
+        tensor_expect_layout4(t, DS4_TENSOR_F32, 4,
+                              DS4_N_SSM_CONV, 1, d_inner, 1);
+        return;
+    }
+    tensor_expect_layout(t, DS4_TENSOR_F32, 3,
+                         DS4_N_SSM_CONV, 1, d_inner);
+}
+
+static void tensor_expect_solar_decay(const ds4_tensor *t) {
+    if (!t) ds4_die("internal error: missing Solar KDA decay tensor");
+    if (t->ndim == 4u) {
+        tensor_expect_layout4(t, DS4_TENSOR_F32, 4,
+                              1, DS4_N_HEAD, 1, 1);
+        return;
+    }
+    tensor_expect_layout(t, DS4_TENSOR_F32, 2, 1, DS4_N_HEAD, 0);
+}
+
+static void weights_validate_solar_open2_layout(const ds4_weights *w) {
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t kda_dim = (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM;
+
+    if (!w) ds4_die("internal error: missing weights while validating Solar layout");
+    tensor_expect_layout(w->token_embd, DS4_TENSOR_Q8_0,
+                         2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    if (w->output_hc_base || w->output_hc_fn || w->output_hc_scale) {
+        ds4_die("Solar must not bind a hyper-connection output head");
+    }
+    tensor_expect_layout(w->output_norm, DS4_TENSOR_F32,
+                         1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(w->output, DS4_TENSOR_Q8_0,
+                         2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_solar_open2_layer_has_required(l, il)) {
+            fprintf(stderr, "ds4: required Solar tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32,
+                             1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32,
+                             1, DS4_N_EMBD, 0, 0);
+
+        if (ds4_solar_layer_is_gqa(il)) {
+            tensor_expect_layout(l->attn_q, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, q_dim, 0);
+            tensor_expect_layout(l->attn_k, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_layout(l->attn_v, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_layout(l->attn_gate, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, q_dim, 0);
+            tensor_expect_layout(l->attn_output, DS4_TENSOR_Q8_0,
+                                 2, q_dim, DS4_N_EMBD, 0);
+        } else {
+            tensor_expect_layout(l->attn_q, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, kda_dim, 0);
+            tensor_expect_layout(l->attn_k, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, kda_dim, 0);
+            tensor_expect_layout(l->attn_v, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, kda_dim, 0);
+            tensor_expect_solar_conv(l->ssm_q_conv);
+            tensor_expect_solar_conv(l->ssm_k_conv);
+            tensor_expect_solar_conv(l->ssm_v_conv);
+            tensor_expect_layout(l->ssm_f_a, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, 0);
+            tensor_expect_layout(l->ssm_f_b, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_KDA_HEAD_DIM, kda_dim, 0);
+            tensor_expect_layout(l->ssm_beta, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, DS4_N_HEAD, 0);
+            tensor_expect_solar_decay(l->ssm_a);
+            tensor_expect_layout(l->ssm_dt_bias, DS4_TENSOR_F32,
+                                 1, kda_dim, 0, 0);
+            tensor_expect_layout(l->ssm_g_a, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, 0);
+            tensor_expect_layout(l->ssm_g_b, DS4_TENSOR_Q8_0,
+                                 2, DS4_N_KDA_HEAD_DIM, kda_dim, 0);
+            tensor_expect_layout(l->ssm_o_norm, DS4_TENSOR_F32,
+                                 1, DS4_N_KDA_HEAD_DIM, 0, 0);
+            tensor_expect_layout(l->attn_output, DS4_TENSOR_Q8_0,
+                                 2, kda_dim, DS4_N_EMBD, 0);
+        }
+
+        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32,
+                             2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32,
+                             1, DS4_N_EXPERT, 0, 0);
+        tensor_expect_solar_routed(l->ffn_gate_exps, true,
+                                   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_solar_routed(l->ffn_up_exps, true,
+                                   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_solar_routed(l->ffn_down_exps, false,
+                                   DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
+            fprintf(stderr,
+                    "ds4: Solar routed gate/up experts use different quant types "
+                    "in layer %u\n",
+                    il);
+            exit(1);
+        }
+        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, DS4_N_FF_SHEXP, 0);
+        tensor_expect_layout(l->ffn_up_shexp, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, DS4_N_FF_SHEXP, 0);
+        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0,
+                             2, DS4_N_FF_SHEXP, DS4_N_EMBD, 0);
+    }
+}
+
 /* Verify every tensor type and dimension used by the specialized pipeline.
  * After this succeeds, inference code can rely on fixed DS4 constants. */
 static void weights_validate_layout(const ds4_weights *w) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        weights_validate_solar_open2_layout(w);
+        return;
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -3682,17 +3924,60 @@ static void config_validate_model(const ds4_model *m) {
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
+static void weights_bind_solar_open2_layer(
+        ds4_layer_weights *l,
+        const ds4_model   *m,
+        uint32_t           il) {
+    l->attn_norm   = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+
+    if (ds4_solar_layer_is_gqa(il)) {
+        l->attn_gate = required_tensorf(m, "blk.%u.attn_gate.weight", il);
+    } else {
+        l->ssm_q_conv = required_tensorf(m, "blk.%u.ssm_conv1d_q.weight", il);
+        l->ssm_k_conv = required_tensorf(m, "blk.%u.ssm_conv1d_k.weight", il);
+        l->ssm_v_conv = required_tensorf(m, "blk.%u.ssm_conv1d_v.weight", il);
+        l->ssm_f_a = required_tensorf(m, "blk.%u.ssm_f_a.weight", il);
+        l->ssm_f_b = required_tensorf(m, "blk.%u.ssm_f_b.weight", il);
+        l->ssm_beta = required_tensorf(m, "blk.%u.ssm_beta.weight", il);
+        l->ssm_a = required_tensorf(m, "blk.%u.ssm_a", il);
+        l->ssm_dt_bias = required_tensorf(m, "blk.%u.ssm_dt.bias", il);
+        l->ssm_g_a = required_tensorf(m, "blk.%u.ssm_g_a.weight", il);
+        l->ssm_g_b = required_tensorf(m, "blk.%u.ssm_g_b.weight", il);
+        l->ssm_o_norm = required_tensorf(m, "blk.%u.ssm_norm.weight", il);
+    }
+
+    l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+    l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+    l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+}
+
 static void weights_bind(ds4_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     w->token_embd       = required_tensor(m, "token_embd.weight");
-    w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
-    w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
-    w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        w->output_hc_base  = required_tensor(m, "output_hc_base.weight");
+        w->output_hc_fn    = required_tensor(m, "output_hc_fn.weight");
+        w->output_hc_scale = required_tensor(m, "output_hc_scale.weight");
+    }
     w->output_norm      = required_tensor(m, "output_norm.weight");
     w->output           = required_tensor(m, "output.weight");
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_layer_weights *l = &w->layer[il];
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+            weights_bind_solar_open2_layer(l, m, il);
+            continue;
+        }
         const uint32_t compress_ratio = ds4_layer_compress_ratio(il);
 
         l->hc_attn_fn      = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
@@ -3788,6 +4073,22 @@ static void model_map_span_vec_include_layer(ds4_model_map_span_vec *spans, cons
     DS4_INCLUDE_TENSOR(l->hc_attn_scale);
     DS4_INCLUDE_TENSOR(l->hc_attn_base);
     DS4_INCLUDE_TENSOR(l->attn_norm);
+    DS4_INCLUDE_TENSOR(l->attn_q);
+    DS4_INCLUDE_TENSOR(l->attn_k);
+    DS4_INCLUDE_TENSOR(l->attn_v);
+    DS4_INCLUDE_TENSOR(l->attn_gate);
+    DS4_INCLUDE_TENSOR(l->attn_output);
+    DS4_INCLUDE_TENSOR(l->ssm_q_conv);
+    DS4_INCLUDE_TENSOR(l->ssm_k_conv);
+    DS4_INCLUDE_TENSOR(l->ssm_v_conv);
+    DS4_INCLUDE_TENSOR(l->ssm_f_a);
+    DS4_INCLUDE_TENSOR(l->ssm_f_b);
+    DS4_INCLUDE_TENSOR(l->ssm_beta);
+    DS4_INCLUDE_TENSOR(l->ssm_a);
+    DS4_INCLUDE_TENSOR(l->ssm_dt_bias);
+    DS4_INCLUDE_TENSOR(l->ssm_g_a);
+    DS4_INCLUDE_TENSOR(l->ssm_g_b);
+    DS4_INCLUDE_TENSOR(l->ssm_o_norm);
     DS4_INCLUDE_TENSOR(l->attn_q_a);
     DS4_INCLUDE_TENSOR(l->attn_q_a_norm);
     DS4_INCLUDE_TENSOR(l->attn_q_b);
