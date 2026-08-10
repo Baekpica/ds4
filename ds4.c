@@ -1409,6 +1409,44 @@ static bool model_get_u32(const ds4_model *m, const char *key, uint32_t *out) {
     return cursor_u32(&c, out);
 }
 
+/* Token ids in converted GGUFs are not consistently stored with one integer
+ * width or signedness.  Accept the lossless non-negative variants. */
+static bool model_get_token_id(const ds4_model *m, const char *key, int *out) {
+    ds4_kv *kv = model_find_kv(m, key);
+    if (!kv) return false;
+
+    ds4_cursor c = cursor_at(m, kv->value_pos);
+    switch (kv->type) {
+    case GGUF_VALUE_UINT32: {
+        uint32_t value = 0;
+        if (!cursor_u32(&c, &value) || value > (uint32_t)INT_MAX) return false;
+        *out = (int)value;
+        return true;
+    }
+    case GGUF_VALUE_INT32: {
+        int32_t value = 0;
+        if (!cursor_read(&c, &value, sizeof(value)) || value < 0) return false;
+        *out = (int)value;
+        return true;
+    }
+    case GGUF_VALUE_UINT64: {
+        uint64_t value = 0;
+        if (!cursor_u64(&c, &value) || value > (uint64_t)INT_MAX) return false;
+        *out = (int)value;
+        return true;
+    }
+    case GGUF_VALUE_INT64: {
+        int64_t value = 0;
+        if (!cursor_read(&c, &value, sizeof(value)) ||
+            value < 0 || value > (int64_t)INT_MAX) return false;
+        *out = (int)value;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 static bool model_get_u64(const ds4_model *m, const char *key, uint64_t *out) {
     ds4_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != GGUF_VALUE_UINT64) return false;
@@ -23332,13 +23370,30 @@ struct ds4_vocab {
     int n_vocab;
     int bos_id;
     int eos_id;
+    int eot_id;
+    int im_start_id;
+    int im_content_id;
+    int im_end_id;
     int user_id;
     int assistant_id;
     int think_start_id;
     int think_end_id;
+    int tool_call_start_id;
+    int tool_call_end_id;
+    int tool_response_start_id;
+    int tool_response_end_id;
+    int arg_key_start_id;
+    int arg_key_end_id;
+    int arg_value_start_id;
+    int arg_value_end_id;
+    int tool_schema_start_id;
+    int tool_schema_end_id;
     int dsml_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
+    str_i32_table user_defined;
+    uint32_t user_defined_max_len;
+    bool user_defined_first[256];
 };
 
 struct ds4_engine {
@@ -23687,6 +23742,267 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
     return utf8_is_cjk_hira_kata(cp);
 }
 
+typedef struct {
+    uint32_t cp;
+    uint64_t next;
+    bool valid;
+    bool is_letter;
+    bool is_number;
+    bool is_whitespace;
+} solar_char_info;
+
+static bool solar_unicode_whitespace(uint32_t cp) {
+    if (cp < 128) return ascii_space((uint8_t)cp);
+    return cp == 0x0085 ||
+           cp == 0x00a0 ||
+           cp == 0x1680 ||
+           (cp >= 0x2000 && cp <= 0x200a) ||
+           cp == 0x2028 ||
+           cp == 0x2029 ||
+           cp == 0x202f ||
+           cp == 0x205f ||
+           cp == 0x3000;
+}
+
+static bool solar_unicode_number(uint32_t cp) {
+    if (cp < 128) return ascii_digit((uint8_t)cp);
+    return (cp >= 0x0660 && cp <= 0x0669) ||
+           (cp >= 0x06f0 && cp <= 0x06f9) ||
+           (cp >= 0x07c0 && cp <= 0x07c9) ||
+           (cp >= 0x0966 && cp <= 0x096f) ||
+           (cp >= 0x09e6 && cp <= 0x09ef) ||
+           (cp >= 0x0a66 && cp <= 0x0a6f) ||
+           (cp >= 0x0ae6 && cp <= 0x0aef) ||
+           (cp >= 0x0b66 && cp <= 0x0b6f) ||
+           (cp >= 0x0be6 && cp <= 0x0bef) ||
+           (cp >= 0x0c66 && cp <= 0x0c6f) ||
+           (cp >= 0x0ce6 && cp <= 0x0cef) ||
+           (cp >= 0x0d66 && cp <= 0x0d6f) ||
+           (cp >= 0x0de6 && cp <= 0x0def) ||
+           (cp >= 0x0e50 && cp <= 0x0e59) ||
+           (cp >= 0x0ed0 && cp <= 0x0ed9) ||
+           (cp >= 0x0f20 && cp <= 0x0f29) ||
+           (cp >= 0x1040 && cp <= 0x1049) ||
+           (cp >= 0x1090 && cp <= 0x1099) ||
+           (cp >= 0x17e0 && cp <= 0x17e9) ||
+           (cp >= 0x1810 && cp <= 0x1819) ||
+           (cp >= 0xff10 && cp <= 0xff19);
+}
+
+static bool solar_unicode_punct_symbol(uint32_t cp) {
+    if (cp < 128) return joyai_ascii_punct_symbol((uint8_t)cp);
+    return (cp >= 0x00a1 && cp <= 0x00a9) ||
+           (cp >= 0x00ab && cp <= 0x00ac) ||
+           (cp >= 0x00ae && cp <= 0x00b1) ||
+           cp == 0x00b4 ||
+           (cp >= 0x00b6 && cp <= 0x00b8) ||
+           cp == 0x00bb ||
+           cp == 0x00bf ||
+           cp == 0x00d7 ||
+           cp == 0x00f7 ||
+           (cp >= 0x02c2 && cp <= 0x02df) ||
+           (cp >= 0x02e5 && cp <= 0x02eb) ||
+           (cp >= 0x02ed && cp <= 0x02ff) ||
+           (cp >= 0x0375 && cp <= 0x037e) ||
+           (cp >= 0x0384 && cp <= 0x0385) ||
+           cp == 0x0387 ||
+           (cp >= 0x055a && cp <= 0x055f) ||
+           (cp >= 0x0589 && cp <= 0x058a) ||
+           (cp >= 0x05be && cp <= 0x05c0) ||
+           cp == 0x05c3 ||
+           (cp >= 0x05c6 && cp <= 0x05c7) ||
+           (cp >= 0x0609 && cp <= 0x060a) ||
+           (cp >= 0x060c && cp <= 0x060d) ||
+           cp == 0x061b ||
+           (cp >= 0x061e && cp <= 0x061f) ||
+           cp == 0x066a ||
+           cp == 0x066d ||
+           cp == 0x06d4 ||
+           (cp >= 0x2000 && cp <= 0x206f) ||
+           (cp >= 0x20a0 && cp <= 0x20cf) ||
+           (cp >= 0x2100 && cp <= 0x214f) ||
+           (cp >= 0x2190 && cp <= 0x23ff) ||
+           (cp >= 0x2460 && cp <= 0x24ff) ||
+           (cp >= 0x2500 && cp <= 0x2775) ||
+           (cp >= 0x2794 && cp <= 0x2bff) ||
+           (cp >= 0x2e00 && cp <= 0x2e7f) ||
+           (cp >= 0x3000 && cp <= 0x303f) ||
+           (cp >= 0xfd3e && cp <= 0xfd3f) ||
+           (cp >= 0xfe10 && cp <= 0xfe6f) ||
+           (cp >= 0xff01 && cp <= 0xff0f) ||
+           (cp >= 0xff1a && cp <= 0xff20) ||
+           (cp >= 0xff3b && cp <= 0xff40) ||
+           (cp >= 0xff5b && cp <= 0xff65) ||
+           (cp >= 0x1f000 && cp <= 0x1faff);
+}
+
+static solar_char_info solar_char_at(const char *s, uint64_t len, uint64_t pos) {
+    solar_char_info info;
+    memset(&info, 0, sizeof(info));
+    if (pos >= len) return info;
+
+    info.valid = true;
+    info.cp = utf8_peek_one(s, len, pos, &info.next);
+    info.is_whitespace = solar_unicode_whitespace(info.cp);
+    info.is_number = solar_unicode_number(info.cp);
+    if (info.cp < 128) {
+        info.is_letter = ascii_alpha((uint8_t)info.cp);
+    } else {
+        info.is_letter = !info.is_whitespace &&
+                         !info.is_number &&
+                         !solar_unicode_punct_symbol(info.cp);
+    }
+    return info;
+}
+
+static uint32_t solar_ascii_tolower(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
+    return cp;
+}
+
+static bool solar_contraction_len(const char *s, uint64_t len, uint64_t pos,
+                                  uint64_t *out_len) {
+    if (pos >= len || s[pos] != '\'') return false;
+    const uint64_t rem = len - pos - 1u;
+    const char *p = s + pos + 1;
+    static const char *two[] = { "re", "ve", "ll" };
+    for (size_t i = 0; i < sizeof(two) / sizeof(two[0]); i++) {
+        if (rem >= 2 &&
+            solar_ascii_tolower((uint8_t)p[0]) == (uint32_t)two[i][0] &&
+            solar_ascii_tolower((uint8_t)p[1]) == (uint32_t)two[i][1]) {
+            *out_len = 3;
+            return true;
+        }
+    }
+    if (rem >= 1) {
+        const uint32_t c = solar_ascii_tolower((uint8_t)p[0]);
+        if (c == 's' || c == 't' || c == 'm' || c == 'd') {
+            *out_len = 2;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Solar Open2 declares tokenizer.ggml.pre="solar-open".  Match its ordered
+ * Qwen2-style regex split before byte-level BPE; changing piece boundaries
+ * changes token ids even when the source bytes are identical. */
+static void bpe_tokenize_text_solar(const ds4_vocab *vocab, const char *text,
+                                    token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+
+    while (pos < len) {
+        const uint64_t start = pos;
+        solar_char_info cur = solar_char_at(text, len, pos);
+        if (!cur.valid) {
+            pos = next_utf8_char(text, len, pos);
+            continue;
+        }
+
+        if (vocab->user_defined_max_len &&
+            vocab->user_defined_first[(uint8_t)text[pos]]) {
+            uint64_t want = len - pos;
+            if (want > vocab->user_defined_max_len) want = vocab->user_defined_max_len;
+            int id = -1;
+            uint64_t hit = 0;
+            for (uint64_t n = want; n >= 1; n--) {
+                if (table_get(&vocab->user_defined, text + pos, n, &id)) {
+                    hit = n;
+                    break;
+                }
+            }
+            if (hit) {
+                token_vec_push(out, id);
+                pos += hit;
+                continue;
+            }
+        }
+
+        uint64_t contraction = 0;
+        if (solar_contraction_len(text, len, pos, &contraction)) {
+            pos += contraction;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        /* Optional non-letter/number prefix followed by a Unicode letter run. */
+        {
+            uint64_t p = pos;
+            if (!(cur.cp == '\r' || cur.cp == '\n' ||
+                  cur.is_letter || cur.is_number)) {
+                p = cur.next;
+            }
+            solar_char_info first = solar_char_at(text, len, p);
+            if (first.valid && first.is_letter) {
+                do {
+                    p = first.next;
+                    first = solar_char_at(text, len, p);
+                } while (first.valid && first.is_letter);
+                pos = p;
+                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                continue;
+            }
+        }
+
+        /* solar-open splits every Unicode number as one pre-token. */
+        if (cur.is_number) {
+            pos = cur.next;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        /* Optional ASCII space, punctuation/symbol run, then trailing CR/LF. */
+        {
+            uint64_t p = pos;
+            if (cur.cp == ' ') p = cur.next;
+            uint64_t run = p;
+            for (;;) {
+                solar_char_info c = solar_char_at(text, len, run);
+                if (!c.valid || c.is_whitespace || c.is_letter || c.is_number) break;
+                run = c.next;
+            }
+            if (run > p) {
+                for (;;) {
+                    solar_char_info c = solar_char_at(text, len, run);
+                    if (!c.valid || !(c.cp == '\r' || c.cp == '\n')) break;
+                    run = c.next;
+                }
+                pos = run;
+                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                continue;
+            }
+        }
+
+        if (cur.is_whitespace) {
+            uint64_t p = pos;
+            uint64_t last_newline_end = 0;
+            uint64_t last_ws_start = pos;
+            uint32_t whitespace_count = 0;
+            for (;;) {
+                solar_char_info c = solar_char_at(text, len, p);
+                if (!c.valid || !c.is_whitespace) break;
+                last_ws_start = p;
+                if (c.cp == '\r' || c.cp == '\n') last_newline_end = c.next;
+                p = c.next;
+                whitespace_count++;
+            }
+            if (last_newline_end) {
+                pos = last_newline_end;
+            } else if (whitespace_count > 1u && p < len) {
+                pos = last_ws_start;
+            } else {
+                pos = p;
+            }
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        pos = cur.next;
+        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+    }
+}
+
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -23708,6 +24024,10 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        bpe_tokenize_text_solar(vocab, text, out);
+        return;
+    }
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -23786,9 +24106,29 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     return token;
 }
 
+static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
+    int token = -1;
+    if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) return -1;
+    return token;
+}
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
+    vocab->eot_id = -1;
+    vocab->im_start_id = -1;
+    vocab->im_content_id = -1;
+    vocab->im_end_id = -1;
+    vocab->tool_call_start_id = -1;
+    vocab->tool_call_end_id = -1;
+    vocab->tool_response_start_id = -1;
+    vocab->tool_response_end_id = -1;
+    vocab->arg_key_start_id = -1;
+    vocab->arg_key_end_id = -1;
+    vocab->arg_value_start_id = -1;
+    vocab->arg_value_end_id = -1;
+    vocab->tool_schema_start_id = -1;
+    vocab->tool_schema_end_id = -1;
 
     ds4_array_ref tokens;
     ds4_array_ref merges;
@@ -23812,12 +24152,74 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->token_to_id, vocab->token[i], i);
     }
 
+    /* Added USER_DEFINED tokens are partitioned before regex splitting by
+     * llama.cpp-compatible tokenizers.  Index them for longest literal match. */
+    table_init(&vocab->user_defined, 64);
+    {
+        ds4_array_ref types;
+        if (model_get_array(model, "tokenizer.ggml.token_type", &types) &&
+            types.len == tokens.len) {
+            ds4_cursor tc = cursor_at(model, types.data_pos);
+            for (int i = 0; i < vocab->n_vocab; i++) {
+                uint32_t type = 0;
+                if (!cursor_u32(&tc, &type)) break;
+                if (type != 4u) continue; /* GGML_TOKEN_TYPE_USER_DEFINED */
+                const ds4_str token = vocab->token[i];
+                if (token.len == 0) continue;
+                table_put(&vocab->user_defined, token, i);
+                if (token.len > vocab->user_defined_max_len) {
+                    vocab->user_defined_max_len = (uint32_t)token.len;
+                }
+                vocab->user_defined_first[(uint8_t)token.ptr[0]] = true;
+            }
+        }
+    }
+
     table_init(&vocab->merge_rank, merges.len);
     c = cursor_at(model, merges.data_pos);
     for (uint64_t i = 0; i < merges.len; i++) {
         ds4_str merge;
         if (!cursor_string(&c, &merge)) ds4_die(c.error);
         table_put(&vocab->merge_rank, merge, (int)i);
+    }
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
+            vocab->bos_id = vocab_lookup_optional(vocab, "<|startoftext|>");
+        }
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+            vocab->eos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
+        }
+        if (!model_get_token_id(model, "tokenizer.ggml.eot_token_id", &vocab->eot_id)) {
+            vocab->eot_id = vocab_lookup_optional(vocab, "<|im:end|>");
+        }
+        vocab->im_start_id = vocab_lookup_optional(vocab, "<|im:start|>");
+        vocab->im_content_id = vocab_lookup_optional(vocab, "<|im:content|>");
+        vocab->im_end_id = vocab_lookup_optional(vocab, "<|im:end|>");
+        vocab->user_id = -1;      /* role names are ordinary BPE text */
+        vocab->assistant_id = -1;
+        vocab->think_start_id = vocab_lookup_optional(vocab, "<|think:start|>");
+        vocab->think_end_id = vocab_lookup_optional(vocab, "<|think:end|>");
+        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<|tool_call:start|>");
+        vocab->tool_call_end_id = vocab_lookup_optional(vocab, "<|tool_call:end|>");
+        vocab->tool_response_start_id = vocab_lookup_optional(vocab, "<|tool_response:start|>");
+        vocab->tool_response_end_id = vocab_lookup_optional(vocab, "<|tool_response:end|>");
+        vocab->arg_key_start_id = vocab_lookup_optional(vocab, "<|tool_arg:start|>");
+        vocab->arg_key_end_id = vocab_lookup_optional(vocab, "<|tool_arg:end|>");
+        vocab->arg_value_start_id = vocab_lookup_optional(vocab, "<|tool_arg:value|>");
+        vocab->arg_value_end_id = vocab->arg_key_end_id;
+        vocab->tool_schema_start_id = vocab_lookup_optional(vocab, "<|tool:start|>");
+        vocab->tool_schema_end_id = vocab_lookup_optional(vocab, "<|tool:end|>");
+        vocab->dsml_id = -1;
+
+        if (vocab->bos_id < 0 || vocab->eos_id < 0 || vocab->eot_id < 0 ||
+            vocab->im_start_id < 0 || vocab->im_content_id < 0 ||
+            vocab->im_end_id < 0 || vocab->think_start_id < 0 ||
+            vocab->think_end_id < 0 || vocab->tool_schema_start_id < 0 ||
+            vocab->tool_schema_end_id < 0) {
+            ds4_die("Solar tokenizer is missing required chat control tokens");
+        }
+        return;
     }
 
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
@@ -23833,7 +24235,67 @@ static void vocab_free(ds4_vocab *vocab) {
     free(vocab->token);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
+    table_free(&vocab->user_defined);
     memset(vocab, 0, sizeof(*vocab));
+}
+
+/* Tokenize a rendered-template fragment whole.  Splitting the prefix and body
+ * would change regex boundaries and therefore BPE ids (notably around newlines). */
+static void chat_push_fragment(const ds4_vocab *vocab, const char *prefix,
+                               const char *text, token_vec *out) {
+    const size_t prefix_len = prefix ? strlen(prefix) : 0;
+    const size_t text_len = text ? strlen(text) : 0;
+    if (prefix_len + text_len == 0) return;
+
+    char *fragment = xmalloc(prefix_len + text_len + 1);
+    if (prefix_len) memcpy(fragment, prefix, prefix_len);
+    if (text_len) memcpy(fragment + prefix_len, text, text_len);
+    fragment[prefix_len + text_len] = '\0';
+    bpe_tokenize_text(vocab, fragment, out);
+    free(fragment);
+}
+
+static void solar_chat_open_role(const ds4_vocab *vocab, const char *role,
+                                 token_vec *out) {
+    token_vec_push(out, vocab->im_start_id);
+    bpe_tokenize_text(vocab, role, out);
+    token_vec_push(out, vocab->im_content_id);
+}
+
+static void solar_chat_close_role(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->im_end_id);
+    chat_push_fragment(vocab, "\n", NULL, out);
+}
+
+/* Official Solar no-tool chat template with provider_system_prompt=false and
+ * add_generation_prompt=true.  tokenizer.ggml.add_bos_token is false. */
+static void encode_chat_prompt_solar(
+        const ds4_vocab *vocab,
+        const char      *system,
+        const char      *prompt,
+        ds4_think_mode   think_mode,
+        token_vec       *out) {
+    if (vocab->im_start_id < 0 || vocab->im_content_id < 0 ||
+        vocab->im_end_id < 0 || vocab->think_start_id < 0 ||
+        vocab->think_end_id < 0) {
+        ds4_die("this tokenizer does not provide the Solar chat markers");
+    }
+
+    if (system && system[0]) {
+        solar_chat_open_role(vocab, "system", out);
+        chat_push_fragment(vocab, "## System Prompt\n\n", system, out);
+        solar_chat_close_role(vocab, out);
+    }
+
+    solar_chat_open_role(vocab, "user", out);
+    chat_push_fragment(vocab, NULL, prompt, out);
+    solar_chat_close_role(vocab, out);
+
+    solar_chat_open_role(vocab, "assistant", out);
+    token_vec_push(out, vocab->think_start_id);
+    if (!ds4_think_mode_enabled(think_mode)) {
+        token_vec_push(out, vocab->think_end_id);
+    }
 }
 
 /* Build the DS4 chat prompt: BOS, optional system text, user prompt, assistant
@@ -23845,6 +24307,10 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        encode_chat_prompt_solar(vocab, system, prompt, think_mode, out);
+        return;
+    }
     token_vec_push(out, vocab->bos_id);
     {
         /* Effort prefix ahead of the system message, matching the reference
@@ -23876,14 +24342,42 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
     } specials[] = {
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
+        {"<|startoftext|>",         vocab->bos_id},
+        {"<|endoftext|>",           vocab->eos_id},
+        {"<|im:start|>",            vocab->im_start_id},
+        {"<|im:content|>",          vocab->im_content_id},
+        {"<|im:end|>",              vocab->im_end_id},
+        {"<|tool:start|>",          vocab->tool_schema_start_id},
+        {"<|tool:end|>",            vocab->tool_schema_end_id},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
+        {"<|think:start|>",         vocab->think_start_id},
+        {"<|think:end|>",           vocab->think_end_id},
+        {"<tool_call>",            vocab->tool_call_start_id},
+        {"</tool_call>",           vocab->tool_call_end_id},
+        {"<|tool_call:start|>",     vocab->tool_call_start_id},
+        {"<|tool_call:end|>",       vocab->tool_call_end_id},
+        {"<tool_response>",        vocab->tool_response_start_id},
+        {"</tool_response>",       vocab->tool_response_end_id},
+        {"<|tool_response:start|>", vocab->tool_response_start_id},
+        {"<|tool_response:end|>",   vocab->tool_response_end_id},
+        /* Match the combined canonical transition before either individual
+         * tag: Solar represents key-close/value-open with one native token. */
+        {"</arg_key><arg_value>",   vocab->arg_value_start_id},
+        {"<arg_key>",              vocab->arg_key_start_id},
+        {"</arg_key>",             vocab->arg_key_end_id},
+        {"<arg_value>",            vocab->arg_value_start_id},
+        {"</arg_value>",           vocab->arg_value_end_id},
+        {"<|tool_arg:start|>",      vocab->arg_key_start_id},
+        {"<|tool_arg:value|>",      vocab->arg_value_start_id},
+        {"<|tool_arg:end|>",        vocab->arg_value_end_id},
         {"｜DSML｜",                vocab->dsml_id},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
+        if (specials[i].token < 0) continue;
         size_t n = strlen(specials[i].text);
         if (!strncmp(p, specials[i].text, n)) {
             *token = specials[i].token;
@@ -23924,11 +24418,34 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
     tokenize_span(vocab, span, (size_t)(p - span), out);
 }
 
+static void bpe_tokenize_wrapped_payload_text(ds4_vocab *vocab,
+                                              const char *content,
+                                              const char *end_marker,
+                                              token_vec *out) {
+    /* Tool output is data inside a model-family wrapper. Escape only an exact
+     * closing sentinel so ordinary shell/file text remains byte-faithful. */
+    const size_t end_len = strlen(end_marker);
+    const char *span = content ? content : "";
+    const char *p = span;
+    while (*p) {
+        if (!strncmp(p, end_marker, end_len)) {
+            tokenize_span(vocab, span, (size_t)(p - span), out);
+            bpe_tokenize_text(vocab, "&lt;", out);
+            p++;
+            span = p;
+        } else {
+            p++;
+        }
+    }
+    tokenize_span(vocab, span, (size_t)(p - span), out);
+}
+
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) return;
     token_vec_push(tokens, e->vocab.bos_id);
 }
 
@@ -23942,6 +24459,7 @@ void ds4_encode_chat_prompt(
 }
 
 void ds4_chat_append_effort_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) return;
     const char *effort = ds4_think_effort_prefix(mode);
     if (effort[0]) bpe_tokenize_text(&e->vocab, effort, tokens);
 }
@@ -23950,6 +24468,44 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        /* A sampled assistant turn ends at <|im:end|>; the official template
+         * places a plain newline before the next role marker. */
+        if (tokens->len > 0 && tokens->v[tokens->len - 1] == vocab->im_end_id) {
+            chat_push_fragment(vocab, "\n", NULL, tokens);
+        }
+
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            solar_chat_open_role(vocab, "system", tokens);
+            chat_push_fragment(vocab, "## System Prompt\n\n", content, tokens);
+            solar_chat_close_role(vocab, tokens);
+        } else if (!strcmp(role, "assistant")) {
+            solar_chat_open_role(vocab, "assistant", tokens);
+            if (strncmp(content, "<|think:start|>", 15) != 0) {
+                token_vec_push(tokens, vocab->think_start_id);
+                token_vec_push(tokens, vocab->think_end_id);
+            }
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+            solar_chat_close_role(vocab, tokens);
+        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            if (vocab->tool_response_start_id < 0 ||
+                vocab->tool_response_end_id < 0) {
+                ds4_die("Solar tokenizer has no tool-response markers");
+            }
+            solar_chat_open_role(vocab, "tool", tokens);
+            token_vec_push(tokens, vocab->tool_response_start_id);
+            bpe_tokenize_wrapped_payload_text(vocab, content,
+                                              "<|tool_response:end|>", tokens);
+            token_vec_push(tokens, vocab->tool_response_end_id);
+            solar_chat_close_role(vocab, tokens);
+        } else {
+            solar_chat_open_role(vocab, "user", tokens);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+            solar_chat_close_role(vocab, tokens);
+        }
+        return;
+    }
 
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         bpe_tokenize_text(vocab, content, tokens);
@@ -23969,6 +24525,17 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        if (tokens->len > 0 && tokens->v[tokens->len - 1] == e->vocab.im_end_id) {
+            chat_push_fragment(&e->vocab, "\n", NULL, tokens);
+        }
+        solar_chat_open_role(&e->vocab, "assistant", tokens);
+        token_vec_push(tokens, e->vocab.think_start_id);
+        if (!ds4_think_mode_enabled(think_mode)) {
+            token_vec_push(tokens, e->vocab.think_end_id);
+        }
+        return;
+    }
     token_vec_push(tokens, e->vocab.assistant_id);
     token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
                    e->vocab.think_start_id : e->vocab.think_end_id);
@@ -24083,6 +24650,9 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 }
 
 int ds4_token_eos(ds4_engine *e) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 && e->vocab.eot_id >= 0) {
+        return e->vocab.eot_id;
+    }
     return e->vocab.eos_id;
 }
 

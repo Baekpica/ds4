@@ -70,7 +70,7 @@ endif
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression \
         proof-cuda-smoke proof-cuda-long proof-cuda-opp-c print-version \
         test-solar-loader test-solar-kda test-solar-kda-prefill \
-        test-solar-gates test-solar-kv
+        test-solar-gates test-solar-kv test-solar-tokenizer
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -359,10 +359,19 @@ test-solar-loader: tests/test_solar_loader
 		{ echo "set DS4_SOLAR_MODEL to the first Solar GGUF shard" >&2; exit 2; }
 	./tests/test_solar_loader "$(DS4_SOLAR_MODEL)"
 
+tests/test_solar_tokenizer: tests/test_solar_tokenizer.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-solar-tokenizer: tests/test_solar_tokenizer
+	@test -n "$(DS4_SOLAR_MODEL)" || \
+		{ echo "set DS4_SOLAR_MODEL to the first Solar GGUF shard" >&2; exit 2; }
+	./tests/test_solar_tokenizer "$(DS4_SOLAR_MODEL)"
+
 test: ds4_test ds4-eval tests/test_split_gguf
 	./ds4-eval --self-test-extractors
 	./ds4_test
 	./tests/test_split_gguf
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_gates.o tests/test_solar_kv.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_gates.o tests/test_solar_kv.o
