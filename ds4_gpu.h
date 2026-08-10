@@ -594,6 +594,30 @@ int ds4_gpu_embed_tokens_hc_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* Quantized token-table gathers for model families without hyper-connection
+ * replication. The current shared contract accepts Q8_0 (type 8), writes F32
+ * rows, and zeroes invalid token ids in the batched form. */
+int ds4_gpu_embed_token_quant_tensor(
+        ds4_gpu_tensor *out,
+        const void       *model_map,
+        uint64_t          model_size,
+        uint64_t          weight_offset,
+        uint32_t          weight_type,
+        uint32_t          n_vocab,
+        uint32_t          token,
+        uint32_t          n_embd);
+
+int ds4_gpu_embed_tokens_quant_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *tokens,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens,
+        uint32_t                n_embd);
+
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -1861,6 +1885,50 @@ int ds4_gpu_swiglu_tensor(
         uint32_t                n,
         float                   clamp,
         float                   weight);
+
+/* Model-family router semantics used by Solar Open 2 and EXAONE: sigmoid
+ * probabilities, top-k selection on probability + optional bias, then
+ * normalization of the selected UNBIASED probabilities and final scaling. */
+int ds4_gpu_sigmoid_topk_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        int                     have_bias,
+        uint32_t                n_expert,
+        uint32_t                n_used,
+        uint32_t                n_tokens,
+        float                   weight_scale);
+
+/* silu(gate) * up * weights[flat_index / n_ff]. */
+int ds4_gpu_swiglu_weighted_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_ff,
+        uint64_t                count);
+
+/* Quantized routed-expert matmul with the common [token, slot, row] output
+ * contract. The executor selects mmvq for at most eight assignments and MMQ
+ * above that; supported raw GGUF types are Q8_0, Q2_K, Q3_K, Q4_K and
+ * IQ2_XXS. Router weighting is intentionally a separate epilogue. */
+int ds4_gpu_routed_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used);
 
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,

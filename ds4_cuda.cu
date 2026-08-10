@@ -13651,6 +13651,73 @@ __global__ static void router_fused_rows_coop_kernel(
     }
 }
 
+/* Sigmoid router shared by plain-residual model families. Selection uses the
+ * optional correction bias, while the emitted/normalized weights come from
+ * the unbiased probabilities. Strict `>` preserves first-index tie breaking. */
+__global__ static void sigmoid_topk_router_kernel(
+        int32_t *selected,
+        float *weights,
+        const float *logits,
+        const float *bias,
+        uint32_t n_expert,
+        uint32_t n_used,
+        float weight_scale) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    extern __shared__ float scratch[];
+    float *prob = scratch;
+    float *score = scratch + n_expert;
+    const float *row = logits + (uint64_t)token * n_expert;
+
+    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
+        const float x = row[e];
+        const float p = !isfinite(x) ? 0.0f : x >= 0.0f
+            ? 1.0f / (1.0f + __expf(-x))
+            : __expf(x) / (1.0f + __expf(x));
+        const float correction = bias && isfinite(bias[e]) ? bias[e] : 0.0f;
+        prob[e] = p;
+        score[e] = p + correction;
+    }
+    __syncthreads();
+
+    if (tid == 0u) {
+        int32_t *ids = selected + (uint64_t)token * n_used;
+        float *out_weights = weights + (uint64_t)token * n_used;
+        float sum = 0.0f;
+        for (uint32_t slot = 0; slot < n_used; slot++) {
+            int32_t best = -1;
+            float best_score = -INFINITY;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                if (score[e] > best_score) {
+                    best_score = score[e];
+                    best = (int32_t)e;
+                }
+            }
+            ids[slot] = best;
+            out_weights[slot] = prob[(uint32_t)best];
+            sum += out_weights[slot];
+            score[(uint32_t)best] = -INFINITY;
+        }
+        sum = fmaxf(sum, 6.103515625e-5f);
+        for (uint32_t slot = 0; slot < n_used; slot++) {
+            out_weights[slot] = out_weights[slot] / sum * weight_scale;
+        }
+    }
+}
+
+__global__ static void swiglu_weighted_kernel(
+        float *mid,
+        const float *gate,
+        const float *up,
+        const float *weights,
+        uint32_t n_ff,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float g = gate[i];
+    mid[i] = (g / (1.0f + expf(-g))) * up[i] * weights[i / n_ff];
+}
+
 __global__ static void swiglu_kernel(float *out, const float *gate, const float *up, uint32_t n, float clamp, float weight) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -16026,6 +16093,109 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
         }
     }
     mask[gid] = v;
+}
+
+__global__ static void embed_token_q8_0_kernel(
+        float *out,
+        const unsigned char *weights,
+        uint32_t token,
+        uint32_t n_embd) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    const uint64_t row_blocks = n_embd / 32u;
+    const unsigned char *block =
+        weights + ((uint64_t)token * row_blocks + (d >> 5)) * 34u;
+    const float scale = __half2float(*(const __half *)block);
+    out[d] = scale * (float)((const int8_t *)(block + 2))[d & 31u];
+}
+
+__global__ static void embed_tokens_q8_0_kernel(
+        float *out,
+        const int32_t *tokens,
+        const unsigned char *weights,
+        uint32_t n_vocab,
+        uint32_t n_tokens,
+        uint32_t n_embd) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)n_tokens * n_embd;
+    if (i >= count) return;
+    const uint32_t t = (uint32_t)(i / n_embd);
+    const uint32_t d = (uint32_t)(i - (uint64_t)t * n_embd);
+    const int32_t token = tokens[t];
+    if (token < 0 || (uint32_t)token >= n_vocab) {
+        out[i] = 0.0f;
+        return;
+    }
+    const uint64_t row_blocks = n_embd / 32u;
+    const unsigned char *block = weights +
+        ((uint64_t)(uint32_t)token * row_blocks + (d >> 5)) * 34u;
+    const float scale = __half2float(*(const __half *)block);
+    out[i] = scale * (float)((const int8_t *)(block + 2))[d & 31u];
+}
+
+extern "C" int ds4_gpu_embed_token_quant_tensor(
+        ds4_gpu_tensor *out,
+        const void       *model_map,
+        uint64_t          model_size,
+        uint64_t          weight_offset,
+        uint32_t          weight_type,
+        uint32_t          n_vocab,
+        uint32_t          token,
+        uint32_t          n_embd) {
+    if (!out || !model_map || weight_type != 8u || n_vocab == 0u ||
+        token >= n_vocab || n_embd == 0u || (n_embd & 31u) != 0u ||
+        out->bytes < (uint64_t)n_embd * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    if ((uint64_t)n_vocab > UINT64_MAX / row_bytes ||
+        weight_offset > model_size ||
+        (uint64_t)n_vocab * row_bytes > model_size - weight_offset) {
+        return 0;
+    }
+    const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
+        model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
+        "quant_token_embedding");
+    if (!weights) return 0;
+    embed_token_q8_0_kernel<<<(n_embd + 255u) / 256u, 256u, 0,
+                               ds4_current_stream()>>>(
+        (float *)out->ptr, weights, token, n_embd);
+    return cuda_ok(cudaGetLastError(), "Q8_0 token embedding launch");
+}
+
+extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *tokens,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens,
+        uint32_t                n_embd) {
+    if (!out || !tokens || !model_map || weight_type != 8u || n_vocab == 0u ||
+        n_tokens == 0u || n_embd == 0u || (n_embd & 31u) != 0u) {
+        return 0;
+    }
+    const uint64_t count = (uint64_t)n_tokens * n_embd;
+    if (count > UINT64_MAX / sizeof(float) ||
+        tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+        out->bytes < count * sizeof(float)) return 0;
+    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    if ((uint64_t)n_vocab > UINT64_MAX / row_bytes ||
+        weight_offset > model_size ||
+        (uint64_t)n_vocab * row_bytes > model_size - weight_offset) {
+        return 0;
+    }
+    const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
+        model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
+        "quant_token_embedding_batch");
+    if (!weights) return 0;
+    embed_tokens_q8_0_kernel<<<(unsigned)((count + 255u) / 256u), 256u, 0,
+                                ds4_current_stream()>>>(
+        (float *)out->ptr, (const int32_t *)tokens->ptr, weights,
+        n_vocab, n_tokens, n_embd);
+    return cuda_ok(cudaGetLastError(), "Q8_0 token embedding batch launch");
 }
 
 extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
@@ -24515,6 +24685,182 @@ extern "C" int ds4_gpu_attention_output_low_q8_batch_tensor(
                                                       blocks_a,
                                                       use_dp4a);
     return cuda_ok(cudaGetLastError(), "attention_output_low_q8_batch launch");
+}
+
+extern "C" int ds4_gpu_sigmoid_topk_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        int                     have_bias,
+        uint32_t                n_expert,
+        uint32_t                n_used,
+        uint32_t                n_tokens,
+        float                   weight_scale) {
+    if (!selected || !weights || !logits || n_expert == 0u ||
+        n_expert > 4096u || n_used == 0u ||
+        n_used > n_expert || n_tokens == 0u || !isfinite(weight_scale) ||
+        selected->bytes < (uint64_t)n_tokens * n_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_used * sizeof(float) ||
+        logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float)) {
+        return 0;
+    }
+    const float *bias = NULL;
+    if (have_bias) {
+        if (!model_map || bias_offset > model_size ||
+            (uint64_t)n_expert * sizeof(float) > model_size - bias_offset) {
+            return 0;
+        }
+        bias = (const float *)cuda_model_range_ptr(
+            model_map, bias_offset, (uint64_t)n_expert * sizeof(float),
+            "sigmoid_router_bias");
+        if (!bias) return 0;
+    }
+    const uint32_t shared_bytes = 2u * n_expert * (uint32_t)sizeof(float);
+    sigmoid_topk_router_kernel<<<n_tokens, 128u, shared_bytes,
+                                 ds4_current_stream()>>>(
+        (int32_t *)selected->ptr, (float *)weights->ptr,
+        (const float *)logits->ptr, bias, n_expert, n_used, weight_scale);
+    return cuda_ok(cudaGetLastError(), "sigmoid top-k router launch");
+}
+
+extern "C" int ds4_gpu_swiglu_weighted_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_ff,
+        uint64_t                count) {
+    if (!mid || !gate || !up || !weights || n_ff == 0u || count == 0u ||
+        count > UINT64_MAX / sizeof(float) ||
+        count % n_ff != 0u ||
+        mid->bytes < count * sizeof(float) ||
+        gate->bytes < count * sizeof(float) ||
+        up->bytes < count * sizeof(float) ||
+        weights->bytes < (count / n_ff) * sizeof(float)) {
+        return 0;
+    }
+    swiglu_weighted_kernel<<<(unsigned)((count + 255u) / 256u), 256u, 0,
+                              ds4_current_stream()>>>(
+        (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr,
+        (const float *)weights->ptr, n_ff, count);
+    return cuda_ok(cudaGetLastError(), "weighted SwiGLU launch");
+}
+
+extern "C" int ds4_gpu_routed_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used) {
+    if (!out || !x || !ids || !model_map || in_dim == 0u ||
+        (in_dim & 255u) != 0u || out_dim == 0u || n_expert == 0u ||
+        n_tokens == 0u || n_expert_used == 0u ||
+        n_expert_used > n_expert || in_dim > (uint32_t)INT_MAX ||
+        out_dim > (uint32_t)INT_MAX || n_tokens > (uint32_t)INT_MAX ||
+        n_expert > (uint32_t)INT_MAX || n_expert_used > (uint32_t)INT_MAX ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+        return 0;
+    }
+
+    const uint64_t assignments = (uint64_t)n_tokens * n_expert_used;
+    const uint64_t x_count = (uint64_t)n_tokens * in_dim;
+    if (x_count > UINT64_MAX / sizeof(float) ||
+        assignments > UINT64_MAX / sizeof(int32_t) ||
+        assignments > UINT64_MAX / out_dim ||
+        assignments * out_dim > UINT64_MAX / sizeof(float) ||
+        x->bytes < x_count * sizeof(float) ||
+        ids->bytes < assignments * sizeof(int32_t) ||
+        out->bytes < assignments * out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    uint32_t block_size = 0u;
+    uint32_t block_width = 256u;
+    switch (weight_type) {
+    case 8u:  block_size = 34u; block_width = 32u; break;  /* Q8_0 */
+    case 10u: block_size = 84u; break;                     /* Q2_K */
+    case 11u: block_size = 110u; break;                    /* Q3_K */
+    case 12u: block_size = 144u; break;                    /* Q4_K */
+    case 16u: block_size = 66u; break;                     /* IQ2_XXS */
+    default:
+        fprintf(stderr, "ds4: routed matmul unsupported weight type %u\n",
+                weight_type);
+        return 0;
+    }
+    if (in_dim % block_width != 0u) return 0;
+    const uint64_t blocks_per_row = in_dim / block_width;
+    if ((uint64_t)n_expert > UINT64_MAX / out_dim ||
+        (uint64_t)n_expert * out_dim > UINT64_MAX / blocks_per_row ||
+        (uint64_t)n_expert * out_dim * blocks_per_row > UINT64_MAX / block_size) {
+        return 0;
+    }
+    const uint64_t required_bytes =
+        (uint64_t)n_expert * out_dim * blocks_per_row * block_size;
+    if (weight_bytes < required_bytes) return 0;
+    if (!ds4_cuda_use_mmq()) {
+        fprintf(stderr, "ds4: routed quantized matmul requires the MMQ tier\n");
+        return 0;
+    }
+
+    const char *weights = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "routed_expert_weights");
+    if (!weights) return 0;
+    const float *xp = (const float *)x->ptr;
+    const int32_t *idp = (const int32_t *)ids->ptr;
+    float *op = (float *)out->ptr;
+    const int M = (int)out_dim;
+    const int K = (int)in_dim;
+    const int NT = (int)n_tokens;
+    const int NE = (int)n_expert;
+    const int NU = (int)n_expert_used;
+    const bool use_vec = assignments <= 8u;
+    const cudaStream_t stream = ds4_current_stream();
+    int rc = -1;
+    switch (weight_type) {
+    case 8u:
+        rc = use_vec
+            ? ds4_mmq_q8_0_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_q8_0_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        break;
+    case 10u:
+        rc = use_vec
+            ? ds4_mmq_q2_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_q2_K_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        break;
+    case 11u:
+        rc = use_vec
+            ? ds4_mmq_q3_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_q3_K_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        break;
+    case 12u:
+        rc = use_vec
+            ? ds4_mmq_q4_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_q4_K_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        break;
+    case 16u:
+        rc = use_vec
+            ? ds4_mmq_iq2_xxs_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_iq2_xxs_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        break;
+    }
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4: routed matmul type=%u rc=%d (M=%d K=%d tokens=%d used=%d)\n",
+                weight_type, rc, M, K, NT, NU);
+        return 0;
+    }
+    return cuda_ok(cudaGetLastError(), "routed quantized matmul launch");
 }
 
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
