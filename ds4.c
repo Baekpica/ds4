@@ -62118,6 +62118,11 @@ bool ds4_engine_is_exaone_moe(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE;
 }
 
+bool ds4_engine_is_solar_open2(ds4_engine *e) {
+    (void)e;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)

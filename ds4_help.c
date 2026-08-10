@@ -330,14 +330,16 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
 
 static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
+    opt(fp, c, "--model-id ID", "Advertise this ID and name from /v1/models.");
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
+    opt(fp, c, "--recurrent-prompt-cache-mb N", "Solar prompt snapshots in RAM, shared across slots. Default: 6144; 0 disables.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
+    para(fp, c, "Without --model-id, model endpoint aliases are selected from the loaded model family.");
     fputc('\n', fp);
 }
 

@@ -8422,6 +8422,20 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+/* Solar's KDA state is recurrent and cannot be rewound after decode.  Keep one
+ * exact prompt-boundary payload per resident slot so an agent client may omit
+ * the prior sampled tail and still resume from a state that contains both the
+ * GQA KV rows and every KDA recurrent tensor.  A one-entry anchor is deliberate:
+ * it covers the hot agent branch while the disk KV bank remains the durable,
+ * multi-prefix tier. */
+typedef struct {
+    bool valid;
+    ds4_tokens tokens;
+    char *text;
+    size_t text_len;
+    ds4_session_snapshot snapshot;
+} recurrent_prompt_anchor;
+
 struct server_slot {
     server *srv;
     int id;
@@ -8429,6 +8443,7 @@ struct server_slot {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
+    recurrent_prompt_anchor recurrent_prompt;
     int continued_last_store_tokens;
 
     job *assigned;
@@ -8448,6 +8463,7 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
     ds4_engine *engine;
+    const char *model_id;
     server_slot *slots;
     int slot_count;
     int ctx_size;
@@ -8455,6 +8471,7 @@ struct server {
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
+    uint64_t recurrent_prompt_cache_slot_bytes;
     kv_disk_cache kv;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
@@ -8492,6 +8509,66 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static const char *server_advertised_model_id(const server *s) {
+    return s->model_id ? s->model_id : server_model_id_from_engine(s->engine);
+}
+
+static const char *server_advertised_model_name(const server *s) {
+    return s->model_id ? s->model_id : ds4_engine_model_name(s->engine);
+}
+
+static uint64_t recurrent_prompt_cache_slot_budget(uint64_t total_mb,
+                                                   int slot_count) {
+    if (slot_count <= 0) return 0;
+    return total_mb / (uint64_t)slot_count;
+}
+
+static int recurrent_prompt_anchor_token_prefix(
+        const recurrent_prompt_anchor *anchor,
+        const ds4_tokens *prompt) {
+    if (!anchor || !anchor->valid || anchor->tokens.len <= 0 || !prompt) return 0;
+    return ds4_tokens_starts_with(prompt, &anchor->tokens) ?
+           anchor->tokens.len : 0;
+}
+
+static bool recurrent_prompt_anchor_text_prefix(
+        const recurrent_prompt_anchor *anchor,
+        const char *prompt_text) {
+    if (!anchor || !anchor->valid || !anchor->text ||
+        anchor->text_len == 0 || !prompt_text) {
+        return false;
+    }
+    const size_t prompt_len = strlen(prompt_text);
+    return prompt_len >= anchor->text_len &&
+           !memcmp(prompt_text, anchor->text, anchor->text_len);
+}
+
+static bool tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
+    if (!a || !b || a->len != b->len) return false;
+    return a->len == 0 ||
+           !memcmp(a->v, b->v, (size_t)a->len * sizeof(a->v[0]));
+}
+
+static void recurrent_prompt_anchor_invalidate(recurrent_prompt_anchor *anchor) {
+    if (!anchor) return;
+    anchor->valid = false;
+    ds4_tokens_free(&anchor->tokens);
+    free(anchor->text);
+    anchor->text = NULL;
+    anchor->text_len = 0;
+    /* Retain the allocation for a later checkpoint, but never load bytes from
+     * a failed or partial save. */
+    anchor->snapshot.len = 0;
+}
+
+static void recurrent_prompt_anchor_free(recurrent_prompt_anchor *anchor) {
+    if (!anchor) return;
+    ds4_tokens_free(&anchor->tokens);
+    free(anchor->text);
+    ds4_session_snapshot_free(&anchor->snapshot);
+    memset(anchor, 0, sizeof(*anchor));
+}
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
  * completion after it has written the response, so request data and the socket
@@ -9860,6 +9937,7 @@ typedef struct {
     int prompt_len;
     int common;
     int rewind_to;
+    int snapshot_to;
     int start;
     int count;
     int live_id[TRACE_CACHE_WINDOW];
@@ -9876,6 +9954,7 @@ static void trace_cache_capture(
     memset(d, 0, sizeof(*d));
     d->valid = true;
     d->rewind_to = -1;
+    d->snapshot_to = -1;
     d->old_pos = old_pos;
     d->prompt_len = prompt ? prompt->len : 0;
     d->common = common;
@@ -9902,6 +9981,7 @@ static void trace_cache_capture(
 static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
+    if (d->snapshot_to >= 0) return "prompt-snapshot-restore";
     if (d->rewind_to >= 0) return "live-prefix-rewind";
     if (d->common != d->old_pos) return "token-mismatch";
     if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
@@ -9910,7 +9990,7 @@ static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
 
 static bool trace_cache_memory_reusable(const trace_cache_diag *d) {
     return d && d->valid &&
-           (d->rewind_to >= 0 ||
+           (d->snapshot_to >= 0 || d->rewind_to >= 0 ||
             (d->old_pos > 0 && d->common == d->old_pos &&
              d->prompt_len >= d->old_pos));
 }
@@ -10550,6 +10630,147 @@ static int server_session_sync(server *s, server_slot *slot,
         }
     }
     return g_stop_requested ? DS4_SESSION_SYNC_INTERRUPTED : 0;
+}
+
+static int recurrent_prompt_anchor_try_restore(
+        server *s,
+        server_slot *slot,
+        const request *req,
+        ds4_tokens *effective_prompt,
+        const ds4_tokens **prompt_for_sync_out) {
+    if (!s || !slot || !req || !effective_prompt || !prompt_for_sync_out ||
+        !ds4_engine_is_solar_open2(s->engine) ||
+        s->recurrent_prompt_cache_slot_bytes == 0) {
+        return 0;
+    }
+
+    recurrent_prompt_anchor *anchor = &slot->recurrent_prompt;
+    const ds4_tokens *target = NULL;
+    const char *match = NULL;
+    int cached = recurrent_prompt_anchor_token_prefix(anchor, &req->prompt);
+    if (cached > 0) {
+        target = &req->prompt;
+        match = "tokens";
+    } else if (recurrent_prompt_anchor_text_prefix(anchor, req->prompt_text)) {
+        build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, &anchor->tokens,
+            req->prompt_text + anchor->text_len,
+            effective_prompt);
+        target = effective_prompt;
+        cached = anchor->tokens.len;
+        match = "text";
+    } else {
+        return 0;
+    }
+
+    const int live_before = ds4_session_pos(slot->session);
+    char restore_err[160] = {0};
+    const double t0 = now_sec();
+    if (!server_prefill_enter(s, slot)) {
+        if (target == effective_prompt) ds4_tokens_free(effective_prompt);
+        return 0;
+    }
+    int rc = ds4_session_load_snapshot(slot->session, &anchor->snapshot,
+                                       restore_err, sizeof(restore_err));
+    if (rc == 0 &&
+        (ds4_session_pos(slot->session) != anchor->tokens.len ||
+         ds4_session_common_prefix(slot->session, &anchor->tokens) !=
+             anchor->tokens.len)) {
+        snprintf(restore_err, sizeof(restore_err),
+                 "restored recurrent prompt snapshot has the wrong token frontier");
+        rc = 1;
+    }
+    if (rc != 0) {
+        ds4_session_invalidate(slot->session);
+        recurrent_prompt_anchor_invalidate(anchor);
+    }
+    server_prefill_leave(s);
+
+    if (rc != 0) {
+        if (target == effective_prompt) ds4_tokens_free(effective_prompt);
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: Solar recurrent prompt snapshot restore failed; falling back to disk/cold prefill: %s",
+                   restore_err[0] ? restore_err : "unknown error");
+        return 0;
+    }
+
+    slot->continued_last_store_tokens = 0;
+    *prompt_for_sync_out = target;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: Solar recurrent prompt cache hit slot=%d match=%s live=%d cached=%d prompt=%d bytes=%.2f MiB restore=%.3fs",
+               slot->id, match, live_before, cached, target->len,
+               (double)anchor->snapshot.len / (1024.0 * 1024.0),
+               now_sec() - t0);
+    return cached;
+}
+
+static void recurrent_prompt_anchor_maybe_store(
+        server *s,
+        server_slot *slot,
+        const ds4_tokens *prompt,
+        const char *canonical_prompt_text) {
+    if (!s || !slot || !prompt || prompt->len <= 0 ||
+        !ds4_engine_is_solar_open2(s->engine) ||
+        s->recurrent_prompt_cache_slot_bytes == 0) {
+        return;
+    }
+
+    recurrent_prompt_anchor *anchor = &slot->recurrent_prompt;
+    if (anchor->valid && tokens_equal(&anchor->tokens, prompt)) {
+        /* Restoring an identical prompt already left the exact same KDA/GQA
+         * frontier live.  Avoid another multi-hundred-MiB device-to-host copy. */
+        return;
+    }
+
+    const uint64_t bytes = ds4_session_payload_bytes(slot->session);
+    if (bytes == 0 || bytes > s->recurrent_prompt_cache_slot_bytes) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: Solar recurrent prompt snapshot skipped slot=%d tokens=%d payload=%.2f MiB slot_budget=%.2f MiB",
+                   slot->id, prompt->len,
+                   (double)bytes / (1024.0 * 1024.0),
+                   (double)s->recurrent_prompt_cache_slot_bytes /
+                       (1024.0 * 1024.0));
+        return;
+    }
+
+    size_t key_len = 0;
+    char *key_text = NULL;
+    if (canonical_prompt_text) {
+        key_text = xstrdup(canonical_prompt_text);
+        key_len = strlen(key_text);
+    } else {
+        key_text = render_tokens_text(s->engine, prompt, &key_len);
+    }
+
+    char save_err[160] = {0};
+    const double t0 = now_sec();
+    if (!server_prefill_enter(s, slot)) {
+        free(key_text);
+        return;
+    }
+    int rc = ds4_session_save_snapshot(slot->session, &anchor->snapshot,
+                                       save_err, sizeof(save_err));
+    server_prefill_leave(s);
+    if (rc != 0) {
+        free(key_text);
+        recurrent_prompt_anchor_invalidate(anchor);
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: Solar recurrent prompt snapshot save failed: %s",
+                   save_err[0] ? save_err : "unknown error");
+        return;
+    }
+
+    ds4_tokens_free(&anchor->tokens);
+    ds4_tokens_copy(&anchor->tokens, prompt);
+    free(anchor->text);
+    anchor->text = key_text;
+    anchor->text_len = key_len;
+    anchor->valid = true;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: Solar recurrent prompt snapshot stored slot=%d tokens=%d bytes=%.2f MiB save=%.3fs",
+               slot->id, prompt->len,
+               (double)anchor->snapshot.len / (1024.0 * 1024.0),
+               now_sec() - t0);
 }
 
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
@@ -11323,6 +11544,17 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    if (cached == 0) {
+        const ds4_tokens *snapshot_prompt = NULL;
+        int snapshot_cached = recurrent_prompt_anchor_try_restore(
+            s, slot, &j->req, &effective_prompt, &snapshot_prompt);
+        if (snapshot_cached > 0) {
+            cached = snapshot_cached;
+            cache_source = "memory-snapshot";
+            prompt_for_sync = snapshot_prompt;
+            cache_diag.snapshot_to = cached;
+        }
+    }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
@@ -11526,6 +11758,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
         }
     }
+    recurrent_prompt_anchor_maybe_store(
+        s, slot, prompt_for_sync,
+        tokens_equal(prompt_for_sync, &j->req.prompt) ?
+            j->req.prompt_text : NULL);
     const uint64_t response_seq = server_next_sequence(s);
     char id[96];
     snprintf(id, sizeof(id), "%s-%llu",
@@ -12574,7 +12810,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
-                             ds4_engine_model_name(s->engine),
+                             server_advertised_model_name(s),
                              s->ctx_size,
                              s->default_tokens);
 }
@@ -12591,7 +12827,9 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
+    if (s->model_id) {
+        append_model_json(&b, s, s->model_id);
+    } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-chat");
@@ -12653,7 +12891,9 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        (server_model_alias_known(hr.path + model_path_prefix_len) ||
+         (s->model_id &&
+          !strcmp(hr.path + model_path_prefix_len, s->model_id))))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -12689,7 +12929,7 @@ static void *client_main(void *arg) {
     }
     if (!req.model_from_request) {
         free(req.model);
-        req.model = xstrdup(server_model_id_from_engine(s->engine));
+        req.model = xstrdup(server_advertised_model_id(s));
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
@@ -12773,10 +13013,12 @@ typedef struct {
     ds4_engine_options engine;
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
+    const char *model_id;
     const char *host;
     int port;
     int ctx_size;
     int default_tokens;
+    uint64_t recurrent_prompt_cache_mb;
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
@@ -12865,6 +13107,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
+        recurrent_prompt_anchor_free(&slot->recurrent_prompt);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
@@ -12925,6 +13168,7 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
+        .recurrent_prompt_cache_mb = 6144,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
     };
@@ -12992,6 +13236,13 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--model-id")) {
+            c.model_id = need_arg(&i, argc, argv, arg);
+            if (!c.model_id[0]) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --model-id must not be empty");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--host")) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
@@ -13005,6 +13256,9 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--recurrent-prompt-cache-mb")) {
+            c.recurrent_prompt_cache_mb = (uint64_t)parse_nonneg_int_arg(
+                need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -13218,12 +13472,17 @@ int main(int argc, char **argv) {
 
     server s = {0};
     s.engine = engine;
+    s.model_id = cfg.model_id;
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
+    const uint64_t recurrent_slot_mb = recurrent_prompt_cache_slot_budget(
+        cfg.recurrent_prompt_cache_mb, slot_count);
+    s.recurrent_prompt_cache_slot_bytes =
+        recurrent_slot_mb * UINT64_C(1024) * UINT64_C(1024);
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -13264,6 +13523,14 @@ int main(int argc, char **argv) {
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+    }
+    if (ds4_engine_is_solar_open2(engine)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: Solar recurrent prompt cache total=%llu MiB slots=%d per_slot=%llu MiB%s",
+                   (unsigned long long)cfg.recurrent_prompt_cache_mb,
+                   slot_count,
+                   (unsigned long long)recurrent_slot_mb,
+                   recurrent_slot_mb ? "" : " (disabled)");
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -13466,6 +13733,89 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+static void test_model_id_option(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.model_id == NULL);
+
+    char *custom_argv[] = {
+        "ds4-server", "--model-id", "Solar-Open2-250B-Mixed-Quant-GGUF"
+    };
+    server_config custom = parse_options(3, custom_argv);
+    TEST_ASSERT(custom.model_id != NULL);
+    TEST_ASSERT(!strcmp(custom.model_id,
+                        "Solar-Open2-250B-Mixed-Quant-GGUF"));
+
+    server s = {
+        .model_id = custom.model_id,
+        .ctx_size = 262144,
+        .default_tokens = 4096,
+    };
+    TEST_ASSERT(!strcmp(server_advertised_model_id(&s), custom.model_id));
+    TEST_ASSERT(!strcmp(server_advertised_model_name(&s), custom.model_id));
+
+    buf b = {0};
+    append_model_json(&b, &s, server_advertised_model_id(&s));
+    TEST_ASSERT(strstr(b.ptr,
+                       "\"id\":\"Solar-Open2-250B-Mixed-Quant-GGUF\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr,
+                       "\"name\":\"Solar-Open2-250B-Mixed-Quant-GGUF\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context_length\":262144") != NULL);
+    buf_free(&b);
+}
+
+static void test_recurrent_prompt_cache_option_and_matching(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.recurrent_prompt_cache_mb == 6144);
+
+    char *custom_argv[] = {
+        "ds4-server", "--recurrent-prompt-cache-mb", "1024"
+    };
+    server_config custom = parse_options(3, custom_argv);
+    TEST_ASSERT(custom.recurrent_prompt_cache_mb == 1024);
+    char *disabled_argv[] = {
+        "ds4-server", "--recurrent-prompt-cache-mb", "0"
+    };
+    server_config disabled = parse_options(3, disabled_argv);
+    TEST_ASSERT(disabled.recurrent_prompt_cache_mb == 0);
+    TEST_ASSERT(recurrent_prompt_cache_slot_budget(6144, 1) == 6144);
+    TEST_ASSERT(recurrent_prompt_cache_slot_budget(6144, 3) == 2048);
+    TEST_ASSERT(recurrent_prompt_cache_slot_budget(2, 3) == 0);
+
+    int anchor_ids[] = {10, 20, 30};
+    int same_ids[] = {10, 20, 30};
+    int extended_ids[] = {10, 20, 30, 40};
+    int diverged_ids[] = {10, 20, 31, 40};
+    int shorter_ids[] = {10, 20};
+    recurrent_prompt_anchor anchor = {
+        .valid = true,
+        .tokens = {.v = anchor_ids, .len = 3},
+        .text = "system prompt<assistant>",
+        .text_len = strlen("system prompt<assistant>"),
+    };
+    ds4_tokens same = {.v = same_ids, .len = 3};
+    ds4_tokens extended = {.v = extended_ids, .len = 4};
+    ds4_tokens diverged = {.v = diverged_ids, .len = 4};
+    ds4_tokens shorter = {.v = shorter_ids, .len = 2};
+
+    TEST_ASSERT(recurrent_prompt_anchor_token_prefix(&anchor, &same) == 3);
+    TEST_ASSERT(recurrent_prompt_anchor_token_prefix(&anchor, &extended) == 3);
+    TEST_ASSERT(recurrent_prompt_anchor_token_prefix(&anchor, &diverged) == 0);
+    TEST_ASSERT(recurrent_prompt_anchor_token_prefix(&anchor, &shorter) == 0);
+    anchor.valid = false;
+    TEST_ASSERT(recurrent_prompt_anchor_token_prefix(&anchor, &same) == 0);
+    anchor.valid = true;
+
+    TEST_ASSERT(recurrent_prompt_anchor_text_prefix(
+        &anchor, "system prompt<assistant>"));
+    TEST_ASSERT(recurrent_prompt_anchor_text_prefix(
+        &anchor, "system prompt<assistant>tool result"));
+    TEST_ASSERT(!recurrent_prompt_anchor_text_prefix(
+        &anchor, "system prompt<assistant-ish>"));
+    TEST_ASSERT(!recurrent_prompt_anchor_text_prefix(&anchor, NULL));
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -17909,6 +18259,8 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_model_id_option();
+    test_recurrent_prompt_cache_option_and_matching();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
