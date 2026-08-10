@@ -72,6 +72,10 @@ typedef struct {
 struct solar_cont_test {
     const ds4_tokens *prompt[2];
     solar_cont_user user[2];
+    int n_requests;
+    int first_cached;
+    int first_max_new;
+    int first_place_bank;
     int next_admit;
     int allow_second;
     int failed;
@@ -97,20 +101,20 @@ static int solar_cont_on_admitted(void *ud, void *user, int n_cached,
 
 static int solar_cont_admit(void *ud, ds4_cont_request *req) {
     solar_cont_test *test = ud;
-    if (test->next_admit >= 2) return 0;
+    if (test->next_admit >= test->n_requests) return 0;
     if (test->next_admit == 1 && !test->allow_second) return 0;
     const int i = test->next_admit++;
     memset(req, 0, sizeof(*req));
     req->tokens = test->prompt[i]->v;
     req->n = test->prompt[i]->len;
-    req->max_new = i == 0 ? 3 : 1;
+    req->max_new = i == 0 ? test->first_max_new : 1;
     req->eos = -1;
     req->user = &test->user[i];
     req->on_admitted = solar_cont_on_admitted;
     req->bank_used = &test->bank_used[i];
     if (i == 0) {
-        req->place_bank = 1;
-        req->n_cached = test->prompt[i]->len;
+        req->place_bank = test->first_place_bank;
+        req->n_cached = test->first_cached;
     }
     return 1;
 }
@@ -160,12 +164,14 @@ int main(int argc, char **argv) {
     ds4_session *session = NULL;
     ds4_tokens prompt = {0};
     ds4_tokens prompt_alt = {0};
+    ds4_tokens prompt_restored = {0};
     float *initial = NULL;
     float *decoded = NULL;
     float *warm = NULL;
     float *replayed = NULL;
     ds4_session_snapshot snapshot = {0};
     ds4_session_snapshot restored_snapshot = {0};
+    ds4_session_payload_file bank_payload = {0};
     char err[256] = "";
     int failed = 0;
 
@@ -427,6 +433,12 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     const int third_next = ds4_session_argmax(session);
+    if (ds4_session_eval(session, third_next, err, sizeof(err)) != 0) {
+        fprintf(stderr, "Solar scalar fourth-token oracle failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+    const int fourth_next = ds4_session_argmax(session);
     ds4_session_invalidate(session);
     if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0 ||
         ds4_session_argmax(session) != next) {
@@ -479,6 +491,10 @@ int main(int argc, char **argv) {
     solar_cont_test cont = {0};
     cont.prompt[0] = &prompt;
     cont.prompt[1] = &prompt_alt;
+    cont.n_requests = 2;
+    cont.first_cached = prompt.len;
+    cont.first_max_new = 3;
+    cont.first_place_bank = 1;
     cont.user[0].test = &cont;
     cont.user[0].id = 0;
     cont.user[1].test = &cont;
@@ -532,6 +548,79 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "Solar batching: scalar seeds=%d/%d rolling=%d,%d,%d + %d\n",
             next, alt_next, next, decoded_argmax, third_next, alt_next);
+
+    const uint64_t bank_bytes =
+        ds4_cont_bank_payload_bytes(batch_ctx, 0);
+    err[0] = '\0';
+    if (bank_bytes == 0u ||
+        ds4_cont_bank_stage_payload(
+            batch_ctx, 0, &bank_payload, err, sizeof(err)) != 0 ||
+        bank_payload.bytes != bank_bytes || !bank_payload.path) {
+        fprintf(stderr, "Solar bank payload stage failed: %s\n", err);
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+    FILE *bank_fp = fopen(bank_payload.path, "rb");
+    if (!bank_fp || ds4_cont_bank_restore_payload(
+            batch_ctx, 1, bank_fp, bank_payload.bytes,
+            err, sizeof(err)) != 0) {
+        fprintf(stderr, "Solar bank payload restore failed: %s\n", err);
+        if (bank_fp) fclose(bank_fp);
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+    if (fclose(bank_fp) != 0) {
+        perror("Solar bank payload close");
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+    ds4_session_payload_file_free(&bank_payload);
+
+    for (int i = 0; i < prompt.len; i++)
+        ds4_tokens_push(&prompt_restored, prompt.v[i]);
+    ds4_tokens_push(&prompt_restored, next);
+    ds4_tokens_push(&prompt_restored, decoded_argmax);
+    ds4_tokens_push(&prompt_restored, third_next);
+    solar_cont_test restored = {0};
+    restored.prompt[0] = &prompt_restored;
+    restored.n_requests = 1;
+    restored.first_cached = 6;
+    restored.first_max_new = 1;
+    restored.first_place_bank = 2;
+    restored.user[0].test = &restored;
+    restored.user[0].id = 0;
+    restored.bank_used[0] = -1;
+    restored.admitted_cached[0] = -1;
+    restored.admitted_computed[0] = -1;
+    restored.admitted_bank[0] = -1;
+    err[0] = '\0';
+    if (ds4_engine_continuous_generate(
+            batch_ctx, solar_cont_admit, solar_cont_on_token,
+            solar_cont_on_done, &restored, err, sizeof(err)) != 0 ||
+        restored.failed || restored.done != 1 ||
+        restored.n_tokens[0] != 1 ||
+        restored.tokens[0][0] != fourth_next ||
+        restored.bank_used[0] != 1 ||
+        restored.admitted_cached[0] != 6 ||
+        restored.admitted_computed[0] != 1 ||
+        restored.admitted_bank[0] != 1 ||
+        ds4_batch_ctx_bank_committed(batch_ctx, 1, NULL) != 7) {
+        fprintf(stderr,
+                "Solar restored bank warm continuation failed: %s "
+                "done=%d token=%d/%d bank=%d split=%d+%d\n",
+                err, restored.done, restored.tokens[0][0], fourth_next,
+                restored.bank_used[0], restored.admitted_cached[0],
+                restored.admitted_computed[0]);
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "Solar bank persistence: bytes=%llu cached=6 computed=1 next=%d\n",
+            (unsigned long long)bank_bytes, fourth_next);
     ds4_batch_ctx_destroy(batch_ctx);
 
     ds4_batch_gen_result batch_result = {0};
@@ -575,6 +664,7 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
+    ds4_session_payload_file_free(&bank_payload);
     ds4_session_snapshot_free(&restored_snapshot);
     ds4_session_snapshot_free(&snapshot);
     free(replayed);
@@ -582,6 +672,7 @@ cleanup:
     free(decoded);
     free(initial);
     ds4_session_free(session);
+    ds4_tokens_free(&prompt_restored);
     ds4_tokens_free(&prompt_alt);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);

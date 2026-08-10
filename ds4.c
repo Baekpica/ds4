@@ -36070,9 +36070,259 @@ static void ds4_cont_bank_walk_done(ds4_batch_ctx *ctx, ds4_gpu_graph *wg) {
     free(wg);
 }
 
+static uint64_t solar_cont_bank_payload_bytes(ds4_batch_ctx *ctx,
+                                              uint32_t bank) {
+    if (!ctx || !ctx->solar || bank >= ctx->max_seq ||
+        !ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0u) {
+        return 0u;
+    }
+    ds4_solar_batch_runtime *rt = ctx->solar;
+    const uint32_t live = ctx->bank_hist_len[bank];
+    if (live >= ctx->ctx_size || rt->graph.state_bytes == 0u ||
+        rt->graph.state_bytes > UINT32_MAX ||
+        rt->graph.base.kv_row_bytes == 0u ||
+        rt->graph.base.kv_row_bytes > UINT32_MAX) {
+        return 0u;
+    }
+    uint64_t bytes =
+        (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    if (!payload_u64_add(&bytes, (uint64_t)live * sizeof(uint32_t)) ||
+        !payload_u64_add(
+            &bytes, (uint64_t)DS4_N_VOCAB * sizeof(float)) ||
+        !payload_u64_add(&bytes, rt->graph.state_bytes)) {
+        return 0u;
+    }
+    const uint64_t kv_bytes =
+        (uint64_t)live * rt->graph.base.kv_row_bytes;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_solar_layer_is_gqa(il) &&
+            !payload_u64_add(&bytes, kv_bytes)) {
+            return 0u;
+        }
+    }
+    return bytes;
+}
+
+static int solar_cont_bank_save_payload(
+        ds4_batch_ctx *ctx, uint32_t bank, FILE *fp,
+        char *err, size_t errlen) {
+    ds4_solar_batch_runtime *rt = ctx->solar;
+    const uint32_t live = ctx->bank_hist_len[bank];
+    if (solar_cont_bank_payload_bytes(ctx, bank) == 0u) {
+        payload_set_err(err, errlen,
+                        "Solar bank payload layout is invalid");
+        return 1;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator before Solar bank snapshot");
+        return 1;
+    }
+    uint32_t n_gqa = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        n_gqa += ds4_solar_layer_is_gqa(il);
+    uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC,
+        DS4_SESSION_PAYLOAD_VERSION,
+        ctx->ctx_size,
+        (uint32_t)rt->graph.base.kv_format,
+        rt->graph.base.ctx_size,
+        DS4_SESSION_SOLAR_LAYOUT_MAGIC,
+        (uint32_t)rt->graph.state_bytes,
+        live,
+        DS4_N_LAYER,
+        (uint32_t)rt->graph.base.kv_row_bytes,
+        n_gqa,
+        DS4_N_VOCAB,
+        live,
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    const int *tokens =
+        ctx->bank_hist + (size_t)bank * ctx->seq_cap;
+    for (uint32_t i = 0; i < live; i++) {
+        if (payload_write_u32(fp, (uint32_t)tokens[i], err, errlen) != 0)
+            return 1;
+    }
+
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    memset(buf, 0, DS4_SESSION_IO_CHUNK);
+    uint64_t zeros_left = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    int rc = 0;
+    while (rc == 0 && zeros_left != 0u) {
+        const size_t n = zeros_left > DS4_SESSION_IO_CHUNK
+            ? DS4_SESSION_IO_CHUNK : (size_t)zeros_left;
+        rc = payload_write_bytes(fp, buf, n, err, errlen);
+        zeros_left -= n;
+    }
+    if (rc == 0) {
+        rc = payload_write_tensor_span(
+            fp, rt->state_pool[bank], 0, rt->graph.state_bytes,
+            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    }
+    const uint64_t live_kv_bytes =
+        (uint64_t)live * rt->graph.base.kv_row_bytes;
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        if (!ds4_solar_layer_is_gqa(il)) continue;
+        rc = payload_write_tensor_span(
+            fp, rt->kv[bank][il], 0, live_kv_bytes,
+            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    }
+    free(buf);
+    return rc;
+}
+
+static void solar_cont_bank_restore_failed(ds4_batch_ctx *ctx,
+                                           uint32_t bank) {
+    ctx->bank_gen[bank]++;
+    ctx->bank_hist_valid[bank] = 0u;
+    ctx->bank_hist_len[bank] = 0u;
+    ctx->solar->bank_logits_valid[bank] = 0u;
+    (void)solar_batch_runtime_reset_bank(ctx->solar, bank);
+}
+
+static int solar_cont_bank_restore_payload(
+        ds4_batch_ctx *ctx, uint32_t bank, FILE *fp,
+        uint64_t payload_bytes, char *err, size_t errlen) {
+    ds4_solar_batch_runtime *rt = ctx->solar;
+    uint64_t remaining = payload_bytes;
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0)
+            return 1;
+    }
+    uint32_t n_gqa = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        n_gqa += ds4_solar_layer_is_gqa(il);
+    const uint32_t saved_ctx = h[2];
+    const uint32_t saved_tokens = h[7];
+    const uint32_t saved_live = h[12];
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
+        h[1] != DS4_SESSION_PAYLOAD_VERSION ||
+        h[5] != DS4_SESSION_SOLAR_LAYOUT_MAGIC) {
+        payload_set_err(err, errlen,
+                        "unsupported Solar bank payload layout");
+        return 1;
+    }
+    if (h[3] != (uint32_t)rt->graph.base.kv_format ||
+        h[4] != saved_ctx || h[6] != rt->graph.state_bytes ||
+        h[8] != DS4_N_LAYER ||
+        h[9] != rt->graph.base.kv_row_bytes ||
+        h[10] != n_gqa || h[11] != DS4_N_VOCAB) {
+        payload_set_err(err, errlen,
+                        "bank payload was written for a different Solar layout");
+        return 1;
+    }
+    if (saved_ctx == 0u || saved_ctx > ctx->ctx_size ||
+        saved_tokens == 0u || saved_tokens >= saved_ctx ||
+        saved_tokens >= ctx->seq_cap || saved_live != saved_tokens) {
+        payload_set_err(err, errlen,
+                        "Solar bank payload does not fit the current context");
+        return 1;
+    }
+    uint64_t expected = (uint64_t)saved_tokens * sizeof(uint32_t);
+    if (!payload_u64_add(
+            &expected, (uint64_t)DS4_N_VOCAB * sizeof(float)) ||
+        !payload_u64_add(&expected, rt->graph.state_bytes)) {
+        payload_set_err(err, errlen,
+                        "Solar bank payload size overflow");
+        return 1;
+    }
+    const uint64_t live_kv_bytes =
+        (uint64_t)saved_live * rt->graph.base.kv_row_bytes;
+    for (uint32_t i = 0; i < n_gqa; i++) {
+        if (!payload_u64_add(&expected, live_kv_bytes)) {
+            payload_set_err(err, errlen,
+                            "Solar bank payload size overflow");
+            return 1;
+        }
+    }
+    if (remaining != expected) {
+        payload_set_err(err, errlen,
+                        "Solar bank payload byte count does not match its header");
+        return 1;
+    }
+    if (!solar_batch_runtime_ensure_state(rt, bank) ||
+        !solar_batch_runtime_ensure_kv(rt, bank, saved_live)) {
+        payload_set_err(err, errlen,
+                        "failed to map Solar bank state for restore");
+        return 1;
+    }
+
+    int *tokens = xmalloc((size_t)saved_tokens * sizeof(*tokens));
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < saved_tokens; i++) {
+        uint32_t tok = 0u;
+        rc = payload_read_u32(fp, &tok, &remaining, err, errlen);
+        if (rc == 0 && tok >= DS4_N_VOCAB) {
+            payload_set_err(err, errlen,
+                            "Solar bank payload contains an invalid token");
+            rc = 1;
+        }
+        tokens[i] = (int)tok;
+    }
+    float *logits = rt->bank_logits + (size_t)bank * DS4_N_VOCAB;
+    if (rc == 0) {
+        rc = payload_read_bytes(
+            fp, logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
+            &remaining, err, errlen);
+    }
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator before Solar bank restore");
+        rc = 1;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    if (rc == 0) {
+        rc = payload_read_tensor_span(
+            fp, rt->state_pool[bank], 0, rt->graph.state_bytes,
+            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+    }
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        if (!ds4_solar_layer_is_gqa(il)) continue;
+        rc = payload_read_tensor_span(
+            fp, rt->kv[bank][il], 0, live_kv_bytes,
+            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+    }
+    free(buf);
+    if (rc == 0 && remaining != 0u) {
+        payload_set_err(err, errlen,
+                        "Solar bank payload has trailing bytes");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator after Solar bank restore");
+        rc = 1;
+    }
+    if (rc != 0) {
+        free(tokens);
+        solar_cont_bank_restore_failed(ctx, bank);
+        return 1;
+    }
+
+    memcpy(ctx->bank_hist + (size_t)bank * ctx->seq_cap, tokens,
+           (size_t)saved_tokens * sizeof(*tokens));
+    free(tokens);
+    bool logits_valid = false;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if (isfinite(logits[i]) && logits[i] != 0.0f) {
+            logits_valid = true;
+            break;
+        }
+    }
+    rt->bank_logits_valid[bank] = logits_valid ? 1u : 0u;
+    ctx->bank_gen[bank]++;
+    ctx->bank_hist_len[bank] = saved_tokens;
+    ctx->bank_hist_valid[bank] = 1u;
+    return 0;
+}
+
 uint64_t ds4_cont_bank_payload_bytes(ds4_batch_ctx *ctx, uint32_t bank) {
     if (!ctx || bank >= (uint32_t)ctx->max_seq || !ctx->bank_hist_valid[bank] ||
         ctx->bank_hist_len[bank] == 0) return 0;
+    if (ctx->solar) return solar_cont_bank_payload_bytes(ctx, bank);
     ds4_gpu_graph *g = &ctx->g;
     ds4_gpu_graph *wg = ds4_cont_bank_walk_graph(ctx);
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
@@ -36118,6 +36368,10 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
     if (!ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0) {
         payload_set_err(err, errlen, "bank has no reuse-trustworthy committed history");
         return 1;
+    }
+    if (ctx->solar) {
+        return solar_cont_bank_save_payload(
+            ctx, bank, fp, err, errlen);
     }
     ds4_gpu_graph *g = &ctx->g;
     const int *tokens = ctx->bank_hist + (uint64_t)bank * ctx->seq_cap;
@@ -36195,6 +36449,10 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
     if (!ctx || !fp || bank >= (uint32_t)ctx->max_seq) {
         payload_set_err(err, errlen, "invalid bank payload load");
         return 1;
+    }
+    if (ctx->solar) {
+        return solar_cont_bank_restore_payload(
+            ctx, bank, fp, payload_bytes, err, errlen);
     }
     ds4_gpu_graph *g = &ctx->g;
     uint64_t remaining = payload_bytes;
