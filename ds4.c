@@ -1211,6 +1211,12 @@ typedef struct {
 
     ds4_kv *kv;
     ds4_tensor *tensors;
+
+    /* Split GGUF shards are mapped into one reserved virtual range.  Keeping
+     * one map base preserves the engine-wide map + abs_offset tensor contract
+     * and leaves every existing CPU/GPU kernel path shard-agnostic. */
+    uint32_t split_count;
+    int *split_fds;       /* descriptors for shards 1..split_count-1 */
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -1319,6 +1325,14 @@ static bool model_get_string(const ds4_model *m, const char *key, ds4_str *out) 
     return cursor_string(&c, out);
 }
 
+/* llama.cpp's GGUF splitter writes split.count as UINT16. */
+static bool model_get_u16(const ds4_model *m, const char *key, uint16_t *out) {
+    ds4_kv *kv = model_find_kv(m, key);
+    if (!kv || kv->type != GGUF_VALUE_UINT16) return false;
+    ds4_cursor c = cursor_at(m, kv->value_pos);
+    return cursor_read(&c, out, sizeof(*out));
+}
+
 static bool model_get_u32(const ds4_model *m, const char *key, uint32_t *out) {
     ds4_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != GGUF_VALUE_UINT32) return false;
@@ -1409,6 +1423,12 @@ static void model_close(ds4_model *m) {
     free(m->kv);
     free(m->tensors);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
+    if (m->split_fds) {
+        for (uint32_t i = 0; i + 1 < m->split_count; i++) {
+            if (m->split_fds[i] >= 0) close(m->split_fds[i]);
+        }
+        free(m->split_fds);
+    }
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
     m->fd = -1;
@@ -1588,6 +1608,60 @@ static void *model_copy_anon_huge(int fd, size_t size, const char *path) {
 }
 #endif
 
+/* Substitute the shard index in a conventional
+ * `name-00001-of-00003.gguf` path. */
+static bool model_split_sibling_path(const char *path, uint32_t index,
+                                     uint32_t count, char *out,
+                                     size_t out_len) {
+    const char *dash = strrchr(path, '-');
+    if (!dash) return false;
+    unsigned parsed_count = 0;
+    if (sscanf(dash, "-%05u.gguf", &parsed_count) != 1 ||
+        parsed_count != count) {
+        return false;
+    }
+    if (dash - path < 9) return false;
+    const char *of = dash - 3;
+    if (strncmp(of, "-of", 3) != 0) return false;
+    const char *num = of - 5;
+    if (num - path < 1 || num[-1] != '-') return false;
+    for (int i = 0; i < 5; i++) {
+        if (num[i] < '0' || num[i] > '9') return false;
+    }
+    const size_t prefix_len = (size_t)(num - path);
+    const int n = snprintf(out, out_len, "%.*s%05u-of-%05u.gguf",
+                           (int)prefix_len, path, index + 1u, count);
+    return n > 0 && (size_t)n < out_len;
+}
+
+/* Parse a mapped shard header and tensor directory.  The returned metadata
+ * and tensor arrays own only their tables; strings continue to point into the
+ * caller-owned shard mapping. */
+static void model_parse_shard(ds4_model *shard, const uint8_t *base,
+                              uint64_t size, const char *path) {
+    memset(shard, 0, sizeof(*shard));
+    shard->fd = -1;
+    shard->map = base;
+    shard->size = size;
+
+    ds4_cursor c = cursor_at(shard, 0);
+    uint32_t magic = 0;
+    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
+    if (magic != DS4_GGUF_MAGIC) {
+        fprintf(stderr, "ds4: model shard is not a GGUF file: %s\n", path);
+        exit(1);
+    }
+    if (!cursor_u32(&c, &shard->version)) ds4_die(c.error);
+    if (!cursor_u64(&c, &shard->n_tensors)) ds4_die(c.error);
+    if (!cursor_u64(&c, &shard->n_kv)) ds4_die(c.error);
+    if (shard->version != 3) ds4_die("only GGUF v3 is supported");
+    parse_metadata(shard, &c);
+    parse_tensors(shard, &c);
+}
+
+static void model_open_split(ds4_model *m, const char *path, uint32_t count,
+                             int mmap_flags);
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
@@ -1660,7 +1734,175 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 
+    uint16_t split_count16 = 0;
+    uint32_t split_count = 0;
+    if (model_get_u16(m, "split.count", &split_count16)) {
+        split_count = split_count16;
+    } else {
+        (void)model_get_u32(m, "split.count", &split_count);
+    }
+    if (split_count > 1u) {
+        free(m->kv);
+        free(m->tensors);
+        m->kv = NULL;
+        m->tensors = NULL;
+        munmap((void *)m->map, (size_t)m->size);
+        m->map = NULL;
+        close(m->fd);
+        m->fd = -1;
+        model_open_split(m, path, split_count, mmap_flags);
+    }
+
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+}
+
+/* Map all files in a split GGUF into one reserved virtual range.  Each
+ * tensor's absolute offset is biased by its shard base, so downstream code
+ * continues to resolve weights as model->map + tensor->abs_offset. */
+static void model_open_split(ds4_model *m, const char *path, uint32_t count,
+                             int mmap_flags) {
+    if (count > 99999u) ds4_die("split GGUF shard count exceeds filename format");
+    char expected_first[PATH_MAX];
+    if (!model_split_sibling_path(path, 0, count,
+                                  expected_first, sizeof(expected_first)) ||
+        strcmp(path, expected_first) != 0) {
+        fprintf(stderr,
+                "ds4: open split GGUFs through their first shard "
+                "(-00001-of-%%05u.gguf): %s\n",
+                path);
+        exit(1);
+    }
+    const long page_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_l > 0 ? (uint64_t)page_l : 4096u;
+    int *fds = xcalloc(count, sizeof(*fds));
+    uint64_t *sizes = xcalloc(count, sizeof(*sizes));
+    uint64_t *bases = xcalloc(count, sizeof(*bases));
+    uint64_t total = 0;
+    char sibling[PATH_MAX];
+
+    for (uint32_t k = 0; k < count; k++) {
+        const char *shard_path = path;
+        if (k > 0) {
+            if (!model_split_sibling_path(path, k, count,
+                                          sibling, sizeof(sibling))) {
+                fprintf(stderr,
+                        "ds4: %s declares split.count=%u but does not use the "
+                        "-%%05u-of-%%05u.gguf naming convention\n",
+                        path, count);
+                exit(1);
+            }
+            shard_path = sibling;
+        }
+        fds[k] = open(shard_path, O_RDONLY);
+        if (fds[k] == -1) ds4_die_errno("cannot open model shard", shard_path);
+        struct stat st;
+        if (fstat(fds[k], &st) == -1) {
+            ds4_die_errno("cannot stat model shard", shard_path);
+        }
+        if (st.st_size < 32) ds4_die("model shard is too small to be GGUF");
+        sizes[k] = (uint64_t)st.st_size;
+        bases[k] = total;
+        const uint64_t span = align_up(sizes[k], page);
+        if (span > UINT64_MAX - total) ds4_die("split GGUF size overflow");
+        total += span;
+    }
+    if (total > SIZE_MAX) ds4_die("split GGUF virtual range is too large");
+
+    int reserve_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    reserve_flags |= MAP_NORESERVE;
+#endif
+    void *region = mmap(NULL, (size_t)total, PROT_NONE,
+                        reserve_flags, -1, 0);
+    if (region == MAP_FAILED) {
+        ds4_die_errno("cannot reserve split GGUF address range", path);
+    }
+
+    for (uint32_t k = 0; k < count; k++) {
+        void *want = (uint8_t *)region + bases[k];
+        void *got = mmap(want, (size_t)sizes[k], PROT_READ,
+                         mmap_flags | MAP_FIXED, fds[k], 0);
+        if (got == MAP_FAILED) ds4_die_errno("cannot mmap model shard", path);
+    }
+
+    m->map = region;
+    m->size = total;
+    m->fd = fds[0];
+    ds4_cursor c = cursor_at(m, 0);
+    uint32_t magic = 0;
+    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
+    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
+    if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
+    if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
+    if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
+    if (m->version != 3) ds4_die("only GGUF v3 is supported");
+    parse_metadata(m, &c);
+    parse_tensors(m, &c);
+
+    uint64_t total_tensors = m->n_tensors;
+    ds4_model *shards = xcalloc(count, sizeof(*shards));
+    for (uint32_t k = 1; k < count; k++) {
+        model_parse_shard(&shards[k],
+                          (const uint8_t *)region + bases[k],
+                          sizes[k], path);
+        if (shards[k].n_tensors > UINT64_MAX - total_tensors) {
+            ds4_die("split GGUF tensor count overflow");
+        }
+        total_tensors += shards[k].n_tensors;
+    }
+    if (total_tensors > SIZE_MAX / sizeof(ds4_tensor)) {
+        ds4_die("split GGUF tensor table is too large");
+    }
+
+    ds4_tensor *all = xcalloc((size_t)total_tensors, sizeof(*all));
+    memcpy(all, m->tensors, (size_t)m->n_tensors * sizeof(*all));
+    uint64_t at = m->n_tensors;
+    for (uint32_t k = 1; k < count; k++) {
+        for (uint64_t i = 0; i < shards[k].n_tensors; i++) {
+            ds4_tensor t = shards[k].tensors[i];
+            t.abs_offset += bases[k];
+            if (t.bytes > m->max_tensor_bytes) m->max_tensor_bytes = t.bytes;
+            all[at++] = t;
+        }
+        free(shards[k].kv);
+        free(shards[k].tensors);
+    }
+    free(shards);
+    free(m->tensors);
+    m->tensors = all;
+    m->n_tensors = total_tensors;
+
+    uint32_t expected_tensors = 0;
+    ds4_kv *count_kv = model_find_kv(m, "split.tensors.count");
+    if (count_kv && (count_kv->type == GGUF_VALUE_INT32 ||
+                     count_kv->type == GGUF_VALUE_UINT32)) {
+        ds4_cursor tc = cursor_at(m, count_kv->value_pos);
+        (void)cursor_u32(&tc, &expected_tensors);
+    }
+    if (expected_tensors != 0 &&
+        (uint64_t)expected_tensors != total_tensors) {
+        fprintf(stderr,
+                "ds4: split GGUF declares %u tensors but %u shards supply "
+                "%" PRIu64 "\n",
+                expected_tensors, count, total_tensors);
+        exit(1);
+    }
+
+    m->split_count = count;
+    m->split_fds = xcalloc(count - 1u, sizeof(*m->split_fds));
+    for (uint32_t k = 1; k < count; k++) m->split_fds[k - 1u] = fds[k];
+
+    uint64_t mapped = 0;
+    for (uint32_t k = 0; k < count; k++) mapped += sizes[k];
+    ds4_log(stderr, DS4_LOG_TIMING,
+            "ds4: mapped %u GGUF shards (%.2f GiB) into one %.2f GiB "
+            "address range, %" PRIu64 " tensors\n",
+            count, (double)mapped / 1073741824.0,
+            (double)total / 1073741824.0, total_tensors);
+
+    free(bases);
+    free(sizes);
+    free(fds);
 }
 
 static void print_size(uint64_t bytes) {

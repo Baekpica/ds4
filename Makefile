@@ -308,9 +308,14 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4-eval
+tests/test_split_gguf: tests/test_split_gguf.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test: ds4_test ds4-eval tests/test_split_gguf
 	./ds4-eval --self-test-extractors
 	./ds4_test
+	./tests/test_split_gguf
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf
