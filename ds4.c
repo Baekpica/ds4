@@ -30606,6 +30606,9 @@ struct ds4_session {
     ds4_dist_session *distributed;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
+    ds4_solar_gpu_graph solar_graph;
+    bool solar_graph_ready;
+    bool solar_state_valid;
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -31903,6 +31906,11 @@ static bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
+static bool ds4_session_is_solar(const ds4_session *s) {
+    return s && s->engine &&
+           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2;
+}
+
 static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     uint32_t rows = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -31958,6 +31966,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
     if (!s || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
+    if (ds4_session_is_solar(s)) return 0;
     if (ds4_session_is_cpu(s)) return 0;
 #ifdef DS4_NO_GPU
     (void)layer_start;
@@ -32414,6 +32423,11 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         payload_set_err(err, errlen, "invalid session layer payload save");
         return 1;
     }
+    if (ds4_session_is_solar(s)) {
+        payload_set_err(err, errlen,
+                        "Solar distributed layer payloads are not supported");
+        return 1;
+    }
     if (ds4_session_is_cpu(s)) {
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
         return 1;
@@ -32609,6 +32623,11 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
+        return 1;
+    }
+    if (ds4_session_is_solar(s)) {
+        payload_set_err(err, errlen,
+                        "Solar distributed layer payloads are not supported");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
@@ -34145,6 +34164,7 @@ static int ds4_session_eval_speculative_batch_first3(
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
+    if (ds4_session_is_solar(s)) return 0;
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -34261,6 +34281,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     }
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
+    }
+    if (ds4_session_is_solar(s)) {
+        payload_set_err(err, errlen,
+                        "Solar session snapshots are not implemented yet");
+        return 1;
     }
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
@@ -34406,6 +34431,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
+        return 1;
+    }
+    if (ds4_session_is_solar(s)) {
+        payload_set_err(err, errlen,
+                        "Solar session snapshots are not implemented yet");
         return 1;
     }
     s->generation++;   /* Inc 5a: content replaced from disk (even on failure
@@ -41052,8 +41082,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
-    if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
+    if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     weights_bind(&e->weights, &e->model);
     if (opt->inspect_only) {
         *out = e;
@@ -41401,11 +41431,15 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
 
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     (void)e;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        return (uint64_t)DS4_N_EMBD;
+    }
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
 }
 
 int ds4_engine_n_hc(ds4_engine *e) {
     (void)e;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) return 1;
     return (int)DS4_N_HC;
 }
 
@@ -41459,10 +41493,79 @@ static bool ds4_session_lazy_graph_enabled(void) {
     return !(e && e[0] == '0' && e[1] == '\0');   /* default ON */
 }
 
+/* Solar uses the same unified-memory admission policy as the upstream graph,
+ * but its exact allocation plan is the plain-residual graph's 12 GQA KV
+ * rings plus 36 recurrent KDA states.  Keep this family branch adjacent to
+ * allocation so lazy and eager sessions cannot drift. */
+static bool solar_graph_session_fit_check(uint32_t ctx_size,
+                                          uint32_t prefill_cap,
+                                          bool loud) {
+    const char *fe = getenv("DS4_SESSION_GRAPH_FIT");
+    if (fe && fe[0] == '0' && fe[1] == '\0') return true;
+
+    const ds4_context_memory plan =
+        solar_graph_context_memory_estimate(ctx_size);
+    if (plan.total_bytes == 0u || plan.prefill_cap != prefill_cap) {
+        if (loud) {
+            ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
+            fprintf(stderr,
+                    "ds4: Solar session graph plan is invalid "
+                    "(ctx=%u prefill_cap=%u planned=%u)\n",
+                    ctx_size, prefill_cap, plan.prefill_cap);
+        }
+        return false;
+    }
+
+    uint64_t free_b = 0u, total_b = 0u;
+    if (ds4_gpu_mem_info(&free_b, &total_b) != 0) return true;
+    const uint64_t sub_out = ds4_gpu_substrate_outstanding();
+    free_b = free_b > sub_out ? free_b - sub_out : 0u;
+
+    uint64_t headroom = 1024ull << 20;
+    const char *he = getenv("DS4_SESSION_GRAPH_HEADROOM_MB");
+    if (he && he[0]) {
+        const long v = atol(he);
+        if (v >= 0) headroom = (uint64_t)v << 20;
+    }
+    const bool fits = plan.total_bytes <= UINT64_MAX - headroom &&
+                      free_b >= plan.total_bytes + headroom;
+    if (fits) return true;
+    if (loud) {
+        ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
+        fprintf(stderr,
+                "ds4: Solar session graph fit check FAILED: need ~%.0f MiB "
+                "(+%.0f MiB headroom) but only %.0f MiB allocatable "
+                "(ctx=%u prefill_cap=%u); refusing the alloc so the box "
+                "survives (DS4_SESSION_GRAPH_FIT=0 overrides)\n",
+                (double)plan.total_bytes / 1048576.0,
+                (double)headroom / 1048576.0,
+                (double)free_b / 1048576.0,
+                ctx_size, prefill_cap);
+    }
+    return false;
+}
+
 /* One body for the eager (create) and lazy (ensure) alloc so the two cannot
  * drift: sizing, quality/power adoption, directional steering. */
 static int ds4_session_alloc_graph(ds4_session *s) {
     ds4_engine *e = s->engine;
+    if (ds4_session_is_solar(s)) {
+        if (!solar_graph_session_fit_check((uint32_t)s->ctx_size,
+                                           s->prefill_cap,
+                                           /*loud=*/true) ||
+            !solar_graph_alloc(&s->solar_graph,
+                               &e->model,
+                               &e->weights,
+                               (uint32_t)s->ctx_size,
+                               s->prefill_cap)) {
+            s->solar_graph_ready = false;
+            s->solar_state_valid = false;
+            return 1;
+        }
+        s->solar_graph_ready = true;
+        s->solar_state_valid = true;
+        return 0;
+    }
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(s->ctx_size, s->prefill_cap);
     if (!metal_graph_session_fit_ok(&e->weights, &e->weights.layer[0],
                                     raw_cap, (uint32_t)s->ctx_size, s->prefill_cap,
@@ -41524,6 +41627,13 @@ int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size) {
     if (!e || ctx_size <= 0) return 0;
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CPU) return 1;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        const uint32_t prefill_cap =
+            solar_graph_prefill_cap_for_context((uint32_t)ctx_size);
+        return solar_graph_session_fit_check((uint32_t)ctx_size,
+                                             prefill_cap,
+                                             /*loud=*/false) ? 1 : 0;
+    }
     const uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
     return metal_graph_session_fit_check(&e->weights, &e->weights.layer[0],
@@ -41538,6 +41648,11 @@ int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size) {
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+            fprintf(stderr,
+                    "ds4: Solar Open2 sessions currently require a graph backend\n");
+            return 1;
+        }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
             return 1;
@@ -41557,12 +41672,26 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     return 1;
 #else
     if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 &&
+        e->distributed.role != DS4_DISTRIBUTED_NONE) {
+        fprintf(stderr,
+                "ds4: Solar Open2 distributed layer sessions are not implemented\n");
+        return 1;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 &&
+        (e->mtp_ready || e->dspark_ready)) {
+        fprintf(stderr,
+                "ds4: DeepSeek support models cannot be attached to Solar Open2\n");
+        return 1;
+    }
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
     s->generation = 1u;   /* Inc 5a: 0 is reserved for "no session" */
-    s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
+    s->prefill_cap = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2
+        ? solar_graph_prefill_cap_for_context((uint32_t)ctx_size)
+        : metal_graph_prefill_cap_for_prompt(ctx_size);
     /* S6 lazy graph: defer the ~2-4 GiB graph alloc to first GPU use unless
      * disabled or this is a distributed coordinator (whose dist session is
      * bound below during create). */
@@ -41574,7 +41703,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-    if (e->mtp_ready) {
+    if (!ds4_session_is_solar(s) && e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
     }
@@ -41590,7 +41719,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr,
                     "ds4: failed to create distributed coordinator session: %s\n",
                     err[0] ? err : "unknown error");
-            metal_graph_free(&s->graph);
+            if (ds4_session_is_solar(s)) solar_graph_free(&s->solar_graph);
+            else metal_graph_free(&s->graph);
             free(s->logits);
             free(s->mtp_logits);
             free(s);
@@ -41611,7 +41741,8 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
-        metal_graph_free(&s->graph);
+        if (ds4_session_is_solar(s)) solar_graph_free(&s->solar_graph);
+        else metal_graph_free(&s->graph);
     }
 #endif
     token_vec_free(&s->checkpoint);
@@ -41641,7 +41772,9 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
     s->engine->power_percent = power_percent;
 #ifndef DS4_NO_GPU
-    if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
+    if (!ds4_session_is_cpu(s) && !ds4_session_is_solar(s)) {
+        s->graph.power_percent = (uint32_t)power_percent;
+    }
 #endif
     return 0;
 }
@@ -41678,6 +41811,17 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
     return 1;
 #else
     if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
+    if (ds4_session_is_solar(s)) {
+        if (!s->solar_graph_ready ||
+            !solar_graph_reset_state(&s->solar_graph)) {
+            s->solar_state_valid = false;
+            if (errlen) snprintf(err, errlen,
+                                 "Solar layer-slice state reset failed");
+            return 1;
+        }
+        s->solar_state_valid = true;
+        return 0;
+    }
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         if (errlen) snprintf(err, errlen, "%s layer-slice state reset failed",
                              ds4_backend_name(s->engine->backend));
@@ -41700,7 +41844,9 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
     }
 
     ds4_engine *e = s->engine;
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_dim = ds4_session_is_solar(s)
+        ? (uint64_t)DS4_N_EMBD
+        : (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const float *last_hc = hidden_hc + (uint64_t)(n_tokens - 1u) * hc_dim;
 
     if (ds4_session_is_cpu(s)) {
@@ -41713,6 +41859,27 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
     return 1;
 #else
     if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
+    if (ds4_session_is_solar(s)) {
+        ds4_plain_gpu_graph *g = &s->solar_graph.base;
+        bool ok = s->solar_graph_ready &&
+                  ds4_gpu_tensor_write(g->cur, 0, last_hc,
+                                       hc_dim * sizeof(float)) != 0;
+        if (ok) ok = plain_graph_output_head(g, &e->model, &e->weights,
+                                             g->cur, 0u);
+        if (ok) ok = ds4_gpu_tensor_read(
+            g->logits, 0, logits,
+            (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        if (!ok) {
+            if (ds4_gpu_synchronize() == 0) {
+                fprintf(stderr,
+                        "ds4: synchronize after Solar output-head failure also failed\n");
+            }
+            if (errlen) snprintf(err, errlen,
+                                 "Solar output-head hidden-state evaluation failed");
+            return 1;
+        }
+        return 0;
+    }
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_tensor_write(g->cur_hc,
                                    0,
@@ -41792,6 +41959,11 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  size_t errlen) {
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
+        return 1;
+    }
+    if (ds4_session_is_solar(s)) {
+        if (errlen) snprintf(err, errlen,
+                             "Solar Open2 layer-slice evaluation is not implemented");
         return 1;
     }
     if (layer_start > layer_end || layer_end >= (uint32_t)DS4_N_LAYER) {
@@ -42154,6 +42326,79 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
 
+    if (ds4_session_is_solar(s)) {
+        ds4_solar_gpu_graph *g = &s->solar_graph;
+        if (!s->solar_graph_ready || g->base.prefill_cap != s->prefill_cap) {
+            if (errlen) snprintf(err, errlen,
+                                 "Solar session graph is not initialized");
+            return 1;
+        }
+
+        int start = 0;
+        if (s->checkpoint_valid && s->solar_state_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+            s->mtp_draft_valid = false;
+            if (start == prompt->len) return 0;
+        } else {
+            s->generation++;   /* non-extending sync rebuilds content */
+            s->checkpoint_valid = false;
+            s->checkpoint.len = 0;
+            s->mtp_draft_valid = false;
+            s->solar_state_valid = false;
+            if (!solar_graph_reset_state(g)) {
+                if (errlen) snprintf(err, errlen,
+                                     "Solar prefill state reset failed");
+                return 1;
+            }
+            s->solar_state_valid = true;
+        }
+
+        uint32_t done = (uint32_t)start;
+        while (done < (uint32_t)prompt->len) {
+            uint32_t n = (uint32_t)prompt->len - done;
+            if (n > s->prefill_cap) n = s->prefill_cap;
+            const bool last = done + n == (uint32_t)prompt->len;
+            if (!solar_graph_prefill_chunk(g, &e->model, &e->weights,
+                                           prompt->v + done, n, done, last)) {
+                if (errlen) {
+                    snprintf(err, errlen,
+                             "Solar prefill failed at token range %u:%u",
+                             done, done + n);
+                }
+                s->checkpoint_valid = false;
+                s->checkpoint.len = 0;
+                s->mtp_draft_valid = false;
+                s->solar_state_valid = false;
+                (void)solar_graph_reset_state(g);
+                return 1;
+            }
+            done += n;
+            if (s->progress) {
+                s->progress(s->progress_ud, "prefill_chunk",
+                            (int)done, prompt->len);
+            }
+        }
+        if (!ds4_gpu_tensor_read(
+                g->base.logits, 0, s->logits,
+                (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+            if (errlen) snprintf(err, errlen,
+                                 "Solar prefill logits readback failed");
+            s->checkpoint_valid = false;
+            s->checkpoint.len = 0;
+            s->mtp_draft_valid = false;
+            s->solar_state_valid = false;
+            (void)solar_graph_reset_state(g);
+            return 1;
+        }
+        ds4_tokens_copy(&s->checkpoint, prompt);
+        s->checkpoint_valid = true;
+        s->solar_state_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
         ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -42461,6 +42706,46 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
     if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
     ds4_engine *e = s->engine;
+    if (ds4_session_is_solar(s)) {
+        ds4_solar_gpu_graph *g = &s->solar_graph;
+        (void)probe_mtp;
+        if (!s->solar_graph_ready) {
+            if (errlen) snprintf(err, errlen,
+                                 "Solar session graph is not initialized");
+            return 1;
+        }
+        if (!s->checkpoint_valid || !s->solar_state_valid) {
+            if (errlen) snprintf(err, errlen,
+                                 "Solar decode requires a valid recurrent checkpoint");
+            return 1;
+        }
+        if ((uint32_t)s->checkpoint.len >= g->base.ctx_size) {
+            if (errlen) snprintf(err, errlen,
+                                 "Solar context reached (%u)",
+                                 g->base.ctx_size);
+            return 1;
+        }
+        if (!solar_graph_decode(g, &e->model, &e->weights, token,
+                                (uint32_t)s->checkpoint.len) ||
+            !ds4_gpu_tensor_read(
+                g->base.logits, 0, s->logits,
+                (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+            if (errlen) snprintf(err, errlen,
+                                 "Solar decode failed at position %d",
+                                 s->checkpoint.len);
+            s->checkpoint_valid = false;
+            s->checkpoint.len = 0;
+            s->mtp_draft_valid = false;
+            s->solar_state_valid = false;
+            (void)solar_graph_reset_state(g);
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->solar_state_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
@@ -43962,13 +44247,25 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+    if (!s) return;
     s->generation++;   /* Inc 5a: committed content discarded */
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_solar(s)) {
+        s->solar_state_valid = false;
+        if (s->solar_graph_ready &&
+            solar_graph_reset_state(&s->solar_graph)) {
+            s->solar_state_valid = true;
+        }
+    }
+#endif
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    if (!s) return;
+    const int old_pos = s->checkpoint.len;
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     /* Inc 5a: a strict truncation lets a later extension regrow to an old
@@ -43977,6 +44274,17 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos < s->checkpoint.len) s->generation++;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_solar(s) && pos != old_pos) {
+        /* KDA recurrence is not invertible.  Keep the caller-visible token
+         * prefix, but force a replay before the next decode. */
+        s->checkpoint_valid = false;
+        s->solar_state_valid = false;
+        if (s->solar_graph_ready) {
+            (void)solar_graph_reset_state(&s->solar_graph);
+        }
+    }
+#endif
 }
 
 int ds4_session_pos(ds4_session *s) {

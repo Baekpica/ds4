@@ -72,7 +72,7 @@ endif
         test-mmq-parity test-model-family-kernels \
         test-solar-loader test-solar-kda test-solar-kda-prefill \
         test-solar-gates test-solar-kv test-solar-tokenizer \
-        test-solar-forward
+        test-solar-forward test-solar-session
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -261,6 +261,9 @@ tests/test_model_family_kernels.o: tests/test_model_family_kernels.c ds4_gpu.h
 tests/test_solar_forward.o: tests/test_solar_forward.c ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
+tests/test_solar_session.o: tests/test_solar_session.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
@@ -367,6 +370,14 @@ test-solar-forward: tests/test_solar_forward
 		{ echo "set DS4_SOLAR_MODEL to the first Solar GGUF shard" >&2; exit 2; }
 	./tests/test_solar_forward "$(DS4_SOLAR_MODEL)" 128 29497 132 4767
 
+tests/test_solar_session: tests/test_solar_session.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-session: tests/test_solar_session
+	@test -n "$(DS4_SOLAR_MODEL)" || \
+		{ echo "set DS4_SOLAR_MODEL to the first Solar GGUF shard" >&2; exit 2; }
+	./tests/test_solar_session "$(DS4_SOLAR_MODEL)"
+
 ds4_weight_server: tools/ds4_weight_server.cu cuda/mmq/ds4_repack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ tools/ds4_weight_server.cu cuda/mmq/ds4_repack.o $(CUDA_LDLIBS)
 
@@ -405,4 +416,4 @@ test: ds4_test ds4-eval tests/test_split_gguf
 	./tests/test_split_gguf
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_gates.o tests/test_solar_kv.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_gates.o tests/test_solar_kv.o
