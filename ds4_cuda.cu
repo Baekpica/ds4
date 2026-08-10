@@ -31245,7 +31245,8 @@ static __global__ void solar_attention_split_warp_kernel(
  * independent per query head and the partial layout is unchanged, so the
  * existing combine kernel remains the oracle/fallback seam. */
 template <int KEY_TILE>
-static __global__ void solar_attention_gqa_grouped_split_kernel(
+static __device__ __forceinline__ void
+solar_attention_gqa_grouped_split_block(
         float         *partials,
         const float   *q,
         const uint8_t *kv,
@@ -31254,16 +31255,14 @@ static __global__ void solar_attention_gqa_grouped_split_kernel(
         uint32_t       n_head,
         uint32_t       n_head_kv,
         uint32_t       kv_cap,
-        uint32_t       first,
-        uint32_t       last,
-        uint32_t       chunk_len,
-        uint32_t       split_count,
+        uint32_t       split,
+        uint32_t       split_stride,
+        uint32_t       kv_head,
+        uint32_t       chunk_first,
+        uint32_t       chunk_last,
         float          scale) {
     constexpr uint32_t HEAD_DIM = 128u;
     constexpr uint32_t DPL = HEAD_DIM / 32u;
-    const uint32_t split = blockIdx.x;
-    const uint32_t kv_head = blockIdx.y;
-    if (split >= split_count || kv_head >= n_head_kv) return;
     const uint32_t group = n_head / n_head_kv;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
@@ -31293,9 +31292,6 @@ static __global__ void solar_attention_gqa_grouped_split_kernel(
 
     __shared__ float shared_k[KEY_TILE][HEAD_DIM];
     __shared__ float shared_v[KEY_TILE][HEAD_DIM];
-    const uint32_t chunk_first = first + split * chunk_len;
-    uint32_t chunk_last = chunk_first + chunk_len - 1u;
-    if (chunk_last > last) chunk_last = last;
     for (uint32_t tile_first = chunk_first; tile_first <= chunk_last;
          tile_first += KEY_TILE) {
         const uint32_t tile_count =
@@ -31360,7 +31356,7 @@ static __global__ void solar_attention_gqa_grouped_split_kernel(
     for (int h = 0; h < 2; h++) {
         if (!active[h]) continue;
         float *part = partials +
-            ((uint64_t)head[h] * split_count + split) * (HEAD_DIM + 2u);
+            ((uint64_t)head[h] * split_stride + split) * (HEAD_DIM + 2u);
         if (lane == 0u) {
             part[0] = running_max[h];
             part[1] = running_sum[h];
@@ -31371,6 +31367,32 @@ static __global__ void solar_attention_gqa_grouped_split_kernel(
             part[2u + dim] = acc[h][d];
         }
     }
+}
+
+template <int KEY_TILE>
+static __global__ void solar_attention_gqa_grouped_split_kernel(
+        float         *partials,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        uint32_t       chunk_len,
+        uint32_t       split_count,
+        float          scale) {
+    const uint32_t split = blockIdx.x;
+    const uint32_t kv_head = blockIdx.y;
+    if (split >= split_count || kv_head >= n_head_kv) return;
+    const uint32_t chunk_first = first + split * chunk_len;
+    uint32_t chunk_last = chunk_first + chunk_len - 1u;
+    if (chunk_last > last) chunk_last = last;
+    solar_attention_gqa_grouped_split_block<KEY_TILE>(
+        partials, q, kv, format, row_bytes, n_head, n_head_kv, kv_cap,
+        split, split_count, kv_head, chunk_first, chunk_last, scale);
 }
 
 static __global__ void solar_attention_decode_kernel(
@@ -31498,6 +31520,52 @@ static __device__ __forceinline__ uint32_t solar_attention_first_position(
         first = pos + 1u - kv_cap;
     }
     return first;
+}
+
+template <int KEY_TILE>
+static __global__ void solar_attention_banks_gqa_grouped_split_kernel(
+        float          *partials,
+        const float    *q,
+        const uint8_t  *kv_slab,
+        const uint32_t *bank_ids,
+        const uint32_t *positions,
+        uint64_t        bank_stride,
+        uint32_t        n_tokens,
+        uint32_t        max_banks,
+        uint32_t        format,
+        uint64_t        row_bytes,
+        uint32_t        n_head,
+        uint32_t        n_head_kv,
+        uint32_t        kv_cap,
+        uint32_t        window,
+        uint32_t        chunk_len,
+        uint32_t        max_splits,
+        float           scale) {
+    constexpr uint32_t HEAD_DIM = 128u;
+    const uint32_t split = blockIdx.x;
+    const uint32_t kv_head = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (token >= n_tokens || kv_head >= n_head_kv) return;
+    const uint32_t bank = bank_ids[token];
+    const uint32_t pos = positions[token];
+    if (bank >= max_banks || pos >= kv_cap) return;
+    const uint32_t first =
+        solar_attention_first_position(pos, window, kv_cap);
+    const uint32_t split_count =
+        (pos - first + 1u + chunk_len - 1u) / chunk_len;
+    if (split >= split_count) return;
+    const uint32_t chunk_first = first + split * chunk_len;
+    uint32_t chunk_last = chunk_first + chunk_len - 1u;
+    if (chunk_last > pos) chunk_last = pos;
+    const uint64_t q_offset =
+        (uint64_t)token * n_head * HEAD_DIM;
+    const uint64_t partial_offset =
+        (uint64_t)token * n_head * max_splits * (HEAD_DIM + 2u);
+    solar_attention_gqa_grouped_split_block<KEY_TILE>(
+        partials + partial_offset, q + q_offset,
+        kv_slab + (uint64_t)bank * bank_stride,
+        format, row_bytes, n_head, n_head_kv, kv_cap,
+        split, max_splits, kv_head, chunk_first, chunk_last, scale);
 }
 
 static __global__ void solar_attention_banks_decode_kernel(
@@ -31642,6 +31710,15 @@ static uint32_t solar_attention_threads(uint32_t head_dim) {
     uint32_t threads = 32u;
     while (threads < head_dim) threads <<= 1u;
     return threads;
+}
+
+static int solar_attention_grouped_gqa_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_CUDA_SOLAR_GQA_GROUPED");
+        enabled = !(value && value[0] == '0' && value[1] == '\0');
+    }
+    return enabled;
 }
 
 extern "C" uint64_t ds4_gpu_solar_kv_row_bytes(
@@ -31854,13 +31931,9 @@ extern "C" int ds4_gpu_solar_attention_decode_split_tensor(
     const uint64_t row_bytes =
         solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
     const uint32_t threads = solar_attention_threads(head_dim);
-    static int grouped_enabled = -1;
-    if (grouped_enabled < 0) {
-        const char *value = getenv("DS4_CUDA_SOLAR_GQA_GROUPED");
-        grouped_enabled = !(value && value[0] == '0' && value[1] == '\0');
-    }
     const uint32_t group = n_head / n_head_kv;
-    if (grouped_enabled && head_dim == 128u && group >= 2u && group <= 8u) {
+    if (solar_attention_grouped_gqa_enabled() && head_dim == 128u &&
+        group >= 2u && group <= 8u) {
         dim3 grouped_grid(split_count, n_head_kv, 1u);
         solar_attention_gqa_grouped_split_kernel<8><<<
             grouped_grid, 128u, 0u, ds4_current_stream()>>>(
@@ -31974,6 +32047,36 @@ extern "C" int ds4_gpu_solar_attention_decode_banks_split_tensor(
     const uint64_t partial_values =
         (uint64_t)n_tokens * n_head * max_splits * (head_dim + 2u);
     if (partials->bytes < partial_values * sizeof(float)) return 0;
+    const uint32_t group = n_head / n_head_kv;
+    if (solar_attention_grouped_gqa_enabled() && head_dim == 128u &&
+        group >= 2u && group <= 8u) {
+        dim3 grouped_grid(max_splits, n_head_kv, n_tokens);
+        solar_attention_banks_gqa_grouped_split_kernel<8><<<
+            grouped_grid, 128u, 0u, ds4_current_stream()>>>(
+            (float *)partials->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv_slab->ptr,
+            (const uint32_t *)bank_ids->ptr,
+            (const uint32_t *)positions->ptr,
+            bank_stride, n_tokens, max_banks, (uint32_t)format, row_bytes,
+            n_head, n_head_kv, kv_cap, window, chunk_len, max_splits,
+            rsqrtf((float)head_dim));
+        static int logged_grouped_banks = 0;
+        if (!logged_grouped_banks) {
+            logged_grouped_banks = 1;
+            fprintf(stderr,
+                    "ds4: Solar grouped banked GQA split decode active "
+                    "(group=%u chunk=%u)\n",
+                    group, chunk_len);
+        }
+        dim3 combine_grid(n_head, n_tokens, 1u);
+        solar_attention_banks_split_combine_kernel<<<
+            combine_grid, threads, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, (const float *)partials->ptr,
+            (const uint32_t *)positions->ptr, n_tokens, n_head, head_dim,
+            kv_cap, window, chunk_len, max_splits);
+        return cuda_ok(cudaGetLastError(),
+                       "solar-open2 grouped banked split attention decode");
+    }
     dim3 split_grid(max_splits, n_head, n_tokens);
     solar_attention_banks_split_kernel<<<
         split_grid, threads, 0, ds4_current_stream()>>>(

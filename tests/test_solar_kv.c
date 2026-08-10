@@ -345,7 +345,7 @@ int main(void) {
     }
     const uint32_t decode_banks[2] = {0u, 1u};
     const uint32_t decode_positions[2] = {
-        T_TOKENS - 1u, T_TOKENS - 1u,
+        T_TOKENS - 1u, T_TOKENS - T_CHUNK - 3u,
     };
     const ds4_solar_kv_format bank_format =
         DS4_SOLAR_KV_KFP8_VFP4;
@@ -427,7 +427,7 @@ int main(void) {
           "alternate serial cache store");
     CHECK(ds4_gpu_solar_attention_decode_tensor(
               alt_heads, last_q, alt_cache,
-              T_HEAD, T_HEAD_KV, T_DIM, T_CAP, T_TOKENS - 1u,
+              T_HEAD, T_HEAD_KV, T_DIM, T_CAP, decode_positions[1],
               0u, bank_format),
           "alternate serial decode");
     CHECK(ds4_gpu_tensor_read(
