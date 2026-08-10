@@ -19795,16 +19795,29 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
          * D2R PROTO ARC section of the D2R ledger. */
         static int dense_d2r_en = -1;
         static int dense_d2r_min_cols = 512;
+        static int dense_d2r_k128_min_cols = 256;
         if (dense_d2r_en < 0) {
             const char *env = getenv("DS4_MMQ_DENSE_D2R");
             dense_d2r_en = (env && env[0] == '0') ? 0 : 1;
-            /* Batch floor: prefill-scale only by default; eval harnesses
-             * lower it so short-prompt quality runs exercise the kernel
-             * (incl. the guarded last col tile). */
+            /* General prefill-scale floor stays at 512.  The wide K=128
+             * shallow projection crosses over by N=256, which also removes
+             * Solar's two 256-token boot chunks from the native warp path.
+             * The global override applies to both floors; the shape-specific
+             * override can then tune or restore K=128 independently. */
             const char *mc = getenv("DS4_MMQ_DENSE_D2R_MIN_COLS");
-            if (mc && atoi(mc) > 0) dense_d2r_min_cols = atoi(mc);
+            if (mc && atoi(mc) > 0) {
+                dense_d2r_min_cols = atoi(mc);
+                dense_d2r_k128_min_cols = dense_d2r_min_cols;
+            }
+            const char *k128_mc = getenv("DS4_MMQ_DENSE_D2R_K128_MIN_COLS");
+            if (k128_mc && atoi(k128_mc) > 0) {
+                dense_d2r_k128_min_cols = atoi(k128_mc);
+            }
         }
-        if (dense_d2r_en && (int)n_tok >= dense_d2r_min_cols &&
+        const int dense_d2r_effective_min_cols =
+            ds4_mmq_q8_0_dense_d2r_min_cols(
+                in_dim, dense_d2r_min_cols, dense_d2r_k128_min_cols);
+        if (dense_d2r_en && (int)n_tok >= dense_d2r_effective_min_cols &&
             (out_dim % 128u) == 0 && out_dim >= 2048 &&
             in_dim <= 4096 && (in_dim % 128u) == 0 &&
             cuda_q8_aligned_enabled()) {

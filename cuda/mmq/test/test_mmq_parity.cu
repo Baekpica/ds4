@@ -555,6 +555,33 @@ bool run_q8_0_dense_d2r(int M, int N, int K, uint32_t seed) {
     return ok;
 }
 
+bool run_q8_0_dense_d2r_floor_policy() {
+    struct floor_case {
+        int K;
+        int general_min_cols;
+        int k128_min_cols;
+        int expected;
+    };
+    const floor_case cases[] = {
+        {128,  512,  256,  256},
+        {4096, 512,  256,  512},
+        {128, 1024, 1024, 1024},
+        {128,  512,  128,  128},
+    };
+    for (const floor_case &c : cases) {
+        const int got = ds4_mmq_q8_0_dense_d2r_min_cols(
+            c.K, c.general_min_cols, c.k128_min_cols);
+        if (got != c.expected) {
+            fprintf(stderr,
+                    "D2R floor policy K=%d general=%d k128=%d got=%d expected=%d\n",
+                    c.K, c.general_min_cols, c.k128_min_cols, got, c.expected);
+            return false;
+        }
+    }
+    fprintf(stderr, "D2R floor policy: PASS\n\n");
+    return true;
+}
+
 bool run_q2_K(int M, int N, int K, uint32_t seed, float abs_scale = 0.05f) {
     fprintf(stderr, "=== Q2_K   M=%d N=%d K=%d  seed=%u ===\n", M, N, K, seed);
     std::mt19937 rng(seed);
@@ -1424,6 +1451,7 @@ int main(int argc, char ** argv) {
     bool all_ok = true;
 
     // Q8_0
+    all_ok &= run_q8_0_dense_d2r_floor_policy();
     all_ok &= run_q8_0(/*M=*/64,   /*N=*/4,   /*K=*/256,  0xC0FFEE);
     all_ok &= run_q8_0(/*M=*/128,  /*N=*/8,   /*K=*/512,  0xDEADBEE);
     all_ok &= run_q8_0(/*M=*/64,   /*N=*/1,   /*K=*/256,  0x12345);

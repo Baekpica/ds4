@@ -120,6 +120,11 @@ int ds4_mmq_q8_0_quantize_ref(
 // the ALIGNED artifact base ([half dq[nblk]][pad64][int8 qs]), and the shape
 // must satisfy M % 128 == 0 && K % 128 == 0.  Callers gate on n_tok scale
 // and K <= 4096 (o_proj's K=8192 measured faster on mmq).
+static inline int ds4_mmq_q8_0_dense_d2r_min_cols(
+        uint64_t K, int general_min_cols, int k128_min_cols) {
+    return K == 128u ? k128_min_cols : general_min_cols;
+}
+
 int ds4_mmq_q8_0_dense_d2r(
     const void  * W_aligned,
     const float * X_f32,
