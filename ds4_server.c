@@ -15769,7 +15769,10 @@ static void *worker_main(void *arg) {
     server *s = arg;
     /* Coalescing config (read once; single worker thread). */
     const char *ce = getenv("DS4_SERVER_COALESCE");
-    const bool coalesce = !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+    const bool coalesce_requested =
+        !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+    const bool coalesce =
+        coalesce_requested && ds4_engine_supports_batching(s->engine);
     /* W5: continuous batching is the default serving path when a persistent batch
      * ctx exists; DS4_SERVER_CONTINUOUS=0 reverts to W3/W4 static coalescing. */
     const char *cc = getenv("DS4_SERVER_CONTINUOUS");
@@ -17934,7 +17937,11 @@ int main(int argc, char **argv) {
      * falls back to the per-call ds4_engine_batched_generate_ex. */
     {
         const char *ce = getenv("DS4_SERVER_COALESCE");
-        const bool coalesce_on = !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+        const bool coalesce_requested =
+            !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+        const bool batching_supported =
+            ds4_engine_supports_batching(s.engine);
+        const bool coalesce_on = coalesce_requested && batching_supported;
         const char *cm = getenv("DS4_SERVER_COALESCE_MAX");
         /* W8 reassessment (2026-06-06): default raised 16->32.  Measured on GB10
          * (ctx=4096) max_seq=32 yields ~24% higher decode throughput than 16
@@ -17951,6 +17958,11 @@ int main(int argc, char **argv) {
         int cmaxtok = ct ? atoi(ct) : cmaxtok_dflt;
         if (cmaxtok <= 0) cmaxtok = cmaxtok_dflt;  /* unbounded coalesce -> size ctx to default */
         if (cmaxtok < cmax) cmaxtok = cmax;        /* need >=1 token per seq */
+        if (coalesce_requested && !batching_supported) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: model multi-sequence graph is not integrated yet; "
+                       "using the serial session lane");
+        }
         if (coalesce_on && cmax > 1) {
             char cerr[256] = {0};
             /* Fit-or-reduce: create_fit budgets the bank count from free
@@ -18039,6 +18051,9 @@ int main(int argc, char **argv) {
                 const char *why = !coalesce_on ? "DS4_SERVER_COALESCE=0" :
                                   cmax <= 1    ? "DS4_SERVER_COALESCE_MAX=1" :
                                                  "batch ctx creation failed";
+                if (!batching_supported) {
+                    why = "model multi-sequence graph unavailable";
+                }
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: speculative decode is ARMED but has no engine to run on: "
                            "the continuous batch path is disabled (%s), so every request decodes "

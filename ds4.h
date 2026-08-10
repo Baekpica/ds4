@@ -172,6 +172,10 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 /* Number of hyper-connection lanes (n_hc); hidden_f32_values / n_hc == n_embd. */
 int ds4_engine_n_hc(ds4_engine *e);
+/* Whether this model/backend currently implements the static and continuous
+ * multi-sequence graph APIs.  Servers use this capability to select lanes
+ * without hard-coding model families. */
+bool ds4_engine_supports_batching(ds4_engine *e);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */

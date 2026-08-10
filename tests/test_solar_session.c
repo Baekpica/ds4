@@ -45,6 +45,23 @@ static double max_abs_diff(const float *a, const float *b, int n,
     return worst;
 }
 
+typedef struct {
+    int token;
+    int emitted;
+    int done;
+} generation_capture;
+
+static void capture_token(void *ud, int token) {
+    generation_capture *capture = ud;
+    capture->token = token;
+    capture->emitted++;
+}
+
+static void capture_done(void *ud) {
+    generation_capture *capture = ud;
+    capture->done++;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s <first-model-shard.gguf>\n", argv[0]);
@@ -279,6 +296,85 @@ int main(int argc, char **argv) {
         expect_same_logits(initial, replayed, n_vocab, "invalidated resync")) {
         fprintf(stderr, "Solar invalidation/resync failed: %s\n", err);
         failed = 1;
+        goto cleanup;
+    }
+
+    /* Unsupported DeepSeek-only roots must reject without mutating the live
+     * Solar session.  The server capability keeps these lanes disabled until
+     * the common multi-sequence graph is integrated. */
+    const int boundary_pos = ds4_session_pos(session);
+    const uint64_t boundary_generation = ds4_session_generation(session);
+    err[0] = '\0';
+    if (ds4_session_layer_slice_reset(session, err, sizeof(err)) == 0 ||
+        ds4_session_pos(session) != boundary_pos ||
+        ds4_session_generation(session) != boundary_generation ||
+        ds4_session_argmax(session) != next) {
+        fprintf(stderr, "Solar layer-slice boundary was not side-effect free: %s\n",
+                err);
+        failed = 1;
+        goto cleanup;
+    }
+    err[0] = '\0';
+    if (ds4_session_output_head_bench(
+            session, 1, stderr, err, sizeof(err)) == 0 ||
+        ds4_session_pos(session) != boundary_pos) {
+        fprintf(stderr, "Solar output-head bench boundary failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+
+    if (ds4_engine_supports_batching(engine)) {
+        fprintf(stderr, "Solar batching capability was enabled prematurely\n");
+        failed = 1;
+        goto cleanup;
+    }
+    ds4_batch_ctx *batch_ctx = NULL;
+    err[0] = '\0';
+    if (ds4_batch_ctx_create_fit(
+            engine, 128, 2, 8, &batch_ctx, err, sizeof(err)) == 0 ||
+        batch_ctx != NULL) {
+        fprintf(stderr, "Solar batch context was not rejected: %s\n", err);
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+    ds4_batch_gen_result batch_result = {0};
+    const int one_token = 1;
+    const int solar_eos = ds4_token_eos(engine);
+    err[0] = '\0';
+    if (ds4_engine_batched_generate_ex(
+            engine, &prompt, 1, 128, &one_token, &solar_eos,
+            &batch_result, err, sizeof(err)) == 0 ||
+        batch_result.tokens != NULL || batch_result.n_tokens != 0) {
+        fprintf(stderr, "Solar per-call batch path was not rejected: %s\n", err);
+        free(batch_result.tokens);
+        failed = 1;
+        goto cleanup;
+    }
+
+    int accepted = -1;
+    err[0] = '\0';
+    if (ds4_session_eval_speculative_argmax(
+            session, next, 4, solar_eos, &accepted, 1,
+            err, sizeof(err)) != 1 ||
+        accepted != next || ds4_session_pos(session) != prompt.len + 1) {
+        fprintf(stderr, "Solar speculative API fallback failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+
+    generation_capture capture = {0};
+    if (ds4_engine_generate_argmax(
+            engine, &prompt, 1, 128,
+            capture_token, capture_done, &capture,
+            NULL, NULL) != 0 ||
+        capture.emitted != 1 || capture.token != next || capture.done != 1) {
+        fprintf(stderr,
+                "Solar public engine generation failed: emitted=%d token=%d "
+                "want=%d done=%d\n",
+                capture.emitted, capture.token, next, capture.done);
+        failed = 1;
+        goto cleanup;
     }
 
 cleanup:

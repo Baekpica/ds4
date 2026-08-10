@@ -31389,6 +31389,12 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
         ds4_output_bench_set_err(err, errlen, "output-head bench is currently CUDA-only");
         return 1;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        ds4_output_bench_set_err(
+            err, errlen,
+            "output-head bench does not yet support the Solar plain graph");
+        return 1;
+    }
     if (!s->checkpoint_valid || s->checkpoint.len <= 0) {
         ds4_output_bench_set_err(err, errlen, "output-head bench requires a synchronized session");
         return 1;
@@ -35259,6 +35265,12 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     return 1;
 #else
     if (!e || !dataset_path || !output_path) return 1;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        fprintf(stderr,
+                "ds4: DeepSeek routed-MoE imatrix collection is unavailable "
+                "for Solar Open2\n");
+        return 1;
+    }
     if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) {
         fprintf(stderr, "ds4: imatrix collection currently requires --metal\n");
         return 1;
@@ -35414,6 +35426,10 @@ int ds4_engine_batched_generate_ex(
     if (n <= 0 || n > DS4_MULTISEQ_MAX_SEQ) { BG_API_ERR("batched_generate: n=%d out of [1,%d]", n, DS4_MULTISEQ_MAX_SEQ); return 1; }
     if (ctx_size <= 0) { BG_API_ERR("batched_generate: ctx_size must be > 0"); return 1; }
     if (!ds4_backend_uses_graph(e->backend)) { BG_API_ERR("batched_generate: graph (CUDA/Metal) backend required"); return 1; }
+    if (!ds4_engine_supports_batching(e)) {
+        BG_API_ERR("batched_generate: this model does not yet implement the multi-sequence graph");
+        return 1;
+    }
 #ifdef DS4_NO_GPU
     BG_API_ERR("batched_generate: build has no graph backend");
     return 1;
@@ -36483,6 +36499,10 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         BC_ERR("batch_ctx_create: max_total_tokens %d < max_seq %d", max_total_tokens, max_seq); return 1; }
     if (!ds4_backend_uses_graph(e->backend)) { BC_ERR("batch_ctx_create: graph backend required"); return 1; }
     if (!e->metal_ready) { BC_ERR("batch_ctx_create: graph backend unavailable"); return 1; }
+    if (!ds4_engine_supports_batching(e)) {
+        BC_ERR("batch_ctx_create: this model does not yet implement the multi-sequence graph");
+        return 1;
+    }
 
     const uint32_t prefill_cap = (uint32_t)max_total_tokens;
     /* R2 (raw-ring shrink): with chunked admission (W > 0) no single forward
@@ -38058,6 +38078,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (!ctx || !admit || !on_done) { CG_ERR("continuous_generate: null argument"); return 1; }
     if (!ctx->e || !ds4_backend_uses_graph(ctx->e->backend) || !ctx->e->metal_ready) {
         CG_ERR("continuous_generate: graph (CUDA) backend required"); return 1; }
+    if (!ds4_engine_supports_batching(ctx->e)) {
+        CG_ERR("continuous_generate: this model does not yet implement the multi-sequence graph");
+        return 1;
+    }
 
     ds4_gpu_graph     *g       = &ctx->g;
     const ds4_model   *model   = &ctx->e->model;
@@ -41053,6 +41077,115 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
 }
 #endif
 
+/* Plain-residual model families use the public session contract for scalar
+ * generation.  This keeps CLI/embedding callers on the same graph and state
+ * lifecycle as the server instead of entering DeepSeek's raw-SWA executor. */
+static int generate_public_session_argmax(
+        ds4_engine        *e,
+        const ds4_tokens  *prompt,
+        int                n_predict,
+        int                ctx_size,
+        ds4_token_emit_fn  emit,
+        ds4_generation_done_fn done,
+        void              *emit_ud,
+        ds4_session_progress_fn progress,
+        void              *progress_ud) {
+    if (!e || !prompt || prompt->len <= 0 || ctx_size <= 0 ||
+        prompt->len >= ctx_size) {
+        fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
+        return 1;
+    }
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, e, ctx_size) != 0 || !session) {
+        fprintf(stderr,
+                "ds4: failed to create public-session generation runtime\n");
+        return 1;
+    }
+    ds4_session_set_progress(session, progress, progress_ud);
+
+    char err[256] = {0};
+    const double prefill_t0 = now_sec();
+    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: public-session prefill failed: %s\n",
+                err[0] ? err : "unknown error");
+        ds4_session_free(session);
+        return 1;
+    }
+    const double prefill_t1 = now_sec();
+
+    const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
+    const bool token_trace = getenv("DS4_TOKEN_TRACE") != NULL;
+    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+    float *trace_logits = trace_top
+        ? xmalloc((size_t)DS4_N_VOCAB * sizeof(float)) : NULL;
+    const int eos = ds4_token_eos(e);
+    int pos = prompt->len;
+    int n_generated = 0;
+    int n_decode_eval = 0;
+    int rc = 0;
+    const double decode_t0 = now_sec();
+    for (int i = 0; i < n_predict && pos < ctx_size; i++) {
+        if (trace_top) {
+            if (ds4_session_copy_logits(
+                    session, trace_logits, DS4_N_VOCAB) !=
+                (int)DS4_N_VOCAB) {
+                fprintf(stderr,
+                        "ds4: failed to read public-session trace logits\n");
+                rc = 1;
+                break;
+            }
+            char label[64];
+            snprintf(label, sizeof(label), "step %d", i);
+            print_top_logits(stderr, label, &e->vocab,
+                             trace_logits, DS4_N_VOCAB, 10);
+        }
+
+        const int token = ds4_session_argmax(session);
+        if (token == eos) break;
+        if (emit) emit(emit_ud, token);
+        if (token_trace) {
+            fprintf(stderr,
+                    "ds4: token trace generated=%d pos=%d token=%d\n",
+                    n_generated, pos, token);
+        }
+        n_generated++;
+
+        if (i == n_predict - 1 || pos + 1 >= ctx_size) {
+            pos++;
+            break;
+        }
+        const double eval_t0 = token_timing ? now_sec() : 0.0;
+        err[0] = '\0';
+        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: public-session decode failed: %s\n",
+                    err[0] ? err : "unknown error");
+            rc = 1;
+            break;
+        }
+        if (token_timing) {
+            fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n",
+                    n_decode_eval + 1, (now_sec() - eval_t0) * 1000.0);
+        }
+        n_decode_eval++;
+        pos++;
+    }
+    const double decode_t1 = now_sec();
+    if (done) done(emit_ud);
+
+    const double prefill_s = prefill_t1 - prefill_t0;
+    const double decode_s = decode_t1 - decode_t0;
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
+            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+            prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+            decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+
+    free(trace_logits);
+    ds4_session_free(session);
+    return rc;
+}
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -41063,6 +41196,11 @@ int ds4_engine_generate_argmax(
         void              *emit_ud,
         ds4_session_progress_fn progress,
         void              *progress_ud) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        return generate_public_session_argmax(
+            e, prompt, n_predict, ctx_size, emit, done, emit_ud,
+            progress, progress_ud);
+    }
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
@@ -41099,6 +41237,11 @@ int ds4_engine_generate_argmax(
 
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 #ifndef DS4_NO_GPU
+    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        fprintf(stderr,
+                "ds4: DeepSeek graph diagnostic is unavailable for Solar Open2\n");
+        return 1;
+    }
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: Metal graph test requested but Metal is unavailable\n");
         return 1;
@@ -41114,6 +41257,11 @@ int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
 #ifndef DS4_NO_GPU
+    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        fprintf(stderr,
+                "ds4: DeepSeek full-graph diagnostic is unavailable for Solar Open2\n");
+        return 1;
+    }
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: Metal full graph test requested but Metal is unavailable\n");
         return 1;
@@ -41129,6 +41277,11 @@ int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size) {
 #ifndef DS4_NO_GPU
+    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        fprintf(stderr,
+                "ds4: DeepSeek prompt-graph diagnostic is unavailable for Solar Open2\n");
+        return 1;
+    }
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: Metal prompt graph test requested but Metal is unavailable\n");
         return 1;
@@ -41144,6 +41297,11 @@ int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, 
 }
 
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
+    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        fprintf(stderr,
+                "ds4: DeepSeek head diagnostic is unavailable for Solar Open2\n");
+        return 1;
+    }
     if (!prompt || prompt->len <= 0) {
         fprintf(stderr, "ds4: head test requires a non-empty prompt\n");
         return 1;
@@ -41241,6 +41399,11 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
+    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        fprintf(stderr,
+                "ds4: DeepSeek first-token diagnostic is unavailable for Solar Open2\n");
+        return 1;
+    }
     if (!prompt || prompt->len <= 0) {
         fprintf(stderr, "ds4: first-token test requires a non-empty prompt\n");
         return 1;
@@ -41750,6 +41913,16 @@ int ds4_engine_n_hc(ds4_engine *e) {
     return (int)DS4_N_HC;
 }
 
+bool ds4_engine_supports_batching(ds4_engine *e) {
+    if (!e || !ds4_backend_uses_graph(e->backend) || !e->metal_ready) {
+        return false;
+    }
+    /* Solar currently owns a scalar plain-residual graph.  Step 5 promotes
+     * that same base to multi-sequence state; the server capability flips
+     * here when the implementation and isolation gates are complete. */
+    return DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_SOLAR_OPEN2;
+}
+
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
     return (int)DS4_MODEL_VARIANT;
@@ -42108,6 +42281,11 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
     }
+    if (ds4_session_is_solar(s)) {
+        if (errlen) snprintf(err, errlen,
+                             "Solar Open2 layer-slice evaluation is not implemented");
+        return 1;
+    }
     ds4_session_invalidate(s);
     if (ds4_session_is_cpu(s)) {
         session_cpu_reset_cache(s);
@@ -42118,17 +42296,6 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
     return 1;
 #else
     if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
-    if (ds4_session_is_solar(s)) {
-        if (!s->solar_graph_ready ||
-            !solar_graph_reset_state(&s->solar_graph)) {
-            s->solar_state_valid = false;
-            if (errlen) snprintf(err, errlen,
-                                 "Solar layer-slice state reset failed");
-            return 1;
-        }
-        s->solar_state_valid = true;
-        return 0;
-    }
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         if (errlen) snprintf(err, errlen, "%s layer-slice state reset failed",
                              ds4_backend_name(s->engine->backend));
@@ -43305,9 +43472,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
-    if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (!s || !accepted || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (s->distributed) {
-        if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
@@ -43315,7 +43481,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (ds4_session_is_cpu(s)) {
         (void)max_tokens;
         (void)eos_token;
-        if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    if (ds4_session_is_solar(s)) {
+        /* Solar has no DeepSeek MTP attachment.  Keep callers on the same
+         * speculative API while committing exactly one target token. */
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
@@ -43323,7 +43495,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 #ifdef DS4_NO_GPU
     (void)s; (void)first_token; (void)max_tokens; (void)eos_token;
     (void)accepted; (void)accepted_cap;
-    snprintf(err, errlen, "GPU support is not compiled in");
+    if (err && errlen) snprintf(err, errlen, "GPU support is not compiled in");
     return -1;
 #else
     ds4_engine *e = s->engine;
