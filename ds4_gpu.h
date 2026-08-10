@@ -2728,7 +2728,9 @@ int ds4_gpu_solar_kda_decode_tensor(
  * [n_tokens, n_head * head_dim] Q/K/V/g projections in one CUDA launch.
  * beta_logits is [n_tokens, n_head], and out is token-major. Sequence order is
  * processed inside each per-head block, avoiding a host/kernel launch loop at
- * 1M context while preserving arbitrary chunk-boundary continuation. */
+ * 1M context while preserving arbitrary chunk-boundary continuation. The
+ * generic one-worker path is the default; DS4_SOLAR_KDA_STATE_PARTS=2 enables
+ * two workers per value-state column for 128-dim prefill. */
 int ds4_gpu_solar_kda_prefill_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *recurrent_state,
