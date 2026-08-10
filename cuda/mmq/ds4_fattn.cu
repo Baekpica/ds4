@@ -31,6 +31,7 @@
 #include "ds4_mmq.h"
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 using namespace ggml_cuda_mma;
 
@@ -55,13 +56,9 @@ typedef tile< 8, 8, half2> tile_b;      /* K keys / V columns           */
 typedef tile<16, 8, float> tile_c;      /* scores / output accumulators */
 
 __device__ __forceinline__ float solar_fattn_e4m3(uint8_t code) {
-    const uint8_t mag = code & 0x7fu;
-    const int exp = (mag >> 3u) & 15;
-    const int mant = mag & 7;
-    const float value = exp == 0
-        ? (float)mant * 0.001953125f
-        : (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
-    return (code & 0x80u) ? -value : value;
+    __nv_fp8_e4m3 value;
+    value.__x = code;
+    return (float)value;
 }
 
 __device__ __forceinline__ float solar_fattn_e2m1(uint8_t code) {
