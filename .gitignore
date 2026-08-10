@@ -11,6 +11,7 @@
 /tests/test_solar_kda
 /tests/test_solar_kda_prefill
 /tests/test_solar_gates
+/tests/test_solar_kv
 /ds4flash.gguf
 /TODO.md
 /gguf/
