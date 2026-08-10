@@ -33175,6 +33175,10 @@ static __global__ void solar_kda_sequence_kernel(
     __shared__ float v_vec[256];
     __shared__ float q_sq[256];
     __shared__ float k_sq[256];
+    __shared__ float decay_vec[256];
+    __shared__ float q_norm_scale;
+    __shared__ float k_norm_scale;
+    __shared__ float beta_value;
 
     const uint32_t head = blockIdx.x;
     const uint32_t dim = threadIdx.x;
@@ -33219,6 +33223,19 @@ static __global__ void solar_kda_sequence_kernel(
         v_vec[dim] = v;
         q_sq[dim] = q * q;
         k_sq[dim] = k * k;
+        if (dim < head_dim) {
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            float gate = decay_scale[head] *
+                solar_kda_softplus(
+                    g_raw[token_base + (uint64_t)head * head_dim + dim] +
+                    dt_bias[(uint64_t)head * head_dim + dim]);
+            if (gate < gate_lower_bound) gate = gate_lower_bound;
+            decay_vec[dim] = expf(gate);
+        }
+        if (dim == 0u) {
+            beta_value = 2.0f /
+                (1.0f + expf(-beta_logits[(uint64_t)token * n_head + head]));
+        }
         __syncthreads();
 
         for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
@@ -33229,33 +33246,30 @@ static __global__ void solar_kda_sequence_kernel(
             __syncthreads();
         }
 
+        if (dim == 0u) {
+            q_norm_scale =
+                rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)head_dim);
+            k_norm_scale = rsqrtf(k_sq[0] + 1.0e-6f);
+        }
+        __syncthreads();
         if (dim < head_dim) {
-            const float q_inv = rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)head_dim);
-            const float k_inv = rsqrtf(k_sq[0] + 1.0e-6f);
-            q_vec[dim] *= q_inv;
-            k_vec[dim] *= k_inv;
+            q_vec[dim] *= q_norm_scale;
+            k_vec[dim] *= k_norm_scale;
         }
         __syncthreads();
 
         if (dim < head_dim) {
-            const float beta = 2.0f /
-                (1.0f + expf(-beta_logits[(uint64_t)token * n_head + head]));
             const uint64_t token_base = (uint64_t)token * vector_count;
             float memory = 0.0f;
             for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
-                float gate = decay_scale[head] *
-                    solar_kda_softplus(g_raw[token_base +
-                                             (uint64_t)head * head_dim + key_dim] +
-                                       dt_bias[(uint64_t)head * head_dim + key_dim]);
-                if (gate < gate_lower_bound) gate = gate_lower_bound;
                 const uint64_t index =
                     state_head + (uint64_t)key_dim * head_dim + dim;
-                const float decayed = state[index] * expf(gate);
+                const float decayed = state[index] * decay_vec[key_dim];
                 state[index] = decayed;
                 memory += decayed * k_vec[key_dim];
             }
 
-            const float delta = (v_vec[dim] - memory) * beta;
+            const float delta = (v_vec[dim] - memory) * beta_value;
             float result = 0.0f;
             for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
                 const uint64_t index =
