@@ -184,9 +184,9 @@ static bool moe_worklist_enabled(ggml_type type) {
            !(specific && specific[0] == '0');
 }
 
-// A final 128-column tile containing at most 64 rows can use the native
-// 64-column MMQ tile.  This switch isolates that scheduling refinement from
-// the worklist itself.
+// A ragged final 128-column tile can use the smallest native 8/16/32/64
+// MMQ tile that contains it.  Keep the original TAIL64 switch name as the
+// production rollback knob for the whole narrow-tail refinement.
 static bool moe_worklist_tail64_enabled() {
     const char *env = getenv("DS4_MMQ_WORKLIST_TAIL64");
     return !(env && env[0] == '0');
@@ -851,6 +851,13 @@ namespace {
 // readback or synchronization is needed; expert_bounds stays authoritative.
 static constexpr int DS4_MOE_WORKLIST_MMQ_X = 128;
 static constexpr int DS4_MOE_WORKLIST_TAIL_X = 64;
+static constexpr uint32_t DS4_MOE_WORKLIST_COL_MASK = 0x1fffffffu;
+static constexpr int DS4_MOE_WORKLIST_WIDTH_SHIFT = 29;
+static constexpr uint32_t DS4_MOE_WORKLIST_WIDTH_128 = 0u;
+static constexpr uint32_t DS4_MOE_WORKLIST_WIDTH_64  = 1u;
+static constexpr uint32_t DS4_MOE_WORKLIST_WIDTH_32  = 2u;
+static constexpr uint32_t DS4_MOE_WORKLIST_WIDTH_16  = 3u;
+static constexpr uint32_t DS4_MOE_WORKLIST_WIDTH_8   = 4u;
 
 __global__ static void ds4_moe_build_tile_worklist(
         const int32_t * __restrict__ expert_bounds,
@@ -858,7 +865,7 @@ __global__ static void ds4_moe_build_tile_worklist(
         uint32_t      * __restrict__ work_count,
         int n_experts,
         int nty,
-        int enable_tail64) {
+        int enable_narrow_tails) {
     const int expert = (int)blockIdx.x;
     if (expert >= n_experts) return;
 
@@ -880,12 +887,22 @@ __global__ static void ds4_moe_build_tile_worklist(
         const uint32_t it = local - jt * (uint32_t)nty;
         const uint32_t col_offset = jt * DS4_MOE_WORKLIST_MMQ_X;
         const int remaining = rows - (int)col_offset;
-        const uint32_t narrow_tail =
-            enable_tail64 && remaining > 0 &&
-                    remaining <= DS4_MOE_WORKLIST_TAIL_X
-                ? 0x80000000u : 0u;
+        uint32_t width_code = DS4_MOE_WORKLIST_WIDTH_128;
+        if (enable_narrow_tails && remaining > 0 &&
+            remaining <= DS4_MOE_WORKLIST_TAIL_X) {
+            width_code = remaining <= 8
+                ? DS4_MOE_WORKLIST_WIDTH_8
+                : remaining <= 16
+                    ? DS4_MOE_WORKLIST_WIDTH_16
+                    : remaining <= 32
+                        ? DS4_MOE_WORKLIST_WIDTH_32
+                        : DS4_MOE_WORKLIST_WIDTH_64;
+        }
         worklist[base + local] =
-            make_uint3((uint32_t)expert, col_offset | narrow_tail, it);
+            make_uint3(
+                (uint32_t)expert,
+                col_offset | (width_code << DS4_MOE_WORKLIST_WIDTH_SHIFT),
+                it);
     }
 }
 
@@ -921,14 +938,24 @@ __global__ static void ds4_moe_worklist_mmq_kernel(
          iw += (uint32_t)gridDim.x) {
         const uint3 item = worklist[iw];
         const int expert = (int)item.x;
-        const bool narrow_tail = (item.y & 0x80000000u) != 0;
-        const int col_offset = (int)(item.y & 0x7fffffffu);
+        const uint32_t width_code =
+            item.y >> DS4_MOE_WORKLIST_WIDTH_SHIFT;
+        const int col_offset =
+            (int)(item.y & DS4_MOE_WORKLIST_COL_MASK);
         const int it = (int)item.z;
         const int col_low = expert_bounds[expert + 0];
         const int col_high = expert_bounds[expert + 1];
         const int col_diff = col_high - col_low;
 
-        const int tile_cols = narrow_tail ? DS4_MOE_WORKLIST_TAIL_X : mmq_x;
+        const int tile_cols = width_code == DS4_MOE_WORKLIST_WIDTH_8
+            ? 8
+            : width_code == DS4_MOE_WORKLIST_WIDTH_16
+                ? 16
+                : width_code == DS4_MOE_WORKLIST_WIDTH_32
+                    ? 32
+                    : width_code == DS4_MOE_WORKLIST_WIDTH_64
+                        ? 64
+                        : mmq_x;
         for (int j = tid; j < tile_cols; j += nwarps * warp_size) {
             const int j_col = col_offset + j;
             ids_dst_shared[j] = j_col < col_diff
@@ -943,7 +970,31 @@ __global__ static void ds4_moe_worklist_mmq_kernel(
         const int tile_x_max_i = nrows_x - it * mmq_y - 1;
         const int tile_y_max_j = col_diff - col_offset - 1;
 
-        if (narrow_tail) {
+        if (width_code == DS4_MOE_WORKLIST_WIDTH_8) {
+            mul_mat_q_process_tile<type, 8, need_check, false>(
+                x, offset_x, y + offset_y, ids_dst_shared,
+                dst + it * mmq_y, nullptr,
+                stride_row_x, ncols_y, stride_col_dst,
+                tile_x_max_i, tile_y_max_j,
+                /*kb0_start=*/0, /*kb0_stop=*/blocks_per_ne00,
+                /*x_soa=*/nullptr, /*soa_blocks=*/0);
+        } else if (width_code == DS4_MOE_WORKLIST_WIDTH_16) {
+            mul_mat_q_process_tile<type, 16, need_check, false>(
+                x, offset_x, y + offset_y, ids_dst_shared,
+                dst + it * mmq_y, nullptr,
+                stride_row_x, ncols_y, stride_col_dst,
+                tile_x_max_i, tile_y_max_j,
+                /*kb0_start=*/0, /*kb0_stop=*/blocks_per_ne00,
+                /*x_soa=*/nullptr, /*soa_blocks=*/0);
+        } else if (width_code == DS4_MOE_WORKLIST_WIDTH_32) {
+            mul_mat_q_process_tile<type, 32, need_check, false>(
+                x, offset_x, y + offset_y, ids_dst_shared,
+                dst + it * mmq_y, nullptr,
+                stride_row_x, ncols_y, stride_col_dst,
+                tile_x_max_i, tile_y_max_j,
+                /*kb0_start=*/0, /*kb0_stop=*/blocks_per_ne00,
+                /*x_soa=*/nullptr, /*soa_blocks=*/0);
+        } else if (width_code == DS4_MOE_WORKLIST_WIDTH_64) {
             mul_mat_q_process_tile<type, DS4_MOE_WORKLIST_TAIL_X,
                                    need_check, false>(
                 x, offset_x, y + offset_y, ids_dst_shared,
@@ -990,7 +1041,8 @@ int ds4_mmq_moe_worklist_launch(
     const int mmq_y = get_mmq_y_host(cc);
     if (get_mmq_x_max_host(cc) < mmq_x || mmq_y != 128 || nsm <= 0 ||
         M <= 0 || K <= 0 || K % ggml_blck_size(type) != 0 ||
-        ne_get_rows <= 0 || ne_get_rows > INT_MAX ||
+        ne_get_rows <= 0 ||
+        ne_get_rows > (int64_t)DS4_MOE_WORKLIST_COL_MASK ||
         stride_row_x <= 0 || stride_row_x > INT_MAX ||
         stride_channel_x <= 0 || stride_channel_x > INT_MAX) {
         return -1;

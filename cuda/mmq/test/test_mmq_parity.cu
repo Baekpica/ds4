@@ -1513,6 +1513,11 @@ int main(int argc, char ** argv) {
     all_ok &= run_q3_K_moe_bounded(
         /*M=*/128, /*K=*/512, /*nt=*/256, /*nexp=*/16, /*nused=*/6,
         0xC3B00D);
+    // Solar-like sparse routing: average bucket population is only three
+    // rows, exercising the compact worklist's narrow ragged-tail classes.
+    all_ok &= run_q3_K_moe_bounded(
+        /*M=*/128, /*K=*/512, /*nt=*/32, /*nexp=*/64, /*nused=*/6,
+        0xC3B008);
     // Q4_K MoE - new in Step 2. Three shapes mirror the IQ2_XXS coverage.
     all_ok &= run_q4_K_moe   (/*M=*/64,   /*K=*/256,  /*nt=*/8,  /*nexp=*/4,   /*nused=*/2, 0xC4FE05);
     all_ok &= run_q4_K_moe   (/*M=*/128,  /*K=*/512,  /*nt=*/16, /*nexp=*/8,   /*nused=*/2, 0xC4FE06);
@@ -1520,6 +1525,9 @@ int main(int argc, char ** argv) {
     all_ok &= run_q4_K_moe_bounded(
         /*M=*/128, /*K=*/512, /*nt=*/256, /*nexp=*/16, /*nused=*/6,
         0xC4B00D);
+    all_ok &= run_q4_K_moe_bounded(
+        /*M=*/128, /*K=*/512, /*nt=*/32, /*nexp=*/64, /*nused=*/6,
+        0xC4B008);
 
     // Step 3 - paired MoE (one quantize, two matmuls).  Each call asserts
     // bit-identity vs two back-to-back single-W moe calls over the same
