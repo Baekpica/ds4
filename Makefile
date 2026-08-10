@@ -9,6 +9,7 @@ SOLAR_KDA_TEST :=
 SOLAR_KDA_PREFILL_TEST :=
 SOLAR_GATE_TEST :=
 SOLAR_KV_TEST :=
+SOLAR_MEMORY_TEST :=
 else
 NATIVE_CPU_FLAG ?= -march=native
 SAMPLING_TEST := tests/test_sampling
@@ -17,6 +18,7 @@ SOLAR_KDA_TEST := tests/test_solar_kda
 SOLAR_KDA_PREFILL_TEST := tests/test_solar_kda_prefill
 SOLAR_GATE_TEST := tests/test_solar_gates
 SOLAR_KV_TEST := tests/test_solar_kv
+SOLAR_MEMORY_TEST := tests/test_solar_memory
 endif
 
 DEBUG_FLAGS ?= -g
@@ -73,7 +75,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch test-solar-kda test-solar-kda-prefill test-solar-kda-fla test-solar-gates test-solar-kv test-solar-loader test-solar-session dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch test-solar-kda test-solar-kda-prefill test-solar-kda-fla test-solar-gates test-solar-kv test-solar-memory test-solar-loader test-solar-session dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -402,6 +404,15 @@ tests/test_solar_kv: tests/test_solar_kv.o ds4_cuda.o $(MMQ_OBJS)
 test-solar-kv: tests/test_solar_kv
 	./tests/test_solar_kv
 
+tests/test_solar_memory.o: tests/test_solar_memory.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_memory: tests/test_solar_memory.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-memory: tests/test_solar_memory
+	./tests/test_solar_memory
+
 tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
@@ -550,7 +561,7 @@ endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	$(SAMPLING_TEST) $(EXAONE_MTP_POLICY_TEST) $(SOLAR_KDA_TEST) $(SOLAR_KDA_PREFILL_TEST) $(SOLAR_GATE_TEST) $(SOLAR_KV_TEST) ds4 ds4-server ds4-bench ds4-agent
+	$(SAMPLING_TEST) $(EXAONE_MTP_POLICY_TEST) $(SOLAR_KDA_TEST) $(SOLAR_KDA_PREFILL_TEST) $(SOLAR_GATE_TEST) $(SOLAR_KV_TEST) $(SOLAR_MEMORY_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -565,6 +576,7 @@ ifneq ($(UNAME_S),Darwin)
 	./tests/test_solar_kda_prefill
 	./tests/test_solar_gates
 	./tests/test_solar_kv
+	./tests/test_solar_memory
 endif
 
 dspark-acceptance: ds4
@@ -601,4 +613,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_exaone_mtp_policy tests/test_exaone_mtp_identity tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_fla tests/test_solar_kv tests/test_solar_gates tests/test_solar_loader tests/test_solar_tokenizer tests/test_solar_session tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_exaone_mtp_policy tests/test_exaone_mtp_identity tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_fla tests/test_solar_kv tests/test_solar_memory tests/test_solar_gates tests/test_solar_loader tests/test_solar_tokenizer tests/test_solar_session tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

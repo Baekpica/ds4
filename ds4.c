@@ -60578,11 +60578,22 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
 
 #ifndef DS4_NO_GPU
-/* KV bytes this model will hold at ctx_size, from the layer schedule rather
- * than a uniform worst case. K-EXAONE's LLLG puts full attention on every
- * n_swa_period-th layer and a fixed window on the rest, so only a quarter of
- * the layers grow with context. */
-static uint64_t ds4_engine_kv_estimate_bytes(const ds4_engine *e, uint32_t ctx_size) {
+/* Runtime bytes that must remain beside a CUDA-owned model image.
+ *
+ * Solar uses the exact graph projection because its 12 full-attention layers,
+ * recurrent KDA pools, split-KV partials, and prefill workspace are all
+ * material at 1M context.  K-EXAONE retains its schedule-aware KV projection;
+ * its smaller fixed workspace is covered by the operator floor below. */
+static uint64_t ds4_engine_weight_residency_context_bytes(
+        const ds4_engine *e,
+        uint32_t          ctx_size) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        return ds4_context_memory_estimate_with_prefill_mode(
+                e->backend,
+                (int)ctx_size,
+                e->prefill_chunk,
+                e->ssd_streaming).total_bytes;
+    }
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_EXAONE_MOE) return 0;
     const uint64_t row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u * sizeof(uint16_t);
     const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
@@ -60595,6 +60606,77 @@ static uint64_t ds4_engine_kv_estimate_bytes(const ds4_engine *e, uint32_t ctx_s
     }
     return total;
 }
+
+/* These are three views of the same GB10 DRAM, not independent pools.
+ * MemAvailable excludes the driver-retained allocation, while cudaMemGetInfo
+ * on the HMM path can report only a tiny immediately-free window.  The total
+ * physical CUDA working set still includes the retained pool that a later
+ * context reuses.  Use the largest view, never their sum.  This path is only
+ * reached for coherent direct-map devices; the operational precondition is
+ * still one large model process at a time, and cudaMalloc failure retains the
+ * existing direct-map fallback. */
+static int ds4_engine_weight_residency_should_copy(
+        uint64_t  model_bytes,
+        uint64_t  context_bytes,
+        uint64_t  floor_bytes,
+        uint64_t  mem_available_bytes,
+        uint64_t  cuda_free_bytes,
+        uint64_t  physical_pool_bytes,
+        uint64_t *need_out,
+        uint64_t *budget_out) {
+    const uint64_t need = ds4_add_sat_u64(
+            ds4_add_sat_u64(model_bytes, context_bytes), floor_bytes);
+    uint64_t budget = mem_available_bytes > cuda_free_bytes
+        ? mem_available_bytes : cuda_free_bytes;
+    if (physical_pool_bytes > budget) budget = physical_pool_bytes;
+    if (need_out) *need_out = need;
+    if (budget_out) *budget_out = budget;
+    return need != UINT64_MAX && need <= budget;
+}
+
+#ifdef DS4_TEST_HOOKS
+uint64_t ds4_test_solar_weight_residency_context_bytes(
+        uint32_t    ctx_size,
+        uint32_t    prefill_chunk,
+        const char *kv_format) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    const char *old_format = getenv("DS4_SOLAR_KV_FORMAT");
+    char *saved_format = old_format ? ds4_strdup(old_format) : NULL;
+
+    g_ds4_shape = DS4_SHAPE_SOLAR_OPEN2_250B;
+    if (kv_format && kv_format[0]) setenv("DS4_SOLAR_KV_FORMAT", kv_format, 1);
+    else unsetenv("DS4_SOLAR_KV_FORMAT");
+
+    ds4_engine e;
+    memset(&e, 0, sizeof(e));
+    e.backend = DS4_BACKEND_CUDA;
+    e.prefill_chunk = prefill_chunk;
+    const uint64_t bytes =
+        ds4_engine_weight_residency_context_bytes(&e, ctx_size);
+
+    if (saved_format) {
+        setenv("DS4_SOLAR_KV_FORMAT", saved_format, 1);
+        free(saved_format);
+    } else {
+        unsetenv("DS4_SOLAR_KV_FORMAT");
+    }
+    g_ds4_shape = saved_shape;
+    return bytes;
+}
+
+int ds4_test_weight_residency_should_copy(
+        uint64_t model_bytes,
+        uint64_t context_bytes,
+        uint64_t floor_bytes,
+        uint64_t mem_available_bytes,
+        uint64_t cuda_free_bytes,
+        uint64_t physical_pool_bytes) {
+    return ds4_engine_weight_residency_should_copy(
+            model_bytes, context_bytes, floor_bytes,
+            mem_available_bytes, cuda_free_bytes, physical_pool_bytes,
+            NULL, NULL);
+}
+#endif
 
 /* Decide between a device-resident copy of the weights and reading the model
  * mapping in place.
@@ -60612,6 +60694,9 @@ static uint64_t ds4_engine_kv_estimate_bytes(const ds4_engine *e, uint32_t ctx_s
  * engine that silently picks one is impossible to reason about later. */
 static void ds4_engine_choose_weight_residency(ds4_engine *e, uint32_t ctx_size) {
     if (e->backend != DS4_BACKEND_CUDA) return;
+    /* This preference is process-global in the CUDA backend.  Clear a prior
+     * engine's choice before every new admission decision. */
+    ds4_gpu_model_prefer_device_copy(0);
     if (!ds4_gpu_model_map_is_direct()) return;   /* discrete GPU: already copies */
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         fprintf(stderr, "ds4: DS4_CUDA_DIRECT_MODEL set; reading weights in place\n");
@@ -60630,7 +60715,8 @@ static void ds4_engine_choose_weight_residency(ds4_engine *e, uint32_t ctx_size)
         return;
     }
     const uint64_t model = e->model.size;
-    const uint64_t kv = ds4_engine_kv_estimate_bytes(e, ctx_size);
+    const uint64_t context =
+        ds4_engine_weight_residency_context_bytes(e, ctx_size);
     const uint64_t floor = 8ull << 30;   /* OS, driver, workspace, page cache */
     uint64_t mem_avail = 0;
     {
@@ -60647,30 +60733,49 @@ static void ds4_engine_choose_weight_residency(ds4_engine *e, uint32_t ctx_size)
             fclose(f);
         }
     }
-    if (mem_avail == 0) return;
-    /* MemAvailable, not MemTotal: on a box where a previous load's memory has
-     * not been returned (a known driver behaviour on this platform), MemTotal
-     * says the copy fits and the OOM killer says otherwise. The chunked copy
-     * releases the source page cache as it goes, so MemAvailable -- which
-     * already counts that cache as reclaimable -- is the honest budget. */
-    const uint64_t need = model + kv + floor;
-    if (need <= mem_avail) {
+    const uint64_t cuda_free = ds4_gpu_tier_free_vram(0);
+    const uint64_t physical_pool =
+        ds4_gpu_recommended_working_set_size();
+    uint64_t need = 0;
+    uint64_t budget = 0;
+    const int copy = ds4_engine_weight_residency_should_copy(
+            model, context, floor, mem_avail, cuda_free, physical_pool,
+            &need, &budget);
+    if (budget == 0) {
+        fprintf(stderr,
+                "ds4: unified memory: availability query failed; reading "
+                "weights in place\n");
+        return;
+    }
+    if (copy) {
         fprintf(stderr,
                 "ds4: unified memory: copying %.2f GiB of weights to device "
-                "(KV %.2f GiB + %.0f GiB floor fits in %.2f GiB available); "
+                "(context %.2f GiB + %.0f GiB floor fits in %.2f GiB UMA "
+                "budget; Linux available %.2f GiB, CUDA immediate %.2f GiB, "
+                "physical pool %.2f GiB); "
                 "the mapping path costs ~30%% of read bandwidth on this part\n",
-                (double)model / 1073741824.0, (double)kv / 1073741824.0,
-                (double)floor / 1073741824.0, (double)mem_avail / 1073741824.0);
+                (double)model / 1073741824.0,
+                (double)context / 1073741824.0,
+                (double)floor / 1073741824.0,
+                (double)budget / 1073741824.0,
+                (double)mem_avail / 1073741824.0,
+                (double)cuda_free / 1073741824.0,
+                (double)physical_pool / 1073741824.0);
         ds4_gpu_model_prefer_device_copy(1);
     } else {
         fprintf(stderr,
                 "ds4: unified memory: reading weights in place -- a device copy "
-                "would need %.2f GiB (model %.2f + KV %.2f + floor %.0f) but "
-                "only %.2f GiB is available. Expect roughly 30%% less read "
-                "bandwidth\n",
+                "would need %.2f GiB (model %.2f + context %.2f + floor %.0f) but "
+                "only %.2f GiB of UMA budget is usable (Linux available %.2f "
+                "GiB, CUDA immediate %.2f GiB, physical pool %.2f GiB). "
+                "Expect roughly 30%% less read bandwidth\n",
                 (double)need / 1073741824.0, (double)model / 1073741824.0,
-                (double)kv / 1073741824.0, (double)floor / 1073741824.0,
-                (double)mem_avail / 1073741824.0);
+                (double)context / 1073741824.0,
+                (double)floor / 1073741824.0,
+                (double)budget / 1073741824.0,
+                (double)mem_avail / 1073741824.0,
+                (double)cuda_free / 1073741824.0,
+                (double)physical_pool / 1073741824.0);
     }
 }
 
