@@ -33499,11 +33499,13 @@ static void *solar_kda_scratch_ensure(uint64_t bytes, const char *what) {
     return g_solar_kda_scratch;
 }
 
-/* One block per (token, head), 128 threads. Reproduces the sequence kernel's
- * conv + SiLU + L2 normalization + gate math bit-for-bit (same reduction
- * tree), but writes token-parallel workspace rows instead of stepping state:
- * qn (normalized, includes 1/sqrt(dim)), kn (normalized), vv (conv+SiLU v),
- * gl (clamped log decay, kept in log space for the chunk prefix sums). */
+/* One block per (8 tokens, head), 128 threads. Reproduces the sequence
+ * kernel's conv + SiLU + L2 normalization + gate math bit-for-bit (same
+ * reduction tree), but writes token-parallel workspace rows instead of
+ * stepping state: qn (normalized, includes 1/sqrt(dim)), kn (normalized),
+ * vv (conv+SiLU v), gl (clamped log decay, kept in log space for the chunk
+ * prefix sums). One token per block measured faster than batching eight:
+ * the serialized reduction trees cost more than the launch grid saves. */
 static __global__ void solar_kda_chunk_prep_kernel(
         float       *qn,
         float       *kn,
@@ -33521,6 +33523,7 @@ static __global__ void solar_kda_chunk_prep_kernel(
         const float *v_conv_weight,
         const float *decay_scale,
         const float *dt_bias,
+        uint32_t     n_tokens,
         uint32_t     n_head,
         uint32_t     conv_kernel,
         float        gate_lower_bound) {
@@ -33529,76 +33532,84 @@ static __global__ void solar_kda_chunk_prep_kernel(
     __shared__ float q_norm_scale;
     __shared__ float k_norm_scale;
 
-    const uint32_t token = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t dim = threadIdx.x;
     const uint64_t vector_count = (uint64_t)n_head * SOLAR_KDA_DIM;
     const uint64_t channel = (uint64_t)head * SOLAR_KDA_DIM + dim;
 
-    /* Taps reach back conv_kernel-1 raw tokens; positions before the launch
-     * come from the shift register, where launch-relative x[-m] sits in
-     * slot conv_kernel-m. */
-    float q = 0.0f;
-    float k = 0.0f;
-    float v = 0.0f;
-    for (uint32_t tap = 0; tap < conv_kernel; tap++) {
-        const int32_t src =
-            (int32_t)token - (int32_t)(conv_kernel - 1u) + (int32_t)tap;
-        float qv;
-        float kv;
-        float vv_in;
-        if (src >= 0) {
-            const uint64_t base = (uint64_t)src * vector_count + channel;
-            qv = q_raw[base];
-            kv = k_raw[base];
-            vv_in = v_raw[base];
-        } else {
-            const uint64_t slot =
-                channel * conv_kernel + (uint32_t)((int32_t)conv_kernel + src);
-            qv = q_conv_state[slot];
-            kv = k_conv_state[slot];
-            vv_in = v_conv_state[slot];
-        }
-        const uint64_t weight = channel * conv_kernel + tap;
-        q += qv * q_conv_weight[weight];
-        k += kv * k_conv_weight[weight];
-        v += vv_in * v_conv_weight[weight];
-    }
-    q = solar_kda_silu(q);
-    k = solar_kda_silu(k);
-    v = solar_kda_silu(v);
+    {
+        const uint32_t token = blockIdx.x;
+        if (token >= n_tokens) return;
 
-    q_sq[dim] = q * q;
-    k_sq[dim] = k * k;
-    __syncthreads();
-    for (uint32_t stride = SOLAR_KDA_DIM / 2u; stride > 0u; stride >>= 1u) {
-        if (dim < stride) {
-            q_sq[dim] += q_sq[dim + stride];
-            k_sq[dim] += k_sq[dim + stride];
+        /* Taps reach back conv_kernel-1 raw tokens; positions before the
+         * launch come from the shift register, where launch-relative x[-m]
+         * sits in slot conv_kernel-m. */
+        float q = 0.0f;
+        float k = 0.0f;
+        float v = 0.0f;
+        for (uint32_t tap = 0; tap < conv_kernel; tap++) {
+            const int32_t src =
+                (int32_t)token - (int32_t)(conv_kernel - 1u) + (int32_t)tap;
+            float qv;
+            float kv;
+            float vv_in;
+            if (src >= 0) {
+                const uint64_t base = (uint64_t)src * vector_count + channel;
+                qv = q_raw[base];
+                kv = k_raw[base];
+                vv_in = v_raw[base];
+            } else {
+                const uint64_t slot = channel * conv_kernel +
+                    (uint32_t)((int32_t)conv_kernel + src);
+                qv = q_conv_state[slot];
+                kv = k_conv_state[slot];
+                vv_in = v_conv_state[slot];
+            }
+            const uint64_t weight = channel * conv_kernel + tap;
+            q += qv * q_conv_weight[weight];
+            k += kv * k_conv_weight[weight];
+            v += vv_in * v_conv_weight[weight];
+        }
+        q = solar_kda_silu(q);
+        k = solar_kda_silu(k);
+        v = solar_kda_silu(v);
+
+        q_sq[dim] = q * q;
+        k_sq[dim] = k * k;
+        __syncthreads();
+        for (uint32_t stride = SOLAR_KDA_DIM / 2u;
+             stride > 0u;
+             stride >>= 1u) {
+            if (dim < stride) {
+                q_sq[dim] += q_sq[dim + stride];
+                k_sq[dim] += k_sq[dim + stride];
+            }
+            __syncthreads();
+        }
+        if (dim == 0u) {
+            q_norm_scale =
+                rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)SOLAR_KDA_DIM);
+            k_norm_scale = rsqrtf(k_sq[0] + 1.0e-6f);
         }
         __syncthreads();
-    }
-    if (dim == 0u) {
-        q_norm_scale =
-            rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)SOLAR_KDA_DIM);
-        k_norm_scale = rsqrtf(k_sq[0] + 1.0e-6f);
-    }
-    __syncthreads();
 
-    float gate = decay_scale[head] *
-        solar_kda_softplus(g_raw[(uint64_t)token * vector_count + channel] +
-                           dt_bias[channel]);
-    if (gate < gate_lower_bound) gate = gate_lower_bound;
+        float gate = decay_scale[head] *
+            solar_kda_softplus(
+                g_raw[(uint64_t)token * vector_count + channel] +
+                dt_bias[channel]);
+        if (gate < gate_lower_bound) gate = gate_lower_bound;
 
-    /* Workspace planes are head-major [head][token][dim]: the chunk kernels
-     * then touch one contiguous 32 KiB span per (chunk, head) instead of 64
-     * rows scattered 32 KiB apart, which is what keeps them L1-resident. */
-    const uint64_t row =
-        ((uint64_t)head * gridDim.x + token) * SOLAR_KDA_DIM + dim;
-    qn[row] = q * q_norm_scale;
-    kn[row] = k * k_norm_scale;
-    vv[row] = v;
-    gl[row] = gate;
+        /* Workspace planes are head-major [head][token][dim]: the chunk
+         * kernels then touch one contiguous 32 KiB span per (chunk, head)
+         * instead of 64 rows scattered 32 KiB apart, which is what keeps
+         * them L1-resident. */
+        const uint64_t row =
+            ((uint64_t)head * n_tokens + token) * SOLAR_KDA_DIM + dim;
+        qn[row] = q * q_norm_scale;
+        kn[row] = k * k_norm_scale;
+        vv[row] = v;
+        gl[row] = gate;
+    }
 }
 
 /* Advances the three shift registers to their post-launch contents in one
@@ -33643,7 +33654,7 @@ static __global__ void solar_kda_chunk_conv_tail_kernel(
  * lives in the gl plane: the prefix pass rewrites it in place and later
  * reads stay in L1, keeping the block under 50 KiB so two blocks share an
  * SM. */
-#define SOLAR_KDA_ROW 129u
+#define SOLAR_KDA_ROW 132u
 #define SOLAR_KDA_SH_A 0u
 #define SOLAR_KDA_SH_BETA (SOLAR_KDA_CHUNK * (SOLAR_KDA_CHUNK + 1u))
 #define SOLAR_KDA_SH_TILE (SOLAR_KDA_SH_BETA + SOLAR_KDA_CHUNK)
@@ -33745,10 +33756,16 @@ static __global__ void solar_kda_chunk_factor_kernel(
             const uint32_t s = c0 + sc;
             float mk = 0.0f;
             float mqv = 0.0f;
-            for (uint32_t d = 0; d < SOLAR_KDA_DIM; d++) {
-                const float rv = rowR[sc * SOLAR_KDA_ROW + d];
-                mk += rowLk[tr * SOLAR_KDA_ROW + d] * rv;
-                mqv += rowLq[tr * SOLAR_KDA_ROW + d] * rv;
+            const float4 *r4 = (const float4 *)(rowR + sc * SOLAR_KDA_ROW);
+            const float4 *lk4 = (const float4 *)(rowLk + tr * SOLAR_KDA_ROW);
+            const float4 *lq4 = (const float4 *)(rowLq + tr * SOLAR_KDA_ROW);
+#pragma unroll 8
+            for (uint32_t d4 = 0; d4 < SOLAR_KDA_DIM / 4u; d4++) {
+                const float4 rv = r4[d4];
+                const float4 lk = lk4[d4];
+                const float4 lq = lq4[d4];
+                mk += lk.x * rv.x + lk.y * rv.y + lk.z * rv.z + lk.w * rv.w;
+                mqv += lq.x * rv.x + lq.y * rv.y + lq.z * rv.z + lq.w * rv.w;
             }
             sA[t * (SOLAR_KDA_CHUNK + 1u) + s] =
                 s < t ? sBeta[t] * mk : 0.0f;
@@ -33797,60 +33814,105 @@ static __global__ void solar_kda_chunk_factor_kernel(
     }
     __syncthreads();
 
-    /* U_loc and W rows through the lower-triangular T. V streams from
-     * global; staging it through shared was tried and lost more to the
-     * occupancy drop (the block crosses the two-blocks-per-SM boundary)
-     * than the latency it saved. */
-    const uint32_t t = tid >> 2;
-    const uint32_t dg = (tid & 3u) * 32u;
-    if (t < n) {
-        const uint64_t out_row = plane + (uint64_t)t * SOLAR_KDA_DIM + dg;
-        float acc[32];
+    /* U_loc and W rows through the lower-triangular T, as 4-row x 8-column
+     * register tiles: per s step each thread takes four T coefficients and
+     * two float4 right-hand-side vectors for 32 FMA. The s loop tops out at
+     * the tile's last row; the pairs it visits above a row's own diagonal
+     * all land in the zero-written upper halves of the diagonal sub-blocks,
+     * so they contribute nothing. V streams from global (staging it through
+     * shared crossed the two-blocks-per-SM boundary and lost more than it
+     * saved); K~ reads full shared rows, which touch every bank quad once. */
+    const uint32_t tg = (tid >> 4) * 4u;
+    const uint32_t dgc = (tid & 15u) * 8u;
+    float acc[4][8];
 #pragma unroll
-        for (uint32_t i = 0; i < 32u; i++) acc[i] = 0.0f;
-        for (uint32_t s = 0; s <= t; s++) {
-            const float coeff =
-                sA[t * (SOLAR_KDA_CHUNK + 1u) + s] * sBeta[s];
-            const float *vrow = vvh + (uint64_t)s * SOLAR_KDA_DIM + dg;
+    for (uint32_t i = 0; i < 4u; i++)
 #pragma unroll
-            for (uint32_t i = 0; i < 32u; i++) acc[i] += coeff * vrow[i];
+        for (uint32_t j = 0; j < 8u; j++) acc[i][j] = 0.0f;
+    for (uint32_t s = 0; s < tg + 4u && s < n; s++) {
+        const float bs = sBeta[s];
+        const float4 va = *(const float4 *)
+            (vvh + (uint64_t)s * SOLAR_KDA_DIM + dgc);
+        const float4 vb = *(const float4 *)
+            (vvh + (uint64_t)s * SOLAR_KDA_DIM + dgc + 4u);
+        const float rv[8] = {va.x * bs, va.y * bs, va.z * bs, va.w * bs,
+                             vb.x * bs, vb.y * bs, vb.z * bs, vb.w * bs};
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const float coeff = sA[(tg + i) * (SOLAR_KDA_CHUNK + 1u) + s];
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) acc[i][j] += coeff * rv[j];
         }
+    }
 #pragma unroll
-        for (uint32_t i = 0; i < 32u; i++) ul[out_row + i] = acc[i];
+    for (uint32_t i = 0; i < 4u; i++) {
+        if (tg + i < n) {
+            float *urow = ul + plane +
+                (uint64_t)(tg + i) * SOLAR_KDA_DIM + dgc;
+            float4 oa;
+            float4 ob;
+            oa.x = acc[i][0]; oa.y = acc[i][1];
+            oa.z = acc[i][2]; oa.w = acc[i][3];
+            ob.x = acc[i][4]; ob.y = acc[i][5];
+            ob.z = acc[i][6]; ob.w = acc[i][7];
+            *(float4 *)urow = oa;
+            *(float4 *)(urow + 4u) = ob;
+        }
+    }
 
 #pragma unroll
-        for (uint32_t i = 0; i < 32u; i++) acc[i] = 0.0f;
-        for (uint32_t s = 0; s <= t; s++) {
-            const float coeff = sA[t * (SOLAR_KDA_CHUNK + 1u) + s];
-            const float *krow = sTile + s * SOLAR_KDA_DIM + dg;
+    for (uint32_t i = 0; i < 4u; i++)
 #pragma unroll
-            for (uint32_t i = 0; i < 32u; i++) acc[i] += coeff * krow[i];
+        for (uint32_t j = 0; j < 8u; j++) acc[i][j] = 0.0f;
+    for (uint32_t s = 0; s < tg + 4u && s < n; s++) {
+        const float4 ka = *(const float4 *)
+            (sTile + s * SOLAR_KDA_DIM + dgc);
+        const float4 kb = *(const float4 *)
+            (sTile + s * SOLAR_KDA_DIM + dgc + 4u);
+        const float rk[8] = {ka.x, ka.y, ka.z, ka.w,
+                             kb.x, kb.y, kb.z, kb.w};
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const float coeff = sA[(tg + i) * (SOLAR_KDA_CHUNK + 1u) + s];
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) acc[i][j] += coeff * rk[j];
         }
+    }
 #pragma unroll
-        for (uint32_t i = 0; i < 32u; i++) ww[out_row + i] = acc[i];
+    for (uint32_t i = 0; i < 4u; i++) {
+        if (tg + i < n) {
+            float *wrow = ww + plane +
+                (uint64_t)(tg + i) * SOLAR_KDA_DIM + dgc;
+            float4 oa;
+            float4 ob;
+            oa.x = acc[i][0]; oa.y = acc[i][1];
+            oa.z = acc[i][2]; oa.w = acc[i][3];
+            ob.x = acc[i][4]; ob.y = acc[i][5];
+            ob.z = acc[i][6]; ob.w = acc[i][7];
+            *(float4 *)wrow = oa;
+            *(float4 *)(wrow + 4u) = ob;
+        }
     }
 }
 
-/* sX Q~/K^ tile + full W tile + this slice's 64-column U tile. The X and W
- * rows are stored as four 36-float segments, one per g lane group: segment
- * bases land on distinct bank quads (36 floats = 9 quads, and 4t+g walks all
- * eight), so the per-t dots read them as conflict-free 16-byte vectors. */
-#define SOLAR_KDA_SEG 36u
-#define SOLAR_KDA_XROW (4u * SOLAR_KDA_SEG)
+/* The scan's shared plan: the 128x64 state slice (rows padded to 68 floats
+ * so column vectors stagger banks), one 64x128 operand tile reused for Q~,
+ * W and K^ in turn, and the slice's U rows (padded like the state). */
+#define SOLAR_KDA_SROW 68u
 #define SOLAR_KDA_SCAN_SHARED \
-    ((2u * SOLAR_KDA_CHUNK * SOLAR_KDA_XROW + \
-      SOLAR_KDA_CHUNK * 64u) * sizeof(float))
+    ((SOLAR_KDA_DIM * SOLAR_KDA_SROW + \
+      SOLAR_KDA_CHUNK * SOLAR_KDA_DIM + \
+      SOLAR_KDA_CHUNK * SOLAR_KDA_SROW) * sizeof(float))
 
-/* One block per (head, 64-column state slice), 256 threads, looping chunks in
- * sequence order. The recurrence is column-separable, so each block keeps its
- * 128x64 state slice in registers for the whole launch: thread tid = dv*4+g
- * owns rows g+4k of column dv, making the 128-row dots a 4-lane in-warp
- * shuffle reduction. Per chunk it emits O_inter = Q~ S0, rewrites ul with the
- * final U = U_loc - W S0, and folds the chunk into the state. W, U_loc and
- * the Q~/K^ tiles are bulk-staged into shared up front: the t loops walk
- * one 512-byte row per step, and reading those rows straight from the UMA
- * planes exposed a full memory latency per step (measured ~3x the whole
- * kernel), while a coalesced prefetch streams them at bandwidth. */
+/* One block per (head, 64-column state slice), 256 threads, looping chunks
+ * in sequence order. The recurrence is column-separable, so each block keeps
+ * its 128x64 state slice in shared memory for the whole launch and runs the
+ * three per-chunk products as register-tiled GEMMs: a 16x16 thread grid with
+ * 4x4 (or 8x4) micro-tiles and float4 operands, eight FMA per shared vector
+ * instead of the one-load-one-FMA shuffle dots of the previous revision.
+ * O_inter = Q~ S0 and U = U_loc - W S0 share one 64x64 output shape; the
+ * state fold S = diag(e) S + K^T U owns disjoint micro-tiles of sS, so no
+ * cross-thread ordering is needed beyond the phase barriers. */
 static __global__ void solar_kda_chunk_scan_kernel(
         float       *out,
         float       *state,
@@ -33862,28 +33924,32 @@ static __global__ void solar_kda_chunk_scan_kernel(
         uint32_t     n_tokens,
         uint32_t     n_head) {
     extern __shared__ float sh[];
-    float *sX = sh;                                     /* [64][4][36] Q~, K^ */
-    float *sW = sh + SOLAR_KDA_CHUNK * SOLAR_KDA_XROW;  /* [64][4][36] W */
-    float *sU = sW + SOLAR_KDA_CHUNK * SOLAR_KDA_XROW;  /* [64][64] slice U */
+    float *sS = sh;                                   /* [128][68] state */
+    float *sX = sS + SOLAR_KDA_DIM * SOLAR_KDA_SROW;  /* [64][128] Q~/W/K^ */
+    float *sU = sX + SOLAR_KDA_CHUNK * SOLAR_KDA_DIM; /* [64][68] U rows */
 
     const uint32_t head = blockIdx.x;
     const uint32_t slice = blockIdx.y;
     const uint32_t tid = threadIdx.x;
-    const uint32_t dvp = tid >> 2;
-    const uint32_t g = tid & 3u;
-    const uint32_t dv = slice * 64u + dvp;
     const uint64_t vector_count = (uint64_t)n_head * SOLAR_KDA_DIM;
     const uint64_t head_base = (uint64_t)head * SOLAR_KDA_DIM;
     const uint64_t state_base = head_base * SOLAR_KDA_DIM;
     const uint64_t plane0 = (uint64_t)head * n_tokens * SOLAR_KDA_DIM;
+    const uint32_t dv_base = slice * 64u;
 
-    /* Thread (dv, g) owns state rows g*32..g*32+31 of its column. */
-    float s0[32];
-#pragma unroll
-    for (uint32_t k = 0; k < 32u; k++) {
-        s0[k] = state[state_base +
-                      (uint64_t)(g * 32u + k) * SOLAR_KDA_DIM + dv];
+    for (uint32_t idx = tid;
+         idx < SOLAR_KDA_DIM * 64u;
+         idx += blockDim.x) {
+        const uint32_t kd = idx >> 6;
+        const uint32_t d = idx & 63u;
+        sS[kd * SOLAR_KDA_SROW + d] =
+            state[state_base + (uint64_t)kd * SOLAR_KDA_DIM + dv_base + d];
     }
+
+    /* 64x64 outputs: 4 rows x 4 columns per thread. 128x64 state fold:
+     * 8 rows x 4 columns. */
+    const uint32_t tg = (tid >> 4) * 4u;
+    const uint32_t dg = (tid & 15u) * 4u;
 
     const uint32_t n_chunks =
         (n_tokens + SOLAR_KDA_CHUNK - 1u) / SOLAR_KDA_CHUNK;
@@ -33898,149 +33964,184 @@ static __global__ void solar_kda_chunk_scan_kernel(
         const float *wwh = ww + cbase;
         float *ulh = ul + cbase;
 
+        __syncthreads();
         for (uint32_t idx = tid;
              idx < SOLAR_KDA_CHUNK * SOLAR_KDA_DIM;
              idx += blockDim.x) {
             const uint32_t t = idx >> 7;
-            const uint32_t d = idx & (SOLAR_KDA_DIM - 1u);
-            float x = 0.0f;
-            float w = 0.0f;
-            if (t < n) {
-                x = qnh[idx] * __expf(glh[idx]);
-                w = wwh[idx];
-            }
-            const uint32_t seg =
-                (t * 4u + (d >> 5)) * SOLAR_KDA_SEG + (d & 31u);
-            sX[seg] = x;
-            sW[seg] = w;
+            sX[idx] = t < n ? qnh[idx] * __expf(glh[idx]) : 0.0f;
         }
         for (uint32_t idx = tid;
              idx < SOLAR_KDA_CHUNK * 64u;
              idx += blockDim.x) {
             const uint32_t t = idx >> 6;
             const uint32_t d = idx & 63u;
-            sU[idx] = t < n
-                ? ulh[t * SOLAR_KDA_DIM + slice * 64u + d] : 0.0f;
+            sU[t * SOLAR_KDA_SROW + d] = t < n
+                ? ulh[t * SOLAR_KDA_DIM + dv_base + d] : 0.0f;
         }
         __syncthreads();
 
-        for (uint32_t t = 0; t < n; t++) {
-            const float4 *xq = (const float4 *)
-                (sX + (t * 4u + g) * SOLAR_KDA_SEG);
-            float p0 = 0.0f;
-            float p1 = 0.0f;
-            float p2 = 0.0f;
-            float p3 = 0.0f;
+        float acc[4][4];
 #pragma unroll
-            for (uint32_t j = 0; j < 8u; j++) {
-                const float4 x4 = xq[j];
-                p0 += x4.x * s0[4u * j];
-                p1 += x4.y * s0[4u * j + 1u];
-                p2 += x4.z * s0[4u * j + 2u];
-                p3 += x4.w * s0[4u * j + 3u];
+        for (uint32_t i = 0; i < 4u; i++)
+#pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) acc[i][j] = 0.0f;
+        for (uint32_t k = 0; k < SOLAR_KDA_DIM; k += 4u) {
+            float sv[4][4];
+#pragma unroll
+            for (uint32_t r = 0; r < 4u; r++) {
+                const float4 v = *(const float4 *)
+                    (sS + (k + r) * SOLAR_KDA_SROW + dg);
+                sv[r][0] = v.x; sv[r][1] = v.y; sv[r][2] = v.z; sv[r][3] = v.w;
             }
-            float p = (p0 + p1) + (p2 + p3);
-            p += __shfl_xor_sync(0xffffffffu, p, 1);
-            p += __shfl_xor_sync(0xffffffffu, p, 2);
-            if (g == 0u) {
-                out[(uint64_t)(base_token + t) * vector_count +
-                    head_base + dv] = p;
+#pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) {
+                const float4 x = *(const float4 *)
+                    (sX + (tg + i) * SOLAR_KDA_DIM + k);
+                const float xa[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+                for (uint32_t r = 0; r < 4u; r++)
+#pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++)
+                        acc[i][j] += xa[r] * sv[r][j];
+            }
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            if (tg + i < n) {
+                float4 o;
+                o.x = acc[i][0]; o.y = acc[i][1];
+                o.z = acc[i][2]; o.w = acc[i][3];
+                *(float4 *)(out +
+                    (uint64_t)(base_token + tg + i) * vector_count +
+                    head_base + dv_base + dg) = o;
             }
         }
         __syncthreads();
 
-        /* K^ rows decay forward to the chunk end. */
+        for (uint32_t idx = tid;
+             idx < SOLAR_KDA_CHUNK * SOLAR_KDA_DIM;
+             idx += blockDim.x) {
+            const uint32_t t = idx >> 7;
+            sX[idx] = t < n ? wwh[idx] : 0.0f;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++)
+#pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) acc[i][j] = 0.0f;
+        for (uint32_t k = 0; k < SOLAR_KDA_DIM; k += 4u) {
+            float sv[4][4];
+#pragma unroll
+            for (uint32_t r = 0; r < 4u; r++) {
+                const float4 v = *(const float4 *)
+                    (sS + (k + r) * SOLAR_KDA_SROW + dg);
+                sv[r][0] = v.x; sv[r][1] = v.y; sv[r][2] = v.z; sv[r][3] = v.w;
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) {
+                const float4 x = *(const float4 *)
+                    (sX + (tg + i) * SOLAR_KDA_DIM + k);
+                const float xa[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+                for (uint32_t r = 0; r < 4u; r++)
+#pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++)
+                        acc[i][j] += xa[r] * sv[r][j];
+            }
+        }
+        /* U = U_loc - W S0. Each (t, dv) micro-tile has one owner, so the
+         * in-place rewrite of sU needs no cross-thread ordering. */
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            float *urow = sU + (tg + i) * SOLAR_KDA_SROW + dg;
+            const float u0 = urow[0] - acc[i][0];
+            const float u1 = urow[1] - acc[i][1];
+            const float u2 = urow[2] - acc[i][2];
+            const float u3 = urow[3] - acc[i][3];
+            urow[0] = u0; urow[1] = u1; urow[2] = u2; urow[3] = u3;
+            if (tg + i < n) {
+                float4 o;
+                o.x = u0; o.y = u1; o.z = u2; o.w = u3;
+                *(float4 *)(ulh +
+                    (uint64_t)(tg + i) * SOLAR_KDA_DIM + dv_base + dg) = o;
+            }
+        }
+        __syncthreads();
+
+        /* K^ rows decay forward to the chunk end; the state rows decay all
+         * the way, before the fold accumulates the chunk's update. */
         const uint32_t last = (n - 1u) * SOLAR_KDA_DIM;
         for (uint32_t idx = tid;
              idx < SOLAR_KDA_CHUNK * SOLAR_KDA_DIM;
              idx += blockDim.x) {
             const uint32_t t = idx >> 7;
             const uint32_t d = idx & (SOLAR_KDA_DIM - 1u);
-            float x = 0.0f;
-            if (t < n) {
-                x = knh[idx] * __expf(glh[last + d] - glh[idx]);
-            }
-            sX[(t * 4u + (d >> 5)) * SOLAR_KDA_SEG + (d & 31u)] = x;
+            sX[idx] = t < n
+                ? knh[idx] * __expf(glh[last + d] - glh[idx]) : 0.0f;
         }
-        __syncthreads();
-
-        float s1[32];
-#pragma unroll
-        for (uint32_t k = 0; k < 32u; k++) {
-            s1[k] = __expf(glh[last + g * 32u + k]) * s0[k];
-        }
-        for (uint32_t t = 0; t < n; t++) {
-            const float4 *wq = (const float4 *)
-                (sW + (t * 4u + g) * SOLAR_KDA_SEG);
-            float p0 = 0.0f;
-            float p1 = 0.0f;
-            float p2 = 0.0f;
-            float p3 = 0.0f;
-#pragma unroll
-            for (uint32_t j = 0; j < 8u; j++) {
-                const float4 w4 = wq[j];
-                p0 += w4.x * s0[4u * j];
-                p1 += w4.y * s0[4u * j + 1u];
-                p2 += w4.z * s0[4u * j + 2u];
-                p3 += w4.w * s0[4u * j + 3u];
-            }
-            float p = (p0 + p1) + (p2 + p3);
-            p += __shfl_xor_sync(0xffffffffu, p, 1);
-            p += __shfl_xor_sync(0xffffffffu, p, 2);
-            /* Only the g0 lane touches this U slot, so the in-place
-             * U_loc -> U rewrite cannot race under independent thread
-             * scheduling; the other lanes take u through the shuffle. */
-            float u = 0.0f;
-            if (g == 0u) {
-                u = sU[t * 64u + dvp] - p;
-                sU[t * 64u + dvp] = u;
-            }
-            u = __shfl_sync(0xffffffffu, u, (threadIdx.x & 31u) & ~3u);
-            const float4 *xq = (const float4 *)
-                (sX + (t * 4u + g) * SOLAR_KDA_SEG);
-#pragma unroll
-            for (uint32_t j = 0; j < 8u; j++) {
-                const float4 x4 = xq[j];
-                s1[4u * j] += x4.x * u;
-                s1[4u * j + 1u] += x4.y * u;
-                s1[4u * j + 2u] += x4.z * u;
-                s1[4u * j + 3u] += x4.w * u;
-            }
-        }
-        __syncthreads();
-
-        /* Final U rows go back out as one coalesced stream for the intra
-         * output kernel. */
         for (uint32_t idx = tid;
-             idx < SOLAR_KDA_CHUNK * 64u;
+             idx < SOLAR_KDA_DIM * 64u;
              idx += blockDim.x) {
-            const uint32_t t = idx >> 6;
+            const uint32_t kd = idx >> 6;
             const uint32_t d = idx & 63u;
-            if (t < n) {
-                ulh[t * SOLAR_KDA_DIM + slice * 64u + d] = sU[idx];
+            sS[kd * SOLAR_KDA_SROW + d] *= __expf(glh[last + kd]);
+        }
+        __syncthreads();
+
+        {
+            const uint32_t kg = (tid >> 4) * 8u;
+            float facc[8][4];
+#pragma unroll
+            for (uint32_t r = 0; r < 8u; r++)
+#pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) facc[r][j] = 0.0f;
+            for (uint32_t t = 0; t < SOLAR_KDA_CHUNK; t++) {
+                const float4 ka = *(const float4 *)
+                    (sX + t * SOLAR_KDA_DIM + kg);
+                const float4 kb = *(const float4 *)
+                    (sX + t * SOLAR_KDA_DIM + kg + 4u);
+                const float kr[8] = {ka.x, ka.y, ka.z, ka.w,
+                                     kb.x, kb.y, kb.z, kb.w};
+                const float4 uv = *(const float4 *)
+                    (sU + t * SOLAR_KDA_SROW + dg);
+                const float ua[4] = {uv.x, uv.y, uv.z, uv.w};
+#pragma unroll
+                for (uint32_t r = 0; r < 8u; r++)
+#pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++)
+                        facc[r][j] += kr[r] * ua[j];
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < 8u; r++) {
+                float *srow = sS + (kg + r) * SOLAR_KDA_SROW + dg;
+#pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) srow[j] += facc[r][j];
             }
         }
-#pragma unroll
-        for (uint32_t k = 0; k < 32u; k++) s0[k] = s1[k];
-        __syncthreads();
     }
 
-#pragma unroll
-    for (uint32_t k = 0; k < 32u; k++) {
-        state[state_base +
-              (uint64_t)(g * 32u + k) * SOLAR_KDA_DIM + dv] = s0[k];
+    __syncthreads();
+    for (uint32_t idx = tid;
+         idx < SOLAR_KDA_DIM * 64u;
+         idx += blockDim.x) {
+        const uint32_t kd = idx >> 6;
+        const uint32_t d = idx & 63u;
+        state[state_base + (uint64_t)kd * SOLAR_KDA_DIM + dv_base + d] =
+            sS[kd * SOLAR_KDA_SROW + d];
     }
 }
 
-/* U rows are stored as four 33-float segments so the four dg groups hit
- * distinct banks instead of sharing one at stride 32. */
 #define SOLAR_KDA_INTRA_SHARED \
     ((SOLAR_KDA_CHUNK * (SOLAR_KDA_CHUNK + 1u) + \
-      SOLAR_KDA_CHUNK * 4u * 33u) * sizeof(float))
+      SOLAR_KDA_CHUNK * SOLAR_KDA_DIM) * sizeof(float))
 
-/* One block per (chunk, head), 256 threads: out += masked Mq U. Both the Mq
- * tile and the chunk's U rows are staged through shared; the row loop's
- * 512-byte walk over the U plane pays a UMA latency per step otherwise. */
+/* One block per (chunk, head), 256 threads: out += masked Mq U as 4-row x
+ * 8-column register tiles, like the factor kernel's T products. Both the Mq
+ * tile and the chunk's U rows are staged through shared; the s loop tops
+ * out at the tile's last row, and the pairs above a row's own diagonal all
+ * land in Mq's zero-masked diagonal sub-blocks. */
 static __global__ void solar_kda_chunk_intra_kernel(
         float       *out,
         const float *mq,
@@ -34074,29 +34175,47 @@ static __global__ void solar_kda_chunk_intra_kernel(
     for (uint32_t idx = tid;
          idx < SOLAR_KDA_CHUNK * SOLAR_KDA_DIM;
          idx += blockDim.x) {
-        const uint32_t t = idx >> 7;
-        const uint32_t d = idx & (SOLAR_KDA_DIM - 1u);
-        sU[(t * 4u + (d >> 5)) * 33u + (d & 31u)] =
-            t < n ? ulh[idx] : 0.0f;
+        sU[idx] = (idx >> 7) < n ? ulh[idx] : 0.0f;
     }
     __syncthreads();
 
-    const uint32_t t = tid >> 2;
-    const uint32_t dg = (tid & 3u) * 32u;
-    if (t >= n) return;
-    float acc[32];
+    const uint32_t tg = (tid >> 4) * 4u;
+    const uint32_t dgc = (tid & 15u) * 8u;
+    float acc[4][8];
 #pragma unroll
-    for (uint32_t i = 0; i < 32u; i++) acc[i] = 0.0f;
-    for (uint32_t s = 0; s <= t; s++) {
-        const float m = sM[t * (SOLAR_KDA_CHUNK + 1u) + s];
-        const float *urow = sU + (s * 4u + (dg >> 5)) * 33u;
+    for (uint32_t i = 0; i < 4u; i++)
 #pragma unroll
-        for (uint32_t i = 0; i < 32u; i++) acc[i] += m * urow[i];
+        for (uint32_t j = 0; j < 8u; j++) acc[i][j] = 0.0f;
+    for (uint32_t s = 0; s < tg + 4u && s < n; s++) {
+        const float4 ua = *(const float4 *)
+            (sU + s * SOLAR_KDA_DIM + dgc);
+        const float4 ub = *(const float4 *)
+            (sU + s * SOLAR_KDA_DIM + dgc + 4u);
+        const float rv[8] = {ua.x, ua.y, ua.z, ua.w,
+                             ub.x, ub.y, ub.z, ub.w};
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const float m = sM[(tg + i) * (SOLAR_KDA_CHUNK + 1u) + s];
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) acc[i][j] += m * rv[j];
+        }
     }
-    float *orow = out +
-        (uint64_t)(base_token + t) * vector_count + head_base + dg;
 #pragma unroll
-    for (uint32_t i = 0; i < 32u; i++) orow[i] += acc[i];
+    for (uint32_t i = 0; i < 4u; i++) {
+        if (tg + i < n) {
+            float *orow = out +
+                (uint64_t)(base_token + tg + i) * vector_count +
+                head_base + dgc;
+            float4 oa = *(const float4 *)orow;
+            float4 ob = *(const float4 *)(orow + 4u);
+            oa.x += acc[i][0]; oa.y += acc[i][1];
+            oa.z += acc[i][2]; oa.w += acc[i][3];
+            ob.x += acc[i][4]; ob.y += acc[i][5];
+            ob.z += acc[i][6]; ob.w += acc[i][7];
+            *(float4 *)orow = oa;
+            *(float4 *)(orow + 4u) = ob;
+        }
+    }
 }
 
 static int solar_kda_chunk_prefill_launch(
@@ -34177,7 +34296,7 @@ static int solar_kda_chunk_prefill_launch(
         (const float *)q_conv_weight->ptr, (const float *)k_conv_weight->ptr,
         (const float *)v_conv_weight->ptr,
         (const float *)decay_scale->ptr, (const float *)dt_bias->ptr,
-        n_head, conv_kernel, gate_lower_bound);
+        n_tokens, n_head, conv_kernel, gate_lower_bound);
     const uint32_t tail_blocks =
         (uint32_t)((vector_count + 255u) / 256u);
     solar_kda_chunk_conv_tail_kernel<<<tail_blocks, 256, 0, stream>>>(
