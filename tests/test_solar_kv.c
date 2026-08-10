@@ -109,6 +109,17 @@ static const char *format_name(ds4_solar_kv_format format) {
     }
 }
 
+static uint32_t prefill_repeat_count(void) {
+    const char *value = getenv("DS4_SOLAR_KV_PREFILL_REPEATS");
+    if (!value || !value[0]) return 1u;
+    char *end = NULL;
+    const unsigned long count = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || count == 0u || count > 10000u) {
+        return 0u;
+    }
+    return (uint32_t)count;
+}
+
 static void compare_vector(const char *label, const float *got,
                            const float *want, size_t n, double rel_limit,
                            double cosine_limit) {
@@ -158,6 +169,9 @@ static void make_fixture(float *q, float *k, float *v) {
 
 int main(void) {
     setenv("DS4_EXAONE_NO_PREFILL_HMMA", "1", 1);
+    const uint32_t prefill_repeats = prefill_repeat_count();
+    CHECK(prefill_repeats != 0u,
+          "DS4_SOLAR_KV_PREFILL_REPEATS must be in [1, 10000]");
     CHECK(ds4_gpu_init(), "CUDA init");
 
     const size_t q_count = (size_t)T_TOKENS * T_HEAD * T_DIM;
@@ -218,6 +232,9 @@ int main(void) {
           "read BF16 decode");
 
     puts("== Solar Open 2 compressed GQA KV ==");
+    if (prefill_repeats > 1u) {
+        printf("compressed prefill repeats=%u\n", prefill_repeats);
+    }
     const ds4_solar_kv_format formats[] = {
         DS4_SOLAR_KV_FP8,
         DS4_SOLAR_KV_FP4,
@@ -265,10 +282,12 @@ int main(void) {
                format_name(format), krel, vrel,
                (unsigned long long)row_bytes, cache_ok ? "ok" : "FAIL");
 
-        CHECK(ds4_gpu_solar_attention_prefill_tensor(
-                  out, dq, cache, T_TOKENS, 0u, T_HEAD, T_HEAD_KV, T_DIM,
-                  T_CAP, 0u, format),
-              "compressed prefill");
+        for (uint32_t repeat = 0; repeat < prefill_repeats; repeat++) {
+            CHECK(ds4_gpu_solar_attention_prefill_tensor(
+                      out, dq, cache, T_TOKENS, 0u, T_HEAD, T_HEAD_KV, T_DIM,
+                      T_CAP, 0u, format),
+                  "compressed prefill");
+        }
         CHECK(ds4_gpu_tensor_read(out, 0, got, q_count * sizeof(float)),
               "read compressed prefill");
         const double attn_limit = format == DS4_SOLAR_KV_FP8 ? 0.06 : 0.25;
