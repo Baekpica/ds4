@@ -1,9 +1,12 @@
 # Solar Open2 DGX Spark optimization handoff
 
 Status: **resumed and advanced on 2026-08-10 KST; no model process running at
-capture.** The chunked-KDA prefill landed as the default production path,
-removed KDA from the top of the kernel profile, and moved the first-order
-bottleneck to IQ2_XXS `mul_mat_q` as the previous capture predicted.
+capture.** Two optimization units landed the same day: the chunked-KDA
+prefill became the default production path, and Solar was routed through the
+aligned-artifact startup flow, putting its IQ2_XXS gate/up prefill on the
+d2r pair kernel. 2K FP8 prefill went 159 -> 270 -> 328 tok/s across the two
+changes, the three quantized KV formats now converge at ~6.24 s, and no
+kernel family holds more than 20.2% of GPU time.
 
 ## Goal
 
@@ -95,6 +98,7 @@ profiling gate:
 | `0b58219` | chunk KDA prefill through the delta-rule UT transform |
 | `def87d4` | cover chunked KDA prefill at production width |
 | `7eb5bec` | compare KV formats on the release KDA path |
+| `980bbe1` | route Solar through the aligned-artifact startup flow |
 
 ## Established correctness and capacity
 
@@ -314,30 +318,92 @@ FP8 nsys profile:
 SHA-256:
 `88828e7a1c729449655ef07614521d23b67e809bdac1f4b87be76fa1fdfdf37f`
 
+## Full-model run with chunked KDA + aligned artifacts (2026-08-10)
+
+| KV | Prefill | Prefill rate | Decode |
+|---|---:|---:|---:|
+| BF16 (first leg, carries warmup) | 15.638152 s | 130.962 tok/s | 138.362 ms |
+| FP8 | 6.244699 s | 327.958 tok/s | 96.950 ms |
+| hybrid | 6.242245 s | **328.087 tok/s** | 95.629 ms |
+| FP4 | 6.256438 s | 327.343 tok/s | 95.628 ms |
+
+Log:
+
+`/home/sunghoon/workspace/ds4-exaone/scratch/solar-open2-spark/solar-kv-full2k-iq2align.log`
+
+SHA-256:
+`f0e4dde4092df3d4a94115b7d163d8eeb700ac64642637b7544d4f356cc43c46`
+
+FP8 nsys profile:
+
+`/home/sunghoon/workspace/ds4-exaone/scratch/solar-open2-spark/nsys-solar-kv-full2k-fp8-hmma-iq2align-sm121.nsys-rep`
+
+SHA-256:
+`8c7a547eca6c29cdcf278a6a00e34e7e23a55250d4380b3405a3b13f7b24d8f1`
+
+## Aligned-artifact startup for Solar (landed 2026-08-10)
+
+The 42.4% IQ2_XXS `mul_mat_q` bottleneck was not a kernel problem but a
+dispatch gap. Solar's gate/up expert stacks (80 tensors, 32.23 GiB, 40
+mid layers x 2) ran the rectangular stream-K MoE fallback: 320 experts x
+10 row tiles x 128 gathered-column tiles = 409,600 blocks per launch, most
+of which exit empty, at 10.6 GB/s of weight throughput against the Q3_K
+worklist's 41.6 GB/s. The tuned path — aligned SoA artifacts consumed by
+`gateup_iq2_d2r_pair_kernel` — already existed from the K-EXAONE work but
+never activated: Solar's loader called the single-file artifact builder,
+which bails on an 11-shard GGUF ("model size changed"), and the family
+gates on the records builder and expert-remainder promotion said
+EXAONE-only. `980bbe1` extends both gates.
+
+Boot now runs: records-driven artifact build (381 artifacts, 39.60 GiB
+device, 98.2 s: 80 IQ2 gate/up replace + Q8 dense additive; q2k finds no
+candidates), whole-image copy skipped by the existing residency chooser,
+model map installed, then the 47.95 GiB Q3_K/Q4_K raw expert remainder
+promoted per range with "expert replaces complete". Peak weights resident:
+39.60 + 47.95 = 87.55 GiB plus KV/scratch.
+
+Effects on the 2K four-format comparison (all versus the chunked-KDA run):
+
+- IQ2_XXS gate/up family: 3.261 s rectangular to 1.278 s d2r (**2.55x**).
+- FP8 prefill 7.59 s -> 6.24 s (270 -> 328 tok/s); hybrid and FP4 converge
+  to the same ~6.24 s / ~328 tok/s.
+- MoE decode: 112 ms -> 96 ms (SoA vec paths).
+- All four formats still select prefill token 11047 and decode token 27294.
+- The BF16 leg reads slower (15.6 s) only because it runs first and now
+  absorbs the one-time lazy SoA/f16-cache warmup; its decode is unchanged.
+- Small regressions elsewhere (Q8 dense 1.08 -> 1.34 s across its two
+  paths, Q3_K worklist 0.69 -> 0.84 s, KDA family +0.2 s) are real but
+  unexplained: candidates are shared-power clock shifts, L2 pressure from
+  the artifact layouts, or per-range versus whole-image locality. Worth a
+  profile before chasing.
+
+At 1M-context capacity runs note: the Q8 additive artifacts cost ~7.4 GiB
+of the ~40 GiB build; `DS4_CUDA_Q8_NO_ALIGNED=1` drops them if admission
+needs the headroom, at the cost of the dense-GEMM d2r paths.
+
 ## Current bottleneck from the final nsys capture
 
-The chunked prefill removed KDA from the top of the profile. In the
-2026-08-10 FP8 full-model capture (7.697 s of GPU time, chunked KDA
-default), the KDA family costs 1.287 s (16.7%) against the generic path's
-7.245 s (55.8%) in the previous capture — a 5.63x full-model reduction:
+In the 2026-08-10 FP8 capture with both changes (6.330 s of GPU time):
 
 | Rank | Kernel family | GPU time | Share |
 |---:|---|---:|---:|
-| 1 | IQ2_XXS `mul_mat_q` | 3.261140 s | **42.4%** |
-| 2 | Q8_0 `mul_mat_q` | 1.078688 s | **14.0%** |
-| 3 | Q3_K routed worklist MMQ | 0.692650 s | 9.0% |
-| 4 | KDA chunk factor | 0.576321 s | 7.5% |
-| 5 | KDA chunk scan | 0.442324 s | 5.7% |
-| 6 | Q4_K routed worklist MMQ | 0.312230 s | 4.1% |
-| 7 | `quantize_mmq_q8_1` | 0.164003 s | 2.1% |
-| 8 | KDA chunk intra | 0.161572 s | 2.1% |
-| - | KDA chunk prep | 0.106621 s | 1.4% |
-| - | compressed GQA HMMA prefill | 0.090710 s | 1.2% |
+| 1 | IQ2 gate/up d2r pair | 1.278300 s | **20.2%** |
+| 2 | Q8 dense d2r | 0.873833 s | **13.8%** |
+| 3 | Q3_K routed worklist MMQ | 0.843690 s | 13.3% |
+| 4 | KDA chunk factor | 0.656101 s | 10.4% |
+| 5 | KDA chunk scan | 0.499530 s | 7.9% |
+| 6 | Q8_0 `mul_mat_q` | 0.469175 s | 7.4% |
+| 7 | Q4_K routed worklist MMQ | 0.369989 s | 5.8% |
+| 8 | KDA chunk intra | 0.176887 s | 2.8% |
+| - | `mm_ids_helper` | 0.156408 s | 2.5% |
+| - | compressed GQA HMMA prefill | 0.124041 s | 2.0% |
 
-The next optimization order is therefore IQ2_XXS `mul_mat_q` first (the
-routed-expert weight format, 42.4%), Q8_0 second, then either the Q3_K
-worklist or the documented KDA register-tiling rewrite. Do not retune
-compressed attention without a new profile showing it has regressed.
+No family dominates any more. The remaining prefill levers, in rough
+expected-value order: the KDA register-tiling rewrite documented above
+(factor+scan+intra = 21.1% together, ~3x headroom measured against
+cuBLAS), the unexplained Q8/Q3_K drift above, then d2r itself. Decode and
+lifecycle gates matter more than further prefill work from here. Do not
+retune compressed attention without a new profile showing it regressed.
 
 ## Experiments intentionally rejected
 
@@ -497,10 +563,11 @@ Do not describe this as a single-DGX-Spark 1M release yet. The defensible
 current statement is:
 
 > The fixed 88.97 GiB Solar Open2 mixed-quant GGUF loads as a native
-> `sm_121a` CUDA-KDA family with resident weights on one GB10. Short-context
+> `sm_121a` CUDA-KDA family on one GB10, with aligned IQ2/Q8 artifacts plus
+> promoted raw expert ranges replacing the whole-image copy. Short-context
 > CUDA correctness, 8K KDA lifecycle behavior, and a 2K four-format KV
-> comparison pass. The chunked-KDA prefill is the default production path,
-> validated against the official FLA fixture at the generic path's error and
-> raising 2K FP8 prefill from 159 to 270 tok/s. Exact-1M resident admission,
-> long-context semantics, the 32K/64K lifecycle gates on the chunked path,
-> and API serving remain unverified.
+> comparison pass. The chunked-KDA prefill and the d2r gate/up path are the
+> default production configuration, raising 2K quantized-KV prefill from
+> 159 to ~328 tok/s in one day's two changes. Exact-1M resident admission,
+> long-context semantics, the 32K/64K lifecycle gates on this
+> configuration, and API serving remain unverified.
