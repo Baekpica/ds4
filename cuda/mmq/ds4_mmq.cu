@@ -790,6 +790,12 @@ extern "C" int ds4_mmq_iq2_xxs_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_dense", W, X, out, M, N, K, stream);
 }
 
+extern "C" int ds4_mmq_q3_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q3_K>("ds4_mmq_q3_K_dense", W, X, out, M, N, K, stream);
+}
+
 extern "C" int ds4_mmq_q4_K_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
@@ -1749,6 +1755,14 @@ extern "C" int ds4_mmq_iq2_xxs_moe(
         cudaStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe", W, X, ids, out, M, K,
                                                n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q3_K_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q3_K>("ds4_mmq_q3_K_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
 }
 
 /* ds4 (P4 Inc3): mmq MoE over the aligned row-pair-SoA Q2_K artifact
@@ -3494,6 +3508,15 @@ extern "C" int ds4_mmq_iq2_xxs_moe_vec(
         n_tokens, n_experts, n_expert_used, stream);
 }
 
+extern "C" int ds4_mmq_q3_K_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q3_K>(
+        "ds4_mmq_q3_K_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
 extern "C" int ds4_mmq_q4_K_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
@@ -4374,6 +4397,8 @@ template void mul_mat_q_case<GGML_TYPE_Q8_0>(
 template void mul_mat_q_case<GGML_TYPE_Q2_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q3_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
