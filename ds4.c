@@ -37725,6 +37725,8 @@ struct ds4_vocab {
     int arg_key_end_id;
     int arg_value_start_id;
     int arg_value_end_id;
+    int tool_schema_start_id;
+    int tool_schema_end_id;
     int dsml_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
@@ -38939,6 +38941,8 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_start_id = -1;
     vocab->im_content_id = -1;
     vocab->im_end_id = -1;
+    vocab->tool_schema_start_id = -1;
+    vocab->tool_schema_end_id = -1;
 
     ds4_array_ref tokens;
     ds4_array_ref merges;
@@ -39076,13 +39080,19 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->arg_key_start_id = vocab_lookup_optional(vocab, "<|tool_arg:start|>");
         vocab->arg_key_end_id = vocab_lookup_optional(vocab, "<|tool_arg:end|>");
         vocab->arg_value_start_id = vocab_lookup_optional(vocab, "<|tool_arg:value|>");
-        vocab->arg_value_end_id = -1;
+        /* Solar uses one delimiter to close the whole key/value argument and
+         * one delimiter to transition from key to value. Canonical tagged-tool
+         * aliases below deliberately share those native ids. */
+        vocab->arg_value_end_id = vocab->arg_key_end_id;
+        vocab->tool_schema_start_id = vocab_lookup_optional(vocab, "<|tool:start|>");
+        vocab->tool_schema_end_id = vocab_lookup_optional(vocab, "<|tool:end|>");
         vocab->dsml_id = -1;
 
         if (vocab->bos_id < 0 || vocab->eos_id < 0 || vocab->eot_id < 0 ||
             vocab->im_start_id < 0 || vocab->im_content_id < 0 ||
             vocab->im_end_id < 0 || vocab->think_start_id < 0 ||
-            vocab->think_end_id < 0) {
+            vocab->think_end_id < 0 || vocab->tool_schema_start_id < 0 ||
+            vocab->tool_schema_end_id < 0) {
             ds4_die("Solar tokenizer is missing required chat control tokens");
         }
         return;
@@ -39321,6 +39331,8 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<|im:start|>",            vocab->im_start_id},
         {"<|im:content|>",          vocab->im_content_id},
         {"<|im:end|>",              vocab->im_end_id},
+        {"<|tool:start|>",          vocab->tool_schema_start_id},
+        {"<|tool:end|>",            vocab->tool_schema_end_id},
         {"[gMASK]",                vocab->bos_id},
         {"<sop>",                  vocab->sop_id},
         {"<|system|>",             vocab->system_id},
@@ -39335,12 +39347,24 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<|think:end|>",           vocab->think_end_id},
         {"<tool_call>",            vocab->tool_call_start_id},
         {"</tool_call>",           vocab->tool_call_end_id},
+        {"<|tool_call:start|>",     vocab->tool_call_start_id},
+        {"<|tool_call:end|>",       vocab->tool_call_end_id},
         {"<tool_response>",        vocab->tool_response_start_id},
         {"</tool_response>",       vocab->tool_response_end_id},
+        {"<|tool_response:start|>", vocab->tool_response_start_id},
+        {"<|tool_response:end|>",   vocab->tool_response_end_id},
+        /* Solar's native <|tool_arg:value|> is one token even though the
+         * canonical parser spelling models it as a key-close/value-open pair.
+         * Match the combined alias before either individual tag so replay is
+         * token-identical to the sampled native output. */
+        {"</arg_key><arg_value>",   vocab->arg_value_start_id},
         {"<arg_key>",              vocab->arg_key_start_id},
         {"</arg_key>",             vocab->arg_key_end_id},
         {"<arg_value>",            vocab->arg_value_start_id},
         {"</arg_value>",           vocab->arg_value_end_id},
+        {"<|tool_arg:start|>",      vocab->arg_key_start_id},
+        {"<|tool_arg:value|>",      vocab->arg_value_start_id},
+        {"<|tool_arg:end|>",        vocab->arg_value_end_id},
         {"｜DSML｜",                vocab->dsml_id},
     };
 

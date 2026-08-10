@@ -540,6 +540,7 @@ typedef enum {
 typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK,
     SERVER_MODEL_SYNTAX_GLM,
+    SERVER_MODEL_SYNTAX_SOLAR,
 } server_model_syntax;
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
@@ -594,6 +595,7 @@ typedef struct {
      * happens to be named "tool_search". */
     bool responses_tool_search;
     char **prop;
+    char **prop_type;
     int len;
     int cap;
 } tool_schema_order;
@@ -764,8 +766,12 @@ static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
     free(o->wire_name);
     free(o->namespace);
-    for (int i = 0; i < o->len; i++) free(o->prop[i]);
+    for (int i = 0; i < o->len; i++) {
+        free(o->prop[i]);
+        free(o->prop_type[i]);
+    }
     free(o->prop);
+    free(o->prop_type);
     memset(o, 0, sizeof(*o));
 }
 
@@ -775,12 +781,17 @@ static void tool_schema_orders_free(tool_schema_orders *orders) {
     memset(orders, 0, sizeof(*orders));
 }
 
-static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+static void tool_schema_order_prop_push(tool_schema_order *o, char *prop,
+                                        char *prop_type) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
         o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+        o->prop_type = xrealloc(o->prop_type,
+                               (size_t)o->cap * sizeof(o->prop_type[0]));
     }
-    o->prop[o->len++] = prop;
+    o->prop[o->len] = prop;
+    o->prop_type[o->len] = prop_type ? prop_type : xstrdup("string");
+    o->len++;
 }
 
 static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
@@ -808,6 +819,17 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
 static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
     int idx = tool_schema_orders_find_index(orders, name);
     return idx >= 0 ? &orders->v[idx] : NULL;
+}
+
+static const char *tool_schema_order_prop_type(const tool_schema_order *order,
+                                               const char *prop) {
+    if (!order || !prop) return "string";
+    for (int i = 0; i < order->len; i++) {
+        if (order->prop[i] && !strcmp(order->prop[i], prop)) {
+            return order->prop_type[i] ? order->prop_type[i] : "string";
+        }
+    }
+    return "string";
 }
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
@@ -970,8 +992,14 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
-    return ds4_engine_is_glm_dsa(engine) ?
-           SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    if (ds4_engine_is_solar_open2(engine)) return SERVER_MODEL_SYNTAX_SOLAR;
+    if (ds4_engine_is_glm_dsa(engine)) return SERVER_MODEL_SYNTAX_GLM;
+    return SERVER_MODEL_SYNTAX_DEEPSEEK;
+}
+
+static bool server_model_syntax_uses_tagged_tools(server_model_syntax syntax) {
+    return syntax == SERVER_MODEL_SYNTAX_GLM ||
+           syntax == SERVER_MODEL_SYNTAX_SOLAR;
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
@@ -1436,6 +1464,63 @@ done:
     return out;
 }
 
+static char *schema_property_type(const char *json) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return xstrdup("string");
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) break;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            break;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(key);
+            json_ws(&p);
+            if (*p == '"') {
+                char *type = NULL;
+                if (json_string(&p, &type)) return type;
+                break;
+            }
+            if (*p == '[') {
+                p++;
+                json_ws(&p);
+                char *selected = NULL;
+                while (*p && *p != ']') {
+                    if (*p == '"') {
+                        char *candidate = NULL;
+                        if (!json_string(&p, &candidate)) break;
+                        if (!selected && strcmp(candidate, "null")) {
+                            selected = candidate;
+                        } else {
+                            free(candidate);
+                        }
+                    } else if (!json_skip_value(&p)) {
+                        break;
+                    }
+                    json_ws(&p);
+                    if (*p == ',') p++;
+                    json_ws(&p);
+                }
+                if (selected) return selected;
+                break;
+            }
+            break;
+        }
+        free(key);
+        if (!json_skip_value(&p)) break;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return xstrdup("string");
+}
+
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1466,8 +1551,14 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
                     return false;
                 }
                 p++;
-                tool_schema_order_prop_push(order, prop);
-                if (!json_skip_value(&p)) return false;
+                char *spec = NULL;
+                if (!json_raw_value(&p, &spec)) {
+                    free(prop);
+                    return false;
+                }
+                char *prop_type = schema_property_type(spec);
+                free(spec);
+                tool_schema_order_prop_push(order, prop, prop_type);
                 json_ws(&p);
                 if (*p == ',') p++;
                 json_ws(&p);
@@ -2120,6 +2211,64 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
         "Emit one <tool_call> block per function call. Use the exact tool and argument names from the schemas.");
 }
 
+static void append_solar_json(buf *b, const char *json, size_t len) {
+    char *raw = xstrndup(json, len);
+    char *minified = json_minify_raw_value(raw);
+    free(raw);
+    bool in_string = false;
+    bool escaped = false;
+    for (const char *p = minified ? minified : ""; *p; p++) {
+        const char c = *p;
+        buf_putc(b, c);
+        if (in_string) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') in_string = false;
+        } else if (c == '"') {
+            in_string = true;
+        } else if (c == ',' || c == ':') {
+            buf_putc(b, ' ');
+        }
+    }
+    free(minified);
+}
+
+/* Solar Open2 was trained on control-token-delimited schemas and tool calls.
+ * Keep this byte layout aligned with the model's official chat_template.jinja;
+ * the rendered-chat tokenizer maps each sentinel to its single native token. */
+static void append_solar_tools_prompt_text(buf *b, const char *tool_schemas) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    buf_puts(b,
+        "## Tools\n"
+        "- You may invoke one or more tools to assist with the user's query.\n\n"
+        "### Available Tools\n");
+
+    const char *p = tool_schemas;
+    while (*p) {
+        const char *end = strchr(p, '\n');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (n) {
+            buf_puts(b, "<|tool:start|>");
+            append_solar_json(b, p, n);
+            buf_puts(b, "<|tool:end|>\n");
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+
+    buf_puts(b,
+        "\n### Tool Call Instruction\n"
+        "- If using a tool, any reasoning must strictly precede the call. "
+        "Do not append any text after the tool call.\n"
+        "- If no tool is required, answer directly from your knowledge without "
+        "ever mentioning the availability or absence of tools.\n"
+        "- Each tool call MUST use this following format: "
+        "<|tool_call:start|>{example-tool-name}\n"
+        "<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n"
+        "<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n"
+        "<|tool_call:end|>\n");
+}
+
 static void json_escape(buf *b, const char *s);
 
 typedef struct {
@@ -2203,6 +2352,124 @@ bad:
         return false;
     }
     return true;
+}
+
+static bool json_text_is_complete_value(const char *text, char required_first) {
+    const char *p = text ? text : "";
+    json_ws(&p);
+    if (required_first && *p != required_first) return false;
+    if (!json_skip_value(&p)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+static bool json_text_is_integer(const char *text) {
+    const char *p = text ? text : "";
+    json_ws(&p);
+    if (*p == '-') p++;
+    if (!isdigit((unsigned char)*p)) return false;
+    if (*p == '0' && isdigit((unsigned char)p[1])) return false;
+    while (isdigit((unsigned char)*p)) p++;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+static bool json_text_is_number(const char *text) {
+    const char *p = text ? text : "";
+    double value = 0.0;
+    json_ws(&p);
+    if (!json_number(&p, &value)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+static void append_solar_typed_value(buf *out, const char *value,
+                                     const char *type) {
+    value = value ? value : "";
+    type = type ? type : "string";
+
+    /* Match the vLLM Solar parser: a literal null is schema-independent. */
+    if (!strcasecmp(value, "null")) {
+        buf_puts(out, "null");
+        return;
+    }
+    if (!strcasecmp(type, "integer") || !strcasecmp(type, "int")) {
+        if (json_text_is_integer(value)) {
+            char *min = json_minify_raw_value(value);
+            buf_puts(out, min);
+            free(min);
+            return;
+        }
+    } else if (!strcasecmp(type, "number") || !strcasecmp(type, "float") ||
+               !strcasecmp(type, "double")) {
+        if (json_text_is_number(value)) {
+            char *min = json_minify_raw_value(value);
+            buf_puts(out, min);
+            free(min);
+            return;
+        }
+    } else if (!strcasecmp(type, "boolean") || !strcasecmp(type, "bool")) {
+        if (!strcasecmp(value, "true") || !strcmp(value, "1") ||
+            !strcasecmp(value, "yes")) {
+            buf_puts(out, "true");
+            return;
+        }
+        if (!strcasecmp(value, "false") || !strcmp(value, "0") ||
+            !strcasecmp(value, "no")) {
+            buf_puts(out, "false");
+            return;
+        }
+    } else if (!strcasecmp(type, "array") || !strcasecmp(type, "list")) {
+        if (json_text_is_complete_value(value, '[')) {
+            char *min = json_minify_raw_value(value);
+            buf_puts(out, min);
+            free(min);
+            return;
+        }
+    } else if (!strcasecmp(type, "object") || !strcasecmp(type, "dict")) {
+        if (json_text_is_complete_value(value, '{')) {
+            char *min = json_minify_raw_value(value);
+            buf_puts(out, min);
+            free(min);
+            return;
+        }
+    } else if (!strcasecmp(type, "null") || !strcasecmp(type, "none")) {
+        buf_puts(out, "null");
+        return;
+    }
+
+    /* Strings and failed coercions round-trip losslessly as strings. */
+    json_escape(out, value);
+}
+
+static void normalize_solar_tool_call_arguments(
+        tool_calls *calls, const tool_schema_orders *orders) {
+    if (!calls) return;
+    for (int ci = 0; ci < calls->len; ci++) {
+        tool_call *call = &calls->v[ci];
+        json_args args = {0};
+        if (!json_args_parse(call->arguments, &args)) continue;
+        const tool_schema_order *order =
+            tool_schema_orders_find(orders, call->name);
+        buf normalized = {0};
+        buf_putc(&normalized, '{');
+        for (int ai = 0; ai < args.len; ai++) {
+            if (ai) buf_putc(&normalized, ',');
+            json_escape(&normalized, args.v[ai].key ? args.v[ai].key : "");
+            buf_putc(&normalized, ':');
+            if (!args.v[ai].is_string) {
+                buf_puts(&normalized, args.v[ai].value ? args.v[ai].value : "null");
+            } else {
+                append_solar_typed_value(
+                    &normalized, args.v[ai].value,
+                    tool_schema_order_prop_type(order, args.v[ai].key));
+            }
+        }
+        buf_putc(&normalized, '}');
+        free(call->arguments);
+        call->arguments = buf_take(&normalized);
+        json_args_free(&args);
+    }
 }
 
 static void append_dsml_attr_escaped(buf *b, const char *s) {
@@ -2302,6 +2569,14 @@ static void append_glm_arg(buf *b, const json_arg *arg) {
     buf_puts(b, "</arg_value>");
 }
 
+static void append_solar_arg(buf *b, const json_arg *arg) {
+    buf_puts(b, "<|tool_arg:start|>");
+    buf_puts(b, arg->key ? arg->key : "");
+    buf_puts(b, "<|tool_arg:value|>");
+    buf_puts(b, arg->value ? arg->value : "");
+    buf_puts(b, "<|tool_arg:end|>\n");
+}
+
 static bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order) {
     json_args args = {0};
     if (!json_args_parse(json, &args)) return false;
@@ -2335,6 +2610,26 @@ static bool append_glm_arguments_from_json(buf *b, const char *json, const tool_
     for (int i = 0; i < args.len; i++) {
         if (args.v[i].used) continue;
         append_glm_arg(b, &args.v[i]);
+    }
+    json_args_free(&args);
+    return true;
+}
+
+static bool append_solar_arguments_from_json(buf *b, const char *json,
+                                             const tool_schema_order *order) {
+    json_args args = {0};
+    if (!json_args_parse(json, &args)) return false;
+    if (order) {
+        for (int i = 0; i < order->len; i++) {
+            int idx = json_args_find_unused(&args, order->prop[i]);
+            if (idx < 0) continue;
+            append_solar_arg(b, &args.v[idx]);
+            args.v[idx].used = true;
+        }
+    }
+    for (int i = 0; i < args.len; i++) {
+        if (args.v[i].used) continue;
+        append_solar_arg(b, &args.v[i]);
     }
     json_args_free(&args);
     return true;
@@ -2409,11 +2704,43 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
     }
 }
 
+static void append_solar_tool_calls_text(buf *b, const tool_calls *calls,
+                                         const tool_schema_orders *tool_orders) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        /* Decode canonicalizes Solar sentinels to the stable tagged-tool
+         * spelling. Rendered-chat tokenization maps those aliases back to the
+         * same native ids, preserving the sampled tool-call token sequence. */
+        buf_puts(b, calls->raw_tool_text);
+        size_t n = strlen(calls->raw_tool_text);
+        if (n && calls->raw_tool_text[n - 1] != '\n') buf_putc(b, '\n');
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        const tool_schema_order *order =
+            tool_schema_orders_find(tool_orders, tc->name);
+        if (i) buf_putc(b, '\n');
+        buf_puts(b, "<|tool_call:start|>");
+        buf_puts(b, tc->name ? tc->name : "");
+        buf_putc(b, '\n');
+        if (!append_solar_arguments_from_json(b, tc->arguments, order)) {
+            buf_puts(b, "<|tool_arg:start|>arguments<|tool_arg:value|>");
+            buf_puts(b, tc->arguments ? tc->arguments : "{}");
+            buf_puts(b, "<|tool_arg:end|>\n");
+        }
+        buf_puts(b, "<|tool_call:end|>");
+    }
+    buf_putc(b, '\n');
+}
+
 static void append_tool_calls_text_for_syntax(buf *b,
                                               server_model_syntax syntax,
                                               const tool_calls *calls,
                                               const tool_schema_orders *tool_orders) {
-    if (syntax == SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_SOLAR) {
+        append_solar_tool_calls_text(b, calls, tool_orders);
+    } else if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         append_glm_tool_calls_text(b, calls, tool_orders);
     } else {
         append_dsml_tool_calls_text(b, calls);
@@ -2609,11 +2936,157 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+static void append_solar_role_open(buf *out, const char *role) {
+    buf_puts(out, "<|im:start|>");
+    buf_puts(out, role ? role : "");
+    buf_puts(out, "<|im:content|>");
+}
+
+static void append_solar_role_close(buf *out) {
+    buf_puts(out, "<|im:end|>\n");
+}
+
+static bool solar_tool_msg_matches_call(const chat_msg *m,
+                                        const tool_call *call) {
+    if (!m || !call || !call->id || !call->id[0]) return false;
+    if (m->tool_call_id && !strcmp(m->tool_call_id, call->id)) return true;
+    for (int i = 0; i < m->tool_call_ids_len; i++) {
+        if (m->tool_call_ids[i] && !strcmp(m->tool_call_ids[i], call->id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void append_solar_tool_response(buf *out, const chat_msg *m,
+                                       bool *first) {
+    if (!*first) buf_putc(out, '\n');
+    *first = false;
+    buf_puts(out, "<|tool_response:start|>");
+    buf_puts(out, m && m->content ? m->content : "");
+    buf_puts(out, "<|tool_response:end|>");
+}
+
+/* Render a contiguous tool-result block in the preceding assistant call order,
+ * matching Solar's official template. Unknown/orphan ids remain visible in
+ * their client order after the matched responses. */
+static void append_solar_tool_result_block(buf *out, const chat_msgs *msgs,
+                                           int start, int end) {
+    append_solar_role_open(out, "tool");
+    bool first = true;
+    const int count = end - start;
+    bool *emitted = count > 0 ? xmalloc((size_t)count * sizeof(*emitted)) : NULL;
+    if (emitted) memset(emitted, 0, (size_t)count * sizeof(*emitted));
+    const chat_msg *previous = start > 0 ? &msgs->v[start - 1] : NULL;
+
+    if (previous && !strcmp(previous->role, "assistant") &&
+        previous->calls.len > 0) {
+        for (int ci = 0; ci < previous->calls.len; ci++) {
+            for (int mi = start; mi < end; mi++) {
+                if (emitted[mi - start]) continue;
+                if (!solar_tool_msg_matches_call(&msgs->v[mi],
+                                                 &previous->calls.v[ci])) {
+                    continue;
+                }
+                append_solar_tool_response(out, &msgs->v[mi], &first);
+                emitted[mi - start] = true;
+            }
+        }
+    }
+    for (int mi = start; mi < end; mi++) {
+        if (emitted && emitted[mi - start]) continue;
+        append_solar_tool_response(out, &msgs->v[mi], &first);
+    }
+    free(emitted);
+    buf_putc(out, '\n');
+    append_solar_role_close(out);
+}
+
+static char *render_solar_chat_prompt_text(const chat_msgs *msgs,
+                                           const char *tool_schemas,
+                                           const tool_schema_orders *tool_orders,
+                                           ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    int last_user_idx = -1;
+    bool has_system = false;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (!strcmp(msgs->v[i].role, "user")) last_user_idx = i;
+        if (role_is_system(msgs->v[i].role)) has_system = true;
+    }
+
+    buf out = {0};
+    if (has_system || (tool_schemas && tool_schemas[0])) {
+        append_solar_role_open(&out, "system");
+        bool wrote_system_block = false;
+        if (has_system) {
+            buf_puts(&out, "## System Prompt");
+            for (int i = 0; msgs && i < msgs->len; i++) {
+                const chat_msg *m = &msgs->v[i];
+                if (!role_is_system(m->role)) continue;
+                buf_puts(&out, "\n\n");
+                buf_puts(&out, m->content ? m->content : "");
+            }
+            wrote_system_block = true;
+        }
+        if (tool_schemas && tool_schemas[0]) {
+            if (wrote_system_block) buf_puts(&out, "\n\n");
+            append_solar_tools_prompt_text(&out, tool_schemas);
+        }
+        append_solar_role_close(&out);
+    }
+
+    bool pending_assistant = false;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            continue;
+        } else if (!strcmp(m->role, "user")) {
+            append_solar_role_open(&out, "user");
+            buf_puts(&out, m->content ? m->content : "");
+            append_solar_role_close(&out);
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            int end = i + 1;
+            while (end < msgs->len &&
+                   (!strcmp(msgs->v[end].role, "tool") ||
+                    !strcmp(msgs->v[end].role, "function"))) {
+                end++;
+            }
+            append_solar_tool_result_block(&out, msgs, i, end);
+            i = end - 1;
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            append_solar_role_open(&out, "assistant");
+            buf_puts(&out, "<|think:start|>");
+            if (think && m->reasoning && i > last_user_idx) {
+                buf_puts(&out, m->reasoning);
+            }
+            buf_puts(&out, "<|think:end|>");
+            buf_puts(&out, m->content ? m->content : "");
+            append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_SOLAR,
+                                              &m->calls, tool_orders);
+            append_solar_role_close(&out);
+            pending_assistant = false;
+        }
+    }
+
+    if (pending_assistant) {
+        append_solar_role_open(&out, "assistant");
+        buf_puts(&out, "<|think:start|>");
+        if (!think) buf_puts(&out, "<|think:end|>");
+    }
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
                                                 const tool_schema_orders *tool_orders,
                                                 ds4_think_mode think_mode) {
+    if (syntax == SERVER_MODEL_SYNTAX_SOLAR) {
+        return render_solar_chat_prompt_text(msgs, tool_schemas,
+                                             tool_orders, think_mode);
+    }
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);
@@ -2734,10 +3207,65 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
+static char *render_solar_live_tool_tail(const chat_msgs *msgs, int start,
+                                         const tool_schema_orders *tool_orders,
+                                         ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    /* Tool generation stops as soon as the sampled tool-call end token is
+     * evaluated. Restore the official template's trailing newline and the
+     * unevaluated assistant-role terminator before appending tool results. */
+    buf_putc(&out, '\n');
+    append_solar_role_close(&out);
+
+    bool pending_assistant = false;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            continue;
+        } else if (!strcmp(m->role, "user")) {
+            append_solar_role_open(&out, "user");
+            buf_puts(&out, m->content ? m->content : "");
+            append_solar_role_close(&out);
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            int end = i + 1;
+            while (end < msgs->len &&
+                   (!strcmp(msgs->v[end].role, "tool") ||
+                    !strcmp(msgs->v[end].role, "function"))) {
+                end++;
+            }
+            append_solar_tool_result_block(&out, msgs, i, end);
+            i = end - 1;
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            append_solar_role_open(&out, "assistant");
+            buf_puts(&out, "<|think:start|>");
+            if (think && m->reasoning) buf_puts(&out, m->reasoning);
+            buf_puts(&out, "<|think:end|>");
+            buf_puts(&out, m->content ? m->content : "");
+            append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_SOLAR,
+                                              &m->calls, tool_orders);
+            append_solar_role_close(&out);
+            pending_assistant = false;
+        }
+    }
+
+    if (pending_assistant) {
+        append_solar_role_open(&out, "assistant");
+        buf_puts(&out, "<|think:start|>");
+        if (!think) buf_puts(&out, "<|think:end|>");
+    }
+    return buf_take(&out);
+}
+
 static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
                                               const chat_msgs *msgs, int start,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
+    if (syntax == SERVER_MODEL_SYNTAX_SOLAR) {
+        return render_solar_live_tool_tail(msgs, start, tool_orders, think_mode);
+    }
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
@@ -4790,16 +5318,104 @@ static bool dsml_parse_nested_params_object(const char **p_in,
     return true;
 }
 
+static const char solar_think_start[] = "<|think:start|>";
+static const char solar_think_end[] = "<|think:end|>";
+static const char solar_tool_call_start[] = "<|tool_call:start|>";
+static const char solar_tool_call_end[] = "<|tool_call:end|>";
+static const char solar_tool_arg_start[] = "<|tool_arg:start|>";
+static const char solar_tool_arg_value[] = "<|tool_arg:value|>";
+static const char solar_tool_arg_end[] = "<|tool_arg:end|>";
+static const char solar_tool_response_start[] = "<|tool_response:start|>";
+static const char solar_tool_response_end[] = "<|tool_response:end|>";
+
+static size_t thinking_open_prefix_len(const char *text) {
+    if (!text) return 0;
+    if (!strncmp(text, "<think>", 7)) return 7;
+    if (!strncmp(text, solar_think_start, sizeof(solar_think_start) - 1)) {
+        return sizeof(solar_think_start) - 1;
+    }
+    return 0;
+}
+
+static const char *find_first_thinking_close(const char *text,
+                                             size_t *marker_len) {
+    const char *canonical = text ? strstr(text, "</think>") : NULL;
+    const char *solar = text ? strstr(text, solar_think_end) : NULL;
+    const char *match = !canonical ? solar :
+                        !solar ? canonical :
+                        canonical < solar ? canonical : solar;
+    if (marker_len) {
+        *marker_len = !match ? 0 :
+                      match == solar ? sizeof(solar_think_end) - 1 : 8;
+    }
+    return match;
+}
+
+static const char *find_last_thinking_close(const char *text,
+                                            size_t *marker_len) {
+    const char *canonical = text ? find_last_substr(text, "</think>") : NULL;
+    const char *solar = text ? find_last_substr(text, solar_think_end) : NULL;
+    const char *match = !canonical ? solar :
+                        !solar ? canonical :
+                        canonical > solar ? canonical : solar;
+    if (marker_len) {
+        *marker_len = !match ? 0 :
+                      match == solar ? sizeof(solar_think_end) - 1 : 8;
+    }
+    return match;
+}
+
+/* All protocol adapters below use stable canonical spellings. Solar emits
+ * equivalent single-token sentinels with native spellings. Convert them once
+ * at the token-to-text boundary so streaming, tool gating, tracing, final
+ * parsing, and cache canonicalization observe one state machine. */
+static void canonicalize_solar_generated_piece(char **piece_io,
+                                                size_t *piece_len_io) {
+    if (!piece_io || !*piece_io || !piece_len_io) return;
+    const char *canonical = NULL;
+    if (!strcmp(*piece_io, solar_think_start)) canonical = "<think>";
+    if (!strcmp(*piece_io, solar_think_end)) canonical = "</think>";
+    if (!strcmp(*piece_io, solar_tool_call_start)) canonical = "<tool_call>";
+    if (!strcmp(*piece_io, solar_tool_call_end)) canonical = "</tool_call>";
+    if (!strcmp(*piece_io, solar_tool_arg_start)) canonical = "<arg_key>";
+    if (!strcmp(*piece_io, solar_tool_arg_value)) {
+        canonical = "</arg_key><arg_value>";
+    }
+    if (!strcmp(*piece_io, solar_tool_arg_end)) canonical = "</arg_value>";
+    if (!strcmp(*piece_io, solar_tool_response_start)) {
+        canonical = "<tool_response>";
+    }
+    if (!strcmp(*piece_io, solar_tool_response_end)) {
+        canonical = "</tool_response>";
+    }
+    if (!canonical) return;
+
+    free(*piece_io);
+    *piece_io = xstrdup(canonical);
+    *piece_len_io = strlen(canonical);
+}
+
+static bool unclosed_thinking_requires_warning(bool thinking_expected,
+                                               bool thinking_inside,
+                                               const char *finish) {
+    /* Hitting the caller's token budget while still reasoning is an expected,
+     * explicitly represented `length` result. Warn only when the model itself
+     * stops the turn without emitting its reasoning close sentinel. */
+    return thinking_expected && thinking_inside && finish &&
+           !strcmp(finish, "stop");
+}
+
 static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
     char *s = xstrndup(text ? text : "", n);
     char *body = s;
-    if (!strncmp(body, "<think>", 7)) body += 7;
+    body += thinking_open_prefix_len(body);
 
-    char *think_end = strstr(body, "</think>");
+    size_t think_end_len = 0;
+    char *think_end = (char *)find_first_thinking_close(body, &think_end_len);
     if (think_end) {
         *think_end = '\0';
         *reasoning_out = xstrdup(body);
-        *content_out = xstrdup(think_end + 8);
+        *content_out = xstrdup(think_end + think_end_len);
     } else {
         *reasoning_out = NULL;
         *content_out = xstrdup(s);
@@ -4826,7 +5442,7 @@ static void ds4_local_unterminated_reasoning(const char *text,
                                              char **content_out,
                                              char **reasoning_out) {
     const char *body = text ? text : "";
-    if (!strncmp(body, "<think>", 7)) body += 7;
+    body += thinking_open_prefix_len(body);
     *reasoning_out = xstrdup(body);
     *content_out = xstrdup("");
 }
@@ -4837,9 +5453,10 @@ static void ds4_unterminated_reasoning_before_tool(const char *text,
                                                    char **reasoning_out) {
     const char *body = text ? text : "";
     if (prefix_len > strlen(body)) prefix_len = strlen(body);
-    if (prefix_len >= 7 && !strncmp(body, "<think>", 7)) {
-        body += 7;
-        prefix_len -= 7;
+    const size_t think_open_len = thinking_open_prefix_len(body);
+    if (prefix_len >= think_open_len) {
+        body += think_open_len;
+        prefix_len -= think_open_len;
     }
     *reasoning_out = xstrndup(body, prefix_len);
     *content_out = xstrdup("");
@@ -4862,18 +5479,18 @@ static bool parse_deepseek_generated_message_ex(const char *text,
      * clients execute something the assistant had not actually emitted as its
      * post-thinking action. */
     if (require_thinking_closed) {
-        const char *think_end = find_last_substr(text, "</think>");
+        size_t think_end_len = 0;
+        const char *think_end = find_last_thinking_close(text, &think_end_len);
         if (!think_end) {
             const char *candidate = find_any_tool_start(text);
             if (!candidate || !find_any_tool_end(candidate)) {
-                fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete DSML in reasoning\n");
                 ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
                 return true;
             }
             tool_search = candidate;
             recovered_unclosed_tool = true;
         } else {
-            tool_search = think_end + 8;
+            tool_search = think_end + think_end_len;
         }
     }
 
@@ -5063,7 +5680,6 @@ static bool parse_glm_generated_message_ex(const char *text,
         if (!think_end) {
             const char *candidate = strstr(text, tool_start);
             if (!candidate || !strstr(candidate, tool_end)) {
-                fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete GLM tool calls in reasoning\n");
                 ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
                 return true;
             }
@@ -5191,7 +5807,7 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   char **content_out,
                                                   char **reasoning_out,
                                                   tool_calls *calls) {
-    if (syntax == SERVER_MODEL_SYNTAX_GLM) {
+    if (server_model_syntax_uses_tagged_tools(syntax)) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
                                               calls);
@@ -9705,6 +10321,40 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 }
 #endif
 
+static bool live_tokens_end_with_solar_tool_call(ds4_engine *engine,
+                                                  const ds4_tokens *tokens) {
+    if (!engine || !ds4_engine_is_solar_open2(engine) ||
+        !tokens || tokens->len <= 0) {
+        return false;
+    }
+    char *piece = ds4_token_text(engine, tokens->v[tokens->len - 1], NULL);
+    const bool result = piece &&
+        ((!strcmp(piece, solar_tool_call_end)) ||
+         (!strcmp(piece, "</tool_call>")));
+    free(piece);
+    return result;
+}
+
+/* Generation recognizes role-end/stop tokens before evaluating them, while
+ * the remembered visible transcript includes the same terminator because that
+ * is how the next client request is rendered.  A visible-prefix continuation
+ * therefore has to restore that unevaluated boundary before appending bytes
+ * after the visible transcript.  Solar tool calls stop one token earlier still:
+ * at <|tool_call:end|>, before the template's separating newline. */
+static char *build_visible_live_suffix_text(server_model_syntax syntax,
+                                            bool ended_with_tool_calls,
+                                            const char *tail) {
+    buf suffix = {0};
+    if (syntax == SERVER_MODEL_SYNTAX_SOLAR) {
+        if (ended_with_tool_calls) buf_putc(&suffix, '\n');
+        append_solar_role_close(&suffix);
+    } else if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK) {
+        buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    }
+    buf_puts(&suffix, tail ? tail : "");
+    return buf_take(&suffix);
+}
+
 static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   const char *prompt_text,
                                   ds4_tokens *effective_prompt,
@@ -9724,6 +10374,26 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
+        if (effective_prompt && prompt_text &&
+            (lr.ext_flags & (KV_EXT_RESPONSES_VISIBLE |
+                             KV_EXT_THINKING_VISIBLE))) {
+            const ds4_tokens *live_tokens =
+                ds4_session_tokens(slot->session);
+            const size_t prompt_len = strlen(prompt_text);
+            if (live_tokens && lr.text_bytes <= prompt_len) {
+                const bool ended_with_tool_calls =
+                    live_tokens_end_with_solar_tool_call(s->engine,
+                                                         live_tokens);
+                char *suffix = build_visible_live_suffix_text(
+                    server_model_syntax_for_engine(s->engine),
+                    ended_with_tool_calls,
+                    prompt_text + lr.text_bytes);
+                ds4_tokens_free(effective_prompt);
+                build_prompt_from_exact_prefix_and_text_suffix(
+                    s->engine, live_tokens, suffix, effective_prompt);
+                free(suffix);
+            }
+        }
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
@@ -9848,6 +10518,7 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
 
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
+    bool ended_with_tool_calls = false;
     pthread_mutex_lock(&s->tool_mu);
     bool ok = slot->responses_live.valid &&
               slot->responses_live.live_tokens == live_pos &&
@@ -9856,25 +10527,32 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
               byte_prefix_match(req->prompt_text, prompt_len,
                                 slot->responses_live.visible_text,
                                 slot->responses_live.visible_len);
-    if (ok) visible_len = slot->responses_live.visible_len;
+    if (ok) {
+        visible_len = slot->responses_live.visible_len;
+        ended_with_tool_calls = slot->responses_live.call_ids.len > 0;
+    }
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+    char *suffix = build_visible_live_suffix_text(
+        req->model_syntax, ended_with_tool_calls,
+        req->prompt_text + visible_len);
+    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live_tokens,
+                                                   suffix, effective_prompt);
+    free(suffix);
     return live_tokens->len;
 }
 
-/* Tool-less thinking continuation.
+/* Visible final-answer thinking continuation.
  *
  * Chat/completions and Anthropic do not have a previous_response_id object that
  * binds a later request to the last sampled turn.  Still, after a normal
- * tool-less thinking answer, the next prompt renderer intentionally omits that
- * hidden reasoning.  The live KV state is richer than the visible transcript.
+ * thinking answer (including a no-call turn with tools available), the next
+ * prompt renderer intentionally omits that hidden reasoning.  The live KV
+ * state is richer than the visible transcript.
  *
  * Remembering the visible transcript as a key lets us keep the sampled hidden
  * KV when the next request clearly extends that same visible history.  This is
@@ -9906,9 +10584,14 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+    const bool ended_with_tool_calls =
+        live_tokens_end_with_solar_tool_call(s->engine, live_tokens);
+    char *suffix = build_visible_live_suffix_text(
+        req->model_syntax, ended_with_tool_calls,
+        req->prompt_text + visible_len);
+    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live_tokens,
+                                                   suffix, effective_prompt);
+    free(suffix);
     return live_tokens->len;
 }
 
@@ -10318,7 +11001,8 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
 
 typedef struct {
     bool inside;
-    char tail[8]; /* Long enough for "</think>". */
+    /* Long enough for Solar's native <|think:start|> sentinel. */
+    char tail[sizeof(solar_think_start) - 1];
     int tail_len;
 } thinking_state;
 
@@ -10335,8 +11019,13 @@ static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
             st->tail_len--;
         }
         st->tail[st->tail_len++] = p[i];
-        if (thinking_tail_ends_with(st, "<think>")) st->inside = true;
-        else if (thinking_tail_ends_with(st, "</think>")) st->inside = false;
+        if (thinking_tail_ends_with(st, "<think>") ||
+            thinking_tail_ends_with(st, solar_think_start)) {
+            st->inside = true;
+        } else if (thinking_tail_ends_with(st, "</think>") ||
+                   thinking_tail_ends_with(st, solar_think_end)) {
+            st->inside = false;
+        }
     }
 }
 
@@ -10454,9 +11143,46 @@ static char *build_invalid_glm_tool_error_suffix(const request *r,
     return buf_take(&suffix);
 }
 
+static char *build_invalid_solar_tool_error_suffix(const request *r,
+                                                   const thinking_state *thinking,
+                                                   const char *detail) {
+    buf tool_error = {0};
+    buf_puts(&tool_error, "Tool error: invalid Solar tool call");
+    if (detail && detail[0]) {
+        buf_puts(&tool_error, ": ");
+        buf_puts(&tool_error, detail);
+    }
+    buf_puts(&tool_error,
+             "\nThe previous assistant output was not executed because the "
+             "Solar tool-call syntax was malformed. Emit a new valid native "
+             "tool call, or answer normally if no tool is needed.");
+
+    buf suffix = {0};
+    if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
+        buf_puts(&suffix, "<|think:end|>");
+    }
+    append_solar_role_close(&suffix);
+    append_solar_role_open(&suffix, "tool");
+    buf_puts(&suffix, "<|tool_response:start|>");
+    buf_puts(&suffix, tool_error.ptr ? tool_error.ptr : "");
+    buf_puts(&suffix, "<|tool_response:end|>\n");
+    append_solar_role_close(&suffix);
+    append_solar_role_open(&suffix, "assistant");
+    buf_puts(&suffix, "<|think:start|>");
+    if (!(r && ds4_think_mode_enabled(r->think_mode))) {
+        buf_puts(&suffix, "<|think:end|>");
+    }
+
+    buf_free(&tool_error);
+    return buf_take(&suffix);
+}
+
 static char *build_invalid_tool_call_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_SOLAR) {
+        return build_invalid_solar_tool_error_suffix(r, thinking, detail);
+    }
     if (r && r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
         return build_invalid_glm_tool_error_suffix(r, thinking, detail);
     }
@@ -10814,8 +11540,14 @@ static bool continue_after_invalid_dsml(server *s, server_slot *slot,
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
-    if (r->prompt_preserves_reasoning) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
+    /* OpenAI-compatible Agent clients advertise tools on every request but
+     * commonly omit the non-standard reasoning_content field on replay.  The
+     * visible-prefix key is still safe for clients that do replay it: their
+     * richer prompt simply will not match this shortcut and exact live-token
+     * matching remains available. */
+    const bool openai_agent_replay = r->api == API_OPENAI && r->has_tools;
+    if (r->prompt_preserves_reasoning && !openai_agent_replay) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
@@ -10959,21 +11691,24 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     buf suffix = {0};
     if (r && ds4_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
-        buf_puts(&suffix, "</think>");
+        buf_puts(&suffix, syntax == SERVER_MODEL_SYNTAX_SOLAR ?
+                          "<|think:end|>" : "</think>");
     }
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_SOLAR) {
+        append_solar_role_close(&suffix);
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
 }
 
-static char *build_responses_visible_assistant_suffix(const request *r,
-                                                      const char *content,
-                                                      const char *reasoning,
-                                                      const tool_calls *calls) {
+static char *build_visible_assistant_suffix(const request *r,
+                                            const char *content,
+                                            const char *reasoning,
+                                            const tool_calls *calls) {
     const server_model_syntax syntax =
         r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
     buf suffix = {0};
@@ -10989,21 +11724,26 @@ static char *build_responses_visible_assistant_suffix(const request *r,
         if (r->reasoning_summary_emit && calls && calls->len > 0) {
             buf_puts(&suffix, reasoning ? reasoning : "");
         }
-        buf_puts(&suffix, "</think>");
+        buf_puts(&suffix, syntax == SERVER_MODEL_SYNTAX_SOLAR ?
+                          "<|think:end|>" : "</think>");
     }
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_SOLAR) {
+        append_solar_role_close(&suffix);
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
 }
 
-/* In thinking mode without tools, old assistant reasoning is intentionally not
- * rendered back into later prompts.  The sampled live graph still contains the
- * reasoning bytes, so the next request would miss the session cache even though
- * the visible conversation prefix is logically the same.
+/* After a normal answer in thinking mode, old assistant reasoning is
+ * intentionally not rendered back into later prompts.  This also applies when
+ * an Agent keeps advertising tools but the model emits no tool call.  The
+ * sampled live graph still contains the reasoning bytes, so the next request
+ * would miss the session cache even though the visible conversation prefix is
+ * logically the same.
  *
  *   prompt-without-final-<think> + </think> + visible-content + eos
  *
@@ -11019,6 +11759,21 @@ static char *build_toolless_thinking_visible_text(const request *r,
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_SOLAR) {
+        const char *think_tag = "<|think:start|>";
+        size_t tag_len = strlen(think_tag);
+        if (pt_len < tag_len ||
+            memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
+            return NULL;
+        }
+        buf visible = {0};
+        buf_puts(&visible, r->prompt_text);
+        buf_puts(&visible, "<|think:end|>");
+        buf_puts(&visible, content ? content : "");
+        append_solar_role_close(&visible);
+        return buf_take(&visible);
+    }
+
     const char *think_tag = "<think>";
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
@@ -11048,6 +11803,36 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(slot->session), strlen(visible));
     free(visible);
+}
+
+/* OpenAI Chat clients commonly replay assistant tool calls but omit the
+ * non-standard reasoning_content field. Keep the richer sampled KV frontier,
+ * keyed by the standard-visible assistant turn, so the following tool-result
+ * request can continue without a token-mismatch rewind. */
+static void remember_chat_tool_checkpoint(server *s, server_slot *slot,
+                                          const job *j, const char *ctx,
+                                          uint64_t trace_id,
+                                          const char *content,
+                                          const char *reasoning,
+                                          const tool_calls *calls) {
+    if (!s || !slot || !j || j->req.api != API_OPENAI ||
+        !j->req.prompt_text || !calls || calls->len == 0) {
+        return;
+    }
+    char *visible_suffix = build_visible_assistant_suffix(
+        &j->req, content ? content : "", reasoning, calls);
+    buf visible = {0};
+    buf_puts(&visible, j->req.prompt_text);
+    buf_puts(&visible, visible_suffix ? visible_suffix : "");
+    thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "");
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: chat tool live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session), visible.len);
+    trace_event(s, trace_id,
+                "chat tool live checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(slot->session), visible.len);
+    buf_free(&visible);
+    free(visible_suffix);
 }
 
 /* After a successful tool-call finish, make the live checkpoint match what the
@@ -11938,6 +12723,9 @@ decode_again:
 
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
+            if (ds4_engine_is_solar_open2(s->engine)) {
+                canonicalize_solar_generated_piece(&piece, &piece_len);
+            }
             completion++;
 
             trace_piece(s, trace_id, piece, piece_len);
@@ -12112,6 +12900,22 @@ decode_again:
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
+    }
+
+    if (j->req.kind == REQ_CHAT &&
+        unclosed_thinking_requires_warning(
+            ds4_think_mode_enabled(j->req.think_mode),
+            thinking.inside,
+            finish))
+    {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: chat ctx=%s%s%s model stopped before closing thinking",
+                   ctx_span,
+                   req_flags[0] ? " " : "",
+                   req_flags);
+        trace_event(s, trace_id,
+                    "model stopped before closing thinking after %d generated tokens",
+                    completion);
     }
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
@@ -12314,6 +13118,11 @@ decode_again:
                             final_finish);
             }
         }
+        if (parsed_ok && j->req.model_syntax == SERVER_MODEL_SYNTAX_SOLAR &&
+            parsed_calls.len > 0) {
+            normalize_solar_tool_call_arguments(&parsed_calls,
+                                                &j->req.tool_orders);
+        }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
             if (j->req.api == API_ANTHROPIC && j->req.stream)
@@ -12340,7 +13149,7 @@ decode_again:
              * visible surface, while the real session also contains hidden
              * reasoning and exact sampled tool-call bytes. */
             char *visible_suffix =
-                build_responses_visible_assistant_suffix(&j->req,
+                build_visible_assistant_suffix(&j->req,
                     parsed_content ? parsed_content : "",
                     parsed_reasoning,
                     &parsed_calls);
@@ -12365,6 +13174,7 @@ decode_again:
         }
     }
 
+    bool canonicalized_tool_checkpoint = false;
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
@@ -12378,9 +13188,18 @@ decode_again:
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
-    } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
+        canonicalized_tool_checkpoint = true;
+    }
+    if (parsed_calls.len) {
+        if (!canonicalized_tool_checkpoint && j->req.api == API_OPENAI &&
+            strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+            remember_chat_tool_checkpoint(
+                s, slot, j, ctx_span, trace_id,
+                parsed_content ? parsed_content : "",
+                parsed_reasoning, &parsed_calls);
+        } else {
+            thinking_live_clear(s, slot);
+        }
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
@@ -15336,6 +16155,129 @@ static void test_render_glm_chat_prompt_text(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_render_solar_chat_prompt_text_uses_native_agent_format(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("What time is it?");
+    chat_msgs_push(&msgs, user);
+
+    const char *tool_schemas =
+        "{\"name\":\"get_time\",\"description\":\"Get time\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"zone\":{\"type\":\"string\"}}}}";
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, &msgs, tool_schemas, NULL, DS4_THINK_HIGH);
+
+    TEST_ASSERT(prompt != NULL);
+    const char *expected =
+        "<|im:start|>system<|im:content|>## System Prompt\n\n"
+        "You are terse.\n\n"
+        "## Tools\n"
+        "- You may invoke one or more tools to assist with the user's query.\n\n"
+        "### Available Tools\n"
+        "<|tool:start|>{\"name\": \"get_time\", \"description\": \"Get time\", "
+        "\"parameters\": {\"type\": \"object\", \"properties\": {"
+        "\"zone\": {\"type\": \"string\"}}}}<|tool:end|>\n\n"
+        "### Tool Call Instruction\n"
+        "- If using a tool, any reasoning must strictly precede the call. "
+        "Do not append any text after the tool call.\n"
+        "- If no tool is required, answer directly from your knowledge without "
+        "ever mentioning the availability or absence of tools.\n"
+        "- Each tool call MUST use this following format: "
+        "<|tool_call:start|>{example-tool-name}\n"
+        "<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n"
+        "<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n"
+        "<|tool_call:end|>\n"
+        "<|im:end|>\n"
+        "<|im:start|>user<|im:content|>What time is it?<|im:end|>\n"
+        "<|im:start|>assistant<|im:content|><|think:start|>";
+    TEST_ASSERT(!strcmp(prompt, expected));
+    TEST_ASSERT(strstr(prompt, "## Tools\n- You may invoke one or more tools") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|tool:start|>{\"name\": \"get_time\", \"description\": \"Get time\", "
+        "\"parameters\": {\"type\": \"object\", \"properties\": {"
+        "\"zone\": {\"type\": \"string\"}}}}<|tool:end|>\n") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im:end|>\n<|im:start|>user<|im:content|>What time is it?"
+        "<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|tool_call:start|>{example-tool-name}\n") != NULL);
+    TEST_ASSERT(strstr(prompt, "DSML") == NULL);
+    TEST_ASSERT(strstr(prompt, "<|user|>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_solar_no_think_closes_native_thinking(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im:start|>user<|im:content|>Hello<|im:end|>\n"
+        "<|im:start|>assistant<|im:content|><|think:start|><|think:end|>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜begin▁of▁sentence｜>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_solar_live_tail_uses_native_tool_result_roles(void) {
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call first = {0};
+    first.id = xstrdup("call_first");
+    first.name = xstrdup("first");
+    first.arguments = xstrdup("{}");
+    tool_calls_push(&assistant.calls, first);
+    tool_call second = {0};
+    second.id = xstrdup("call_second");
+    second.name = xstrdup("second");
+    second.arguments = xstrdup("{}");
+    tool_calls_push(&assistant.calls, second);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg result_second = {0};
+    result_second.role = xstrdup("tool");
+    result_second.content = xstrdup("SECOND_RESULT");
+    chat_msg_add_tool_call_id(&result_second, "call_second");
+    chat_msgs_push(&msgs, result_second);
+    chat_msg result_first = {0};
+    result_first.role = xstrdup("tool");
+    result_first.content = xstrdup("FIRST_RESULT");
+    chat_msg_add_tool_call_id(&result_first, "call_first");
+    chat_msgs_push(&msgs, result_first);
+
+    char *tail = render_live_tool_tail_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, &msgs, 1, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(tail != NULL);
+    TEST_ASSERT(!strncmp(tail,
+        "\n<|im:end|>\n<|im:start|>tool<|im:content|>",
+        strlen("\n<|im:end|>\n<|im:start|>tool<|im:content|>")));
+    const char *first_result = strstr(tail, "FIRST_RESULT");
+    const char *second_result = strstr(tail, "SECOND_RESULT");
+    TEST_ASSERT(first_result && second_result && first_result < second_result);
+    TEST_ASSERT(strstr(tail,
+        "<|tool_response:end|>\n<|im:end|>\n"
+        "<|im:start|>assistant<|im:content|><|think:start|>") != NULL);
+    TEST_ASSERT(strstr(tail, "call_first") == NULL);
+    TEST_ASSERT(strstr(tail, "<｜Assistant｜>") == NULL);
+
+    free(tail);
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_glm_drops_old_reasoning_without_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
@@ -15839,6 +16781,31 @@ static void test_invalid_glm_tool_error_suffix(void) {
     request_free(&r);
 }
 
+static void test_invalid_solar_tool_error_suffix_uses_native_roles(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_SOLAR;
+    r.think_mode = DS4_THINK_HIGH;
+    thinking_state st = {.inside = true};
+
+    char *suffix = build_invalid_tool_call_error_suffix(&r, &st,
+                                                        "missing tool_arg:end");
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(strstr(suffix,
+        "<|think:end|><|im:end|>\n<|im:start|>tool<|im:content|>"
+        "<|tool_response:start|>") == suffix);
+    TEST_ASSERT(strstr(suffix,
+        "Tool error: invalid Solar tool call: missing tool_arg:end") != NULL);
+    TEST_ASSERT(strstr(suffix,
+        "<|tool_response:end|>\n<|im:end|>\n"
+        "<|im:start|>assistant<|im:content|><|think:start|>") != NULL);
+    TEST_ASSERT(strstr(suffix, "DSML") == NULL);
+    TEST_ASSERT(strstr(suffix, "<|observation|>") == NULL);
+
+    free(suffix);
+    request_free(&r);
+}
+
 static void test_thinking_dsml_is_not_executable_before_think_close(void) {
     const char *generated =
         "<think>I might mention a malformed or tentative tool call here:\n\n"
@@ -15886,6 +16853,136 @@ static void test_thinking_dsml_after_think_close_is_executable(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
+}
+
+static void test_solar_native_thinking_close_splits_reasoning_and_content(void) {
+    const char *generated =
+        "brief internal check<|think:end|>OK";
+
+    char *piece = xstrdup(solar_think_end);
+    size_t piece_len = strlen(piece);
+    canonicalize_solar_generated_piece(&piece, &piece_len);
+    TEST_ASSERT(piece_len == strlen("</think>"));
+    TEST_ASSERT(!strcmp(piece, "</think>"));
+    free(piece);
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, true,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "brief internal check"));
+    TEST_ASSERT(content && !strcmp(content, "OK"));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_solar_native_tool_tokens_parse_as_agent_tool_call(void) {
+    const char *pieces[] = {
+        "check the requested zone",
+        "<|think:end|>",
+        "<|tool_call:start|>",
+        "get_time\n",
+        "<|tool_arg:start|>",
+        "zone",
+        "<|tool_arg:value|>",
+        "Asia/Seoul",
+        "<|tool_arg:end|>",
+        "\n",
+        "<|tool_call:end|>",
+    };
+    buf generated = {0};
+    for (size_t i = 0; i < sizeof(pieces) / sizeof(pieces[0]); i++) {
+        char *piece = xstrdup(pieces[i]);
+        size_t piece_len = strlen(piece);
+        canonicalize_solar_generated_piece(&piece, &piece_len);
+        buf_append(&generated, piece, piece_len);
+        free(piece);
+    }
+
+    TEST_ASSERT(strstr(generated.ptr, "<|tool_call:start|>") == NULL);
+    TEST_ASSERT(strstr(generated.ptr,
+        "</think><tool_call>get_time\n"
+        "<arg_key>zone</arg_key><arg_value>Asia/Seoul</arg_value>\n"
+        "</tool_call>") != NULL);
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, generated.ptr, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "check the requested zone"));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "get_time"));
+    TEST_ASSERT(calls.len == 1 &&
+                strstr(calls.v[0].arguments, "\"zone\": \"Asia/Seoul\"") != NULL);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    buf_free(&generated);
+}
+
+static void test_solar_tool_arguments_follow_json_schema_types(void) {
+    const char *tools_json =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"typed\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"count\":{\"type\":\"integer\"},"
+        "\"enabled\":{\"type\":\"boolean\"},"
+        "\"tags\":{\"type\":\"array\"},"
+        "\"label\":{\"type\":\"string\"},"
+        "\"maybe\":{\"type\":[\"null\",\"string\"]},"
+        "\"bad\":{\"type\":\"integer\"}}}}}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
+    const tool_schema_order *order = tool_schema_orders_find(&orders, "typed");
+    TEST_ASSERT(order != NULL);
+    TEST_ASSERT(order && !strcmp(tool_schema_order_prop_type(order, "count"),
+                                 "integer"));
+    TEST_ASSERT(order && !strcmp(tool_schema_order_prop_type(order, "maybe"),
+                                 "string"));
+
+    const char *generated =
+        "done</think><tool_call>typed\n"
+        "<arg_key>count</arg_key><arg_value>7</arg_value>\n"
+        "<arg_key>enabled</arg_key><arg_value>yes</arg_value>\n"
+        "<arg_key>tags</arg_key><arg_value>[\"a\", 2]</arg_value>\n"
+        "<arg_key>label</arg_key><arg_value>7</arg_value>\n"
+        "<arg_key>maybe</arg_key><arg_value>null</arg_value>\n"
+        "<arg_key>bad</arg_key><arg_value>seven</arg_value>\n"
+        "</tool_call>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, generated, true,
+        &content, &reasoning, &calls));
+    normalize_solar_tool_call_arguments(&calls, &orders);
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].arguments,
+        "{\"count\":7,\"enabled\":true,\"tags\":[\"a\",2],"
+        "\"label\":\"7\",\"maybe\":null,\"bad\":\"seven\"}"));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_unclosed_thinking_warning_excludes_expected_truncation(void) {
+    TEST_ASSERT(!unclosed_thinking_requires_warning(true, true, "length"));
+    TEST_ASSERT(!unclosed_thinking_requires_warning(true, true, "error"));
+    TEST_ASSERT(!unclosed_thinking_requires_warning(true, false, "stop"));
+    TEST_ASSERT(!unclosed_thinking_requires_warning(false, true, "stop"));
+    TEST_ASSERT(unclosed_thinking_requires_warning(true, true, "stop"));
 }
 
 static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
@@ -16035,6 +17132,196 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     tool_calls_free(&calls);
     request_free(&r);
     tool_schema_orders_free(&orders);
+}
+
+static void test_solar_tool_checkpoint_suffix_is_canonical(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"get_time\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"zone\":{\"type\":\"string\"}}}}" );
+    const char *tool_schemas =
+        "{\"name\":\"get_time\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"zone\":{\"type\":\"string\"}}}}";
+
+    chat_msgs prefix_msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("time");
+    chat_msgs_push(&prefix_msgs, user);
+    char *prompt_text = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, &prefix_msgs, tool_schemas,
+        &orders, DS4_THINK_HIGH);
+
+    const char *generated =
+        "need zone</think><tool_call>get_time\n"
+        "<arg_key>zone</arg_key><arg_value>Asia/Seoul</arg_value>\n"
+        "</tool_call>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, generated, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_SOLAR;
+    r.think_mode = DS4_THINK_HIGH;
+    r.tool_orders = orders;
+    memset(&orders, 0, sizeof(orders));
+    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
+    TEST_ASSERT(strstr(suffix, "need zone<|think:end|><tool_call>get_time\n") != NULL);
+    TEST_ASSERT(strstr(suffix, "</tool_call>\n<|im:end|>\n") != NULL);
+    TEST_ASSERT(strstr(suffix, "DSML") == NULL);
+    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") == NULL);
+
+    buf canonical = {0};
+    buf_puts(&canonical, prompt_text);
+    buf_puts(&canonical, suffix);
+
+    chat_msgs history_msgs = {0};
+    chat_msg user2 = {0};
+    user2.role = xstrdup("user");
+    user2.content = xstrdup("time");
+    chat_msgs_push(&history_msgs, user2);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
+    assistant.content = xstrdup(content ? content : "");
+    assistant.calls = calls;
+    memset(&calls, 0, sizeof(calls));
+    chat_msgs_push(&history_msgs, assistant);
+    char *future_prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, &history_msgs, tool_schemas,
+        &r.tool_orders, DS4_THINK_HIGH);
+    TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
+
+    free(future_prompt);
+    buf_free(&canonical);
+    free(suffix);
+    free(prompt_text);
+    free(content);
+    free(reasoning);
+    chat_msgs_free(&history_msgs);
+    chat_msgs_free(&prefix_msgs);
+    tool_calls_free(&calls);
+    request_free(&r);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_solar_visible_tool_checkpoint_omits_hidden_reasoning(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"get_time\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"zone\":{\"type\":\"string\"}}}}" );
+    const char *tool_schemas =
+        "{\"name\":\"get_time\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"zone\":{\"type\":\"string\"}}}}";
+
+    chat_msgs prefix = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("time");
+    chat_msgs_push(&prefix, user);
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, &prefix, tool_schemas,
+        &orders, DS4_THINK_HIGH);
+
+    const char *generated =
+        "hidden tool reasoning</think><tool_call>get_time\n"
+        "<arg_key>zone</arg_key><arg_value>Asia/Seoul</arg_value>\n"
+        "</tool_call>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, generated, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_SOLAR;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt);
+    r.tool_orders = orders;
+    memset(&orders, 0, sizeof(orders));
+    char *suffix = build_visible_assistant_suffix(
+        &r, content, reasoning, &calls);
+    buf visible = {0};
+    buf_puts(&visible, prompt);
+    buf_puts(&visible, suffix);
+    TEST_ASSERT(strstr(visible.ptr, "hidden tool reasoning") == NULL);
+
+    chat_msgs replay = {0};
+    chat_msg replay_user = {0};
+    replay_user.role = xstrdup("user");
+    replay_user.content = xstrdup("time");
+    chat_msgs_push(&replay, replay_user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup(content ? content : "");
+    assistant.calls = calls;
+    memset(&calls, 0, sizeof(calls));
+    chat_msgs_push(&replay, assistant);
+    char *future = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, &replay, tool_schemas,
+        &r.tool_orders, DS4_THINK_HIGH);
+    TEST_ASSERT(!strcmp(visible.ptr, future));
+
+    free(future);
+    buf_free(&visible);
+    free(suffix);
+    free(content);
+    free(reasoning);
+    free(prompt);
+    chat_msgs_free(&replay);
+    chat_msgs_free(&prefix);
+    tool_calls_free(&calls);
+    request_free(&r);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_solar_thinking_visible_checkpoint_matches_future_prompt(void) {
+    chat_msgs prefix = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("2+2?");
+    chat_msgs_push(&prefix, user);
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, &prefix, NULL, NULL, DS4_THINK_HIGH);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_SOLAR;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt);
+    char *visible = build_toolless_thinking_visible_text(&r, "4");
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(strstr(visible,
+        "<|think:start|><|think:end|>4<|im:end|>\n") != NULL);
+
+    chat_msgs history = {0};
+    chat_msg user2 = {0};
+    user2.role = xstrdup("user");
+    user2.content = xstrdup("2+2?");
+    chat_msgs_push(&history, user2);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("4");
+    assistant.reasoning = xstrdup("");
+    chat_msgs_push(&history, assistant);
+    char *future = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_SOLAR, &history, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(!strcmp(visible, future));
+
+    free(future);
+    free(visible);
+    free(prompt);
+    chat_msgs_free(&history);
+    chat_msgs_free(&prefix);
+    request_free(&r);
 }
 
 static void test_tool_checkpoint_minifies_json_parameters(void) {
@@ -16571,9 +17858,8 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     r.think_mode = DS4_THINK_HIGH;
     r.reasoning_summary_emit = true;
 
-    char *suffix = build_responses_visible_assistant_suffix(&r, "5",
-                                                            "hidden summary",
-                                                            NULL);
+    char *suffix = build_visible_assistant_suffix(&r, "5",
+                                                  "hidden summary", NULL);
     TEST_ASSERT(strstr(suffix, "hidden summary") == NULL);
     TEST_ASSERT(strstr(suffix, "</think>5") != NULL);
     free(suffix);
@@ -16585,15 +17871,40 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     tc.arguments = xstrdup("{\"command\":\"pwd\"}");
     tool_calls_push(&calls, tc);
 
-    suffix = build_responses_visible_assistant_suffix(&r, "",
-                                                      "tool summary",
-                                                      &calls);
+    suffix = build_visible_assistant_suffix(&r, "", "tool summary", &calls);
     TEST_ASSERT(strstr(suffix, "tool summary</think>") != NULL);
     TEST_ASSERT(strstr(suffix, "<｜DSML｜tool_calls>") != NULL);
     free(suffix);
 
     tool_calls_free(&calls);
     request_free(&r);
+}
+
+static void test_visible_live_suffix_restores_unevaluated_turn_end(void) {
+    char *suffix = build_visible_live_suffix_text(
+        SERVER_MODEL_SYNTAX_SOLAR, true,
+        "<|im:start|>tool<|im:content|>");
+    TEST_ASSERT(!strcmp(suffix,
+        "\n<|im:end|>\n<|im:start|>tool<|im:content|>"));
+    free(suffix);
+
+    suffix = build_visible_live_suffix_text(
+        SERVER_MODEL_SYNTAX_SOLAR, false,
+        "<|im:start|>user<|im:content|>next");
+    TEST_ASSERT(!strcmp(suffix,
+        "<|im:end|>\n<|im:start|>user<|im:content|>next"));
+    free(suffix);
+
+    suffix = build_visible_live_suffix_text(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, true, "<｜User｜>next");
+    TEST_ASSERT(!strcmp(suffix,
+        "<｜end▁of▁sentence｜><｜User｜>next"));
+    free(suffix);
+
+    suffix = build_visible_live_suffix_text(
+        SERVER_MODEL_SYNTAX_GLM, false, "<|user|>next");
+    TEST_ASSERT(!strcmp(suffix, "<|user|>next"));
+    free(suffix);
 }
 
 static void test_exact_dsml_tool_replay_can_be_disabled(void) {
@@ -17163,6 +18474,19 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     st = thinking_state_from_prompt(&r);
     TEST_ASSERT(st.inside == false);
     request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_SOLAR;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(
+        "<|im:start|>assistant<|im:content|><|think:start|>");
+    st = thinking_state_from_prompt(&r);
+    TEST_ASSERT(st.inside == true);
+    thinking_state_feed(&st, "<|think:", strlen("<|think:"));
+    TEST_ASSERT(st.inside == true);
+    thinking_state_feed(&st, "end|>", strlen("end|>"));
+    TEST_ASSERT(st.inside == false);
+    request_free(&r);
 }
 
 static void test_thinking_checkpoint_remember_gate(void) {
@@ -17180,9 +18504,14 @@ static void test_thinking_checkpoint_remember_gate(void) {
 
     r.prompt_preserves_reasoning = true;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-    r.prompt_preserves_reasoning = false;
     r.has_tools = true;
+    /* Agent clients keep advertising tools even when this turn finishes with
+     * a normal answer.  Hidden reasoning can still be omitted on replay. */
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.api = API_ANTHROPIC;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.api = API_OPENAI;
+    r.prompt_preserves_reasoning = false;
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
@@ -18272,6 +19601,9 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
+    test_render_solar_chat_prompt_text_uses_native_agent_format();
+    test_render_solar_no_think_closes_native_thinking();
+    test_solar_live_tail_uses_native_tool_result_roles();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
@@ -18314,10 +19646,18 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_parse_failure_returns_recoverable_finish();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_invalid_glm_tool_error_suffix();
+    test_invalid_solar_tool_error_suffix_uses_native_roles();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
+    test_solar_native_thinking_close_splits_reasoning_and_content();
+    test_solar_native_tool_tokens_parse_as_agent_tool_call();
+    test_solar_tool_arguments_follow_json_schema_types();
+    test_unclosed_thinking_warning_excludes_expected_truncation();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_glm_tool_checkpoint_suffix_is_canonical();
+    test_solar_tool_checkpoint_suffix_is_canonical();
+    test_solar_visible_tool_checkpoint_omits_hidden_reasoning();
+    test_solar_thinking_visible_checkpoint_matches_future_prompt();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
@@ -18330,6 +19670,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
     test_responses_visible_suffix_matches_client_replay();
+    test_visible_live_suffix_restores_unevaluated_turn_end();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
