@@ -1615,6 +1615,51 @@ static void model_close(ds4_model *m) {
     m->fd = -1;
 }
 
+/* Return clean pages streamed during artifact construction or device
+ * promotion.  Split shards share one virtual range, but each backing fd also
+ * needs the fadvise so the kernel can reclaim its page-cache accounting. */
+static void model_release_mapping_cache(const ds4_model *m) {
+    if (!m || !m->map || m->size == 0) return;
+    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL) return;
+#if defined(MADV_DONTNEED)
+    if (madvise((void *)(uintptr_t)m->map, (size_t)m->size,
+                MADV_DONTNEED) != 0) {
+        fprintf(stderr, "ds4: model mapping cache release failed: %s\n",
+                strerror(errno));
+    }
+#elif defined(POSIX_MADV_DONTNEED)
+    {
+        const int rc = posix_madvise((void *)(uintptr_t)m->map,
+                                     (size_t)m->size,
+                                     POSIX_MADV_DONTNEED);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: model mapping cache release failed: %s\n",
+                    strerror(rc));
+        }
+    }
+#endif
+#if defined(POSIX_FADV_DONTNEED)
+    if (m->fd >= 0) {
+        const int rc = posix_fadvise(m->fd, 0, 0, POSIX_FADV_DONTNEED);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: model shard cache release failed: %s\n",
+                    strerror(rc));
+        }
+    }
+    if (m->split_fds) {
+        for (uint32_t i = 0; i + 1u < m->split_count; i++) {
+            if (m->split_fds[i] < 0) continue;
+            const int rc = posix_fadvise(m->split_fds[i], 0, 0,
+                                         POSIX_FADV_DONTNEED);
+            if (rc != 0) {
+                fprintf(stderr, "ds4: model shard cache release failed: %s\n",
+                        strerror(rc));
+            }
+        }
+    }
+#endif
+}
+
 static void model_prefetch_cpu_mapping(const ds4_model *m) {
     if (!m || !m->map || m->size == 0) return;
 
@@ -2224,15 +2269,16 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
 }
 
 static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
-    /* Routed MoE expert weights (`*_exps.weight`) are ~65 GiB of the model on
-     * V4-Flash but only top-K of N=256 experts fire per token — pre-caching
-     * them in HBM wastes most of the budget on cold weights and starves the
-     * hot non-MoE tensors that every token reads.  Skip them at the span-
-     * build stage so the cap fills with attn / shared FFN / embedding /
-     * output head.  Cold MoE expert reads fall back to the UVA-mapped
-     * pointer. */
+    /* Without replacement artifacts, routed experts remain the cold top-K
+     * mmap tier.  With a complete aligned replace set, however, gate/up raws
+     * are gone and the unrepresented down/edge stacks must be promoted: the
+     * mapping was deliberately left unregistered to avoid double residency. */
     accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
     uint64_t nspan = 0;
+    uint64_t replaced_expert_bytes = 0;
+    uint64_t raw_expert_bytes = 0;
+    const bool replacement_mode =
+        ds4_gpu_model_map_replacements_complete(m->map) != 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
@@ -2240,15 +2286,28 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             free(spans);
             return false;
         }
-        /* Routed-expert weights are the only tensors with "_exps." in the
-         * name; memmem is safe on short names (returns NULL). */
-        if (memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
-            continue;
+        const bool expert =
+            memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL;
+        if (expert) {
+            if (!replacement_mode) continue;
+            if (ds4_gpu_model_range_replaced(m->map, t->abs_offset,
+                                             t->bytes)) {
+                replaced_expert_bytes += t->bytes;
+                continue;
+            }
+            raw_expert_bytes += t->bytes;
         }
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
         };
+    }
+    if (replacement_mode) {
+        fprintf(stderr,
+                "ds4: aligned expert residency plan: %.2f GiB replaced, "
+                "%.2f GiB raw remainder queued for device cache\n",
+                (double)replaced_expert_bytes / 1073741824.0,
+                (double)raw_expert_bytes / 1073741824.0);
     }
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
@@ -2325,6 +2384,9 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
                 "ds4: CUDA startup model cache prepared %.2f GiB of tensor spans in %.3fs\n",
                 (double)cached / 1073741824.0,
                 t1 - t0);
+    }
+    if (ds4_gpu_model_map_replacements_complete(m->map)) {
+        model_release_mapping_cache(m);
     }
     return true;
 }
@@ -15887,15 +15949,11 @@ static bool plain_graph_layer_tail(ds4_plain_gpu_graph *g,
         batch ? ws->routed_mid : g->routed_mid;
     ds4_gpu_tensor *routed_down =
         batch ? ws->routed_down : g->routed_down;
-    if (!ds4_gpu_routed_matmul_tensor(
-                routed_gate, norm, selected, model->map, model->size,
+    if (!ds4_gpu_routed_gate_up_tensor(
+                routed_gate, routed_up, norm, selected,
+                model->map, model->size,
                 layer->ffn_gate_exps->abs_offset,
                 layer->ffn_gate_exps->bytes,
-                layer->ffn_gate_exps->type,
-                (uint32_t)g->n_embd, n_ff_exp, DS4_N_EXPERT,
-                n_tokens, n_used) ||
-        !ds4_gpu_routed_matmul_tensor(
-                routed_up, norm, selected, model->map, model->size,
                 layer->ffn_up_exps->abs_offset,
                 layer->ffn_up_exps->bytes,
                 layer->ffn_up_exps->type,
@@ -43215,7 +43273,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_gpu_set_quality(e->quality);
-        (void)ds4_gpu_set_model_fd(e->model.fd);
+        /* A split model has no single fd whose offsets match the merged
+         * virtual address space.  Disable the single-file direct-I/O cache;
+         * startup promotion and any cold fallback copy from the merged map. */
+        (void)ds4_gpu_set_model_fd(e->model.split_count > 1u
+                                   ? -1 : e->model.fd);
 #ifndef __APPLE__
         /* Self-load aligned artifacts: with no weight-server manifest, build
          * the aligned-SoA repack artifacts in-process BEFORE the model map
@@ -43226,9 +43288,33 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         {
             const char *weight_manifest_probe = getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST");
             if ((!weight_manifest_probe || !weight_manifest_probe[0]) && !load_slice) {
-                (void)ds4_gpu_build_derived_artifacts(e->model.map,
-                                                      e->model.size,
-                                                      opt->model_path);
+                int built = 0;
+                if (e->model.split_count > 1u &&
+                    e->model.n_tensors <= UINT32_MAX) {
+                    ds4_gpu_tensor_record *records =
+                        xcalloc((size_t)e->model.n_tensors, sizeof(*records));
+                    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+                        const ds4_tensor *t = &e->model.tensors[i];
+                        records[i].name = t->name.ptr;
+                        records[i].name_len = (uint32_t)t->name.len;
+                        records[i].type = t->type;
+                        records[i].ndim = t->ndim;
+                        for (uint32_t d = 0; d < t->ndim && d < 4u; d++) {
+                            records[i].dims[d] = t->dim[d];
+                        }
+                        records[i].offset = t->abs_offset;
+                        records[i].bytes = t->bytes;
+                    }
+                    built = ds4_gpu_build_derived_artifacts_from_records(
+                            e->model.map, e->model.size, records,
+                            (uint32_t)e->model.n_tensors);
+                    free(records);
+                } else {
+                    built = ds4_gpu_build_derived_artifacts(e->model.map,
+                                                            e->model.size,
+                                                            opt->model_path);
+                }
+                if (built > 0) model_release_mapping_cache(&e->model);
             }
         }
 #endif

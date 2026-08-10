@@ -26,6 +26,9 @@ enum {
     T_MOE_USED = 8,
     T_MOE_IN = 256,
     T_MOE_OUT = 64,
+    T_IQ2_IN = 1024,
+    T_IQ2_OUT = 64,
+    T_IQ2_TOKENS = 4,
 };
 
 typedef struct {
@@ -431,6 +434,109 @@ static void test_q3_routed_matmul(void *map, uint64_t map_size,
     ds4_gpu_tensor_free(dy); ds4_gpu_tensor_free(di); ds4_gpu_tensor_free(dx);
 }
 
+static void fill_iq2_weights(unsigned char *weights, uint64_t blocks,
+                             uint32_t seed) {
+    for (uint64_t b = 0; b < blocks; b++) {
+        unsigned char *block = weights + b * 66u;
+        const uint16_t d = f32_to_f16(0.003f +
+            0.0002f * (float)(b % 11u));
+        memcpy(block, &d, sizeof(d));
+        for (uint32_t i = 0; i < 64u; i++) {
+            block[2u + i] = (uint8_t)(next_u32(&seed) >> 24);
+        }
+    }
+}
+
+static void test_iq2_aligned_pair(void *map, uint64_t map_size,
+                                  uint64_t gate_off, uint64_t up_off,
+                                  uint64_t weight_bytes) {
+    const size_t x_n = (size_t)T_IQ2_TOKENS * T_IQ2_IN;
+    const size_t ids_n = (size_t)T_IQ2_TOKENS * T_MOE_USED;
+    const size_t out_n = ids_n * T_IQ2_OUT;
+    float *x = malloc(x_n * sizeof(*x));
+    int32_t *ids = malloc(ids_n * sizeof(*ids));
+    float *raw_gate = malloc(out_n * sizeof(*raw_gate));
+    float *raw_up = malloc(out_n * sizeof(*raw_up));
+    float *aligned_gate = malloc(out_n * sizeof(*aligned_gate));
+    float *aligned_up = malloc(out_n * sizeof(*aligned_up));
+    REQUIRE(x && ids && raw_gate && raw_up && aligned_gate && aligned_up,
+            "IQ2 pair host arrays");
+    for (size_t i = 0; i < x_n; i++) {
+        x[i] = 0.4f * sinf(0.013f * (float)(i + 1u)) +
+               0.2f * cosf(0.031f * (float)(i + 7u));
+    }
+    for (size_t i = 0; i < ids_n; i++) {
+        ids[i] = (int32_t)((i * 7u + i / T_MOE_USED * 3u) % T_MOE_EXPERT);
+    }
+
+    ds4_gpu_tensor *dx = ds4_gpu_tensor_alloc(x_n * sizeof(*x));
+    ds4_gpu_tensor *di = ds4_gpu_tensor_alloc(ids_n * sizeof(*ids));
+    ds4_gpu_tensor *dg_raw = ds4_gpu_tensor_alloc(out_n * sizeof(float));
+    ds4_gpu_tensor *du_raw = ds4_gpu_tensor_alloc(out_n * sizeof(float));
+    ds4_gpu_tensor *dg_al = ds4_gpu_tensor_alloc(out_n * sizeof(float));
+    ds4_gpu_tensor *du_al = ds4_gpu_tensor_alloc(out_n * sizeof(float));
+    REQUIRE(dx && di && dg_raw && du_raw && dg_al && du_al,
+            "IQ2 pair device tensors");
+    REQUIRE(ds4_gpu_tensor_write(dx, 0, x, x_n * sizeof(*x)),
+            "write IQ2 activation");
+    REQUIRE(ds4_gpu_tensor_write(di, 0, ids, ids_n * sizeof(*ids)),
+            "write IQ2 ids");
+    REQUIRE(ds4_gpu_routed_matmul_tensor(
+        dg_raw, dx, di, map, map_size, gate_off, weight_bytes, 16u,
+        T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT, T_IQ2_TOKENS, T_MOE_USED),
+        "raw IQ2 gate dispatch");
+    REQUIRE(ds4_gpu_routed_matmul_tensor(
+        du_raw, dx, di, map, map_size, up_off, weight_bytes, 16u,
+        T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT, T_IQ2_TOKENS, T_MOE_USED),
+        "raw IQ2 up dispatch");
+    REQUIRE(ds4_gpu_tensor_read(dg_raw, 0, raw_gate,
+                                out_n * sizeof(float)), "read raw IQ2 gate");
+    REQUIRE(ds4_gpu_tensor_read(du_raw, 0, raw_up,
+                                out_n * sizeof(float)), "read raw IQ2 up");
+
+    const char gate_name[] = "blk.4.ffn_gate_exps.weight";
+    const char up_name[] = "blk.4.ffn_up_exps.weight";
+    ds4_gpu_tensor_record records[2] = {
+        {
+            .name = gate_name, .name_len = sizeof(gate_name) - 1u,
+            .type = 16u, .ndim = 3u,
+            .dims = {T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT, 0u},
+            .offset = gate_off, .bytes = weight_bytes,
+        },
+        {
+            .name = up_name, .name_len = sizeof(up_name) - 1u,
+            .type = 16u, .ndim = 3u,
+            .dims = {T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT, 0u},
+            .offset = up_off, .bytes = weight_bytes,
+        },
+    };
+    REQUIRE(ds4_gpu_build_derived_artifacts_from_records(
+                map, map_size, records, 2u) == 2,
+            "build IQ2 artifacts from merged records");
+    REQUIRE(ds4_gpu_model_map_replacements_complete(map),
+            "IQ2 replacement set complete");
+    REQUIRE(ds4_gpu_routed_gate_up_tensor(
+        dg_al, du_al, dx, di, map, map_size,
+        gate_off, weight_bytes, up_off, weight_bytes, 16u,
+        T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT,
+        T_IQ2_TOKENS, T_MOE_USED),
+        "aligned IQ2 pair dispatch");
+    REQUIRE(ds4_gpu_tensor_read(dg_al, 0, aligned_gate,
+                                out_n * sizeof(float)), "read aligned IQ2 gate");
+    REQUIRE(ds4_gpu_tensor_read(du_al, 0, aligned_up,
+                                out_n * sizeof(float)), "read aligned IQ2 up");
+    compare_f32("IQ2 aligned pair gate vs raw", aligned_gate, raw_gate,
+                out_n, 1.0e-5, 1.0e-5);
+    compare_f32("IQ2 aligned pair up vs raw", aligned_up, raw_up,
+                out_n, 1.0e-5, 1.0e-5);
+
+    ds4_gpu_tensor_free(du_al); ds4_gpu_tensor_free(dg_al);
+    ds4_gpu_tensor_free(du_raw); ds4_gpu_tensor_free(dg_raw);
+    ds4_gpu_tensor_free(di); ds4_gpu_tensor_free(dx);
+    free(aligned_up); free(aligned_gate); free(raw_up); free(raw_gate);
+    free(ids); free(x);
+}
+
 int main(void) {
     REQUIRE(ds4_gpu_init(), "CUDA init");
     const uint64_t embed_off = 4096u;
@@ -439,12 +545,23 @@ int main(void) {
     const uint64_t q3_off = bias_off + 4096u;
     const uint64_t q3_bytes =
         (uint64_t)T_MOE_EXPERT * T_MOE_OUT * sizeof(test_block_q3_k);
-    const uint64_t map_size = (q3_off + q3_bytes + 4095u) & ~4095ull;
+    const uint64_t iq2_gate_off = (q3_off + q3_bytes + 4095u) & ~4095ull;
+    const uint64_t iq2_blocks =
+        (uint64_t)T_MOE_EXPERT * T_IQ2_OUT * (T_IQ2_IN / 256u);
+    const uint64_t iq2_bytes = iq2_blocks * 66u;
+    const uint64_t iq2_up_off =
+        (iq2_gate_off + iq2_bytes + 4095u) & ~4095ull;
+    const uint64_t map_size =
+        (iq2_up_off + iq2_bytes + 4095u) & ~4095ull;
     void *map = NULL;
     REQUIRE(posix_memalign(&map, 4096u, (size_t)map_size) == 0, "model map alloc");
     memset(map, 0, (size_t)map_size);
     fill_q8_embedding((unsigned char *)map + embed_off);
     fill_q3_weights((test_block_q3_k *)((unsigned char *)map + q3_off));
+    fill_iq2_weights((unsigned char *)map + iq2_gate_off,
+                     iq2_blocks, 0x13579bdfu);
+    fill_iq2_weights((unsigned char *)map + iq2_up_off,
+                     iq2_blocks, 0x2468ace0u);
     REQUIRE(ds4_gpu_set_model_map(map, map_size), "model map registration");
 
     puts("== generic model-family CUDA primitives ==");
@@ -452,6 +569,8 @@ int main(void) {
     test_router(map, map_size, bias_off);
     test_weighted_swiglu();
     test_q3_routed_matmul(map, map_size, q3_off, q3_bytes);
+    test_iq2_aligned_pair(map, map_size, iq2_gate_off, iq2_up_off,
+                          iq2_bytes);
 
     ds4_gpu_unregister_model_map(map);
     free(map);

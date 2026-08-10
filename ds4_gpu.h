@@ -514,6 +514,18 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_import_model_ipc_manifest(const void *model_map, uint64_t model_size, const char *manifest_path, const char *model_id);
+/* Engine-owned GGUF catalog entry.  Split models use offsets in the merged
+ * mapping, which no individual shard catalog can represent. */
+typedef struct {
+    const char *name;
+    uint32_t name_len;
+    uint32_t type;
+    uint32_t ndim;
+    uint64_t dims[4];
+    uint64_t offset;
+    uint64_t bytes;
+} ds4_gpu_tensor_record;
+
 /* Self-load aligned artifacts (v0.2.2): with no weight-server manifest, build
  * the aligned-SoA repack artifacts in-process at load (shared layout library
  * cuda/mmq/ds4_repack.cu) so self-load boots ride the same fast dispatches as
@@ -521,6 +533,14 @@ int ds4_gpu_import_model_ipc_manifest(const void *model_map, uint64_t model_size
  * model.  Returns the number of artifacts built (0 = raw tier; boot goes on).
  * Opt-outs: DS4_CUDA_NO_DERIVED_WEIGHTS, DS4_CUDA_BUILD_ARTIFACTS=0. */
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size, const char *model_path);
+/* Split-GGUF twin: consume the engine's merged catalog and mapping directly. */
+int ds4_gpu_build_derived_artifacts_from_records(
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_tensor_record *records, uint32_t count);
+/* Replacement residency queries used by the common startup cache planner. */
+int ds4_gpu_model_map_replacements_complete(const void *model_map);
+int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
+                                 uint64_t bytes);
 /* Aligned-artifact tier for observability: source 0=none 1=imported 2=built.
  * Any out pointer may be NULL. */
 void ds4_gpu_derived_artifact_stats(int *source, uint64_t *count, uint64_t *bytes, double *build_secs);
@@ -1923,6 +1943,27 @@ int ds4_gpu_routed_matmul_tensor(
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used);
+
+/* Paired routed gate/up projection.  The aligned IQ2 artifact tier shares
+ * one activation quantization and one assignment schedule; other types use
+ * the established single-projection fallback. */
+int ds4_gpu_routed_gate_up_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                gate_bytes,
+        uint64_t                up_offset,
+        uint64_t                up_bytes,
         uint32_t                weight_type,
         uint32_t                in_dim,
         uint32_t                out_dim,
