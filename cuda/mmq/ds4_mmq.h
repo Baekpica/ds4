@@ -45,6 +45,21 @@ int ds4_mmq_init(int device);
 //   n_experts: 0 for dense matmul, >0 for MoE (e.g. 256 for V4 Flash).
 int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 
+// Tensor-core prefill attention for the production 128-wide GQA head.
+// The Solar entry decodes compressed K/V once per shared 16-key tile and
+// reuses it across 64 query rows. Returns 0 on success and -1 when the
+// shape or architecture is unsupported so callers can retain a fallback.
+int ds4_mmq_exaone_prefill_attn_hmma(
+        float *heads, const float *q, const void *kv,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
+        int kv_cap, int window, float scale, cudaStream_t stream);
+
+int ds4_mmq_solar_prefill_attn_hmma(
+        float *heads, const float *q, const void *kv,
+        int format, size_t row_bytes,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
+        int kv_cap, int window, float scale, cudaStream_t stream);
+
 // Dense matmul entry points. Per-type wrappers that all share the same
 // underlying mul_mat_q template, parameterised by the weight quant type.
 //

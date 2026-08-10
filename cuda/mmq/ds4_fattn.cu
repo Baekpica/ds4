@@ -1,0 +1,377 @@
+/* Prefill attention on tensor cores (flash-attention style).
+ *
+ * Layout (head_dim 128 only): grid (ceil(n_tokens/64), n_head), block 128
+ * threads. Each warp owns 16 query rows. The block stages 64 Q rows and
+ * walks 16-key K/V tiles; Q.K^T and P.V use m16n8k16 HMMA with online
+ * softmax between them. Compressed Solar K/V is decoded once per shared
+ * tile, so all 64 query rows reuse it.
+ */
+#include "common.cuh"
+#include "mma.cuh"
+#include "ds4_mmq.h"
+
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_fp4.h>
+
+using namespace ggml_cuda_mma;
+
+namespace {
+
+enum {
+    FA_HD      = 128,
+    FA_WQ      = 16,
+    FA_WARPS   = 4,
+    FA_TQ      = FA_WQ * FA_WARPS,
+    FA_TK      = 16,
+    FA_PAD     = 8,
+    FA_ROW     = FA_HD + FA_PAD,
+    SOLAR_KV_BF16 = 0,
+    SOLAR_KV_FP8 = 1,
+    SOLAR_KV_FP4 = 2,
+    SOLAR_KV_KFP8_VFP4 = 3,
+};
+
+typedef tile<16, 8, half2> tile_a;
+typedef tile< 8, 8, half2> tile_b;
+typedef tile<16, 8, float> tile_c;
+
+__device__ __forceinline__ float solar_fattn_e4m3(uint8_t code) {
+    __nv_fp8_e4m3 value;
+    value.__x = code;
+    return (float)value;
+}
+
+__device__ __forceinline__ float solar_fattn_e2m1(uint8_t code) {
+    __nv_fp4_e2m1 value;
+    value.__x = code & 0x0fu;
+    return (float)value;
+}
+
+template <int FORMAT, bool VALUE>
+__device__ __forceinline__ float solar_fattn_kv_load(
+        const uint8_t *row,
+        uint32_t       n_head_kv,
+        uint32_t       kvh,
+        uint32_t       dim) {
+    const uint64_t kv_dim = (uint64_t)n_head_kv * FA_HD;
+    const uint64_t elem = (uint64_t)kvh * FA_HD + dim;
+    const uint64_t k_bytes = FORMAT == SOLAR_KV_FP4 ? kv_dim / 2u : kv_dim;
+    const uint64_t v_bytes = FORMAT == SOLAR_KV_FP8 ? kv_dim : kv_dim / 2u;
+    const __half *scales = (const __half *)(row + k_bytes + v_bytes);
+    const float scale = __half2float(
+        scales[(VALUE ? n_head_kv : 0u) + kvh]);
+    const uint8_t *data = VALUE ? row + k_bytes : row;
+    if constexpr ((VALUE && FORMAT == SOLAR_KV_FP8) ||
+                  (!VALUE && FORMAT != SOLAR_KV_FP4)) {
+        return solar_fattn_e4m3(data[elem]) * scale;
+    } else {
+        const uint8_t packed = data[elem >> 1u];
+        const uint8_t code = (elem & 1u) ? packed >> 4u : packed & 0x0fu;
+        return solar_fattn_e2m1(code) * scale;
+    }
+}
+
+template <int KV_FORMAT>
+__global__ void ds4_fattn_hmma_kernel(
+        float * __restrict__ heads,
+        const float * __restrict__ q,
+        const void * __restrict__ kv,
+        const uint64_t row_bytes,
+        const uint32_t n_tokens,
+        const uint32_t pos0,
+        const uint32_t n_head,
+        const uint32_t n_head_kv,
+        const uint32_t kv_cap,
+        const uint32_t window,
+        const float scale) {
+    const uint32_t tq0 = blockIdx.x * FA_TQ;
+    const uint32_t h = blockIdx.y;
+    if (tq0 >= n_tokens || h >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t kvh = h / group;
+    const uint32_t kv_dim = n_head_kv * FA_HD;
+
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+
+    __shared__ __half s_q[FA_TQ][FA_ROW];
+    __shared__ __half s_k[FA_TK][FA_ROW];
+    __shared__ __half s_v[FA_TK][FA_ROW];
+
+    for (uint32_t idx = threadIdx.x; idx < FA_TQ * FA_HD;
+         idx += blockDim.x) {
+        const uint32_t r = idx / FA_HD;
+        const uint32_t c = idx - r * FA_HD;
+        const uint32_t t = tq0 + r < n_tokens ? tq0 + r : 0u;
+        s_q[r][c] = __float2half(
+            q[((size_t)t * n_head + h) * FA_HD + c]);
+    }
+    __syncthreads();
+
+    const uint32_t qrow[2] = {
+        warp * FA_WQ + lane / 4,
+        warp * FA_WQ + lane / 4 + 8u,
+    };
+    uint32_t qpos[2], qfirst[2];
+    bool alive[2];
+    float row_m[2], row_l[2];
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        alive[r] = tq0 + qrow[r] < n_tokens;
+        qpos[r] = alive[r] ? pos0 + tq0 + qrow[r] : pos0;
+        qfirst[r] = window && qpos[r] + 1u > window
+            ? qpos[r] + 1u - window : 0u;
+        row_m[r] = -INFINITY;
+        row_l[r] = 0.0f;
+    }
+
+    tile_a qa[FA_HD / 16];
+#pragma unroll
+    for (int kc = 0; kc < FA_HD / 16; kc++) {
+#pragma unroll
+        for (int l = 0; l < tile_a::ne; l++) {
+            const int i = (l % 2) * 8 + (int)(lane / 4);
+            const int j = (l / 2) * 4 + (int)(lane % 4);
+            qa[kc].x[l] = *(const half2 *)&s_q[
+                warp * FA_WQ + i][kc * 16 + 2 * j];
+        }
+    }
+
+    tile_c output[FA_HD / 8];
+    uint32_t block_first = 0xffffffffu;
+    uint32_t block_last = 0u;
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        if (!alive[r]) continue;
+        block_first = min(block_first, qfirst[r]);
+        block_last = max(block_last, qpos[r]);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        block_first = min(
+            block_first,
+            __shfl_xor_sync(0xffffffffu, block_first, offset));
+        block_last = max(
+            block_last,
+            __shfl_xor_sync(0xffffffffu, block_last, offset));
+    }
+    __shared__ uint32_t shared_first;
+    __shared__ uint32_t shared_last;
+    if (threadIdx.x == 0u) {
+        shared_first = 0xffffffffu;
+        shared_last = 0u;
+    }
+    __syncthreads();
+    if (lane == 0u) {
+        atomicMin(&shared_first, block_first);
+        atomicMax(&shared_last, block_last);
+    }
+    __syncthreads();
+    block_first = shared_first;
+    block_last = shared_last;
+    if (block_first == 0xffffffffu) return;
+
+    for (uint32_t kt0 = block_first; kt0 <= block_last; kt0 += FA_TK) {
+        const uint32_t remaining = block_last - kt0 + 1u;
+        const uint32_t tile_len = remaining < (uint32_t)FA_TK
+            ? remaining : (uint32_t)FA_TK;
+        for (uint32_t idx = threadIdx.x; idx < FA_TK * FA_HD;
+             idx += blockDim.x) {
+            const uint32_t r = idx / FA_HD;
+            const uint32_t c = idx - r * FA_HD;
+            const uint32_t src = r < tile_len ? kt0 + r : kt0;
+            if constexpr (KV_FORMAT == SOLAR_KV_BF16) {
+                const __half *row = (const __half *)kv +
+                    (size_t)(src % kv_cap) * kv_dim * 2u +
+                    (size_t)kvh * FA_HD;
+                s_k[r][c] = row[c];
+                s_v[r][c] = row[kv_dim + c];
+            } else {
+                const uint8_t *row = (const uint8_t *)kv +
+                    (uint64_t)(src % kv_cap) * row_bytes;
+                s_k[r][c] = __float2half(
+                    solar_fattn_kv_load<KV_FORMAT, false>(
+                        row, n_head_kv, kvh, c));
+                s_v[r][c] = __float2half(
+                    solar_fattn_kv_load<KV_FORMAT, true>(
+                        row, n_head_kv, kvh, c));
+            }
+        }
+        __syncthreads();
+
+        tile_c scores[2];
+#pragma unroll
+        for (int nb = 0; nb < 2; nb++) {
+            tile_c zero;
+            scores[nb] = zero;
+#pragma unroll
+            for (int kc = 0; kc < FA_HD / 16; kc++) {
+                tile_b keys;
+#pragma unroll
+                for (int l = 0; l < tile_b::ne; l++) {
+                    const int i = (int)(lane / 4);
+                    const int j = l * 4 + (int)(lane % 4);
+                    keys.x[l] = *(const half2 *)&s_k[
+                        nb * 8 + i][kc * 16 + 2 * j];
+                }
+                mma(scores[nb], qa[kc], keys);
+            }
+        }
+
+        float tile_max[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int nb = 0; nb < 2; nb++) {
+#pragma unroll
+            for (int l = 0; l < tile_c::ne; l++) {
+                const int r = l / 2;
+                const uint32_t p =
+                    kt0 + nb * 8u + (lane % 4u) * 2u + (l % 2u);
+                float score = scores[nb].x[l] * scale;
+                if (!alive[r] || p > qpos[r] || p < qfirst[r] ||
+                    p >= kt0 + tile_len) {
+                    score = -INFINITY;
+                }
+                scores[nb].x[l] = score;
+                tile_max[r] = fmaxf(tile_max[r], score);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            tile_max[r] = fmaxf(
+                tile_max[r],
+                __shfl_xor_sync(0xffffffffu, tile_max[r], 1));
+            tile_max[r] = fmaxf(
+                tile_max[r],
+                __shfl_xor_sync(0xffffffffu, tile_max[r], 2));
+        }
+
+        float rescale[2];
+        float tile_sum[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const float next_max = fmaxf(row_m[r], tile_max[r]);
+            rescale[r] = row_m[r] == -INFINITY
+                ? 0.0f : __expf(row_m[r] - next_max);
+            row_m[r] = next_max;
+        }
+#pragma unroll
+        for (int nb = 0; nb < 2; nb++) {
+#pragma unroll
+            for (int l = 0; l < tile_c::ne; l++) {
+                const int r = l / 2;
+                const float weight =
+                    scores[nb].x[l] == -INFINITY || row_m[r] == -INFINITY
+                        ? 0.0f : __expf(scores[nb].x[l] - row_m[r]);
+                scores[nb].x[l] = weight;
+                tile_sum[r] += weight;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            tile_sum[r] +=
+                __shfl_xor_sync(0xffffffffu, tile_sum[r], 1);
+            tile_sum[r] +=
+                __shfl_xor_sync(0xffffffffu, tile_sum[r], 2);
+            row_l[r] = row_l[r] * rescale[r] + tile_sum[r];
+        }
+
+        tile_a probabilities;
+#pragma unroll
+        for (int l = 0; l < tile_a::ne; l++) {
+            probabilities.x[l] = __floats2half2_rn(
+                scores[l / 2].x[(l % 2) * 2],
+                scores[l / 2].x[(l % 2) * 2 + 1]);
+        }
+#pragma unroll
+        for (int cb = 0; cb < FA_HD / 8; cb++) {
+#pragma unroll
+            for (int l = 0; l < tile_c::ne; l++) {
+                output[cb].x[l] *= rescale[l / 2];
+            }
+            tile_b values;
+#pragma unroll
+            for (int l = 0; l < tile_b::ne; l++) {
+                const int i = (int)(lane / 4);
+                const int j = l * 4 + (int)(lane % 4);
+                values.x[l] = __halves2half2(
+                    s_v[2 * j][cb * 8 + i],
+                    s_v[2 * j + 1][cb * 8 + i]);
+            }
+            mma(output[cb], probabilities, values);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int cb = 0; cb < FA_HD / 8; cb++) {
+#pragma unroll
+        for (int l = 0; l < tile_c::ne; l++) {
+            const int r = l / 2;
+            if (!alive[r] || row_l[r] <= 0.0f) continue;
+            const uint32_t token = tq0 + qrow[r];
+            const int col = (int)(lane % 4) * 2 + (l % 2);
+            heads[((size_t)token * n_head + h) * FA_HD + cb * 8 + col] =
+                output[cb].x[l] / row_l[r];
+        }
+    }
+}
+
+}  // namespace
+
+extern "C" int ds4_mmq_exaone_prefill_attn_hmma(
+        float *heads, const float *q, const void *kv,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
+        int kv_cap, int window, float scale, cudaStream_t stream) {
+    if (!heads || !q || !kv || n_tokens <= 0 || pos0 < 0 || n_head <= 0 ||
+        n_head_kv <= 0 || head_dim != FA_HD || kv_cap <= 0 ||
+        n_head % n_head_kv != 0) {
+        return -1;
+    }
+    const int device = ggml_cuda_get_device();
+    if (ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_AMPERE) return -1;
+    const dim3 grid((n_tokens + FA_TQ - 1) / FA_TQ, n_head, 1);
+    ds4_fattn_hmma_kernel<SOLAR_KV_BF16>
+        <<<grid, FA_WARPS * 32, 0, stream>>>(
+            heads, q, kv, 0u, (uint32_t)n_tokens, (uint32_t)pos0,
+            (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)kv_cap,
+            (uint32_t)window, scale);
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+extern "C" int ds4_mmq_solar_prefill_attn_hmma(
+        float *heads, const float *q, const void *kv,
+        int format, size_t row_bytes,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
+        int kv_cap, int window, float scale, cudaStream_t stream) {
+    if (!heads || !q || !kv || format < SOLAR_KV_FP8 ||
+        format > SOLAR_KV_KFP8_VFP4 || row_bytes == 0u || n_tokens <= 0 ||
+        pos0 < 0 || n_head <= 0 || n_head_kv <= 0 || head_dim != FA_HD ||
+        kv_cap <= 0 || n_head % n_head_kv != 0) {
+        return -1;
+    }
+    const int device = ggml_cuda_get_device();
+    if (ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_AMPERE) return -1;
+    const dim3 grid((n_tokens + FA_TQ - 1) / FA_TQ, n_head, 1);
+#define DS4_SOLAR_FATTN_LAUNCH(FORMAT)                                      \
+    ds4_fattn_hmma_kernel<FORMAT>                                           \
+        <<<grid, FA_WARPS * 32, 0, stream>>>(                               \
+            heads, q, kv, (uint64_t)row_bytes,                              \
+            (uint32_t)n_tokens, (uint32_t)pos0, (uint32_t)n_head,           \
+            (uint32_t)n_head_kv, (uint32_t)kv_cap, (uint32_t)window, scale)
+    switch (format) {
+    case SOLAR_KV_FP8:
+        DS4_SOLAR_FATTN_LAUNCH(SOLAR_KV_FP8);
+        break;
+    case SOLAR_KV_FP4:
+        DS4_SOLAR_FATTN_LAUNCH(SOLAR_KV_FP4);
+        break;
+    case SOLAR_KV_KFP8_VFP4:
+        DS4_SOLAR_FATTN_LAUNCH(SOLAR_KV_KFP8_VFP4);
+        break;
+    default:
+        return -1;
+    }
+#undef DS4_SOLAR_FATTN_LAUNCH
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}

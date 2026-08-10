@@ -1,5 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_fp4.h>
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
@@ -30372,8 +30374,9 @@ static __device__ uint8_t solar_e4m3fn_encode(float x) {
 }
 
 static __device__ __forceinline__ float solar_e4m3fn_decode(uint8_t code) {
-    const float value = dsv4_e4m3fn_value_dev((int)(code & 0x7fu));
-    return (code & 0x80u) ? -value : value;
+    __nv_fp8_e4m3 value;
+    value.__x = code;
+    return (float)value;
 }
 
 static __device__ uint8_t solar_e2m1_encode(float x) {
@@ -30394,8 +30397,9 @@ static __device__ uint8_t solar_e2m1_encode(float x) {
 }
 
 static __device__ __forceinline__ float solar_e2m1_decode(uint8_t code) {
-    const float value = dsv4_e2m1fn_value_dev((int)(code & 0x7u));
-    return (code & 0x8u) ? -value : value;
+    __nv_fp4_e2m1 value;
+    value.__x = code & 0x0fu;
+    return (float)value;
 }
 
 static __device__ float solar_scale_to_f16(
@@ -30735,6 +30739,202 @@ static __device__ void solar_attention_range(
     }
     __syncthreads();
     if (dim < head_dim && out_max) out[dim] = acc;
+}
+
+/* The scalar anchor above assigns one thread to each head dimension and
+ * reduces every key with block-wide barriers.  That is a useful portability
+ * fallback, but it serializes the entire KV scan.  The production Solar head
+ * widths are multiples of a warp: give each warp independent key positions,
+ * use shuffles for Q.K, then merge the per-warp online-softmax states once at
+ * the end.  DPL is the number of 32-wide dimension slices owned by a lane. */
+template <int DPL>
+static __device__ __forceinline__ void solar_attention_warp_range(
+        float         *out,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       kv_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        float          scale,
+        float         *out_max,
+        float         *out_sum) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t nwarps = blockDim.x >> 5u;
+    float qv[DPL];
+    float acc[DPL];
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        const uint32_t dim = lane + (uint32_t)d * 32u;
+        qv[d] = q[dim];
+        acc[d] = 0.0f;
+    }
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    for (uint32_t pos = first + warp; pos <= last; pos += nwarps) {
+        const uint8_t *row = kv + (uint64_t)(pos % kv_cap) * row_bytes;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            dot += qv[d] * solar_kv_load(
+                row, format, n_head_kv, head_dim, kv_head, dim, false);
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+        }
+        const float score = dot * scale;
+        const float next_max = fmaxf(running_max, score);
+        const float rescale = running_max == -INFINITY
+            ? 0.0f : __expf(running_max - next_max);
+        const float weight = __expf(score - next_max);
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            acc[d] = acc[d] * rescale + weight * solar_kv_load(
+                row, format, n_head_kv, head_dim, kv_head, dim, true);
+        }
+        running_sum = running_sum * rescale + weight;
+        running_max = next_max;
+    }
+
+    __shared__ float warp_max[8];
+    __shared__ float warp_sum[8];
+    extern __shared__ float warp_acc[];
+    if (lane == 0u) {
+        warp_max[warp] = running_max;
+        warp_sum[warp] = running_sum;
+    }
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        const uint32_t dim = lane + (uint32_t)d * 32u;
+        warp_acc[(uint64_t)warp * head_dim + dim] = acc[d];
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+        float global_max = -INFINITY;
+        for (uint32_t w = 0; w < nwarps; w++) {
+            global_max = fmaxf(global_max, warp_max[w]);
+        }
+        float global_sum = 0.0f;
+        for (uint32_t w = 0; w < nwarps; w++) {
+            if (warp_max[w] != -INFINITY) {
+                global_sum += warp_sum[w] *
+                    __expf(warp_max[w] - global_max);
+            }
+        }
+        if (lane == 0u) {
+            if (out_max) *out_max = global_max;
+            if (out_sum) *out_sum = global_sum;
+        }
+        const float inverse_sum = global_sum > 0.0f
+            ? 1.0f / global_sum : 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            float merged = 0.0f;
+            for (uint32_t w = 0; w < nwarps; w++) {
+                if (warp_max[w] != -INFINITY) {
+                    merged += warp_acc[(uint64_t)w * head_dim + dim] *
+                        __expf(warp_max[w] - global_max);
+                }
+            }
+            out[dim] = out_max ? merged : merged * inverse_sum;
+        }
+    }
+}
+
+template <int DPL>
+static __global__ void solar_attention_decode_warp_kernel(
+        float         *heads,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        float          scale) {
+    const uint32_t head = blockIdx.x;
+    if (head >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t base = (uint64_t)head * head_dim;
+    solar_attention_warp_range<DPL>(
+        heads + base, q + base, kv, format, row_bytes, head / group,
+        n_head_kv, head_dim, kv_cap, first, last, scale, NULL, NULL);
+}
+
+template <int DPL>
+static __global__ void solar_attention_prefill_warp_kernel(
+        float         *heads,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_tokens,
+        uint32_t       pos0,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       window,
+        float          scale) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    if (token >= n_tokens || head >= n_head) return;
+    const uint32_t pos = pos0 + token;
+    uint32_t first = window && pos + 1u > window ? pos + 1u - window : 0u;
+    if (pos + 1u > kv_cap && first < pos + 1u - kv_cap) {
+        first = pos + 1u - kv_cap;
+    }
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t base = ((uint64_t)token * n_head + head) * head_dim;
+    solar_attention_warp_range<DPL>(
+        heads + base, q + base, kv, format, row_bytes, head / group,
+        n_head_kv, head_dim, kv_cap, first, pos, scale, NULL, NULL);
+}
+
+template <int DPL>
+static __global__ void solar_attention_split_warp_kernel(
+        float         *partials,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        uint32_t       chunk_len,
+        uint32_t       split_count,
+        float          scale) {
+    const uint32_t split = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    if (split >= split_count || head >= n_head) return;
+    const uint32_t chunk_first = first + split * chunk_len;
+    uint32_t chunk_last = chunk_first + chunk_len - 1u;
+    if (chunk_last > last) chunk_last = last;
+    float *part = partials +
+        ((uint64_t)head * split_count + split) * (head_dim + 2u);
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t qbase = (uint64_t)head * head_dim;
+    solar_attention_warp_range<DPL>(
+        part + 2u, q + qbase, kv, format, row_bytes, head / group,
+        n_head_kv, head_dim, kv_cap, chunk_first, chunk_last, scale,
+        part, part + 1u);
 }
 
 static __global__ void solar_attention_decode_kernel(
@@ -31154,11 +31354,32 @@ extern "C" int ds4_gpu_solar_attention_decode_tensor(
     }
     const uint64_t row_bytes =
         solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
-    solar_attention_decode_kernel<<<n_head, solar_attention_threads(head_dim),
-                                    0, ds4_current_stream()>>>(
-        (float *)heads->ptr, (const float *)q->ptr,
-        (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
-        n_head_kv, head_dim, kv_cap, first, pos, rsqrtf((float)head_dim));
+    const uint32_t threads = solar_attention_threads(head_dim);
+    const uint32_t shmem =
+        (threads / 32u) * head_dim * (uint32_t)sizeof(float);
+#define DS4_SOLAR_DECODE_WARP_CASE(DPL)                                      \
+    case DPL:                                                                \
+        solar_attention_decode_warp_kernel<DPL><<<                           \
+            n_head, threads, shmem, ds4_current_stream()>>>(                 \
+            (float *)heads->ptr, (const float *)q->ptr,                      \
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,   \
+            n_head_kv, head_dim, kv_cap, first, pos,                         \
+            rsqrtf((float)head_dim));                                        \
+        break
+    switch (head_dim / 32u) {
+    DS4_SOLAR_DECODE_WARP_CASE(2);
+    DS4_SOLAR_DECODE_WARP_CASE(4);
+    DS4_SOLAR_DECODE_WARP_CASE(8);
+    default:
+        solar_attention_decode_kernel<<<
+            n_head, threads, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
+            n_head_kv, head_dim, kv_cap, first, pos,
+            rsqrtf((float)head_dim));
+        break;
+    }
+#undef DS4_SOLAR_DECODE_WARP_CASE
     return cuda_ok(cudaGetLastError(), "solar-open2 attention decode");
 }
 
@@ -31197,12 +31418,32 @@ extern "C" int ds4_gpu_solar_attention_decode_split_tensor(
     const uint64_t row_bytes =
         solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
     const uint32_t threads = solar_attention_threads(head_dim);
+    const uint32_t shmem =
+        (threads / 32u) * head_dim * (uint32_t)sizeof(float);
     dim3 grid(split_count, n_head, 1u);
-    solar_attention_split_kernel<<<grid, threads, 0, ds4_current_stream()>>>(
-        (float *)partials->ptr, (const float *)q->ptr,
-        (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
-        n_head_kv, head_dim, kv_cap, first, pos, chunk_len, split_count,
-        rsqrtf((float)head_dim));
+#define DS4_SOLAR_SPLIT_WARP_CASE(DPL)                                       \
+    case DPL:                                                                \
+        solar_attention_split_warp_kernel<DPL><<<                            \
+            grid, threads, shmem, ds4_current_stream()>>>(                   \
+            (float *)partials->ptr, (const float *)q->ptr,                   \
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,   \
+            n_head_kv, head_dim, kv_cap, first, pos, chunk_len, split_count, \
+            rsqrtf((float)head_dim));                                        \
+        break
+    switch (head_dim / 32u) {
+    DS4_SOLAR_SPLIT_WARP_CASE(2);
+    DS4_SOLAR_SPLIT_WARP_CASE(4);
+    DS4_SOLAR_SPLIT_WARP_CASE(8);
+    default:
+        solar_attention_split_kernel<<<
+            grid, threads, 0, ds4_current_stream()>>>(
+            (float *)partials->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
+            n_head_kv, head_dim, kv_cap, first, pos, chunk_len, split_count,
+            rsqrtf((float)head_dim));
+        break;
+    }
+#undef DS4_SOLAR_SPLIT_WARP_CASE
     solar_attention_split_combine_kernel<<<n_head, threads, 0,
                                             ds4_current_stream()>>>(
         (float *)heads->ptr, (const float *)partials->ptr,
@@ -31307,13 +31548,57 @@ extern "C" int ds4_gpu_solar_attention_prefill_tensor(
     }
     const uint64_t row_bytes =
         solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    /* Production default for the verified 128-wide Solar shape.  Keep the
+     * old environment variable as a diagnostic escape hatch: explicitly
+     * setting it to 0 restores the warp-parallel fallback. */
+    static int hmma_enabled = -1;
+    if (hmma_enabled < 0) {
+        const char *value = getenv("DS4_SOLAR_KV_PREFILL_HMMA");
+        hmma_enabled = !(value && value[0] == '0');
+    }
+    if (hmma_enabled && head_dim == 128u && n_tokens >= 64u) {
+        const int rc = ds4_mmq_solar_prefill_attn_hmma(
+            (float *)heads->ptr, (const float *)q->ptr, kv->ptr,
+            (int)format, (size_t)row_bytes, (int)n_tokens, (int)pos0,
+            (int)n_head, (int)n_head_kv, (int)head_dim, (int)kv_cap,
+            (int)window, rsqrtf((float)head_dim), ds4_current_stream());
+        if (rc == 0) {
+            static int logged = 0;
+            if (!logged) {
+                fprintf(stderr,
+                        "ds4: Solar compressed KV prefill using HMMA tiles\n");
+                logged = 1;
+            }
+            return 1;
+        }
+    }
+    const uint32_t threads = solar_attention_threads(head_dim);
+    const uint32_t shmem =
+        (threads / 32u) * head_dim * (uint32_t)sizeof(float);
     dim3 grid(n_tokens, n_head, 1u);
-    solar_attention_prefill_kernel<<<grid, solar_attention_threads(head_dim),
-                                     0, ds4_current_stream()>>>(
-        (float *)heads->ptr, (const float *)q->ptr,
-        (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_tokens,
-        pos0, n_head, n_head_kv, head_dim, kv_cap, window,
-        rsqrtf((float)head_dim));
+#define DS4_SOLAR_PREFILL_WARP_CASE(DPL)                                     \
+    case DPL:                                                                \
+        solar_attention_prefill_warp_kernel<DPL><<<                          \
+            grid, threads, shmem, ds4_current_stream()>>>(                   \
+            (float *)heads->ptr, (const float *)q->ptr,                      \
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_tokens, \
+            pos0, n_head, n_head_kv, head_dim, kv_cap, window,               \
+            rsqrtf((float)head_dim));                                        \
+        break
+    switch (head_dim / 32u) {
+    DS4_SOLAR_PREFILL_WARP_CASE(2);
+    DS4_SOLAR_PREFILL_WARP_CASE(4);
+    DS4_SOLAR_PREFILL_WARP_CASE(8);
+    default:
+        solar_attention_prefill_kernel<<<
+            grid, threads, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_tokens,
+            pos0, n_head, n_head_kv, head_dim, kv_cap, window,
+            rsqrtf((float)head_dim));
+        break;
+    }
+#undef DS4_SOLAR_PREFILL_WARP_CASE
     return cuda_ok(cudaGetLastError(), "solar-open2 attention prefill");
 }
 

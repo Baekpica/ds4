@@ -60,7 +60,7 @@ CUDA_SPARK_FLAGS :=
 MMQ_INCLUDES := -Icuda/mmq
 # -lcuda is required for the in-process VMM weight arena (CUDA driver API).
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcuda
-MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
+MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o cuda/mmq/ds4_fattn.o
 CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 METAL_LDLIBS := $(LDLIBS)
@@ -320,6 +320,9 @@ cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq
 # bit-identical repack artifacts.
 cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+
+cuda/mmq/ds4_fattn.o: cuda/mmq/ds4_fattn.cu cuda/mmq/common.cuh cuda/mmq/mma.cuh cuda/mmq/ds4_mmq.h
+	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
 
 tests/test_repack_premapped: tests/test_repack_premapped.cu cuda/mmq/ds4_repack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
