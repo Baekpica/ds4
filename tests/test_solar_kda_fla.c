@@ -252,6 +252,44 @@ int main(int argc, char **argv) {
     CHECK(ds4_gpu_tensor_read(dvc, 0, conv_scratch, (uint64_t)conv_state * sizeof(float)), "read v decode state");
     compare("FLA v conv decode state", conv_scratch, f.v_decode_state, conv_state, 0.0, 0.0);
 
+    /* The default production path: 64-token chunked prefill. Judged against
+     * the official fixture on the generic path's tolerances, and against the
+     * generic output as the in-family reorder-drift bound. */
+    CHECK(ds4_gpu_tensor_write(dq, 0, f.q, prefill_vector_bytes), "rewrite q");
+    CHECK(ds4_gpu_tensor_write(dk, 0, f.k, prefill_vector_bytes), "rewrite k");
+    CHECK(ds4_gpu_tensor_write(dv, 0, f.v, prefill_vector_bytes), "rewrite v");
+    CHECK(ds4_gpu_tensor_write(dg, 0, f.g, prefill_vector_bytes), "rewrite gate");
+    CHECK(ds4_gpu_tensor_write(db, 0, f.beta, (uint64_t)f.tokens * f.heads * sizeof(float)), "rewrite beta");
+    CHECK(ds4_gpu_tensor_fill_f32(dstate, 0.0f, state), "reset state for chunked prefill");
+    CHECK(ds4_gpu_tensor_fill_f32(dqc, 0.0f, conv_state), "reset q conv for chunked prefill");
+    CHECK(ds4_gpu_tensor_fill_f32(dkc, 0.0f, conv_state), "reset k conv for chunked prefill");
+    CHECK(ds4_gpu_tensor_fill_f32(dvc, 0.0f, conv_state), "reset v conv for chunked prefill");
+    CHECK(unsetenv("DS4_SOLAR_KDA_STATE_PARTS") == 0,
+          "select chunked KDA prefill");
+    CHECK(ds4_gpu_solar_kda_prefill_tensor(
+              dout, dstate, dqc, dkc, dvc, dq, dk, dv, dg, db,
+              dqw, dkw, dvw, dda, ddt, f.tokens, f.heads, f.dim, f.conv, -5.0f),
+          "chunked fixture prefill");
+    CHECK(ds4_gpu_tensor_read(dout, 0, scratch, prefill_vector_bytes),
+          "read chunked prefill output");
+    compare("FLA chunked prefill output", scratch, f.prefill_out,
+            (size_t)f.tokens * vector, 1.0e-3, 5.0e-2);
+    compare("chunked vs generic output", scratch, generic_out,
+            (size_t)f.tokens * vector, 1.0e-4, 1.0e-3);
+    CHECK(ds4_gpu_tensor_read(dstate, 0, state_scratch,
+                              (uint64_t)state * sizeof(float)),
+          "read chunked prefill state");
+    compare("FLA chunked final state", state_scratch, f.prefill_state, state,
+            2.0e-2, 5.0e-2);
+    compare("chunked vs generic state", state_scratch, generic_state, state,
+            2.0e-4, 2.0e-3);
+    CHECK(ds4_gpu_tensor_read(dqc, 0, conv_scratch, (uint64_t)conv_state * sizeof(float)), "read chunked q conv");
+    compare("chunked q conv prefill state", conv_scratch, f.q_prefill_state, conv_state, 0.0, 0.0);
+    CHECK(ds4_gpu_tensor_read(dkc, 0, conv_scratch, (uint64_t)conv_state * sizeof(float)), "read chunked k conv");
+    compare("chunked k conv prefill state", conv_scratch, f.k_prefill_state, conv_state, 0.0, 0.0);
+    CHECK(ds4_gpu_tensor_read(dvc, 0, conv_scratch, (uint64_t)conv_state * sizeof(float)), "read chunked v conv");
+    compare("chunked v conv prefill state", conv_scratch, f.v_prefill_state, conv_state, 0.0, 0.0);
+
     free(scratch); free(state_scratch); free(conv_scratch);
     free(generic_out); free(generic_state);
     ds4_gpu_tensor_free(dq); ds4_gpu_tensor_free(dk); ds4_gpu_tensor_free(dv);

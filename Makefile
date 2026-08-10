@@ -75,7 +75,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch test-solar-kda test-solar-kda-prefill test-solar-kda-fla test-solar-gates test-solar-kv test-solar-memory test-solar-loader test-solar-session test-solar-lifecycle test-solar-kv-formats dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch test-solar-kda test-solar-kda-prefill test-solar-kda-chunk test-solar-kda-fla test-solar-gates test-solar-kv test-solar-memory test-solar-loader test-solar-session test-solar-lifecycle test-solar-kv-formats dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -376,6 +376,15 @@ tests/test_solar_kda_prefill: tests/test_solar_kda_prefill.o ds4_cuda.o $(MMQ_OB
 
 test-solar-kda-prefill: tests/test_solar_kda_prefill
 	./tests/test_solar_kda_prefill
+
+tests/test_solar_kda_chunk.o: tests/test_solar_kda_chunk.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_kda_chunk: tests/test_solar_kda_chunk.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-kda-chunk: tests/test_solar_kda_chunk
+	./tests/test_solar_kda_chunk
 
 tests/test_solar_kda_fla.o: tests/test_solar_kda_fla.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
