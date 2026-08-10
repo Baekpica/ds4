@@ -450,6 +450,24 @@ int ds4_mmq_q4_K_moe_pair(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// Paired Q4_K entry with a caller-proven expert-bucket bound.  The two
+// weights share one expert map and Q8_1 activation, then run through the
+// compact routed worklist.  Router ids remain authoritative.
+int ds4_mmq_q4_K_moe_pair_bounded(
+    const void    * W_a,
+    const void    * W_b,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_a,
+    float         * out_b,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
+    cudaStream_t    stream);
+
 // MoE vector matmul entries (Step 6). Same signature and semantics as the
 // ds4_mmq_<type>_moe entries above, but route through llama.cpp's mmvq
 // kernels instead of mmq. mmvq is structurally optimised for small batch

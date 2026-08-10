@@ -25099,6 +25099,72 @@ extern "C" int ds4_gpu_routed_gate_up_tensor(
         return 0;
     }
 
+    const uint64_t assignments = (uint64_t)n_tokens * n_expert_used;
+    if (assignments > UINT64_MAX / out_dim ||
+        assignments * out_dim > UINT64_MAX / sizeof(float) ||
+        gate->bytes < assignments * out_dim * sizeof(float) ||
+        up->bytes < assignments * out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    /* Q4_K appears in Solar's shallow and tail routed layers. Pairing here
+     * lets gate/up share the expert map and activation quantize; prefill then
+     * uses the common compact worklist with the top-k bucket bound. */
+    const char *q4_pair_env = getenv("DS4_MMQ_Q4_PAIR");
+    const bool q4_pair_enabled =
+        !(q4_pair_env && q4_pair_env[0] == '0');
+    if (weight_type == 12u && in_dim % 256u == 0u &&
+        gate_bytes == up_bytes && ds4_cuda_use_mmq() && q4_pair_enabled) {
+        const uint64_t blocks_per_row = in_dim / 256u;
+        bool q4_shape_ok = (uint64_t)n_expert <= UINT64_MAX / out_dim;
+        uint64_t required_bytes = 0u;
+        if (q4_shape_ok) {
+            const uint64_t expert_rows = (uint64_t)n_expert * out_dim;
+            q4_shape_ok = expert_rows <= UINT64_MAX / blocks_per_row;
+            if (q4_shape_ok) {
+                const uint64_t blocks = expert_rows * blocks_per_row;
+                q4_shape_ok = blocks <= UINT64_MAX / 144u;
+                if (q4_shape_ok) required_bytes = blocks * 144u;
+            }
+        }
+        if (q4_shape_ok && gate_bytes >= required_bytes) {
+            const char *gate_raw = cuda_model_range_ptr(
+                model_map, gate_offset, gate_bytes,
+                "routed_gate_q4_pair_weights");
+            const char *up_raw = cuda_model_range_ptr(
+                model_map, up_offset, up_bytes,
+                "routed_up_q4_pair_weights");
+            if (gate_raw && up_raw) {
+                const cudaStream_t stream = ds4_mmq_stream_for_call();
+                const int rc = n_tokens == 1u
+                    ? ds4_mmq_q4_K_moe_pair_raw_vec(
+                          gate_raw, up_raw,
+                          (const float *)x->ptr, (const int32_t *)ids->ptr,
+                          (float *)gate->ptr, (float *)up->ptr,
+                          (int)out_dim, (int)in_dim, (int)n_tokens,
+                          (int)n_expert, (int)n_expert_used, stream)
+                    : ds4_mmq_q4_K_moe_pair_bounded(
+                          gate_raw, up_raw,
+                          (const float *)x->ptr, (const int32_t *)ids->ptr,
+                          (float *)gate->ptr, (float *)up->ptr,
+                          (int)out_dim, (int)in_dim, (int)n_tokens,
+                          (int)n_expert, (int)n_expert_used,
+                          (int)n_tokens, stream);
+                if (rc == 0) {
+                    static bool logged_q4_pair = false;
+                    if (!logged_q4_pair) {
+                        logged_q4_pair = true;
+                        fprintf(stderr,
+                                "ds4: routed gate/up using Q4_K pair (%s)\n",
+                                n_tokens == 1u ? "decode" : "bounded prefill");
+                    }
+                    return cuda_ok(cudaGetLastError(),
+                                   "routed Q4_K gate/up pair launch");
+                }
+            }
+        }
+    }
+
     if (weight_type != 16u || (in_dim & 1023u) != 0u ||
         gate_bytes != up_bytes || !ds4_cuda_use_mmq()) {
         return ds4_gpu_routed_matmul_tensor(
@@ -25109,13 +25175,6 @@ extern "C" int ds4_gpu_routed_gate_up_tensor(
                     up, x, ids, model_map, model_size,
                     up_offset, up_bytes, weight_type,
                     in_dim, out_dim, n_expert, n_tokens, n_expert_used);
-    }
-    const uint64_t assignments = (uint64_t)n_tokens * n_expert_used;
-    if (assignments > UINT64_MAX / out_dim ||
-        assignments * out_dim > UINT64_MAX / sizeof(float) ||
-        gate->bytes < assignments * out_dim * sizeof(float) ||
-        up->bytes < assignments * out_dim * sizeof(float)) {
-        return 0;
     }
 
     const uint64_t aligned_bytes = ds4_mmq_iq2_xxs_aligned_bytes(

@@ -1474,7 +1474,11 @@ int ds4_mmq_moe_pair_impl(
         int64_t         soa_blocks = 0,
         /* ds4 (P3): see ds4_mmq_moe_impl. */
         bool            sanitize_out = true,
-        const ds4_mmq_fused_down *fused_down = nullptr) {
+        const ds4_mmq_fused_down *fused_down = nullptr,
+        /* Optional caller-proven maximum expert bucket size. Router ids are
+         * still authoritative through expert_bounds. A positive hint also
+         * opts Q3_K/Q4_K pairs into the compact routed worklist. */
+        int64_t         ncols_max_hint = 0) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
@@ -1532,6 +1536,11 @@ int ds4_mmq_moe_pair_impl(
     ds4_pool_set_stream(stream);  /* task #22: pool ops must be stream-ordered with the kernels (see ds4_mmq_dense_impl) */
 
     const int64_t ne_get_rows  = (int64_t)n_tokens * n_expert_used;
+    if (ncols_max_hint < 0 || ncols_max_hint > ne_get_rows) {
+        fprintf(stderr, "%s: invalid expert bucket bound %lld for %lld rows\n",
+                tag, (long long)ncols_max_hint, (long long)ne_get_rows);
+        return -1;
+    }
     const int64_t ne00         = K;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const int64_t ne11         = 1;
@@ -1647,9 +1656,9 @@ int ds4_mmq_moe_pair_impl(
      * token cannot select the same expert twice, so no expert bucket can
      * exceed n_tokens rows. Keep the conservative gathered-row bound for all
      * generic MMQ callers, including DSpark/MTP. */
-    const int64_t routed_ncols_max = fused_down
-        ? (int64_t)n_tokens
-        : ne_get_rows;
+    const int64_t routed_ncols_max = ncols_max_hint > 0
+        ? ncols_max_hint
+        : fused_down ? (int64_t)n_tokens : ne_get_rows;
 
     /* The materialized path stream-frees gate/up Q8_1 before allocating the
      * down Q8_1. The direct path needs both simultaneously, but writes down
@@ -1859,6 +1868,40 @@ int ds4_mmq_moe_pair_impl(
                     gate_up_done = true;
                 }
             }
+        }
+    }
+
+    if (!gate_up_done && ncols_max_hint > 0 && xa_soa == nullptr &&
+        xb_soa == nullptr && moe_worklist_enabled(type)) {
+        int pair_a_rc = -1;
+        int pair_b_rc = -1;
+        if constexpr (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K) {
+            pair_a_rc = ds4_mmq_moe_worklist_launch<type>(
+                tag, *ctx, W_a, (const int *)src1_q8_1,
+                ids_dst, expert_bounds, out_a,
+                M, K, ne_get_rows, n_experts, s01, s02, stream);
+            if (pair_a_rc == 0) {
+                pair_b_rc = ds4_mmq_moe_worklist_launch<type>(
+                    tag, *ctx, W_b, (const int *)src1_q8_1,
+                    ids_dst, expert_bounds, out_b,
+                    M, K, ne_get_rows, n_experts, s01, s02, stream);
+            }
+        }
+        if (pair_a_rc == 0 && pair_b_rc == 0) {
+            gate_up_done = true;
+            static bool logged_pair_worklist = false;
+            if (!logged_pair_worklist) {
+                logged_pair_worklist = true;
+                fprintf(stderr,
+                        "ds4: compact routed MMQ pair worklist active "
+                        "(type=%d rows=%lld experts=%d)\n",
+                        (int)type, (long long)ne_get_rows, n_experts);
+            }
+        } else if (pair_a_rc != -1 || pair_b_rc != -1) {
+            /* A launched first output cannot safely fall back to the generic
+             * pair if the second launch fails. The same shape validation is
+             * shared by both calls, so -1 can only be an all-or-none refusal. */
+            return pair_a_rc != 0 ? pair_a_rc : pair_b_rc;
         }
     }
 
@@ -2318,6 +2361,26 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
     return ds4_mmq_moe_pair_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_moe_pair_bounded(
+        const void * W_a, const void * W_b,
+        const float * X, const int32_t * ids, float * out_a, float * out_b,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        int max_rows_per_expert, cudaStream_t stream) {
+    if (max_rows_per_expert <= 0) {
+        fprintf(stderr,
+                "ds4_mmq_q4_K_moe_pair_bounded: invalid bound %d\n",
+                max_rows_per_expert);
+        return -1;
+    }
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_moe_pair_bounded",
+        W_a, W_b, X, ids, out_a, out_b,
+        M, K, n_tokens, n_experts, n_expert_used, stream,
+        /*xa_soa=*/NULL, /*xb_soa=*/NULL, /*soa_blocks=*/0,
+        /*sanitize_out=*/true, /*fused_down=*/nullptr,
+        /*ncols_max_hint=*/max_rows_per_expert);
 }
 
 // ----------------------------------------------------------------------------

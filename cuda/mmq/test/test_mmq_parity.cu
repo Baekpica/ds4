@@ -1150,6 +1150,15 @@ bool run_q4_K_moe_bounded(
         q4_K_moe_bounded_test_entry, ds4_mmq_q4_K_moe);
 }
 
+static int q4_K_moe_pair_bounded_test_entry(
+        const void *wa, const void *wb, const float *x,
+        const int32_t *ids, float *out_a, float *out_b,
+        int M, int K, int nt, int ne, int nu, cudaStream_t stream) {
+    return ds4_mmq_q4_K_moe_pair_bounded(
+        wa, wb, x, ids, out_a, out_b,
+        M, K, nt, ne, nu, nt, stream);
+}
+
 // --------------------------------------------------------------------------
 // Step 6 - mmvq vector matmul parity runners.
 //
@@ -1571,6 +1580,10 @@ int main(int argc, char ** argv) {
         "Q4_K", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
         /*ne=*/16, /*nu=*/6, 0xC4FE10, gen_q4k,
         ds4_mmq_q4_K_moe_pair, ds4_mmq_q4_K_moe);
+    all_ok &= run_moe_pair_generic<block_q4_K>(
+        "Q4_K/BOUNDED", QK_K_LOCAL, /*M=*/128, /*K=*/512, /*nt=*/32,
+        /*ne=*/64, /*nu=*/6, 0xC4FE11, gen_q4k,
+        q4_K_moe_pair_bounded_test_entry, q4_K_moe_bounded_test_entry);
 
     // Step 6 - mmvq vector matmul tests.
     //
