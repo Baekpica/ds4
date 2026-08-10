@@ -35442,7 +35442,28 @@ int ds4_engine_batched_generate_ex(
         if (prompts[i].len > ctx_size) { BG_API_ERR("batched_generate: prompt %d (%d tok) exceeds ctx %d", i, prompts[i].len, ctx_size); return 1; }
         const uint32_t L = (uint32_t)prompts[i].len;
         if (L > max_len) max_len = L;
+        if (L > UINT32_MAX - n_packed) {
+            BG_API_ERR("batched_generate: packed prompt size overflow");
+            return 1;
+        }
         n_packed += L;
+    }
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        if (n_packed > INT_MAX) {
+            BG_API_ERR("batched_generate: packed prompt is too large");
+            return 1;
+        }
+        ds4_batch_ctx *ctx = NULL;
+        if (ds4_batch_ctx_create(
+                e, ctx_size, n, (int)n_packed,
+                &ctx, err, errlen) != 0) {
+            return 1;
+        }
+        const int rc = ds4_engine_batched_generate_ctx(
+            ctx, prompts, n, max_new_tokens, eos_ids, out, err, errlen);
+        ds4_batch_ctx_destroy(ctx);
+        return rc;
     }
 
     /* Ragged prefill is one un-chunked forward, so prefill_cap must cover Σlen. */
@@ -35549,6 +35570,341 @@ int ds4_engine_batched_generate(
     return ds4_engine_batched_generate_ex(e, prompts, n, ctx_size, mn, ei, out, err, errlen);
 }
 
+#ifndef DS4_NO_GPU
+/* Solar's continuous lane reuses one plain-residual compute graph while the
+ * mutable model state lives in independent banks.  The graph only borrows the
+ * currently selected bank's tensor views; the runtime owns every view/slab and
+ * clears the borrowed pointers before solar_graph_free().  This keeps the
+ * public ds4_batch_ctx boundary common without teaching the DeepSeek graph
+ * about KDA recurrence or Solar's GQA row format. */
+typedef struct ds4_solar_batch_runtime {
+    ds4_solar_gpu_graph graph;
+    uint32_t max_seq;
+    int32_t bound_bank;
+
+    ds4_gpu_tensor *state_slab;
+    ds4_gpu_tensor *state_pool[DS4_MULTISEQ_MAX_SEQ];
+    ds4_gpu_tensor *recurrent[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    ds4_gpu_tensor *q_conv_state[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    ds4_gpu_tensor *k_conv_state[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    ds4_gpu_tensor *v_conv_state[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+
+    ds4_gpu_tensor *kv_slab[DS4_MAX_LAYER];
+    ds4_gpu_tensor *kv[DS4_MULTISEQ_MAX_SEQ][DS4_MAX_LAYER];
+    uint64_t kv_bank_bytes[DS4_MAX_LAYER];
+
+    /* A retired bank can be admitted with an empty suffix.  Its last next-token
+     * distribution is host-resident so that exact warm reuse does not need to
+     * mutate/replay recurrent state merely to recover logits. */
+    float   *bank_logits;
+    uint8_t *bank_logits_valid;
+} ds4_solar_batch_runtime;
+
+static void solar_batch_runtime_unborrow(ds4_solar_batch_runtime *rt) {
+    if (!rt) return;
+    rt->graph.state_pool = NULL;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        rt->graph.recurrent[il] = NULL;
+        rt->graph.q_conv_state[il] = NULL;
+        rt->graph.k_conv_state[il] = NULL;
+        rt->graph.v_conv_state[il] = NULL;
+        rt->graph.base.layer_kv[il] = NULL;
+    }
+    rt->bound_bank = -1;
+}
+
+static void solar_batch_runtime_free(ds4_solar_batch_runtime *rt) {
+    if (!rt) return;
+    solar_batch_runtime_unborrow(rt);
+    for (uint32_t b = 0; b < rt->max_seq; b++) {
+        for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+            ds4_gpu_tensor_free(rt->recurrent[b][il]);
+            ds4_gpu_tensor_free(rt->q_conv_state[b][il]);
+            ds4_gpu_tensor_free(rt->k_conv_state[b][il]);
+            ds4_gpu_tensor_free(rt->v_conv_state[b][il]);
+            ds4_gpu_tensor_free(rt->kv[b][il]);
+        }
+        ds4_gpu_tensor_free(rt->state_pool[b]);
+    }
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(rt->kv_slab[il]);
+    }
+    ds4_gpu_tensor_free(rt->state_slab);
+    free(rt->bank_logits);
+    free(rt->bank_logits_valid);
+    solar_graph_free(&rt->graph);
+    free(rt);
+}
+
+static ds4_gpu_tensor *solar_batch_reserve_or_alloc(uint64_t bytes) {
+    ds4_gpu_tensor *t = ds4_gpu_tensor_reserve(bytes);
+    return t ? t : ds4_gpu_tensor_alloc(bytes);
+}
+
+static bool solar_batch_runtime_bind(ds4_solar_batch_runtime *rt, uint32_t bank) {
+    if (!rt || bank >= rt->max_seq || !rt->state_pool[bank]) return false;
+    rt->graph.state_pool = rt->state_pool[bank];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_solar_layer_is_gqa(il)) {
+            rt->graph.base.layer_kv[il] = rt->kv[bank][il];
+        } else {
+            rt->graph.recurrent[il] = rt->recurrent[bank][il];
+            rt->graph.q_conv_state[il] = rt->q_conv_state[bank][il];
+            rt->graph.k_conv_state[il] = rt->k_conv_state[bank][il];
+            rt->graph.v_conv_state[il] = rt->v_conv_state[bank][il];
+        }
+    }
+    rt->bound_bank = (int32_t)bank;
+    return true;
+}
+
+static bool solar_batch_runtime_ensure_state(ds4_solar_batch_runtime *rt,
+                                             uint32_t bank) {
+    if (!rt || bank >= rt->max_seq || !rt->state_slab) return false;
+    return ds4_gpu_tensor_ensure(
+               rt->state_slab,
+               (uint64_t)bank * rt->graph.state_bytes,
+               rt->graph.state_bytes) != 0;
+}
+
+static bool solar_batch_runtime_ensure_kv(ds4_solar_batch_runtime *rt,
+                                          uint32_t bank,
+                                          uint32_t end_pos) {
+    if (!rt || bank >= rt->max_seq || end_pos > rt->graph.base.ctx_size) {
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_solar_layer_is_gqa(il)) continue;
+        const uint64_t bytes = (uint64_t)end_pos * rt->graph.base.kv_row_bytes;
+        if (bytes != 0u &&
+            ds4_gpu_tensor_ensure(
+                rt->kv_slab[il],
+                (uint64_t)bank * rt->kv_bank_bytes[il], bytes) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint64_t solar_batch_span_need(const ds4_gpu_tensor *tensor,
+                                      uint64_t offset, uint64_t bytes) {
+    if (!tensor || bytes == 0u) return 0u;
+    const uint64_t resident =
+        ds4_gpu_tensor_resident(tensor, offset, bytes);
+    return resident < bytes ? bytes - resident : 0u;
+}
+
+static uint64_t solar_batch_runtime_bank_need(
+        const ds4_solar_batch_runtime *rt, uint32_t bank,
+        uint32_t end_pos) {
+    if (!rt || bank >= rt->max_seq || end_pos == 0u ||
+        end_pos > rt->graph.base.ctx_size) {
+        return UINT64_MAX;
+    }
+    uint64_t need = solar_batch_span_need(
+        rt->state_slab, (uint64_t)bank * rt->graph.state_bytes,
+        rt->graph.state_bytes);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_solar_layer_is_gqa(il)) continue;
+        const uint64_t bytes =
+            (uint64_t)end_pos * rt->graph.base.kv_row_bytes;
+        const uint64_t add = solar_batch_span_need(
+            rt->kv_slab[il], (uint64_t)bank * rt->kv_bank_bytes[il],
+            bytes);
+        if (add > UINT64_MAX - need) return UINT64_MAX;
+        need += add;
+    }
+    return need;
+}
+
+static uint64_t solar_batch_runtime_projected_need(
+        const ds4_solar_batch_runtime *rt, const uint32_t *credit_end,
+        uint32_t candidate, uint32_t candidate_end) {
+    uint64_t need = 0u;
+    for (uint32_t b = 0; b < rt->max_seq; b++) {
+        const uint32_t end = b == candidate ? candidate_end : credit_end[b];
+        if (end == 0u) continue;
+        const uint64_t add = solar_batch_runtime_bank_need(rt, b, end);
+        if (add == UINT64_MAX || add > UINT64_MAX - need) return UINT64_MAX;
+        need += add;
+    }
+    return need;
+}
+
+static bool solar_batch_runtime_reset_bank(ds4_solar_batch_runtime *rt,
+                                           uint32_t bank) {
+    if (!solar_batch_runtime_ensure_state(rt, bank) ||
+        !solar_batch_runtime_bind(rt, bank) ||
+        !solar_graph_reset_state(&rt->graph)) {
+        return false;
+    }
+    rt->bank_logits_valid[bank] = 0u;
+    return true;
+}
+
+static bool solar_batch_runtime_copy_bank(ds4_solar_batch_runtime *rt,
+                                          uint32_t src,
+                                          uint32_t dst,
+                                          uint32_t prefix) {
+    if (!rt || src >= rt->max_seq || dst >= rt->max_seq) return false;
+    if (src == dst) return true;
+    if (!solar_batch_runtime_ensure_state(rt, dst) ||
+        !solar_batch_runtime_ensure_kv(rt, dst, prefix) ||
+        ds4_gpu_tensor_copy(
+            rt->state_slab, (uint64_t)dst * rt->graph.state_bytes,
+            rt->state_slab, (uint64_t)src * rt->graph.state_bytes,
+            rt->graph.state_bytes) == 0) {
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_solar_layer_is_gqa(il)) continue;
+        const uint64_t bytes = (uint64_t)prefix * rt->graph.base.kv_row_bytes;
+        if (bytes != 0u &&
+            ds4_gpu_tensor_copy(
+                rt->kv_slab[il], (uint64_t)dst * rt->kv_bank_bytes[il],
+                rt->kv_slab[il], (uint64_t)src * rt->kv_bank_bytes[il],
+                bytes) == 0) {
+            return false;
+        }
+    }
+    if (rt->bank_logits_valid[src]) {
+        memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
+               rt->bank_logits + (size_t)src * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->bank_logits_valid[dst] = 1u;
+    } else {
+        rt->bank_logits_valid[dst] = 0u;
+    }
+    return true;
+}
+
+static bool solar_batch_runtime_read_logits(ds4_solar_batch_runtime *rt,
+                                            uint32_t bank) {
+    if (!rt || bank >= rt->max_seq ||
+        ds4_gpu_tensor_read(
+            rt->graph.base.logits, 0,
+            rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+            (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0) {
+        return false;
+    }
+    rt->bank_logits_valid[bank] = 1u;
+    return true;
+}
+
+static ds4_solar_batch_runtime *solar_batch_runtime_create(
+        ds4_engine *e, uint32_t ctx_size, uint32_t max_seq,
+        uint32_t prefill_cap) {
+    if (!e || max_seq == 0u || max_seq > DS4_MULTISEQ_MAX_SEQ) return NULL;
+    ds4_solar_batch_runtime *rt = xcalloc(1, sizeof(*rt));
+    rt->max_seq = max_seq;
+    rt->bound_bank = -1;
+    if (!solar_graph_alloc(&rt->graph, &e->model, &e->weights,
+                           ctx_size, prefill_cap)) {
+        solar_batch_runtime_free(rt);
+        return NULL;
+    }
+
+    /* Replace the one-session state allocated by solar_graph_alloc with
+     * demand-mapped multi-bank slabs.  Controls and all compute workspaces stay
+     * shared and are still owned by the graph. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_solar_layer_is_gqa(il)) {
+            ds4_gpu_tensor_free(rt->graph.base.layer_kv[il]);
+            rt->graph.base.layer_kv[il] = NULL;
+        } else {
+            ds4_gpu_tensor_free(rt->graph.recurrent[il]);
+            ds4_gpu_tensor_free(rt->graph.q_conv_state[il]);
+            ds4_gpu_tensor_free(rt->graph.k_conv_state[il]);
+            ds4_gpu_tensor_free(rt->graph.v_conv_state[il]);
+            rt->graph.recurrent[il] = NULL;
+            rt->graph.q_conv_state[il] = NULL;
+            rt->graph.k_conv_state[il] = NULL;
+            rt->graph.v_conv_state[il] = NULL;
+        }
+    }
+    ds4_gpu_tensor_free(rt->graph.state_pool);
+    rt->graph.state_pool = NULL;
+
+    if (rt->graph.state_bytes > UINT64_MAX / max_seq) {
+        solar_batch_runtime_free(rt);
+        return NULL;
+    }
+    rt->state_slab = solar_batch_reserve_or_alloc(
+        rt->graph.state_bytes * max_seq);
+    if (!rt->state_slab) {
+        solar_batch_runtime_free(rt);
+        return NULL;
+    }
+
+    const uint64_t kda_dim =
+        (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint64_t recurrent_bytes =
+        (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM *
+        DS4_N_KDA_HEAD_DIM * sizeof(float);
+    const uint64_t conv_bytes =
+        kda_dim * DS4_N_SSM_CONV * sizeof(float);
+    for (uint32_t b = 0; b < max_seq; b++) {
+        rt->state_pool[b] = ds4_gpu_tensor_view(
+            rt->state_slab, (uint64_t)b * rt->graph.state_bytes,
+            rt->graph.state_bytes);
+        uint64_t cursor = 0u;
+        bool ok = rt->state_pool[b] != NULL;
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            if (ds4_solar_layer_is_gqa(il)) continue;
+            ok = solar_pool_take(&rt->recurrent[b][il], rt->state_pool[b],
+                                 &cursor, recurrent_bytes) &&
+                 solar_pool_take(&rt->q_conv_state[b][il], rt->state_pool[b],
+                                 &cursor, conv_bytes) &&
+                 solar_pool_take(&rt->k_conv_state[b][il], rt->state_pool[b],
+                                 &cursor, conv_bytes) &&
+                 solar_pool_take(&rt->v_conv_state[b][il], rt->state_pool[b],
+                                 &cursor, conv_bytes);
+        }
+        if (!ok || cursor != rt->graph.state_bytes) {
+            solar_batch_runtime_free(rt);
+            return NULL;
+        }
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_solar_layer_is_gqa(il)) continue;
+        const uint64_t bank_bytes =
+            (uint64_t)ctx_size * rt->graph.base.kv_row_bytes;
+        if (bank_bytes == 0u || bank_bytes > UINT64_MAX / max_seq) {
+            solar_batch_runtime_free(rt);
+            return NULL;
+        }
+        rt->kv_bank_bytes[il] = bank_bytes;
+        rt->kv_slab[il] = solar_batch_reserve_or_alloc(bank_bytes * max_seq);
+        if (!rt->kv_slab[il]) {
+            solar_batch_runtime_free(rt);
+            return NULL;
+        }
+        for (uint32_t b = 0; b < max_seq; b++) {
+            rt->kv[b][il] = ds4_gpu_tensor_view(
+                rt->kv_slab[il], (uint64_t)b * bank_bytes, bank_bytes);
+            if (!rt->kv[b][il]) {
+                solar_batch_runtime_free(rt);
+                return NULL;
+            }
+        }
+    }
+    rt->bank_logits = xcalloc((size_t)max_seq * DS4_N_VOCAB,
+                              sizeof(*rt->bank_logits));
+    rt->bank_logits_valid = xcalloc(max_seq, sizeof(*rt->bank_logits_valid));
+    if (!rt->bank_logits || !rt->bank_logits_valid ||
+        !solar_batch_runtime_bind(rt, 0u)) {
+        solar_batch_runtime_free(rt);
+        return NULL;
+    }
+    ds4_log(stderr, DS4_LOG_TIMING,
+            "ds4: Solar batch runtime: %u banks, KDA %.2f MiB/bank, "
+            "GQA KV %.2f GiB virtual/bank\n",
+            max_seq, (double)rt->graph.state_bytes / 1048576.0,
+            (double)rt->graph.base.kv_bytes / 1073741824.0);
+    return rt;
+}
+
 /* ---- W4: persistent batched-generation context -----------------------------
  * Holds the graph + N KV-bank slabs allocated ONCE (sized for up to max_seq
  * sequences and max_total_tokens packed prompt tokens at the given ctx_size),
@@ -35556,9 +35912,9 @@ int ds4_engine_batched_generate(
  * the per-batch metal_graph_alloc_raw_cap + ds4_batch_slabs_alloc from the
  * server's hot path.  The per-call ds4_engine_batched_generate_ex stays for the
  * CLI/W2 paths and as a fallback when a batch exceeds the ctx's limits. */
-#ifndef DS4_NO_GPU
 struct ds4_batch_ctx {
     ds4_engine     *e;
+    ds4_solar_batch_runtime *solar; /* non-NULL selects the Solar dispatch */
     ds4_gpu_graph   g;
     ds4_batch_slabs sl;            /* allocated for max_seq banks */
     ds4_mtp_slabs   msl;           /* S1: per-bank MTP draft banks (only if mtp) */
@@ -36482,9 +36838,86 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
  * class, nothing more. */
 uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
     if (!ctx || want_bytes == 0) return 0;
+    if (ctx->solar) {
+        uint64_t freed = 0u;
+        ds4_solar_batch_runtime *rt = ctx->solar;
+        for (uint32_t b = 0; b < ctx->max_seq && freed < want_bytes; b++) {
+            uint64_t got = ds4_gpu_tensor_trim(
+                rt->state_slab, (uint64_t)b * rt->graph.state_bytes,
+                rt->graph.state_bytes);
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                if (!ds4_solar_layer_is_gqa(il)) continue;
+                got += ds4_gpu_tensor_trim(
+                    rt->kv_slab[il], (uint64_t)b * rt->kv_bank_bytes[il],
+                    rt->kv_bank_bytes[il]);
+            }
+            if (got != 0u) {
+                ctx->bank_gen[b]++;
+                ctx->bank_hist_valid[b] = 0u;
+                ctx->bank_hist_len[b] = 0u;
+                rt->bank_logits_valid[b] = 0u;
+                freed += got;
+                ctx->trim_banks++;
+                ctx->trim_bytes += got;
+            }
+        }
+        return freed;
+    }
     return ds4_batch_trim_free_banks(ctx, &ctx->g, NULL, NULL, NULL,
                                      (uint32_t)ctx->max_seq, -1, want_bytes,
                                      "for the serial lane (reclaim)");
+}
+
+static int solar_batch_ctx_create_impl(
+        ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
+        bool fit, ds4_batch_ctx **out, char *err, size_t errlen) {
+#define SBC_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
+    ds4_batch_ctx *ctx = xcalloc(1, sizeof(*ctx));
+    ctx->e = e;
+    ctx->ctx_size = (uint32_t)ctx_size;
+    ctx->raw_cap = (uint32_t)ctx_size;
+    ctx->seq_cap = (uint32_t)ctx_size;
+    ctx->max_seq = (uint32_t)max_seq;
+
+    for (;;) {
+        ctx->solar = solar_batch_runtime_create(
+            e, ctx->ctx_size, ctx->max_seq, (uint32_t)max_total_tokens);
+        if (ctx->solar) break;
+        if (!fit || ctx->max_seq <= 1u) {
+            SBC_ERR("batch_ctx_create: Solar bank runtime allocation failed "
+                    "(max_seq=%u ctx=%u)", ctx->max_seq, ctx->ctx_size);
+            free(ctx);
+            return 1;
+        }
+        uint32_t next = ctx->max_seq * 3u / 4u;
+        if (next >= ctx->max_seq) next = ctx->max_seq - 1u;
+        if (next < 1u) next = 1u;
+        fprintf(stderr,
+                "ds4: Solar batch fit: runtime allocation failed at "
+                "max_seq=%u, retrying at %u\n",
+                ctx->max_seq, next);
+        ctx->max_seq = next;
+    }
+    ctx->prefill_cap = ctx->solar->graph.base.prefill_cap;
+
+    if ((uint64_t)ctx->max_seq * ctx->seq_cap > SIZE_MAX / sizeof(int)) {
+        SBC_ERR("batch_ctx_create: Solar bank history size overflow");
+        solar_batch_runtime_free(ctx->solar);
+        free(ctx);
+        return 1;
+    }
+    ctx->bank_hist = xmalloc(
+        (size_t)ctx->max_seq * ctx->seq_cap * sizeof(*ctx->bank_hist));
+    ctx->bank_hist_len = xcalloc(ctx->max_seq,
+                                 sizeof(*ctx->bank_hist_len));
+    ctx->bank_hist_valid = xcalloc(ctx->max_seq,
+                                   sizeof(*ctx->bank_hist_valid));
+    ctx->bank_gen = xmalloc(ctx->max_seq * sizeof(*ctx->bank_gen));
+    for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b] = 1u;
+    ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
+    *out = ctx;
+    return 0;
+#undef SBC_ERR
 }
 
 static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
@@ -36502,6 +36935,11 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     if (!ds4_engine_supports_batching(e)) {
         BC_ERR("batch_ctx_create: this model does not yet implement the multi-sequence graph");
         return 1;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        const int rc = solar_batch_ctx_create_impl(
+            e, ctx_size, max_seq, max_total_tokens, fit, out, err, errlen);
+        return rc;
     }
 
     const uint32_t prefill_cap = (uint32_t)max_total_tokens;
@@ -36812,6 +37250,15 @@ int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_t
 
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     if (!ctx) return;
+    if (ctx->solar) {
+        solar_batch_runtime_free(ctx->solar);
+        free(ctx->bank_hist);
+        free(ctx->bank_hist_len);
+        free(ctx->bank_hist_valid);
+        free(ctx->bank_gen);
+        free(ctx);
+        return;
+    }
     ds4_dspark_slabs_free(&ctx->dsl, &ctx->g); /* restores g->dspark_raw_cache before metal_graph_free; no-op if zeroed */
     ds4_mtp_slabs_free(&ctx->msl, &ctx->g);   /* restores g->mtp_* before metal_graph_free; no-op if !mtp */
     ds4_batch_slabs_free(&ctx->sl, &ctx->g);
@@ -37261,6 +37708,11 @@ int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) {
     return ctx ? (int)ctx->seq_cap : 0;
 }
 
+static int solar_engine_batched_generate_ctx(
+        ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
+        const int *max_new_tokens, const int *eos_ids,
+        ds4_batch_gen_result *out, char *err, size_t errlen);
+
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {
@@ -37279,12 +37731,20 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
         if (prompts[i].len <= 0) { BCG_ERR("batched_generate_ctx: prompt %d is empty", i); return 1; }
         const uint32_t L = (uint32_t)prompts[i].len;
         if (L > max_len) max_len = L;
+        if (L > UINT32_MAX - n_packed) {
+            BCG_ERR("batched_generate_ctx: packed prompt size overflow");
+            return 1;
+        }
         n_packed += L;
     }
     if (n_packed > ctx->prefill_cap) {
         BCG_ERR("batched_generate_ctx: Σlen %u exceeds ctx prefill_cap %u", n_packed, ctx->prefill_cap); return 1; }
     if (max_len > ctx->raw_cap) {
         BCG_ERR("batched_generate_ctx: longest prompt %u exceeds ctx raw_cap %u", max_len, ctx->raw_cap); return 1; }
+    if (ctx->solar) {
+        return solar_engine_batched_generate_ctx(
+            ctx, prompts, n, max_new_tokens, eos_ids, out, err, errlen);
+    }
 
     /* Per-seq budgets + EOS, capped to the raw ring (no wrap): prompt+budget <= raw_cap.
      * Log when the cap binds -- a silently shortened budget surfaces as an
@@ -38068,6 +38528,547 @@ static void cont_stats_publish_done(ds4_batch_ctx *ctx, ds4_cont_seq_stats *sst,
     ctx->last_done_set = 1u;
 }
 
+enum {
+    SOLAR_CONT_FREE = 0,
+    SOLAR_CONT_PREFILL = 1,
+    SOLAR_CONT_DECODE = 2,
+};
+
+typedef struct {
+    uint8_t phase;
+    void *user;
+    int *prefill;
+    uint32_t prefill_len;
+    uint32_t prefill_off;
+    uint32_t prefill_base;
+    int *generated;
+    uint32_t generated_len;
+    uint32_t max_new;
+    int current;
+    int eos;
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+    uint64_t rng;
+    int (*sample_override)(void *ud, void *user);
+    int (*alive)(void *ud, void *user);
+    ds4_cont_seq_stats stats;
+} ds4_solar_cont_bank;
+
+static bool solar_cont_history_exact(const ds4_batch_ctx *ctx,
+                                     uint32_t bank,
+                                     const int *tokens,
+                                     uint32_t n) {
+    return ctx && bank < ctx->max_seq && tokens && n != 0u &&
+           ctx->bank_hist_valid[bank] &&
+           ctx->bank_hist_len[bank] == n &&
+           memcmp(ctx->bank_hist + (size_t)bank * ctx->seq_cap,
+                  tokens, (size_t)n * sizeof(*tokens)) == 0;
+}
+
+static uint32_t solar_cont_busy_count(const ds4_solar_cont_bank *bank,
+                                      uint32_t n) {
+    uint32_t busy = 0u;
+    for (uint32_t b = 0; b < n; b++) busy += bank[b].phase != SOLAR_CONT_FREE;
+    return busy;
+}
+
+static void solar_cont_stats_publish_done(ds4_batch_ctx *ctx,
+                                          ds4_solar_cont_bank *bank,
+                                          uint32_t emitted) {
+    bank->stats.decode_tokens = emitted;
+    bank->stats.done_sec = now_sec();
+    ctx->last_done = bank->stats;
+    ctx->last_done_set = 1u;
+}
+
+static void solar_cont_publish_empty(
+        ds4_batch_ctx *ctx, ds4_solar_cont_bank *bank, uint32_t b,
+        void (*on_done)(void *, void *, const int *, int, int), void *ud) {
+    const int empty = 0;
+    void *user = bank[b].user;
+    free(bank[b].prefill);
+    bank[b].prefill = NULL;
+    bank[b].phase = SOLAR_CONT_FREE;
+    bank[b].user = NULL;
+    solar_cont_stats_publish_done(ctx, &bank[b], 0u);
+    on_done(ud, user, &empty, 0, 0);
+}
+
+static void solar_cont_publish_generated(
+        ds4_batch_ctx *ctx, ds4_solar_cont_bank *bank, uint32_t b,
+        int finish,
+        void (*on_done)(void *, void *, const int *, int, int), void *ud) {
+    void *user = bank[b].user;
+    int *generated = bank[b].generated;
+    const uint32_t n = bank[b].generated_len;
+    bank[b].generated = NULL;
+    bank[b].generated_len = 0u;
+    bank[b].phase = SOLAR_CONT_FREE;
+    bank[b].user = NULL;
+    solar_cont_stats_publish_done(ctx, &bank[b], n);
+    on_done(ud, user, generated, (int)n, finish);
+    free(generated);
+}
+
+/* Correctness-first Solar scheduler.  Admission/prefill/decode all use the
+ * same public continuous contract as upstream ds4, while each forward binds
+ * one independent KDA+KV bank into the shared plain graph.  This first tier
+ * removes per-request graph allocation and gives the server safe rolling
+ * admission.  A later bank-aware CUDA forward fuses the serial bank loop for
+ * throughput; the state/lifecycle contract below remains its oracle. */
+static int solar_engine_continuous_generate(
+        ds4_batch_ctx *ctx,
+        int (*admit)(void *ud, ds4_cont_request *req),
+        int (*on_token)(void *ud, void *user, int token),
+        void (*on_done)(void *ud, void *user,
+                        const int *tokens, int n, int finish),
+        void *ud, char *err, size_t errlen) {
+#define SCG_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
+    ds4_solar_batch_runtime *rt = ctx->solar;
+    const uint32_t MS = ctx->max_seq;
+    ds4_solar_cont_bank *bank = xcalloc(MS, sizeof(*bank));
+    uint32_t *credit_end = xcalloc(MS, sizeof(*credit_end));
+    uint32_t prefill_cursor = 0u;
+    bool ok = rt != NULL && credit_end != NULL;
+    ctx->last_done_set = 0u;
+    ds4_metric_set(&ds4_metrics_get()->banks_live, 0u);
+
+    while (ok) {
+        bool admit_returned_none = false;
+
+        /* Fill every currently free slot.  The callback is not polled when no
+         * slot exists, matching the existing server's backpressure contract. */
+        while (solar_cont_busy_count(bank, MS) < MS) {
+            ds4_cont_request req;
+            memset(&req, 0, sizeof(req));
+            if (!admit(ud, &req)) {
+                admit_returned_none = true;
+                break;
+            }
+
+            if (!req.tokens || req.n <= 0 ||
+                (uint32_t)req.n > ctx->seq_cap) {
+                ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1u);
+                on_done(ud, req.user, NULL, 0, 0);
+                continue;
+            }
+
+            int src = req.fork_bank > 0 ? req.fork_bank - 1 : -1;
+            int target = req.place_bank > 0 ? req.place_bank - 1 : -1;
+            if (target >= 0 &&
+                ((uint32_t)target >= MS ||
+                 bank[target].phase != SOLAR_CONT_FREE)) {
+                ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1u);
+                on_done(ud, req.user, NULL, 0, 0);
+                continue;
+            }
+            if (target < 0) {
+                /* Preserve a fork source when another target is available. */
+                for (uint32_t b = 0; b < MS; b++) {
+                    if (bank[b].phase == SOLAR_CONT_FREE && (int)b != src) {
+                        target = (int)b;
+                        break;
+                    }
+                }
+                if (target < 0 && src >= 0 && (uint32_t)src < MS &&
+                    bank[src].phase == SOLAR_CONT_FREE) {
+                    target = src;
+                }
+                if (target < 0) break;
+            }
+            const uint32_t b = (uint32_t)target;
+
+            const uint32_t requested_new = req.max_new > 0
+                ? (uint32_t)req.max_new : 1u;
+            const uint32_t room = ctx->seq_cap > (uint32_t)req.n
+                ? ctx->seq_cap - (uint32_t)req.n : 1u;
+            uint32_t effective_new = requested_new < room
+                ? requested_new : room;
+            if (effective_new == 0u) effective_new = 1u;
+            /* The last sampled token is not forwarded, so the maximum KV
+             * frontier is prompt + max_new - 1.  Charge every live bank's
+             * still-unmapped credited extent against the operator floor
+             * before mutating the candidate bank. */
+            uint64_t projected_end64 =
+                (uint64_t)req.n + effective_new - 1u;
+            if (projected_end64 > ctx->seq_cap)
+                projected_end64 = ctx->seq_cap;
+            const uint64_t projected_need =
+                solar_batch_runtime_projected_need(
+                    rt, credit_end, b, (uint32_t)projected_end64);
+            const uint64_t usable =
+                ds4_mem_usable_beyond(ctx->serial_reserve);
+            if (projected_need == UINT64_MAX ||
+                (usable != UINT64_MAX && projected_need > usable)) {
+                ctx->mem_rejects++;
+                ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1u);
+                on_done(ud, req.user, NULL, 0, 0);
+                continue;
+            }
+
+            uint32_t cached = 0u;
+            bool forked = false;
+            bool warm = false;
+            const uint32_t requested_cached =
+                req.n_cached > 0 && req.n_cached <= req.n
+                    ? (uint32_t)req.n_cached : 0u;
+
+            if (src >= 0 && requested_cached != 0u) {
+                const bool source_ok =
+                    (uint32_t)src < MS &&
+                    bank[src].phase == SOLAR_CONT_FREE &&
+                    solar_cont_history_exact(
+                        ctx, (uint32_t)src, req.tokens, requested_cached);
+                if (source_ok) {
+                    if ((uint32_t)src != b) {
+                        if (!solar_batch_runtime_copy_bank(
+                                rt, (uint32_t)src, b, requested_cached)) {
+                            ctx->bank_gen[b]++;
+                            ctx->bank_hist_valid[b] = 0u;
+                            SCG_ERR("continuous_generate: Solar fork copy failed "
+                                    "src=%d dst=%u", src, b);
+                            ok = false;
+                            break;
+                        }
+                        memcpy(ctx->bank_hist + (size_t)b * ctx->seq_cap,
+                               ctx->bank_hist + (size_t)src * ctx->seq_cap,
+                               (size_t)requested_cached * sizeof(int));
+                        ctx->bank_gen[b]++;
+                        ctx->bank_hist_len[b] = requested_cached;
+                        ctx->bank_hist_valid[b] = 1u;
+                    }
+                    cached = requested_cached;
+                    forked = true;
+                } else {
+                    ctx->fork_rejects++;
+                }
+            } else if (requested_cached != 0u && req.place_bank > 0 &&
+                       solar_cont_history_exact(
+                           ctx, b, req.tokens, requested_cached)) {
+                cached = requested_cached;
+                warm = true;
+            } else if (requested_cached != 0u) {
+                ctx->warm_rejects++;
+            }
+
+            /* A zero-suffix reuse needs its retained logits.  Old/persisted
+             * records without them safely degrade to a cold replay. */
+            if (cached == (uint32_t)req.n &&
+                !rt->bank_logits_valid[b]) {
+                cached = 0u;
+                warm = false;
+                if (forked) ctx->fork_rejects++;
+                forked = false;
+            }
+
+            if (forked) {
+                ctx->fork_admits++;
+                ds4_metric_add(&ds4_metrics_get()->admits_fork, 1u);
+            } else if (warm) {
+                ctx->warm_admits++;
+                ds4_metric_add(&ds4_metrics_get()->admits_warm, 1u);
+            }
+
+            if (!solar_batch_runtime_ensure_state(rt, b) ||
+                !solar_batch_runtime_ensure_kv(rt, b, (uint32_t)req.n)) {
+                ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1u);
+                on_done(ud, req.user, NULL, 0, 0);
+                continue;
+            }
+            if (cached == 0u) {
+                if (!solar_batch_runtime_reset_bank(rt, b)) {
+                    SCG_ERR("continuous_generate: Solar bank %u reset failed", b);
+                    ok = false;
+                    break;
+                }
+                bank_hist_reset(ctx, b);
+                ds4_metric_add(&ds4_metrics_get()->admits_cold, 1u);
+            }
+
+            ds4_solar_cont_bank *sb = &bank[b];
+            sb->phase = SOLAR_CONT_PREFILL;
+            sb->user = req.user;
+            sb->prefill_base = cached;
+            sb->prefill_len = (uint32_t)req.n - cached;
+            sb->prefill_off = 0u;
+            if (sb->prefill_len != 0u) {
+                sb->prefill = xmalloc(
+                    (size_t)sb->prefill_len * sizeof(*sb->prefill));
+                memcpy(sb->prefill, req.tokens + cached,
+                       (size_t)sb->prefill_len * sizeof(*sb->prefill));
+            }
+            sb->max_new = effective_new;
+            sb->eos = req.eos >= 0 ? req.eos : ctx->e->vocab.eos_id;
+            sb->temperature = req.temperature;
+            sb->top_k = req.top_k;
+            sb->top_p = req.top_p;
+            sb->min_p = req.min_p;
+            sb->rng = req.seed;
+            sb->sample_override = req.sample_override;
+            sb->alive = req.alive;
+            memset(&sb->stats, 0, sizeof(sb->stats));
+            sb->stats.admit_sec = now_sec();
+            sb->stats.prefill_cached = cached;
+            sb->stats.prefill_computed = (uint32_t)req.n - cached;
+            ds4_metric_add(&ds4_metrics_get()->tokens_prefilled_cached, cached);
+            if (req.bank_used) *req.bank_used = (int)b;
+
+            if (req.on_admitted &&
+                !req.on_admitted(ud, req.user, (int)cached,
+                                 req.n - (int)cached, (int)b)) {
+                solar_cont_publish_empty(ctx, bank, b, on_done, ud);
+                credit_end[b] = 0u;
+                continue;
+            }
+            credit_end[b] = (uint32_t)projected_end64;
+
+        }
+        if (!ok) break;
+
+        /* Advance one pending prompt chunk per pass.  This bounds the stall
+         * imposed on already-live decodes by one Solar prefill forward. */
+        uint32_t pb = MS;
+        for (uint32_t i = 0; i < MS; i++) {
+            const uint32_t cand = (prefill_cursor + i) % MS;
+            if (bank[cand].phase == SOLAR_CONT_PREFILL) {
+                pb = cand;
+                prefill_cursor = (cand + 1u) % MS;
+                break;
+            }
+        }
+        if (pb < MS) {
+            ds4_solar_cont_bank *sb = &bank[pb];
+            if (sb->alive && !sb->alive(ud, sb->user)) {
+                solar_cont_publish_empty(ctx, bank, pb, on_done, ud);
+                credit_end[pb] = 0u;
+            } else {
+                const uint32_t remain = sb->prefill_len - sb->prefill_off;
+                if (remain != 0u) {
+                    uint32_t n = remain;
+                    if (n > rt->graph.base.prefill_cap)
+                        n = rt->graph.base.prefill_cap;
+                    const uint32_t pos = sb->prefill_base + sb->prefill_off;
+                    const bool final = n == remain;
+                    if (!solar_batch_runtime_ensure_kv(rt, pb, pos + n) ||
+                        !solar_batch_runtime_bind(rt, pb) ||
+                        !solar_graph_prefill_chunk(
+                            &rt->graph, &ctx->e->model, &ctx->e->weights,
+                            sb->prefill + sb->prefill_off, n, pos, final)) {
+                        ctx->bank_gen[pb]++;
+                        ctx->bank_hist_valid[pb] = 0u;
+                        SCG_ERR("continuous_generate: Solar prefill failed "
+                                "bank=%u pos=%u n=%u", pb, pos, n);
+                        ok = false;
+                        break;
+                    }
+                    bank_hist_append_n(
+                        ctx, pb, sb->prefill + sb->prefill_off, n);
+                    sb->prefill_off += n;
+                    ds4_metric_add(
+                        &ds4_metrics_get()->tokens_prefilled_computed, n);
+                    ds4_metrics_window_add(0u, 0u, n);
+                    if (final && !solar_batch_runtime_read_logits(rt, pb)) {
+                        ctx->bank_gen[pb]++;
+                        ctx->bank_hist_valid[pb] = 0u;
+                        SCG_ERR("continuous_generate: Solar prefill logits "
+                                "read failed for bank=%u", pb);
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if (sb->prefill_off == sb->prefill_len) {
+                    if (!rt->bank_logits_valid[pb]) {
+                        SCG_ERR("continuous_generate: Solar bank %u has no "
+                                "frontier logits", pb);
+                        ok = false;
+                        break;
+                    }
+                    const float temperature =
+                        sb->sample_override &&
+                        sb->sample_override(ud, sb->user)
+                            ? 0.0f : sb->temperature;
+                    const int token = sample_top_p_min_p(
+                        rt->bank_logits + (size_t)pb * DS4_N_VOCAB,
+                        DS4_N_VOCAB, temperature, sb->top_k,
+                        sb->top_p, sb->min_p, &sb->rng);
+                    free(sb->prefill);
+                    sb->prefill = NULL;
+                    sb->generated = xmalloc(
+                        (size_t)sb->max_new * sizeof(*sb->generated));
+                    sb->generated[0] = token;
+                    sb->generated_len = 1u;
+                    sb->current = token;
+                    sb->stats.first_token_sec = now_sec();
+                    ds4_metric_add(&ds4_metrics_get()->tokens_decoded, 1u);
+                    ds4_metrics_window_add(1u, 0u, 0u);
+                    const bool hit_eos = token == sb->eos;
+                    const bool aborted = !hit_eos && on_token &&
+                        !on_token(ud, sb->user, token);
+                    if (hit_eos || sb->generated_len >= sb->max_new || aborted) {
+                        solar_cont_publish_generated(
+                            ctx, bank, pb, hit_eos ? 1 : 0,
+                            on_done, ud);
+                        credit_end[pb] = 0u;
+                    } else {
+                        sb->phase = SOLAR_CONT_DECODE;
+                    }
+                }
+            }
+        }
+        if (!ok) break;
+
+        /* Correctness oracle: one bank-bound decode forward per live row.
+         * The upcoming CUDA multi-bank primitive replaces this loop without
+         * changing admission, history, sampling, or callback behavior. */
+        for (uint32_t b = 0; ok && b < MS; b++) {
+            ds4_solar_cont_bank *sb = &bank[b];
+            if (sb->phase != SOLAR_CONT_DECODE) continue;
+            const uint32_t pos = ctx->bank_hist_len[b];
+            if (pos >= ctx->seq_cap ||
+                !solar_batch_runtime_ensure_kv(rt, b, pos + 1u) ||
+                !solar_batch_runtime_bind(rt, b) ||
+                !solar_graph_decode(
+                    &rt->graph, &ctx->e->model, &ctx->e->weights,
+                    sb->current, pos) ||
+                !solar_batch_runtime_read_logits(rt, b)) {
+                ctx->bank_gen[b]++;
+                ctx->bank_hist_valid[b] = 0u;
+                SCG_ERR("continuous_generate: Solar decode failed "
+                        "bank=%u pos=%u", b, pos);
+                ok = false;
+                break;
+            }
+            bank_hist_append(ctx, b, sb->current);
+            sb->stats.decode_steps++;
+            ds4_metric_add(&ds4_metrics_get()->decode_steps, 1u);
+
+            const float temperature =
+                sb->sample_override && sb->sample_override(ud, sb->user)
+                    ? 0.0f : sb->temperature;
+            const int token = sample_top_p_min_p(
+                rt->bank_logits + (size_t)b * DS4_N_VOCAB,
+                DS4_N_VOCAB, temperature, sb->top_k,
+                sb->top_p, sb->min_p, &sb->rng);
+            sb->generated[sb->generated_len++] = token;
+            sb->current = token;
+            ds4_metric_add(&ds4_metrics_get()->tokens_decoded, 1u);
+            ds4_metrics_window_add(1u, 1u, 0u);
+            const bool hit_eos = token == sb->eos;
+            const bool aborted = !hit_eos && on_token &&
+                !on_token(ud, sb->user, token);
+            if (hit_eos || sb->generated_len >= sb->max_new || aborted) {
+                solar_cont_publish_generated(
+                    ctx, bank, b, hit_eos ? 1 : 0, on_done, ud);
+                credit_end[b] = 0u;
+            }
+        }
+
+        const uint32_t busy = solar_cont_busy_count(bank, MS);
+        uint32_t live = 0u;
+        for (uint32_t b = 0; b < MS; b++)
+            live += bank[b].phase == SOLAR_CONT_DECODE;
+        ds4_metric_set(&ds4_metrics_get()->banks_live, live);
+        if (ok && busy == 0u && admit_returned_none) break;
+    }
+
+    if (!ok) {
+        ds4_metric_add(&ds4_metrics_get()->cont_batch_failures, 1u);
+        for (uint32_t b = 0; b < MS; b++) {
+            if (bank[b].phase != SOLAR_CONT_FREE) {
+                ctx->bank_gen[b]++;
+                ctx->bank_hist_valid[b] = 0u;
+            }
+        }
+    }
+    for (uint32_t b = 0; b < MS; b++) {
+        free(bank[b].prefill);
+        free(bank[b].generated);
+    }
+    free(bank);
+    free(credit_end);
+    ds4_metric_set(&ds4_metrics_get()->banks_live, 0u);
+    return ok ? 0 : 1;
+#undef SCG_ERR
+}
+
+typedef struct {
+    const ds4_tokens *prompts;
+    const int *max_new;
+    const int *eos;
+    ds4_batch_gen_result *out;
+    int n;
+    int next;
+    int completed;
+    int failed;
+} ds4_solar_static_batch;
+
+static int solar_static_admit(void *ud, ds4_cont_request *req) {
+    ds4_solar_static_batch *batch = ud;
+    if (batch->next >= batch->n) return 0;
+    const int i = batch->next++;
+    memset(req, 0, sizeof(*req));
+    req->tokens = batch->prompts[i].v;
+    req->n = batch->prompts[i].len;
+    req->max_new = batch->max_new && batch->max_new[i] > 0
+        ? batch->max_new[i] : 1;
+    req->eos = batch->eos ? batch->eos[i] : -1;
+    req->user = (void *)(uintptr_t)(i + 1);
+    return 1;
+}
+
+static void solar_static_done(void *ud, void *user,
+                              const int *tokens, int n, int finish) {
+    ds4_solar_static_batch *batch = ud;
+    const int i = (int)(uintptr_t)user - 1;
+    if (!tokens) {
+        batch->failed = 1;
+    } else {
+        batch->out[i].tokens = xmalloc(
+            (size_t)(n > 0 ? n : 1) * sizeof(*batch->out[i].tokens));
+        if (n > 0) {
+            memcpy(batch->out[i].tokens, tokens,
+                   (size_t)n * sizeof(*tokens));
+        }
+        batch->out[i].n_tokens = n;
+        batch->out[i].finish = finish;
+        batch->completed++;
+    }
+}
+
+static int solar_engine_batched_generate_ctx(
+        ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
+        const int *max_new_tokens, const int *eos_ids,
+        ds4_batch_gen_result *out, char *err, size_t errlen) {
+    ds4_solar_static_batch batch = {
+        .prompts = prompts,
+        .max_new = max_new_tokens,
+        .eos = eos_ids,
+        .out = out,
+        .n = n,
+    };
+    const int rc = solar_engine_continuous_generate(
+        ctx, solar_static_admit, NULL, solar_static_done,
+        &batch, err, errlen);
+    if (rc != 0 || batch.failed || batch.completed != n) {
+        if (err && errlen && err[0] == '\0') {
+            snprintf(err, errlen,
+                     "batched_generate_ctx: Solar continuous adapter "
+                     "completed %d/%d", batch.completed, n);
+        }
+        for (int i = 0; i < n; i++) {
+            free(out[i].tokens);
+            out[i].tokens = NULL;
+            out[i].n_tokens = 0;
+            out[i].finish = 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                    int (*admit)(void *ud, ds4_cont_request *req),
                                    int (*on_token)(void *ud, void *user, int token),
@@ -38081,6 +39082,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (!ds4_engine_supports_batching(ctx->e)) {
         CG_ERR("continuous_generate: this model does not yet implement the multi-sequence graph");
         return 1;
+    }
+    if (ctx->solar) {
+        const int rc = solar_engine_continuous_generate(
+            ctx, admit, on_token, on_done, ud, err, errlen);
+        return rc;
     }
 
     ds4_gpu_graph     *g       = &ctx->g;
@@ -41917,10 +42923,7 @@ bool ds4_engine_supports_batching(ds4_engine *e) {
     if (!e || !ds4_backend_uses_graph(e->backend) || !e->metal_ready) {
         return false;
     }
-    /* Solar currently owns a scalar plain-residual graph.  Step 5 promotes
-     * that same base to multi-sequence state; the server capability flips
-     * here when the implementation and isolation gates are complete. */
-    return DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_SOLAR_OPEN2;
+    return true;
 }
 
 int ds4_engine_model_id(ds4_engine *e) {
