@@ -24854,7 +24854,7 @@ extern "C" int ds4_gpu_swiglu_weighted_tensor(
     return cuda_ok(cudaGetLastError(), "weighted SwiGLU launch");
 }
 
-extern "C" int ds4_gpu_routed_matmul_tensor(
+static int routed_matmul_tensor_impl(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *ids,
@@ -24867,7 +24867,8 @@ extern "C" int ds4_gpu_routed_matmul_tensor(
         uint32_t                out_dim,
         uint32_t                n_expert,
         uint32_t                n_tokens,
-        uint32_t                n_expert_used) {
+        uint32_t                n_expert_used,
+        uint32_t                max_rows_per_expert) {
     if (!out || !x || !ids || !model_map || in_dim == 0u ||
         (in_dim & 255u) != 0u || out_dim == 0u || n_expert == 0u ||
         n_tokens == 0u || n_expert_used == 0u ||
@@ -24886,7 +24887,9 @@ extern "C" int ds4_gpu_routed_matmul_tensor(
         assignments * out_dim > UINT64_MAX / sizeof(float) ||
         x->bytes < x_count * sizeof(float) ||
         ids->bytes < assignments * sizeof(int32_t) ||
-        out->bytes < assignments * out_dim * sizeof(float)) {
+        out->bytes < assignments * out_dim * sizeof(float) ||
+        max_rows_per_expert > assignments ||
+        max_rows_per_expert > (uint32_t)INT_MAX) {
         return 0;
     }
 
@@ -24930,6 +24933,14 @@ extern "C" int ds4_gpu_routed_matmul_tensor(
     const int NE = (int)n_expert;
     const int NU = (int)n_expert_used;
     const bool use_vec = assignments <= 8u;
+    const char *bound_global = getenv("DS4_MMQ_EXPERT_BOUND");
+    const char *bound_type = weight_type == 11u
+        ? getenv("DS4_MMQ_Q3_BOUND")
+        : weight_type == 12u ? getenv("DS4_MMQ_Q4_BOUND") : NULL;
+    const bool use_bucket_bound =
+        !use_vec && max_rows_per_expert > 0u &&
+        !(bound_global && bound_global[0] == '0') &&
+        !(bound_type && bound_type[0] == '0');
     const cudaStream_t stream = ds4_current_stream();
     int rc = -1;
     switch (weight_type) {
@@ -24946,12 +24957,44 @@ extern "C" int ds4_gpu_routed_matmul_tensor(
     case 11u:
         rc = use_vec
             ? ds4_mmq_q3_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
-            : ds4_mmq_q3_K_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+            : use_bucket_bound
+                ? ds4_mmq_q3_K_moe_bounded(
+                      weights, xp, idp, op, M, K, NT, NE, NU,
+                      (int)max_rows_per_expert, stream)
+                : ds4_mmq_q3_K_moe(
+                      weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        if (use_bucket_bound) {
+            static bool logged_q3_bound = false;
+            if (!logged_q3_bound) {
+                logged_q3_bound = true;
+                fprintf(stderr,
+                        "ds4: Q3_K routed MMQ expert-bucket bound active "
+                        "(rows=%llu bound=%u)\n",
+                        (unsigned long long)assignments,
+                        max_rows_per_expert);
+            }
+        }
         break;
     case 12u:
         rc = use_vec
             ? ds4_mmq_q4_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
-            : ds4_mmq_q4_K_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+            : use_bucket_bound
+                ? ds4_mmq_q4_K_moe_bounded(
+                      weights, xp, idp, op, M, K, NT, NE, NU,
+                      (int)max_rows_per_expert, stream)
+                : ds4_mmq_q4_K_moe(
+                      weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        if (use_bucket_bound) {
+            static bool logged_q4_bound = false;
+            if (!logged_q4_bound) {
+                logged_q4_bound = true;
+                fprintf(stderr,
+                        "ds4: Q4_K routed MMQ expert-bucket bound active "
+                        "(rows=%llu bound=%u)\n",
+                        (unsigned long long)assignments,
+                        max_rows_per_expert);
+            }
+        }
         break;
     case 16u:
         rc = use_vec
@@ -24966,6 +25009,48 @@ extern "C" int ds4_gpu_routed_matmul_tensor(
         return 0;
     }
     return cuda_ok(cudaGetLastError(), "routed quantized matmul launch");
+}
+
+extern "C" int ds4_gpu_routed_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used) {
+    return routed_matmul_tensor_impl(
+        out, x, ids, model_map, model_size, weight_offset, weight_bytes,
+        weight_type, in_dim, out_dim, n_expert, n_tokens, n_expert_used,
+        /*max_rows_per_expert=*/0u);
+}
+
+extern "C" int ds4_gpu_routed_matmul_bounded_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used,
+        uint32_t                max_rows_per_expert) {
+    if (max_rows_per_expert == 0u) return 0;
+    return routed_matmul_tensor_impl(
+        out, x, ids, model_map, model_size, weight_offset, weight_bytes,
+        weight_type, in_dim, out_dim, n_expert, n_tokens, n_expert_used,
+        max_rows_per_expert);
 }
 
 extern "C" int ds4_gpu_routed_gate_up_tensor(

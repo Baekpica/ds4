@@ -15963,14 +15963,18 @@ static bool plain_graph_layer_tail(ds4_plain_gpu_graph *g,
                 routed_mid, routed_gate, routed_up, router_weights,
                 n_ff_exp,
                 (uint64_t)n_tokens * n_used * n_ff_exp) ||
-        !ds4_gpu_routed_matmul_tensor(
+        /* selected is top-k without replacement for each forward token.
+         * After [token, slot] is flattened for down, one expert can therefore
+         * own at most n_tokens rows even though the MMQ input has
+         * n_tokens*n_used single-slot rows. */
+        !ds4_gpu_routed_matmul_bounded_tensor(
                 routed_down, routed_mid, selected,
                 model->map, model->size,
                 layer->ffn_down_exps->abs_offset,
                 layer->ffn_down_exps->bytes,
                 layer->ffn_down_exps->type,
                 n_ff_exp, (uint32_t)g->n_embd, DS4_N_EXPERT,
-                n_tokens * n_used, 1u)) {
+                n_tokens * n_used, 1u, n_tokens)) {
         return false;
     }
 

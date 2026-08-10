@@ -259,6 +259,24 @@ int ds4_mmq_q3_K_moe(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// Same result/layout as the unbounded entry, but the caller supplies a
+// proven upper bound on rows routed to one expert.  Router-generated
+// expert_bounds remains authoritative for every read and write; the bound
+// only permits compact launch geometry.  A unique top-k router can safely
+// use the unflattened forward-token count after [token, slot] is flattened.
+int ds4_mmq_q3_K_moe_bounded(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
+    cudaStream_t    stream);
+
 // ds4 (P4 Inc3): same contract as ds4_mmq_q2_K_moe but W_soa is the aligned
 // row-pair-SoA artifact (weight server --repack-q2k-aligned, layout in
 // ds4_mmq_q2_k_aligned_bytes' comment) instead of the raw block stream.  The
@@ -290,6 +308,19 @@ int ds4_mmq_q4_K_moe(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q4_K_moe_bounded(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
     cudaStream_t    stream);
 
 // Paired MoE entries. Compute gate AND up over the same activation in a

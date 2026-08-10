@@ -1950,6 +1950,26 @@ int ds4_gpu_routed_matmul_tensor(
         uint32_t                n_tokens,
         uint32_t                n_expert_used);
 
+/* Bounded wide-prefill variant.  max_rows_per_expert must be a caller-proven
+ * upper bound for the selected-id table; the GPU-generated expert bounds
+ * remain authoritative.  The regular entry above preserves the generic ABI
+ * and launch geometry for callers without that proof. */
+int ds4_gpu_routed_matmul_bounded_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used,
+        uint32_t                max_rows_per_expert);
+
 /* Paired routed gate/up projection.  The aligned IQ2 artifact tier shares
  * one activation quantization and one assignment schedule; other types use
  * the established single-projection fallback. */
