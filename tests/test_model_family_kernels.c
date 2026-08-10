@@ -31,6 +31,11 @@ enum {
      * aligned routed gate/up pair path, including ragged expert buckets. */
     T_IQ2_OUT = 128,
     T_IQ2_TOKENS = 128,
+    /* 512 also satisfies the dense MMQ row-padding contract, so the test's
+     * verify mode byte-diffs the producer mirror against the real reference
+     * quantizer instead of declining the diagnostic. */
+    T_NORM_DIM = 512,
+    T_NORM_ROWS = 64,
 };
 
 typedef struct {
@@ -323,6 +328,51 @@ static void test_weighted_swiglu(void) {
     free(got); free(want); free(weights); free(up); free(gate);
 }
 
+static void test_rms_norm_q8_producer(void *map, uint64_t map_size,
+                                      uint64_t norm_off) {
+    const size_t count = (size_t)T_NORM_ROWS * T_NORM_DIM;
+    float *x = malloc(count * sizeof(*x));
+    float *want = malloc(count * sizeof(*want));
+    float *got = malloc(count * sizeof(*got));
+    float *weight = (float *)((unsigned char *)map + norm_off);
+    REQUIRE(x && want && got, "RMS Q8 producer host arrays");
+    for (uint32_t i = 0; i < T_NORM_DIM; i++) {
+        weight[i] = 0.75f + 0.003f * (float)(i % 67u);
+    }
+    for (uint32_t row = 0; row < T_NORM_ROWS; row++) {
+        double sum = 0.0;
+        for (uint32_t i = 0; i < T_NORM_DIM; i++) {
+            const size_t at = (size_t)row * T_NORM_DIM + i;
+            x[at] = 1.2f * sinf(0.007f * (float)(at + 1u)) +
+                    0.4f * cosf(0.019f * (float)(at + 5u));
+            sum += (double)x[at] * x[at];
+        }
+        const float scale = 1.0f /
+            sqrtf((float)(sum / (double)T_NORM_DIM) + 1.0e-6f);
+        for (uint32_t i = 0; i < T_NORM_DIM; i++) {
+            const size_t at = (size_t)row * T_NORM_DIM + i;
+            want[at] = x[at] * scale * weight[i];
+        }
+    }
+
+    ds4_gpu_tensor *dx = ds4_gpu_tensor_alloc(count * sizeof(float));
+    ds4_gpu_tensor *dy = ds4_gpu_tensor_alloc(count * sizeof(float));
+    REQUIRE(dx && dy, "RMS Q8 producer tensors");
+    REQUIRE(ds4_gpu_tensor_write(dx, 0, x, count * sizeof(float)),
+            "write RMS Q8 producer input");
+    REQUIRE(ds4_gpu_rms_norm_weight_rows_q8_tensor(
+                dy, dx, map, map_size, norm_off,
+                T_NORM_DIM, T_NORM_ROWS, 1.0e-6f),
+            "RMS norm with Q8 producer");
+    REQUIRE(ds4_gpu_tensor_read(dy, 0, got, count * sizeof(float)),
+            "read RMS Q8 producer output");
+    compare_f32("RMS norm Q8 producer vs CPU", got, want, count,
+                3.0e-6, 3.0e-6);
+
+    ds4_gpu_tensor_free(dy); ds4_gpu_tensor_free(dx);
+    free(got); free(want); free(x);
+}
+
 static uint32_t next_u32(uint32_t *state) {
     *state = *state * 1664525u + 1013904223u;
     return *state;
@@ -544,6 +594,7 @@ int main(void) {
     const uint64_t embed_off = 4096u;
     const uint64_t embed_bytes = (uint64_t)T_VOCAB * (T_EMBD / 32u) * 34u;
     const uint64_t bias_off = (embed_off + embed_bytes + 4095u) & ~4095ull;
+    const uint64_t norm_off = bias_off + 2048u;
     const uint64_t q3_off = bias_off + 4096u;
     const uint64_t q3_bytes =
         (uint64_t)T_MOE_EXPERT * T_MOE_OUT * sizeof(test_block_q3_k);
@@ -570,6 +621,7 @@ int main(void) {
     test_embedding(map, map_size, embed_off);
     test_router(map, map_size, bias_off);
     test_weighted_swiglu();
+    test_rms_norm_q8_producer(map, map_size, norm_off);
     test_q3_routed_matmul(map, map_size, q3_off, q3_bytes);
     test_iq2_aligned_pair(map, map_size, iq2_gate_off, iq2_up_off,
                           iq2_bytes);

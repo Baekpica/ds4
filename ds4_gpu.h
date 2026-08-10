@@ -1042,6 +1042,21 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+/* CUDA prefill producer: writes the same f32 RMS-norm result as the classic
+ * rows entry and, when profitable, also publishes its exact internal Q8_1
+ * activation mirror for following dense/MoE consumers.  The optimization is
+ * transparent: unsupported widths/backends and the runtime kill switch still
+ * produce the classic f32 output. */
+int ds4_gpu_rms_norm_weight_rows_q8_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
+
 /* v0.5 inc-12c: dual-emit variant -- out gets the identical f32 result and
  * out_f16 the __float2half of the same value (bit-identical to running the
  * classic entry followed by a f32->f16 convert launch).  Returns 0 with both

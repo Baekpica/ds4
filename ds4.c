@@ -15902,7 +15902,7 @@ static bool plain_graph_layer_tail(ds4_plain_gpu_graph *g,
     if (!plain_graph_matmul_tensor(attn_out, model, layer->attn_output,
                                    g->q_dim, g->n_embd, heads, n_tokens) ||
         !plain_graph_add_inplace(x, attn_out, residual_count) ||
-        !ds4_gpu_rms_norm_weight_rows_tensor(
+        !ds4_gpu_rms_norm_weight_rows_q8_tensor(
                 norm, x, model->map, model->size,
                 layer->ffn_norm->abs_offset, (uint32_t)g->n_embd,
                 n_tokens, DS4_RMS_EPS)) {
@@ -16088,7 +16088,7 @@ static bool solar_graph_gqa_layer(ds4_solar_gpu_graph *solar,
     ds4_gpu_tensor *attn_out = batch ? ws->attn_out : g->attn_out;
     ds4_gpu_tensor *ffn_out = batch ? ws->ffn_out : g->ffn_out;
 
-    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+    if (!ds4_gpu_rms_norm_weight_rows_q8_tensor(
                 norm, x, model->map, model->size,
                 layer->attn_norm->abs_offset, (uint32_t)g->n_embd,
                 n_tokens, DS4_RMS_EPS) ||
@@ -16153,7 +16153,7 @@ static bool solar_graph_kda_layer(ds4_solar_gpu_graph *solar,
     ds4_gpu_tensor *attn_out = batch ? ws->attn_out : g->attn_out;
     ds4_gpu_tensor *ffn_out = batch ? ws->ffn_out : g->ffn_out;
 
-    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+    if (!ds4_gpu_rms_norm_weight_rows_q8_tensor(
                 norm, x, model->map, model->size,
                 layer->attn_norm->abs_offset, (uint32_t)g->n_embd,
                 n_tokens, DS4_RMS_EPS) ||
@@ -35924,7 +35924,7 @@ static bool solar_batch_runtime_gqa_decode_layer(
     struct ds4_plain_batch_ws *ws = g->batch;
     const ds4_layer_weights *layer = &weights->layer[il];
     if (!ws || !rt->kv_slab[il] || n_tokens < 2u) return false;
-    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+    if (!ds4_gpu_rms_norm_weight_rows_q8_tensor(
                 ws->norm, x, model->map, model->size,
                 layer->attn_norm->abs_offset, (uint32_t)g->n_embd,
                 n_tokens, DS4_RMS_EPS) ||
@@ -35977,7 +35977,7 @@ static bool solar_batch_runtime_kda_decode_layer(
     const uint64_t kda_dim =
         (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM;
     if (!ws || n_tokens < 2u) return false;
-    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+    if (!ds4_gpu_rms_norm_weight_rows_q8_tensor(
                 ws->norm, x, model->map, model->size,
                 layer->attn_norm->abs_offset, (uint32_t)g->n_embd,
                 n_tokens, DS4_RMS_EPS) ||

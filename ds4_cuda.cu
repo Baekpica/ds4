@@ -141,6 +141,10 @@ static int g_model_cache_full;
 static uint64_t g_substrate_promotable_total;
 static uint64_t g_substrate_promotable_covered;
 
+/* Defined with the norm producer registry below; cleanup lives earlier in
+ * this translation unit, so keep the lifecycle hook visible here. */
+static void cuda_norm_q8_release(void);
+
 static void cuda_substrate_cover(const void *model_map, uint64_t bytes) {
     if (g_model_fd_host_base && model_map == g_model_fd_host_base)
         g_substrate_promotable_covered += bytes;
@@ -3006,6 +3010,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaFree(g_hc_stage_scratch);
         g_hc_stage_scratch = NULL;
     }
+    cuda_norm_q8_release();
     for (int i = 0; i < 2; i++) {
         if (g_q8_fold_q80_buf[i]) { (void)cudaFree(g_q8_fold_q80_buf[i]); g_q8_fold_q80_buf[i] = NULL; }
         if (g_q8_fold_q81_buf[i]) { (void)cudaFree(g_q8_fold_q81_buf[i]); g_q8_fold_q81_buf[i] = NULL; }
@@ -6502,6 +6507,60 @@ __global__ static void rms_norm_weight_f16q8_kernel(float *out, __half *out16, c
         float v = xr[i] * scale * w[i];
         orow[i] = v;
         o16row[i] = __float2half(v);
+    }
+    __syncthreads();
+    const uint32_t lane = threadIdx.x & 31u;
+    for (uint32_t qb = threadIdx.x >> 5u; qb < (n >> 7u); qb += (blockDim.x >> 5u)) {
+        const float4 xi = *reinterpret_cast<const float4 *>(orow + (uint64_t)qb * 128u + lane * 4u);
+        float amax = fabsf(xi.x);
+        amax = fmaxf(amax, fabsf(xi.y));
+        amax = fmaxf(amax, fabsf(xi.z));
+        amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off, 32));
+        }
+        float rcp_amax;
+        asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp_amax) : "f"(amax));
+        const float d_inv = __fmul_rn(rcp_amax, 127.0f);
+        char4 q;
+        q.x = (int8_t)roundf(__fmul_rn(xi.x, d_inv));
+        q.y = (int8_t)roundf(__fmul_rn(xi.y, d_inv));
+        q.z = (int8_t)roundf(__fmul_rn(xi.z, d_inv));
+        q.w = (int8_t)roundf(__fmul_rn(xi.w, d_inv));
+        char *blk = y_q8 + ((uint64_t)qb * rows + row) * 144u;
+        *reinterpret_cast<char4 *>(blk + 16u + lane * 4u) = q;
+        if ((lane & 7u) == 0u) {
+            float d;
+            asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(d) : "f"(d_inv));
+            reinterpret_cast<float *>(blk)[lane >> 3u] = d;
+        }
+    }
+}
+
+/* F32-only counterpart used by the common plain model graph.  Keep the RMS
+ * body and Q8 D4 lowering identical to rms_norm_weight_f16q8_kernel; omitting
+ * the unused F16 mirror avoids one global store over the activation. */
+__global__ static void rms_norm_weight_q8_kernel(float *out, char *y_q8, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = xr[i] * scale * w[i];
     }
     __syncthreads();
     const uint32_t lane = threadIdx.x & 31u;
@@ -19534,6 +19593,19 @@ static struct {
 static void  *g_norm_q8_buf = NULL;
 static size_t g_norm_q8_cap = 0;
 
+static void cuda_norm_q8_release(void) {
+    g_norm_q8_reg.src = NULL;
+    g_norm_q8_reg.y = NULL;
+    g_norm_q8_reg.bytes = 0;
+    g_norm_q8_reg.rows = 0u;
+    g_norm_q8_reg.n = 0u;
+    if (g_norm_q8_buf) {
+        (void)cudaFree(g_norm_q8_buf);
+        g_norm_q8_buf = NULL;
+    }
+    g_norm_q8_cap = 0;
+}
+
 static int cuda_norm_q8emit_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -19554,6 +19626,77 @@ static void *cuda_norm_q8_lookup(const void *x, uint64_t n_tok, uint64_t k, size
     if ((uint64_t)g_norm_q8_reg.rows != n_tok || (uint64_t)g_norm_q8_reg.n != k) return NULL;
     if (bytes_out) *bytes_out = g_norm_q8_reg.bytes;
     return g_norm_q8_reg.y;
+}
+
+static char *cuda_norm_q8_prepare(uint32_t rows, uint32_t n,
+                                  size_t *payload_out) {
+    if (!cuda_norm_q8emit_enabled() || rows < 64u || (n & 127u) != 0u) {
+        return NULL;
+    }
+    const uint32_t nkseg = n >> 7u;
+    const size_t payload = (size_t)rows * nkseg * 144u;
+    const size_t need = payload + 128u * 144u;  /* consumer slack ceiling */
+    if (g_norm_q8_cap < need) {
+        /* Allocate for the largest normal prefill chunk immediately.  A later
+         * grow would cudaFree on the hot path and serialize the stream. */
+        const size_t floor_need =
+            (size_t)(rows > 4096u ? rows : 4096u) * nkseg * 144u +
+            128u * 144u;
+        cuda_norm_q8_release();
+        if (cudaMalloc(&g_norm_q8_buf, floor_need) == cudaSuccess) {
+            g_norm_q8_cap = floor_need;
+        } else {
+            /* Allocation is an optional optimization.  Do not let its sticky
+             * runtime error poison the classic RMS fallback launch. */
+            (void)cudaGetLastError();
+        }
+    }
+    if (payload_out) *payload_out = payload;
+    return (char *)g_norm_q8_buf;
+}
+
+static void cuda_norm_q8_publish(const void *src, uint32_t rows, uint32_t n) {
+    g_norm_q8_reg.src   = src;
+    g_norm_q8_reg.y     = g_norm_q8_buf;
+    g_norm_q8_reg.bytes = g_norm_q8_cap;
+    g_norm_q8_reg.rows  = rows;
+    g_norm_q8_reg.n     = n;
+}
+
+static void cuda_norm_q8_verify(const ds4_gpu_tensor *out, uint32_t rows,
+                                uint32_t n, size_t payload) {
+    if (getenv("DS4_CUDA_NORM_Q8EMIT_VERIFY") == NULL) return;
+    char *ref = NULL;
+    if (cudaMalloc((void **)&ref, payload) == cudaSuccess) {
+        if (ds4_mmq_q8_0_quantize_ref((const float *)out->ptr, ref,
+                                      payload, (int)rows, (int)n,
+                                      ds4_current_stream()) == 0) {
+            char *h_ref = (char *)malloc(payload);
+            char *h_got = (char *)malloc(payload);
+            if (h_ref && h_got) {
+                cudaMemcpy(h_ref, ref, payload, cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_got, g_norm_q8_buf, payload,
+                           cudaMemcpyDeviceToHost);
+                uint64_t bad = 0;
+                const uint64_t nblk = payload / 144u;
+                for (uint64_t ib = 0; ib < nblk; ib++) {
+                    if (memcmp(h_ref + ib * 144u, h_got + ib * 144u,
+                               144u) != 0) {
+                        bad++;
+                    }
+                }
+                fprintf(stderr,
+                        "ds4: norm q8emit VERIFY rows=%u blocks=%llu bad=%llu\n",
+                        rows, (unsigned long long)nblk,
+                        (unsigned long long)bad);
+            }
+            free(h_ref);
+            free(h_got);
+        }
+        cudaFree(ref);
+    } else {
+        (void)cudaGetLastError();
+    }
 }
 
 static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label);
@@ -21232,6 +21375,42 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 
+extern "C" int ds4_gpu_rms_norm_weight_rows_q8_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+    if (!out || !x || !model_map || weight_offset > model_size ||
+        model_size - weight_offset < (uint64_t)n * sizeof(float) ||
+        out->bytes < (uint64_t)n * rows * sizeof(float) ||
+        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(
+            model_map, weight_offset, (uint64_t)n * sizeof(float),
+            "rms_weight");
+    if (!wptr) return 0;
+    cuda_norm_q8_invalidate(out->ptr);
+    size_t payload = 0;
+    char *q8 = cuda_norm_q8_prepare(rows, n, &payload);
+    if (q8) {
+        rms_norm_weight_q8_kernel<<<rows, 256, 0, ds4_current_stream()>>>(
+                (float *)out->ptr, q8, (const float *)x->ptr,
+                (const float *)wptr, n, rows, eps);
+        if (!cuda_ok(cudaGetLastError(), "rms_norm_weight q8 launch")) {
+            return 0;
+        }
+        cuda_norm_q8_publish(out->ptr, rows, n);
+        static int logged_norm_q8_plain = 0;
+        if (!logged_norm_q8_plain) {
+            logged_norm_q8_plain = 1;
+            fprintf(stderr,
+                    "ds4: norm producer emits f32+q8 (flat-pool p5c, first rows=%u n=%u)\n",
+                    rows, n);
+        }
+        cuda_norm_q8_verify(out, rows, n, payload);
+        return 1;
+    }
+    rms_norm_weight_kernel<<<rows, 256, 0, ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr,
+            (const float *)wptr, n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "rms_norm_weight q8 fallback launch");
+}
+
 /* v0.5 inc-12c: rows entry for the dual-emit twin (see
  * rms_norm_weight_f16pair_kernel).  Returns 0 with both outputs untouched on
  * any precondition miss; the caller then runs the classic entry (and, for
@@ -21251,67 +21430,23 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_f16_tensor(ds4_gpu_tensor *out, ds4_
      * grow-only scratch only ever (re)allocates on this eager prefill
      * path (sticky-scratch law). */
     cuda_norm_q8_invalidate(out->ptr);
-    if (cuda_norm_q8emit_enabled() && rows >= 64u && (n & 127u) == 0u) {
-        const uint32_t nkseg = n >> 7u;
-        const size_t payload = (size_t)rows * nkseg * 144u;
-        const size_t need = payload + 128u * 144u;  /* consumer slack ceiling */
-        if (g_norm_q8_cap < need) {
-            /* Floor the allocation at the batch max chunk (4096 rows) so the
-             * buffer never regrows: the free+malloc pair stalls the stream
-             * ~33 ms (p4 re-receipt trace, 3 gaps totaling 98 ms/boot) and
-             * would recur in serving on the first larger chunk. */
-            const size_t floor_need =
-                (size_t)(rows > 4096u ? rows : 4096u) * nkseg * 144u +
-                128u * 144u;
-            if (g_norm_q8_buf) { cudaFree(g_norm_q8_buf); g_norm_q8_buf = NULL; }
-            g_norm_q8_cap = 0;
-            if (cudaMalloc(&g_norm_q8_buf, floor_need) == cudaSuccess) {
-                g_norm_q8_cap = floor_need;
-            }
-        }
-        if (g_norm_q8_buf) {
+    {
+        size_t payload = 0;
+        char *q8 = cuda_norm_q8_prepare(rows, n, &payload);
+        if (q8) {
             rms_norm_weight_f16q8_kernel<<<rows, 256, 0, ds4_current_stream()>>>(
                     (float *)out->ptr, (__half *)out_f16->ptr,
-                    (char *)g_norm_q8_buf, (const float *)x->ptr,
+                    q8, (const float *)x->ptr,
                     (const float *)wptr, n, rows, eps);
             if (!cuda_ok(cudaGetLastError(), "rms_norm_weight f16q8 launch")) return 0;
-            g_norm_q8_reg.src   = out->ptr;
-            g_norm_q8_reg.y     = g_norm_q8_buf;
-            g_norm_q8_reg.bytes = g_norm_q8_cap;
-            g_norm_q8_reg.rows  = rows;
-            g_norm_q8_reg.n     = n;
+            cuda_norm_q8_publish(out->ptr, rows, n);
             static int logged_norm_q8 = 0;
             if (!logged_norm_q8) {
                 logged_norm_q8 = 1;
                 fprintf(stderr, "ds4: norm producer triple-emits q8 (flat-pool p5c, first rows=%u n=%u)\n",
                         rows, n);
             }
-            if (getenv("DS4_CUDA_NORM_Q8EMIT_VERIFY") != NULL) {
-                /* In-situ byte-diff vs the reference quantizer over the
-                 * just-written f32 rows (p5a instrument pattern). */
-                char *ref = NULL;
-                if (cudaMalloc((void **)&ref, payload) == cudaSuccess) {
-                    if (ds4_mmq_q8_0_quantize_ref((const float *)out->ptr, ref,
-                                                  payload, (int)rows, (int)n,
-                                                  ds4_current_stream()) == 0) {
-                        char *h_ref = (char *)malloc(payload);
-                        char *h_got = (char *)malloc(payload);
-                        if (h_ref && h_got) {
-                            cudaMemcpy(h_ref, ref, payload, cudaMemcpyDeviceToHost);
-                            cudaMemcpy(h_got, g_norm_q8_buf, payload, cudaMemcpyDeviceToHost);
-                            uint64_t bad = 0;
-                            const uint64_t nblk = payload / 144u;
-                            for (uint64_t ib = 0; ib < nblk; ib++) {
-                                if (memcmp(h_ref + ib * 144u, h_got + ib * 144u, 144u) != 0) bad++;
-                            }
-                            fprintf(stderr, "ds4: norm q8emit VERIFY rows=%u blocks=%llu bad=%llu\n",
-                                    rows, (unsigned long long)nblk, (unsigned long long)bad);
-                        }
-                        free(h_ref); free(h_got);
-                    }
-                    cudaFree(ref);
-                }
-            }
+            cuda_norm_q8_verify(out, rows, n, payload);
             return 1;
         }
     }
