@@ -137,6 +137,8 @@ int main(int argc, char **argv) {
     }
     fla_fixture f;
     CHECK(fixture_load(&f, argv[1]), "load official FLA fixture");
+    CHECK(f.tokens > 1u && f.dim == 128u,
+          "fixture exercises exact-order production KDA path");
     CHECK(ds4_gpu_init(), "CUDA init");
 
     const size_t total = (size_t)f.tokens + 1u;
@@ -179,6 +181,8 @@ int main(int argc, char **argv) {
     CHECK(ds4_gpu_tensor_fill_f32(dkc, 0.0f, conv_state), "reset k conv");
     CHECK(ds4_gpu_tensor_fill_f32(dvc, 0.0f, conv_state), "reset v conv");
 
+    CHECK(setenv("DS4_SOLAR_KDA_STATE_PARTS", "1", 1) == 0,
+          "select generic KDA prefill");
     CHECK(ds4_gpu_solar_kda_prefill_tensor(
               dout, dstate, dqc, dkc, dvc, dq, dk, dv, dg, db,
               dqw, dkw, dvw, dda, ddt, f.tokens, f.heads, f.dim, f.conv, -5.0f),
@@ -186,17 +190,46 @@ int main(int argc, char **argv) {
     float *scratch = malloc((size_t)f.tokens * vector * sizeof(float));
     float *state_scratch = malloc(state * sizeof(float));
     float *conv_scratch = malloc(conv_state * sizeof(float));
-    CHECK(scratch && state_scratch && conv_scratch, "host scratch allocation");
+    float *generic_out = malloc((size_t)f.tokens * vector * sizeof(float));
+    float *generic_state = malloc(state * sizeof(float));
+    CHECK(scratch && state_scratch && conv_scratch && generic_out &&
+          generic_state, "host scratch allocation");
     CHECK(ds4_gpu_tensor_read(dout, 0, scratch, prefill_vector_bytes), "read prefill output");
     compare("FLA chunk prefill output", scratch, f.prefill_out, (size_t)f.tokens * vector, 1.0e-3, 5.0e-2);
+    memcpy(generic_out, scratch, (size_t)f.tokens * vector * sizeof(float));
     CHECK(ds4_gpu_tensor_read(dstate, 0, state_scratch, (uint64_t)state * sizeof(float)), "read prefill state");
     compare("FLA chunk final state", state_scratch, f.prefill_state, state, 2.0e-2, 5.0e-2);
+    memcpy(generic_state, state_scratch, state * sizeof(float));
     CHECK(ds4_gpu_tensor_read(dqc, 0, conv_scratch, (uint64_t)conv_state * sizeof(float)), "read q conv state");
     compare("FLA q conv prefill state", conv_scratch, f.q_prefill_state, conv_state, 0.0, 0.0);
     CHECK(ds4_gpu_tensor_read(dkc, 0, conv_scratch, (uint64_t)conv_state * sizeof(float)), "read k conv state");
     compare("FLA k conv prefill state", conv_scratch, f.k_prefill_state, conv_state, 0.0, 0.0);
     CHECK(ds4_gpu_tensor_read(dvc, 0, conv_scratch, (uint64_t)conv_state * sizeof(float)), "read v conv state");
     compare("FLA v conv prefill state", conv_scratch, f.v_prefill_state, conv_state, 0.0, 0.0);
+
+    CHECK(ds4_gpu_tensor_fill_f32(dstate, 0.0f, state),
+          "reset state for exact-order prefill");
+    CHECK(ds4_gpu_tensor_fill_f32(dqc, 0.0f, conv_state),
+          "reset q conv for exact-order prefill");
+    CHECK(ds4_gpu_tensor_fill_f32(dkc, 0.0f, conv_state),
+          "reset k conv for exact-order prefill");
+    CHECK(ds4_gpu_tensor_fill_f32(dvc, 0.0f, conv_state),
+          "reset v conv for exact-order prefill");
+    CHECK(setenv("DS4_SOLAR_KDA_STATE_PARTS", "2-exact", 1) == 0,
+          "select exact-order KDA prefill");
+    CHECK(ds4_gpu_solar_kda_prefill_tensor(
+              dout, dstate, dqc, dkc, dvc, dq, dk, dv, dg, db,
+              dqw, dkw, dvw, dda, ddt, f.tokens, f.heads, f.dim, f.conv, -5.0f),
+          "exact-order fixture prefill");
+    CHECK(ds4_gpu_tensor_read(dout, 0, scratch, prefill_vector_bytes),
+          "read exact-order prefill output");
+    compare("exact-order prefill identity", scratch, generic_out,
+            (size_t)f.tokens * vector, 0.0, 0.0);
+    CHECK(ds4_gpu_tensor_read(
+              dstate, 0, state_scratch, (uint64_t)state * sizeof(float)),
+          "read exact-order prefill state");
+    compare("exact-order state identity", state_scratch, generic_state,
+            state, 0.0, 0.0);
 
     CHECK(ds4_gpu_tensor_write(dq, 0, f.q + (size_t)f.tokens * vector, vector_bytes), "write decode q");
     CHECK(ds4_gpu_tensor_write(dk, 0, f.k + (size_t)f.tokens * vector, vector_bytes), "write decode k");
@@ -220,6 +253,7 @@ int main(int argc, char **argv) {
     compare("FLA v conv decode state", conv_scratch, f.v_decode_state, conv_state, 0.0, 0.0);
 
     free(scratch); free(state_scratch); free(conv_scratch);
+    free(generic_out); free(generic_state);
     ds4_gpu_tensor_free(dq); ds4_gpu_tensor_free(dk); ds4_gpu_tensor_free(dv);
     ds4_gpu_tensor_free(dg); ds4_gpu_tensor_free(db); ds4_gpu_tensor_free(dout);
     ds4_gpu_tensor_free(dstate); ds4_gpu_tensor_free(dqc); ds4_gpu_tensor_free(dkc); ds4_gpu_tensor_free(dvc);
