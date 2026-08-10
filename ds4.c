@@ -703,6 +703,16 @@ static bool ds4_solar_layer_is_gqa(uint32_t il) {
     return (il % 4u) == 0u;
 }
 
+static const char *solar_kv_format_name(ds4_solar_kv_format format) {
+    switch (format) {
+    case DS4_SOLAR_KV_BF16: return "bf16";
+    case DS4_SOLAR_KV_FP8: return "fp8-e4m3fn";
+    case DS4_SOLAR_KV_FP4: return "fp4-e2m1";
+    case DS4_SOLAR_KV_KFP8_VFP4: return "k-fp8/v-fp4";
+    }
+    return "invalid";
+}
+
 static uint64_t solar_kv_row_bytes(ds4_solar_kv_format format,
                                    uint32_t n_head_kv,
                                    uint32_t head_dim) {
@@ -15220,6 +15230,991 @@ static bool metal_graph_matmul_plain_tensor(
     }
     fprintf(stderr, "ds4: Metal plain matmul does not support %s\n", tensor_type_name(w->type));
     return false;
+}
+
+/* =========================================================================
+ * Plain-residual model-family graph
+ * =========================================================================
+ *
+ * Solar and EXAONE do not use DeepSeek's hyper-connections, MLA compressor,
+ * or sparse indexer.  Keep their residual/MoE/output workspace independent
+ * from ds4_gpu_graph; model-specific attention state wraps this small common
+ * base instead of threading family checks through the DeepSeek executor.
+ */
+
+struct ds4_plain_batch_ws {
+    ds4_gpu_tensor *tokens;
+    ds4_gpu_tensor *cur;
+    ds4_gpu_tensor *norm;
+    ds4_gpu_tensor *q;
+    ds4_gpu_tensor *k;
+    ds4_gpu_tensor *v;
+    ds4_gpu_tensor *heads;
+    ds4_gpu_tensor *attn_out;
+    ds4_gpu_tensor *ffn_out;
+    ds4_gpu_tensor *dense_gate;
+    ds4_gpu_tensor *dense_up;
+    ds4_gpu_tensor *dense_mid;
+    ds4_gpu_tensor *shared_gate;
+    ds4_gpu_tensor *shared_up;
+    ds4_gpu_tensor *shared_mid;
+    ds4_gpu_tensor *shared_out;
+    ds4_gpu_tensor *router_logits;
+    ds4_gpu_tensor *router_selected;
+    ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *routed_gate;
+    ds4_gpu_tensor *routed_up;
+    ds4_gpu_tensor *routed_mid;
+    ds4_gpu_tensor *routed_down;
+    uint32_t prefill_cap;
+    uint64_t bytes;
+};
+
+typedef struct {
+    uint32_t ctx_size;
+    uint32_t prefill_cap;
+    uint64_t n_embd;
+    uint64_t q_dim;
+    uint64_t kv_dim;
+
+    ds4_gpu_tensor *cur;
+    ds4_gpu_tensor *norm;
+    ds4_gpu_tensor *q;
+    ds4_gpu_tensor *k;
+    ds4_gpu_tensor *v;
+    ds4_gpu_tensor *heads;
+    ds4_gpu_tensor *attn_out;
+    ds4_gpu_tensor *ffn_out;
+    ds4_gpu_tensor *dense_gate;
+    ds4_gpu_tensor *dense_up;
+    ds4_gpu_tensor *dense_mid;
+    ds4_gpu_tensor *shared_gate;
+    ds4_gpu_tensor *shared_up;
+    ds4_gpu_tensor *shared_mid;
+    ds4_gpu_tensor *shared_out;
+    ds4_gpu_tensor *router_logits;
+    ds4_gpu_tensor *router_selected;
+    ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *routed_gate;
+    ds4_gpu_tensor *routed_up;
+    ds4_gpu_tensor *routed_mid;
+    ds4_gpu_tensor *routed_down;
+    ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *attn_split;
+
+    struct ds4_plain_batch_ws *batch;
+    ds4_gpu_tensor *layer_kv[DS4_MAX_LAYER];
+    uint32_t layer_kv_cap[DS4_MAX_LAYER];
+    ds4_solar_kv_format kv_format;
+    uint64_t kv_row_bytes;
+    uint64_t kv_bytes;
+    uint64_t workspace_bytes;
+} ds4_plain_gpu_graph;
+
+typedef struct {
+    ds4_plain_gpu_graph base;
+
+    ds4_gpu_tensor *kda_k;
+    ds4_gpu_tensor *kda_v;
+    ds4_gpu_tensor *gate;
+    ds4_gpu_tensor *low_rank;
+    ds4_gpu_tensor *beta;
+    ds4_gpu_tensor *batch_kda_k;
+    ds4_gpu_tensor *batch_kda_v;
+    ds4_gpu_tensor *batch_gate;
+    ds4_gpu_tensor *batch_low_rank;
+    ds4_gpu_tensor *batch_beta;
+
+    ds4_gpu_tensor *state_pool;
+    ds4_gpu_tensor *control_pool;
+    ds4_gpu_tensor *recurrent[DS4_MAX_LAYER];
+    ds4_gpu_tensor *q_conv_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *k_conv_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *v_conv_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *q_conv_weight[DS4_MAX_LAYER];
+    ds4_gpu_tensor *k_conv_weight[DS4_MAX_LAYER];
+    ds4_gpu_tensor *v_conv_weight[DS4_MAX_LAYER];
+    ds4_gpu_tensor *decay_scale[DS4_MAX_LAYER];
+    ds4_gpu_tensor *dt_bias[DS4_MAX_LAYER];
+    ds4_gpu_tensor *o_norm[DS4_MAX_LAYER];
+    uint64_t state_bytes;
+    uint64_t control_bytes;
+    uint64_t scratch_bytes;
+} ds4_solar_gpu_graph;
+
+enum { DS4_PLAIN_SPLITKV_CHUNK = 2048 };
+
+static uint32_t solar_graph_prefill_cap_for_context(uint32_t ctx);
+
+static bool plain_graph_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_model      *model,
+        const ds4_tensor     *weight,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tokens) {
+    if (!out || !model || !weight || !x || n_tokens == 0u) return false;
+    if (weight->type == DS4_TENSOR_Q8_0) {
+        return ds4_gpu_matmul_q8_0_tensor(
+                out, model->map, model->size, weight->abs_offset,
+                in_dim, out_dim, x, n_tokens) != 0;
+    }
+    return metal_graph_matmul_plain_tensor(
+            out, model, weight, in_dim, out_dim, x, n_tokens);
+}
+
+static void plain_batch_ws_free(struct ds4_plain_batch_ws *w) {
+    if (!w) return;
+    ds4_gpu_tensor **all[] = {
+        &w->tokens, &w->cur, &w->norm, &w->q, &w->k, &w->v,
+        &w->heads, &w->attn_out, &w->ffn_out,
+        &w->dense_gate, &w->dense_up, &w->dense_mid,
+        &w->shared_gate, &w->shared_up, &w->shared_mid, &w->shared_out,
+        &w->router_logits, &w->router_selected, &w->router_weights,
+        &w->routed_gate, &w->routed_up, &w->routed_mid, &w->routed_down,
+    };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        ds4_gpu_tensor_free(*all[i]);
+        *all[i] = NULL;
+    }
+    memset(w, 0, sizeof(*w));
+}
+
+static bool plain_batch_ws_alloc(struct ds4_plain_batch_ws *w,
+                                 uint32_t prefill_cap,
+                                 uint64_t n_embd,
+                                 uint64_t q_dim,
+                                 uint64_t kv_dim) {
+    if (!w || prefill_cap == 0u) return false;
+    memset(w, 0, sizeof(*w));
+    w->prefill_cap = prefill_cap;
+    const uint64_t P = prefill_cap;
+    const uint64_t n_used = DS4_N_EXPERT_USED;
+    const uint64_t n_ff_exp = DS4_N_FF_EXP;
+    const uint64_t n_ff_dense = DS4_N_FF_DENSE;
+    const uint64_t n_ff_shared = DS4_N_FF_SHEXP;
+    uint64_t bytes = 0u;
+
+#define PLAIN_BATCH_ALLOC(field, elems)                                       \
+    do {                                                                       \
+        const uint64_t _bytes = (uint64_t)(elems) * sizeof(float);             \
+        w->field = ds4_gpu_tensor_alloc(_bytes);                               \
+        if (!w->field) {                                                       \
+            fprintf(stderr,                                                    \
+                    "ds4: plain graph: batch %s allocation failed "            \
+                    "(%.1f MiB)\n", #field, (double)_bytes / 1048576.0);      \
+            plain_batch_ws_free(w);                                            \
+            return false;                                                      \
+        }                                                                      \
+        bytes += _bytes;                                                       \
+    } while (0)
+    PLAIN_BATCH_ALLOC(tokens,          P);
+    PLAIN_BATCH_ALLOC(cur,             P * n_embd);
+    PLAIN_BATCH_ALLOC(norm,            P * n_embd);
+    PLAIN_BATCH_ALLOC(q,               P * q_dim);
+    PLAIN_BATCH_ALLOC(k,               P * kv_dim);
+    PLAIN_BATCH_ALLOC(v,               P * kv_dim);
+    PLAIN_BATCH_ALLOC(heads,           P * q_dim);
+    PLAIN_BATCH_ALLOC(attn_out,        P * n_embd);
+    PLAIN_BATCH_ALLOC(ffn_out,         P * n_embd);
+    PLAIN_BATCH_ALLOC(dense_gate,      P * n_ff_dense);
+    PLAIN_BATCH_ALLOC(dense_up,        P * n_ff_dense);
+    PLAIN_BATCH_ALLOC(dense_mid,       P * n_ff_dense);
+    PLAIN_BATCH_ALLOC(shared_gate,     P * n_ff_shared);
+    PLAIN_BATCH_ALLOC(shared_up,       P * n_ff_shared);
+    PLAIN_BATCH_ALLOC(shared_mid,      P * n_ff_shared);
+    PLAIN_BATCH_ALLOC(shared_out,      P * n_embd);
+    PLAIN_BATCH_ALLOC(router_logits,   P * DS4_N_EXPERT);
+    PLAIN_BATCH_ALLOC(router_selected, P * n_used);
+    PLAIN_BATCH_ALLOC(router_weights,  P * n_used);
+    PLAIN_BATCH_ALLOC(routed_gate,     P * n_used * n_ff_exp);
+    PLAIN_BATCH_ALLOC(routed_up,       P * n_used * n_ff_exp);
+    PLAIN_BATCH_ALLOC(routed_mid,      P * n_used * n_ff_exp);
+    PLAIN_BATCH_ALLOC(routed_down,     P * n_used * n_embd);
+#undef PLAIN_BATCH_ALLOC
+    w->bytes = bytes;
+    return true;
+}
+
+static void plain_graph_free(ds4_plain_gpu_graph *g) {
+    if (!g) return;
+    ds4_gpu_tensor **all[] = {
+        &g->cur, &g->norm, &g->q, &g->k, &g->v, &g->heads,
+        &g->attn_out, &g->ffn_out,
+        &g->dense_gate, &g->dense_up, &g->dense_mid,
+        &g->shared_gate, &g->shared_up, &g->shared_mid, &g->shared_out,
+        &g->router_logits, &g->router_selected, &g->router_weights,
+        &g->routed_gate, &g->routed_up, &g->routed_mid, &g->routed_down,
+        &g->logits, &g->attn_split,
+    };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        ds4_gpu_tensor_free(*all[i]);
+        *all[i] = NULL;
+    }
+    if (g->batch) {
+        plain_batch_ws_free(g->batch);
+        free(g->batch);
+        g->batch = NULL;
+    }
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_kv[il]);
+        g->layer_kv[il] = NULL;
+    }
+    memset(g, 0, sizeof(*g));
+}
+
+static bool plain_graph_layer_uses_kv(uint32_t il) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2
+        ? ds4_solar_layer_is_gqa(il) : true;
+}
+
+static bool plain_graph_alloc(ds4_plain_gpu_graph *g,
+                              const ds4_weights *weights,
+                              uint32_t ctx_size,
+                              uint32_t prefill_chunk) {
+    if (!g || !weights || ctx_size == 0u) return false;
+    memset(g, 0, sizeof(*g));
+    g->ctx_size = ctx_size;
+    g->n_embd = DS4_N_EMBD;
+    g->q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    g->kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    g->prefill_cap = prefill_chunk
+        ? (prefill_chunk < ctx_size ? prefill_chunk : ctx_size)
+        : solar_graph_prefill_cap_for_context(ctx_size);
+    g->kv_format = DS4_SOLAR_KV_BF16;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 &&
+        !solar_kv_format_from_env(&g->kv_format)) {
+        return false;
+    }
+    g->kv_row_bytes = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2
+        ? solar_kv_row_bytes(g->kv_format, DS4_N_HEAD_KV, DS4_N_HEAD_DIM)
+        : g->kv_dim * 2u * sizeof(uint16_t);
+    if (g->prefill_cap == 0u || g->kv_row_bytes == 0u) return false;
+
+    const uint64_t n_used = DS4_N_EXPERT_USED;
+    const uint64_t n_ff_exp = DS4_N_FF_EXP;
+    const uint64_t n_ff_dense = DS4_N_FF_DENSE;
+    const uint64_t n_ff_shared = DS4_N_FF_SHEXP;
+    uint64_t workspace = 0u;
+#define PLAIN_ALLOC(field, elems)                                             \
+    do {                                                                       \
+        const uint64_t _bytes = (uint64_t)(elems) * sizeof(float);             \
+        g->field = ds4_gpu_tensor_alloc(_bytes);                               \
+        if (!g->field) {                                                       \
+            fprintf(stderr,                                                    \
+                    "ds4: plain graph: %s allocation failed (%.1f MiB)\n",   \
+                    #field, (double)_bytes / 1048576.0);                        \
+            plain_graph_free(g);                                               \
+            return false;                                                      \
+        }                                                                      \
+        workspace += _bytes;                                                   \
+    } while (0)
+    PLAIN_ALLOC(cur,             g->n_embd);
+    PLAIN_ALLOC(norm,            g->n_embd);
+    PLAIN_ALLOC(q,               g->q_dim);
+    PLAIN_ALLOC(k,               g->kv_dim);
+    PLAIN_ALLOC(v,               g->kv_dim);
+    PLAIN_ALLOC(heads,           g->q_dim);
+    PLAIN_ALLOC(attn_out,        g->n_embd);
+    PLAIN_ALLOC(ffn_out,         g->n_embd);
+    PLAIN_ALLOC(dense_gate,      n_ff_dense);
+    PLAIN_ALLOC(dense_up,        n_ff_dense);
+    PLAIN_ALLOC(dense_mid,       n_ff_dense);
+    PLAIN_ALLOC(shared_gate,     n_ff_shared);
+    PLAIN_ALLOC(shared_up,       n_ff_shared);
+    PLAIN_ALLOC(shared_mid,      n_ff_shared);
+    PLAIN_ALLOC(shared_out,      g->n_embd);
+    PLAIN_ALLOC(router_logits,   DS4_N_EXPERT);
+    PLAIN_ALLOC(router_selected, n_used);
+    PLAIN_ALLOC(router_weights,  n_used);
+    PLAIN_ALLOC(routed_gate,     n_used * n_ff_exp);
+    PLAIN_ALLOC(routed_up,       n_used * n_ff_exp);
+    PLAIN_ALLOC(routed_mid,      n_used * n_ff_exp);
+    PLAIN_ALLOC(routed_down,     n_used * g->n_embd);
+    PLAIN_ALLOC(logits,          DS4_N_VOCAB);
+    {
+        const uint32_t chunks =
+            (ctx_size + DS4_PLAIN_SPLITKV_CHUNK - 1u) /
+            DS4_PLAIN_SPLITKV_CHUNK;
+        PLAIN_ALLOC(attn_split,
+                    (uint64_t)DS4_N_HEAD * chunks *
+                    (DS4_N_HEAD_DIM + 2u));
+    }
+#undef PLAIN_ALLOC
+
+    g->batch = xcalloc(1, sizeof(*g->batch));
+    if (!plain_batch_ws_alloc(g->batch, g->prefill_cap, g->n_embd,
+                              g->q_dim, g->kv_dim)) {
+        free(g->batch);
+        g->batch = NULL;
+        plain_graph_free(g);
+        return false;
+    }
+    workspace += g->batch->bytes;
+    g->workspace_bytes = workspace;
+
+    uint32_t kv_layers = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!weights->layer[il].attn_q || !plain_graph_layer_uses_kv(il)) {
+            continue;
+        }
+        const uint64_t bytes = (uint64_t)ctx_size * g->kv_row_bytes;
+        g->layer_kv[il] = ds4_gpu_tensor_alloc(bytes);
+        if (!g->layer_kv[il]) {
+            fprintf(stderr,
+                    "ds4: plain graph: layer %u KV allocation failed "
+                    "(%.1f MiB)\n", il, (double)bytes / 1048576.0);
+            plain_graph_free(g);
+            return false;
+        }
+        g->layer_kv_cap[il] = ctx_size;
+        g->kv_bytes += bytes;
+        kv_layers++;
+    }
+    ds4_log(stderr, DS4_LOG_TIMING,
+            "ds4: plain graph: ctx %u, prefill %u, KV %.2f GiB "
+            "(%s, %llu B/row, %u layers), workspace %.2f GiB\n",
+            ctx_size, g->prefill_cap,
+            (double)g->kv_bytes / 1073741824.0,
+            solar_kv_format_name(g->kv_format),
+            (unsigned long long)g->kv_row_bytes, kv_layers,
+            (double)g->workspace_bytes / 1073741824.0);
+    return true;
+}
+
+static void solar_graph_free(ds4_solar_gpu_graph *g) {
+    if (!g) return;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor **views[] = {
+            &g->recurrent[il], &g->q_conv_state[il],
+            &g->k_conv_state[il], &g->v_conv_state[il],
+            &g->q_conv_weight[il], &g->k_conv_weight[il],
+            &g->v_conv_weight[il], &g->decay_scale[il],
+            &g->dt_bias[il], &g->o_norm[il],
+        };
+        for (size_t i = 0; i < sizeof(views) / sizeof(views[0]); i++) {
+            ds4_gpu_tensor_free(*views[i]);
+            *views[i] = NULL;
+        }
+    }
+    ds4_gpu_tensor **owned[] = {
+        &g->kda_k, &g->kda_v, &g->gate, &g->low_rank, &g->beta,
+        &g->batch_kda_k, &g->batch_kda_v, &g->batch_gate,
+        &g->batch_low_rank, &g->batch_beta,
+        &g->state_pool, &g->control_pool,
+    };
+    for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) {
+        ds4_gpu_tensor_free(*owned[i]);
+        *owned[i] = NULL;
+    }
+    plain_graph_free(&g->base);
+    memset(g, 0, sizeof(*g));
+}
+
+static bool solar_pool_take(ds4_gpu_tensor **out,
+                            const ds4_gpu_tensor *pool,
+                            uint64_t *cursor,
+                            uint64_t bytes) {
+    if (!out || !pool || !cursor || bytes == 0u ||
+        *cursor > ds4_gpu_tensor_bytes(pool) ||
+        bytes > ds4_gpu_tensor_bytes(pool) - *cursor) {
+        return false;
+    }
+    *out = ds4_gpu_tensor_view(pool, *cursor, bytes);
+    if (!*out) return false;
+    *cursor += bytes;
+    return true;
+}
+
+static bool solar_copy_control(ds4_gpu_tensor *dst,
+                               const ds4_model *model,
+                               const ds4_tensor *src,
+                               uint64_t expected_bytes) {
+    if (!dst || !model || !src || src->bytes != expected_bytes ||
+        src->abs_offset > model->size ||
+        expected_bytes > model->size - src->abs_offset) {
+        return false;
+    }
+    return ds4_gpu_tensor_write(dst, 0, model->map + src->abs_offset,
+                                expected_bytes) != 0;
+}
+
+static bool solar_graph_reset_state(ds4_solar_gpu_graph *g) {
+    if (!g || !g->state_pool || g->state_bytes == 0u ||
+        (g->state_bytes % sizeof(float)) != 0u) {
+        return false;
+    }
+    return ds4_gpu_tensor_fill_f32(
+            g->state_pool, 0.0f, g->state_bytes / sizeof(float)) != 0;
+}
+
+static bool solar_graph_alloc(ds4_solar_gpu_graph *g,
+                              const ds4_model *model,
+                              const ds4_weights *weights,
+                              uint32_t ctx_size,
+                              uint32_t prefill_chunk) {
+    if (!g || !model || !weights ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+        return false;
+    }
+    memset(g, 0, sizeof(*g));
+    if (!plain_graph_alloc(&g->base, weights, ctx_size, prefill_chunk)) {
+        return false;
+    }
+
+    const uint64_t kda_dim =
+        (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint64_t low_dim = DS4_N_KDA_HEAD_DIM;
+    const uint64_t beta_dim = DS4_N_HEAD;
+    const uint64_t P = g->base.prefill_cap;
+    uint64_t scratch = 0u;
+#define SOLAR_ALLOC(field, elems)                                             \
+    do {                                                                       \
+        const uint64_t _bytes = (uint64_t)(elems) * sizeof(float);             \
+        g->field = ds4_gpu_tensor_alloc(_bytes);                               \
+        if (!g->field) {                                                       \
+            fprintf(stderr,                                                    \
+                    "ds4: Solar graph: %s allocation failed (%.1f MiB)\n",   \
+                    #field, (double)_bytes / 1048576.0);                        \
+            solar_graph_free(g);                                               \
+            return false;                                                      \
+        }                                                                      \
+        scratch += _bytes;                                                     \
+    } while (0)
+    SOLAR_ALLOC(kda_k,          kda_dim);
+    SOLAR_ALLOC(kda_v,          kda_dim);
+    SOLAR_ALLOC(gate,           kda_dim);
+    SOLAR_ALLOC(low_rank,       low_dim);
+    SOLAR_ALLOC(beta,           beta_dim);
+    SOLAR_ALLOC(batch_kda_k,    P * kda_dim);
+    SOLAR_ALLOC(batch_kda_v,    P * kda_dim);
+    SOLAR_ALLOC(batch_gate,     P * kda_dim);
+    SOLAR_ALLOC(batch_low_rank, P * low_dim);
+    SOLAR_ALLOC(batch_beta,     P * beta_dim);
+#undef SOLAR_ALLOC
+    g->scratch_bytes = scratch;
+
+    const uint64_t recurrent_bytes =
+        (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM *
+        DS4_N_KDA_HEAD_DIM * sizeof(float);
+    const uint64_t conv_bytes =
+        kda_dim * DS4_N_SSM_CONV * sizeof(float);
+    const uint64_t decay_bytes = (uint64_t)DS4_N_HEAD * sizeof(float);
+    const uint64_t dt_bytes = kda_dim * sizeof(float);
+    const uint64_t norm_bytes =
+        (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float);
+    const uint64_t state_per_layer = recurrent_bytes + 3u * conv_bytes;
+    const uint64_t control_per_layer =
+        3u * conv_bytes + decay_bytes + dt_bytes + norm_bytes;
+    uint32_t n_kda = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_solar_layer_is_gqa(il)) n_kda++;
+    }
+    if (n_kda == 0u || state_per_layer > UINT64_MAX / n_kda ||
+        control_per_layer > UINT64_MAX / n_kda) {
+        solar_graph_free(g);
+        return false;
+    }
+    g->state_bytes = state_per_layer * n_kda;
+    g->control_bytes = control_per_layer * n_kda;
+    g->state_pool = ds4_gpu_tensor_alloc(g->state_bytes);
+    g->control_pool = ds4_gpu_tensor_alloc(g->control_bytes);
+    if (!g->state_pool || !g->control_pool) {
+        fprintf(stderr,
+                "ds4: Solar graph: KDA pool allocation failed "
+                "(state %.1f MiB, controls %.1f MiB)\n",
+                (double)g->state_bytes / 1048576.0,
+                (double)g->control_bytes / 1048576.0);
+        solar_graph_free(g);
+        return false;
+    }
+
+    uint64_t state_cursor = 0u;
+    uint64_t control_cursor = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_solar_layer_is_gqa(il)) continue;
+        const ds4_layer_weights *layer = &weights->layer[il];
+        const bool views_ok =
+            solar_pool_take(&g->recurrent[il], g->state_pool,
+                            &state_cursor, recurrent_bytes) &&
+            solar_pool_take(&g->q_conv_state[il], g->state_pool,
+                            &state_cursor, conv_bytes) &&
+            solar_pool_take(&g->k_conv_state[il], g->state_pool,
+                            &state_cursor, conv_bytes) &&
+            solar_pool_take(&g->v_conv_state[il], g->state_pool,
+                            &state_cursor, conv_bytes) &&
+            solar_pool_take(&g->q_conv_weight[il], g->control_pool,
+                            &control_cursor, conv_bytes) &&
+            solar_pool_take(&g->k_conv_weight[il], g->control_pool,
+                            &control_cursor, conv_bytes) &&
+            solar_pool_take(&g->v_conv_weight[il], g->control_pool,
+                            &control_cursor, conv_bytes) &&
+            solar_pool_take(&g->decay_scale[il], g->control_pool,
+                            &control_cursor, decay_bytes) &&
+            solar_pool_take(&g->dt_bias[il], g->control_pool,
+                            &control_cursor, dt_bytes) &&
+            solar_pool_take(&g->o_norm[il], g->control_pool,
+                            &control_cursor, norm_bytes);
+        const bool copy_ok = views_ok &&
+            solar_copy_control(g->q_conv_weight[il], model,
+                               layer->ssm_q_conv, conv_bytes) &&
+            solar_copy_control(g->k_conv_weight[il], model,
+                               layer->ssm_k_conv, conv_bytes) &&
+            solar_copy_control(g->v_conv_weight[il], model,
+                               layer->ssm_v_conv, conv_bytes) &&
+            solar_copy_control(g->decay_scale[il], model,
+                               layer->ssm_a, decay_bytes) &&
+            solar_copy_control(g->dt_bias[il], model,
+                               layer->ssm_dt_bias, dt_bytes) &&
+            solar_copy_control(g->o_norm[il], model,
+                               layer->ssm_o_norm, norm_bytes);
+        if (!copy_ok) {
+            fprintf(stderr,
+                    "ds4: Solar graph: KDA state/control bind failed at "
+                    "layer %u\n", il);
+            solar_graph_free(g);
+            return false;
+        }
+    }
+    if (state_cursor != g->state_bytes ||
+        control_cursor != g->control_bytes || !solar_graph_reset_state(g)) {
+        fprintf(stderr,
+                "ds4: Solar graph: KDA pool accounting/reset failed\n");
+        solar_graph_free(g);
+        return false;
+    }
+    ds4_log(stderr, DS4_LOG_TIMING,
+            "ds4: Solar graph: state %.2f MiB, controls %.2f MiB, "
+            "extra scratch %.2f MiB\n",
+            (double)g->state_bytes / 1048576.0,
+            (double)g->control_bytes / 1048576.0,
+            (double)g->scratch_bytes / 1048576.0);
+    return true;
+}
+
+static bool plain_graph_add_inplace(ds4_gpu_tensor *dst,
+                                    const ds4_gpu_tensor *add,
+                                    uint64_t count) {
+    if (count > UINT32_MAX) return false;
+    return ds4_gpu_add_tensor(dst, dst, add, (uint32_t)count) != 0;
+}
+
+/* Attention output projection followed by the shared residual/MoE tail.
+ * Every model-specific attention front writes `heads`; this function owns the
+ * rest of the transformer layer and is the seam EXAONE can reuse later. */
+static bool plain_graph_layer_tail(ds4_plain_gpu_graph *g,
+                                   const ds4_model *model,
+                                   const ds4_weights *weights,
+                                   uint32_t il,
+                                   uint32_t n_tokens,
+                                   ds4_gpu_tensor *x,
+                                   ds4_gpu_tensor *norm,
+                                   ds4_gpu_tensor *heads,
+                                   ds4_gpu_tensor *attn_out,
+                                   ds4_gpu_tensor *ffn_out) {
+    if (!g || !model || !weights || !x || n_tokens == 0u ||
+        il >= DS4_N_LAYER) {
+        return false;
+    }
+    const ds4_layer_weights *layer = &weights->layer[il];
+    const bool batch = n_tokens > 1u;
+    const uint64_t residual_count = (uint64_t)n_tokens * g->n_embd;
+    if (!plain_graph_matmul_tensor(attn_out, model, layer->attn_output,
+                                   g->q_dim, g->n_embd, heads, n_tokens) ||
+        !plain_graph_add_inplace(x, attn_out, residual_count) ||
+        !ds4_gpu_rms_norm_weight_rows_tensor(
+                norm, x, model->map, model->size,
+                layer->ffn_norm->abs_offset, (uint32_t)g->n_embd,
+                n_tokens, DS4_RMS_EPS)) {
+        return false;
+    }
+
+    struct ds4_plain_batch_ws *ws = g->batch;
+    if (!layer->ffn_gate_exps) {
+        /* The shared base reserves dense slots so an EXAONE binder can add
+         * its leading-dense mapping without changing session memory layout.
+         * Solar itself declares zero leading dense blocks. */
+        fprintf(stderr,
+                "ds4: plain graph: layer %u has no routed experts\n", il);
+        return false;
+    }
+
+    ds4_gpu_tensor *router_logits =
+        batch ? ws->router_logits : g->router_logits;
+    ds4_gpu_tensor *selected =
+        batch ? ws->router_selected : g->router_selected;
+    ds4_gpu_tensor *router_weights =
+        batch ? ws->router_weights : g->router_weights;
+    if (!plain_graph_matmul_tensor(
+                router_logits, model, layer->ffn_gate_inp,
+                g->n_embd, DS4_N_EXPERT, norm, n_tokens) ||
+        !ds4_gpu_sigmoid_topk_router_tensor(
+                selected, router_weights, router_logits,
+                model->map, model->size,
+                layer->ffn_exp_probs_b
+                    ? layer->ffn_exp_probs_b->abs_offset : 0u,
+                layer->ffn_exp_probs_b ? 1 : 0,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, n_tokens,
+                DS4_EXPERT_WEIGHT_SCALE)) {
+        return false;
+    }
+
+    const uint32_t n_used = DS4_N_EXPERT_USED;
+    const uint32_t n_ff_exp = (uint32_t)layer->ffn_gate_exps->dim[1];
+    ds4_gpu_tensor *routed_gate =
+        batch ? ws->routed_gate : g->routed_gate;
+    ds4_gpu_tensor *routed_up =
+        batch ? ws->routed_up : g->routed_up;
+    ds4_gpu_tensor *routed_mid =
+        batch ? ws->routed_mid : g->routed_mid;
+    ds4_gpu_tensor *routed_down =
+        batch ? ws->routed_down : g->routed_down;
+    if (!ds4_gpu_routed_matmul_tensor(
+                routed_gate, norm, selected, model->map, model->size,
+                layer->ffn_gate_exps->abs_offset,
+                layer->ffn_gate_exps->bytes,
+                layer->ffn_gate_exps->type,
+                (uint32_t)g->n_embd, n_ff_exp, DS4_N_EXPERT,
+                n_tokens, n_used) ||
+        !ds4_gpu_routed_matmul_tensor(
+                routed_up, norm, selected, model->map, model->size,
+                layer->ffn_up_exps->abs_offset,
+                layer->ffn_up_exps->bytes,
+                layer->ffn_up_exps->type,
+                (uint32_t)g->n_embd, n_ff_exp, DS4_N_EXPERT,
+                n_tokens, n_used) ||
+        !ds4_gpu_swiglu_weighted_tensor(
+                routed_mid, routed_gate, routed_up, router_weights,
+                n_ff_exp,
+                (uint64_t)n_tokens * n_used * n_ff_exp) ||
+        !ds4_gpu_routed_matmul_tensor(
+                routed_down, routed_mid, selected,
+                model->map, model->size,
+                layer->ffn_down_exps->abs_offset,
+                layer->ffn_down_exps->bytes,
+                layer->ffn_down_exps->type,
+                n_ff_exp, (uint32_t)g->n_embd, DS4_N_EXPERT,
+                n_tokens * n_used, 1u)) {
+        return false;
+    }
+
+    const uint64_t n_ff_shared = layer->ffn_gate_shexp->dim[1];
+    const uint64_t shared_count = (uint64_t)n_tokens * n_ff_shared;
+    if (shared_count > UINT32_MAX) return false;
+    ds4_gpu_tensor *shared_gate =
+        batch ? ws->shared_gate : g->shared_gate;
+    ds4_gpu_tensor *shared_up = batch ? ws->shared_up : g->shared_up;
+    ds4_gpu_tensor *shared_mid = batch ? ws->shared_mid : g->shared_mid;
+    ds4_gpu_tensor *shared_out = batch ? ws->shared_out : g->shared_out;
+    if (!plain_graph_matmul_tensor(
+                shared_gate, model, layer->ffn_gate_shexp,
+                g->n_embd, n_ff_shared, norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                shared_up, model, layer->ffn_up_shexp,
+                g->n_embd, n_ff_shared, norm, n_tokens) ||
+        !ds4_gpu_swiglu_tensor(
+                shared_mid, shared_gate, shared_up,
+                (uint32_t)shared_count, 0.0f, 1.0f) ||
+        !plain_graph_matmul_tensor(
+                shared_out, model, layer->ffn_down_shexp,
+                n_ff_shared, g->n_embd, shared_mid, n_tokens) ||
+        !ds4_gpu_moe_sum_tensor(
+                ffn_out, routed_down, (uint32_t)g->n_embd,
+                n_used, n_tokens) ||
+        !plain_graph_add_inplace(ffn_out, shared_out, residual_count) ||
+        !plain_graph_add_inplace(x, ffn_out, residual_count)) {
+        return false;
+    }
+    return true;
+}
+
+static bool plain_graph_output_head(ds4_plain_gpu_graph *g,
+                                    const ds4_model *model,
+                                    const ds4_weights *weights,
+                                    ds4_gpu_tensor *x,
+                                    uint64_t row_offset_elems) {
+    if (!g || !model || !weights || !x) return false;
+    ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+            x, row_offset_elems * sizeof(float),
+            g->n_embd * sizeof(float));
+    if (!row) return false;
+    const bool ok =
+        ds4_gpu_rms_norm_weight_rows_tensor(
+                g->norm, row, model->map, model->size,
+                weights->output_norm->abs_offset, (uint32_t)g->n_embd,
+                1u, DS4_RMS_EPS) != 0 &&
+        plain_graph_matmul_tensor(
+                g->logits, model, weights->output,
+                g->n_embd, DS4_N_VOCAB, g->norm, 1u);
+    ds4_gpu_tensor_free(row);
+    return ok;
+}
+
+static bool solar_graph_attention_decode(ds4_plain_gpu_graph *g,
+                                         uint32_t il,
+                                         uint32_t pos,
+                                         ds4_gpu_tensor *heads,
+                                         const ds4_gpu_tensor *q) {
+    if (g->attn_split) {
+        return ds4_gpu_solar_attention_decode_split_tensor(
+                heads, q, g->layer_kv[il], g->attn_split,
+                DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                g->layer_kv_cap[il], pos, 0u,
+                DS4_PLAIN_SPLITKV_CHUNK, g->kv_format) != 0;
+    }
+    return ds4_gpu_solar_attention_decode_tensor(
+            heads, q, g->layer_kv[il],
+            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+            g->layer_kv_cap[il], pos, 0u, g->kv_format) != 0;
+}
+
+static bool solar_graph_gqa_layer(ds4_solar_gpu_graph *solar,
+                                  const ds4_model *model,
+                                  const ds4_weights *weights,
+                                  uint32_t il,
+                                  uint32_t n_tokens,
+                                  uint32_t pos0,
+                                  ds4_gpu_tensor *x) {
+    ds4_plain_gpu_graph *g = &solar->base;
+    const ds4_layer_weights *layer = &weights->layer[il];
+    const bool batch = n_tokens > 1u;
+    struct ds4_plain_batch_ws *ws = g->batch;
+    ds4_gpu_tensor *norm = batch ? ws->norm : g->norm;
+    ds4_gpu_tensor *q = batch ? ws->q : g->q;
+    ds4_gpu_tensor *k = batch ? ws->k : g->k;
+    ds4_gpu_tensor *v = batch ? ws->v : g->v;
+    ds4_gpu_tensor *gate = batch ? solar->batch_gate : solar->gate;
+    ds4_gpu_tensor *heads = batch ? ws->heads : g->heads;
+    ds4_gpu_tensor *attn_out = batch ? ws->attn_out : g->attn_out;
+    ds4_gpu_tensor *ffn_out = batch ? ws->ffn_out : g->ffn_out;
+
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+                norm, x, model->map, model->size,
+                layer->attn_norm->abs_offset, (uint32_t)g->n_embd,
+                n_tokens, DS4_RMS_EPS) ||
+        !plain_graph_matmul_tensor(
+                q, model, layer->attn_q,
+                g->n_embd, g->q_dim, norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                k, model, layer->attn_k,
+                g->n_embd, g->kv_dim, norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                v, model, layer->attn_v,
+                g->n_embd, g->kv_dim, norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                gate, model, layer->attn_gate,
+                g->n_embd, g->q_dim, norm, n_tokens) ||
+        !ds4_gpu_solar_kv_store_tensor(
+                g->layer_kv[il], k, v,
+                DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                n_tokens, pos0, g->layer_kv_cap[il], g->kv_format)) {
+        return false;
+    }
+    if (batch) {
+        if (!ds4_gpu_solar_attention_prefill_tensor(
+                    heads, q, g->layer_kv[il], n_tokens, pos0,
+                    DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                    g->layer_kv_cap[il], 0u, g->kv_format)) {
+            return false;
+        }
+    } else if (!solar_graph_attention_decode(g, il, pos0, heads, q)) {
+        return false;
+    }
+    if (!ds4_gpu_solar_sigmoid_gate_tensor(
+                heads, heads, gate,
+                (uint64_t)n_tokens * g->q_dim)) {
+        return false;
+    }
+    return plain_graph_layer_tail(
+            g, model, weights, il, n_tokens, x, norm, heads,
+            attn_out, ffn_out);
+}
+
+static bool solar_graph_kda_layer(ds4_solar_gpu_graph *solar,
+                                  const ds4_model *model,
+                                  const ds4_weights *weights,
+                                  uint32_t il,
+                                  uint32_t n_tokens,
+                                  ds4_gpu_tensor *x) {
+    ds4_plain_gpu_graph *g = &solar->base;
+    const ds4_layer_weights *layer = &weights->layer[il];
+    const bool batch = n_tokens > 1u;
+    const uint64_t kda_dim =
+        (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM;
+    struct ds4_plain_batch_ws *ws = g->batch;
+    ds4_gpu_tensor *norm = batch ? ws->norm : g->norm;
+    ds4_gpu_tensor *q = batch ? ws->q : g->q;
+    ds4_gpu_tensor *k = batch ? solar->batch_kda_k : solar->kda_k;
+    ds4_gpu_tensor *v = batch ? solar->batch_kda_v : solar->kda_v;
+    ds4_gpu_tensor *gate = batch ? solar->batch_gate : solar->gate;
+    ds4_gpu_tensor *low = batch ? solar->batch_low_rank : solar->low_rank;
+    ds4_gpu_tensor *beta = batch ? solar->batch_beta : solar->beta;
+    ds4_gpu_tensor *heads = batch ? ws->heads : g->heads;
+    ds4_gpu_tensor *attn_out = batch ? ws->attn_out : g->attn_out;
+    ds4_gpu_tensor *ffn_out = batch ? ws->ffn_out : g->ffn_out;
+
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+                norm, x, model->map, model->size,
+                layer->attn_norm->abs_offset, (uint32_t)g->n_embd,
+                n_tokens, DS4_RMS_EPS) ||
+        !plain_graph_matmul_tensor(
+                q, model, layer->attn_q,
+                g->n_embd, kda_dim, norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                k, model, layer->attn_k,
+                g->n_embd, kda_dim, norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                v, model, layer->attn_v,
+                g->n_embd, kda_dim, norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                low, model, layer->ssm_f_a,
+                g->n_embd, DS4_N_KDA_HEAD_DIM, norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                gate, model, layer->ssm_f_b,
+                DS4_N_KDA_HEAD_DIM, kda_dim, low, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                beta, model, layer->ssm_beta,
+                g->n_embd, DS4_N_HEAD, norm, n_tokens)) {
+        return false;
+    }
+
+    const int kda_ok = batch
+        ? ds4_gpu_solar_kda_prefill_tensor(
+              heads, solar->recurrent[il], solar->q_conv_state[il],
+              solar->k_conv_state[il], solar->v_conv_state[il],
+              q, k, v, gate, beta,
+              solar->q_conv_weight[il], solar->k_conv_weight[il],
+              solar->v_conv_weight[il], solar->decay_scale[il],
+              solar->dt_bias[il], n_tokens, DS4_N_HEAD,
+              DS4_N_KDA_HEAD_DIM, DS4_N_SSM_CONV,
+              DS4_KDA_GATE_CLAMP_MIN)
+        : ds4_gpu_solar_kda_decode_tensor(
+              heads, solar->recurrent[il], solar->q_conv_state[il],
+              solar->k_conv_state[il], solar->v_conv_state[il],
+              q, k, v, gate, beta,
+              solar->q_conv_weight[il], solar->k_conv_weight[il],
+              solar->v_conv_weight[il], solar->decay_scale[il],
+              solar->dt_bias[il], DS4_N_HEAD, DS4_N_KDA_HEAD_DIM,
+              DS4_N_SSM_CONV, DS4_KDA_GATE_CLAMP_MIN);
+    if (!kda_ok ||
+        !plain_graph_matmul_tensor(
+                low, model, layer->ssm_g_a,
+                g->n_embd, DS4_N_KDA_HEAD_DIM, norm, n_tokens) ||
+        !plain_graph_matmul_tensor(
+                gate, model, layer->ssm_g_b,
+                DS4_N_KDA_HEAD_DIM, kda_dim, low, n_tokens) ||
+        !ds4_gpu_solar_head_rms_sigmoid_gate_tensor(
+                heads, heads, gate, solar->o_norm[il],
+                n_tokens, DS4_N_HEAD, DS4_N_KDA_HEAD_DIM,
+                DS4_RMS_EPS)) {
+        return false;
+    }
+    return plain_graph_layer_tail(
+            g, model, weights, il, n_tokens, x, norm, heads,
+            attn_out, ffn_out);
+}
+
+static bool solar_graph_layer(ds4_solar_gpu_graph *g,
+                              const ds4_model *model,
+                              const ds4_weights *weights,
+                              uint32_t il,
+                              uint32_t n_tokens,
+                              uint32_t pos0,
+                              ds4_gpu_tensor *x) {
+    return ds4_solar_layer_is_gqa(il)
+        ? solar_graph_gqa_layer(
+              g, model, weights, il, n_tokens, pos0, x)
+        : solar_graph_kda_layer(
+              g, model, weights, il, n_tokens, x);
+}
+
+static bool solar_graph_embed_batch(ds4_plain_gpu_graph *g,
+                                    const ds4_model *model,
+                                    const ds4_weights *weights,
+                                    const int *tokens,
+                                    uint32_t n_tokens) {
+    if (n_tokens >= 32u) {
+        return ds4_gpu_tensor_write(
+                       g->batch->tokens, 0, tokens,
+                       (uint64_t)n_tokens * sizeof(int32_t)) != 0 &&
+               ds4_gpu_embed_tokens_quant_tensor(
+                       g->batch->cur, g->batch->tokens,
+                       model->map, model->size,
+                       weights->token_embd->abs_offset,
+                       weights->token_embd->type, DS4_N_VOCAB,
+                       n_tokens, (uint32_t)g->n_embd) != 0;
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+                g->batch->cur,
+                (uint64_t)t * g->n_embd * sizeof(float),
+                g->n_embd * sizeof(float));
+        if (!row) return false;
+        const int ok = ds4_gpu_embed_token_quant_tensor(
+                row, model->map, model->size,
+                weights->token_embd->abs_offset,
+                weights->token_embd->type, DS4_N_VOCAB,
+                (uint32_t)tokens[t], (uint32_t)g->n_embd);
+        ds4_gpu_tensor_free(row);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool solar_graph_prefill_chunk(ds4_solar_gpu_graph *solar,
+                                      const ds4_model *model,
+                                      const ds4_weights *weights,
+                                      const int *tokens,
+                                      uint32_t n_tokens,
+                                      uint32_t pos0,
+                                      bool want_logits) {
+    if (!solar || !model || !weights || !tokens) return false;
+    ds4_plain_gpu_graph *g = &solar->base;
+    if (n_tokens == 0u || n_tokens > g->prefill_cap ||
+        pos0 > g->ctx_size || n_tokens > g->ctx_size - pos0 ||
+        !solar_graph_embed_batch(g, model, weights, tokens, n_tokens)) {
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!solar_graph_layer(
+                    solar, model, weights, il, n_tokens, pos0,
+                    g->batch->cur)) {
+            fprintf(stderr,
+                    "ds4: Solar prefill failed at layer %u\n", il);
+            return false;
+        }
+    }
+    if (!want_logits) return true;
+    return plain_graph_output_head(
+            g, model, weights, g->batch->cur,
+            (uint64_t)(n_tokens - 1u) * g->n_embd);
+}
+
+static bool solar_graph_decode(ds4_solar_gpu_graph *solar,
+                               const ds4_model *model,
+                               const ds4_weights *weights,
+                               int token,
+                               uint32_t pos) {
+    if (!solar || !model || !weights) return false;
+    ds4_plain_gpu_graph *g = &solar->base;
+    if (pos >= g->ctx_size ||
+        !ds4_gpu_embed_token_quant_tensor(
+                g->cur, model->map, model->size,
+                weights->token_embd->abs_offset,
+                weights->token_embd->type, DS4_N_VOCAB,
+                (uint32_t)token, (uint32_t)g->n_embd)) {
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!solar_graph_layer(
+                    solar, model, weights, il, 1u, pos, g->cur)) {
+            fprintf(stderr,
+                    "ds4: Solar decode failed at layer %u\n", il);
+            return false;
+        }
+    }
+    return plain_graph_output_head(g, model, weights, g->cur, 0u);
 }
 
 /* v0.5 inc-11 F1: f16 GEMM with an optional shared pre-converted activation
