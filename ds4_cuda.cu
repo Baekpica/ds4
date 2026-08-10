@@ -29731,3 +29731,370 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
     }
     return ok;
 }
+
+/* Solar Open 2 single-token KDA recurrence. One block owns one head and one
+ * thread owns a value-state column. That makes both state passes race-free:
+ * each thread decays and updates state[:, value_dim] while all threads share
+ * the normalized Q/K vectors. The generic path deliberately uses only
+ * ordinary CUDA math and shared memory; Hopper-specific tuning comes after
+ * official-fixture parity and must retain this fallback for sm_121. */
+static __device__ __forceinline__ float solar_kda_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+static __device__ __forceinline__ float solar_kda_silu(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+static __global__ void solar_kda_sequence_kernel(
+        float       *out,
+        float       *state,
+        float       *q_conv_state,
+        float       *k_conv_state,
+        float       *v_conv_state,
+        const float *q_raw,
+        const float *k_raw,
+        const float *v_raw,
+        const float *g_raw,
+        const float *beta_logits,
+        const float *q_conv_weight,
+        const float *k_conv_weight,
+        const float *v_conv_weight,
+        const float *decay_scale,
+        const float *dt_bias,
+        uint32_t     n_tokens,
+        uint32_t     n_head,
+        uint32_t     head_dim,
+        uint32_t     conv_kernel,
+        float        gate_lower_bound) {
+    __shared__ float q_vec[256];
+    __shared__ float k_vec[256];
+    __shared__ float v_vec[256];
+    __shared__ float q_sq[256];
+    __shared__ float k_sq[256];
+
+    const uint32_t head = blockIdx.x;
+    const uint32_t dim = threadIdx.x;
+    const uint64_t channel = (uint64_t)head * head_dim + dim;
+    const uint64_t vector_count = (uint64_t)n_head * head_dim;
+    const uint64_t state_head = (uint64_t)head * head_dim * head_dim;
+
+    /* One launch consumes an entire chunk. KDA is recurrent in sequence order,
+     * but the loop lives inside 64 concurrently resident head blocks rather
+     * than launching a PyTorch-style kernel for every token. */
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        float q = 0.0f;
+        float k = 0.0f;
+        float v = 0.0f;
+        if (dim < head_dim) {
+            float *qcs = q_conv_state + channel * conv_kernel;
+            float *kcs = k_conv_state + channel * conv_kernel;
+            float *vcs = v_conv_state + channel * conv_kernel;
+            for (uint32_t tap = 0; tap + 1u < conv_kernel; tap++) {
+                qcs[tap] = qcs[tap + 1u];
+                kcs[tap] = kcs[tap + 1u];
+                vcs[tap] = vcs[tap + 1u];
+            }
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            qcs[conv_kernel - 1u] = q_raw[token_base + channel];
+            kcs[conv_kernel - 1u] = k_raw[token_base + channel];
+            vcs[conv_kernel - 1u] = v_raw[token_base + channel];
+
+            const uint64_t weight_base = channel * conv_kernel;
+            for (uint32_t tap = 0; tap < conv_kernel; tap++) {
+                q += qcs[tap] * q_conv_weight[weight_base + tap];
+                k += kcs[tap] * k_conv_weight[weight_base + tap];
+                v += vcs[tap] * v_conv_weight[weight_base + tap];
+            }
+            q = solar_kda_silu(q);
+            k = solar_kda_silu(k);
+            v = solar_kda_silu(v);
+        }
+
+        q_vec[dim] = q;
+        k_vec[dim] = k;
+        v_vec[dim] = v;
+        q_sq[dim] = q * q;
+        k_sq[dim] = k * k;
+        __syncthreads();
+
+        for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+            if (dim < stride) {
+                q_sq[dim] += q_sq[dim + stride];
+                k_sq[dim] += k_sq[dim + stride];
+            }
+            __syncthreads();
+        }
+
+        if (dim < head_dim) {
+            const float q_inv = rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)head_dim);
+            const float k_inv = rsqrtf(k_sq[0] + 1.0e-6f);
+            q_vec[dim] *= q_inv;
+            k_vec[dim] *= k_inv;
+        }
+        __syncthreads();
+
+        if (dim < head_dim) {
+            const float beta = 2.0f /
+                (1.0f + expf(-beta_logits[(uint64_t)token * n_head + head]));
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            float memory = 0.0f;
+            for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
+                float gate = decay_scale[head] *
+                    solar_kda_softplus(g_raw[token_base +
+                                             (uint64_t)head * head_dim + key_dim] +
+                                       dt_bias[(uint64_t)head * head_dim + key_dim]);
+                if (gate < gate_lower_bound) gate = gate_lower_bound;
+                const uint64_t index =
+                    state_head + (uint64_t)key_dim * head_dim + dim;
+                const float decayed = state[index] * expf(gate);
+                state[index] = decayed;
+                memory += decayed * k_vec[key_dim];
+            }
+
+            const float delta = (v_vec[dim] - memory) * beta;
+            float result = 0.0f;
+            for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
+                const uint64_t index =
+                    state_head + (uint64_t)key_dim * head_dim + dim;
+                const float updated = state[index] + k_vec[key_dim] * delta;
+                state[index] = updated;
+                result += updated * q_vec[key_dim];
+            }
+            out[token_base + (uint64_t)head * head_dim + dim] = result;
+        }
+        __syncthreads();
+    }
+}
+
+static int solar_kda_sequence_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound,
+        const char             *what) {
+    if (!out || !recurrent_state || !q_conv_state || !k_conv_state ||
+        !v_conv_state || !q_raw || !k_raw || !v_raw || !g_raw ||
+        !beta_logits || !q_conv_weight || !k_conv_weight ||
+        !v_conv_weight || !decay_scale || !dt_bias ||
+        n_tokens == 0u || n_head == 0u || head_dim == 0u || head_dim > 256u ||
+        conv_kernel == 0u || conv_kernel > 16u || gate_lower_bound > 0.0f) {
+        return 0;
+    }
+
+    const uint64_t vector_count = (uint64_t)n_head * head_dim;
+    const uint64_t vector_bytes = vector_count * sizeof(float);
+    const uint64_t sequence_vector_bytes = (uint64_t)n_tokens * vector_bytes;
+    const uint64_t conv_bytes = vector_count * conv_kernel * sizeof(float);
+    const uint64_t state_bytes = vector_count * head_dim * sizeof(float);
+    const uint64_t head_bytes = (uint64_t)n_head * sizeof(float);
+    const uint64_t sequence_head_bytes = (uint64_t)n_tokens * head_bytes;
+    if (out->bytes < sequence_vector_bytes || recurrent_state->bytes < state_bytes ||
+        q_conv_state->bytes < conv_bytes || k_conv_state->bytes < conv_bytes ||
+        v_conv_state->bytes < conv_bytes || q_raw->bytes < sequence_vector_bytes ||
+        k_raw->bytes < sequence_vector_bytes || v_raw->bytes < sequence_vector_bytes ||
+        g_raw->bytes < sequence_vector_bytes || beta_logits->bytes < sequence_head_bytes ||
+        q_conv_weight->bytes < conv_bytes || k_conv_weight->bytes < conv_bytes ||
+        v_conv_weight->bytes < conv_bytes || decay_scale->bytes < head_bytes ||
+        dt_bias->bytes < vector_bytes) {
+        return 0;
+    }
+
+    uint32_t threads = 1u;
+    while (threads < head_dim) threads <<= 1u;
+    solar_kda_sequence_kernel<<<n_head, threads, 0, ds4_current_stream()>>>(
+            (float *)out->ptr,
+            (float *)recurrent_state->ptr,
+            (float *)q_conv_state->ptr,
+            (float *)k_conv_state->ptr,
+            (float *)v_conv_state->ptr,
+            (const float *)q_raw->ptr,
+            (const float *)k_raw->ptr,
+            (const float *)v_raw->ptr,
+            (const float *)g_raw->ptr,
+            (const float *)beta_logits->ptr,
+            (const float *)q_conv_weight->ptr,
+            (const float *)k_conv_weight->ptr,
+            (const float *)v_conv_weight->ptr,
+            (const float *)decay_scale->ptr,
+            (const float *)dt_bias->ptr,
+            n_tokens, n_head, head_dim, conv_kernel, gate_lower_bound);
+    return cuda_ok(cudaGetLastError(), what);
+}
+
+extern "C" int ds4_gpu_solar_kda_decode_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound) {
+    return solar_kda_sequence_tensor(
+        out, recurrent_state, q_conv_state, k_conv_state, v_conv_state,
+        q_raw, k_raw, v_raw, g_raw, beta_logits,
+        q_conv_weight, k_conv_weight, v_conv_weight, decay_scale, dt_bias,
+        1u, n_head, head_dim, conv_kernel, gate_lower_bound,
+        "solar-open2 KDA decode");
+}
+
+extern "C" int ds4_gpu_solar_kda_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound) {
+    return solar_kda_sequence_tensor(
+        out, recurrent_state, q_conv_state, k_conv_state, v_conv_state,
+        q_raw, k_raw, v_raw, g_raw, beta_logits,
+        q_conv_weight, k_conv_weight, v_conv_weight, decay_scale, dt_bias,
+        n_tokens, n_head, head_dim, conv_kernel, gate_lower_bound,
+        "solar-open2 KDA chunked prefill");
+}
+
+/* Solar output gates. Keeping these separate from the KDA recurrence makes
+ * the recurrence fixture useful on its own and gives the GQA branch the same
+ * elementwise sigmoid implementation. */
+static __global__ void solar_sigmoid_gate_kernel(
+        float *out, const float *x, const float *gate, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = x[i] / (1.0f + expf(-gate[i]));
+}
+
+static __global__ void solar_head_rms_sigmoid_gate_kernel(
+        float       *out,
+        const float *x,
+        const float *gate,
+        const float *weight,
+        uint32_t     n_head,
+        uint32_t     head_dim,
+        float        eps) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    const uint64_t base = (uint64_t)row * head_dim;
+    (void)n_head;
+
+    __shared__ float warp_sum[32];
+    float sumsq = 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += nth) {
+        const float v = x[base + d];
+        sumsq += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+    }
+    if ((tid & 31u) == 0u) warp_sum[tid >> 5] = sumsq;
+    __syncthreads();
+    if (tid < 32u) {
+        sumsq = tid < (nth + 31u) / 32u ? warp_sum[tid] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+        }
+        if (tid == 0u) warp_sum[0] = sumsq;
+    }
+    __syncthreads();
+
+    const float scale = rsqrtf(warp_sum[0] / (float)head_dim + eps);
+    for (uint32_t d = tid; d < head_dim; d += nth) {
+        const float sigmoid = 1.0f / (1.0f + expf(-gate[base + d]));
+        out[base + d] = x[base + d] * scale * weight[d] * sigmoid;
+    }
+}
+
+extern "C" int ds4_gpu_solar_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        uint64_t                count) {
+    const uint64_t bytes = count * sizeof(float);
+    if (!out || !x || !gate || count == 0u ||
+        out->bytes < bytes || x->bytes < bytes || gate->bytes < bytes) {
+        return 0;
+    }
+    const uint32_t threads = 256u;
+    const uint64_t blocks = (count + threads - 1u) / threads;
+    if (blocks > UINT32_MAX) return 0;
+    solar_sigmoid_gate_kernel<<<(uint32_t)blocks, threads, 0,
+                                ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr,
+            (const float *)gate->ptr, count);
+    return cuda_ok(cudaGetLastError(), "solar-open2 GQA sigmoid gate");
+}
+
+extern "C" int ds4_gpu_solar_head_rms_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *weight,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   eps) {
+    if (!out || !x || !gate || !weight || n_tokens == 0u || n_head == 0u ||
+        head_dim == 0u || head_dim > 1024u || !(eps > 0.0f)) {
+        return 0;
+    }
+    const uint64_t count = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t bytes = count * sizeof(float);
+    if (out->bytes < bytes || x->bytes < bytes || gate->bytes < bytes ||
+        weight->bytes < (uint64_t)head_dim * sizeof(float)) {
+        return 0;
+    }
+    uint32_t threads = 32u;
+    while (threads < head_dim && threads < 1024u) threads <<= 1u;
+    const uint64_t rows = (uint64_t)n_tokens * n_head;
+    if (rows > UINT32_MAX) return 0;
+    solar_head_rms_sigmoid_gate_kernel<<<(uint32_t)rows, threads, 0,
+                                         ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr,
+            (const float *)gate->ptr, (const float *)weight->ptr,
+            n_head, head_dim, eps);
+    return cuda_ok(cudaGetLastError(),
+                   "solar-open2 KDA gated head RMS norm");
+}

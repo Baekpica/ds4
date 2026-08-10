@@ -69,7 +69,8 @@ endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression \
         proof-cuda-smoke proof-cuda-long proof-cuda-opp-c print-version \
-        test-solar-loader
+        test-solar-loader test-solar-kda test-solar-kda-prefill \
+        test-solar-gates
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -240,6 +241,15 @@ ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
 
+tests/test_solar_kda.o: tests/test_solar_kda.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_kda_prefill.o: tests/test_solar_kda_prefill.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_gates.o: tests/test_solar_gates.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
@@ -299,6 +309,24 @@ cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/test_solar_kda: tests/test_solar_kda.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-kda: tests/test_solar_kda
+	./tests/test_solar_kda
+
+tests/test_solar_kda_prefill: tests/test_solar_kda_prefill.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-kda-prefill: tests/test_solar_kda_prefill
+	./tests/test_solar_kda_prefill
+
+tests/test_solar_gates: tests/test_solar_gates.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-gates: tests/test_solar_gates
+	./tests/test_solar_gates
+
 ds4_weight_server: tools/ds4_weight_server.cu cuda/mmq/ds4_repack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ tools/ds4_weight_server.cu cuda/mmq/ds4_repack.o $(CUDA_LDLIBS)
 
@@ -328,4 +356,4 @@ test: ds4_test ds4-eval tests/test_split_gguf
 	./tests/test_split_gguf
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_gates tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_gates.o
