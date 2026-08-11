@@ -16275,6 +16275,63 @@ static const char *server_artifact_source_name(uint64_t source) {
     return source == 2 ? "built" : source == 1 ? "imported" : "none";
 }
 
+/* memgov D0a-3: census snapshot publication.  ONE registry image per
+ * rendering pass -- a single copy loop over ds4_gpu_mem_census_read --
+ * feeds /metrics, /v1/stats, and the boot census block, so no porcelain
+ * mixes per-counter reads across in-flight updates.  Registry reads stay
+ * single-writer racy by design until D0b's epochs (plan sec 6.3); a
+ * control-plane copy is exactly as coherent as the tripwire idiom.
+ * Names are FIXED cardinality, positional against the census enums
+ * (census sec 6; metrics plan sec 14): no dynamic labels, ever. */
+static const char *mem_class_names[DS4_MEMC__COUNT] = {
+    "engine_other",   "weight_arena",   "weight_span",   "weight_whole",
+    "weight_derived", "weight_import",  "weight_artifact", "weight_host_pin",
+    "stage_pin",      "scalars_mirror", "session_tensors", "kv_primary",
+    "batch_bank",     "scratch_sticky", "kernel_partials", "graph_exec",
+    "diag",
+};
+static const char *mem_domain_names[DS4_MEMD__COUNT] = {
+    "unified_device", "pinned_host",
+};
+static const char *mem_obs_status_names[3] = { "ok", "unsupported", "query_error" };
+static const char *mem_obs_source_names[3] = { "none", "cuda_free", "meminfo_available" };
+
+typedef struct {
+    ds4_mem_cell cells[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
+    uint64_t faults;
+    int supported;                 /* 0 = backend keeps no census (Metal/CPU):
+                                    * porcelains render ABSENCE, never zero */
+} mem_census_image;
+
+static void mem_census_snapshot(mem_census_image *img) {
+    memset(img, 0, sizeof(*img));
+#ifndef DS4_NO_GPU
+    for (int c = 0; c < DS4_MEMC__COUNT; c++)
+        for (int d = 0; d < DS4_MEMD__COUNT; d++)
+            if (ds4_gpu_mem_census_read(c, d, &img->cells[c][d]) != 0)
+                return;
+    img->faults = ds4_gpu_mem_census_faults();
+    img->supported = 1;
+#endif
+}
+
+/* Fresh typed observation for render time; UNSUPPORTED where the backend
+ * (or a CPU build) keeps no answer.  Clamped enums so the name tables
+ * above can never be indexed out of range by a future status. */
+static void mem_obs_sample(ds4_mem_observation *o) {
+    memset(o, 0, sizeof(*o));
+    o->status = DS4_MEMOBS_UNSUPPORTED;
+#ifndef DS4_NO_GPU
+    (void)ds4_gpu_mem_observe(o);
+#endif
+    if (o->status < 0 || o->status > DS4_MEMOBS_QUERY_ERROR)
+        o->status = DS4_MEMOBS_QUERY_ERROR;
+    if (o->source < 0 || o->source > DS4_MEMOBS_SRC_MEMINFO_AVAILABLE)
+        o->source = DS4_MEMOBS_SRC_NONE;
+}
+
+static double mem_gib(uint64_t bytes) { return (double)bytes / 1073741824.0; }
+
 /* Prometheus text exposition (hand-rolled: it is just lines). */
 static void send_metrics(server *s, int fd) {
     ds4_metrics *m = ds4_metrics_get();
@@ -16452,6 +16509,69 @@ static void send_metrics(server *s, int fd) {
                server_artifact_source_name(ds4_metric_read(&m->derived_artifact_source)),
                (unsigned long long)ds4_metric_read(&m->derived_artifacts),
                (unsigned long long)ds4_metric_read(&m->derived_artifact_bytes));
+    /* memgov D0a-3: allocation census, one image, all cells always emitted
+     * (17 classes x 2 domains x 3 states).  requested/allocated are LIVE
+     * sums (consumer asks vs allocator commits); slack their floor-0
+     * difference (census sec 4).  The whole family is ABSENT when the
+     * backend keeps no census -- absence is not zero. */
+    {
+        mem_census_image img;
+        mem_census_snapshot(&img);
+        buf_printf(&b, "# TYPE ds4_memory_census_supported gauge\n"
+                       "ds4_memory_census_supported %d\n", img.supported);
+        if (img.supported) {
+            buf_puts(&b, "# TYPE ds4_memory_bytes gauge\n");
+            for (int d = 0; d < DS4_MEMD__COUNT; d++) {
+                for (int c = 0; c < DS4_MEMC__COUNT; c++) {
+                    const ds4_mem_cell *cc = &img.cells[c][d];
+                    const uint64_t req = cc->requested - cc->freed_requested;
+                    buf_printf(&b,
+                        "ds4_memory_bytes{domain=\"%s\",class=\"%s\",state=\"requested\"} %llu\n"
+                        "ds4_memory_bytes{domain=\"%s\",class=\"%s\",state=\"allocated\"} %llu\n"
+                        "ds4_memory_bytes{domain=\"%s\",class=\"%s\",state=\"slack\"} %llu\n",
+                        mem_domain_names[d], mem_class_names[c],
+                        (unsigned long long)req,
+                        mem_domain_names[d], mem_class_names[c],
+                        (unsigned long long)ds4_mem_cell_live(cc),
+                        mem_domain_names[d], mem_class_names[c],
+                        (unsigned long long)ds4_mem_cell_slack(cc));
+                }
+            }
+            buf_printf(&b, "# TYPE ds4_memory_census_faults_total counter\n"
+                           "ds4_memory_census_faults_total %llu\n",
+                       (unsigned long long)img.faults);
+        }
+#ifndef DS4_NO_GPU
+        /* lite-3 tripwire, SAME call the fit/floor verdicts consume --
+         * published, not re-derived (bit-identity is a close-gate assert). */
+        buf_printf(&b, "# TYPE ds4_memory_substrate_outstanding_bytes gauge\n"
+                       "ds4_memory_substrate_outstanding_bytes %llu\n",
+                   (unsigned long long)ds4_gpu_substrate_outstanding());
+#endif
+        /* Render-time observation (fresh sample) + decision-site history. */
+        ds4_mem_observation o;
+        mem_obs_sample(&o);
+        buf_puts(&b, "# TYPE ds4_memory_observation_info gauge\n");
+        for (int st = 0; st < 3; st++)
+            for (int so = 0; so < 3; so++)
+                buf_printf(&b, "ds4_memory_observation_info{status=\"%s\",source=\"%s\"} %d\n",
+                           mem_obs_status_names[st], mem_obs_source_names[so],
+                           (o.status == st && o.source == so) ? 1 : 0);
+        if (o.status == DS4_MEMOBS_OK)
+            buf_printf(&b, "# TYPE ds4_memory_observation_bytes gauge\n"
+                           "ds4_memory_observation_bytes{kind=\"free\"} %llu\n"
+                           "ds4_memory_observation_bytes{kind=\"total\"} %llu\n",
+                       (unsigned long long)o.free_bytes,
+                       (unsigned long long)o.total_bytes);
+        buf_puts(&b, "# TYPE ds4_memory_observation_calls_total counter\n");
+        for (int so = 0; so < 3; so++)
+            buf_printf(&b, "ds4_memory_observation_calls_total{source=\"%s\"} %llu\n",
+                       mem_obs_source_names[so],
+                       (unsigned long long)ds4_metric_read(&m->memobs_calls[so]));
+        buf_printf(&b, "# TYPE ds4_memory_observation_errors_total counter\n"
+                       "ds4_memory_observation_errors_total %llu\n",
+                   (unsigned long long)ds4_metric_read(&m->memobs_errors));
+    }
     http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);
 }
@@ -16545,7 +16665,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                        "\"tokens_prefilled_computed\":%llu,"
                        "\"tokens_prefilled_cached\":%llu,\"prefill_tok_s_60s\":%.2f,"
                        "\"warm_records\":%llu,\"banks_live\":%llu,\"banks_total\":%llu,"
-                       "\"kv_pages_resident\":%llu}}\n",
+                       "\"kv_pages_resident\":%llu}",
                    (unsigned long long)ds4_metric_read(&m->admits_cold),
                    (unsigned long long)ds4_metric_read(&m->admits_warm),
                    (unsigned long long)ds4_metric_read(&m->admits_fork),
@@ -16560,6 +16680,56 @@ static void send_stats(server *s, int fd, bool as_json) {
                    (unsigned long long)ds4_metric_read(&m->banks_live),
                    (unsigned long long)ds4_metric_read(&m->banks_total),
                    (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+        /* memgov D0a-3: memory section from ONE census image (fixed keys;
+         * classes/totals omitted entirely when the backend keeps none). */
+        {
+            mem_census_image img;
+            mem_census_snapshot(&img);
+            buf_printf(&b, ",\"memory\":{\"census_supported\":%s",
+                       img.supported ? "true" : "false");
+            if (img.supported) {
+                uint64_t tl[DS4_MEMD__COUNT] = {0}, ts[DS4_MEMD__COUNT] = {0};
+                buf_puts(&b, ",\"classes\":{");
+                for (int c = 0; c < DS4_MEMC__COUNT; c++) {
+                    buf_printf(&b, "%s\"%s\":{", c ? "," : "", mem_class_names[c]);
+                    for (int d = 0; d < DS4_MEMD__COUNT; d++) {
+                        const uint64_t lv = ds4_mem_cell_live(&img.cells[c][d]);
+                        const uint64_t sl = ds4_mem_cell_slack(&img.cells[c][d]);
+                        tl[d] += lv; ts[d] += sl;
+                        buf_printf(&b, "%s\"%s\":{\"live\":%llu,\"slack\":%llu}",
+                                   d ? "," : "", mem_domain_names[d],
+                                   (unsigned long long)lv, (unsigned long long)sl);
+                    }
+                    buf_putc(&b, '}');
+                }
+                buf_printf(&b, "},\"totals\":{\"device_live\":%llu,\"device_slack\":%llu,"
+                               "\"host_pin_live\":%llu,\"host_pin_slack\":%llu},"
+                               "\"census_faults\":%llu",
+                           (unsigned long long)tl[DS4_MEMD_UNIFIED_DEVICE],
+                           (unsigned long long)ts[DS4_MEMD_UNIFIED_DEVICE],
+                           (unsigned long long)tl[DS4_MEMD_PINNED_HOST],
+                           (unsigned long long)ts[DS4_MEMD_PINNED_HOST],
+                           (unsigned long long)img.faults);
+#ifndef DS4_NO_GPU
+                buf_printf(&b, ",\"substrate_outstanding\":%llu",
+                           (unsigned long long)ds4_gpu_substrate_outstanding());
+#endif
+            }
+            ds4_mem_observation o;
+            mem_obs_sample(&o);
+            buf_printf(&b, ",\"observation\":{\"status\":\"%s\",\"source\":\"%s\"",
+                       mem_obs_status_names[o.status], mem_obs_source_names[o.source]);
+            if (o.status == DS4_MEMOBS_OK)
+                buf_printf(&b, ",\"free_bytes\":%llu,\"total_bytes\":%llu",
+                           (unsigned long long)o.free_bytes,
+                           (unsigned long long)o.total_bytes);
+            buf_printf(&b, ",\"calls_cuda_free\":%llu,\"calls_meminfo_available\":%llu,"
+                           "\"errors\":%llu}}",
+                       (unsigned long long)ds4_metric_read(&m->memobs_calls[DS4_MEMOBS_SRC_CUDA_FREE]),
+                       (unsigned long long)ds4_metric_read(&m->memobs_calls[DS4_MEMOBS_SRC_MEMINFO_AVAILABLE]),
+                       (unsigned long long)ds4_metric_read(&m->memobs_errors));
+        }
+        buf_puts(&b, "}\n");
         http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
         buf_free(&b);
         return;
@@ -16671,6 +16841,43 @@ static void send_stats(server *s, int fd, bool as_json) {
                (unsigned long long)ds4_metric_read(&m->banks_live),
                (unsigned long long)ds4_metric_read(&m->banks_total),
                (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+    /* memgov D0a-3: status-board view of the same ONE census image --
+     * nonzero rows only (the complete fixed surface is /metrics). */
+    {
+        mem_census_image img;
+        mem_census_snapshot(&img);
+        buf_printf(&b, "\n# Memory census\ncensus_supported:%d\n", img.supported);
+        if (img.supported) {
+            uint64_t tl[DS4_MEMD__COUNT] = {0}, ts[DS4_MEMD__COUNT] = {0};
+            for (int d = 0; d < DS4_MEMD__COUNT; d++) {
+                for (int c = 0; c < DS4_MEMC__COUNT; c++) {
+                    const uint64_t lv = ds4_mem_cell_live(&img.cells[c][d]);
+                    const uint64_t sl = ds4_mem_cell_slack(&img.cells[c][d]);
+                    tl[d] += lv; ts[d] += sl;
+                    if (lv || sl)
+                        buf_printf(&b, "%s.%s:live=%.2fGiB slack=%.2fGiB\n",
+                                   mem_domain_names[d], mem_class_names[c],
+                                   mem_gib(lv), mem_gib(sl));
+                }
+            }
+            buf_printf(&b, "totals:device_live=%.2fGiB device_slack=%.2fGiB "
+                           "host_pin_live=%.2fGiB host_pin_slack=%.2fGiB\n"
+                           "census_faults:%llu\n",
+                       mem_gib(tl[DS4_MEMD_UNIFIED_DEVICE]),
+                       mem_gib(ts[DS4_MEMD_UNIFIED_DEVICE]),
+                       mem_gib(tl[DS4_MEMD_PINNED_HOST]),
+                       mem_gib(ts[DS4_MEMD_PINNED_HOST]),
+                       (unsigned long long)img.faults);
+        }
+        ds4_mem_observation o;
+        mem_obs_sample(&o);
+        if (o.status == DS4_MEMOBS_OK)
+            buf_printf(&b, "observation:%s free=%.2fGiB total=%.2fGiB\n",
+                       mem_obs_source_names[o.source],
+                       mem_gib(o.free_bytes), mem_gib(o.total_bytes));
+        else
+            buf_printf(&b, "observation:%s\n", mem_obs_status_names[o.status]);
+    }
     http_response(fd, s->enable_cors, 200, "text/plain", b.ptr);
     buf_free(&b);
 }
@@ -18106,6 +18313,42 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     ds4_metric_set(&ds4_metrics_get()->boot_stamp, (uint64_t)now_sec());
+#ifndef DS4_NO_GPU
+    /* memgov D0a-3: one-shot boot census block -- the same ONE image the
+     * porcelains render, at boot settle (ctx ready + prewarm done, before
+     * the listener opens).  Nonzero cells only; the totals line carries
+     * faults and the substrate tripwire via the SAME call the fit/floor
+     * verdicts consume (bit-identity is a close-gate assert). */
+    {
+        mem_census_image img;
+        mem_census_snapshot(&img);
+        if (img.supported) {
+            uint64_t tl[DS4_MEMD__COUNT] = {0}, ts[DS4_MEMD__COUNT] = {0};
+            for (int d = 0; d < DS4_MEMD__COUNT; d++) {
+                for (int c = 0; c < DS4_MEMC__COUNT; c++) {
+                    const uint64_t lv = ds4_mem_cell_live(&img.cells[c][d]);
+                    const uint64_t sl = ds4_mem_cell_slack(&img.cells[c][d]);
+                    tl[d] += lv; ts[d] += sl;
+                    if (lv || sl)
+                        server_log(DS4_LOG_DEFAULT,
+                                   "ds4-server: memory census: %s %s live=%.2f GiB slack=%.2f GiB",
+                                   mem_domain_names[d], mem_class_names[c],
+                                   mem_gib(lv), mem_gib(sl));
+                }
+            }
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: memory census totals: device live=%.2f GiB slack=%.2f GiB "
+                       "host_pin live=%.2f GiB slack=%.2f GiB faults=%llu "
+                       "substrate_outstanding=%.2f GiB",
+                       mem_gib(tl[DS4_MEMD_UNIFIED_DEVICE]),
+                       mem_gib(ts[DS4_MEMD_UNIFIED_DEVICE]),
+                       mem_gib(tl[DS4_MEMD_PINNED_HOST]),
+                       mem_gib(ts[DS4_MEMD_PINNED_HOST]),
+                       (unsigned long long)img.faults,
+                       mem_gib(ds4_gpu_substrate_outstanding()));
+        }
+    }
+#endif
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
     update_check_start();
 
@@ -25604,6 +25847,31 @@ static void test_mem_census_trim_inject_driver(void) {
 }
 #endif /* !DS4_NO_GPU */
 
+/* memgov D0a-3: publication preconditions on EVERY backend -- positional
+ * name tables fully populated (a hole would misattribute a class in every
+ * porcelain), snapshot supported-flag consistent with the backend, and
+ * the render-time observation sampler always returning clamped enums the
+ * name tables can index. */
+static void test_mem_census_publication_shape(void) {
+    for (int c = 0; c < DS4_MEMC__COUNT; c++)
+        TEST_ASSERT(mem_class_names[c] && mem_class_names[c][0]);
+    for (int d = 0; d < DS4_MEMD__COUNT; d++)
+        TEST_ASSERT(mem_domain_names[d] && mem_domain_names[d][0]);
+    mem_census_image img;
+    mem_census_snapshot(&img);
+    int backend = 0;
+#ifndef DS4_NO_GPU
+    ds4_mem_cell probe;
+    backend = ds4_gpu_mem_census_read(0, 0, &probe) == 0;
+#endif
+    TEST_ASSERT(img.supported == backend);
+    ds4_mem_observation o;
+    mem_obs_sample(&o);
+    TEST_ASSERT(o.status >= DS4_MEMOBS_OK && o.status <= DS4_MEMOBS_QUERY_ERROR);
+    TEST_ASSERT(o.source >= DS4_MEMOBS_SRC_NONE &&
+                o.source <= DS4_MEMOBS_SRC_MEMINFO_AVAILABLE);
+}
+
 static void test_mem_obs_legacy_shim(void) {
     /* D0a-2: every typed state must map to the EXACT legacy
      * ds4_gpu_mem_info contract -- rc 0 + outputs only on OK, rc 1 with
@@ -25785,6 +26053,7 @@ static void ds4_server_unit_tests_run(void) {
 #ifndef DS4_NO_GPU
     test_mem_census_trim_inject_driver();
 #endif
+    test_mem_census_publication_shape();
     /* memgov D0a-2: typed observation legacy shim. */
     test_mem_obs_legacy_shim();
 }

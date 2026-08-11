@@ -604,6 +604,13 @@ typedef struct {
      * cut-list check reads). */
     uint64_t batch_genmu_wait_ns;
     uint64_t batch_genmu_waits;
+    /* memgov D0a-3: typed-observation history at the DECISION site (O1,
+     * the ds4_mem_usable live gate) -- OK answers by winning source, plus
+     * non-OK calls.  The porcelains sample the CURRENT observation fresh
+     * at render time; these counters carry what the gate actually
+     * consumed over the process lifetime. */
+    uint64_t memobs_calls[DS4_MEMOBS_SRC_MEMINFO_AVAILABLE + 1];
+    uint64_t memobs_errors;
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);

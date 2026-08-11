@@ -3462,6 +3462,13 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
+    /* memgov D0a-3: a view is a WINDOW into the base's allocation -- pages
+     * ensured (or trimmed) through it charge the base's census class, not
+     * the ambient scope at view creation.  Without this, the emit-site
+     * ensure_rows hooks (which run through per-bank slab views installed
+     * at admission) charged ENGINE_OTHER ~2 pages/layer per new tenant --
+     * measured 84 MiB on the first admission. */
+    t->memc = base->memc;
     return t;
 }
 

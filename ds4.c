@@ -33446,6 +33446,16 @@ static uint64_t ds4_mem_floor_bytes(void) {
 static uint64_t ds4_mem_usable(void) {
     ds4_mem_observation o;
     (void)ds4_gpu_mem_observe(&o);
+    /* D0a-3: decision-site observation counters (rendered by /metrics and
+     * /v1/stats).  Relaxed adds; no decision reads them. */
+    if (o.status == DS4_MEMOBS_OK) {
+        const int src = (o.source >= 0 &&
+                         o.source <= DS4_MEMOBS_SRC_MEMINFO_AVAILABLE)
+                            ? o.source : DS4_MEMOBS_SRC_NONE;
+        ds4_metric_add(&ds4_metrics_get()->memobs_calls[src], 1);
+    } else {
+        ds4_metric_add(&ds4_metrics_get()->memobs_errors, 1);
+    }
     /* D0a-2: one-time source disclosure -- which estimate the live gate
      * actually consumes (the integrated max-of-two pick was previously
      * silent).  Values and the UINT64_MAX fail-open are bit-identical to
