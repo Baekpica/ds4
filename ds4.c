@@ -33444,10 +33444,22 @@ static uint64_t ds4_mem_floor_bytes(void) {
  * (inc0b_receipt_2026-08-06.md).  One term, one place: every usable()
  * consumer (floor verdict, serial-reserve clamp, reject prints) inherits. */
 static uint64_t ds4_mem_usable(void) {
-    uint64_t lfree = 0, ltotal = 0;
-    if (ds4_gpu_mem_info(&lfree, &ltotal) != 0) return UINT64_MAX;
+    ds4_mem_observation o;
+    (void)ds4_gpu_mem_observe(&o);
+    /* D0a-2: one-time source disclosure -- which estimate the live gate
+     * actually consumes (the integrated max-of-two pick was previously
+     * silent).  Values and the UINT64_MAX fail-open are bit-identical to
+     * the pre-typed ds4_gpu_mem_info path. */
+    static int obs_logged = 0;
+    if (!obs_logged && o.status == DS4_MEMOBS_OK) {
+        obs_logged = 1;
+        fprintf(stderr, "ds4: mem observation source=%s\n",
+                o.source == DS4_MEMOBS_SRC_MEMINFO_AVAILABLE
+                    ? "meminfo-available" : "cuda-free");
+    }
+    if (o.status != DS4_MEMOBS_OK) return UINT64_MAX;
     const uint64_t fl = ds4_mem_floor_bytes();
-    uint64_t u = lfree > fl ? lfree - fl : 0;
+    uint64_t u = o.free_bytes > fl ? o.free_bytes - fl : 0;
     const uint64_t sub = ds4_gpu_substrate_outstanding();
     return u > sub ? u - sub : 0;
 }

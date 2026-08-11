@@ -122,4 +122,46 @@ static inline uint64_t ds4_mem_cell_slack(const ds4_mem_cell *c) {
     return live_com > live_req ? live_com - live_req : 0;
 }
 
+/* =========================================================================
+ * memgov D0a-2: typed memory observation.
+ *
+ * The provider (ds4_gpu_mem_observe) reports a typed status + WHICH source
+ * produced the winning free-bytes answer, replacing sentinel-only returns.
+ * The legacy shim below maps the typed form to the EXACT ds4_gpu_mem_info
+ * contract (rc!=0 with outputs untouched on anything but OK) so no
+ * decision can move in D0a; enforcement changes are D0b/D2's.  On
+ * integrated CUDA the provider takes max(cudaMemGetInfo free,
+ * /proc/meminfo MemAvailable) -- the source field makes that choice,
+ * previously silent, observable. */
+typedef enum {
+    DS4_MEMOBS_OK = 0,
+    DS4_MEMOBS_UNSUPPORTED,          /* backend keeps no answer (Metal)   */
+    DS4_MEMOBS_QUERY_ERROR           /* backend query failed this call    */
+} ds4_mem_obs_status;
+
+typedef enum {
+    DS4_MEMOBS_SRC_NONE = 0,
+    DS4_MEMOBS_SRC_CUDA_FREE,        /* cudaMemGetInfo free won           */
+    DS4_MEMOBS_SRC_MEMINFO_AVAILABLE /* MemAvailable won (integrated)     */
+} ds4_mem_obs_source;
+
+typedef struct {
+    int status;                      /* ds4_mem_obs_status                */
+    int source;                      /* ds4_mem_obs_source of free_bytes  */
+    uint64_t free_bytes;
+    uint64_t total_bytes;
+} ds4_mem_observation;
+
+/* Typed -> legacy ds4_gpu_mem_info semantics: rc 0 + outputs only on OK;
+ * every non-OK state is rc 1 with the outputs left untouched (callers
+ * pre-zero or fail open, exactly as before). */
+static inline int ds4_mem_obs_to_legacy(const ds4_mem_observation *o,
+                                        uint64_t *free_bytes,
+                                        uint64_t *total_bytes) {
+    if (!o || o->status != DS4_MEMOBS_OK) return 1;
+    if (free_bytes) *free_bytes = o->free_bytes;
+    if (total_bytes) *total_bytes = o->total_bytes;
+    return 0;
+}
+
 #endif /* DS4_MEM_CENSUS_H */

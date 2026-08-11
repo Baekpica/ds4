@@ -4498,6 +4498,16 @@ int ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out) {
     return 1;
 }
 uint64_t ds4_gpu_mem_census_faults(void) { return 0; }
+int ds4_gpu_mem_observe(ds4_mem_observation *out) {
+    /* Same truth ds4_gpu_mem_info always told (no reliable free-memory
+     * answer on Metal), now as a typed state instead of a bare rc. */
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        out->status = DS4_MEMOBS_UNSUPPORTED;
+        out->source = DS4_MEMOBS_SRC_NONE;
+    }
+    return 1;
+}
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;

@@ -488,6 +488,9 @@ void ds4_gpu_mem_scope_begin(int consumer_class);
 void ds4_gpu_mem_scope_end(void);
 int  ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out);
 uint64_t ds4_gpu_mem_census_faults(void);
+/* D0a-2 typed observation provider (CUDA real; Metal reports
+ * UNSUPPORTED).  ds4_gpu_mem_info is now a shim over this. */
+int  ds4_gpu_mem_observe(ds4_mem_observation *out);
 
 /* =========================================================================
  * Live serving metrics (v0.2.x observability): ONE registry, THREE porcelains.

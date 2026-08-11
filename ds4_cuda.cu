@@ -3365,14 +3365,25 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     return free_bytes - context_bytes < reserve_bytes;
 }
 
-extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+/* memgov D0a-2: THE typed memory-observation provider.  Body is the old
+ * ds4_gpu_mem_info verbatim plus status/source stamping; ds4_gpu_mem_info
+ * below is now a shim over this (ds4_mem_obs_to_legacy), so every legacy
+ * caller sees bit-identical values and return codes. */
+extern "C" int ds4_gpu_mem_observe(ds4_mem_observation *out) {
+    ds4_mem_observation o;
+    memset(&o, 0, sizeof(o));
+    o.status = DS4_MEMOBS_QUERY_ERROR;
+    o.source = DS4_MEMOBS_SRC_NONE;
     size_t free_b = 0;
     size_t total_b = 0;
     cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
+        if (out) *out = o;
         return 1;
     }
+    o.status = DS4_MEMOBS_OK;
+    o.source = DS4_MEMOBS_SRC_CUDA_FREE;
     uint64_t free_out = (uint64_t)free_b;
 #ifdef __linux__
     /* Integrated/unified (GB10): cudaMemGetInfo's free tracks MemFree and
@@ -3410,7 +3421,10 @@ extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
                      * mapping's page cache does not thrash decode.  Trust
                      * MemAvailable; the caller's own headroom is the margin. */
                     uint64_t avail = kb * 1024ull;
-                    if (avail > free_out) free_out = avail;
+                    if (avail > free_out) {
+                        free_out = avail;
+                        o.source = DS4_MEMOBS_SRC_MEMINFO_AVAILABLE;
+                    }
                     break;
                 }
             }
@@ -3419,9 +3433,16 @@ extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
     }
     (void)cudaGetLastError();
 #endif
-    if (free_bytes) *free_bytes = free_out;
-    if (total_bytes) *total_bytes = (uint64_t)total_b;
+    o.free_bytes = free_out;
+    o.total_bytes = (uint64_t)total_b;
+    if (out) *out = o;
     return 0;
+}
+
+extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+    ds4_mem_observation o;
+    (void)ds4_gpu_mem_observe(&o);
+    return ds4_mem_obs_to_legacy(&o, free_bytes, total_bytes);
 }
 
 extern "C" void ds4_gpu_boot_trim(void) {

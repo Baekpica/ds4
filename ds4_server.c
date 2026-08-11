@@ -25496,6 +25496,28 @@ static void test_mem_census_trim_residue_shape(void) {
     TEST_ASSERT(DS4_MEMD__COUNT == 2);
 }
 
+static void test_mem_obs_legacy_shim(void) {
+    /* D0a-2: every typed state must map to the EXACT legacy
+     * ds4_gpu_mem_info contract -- rc 0 + outputs only on OK, rc 1 with
+     * outputs untouched otherwise (callers pre-zero or fail open). */
+    ds4_mem_observation o;
+    o.status = DS4_MEMOBS_OK;
+    o.source = DS4_MEMOBS_SRC_MEMINFO_AVAILABLE;
+    o.free_bytes = 123;
+    o.total_bytes = 456;
+    uint64_t f = 0, t = 0;
+    TEST_ASSERT(ds4_mem_obs_to_legacy(&o, &f, &t) == 0);
+    TEST_ASSERT(f == 123 && t == 456);
+    f = t = 77;
+    o.status = DS4_MEMOBS_QUERY_ERROR;
+    TEST_ASSERT(ds4_mem_obs_to_legacy(&o, &f, &t) == 1);
+    TEST_ASSERT(f == 77 && t == 77);              /* untouched on failure */
+    o.status = DS4_MEMOBS_UNSUPPORTED;
+    TEST_ASSERT(ds4_mem_obs_to_legacy(&o, &f, &t) == 1);
+    TEST_ASSERT(ds4_mem_obs_to_legacy(NULL, &f, &t) == 1);
+    TEST_ASSERT(ds4_mem_obs_to_legacy(&o, NULL, NULL) == 1);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -25651,6 +25673,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_census_cell_arithmetic();
     test_mem_census_arena_slack_shape();
     test_mem_census_trim_residue_shape();
+    /* memgov D0a-2: typed observation legacy shim. */
+    test_mem_obs_legacy_shim();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
