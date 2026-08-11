@@ -537,6 +537,16 @@ void ds4_gpu_mem_census_fault_note(void);
  * under which raw expert ranges are never device-allocated.  Metal
  * stub returns 0. */
 int  ds4_gpu_model_map_replaces_complete(const void *model_map);
+/* memgov D1a-4: bind a source's compiled canonical-unit table (D1a-3) to
+ * the backend as THE residency plan.  The range-publication funnel stamps
+ * every published weight range with its source row + intersecting unit
+ * span; the boot report backfills publications that preceded the bind.
+ * The backend copies the table (process-lifetime, rebind refreshes in
+ * place -- the source-table law).  Requires the map already bound as a
+ * source; returns nonzero (and faults) otherwise.  Metal stub returns
+ * nonzero: units describe the CUDA residency plan (OBS-policy). */
+int  ds4_gpu_model_units_bind(const void *map_base, const ds4_phys_unit *units,
+                              uint32_t count);
 /* memgov D0b-3: the SHADOW governor.  One process-global lease ledger
  * (ds4_mem_gov.h types) written under the same single-writer discipline
  * as the census and read through the same seqlock protocol.  Publishes

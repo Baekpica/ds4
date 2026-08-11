@@ -330,6 +330,30 @@ static inline int ds4_unit_import_satisfied(const ds4_phys_unit *u,
     return 0;
 }
 
+/* D1a-4: the unit span of a published physical range -- the publication
+ * funnel's stamp.  Units are sorted and non-overlapping (ds4_units_verify),
+ * so the units intersecting [off, off+bytes) form a contiguous run:
+ * binary-search the first unit ending past `off`, then walk while units
+ * start before the interval end.  Outputs are inclusive unit indices;
+ * -1/-1 = no table, empty interval, or no intersection. */
+static inline void ds4_units_span_of(const ds4_phys_unit *units, uint32_t n,
+                                     uint64_t off, uint64_t bytes,
+                                     int *lo, int *hi) {
+    uint32_t a = 0, b = n, j;
+    *lo = *hi = -1;
+    if (!units || n == 0 || bytes == 0 || off + bytes < off) return;
+    while (a < b) {
+        const uint32_t mid = a + (b - a) / 2u;
+        if (units[mid].src_off + units[mid].src_bytes <= off) a = mid + 1;
+        else b = mid;
+    }
+    if (a >= n || units[a].src_off >= off + bytes) return;
+    *lo = (int)a;
+    j = a;
+    while (j + 1 < n && units[j + 1].src_off < off + bytes) j++;
+    *hi = (int)j;
+}
+
 /* Unit-table census for the boot line + gate reconcile. */
 typedef struct {
     uint64_t units;

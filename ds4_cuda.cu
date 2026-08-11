@@ -27,6 +27,7 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_mem_census.h"
+#include "ds4_model_catalog.h" /* memgov D1a-4: unit tables for range stamps */
 #include "ds4_mem_gov.h"      /* memgov D0b: epoch protocol primitives */
 
 #ifndef M_PI
@@ -645,6 +646,13 @@ struct cuda_model_range {
     CUmemGenericAllocationHandle vmm_handle;
     CUdeviceptr vmm_va;
     uint64_t vmm_alloc_bytes;
+    /* memgov D1a-4 publication stamps (funnel-owned; sites never set them).
+     * src = ledger row; unit_lo/unit_hi = inclusive canonical-unit span
+     * intersecting the range, -1/-1 before the source's table binds (the
+     * report backfills those once the plan exists). */
+    int src;
+    int unit_lo;
+    int unit_hi;
 };
 
 struct cuda_model_arena {
@@ -682,6 +690,9 @@ struct cuda_q8_f16_range {
     uint64_t in_dim;
     uint64_t out_dim;
     __half *device_ptr;
+    int src;                    /* D1a-4 stamps (see cuda_model_range) */
+    int unit_lo;
+    int unit_hi;
 };
 
 struct cuda_q8_f32_range {
@@ -691,6 +702,9 @@ struct cuda_q8_f32_range {
     uint64_t in_dim;
     uint64_t out_dim;
     float *device_ptr;
+    int src;                    /* D1a-4 stamps (see cuda_model_range) */
+    int unit_lo;
+    int unit_hi;
 };
 
 enum cuda_derived_kind {
@@ -732,6 +746,10 @@ struct cuda_derived_range {
     CUmemGenericAllocationHandle vmm_handle;
     CUdeviceptr vmm_va;
     uint64_t vmm_alloc_bytes;
+    int src;                    /* D1a-4 stamps (see cuda_model_range); the
+                                   unit span covers source_offset/_bytes */
+    int unit_lo;
+    int unit_hi;
 };
 
 /* memgov D1a-1: the exact-hit indexes key on (source map, offset) -- a
@@ -792,13 +810,175 @@ static int cuda_range_parity_on(void) {
     return on;
 }
 
-/* The one publication point for model-range index entries (the q8 caches
- * keep their own).  D1a-4 widens this into the checked full-range funnel;
- * for D1a-1 it carries the composite key + the parity shadow. */
+/* Index write for model-range entries: composite key + the D1a-1 parity
+ * shadow.  D1a-4: internal to cuda_model_range_publish -- no push site
+ * touches the index directly anymore. */
 static void cuda_range_index_note(const void *host_base, uint64_t offset,
                                   size_t idx) {
     g_model_range_by_offset[cuda_range_key{host_base, offset}] = idx;
     if (cuda_range_parity_on()) g_model_range_by_offset_legacy[offset] = idx;
+}
+
+/* --------------------------------------------------------------------
+ * memgov D1a-4: the checked range-publication funnel (plan §5.3).
+ *
+ * ONE checked helper per registry replaces the direct push sites: it
+ * refuses anomalous publications, stamps the source handle + canonical-
+ * unit span onto the published range, and owns the by-offset index.
+ * A refusal counts a census fault (every standing gate asserts zero)
+ * and prints one loud line; the caller routes it into its own
+ * allocation-failure path, so serving degrades to the next residency
+ * tier instead of trusting a corrupted registry.  After this, a range
+ * that exists is a range the plan knows.
+ *
+ * Refusal semantics, derived from what healthy flows actually publish:
+ * - model ranges refuse SAME-TIER interval overlap (host_registered
+ *   equal).  Device copies deliberately overlay the whole-map
+ *   registered view (the two-pass resolve prefers them), so cross-tier
+ *   overlap is the design, and a cross-tier exact-key collision stays
+ *   last-write-wins -- that is the promotion path.  Every caller
+ *   already dedups against the registry before allocating (resolve /
+ *   the S6 coverage belt), so a same-tier overlap here means double
+ *   residency of the same source bytes: silent VRAM double-booking
+ *   under the old push, a loud fault now.
+ * - derived artifacts refuse source-interval overlap within one KIND
+ *   for one map (one source span legitimately carries artifacts of
+ *   SEVERAL kinds: aligned Q8 + f16 colmajor from the same tensor).
+ * - the q8 dequant caches are exact-key registries: refuse a duplicate
+ *   live key (a hit with matching metadata never republishes, so a
+ *   duplicate means a metadata-mismatched shadow entry).
+ * Neutered entries (host_base nulled by ds4_gpu_unregister_model_map)
+ * match no live map and never block a publication; their stale index
+ * slots are legitimately reclaimed by overwrite. */
+static ds4_phys_unit *g_model_units_v[DS4_MSRC_MAX];
+static uint32_t g_model_units_n[DS4_MSRC_MAX];
+
+extern "C" int ds4_gpu_model_units_bind(const void *map_base,
+                                        const ds4_phys_unit *units,
+                                        uint32_t count) {
+    const int row = ds4_model_source_find(&g_model_srcs, map_base);
+    if (row < 0 || row >= DS4_MSRC_MAX || (count != 0 && !units)) {
+        g_mem_census_faults++;
+        return 1;
+    }
+    ds4_phys_unit *copy = NULL;
+    if (count != 0) {
+        copy = (ds4_phys_unit *)malloc((size_t)count * sizeof(*copy));
+        if (!copy) {
+            g_mem_census_faults++;
+            return 1;
+        }
+        memcpy(copy, units, (size_t)count * sizeof(*copy));
+    }
+    free(g_model_units_v[row]);     /* rebind refreshes in place */
+    g_model_units_v[row] = copy;
+    g_model_units_n[row] = count;
+    return 0;
+}
+
+/* Stamp resolution: source row by map containment, unit span by binary
+ * search of the row's bound table.  Publications that precede the table
+ * bind (the pre-cache walk and manifest imports run inside model open;
+ * the tables compile after) stamp -1/-1 and are backfilled by
+ * ds4_gpu_report_model_sources once the plan exists. */
+static void cuda_range_stamp(const void *map, uint64_t off, uint64_t bytes,
+                             int *src, int *unit_lo, int *unit_hi) {
+    *src = cuda_mem_src_index(map);
+    *unit_lo = *unit_hi = -1;
+    if (*src >= 0 && *src < DS4_MSRC_MAX)
+        ds4_units_span_of(g_model_units_v[*src], g_model_units_n[*src],
+                          off, bytes, unit_lo, unit_hi);
+}
+
+static uint64_t g_range_publish_refused;
+
+static int cuda_range_publish_refuse(const char *what, const void *map,
+                                     uint64_t off, uint64_t bytes,
+                                     const char *why) {
+    g_range_publish_refused++;
+    ds4_gpu_mem_census_fault_note();
+    fprintf(stderr,
+            "ds4: RANGE-PUBLISH REFUSED %s map=%p off=%llu bytes=%llu (%s)\n",
+            what, map, (unsigned long long)off, (unsigned long long)bytes, why);
+    return 0;
+}
+
+static int cuda_iv_overlap(uint64_t a_off, uint64_t a_bytes,
+                           uint64_t b_off, uint64_t b_bytes) {
+    return a_off < b_off + b_bytes && b_off < a_off + a_bytes;
+}
+
+/* Publish one model range: checks, stamps, vector push, index claim.
+ * Returns 1 published, 0 refused (fault counted; caller frees/unwinds
+ * exactly like its allocation-failure path). */
+static int cuda_model_range_publish(const cuda_model_range &nr) {
+    if (nr.bytes == 0 || nr.offset + nr.bytes < nr.offset)
+        return cuda_range_publish_refuse("model", nr.host_base, nr.offset,
+                                         nr.bytes, "empty/overflowed interval");
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base != nr.host_base) continue;
+        if ((r.host_registered != 0) != (nr.host_registered != 0)) continue;
+        if (cuda_iv_overlap(nr.offset, nr.bytes, r.offset, r.bytes))
+            return cuda_range_publish_refuse("model", nr.host_base, nr.offset,
+                                             nr.bytes, "same-tier overlap");
+    }
+    g_model_ranges.push_back(nr);
+    cuda_model_range &pr = g_model_ranges.back();
+    cuda_range_stamp(pr.host_base, pr.offset, pr.bytes,
+                     &pr.src, &pr.unit_lo, &pr.unit_hi);
+    cuda_range_index_note(pr.host_base, pr.offset, g_model_ranges.size() - 1u);
+    return 1;
+}
+
+static int cuda_derived_range_publish(const cuda_derived_range &nr) {
+    if (nr.source_bytes == 0 ||
+        nr.source_offset + nr.source_bytes < nr.source_offset)
+        return cuda_range_publish_refuse("derived", nr.host_base,
+                                         nr.source_offset, nr.source_bytes,
+                                         "empty/overflowed interval");
+    for (const cuda_derived_range &r : g_derived_ranges) {
+        if (r.host_base != nr.host_base || r.kind != nr.kind) continue;
+        if (cuda_iv_overlap(nr.source_offset, nr.source_bytes,
+                            r.source_offset, r.source_bytes))
+            return cuda_range_publish_refuse("derived", nr.host_base,
+                                             nr.source_offset, nr.source_bytes,
+                                             "same-kind source overlap");
+    }
+    g_derived_ranges.push_back(nr);
+    cuda_derived_range &pr = g_derived_ranges.back();
+    cuda_range_stamp(pr.host_base, pr.source_offset, pr.source_bytes,
+                     &pr.src, &pr.unit_lo, &pr.unit_hi);
+    return 1;
+}
+
+static int cuda_q8_f16_publish(const cuda_q8_f16_range &nr) {
+    auto it = g_q8_f16_by_offset.find(cuda_range_key{nr.host_base, nr.offset});
+    if (it != g_q8_f16_by_offset.end() &&
+        g_q8_f16_ranges[it->second].host_base == nr.host_base)
+        return cuda_range_publish_refuse("q8_f16", nr.host_base, nr.offset,
+                                         nr.weight_bytes, "duplicate live key");
+    g_q8_f16_ranges.push_back(nr);
+    cuda_q8_f16_range &pr = g_q8_f16_ranges.back();
+    cuda_range_stamp(pr.host_base, pr.offset, pr.weight_bytes,
+                     &pr.src, &pr.unit_lo, &pr.unit_hi);
+    g_q8_f16_by_offset[cuda_range_key{pr.host_base, pr.offset}] =
+        g_q8_f16_ranges.size() - 1u;
+    return 1;
+}
+
+static int cuda_q8_f32_publish(const cuda_q8_f32_range &nr) {
+    auto it = g_q8_f32_by_offset.find(cuda_range_key{nr.host_base, nr.offset});
+    if (it != g_q8_f32_by_offset.end() &&
+        g_q8_f32_ranges[it->second].host_base == nr.host_base)
+        return cuda_range_publish_refuse("q8_f32", nr.host_base, nr.offset,
+                                         nr.weight_bytes, "duplicate live key");
+    g_q8_f32_ranges.push_back(nr);
+    cuda_q8_f32_range &pr = g_q8_f32_ranges.back();
+    cuda_range_stamp(pr.host_base, pr.offset, pr.weight_bytes,
+                     &pr.src, &pr.unit_lo, &pr.unit_hi);
+    g_q8_f32_by_offset[cuda_range_key{pr.host_base, pr.offset}] =
+        g_q8_f32_ranges.size() - 1u;
+    return 1;
 }
 /* Aligned-artifact tier accounting (v0.2.2 self-load artifacts): which
  * producer put the aligned repack artifacts on device — the weight-server
@@ -1124,26 +1304,26 @@ static void cuda_model_preserve_current_direct_mapping(void) {
 
     if (!cuda_model_has_full_range(g_model_host_base, g_model_registered_size)) {
         if (g_model_device_owned && g_model_device_base) {
-            g_model_ranges.push_back({
-                g_model_host_base,
-                0,
-                g_model_registered_size,
-                (char *)g_model_device_base,
-                NULL,
-                NULL,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0
-            });
-            cuda_range_index_note(g_model_host_base, 0, g_model_ranges.size() - 1u);
-            g_model_range_bytes += g_model_registered_size;
+            if (cuda_model_range_publish({
+                    g_model_host_base,
+                    0,
+                    g_model_registered_size,
+                    (char *)g_model_device_base,
+                    NULL,
+                    NULL,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                })) {
+                g_model_range_bytes += g_model_registered_size;
+            }
         } else if (g_model_registered && g_model_device_base) {
-            g_model_ranges.push_back({
+            (void)cuda_model_range_publish({
                 g_model_host_base,
                 0,
                 g_model_registered_size,
@@ -1159,7 +1339,6 @@ static void cuda_model_preserve_current_direct_mapping(void) {
                 0,
                 0
             });
-            cuda_range_index_note(g_model_host_base, 0, g_model_ranges.size() - 1u);
         }
     }
 
@@ -1200,8 +1379,10 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
             return NULL;
         }
     }
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0});
-    cuda_range_index_note(model_map, offset, g_model_ranges.size() - 1u);
+    if (!cuda_model_range_publish({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0})) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
     g_model_range_bytes += bytes;
     cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_SPAN, DS4_MEMD_UNIFIED_DEVICE,
                             bytes, bytes, model_map);
@@ -1320,8 +1501,12 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
                 char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
-                cuda_range_index_note(model_map, offset, g_model_ranges.size() - 1u);
+                if (!cuda_model_range_publish({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0})) {
+                    (void)cudaHostUnregister((void *)reg_addr);
+                    cuda_pinned_file_note_unregister((void *)reg_addr);
+                    (void)cudaGetLastError();
+                    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
+                }
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
                             what ? what : "weights",
@@ -1648,8 +1833,10 @@ static const __half *cuda_q8_f16_ptr(
         cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
         return NULL;
     }
-    g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
-    g_q8_f16_by_offset[cuda_range_key{model_map, offset}] = g_q8_f16_ranges.size() - 1u;
+    if (!cuda_q8_f16_publish({model_map, offset, weight_bytes, in_dim, out_dim, dev})) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
     g_q8_f16_bytes += out_bytes;
     cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
                             out_bytes, out_bytes, model_map);
@@ -1712,8 +1899,10 @@ static float *cuda_q8_f32_ptr(
         (void)cudaFree(dev);
         return NULL;
     }
-    g_q8_f32_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
-    g_q8_f32_by_offset[cuda_range_key{model_map, offset}] = g_q8_f32_ranges.size() - 1u;
+    if (!cuda_q8_f32_publish({model_map, offset, weight_bytes, in_dim, out_dim, dev})) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
     g_q8_f32_bytes += out_bytes;
     cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
                             out_bytes, out_bytes, model_map);
@@ -2959,8 +3148,10 @@ static const char *cuda_model_range_ptr_from_fd(
         return NULL;
     }
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0});
-    cuda_range_index_note(model_map, offset, g_model_ranges.size() - 1u);
+    /* Refusal leaves the arena carve behind, exactly like the staging-read
+     * failure paths above (bump arenas cannot un-carve). */
+    if (!cuda_model_range_publish({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0}))
+        return NULL;
     g_model_range_bytes += bytes;
     cuda_substrate_cover(model_map, bytes);   /* tripwire: fd promotion materialized */
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -4524,23 +4715,27 @@ static int import_vmm_allocation(
         return 0;
     }
 
-    g_model_ranges.push_back({
-        model_map,
-        (uint64_t)off,
-        (uint64_t)bytes,
-        (char *)va,
-        NULL,
-        NULL,
-        0,
-        0,
-        0,
-        0,
-        1,
-        handle,
-        va,
-        (uint64_t)alloc_bytes,
-    });
-    cuda_range_index_note(model_map, (uint64_t)off, g_model_ranges.size() - 1u);
+    if (!cuda_model_range_publish({
+            model_map,
+            (uint64_t)off,
+            (uint64_t)bytes,
+            (char *)va,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            0,
+            1,
+            handle,
+            va,
+            (uint64_t)alloc_bytes,
+        })) {
+        (void)cuMemUnmap(va, (size_t)alloc_bytes);
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return 0;
+    }
     g_model_range_bytes += (uint64_t)bytes;
     cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
                             (uint64_t)bytes, (uint64_t)alloc_bytes, model_map);
@@ -4636,22 +4831,27 @@ static int import_vmm_derived_allocation(
         return 0;
     }
 
-    g_derived_ranges.push_back({
-        model_map,
-        (uint64_t)source_off,
-        (uint64_t)source_bytes,
-        (uint32_t)kind,
-        (uint64_t)in_dim,
-        (uint64_t)out_dim,
-        (uint32_t)group_count,
-        (uint64_t)bytes,
-        (char *)va,
-        0,
-        1,
-        handle,
-        va,
-        (uint64_t)alloc_bytes,
-    });
+    if (!cuda_derived_range_publish({
+            model_map,
+            (uint64_t)source_off,
+            (uint64_t)source_bytes,
+            (uint32_t)kind,
+            (uint64_t)in_dim,
+            (uint64_t)out_dim,
+            (uint32_t)group_count,
+            (uint64_t)bytes,
+            (char *)va,
+            0,
+            1,
+            handle,
+            va,
+            (uint64_t)alloc_bytes,
+        })) {
+        (void)cuMemUnmap(va, (size_t)alloc_bytes);
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return 0;
+    }
     g_derived_range_bytes += (uint64_t)bytes;
     cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
                             (uint64_t)bytes, (uint64_t)alloc_bytes, model_map);
@@ -4870,22 +5070,27 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
                 ok = 0;
                 break;
             }
-            g_derived_ranges.push_back({
-                model_map,
-                (uint64_t)source_off,
-                (uint64_t)source_bytes,
-                (uint32_t)kind,
-                (uint64_t)in_dim,
-                (uint64_t)out_dim,
-                (uint32_t)group_count,
-                (uint64_t)derived_bytes,
-                (char *)dev,
-                1,
-                0,
-                0,
-                0,
-                0,
-            });
+            if (!cuda_derived_range_publish({
+                    model_map,
+                    (uint64_t)source_off,
+                    (uint64_t)source_bytes,
+                    (uint32_t)kind,
+                    (uint64_t)in_dim,
+                    (uint64_t)out_dim,
+                    (uint32_t)group_count,
+                    (uint64_t)derived_bytes,
+                    (char *)dev,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                })) {
+                (void)cudaIpcCloseMemHandle(dev);
+                (void)cudaGetLastError();
+                ok = 0;
+                break;
+            }
             g_derived_range_bytes += (uint64_t)derived_bytes;
             cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
                                     (uint64_t)derived_bytes,
@@ -4935,23 +5140,27 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
             ok = 0;
             break;
         }
-        g_model_ranges.push_back({
-            model_map,
-            (uint64_t)off,
-            (uint64_t)bytes,
-            (char *)dev,
-            NULL,
-            NULL,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-        });
-        cuda_range_index_note(model_map, (uint64_t)off, g_model_ranges.size() - 1u);
+        if (!cuda_model_range_publish({
+                model_map,
+                (uint64_t)off,
+                (uint64_t)bytes,
+                (char *)dev,
+                NULL,
+                NULL,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+            })) {
+            (void)cudaIpcCloseMemHandle(dev);
+            (void)cudaGetLastError();
+            ok = 0;
+            break;
+        }
         g_model_range_bytes += (uint64_t)bytes;
         cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
                                 (uint64_t)bytes, (uint64_t)bytes, model_map);
@@ -5136,26 +5345,36 @@ extern "C" int ds4_gpu_build_derived_artifacts(
         return 0;
     }
 
-    for (const ds4_repack_artifact &art : arts) {
-        g_derived_ranges.push_back({
-            model_map,
-            art.t->off,
-            art.t->bytes,
-            art.kind,
-            art.in_dim,
-            art.out_dim,
-            art.group_count,
-            art.bytes,
-            (char *)art.dev,
-            0,
-            0,
-            0,
-            0,
-            0,
-        });
+    uint64_t published = 0;
+    for (ds4_repack_artifact &art : arts) {
+        if (!cuda_derived_range_publish({
+                model_map,
+                art.t->off,
+                art.t->bytes,
+                art.kind,
+                art.in_dim,
+                art.out_dim,
+                art.group_count,
+                art.bytes,
+                (char *)art.dev,
+                0,
+                0,
+                0,
+                0,
+                0,
+            })) {
+            /* D1a-4 refusal: free the orphan build and mark the artifact
+             * absent (nulled dev) so the completeness scan below cannot
+             * count a REPLACE candidate the registry never accepted. */
+            (void)cudaFree(art.dev);
+            built_bytes -= art.bytes;
+            art.dev = NULL;
+            continue;
+        }
         g_derived_range_bytes += art.bytes;
         cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_ARTIFACT, DS4_MEMD_UNIFIED_DEVICE,
                                 art.bytes, art.bytes, model_map);
+        published++;
     }
 
     /* Replace-set completeness: the registration skip must only fire when
@@ -5166,7 +5385,7 @@ extern "C" int ds4_gpu_build_derived_artifacts(
             if (!ds4_repack_iq2_candidate(t) && !ds4_repack_q2k_candidate(t)) continue;
             bool have = false;
             for (const ds4_repack_artifact &art : arts) {
-                if (art.t == &t) { have = true; break; }
+                if (art.t == &t && art.dev) { have = true; break; }
             }
             if (!have) { replaces_complete = 0; break; }
         }
@@ -5174,10 +5393,10 @@ extern "C" int ds4_gpu_build_derived_artifacts(
     g_derived_replaces_complete = replaces_complete;
 
     g_derived_artifact_source = CUDA_DERIVED_ARTIFACTS_BUILT;
-    g_derived_artifact_count = arts.size();
+    g_derived_artifact_count = published;
     g_derived_artifact_bytes = built_bytes;
     g_derived_artifact_build_secs = cuda_wall_sec() - t0;
-    return (int)arts.size();
+    return (int)published;
 }
 
 extern "C" void ds4_gpu_derived_artifact_stats(
@@ -5225,6 +5444,33 @@ extern "C" void ds4_gpu_report_derived_artifacts(void) {
  * and counts a census fault (every standing gate asserts faults == 0).
  * Weight classes are the contiguous enum run ARENA..HOST_PIN. */
 extern "C" void ds4_gpu_report_model_sources(void) {
+    /* D1a-4 backfill: boot publications precede the unit-table binds (the
+     * pre-cache walk and manifest imports run inside model open; the
+     * tables compile after), so ranges published early carry the -1/-1
+     * no-plan marker.  Stamp them now from the bound tables -- the stamp
+     * is a pure function of (map, interval), so late stamping is exact.
+     * Publications after the binds stamp at publish time, keeping the
+     * "every live range is plan-known" invariant continuous post-boot. */
+    for (cuda_model_range &r : g_model_ranges) {
+        if (r.host_base && r.unit_lo < 0)
+            cuda_range_stamp(r.host_base, r.offset, r.bytes,
+                             &r.src, &r.unit_lo, &r.unit_hi);
+    }
+    for (cuda_derived_range &r : g_derived_ranges) {
+        if (r.host_base && r.unit_lo < 0)
+            cuda_range_stamp(r.host_base, r.source_offset, r.source_bytes,
+                             &r.src, &r.unit_lo, &r.unit_hi);
+    }
+    for (cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        if (r.host_base && r.unit_lo < 0)
+            cuda_range_stamp(r.host_base, r.offset, r.weight_bytes,
+                             &r.src, &r.unit_lo, &r.unit_hi);
+    }
+    for (cuda_q8_f32_range &r : g_q8_f32_ranges) {
+        if (r.host_base && r.unit_lo < 0)
+            cuda_range_stamp(r.host_base, r.offset, r.weight_bytes,
+                             &r.src, &r.unit_lo, &r.unit_hi);
+    }
     for (int i = 0; i < g_model_srcs.count; i++) {
         const ds4_model_source *s = &g_model_srcs.v[i];
         uint64_t dev_live = 0;
@@ -5293,6 +5539,39 @@ extern "C" void ds4_gpu_report_model_sources(void) {
                 DS4_MEMC_WEIGHT_HOST_PIN - DS4_MEMC_WEIGHT_ARENA + 1,
                 (int)DS4_MEMD__COUNT,
                 g_model_srcs.count);
+    }
+    /* D1a-4: one range-plan line per source -- live publications vs how
+     * many the plan knows (unit-stamped).  planned == total is the gate
+     * assertion; refused publications already faulted one by one. */
+    for (int i = 0; i < g_model_srcs.count; i++) {
+        uint32_t nm = 0, nm_planned = 0, nd = 0, nd_planned = 0;
+        uint32_t nq = 0, nq_planned = 0;
+        for (const cuda_model_range &r : g_model_ranges) {
+            if (!r.host_base || r.src != i) continue;
+            nm++;
+            if (r.unit_lo >= 0) nm_planned++;
+        }
+        for (const cuda_derived_range &r : g_derived_ranges) {
+            if (!r.host_base || r.src != i) continue;
+            nd++;
+            if (r.unit_lo >= 0) nd_planned++;
+        }
+        for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+            if (!r.host_base || r.src != i) continue;
+            nq++;
+            if (r.unit_lo >= 0) nq_planned++;
+        }
+        for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
+            if (!r.host_base || r.src != i) continue;
+            nq++;
+            if (r.unit_lo >= 0) nq_planned++;
+        }
+        fprintf(stderr,
+                "ds4: range plan %s: model %u/%u planned, derived %u/%u, "
+                "q8 %u/%u, refused %llu\n",
+                g_model_srcs.v[i].name,
+                nm_planned, nm, nd_planned, nd, nq_planned, nq,
+                (unsigned long long)g_range_publish_refused);
     }
 }
 

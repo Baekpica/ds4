@@ -26792,6 +26792,40 @@ static void test_unit_compiler_properties(void) {
     }
 }
 
+/* memgov D1a-4: the publication funnel's unit-span stamp.  Table units:
+ * [100,200) [250,350) [1000,2000) -- gaps before, between, and after. */
+static void test_unit_span_lookup(void) {
+    ds4_phys_unit u[3];
+    memset(u, 0, sizeof u);
+    u[0].src_off = 100;  u[0].src_bytes = 100;
+    u[1].src_off = 250;  u[1].src_bytes = 100;
+    u[2].src_off = 1000; u[2].src_bytes = 1000;
+    int lo, hi;
+
+    ds4_units_span_of(u, 3, 120, 10, &lo, &hi);        /* interior of one  */
+    TEST_ASSERT(lo == 0 && hi == 0);
+    ds4_units_span_of(u, 3, 100, 100, &lo, &hi);       /* exact unit       */
+    TEST_ASSERT(lo == 0 && hi == 0);
+    ds4_units_span_of(u, 3, 150, 200, &lo, &hi);       /* spans the gap    */
+    TEST_ASSERT(lo == 0 && hi == 1);
+    ds4_units_span_of(u, 3, 0, 4096, &lo, &hi);        /* covers them all  */
+    TEST_ASSERT(lo == 0 && hi == 2);
+    ds4_units_span_of(u, 3, 0, 100, &lo, &hi);         /* ends AT first    */
+    TEST_ASSERT(lo == -1 && hi == -1);
+    ds4_units_span_of(u, 3, 200, 50, &lo, &hi);        /* gap between      */
+    TEST_ASSERT(lo == -1 && hi == -1);
+    ds4_units_span_of(u, 3, 2000, 50, &lo, &hi);       /* past the last    */
+    TEST_ASSERT(lo == -1 && hi == -1);
+    ds4_units_span_of(u, 3, 350, 700, &lo, &hi);       /* gap up to last   */
+    TEST_ASSERT(lo == 2 && hi == 2);
+    ds4_units_span_of(u, 3, 120, 0, &lo, &hi);         /* empty interval   */
+    TEST_ASSERT(lo == -1 && hi == -1);
+    ds4_units_span_of(NULL, 0, 120, 10, &lo, &hi);     /* no table         */
+    TEST_ASSERT(lo == -1 && hi == -1);
+    ds4_units_span_of(u, 3, UINT64_MAX - 10, 100, &lo, &hi);  /* overflow  */
+    TEST_ASSERT(lo == -1 && hi == -1);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -26973,6 +27007,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_catalog_classify();
     /* memgov D1a-3: unit-compiler properties. */
     test_unit_compiler_properties();
+    test_unit_span_lookup();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

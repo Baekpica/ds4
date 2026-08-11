@@ -39351,6 +39351,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                             uts[si].nm, viol);
                     ds4_gpu_mem_census_fault_note();
                 }
+                /* memgov D1a-4: a clean table becomes THE plan -- the
+                 * range-publication funnel stamps every published weight
+                 * range with its unit span (the boot report backfills the
+                 * publications that preceded this bind).  A corrupt table
+                 * must not become the plan; bind faults internally. */
+                if (nu > 0 && viol == 0 &&
+                    ds4_gpu_model_units_bind(mm->map, units, (uint32_t)nu) != 0) {
+                    fprintf(stderr, "ds4: UNIT-TABLE FAULT: %s bind failed\n",
+                            uts[si].nm);
+                }
                 free(tin);
                 free(units);
             }

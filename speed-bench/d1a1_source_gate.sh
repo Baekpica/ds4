@@ -18,6 +18,10 @@
 #   (s2) AUXILIARY ROLE: a --no-dspark boot re-arms the default MTP head;
 #       assert base [primary] + mtp [auxiliary] lines + reconcile.  With
 #       (s) this covers all three roles live in one gate.
+#       Both boot legs also assert the D1a-4 funnel porcelain: one
+#       "ds4: range plan" line per source with planned == total for the
+#       model/derived/q8 families and refused == 0, and no
+#       RANGE-PUBLISH REFUSED line anywhere in the boot.
 #   (p) LOOKUP MICRO-PARITY: the same boot under
 #       DS4_CUDA_RANGE_LOOKUP_PARITY=1 recomputes EVERY token-path range
 #       resolve against the legacy flat-keyed algorithm (a shadow index
@@ -87,6 +91,15 @@ R "grep -q 'CATALOG-TRIPWIRE' $BOOTLOG" && die "catalog-vs-heuristic tripwire fi
 R "grep -q 'ds4: model units base: .* (verify=0)' $BOOTLOG" || die "no clean base unit table"
 R "grep -q 'ds4: model units drafter: .* (verify=0)' $BOOTLOG" || die "no clean drafter unit table"
 R "grep -q 'UNIT-TABLE FAULT' $BOOTLOG" && die "unit-table fault at boot"
+# D1a-4: publication funnel -- every live range plan-known on a full boot
+# (model/derived/q8 planned == total per source), zero refusals.
+R "grep -q 'ds4: range plan base:' $BOOTLOG" || die "no base range-plan line"
+R "grep -q 'ds4: range plan drafter:' $BOOTLOG" || die "no drafter range-plan line"
+R "grep -q 'RANGE-PUBLISH REFUSED' $BOOTLOG" && die "range publication refused at boot"
+BAD=$(R "grep 'ds4: range plan ' $BOOTLOG" \
+    | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7/' \
+    | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 {print}')
+[ -z "$BAD" ] || die "range plan incomplete/refused: $BAD"
 CF0=$(met ds4_memory_census_faults_total)
 [ "$CF0" = "0" ] || die "census faults=$CF0 at boot settle"
 decode_one /tmp/d1a1_s_dec.json s || die "leg (s) decode failed"
@@ -117,6 +130,13 @@ R "grep -q 'CATALOG-TRIPWIRE' $BOOTLOG" && die "(s2) catalog tripwire fired"
 # D1a-3: mtp unit table clean.
 R "grep -q 'ds4: model units mtp: .* (verify=0)' $BOOTLOG" || die "(s2) no clean mtp unit table"
 R "grep -q 'UNIT-TABLE FAULT' $BOOTLOG" && die "(s2) unit-table fault"
+# D1a-4: funnel plan-known on the base+mtp shape too.
+R "grep -q 'ds4: range plan mtp:' $BOOTLOG" || die "(s2) no mtp range-plan line"
+R "grep -q 'RANGE-PUBLISH REFUSED' $BOOTLOG" && die "(s2) range publication refused"
+BAD=$(R "grep 'ds4: range plan ' $BOOTLOG" \
+    | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7/' \
+    | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 {print}')
+[ -z "$BAD" ] || die "(s2) range plan incomplete/refused: $BAD"
 CF2=$(met ds4_memory_census_faults_total)
 [ "$CF2" = "0" ] || die "(s2) census faults=$CF2"
 log "(s2) PASS (base+mtp reconciled, faults 0)"

@@ -4549,6 +4549,14 @@ int ds4_gpu_mem_src_census_read(int src_idx, int consumer_class, int domain,
     return 1;
 }
 void ds4_gpu_report_model_sources(void) {}
+/* memgov D1a-4: unit tables describe the CUDA residency plan; Metal
+ * plans no device residency here (OBS-policy), so bind is unsupported
+ * like the ledger reads above. */
+int ds4_gpu_model_units_bind(const void *map_base, const ds4_phys_unit *units,
+                             uint32_t count) {
+    (void)map_base; (void)units; (void)count;
+    return 1;
+}
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
