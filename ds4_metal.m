@@ -4488,6 +4488,17 @@ int ds4_gpu_init(void) {
     return 1;
 }
 
+/* memgov D0a-1 census stubs: Metal keeps no allocation census (the class
+ * taxonomy is CUDA-backend accounting).  Scope tags no-op; a census read
+ * reports unsupported (nonzero) so gates cannot mistake absence for zero. */
+void ds4_gpu_mem_scope_begin(int consumer_class) { (void)consumer_class; }
+void ds4_gpu_mem_scope_end(void) {}
+int ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out) {
+    (void)consumer_class; (void)domain; (void)out;
+    return 1;
+}
+uint64_t ds4_gpu_mem_census_faults(void) { return 0; }
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;

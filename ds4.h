@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "ds4_mem_census.h"
+
 /* Public engine boundary.
  *
  * The CLI and server should treat ds4_engine as the loaded model and
@@ -461,6 +463,31 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                     void (*on_done)(void *ud, void *user,
                                                     const int *tokens, int n, int finish),
                                     void *ud, char *err, size_t errlen);
+
+/* =========================================================================
+ * memgov D0a-1: allocation-census registry (accounting ONLY).
+ *
+ * Types + checked arithmetic live in ds4_mem_census.h (a dependency-free
+ * leaf header shared with ds4_cuda.cu, which self-carries its signatures
+ * and does not include this file); the unit suite drives that exact
+ * production math without a GPU (the D-1c ds4_credit_union_runs
+ * precedent).  This block declares the backend surface only.
+ *
+ * Backend surface (CUDA: real; Metal: stubs -- read returns nonzero).
+ * Scope tags attribute ds4_gpu_tensor_alloc/_reserve funnel traffic to a
+ * consumer class without touching the funnel's 200+ engine call sites:
+ * control-plane code brackets a subsystem (session create, KV create,
+ * batch-ctx create, artifact build, drafter load) and every funnel
+ * allocation inside lands on that class.  Nesting is supported; unmatched
+ * end or overflow counts a fault.  Control-plane only by contract -- the
+ * decode/capture hot path allocates nothing (capture-refusal disciplines)
+ * and therefore never touches the scope.  ds4_gpu_mem_census_read copies
+ * one cell (returns 0) so gates/units can reconcile; rendering porcelain
+ * is D0a-3's. */
+void ds4_gpu_mem_scope_begin(int consumer_class);
+void ds4_gpu_mem_scope_end(void);
+int  ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out);
+uint64_t ds4_gpu_mem_census_faults(void);
 
 /* =========================================================================
  * Live serving metrics (v0.2.x observability): ONE registry, THREE porcelains.

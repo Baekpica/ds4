@@ -25421,6 +25421,81 @@ static void test_job_emit_backlog_eviction(void) {
     pthread_mutex_destroy(&j3.mu); pthread_cond_destroy(&j3.cv);
 }
 
+/* memgov D0a-1: pure-arithmetic tests for the allocation-census cells
+ * (ds4_mem_census.h).  Production (ds4_cuda.cu note sites) drives these
+ * exact inlines, so the shapes pinned here are the ledger semantics the
+ * census gate reconciles: monotonic requested/committed with clamped
+ * frees, arena slack = committed - requested, and the trim-residue rule
+ * (release-failure keeps committed live and surfaces as slack). */
+static void test_mem_census_cell_arithmetic(void) {
+    ds4_mem_cell c = {0, 0, 0, 0, 0, 0};
+    uint64_t faults = 0;
+    ds4_mem_cell_note_alloc(&c, 100, 100, &faults);
+    ds4_mem_cell_note_alloc(&c, 50, 50, &faults);
+    TEST_ASSERT(ds4_mem_cell_live(&c) == 150);
+    TEST_ASSERT(ds4_mem_cell_slack(&c) == 0);
+    TEST_ASSERT(c.alloc_calls == 2 && faults == 0);
+    ds4_mem_cell_note_free(&c, 100, 100, &faults);
+    TEST_ASSERT(ds4_mem_cell_live(&c) == 50 && faults == 0);
+    /* Over-free clamps to outstanding and counts faults (both axes). */
+    ds4_mem_cell_note_free(&c, 60, 60, &faults);
+    TEST_ASSERT(ds4_mem_cell_live(&c) == 0);
+    TEST_ASSERT(c.freed_requested == c.requested);
+    TEST_ASSERT(c.freed_committed == c.committed);
+    TEST_ASSERT(faults == 2);
+    /* Saturation pins at UINT64_MAX and faults instead of wrapping. */
+    ds4_mem_cell s = {UINT64_MAX - 10, UINT64_MAX - 10, 0, 0, 0, 0};
+    uint64_t sf = 0;
+    ds4_mem_cell_note_alloc(&s, 100, 100, &sf);
+    TEST_ASSERT(s.requested == UINT64_MAX && s.committed == UINT64_MAX);
+    TEST_ASSERT(sf == 2);
+    /* NULL cell and NULL faults are inert. */
+    ds4_mem_cell_note_alloc(NULL, 1, 1, NULL);
+    ds4_mem_cell_note_free(NULL, 1, 1, NULL);
+    ds4_mem_cell n = {0, 0, 0, 0, 0, 0};
+    ds4_mem_cell_note_alloc(&n, 5, 5, NULL);
+    TEST_ASSERT(ds4_mem_cell_live(&n) == 5);
+}
+
+static void test_mem_census_arena_slack_shape(void) {
+    /* Arena discipline: chunk commits carry committed only, bumps carry
+     * requested only; slack = chunk tail nobody asked for. */
+    ds4_mem_cell c = {0, 0, 0, 0, 0, 0};
+    uint64_t faults = 0;
+    const uint64_t chunk = 1792ull << 20;
+    ds4_mem_cell_note_alloc(&c, 0, chunk, &faults);      /* chunk commit  */
+    ds4_mem_cell_note_alloc(&c, 512u << 20, 0, &faults); /* bump          */
+    ds4_mem_cell_note_alloc(&c, 256u << 20, 0, &faults); /* bump          */
+    TEST_ASSERT(ds4_mem_cell_live(&c) == chunk);
+    TEST_ASSERT(ds4_mem_cell_slack(&c) == chunk - (768ull << 20));
+    /* Teardown frees the used total against the chunk commit. */
+    ds4_mem_cell_note_free(&c, 768ull << 20, chunk, &faults);
+    TEST_ASSERT(ds4_mem_cell_live(&c) == 0);
+    TEST_ASSERT(ds4_mem_cell_slack(&c) == 0);
+    TEST_ASSERT(faults == 0);
+}
+
+static void test_mem_census_trim_residue_shape(void) {
+    /* D-1b trim semantics: unmap-ok + release-FAIL frees the ask but not
+     * the commitment -- the physical leak stays live and reads as slack,
+     * never as an undercharge. */
+    ds4_mem_cell c = {0, 0, 0, 0, 0, 0};
+    uint64_t faults = 0;
+    const uint64_t page = 2048u << 10;
+    ds4_mem_cell_note_alloc(&c, page, page, &faults);
+    ds4_mem_cell_note_alloc(&c, page, page, &faults);
+    ds4_mem_cell_note_free(&c, page, page, &faults);     /* clean trim   */
+    ds4_mem_cell_note_free(&c, page, 0, &faults);        /* release-fail */
+    TEST_ASSERT(ds4_mem_cell_live(&c) == page);          /* leak visible */
+    TEST_ASSERT(ds4_mem_cell_slack(&c) == page);         /* ...as slack  */
+    TEST_ASSERT(faults == 0);
+    /* Class/domain bounds are compile-time enums; assert the fixed
+     * cardinality the metrics render (D0a-3) will bake in. */
+    TEST_ASSERT(DS4_MEMC_ENGINE_OTHER == 0);
+    TEST_ASSERT(DS4_MEMC__COUNT == 17);
+    TEST_ASSERT(DS4_MEMD__COUNT == 2);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -25572,6 +25647,10 @@ static void ds4_server_unit_tests_run(void) {
     /* v0.5.6 API Inc 2e: admission bounds + shed. */
     test_admission_bounds_shed();
     test_job_emit_backlog_eviction();
+    /* memgov D0a-1: allocation-census cell arithmetic. */
+    test_mem_census_cell_arithmetic();
+    test_mem_census_arena_slack_shape();
+    test_mem_census_trim_residue_shape();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

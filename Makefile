@@ -266,7 +266,7 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h lin
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_repack.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_mem_census.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_repack.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces. ds4_mmq.cu transitively pulls in mmq.cuh which has

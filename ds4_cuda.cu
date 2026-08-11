@@ -26,6 +26,7 @@
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
+#include "ds4_mem_census.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -48,6 +49,10 @@ struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
+    int memc;   /* census consumer class captured at alloc/reserve time
+                   (ds4_mem_consumer_class); calloc zero = ENGINE_OTHER.
+                   Frees and demand-page ensures charge this class so the
+                   engine-side scope only has to bracket creation. */
 };
 
 typedef struct ds4_gpu_top2_result {
@@ -130,6 +135,99 @@ static void cuda_substrate_cover(const void *model_map, uint64_t bytes) {
     if (g_model_fd_host_base && model_map == g_model_fd_host_base)
         g_substrate_promotable_covered += bytes;
 }
+
+/* --------------------------------------------------------------------
+ * memgov D0a-1: allocation-census registry (accounting only).
+ *
+ * One cell per consumer class x domain (arithmetic in ds4.h so the server
+ * unit suite drives it CPU-only); every allocation/release site in this
+ * file records {requested, committed} on its census row
+ * (local/docs/v057/d0a_census_table.md).  NOTHING reads these cells on a
+ * decision path -- D0a's contract is zero decision change.
+ *
+ * Concurrency follows the tripwire convention above: every writer (boot
+ * loader, admissions, sticky-scratch growth, teardown) already runs under
+ * the server's gen_mu / boot single-thread serialization, so writes are
+ * plain; a racy census_read during a control-plane transition may see one
+ * site's requested without its committed, which the D0a gate avoids by
+ * reading only at quiesced settle points.  Coherent epoch snapshots are
+ * deliberately D0b's (plan sec 6.3), not bolted on here.
+ *
+ * The scope stack attributes ds4_gpu_tensor_alloc/_reserve traffic to the
+ * bracketing subsystem (ENGINE_OTHER when unbracketed -- the close gate
+ * asserts that class settles to zero live bytes).  Depth is generous:
+ * real nesting today is engine-boundary -> at most one inner helper. */
+static ds4_mem_cell g_mem_census[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
+static uint64_t g_mem_census_faults;
+static int g_mem_scope_stack[8];
+static int g_mem_scope_depth;
+
+static void cuda_mem_note_alloc(int cls, int dom, uint64_t requested,
+                                uint64_t committed) {
+    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT) {
+        g_mem_census_faults++;
+        return;
+    }
+    ds4_mem_cell_note_alloc(&g_mem_census[cls][dom], requested, committed,
+                            &g_mem_census_faults);
+}
+
+static void cuda_mem_note_free(int cls, int dom, uint64_t requested,
+                               uint64_t committed) {
+    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT) {
+        g_mem_census_faults++;
+        return;
+    }
+    ds4_mem_cell_note_free(&g_mem_census[cls][dom], requested, committed,
+                           &g_mem_census_faults);
+}
+
+static int cuda_mem_scope_class(void) {
+    return g_mem_scope_depth > 0 ? g_mem_scope_stack[g_mem_scope_depth - 1]
+                                 : DS4_MEMC_ENGINE_OTHER;
+}
+
+extern "C" void ds4_gpu_mem_scope_begin(int consumer_class) {
+    if (consumer_class < 0 || consumer_class >= DS4_MEMC__COUNT ||
+        g_mem_scope_depth >= (int)(sizeof(g_mem_scope_stack) /
+                                   sizeof(g_mem_scope_stack[0]))) {
+        g_mem_census_faults++;
+        return;
+    }
+    g_mem_scope_stack[g_mem_scope_depth++] = consumer_class;
+}
+
+extern "C" void ds4_gpu_mem_scope_end(void) {
+    if (g_mem_scope_depth <= 0) {
+        g_mem_census_faults++;
+        return;
+    }
+    g_mem_scope_depth--;
+}
+
+extern "C" int ds4_gpu_mem_census_read(int consumer_class, int domain,
+                                       ds4_mem_cell *out) {
+    if (!out || consumer_class < 0 || consumer_class >= DS4_MEMC__COUNT ||
+        domain < 0 || domain >= DS4_MEMD__COUNT)
+        return 1;
+    *out = g_mem_census[consumer_class][domain];
+    return 0;
+}
+
+extern "C" uint64_t ds4_gpu_mem_census_faults(void) {
+    return g_mem_census_faults;
+}
+
+/* Census: per-slot committed bytes of the pinned staging pool.  File-scope
+ * because TWO paths free the slots (growth in cuda_model_stage_pool_alloc,
+ * model close), and a partial-failure growth attempt leaves earlier slots
+ * allocated at the NEW size while g_model_stage_bytes stays 0 -- the
+ * pool-level size cannot price either free pass. */
+static uint64_t g_mem_stage_slot_bytes[4];
+/* Census: bytes behind g_model_device_base when g_model_device_owned
+ * (whole-model copies -- two success sites, one close-path free). */
+static uint64_t g_mem_device_owned_bytes;
+
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 
@@ -593,12 +691,19 @@ static void cuda_pinned_file_note_register(const void *base, uint64_t bytes) {
     if (bytes == 0 || !cuda_host_range_is_file_backed(base)) return;
     g_pinned_file_reg[(uintptr_t)base] = bytes;
     g_pinned_file_bytes += bytes;
+    /* Census: every model-map cudaHostRegister site funnels through here,
+     * so this ONE pair keeps the WEIGHT_HOST_PIN cell reconciled 1:1 with
+     * g_pinned_file_bytes (a d0a gate assert). */
+    cuda_mem_note_alloc(DS4_MEMC_WEIGHT_HOST_PIN, DS4_MEMD_PINNED_HOST,
+                        bytes, bytes);
 }
 
 static void cuda_pinned_file_note_unregister(const void *base) {
     auto it = g_pinned_file_reg.find((uintptr_t)base);
     if (it == g_pinned_file_reg.end()) return;
     g_pinned_file_bytes -= it->second <= g_pinned_file_bytes ? it->second : g_pinned_file_bytes;
+    cuda_mem_note_free(DS4_MEMC_WEIGHT_HOST_PIN, DS4_MEMD_PINNED_HOST,
+                       it->second, it->second);
     g_pinned_file_reg.erase(it);
 }
 static uint64_t g_q8_f16_bytes;
@@ -739,6 +844,8 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
          * recapture cost decays to zero. */
         ds4_cuda_invalidate_captured_graphs(what ? what : "cuda_tmp resize");
         (void)cudaFree(g_cuda_tmp);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_cuda_tmp_bytes, g_cuda_tmp_bytes);
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
@@ -760,6 +867,8 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
      * argmax flip downstream.  Zeroing on (re)alloc makes the read-before-write
      * deterministic.  Cheap: resizes are rare (sticky high-water buffer). */
     if (ptr) (void)cudaMemset(ptr, 0, (size_t)bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
@@ -772,6 +881,8 @@ static void *tt_scratch_ensure(uint64_t bytes, const char *what) {
     (void)cudaDeviceSynchronize();
     if (g_tt_scratch) {
         (void)cudaFree(g_tt_scratch);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_tt_scratch_bytes, g_tt_scratch_bytes);
         g_tt_scratch = NULL;
         g_tt_scratch_bytes = 0;
     }
@@ -787,6 +898,8 @@ static void *tt_scratch_ensure(uint64_t bytes, const char *what) {
         return NULL;
     }
     if (ptr) (void)cudaMemset(ptr, 0, (size_t)bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
     g_tt_scratch = ptr;
     g_tt_scratch_bytes = bytes;
     return g_tt_scratch;
@@ -907,6 +1020,8 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
+    cuda_mem_note_alloc(DS4_MEMC_WEIGHT_SPAN, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
     cuda_substrate_cover(model_map, bytes);   /* tripwire: promotion materialized */
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
@@ -1041,6 +1156,8 @@ static char *cuda_derived_weight_ptr(
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
+    cuda_mem_note_free(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
+                       g_q8_f16_bytes, g_q8_f16_bytes);
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -1298,6 +1415,8 @@ static const __half *cuda_q8_f16_ptr(
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
     g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
     g_q8_f16_bytes += out_bytes;
+    cuda_mem_note_alloc(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
+                        out_bytes, out_bytes);
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA cached q8 fp16 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
@@ -1360,6 +1479,8 @@ static float *cuda_q8_f32_ptr(
     g_q8_f32_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
     g_q8_f32_by_offset[offset] = g_q8_f32_ranges.size() - 1u;
     g_q8_f32_bytes += out_bytes;
+    cuda_mem_note_alloc(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
+                        out_bytes, out_bytes);
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA cached q8 fp32 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
@@ -1426,16 +1547,24 @@ extern "C" int ds4_gpu_decode_scalars_init(void) {
         g_decode_host = NULL;
         return 0;
     }
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                        sizeof(*g_decode_host), sizeof(*g_decode_host));
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                        sizeof(*g_decode_host), sizeof(*g_decode_host));
     return 1;
 }
 
 extern "C" void ds4_gpu_decode_scalars_cleanup(void) {
     if (g_decode_dev != NULL) {
         cudaFree(g_decode_dev);
+        cuda_mem_note_free(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                           sizeof(*g_decode_host), sizeof(*g_decode_host));
         g_decode_dev = NULL;
     }
     if (g_decode_host != NULL) {
         cudaFreeHost(g_decode_host);
+        cuda_mem_note_free(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                           sizeof(*g_decode_host), sizeof(*g_decode_host));
         g_decode_host = NULL;
     }
 }
@@ -1652,17 +1781,27 @@ extern "C" int ds4_gpu_decode_layer_scalars_init(void) {
         return 0;
     }
     g_layer_dev_idx = 0;
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                        2u * bytes, 2u * bytes);
     return 1;
 }
 
 extern "C" void ds4_gpu_decode_layer_scalars_cleanup(void) {
+    const size_t bytes = (size_t)DS4_LAYER_SCALARS_COUNT *
+                         sizeof(struct ds4_layer_scalars);
     if (g_layer_dev != NULL) {
         cudaFree(g_layer_dev);
+        cuda_mem_note_free(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                           bytes, bytes);
         g_layer_dev = NULL;
     }
     for (int b = 0; b < 2; ++b) {
         if (g_layer_host[b] != NULL) {
             cudaFreeHost(g_layer_host[b]);
+            cuda_mem_note_free(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                               bytes, bytes);
             g_layer_host[b] = NULL;
         }
     }
@@ -1785,6 +1924,10 @@ extern "C" int ds4_gpu_decode_row_scalars_init(void) {
         return 0;
     }
     g_row_dev_idx = 0;
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                        2u * bytes, 2u * bytes);
     return 1;
 }
 
@@ -2020,6 +2163,10 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
         if (g_model_stage_raw[i]) {
             (void)cudaFreeHost(g_model_stage_raw[i]);
+            cuda_mem_note_free(DS4_MEMC_STAGE_PIN, DS4_MEMD_PINNED_HOST,
+                               g_mem_stage_slot_bytes[i],
+                               g_mem_stage_slot_bytes[i]);
+            g_mem_stage_slot_bytes[i] = 0;
             g_model_stage_raw[i] = NULL;
             g_model_stage[i] = NULL;
         }
@@ -2040,6 +2187,9 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
             (void)cudaGetLastError();
             return 0;
         }
+        cuda_mem_note_alloc(DS4_MEMC_STAGE_PIN, DS4_MEMD_PINNED_HOST,
+                            bytes, bytes);
+        g_mem_stage_slot_bytes[i] = bytes;
         g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], g_model_direct_align);
         err = cudaEventCreateWithFlags(&g_model_stage_event[i], cudaEventDisableTiming);
         if (err != cudaSuccess) {
@@ -2252,6 +2402,8 @@ static char *cuda_vmm_arena_alloc(uint64_t bytes, const char *what) {
         if (used_aligned <= a.alloc_bytes && aligned <= a.alloc_bytes - used_aligned) {
             char *ptr = (char *)(uintptr_t)(a.va + used_aligned);
             a.used = used_aligned + aligned;
+            cuda_mem_note_alloc(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
+                                aligned, 0);
             return ptr;
         }
     }
@@ -2313,6 +2465,8 @@ static char *cuda_vmm_arena_alloc(uint64_t bytes, const char *what) {
     a.alloc_bytes = chunk_bytes;
     a.used = aligned;
     g_vmm_arenas.push_back(a);
+    cuda_mem_note_alloc(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
+                        aligned, chunk_bytes);
 
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         uint64_t total = 0;
@@ -2334,6 +2488,8 @@ static void cuda_vmm_arenas_release_all(void) {
             (void)cuMemAddressFree(a.va, (size_t)a.alloc_bytes);
         }
         if (a.handle) (void)cuMemRelease(a.handle);
+        cuda_mem_note_free(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
+                           a.used, a.alloc_bytes);
     }
     g_vmm_arenas.clear();
 }
@@ -2410,6 +2566,8 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         if (used <= a.bytes && aligned <= a.bytes - used) {
             char *ptr = a.device_ptr + used;
             a.used = used + aligned;
+            cuda_mem_note_alloc(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
+                                aligned, 0);
             return ptr;
         }
     }
@@ -2430,6 +2588,10 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         return NULL;
     }
     g_model_arenas.push_back({(char *)dev, chunk, aligned});
+    /* Census: chunk commit + this call's bump.  Bump asks accumulate on
+     * `requested`; the chunk's rounding tail is the cell's slack. */
+    cuda_mem_note_alloc(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
+                        aligned, chunk);
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         uint64_t arena_bytes = 0;
         for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
@@ -2643,6 +2805,9 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     g_model_device_base = (const char *)dev;
     g_model_device_owned = 1;
     g_model_hmm_direct = 0;
+    cuda_mem_note_alloc(DS4_MEMC_WEIGHT_WHOLE, DS4_MEMD_UNIFIED_DEVICE,
+                        model_size, model_size);
+    g_mem_device_owned_bytes = model_size;
     const double t1 = cuda_wall_sec();
     fprintf(stderr,
             "ds4: CUDA model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
@@ -2661,11 +2826,17 @@ static void cuda_model_range_release_all(void) {
             if (r.vmm_handle) {
                 (void)cuMemRelease(r.vmm_handle);
             }
+            cuda_mem_note_free(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                               r.bytes, r.vmm_alloc_bytes);
         } else if (r.imported_ipc && r.device_ptr) {
             (void)cudaIpcCloseMemHandle(r.device_ptr);
+            cuda_mem_note_free(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                               r.bytes, r.bytes);
         } else if (r.device_ptr) {
             /* In-process self-load artifact (plain cudaMalloc). */
             (void)cudaFree(r.device_ptr);
+            cuda_mem_note_free(DS4_MEMC_WEIGHT_ARTIFACT, DS4_MEMD_UNIFIED_DEVICE,
+                               r.bytes, r.bytes);
         }
     }
     g_derived_ranges.clear();
@@ -2687,14 +2858,24 @@ static void cuda_model_range_release_all(void) {
             if (r.vmm_handle) {
                 (void)cuMemRelease(r.vmm_handle);
             }
+            cuda_mem_note_free(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                               r.bytes, r.vmm_alloc_bytes);
         } else if (r.imported_ipc && r.device_ptr) {
             (void)cudaIpcCloseMemHandle(r.device_ptr);
+            cuda_mem_note_free(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                               r.bytes, r.bytes);
         } else if (r.device_ptr && !r.arena_allocated) {
             (void)cudaFree(r.device_ptr);
+            cuda_mem_note_free(DS4_MEMC_WEIGHT_SPAN, DS4_MEMD_UNIFIED_DEVICE,
+                               r.bytes, r.bytes);
         }
     }
     for (const cuda_model_arena &a : g_model_arenas) {
-        if (a.device_ptr) (void)cudaFree(a.device_ptr);
+        if (a.device_ptr) {
+            (void)cudaFree(a.device_ptr);
+            cuda_mem_note_free(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
+                               a.used, a.bytes);
+        }
     }
     g_model_arenas.clear();
     // VMM-backed arenas own the device VA + handle for many ranges in
@@ -2818,6 +2999,9 @@ extern "C" int ds4_gpu_init(void) {
         if (cudaMalloc(&g_cublas_ws, cublas_ws_bytes) == cudaSuccess) {
             g_cublas_ws_bytes = cublas_ws_bytes;
             (void)cublasSetWorkspace(g_cublas, g_cublas_ws, g_cublas_ws_bytes);
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE,
+                                cublas_ws_bytes, cublas_ws_bytes);
         } else {
             (void)cudaGetLastError();
             g_cublas_ws = NULL;
@@ -2837,6 +3021,8 @@ extern "C" int ds4_gpu_init(void) {
         if (cudaMalloc(&p, (size_t)bytes) == cudaSuccess) {
             g_f16_splitk_partials = (float *)p;
             g_f16_splitk_partials_bytes = bytes;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE, bytes, bytes);
         } else {
             (void)cudaGetLastError();
         }
@@ -2848,6 +3034,9 @@ extern "C" int ds4_gpu_init(void) {
         void *p = NULL;
         if (cudaMalloc(&p, 256u * sizeof(float)) == cudaSuccess) {
             g_hc_stage_scratch = (float *)p;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE,
+                                256u * sizeof(float), 256u * sizeof(float));
         } else {
             (void)cudaGetLastError();
         }
@@ -2860,6 +3049,10 @@ extern "C" int ds4_gpu_init(void) {
         void *p = NULL;
         if (cudaMalloc(&p, 8u * 2048u * sizeof(float)) == cudaSuccess) {
             g_router_fused_partials = (float *)p;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE,
+                                8u * 2048u * sizeof(float),
+                                8u * 2048u * sizeof(float));
         } else {
             (void)cudaGetLastError();
         }
@@ -2872,6 +3065,10 @@ extern "C" int ds4_gpu_init(void) {
         void *p = NULL;
         if (cudaMalloc(&p, 8u * 2u * 2048u * sizeof(float)) == cudaSuccess) {
             g_comp_pair_partials = (float *)p;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE,
+                                8u * 2u * 2048u * sizeof(float),
+                                8u * 2u * 2048u * sizeof(float));
         } else {
             (void)cudaGetLastError();
         }
@@ -2889,13 +3086,21 @@ extern "C" int ds4_gpu_init(void) {
         const uint64_t q81_bytes = (8192u / 32u) * 36u;
         if (g_q8_fold_q80_buf[i] == NULL) {
             void *p = NULL;
-            if (cudaMalloc(&p, (size_t)q80_bytes) == cudaSuccess) g_q8_fold_q80_buf[i] = (int8_t *)p;
-            else (void)cudaGetLastError();
+            if (cudaMalloc(&p, (size_t)q80_bytes) == cudaSuccess) {
+                g_q8_fold_q80_buf[i] = (int8_t *)p;
+                cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                    DS4_MEMD_UNIFIED_DEVICE,
+                                    q80_bytes, q80_bytes);
+            } else (void)cudaGetLastError();
         }
         if (g_q8_fold_q81_buf[i] == NULL) {
             void *p = NULL;
-            if (cudaMalloc(&p, (size_t)q81_bytes) == cudaSuccess) g_q8_fold_q81_buf[i] = p;
-            else (void)cudaGetLastError();
+            if (cudaMalloc(&p, (size_t)q81_bytes) == cudaSuccess) {
+                g_q8_fold_q81_buf[i] = p;
+                cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                    DS4_MEMD_UNIFIED_DEVICE,
+                                    q81_bytes, q81_bytes);
+            } else (void)cudaGetLastError();
         }
     }
     /* SM count for the flash-decode attention split gate. */
@@ -2912,6 +3117,8 @@ extern "C" int ds4_gpu_init(void) {
         if (cudaMalloc(&p, (size_t)bytes) == cudaSuccess) {
             g_attn_split_partials = (float *)p;
             g_attn_split_partials_bytes = bytes;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE, bytes, bytes);
         } else {
             (void)cudaGetLastError();
         }
@@ -2959,6 +3166,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     if (g_cublas_ws) {
         (void)cudaFree(g_cublas_ws);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           g_cublas_ws_bytes, g_cublas_ws_bytes);
         g_cublas_ws = NULL;
         g_cublas_ws_bytes = 0;
     }
@@ -2966,6 +3175,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
+    cuda_mem_note_free(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
+                       g_q8_f32_bytes, g_q8_f32_bytes);
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -2974,34 +3185,65 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_q8_f32_bytes = 0;
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_cuda_tmp_bytes, g_cuda_tmp_bytes);
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
     if (g_tt_scratch) {
         (void)cudaFree(g_tt_scratch);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_tt_scratch_bytes, g_tt_scratch_bytes);
         g_tt_scratch = NULL;
         g_tt_scratch_bytes = 0;
     }
     if (g_f16_splitk_partials) {
         (void)cudaFree(g_f16_splitk_partials);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           g_f16_splitk_partials_bytes,
+                           g_f16_splitk_partials_bytes);
         g_f16_splitk_partials = NULL;
         g_f16_splitk_partials_bytes = 0;
     }
     if (g_hc_stage_scratch) {
         (void)cudaFree(g_hc_stage_scratch);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           256u * sizeof(float), 256u * sizeof(float));
         g_hc_stage_scratch = NULL;
     }
-    for (int i = 0; i < 2; i++) {
-        if (g_q8_fold_q80_buf[i]) { (void)cudaFree(g_q8_fold_q80_buf[i]); g_q8_fold_q80_buf[i] = NULL; }
-        if (g_q8_fold_q81_buf[i]) { (void)cudaFree(g_q8_fold_q81_buf[i]); g_q8_fold_q81_buf[i] = NULL; }
+    {
+        const uint64_t q80_bytes = 8192u + 16u + (8192u / 32u) * sizeof(float);
+        const uint64_t q81_bytes = (8192u / 32u) * 36u;
+        for (int i = 0; i < 2; i++) {
+            if (g_q8_fold_q80_buf[i]) {
+                (void)cudaFree(g_q8_fold_q80_buf[i]);
+                cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS,
+                                   DS4_MEMD_UNIFIED_DEVICE,
+                                   q80_bytes, q80_bytes);
+                g_q8_fold_q80_buf[i] = NULL;
+            }
+            if (g_q8_fold_q81_buf[i]) {
+                (void)cudaFree(g_q8_fold_q81_buf[i]);
+                cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS,
+                                   DS4_MEMD_UNIFIED_DEVICE,
+                                   q81_bytes, q81_bytes);
+                g_q8_fold_q81_buf[i] = NULL;
+            }
+        }
     }
     cuda_q8_fold_reset();
     if (g_router_fused_partials) {
         (void)cudaFree(g_router_fused_partials);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           8u * 2048u * sizeof(float),
+                           8u * 2048u * sizeof(float));
         g_router_fused_partials = NULL;
     }
     if (g_comp_pair_partials) {
         (void)cudaFree(g_comp_pair_partials);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           8u * 2u * 2048u * sizeof(float),
+                           8u * 2u * 2048u * sizeof(float));
         g_comp_pair_partials = NULL;
     }
     for (size_t i = 0; i < 4; i++) {
@@ -3011,6 +3253,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
         if (g_model_stage_raw[i]) {
             (void)cudaFreeHost(g_model_stage_raw[i]);
+            cuda_mem_note_free(DS4_MEMC_STAGE_PIN, DS4_MEMD_PINNED_HOST,
+                               g_mem_stage_slot_bytes[i],
+                               g_mem_stage_slot_bytes[i]);
+            g_mem_stage_slot_bytes[i] = 0;
             g_model_stage_raw[i] = NULL;
             g_model_stage[i] = NULL;
         }
@@ -3022,6 +3268,9 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     if (g_model_device_owned && g_model_device_base) {
         (void)cudaFree((void *)g_model_device_base);
+        cuda_mem_note_free(DS4_MEMC_WEIGHT_WHOLE, DS4_MEMD_UNIFIED_DEVICE,
+                           g_mem_device_owned_bytes, g_mem_device_owned_bytes);
+        g_mem_device_owned_bytes = 0;
     }
     if (g_model_registered && g_model_host_base) {
         (void)cudaHostUnregister((void *)g_model_host_base);
@@ -3060,6 +3309,8 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->memc = cuda_mem_scope_class();
+    cuda_mem_note_alloc(t->memc, DS4_MEMD_UNIFIED_DEVICE, bytes, bytes);
     return t;
 }
 
@@ -3073,6 +3324,8 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->memc = cuda_mem_scope_class();
+    cuda_mem_note_alloc(t->memc, DS4_MEMD_UNIFIED_DEVICE, bytes, bytes);
     return t;
 }
 
@@ -3217,6 +3470,9 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_reserve(uint64_t bytes) {
     t->ptr = (void *)(uintptr_t)va;
     t->bytes = bytes;
     t->owner = 2;                              /* reserved: freed via the registry */
+    /* Census: a reservation is VIRTUAL -- no cell charge here.  Physical
+     * commitment lands page-by-page in ds4_gpu_tensor_ensure below. */
+    t->memc = cuda_mem_scope_class();
     return t;
 }
 
@@ -3260,6 +3516,8 @@ extern "C" int ds4_gpu_tensor_ensure(const ds4_gpu_tensor *tensor, uint64_t offs
         }
         d->pages[(size_t)p] = h;
         d->mapped += d->page;
+        cuda_mem_note_alloc(tensor->memc, DS4_MEMD_UNIFIED_DEVICE,
+                            d->page, d->page);
     }
     return 1;
 }
@@ -3315,6 +3573,12 @@ extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t o
         d->pages[(size_t)p] = 0;
         d->mapped -= d->page;
         if (rel_ok) released += d->page;
+        /* Census mirrors the D-1b semantics exactly: the ask (mapping) is
+         * gone either way, but a release failure did NOT return the bytes
+         * -- freed_committed stays behind and the residue shows up as
+         * cell slack, never as an undercharge. */
+        cuda_mem_note_free(tensor->memc, DS4_MEMD_UNIFIED_DEVICE,
+                           d->page, rel_ok ? d->page : 0);
     }
     return released;
 }
@@ -3330,6 +3594,8 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
                 (void)cuMemUnmap(d->va + (CUdeviceptr)(p * d->page), (size_t)d->page);
                 (void)cuMemRelease(d->pages[p]);
             }
+            cuda_mem_note_free(tensor->memc, DS4_MEMD_UNIFIED_DEVICE,
+                               d->mapped, d->mapped);
             (void)cuMemAddressFree(d->va, (size_t)d->span);
             g_vmm_demand.erase(g_vmm_demand.begin() + (ptrdiff_t)i);
             delete d;
@@ -3338,7 +3604,11 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
         free(tensor);
         return;
     }
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner && tensor->ptr) {
+        (void)cudaFree(tensor->ptr);
+        cuda_mem_note_free(tensor->memc, DS4_MEMD_UNIFIED_DEVICE,
+                           tensor->bytes, tensor->bytes);
+    }
     free(tensor);
 }
 
@@ -3498,6 +3768,10 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
             if (err == cudaSuccess) {
                 g_model_device_base = (const char *)dev;
                 g_model_device_owned = 1;
+                cuda_mem_note_alloc(DS4_MEMC_WEIGHT_WHOLE,
+                                    DS4_MEMD_UNIFIED_DEVICE,
+                                    model_size, model_size);
+                g_mem_device_owned_bytes = model_size;
                 const double t1 = clock() / (double)CLOCKS_PER_SEC;
                 fprintf(stderr, "ds4: CUDA model copy complete in %.3fs\n", t1 - t0);
                 return 1;
@@ -3905,6 +4179,8 @@ static int import_vmm_allocation(
     });
     g_model_range_by_offset[(uint64_t)off] = g_model_ranges.size() - 1u;
     g_model_range_bytes += (uint64_t)bytes;
+    cuda_mem_note_alloc(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                        (uint64_t)bytes, (uint64_t)alloc_bytes);
     *imported_bytes += (uint64_t)bytes;
     *imported_ranges += 1;
     return 1;
@@ -4014,6 +4290,8 @@ static int import_vmm_derived_allocation(
         (uint64_t)alloc_bytes,
     });
     g_derived_range_bytes += (uint64_t)bytes;
+    cuda_mem_note_alloc(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                        (uint64_t)bytes, (uint64_t)alloc_bytes);
     *imported_bytes += (uint64_t)bytes;
     *imported_ranges += 1;
     return 1;
@@ -4246,6 +4524,9 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
                 0,
             });
             g_derived_range_bytes += (uint64_t)derived_bytes;
+            cuda_mem_note_alloc(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                                (uint64_t)derived_bytes,
+                                (uint64_t)derived_bytes);
             imported_derived_bytes += (uint64_t)derived_bytes;
             imported_derived_ranges++;
             continue;
@@ -4309,6 +4590,8 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         });
         g_model_range_by_offset[(uint64_t)off] = g_model_ranges.size() - 1u;
         g_model_range_bytes += (uint64_t)bytes;
+        cuda_mem_note_alloc(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                            (uint64_t)bytes, (uint64_t)bytes);
         imported_bytes += (uint64_t)bytes;
         imported_ranges++;
     }
@@ -4508,6 +4791,8 @@ extern "C" int ds4_gpu_build_derived_artifacts(
             0,
         });
         g_derived_range_bytes += art.bytes;
+        cuda_mem_note_alloc(DS4_MEMC_WEIGHT_ARTIFACT, DS4_MEMD_UNIFIED_DEVICE,
+                            art.bytes, art.bytes);
     }
 
     /* Replace-set completeness: the registration skip must only fire when
@@ -9549,7 +9834,12 @@ static float *fp8_predecode_scratch_alloc(uint64_t bytes) {
         if (!ds4_capture_active()) (void)cudaDeviceSynchronize();
         ds4_cuda_invalidate_captured_graphs("fp8 predecode scratch resize");
         (void)cudaFree(g_fp8_predecode_scratch);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_fp8_predecode_scratch_bytes,
+                           g_fp8_predecode_scratch_bytes);
     }
+    cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
     g_fp8_predecode_scratch = ptr;
     g_fp8_predecode_scratch_bytes = bytes;
     return (float *)g_fp8_predecode_scratch;
@@ -15946,6 +16236,8 @@ static void *rr_scratch_ensure(uint64_t bytes) {
     (void)cudaDeviceSynchronize();
     if (g_rr_scratch) {
         (void)cudaFree(g_rr_scratch);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_rr_scratch_bytes, g_rr_scratch_bytes);
         g_rr_scratch = NULL;
         g_rr_scratch_bytes = 0;
     }
@@ -15961,6 +16253,8 @@ static void *rr_scratch_ensure(uint64_t bytes) {
         return NULL;
     }
     (void)cudaMemset(ptr, 0, (size_t)bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
     g_rr_scratch = ptr;
     g_rr_scratch_bytes = bytes;
     return g_rr_scratch;
@@ -19000,7 +19294,12 @@ static const char *cuda_moe_iq2_derepack_scratch(
     static uint64_t buf_bytes[2] = {0, 0};
     static uint64_t tag[2]       = {UINT64_MAX, UINT64_MAX};
     if (buf_bytes[which] < raw_bytes) {
-        if (buf[which]) { (void)cudaFree(buf[which]); buf[which] = NULL; buf_bytes[which] = 0; tag[which] = UINT64_MAX; }
+        if (buf[which]) {
+            (void)cudaFree(buf[which]);
+            cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                               buf_bytes[which], buf_bytes[which]);
+            buf[which] = NULL; buf_bytes[which] = 0; tag[which] = UINT64_MAX;
+        }
         cudaError_t err = cudaMalloc(&buf[which], raw_bytes);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: iq2 derepack scratch alloc failed (%.1f MiB): %s; using mmap raw\n",
@@ -19011,6 +19310,8 @@ static const char *cuda_moe_iq2_derepack_scratch(
         }
         buf_bytes[which] = raw_bytes;
         tag[which] = UINT64_MAX;
+        cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                            raw_bytes, raw_bytes);
         fprintf(stderr, "ds4: iq2 derepack scratch active (%s, %.1f MiB)\n",
                 which == 0 ? "gate" : "up", (double)raw_bytes / (1024.0 * 1024.0));
     }
@@ -19054,7 +19355,12 @@ static const char *cuda_moe_q2k_derepack_scratch(
     static uint64_t buf_bytes = 0;
     static uint64_t tag       = UINT64_MAX;
     if (buf_bytes < raw_bytes) {
-        if (buf) { (void)cudaFree(buf); buf = NULL; buf_bytes = 0; tag = UINT64_MAX; }
+        if (buf) {
+            (void)cudaFree(buf);
+            cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                               buf_bytes, buf_bytes);
+            buf = NULL; buf_bytes = 0; tag = UINT64_MAX;
+        }
         cudaError_t err = cudaMalloc(&buf, raw_bytes);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: q2k derepack scratch alloc failed (%.1f MiB): %s; using mmap raw\n",
@@ -19065,6 +19371,8 @@ static const char *cuda_moe_q2k_derepack_scratch(
         }
         buf_bytes = raw_bytes;
         tag = UINT64_MAX;
+        cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                            raw_bytes, raw_bytes);
         fprintf(stderr, "ds4: q2k derepack scratch active (down, %.1f MiB)\n",
                 (double)raw_bytes / (1024.0 * 1024.0));
     }
@@ -20955,10 +21263,19 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_f16_tensor(ds4_gpu_tensor *out, ds4_
             const size_t floor_need =
                 (size_t)(rows > 4096u ? rows : 4096u) * nkseg * 144u +
                 128u * 144u;
-            if (g_norm_q8_buf) { cudaFree(g_norm_q8_buf); g_norm_q8_buf = NULL; }
+            if (g_norm_q8_buf) {
+                cudaFree(g_norm_q8_buf);
+                cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY,
+                                   DS4_MEMD_UNIFIED_DEVICE,
+                                   g_norm_q8_cap, g_norm_q8_cap);
+                g_norm_q8_buf = NULL;
+            }
             g_norm_q8_cap = 0;
             if (cudaMalloc(&g_norm_q8_buf, floor_need) == cudaSuccess) {
                 g_norm_q8_cap = floor_need;
+                cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY,
+                                    DS4_MEMD_UNIFIED_DEVICE,
+                                    floor_need, floor_need);
             }
         }
         if (g_norm_q8_buf) {

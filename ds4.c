@@ -9773,7 +9773,9 @@ static bool metal_graph_load_directional_steering(
     float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
     bool ok = read_f32_binary_file(path, dirs, n);
     if (ok) {
+        ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
         g->directional_steering_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
+        ds4_gpu_mem_scope_end();
         ok = g->directional_steering_dirs != NULL &&
              ds4_gpu_tensor_write(g->directional_steering_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
     }
@@ -9874,7 +9876,11 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
 }
 
 static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
-    return managed ? ds4_gpu_tensor_alloc_managed(bytes) : ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_mem_scope_begin(DS4_MEMC_KV_PRIMARY);
+    ds4_gpu_tensor *t = managed ? ds4_gpu_tensor_alloc_managed(bytes)
+                                : ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_mem_scope_end();
+    return t;
 }
 
 /* =========================================================================
@@ -10005,14 +10011,18 @@ static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint3
 
 static bool metal_graph_ensure_ffn_out(ds4_gpu_graph *g) {
     if (!g->ffn_out) {
+        ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
         g->ffn_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_mem_scope_end();
     }
     return g->ffn_out != NULL;
 }
 
 static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
     if (!g->batch_ffn_out) {
+        ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
         g->batch_ffn_out = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+        ds4_gpu_mem_scope_end();
     }
     return g->batch_ffn_out != NULL;
 }
@@ -10691,7 +10701,12 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, false);
+    /* memgov D0a-1: every session-graph tensor the creator allocates lands
+     * on the SESSION_TENSORS census class.  Accounting only. */
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
+    const bool ok = metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, false);
+    ds4_gpu_mem_scope_end();
+    return ok;
 }
 
 static uint32_t metal_graph_raw_span_for_batch(
@@ -11056,7 +11071,9 @@ static ds4_gpu_tensor *metal_graph_comp_emit_scratch(ds4_gpu_graph *g, uint64_t 
     const uint64_t need = rows ? rows : 1u;
     if (g->comp_emit_scratch && g->comp_emit_scratch_rows >= need)
         return g->comp_emit_scratch;
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SCRATCH_STICKY);
     ds4_gpu_tensor *nt = ds4_gpu_tensor_alloc(need * DS4_N_HEAD_DIM * sizeof(float));
+    ds4_gpu_mem_scope_end();
     if (!nt) {
         fprintf(stderr, "ds4: fp8-primary emit scratch alloc failed (%llu rows)\n",
                 (unsigned long long)need);
@@ -11094,7 +11111,9 @@ static ds4_gpu_tensor *metal_graph_index_emit_scratch(ds4_gpu_graph *g, uint64_t
     const uint64_t need = rows ? rows : 1u;
     if (g->index_emit_scratch && g->index_emit_scratch_rows >= need)
         return g->index_emit_scratch;
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SCRATCH_STICKY);
     ds4_gpu_tensor *nt = ds4_gpu_tensor_alloc(need * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    ds4_gpu_mem_scope_end();
     if (!nt) {
         fprintf(stderr, "ds4: fp4-primary index emit scratch alloc failed (%llu rows)\n",
                 (unsigned long long)need);
@@ -21837,7 +21856,9 @@ static bool metal_graph_verify_decode2_exact(
         uint32_t cert_candidate = token1 >= 0 ? (uint32_t)token1 : UINT32_MAX;
         if (cert_enabled) {
             const double t0 = cert_timing ? now_sec() : 0.0;
+            ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
             ok = metal_graph_prepare_output_certifier(g, model, weights, weights->output->dim[1]);
+            ds4_gpu_mem_scope_end();
             if (cert_timing) cert_prepare_ms = (now_sec() - t0) * 1000.0;
         }
         if (ok && cert_enabled) {
@@ -28196,7 +28217,9 @@ static bool metal_graph_dspark_capture_hc(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     if (n_tok == 0 || n_tok > g->prefill_cap || cap_layers[2] >= (uint32_t)DS4_N_LAYER) return false;
     ds4_gpu_tensor *cap[3] = {0};
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
     for (int k = 0; k < 3; k++) cap[k] = ds4_gpu_tensor_alloc((uint64_t)n_tok * hc_dim * sizeof(float));
+    ds4_gpu_mem_scope_end();
     float *host = xmalloc((size_t)n_tok * hc_dim * sizeof(float));
     bool ok = cap[0] && cap[1] && cap[2] && host;
 
@@ -28998,7 +29021,11 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
     const bool candidates_match = ok && cand0_diff <= 1.0e-3f && cand1_diff <= 1.0e-3f;
 
     const double cert_prepare_t0 = ok ? now_sec() : 0.0;
-    if (ok) ok = metal_graph_prepare_output_certifier(g, &e->model, &e->weights, vocab_dim);
+    if (ok) {
+        ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
+        ok = metal_graph_prepare_output_certifier(g, &e->model, &e->weights, vocab_dim);
+        ds4_gpu_mem_scope_end();
+    }
     const double cert_prepare_ms = ok ? (now_sec() - cert_prepare_t0) * 1000.0 : 0.0;
     ds4_gpu_candidate_cert_result cert;
     memset(&cert, 0, sizeof(cert));
@@ -32670,11 +32697,14 @@ int ds4_engine_batched_generate_ex(
     }
 
     ds4_gpu_graph g;
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
     if (!metal_graph_alloc_raw_cap(&g, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, prefill_cap, false, false)) {
+        ds4_gpu_mem_scope_end();
         BG_API_ERR("batched_generate: graph alloc failed (raw_cap=%u prefill_cap=%u)", raw_cap, prefill_cap);
         return 1;
     }
+    ds4_gpu_mem_scope_end();
     g.quality = e->quality;
     g.power_percent = e->power_percent > 0 ? (uint32_t)e->power_percent : 100u;
 
@@ -34006,12 +34036,18 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
 
 int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                          ds4_batch_ctx **out, char *err, size_t errlen) {
-    return ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, false, out, err, errlen);
+    ds4_gpu_mem_scope_begin(DS4_MEMC_BATCH_BANK);
+    const int rc = ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, false, out, err, errlen);
+    ds4_gpu_mem_scope_end();
+    return rc;
 }
 
 int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                              ds4_batch_ctx **out, char *err, size_t errlen) {
-    return ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, true, out, err, errlen);
+    ds4_gpu_mem_scope_begin(DS4_MEMC_BATCH_BANK);
+    const int rc = ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, true, out, err, errlen);
+    ds4_gpu_mem_scope_end();
+    return rc;
 }
 
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
@@ -35553,6 +35589,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * gathered markov_w1 rows, mk_bias the [MS*vocab] per-bank bias.  Allocated once;
      * the block draft reuses vlogits as the base-logits dst (vcap_rows = MS*B >= nl*B). */
     const uint32_t mk_rank = dspark_mode ? (uint32_t)dw->markov_w2->dim[0] : 0u;
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
     ds4_gpu_tensor *mk_cand = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)DS4_DSPARK_BLOCK * MS * sizeof(int32_t)) : NULL;
     ds4_gpu_tensor *mk_prev = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)MS * mk_rank * sizeof(float)) : NULL;
     ds4_gpu_tensor *mk_bias = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)MS * DS4_N_VOCAB * sizeof(float)) : NULL;
@@ -35561,6 +35598,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * its head ON DEVICE and the on-device Markov refine reads it ON DEVICE, so a
      * device tensor is required.  Sized like vlogits (vcap_rows = min(MS*B, prefill_cap)). */
     ds4_gpu_tensor *mk_logits = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)vcap_rows * DS4_N_VOCAB * sizeof(float)) : NULL;
+    ds4_gpu_mem_scope_end();
     /* D4.5e: host position/seq_id scratch for injecting a PREFILL chunk's target hidden
      * into the bank's DSpark ring (so the drafter attends real prefix KV, not zero slots,
      * from the first decode step).  Sized for the widest prefill chunk (prefill_cap). */
