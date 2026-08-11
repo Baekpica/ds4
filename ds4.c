@@ -26165,6 +26165,31 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+/* Apply the wire/parser-owned per-token override without exposing logits or
+ * protocol state outside the engine.  Exact tokens, like greedy argmax, do not
+ * advance the request RNG; this keeps plain and speculative streams aligned. */
+static int sample_top_p_min_p_override(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        int          top_k,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng,
+        int          override) {
+    if (DS4_SAMPLE_OVERRIDE_IS_TOKEN(override)) {
+        const int token = DS4_SAMPLE_OVERRIDE_TOKEN_ID(override);
+        if (token >= 0 && (uint32_t)token < n_vocab) return token;
+        fprintf(stderr,
+                "ds4: invalid exact sample override token=%d vocab=%u; using argmax\n",
+                token, n_vocab);
+        return sample_argmax(logits, n_vocab);
+    }
+    if (override == DS4_SAMPLE_OVERRIDE_GREEDY) temperature = 0.0f;
+    return sample_top_p_min_p(logits, n_vocab, temperature,
+                              top_k, top_p, min_p, rng);
+}
+
 static void print_top_logits(
         FILE          * fp,
         const char    * label,
@@ -39543,14 +39568,13 @@ static int solar_engine_continuous_generate(
                         ok = false;
                         break;
                     }
-                    const float temperature =
-                        sb->sample_override &&
-                        sb->sample_override(ud, sb->user)
-                            ? 0.0f : sb->temperature;
-                    const int token = sample_top_p_min_p(
+                    const int sample_override = sb->sample_override ?
+                        sb->sample_override(ud, sb->user) :
+                        DS4_SAMPLE_OVERRIDE_NONE;
+                    const int token = sample_top_p_min_p_override(
                         rt->bank_logits + (size_t)pb * DS4_N_VOCAB,
-                        DS4_N_VOCAB, temperature, sb->top_k,
-                        sb->top_p, sb->min_p, &sb->rng);
+                        DS4_N_VOCAB, sb->temperature, sb->top_k,
+                        sb->top_p, sb->min_p, &sb->rng, sample_override);
                     free(sb->prefill);
                     sb->prefill = NULL;
                     sb->generated = xmalloc(
@@ -39631,13 +39655,13 @@ static int solar_engine_continuous_generate(
             sb->stats.decode_steps++;
             ds4_metric_add(&ds4_metrics_get()->decode_steps, 1u);
 
-            const float temperature =
-                sb->sample_override && sb->sample_override(ud, sb->user)
-                    ? 0.0f : sb->temperature;
-            const int token = sample_top_p_min_p(
+            const int sample_override = sb->sample_override ?
+                sb->sample_override(ud, sb->user) :
+                DS4_SAMPLE_OVERRIDE_NONE;
+            const int token = sample_top_p_min_p_override(
                 rt->bank_logits + (size_t)b * DS4_N_VOCAB,
-                DS4_N_VOCAB, temperature, sb->top_k,
-                sb->top_p, sb->min_p, &sb->rng);
+                DS4_N_VOCAB, sb->temperature, sb->top_k,
+                sb->top_p, sb->min_p, &sb->rng, sample_override);
             sb->generated[sb->generated_len++] = token;
             sb->current = token;
             ds4_metric_add(&ds4_metrics_get()->tokens_decoded, 1u);
@@ -40700,9 +40724,11 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     pflen[b] = pfoff[b] = 0u;
                     pfq_h = (pfq_h + 1u) % MS;
                     pfq_n--;
-                    const int nt = sample_top_p_min_p(seedlog, DS4_N_VOCAB,
-                                                      (bsoc[b] && bsoc[b](ud, usr[b])) ? 0.0f : btemp[b],
-                                                      btopk[b], btopp[b], bminp[b], &brng[b]);
+                    const int sample_override = bsoc[b] ?
+                        bsoc[b](ud, usr[b]) : DS4_SAMPLE_OVERRIDE_NONE;
+                    const int nt = sample_top_p_min_p_override(
+                        seedlog, DS4_N_VOCAB, btemp[b], btopk[b],
+                        btopp[b], bminp[b], &brng[b], sample_override);
                     gbuf[b] = xmalloc((size_t)bmax[b] * sizeof(int));
                     if (!gbuf[b]) { ok = false; break; }
                     gbuf[b][0] = nt;
@@ -40975,9 +41001,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 const uint32_t nd = vnr[b];
                 /* sample with the SAME function + per-bank params as the plain path so the
                  * accepted stream matches mode-0 tie-break-for-tie-break (greedy at temp 0). */
-                int u = sample_top_p_min_p(vlogits + (uint64_t)f * DS4_N_VOCAB, DS4_N_VOCAB,
-                                           (bsoc[b] && bsoc[b](ud, usr[b])) ? 0.0f : btemp[b],
-                                           btopk[b], btopp[b], bminp[b], &brng[b]);
+                int sample_override = bsoc[b] ?
+                    bsoc[b](ud, usr[b]) : DS4_SAMPLE_OVERRIDE_NONE;
+                int u = sample_top_p_min_p_override(
+                    vlogits + (uint64_t)f * DS4_N_VOCAB, DS4_N_VOCAB,
+                    btemp[b], btopk[b], btopp[b], bminp[b], &brng[b],
+                    sample_override);
                 uint32_t M = 1u;
                 bool evicted = false;
                 /* v0.5.6 Inc 6: a row retiring mid-accept-step must NOT fire
@@ -41015,9 +41044,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     /* draft j accepted: its row (input == committed token) yields the next real token.
                      * sample_override sees a scanner already advanced through the just-committed
                      * u (on_token above ran synchronously), so its verdict is position-exact. */
-                    u = sample_top_p_min_p(vlogits + (uint64_t)(f + j + 1u) * DS4_N_VOCAB, DS4_N_VOCAB,
-                                           (bsoc[b] && bsoc[b](ud, usr[b])) ? 0.0f : btemp[b],
-                                           btopk[b], btopp[b], bminp[b], &brng[b]);
+                    sample_override = bsoc[b] ?
+                        bsoc[b](ud, usr[b]) : DS4_SAMPLE_OVERRIDE_NONE;
+                    u = sample_top_p_min_p_override(
+                        vlogits + (uint64_t)(f + j + 1u) * DS4_N_VOCAB,
+                        DS4_N_VOCAB, btemp[b], btopk[b], btopp[b], bminp[b],
+                        &brng[b], sample_override);
                     M++;
                     seedtok[b] = vqtok[f + j + 1u];
                     gbuf[b][glen[b]++] = u; cur[b] = u; posv[b]++; mtp_acc_emit++;
@@ -41575,9 +41607,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         const double smp_t0 = g_cont_prof ? now_sec() : 0.0;
         for (uint32_t r = 0; r < k; r++) {
             const uint32_t b = rowbank[r];
-            const int nt = sample_top_p_min_p(logits + (uint64_t)r * DS4_N_VOCAB, DS4_N_VOCAB,
-                                              (bsoc[b] && bsoc[b](ud, usr[b])) ? 0.0f : btemp[b],
-                                              btopk[b], btopp[b], bminp[b], &brng[b]);
+            const int sample_override = bsoc[b] ?
+                bsoc[b](ud, usr[b]) : DS4_SAMPLE_OVERRIDE_NONE;
+            const int nt = sample_top_p_min_p_override(
+                logits + (uint64_t)r * DS4_N_VOCAB, DS4_N_VOCAB,
+                btemp[b], btopk[b], btopp[b], bminp[b], &brng[b],
+                sample_override);
             sampled[r] = nt;            /* S1.0b: probe compares draft0 against this */
             bank_hist_append(ctx, b, qtokens[r]);   /* A2a: the forwarded token is now committed */
             gbuf[b][glen[b]] = nt;
@@ -43606,6 +43641,13 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent) {
 const char *ds4_engine_model_name(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_SHAPE_NAME;
+}
+
+ds4_chat_format ds4_engine_chat_format(ds4_engine *e) {
+    (void)e;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2
+        ? DS4_CHAT_FORMAT_SOLAR_OPEN2
+        : DS4_CHAT_FORMAT_DSML;
 }
 
 int ds4_engine_layer_count(ds4_engine *e) {
