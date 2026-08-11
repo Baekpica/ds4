@@ -41,7 +41,8 @@ static int check_large_topk(void) {
     if (scores && selected &&
         ds4_gpu_tensor_write(scores, 0, scores_host, score_count * sizeof(float))) {
         const double t0 = monotonic_seconds();
-        if (ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) &&
+        if (ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens,
+                                         top_k, 0u, UINT32_MAX) &&
             ds4_gpu_synchronize()) {
             elapsed = monotonic_seconds() - t0;
             rc = ds4_gpu_tensor_read(selected, 0, selected_host,
@@ -118,11 +119,16 @@ static int check_decode_attention_overflow_path(void) {
                                               n_raw,
                                               0,
                                               comp,
+                                              0,
                                               n_comp,
                                               NULL,
                                               0,
                                               n_head,
-                                              head_dim) &&
+                                              head_dim,
+                                              NULL,
+                                              UINT32_MAX,
+                                              NULL,
+                                              NULL) &&
         ds4_gpu_synchronize() &&
         ds4_gpu_tensor_read(heads, 0, heads_host, q_count * sizeof(float))) {
         rc = 0;
