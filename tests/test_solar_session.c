@@ -172,6 +172,8 @@ int main(int argc, char **argv) {
     ds4_session_snapshot snapshot = {0};
     ds4_session_snapshot restored_snapshot = {0};
     ds4_session_payload_file bank_payload = {0};
+    ds4_batch_gen_result primary_batch_oracle = {0};
+    ds4_batch_gen_result alternate_batch_oracle = {0};
     char err[256] = "";
     int failed = 0;
 
@@ -438,11 +440,38 @@ int main(int argc, char **argv) {
         failed = 1;
         goto cleanup;
     }
-    const int fourth_next = ds4_session_argmax(session);
     ds4_session_invalidate(session);
     if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0 ||
         ds4_session_argmax(session) != next) {
         fprintf(stderr, "Solar scalar oracle restore failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+
+    /* The K=128 D2R prefill tier is value-equivalent, not bit-identical, to
+     * the scalar/native path.  Derive the isolation oracle from fresh
+     * one-bank batch contexts so this test detects bank-width contamination
+     * without conflating it with the documented kernel fold-order change. */
+    const int batch_oracle_budget = 6;
+    const int one_token_single = 1;
+    const int solar_eos = ds4_token_eos(engine);
+    err[0] = '\0';
+    if (ds4_engine_batched_generate_ex(
+            engine, &prompt, 1, 128, &batch_oracle_budget, &solar_eos,
+            &primary_batch_oracle, err, sizeof(err)) != 0 ||
+        primary_batch_oracle.n_tokens != batch_oracle_budget) {
+        fprintf(stderr, "Solar primary batch oracle failed: %s n=%d\n",
+                err, primary_batch_oracle.n_tokens);
+        failed = 1;
+        goto cleanup;
+    }
+    err[0] = '\0';
+    if (ds4_engine_batched_generate_ex(
+            engine, &prompt_alt, 1, 128, &one_token_single, &solar_eos,
+            &alternate_batch_oracle, err, sizeof(err)) != 0 ||
+        alternate_batch_oracle.n_tokens != one_token_single) {
+        fprintf(stderr, "Solar alternate batch oracle failed: %s n=%d\n",
+                err, alternate_batch_oracle.n_tokens);
         failed = 1;
         goto cleanup;
     }
@@ -471,14 +500,15 @@ int main(int argc, char **argv) {
             batch_results, err, sizeof(err)) != 0 ||
         batch_results[0].n_tokens != 1 ||
         batch_results[1].n_tokens != 1 ||
-        batch_results[0].tokens[0] != next ||
-        batch_results[1].tokens[0] != alt_next) {
+        batch_results[0].tokens[0] != primary_batch_oracle.tokens[0] ||
+        batch_results[1].tokens[0] != alternate_batch_oracle.tokens[0]) {
         fprintf(stderr,
                 "Solar persistent batch isolation failed: %s got=%d/%d want=%d/%d\n",
                 err,
                 batch_results[0].n_tokens ? batch_results[0].tokens[0] : -1,
                 batch_results[1].n_tokens ? batch_results[1].tokens[0] : -1,
-                next, alt_next);
+                primary_batch_oracle.tokens[0],
+                alternate_batch_oracle.tokens[0]);
         free(batch_results[0].tokens);
         free(batch_results[1].tokens);
         ds4_batch_ctx_destroy(batch_ctx);
@@ -509,10 +539,10 @@ int main(int argc, char **argv) {
             solar_cont_on_done, &cont, err, sizeof(err)) != 0 ||
         cont.failed || cont.done != 2 || cont.next_admit != 2 ||
         cont.n_tokens[0] != 3 || cont.n_tokens[1] != 1 ||
-        cont.tokens[0][0] != next ||
-        cont.tokens[0][1] != decoded_argmax ||
-        cont.tokens[0][2] != third_next ||
-        cont.tokens[1][0] != alt_next ||
+        cont.tokens[0][0] != primary_batch_oracle.tokens[0] ||
+        cont.tokens[0][1] != primary_batch_oracle.tokens[1] ||
+        cont.tokens[0][2] != primary_batch_oracle.tokens[2] ||
+        cont.tokens[1][0] != alternate_batch_oracle.tokens[0] ||
         cont.bank_used[0] != 0 || cont.bank_used[1] != 1 ||
         cont.admitted_cached[0] != prompt.len ||
         cont.admitted_computed[0] != 0 ||
@@ -535,8 +565,8 @@ int main(int argc, char **argv) {
     }
     const int *committed = NULL;
     if (ds4_batch_ctx_bank_committed(batch_ctx, 0, &committed) != 6 ||
-        !committed || committed[4] != next ||
-        committed[5] != decoded_argmax ||
+        !committed || committed[4] != primary_batch_oracle.tokens[0] ||
+        committed[5] != primary_batch_oracle.tokens[1] ||
         ds4_batch_ctx_bank_committed(batch_ctx, 1, NULL) != prompt_alt.len ||
         ds4_batch_ctx_bank_generation(batch_ctx, 0) == 0u ||
         ds4_batch_ctx_bank_generation(batch_ctx, 1) == 0u) {
@@ -546,8 +576,12 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     fprintf(stderr,
-            "Solar batching: scalar seeds=%d/%d rolling=%d,%d,%d + %d\n",
-            next, alt_next, next, decoded_argmax, third_next, alt_next);
+            "Solar batching: scalar seeds=%d/%d batch=%d/%d "
+            "rolling=%d,%d,%d + %d\n",
+            next, alt_next,
+            primary_batch_oracle.tokens[0], alternate_batch_oracle.tokens[0],
+            primary_batch_oracle.tokens[0], primary_batch_oracle.tokens[1],
+            primary_batch_oracle.tokens[2], alternate_batch_oracle.tokens[0]);
 
     const uint64_t bank_bytes =
         ds4_cont_bank_payload_bytes(batch_ctx, 0);
@@ -581,9 +615,9 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < prompt.len; i++)
         ds4_tokens_push(&prompt_restored, prompt.v[i]);
-    ds4_tokens_push(&prompt_restored, next);
-    ds4_tokens_push(&prompt_restored, decoded_argmax);
-    ds4_tokens_push(&prompt_restored, third_next);
+    ds4_tokens_push(&prompt_restored, primary_batch_oracle.tokens[0]);
+    ds4_tokens_push(&prompt_restored, primary_batch_oracle.tokens[1]);
+    ds4_tokens_push(&prompt_restored, primary_batch_oracle.tokens[2]);
     solar_cont_test restored = {0};
     restored.prompt[0] = &prompt_restored;
     restored.n_requests = 1;
@@ -602,7 +636,7 @@ int main(int argc, char **argv) {
             solar_cont_on_done, &restored, err, sizeof(err)) != 0 ||
         restored.failed || restored.done != 1 ||
         restored.n_tokens[0] != 1 ||
-        restored.tokens[0][0] != fourth_next ||
+        restored.tokens[0][0] != primary_batch_oracle.tokens[3] ||
         restored.bank_used[0] != 1 ||
         restored.admitted_cached[0] != 6 ||
         restored.admitted_computed[0] != 1 ||
@@ -611,7 +645,8 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "Solar restored bank warm continuation failed: %s "
                 "done=%d token=%d/%d bank=%d split=%d+%d\n",
-                err, restored.done, restored.tokens[0][0], fourth_next,
+                err, restored.done, restored.tokens[0][0],
+                primary_batch_oracle.tokens[3],
                 restored.bank_used[0], restored.admitted_cached[0],
                 restored.admitted_computed[0]);
         ds4_batch_ctx_destroy(batch_ctx);
@@ -620,11 +655,11 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr,
             "Solar bank persistence: bytes=%llu cached=6 computed=1 next=%d\n",
-            (unsigned long long)bank_bytes, fourth_next);
+            (unsigned long long)bank_bytes, primary_batch_oracle.tokens[3]);
 
     /* Ramp through 2/3/4-row decode passes.  Chunked admission staggers the
      * four identical banks by one step; every final sequence must still be
-     * identical, with its known prefix matching the scalar trajectory. */
+     * identical to the independent one-bank batch trajectory. */
     ds4_tokens fused_prompts[4] = { prompt, prompt, prompt, prompt };
     ds4_batch_gen_result fused_results[4] = {0};
     const int six_tokens[4] = {6, 6, 6, 6};
@@ -639,9 +674,9 @@ int main(int argc, char **argv) {
     int fused_ok = fused_rc == 0;
     for (int i = 0; fused_ok && i < 4; i++) {
         fused_ok = fused_results[i].n_tokens == 6 &&
-                   fused_results[i].tokens[0] == next &&
-                   fused_results[i].tokens[1] == decoded_argmax &&
-                   fused_results[i].tokens[2] == third_next &&
+                   memcmp(fused_results[i].tokens,
+                          primary_batch_oracle.tokens,
+                          6u * sizeof(int)) == 0 &&
                    (i == 0 || memcmp(
                        fused_results[0].tokens, fused_results[i].tokens,
                        6u * sizeof(int)) == 0);
@@ -662,18 +697,18 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr,
             "Solar fused decode: banks=4 tokens=%d,%d,%d,...\n",
-            next, decoded_argmax, third_next);
+            primary_batch_oracle.tokens[0], primary_batch_oracle.tokens[1],
+            primary_batch_oracle.tokens[2]);
     for (int i = 0; i < 4; i++) free(fused_results[i].tokens);
     ds4_batch_ctx_destroy(batch_ctx);
 
     ds4_batch_gen_result batch_result = {0};
-    const int one_token_single = 1;
-    const int solar_eos = ds4_token_eos(engine);
     err[0] = '\0';
     if (ds4_engine_batched_generate_ex(
             engine, &prompt, 1, 128, &one_token_single, &solar_eos,
             &batch_result, err, sizeof(err)) != 0 ||
-        batch_result.n_tokens != 1 || batch_result.tokens[0] != next) {
+        batch_result.n_tokens != 1 ||
+        batch_result.tokens[0] != primary_batch_oracle.tokens[0]) {
         fprintf(stderr, "Solar per-call batch path failed: %s\n", err);
         free(batch_result.tokens);
         failed = 1;
@@ -707,6 +742,8 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
+    free(alternate_batch_oracle.tokens);
+    free(primary_batch_oracle.tokens);
     ds4_session_payload_file_free(&bank_payload);
     ds4_session_snapshot_free(&restored_snapshot);
     ds4_session_snapshot_free(&snapshot);
