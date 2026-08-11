@@ -5,6 +5,38 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.5.6.3 — 2026-08-11
+
+Memory-footprint fix for long-running serving on memory-tight boxes
+(forum 378855 post 86 — thanks to emptysands for a field report with
+the measurement discipline to bisect it: identical loads, both
+process and system metrics, two engine versions back to back).
+
+- The KV-cache growth budget is re-tethered to capacity. Since v0.5.5
+  the budget was the bank plan's own allowance (every bank at its
+  full cache extent) regardless of what the box could afford; on a
+  32k boot that authorized more than free-minus-headroom, so
+  demand-mapped cache pages marched into system memory with no brake
+  engaging — measured as a steady MemAvailable drain under sequential
+  load and, on a memory-tight single Spark, an eventual system OOM
+  that v0.5.0 did not exhibit. The budget is now the plan allowance
+  capped to measured capacity at boot-settle, floored at two full
+  banks so pressure trims can never evict every warm record. Under
+  the same 20-minute reproduction the drain now front-loads the bank
+  working set and goes flat (0.02 GB in the second half); the trim
+  gate confirms pressure is absorbed by page recycling with zero
+  admission rejects and intact warm records.
+- The boot ledger shows the decision: the batch vmm line now prints
+  budget=[chosen] [plan X, capacity Y]. DS4_BATCH_VMM_BUDGET_MB
+  still pins the budget explicitly; DS4_MEM_FLOOR_GB (default 4)
+  remains the operator floor for admissions.
+- Also documented from the same report: the ~8.2 GiB startup weight
+  span cache has been a runtime default on GB10 since v0.5.6 (it is
+  what the +~7 GB VmHWM and lower MemAvailable baseline vs v0.5.0
+  are). It is deliberate — promotions land before the bank plan so
+  every build plans honestly — and DS4_CUDA_NO_HBM_CACHE=1 opts out
+  while keeping the plan honest via the outstanding-substrate charge.
+
 ## v0.5.6.2 — 2026-08-10
 
 The proper Codex fix. v0.5.6.1 documented two caveats around OpenAI

@@ -37846,21 +37846,47 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         const uint64_t cache_per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, false, false) -
                                         ds4_batch_slabs_bank_bytes(&ctx->g, false, true) + floor_pb;
         /* #15 governance (2026-08-04, resolves the Inc0 adjudication): the
-         * budget is the FIT PLAN's own allowance -- max_seq banks at their
-         * full per-bank cache extent -- never a boot-time vfree snapshot.
-         * The snapshot formula sampled a mid-boot transient (bank_mutation
-         * c3: budget 1.24 GiB vs a 1.4 GiB working set -> pressure trims
-         * ate every warm record) and needed both a floor grant-back
-         * (double-counting at high samples) and a grow-only live refresh
-         * to paper over its noise; all three delete with it.  Resident
-         * cache pages can never exceed the plan allowance, so this class
-         * gate is exact by construction; the LIVE spend question -- has
-         * the box lost memory since boot -- is the mem-floor verdict's job
-         * (inc1 + the inc2 serial reserve + Inc0 outstanding projections),
-         * which runs in the same admission block.  DS4_BATCH_VMM_BUDGET_MB
-         * survives as the explicit ops/gate override (pinned budgets are
-         * how gates force deterministic rejects). */
-        ctx->comp_map_budget = (uint64_t)ctx->max_seq * cache_per_bank;
+         * budget's UPPER bound is the FIT PLAN's own allowance -- max_seq
+         * banks at their full per-bank cache extent.  Resident cache pages
+         * can never exceed the plan allowance, so this class gate is exact
+         * by construction; the LIVE spend question -- has the box lost
+         * memory since boot -- is the mem-floor verdict's job (inc1 + the
+         * inc2 serial reserve + Inc0 outstanding projections), which runs
+         * in the same admission block.
+         *
+         * 378855/86 re-tether (2026-08-10): the plan allowance alone is
+         * NOT the budget.  A 32k plan authorizes max_seq x full extent
+         * regardless of what the box can afford (measured: budget 10.93
+         * GiB on a boot whose free-minus-headroom was 9.89 GiB), so
+         * fleet-spread demand mapping marches into system memory with no
+         * brake ever engaging -- the v0.5.0->v0.5.6.1 field drain-to-OOM.
+         * The budget is the plan CAPPED to capacity, sampled HERE (post
+         * session create, the settled boot state -- not the mid-boot
+         * transient that killed the old snapshot-only formula via
+         * bank_mutation c3: budget 1.24 GiB vs a 1.4 GiB working set,
+         * pressure trims eating every warm record).  The same c3 class is
+         * additionally guarded by a two-full-banks working floor: trims
+         * can recycle cold warm records, but the budget can never be so
+         * small that every record is a victim.  The fit already charged
+         * every bank its first-touch floor, so capacity grants those
+         * floors back on top of free-beyond-headroom -- fit and page
+         * budget split the same memory.  DS4_BATCH_VMM_BUDGET_MB survives
+         * as the explicit ops/gate override (pinned budgets are how gates
+         * force deterministic rejects). */
+        const uint64_t plan_allow = (uint64_t)ctx->max_seq * cache_per_bank;
+        uint64_t capacity_allow = plan_allow;   /* no memory answer: plan-only */
+        { uint64_t vfree = 0, vtotal = 0;
+          if (ds4_gpu_mem_info(&vfree, &vtotal) == 0) {
+              const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
+              const uint64_t res = ds4_batch_slabs_cache_resident(&ctx->sl);
+              const uint64_t floor_work = 2u * cache_per_bank +
+                                          (uint64_t)ctx->max_seq * floor_pb;
+              capacity_allow = res + (vfree > headroom ? vfree - headroom : 0) +
+                               (uint64_t)ctx->max_seq * floor_pb;
+              if (capacity_allow < floor_work) capacity_allow = floor_work;
+          } }
+        ctx->comp_map_budget = plan_allow < capacity_allow ? plan_allow
+                                                           : capacity_allow;
         /* Explicit override (MB): pins the page budget below the plan
          * allowance -- ops guardrail + the only way a gate can force the
          * admission reject path deterministically. */
@@ -37868,10 +37894,12 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
           if (be && be[0]) { const long bv = atol(be);
             if (bv > 0) { ctx->comp_map_budget = (uint64_t)bv << 20; ctx->comp_map_budget_pinned = 1u; } } }
         fprintf(stderr,
-                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB, mem floor=%.1f GiB, serial reserve=%.2f GiB, substrate outstanding=%.2f GiB%s)\n",
+                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB [plan %.2f, capacity %.2f], mem floor=%.1f GiB, serial reserve=%.2f GiB, substrate outstanding=%.2f GiB%s)\n",
                 (unsigned long long)(ds4_gpu_vmm_demand_page() >> 10),
                 (double)cache_per_bank / 1048576.0, (double)floor_pb / 1048576.0,
                 ctx->max_seq, (double)ctx->comp_map_budget / 1073741824.0,
+                (double)plan_allow / 1073741824.0,
+                (double)capacity_allow / 1073741824.0,
                 (double)ds4_mem_floor_bytes() / 1073741824.0,
                 (double)ctx->serial_reserve / 1073741824.0,
                 (double)ds4_gpu_substrate_outstanding() / 1073741824.0,
