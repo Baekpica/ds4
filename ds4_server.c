@@ -16353,6 +16353,20 @@ static const char *mem_domain_names[DS4_MEMD__COUNT] = {
 };
 static const char *mem_obs_status_names[3] = { "ok", "unsupported", "query_error" };
 static const char *mem_obs_source_names[3] = { "none", "cuda_free", "meminfo_available" };
+/* memgov D0b-4: governor name tables, positional against the gov enums
+ * (ds4_mem_gov.h) -- same fixed-cardinality contract as the census. */
+static const char *gov_consumer_names[DS4_GOVC__COUNT] = {
+    "engine_boot", "prewarm", "batch_bank_plan", "serial_session",
+    "static_batch",
+};
+static const char *gov_status_names[DS4_GOV_STATUS__COUNT] = {
+    "admit", "refuse_class", "refuse_live", "retry_obs", "unsupported",
+    "fault",
+};
+static const char *gov_cmp_names[DS4_GOV_CMP__COUNT] = {
+    "agree", "live_stricter", "shadow_stricter", "verdict_class",
+    "obs_policy", "fault",
+};
 
 typedef struct {
     ds4_mem_cell cells[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
@@ -16677,6 +16691,42 @@ static void send_metrics(server *s, int fd) {
         buf_printf(&b, "# TYPE ds4_memory_observation_errors_total counter\n"
                        "ds4_memory_observation_errors_total %llu\n",
                    (unsigned long long)ds4_metric_read(&m->memobs_errors));
+        /* memgov D0b-4: the shadow governor.  Leases (one ledger image
+         * through the seqlock), then the full fixed-cardinality decision
+         * matrix (plan sec 14 ds4_memory_decisions_total) -- all cells
+         * always emitted, result = the SHADOW quote's status, reason =
+         * the old/new comparison class.  Process counters, meaningful on
+         * every backend (on Metal/CPU the cells accumulate obs_policy). */
+        {
+            ds4_gov_ledger lg;
+            memset(&lg, 0, sizeof(lg));
+            ds4_gov_snapshot(&lg);
+            buf_printf(&b, "# TYPE ds4_memory_governor_epoch gauge\n"
+                           "ds4_memory_governor_epoch %llu\n",
+                       (unsigned long long)lg.epoch);
+            buf_puts(&b, "# TYPE ds4_memory_lease_bytes gauge\n");
+            for (int c = 0; c < DS4_GOVC__COUNT; c++)
+                buf_printf(&b,
+                    "ds4_memory_lease_bytes{consumer=\"%s\",field=\"intent\"} %llu\n"
+                    "ds4_memory_lease_bytes{consumer=\"%s\",field=\"resident\"} %llu\n"
+                    "ds4_memory_lease_bytes{consumer=\"%s\",field=\"reservation\"} %llu\n",
+                    gov_consumer_names[c], (unsigned long long)lg.lease[c].intent,
+                    gov_consumer_names[c], (unsigned long long)lg.lease[c].resident,
+                    gov_consumer_names[c], (unsigned long long)lg.lease[c].reservation);
+            buf_puts(&b, "# TYPE ds4_memory_decisions_total counter\n");
+            for (int c = 0; c < DS4_GOVC__COUNT; c++)
+                for (int st = 0; st < DS4_GOV_STATUS__COUNT; st++)
+                    for (int r = 0; r < DS4_GOV_CMP__COUNT; r++)
+                        buf_printf(&b,
+                            "ds4_memory_decisions_total{consumer=\"%s\",result=\"%s\",reason=\"%s\"} %llu\n",
+                            gov_consumer_names[c], gov_status_names[st],
+                            gov_cmp_names[r],
+                            (unsigned long long)ds4_metric_read(
+                                &m->memgov_decisions[c][st][r]));
+            buf_printf(&b, "# TYPE ds4_memory_governor_faults_total counter\n"
+                           "ds4_memory_governor_faults_total %llu\n",
+                       (unsigned long long)ds4_metric_read(&m->memgov_faults));
+        }
     }
     http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);
@@ -16835,6 +16885,36 @@ static void send_stats(server *s, int fd, bool as_json) {
                        (unsigned long long)ds4_metric_read(&m->memobs_calls[DS4_MEMOBS_SRC_MEMINFO_AVAILABLE]),
                        (unsigned long long)ds4_metric_read(&m->memobs_errors));
         }
+        /* memgov D0b-4: governor section -- leases + decisions by reason
+         * (the full consumer x result x reason matrix lives in /metrics;
+         * stats summarizes by reason, the board-glance question being
+         * "does the shadow agree?"). */
+        {
+            ds4_gov_ledger lg;
+            memset(&lg, 0, sizeof(lg));
+            ds4_gov_snapshot(&lg);
+            buf_printf(&b, ",\"governor\":{\"shadow\":true,\"epoch\":%llu,"
+                           "\"faults\":%llu,\"leases\":{",
+                       (unsigned long long)lg.epoch,
+                       (unsigned long long)ds4_metric_read(&m->memgov_faults));
+            for (int c = 0; c < DS4_GOVC__COUNT; c++)
+                buf_printf(&b, "%s\"%s\":{\"intent\":%llu,\"resident\":%llu,"
+                               "\"reservation\":%llu}",
+                           c ? "," : "", gov_consumer_names[c],
+                           (unsigned long long)lg.lease[c].intent,
+                           (unsigned long long)lg.lease[c].resident,
+                           (unsigned long long)lg.lease[c].reservation);
+            buf_puts(&b, "},\"decisions\":{");
+            for (int r = 0; r < DS4_GOV_CMP__COUNT; r++) {
+                uint64_t n = 0;
+                for (int c = 0; c < DS4_GOVC__COUNT; c++)
+                    for (int st = 0; st < DS4_GOV_STATUS__COUNT; st++)
+                        n += ds4_metric_read(&m->memgov_decisions[c][st][r]);
+                buf_printf(&b, "%s\"%s\":%llu", r ? "," : "",
+                           gov_cmp_names[r], (unsigned long long)n);
+            }
+            buf_puts(&b, "}}");
+        }
         buf_puts(&b, "}\n");
         http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
         buf_free(&b);
@@ -16983,6 +17063,32 @@ static void send_stats(server *s, int fd, bool as_json) {
                        mem_gib(o.free_bytes), mem_gib(o.total_bytes));
         else
             buf_printf(&b, "observation:%s\n", mem_obs_status_names[o.status]);
+    }
+    /* memgov D0b-4: governor board -- nonzero leases + decisions by
+     * reason (full matrix in /metrics). */
+    {
+        ds4_gov_ledger lg;
+        memset(&lg, 0, sizeof(lg));
+        ds4_gov_snapshot(&lg);
+        buf_printf(&b, "\n# Memory governor (shadow)\ngovernor_faults:%llu\n",
+                   (unsigned long long)ds4_metric_read(&m->memgov_faults));
+        for (int c = 0; c < DS4_GOVC__COUNT; c++)
+            if (lg.lease[c].intent || lg.lease[c].resident ||
+                lg.lease[c].reservation)
+                buf_printf(&b, "lease.%s:intent=%.2fGiB resident=%.2fGiB "
+                               "reservation=%.2fGiB\n",
+                           gov_consumer_names[c], mem_gib(lg.lease[c].intent),
+                           mem_gib(lg.lease[c].resident),
+                           mem_gib(lg.lease[c].reservation));
+        for (int r = 0; r < DS4_GOV_CMP__COUNT; r++) {
+            uint64_t n = 0;
+            for (int c = 0; c < DS4_GOVC__COUNT; c++)
+                for (int st = 0; st < DS4_GOV_STATUS__COUNT; st++)
+                    n += ds4_metric_read(&m->memgov_decisions[c][st][r]);
+            if (n)
+                buf_printf(&b, "decisions_%s:%llu\n", gov_cmp_names[r],
+                           (unsigned long long)n);
+        }
     }
     http_response(fd, s->enable_cors, 200, "text/plain", b.ptr);
     buf_free(&b);
@@ -26394,6 +26500,18 @@ static void test_mem_gov_shadow_ledger(void) {
                 lg.lease[DS4_GOVC_SERIAL_SESSION].reservation == 0);
 }
 
+/* memgov D0b-4: the governor porcelain's name tables are positional
+ * against closed enums -- a grown enum without its name is a NULL deref
+ * at render time; pin the shape here instead. */
+static void test_mem_gov_publication_shape(void) {
+    for (int c = 0; c < DS4_GOVC__COUNT; c++)
+        TEST_ASSERT(gov_consumer_names[c] && gov_consumer_names[c][0]);
+    for (int st = 0; st < DS4_GOV_STATUS__COUNT; st++)
+        TEST_ASSERT(gov_status_names[st] && gov_status_names[st][0]);
+    for (int r = 0; r < DS4_GOV_CMP__COUNT; r++)
+        TEST_ASSERT(gov_cmp_names[r] && gov_cmp_names[r][0]);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -26565,9 +26683,10 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_gov_state_machine();
     /* memgov D0b-2: versioned snapshot protocol. */
     test_mem_gov_epoch_protocol();
-    /* memgov D0b-3: comparison classes + the live shadow ledger. */
+    /* memgov D0b-3/4: comparison classes, shadow ledger, porcelain shape. */
     test_mem_gov_compare_classes();
     test_mem_gov_shadow_ledger();
+    test_mem_gov_publication_shape();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

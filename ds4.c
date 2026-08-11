@@ -32837,6 +32837,14 @@ struct ds4_batch_ctx {
      * the budget is an ops/gate constant, never refreshed from live memory. */
     uint64_t        comp_map_budget;
     uint8_t         comp_map_budget_pinned;
+    /* memgov D0b-4: the bank plan's eager boot cost (BATCH_BANK census
+     * minus the demand-mapped families' resident, captured once after
+     * every bank-scope boot allocation).  The governor ledger is
+     * ABSOLUTE, the live budget formulas are family-relative; this
+     * constant converts between them (x > budget <=> eager + x >
+     * eager + budget), so the lease reconciles against the census
+     * while every shadow verdict stays bit-identical. */
+    uint64_t        bank_census_eager;
     /* Governance inc2 (#8, field 378855/49): bytes carved out of every
      * bank-growth verdict so the serial lane always has room for a
      * right-sized session graph (entitlement ctx, default 32768 tokens,
@@ -34153,12 +34161,6 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                 (double)ctx->serial_reserve / 1073741824.0,
                 (double)ds4_gpu_substrate_outstanding() / 1073741824.0,
                 g_slab_vmm_fallbacks ? " -- WITH EAGER FALLBACKS, see above" : "");
-        /* memgov D0b-3 (S1/S2): the bank plan's boot lease -- an absolute
-         * publication, no quote (there is no live boolean at boot; the
-         * fit retry-down IS the decision).  intent == resident: nothing
-         * is credited yet, the plan's first-touch floors are physical. */
-        { const uint64_t r0 = ds4_batch_slabs_cache_resident(&ctx->sl);
-          ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN, r0, r0); }
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
      * R2: sized by seq_cap (the committed-token bound), not the raw ring. */
@@ -34199,6 +34201,23 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         return 1;
     }
     ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
+    /* memgov D0b-4 (S1/S2): the bank plan's boot lease -- an absolute
+     * publication, no quote (there is no live boolean at boot; the fit
+     * retry-down IS the decision).  Captured after EVERY bank-scope
+     * boot allocation (slabs, mtp/dspark, stashes) so the lease equals
+     * the BATCH_BANK census; the eager constant (census minus the
+     * demand-mapped families) converts the family-relative admission
+     * formulas to this absolute basis at S4/S5. */
+    {
+        ds4_mem_cell cc;
+        uint64_t bank_census = 0;
+        if (ds4_gpu_mem_census_read(DS4_MEMC_BATCH_BANK,
+                                    DS4_MEMD_UNIFIED_DEVICE, &cc) == 0)
+            bank_census = ds4_mem_cell_live(&cc);
+        const uint64_t r0 = ds4_batch_slabs_cache_resident(&ctx->sl);
+        ctx->bank_census_eager = bank_census > r0 ? bank_census - r0 : 0;
+        ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN, bank_census, bank_census);
+    }
     *out = ctx;
     return 0;
 #undef BC_ERR
@@ -36042,15 +36061,21 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 /* memgov D0b-3 (S4/S5): ONE claim for both live verdicts,
                  * built from the exact inputs the class check consumes
                  * (post class-trim mres).  proposed is the ABSOLUTE
-                 * post-fault total: resident + the whole union's unfaulted
-                 * growth (the projection already carries every credit and
-                 * this candidate, sec 6.2's do-not-resum rule). */
+                 * post-fault total: the plan's eager boot cost + resident
+                 * + the whole union's unfaulted growth (the projection
+                 * already carries every credit and this candidate, sec
+                 * 6.2's do-not-resum rule).  D0b-4: the eager constant
+                 * shifts BOTH proposed and the class limit, so the class
+                 * verdict is the live check verbatim (x > budget <=>
+                 * eager + x > eager + budget) while the ledger stays on
+                 * the census basis. */
                 ds4_gov_claim scl = {0};
                 scl.requester = DS4_GOVC_BATCH_BANK_PLAN;
                 scl.memc = DS4_MEMC_BATCH_BANK;
                 scl.domain = DS4_MEMD_UNIFIED_DEVICE;
-                scl.proposed_outstanding = mres + mneed;
-                scl.class_limit = ctx->comp_map_budget;
+                scl.proposed_outstanding = ctx->bank_census_eager + mres + mneed;
+                scl.class_limit = ctx->comp_map_budget != 0
+                                ? ctx->bank_census_eager + ctx->comp_map_budget : 0;
                 if (ctx->comp_map_budget != 0 && mneed != 0 &&
                     mres + mneed > ctx->comp_map_budget) {
                     ctx->mem_rejects++;
@@ -36102,10 +36127,12 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 }
                 /* memgov D0b-3: both live verdicts passed -- shadow the
                  * admit and publish the lane's absolute lease (intent =
-                 * post-fault total, resident = what the page scan sees). */
+                 * eager cost + post-fault total, resident = eager cost +
+                 * what the page scan sees: the census basis). */
                 ds4_gov_shadow_check("cont_admit", &scl, DS4_GOV_ADMIT);
                 ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
-                                    mres + mneed, mres);
+                                    ctx->bank_census_eager + mres + mneed,
+                                    ctx->bank_census_eager + mres);
             }
             /* R4: ADMISSION = INSTALL ONLY.  Bank state is prepared here (reset /
              * fork copy / warm reuse) and the tokens to prefill are parked in the
