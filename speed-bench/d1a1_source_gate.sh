@@ -83,6 +83,10 @@ R "grep -q 'model source UNATTRIBUTED' $BOOTLOG" && die "unattributed weight byt
 R "grep -q 'ds4: model catalog base:' $BOOTLOG" || die "no base catalog line"
 R "grep -q 'ds4: model catalog drafter:' $BOOTLOG" || die "no drafter catalog line"
 R "grep -q 'CATALOG-TRIPWIRE' $BOOTLOG" && die "catalog-vs-heuristic tripwire fired"
+# D1a-3: unit tables compile + verify clean on every source.
+R "grep -q 'ds4: model units base: .* (verify=0)' $BOOTLOG" || die "no clean base unit table"
+R "grep -q 'ds4: model units drafter: .* (verify=0)' $BOOTLOG" || die "no clean drafter unit table"
+R "grep -q 'UNIT-TABLE FAULT' $BOOTLOG" && die "unit-table fault at boot"
 CF0=$(met ds4_memory_census_faults_total)
 [ "$CF0" = "0" ] || die "census faults=$CF0 at boot settle"
 decode_one /tmp/d1a1_s_dec.json s || die "leg (s) decode failed"
@@ -110,6 +114,9 @@ R "grep -q 'model source UNATTRIBUTED' $BOOTLOG" && die "(s2) unattributed weigh
 # D1a-2: catalog engagement on the mtp shape.
 R "grep -q 'ds4: model catalog mtp:' $BOOTLOG" || die "(s2) no mtp catalog line"
 R "grep -q 'CATALOG-TRIPWIRE' $BOOTLOG" && die "(s2) catalog tripwire fired"
+# D1a-3: mtp unit table clean.
+R "grep -q 'ds4: model units mtp: .* (verify=0)' $BOOTLOG" || die "(s2) no clean mtp unit table"
+R "grep -q 'UNIT-TABLE FAULT' $BOOTLOG" && die "(s2) unit-table fault"
 CF2=$(met ds4_memory_census_faults_total)
 [ "$CF2" = "0" ] || die "(s2) census faults=$CF2"
 log "(s2) PASS (base+mtp reconciled, faults 0)"

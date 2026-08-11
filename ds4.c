@@ -39271,6 +39271,91 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* memgov D1a-3: compile + verify the canonical unit table per
+         * source (STRUCTURAL: reconciled here, not yet consumed by the
+         * live walk).  Active set = the boot slice for the base map
+         * (§5.1: a slice boot enumerates only its intervals), everything
+         * for support models.  Any compile/verify violation counts a
+         * census fault, which every standing gate asserts zero.
+         * CUDA-only like the census (OBS-policy): the policy stamps are
+         * the CUDA residency plan (VMM arena / HBM promote); Metal keeps
+         * descriptors + catalogs but plans no device residency here. */
+#ifndef __APPLE__
+        {
+            const struct { const char *nm; const ds4_model *mm; int on; int sliced; } uts[] = {
+                {"base", &e->model, 1, load_slice},
+                {"mtp", &e->mtp_model, e->mtp_ready, 0},
+                {"drafter", &e->dspark_model, e->dspark_ready, 0},
+            };
+            for (size_t si = 0; si < sizeof(uts) / sizeof(uts[0]); si++) {
+                if (!uts[si].on || uts[si].mm->n_tensors == 0) continue;
+                const ds4_model *mm = uts[si].mm;
+                const uint32_t n = (uint32_t)mm->n_tensors;
+                ds4_unit_tensor_in *tin = xmalloc((size_t)n * sizeof(tin[0]));
+                ds4_phys_unit *units = xmalloc((size_t)n * sizeof(units[0]));
+                ds4_model_map_span_vec sl_spans = {NULL, 0, 0, 0};
+                bool have_slice = false;
+                if (uts[si].sliced) {
+                    have_slice = weights_model_map_spans(&e->weights,
+                                                         load_layer_start,
+                                                         load_layer_end,
+                                                         load_output,
+                                                         &sl_spans);
+                }
+                for (uint32_t i = 0; i < n; i++) {
+                    const ds4_tensor *t = &mm->tensors[i];
+                    tin[i].off = t->abs_offset;
+                    tin[i].bytes = t->bytes;
+                    tin[i].traits = mm->tensor_traits ? mm->tensor_traits[i] : 0;
+                    tin[i].active = 1;
+                    if (have_slice) {
+                        tin[i].active = 0;
+                        for (uint32_t sj = 0; sj < sl_spans.len; sj++) {
+                            if (t->abs_offset >= sl_spans.v[sj].off &&
+                                t->abs_offset + t->bytes <= sl_spans.v[sj].end) {
+                                tin[i].active = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                free(sl_spans.v);
+                ds4_unit_compile_params up;
+                memset(&up, 0, sizeof up);
+                up.merge_gap = 65536;
+                up.max_unit_bytes = accelerator_cuda_preload_span_bytes();
+                up.vmm_granularity = 256;   /* the weight-arena bump align */
+                up.hbm_cache_on = getenv("DS4_CUDA_NO_HBM_CACHE") == NULL;
+                up.replaces_complete =
+                    ds4_gpu_model_map_replaces_complete(mm->map) != 0;
+                const int nu = ds4_units_compile(tin, n, &up, units);
+                uint32_t viol = nu < 0 ? 1
+                    : ds4_units_verify(tin, n, &up, units, nu);
+                ds4_unit_table_counts uc;
+                ds4_units_count(units, nu < 0 ? 0 : nu, &uc);
+                fprintf(stderr,
+                        "ds4: model units %s: %llu units, covered %.2f GiB, "
+                        "planned %.2f GiB, promote %.2f GiB, cold %.2f GiB "
+                        "(verify=%u)\n",
+                        uts[si].nm,
+                        (unsigned long long)uc.units,
+                        (double)uc.covered_bytes / 1073741824.0,
+                        (double)uc.planned_bytes / 1073741824.0,
+                        (double)uc.promote_bytes / 1073741824.0,
+                        (double)uc.cold_bytes / 1073741824.0,
+                        viol);
+                if (viol != 0) {
+                    fprintf(stderr,
+                            "ds4: UNIT-TABLE FAULT: %s compile/verify "
+                            "violations=%u\n",
+                            uts[si].nm, viol);
+                    ds4_gpu_mem_census_fault_note();
+                }
+                free(tin);
+                free(units);
+            }
+        }
+#endif
         /* memgov D1a-1: per-source residency lines + ledger reconciliation
          * against the census cells (no-op on Metal).  Post-pre-cache is the
          * interesting snapshot; the reconciliation invariant itself holds at

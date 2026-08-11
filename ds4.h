@@ -531,6 +531,12 @@ void ds4_gpu_report_model_sources(void);
  * asserts zero).  Monotonic bump, no epoch bracket (the scope-tag
  * precedent); Metal stub is a no-op (no census there). */
 void ds4_gpu_mem_census_fault_note(void);
+/* memgov D1a-3: policy provenance for the unit compiler — nonzero when
+ * every replace-kind artifact candidate of this map is served by a
+ * device artifact (self-load build or manifest import), the condition
+ * under which raw expert ranges are never device-allocated.  Metal
+ * stub returns 0. */
+int  ds4_gpu_model_map_replaces_complete(const void *model_map);
 /* memgov D0b-3: the SHADOW governor.  One process-global lease ledger
  * (ds4_mem_gov.h types) written under the same single-writer discipline
  * as the census and read through the same seqlock protocol.  Publishes

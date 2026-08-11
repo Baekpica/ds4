@@ -26652,6 +26652,146 @@ static void test_model_catalog_classify(void) {
     }
 }
 
+/* memgov D1a-3: unit-compiler property tests (ds4_model_catalog.h).
+ * Every invariant the boot build reconciles is pinned here on synthetic
+ * layouts: exact coverage, no overlap/split, policy homogeneity,
+ * merge/cap rules, rounding exactness, slice exclusion, import rules. */
+static void test_unit_compiler_properties(void) {
+    ds4_unit_compile_params p;
+    memset(&p, 0, sizeof p);
+    p.merge_gap = 64;
+    p.max_unit_bytes = 4096;
+    p.vmm_granularity = 256;
+    p.hbm_cache_on = 1;
+    p.replaces_complete = 0;
+
+    /* Merge within gap + policy split + coverage/verify green. */
+    {
+        const ds4_unit_tensor_in ts[] = {
+            {0, 100, 0, 1},                                /* hot          */
+            {150, 100, 0, 1},                              /* hot, gap 50  */
+            {300, 500, DS4_TCAT_ROUTED_EXPERT, 1},         /* expert       */
+            {820, 100, 0, 1},                              /* hot, gap 20
+                                                              from expert  */
+        };
+        ds4_phys_unit u[4];
+        const int nu = ds4_units_compile(ts, 4, &p, u);
+        TEST_ASSERT(nu == 3);
+        TEST_ASSERT(u[0].src_off == 0 && u[0].src_bytes == 250 && u[0].n_tensors == 2);
+        TEST_ASSERT(u[0].policy == DS4_UPOL_DEVICE_PROMOTE);
+        TEST_ASSERT(u[0].allocator == DS4_UALLOC_VMM_ARENA);
+        TEST_ASSERT(u[0].planned_bytes == 256);            /* 250 -> 256   */
+        TEST_ASSERT(u[1].policy == DS4_UPOL_EXPERT_COLD && u[1].n_tensors == 1);
+        TEST_ASSERT(u[1].allocator == DS4_UALLOC_NONE && u[1].planned_bytes == 500);
+        TEST_ASSERT(u[2].src_off == 820);                  /* no cross-
+                                                              policy merge */
+        TEST_ASSERT(ds4_units_verify(ts, 4, &p, u, nu) == 0);
+        ds4_unit_table_counts uc;
+        ds4_units_count(u, nu, &uc);
+        TEST_ASSERT(uc.units == 3 && uc.covered_bytes == 250 + 500 + 100);
+        TEST_ASSERT(uc.promote_bytes == 350 && uc.cold_bytes == 500);
+    }
+
+    /* Gap beyond merge_gap splits; oversized tensor is its own intact
+     * unit and nothing merges into it past the cap. */
+    {
+        const ds4_unit_tensor_in ts[] = {
+            {0, 100, 0, 1},
+            {200, 100, 0, 1},          /* gap 100 > 64: new unit          */
+            {310, 8000, 0, 1},         /* > max_unit_bytes: own unit      */
+            {8320, 100, 0, 1},         /* would exceed cap if merged      */
+        };
+        ds4_phys_unit u[4];
+        const int nu = ds4_units_compile(ts, 4, &p, u);
+        TEST_ASSERT(nu == 4);
+        TEST_ASSERT(u[2].src_bytes == 8000 && u[2].n_tensors == 1);
+        TEST_ASSERT(u[3].src_off == 8320);
+        TEST_ASSERT(ds4_units_verify(ts, 4, &p, u, nu) == 0);
+    }
+
+    /* Slice exclusion: inactive tensors join no unit; actives on both
+     * sides stay covered. */
+    {
+        const ds4_unit_tensor_in ts[] = {
+            {0, 100, 0, 1},
+            {110, 100, 0, 0},          /* inactive (out of slice)         */
+            {220, 100, 0, 1},
+        };
+        ds4_phys_unit u[3];
+        const int nu = ds4_units_compile(ts, 3, &p, u);
+        TEST_ASSERT(nu == 2);
+        TEST_ASSERT(u[0].n_tensors == 1 && u[1].n_tensors == 1);
+        TEST_ASSERT(ds4_units_verify(ts, 3, &p, u, nu) == 0);
+    }
+
+    /* replaces_complete flips only REPLACED-trait experts. */
+    {
+        ds4_unit_compile_params pr = p;
+        pr.replaces_complete = 1;
+        const ds4_unit_tensor_in ts[] = {
+            {0, 100, DS4_TCAT_ROUTED_EXPERT | DS4_TCAT_ARTIFACT_REPLACED, 1},
+            {1000, 100, DS4_TCAT_ROUTED_EXPERT, 1},
+        };
+        ds4_phys_unit u[2];
+        const int nu = ds4_units_compile(ts, 2, &pr, u);
+        TEST_ASSERT(nu == 2);
+        TEST_ASSERT(u[0].policy == DS4_UPOL_ARTIFACT_REPLACED);
+        TEST_ASSERT(u[1].policy == DS4_UPOL_EXPERT_COLD);
+        TEST_ASSERT(ds4_units_verify(ts, 2, &pr, u, nu) == 0);
+    }
+
+    /* hbm off: hot tensors plan HOST_MAPPED with no allocator. */
+    {
+        ds4_unit_compile_params ph = p;
+        ph.hbm_cache_on = 0;
+        const ds4_unit_tensor_in ts[] = {{0, 100, 0, 1}};
+        ds4_phys_unit u[1];
+        TEST_ASSERT(ds4_units_compile(ts, 1, &ph, u) == 1);
+        TEST_ASSERT(u[0].policy == DS4_UPOL_HOST_MAPPED &&
+                    u[0].allocator == DS4_UALLOC_NONE &&
+                    u[0].planned_bytes == 100);
+    }
+
+    /* Unsorted / overlapping input refuses. */
+    {
+        const ds4_unit_tensor_in bad1[] = {{100, 50, 0, 1}, {0, 50, 0, 1}};
+        const ds4_unit_tensor_in bad2[] = {{0, 100, 0, 1}, {50, 100, 0, 1}};
+        ds4_phys_unit u[2];
+        TEST_ASSERT(ds4_units_compile(bad1, 2, &p, u) == -1);
+        TEST_ASSERT(ds4_units_compile(bad2, 2, &p, u) == -1);
+    }
+
+    /* Import satisfaction: ONE device interval must fully cover; two
+     * adjacent halves do not; exact-boundary cover does. */
+    {
+        ds4_phys_unit u;
+        memset(&u, 0, sizeof u);
+        u.src_off = 1000;
+        u.src_bytes = 500;
+        const ds4_unit_import_iv full = {900, 700};
+        const ds4_unit_import_iv exact = {1000, 500};
+        const ds4_unit_import_iv half_a = {1000, 250};
+        const ds4_unit_import_iv half_b = {1250, 250};
+        const ds4_unit_import_iv halves[] = {{1000, 250}, {1250, 250}};
+        TEST_ASSERT(ds4_unit_import_satisfied(&u, &full, 1) == 1);
+        TEST_ASSERT(ds4_unit_import_satisfied(&u, &exact, 1) == 1);
+        TEST_ASSERT(ds4_unit_import_satisfied(&u, &half_a, 1) == 0);
+        TEST_ASSERT(ds4_unit_import_satisfied(&u, &half_b, 1) == 0);
+        TEST_ASSERT(ds4_unit_import_satisfied(&u, halves, 2) == 0);
+        TEST_ASSERT(ds4_unit_import_satisfied(&u, NULL, 0) == 0);
+    }
+
+    /* Verify catches a corrupted table: shrink a unit so its member
+     * tensor is split across the boundary. */
+    {
+        const ds4_unit_tensor_in ts[] = {{0, 100, 0, 1}};
+        ds4_phys_unit u[1];
+        TEST_ASSERT(ds4_units_compile(ts, 1, &p, u) == 1);
+        u[0].src_bytes = 50;
+        TEST_ASSERT(ds4_units_verify(ts, 1, &p, u, 1) != 0);
+    }
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -26831,6 +26971,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_src_table_bind_find();
     /* memgov D1a-2: semantic tensor classifier + tripwire relation. */
     test_model_catalog_classify();
+    /* memgov D1a-3: unit-compiler properties. */
+    test_unit_compiler_properties();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

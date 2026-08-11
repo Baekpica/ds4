@@ -2527,6 +2527,11 @@ static int cuda_model_map_replaces_complete(const void *model_map) {
     return 0;
 }
 
+/* memgov D1a-3: the unit compiler's policy-provenance input. */
+extern "C" int ds4_gpu_model_map_replaces_complete(const void *model_map) {
+    return cuda_model_map_replaces_complete(model_map);
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     uint64_t mb = 1792;
     const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
