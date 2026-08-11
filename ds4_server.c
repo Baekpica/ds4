@@ -665,10 +665,16 @@ typedef struct {
     ds4_think_mode think_mode;
     ds4_chat_format chat_format;
     bool has_tools;
+    /* True when this request follows an assistant tool call with one or more
+     * tool results.  These turns need room after thinking for the actual tool
+     * answer even when tool_choice is automatic. */
+    bool has_tool_results;
     tool_choice_mode tool_choice;
-    /* Canonical DSML opener tokenized with special-token awareness.  A
-     * required request consumes this prefix immediately after thinking closes;
-     * the inference engine remains protocol-agnostic via sample_override. */
+    /* Model-native control tokens, tokenized with special-token awareness.
+     * Required T1 consumes the tool opener after thinking closes; required T1
+     * and a pending tool-result T2 may consume the thinking closer to preserve
+     * room for their visible action or answer.  The engine stays protocol-
+     * agnostic through sample_override. */
     ds4_tokens required_tool_prefix;
     ds4_tokens required_think_end_prefix;
     bool prompt_preserves_reasoning;
@@ -2283,8 +2289,7 @@ static void append_solar_tool_schema_blocks(buf *b, const char *tool_schemas) {
 /* Byte-for-byte counterpart of Solar Open2's embedded GGUF chat template.
  * Keeping the model-native grammar here lets the common HTTP surface stay
  * model-agnostic while ds4 remains the inference engine. */
-static void append_solar_tools_prompt_text(buf *b, const char *tool_schemas,
-                                           bool tool_required) {
+static void append_solar_tools_prompt_text(buf *b, const char *tool_schemas) {
     if (!tool_schemas || !tool_schemas[0]) return;
     buf_puts(b,
         "## Tools\n"
@@ -2304,11 +2309,6 @@ static void append_solar_tools_prompt_text(buf *b, const char *tool_schemas,
         DS4_SOLAR_TOOL_ARG_VALUE "{example-value-2}"
         DS4_SOLAR_TOOL_ARG_END "\n"
         DS4_SOLAR_TOOL_CALL_END "\n");
-    if (tool_required) {
-        buf_puts(b,
-            "- You MUST call at least one available tool in this turn. "
-            "Do not end the turn with only reasoning or a final answer.\n");
-    }
 }
 
 static void json_escape(buf *b, const char *s);
@@ -2725,6 +2725,23 @@ static bool chat_msg_is_model_tool_result(const chat_msg *m) {
             m->tool_call_ids_len > 0);
 }
 
+static bool chat_history_has_pending_tool_results(const chat_msgs *msgs) {
+    bool saw_tool_result = false;
+    for (int i = msgs ? msgs->len - 1 : -1; i >= 0; i--) {
+        const chat_msg *m = &msgs->v[i];
+        if (!m->role || role_is_system(m->role)) continue;
+        if (chat_msg_is_model_tool_result(m)) {
+            saw_tool_result = true;
+            continue;
+        }
+        /* An assistant response resolves every older result.  User text after
+         * a still-pending result remains part of that result turn, while an
+         * output-only continuation has no assistant message to replay. */
+        if (!strcmp(m->role, "assistant")) return saw_tool_result;
+    }
+    return saw_tool_result;
+}
+
 typedef struct {
     const char *text;
     size_t len;
@@ -2855,6 +2872,9 @@ static char *render_solar_chat_prompt_text_choice(
         const chat_msgs *msgs, const char *tool_schemas,
         const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
         tool_choice_mode tool_choice) {
+    /* Required mode is enforced at sampling time.  Keeping it out of the
+     * rendered prefix lets a normal required-T1/auto-T2 agent turn reuse KV. */
+    (void)tool_choice;
     int last_user_idx = -1;
     for (int i = 0; msgs && i < msgs->len; i++) {
         if (!strcmp(msgs->v[i].role, "user") &&
@@ -2876,8 +2896,7 @@ static char *render_solar_chat_prompt_text_choice(
     }
     if (tool_schemas && tool_schemas[0]) {
         if (system.len) buf_puts(&system, "\n\n");
-        append_solar_tools_prompt_text(&system, tool_schemas,
-                                       tool_choice == TOOL_CHOICE_REQUIRED);
+        append_solar_tools_prompt_text(&system, tool_schemas);
     }
 
     buf out = {0};
@@ -3347,6 +3366,18 @@ static bool request_prepare_tool_choice(ds4_engine *e, request *r,
                                         char *err, size_t errlen) {
     r->chat_format = ds4_engine_chat_format(e);
     r->has_tools = have_tool_schemas && r->tool_choice != TOOL_CHOICE_NONE;
+    if (r->tool_choice == TOOL_CHOICE_REQUIRED || r->has_tool_results) {
+        /* Required T1 and pending-result T2 may need to close an overlong
+         * thinking block before the request budget is exhausted. */
+        ds4_tokenize_rendered_chat(e, chat_think_end(r->chat_format),
+                                   &r->required_think_end_prefix);
+        if (r->required_think_end_prefix.len <= 0) {
+            if (err && errlen)
+                snprintf(err, errlen,
+                         "failed to tokenize thinking control prefix");
+            return false;
+        }
+    }
     if (r->tool_choice != TOOL_CHOICE_REQUIRED) return true;
     if (!have_tool_schemas) {
         if (err && errlen)
@@ -3359,10 +3390,7 @@ static bool request_prepare_tool_choice(ds4_engine *e, request *r,
                                    ? DS4_SOLAR_TOOL_CALL_START
                                    : "<｜DSML｜tool_calls>",
                                &r->required_tool_prefix);
-    ds4_tokenize_rendered_chat(e, chat_think_end(r->chat_format),
-                               &r->required_think_end_prefix);
-    if (r->required_tool_prefix.len <= 0 ||
-        r->required_think_end_prefix.len <= 0) {
+    if (r->required_tool_prefix.len <= 0) {
         if (err && errlen)
             snprintf(err, errlen, "failed to tokenize required tool control prefix");
         return false;
@@ -3528,6 +3556,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    r->has_tool_results = chat_history_has_pending_tool_results(&msgs);
     if (!request_prepare_tool_choice(e, r,
                                      tool_schemas && tool_schemas[0],
                                      err, errlen)) {
@@ -3707,6 +3736,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         system = NULL;
         chat_msgs_push(&msgs, msg);
     }
+    r->has_tool_results = chat_history_has_pending_tool_results(&msgs);
     if (!request_prepare_tool_choice(e, r,
                                      tool_schemas && tool_schemas[0],
                                      err, errlen)) {
@@ -4632,6 +4662,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
                    loaded_tool_schemas.len);
     }
+    r->has_tool_results = chat_history_has_pending_tool_results(&msgs);
     if (!request_prepare_tool_choice(e, r, combined_tool_schemas.len != 0,
                                      err, errlen)) {
         chat_msgs_free(&msgs);
@@ -10136,6 +10167,46 @@ static bool cont_registry_bank_claim(server *s, api_style proto,
     return ok;
 }
 
+static bool cont_record_bank_reference_matches(const cont_record *rec,
+                                                uint64_t live_gen,
+                                                int live_frontier) {
+    return rec && rec->state == CONT_REC_LIVE_FRONTIER &&
+           rec->owner == CONT_OWNER_BATCH_BANK && live_gen != 0 &&
+           live_frontier > 0 && rec->owner_gen == live_gen &&
+           rec->frontier == live_frontier;
+}
+
+typedef bool (*cont_bank_reference_query)(server *s, int bank,
+                                          uint64_t *gen, int *frontier,
+                                          void *user);
+
+static bool cont_engine_bank_reference_query(server *s, int bank,
+                                             uint64_t *gen, int *frontier,
+                                             void *user) {
+    (void)user;
+    if (!s || !s->batch_ctx || bank < 0 || bank >= s->batch_ctx_max_seq)
+        return false;
+    if (frontier)
+        *frontier = ds4_batch_ctx_bank_committed(s->batch_ctx, bank, NULL);
+    if (gen) *gen = ds4_batch_ctx_bank_generation(s->batch_ctx, bank);
+    return true;
+}
+
+/* Bank records deliberately remain LIVE after their frontier moves so a
+ * repeated output-only T2 reaches the worker and receives the protocol-native
+ * 409 instead of a parse-time 400.  That stale record must not reserve its old
+ * bank, though: no continuation can consume the reference once generation or
+ * committed length differs. */
+static bool cont_record_bank_reference_is_current(
+        server *s, const cont_record *rec,
+        cont_bank_reference_query query, void *query_user) {
+    if (!s || !rec || !query) return false;
+    uint64_t gen = 0;
+    int frontier = 0;
+    if (!query(s, rec->owner_id, &gen, &frontier, query_user)) return false;
+    return cont_record_bank_reference_matches(rec, gen, frontier);
+}
+
 /* Inc 6c: is this bank's frontier retention-protected right now?  True
  * while a LIVE bank-owned record naming the bank is inside its grace
  * window or validly hard-pinned by a queued continuation -- the
@@ -10150,13 +10221,21 @@ static bool cont_registry_bank_claim(server *s, api_style proto,
  * pressure (job_queue_aged still sheds a stuck head).  Read-only probe:
  * a TTL-stale record cannot protect (in_grace false; a pin can only be
  * acquired on a record that was LIVE at pin time), so no expire walk. */
-static bool cont_registry_bank_protected(server *s, int bank, double now) {
+/* Production callers hold gen_mu before entering these helpers.  The query
+ * reads batch_ctx while tool_mu protects the registry, preserving the global
+ * gen_mu -> tool_mu lock order.  Tests inject an immutable reference query so
+ * generation/frontier drift exercises the same registry loop. */
+static bool cont_registry_bank_protected_with_query(
+        server *s, int bank, double now,
+        cont_bank_reference_query query, void *query_user) {
     if (!s || bank < 0) return false;
     bool prot = false;
     pthread_mutex_lock(&s->tool_mu);
     for (cont_record *rec = s->creg.head; rec && !prot; rec = rec->next) {
         if (rec->owner != CONT_OWNER_BATCH_BANK || rec->owner_id != bank ||
             rec->state != CONT_REC_LIVE_FRONTIER) continue;
+        if (!cont_record_bank_reference_is_current(s, rec, query, query_user))
+            continue;
         const bool in_grace = s->creg.grace_s > 0 &&
             now - rec->publish_time < s->creg.grace_s;
         const bool pinned = rec->hard_refs > 0 &&
@@ -10167,16 +10246,25 @@ static bool cont_registry_bank_protected(server *s, int bank, double now) {
     return prot;
 }
 
+static bool cont_registry_bank_protected(server *s, int bank, double now) {
+    return cont_registry_bank_protected_with_query(
+        s, bank, now, cont_engine_bank_reference_query, NULL);
+}
+
 /* Inc 6c: honest Retry-After for a fully protected bank set -- the SOONEST
  * moment any live bank record's protection (grace or pin) lapses, i.e. when
  * the first victim bank frees up.  Mirrors cont_registry_serial_hold's
  * retry arithmetic on the bank-owner side. */
-static int cont_registry_bank_hold_retry(server *s, double now) {
+static int cont_registry_bank_hold_retry_with_query(
+        server *s, double now,
+        cont_bank_reference_query query, void *query_user) {
     double left_min = -1.0;
     pthread_mutex_lock(&s->tool_mu);
     for (cont_record *rec = s->creg.head; rec; rec = rec->next) {
         if (rec->owner != CONT_OWNER_BATCH_BANK ||
             rec->state != CONT_REC_LIVE_FRONTIER) continue;
+        if (!cont_record_bank_reference_is_current(s, rec, query, query_user))
+            continue;
         const double grace_left = s->creg.grace_s > 0 ?
             s->creg.grace_s - (now - rec->publish_time) : 0.0;
         const double pin_left = (rec->hard_refs > 0 &&
@@ -10190,6 +10278,11 @@ static int cont_registry_bank_hold_retry(server *s, double now) {
     if (left_min <= 0) return 1;
     const int ra = (int)(left_min + 0.999);
     return ra < 1 ? 1 : ra;
+}
+
+static int cont_registry_bank_hold_retry(server *s, double now) {
+    return cont_registry_bank_hold_retry_with_query(
+        s, now, cont_engine_bank_reference_query, NULL);
 }
 
 /* Mint uniqueness: an id is in use while ANY record (any protocol, any
@@ -12231,10 +12324,10 @@ static dsml_decode_state sem_accum_dsml_state(const sem_accum *a) {
         ? a->dsml.decode : DSML_DECODE_OUTSIDE;
 }
 
-static int required_tool_reasoning_cap(const request *r) {
-    /* Reserve enough output budget for a small valid function call.  Required
-     * tool use is an action contract, so unbounded hidden reasoning must not
-     * consume the whole turn and return an empty completed response. */
+static int agent_turn_reasoning_cap(const request *r) {
+    /* Reserve enough output budget for a small valid function call or the
+     * answer after a tool result.  Agent action/result turns must not spend the
+     * whole budget in hidden reasoning and return an empty visible response. */
     const int reserve = 64;
     int budget_cap = r->max_tokens > reserve ? r->max_tokens - reserve : 0;
     int effort_cap = 64;
@@ -12248,18 +12341,22 @@ static int required_tool_reasoning_cap(const request *r) {
  * closes; once the marker scanner enters the block, the existing structural
  * greedy policy takes over while payload retains the request sampler. */
 static int sem_accum_sampling_override(sem_accum *a, const request *r) {
-    if (a && r && r->tool_choice == TOOL_CHOICE_REQUIRED &&
-        a->track_tools && !a->saw_tool_start) {
-        if (a->thinking.inside) {
-            if (a->completion >= required_tool_reasoning_cap(r) &&
-                a->required_think_end_prefix_pos <
-                    r->required_think_end_prefix.len) {
-                const int token = r->required_think_end_prefix.v[
-                    a->required_think_end_prefix_pos++];
-                return DS4_SAMPLE_OVERRIDE_TOKEN(token);
-            }
-            return DS4_SAMPLE_OVERRIDE_NONE;
+    const bool required_pending = a && r &&
+        r->tool_choice == TOOL_CHOICE_REQUIRED &&
+        a->track_tools && !a->saw_tool_start;
+    const bool reserve_post_thinking = required_pending ||
+        (a && r && r->has_tool_results);
+    if (reserve_post_thinking && a->thinking.inside) {
+        if (a->completion >= agent_turn_reasoning_cap(r) &&
+            a->required_think_end_prefix_pos <
+                r->required_think_end_prefix.len) {
+            const int token = r->required_think_end_prefix.v[
+                a->required_think_end_prefix_pos++];
+            return DS4_SAMPLE_OVERRIDE_TOKEN(token);
         }
+        return DS4_SAMPLE_OVERRIDE_NONE;
+    }
+    if (required_pending) {
         if (a->required_tool_prefix_pos < r->required_tool_prefix.len) {
             const int token =
                 r->required_tool_prefix.v[a->required_tool_prefix_pos++];
@@ -15018,6 +15115,8 @@ static int detok_result_until_eos(server *s, const int *tokens, int n_tokens, in
     return emitted;
 }
 
+static int cont_usage_prompt_tokens(const request *r);
+
 /* Format one coalesced job's HTTP response from its generated tokens, mirroring
  * the non-streaming OpenAI tail of generate_job() (detok to first EOS, then
  * parse_generated_message_for_response for chat to split reasoning/content). */
@@ -15044,7 +15143,7 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
     int reasoning_tokens = 0;
     int emitted = detok_result_until_eos(s, r->tokens, n_tokens, eos, &text,
                                          &j->req, &reasoning_tokens);
-    const int prompt_tokens = j->req.prompt.len;
+    const int prompt_tokens = cont_usage_prompt_tokens(&j->req);
 
     if (j->req.kind == REQ_CHAT) {
         tool_calls calls = {0};
@@ -15912,6 +16011,11 @@ static int cont_on_admitted(void *ud, void *user, int n_cached,
                             int n_computed, int bank);
 static void cont_prefill_heartbeat(cont_sched *cs, job *j);
 
+static bool request_needs_cont_semantics(const request *r) {
+    return r && r->kind == REQ_CHAT &&
+           (r->has_tools || r->has_tool_results);
+}
+
 /* v0.5.2 inc3: engine liveness probe for a pending admission prefill.
  * Runs on the worker thread between prefill chunks; the MSG_PEEK probe
  * never consumes request bytes.  Marks the job so every later path agrees.
@@ -16073,13 +16177,11 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
         req->min_p       = j->req.min_p;
     }
     req->seed        = resolve_job_seed(s, j);
-    /* Spec+tools: tools rows get generate_job's per-token DSML sampling
-     * override on the continuous path too -- the engine consults it before
-     * every target sample (plain AND speculative accept), so structural
-     * tool-call syntax is argmax'd at any request temperature while payload
-     * and reasoning keep the seq params above. */
-    req->sample_override = (j->req.kind == REQ_CHAT && j->req.has_tools) ?
-        cont_sample_override : NULL;
+    /* Agent rows get generate_job's per-token semantic override on the
+     * continuous path too.  Tool-capable rows force structural call syntax;
+     * a tools-omitted result T2 still needs its thinking cap/closer. */
+    req->sample_override = request_needs_cont_semantics(&j->req) ?
+                           cont_sample_override : NULL;
     /* v0.5.2 inc3: let the engine drop this admission mid-prefill if the
      * client dies (the zombie-reap probe, engine-polled between chunks).
      * Inc 4a: streaming rows register it unconditionally -- the same poll is
@@ -16133,7 +16235,7 @@ struct cont_stream {
 /* A1: does this row need host-side text (stream projection or stop/tool scan)? */
 static bool cont_needs_text(const request *r) {
     return r->stream || r->stops.len > 0 ||
-           (r->kind == REQ_CHAT && r->has_tools);
+           request_needs_cont_semantics(r);
 }
 
 /* Lazily allocate the per-seq stream state (zeroed). */
@@ -16146,15 +16248,12 @@ static cont_stream *cont_stream_ensure(job *j) {
     return j->cstream;
 }
 
-/* Spec+tools: ds4_cont_request.sample_override for tools rows (cont_admit
- * registers it only when kind==REQ_CHAT && has_tools).  The engine consults it
- * immediately before EVERY target sample of the row -- seed token, plain
- * decode step, and both speculative accept-loop sites -- and a nonzero return
- * forces that one token to greedy argmax.  The decision mirrors generate_job's
- * per-token DSML override bit-for-bit: structural tool-call syntax -> argmax,
- * payload string/JSON-string bodies (and everything outside a tool block) ->
- * the seq params.  Ensure the accumulator before the seed token so required
- * tool choice can force its opener on buffered rows too. */
+/* ds4_cont_request.sample_override for agent rows.  The engine consults it
+ * immediately before EVERY target sample -- seed, plain decode, and both
+ * speculative accept sites.  Tool rows mirror generate_job's structural DSML
+ * policy; a pending result row without schemas uses the same state machine only
+ * to reserve post-thinking answer budget.  Ensure the accumulator before the
+ * seed token so required T1 and result T2 controls also work when buffered. */
 static int cont_sample_override(void *ud, void *user) {
     (void)ud;
     job *j = user;
@@ -16188,13 +16287,23 @@ static void cont_stream_error_abort(job *j, const char *msg) {
 
 /* Most warm admissions report usage in the client's rendered-prompt frame:
  * hidden sampled reasoning can make the engine's retained frame longer than
- * the visible replay.  A Responses output-only bank continuation is different:
- * its request prompt is only the function_call_output suffix, while the API's
- * input_tokens contract (and the serial continuation path) counts the complete
- * model input, cached prefix included. */
+ * the visible replay.  An output-only bank continuation is different: its
+ * request prompt is only the tool-result suffix, while the native usage/cache
+ * contract counts the complete effective model input, cached prefix included. */
 static bool cont_usage_uses_effective_frame(const request *r) {
-    return r && r->api == API_RESPONSES &&
-           (r->needs & DS4_NEED_BANK_FRONTIER) != 0;
+    return r && (r->needs & DS4_NEED_BANK_FRONTIER) != 0;
+}
+
+/* Buffered continuous terminals do not have the streaming state's frozen
+ * prompt_tokens field.  Reconstruct the validated wire frame from the engine
+ * split for output-only bank continuations; ordinary requests stay in their
+ * rendered client-prompt frame. */
+static int cont_usage_prompt_tokens(const request *r) {
+    if (!r) return 0;
+    if (!cont_usage_uses_effective_frame(r)) return r->prompt.len;
+    const int n_cached = r->cache_read_tokens > 0 ? r->cache_read_tokens : 0;
+    const int n_computed = r->cache_write_tokens > 0 ? r->cache_write_tokens : 0;
+    return n_cached <= INT_MAX - n_computed ? n_cached + n_computed : INT_MAX;
 }
 
 static int cont_usage_apply_engine_split(request *r,
@@ -16483,7 +16592,7 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
     const char *fin = st->acc.verdict ? st->acc.verdict
                                       : (engine_finish ? "stop" : "length");
     fin = sem_accum_terminal_finish(&st->acc, fin);
-    const int prompt_tokens = j->req.prompt.len;
+    const int prompt_tokens = cont_usage_prompt_tokens(&j->req);
 
     if (j->req.kind == REQ_CHAT) {
         tool_calls calls = {0};
@@ -16716,10 +16825,10 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
              * warm shape) this is bit-identical to the old direct copy, so
              * usage.cached == timings.prefill_cached stays structural
              * there; timings ALWAYS keeps the effective frame (engine
-             * truth).  Responses output-only bank continuations are the one
-             * exception: their wire usage also uses the effective frame,
-             * because input_tokens includes the retained cached prefix and
-             * serial live continuations already report it that way. */
+             * truth).  Output-only bank continuations (Responses function
+             * outputs and Anthropic tool results) are the exception: their
+             * wire usage also uses the effective frame because input_tokens
+             * includes the retained cached prefix. */
             (void)cont_usage_apply_engine_split(
                 &j->req, (int)es.prefill_cached, (int)es.prefill_computed);
         }
@@ -20676,6 +20785,78 @@ static void test_tool_choice_contract_and_required_prefix(void) {
     request_free(&r);
 }
 
+static void test_tool_result_turn_reserves_post_thinking_budget(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_LOW;
+    r.tool_choice = TOOL_CHOICE_AUTO;
+    r.has_tools = true;
+    ds4_tokens_push(&r.required_think_end_prefix, 303);
+
+    sem_accum acc;
+    sem_accum_init(&acc, &r);
+    acc.thinking.inside = true;
+    acc.completion = 64;
+    TEST_ASSERT(sem_accum_sampling_override(&acc, &r) ==
+                DS4_SAMPLE_OVERRIDE_NONE);
+    sem_accum_free(&acc);
+
+    r.has_tool_results = true;
+    r.has_tools = false;
+    TEST_ASSERT(request_needs_cont_semantics(&r));
+    TEST_ASSERT(cont_needs_text(&r));
+    sem_accum_init(&acc, &r);
+    acc.thinking.inside = true;
+    acc.completion = 63;
+    TEST_ASSERT(sem_accum_sampling_override(&acc, &r) ==
+                DS4_SAMPLE_OVERRIDE_NONE);
+    acc.completion = 64;
+    const int ov = sem_accum_sampling_override(&acc, &r);
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_IS_TOKEN(ov));
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_TOKEN_ID(ov) == 303);
+    sem_accum_free(&acc);
+    request_free(&r);
+}
+
+static void test_tool_result_turn_detection_uses_pending_tail(void) {
+    chat_msgs msgs = {0};
+
+    /* Output-only continuation requests have no replayed assistant message. */
+    chat_msg tool = {.role = xstrdup("tool"),
+                     .content = xstrdup("value-one")};
+    chat_msgs_push(&msgs, tool);
+    TEST_ASSERT(chat_history_has_pending_tool_results(&msgs));
+
+    /* Anthropic appends system content after its messages; it must not hide
+     * the pending tool_result tail. */
+    chat_msg system = {.role = xstrdup("system"),
+                       .content = xstrdup("be precise")};
+    chat_msgs_push(&msgs, system);
+    TEST_ASSERT(chat_history_has_pending_tool_results(&msgs));
+
+    /* Once the assistant has answered that result, a later user question is
+     * a normal turn and must not inherit the short T2 reasoning cap. */
+    chat_msg assistant = {.role = xstrdup("assistant"),
+                          .content = xstrdup("value-one")};
+    chat_msgs_push(&msgs, assistant);
+    chat_msg user = {.role = xstrdup("user"),
+                     .content = xstrdup("Now explain the implications.")};
+    chat_msgs_push(&msgs, user);
+    TEST_ASSERT(!chat_history_has_pending_tool_results(&msgs));
+
+    chat_msgs_free(&msgs);
+
+    chat_msgs anthropic = {0};
+    chat_msg anthropic_result = {
+        .role = xstrdup("user"),
+        .content = xstrdup("<tool_result>value-two</tool_result>"),
+        .tool_call_id = xstrdup("toolu_pending"),
+    };
+    chat_msgs_push(&anthropic, anthropic_result);
+    TEST_ASSERT(chat_history_has_pending_tool_results(&anthropic));
+    chat_msgs_free(&anthropic);
+}
+
 static void test_solar_native_tool_protocol(void) {
     chat_msgs msgs = {0};
     chat_msg sys = {.role = xstrdup("system"),
@@ -20701,8 +20882,6 @@ static void test_solar_native_tool_protocol(void) {
     TEST_ASSERT(strstr(prompt, DS4_SOLAR_TOOL_END) != NULL);
     TEST_ASSERT(strstr(prompt, DS4_SOLAR_TOOL_CALL_START
                                "{example-tool-name}") != NULL);
-    TEST_ASSERT(strstr(prompt,
-        "You MUST call at least one available tool in this turn.") != NULL);
     TEST_ASSERT(strstr(prompt, "DSML") == NULL);
     TEST_ASSERT(strstr(prompt,
         DS4_SOLAR_IM_START "user" DS4_SOLAR_IM_CONTENT "Inspect /tmp"
@@ -20771,6 +20950,32 @@ static void test_solar_native_tool_protocol(void) {
     free(reasoning);
     tool_calls_free(&calls);
     tool_schema_orders_free(&orders);
+}
+
+static void test_solar_tool_choice_prompt_is_cache_stable(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"),
+                     .content = xstrdup("Look up the current value.")};
+    chat_msgs_push(&msgs, user);
+    const char *schemas =
+        "{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"key\":{\"type\":\"string\"}}}}";
+
+    char *required = render_chat_prompt_text_choice_format(
+        &msgs, schemas, NULL, DS4_THINK_LOW, TOOL_CHOICE_REQUIRED,
+        DS4_CHAT_FORMAT_SOLAR_OPEN2);
+    char *automatic = render_chat_prompt_text_choice_format(
+        &msgs, schemas, NULL, DS4_THINK_LOW, TOOL_CHOICE_AUTO,
+        DS4_CHAT_FORMAT_SOLAR_OPEN2);
+
+    /* Required tool use is enforced by sem_accum_sampling_override().  It must
+     * not rewrite the reusable prompt prefix between an agent's required T1
+     * and automatic T2. */
+    TEST_ASSERT(!strcmp(required, automatic));
+
+    free(required);
+    free(automatic);
+    chat_msgs_free(&msgs);
 }
 
 static void test_solar_native_tool_recovery(void) {
@@ -22532,6 +22737,27 @@ static void test_cont_registry_bank_publish_claim(void) {
 /* Inc 6c: bank retention protection -- LIVE-only, grace-scoped, extended by
  * a valid hard pin, never by a demoted record; the hold Retry-After answers
  * the soonest protection lapse. */
+typedef struct {
+    int bank[4];
+    uint64_t gen[4];
+    int frontier[4];
+    int len;
+} test_cont_bank_references;
+
+static bool test_cont_bank_reference_query(server *s, int bank,
+                                           uint64_t *gen, int *frontier,
+                                           void *user) {
+    (void)s;
+    test_cont_bank_references *refs = user;
+    for (int i = 0; refs && i < refs->len; i++) {
+        if (refs->bank[i] != bank) continue;
+        if (gen) *gen = refs->gen[i];
+        if (frontier) *frontier = refs->frontier[i];
+        return true;
+    }
+    return false;
+}
+
 static void test_cont_registry_bank_protection(void) {
     server s = {0};
     pthread_mutex_init(&s.tool_mu, NULL);
@@ -22548,25 +22774,85 @@ static void test_cont_registry_bank_protection(void) {
         tool_calls_free(&calls);
     }
     const double now = now_sec();
+    test_cont_bank_references refs = {
+        .bank = {5}, .gen = {3}, .frontier = {200}, .len = 1,
+    };
+    cont_record *live = s.creg.head;
+    TEST_ASSERT(live != NULL);
+    TEST_ASSERT(cont_record_bank_reference_matches(live, 3, 200));
+    TEST_ASSERT(!cont_record_bank_reference_matches(live, 4, 200));
+    TEST_ASSERT(!cont_record_bank_reference_matches(live, 3, 201));
     /* In grace: the record's bank is protected; other banks are not. */
-    TEST_ASSERT(cont_registry_bank_protected(&s, 5, now));
-    TEST_ASSERT(!cont_registry_bank_protected(&s, 4, now));
+    TEST_ASSERT(cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 4, now, test_cont_bank_reference_query, &refs));
+    /* Either side of the execution reference moving makes the record stale. */
+    refs.gen[0] = 4;
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    refs.gen[0] = 3;
+    refs.frontier[0] = 201;
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    refs.frontier[0] = 200;
     /* Honest Retry-After: bounded by the grace remaining. */
-    const int ra = cont_registry_bank_hold_retry(&s, now);
+    const int ra = cont_registry_bank_hold_retry_with_query(
+        &s, now, test_cont_bank_reference_query, &refs);
     TEST_ASSERT(ra >= 1 && ra <= 61);
+
+    /* A stale record with a nearly-expired grace must not shorten Retry-After
+     * for a different current bank. */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_prot2");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_bank(&s, API_RESPONSES, &calls, 6, 7, 80);
+        tool_calls_free(&calls);
+    }
+    refs.bank[1] = 6;
+    refs.gen[1] = 7;
+    refs.frontier[1] = 80;
+    refs.len = 2;
+    pthread_mutex_lock(&s.tool_mu);
+    for (cont_record *rec = s.creg.head; rec; rec = rec->next) {
+        if (rec->owner_id == 5) rec->publish_time = now - 55.0;
+        if (rec->owner_id == 6) rec->publish_time = now;
+    }
+    pthread_mutex_unlock(&s.tool_mu);
+    refs.gen[0] = 4;  /* bank 5 moved; only bank 6 remains protective */
+    const int current_only_ra = cont_registry_bank_hold_retry_with_query(
+        &s, now, test_cont_bank_reference_query, &refs);
+    TEST_ASSERT(current_only_ra >= 59 && current_only_ra <= 61);
+    refs.gen[0] = 3;
+    pthread_mutex_lock(&s.tool_mu);
+    for (cont_record *rec = s.creg.head; rec; rec = rec->next) {
+        if (rec->owner_id == 5) rec->publish_time = now;
+        if (rec->owner_id == 6 && rec->state == CONT_REC_LIVE_FRONTIER)
+            cont_registry_demote_locked(&s, rec);
+    }
+    pthread_mutex_unlock(&s.tool_mu);
     /* Grace lapsed, no pin: unprotected (still LIVE until TTL -- the claim
      * keeps working; only VICTIM protection ends with grace). */
     pthread_mutex_lock(&s.tool_mu);
     for (cont_record *rec = s.creg.head; rec; rec = rec->next)
         rec->publish_time -= 61.0;
     pthread_mutex_unlock(&s.tool_mu);
-    TEST_ASSERT(!cont_registry_bank_protected(&s, 5, now));
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
     /* A queued T2's hard pin re-protects past grace until its deadline. */
     void *pin = cont_registry_pin_live(&s, API_ANTHROPIC, "toolu_prot1");
     TEST_ASSERT(pin != NULL);
-    TEST_ASSERT(cont_registry_bank_protected(&s, 5, now));
+    TEST_ASSERT(cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    refs.frontier[0] = 201;
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    refs.frontier[0] = 200;
     cont_registry_unpin(&s, pin);
-    TEST_ASSERT(!cont_registry_bank_protected(&s, 5, now));
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
     /* A demoted record never protects, pinned or not (state gate first). */
     pin = cont_registry_pin_live(&s, API_ANTHROPIC, "toolu_prot1");
     TEST_ASSERT(pin != NULL);
@@ -22575,7 +22861,8 @@ static void test_cont_registry_bank_protection(void) {
         if (rec->state == CONT_REC_LIVE_FRONTIER)
             cont_registry_demote_locked(&s, rec);
     pthread_mutex_unlock(&s.tool_mu);
-    TEST_ASSERT(!cont_registry_bank_protected(&s, 5, now));
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
     cont_registry_unpin(&s, pin);
 
     cont_registry_free(&s);
@@ -25887,12 +26174,11 @@ static void test_cont_admission_transport_and_heartbeat(void) {
     close(sv[1]);
 }
 
-/* A Responses output-only T2 carries only the new function_call_output in the
- * request JSON, but a bank continuation feeds the model the retained frontier
- * plus that suffix.  Responses usage counts the full model input (cached
- * tokens included), so the continuous terminal must use the engine's effective
- * frame just like the serial live-continuation path. */
-static void test_cont_responses_bank_usage_uses_effective_frame(void) {
+/* An output-only T2 carries only the new tool result in the request JSON, but
+ * a bank continuation feeds the model the retained frontier plus that suffix.
+ * Native usage counts the effective model input, so Responses and Anthropic
+ * must both report the engine split rather than clamp to the tiny wire frame. */
+static void test_cont_bank_usage_uses_effective_frame(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
@@ -25935,6 +26221,107 @@ static void test_cont_responses_bank_usage_uses_effective_frame(void) {
     pthread_mutex_destroy(&j.mu);
     close(sv[0]);
     close(sv[1]);
+
+    /* Anthropic emits usage in message_start, before any token.  Cover that
+     * real wire path rather than relying only on the shared split helper. */
+    job anthropic_stream;
+    memset(&anthropic_stream, 0, sizeof(anthropic_stream));
+    anthropic_stream.fd = -1;  /* t_emit_job redirects transport into out */
+    pthread_mutex_init(&anthropic_stream.mu, NULL);
+    pthread_cond_init(&anthropic_stream.cv, NULL);
+    request_init(&anthropic_stream.req, REQ_CHAT, 128);
+    anthropic_stream.req.api = API_ANTHROPIC;
+    anthropic_stream.req.stream = true;
+    anthropic_stream.req.think_mode = DS4_THINK_NONE;
+    anthropic_stream.req.needs = DS4_NEED_BANK_FRONTIER;
+    anthropic_stream.req.prompt.len = 20;
+    TEST_ASSERT(cont_on_admitted(&cs, &anthropic_stream, 244, 22, 0) == 1);
+    out = job_out_text(&anthropic_stream);
+    TEST_ASSERT(strstr(out, "event: message_start") != NULL);
+    TEST_ASSERT(strstr(out, "\"input_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":244") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":22") != NULL);
+    free(out);
+    cont_stream_discard(&anthropic_stream);
+    buf_free(&anthropic_stream.out);
+    request_free(&anthropic_stream.req);
+    pthread_cond_destroy(&anthropic_stream.cv);
+    pthread_mutex_destroy(&anthropic_stream.mu);
+
+    /* Exercise the production buffered terminal too: unlike a stream it has
+     * no st->prompt_tokens field, so the serializer must recover the same
+     * effective frame from the request's validated engine split. */
+    job anthropic;
+    memset(&anthropic, 0, sizeof(anthropic));
+    pthread_mutex_init(&anthropic.mu, NULL);
+    pthread_cond_init(&anthropic.cv, NULL);
+    request_init(&anthropic.req, REQ_CHAT, 128);
+    anthropic.req.api = API_ANTHROPIC;
+    anthropic.req.stream = false;
+    anthropic.req.think_mode = DS4_THINK_NONE;
+    anthropic.req.has_tool_results = true;
+    anthropic.req.needs = DS4_NEED_BANK_FRONTIER;
+    anthropic.req.prompt.len = 20;  /* output-only tool_result request frame */
+    TEST_ASSERT(cont_on_admitted(&cs, &anthropic, 244, 22, 0) == 1);
+    TEST_ASSERT(anthropic.req.cache_read_tokens == 244);
+    TEST_ASSERT(anthropic.req.cache_write_tokens == 22);
+    cont_stream *anthropic_st = cont_stream_ensure(&anthropic);
+    (void)sem_accum_feed(&anthropic_st->acc, &anthropic.req,
+                         "answer", strlen("answer"));
+    t_emit_job = &anthropic;
+    write_cont_completion(&s, &anthropic, 1);
+    t_emit_job = NULL;
+    out = job_out_text(&anthropic);
+    TEST_ASSERT(strstr(out, "\"input_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":244") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":22") != NULL);
+    free(out);
+    buf_free(&anthropic.out);
+    request_free(&anthropic.req);
+    pthread_cond_destroy(&anthropic.cv);
+    pthread_mutex_destroy(&anthropic.mu);
+
+    job responses;
+    memset(&responses, 0, sizeof(responses));
+    pthread_mutex_init(&responses.mu, NULL);
+    pthread_cond_init(&responses.cv, NULL);
+    request_init(&responses.req, REQ_CHAT, 128);
+    responses.req.api = API_RESPONSES;
+    responses.req.stream = false;
+    responses.req.think_mode = DS4_THINK_NONE;
+    responses.req.has_tool_results = true;
+    responses.req.needs = DS4_NEED_BANK_FRONTIER;
+    responses.req.prompt.len = 16;  /* output-only function_call_output frame */
+    TEST_ASSERT(cont_on_admitted(&cs, &responses, 260, 18, 0) == 1);
+    cont_stream *responses_st = cont_stream_ensure(&responses);
+    (void)sem_accum_feed(&responses_st->acc, &responses.req,
+                         "answer", strlen("answer"));
+    t_emit_job = &responses;
+    write_cont_completion(&s, &responses, 1);
+    t_emit_job = NULL;
+    out = job_out_text(&responses);
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":278") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":260") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_write_tokens\":18") != NULL);
+    free(out);
+    buf_free(&responses.out);
+    request_free(&responses.req);
+    pthread_cond_destroy(&responses.cv);
+    pthread_mutex_destroy(&responses.mu);
+
+    /* Hidden reasoning can make the ENGINE split wider than an ordinary
+     * replayed prompt.  Without BANK_FRONTIER that request must stay in the
+     * client's rendered frame; do not generalize the output-only exception
+     * to every Anthropic warm hit. */
+    request ordinary;
+    request_init(&ordinary, REQ_CHAT, 128);
+    ordinary.api = API_ANTHROPIC;
+    ordinary.prompt.len = 20;
+    TEST_ASSERT(cont_usage_apply_engine_split(&ordinary, 244, 2) == 20);
+    TEST_ASSERT(ordinary.cache_read_tokens == 18);
+    TEST_ASSERT(ordinary.cache_write_tokens == 2);
+    TEST_ASSERT(cont_usage_prompt_tokens(&ordinary) == 20);
+    request_free(&ordinary);
 }
 
 /* Inc 4b: a promoted Anthropic stream on the CONT path projects through the
@@ -26970,7 +27357,10 @@ static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
     test_tool_choice_contract_and_required_prefix();
+    test_tool_result_turn_reserves_post_thinking_budget();
+    test_tool_result_turn_detection_uses_pending_tail();
     test_solar_native_tool_protocol();
+    test_solar_tool_choice_prompt_is_cache_stable();
     test_solar_native_tool_recovery();
     test_solar_native_anthropic_tool_result_rendering();
     test_reasoning_effort_mapping();
@@ -27106,7 +27496,7 @@ static void ds4_server_unit_tests_run(void) {
     test_wire_finish_stream_matches_direct_dispatch();
     test_cont_completion_stream_matches_serial_oracle();
     test_cont_admission_transport_and_heartbeat();
-    test_cont_responses_bank_usage_uses_effective_frame();
+    test_cont_bank_usage_uses_effective_frame();
     test_cont_anthropic_stream_matches_serial_oracle();
     test_cont_responses_stream_matches_serial_oracle();
     test_sem_accum_feed_verdicts();
