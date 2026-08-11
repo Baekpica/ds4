@@ -31719,6 +31719,26 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
     return 0;
 }
 #else
+int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: DSpark block validation requires GPU support\n");
+    return 1;
+}
+int ds4_dspark_capture_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: DSpark capture validation requires GPU support\n");
+    return 1;
+}
+int ds4_dspark_slabs_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: DSpark slabs validation requires GPU support\n");
+    return 1;
+}
+int ds4_dspark_tap_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: DSpark tap validation requires GPU support\n");
+    return 1;
+}
 int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err, size_t errlen) {
     (void)s;
     (void)iters;
@@ -32182,6 +32202,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
 #endif
 }
 
+#ifndef DS4_NO_GPU
 /* Increment B: the per-layer tensor walk of a session payload, over one
  * payload_region.  Serial save passes the zero-offset region; the bank
  * serializer passes seq-strided offsets + that bank's counters.  Byte
@@ -32600,6 +32621,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
     }
     return rc;
 }
+#endif
 
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
@@ -42795,6 +42817,35 @@ int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int *
 int ds4_cont_last_done_stats(const ds4_batch_ctx *ctx, ds4_cont_seq_stats *out) {
     (void)ctx; (void)out;
     return 0;
+}
+uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
+    (void)ctx; (void)want_bytes;
+    return 0;
+}
+uint64_t ds4_cont_bank_payload_bytes(ds4_batch_ctx *ctx, uint32_t bank) {
+    (void)ctx; (void)bank;
+    return 0;
+}
+int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                               FILE *fp, char *err, size_t errlen) {
+    (void)ctx; (void)bank; (void)fp;
+    if (err && errlen) snprintf(err, errlen, "bank payload save: build has no graph backend");
+    return 1;
+}
+int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                  FILE *fp, uint64_t payload_bytes,
+                                  char *err, size_t errlen) {
+    (void)ctx; (void)bank; (void)fp; (void)payload_bytes;
+    if (err && errlen) snprintf(err, errlen, "bank payload restore: build has no graph backend");
+    return 1;
+}
+int ds4_cont_bank_stage_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                ds4_session_payload_file *out,
+                                char *err, size_t errlen) {
+    (void)ctx; (void)bank;
+    if (out) memset(out, 0, sizeof(*out));
+    if (err && errlen) snprintf(err, errlen, "bank payload staging: build has no graph backend");
+    return 1;
 }
 int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                          ds4_batch_ctx **out, char *err, size_t errlen) {
