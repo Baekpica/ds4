@@ -1074,15 +1074,21 @@ static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
 }
 
+static const char *server_model_id_from_variant(int model_id) {
+    if (model_id == 2) return "solar-open2-250b";
+    if (model_id == 1) return "deepseek-v4-pro";
+    return "deepseek-v4-flash";
+}
+
 static const char *server_model_id_from_engine(ds4_engine *engine) {
-    return ds4_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+    return server_model_id_from_variant(ds4_engine_model_id(engine));
 }
 
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro"));
+            !strcmp(id, "deepseek-v4-pro") ||
+            !strcmp(id, "solar-open2-250b"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -23354,6 +23360,13 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_server_model_ids_cover_loaded_variants(void) {
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(0), "deepseek-v4-flash"));
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(1), "deepseek-v4-pro"));
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(2), "solar-open2-250b"));
+    TEST_ASSERT(server_model_alias_known("solar-open2-250b"));
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -27387,6 +27400,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
+    test_server_model_ids_cover_loaded_variants();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
