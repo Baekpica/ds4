@@ -13741,8 +13741,18 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     const int cur_ctx = ds4_session_ctx(s->session);
     const bool pending = ds4_session_graph_pending(s->session) != 0;
     if (cur_ctx >= need_min &&
-        (!pending || ds4_engine_session_graph_fits(s->engine, cur_ctx)))
+        (!pending || ds4_engine_session_graph_fits(s->engine, cur_ctx))) {
+        /* memgov D0b-3 (S6): refresh the lane's absolute lease.  BOUNDED
+         * (scoping sec 2): a pending graph commits within THIS request,
+         * so intent==resident with a commit-lead window, no quote (no
+         * memory verdict was taken on this path). */
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION,
+                            ds4_engine_session_graph_bytes_estimate(s->engine,
+                                                                    cur_ctx),
+                            ds4_engine_session_graph_bytes_estimate(s->engine,
+                                                                    cur_ctx));
         return true;   /* committed-and-big-enough, or pending-and-allocatable */
+    }
 
     /* The current session cannot serve this request either way -- free it
      * BEFORE probing so a committed right-sized graph's own GiBs count as
@@ -13754,6 +13764,7 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     responses_live_clear(s);
     thinking_live_clear(s);
     cont_registry_demote_serial(s);   /* Inc 5a: session gone, frontier gone */
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);   /* memgov D0b-3 */
 
     /* Freed graph bytes reach MemAvailable with driver-reclaim lag (the
      * WAIT_MEM class); give the floor probe a bounded settle window. */
@@ -13816,6 +13827,19 @@ static bool serial_session_ensure_fit(server *s, job *j) {
                    "(DS4_SERVER_SERIAL_RIGHTSIZE=0 restores full--c alloc)",
                    cur_ctx, target, boot_ctx, j->req.prompt.len, budget,
                    pending ? "" : " [live serial state reset]");
+        /* memgov D0b-3 (S6): the right-size verdict, shadowed.  The live
+         * outcome is SERVED at target ctx; the claim is that absolute. */
+        {
+            const uint64_t est =
+                ds4_engine_session_graph_bytes_estimate(s->engine, (int)target);
+            ds4_gov_claim scl = {0};
+            scl.requester = DS4_GOVC_SERIAL_SESSION;
+            scl.memc = DS4_MEMC_SESSION_TENSORS;
+            scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+            scl.proposed_outstanding = est;
+            ds4_gov_shadow_check("serial_rightsize", &scl, DS4_GOV_ADMIT);
+            ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, est);
+        }
         return true;
     }
     /* Refusal: restore the boot-shape session (lazy graph -> holds nothing)
@@ -13825,6 +13849,18 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     server_log(DS4_LOG_WARNING,
                "ds4-server: serial right-size: no graph fits (prompt=%d need_min=%ld boot -c %d); refusing 503",
                j->req.prompt.len, need_min, boot_ctx);
+    /* memgov D0b-3 (S6): the refusal, shadowed at the minimal ask.  The
+     * restored boot-shape session is lazy and holds nothing. */
+    {
+        ds4_gov_claim scl = {0};
+        scl.requester = DS4_GOVC_SERIAL_SESSION;
+        scl.memc = DS4_MEMC_SESSION_TENSORS;
+        scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        scl.proposed_outstanding =
+            ds4_engine_session_graph_bytes_estimate(s->engine, (int)need_min);
+        ds4_gov_shadow_check("serial_rightsize", &scl, DS4_GOV_REFUSE_LIVE);
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
+    }
     char msg[192];
     snprintf(msg, sizeof(msg),
              "Server is temporarily at capacity for a %d-token serial request "
@@ -14064,12 +14100,29 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
     int rc = 1;
     if (res) {
         pthread_mutex_lock(&s->gen_mu);
-        if (use_ctx)
+        if (use_ctx) {
             rc = ds4_engine_batched_generate_ctx(s->batch_ctx, prompts, n,
                                                  max_new, eos_ids, res, err, sizeof(err));
-        else
+        } else {
+            /* memgov D0b-3 (S7): the per-call path creates a fresh
+             * right-sized graph behind gen_mu with NO fit quote -- the
+             * exact sec 6.1 gap D2 will close.  Shadow-quote it (live
+             * always proceeds: ADMIT), hold the debt as a transient
+             * lease across the call, release after (the path frees its
+             * graph internally). */
+            const uint64_t est =
+                ds4_engine_session_graph_bytes_estimate(s->engine, ctx_size);
+            ds4_gov_claim scl = {0};
+            scl.requester = DS4_GOVC_STATIC_BATCH;
+            scl.memc = DS4_MEMC_SESSION_TENSORS;
+            scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+            scl.proposed_outstanding = est;
+            ds4_gov_shadow_check("static_batch_percall", &scl, DS4_GOV_ADMIT);
+            ds4_gov_publish_use(DS4_GOVC_STATIC_BATCH, est, 0);
             rc = ds4_engine_batched_generate_ex(s->engine, prompts, n, ctx_size,
                                                 max_new, eos_ids, res, err, sizeof(err));
+            ds4_gov_publish_use(DS4_GOVC_STATIC_BATCH, 0, 0);
+        }
         pthread_mutex_unlock(&s->gen_mu);
     }
 
@@ -18399,6 +18452,28 @@ int main(int argc, char **argv) {
                        mem_gib(ts[DS4_MEMD_PINNED_HOST]),
                        (unsigned long long)img.faults,
                        mem_gib(ds4_gpu_substrate_outstanding()));
+            /* memgov D0b-3: the ENGINE_BOOT lease -- everything the boot
+             * settled that other consumers do not own: total census live
+             * minus the bank plan's pages and prewarm's growth (their own
+             * leases).  Published once at boot settle; the close gate
+             * reconciles the three leases against the census totals. */
+            {
+                ds4_gov_ledger lg;
+                memset(&lg, 0, sizeof(lg));
+                ds4_gov_snapshot(&lg);
+                uint64_t total = tl[DS4_MEMD_UNIFIED_DEVICE] +
+                                 tl[DS4_MEMD_PINNED_HOST];
+                uint64_t bank_live = ds4_mem_cell_live(
+                    &img.cells[DS4_MEMC_BATCH_BANK][DS4_MEMD_UNIFIED_DEVICE]);
+                const uint64_t owned =
+                    bank_live + lg.lease[DS4_GOVC_PREWARM].intent;
+                const uint64_t boot = total > owned ? total - owned : 0;
+                ds4_gov_publish_use(DS4_GOVC_ENGINE_BOOT, boot, boot);
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: memgov shadow: %d consumers, boot "
+                           "lease %.2f GiB, epoch protocol armed",
+                           DS4_GOVC__COUNT, mem_gib(boot));
+            }
         }
     }
 #endif
@@ -26241,6 +26316,84 @@ static void test_mem_gov_epoch_protocol(void) {
     TEST_ASSERT(ds4_gpu_mem_census_epoch_verify(live + 1u) == 0);
 }
 
+/* memgov D0b-3: the closed comparison-reason set -- every (live, shadow)
+ * pair classifies to exactly one reason, no OTHER bucket. */
+static void test_mem_gov_compare_classes(void) {
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_ADMIT, DS4_GOV_ADMIT) ==
+                DS4_GOV_CMP_AGREE);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_REFUSE_LIVE, DS4_GOV_REFUSE_LIVE) ==
+                DS4_GOV_CMP_AGREE);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_REFUSE_CLASS, DS4_GOV_REFUSE_CLASS) ==
+                DS4_GOV_CMP_AGREE);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_REFUSE_LIVE, DS4_GOV_ADMIT) ==
+                DS4_GOV_CMP_LIVE_STRICTER);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_REFUSE_CLASS, DS4_GOV_ADMIT) ==
+                DS4_GOV_CMP_LIVE_STRICTER);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_ADMIT, DS4_GOV_REFUSE_LIVE) ==
+                DS4_GOV_CMP_SHADOW_STRICTER);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_ADMIT, DS4_GOV_REFUSE_CLASS) ==
+                DS4_GOV_CMP_SHADOW_STRICTER);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_REFUSE_CLASS, DS4_GOV_REFUSE_LIVE) ==
+                DS4_GOV_CMP_VERDICT_CLASS);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_REFUSE_LIVE, DS4_GOV_REFUSE_CLASS) ==
+                DS4_GOV_CMP_VERDICT_CLASS);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_ADMIT, DS4_GOV_RETRY_OBS) ==
+                DS4_GOV_CMP_OBS_POLICY);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_REFUSE_LIVE, DS4_GOV_UNSUPPORTED) ==
+                DS4_GOV_CMP_OBS_POLICY);
+    TEST_ASSERT(ds4_gov_compare(DS4_GOV_ADMIT, DS4_GOV_FAULT) ==
+                DS4_GOV_CMP_FAULT);
+}
+
+/* memgov D0b-3: the live shadow ledger + check plumbing (process-global,
+ * so leases are restored to zero at the end).  Backend-portable: on
+ * Metal/CPU the observation is UNSUPPORTED and the check must classify
+ * OBS_POLICY; on CUDA it quotes for real -- either way EXACTLY ONE
+ * decision cell ticks per check. */
+static void test_mem_gov_shadow_ledger(void) {
+    ds4_metrics *m = ds4_metrics_get();
+    ds4_gov_ledger lg;
+    ds4_gov_publish_use(DS4_GOVC_PREWARM, 100, 100);
+    ds4_gov_publish_reservation(DS4_GOVC_SERIAL_SESSION, 50);
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 10, 10);
+    ds4_gov_snapshot(&lg);
+    TEST_ASSERT((lg.epoch & 1u) == 0);
+    TEST_ASSERT(lg.lease[DS4_GOVC_PREWARM].intent == 100);
+    TEST_ASSERT(lg.lease[DS4_GOVC_PREWARM].resident == 100);
+    /* _use and _reservation are independent absolute setters. */
+    TEST_ASSERT(lg.lease[DS4_GOVC_SERIAL_SESSION].intent == 10);
+    TEST_ASSERT(lg.lease[DS4_GOVC_SERIAL_SESSION].reservation == 50);
+    /* One check ticks exactly one cell. */
+    uint64_t cells0 = 0, cells1 = 0;
+    for (int c = 0; c < DS4_GOVC__COUNT; c++)
+        for (int st = 0; st < DS4_GOV_STATUS__COUNT; st++)
+            for (int r = 0; r < DS4_GOV_CMP__COUNT; r++)
+                cells0 += ds4_metric_read(&m->memgov_decisions[c][st][r]);
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_STATIC_BATCH;
+    cl.memc = DS4_MEMC_SESSION_TENSORS;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 4096;
+    ds4_gov_shadow_check("unit", &cl, DS4_GOV_ADMIT);
+    for (int c = 0; c < DS4_GOVC__COUNT; c++)
+        for (int st = 0; st < DS4_GOV_STATUS__COUNT; st++)
+            for (int r = 0; r < DS4_GOV_CMP__COUNT; r++)
+                cells1 += ds4_metric_read(&m->memgov_decisions[c][st][r]);
+    TEST_ASSERT(cells1 == cells0 + 1);
+    /* Malformed checks fail closed into the gov fault counter. */
+    const uint64_t f0 = ds4_metric_read(&m->memgov_faults);
+    ds4_gov_shadow_check("unit", NULL, DS4_GOV_ADMIT);
+    ds4_gov_shadow_check("unit", &cl, DS4_GOV_FAULT);   /* not a live verdict */
+    TEST_ASSERT(ds4_metric_read(&m->memgov_faults) == f0 + 2);
+    /* Restore the shared ledger. */
+    ds4_gov_publish_use(DS4_GOVC_PREWARM, 0, 0);
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
+    ds4_gov_publish_reservation(DS4_GOVC_SERIAL_SESSION, 0);
+    ds4_gov_snapshot(&lg);
+    TEST_ASSERT(lg.lease[DS4_GOVC_SERIAL_SESSION].intent == 0 &&
+                lg.lease[DS4_GOVC_SERIAL_SESSION].reservation == 0);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -26412,6 +26565,9 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_gov_state_machine();
     /* memgov D0b-2: versioned snapshot protocol. */
     test_mem_gov_epoch_protocol();
+    /* memgov D0b-3: comparison classes + the live shadow ledger. */
+    test_mem_gov_compare_classes();
+    test_mem_gov_shadow_ledger();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

@@ -34,7 +34,9 @@
 set -uo pipefail
 HOST=${HOST:-sync-192_168_88_33}
 TEST_TREE='~/code/ds4-phase0'
-CTRL_TREE='~/code/ds4-v0563base'
+# Control tree: pre-stage tip, re-based per stage (D0a: ds4-v0563base @
+# b9c97ad; D0b: ds4-cebaff7base @ cebaff7 -- rider #37).  Overridable.
+CTRL_TREE=${CTRL_TREE:-'~/code/ds4-cebaff7base'}
 CTX=${CTX:-32768}
 DEEP_CTX=${DEEP_CTX:-240000}
 TOL_GIB=${TOL_GIB:-3}
@@ -204,8 +206,17 @@ oracle_leg() { # $1 name  $2 env  $3 ctx
         mt=$(fit_max_seq  "/tmp/d0aclose_${name}_T.log"); mc=$(fit_max_seq  "/tmp/d0aclose_${name}_C.log")
         bt=$(vmm_banks    "/tmp/d0aclose_${name}_T.log"); bc=$(vmm_banks    "/tmp/d0aclose_${name}_C.log")
         log "(a) $name inputs: free T=$ft C=$fc GiB; max_seq T=$mt C=$mc; vmm_banks T=${bt:--} C=${bc:--}"
+        # Input-quality precondition for the jitter adjudication: the free
+        # inputs must sit inside a 1.0 GiB band or the derived comparison
+        # judges BOX STATE, not the formula.  A violated precondition gets
+        # the same one-pair-retry as boundary jitter (fresh boots resample
+        # MemAvailable); two violations in a row die -- that is real drift
+        # (memavailable-decline law: reboot before decisive legs).
         local band; band=$(python3 -c "print(1 if abs($ft-$fc)<1.0 else 0)")
-        [ "$band" = "1" ] || die "$name: free inputs outside the 1.0 GiB drift band"
+        if [ "$band" != "1" ]; then
+            log "(a) $name: free inputs outside the 1.0 GiB drift band -- retrying pair once"
+            continue
+        fi
         mv=$(jitter_ok "$name/max_seq" "$mt" "$mc" "$ft" "$fc") || { log "(a) $name max_seq $mt vs $mc DIVERGENT"; mv=FAIL; }
         bv=EQUAL
         if [ -n "$bt" ] && [ -n "$bc" ]; then
@@ -217,7 +228,7 @@ oracle_leg() { # $1 name  $2 env  $3 ctx
         fi
         log "(a) $name: derived decision divergent -- retrying pair once"
     done
-    die "$name: derived decisions diverge on both attempts -- NOT jitter"
+    die "$name: derived decisions diverge or inputs drift on both attempts -- NOT jitter"
 }
 oracle_leg eager  ""                       "$CTX"
 # nohbm: the vmm budget is PINNED on both trees (handoff law: pin the plan)

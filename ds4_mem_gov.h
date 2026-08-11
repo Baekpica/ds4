@@ -104,8 +104,39 @@ typedef enum {
     DS4_GOV_REFUSE_LIVE,
     DS4_GOV_RETRY_OBS,
     DS4_GOV_UNSUPPORTED,
-    DS4_GOV_FAULT
+    DS4_GOV_FAULT,
+    DS4_GOV_STATUS__COUNT
 } ds4_gov_status;
+
+/* D0b-3: old/new verdict comparison, a CLOSED reason set (plan sec 12
+ * D0b: "expose old/new verdict disagreements with fixed reasons").
+ * Growing this enum is a commit-visible act; there is no OTHER bucket by
+ * design -- an unclassifiable pair is a FAULT, never a shrug. */
+typedef enum {
+    DS4_GOV_CMP_AGREE = 0,          /* same verdict class                 */
+    DS4_GOV_CMP_LIVE_STRICTER,      /* live refused, shadow admits        */
+    DS4_GOV_CMP_SHADOW_STRICTER,    /* live proceeded, shadow refuses     */
+    DS4_GOV_CMP_VERDICT_CLASS,      /* both refuse, different refusal     */
+    DS4_GOV_CMP_OBS_POLICY,         /* shadow has no OK observation where
+                                       the live formula failed open       */
+    DS4_GOV_CMP_FAULT,              /* evaluator fault -- no comparison   */
+    DS4_GOV_CMP__COUNT
+} ds4_gov_cmp;
+
+/* Classify a (live verdict, shadow quote status) pair.  live_status is
+ * the LIVE formula's outcome mapped by the call site onto the quote
+ * vocabulary (ADMIT / REFUSE_CLASS / REFUSE_LIVE -- the only three the
+ * live formulas can express). */
+static inline int ds4_gov_compare(int live_status, int shadow_status) {
+    if (shadow_status == DS4_GOV_FAULT) return DS4_GOV_CMP_FAULT;
+    if (shadow_status == DS4_GOV_RETRY_OBS ||
+        shadow_status == DS4_GOV_UNSUPPORTED)
+        return DS4_GOV_CMP_OBS_POLICY;
+    if (live_status == shadow_status) return DS4_GOV_CMP_AGREE;
+    if (live_status == DS4_GOV_ADMIT) return DS4_GOV_CMP_SHADOW_STRICTER;
+    if (shadow_status == DS4_GOV_ADMIT) return DS4_GOV_CMP_LIVE_STRICTER;
+    return DS4_GOV_CMP_VERDICT_CLASS;   /* both refusals, different class */
+}
 
 /* The complete decision record (sec 6.2 list, field for field). */
 typedef struct {

@@ -33482,6 +33482,131 @@ static uint64_t ds4_mem_usable_beyond(uint64_t reserve) {
     return u > reserve ? u - reserve : 0;
 }
 
+/* =========================================================================
+ * memgov D0b-3: the SHADOW governor ledger (plan sec 6.2/12).
+ *
+ * One process-global lease ledger.  Writers are the decision/publication
+ * sites, all under gen_mu or pre-listener boot -- the same single-writer
+ * precondition the census tripwires, enforced by the same seqlock
+ * primitives over the ledger's own epoch word (violations count into
+ * memgov_faults).  Readers (shadow evaluation, D0b-4 porcelain) snapshot
+ * through the protocol and never block.
+ *
+ * SHADOW CONTRACT: nothing in this block reads back into any live
+ * verdict.  The evaluator's quotes are counted and disclosed, full stop.
+ * Enforcement is D2's, behind its own gate. */
+static ds4_gov_ledger g_gov_ledger;
+
+void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
+    uint64_t *faults = &ds4_metrics_get()->memgov_faults;
+    ds4_gov_epoch_write_begin(&g_gov_ledger.epoch, faults);
+    if (consumer >= 0 && consumer < DS4_GOVC__COUNT)
+        (void)ds4_gov_lease_publish(&g_gov_ledger, consumer, intent, resident,
+                                    g_gov_ledger.lease[consumer].reservation,
+                                    faults);
+    else
+        (*faults)++;
+    ds4_gov_epoch_write_end(&g_gov_ledger.epoch, faults);
+}
+
+void ds4_gov_publish_reservation(int consumer, uint64_t reservation) {
+    uint64_t *faults = &ds4_metrics_get()->memgov_faults;
+    ds4_gov_epoch_write_begin(&g_gov_ledger.epoch, faults);
+    if (consumer >= 0 && consumer < DS4_GOVC__COUNT)
+        (void)ds4_gov_lease_publish(&g_gov_ledger, consumer,
+                                    g_gov_ledger.lease[consumer].intent,
+                                    g_gov_ledger.lease[consumer].resident,
+                                    reservation, faults);
+    else
+        (*faults)++;
+    ds4_gov_epoch_write_end(&g_gov_ledger.epoch, faults);
+}
+
+void ds4_gov_snapshot(ds4_gov_ledger *out) {
+    if (!out) return;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        const uint64_t began = ds4_gov_epoch_read_begin(&g_gov_ledger.epoch);
+        if (began & 1u) continue;
+        *out = g_gov_ledger;
+        if (ds4_gov_epoch_read_verify(&g_gov_ledger.epoch, began)) {
+            out->epoch = began;
+            return;
+        }
+    }
+    /* Exhausted (a writer wedged mid-publish -- the tripwire class): the
+     * last copy stands, counted.  Shadow quotes from it can only feed
+     * counters, never a decision. */
+    ds4_metric_add(&ds4_metrics_get()->memgov_faults, 1);
+}
+
+void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
+                          int live_status) {
+    ds4_metrics *m = ds4_metrics_get();
+    if (!cl || cl->requester < 0 || cl->requester >= DS4_GOVC__COUNT ||
+        (live_status != DS4_GOV_ADMIT && live_status != DS4_GOV_REFUSE_CLASS &&
+         live_status != DS4_GOV_REFUSE_LIVE)) {
+        ds4_metric_add(&m->memgov_faults, 1);
+        return;
+    }
+    ds4_gov_ledger img;
+    memset(&img, 0, sizeof(img));
+    ds4_gov_snapshot(&img);
+    /* floor/substrate/observation are sampled HERE, closest in time to
+     * the live verdict the caller just took -- residual sampling skew is
+     * a real (and wanted) disagreement source, not an error. */
+    img.floor_bytes = ds4_mem_floor_bytes();
+    img.substrate_outstanding = ds4_gpu_substrate_outstanding();
+    ds4_mem_observation o;
+    memset(&o, 0, sizeof(o));
+    (void)ds4_gpu_mem_observe(&o);
+    const ds4_gov_quote q = ds4_gov_evaluate(&img, &o, cl);
+    const int status = (q.status >= 0 && q.status < DS4_GOV_STATUS__COUNT)
+                           ? q.status : DS4_GOV_FAULT;
+    const int reason = ds4_gov_compare(live_status, status);
+    ds4_metric_add(&m->memgov_decisions[cl->requester][status][reason], 1);
+    if (status == DS4_GOV_FAULT)
+        ds4_metric_add(&m->memgov_faults, 1);
+    /* Disclose early REAL disagreements (not the documented OBS_POLICY
+     * divergence -- live fails open where the backend has no answer, a
+     * counted policy fact, not news).  Bounded so a systematic
+     * disagreement cannot flood serving logs; the counters carry the
+     * full story for the gate. */
+    if (reason != DS4_GOV_CMP_AGREE && reason != DS4_GOV_CMP_OBS_POLICY) {
+        static int disclosed = 0;
+        if (disclosed < 16) {
+            disclosed++;
+            fprintf(stderr,
+                    "ds4: memgov shadow DISAGREE site=%s consumer=%d "
+                    "live=%d shadow=%d reason=%d proposed=%llu old=%llu "
+                    "prospective=%llu available=%llu required=%llu "
+                    "deficit=%llu class_limit=%llu epoch=%llu\n",
+                    site ? site : "?", cl->requester, live_status, status,
+                    reason,
+                    (unsigned long long)q.proposed_intent,
+                    (unsigned long long)q.old_intent,
+                    (unsigned long long)(q.total_prospective_intent),
+                    (unsigned long long)q.available,
+                    (unsigned long long)q.required,
+                    (unsigned long long)q.deficit,
+                    (unsigned long long)q.class_limit,
+                    (unsigned long long)q.epoch);
+        }
+    }
+}
+
+/* Absolute session-graph intent at a ctx: the serial-reserve estimator
+ * (v0.5.6 governance) exported for SERIAL_SESSION / STATIC_BATCH shadow
+ * claims.  Estimate, not measurement -- the scoping table marks these
+ * rows BOUNDED. */
+uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx) {
+    if (!e || ctx <= 0) return 0;
+    const uint32_t spc = metal_graph_prefill_cap_for_prompt(ctx);
+    const uint32_t src = metal_graph_raw_cap_for_context(ctx, spc);
+    return metal_graph_alloc_bytes_estimate(&e->weights, &e->weights.layer[0],
+                                            src, (uint32_t)ctx, spc,
+                                            e->mtp_ready, e->dspark_ready);
+}
+
 /* R5 Inc1b: resident bytes across the comp/index cache slabs (page multiples
  * for demand-mapped reservations).  Host-side page-flag scan, no driver
  * calls.  CONTRACT (deepmem D-1a): this sum feeds the comp_map_budget
@@ -33927,6 +34052,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                                                  src, (uint32_t)ent, spc,
                                                  e->mtp_ready, e->dspark_ready) +
                 (1024ull << 20);
+            const uint64_t want_pre_clamp = want;   /* memgov D0b-3 (S3) */
             /* Clamp to what remains after the commons keeps its own floor. */
             const uint64_t commons_floor =
                 (uint64_t)ctx->max_seq * ds4_batch_vmm_floor_per_bank(&ctx->g);
@@ -33946,6 +34072,22 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                 }
             }
             ctx->serial_reserve = want;
+            /* memgov D0b-3 (S3): the live formula CLAMPS instead of
+             * refusing; a clamp is its way of saying the full entitlement
+             * cannot be funded live.  Publish the carve as the serial
+             * lane's own reservation, then shadow the pre-clamp ask. */
+            ds4_gov_publish_reservation(DS4_GOVC_SERIAL_SESSION, want);
+            {
+                ds4_gov_claim scl = {0};
+                scl.requester = DS4_GOVC_SERIAL_SESSION;
+                scl.memc = DS4_MEMC_SESSION_TENSORS;
+                scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+                scl.proposed_outstanding = want_pre_clamp;
+                ds4_gov_shadow_check("serial_reserve_carve", &scl,
+                                     want == want_pre_clamp
+                                         ? DS4_GOV_ADMIT
+                                         : DS4_GOV_REFUSE_LIVE);
+            }
         }
     }
     if (ctx->sl.vmm) {
@@ -34011,6 +34153,12 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                 (double)ctx->serial_reserve / 1073741824.0,
                 (double)ds4_gpu_substrate_outstanding() / 1073741824.0,
                 g_slab_vmm_fallbacks ? " -- WITH EAGER FALLBACKS, see above" : "");
+        /* memgov D0b-3 (S1/S2): the bank plan's boot lease -- an absolute
+         * publication, no quote (there is no live boolean at boot; the
+         * fit retry-down IS the decision).  intent == resident: nothing
+         * is credited yet, the plan's first-touch floors are physical. */
+        { const uint64_t r0 = ds4_batch_slabs_cache_resident(&ctx->sl);
+          ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN, r0, r0); }
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
      * R2: sized by seq_cap (the committed-token bound), not the raw ring. */
@@ -35891,6 +36039,18 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                                   want, NULL) > 0)
                         mres = ds4_batch_slabs_cache_resident(&ctx->sl);
                 }
+                /* memgov D0b-3 (S4/S5): ONE claim for both live verdicts,
+                 * built from the exact inputs the class check consumes
+                 * (post class-trim mres).  proposed is the ABSOLUTE
+                 * post-fault total: resident + the whole union's unfaulted
+                 * growth (the projection already carries every credit and
+                 * this candidate, sec 6.2's do-not-resum rule). */
+                ds4_gov_claim scl = {0};
+                scl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+                scl.memc = DS4_MEMC_BATCH_BANK;
+                scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+                scl.proposed_outstanding = mres + mneed;
+                scl.class_limit = ctx->comp_map_budget;
                 if (ctx->comp_map_budget != 0 && mneed != 0 &&
                     mres + mneed > ctx->comp_map_budget) {
                     ctx->mem_rejects++;
@@ -35900,6 +36060,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                             b, (double)mres / 1048576.0,
                             (double)mneed / 1048576.0,
                             (double)ctx->comp_map_budget / 1048576.0);
+                    ds4_gov_shadow_check("cont_admit", &scl,
+                                         DS4_GOV_REFUSE_CLASS);
                     on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
                     continue;
                 }
@@ -35932,10 +36094,18 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                 (double)ds4_mem_floor_bytes() / 1073741824.0,
                                 (double)ctx->serial_reserve / 1073741824.0,
                                 (double)ds4_gpu_substrate_outstanding() / 1048576.0);
+                        ds4_gov_shadow_check("cont_admit", &scl,
+                                             DS4_GOV_REFUSE_LIVE);
                         on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
                         continue;
                     }
                 }
+                /* memgov D0b-3: both live verdicts passed -- shadow the
+                 * admit and publish the lane's absolute lease (intent =
+                 * post-fault total, resident = what the page scan sees). */
+                ds4_gov_shadow_check("cont_admit", &scl, DS4_GOV_ADMIT);
+                ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
+                                    mres + mneed, mres);
             }
             /* R4: ADMISSION = INSTALL ONLY.  Bank state is prepared here (reset /
              * fork copy / warm reuse) and the tokens to prefill are parked in the
@@ -38590,6 +38760,23 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
         return;
     e->boot_prewarm_done = true;
     const double warm_t0 = now_sec();
+    /* memgov D0b-3 (S8): prewarm allocates by design (post-placement
+     * headroom growth); its lease is the census delta of the classes it
+     * grows -- a BOUNDED publication (scoping sec 2), exact when nothing
+     * else allocates during boot prewarm (boot is single-threaded). */
+    uint64_t warm_before = 0;
+    int warm_census = 0;
+    {
+        ds4_mem_cell cc;
+        if (ds4_gpu_mem_census_read(DS4_MEMC_SCRATCH_STICKY,
+                                    DS4_MEMD_UNIFIED_DEVICE, &cc) == 0) {
+            warm_census = 1;
+            warm_before = ds4_mem_cell_live(&cc);
+            if (ds4_gpu_mem_census_read(DS4_MEMC_KERNEL_PARTIALS,
+                                        DS4_MEMD_UNIFIED_DEVICE, &cc) == 0)
+                warm_before += ds4_mem_cell_live(&cc);
+        }
+    }
     const int warm_len = 512;
     ds4_session *warm = NULL;
     if (ds4_session_create(&warm, e, warm_len + 16) == 0 && warm) {
@@ -38618,6 +38805,20 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
         /* Return device reserves the warm session no longer backs (unused
          * graph-pool slack); everything deliberately warmed stays resident. */
         ds4_gpu_boot_trim();
+        /* memgov D0b-3 (S8): what prewarm deliberately left resident. */
+        if (warm_census) {
+            ds4_mem_cell cc;
+            uint64_t warm_after = 0;
+            if (ds4_gpu_mem_census_read(DS4_MEMC_SCRATCH_STICKY,
+                                        DS4_MEMD_UNIFIED_DEVICE, &cc) == 0)
+                warm_after += ds4_mem_cell_live(&cc);
+            if (ds4_gpu_mem_census_read(DS4_MEMC_KERNEL_PARTIALS,
+                                        DS4_MEMD_UNIFIED_DEVICE, &cc) == 0)
+                warm_after += ds4_mem_cell_live(&cc);
+            const uint64_t grew = warm_after > warm_before
+                                      ? warm_after - warm_before : 0;
+            ds4_gov_publish_use(DS4_GOVC_PREWARM, grew, grew);
+        }
     } else {
         fprintf(stderr, "ds4: boot prewarm session unavailable; first "
                         "request pays the one-time driver costs\n");

@@ -507,6 +507,26 @@ int  ds4_gpu_mem_observe(ds4_mem_observation *out);
  * engagement counter gates assert on. */
 int      ds4_gpu_trim_inject_set(int site, uint32_t count);
 uint32_t ds4_gpu_trim_inject_fired(void);
+/* memgov D0b-3: the SHADOW governor.  One process-global lease ledger
+ * (ds4_mem_gov.h types) written under the same single-writer discipline
+ * as the census and read through the same seqlock protocol.  Publishes
+ * are ABSOLUTE (sec 6.2); _use and _reservation set their fields
+ * independently so the two owners of a lane (boot carve vs session
+ * growth) never clobber each other.  ds4_gov_shadow_check evaluates a
+ * claim against a fresh ledger image + floor + substrate + observation,
+ * compares with the LIVE formula's verdict (mapped by the caller onto
+ * ADMIT / REFUSE_CLASS / REFUSE_LIVE), ticks exactly one
+ * memgov_decisions cell, and stderr-discloses early real disagreements.
+ * LOG-AND-COUNT ONLY: nothing here influences any live decision (D2). */
+void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident);
+void ds4_gov_publish_reservation(int consumer, uint64_t reservation);
+void ds4_gov_snapshot(ds4_gov_ledger *out);
+void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
+                          int live_status);
+/* Absolute session-graph intent for a ctx (the serial-reserve estimator,
+ * exported): what a committed graph at this ctx costs, for SERIAL_SESSION
+ * and STATIC_BATCH shadow claims. */
+uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx);
 
 /* =========================================================================
  * Live serving metrics (v0.2.x observability): ONE registry, THREE porcelains.
@@ -619,6 +639,15 @@ typedef struct {
      * consumed over the process lifetime. */
     uint64_t memobs_calls[DS4_MEMOBS_SRC_MEMINFO_AVAILABLE + 1];
     uint64_t memobs_errors;
+    /* memgov D0b-3: shadow-decision counters, fixed cardinality by
+     * construction (consumer x shadow status x comparison reason; all
+     * three enums are closed).  Every ds4_gov_shadow_check ticks exactly
+     * one cell; /metrics renders the full family (absence-is-never-zero
+     * does not apply -- these are process counters, not backend state). */
+    uint64_t memgov_decisions[DS4_GOVC__COUNT]
+                             [DS4_GOV_STATUS__COUNT]
+                             [DS4_GOV_CMP__COUNT];
+    uint64_t memgov_faults;       /* publish/evaluate faults (gov ledger) */
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);
