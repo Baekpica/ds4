@@ -16186,6 +16186,34 @@ static void cont_stream_error_abort(job *j, const char *msg) {
     cont_stream_discard(j);
 }
 
+/* Most warm admissions report usage in the client's rendered-prompt frame:
+ * hidden sampled reasoning can make the engine's retained frame longer than
+ * the visible replay.  A Responses output-only bank continuation is different:
+ * its request prompt is only the function_call_output suffix, while the API's
+ * input_tokens contract (and the serial continuation path) counts the complete
+ * model input, cached prefix included. */
+static bool cont_usage_uses_effective_frame(const request *r) {
+    return r && r->api == API_RESPONSES &&
+           (r->needs & DS4_NEED_BANK_FRONTIER) != 0;
+}
+
+static int cont_usage_apply_engine_split(request *r,
+                                         int n_cached, int n_computed) {
+    if (!r) return 0;
+    if (n_cached < 0) n_cached = 0;
+    if (n_computed < 0) n_computed = 0;
+    if (cont_usage_uses_effective_frame(r)) {
+        r->cache_read_tokens = n_cached;
+        r->cache_write_tokens = n_computed;
+        return n_cached <= INT_MAX - n_computed ? n_cached + n_computed
+                                                 : INT_MAX;
+    }
+    const int p = r->prompt.len;
+    r->cache_write_tokens = n_computed > p ? p : n_computed;
+    r->cache_read_tokens  = p - r->cache_write_tokens;
+    return p;
+}
+
 /* Send SSE headers + the surface's protocol start and mint the completion id.
  * Sets failed (not started=false) on a write error so callers stop touching
  * the fd.  Inc 4a: normally called from cont_on_admitted (transport starts at
@@ -16196,7 +16224,7 @@ static void cont_stream_start(server *s, job *j) {
     snprintf(st->id, sizeof(st->id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
-    st->prompt_tokens = j->req.prompt.len;
+    if (st->prompt_tokens <= 0) st->prompt_tokens = j->req.prompt.len;
     st->started = true;
     st->last_keepalive = now_sec();
     wire_init(&st->wsess, wire_surface_for(&j->req), st->id);
@@ -16230,15 +16258,12 @@ static int cont_on_admitted(void *ud, void *user, int n_cached,
                             int n_computed, int bank) {
     cont_sched *cs = ud;
     job *j = user;
-    (void)n_cached;
     (void)bank;
-    {
-        const int p = j->req.prompt.len;
-        j->req.cache_write_tokens = n_computed > p ? p : n_computed;
-        j->req.cache_read_tokens  = p - j->req.cache_write_tokens;
-    }
+    const int usage_prompt_tokens =
+        cont_usage_apply_engine_split(&j->req, n_cached, n_computed);
     if (!j->req.stream) return 1;
     cont_stream *st = cont_stream_ensure(j);
+    st->prompt_tokens = usage_prompt_tokens;
     if (st->started) return j->client_gone ? 0 : 1;
     t_emit_job = j;
     cont_stream_start(cs->s, j);
@@ -16691,14 +16716,12 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
              * warm shape) this is bit-identical to the old direct copy, so
              * usage.cached == timings.prefill_cached stays structural
              * there; timings ALWAYS keeps the effective frame (engine
-             * truth).  Invariant either way: usage's uncached prompt
-             * portion == min(prefill_computed, prompt). */
-            {
-                const int p = j->req.prompt.len;
-                const int w = (int)es.prefill_computed;
-                j->req.cache_write_tokens = w > p ? p : w;
-                j->req.cache_read_tokens  = p - j->req.cache_write_tokens;
-            }
+             * truth).  Responses output-only bank continuations are the one
+             * exception: their wire usage also uses the effective frame,
+             * because input_tokens includes the retained cached prefix and
+             * serial live continuations already report it that way. */
+            (void)cont_usage_apply_engine_split(
+                &j->req, (int)es.prefill_cached, (int)es.prefill_computed);
         }
     }
     /* Inc 3c: wire honors the client's zero budget exactly like the serial
@@ -25864,6 +25887,56 @@ static void test_cont_admission_transport_and_heartbeat(void) {
     close(sv[1]);
 }
 
+/* A Responses output-only T2 carries only the new function_call_output in the
+ * request JSON, but a bank continuation feeds the model the retained frontier
+ * plus that suffix.  Responses usage counts the full model input (cached
+ * tokens included), so the continuous terminal must use the engine's effective
+ * frame just like the serial live-continuation path. */
+static void test_cont_responses_bank_usage_uses_effective_frame(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    cont_sched cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.s = &s;
+
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.api = API_RESPONSES;
+    j.req.stream = true;
+    j.req.think_mode = DS4_THINK_NONE;
+    j.req.needs = DS4_NEED_BANK_FRONTIER;
+    j.req.prompt.len = 16;       /* canonical output-only request frame */
+
+    TEST_ASSERT(cont_on_admitted(&cs, &j, 260, 18, 0) == 1);
+    TEST_ASSERT(j.req.cache_read_tokens == 260);
+    TEST_ASSERT(j.req.cache_write_tokens == 18);
+    TEST_ASSERT(j.cstream && j.cstream->prompt_tokens == 278);
+
+    t_emit_job = &j;
+    cont_stream_finalize(&s, &j, "stop");
+    t_emit_job = NULL;
+    char *out = job_out_text(&j);
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":278") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":260") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_write_tokens\":18") != NULL);
+
+    free(out);
+    buf_free(&j.out);
+    request_free(&j.req);
+    pthread_cond_destroy(&j.cv);
+    pthread_mutex_destroy(&j.mu);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 /* Inc 4b: a promoted Anthropic stream on the CONT path projects through the
  * SAME machine the serial path uses -- the identical tape driven through the
  * real cont entry points (cont_stream_start / wire_update /
@@ -27033,6 +27106,7 @@ static void ds4_server_unit_tests_run(void) {
     test_wire_finish_stream_matches_direct_dispatch();
     test_cont_completion_stream_matches_serial_oracle();
     test_cont_admission_transport_and_heartbeat();
+    test_cont_responses_bank_usage_uses_effective_frame();
     test_cont_anthropic_stream_matches_serial_oracle();
     test_cont_responses_stream_matches_serial_oracle();
     test_sem_accum_feed_verdicts();
