@@ -83,10 +83,10 @@ R "grep -q 'ds4: model-source ledger reconciled:' $BOOTLOG" \
     || die "no ledger reconcile line"
 R "grep -q 'source ledger mismatch' $BOOTLOG" && die "ledger mismatch at boot"
 R "grep -q 'model source UNATTRIBUTED' $BOOTLOG" && die "unattributed weight bytes at boot"
-# D1a-2: catalog engagement (positive lines per source, zero tripwires).
+# D1a-2 (tripwire retired in D1a-4b): the catalog lines ARE the positive
+# engagement signal; the classifier units pin the name relation.
 R "grep -q 'ds4: model catalog base:' $BOOTLOG" || die "no base catalog line"
 R "grep -q 'ds4: model catalog drafter:' $BOOTLOG" || die "no drafter catalog line"
-R "grep -q 'CATALOG-TRIPWIRE' $BOOTLOG" && die "catalog-vs-heuristic tripwire fired"
 # D1a-3: unit tables compile + verify clean on every source.
 R "grep -q 'ds4: model units base: .* (verify=0)' $BOOTLOG" || die "no clean base unit table"
 R "grep -q 'ds4: model units drafter: .* (verify=0)' $BOOTLOG" || die "no clean drafter unit table"
@@ -124,9 +124,8 @@ R "grep -q 'ds4: model-source ledger reconciled:' $BOOTLOG" \
     || die "(s2) no ledger reconcile line"
 R "grep -q 'source ledger mismatch' $BOOTLOG" && die "(s2) ledger mismatch"
 R "grep -q 'model source UNATTRIBUTED' $BOOTLOG" && die "(s2) unattributed weight bytes"
-# D1a-2: catalog engagement on the mtp shape.
+# D1a-2 (tripwire retired in D1a-4b): catalog engagement on the mtp shape.
 R "grep -q 'ds4: model catalog mtp:' $BOOTLOG" || die "(s2) no mtp catalog line"
-R "grep -q 'CATALOG-TRIPWIRE' $BOOTLOG" && die "(s2) catalog tripwire fired"
 # D1a-3: mtp unit table clean.
 R "grep -q 'ds4: model units mtp: .* (verify=0)' $BOOTLOG" || die "(s2) no clean mtp unit table"
 R "grep -q 'UNIT-TABLE FAULT' $BOOTLOG" && die "(s2) unit-table fault"

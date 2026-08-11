@@ -1835,23 +1835,14 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             free(spans);
             return false;
         }
-        /* memgov D1a-2: the CATALOG drives the routed-expert skip; the old
-         * memmem("_exps.") predicate stays compiled as a cross-check
-         * tripwire for ONE stage (scoping sec 5: retired by cross-checked
-         * replacement).  A mismatch is a classification bug: it prints the
-         * tensor and counts a census fault, which every standing gate
-         * asserts zero. */
-        const int routed = m->tensor_traits != NULL &&
-            (m->tensor_traits[i] & DS4_TCAT_ROUTED_EXPERT) != 0;
-        const int legacy_exps =
-            memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL;
-        if (routed != legacy_exps) {
-            fprintf(stderr,
-                    "ds4: CATALOG-TRIPWIRE routed=%d legacy=%d tensor %.*s\n",
-                    routed, legacy_exps, (int)t->name.len, t->name.ptr);
-            ds4_gpu_mem_census_fault_note();
-        }
-        if (routed) {
+        /* memgov D1a-2/D1a-4b: the CATALOG drives the routed-expert skip.
+         * The legacy memmem("_exps.") predicate served one stage as a
+         * cross-check tripwire (zero mismatches across the D1a-2/3/4 gate
+         * batteries) and is retired -- scoping sec 5: the heuristic dies
+         * by cross-checked replacement.  The exact name relation stays
+         * pinned by the classifier units (test_model_catalog_classify). */
+        if (m->tensor_traits != NULL &&
+            (m->tensor_traits[i] & DS4_TCAT_ROUTED_EXPERT) != 0) {
             continue;
         }
         spans[nspan++] = (accelerator_tensor_span){

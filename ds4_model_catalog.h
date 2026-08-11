@@ -15,9 +15,10 @@
  * candidacy rules (cuda/mmq/ds4_repack.cu ds4_repack_*_candidate), so the
  * residency planner can reason about tensor classes without substring
  * heuristics.  The legacy memmem(name, "_exps.") predicate at the HBM
- * pre-cache site survives ONE stage as a cross-check tripwire (mismatch =
- * census fault + gate FAIL) and then dies — scoping sec 5: the heuristic
- * is retired by cross-checked replacement, not deletion.
+ * pre-cache site survived ONE stage as a cross-check tripwire (zero
+ * mismatches across the D1a gate batteries) and was retired in D1a-4b —
+ * scoping sec 5: the heuristic died by cross-checked replacement; the
+ * name relation stays pinned by the classifier units.
  *
  * Trait bits (0 = ALWAYS-HOT, the pre-cacheable default):
  * - ROUTED_EXPERT: the 3-D ffn_{gate,up,down}_exps stacks — top-K of N
