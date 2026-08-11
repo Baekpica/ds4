@@ -270,4 +270,52 @@ static inline ds4_gov_quote ds4_gov_evaluate(const ds4_gov_ledger *lg,
     return q;
 }
 
+/* =========================================================================
+ * memgov D0b-2: versioned snapshot protocol (plan sec 6.3).
+ *
+ * A seqlock over a single-writer ledger: the writer marks the epoch odd,
+ * mutates, publishes, marks it even; a reader samples epoch -> data ->
+ * epoch and discards the copy unless both samples match and are even.
+ * The reader's data copy itself may tear WHILE it is being discarded --
+ * that benign race is the protocol (the C-standard caveat is documented
+ * at the instantiation sites, as for the D0a copy loop).
+ *
+ * Single-writer is a PRECONDITION (the census writers all run under the
+ * server's gen_mu or pre-listener boot), but it is TRIPWIRED here, not
+ * assumed (plan sec 6.3 last para): write_begin faults on an odd epoch
+ * (someone else mid-flight), write_end faults on an even one (unbalanced
+ * bracket).  Both still increment, so parity self-heals after any
+ * balanced sequence and readers keep discarding through the violation
+ * window -- the tripwire is a loud counter, never a lock.
+ *
+ * SEQ_CST fences: these run at durable allocation points only (never
+ * per-token), so the strongest fence is free and unambiguous. */
+static inline void ds4_gov_epoch_write_begin(uint64_t *epoch,
+                                             uint64_t *faults) {
+    const uint64_t s = __atomic_load_n(epoch, __ATOMIC_RELAXED);
+    if (s & 1u) { if (faults) (*faults)++; }   /* single-writer violated */
+    __atomic_store_n(epoch, s + 1u, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+static inline void ds4_gov_epoch_write_end(uint64_t *epoch,
+                                           uint64_t *faults) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    const uint64_t s = __atomic_load_n(epoch, __ATOMIC_RELAXED);
+    if (!(s & 1u)) { if (faults) (*faults)++; } /* unbalanced bracket */
+    __atomic_store_n(epoch, s + 1u, __ATOMIC_RELAXED);
+}
+
+static inline uint64_t ds4_gov_epoch_read_begin(const uint64_t *epoch) {
+    return __atomic_load_n(epoch, __ATOMIC_ACQUIRE);
+}
+
+/* 1 = the copy taken since read_begin is coherent (same epoch, even). */
+static inline int ds4_gov_epoch_read_verify(const uint64_t *epoch,
+                                            uint64_t began) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    const uint64_t now = __atomic_load_n(epoch, __ATOMIC_RELAXED);
+    return now == began && !(began & 1u);
+}
+
 #endif /* DS4_MEM_GOV_H */

@@ -27,6 +27,7 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_mem_census.h"
+#include "ds4_mem_gov.h"      /* memgov D0b: epoch protocol primitives */
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -145,13 +146,19 @@ static void cuda_substrate_cover(const void *model_map, uint64_t bytes) {
  * (local/docs/v057/d0a_census_table.md).  NOTHING reads these cells on a
  * decision path -- D0a's contract is zero decision change.
  *
- * Concurrency follows the tripwire convention above: every writer (boot
- * loader, admissions, sticky-scratch growth, teardown) already runs under
- * the server's gen_mu / boot single-thread serialization, so writes are
- * plain; a racy census_read during a control-plane transition may see one
- * site's requested without its committed, which the D0a gate avoids by
- * reading only at quiesced settle points.  Coherent epoch snapshots are
- * deliberately D0b's (plan sec 6.3), not bolted on here.
+ * Concurrency (memgov D0b-2, plan sec 6.3): every writer (boot loader,
+ * admissions, sticky-scratch growth, teardown) runs under the server's
+ * gen_mu / boot single-thread serialization -- a PRECONDITION the epoch
+ * brackets below TRIPWIRE rather than assume (write_begin faults on an
+ * odd epoch, write_end on an even one; both self-heal parity).  Every
+ * note transaction brackets with ds4_gov_epoch_write_begin/_end, so a
+ * reader (server mem_census_snapshot) that samples epoch -> cells ->
+ * epoch discards any copy taken across an in-flight note.  The cell
+ * writes themselves stay plain: a torn reader copy is DISCARDED by
+ * verify, which is the seqlock's documented benign race (formally a
+ * C-standard data race; the fences in the primitives order it on real
+ * targets).  The scope stack below is single-writer-only state that no
+ * reader snapshots; it stays outside the brackets.
  *
  * The scope stack attributes ds4_gpu_tensor_alloc/_reserve traffic to the
  * bracketing subsystem (ENGINE_OTHER when unbracketed -- the close gate
@@ -159,27 +166,30 @@ static void cuda_substrate_cover(const void *model_map, uint64_t bytes) {
  * real nesting today is engine-boundary -> at most one inner helper. */
 static ds4_mem_cell g_mem_census[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
 static uint64_t g_mem_census_faults;
+static uint64_t g_mem_census_epoch;   /* D0b-2 seqlock (ds4_mem_gov.h) */
 static int g_mem_scope_stack[8];
 static int g_mem_scope_depth;
 
 static void cuda_mem_note_alloc(int cls, int dom, uint64_t requested,
                                 uint64_t committed) {
-    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT) {
+    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT)
         g_mem_census_faults++;
-        return;
-    }
-    ds4_mem_cell_note_alloc(&g_mem_census[cls][dom], requested, committed,
-                            &g_mem_census_faults);
+    else
+        ds4_mem_cell_note_alloc(&g_mem_census[cls][dom], requested, committed,
+                                &g_mem_census_faults);
+    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
 }
 
 static void cuda_mem_note_free(int cls, int dom, uint64_t requested,
                                uint64_t committed) {
-    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT) {
+    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT)
         g_mem_census_faults++;
-        return;
-    }
-    ds4_mem_cell_note_free(&g_mem_census[cls][dom], requested, committed,
-                           &g_mem_census_faults);
+    else
+        ds4_mem_cell_note_free(&g_mem_census[cls][dom], requested, committed,
+                               &g_mem_census_faults);
+    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
 }
 
 static int cuda_mem_scope_class(void) {
@@ -216,6 +226,17 @@ extern "C" int ds4_gpu_mem_census_read(int consumer_class, int domain,
 
 extern "C" uint64_t ds4_gpu_mem_census_faults(void) {
     return g_mem_census_faults;
+}
+
+/* D0b-2: reader half of the registry seqlock (writer half brackets the
+ * note wrappers above).  Exposed as begin/verify so the server's
+ * snapshot loop drives the protocol without touching the epoch word. */
+extern "C" uint64_t ds4_gpu_mem_census_epoch_begin(void) {
+    return ds4_gov_epoch_read_begin(&g_mem_census_epoch);
+}
+
+extern "C" int ds4_gpu_mem_census_epoch_verify(uint64_t began) {
+    return ds4_gov_epoch_read_verify(&g_mem_census_epoch, began);
 }
 
 /* Census: per-slot committed bytes of the pinned staging pool.  File-scope

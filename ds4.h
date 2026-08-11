@@ -489,6 +489,13 @@ void ds4_gpu_mem_scope_begin(int consumer_class);
 void ds4_gpu_mem_scope_end(void);
 int  ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out);
 uint64_t ds4_gpu_mem_census_faults(void);
+/* D0b-2 versioned snapshots (plan sec 6.3): the registry's seqlock epoch
+ * (ds4_mem_gov.h primitives).  A reader samples begin, copies cells +
+ * faults, then verify(began) -- nonzero means the copy is coherent.
+ * Stubs (Metal/CPU) report a permanently even, never-changing epoch, so
+ * readers there trivially verify (the census itself is UNSUPPORTED). */
+uint64_t ds4_gpu_mem_census_epoch_begin(void);
+int      ds4_gpu_mem_census_epoch_verify(uint64_t began);
 /* D0a-2 typed observation provider (CUDA real; Metal reports
  * UNSUPPORTED).  ds4_gpu_mem_info is now a shim over this. */
 int  ds4_gpu_mem_observe(ds4_mem_observation *out);

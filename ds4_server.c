@@ -16278,9 +16278,14 @@ static const char *server_artifact_source_name(uint64_t source) {
 /* memgov D0a-3: census snapshot publication.  ONE registry image per
  * rendering pass -- a single copy loop over ds4_gpu_mem_census_read --
  * feeds /metrics, /v1/stats, and the boot census block, so no porcelain
- * mixes per-counter reads across in-flight updates.  Registry reads stay
- * single-writer racy by design until D0b's epochs (plan sec 6.3); a
- * control-plane copy is exactly as coherent as the tripwire idiom.
+ * mixes per-counter reads across in-flight updates.
+ *
+ * D0b-2 (plan sec 6.3): the copy loop now rides the registry seqlock --
+ * sample epoch, copy, verify; a copy taken across an in-flight note is
+ * DISCARDED and retried (the discarded copy may tear; that is the
+ * protocol's documented benign race).  After bounded retries the LAST
+ * STABLE image is served and a fallback counted: metrics render the last
+ * stable published image and never block or take gen_mu (sec 6.3).
  * Names are FIXED cardinality, positional against the census enums
  * (census sec 6; metrics plan sec 14): no dynamic labels, ever. */
 static const char *mem_class_names[DS4_MEMC__COUNT] = {
@@ -16299,19 +16304,51 @@ static const char *mem_obs_source_names[3] = { "none", "cuda_free", "meminfo_ava
 typedef struct {
     ds4_mem_cell cells[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
     uint64_t faults;
+    uint64_t epoch;                /* D0b-2: registry epoch of this image */
     int supported;                 /* 0 = backend keeps no census (Metal/CPU):
                                     * porcelains render ABSENCE, never zero */
 } mem_census_image;
 
+/* D0b-2 last-stable cache: the fallback image when the seqlock read stays
+ * torn through every retry (a writer wedged mid-note -- the tripwire
+ * class).  snap_mu guards only this cache, is never held across GPU work,
+ * and is NOT gen_mu; the fallback counter is rendered by /metrics. */
+static pthread_mutex_t mem_census_snap_mu = PTHREAD_MUTEX_INITIALIZER;
+#ifndef DS4_NO_GPU
+static mem_census_image mem_census_last_stable;      /* under snap_mu */
+static int mem_census_last_stable_valid;             /* under snap_mu */
+#endif
+static uint64_t mem_census_torn_fallbacks;           /* under snap_mu */
+
 static void mem_census_snapshot(mem_census_image *img) {
     memset(img, 0, sizeof(*img));
 #ifndef DS4_NO_GPU
-    for (int c = 0; c < DS4_MEMC__COUNT; c++)
-        for (int d = 0; d < DS4_MEMD__COUNT; d++)
-            if (ds4_gpu_mem_census_read(c, d, &img->cells[c][d]) != 0)
-                return;
-    img->faults = ds4_gpu_mem_census_faults();
-    img->supported = 1;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        const uint64_t began = ds4_gpu_mem_census_epoch_begin();
+        if (began & 1u)
+            continue;              /* writer mid-note: sample again      */
+        for (int c = 0; c < DS4_MEMC__COUNT; c++)
+            for (int d = 0; d < DS4_MEMD__COUNT; d++)
+                if (ds4_gpu_mem_census_read(c, d, &img->cells[c][d]) != 0)
+                    return;        /* backend keeps no census            */
+        img->faults = ds4_gpu_mem_census_faults();
+        if (ds4_gpu_mem_census_epoch_verify(began)) {
+            img->epoch = began;
+            img->supported = 1;
+            pthread_mutex_lock(&mem_census_snap_mu);
+            mem_census_last_stable = *img;
+            mem_census_last_stable_valid = 1;
+            pthread_mutex_unlock(&mem_census_snap_mu);
+            return;
+        }
+    }
+    /* Torn through every retry: serve the last stable published image
+     * (absence stays absence if none was ever published). */
+    pthread_mutex_lock(&mem_census_snap_mu);
+    mem_census_torn_fallbacks++;
+    if (mem_census_last_stable_valid)
+        *img = mem_census_last_stable;
+    pthread_mutex_unlock(&mem_census_snap_mu);
 #endif
 }
 
@@ -16540,6 +16577,22 @@ static void send_metrics(server *s, int fd) {
             buf_printf(&b, "# TYPE ds4_memory_census_faults_total counter\n"
                            "ds4_memory_census_faults_total %llu\n",
                        (unsigned long long)img.faults);
+        }
+        /* D0b-2: seqlock-reader health.  Fallbacks stay 0 unless a writer
+         * wedged mid-note (the tripwire class); the epoch gauge is the
+         * stamp of the image rendered ABOVE (torn-fallback images carry
+         * their cached stamp). */
+        {
+            uint64_t torn;
+            pthread_mutex_lock(&mem_census_snap_mu);
+            torn = mem_census_torn_fallbacks;
+            pthread_mutex_unlock(&mem_census_snap_mu);
+            buf_printf(&b, "# TYPE ds4_memory_census_torn_fallbacks_total counter\n"
+                           "ds4_memory_census_torn_fallbacks_total %llu\n"
+                           "# TYPE ds4_memory_census_epoch gauge\n"
+                           "ds4_memory_census_epoch %llu\n",
+                       (unsigned long long)torn,
+                       (unsigned long long)img.epoch);
         }
 #ifndef DS4_NO_GPU
         /* lite-3 tripwire, SAME call the fit/floor verdicts consume --
@@ -26123,6 +26176,71 @@ static void test_mem_gov_state_machine(void) {
     TEST_ASSERT(faults == 0);
 }
 
+/* memgov D0b-2: the versioned snapshot protocol (plan sec 6.3), pinned by
+ * DETERMINISTIC interleaving enumeration on a fake (epoch, data) pair --
+ * the reader must never ACCEPT a copy taken across an in-flight write, at
+ * any interleaving point.  (True concurrency cannot be enumerated; the
+ * torn-snapshot hunt under live load is the close gate's leg.  What is
+ * provable deterministically is the protocol's verdict at every step.) */
+static void test_mem_gov_epoch_protocol(void) {
+    uint64_t epoch = 0, faults = 0;
+    struct { uint64_t a, b; } data = {1, 1};   /* invariant: a == b */
+    uint64_t began;
+
+    /* Quiescent read: accept, coherent. */
+    began = ds4_gov_epoch_read_begin(&epoch);
+    TEST_ASSERT(ds4_gov_epoch_read_verify(&epoch, began) == 1);
+
+    /* Reader lands after write_begin: odd epoch, must not accept. */
+    ds4_gov_epoch_write_begin(&epoch, &faults);
+    began = ds4_gov_epoch_read_begin(&epoch);
+    TEST_ASSERT((began & 1u) != 0);
+    TEST_ASSERT(ds4_gov_epoch_read_verify(&epoch, began) == 0);
+
+    /* Reader copies mid-mutation (exactly one field written): the copy is
+     * torn by construction and the verdict discards it. */
+    data.a = 2;                                 /* half the write         */
+    TEST_ASSERT(ds4_gov_epoch_read_verify(&epoch, began) == 0);
+    data.b = 2;                                 /* write completes        */
+    ds4_gov_epoch_write_end(&epoch, &faults);
+    TEST_ASSERT(faults == 0);
+
+    /* Reader straddles a whole transaction (begin before, verify after):
+     * epoch advanced by 2, must not accept even though it is even now. */
+    began = ds4_gov_epoch_read_begin(&epoch);
+    ds4_gov_epoch_write_begin(&epoch, &faults);
+    data.a = 3; data.b = 3;
+    ds4_gov_epoch_write_end(&epoch, &faults);
+    TEST_ASSERT(ds4_gov_epoch_read_verify(&epoch, began) == 0);
+
+    /* Reader entirely after: accept, and the data invariant holds. */
+    began = ds4_gov_epoch_read_begin(&epoch);
+    TEST_ASSERT(data.a == data.b);
+    TEST_ASSERT(ds4_gov_epoch_read_verify(&epoch, began) == 1);
+    TEST_ASSERT(faults == 0);
+
+    /* Single-writer tripwire: a nested begin faults (odd seen), the inner
+     * end faults (even seen), and parity SELF-HEALS -- after the balanced
+     * sequence the epoch is even and readable again. */
+    ds4_gov_epoch_write_begin(&epoch, &faults);     /* outer: ok          */
+    ds4_gov_epoch_write_begin(&epoch, &faults);     /* inner: FAULT       */
+    TEST_ASSERT(faults == 1);
+    ds4_gov_epoch_write_end(&epoch, &faults);       /* inner: FAULT (even)*/
+    TEST_ASSERT(faults == 2);
+    ds4_gov_epoch_write_end(&epoch, &faults);       /* outer: ok (odd)    */
+    TEST_ASSERT(faults == 2);
+    began = ds4_gov_epoch_read_begin(&epoch);
+    TEST_ASSERT((began & 1u) == 0);
+    TEST_ASSERT(ds4_gov_epoch_read_verify(&epoch, began) == 1);
+
+    /* Backend hook contract at unit-time quiesce (Metal: permanently even
+     * stub; CUDA: the live registry epoch between transactions). */
+    const uint64_t live = ds4_gpu_mem_census_epoch_begin();
+    TEST_ASSERT((live & 1u) == 0);
+    TEST_ASSERT(ds4_gpu_mem_census_epoch_verify(live) == 1);
+    TEST_ASSERT(ds4_gpu_mem_census_epoch_verify(live + 1u) == 0);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -26292,6 +26410,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_gov_observation_policy();
     test_mem_gov_checked_arithmetic();
     test_mem_gov_state_machine();
+    /* memgov D0b-2: versioned snapshot protocol. */
+    test_mem_gov_epoch_protocol();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
