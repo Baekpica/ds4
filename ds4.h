@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "ds4_mem_census.h"
+#include "ds4_mem_gov.h"     /* memgov D0b: shadow governor core (leaf) */
 
 /* Public engine boundary.
  *

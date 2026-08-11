@@ -25894,6 +25894,235 @@ static void test_mem_obs_legacy_shim(void) {
     TEST_ASSERT(ds4_mem_obs_to_legacy(&o, NULL, NULL) == 1);
 }
 
+/* memgov D0b-1: shadow-governor core (ds4_mem_gov.h).  The evaluator is
+ * pure, so these ARE the fake memory provider: ledger images and typed
+ * observations are constructed directly and every verdict/fault path is
+ * pinned without a GPU.  The fixture mirrors the live boot shape in
+ * unit-agnostic numbers (the arithmetic never sees units): settled boot
+ * lease, prewarm lease, a bank plan with unfaulted credit debt, and the
+ * serial lane holding its opt-in reserve as its own lease reservation. */
+static ds4_gov_ledger mem_gov_test_ledger(void) {
+    ds4_gov_ledger lg = {0};
+    uint64_t faults = 0;
+    ds4_gov_lease_publish(&lg, DS4_GOVC_ENGINE_BOOT, 10000, 10000, 0, &faults);
+    ds4_gov_lease_publish(&lg, DS4_GOVC_PREWARM, 200, 200, 0, &faults);
+    /* bank plan: 1200 promised, 1000 faulted-in -> 200 outstanding debt */
+    ds4_gov_lease_publish(&lg, DS4_GOVC_BATCH_BANK_PLAN, 1200, 1000, 0, &faults);
+    /* serial lane: empty session holding a 200 reserve */
+    ds4_gov_lease_publish(&lg, DS4_GOVC_SERIAL_SESSION, 0, 0, 200, &faults);
+    TEST_ASSERT(faults == 0);
+    lg.floor_bytes = 600;
+    lg.substrate_outstanding = 50;
+    lg.epoch = 42;
+    return lg;
+}
+
+static ds4_mem_observation mem_gov_test_obs(uint64_t free_bytes) {
+    ds4_mem_observation o;
+    o.status = DS4_MEMOBS_OK;
+    o.source = DS4_MEMOBS_SRC_MEMINFO_AVAILABLE;
+    o.free_bytes = free_bytes;
+    o.total_bytes = 20000;
+    return o;
+}
+
+static void test_mem_gov_evaluate_verdicts(void) {
+    const ds4_gov_ledger lg = mem_gov_test_ledger();
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+    cl.memc = DS4_MEMC_BATCH_BANK;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 1500;      /* absolute; unfunded = 500 */
+    cl.class_limit = 2000;
+    /* required = floor 600 + substrate 50 + serial reserve 200
+     *          + others' unfunded 0 + own unfunded 500 = 1350 */
+    ds4_mem_observation o = mem_gov_test_obs(1350);
+    ds4_gov_quote q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_ADMIT);
+    TEST_ASSERT(q.required == 1350 && q.available == 1350 && q.deficit == 0);
+    TEST_ASSERT(q.old_intent == 1200 && q.proposed_intent == 1500);
+    TEST_ASSERT(q.other_reservations == 200);
+    TEST_ASSERT(q.total_prospective_intent == 10000 + 200 + 1500 + 0 + 0);
+    TEST_ASSERT(q.epoch == 42);
+    TEST_ASSERT(q.obs_source == DS4_MEMOBS_SRC_MEMINFO_AVAILABLE);
+    /* One byte short: live refusal, exact deficit, retryable. */
+    o = mem_gov_test_obs(1349);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_REFUSE_LIVE && q.retryable == 1);
+    TEST_ASSERT(q.deficit == 1);
+    /* Class cap refuses before the live gate and is not retryable. */
+    cl.proposed_outstanding = 2500;
+    o = mem_gov_test_obs(UINT64_MAX / 2);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_REFUSE_CLASS && q.retryable == 0);
+    TEST_ASSERT(q.proposed_class_bytes == 2500 && q.class_limit == 2000);
+    /* class_limit 0 = uncapped: the same ask rides through to ADMIT. */
+    cl.class_limit = 0;
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_ADMIT);
+    /* The operation transient is part of required. */
+    cl.proposed_outstanding = 1500;
+    cl.class_limit = 2000;
+    cl.operation_transient = 100;
+    o = mem_gov_test_obs(1449);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_REFUSE_LIVE && q.deficit == 1);
+}
+
+static void test_mem_gov_requester_asymmetry(void) {
+    /* sec 6.2: the serial requester spends its own reserve; a batch
+     * requester must treat it as spoken for.  Identical numbers, the two
+     * verdicts differ by exactly the reservation. */
+    const ds4_gov_ledger lg = mem_gov_test_ledger();
+    ds4_gov_claim cl = {0};
+    cl.memc = DS4_MEMC_SESSION_TENSORS;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 700;
+    /* serial: floor 600 + sub 50 + others' reservations 0
+     *       + others' unfunded (bank 200) + own 700 = 1550 */
+    cl.requester = DS4_GOVC_SERIAL_SESSION;
+    ds4_mem_observation o = mem_gov_test_obs(1550);
+    ds4_gov_quote qs = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(qs.status == DS4_GOV_ADMIT && qs.required == 1550);
+    TEST_ASSERT(qs.other_reservations == 0);
+    /* static-batch requester, same ask: + the 200 serial reserve, but
+     * NOT the serial lane's unfunded (still 0) twice. */
+    cl.requester = DS4_GOVC_STATIC_BATCH;
+    ds4_gov_quote qb = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(qb.status == DS4_GOV_REFUSE_LIVE);
+    TEST_ASSERT(qb.required == 1550 + 200 && qb.deficit == 200);
+    TEST_ASSERT(qb.other_reservations == 200);
+}
+
+static void test_mem_gov_absolute_replacement(void) {
+    /* Absolute leases: re-evaluating the same claim is idempotent, and a
+     * shrink (proposed <= resident) spends nothing -- the page-union
+     * projection can be re-published forever without drift (sec 6.2). */
+    const ds4_gov_ledger lg = mem_gov_test_ledger();
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+    cl.memc = DS4_MEMC_BATCH_BANK;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 1500;
+    cl.class_limit = 2000;
+    const ds4_mem_observation o = mem_gov_test_obs(1350);
+    ds4_gov_quote q1 = ds4_gov_evaluate(&lg, &o, &cl);
+    ds4_gov_quote q2 = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(memcmp(&q1, &q2, sizeof(q1)) == 0);
+    /* Shrink below resident: unfunded 0, required = 600+50+200 = 850. */
+    cl.proposed_outstanding = 900;
+    const ds4_mem_observation lo = mem_gov_test_obs(850);
+    ds4_gov_quote qs = ds4_gov_evaluate(&lg, &lo, &cl);
+    TEST_ASSERT(qs.status == DS4_GOV_ADMIT && qs.required == 850);
+    /* Idempotent publish: same absolute state twice, ledger unchanged. */
+    ds4_gov_ledger a = mem_gov_test_ledger();
+    ds4_gov_ledger b = a;
+    uint64_t faults = 0;
+    TEST_ASSERT(ds4_gov_lease_publish(&b, DS4_GOVC_BATCH_BANK_PLAN,
+                                      1200, 1000, 0, &faults) == 1);
+    TEST_ASSERT(memcmp(&a, &b, sizeof(a)) == 0 && faults == 0);
+}
+
+static void test_mem_gov_observation_policy(void) {
+    /* sec 6.4: UNSUPPORTED is a documented terminal policy (CPU/Metal);
+     * QUERY_ERROR is a retryable transient.  Both still return a full
+     * record (requester + epoch stamped, no free bytes claimed). */
+    const ds4_gov_ledger lg = mem_gov_test_ledger();
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+    cl.memc = DS4_MEMC_BATCH_BANK;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 1500;
+    ds4_mem_observation o = mem_gov_test_obs(1350);
+    o.status = DS4_MEMOBS_UNSUPPORTED;
+    ds4_gov_quote q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_UNSUPPORTED && q.retryable == 0);
+    TEST_ASSERT(q.obs_free == 0 && q.available == 0);
+    TEST_ASSERT(q.requester == DS4_GOVC_BATCH_BANK_PLAN && q.epoch == 42);
+    o.status = DS4_MEMOBS_QUERY_ERROR;
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_RETRY_OBS && q.retryable == 1);
+}
+
+static void test_mem_gov_checked_arithmetic(void) {
+    const ds4_mem_observation o = mem_gov_test_obs(1350);
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+    cl.memc = DS4_MEMC_BATCH_BANK;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 1500;
+    /* NULL and out-of-range args fail closed, never decide. */
+    TEST_ASSERT(ds4_gov_evaluate(NULL, &o, &cl).status == DS4_GOV_FAULT);
+    ds4_gov_ledger lg = mem_gov_test_ledger();
+    TEST_ASSERT(ds4_gov_evaluate(&lg, NULL, &cl).status == DS4_GOV_FAULT);
+    TEST_ASSERT(ds4_gov_evaluate(&lg, &o, NULL).status == DS4_GOV_FAULT);
+    ds4_gov_claim bad = cl;
+    bad.requester = DS4_GOVC__COUNT;
+    TEST_ASSERT(ds4_gov_evaluate(&lg, &o, &bad).status == DS4_GOV_FAULT);
+    bad = cl; bad.memc = DS4_MEMC__COUNT;
+    TEST_ASSERT(ds4_gov_evaluate(&lg, &o, &bad).status == DS4_GOV_FAULT);
+    bad = cl; bad.domain = -1;
+    TEST_ASSERT(ds4_gov_evaluate(&lg, &o, &bad).status == DS4_GOV_FAULT);
+    /* Impossible ledger state anywhere in the image fails closed --
+     * including on a lease the requester does not own. */
+    lg.lease[DS4_GOVC_ENGINE_BOOT].resident =
+        lg.lease[DS4_GOVC_ENGINE_BOOT].intent + 1;
+    TEST_ASSERT(ds4_gov_evaluate(&lg, &o, &cl).status == DS4_GOV_FAULT);
+    /* Saturating sums never wrap into an ADMIT. */
+    lg = mem_gov_test_ledger();
+    lg.floor_bytes = UINT64_MAX;
+    const ds4_mem_observation big = mem_gov_test_obs(UINT64_MAX);
+    TEST_ASSERT(ds4_gov_evaluate(&lg, &big, &cl).status == DS4_GOV_FAULT);
+    lg = mem_gov_test_ledger();
+    lg.lease[DS4_GOVC_ENGINE_BOOT].intent = UINT64_MAX;
+    lg.lease[DS4_GOVC_ENGINE_BOOT].resident = UINT64_MAX;
+    TEST_ASSERT(ds4_gov_evaluate(&lg, &big, &cl).status == DS4_GOV_FAULT);
+    /* Publish guards: out-of-range consumer and resident > intent are
+     * refused with a fault, ledger untouched. */
+    ds4_gov_ledger before = mem_gov_test_ledger();
+    ds4_gov_ledger after = before;
+    uint64_t faults = 0;
+    TEST_ASSERT(ds4_gov_lease_publish(&after, DS4_GOVC__COUNT,
+                                      1, 1, 0, &faults) == 0);
+    TEST_ASSERT(ds4_gov_lease_publish(&after, DS4_GOVC_PREWARM,
+                                      100, 101, 0, &faults) == 0);
+    TEST_ASSERT(ds4_gov_lease_publish(NULL, DS4_GOVC_PREWARM,
+                                      1, 1, 0, &faults) == 0);
+    TEST_ASSERT(faults == 3);
+    TEST_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+}
+
+static void test_mem_gov_state_machine(void) {
+    /* A deterministic admission lifecycle: claim -> admit -> allocation
+     * completes (intent becomes resident) -> the SAME absolute claim now
+     * costs nothing -> release -> a fresh grow starts from zero.  This is
+     * the sec 6.2/6.3 story the shadow wiring will drive with live
+     * numbers; the invariants are pinned here first. */
+    ds4_gov_ledger lg = mem_gov_test_ledger();
+    uint64_t faults = 0;
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+    cl.memc = DS4_MEMC_BATCH_BANK;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 1500;
+    cl.class_limit = 2000;
+    const ds4_mem_observation o = mem_gov_test_obs(1350);
+    TEST_ASSERT(ds4_gov_evaluate(&lg, &o, &cl).status == DS4_GOV_ADMIT);
+    /* Allocation lands: absolute publish, resident catches intent. */
+    TEST_ASSERT(ds4_gov_lease_publish(&lg, DS4_GOVC_BATCH_BANK_PLAN,
+                                      1500, 1500, 0, &faults) == 1);
+    ds4_gov_quote q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_ADMIT);
+    TEST_ASSERT(q.required == 850);      /* 600+50+200: nothing unfunded */
+    /* Release everything; a new grow quotes from a zero base. */
+    TEST_ASSERT(ds4_gov_lease_publish(&lg, DS4_GOVC_BATCH_BANK_PLAN,
+                                      0, 0, 0, &faults) == 1);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.old_intent == 0 && q.required == 850 + 1500);
+    TEST_ASSERT(q.status == DS4_GOV_REFUSE_LIVE && q.deficit == 1000);
+    TEST_ASSERT(faults == 0);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -26056,6 +26285,13 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_census_publication_shape();
     /* memgov D0a-2: typed observation legacy shim. */
     test_mem_obs_legacy_shim();
+    /* memgov D0b-1: shadow-governor evaluator (pure core). */
+    test_mem_gov_evaluate_verdicts();
+    test_mem_gov_requester_asymmetry();
+    test_mem_gov_absolute_replacement();
+    test_mem_gov_observation_policy();
+    test_mem_gov_checked_arithmetic();
+    test_mem_gov_state_machine();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN
