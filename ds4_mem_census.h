@@ -164,4 +164,56 @@ static inline int ds4_mem_obs_to_legacy(const ds4_mem_observation *o,
     return 0;
 }
 
+/* =========================================================================
+ * memgov D0a-4: trim failure-injection (TEST ONLY).
+ *
+ * ds4_gpu_tensor_trim survives two driver failures with distinct ledger
+ * shapes (D-1b): a cuMemUnmap failure keeps the page owned, mapped, and
+ * charged; a cuMemRelease failure after a successful unmap is a physical
+ * leak the cell reports as slack.  The CUDA backend can force either at
+ * the real driver boundary -- armed by the DS4_CUDA_TRIM_INJECT env spec
+ * or programmatically (ds4_gpu_trim_inject_set, declared in ds4.h).  The
+ * spec grammar lives here as a pure function so the unit suite pins the
+ * exact production parse without a GPU. */
+typedef enum {
+    DS4_TRIM_INJECT_OFF = 0,
+    DS4_TRIM_INJECT_UNMAP,           /* force cuMemUnmap failure           */
+    DS4_TRIM_INJECT_RELEASE          /* force cuMemRelease failure         */
+} ds4_trim_inject_site;
+
+static inline const char *ds4_mem_prefix_match(const char *s, const char *pre) {
+    while (*pre) { if (*s != *pre) return 0; s++; pre++; }
+    return s;
+}
+
+/* Parse "unmap:N" | "release:N" (decimal N in [1, UINT32_MAX]).  Returns 1
+ * and writes site/count on a valid spec; 0 with the outputs untouched
+ * otherwise.  N=0 is rejected: "off" is spelled by unsetting the env, so
+ * an armed-but-inert state cannot exist.  Manual scan keeps the leaf
+ * header dependency-free. */
+static inline int ds4_trim_inject_parse(const char *spec,
+                                        int *site_out, uint32_t *count_out) {
+    if (!spec) return 0;
+    int site = DS4_TRIM_INJECT_OFF;
+    const char *digits = ds4_mem_prefix_match(spec, "unmap:");
+    if (digits) {
+        site = DS4_TRIM_INJECT_UNMAP;
+    } else if ((digits = ds4_mem_prefix_match(spec, "release:")) != 0) {
+        site = DS4_TRIM_INJECT_RELEASE;
+    } else {
+        return 0;
+    }
+    if (*digits < '0' || *digits > '9') return 0;
+    uint64_t n = 0;
+    for (; *digits; digits++) {
+        if (*digits < '0' || *digits > '9') return 0;
+        n = n * 10u + (uint64_t)(*digits - '0');
+        if (n > UINT32_MAX) return 0;
+    }
+    if (n == 0) return 0;
+    *site_out = site;
+    *count_out = (uint32_t)n;
+    return 1;
+}
+
 #endif /* DS4_MEM_CENSUS_H */

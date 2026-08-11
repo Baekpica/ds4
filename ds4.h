@@ -491,6 +491,14 @@ uint64_t ds4_gpu_mem_census_faults(void);
 /* D0a-2 typed observation provider (CUDA real; Metal reports
  * UNSUPPORTED).  ds4_gpu_mem_info is now a shim over this. */
 int  ds4_gpu_mem_observe(ds4_mem_observation *out);
+/* D0a-4 trim failure-injection (TEST ONLY).  set() arms a bounded burst
+ * at one driver site inside ds4_gpu_tensor_trim (DS4_TRIM_INJECT_UNMAP /
+ * _RELEASE; OFF disarms) and always overrides the DS4_CUDA_TRIM_INJECT
+ * env spec; returns 1 where injection is supported (CUDA), 0 on stubs --
+ * units use that return as their skip gate.  fired() is the lifetime
+ * engagement counter gates assert on. */
+int      ds4_gpu_trim_inject_set(int site, uint32_t count);
+uint32_t ds4_gpu_trim_inject_fired(void);
 
 /* =========================================================================
  * Live serving metrics (v0.2.x observability): ONE registry, THREE porcelains.

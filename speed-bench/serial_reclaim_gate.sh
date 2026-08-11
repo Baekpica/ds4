@@ -7,12 +7,15 @@
 # path calls ds4_batch_ctx_trim_free (context-owned, NULL-tolerant victims),
 # re-runs the settle poll, refuses only if the graph still cannot fit.
 #
-# LANE: the serial route is driven by API FLAVOR (Anthropic /v1/messages
-# routes serial at any length -- job_is_batchable is OpenAI-only until API
-# plan Inc 3+), NOT by prompt length: at -c 32768 every prompt that exceeds
-# seq_cap also exceeds the serial session, so there is no oversized-but-
-# servable length (first-run lesson).  Lane oracle: the serial 'prompt
-# start' log marker.
+# LANE (updated 2026-08-11 for the v0.5.6 API arc): plain Anthropic chat
+# now rides the CONTINUOUS lane (route_decide; the old API-flavor rule
+# died with Inc 3).  What still routes /v1/messages SERIAL is NON-STREAMING
+# TOOL GENERATION -- request_compute_needs sets DS4_NEED_CORRECTIVE_RECOVERY
+# (the serial corrective-retry contract, Inc 6 adjudication) -- so the deep
+# request below carries a trivial tools array.  NOT prompt length: at
+# -c 32768 every prompt that exceeds seq_cap also exceeds the serial
+# session, so there is no oversized-but-servable length (first-run lesson).
+# Lane oracle: the serial 'prompt start' log marker.
 #
 # SIZING (measured 08-06 on .33, zero-config -c 32768 boot, MTP+DSpark
 # armed -- the fit estimate includes their scaffolding and the probe path
@@ -41,6 +44,14 @@
 #   B (control): DS4_BATCH_VMM_TRIM=0, same shape -> the old 503 +
 #      'no graph fits', ZERO reclaim lines.  Causality.
 #
+# memgov D0a-4 injection mode: INJECT=unmap:N (or release:N) arms
+# DS4_CUDA_TRIM_INJECT on leg A's boot only.  Leg A then ADDITIONALLY
+# asserts the armed line and exactly N forced-failure lines on top of the
+# unchanged serve-via-reclaim verdicts -- the reclaim path surviving a
+# partial trim (the burst is a few pages against ~1.9 GiB trimmable, far
+# inside the drift-proof threshold margins above).  Leg B stays
+# injection-free and asserts ZERO inject lines (hygiene).
+#
 # Remote-wait discipline: every detached remote command goes through
 # fire_remote() (local-background ssh + grace kill -- the bare
 # `ssh '... & exit 0'` pattern hangs the local ssh nondeterministically).
@@ -51,6 +62,8 @@ NEED_EST_MB=${NEED_EST_MB:-5900}
 RECLAIM_MARGIN_MB=${RECLAIM_MARGIN_MB:-400}
 TENANT_TOKENS=${TENANT_TOKENS:-31000}
 PROMPT_TOKENS=${PROMPT_TOKENS:-28000}
+INJECT=${INJECT:-}                 # D0a-4: unmap:N | release:N on leg A
+INJECT_N=${INJECT##*:}
 CTX=32768
 BANKS=24
 TS=$(date +%s)
@@ -129,7 +142,13 @@ start_hog() { # $1 log-for-sizing-message
     local avail hog
     avail=$(remote "awk '/MemAvailable/{print int(\$2/1024)}' /proc/meminfo")
     hog=$((avail - NEED_EST_MB + RECLAIM_MARGIN_MB))
-    [ "$hog" -gt 1000 ] || die "hog sizing degenerate (avail=$avail need_est=$NEED_EST_MB)"
+    # A churned box can arrive at hog time ALREADY near the free-after
+    # target (measured 08-11: avail=6006 after 24 saturated banks) -- the
+    # tenants themselves supply the pressure and only a minimal hot pin is
+    # needed to stop kswapd creeping MemAvailable back over the threshold
+    # (run-4 lesson).  Below 256M the envelope is genuinely unreachable
+    # (free-after would land under the drift band): die with guidance.
+    [ "$hog" -ge 256 ] || die "avail=$avail already below free-after target (need_est=$NEED_EST_MB margin=$RECLAIM_MARGIN_MB) -- reboot the box or re-bracket"
     log "MemAvailable=${avail}M -> hog=${hog}M (free-after ~= need_est - margin)"
     # The box carries 16 GiB of swap and kswapd evicts a cold slept-on hog
     # within ~1 min (MemAvailable creeps back over the threshold and the
@@ -175,11 +194,19 @@ fire_tenant() { # $1 outfile-prefix  $2 tenant-index
       -o $1$2.out > /dev/null 2>&1 < /dev/null & exit 0"
 }
 
-saturate() { # $1 outfile-prefix
+saturate() { # $1 outfile-prefix  [$2 mode: strict|terminal, default strict]
     # Waves of 8: prefill aggregation past width 8 hits the small16-tier
     # cliff (knobs-k5 law; measured here as ~350 tok/s at width 24 vs
     # ~2400 at width 8) -- 24-wide saturation runs 3x slower than three
     # 8-wide waves reaching the same final bank state.
+    #
+    # terminal mode (leg B): with trim DISABLED a churned box exhausts the
+    # comp-cache budget mid-saturation (08-11: admission refused at bank
+    # 16, the rest 503'd 'no graph fits') -- which IS the control behavior.
+    # A refused tenant is TERMINAL; strict counting waits 20 min for
+    # completions that already refused and deadlocks the leg.
+    local mode=${2:-strict} MARK='finish_reason'
+    [ "$mode" = "terminal" ] && MARK='finish_reason|"error"'
     remote "rm -f $1*.out"   # stale outs from a prior run corrupt arrival counting
     local wave_sz=8 fired=0 done_n=0
     while [ "$fired" -lt "$BANKS" ]; do
@@ -198,31 +225,42 @@ saturate() { # $1 outfile-prefix
         # 600 s deadline, whichever comes first.
         local refired=0 live
         for i in $(seq 240); do
-            done_n=$(remote "ls $1*.out 2>/dev/null | xargs -r grep -l finish_reason | wc -l")
+            done_n=$(remote "ls $1*.out 2>/dev/null | xargs -r grep -lE '$MARK' | wc -l")
             [ "$done_n" -ge "$fired" ] && break
             if [ "$refired" -eq 0 ] && [ "$i" -ge 12 ]; then
                 live=$(remote "ps -eo comm | grep -c '^curl'" || true)
                 if [ "${live:-1}" -eq 0 ] || [ "$i" -eq 120 ]; then
                     refired=1
                     for b in $(seq 1 $fired); do
-                        remote "grep -l finish_reason $1$b.out >/dev/null 2>&1" && continue
-                        log "refire tenant $b ($done_n/$fired complete, live_curls=${live:-?})"
+                        remote "grep -qE '$MARK' $1$b.out 2>/dev/null" && continue
+                        log "refire tenant $b ($done_n/$fired terminal, live_curls=${live:-?})"
                         fire_tenant "$1" "$b"
                     done
                 fi
             fi
             sleep 5
         done
-        [ "$done_n" -ge "$fired" ] || die "wave stalled: $done_n/$fired tenants completed (arrival, refires=$refired)"
+        [ "$done_n" -ge "$fired" ] || die "wave stalled: $done_n/$fired tenants terminal (mode=$mode, refires=$refired)"
         log "wave done ($done_n/$BANKS)"
     done
-    log "tenants done ($done_n/$BANKS)"
+    if [ "$mode" = "terminal" ]; then
+        local comp
+        comp=$(remote "ls $1*.out 2>/dev/null | xargs -r grep -l finish_reason | wc -l")
+        [ "$comp" -ge "$wave_sz" ] || die "terminal saturation: only $comp completions (banks would be empty; pressure not real)"
+        log "tenants terminal ($done_n/$BANKS; $comp completed)"
+    else
+        log "tenants done ($done_n/$BANKS)"
+    fi
 }
 
 anthropic_deep() { # $1 outfile -> echoes http code
+    # The tools array is the SERIAL LANE TICKET (see LANE note): buffered
+    # anthropic tool generation keeps the corrective-retry contract and
+    # routes serial; without it the cont lane admits the prompt into a
+    # bank and the serial fit (the machinery under test) never runs.
     remote "curl -s -m 600 -o $1 -w '%{http_code}' localhost:$PORT/v1/messages \
       -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' \
-      --data-binary @<(python3 -c \"import json;print(json.dumps({'model':'ds4','max_tokens':16,'messages':[{'role':'user','content':open('/tmp/reclaim_deep.txt').read()}]}))\")"
+      --data-binary @<(python3 -c \"import json;print(json.dumps({'model':'ds4','max_tokens':16,'tools':[{'name':'noop','description':'no-op probe tool','input_schema':{'type':'object','properties':{}}}],'messages':[{'role':'user','content':open('/tmp/reclaim_deep.txt').read()}]}))\")"
 }
 
 count() { remote "grep -c \"$1\" $2 || true"; }
@@ -233,8 +271,8 @@ done
 gen_prompt $PROMPT_TOKENS 999 /tmp/reclaim_deep.txt
 
 # ---- LEG A ----
-log "boot A (stock, $BANKS banks pinned)"
-boot "" /tmp/reclaim_A.log
+log "boot A (stock, $BANKS banks pinned${INJECT:+, trim-inject $INJECT})"
+boot "${INJECT:+DS4_CUDA_TRIM_INJECT=$INJECT}" /tmp/reclaim_A.log
 log "saturating $BANKS banks with ${TENANT_TOKENS}-token tenants"
 saturate /tmp/reclaim_ta
 start_hog A
@@ -253,6 +291,13 @@ log "leg A: http=$CODE prompt_start=$PSTART reclaim_lines=$RECL trim_lines=$TRIM
 [ "$CODE" = "200" ] || die "leg A: reclaim fired (trim receipt in the A log shows released MiB) but the re-poll still missed -- post-trim free must exceed the need_min threshold; raise TENANT_TOKENS (more trimmable) or NEED_EST_MB (higher free-after)"
 [ "$PSTART" -ge 1 ] || die "leg A: served without the serial success marker (unexpected lane)"
 log "A PASS (served via reclaim: prompt_start=$PSTART reclaim=$RECL trim=$TRIM)"
+if [ -n "$INJECT" ]; then
+    ARMED=$(count "trim inject: armed" /tmp/reclaim_A.log)
+    FIRED=$(count "trim inject: forced" /tmp/reclaim_A.log)
+    [ "$ARMED" = "1" ] || die "leg A: injection requested but not armed (armed=$ARMED; bad spec?)"
+    [ "$FIRED" = "$INJECT_N" ] || die "leg A: inject fired $FIRED != $INJECT_N (burst must exhaust inside the reclaim trim)"
+    log "A INJECT PASS (armed=1 fired=$FIRED/$INJECT_N; reclaim survived partial trim)"
+fi
 
 # ---- LEG C ----
 gen_prompt 200 777 /tmp/reclaim_c.txt
@@ -269,7 +314,7 @@ kill_server
 # ---- LEG B (control) ----
 log "boot B (DS4_BATCH_VMM_TRIM=0 control)"
 boot "DS4_BATCH_VMM_TRIM=0" /tmp/reclaim_B.log
-saturate /tmp/reclaim_tb
+saturate /tmp/reclaim_tb terminal
 start_hog B
 CODE=$(anthropic_deep /tmp/reclaim_bdeep.out)
 NOFIT=$(count "no graph fits" /tmp/reclaim_B.log)
@@ -278,6 +323,8 @@ log "leg B: http=$CODE nofit=$NOFIT reclaim_lines=$RECL"
 [ "$CODE" = "503" ] || die "leg B control: expected 503, got $CODE"
 [ "$NOFIT" -ge 1 ] || die "leg B control: no 'no graph fits' line"
 [ "$RECL" = "0" ] || die "leg B control: reclaim fired with trim disabled"
+INJ_B=$(count "trim inject" /tmp/reclaim_B.log)
+[ "$INJ_B" = "0" ] || die "leg B control: inject lines leaked into an injection-free boot ($INJ_B)"
 log "B PASS (control reproduces the old 503, zero reclaim lines)"
 stop_hog
 

@@ -1,5 +1,8 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#ifndef DS4_NO_GPU
+#include "ds4_gpu.h"   /* memgov D0a-4: the driver-boundary census unit */
+#endif
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -25496,6 +25499,111 @@ static void test_mem_census_trim_residue_shape(void) {
     TEST_ASSERT(DS4_MEMD__COUNT == 2);
 }
 
+/* memgov D0a-4: the exact production parse of DS4_CUDA_TRIM_INJECT. */
+static void test_mem_census_trim_inject_parse(void) {
+    int site = 0; uint32_t n = 0;
+    TEST_ASSERT(ds4_trim_inject_parse("unmap:4", &site, &n) == 1);
+    TEST_ASSERT(site == DS4_TRIM_INJECT_UNMAP && n == 4);
+    TEST_ASSERT(ds4_trim_inject_parse("release:1", &site, &n) == 1);
+    TEST_ASSERT(site == DS4_TRIM_INJECT_RELEASE && n == 1);
+    TEST_ASSERT(ds4_trim_inject_parse("unmap:4294967295", &site, &n) == 1);
+    TEST_ASSERT(n == UINT32_MAX);
+    /* Rejections leave the outputs untouched. */
+    site = -7; n = 77;
+    TEST_ASSERT(ds4_trim_inject_parse(NULL, &site, &n) == 0);
+    TEST_ASSERT(ds4_trim_inject_parse("", &site, &n) == 0);
+    TEST_ASSERT(ds4_trim_inject_parse("unmap", &site, &n) == 0);
+    TEST_ASSERT(ds4_trim_inject_parse("unmap:", &site, &n) == 0);
+    TEST_ASSERT(ds4_trim_inject_parse("unmap:0", &site, &n) == 0);  /* off = unset, not zero */
+    TEST_ASSERT(ds4_trim_inject_parse("unmap:4x", &site, &n) == 0);
+    TEST_ASSERT(ds4_trim_inject_parse("release:4294967296", &site, &n) == 0);
+    TEST_ASSERT(ds4_trim_inject_parse("free:3", &site, &n) == 0);
+    TEST_ASSERT(site == -7 && n == 77);
+}
+
+#ifndef DS4_NO_GPU
+/* memgov D0a-4: drive the D-1b trim-failure semantics at the REAL driver
+ * boundary.  Runs only where the backend supports injection (CUDA) AND
+ * demand mapping; Metal skips via the set() return, CPU builds compile it
+ * out.  Delta-based census asserts: the test binary's tensor traffic is
+ * untagged (ENGINE_OTHER) by contract and earlier suites may have left
+ * live cells.  The release-injection case deliberately orphans ONE real
+ * page handle -- a bounded, process-scoped leak that stays visible as
+ * cell slack forever after, which is exactly the property under test. */
+static void test_mem_census_trim_inject_driver(void) {
+    if (!ds4_gpu_trim_inject_set(DS4_TRIM_INJECT_OFF, 0)) {
+        printf("    (trim-inject driver test skipped: backend has no injection)\n");
+        return;
+    }
+    /* Context warmup through the funnel (balanced: alloc+free nets zero). */
+    ds4_gpu_tensor *warm = ds4_gpu_tensor_alloc(4096);
+    if (!warm) {
+        printf("    (trim-inject driver test skipped: no GPU context)\n");
+        return;
+    }
+    ds4_gpu_tensor_free(warm);
+    const uint64_t page = ds4_gpu_vmm_demand_page();
+    if (page == 0) {
+        printf("    (trim-inject driver test skipped: no VMM demand mapping)\n");
+        return;
+    }
+    ds4_mem_cell c0;
+    TEST_ASSERT(ds4_gpu_mem_census_read(DS4_MEMC_ENGINE_OTHER,
+                                        DS4_MEMD_UNIFIED_DEVICE, &c0) == 0);
+    const uint64_t faults0 = ds4_gpu_mem_census_faults();
+    const uint32_t fired0 = ds4_gpu_trim_inject_fired();
+
+    ds4_gpu_tensor *t = ds4_gpu_tensor_reserve(4 * page);
+    TEST_ASSERT(t != NULL);
+    TEST_ASSERT(ds4_gpu_tensor_ensure(t, 0, 4 * page) == 1);
+    ds4_mem_cell c1;
+    TEST_ASSERT(ds4_gpu_mem_census_read(DS4_MEMC_ENGINE_OTHER,
+                                        DS4_MEMD_UNIFIED_DEVICE, &c1) == 0);
+    TEST_ASSERT(ds4_mem_cell_live(&c1) - ds4_mem_cell_live(&c0) == 4 * page);
+
+    /* Injected unmap failure: the page stays owned, resident, and charged
+     * -- registry cell byte-identical, trim reports nothing released. */
+    TEST_ASSERT(ds4_gpu_trim_inject_set(DS4_TRIM_INJECT_UNMAP, 1) == 1);
+    TEST_ASSERT(ds4_gpu_tensor_trim(t, 0, page) == 0);
+    TEST_ASSERT(ds4_gpu_trim_inject_fired() - fired0 == 1);
+    TEST_ASSERT(ds4_gpu_tensor_resident(t, 0, 4 * page) == 4 * page);
+    ds4_mem_cell c2;
+    TEST_ASSERT(ds4_gpu_mem_census_read(DS4_MEMC_ENGINE_OTHER,
+                                        DS4_MEMD_UNIFIED_DEVICE, &c2) == 0);
+    TEST_ASSERT(memcmp(&c2, &c1, sizeof(c2)) == 0);
+
+    /* Injected release failure after a REAL unmap: the ask is freed, the
+     * commitment is not -- live unchanged, residue visible as slack,
+     * never counted as released. */
+    TEST_ASSERT(ds4_gpu_trim_inject_set(DS4_TRIM_INJECT_RELEASE, 1) == 1);
+    TEST_ASSERT(ds4_gpu_tensor_trim(t, 0, page) == 0);
+    TEST_ASSERT(ds4_gpu_trim_inject_fired() - fired0 == 2);
+    TEST_ASSERT(ds4_gpu_tensor_resident(t, 0, 4 * page) == 3 * page);
+    ds4_mem_cell c3;
+    TEST_ASSERT(ds4_gpu_mem_census_read(DS4_MEMC_ENGINE_OTHER,
+                                        DS4_MEMD_UNIFIED_DEVICE, &c3) == 0);
+    TEST_ASSERT(ds4_mem_cell_live(&c3) - ds4_mem_cell_live(&c0) == 4 * page);
+    TEST_ASSERT(ds4_mem_cell_slack(&c3) - ds4_mem_cell_slack(&c0) == page);
+
+    /* Disarmed: the surviving pages trim clean; the leak alone stays. */
+    TEST_ASSERT(ds4_gpu_trim_inject_set(DS4_TRIM_INJECT_OFF, 0) == 1);
+    TEST_ASSERT(ds4_gpu_tensor_trim(t, page, 3 * page) == 3 * page);
+    ds4_mem_cell c4;
+    TEST_ASSERT(ds4_gpu_mem_census_read(DS4_MEMC_ENGINE_OTHER,
+                                        DS4_MEMD_UNIFIED_DEVICE, &c4) == 0);
+    TEST_ASSERT(ds4_mem_cell_live(&c4) - ds4_mem_cell_live(&c0) == page);
+    TEST_ASSERT(ds4_mem_cell_slack(&c4) - ds4_mem_cell_slack(&c0) == page);
+
+    ds4_gpu_tensor_free(t);
+    ds4_mem_cell c5;
+    TEST_ASSERT(ds4_gpu_mem_census_read(DS4_MEMC_ENGINE_OTHER,
+                                        DS4_MEMD_UNIFIED_DEVICE, &c5) == 0);
+    TEST_ASSERT(ds4_mem_cell_live(&c5) - ds4_mem_cell_live(&c0) == page);
+    TEST_ASSERT(ds4_gpu_trim_inject_fired() - fired0 == 2);
+    TEST_ASSERT(ds4_gpu_mem_census_faults() == faults0);
+}
+#endif /* !DS4_NO_GPU */
+
 static void test_mem_obs_legacy_shim(void) {
     /* D0a-2: every typed state must map to the EXACT legacy
      * ds4_gpu_mem_info contract -- rc 0 + outputs only on OK, rc 1 with
@@ -25673,6 +25781,10 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_census_cell_arithmetic();
     test_mem_census_arena_slack_shape();
     test_mem_census_trim_residue_shape();
+    test_mem_census_trim_inject_parse();
+#ifndef DS4_NO_GPU
+    test_mem_census_trim_inject_driver();
+#endif
     /* memgov D0a-2: typed observation legacy shim. */
     test_mem_obs_legacy_shim();
 }

@@ -4508,6 +4508,13 @@ int ds4_gpu_mem_observe(ds4_mem_observation *out) {
     }
     return 1;
 }
+/* D0a-4: no VMM trim on Metal -- nothing to inject into.  0 = unsupported
+ * (the unit suite's skip gate). */
+int ds4_gpu_trim_inject_set(int site, uint32_t count) {
+    (void)site; (void)count;
+    return 0;
+}
+uint32_t ds4_gpu_trim_inject_fired(void) { return 0; }
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;

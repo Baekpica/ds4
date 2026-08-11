@@ -3558,6 +3558,60 @@ extern "C" uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64
     return res;
 }
 
+/* memgov D0a-4: trim failure-injection (TEST ONLY).  Forces the two driver
+ * failures the loop below must survive.  An injected unmap failure takes
+ * the exact keep-everything path a real one takes (skip the page BEFORE
+ * touching the driver).  An injected release failure skips the REAL
+ * cuMemRelease, deliberately orphaning the handle: the leak is physical,
+ * so the cell's slack claim stays reconcilable against the allocator and
+ * cudaMemGetInfo -- an injection that released anyway would make the
+ * ledger lie about reality.  Armed as a bounded burst (first N candidate
+ * driver calls fail, then the hook disarms) via DS4_CUDA_TRIM_INJECT=
+ * unmap:N|release:N, or programmatically by units through
+ * ds4_gpu_trim_inject_set, which always wins over the env.  Single-writer
+ * like the census registry: trim runs on the engine thread only. */
+static int      g_trim_inject_env_seen = 0;
+static int      g_trim_inject_site = DS4_TRIM_INJECT_OFF;
+static uint32_t g_trim_inject_left = 0;
+static uint32_t g_trim_inject_fired = 0;
+
+static void cuda_trim_inject_env_once(void) {
+    if (g_trim_inject_env_seen) return;
+    g_trim_inject_env_seen = 1;
+    const char *e = getenv("DS4_CUDA_TRIM_INJECT");
+    if (!e || !*e) return;
+    if (!ds4_trim_inject_parse(e, &g_trim_inject_site, &g_trim_inject_left)) {
+        fprintf(stderr, "ds4: trim inject: bad spec '%s' (want unmap:N|release:N) -- off\n", e);
+        return;
+    }
+    fprintf(stderr, "ds4: trim inject: armed %s x%u (TEST ONLY)\n",
+            g_trim_inject_site == DS4_TRIM_INJECT_UNMAP ? "unmap" : "release",
+            g_trim_inject_left);
+}
+
+static int cuda_trim_inject_fire(int site) {
+    if (g_trim_inject_site != site || g_trim_inject_left == 0) return 0;
+    g_trim_inject_left--;
+    g_trim_inject_fired++;
+    fprintf(stderr, "ds4: trim inject: forced %s failure (%u left)\n",
+            site == DS4_TRIM_INJECT_UNMAP ? "cuMemUnmap" : "cuMemRelease",
+            g_trim_inject_left);
+    return 1;
+}
+
+extern "C" int ds4_gpu_trim_inject_set(int site, uint32_t count) {
+    cuda_trim_inject_env_once();   /* a later env parse must not clobber this */
+    const int valid = (site == DS4_TRIM_INJECT_UNMAP ||
+                       site == DS4_TRIM_INJECT_RELEASE);
+    g_trim_inject_site = valid ? site : DS4_TRIM_INJECT_OFF;
+    g_trim_inject_left = valid ? count : 0;
+    return 1;                      /* CUDA backend: injection supported */
+}
+
+extern "C" uint32_t ds4_gpu_trim_inject_fired(void) {
+    return g_trim_inject_fired;
+}
+
 extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
     /* Unmap the demand-mapped pages lying ENTIRELY inside [offset, offset+bytes)
      * of a ds4_gpu_tensor_reserve() tensor.  Interior pages only: the caller's
@@ -3573,6 +3627,7 @@ extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t o
     if (bytes > tensor->bytes - offset) bytes = tensor->bytes - offset;
     cuda_vmm_demand *d = cuda_vmm_demand_find(tensor->ptr, offset, bytes);
     if (!d) return 0;                          /* eager allocation: nothing to trim */
+    cuda_trim_inject_env_once();
     const uint64_t rel = ((uint64_t)(uintptr_t)tensor->ptr + offset) - (uint64_t)d->va;
     const uint64_t p0  = (rel + d->page - 1u) / d->page;   /* first page fully inside */
     const uint64_t p1x = (rel + bytes) / d->page;          /* exclusive end page */
@@ -3585,11 +3640,14 @@ extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t o
          * after a successful unmap is a physical leak: accounting follows
          * the mapping (the VA no longer reads it), but the bytes were NOT
          * returned to the system, so they are not counted as released. */
+        if (cuda_trim_inject_fire(DS4_TRIM_INJECT_UNMAP))
+            continue;
         if (!driver_ok(cuMemUnmap(d->va + (CUdeviceptr)(p * d->page),
                                   (size_t)d->page),
                        "VMM trim page unmap"))
             continue;
-        const int rel_ok = driver_ok(cuMemRelease(d->pages[(size_t)p]),
+        const int rel_ok = cuda_trim_inject_fire(DS4_TRIM_INJECT_RELEASE) ? 0 :
+                           driver_ok(cuMemRelease(d->pages[(size_t)p]),
                                      "VMM trim page release");
         d->pages[(size_t)p] = 0;
         d->mapped -= d->page;
