@@ -17533,11 +17533,18 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         max_completion);
 }
 
+static int server_model_context_window(const server *s) {
+    /* Serial right-sizing is an internal allocation detail.  Model clients
+     * need the configured serving limit so their own admission policy does
+     * not shrink after an unrelated request resized the serial graph. */
+    return s->serial_boot_ctx;
+}
+
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
-                             ds4_session_ctx(s->session),
+                             server_model_context_window(s),
                              s->default_tokens);
 }
 
@@ -17632,12 +17639,12 @@ static void server_load_codex_models(server *s) {
     const char *cw = strstr(arr, "\"context_window\"");
     const char *cwv = cw ? strchr(cw, ':') : NULL;
     const long file_ctx = cwv ? strtol(cwv + 1, NULL, 10) : 0;
-    const int live_ctx = ds4_session_ctx(s->session);
-    if (file_ctx > 0 && file_ctx != live_ctx)
+    const int boot_ctx = server_model_context_window(s);
+    if (file_ctx > 0 && file_ctx != boot_ctx)
         server_log(DS4_LOG_WARNING,
                    "ds4-server: codex models file declares context_window=%ld but "
                    "this boot is -c %d -- edit %s to match",
-                   file_ctx, live_ctx, path);
+                   file_ctx, boot_ctx, path);
     s->codex_models_json = arr;
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: codex models catalog spliced into /v1/models "
@@ -23877,6 +23884,19 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_model_metadata_keeps_configured_context_after_session_rightsize(void) {
+    server s = {.serial_boot_ctx = 262144};
+    const int advertised_ctx = server_model_context_window(&s);
+    TEST_ASSERT(advertised_ctx == 262144);
+
+    buf b = {0};
+    append_model_json_values(&b, "solar-open2-250b", "Solar Open2 250B",
+                             advertised_ctx, 1024);
+    TEST_ASSERT(strstr(b.ptr, "\"context_length\":262144") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":1024") != NULL);
+    buf_free(&b);
+}
+
 static void test_server_model_ids_cover_loaded_variants(void) {
     TEST_ASSERT(!strcmp(server_model_id_from_variant(0), "deepseek-v4-flash"));
     TEST_ASSERT(!strcmp(server_model_id_from_variant(1), "deepseek-v4-pro"));
@@ -28069,6 +28089,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
     test_server_model_ids_cover_loaded_variants();
+    test_model_metadata_keeps_configured_context_after_session_rightsize();
     test_partial_warm_policy_requires_runtime_support();
     test_rewind_only_record_cannot_supersede_exact_record();
     test_anthropic_live_stream_sends_incremental_blocks();
