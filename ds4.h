@@ -335,6 +335,10 @@ int  ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx);
  * ctx size; legacy one-shot admission (=0) keeps the historical raw-ring bound.
  * Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx);
+/* Whether this persistent context can rewind a retained bank to an earlier
+ * committed prefix for partial fork/truncate reuse.  Exact-frontier warm and
+ * fork reuse are separate capabilities.  Returns false for NULL. */
+bool ds4_batch_ctx_supports_partial_reuse(const ds4_batch_ctx *ctx);
 /* Batched generation over a persistent context (W4); same semantics as
  * ds4_engine_batched_generate_ex but reuses ctx's graph + slabs.  n <= ctx max_seq,
  * Σ(prompt len) <= ctx max_total_tokens. Returns 0 on success. */

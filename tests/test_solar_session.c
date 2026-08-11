@@ -78,6 +78,11 @@ struct solar_cont_test {
     int first_place_bank;
     int next_admit;
     int allow_second;
+    int alive_calls;
+    int alive_fail_after;
+    int abort_first_token;
+    int on_token_calls;
+    int sample_override;
     int failed;
     int done;
     int bank_used[2];
@@ -88,6 +93,18 @@ struct solar_cont_test {
     int n_tokens[2];
     int finish[2];
 };
+
+static int solar_cont_sample_override(void *ud, void *user) {
+    (void)ud;
+    solar_cont_user *u = user;
+    return u->test->sample_override;
+}
+
+static int solar_cont_alive(void *ud, void *user) {
+    (void)user;
+    solar_cont_test *test = ud;
+    return test->alive_calls++ < test->alive_fail_after;
+}
 
 static int solar_cont_on_admitted(void *ud, void *user, int n_cached,
                                   int n_computed, int bank) {
@@ -112,6 +129,9 @@ static int solar_cont_admit(void *ud, ds4_cont_request *req) {
     req->user = &test->user[i];
     req->on_admitted = solar_cont_on_admitted;
     req->bank_used = &test->bank_used[i];
+    if (test->alive_fail_after > 0) req->alive = solar_cont_alive;
+    if (test->sample_override != DS4_SAMPLE_OVERRIDE_NONE)
+        req->sample_override = solar_cont_sample_override;
     if (i == 0) {
         req->place_bank = test->first_place_bank;
         req->n_cached = test->first_cached;
@@ -123,7 +143,9 @@ static int solar_cont_on_token(void *ud, void *user, int token) {
     (void)token;
     solar_cont_test *test = ud;
     solar_cont_user *u = user;
+    test->on_token_calls++;
     if (u->id == 0) test->allow_second = 1;
+    if (u->id == 0 && test->abort_first_token) return 0;
     return 1;
 }
 
@@ -165,6 +187,8 @@ int main(int argc, char **argv) {
     ds4_tokens prompt = {0};
     ds4_tokens prompt_alt = {0};
     ds4_tokens prompt_restored = {0};
+    ds4_tokens prompt_interrupted = {0};
+    ds4_tokens prompt_retained = {0};
     float *initial = NULL;
     float *decoded = NULL;
     float *warm = NULL;
@@ -490,6 +514,13 @@ int main(int argc, char **argv) {
         failed = 1;
         goto cleanup;
     }
+    if (ds4_batch_ctx_supports_partial_reuse(batch_ctx)) {
+        fprintf(stderr,
+                "Solar batch context incorrectly advertises partial reuse\n");
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
     ds4_tokens batch_prompts[2] = { prompt, prompt_alt };
     ds4_batch_gen_result batch_results[2] = {0};
     const int one_token[2] = {1, 1};
@@ -657,6 +688,218 @@ int main(int argc, char **argv) {
             "Solar bank persistence: bytes=%llu cached=6 computed=1 next=%d\n",
             (unsigned long long)bank_bytes, primary_batch_oracle.tokens[3]);
 
+    /* A warm suffix longer than one prefill chunk advances KDA/GQA state and
+     * history before frontier logits exist.  If the client leaves between
+     * chunks, an exact zero-suffix retry must not sample the older frontier's
+     * logits: it safely cold-replays the retained prefix instead. */
+    for (int i = 0; i < prompt.len; i++)
+        ds4_tokens_push(&prompt_interrupted, prompt.v[i]);
+    /* Two appended tokens reproduce bank0's committed 4->6 frontier; the
+     * remaining 17 form the warm suffix under test (total request len 23). */
+    for (int i = 0; i < 19; i++)
+        ds4_tokens_push(&prompt_interrupted,
+                        primary_batch_oracle.tokens[i % 6]);
+    for (int i = 0; i < 22; i++)
+        ds4_tokens_push(&prompt_retained, prompt_interrupted.v[i]);
+
+    /* Derive the oracle through another bank of this same persistent context
+     * so both cold paths use the same 16-token prefill chunk shape. */
+    solar_cont_test retained_cold_oracle = {0};
+    retained_cold_oracle.prompt[0] = &prompt_retained;
+    retained_cold_oracle.n_requests = 1;
+    retained_cold_oracle.first_cached = 0;
+    retained_cold_oracle.first_max_new = 1;
+    retained_cold_oracle.first_place_bank = 3;
+    retained_cold_oracle.user[0].test = &retained_cold_oracle;
+    retained_cold_oracle.user[0].id = 0;
+    retained_cold_oracle.bank_used[0] = -1;
+    retained_cold_oracle.admitted_cached[0] = -1;
+    retained_cold_oracle.admitted_computed[0] = -1;
+    retained_cold_oracle.admitted_bank[0] = -1;
+    err[0] = '\0';
+    if (ds4_engine_continuous_generate(
+            batch_ctx, solar_cont_admit, solar_cont_on_token,
+            solar_cont_on_done, &retained_cold_oracle,
+            err, sizeof(err)) != 0 ||
+        retained_cold_oracle.failed || retained_cold_oracle.done != 1 ||
+        retained_cold_oracle.n_tokens[0] != 1 ||
+        retained_cold_oracle.admitted_cached[0] != 0 ||
+        retained_cold_oracle.admitted_computed[0] != 22 ||
+        retained_cold_oracle.admitted_bank[0] != 2) {
+        fprintf(stderr,
+                "Solar retained-prefix cold oracle failed: %s "
+                "done=%d split=%d+%d bank=%d\n",
+                err, retained_cold_oracle.done,
+                retained_cold_oracle.admitted_cached[0],
+                retained_cold_oracle.admitted_computed[0],
+                retained_cold_oracle.admitted_bank[0]);
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+
+    solar_cont_test interrupted = {0};
+    interrupted.prompt[0] = &prompt_interrupted;
+    interrupted.n_requests = 1;
+    interrupted.first_cached = 6;
+    interrupted.first_max_new = 1;
+    interrupted.first_place_bank = 1;
+    interrupted.alive_fail_after = 1; /* run one 16-token chunk, then cancel */
+    interrupted.user[0].test = &interrupted;
+    interrupted.user[0].id = 0;
+    interrupted.bank_used[0] = -1;
+    interrupted.admitted_cached[0] = -1;
+    interrupted.admitted_computed[0] = -1;
+    interrupted.admitted_bank[0] = -1;
+    err[0] = '\0';
+    if (ds4_engine_continuous_generate(
+            batch_ctx, solar_cont_admit, solar_cont_on_token,
+            solar_cont_on_done, &interrupted, err, sizeof(err)) != 0 ||
+        interrupted.failed || interrupted.done != 1 ||
+        interrupted.n_tokens[0] != 0 ||
+        interrupted.alive_calls != 2 ||
+        interrupted.admitted_cached[0] != 6 ||
+        interrupted.admitted_computed[0] != 17 ||
+        interrupted.admitted_bank[0] != 0 ||
+        ds4_batch_ctx_bank_committed(batch_ctx, 0, NULL) != 22) {
+        fprintf(stderr,
+                "Solar interrupted warm prefill failed: %s done=%d n=%d "
+                "split=%d+%d bank=%d alive=%d committed=%d\n",
+                err, interrupted.done, interrupted.n_tokens[0],
+                interrupted.admitted_cached[0],
+                interrupted.admitted_computed[0],
+                interrupted.admitted_bank[0],
+                interrupted.alive_calls,
+                ds4_batch_ctx_bank_committed(batch_ctx, 0, NULL));
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+
+    solar_cont_test retained_retry = {0};
+    retained_retry.prompt[0] = &prompt_retained;
+    retained_retry.n_requests = 1;
+    retained_retry.first_cached = 22;
+    retained_retry.first_max_new = 1;
+    retained_retry.first_place_bank = 1;
+    retained_retry.user[0].test = &retained_retry;
+    retained_retry.user[0].id = 0;
+    retained_retry.bank_used[0] = -1;
+    retained_retry.admitted_cached[0] = -1;
+    retained_retry.admitted_computed[0] = -1;
+    retained_retry.admitted_bank[0] = -1;
+    err[0] = '\0';
+    if (ds4_engine_continuous_generate(
+            batch_ctx, solar_cont_admit, solar_cont_on_token,
+            solar_cont_on_done, &retained_retry, err, sizeof(err)) != 0 ||
+        retained_retry.failed || retained_retry.done != 1 ||
+        retained_retry.n_tokens[0] != 1 ||
+        retained_retry.tokens[0][0] != retained_cold_oracle.tokens[0][0] ||
+        retained_retry.admitted_cached[0] != 0 ||
+        retained_retry.admitted_computed[0] != 22 ||
+        retained_retry.admitted_bank[0] != 0) {
+        fprintf(stderr,
+                "Solar interrupted-prefix cold replay failed: %s "
+                "done=%d token=%d/%d split=%d+%d bank=%d\n",
+                err, retained_retry.done, retained_retry.tokens[0][0],
+                retained_cold_oracle.tokens[0][0],
+                retained_retry.admitted_cached[0],
+                retained_retry.admitted_computed[0],
+                retained_retry.admitted_bank[0]);
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "Solar interrupted prefill: retained=22 retry=cold token=%d\n",
+            retained_cold_oracle.tokens[0][0]);
+
+    /* Aborting from the first sampled-token callback is different: that
+     * token has not been forwarded into KDA/GQA state or bank history yet,
+     * and the final-prompt logits are current.  The identical retry must keep
+     * the exact-frontier fast path and sample the same first token. */
+    solar_cont_test first_token_abort = {0};
+    int forced_abort_token = retained_cold_oracle.tokens[0][0];
+    if (forced_abort_token == solar_eos)
+        forced_abort_token = (solar_eos + 1) % ds4_engine_vocab_size(engine);
+    first_token_abort.prompt[0] = &prompt_retained;
+    first_token_abort.n_requests = 1;
+    first_token_abort.first_cached = 22;
+    first_token_abort.first_max_new = 2;
+    first_token_abort.first_place_bank = 1;
+    first_token_abort.abort_first_token = 1;
+    first_token_abort.sample_override =
+        DS4_SAMPLE_OVERRIDE_TOKEN(forced_abort_token);
+    first_token_abort.user[0].test = &first_token_abort;
+    first_token_abort.user[0].id = 0;
+    first_token_abort.bank_used[0] = -1;
+    first_token_abort.admitted_cached[0] = -1;
+    first_token_abort.admitted_computed[0] = -1;
+    first_token_abort.admitted_bank[0] = -1;
+    err[0] = '\0';
+    if (ds4_engine_continuous_generate(
+            batch_ctx, solar_cont_admit, solar_cont_on_token,
+            solar_cont_on_done, &first_token_abort, err, sizeof(err)) != 0 ||
+        first_token_abort.failed || first_token_abort.done != 1 ||
+        first_token_abort.on_token_calls != 1 ||
+        first_token_abort.n_tokens[0] != 1 ||
+        first_token_abort.tokens[0][0] != forced_abort_token ||
+        first_token_abort.admitted_cached[0] != 22 ||
+        first_token_abort.admitted_computed[0] != 0 ||
+        ds4_batch_ctx_bank_committed(batch_ctx, 0, NULL) != 22) {
+        fprintf(stderr,
+                "Solar first-token abort frontier failed: %s done=%d "
+                "token=%d/%d calls=%d split=%d+%d committed=%d\n",
+                err, first_token_abort.done,
+                first_token_abort.tokens[0][0],
+                forced_abort_token, first_token_abort.on_token_calls,
+                first_token_abort.admitted_cached[0],
+                first_token_abort.admitted_computed[0],
+                ds4_batch_ctx_bank_committed(batch_ctx, 0, NULL));
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+
+    solar_cont_test first_token_retry = {0};
+    first_token_retry.prompt[0] = &prompt_retained;
+    first_token_retry.n_requests = 1;
+    first_token_retry.first_cached = 22;
+    first_token_retry.first_max_new = 1;
+    first_token_retry.first_place_bank = 1;
+    first_token_retry.sample_override =
+        DS4_SAMPLE_OVERRIDE_TOKEN(forced_abort_token);
+    first_token_retry.user[0].test = &first_token_retry;
+    first_token_retry.user[0].id = 0;
+    first_token_retry.bank_used[0] = -1;
+    first_token_retry.admitted_cached[0] = -1;
+    first_token_retry.admitted_computed[0] = -1;
+    first_token_retry.admitted_bank[0] = -1;
+    err[0] = '\0';
+    if (ds4_engine_continuous_generate(
+            batch_ctx, solar_cont_admit, solar_cont_on_token,
+            solar_cont_on_done, &first_token_retry, err, sizeof(err)) != 0 ||
+        first_token_retry.failed || first_token_retry.done != 1 ||
+        first_token_retry.n_tokens[0] != 1 ||
+        first_token_retry.tokens[0][0] != forced_abort_token ||
+        first_token_retry.admitted_cached[0] != 22 ||
+        first_token_retry.admitted_computed[0] != 0) {
+        fprintf(stderr,
+                "Solar first-token retry warm reuse failed: %s done=%d "
+                "token=%d/%d split=%d+%d\n",
+                err, first_token_retry.done,
+                first_token_retry.tokens[0][0],
+                forced_abort_token,
+                first_token_retry.admitted_cached[0],
+                first_token_retry.admitted_computed[0]);
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "Solar first-token abort: retained=22 retry=cached token=%d\n",
+            forced_abort_token);
+
     /* Ramp through 2/3/4-row decode passes.  Chunked admission staggers the
      * four identical banks by one step; every final sequence must still be
      * identical to the independent one-bank batch trajectory. */
@@ -753,6 +996,8 @@ cleanup:
     free(initial);
     ds4_session_free(session);
     ds4_tokens_free(&prompt_restored);
+    ds4_tokens_free(&prompt_retained);
+    ds4_tokens_free(&prompt_interrupted);
     ds4_tokens_free(&prompt_alt);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);

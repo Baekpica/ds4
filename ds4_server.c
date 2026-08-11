@@ -1091,6 +1091,12 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "solar-open2-250b"));
 }
 
+/* A server knob may request partial warm reuse, but the model runtime is the
+ * authority on whether a retained bank can be rewound to an earlier prefix. */
+static bool server_partial_warm_policy(bool requested, bool supported) {
+    return requested && supported;
+}
+
 static void stop_list_clear(stop_list *stops) {
     for (int i = 0; i < stops->len; i++) free(stops->v[i]);
     stops->len = 0;
@@ -19209,9 +19215,19 @@ int main(int argc, char **argv) {
                         /* P1 partial forks (mid-prompt divergence reuse).
                          * DS4_SERVER_FORK_PARTIAL=0 = full-prefix matching
                          * only (the pre-P1 behavior); _MIN = minimum shared
-                         * canonical tokens worth a fork (default 128). */
+                         * canonical tokens worth a fork (default 192).
+                         * The ctx capability is authoritative: recurrent
+                         * runtimes such as Solar cannot rewind an arbitrary
+                         * KDA frontier and must keep exact warm/fork only. */
                         const char *pe = getenv("DS4_SERVER_FORK_PARTIAL");
-                        s.warm_fork_partial = !(pe && pe[0] == '0' && pe[1] == '\0');
+                        const bool partial_requested =
+                            !(pe && pe[0] == '0' && pe[1] == '\0');
+                        s.warm_fork_partial = server_partial_warm_policy(
+                            partial_requested,
+                            ds4_batch_ctx_supports_partial_reuse(s.batch_ctx));
+                        if (partial_requested && !s.warm_fork_partial)
+                            server_log(DS4_LOG_DEFAULT,
+                                       "ds4-server: partial bank reuse disabled by model runtime");
                         const char *pm = getenv("DS4_SERVER_FORK_PARTIAL_MIN");
                         s.warm_partial_min = (pm && pm[0]) ? atoi(pm) : 192;
                         /* v0.2 ws4: deep-record pin threshold for cold-admit
@@ -19227,7 +19243,8 @@ int main(int argc, char **argv) {
                         /* v0.5.1 inc3 kill switches (A/B): disk-tier partial
                          * restore + pin-tier bank checkpointing. */
                         const char *dp = getenv("DS4_SERVER_DISK_PARTIAL");
-                        s.warm_disk_partial = !(dp && dp[0] == '0' && dp[1] == '\0');
+                        s.warm_disk_partial = s.warm_fork_partial &&
+                            !(dp && dp[0] == '0' && dp[1] == '\0');
                         const char *bc = getenv("DS4_SERVER_BANK_CHECKPOINT");
                         s.warm_checkpoint = !(bc && bc[0] == '0' && bc[1] == '\0');
                     }
@@ -23367,6 +23384,13 @@ static void test_server_model_ids_cover_loaded_variants(void) {
     TEST_ASSERT(server_model_alias_known("solar-open2-250b"));
 }
 
+static void test_partial_warm_policy_requires_runtime_support(void) {
+    TEST_ASSERT(server_partial_warm_policy(true, true));
+    TEST_ASSERT(!server_partial_warm_policy(true, false));
+    TEST_ASSERT(!server_partial_warm_policy(false, true));
+    TEST_ASSERT(!server_partial_warm_policy(false, false));
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -27401,6 +27425,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
     test_server_model_ids_cover_loaded_variants();
+    test_partial_warm_policy_requires_runtime_support();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();

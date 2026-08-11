@@ -36362,6 +36362,7 @@ static ds4_solar_batch_runtime *solar_batch_runtime_create(
 struct ds4_batch_ctx {
     ds4_engine     *e;
     ds4_solar_batch_runtime *solar; /* non-NULL selects the Solar dispatch */
+    bool            supports_partial_reuse; /* explicit runtime capability */
     ds4_gpu_graph   g;
     ds4_batch_slabs sl;            /* allocated for max_seq banks */
     ds4_mtp_slabs   msl;           /* S1: per-bank MTP draft banks (only if mtp) */
@@ -37966,6 +37967,9 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         return 1;
     }
     ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
+    /* This is a positive declaration, not a non-Solar inference: future
+     * runtimes remain safely disabled until they implement prefix rewind. */
+    ctx->supports_partial_reuse = true;
     *out = ctx;
     return 0;
 #undef BC_ERR
@@ -38439,6 +38443,10 @@ int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) {
  * returns raw_cap, the historical bound. */
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) {
     return ctx ? (int)ctx->seq_cap : 0;
+}
+
+bool ds4_batch_ctx_supports_partial_reuse(const ds4_batch_ctx *ctx) {
+    return ctx && ctx->supports_partial_reuse;
 }
 
 static int solar_engine_batched_generate_ctx(
@@ -39489,6 +39497,7 @@ static int solar_engine_continuous_generate(
              * records without them safely degrade to a cold replay. */
             if (cached == (uint32_t)req.n &&
                 !rt->bank_logits_valid[b]) {
+                if (warm) ctx->warm_rejects++;
                 cached = 0u;
                 warm = false;
                 if (forked) ctx->fork_rejects++;
@@ -39583,6 +39592,11 @@ static int solar_engine_continuous_generate(
                         n = rt->graph.base.prefill_cap;
                     const uint32_t pos = sb->prefill_base + sb->prefill_off;
                     const bool final = n == remain;
+                    /* Any successful chunk advances the recurrent/KV
+                     * frontier.  Until the final chunk publishes matching
+                     * logits, the previous frontier's host logits must not
+                     * authorize a zero-suffix warm sample after cancellation. */
+                    rt->bank_logits_valid[pb] = 0u;
                     if (!solar_batch_runtime_ensure_kv(rt, pb, pos + n) ||
                         !solar_batch_runtime_bind(rt, pb) ||
                         !solar_graph_prefill_chunk(
@@ -42316,6 +42330,10 @@ static int ds4_warm_gate_dump(ds4_batch_ctx *ctx, uint32_t nbanks, float **vals,
 int ds4_cont_warm_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
 #define WGATE_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
     if (!ctx || !ctx->e) { WGATE_ERR("cont_warm_gate: null ctx"); return 2; }
+    if (!ds4_batch_ctx_supports_partial_reuse(ctx)) {
+        WGATE_ERR("cont_warm_gate: runtime has no partial-reuse capability");
+        return 2;
+    }
     if (ctx->max_seq < 2u) { WGATE_ERR("cont_warm_gate: needs max_seq >= 2"); return 2; }
     ds4_engine *e = ctx->e;
     const char *te = getenv("DS4_CONT_WARM_GATE_T");
@@ -42863,6 +42881,10 @@ int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) { (void)ctx; (void)bank; return 0u; }
 int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+bool ds4_batch_ctx_supports_partial_reuse(const ds4_batch_ctx *ctx) {
+    (void)ctx;
+    return false;
+}
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {
