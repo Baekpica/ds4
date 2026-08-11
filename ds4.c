@@ -1211,6 +1211,10 @@ typedef struct {
 
     ds4_kv *kv;
     ds4_tensor *tensors;
+    /* memgov D1a-2: per-tensor semantic traits (ds4_model_catalog.h),
+     * classified once at model_open from the exact-name binding
+     * knowledge.  Consumers index it in tensor order. */
+    uint8_t *tensor_traits;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -1408,6 +1412,7 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    free(m->tensor_traits);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -1660,6 +1665,19 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 
+    /* memgov D1a-2: build the semantic catalog while the tensor table is
+     * hot.  Pure per-tensor classification (suffix + type + dims mirrors
+     * of the binder names and repack candidacy) — cheap enough to run for
+     * every open, including inspect-only tools. */
+    if (m->n_tensors != 0) {
+        m->tensor_traits = xmalloc((size_t)m->n_tensors);
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            const ds4_tensor *t = &m->tensors[i];
+            m->tensor_traits[i] = (uint8_t)ds4_tensor_catalog_classify(
+                t->name.ptr, t->name.len, t->ndim, t->type, t->dim, t->bytes);
+        }
+    }
+
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
 
@@ -1817,9 +1835,23 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             free(spans);
             return false;
         }
-        /* Routed-expert weights are the only tensors with "_exps." in the
-         * name; memmem is safe on short names (returns NULL). */
-        if (memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
+        /* memgov D1a-2: the CATALOG drives the routed-expert skip; the old
+         * memmem("_exps.") predicate stays compiled as a cross-check
+         * tripwire for ONE stage (scoping sec 5: retired by cross-checked
+         * replacement).  A mismatch is a classification bug: it prints the
+         * tensor and counts a census fault, which every standing gate
+         * asserts zero. */
+        const int routed = m->tensor_traits != NULL &&
+            (m->tensor_traits[i] & DS4_TCAT_ROUTED_EXPERT) != 0;
+        const int legacy_exps =
+            memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL;
+        if (routed != legacy_exps) {
+            fprintf(stderr,
+                    "ds4: CATALOG-TRIPWIRE routed=%d legacy=%d tensor %.*s\n",
+                    routed, legacy_exps, (int)t->name.len, t->name.ptr);
+            ds4_gpu_mem_census_fault_note();
+        }
+        if (routed) {
             continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
@@ -38999,6 +39031,31 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                             DS4_MSRC_ROLE_DRAFTER,
                                             e->dspark_model.fd,
                                             "drafter", dspark_prov);
+        }
+        /* memgov D1a-2: one semantic-catalog line per source — the D1a
+         * gate's positive engagement signal (the tripwire at the pre-cache
+         * site is its negative twin). */
+        {
+            const struct { const char *nm; const ds4_model *mm; int on; } cats[] = {
+                {"base", &e->model, 1},
+                {"mtp", &e->mtp_model, e->mtp_ready},
+                {"drafter", &e->dspark_model, e->dspark_ready},
+            };
+            for (size_t ci = 0; ci < sizeof(cats) / sizeof(cats[0]); ci++) {
+                ds4_model_catalog_counts cc;
+                if (!cats[ci].on) continue;
+                ds4_model_catalog_count(cats[ci].mm->tensor_traits,
+                                        cats[ci].mm->n_tensors, &cc);
+                fprintf(stderr,
+                        "ds4: model catalog %s: %llu tensors, %llu routed-expert, "
+                        "%llu artifact-replaced, %llu artifact-additive, %llu optional\n",
+                        cats[ci].nm,
+                        (unsigned long long)cc.tensors,
+                        (unsigned long long)cc.routed,
+                        (unsigned long long)cc.replaced,
+                        (unsigned long long)cc.additive,
+                        (unsigned long long)cc.optional);
+            }
         }
 #ifndef __APPLE__
         /* Self-load aligned artifacts: with no weight-server manifest, build

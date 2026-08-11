@@ -320,6 +320,12 @@ extern "C" uint64_t ds4_gpu_mem_census_faults(void) {
     return g_mem_census_faults;
 }
 
+/* memgov D1a-2: engine-side integrity fault (catalog tripwire).  Bare
+ * monotonic bump like the scope-tag faults -- no epoch bracket needed. */
+extern "C" void ds4_gpu_mem_census_fault_note(void) {
+    g_mem_census_faults++;
+}
+
 /* D0b-2: reader half of the registry seqlock (writer half brackets the
  * note wrappers above).  Exposed as begin/verify so the server's
  * snapshot loop drives the protocol without touching the epoch word. */

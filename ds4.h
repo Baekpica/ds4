@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "ds4_mem_census.h"
+#include "ds4_model_catalog.h"
 #include "ds4_mem_gov.h"     /* memgov D0b: shadow governor core (leaf) */
 
 /* Public engine boundary.
@@ -525,6 +526,11 @@ int  ds4_gpu_model_source_info(int idx, ds4_model_source *out);
 int  ds4_gpu_mem_src_census_read(int src_idx, int consumer_class, int domain,
                                  ds4_mem_cell *out);
 void ds4_gpu_report_model_sources(void);
+/* memgov D1a-2: engine-side census-integrity fault (the catalog-vs-
+ * heuristic tripwire feeds the SAME faults counter every standing gate
+ * asserts zero).  Monotonic bump, no epoch bracket (the scope-tag
+ * precedent); Metal stub is a no-op (no census there). */
+void ds4_gpu_mem_census_fault_note(void);
 /* memgov D0b-3: the SHADOW governor.  One process-global lease ledger
  * (ds4_mem_gov.h types) written under the same single-writer discipline
  * as the census and read through the same seqlock protocol.  Publishes

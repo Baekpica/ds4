@@ -26581,6 +26581,77 @@ static void test_mem_src_table_bind_find(void) {
     TEST_ASSERT(strcmp(ds4_model_source_role_name(99), "unknown") == 0);
 }
 
+/* memgov D1a-2: the semantic tensor classifier (ds4_model_catalog.h) --
+ * the exact suffix/type/dims rules the engine builds every model's
+ * catalog with, pinned against the binder names and the repack
+ * candidacy mirrors. */
+static uint32_t test_tcat(const char *name, uint32_t ndim, uint32_t type,
+                          uint64_t d0, uint64_t d1, uint64_t d2,
+                          uint64_t bytes) {
+    const uint64_t dims[4] = {d0, d1, d2, 1};
+    return ds4_tensor_catalog_classify(name, strlen(name), ndim, type,
+                                       dims, bytes);
+}
+
+static void test_model_catalog_classify(void) {
+    /* Routed 3-D expert stacks; artifact-replaced when the repack rules
+     * hold (IQ2_XXS gate/up, Q2_K down). */
+    TEST_ASSERT(test_tcat("blk.7.ffn_gate_exps.weight", 3, 16, 2048, 1024, 256, 66 * 1000) ==
+                (DS4_TCAT_ROUTED_EXPERT | DS4_TCAT_ARTIFACT_REPLACED));
+    TEST_ASSERT(test_tcat("mtp.0.ffn_down_exps.weight", 3, 10, 2560, 2048, 256, 84 * 500) ==
+                (DS4_TCAT_ROUTED_EXPERT | DS4_TCAT_ARTIFACT_REPLACED));
+    /* Routed but NOT replaced: bad alignment / wrong type / wrong stack. */
+    TEST_ASSERT(test_tcat("dspark.1.ffn_up_exps.weight", 3, 16, 1000, 1024, 64, 66 * 10) ==
+                DS4_TCAT_ROUTED_EXPERT);
+    TEST_ASSERT(test_tcat("blk.7.ffn_down_exps.weight", 3, 16, 2048, 1024, 256, 66 * 1000) ==
+                DS4_TCAT_ROUTED_EXPERT);   /* IQ2 down is not a candidate */
+    TEST_ASSERT(test_tcat("blk.7.ffn_gate_exps.weight", 2, 16, 2048, 1024, 0, 66 * 1000) == 0);
+    /* Shared experts are NOT routed; a big aligned Q8_0 one is an
+     * aligned-dense additive candidate exactly like the repack rule. */
+    TEST_ASSERT(test_tcat("blk.3.ffn_gate_shexp.weight", 2, 8, 4096, 2048, 0, 34u * 100000u) ==
+                DS4_TCAT_ARTIFACT_ADDITIVE);
+    /* token_embd is excluded from the aligned-dense tier. */
+    TEST_ASSERT(test_tcat("token_embd.weight", 2, 8, 4096, 129280, 0, 34u * 100000u) == 0);
+    /* attn_output_a rides the f16 prebuild tier even under the 2 MiB
+     * dense floor. */
+    TEST_ASSERT(test_tcat("blk.2.attn_output_a.weight", 2, 8, 4096, 512, 0, 34u * 30000u) ==
+                DS4_TCAT_ARTIFACT_ADDITIVE);
+    /* Optional bind (exp_probs bias). */
+    TEST_ASSERT(test_tcat("blk.9.exp_probs_b.bias", 1, 0, 256, 0, 0, 1024) ==
+                DS4_TCAT_OPTIONAL);
+
+    /* TRIPWIRE RELATION PIN: over the real name shapes, the catalog's
+     * ROUTED bit must equal the legacy memmem("_exps.") predicate -- the
+     * exact cross-check the pre-cache site runs for this one stage. */
+    static const struct { const char *nm; uint32_t nd; } corpus[] = {
+        {"blk.0.ffn_gate_exps.weight", 3}, {"blk.0.ffn_up_exps.weight", 3},
+        {"blk.0.ffn_down_exps.weight", 3}, {"mtp.0.ffn_gate_exps.weight", 3},
+        {"dspark.2.ffn_down_exps.weight", 3},
+        {"blk.0.ffn_gate_shexp.weight", 2}, {"blk.0.ffn_up_shexp.weight", 2},
+        {"blk.0.ffn_down_shexp.weight", 2}, {"blk.0.exp_probs_b.bias", 1},
+        {"blk.0.attn_kv.weight", 2}, {"blk.0.indexer.proj.weight", 2},
+        {"token_embd.weight", 2}, {"output.weight", 2},
+    };
+    for (size_t i = 0; i < sizeof(corpus) / sizeof(corpus[0]); i++) {
+        const uint32_t tr = test_tcat(corpus[i].nm, corpus[i].nd, 16, 2048, 1024, 256, 66);
+        const int legacy = ds4_tcat_contains(corpus[i].nm, strlen(corpus[i].nm), "_exps.");
+        TEST_ASSERT(((tr & DS4_TCAT_ROUTED_EXPERT) != 0) == (legacy != 0));
+    }
+
+    /* Counts render helper. */
+    {
+        const uint8_t traits[] = {0, DS4_TCAT_ROUTED_EXPERT,
+                                  DS4_TCAT_ROUTED_EXPERT | DS4_TCAT_ARTIFACT_REPLACED,
+                                  DS4_TCAT_ARTIFACT_ADDITIVE, DS4_TCAT_OPTIONAL};
+        ds4_model_catalog_counts cc;
+        ds4_model_catalog_count(traits, 5, &cc);
+        TEST_ASSERT(cc.tensors == 5 && cc.routed == 2 && cc.replaced == 1 &&
+                    cc.additive == 1 && cc.optional == 1);
+        ds4_model_catalog_count(NULL, 3, &cc);
+        TEST_ASSERT(cc.tensors == 3 && cc.routed == 0);
+    }
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -26758,6 +26829,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_gov_publication_shape();
     /* memgov D1a-1: model-source table resolution. */
     test_mem_src_table_bind_find();
+    /* memgov D1a-2: semantic tensor classifier + tripwire relation. */
+    test_model_catalog_classify();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

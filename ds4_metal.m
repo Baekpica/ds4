@@ -4498,6 +4498,7 @@ int ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out) {
     return 1;
 }
 uint64_t ds4_gpu_mem_census_faults(void) { return 0; }
+void ds4_gpu_mem_census_fault_note(void) {}
 /* D0b-2: no registry, no writers -- a permanently even, never-changing
  * epoch, so any reader copy trivially verifies. */
 uint64_t ds4_gpu_mem_census_epoch_begin(void) { return 0; }

@@ -79,6 +79,10 @@ R "grep -q 'ds4: model-source ledger reconciled:' $BOOTLOG" \
     || die "no ledger reconcile line"
 R "grep -q 'source ledger mismatch' $BOOTLOG" && die "ledger mismatch at boot"
 R "grep -q 'model source UNATTRIBUTED' $BOOTLOG" && die "unattributed weight bytes at boot"
+# D1a-2: catalog engagement (positive lines per source, zero tripwires).
+R "grep -q 'ds4: model catalog base:' $BOOTLOG" || die "no base catalog line"
+R "grep -q 'ds4: model catalog drafter:' $BOOTLOG" || die "no drafter catalog line"
+R "grep -q 'CATALOG-TRIPWIRE' $BOOTLOG" && die "catalog-vs-heuristic tripwire fired"
 CF0=$(met ds4_memory_census_faults_total)
 [ "$CF0" = "0" ] || die "census faults=$CF0 at boot settle"
 decode_one /tmp/d1a1_s_dec.json s || die "leg (s) decode failed"
@@ -103,6 +107,9 @@ R "grep -q 'ds4: model-source ledger reconciled:' $BOOTLOG" \
     || die "(s2) no ledger reconcile line"
 R "grep -q 'source ledger mismatch' $BOOTLOG" && die "(s2) ledger mismatch"
 R "grep -q 'model source UNATTRIBUTED' $BOOTLOG" && die "(s2) unattributed weight bytes"
+# D1a-2: catalog engagement on the mtp shape.
+R "grep -q 'ds4: model catalog mtp:' $BOOTLOG" || die "(s2) no mtp catalog line"
+R "grep -q 'CATALOG-TRIPWIRE' $BOOTLOG" && die "(s2) catalog tripwire fired"
 CF2=$(met ds4_memory_census_faults_total)
 [ "$CF2" = "0" ] || die "(s2) census faults=$CF2"
 log "(s2) PASS (base+mtp reconciled, faults 0)"
