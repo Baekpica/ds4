@@ -26512,6 +26512,75 @@ static void test_mem_gov_publication_shape(void) {
         TEST_ASSERT(gov_cmp_names[r] && gov_cmp_names[r][0]);
 }
 
+/* memgov D1a-1: model-source table (pure logic from ds4_mem_census.h --
+ * the exact bind/containment resolution the CUDA backend attributes
+ * every WEIGHT_* census note with). */
+static void test_mem_src_table_bind_find(void) {
+    /* One backing arena with guard gaps: adjacent static arrays would make
+     * one-past-end of a map alias the NEXT map's base, which containment
+     * legitimately resolves (mmaps in production are never adjacent). */
+    static char backing[16384];
+    char *base_map = backing;              /* [0, 4096)     */
+    char *mtp_map = backing + 6144;        /* [6144, 6656)  */
+    char *drafter_map = backing + 8192;    /* [8192, 8448)  */
+    const uint64_t base_len = 4096, mtp_len = 512, drafter_len = 256;
+    ds4_model_source_table t;
+    uint64_t faults = 0;
+    memset(&t, 0, sizeof t);
+
+    /* Bad descriptors fault and refuse. */
+    TEST_ASSERT(ds4_model_source_bind(&t, NULL, 10, 0, -1, "x", "p", &faults) == -1);
+    TEST_ASSERT(ds4_model_source_bind(&t, base_map, 0, 0, -1, "x", "p", &faults) == -1);
+    TEST_ASSERT(faults == 2 && t.count == 0);
+
+    const int b = ds4_model_source_bind(&t, base_map, base_len,
+                                        DS4_MSRC_ROLE_PRIMARY, 7,
+                                        "base", "/models/base.gguf", &faults);
+    const int m = ds4_model_source_bind(&t, mtp_map, mtp_len,
+                                        DS4_MSRC_ROLE_AUXILIARY, 8,
+                                        "mtp", "/models/mtp.gguf", &faults);
+    const int d = ds4_model_source_bind(&t, drafter_map, drafter_len,
+                                        DS4_MSRC_ROLE_DRAFTER, 9,
+                                        "drafter", NULL, &faults);
+    TEST_ASSERT(b == 0 && m == 1 && d == 2 && t.count == 3 && faults == 2);
+    TEST_ASSERT(t.v[b].fd == 7 && t.v[d].path[0] == '\0');
+    TEST_ASSERT(strcmp(t.v[m].name, "mtp") == 0);
+
+    /* Resolution: base equality, interior containment, one-past-end and
+     * unrelated pointers miss. */
+    TEST_ASSERT(ds4_model_source_find(&t, base_map) == b);
+    TEST_ASSERT(ds4_model_source_find(&t, base_map + 1) == b);
+    TEST_ASSERT(ds4_model_source_find(&t, base_map + base_len - 1) == b);
+    TEST_ASSERT(ds4_model_source_find(&t, mtp_map + 100) == m);
+    TEST_ASSERT(ds4_model_source_find(&t, drafter_map + drafter_len) == -1);
+    TEST_ASSERT(ds4_model_source_find(&t, &faults) == -1);
+    TEST_ASSERT(ds4_model_source_find(&t, NULL) == -1);
+
+    /* Rebind refreshes in place: the handle (= ledger row key) is stable. */
+    TEST_ASSERT(ds4_model_source_bind(&t, mtp_map, mtp_len,
+                                      DS4_MSRC_ROLE_AUXILIARY, 12,
+                                      "mtp", "/models/mtp-v2.gguf", &faults) == m);
+    TEST_ASSERT(t.count == 3 && t.v[m].fd == 12);
+    TEST_ASSERT(strcmp(t.v[m].path, "/models/mtp-v2.gguf") == 0);
+
+    /* Overflow faults and refuses; the table keeps its bound entries.
+     * Gapped 16-byte strides in the arena tail, 8-byte lengths. */
+    int accepted = 0;
+    for (int i = 0; i < DS4_MSRC_MAX; i++)
+        if (ds4_model_source_bind(&t, backing + 12288 + 16 * i, 8, 0, -1,
+                                  "extra", NULL, &faults) >= 0)
+            accepted++;
+    TEST_ASSERT(t.count == DS4_MSRC_MAX);
+    TEST_ASSERT(accepted == DS4_MSRC_MAX - 3);
+    TEST_ASSERT(faults == 2 + 3);
+
+    /* Role names are total over the enum (publication-shape discipline). */
+    TEST_ASSERT(strcmp(ds4_model_source_role_name(DS4_MSRC_ROLE_PRIMARY), "primary") == 0);
+    TEST_ASSERT(strcmp(ds4_model_source_role_name(DS4_MSRC_ROLE_AUXILIARY), "auxiliary") == 0);
+    TEST_ASSERT(strcmp(ds4_model_source_role_name(DS4_MSRC_ROLE_DRAFTER), "drafter") == 0);
+    TEST_ASSERT(strcmp(ds4_model_source_role_name(99), "unknown") == 0);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -26687,6 +26756,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_gov_compare_classes();
     test_mem_gov_shadow_ledger();
     test_mem_gov_publication_shape();
+    /* memgov D1a-1: model-source table resolution. */
+    test_mem_src_table_bind_find();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

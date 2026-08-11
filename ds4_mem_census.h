@@ -123,6 +123,121 @@ static inline uint64_t ds4_mem_cell_slack(const ds4_mem_cell *c) {
 }
 
 /* =========================================================================
+ * memgov D1a-1: model source descriptors (pure table logic).
+ *
+ * A model SOURCE is one host mmap the engine serves weights from (base
+ * checkpoint, MTP head, DSpark drafter, future support models).  Every
+ * range registry in the CUDA backend already keys on the map base pointer;
+ * this table names that identity: an opaque handle (the table index) with
+ * role, extent, fd identity, and provenance.  Roles are semantic and
+ * extensible (scoping sec 5) -- never a base/mtp/dspark hard-code.
+ *
+ * The table is pure (bind/find below) so the unit suite drives the exact
+ * production resolution logic without a GPU, the ds4_gov_evaluate
+ * precedent.  The CUDA backend instantiates one table and mirrors every
+ * WEIGHT_*-class census note into a per-source side-ledger keyed by the
+ * handle; the 2-D census cells stay the porcelain truth, and in a
+ * fault-free ledger the source rows of each weight class sum to its cell
+ * EXACTLY (dual writes under one epoch bracket; boot reconciles and any
+ * divergence counts a census fault). */
+#define DS4_MSRC_MAX 8                   /* bound sources + 1 spare row:
+                                            index DS4_MSRC_MAX is the
+                                            UNATTRIBUTED bucket (a weight
+                                            note outside every bound map,
+                                            e.g. kernel unit tests that
+                                            map-swap without an engine) */
+
+typedef enum {
+    DS4_MSRC_ROLE_PRIMARY = 0,           /* the checkpoint being served    */
+    DS4_MSRC_ROLE_AUXILIARY,             /* support model bound to the
+                                            primary (MTP head)             */
+    DS4_MSRC_ROLE_DRAFTER                /* speculative drafter (DSpark)   */
+} ds4_model_source_role;
+
+typedef struct {
+    const void *map_base;                /* host mmap base = source identity */
+    uint64_t    map_len;
+    int         role;                    /* ds4_model_source_role          */
+    int         fd;                      /* file identity at open, -1 none */
+    char        name[24];                /* semantic id ("base"/"mtp"/
+                                            "drafter") -- deliberately the
+                                            weight-server manifest model_id
+                                            vocabulary                     */
+    char        path[192];               /* provenance (truncated copy)    */
+} ds4_model_source;
+
+typedef struct {
+    ds4_model_source v[DS4_MSRC_MAX];
+    int count;
+} ds4_model_source_table;
+
+/* Manual copy keeps the leaf header dependency-free (no string.h). */
+static inline void ds4_msrc_copy_str(char *dst, uint64_t cap, const char *src) {
+    uint64_t i = 0;
+    if (cap == 0) return;
+    if (src) for (; src[i] && i + 1 < cap; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+/* Bind (or re-bind) a source.  Returns the handle, or -1 with a fault on
+ * a bad descriptor / table overflow.  Re-binding the same map_base
+ * refreshes the descriptor in place and keeps the handle stable -- ledger
+ * rows outlive a rebind by design (map identity is the row key). */
+static inline int ds4_model_source_bind(ds4_model_source_table *t,
+                                        const void *map_base, uint64_t map_len,
+                                        int role, int fd,
+                                        const char *name, const char *path,
+                                        uint64_t *faults) {
+    int i;
+    if (!t || !map_base || map_len == 0) {
+        if (faults) (*faults)++;
+        return -1;
+    }
+    for (i = 0; i < t->count; i++)
+        if (t->v[i].map_base == map_base) break;
+    if (i == t->count) {
+        if (t->count >= DS4_MSRC_MAX) {
+            if (faults) (*faults)++;
+            return -1;
+        }
+        t->count++;
+    }
+    t->v[i].map_base = map_base;
+    t->v[i].map_len = map_len;
+    t->v[i].role = role;
+    t->v[i].fd = fd;
+    ds4_msrc_copy_str(t->v[i].name, sizeof(t->v[i].name), name);
+    ds4_msrc_copy_str(t->v[i].path, sizeof(t->v[i].path), path);
+    return i;
+}
+
+/* Resolve a pointer to its source: map-base equality fast path, then
+ * containment in [base, base+len).  Distinct mmaps never overlap, so at
+ * most one source can contain p.  Returns the handle or -1. */
+static inline int ds4_model_source_find(const ds4_model_source_table *t,
+                                        const void *p) {
+    int i;
+    if (!t || !p) return -1;
+    for (i = 0; i < t->count; i++)
+        if (t->v[i].map_base == p) return i;
+    for (i = 0; i < t->count; i++) {
+        const uint64_t b = (uint64_t)(uintptr_t)t->v[i].map_base;
+        const uint64_t q = (uint64_t)(uintptr_t)p;
+        if (q >= b && q - b < t->v[i].map_len) return i;
+    }
+    return -1;
+}
+
+static inline const char *ds4_model_source_role_name(int role) {
+    switch (role) {
+    case DS4_MSRC_ROLE_PRIMARY:   return "primary";
+    case DS4_MSRC_ROLE_AUXILIARY: return "auxiliary";
+    case DS4_MSRC_ROLE_DRAFTER:   return "drafter";
+    default:                      return "unknown";
+    }
+}
+
+/* =========================================================================
  * memgov D0a-2: typed memory observation.
  *
  * The provider (ds4_gpu_mem_observe) reports a typed status + WHICH source

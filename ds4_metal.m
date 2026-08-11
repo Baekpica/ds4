@@ -4520,6 +4520,31 @@ int ds4_gpu_trim_inject_set(int site, uint32_t count) {
 }
 uint32_t ds4_gpu_trim_inject_fired(void) { return 0; }
 
+/* memgov D1a-1: source descriptors are backend-neutral (the pure table
+ * from ds4_mem_census.h), so Metal keeps them; the per-source ledger is
+ * CUDA accounting, so reads report unsupported (nonzero) like the census
+ * stub above, and the residency report stays silent (OBS-policy: Metal
+ * makes no residency claims it cannot measure). */
+static ds4_model_source_table g_metal_model_srcs;
+int ds4_gpu_model_source_bind(const void *map_base, uint64_t map_len,
+                              int role, int fd,
+                              const char *name, const char *path) {
+    return ds4_model_source_bind(&g_metal_model_srcs, map_base, map_len,
+                                 role, fd, name, path, NULL);
+}
+int ds4_gpu_model_source_count(void) { return g_metal_model_srcs.count; }
+int ds4_gpu_model_source_info(int idx, ds4_model_source *out) {
+    if (!out || idx < 0 || idx >= g_metal_model_srcs.count) return 1;
+    *out = g_metal_model_srcs.v[idx];
+    return 0;
+}
+int ds4_gpu_mem_src_census_read(int src_idx, int consumer_class, int domain,
+                                ds4_mem_cell *out) {
+    (void)src_idx; (void)consumer_class; (void)domain; (void)out;
+    return 1;
+}
+void ds4_gpu_report_model_sources(void) {}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;

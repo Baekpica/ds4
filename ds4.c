@@ -38977,6 +38977,29 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
+        /* memgov D1a-1: declare every served mmap as a model source BEFORE
+         * its first weight-class allocation (the artifact build below is
+         * the earliest) -- the backend attributes each WEIGHT_* census
+         * note to a source row by map containment.  Names deliberately use
+         * the weight-server manifest model_id vocabulary. */
+        (void)ds4_gpu_model_source_bind(e->model.map, e->model.size,
+                                        DS4_MSRC_ROLE_PRIMARY, e->model.fd,
+                                        "base", opt->model_path);
+        if (e->mtp_ready) {
+            (void)ds4_gpu_model_source_bind(e->mtp_model.map, e->mtp_model.size,
+                                            DS4_MSRC_ROLE_AUXILIARY,
+                                            e->mtp_model.fd,
+                                            "mtp", opt->mtp_path);
+        }
+        if (e->dspark_ready) {
+            const char *dspark_prov = opt->dspark_path && opt->dspark_path[0]
+                ? opt->dspark_path : getenv("DS4_DSPARK_MODEL");
+            (void)ds4_gpu_model_source_bind(e->dspark_model.map,
+                                            e->dspark_model.size,
+                                            DS4_MSRC_ROLE_DRAFTER,
+                                            e->dspark_model.fd,
+                                            "drafter", dspark_prov);
+        }
 #ifndef __APPLE__
         /* Self-load aligned artifacts: with no weight-server manifest, build
          * the aligned-SoA repack artifacts in-process BEFORE the model map
@@ -39191,6 +39214,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* memgov D1a-1: per-source residency lines + ledger reconciliation
+         * against the census cells (no-op on Metal).  Post-pre-cache is the
+         * interesting snapshot; the reconciliation invariant itself holds at
+         * any instant by the dual-write construction. */
+        ds4_gpu_report_model_sources();
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
         /* v0.5 inc-14b: boot prewarm (see ds4_engine_boot_prewarm).  Callers

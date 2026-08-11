@@ -507,6 +507,24 @@ int  ds4_gpu_mem_observe(ds4_mem_observation *out);
  * engagement counter gates assert on. */
 int      ds4_gpu_trim_inject_set(int site, uint32_t count);
 uint32_t ds4_gpu_trim_inject_fired(void);
+/* memgov D1a-1: model source handles + per-source weight ledger.  bind()
+ * declares one host mmap as a served model source (descriptor types in
+ * ds4_mem_census.h) and must run before the map's first weight-class
+ * allocation; the backend then attributes every WEIGHT_* census note to
+ * a source row by map containment.  src_census_read() copies one row
+ * cell -- src index DS4_MSRC_MAX is the UNATTRIBUTED bucket -- returns
+ * nonzero where unsupported (Metal keeps descriptors but no ledger).
+ * report() prints the per-source boot residency lines and reconciles
+ * every weight class cell against its source rows, counting a census
+ * fault on divergence (the standing gates assert faults == 0). */
+int  ds4_gpu_model_source_bind(const void *map_base, uint64_t map_len,
+                               int role, int fd,
+                               const char *name, const char *path);
+int  ds4_gpu_model_source_count(void);
+int  ds4_gpu_model_source_info(int idx, ds4_model_source *out);
+int  ds4_gpu_mem_src_census_read(int src_idx, int consumer_class, int domain,
+                                 ds4_mem_cell *out);
+void ds4_gpu_report_model_sources(void);
 /* memgov D0b-3: the SHADOW governor.  One process-global lease ledger
  * (ds4_mem_gov.h types) written under the same single-writer discipline
  * as the census and read through the same seqlock protocol.  Publishes
