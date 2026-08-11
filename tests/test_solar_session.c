@@ -943,6 +943,32 @@ int main(int argc, char **argv) {
             primary_batch_oracle.tokens[0], primary_batch_oracle.tokens[1],
             primary_batch_oracle.tokens[2]);
     for (int i = 0; i < 4; i++) free(fused_results[i].tokens);
+
+    /* Final idle-context trim exercises the Solar-specific VMM path.  The
+     * implementation must synchronize before unmapping any state/KV slab;
+     * after successful release at least one bank generation changes so a
+     * stale warm directive cannot survive the destructive reclaim. */
+    uint64_t trim_gen_before[4];
+    for (int i = 0; i < 4; i++)
+        trim_gen_before[i] = ds4_batch_ctx_bank_generation(batch_ctx, i);
+    const uint64_t trimmed_bytes =
+        ds4_batch_ctx_trim_free(batch_ctx, UINT64_MAX);
+    int trim_gen_changed = 0;
+    for (int i = 0; i < 4; i++) {
+        if (ds4_batch_ctx_bank_generation(batch_ctx, i) != trim_gen_before[i])
+            trim_gen_changed++;
+    }
+    if (trimmed_bytes == 0 || trim_gen_changed == 0) {
+        fprintf(stderr,
+                "Solar idle-bank trim failed: bytes=%llu generations=%d\n",
+                (unsigned long long)trimmed_bytes, trim_gen_changed);
+        ds4_batch_ctx_destroy(batch_ctx);
+        failed = 1;
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "Solar idle-bank trim: %.1f MiB generations=%d\n",
+            (double)trimmed_bytes / 1048576.0, trim_gen_changed);
     ds4_batch_ctx_destroy(batch_ctx);
 
     ds4_batch_gen_result batch_result = {0};

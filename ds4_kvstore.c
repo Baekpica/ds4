@@ -425,7 +425,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
         h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
     if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
     e->quant_bits = h[4];
-    e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
+    e->reason = h[5] <= DS4_KVSTORE_REASON_BANK_CHECKPOINT ? h[5] :
                 DS4_KVSTORE_REASON_UNKNOWN;
     e->ext_flags = h[6];
     e->model_id = h[7];
@@ -869,17 +869,58 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
     return ok;
 }
 
+static int kv_cache_reason_family(uint8_t reason) {
+    if (reason >= DS4_KVSTORE_REASON_COLD &&
+        reason <= DS4_KVSTORE_REASON_SHUTDOWN) return 1;
+    if (reason >= DS4_KVSTORE_REASON_AGENT_SYSTEM &&
+        reason <= DS4_KVSTORE_REASON_AGENT_SESSION) return 2;
+    if (reason >= DS4_KVSTORE_REASON_BANK_EVICT &&
+        reason <= DS4_KVSTORE_REASON_BANK_CHECKPOINT) return 3;
+    return 0;
+}
+
+static bool kv_entry_is_bank_replay_v1(const ds4_kvstore_entry *e) {
+    return e && kv_cache_reason_family(e->reason) == 3 &&
+           (e->ext_flags & DS4_KVSTORE_EXT_BANK_REPLAY_V1) != 0;
+}
+
+static bool kv_entry_is_automatic_exact_replay(const ds4_kvstore_entry *e) {
+    if (!e) return false;
+    const int family = kv_cache_reason_family(e->reason);
+    if (family == 1)
+        return (e->ext_flags & DS4_KVSTORE_EXT_BANK_REPLAY_V1) == 0;
+    return kv_entry_is_bank_replay_v1(e);
+}
+
+static bool kv_reopened_header_matches_entry(const ds4_kvstore_entry *hdr,
+                                             uint32_t text_bytes,
+                                             const ds4_kvstore_entry *e) {
+    return hdr && e &&
+           hdr->model_id == e->model_id &&
+           hdr->quant_bits == e->quant_bits &&
+           hdr->ctx_size == e->ctx_size &&
+           hdr->tokens == e->tokens &&
+           (uint64_t)text_bytes == e->text_bytes;
+}
+
 static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
-                                         int model_id, int quant_bits, int ctx_size) {
+                                         int model_id, int quant_bits, int ctx_size,
+                                         uint8_t reason, uint8_t ext_flags) {
     if (access(path, F_OK) != 0) return false;
     ds4_kvstore_entry e = {0};
     if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
+    const ds4_kvstore_entry expected = {
+        .reason = reason,
+        .ext_flags = ext_flags,
+    };
     bool compatible = e.model_id == (uint8_t)model_id &&
                       (!kc->reject_different_quant ||
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
+                      kv_entry_is_automatic_exact_replay(&e) &&
+                      kv_entry_is_automatic_exact_replay(&expected) &&
                       kv_cache_file_text_matches(path, sha, text, text_len);
     ds4_kvstore_entry_free(&e);
     if (!compatible) {
@@ -1032,10 +1073,13 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
+    uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
+    if (text_override) ext_flags |= cache_text_ext;
 
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
-                                     quant_bits, ctx_size)) {
+                                     quant_bits, ctx_size,
+                                     reason_code, ext_flags)) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
         free(text);
         free(path);
@@ -1113,8 +1157,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
 
     const uint64_t now = (uint64_t)time(NULL);
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
-    if (text_override) ext_flags |= cache_text_ext;
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
@@ -1230,15 +1272,24 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
     return false;
 }
 
-int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size) {
+static int kv_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+                               int model_id, int quant_bits, int ctx_size,
+                               bool require_suffix) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
     int best = -1;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
+        if (!kv_entry_is_automatic_exact_replay(e)) continue;
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
+        /* A bank lookup always needs a suffix.  In the serial tier, bank
+         * payloads also require one because they intentionally omit frontier
+         * logits; equal-text restore would sample zero/stale logits.  Native
+         * serial checkpoints carry logits and retain equality. */
+        if ((require_suffix || kv_entry_is_bank_replay_v1(e)) &&
+            e->text_bytes == prompt_bytes)
+            continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if (e->model_id != (uint8_t)model_id) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
@@ -1253,6 +1304,20 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (!strcmp(sha, e->sha)) best = i;
     }
     return best;
+}
+
+int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                 int model_id, int quant_bits, int ctx_size) {
+    return kv_find_text_prefix(kc, prompt_text, model_id, quant_bits, ctx_size,
+                               false);
+}
+
+int ds4_kvstore_find_bank_text_prefix(ds4_kvstore *kc,
+                                      const char *prompt_text,
+                                      int model_id, int quant_bits,
+                                      int ctx_size) {
+    return kv_find_text_prefix(kc, prompt_text, model_id, quant_bits, ctx_size,
+                               true);
 }
 
 /* v0.5.1: the disk twin of the server's P1 partial ranking.  A record whose
@@ -1279,6 +1344,7 @@ int ds4_kvstore_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
     uint64_t best_text = 0;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
+        if (!kv_entry_is_automatic_exact_replay(e)) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if (e->model_id != (uint8_t)model_id) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
@@ -1345,12 +1411,15 @@ static int kv_restore_bank_entry(ds4_kvstore *kc,
     bool header_ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
     char *cached_text = NULL;
     if (header_ok) {
-        if (hdr.model_id != e.model_id) {
+        if (!kv_entry_is_automatic_exact_replay(&hdr)) {
             header_ok = false;
-            fail_reason = "cached checkpoint was written for a different model";
-        } else if (prompt_text && (uint64_t)text_bytes > prompt_bytes) {
+            fail_reason = "legacy automatic replay contract";
+        } else if (!kv_reopened_header_matches_entry(&hdr, text_bytes, &e)) {
             header_ok = false;
-            fail_reason = "cached text is longer than prompt";
+            fail_reason = "cached checkpoint changed during lookup";
+        } else if (prompt_text && (uint64_t)text_bytes >= prompt_bytes) {
+            header_ok = false;
+            fail_reason = "cached text is not a strict prompt prefix";
         } else {
             cached_text = kv_xmalloc((size_t)text_bytes + 1);
             if (fread(cached_text, 1, text_bytes, fp) != text_bytes) {
@@ -1432,8 +1501,8 @@ int ds4_kvstore_try_restore_bank_text(ds4_kvstore *kc,
     if (quant_bits != 2 && quant_bits != 4) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
-    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ctx_size);
+    int idx = ds4_kvstore_find_bank_text_prefix(
+        kc, prompt_text, model_id, quant_bits, ctx_size);
     if (idx < 0) return 0;
     return kv_restore_bank_entry(kc, batch_ctx, bank, idx,
                                  prompt_text, prompt_bytes,
@@ -1492,9 +1561,19 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     bool header_ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
     char *cached_text = NULL;
     if (header_ok) {
-        if (hdr.model_id != (uint8_t)model_id) {
+        if (!kv_entry_is_automatic_exact_replay(&hdr)) {
+            header_ok = false;
+            fail_reason = "legacy automatic replay contract";
+        } else if (!kv_reopened_header_matches_entry(&hdr, text_bytes, &e)) {
+            header_ok = false;
+            fail_reason = "cached checkpoint changed during lookup";
+        } else if (hdr.model_id != (uint8_t)model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
+        } else if (kv_entry_is_bank_replay_v1(&hdr) &&
+                   (uint64_t)text_bytes == prompt_bytes) {
+            header_ok = false;
+            fail_reason = "bank checkpoint has no exact-frontier logits";
         } else if ((uint64_t)text_bytes > prompt_bytes) {
             header_ok = false;
             fail_reason = "cached text is longer than prompt";

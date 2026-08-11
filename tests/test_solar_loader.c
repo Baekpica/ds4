@@ -7,12 +7,71 @@
  */
 #include "../ds4.c"
 
+typedef struct {
+    int sync_ok;
+    int sync_calls;
+    int trim_calls;
+    char order[16];
+    int order_len;
+    uint64_t bank_bytes[4];
+} solar_trim_fake;
+
+static int solar_trim_fake_sync(void *user) {
+    solar_trim_fake *f = user;
+    f->sync_calls++;
+    f->order[f->order_len++] = 'S';
+    return f->sync_ok;
+}
+
+static uint64_t solar_trim_fake_bank(uint32_t bank, void *user) {
+    solar_trim_fake *f = user;
+    f->trim_calls++;
+    f->order[f->order_len++] = (char)('0' + bank);
+    return f->bank_bytes[bank];
+}
+
+static int test_solar_trim_sequence(void) {
+    solar_trim_fake f = {.sync_ok = 0, .bank_bytes = {4u, 0u, 3u, 9u}};
+    if (solar_trim_sequence_with_ops(
+            4u, 6u, solar_trim_fake_sync, solar_trim_fake_bank, &f) != 0u ||
+        f.sync_calls != 1 || f.trim_calls != 0 ||
+        f.order_len != 1 || f.order[0] != 'S') {
+        fprintf(stderr, "Solar trim ran an unmap after failed sync\n");
+        return 0;
+    }
+
+    memset(&f, 0, sizeof(f));
+    f.sync_ok = 1;
+    f.bank_bytes[0] = 4u;
+    f.bank_bytes[1] = 0u;
+    f.bank_bytes[2] = 3u;
+    f.bank_bytes[3] = 9u;
+    const uint64_t freed = solar_trim_sequence_with_ops(
+        4u, 6u, solar_trim_fake_sync, solar_trim_fake_bank, &f);
+    if (freed != 7u || f.sync_calls != 1 || f.trim_calls != 3 ||
+        f.order_len != 4 || memcmp(f.order, "S012", 4u) != 0) {
+        fprintf(stderr, "Solar trim sync/unmap order regressed\n");
+        return 0;
+    }
+
+    memset(&f, 0, sizeof(f));
+    f.sync_ok = 1;
+    if (solar_trim_sequence_with_ops(
+            4u, 0u, solar_trim_fake_sync, solar_trim_fake_bank, &f) != 0u ||
+        f.sync_calls != 0 || f.trim_calls != 0) {
+        fprintf(stderr, "Solar zero-byte trim unexpectedly touched the device\n");
+        return 0;
+    }
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2 || argc > 3 ||
         (argc == 3 && strcmp(argv[2], "--deepseek") != 0)) {
         fprintf(stderr, "usage: %s <model.gguf> [--deepseek]\n", argv[0]);
         return 2;
     }
+    if (!test_solar_trim_sequence()) return 1;
 
     ds4_model model;
     model_open(&model, argv[1], false, false);

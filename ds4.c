@@ -37529,6 +37529,51 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     return freed;
 }
 
+typedef int (*solar_trim_sync_fn)(void *user);
+typedef uint64_t (*solar_trim_bank_fn)(uint32_t bank, void *user);
+
+/* Keep the destructive ordering independently testable: no bank callback may
+ * run until the device drain succeeds, and the drain happens exactly once no
+ * matter how many banks are released. */
+static uint64_t solar_trim_sequence_with_ops(
+        uint32_t max_seq, uint64_t want_bytes,
+        solar_trim_sync_fn sync_fn, solar_trim_bank_fn trim_fn, void *user) {
+    if (max_seq == 0u || want_bytes == 0u || !sync_fn || !trim_fn) return 0u;
+    if (!sync_fn(user)) return 0u;
+    uint64_t freed = 0u;
+    for (uint32_t b = 0; b < max_seq && freed < want_bytes; b++)
+        freed += trim_fn(b, user);
+    return freed;
+}
+
+static int solar_trim_sync_cuda(void *user) {
+    (void)user;
+    return ds4_gpu_synchronize();
+}
+
+static uint64_t solar_trim_bank_cuda(uint32_t b, void *user) {
+    ds4_batch_ctx *ctx = user;
+    ds4_solar_batch_runtime *rt = ctx->solar;
+    uint64_t got = ds4_gpu_tensor_trim(
+        rt->state_slab, (uint64_t)b * rt->graph.state_bytes,
+        rt->graph.state_bytes);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_solar_layer_is_gqa(il)) continue;
+        got += ds4_gpu_tensor_trim(
+            rt->kv_slab[il], (uint64_t)b * rt->kv_bank_bytes[il],
+            rt->kv_bank_bytes[il]);
+    }
+    if (got != 0u) {
+        ctx->bank_gen[b]++;
+        ctx->bank_hist_valid[b] = 0u;
+        ctx->bank_hist_len[b] = 0u;
+        rt->bank_logits_valid[b] = 0u;
+        ctx->trim_banks++;
+        ctx->trim_bytes += got;
+    }
+    return got;
+}
+
 /* deepmem lite-4 (minimal reclaim): public context-owned trim for a
  * non-batch consumer -- the serial lane COLLECTS from the commons instead
  * of pre-paying for it (governance LEARNING 7: the commons is a cache
@@ -37545,29 +37590,14 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
 uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
     if (!ctx || want_bytes == 0) return 0;
     if (ctx->solar) {
-        uint64_t freed = 0u;
-        ds4_solar_batch_runtime *rt = ctx->solar;
-        for (uint32_t b = 0; b < ctx->max_seq && freed < want_bytes; b++) {
-            uint64_t got = ds4_gpu_tensor_trim(
-                rt->state_slab, (uint64_t)b * rt->graph.state_bytes,
-                rt->graph.state_bytes);
-            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-                if (!ds4_solar_layer_is_gqa(il)) continue;
-                got += ds4_gpu_tensor_trim(
-                    rt->kv_slab[il], (uint64_t)b * rt->kv_bank_bytes[il],
-                    rt->kv_bank_bytes[il]);
-            }
-            if (got != 0u) {
-                ctx->bank_gen[b]++;
-                ctx->bank_hist_valid[b] = 0u;
-                ctx->bank_hist_len[b] = 0u;
-                rt->bank_logits_valid[b] = 0u;
-                freed += got;
-                ctx->trim_banks++;
-                ctx->trim_bytes += got;
-            }
-        }
-        return freed;
+        /* ds4_gpu_tensor_trim unmaps VMM pages.  gen_mu prevents new server
+         * launches but does not drain work already queued on the device; match
+         * the generic bank trimmer's contract and synchronize exactly once,
+         * off capture, before touching the first Solar slab.  On sync failure
+         * leave generations, histories, logits, and accounting untouched. */
+        return solar_trim_sequence_with_ops(
+            ctx->max_seq, want_bytes, solar_trim_sync_cuda,
+            solar_trim_bank_cuda, ctx);
     }
     return ds4_batch_trim_free_banks(ctx, &ctx->g, NULL, NULL, NULL,
                                      (uint32_t)ctx->max_seq, -1, want_bytes,

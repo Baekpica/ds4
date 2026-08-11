@@ -1097,6 +1097,16 @@ static bool server_partial_warm_policy(bool requested, bool supported) {
     return requested && supported;
 }
 
+static bool server_thinking_record_requires_rewind(int sampled_tokens,
+                                                   bool client_gone,
+                                                   bool semantic_or_transport_cut,
+                                                   bool split_think_close) {
+    /* tokens[0..n-2] are committed.  With only the seed/final sample (n==1),
+     * the bank still equals the prompt and no rewind is needed. */
+    return sampled_tokens > 1 &&
+           (client_gone || semantic_or_transport_cut || split_think_close);
+}
+
 static void stop_list_clear(stop_list *stops) {
     for (int i = 0; i < stops->len; i++) free(stops->v[i]);
     stops->len = 0;
@@ -5310,6 +5320,32 @@ static void split_reasoning_content(const char *text, size_t n,
                                    content_out, reasoning_out);
 }
 
+/* The response surface must keep an unfinished thinking turn out of visible
+ * assistant content even when the request declared no tools.  The structured
+ * tool parser already has this contract, but no-tools responses deliberately
+ * bypass tool extraction; preserve the same closed-thinking gate while doing
+ * only the content/reasoning split. */
+static void split_reasoning_response_format(const char *text, size_t n,
+                                            ds4_chat_format format,
+                                            bool require_thinking_closed,
+                                            char **content_out,
+                                            char **reasoning_out) {
+    char *s = xstrndup(text ? text : "", n);
+    const char *think_start = chat_think_start(format);
+    const char *think_end = chat_think_end(format);
+    if (require_thinking_closed && !find_last_substr(s, think_end)) {
+        const char *body = !strncmp(s, think_start, strlen(think_start))
+            ? s + strlen(think_start) : s;
+        *reasoning_out = xstrdup(body);
+        *content_out = xstrdup("");
+        free(s);
+        return;
+    }
+    split_reasoning_content_format(s, strlen(s), format,
+                                   content_out, reasoning_out);
+    free(s);
+}
+
 static char *trim_ascii_span_dup(const char *start, const char *end) {
     while (start < end && isspace((unsigned char)*start)) start++;
     while (end > start && isspace((unsigned char)end[-1])) end--;
@@ -5830,9 +5866,10 @@ static bool parse_generated_message_for_response_format(
      * tool_calls.  The accumulator's cut keeps DSML out of visible text
      * upstream; this gate makes the invariant structural for every caller. */
     if (!has_tools) {
-        split_reasoning_content_format(text ? text : "",
-                                       text ? strlen(text) : 0, format,
-                                       content_out, reasoning_out);
+        split_reasoning_response_format(text ? text : "",
+                                        text ? strlen(text) : 0, format,
+                                        require_thinking_closed,
+                                        content_out, reasoning_out);
         return true;
     }
 
@@ -9333,6 +9370,10 @@ struct server {
         size_t   len;
         uint64_t last_use;
         bool     valid;
+        /* A client/semantic cut or split think-close can leave a key shorter
+         * than the bank frontier.  Such a record is only a rewind hint: never
+         * exact-splice or persist it for binaries that lack this distinction. */
+        bool     partial_only;
         /* v0.5.1 inc3b: committed length at this bank lineage's last disk
          * persist (0 = never stored).  Pacing marker ONLY -- a stale value
          * delays or duplicates a checkpoint store, never corrupts one (the
@@ -10261,6 +10302,46 @@ static bool cont_registry_bank_protected_with_query(
 static bool cont_registry_bank_protected(server *s, int bank, double now) {
     return cont_registry_bank_protected_with_query(
         s, bank, now, cont_engine_bank_reference_query, NULL);
+}
+
+typedef uint64_t (*cont_bank_reclaim_callback)(server *s, uint64_t want,
+                                               void *user);
+
+/* The serial lane's emergency reclaim spends every batch bank.  A separate
+ * protection probe followed by trim would race a parser thread pinning an
+ * output-only T2 between those operations.  Keep tool_mu across the complete
+ * check-and-act sequence: production already holds gen_mu, so this preserves
+ * the global gen_mu -> tool_mu order, and the reclaim callback never re-enters
+ * the continuation registry. */
+static uint64_t cont_registry_reclaim_unprotected_with_query(
+        server *s, double now,
+        cont_bank_reference_query query, void *query_user,
+        cont_bank_reclaim_callback reclaim, void *reclaim_user,
+        bool *skipped_protected) {
+    if (skipped_protected) *skipped_protected = false;
+    if (!s || !query || !reclaim) return 0;
+
+    bool protected = false;
+    pthread_mutex_lock(&s->tool_mu);
+    for (cont_record *rec = s->creg.head; rec && !protected; rec = rec->next) {
+        if (rec->owner != CONT_OWNER_BATCH_BANK ||
+            rec->state != CONT_REC_LIVE_FRONTIER) continue;
+        if (!cont_record_bank_reference_is_current(s, rec, query, query_user))
+            continue;
+        const bool in_grace = s->creg.grace_s > 0 &&
+            now - rec->publish_time < s->creg.grace_s;
+        const bool pinned = rec->hard_refs > 0 &&
+            s->creg.pin_deadline_s > 0 && now < rec->pin_expiry;
+        protected = in_grace || pinned;
+    }
+    uint64_t freed = 0;
+    if (protected) {
+        if (skipped_protected) *skipped_protected = true;
+    } else {
+        freed = reclaim(s, UINT64_MAX, reclaim_user);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return freed;
 }
 
 /* Inc 6c: honest Retry-After for a fully protected bank set -- the SOONEST
@@ -11512,6 +11593,7 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
     if (min_committed <= 0) return;
     if (!s->kv.enabled || !s->batch_ctx || !s->warm) return;
     if (bank < 0 || bank >= s->batch_ctx_max_seq || !s->warm[bank].valid) return;
+    if (s->warm[bank].partial_only) return;
     if (!s->warm[bank].text || s->warm[bank].len == 0) return;
     const int *htok = NULL;
     const int hl = ds4_batch_ctx_bank_committed(s->batch_ctx, bank, &htok);
@@ -11533,7 +11615,8 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
     const bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                         s->session, s->serial_boot_ctx,
                         &tokens, (int)hl, reason,
-                        s->warm[bank].text, 0, "bank",
+                        s->warm[bank].text,
+                        DS4_KVSTORE_EXT_BANK_REPLAY_V1, "bank",
                         &hooks, &staged, err, sizeof(err));
     ds4_session_payload_file_free(&staged);
     if (ok) {
@@ -11666,10 +11749,10 @@ static int live_text_prefix_prompt(server *s, const request *req,
  * the registry record's execution reference (engine generation + committed
  * frontier, Inc 5a) and call-id set match exactly -- a session rebuilt to
  * the same position no longer revalidates a dead binding. */
-static int responses_live_continuation_prompt(server *s, const request *req,
-                                              int live_pos,
-                                              ds4_tokens *effective_prompt,
-                                              int *matched_ids) {
+static int responses_live_continuation_prompt_impl(
+        server *s, const request *req, int live_pos,
+        ds4_tokens *effective_prompt, int *matched_ids,
+        bool record_resolution) {
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_RESPONSES || !req->responses_live_suffix_text) return 0;
     if (req->responses_live_call_ids.len == 0) return 0;
@@ -11685,8 +11768,17 @@ static int responses_live_continuation_prompt(server *s, const request *req,
         s->engine, live_tokens, req->responses_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
-    ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
+    if (record_resolution)
+        ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
     return live_tokens->len;
+}
+
+static int responses_live_continuation_prompt(server *s, const request *req,
+                                              int live_pos,
+                                              ds4_tokens *effective_prompt,
+                                              int *matched_ids) {
+    return responses_live_continuation_prompt_impl(
+        s, req, live_pos, effective_prompt, matched_ids, true);
 }
 
 /* Tool-result Anthropic continuation.
@@ -11696,10 +11788,10 @@ static int responses_live_continuation_prompt(server *s, const request *req,
  * live local agent loop.  When the registry record's ids and execution
  * reference (generation + frontier, Inc 5a) match, continue from the sampled
  * DSML state and append only the user tool_result suffix. */
-static int anthropic_live_continuation_prompt(server *s, const request *req,
-                                              int live_pos,
-                                              ds4_tokens *effective_prompt,
-                                              int *matched_ids) {
+static int anthropic_live_continuation_prompt_impl(
+        server *s, const request *req, int live_pos,
+        ds4_tokens *effective_prompt, int *matched_ids,
+        bool record_resolution) {
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
     if (req->anthropic_live_call_ids.len == 0) return 0;
@@ -11715,8 +11807,17 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
         s->engine, live_tokens, req->anthropic_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
-    ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
+    if (record_resolution)
+        ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
     return live_tokens->len;
+}
+
+static int anthropic_live_continuation_prompt(server *s, const request *req,
+                                              int live_pos,
+                                              ds4_tokens *effective_prompt,
+                                              int *matched_ids) {
+    return anthropic_live_continuation_prompt_impl(
+        s, req, live_pos, effective_prompt, matched_ids, true);
 }
 
 /* Visible-replay Responses continuation.
@@ -12865,7 +12966,8 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * reasoning bytes, so the next request would miss the session cache even though
  * the visible conversation prefix is logically the same.
  *
- *   prompt-without-final-<think> + </think> + visible-content + eos
+ *   DSML:  prompt-without-final-<think> + </think> + visible-content + eos
+ *   Solar: prompt-with-<|think:start|> + <|think:end|> + content + eos
  *
  * is exactly the visible prefix that render_chat_prompt_text() will produce on
  * the next turn.  Do not rebuild the KV cache to erase hidden reasoning here:
@@ -12873,8 +12975,9 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * Instead, remember the visible bytes as a key for the current sampled frontier.
  * The next request can then continue from live KV while tokenizing only the new
  * visible suffix. */
-static char *build_toolless_thinking_visible_text(const request *r,
-                                                  const char *content) {
+static char *build_toolless_thinking_visible_prefix(const request *r,
+                                                    const char *content,
+                                                    bool terminal) {
     if (!r || !r->prompt_text) return NULL;
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
@@ -12887,13 +12990,48 @@ static char *build_toolless_thinking_visible_text(const request *r,
     }
 
     buf visible = {0};
-    buf_append(&visible, r->prompt_text, pt_len - tag_len);
+    /* DSML renders an older tool-less assistant as </think> + content, so its
+     * generation-only <think> prefix must be removed.  Solar renders the
+     * older assistant as <|think:start|><|think:end|> + content and therefore
+     * keeps the start marker. */
+    const size_t prefix_len = r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+                                ? pt_len : pt_len - tag_len;
+    buf_append(&visible, r->prompt_text, prefix_len);
     buf_puts(&visible, chat_think_end(r->chat_format));
     buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2
-                           ? DS4_SOLAR_IM_END "\n"
-                           : "<｜end▁of▁sentence｜>");
+    if (terminal) {
+        buf_puts(&visible, r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+                               ? DS4_SOLAR_IM_END "\n"
+                               : "<｜end▁of▁sentence｜>");
+    }
     return buf_take(&visible);
+}
+
+static char *build_toolless_thinking_visible_text(const request *r,
+                                                  const char *content) {
+    return build_toolless_thinking_visible_prefix(r, content, true);
+}
+
+/* A continuous bank never commits its final sampled token.  Its replay key
+ * must therefore stop before the terminal marker even when the sample was an
+ * EOS; the next request tokenizes that marker as the first suffix. */
+static char *build_cont_toolless_thinking_visible_key(const request *r,
+                                                      const char *content) {
+    return build_toolless_thinking_visible_prefix(r, content, false);
+}
+
+/* A multi-token think-close can straddle the uncommitted final sample.  In
+ * that case the bank ends in only a prefix of the marker, so a prompt-key
+ * exact splice would append the whole marker and duplicate those bytes. */
+static bool text_ends_with_proper_prefix(const char *text, const char *marker) {
+    if (!text || !marker) return false;
+    const size_t n = strlen(text);
+    const size_t m = strlen(marker);
+    if (n == 0 || m <= 1) return false;
+    size_t k = n < m - 1 ? n : m - 1;
+    for (; k > 0; k--)
+        if (!memcmp(text + n - k, marker, k)) return true;
+    return false;
 }
 
 static void remember_thinking_checkpoint(server *s, const job *j, const char *ctx,
@@ -14873,6 +15011,108 @@ static void serial_terminal_commit(server *s, job *j, api_style proto,
     terminal_sink_release(tb->len);
 }
 
+static bool serial_session_reuse_ok(int cur_ctx, bool graph_pending,
+                                    long need_min, long request_cap,
+                                    bool current_graph_fits) {
+    if (cur_ctx < need_min) return false;
+    if (!graph_pending) return true;
+    /* A graphless boot-shape session has no state to preserve.  Do not let a
+     * tiny first serial request commit a deep full--c graph merely because it
+     * fits before the batch banks grow; cap it to what this conversation can
+     * use plus the continuation allowance. */
+    return cur_ctx <= request_cap && current_graph_fits;
+}
+
+typedef enum {
+    SERIAL_FRAME_CANONICAL = 0,
+    SERIAL_FRAME_RESOLVED_LIVE,
+    SERIAL_FRAME_REQUIRED_MISS,
+} serial_frame_kind;
+
+typedef enum {
+    SERIAL_FIT_REUSE = 0,
+    SERIAL_FIT_RESIZE,
+    SERIAL_FIT_REFUSE_PRESERVE,
+    SERIAL_FIT_PASS_NATIVE,
+} serial_fit_plan;
+
+static serial_fit_plan serial_session_fit_plan(
+        int cur_ctx, bool graph_pending, long need_min, long request_cap,
+        bool current_graph_fits, serial_frame_kind frame_kind) {
+    if (frame_kind == SERIAL_FRAME_REQUIRED_MISS)
+        return SERIAL_FIT_PASS_NATIVE;
+    if (serial_session_reuse_ok(cur_ctx, graph_pending, need_min, request_cap,
+                                current_graph_fits))
+        return SERIAL_FIT_REUSE;
+    if (frame_kind == SERIAL_FRAME_RESOLVED_LIVE)
+        return SERIAL_FIT_REFUSE_PRESERVE;
+    return SERIAL_FIT_RESIZE;
+}
+
+/* Size the same authoritative live frame that generate_job will sync, but do
+ * not consume registry state or increment resolution metrics.  In particular,
+ * an output-only Responses/Anthropic client frame can be only a few tokens
+ * while the effective frame is live_tokens + tool-result suffix near -c. */
+static serial_frame_kind serial_effective_frame_preflight(
+        server *s, const request *req, long *prompt_len) {
+    if (prompt_len) *prompt_len = req ? req->prompt.len : 0;
+    if (!s || !req || !s->session) return SERIAL_FRAME_CANONICAL;
+
+    const int live_pos = ds4_session_pos(s->session);
+    ds4_tokens effective = {0};
+    if (req->api == API_RESPONSES && req->responses_requires_live_tool_state) {
+        const int cached = responses_live_continuation_prompt_impl(
+            s, req, live_pos, &effective, NULL, false);
+        if (cached > 0) {
+            if (prompt_len) *prompt_len = effective.len;
+            ds4_tokens_free(&effective);
+            return SERIAL_FRAME_RESOLVED_LIVE;
+        }
+        ds4_tokens_free(&effective);
+        return SERIAL_FRAME_REQUIRED_MISS;
+    }
+
+    if (req->api == API_ANTHROPIC && req->anthropic_requires_live_tool_state) {
+        const int cached = anthropic_live_continuation_prompt_impl(
+            s, req, live_pos, &effective, NULL, false);
+        if (cached > 0) {
+            if (prompt_len) *prompt_len = effective.len;
+            ds4_tokens_free(&effective);
+            return SERIAL_FRAME_RESOLVED_LIVE;
+        }
+        ds4_tokens_free(&effective);
+        return SERIAL_FRAME_REQUIRED_MISS;
+    }
+
+    ds4_tokens_free(&effective);
+    return SERIAL_FRAME_CANONICAL;
+}
+
+static uint64_t serial_batch_reclaim_callback(server *s, uint64_t want,
+                                              void *user) {
+    (void)user;
+    return s && s->batch_ctx ? ds4_batch_ctx_trim_free(s->batch_ctx, want) : 0;
+}
+
+static bool serial_live_capacity_refuse(server *s, job *j,
+                                        long effective_prompt_len,
+                                        long need_min, int cur_ctx) {
+    server_log(DS4_LOG_WARNING,
+               "ds4-server: live serial continuation needs %ld tokens "
+               "(minimum=%ld) but retained session ctx=%d; preserving frontier and refusing 503",
+               effective_prompt_len, need_min, cur_ctx);
+    char msg[224];
+    snprintf(msg, sizeof(msg),
+             "Server cannot extend the retained %ld-token continuation inside "
+             "its %d-token serial context; retry with a smaller output budget "
+             "or replay the full history",
+             effective_prompt_len, cur_ctx);
+    wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req),
+                    503, msg);
+    j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
+    return false;
+}
+
 /* v0.5.2 inc1: make sure the serial session can actually allocate its graph
  * before generate_job commits to it.  The session is created at server -c
  * and its S6 lazy graph is sized by that ctx, NOT the request -- on a
@@ -14890,6 +15130,19 @@ static void serial_terminal_commit(server *s, job *j, api_style proto,
  * Worker thread only, under gen_mu (the session swap must exclude the cont
  * loop and the /v1/batch path).  Returns false after writing the refusal. */
 static bool serial_session_ensure_fit(server *s, job *j) {
+    long prompt_len = j->req.prompt.len;
+    const serial_frame_kind frame_kind =
+        serial_effective_frame_preflight(s, &j->req, &prompt_len);
+    if (frame_kind == SERIAL_FRAME_REQUIRED_MISS)
+        return true; /* generate_job emits the protocol-native 409. */
+
+    long budget = request_decode_budget(&j->req, s->default_tokens);
+    if (budget < 1) budget = 1;
+    const int cur_ctx = ds4_session_ctx(s->session);
+    long live_need_min = prompt_len + (budget < 1024 ? budget : 1024);
+    if (frame_kind == SERIAL_FRAME_RESOLVED_LIVE && cur_ctx < live_need_min)
+        return serial_live_capacity_refuse(s, j, prompt_len,
+                                           live_need_min, cur_ctx);
     if (!s->serial_rightsize) return true;
     /* Scope: bank-holding boots only (the field 500 class).  On a
      * serial-only deployment (no batch ctx) the full--c session IS the
@@ -14898,22 +15151,28 @@ static bool serial_session_ensure_fit(server *s, job *j) {
      * the serial disk tier -- its payloads are ring-images at the stamped
      * ctx and cannot load into a smaller session. */
     if (!s->batch_ctx) return true;
-    long budget = request_decode_budget(&j->req, s->default_tokens);
-    if (budget < 1) budget = 1;
     const int boot_ctx = s->serial_boot_ctx;
-    long need_full = (long)j->req.prompt.len + budget;
+    long need_full = prompt_len + budget;
     if (need_full > boot_ctx) need_full = boot_ctx;
     /* Below a minimal output window a truncated completion is useless --
      * refuse instead (the deep-serial guard upstream already 503s deep
      * cont-rejects; this is the same capacity class). */
-    long need_min = (long)j->req.prompt.len + (budget < 1024 ? budget : 1024);
+    long need_min = live_need_min;
     if (need_min > boot_ctx) need_min = boot_ctx;
+    long request_cap = need_full + 32768;
+    if (request_cap > boot_ctx) request_cap = boot_ctx;
 
-    const int cur_ctx = ds4_session_ctx(s->session);
     const bool pending = ds4_session_graph_pending(s->session) != 0;
-    if (cur_ctx >= need_min &&
-        (!pending || ds4_engine_session_graph_fits(s->engine, cur_ctx)))
+    bool current_fits = true;
+    if (pending && cur_ctx <= request_cap)
+        current_fits = ds4_engine_session_graph_fits(s->engine, cur_ctx);
+    const serial_fit_plan fit_plan = serial_session_fit_plan(
+        cur_ctx, pending, need_min, request_cap, current_fits, frame_kind);
+    if (fit_plan == SERIAL_FIT_REUSE || fit_plan == SERIAL_FIT_PASS_NATIVE)
         return true;   /* committed-and-big-enough, or pending-and-allocatable */
+    if (fit_plan == SERIAL_FIT_REFUSE_PRESERVE)
+        return serial_live_capacity_refuse(s, j, prompt_len,
+                                           need_min, cur_ctx);
 
     /* The current session cannot serve this request either way -- free it
      * BEFORE probing so a committed right-sized graph's own GiBs count as
@@ -14947,12 +15206,19 @@ static bool serial_session_ensure_fit(server *s, job *j) {
      * Then re-run the same settle window; a still-unfittable request
      * refuses exactly as before. */
     if (!min_fits && s->batch_ctx) {
-        const uint64_t freed = ds4_batch_ctx_trim_free(s->batch_ctx, UINT64_MAX);
+        bool skipped_protected = false;
+        const uint64_t freed = cont_registry_reclaim_unprotected_with_query(
+            s, now_sec(), cont_engine_bank_reference_query, NULL,
+            serial_batch_reclaim_callback, NULL, &skipped_protected);
+        if (skipped_protected) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: serial fit reclaim skipped: a live bank continuation is grace/pin protected");
+        }
         if (freed) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: serial fit reclaim: trimmed %.1f MiB of free-bank cache "
                        "for a %d-token serial request",
-                       (double)freed / 1048576.0, j->req.prompt.len);
+                       (double)freed / 1048576.0, (int)prompt_len);
             for (int tries = 0; tries < 20 && !min_fits; tries++) {
                 if (ds4_engine_session_graph_fits(s->engine, (int)need_min))
                     min_fits = true;
@@ -14968,8 +15234,7 @@ static bool serial_session_ensure_fit(server *s, job *j) {
          * responses APIs live here) grows for many turns inside one session
          * -- per-request-exact sizing would re-create every turn and
          * cold-prefill each time. */
-        long hi = need_full + 32768;
-        if (hi > boot_ctx) hi = boot_ctx;
+        long hi = request_cap;
         long lo = need_min;               /* invariant: lo fits */
         while (hi - lo > 1024) {
             const long mid = lo + (hi - lo) / 2;
@@ -14982,10 +15247,10 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     if (target > 0 && ds4_session_create(&ns, s->engine, (int)target) == 0) {
         s->session = ns;
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: serial session right-sized ctx=%d -> %ld (boot -c %d graph "
-                   "does not fit beside the batch banks; prompt=%d budget=%ld)%s "
+                   "ds4-server: serial session right-sized ctx=%d -> %ld (boot -c %d; "
+                   "request-bounded beside the batch banks, prompt=%d budget=%ld)%s "
                    "(DS4_SERVER_SERIAL_RIGHTSIZE=0 restores full--c alloc)",
-                   cur_ctx, target, boot_ctx, j->req.prompt.len, budget,
+                   cur_ctx, target, boot_ctx, (int)prompt_len, budget,
                    pending ? "" : " [live serial state reset]");
         return true;
     }
@@ -14995,12 +15260,12 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     else die("serial right-size: could not restore the boot session");
     server_log(DS4_LOG_WARNING,
                "ds4-server: serial right-size: no graph fits (prompt=%d need_min=%ld boot -c %d); refusing 503",
-               j->req.prompt.len, need_min, boot_ctx);
+               (int)prompt_len, need_min, boot_ctx);
     char msg[192];
     snprintf(msg, sizeof(msg),
              "Server is temporarily at capacity for a %d-token serial request "
              "(no session graph fits beside the batch banks); retry shortly",
-             j->req.prompt.len);
+             (int)prompt_len);
     wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 503, msg);
     j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
     return false;
@@ -15313,6 +15578,10 @@ typedef struct {
     job   **inflight;
 } cont_sched;
 
+/* Defined after struct cont_stream; retirement only needs its semantic verdict
+ * and transport-failure bit, so keep the state layout private there. */
+static bool cont_stream_requires_partial_rewind(const job *j);
+
 /* ---- A2a: per-bank warm start (retirement records + matching + placement).
  * All of this runs on the worker thread under gen_mu.  The matching is
  * ADVISORY: the engine validates every warm admit against its own committed
@@ -15335,6 +15604,7 @@ static void warm_rec_invalidate(server *s, int bank) {
     s->warm[bank].text = NULL;
     s->warm[bank].len = 0;
     s->warm[bank].valid = false;
+    s->warm[bank].partial_only = false;
     warm_records_gauge_refresh(s);
 }
 
@@ -15365,9 +15635,10 @@ static void cont_append_committed_text(server *s, buf *b, const int *tokens, int
  *     bank's committed frontier, which cont_warm_pick pairs with a tokenized
  *     suffix, so hidden reasoning stays in KV and is never re-prefilled.
  *
- * Same gates as should_remember_thinking_checkpoint(): chat only, tool-less,
- * a clean finish, and a closed thinking block.  Anything else retires without
- * a record, as before. */
+ * A completed/length-limited tool-less row records only a key whose suffix can
+ * be appended to the actual committed frontier.  Transport/semantic cuts, and
+ * a think-close split across the uncommitted last sample, are rewind-only;
+ * runtimes without partial restore retire those banks without a record. */
 static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
                              int finish) {
     if (!s->warm || j->cont_bank < 0 || j->cont_bank >= s->batch_ctx_max_seq) return;
@@ -15430,24 +15701,63 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
          * timeouts on a ~96k compression request, each re-prefilling for
          * minutes.  The bank's committed history begins with exactly the
          * admitted prompt tokens (frontier discipline), so the PROMPT text
-         * alone is a sound record: the retry partial-matches it at the full
-         * prompt and resumes.  The generated reasoning tail is deliberately
-         * NOT recorded (the next re-render drops reasoning); the partial
-         * cut truncates it on reuse. */
-        if (!(s->batch_ctx &&
-              ds4_batch_ctx_bank_committed(s->batch_ctx, bank, NULL) > 0))
+         * alone is a sound key while the committed generation is still inside
+         * thinking: the response parser exposes that tail as reasoning (never
+         * visible content), the next renderer drops old reasoning and appends
+         * exactly one think-close after the retained live tail.  If the close
+         * is already committed, key the committed VISIBLE prefix instead; a
+         * prompt-only exact splice would duplicate close/content.
+         *
+         * A transport failure or semantic stop has no replayable terminal
+         * transcript.  Such a prompt-only record is a partial-rewind hint only
+         * and is dropped on runtimes (Solar KDA) that cannot rewind. */
+        const int committed = s->batch_ctx ?
+            ds4_batch_ctx_bank_committed(s->batch_ctx, bank, NULL) : 0;
+        if (committed <= 0) return;
+
+        buf gen = {0};
+        cont_append_committed_text(s, &gen, tokens, n);
+        const char *think_close = chat_think_end(j->req.chat_format);
+        const char *close = gen.ptr ? strstr(gen.ptr, think_close) : NULL;
+        const bool close_boundary_partial = !close &&
+            text_ends_with_proper_prefix(gen.ptr, think_close);
+        const bool partial_only = server_thinking_record_requires_rewind(
+            n, j->client_gone, cont_stream_requires_partial_rewind(j),
+            close_boundary_partial);
+        if (partial_only && !s->warm_fork_partial) {
+            buf_free(&gen);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: unfinished thinking bank=%d drops rewind-only warm record",
+                       bank);
             return;
-        buf_puts(&tb, j->req.prompt_text);
-        server_log(DS4_LOG_GENERATION,
-                   "ds4-server: aborted decode bank=%d keeps %d-token prompt as warm record",
-                   bank, j->req.prompt.len);
+        }
+
+        if (!partial_only && close) {
+            char *visible = build_cont_toolless_thinking_visible_key(
+                &j->req, close + strlen(think_close));
+            buf_free(&gen);
+            if (!visible) return;
+            buf_puts(&tb, visible);
+            free(visible);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: length-limited thinking bank=%d keeps visible frontier prefix",
+                       bank);
+        } else {
+            buf_free(&gen);
+            buf_puts(&tb, j->req.prompt_text);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: unfinished thinking bank=%d keeps %d-token prompt%s",
+                       bank, j->req.prompt.len,
+                       partial_only ? " as rewind-only record" : " as live-tail key");
+        }
+        s->warm[bank].partial_only = partial_only;
     } else {
         if (j->req.kind != REQ_CHAT || j->req.has_tools) return;
         buf gen = {0};
         cont_append_committed_text(s, &gen, tokens, n);
         const char *think_close = chat_think_end(j->req.chat_format);
         const char *close = gen.ptr ? strstr(gen.ptr, think_close) : NULL;
-        char *visible = close ? build_toolless_thinking_visible_text(
+        char *visible = close ? build_cont_toolless_thinking_visible_key(
                                     &j->req, close + strlen(think_close))
                               : NULL;
         buf_free(&gen);
@@ -15488,7 +15798,8 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
 static bool warm_rec_superseded(const server *s, const bool *occ, int b) {
     if (s->warm[b].len == 0) return false;
     for (int o = 0; o < s->batch_ctx_max_seq; o++) {
-        if (o == b || occ[o] || !s->warm[o].valid) continue;
+        if (o == b || occ[o] || !s->warm[o].valid ||
+            s->warm[o].partial_only) continue;
         if (byte_prefix_match(s->warm[o].text, s->warm[o].len,
                               s->warm[b].text, s->warm[b].len))
             return true;
@@ -15586,7 +15897,7 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
     int best = -1;
     size_t best_len = 0;
     for (int b = 0; b < s->batch_ctx_max_seq; b++) {
-        if (occ[b] || !s->warm[b].valid) continue;
+        if (occ[b] || !s->warm[b].valid || s->warm[b].partial_only) continue;
         if (plen && s->warm[b].len > 0 && s->warm[b].len < plen &&
             s->warm[b].len > best_len &&
             byte_prefix_match(ptext, plen, s->warm[b].text, s->warm[b].len)) {
@@ -15649,7 +15960,8 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
      * exactly like a live retirement. */
     if (best < 0 && plen && s->kv.enabled) {
         int rb = -1;
-        const int didx = ds4_kvstore_find_text_prefix(&s->kv, ptext,
+        const int didx = ds4_kvstore_find_bank_text_prefix(
+                             &s->kv, ptext,
                              ds4_engine_model_id(s->engine),
                              ds4_engine_routed_quant_bits(s->engine),
                              s->serial_boot_ctx);   /* bank tier: serving ctx */
@@ -15666,6 +15978,7 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                 s->warm[rb].text = rtext;
                 s->warm[rb].len = rlen;
                 s->warm[rb].valid = true;
+                s->warm[rb].partial_only = false;
                 s->warm[rb].last_use = ++s->warm_clock;
                 s->warm[rb].stored_tokens = rtok;   /* it IS the disk record */
                 warm_records_gauge_refresh(s);
@@ -15810,6 +16123,7 @@ warm_full_skipped:
                         s->warm[rb].text = rtext;
                         s->warm[rb].len = rlen;
                         s->warm[rb].valid = true;
+                        s->warm[rb].partial_only = false;
                         s->warm[rb].last_use = ++s->warm_clock;
                         s->warm[rb].stored_tokens = rtok;
                         warm_records_gauge_refresh(s);
@@ -16243,6 +16557,11 @@ struct cont_stream {
      * delta machine -- this is the emitted-bytes cursor for that path. */
     size_t plain_stream_pos;
 };
+
+static bool cont_stream_requires_partial_rewind(const job *j) {
+    return j && j->cstream &&
+           (j->cstream->failed || j->cstream->acc.verdict != NULL);
+}
 
 /* A1: does this row need host-side text (stream projection or stop/tool scan)? */
 static bool cont_needs_text(const request *r) {
@@ -21800,6 +22119,130 @@ static void test_unclosed_thinking_is_incomplete_reasoning(void) {
     TEST_ASSERT(!strcmp(sem_accum_terminal_finish(&acc, "length"), "length"));
 }
 
+static void test_no_tools_unclosed_thinking_uses_reasoning_channel(void) {
+    const struct {
+        ds4_chat_format format;
+        const char *raw;
+    } cases[] = {
+        { DS4_CHAT_FORMAT_DSML, "unfinished DSML reasoning" },
+        { DS4_CHAT_FORMAT_SOLAR_OPEN2, "unfinished Solar reasoning" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *finish = "length";
+        char err[64] = {0};
+        char *content = NULL;
+        char *reasoning = NULL;
+        tool_calls calls = {0};
+        bool recovered = false;
+
+        TEST_ASSERT(parse_generated_message_for_response_format(
+            cases[i].raw, false, false, true, cases[i].format, NULL,
+            &finish, err, sizeof(err), &content, &reasoning, &calls,
+            &recovered));
+        TEST_ASSERT(content && content[0] == '\0');
+        TEST_ASSERT(reasoning && !strcmp(reasoning, cases[i].raw));
+        TEST_ASSERT(calls.len == 0);
+        TEST_ASSERT(!strcmp(finish, "length"));
+        TEST_ASSERT(!recovered);
+        TEST_ASSERT(err[0] == '\0');
+
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    }
+}
+
+static void test_length_limited_thinking_uses_nonterminal_visible_prefix(void) {
+    const ds4_chat_format formats[] = {
+        DS4_CHAT_FORMAT_DSML,
+        DS4_CHAT_FORMAT_SOLAR_OPEN2,
+    };
+    for (size_t fi = 0; fi < sizeof(formats) / sizeof(formats[0]); fi++) {
+        const ds4_chat_format format = formats[fi];
+        chat_msgs first = {0};
+        chat_msg u1 = {0};
+        u1.role = xstrdup("user");
+        u1.content = xstrdup("Explain the prefix contract");
+        chat_msgs_push(&first, u1);
+        char *prompt = render_chat_prompt_text_choice_format(
+            &first, NULL, NULL, DS4_THINK_LOW, TOOL_CHOICE_AUTO, format);
+
+        request r = {0};
+        r.think_mode = DS4_THINK_LOW;
+        r.chat_format = format;
+        r.prompt_text = xstrdup(prompt);
+        char *prefix = build_toolless_thinking_visible_prefix(
+            &r, "partial answer", false);
+        char *cont_key = build_cont_toolless_thinking_visible_key(
+            &r, "partial answer");
+        char *terminal = build_toolless_thinking_visible_text(
+            &r, "complete answer");
+        TEST_ASSERT(prefix != NULL);
+        TEST_ASSERT(cont_key != NULL);
+        TEST_ASSERT(terminal != NULL);
+        TEST_ASSERT(prefix && cont_key && !strcmp(prefix, cont_key));
+
+        chat_msgs partial_history = {0};
+        chat_msg ph_u1 = {0};
+        ph_u1.role = xstrdup("user");
+        ph_u1.content = xstrdup("Explain the prefix contract");
+        chat_msgs_push(&partial_history, ph_u1);
+        chat_msg ph_a = {0};
+        ph_a.role = xstrdup("assistant");
+        ph_a.reasoning = xstrdup("hidden reasoning");
+        ph_a.content = xstrdup("partial answer plus uncommitted tail");
+        chat_msgs_push(&partial_history, ph_a);
+        chat_msg ph_u2 = {0};
+        ph_u2.role = xstrdup("user");
+        ph_u2.content = xstrdup("continue");
+        chat_msgs_push(&partial_history, ph_u2);
+        char *partial_future = render_chat_prompt_text_choice_format(
+            &partial_history, NULL, NULL, DS4_THINK_LOW,
+            TOOL_CHOICE_AUTO, format);
+        TEST_ASSERT(prefix && strlen(partial_future) > strlen(prefix));
+        TEST_ASSERT(prefix && !memcmp(partial_future, prefix, strlen(prefix)));
+
+        chat_msgs terminal_history = {0};
+        chat_msg th_u1 = {0};
+        th_u1.role = xstrdup("user");
+        th_u1.content = xstrdup("Explain the prefix contract");
+        chat_msgs_push(&terminal_history, th_u1);
+        chat_msg th_a = {0};
+        th_a.role = xstrdup("assistant");
+        th_a.reasoning = xstrdup("hidden reasoning");
+        th_a.content = xstrdup("complete answer");
+        chat_msgs_push(&terminal_history, th_a);
+        chat_msg th_u2 = {0};
+        th_u2.role = xstrdup("user");
+        th_u2.content = xstrdup("continue");
+        chat_msgs_push(&terminal_history, th_u2);
+        char *terminal_future = render_chat_prompt_text_choice_format(
+            &terminal_history, NULL, NULL, DS4_THINK_LOW,
+            TOOL_CHOICE_AUTO, format);
+        TEST_ASSERT(terminal && strlen(terminal_future) > strlen(terminal));
+        TEST_ASSERT(terminal &&
+                    !memcmp(terminal_future, terminal, strlen(terminal)));
+
+        free(terminal_future);
+        free(partial_future);
+        chat_msgs_free(&terminal_history);
+        chat_msgs_free(&partial_history);
+        free(terminal);
+        free(cont_key);
+        free(prefix);
+        free(r.prompt_text);
+        free(prompt);
+        chat_msgs_free(&first);
+    }
+
+    TEST_ASSERT(text_ends_with_proper_prefix("reasoning</thi", "</think>"));
+    TEST_ASSERT(text_ends_with_proper_prefix("reasoning<|think:e",
+                                             DS4_SOLAR_THINK_END));
+    TEST_ASSERT(!text_ends_with_proper_prefix("reasoning", "</think>"));
+    TEST_ASSERT(!text_ends_with_proper_prefix("reasoning</think>", "</think>"));
+}
+
 static void test_thinking_dsml_after_think_close_is_executable(void) {
     const char *generated =
         "<think>need a shell check</think>\n\n"
@@ -22652,6 +23095,36 @@ static void test_serial_terminal_commit_ladder(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* A graphless deep boot must not reuse its full--c serial shell for a tiny
+ * request merely because that graph fits at this instant: doing so consumes
+ * the batch lane's future deep-cache budget.  A committed graph, however,
+ * carries live continuation state and remains reusable when large enough. */
+static void test_serial_pending_session_respects_request_cap(void) {
+    TEST_ASSERT(!serial_session_reuse_ok(262144, true, 1050, 33818, true));
+    TEST_ASSERT(serial_session_reuse_ok(16384, true, 1050, 16384, true));
+    TEST_ASSERT(serial_session_reuse_ok(32768, true, 1050, 33818, true));
+    TEST_ASSERT(!serial_session_reuse_ok(32768, true, 1050, 33818, false));
+    TEST_ASSERT(serial_session_reuse_ok(262144, false, 1050, 33818, false));
+    TEST_ASSERT(!serial_session_reuse_ok(1024, false, 1050, 33818, true));
+
+    /* A mandatory output-only continuation is sized from its effective live
+     * frame, not its tiny client-frame prompt.  If the retained session cannot
+     * fit that frame, admission must refuse without freeing the only copy of
+     * the continuation frontier. */
+    TEST_ASSERT(serial_session_fit_plan(
+        32066, false, 251024, 262144, false,
+        SERIAL_FRAME_RESOLVED_LIVE) == SERIAL_FIT_REFUSE_PRESERVE);
+    TEST_ASSERT(serial_session_fit_plan(
+        262144, false, 251024, 262144, false,
+        SERIAL_FRAME_RESOLVED_LIVE) == SERIAL_FIT_REUSE);
+    TEST_ASSERT(serial_session_fit_plan(
+        32066, false, 64, 32800, false,
+        SERIAL_FRAME_REQUIRED_MISS) == SERIAL_FIT_PASS_NATIVE);
+    TEST_ASSERT(serial_session_fit_plan(
+        32066, false, 1024, 33792, false,
+        SERIAL_FRAME_CANONICAL) == SERIAL_FIT_REUSE);
+}
+
 /* Inc 5c: BATCH_BANK publication + claim -- per-bank supersession, owner
  * isolation from the serial tip, the caller-side generation/frontier
  * equality that refuses the queued-eviction ABA, and lazy TTL covering
@@ -22767,6 +23240,20 @@ typedef struct {
     int len;
 } test_cont_bank_references;
 
+typedef struct {
+    int calls;
+    uint64_t result;
+} test_cont_reclaim_state;
+
+static uint64_t test_cont_reclaim_callback(server *s, uint64_t want,
+                                           void *user) {
+    (void)s;
+    (void)want;
+    test_cont_reclaim_state *state = user;
+    state->calls++;
+    return state->result;
+}
+
 static bool test_cont_bank_reference_query(server *s, int bank,
                                            uint64_t *gen, int *frontier,
                                            void *user) {
@@ -22810,10 +23297,23 @@ static void test_cont_registry_bank_protection(void) {
         &s, 5, now, test_cont_bank_reference_query, &refs));
     TEST_ASSERT(!cont_registry_bank_protected_with_query(
         &s, 4, now, test_cont_bank_reference_query, &refs));
+    /* Serial reclaim is an atomic check-and-act under tool_mu: one current
+     * grace/pin-protected bank blocks the all-bank trim callback entirely. */
+    test_cont_reclaim_state reclaim = {.calls = 0, .result = 77};
+    bool reclaim_skipped = false;
+    TEST_ASSERT(cont_registry_reclaim_unprotected_with_query(
+        &s, now, test_cont_bank_reference_query, &refs,
+        test_cont_reclaim_callback, &reclaim, &reclaim_skipped) == 0);
+    TEST_ASSERT(reclaim_skipped && reclaim.calls == 0);
     /* Either side of the execution reference moving makes the record stale. */
     refs.gen[0] = 4;
     TEST_ASSERT(!cont_registry_bank_protected_with_query(
         &s, 5, now, test_cont_bank_reference_query, &refs));
+    reclaim_skipped = true;
+    TEST_ASSERT(cont_registry_reclaim_unprotected_with_query(
+        &s, now, test_cont_bank_reference_query, &refs,
+        test_cont_reclaim_callback, &reclaim, &reclaim_skipped) == 77);
+    TEST_ASSERT(!reclaim_skipped && reclaim.calls == 1);
     refs.gen[0] = 3;
     refs.frontier[0] = 201;
     TEST_ASSERT(!cont_registry_bank_protected_with_query(
@@ -23389,6 +23889,37 @@ static void test_partial_warm_policy_requires_runtime_support(void) {
     TEST_ASSERT(!server_partial_warm_policy(true, false));
     TEST_ASSERT(!server_partial_warm_policy(false, true));
     TEST_ASSERT(!server_partial_warm_policy(false, false));
+    TEST_ASSERT(!server_thinking_record_requires_rewind(1, true, true, true));
+    TEST_ASSERT(server_thinking_record_requires_rewind(2, true, false, false));
+    TEST_ASSERT(server_thinking_record_requires_rewind(2, false, true, false));
+    TEST_ASSERT(server_thinking_record_requires_rewind(2, false, false, true));
+    TEST_ASSERT(!server_thinking_record_requires_rewind(2, false, false, false));
+}
+
+static void test_rewind_only_record_cannot_supersede_exact_record(void) {
+    server s = {0};
+    s.batch_ctx_max_seq = 2;
+    s.warm = xmalloc(2 * sizeof(*s.warm));
+    memset(s.warm, 0, 2 * sizeof(*s.warm));
+    bool occ[2] = {false, false};
+
+    s.warm[0].valid = true;
+    s.warm[0].text = xstrdup("prefix");
+    s.warm[0].len = strlen(s.warm[0].text);
+    s.warm[0].partial_only = false;
+    s.warm[1].valid = true;
+    s.warm[1].text = xstrdup("prefix plus tail");
+    s.warm[1].len = strlen(s.warm[1].text);
+    s.warm[1].partial_only = true;
+    TEST_ASSERT(!warm_rec_superseded(&s, occ, 0));
+
+    s.warm[0].partial_only = true;
+    s.warm[1].partial_only = false;
+    TEST_ASSERT(warm_rec_superseded(&s, occ, 0));
+
+    free(s.warm[0].text);
+    free(s.warm[1].text);
+    free(s.warm);
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -23682,10 +24213,11 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
-static void test_kv_text_stub_file_model(const char *dir, const char *text,
-                                         uint8_t model_id, uint8_t reason,
-                                         uint32_t tokens,
-                                         uint64_t payload_bytes) {
+static void test_kv_text_stub_file_model_ext(const char *dir, const char *text,
+                                             uint8_t model_id, uint8_t reason,
+                                             uint8_t ext_flags,
+                                             uint32_t tokens,
+                                             uint64_t payload_bytes) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
     char name[44];
@@ -23699,7 +24231,7 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
+    ds4_kvstore_fill_header(h, model_id, 2, reason, ext_flags, tokens, 0,
                             32768, 100, 100, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
@@ -23711,6 +24243,14 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static void test_kv_text_stub_file_model(const char *dir, const char *text,
+                                         uint8_t model_id, uint8_t reason,
+                                         uint32_t tokens,
+                                         uint64_t payload_bytes) {
+    test_kv_text_stub_file_model_ext(dir, text, model_id, reason, 0,
+                                     tokens, payload_bytes);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
@@ -23829,6 +24369,110 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     kv_cache_close(&kc);
     unlink(path);
     free(path);
+    rmdir(dir);
+}
+
+static void test_kv_bank_records_require_replay_contract(void) {
+    char tmpl[] = "/tmp/ds4-kv-bank-contract-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *legacy = "legacy bank prefix";
+    const char *safe = "safe bank prefix";
+    const char *serial = "serial prefix";
+    const char *touched = "unknown touched bank";
+    const char *malformed = "marked serial prefix";
+    test_kv_text_stub_file_model_ext(
+        dir, legacy, 2, DS4_KVSTORE_REASON_BANK_CHECKPOINT, 0, 700, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, safe, 2, DS4_KVSTORE_REASON_BANK_CHECKPOINT,
+        DS4_KVSTORE_EXT_BANK_REPLAY_V1, 800, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, serial, 2, DS4_KVSTORE_REASON_COLD, 0, 600, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, touched, 2, DS4_KVSTORE_REASON_UNKNOWN, 0, 750, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, malformed, 2, DS4_KVSTORE_REASON_COLD,
+        DS4_KVSTORE_EXT_BANK_REPLAY_V1, 650, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "serial prefix tail", 2, 2, 32768) >= 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "serial prefix", 2, 2, 32768) >= 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "serial prefix", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "legacy bank prefix tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "safe bank prefix tail", 2, 2, 32768) >= 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "safe bank prefix", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "legacy bank prefix tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "unknown touched bank tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "unknown touched bank tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "marked serial prefix tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "marked serial prefix tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "serial prefix tail", 2, 2, 32768) >= 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "safe bank prefix", 2, 2, 32768) < 0);
+    int idx = ds4_kvstore_find_bank_text_prefix(
+        &kc, "safe bank prefix tail", 2, 2, 32768);
+    TEST_ASSERT(idx >= 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].reason ==
+                               DS4_KVSTORE_REASON_BANK_CHECKPOINT);
+    TEST_ASSERT(idx >= 0 &&
+                (kc.entry[idx].ext_flags & DS4_KVSTORE_EXT_BANK_REPLAY_V1));
+    size_t lcp = 0;
+    TEST_ASSERT(ds4_kvstore_find_text_lcp(
+                    &kc, "legacy bank prefiX", 2, 2, 32768, 8, &lcp) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_lcp(
+                    &kc, "unknown touched banX", 2, 2, 32768, 8, &lcp) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_lcp(
+                    &kc, "marked serial prefiX", 2, 2, 32768, 8, &lcp) < 0);
+    idx = ds4_kvstore_find_text_lcp(
+        &kc, "safe bank prefiX", 2, 2, 32768, 8, &lcp);
+    TEST_ASSERT(idx >= 0 && lcp >= 8);
+
+    char safe_sha[41];
+    sha1_bytes_hex(safe, strlen(safe), safe_sha);
+    char safe_name[44];
+    snprintf(safe_name, sizeof(safe_name), "%.40s.kv", safe_sha);
+    char *safe_path = path_join(dir, safe_name);
+    ds4_kvstore_entry before = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(safe_path, safe_sha, &before));
+    TEST_ASSERT(before.reason == DS4_KVSTORE_REASON_BANK_CHECKPOINT);
+    TEST_ASSERT(ds4_kvstore_touch_file(safe_path, 3));
+    ds4_kvstore_entry after = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(safe_path, safe_sha, &after));
+    TEST_ASSERT(after.reason == DS4_KVSTORE_REASON_BANK_CHECKPOINT);
+    TEST_ASSERT(after.hits == 3);
+    TEST_ASSERT(after.ext_flags & DS4_KVSTORE_EXT_BANK_REPLAY_V1);
+    ds4_kvstore_entry_free(&before);
+    ds4_kvstore_entry_free(&after);
+
+    kv_cache_close(&kc);
+    const char *texts[] = {legacy, safe, serial, touched, malformed};
+    for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]); i++) {
+        char sha[41], name[44];
+        sha1_bytes_hex(texts[i], strlen(texts[i]), sha);
+        snprintf(name, sizeof(name), "%.40s.kv", sha);
+        char *path = path_join(dir, name);
+        unlink(path);
+        free(path);
+    }
+    free(safe_path);
     rmdir(dir);
 }
 
@@ -27426,6 +28070,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_sse_headers();
     test_server_model_ids_cover_loaded_variants();
     test_partial_warm_policy_requires_runtime_support();
+    test_rewind_only_record_cannot_supersede_exact_record();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
@@ -27452,6 +28097,8 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
     test_unclosed_thinking_is_incomplete_reasoning();
+    test_no_tools_unclosed_thinking_uses_reasoning_channel();
+    test_length_limited_thinking_uses_nonterminal_visible_prefix();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
@@ -27468,6 +28115,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_registry_record_unit_eviction();
     test_send_all_capture_redirect();
     test_serial_terminal_commit_ladder();
+    test_serial_pending_session_respects_request_cap();
     test_cont_registry_bank_publish_claim();
     test_cont_registry_bank_protection();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
@@ -27508,6 +28156,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
+    test_kv_bank_records_require_replay_contract();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();
