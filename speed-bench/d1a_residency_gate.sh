@@ -226,7 +226,10 @@ pair_leg l3_allthree "" "--mtp $MTP_GGUF" base mtp drafter
 # ---- (l4) slice boot: worker-shape, boot asserts only ----
 log "(l4) slice boot: coordinator --layers 20:40 (boot-shape leg)"
 SLOG=/tmp/d1ares_l4_slice.log
-boot_tree "$TEST_TREE" "" "--role coordinator --listen 127.0.0.1 9411 --layers 20:40 --no-spec" \
+# -m is EXPLICIT here: zero-config launch defaults do not engage on
+# distributed-role boots (l4 finding #2 -- the coordinator fell back to
+# the ds4flash.gguf default path).
+boot_tree "$TEST_TREE" "" "-m $BASE_GGUF --role coordinator --listen 127.0.0.1 9411 --layers 20:40 --no-spec" \
     "$SLOG" "backend initialized for graph diagnostics" \
     || die "l4 slice coordinator boot failed (never reached backend init)"
 plan_asserts "$SLOG" base
