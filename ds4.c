@@ -15988,7 +15988,29 @@ static bool plain_graph_layer_tail(ds4_plain_gpu_graph *g,
         batch ? ws->routed_mid : g->routed_mid;
     ds4_gpu_tensor *routed_down =
         batch ? ws->routed_down : g->routed_down;
-    if (!ds4_gpu_routed_gate_up_tensor(
+    /* Default-on atomic IQ2->Q3 wide-prefill handoff (n_tokens >= 512). Set
+     * DS4_CUDA_MOE_IQ2_Q3_HANDOFF=0 for the classic chain. routed_mid is large
+     * enough for the D4 payload plus MMQ tail slack at every Solar production
+     * shape; the CUDA wrapper proves the exact logical capacity before
+     * launching. A pre-launch refusal returns 0 and replays the established
+     * chain from its first operation. A negative value is post-launch and must
+     * fail the layer rather than double-execute it. */
+    const int iq2_q3_handoff = ds4_gpu_routed_iq2_q3_handoff_tensor(
+                routed_down, routed_gate, routed_up, routed_mid,
+                norm, selected, router_weights,
+                model->map, model->size,
+                layer->ffn_gate_exps->abs_offset,
+                layer->ffn_gate_exps->bytes,
+                layer->ffn_up_exps->abs_offset,
+                layer->ffn_up_exps->bytes,
+                layer->ffn_down_exps->abs_offset,
+                layer->ffn_down_exps->bytes,
+                layer->ffn_gate_exps->type,
+                layer->ffn_down_exps->type,
+                (uint32_t)g->n_embd, n_ff_exp, (uint32_t)g->n_embd,
+                DS4_N_EXPERT, n_tokens, n_used);
+    if (iq2_q3_handoff < 0) return false;
+    if (iq2_q3_handoff == 0 && (!ds4_gpu_routed_gate_up_tensor(
                 routed_gate, routed_up, norm, selected,
                 model->map, model->size,
                 layer->ffn_gate_exps->abs_offset,
@@ -16013,7 +16035,7 @@ static bool plain_graph_layer_tail(ds4_plain_gpu_graph *g,
                 layer->ffn_down_exps->bytes,
                 layer->ffn_down_exps->type,
                 n_ff_exp, (uint32_t)g->n_embd, DS4_N_EXPERT,
-                n_tokens * n_used, 1u, n_tokens)) {
+                n_tokens * n_used, 1u, n_tokens))) {
         return false;
     }
 

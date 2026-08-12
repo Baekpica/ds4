@@ -25389,6 +25389,219 @@ extern "C" int ds4_gpu_routed_gate_up_tensor(
                               "routed gate/up pair launch");
 }
 
+static unsigned long long g_moe_iq2_q3_handoff_launches = 0;
+
+/* The handoff is an adopted production prefill path. Unset and exactly "1"
+ * enable it; exactly "0" and every other explicit value conservatively
+ * disable it before any CUDA work is submitted. */
+static bool cuda_moe_iq2_q3_handoff_enabled(void) {
+    const char *policy = getenv("DS4_CUDA_MOE_IQ2_Q3_HANDOFF");
+    return policy == nullptr ||
+           (policy[0] == '1' && policy[1] == '\0');
+}
+
+static bool cuda_q8_d4_bytes(uint64_t value_count, uint64_t *bytes) {
+    constexpr uint64_t values_per_block = 128u;
+    constexpr uint64_t bytes_per_block = 144u;
+    if (!bytes || value_count % values_per_block != 0u) return false;
+    const uint64_t blocks = value_count / values_per_block;
+    if (blocks > UINT64_MAX / bytes_per_block) return false;
+    *bytes = blocks * bytes_per_block;
+    return true;
+}
+
+extern "C" unsigned long long ds4_cuda_moe_iq2_q3_handoff_launches(void) {
+    return g_moe_iq2_q3_handoff_launches;
+}
+
+extern "C" int ds4_gpu_swiglu_weighted_q8_d4_emit_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, const ds4_gpu_tensor *router_weights,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim,
+        uint32_t n_assign) {
+    if (!q8_out || !gate || !up || !router_weights || !ids_dst ||
+        mid_dim == 0u || (mid_dim & 255u) != 0u || n_assign == 0u ||
+        mid_dim > (uint32_t)INT_MAX || n_assign > (uint32_t)INT_MAX ||
+        (uint64_t)n_assign > UINT64_MAX / mid_dim) return 0;
+    const uint64_t count = (uint64_t)n_assign * mid_dim;
+    if (count > UINT64_MAX / sizeof(float)) return 0;
+    uint64_t q8_bytes = 0;
+    if (!cuda_q8_d4_bytes(count, &q8_bytes)) return 0;
+    if (gate->bytes < count * sizeof(float) ||
+        up->bytes < count * sizeof(float) ||
+        router_weights->bytes < (uint64_t)n_assign * sizeof(float) ||
+        ids_dst->bytes < (uint64_t)n_assign * sizeof(int32_t) ||
+        q8_out->bytes < q8_bytes) return 0;
+    return ds4_mmq_swiglu_weighted_q8_d4_emit_test(
+        (const float *)gate->ptr, (const float *)up->ptr,
+        (const float *)router_weights->ptr,
+        (const int32_t *)ids_dst->ptr, q8_out->ptr,
+        (int)mid_dim, (int)n_assign, ds4_mmq_stream_for_call()) == 0;
+}
+
+extern "C" int ds4_gpu_q3_quantize_ref_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim,
+        uint32_t n_assign) {
+    if (!q8_out || !mid || !ids_dst || mid_dim == 0u ||
+        (mid_dim & 255u) != 0u || n_assign == 0u ||
+        mid_dim > (uint32_t)INT_MAX || n_assign > (uint32_t)INT_MAX ||
+        (uint64_t)n_assign > UINT64_MAX / mid_dim) return 0;
+    const uint64_t count = (uint64_t)n_assign * mid_dim;
+    if (count > UINT64_MAX / sizeof(float)) return 0;
+    uint64_t q8_bytes = 0;
+    if (!cuda_q8_d4_bytes(count, &q8_bytes)) return 0;
+    if (mid->bytes < count * sizeof(float) ||
+        ids_dst->bytes < (uint64_t)n_assign * sizeof(int32_t) ||
+        q8_out->bytes < q8_bytes) return 0;
+    return ds4_mmq_q3_K_quantize_ref(
+        (const float *)mid->ptr, (const int32_t *)ids_dst->ptr,
+        q8_out->ptr, (int)mid_dim, (int)n_assign,
+        ds4_mmq_stream_for_call()) == 0;
+}
+
+extern "C" int ds4_gpu_q3_worklist_preflight_test(
+        int32_t out_dim, int32_t mid_dim, int64_t n_assign,
+        int32_t n_expert, int64_t stride_row, int64_t stride_expert) {
+    return ds4_mmq_q3_K_worklist_preflight_test(
+        (int)out_dim, (int)mid_dim, n_assign, (int)n_expert,
+        stride_row, stride_expert);
+}
+
+extern "C" int ds4_gpu_routed_iq2_q3_handoff_tensor(
+        ds4_gpu_tensor *down, ds4_gpu_tensor *gate_scratch,
+        ds4_gpu_tensor *up_scratch, ds4_gpu_tensor *q8_scratch,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *router_weights,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t gate_bytes,
+        uint64_t up_offset, uint64_t up_bytes,
+        uint64_t down_offset, uint64_t down_bytes,
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        uint32_t n_expert, uint32_t n_tokens, uint32_t n_expert_used) {
+    if (!cuda_moe_iq2_q3_handoff_enabled() ||
+        !down || !gate_scratch || !up_scratch || !q8_scratch || !x ||
+        !ids || !router_weights || !model_map || gate_type != 16u ||
+        down_type != 11u || n_tokens < 512u || n_expert == 0u ||
+        n_expert_used == 0u || n_expert_used > n_expert ||
+        n_tokens >= (1u << 22) || n_expert_used >= (1u << 10) ||
+        in_dim > (uint32_t)INT_MAX || mid_dim > (uint32_t)INT_MAX ||
+        out_dim > (uint32_t)INT_MAX || n_expert > 32768u ||
+        n_tokens > (uint32_t)INT_MAX ||
+        n_expert_used > (uint32_t)INT_MAX ||
+        in_dim == 0u || (in_dim & 255u) != 0u ||
+        mid_dim == 0u || (mid_dim & 255u) != 0u || out_dim == 0u ||
+        gate_bytes != up_bytes || gate_offset > model_size ||
+        gate_bytes > model_size - gate_offset || up_offset > model_size ||
+        up_bytes > model_size - up_offset || down_offset > model_size ||
+        down_bytes > model_size - down_offset || !ds4_cuda_use_mmq() ||
+        !cuda_moe_iq2_aligned_enabled() ||
+        !cuda_mmq_aligned_tiles_enabled() ||
+        q8_scratch->bytes > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    if ((uint64_t)n_tokens > UINT64_MAX / n_expert_used) return 0;
+    const uint64_t assignments = (uint64_t)n_tokens * n_expert_used;
+    const uint64_t d2r_capacity64 =
+        (assignments + 63u) / 64u + (uint64_t)n_expert;
+    if (d2r_capacity64 > 65535u) return 0;
+    if (assignments > UINT64_MAX / mid_dim ||
+        assignments > UINT64_MAX / out_dim) return 0;
+    const uint64_t mid_count = assignments * mid_dim;
+    const uint64_t down_count = assignments * out_dim;
+    if (mid_count > (uint64_t)INT_MAX ||
+        mid_count > UINT64_MAX / sizeof(float) ||
+        down_count > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_tokens > UINT64_MAX / in_dim ||
+        (uint64_t)n_tokens * in_dim > UINT64_MAX / sizeof(float) ||
+        x->bytes < (uint64_t)n_tokens * in_dim * sizeof(float) ||
+        ids->bytes < assignments * sizeof(int32_t) ||
+        router_weights->bytes < assignments * sizeof(float) ||
+        gate_scratch->bytes < mid_count * sizeof(float) ||
+        up_scratch->bytes < mid_count * sizeof(float) ||
+        down->bytes < down_count * sizeof(float)) {
+        return 0;
+    }
+    /* routed_mid is the only reused scratch view. Its declared tensor bytes
+     * are the authoritative logical span (not the surrounding arena cap).
+     * The low-level preflight applies the architecture-specific MMQ slack. */
+    uint64_t q8_payload = 0;
+    constexpr uint64_t q8_slack = 128u * 144u;
+    if (!cuda_q8_d4_bytes(mid_count, &q8_payload) ||
+        q8_payload > UINT64_MAX - q8_slack ||
+        q8_scratch->bytes < q8_payload + q8_slack) {
+        return 0;
+    }
+    const uint64_t iq2_blocks_per_row = in_dim / 256u;
+    const uint64_t q3_blocks_per_row = mid_dim / 256u;
+    if ((uint64_t)n_expert > UINT64_MAX / mid_dim ||
+        (uint64_t)n_expert * mid_dim > UINT64_MAX / iq2_blocks_per_row ||
+        (uint64_t)n_expert > UINT64_MAX / out_dim ||
+        (uint64_t)n_expert * out_dim > UINT64_MAX / q3_blocks_per_row) {
+        return 0;
+    }
+    const uint64_t iq2_blocks =
+        (uint64_t)n_expert * mid_dim * iq2_blocks_per_row;
+    const uint64_t q3_blocks =
+        (uint64_t)n_expert * out_dim * q3_blocks_per_row;
+    /* The aligned IQ2 artifact rounds its 2-byte scale plane up to 64 bytes,
+     * then appends 64 bytes per block. Reserve the worst-case 63-byte round-up
+     * before calling the lower-level size helper. */
+    if (iq2_blocks > (UINT64_MAX - 63u) / 66u ||
+        q3_blocks > UINT64_MAX / 110u ||
+        gate_bytes < iq2_blocks * 66u || down_bytes < q3_blocks * 110u) {
+        return 0;
+    }
+
+    const uint64_t aligned_bytes = ds4_mmq_iq2_xxs_aligned_bytes(
+        (int)mid_dim, (int)in_dim, (int)n_expert);
+    const char *gate_aligned = aligned_bytes
+        ? cuda_derived_weight_ptr(
+              model_map, gate_offset, gate_bytes,
+              CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+              in_dim, mid_dim, n_expert, aligned_bytes,
+              "iq2_q3_gate_aligned")
+        : NULL;
+    const char *up_aligned = aligned_bytes
+        ? cuda_derived_weight_ptr(
+              model_map, up_offset, up_bytes,
+              CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+              in_dim, mid_dim, n_expert, aligned_bytes,
+              "iq2_q3_up_aligned")
+        : NULL;
+    const char *down_q3 = cuda_model_range_ptr(
+        model_map, down_offset, down_bytes, "iq2_q3_down_q3");
+    if (!gate_aligned || !up_aligned || !down_q3) return 0;
+
+    const int rc = ds4_mmq_iq2_xxs_q3_K_moe_handoff_soa(
+        gate_aligned, up_aligned, down_q3,
+        (const float *)x->ptr, (const int32_t *)ids->ptr,
+        (const float *)router_weights->ptr,
+        (float *)gate_scratch->ptr, (float *)up_scratch->ptr,
+        q8_scratch->ptr, (size_t)q8_scratch->bytes,
+        (float *)down->ptr, (int)mid_dim, (int)in_dim, (int)out_dim,
+        (int)n_tokens, (int)n_expert, (int)n_expert_used,
+        ds4_mmq_stream_for_call());
+    if (rc == -1) return 0;
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4: IQ2/Q3 shared-map handoff failed after launch rc=%d\n",
+                rc);
+        return -1;
+    }
+    ++g_moe_iq2_q3_handoff_launches;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr,
+                "ds4: IQ2/Q3 shared-map D4 handoff engaged "
+                "(default on; DS4_CUDA_MOE_IQ2_Q3_HANDOFF=0 disables; "
+                "tokens=%u mid=%u)\n", n_tokens, mid_dim);
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
