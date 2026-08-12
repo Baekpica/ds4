@@ -29131,6 +29131,26 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
     if (errlen != 0) snprintf(err, errlen, "%s", "output-head bench requires GPU support");
     return 1;
 }
+int ds4_dspark_capture_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: dspark capture validate requires GPU support\n");
+    return 1;
+}
+int ds4_dspark_slabs_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: dspark slabs validate requires GPU support\n");
+    return 1;
+}
+int ds4_dspark_tap_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: dspark tap validate requires GPU support\n");
+    return 1;
+}
+int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: dspark block validate requires GPU support\n");
+    return 1;
+}
 #endif
 
 /* =========================================================================
@@ -29570,6 +29590,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
 #endif
 }
 
+#ifndef DS4_NO_GPU
 /* Increment B: the per-layer tensor walk of a session payload, over one
  * payload_region.  Serial save passes the zero-offset region; the bank
  * serializer passes seq-strided offsets + that bank's counters.  Byte
@@ -29988,6 +30009,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
     }
     return rc;
 }
+#endif /* !DS4_NO_GPU */
 
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
@@ -38554,6 +38576,41 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     (void)ctx; (void)admit; (void)on_token; (void)on_done; (void)ud;
     if (err && errlen) snprintf(err, errlen, "continuous_generate: build has no graph backend");
     return 1;
+}
+int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                  FILE *fp, uint64_t payload_bytes,
+                                  char *err, size_t errlen) {
+    (void)ctx; (void)bank; (void)fp; (void)payload_bytes;
+    if (err && errlen) snprintf(err, errlen, "bank_restore_payload: build has no graph backend");
+    return 1;
+}
+int ds4_cont_bank_stage_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                ds4_session_payload_file *out,
+                                char *err, size_t errlen) {
+    (void)ctx; (void)bank;
+    if (out) memset(out, 0, sizeof(*out));
+    if (err && errlen) snprintf(err, errlen, "bank_stage_payload: build has no graph backend");
+    return 1;
+}
+uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
+    (void)ctx; (void)want_bytes;
+    return 0;
+}
+uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx) {
+    (void)e; (void)ctx;
+    return 0;
+}
+/* memgov shadow governor: no graph backend means no substrate to govern.
+ * Publishes drop, checks don't tick, snapshots read as the empty ledger. */
+void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
+    (void)consumer; (void)intent; (void)resident;
+}
+void ds4_gov_snapshot(ds4_gov_ledger *out) {
+    if (out) memset(out, 0, sizeof(*out));
+}
+void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
+                          int live_status) {
+    (void)site; (void)cl; (void)live_status;
 }
 #endif
 
