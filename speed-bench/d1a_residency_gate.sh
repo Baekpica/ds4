@@ -27,7 +27,11 @@
 #   (l5) raw                DS4_CUDA_NO_DERIVED_WEIGHTS=1
 #                           DS4_CUDA_NO_HBM_CACHE=1 (+ pinned vmm budget
 #                           for the control pair, d0a nohbm law)
-#        + golden vectors under the same env.
+#        + golden vectors under the same env in CONTROL mode: raw runs
+#        different kernel families than the stock-recorded fixture and
+#        sits outside its band BY CONSTRUCTION (control A/B 08-12
+#        reproduced 3/5 45/64 max_abs 9.69399 digit-for-digit on the
+#        pre-D1a tree) -- the oracle is exact test==control equivalence.
 #   (l6) self-load          stock zero-config; asserts the BUILT artifact
 #        banner + golden vectors under stock env.
 #   (l7) manifest           .33-local ds4_weight_server --scope base,
@@ -221,18 +225,40 @@ pair_leg() { # $1 name  $2 env  $3 flags  $4.. expected sources
     die "$name: derived decisions diverge or inputs drift on both attempts -- NOT jitter"
 }
 
-golden_leg() { # $1 name  $2 env
+golden_run() { # $1 tree  $2 env  $3 log -> echoes RC
+    R "cd $1 && env DS4_TEST_MODEL=$BASE_GGUF DS4_TEST_LOCAL_GOLDEN_FILE=$GOLDEN_VEC $2 ./ds4_test --local-golden-vectors > $3 2>&1; echo \$?"
+}
+golden_leg() { # $1 name  $2 env  $3 mode: fixture|control
     # NOTE: GLOG must sit in its OWN local statement -- all words of one
     # `local` command expand BEFORE any assignment lands, so a same-line
     # ${name} is unbound under set -u (l5->golden first-run finding).
-    local name=$1 env=$2 RC
+    local name=$1 env=$2 mode=$3 RC
     local GLOG=/tmp/d1ares_golden_${name}.log
-    log "(golden:$name) ds4_test --local-golden-vectors under $name env"
-    RC=$(R "cd $TEST_TREE && env DS4_TEST_MODEL=$BASE_GGUF DS4_TEST_LOCAL_GOLDEN_FILE=$GOLDEN_VEC $env ./ds4_test --local-golden-vectors > $GLOG 2>&1; echo \$?")
+    log "(golden:$name) ds4_test --local-golden-vectors under $name env [$mode]"
+    RC=$(golden_run "$TEST_TREE" "$env" "$GLOG")
     R "grep 'ds4-test: local golden' $GLOG" || true
-    [ "$RC" = "0" ] || { R "tail -15 $GLOG"; die "golden:$name RC=$RC"; }
     R "grep -q 'ds4-test: local golden' $GLOG" || die "golden:$name: no golden summary line"
-    log "(golden:$name) PASS"
+    if [ "$mode" = "fixture" ]; then
+        # The fixture band is the oracle ONLY for configs matching the
+        # fixture's recorded config (aligned artifacts: self-load and
+        # manifest boots).
+        [ "$RC" = "0" ] || { R "tail -15 $GLOG"; die "golden:$name RC=$RC"; }
+    else
+        # Kernel-family modes (raw) drift outside the stock-recorded band
+        # BY CONSTRUCTION -- control A/B 2026-08-12 reproduced the raw
+        # numbers digit-for-digit on the pre-D1a tree (3/5, 45/64,
+        # max_abs 9.69399, RC=1 on both).  The oracle here is EXACT
+        # equivalence with the control tree under the same env.
+        local CRC
+        CRC=$(golden_run "$CTRL_TREE" "$env" "${GLOG}.ctrl")
+        R "grep 'ds4-test: local golden' ${GLOG}.ctrl" | sed 's/^/    ctrl: /' || true
+        if ! diff <(R "grep 'ds4-test: local golden' $GLOG") \
+                  <(R "grep 'ds4-test: local golden' ${GLOG}.ctrl") >/dev/null; then
+            die "golden:$name: test/control golden lines differ under $name env"
+        fi
+        [ "$RC" = "$CRC" ] || die "golden:$name: RC differs (test=$RC control=$CRC)"
+    fi
+    log "(golden:$name) PASS ($mode)"
     sleep 10
 }
 
@@ -266,13 +292,13 @@ log "(l4) PASS (boot-shape asserts; serving needs a coordinator — receipt note
 
 # ---- (l5) raw + goldens ----
 pair_leg l5_raw "DS4_CUDA_NO_DERIVED_WEIGHTS=1 DS4_CUDA_NO_HBM_CACHE=1 DS4_BATCH_VMM_BUDGET_MB=8000" "" base drafter
-golden_leg raw "DS4_CUDA_NO_DERIVED_WEIGHTS=1 DS4_CUDA_NO_HBM_CACHE=1"
+golden_leg raw "DS4_CUDA_NO_DERIVED_WEIGHTS=1 DS4_CUDA_NO_HBM_CACHE=1" control
 
 # ---- (l6) self-load + goldens ----
 pair_leg l6_selfload "" "" base drafter
 R "grep -q 'ds4: aligned artifacts built in-process' /tmp/d1ares_l6_selfload_T.log" \
     || die "l6: no BUILT artifact banner on the self-load boot"
-golden_leg selfload ""
+golden_leg selfload "" fixture
 
 # ---- (l7) manifest via .33-local weight server + goldens ----
 log "(l7) starting ds4_weight_server (scope=base) -- repacks take minutes"
@@ -292,7 +318,7 @@ if [ "$WS_OK" = "1" ]; then
     pair_leg l7_manifest "DS4_CUDA_WEIGHT_IPC_MANIFEST=$WS_MANIFEST" "--no-spec" base
     R "grep -q 'ds4: CUDA imported shared' /tmp/d1ares_l7_manifest_T.log" \
         || die "l7: no import engagement line"
-    golden_leg manifest "DS4_CUDA_WEIGHT_IPC_MANIFEST=$WS_MANIFEST"
+    golden_leg manifest "DS4_CUDA_WEIGHT_IPC_MANIFEST=$WS_MANIFEST" fixture
     R "kill $WSPID" 2>/dev/null; WSPID=""
     sleep 5
 else
