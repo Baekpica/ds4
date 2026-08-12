@@ -5,6 +5,26 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## Unreleased
+
+- The zero-config launch defaults are now checkpoint-generation aware
+  (serving-gguf audit 2026-08-12: the compiled-in default file names
+  were the pre-0731 set, so a raw `ds4-server -c N` on a box holding
+  both generations silently served the old checkpoint). Resolution
+  prefers the -0731 file names and falls back to the previous-
+  generation names; the generation is detected from the resolved base
+  file name — the same scheme as the ds4-on-spark installer, so
+  GGUF_FILE overrides keep working in both directions. The 0731
+  checkpoint has no MTP head (replaced upstream by the DSpark
+  stages), so the legacy MTP gguf never auto-attaches beside a 0731
+  base — `--preset spark` included, whose full stack on 0731 is base
+  + drafter — and the boot line says so (`mtp=retired`). An explicit
+  `--mtp` still wins, as do all existing flags and env overrides.
+  Gate: `launch_defaults_gate.sh` new `gen_resolve` fake-layout leg
+  (boot-line asserts on dirs holding both generations, either alone,
+  and the mixed fallback) plus 0731-shape assertions on the
+  zero-config and preset legs.
+
 ## v0.5.6.3 — 2026-08-11
 
 Memory-footprint fix for long-running serving on memory-tight boxes
