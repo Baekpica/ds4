@@ -21,9 +21,10 @@
 #        peer required, which is exactly the boot shape this leg gates.)
 #        Boot-shape only (no workers -> no serving): catalog + unit
 #        tables + reconcile + zero faults/refusals asserted from the boot
-#        log.  planned==total is NOT asserted here: the pre-cache walk is
-#        slice-blind until D1b adopts the unit table — the leg RECORDS
-#        the plan-coverage numbers as the slice-blindness measurement.
+#        log.  memgov D1b-1: planned==total IS asserted here — the eager
+#        pass materializes the bound slice plan, so any off-plan
+#        promotion (the retired D1a-4 5/10 slice-blindness) dies loudly.
+#        This leg is the D1b regression needle.
 #   (l5) raw                DS4_CUDA_NO_DERIVED_WEIGHTS=1
 #                           DS4_CUDA_NO_HBM_CACHE=1 (+ pinned vmm budget
 #                           for the control pair, d0a nohbm law)
@@ -55,12 +56,13 @@ PORT=8000
 BASE_GGUF=/home/ent/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
 MTP_GGUF=/home/ent/gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 # Golden legs pair the -0731 gguf with the 0731-recorded fixture (the
-# documented-green pairing).  BASE_GGUF -- what zero-config SERVING
-# resolves -- is the May-18 OLD checkpoint on this box: same size and
-# metadata, DIFFERENT weight bytes (cmp at 40 GiB offset, 2026-08-12).
-# Pairing it with the 0731 fixture fails max_abs ~10 by model mismatch,
-# not numerics (run-8 finding; serving-file identity escalated to the
-# user -- the residency/ledger legs are model-agnostic and unaffected).
+# documented-green pairing; GOLDEN-HARNESS LAW).  BASE_GGUF -- what
+# zero-config SERVING resolves -- was the May-18 OLD checkpoint at the
+# D1a close (run-8 finding, mismatch signature max_abs ~10); the user's
+# card session made it a SYMLINK to the -0731 file on 2026-08-12
+# (verify: readlink $BASE_GGUF).  Keeping the explicit GOLDEN_GGUF
+# pairing anyway: the law binds vectors to a NAMED checkpoint, never to
+# whatever serving currently resolves.
 GOLDEN_GGUF=/home/ent/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 GOLDEN_VEC=tests/test-vectors/local-golden-0731.vec
 WS_MANIFEST=/tmp/d1a_ws.manifest
@@ -155,6 +157,10 @@ plan_asserts() { # $1 log  $2.. expected source names
         R "grep -q 'ds4: model catalog $s:' $L" || die "$L: no $s catalog line"
         R "grep -q 'ds4: model units $s: .* (verify=0)' $L" || die "$L: no clean $s unit table"
         R "grep -q 'ds4: range plan $s:' $L" || die "$L: no $s range-plan line"
+        # memgov D1b-1: the eager pass runs per source, plan-first, and
+        # never fails a funded unit on a healthy boot.
+        R "grep -q 'ds4: materialize $s: funded .* failed 0' $L" \
+            || die "$L: no clean $s materialize line"
     done
 }
 range_plan_full() { # $1 log — planned == total + refused 0 on EVERY line
@@ -310,11 +316,17 @@ SLICELINE=$(R "grep 'ds4: range plan base' $SLOG" | tail -1)
 echo "$SLICELINE" | grep -q 'refused 0' || die "l4: slice refused != 0 ($SLICELINE)"
 UNITLINE=$(R "grep 'ds4: model units base' $SLOG" | tail -1)
 log "(l4) slice unit table: $UNITLINE"
+# memgov D1b-1: the eager pass materializes the BOUND slice plan, so a
+# slice boot's publications are fully planned BY CONSTRUCTION.  The D1a-4
+# 5/10 slice-blindness measurement is retired as a hard assert — any
+# regression to off-plan promotion dies here (the regression needle).
 if echo "$SLICELINE" | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned.*/\1 \2/' | awk '$1!=$2{exit 0} {exit 1}'; then
-    log "(l4) SLICE-BLINDNESS RECORDED (expected until D1b adopts the table): $SLICELINE"
-else
-    log "(l4) slice fully planned: $SLICELINE"
+    die "l4: SLICE-BLIND publication (off-plan promotion): $SLICELINE"
 fi
+log "(l4) slice fully planned: $SLICELINE"
+MATLINE=$(R "grep 'ds4: materialize base' $SLOG" | tail -1)
+echo "$MATLINE" | grep -q 'failed 0' || die "l4: slice materialize unhealthy ($MATLINE)"
+log "(l4) slice materialize: $MATLINE"
 kill_server
 sleep 10
 log "(l4) PASS (boot-shape asserts; serving needs a coordinator — receipt notes the scope)"

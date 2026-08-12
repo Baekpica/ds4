@@ -1784,27 +1784,14 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
-/* deepmem lite-2: the startup span walk is compiled UNCONDITIONALLY (the
- * DS4_CUDA_SPARK_HBM_CACHE compile fork is retired); runtime policy lives
- * in ds4_gpu_cache_model_range (integrated devices only, opt-out
- * DS4_CUDA_NO_HBM_CACHE).  Eager-before-the-plan is the accounting fix:
- * these promotions land before the bank fit samples free memory, so any
- * build plans honestly (the 08-05 29-vs-13-bank divergence class). */
-typedef struct {
-    uint64_t off;
-    uint64_t end;
-} accelerator_tensor_span;
-
-static int accelerator_tensor_span_cmp(const void *a, const void *b) {
-    const accelerator_tensor_span *sa = a;
-    const accelerator_tensor_span *sb = b;
-    if (sa->off < sb->off) return -1;
-    if (sa->off > sb->off) return 1;
-    if (sa->end < sb->end) return -1;
-    if (sa->end > sb->end) return 1;
-    return 0;
-}
-
+/* deepmem lite-2 / memgov D1b-1: the eager residency pass is compiled
+ * UNCONDITIONALLY (the DS4_CUDA_SPARK_HBM_CACHE compile fork is
+ * retired); runtime policy lives in the bound canonical-unit table +
+ * ds4_gpu_materialize_model_plan (integrated devices only, opt-out
+ * DS4_CUDA_NO_HBM_CACHE via the table's policy stamps).  Eager-before-
+ * the-plan is the accounting fix: these promotions land before the bank
+ * fit samples free memory, so any build plans honestly (the 08-05
+ * 29-vs-13-bank divergence class). */
 static uint64_t accelerator_cuda_preload_span_bytes(void) {
     uint64_t mb = 1024;
     const char *env = getenv("DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB");
@@ -1818,80 +1805,6 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     return mb * 1048576ull;
 }
 
-static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
-    /* Routed MoE expert weights (`*_exps.weight`) are ~65 GiB of the model on
-     * V4-Flash but only top-K of N=256 experts fire per token — pre-caching
-     * them in HBM wastes most of the budget on cold weights and starves the
-     * hot non-MoE tensors that every token reads.  Skip them at the span-
-     * build stage so the cap fills with attn / shared FFN / embedding /
-     * output head.  Cold MoE expert reads fall back to the UVA-mapped
-     * pointer. */
-    accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
-    uint64_t nspan = 0;
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        const ds4_tensor *t = &m->tensors[i];
-        if (t->bytes == 0) continue;
-        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
-            free(spans);
-            return false;
-        }
-        /* memgov D1a-2/D1a-4b: the CATALOG drives the routed-expert skip.
-         * The legacy memmem("_exps.") predicate served one stage as a
-         * cross-check tripwire (zero mismatches across the D1a-2/3/4 gate
-         * batteries) and is retired -- scoping sec 5: the heuristic dies
-         * by cross-checked replacement.  The exact name relation stays
-         * pinned by the classifier units (test_model_catalog_classify). */
-        if (m->tensor_traits != NULL &&
-            (m->tensor_traits[i] & DS4_TCAT_ROUTED_EXPERT) != 0) {
-            continue;
-        }
-        spans[nspan++] = (accelerator_tensor_span){
-            .off = t->abs_offset,
-            .end = t->abs_offset + t->bytes,
-        };
-    }
-    qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
-
-    const uint64_t max_span = accelerator_cuda_preload_span_bytes();
-    uint64_t cached = 0;
-    uint64_t merged = 0;
-    for (uint64_t i = 0; i < nspan;) {
-        uint64_t off = spans[i].off;
-        uint64_t end = spans[i].end;
-        i++;
-        while (i < nspan && spans[i].off <= end + 65536u && spans[i].end - off <= max_span) {
-            if (spans[i].end > end) end = spans[i].end;
-            i++;
-        }
-        while (off < end) {
-            uint64_t chunk_end = end;
-            if (chunk_end - off > max_span) chunk_end = off + max_span;
-            char label[96];
-            snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-            const int rc = ds4_gpu_cache_model_range(m->map, m->size, off,
-                                                     chunk_end - off, label);
-            if (rc == 0) {
-                fprintf(stderr,
-                        "ds4: accelerator failed to cache model tensor span %" PRIu64
-                        " at offset %" PRIu64 "\n",
-                        merged, off);
-                free(spans);
-                return false;
-            }
-            /* Honesty (deepmem lite-2): count only bytes actually POPULATED
-             * (rc==1).  Policy skips (rc==2: opt-out, discrete, budget,
-             * dedup) used to be counted as "prepared", letting the boot
-             * line overstate residency by the whole attempted total. */
-            if (rc == 1) cached += chunk_end - off;
-            merged++;
-            off = chunk_end;
-        }
-    }
-    free(spans);
-    if (cached_out) *cached_out = cached;
-    return true;
-}
-
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
@@ -1901,7 +1814,16 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 
     const double t0 = now_sec();
     uint64_t cached = 0;
-    if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+    /* memgov D1b-1: the eager pass materializes the map's BOUND unit
+     * table (compiled + verified + bound just above the pre-cache calls
+     * in engine open).  The walk's private span compiler is gone — the
+     * table is the only enumeration, slice-aware active sets included,
+     * and the routed-expert skip (~65 GiB of cold top-K experts that
+     * would starve the hot non-MoE tensors) is the units' policy stamp
+     * from the D1a-2 catalog.  `cached` reports bytes actually
+     * device-copied (POPULATED), never policy skips — the deepmem
+     * lite-2 honesty rule. */
+    if (!ds4_gpu_materialize_model_plan(m->map, m->size, &cached)) return false;
     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -39287,44 +39209,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             ds4_metric_set(&ds4_metrics_get()->derived_artifact_bytes, art_bytes);
         }
 #endif
-        // Pre-cache main and support-model tensor spans into device memory at
-        // startup, so the first decode, MTP draft, or DSpark block doesn't pay
-        // a multi-second cudaMemcpy cost in the hot path.  The previous
-        // !e->mtp_ready guard skipped both pre-caches when MTP was loaded,
-        // which left the entire 3.6 GiB Q4_K MoE weight set to be copied
-        // synchronously on the first MTP routed_moe invocation.
-        if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
-            fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        /* Also populate the HBM cache for the MTP support model when loaded.
-         * Without this, MTP-block tensor reads at decode time hit the UVA-
-         * mapped pointer (slow) instead of cudaMalloc'd HBM copies (fast).
-         * The MoE expert filter in accelerator_cache_model_tensor_spans
-         * skips `mtp.0.ffn_*_exps.weight` automatically. */
-        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
-            fprintf(stderr, "ds4: %s failed to prepare MTP startup model cache\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (e->dspark_ready && !accelerator_cache_model_tensors(e->backend, &e->dspark_model)) {
-            fprintf(stderr, "ds4: %s failed to prepare DSpark startup model cache\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        /* memgov D1a-3: compile + verify the canonical unit table per
-         * source (STRUCTURAL: reconciled here, not yet consumed by the
-         * live walk).  Active set = the boot slice for the base map
-         * (§5.1: a slice boot enumerates only its intervals), everything
-         * for support models.  Any compile/verify violation counts a
-         * census fault, which every standing gate asserts zero.
+        /* memgov D1a-3/D1b-1: compile + verify + BIND the canonical unit
+         * table per source BEFORE the eager pass — plan-first ordering
+         * (D1b-1 inverted the D1a-3 observer placement): the pass below
+         * materializes exactly these units, and every boot publication
+         * stamps at publish (the report's backfill now covers only
+         * pre-open publications such as manifest imports).  Active set =
+         * the boot slice for the base map (§5.1: a slice boot enumerates
+         * only its intervals), everything for support models.  Any
+         * compile/verify violation counts a census fault, which every
+         * standing gate asserts zero, and a corrupt table is NOT bound —
+         * the eager pass then skips rather than promote off-plan.
          * CUDA-only like the census (OBS-policy): the policy stamps are
          * the CUDA residency plan (VMM arena / HBM promote); Metal keeps
          * descriptors + catalogs but plans no device residency here. */
@@ -39414,6 +39309,39 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
         }
 #endif
+        // Eager residency pass: materialize each bound plan into device
+        // memory at startup, so the first decode, MTP draft, or DSpark
+        // block doesn't pay a multi-second copy cost in the hot path.
+        // The previous !e->mtp_ready guard skipped both pre-caches when
+        // MTP was loaded, which left the entire 3.6 GiB Q4_K MoE weight
+        // set to be copied synchronously on the first MTP routed_moe
+        // invocation.
+        if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
+            fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        /* Also populate the HBM cache for the MTP support model when loaded.
+         * Without this, MTP-block tensor reads at decode time hit the UVA-
+         * mapped pointer (slow) instead of device copies (fast).  The MTP
+         * plan's expert-cold policy keeps `mtp.0.ffn_*_exps.weight` off
+         * the eager pass automatically. */
+        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
+            fprintf(stderr, "ds4: %s failed to prepare MTP startup model cache\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->dspark_ready && !accelerator_cache_model_tensors(e->backend, &e->dspark_model)) {
+            fprintf(stderr, "ds4: %s failed to prepare DSpark startup model cache\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         /* memgov D1a-1: per-source residency lines + ledger reconciliation
          * against the census cells (no-op on Metal).  Post-pre-cache is the
          * interesting snapshot; the reconciliation invariant itself holds at

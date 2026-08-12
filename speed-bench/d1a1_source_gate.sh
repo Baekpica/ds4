@@ -100,6 +100,12 @@ BAD=$(R "grep 'ds4: range plan ' $BOOTLOG" \
     | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7/' \
     | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 {print}')
 [ -z "$BAD" ] || die "range plan incomplete/refused: $BAD"
+# memgov D1b-1: the eager pass runs plan-first per source; funded units
+# never fail on a healthy boot.
+R "grep -q 'ds4: materialize base: funded .* failed 0' $BOOTLOG" \
+    || die "no clean base materialize line"
+R "grep -q 'ds4: materialize drafter: funded .* failed 0' $BOOTLOG" \
+    || die "no clean drafter materialize line"
 CF0=$(met ds4_memory_census_faults_total)
 [ "$CF0" = "0" ] || die "census faults=$CF0 at boot settle"
 decode_one /tmp/d1a1_s_dec.json s || die "leg (s) decode failed"
@@ -132,6 +138,9 @@ R "grep -q 'UNIT-TABLE FAULT' $BOOTLOG" && die "(s2) unit-table fault"
 # D1a-4: funnel plan-known on the base+mtp shape too.
 R "grep -q 'ds4: range plan mtp:' $BOOTLOG" || die "(s2) no mtp range-plan line"
 R "grep -q 'RANGE-PUBLISH REFUSED' $BOOTLOG" && die "(s2) range publication refused"
+# memgov D1b-1: mtp eager pass healthy on this shape.
+R "grep -q 'ds4: materialize mtp: funded .* failed 0' $BOOTLOG" \
+    || die "(s2) no clean mtp materialize line"
 BAD=$(R "grep 'ds4: range plan ' $BOOTLOG" \
     | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7/' \
     | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 {print}')

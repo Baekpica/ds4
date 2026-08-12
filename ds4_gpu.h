@@ -532,7 +532,15 @@ int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, cons
    outlives its allocation poisons later cudaMemcpy calls whose host buffers
    land on the recycled pages.  No-op when the base was never registered. */
 void ds4_gpu_unregister_model_map(const void *base);
-int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+/* memgov D1b-1: the EAGER residency pass — materialize the map's funded
+ * plan (its bound canonical-unit table) before serve.  Replaces the old
+ * per-span walk (ds4_gpu_cache_model_range): the table IS the
+ * enumeration, so slice boots promote exactly their plan.  Returns 0
+ * only when a funded unit fails to materialize (callers abort engine
+ * open, the old walk's failure contract); discrete devices and unbound
+ * tables skip the pass (the lazy tier still promotes on demand).
+ * populated_bytes (optional) reports bytes actually device-copied. */
+int ds4_gpu_materialize_model_plan(const void *model_map, uint64_t model_size, uint64_t *populated_bytes);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 /* R5 Inc1a: device memory snapshot for budget-computed batch-bank sizing.

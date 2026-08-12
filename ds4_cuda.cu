@@ -117,11 +117,13 @@ static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
 /* deepmem lite-3 (tripwire): base-map promotable-span accounting.  `total`
- * is declared by the startup walk's ds4_gpu_cache_model_range calls (every
- * non-expert span chunk flows through it on EVERY boot, integrated devices
- * only); `covered` grows as spans become device-resident or provably never
- * will (walk populate, fd-cache promotion, dup/dedup/limit/device-owned
- * skips).  The DS4_CUDA_NO_HBM_CACHE lever skip deliberately does NOT
+ * is declared up front by ds4_gpu_materialize_model_plan from the bound
+ * unit table's ACTIVE promote + host-mapped units (memgov D1b-1 — a slice
+ * boot therefore declares its slice's bytes, not the whole map's;
+ * integrated devices only); `covered` grows as units become device-
+ * resident or provably never will (materialized units, fd-cache
+ * promotion, ready/import/limit/device-owned skips).  The
+ * DS4_CUDA_NO_HBM_CACHE lever's HOST_MAPPED policy deliberately does NOT
  * cover -- those bytes are the deferred device promotions the boot plan
  * and the live verdicts must charge (outstanding = total - covered: ~0 on
  * eager boots, ~8 GiB under the lever).  Scope is the fd-owner base map
@@ -1003,14 +1005,6 @@ static const char *g_derived_artifact_none_reason;
  * while still pinning ~90 GiB — the worst of both). */
 static int g_derived_replaces_complete;
 static uint64_t g_model_range_bytes;
-/* S6 (2026-07-07): HBM-cache coverage dedup vs imported manifest ranges --
- * bytes the startup walk SKIPPED because a device-resident range (WS VMM/IPC
- * import, or an earlier populated copy) already fully covers the span.
- * Surfaced in ds4_gpu_print_memory_report.  NOTE: in manifest configs the
- * walk's byte-budget check usually short-circuits first (imports count
- * against the same budget), so this fires only for sub-limit imports. */
-static uint64_t g_hbm_cache_dedup_bytes;
-static int g_hbm_cache_dedup_logged;
 static uint64_t g_derived_range_bytes;
 
 /* Pinned FILE-BACKED registration accounting.  cudaHostRegister pins the
@@ -3050,6 +3044,94 @@ static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_
     return NULL;
 }
 
+/* --------------------------------------------------------------------
+ * memgov D1b-1: ONE staged upload pipeline (plan §5.4).
+ *
+ * Both promotion modes copy source bytes into a device carve through
+ * the same 4-slot pinned staging pipeline; the source fill is the only
+ * per-map difference: fd reads (O_DIRECT when available) for the map
+ * that owns g_model_fd, a host-pointer memcpy from the mapped file for
+ * every other map — which the fd tier could never serve.  `discard`
+ * drops source pages per synchronized chunk and is honored only on the
+ * fd path: the lazy tier keeps its historical always-on discard, the
+ * eager pass gates it (DS4_CUDA_EAGER_SOURCE_DISCARD) because dropping
+ * ~8 GiB of page cache at boot moves MemAvailable-derived decisions —
+ * evidence first, default later.  Registered support-map pages are
+ * pinned and are never madvised. */
+static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
+                                  uint64_t bytes, char *dev, int discard,
+                                  const char *what) {
+    const int fd_source = g_model_fd >= 0 && g_model_fd_host_base &&
+                          model_map == g_model_fd_host_base;
+    cudaError_t err = cudaSuccess;
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return 0;
+
+    uint64_t copied = 0;
+    uint64_t chunk_idx = 0;
+    while (copied < bytes) {
+        const uint64_t n = (bytes - copied < chunk) ? (bytes - copied) : chunk;
+        const uint64_t bi = chunk_idx % 4u;
+        if (chunk_idx >= 4u) {
+            err = cudaEventSynchronize(g_model_stage_event[bi]);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
+                        what ? what : "weights", cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+        }
+        const char *payload = NULL;
+        if (fd_source) {
+            if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+                                       offset + copied, n, &payload)) {
+                fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
+                        what ? what : "weights",
+                        (double)copied / 1048576.0,
+                        strerror(errno));
+                return 0;
+            }
+        } else {
+            memcpy(g_model_stage[bi],
+                   (const char *)model_map + offset + copied, (size_t)n);
+            payload = (const char *)g_model_stage[bi];
+        }
+        err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
+                              cudaMemcpyHostToDevice, g_model_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f MiB: %s\n",
+                    what ? what : "weights",
+                    (double)copied / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
+                    what ? what : "weights", cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        if (discard && fd_source) {
+            cuda_model_drop_file_pages(offset + copied, n);
+            cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
+        }
+        copied += n;
+        cuda_model_load_progress_note(g_model_range_bytes + copied);
+        chunk_idx++;
+    }
+    err = cudaStreamSynchronize(g_model_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
+                what ? what : "weights", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -3088,68 +3170,13 @@ static const char *cuda_model_range_ptr_from_fd(
         if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
         return cuda_model_direct_fallback_ptr(model_map, offset);
     }
-    cudaError_t err = cudaSuccess;
-
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
-
-    uint64_t copied = 0;
-    uint64_t chunk_idx = 0;
-    while (copied < bytes) {
-        const uint64_t n = (bytes - copied < chunk) ? (bytes - copied) : chunk;
-        const uint64_t bi = chunk_idx % 4u;
-        if (chunk_idx >= 4u) {
-            err = cudaEventSynchronize(g_model_stage_event[bi]);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
-                        what ? what : "weights", cudaGetErrorString(err));
-                (void)cudaGetLastError();
-                return NULL;
-            }
-        }
-        const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
-                                   offset + copied, n, &payload)) {
-            fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
-                    what ? what : "weights",
-                    (double)copied / 1048576.0,
-                    strerror(errno));
-            return NULL;
-        }
-        err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
-                              cudaMemcpyHostToDevice, g_model_upload_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f MiB: %s\n",
-                    what ? what : "weights",
-                    (double)copied / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return NULL;
-        }
-        err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
-                    what ? what : "weights", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return NULL;
-        }
-        cuda_model_drop_file_pages(offset + copied, n);
-        cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
-        copied += n;
-        cuda_model_load_progress_note(g_model_range_bytes + copied);
-        chunk_idx++;
-    }
-    err = cudaStreamSynchronize(g_model_upload_stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
-                what ? what : "weights", cudaGetErrorString(err));
-        (void)cudaGetLastError();
+    if (!cuda_stage_copy_to_dev(model_map, offset, bytes, dev,
+                                /*discard=*/1, what))
         return NULL;
-    }
 
     /* Refusal leaves the arena carve behind, exactly like the staging-read
-     * failure paths above (bump arenas cannot un-carve). */
+     * failure paths inside the shared pipeline (bump arenas cannot
+     * un-carve). */
     if (!cuda_model_range_publish({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0}))
         return NULL;
     g_model_range_bytes += bytes;
@@ -3162,6 +3189,54 @@ static const char *cuda_model_range_ptr_from_fd(
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return (const char *)dev;
+}
+
+/* --------------------------------------------------------------------
+ * memgov D1b-1: the canonical materializer (plan §5.4).
+ *
+ * Typed per-unit outcomes; ONE publication per unit (every eager range
+ * stamps unit_lo == unit_hi by construction).  Plan decisions — policy,
+ * coverage, budget funding — belong to the caller; the copy transaction
+ * below is purely physical.  WAIVED_OPTIONAL is reserved (no optional
+ * promote units exist in the 0731 catalogs); the enum keeps the plan's
+ * fixed cardinality like the census classes. */
+enum {
+    CUDA_MAT_POPULATED = 0,
+    CUDA_MAT_ALREADY_READY,
+    CUDA_MAT_SATISFIED_IMPORT,
+    CUDA_MAT_HOST_MAPPED_BY_POLICY,
+    CUDA_MAT_WAIVED_OPTIONAL,
+    CUDA_MAT_FAILED,
+    CUDA_MAT__COUNT
+};
+static uint64_t g_materialize_outcomes[CUDA_MAT__COUNT];
+
+/* Copy ONE funded DEVICE_PROMOTE unit into an arena carve and publish
+ * it.  Failure leaves any carve behind (bump arenas cannot un-carve) —
+ * the census already holds it as arena slack: the transactional-residue
+ * rule, same as the fd tier's precedent. */
+static int cuda_unit_materialize_copy(const void *model_map,
+                                      const ds4_phys_unit *u,
+                                      int discard, const char *what) {
+    char *dev = cuda_vmm_arena_alloc(model_map, u->src_bytes, what);
+    if (!dev) dev = cuda_model_arena_alloc(model_map, u->src_bytes, what);
+    if (!dev) return CUDA_MAT_FAILED;
+    if (!cuda_stage_copy_to_dev(model_map, u->src_off, u->src_bytes, dev,
+                                discard, what))
+        return CUDA_MAT_FAILED;
+    if (!cuda_model_range_publish({model_map, u->src_off, u->src_bytes, dev,
+                                   NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0}))
+        return CUDA_MAT_FAILED;
+    g_model_range_bytes += u->src_bytes;
+    cuda_substrate_cover(model_map, u->src_bytes);   /* tripwire: unit materialized */
+    cuda_model_load_progress_note(g_model_range_bytes);
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA materialized %s %.2f MiB (total %.2f GiB)\n",
+                what ? what : "unit",
+                (double)u->src_bytes / 1048576.0,
+                (double)g_model_range_bytes / 1073741824.0);
+    }
+    return CUDA_MAT_POPULATED;
 }
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
@@ -5575,89 +5650,163 @@ extern "C" void ds4_gpu_report_model_sources(void) {
     }
 }
 
-/* Returns 0 = allocation/copy FAILURE, 1 = span POPULATED into a device
- * copy, 2 = SKIPPED by policy (opt-out, discrete device, budget, already
- * covered).  deepmem lite-2: compiled unconditionally (the
- * DS4_CUDA_SPARK_HBM_CACHE compile fork is retired) and defaults ON for
- * INTEGRATED devices only.  On GB10-class unified memory the deferred
- * device promotions this pre-pays are exactly the bytes the bank planner
- * otherwise cannot see (hbm_cache_ab_2026-08-05.md: 29-vs-13-bank
- * overcommit, admission collapse at depth); on discrete devices the
- * historical shape is preserved (no startup walk; the lazy fd-cache tier
- * still promotes on demand).  Callers reporting "prepared" bytes must
- * count rc==1 only -- the old success/no-op boolean let the boot line
- * overstate residency by the full attempted total. */
-extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
-    if (!model_map || bytes == 0) return 2;
-    if (offset > model_size || bytes > model_size - offset) return 0;
+/* memgov D1b-1: the EAGER pass — materialize a map's funded residency
+ * plan (its bound canonical-unit table) before serve.  Replaces the
+ * walk's private span compiler + ds4_gpu_cache_model_range: the table
+ * IS the enumeration, slice-aware active sets included, so a slice boot
+ * promotes exactly its plan (closes the D1a-4 5/10 slice-blindness
+ * measurement).  Defaults ON for INTEGRATED devices only — on GB10-class
+ * unified memory the deferred promotions this pre-pays are exactly the
+ * bytes the bank planner otherwise cannot see (hbm_cache_ab_2026-08-05:
+ * 29-vs-13-bank overcommit); discrete devices keep the historical shape
+ * (no eager pass; the lazy fd tier still promotes on demand).
+ *
+ * Per-unit outcomes, decided in plan order:
+ *   HOST_MAPPED_BY_POLICY  non-promote policy (NO_HBM boots) — declared
+ *                          to the substrate tripwire, never copied
+ *   ALREADY_READY          an exact-offset device range covers the unit
+ *                          (a prior materialization)
+ *   SATISFIED_IMPORT       ONE other device-resident interval fully
+ *                          covers it — the ds4_unit_import_satisfied
+ *                          rule evaluated over the live registry
+ *                          (host-registered ranges never count); this
+ *                          replaces the S6 coverage belt for the eager
+ *                          pass at unit granularity
+ *   POPULATED              arena carve + staged copy + funnel publish
+ *   FAILED                 allocation/copy/publication failure — the
+ *                          caller aborts engine open (old walk contract)
+ * Budget-unfunded promote units take NO outcome: they are not in the
+ * funded plan (the porcelain reports them) and stay lazy-eligible,
+ * mirroring the old walk's per-chunk skip.  Expert-cold and
+ * artifact-replaced units are the cold tier by design and are not the
+ * eager pass's units at all.
+ *
+ * The substrate tripwire declares the ACTIVE promotable bytes up front —
+ * on slice boots this is the slice's bytes, correcting the old walk's
+ * slice-blind declaration (a slice boot's "substrate outstanding" now
+ * reflects its own plan). */
+extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
+                                              uint64_t model_size,
+                                              uint64_t *populated_bytes) {
+    if (populated_bytes) *populated_bytes = 0;
+    if (!model_map || model_size == 0) return 1;
     {
         int dev = 0, integrated = 0;
         if (cudaGetDevice(&dev) == cudaSuccess)
             (void)cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
-        if (!integrated) return 2;
+        if (!integrated) return 1;
     }
-    /* Tripwire declaration: every promotable base-map chunk is declared
-     * here (the walk feeds all of them through on every boot).  The skip
-     * branches below cover bytes that will never promote lazily; the
-     * NO_HBM_CACHE lever skip does NOT -- it merely defers the promotion
-     * to the fd-cache tier, which covers on materialization. */
-    if (g_model_fd_host_base && model_map == g_model_fd_host_base)
-        g_substrate_promotable_total += bytes;
-    /* Startup walk: force-populate the device-resident HBM cache so hot
-     * tensors hit cudaMalloc copies rather than the UVA-mapped fallback.
-     * Skip silently if over budget or opted out — the mapped pointer still
-     * works for any tensor we don't pre-cache. */
-    if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 2;
-    if (g_model_device_owned) { cuda_substrate_cover(model_map, bytes); return 2; }
-    /* Self-load artifacts mode: this map's expert raws live in device
-     * artifacts and the whole-model registration was skipped, so the walk
-     * must device-copy ALL of its remaining (non-expert) spans — the same
-     * residency a weight-server import gives them.  The cap still applies
-     * to every other map (MTP / DSpark support models stay registered). */
+    const int src = cuda_mem_src_index(model_map);
+    const ds4_phys_unit *units =
+        (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_v[src] : NULL;
+    const uint32_t nu =
+        (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_n[src] : 0;
+    const char *nm = src >= 0 ? g_model_srcs.v[src].name : "?";
+    if (!units || nu == 0) {
+        /* Plan-first contract: no bound table, no eager promotion (a
+         * corrupt table must not become the plan — the compile/bind
+         * path already counted its fault loudly).  Lazy tiers serve. */
+        fprintf(stderr,
+                "ds4: materialize %s: no bound unit table; eager pass skipped\n",
+                nm);
+        return 1;
+    }
+    /* Tripwire declaration (v0.5.6.3 substrate view): every promotable
+     * byte of the ACTIVE plan, before any policy or budget skip — the
+     * NO_HBM lever merely defers promotion to the lazy tier, which
+     * covers on materialization. */
+    if (g_model_fd_host_base && model_map == g_model_fd_host_base) {
+        for (uint32_t i = 0; i < nu; i++) {
+            if (units[i].policy == DS4_UPOL_DEVICE_PROMOTE ||
+                units[i].policy == DS4_UPOL_HOST_MAPPED)
+                g_substrate_promotable_total += units[i].src_bytes;
+        }
+    }
+    if (g_model_device_owned) {
+        for (uint32_t i = 0; i < nu; i++) {
+            if (units[i].policy == DS4_UPOL_DEVICE_PROMOTE ||
+                units[i].policy == DS4_UPOL_HOST_MAPPED)
+                cuda_substrate_cover(model_map, units[i].src_bytes);
+        }
+        fprintf(stderr,
+                "ds4: materialize %s: device-owned map; plan covered, no copies\n",
+                nm);
+        return 1;
+    }
     const uint64_t limit = cuda_model_map_replaces_complete(model_map)
         ? UINT64_MAX
         : cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) {
-        cuda_substrate_cover(model_map, bytes);   /* budget-capped: will not promote */
-        return 2;
-    }
-    const char *what = label ? label : "model_tensor";
-    /* Skip if this span is already populated. */
-    auto exact = g_model_range_by_offset.find(cuda_range_key{model_map, offset});
-    if (exact != g_model_range_by_offset.end()) {
-        const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) {
-            cuda_substrate_cover(model_map, bytes);   /* already device-resident */
-            return 2;
+    const int discard = getenv("DS4_CUDA_EAGER_SOURCE_DISCARD") != NULL;
+    uint64_t counts[CUDA_MAT__COUNT] = {0};
+    uint32_t promote = 0, funded = 0, unfunded = 0;
+    uint64_t pop_bytes = 0;
+    int failed = 0;
+    for (uint32_t i = 0; i < nu && !failed; i++) {
+        const ds4_phys_unit *u = &units[i];
+        if (u->policy == DS4_UPOL_HOST_MAPPED) {
+            counts[CUDA_MAT_HOST_MAPPED_BY_POLICY]++;
+            continue;
         }
-    }
-    /* S6 (2026-07-07): coverage dedup vs imported manifest ranges.  WS
-     * VMM/IPC imports land in g_model_ranges as LARGE coalesced device
-     * ranges; the exact-offset check above misses any tensor INTERIOR to
-     * one.  A covered span already reads through the imported pointer at
-     * the same device-resident speed class (cuda_model_range_ptr's first
-     * pass prefers it), so a duplicate copy buys nothing.  In practice the
-     * byte-budget check above short-circuits for full-model manifests
-     * (imports count against the budget; cmthbm15 measured ZERO double-book
-     * in ship configs) -- this is the belt for sub-limit import scopes. */
-    const uint64_t span_end = offset + bytes;
-    for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && !r.host_registered &&
-            offset >= r.offset && span_end >= offset && span_end <= r.offset + r.bytes) {
-            g_hbm_cache_dedup_bytes += bytes;
-            if (!g_hbm_cache_dedup_logged) {
-                g_hbm_cache_dedup_logged = 1;
-                fprintf(stderr,
-                        "ds4: HBM cache dedup: '%s' already covered by a device-resident "
-                        "range (imported manifest span); skipping duplicate copies\n",
-                        what);
+        if (u->policy != DS4_UPOL_DEVICE_PROMOTE) continue;
+        promote++;
+        if (u->src_off > model_size || u->src_bytes > model_size - u->src_off) {
+            /* The verify pass cannot see the map size; a unit outside the
+             * map would send the host-memcpy source out of bounds.  Loud
+             * failure, same contract as the old walk's span check. */
+            fprintf(stderr,
+                    "ds4: materialize %s: unit %u outside map (off=%llu bytes=%llu size=%llu)\n",
+                    nm, i, (unsigned long long)u->src_off,
+                    (unsigned long long)u->src_bytes,
+                    (unsigned long long)model_size);
+            counts[CUDA_MAT_FAILED]++;
+            failed = 1;
+            continue;
+        }
+        int covered = 0, exact_hit = 0;
+        for (const cuda_model_range &r : g_model_ranges) {
+            if (r.host_base != model_map || r.host_registered) continue;
+            if (r.offset <= u->src_off &&
+                r.offset + r.bytes >= u->src_off + u->src_bytes) {
+                covered = 1;
+                exact_hit = (r.offset == u->src_off);
+                break;
             }
-            cuda_substrate_cover(model_map, bytes);   /* import-covered */
-            return 2;
         }
+        if (covered) {
+            counts[exact_hit ? CUDA_MAT_ALREADY_READY
+                             : CUDA_MAT_SATISFIED_IMPORT]++;
+            cuda_substrate_cover(model_map, u->src_bytes);
+            continue;
+        }
+        if (g_model_range_bytes >= limit ||
+            u->src_bytes > limit - g_model_range_bytes) {
+            unfunded++;
+            cuda_substrate_cover(model_map, u->src_bytes);   /* budget-capped: will not promote eagerly */
+            continue;
+        }
+        funded++;
+        char label[64];
+        snprintf(label, sizeof(label), "%s unit:%u", nm, i);
+        const int oc = cuda_unit_materialize_copy(model_map, u, discard, label);
+        counts[oc]++;
+        if (oc == CUDA_MAT_POPULATED) pop_bytes += u->src_bytes;
+        else if (oc == CUDA_MAT_FAILED) failed = 1;
     }
-    /* populate credits coverage itself at the range-registration funnel */
-    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what) != NULL;
+    for (int i = 0; i < CUDA_MAT__COUNT; i++)
+        g_materialize_outcomes[i] += counts[i];
+    if (populated_bytes) *populated_bytes = pop_bytes;
+    fprintf(stderr,
+            "ds4: materialize %s: funded %u/%u promote units (%u unfunded), "
+            "populated %llu (%.2f GiB), ready %llu, import %llu, "
+            "mapped-policy %llu, failed %llu\n",
+            nm, funded, promote, unfunded,
+            (unsigned long long)counts[CUDA_MAT_POPULATED],
+            (double)pop_bytes / 1073741824.0,
+            (unsigned long long)counts[CUDA_MAT_ALREADY_READY],
+            (unsigned long long)counts[CUDA_MAT_SATISFIED_IMPORT],
+            (unsigned long long)counts[CUDA_MAT_HOST_MAPPED_BY_POLICY],
+            (unsigned long long)counts[CUDA_MAT_FAILED]);
+    return failed ? 0 : 1;
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
@@ -5683,12 +5832,6 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
     (void)cudaMemGetInfo(&free_b, &total_b);
     fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
             label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
-    if (g_hbm_cache_dedup_bytes != 0) {
-        fprintf(stderr,
-                "ds4: HBM cache dedup: %.2f GiB of startup-walk spans were already "
-                "covered by device-resident ranges (no duplicate copies made)\n",
-                (double)g_hbm_cache_dedup_bytes / 1073741824.0);
-    }
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
