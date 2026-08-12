@@ -13,9 +13,13 @@
 #   (l3) base+mtp+drafter   --mtp <gguf>   (launch defaults drop mtp when
 #                                           the drafter arms; the flag
 #                                           overrides — all 3 roles live)
-#   (l4) SLICE boot         --role worker --listen 127.0.0.1 9411
+#   (l4) SLICE boot         --role coordinator --listen 127.0.0.1 9411
 #                           --layers 20:40 --no-spec
-#        Boot-shape only (a lone worker serves no HTTP): catalog + unit
+#        (coordinator, not worker: a worker validates --coordinator HOST
+#        PORT before anything runs — l4 first-run finding.  The
+#        coordinator opens its own engine slice [20:40]+output with no
+#        peer required, which is exactly the boot shape this leg gates.)
+#        Boot-shape only (no workers -> no serving): catalog + unit
 #        tables + reconcile + zero faults/refusals asserted from the boot
 #        log.  planned==total is NOT asserted here: the pre-cache walk is
 #        slice-blind until D1b adopts the unit table — the leg RECORDS
@@ -220,11 +224,11 @@ pair_leg l2_basemtp  "" "--no-dspark" base mtp
 pair_leg l3_allthree "" "--mtp $MTP_GGUF" base mtp drafter
 
 # ---- (l4) slice boot: worker-shape, boot asserts only ----
-log "(l4) slice boot: worker --layers 20:40 (boot-shape leg)"
+log "(l4) slice boot: coordinator --layers 20:40 (boot-shape leg)"
 SLOG=/tmp/d1ares_l4_slice.log
-boot_tree "$TEST_TREE" "" "--role worker --listen 127.0.0.1 9411 --layers 20:40 --no-spec" \
+boot_tree "$TEST_TREE" "" "--role coordinator --listen 127.0.0.1 9411 --layers 20:40 --no-spec" \
     "$SLOG" "backend initialized for graph diagnostics" \
-    || die "l4 slice worker boot failed (never reached backend init)"
+    || die "l4 slice coordinator boot failed (never reached backend init)"
 plan_asserts "$SLOG" base
 SLICELINE=$(R "grep 'ds4: range plan base' $SLOG" | tail -1)
 echo "$SLICELINE" | grep -q 'refused 0' || die "l4: slice refused != 0 ($SLICELINE)"
