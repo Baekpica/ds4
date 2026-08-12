@@ -104,9 +104,12 @@ stable_avail() { # two reads within 150M (d0a ABORT-on-unstable law)
 # Decision families, normalized exactly like d0a_census_gate.sh: strip
 # timestamps, mask the free-derived inputs; formulas + verdict shapes
 # must byte-match.  The test tree's D1a lines are excluded by grep
-# construction (the control cannot print them).
+# construction (the control cannot print them) -- the D1a-4 range-plan
+# porcelain ends in "refused N" and would otherwise leak in through the
+# 'refus' family pattern (l1 first-run finding, 2026-08-12).
 extract_decisions() { # $1 remote log  $2 local out
     R "grep -E 'batch fit|batch vmm|mem floor|boot ledger|refus|reject|no graph fits|admission|serial fit' $1" \
+        | grep -v 'ds4: range plan ' \
         | sed -E 's/^[0-9]{4} [0-9:]{8} //; s/free=[0-9.]+ GiB/free=# GiB/g; s/MemAvailable[= ][0-9.]+/MemAvailable=#/g; s/capacity [0-9.]+ GiB/capacity # GiB/g; s/max_seq [0-9]+/max_seq #/g; s/x [0-9]+ banks/x # banks/g; s/budget=[0-9.]+ GiB/budget=# GiB/g; s/\[plan [0-9.]+, capacity [0-9.]+\]/[plan #, capacity #]/g' \
         > "$2"
 }

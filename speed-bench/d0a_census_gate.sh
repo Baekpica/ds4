@@ -163,7 +163,11 @@ extract_decisions() { # $1 remote log  $2 local out
     # The batch-vmm ledger's banks/budget/plan/capacity are ALL free-input
     # derived (plan = banks x per-bank; banks from the free-derived fit):
     # masked here, with the bank COUNT adjudicated separately like max_seq.
+    # The D1a-4 range-plan porcelain ends in "refused N" and matches the
+    # 'refus' family pattern -- excluded by construction (the control
+    # cannot print it; d1a residency-gate l1 first-run finding).
     R "grep -E 'batch fit|batch vmm|mem floor|boot ledger|refus|reject|no graph fits|admission|serial fit' $1" \
+        | grep -v 'ds4: range plan ' \
         | sed -E 's/^[0-9]{4} [0-9:]{8} //; s/free=[0-9.]+ GiB/free=# GiB/g; s/MemAvailable[= ][0-9.]+/MemAvailable=#/g; s/capacity [0-9.]+ GiB/capacity # GiB/g; s/max_seq [0-9]+/max_seq #/g; s/x [0-9]+ banks/x # banks/g; s/budget=[0-9.]+ GiB/budget=# GiB/g; s/\[plan [0-9.]+, capacity [0-9.]+\]/[plan #, capacity #]/g' \
         > "$2"
 }
