@@ -54,6 +54,14 @@ CTX=${CTX:-32768}
 PORT=8000
 BASE_GGUF=/home/ent/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
 MTP_GGUF=/home/ent/gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+# Golden legs pair the -0731 gguf with the 0731-recorded fixture (the
+# documented-green pairing).  BASE_GGUF -- what zero-config SERVING
+# resolves -- is the May-18 OLD checkpoint on this box: same size and
+# metadata, DIFFERENT weight bytes (cmp at 40 GiB offset, 2026-08-12).
+# Pairing it with the 0731 fixture fails max_abs ~10 by model mismatch,
+# not numerics (run-8 finding; serving-file identity escalated to the
+# user -- the residency/ledger legs are model-agnostic and unaffected).
+GOLDEN_GGUF=/home/ent/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 GOLDEN_VEC=tests/test-vectors/local-golden-0731.vec
 WS_MANIFEST=/tmp/d1a_ws.manifest
 TS=$(date +%s); NONCE="d1ares-$TS-$$"
@@ -226,7 +234,7 @@ pair_leg() { # $1 name  $2 env  $3 flags  $4.. expected sources
 }
 
 golden_run() { # $1 tree  $2 env  $3 log -> echoes RC
-    R "cd $1 && env DS4_TEST_MODEL=$BASE_GGUF DS4_TEST_LOCAL_GOLDEN_FILE=$GOLDEN_VEC $2 ./ds4_test --local-golden-vectors > $3 2>&1; echo \$?"
+    R "cd $1 && env DS4_TEST_MODEL=$GOLDEN_GGUF DS4_TEST_LOCAL_GOLDEN_FILE=$GOLDEN_VEC $2 ./ds4_test --local-golden-vectors > $3 2>&1; echo \$?"
 }
 golden_leg() { # $1 name  $2 env  $3 mode: fixture|control
     # NOTE: GLOG must sit in its OWN local statement -- all words of one
