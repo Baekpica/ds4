@@ -222,7 +222,11 @@ pair_leg() { # $1 name  $2 env  $3 flags  $4.. expected sources
 }
 
 golden_leg() { # $1 name  $2 env
-    local name=$1 env=$2 GLOG=/tmp/d1ares_golden_${name}.log RC
+    # NOTE: GLOG must sit in its OWN local statement -- all words of one
+    # `local` command expand BEFORE any assignment lands, so a same-line
+    # ${name} is unbound under set -u (l5->golden first-run finding).
+    local name=$1 env=$2 RC
+    local GLOG=/tmp/d1ares_golden_${name}.log
     log "(golden:$name) ds4_test --local-golden-vectors under $name env"
     RC=$(R "cd $TEST_TREE && env DS4_TEST_MODEL=$BASE_GGUF DS4_TEST_LOCAL_GOLDEN_FILE=$GOLDEN_VEC $env ./ds4_test --local-golden-vectors > $GLOG 2>&1; echo \$?")
     R "grep 'ds4-test: local golden' $GLOG" || true
