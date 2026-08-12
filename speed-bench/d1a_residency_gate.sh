@@ -285,6 +285,12 @@ golden_leg() { # $1 name  $2 env  $3 mode: fixture|control
     sleep 10
 }
 
+# L7_ONLY=1: completion mode -- run ONLY the manifest leg (used when
+# l1..l6 already passed on this exact tree+binaries and the weight
+# server needed a knob fix; the receipt cites both runs).
+L7_ONLY=${L7_ONLY:-0}
+if [ "$L7_ONLY" != "1" ]; then
+
 # ---- (l1..l3) source-combination legs ----
 pair_leg l1_baseonly "" "--no-spec" base
 pair_leg l2_basemtp  "" "--no-dspark" base mtp
@@ -323,11 +329,18 @@ R "grep -q 'ds4: aligned artifacts built in-process' /tmp/d1ares_l6_selfload_T.l
     || die "l6: no BUILT artifact banner on the self-load boot"
 golden_leg selfload "" fixture
 
+fi  # L7_ONLY
+
 # ---- (l7) manifest via .33-local weight server + goldens ----
+# --reserve-gb 12: the default 32 GiB reserve fails preflight on this
+# box (plan 80.76 + 32 > budget ~106 with free ~95 after a night of
+# boots); 12 GiB still covers the import client's non-weight footprint
+# (the weights are shared IPC memory, and the client's bank fit adapts
+# to whatever is free).
 log "(l7) starting ds4_weight_server (scope=base) -- repacks take minutes"
 R "rm -f $WS_MANIFEST"
 ssh -o ConnectTimeout=10 "$HOST" \
-    "cd $TEST_TREE && setsid nohup ./ds4_weight_server --base $BASE_GGUF --scope base --manifest $WS_MANIFEST > /tmp/d1a_ws.log 2>&1 < /dev/null & exit 0" &
+    "cd $TEST_TREE && setsid nohup ./ds4_weight_server --base $BASE_GGUF --scope base --reserve-gb 12 --manifest $WS_MANIFEST > /tmp/d1a_ws.log 2>&1 < /dev/null & exit 0" &
 WLP=$!; sleep 5; kill $WLP 2>/dev/null || true
 WS_OK=0
 for i in $(seq 450); do
