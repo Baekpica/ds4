@@ -187,6 +187,20 @@ pair_leg() { # $1 name  $2 env  $3 flags  $4.. expected sources
         mt=$(fit_max_seq  "$TLOG"); mc=$(fit_max_seq  "$CLOG")
         bt=$(vmm_banks    "$TLOG"); bc=$(vmm_banks    "$CLOG")
         log "($name) inputs: free T=$ft C=$fc GiB; max_seq T=$mt C=$mc; vmm_banks T=${bt:--} C=${bc:--}"
+        if [ -z "$ft" ] || [ -z "$fc" ]; then
+            # Pinned-budget shapes (l5 raw: banks come straight from
+            # DS4_BATCH_VMM_BUDGET_MB) print NO free-derived 'batch fit'
+            # family -- there is nothing to band-check and no jitter
+            # excuse: whatever derived decisions exist must be EXACTLY
+            # equal (l5 first-run finding, 2026-08-12).
+            if [ "${mt:-}" = "${mc:-}" ] && [ "${bt:-}" = "${bc:-}" ]; then
+                log "($name) PASS (no free-derived fit family; derived decisions exactly equal)"
+                sleep 10
+                return 0
+            fi
+            log "($name): no fit family and derived decisions unequal -- retrying pair once"
+            continue
+        fi
         band=$(python3 -c "print(1 if abs($ft-$fc)<1.0 else 0)")
         if [ "$band" != "1" ]; then
             log "($name): free inputs outside the 1.0 GiB drift band -- retrying pair once"
