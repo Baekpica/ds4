@@ -3132,74 +3132,15 @@ static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
     return 1;
 }
 
-static const char *cuda_model_range_ptr_from_fd(
-        const void *model_map,
-        uint64_t offset,
-        uint64_t bytes,
-        const char *what) {
-    if (g_model_fd < 0 || bytes == 0) return NULL;
-    // fd-cache reads from g_model_fd at `offset`. The fd belongs to the model
-    // that was registered first via set_model_map after set_model_fd; using it
-    // for any other model_map would read bytes from the wrong file. Refuse and
-    // let the caller fall through to the cudaMemcpy path (which dereferences
-    // `model_map + offset` directly, the correct host pointer for any
-    // registered mmap).
-    if (g_model_fd_host_base && model_map != g_model_fd_host_base) return NULL;
-    const uint64_t limit = cuda_model_map_replaces_complete(model_map)
-        ? UINT64_MAX
-        : cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
-        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-            fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
-                    what ? what : "weights",
-                    (double)bytes / 1048576.0,
-                    (double)limit / 1073741824.0);
-        }
-        return cuda_model_direct_fallback_ptr(model_map, offset);
-    }
-
-    // Prefer the VMM arena when supported: same backing storage the
-    // ds4_weight_server uses, gives us 2 MiB device pages and a 1.7-2.0x
-    // prefill win on PRO 6000. Hard-gated off when the sidecar is in use
-    // (DS4_CUDA_WEIGHT_IPC_MANIFEST), soft-gated by DS4_CUDA_VMM_ARENA=0.
-    // On any driver error during allocation we transparently retry via the
-    // existing cudaMalloc arena, so this is never a correctness regression.
-    char *dev = cuda_vmm_arena_alloc(model_map, bytes, what);
-    if (!dev) dev = cuda_model_arena_alloc(model_map, bytes, what);
-    if (!dev) {
-        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
-        return cuda_model_direct_fallback_ptr(model_map, offset);
-    }
-    if (!cuda_stage_copy_to_dev(model_map, offset, bytes, dev,
-                                /*discard=*/1, what))
-        return NULL;
-
-    /* Refusal leaves the arena carve behind, exactly like the staging-read
-     * failure paths inside the shared pipeline (bump arenas cannot
-     * un-carve). */
-    if (!cuda_model_range_publish({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0}))
-        return NULL;
-    g_model_range_bytes += bytes;
-    cuda_substrate_cover(model_map, bytes);   /* tripwire: fd promotion materialized */
-    cuda_model_load_progress_note(g_model_range_bytes);
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA fd-cached %s %.2f MiB (total %.2f GiB)\n",
-                what ? what : "weights",
-                (double)bytes / 1048576.0,
-                (double)g_model_range_bytes / 1073741824.0);
-    }
-    return (const char *)dev;
-}
-
 /* --------------------------------------------------------------------
  * memgov D1b-1: the canonical materializer (plan §5.4).
  *
- * Typed per-unit outcomes; ONE publication per unit (every eager range
- * stamps unit_lo == unit_hi by construction).  Plan decisions — policy,
- * coverage, budget funding — belong to the caller; the copy transaction
- * below is purely physical.  WAIVED_OPTIONAL is reserved (no optional
- * promote units exist in the 0731 catalogs); the enum keeps the plan's
- * fixed cardinality like the census classes. */
+ * Typed per-unit outcomes; ONE publication per unit (every device-copy
+ * range stamps unit_lo == unit_hi by construction).  Plan decisions —
+ * policy, coverage, budget funding — belong to the caller; the copy
+ * transaction below is purely physical.  WAIVED_OPTIONAL is reserved
+ * (no optional promote units exist in the 0731 catalogs); the enum
+ * keeps the plan's fixed cardinality like the census classes. */
 enum {
     CUDA_MAT_POPULATED = 0,
     CUDA_MAT_ALREADY_READY,
@@ -3211,10 +3152,13 @@ enum {
 };
 static uint64_t g_materialize_outcomes[CUDA_MAT__COUNT];
 
-/* Copy ONE funded DEVICE_PROMOTE unit into an arena carve and publish
- * it.  Failure leaves any carve behind (bump arenas cannot un-carve) —
- * the census already holds it as arena slack: the transactional-residue
- * rule, same as the fd tier's precedent. */
+/* Copy ONE funded unit into an arena carve and publish it.  Failure
+ * leaves any carve behind (bump arenas cannot un-carve) — the census
+ * already holds it as arena slack: the transactional-residue rule, same
+ * as the fd tier's precedent.  VMM arena preferred when supported: same
+ * backing storage the ds4_weight_server uses, 2 MiB device pages,
+ * 1.7-2.0x prefill on PRO 6000; hard-gated off under an IPC manifest,
+ * transparent cudaMalloc-arena retry on driver errors. */
 static int cuda_unit_materialize_copy(const void *model_map,
                                       const ds4_phys_unit *u,
                                       int discard, const char *what) {
@@ -3237,6 +3181,77 @@ static int cuda_unit_materialize_copy(const void *model_map,
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return CUDA_MAT_POPULATED;
+}
+
+/* memgov D1b-2: the LAZY pass materializes CONTAINING UNITS through the
+ * same core as the eager pass — arbitrary-extent promotions cease to
+ * exist.  Eligibility is the historical fd tier's, unchanged: fd-owner
+ * base map only (any other map would read bytes from the wrong file —
+ * the caller falls through to the registered-mapping/populate tiers,
+ * whose host pointers are correct for every mmap), per-unit budget fit,
+ * source-page discard always on (the historical lazy behavior; the
+ * D1b-1 gate applies to the EAGER pass only).  Requests never straddle
+ * units on live paths (a unit boundary never splits a tensor, and
+ * consumers request within tensors); a theoretical multi-unit span
+ * materializes its units and then falls through to the mapped tiers if
+ * the re-resolve still misses (no contiguity across carves) — the same
+ * degradation the funnel-refusal path already takes.  No bound table =
+ * no lazy promotion (plan-first: a range that exists is a range the
+ * plan knows). */
+static const char *cuda_model_range_ptr_from_fd(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what) {
+    if (g_model_fd < 0 || bytes == 0) return NULL;
+    if (g_model_fd_host_base && model_map != g_model_fd_host_base) return NULL;
+    const int src = cuda_mem_src_index(model_map);
+    const ds4_phys_unit *units =
+        (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_v[src] : NULL;
+    const uint32_t nu =
+        (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_n[src] : 0;
+    if (!units || nu == 0) return NULL;
+    int lo = -1, hi = -1;
+    ds4_units_span_of(units, nu, offset, bytes, &lo, &hi);
+    if (lo < 0) return NULL;
+    const uint64_t limit = cuda_model_map_replaces_complete(model_map)
+        ? UINT64_MAX
+        : cuda_model_cache_limit_bytes();
+    for (int ui = lo; ui <= hi; ui++) {
+        const ds4_phys_unit *u = &units[ui];
+        int covered = 0;
+        for (const cuda_model_range &r : g_model_ranges) {
+            if (r.host_base != model_map || r.host_registered) continue;
+            if (r.offset <= u->src_off &&
+                r.offset + r.bytes >= u->src_off + u->src_bytes) {
+                covered = 1;
+                break;
+            }
+        }
+        if (covered) continue;
+        if (g_model_range_bytes >= limit ||
+            u->src_bytes > limit - g_model_range_bytes) {
+            if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
+                        what ? what : "weights",
+                        (double)bytes / 1048576.0,
+                        (double)limit / 1073741824.0);
+            }
+            return cuda_model_direct_fallback_ptr(model_map, offset);
+        }
+        const int oc = cuda_unit_materialize_copy(model_map, u, /*discard=*/1, what);
+        g_materialize_outcomes[oc]++;
+        if (oc != CUDA_MAT_POPULATED) return NULL;
+    }
+    /* Every needed unit is device-resident: the resolve that missed now
+     * hits (single-unit requests — the live shape).  A multi-unit span
+     * with no single covering range returns NULL and the mapped tiers
+     * serve. */
+    const cuda_model_range *exact_r = NULL;
+    auto exact = g_model_range_by_offset.find(cuda_range_key{model_map, offset});
+    if (exact != g_model_range_by_offset.end())
+        exact_r = &g_model_ranges[exact->second];
+    return cuda_model_range_resolve(model_map, offset, bytes, exact_r);
 }
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
