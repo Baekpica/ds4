@@ -354,6 +354,31 @@ if [ "$WS_OK" = "1" ]; then
     pair_leg l7_manifest "DS4_CUDA_WEIGHT_IPC_MANIFEST=$WS_MANIFEST" "--no-spec" base
     R "grep -q 'ds4: CUDA imported shared' /tmp/d1ares_l7_manifest_T.log" \
         || die "l7: no import engagement line"
+    # The golden phase needs the WS to serve the GOLDEN model: the
+    # import validates identity by model_id + FILE SIZE only, and the
+    # old/0731 checkpoints are size-identical -- a BASE_GGUF-serving WS
+    # feeds old-model bytes to a -0731 engine and reproduces the
+    # model-mismatch signature (max_abs 10.0568) digit-for-digit
+    # (l7-golden first-run finding; manifest content-hash chartered as
+    # a rider).  Restart the WS on GOLDEN_GGUF for the fixture run.
+    log "(l7) restarting weight server on the golden gguf for the fixture run"
+    R "kill $WSPID" 2>/dev/null; WSPID=""
+    for i in $(seq 30); do
+        R "ps -eo comm | grep -q '^ds4_weight_serv'" || break
+        sleep 2
+    done
+    R "rm -f $WS_MANIFEST"
+    ssh -o ConnectTimeout=10 "$HOST" \
+        "cd $TEST_TREE && setsid nohup ./ds4_weight_server --base $GOLDEN_GGUF --scope base --reserve-gb 12 --manifest $WS_MANIFEST > /tmp/d1a_ws_golden.log 2>&1 < /dev/null & exit 0" &
+    WLP=$!; sleep 5; kill $WLP 2>/dev/null || true
+    WS_OK=0
+    for i in $(seq 450); do
+        R "grep -q 'ds4_weight_server: ready manifest=' /tmp/d1a_ws_golden.log" && { WS_OK=1; break; }
+        R "ps -eo comm | grep -q '^ds4_weight_serv'" || break
+        sleep 2
+    done
+    [ "$WS_OK" = "1" ] || { R "tail -6 /tmp/d1a_ws_golden.log"; die "l7: golden-model weight server never reached ready"; }
+    WSPID=$(R "pgrep -x ds4_weight_serv | head -1")
     golden_leg manifest "DS4_CUDA_WEIGHT_IPC_MANIFEST=$WS_MANIFEST" fixture
     R "kill $WSPID" 2>/dev/null; WSPID=""
     sleep 5
