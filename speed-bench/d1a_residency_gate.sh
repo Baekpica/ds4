@@ -245,18 +245,33 @@ golden_leg() { # $1 name  $2 env  $3 mode: fixture|control
         [ "$RC" = "0" ] || { R "tail -15 $GLOG"; die "golden:$name RC=$RC"; }
     else
         # Kernel-family modes (raw) drift outside the stock-recorded band
-        # BY CONSTRUCTION -- control A/B 2026-08-12 reproduced the raw
-        # numbers digit-for-digit on the pre-D1a tree (3/5, 45/64,
-        # max_abs 9.69399, RC=1 on both).  The oracle here is EXACT
-        # equivalence with the control tree under the same env.
+        # BY CONSTRUCTION (control A/B 2026-08-12: the pre-D1a tree fails
+        # the fixture band identically).  Raw-mode logits are also NOT
+        # run-to-run stable on ONE tree (test tree across runs on
+        # identical sources: 45/64 -> 43/64, max_abs 9.69399 -> 9.85727),
+        # so byte-equality with control is not a valid oracle either.
+        # The evidence-backed oracle: top1 ref==cand on BOTH trees, RCs
+        # equal, and gross-drift floors (top5>=2/5 top20>=12/20
+        # top64>=35/64 max_abs<=12) on BOTH lines -- comfortably above
+        # real breakage (wrong tiling produces near-zero overlaps),
+        # comfortably below observed raw-mode noise (3/5, 16/20,
+        # 43-45/64, 9.69-9.86 across four runs on two trees).
         local CRC
         CRC=$(golden_run "$CTRL_TREE" "$env" "${GLOG}.ctrl")
         R "grep 'ds4-test: local golden' ${GLOG}.ctrl" | sed 's/^/    ctrl: /' || true
-        if ! diff <(R "grep 'ds4-test: local golden' $GLOG") \
-                  <(R "grep 'ds4-test: local golden' ${GLOG}.ctrl") >/dev/null; then
-            die "golden:$name: test/control golden lines differ under $name env"
-        fi
         [ "$RC" = "$CRC" ] || die "golden:$name: RC differs (test=$RC control=$CRC)"
+        local side line ref cand nums
+        for side in "$GLOG" "${GLOG}.ctrl"; do
+            line=$(R "grep 'ds4-test: local golden' $side" | tail -1)
+            [ -n "$line" ] || die "golden:$name: no summary line in $side"
+            ref=$(echo "$line" | sed -E 's/.*top1 ref=([0-9]+) cand=([0-9]+).*/\1/')
+            cand=$(echo "$line" | sed -E 's/.*top1 ref=([0-9]+) cand=([0-9]+).*/\2/')
+            [ -n "$ref" ] && [ "$ref" = "$cand" ] \
+                || die "golden:$name: top1 moved in $side (ref=$ref cand=$cand)"
+            nums=$(echo "$line" | sed -E 's/.*top5_overlap=([0-9]+)\/5 top20_overlap=([0-9]+)\/20 top64_overlap=([0-9]+)\/64 top20_max_abs=([0-9.]+).*/\1 \2 \3 \4/')
+            echo "$nums" | awk '$1>=2 && $2>=12 && $3>=35 && $4<=12.0 {exit 0} {exit 1}' \
+                || die "golden:$name: gross-drift floor violated in $side ($nums)"
+        done
     fi
     log "(golden:$name) PASS ($mode)"
     sleep 10
