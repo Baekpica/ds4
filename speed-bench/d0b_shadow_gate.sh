@@ -69,9 +69,9 @@ met() { # $1 metric line prefix (exact $1 match on field 1)
 log "(t) torn-snapshot hunt: boot + ${WAVE}-wide admission wave under poll hammer"
 boot_tree /tmp/d0bshadow_boot.log || die "boot failed"
 # memgov D2-1: the governance mode board rides every boot; a stock boot
-# shows the tree defaults (all observe until the D2 increments ratchet a
-# family to enforce -- update this expectation WITH each ratchet commit).
-R "grep -q 'memgov modes: boot=observe prewarm=observe bank=observe serial=observe static=observe' /tmp/d0bshadow_boot.log" \
+# shows the tree defaults (update this expectation WITH each ratchet
+# commit).  D2-2b ratcheted BOOT and BANK to enforce.
+R "grep -q 'memgov modes: boot=enforce prewarm=observe bank=enforce serial=observe static=observe' /tmp/d0bshadow_boot.log" \
     || die "memgov mode board missing or not at tree defaults"
 grep -q . /dev/null   # no-op keeps set -u happy on empty locals below
 # SNAP0: the boot-settle ledger, BEFORE any request (leg (r) asserts the
@@ -191,7 +191,10 @@ if [ -n "$ADMITS" ] && [ "$ADMITS" != "0" ]; then
     # wave is 8-wide COLD on a fresh boot: every admission projects
     # growth, so exact equality stands.  A future wave that adds warm
     # reuse must subtract its zero-growth admits before asserting.
-    [ "$BANK_CELLS" = "$ADMITS" ] || die "decision-cell sum ($BANK_CELLS) != growth admissions+rejects ($ADMITS)"
+    # D2-2b: +1 = the boot bank-fit quote (one governed check per
+    # successful persistent-ctx create; a healthy boot creates once and
+    # never descends).
+    [ "$BANK_CELLS" = "$((ADMITS + 1))" ] || die "decision-cell sum ($BANK_CELLS) != growth admissions+rejects + boot fit ($ADMITS + 1)"
 else
     [ -n "$BANK_CELLS" ] && [ "$BANK_CELLS" -ge "$WAVE" ] || die "bank decision cells ($BANK_CELLS) < wave ($WAVE)"
 fi
@@ -199,6 +202,47 @@ fi
 DIS_LOG=$(R "grep -c 'memgov shadow DISAGREE' /tmp/d0bshadow_boot.log" || true)
 [ "${DIS_LOG:-0}" = "0" ] || die "DISAGREE disclosures in server log ($DIS_LOG)"
 log "(d) PASS (bank cells=$BANK_CELLS admissions=$ADMITS disagreements=0)"
+
+log "(e) D2-2b deterministic fit refusal (pinned headroom -> serial-only boot)"
+# The enforce leg the ratchet demands: a headroom pinned above any real
+# free makes budget 0 DETERMINISTICALLY (no settle dependence), so the
+# governed fit must refuse the batch ctx at every fit-or-reduce halving
+# and the server must land on the per-call path and still serve.  This
+# boot's log (/tmp/d0bfit_boot.log) contains INTENTIONAL
+# SHADOW_STRICTER DISAGREE disclosures (the quote refusing what legacy
+# would have poked) -- it is EXCLUDED from zero-DISAGREE audits BY PATH;
+# never point a battery audit at it.
+[ -n "$SPID" ] && R "kill $SPID" 2>/dev/null; SPID=""
+R 'ps -eo pid,comm | awk '"'"'$2=="ds4-server"{print $1}'"'"' | xargs -r kill' 2>/dev/null
+sleep 10
+ssh -o ConnectTimeout=10 "$HOST" \
+    "cd $TEST_TREE && DS4_BATCH_FIT_HEADROOM_MB=1000000 setsid nohup ./ds4-server -c $CTX > /tmp/d0bfit_boot.log 2>&1 < /dev/null & exit 0" &
+LP=$!; sleep 5; kill $LP 2>/dev/null || true
+BOOTED=0
+for i in $(seq 240); do
+    R "grep -q 'listening on http' /tmp/d0bfit_boot.log" && { BOOTED=1; break; }
+    R "ps -eo comm | grep -q '^ds4-server'" || break
+    sleep 2
+done
+[ "$BOOTED" = "1" ] || { R "tail -5 /tmp/d0bfit_boot.log"; die "(e) refused boot did not reach listening"; }
+SPID=$(R "pgrep -x ds4-server | head -1")
+R "grep -q 'memgov modes: boot=enforce prewarm=observe bank=enforce serial=observe static=observe' /tmp/d0bfit_boot.log" \
+    || die "(e) mode board not at enforce defaults"
+ENF=$(R "grep -c 'memgov ENFORCE refuse site=boot_bank_fit' /tmp/d0bfit_boot.log" || true)
+[ "${ENF:-0}" -ge 1 ] || die "(e) no boot_bank_fit ENFORCE refusal in log"
+R "grep -q 'memgov refused the bank plan' /tmp/d0bfit_boot.log" \
+    || die "(e) typed refusal text missing from the shell's unavailable line"
+R "grep -q 'persistent batch ctx unavailable' /tmp/d0bfit_boot.log" \
+    || die "(e) server did not fall back to the per-call path"
+R "grep -q 'persistent batch ctx ready' /tmp/d0bfit_boot.log" \
+    && die "(e) a batch ctx was created despite the refusal"
+STRAY=$(R "grep 'memgov shadow DISAGREE' /tmp/d0bfit_boot.log | grep -vc 'site=boot_bank_fit'" || true)
+[ "${STRAY:-0}" = "0" ] || die "(e) DISAGREE disclosures beyond the fit site ($STRAY)"
+# The refused shape still serves (per-call batch path, real decode).
+R "curl -s -m 300 -X POST localhost:$PORT/v1/messages -H 'content-type: application/json' \
+    -d '{\"model\":\"ds4\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Say OK.\"}]}'" \
+    | grep -q '\"type\":\"message\"' || die "(e) refused-shape boot does not serve"
+log "(e) PASS (enforce_refusals=$ENF, per-call fallback serves)"
 
 cleanup
 trap - EXIT

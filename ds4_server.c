@@ -26589,13 +26589,24 @@ static void test_mem_gov_modes(void) {
             for (int r = 0; r < DS4_GOV_CMP__COUNT; r++)
                 cells1 += ds4_metric_read(&m->memgov_decisions[c][st][r]);
     TEST_ASSERT(cells1 == cells0);
-    /* Restore observe-everywhere for the rest of the suite. */
-    unsetenv("DS4_MEMGOV");
+    /* DS4_MEMGOV=observe is the one-word rollback: every family shadows
+     * regardless of the ratcheted per-family defaults. */
+    setenv("DS4_MEMGOV", "observe", 1);
     unsetenv("DS4_MEMGOV_SERIAL");
     unsetenv("DS4_MEMGOV_STATIC");
     ds4_gov_modes_init();
     for (int c = 0; c < DS4_GOVC__COUNT; c++)
         TEST_ASSERT(ds4_gov_mode(c) == DS4_GOV_MODE_OBSERVE);
+    /* Ship defaults (D2-2b ratchet): BOOT and BANK enforce, the
+     * unratcheted families observe.  This assertion IS the ratchet's
+     * unit-level record -- update it with each D2 default flip. */
+    unsetenv("DS4_MEMGOV");
+    ds4_gov_modes_init();
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_ENGINE_BOOT) == DS4_GOV_MODE_ENFORCE);
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_PREWARM) == DS4_GOV_MODE_OBSERVE);
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_BATCH_BANK_PLAN) == DS4_GOV_MODE_ENFORCE);
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_SERIAL_SESSION) == DS4_GOV_MODE_OBSERVE);
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_STATIC_BATCH) == DS4_GOV_MODE_OBSERVE);
     ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 5, 5);
     ds4_gov_snapshot(&lg);
     TEST_ASSERT(lg.lease[DS4_GOVC_SERIAL_SESSION].intent == 5);

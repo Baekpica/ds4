@@ -33491,7 +33491,7 @@ int ds4_gov_mode(int consumer) {
 void ds4_gov_modes_init(void) {
     /* Env map: index == ds4_gov_consumer.  BANK covers the whole
      * BATCH_BANK lane (fit + budget + cont admission -- one lease, one
-     * knob); the D2 defaults ratchet per increment, all OBSERVE today. */
+     * knob); the D2 defaults ratchet per increment. */
     static const char *knob[DS4_GOVC__COUNT] = {
         "DS4_MEMGOV_BOOT",      /* DS4_GOVC_ENGINE_BOOT     */
         "DS4_MEMGOV_PREWARM",   /* DS4_GOVC_PREWARM         */
@@ -33499,17 +33499,31 @@ void ds4_gov_modes_init(void) {
         "DS4_MEMGOV_SERIAL",    /* DS4_GOVC_SERIAL_SESSION  */
         "DS4_MEMGOV_STATIC",    /* DS4_GOVC_STATIC_BATCH    */
     };
-    int def = DS4_GOV_MODE_OBSERVE;
+    /* D2-2b ratchet (the box gates the ratchet, not the machinery):
+     * BOOT and BANK default ENFORCE -- their quotes ran AGREE across
+     * every D2-1/2a/3 battery boot and the post-reboot fit check;
+     * enforce only inverts which side of that identical comparison
+     * rules.  SERIAL ratchets at D2-4, PREWARM/STATIC at D2-5.
+     * DS4_MEMGOV=observe is the one-word rollback to shadow-everywhere;
+     * off stays the kill switch; per-family knobs win over both. */
+    static const uint8_t defm[DS4_GOVC__COUNT] = {
+        DS4_GOV_MODE_ENFORCE,   /* ENGINE_BOOT      (D2-2b) */
+        DS4_GOV_MODE_OBSERVE,   /* PREWARM          (D2-5)  */
+        DS4_GOV_MODE_ENFORCE,   /* BATCH_BANK_PLAN  (D2-2b) */
+        DS4_GOV_MODE_OBSERVE,   /* SERIAL_SESSION   (D2-4)  */
+        DS4_GOV_MODE_OBSERVE,   /* STATIC_BATCH     (D2-5)  */
+    };
+    int gdef = -1;
     const char *g = getenv("DS4_MEMGOV");
     if (g && g[0]) {
-        const int m = ds4_gov_mode_parse(g);
-        if (m >= 0) def = m;
-        else fprintf(stderr, "ds4: memgov: DS4_MEMGOV=%s unrecognized "
-                             "(off|observe|enforce); keeping %s\n",
-                     g, ds4_gov_mode_name(def));
+        gdef = ds4_gov_mode_parse(g);
+        if (gdef < 0)
+            fprintf(stderr, "ds4: memgov: DS4_MEMGOV=%s unrecognized "
+                            "(off|observe|enforce); keeping per-family "
+                            "defaults\n", g);
     }
     for (int c = 0; c < DS4_GOVC__COUNT; c++) {
-        int m = def;
+        int m = gdef >= 0 ? gdef : defm[c];
         const char *v = getenv(knob[c]);
         if (v && v[0]) {
             const int pm = ds4_gov_mode_parse(v);
@@ -33581,15 +33595,19 @@ void ds4_gov_snapshot(ds4_gov_ledger *out) {
  * observe and enforce read identically at the gate.  Returns the quote's
  * validated status. */
 static int gov_check_core(const char *site, const ds4_gov_claim *cl,
-                          int legacy_status) {
+                          int legacy_status, const uint64_t *floor_override) {
     ds4_metrics *m = ds4_metrics_get();
     ds4_gov_ledger img;
     memset(&img, 0, sizeof(img));
     ds4_gov_snapshot(&img);
     /* floor/substrate/observation are sampled HERE, closest in time to
      * the legacy verdict the caller just took -- residual sampling skew
-     * is a real (and wanted) disagreement source, not an error. */
-    img.floor_bytes = ds4_mem_floor_bytes();
+     * is a real (and wanted) disagreement source, not an error.
+     * D2-2b: floor_override substitutes the caller's OWN protected
+     * margin for the operator floor (the boot fit protects its planning
+     * headroom, not the live floor -- scoping sec 7); the quote records
+     * whichever it used. */
+    img.floor_bytes = floor_override ? *floor_override : ds4_mem_floor_bytes();
     img.substrate_outstanding = ds4_gpu_substrate_outstanding();
     ds4_mem_observation o;
     memset(&o, 0, sizeof(o));
@@ -33646,15 +33664,19 @@ void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
                           int live_status) {
     if (!gov_check_args_ok(cl, live_status)) return;
     if (ds4_gov_mode(cl->requester) == DS4_GOV_MODE_OFF) return;   /* D2-1 */
-    (void)gov_check_core(site, cl, live_status);
+    (void)gov_check_core(site, cl, live_status, NULL);
 }
 
-int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
-                           int legacy_status) {
+/* Mode dispatch shared by the public governed check (operator floor) and
+ * the boot fit's floored variant (D2-2b).  The enforce mapping is the
+ * one place the quote-status vocabulary meets the caller's boolean. */
+static int gov_governed_dispatch(const char *site, const ds4_gov_claim *cl,
+                                 int legacy_status,
+                                 const uint64_t *floor_override) {
     if (!gov_check_args_ok(cl, legacy_status)) return legacy_status;
     const int mode = ds4_gov_mode(cl->requester);
     if (mode == DS4_GOV_MODE_OFF) return legacy_status;
-    const int qs = gov_check_core(site, cl, legacy_status);
+    const int qs = gov_check_core(site, cl, legacy_status, floor_override);
     if (mode != DS4_GOV_MODE_ENFORCE) return legacy_status;
     switch (qs) {
     case DS4_GOV_ADMIT:
@@ -33671,6 +33693,11 @@ int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
          * memory answer keeps the historical behavior (sec 6.4). */
         return legacy_status;
     }
+}
+
+int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
+                           int legacy_status) {
+    return gov_governed_dispatch(site, cl, legacy_status, NULL);
 }
 
 /* Absolute session-graph intent at a ctx: the serial-reserve estimator
@@ -34034,6 +34061,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
      * growth: tmp pools, capture graphs, logits staging.  DS4_BATCH_FIT=0
      * keeps caller-driven sizing.  Backends with no memory query (Metal)
      * skip the budget and rely on the descent loop below. */
+    uint64_t fit_per_bank = 0, fit_headroom = 0;   /* armed iff the budget ran */
     if (fit) {
         const char *fe = getenv("DS4_BATCH_FIT");
         uint64_t free_b = 0, total_b = 0;
@@ -34055,16 +34083,51 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
             uint64_t budget = free_b > headroom ? free_b - headroom : 0;
             budget = budget > sub_out ? budget - sub_out : 0;
             uint32_t n = (uint32_t)(budget / per_bank);
-            /* memgov D2-2b (DEFERRED, design in d2_scoping sec 7): the
-             * governed fit -- claim {proposed = n_want*per_bank,
-             * class_limit = budget?:1} through ds4_gov_governed_check
-             * ("boot_bank_fit"), enforce killing this forced-2 poke with
-             * a typed ctx refusal (serial-only fallback).  BLOCKED on
-             * the box reboot (rider #47): on the current box EVERY stock
-             * boot sits at the forced-2 boundary, so even the observe
-             * quote would disclose SHADOW_STRICTER on every standing-
-             * battery boot and no close can go green.  Lands with the
-             * BANK enforce ratchet on the first healthy-box battery. */
+            fit_per_bank = per_bank;
+            fit_headroom = headroom;
+            /* memgov D2-2b (plan sec 12 consumer 2): the governed fit.
+             * The quote validates what legacy is about to POKE (n_eff
+             * banks) under the fit's own arithmetic -- class_limit is
+             * the boot budget (pinned to 1 when zero: 0 means uncapped
+             * to the evaluator), the protected margin is the planning
+             * HEADROOM, not the operator floor (the ledger is near-
+             * empty here by design; ENGINE_BOOT publishes at settle).
+             * Legacy maps to ADMIT always: the old poke proceeded at
+             * max(n, 2) and used physical alloc failure as its verdict.
+             * enforce: a plan below 2 funded banks is a typed refusal
+             * of the batch ctx -- the server's fit-or-reduce shell
+             * lands serial-only and the drain-to-OOM overcommit class
+             * dies with the forced-2 poke.  observe/off: the poke
+             * stays verbatim (rollback), the quote only counts. */
+            {
+                /* n_eff is EXACTLY the plan legacy pokes below: the
+                 * forced floor when the budget funds fewer than 2, else
+                 * the funded count capped at the caller's request (a
+                 * budget that funds more than requested allocates only
+                 * max_seq banks -- quote the poke, not the surplus). */
+                const uint32_t n_eff = n < 2u ? 2u
+                                     : n < ctx->max_seq ? n : ctx->max_seq;
+                ds4_gov_claim fcl = {0};
+                fcl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+                fcl.memc = DS4_MEMC_BATCH_BANK;
+                fcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+                fcl.proposed_outstanding = (uint64_t)n_eff * per_bank;
+                fcl.class_limit = budget != 0 ? budget : 1;
+                const int fv = gov_governed_dispatch("boot_bank_fit", &fcl,
+                                                     DS4_GOV_ADMIT, &headroom);
+                if (fv != DS4_GOV_ADMIT) {
+                    fprintf(stderr,
+                            "ds4: memgov ENFORCE refuse site=boot_bank_fit status=%d legacy=%d proposed=%llu class_limit=%llu banks=%u requested=%u\n",
+                            fv, DS4_GOV_ADMIT,
+                            (unsigned long long)fcl.proposed_outstanding,
+                            (unsigned long long)fcl.class_limit,
+                            n_eff, ctx->max_seq);
+                    BC_ERR("batch_ctx_create: memgov refused the bank plan (budget funds %u banks, floor is 2; serial-only boot)", n);
+                    metal_graph_free(&ctx->g);
+                    free(ctx);
+                    return 1;
+                }
+            }
             if (n < 2u) n = 2u;   /* still try the floor: a failing 2-bank slab
                                    * alloc is a ~2-GB poke, not a 20-GB one */
             if (n < ctx->max_seq) {
@@ -34095,6 +34158,44 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         /* Finer than halving so a near-miss budget doesn't cost half the banks. */
         uint32_t next = ctx->max_seq * 3u / 4u;
         if (next < 2u) next = 2u;
+        /* memgov D2-2b: each physical descent re-quotes the adapted plan
+         * against a FRESH budget (a failed alloc can mean free moved
+         * since the boot quote); enforce refuses a descent the budget
+         * cannot fund instead of poking it.  When the re-read gives no
+         * answer the quote is skipped -- legacy keeps ruling exactly as
+         * on query-less backends (sec 6.4); unreachable in practice when
+         * the boot quote admitted, kept for the resilience path's
+         * honesty. */
+        if (fit_per_bank != 0) {
+            uint64_t free2 = 0, total2 = 0;
+            if (ds4_gpu_mem_info(&free2, &total2) == 0) {
+                const uint64_t sub2 = ds4_gpu_substrate_outstanding();
+                uint64_t budget2 = free2 > fit_headroom ? free2 - fit_headroom : 0;
+                budget2 = budget2 > sub2 ? budget2 - sub2 : 0;
+                ds4_gov_claim fcl = {0};
+                fcl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+                fcl.memc = DS4_MEMC_BATCH_BANK;
+                fcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+                fcl.proposed_outstanding = (uint64_t)next * fit_per_bank;
+                fcl.class_limit = budget2 != 0 ? budget2 : 1;
+                const int fv = gov_governed_dispatch("boot_bank_fit", &fcl,
+                                                     DS4_GOV_ADMIT,
+                                                     &fit_headroom);
+                if (fv != DS4_GOV_ADMIT) {
+                    fprintf(stderr,
+                            "ds4: memgov ENFORCE refuse site=boot_bank_fit status=%d legacy=%d proposed=%llu class_limit=%llu banks=%u requested=%u (descent)\n",
+                            fv, DS4_GOV_ADMIT,
+                            (unsigned long long)fcl.proposed_outstanding,
+                            (unsigned long long)fcl.class_limit,
+                            next, ctx->max_seq);
+                    BC_ERR("batch_ctx_create: memgov refused the descent plan (%u banks after alloc failure at %u; serial-only boot)",
+                           next, ctx->max_seq);
+                    metal_graph_free(&ctx->g);
+                    free(ctx);
+                    return 1;
+                }
+            }
+        }
         fprintf(stderr, "ds4: batch fit: %s alloc failed at max_seq=%u, retrying at %u\n",
                 slabs_ok ? "MTP slab" : "slab", ctx->max_seq, next);
         ctx->max_seq = next;
