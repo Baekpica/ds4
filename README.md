@@ -386,6 +386,46 @@ reference: it builds with `make cuda-spark` (on a GB10 a generic
 header documents the run flags — in particular, never give the container a
 memory limit, because the mmap'd weights live in the host page cache.
 
+## Motif-3 mixed-quant runtime
+
+Motif-3 is an explicit native CUDA model family for the official final
+`Motif-Technologies/Motif-3` topology. The loader and fixture gates cover all
+53 layers, 384 routed experts with sigmoid top-8 routing, the shared expert,
+Expert-Specific PolyNorm, modified mHC, interleaved full/SWA GDLA with YaRN,
+latent KV plus decoupled RoPE state, and the official tokenizer/chat protocol.
+A Motif container is never routed through the DeepSeek graph.
+
+The public full-topology MQ87-88 artifact is
+[`Baekpica/Motif-3-Mixed-Quant-GGUF`](https://huggingface.co/Baekpica/Motif-3-Mixed-Quant-GGUF).
+The current loader consumes one GGUF, so first verify all public shard hashes
+and merge them once with `llama-gguf-split --merge`. The merge is artifact
+assembly, not runtime streaming.
+
+Build DGX Spark/GB10 with `make cuda-spark`; that target emits
+`compute_121a`/`sm_121a`. The resident lifecycle is the same as the other
+supported families: keep one VMM weight owner alive and restart only the
+inference worker. Run the owner's `--dry-run` preflight first, then remove
+`--dry-run` and wait for its ready manifest before launching the worker:
+
+```sh
+./ds4_weight_server --base /path/to/Motif-3-MQ87-88-FIT.gguf \
+  --manifest /path/to/run/weights.manifest --backend vmm --scope base \
+  --reserve-gb 24 --no-repack-q8-aligned --dry-run
+
+DS4_CUDA_WEIGHT_IPC_MANIFEST=/path/to/run/weights.manifest \
+  ./ds4-server -m /path/to/Motif-3-MQ87-88-FIT.gguf -c 2048 \
+  --host 0.0.0.0 --port 8001
+```
+
+The shared server surface includes OpenAI chat/completions, Responses, and
+Anthropic Messages, with streaming and non-streaming modes. Live Motif API,
+resident-memory, throughput, and 256K prefill-plus-decode results remain release
+gates; they are not implied by the loader and kernel fixture results. See
+[`docs/motif-3-spark-optimization-handoff.md`](docs/motif-3-spark-optimization-handoff.md)
+for the current verified boundary and exact test order. MTP is not enabled or
+described as a speedup until target-token identity and end-to-end throughput are
+measured.
+
 ## Speed
 
 These are single-run CLI numbers with `--ctx 32768`, `--nothink`, greedy
@@ -828,16 +868,22 @@ The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
 the shared prefix instead of pre-filling from token zero.
 
-Request parsing and sockets run in client threads, but inference itself is
-serialized through one graph worker. The current server does not batch multiple
-independent requests together; concurrent requests wait their turn on the single
-live graph/session.
+Request parsing and sockets run in client threads. By default the inference
+worker attempts to create a persistent multi-session context and routes eligible
+requests through continuous batching; unsupported or unfunded cases fall back
+to the ordered static or serial path. `DS4_SERVER_COALESCE_MAX` bounds resident
+banks, `DS4_SERVER_COALESCE=0` disables coalescing, and
+`DS4_SERVER_CONTINUOUS=0` keeps only static coalescing. Long admissions are
+chunked with the `DS4_CONT_PREFILL_CHUNK` and
+`DS4_CONT_PREFILL_CHUNK_LIVE` controls. Size `--ctx` and the bank count against
+the startup memory ledger; a context that fits one session may not fit many.
 
 Supported endpoints:
 
 - `GET /v1/models` (lists the loaded model)
 - `GET /v1/models/deepseek-v4-flash`
 - `GET /v1/models/deepseek-v4-pro`
+- `GET /v1/models/motif-3` (when a Motif-3 GGUF is loaded)
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/completions`
