@@ -121,10 +121,11 @@ int main(int argc, char **argv) {
     int prompt_tokens = source_tokens;
     int ctx = prompt_tokens + generation_budget;
     if (ctx > native_ctx) {
-        /* Every generated fixture has a 20-token question tail.  Remove only
-         * filler immediately before it, preserving all records and the exact
-         * question while reserving native-context decode room. */
-        const int question_tail = 20;
+        /* Every generated v2 fixture has a 25-token final question plus
+         * generation-prefix tail. Remove only filler immediately before it,
+         * preserving all records and the complete question while reserving
+         * native-context decode room. */
+        const int question_tail = 25;
         const int remove = ctx - native_ctx;
         if (remove <= 0 || prompt_tokens <= remove + question_tail) {
             free(token_data); return 1;
