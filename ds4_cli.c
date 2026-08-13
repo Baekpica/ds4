@@ -603,7 +603,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_token_is_stop(engine, token)) break;
 
         int toks[17];
         int ntok = 0;
@@ -647,7 +647,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         if (gen_step_profile) {
             int measured_accept = 0;
             for (int j = 0; j < ntok && generated + measured_accept < max_tokens; j++) {
-                if (toks[j] == ds4_token_eos(engine)) break;
+                if (ds4_token_is_stop(engine, toks[j])) break;
                 measured_accept++;
             }
             fprintf(stderr,
@@ -661,7 +661,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             gen_step_cycle++;
         }
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == ds4_token_eos(engine)) {
+            if (ds4_token_is_stop(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -922,7 +922,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         }
         fputs("]}", fp);
 
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_token_is_stop(engine, token)) break;
         if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4: decode failed while dumping logprobs: %s\n", err);
             free(scores);
@@ -1071,7 +1071,8 @@ static int run_batch_generate(ds4_engine *engine, const cli_config *cfg) {
             printf("=== seq %d (%s, %d tok) ===\n", i,
                    res[i].finish ? "eos" : "budget", res[i].n_tokens);
             for (int k = 0; k < res[i].n_tokens; k++) {
-                if (res[i].tokens[k] == eos) break;
+                if (res[i].tokens[k] == eos ||
+                    ds4_token_is_stop(engine, res[i].tokens[k])) break;
                 size_t plen = 0;
                 char *piece = ds4_token_text(engine, res[i].tokens[k], &plen);
                 if (piece) { fwrite(piece, 1, plen, stdout); free(piece); }
@@ -1363,7 +1364,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
-        if (token == ds4_token_eos(engine)) break;
+        if (ds4_token_is_stop(engine, token)) break;
 
         int toks[17];
         int ntok = 0;
@@ -1397,7 +1398,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == ds4_token_eos(engine)) {
+            if (ds4_token_is_stop(engine, toks[j])) {
                 stop = true;
                 break;
             }

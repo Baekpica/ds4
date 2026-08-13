@@ -656,6 +656,8 @@ int ds4_dspark_slabs_validate(ds4_engine *e, ds4_session *s, const char *trace_p
 int ds4_dspark_tap_validate(ds4_engine *e, ds4_session *s, const char *trace_path);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
+int ds4_engine_motif3_sparse_test(ds4_engine *e);
+int ds4_engine_motif3_forward_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size);
@@ -679,6 +681,10 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
+bool ds4_token_is_stop(ds4_engine *e, int token);
+bool ds4_token_is_thinking_control(ds4_engine *e, int token);
+bool ds4_token_is_stop_for_think_mode(
+        ds4_engine *e, int token, ds4_think_mode mode);
 int ds4_token_eos(ds4_engine *e);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);

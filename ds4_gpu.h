@@ -4,6 +4,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Every definition behind this header is C linkage; the guard lets CUDA/C++
+ * test drivers include it directly (they link against ds4_cuda.o's
+ * extern "C" symbols). */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================
@@ -594,6 +601,17 @@ int ds4_gpu_embed_tokens_hc_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* Batch embed straight from a Q8_0 row table (Motif-3 token embedding). */
+int ds4_gpu_embed_tokens_q8_0_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *tokens,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens,
+        uint32_t                n_embd);
+
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -879,6 +897,18 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         float                   clamp);
 
 int ds4_gpu_matmul_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+/* Motif mHC/control projections keep checkpoint BF16 weights and BF16
+ * activations while accumulating the GEMM in FP32. */
+int ds4_gpu_matmul_bf16_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1972,6 +2002,322 @@ int ds4_gpu_router_select_batch_tensor(
         float                   expert_weight_scale,
         uint32_t                n_tokens);
 
+/* Motif-3 control-path primitives.  Inputs and outputs are F32 so routing,
+ * PolyNorm coefficients/moments, and mHC mixing retain the official numeric
+ * contract independently of the quantized expert GEMMs. */
+int ds4_gpu_motif3_router_select_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *bias,
+        uint32_t                n_tokens,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   route_scale);
+
+int ds4_gpu_motif3_router_select_batch_model_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              bias_offset,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_tokens,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        float                 route_scale);
+
+int ds4_gpu_motif3_polynorm_mul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *coeff,
+        const ds4_gpu_tensor *bias,
+        uint32_t                rows,
+        uint32_t                width,
+        float                   hidden_clamp,
+        float                   bias_clamp,
+        float                   output_scale,
+        float                   eps);
+
+int ds4_gpu_motif3_polynorm_mul_model_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              coeff_offset,
+        uint64_t              bias_offset,
+        uint32_t              rows,
+        uint32_t              width,
+        float                 hidden_clamp,
+        float                 bias_clamp,
+        float                 output_scale,
+        float                 eps,
+        bool                  round_bf16);
+
+/* Native Motif-3 sparse expert path over the release MQ87 layout:
+ * IQ2_XXS gate/up -> per-selected-expert PolyNorm -> Q2_K down ->
+ * post-down router-weighted sum.  Unlike the generic ds4 routed path this
+ * deliberately does not use SwiGLU or fold route weights into the input to
+ * down_proj.  The coefficient tensors are resolved from the resident model
+ * map and remain F32 throughout the PolyNorm calculation. */
+int ds4_gpu_motif3_routed_moe_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *down,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint64_t              polynorm_weight_offset,
+        uint64_t              polynorm_bias_offset,
+        uint64_t              gate_expert_bytes,
+        uint64_t              down_expert_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert_used,
+        float                 hidden_clamp,
+        float                 bias_clamp,
+        float                 output_scale,
+        float                 eps,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tokens);
+
+int ds4_gpu_motif3_mhc_controls_tensor(
+        ds4_gpu_tensor       *h_pre,
+        ds4_gpu_tensor       *h_post,
+        ds4_gpu_tensor       *h_res,
+        const ds4_gpu_tensor *projected_pre,
+        const ds4_gpu_tensor *projected_post,
+        const ds4_gpu_tensor *projected_res,
+        const ds4_gpu_tensor *alpha_pre,
+        const ds4_gpu_tensor *alpha_post,
+        const ds4_gpu_tensor *alpha_res,
+        const ds4_gpu_tensor *bias_pre,
+        const ds4_gpu_tensor *bias_post,
+        const ds4_gpu_tensor *bias_res,
+        uint32_t                rows,
+        uint32_t                expansion,
+        uint32_t                sinkhorn_iters,
+        float                   post_coefficient);
+
+int ds4_gpu_motif3_mhc_controls_model_tensor(
+        ds4_gpu_tensor       *h_pre,
+        ds4_gpu_tensor       *h_post,
+        ds4_gpu_tensor       *h_res,
+        const ds4_gpu_tensor *projected_pre,
+        const ds4_gpu_tensor *projected_post,
+        const ds4_gpu_tensor *projected_res,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              alpha_pre_offset,
+        uint64_t              alpha_post_offset,
+        uint64_t              alpha_res_offset,
+        uint64_t              bias_pre_offset,
+        uint64_t              bias_post_offset,
+        uint64_t              bias_res_offset,
+        uint32_t              rows,
+        uint32_t              expansion,
+        uint32_t              sinkhorn_iters,
+        float                 post_coefficient);
+
+int ds4_gpu_motif3_mhc_apply_pre_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *hidden,
+        const ds4_gpu_tensor *h_pre,
+        uint32_t                rows,
+        uint32_t                expansion,
+        uint32_t                hidden_size);
+
+int ds4_gpu_motif3_mhc_apply_res_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *hidden,
+        const ds4_gpu_tensor *h_res,
+        uint32_t                rows,
+        uint32_t                expansion,
+        uint32_t                hidden_size);
+
+int ds4_gpu_motif3_mhc_combine_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *hidden,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *h_post,
+        const ds4_gpu_tensor *h_res,
+        uint32_t              rows,
+        uint32_t              expansion,
+        uint32_t              hidden_size);
+
+int ds4_gpu_motif3_mean_expansion_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *hidden,
+        uint32_t              rows,
+        uint32_t              expansion,
+        uint32_t              hidden_size);
+
+int ds4_gpu_motif3_round_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *in,
+        uint64_t              count);
+
+int ds4_gpu_concat_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              rows,
+        uint32_t              width);
+
+int ds4_gpu_motif3_split_kv_latent_tensor(
+        ds4_gpu_tensor       *kv_latent,
+        const ds4_gpu_tensor *kv_raw,
+        uint32_t              rows,
+        uint32_t              kv_raw_dim,
+        uint32_t              kv_latent_dim);
+
+int ds4_gpu_motif3_prepare_qkv_tensor(
+        ds4_gpu_tensor       *q_full,
+        ds4_gpu_tensor       *k_full,
+        ds4_gpu_tensor       *value,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *kv_raw,
+        const ds4_gpu_tensor *kv_proj,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t              rows,
+        uint32_t              q_heads,
+        uint32_t              kv_heads,
+        uint32_t              key_dim,
+        uint32_t              rope_dim,
+        uint32_t              value_dim,
+        uint32_t              kv_latent_dim);
+
+/* Production Motif-3 latent-cache path.  The cache stores normalized latent
+ * KV and already-rotated k_pe in BF16; full-attention layers use a linear
+ * cache while SWA layers use a fixed-size ring.  Historical expanded K/V is
+ * never materialized persistently. */
+int ds4_gpu_motif3_prepare_q_tensor(
+        ds4_gpu_tensor       *q_full,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t              rows,
+        uint32_t              q_heads,
+        uint32_t              key_dim,
+        uint32_t              rope_dim);
+
+int ds4_gpu_motif3_store_latent_kv_bf16_tensor(
+        ds4_gpu_tensor       *kv_latent_cache,
+        ds4_gpu_tensor       *k_pe_cache,
+        const ds4_gpu_tensor *kv_norm,
+        const ds4_gpu_tensor *kv_raw,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t              rows,
+        uint32_t              cache_cap,
+        uint32_t              kv_raw_dim,
+        uint32_t              kv_latent_dim,
+        uint32_t              rope_dim,
+        bool                  ring);
+
+int ds4_gpu_motif3_qk_absorb_q8_0_tensor(
+        ds4_gpu_tensor       *q_absorbed,
+        const ds4_gpu_tensor *q_full,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              kv_b_offset,
+        uint32_t              rows,
+        uint32_t              q_heads,
+        uint32_t              kv_heads,
+        uint32_t              group_size,
+        uint32_t              kv_latent_dim,
+        uint32_t              qk_nope,
+        uint32_t              key_dim,
+        uint32_t              value_dim);
+
+int ds4_gpu_motif3_latent_attention_bf16_tensor(
+        ds4_gpu_tensor       *latent_out,
+        const ds4_gpu_tensor *q_full,
+        const ds4_gpu_tensor *q_absorbed,
+        const ds4_gpu_tensor *kv_latent_cache,
+        const ds4_gpu_tensor *k_pe_cache,
+        uint32_t              rows,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        uint32_t              window,
+        uint32_t              q_heads,
+        uint32_t              kv_latent_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        float                 scale);
+
+int ds4_gpu_motif3_value_project_q8_0_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *latent,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              kv_b_offset,
+        uint32_t              rows,
+        uint32_t              q_heads,
+        uint32_t              kv_heads,
+        uint32_t              group_size,
+        uint32_t              kv_latent_dim,
+        uint32_t              qk_nope,
+        uint32_t              value_dim);
+
+int ds4_gpu_motif3_rope_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *in,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t                rows,
+        uint32_t                heads,
+        uint32_t                rope_dim);
+
+int ds4_gpu_motif3_expanded_attention_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                rows,
+        uint32_t                q_heads,
+        uint32_t                kv_heads,
+        uint32_t                key_dim,
+        uint32_t                value_dim,
+        float                   scale,
+        bool                    causal);
+
+int ds4_gpu_motif3_expanded_attention_window_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows,
+        uint32_t              q_heads,
+        uint32_t              kv_heads,
+        uint32_t              key_dim,
+        uint32_t              value_dim,
+        float                 scale,
+        bool                  causal,
+        uint32_t              window);
+
+int ds4_gpu_motif3_differential_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *attention,
+        const ds4_gpu_tensor *lambda,
+        const ds4_gpu_tensor *gate,
+        uint32_t                rows,
+        uint32_t                kv_heads,
+        uint32_t                group_size,
+        uint32_t                value_dim);
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -2366,5 +2712,9 @@ int ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -106,9 +106,9 @@ enum {
      * lossless in-forward-emit+rollback path needs 4 checkpoint depths. */
     DS4_MTP_RB_DEPTH         = 4,
     DS4_MAX_EMBD             = 7168,
-    DS4_MAX_VOCAB            = 129280,
+    DS4_MAX_VOCAB            = 220160,
     DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 1,
+    DS4_MAX_HEAD_KV          = 16,
     DS4_MAX_HEAD_DIM         = 512,
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
@@ -116,7 +116,7 @@ enum {
     DS4_MAX_LORA_Q           = 1536,
     DS4_MAX_LORA_O           = 1024,
     DS4_MAX_EXPERT           = 384,
-    DS4_MAX_EXPERT_USED      = 6,
+    DS4_MAX_EXPERT_USED      = 8,
     DS4_MAX_EXPERT_SHARED    = 1,
     DS4_MAX_FF_EXP           = 3072,
     DS4_MAX_HASH_LAYER       = 3,
@@ -129,18 +129,26 @@ enum {
 };
 
 typedef enum {
+    DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
+    DS4_MODEL_FAMILY_MOTIF3    = 1,
+} ds4_model_family;
+
+typedef enum {
     DS4_VARIANT_FLASH = 0,
     DS4_VARIANT_PRO   = 1,
+    DS4_VARIANT_MOTIF3 = 2,
 } ds4_variant;
 
 typedef struct {
     const char *name;
+    ds4_model_family family;
     ds4_variant variant;
     uint32_t n_layer;
     uint32_t n_embd;
     uint32_t n_vocab;
     uint32_t n_head;
     uint32_t n_head_kv;
+    uint32_t n_noise_head;
     uint32_t n_head_dim;
     uint32_t n_value_dim;
     uint32_t n_rot;
@@ -151,13 +159,20 @@ typedef struct {
     uint32_t n_expert_used;
     uint32_t n_expert_shared;
     uint32_t n_ff_exp;
+    uint32_t n_ff_dense;
     uint32_t n_hash_layer;
     uint32_t n_swa;
+    uint32_t n_swa_period;
     uint32_t n_indexer_head;
     uint32_t n_indexer_head_dim;
     uint32_t n_indexer_top_k;
     uint32_t n_hc;
     uint32_t n_hc_sinkhorn_iter;
+    uint32_t n_nextn_predict;
+    uint32_t n_leading_dense;
+    uint32_t n_kv_lora;
+    uint32_t n_key_mla;
+    uint32_t n_value_mla;
     float rms_eps;
     float hc_eps;
     float expert_weight_scale;
@@ -172,6 +187,7 @@ typedef struct {
 
 static const ds4_shape DS4_SHAPE_FLASH = {
     .name = "DeepSeek V4 Flash",
+    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
     .variant = DS4_VARIANT_FLASH,
     .n_layer = 43,
     .n_embd = 4096,
@@ -209,6 +225,7 @@ static const ds4_shape DS4_SHAPE_FLASH = {
 
 static const ds4_shape DS4_SHAPE_PRO = {
     .name = "DeepSeek V4 Pro",
+    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
     .variant = DS4_VARIANT_PRO,
     .n_layer = 61,
     .n_embd = 7168,
@@ -244,8 +261,58 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+/* Motif-Technologies/Motif-3 official final release.  This profile is pinned
+ * to revision ccceb1a5fd7b5eb32e47841216b3caf5666c07bc; it must not be
+ * inferred from, or relaxed to accept, any earlier prerelease topology. */
+static const ds4_shape DS4_SHAPE_MOTIF3 = {
+    .name = "Motif-3",
+    .family = DS4_MODEL_FAMILY_MOTIF3,
+    .variant = DS4_VARIANT_MOTIF3,
+    .n_layer = 53,
+    .n_embd = 4096,
+    .n_vocab = 220160,
+    .n_head = 80,
+    .n_head_kv = 16,
+    .n_noise_head = 16,
+    .n_head_dim = 192,
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_out_group = 0,
+    .n_lora_q = 1024,
+    .n_lora_o = 0,
+    .n_expert = 384,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 1280,
+    .n_ff_dense = 12288,
+    .n_hash_layer = 0,
+    .n_swa = 128,
+    .n_swa_period = 4,
+    .n_indexer_head = 0,
+    .n_indexer_head_dim = 0,
+    .n_indexer_top_k = 0,
+    .n_hc = 4,
+    .n_hc_sinkhorn_iter = 20,
+    .n_nextn_predict = 1,
+    .n_leading_dense = 2,
+    .n_kv_lora = 512,
+    .n_key_mla = 192,
+    .n_value_mla = 128,
+    .rms_eps = 1.0e-5f,
+    .hc_eps = 1.0e-6f,
+    .expert_weight_scale = 2.0f,
+    .swiglu_clamp_exp = 0.0f,
+    .rope_freq_base = 10000.0f,
+    .rope_scale_factor = 64.0f,
+    .rope_yarn_beta_fast = 32.0f,
+    .rope_yarn_beta_slow = 1.0f,
+    .compress_rope_freq_base = 0.0f,
+    .rope_orig_ctx = 4096,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
+    .family = DS4_MODEL_FAMILY_DEEPSEEK4,
     .variant = DS4_VARIANT_FLASH,
     .n_layer = 43,
     .n_embd = 4096,
@@ -284,12 +351,14 @@ static ds4_shape g_ds4_shape = {
 static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 
 #define DS4_MODEL_SHAPE_NAME          (g_ds4_shape.name)
+#define DS4_MODEL_FAMILY              (g_ds4_shape.family)
 #define DS4_MODEL_VARIANT             (g_ds4_shape.variant)
 #define DS4_N_LAYER                   (g_ds4_shape.n_layer)
 #define DS4_N_EMBD                    (g_ds4_shape.n_embd)
 #define DS4_N_VOCAB                   (g_ds4_shape.n_vocab)
 #define DS4_N_HEAD                    (g_ds4_shape.n_head)
 #define DS4_N_HEAD_KV                 (g_ds4_shape.n_head_kv)
+#define DS4_N_NOISE_HEAD              (g_ds4_shape.n_noise_head)
 #define DS4_N_HEAD_DIM                (g_ds4_shape.n_head_dim)
 #define DS4_N_VALUE_DIM               (g_ds4_shape.n_value_dim)
 #define DS4_N_ROT                     (g_ds4_shape.n_rot)
@@ -300,13 +369,20 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_EXPERT_USED             (g_ds4_shape.n_expert_used)
 #define DS4_N_EXPERT_SHARED           (g_ds4_shape.n_expert_shared)
 #define DS4_N_FF_EXP                  (g_ds4_shape.n_ff_exp)
+#define DS4_N_FF_DENSE                (g_ds4_shape.n_ff_dense)
 #define DS4_N_HASH_LAYER              (g_ds4_shape.n_hash_layer)
 #define DS4_N_SWA                     (g_ds4_shape.n_swa)
+#define DS4_N_SWA_PERIOD              (g_ds4_shape.n_swa_period)
 #define DS4_N_INDEXER_HEAD            (g_ds4_shape.n_indexer_head)
 #define DS4_N_INDEXER_HEAD_DIM        (g_ds4_shape.n_indexer_head_dim)
 #define DS4_N_INDEXER_TOP_K           (g_ds4_shape.n_indexer_top_k)
 #define DS4_N_HC                      (g_ds4_shape.n_hc)
 #define DS4_N_HC_SINKHORN_ITER        (g_ds4_shape.n_hc_sinkhorn_iter)
+#define DS4_N_NEXTN_PREDICT           (g_ds4_shape.n_nextn_predict)
+#define DS4_N_LEADING_DENSE           (g_ds4_shape.n_leading_dense)
+#define DS4_N_KV_LORA                 (g_ds4_shape.n_kv_lora)
+#define DS4_N_KEY_MLA                 (g_ds4_shape.n_key_mla)
+#define DS4_N_VALUE_MLA               (g_ds4_shape.n_value_mla)
 #define DS4_RMS_EPS                   (g_ds4_shape.rms_eps)
 #define DS4_HC_EPS                    (g_ds4_shape.hc_eps)
 #define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
@@ -621,6 +697,12 @@ static void ds4_die(const char *msg) {
 static uint32_t ds4_layer_compress_ratio(uint32_t il) {
     if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
     return g_ds4_compress_ratios[il];
+}
+
+static bool ds4_motif3_layer_is_full_attention(uint32_t il) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MOTIF3) return false;
+    if (il >= DS4_N_LAYER) ds4_die("Motif-3 layer index is outside the loaded model layout");
+    return DS4_N_SWA_PERIOD != 0 && (il % DS4_N_SWA_PERIOD) == 0;
 }
 
 static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
@@ -1178,6 +1260,8 @@ enum {
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_BF16     = 30,
+    DS4_TENSOR_MXFP4    = 39,
 };
 
 typedef struct {
@@ -1326,11 +1410,40 @@ static bool model_get_u32(const ds4_model *m, const char *key, uint32_t *out) {
     return cursor_u32(&c, out);
 }
 
-static bool model_get_u64(const ds4_model *m, const char *key, uint64_t *out) {
+static bool model_get_token_id(const ds4_model *m, const char *key, int *out) {
     ds4_kv *kv = model_find_kv(m, key);
-    if (!kv || kv->type != GGUF_VALUE_UINT64) return false;
+    if (!kv) return false;
+
     ds4_cursor c = cursor_at(m, kv->value_pos);
-    return cursor_u64(&c, out);
+    switch (kv->type) {
+    case GGUF_VALUE_UINT32: {
+        uint32_t v = 0;
+        if (!cursor_u32(&c, &v) || v > (uint32_t)INT_MAX) return false;
+        *out = (int)v;
+        return true;
+    }
+    case GGUF_VALUE_INT32: {
+        int32_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v)) || v < 0) return false;
+        *out = (int)v;
+        return true;
+    }
+    case GGUF_VALUE_UINT64: {
+        uint64_t v = 0;
+        if (!cursor_u64(&c, &v) || v > (uint64_t)INT_MAX) return false;
+        *out = (int)v;
+        return true;
+    }
+    case GGUF_VALUE_INT64: {
+        int64_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v)) ||
+            v < 0 || v > (int64_t)INT_MAX) return false;
+        *out = (int)v;
+        return true;
+    }
+    default:
+        return false;
+    }
 }
 
 static bool model_get_u64_compat(const ds4_model *m, const char *key, uint64_t *out) {
@@ -1689,17 +1802,25 @@ static void model_summary(const ds4_model *m) {
 
     model_get_string(m, "general.name", &name);
     model_get_string(m, "general.architecture", &arch);
-    model_get_u32(m, "deepseek4.block_count", &layers);
-    model_get_u64(m, "deepseek4.context_length", &ctx_train);
-    model_get_u32(m, "deepseek4.attention.head_count", &n_head);
-    model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv);
-    model_get_u32(m, "deepseek4.attention.key_length", &head_dim);
-    model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa);
+    if (!model_get_u32(m, "deepseek4.block_count", &layers))
+        model_get_u32(m, "motif3.block_count", &layers);
+    if (!model_get_u64_compat(m, "deepseek4.context_length", &ctx_train))
+        model_get_u64_compat(m, "motif3.context_length", &ctx_train);
+    if (!model_get_u32(m, "deepseek4.attention.head_count", &n_head))
+        model_get_u32(m, "motif3.attention.head_count", &n_head);
+    if (!model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv))
+        model_get_u32(m, "motif3.attention.head_count_kv", &n_head_kv);
+    if (!model_get_u32(m, "deepseek4.attention.key_length", &head_dim))
+        model_get_u32(m, "motif3.attention.key_length", &head_dim);
+    if (!model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa))
+        model_get_u32(m, "motif3.attention.sliding_window", &n_swa);
     model_get_u32(m, "deepseek4.attention.indexer.head_count", &indexer_heads);
     model_get_u32(m, "deepseek4.attention.indexer.key_length", &indexer_head_dim);
     model_get_u32(m, "deepseek4.attention.indexer.top_k", &indexer_top_k);
-    model_get_u32(m, "deepseek4.expert_count", &n_expert);
-    model_get_u32(m, "deepseek4.expert_used_count", &n_expert_used);
+    if (!model_get_u32(m, "deepseek4.expert_count", &n_expert))
+        model_get_u32(m, "motif3.expert_count", &n_expert);
+    if (!model_get_u32(m, "deepseek4.expert_used_count", &n_expert_used))
+        model_get_u32(m, "motif3.expert_used_count", &n_expert_used);
     model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
     model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used);
 
@@ -2524,13 +2645,28 @@ typedef struct {
     ds4_tensor *hc_attn_fn;
     ds4_tensor *hc_attn_scale;
     ds4_tensor *hc_attn_base;
+    ds4_tensor *mhc_attn_rms_norm;
+    ds4_tensor *mhc_attn_proj_pre;
+    ds4_tensor *mhc_attn_proj_post;
+    ds4_tensor *mhc_attn_proj_res;
+    ds4_tensor *mhc_attn_alpha_pre;
+    ds4_tensor *mhc_attn_alpha_post;
+    ds4_tensor *mhc_attn_alpha_res;
+    ds4_tensor *mhc_attn_bias_pre;
+    ds4_tensor *mhc_attn_bias_post;
+    ds4_tensor *mhc_attn_bias_res;
     ds4_tensor *attn_norm;
     ds4_tensor *attn_q_a;
     ds4_tensor *attn_q_a_norm;
     ds4_tensor *attn_q_b;
     ds4_tensor *attn_kv;
+    ds4_tensor *attn_kv_a_mqa;
     ds4_tensor *attn_kv_a_norm;
+    ds4_tensor *attn_kv_b;
+    ds4_tensor *attn_lambda;
+    ds4_tensor *attn_q_gate;
     ds4_tensor *attn_sinks;
+    ds4_tensor *attn_output;
     ds4_tensor *attn_output_a;
     ds4_tensor *attn_output_b;
     ds4_tensor *attn_compressor_ape;
@@ -2546,8 +2682,27 @@ typedef struct {
     ds4_tensor *hc_ffn_fn;
     ds4_tensor *hc_ffn_scale;
     ds4_tensor *hc_ffn_base;
+    ds4_tensor *mhc_ffn_rms_norm;
+    ds4_tensor *mhc_ffn_proj_pre;
+    ds4_tensor *mhc_ffn_proj_post;
+    ds4_tensor *mhc_ffn_proj_res;
+    ds4_tensor *mhc_ffn_alpha_pre;
+    ds4_tensor *mhc_ffn_alpha_post;
+    ds4_tensor *mhc_ffn_alpha_res;
+    ds4_tensor *mhc_ffn_bias_pre;
+    ds4_tensor *mhc_ffn_bias_post;
+    ds4_tensor *mhc_ffn_bias_res;
     ds4_tensor *ffn_norm;
+    ds4_tensor *ffn_polynorm_weight;
+    ds4_tensor *ffn_polynorm_bias;
+    ds4_tensor *ffn_polynorm_exps_weight;
+    ds4_tensor *ffn_polynorm_exps_bias;
+    ds4_tensor *ffn_polynorm_shexp_weight;
+    ds4_tensor *ffn_polynorm_shexp_bias;
     ds4_tensor *ffn_gate_tid2eid;
+    ds4_tensor *ffn_gate;
+    ds4_tensor *ffn_up;
+    ds4_tensor *ffn_down;
     ds4_tensor *ffn_gate_inp;
     ds4_tensor *ffn_exp_probs_b;
     ds4_tensor *ffn_gate_exps;
@@ -2566,6 +2721,13 @@ typedef struct {
     ds4_tensor *output_norm;
     ds4_tensor *output;
     ds4_layer_weights layer[DS4_MAX_LAYER];
+    /* The official checkpoint carries one dense MTP block in the same GGUF.
+     * It is bound separately from the 53 executable target-model layers. */
+    ds4_tensor *motif_mtp_embed_norm;
+    ds4_tensor *motif_mtp_input_norm;
+    ds4_tensor *motif_mtp_input_proj;
+    ds4_tensor *motif_mtp_final_norm;
+    ds4_layer_weights motif_mtp;
 } ds4_weights;
 
 typedef struct {
@@ -2623,6 +2785,15 @@ typedef struct {
 static uint32_t required_u32(const ds4_model *m, const char *key) {
     uint32_t v = 0;
     if (!model_get_u32(m, key, &v)) {
+        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
+        exit(1);
+    }
+    return v;
+}
+
+static uint64_t required_u64_compat(const ds4_model *m, const char *key) {
+    uint64_t v = 0;
+    if (!model_get_u64_compat(m, key, &v)) {
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
         exit(1);
     }
@@ -2739,6 +2910,44 @@ static void tensor_expect_plain_layout(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
+static DS4_MAYBE_UNUSED void tensor_expect_motif_plain_layout(
+        const ds4_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing Motif-3 plain tensor");
+    if (t->type != DS4_TENSOR_F16 &&
+        t->type != DS4_TENSOR_BF16 &&
+        t->type != DS4_TENSOR_F32) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type %s, expected F16, BF16, or F32\n",
+                (int)t->name.len,
+                t->name.ptr,
+                tensor_type_name(t->type));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
+}
+
+static void tensor_expect_motif_small_projection_layout(
+        const ds4_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing Motif-3 small projection");
+    if (t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_BF16) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type %s, expected F16 or BF16\n",
+                (int)t->name.len,
+                t->name.ptr,
+                tensor_type_name(t->type));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
+}
+
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
@@ -2799,9 +3008,264 @@ static void tensor_expect_routed_expert(
     }
 }
 
-/* Verify every tensor type and dimension used by the specialized pipeline.
- * After this succeeds, inference code can rely on fixed DS4 constants. */
+static bool weights_have_output_head(const ds4_weights *w) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        return w && w->output_norm && w->output;
+    }
+    return w &&
+           w->output_hc_base &&
+           w->output_hc_fn &&
+           w->output_hc_scale &&
+           w->output_norm &&
+           w->output;
+}
+
+static bool weights_have_partial_output_head(const ds4_weights *w) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        return w && (w->output_norm || w->output);
+    }
+    return w &&
+           (w->output_hc_base ||
+            w->output_hc_fn ||
+            w->output_hc_scale ||
+            w->output_norm ||
+            w->output);
+}
+
+static bool weights_motif3_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l ||
+        !l->attn_norm ||
+        !l->mhc_attn_rms_norm ||
+        !l->mhc_attn_proj_pre ||
+        !l->mhc_attn_proj_post ||
+        !l->mhc_attn_proj_res ||
+        !l->mhc_attn_alpha_pre ||
+        !l->mhc_attn_alpha_post ||
+        !l->mhc_attn_alpha_res ||
+        !l->mhc_attn_bias_pre ||
+        !l->mhc_attn_bias_post ||
+        !l->mhc_attn_bias_res ||
+        !l->attn_q_a ||
+        !l->attn_q_a_norm ||
+        !l->attn_q_b ||
+        !l->attn_q_gate ||
+        !l->attn_kv_a_mqa ||
+        !l->attn_kv_a_norm ||
+        !l->attn_kv_b ||
+        !l->attn_lambda ||
+        !l->attn_output ||
+        !l->mhc_ffn_rms_norm ||
+        !l->mhc_ffn_proj_pre ||
+        !l->mhc_ffn_proj_post ||
+        !l->mhc_ffn_proj_res ||
+        !l->mhc_ffn_alpha_pre ||
+        !l->mhc_ffn_alpha_post ||
+        !l->mhc_ffn_alpha_res ||
+        !l->mhc_ffn_bias_pre ||
+        !l->mhc_ffn_bias_post ||
+        !l->mhc_ffn_bias_res ||
+        !l->ffn_norm) {
+        return false;
+    }
+
+    if (il < DS4_N_LEADING_DENSE) {
+        return l->ffn_gate &&
+               l->ffn_up &&
+               l->ffn_down &&
+               l->ffn_polynorm_weight &&
+               l->ffn_polynorm_bias;
+    }
+    return l->ffn_gate_inp &&
+           l->ffn_exp_probs_b &&
+           l->ffn_gate_exps &&
+           l->ffn_up_exps &&
+           l->ffn_down_exps &&
+           l->ffn_polynorm_exps_weight &&
+           l->ffn_polynorm_exps_bias &&
+           l->ffn_gate_shexp &&
+           l->ffn_up_shexp &&
+           l->ffn_down_shexp &&
+           l->ffn_polynorm_shexp_weight &&
+           l->ffn_polynorm_shexp_bias;
+}
+
+static void weights_validate_motif3_mhc(
+        const ds4_tensor *rms_norm,
+        const ds4_tensor *proj_pre,
+        const ds4_tensor *proj_post,
+        const ds4_tensor *proj_res,
+        const ds4_tensor *alpha_pre,
+        const ds4_tensor *alpha_post,
+        const ds4_tensor *alpha_res,
+        const ds4_tensor *bias_pre,
+        const ds4_tensor *bias_post,
+        const ds4_tensor *bias_res) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    tensor_expect_layout(rms_norm,   DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+    tensor_expect_motif_small_projection_layout(proj_pre,  2, hc_dim, DS4_N_HC, 0);
+    tensor_expect_motif_small_projection_layout(proj_post, 2, hc_dim, DS4_N_HC, 0);
+    tensor_expect_motif_small_projection_layout(proj_res,  2, hc_dim,
+                                                 (uint64_t)DS4_N_HC * DS4_N_HC, 0);
+    tensor_expect_layout(alpha_pre,  DS4_TENSOR_F32, 1, 1, 0, 0);
+    tensor_expect_layout(alpha_post, DS4_TENSOR_F32, 1, 1, 0, 0);
+    tensor_expect_layout(alpha_res,  DS4_TENSOR_F32, 1, 1, 0, 0);
+    tensor_expect_layout(bias_pre,   DS4_TENSOR_F32, 1, DS4_N_HC, 0, 0);
+    tensor_expect_layout(bias_post,  DS4_TENSOR_F32, 1, DS4_N_HC, 0, 0);
+    tensor_expect_layout(bias_res,   DS4_TENSOR_F32, 2, DS4_N_HC, DS4_N_HC, 0);
+}
+
+static void weights_validate_motif3_attention(const ds4_layer_weights *l) {
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t signal_heads = DS4_N_HEAD - DS4_N_NOISE_HEAD;
+    const uint64_t signal_value_dim = signal_heads * DS4_N_VALUE_DIM;
+    const uint64_t kv_b_dim =
+        (uint64_t)DS4_N_HEAD_KV *
+        ((DS4_N_HEAD_DIM - DS4_N_ROT) + DS4_N_VALUE_DIM);
+
+    tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+    tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32, 1, DS4_N_LORA_Q, 0, 0);
+    tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
+    tensor_expect_layout(l->attn_q_gate,    DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, signal_value_dim, 0);
+    tensor_expect_layout(l->attn_kv_a_mqa,  DS4_TENSOR_Q8_0, 2, DS4_N_EMBD,
+                         (uint64_t)DS4_N_KV_LORA + DS4_N_ROT, 0);
+    tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32, 1, DS4_N_KV_LORA, 0, 0);
+    tensor_expect_layout(l->attn_kv_b,      DS4_TENSOR_Q8_0, 2, DS4_N_KV_LORA, kv_b_dim, 0);
+    tensor_expect_layout(l->attn_lambda,    DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, signal_heads, 0);
+    tensor_expect_layout(l->attn_output,    DS4_TENSOR_Q8_0, 2, signal_value_dim, DS4_N_EMBD, 0);
+}
+
+static void weights_validate_motif3_dense_ffn(const ds4_layer_weights *l) {
+    tensor_expect_layout(l->ffn_gate, DS4_TENSOR_Q8_0, 2,
+                         DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+    tensor_expect_layout(l->ffn_up, DS4_TENSOR_Q8_0, 2,
+                         DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+    tensor_expect_layout(l->ffn_down, DS4_TENSOR_Q8_0, 2,
+                         DS4_N_FF_DENSE, DS4_N_EMBD, 0);
+    tensor_expect_layout(l->ffn_polynorm_weight, DS4_TENSOR_F32, 1, 3, 0, 0);
+    tensor_expect_layout(l->ffn_polynorm_bias, DS4_TENSOR_F32, 1, 1, 0, 0);
+}
+
+static void weights_validate_motif3_sparse_ffn(const ds4_layer_weights *l) {
+    tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2,
+                         DS4_N_EMBD, DS4_N_EXPERT, 0);
+    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1,
+                         DS4_N_EXPERT, 0, 0);
+    tensor_expect_layout(l->ffn_gate_exps, DS4_TENSOR_IQ2_XXS, 3,
+                         DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+    tensor_expect_layout(l->ffn_up_exps, DS4_TENSOR_IQ2_XXS, 3,
+                         DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+    tensor_expect_layout(l->ffn_down_exps, DS4_TENSOR_Q2_K, 3,
+                         DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+    tensor_expect_layout(l->ffn_polynorm_exps_weight, DS4_TENSOR_F32, 2,
+                         3, DS4_N_EXPERT, 0);
+    tensor_expect_layout(l->ffn_polynorm_exps_bias, DS4_TENSOR_F32, 2,
+                         1, DS4_N_EXPERT, 0);
+    tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2,
+                         DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_layout(l->ffn_up_shexp, DS4_TENSOR_Q8_0, 2,
+                         DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2,
+                         DS4_N_FF_EXP, DS4_N_EMBD, 0);
+    tensor_expect_layout(l->ffn_polynorm_shexp_weight, DS4_TENSOR_F32, 1,
+                         3, 0, 0);
+    tensor_expect_layout(l->ffn_polynorm_shexp_bias, DS4_TENSOR_F32, 1,
+                         1, 0, 0);
+}
+
+static void weights_validate_motif3_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    if (!w) ds4_die("internal error: missing weights while validating Motif-3 layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in Motif-3 layout");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in Motif-3 layout");
+    }
+
+    if (require_token_embd && !w->token_embd) {
+        ds4_die("required Motif-3 token embedding tensor is missing");
+    }
+    if (w->token_embd) {
+        tensor_expect_layout(w->token_embd, DS4_TENSOR_Q8_0, 2,
+                             DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required Motif-3 output head is missing");
+    if (weights_have_partial_output_head(w) && !have_output) {
+        ds4_die("partial Motif-3 output head in GGUF");
+    }
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(w->output, DS4_TENSOR_Q8_0, 2,
+                             DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_motif3_layer_has_required(l, il)) {
+            fprintf(stderr, "ds4: required Motif-3 tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        weights_validate_motif3_mhc(
+            l->mhc_attn_rms_norm, l->mhc_attn_proj_pre, l->mhc_attn_proj_post,
+            l->mhc_attn_proj_res, l->mhc_attn_alpha_pre, l->mhc_attn_alpha_post,
+            l->mhc_attn_alpha_res, l->mhc_attn_bias_pre, l->mhc_attn_bias_post,
+            l->mhc_attn_bias_res);
+        weights_validate_motif3_attention(l);
+        weights_validate_motif3_mhc(
+            l->mhc_ffn_rms_norm, l->mhc_ffn_proj_pre, l->mhc_ffn_proj_post,
+            l->mhc_ffn_proj_res, l->mhc_ffn_alpha_pre, l->mhc_ffn_alpha_post,
+            l->mhc_ffn_alpha_res, l->mhc_ffn_bias_pre, l->mhc_ffn_bias_post,
+            l->mhc_ffn_bias_res);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        if (il < DS4_N_LEADING_DENSE) {
+            weights_validate_motif3_dense_ffn(l);
+        } else {
+            weights_validate_motif3_sparse_ffn(l);
+        }
+    }
+
+    /* MTP is intentionally validated as part of a full-model bind even though
+     * target-model serving does not execute it until speculative decode is on. */
+    if (layer_start == 0 && layer_end == DS4_N_LAYER - 1u) {
+        const ds4_layer_weights *l = &w->motif_mtp;
+        if (!w->motif_mtp_embed_norm || !w->motif_mtp_input_norm ||
+            !w->motif_mtp_input_proj || !w->motif_mtp_final_norm ||
+            !l->attn_q_a || !l->attn_q_a_norm || !l->attn_q_b ||
+            !l->attn_q_gate || !l->attn_kv_a_mqa || !l->attn_kv_a_norm ||
+            !l->attn_kv_b || !l->attn_lambda || !l->attn_output ||
+            !l->ffn_norm || !l->ffn_gate || !l->ffn_up || !l->ffn_down ||
+            !l->ffn_polynorm_weight || !l->ffn_polynorm_bias) {
+            ds4_die("official Motif-3 MTP topology is incomplete");
+        }
+        tensor_expect_layout(w->motif_mtp_embed_norm, DS4_TENSOR_F32, 1,
+                             DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(w->motif_mtp_input_norm, DS4_TENSOR_F32, 1,
+                             DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(w->motif_mtp_input_proj, DS4_TENSOR_Q8_0, 2,
+                             2u * DS4_N_EMBD, DS4_N_EMBD, 0);
+        tensor_expect_layout(w->motif_mtp_final_norm, DS4_TENSOR_F32, 1,
+                             DS4_N_EMBD, 0, 0);
+        weights_validate_motif3_attention(l);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        weights_validate_motif3_dense_ffn(l);
+    }
+}
+
+/* Verify every tensor type and dimension used by the selected family. */
 static void weights_validate_layout(const ds4_weights *w) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        weights_validate_motif3_layout(w,
+                                       0,
+                                       DS4_N_LAYER - 1u,
+                                       true,
+                                       true);
+        return;
+    }
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -3097,6 +3561,13 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
     exit(1);
 }
 
+static void config_expect_u64(const char *name, uint64_t got, uint64_t expected) {
+    if (got == expected) return;
+    fprintf(stderr, "ds4: expected %s=%" PRIu64 " for %s, got %" PRIu64 "\n",
+            name, expected, DS4_MODEL_SHAPE_NAME, got);
+    exit(1);
+}
+
 static void config_expect_f32(const char *name, float got, float expected) {
     const float scale = fabsf(expected) > 1.0f ? fabsf(expected) : 1.0f;
     if (fabsf(got - expected) <= scale * 1.0e-6f) return;
@@ -3118,7 +3589,7 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
 
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
-static void config_validate_model(const ds4_model *m) {
+static void config_validate_deepseek4_model(const ds4_model *m) {
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
     const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
     const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
@@ -3230,10 +3701,243 @@ static void config_validate_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
+static void config_validate_motif3_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_MOTIF3;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_layer = required_u32(m, "motif3.block_count");
+    const uint64_t n_ctx = required_u64_compat(m, "motif3.context_length");
+    const uint32_t n_embd = required_u32(m, "motif3.embedding_length");
+    const uint32_t n_vocab = required_u32(m, "motif3.vocab_size");
+    const uint32_t n_ff_dense = required_u32(m, "motif3.feed_forward_length");
+    const uint32_t n_leading_dense = required_u32(m, "motif3.leading_dense_block_count");
+    const uint32_t n_expert = required_u32(m, "motif3.expert_count");
+    const uint32_t n_expert_used = required_u32(m, "motif3.expert_used_count");
+    const uint32_t n_ff_exp = required_u32(m, "motif3.expert_feed_forward_length");
+    const uint32_t n_expert_shared = required_u32(m, "motif3.expert_shared_count");
+    const uint32_t expert_gating_func = required_u32(m, "motif3.expert_gating_func");
+    const uint32_t n_head = required_u32(m, "motif3.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "motif3.attention.head_count_kv");
+    const uint32_t n_noise_head = required_u32(m, "motif3.attention.noise_head_count");
+    const uint32_t n_head_dim = required_u32(m, "motif3.attention.key_length");
+    const uint32_t n_value_dim = required_u32(m, "motif3.attention.value_length");
+    const uint32_t n_lora_q = required_u32(m, "motif3.attention.q_lora_rank");
+    const uint32_t n_kv_lora = required_u32(m, "motif3.attention.kv_lora_rank");
+    const uint32_t n_rot = required_u32(m, "motif3.attention.rope_dimension_count");
+    const uint32_t n_swa = required_u32(m, "motif3.attention.sliding_window");
+    const uint32_t n_swa_period = required_u32(m, "motif3.attention.sliding_window_period");
+    const uint32_t n_hc = required_u32(m, "motif3.mhc.expansion_rate");
+    const uint32_t n_sinkhorn = required_u32(m, "motif3.mhc.sinkhorn_iterations");
+    const uint32_t n_mtp = required_u32(m, "motif3.mtp.block_count");
+
+    config_expect_u32("block_count", n_layer, DS4_N_LAYER);
+    config_expect_u64("context_length", n_ctx, UINT64_C(262144));
+    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
+    config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
+    config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
+    config_expect_u32("leading_dense_block_count", n_leading_dense, DS4_N_LEADING_DENSE);
+    config_expect_u32("expert_count", n_expert, DS4_N_EXPERT);
+    config_expect_u32("expert_used_count", n_expert_used, DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length", n_ff_exp, DS4_N_FF_EXP);
+    config_expect_u32("expert_shared_count", n_expert_shared, DS4_N_EXPERT_SHARED);
+    config_expect_u32("expert_gating_func", expert_gating_func, 1); /* sigmoid */
+    config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv", n_head_kv, DS4_N_HEAD_KV);
+    config_expect_u32("attention.noise_head_count", n_noise_head, DS4_N_NOISE_HEAD);
+    config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length", n_value_dim, DS4_N_VALUE_DIM);
+    config_expect_u32("attention.q_lora_rank", n_lora_q, DS4_N_LORA_Q);
+    config_expect_u32("attention.kv_lora_rank", n_kv_lora, DS4_N_KV_LORA);
+    config_expect_u32("attention.rope_dimension_count", n_rot, DS4_N_ROT);
+    config_expect_u32("attention.sliding_window", n_swa, DS4_N_SWA);
+    config_expect_u32("attention.sliding_window_period", n_swa_period, DS4_N_SWA_PERIOD);
+    config_expect_u32("mhc.expansion_rate", n_hc, DS4_N_HC);
+    config_expect_u32("mhc.sinkhorn_iterations", n_sinkhorn, DS4_N_HC_SINKHORN_ITER);
+    config_expect_u32("mtp.block_count", n_mtp, DS4_N_NEXTN_PREDICT);
+
+    config_expect_bool("expert_weights_norm",
+                       required_bool(m, "motif3.expert_weights_norm"), true);
+    config_expect_bool("attention.elementwise_output_gate",
+                       required_bool(m, "motif3.attention.elementwise_output_gate"), true);
+    config_expect_bool("mhc.enabled", required_bool(m, "motif3.mhc.enabled"), true);
+    config_expect_bool("polynorm.sigmoid_weight",
+                       required_bool(m, "motif3.polynorm.sigmoid_weight"), true);
+    config_expect_bool("rope.scaling.apply_mscale",
+                       required_bool(m, "motif3.rope.scaling.apply_mscale"), false);
+
+    config_expect_f32("expert_weights_scale",
+                      required_f32(m, "motif3.expert_weights_scale"), DS4_EXPERT_WEIGHT_SCALE);
+    config_expect_f32("expert_score_correction",
+                      required_f32(m, "motif3.expert_score_correction"), 1.0e-4f);
+    config_expect_f32("attention.layer_norm_rms_epsilon",
+                      required_f32(m, "motif3.attention.layer_norm_rms_epsilon"), DS4_RMS_EPS);
+    config_expect_f32("rope.freq_base",
+                      required_f32(m, "motif3.rope.freq_base"), DS4_ROPE_FREQ_BASE);
+    config_expect_f32("rope.freq_base_swa",
+                      required_f32(m, "motif3.rope.freq_base_swa"), 10000.0f);
+    config_expect_f32("rope.scaling.factor",
+                      required_f32(m, "motif3.rope.scaling.factor"), DS4_ROPE_SCALE_FACTOR);
+    config_expect_f32("rope.scaling.beta_fast",
+                      required_f32(m, "motif3.rope.scaling.beta_fast"), DS4_ROPE_YARN_BETA_FAST);
+    config_expect_f32("rope.scaling.beta_slow",
+                      required_f32(m, "motif3.rope.scaling.beta_slow"), DS4_ROPE_YARN_BETA_SLOW);
+    config_expect_f32("rope.scaling.mscale",
+                      required_f32(m, "motif3.rope.scaling.mscale"), 1.0f);
+    config_expect_f32("mhc.h_post_coefficient",
+                      required_f32(m, "motif3.mhc.h_post_coefficient"), 1.0f);
+    config_expect_f32("polynorm.output_scale",
+                      required_f32(m, "motif3.polynorm.output_scale"), 0.5f);
+    config_expect_f32("polynorm.bias_clamp",
+                      required_f32(m, "motif3.polynorm.bias_clamp"), 0.5f);
+    config_expect_f32("hidden_clamp",
+                      required_f32(m, "motif3.hidden_clamp"), 1000000.0f);
+
+    ds4_str pattern = {0};
+    ds4_str rope_type = {0};
+    ds4_str activation = {0};
+    ds4_str config_sha = {0};
+    if (!model_get_string(m, "motif3.attention.sliding_window_pattern", &pattern) ||
+        !ds4_streq(pattern, "interleave")) {
+        ds4_die("Motif-3 requires the official interleaved SWA/full-attention schedule");
+    }
+    if (!model_get_string(m, "motif3.rope.scaling.type", &rope_type) ||
+        !ds4_streq(rope_type, "yarn")) {
+        ds4_die("Motif-3 requires official YaRN metadata");
+    }
+    if (!model_get_string(m, "motif3.activation", &activation) ||
+        !ds4_streq(activation, "poly_norm")) {
+        ds4_die("Motif-3 requires PolyNorm activation metadata");
+    }
+    if (!model_get_string(m, "motif3.source.config_sha256", &config_sha) ||
+        !ds4_streq(config_sha,
+                   "30f14b635d3258a18c3ff7e69829f8fbfa775e87477ffabb59a79115bba820a5")) {
+        ds4_die("Motif-3 GGUF does not match the pinned official final config");
+    }
+
+    uint32_t full_layers = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_motif3_layer_is_full_attention(il)) full_layers++;
+    }
+    config_expect_u32("full_attention_layer_count", full_layers, 14);
+}
+
+static void config_validate_model(const ds4_model *m) {
+    ds4_str arch = {0};
+    if (model_get_string(m, "general.architecture", &arch) &&
+        ds4_streq(arch, "motif3")) {
+        config_validate_motif3_model(m);
+        return;
+    }
+    config_validate_deepseek4_model(m);
+}
+
+static void weights_bind_motif3_layer(
+        ds4_layer_weights *l,
+        const ds4_model   *m,
+        uint32_t           il) {
+    l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->mhc_attn_rms_norm = required_tensorf(m, "blk.%u.mhc_attn.rms_norm.weight", il);
+    l->mhc_attn_proj_pre = required_tensorf(m, "blk.%u.mhc_attn.proj_pre.weight", il);
+    l->mhc_attn_proj_post = required_tensorf(m, "blk.%u.mhc_attn.proj_post.weight", il);
+    l->mhc_attn_proj_res = required_tensorf(m, "blk.%u.mhc_attn.proj_res.weight", il);
+    l->mhc_attn_alpha_pre = required_tensorf(m, "blk.%u.mhc_attn.alpha_pre", il);
+    l->mhc_attn_alpha_post = required_tensorf(m, "blk.%u.mhc_attn.alpha_post", il);
+    l->mhc_attn_alpha_res = required_tensorf(m, "blk.%u.mhc_attn.alpha_res", il);
+    l->mhc_attn_bias_pre = required_tensorf(m, "blk.%u.mhc_attn.bias_pre", il);
+    l->mhc_attn_bias_post = required_tensorf(m, "blk.%u.mhc_attn.bias_post", il);
+    l->mhc_attn_bias_res = required_tensorf(m, "blk.%u.mhc_attn.bias_res", il);
+
+    l->attn_q_a = required_tensorf(m, "blk.%u.attn_q_a.weight", il);
+    l->attn_q_a_norm = required_tensorf(m, "blk.%u.attn_q_a_norm.weight", il);
+    l->attn_q_b = required_tensorf(m, "blk.%u.attn_q_b.weight", il);
+    l->attn_q_gate = required_tensorf(m, "blk.%u.attn_q_gate.weight", il);
+    l->attn_kv_a_mqa = required_tensorf(m, "blk.%u.attn_kv_a.weight", il);
+    l->attn_kv_a_norm = required_tensorf(m, "blk.%u.attn_kv_a_norm.weight", il);
+    l->attn_kv_b = required_tensorf(m, "blk.%u.attn_kv_b.weight", il);
+    l->attn_lambda = required_tensorf(m, "blk.%u.attn_lambda.weight", il);
+    l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+
+    l->mhc_ffn_rms_norm = required_tensorf(m, "blk.%u.mhc_ffn.rms_norm.weight", il);
+    l->mhc_ffn_proj_pre = required_tensorf(m, "blk.%u.mhc_ffn.proj_pre.weight", il);
+    l->mhc_ffn_proj_post = required_tensorf(m, "blk.%u.mhc_ffn.proj_post.weight", il);
+    l->mhc_ffn_proj_res = required_tensorf(m, "blk.%u.mhc_ffn.proj_res.weight", il);
+    l->mhc_ffn_alpha_pre = required_tensorf(m, "blk.%u.mhc_ffn.alpha_pre", il);
+    l->mhc_ffn_alpha_post = required_tensorf(m, "blk.%u.mhc_ffn.alpha_post", il);
+    l->mhc_ffn_alpha_res = required_tensorf(m, "blk.%u.mhc_ffn.alpha_res", il);
+    l->mhc_ffn_bias_pre = required_tensorf(m, "blk.%u.mhc_ffn.bias_pre", il);
+    l->mhc_ffn_bias_post = required_tensorf(m, "blk.%u.mhc_ffn.bias_post", il);
+    l->mhc_ffn_bias_res = required_tensorf(m, "blk.%u.mhc_ffn.bias_res", il);
+    l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+
+    if (il < DS4_N_LEADING_DENSE) {
+        l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_up = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+        l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+        l->ffn_polynorm_weight =
+            required_tensorf(m, "blk.%u.ffn_polynorm.weight", il);
+        l->ffn_polynorm_bias =
+            required_tensorf(m, "blk.%u.ffn_polynorm.bias", il);
+        return;
+    }
+
+    l->ffn_gate_inp = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_polynorm_exps_weight =
+        required_tensorf(m, "blk.%u.ffn_polynorm_exps.weight", il);
+    l->ffn_polynorm_exps_bias =
+        required_tensorf(m, "blk.%u.ffn_polynorm_exps.bias", il);
+    l->ffn_gate_shexp = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+    l->ffn_up_shexp = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+    l->ffn_down_shexp = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+    l->ffn_polynorm_shexp_weight =
+        required_tensorf(m, "blk.%u.ffn_polynorm_shexp.weight", il);
+    l->ffn_polynorm_shexp_bias =
+        required_tensorf(m, "blk.%u.ffn_polynorm_shexp.bias", il);
+}
+
+static void weights_bind_motif3_mtp(ds4_weights *w, const ds4_model *m) {
+    ds4_layer_weights *l = &w->motif_mtp;
+    w->motif_mtp_embed_norm = required_tensor(m, "mtp.0.embed_norm.weight");
+    w->motif_mtp_input_norm = required_tensor(m, "mtp.0.input_layernorm.weight");
+    w->motif_mtp_input_proj = required_tensor(m, "mtp.0.input_proj.weight");
+    w->motif_mtp_final_norm = required_tensor(m, "mtp.0.final_layernorm.weight");
+    l->attn_norm = w->motif_mtp_input_norm;
+    l->attn_q_a = required_tensor(m, "mtp.0.attn_q_a.weight");
+    l->attn_q_a_norm = required_tensor(m, "mtp.0.attn_q_a_norm.weight");
+    l->attn_q_b = required_tensor(m, "mtp.0.attn_q_b.weight");
+    l->attn_q_gate = required_tensor(m, "mtp.0.attn_q_gate.weight");
+    l->attn_kv_a_mqa = required_tensor(m, "mtp.0.attn_kv_a.weight");
+    l->attn_kv_a_norm = required_tensor(m, "mtp.0.attn_kv_a_norm.weight");
+    l->attn_kv_b = required_tensor(m, "mtp.0.attn_kv_b.weight");
+    l->attn_lambda = required_tensor(m, "mtp.0.attn_lambda.weight");
+    l->attn_output = required_tensor(m, "mtp.0.attn_output.weight");
+    l->ffn_norm = required_tensor(m, "mtp.0.post_attention_layernorm.weight");
+    l->ffn_gate = required_tensor(m, "mtp.0.ffn_gate.weight");
+    l->ffn_up = required_tensor(m, "mtp.0.ffn_up.weight");
+    l->ffn_down = required_tensor(m, "mtp.0.ffn_down.weight");
+    l->ffn_polynorm_weight = required_tensor(m, "mtp.0.ffn_polynorm.weight");
+    l->ffn_polynorm_bias = required_tensor(m, "mtp.0.ffn_polynorm.bias");
+}
+
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
 static void weights_bind(ds4_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        w->token_embd = required_tensor(m, "token_embd.weight");
+        w->output_norm = required_tensor(m, "output_norm.weight");
+        w->output = required_tensor(m, "output.weight");
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            weights_bind_motif3_layer(&w->layer[il], m, il);
+        }
+        weights_bind_motif3_mtp(w, m);
+        weights_validate_layout(w);
+        return;
+    }
     w->token_embd       = required_tensor(m, "token_embd.weight");
     w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
     w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
@@ -4923,6 +5627,36 @@ static void matvec_q2_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
     }
 }
 
+/* One expert's down projection for the CPU reference/validation path.  Only
+ * the types the Motif-3 mixed artifact actually ships (IQ2_XXS gate/up,
+ * Q2_K down) are supported; anything else is a recipe change and fails
+ * loudly instead of silently dequantizing through the wrong path. */
+static DS4_MAYBE_UNUSED void matvec_expert_down(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint32_t          expert) {
+    if (w->type == DS4_TENSOR_IQ2_XXS) {
+        uint64_t in_dim, out_dim, row_bytes;
+        const uint8_t *base = tensor_expert_bytes(m, w, expert, &in_dim, &out_dim, &row_bytes);
+        if (in_dim % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
+
+        block_q8_K *xq = xmalloc((size_t)(in_dim / QK_K) * sizeof(xq[0]));
+        ds4_quantize_row_q8_K(x, xq, (int64_t)in_dim);
+
+        for (uint64_t row = 0; row < out_dim; row++) {
+            const block_iq2_xxs *br = (const block_iq2_xxs *)(base + row * row_bytes);
+            ds4_vec_dot_iq2_xxs_q8_K((int)in_dim, &out[row], br, xq);
+        }
+        free(xq);
+    } else if (w->type == DS4_TENSOR_Q2_K) {
+        matvec_q2_k_expert(out, m, w, x, expert);
+    } else {
+        ds4_die("unsupported down expert tensor type");
+    }
+}
+
 /* Accumulate all selected experts' Q2_K down projections directly into the
  * 4096-wide MoE output. */
 static void matvec_q2_k_experts_accum_prequant(
@@ -6196,6 +6930,304 @@ static void topk_desc(const float *score, int n, int k, int *idx) {
                 for (int m = k - 1; m > j; m--) idx[m] = idx[m - 1];
                 idx[j] = i;
                 break;
+            }
+        }
+    }
+}
+
+/* Motif-3 control-path references.  These intentionally stay plain C and
+ * FP32: CUDA kernels are judged against them before any fusion is enabled. */
+static DS4_MAYBE_UNUSED void motif3_router_from_logits_reference(
+        int32_t     *selected_out,
+        float       *weights_out,
+        const float *logits,
+        const float *correction_bias,
+        uint32_t     n_tok,
+        uint32_t     n_expert,
+        uint32_t     top_k,
+        float        route_scale) {
+    if (n_expert > DS4_MAX_EXPERT || top_k > DS4_MAX_EXPERT_USED || top_k == 0) {
+        ds4_die("Motif-3 router reference dimensions exceed fixed limits");
+    }
+    float probs[DS4_MAX_EXPERT] = {0};
+    float selection[DS4_MAX_EXPERT] = {0};
+    int selected[DS4_MAX_EXPERT_USED] = {0};
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *row = logits + (uint64_t)t * n_expert;
+        for (uint32_t e = 0; e < n_expert; e++) {
+            probs[e] = sigmoid_stable(row[e]);
+            selection[e] = probs[e] + correction_bias[e];
+        }
+        topk_desc(selection, (int)n_expert, (int)top_k, selected);
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < top_k; k++) sum += probs[selected[k]];
+        if (!(sum > 0.0f)) ds4_die("Motif-3 router reference produced zero mass");
+        for (uint32_t k = 0; k < top_k; k++) {
+            selected_out[(uint64_t)t * top_k + k] = selected[k];
+            weights_out[(uint64_t)t * top_k + k] =
+                probs[selected[k]] / sum * route_scale;
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void motif3_polynorm_mul_reference(
+        float       *out,
+        const float *gate,
+        const float *up,
+        const float  raw_coeff[3],
+        float        raw_bias,
+        uint32_t     n_tok,
+        uint32_t     width,
+        float        hidden_clamp,
+        float        bias_clamp,
+        float        output_scale,
+        float        eps) {
+    const float coeff[3] = {
+        sigmoid_stable(raw_coeff[0]),
+        sigmoid_stable(raw_coeff[1]),
+        sigmoid_stable(raw_coeff[2]),
+    };
+    const float bias = fmaxf(-bias_clamp, fminf(bias_clamp, raw_bias));
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *g_row = gate + (uint64_t)t * width;
+        const float *u_row = up + (uint64_t)t * width;
+        float m2 = 0.0f;
+        float m4 = 0.0f;
+        float m6 = 0.0f;
+        for (uint32_t i = 0; i < width; i++) {
+            const float g = fmaxf(-hidden_clamp, fminf(hidden_clamp, g_row[i]));
+            const float g2 = g * g;
+            const float g3 = g2 * g;
+            m2 += g2;
+            m4 += g2 * g2;
+            m6 += g3 * g3;
+        }
+        const float inv2 = 1.0f / sqrtf(m2 / (float)width + eps);
+        const float inv4 = 1.0f / sqrtf(m4 / (float)width + eps);
+        const float inv6 = 1.0f / sqrtf(m6 / (float)width + eps);
+        for (uint32_t i = 0; i < width; i++) {
+            const float g = fmaxf(-hidden_clamp, fminf(hidden_clamp, g_row[i]));
+            const float u = fmaxf(-hidden_clamp, fminf(hidden_clamp, u_row[i]));
+            const float g2 = g * g;
+            const float g3 = g2 * g;
+            const float poly = coeff[0] * g3 * inv6 +
+                               coeff[1] * g2 * inv4 +
+                               coeff[2] * g * inv2 + bias;
+            out[(uint64_t)t * width + i] = poly * u * output_scale;
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void motif3_mhc_controls_reference(
+        float       *h_pre,
+        float       *h_post,
+        float       *h_res,
+        const float *projected_pre,
+        const float *projected_post,
+        const float *projected_res,
+        float        alpha_pre,
+        float        alpha_post,
+        float        alpha_res,
+        const float *bias_pre,
+        const float *bias_post,
+        const float *bias_res,
+        uint32_t     n_tok,
+        uint32_t     expansion,
+        uint32_t     sinkhorn_iters,
+        float        h_post_coeff) {
+    if (expansion > DS4_MAX_HC || sinkhorn_iters == 0) {
+        ds4_die("Motif-3 mHC reference dimensions exceed fixed limits");
+    }
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < expansion; i++) {
+            const uint64_t off = (uint64_t)t * expansion + i;
+            const float pre_z = fmaxf(-10.0f, fminf(10.0f,
+                alpha_pre * projected_pre[off] + bias_pre[i]));
+            const float post_z = fmaxf(-10.0f, fminf(10.0f,
+                alpha_post * projected_post[off] + bias_post[i]));
+            h_pre[off] = sigmoid_stable(pre_z);
+            h_post[off] = h_post_coeff * sigmoid_stable(post_z);
+        }
+        float *matrix = h_res + (uint64_t)t * expansion * expansion;
+        const float *raw = projected_res + (uint64_t)t * expansion * expansion;
+        for (uint32_t i = 0; i < expansion; i++) {
+            for (uint32_t j = 0; j < expansion; j++) {
+                const uint32_t off = i * expansion + j;
+                const float z = fmaxf(-20.0f, fminf(20.0f,
+                    alpha_res * raw[off] + bias_res[off]));
+                matrix[off] = expf(z);
+            }
+        }
+        for (uint32_t iter = 0; iter < sinkhorn_iters; iter++) {
+            for (uint32_t i = 0; i < expansion; i++) {
+                float sum = 0.0f;
+                for (uint32_t j = 0; j < expansion; j++) {
+                    sum += matrix[i * expansion + j];
+                }
+                const float inv = 1.0f / fmaxf(sum, 1.0e-8f);
+                for (uint32_t j = 0; j < expansion; j++) {
+                    matrix[i * expansion + j] *= inv;
+                }
+            }
+            for (uint32_t j = 0; j < expansion; j++) {
+                float sum = 0.0f;
+                for (uint32_t i = 0; i < expansion; i++) {
+                    sum += matrix[i * expansion + j];
+                }
+                const float inv = 1.0f / fmaxf(sum, 1.0e-8f);
+                for (uint32_t i = 0; i < expansion; i++) {
+                    matrix[i * expansion + j] *= inv;
+                }
+            }
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void motif3_mhc_apply_pre_reference(
+        float       *out,
+        const float *hidden,
+        const float *h_pre,
+        uint32_t     n_tok,
+        uint32_t     expansion,
+        uint32_t     hidden_size) {
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t d = 0; d < hidden_size; d++) {
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < expansion; i++) {
+                const uint64_t xoff = ((uint64_t)t * expansion + i) * hidden_size + d;
+                sum += hidden[xoff] * h_pre[(uint64_t)t * expansion + i];
+            }
+            out[(uint64_t)t * hidden_size + d] = sum;
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void motif3_mhc_apply_res_reference(
+        float       *out,
+        const float *hidden,
+        const float *h_res,
+        uint32_t     n_tok,
+        uint32_t     expansion,
+        uint32_t     hidden_size) {
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < expansion; i++) {
+            for (uint32_t d = 0; d < hidden_size; d++) {
+                float sum = 0.0f;
+                for (uint32_t j = 0; j < expansion; j++) {
+                    const uint64_t moff = ((uint64_t)t * expansion + i) * expansion + j;
+                    const uint64_t xoff = ((uint64_t)t * expansion + j) * hidden_size + d;
+                    sum += h_res[moff] * hidden[xoff];
+                }
+                out[((uint64_t)t * expansion + i) * hidden_size + d] = sum;
+            }
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void motif3_neox_rope_reference(
+        float         *out,
+        const float   *in,
+        const int32_t *positions,
+        const float   *inv_freq,
+        uint32_t       n_tok,
+        uint32_t       n_head,
+        uint32_t       rope_dim) {
+    if ((rope_dim & 1u) != 0) ds4_die("Motif-3 RoPE dimension must be even");
+    const uint32_t half = rope_dim / 2u;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            const uint64_t base = ((uint64_t)t * n_head + h) * rope_dim;
+            for (uint32_t i = 0; i < half; i++) {
+                const float angle = (float)positions[t] * inv_freq[i];
+                const float c = cosf(angle);
+                const float s = sinf(angle);
+                const float a = in[base + i];
+                const float b = in[base + half + i];
+                out[base + i] = a * c - b * s;
+                out[base + half + i] = b * c + a * s;
+            }
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void motif3_expanded_attention_reference(
+        float       *out,
+        const float *q,
+        const float *k,
+        const float *v,
+        uint32_t     n_tok,
+        uint32_t     n_head,
+        uint32_t     n_kv_head,
+        uint32_t     head_dim,
+        uint32_t     value_dim,
+        float        scale) {
+    if (n_kv_head == 0 || n_head % n_kv_head != 0) {
+        ds4_die("Motif-3 expanded attention has invalid GQA grouping");
+    }
+    const uint32_t group = n_head / n_kv_head;
+    float *score = xmalloc((size_t)n_tok * sizeof(score[0]));
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            const uint32_t kh = h / group;
+            const float *q_row = q + ((uint64_t)t * n_head + h) * head_dim;
+            float max_score = DS4_NEG_INF;
+            for (uint32_t j = 0; j <= t; j++) {
+                const float *k_row = k + ((uint64_t)j * n_kv_head + kh) * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += q_row[d] * k_row[d];
+                score[j] = dot * scale;
+                if (score[j] > max_score) max_score = score[j];
+            }
+            float sum = 0.0f;
+            for (uint32_t j = 0; j <= t; j++) {
+                score[j] = expf(score[j] - max_score);
+                sum += score[j];
+            }
+            const float inv = 1.0f / sum;
+            float *out_row = out + ((uint64_t)t * n_head + h) * value_dim;
+            memset(out_row, 0, (size_t)value_dim * sizeof(out_row[0]));
+            for (uint32_t j = 0; j <= t; j++) {
+                const float weight = score[j] * inv;
+                const float *v_row = v + ((uint64_t)j * n_kv_head + kh) * value_dim;
+                for (uint32_t d = 0; d < value_dim; d++) {
+                    out_row[d] += weight * v_row[d];
+                }
+            }
+        }
+    }
+    free(score);
+}
+
+static DS4_MAYBE_UNUSED void motif3_differential_attention_reference(
+        float       *out,
+        const float *attention,
+        const float *lambda_value,
+        const float *gate_score,
+        uint32_t     n_tok,
+        uint32_t     noise_heads,
+        uint32_t     grouped_ratio,
+        uint32_t     value_dim) {
+    const uint32_t source_group = grouped_ratio + 1u;
+    const uint32_t signal_heads = noise_heads * grouped_ratio;
+    const uint32_t all_heads = noise_heads * source_group;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t g = 0; g < noise_heads; g++) {
+            const float *noise = attention +
+                ((uint64_t)t * all_heads + g * source_group + grouped_ratio) * value_dim;
+            for (uint32_t s = 0; s < grouped_ratio; s++) {
+                const uint32_t signal = g * grouped_ratio + s;
+                const float lambda_scale =
+                    sigmoid_stable(lambda_value[(uint64_t)t * signal_heads + signal]);
+                const float *signal_value = attention +
+                    ((uint64_t)t * all_heads + g * source_group + s) * value_dim;
+                const float *gate = gate_score +
+                    ((uint64_t)t * signal_heads + signal) * value_dim;
+                float *dst = out +
+                    ((uint64_t)t * signal_heads + signal) * value_dim;
+                for (uint32_t d = 0; d < value_dim; d++) {
+                    dst[d] = (signal_value[d] - lambda_scale * noise[d]) *
+                             sigmoid_stable(gate[d]);
+                }
             }
         }
     }
@@ -22581,10 +23613,30 @@ struct ds4_vocab {
     int n_vocab;
     int bos_id;
     int eos_id;
+    int system_id;
     int user_id;
     int assistant_id;
+    int start_of_turn_id;
+    int end_of_turn_id;
+    int tool_id;
+    int reference_id;
+    int plan_start_id;
+    int plan_end_id;
+    int observation_id;
+    int sop_id;
     int think_start_id;
     int think_end_id;
+    int tool_call_start_id;
+    int tool_call_end_id;
+    int tool_response_start_id;
+    int tool_response_end_id;
+    int arg_key_start_id;
+    int arg_key_end_id;
+    int arg_value_start_id;
+    int arg_value_end_id;
+    int latent_start_id;
+    int latent_pad_id;
+    int latent_end_id;
     int dsml_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
@@ -22936,6 +23988,410 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
     return utf8_is_cjk_hira_kata(cp);
 }
 
+typedef struct {
+    uint32_t cp;
+    uint64_t next;
+    bool valid;
+    bool is_letter;
+    bool is_number;
+    bool is_whitespace;
+} glm4_char_info;
+
+static bool glm4_unicode_whitespace(uint32_t cp) {
+    if (cp < 128) return ascii_space((uint8_t)cp);
+    return cp == 0x0085 ||
+           cp == 0x00a0 ||
+           cp == 0x1680 ||
+           (cp >= 0x2000 && cp <= 0x200a) ||
+           cp == 0x2028 ||
+           cp == 0x2029 ||
+           cp == 0x202f ||
+           cp == 0x205f ||
+           cp == 0x3000;
+}
+
+static bool glm4_unicode_number(uint32_t cp) {
+    if (cp < 128) return ascii_digit((uint8_t)cp);
+    return (cp >= 0x0660 && cp <= 0x0669) ||
+           (cp >= 0x06f0 && cp <= 0x06f9) ||
+           (cp >= 0x07c0 && cp <= 0x07c9) ||
+           (cp >= 0x0966 && cp <= 0x096f) ||
+           (cp >= 0x09e6 && cp <= 0x09ef) ||
+           (cp >= 0x0a66 && cp <= 0x0a6f) ||
+           (cp >= 0x0ae6 && cp <= 0x0aef) ||
+           (cp >= 0x0b66 && cp <= 0x0b6f) ||
+           (cp >= 0x0be6 && cp <= 0x0bef) ||
+           (cp >= 0x0c66 && cp <= 0x0c6f) ||
+           (cp >= 0x0ce6 && cp <= 0x0cef) ||
+           (cp >= 0x0d66 && cp <= 0x0d6f) ||
+           (cp >= 0x0de6 && cp <= 0x0def) ||
+           (cp >= 0x0e50 && cp <= 0x0e59) ||
+           (cp >= 0x0ed0 && cp <= 0x0ed9) ||
+           (cp >= 0x0f20 && cp <= 0x0f29) ||
+           (cp >= 0x1040 && cp <= 0x1049) ||
+           (cp >= 0x1090 && cp <= 0x1099) ||
+           (cp >= 0x17e0 && cp <= 0x17e9) ||
+           (cp >= 0x1810 && cp <= 0x1819) ||
+           (cp >= 0xff10 && cp <= 0xff19);
+}
+
+static bool glm4_unicode_punct_symbol(uint32_t cp) {
+    if (cp < 128) return joyai_ascii_punct_symbol((uint8_t)cp);
+    return (cp >= 0x00a1 && cp <= 0x00a9) ||
+           (cp >= 0x00ab && cp <= 0x00ac) ||
+           (cp >= 0x00ae && cp <= 0x00b1) ||
+           cp == 0x00b4 ||
+           (cp >= 0x00b6 && cp <= 0x00b8) ||
+           cp == 0x00bb ||
+           cp == 0x00bf ||
+           cp == 0x00d7 ||
+           cp == 0x00f7 ||
+           (cp >= 0x02c2 && cp <= 0x02df) ||
+           (cp >= 0x02e5 && cp <= 0x02eb) ||
+           (cp >= 0x02ed && cp <= 0x02ff) ||
+           (cp >= 0x0375 && cp <= 0x037e) ||
+           (cp >= 0x0384 && cp <= 0x0385) ||
+           cp == 0x0387 ||
+           (cp >= 0x055a && cp <= 0x055f) ||
+           (cp >= 0x0589 && cp <= 0x058a) ||
+           (cp >= 0x05be && cp <= 0x05c0) ||
+           cp == 0x05c3 ||
+           (cp >= 0x05c6 && cp <= 0x05c7) ||
+           (cp >= 0x0609 && cp <= 0x060a) ||
+           (cp >= 0x060c && cp <= 0x060d) ||
+           cp == 0x061b ||
+           (cp >= 0x061e && cp <= 0x061f) ||
+           cp == 0x066a ||
+           cp == 0x066d ||
+           cp == 0x06d4 ||
+           (cp >= 0x2000 && cp <= 0x206f) ||
+           (cp >= 0x20a0 && cp <= 0x20cf) ||
+           (cp >= 0x2100 && cp <= 0x214f) ||
+           (cp >= 0x2190 && cp <= 0x23ff) ||
+           (cp >= 0x2460 && cp <= 0x24ff) ||
+           (cp >= 0x2500 && cp <= 0x2775) ||
+           (cp >= 0x2794 && cp <= 0x2bff) ||
+           (cp >= 0x2e00 && cp <= 0x2e7f) ||
+           (cp >= 0x3000 && cp <= 0x303f) ||
+           (cp >= 0xfd3e && cp <= 0xfd3f) ||
+           (cp >= 0xfe10 && cp <= 0xfe6f) ||
+           (cp >= 0xff01 && cp <= 0xff0f) ||
+           (cp >= 0xff1a && cp <= 0xff20) ||
+           (cp >= 0xff3b && cp <= 0xff40) ||
+           (cp >= 0xff5b && cp <= 0xff65) ||
+           (cp >= 0x1f000 && cp <= 0x1faff);
+}
+
+static glm4_char_info glm4_char_at(const char *s, uint64_t len, uint64_t pos) {
+    glm4_char_info info;
+    memset(&info, 0, sizeof(info));
+    if (pos >= len) return info;
+
+    info.valid = true;
+    info.cp = utf8_peek_one(s, len, pos, &info.next);
+    info.is_whitespace = glm4_unicode_whitespace(info.cp);
+    info.is_number = glm4_unicode_number(info.cp);
+    if (info.cp < 128) {
+        info.is_letter = ascii_alpha((uint8_t)info.cp);
+    } else {
+        info.is_letter =
+            !info.is_whitespace &&
+            !info.is_number &&
+            !glm4_unicode_punct_symbol(info.cp);
+    }
+    return info;
+}
+
+static uint32_t ascii_tolower_cp(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
+    return cp;
+}
+
+static bool motif3_upperish(glm4_char_info info) {
+    if (!info.valid) return false;
+    if (info.cp < 128) return info.cp >= 'A' && info.cp <= 'Z';
+    /* Motif's regex admits Lm/Lo/M in both case branches.  The existing
+     * dependency-free Unicode classifier deliberately treats ordinary
+     * non-ASCII alphabetic code points as that shared class. */
+    return info.is_letter;
+}
+
+static bool motif3_lowerish(glm4_char_info info) {
+    if (!info.valid) return false;
+    if (info.cp < 128) return info.cp >= 'a' && info.cp <= 'z';
+    return info.is_letter;
+}
+
+/* Match [Lu Lt Lm Lo M]*[Ll Lm Lo M]+ at a UTF-8 byte position.  The first
+ * run is greedy, so a code point admitted by both sets (Lo/Lm/M) is retained
+ * as prefix until the final possible point and then backtracked once. */
+static uint64_t motif3_match_lower_word(const char *text, uint64_t len, uint64_t pos) {
+    uint64_t scan = pos;
+    uint64_t last_lowerish = UINT64_MAX;
+    while (scan < len) {
+        glm4_char_info info = glm4_char_at(text, len, scan);
+        if (!motif3_upperish(info)) break;
+        if (motif3_lowerish(info)) last_lowerish = scan;
+        scan = info.next;
+    }
+
+    uint64_t lower = scan;
+    glm4_char_info first = glm4_char_at(text, len, lower);
+    if (!motif3_lowerish(first)) {
+        if (last_lowerish == UINT64_MAX) return pos;
+        lower = last_lowerish;
+        first = glm4_char_at(text, len, lower);
+    }
+
+    scan = lower;
+    while (scan < len) {
+        glm4_char_info info = glm4_char_at(text, len, scan);
+        if (!motif3_lowerish(info)) break;
+        scan = info.next;
+    }
+    return scan;
+}
+
+/* Match [Lu Lt Lm Lo M]+[Ll Lm Lo M]*. */
+static uint64_t motif3_match_upper_word(const char *text, uint64_t len, uint64_t pos) {
+    uint64_t scan = pos;
+    int n_upper = 0;
+    while (scan < len) {
+        glm4_char_info info = glm4_char_at(text, len, scan);
+        if (!motif3_upperish(info)) break;
+        scan = info.next;
+        n_upper++;
+    }
+    if (n_upper == 0) return pos;
+    while (scan < len) {
+        glm4_char_info info = glm4_char_at(text, len, scan);
+        if (!motif3_lowerish(info)) break;
+        scan = info.next;
+    }
+    return scan;
+}
+
+static uint64_t motif3_match_contraction(const char *text, uint64_t len, uint64_t pos) {
+    if (pos >= len || text[pos] != '\'') return pos;
+    uint64_t p1 = pos + 1;
+    if (p1 >= len) return pos;
+    uint32_t c1 = ascii_tolower_cp((uint8_t)text[p1]);
+    if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') return p1 + 1;
+    if (p1 + 1 >= len) return pos;
+    uint32_t c2 = ascii_tolower_cp((uint8_t)text[p1 + 1]);
+    if ((c1 == 'r' && c2 == 'e') ||
+        (c1 == 'v' && c2 == 'e') ||
+        (c1 == 'l' && c2 == 'l')) {
+        return p1 + 2;
+    }
+    return pos;
+}
+
+static uint64_t motif3_match_word_pattern(
+        const char *text, uint64_t len, uint64_t pos, bool lower_pattern) {
+    uint64_t word = pos;
+    glm4_char_info first = glm4_char_at(text, len, word);
+    if (first.valid && first.cp != '\r' && first.cp != '\n' &&
+        !first.is_letter && !first.is_number) {
+        word = first.next;
+    }
+
+    uint64_t end = lower_pattern ?
+        motif3_match_lower_word(text, len, word) :
+        motif3_match_upper_word(text, len, word);
+    if (end == word) return pos;
+
+    for (;;) {
+        glm4_char_info space = glm4_char_at(text, len, end);
+        if (!space.valid || space.cp != ' ') break;
+        uint64_t next = lower_pattern ?
+            motif3_match_lower_word(text, len, space.next) :
+            motif3_match_upper_word(text, len, space.next);
+        if (next == space.next) break;
+        end = next;
+    }
+    return motif3_match_contraction(text, len, end);
+}
+
+/* Official Motif-3 tokenizer.json pre-tokenizer, expressed directly so ds4
+ * does not depend on a regex or ICU runtime:
+ *
+ *   lower/capitalized multi-word branch | upper multi-word branch
+ *   | N{1,3} | optional-space punctuation + CR/LF/slash tail
+ *   | whitespace through final newline | trailing/general whitespace
+ */
+static void bpe_tokenize_text_motif3_core(const ds4_vocab *vocab, const char *text,
+                                          token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+
+    while (pos < len) {
+        const uint64_t start = pos;
+        uint64_t end = motif3_match_word_pattern(text, len, pos, true);
+        if (end == pos) end = motif3_match_word_pattern(text, len, pos, false);
+        if (end != pos) {
+            pos = end;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        glm4_char_info cur = glm4_char_at(text, len, pos);
+        if (!cur.valid) break;
+        if (cur.is_number) {
+            int count = 0;
+            while (pos < len && count < 3) {
+                glm4_char_info scan = glm4_char_at(text, len, pos);
+                if (!scan.valid || !scan.is_number) break;
+                pos = scan.next;
+                count++;
+            }
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        uint64_t punct_pos = pos;
+        glm4_char_info punct = cur;
+        if (cur.cp == ' ') {
+            punct_pos = cur.next;
+            punct = glm4_char_at(text, len, punct_pos);
+        }
+        if (punct.valid && !punct.is_whitespace &&
+            !punct.is_letter && !punct.is_number) {
+            pos = punct_pos;
+            while (pos < len) {
+                glm4_char_info scan = glm4_char_at(text, len, pos);
+                if (!scan.valid || scan.is_whitespace ||
+                    scan.is_letter || scan.is_number) break;
+                pos = scan.next;
+            }
+            while (pos < len) {
+                glm4_char_info scan = glm4_char_at(text, len, pos);
+                if (!scan.valid ||
+                    !(scan.cp == '\r' || scan.cp == '\n' || scan.cp == '/')) break;
+                pos = scan.next;
+            }
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        if (cur.is_whitespace) {
+            uint64_t scan_pos = pos;
+            uint64_t last_newline_end = 0;
+            uint64_t last_ws_start = pos;
+            int count = 0;
+            while (scan_pos < len) {
+                glm4_char_info scan = glm4_char_at(text, len, scan_pos);
+                if (!scan.valid || !scan.is_whitespace) break;
+                last_ws_start = scan_pos;
+                if (scan.cp == '\r' || scan.cp == '\n') last_newline_end = scan.next;
+                scan_pos = scan.next;
+                count++;
+            }
+            if (last_newline_end) {
+                pos = last_newline_end;
+            } else if (count > 1 && scan_pos < len) {
+                pos = last_ws_start;
+            } else {
+                pos = scan_pos;
+            }
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        pos = cur.next;
+        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+    }
+}
+
+static bool motif3_added_token_lstrip(int token_id) {
+    return token_id == 53 || token_id == 54 ||
+           (token_id >= 85 && token_id <= 159);
+}
+
+/* tokenizer.json defines IDs 0..159 as AddedToken entries.  Longest direct
+ * match mirrors tokenizers' leftmost/longest extraction before regex+BPE. */
+static bool motif3_added_token_at(const ds4_vocab *vocab, const char *text,
+                                  uint64_t len, uint64_t pos,
+                                  int *token_id, uint64_t *token_len) {
+    const int limit = vocab->n_vocab < 160 ? vocab->n_vocab : 160;
+    int best_id = -1;
+    uint64_t best_len = 0;
+    for (int id = 0; id < limit; id++) {
+        ds4_str token = vocab->token[id];
+        if (token.len == 0 || token.len > len - pos || token.len < best_len) continue;
+        if (memcmp(text + pos, token.ptr, (size_t)token.len) != 0) continue;
+        if (token.len > best_len || best_id < 0) {
+            best_id = id;
+            best_len = token.len;
+        }
+    }
+    if (best_id < 0) return false;
+    *token_id = best_id;
+    *token_len = best_len;
+    return true;
+}
+
+static uint64_t motif3_added_lstrip_start(const char *text, uint64_t span_start,
+                                          uint64_t token_start) {
+    uint64_t scan = span_start;
+    uint64_t trailing_ws = span_start;
+    while (scan < token_start) {
+        glm4_char_info info = glm4_char_at(text, token_start, scan);
+        if (!info.valid || info.next > token_start) break;
+        if (!info.is_whitespace) trailing_ws = info.next;
+        scan = info.next;
+    }
+    return trailing_ws;
+}
+
+static void motif3_emit_core_span(const ds4_vocab *vocab, const char *text,
+                                  uint64_t start, uint64_t end, token_vec *out) {
+    if (end <= start) return;
+    const uint64_t n = end - start;
+    char *copy = xmalloc((size_t)n + 1u);
+    memcpy(copy, text + start, (size_t)n);
+    copy[n] = '\0';
+    bpe_tokenize_text_motif3_core(vocab, copy, out);
+    free(copy);
+}
+
+static void bpe_tokenize_text_motif3(const ds4_vocab *vocab, const char *text,
+                                     token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+    while (pos < len) {
+        int token_id = -1;
+        uint64_t token_len = 0;
+        if (motif3_added_token_at(vocab, text, len, pos, &token_id, &token_len)) {
+            token_vec_push(out, token_id);
+            pos += token_len;
+            continue;
+        }
+
+        uint64_t found = len;
+        int found_id = -1;
+        uint64_t found_len = 0;
+        for (uint64_t scan = pos + 1; scan < len; scan++) {
+            if (motif3_added_token_at(vocab, text, len, scan,
+                                      &found_id, &found_len)) {
+                found = scan;
+                break;
+            }
+        }
+        if (found_id < 0) {
+            motif3_emit_core_span(vocab, text, pos, len, out);
+            break;
+        }
+
+        uint64_t core_end = found;
+        if (motif3_added_token_lstrip(found_id))
+            core_end = motif3_added_lstrip_start(text, pos, found);
+        motif3_emit_core_span(vocab, text, pos, core_end, out);
+        token_vec_push(out, found_id);
+        pos = found + found_len;
+    }
+}
+
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -22957,6 +24413,10 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        bpe_tokenize_text_motif3(vocab, text, out);
+        return;
+    }
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -23069,12 +24529,64 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id))
+            vocab->bos_id = vocab_lookup(vocab, "<|beginoftext|>");
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id))
+            vocab->eos_id = vocab_lookup(vocab, "<|endoftext|>");
+        vocab->system_id = vocab_lookup(vocab, "<|system|>");
+        vocab->user_id = vocab_lookup(vocab, "<|user|>");
+        vocab->assistant_id = vocab_lookup(vocab, "<|assistant|>");
+        vocab->start_of_turn_id = vocab_lookup(vocab, "<|startofturn|>");
+        vocab->end_of_turn_id = vocab_lookup(vocab, "<|endofturn|>");
+        vocab->tool_id = vocab_lookup(vocab, "<|tool|>");
+        vocab->reference_id = vocab_lookup(vocab, "<|reference|>");
+        vocab->plan_start_id = vocab_lookup(vocab, "<|plan|>");
+        vocab->plan_end_id = vocab_lookup(vocab, "<|endofplan|>");
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup(vocab, "<tool_call>");
+        vocab->tool_call_end_id = vocab_lookup(vocab, "</tool_call>");
+        vocab->tool_response_start_id = vocab_lookup(vocab, "<tool_response>");
+        vocab->tool_response_end_id = vocab_lookup(vocab, "</tool_response>");
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->latent_start_id = vocab_lookup(vocab, "<latent>");
+        vocab->latent_pad_id = vocab_lookup(vocab, "<latent_pad>");
+        vocab->latent_end_id = vocab_lookup(vocab, "</latent>");
+        vocab->dsml_id = -1;
+        return;
+    }
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
     vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
     vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
+    vocab->system_id = -1;
+    vocab->start_of_turn_id = -1;
+    vocab->end_of_turn_id = -1;
+    vocab->tool_id = -1;
+    vocab->reference_id = -1;
+    vocab->plan_start_id = -1;
+    vocab->plan_end_id = -1;
+    vocab->observation_id = -1;
+    vocab->sop_id = -1;
     vocab->think_start_id = vocab_lookup(vocab, "<think>");
     vocab->think_end_id = vocab_lookup(vocab, "</think>");
+    vocab->tool_call_start_id = -1;
+    vocab->tool_call_end_id = -1;
+    vocab->tool_response_start_id = -1;
+    vocab->tool_response_end_id = -1;
+    vocab->arg_key_start_id = -1;
+    vocab->arg_key_end_id = -1;
+    vocab->arg_value_start_id = -1;
+    vocab->arg_value_end_id = -1;
+    vocab->latent_start_id = -1;
+    vocab->latent_pad_id = -1;
+    vocab->latent_end_id = -1;
     vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
 }
 
@@ -23088,12 +24600,41 @@ static void vocab_free(ds4_vocab *vocab) {
 /* Build the DS4 chat prompt: BOS, optional system text, user prompt, assistant
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
+static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->bos_id);
+}
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        if (vocab->bos_id < 0 || vocab->system_id < 0 || vocab->user_id < 0 ||
+            vocab->assistant_id < 0 || vocab->start_of_turn_id < 0 ||
+            vocab->end_of_turn_id < 0 || vocab->think_start_id < 0 ||
+            vocab->think_end_id < 0) {
+            ds4_die("Motif-3 tokenizer is missing an official chat marker");
+        }
+        chat_push_bos_sequence(vocab, out);
+        if (system && system[0]) {
+            token_vec_push(out, vocab->start_of_turn_id);
+            token_vec_push(out, vocab->system_id);
+            bpe_tokenize_text(vocab, system, out);
+            token_vec_push(out, vocab->end_of_turn_id);
+        }
+        token_vec_push(out, vocab->start_of_turn_id);
+        token_vec_push(out, vocab->user_id);
+        bpe_tokenize_text(vocab, prompt, out);
+        token_vec_push(out, vocab->end_of_turn_id);
+        token_vec_push(out, vocab->start_of_turn_id);
+        token_vec_push(out, vocab->assistant_id);
+        token_vec_push(out, vocab->think_start_id);
+        if (!ds4_think_mode_enabled(think_mode))
+            token_vec_push(out, vocab->think_end_id);
+        return;
+    }
+
     token_vec_push(out, vocab->bos_id);
     {
         /* Effort prefix ahead of the system message, matching the reference
@@ -23123,16 +24664,36 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         const char *text;
         int token;
     } specials[] = {
+        {"<|endoftext|>",           vocab->eos_id},
+        {"<|beginoftext|>",         vocab->bos_id},
+        {"<|startofturn|>",         vocab->start_of_turn_id},
+        {"<|endofturn|>",           vocab->end_of_turn_id},
+        {"<|tool|>",                vocab->tool_id},
+        {"<|reference|>",           vocab->reference_id},
+        {"<|plan|>",                vocab->plan_start_id},
+        {"<|endofplan|>",           vocab->plan_end_id},
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
+        {"<tool_call>",            vocab->tool_call_start_id},
+        {"</tool_call>",           vocab->tool_call_end_id},
+        {"<tool_response>",        vocab->tool_response_start_id},
+        {"</tool_response>",       vocab->tool_response_end_id},
+        {"<arg_key>",              vocab->arg_key_start_id},
+        {"</arg_key>",             vocab->arg_key_end_id},
+        {"<arg_value>",            vocab->arg_value_start_id},
+        {"</arg_value>",           vocab->arg_value_end_id},
+        {"<latent>",               vocab->latent_start_id},
+        {"<latent_pad>",           vocab->latent_pad_id},
+        {"</latent>",              vocab->latent_end_id},
         {"｜DSML｜",                vocab->dsml_id},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
+        if (specials[i].token < 0) continue;
         size_t n = strlen(specials[i].text);
         if (!strncmp(p, specials[i].text, n)) {
             *token = specials[i].token;
@@ -23191,8 +24752,27 @@ void ds4_encode_chat_prompt(
 }
 
 void ds4_chat_append_effort_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) return;
     const char *effort = ds4_think_effort_prefix(mode);
     if (effort[0]) bpe_tokenize_text(&e->vocab, effort, tokens);
+}
+
+static void bpe_tokenize_wrapped_payload_text(
+        ds4_vocab *vocab, const char *content, const char *end, token_vec *out) {
+    const size_t endlen = strlen(end);
+    const char *span = content ? content : "";
+    const char *p = span;
+    while (*p) {
+        if (!strncmp(p, end, endlen)) {
+            tokenize_span(vocab, span, (size_t)(p - span), out);
+            bpe_tokenize_text(vocab, "&lt;", out);
+            p++;
+            span = p;
+        } else {
+            p++;
+        }
+    }
+    tokenize_span(vocab, span, (size_t)(p - span), out);
 }
 
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
@@ -23200,6 +24780,26 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        token_vec_push(tokens, vocab->start_of_turn_id);
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            token_vec_push(tokens, vocab->system_id);
+            bpe_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "assistant")) {
+            token_vec_push(tokens, vocab->assistant_id);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            token_vec_push(tokens, vocab->tool_id);
+            token_vec_push(tokens, vocab->tool_response_start_id);
+            bpe_tokenize_wrapped_payload_text(vocab, content, "</tool_response>", tokens);
+            token_vec_push(tokens, vocab->tool_response_end_id);
+        } else {
+            token_vec_push(tokens, vocab->user_id);
+            bpe_tokenize_text(vocab, content, tokens);
+        }
+        token_vec_push(tokens, vocab->end_of_turn_id);
+        return;
+    }
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         bpe_tokenize_text(vocab, content, tokens);
     } else if (!strcmp(role, "assistant")) {
@@ -23218,6 +24818,14 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        token_vec_push(tokens, e->vocab.start_of_turn_id);
+        token_vec_push(tokens, e->vocab.assistant_id);
+        token_vec_push(tokens, e->vocab.think_start_id);
+        if (!ds4_think_mode_enabled(think_mode))
+            token_vec_push(tokens, e->vocab.think_end_id);
+        return;
+    }
     token_vec_push(tokens, e->vocab.assistant_id);
     token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
                    e->vocab.think_start_id : e->vocab.think_end_id);
@@ -23331,8 +24939,39 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     return vocab_token_text(&e->vocab, token, len);
 }
 
+static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
+    if (!vocab || token < 0) return false;
+    if (token == vocab->eos_id) return true;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        /* The official final generation_config pins eos_token_id to
+         * [0, 3, 6]: end-of-text, user, and end-of-turn.  In particular,
+         * end-of-turn is a protocol delimiter and must never leak into an
+         * OpenAI-compatible content string. */
+        return (vocab->user_id >= 0 && token == vocab->user_id) ||
+               (vocab->end_of_turn_id >= 0 && token == vocab->end_of_turn_id);
+    }
+    return false;
+}
+
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
+}
+
+bool ds4_token_is_stop(ds4_engine *e, int token) {
+    return e ? vocab_token_is_generation_stop(&e->vocab, token) : false;
+}
+
+bool ds4_token_is_thinking_control(ds4_engine *e, int token) {
+    if (!e || token < 0) return false;
+    return (e->vocab.think_start_id >= 0 && token == e->vocab.think_start_id) ||
+           (e->vocab.think_end_id >= 0 && token == e->vocab.think_end_id);
+}
+
+bool ds4_token_is_stop_for_think_mode(
+        ds4_engine *e, int token, ds4_think_mode mode) {
+    if (ds4_token_is_stop(e, token)) return true;
+    return !ds4_think_mode_enabled(mode) &&
+           ds4_token_is_thinking_control(e, token);
 }
 
 int ds4_token_user(ds4_engine *e) {
@@ -28134,11 +29773,82 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
+#ifndef DS4_NO_GPU
+/* Motif-3 correctness graph.  The first bring-up path keeps expanded K/V
+ * only for the currently evaluated short prompt (cap <= 256); it is separate
+ * from the production latent-cache state added below.  All weights remain in
+ * the resident model image and this structure owns activations only. */
+typedef struct {
+    bool ready;
+    bool latent_cache_ready;
+    uint32_t cap;
+    uint32_t ctx_cap;
+    uint32_t cache_len;
+    uint32_t mtp_cache_len;
+    uint64_t latent_cache_bytes;
+    ds4_gpu_tensor *tokens;
+    ds4_gpu_tensor *positions;
+    ds4_gpu_tensor *inv_yarn;
+    ds4_gpu_tensor *inv_swa;
+    ds4_gpu_tensor *hidden[2];
+    ds4_gpu_tensor *mhc_norm;
+    ds4_gpu_tensor *projected_pre;
+    ds4_gpu_tensor *projected_post;
+    ds4_gpu_tensor *projected_res;
+    ds4_gpu_tensor *h_pre;
+    ds4_gpu_tensor *h_post;
+    ds4_gpu_tensor *h_res;
+    ds4_gpu_tensor *reduced;
+    ds4_gpu_tensor *norm;
+    ds4_gpu_tensor *q_latent;
+    ds4_gpu_tensor *q_latent_norm;
+    ds4_gpu_tensor *q_raw;
+    ds4_gpu_tensor *q_gate;
+    ds4_gpu_tensor *kv_raw;
+    ds4_gpu_tensor *kv_latent;
+    ds4_gpu_tensor *kv_norm;
+    ds4_gpu_tensor *kv_proj;
+    ds4_gpu_tensor *q_full;
+    ds4_gpu_tensor *q_absorbed;
+    ds4_gpu_tensor *latent_attention;
+    ds4_gpu_tensor *k_full;
+    ds4_gpu_tensor *value;
+    ds4_gpu_tensor *lambda;
+    ds4_gpu_tensor *attention;
+    ds4_gpu_tensor *differential;
+    ds4_gpu_tensor *block_out;
+    ds4_gpu_tensor *dense_gate;
+    ds4_gpu_tensor *dense_up;
+    ds4_gpu_tensor *dense_mid;
+    ds4_gpu_tensor *shared_gate;
+    ds4_gpu_tensor *shared_up;
+    ds4_gpu_tensor *shared_mid;
+    ds4_gpu_tensor *shared_out;
+    ds4_gpu_tensor *router_logits;
+    ds4_gpu_tensor *router_probs;
+    ds4_gpu_tensor *selected;
+    ds4_gpu_tensor *route_weights;
+    ds4_gpu_tensor *routed_gate;
+    ds4_gpu_tensor *routed_up;
+    ds4_gpu_tensor *routed_mid;
+    ds4_gpu_tensor *routed_down;
+    ds4_gpu_tensor *routed_out;
+    ds4_gpu_tensor *mean_hidden;
+    ds4_gpu_tensor *final_norm;
+    ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *mtp_concat;
+    ds4_gpu_tensor *layer_kv_latent[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_k_pe[DS4_MAX_LAYER];
+    uint32_t layer_cache_cap[DS4_MAX_LAYER];
+} ds4_motif3_gpu_graph;
+#endif
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
+    ds4_motif3_gpu_graph motif3_graph;
+    bool motif3_graph_ready;
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -28173,6 +29883,915 @@ struct ds4_session {
 };
 
 #ifndef DS4_NO_GPU
+static void motif3_graph_free(ds4_motif3_gpu_graph *g) {
+    if (!g) return;
+#define M3_FREE(field) do { ds4_gpu_tensor_free(g->field); g->field = NULL; } while (0)
+    M3_FREE(tokens); M3_FREE(positions); M3_FREE(inv_yarn); M3_FREE(inv_swa);
+    M3_FREE(hidden[0]); M3_FREE(hidden[1]); M3_FREE(mhc_norm);
+    M3_FREE(projected_pre); M3_FREE(projected_post); M3_FREE(projected_res);
+    M3_FREE(h_pre); M3_FREE(h_post); M3_FREE(h_res);
+    M3_FREE(reduced); M3_FREE(norm); M3_FREE(q_latent); M3_FREE(q_latent_norm);
+    M3_FREE(q_raw); M3_FREE(q_gate); M3_FREE(kv_raw); M3_FREE(kv_latent);
+    M3_FREE(kv_norm); M3_FREE(kv_proj); M3_FREE(q_full);
+    M3_FREE(q_absorbed); M3_FREE(latent_attention); M3_FREE(k_full);
+    M3_FREE(value); M3_FREE(lambda); M3_FREE(attention); M3_FREE(differential);
+    M3_FREE(block_out); M3_FREE(dense_gate); M3_FREE(dense_up); M3_FREE(dense_mid);
+    M3_FREE(shared_gate); M3_FREE(shared_up); M3_FREE(shared_mid); M3_FREE(shared_out);
+    M3_FREE(router_logits); M3_FREE(router_probs); M3_FREE(selected);
+    M3_FREE(route_weights); M3_FREE(routed_gate); M3_FREE(routed_up);
+    M3_FREE(routed_mid); M3_FREE(routed_down); M3_FREE(routed_out);
+    M3_FREE(mean_hidden); M3_FREE(final_norm); M3_FREE(logits);
+    M3_FREE(mtp_concat);
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_kv_latent[il]);
+        ds4_gpu_tensor_free(g->layer_k_pe[il]);
+        g->layer_kv_latent[il] = NULL;
+        g->layer_k_pe[il] = NULL;
+    }
+#undef M3_FREE
+    memset(g, 0, sizeof(*g));
+}
+
+static bool motif3_graph_alloc(ds4_motif3_gpu_graph *g, uint32_t cap) {
+    if (!g || cap == 0 || cap > 256u) return false;
+    memset(g, 0, sizeof(*g));
+    g->cap = cap;
+#define M3_ALLOC(field, count, type) do {                                      \
+        uint64_t m3_count_ = (uint64_t)(count);                               \
+        if (m3_count_ > UINT64_MAX / sizeof(type) ||                          \
+            !(g->field = ds4_gpu_tensor_alloc(m3_count_ * sizeof(type)))) {   \
+            fprintf(stderr, "ds4: Motif-3 graph allocation failed: %s\n", #field); \
+            motif3_graph_free(g);                                              \
+            return false;                                                      \
+        }                                                                      \
+    } while (0)
+    M3_ALLOC(tokens, cap, int32_t);
+    M3_ALLOC(positions, cap, int32_t);
+    M3_ALLOC(inv_yarn, DS4_N_ROT / 2u, float);
+    M3_ALLOC(inv_swa, DS4_N_ROT / 2u, float);
+    M3_ALLOC(hidden[0], (uint64_t)cap * DS4_N_HC * DS4_N_EMBD, float);
+    M3_ALLOC(hidden[1], (uint64_t)cap * DS4_N_HC * DS4_N_EMBD, float);
+    M3_ALLOC(mhc_norm, (uint64_t)cap * DS4_N_HC * DS4_N_EMBD, float);
+    M3_ALLOC(projected_pre, (uint64_t)cap * DS4_N_HC, float);
+    M3_ALLOC(projected_post, (uint64_t)cap * DS4_N_HC, float);
+    M3_ALLOC(projected_res, (uint64_t)cap * DS4_N_HC * DS4_N_HC, float);
+    M3_ALLOC(h_pre, (uint64_t)cap * DS4_N_HC, float);
+    M3_ALLOC(h_post, (uint64_t)cap * DS4_N_HC, float);
+    M3_ALLOC(h_res, (uint64_t)cap * DS4_N_HC * DS4_N_HC, float);
+    M3_ALLOC(reduced, (uint64_t)cap * DS4_N_EMBD, float);
+    M3_ALLOC(norm, (uint64_t)cap * DS4_N_EMBD, float);
+    M3_ALLOC(q_latent, (uint64_t)cap * DS4_N_LORA_Q, float);
+    M3_ALLOC(q_latent_norm, (uint64_t)cap * DS4_N_LORA_Q, float);
+    M3_ALLOC(q_raw, (uint64_t)cap * DS4_N_HEAD * DS4_N_HEAD_DIM, float);
+    M3_ALLOC(q_gate, (uint64_t)cap * (DS4_N_HEAD - DS4_N_NOISE_HEAD) * DS4_N_VALUE_DIM, float);
+    M3_ALLOC(kv_raw, (uint64_t)cap * (DS4_N_KV_LORA + DS4_N_ROT), float);
+    M3_ALLOC(kv_latent, (uint64_t)cap * DS4_N_KV_LORA, float);
+    M3_ALLOC(kv_norm, (uint64_t)cap * DS4_N_KV_LORA, float);
+    M3_ALLOC(kv_proj, (uint64_t)cap * DS4_N_HEAD_KV *
+             ((DS4_N_HEAD_DIM - DS4_N_ROT) + DS4_N_VALUE_DIM), float);
+    M3_ALLOC(q_full, (uint64_t)cap * DS4_N_HEAD * DS4_N_HEAD_DIM, float);
+    M3_ALLOC(q_absorbed, (uint64_t)cap * DS4_N_HEAD * DS4_N_KV_LORA, float);
+    M3_ALLOC(latent_attention, (uint64_t)cap * DS4_N_HEAD * DS4_N_KV_LORA, float);
+    M3_ALLOC(k_full, (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM, float);
+    M3_ALLOC(value, (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_VALUE_DIM, float);
+    M3_ALLOC(lambda, (uint64_t)cap * (DS4_N_HEAD - DS4_N_NOISE_HEAD), float);
+    M3_ALLOC(attention, (uint64_t)cap * DS4_N_HEAD * DS4_N_VALUE_DIM, float);
+    M3_ALLOC(differential, (uint64_t)cap * (DS4_N_HEAD - DS4_N_NOISE_HEAD) * DS4_N_VALUE_DIM, float);
+    M3_ALLOC(block_out, (uint64_t)cap * DS4_N_EMBD, float);
+    M3_ALLOC(dense_gate, (uint64_t)cap * DS4_N_FF_DENSE, float);
+    M3_ALLOC(dense_up, (uint64_t)cap * DS4_N_FF_DENSE, float);
+    M3_ALLOC(dense_mid, (uint64_t)cap * DS4_N_FF_DENSE, float);
+    M3_ALLOC(shared_gate, (uint64_t)cap * DS4_N_FF_EXP, float);
+    M3_ALLOC(shared_up, (uint64_t)cap * DS4_N_FF_EXP, float);
+    M3_ALLOC(shared_mid, (uint64_t)cap * DS4_N_FF_EXP, float);
+    M3_ALLOC(shared_out, (uint64_t)cap * DS4_N_EMBD, float);
+    M3_ALLOC(router_logits, (uint64_t)cap * DS4_N_EXPERT, float);
+    M3_ALLOC(router_probs, (uint64_t)cap * DS4_N_EXPERT, float);
+    M3_ALLOC(selected, (uint64_t)cap * DS4_N_EXPERT_USED, int32_t);
+    M3_ALLOC(route_weights, (uint64_t)cap * DS4_N_EXPERT_USED, float);
+    M3_ALLOC(routed_gate, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP, float);
+    M3_ALLOC(routed_up, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP, float);
+    M3_ALLOC(routed_mid, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP, float);
+    M3_ALLOC(routed_down, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_EMBD, float);
+    M3_ALLOC(routed_out, (uint64_t)cap * DS4_N_EMBD, float);
+    M3_ALLOC(mean_hidden, (uint64_t)cap * DS4_N_EMBD, float);
+    M3_ALLOC(final_norm, (uint64_t)cap * DS4_N_EMBD, float);
+    M3_ALLOC(logits, DS4_N_VOCAB, float);
+    M3_ALLOC(mtp_concat, (uint64_t)cap * 2u * DS4_N_EMBD, float);
+#undef M3_ALLOC
+
+    float yarn[DS4_MAX_ROT / 2u];
+    float swa[DS4_MAX_ROT / 2u];
+    const float low_f = (float)DS4_N_ROT *
+        logf((float)DS4_ROPE_ORIG_CTX /
+             (DS4_ROPE_YARN_BETA_FAST * 2.0f * (float)M_PI)) /
+        (2.0f * logf(DS4_ROPE_FREQ_BASE));
+    const float high_f = (float)DS4_N_ROT *
+        logf((float)DS4_ROPE_ORIG_CTX /
+             (DS4_ROPE_YARN_BETA_SLOW * 2.0f * (float)M_PI)) /
+        (2.0f * logf(DS4_ROPE_FREQ_BASE));
+    int low = (int)floorf(low_f);
+    int high = (int)ceilf(high_f);
+    if (low < 0) low = 0;
+    if (high >= (int)DS4_N_ROT) high = (int)DS4_N_ROT - 1;
+    if (low == high) high++;
+    for (uint32_t i = 0; i < DS4_N_ROT / 2u; i++) {
+        const float base = 1.0f / powf(DS4_ROPE_FREQ_BASE,
+                                      (2.0f * (float)i) / (float)DS4_N_ROT);
+        float ramp = ((float)i - (float)low) / (float)(high - low);
+        ramp = fmaxf(0.0f, fminf(1.0f, ramp));
+        yarn[i] = base * (1.0f - ramp) + base / DS4_ROPE_SCALE_FACTOR * ramp;
+        swa[i] = base;
+    }
+    if (!ds4_gpu_tensor_write(g->inv_yarn, 0, yarn,
+                              (uint64_t)(DS4_N_ROT / 2u) * sizeof(float)) ||
+        !ds4_gpu_tensor_write(g->inv_swa, 0, swa,
+                              (uint64_t)(DS4_N_ROT / 2u) * sizeof(float))) {
+        motif3_graph_free(g);
+        return false;
+    }
+    g->ready = true;
+    return true;
+}
+
+static bool motif3_graph_alloc_latent_cache(
+        ds4_motif3_gpu_graph *g, uint32_t ctx_cap) {
+    if (!g || !g->ready || g->latent_cache_ready || ctx_cap == 0 ||
+        ctx_cap > 262144u || DS4_N_LAYER >= DS4_MAX_LAYER) {
+        return false;
+    }
+    uint64_t total = 0;
+    for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
+        const bool mtp = il == DS4_N_LAYER;
+        const bool full = !mtp && ds4_motif3_layer_is_full_attention(il);
+        uint64_t cap = ctx_cap;
+        if (!full) {
+            /* The entire current chunk is inserted before its causal
+             * attention launch.  Keep one chunk of slack beyond the visible
+             * window so future rows cannot overwrite history needed by the
+             * first query in that same chunk. */
+            cap = (uint64_t)DS4_N_SWA + 1u + g->cap;
+            if (cap > ctx_cap) cap = ctx_cap;
+        }
+        if (cap == 0 || cap > UINT32_MAX ||
+            cap > UINT64_MAX / DS4_N_KV_LORA / sizeof(uint16_t) ||
+            cap > UINT64_MAX / DS4_N_ROT / sizeof(uint16_t)) {
+            motif3_graph_free(g);
+            return false;
+        }
+        const uint64_t latent_bytes =
+            cap * DS4_N_KV_LORA * sizeof(uint16_t);
+        const uint64_t k_pe_bytes = cap * DS4_N_ROT * sizeof(uint16_t);
+        g->layer_kv_latent[il] = ds4_gpu_tensor_alloc(latent_bytes);
+        g->layer_k_pe[il] = ds4_gpu_tensor_alloc(k_pe_bytes);
+        if (!g->layer_kv_latent[il] || !g->layer_k_pe[il]) {
+            fprintf(stderr,
+                    "ds4: Motif-3 latent cache allocation failed at layer %u\n",
+                    il);
+            motif3_graph_free(g);
+            return false;
+        }
+        g->layer_cache_cap[il] = (uint32_t)cap;
+        total += latent_bytes + k_pe_bytes;
+    }
+    g->ctx_cap = ctx_cap;
+    g->cache_len = 0;
+    g->mtp_cache_len = 0;
+    g->latent_cache_bytes = total;
+    g->latent_cache_ready = true;
+    fprintf(stderr,
+            "ds4: Motif-3 resident latent KV allocated: ctx=%u, %.3f GiB "
+            "(%" PRIu64 " bytes; normalized latent + rotated k_pe; SWA rings)\n",
+            ctx_cap, (double)total / 1073741824.0, total);
+    return true;
+}
+
+static bool motif3_graph_small_projection(
+        ds4_gpu_tensor *out, const ds4_model *model,
+        const ds4_tensor *weight, const ds4_gpu_tensor *x,
+        uint64_t rows) {
+    if (!weight) return false;
+    if (weight->type == DS4_TENSOR_BF16) {
+        return ds4_gpu_matmul_bf16_tensor(out, model->map, model->size,
+                                          weight->abs_offset,
+                                          weight->dim[0], weight->dim[1],
+                                          x, rows) != 0;
+    }
+    if (weight->type == DS4_TENSOR_F16) {
+        return ds4_gpu_matmul_f16_tensor(out, model->map, model->size,
+                                         weight->abs_offset,
+                                         weight->dim[0], weight->dim[1],
+                                         x, rows) != 0;
+    }
+    return false;
+}
+
+static bool motif3_graph_begin_sublayer(
+        ds4_motif3_gpu_graph *g, const ds4_model *model,
+        const ds4_gpu_tensor *hidden,
+        const ds4_tensor *mhc_norm,
+        const ds4_tensor *proj_pre, const ds4_tensor *proj_post,
+        const ds4_tensor *proj_res,
+        const ds4_tensor *alpha_pre, const ds4_tensor *alpha_post,
+        const ds4_tensor *alpha_res,
+        const ds4_tensor *bias_pre, const ds4_tensor *bias_post,
+        const ds4_tensor *bias_res,
+        const ds4_tensor *sublayer_norm,
+        uint32_t rows, uint32_t il, const char *which) {
+    const uint32_t hc_dim = DS4_N_HC * DS4_N_EMBD;
+#define M3_BEGIN(expr, stage) do { if (!(expr)) {                              \
+        fprintf(stderr, "ds4: Motif-3 layer %u %s failed at %s\n",            \
+                il, which, stage); return false; } } while (0)
+    M3_BEGIN(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->mhc_norm, hidden, model->map, model->size,
+            mhc_norm->abs_offset, hc_dim, rows, DS4_HC_EPS), "mHC RMSNorm");
+    M3_BEGIN(motif3_graph_small_projection(g->projected_pre, model,
+            proj_pre, g->mhc_norm, rows), "proj_pre");
+    M3_BEGIN(motif3_graph_small_projection(g->projected_post, model,
+            proj_post, g->mhc_norm, rows), "proj_post");
+    M3_BEGIN(motif3_graph_small_projection(g->projected_res, model,
+            proj_res, g->mhc_norm, rows), "proj_res");
+    M3_BEGIN(ds4_gpu_motif3_mhc_controls_model_tensor(
+            g->h_pre, g->h_post, g->h_res,
+            g->projected_pre, g->projected_post, g->projected_res,
+            model->map, model->size,
+            alpha_pre->abs_offset, alpha_post->abs_offset,
+            alpha_res->abs_offset, bias_pre->abs_offset,
+            bias_post->abs_offset, bias_res->abs_offset,
+            rows, DS4_N_HC, DS4_N_HC_SINKHORN_ITER, 1.0f), "controls");
+    M3_BEGIN(ds4_gpu_motif3_mhc_apply_pre_tensor(
+            g->reduced, hidden, g->h_pre, rows, DS4_N_HC, DS4_N_EMBD),
+            "apply_h_pre");
+    M3_BEGIN(ds4_gpu_motif3_round_bf16_tensor(
+            g->reduced, g->reduced, (uint64_t)rows * DS4_N_EMBD),
+            "reduced BF16 boundary");
+    M3_BEGIN(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->norm, g->reduced, model->map, model->size,
+            sublayer_norm->abs_offset, DS4_N_EMBD, rows, DS4_RMS_EPS),
+            "sublayer RMSNorm");
+    M3_BEGIN(ds4_gpu_motif3_round_bf16_tensor(
+            g->norm, g->norm, (uint64_t)rows * DS4_N_EMBD),
+            "norm BF16 boundary");
+#undef M3_BEGIN
+    return true;
+}
+
+static bool motif3_graph_finish_sublayer(
+        ds4_motif3_gpu_graph *g, ds4_gpu_tensor *next,
+        const ds4_gpu_tensor *hidden, uint32_t rows,
+        uint32_t il, const char *which) {
+    if (!ds4_gpu_motif3_mhc_combine_tensor(
+            next, hidden, g->block_out, g->h_post, g->h_res,
+            rows, DS4_N_HC, DS4_N_EMBD) ||
+        !ds4_gpu_motif3_round_bf16_tensor(
+            next, next, (uint64_t)rows * DS4_N_HC * DS4_N_EMBD)) {
+        fprintf(stderr, "ds4: Motif-3 layer %u %s mHC combine failed\n",
+                il, which);
+        return false;
+    }
+    return true;
+}
+
+static bool motif3_graph_attention(
+        ds4_motif3_gpu_graph *g, const ds4_model *model,
+        const ds4_layer_weights *l, uint32_t rows, uint32_t il) {
+    const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint32_t signal_heads = DS4_N_HEAD - DS4_N_NOISE_HEAD;
+    const uint32_t signal_dim = signal_heads * DS4_N_VALUE_DIM;
+    const uint32_t kv_raw_dim = DS4_N_KV_LORA + DS4_N_ROT;
+    const uint32_t kv_proj_dim = DS4_N_HEAD_KV *
+        ((DS4_N_HEAD_DIM - DS4_N_ROT) + DS4_N_VALUE_DIM);
+#define M3_ATTN(expr, stage) do { if (!(expr)) {                              \
+        fprintf(stderr, "ds4: Motif-3 layer %u attention failed at %s\n",     \
+                il, stage); return false; } } while (0)
+    M3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->q_latent, model->map, model->size, l->attn_q_a->abs_offset,
+            DS4_N_EMBD, DS4_N_LORA_Q, g->norm, rows), "q_a");
+    M3_ATTN(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->q_latent_norm, g->q_latent, model->map, model->size,
+            l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, rows, DS4_RMS_EPS),
+            "q_norm");
+    M3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->q_raw, model->map, model->size, l->attn_q_b->abs_offset,
+            DS4_N_LORA_Q, q_dim, g->q_latent_norm, rows), "q_b");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->q_raw, g->q_raw, (uint64_t)rows * q_dim), "q BF16 boundary");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->q_latent_norm, g->q_latent_norm,
+            (uint64_t)rows * DS4_N_LORA_Q), "q latent gate BF16 boundary");
+    M3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->q_gate, model->map, model->size, l->attn_q_gate->abs_offset,
+            DS4_N_LORA_Q, signal_dim, g->q_latent_norm, rows), "q_gate");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->q_gate, g->q_gate, (uint64_t)rows * signal_dim),
+            "q gate BF16 boundary");
+    M3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->kv_raw, model->map, model->size, l->attn_kv_a_mqa->abs_offset,
+            DS4_N_EMBD, kv_raw_dim, g->norm, rows), "kv_a");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->kv_raw, g->kv_raw, (uint64_t)rows * kv_raw_dim),
+            "kv raw BF16 boundary");
+    M3_ATTN(ds4_gpu_motif3_split_kv_latent_tensor(
+            g->kv_latent, g->kv_raw, rows, kv_raw_dim, DS4_N_KV_LORA),
+            "split kv latent");
+    M3_ATTN(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->kv_norm, g->kv_latent, model->map, model->size,
+            l->attn_kv_a_norm->abs_offset, DS4_N_KV_LORA, rows, DS4_RMS_EPS),
+            "kv norm");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->kv_norm, g->kv_norm, (uint64_t)rows * DS4_N_KV_LORA),
+            "kv norm BF16 boundary");
+    M3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->kv_proj, model->map, model->size, l->attn_kv_b->abs_offset,
+            DS4_N_KV_LORA, kv_proj_dim, g->kv_norm, rows), "kv_b");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->kv_proj, g->kv_proj, (uint64_t)rows * kv_proj_dim),
+            "kv proj BF16 boundary");
+    M3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->lambda, model->map, model->size, l->attn_lambda->abs_offset,
+            DS4_N_EMBD, signal_heads, g->norm, rows), "lambda");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->lambda, g->lambda, (uint64_t)rows * signal_heads),
+            "lambda BF16 boundary");
+
+    const bool full = ds4_motif3_layer_is_full_attention(il);
+    M3_ATTN(ds4_gpu_motif3_prepare_qkv_tensor(
+            g->q_full, g->k_full, g->value,
+            g->q_raw, g->kv_raw, g->kv_proj,
+            g->positions, full ? g->inv_yarn : g->inv_swa,
+            rows, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+            DS4_N_ROT, DS4_N_VALUE_DIM, DS4_N_KV_LORA), "prepare qkv");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->q_full, g->q_full, (uint64_t)rows * q_dim), "q full BF16");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->k_full, g->k_full,
+            (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM), "k full BF16");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->value, g->value,
+            (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_VALUE_DIM), "value BF16");
+    float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    if (full) {
+        const float mscale = 0.1f * logf(DS4_ROPE_SCALE_FACTOR) + 1.0f;
+        scale *= mscale * mscale;
+    }
+    M3_ATTN(ds4_gpu_motif3_expanded_attention_window_tensor(
+            g->attention, g->q_full, g->k_full, g->value,
+            rows, DS4_N_HEAD, DS4_N_HEAD_KV,
+            DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, scale, true,
+            full ? 0u : DS4_N_SWA + 1u), "expanded attention");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->attention, g->attention,
+            (uint64_t)rows * DS4_N_HEAD * DS4_N_VALUE_DIM),
+            "attention BF16 boundary");
+    M3_ATTN(ds4_gpu_motif3_differential_tensor(
+            g->differential, g->attention, g->lambda, g->q_gate,
+            rows, DS4_N_HEAD_KV,
+            DS4_N_HEAD / DS4_N_HEAD_KV, DS4_N_VALUE_DIM),
+            "differential/gate");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->differential, g->differential,
+            (uint64_t)rows * signal_dim), "differential BF16 boundary");
+    M3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->block_out, model->map, model->size,
+            l->attn_output->abs_offset, signal_dim, DS4_N_EMBD,
+            g->differential, rows), "output projection");
+    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->block_out, g->block_out, (uint64_t)rows * DS4_N_EMBD),
+            "attention output BF16 boundary");
+#undef M3_ATTN
+    return true;
+}
+
+static bool motif3_graph_attention_latent(
+        ds4_motif3_gpu_graph *g, const ds4_model *model,
+        const ds4_layer_weights *l, uint32_t rows,
+        uint32_t pos0, uint32_t il) {
+    const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint32_t signal_heads = DS4_N_HEAD - DS4_N_NOISE_HEAD;
+    const uint32_t signal_dim = signal_heads * DS4_N_VALUE_DIM;
+    const uint32_t kv_raw_dim = DS4_N_KV_LORA + DS4_N_ROT;
+#define M3_LATTN(expr, stage) do { if (!(expr)) {                             \
+        fprintf(stderr, "ds4: Motif-3 layer %u latent attention failed at %s\n", \
+                il, stage); return false; } } while (0)
+    const bool mtp = il == DS4_N_LAYER;
+    const uint32_t expected_cache_len = mtp ? g->mtp_cache_len : g->cache_len;
+    if (!g->latent_cache_ready || il > DS4_N_LAYER ||
+        pos0 != expected_cache_len || pos0 + rows > g->ctx_cap) {
+        fprintf(stderr,
+                "ds4: Motif-3 layer %u latent cache identity mismatch "
+                "(pos=%u rows=%u cached=%u ctx=%u)\n",
+                il, pos0, rows, expected_cache_len, g->ctx_cap);
+        return false;
+    }
+    M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->q_latent, model->map, model->size, l->attn_q_a->abs_offset,
+            DS4_N_EMBD, DS4_N_LORA_Q, g->norm, rows), "q_a");
+    M3_LATTN(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->q_latent_norm, g->q_latent, model->map, model->size,
+            l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, rows, DS4_RMS_EPS),
+            "q_norm");
+    M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->q_raw, model->map, model->size, l->attn_q_b->abs_offset,
+            DS4_N_LORA_Q, q_dim, g->q_latent_norm, rows), "q_b");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->q_raw, g->q_raw, (uint64_t)rows * q_dim), "q BF16 boundary");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->q_latent_norm, g->q_latent_norm,
+            (uint64_t)rows * DS4_N_LORA_Q), "q latent gate BF16 boundary");
+    M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->q_gate, model->map, model->size, l->attn_q_gate->abs_offset,
+            DS4_N_LORA_Q, signal_dim, g->q_latent_norm, rows), "q_gate");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->q_gate, g->q_gate, (uint64_t)rows * signal_dim),
+            "q gate BF16 boundary");
+    M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->kv_raw, model->map, model->size, l->attn_kv_a_mqa->abs_offset,
+            DS4_N_EMBD, kv_raw_dim, g->norm, rows), "kv_a");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->kv_raw, g->kv_raw, (uint64_t)rows * kv_raw_dim),
+            "kv raw BF16 boundary");
+    M3_LATTN(ds4_gpu_motif3_split_kv_latent_tensor(
+            g->kv_latent, g->kv_raw, rows, kv_raw_dim, DS4_N_KV_LORA),
+            "split kv latent");
+    M3_LATTN(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->kv_norm, g->kv_latent, model->map, model->size,
+            l->attn_kv_a_norm->abs_offset, DS4_N_KV_LORA, rows, DS4_RMS_EPS),
+            "kv norm");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->kv_norm, g->kv_norm, (uint64_t)rows * DS4_N_KV_LORA),
+            "kv norm BF16 boundary");
+    M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->lambda, model->map, model->size, l->attn_lambda->abs_offset,
+            DS4_N_EMBD, signal_heads, g->norm, rows), "lambda");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->lambda, g->lambda, (uint64_t)rows * signal_heads),
+            "lambda BF16 boundary");
+
+    /* The official MTP transformer block is dense, has no mHC, and always
+     * uses plain-RoPE SWA regardless of its synthetic layer index 53. */
+    const bool full = !mtp && ds4_motif3_layer_is_full_attention(il);
+    const uint32_t cache_cap = g->layer_cache_cap[il];
+    uint32_t window = full ? 0u : DS4_N_SWA + 1u;
+    if (window > cache_cap) window = cache_cap;
+    M3_LATTN(ds4_gpu_motif3_prepare_q_tensor(
+            g->q_full, g->q_raw, g->positions,
+            full ? g->inv_yarn : g->inv_swa,
+            rows, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT), "prepare q");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->q_full, g->q_full, (uint64_t)rows * q_dim),
+            "q full BF16");
+    M3_LATTN(ds4_gpu_motif3_store_latent_kv_bf16_tensor(
+            g->layer_kv_latent[il], g->layer_k_pe[il],
+            g->kv_norm, g->kv_raw, g->positions,
+            full ? g->inv_yarn : g->inv_swa,
+            rows, cache_cap, kv_raw_dim, DS4_N_KV_LORA,
+            DS4_N_ROT, !full), "cache latent/k_pe");
+    M3_LATTN(ds4_gpu_motif3_qk_absorb_q8_0_tensor(
+            g->q_absorbed, g->q_full, model->map, model->size,
+            l->attn_kv_b->abs_offset, rows,
+            DS4_N_HEAD, DS4_N_HEAD_KV,
+            DS4_N_HEAD / DS4_N_HEAD_KV,
+            DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
+            DS4_N_HEAD_DIM, DS4_N_VALUE_DIM), "absorb q/k");
+    float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    if (full) {
+        const float mscale = 0.1f * logf(DS4_ROPE_SCALE_FACTOR) + 1.0f;
+        scale *= mscale * mscale;
+    }
+    M3_LATTN(ds4_gpu_motif3_latent_attention_bf16_tensor(
+            g->latent_attention, g->q_full, g->q_absorbed,
+            g->layer_kv_latent[il], g->layer_k_pe[il],
+            rows, pos0, cache_cap, window, DS4_N_HEAD,
+            DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
+            DS4_N_ROT, scale), "latent attention");
+    M3_LATTN(ds4_gpu_motif3_value_project_q8_0_tensor(
+            g->attention, g->latent_attention,
+            model->map, model->size, l->attn_kv_b->abs_offset,
+            rows, DS4_N_HEAD, DS4_N_HEAD_KV,
+            DS4_N_HEAD / DS4_N_HEAD_KV,
+            DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
+            DS4_N_VALUE_DIM), "latent value projection");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->attention, g->attention,
+            (uint64_t)rows * DS4_N_HEAD * DS4_N_VALUE_DIM),
+            "attention BF16 boundary");
+    M3_LATTN(ds4_gpu_motif3_differential_tensor(
+            g->differential, g->attention, g->lambda, g->q_gate,
+            rows, DS4_N_HEAD_KV,
+            DS4_N_HEAD / DS4_N_HEAD_KV, DS4_N_VALUE_DIM),
+            "differential/gate");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->differential, g->differential,
+            (uint64_t)rows * signal_dim), "differential BF16 boundary");
+    M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->block_out, model->map, model->size,
+            l->attn_output->abs_offset, signal_dim, DS4_N_EMBD,
+            g->differential, rows), "output projection");
+    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+            g->block_out, g->block_out, (uint64_t)rows * DS4_N_EMBD),
+            "attention output BF16 boundary");
+#undef M3_LATTN
+    return true;
+}
+
+static bool motif3_graph_ffn(
+        ds4_motif3_gpu_graph *g, const ds4_model *model,
+        const ds4_layer_weights *l, uint32_t rows, uint32_t il) {
+    const uint32_t out_values = rows * DS4_N_EMBD;
+#define M3_FFN(expr, stage) do { if (!(expr)) {                               \
+        fprintf(stderr, "ds4: Motif-3 layer %u FFN failed at %s\n",          \
+                il, stage); return false; } } while (0)
+
+    /* The target model has two leading dense blocks, while the separately
+     * bound MTP block is also dense despite using synthetic index n_layer. */
+    if (l->ffn_gate && l->ffn_up && l->ffn_down) {
+        M3_FFN(ds4_gpu_matmul_q8_0_pair_tensor(
+                g->dense_gate, g->dense_up, model->map, model->size,
+                l->ffn_gate->abs_offset, l->ffn_up->abs_offset,
+                DS4_N_EMBD, DS4_N_FF_DENSE, DS4_N_FF_DENSE,
+                g->norm, rows), "dense gate/up");
+        M3_FFN(ds4_gpu_motif3_round_bf16_tensor(
+                g->dense_gate, g->dense_gate,
+                (uint64_t)rows * DS4_N_FF_DENSE), "dense gate BF16");
+        M3_FFN(ds4_gpu_motif3_round_bf16_tensor(
+                g->dense_up, g->dense_up,
+                (uint64_t)rows * DS4_N_FF_DENSE), "dense up BF16");
+        M3_FFN(ds4_gpu_motif3_polynorm_mul_model_tensor(
+                g->dense_mid, g->dense_gate, g->dense_up,
+                model->map, model->size,
+                l->ffn_polynorm_weight->abs_offset,
+                l->ffn_polynorm_bias->abs_offset,
+                rows, DS4_N_FF_DENSE, 1.0e6f, 0.5f, 0.5f, 1.0e-6f,
+                true), "dense PolyNorm");
+        M3_FFN(ds4_gpu_matmul_q8_0_tensor(
+                g->block_out, model->map, model->size,
+                l->ffn_down->abs_offset, DS4_N_FF_DENSE, DS4_N_EMBD,
+                g->dense_mid, rows), "dense down");
+    } else {
+        M3_FFN(ds4_gpu_matmul_f32_tensor(
+                g->router_logits, model->map, model->size,
+                l->ffn_gate_inp->abs_offset, DS4_N_EMBD, DS4_N_EXPERT,
+                g->norm, rows), "router projection");
+        M3_FFN(ds4_gpu_motif3_router_select_batch_model_tensor(
+                g->selected, g->route_weights, g->router_probs,
+                model->map, model->size, l->ffn_exp_probs_b->abs_offset,
+                g->router_logits, rows, DS4_N_EXPERT,
+                DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE), "router top-8");
+
+        const uint64_t gate_expert_bytes =
+            l->ffn_gate_exps->bytes / DS4_N_EXPERT;
+        const uint64_t down_expert_bytes =
+            l->ffn_down_exps->bytes / DS4_N_EXPERT;
+        M3_FFN(ds4_gpu_motif3_routed_moe_batch_tensor(
+                g->routed_out, g->routed_gate, g->routed_up,
+                g->routed_mid, g->routed_down,
+                model->map, model->size,
+                l->ffn_gate_exps->abs_offset,
+                l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset,
+                l->ffn_polynorm_exps_weight->abs_offset,
+                l->ffn_polynorm_exps_bias->abs_offset,
+                gate_expert_bytes, down_expert_bytes,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                g->selected, g->route_weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                1.0e6f, 0.5f, 0.5f, 1.0e-6f,
+                g->norm, rows), "routed experts");
+
+        M3_FFN(ds4_gpu_matmul_q8_0_pair_tensor(
+                g->shared_gate, g->shared_up, model->map, model->size,
+                l->ffn_gate_shexp->abs_offset,
+                l->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_FF_EXP,
+                g->norm, rows), "shared gate/up");
+        M3_FFN(ds4_gpu_motif3_round_bf16_tensor(
+                g->shared_gate, g->shared_gate,
+                (uint64_t)rows * DS4_N_FF_EXP), "shared gate BF16");
+        M3_FFN(ds4_gpu_motif3_round_bf16_tensor(
+                g->shared_up, g->shared_up,
+                (uint64_t)rows * DS4_N_FF_EXP), "shared up BF16");
+        M3_FFN(ds4_gpu_motif3_polynorm_mul_model_tensor(
+                g->shared_mid, g->shared_gate, g->shared_up,
+                model->map, model->size,
+                l->ffn_polynorm_shexp_weight->abs_offset,
+                l->ffn_polynorm_shexp_bias->abs_offset,
+                rows, DS4_N_FF_EXP, 1.0e6f, 0.5f, 0.5f, 1.0e-6f,
+                true), "shared PolyNorm");
+        M3_FFN(ds4_gpu_matmul_q8_0_tensor(
+                g->shared_out, model->map, model->size,
+                l->ffn_down_shexp->abs_offset,
+                DS4_N_FF_EXP, DS4_N_EMBD, g->shared_mid, rows),
+                "shared down");
+        M3_FFN(ds4_gpu_add_tensor(
+                g->block_out, g->routed_out, g->shared_out, out_values),
+                "routed/shared sum");
+    }
+    M3_FFN(ds4_gpu_motif3_round_bf16_tensor(
+            g->block_out, g->block_out, out_values),
+            "FFN output BF16 boundary");
+#undef M3_FFN
+    return true;
+}
+
+/* Expanded-path correctness executor.  It deliberately recomputes a complete
+ * prompt of at most 256 tokens and does not claim to be the production cache
+ * path.  That keeps the first end-to-end check independent of latent-cache
+ * implementation while exercising every official target-model layer. */
+static bool motif3_graph_forward_impl(
+        ds4_motif3_gpu_graph *g, const ds4_model *model,
+        const ds4_weights *weights, const int *tokens,
+        uint32_t rows, uint32_t pos0, float *host_logits,
+        bool latent) {
+    if (!g || !g->ready || !model || !weights || !tokens ||
+        rows == 0 || rows > g->cap) {
+        return false;
+    }
+    if (latent && (!g->latent_cache_ready || pos0 != g->cache_len ||
+                   pos0 + rows > g->ctx_cap)) {
+        return false;
+    }
+    int32_t *token_ids = xmalloc((size_t)rows * sizeof(token_ids[0]));
+    int32_t *positions = xmalloc((size_t)rows * sizeof(positions[0]));
+    bool ok = true;
+    for (uint32_t i = 0; i < rows; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) ok = false;
+        token_ids[i] = tokens[i];
+        positions[i] = (int32_t)(pos0 + i);
+    }
+    if (ok) ok = ds4_gpu_tensor_write(
+            g->tokens, 0, token_ids, (uint64_t)rows * sizeof(token_ids[0])) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(
+            g->positions, 0, positions,
+            (uint64_t)rows * sizeof(positions[0])) != 0;
+    free(positions);
+    free(token_ids);
+    if (!ok) return false;
+
+#define M3_FORWARD(expr, stage) do { if (!(expr)) {                           \
+        fprintf(stderr, "ds4: Motif-3 forward failed at %s\n", stage);       \
+        return false; } } while (0)
+    M3_FORWARD(ds4_gpu_embed_tokens_q8_0_tensor(
+            g->reduced, g->tokens, model->map, model->size,
+            weights->token_embd->abs_offset, DS4_N_VOCAB, rows, DS4_N_EMBD),
+            "token embedding");
+    M3_FORWARD(ds4_gpu_motif3_round_bf16_tensor(
+            g->reduced, g->reduced, (uint64_t)rows * DS4_N_EMBD),
+            "embedding BF16 boundary");
+    M3_FORWARD(ds4_gpu_repeat_hc_rows_tensor(
+            g->hidden[0], g->reduced, rows, DS4_N_EMBD, DS4_N_HC),
+            "mHC input expansion");
+
+    uint32_t current = 0;
+    const bool trace = getenv("DS4_MOTIF3_FORWARD_TRACE") != NULL;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        M3_FORWARD(motif3_graph_begin_sublayer(
+                g, model, g->hidden[current],
+                l->mhc_attn_rms_norm,
+                l->mhc_attn_proj_pre, l->mhc_attn_proj_post,
+                l->mhc_attn_proj_res,
+                l->mhc_attn_alpha_pre, l->mhc_attn_alpha_post,
+                l->mhc_attn_alpha_res,
+                l->mhc_attn_bias_pre, l->mhc_attn_bias_post,
+                l->mhc_attn_bias_res, l->attn_norm,
+                rows, il, "attention"), "attention mHC pre");
+        M3_FORWARD(latent
+                ? motif3_graph_attention_latent(
+                        g, model, l, rows, pos0, il)
+                : motif3_graph_attention(g, model, l, rows, il),
+                   latent ? "latent GDLA" : "expanded GDLA");
+        M3_FORWARD(motif3_graph_finish_sublayer(
+                g, g->hidden[current ^ 1u], g->hidden[current],
+                rows, il, "attention"), "attention mHC post");
+        current ^= 1u;
+
+        M3_FORWARD(motif3_graph_begin_sublayer(
+                g, model, g->hidden[current],
+                l->mhc_ffn_rms_norm,
+                l->mhc_ffn_proj_pre, l->mhc_ffn_proj_post,
+                l->mhc_ffn_proj_res,
+                l->mhc_ffn_alpha_pre, l->mhc_ffn_alpha_post,
+                l->mhc_ffn_alpha_res,
+                l->mhc_ffn_bias_pre, l->mhc_ffn_bias_post,
+                l->mhc_ffn_bias_res, l->ffn_norm,
+                rows, il, "FFN"), "FFN mHC pre");
+        M3_FORWARD(motif3_graph_ffn(g, model, l, rows, il), "FFN");
+        M3_FORWARD(motif3_graph_finish_sublayer(
+                g, g->hidden[current ^ 1u], g->hidden[current],
+                rows, il, "FFN"), "FFN mHC post");
+        current ^= 1u;
+        if (trace) {
+            fprintf(stderr, "ds4: Motif-3 %s forward layer %u/%u\n",
+                    latent ? "latent" : "expanded", il + 1u, DS4_N_LAYER);
+        }
+    }
+
+    if (!host_logits) {
+        if (latent) g->cache_len = pos0 + rows;
+        return true;
+    }
+
+    M3_FORWARD(ds4_gpu_motif3_mean_expansion_tensor(
+            g->mean_hidden, g->hidden[current], rows, DS4_N_HC, DS4_N_EMBD),
+            "final mHC mean");
+    M3_FORWARD(ds4_gpu_motif3_round_bf16_tensor(
+            g->mean_hidden, g->mean_hidden, (uint64_t)rows * DS4_N_EMBD),
+            "final mean BF16 boundary");
+    M3_FORWARD(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->final_norm, g->mean_hidden, model->map, model->size,
+            weights->output_norm->abs_offset, DS4_N_EMBD, rows, DS4_RMS_EPS),
+            "output norm");
+    M3_FORWARD(ds4_gpu_motif3_round_bf16_tensor(
+            g->final_norm, g->final_norm, (uint64_t)rows * DS4_N_EMBD),
+            "output norm BF16 boundary");
+
+    ds4_gpu_tensor *last = ds4_gpu_tensor_view(
+            g->final_norm, (uint64_t)(rows - 1u) * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+    if (!last) {
+        fprintf(stderr, "ds4: Motif-3 forward failed to view final row\n");
+        return false;
+    }
+    ok = ds4_gpu_matmul_q8_0_tensor(
+            g->logits, model->map, model->size, weights->output->abs_offset,
+            DS4_N_EMBD, DS4_N_VOCAB, last, 1u) != 0;
+    ds4_gpu_tensor_free(last);
+    if (!ok) {
+        fprintf(stderr, "ds4: Motif-3 forward failed at LM head\n");
+        return false;
+    }
+    M3_FORWARD(ds4_gpu_tensor_read(
+            g->logits, 0, host_logits,
+            (uint64_t)DS4_N_VOCAB * sizeof(host_logits[0])),
+            "logits readback");
+#undef M3_FORWARD
+    if (latent) g->cache_len = pos0 + rows;
+    return true;
+}
+
+static bool motif3_graph_forward_prompt(
+        ds4_motif3_gpu_graph *g, const ds4_model *model,
+        const ds4_weights *weights, const int *tokens,
+        uint32_t rows, float *host_logits) {
+    if (!host_logits) return false;
+    return motif3_graph_forward_impl(
+            g, model, weights, tokens, rows, 0u, host_logits, false);
+}
+
+static bool motif3_graph_forward_chunk(
+        ds4_motif3_gpu_graph *g, const ds4_model *model,
+        const ds4_weights *weights, const int *tokens,
+        uint32_t rows, uint32_t pos0, float *host_logits) {
+    return motif3_graph_forward_impl(
+            g, model, weights, tokens, rows, pos0, host_logits, true);
+}
+
+/* Execute the official in-checkpoint MTP topology teacher-forced over a short
+ * prefix.  For base hidden h[i], MTP consumes embed(t[i+1]) and predicts
+ * t[i+2].  This diagnostic intentionally validates real MTP weights and the
+ * dense all-SWA block without enabling speculative scheduling policy. */
+static bool motif3_graph_forward_mtp_diagnostic(
+        ds4_motif3_gpu_graph *g, const ds4_model *model,
+        const ds4_weights *weights, const int *tokens,
+        uint32_t rows, float *host_logits) {
+    if (!g || !g->ready || !g->latent_cache_ready || !model || !weights ||
+        !tokens || !host_logits || rows < 3u || rows > g->cap) return false;
+    const uint32_t mtp_rows = rows - 2u;
+    int32_t *shifted = xmalloc((size_t)mtp_rows * sizeof(shifted[0]));
+    int32_t *positions = xmalloc((size_t)mtp_rows * sizeof(positions[0]));
+    bool ok = true;
+    for (uint32_t i = 0; i < mtp_rows; i++) {
+        if (tokens[i + 1u] < 0 ||
+            (uint32_t)tokens[i + 1u] >= DS4_N_VOCAB) ok = false;
+        shifted[i] = tokens[i + 1u];
+        positions[i] = (int32_t)i;
+    }
+    if (ok) ok = ds4_gpu_tensor_write(
+            g->tokens, 0, shifted,
+            (uint64_t)mtp_rows * sizeof(shifted[0])) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(
+            g->positions, 0, positions,
+            (uint64_t)mtp_rows * sizeof(positions[0])) != 0;
+    free(positions);
+    free(shifted);
+    if (!ok) return false;
+
+    const ds4_layer_weights *l = &weights->motif_mtp;
+    if (!weights->token_embd || !weights->output ||
+        !weights->motif_mtp_embed_norm || !weights->motif_mtp_input_norm ||
+        !weights->motif_mtp_input_proj || !weights->motif_mtp_final_norm ||
+        !l->attn_q_a || !l->attn_q_a_norm || !l->attn_q_b ||
+        !l->attn_q_gate || !l->attn_kv_a_mqa || !l->attn_kv_a_norm ||
+        !l->attn_kv_b || !l->attn_lambda || !l->attn_output ||
+        !l->ffn_norm || !l->ffn_gate || !l->ffn_up || !l->ffn_down ||
+        !l->ffn_polynorm_weight || !l->ffn_polynorm_bias) {
+        fprintf(stderr, "ds4: Motif-3 MTP diagnostic weight binding is incomplete\n");
+        return false;
+    }
+    const bool trace = getenv("DS4_MOTIF3_MTP_TRACE") != NULL;
+#define M3_MTP(expr, stage) do { if (!(expr)) {                               \
+        fprintf(stderr, "ds4: Motif-3 MTP diagnostic failed at %s\n", stage); \
+        return false; } else if (trace) {                                     \
+        fprintf(stderr, "ds4: Motif-3 MTP diagnostic passed %s\n", stage);  \
+    } } while (0)
+    M3_MTP(ds4_gpu_embed_tokens_q8_0_tensor(
+            g->reduced, g->tokens, model->map, model->size,
+            weights->token_embd->abs_offset, DS4_N_VOCAB,
+            mtp_rows, DS4_N_EMBD), "shifted token embedding");
+    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
+            g->reduced, g->reduced, (uint64_t)mtp_rows * DS4_N_EMBD),
+            "embedding BF16 boundary");
+    M3_MTP(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->norm, g->reduced, model->map, model->size,
+            weights->motif_mtp_embed_norm->abs_offset,
+            DS4_N_EMBD, mtp_rows, DS4_RMS_EPS), "embed_norm");
+    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
+            g->norm, g->norm, (uint64_t)mtp_rows * DS4_N_EMBD),
+            "embed_norm BF16 boundary");
+
+    ds4_gpu_tensor *previous = ds4_gpu_tensor_view(
+            g->final_norm, 0,
+            (uint64_t)mtp_rows * DS4_N_EMBD * sizeof(float));
+    if (!previous) {
+        fprintf(stderr, "ds4: Motif-3 MTP previous-hidden view failed\n");
+        return false;
+    }
+    ok = ds4_gpu_concat_rows_tensor(
+            g->mtp_concat, previous, g->norm, mtp_rows, DS4_N_EMBD) != 0;
+    ds4_gpu_tensor_free(previous);
+    M3_MTP(ok, "concat(base hidden, next embedding)");
+    M3_MTP(ds4_gpu_matmul_q8_0_tensor(
+            g->reduced, model->map, model->size,
+            weights->motif_mtp_input_proj->abs_offset,
+            2u * DS4_N_EMBD, DS4_N_EMBD,
+            g->mtp_concat, mtp_rows), "input_proj");
+    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
+            g->reduced, g->reduced, (uint64_t)mtp_rows * DS4_N_EMBD),
+            "input projection BF16 boundary");
+
+    M3_MTP(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->norm, g->reduced, model->map, model->size,
+            weights->motif_mtp_input_norm->abs_offset,
+            DS4_N_EMBD, mtp_rows, DS4_RMS_EPS), "input layernorm");
+    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
+            g->norm, g->norm, (uint64_t)mtp_rows * DS4_N_EMBD),
+            "input norm BF16 boundary");
+    g->mtp_cache_len = 0;
+    M3_MTP(motif3_graph_attention_latent(
+            g, model, l, mtp_rows, 0u, DS4_N_LAYER),
+            "dense SWA attention");
+    g->mtp_cache_len = mtp_rows;
+    M3_MTP(ds4_gpu_add_tensor(
+            g->mean_hidden, g->reduced, g->block_out,
+            (uint64_t)mtp_rows * DS4_N_EMBD), "attention residual");
+    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
+            g->mean_hidden, g->mean_hidden,
+            (uint64_t)mtp_rows * DS4_N_EMBD),
+            "attention residual BF16 boundary");
+    M3_MTP(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->norm, g->mean_hidden, model->map, model->size,
+            l->ffn_norm->abs_offset,
+            DS4_N_EMBD, mtp_rows, DS4_RMS_EPS), "post-attention norm");
+    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
+            g->norm, g->norm, (uint64_t)mtp_rows * DS4_N_EMBD),
+            "post-attention norm BF16 boundary");
+    M3_MTP(motif3_graph_ffn(g, model, l, mtp_rows, DS4_N_LAYER),
+            "dense PolyNorm FFN");
+    M3_MTP(ds4_gpu_add_tensor(
+            g->reduced, g->mean_hidden, g->block_out,
+            (uint64_t)mtp_rows * DS4_N_EMBD), "FFN residual");
+    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
+            g->reduced, g->reduced, (uint64_t)mtp_rows * DS4_N_EMBD),
+            "FFN residual BF16 boundary");
+    M3_MTP(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->final_norm, g->reduced, model->map, model->size,
+            weights->motif_mtp_final_norm->abs_offset,
+            DS4_N_EMBD, mtp_rows, DS4_RMS_EPS), "final_layernorm");
+    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
+            g->final_norm, g->final_norm,
+            (uint64_t)mtp_rows * DS4_N_EMBD), "final norm BF16 boundary");
+    ds4_gpu_tensor *last = ds4_gpu_tensor_view(
+            g->final_norm,
+            (uint64_t)(mtp_rows - 1u) * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+    if (!last) {
+        fprintf(stderr, "ds4: Motif-3 MTP final-row view failed\n");
+        return false;
+    }
+    ok = ds4_gpu_matmul_q8_0_tensor(
+            g->logits, model->map, model->size,
+            weights->output->abs_offset,
+            DS4_N_EMBD, DS4_N_VOCAB, last, 1u) != 0;
+    ds4_gpu_tensor_free(last);
+    M3_MTP(ok, "shared LM head");
+    M3_MTP(ds4_gpu_tensor_read(
+            g->logits, 0, host_logits,
+            (uint64_t)DS4_N_VOCAB * sizeof(host_logits[0])),
+            "logits readback");
+#undef M3_MTP
+    return true;
+}
+
 /* S6 lazy session graph (definition above ds4_session_create). */
 static int ds4_session_ensure_graph(ds4_session *s, char *err, size_t errlen);
 #endif
@@ -29074,6 +31693,26 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
     return 0;
 }
 #else
+int ds4_dspark_capture_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: dspark capture validate requires the graph backend\n");
+    return 1;
+}
+int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: dspark block validate requires the graph backend\n");
+    return 1;
+}
+int ds4_dspark_slabs_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: dspark slabs validate requires the graph backend\n");
+    return 1;
+}
+int ds4_dspark_tap_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
+    (void)e; (void)s; (void)trace_path;
+    fprintf(stderr, "ds4: dspark tap validate requires the graph backend\n");
+    return 1;
+}
 int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err, size_t errlen) {
     (void)s;
     (void)iters;
@@ -29436,6 +32075,9 @@ static bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
+static DS4_MAYBE_UNUSED bool ds4_session_is_motif3(const ds4_session *s) {
+    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3;
+}
 static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     uint32_t rows = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -29524,7 +32166,12 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
  * payload_region.  Serial save passes the zero-offset region; the bank
  * serializer passes seq-strided offsets + that bank's counters.  Byte
  * stream is IDENTICAL to the pre-refactor serial writer for the serial
- * region (kv_crossmode gate is the proof). */
+ * region (kv_crossmode gate is the proof).
+ *
+ * GPU-only like every caller: payload_region and ds4_gpu_graph do not exist
+ * under DS4_NO_GPU, and each public entry point already stubs the CPU build
+ * before reaching these walkers. */
+#ifndef DS4_NO_GPU
 static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *reg,
                                         uint32_t row_flags, FILE *fp, uint8_t *buf,
                                         char *err, size_t errlen) {
@@ -29938,6 +32585,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
     }
     return rc;
 }
+#endif /* !DS4_NO_GPU: session payload region walkers */
 
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
@@ -36220,7 +38868,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     sst[b].first_token_sec = now_sec();
                     ds4_metric_add(&ds4_metrics_get()->tokens_decoded, 1);
                     ds4_metrics_window_add(1, 0, 0);
-                    const bool hit_eos = (beos[b] >= 0 && nt == beos[b]);
+                    const bool hit_eos = beos[b] >= 0 &&
+                        (nt == beos[b] ||
+                         vocab_token_is_generation_stop(&ctx->e->vocab, nt));
                     /* Stream the seed token (skip EOS, which carries no visible text
                      * and is the stop signal); on_token returning 0 aborts this seq. */
                     bool aborted = false;
@@ -36502,7 +39152,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 seedtok[b] = vqtok[f];
                 gbuf[b][glen[b]++] = u; cur[b] = u; posv[b]++; mtp_acc_emit++;
                 {
-                    const bool hit_eos = (beos[b] >= 0 && u == beos[b]);
+                    const bool hit_eos = beos[b] >= 0 &&
+                        (u == beos[b] ||
+                         vocab_token_is_generation_stop(&ctx->e->vocab, u));
                     bool aborted = false;
                     if (!hit_eos && on_token && !on_token(ud, usr[b], u)) aborted = true;
                     if (hit_eos || glen[b] >= bmax[b] || aborted) {
@@ -36529,7 +39181,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     M++;
                     seedtok[b] = vqtok[f + j + 1u];
                     gbuf[b][glen[b]++] = u; cur[b] = u; posv[b]++; mtp_acc_emit++;
-                    const bool hit_eos = (beos[b] >= 0 && u == beos[b]);
+                    const bool hit_eos = beos[b] >= 0 &&
+                        (u == beos[b] ||
+                         vocab_token_is_generation_stop(&ctx->e->vocab, u));
                     bool aborted = false;
                     if (!hit_eos && on_token && !on_token(ud, usr[b], u)) aborted = true;
                     if (hit_eos || glen[b] >= bmax[b] || aborted) {
@@ -37093,7 +39747,9 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
             cur[b] = nt;
             posv[b]++;
             sst[b].decode_steps++;
-            const bool hit_eos = (beos[b] >= 0 && nt == beos[b]);
+            const bool hit_eos = beos[b] >= 0 &&
+                (nt == beos[b] ||
+                 vocab_token_is_generation_stop(&ctx->e->vocab, nt));
             bool aborted = false;
             if (!hit_eos && on_token && !on_token(ud, usr[b], nt)) aborted = true;
             if (hit_eos || glen[b] >= bmax[b] || aborted) {
@@ -38275,6 +40931,24 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (err && errlen) snprintf(err, errlen, "continuous_generate: build has no graph backend");
     return 1;
 }
+int ds4_cont_bank_stage_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                ds4_session_payload_file *out,
+                                char *err, size_t errlen) {
+    (void)ctx; (void)bank; (void)out;
+    if (err && errlen) snprintf(err, errlen, "bank_stage_payload: build has no graph backend");
+    return 1;
+}
+int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
+                                  FILE *fp, uint64_t payload_bytes,
+                                  char *err, size_t errlen) {
+    (void)ctx; (void)bank; (void)fp; (void)payload_bytes;
+    if (err && errlen) snprintf(err, errlen, "bank_restore_payload: build has no graph backend");
+    return 1;
+}
+uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
+    (void)ctx; (void)want_bytes;
+    return 0u;
+}
 #endif
 
 int ds4_engine_generate_argmax(
@@ -38462,6 +41136,394 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
     free(hc0);
     free(prompt_embd);
     return 0;
+}
+
+static DS4_MAYBE_UNUSED float motif3_bf16_round_reference(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    bits &= 0xffff0000u;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+/* End-to-end sparse-block diagnostic against the actual MQ87 tensors.
+ * It intentionally uses a single row: the purpose is to prove that the
+ * resident GGUF layout, 384E router, paired IQ2 MMQ, expert-specific
+ * PolyNorm, Q2_K down MMQ and post-down route sum are connected with the
+ * official Motif semantics.  Full model/session tests exercise batching. */
+int ds4_engine_motif3_sparse_test(ds4_engine *e) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    fprintf(stderr, "ds4: Motif-3 sparse test requires a GPU build\n");
+    return 1;
+#else
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MOTIF3 ||
+        e->backend != DS4_BACKEND_CUDA) {
+        fprintf(stderr, "ds4: Motif-3 sparse test requires a CUDA Motif-3 engine\n");
+        return 1;
+    }
+    const uint32_t il = DS4_N_LEADING_DENSE;
+    const ds4_model *model = &e->model;
+    const ds4_layer_weights *layer = &e->weights.layer[il];
+    if (!layer->ffn_gate_inp || !layer->ffn_exp_probs_b ||
+        !layer->ffn_gate_exps || !layer->ffn_up_exps ||
+        !layer->ffn_down_exps || !layer->ffn_polynorm_exps_weight ||
+        !layer->ffn_polynorm_exps_bias ||
+        layer->ffn_gate_inp->type != DS4_TENSOR_F32 ||
+        layer->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+        layer->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
+        layer->ffn_down_exps->type != DS4_TENSOR_Q2_K) {
+        fprintf(stderr, "ds4: Motif-3 sparse test found an unexpected layer layout\n");
+        return 1;
+    }
+
+    const uint32_t n_tokens = 1u;
+    const uint32_t top_k = DS4_N_EXPERT_USED;
+    const uint64_t assignments = (uint64_t)n_tokens * top_k;
+    const uint64_t gate_expert_bytes = layer->ffn_gate_exps->bytes / DS4_N_EXPERT;
+    const uint64_t down_expert_bytes = layer->ffn_down_exps->bytes / DS4_N_EXPERT;
+    float *x = xcalloc(DS4_N_EMBD, sizeof(float));
+    float *cpu_logits = xcalloc(DS4_N_EXPERT, sizeof(float));
+    int32_t *cpu_selected = xcalloc(top_k, sizeof(int32_t));
+    float *cpu_weights = xcalloc(top_k, sizeof(float));
+    float *gpu_gate = xcalloc(assignments * DS4_N_FF_EXP, sizeof(float));
+    float *gpu_up = xcalloc(assignments * DS4_N_FF_EXP, sizeof(float));
+    float *gpu_mid = xcalloc(assignments * DS4_N_FF_EXP, sizeof(float));
+    float *gpu_down = xcalloc(assignments * DS4_N_EMBD, sizeof(float));
+    float *gpu_out = xcalloc(DS4_N_EMBD, sizeof(float));
+    float *mid_ref = xcalloc(DS4_N_FF_EXP, sizeof(float));
+    float *down_ref = xcalloc(DS4_N_EMBD, sizeof(float));
+    float *out_ref = xcalloc(DS4_N_EMBD, sizeof(float));
+    int rc = 1;
+    ds4_gpu_tensor *x_t = NULL, *logits_t = NULL, *bias_t = NULL;
+    ds4_gpu_tensor *selected_t = NULL, *weights_t = NULL, *probs_t = NULL;
+    ds4_gpu_tensor *gate_t = NULL, *up_t = NULL, *mid_t = NULL;
+    ds4_gpu_tensor *down_t = NULL, *out_t = NULL;
+
+    for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+        const int32_t raw = (int32_t)((i * 37u + 13u) % 257u) - 128;
+        x[i] = (float)raw / 256.0f;
+    }
+    matvec_f32(cpu_logits, model, layer->ffn_gate_inp, x);
+    motif3_router_from_logits_reference(
+            cpu_selected, cpu_weights, cpu_logits,
+            tensor_data(model, layer->ffn_exp_probs_b),
+            n_tokens, DS4_N_EXPERT, top_k, DS4_EXPERT_WEIGHT_SCALE);
+
+#define MOTIF3_ALLOC(name, count, type) do {                                    \
+        name##_t = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(type));       \
+        if (!name##_t) {                                                         \
+            fprintf(stderr, "ds4: Motif-3 sparse test GPU allocation failed: %s\n", #name); \
+            goto cleanup;                                                        \
+        }                                                                        \
+    } while (0)
+    MOTIF3_ALLOC(x, DS4_N_EMBD, float);
+    MOTIF3_ALLOC(logits, DS4_N_EXPERT, float);
+    MOTIF3_ALLOC(bias, DS4_N_EXPERT, float);
+    MOTIF3_ALLOC(selected, assignments, int32_t);
+    MOTIF3_ALLOC(weights, assignments, float);
+    MOTIF3_ALLOC(probs, DS4_N_EXPERT, float);
+    MOTIF3_ALLOC(gate, assignments * DS4_N_FF_EXP, float);
+    MOTIF3_ALLOC(up, assignments * DS4_N_FF_EXP, float);
+    MOTIF3_ALLOC(mid, assignments * DS4_N_FF_EXP, float);
+    MOTIF3_ALLOC(down, assignments * DS4_N_EMBD, float);
+    MOTIF3_ALLOC(out, DS4_N_EMBD, float);
+#undef MOTIF3_ALLOC
+
+    if (!ds4_gpu_tensor_write(x_t, 0, x, (uint64_t)DS4_N_EMBD * sizeof(float)) ||
+        !ds4_gpu_tensor_write(bias_t, 0,
+                              tensor_data(model, layer->ffn_exp_probs_b),
+                              (uint64_t)DS4_N_EXPERT * sizeof(float)) ||
+        !ds4_gpu_matmul_f32_tensor(logits_t, model->map, model->size,
+                                   layer->ffn_gate_inp->abs_offset,
+                                   DS4_N_EMBD, DS4_N_EXPERT, x_t, n_tokens) ||
+        !ds4_gpu_motif3_router_select_batch_tensor(
+                selected_t, weights_t, probs_t, logits_t, bias_t,
+                n_tokens, DS4_N_EXPERT, top_k, DS4_EXPERT_WEIGHT_SCALE) ||
+        !ds4_gpu_motif3_routed_moe_batch_tensor(
+                out_t, gate_t, up_t, mid_t, down_t,
+                model->map, model->size,
+                layer->ffn_gate_exps->abs_offset,
+                layer->ffn_up_exps->abs_offset,
+                layer->ffn_down_exps->abs_offset,
+                layer->ffn_polynorm_exps_weight->abs_offset,
+                layer->ffn_polynorm_exps_bias->abs_offset,
+                gate_expert_bytes, down_expert_bytes,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                selected_t, weights_t, DS4_N_EXPERT, top_k,
+                1.0e6f, 0.5f, 0.5f, 1.0e-6f, x_t, n_tokens)) {
+        fprintf(stderr, "ds4: Motif-3 sparse CUDA dispatch failed\n");
+        goto cleanup;
+    }
+
+    int32_t gpu_selected[DS4_MAX_EXPERT_USED];
+    float gpu_weights[DS4_MAX_EXPERT_USED];
+    if (!ds4_gpu_tensor_read(selected_t, 0, gpu_selected,
+                             assignments * sizeof(gpu_selected[0])) ||
+        !ds4_gpu_tensor_read(weights_t, 0, gpu_weights,
+                             assignments * sizeof(gpu_weights[0])) ||
+        !ds4_gpu_tensor_read(gate_t, 0, gpu_gate,
+                             assignments * DS4_N_FF_EXP * sizeof(float)) ||
+        !ds4_gpu_tensor_read(up_t, 0, gpu_up,
+                             assignments * DS4_N_FF_EXP * sizeof(float)) ||
+        !ds4_gpu_tensor_read(mid_t, 0, gpu_mid,
+                             assignments * DS4_N_FF_EXP * sizeof(float)) ||
+        !ds4_gpu_tensor_read(down_t, 0, gpu_down,
+                             assignments * DS4_N_EMBD * sizeof(float)) ||
+        !ds4_gpu_tensor_read(out_t, 0, gpu_out,
+                             (uint64_t)DS4_N_EMBD * sizeof(float))) {
+        fprintf(stderr, "ds4: Motif-3 sparse CUDA readback failed\n");
+        goto cleanup;
+    }
+    for (uint32_t slot = 0; slot < top_k; slot++) {
+        if (gpu_selected[slot] != cpu_selected[slot] ||
+            fabsf(gpu_weights[slot] - cpu_weights[slot]) > 2.0e-5f) {
+            fprintf(stderr,
+                    "ds4: Motif-3 router mismatch at slot %u: gpu=(%d,%.8g) cpu=(%d,%.8g)\n",
+                    slot, gpu_selected[slot], gpu_weights[slot],
+                    cpu_selected[slot], cpu_weights[slot]);
+            goto cleanup;
+        }
+    }
+
+    double mid_err2 = 0.0, mid_ref2 = 0.0;
+    double down_dot = 0.0, down_gpu2 = 0.0, down_ref2 = 0.0;
+    const float *all_coeff = tensor_data(model, layer->ffn_polynorm_exps_weight);
+    const float *all_bias = tensor_data(model, layer->ffn_polynorm_exps_bias);
+    for (uint32_t slot = 0; slot < top_k; slot++) {
+        const uint32_t expert = (uint32_t)gpu_selected[slot];
+        motif3_polynorm_mul_reference(
+                mid_ref,
+                gpu_gate + (uint64_t)slot * DS4_N_FF_EXP,
+                gpu_up + (uint64_t)slot * DS4_N_FF_EXP,
+                all_coeff + (uint64_t)expert * 3u,
+                all_bias[expert], 1u, DS4_N_FF_EXP,
+                1.0e6f, 0.5f, 1.0f, 1.0e-6f);
+        for (uint32_t j = 0; j < DS4_N_FF_EXP; j++) {
+            float v = fmaxf(-1.0e6f, fminf(1.0e6f, mid_ref[j]));
+            v = motif3_bf16_round_reference(v) * 0.5f;
+            const double d = (double)gpu_mid[(uint64_t)slot * DS4_N_FF_EXP + j] - v;
+            mid_ref[j] = v;
+            mid_err2 += d * d;
+            mid_ref2 += (double)v * v;
+        }
+        matvec_expert_down(down_ref, model, layer->ffn_down_exps,
+                           mid_ref, expert);
+        for (uint32_t j = 0; j < DS4_N_EMBD; j++) {
+            const float gv = gpu_down[(uint64_t)slot * DS4_N_EMBD + j];
+            const float rv = down_ref[j];
+            down_dot += (double)gv * rv;
+            down_gpu2 += (double)gv * gv;
+            down_ref2 += (double)rv * rv;
+            out_ref[j] += rv * gpu_weights[slot];
+        }
+    }
+    const double mid_nrmse = sqrt(mid_err2 / fmax(mid_ref2, 1.0e-30));
+    const double down_cos = down_dot /
+        sqrt(fmax(down_gpu2 * down_ref2, 1.0e-30));
+    double out_err2 = 0.0, out_ref2 = 0.0, out_dot = 0.0, out_gpu2 = 0.0;
+    for (uint32_t j = 0; j < DS4_N_EMBD; j++) {
+        const double d = (double)gpu_out[j] - out_ref[j];
+        out_err2 += d * d;
+        out_ref2 += (double)out_ref[j] * out_ref[j];
+        out_dot += (double)gpu_out[j] * out_ref[j];
+        out_gpu2 += (double)gpu_out[j] * gpu_out[j];
+    }
+    const double out_nrmse = sqrt(out_err2 / fmax(out_ref2, 1.0e-30));
+    const double out_cos = out_dot / sqrt(fmax(out_gpu2 * out_ref2, 1.0e-30));
+    if (!isfinite(mid_nrmse) || !isfinite(down_cos) ||
+        !isfinite(out_nrmse) || !isfinite(out_cos) ||
+        mid_nrmse > 2.0e-4 || down_cos < 0.995 || out_cos < 0.995 ||
+        out_nrmse > 0.15) {
+        fprintf(stderr,
+                "ds4: Motif-3 sparse parity failed: mid_nrmse=%.6g "
+                "down_cos=%.8f out_nrmse=%.6g out_cos=%.8f\n",
+                mid_nrmse, down_cos, out_nrmse, out_cos);
+        goto cleanup;
+    }
+    printf("Motif-3 MQ87 sparse layer %u: router 384E top-%u exact, "
+           "PolyNorm nrmse=%.3g, Q2 down cos=%.7f, output cos=%.7f nrmse=%.3g\n",
+           il, top_k, mid_nrmse, down_cos, out_cos, out_nrmse);
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(out_t);
+    ds4_gpu_tensor_free(down_t);
+    ds4_gpu_tensor_free(mid_t);
+    ds4_gpu_tensor_free(up_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(probs_t);
+    ds4_gpu_tensor_free(weights_t);
+    ds4_gpu_tensor_free(selected_t);
+    ds4_gpu_tensor_free(bias_t);
+    ds4_gpu_tensor_free(logits_t);
+    ds4_gpu_tensor_free(x_t);
+    free(out_ref);
+    free(down_ref);
+    free(mid_ref);
+    free(gpu_out);
+    free(gpu_down);
+    free(gpu_mid);
+    free(gpu_up);
+    free(gpu_gate);
+    free(cpu_weights);
+    free(cpu_selected);
+    free(cpu_logits);
+    free(x);
+    return rc;
+#endif
+}
+
+int ds4_engine_motif3_forward_test(ds4_engine *e, const ds4_tokens *prompt) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)prompt;
+    fprintf(stderr, "ds4: Motif-3 forward test requires a GPU build\n");
+    return 1;
+#else
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MOTIF3 ||
+        e->backend != DS4_BACKEND_CUDA || !prompt || prompt->len <= 0 ||
+        prompt->len > 256) {
+        fprintf(stderr,
+                "ds4: Motif-3 forward test requires CUDA and 1..256 prompt tokens\n");
+        return 1;
+    }
+    ds4_motif3_gpu_graph graph;
+    if (!motif3_graph_alloc(&graph, (uint32_t)prompt->len)) return 1;
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+    const double t0 = now_sec();
+    const bool ok = motif3_graph_forward_prompt(
+            &graph, &e->model, &e->weights, prompt->v,
+            (uint32_t)prompt->len, logits);
+    const double elapsed = now_sec() - t0;
+    int best[8];
+    for (int i = 0; i < 8; i++) best[i] = -1;
+    bool finite = ok;
+    if (ok) {
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            if (!isfinite(logits[i])) {
+                finite = false;
+                break;
+            }
+            for (int j = 0; j < 8; j++) {
+                if (best[j] < 0 || logits[i] > logits[best[j]]) {
+                    for (int k = 7; k > j; k--) best[k] = best[k - 1];
+                    best[j] = (int)i;
+                    break;
+                }
+            }
+        }
+    }
+    if (finite) {
+        printf("Motif-3 MQ87 native expanded prefill: %d tokens, %.3f s, "
+               "%.2f tok/s; finite logits; top-8:\n",
+               prompt->len, elapsed,
+               elapsed > 0.0 ? (double)prompt->len / elapsed : 0.0);
+        for (int i = 0; i < 8; i++) {
+            const int token = best[i];
+            printf("  %6d  %10.4f  %.*s\n", token, logits[token],
+                   (int)e->vocab.token[token].len,
+                   e->vocab.token[token].ptr);
+        }
+    } else {
+        fprintf(stderr,
+                "ds4: Motif-3 native expanded forward produced invalid logits\n");
+    }
+    float *latent_logits = xmalloc(
+            (size_t)DS4_N_VOCAB * sizeof(latent_logits[0]));
+    const double latent_t0 = now_sec();
+    bool latent_ok = finite &&
+        motif3_graph_alloc_latent_cache(&graph, (uint32_t)prompt->len) &&
+        motif3_graph_forward_chunk(
+                &graph, &e->model, &e->weights, prompt->v,
+                (uint32_t)prompt->len, 0u, latent_logits);
+    const double latent_elapsed = now_sec() - latent_t0;
+    int latent_best[8];
+    for (int i = 0; i < 8; i++) latent_best[i] = -1;
+    double err2 = 0.0, ref2 = 0.0, got2 = 0.0, dot = 0.0;
+    if (latent_ok) {
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            if (!isfinite(latent_logits[i])) {
+                latent_ok = false;
+                break;
+            }
+            const double d = (double)latent_logits[i] - logits[i];
+            err2 += d * d;
+            ref2 += (double)logits[i] * logits[i];
+            got2 += (double)latent_logits[i] * latent_logits[i];
+            dot += (double)latent_logits[i] * logits[i];
+            for (int j = 0; j < 8; j++) {
+                if (latent_best[j] < 0 ||
+                    latent_logits[i] > latent_logits[latent_best[j]]) {
+                    for (int k = 7; k > j; k--)
+                        latent_best[k] = latent_best[k - 1];
+                    latent_best[j] = (int)i;
+                    break;
+                }
+            }
+        }
+    }
+    const double nrmse = sqrt(err2 / fmax(ref2, 1.0e-30));
+    const double cosine = dot / sqrt(fmax(ref2 * got2, 1.0e-30));
+    int top8_overlap = 0;
+    if (latent_ok) {
+        for (int i = 0; i < 8; i++) for (int j = 0; j < 8; j++)
+            if (latent_best[i] == best[j]) top8_overlap++;
+        printf("Motif-3 latent/expanded parity: first=%d/%d, "
+               "logit_cos=%.8f nrmse=%.6g top8_overlap=%d/8, "
+               "latent %.3f s (%.2f tok/s)\n",
+               latent_best[0], best[0], cosine, nrmse, top8_overlap,
+               latent_elapsed,
+               latent_elapsed > 0.0 ?
+                   (double)prompt->len / latent_elapsed : 0.0);
+    }
+    latent_ok = latent_ok && latent_best[0] == best[0] &&
+                cosine >= 0.95 && nrmse <= 0.35 && top8_overlap >= 4;
+    if (!latent_ok) {
+        fprintf(stderr,
+                "ds4: Motif-3 latent/expanded parity gate failed: "
+                "cos=%.8f nrmse=%.6g overlap=%d\n",
+                cosine, nrmse, top8_overlap);
+    }
+    float *mtp_logits = xmalloc(
+            (size_t)DS4_N_VOCAB * sizeof(mtp_logits[0]));
+    const double mtp_t0 = now_sec();
+    bool mtp_ok = latent_ok && motif3_graph_forward_mtp_diagnostic(
+            &graph, &e->model, &e->weights, prompt->v,
+            (uint32_t)prompt->len, mtp_logits);
+    const double mtp_elapsed = now_sec() - mtp_t0;
+    int mtp_best = -1;
+    uint32_t target_rank = 0;
+    const int teacher_target = prompt->v[prompt->len - 1];
+    if (mtp_ok) {
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            if (!isfinite(mtp_logits[i])) {
+                mtp_ok = false;
+                break;
+            }
+            if (mtp_best < 0 || mtp_logits[i] > mtp_logits[mtp_best])
+                mtp_best = (int)i;
+        }
+    }
+    if (mtp_ok) {
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++)
+            if (mtp_logits[i] > mtp_logits[teacher_target]) target_rank++;
+        target_rank++;
+        printf("Motif-3 MTP real-weight diagnostic: %d teacher-forced rows, "
+               "finite logits, draft=%d teacher=%d rank=%u, %.3f s\n",
+               prompt->len - 2, mtp_best, teacher_target,
+               target_rank, mtp_elapsed);
+    } else {
+        fprintf(stderr, "ds4: Motif-3 MTP real-weight diagnostic failed\n");
+    }
+    finite = finite && latent_ok && mtp_ok;
+    free(mtp_logits);
+    free(latent_logits);
+    free(logits);
+    motif3_graph_free(&graph);
+    return finite ? 0 : 1;
+#endif
 }
 
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
@@ -39085,6 +42147,8 @@ int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size) {
     if (!e || ctx_size <= 0) return 0;
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CPU) return 1;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3)
+        return e->backend == DS4_BACKEND_CUDA && ctx_size <= 262144;
     const uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
     return metal_graph_session_fit_check(&e->weights, &e->weights.layer[0],
@@ -39098,6 +42162,49 @@ int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        /* Production Motif sessions keep only normalized latent KV + rotated
+         * k_pe.  Expanded historical K/V is reserved for the independent
+         * short-context diagnostic executor above. */
+#ifdef DS4_NO_GPU
+        fprintf(stderr, "ds4: Motif-3 sessions require the CUDA backend\n");
+        return 1;
+#else
+        if (ctx_size > 262144 || e->backend != DS4_BACKEND_CUDA ||
+            !e->metal_ready ||
+            e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr,
+                    "ds4: Motif-3 native sessions require one resident CUDA model\n");
+            return 1;
+        }
+        ds4_session *s = xcalloc(1, sizeof(*s));
+        s->engine = e;
+        s->ctx_size = ctx_size;
+        s->generation = 1u;
+        uint32_t motif_chunk = 256u;
+        const char *chunk_env = getenv("DS4_MOTIF3_PREFILL_CHUNK");
+        if (chunk_env && chunk_env[0]) {
+            char *end = NULL;
+            const unsigned long value = strtoul(chunk_env, &end, 10);
+            if (end != chunk_env && *end == '\0' && value <= UINT32_MAX)
+                motif_chunk = (uint32_t)value;
+        }
+        if (motif_chunk == 0u) motif_chunk = 1u;
+        if (motif_chunk > 256u) motif_chunk = 256u;
+        if (motif_chunk > (uint32_t)ctx_size) motif_chunk = (uint32_t)ctx_size;
+        s->prefill_cap = motif_chunk;
+        if (!motif3_graph_alloc(&s->motif3_graph, s->prefill_cap) ||
+            !motif3_graph_alloc_latent_cache(
+                    &s->motif3_graph, (uint32_t)ctx_size)) {
+            free(s);
+            return 1;
+        }
+        s->motif3_graph_ready = true;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        *out = s;
+        return 0;
+#endif
+    }
     if (e->backend == DS4_BACKEND_CPU) {
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
@@ -39172,7 +42279,12 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
-        metal_graph_free(&s->graph);
+        if (ds4_session_is_motif3(s)) {
+            motif3_graph_free(&s->motif3_graph);
+            s->motif3_graph_ready = false;
+        } else {
+            metal_graph_free(&s->graph);
+        }
     }
 #endif
     token_vec_free(&s->checkpoint);
@@ -39202,7 +42314,8 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
     s->engine->power_percent = power_percent;
 #ifndef DS4_NO_GPU
-    if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
+    if (!ds4_session_is_cpu(s) && !ds4_session_is_motif3(s))
+        s->graph.power_percent = (uint32_t)power_percent;
 #endif
     return 0;
 }
@@ -39648,6 +42761,53 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
     }
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_motif3(s)) {
+        if (!s->motif3_graph_ready ||
+            !s->motif3_graph.latent_cache_ready) {
+            snprintf(err, errlen, "Motif-3 latent session is not initialized");
+            return 1;
+        }
+        int start = 0;
+        if (s->checkpoint_valid &&
+            s->motif3_graph.cache_len == (uint32_t)s->checkpoint.len &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+            if (start == prompt->len) return 0;
+        } else {
+            s->checkpoint_valid = false;
+            s->checkpoint.len = 0;
+            s->motif3_graph.cache_len = 0;
+        }
+        while (start < prompt->len) {
+            uint32_t rows = (uint32_t)(prompt->len - start);
+            if (rows > s->prefill_cap) rows = s->prefill_cap;
+            const bool last = start + (int)rows == prompt->len;
+            if (!motif3_graph_forward_chunk(
+                        &s->motif3_graph, &s->engine->model,
+                        &s->engine->weights, prompt->v + start,
+                        rows, (uint32_t)start, last ? s->logits : NULL)) {
+                snprintf(err, errlen,
+                         "CUDA Motif-3 latent prefill failed at position %d",
+                         start);
+                s->checkpoint_valid = false;
+                s->checkpoint.len = 0;
+                s->motif3_graph.cache_len = 0;
+                return 1;
+            }
+            start += (int)rows;
+            if (s->progress) {
+                s->progress(s->progress_ud, "prefill_chunk",
+                            start, prompt->len);
+            }
+        }
+        ds4_tokens_copy(&s->checkpoint, prompt);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
         /* Inc 5a: the distributed path manages the checkpoint internally, so
@@ -40022,6 +43182,35 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
     if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
     ds4_engine *e = s->engine;
+    if (ds4_session_is_motif3(s)) {
+        if (!s->motif3_graph_ready || !s->checkpoint_valid) {
+            if (errlen) snprintf(err, errlen,
+                                 "Motif-3 session requires a valid prefill checkpoint");
+            return 1;
+        }
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        if (pos >= (uint32_t)s->ctx_size ||
+            pos != s->motif3_graph.cache_len) {
+            if (errlen) snprintf(err, errlen,
+                                 "Motif-3 latent cache/context boundary reached");
+            return 1;
+        }
+        const bool ok = motif3_graph_forward_chunk(
+                &s->motif3_graph, &e->model, &e->weights,
+                &token, 1u, pos, s->logits);
+        if (!ok) {
+            if (errlen) snprintf(err, errlen,
+                                 "CUDA Motif-3 latent decode failed");
+            s->checkpoint_valid = false;
+            s->motif3_graph.cache_len = 0;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        (void)probe_mtp;
+        return 0;
+    }
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&

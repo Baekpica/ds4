@@ -13,6 +13,8 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
+DS4_MOTIF3_MODEL ?=
+DS4_MOTIF3_FIXTURES ?= ../motif-3-mixed-ds4/fixtures/official-final
 CUDA_EXTRA_BINS :=
 
 ifeq ($(UNAME_S),Darwin)
@@ -68,7 +70,9 @@ CUDA_EXTRA_BINS := ds4_weight_server
 endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression \
-        proof-cuda-smoke proof-cuda-long proof-cuda-opp-c print-version
+        proof-cuda-smoke proof-cuda-long proof-cuda-opp-c print-version \
+        test-motif3-loader test-motif3-reference test-motif3-tokenizer \
+        test-motif3-cuda test-motif3-resident
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -312,5 +316,56 @@ test: ds4_test ds4-eval
 	./ds4-eval --self-test-extractors
 	./ds4_test
 
+# Metadata and full tensor-layout smoke. The structural GGUF is sparse, so
+# this validates all descriptors without materializing an 88 GiB copy.
+tests/test_motif3_loader: tests/test_motif3_loader.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-motif3-loader: tests/test_motif3_loader
+	@test -n "$(DS4_MOTIF3_MODEL)" || \
+		{ echo "set DS4_MOTIF3_MODEL to the structural or completed GGUF" >&2; exit 2; }
+	./tests/test_motif3_loader "$(DS4_MOTIF3_MODEL)"
+
+tests/test_motif3_reference: tests/test_motif3_reference.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-motif3-reference: tests/test_motif3_reference
+	./tests/test_motif3_reference "$(DS4_MOTIF3_FIXTURES)"
+
+tests/test_motif3_tokenizer: tests/test_motif3_tokenizer.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-motif3-tokenizer: tests/test_motif3_tokenizer
+	@test -n "$(DS4_MOTIF3_MODEL)" || \
+		{ echo "set DS4_MOTIF3_MODEL to the structural or completed GGUF" >&2; exit 2; }
+	./tests/test_motif3_tokenizer "$(DS4_MOTIF3_MODEL)" \
+		"$(DS4_MOTIF3_FIXTURES)/tokenizer-chat.ds4tok"
+
+ifneq ($(UNAME_S),Darwin)
+tests/test_motif3_cuda: tests/test_motif3_cuda.cu ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< ds4_cuda.o $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+test-motif3-cuda: tests/test_motif3_cuda
+	./tests/test_motif3_cuda "$(DS4_MOTIF3_FIXTURES)"
+
+tests/test_motif3_resident.o: tests/test_motif3_resident.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_motif3_resident: tests/test_motif3_resident.o ds4_kvstore.o rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-motif3-resident: tests/test_motif3_resident
+	CUDA_VISIBLE_DEVICES=0 ./tests/test_motif3_resident "$(DS4_MOTIF3_MODEL)"
+
+tests/test_motif3_long.o: tests/test_motif3_long.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_motif3_long: tests/test_motif3_long.o ds4_kvstore.o rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+endif
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_long.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

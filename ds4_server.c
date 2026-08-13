@@ -471,6 +471,22 @@ fail:
     return false;
 }
 
+static bool json_string_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_string(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
+static bool json_raw_value_replace(const char **p, char **dst) {
+    char *tmp = NULL;
+    if (!json_raw_value(p, &tmp)) return false;
+    free(*dst);
+    *dst = tmp;
+    return true;
+}
+
 typedef enum {
     REQ_CHAT,
     REQ_COMPLETION,
@@ -481,6 +497,11 @@ typedef enum {
     API_ANTHROPIC,
     API_RESPONSES,
 } api_style;
+
+typedef enum {
+    SERVER_MODEL_SYNTAX_DEEPSEEK,
+    SERVER_MODEL_SYNTAX_MOTIF3,
+} server_model_syntax;
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
     static uint64_t fallback_ctr;
@@ -517,6 +538,7 @@ typedef struct {
     int len;
     int cap;
     char *raw_dsml;
+    char *raw_tool_text;
 } tool_calls;
 
 typedef struct {
@@ -608,6 +630,7 @@ typedef struct {
 typedef struct {
     req_kind kind;
     api_style api;
+    server_model_syntax model_syntax;
     ds4_tokens prompt;
     char *model;
     bool model_from_request;
@@ -696,6 +719,7 @@ static void tool_call_free(tool_call *tc) {
 static void tool_calls_free(tool_calls *calls) {
     for (int i = 0; i < calls->len; i++) tool_call_free(&calls->v[i]);
     free(calls->raw_dsml);
+    free(calls->raw_tool_text);
     free(calls->v);
     memset(calls, 0, sizeof(*calls));
 }
@@ -810,6 +834,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
+    r->model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
     r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
     r->top_k = 0;
@@ -1007,7 +1032,27 @@ static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
 }
 
+static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_model_id(engine) == 3) return SERVER_MODEL_SYNTAX_MOTIF3;
+    return SERVER_MODEL_SYNTAX_DEEPSEEK;
+}
+
+/* Family-aware generation stop.  ds4_token_is_stop is the engine's official
+ * stop set (for DeepSeek exactly EOS; Motif-3 additionally stops on the
+ * <|user|> and <|endofturn|> ids its generation_config pins).  The
+ * think-control clause is Motif-only: in no-think mode a bare <think>/</think>
+ * special token is turn drift, and ending the turn there keeps it out of
+ * OpenAI content -- DeepSeek keeps upstream behavior (its think ids stream as
+ * text). */
+static bool server_token_ends_generation(ds4_engine *engine,
+                                         const request *r, int token) {
+    if (ds4_token_is_stop(engine, token)) return true;
+    return r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 &&
+           ds4_token_is_stop_for_think_mode(engine, token, r->think_mode);
+}
+
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_model_id(engine) == 3) return "motif-3";
     return ds4_engine_model_id(engine) == 1 ?
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
@@ -1015,7 +1060,9 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro"));
+            !strcmp(id, "deepseek-v4-pro") ||
+            !strcmp(id, "motif-3") ||
+            !strcmp(id, "Motif-Technologies/Motif-3"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -2367,6 +2414,22 @@ static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
     buf_puts(b, "</｜DSML｜tool_calls>");
 }
 
+static void append_motif3_tool_calls_text(buf *out,
+                                          const tool_calls *calls,
+                                          bool include_ids);
+
+static void append_tool_calls_text_for_syntax(buf *b,
+                                              server_model_syntax syntax,
+                                              const tool_calls *calls,
+                                              const tool_schema_orders *tool_orders) {
+    (void)tool_orders;
+    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
+        append_motif3_tool_calls_text(b, calls, true);
+    } else {
+        append_dsml_tool_calls_text(b, calls);
+    }
+}
+
 static bool role_is_system(const char *role) {
     return !strcmp(role, "system") || !strcmp(role, "developer");
 }
@@ -2469,6 +2532,167 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     return buf_take(&out);
 }
 
+static void motif3_buf_put_trimmed(buf *out, const char *text) {
+    const char *begin = text ? text : "";
+    while (*begin && isspace((unsigned char)*begin)) begin++;
+    const char *end = begin + strlen(begin);
+    while (end > begin && isspace((unsigned char)end[-1])) end--;
+    buf_append(out, begin, (size_t)(end - begin));
+}
+
+static void append_motif3_tool_calls_text(buf *out,
+                                          const tool_calls *calls,
+                                          bool include_ids) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        buf_puts(out, calls->raw_tool_text);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        buf_puts(out, "\n<tool_call>{\"name\": ");
+        json_escape(out, tc->name ? tc->name : "");
+        buf_puts(out, ", \"arguments\": ");
+        if (tc->arguments && tc->arguments[0])
+            buf_puts(out, tc->arguments);
+        else
+            buf_puts(out, "null");
+        if (include_ids && tc->id && tc->id[0]) {
+            buf_puts(out, ", \"id\": ");
+            json_escape(out, tc->id);
+        }
+        buf_puts(out, "}</tool_call>");
+    }
+}
+
+static void append_motif3_tools_system_text(
+        buf *out, const char *tool_schemas,
+        const tool_schema_orders *tool_orders) {
+    buf_puts(out,
+        "# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n\n"
+        "<tools>");
+    const char *p = tool_schemas ? tool_schemas : "";
+    while (*p) {
+        const char *end = strchr(p, '\n');
+        buf_putc(out, '\n');
+        if (end) {
+            buf_append(out, p, (size_t)(end - p));
+            p = end + 1;
+        } else {
+            buf_puts(out, p);
+            break;
+        }
+    }
+    buf_puts(out,
+        "\n</tools>"
+        "\n\nFor each function call, output in JSON within <tool_call> tags:\n");
+    for (int i = 0; tool_orders && i < tool_orders->len; i++) {
+        const tool_schema_order *order = &tool_orders->v[i];
+        buf_puts(out, "\n<tool_call>{\"name\": ");
+        json_escape(out, order->name ? order->name : "");
+        buf_puts(out, ", \"arguments\": {");
+        for (int j = 0; j < order->len; j++) {
+            if (j) buf_puts(out, ", ");
+            json_escape(out, order->prop[j]);
+            buf_puts(out, ": <");
+            buf_puts(out, order->prop[j]);
+            buf_putc(out, '>');
+        }
+        buf_puts(out, "}}</tool_call>");
+    }
+}
+
+/* Byte-for-byte rendering of the official final Motif-3 chat protocol.  The
+ * pinned chat_template.jinja uses start/end-of-turn framing for every role and
+ * a paired <think></think> generation prefix when reasoning is disabled. */
+static char *render_motif3_chat_prompt_text(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders,
+        ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    const bool have_tools = tool_schemas && tool_schemas[0];
+    const bool first_system = msgs && msgs->len > 0 &&
+        role_is_system(msgs->v[0].role);
+    int last_assistant = -1;
+    for (int i = 0; msgs && i < msgs->len; i++)
+        if (!strcmp(msgs->v[i].role, "assistant")) last_assistant = i;
+
+    buf out = {0};
+    buf_puts(&out, "<|beginoftext|>");
+    if (have_tools) {
+        buf_puts(&out, "<|startofturn|><|system|>");
+        append_motif3_tools_system_text(&out, tool_schemas, tool_orders);
+        if (first_system) {
+            buf_puts(&out, "\n\n");
+            buf_puts(&out, msgs->v[0].content ? msgs->v[0].content : "");
+        }
+        buf_puts(&out, "<|endofturn|>");
+    } else if (first_system) {
+        buf_puts(&out, "<|startofturn|><|system|>");
+        buf_puts(&out, msgs->v[0].content ? msgs->v[0].content : "");
+        buf_puts(&out, "<|endofturn|>");
+    }
+
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (i == 0 && first_system) {
+            continue;
+        } else if (role_is_system(m->role)) {
+            buf_puts(&out, "<|startofturn|><|system|>");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|endofturn|>");
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<|startofturn|><|user|>");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|endofturn|>");
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&out, "<|startofturn|><|assistant|>");
+            if (m->reasoning && m->reasoning[0] &&
+                (have_tools || i == last_assistant)) {
+                buf_puts(&out, "<think>");
+                motif3_buf_put_trimmed(&out, m->reasoning);
+                buf_puts(&out, "</think>");
+            }
+            motif3_buf_put_trimmed(&out, m->content);
+            append_motif3_tool_calls_text(&out, &m->calls, true);
+            buf_puts(&out, "<|endofturn|>");
+        } else if (!strcmp(m->role, "tool") ||
+                   !strcmp(m->role, "function")) {
+            const bool group_start = i == 0 ||
+                (strcmp(msgs->v[i - 1].role, "tool") &&
+                 strcmp(msgs->v[i - 1].role, "function"));
+            const bool group_end = i + 1 == msgs->len ||
+                (strcmp(msgs->v[i + 1].role, "tool") &&
+                 strcmp(msgs->v[i + 1].role, "function"));
+            if (group_start) buf_puts(&out, "<|startofturn|><|tool|>");
+            buf_puts(&out, "<tool_response>{\"tool_call_id\": ");
+            json_escape(&out, m->tool_call_id ? m->tool_call_id : "");
+            buf_puts(&out, ", \"content\": ");
+            json_escape(&out, m->content ? m->content : "");
+            buf_puts(&out, "}</tool_response>");
+            if (group_end) buf_puts(&out, "<|endofturn|>");
+        }
+    }
+
+    buf_puts(&out, "<|startofturn|><|assistant|><think>");
+    if (!think) buf_puts(&out, "</think>");
+    return buf_take(&out);
+}
+
+static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
+                                                const chat_msgs *msgs,
+                                                const char *tool_schemas,
+                                                const tool_schema_orders *tool_orders,
+                                                ds4_think_mode think_mode) {
+    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
+        return render_motif3_chat_prompt_text(msgs, tool_schemas,
+                                              tool_orders, think_mode);
+    }
+    return render_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
+}
+
 /* Render only the semantic tail that must be appended to the live KV for a
  * tool-result continuation.
  *
@@ -2541,6 +2765,55 @@ static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
         if (m->calls.v[i].id && !strcmp(m->calls.v[i].id, id)) return true;
     }
     return false;
+}
+
+static char *render_motif3_live_tool_tail(
+        const chat_msgs *msgs, int start,
+        ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    buf_puts(&out, "<|endofturn|>");
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            buf_puts(&out, "<|startofturn|><|system|>");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|endofturn|>");
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<|startofturn|><|user|>");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|endofturn|>");
+        } else if (!strcmp(m->role, "tool") ||
+                   !strcmp(m->role, "function")) {
+            const bool group_start = i == start ||
+                (strcmp(msgs->v[i - 1].role, "tool") &&
+                 strcmp(msgs->v[i - 1].role, "function"));
+            const bool group_end = i + 1 == msgs->len ||
+                (strcmp(msgs->v[i + 1].role, "tool") &&
+                 strcmp(msgs->v[i + 1].role, "function"));
+            if (group_start) buf_puts(&out, "<|startofturn|><|tool|>");
+            buf_puts(&out, "<tool_response>{\"tool_call_id\": ");
+            json_escape(&out, m->tool_call_id ? m->tool_call_id : "");
+            buf_puts(&out, ", \"content\": ");
+            json_escape(&out, m->content ? m->content : "");
+            buf_puts(&out, "}</tool_response>");
+            if (group_end) buf_puts(&out, "<|endofturn|>");
+        }
+    }
+    buf_puts(&out, "<|startofturn|><|assistant|><think>");
+    if (!think) buf_puts(&out, "</think>");
+    return buf_take(&out);
+}
+
+static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
+                                              const chat_msgs *msgs, int start,
+                                              const tool_schema_orders *tool_orders,
+                                              ds4_think_mode think_mode) {
+    (void)tool_orders;
+    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
+        return render_motif3_live_tool_tail(msgs, start, think_mode);
+    }
+    return render_live_tool_tail(msgs, start, think_mode);
 }
 
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
@@ -2653,7 +2926,8 @@ static void responses_prepare_live_continuation(request *r,
 
     free(r->responses_live_suffix_text);
     r->responses_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->think_mode);
+        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
+                                         &r->tool_orders, r->think_mode);
 }
 
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
@@ -2731,7 +3005,8 @@ static void anthropic_prepare_live_continuation(request *r,
 
     free(r->anthropic_live_suffix_text);
     r->anthropic_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->think_mode);
+        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
+                                         &r->tool_orders, r->think_mode);
 }
 
 /* The API parsers are intentionally selective JSON parsers: they keep only
@@ -2741,6 +3016,7 @@ static void anthropic_prepare_live_continuation(request *r,
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
@@ -2914,8 +3190,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_for_syntax(
+        r->model_syntax, &msgs, active_tool_schemas,
+        &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
@@ -2932,6 +3209,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
+    r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
@@ -3138,8 +3416,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_for_syntax(
+        r->model_syntax, &msgs, active_tool_schemas,
+        &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
@@ -3836,6 +4115,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
+    r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_input = false;
     bool tool_choice_none = false;
@@ -4092,8 +4372,9 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
     request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_for_syntax(
+        r->model_syntax, &msgs, active_tool_schemas,
+        &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
@@ -4144,6 +4425,7 @@ static bool parse_prompt(const char **p, char **out) {
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
+    r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
@@ -4284,14 +4566,33 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
-    buf rendered = {0};
-    buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
-    buf_puts(&rendered, ds4_think_effort_prefix(r->think_mode));
-    buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
-    buf_puts(&rendered, prompt);
-    buf_puts(&rendered, "<｜Assistant｜>");
-    buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
-    r->prompt_text = buf_take(&rendered);
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
+        /* The raw-completion surface still speaks the loaded model's own
+         * protocol: one default-system + user turn through the official
+         * Motif template, byte-identical to the chat path's renderer. */
+        chat_msgs msgs = {0};
+        chat_msg sys = {0};
+        sys.role = xstrdup("system");
+        sys.content = xstrdup("You are a helpful assistant");
+        chat_msgs_push(&msgs, sys);
+        chat_msg user_msg = {0};
+        user_msg.role = xstrdup("user");
+        user_msg.content = prompt;
+        prompt = NULL;
+        chat_msgs_push(&msgs, user_msg);
+        r->prompt_text = render_chat_prompt_text_for_syntax(
+            r->model_syntax, &msgs, NULL, NULL, r->think_mode);
+        chat_msgs_free(&msgs);
+    } else {
+        buf rendered = {0};
+        buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
+        buf_puts(&rendered, ds4_think_effort_prefix(r->think_mode));
+        buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
+        buf_puts(&rendered, prompt);
+        buf_puts(&rendered, "<｜Assistant｜>");
+        buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+        r->prompt_text = buf_take(&rendered);
+    }
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;
@@ -4429,6 +4730,7 @@ static const char *find_any_tool_start(const char *s) {
         strstr(s, DS4_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START_SHORT),
         strstr(s, "<tool_calls>"),
+        strstr(s, "<tool_call>"),      /* Motif-3 per-call wrapper */
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -4442,6 +4744,7 @@ static const char *find_any_tool_end(const char *s) {
         strstr(s, DS4_TOOL_CALLS_END),
         strstr(s, DS4_TOOL_CALLS_END_SHORT),
         strstr(s, "</tool_calls>"),
+        strstr(s, "</tool_call>"),     /* Motif-3 per-call wrapper */
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -4641,6 +4944,29 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+static void ds4_local_unterminated_reasoning(const char *text,
+                                             char **content_out,
+                                             char **reasoning_out) {
+    const char *body = text ? text : "";
+    if (!strncmp(body, "<think>", 7)) body += 7;
+    *reasoning_out = xstrdup(body);
+    *content_out = xstrdup("");
+}
+
+static void ds4_unterminated_reasoning_before_tool(const char *text,
+                                                   size_t prefix_len,
+                                                   char **content_out,
+                                                   char **reasoning_out) {
+    const char *body = text ? text : "";
+    if (prefix_len > strlen(body)) prefix_len = strlen(body);
+    if (prefix_len >= 7 && !strncmp(body, "<think>", 7)) {
+        body += 7;
+        prefix_len -= 7;
+    }
+    *reasoning_out = xstrndup(body, prefix_len);
+    *content_out = xstrdup("");
+}
+
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
@@ -4821,6 +5147,142 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     }
 }
 
+static bool parse_motif3_tool_call_json(const char *json, tool_call *tc) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto bad;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto bad;
+        }
+        p++;
+        if (!strcmp(key, "name")) {
+            if (!json_string_replace(&p, &tc->name)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "arguments")) {
+            if (!json_raw_value_replace(&p, &tc->arguments)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "id")) {
+            if (!json_string_replace(&p, &tc->id)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p || !tc->name || !tc->name[0]) goto bad;
+    if (!tc->arguments) tc->arguments = xstrdup("null");
+    return true;
+bad:
+    tool_call_free(tc);
+    return false;
+}
+
+/* Official Motif-3 emits one compact JSON object per <tool_call> wrapper.
+ * Keep the exact sampled wrapper for cache replay while returning structured
+ * OpenAI/Responses/Anthropic calls to clients. */
+static bool parse_motif3_generated_message_ex(const char *text,
+                                              bool require_thinking_closed,
+                                              char **content_out,
+                                              char **reasoning_out,
+                                              tool_calls *calls) {
+    static const char tool_start[] = "<tool_call>";
+    static const char tool_end[] = "</tool_call>";
+    text = text ? text : "";
+    const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
+    if (require_thinking_closed) {
+        const char *think_end = find_last_substr(text, "</think>");
+        if (!think_end) {
+            const char *candidate = strstr(text, tool_start);
+            if (!candidate || !strstr(candidate, tool_end)) {
+                fprintf(stderr,
+                        "ds4-server: thinking not closed, ignoring incomplete "
+                        "Motif-3 tool call in reasoning\n");
+                ds4_local_unterminated_reasoning(text,
+                                                  content_out, reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + 8;
+        }
+    }
+
+    const char *start = strstr(tool_search, tool_start);
+    if (!start) {
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        return true;
+    }
+    const char *raw_block_start = start;
+    if (start > text && start[-1] == '\n') raw_block_start = start - 1;
+    const size_t content_len = trim_tool_separator_ws(
+        text, 0, (size_t)(raw_block_start - text));
+    const char *p = start;
+    while (true) {
+        p = skip_ascii_ws(p);
+        if (strncmp(p, tool_start, strlen(tool_start)) != 0) break;
+        p += strlen(tool_start);
+        const char *close = strstr(p, tool_end);
+        if (!close) return false;
+        char *json = xstrndup(p, (size_t)(close - p));
+        tool_call tc = {0};
+        const bool ok = parse_motif3_tool_call_json(json, &tc);
+        free(json);
+        if (!ok) return false;
+        tool_calls_push(calls, tc);
+        p = close + strlen(tool_end);
+    }
+    if (calls->len == 0) return false;
+    free(calls->raw_tool_text);
+    calls->raw_tool_text = xstrndup(raw_block_start,
+                                    (size_t)(p - raw_block_start));
+    if (recovered_unclosed_tool) {
+        ds4_unterminated_reasoning_before_tool(text, content_len,
+                                               content_out, reasoning_out);
+    } else {
+        split_reasoning_content(text, content_len,
+                                content_out, reasoning_out);
+    }
+    return true;
+}
+
+static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
+                                                  const char *text,
+                                                  bool require_thinking_closed,
+                                                  char **content_out,
+                                                  char **reasoning_out,
+                                                  tool_calls *calls) {
+    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
+        return parse_motif3_generated_message_ex(text,
+                                                 require_thinking_closed,
+                                                 content_out, reasoning_out,
+                                                 calls);
+    }
+    return parse_generated_message_ex(text, require_thinking_closed,
+                                      content_out, reasoning_out, calls);
+}
+
 /* Try to repair a truncated DSML block.
  *
  * DSML nesting order is: tool_calls > invoke > parameter.
@@ -4894,7 +5356,8 @@ static const char *tool_parse_failure_recovery_finish(const char *finish) {
     return "stop";
 }
 
-static bool parse_generated_message_for_response(const char *text,
+static bool parse_generated_message_for_response(server_model_syntax syntax,
+                                                 const char *text,
                                                  bool has_tools,
                                                  bool saw_tool_start,
                                                  bool require_thinking_closed,
@@ -4917,10 +5380,12 @@ static bool parse_generated_message_for_response(const char *text,
         return true;
     }
 
-    bool parsed_ok = parse_generated_message_ex(text ? text : "",
-                                                require_thinking_closed,
-                                                content_out, reasoning_out,
-                                                calls);
+    bool parsed_ok = parse_generated_message_ex_for_syntax(syntax,
+                                                           text ? text : "",
+                                                           require_thinking_closed,
+                                                           content_out,
+                                                           reasoning_out,
+                                                           calls);
     if (parsed_ok) return true;
 
     free(*content_out);
@@ -11299,11 +11764,11 @@ static dsml_decode_state sem_accum_dsml_state(const sem_accum *a) {
  * the whole marker off the wire, and bytes already sent cannot be unsent.
  * Same contract as stop_list_stream_safe_len, for the two marker spellings. */
 static size_t tool_marker_stream_safe_len(const char *text, size_t len) {
-    static const char *const marks[2] =
-        { DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT };
+    static const char *const marks[3] =
+        { DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT, "<tool_call>" };
     if (!text || !len) return len;
     size_t safe = len;
-    for (int m = 0; m < 2; m++) {
+    for (int m = 0; m < 3; m++) {
         const size_t ml = strlen(marks[m]);
         size_t k = ml - 1 < len ? ml - 1 : len;
         for (; k >= 1; k--) {
@@ -11668,8 +12133,14 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
         buf_puts(&suffix, "</think>");
     }
     buf_puts(&suffix, content ? content : "");
-    append_dsml_tool_calls_text(&suffix, calls);
-    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    const server_model_syntax syntax = r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    append_tool_calls_text_for_syntax(&suffix, syntax, calls,
+                                      r ? &r->tool_orders : NULL);
+    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
+        buf_puts(&suffix, "<|endofturn|>");
+    } else {
+        buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    }
     return buf_take(&suffix);
 }
 
@@ -11693,8 +12164,14 @@ static char *build_responses_visible_assistant_suffix(const request *r,
         buf_puts(&suffix, "</think>");
     }
     buf_puts(&suffix, content ? content : "");
-    append_dsml_tool_calls_text(&suffix, calls);
-    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    const server_model_syntax syntax = r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    append_tool_calls_text_for_syntax(&suffix, syntax, calls,
+                                      r ? &r->tool_orders : NULL);
+    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
+        buf_puts(&suffix, "<|endofturn|>");
+    } else {
+        buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    }
     return buf_take(&suffix);
 }
 
@@ -11728,8 +12205,69 @@ static char *build_toolless_thinking_visible_text(const request *r,
     buf_append(&visible, r->prompt_text, pt_len - tag_len);
     buf_puts(&visible, "</think>");
     buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    buf_puts(&visible,
+             r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ?
+             "<|endofturn|>" : "<｜end▁of▁sentence｜>");
     return buf_take(&visible);
+}
+
+/* Motif-3's official template deliberately differs between a generation
+ * prefix and a historical assistant turn when reasoning is disabled:
+ *
+ *   generation:  <|assistant|><think></think>
+ *   history:     <|assistant|>...tool call...
+ *
+ * The empty think pair is therefore present in the sampled KV but absent from
+ * the next OpenAI chat replay.  Preserve the sampled frontier and remember the
+ * official visible-history bytes as its key.  The next request can then append
+ * only <|endofturn|>, the tool response, and the new assistant prefix instead
+ * of throwing away the live KV on the two-token template mismatch.
+ *
+ * Do not include <|endofturn|> here: generation stops as soon as a complete
+ * tool_call closes, so that delimiter belongs to the newly tokenized suffix on
+ * the continuation request. */
+static char *build_motif3_no_think_tool_visible_text(
+        const request *r, const char *content, const tool_calls *calls) {
+    static const char empty_think[] = "<think></think>";
+    if (!r || r->model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 ||
+        ds4_think_mode_enabled(r->think_mode) || !r->prompt_text ||
+        !calls || calls->len == 0)
+    {
+        return NULL;
+    }
+
+    const size_t prompt_len = strlen(r->prompt_text);
+    const size_t empty_think_len = sizeof(empty_think) - 1;
+    if (prompt_len < empty_think_len ||
+        memcmp(r->prompt_text + prompt_len - empty_think_len,
+               empty_think, empty_think_len) != 0)
+    {
+        return NULL;
+    }
+
+    buf visible = {0};
+    buf_append(&visible, r->prompt_text, prompt_len - empty_think_len);
+    motif3_buf_put_trimmed(&visible, content);
+    append_motif3_tool_calls_text(&visible, calls, true);
+    return buf_take(&visible);
+}
+
+static bool remember_motif3_no_think_tool_checkpoint(
+        server *s, const job *j, const char *ctx,
+        uint64_t trace_id, const char *content, const tool_calls *calls) {
+    char *visible = build_motif3_no_think_tool_visible_text(
+        &j->req, content, calls);
+    if (!visible) return false;
+
+    thinking_live_remember(s, visible);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: Motif-3 no-think tool live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(s->session), strlen(visible));
+    trace_event(s, trace_id,
+                "Motif-3 no-think tool live checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(s->session), strlen(visible));
+    free(visible);
+    return true;
 }
 
 static void remember_thinking_checkpoint(server *s, const job *j, const char *ctx,
@@ -12393,7 +12931,7 @@ decode_again:
             temperature = 0.0f;
         }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
-        if (token == ds4_token_eos(s->engine)) {
+        if (server_token_ends_generation(s->engine, &j->req, token)) {
             finish = "stop";
             break;
         }
@@ -12428,7 +12966,7 @@ decode_again:
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && acc.completion < max_tokens; ti++) {
             token = toks[ti];
-            if (token == ds4_token_eos(s->engine)) {
+            if (server_token_ends_generation(s->engine, &j->req, token)) {
                 finish = "stop";
                 stop_decode = true;
                 break;
@@ -12585,12 +13123,15 @@ decode_again:
     }
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
+        j->req.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK &&
         acc.saw_tool_start && !acc.saw_tool_end && strcmp(finish, "error") != 0)
     {
         /* Deterministically complete a simple truncation.  Anything more than
          * missing closing tags stays model-owned: for non-streaming requests,
          * append a tool error plus prompt reminder to the live session and let
-         * the model issue a fresh call. */
+         * the model issue a fresh call.  DSML-only: a truncated Motif JSON
+         * call has no tag-completion repair and takes the parse-failure
+         * recovery below instead. */
         bool completed_truncation = false;
         buf repaired = {0};
         if (try_repair_dsml(acc.text.ptr, acc.text.len, &repaired)) {
@@ -12701,6 +13242,7 @@ decode_again:
     bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
         bool parsed_ok = parse_generated_message_for_response(
+            j->req.model_syntax,
             acc.text.ptr ? acc.text.ptr : "",
             j->req.has_tools,
             acc.saw_tool_start,
@@ -12875,6 +13417,21 @@ decode_again:
     }
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+        j->req.api == API_OPENAI &&
+        j->req.model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 &&
+        !ds4_think_mode_enabled(j->req.think_mode))
+    {
+        /* The official Motif-3 renderer omits the generation-only empty think
+         * pair when this assistant tool turn becomes history.  Bind that
+         * visible replay to the exact sampled KV instead of canonicalizing or
+         * rebuilding the whole prompt. */
+        if (!remember_motif3_no_think_tool_checkpoint(
+                s, j, ctx_span, trace_id,
+                parsed_content ? parsed_content : "", &parsed_calls))
+        {
+            thinking_live_clear(s);
+        }
+    } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
@@ -13937,7 +14494,7 @@ static int detok_result_until_eos(server *s, const int *tokens, int n_tokens, in
     const bool count = r && reasoning_tokens && ds4_think_mode_enabled(r->think_mode);
     if (count) th = thinking_state_from_prompt(r);
     for (int k = 0; k < n_tokens; k++) {
-        if (tokens[k] == eos) break;
+        if (tokens[k] == eos || ds4_token_is_stop(s->engine, tokens[k])) break;
         size_t pl = 0;
         char *piece = ds4_token_text(s->engine, tokens[k], &pl);
         if (count && th.inside) n_reason++;
@@ -13987,7 +14544,8 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
         const char *fin = finish;
         char perr[160] = {0};
         bool recovered = false;
-        parse_generated_message_for_response(text.ptr ? text.ptr : "",
+        parse_generated_message_for_response(j->req.model_syntax,
+                                             text.ptr ? text.ptr : "",
                                              false /*has_tools*/, false /*saw_tool_start*/,
                                              ds4_think_mode_enabled(j->req.think_mode),
                                              &fin, perr, sizeof(perr),
@@ -15062,10 +15620,14 @@ struct cont_stream {
     size_t plain_stream_pos;
 };
 
-/* A1: does this row need host-side text (stream projection or stop/tool scan)? */
+/* A1: does this row need host-side text (stream projection or stop/tool scan)?
+ * Motif no-think rows join so the think-control stop below finalizes from the
+ * accumulator (clean text + verdict) instead of the raw engine buffer. */
 static bool cont_needs_text(const request *r) {
     return r->stream || r->stops.len > 0 ||
-           (r->kind == REQ_CHAT && r->has_tools);
+           (r->kind == REQ_CHAT && r->has_tools) ||
+           (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 &&
+            !ds4_think_mode_enabled(r->think_mode));
 }
 
 /* Lazily allocate the per-seq stream state (zeroed). */
@@ -15232,9 +15794,12 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
                               const char **fin_io,
                               char **content, char **reasoning,
                               tool_calls *calls) {
-    if (j->req.has_tools && st->acc.saw_tool_start && !st->acc.saw_tool_end) {
+    if (j->req.has_tools &&
+        j->req.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK &&
+        st->acc.saw_tool_start && !st->acc.saw_tool_end) {
         /* Budget/eviction cut the block: deterministically complete a simple
-         * truncation (verify the repaired text actually parses to calls). */
+         * truncation (verify the repaired text actually parses to calls).
+         * DSML-only, mirroring the serial driver's repair gate. */
         buf repaired = {0};
         if (try_repair_dsml(st->acc.text.ptr, st->acc.text.len, &repaired)) {
             tool_calls tc = {0};
@@ -15277,7 +15842,8 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
     }
     char perr[160] = {0};
     bool recovered = false;
-    parse_generated_message_for_response(st->acc.text.ptr ? st->acc.text.ptr : "",
+    parse_generated_message_for_response(j->req.model_syntax,
+                                         st->acc.text.ptr ? st->acc.text.ptr : "",
                                          j->req.has_tools, st->acc.saw_tool_start,
                                          ds4_think_mode_enabled(j->req.think_mode),
                                          fin_io, perr, sizeof(perr),
@@ -15393,7 +15959,8 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         } else {
             char perr[160] = {0};
             bool recovered = false;
-            parse_generated_message_for_response(st->acc.text.ptr ? st->acc.text.ptr : "",
+            parse_generated_message_for_response(j->req.model_syntax,
+                                                 st->acc.text.ptr ? st->acc.text.ptr : "",
                                                  false /*has_tools*/, false /*saw_tool_start*/,
                                                  ds4_think_mode_enabled(j->req.think_mode),
                                                  &fin, perr, sizeof(perr),
@@ -15480,6 +16047,16 @@ static int cont_on_token(void *ud, void *user, int token) {
     t_emit_job = j;                            /* W8a: send_all -> j->out (off the GPU path) */
     if (j->req.stream && !st->started) cont_stream_start(s, j); /* first token: headers + role preamble */
     if (st->failed || j->client_gone) { t_emit_job = NULL; return 0; }
+    /* Motif no-think: a bare think-control token ends the turn before it can
+     * reach the accumulator or the wire (parity with the serial driver's
+     * server_token_ends_generation).  Engine-level stop ids never get here --
+     * the cont core retires them as EOS. */
+    if (j->req.model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 &&
+        ds4_token_is_stop_for_think_mode(s->engine, token, j->req.think_mode)) {
+        if (!st->acc.verdict) st->acc.verdict = "stop";
+        t_emit_job = NULL;
+        return 0;
+    }
     /* Inc 7c: measure the host-side per-token cost this callback spends
      * inside the engine's decode loop (under gen_mu) -- detok + accumulator
      * + wire projection.  The plan's offload decision reads the quotient. */
@@ -19715,6 +20292,36 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_render_motif3_chat_prompt_text(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are precise.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_MOTIF3, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|beginoftext|>"
+        "<|startofturn|><|system|>You are precise.<|endofturn|>"
+        "<|startofturn|><|user|>Hello<|endofturn|>"
+        "<|startofturn|><|assistant|><think></think>"));
+    free(prompt);
+
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_MOTIF3, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|startofturn|><|assistant|><think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "</think>") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
 static void test_dsml_tool_args_preserve_call_order(void) {
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
@@ -19809,6 +20416,72 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     free(suffix);
     free(content);
     free(reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
+static void test_parse_motif3_tool_call_message(void) {
+    const char *generated =
+        "<think>need weather</think>\n"
+        "<tool_call>{\"name\": \"get_weather\", \"arguments\": "
+        "{\"city\": \"Seoul\"}}</tool_call>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_MOTIF3, generated, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "need weather"));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.v[0].name &&
+                !strcmp(calls.v[0].name, "get_weather"));
+    TEST_ASSERT(calls.v[0].arguments &&
+                strstr(calls.v[0].arguments, "\"city\"") != NULL);
+    TEST_ASSERT(calls.raw_tool_text &&
+                !strncmp(calls.raw_tool_text, "\n<tool_call>",
+                         strlen("\n<tool_call>")));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_motif3_no_think_tool_visible_checkpoint(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_MOTIF3;
+    r.think_mode = DS4_THINK_NONE;
+    r.prompt_text = xstrdup(
+        "<|beginoftext|><|startofturn|><|user|>weather?"
+        "<|endofturn|><|startofturn|><|assistant|><think></think>");
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_weather_1");
+    tc.name = xstrdup("get_weather");
+    tc.arguments = xstrdup("{\"city\":\"Seoul\"}");
+    tool_calls_push(&calls, tc);
+    calls.raw_tool_text = xstrdup(
+        "\n<tool_call>{\"name\": \"get_weather\", \"arguments\": "
+        "{\"city\":\"Seoul\"}}</tool_call>");
+
+    char *visible = build_motif3_no_think_tool_visible_text(
+        &r, "  \n", &calls);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(strstr(visible, "<think></think>") == NULL);
+    TEST_ASSERT(strstr(visible, calls.raw_tool_text) != NULL);
+    TEST_ASSERT(strlen(visible) < strlen("<|endofturn|>") ||
+                strcmp(visible + strlen(visible) - strlen("<|endofturn|>"),
+                       "<|endofturn|>"));
+    TEST_ASSERT(!strcmp(visible,
+        "<|beginoftext|><|startofturn|><|user|>weather?"
+        "<|endofturn|><|startofturn|><|assistant|>"
+        "\n<tool_call>{\"name\": \"get_weather\", \"arguments\": "
+        "{\"city\":\"Seoul\"}}</tool_call>"));
+
+    free(visible);
     tool_calls_free(&calls);
     request_free(&r);
 }
@@ -20063,7 +20736,8 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
     const char *finish = "tool_calls";
     bool recovered = false;
 
-    TEST_ASSERT(!parse_generated_message_for_response(generated,
+    TEST_ASSERT(!parse_generated_message_for_response(SERVER_MODEL_SYNTAX_DEEPSEEK,
+                                                       generated,
                                                        true,
                                                        true,
                                                        false,
@@ -24848,7 +25522,8 @@ static void test_sem_accum_no_tools_dsml_cut(void) {
     buf_puts(&t, "summary text\n\n");
     buf_puts(&t, DS4_TOOL_CALLS_START);
     buf_puts(&t, DS4_TOOL_CALLS_END);
-    bool ok = parse_generated_message_for_response(t.ptr, false, true, false,
+    bool ok = parse_generated_message_for_response(SERVER_MODEL_SYNTAX_DEEPSEEK,
+                                                   t.ptr, false, true, false,
                                                    &finish, err, sizeof(err),
                                                    &content, &reasoning, &calls,
                                                    &recovered);
@@ -25432,6 +26107,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
+    test_render_motif3_chat_prompt_text();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
@@ -25467,6 +26143,8 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
+    test_parse_motif3_tool_call_message();
+    test_motif3_no_think_tool_visible_checkpoint();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
