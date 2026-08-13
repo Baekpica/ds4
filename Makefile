@@ -21,6 +21,8 @@ DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+DS4_MOTIF3_MODEL ?=
+DS4_MOTIF3_FIXTURES ?= ../motif-3-mixed-ds4/fixtures/official-final
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -62,7 +64,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch test-motif3-loader test-motif3-reference test-motif3-tokenizer test-motif3-cuda test-motif3-resident dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -462,5 +464,56 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
 	./tests/test_mxfp4_dot
 
+# Metadata and full tensor-layout smoke. The structural GGUF is sparse, so
+# this validates all descriptors without materializing an 88 GiB copy.
+tests/test_motif3_loader: tests/test_motif3_loader.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-motif3-loader: tests/test_motif3_loader
+	@test -n "$(DS4_MOTIF3_MODEL)" || \
+		{ echo "set DS4_MOTIF3_MODEL to the structural or completed GGUF" >&2; exit 2; }
+	./tests/test_motif3_loader "$(DS4_MOTIF3_MODEL)"
+
+tests/test_motif3_reference: tests/test_motif3_reference.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-motif3-reference: tests/test_motif3_reference
+	./tests/test_motif3_reference "$(DS4_MOTIF3_FIXTURES)"
+
+tests/test_motif3_tokenizer: tests/test_motif3_tokenizer.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-motif3-tokenizer: tests/test_motif3_tokenizer
+	@test -n "$(DS4_MOTIF3_MODEL)" || \
+		{ echo "set DS4_MOTIF3_MODEL to the structural or completed GGUF" >&2; exit 2; }
+	./tests/test_motif3_tokenizer "$(DS4_MOTIF3_MODEL)" \
+		"$(DS4_MOTIF3_FIXTURES)/tokenizer-chat.ds4tok"
+
+ifneq ($(UNAME_S),Darwin)
+tests/test_motif3_cuda: tests/test_motif3_cuda.cu ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< ds4_cuda.o $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+test-motif3-cuda: tests/test_motif3_cuda
+	./tests/test_motif3_cuda "$(DS4_MOTIF3_FIXTURES)"
+
+tests/test_motif3_resident.o: tests/test_motif3_resident.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_motif3_resident: tests/test_motif3_resident.o ds4_gpu_args.o ds4_kvstore.o rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-motif3-resident: tests/test_motif3_resident
+	CUDA_VISIBLE_DEVICES=0 ./tests/test_motif3_resident "$(DS4_MOTIF3_MODEL)"
+
+tests/test_motif3_long.o: tests/test_motif3_long.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_motif3_long: tests/test_motif3_long.o ds4_gpu_args.o ds4_kvstore.o rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+endif
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_long tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

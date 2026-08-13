@@ -660,6 +660,45 @@ static st_value db_read(st_db *db, const char *name) {
     return v;
 }
 
+static st_value db_read_2d_slice(st_db *db, const char *name,
+                                 uint64_t element_offset,
+                                 int64_t nrows, int64_t ncols) {
+    shard *s = NULL;
+    tensor_entry *te = db_tensor(db, name, &s);
+    if (nrows <= 0 || ncols <= 0) die("bad safetensors slice shape");
+    uint64_t elements = 1;
+    for (int i = 0; i < te->info.n_dims; i++) {
+        if (te->info.shape[i] <= 0 || elements > UINT64_MAX / (uint64_t)te->info.shape[i]) {
+            die("bad safetensors slice source shape");
+        }
+        elements *= (uint64_t)te->info.shape[i];
+    }
+    const uint64_t source_bytes = te->info.end - te->info.begin;
+    if (elements == 0 || source_bytes % elements != 0) die("bad safetensors element size");
+    const uint64_t element_bytes = source_bytes / elements;
+    const uint64_t slice_elements = (uint64_t)nrows * (uint64_t)ncols;
+    if (element_offset > elements || slice_elements > elements - element_offset) {
+        die("safetensors slice exceeds source tensor");
+    }
+    if (slice_elements > SIZE_MAX / element_bytes) die("safetensors slice is too large");
+
+    st_value v = {0};
+    v.dtype = xstrdup(te->info.dtype);
+    v.n_dims = 2;
+    v.shape[0] = nrows;
+    v.shape[1] = ncols;
+    v.nbytes = (size_t)(slice_elements * element_bytes);
+    v.data = xmalloc(v.nbytes);
+    pthread_mutex_lock(&s->lock);
+    const uint64_t offset = s->data_base + te->info.begin + element_offset * element_bytes;
+    if (fseeko(s->fp, (off_t)offset, SEEK_SET) != 0) die_errno("seek", s->path);
+    if (v.nbytes && fread(v.data, 1, v.nbytes, s->fp) != v.nbytes) {
+        die_errno("read tensor slice", s->path);
+    }
+    pthread_mutex_unlock(&s->lock);
+    return v;
+}
+
 /* =====
  * DeepSeek V4 data conversion
  */
@@ -1012,6 +1051,8 @@ static void imatrix_free(imatrix_store *im) {
  * GGUF tensor mapping and quantization policy
  */
 
+static bool g_motif3_mode;
+
 typedef enum { EXP_SCOPE_LAYER, EXP_SCOPE_MTP } expert_scope;
 typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
 
@@ -1110,7 +1151,112 @@ static const name_map layer_map[] = {
     { "ffn_gate_tid2eid.weight",          "ffn.gate.tid2eid" },
 };
 
+static char *format_hf_name(const char *format, int layer, const char *suffix) {
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), format, layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof(buf)) die("HF tensor name is too long");
+    return xstrdup(buf);
+}
+
+static const char *motif3_attention_hf_suffix(const char *gguf_suffix) {
+    static const name_map map[] = {
+        { "attn_q_a_norm.weight",  "q_norm.weight" },
+        { "attn_kv_a_norm.weight", "kv_norm.weight" },
+        { "attn_q_a.weight",       "wq_a.weight" },
+        { "attn_q_b.weight",       "wq_b.weight" },
+        { "attn_q_gate.weight",    "wq_b_gate.weight" },
+        { "attn_kv_a.weight",      "wkv_a.weight" },
+        { "attn_kv_b.weight",      "wkv_b.weight" },
+        { "attn_lambda.weight",    "lambda_proj.weight" },
+        { "attn_output.weight",    "wo.weight" },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (strcmp(gguf_suffix, map[i].gguf) == 0) return map[i].hf;
+    }
+    return NULL;
+}
+
+static char *motif3_hf_name_for_regular(const char *gguf_name) {
+    if (strcmp(gguf_name, "token_embd.weight") == 0) return xstrdup("model.embed_tokens.weight");
+    if (strcmp(gguf_name, "output_norm.weight") == 0) return xstrdup("model.norm.weight");
+    if (strcmp(gguf_name, "output.weight") == 0) return xstrdup("lm_head.weight");
+
+    int stage = -1;
+    int used = 0;
+    if (sscanf(gguf_name, "mtp.%d.%n", &stage, &used) == 1 && used > 0 && stage == 0) {
+        const char *rest = gguf_name + used;
+        const char *attn = motif3_attention_hf_suffix(rest);
+        if (attn) return format_hf_name("model.mtp_layers.%d.self_attn.%s", stage, attn);
+        static const name_map mtp_map[] = {
+            { "ffn_gate.weight",     "mlp.gate_proj.weight" },
+            { "ffn_up.weight",       "mlp.up_proj.weight" },
+            { "ffn_down.weight",     "mlp.down_proj.weight" },
+            { "ffn_polynorm.weight", "mlp.act_fn.weight" },
+            { "ffn_polynorm.bias",   "mlp.act_fn.bias" },
+        };
+        for (size_t i = 0; i < sizeof(mtp_map) / sizeof(mtp_map[0]); i++) {
+            if (strcmp(rest, mtp_map[i].gguf) == 0) {
+                return format_hf_name("model.mtp_layers.%d.%s", stage, mtp_map[i].hf);
+            }
+        }
+        return format_hf_name("model.mtp_layers.%d.%s", stage, rest);
+    }
+
+    int layer = -1;
+    used = 0;
+    if (sscanf(gguf_name, "blk.%d.%n", &layer, &used) != 1 || used <= 0) {
+        fprintf(stderr, "error: cannot map Motif 3 GGUF tensor to HF tensor: %s\n", gguf_name);
+        exit(1);
+    }
+    const char *rest = gguf_name + used;
+    if (strcmp(rest, "attn_norm.weight") == 0) {
+        return format_hf_name("model.layers.%d.%s", layer, "input_layernorm.weight");
+    }
+    if (strcmp(rest, "ffn_norm.weight") == 0) {
+        return format_hf_name("model.layers.%d.%s", layer, "post_attention_layernorm.weight");
+    }
+    const char *attn = motif3_attention_hf_suffix(rest);
+    if (attn) return format_hf_name("model.layers.%d.self_attn.%s", layer, attn);
+    if (str_starts(rest, "mhc_attn.") || str_starts(rest, "mhc_ffn.")) {
+        return format_hf_name("model.layers.%d.%s", layer, rest);
+    }
+
+    static const name_map dense_map[] = {
+        { "ffn_gate.weight",     "mlp.gate_proj.weight" },
+        { "ffn_up.weight",       "mlp.up_proj.weight" },
+        { "ffn_down.weight",     "mlp.down_proj.weight" },
+        { "ffn_polynorm.weight", "mlp.act_fn.weight" },
+        { "ffn_polynorm.bias",   "mlp.act_fn.bias" },
+    };
+    for (size_t i = 0; i < sizeof(dense_map) / sizeof(dense_map[0]); i++) {
+        if (strcmp(rest, dense_map[i].gguf) == 0) {
+            return format_hf_name("model.layers.%d.%s", layer, dense_map[i].hf);
+        }
+    }
+
+    static const name_map moe_map[] = {
+        { "ffn_gate_inp.weight",           "moe.router.gate.weight" },
+        { "exp_probs_b.bias",              "moe.expert_bias" },
+        { "ffn_polynorm_exps.weight",      "moe.experts.act_fn.weight" },
+        { "ffn_polynorm_exps.bias",        "moe.experts.act_fn.bias" },
+        { "ffn_gate_shexp.weight",         "moe.shared_experts.gate_proj.weight" },
+        { "ffn_up_shexp.weight",           "moe.shared_experts.up_proj.weight" },
+        { "ffn_down_shexp.weight",         "moe.shared_experts.down_proj.weight" },
+        { "ffn_polynorm_shexp.weight",     "moe.shared_experts.act_fn.weight" },
+        { "ffn_polynorm_shexp.bias",       "moe.shared_experts.act_fn.bias" },
+    };
+    for (size_t i = 0; i < sizeof(moe_map) / sizeof(moe_map[0]); i++) {
+        if (strcmp(rest, moe_map[i].gguf) == 0) {
+            return format_hf_name("model.layers.%d.%s", layer, moe_map[i].hf);
+        }
+    }
+
+    fprintf(stderr, "error: cannot map Motif 3 GGUF tensor to HF tensor: %s\n", gguf_name);
+    exit(1);
+}
+
 static char *hf_name_for_regular(const char *gguf_name) {
+    if (g_motif3_mode) return motif3_hf_name_for_regular(gguf_name);
     for (size_t i = 0; i < sizeof(top_map) / sizeof(top_map[0]); i++) {
         if (strcmp(gguf_name, top_map[i].gguf) == 0) return xstrdup(top_map[i].hf);
     }
@@ -1403,6 +1549,41 @@ typedef struct {
     pthread_mutex_t lock;
 } expert_job;
 
+static st_value motif3_read_expert_slice(expert_job *j, int xid,
+                                         char *source_name, size_t source_name_size) {
+    if (j->expert.scope != EXP_SCOPE_LAYER) die("Motif 3 has no routed MTP experts");
+    const int layer = j->expert.layer;
+    if (j->expert.part == EXP_W1 || j->expert.part == EXP_W3) {
+        snprintf(source_name, source_name_size,
+                 "model.layers.%d.moe.experts.gate_up_proj", layer);
+        tensor_entry *te = db_tensor(j->db, source_name, NULL);
+        if (te->info.n_dims != 3 || te->info.shape[0] != j->n_experts ||
+            te->info.shape[1] != 2 * j->nrows || te->info.shape[2] != j->ncols) {
+            die("Motif 3 fused gate/up expert shape mismatch");
+        }
+        const uint64_t row = (uint64_t)xid * (uint64_t)(2 * j->nrows) +
+            (j->expert.part == EXP_W3 ? (uint64_t)j->nrows : 0);
+        return db_read_2d_slice(j->db, source_name,
+                                row * (uint64_t)j->ncols,
+                                j->nrows, j->ncols);
+    }
+    if (j->expert.part == EXP_W2) {
+        snprintf(source_name, source_name_size,
+                 "model.layers.%d.moe.experts.down_proj", layer);
+        tensor_entry *te = db_tensor(j->db, source_name, NULL);
+        if (te->info.n_dims != 3 || te->info.shape[0] != j->n_experts ||
+            te->info.shape[1] != j->nrows || te->info.shape[2] != j->ncols) {
+            die("Motif 3 down expert shape mismatch");
+        }
+        const uint64_t element_offset =
+            (uint64_t)xid * (uint64_t)j->nrows * (uint64_t)j->ncols;
+        return db_read_2d_slice(j->db, source_name, element_offset,
+                                j->nrows, j->ncols);
+    }
+    die("bad Motif 3 expert projection");
+    return (st_value){0};
+}
+
 static void generate_one_expert(expert_job *j, int xid) {
     char prefix[256];
     if (j->expert.scope == EXP_SCOPE_MTP) {
@@ -1412,9 +1593,15 @@ static void generate_one_expert(expert_job *j, int xid) {
     }
     char weight_name[320];
     char scale_name[320];
-    snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
-    snprintf(scale_name, sizeof(scale_name), "%s.scale", prefix);
-    st_value w = db_read(j->db, weight_name);
+    st_value w;
+    if (g_motif3_mode) {
+        w = motif3_read_expert_slice(j, xid, weight_name, sizeof(weight_name));
+        scale_name[0] = '\0';
+    } else {
+        snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
+        snprintf(scale_name, sizeof(scale_name), "%s.scale", prefix);
+        w = db_read(j->db, weight_name);
+    }
     if (j->target == DS4Q_TYPE_MXFP4) {
         if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) {
             die("MXFP4 expert shape mismatch");
@@ -1532,6 +1719,7 @@ typedef struct {
 
 typedef struct {
     char *path;
+    char *architecture;
     uint32_t version;
     uint64_t n_kv;
     uint64_t n_tensors;
@@ -1631,6 +1819,10 @@ static bool is_imatrix_kv_key(const char *key) {
     return str_starts(key, "quantize.imatrix.");
 }
 
+static bool is_template_only_kv_key(const char *key) {
+    return strcmp(key, "motif3.template_only") == 0;
+}
+
 static size_t extra_imatrix_kv_size(const imatrix_store *im) {
     if (!imatrix_enabled(im)) return 0;
     size_t n = 0;
@@ -1691,13 +1883,22 @@ static gguf_file load_gguf_metadata(const char *path) {
         if (rec_start < 0 || rec_start < kv_start) die("GGUF ftell failed");
         char *key = read_gguf_string_fp(fp);
         uint32_t type = read_u32_le_fp(fp, "GGUF KV type");
-        if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
+        if (strcmp(key, "general.architecture") == 0 && type == GGUF_TYPE_STRING) {
+            free(g.architecture);
+            g.architecture = read_gguf_string_fp(fp);
+        } else if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t a = read_u32_le_fp(fp, "GGUF alignment");
             if (a) g.alignment = a;
         } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t n = read_u32_le_fp(fp, "GGUF expert count");
             if (n <= (uint32_t)INT_MAX) g.n_experts = (int)n;
         } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT64) {
+            uint64_t n = read_u64_le_fp(fp, "GGUF expert count");
+            if (n <= (uint64_t)INT_MAX) g.n_experts = (int)n;
+        } else if (strcmp(key, "motif3.expert_count") == 0 && type == GGUF_TYPE_UINT32) {
+            uint32_t n = read_u32_le_fp(fp, "GGUF expert count");
+            if (n <= (uint32_t)INT_MAX) g.n_experts = (int)n;
+        } else if (strcmp(key, "motif3.expert_count") == 0 && type == GGUF_TYPE_UINT64) {
             uint64_t n = read_u64_le_fp(fp, "GGUF expert count");
             if (n <= (uint64_t)INT_MAX) g.n_experts = (int)n;
         } else {
@@ -1712,7 +1913,7 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key)) {
+        if (!is_imatrix_kv_key(key) && !is_template_only_kv_key(key)) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -1760,6 +1961,64 @@ static gguf_file load_gguf_metadata(const char *path) {
     free(keys);
     fclose(fp);
     return g;
+}
+
+static char *motif3_hf_name_for_expert(expert_tensor expert) {
+    char buf[320];
+    if (expert.scope != EXP_SCOPE_LAYER) die("Motif 3 has no routed MTP experts");
+    const char *suffix = expert.part == EXP_W2
+        ? "moe.experts.down_proj"
+        : "moe.experts.gate_up_proj";
+    int n = snprintf(buf, sizeof(buf), "model.layers.%d.%s", expert.layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof(buf)) die("Motif 3 expert name is too long");
+    return xstrdup(buf);
+}
+
+static void validate_motif3_source_map(st_db *db, const gguf_file *tmpl) {
+    char **used = xmalloc((size_t)tmpl->n_tensors * sizeof(used[0]));
+    int n_used = 0;
+    for (uint64_t i = 0; i < tmpl->n_tensors; i++) {
+        expert_tensor expert = parse_expert_tensor(tmpl->tensors[i].name);
+        char *hf_name = expert.is_expert
+            ? motif3_hf_name_for_expert(expert)
+            : motif3_hf_name_for_regular(tmpl->tensors[i].name);
+        if (!db_has(db, hf_name)) {
+            fprintf(stderr, "error: Motif 3 source tensor is missing: %s -> %s\n",
+                    tmpl->tensors[i].name, hf_name);
+            exit(1);
+        }
+        bool duplicate = false;
+        for (int j = 0; j < n_used; j++) {
+            if (strcmp(used[j], hf_name) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) used[n_used++] = hf_name;
+        else free(hf_name);
+    }
+
+    if (n_used != db->n_weights) {
+        fprintf(stderr,
+                "error: Motif 3 source coverage mismatch: %d unique mapped, %d indexed\n",
+                n_used, db->n_weights);
+        exit(1);
+    }
+    hmap used_map = {0};
+    hmap_build(&used_map, used, n_used);
+    for (int i = 0; i < db->n_weights; i++) {
+        if (hmap_get(&used_map, db->weights[i].name) < 0) {
+            fprintf(stderr, "error: unmapped Motif 3 source tensor: %s\n",
+                    db->weights[i].name);
+            exit(1);
+        }
+    }
+    hmap_free(&used_map);
+    for (int i = 0; i < n_used; i++) free(used[i]);
+    free(used);
+    fprintf(stderr,
+            "validated Motif 3 source map: %" PRIu64 " GGUF tensors cover %d source tensors\n",
+            tmpl->n_tensors, db->n_weights);
 }
 
 static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name) {
@@ -2817,6 +3076,7 @@ static params parse_args(int argc, char **argv) {
 
 static void free_gguf_file(gguf_file *g) {
     free(g->path);
+    free(g->architecture);
     free(g->kv_raw);
     for (uint64_t i = 0; i < g->n_tensors; i++) free(g->tensors[i].name);
     free(g->tensors);
@@ -2956,6 +3216,10 @@ int main(int argc, char **argv) {
     }
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    g_motif3_mode = tmpl.architecture && strcmp(tmpl.architecture, "motif3") == 0;
+    if (g_motif3_mode) {
+        fprintf(stderr, "using Motif 3 safetensors mapping\n");
+    }
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;
@@ -2969,10 +3233,19 @@ int main(int argc, char **argv) {
     }
     output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
     print_plan(&tmpl, &out_ctx);
-    if (p.dry_run) return 0;
+    if (p.dry_run) {
+        if (g_motif3_mode) {
+            st_db db;
+            db_open(&db, p.hf_dir);
+            validate_motif3_source_map(&db, &tmpl);
+            db_close(&db);
+        }
+        return 0;
+    }
 
     st_db db;
     db_open(&db, p.hf_dir);
+    if (g_motif3_mode) validate_motif3_source_map(&db, &tmpl);
     if (p.compare_tensor) {
         compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
         db_close(&db);
