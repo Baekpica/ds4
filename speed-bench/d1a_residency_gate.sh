@@ -163,12 +163,15 @@ plan_asserts() { # $1 log  $2.. expected source names
             || die "$L: no clean $s materialize line"
     done
 }
-range_plan_full() { # $1 log — planned == total + refused 0 on EVERY line
+range_plan_full() { # $1 log — planned == total + multi 0 + refused 0 on EVERY line
+    # memgov D1b-3: multi counts device-copy ranges spanning >1 unit
+    # (imports/registered excluded engine-side) — any nonzero is an
+    # extent-shaped promotion, a materializer regression.
     local BAD
     BAD=$(R "grep 'ds4: range plan ' $1" \
-        | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7/' \
-        | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 {print}')
-    [ -z "$BAD" ] || die "$1: range plan incomplete/refused: $BAD"
+        | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), multi ([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7 \8/' \
+        | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 || $8!=0 {print}')
+    [ -z "$BAD" ] || die "$1: range plan incomplete/multi/refused: $BAD"
 }
 faults_zero() { # $1 tag
     local CF; CF=$(met ds4_memory_census_faults_total)
@@ -339,6 +342,21 @@ golden_leg raw "DS4_CUDA_NO_DERIVED_WEIGHTS=1 DS4_CUDA_NO_HBM_CACHE=1" control
 pair_leg l6_selfload "" "" base drafter
 R "grep -q 'ds4: aligned artifacts built in-process' /tmp/d1ares_l6_selfload_T.log" \
     || die "l6: no BUILT artifact banner on the self-load boot"
+# memgov D1b-3 per-source exactness (the D1b-0 F3 restatement): on the
+# stock self-load shape, base device bytes decompose EXACTLY into
+# artifacts + eager-populated units (the 2-D census SPAN/ARENA
+# aggregation ambiguity is gone at source scope).  2-dp porcelain =>
+# +/-0.05 GiB band.
+L6T=/tmp/d1ares_l6_selfload_T.log
+BDEV=$(R "grep 'ds4: model source base' $L6T" | tail -1 | sed -E 's/.*device ([0-9.]+) GiB.*/\1/')
+BART=$(R "grep 'ds4: aligned artifacts built in-process' $L6T" | tail -1 | sed -E 's/.*artifacts, ([0-9.]+) GiB.*/\1/')
+BPOP=$(R "grep 'ds4: materialize base' $L6T" | tail -1 | sed -E 's/.*populated [0-9]+ \(([0-9.]+) GiB\).*/\1/')
+python3 -c "
+d, a, p = float('$BDEV'), float('$BART'), float('$BPOP')
+gap = d - a - p
+assert abs(gap) <= 0.05, 'per-source exactness gap %.3f GiB (dev %.2f != art %.2f + pop %.2f)' % (gap, d, a, p)
+print('l6 exactness: base dev %.2f == art %.2f + populated %.2f (gap %+.3f)' % (d, a, p, gap))" \
+    || die "l6: per-source exactness failed (dev=$BDEV art=$BART pop=$BPOP)"
 golden_leg selfload "" fixture
 
 fi  # L7_ONLY
@@ -397,6 +415,28 @@ if [ "$WS_OK" = "1" ]; then
 else
     R "tail -10 /tmp/d1a_ws.log" || true
     log "(l7) SKIPPED: weight server never reached ready -- RECEIPT NOTE REQUIRED"
+fi
+
+# ---- (ld) OPTIONAL discard measured leg (RUN_DISCARD_LEG=1) ----
+# memgov D1b-3: REPORT-ONLY (F4).  One extra test-tree pair, stock vs
+# DS4_CUDA_EAGER_SOURCE_DISCARD=1 (O_DIRECT + per-chunk discard): logs
+# boot wall time, fit line, and settle MemAvailable so the F4 default
+# decision accumulates evidence.  Never asserted -- the discard mode
+# CHANGES fit inputs by design (the D1b-2 fit-parity law), which is
+# exactly why it ships default-OFF.
+if [ "${RUN_DISCARD_LEG:-0}" = "1" ]; then
+    for mode in stock discard; do
+        ENVV=""; [ "$mode" = "discard" ] && ENVV="DS4_CUDA_EAGER_SOURCE_DISCARD=1"
+        DLOG=/tmp/d1ares_ld_${mode}.log
+        T0=$(date +%s)
+        boot_tree "$TEST_TREE" "$ENVV" "--no-spec" "$DLOG" || die "ld: $mode boot failed"
+        T1=$(date +%s)
+        FITLINE=$(R "grep -m1 'batch fit' $DLOG")
+        AVAIL=$(R "grep MemAvailable /proc/meminfo" | awk '{printf "%.2f", $2/1048576}')
+        log "(ld) $mode: boot $((T1-T0))s; $FITLINE; settle MemAvailable=${AVAIL} GiB"
+        kill_server
+    done
+    log "(ld) REPORTED (no asserts by design)"
 fi
 
 log "D1A RESIDENCY GATE: ALL LEGS COMPLETE"

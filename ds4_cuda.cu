@@ -795,30 +795,15 @@ static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static cuda_range_index g_q8_f32_by_offset;
 static std::vector<cuda_derived_range> g_derived_ranges;
 
-/* D1a-1 lookup micro-parity (TEST ONLY, DS4_CUDA_RANGE_LOOKUP_PARITY):
- * the token-path lookup re-keyed above must resolve every request to the
- * IDENTICAL pointer the old flat-keyed algorithm produced.  Under the
- * flag, a legacy flat index is maintained at the same publication sites
- * (last-write-wins, exactly the old collision semantics) and every
- * registry resolve is recomputed against it; a divergence counts here
- * and prints once.  The close gate boots with the flag, drives decode,
- * and asserts checked > 0 with divergent == 0. */
-static std::unordered_map<uint64_t, size_t> g_model_range_by_offset_legacy;
-static uint64_t g_range_parity_checked;
-static uint64_t g_range_parity_divergent;
-
-static int cuda_range_parity_on(void) {
-    static const int on = getenv("DS4_CUDA_RANGE_LOOKUP_PARITY") != NULL;
-    return on;
-}
-
-/* Index write for model-range entries: composite key + the D1a-1 parity
- * shadow.  D1a-4: internal to cuda_model_range_publish -- no push site
- * touches the index directly anymore. */
+/* Index write for model-range entries.  D1a-4: internal to
+ * cuda_model_range_publish -- no push site touches the index directly.
+ * (The D1a-1 lookup micro-parity shadow that once dual-wrote a legacy
+ * flat index here retired in D1b-3: with both promotion passes
+ * materializing plan units, the re-keyed resolve had held divergent=0
+ * across every close battery from D1a-1 through D1b-2.) */
 static void cuda_range_index_note(const void *host_base, uint64_t offset,
                                   size_t idx) {
     g_model_range_by_offset[cuda_range_key{host_base, offset}] = idx;
-    if (cuda_range_parity_on()) g_model_range_by_offset_legacy[offset] = idx;
 }
 
 /* --------------------------------------------------------------------
@@ -1441,27 +1426,6 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     if (exact != g_model_range_by_offset.end())
         exact_r = &g_model_ranges[exact->second];
     const char *resolved = cuda_model_range_resolve(model_map, offset, bytes, exact_r);
-    if (cuda_range_parity_on()) {
-        const cuda_model_range *legacy_r = NULL;
-        auto lx = g_model_range_by_offset_legacy.find(offset);
-        if (lx != g_model_range_by_offset_legacy.end())
-            legacy_r = &g_model_ranges[lx->second];
-        const char *legacy = cuda_model_range_resolve(model_map, offset, bytes, legacy_r);
-        g_range_parity_checked++;
-        if (legacy != resolved) {
-            g_range_parity_divergent++;
-            if (g_range_parity_divergent == 1) {
-                fprintf(stderr,
-                        "ds4: RANGE-PARITY DIVERGENT map=%p offset=%llu bytes=%llu "
-                        "new=%p legacy=%p\n",
-                        model_map,
-                        (unsigned long long)offset,
-                        (unsigned long long)bytes,
-                        (const void *)resolved,
-                        (const void *)legacy);
-            }
-        }
-    }
     if (resolved) return resolved;
 
     if (cuda_model_current_direct_available(model_map)) return cuda_model_ptr(model_map, offset);
@@ -3435,7 +3399,6 @@ static void cuda_model_range_release_all(void) {
     cuda_vmm_arenas_release_all();
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
-    g_model_range_by_offset_legacy.clear();
     g_model_range_bytes = 0;
     g_substrate_promotable_total = 0;     /* tripwire: census dies with the ranges */
     g_substrate_promotable_covered = 0;
@@ -3721,14 +3684,6 @@ extern "C" void ds4_gpu_cleanup(void) {
                            g_cublas_ws_bytes, g_cublas_ws_bytes);
         g_cublas_ws = NULL;
         g_cublas_ws_bytes = 0;
-    }
-    if (cuda_range_parity_on()) {
-        /* D1a-1 close evidence: the gate boots with the flag, drives
-         * decode, and asserts checked > 0 with divergent == 0 here. */
-        fprintf(stderr,
-                "ds4: range-lookup parity: checked=%llu divergent=%llu\n",
-                (unsigned long long)g_range_parity_checked,
-                (unsigned long long)g_range_parity_divergent);
     }
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -5656,11 +5611,21 @@ extern "C" void ds4_gpu_report_model_sources(void) {
      * assertion; refused publications already faulted one by one. */
     for (int i = 0; i < g_model_srcs.count; i++) {
         uint32_t nm = 0, nm_planned = 0, nd = 0, nd_planned = 0;
-        uint32_t nq = 0, nq_planned = 0;
+        uint32_t nq = 0, nq_planned = 0, nm_multi = 0;
         for (const cuda_model_range &r : g_model_ranges) {
             if (!r.host_base || r.src != i) continue;
             nm++;
             if (r.unit_lo >= 0) nm_planned++;
+            /* memgov D1b-3: with both promotion passes materializing
+             * plan units, every DEVICE-COPY range is exactly one unit.
+             * Imports legitimately span unit runs (one coalesced
+             * interval satisfies many units) and the registered
+             * whole-map view spans everything -- both excluded.  The
+             * gates assert multi == 0: an extent-shaped copy
+             * reappearing anywhere is a materializer regression. */
+            if (!r.host_registered && !r.imported_ipc && !r.imported_vmm &&
+                r.unit_lo >= 0 && r.unit_lo != r.unit_hi)
+                nm_multi++;
         }
         for (const cuda_derived_range &r : g_derived_ranges) {
             if (!r.host_base || r.src != i) continue;
@@ -5679,9 +5644,9 @@ extern "C" void ds4_gpu_report_model_sources(void) {
         }
         fprintf(stderr,
                 "ds4: range plan %s: model %u/%u planned, derived %u/%u, "
-                "q8 %u/%u, refused %llu\n",
+                "q8 %u/%u, multi %u, refused %llu\n",
                 g_model_srcs.v[i].name,
-                nm_planned, nm, nd_planned, nd, nq_planned, nq,
+                nm_planned, nm, nd_planned, nd, nq_planned, nq, nm_multi,
                 (unsigned long long)g_range_publish_refused);
     }
 }

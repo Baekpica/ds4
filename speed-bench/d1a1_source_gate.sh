@@ -20,14 +20,12 @@
 #       (s) this covers all three roles live in one gate.
 #       Both boot legs also assert the D1a-4 funnel porcelain: one
 #       "ds4: range plan" line per source with planned == total for the
-#       model/derived/q8 families and refused == 0, and no
-#       RANGE-PUBLISH REFUSED line anywhere in the boot.
-#   (p) LOOKUP MICRO-PARITY: the same boot under
-#       DS4_CUDA_RANGE_LOOKUP_PARITY=1 recomputes EVERY token-path range
-#       resolve against the legacy flat-keyed algorithm (a shadow index
-#       maintained with the old last-write-wins semantics).  After real
-#       decode traffic + graceful shutdown: checked > 0, divergent == 0,
-#       and the decode output is a terminal message.
+#       model/derived/q8 families, multi == 0 (memgov D1b-3: no
+#       device-copy range spans more than one plan unit) and
+#       refused == 0, and no RANGE-PUBLISH REFUSED line in the boot.
+#   (p) retired in D1b-3 with the legacy parity shadow it exercised
+#       (final reading checked=23520 divergent=0; multi==0 is the
+#       successor invariant).
 #
 # Usage: bash speed-bench/d1a1_source_gate.sh   (from the repo root)
 set -uo pipefail
@@ -97,8 +95,8 @@ R "grep -q 'ds4: range plan base:' $BOOTLOG" || die "no base range-plan line"
 R "grep -q 'ds4: range plan drafter:' $BOOTLOG" || die "no drafter range-plan line"
 R "grep -q 'RANGE-PUBLISH REFUSED' $BOOTLOG" && die "range publication refused at boot"
 BAD=$(R "grep 'ds4: range plan ' $BOOTLOG" \
-    | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7/' \
-    | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 {print}')
+    | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), multi ([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7 \8/' \
+    | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 || $8!=0 {print}')
 [ -z "$BAD" ] || die "range plan incomplete/refused: $BAD"
 # memgov D1b-1: the eager pass runs plan-first per source; funded units
 # never fail on a healthy boot.
@@ -142,8 +140,8 @@ R "grep -q 'RANGE-PUBLISH REFUSED' $BOOTLOG" && die "(s2) range publication refu
 R "grep -q 'ds4: materialize mtp: funded .* failed 0' $BOOTLOG" \
     || die "(s2) no clean mtp materialize line"
 BAD=$(R "grep 'ds4: range plan ' $BOOTLOG" \
-    | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7/' \
-    | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 {print}')
+    | sed -E 's/.*model ([0-9]+)\/([0-9]+) planned, derived ([0-9]+)\/([0-9]+), q8 ([0-9]+)\/([0-9]+), multi ([0-9]+), refused ([0-9]+).*/\1 \2 \3 \4 \5 \6 \7 \8/' \
+    | awk '$1!=$2 || $3!=$4 || $5!=$6 || $7!=0 || $8!=0 {print}')
 [ -z "$BAD" ] || die "(s2) range plan incomplete/refused: $BAD"
 CF2=$(met ds4_memory_census_faults_total)
 [ "$CF2" = "0" ] || die "(s2) census faults=$CF2"
@@ -153,25 +151,11 @@ sleep 8
 R 'ps -eo pid,comm | awk '"'"'$2=="ds4-server"{print $1}'"'"' | xargs -r kill -9' 2>/dev/null
 sleep 5
 
-log "(p) lookup micro-parity: parity boot + decode + graceful shutdown"
-BOOTLOG=/tmp/d1a1_boot_p.log
-boot_tree "$BOOTLOG" "DS4_CUDA_RANGE_LOOKUP_PARITY=1" "" || die "leg (p) boot failed"
-decode_one /tmp/d1a1_p_dec.json p || die "leg (p) decode failed"
-R "grep -q 'RANGE-PARITY DIVERGENT' $BOOTLOG" && die "range parity divergence during run"
-R "kill $SPID" 2>/dev/null
-for i in $(seq 60); do
-    R "grep -q 'ds4: range-lookup parity:' $BOOTLOG" && break
-    R "ps -eo comm | grep -q '^ds4-server'" || break
-    sleep 2
-done
-SPID=""
-PLINE=$(R "grep 'ds4: range-lookup parity:' $BOOTLOG | tail -1")
-[ -n "$PLINE" ] || die "no parity summary after graceful shutdown"
-CHECKED=$(echo "$PLINE" | sed -E 's/.*checked=([0-9]+).*/\1/')
-DIVERGENT=$(echo "$PLINE" | sed -E 's/.*divergent=([0-9]+).*/\1/')
-[ -n "$CHECKED" ] && [ "$CHECKED" -gt 0 ] || die "parity checked=$CHECKED (no coverage)"
-[ "$DIVERGENT" = "0" ] || die "parity divergent=$DIVERGENT"
-log "(p) PASS ($PLINE)"
+# (p) lookup micro-parity leg RETIRED in D1b-3 with its subject: the
+# D1a-1 legacy shadow index is deleted (divergent=0 held across every
+# close battery D1a-1 -> D1b-2, final reading checked=23520/0).  The
+# "multi 0" range-plan assert above is the successor invariant: every
+# device-copy range is exactly one plan unit.
 
 log "D1A1 SOURCE GATE: ALL LEGS PASS"
 cleanup
