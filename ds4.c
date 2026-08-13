@@ -36176,42 +36176,64 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 scl.proposed_outstanding = ctx->bank_census_eager + mres + mneed;
                 scl.class_limit = ctx->comp_map_budget != 0
                                 ? ctx->bank_census_eager + ctx->comp_map_budget : 0;
+                /* memgov D2-3: the boolean OWNER swap (plan sec 12 D2
+                 * consumer 3).  The legacy formulas and their trim
+                 * ACTORS run first, in live order -- class verdict after
+                 * the class trim above; floor trim then floor verdict
+                 * only when the class passed (a class refusal never
+                 * reached the floor trim before D2-3 either: side-effect
+                 * parity).  ONE governed check per growth admission
+                 * takes the composite legacy verdict (leg (d)'s cells ==
+                 * growth admissions stands); observe -- the default
+                 * until the D2-2b ratchet -- returns that verdict, so
+                 * behavior is bit-identical; enforce lets the quote
+                 * rule.  The frozen reject porcelain prints only when
+                 * its own formula refused (true numbers); an enforce
+                 * divergence discloses in the memgov format instead. */
+                int verdict = DS4_GOV_ADMIT;
+                uint64_t usable = 0;
                 if (ctx->comp_map_budget != 0 && mneed != 0 &&
                     mres + mneed > ctx->comp_map_budget) {
-                    ctx->mem_rejects++;
-                    ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
-                    fprintf(stderr,
-                            "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + projected credits %.1f MiB > budget %.1f MiB)\n",
-                            b, (double)mres / 1048576.0,
-                            (double)mneed / 1048576.0,
-                            (double)ctx->comp_map_budget / 1048576.0);
-                    ds4_gov_shadow_check("cont_admit", &scl,
-                                         DS4_GOV_REFUSE_CLASS);
-                    on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
-                    continue;
-                }
-                /* v0.5.4 governance inc1 (item 16): the budget above is a
-                 * boot-time PLAN and cannot see memory the box lost since
-                 * boot.  Every admission spend must ALSO fit live free
-                 * memory beyond the operator floor.  The union projection
-                 * already carries every credit's unfaulted growth, so mneed
-                 * IS the floor charge.  Trim can hand pages back (unmap is
-                 * exact and immediate), so it runs before the verdict;
-                 * credited banks stay inviolable. */
-                if (mneed != 0) {
-                    /* inc2: the serial reserve is spoken for -- growth may
-                     * not spend it (the serial lane's lazy graph draws from
-                     * this same pool at request time). */
-                    uint64_t usable = ds4_mem_usable_beyond(ctx->serial_reserve);
+                    verdict = DS4_GOV_REFUSE_CLASS;
+                } else if (mneed != 0) {
+                    /* v0.5.4 governance inc1 (item 16): the budget above
+                     * is a boot-time PLAN and cannot see memory the box
+                     * lost since boot.  Every admission spend must ALSO
+                     * fit live free memory beyond the operator floor.
+                     * The union projection already carries every
+                     * credit's unfaulted growth, so mneed IS the floor
+                     * charge.  Trim can hand pages back (unmap is exact
+                     * and immediate), so it runs before the verdict;
+                     * credited banks stay inviolable.  inc2: the serial
+                     * reserve is spoken for -- growth may not spend it
+                     * (the serial lane's lazy graph draws from this same
+                     * pool at request time). */
+                    usable = ds4_mem_usable_beyond(ctx->serial_reserve);
                     if (mneed > usable) {
                         if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
                                                       (fork || partial) ? (int)fsrc : -1,
                                                       mneed - usable, NULL) > 0)
                             usable = ds4_mem_usable_beyond(ctx->serial_reserve);
                     }
-                    if (mneed > usable) {
-                        ctx->mem_rejects++;
-                        ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
+                    if (mneed > usable) verdict = DS4_GOV_REFUSE_LIVE;
+                }
+                /* D2-1 (artifact 2, epoch-58): a zero-growth admit spends
+                 * nothing and takes NO verdict in any mode; the
+                 * publication below is the honest absolute refresh. */
+                const int final_verdict = mneed != 0
+                    ? ds4_gov_governed_check("cont_admit", &scl, verdict)
+                    : DS4_GOV_ADMIT;
+                if (final_verdict != DS4_GOV_ADMIT) {
+                    ctx->mem_rejects++;
+                    ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
+                    if (final_verdict == verdict &&
+                        verdict == DS4_GOV_REFUSE_CLASS) {
+                        fprintf(stderr,
+                                "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + projected credits %.1f MiB > budget %.1f MiB)\n",
+                                b, (double)mres / 1048576.0,
+                                (double)mneed / 1048576.0,
+                                (double)ctx->comp_map_budget / 1048576.0);
+                    } else if (final_verdict == verdict) {
                         fprintf(stderr,
                                 "ds4: cont admit rejected on memory floor (bank %u: projected credits %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor + %.2f GiB serial reserve + %.1f MiB substrate outstanding -- the box cannot fund this admission; --mem-floor-gb and DS4_SERIAL_RESERVE_CTX govern)\n",
                                 b, (double)mneed / 1048576.0,
@@ -36219,25 +36241,28 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                 (double)ds4_mem_floor_bytes() / 1073741824.0,
                                 (double)ctx->serial_reserve / 1073741824.0,
                                 (double)ds4_gpu_substrate_outstanding() / 1048576.0);
-                        ds4_gov_shadow_check("cont_admit", &scl,
-                                             DS4_GOV_REFUSE_LIVE);
-                        on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
-                        continue;
+                    } else {
+                        /* Enforce diverged from the legacy formula: the
+                         * quote's refusal rules.  Bounded like the
+                         * DISAGREE disclosure (which the shared core
+                         * already printed with the full quote). */
+                        static int enf_disclosed = 0;
+                        if (enf_disclosed < 16) {
+                            enf_disclosed++;
+                            fprintf(stderr,
+                                    "ds4: memgov ENFORCE refuse site=cont_admit bank=%u status=%d legacy=%d proposed=%llu class_limit=%llu\n",
+                                    b, final_verdict, verdict,
+                                    (unsigned long long)scl.proposed_outstanding,
+                                    (unsigned long long)scl.class_limit);
+                        }
                     }
+                    on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
+                    continue;
                 }
-                /* memgov D0b-3: both live verdicts passed -- shadow the
-                 * admit and publish the lane's absolute lease (intent =
-                 * eager cost + post-fault total, resident = eager cost +
-                 * what the page scan sees: the census basis).
-                 * D2-1 (artifact 2, D0b receipt epoch-58): a zero-growth
-                 * admit spends nothing and the live path takes NO memory
-                 * verdict -- neither does the shadow.  The old vacuous
-                 * quote charged mres minus a stale lease-resident as
-                 * phantom unfunded under pressure; the publication below
-                 * is the honest zero-growth act (absolute refresh, no
-                 * debt).  Enforce mode (D2-3) keeps this precondition. */
-                if (mneed != 0)
-                    ds4_gov_shadow_check("cont_admit", &scl, DS4_GOV_ADMIT);
+                /* Admission granted -- publish the lane's absolute lease
+                 * (intent = eager cost + post-fault total, resident =
+                 * eager cost + what the page scan sees: the census
+                 * basis). */
                 ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
                                     ctx->bank_census_eager + mres + mneed,
                                     ctx->bank_census_eager + mres);
