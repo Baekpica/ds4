@@ -12896,6 +12896,8 @@ static bool send_models(server *s, int fd) {
         append_model_json(&b, s, "glm-5.2-chat");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-reasoner");
+    } else if (ds4_engine_model_id(s->engine) == 3) {
+        append_model_json(&b, s, "motif-3");
     } else {
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
@@ -15088,6 +15090,8 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+    TEST_ASSERT(server_model_alias_known("motif-3"));
+    TEST_ASSERT(server_model_alias_known("Motif-Technologies/Motif-3"));
 }
 
 static void test_api_thinking_controls_parse(void) {
