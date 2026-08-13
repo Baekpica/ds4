@@ -374,6 +374,48 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     int             n_expert_used,
     cudaStream_t    stream);
 
+/* Experimental atomic IQ2->Q3 wide-prefill handoff (n_tokens >= 512). The
+ * aligned IQ2 pair
+ * producer remains unchanged and materializes its canonical F32 gate/up
+ * outputs.  While that producer's expert map is still live, a separate
+ * 128-thread epilogue emits weighted SwiGLU directly as D4 Q8_1 into
+ * q8_scratch and the established Q3 compact worklist consumes the SAME
+ * ids_dst/expert_bounds.  The caller owns all scratch; no persistent
+ * allocation is made.  Returns -1 only for pre-launch refusal, and <= -2
+ * for any failure after a launch has been queued. */
+int ds4_mmq_iq2_xxs_q3_K_moe_handoff_soa(
+    const void    * W_gate_soa,
+    const void    * W_up_soa,
+    const void    * W_down_q3,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    float         * gate_f32,
+    float         * up_f32,
+    void          * q8_scratch,
+    size_t          q8_scratch_bytes,
+    float         * down_f32,
+    int             expert_mid_dim,
+    int             expert_in_dim,
+    int             out_dim,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+/* Focused byte-parity test hooks for the handoff's D4 epilogue. */
+int ds4_mmq_swiglu_weighted_q8_d4_emit_test(
+    const float *gate, const float *up, const float *router_weights,
+    const int32_t *ids_dst, void *q8_out, int K, int n_assign,
+    cudaStream_t stream);
+int ds4_mmq_q3_K_quantize_ref(
+    const float *x, const int32_t *ids_dst, void *q8_out,
+    int K, int n_assign, cudaStream_t stream);
+int ds4_mmq_q3_K_worklist_preflight_test(
+    int M, int K, int64_t ne_get_rows, int n_experts,
+    int64_t stride_row_x, int64_t stride_channel_x);
+
+
 /* v0.5 inc-9 (F7): fused target-prefill pipeline over the aligned-SoA
  * IQ2_XXS gate/up and Q2_K down artifacts.  Builds the expert-major
  * assignment map once, runs the paired gate/up MMQs, computes clamp +

@@ -8,10 +8,14 @@
 #include "ds4_gpu.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 enum {
     T_VOCAB = 17,
@@ -27,10 +31,14 @@ enum {
     T_MOE_IN = 256,
     T_MOE_OUT = 64,
     T_IQ2_IN = 1024,
-    /* 128 * top-8 reaches the production D2R threshold and exercises the
-     * aligned routed gate/up pair path, including ragged expert buckets. */
-    T_IQ2_OUT = 128,
-    T_IQ2_TOKENS = 128,
+    /* Solar Open2's routed expert intermediate width. Keeping the production
+     * 1280 here exercises all ten k128 D4 blocks, including the final partial
+     * four-warp emitter CTA, instead of only the first two blocks. */
+    T_IQ2_OUT = 1280,
+    /* 512 * top-8 reaches the production D2R threshold while staying above
+     * the handoff's conservative prefill-only floor. It exercises the aligned
+     * routed gate/up pair path, including ragged expert buckets. */
+    T_IQ2_TOKENS = 512,
     /* 512 also satisfies the dense MMQ row-padding contract, so the test's
      * verify mode byte-diffs the producer mirror against the real reference
      * quantizer instead of declining the diagnostic. */
@@ -111,16 +119,24 @@ static void compare_f32(const char *label, const float *got, const float *want,
                         size_t n, double atol, double rtol) {
     double max_abs = 0.0, max_rel = 0.0;
     size_t worst = 0;
+    size_t first_nonfinite = 0, nonfinite = 0;
     for (size_t i = 0; i < n; i++) {
+        if (!isfinite(got[i]) || !isfinite(want[i])) {
+            if (nonfinite == 0) first_nonfinite = i;
+            nonfinite++;
+            continue;
+        }
         const double delta = fabs((double)got[i] - want[i]);
         const double scale = fmax(fabs((double)got[i]), fabs((double)want[i]));
         if (delta > max_abs) { max_abs = delta; worst = i; }
         if (scale > 1.0e-12 && delta / scale > max_rel) max_rel = delta / scale;
     }
-    const int ok = max_abs <= atol || max_rel <= rtol;
+    const int ok = nonfinite == 0 && (max_abs <= atol || max_rel <= rtol);
     if (!ok) failures++;
-    printf("%-38s abs=%.3e rel=%.3e worst=%zu %s\n",
-           label, max_abs, max_rel, worst, ok ? "ok" : "FAIL");
+    printf("%-38s abs=%.3e rel=%.3e worst=%zu nonfinite=%zu",
+           label, max_abs, max_rel, worst, nonfinite);
+    if (nonfinite != 0) printf(" first_nonfinite=%zu", first_nonfinite);
+    printf(" %s\n", ok ? "ok" : "FAIL");
 }
 
 static void fill_q8_embedding(unsigned char *table) {
@@ -328,6 +344,88 @@ static void test_weighted_swiglu(void) {
     free(got); free(want); free(weights); free(up); free(gate);
 }
 
+static void test_weighted_swiglu_q8_d4_bytes(void) {
+    enum { NA = 64, K = 1280 };
+    const size_t count = (size_t)NA * K;
+    const size_t q8_bytes = (count / 128u) * 144u;
+    float *gate = malloc(count * sizeof(float));
+    float *up = malloc(count * sizeof(float));
+    float weights[NA];
+    int32_t ids_dst[NA];
+    unsigned char *emit = malloc(q8_bytes);
+    unsigned char *ref = malloc(q8_bytes);
+    REQUIRE(gate && up && emit && ref, "D4 parity host arrays");
+    for (int p = 0; p < NA; p++) {
+        ids_dst[p] = (int32_t)((p * 37) % NA);
+        weights[p] = (p & 1) ? -0.07f * (float)(p + 1)
+                             : 0.03f * (float)(p + 1);
+    }
+    for (size_t i = 0; i < count; i++) {
+        gate[i] = 2.1f * sinf(0.011f * (float)(i + 1u));
+        up[i] = 1.7f * cosf(0.019f * (float)(i + 7u));
+    }
+    gate[3] = NAN; up[37] = INFINITY; gate[95] = -INFINITY;
+    /* One complete 32-value D4 subgroup is exactly zero.  This fixes the
+     * canonical 127/amax infinity path (including its byte representation)
+     * as part of the fused-emitter parity contract. */
+    const int zero_pair = ids_dst[1];
+    for (int k = 64; k < 96; k++) {
+        gate[(size_t)zero_pair * K + (size_t)k] = 0.0f;
+        up[(size_t)zero_pair * K + (size_t)k] = 0.0f;
+    }
+    ds4_gpu_tensor *dg = ds4_gpu_tensor_alloc(count * sizeof(float));
+    ds4_gpu_tensor *du = ds4_gpu_tensor_alloc(count * sizeof(float));
+    ds4_gpu_tensor *dw = ds4_gpu_tensor_alloc(sizeof(weights));
+    ds4_gpu_tensor *dm = ds4_gpu_tensor_alloc(count * sizeof(float));
+    ds4_gpu_tensor *di = ds4_gpu_tensor_alloc(sizeof(ids_dst));
+    ds4_gpu_tensor *de = ds4_gpu_tensor_alloc(q8_bytes);
+    ds4_gpu_tensor *dr = ds4_gpu_tensor_alloc(q8_bytes);
+    REQUIRE(dg && du && dw && dm && di && de && dr, "D4 parity tensors");
+    REQUIRE(ds4_gpu_tensor_write(dg, 0, gate, count * sizeof(float)),
+            "write D4 gate");
+    REQUIRE(ds4_gpu_tensor_write(du, 0, up, count * sizeof(float)),
+            "write D4 up");
+    REQUIRE(ds4_gpu_tensor_write(dw, 0, weights, sizeof(weights)),
+            "write D4 router weights");
+    REQUIRE(ds4_gpu_tensor_write(di, 0, ids_dst, sizeof(ids_dst)),
+            "write D4 ids_dst");
+    /* Generate the reference mid with the production GPU SwiGLU kernel;
+     * host expf is not byte-equivalent to device fast-math. */
+    REQUIRE(ds4_gpu_swiglu_weighted_tensor(dm, dg, du, dw, K, count),
+            "production GPU weighted SwiGLU reference");
+    REQUIRE(ds4_gpu_swiglu_weighted_q8_d4_emit_test(
+                de, dg, du, dw, di, K, NA), "D4 fused emit");
+    REQUIRE(ds4_gpu_q3_quantize_ref_test(dr, dm, di, K, NA),
+            "canonical Q3 D4 reference quantize");
+    REQUIRE(ds4_gpu_tensor_read(de, 0, emit, q8_bytes), "read D4 emit");
+    REQUIRE(ds4_gpu_tensor_read(dr, 0, ref, q8_bytes), "read D4 ref");
+    const int same = memcmp(emit, ref, q8_bytes) == 0;
+    printf("%-38s %s\n", "weighted SwiGLU Q8 D4 bytes",
+           same ? "ok" : "FAIL");
+    if (!same) failures++;
+    ds4_gpu_tensor_free(dr); ds4_gpu_tensor_free(de); ds4_gpu_tensor_free(di);
+    ds4_gpu_tensor_free(dm); ds4_gpu_tensor_free(dw); ds4_gpu_tensor_free(du);
+    ds4_gpu_tensor_free(dg);
+    free(ref); free(emit); free(up); free(gate);
+}
+
+static void test_q3_worklist_index_bounds(void) {
+    /* Solar production down: [4096,1280], 4096 tokens * top-8, 320 experts. */
+    REQUIRE(ds4_gpu_q3_worklist_preflight_test(
+                4096, 1280, 4096ll * 8ll, 320, 5, 4096ll * 5ll),
+            "Q3 worklist accepts Solar production geometry");
+    REQUIRE(!ds4_gpu_q3_worklist_preflight_test(
+                128, 256, 1, 2, 1, INT_MAX),
+            "Q3 worklist rejects weight int-offset overflow");
+    REQUIRE(!ds4_gpu_q3_worklist_preflight_test(
+                128, 1280, 10000000ll, 1, 5, 640),
+            "Q3 worklist rejects Q8 int-span overflow");
+    REQUIRE(!ds4_gpu_q3_worklist_preflight_test(
+                128, 256, 20000000ll, 1, 1, 128),
+            "Q3 worklist rejects destination int-span overflow");
+    printf("%-38s ok\n", "Q3 worklist signed-index bounds");
+}
+
 static void test_rms_norm_q8_producer(void *map, uint64_t map_size,
                                       uint64_t norm_off) {
     const size_t count = (size_t)T_NORM_ROWS * T_NORM_DIM;
@@ -378,9 +476,8 @@ static uint32_t next_u32(uint32_t *state) {
     return *state;
 }
 
-static void fill_q3_weights(test_block_q3_k *weights) {
-    uint32_t state = 0x51a7c0deu;
-    const size_t blocks = (size_t)T_MOE_EXPERT * T_MOE_OUT;
+static void fill_q3_weights(test_block_q3_k *weights, size_t blocks,
+                            uint32_t state) {
     for (size_t b = 0; b < blocks; b++) {
         for (size_t i = 0; i < sizeof(weights[b].hmask); i++) {
             weights[b].hmask[i] = (uint8_t)(next_u32(&state) >> 24);
@@ -499,6 +596,32 @@ static void fill_iq2_weights(unsigned char *weights, uint64_t blocks,
     }
 }
 
+static void build_iq2_artifacts(void *map, uint64_t map_size,
+                                uint64_t gate_off, uint64_t up_off,
+                                uint64_t weight_bytes) {
+    const char gate_name[] = "blk.4.ffn_gate_exps.weight";
+    const char up_name[] = "blk.4.ffn_up_exps.weight";
+    ds4_gpu_tensor_record records[2] = {
+        {
+            .name = gate_name, .name_len = sizeof(gate_name) - 1u,
+            .type = 16u, .ndim = 3u,
+            .dims = {T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT, 0u},
+            .offset = gate_off, .bytes = weight_bytes,
+        },
+        {
+            .name = up_name, .name_len = sizeof(up_name) - 1u,
+            .type = 16u, .ndim = 3u,
+            .dims = {T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT, 0u},
+            .offset = up_off, .bytes = weight_bytes,
+        },
+    };
+    REQUIRE(ds4_gpu_build_derived_artifacts_from_records(
+                map, map_size, records, 2u) == 2,
+            "build IQ2 artifacts from merged records");
+    REQUIRE(ds4_gpu_model_map_replacements_complete(map),
+            "IQ2 replacement set complete");
+}
+
 static void test_iq2_aligned_pair(void *map, uint64_t map_size,
                                   uint64_t gate_off, uint64_t up_off,
                                   uint64_t weight_bytes) {
@@ -546,27 +669,7 @@ static void test_iq2_aligned_pair(void *map, uint64_t map_size,
     REQUIRE(ds4_gpu_tensor_read(du_raw, 0, raw_up,
                                 out_n * sizeof(float)), "read raw IQ2 up");
 
-    const char gate_name[] = "blk.4.ffn_gate_exps.weight";
-    const char up_name[] = "blk.4.ffn_up_exps.weight";
-    ds4_gpu_tensor_record records[2] = {
-        {
-            .name = gate_name, .name_len = sizeof(gate_name) - 1u,
-            .type = 16u, .ndim = 3u,
-            .dims = {T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT, 0u},
-            .offset = gate_off, .bytes = weight_bytes,
-        },
-        {
-            .name = up_name, .name_len = sizeof(up_name) - 1u,
-            .type = 16u, .ndim = 3u,
-            .dims = {T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT, 0u},
-            .offset = up_off, .bytes = weight_bytes,
-        },
-    };
-    REQUIRE(ds4_gpu_build_derived_artifacts_from_records(
-                map, map_size, records, 2u) == 2,
-            "build IQ2 artifacts from merged records");
-    REQUIRE(ds4_gpu_model_map_replacements_complete(map),
-            "IQ2 replacement set complete");
+    build_iq2_artifacts(map, map_size, gate_off, up_off, weight_bytes);
     REQUIRE(ds4_gpu_routed_gate_up_tensor(
         dg_al, du_al, dx, di, map, map_size,
         gate_off, weight_bytes, up_off, weight_bytes, 16u,
@@ -589,7 +692,309 @@ static void test_iq2_aligned_pair(void *map, uint64_t map_size,
     free(ids); free(x);
 }
 
-int main(void) {
+static void test_iq2_q3_handoff_contract(void *map, uint64_t map_size,
+                                         uint64_t gate_off, uint64_t up_off,
+                                         uint64_t iq2_bytes,
+                                         uint64_t q3_off, uint64_t q3_bytes) {
+    const size_t x_n = (size_t)T_IQ2_TOKENS * T_IQ2_IN;
+    const size_t pair_n = (size_t)T_IQ2_TOKENS * T_MOE_USED;
+    const size_t mid_n = pair_n * T_IQ2_OUT;
+    const size_t down_n = pair_n * T_MOE_OUT;
+    float *x = malloc(x_n * sizeof(*x));
+    int32_t *ids = malloc(pair_n * sizeof(*ids));
+    float *weights = malloc(pair_n * sizeof(*weights));
+    float *want = malloc(down_n * sizeof(*want));
+    float *got = malloc(down_n * sizeof(*got));
+    REQUIRE(x && ids && weights && want && got,
+            "IQ2/Q3 handoff host arrays");
+    for (size_t i = 0; i < x_n; i++) {
+        x[i] = 0.35f * sinf(0.009f * (float)(i + 1u)) +
+               0.15f * cosf(0.023f * (float)(i + 3u));
+    }
+    for (size_t p = 0; p < pair_n; p++) {
+        ids[p] = (int32_t)((p * 11u + p / T_MOE_USED * 5u) % T_MOE_EXPERT);
+        weights[p] = 0.03f + 0.002f * (float)(p % 23u);
+    }
+
+    ds4_gpu_tensor *dx = ds4_gpu_tensor_alloc(x_n * sizeof(*x));
+    ds4_gpu_tensor *di = ds4_gpu_tensor_alloc(pair_n * sizeof(*ids));
+    ds4_gpu_tensor *dw = ds4_gpu_tensor_alloc(pair_n * sizeof(*weights));
+    ds4_gpu_tensor *dg = ds4_gpu_tensor_alloc(mid_n * sizeof(float));
+    ds4_gpu_tensor *du = ds4_gpu_tensor_alloc(mid_n * sizeof(float));
+    ds4_gpu_tensor *dm = ds4_gpu_tensor_alloc(mid_n * sizeof(float));
+    ds4_gpu_tensor *dy_ref = ds4_gpu_tensor_alloc(down_n * sizeof(float));
+    ds4_gpu_tensor *dy = ds4_gpu_tensor_alloc(down_n * sizeof(float));
+    REQUIRE(dx && di && dw && dg && du && dm && dy_ref && dy,
+            "IQ2/Q3 handoff tensors");
+    REQUIRE(ds4_gpu_tensor_write(dx, 0, x, x_n * sizeof(*x)),
+            "write IQ2/Q3 activation");
+    REQUIRE(ds4_gpu_tensor_write(di, 0, ids, pair_n * sizeof(*ids)),
+            "write IQ2/Q3 ids");
+    REQUIRE(ds4_gpu_tensor_write(dw, 0, weights, pair_n * sizeof(*weights)),
+            "write IQ2/Q3 router weights");
+    REQUIRE(ds4_gpu_routed_gate_up_tensor(
+                dg, du, dx, di, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes, 16u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_EXPERT,
+                T_IQ2_TOKENS, T_MOE_USED),
+            "IQ2/Q3 classic gate/up");
+    REQUIRE(ds4_gpu_swiglu_weighted_tensor(
+                dm, dg, du, dw, T_IQ2_OUT, mid_n),
+            "IQ2/Q3 classic weighted SwiGLU");
+    REQUIRE(ds4_gpu_routed_matmul_bounded_tensor(
+                dy_ref, dm, di, map, map_size, q3_off, q3_bytes, 11u,
+                T_IQ2_OUT, T_MOE_OUT, T_MOE_EXPERT,
+                (uint32_t)pair_n, 1u, T_IQ2_TOKENS),
+            "IQ2/Q3 classic Q3 down");
+    REQUIRE(ds4_gpu_tensor_read(dy_ref, 0, want, down_n * sizeof(*want)),
+            "read IQ2/Q3 classic down");
+
+    REQUIRE(unsetenv("DS4_CUDA_MOE_IQ2_Q3_HANDOFF") == 0,
+            "use default-on IQ2/Q3 handoff policy");
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, T_MOE_EXPERT,
+                T_IQ2_TOKENS, T_MOE_USED) == 1,
+            "default-unset IQ2/Q3 fused handoff accepted");
+    REQUIRE(ds4_cuda_moe_iq2_q3_handoff_launches() > 0,
+            "IQ2/Q3 fused handoff launch proof");
+    REQUIRE(ds4_gpu_tensor_read(dy, 0, got, down_n * sizeof(*got)),
+            "read IQ2/Q3 fused down");
+    compare_f32("IQ2/Q3 handoff vs classic", got, want, down_n,
+                2.0e-3, 2.0e-2);
+
+    const unsigned long long default_launches =
+        ds4_cuda_moe_iq2_q3_handoff_launches();
+    REQUIRE(setenv("DS4_CUDA_MOE_IQ2_Q3_HANDOFF", "1", 1) == 0,
+            "explicitly enable IQ2/Q3 handoff");
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, T_MOE_EXPERT,
+                T_IQ2_TOKENS, T_MOE_USED) == 1,
+            "explicit-1 IQ2/Q3 fused handoff accepted");
+    REQUIRE(ds4_cuda_moe_iq2_q3_handoff_launches() > default_launches,
+            "explicit-1 IQ2/Q3 launch proof");
+
+    /* Decode, sub-threshold batches, and Q4 are pre-launch refusals, so the
+     * caller can safely run the established chain. */
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, T_MOE_EXPERT,
+                1u, T_MOE_USED) == 0,
+            "IQ2/Q3 handoff refuses decode");
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, T_MOE_EXPERT,
+                4u, T_MOE_USED) == 0,
+            "IQ2/Q3 handoff refuses continuous decode width");
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, T_MOE_EXPERT,
+                511u, T_MOE_USED) == 0,
+            "IQ2/Q3 handoff refuses 511-token boundary");
+    const unsigned long long overflow_launches =
+        ds4_cuda_moe_iq2_q3_handoff_launches();
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, (uint32_t)INT_MAX,
+                T_IQ2_TOKENS, T_MOE_USED) == 0,
+            "IQ2/Q3 handoff refuses INT_MAX experts");
+    REQUIRE(ds4_cuda_moe_iq2_q3_handoff_launches() == overflow_launches,
+            "overflow refusal leaves launch counter unchanged");
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, 65536u,
+                T_IQ2_TOKENS, T_MOE_USED) == 0,
+            "IQ2/Q3 handoff refuses CUDA grid-z overflow");
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, 32769u,
+                T_IQ2_TOKENS, T_MOE_USED) == 0,
+            "IQ2/Q3 handoff refuses signed D2R expert packing overflow");
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, 1048576u, T_MOE_OUT, T_MOE_EXPERT,
+                T_IQ2_TOKENS, T_MOE_USED) == 0,
+            "IQ2/Q3 handoff refuses gate/up int-span overflow");
+    REQUIRE(ds4_cuda_moe_iq2_q3_handoff_launches() == overflow_launches,
+            "gate/up overflow refusal leaves launch counter unchanged");
+    REQUIRE(!ds4_gpu_swiglu_weighted_q8_d4_emit_test(
+                dm, dg, du, dw, di, 0x80000000u, 1u),
+            "D4 diagnostic refuses mid_dim above INT_MAX");
+    REQUIRE(!ds4_gpu_q3_quantize_ref_test(
+                dm, dg, di, T_IQ2_OUT, 0x80000000u),
+            "D4 diagnostic refuses assignment count above INT_MAX");
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 12u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, T_MOE_EXPERT,
+                T_IQ2_TOKENS, T_MOE_USED) == 0,
+            "IQ2/Q3 handoff refuses Q4 down");
+
+    ds4_gpu_tensor_free(dy); ds4_gpu_tensor_free(dy_ref);
+    ds4_gpu_tensor_free(dm); ds4_gpu_tensor_free(du); ds4_gpu_tensor_free(dg);
+    ds4_gpu_tensor_free(dw); ds4_gpu_tensor_free(di); ds4_gpu_tensor_free(dx);
+    free(got); free(want);
+    free(weights); free(ids); free(x);
+}
+
+static void fill_sentinel(unsigned char *dst, size_t bytes, uint8_t seed) {
+    for (size_t i = 0; i < bytes; i++) {
+        dst[i] = (uint8_t)(seed + 29u * (uint8_t)i);
+    }
+}
+
+static void test_iq2_q3_handoff_prelaunch_refusal(
+        void *map, uint64_t map_size, uint64_t gate_off, uint64_t up_off,
+        uint64_t iq2_bytes, uint64_t q3_off, uint64_t q3_bytes,
+        const char *case_name) {
+    const size_t x_n = (size_t)T_IQ2_TOKENS * T_IQ2_IN;
+    const size_t pair_n = (size_t)T_IQ2_TOKENS * T_MOE_USED;
+    const size_t mid_bytes = pair_n * T_IQ2_OUT * sizeof(float);
+    const size_t down_bytes = pair_n * T_MOE_OUT * sizeof(float);
+    float *x = calloc(x_n, sizeof(*x));
+    int32_t *ids = calloc(pair_n, sizeof(*ids));
+    float *weights = calloc(pair_n, sizeof(*weights));
+    unsigned char *before = malloc(mid_bytes);
+    unsigned char *after = malloc(mid_bytes);
+    REQUIRE(x && ids && weights && before && after,
+            "prelaunch refusal host arrays");
+    for (size_t p = 0; p < pair_n; p++) {
+        ids[p] = (int32_t)(p % T_MOE_EXPERT);
+        weights[p] = 0.125f;
+    }
+
+    ds4_gpu_tensor *dx = ds4_gpu_tensor_alloc(x_n * sizeof(*x));
+    ds4_gpu_tensor *di = ds4_gpu_tensor_alloc(pair_n * sizeof(*ids));
+    ds4_gpu_tensor *dw = ds4_gpu_tensor_alloc(pair_n * sizeof(*weights));
+    ds4_gpu_tensor *dg = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *du = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *dm = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *dy = ds4_gpu_tensor_alloc(down_bytes);
+    REQUIRE(dx && di && dw && dg && du && dm && dy,
+            "prelaunch refusal tensors");
+    REQUIRE(ds4_gpu_tensor_write(dx, 0, x, x_n * sizeof(*x)),
+            "write prelaunch-refusal activation");
+    REQUIRE(ds4_gpu_tensor_write(di, 0, ids, pair_n * sizeof(*ids)),
+            "write prelaunch-refusal ids");
+    REQUIRE(ds4_gpu_tensor_write(dw, 0, weights, pair_n * sizeof(*weights)),
+            "write prelaunch-refusal router weights");
+
+#define CHECK_REFUSAL_SENTINEL(tensor_, bytes_, seed_, label_) do {          \
+        fill_sentinel(before, (bytes_), (seed_));                            \
+        REQUIRE(ds4_gpu_tensor_write((tensor_), 0, before, (bytes_)),        \
+                "write " label_ " sentinel");                             \
+    } while (0)
+    CHECK_REFUSAL_SENTINEL(dg, mid_bytes, 0x11u, "gate");
+    CHECK_REFUSAL_SENTINEL(du, mid_bytes, 0x37u, "up");
+    CHECK_REFUSAL_SENTINEL(dm, mid_bytes, 0x59u, "Q8 scratch");
+    CHECK_REFUSAL_SENTINEL(dy, down_bytes, 0x7bu, "down");
+#undef CHECK_REFUSAL_SENTINEL
+
+    const unsigned long long launches_before =
+        ds4_cuda_moe_iq2_q3_handoff_launches();
+    REQUIRE(ds4_gpu_routed_iq2_q3_handoff_tensor(
+                dy, dg, du, dm, dx, di, dw, map, map_size,
+                gate_off, iq2_bytes, up_off, iq2_bytes,
+                q3_off, q3_bytes, 16u, 11u,
+                T_IQ2_IN, T_IQ2_OUT, T_MOE_OUT, T_MOE_EXPERT,
+                T_IQ2_TOKENS, T_MOE_USED) == 0,
+            "IQ2/Q3 handoff refused before launch");
+    REQUIRE(ds4_cuda_moe_iq2_q3_handoff_launches() == launches_before,
+            "prelaunch refusal does not increment launch counter");
+
+#define REQUIRE_REFUSAL_SENTINEL(tensor_, bytes_, seed_, label_) do {        \
+        fill_sentinel(before, (bytes_), (seed_));                            \
+        REQUIRE(ds4_gpu_tensor_read((tensor_), 0, after, (bytes_)),          \
+                "read " label_ " sentinel");                              \
+        REQUIRE(memcmp(before, after, (bytes_)) == 0,                        \
+                label_ " unchanged after refusal");                        \
+    } while (0)
+    REQUIRE_REFUSAL_SENTINEL(dg, mid_bytes, 0x11u, "gate");
+    REQUIRE_REFUSAL_SENTINEL(du, mid_bytes, 0x37u, "up");
+    REQUIRE_REFUSAL_SENTINEL(dm, mid_bytes, 0x59u, "Q8 scratch");
+    REQUIRE_REFUSAL_SENTINEL(dy, down_bytes, 0x7bu, "down");
+#undef REQUIRE_REFUSAL_SENTINEL
+
+    printf("%-38s ok\n", case_name);
+
+    ds4_gpu_tensor_free(dy); ds4_gpu_tensor_free(dm);
+    ds4_gpu_tensor_free(du); ds4_gpu_tensor_free(dg);
+    ds4_gpu_tensor_free(dw); ds4_gpu_tensor_free(di); ds4_gpu_tensor_free(dx);
+    free(after); free(before); free(weights); free(ids); free(x);
+}
+
+static void test_iq2_q3_xmax64_subprocess(void) {
+    const pid_t pid = fork();
+    REQUIRE(pid >= 0, "fork X_MAX=64 refusal subprocess");
+    if (pid == 0) {
+        REQUIRE(setenv("DS4_CUDA_MMQ_X_MAX", "64", 1) == 0,
+                "set X_MAX=64 in refusal subprocess");
+        REQUIRE(setenv("DS4_CUDA_MOE_IQ2_Q3_HANDOFF", "1", 1) == 0,
+                "enable handoff in refusal subprocess");
+        execl("/proc/self/exe", "test_model_family_kernels",
+              "--iq2-q3-xmax64-refusal", (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    REQUIRE(waitpid(pid, &status, 0) == pid,
+            "wait X_MAX=64 refusal subprocess");
+    REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+            "X_MAX=64 refusal subprocess passed");
+}
+
+static void test_iq2_q3_disabled_policy_subprocess(void) {
+    const pid_t pid = fork();
+    REQUIRE(pid >= 0, "fork disabled-policy refusal subprocess");
+    if (pid == 0) {
+        REQUIRE(unsetenv("DS4_CUDA_MMQ_X_MAX") == 0,
+                "unset X_MAX in disabled-policy subprocess");
+        REQUIRE(setenv("DS4_CUDA_MOE_IQ2_Q3_HANDOFF", "0", 1) == 0,
+                "disable handoff in policy subprocess");
+        execl("/proc/self/exe", "test_model_family_kernels",
+              "--iq2-q3-disabled-policy-refusal", (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    REQUIRE(waitpid(pid, &status, 0) == pid,
+            "wait disabled-policy refusal subprocess");
+    REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+            "disabled-policy refusal subprocess passed");
+}
+
+int main(int argc, char **argv) {
+    const int xmax64_refusal_only =
+        argc == 2 && strcmp(argv[1], "--iq2-q3-xmax64-refusal") == 0;
+    const int disabled_policy_refusal_only =
+        argc == 2 &&
+        strcmp(argv[1], "--iq2-q3-disabled-policy-refusal") == 0;
+    const int refusal_only =
+        xmax64_refusal_only || disabled_policy_refusal_only;
+    REQUIRE(argc == 1 || refusal_only,
+            "recognized model-family test argument");
+    if (!refusal_only) {
+        test_iq2_q3_xmax64_subprocess();
+        test_iq2_q3_disabled_policy_subprocess();
+    }
     REQUIRE(ds4_gpu_init(), "CUDA init");
     const uint64_t embed_off = 4096u;
     const uint64_t embed_bytes = (uint64_t)T_VOCAB * (T_EMBD / 32u) * 34u;
@@ -604,27 +1009,67 @@ int main(void) {
     const uint64_t iq2_bytes = iq2_blocks * 66u;
     const uint64_t iq2_up_off =
         (iq2_gate_off + iq2_bytes + 4095u) & ~4095ull;
-    const uint64_t map_size =
+    const uint64_t handoff_q3_off =
         (iq2_up_off + iq2_bytes + 4095u) & ~4095ull;
+    const uint64_t handoff_q3_blocks =
+        (uint64_t)T_MOE_EXPERT * T_MOE_OUT * (T_IQ2_OUT / 256u);
+    const uint64_t handoff_q3_bytes =
+        handoff_q3_blocks * sizeof(test_block_q3_k);
+    const uint64_t map_size =
+        (handoff_q3_off + handoff_q3_bytes + 4095u) & ~4095ull;
     void *map = NULL;
     REQUIRE(posix_memalign(&map, 4096u, (size_t)map_size) == 0, "model map alloc");
     memset(map, 0, (size_t)map_size);
     fill_q8_embedding((unsigned char *)map + embed_off);
-    fill_q3_weights((test_block_q3_k *)((unsigned char *)map + q3_off));
+    fill_q3_weights((test_block_q3_k *)((unsigned char *)map + q3_off),
+                    (size_t)T_MOE_EXPERT * T_MOE_OUT, 0x51a7c0deu);
+    fill_q3_weights(
+        (test_block_q3_k *)((unsigned char *)map + handoff_q3_off),
+        (size_t)handoff_q3_blocks, 0x7e57c0deu);
     fill_iq2_weights((unsigned char *)map + iq2_gate_off,
                      iq2_blocks, 0x13579bdfu);
     fill_iq2_weights((unsigned char *)map + iq2_up_off,
                      iq2_blocks, 0x2468ace0u);
     REQUIRE(ds4_gpu_set_model_map(map, map_size), "model map registration");
 
+    if (refusal_only) {
+        build_iq2_artifacts(map, map_size, iq2_gate_off, iq2_up_off,
+                            iq2_bytes);
+        test_iq2_q3_handoff_prelaunch_refusal(
+            map, map_size, iq2_gate_off, iq2_up_off, iq2_bytes,
+            handoff_q3_off, handoff_q3_bytes,
+            xmax64_refusal_only ? "X_MAX=64 prelaunch refusal"
+                                : "env=0 prelaunch refusal");
+        if (disabled_policy_refusal_only) {
+            REQUIRE(setenv("DS4_CUDA_MOE_IQ2_Q3_HANDOFF", "invalid", 1) == 0,
+                    "set invalid handoff policy value");
+            test_iq2_q3_handoff_prelaunch_refusal(
+                map, map_size, iq2_gate_off, iq2_up_off, iq2_bytes,
+                handoff_q3_off, handoff_q3_bytes,
+                "invalid-env prelaunch refusal");
+        }
+        ds4_gpu_unregister_model_map(map);
+        free(map);
+        ds4_gpu_cleanup();
+        puts(xmax64_refusal_only
+                 ? "IQ2/Q3 X_MAX=64 prelaunch refusal passed"
+                 : "IQ2/Q3 disabled policy refusals passed");
+        return failures ? 1 : 0;
+    }
+
     puts("== generic model-family CUDA primitives ==");
     test_embedding(map, map_size, embed_off);
     test_router(map, map_size, bias_off);
     test_weighted_swiglu();
+    test_weighted_swiglu_q8_d4_bytes();
+    test_q3_worklist_index_bounds();
     test_rms_norm_q8_producer(map, map_size, norm_off);
     test_q3_routed_matmul(map, map_size, q3_off, q3_bytes);
     test_iq2_aligned_pair(map, map_size, iq2_gate_off, iq2_up_off,
                           iq2_bytes);
+    test_iq2_q3_handoff_contract(map, map_size,
+                                 iq2_gate_off, iq2_up_off, iq2_bytes,
+                                 handoff_q3_off, handoff_q3_bytes);
 
     ds4_gpu_unregister_model_map(map);
     free(map);

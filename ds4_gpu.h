@@ -2006,6 +2006,55 @@ int ds4_gpu_routed_gate_up_tensor(
         uint32_t                n_tokens,
         uint32_t                n_expert_used);
 
+/* Default-on wide-prefill handoff (n_tokens >= 512) for Solar's IQ2_XXS
+ * gate/up + Q3_K down layers. The conservative floor keeps multi-sequence
+ * decode batches (currently capped at 128 rows) on the established path.
+ * DS4_CUDA_MOE_IQ2_Q3_HANDOFF=0 disables it; exactly 1 enables it explicitly,
+ * while any other explicit value disables it conservatively. Returns 1 only
+ * after the fused launch sequence is accepted, 0 when disabled or when the
+ * complete shape/artifact contract is refused before launch, and -1 after any
+ * launch-time failure (callers must not replay the classic chain after a
+ * partial launch). */
+int ds4_gpu_routed_iq2_q3_handoff_tensor(
+        ds4_gpu_tensor       *down,
+        ds4_gpu_tensor       *gate_scratch,
+        ds4_gpu_tensor       *up_scratch,
+        ds4_gpu_tensor       *q8_scratch,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *router_weights,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                gate_bytes,
+        uint64_t                up_offset,
+        uint64_t                up_bytes,
+        uint64_t                down_offset,
+        uint64_t                down_bytes,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint32_t                in_dim,
+        uint32_t                mid_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used);
+
+/* Test/diagnostic proof that the handoff launched. */
+unsigned long long ds4_cuda_moe_iq2_q3_handoff_launches(void);
+
+int ds4_gpu_swiglu_weighted_q8_d4_emit_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, const ds4_gpu_tensor *router_weights,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim, uint32_t n_assign);
+int ds4_gpu_q3_quantize_ref_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim, uint32_t n_assign);
+int ds4_gpu_q3_worklist_preflight_test(
+        int32_t out_dim, int32_t mid_dim, int64_t n_assign,
+        int32_t n_expert, int64_t stride_row, int64_t stride_expert);
+
+
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,

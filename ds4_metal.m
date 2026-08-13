@@ -6343,6 +6343,57 @@ int ds4_gpu_matmul_q8_0_top2_tensor(
     return 0;
 }
 
+int ds4_gpu_routed_iq2_q3_handoff_tensor(
+        ds4_gpu_tensor *down, ds4_gpu_tensor *gate_scratch,
+        ds4_gpu_tensor *up_scratch, ds4_gpu_tensor *q8_scratch,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *router_weights,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t gate_bytes,
+        uint64_t up_offset, uint64_t up_bytes,
+        uint64_t down_offset, uint64_t down_bytes,
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        uint32_t n_expert, uint32_t n_tokens, uint32_t n_expert_used) {
+    (void)down; (void)gate_scratch; (void)up_scratch; (void)q8_scratch;
+    (void)x; (void)ids; (void)router_weights; (void)model_map;
+    (void)model_size; (void)gate_offset; (void)gate_bytes;
+    (void)up_offset; (void)up_bytes; (void)down_offset; (void)down_bytes;
+    (void)gate_type; (void)down_type; (void)in_dim; (void)mid_dim;
+    (void)out_dim; (void)n_expert; (void)n_tokens; (void)n_expert_used;
+    return 0;
+}
+
+unsigned long long ds4_cuda_moe_iq2_q3_handoff_launches(void) {
+    return 0;
+}
+
+int ds4_gpu_q3_worklist_preflight_test(
+        int32_t out_dim, int32_t mid_dim, int64_t n_assign,
+        int32_t n_expert, int64_t stride_row, int64_t stride_expert) {
+    (void)out_dim; (void)mid_dim; (void)n_assign; (void)n_expert;
+    (void)stride_row; (void)stride_expert;
+    return 0;
+}
+
+int ds4_gpu_swiglu_weighted_q8_d4_emit_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, const ds4_gpu_tensor *router_weights,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim,
+        uint32_t n_assign) {
+    (void)q8_out; (void)gate; (void)up; (void)router_weights;
+    (void)ids_dst; (void)mid_dim; (void)n_assign;
+    return 0;
+}
+
+int ds4_gpu_q3_quantize_ref_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim,
+        uint32_t n_assign) {
+    (void)q8_out; (void)mid; (void)ids_dst; (void)mid_dim; (void)n_assign;
+    return 0;
+}
+
 int ds4_gpu_matmul_q8_0_top2_and_logits_n2_tensor(
         ds4_gpu_tensor       *row0_top2,
         ds4_gpu_tensor       *row1_logits,
