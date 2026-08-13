@@ -2573,8 +2573,11 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
     return (void *)(((p + a - 1u) / a) * a);
 }
 
-static int cuda_model_stage_pool_alloc(uint64_t bytes) {
-    if (g_model_stage_bytes >= bytes) return 1;
+/* memgov D1b-2 fix: release the pinned staging slots.  The eager pass
+ * calls this when its pass ends so no pinned residue survives to the
+ * bank fit (the pre-D1b walk had none); the lazy tier re-allocates on
+ * its first miss through the normal grow path below. */
+static void cuda_model_stage_pool_release(void) {
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -2591,6 +2594,11 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_model_stage_bytes = 0;
+}
+
+static int cuda_model_stage_pool_alloc(uint64_t bytes) {
+    if (g_model_stage_bytes >= bytes) return 1;
+    cuda_model_stage_pool_release();
     if (!g_model_upload_stream) {
         cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
         if (err != cudaSuccess) {
@@ -3049,18 +3057,26 @@ static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_
  *
  * Both promotion modes copy source bytes into a device carve through
  * the same 4-slot pinned staging pipeline; the source fill is the only
- * per-map difference: fd reads (O_DIRECT when available) for the map
- * that owns g_model_fd, a host-pointer memcpy from the mapped file for
- * every other map — which the fd tier could never serve.  `discard`
- * drops source pages per synchronized chunk and is honored only on the
- * fd path: the lazy tier keeps its historical always-on discard, the
- * eager pass gates it (DS4_CUDA_EAGER_SOURCE_DISCARD) because dropping
- * ~8 GiB of page cache at boot moves MemAvailable-derived decisions —
- * evidence first, default later.  Registered support-map pages are
- * pinned and are never madvised. */
+ * per-map difference: fd reads for the map that owns g_model_fd, a
+ * host-pointer memcpy from the mapped file for every other map — which
+ * the fd tier could never serve.
+ *
+ * `direct_discard` selects the fd path's SOURCE MODE — the two
+ * behaviors are policy-coupled by design:
+ *   0 (eager default): BUFFERED reads, no discard.  The unified page
+ *     cache faults exactly as the pre-D1b memcpy walk faulted the map's
+ *     pages, so the boot's MemAvailable trajectory — which the bank fit
+ *     samples mid-boot — is control-equivalent.  The D1b-2 close probe
+ *     measured the O_DIRECT eager pass deflating the fit input ~0.8 GiB
+ *     (~2 banks): the old walk's fault-in was itself the fit-time
+ *     reclaimable credit.
+ *   1 (lazy always; eager under DS4_CUDA_EAGER_SOURCE_DISCARD): O_DIRECT
+ *     reads when available + per-chunk source-page discard — the lazy
+ *     tier's historical behavior, and the F4 measured mode for eager.
+ * Registered support-map pages are pinned and are never madvised. */
 static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
-                                  uint64_t bytes, char *dev, int discard,
-                                  const char *what) {
+                                  uint64_t bytes, char *dev,
+                                  int direct_discard, const char *what) {
     const int fd_source = g_model_fd >= 0 && g_model_fd_host_base &&
                           model_map == g_model_fd_host_base;
     cudaError_t err = cudaSuccess;
@@ -3083,7 +3099,7 @@ static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
             }
         }
         const char *payload = NULL;
-        if (fd_source) {
+        if (fd_source && direct_discard) {
             if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
                                        offset + copied, n, &payload)) {
                 fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
@@ -3092,6 +3108,18 @@ static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
                         strerror(errno));
                 return 0;
             }
+        } else if (fd_source) {
+            /* Buffered read: faults the unified page cache exactly like
+             * the pre-D1b memcpy walk (the fit-time credit, see above). */
+            if (!cuda_pread_full(g_model_fd, g_model_stage[bi], n,
+                                 offset + copied)) {
+                fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
+                        what ? what : "weights",
+                        (double)copied / 1048576.0,
+                        strerror(errno));
+                return 0;
+            }
+            payload = (const char *)g_model_stage[bi];
         } else {
             memcpy(g_model_stage[bi],
                    (const char *)model_map + offset + copied, (size_t)n);
@@ -3114,7 +3142,7 @@ static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
             (void)cudaGetLastError();
             return 0;
         }
-        if (discard && fd_source) {
+        if (direct_discard && fd_source) {
             cuda_model_drop_file_pages(offset + copied, n);
             cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
         }
@@ -3161,12 +3189,12 @@ static uint64_t g_materialize_outcomes[CUDA_MAT__COUNT];
  * transparent cudaMalloc-arena retry on driver errors. */
 static int cuda_unit_materialize_copy(const void *model_map,
                                       const ds4_phys_unit *u,
-                                      int discard, const char *what) {
+                                      int direct_discard, const char *what) {
     char *dev = cuda_vmm_arena_alloc(model_map, u->src_bytes, what);
     if (!dev) dev = cuda_model_arena_alloc(model_map, u->src_bytes, what);
     if (!dev) return CUDA_MAT_FAILED;
     if (!cuda_stage_copy_to_dev(model_map, u->src_off, u->src_bytes, dev,
-                                discard, what))
+                                direct_discard, what))
         return CUDA_MAT_FAILED;
     if (!cuda_model_range_publish({model_map, u->src_off, u->src_bytes, dev,
                                    NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0}))
@@ -3239,7 +3267,8 @@ static const char *cuda_model_range_ptr_from_fd(
             }
             return cuda_model_direct_fallback_ptr(model_map, offset);
         }
-        const int oc = cuda_unit_materialize_copy(model_map, u, /*discard=*/1, what);
+        const int oc = cuda_unit_materialize_copy(model_map, u,
+                                                  /*direct_discard=*/1, what);
         g_materialize_outcomes[oc]++;
         if (oc != CUDA_MAT_POPULATED) return NULL;
     }
@@ -5751,7 +5780,11 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
     const uint64_t limit = cuda_model_map_replaces_complete(model_map)
         ? UINT64_MAX
         : cuda_model_cache_limit_bytes();
-    const int discard = getenv("DS4_CUDA_EAGER_SOURCE_DISCARD") != NULL;
+    /* Coupled source mode (see cuda_stage_copy_to_dev): default buffered
+     * + no discard = the pre-D1b boot's page-cache shape; the env flips
+     * eager to O_DIRECT + discard (the F4 measured mode). */
+    const int direct_discard =
+        getenv("DS4_CUDA_EAGER_SOURCE_DISCARD") != NULL;
     uint64_t counts[CUDA_MAT__COUNT] = {0};
     uint32_t promote = 0, funded = 0, unfunded = 0;
     uint64_t pop_bytes = 0;
@@ -5802,11 +5835,16 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
         funded++;
         char label[64];
         snprintf(label, sizeof(label), "%s unit:%u", nm, i);
-        const int oc = cuda_unit_materialize_copy(model_map, u, discard, label);
+        const int oc = cuda_unit_materialize_copy(model_map, u,
+                                                  direct_discard, label);
         counts[oc]++;
         if (oc == CUDA_MAT_POPULATED) pop_bytes += u->src_bytes;
         else if (oc == CUDA_MAT_FAILED) failed = 1;
     }
+    /* No pinned residue past the pass: the bank fit samples MemAvailable
+     * after engine open, and the pre-D1b walk left no staging behind.
+     * The lazy tier re-allocates on its first miss. */
+    cuda_model_stage_pool_release();
     for (int i = 0; i < CUDA_MAT__COUNT; i++)
         g_materialize_outcomes[i] += counts[i];
     if (populated_bytes) *populated_bytes = pop_bytes;
