@@ -193,6 +193,51 @@ make cpu              # CPU-only diagnostics build
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
 
+## Motif-3 mixed-quant runtime
+
+The `feature/motif-3-model-loader` branch adds a separate native CUDA family
+for the official final `Motif-Technologies/Motif-3` topology. It supports the
+full 53-layer model, 384 routed experts with sigmoid top-8 routing, the shared
+expert, Expert-Specific PolyNorm, modified mHC, interleaved full/SWA GDLA with
+YaRN, production latent KV plus decoupled RoPE state, the official tokenizer
+and chat/tool protocol, and the complete MTP weight path. It does not route a
+Motif container through the DeepSeek or GLM graphs.
+
+The public full-topology MQ87-88 artifact is
+[`Baekpica/Motif-3-Mixed-Quant-GGUF`](https://huggingface.co/Baekpica/Motif-3-Mixed-Quant-GGUF).
+The current loader consumes one GGUF, so first verify all public shard hashes
+and merge them once with `llama-gguf-split --merge`. The merge is artifact
+assembly, not runtime streaming.
+
+Build H200 with `make cuda-generic`. Build DGX Spark/GB10 from clean objects
+with `make cuda-spark`; that target emits `compute_121a`/`sm_121a`. A strict
+resident server launch is:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 ./ds4-server \
+  --cuda \
+  --model /path/to/Motif-3-MQ87-88-FIT.gguf \
+  --ctx 262144 \
+  --prefill-chunk 256 \
+  --batched-session 1 \
+  --tokens 64
+```
+
+Do not pass `--ssd-streaming` for the resident release gate, and do not enable
+`--kv-disk-dir` while proving that model, latent KV, workspace, and server are
+simultaneously resident. Motif startup fails if the complete CUDA-owned model
+image cannot be established. After CUDA preparation it discards the raw GGUF
+tensor payload pages, avoiding a second steady physical copy alongside the
+resident weights. Measure both runtime allocations and OS `MemAvailable` on
+GB10; GGUF file size alone is not an admission result.
+
+The server advertises `motif-3` from `/v1/models` and accepts both `motif-3`
+and `Motif-Technologies/Motif-3` request aliases. OpenAI chat completions,
+streaming/non-streaming output, thinking controls, structured tool calls,
+prefix/session reuse, and continuous batching share the native Motif graph.
+MTP is currently a finite real-weight diagnostic, not a claimed speculative
+decode speedup.
+
 ## DSpark Speculative Decoding
 
 DSpark is an auxiliary draft model released by DeepSeek for DeepSeek V4 Flash.
@@ -1015,6 +1060,7 @@ logits as separate session evaluations. The current backend behavior is:
 | Metal, resident DeepSeek Flash | Native shared-expert and QKV batching from two rows upward when supported; ordered fallback otherwise. |
 | Metal, GLM 5.2 | Ordered exact fallback. |
 | CUDA, DeepSeek Flash on a supported multi-GPU TP/EP layout | Native decode and mixed prefill/decode, with exact fallbacks for unsupported kernel shapes. |
+| CUDA, Motif-3 | Native resident Motif sessions with ordered exact multi-session scheduling. |
 | CUDA single GPU, including DGX Spark | Ordered exact fallback. |
 
 `N` resident sessions allocate `N` KV states, so a context size that fits once
@@ -1027,6 +1073,7 @@ Supported endpoints:
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
 - `GET /v1/models/deepseek-v4-pro`
+- `GET /v1/models/motif-3` (when a Motif-3 GGUF is loaded)
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/completions`

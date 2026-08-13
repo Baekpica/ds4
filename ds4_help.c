@@ -335,7 +335,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
+    para(fp, c, "Model endpoint aliases include deepseek-v4-flash, deepseek-v4-pro, motif-3, and Motif-Technologies/Motif-3; the loaded GGUF family is advertised by /v1/models.");
     fputc('\n', fp);
 }
 
