@@ -879,6 +879,27 @@ static void cuda_range_stamp(const void *map, uint64_t off, uint64_t bytes,
 
 static uint64_t g_range_publish_refused;
 
+/* =========================================================================
+ * memgov D2-2: plan freeze + governed materialization plumbing.
+ *
+ * The server freezes the plan at boot settle; after freeze, a device-copy
+ * (arena) range may enter the funnel ONLY through the unit materializer,
+ * whose every promotion carries a governor claim.  The tripwire guards
+ * future rogue promotion paths -- on this tree the materializer is already
+ * the only arena publisher (D1b "multi 0" invariant), so a firing means a
+ * regression, counted into the governor fault family (ledger intent, not
+ * census physics).  The gov entry points live in ds4.c (C linkage; the
+ * standing local-fwd-decl law for cross-TU calls). */
+static int g_model_plan_frozen;
+static int g_in_unit_materialize;
+extern "C" void ds4_gov_publish_use(int consumer, uint64_t intent,
+                                    uint64_t resident);
+extern "C" int ds4_gov_governed_check(const char *site,
+                                      const ds4_gov_claim *cl,
+                                      int legacy_status);
+extern "C" void ds4_gov_fault_tick(void);
+extern "C" void ds4_gpu_model_plan_freeze(void) { g_model_plan_frozen = 1; }
+
 static int cuda_range_publish_refuse(const char *what, const void *map,
                                      uint64_t off, uint64_t bytes,
                                      const char *why) {
@@ -902,6 +923,23 @@ static int cuda_model_range_publish(const cuda_model_range &nr) {
     if (nr.bytes == 0 || nr.offset + nr.bytes < nr.offset)
         return cuda_range_publish_refuse("model", nr.host_base, nr.offset,
                                          nr.bytes, "empty/overflowed interval");
+    /* memgov D2-2 post-freeze tripwire (plan sec 12 D2 gate: "no
+     * unregistered post-freeze allocation").  Loud + counted, never a
+     * refusal: the range is real and the census must stay physical
+     * truth -- the fault says the INTENT ledger was bypassed. */
+    if (g_model_plan_frozen && !g_in_unit_materialize &&
+        !nr.host_registered && !nr.imported_ipc && !nr.imported_vmm) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: memgov POST-FREEZE arena range without a claim "
+                    "(map=%p off=%llu bytes=%llu) -- ungoverned promotion path\n",
+                    nr.host_base, (unsigned long long)nr.offset,
+                    (unsigned long long)nr.bytes);
+        }
+        ds4_gov_fault_tick();
+    }
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_base != nr.host_base) continue;
         if ((r.host_registered != 0) != (nr.host_registered != 0)) continue;
@@ -3152,9 +3190,16 @@ static int cuda_unit_materialize_copy(const void *model_map,
     if (!cuda_stage_copy_to_dev(model_map, u->src_off, u->src_bytes, dev,
                                 direct_discard, what))
         return CUDA_MAT_FAILED;
-    if (!cuda_model_range_publish({model_map, u->src_off, u->src_bytes, dev,
-                                   NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0}))
-        return CUDA_MAT_FAILED;
+    /* memgov D2-2: this is the ONE claimed promotion path; the funnel's
+     * post-freeze tripwire keys on the marker (no early return between
+     * set and clear: publish is the next call). */
+    g_in_unit_materialize = 1;
+    const int pub = cuda_model_range_publish({model_map, u->src_off,
+                                              u->src_bytes, dev,
+                                              NULL, NULL, 0, 0, 1, 0, 0,
+                                              0, 0, 0});
+    g_in_unit_materialize = 0;
+    if (!pub) return CUDA_MAT_FAILED;
     g_model_range_bytes += u->src_bytes;
     cuda_substrate_cover(model_map, u->src_bytes);   /* tripwire: unit materialized */
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -3213,8 +3258,26 @@ static const char *cuda_model_range_ptr_from_fd(
             }
         }
         if (covered) continue;
-        if (g_model_range_bytes >= limit ||
-            u->src_bytes > limit - g_model_range_bytes) {
+        /* memgov D2-2: the lazy miss is the same governed decision as
+         * the eager unit.  Post-freeze the ENGINE_BOOT lease holds the
+         * boot absolute (resident >= any range-scoped proposal, so the
+         * shrink rule spends nothing) and the honest physical ask rides
+         * operation_transient instead -- one claim shape, two lifecycle
+         * phases.  Any non-ADMIT takes the legacy exhausted path
+         * (direct mapped fallback; correctness never depends on the
+         * promotion). */
+        const int legacy = (g_model_range_bytes >= limit ||
+                            u->src_bytes > limit - g_model_range_bytes)
+                               ? DS4_GOV_REFUSE_CLASS : DS4_GOV_ADMIT;
+        ds4_gov_claim mcl = {0};
+        mcl.requester = DS4_GOVC_ENGINE_BOOT;
+        mcl.memc = DS4_MEMC_WEIGHT_ARENA;
+        mcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        mcl.proposed_outstanding = g_model_range_bytes + u->src_bytes;
+        mcl.class_limit = limit == UINT64_MAX ? 0 : (limit ? limit : 1);
+        mcl.operation_transient = g_model_plan_frozen ? u->src_bytes : 0;
+        if (ds4_gov_governed_check("lazy_materialize", &mcl, legacy)
+                != DS4_GOV_ADMIT) {
             if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                 fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
                         what ? what : "weights",
@@ -5783,8 +5846,30 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
             cuda_substrate_cover(model_map, u->src_bytes);
             continue;
         }
-        if (g_model_range_bytes >= limit ||
-            u->src_bytes > limit - g_model_range_bytes) {
+        /* memgov D2-2: every promotion is a GOVERNED decision.  The
+         * claim's class verdict carries the legacy budget predicate
+         * verbatim (proposed = range + unit vs the same limit, so
+         * observe mode is bit-identical); the live verdict adds the
+         * honest marginal charge -- during the eager pass the
+         * incremental ENGINE_BOOT publications below keep resident ==
+         * range, so unfunded == this unit's bytes (never the whole
+         * accumulated range).  A REFUSE (any kind, incl. fail-closed
+         * FAULT) lands exactly on the legacy unfunded path: the unit
+         * stays lazy-eligible, nothing is lost. */
+        const int legacy = (g_model_range_bytes >= limit ||
+                            u->src_bytes > limit - g_model_range_bytes)
+                               ? DS4_GOV_REFUSE_CLASS : DS4_GOV_ADMIT;
+        ds4_gov_claim mcl = {0};
+        mcl.requester = DS4_GOVC_ENGINE_BOOT;
+        mcl.memc = DS4_MEMC_WEIGHT_ARENA;
+        mcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        mcl.proposed_outstanding = g_model_range_bytes + u->src_bytes;
+        /* class_limit 0 = UNCAPPED to the evaluator: complete-map
+         * replacement (UINT64_MAX) maps there; a zero limit must refuse
+         * any ask, so it pins to 1. */
+        mcl.class_limit = limit == UINT64_MAX ? 0 : (limit ? limit : 1);
+        if (ds4_gov_governed_check("boot_materialize", &mcl, legacy)
+                != DS4_GOV_ADMIT) {
             unfunded++;
             cuda_substrate_cover(model_map, u->src_bytes);   /* budget-capped: will not promote eagerly */
             continue;
@@ -5795,8 +5880,17 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
         const int oc = cuda_unit_materialize_copy(model_map, u,
                                                   direct_discard, label);
         counts[oc]++;
-        if (oc == CUDA_MAT_POPULATED) pop_bytes += u->src_bytes;
-        else if (oc == CUDA_MAT_FAILED) failed = 1;
+        if (oc == CUDA_MAT_POPULATED) {
+            pop_bytes += u->src_bytes;
+            /* Incremental boot lease: resident tracks the range registry
+             * so each later unit's quote charges only ITS bytes.  The
+             * server's boot-settle publication replaces this with the
+             * full census absolute (leases replace, never accumulate). */
+            ds4_gov_publish_use(DS4_GOVC_ENGINE_BOOT,
+                                g_model_range_bytes, g_model_range_bytes);
+        } else if (oc == CUDA_MAT_FAILED) {
+            failed = 1;
+        }
     }
     /* No pinned residue past the pass: the bank fit samples MemAvailable
      * after engine open, and the pre-D1b walk left no staging behind.

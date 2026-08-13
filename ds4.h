@@ -573,6 +573,20 @@ void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
  * publish/check entry points above become no-ops for that consumer. */
 void ds4_gov_modes_init(void);
 int  ds4_gov_mode(int consumer);
+/* memgov D2-2: the one entry point for a site WITH enforce plumbing.
+ * Returns the status that GOVERNS the caller's behavior:
+ *   off      -> legacy_status, zero governor activity;
+ *   observe  -> legacy_status (the D0b contract: quote counted against
+ *               the legacy verdict, legacy rules);
+ *   enforce  -> the quote rules and the legacy verdict becomes the
+ *               counted comparison target (the matrix stays the oracle
+ *               in both directions until D4 deletes the legacy formulas).
+ * Enforce policy for non-verdict quote statuses (sec 6.2/6.4): FAULT
+ * fails CLOSED (returned as REFUSE_LIVE, disclosed); UNSUPPORTED and
+ * RETRY_OBS defer to the legacy verdict (documented backend policy --
+ * a backend with no memory answer keeps its historical behavior). */
+int  ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
+                            int legacy_status);
 /* Absolute session-graph intent for a ctx (the serial-reserve estimator,
  * exported): what a committed graph at this ctx costs, for SERIAL_SESSION
  * and STATIC_BATCH shadow claims. */

@@ -541,6 +541,11 @@ void ds4_gpu_unregister_model_map(const void *base);
  * tables skip the pass (the lazy tier still promotes on demand).
  * populated_bytes (optional) reports bytes actually device-copied. */
 int ds4_gpu_materialize_model_plan(const void *model_map, uint64_t model_size, uint64_t *populated_bytes);
+/* memgov D2-2: freeze the residency plan at boot settle.  After freeze,
+ * arena ranges may enter the publication funnel only through the unit
+ * materializer (whose promotions carry governor claims); a bypass counts
+ * a governor fault (loud once).  Metal/no-GPU: no plan, no-op. */
+void ds4_gpu_model_plan_freeze(void);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 /* R5 Inc1a: device memory snapshot for budget-computed batch-bank sizing.

@@ -4557,6 +4557,8 @@ int ds4_gpu_model_units_bind(const void *map_base, const ds4_phys_unit *units,
     (void)map_base; (void)units; (void)count;
     return 1;
 }
+/* memgov D2-2: no residency plan on Metal -- freeze is a no-op. */
+void ds4_gpu_model_plan_freeze(void) {}
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;

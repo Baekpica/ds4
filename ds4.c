@@ -33523,6 +33523,13 @@ void ds4_gov_modes_init(void) {
     g_gov_modes_ready = 1;
 }
 
+/* memgov D2-2: the governor fault family, callable from the CUDA TU
+ * (the post-freeze funnel tripwire) without dragging the metrics
+ * registry across the language boundary. */
+void ds4_gov_fault_tick(void) {
+    ds4_metric_add(&ds4_metrics_get()->memgov_faults, 1);
+}
+
 void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
     if (ds4_gov_mode(consumer) == DS4_GOV_MODE_OFF) return;   /* D2-1 kill */
     uint64_t *faults = &ds4_metrics_get()->memgov_faults;
@@ -33567,22 +33574,21 @@ void ds4_gov_snapshot(ds4_gov_ledger *out) {
     ds4_metric_add(&ds4_metrics_get()->memgov_faults, 1);
 }
 
-void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
-                          int live_status) {
+/* Shared evaluation core (D0b-3 body, extracted for D2-2): snapshot +
+ * observe + evaluate + count + bounded disclosure.  legacy_status is the
+ * legacy formula's verdict mapped onto the quote vocabulary; the matrix
+ * cell and the DISAGREE line keep the same orientation in every mode, so
+ * observe and enforce read identically at the gate.  Returns the quote's
+ * validated status. */
+static int gov_check_core(const char *site, const ds4_gov_claim *cl,
+                          int legacy_status) {
     ds4_metrics *m = ds4_metrics_get();
-    if (!cl || cl->requester < 0 || cl->requester >= DS4_GOVC__COUNT ||
-        (live_status != DS4_GOV_ADMIT && live_status != DS4_GOV_REFUSE_CLASS &&
-         live_status != DS4_GOV_REFUSE_LIVE)) {
-        ds4_metric_add(&m->memgov_faults, 1);
-        return;
-    }
-    if (ds4_gov_mode(cl->requester) == DS4_GOV_MODE_OFF) return;   /* D2-1 */
     ds4_gov_ledger img;
     memset(&img, 0, sizeof(img));
     ds4_gov_snapshot(&img);
     /* floor/substrate/observation are sampled HERE, closest in time to
-     * the live verdict the caller just took -- residual sampling skew is
-     * a real (and wanted) disagreement source, not an error. */
+     * the legacy verdict the caller just took -- residual sampling skew
+     * is a real (and wanted) disagreement source, not an error. */
     img.floor_bytes = ds4_mem_floor_bytes();
     img.substrate_outstanding = ds4_gpu_substrate_outstanding();
     ds4_mem_observation o;
@@ -33591,7 +33597,7 @@ void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
     const ds4_gov_quote q = ds4_gov_evaluate(&img, &o, cl);
     const int status = (q.status >= 0 && q.status < DS4_GOV_STATUS__COUNT)
                            ? q.status : DS4_GOV_FAULT;
-    const int reason = ds4_gov_compare(live_status, status);
+    const int reason = ds4_gov_compare(legacy_status, status);
     ds4_metric_add(&m->memgov_decisions[cl->requester][status][reason], 1);
     if (status == DS4_GOV_FAULT)
         ds4_metric_add(&m->memgov_faults, 1);
@@ -33609,7 +33615,7 @@ void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
                     "live=%d shadow=%d reason=%d proposed=%llu old=%llu "
                     "prospective=%llu available=%llu required=%llu "
                     "deficit=%llu class_limit=%llu epoch=%llu\n",
-                    site ? site : "?", cl->requester, live_status, status,
+                    site ? site : "?", cl->requester, legacy_status, status,
                     reason,
                     (unsigned long long)q.proposed_intent,
                     (unsigned long long)q.old_intent,
@@ -33620,6 +33626,50 @@ void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
                     (unsigned long long)q.class_limit,
                     (unsigned long long)q.epoch);
         }
+    }
+    return status;
+}
+
+/* 1 = a well-formed (claim, legacy verdict) pair; malformed pairs fault
+ * (programming error, counted, never a crash). */
+static int gov_check_args_ok(const ds4_gov_claim *cl, int legacy_status) {
+    if (cl && cl->requester >= 0 && cl->requester < DS4_GOVC__COUNT &&
+        (legacy_status == DS4_GOV_ADMIT ||
+         legacy_status == DS4_GOV_REFUSE_CLASS ||
+         legacy_status == DS4_GOV_REFUSE_LIVE))
+        return 1;
+    ds4_metric_add(&ds4_metrics_get()->memgov_faults, 1);
+    return 0;
+}
+
+void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
+                          int live_status) {
+    if (!gov_check_args_ok(cl, live_status)) return;
+    if (ds4_gov_mode(cl->requester) == DS4_GOV_MODE_OFF) return;   /* D2-1 */
+    (void)gov_check_core(site, cl, live_status);
+}
+
+int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
+                           int legacy_status) {
+    if (!gov_check_args_ok(cl, legacy_status)) return legacy_status;
+    const int mode = ds4_gov_mode(cl->requester);
+    if (mode == DS4_GOV_MODE_OFF) return legacy_status;
+    const int qs = gov_check_core(site, cl, legacy_status);
+    if (mode != DS4_GOV_MODE_ENFORCE) return legacy_status;
+    switch (qs) {
+    case DS4_GOV_ADMIT:
+    case DS4_GOV_REFUSE_CLASS:
+    case DS4_GOV_REFUSE_LIVE:
+        return qs;                     /* the quote rules              */
+    case DS4_GOV_FAULT:
+        /* sec 6.2: impossible states fail CLOSED for new allocations.
+         * Disclosed once per site burst via the core's DISAGREE line
+         * (a FAULT is never CMP_AGREE). */
+        return DS4_GOV_REFUSE_LIVE;
+    default:
+        /* UNSUPPORTED / RETRY_OBS: documented backend policy -- no
+         * memory answer keeps the historical behavior (sec 6.4). */
+        return legacy_status;
     }
 }
 
@@ -34005,6 +34055,16 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
             uint64_t budget = free_b > headroom ? free_b - headroom : 0;
             budget = budget > sub_out ? budget - sub_out : 0;
             uint32_t n = (uint32_t)(budget / per_bank);
+            /* memgov D2-2b (DEFERRED, design in d2_scoping sec 7): the
+             * governed fit -- claim {proposed = n_want*per_bank,
+             * class_limit = budget?:1} through ds4_gov_governed_check
+             * ("boot_bank_fit"), enforce killing this forced-2 poke with
+             * a typed ctx refusal (serial-only fallback).  BLOCKED on
+             * the box reboot (rider #47): on the current box EVERY stock
+             * boot sits at the forced-2 boundary, so even the observe
+             * quote would disclose SHADOW_STRICTER on every standing-
+             * battery boot and no close can go green.  Lands with the
+             * BANK enforce ratchet on the first healthy-box battery. */
             if (n < 2u) n = 2u;   /* still try the floor: a failing 2-bank slab
                                    * alloc is a ~2-GB poke, not a 20-GB one */
             if (n < ctx->max_seq) {
@@ -38614,6 +38674,12 @@ void ds4_gov_modes_init(void) {}
 int ds4_gov_mode(int consumer) {
     (void)consumer;
     return DS4_GOV_MODE_OBSERVE;   /* harmless: the entry points are stubs */
+}
+void ds4_gov_fault_tick(void) {}
+int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
+                           int legacy_status) {
+    (void)site; (void)cl;
+    return legacy_status;   /* no governor: the legacy verdict rules */
 }
 void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
     (void)consumer; (void)intent; (void)resident;

@@ -18602,6 +18602,10 @@ int main(int argc, char **argv) {
                            ds4_gov_mode_name(ds4_gov_mode(DS4_GOVC_BATCH_BANK_PLAN)),
                            ds4_gov_mode_name(ds4_gov_mode(DS4_GOVC_SERIAL_SESSION)),
                            ds4_gov_mode_name(ds4_gov_mode(DS4_GOVC_STATIC_BATCH)));
+                /* memgov D2-2: the boot settle IS the plan freeze --
+                 * later arena promotions must carry claims (the lazy
+                 * materializer does; the funnel tripwires bypasses). */
+                ds4_gpu_model_plan_freeze();
             }
         }
     }
@@ -26598,6 +26602,44 @@ static void test_mem_gov_modes(void) {
     ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
 }
 
+/* memgov D2-2: governed_check mode dispatch.  observe/off return the
+ * legacy verdict; enforce returns the quote -- but only when the backend
+ * has an OK memory observation (Metal/CPU: UNSUPPORTED defers to legacy,
+ * the documented sec 6.4 policy), so the enforce expectation is derived
+ * from the live observation status, not hardcoded per platform. */
+static void test_mem_gov_governed_check(void) {
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_STATIC_BATCH;
+    cl.memc = DS4_MEMC_SESSION_TENSORS;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 100;
+    cl.class_limit = 10;             /* class-refusing claim by design */
+    /* observe (suite default): legacy rules regardless of the quote. */
+    TEST_ASSERT(ds4_gov_governed_check("unit", &cl, DS4_GOV_ADMIT)
+                == DS4_GOV_ADMIT);
+    /* enforce: the quote rules where the backend can quote. */
+    ds4_mem_observation o;
+    memset(&o, 0, sizeof(o));
+    (void)ds4_gpu_mem_observe(&o);
+    const int want = o.status == DS4_MEMOBS_OK ? DS4_GOV_REFUSE_CLASS
+                                               : DS4_GOV_ADMIT;
+    setenv("DS4_MEMGOV_STATIC", "enforce", 1);
+    ds4_gov_modes_init();
+    TEST_ASSERT(ds4_gov_governed_check("unit", &cl, DS4_GOV_ADMIT) == want);
+    /* off: legacy rules, zero governor activity. */
+    setenv("DS4_MEMGOV_STATIC", "off", 1);
+    ds4_gov_modes_init();
+    TEST_ASSERT(ds4_gov_governed_check("unit", &cl, DS4_GOV_ADMIT)
+                == DS4_GOV_ADMIT);
+    /* malformed pair: fault counted, legacy rules. */
+    const uint64_t f0 = ds4_metric_read(&ds4_metrics_get()->memgov_faults);
+    TEST_ASSERT(ds4_gov_governed_check("unit", NULL, DS4_GOV_ADMIT)
+                == DS4_GOV_ADMIT);
+    TEST_ASSERT(ds4_metric_read(&ds4_metrics_get()->memgov_faults) == f0 + 1);
+    unsetenv("DS4_MEMGOV_STATIC");
+    ds4_gov_modes_init();
+}
+
 /* memgov D1a-1: model-source table (pure logic from ds4_mem_census.h --
  * the exact bind/containment resolution the CUDA backend attributes
  * every WEIGHT_* census note with). */
@@ -27088,6 +27130,7 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_gov_shadow_ledger();
     test_mem_gov_publication_shape();
     test_mem_gov_modes();
+    test_mem_gov_governed_check();
     /* memgov D1a-1: model-source table resolution. */
     test_mem_src_table_bind_find();
     /* memgov D1a-2: semantic tensor classifier + tripwire relation. */
