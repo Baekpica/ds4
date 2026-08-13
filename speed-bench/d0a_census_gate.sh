@@ -89,6 +89,11 @@ allow = {
     "cuda_model_arena_alloc", "cuda_model_copy_chunked",
     "cuda_model_range_populate_device_copy", "cuda_model_range_release_all",
     "cuda_model_stage_pool_alloc",
+    # memgov D1b-2 (reviewed 2026-08-13): the stage-pin free-note moved
+    # into the extracted release helper -- same accounting the alloc's
+    # grow path always carried; control-plane only (eager-pass end +
+    # first-miss grow), never the token path.
+    "cuda_model_stage_pool_release",
     "cuda_moe_iq2_derepack_scratch", "cuda_moe_q2k_derepack_scratch",
     "fp8_predecode_scratch_alloc", "rr_scratch_ensure", "tt_scratch_ensure",
     "cuda_tmp_alloc",
