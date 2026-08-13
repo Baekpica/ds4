@@ -3061,18 +3061,20 @@ static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_
  * host-pointer memcpy from the mapped file for every other map — which
  * the fd tier could never serve.
  *
- * `direct_discard` selects the fd path's SOURCE MODE — the two
- * behaviors are policy-coupled by design:
- *   0 (eager default): BUFFERED reads, no discard.  The unified page
- *     cache faults exactly as the pre-D1b memcpy walk faulted the map's
- *     pages, so the boot's MemAvailable trajectory — which the bank fit
- *     samples mid-boot — is control-equivalent.  The D1b-2 close probe
- *     measured the O_DIRECT eager pass deflating the fit input ~0.8 GiB
- *     (~2 banks): the old walk's fault-in was itself the fit-time
- *     reclaimable credit.
- *   1 (lazy always; eager under DS4_CUDA_EAGER_SOURCE_DISCARD): O_DIRECT
- *     reads when available + per-chunk source-page discard — the lazy
- *     tier's historical behavior, and the F4 measured mode for eager.
+ * `direct_discard` selects the SOURCE MODE — the two behaviors are
+ * policy-coupled by design:
+ *   0 (eager default): memcpy FROM THE MAP, no discard — the pre-D1b
+ *     walk's exact mechanism, so the boot faults MAPPED file pages and
+ *     the MemAvailable trajectory the bank fit samples mid-boot is
+ *     control-identical by construction.  The D1b-2 close probes
+ *     measured both alternatives deflating the fit input: O_DIRECT
+ *     leaves no page-cache credit at all (~0.8 GiB, ~2 banks), and
+ *     buffered preads fill UNMAPPED cache that MemAvailable credits
+ *     less than mapped file pages (~0.4 GiB residual).
+ *   1 (lazy always; eager under DS4_CUDA_EAGER_SOURCE_DISCARD): fd reads
+ *     (O_DIRECT when available) + per-chunk source-page discard — the
+ *     lazy tier's historical behavior, and the F4 measured mode for
+ *     eager.
  * Registered support-map pages are pinned and are never madvised. */
 static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
                                   uint64_t bytes, char *dev,
@@ -3108,19 +3110,9 @@ static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
                         strerror(errno));
                 return 0;
             }
-        } else if (fd_source) {
-            /* Buffered read: faults the unified page cache exactly like
-             * the pre-D1b memcpy walk (the fit-time credit, see above). */
-            if (!cuda_pread_full(g_model_fd, g_model_stage[bi], n,
-                                 offset + copied)) {
-                fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
-                        what ? what : "weights",
-                        (double)copied / 1048576.0,
-                        strerror(errno));
-                return 0;
-            }
-            payload = (const char *)g_model_stage[bi];
         } else {
+            /* Map source: faults MAPPED file pages, the pre-D1b walk's
+             * exact cache shape (the fit-time credit, see above). */
             memcpy(g_model_stage[bi],
                    (const char *)model_map + offset + copied, (size_t)n);
             payload = (const char *)g_model_stage[bi];
