@@ -20117,6 +20117,14 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_NONE) == DS4_THINK_NONE);
 }
 
+static void test_model_family_aliases(void) {
+    TEST_ASSERT(server_model_alias_known("deepseek-v4-flash"));
+    TEST_ASSERT(server_model_alias_known("deepseek-v4-pro"));
+    TEST_ASSERT(server_model_alias_known("motif-3"));
+    TEST_ASSERT(server_model_alias_known("Motif-Technologies/Motif-3"));
+    TEST_ASSERT(!server_model_alias_known("glm-5.2"));
+}
+
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
@@ -26100,6 +26108,7 @@ static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
+    test_model_family_aliases();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefix_tiers();
