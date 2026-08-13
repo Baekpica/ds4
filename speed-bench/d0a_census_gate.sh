@@ -163,6 +163,11 @@ stable_avail() { # ABORT-on-unstable (plan §13): two reads within 150M
 # free-memory inputs (fit-jitter law) -- formulas and verdict shapes must
 # byte-match; the masked inputs are band-checked separately.
 extract_decisions() { # $1 remote log  $2 local out
+    # memgov D2-3 amendment (08-14): the session-graph-fit refusal's
+    # "only N MiB allocatable" operand is the SAME free-input class as
+    # free= (observed: T=1520 C=1567 on deep boots a minute apart on the
+    # stale box, decisions identical) -- masked; the refusal itself still
+    # byte-compares.  need ~N MiB is graph-shape-derived and stays exact.
     # max_seq is masked HERE (it is free-input-derived, the fit-jitter law);
     # its equality is asserted separately with a one-retry jitter policy.
     # The batch-vmm ledger's banks/budget/plan/capacity are ALL free-input
@@ -173,7 +178,7 @@ extract_decisions() { # $1 remote log  $2 local out
     # cannot print it; d1a residency-gate l1 first-run finding).
     R "grep -E 'batch fit|batch vmm|mem floor|boot ledger|refus|reject|no graph fits|admission|serial fit' $1" \
         | grep -v 'ds4: range plan ' \
-        | sed -E 's/^[0-9]{4} [0-9:]{8} //; s/free=[0-9.]+ GiB/free=# GiB/g; s/MemAvailable[= ][0-9.]+/MemAvailable=#/g; s/capacity [0-9.]+ GiB/capacity # GiB/g; s/max_seq [0-9]+/max_seq #/g; s/x [0-9]+ banks/x # banks/g; s/budget=[0-9.]+ GiB/budget=# GiB/g; s/\[plan [0-9.]+, capacity [0-9.]+\]/[plan #, capacity #]/g' \
+        | sed -E 's/^[0-9]{4} [0-9:]{8} //; s/free=[0-9.]+ GiB/free=# GiB/g; s/MemAvailable[= ][0-9.]+/MemAvailable=#/g; s/capacity [0-9.]+ GiB/capacity # GiB/g; s/max_seq [0-9]+/max_seq #/g; s/x [0-9]+ banks/x # banks/g; s/budget=[0-9.]+ GiB/budget=# GiB/g; s/\[plan [0-9.]+, capacity [0-9.]+\]/[plan #, capacity #]/g; s/only [0-9]+ MiB allocatable/only # MiB allocatable/g' \
         > "$2"
 }
 # Fit-jitter adjudication for a free-derived integer decision: equal is
