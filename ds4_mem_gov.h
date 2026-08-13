@@ -138,6 +138,62 @@ static inline int ds4_gov_compare(int live_status, int shadow_status) {
     return DS4_GOV_CMP_VERDICT_CLASS;   /* both refusals, different class */
 }
 
+/* =========================================================================
+ * memgov D2-1: per-consumer governance mode (plan sec 12 D2).
+ *
+ * The TEMPORARY migration vocabulary: every consumer family runs under
+ * off | observe | enforce until D4 deletes the legacy formulas and this
+ * mode with them.  Parsed ONCE at engine open into a process mode table
+ * (no hot-path getenv); the table's accessor defaults to OBSERVE before
+ * init so a missed init can never silently disable the shadow.
+ *
+ *   OFF      kill switch: no evaluation, no publication -- zero governor
+ *            activity (snapshots read the empty ledger, documented);
+ *   OBSERVE  the D0b contract: live decides, quotes counted/disclosed;
+ *   ENFORCE  the governor's quote IS the verdict; the legacy formula
+ *            keeps being computed as the comparison target, so the
+ *            memgov_decisions matrix stays the oracle in both
+ *            directions (healthy legs assert zero *_STRICTER exactly
+ *            as observe legs do). */
+typedef enum {
+    DS4_GOV_MODE_OFF = 0,
+    DS4_GOV_MODE_OBSERVE,
+    DS4_GOV_MODE_ENFORCE,
+    DS4_GOV_MODE__COUNT
+} ds4_gov_mode_t;
+
+/* Pure vocabulary helpers (unit-tested on CPU).  parse returns -1 on an
+ * unrecognized value -- the caller decides loudness; it never guesses. */
+static inline int ds4_gov_mode_parse(const char *s) {
+    if (!s) return -1;
+    if (s[0] == 'o' && s[1] == 'f' && s[2] == 'f' && !s[3])
+        return DS4_GOV_MODE_OFF;
+    if (s[0] == 'o' && s[1] == 'b') {                 /* observe */
+        const char *t = "observe";
+        for (int i = 0; ; i++) {
+            if (t[i] != s[i]) return -1;
+            if (!t[i]) return DS4_GOV_MODE_OBSERVE;
+        }
+    }
+    if (s[0] == 'e' && s[1] == 'n') {                 /* enforce */
+        const char *t = "enforce";
+        for (int i = 0; ; i++) {
+            if (t[i] != s[i]) return -1;
+            if (!t[i]) return DS4_GOV_MODE_ENFORCE;
+        }
+    }
+    return -1;
+}
+
+static inline const char *ds4_gov_mode_name(int m) {
+    switch (m) {
+    case DS4_GOV_MODE_OFF:     return "off";
+    case DS4_GOV_MODE_OBSERVE: return "observe";
+    case DS4_GOV_MODE_ENFORCE: return "enforce";
+    default:                   return "?";
+    }
+}
+
 /* The complete decision record (sec 6.2 list, field for field). */
 typedef struct {
     int status;                      /* ds4_gov_status                    */

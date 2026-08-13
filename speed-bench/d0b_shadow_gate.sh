@@ -68,6 +68,11 @@ met() { # $1 metric line prefix (exact $1 match on field 1)
 
 log "(t) torn-snapshot hunt: boot + ${WAVE}-wide admission wave under poll hammer"
 boot_tree /tmp/d0bshadow_boot.log || die "boot failed"
+# memgov D2-1: the governance mode board rides every boot; a stock boot
+# shows the tree defaults (all observe until the D2 increments ratchet a
+# family to enforce -- update this expectation WITH each ratchet commit).
+R "grep -q 'memgov modes: boot=observe prewarm=observe bank=observe serial=observe static=observe' /tmp/d0bshadow_boot.log" \
+    || die "memgov mode board missing or not at tree defaults"
 grep -q . /dev/null   # no-op keeps set -u happy on empty locals below
 # SNAP0: the boot-settle ledger, BEFORE any request (leg (r) asserts the
 # boot leases exactly; a request would legitimately grow sticky scratch).
@@ -180,7 +185,13 @@ print(sum(int(b.get(k,0)) for k in ('admits_cold','admits_warm','admits_fork','a
 BANK_CELLS=$(echo "$MET" | grep 'ds4_memory_decisions_total{consumer="batch_bank_plan"' | awk '{s+=$NF} END{print s}')
 DISAGREE=$(echo "$MET" | grep 'ds4_memory_decisions_total{' | grep -v 'reason="agree"' | awk '{s+=$NF} END{print s}')
 if [ -n "$ADMITS" ] && [ "$ADMITS" != "0" ]; then
-    [ "$BANK_CELLS" = "$ADMITS" ] || die "decision-cell sum ($BANK_CELLS) != admissions+rejects ($ADMITS)"
+    # memgov D2-1: cells count admissions that TOOK a memory verdict --
+    # a zero-growth warm admit (mneed==0) spends nothing, so neither live
+    # nor shadow quotes it (the epoch-58 phantom-unfunded fix).  This
+    # wave is 8-wide COLD on a fresh boot: every admission projects
+    # growth, so exact equality stands.  A future wave that adds warm
+    # reuse must subtract its zero-growth admits before asserting.
+    [ "$BANK_CELLS" = "$ADMITS" ] || die "decision-cell sum ($BANK_CELLS) != growth admissions+rejects ($ADMITS)"
 else
     [ -n "$BANK_CELLS" ] && [ "$BANK_CELLS" -ge "$WAVE" ] || die "bank decision cells ($BANK_CELLS) < wave ($WAVE)"
 fi

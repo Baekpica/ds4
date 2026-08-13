@@ -563,6 +563,16 @@ void ds4_gov_publish_reservation(int consumer, uint64_t reservation);
 void ds4_gov_snapshot(ds4_gov_ledger *out);
 void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
                           int live_status);
+/* memgov D2-1: the per-consumer governance mode table (off | observe |
+ * enforce, ds4_mem_gov.h vocabulary).  Parsed ONCE by _init at engine
+ * open -- DS4_MEMGOV sets every family, DS4_MEMGOV_{BOOT,BANK,SERIAL,
+ * STATIC,PREWARM} win per family; an unrecognized value warns loudly and
+ * keeps the tree default.  ds4_gov_mode never touches the environment
+ * (no hot-path getenv) and returns OBSERVE before init so a missed init
+ * can never silently disable the shadow.  OFF is the kill switch: the
+ * publish/check entry points above become no-ops for that consumer. */
+void ds4_gov_modes_init(void);
+int  ds4_gov_mode(int consumer);
 /* Absolute session-graph intent for a ctx (the serial-reserve estimator,
  * exported): what a committed graph at this ctx costs, for SERIAL_SESSION
  * and STATIC_BATCH shadow claims. */

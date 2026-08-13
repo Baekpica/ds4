@@ -16894,9 +16894,15 @@ static void send_stats(server *s, int fd, bool as_json) {
             memset(&lg, 0, sizeof(lg));
             ds4_gov_snapshot(&lg);
             buf_printf(&b, ",\"governor\":{\"shadow\":true,\"epoch\":%llu,"
-                           "\"faults\":%llu,\"leases\":{",
+                           "\"faults\":%llu,\"modes\":{",
                        (unsigned long long)lg.epoch,
                        (unsigned long long)ds4_metric_read(&m->memgov_faults));
+            /* memgov D2-1: the mode board rides the same section. */
+            for (int c = 0; c < DS4_GOVC__COUNT; c++)
+                buf_printf(&b, "%s\"%s\":\"%s\"", c ? "," : "",
+                           gov_consumer_names[c],
+                           ds4_gov_mode_name(ds4_gov_mode(c)));
+            buf_puts(&b, "},\"leases\":{");
             for (int c = 0; c < DS4_GOVC__COUNT; c++)
                 buf_printf(&b, "%s\"%s\":{\"intent\":%llu,\"resident\":%llu,"
                                "\"reservation\":%llu}",
@@ -17072,6 +17078,12 @@ static void send_stats(server *s, int fd, bool as_json) {
         ds4_gov_snapshot(&lg);
         buf_printf(&b, "\n# Memory governor (shadow)\ngovernor_faults:%llu\n",
                    (unsigned long long)ds4_metric_read(&m->memgov_faults));
+        /* memgov D2-1: the mode board (always all five families). */
+        buf_puts(&b, "modes:");
+        for (int c = 0; c < DS4_GOVC__COUNT; c++)
+            buf_printf(&b, "%s%s=%s", c ? " " : "", gov_consumer_names[c],
+                       ds4_gov_mode_name(ds4_gov_mode(c)));
+        buf_puts(&b, "\n");
         for (int c = 0; c < DS4_GOVC__COUNT; c++)
             if (lg.lease[c].intent || lg.lease[c].resident ||
                 lg.lease[c].reservation)
@@ -18579,6 +18591,17 @@ int main(int argc, char **argv) {
                            "ds4-server: memgov shadow: %d consumers, boot "
                            "lease %.2f GiB, epoch protocol armed",
                            DS4_GOVC__COUNT, mem_gib(boot));
+                /* memgov D2-1: the governance mode board -- one line,
+                 * all five families, every boot (gate-asserted; the D2
+                 * increments ratchet defaults family by family). */
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: memgov modes: boot=%s prewarm=%s "
+                           "bank=%s serial=%s static=%s",
+                           ds4_gov_mode_name(ds4_gov_mode(DS4_GOVC_ENGINE_BOOT)),
+                           ds4_gov_mode_name(ds4_gov_mode(DS4_GOVC_PREWARM)),
+                           ds4_gov_mode_name(ds4_gov_mode(DS4_GOVC_BATCH_BANK_PLAN)),
+                           ds4_gov_mode_name(ds4_gov_mode(DS4_GOVC_SERIAL_SESSION)),
+                           ds4_gov_mode_name(ds4_gov_mode(DS4_GOVC_STATIC_BATCH)));
             }
         }
     }
@@ -26512,6 +26535,69 @@ static void test_mem_gov_publication_shape(void) {
         TEST_ASSERT(gov_cmp_names[r] && gov_cmp_names[r][0]);
 }
 
+/* memgov D2-1: mode vocabulary + env table + the OFF kill switch.  The
+ * table is process state: the test re-invokes the idempotent init under
+ * controlled env and restores observe-everywhere before returning. */
+static void test_mem_gov_modes(void) {
+    /* Pure vocabulary: exact words only -- no prefixes, no case slack. */
+    TEST_ASSERT(ds4_gov_mode_parse("off") == DS4_GOV_MODE_OFF);
+    TEST_ASSERT(ds4_gov_mode_parse("observe") == DS4_GOV_MODE_OBSERVE);
+    TEST_ASSERT(ds4_gov_mode_parse("enforce") == DS4_GOV_MODE_ENFORCE);
+    TEST_ASSERT(ds4_gov_mode_parse(NULL) == -1);
+    TEST_ASSERT(ds4_gov_mode_parse("") == -1);
+    TEST_ASSERT(ds4_gov_mode_parse("obs") == -1);
+    TEST_ASSERT(ds4_gov_mode_parse("observed") == -1);
+    TEST_ASSERT(ds4_gov_mode_parse("Enforce") == -1);
+    TEST_ASSERT(ds4_gov_mode_parse("offx") == -1);
+    for (int mi = 0; mi < DS4_GOV_MODE__COUNT; mi++)
+        TEST_ASSERT(ds4_gov_mode_parse(ds4_gov_mode_name(mi)) == mi);
+    /* Env layering: global default, per-family override, bogus value
+     * keeps the layer beneath (loudly -- stderr, not asserted here). */
+    setenv("DS4_MEMGOV", "enforce", 1);
+    setenv("DS4_MEMGOV_SERIAL", "off", 1);
+    setenv("DS4_MEMGOV_STATIC", "bogus", 1);
+    ds4_gov_modes_init();
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_ENGINE_BOOT) == DS4_GOV_MODE_ENFORCE);
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_BATCH_BANK_PLAN) == DS4_GOV_MODE_ENFORCE);
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_SERIAL_SESSION) == DS4_GOV_MODE_OFF);
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_STATIC_BATCH) == DS4_GOV_MODE_ENFORCE);
+    TEST_ASSERT(ds4_gov_mode(-1) == DS4_GOV_MODE_OFF);
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC__COUNT) == DS4_GOV_MODE_OFF);
+    /* OFF is the kill switch: publications drop, checks tick nothing. */
+    ds4_gov_ledger lg;
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 777, 777);
+    ds4_gov_snapshot(&lg);
+    TEST_ASSERT(lg.lease[DS4_GOVC_SERIAL_SESSION].intent == 0);
+    ds4_metrics *m = ds4_metrics_get();
+    uint64_t cells0 = 0, cells1 = 0;
+    for (int c = 0; c < DS4_GOVC__COUNT; c++)
+        for (int st = 0; st < DS4_GOV_STATUS__COUNT; st++)
+            for (int r = 0; r < DS4_GOV_CMP__COUNT; r++)
+                cells0 += ds4_metric_read(&m->memgov_decisions[c][st][r]);
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_SERIAL_SESSION;
+    cl.memc = DS4_MEMC_SESSION_TENSORS;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 4096;
+    ds4_gov_shadow_check("unit", &cl, DS4_GOV_ADMIT);
+    for (int c = 0; c < DS4_GOVC__COUNT; c++)
+        for (int st = 0; st < DS4_GOV_STATUS__COUNT; st++)
+            for (int r = 0; r < DS4_GOV_CMP__COUNT; r++)
+                cells1 += ds4_metric_read(&m->memgov_decisions[c][st][r]);
+    TEST_ASSERT(cells1 == cells0);
+    /* Restore observe-everywhere for the rest of the suite. */
+    unsetenv("DS4_MEMGOV");
+    unsetenv("DS4_MEMGOV_SERIAL");
+    unsetenv("DS4_MEMGOV_STATIC");
+    ds4_gov_modes_init();
+    for (int c = 0; c < DS4_GOVC__COUNT; c++)
+        TEST_ASSERT(ds4_gov_mode(c) == DS4_GOV_MODE_OBSERVE);
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 5, 5);
+    ds4_gov_snapshot(&lg);
+    TEST_ASSERT(lg.lease[DS4_GOVC_SERIAL_SESSION].intent == 5);
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
+}
+
 /* memgov D1a-1: model-source table (pure logic from ds4_mem_census.h --
  * the exact bind/containment resolution the CUDA backend attributes
  * every WEIGHT_* census note with). */
@@ -27001,6 +27087,7 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_gov_compare_classes();
     test_mem_gov_shadow_ledger();
     test_mem_gov_publication_shape();
+    test_mem_gov_modes();
     /* memgov D1a-1: model-source table resolution. */
     test_mem_src_table_bind_find();
     /* memgov D1a-2: semantic tensor classifier + tripwire relation. */

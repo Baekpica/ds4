@@ -33472,7 +33472,59 @@ static uint64_t ds4_mem_usable_beyond(uint64_t reserve) {
  * Enforcement is D2's, behind its own gate. */
 static ds4_gov_ledger g_gov_ledger;
 
+/* memgov D2-1: the governance mode table (plan sec 12 D2).  One byte per
+ * consumer family, parsed once at engine open; every entry point below
+ * short-circuits on OFF so the kill switch means ZERO governor activity
+ * for that family (no evaluation, no publication -- snapshots then read
+ * an empty lease, a documented consequence).  Before init the accessor
+ * answers OBSERVE: a missed init keeps the D0b shadow alive rather than
+ * silently disabling it. */
+static uint8_t g_gov_mode[DS4_GOVC__COUNT];
+static int g_gov_modes_ready;
+
+int ds4_gov_mode(int consumer) {
+    if (consumer < 0 || consumer >= DS4_GOVC__COUNT)
+        return DS4_GOV_MODE_OFF;
+    return g_gov_modes_ready ? g_gov_mode[consumer] : DS4_GOV_MODE_OBSERVE;
+}
+
+void ds4_gov_modes_init(void) {
+    /* Env map: index == ds4_gov_consumer.  BANK covers the whole
+     * BATCH_BANK lane (fit + budget + cont admission -- one lease, one
+     * knob); the D2 defaults ratchet per increment, all OBSERVE today. */
+    static const char *knob[DS4_GOVC__COUNT] = {
+        "DS4_MEMGOV_BOOT",      /* DS4_GOVC_ENGINE_BOOT     */
+        "DS4_MEMGOV_PREWARM",   /* DS4_GOVC_PREWARM         */
+        "DS4_MEMGOV_BANK",      /* DS4_GOVC_BATCH_BANK_PLAN */
+        "DS4_MEMGOV_SERIAL",    /* DS4_GOVC_SERIAL_SESSION  */
+        "DS4_MEMGOV_STATIC",    /* DS4_GOVC_STATIC_BATCH    */
+    };
+    int def = DS4_GOV_MODE_OBSERVE;
+    const char *g = getenv("DS4_MEMGOV");
+    if (g && g[0]) {
+        const int m = ds4_gov_mode_parse(g);
+        if (m >= 0) def = m;
+        else fprintf(stderr, "ds4: memgov: DS4_MEMGOV=%s unrecognized "
+                             "(off|observe|enforce); keeping %s\n",
+                     g, ds4_gov_mode_name(def));
+    }
+    for (int c = 0; c < DS4_GOVC__COUNT; c++) {
+        int m = def;
+        const char *v = getenv(knob[c]);
+        if (v && v[0]) {
+            const int pm = ds4_gov_mode_parse(v);
+            if (pm >= 0) m = pm;
+            else fprintf(stderr, "ds4: memgov: %s=%s unrecognized "
+                                 "(off|observe|enforce); keeping %s\n",
+                         knob[c], v, ds4_gov_mode_name(m));
+        }
+        g_gov_mode[c] = (uint8_t)m;
+    }
+    g_gov_modes_ready = 1;
+}
+
 void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
+    if (ds4_gov_mode(consumer) == DS4_GOV_MODE_OFF) return;   /* D2-1 kill */
     uint64_t *faults = &ds4_metrics_get()->memgov_faults;
     ds4_gov_epoch_write_begin(&g_gov_ledger.epoch, faults);
     if (consumer >= 0 && consumer < DS4_GOVC__COUNT)
@@ -33485,6 +33537,7 @@ void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
 }
 
 void ds4_gov_publish_reservation(int consumer, uint64_t reservation) {
+    if (ds4_gov_mode(consumer) == DS4_GOV_MODE_OFF) return;   /* D2-1 kill */
     uint64_t *faults = &ds4_metrics_get()->memgov_faults;
     ds4_gov_epoch_write_begin(&g_gov_ledger.epoch, faults);
     if (consumer >= 0 && consumer < DS4_GOVC__COUNT)
@@ -33523,6 +33576,7 @@ void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
         ds4_metric_add(&m->memgov_faults, 1);
         return;
     }
+    if (ds4_gov_mode(cl->requester) == DS4_GOV_MODE_OFF) return;   /* D2-1 */
     ds4_gov_ledger img;
     memset(&img, 0, sizeof(img));
     ds4_gov_snapshot(&img);
@@ -33682,6 +33736,25 @@ static uint64_t ds4_batch_credit_union_projection(const ds4_batch_ctx *ctx,
         /* fp4 scale slab: eager, fully paid at boot -- never projected. */
     }
     return need;
+}
+
+/* memgov D2-1 (artifact 1, D0b receipt DISAGREE audit): rows release their
+ * lifetime credit at five terminal sites; without a refresh the BATCH_BANK
+ * lease carries the dead union as phantom unfunded debt (intent - resident)
+ * until the next admission -- shadow-stricter refusals under pressure, the
+ * epoch-56 class, and the very staleness the D0b close chartered to D2.
+ * Re-publish the lane's absolute at every row end: the union over the
+ * REMAINING credits (cand_len 0 contributes nothing -- the header contract)
+ * plus the same page scan the admission's resident term uses.  Row ends are
+ * durable points; this is the admission-time walk's cost, never per-token. */
+static void ds4_batch_gov_refresh_rowend(ds4_batch_ctx *ctx,
+                                         const uint64_t *credit, uint32_t b) {
+    if (ds4_gov_mode(DS4_GOVC_BATCH_BANK_PLAN) == DS4_GOV_MODE_OFF) return;
+    const uint64_t mres = ds4_batch_slabs_cache_resident(&ctx->sl);
+    const uint64_t mneed = ds4_batch_credit_union_projection(ctx, credit, b, 0u);
+    ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
+                        ctx->bank_census_eager + mres + mneed,
+                        ctx->bank_census_eager + mres);
 }
 
 /* v0.5.1 Inc2 (field #31): release ONE bank's demand-mapped cache pages
@@ -36095,8 +36168,16 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 /* memgov D0b-3: both live verdicts passed -- shadow the
                  * admit and publish the lane's absolute lease (intent =
                  * eager cost + post-fault total, resident = eager cost +
-                 * what the page scan sees: the census basis). */
-                ds4_gov_shadow_check("cont_admit", &scl, DS4_GOV_ADMIT);
+                 * what the page scan sees: the census basis).
+                 * D2-1 (artifact 2, D0b receipt epoch-58): a zero-growth
+                 * admit spends nothing and the live path takes NO memory
+                 * verdict -- neither does the shadow.  The old vacuous
+                 * quote charged mres minus a stale lease-resident as
+                 * phantom unfunded under pressure; the publication below
+                 * is the honest zero-growth act (absolute refresh, no
+                 * debt).  Enforce mode (D2-3) keeps this precondition. */
+                if (mneed != 0)
+                    ds4_gov_shadow_check("cont_admit", &scl, DS4_GOV_ADMIT);
                 ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
                                     ctx->bank_census_eager + mres + mneed,
                                     ctx->bank_census_eager + mres);
@@ -36295,6 +36376,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     usr[b] = NULL;
                     live[b] = 0u;
                     credit[b] = 0u;   /* Inc 0b: release the lifetime credit */
+                    ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
                     continue;
                 }
                 uint32_t n_live_now = 0;
@@ -36416,6 +36498,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     usr[b] = NULL;
                     live[b] = 0u;
                     credit[b] = 0u;   /* Inc 0b: release the lifetime credit */
+                    ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
                     ok = true;
                     continue;
                 }
@@ -36453,6 +36536,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         cont_stats_publish_done(ctx, sst, b, glen[b]);
                         on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                         free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; credit[b] = 0u;
+                        ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
                         if (dspark_trace)
                             ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
                                                    dspark_shadow_guard, dspark_shadow_alpha,
@@ -36802,6 +36886,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     cont_stats_publish_done(ctx, sst, b, glen[b]);
                     on_done(ud, usr[b], gbuf[b], (int)glen[b], done_eos);
                     free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; credit[b] = 0u;
+                    ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
                 }
             }
             if (dspark_prof && dspark_now) dspark_t_accept_s += now_sec() - accept_t0;
@@ -37324,6 +37409,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 cont_stats_publish_done(ctx, sst, b, glen[b]);
                 on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                 free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; credit[b] = 0u;
+                ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
             }
         }
         /* v0.2.x observability: one registry update per plain decode step. */
@@ -38524,6 +38610,11 @@ uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx) {
 }
 /* memgov shadow governor: no graph backend means no substrate to govern.
  * Publishes drop, checks don't tick, snapshots read as the empty ledger. */
+void ds4_gov_modes_init(void) {}
+int ds4_gov_mode(int consumer) {
+    (void)consumer;
+    return DS4_GOV_MODE_OBSERVE;   /* harmless: the entry points are stubs */
+}
 void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
     (void)consumer; (void)intent; (void)resident;
 }
@@ -38858,6 +38949,10 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
 }
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    /* memgov D2-1: parse the governance mode table before the first
+     * decision or publication site can run (they all live behind an open
+     * engine).  Idempotent; the unit suite re-invokes it directly. */
+    ds4_gov_modes_init();
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
