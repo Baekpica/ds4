@@ -270,6 +270,28 @@ for b in $(seq 1 $BANKS); do
 done
 gen_prompt $PROMPT_TOKENS 999 /tmp/reclaim_deep.txt
 
+# ---- stable-start guard (memgov D2-1 amendment; plan sec 13: "a failure
+# to reach a stable starting memory state must abort the experiment").
+# Booting into a predecessor's un-reclaimed teardown (driver-lag WAIT_MEM
+# class) silently shrinks the fit -- observed 2026-08-13: boot 16s after a
+# shadow-gate teardown got free=8.61 GiB -> max_seq 2 (requested 24) and
+# the whole saturate/hog/serve choreography ran off its design point.
+# The fit needs headroom (8 GiB) + BANKS x ~0.5 GiB, plus the wave's page
+# budget; require an idle-shaped box before EVERY boot and DIE if it
+# never settles (legs A and B both boot fresh servers).
+SETTLE_MIN_MB=${SETTLE_MIN_MB:-90000}
+settle_wait() {
+    local avail=0
+    for i in $(seq 60); do
+        avail=$(( $(remote "awk '/MemAvailable/{print \$2}' /proc/meminfo") / 1024 ))
+        [ "$avail" -ge "$SETTLE_MIN_MB" ] && { \
+            log "stable start: MemAvailable=${avail}M >= ${SETTLE_MIN_MB}M"; return 0; }
+        sleep 5
+    done
+    die "starting memory never settled (MemAvailable ${avail}M < ${SETTLE_MIN_MB}M after 300s) -- aborting per plan sec 13, not continuing degraded"
+}
+settle_wait
+
 # ---- LEG A ----
 log "boot A (stock, $BANKS banks pinned${INJECT:+, trim-inject $INJECT})"
 boot "${INJECT:+DS4_CUDA_TRIM_INJECT=$INJECT}" /tmp/reclaim_A.log
@@ -312,6 +334,7 @@ stop_hog
 kill_server
 
 # ---- LEG B (control) ----
+settle_wait   # leg A's teardown must reclaim before the control boots
 log "boot B (DS4_BATCH_VMM_TRIM=0 control)"
 boot "DS4_BATCH_VMM_TRIM=0" /tmp/reclaim_B.log
 saturate /tmp/reclaim_tb terminal
