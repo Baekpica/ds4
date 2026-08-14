@@ -27,7 +27,7 @@
 # Usage: bash speed-bench/d0b_shadow_gate.sh   (from the repo root)
 set -uo pipefail
 HOST=${HOST:-sync-192_168_88_33}
-TEST_TREE='~/code/ds4-phase0'
+TEST_TREE=${TEST_TREE:-'~/code/ds4-phase0'}   # override for branch-tree verification runs
 CTX=${CTX:-32768}
 PORT=8000
 WAVE=${WAVE:-8}
@@ -259,19 +259,28 @@ log "(f) D2-5 full-board composite: every family's enforce refusal in one boot"
 # arrive with ms skew and each collapsed to run_job_single (served,
 # but never touching the per-call path this leg exists to refuse).
 # The knob exists exactly for burst-arrival skew.
-# BOOT pinned to OBSERVE (first-run finding, 08-14): the materializer's
+# BOOT UN-PINNED (08-14, memgov-mapped-serve-hardening `0998f5a`): this
+# leg once pinned DS4_MEMGOV_BOOT=observe because the materializer's
 # claims also carry the floor, and on this box geometry (85 GiB model,
 # ~34 GiB slack) any floor big enough to refuse prewarm (>~30 GiB) also
-# starves eager materialization -- the model boots fully COVERED and
-# the mapped-serve path fails prefill (rider: that degraded path is
-# broken under TOTAL refusal, and the funnel tripwire caught a 4 KiB
-# unclaimed post-freeze range on it).  This leg's subjects are
-# PREWARM/STATIC/SERIAL; BANK's refusals are leg (e)'s.
+# starves eager materialization -- the model boots fully COVERED, and
+# the degraded serve path was BROKEN under total refusal ("cuda prefill
+# failed" + a 4 KiB unclaimed post-freeze arena range).  Both gaps are
+# fixed: a governed refusal now degrades to the coherent mapped pointer
+# (raw ATS mapped-serve -- slow, correct), and the cold device-copy
+# tier takes a governed "cold_materialize" claim under the funnel
+# marker.  The composite therefore runs the TRUE FULL BOARD: the
+# materializer's total refusal (funded 0/10) is now a SUBJECT of this
+# leg alongside PREWARM/STATIC/SERIAL; BANK's refusals are leg (e)'s.
+# Materializer refusals disclose as bounded DISAGREE lines plus the
+# funded-0 porcelain (no per-site ENFORCE-refuse fprintf today); the
+# stray-refusal allowlist below carries the three materializer sites
+# for when they grow ENFORCE disclosures of their own.
 [ -n "$SPID" ] && R "kill $SPID" 2>/dev/null; SPID=""
 R 'ps -eo pid,comm | awk '"'"'$2=="ds4-server"{print $1}'"'"' | xargs -r kill' 2>/dev/null
 sleep 10
 ssh -o ConnectTimeout=10 "$HOST" \
-    "cd $TEST_TREE && DS4_BATCH_FIT_HEADROOM_MB=1000000 DS4_MEM_FLOOR_GB=600 DS4_MEMGOV_BOOT=observe DS4_SERVER_COALESCE_WAIT_MS=1000 setsid nohup ./ds4-server -c $CTX > /tmp/d0bboard_boot.log 2>&1 < /dev/null & exit 0" &
+    "cd $TEST_TREE && DS4_BATCH_FIT_HEADROOM_MB=1000000 DS4_MEM_FLOOR_GB=600 DS4_SERVER_COALESCE_WAIT_MS=1000 setsid nohup ./ds4-server -c $CTX > /tmp/d0bboard_boot.log 2>&1 < /dev/null & exit 0" &
 LP=$!; sleep 5; kill $LP 2>/dev/null || true
 BOOTED=0
 for i in $(seq 240); do
@@ -281,6 +290,10 @@ for i in $(seq 240); do
 done
 [ "$BOOTED" = "1" ] || { R "tail -5 /tmp/d0bboard_boot.log"; die "(f) pinned-board boot did not reach listening"; }
 SPID=$(R "pgrep -x ds4-server | head -1")
+R "grep -q 'memgov modes: boot=enforce prewarm=enforce bank=enforce serial=enforce static=enforce' /tmp/d0bboard_boot.log" \
+    || die "(f) mode board not at full-enforce defaults (BOOT re-pinned?)"
+R "grep -q 'materialize base: funded 0/10' /tmp/d0bboard_boot.log" \
+    || die "(f) materializer not fully refused (expected 'materialize base: funded 0/10' under the pinned floor)"
 R "grep -q 'memgov ENFORCE refuse site=boot_bank_fit' /tmp/d0bboard_boot.log" \
     || die "(f) no BANK fit refusal"
 R "grep -q 'memgov ENFORCE refuse site=boot_prewarm' /tmp/d0bboard_boot.log" \
@@ -311,9 +324,16 @@ R "grep -q 'memgov ENFORCE refuse site=static_batch_percall' /tmp/d0bboard_boot.
     || die "(f) no STATIC per-call refusal (requests did not coalesce onto the per-call path?)"
 R "grep -q 'memgov refused the per-call graph' /tmp/d0bboard_boot.log" \
     || die "(f) fallback reason line missing"
-STRAYF=$(R "grep 'memgov ENFORCE refuse' /tmp/d0bboard_boot.log | grep -vcE 'site=(boot_bank_fit|boot_prewarm|static_batch_percall)'" || true)
+STRAYF=$(R "grep 'memgov ENFORCE refuse' /tmp/d0bboard_boot.log | grep -vcE 'site=(boot_bank_fit|boot_prewarm|static_batch_percall|boot_materialize|lazy_materialize|cold_materialize)'" || true)
 [ "${STRAYF:-0}" = "0" ] || die "(f) unexpected enforce refusals beyond the pinned families ($STRAYF)"
-log "(f) PASS (BANK+PREWARM+STATIC refuse deterministically; serial fallback serves 2/2)"
+# The hardening's degraded-path contract: a fully-refused (COVERED)
+# model must SERVE from the coherent mapped tier -- zero prefill
+# failures, zero unclaimed post-freeze publications (funnel tripwire).
+PFAIL=$(R "grep -c 'prefill failed' /tmp/d0bboard_boot.log" || true)
+[ "${PFAIL:-0}" = "0" ] || { R "grep 'prefill failed' /tmp/d0bboard_boot.log | head -3"; die "(f) prefill failures under the full board ($PFAIL)"; }
+TRIPW=$(R "grep -c 'POST-FREEZE arena range' /tmp/d0bboard_boot.log" || true)
+[ "${TRIPW:-0}" = "0" ] || { R "grep 'POST-FREEZE arena range' /tmp/d0bboard_boot.log | head -3"; die "(f) funnel tripwire fired ($TRIPW unclaimed post-freeze publication(s))"; }
+log "(f) PASS (full board: BOOT starves the materializer (funded 0/10), BANK+PREWARM+STATIC refuse; mapped-tier fallback serves 2/2, prefill-failed 0, tripwire 0)"
 
 cleanup
 trap - EXIT
