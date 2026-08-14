@@ -26702,7 +26702,12 @@ static void test_mem_gov_governed_check(void) {
     cl.domain = DS4_MEMD_UNIFIED_DEVICE;
     cl.proposed_outstanding = 100;
     cl.class_limit = 10;             /* class-refusing claim by design */
-    /* observe (suite default): legacy rules regardless of the quote. */
+    /* observe: legacy rules regardless of the quote.  Pinned explicitly
+     * -- the SHIP default is enforce since the D2-5 full board, so on a
+     * CUDA backend (observation OK) an unpinned check would refuse
+     * (exactly how the stage-close battery caught this assumption). */
+    setenv("DS4_MEMGOV_STATIC", "observe", 1);
+    ds4_gov_modes_init();
     TEST_ASSERT(ds4_gov_governed_check("unit", &cl, DS4_GOV_ADMIT)
                 == DS4_GOV_ADMIT);
     /* enforce: the quote rules where the backend can quote. */
