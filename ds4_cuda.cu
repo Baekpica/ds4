@@ -1408,7 +1408,10 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
         (void)cudaGetLastError();
         fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
                 what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
-        return NULL;
+        /* Physical failure degrades exactly like a governed refusal
+         * (0998f5a's contract): mapped-serve where coherent, else the
+         * historical NULL. */
+        return cuda_model_direct_fallback_ptr(model_map, offset);
     }
 
     const char *src = (const char *)model_map + offset;
@@ -1417,14 +1420,23 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
         err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
+            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s (serving mapped)\n",
                     what ? what : "weights",
                     (double)done / 1048576.0,
                     (double)bytes / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaFree(dev);
             (void)cudaGetLastError();
-            return NULL;
+            /* Probe-proven shape (rent-gate M leg, 08-14): the per-range
+             * register tier page-rounds its registrations, so a tiny
+             * neighbor tensor can land with its source STRADDLING a
+             * registration boundary -- its own registration fails with
+             * HostMemoryAlreadyRegistered (silent by design) and the
+             * cudaMemcpy here rejects the boundary-crossing source with
+             * invalid argument (kv_rms_weight, deterministic).  The raw
+             * coherent map serves any host range regardless of
+             * registration geometry; degrade, never dead-resolve. */
+            return cuda_model_direct_fallback_ptr(model_map, offset);
         }
     }
     g_in_governed_materialize = 1;   /* claim taken above: funneled publication */
