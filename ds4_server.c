@@ -16675,6 +16675,18 @@ static void send_metrics(server *s, int fd) {
     buf_printf(&b, "# TYPE ds4_graph_fit_refusals_total counter\n"
                    "ds4_graph_fit_refusals_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->graph_fit_refusals));
+    /* memgov D4-3: reclaim outcome families, full fixed cardinality (the
+     * status vocabulary is closed; absent activity renders as zeros). */
+    buf_puts(&b, "# TYPE ds4_reclaim_banks_total counter\n");
+    for (int rs = 0; rs < DS4_RECLAIM_STATUS__COUNT; rs++)
+        buf_printf(&b, "ds4_reclaim_banks_total{result=\"%s\"} %llu\n",
+                   ds4_reclaim_status_str(rs),
+                   (unsigned long long)ds4_metric_read(&m->reclaim_banks[rs]));
+    buf_puts(&b, "# TYPE ds4_reclaim_bytes_total counter\n");
+    for (int rs = 0; rs < DS4_RECLAIM_STATUS__COUNT; rs++)
+        buf_printf(&b, "ds4_reclaim_bytes_total{result=\"%s\"} %llu\n",
+                   ds4_reclaim_status_str(rs),
+                   (unsigned long long)ds4_metric_read(&m->reclaim_bytes[rs]));
     buf_printf(&b, "# TYPE ds4_admits_total counter\n"
                    "ds4_admits_total{kind=\"cold\"} %llu\n"
                    "ds4_admits_total{kind=\"warm\"} %llu\n"

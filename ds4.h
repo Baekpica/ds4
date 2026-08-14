@@ -284,6 +284,7 @@ typedef enum {
     DS4_RECLAIM_BUSY,          /* a batched pass is driving this context */
     DS4_RECLAIM_UNSUPPORTED,   /* no trimmable substrate, or trim disabled */
     DS4_RECLAIM_DEVICE_ERROR,  /* driver failure with zero bytes destroyed */
+    DS4_RECLAIM_STATUS__COUNT,
 } ds4_reclaim_status;
 typedef struct {
     uint32_t bank;
@@ -771,6 +772,14 @@ typedef struct {
                              [DS4_GOV_STATUS__COUNT]
                              [DS4_GOV_CMP__COUNT];
     uint64_t memgov_faults;       /* publish/evaluate faults (gov ledger) */
+    /* memgov D4-3: reclaim outcome counters, fixed cardinality by
+     * construction (ds4_reclaim_status is closed).  Per-BANK outcomes and
+     * released bytes, ticked inside reclaim commit so every consumer is
+     * counted -- plan sec 14's ds4_reclaim_{banks,bytes}_total{result}
+     * families.  Request-level BUSY/UNSUPPORTED refusals plan no banks and
+     * tick nothing; the families still render every label. */
+    uint64_t reclaim_banks[DS4_RECLAIM_STATUS__COUNT];
+    uint64_t reclaim_bytes[DS4_RECLAIM_STATUS__COUNT];
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);

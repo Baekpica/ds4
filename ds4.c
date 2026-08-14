@@ -34056,6 +34056,33 @@ static uint64_t ds4_batch_bank_trim_estimate(ds4_batch_ctx *ctx, uint32_t b) {
  * the caller's ranked ids; commit is the only phase that touches the
  * driver, and it acknowledges destroyed content through the same
  * mark-trimmed helper the in-pass ladder uses. */
+/* memgov D4-3: temporary per-request reclaim ceiling (plan sec 10 -- kept
+ * one release beside the DS4_BATCH_VMM_TRIM kill switch, then deleted).
+ * DS4_BATCH_RECLAIM_MAX_BANKS / DS4_BATCH_RECLAIM_MAX_MB bound ONE
+ * prepare's plan; 0/unset = unbounded, the lite-4 field envelope v0.5.6
+ * validated -- the ceiling is an ops lever for deployments that want a
+ * smaller blast radius per serial request, not a new default. */
+static void ds4_batch_reclaim_ceiling(uint32_t *max_banks, uint64_t *max_bytes) {
+    static uint32_t banks = UINT32_MAX;
+    static uint64_t bytes = UINT64_MAX;
+    static int seen = 0;
+    if (!seen) {
+        seen = 1;
+        const char *eb = getenv("DS4_BATCH_RECLAIM_MAX_BANKS");
+        if (eb && eb[0]) {
+            const long v = atol(eb);
+            if (v > 0) banks = (uint32_t)v;
+        }
+        const char *em = getenv("DS4_BATCH_RECLAIM_MAX_MB");
+        if (em && em[0]) {
+            const long v = atol(em);
+            if (v > 0) bytes = (uint64_t)v << 20;
+        }
+    }
+    *max_banks = banks;
+    *max_bytes = bytes;
+}
+
 int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_ids,
                                   uint32_t n_ids, uint64_t want_bytes,
                                   ds4_reclaim_plan *plan) {
@@ -34065,9 +34092,14 @@ int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_id
     if (!ctx || !ds4_batch_trim_enabled()) return DS4_RECLAIM_UNSUPPORTED;
     if (ctx->in_pass) return DS4_RECLAIM_BUSY;
     if (!ordered_ids || n_ids == 0 || want_bytes == 0) return DS4_RECLAIM_OK;
+    uint32_t cap_banks;
+    uint64_t cap_bytes;
+    ds4_batch_reclaim_ceiling(&cap_banks, &cap_bytes);
+    const uint64_t capped_want = want_bytes < cap_bytes ? want_bytes : cap_bytes;
+    if (cap_banks > DS4_RECLAIM_MAX_BANKS) cap_banks = DS4_RECLAIM_MAX_BANKS;
     uint8_t seen[DS4_MULTISEQ_MAX_SEQ] = {0};
-    for (uint32_t i = 0; i < n_ids && plan->est_bytes < want_bytes &&
-                         plan->n < DS4_RECLAIM_MAX_BANKS; i++) {
+    for (uint32_t i = 0; i < n_ids && plan->est_bytes < capped_want &&
+                         plan->n < cap_banks; i++) {
         const uint32_t b = ordered_ids[i];
         if (b >= (uint32_t)ctx->max_seq || seen[b]) continue;
         seen[b] = 1;
@@ -34080,6 +34112,20 @@ int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_id
         rb->got_bytes = 0;
         rb->status = DS4_RECLAIM_OK;          /* provisional until commit */
         plan->est_bytes += est;
+    }
+    if (plan->est_bytes < want_bytes &&
+        (capped_want < want_bytes || plan->n == cap_banks)) {
+        /* Loud when the ceiling binds (the serial-reserve clamp law): the
+         * caller sees a smaller plan than the deficit asked for. */
+        static int ceil_disclosed = 0;
+        if (ceil_disclosed < 8) {
+            ceil_disclosed++;
+            fprintf(stderr,
+                    "ds4: batch reclaim: ceiling bound the plan (%u bank(s), %.1f MiB of "
+                    "%.1f MiB wanted; DS4_BATCH_RECLAIM_MAX_BANKS/MAX_MB)\n",
+                    plan->n, (double)plan->est_bytes / 1048576.0,
+                    (double)want_bytes / 1048576.0);
+        }
     }
     return DS4_RECLAIM_OK;
 }
@@ -34161,6 +34207,17 @@ int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
     } else if (failed > 0) {
         rr.status = DS4_RECLAIM_DEVICE_ERROR;
     }                                          /* else: empty plan -> OK */
+    /* memgov D4-3: exact per-bank outcome counters (plan sec 14 families).
+     * One tick per planned bank by its FINAL status; bytes follow the bank
+     * so a partial's shortfall is visible as bytes[partial] < est. */
+    for (uint32_t i = 0; i < plan->n; i++) {
+        const ds4_reclaim_bank *rb = &plan->banks[i];
+        if (rb->status >= 0 && rb->status < DS4_RECLAIM_STATUS__COUNT) {
+            ds4_metric_add(&ds4_metrics_get()->reclaim_banks[rb->status], 1);
+            ds4_metric_add(&ds4_metrics_get()->reclaim_bytes[rb->status],
+                           rb->got_bytes);
+        }
+    }
     if (result) *result = rr;
     return rr.status;
 }
