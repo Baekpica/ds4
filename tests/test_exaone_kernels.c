@@ -25,7 +25,10 @@ static void test_context_memory_plan(void) {
     g_ds4_shape = DS4_SHAPE_KEXAONE_236B;
     const ds4_context_memory m =
         ds4_context_memory_estimate(DS4_BACKEND_CUDA, 262144);
+    ds4_engine engine = {0};
     const int ok =
+        ds4_engine_hidden_f32_values(&engine) == 6144u &&
+        ds4_engine_n_hc(&engine) == 1 &&
         m.prefill_cap == 512u &&
         m.raw_cap == 262144u &&
         exaone_graph_layer_kv_cap(0u, 262144u, m.prefill_cap) == 640u &&
@@ -40,6 +43,28 @@ static void test_context_memory_plan(void) {
            (double)m.raw_bytes / 1073741824.0,
            (double)m.scratch_bytes / 1073741824.0,
            (double)m.total_bytes / 1073741824.0,
+           ok ? "ok" : "FAIL");
+}
+
+static void test_batch_memory_plan(void) {
+    uint64_t shared = 0u, per_bank = 0u, total1 = 0u, total2 = 0u;
+    const ds4_context_memory one =
+        exaone_graph_context_memory_estimate(262144u, 512u);
+    const bool estimated1 = exaone_graph_batch_memory_estimate(
+        262144u, 512u, 1u, &shared, &per_bank, &total1);
+    const bool estimated2 = exaone_graph_batch_memory_estimate(
+        262144u, 512u, 2u, NULL, NULL, &total2);
+    const uint64_t logits_row =
+        (uint64_t)DS4_N_VOCAB * sizeof(float);
+    const int ok = estimated1 && estimated2 && shared != 0u &&
+                   per_bank != 0u && shared + per_bank == one.total_bytes &&
+                   total1 == one.total_bytes + logits_row &&
+                   total2 == total1 + per_bank + logits_row;
+    if (!ok) g_fail++;
+    printf("%-38s shared=%.2f GiB bank=%.2f GiB  %s\n",
+           "persistent-bank memory plan",
+           (double)shared / 1073741824.0,
+           (double)per_bank / 1073741824.0,
            ok ? "ok" : "FAIL");
 }
 
@@ -254,6 +279,30 @@ static void test_shared_prefill_workspace(void) {
     if (!ok) g_fail++;
     printf("%-38s bytes=%.2f MiB  %s\n", "shared prefill workspace ownership",
            (double)expected_bytes / 1048576.0, ok ? "ok" : "FAIL");
+}
+
+static void test_persistent_bank_runtime_ownership(void) {
+    ds4_engine engine = {0};
+    ds4_exaone_batch_runtime *rt =
+        exaone_batch_runtime_create(&engine, 8u, 3u, 2u);
+    bool ok = rt && rt->max_seq == 3u &&
+              rt->graph[0].ws == &rt->shared_ws &&
+              rt->graph[1].ws == &rt->shared_ws &&
+              rt->graph[2].ws == &rt->shared_ws &&
+              !rt->graph[0].ws_owned && !rt->graph[1].ws_owned;
+    if (ok) {
+        float *src = rt->bank_logits;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) src[i] = (float)i;
+        rt->bank_logits_valid[0] = 1u;
+        ok = exaone_batch_runtime_copy_bank(rt, 0u, 1u, 0u) &&
+             rt->bank_logits_valid[1] &&
+             rt->bank_logits[DS4_N_VOCAB + 17u] == 17.0f &&
+             !exaone_batch_runtime_copy_bank(rt, 3u, 3u, 0u);
+    }
+    exaone_batch_runtime_free(rt);
+    if (!ok) g_fail++;
+    printf("%-38s banks=3/prefill=2  %s\n", "persistent bank shared ownership",
+           ok ? "ok" : "FAIL");
 }
 
 static void test_qk_norm_rope(void *map, uint64_t map_size, uint64_t w_off,
@@ -717,9 +766,11 @@ static void test_moe_matmul(const ds4_model *m, const ds4_weights *wts) {
 
 int main(int argc, char **argv) {
     test_context_memory_plan();
+    test_batch_memory_plan();
     test_exaone_rewind_span();
     if (!ds4_gpu_init()) { fprintf(stderr, "ds4_gpu_init failed\n"); return 1; }
     test_shared_prefill_workspace();
+    test_persistent_bank_runtime_ownership();
 
     /* Synthetic "model map": a QK-norm weight vector followed by a router
      * bias, at 256-byte-aligned offsets, registered the same way a real

@@ -26544,6 +26544,50 @@ static ds4_context_memory exaone_graph_context_memory_estimate(
     return m;
 }
 
+/* Persistent EXAONE banks share the P-row prefill workspace but retain one
+ * decode workspace and one KV cache each.  Keep this arithmetic beside the
+ * single-graph estimate so fit decisions happen before unified-memory
+ * allocation, never by probing until the host becomes unresponsive. */
+static bool exaone_graph_batch_memory_estimate(
+        uint32_t ctx, uint32_t prefill_cap, uint32_t banks,
+        uint64_t *shared_bytes, uint64_t *per_bank_bytes,
+        uint64_t *total_bytes) {
+    if (banks == 0u) return false;
+    const ds4_context_memory m =
+        exaone_graph_context_memory_estimate(ctx, prefill_cap);
+    if (m.total_bytes == 0u || m.prefill_cap != prefill_cap) return false;
+    const uint64_t n_embd = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t n_used = DS4_N_EXPERT_USED;
+    const uint64_t n_ff_shared =
+        DS4_N_FF_SHEXP ? DS4_N_FF_SHEXP : DS4_N_FF_EXP;
+    const uint64_t prefill_elems =
+        5u * n_embd + 2u * q_dim + 2u * kv_dim +
+        3u * DS4_N_FF_DENSE + 3u * n_ff_shared +
+        DS4_N_EXPERT + 2u * n_used +
+        3u * n_used * DS4_N_FF_EXP + n_used * n_embd;
+    if (prefill_elems > UINT64_MAX / prefill_cap / sizeof(float))
+        return false;
+    const uint64_t shared =
+        (uint64_t)prefill_cap * prefill_elems * sizeof(float);
+    if (shared > m.scratch_bytes) return false;
+    const uint64_t decode_scratch = m.scratch_bytes - shared;
+    if (m.raw_bytes > UINT64_MAX - decode_scratch) return false;
+    const uint64_t per_bank = m.raw_bytes + decode_scratch;
+    const uint64_t batch_logits =
+        (uint64_t)banks * DS4_N_VOCAB * sizeof(float);
+    if (shared > UINT64_MAX - batch_logits) return false;
+    const uint64_t fixed = shared + batch_logits;
+    if (per_bank > (UINT64_MAX - fixed) / banks)
+        return false;
+    const uint64_t total = fixed + (uint64_t)banks * per_bank;
+    if (shared_bytes) *shared_bytes = shared;
+    if (per_bank_bytes) *per_bank_bytes = per_bank;
+    if (total_bytes) *total_bytes = total;
+    return true;
+}
+
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
@@ -34081,6 +34125,14 @@ typedef struct {
     uint64_t        workspace_bytes;
 } ds4_exaone_gpu_graph;
 
+/* One row in a cross-bank decode.  Weight-bound stages run once over all
+ * rows; only position-dependent QK/RoPE, KV store, and attention select the
+ * row's own graph. */
+typedef struct {
+    ds4_exaone_gpu_graph *graph;
+    uint32_t pos;
+} ds4_exaone_decode_row;
+
 /* LLLG: full attention on every n_swa_period-th layer, sliding otherwise.
  * Shared with the CPU reference so the two cannot drift apart. */
 static bool exaone_graph_layer_is_sliding(uint32_t il) {
@@ -34333,13 +34385,63 @@ static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
  * x is updated in place: it enters as the residual stream and leaves as the
  * residual stream after both sublayers.
  */
+static bool exaone_graph_decode_attention_rows(
+        uint32_t il, uint32_t n_tok, bool sliding,
+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *heads, uint64_t q_dim, uint64_t kv_dim,
+        const ds4_model *m, const ds4_layer_weights *l,
+        const ds4_exaone_decode_row *rows) {
+    if (!rows || n_tok < 2u) return false;
+    const uint32_t window = sliding ? DS4_N_SWA : 0u;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        ds4_exaone_gpu_graph *row_graph = rows[t].graph;
+        if (!row_graph || !row_graph->layer_kv[il]) return false;
+        ds4_gpu_tensor *qr = ds4_gpu_tensor_view(
+            q, (uint64_t)t * q_dim * sizeof(float), q_dim * sizeof(float));
+        ds4_gpu_tensor *kr = ds4_gpu_tensor_view(
+            k, (uint64_t)t * kv_dim * sizeof(float), kv_dim * sizeof(float));
+        ds4_gpu_tensor *vr = ds4_gpu_tensor_view(
+            v, (uint64_t)t * kv_dim * sizeof(float), kv_dim * sizeof(float));
+        ds4_gpu_tensor *hr = ds4_gpu_tensor_view(
+            heads, (uint64_t)t * q_dim * sizeof(float),
+            q_dim * sizeof(float));
+        bool ok = qr && kr && vr && hr;
+        if (ok && DS4_USE_QK_NORM) {
+            ok = ds4_gpu_exaone_qk_norm_rope_tensor(
+                     qr, m->map, m->size, l->attn_q_norm->abs_offset,
+                     DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, rows[t].pos,
+                     1u, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS, sliding) &&
+                 ds4_gpu_exaone_qk_norm_rope_tensor(
+                     kr, m->map, m->size, l->attn_k_norm->abs_offset,
+                     DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, rows[t].pos,
+                     1u, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS, sliding);
+        }
+        if (ok) {
+            ok = ds4_gpu_exaone_kv_store_tensor(
+                     row_graph->layer_kv[il], kr, vr, (uint32_t)kv_dim,
+                     1u, rows[t].pos, row_graph->layer_kv_cap[il]) &&
+                 ds4_gpu_exaone_attention_decode_tensor(
+                     hr, qr, row_graph->layer_kv[il], DS4_N_HEAD,
+                     DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                     row_graph->layer_kv_cap[il], rows[t].pos, window);
+        }
+        ds4_gpu_tensor_free(hr);
+        ds4_gpu_tensor_free(vr);
+        ds4_gpu_tensor_free(kr);
+        ds4_gpu_tensor_free(qr);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
                                const ds4_model *m,
                                const ds4_weights *w,
                                uint32_t il,
                                uint32_t n_tok,
                                uint32_t pos0,
-                               ds4_gpu_tensor *x) {
+                               ds4_gpu_tensor *x,
+                               const ds4_exaone_decode_row *rows) {
     const ds4_layer_weights *l = &w->layer[il];
     const bool batch = n_tok > 1u;
     const uint64_t n_embd = g->n_embd;
@@ -34360,14 +34462,14 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
                                         l->attn_norm->abs_offset,
                                         (uint32_t)n_embd, n_tok, DS4_RMS_EPS))
         return false;
-    if (!metal_graph_matmul_plain_tensor(q, m, l->attn_q, n_embd, g->q_dim, norm, n_tok) ||
-        !metal_graph_matmul_plain_tensor(k, m, l->attn_k, n_embd, g->kv_dim, norm, n_tok) ||
-        !metal_graph_matmul_plain_tensor(v, m, l->attn_v, n_embd, g->kv_dim, norm, n_tok))
+    if (!plain_graph_matmul_tensor(q, m, l->attn_q, n_embd, g->q_dim, norm, n_tok) ||
+        !plain_graph_matmul_tensor(k, m, l->attn_k, n_embd, g->kv_dim, norm, n_tok) ||
+        !plain_graph_matmul_tensor(v, m, l->attn_v, n_embd, g->kv_dim, norm, n_tok))
         return false;
 
     /* QK-norm before RoPE, per head over head_dim; RoPE only on the sliding
      * layers -- the full-attention ones carry no positional encoding. */
-    if (DS4_USE_QK_NORM) {
+    if (!rows && DS4_USE_QK_NORM) {
         if (!ds4_gpu_exaone_qk_norm_rope_tensor(q, m->map, m->size,
                                                 l->attn_q_norm->abs_offset,
                                                 DS4_N_HEAD, DS4_N_HEAD_DIM,
@@ -34383,24 +34485,31 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
             return false;
     }
 
-    if (!ds4_gpu_exaone_kv_store_tensor(g->layer_kv[il], k, v,
-                                        (uint32_t)g->kv_dim, n_tok, pos0, kv_cap))
-        return false;
-
-    const uint32_t window = sliding ? DS4_N_SWA : 0u;
-    if (batch) {
-        if (!ds4_gpu_exaone_attention_prefill_tensor(
-                heads, q, g->layer_kv[il], n_tok, pos0, DS4_N_HEAD,
-                DS4_N_HEAD_KV, DS4_N_HEAD_DIM, kv_cap, window))
+    if (rows) {
+        if (!exaone_graph_decode_attention_rows(
+                il, n_tok, sliding, q, k, v, heads, g->q_dim, g->kv_dim,
+                m, l, rows))
             return false;
     } else {
-        if (!ds4_gpu_exaone_attention_decode_tensor(
-                heads, q, g->layer_kv[il], DS4_N_HEAD, DS4_N_HEAD_KV,
-                DS4_N_HEAD_DIM, kv_cap, pos0, window))
+        if (!ds4_gpu_exaone_kv_store_tensor(
+                g->layer_kv[il], k, v, (uint32_t)g->kv_dim,
+                n_tok, pos0, kv_cap))
             return false;
+        const uint32_t window = sliding ? DS4_N_SWA : 0u;
+        if (batch) {
+            if (!ds4_gpu_exaone_attention_prefill_tensor(
+                    heads, q, g->layer_kv[il], n_tok, pos0, DS4_N_HEAD,
+                    DS4_N_HEAD_KV, DS4_N_HEAD_DIM, kv_cap, window))
+                return false;
+        } else {
+            if (!ds4_gpu_exaone_attention_decode_tensor(
+                    heads, q, g->layer_kv[il], DS4_N_HEAD, DS4_N_HEAD_KV,
+                    DS4_N_HEAD_DIM, kv_cap, pos0, window))
+                return false;
+        }
     }
-    if (!metal_graph_matmul_plain_tensor(attn_out, m, l->attn_output,
-                                         g->q_dim, n_embd, heads, n_tok))
+    if (!plain_graph_matmul_tensor(attn_out, m, l->attn_output,
+                                   g->q_dim, n_embd, heads, n_tok))
         return false;
     if (!ds4_gpu_exaone_add_tensor(x, attn_out, (uint64_t)n_tok * n_embd))
         return false;
@@ -34418,10 +34527,10 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
         ds4_gpu_tensor *gt = batch ? g->ws->b_dense_gate : g->dense_gate;
         ds4_gpu_tensor *ut = batch ? g->ws->b_dense_up   : g->dense_up;
         ds4_gpu_tensor *mt = batch ? g->ws->b_dense_mid  : g->dense_mid;
-        if (!metal_graph_matmul_plain_tensor(gt, m, l->ffn_gate, n_embd, n_ff, norm, n_tok) ||
-            !metal_graph_matmul_plain_tensor(ut, m, l->ffn_up,   n_embd, n_ff, norm, n_tok) ||
+        if (!plain_graph_matmul_tensor(gt, m, l->ffn_gate, n_embd, n_ff, norm, n_tok) ||
+            !plain_graph_matmul_tensor(ut, m, l->ffn_up,   n_embd, n_ff, norm, n_tok) ||
             !ds4_gpu_exaone_swiglu_tensor(mt, gt, ut, (uint64_t)n_tok * n_ff) ||
-            !metal_graph_matmul_plain_tensor(ffn_out, m, l->ffn_down, n_ff, n_embd, mt, n_tok))
+            !plain_graph_matmul_tensor(ffn_out, m, l->ffn_down, n_ff, n_embd, mt, n_tok))
             return false;
         return ds4_gpu_exaone_add_tensor(x, ffn_out, (uint64_t)n_tok * n_embd);
     }
@@ -34431,8 +34540,8 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
     ds4_gpu_tensor *rl  = batch ? g->ws->b_router_logits   : g->router_logits;
     ds4_gpu_tensor *sel = batch ? g->ws->b_router_selected : g->router_selected;
     ds4_gpu_tensor *rw  = batch ? g->ws->b_router_weights  : g->router_weights;
-    if (!metal_graph_matmul_plain_tensor(rl, m, l->ffn_gate_inp, n_embd,
-                                         DS4_N_EXPERT, norm, n_tok))
+    if (!plain_graph_matmul_tensor(rl, m, l->ffn_gate_inp, n_embd,
+                                   DS4_N_EXPERT, norm, n_tok))
         return false;
     if (!ds4_gpu_exaone_router_tensor(sel, rw, rl, m->map, m->size,
                                       l->ffn_exp_probs_b
@@ -34487,10 +34596,10 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
     ds4_gpu_tensor *su = batch ? g->ws->b_shared_up   : g->shared_up;
     ds4_gpu_tensor *sm = batch ? g->ws->b_shared_mid  : g->shared_mid;
     ds4_gpu_tensor *so = batch ? g->ws->b_shared_out  : g->shared_out;
-    if (!metal_graph_matmul_plain_tensor(sg, m, l->ffn_gate_shexp, n_embd, n_ff_shexp, norm, n_tok) ||
-        !metal_graph_matmul_plain_tensor(su, m, l->ffn_up_shexp,   n_embd, n_ff_shexp, norm, n_tok) ||
+    if (!plain_graph_matmul_tensor(sg, m, l->ffn_gate_shexp, n_embd, n_ff_shexp, norm, n_tok) ||
+        !plain_graph_matmul_tensor(su, m, l->ffn_up_shexp,   n_embd, n_ff_shexp, norm, n_tok) ||
         !ds4_gpu_exaone_swiglu_tensor(sm, sg, su, (uint64_t)n_tok * n_ff_shexp) ||
-        !metal_graph_matmul_plain_tensor(so, m, l->ffn_down_shexp, n_ff_shexp, n_embd, sm, n_tok))
+        !plain_graph_matmul_tensor(so, m, l->ffn_down_shexp, n_ff_shexp, n_embd, sm, n_tok))
         return false;
 
     /* Router weights were folded into routed_mid before the down projection,
@@ -34517,10 +34626,26 @@ static bool exaone_graph_output_head(ds4_exaone_gpu_graph *g,
         ds4_gpu_exaone_rms_norm_tensor(g->norm, row, m->map, m->size,
                                        w->output_norm->abs_offset,
                                        (uint32_t)g->n_embd, 1u, DS4_RMS_EPS) &&
-        metal_graph_matmul_plain_tensor(g->logits, m, w->output,
-                                        g->n_embd, DS4_N_VOCAB, g->norm, 1u);
+        plain_graph_matmul_tensor(g->logits, m, w->output,
+                                  g->n_embd, DS4_N_VOCAB, g->norm, 1u);
     ds4_gpu_tensor_free(row);
     return ok;
+}
+
+static bool exaone_graph_output_head_batch(ds4_exaone_gpu_graph *g,
+                                           const ds4_model *m,
+                                           const ds4_weights *w,
+                                           ds4_gpu_tensor *x,
+                                           uint32_t n_tok,
+                                           ds4_gpu_tensor *logits) {
+    return n_tok != 0u && g->ws &&
+           ds4_gpu_exaone_rms_norm_tensor(
+               g->ws->b_norm, x, m->map, m->size,
+               w->output_norm->abs_offset, (uint32_t)g->n_embd,
+               n_tok, DS4_RMS_EPS) &&
+           plain_graph_matmul_tensor(
+               logits, m, w->output, g->n_embd, DS4_N_VOCAB,
+               g->ws->b_norm, n_tok);
 }
 
 /* Prefill one chunk. Only the final token's logits are produced -- the rest
@@ -34548,7 +34673,8 @@ static bool exaone_graph_prefill_chunk(ds4_exaone_gpu_graph *g,
         if (!ok) return false;
     }
     for (uint32_t il = 0; il < n_exec; il++) {
-        if (!exaone_graph_layer(g, m, w, il, n_tok, pos0, g->ws->b_cur)) {
+        if (!exaone_graph_layer(g, m, w, il, n_tok, pos0,
+                                g->ws->b_cur, NULL)) {
             fprintf(stderr, "ds4: exaone prefill failed at layer %u\n", il);
             return false;
         }
@@ -34571,12 +34697,216 @@ static bool exaone_graph_decode(ds4_exaone_gpu_graph *g,
                                           (uint32_t)token, (uint32_t)g->n_embd))
         return false;
     for (uint32_t il = 0; il < n_exec; il++) {
-        if (!exaone_graph_layer(g, m, w, il, 1u, pos, g->cur)) {
+        if (!exaone_graph_layer(g, m, w, il, 1u, pos, g->cur, NULL)) {
             fprintf(stderr, "ds4: exaone decode failed at layer %u\n", il);
             return false;
         }
     }
     return exaone_graph_output_head(g, m, w, g->cur, 0);
+}
+
+enum { DS4_EXAONE_DECODE_BATCH_MAX = DS4_MULTISEQ_MAX_SEQ };
+
+typedef struct ds4_exaone_batch_runtime {
+    uint32_t max_seq;
+    uint32_t ctx_size;
+    ds4_exaone_batch_ws shared_ws;
+    ds4_exaone_gpu_graph *graph;
+    ds4_gpu_tensor *decode_logits;
+    float *decode_logits_host;
+    float *bank_logits;
+    uint8_t *bank_logits_valid;
+} ds4_exaone_batch_runtime;
+
+static void exaone_batch_runtime_free(ds4_exaone_batch_runtime *rt) {
+    if (!rt) return;
+    if (rt->graph) {
+        for (uint32_t b = 0; b < rt->max_seq; b++)
+            exaone_graph_free(&rt->graph[b]);
+    }
+    free(rt->graph);
+    exaone_batch_ws_free(&rt->shared_ws);
+    ds4_gpu_tensor_free(rt->decode_logits);
+    free(rt->decode_logits_host);
+    free(rt->bank_logits);
+    free(rt->bank_logits_valid);
+    free(rt);
+}
+
+static ds4_exaone_batch_runtime *exaone_batch_runtime_create(
+        ds4_engine *e, uint32_t ctx_size, uint32_t max_seq,
+        uint32_t prefill_cap) {
+    if (!e || max_seq == 0u ||
+        max_seq > DS4_EXAONE_DECODE_BATCH_MAX) {
+        return NULL;
+    }
+    ds4_exaone_batch_runtime *rt = xcalloc(1, sizeof(*rt));
+    rt->max_seq = max_seq;
+    rt->ctx_size = ctx_size;
+    if (!exaone_batch_ws_alloc(
+            &rt->shared_ws, prefill_cap, DS4_N_EMBD,
+            (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM,
+            (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM)) {
+        exaone_batch_runtime_free(rt);
+        return NULL;
+    }
+
+    rt->graph = xcalloc(max_seq, sizeof(*rt->graph));
+    for (uint32_t b = 0; b < max_seq; b++) {
+        if (!exaone_graph_alloc_with_ws(
+                &rt->graph[b], &e->model, &e->weights,
+                ctx_size, prefill_cap, &rt->shared_ws)) {
+            exaone_batch_runtime_free(rt);
+            return NULL;
+        }
+    }
+    const uint64_t logits_bytes =
+        (uint64_t)max_seq * DS4_N_VOCAB * sizeof(float);
+    rt->decode_logits = ds4_gpu_tensor_alloc(logits_bytes);
+    rt->decode_logits_host = xcalloc(
+        (size_t)max_seq * DS4_N_VOCAB,
+        sizeof(*rt->decode_logits_host));
+    rt->bank_logits = xcalloc(
+        (size_t)max_seq * DS4_N_VOCAB,
+        sizeof(*rt->bank_logits));
+    rt->bank_logits_valid = xcalloc(
+        max_seq, sizeof(*rt->bank_logits_valid));
+    if (!rt->decode_logits || !rt->decode_logits_host ||
+        !rt->bank_logits || !rt->bank_logits_valid) {
+        exaone_batch_runtime_free(rt);
+        return NULL;
+    }
+    ds4_log(stderr, DS4_LOG_TIMING,
+            "ds4: EXAONE batch runtime: %u banks, ctx %u, "
+            "KV %.2f GiB/bank, shared prefill scratch %.2f GiB\n",
+            max_seq, ctx_size,
+            (double)rt->graph[0].kv_bytes / 1073741824.0,
+            (double)rt->shared_ws.bytes / 1073741824.0);
+    return rt;
+}
+
+static bool exaone_batch_runtime_copy_bank(
+        ds4_exaone_batch_runtime *rt, uint32_t src, uint32_t dst,
+        uint32_t tokens) {
+    if (!rt || src >= rt->max_seq || dst >= rt->max_seq) return false;
+    if (src == dst) return true;
+    ds4_exaone_gpu_graph *sg = &rt->graph[src];
+    ds4_exaone_gpu_graph *dg = &rt->graph[dst];
+    const uint64_t row_bytes = sg->kv_dim * 2u * sizeof(uint16_t);
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (!sg->layer_kv[il]) continue;
+        const uint32_t rows = tokens < sg->layer_kv_cap[il]
+            ? tokens : sg->layer_kv_cap[il];
+        ok = rows == 0u || ds4_gpu_tensor_copy(
+            dg->layer_kv[il], 0, sg->layer_kv[il], 0,
+            (uint64_t)rows * row_bytes) != 0;
+    }
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+    if (!ok) {
+        rt->bank_logits_valid[dst] = 0u;
+        return false;
+    }
+    if (rt->bank_logits_valid[src]) {
+        memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
+               rt->bank_logits + (size_t)src * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->bank_logits_valid[dst] = 1u;
+    } else {
+        rt->bank_logits_valid[dst] = 0u;
+    }
+    return true;
+}
+
+static bool exaone_batch_runtime_read_prefill_logits(
+        ds4_exaone_batch_runtime *rt, uint32_t bank) {
+    if (!rt || bank >= rt->max_seq ||
+        ds4_gpu_synchronize() == 0) {
+        return false;
+    }
+    float *dst = rt->bank_logits + (size_t)bank * DS4_N_VOCAB;
+    const bool ok = ds4_gpu_tensor_read(
+        rt->graph[bank].logits, 0, dst,
+        (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    rt->bank_logits_valid[bank] = ok ? 1u : 0u;
+    return ok;
+}
+
+static bool exaone_batch_runtime_decode(
+        ds4_exaone_batch_runtime *rt, const ds4_model *m,
+        const ds4_weights *w, const uint32_t *banks,
+        const int *tokens, const uint32_t *positions, uint32_t n_rows) {
+    if (!rt || !banks || !tokens || !positions || n_rows == 0u ||
+        n_rows > rt->max_seq || n_rows > rt->shared_ws.prefill_cap) {
+        return false;
+    }
+    if (n_rows == 1u) {
+        const uint32_t bank = banks[0];
+        if (bank >= rt->max_seq ||
+            !exaone_graph_decode(
+                &rt->graph[bank], m, w, tokens[0], positions[0]) ||
+            ds4_gpu_synchronize() == 0) {
+            if (bank < rt->max_seq) rt->bank_logits_valid[bank] = 0u;
+            return false;
+        }
+        float *dst = rt->bank_logits + (size_t)bank * DS4_N_VOCAB;
+        const bool ok = ds4_gpu_tensor_read(
+            rt->graph[bank].logits, 0, dst,
+            (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        rt->bank_logits_valid[bank] = ok ? 1u : 0u;
+        return ok;
+    }
+
+    ds4_exaone_gpu_graph *carrier = &rt->graph[banks[0]];
+    ds4_exaone_decode_row rows[DS4_EXAONE_DECODE_BATCH_MAX];
+    for (uint32_t i = 0; i < n_rows; i++) {
+        const uint32_t bank = banks[i];
+        if (bank >= rt->max_seq) return false;
+        rows[i].graph = &rt->graph[bank];
+        rows[i].pos = positions[i];
+        ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+            rt->shared_ws.b_cur,
+            (uint64_t)i * carrier->n_embd * sizeof(float),
+            carrier->n_embd * sizeof(float));
+        if (!row) return false;
+        const bool ok = ds4_gpu_embed_token_quant_tensor(
+            row, m->map, m->size, w->token_embd->abs_offset,
+            w->token_embd->type, DS4_N_VOCAB, (uint32_t)tokens[i],
+            (uint32_t)carrier->n_embd) != 0;
+        ds4_gpu_tensor_free(row);
+        if (!ok) return false;
+    }
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        if (!exaone_graph_layer(
+                carrier, m, w, il, n_rows, 0u,
+                rt->shared_ws.b_cur, rows)) {
+            fprintf(stderr,
+                    "ds4: EXAONE banked decode failed at layer %u\n", il);
+            return false;
+        }
+    }
+    const uint64_t logits_bytes =
+        (uint64_t)n_rows * DS4_N_VOCAB * sizeof(float);
+    if (!exaone_graph_output_head_batch(
+            carrier, m, w, rt->shared_ws.b_cur,
+            n_rows, rt->decode_logits) ||
+        ds4_gpu_synchronize() == 0 ||
+        !ds4_gpu_tensor_read(
+            rt->decode_logits, 0, rt->decode_logits_host,
+            logits_bytes)) {
+        for (uint32_t i = 0; i < n_rows; i++)
+            rt->bank_logits_valid[banks[i]] = 0u;
+        return false;
+    }
+    for (uint32_t i = 0; i < n_rows; i++) {
+        const uint32_t bank = banks[i];
+        memcpy(rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+               rt->decode_logits_host + (size_t)i * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->bank_logits_valid[bank] = 1u;
+    }
+    return true;
 }
 #endif /* DS4_NO_GPU */
 
@@ -40206,10 +40536,10 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     return 1;
 #else
     if (!e || !dataset_path || !output_path) return 1;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
                 "ds4: DeepSeek routed-MoE imatrix collection is unavailable "
-                "for Solar Open2\n");
+                "for this model family\n");
         return 1;
     }
     if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) {
@@ -40390,7 +40720,8 @@ int ds4_engine_batched_generate_ex(
         n_packed += L;
     }
 
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
         if (n_packed > INT_MAX) {
             BG_API_ERR("batched_generate: packed prompt is too large");
             return 1;
@@ -41112,6 +41443,7 @@ static ds4_solar_batch_runtime *solar_batch_runtime_create(
 struct ds4_batch_ctx {
     ds4_engine     *e;
     ds4_solar_batch_runtime *solar; /* non-NULL selects the Solar dispatch */
+    ds4_exaone_batch_runtime *exaone; /* non-NULL selects the EXAONE dispatch */
     bool            supports_partial_reuse; /* explicit runtime capability */
     ds4_gpu_graph   g;
     ds4_batch_slabs sl;            /* allocated for max_seq banks */
@@ -41520,6 +41852,10 @@ static int solar_cont_bank_restore_payload(
 uint64_t ds4_cont_bank_payload_bytes(ds4_batch_ctx *ctx, uint32_t bank) {
     if (!ctx || bank >= (uint32_t)ctx->max_seq || !ctx->bank_hist_valid[bank] ||
         ctx->bank_hist_len[bank] == 0) return 0;
+    /* Durable EXAONE bank payloads need an LLLG-specific wire layout.  Keep
+     * checkpointing explicitly unavailable until that layout is implemented;
+     * falling into the DeepSeek walker would serialize unrelated fields. */
+    if (ctx->exaone) return 0u;
     if (ctx->solar) return solar_cont_bank_payload_bytes(ctx, bank);
     ds4_gpu_graph *g = &ctx->g;
     ds4_gpu_graph *wg = ds4_cont_bank_walk_graph(ctx);
@@ -41565,6 +41901,11 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
     }
     if (!ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0) {
         payload_set_err(err, errlen, "bank has no reuse-trustworthy committed history");
+        return 1;
+    }
+    if (ctx->exaone) {
+        payload_set_err(err, errlen,
+                        "EXAONE bank payloads are not implemented");
         return 1;
     }
     if (ctx->solar) {
@@ -41646,6 +41987,11 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
                                   char *err, size_t errlen) {
     if (!ctx || !fp || bank >= (uint32_t)ctx->max_seq) {
         payload_set_err(err, errlen, "invalid bank payload load");
+        return 1;
+    }
+    if (ctx->exaone) {
+        payload_set_err(err, errlen,
+                        "EXAONE bank payloads are not implemented");
         return 1;
     }
     if (ctx->solar) {
@@ -42339,6 +42685,10 @@ static uint64_t solar_trim_bank_cuda(uint32_t b, void *user) {
  * class, nothing more. */
 uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
     if (!ctx || want_bytes == 0) return 0;
+    /* EXAONE banks currently use fixed CUDA allocations.  They are fit before
+     * allocation and cannot be partially unmapped; never fall through to the
+     * unrelated DeepSeek slab trimmer. */
+    if (ctx->exaone) return 0;
     if (ctx->solar) {
         /* ds4_gpu_tensor_trim unmaps VMM pages.  gen_mu prevents new server
          * launches but does not drain work already queued on the device; match
@@ -42406,6 +42756,113 @@ static int solar_batch_ctx_create_impl(
 #undef SBC_ERR
 }
 
+static int exaone_batch_ctx_create_impl(
+        ds4_engine *e, int ctx_size, int max_seq, bool fit,
+        ds4_batch_ctx **out, char *err, size_t errlen) {
+#define EBC_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
+    const uint32_t prefill_cap = exaone_graph_prefill_cap_for_context(
+        (uint32_t)ctx_size, 0u);
+    uint32_t chosen = (uint32_t)max_seq;
+    uint64_t shared = 0u, per_bank = 0u, planned = 0u;
+    if (prefill_cap < chosen ||
+        !exaone_graph_batch_memory_estimate(
+            (uint32_t)ctx_size, prefill_cap, chosen,
+            &shared, &per_bank, &planned)) {
+        EBC_ERR("batch_ctx_create: EXAONE memory plan is invalid "
+                "(ctx=%d max_seq=%d prefill=%u)",
+                ctx_size, max_seq, prefill_cap);
+        return 1;
+    }
+
+    uint64_t free_b = 0u, total_b = 0u;
+    if (ds4_gpu_mem_info(&free_b, &total_b) == 0) {
+        const uint64_t outstanding = ds4_gpu_substrate_outstanding();
+        free_b = free_b > outstanding ? free_b - outstanding : 0u;
+        const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
+        const uint64_t budget = free_b > headroom ? free_b - headroom : 0u;
+        if (planned > budget) {
+            const uint64_t logits_row =
+                (uint64_t)DS4_N_VOCAB * sizeof(float);
+            const uint64_t bank_charge = per_bank + logits_row;
+            uint32_t affordable = 0u;
+            if (budget > shared && bank_charge != 0u) {
+                const uint64_t n = (budget - shared) / bank_charge;
+                affordable = n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
+            }
+            if (!fit || affordable == 0u) {
+                EBC_ERR("batch_ctx_create: EXAONE banks need %.2f GiB "
+                        "plus %.2f GiB headroom, only %.2f GiB is free "
+                        "(ctx=%d max_seq=%u)",
+                        (double)planned / 1073741824.0,
+                        (double)headroom / 1073741824.0,
+                        (double)free_b / 1073741824.0,
+                        ctx_size, chosen);
+                return 1;
+            }
+            if (affordable < chosen) {
+                fprintf(stderr,
+                        "ds4: EXAONE batch fit: max_seq %u -> %u "
+                        "(shared %.2f GiB, %.2f GiB/bank, "
+                        "free %.2f GiB, headroom %.2f GiB)\n",
+                        chosen, affordable,
+                        (double)shared / 1073741824.0,
+                        (double)bank_charge / 1073741824.0,
+                        (double)free_b / 1073741824.0,
+                        (double)headroom / 1073741824.0);
+                chosen = affordable;
+            }
+        }
+    }
+
+    ds4_batch_ctx *ctx = xcalloc(1, sizeof(*ctx));
+    ctx->e = e;
+    ctx->ctx_size = (uint32_t)ctx_size;
+    ctx->prefill_cap = prefill_cap;
+    ctx->raw_cap = (uint32_t)ctx_size;
+    ctx->seq_cap = (uint32_t)ctx_size;
+    ctx->max_seq = chosen;
+
+    for (;;) {
+        ctx->exaone = exaone_batch_runtime_create(
+            e, ctx->ctx_size, ctx->max_seq, ctx->prefill_cap);
+        if (ctx->exaone) break;
+        if (!fit || ctx->max_seq <= 1u) {
+            EBC_ERR("batch_ctx_create: EXAONE runtime allocation failed "
+                    "(max_seq=%u ctx=%u)", ctx->max_seq, ctx->ctx_size);
+            free(ctx);
+            return 1;
+        }
+        uint32_t next = ctx->max_seq * 3u / 4u;
+        if (next >= ctx->max_seq) next = ctx->max_seq - 1u;
+        if (next < 1u) next = 1u;
+        fprintf(stderr,
+                "ds4: EXAONE batch allocation failed at max_seq=%u, "
+                "retrying at %u\n", ctx->max_seq, next);
+        ctx->max_seq = next;
+    }
+
+    if ((uint64_t)ctx->max_seq * ctx->seq_cap >
+        SIZE_MAX / sizeof(*ctx->bank_hist)) {
+        EBC_ERR("batch_ctx_create: EXAONE bank history size overflow");
+        exaone_batch_runtime_free(ctx->exaone);
+        free(ctx);
+        return 1;
+    }
+    ctx->bank_hist = xmalloc(
+        (size_t)ctx->max_seq * ctx->seq_cap * sizeof(*ctx->bank_hist));
+    ctx->bank_hist_len = xcalloc(
+        ctx->max_seq, sizeof(*ctx->bank_hist_len));
+    ctx->bank_hist_valid = xcalloc(
+        ctx->max_seq, sizeof(*ctx->bank_hist_valid));
+    ctx->bank_gen = xmalloc(ctx->max_seq * sizeof(*ctx->bank_gen));
+    for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b] = 1u;
+    ctx->supports_partial_reuse = false;
+    ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
+    *out = ctx;
+    return 0;
+#undef EBC_ERR
+}
+
 static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                                      bool fit, ds4_batch_ctx **out, char *err, size_t errlen) {
 #define BC_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
@@ -42426,6 +42883,10 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         const int rc = solar_batch_ctx_create_impl(
             e, ctx_size, max_seq, max_total_tokens, fit, out, err, errlen);
         return rc;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+        return exaone_batch_ctx_create_impl(
+            e, ctx_size, max_seq, fit, out, err, errlen);
     }
 
     const uint32_t prefill_cap = (uint32_t)max_total_tokens;
@@ -42767,6 +43228,15 @@ int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_t
 
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     if (!ctx) return;
+    if (ctx->exaone) {
+        exaone_batch_runtime_free(ctx->exaone);
+        free(ctx->bank_hist);
+        free(ctx->bank_hist_len);
+        free(ctx->bank_hist_valid);
+        free(ctx->bank_gen);
+        free(ctx);
+        return;
+    }
     if (ctx->solar) {
         solar_batch_runtime_free(ctx->solar);
         free(ctx->bank_hist);
@@ -43229,7 +43699,7 @@ bool ds4_batch_ctx_supports_partial_reuse(const ds4_batch_ctx *ctx) {
     return ctx && ctx->supports_partial_reuse;
 }
 
-static int solar_engine_batched_generate_ctx(
+static int family_engine_batched_generate_ctx(
         ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
         const int *max_new_tokens, const int *eos_ids,
         ds4_batch_gen_result *out, char *err, size_t errlen);
@@ -43242,8 +43712,9 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
     if (!ctx || !prompts || !out) { BCG_ERR("batched_generate_ctx: null argument"); return 1; }
     if (n <= 0 || (uint32_t)n > ctx->max_seq) {
         BCG_ERR("batched_generate_ctx: n=%d out of [1,%u]", n, ctx->max_seq); return 1; }
-    /* A2a: the static path reuses ctx->sl banks without committed-history
-     * bookkeeping -- retired warm state is gone after this call. */
+    /* A static batch replaces any retired warm state.  Family adapters below
+     * rebuild exact histories for the newly completed rows; the original
+     * multi-sequence graph still has its own bookkeeping in this call. */
     bank_hist_invalidate_all(ctx);
 
     ds4_engine *e = ctx->e;
@@ -43251,6 +43722,11 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
     for (int i = 0; i < n; i++) {
         if (prompts[i].len <= 0) { BCG_ERR("batched_generate_ctx: prompt %d is empty", i); return 1; }
         const uint32_t L = (uint32_t)prompts[i].len;
+        if (ctx->exaone && L > ctx->seq_cap) {
+            BCG_ERR("batched_generate_ctx: EXAONE prompt %d length %u "
+                    "exceeds context %u", i, L, ctx->seq_cap);
+            return 1;
+        }
         if (L > max_len) max_len = L;
         if (L > UINT32_MAX - n_packed) {
             BCG_ERR("batched_generate_ctx: packed prompt size overflow");
@@ -43258,12 +43734,16 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
         }
         n_packed += L;
     }
+    if (ctx->exaone) {
+        return family_engine_batched_generate_ctx(
+            ctx, prompts, n, max_new_tokens, eos_ids, out, err, errlen);
+    }
     if (n_packed > ctx->prefill_cap) {
         BCG_ERR("batched_generate_ctx: Σlen %u exceeds ctx prefill_cap %u", n_packed, ctx->prefill_cap); return 1; }
     if (max_len > ctx->raw_cap) {
         BCG_ERR("batched_generate_ctx: longest prompt %u exceeds ctx raw_cap %u", max_len, ctx->raw_cap); return 1; }
     if (ctx->solar) {
-        return solar_engine_batched_generate_ctx(
+        return family_engine_batched_generate_ctx(
             ctx, prompts, n, max_new_tokens, eos_ids, out, err, errlen);
     }
 
@@ -44050,9 +44530,9 @@ static void cont_stats_publish_done(ds4_batch_ctx *ctx, ds4_cont_seq_stats *sst,
 }
 
 enum {
-    SOLAR_CONT_FREE = 0,
-    SOLAR_CONT_PREFILL = 1,
-    SOLAR_CONT_DECODE = 2,
+    FAMILY_CONT_FREE = 0,
+    FAMILY_CONT_PREFILL = 1,
+    FAMILY_CONT_DECODE = 2,
 };
 
 typedef struct {
@@ -44075,12 +44555,12 @@ typedef struct {
     int (*sample_override)(void *ud, void *user);
     int (*alive)(void *ud, void *user);
     ds4_cont_seq_stats stats;
-} ds4_solar_cont_bank;
+} ds4_family_cont_bank;
 
-static bool solar_cont_history_exact(const ds4_batch_ctx *ctx,
-                                     uint32_t bank,
-                                     const int *tokens,
-                                     uint32_t n) {
+static bool family_cont_history_exact(const ds4_batch_ctx *ctx,
+                                      uint32_t bank,
+                                      const int *tokens,
+                                      uint32_t n) {
     return ctx && bank < ctx->max_seq && tokens && n != 0u &&
            ctx->bank_hist_valid[bank] &&
            ctx->bank_hist_len[bank] == n &&
@@ -44088,37 +44568,37 @@ static bool solar_cont_history_exact(const ds4_batch_ctx *ctx,
                   tokens, (size_t)n * sizeof(*tokens)) == 0;
 }
 
-static uint32_t solar_cont_busy_count(const ds4_solar_cont_bank *bank,
-                                      uint32_t n) {
+static uint32_t family_cont_busy_count(const ds4_family_cont_bank *bank,
+                                       uint32_t n) {
     uint32_t busy = 0u;
-    for (uint32_t b = 0; b < n; b++) busy += bank[b].phase != SOLAR_CONT_FREE;
+    for (uint32_t b = 0; b < n; b++) busy += bank[b].phase != FAMILY_CONT_FREE;
     return busy;
 }
 
-static void solar_cont_stats_publish_done(ds4_batch_ctx *ctx,
-                                          ds4_solar_cont_bank *bank,
-                                          uint32_t emitted) {
+static void family_cont_stats_publish_done(ds4_batch_ctx *ctx,
+                                           ds4_family_cont_bank *bank,
+                                           uint32_t emitted) {
     bank->stats.decode_tokens = emitted;
     bank->stats.done_sec = now_sec();
     ctx->last_done = bank->stats;
     ctx->last_done_set = 1u;
 }
 
-static void solar_cont_publish_empty(
-        ds4_batch_ctx *ctx, ds4_solar_cont_bank *bank, uint32_t b,
+static void family_cont_publish_empty(
+        ds4_batch_ctx *ctx, ds4_family_cont_bank *bank, uint32_t b,
         void (*on_done)(void *, void *, const int *, int, int), void *ud) {
     const int empty = 0;
     void *user = bank[b].user;
     free(bank[b].prefill);
     bank[b].prefill = NULL;
-    bank[b].phase = SOLAR_CONT_FREE;
+    bank[b].phase = FAMILY_CONT_FREE;
     bank[b].user = NULL;
-    solar_cont_stats_publish_done(ctx, &bank[b], 0u);
+    family_cont_stats_publish_done(ctx, &bank[b], 0u);
     on_done(ud, user, &empty, 0, 0);
 }
 
-static void solar_cont_publish_generated(
-        ds4_batch_ctx *ctx, ds4_solar_cont_bank *bank, uint32_t b,
+static void family_cont_publish_generated(
+        ds4_batch_ctx *ctx, ds4_family_cont_bank *bank, uint32_t b,
         int finish,
         void (*on_done)(void *, void *, const int *, int, int), void *ud) {
     void *user = bank[b].user;
@@ -44126,9 +44606,9 @@ static void solar_cont_publish_generated(
     const uint32_t n = bank[b].generated_len;
     bank[b].generated = NULL;
     bank[b].generated_len = 0u;
-    bank[b].phase = SOLAR_CONT_FREE;
+    bank[b].phase = FAMILY_CONT_FREE;
     bank[b].user = NULL;
-    solar_cont_stats_publish_done(ctx, &bank[b], n);
+    family_cont_stats_publish_done(ctx, &bank[b], n);
     on_done(ud, user, generated, (int)n, finish);
     free(generated);
 }
@@ -44148,7 +44628,7 @@ static int solar_engine_continuous_generate(
 #define SCG_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
     ds4_solar_batch_runtime *rt = ctx->solar;
     const uint32_t MS = ctx->max_seq;
-    ds4_solar_cont_bank *bank = xcalloc(MS, sizeof(*bank));
+    ds4_family_cont_bank *bank = xcalloc(MS, sizeof(*bank));
     uint32_t *credit_end = xcalloc(MS, sizeof(*credit_end));
     uint32_t prefill_cursor = 0u;
     bool ok = rt != NULL && credit_end != NULL;
@@ -44160,7 +44640,7 @@ static int solar_engine_continuous_generate(
 
         /* Fill every currently free slot.  The callback is not polled when no
          * slot exists, matching the existing server's backpressure contract. */
-        while (solar_cont_busy_count(bank, MS) < MS) {
+        while (family_cont_busy_count(bank, MS) < MS) {
             ds4_cont_request req;
             memset(&req, 0, sizeof(req));
             if (!admit(ud, &req)) {
@@ -44179,7 +44659,7 @@ static int solar_engine_continuous_generate(
             int target = req.place_bank > 0 ? req.place_bank - 1 : -1;
             if (target >= 0 &&
                 ((uint32_t)target >= MS ||
-                 bank[target].phase != SOLAR_CONT_FREE)) {
+                 bank[target].phase != FAMILY_CONT_FREE)) {
                 ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1u);
                 on_done(ud, req.user, NULL, 0, 0);
                 continue;
@@ -44187,13 +44667,13 @@ static int solar_engine_continuous_generate(
             if (target < 0) {
                 /* Preserve a fork source when another target is available. */
                 for (uint32_t b = 0; b < MS; b++) {
-                    if (bank[b].phase == SOLAR_CONT_FREE && (int)b != src) {
+                    if (bank[b].phase == FAMILY_CONT_FREE && (int)b != src) {
                         target = (int)b;
                         break;
                     }
                 }
                 if (target < 0 && src >= 0 && (uint32_t)src < MS &&
-                    bank[src].phase == SOLAR_CONT_FREE) {
+                    bank[src].phase == FAMILY_CONT_FREE) {
                     target = src;
                 }
                 if (target < 0) break;
@@ -44238,8 +44718,8 @@ static int solar_engine_continuous_generate(
             if (src >= 0 && requested_cached != 0u) {
                 const bool source_ok =
                     (uint32_t)src < MS &&
-                    bank[src].phase == SOLAR_CONT_FREE &&
-                    solar_cont_history_exact(
+                    bank[src].phase == FAMILY_CONT_FREE &&
+                    family_cont_history_exact(
                         ctx, (uint32_t)src, req.tokens, requested_cached);
                 if (source_ok) {
                     if ((uint32_t)src != b) {
@@ -44265,7 +44745,7 @@ static int solar_engine_continuous_generate(
                     ctx->fork_rejects++;
                 }
             } else if (requested_cached != 0u && req.place_bank > 0 &&
-                       solar_cont_history_exact(
+                       family_cont_history_exact(
                            ctx, b, req.tokens, requested_cached)) {
                 cached = requested_cached;
                 warm = true;
@@ -44308,8 +44788,8 @@ static int solar_engine_continuous_generate(
                 ds4_metric_add(&ds4_metrics_get()->admits_cold, 1u);
             }
 
-            ds4_solar_cont_bank *sb = &bank[b];
-            sb->phase = SOLAR_CONT_PREFILL;
+            ds4_family_cont_bank *sb = &bank[b];
+            sb->phase = FAMILY_CONT_PREFILL;
             sb->user = req.user;
             sb->prefill_base = cached;
             sb->prefill_len = (uint32_t)req.n - cached;
@@ -44339,7 +44819,7 @@ static int solar_engine_continuous_generate(
             if (req.on_admitted &&
                 !req.on_admitted(ud, req.user, (int)cached,
                                  req.n - (int)cached, (int)b)) {
-                solar_cont_publish_empty(ctx, bank, b, on_done, ud);
+                family_cont_publish_empty(ctx, bank, b, on_done, ud);
                 credit_end[b] = 0u;
                 continue;
             }
@@ -44353,16 +44833,16 @@ static int solar_engine_continuous_generate(
         uint32_t pb = MS;
         for (uint32_t i = 0; i < MS; i++) {
             const uint32_t cand = (prefill_cursor + i) % MS;
-            if (bank[cand].phase == SOLAR_CONT_PREFILL) {
+            if (bank[cand].phase == FAMILY_CONT_PREFILL) {
                 pb = cand;
                 prefill_cursor = (cand + 1u) % MS;
                 break;
             }
         }
         if (pb < MS) {
-            ds4_solar_cont_bank *sb = &bank[pb];
+            ds4_family_cont_bank *sb = &bank[pb];
             if (sb->alive && !sb->alive(ud, sb->user)) {
-                solar_cont_publish_empty(ctx, bank, pb, on_done, ud);
+                family_cont_publish_empty(ctx, bank, pb, on_done, ud);
                 credit_end[pb] = 0u;
             } else {
                 const uint32_t remain = sb->prefill_len - sb->prefill_off;
@@ -44433,12 +44913,12 @@ static int solar_engine_continuous_generate(
                     const bool aborted = !hit_eos && on_token &&
                         !on_token(ud, sb->user, token);
                     if (hit_eos || sb->generated_len >= sb->max_new || aborted) {
-                        solar_cont_publish_generated(
+                        family_cont_publish_generated(
                             ctx, bank, pb, hit_eos ? 1 : 0,
                             on_done, ud);
                         credit_end[pb] = 0u;
                     } else {
-                        sb->phase = SOLAR_CONT_DECODE;
+                        sb->phase = FAMILY_CONT_DECODE;
                     }
                 }
             }
@@ -44454,8 +44934,8 @@ static int solar_engine_continuous_generate(
         int decode_tokens[DS4_MULTISEQ_MAX_SEQ];
         uint32_t decode_count = 0u;
         for (uint32_t b = 0; ok && b < MS; b++) {
-            ds4_solar_cont_bank *sb = &bank[b];
-            if (sb->phase != SOLAR_CONT_DECODE) continue;
+            ds4_family_cont_bank *sb = &bank[b];
+            if (sb->phase != FAMILY_CONT_DECODE) continue;
             const uint32_t pos = ctx->bank_hist_len[b];
             if (pos >= ctx->seq_cap ||
                 !solar_batch_runtime_ensure_kv(rt, b, pos + 1u)) {
@@ -44494,7 +44974,7 @@ static int solar_engine_continuous_generate(
         }
         for (uint32_t row = 0u; ok && row < decode_count; row++) {
             const uint32_t b = decode_banks[row];
-            ds4_solar_cont_bank *sb = &bank[b];
+            ds4_family_cont_bank *sb = &bank[b];
             bank_hist_append(ctx, b, sb->current);
             sb->stats.decode_steps++;
             ds4_metric_add(&ds4_metrics_get()->decode_steps, 1u);
@@ -44514,16 +44994,16 @@ static int solar_engine_continuous_generate(
             const bool aborted = !hit_eos && on_token &&
                 !on_token(ud, sb->user, token);
             if (hit_eos || sb->generated_len >= sb->max_new || aborted) {
-                solar_cont_publish_generated(
+                family_cont_publish_generated(
                     ctx, bank, b, hit_eos ? 1 : 0, on_done, ud);
                 credit_end[b] = 0u;
             }
         }
 
-        const uint32_t busy = solar_cont_busy_count(bank, MS);
+        const uint32_t busy = family_cont_busy_count(bank, MS);
         uint32_t live = 0u;
         for (uint32_t b = 0; b < MS; b++)
-            live += bank[b].phase == SOLAR_CONT_DECODE;
+            live += bank[b].phase == FAMILY_CONT_DECODE;
         ds4_metric_set(&ds4_metrics_get()->banks_live, live);
         if (ok && busy == 0u && admit_returned_none) break;
     }
@@ -44531,7 +45011,7 @@ static int solar_engine_continuous_generate(
     if (!ok) {
         ds4_metric_add(&ds4_metrics_get()->cont_batch_failures, 1u);
         for (uint32_t b = 0; b < MS; b++) {
-            if (bank[b].phase != SOLAR_CONT_FREE) {
+            if (bank[b].phase != FAMILY_CONT_FREE) {
                 ctx->bank_gen[b]++;
                 ctx->bank_hist_valid[b] = 0u;
             }
@@ -44548,6 +45028,356 @@ static int solar_engine_continuous_generate(
 #undef SCG_ERR
 }
 
+/* EXAONE uses the same continuous-serving contract and lifecycle as Solar,
+ * but keeps one LLLG KV graph per bank.  Prefill scratch and weight-bound
+ * decode stages are shared; position-dependent attention selects each row's
+ * graph explicitly in exaone_graph_decode_attention_rows. */
+static int exaone_engine_continuous_generate(
+        ds4_batch_ctx *ctx,
+        int (*admit)(void *ud, ds4_cont_request *req),
+        int (*on_token)(void *ud, void *user, int token),
+        void (*on_done)(void *ud, void *user,
+                        const int *tokens, int n, int finish),
+        void *ud, char *err, size_t errlen) {
+#define ECG_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
+    ds4_exaone_batch_runtime *rt = ctx->exaone;
+    const uint32_t MS = ctx->max_seq;
+    ds4_family_cont_bank *bank = xcalloc(MS, sizeof(*bank));
+    uint32_t prefill_cursor = 0u;
+    bool ok = rt != NULL;
+    ctx->last_done_set = 0u;
+    ds4_metric_set(&ds4_metrics_get()->banks_live, 0u);
+
+    while (ok) {
+        bool admit_returned_none = false;
+        while (family_cont_busy_count(bank, MS) < MS) {
+            ds4_cont_request req;
+            memset(&req, 0, sizeof(req));
+            if (!admit(ud, &req)) {
+                admit_returned_none = true;
+                break;
+            }
+            if (!req.tokens || req.n <= 0 ||
+                (uint32_t)req.n > ctx->seq_cap) {
+                ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1u);
+                on_done(ud, req.user, NULL, 0, 0);
+                continue;
+            }
+
+            int src = req.fork_bank > 0 ? req.fork_bank - 1 : -1;
+            int target = req.place_bank > 0 ? req.place_bank - 1 : -1;
+            if (target >= 0 &&
+                ((uint32_t)target >= MS ||
+                 bank[target].phase != FAMILY_CONT_FREE)) {
+                ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1u);
+                on_done(ud, req.user, NULL, 0, 0);
+                continue;
+            }
+            if (target < 0) {
+                for (uint32_t b = 0; b < MS; b++) {
+                    if (bank[b].phase == FAMILY_CONT_FREE && (int)b != src) {
+                        target = (int)b;
+                        break;
+                    }
+                }
+                if (target < 0 && src >= 0 && (uint32_t)src < MS &&
+                    bank[src].phase == FAMILY_CONT_FREE) {
+                    target = src;
+                }
+                if (target < 0) break;
+            }
+            const uint32_t b = (uint32_t)target;
+            const uint32_t requested_new = req.max_new > 0
+                ? (uint32_t)req.max_new : 1u;
+            const uint32_t room = ctx->seq_cap > (uint32_t)req.n
+                ? ctx->seq_cap - (uint32_t)req.n : 1u;
+            uint32_t effective_new = requested_new < room
+                ? requested_new : room;
+            if (effective_new == 0u) effective_new = 1u;
+
+            uint32_t cached = 0u;
+            bool forked = false;
+            bool warm = false;
+            const uint32_t requested_cached =
+                req.n_cached > 0 && req.n_cached <= req.n
+                    ? (uint32_t)req.n_cached : 0u;
+            if (src >= 0 && requested_cached != 0u) {
+                const bool source_ok =
+                    (uint32_t)src < MS &&
+                    bank[src].phase == FAMILY_CONT_FREE &&
+                    family_cont_history_exact(
+                        ctx, (uint32_t)src, req.tokens, requested_cached);
+                if (source_ok) {
+                    if ((uint32_t)src != b) {
+                        if (!exaone_batch_runtime_copy_bank(
+                                rt, (uint32_t)src, b, requested_cached)) {
+                            ctx->bank_gen[b]++;
+                            ctx->bank_hist_valid[b] = 0u;
+                            ECG_ERR("continuous_generate: EXAONE fork copy "
+                                    "failed src=%d dst=%u", src, b);
+                            ok = false;
+                            break;
+                        }
+                        memcpy(ctx->bank_hist + (size_t)b * ctx->seq_cap,
+                               ctx->bank_hist + (size_t)src * ctx->seq_cap,
+                               (size_t)requested_cached * sizeof(int));
+                        ctx->bank_gen[b]++;
+                        ctx->bank_hist_len[b] = requested_cached;
+                        ctx->bank_hist_valid[b] = 1u;
+                    }
+                    cached = requested_cached;
+                    forked = true;
+                } else {
+                    ctx->fork_rejects++;
+                }
+            } else if (requested_cached != 0u && req.place_bank > 0 &&
+                       family_cont_history_exact(
+                           ctx, b, req.tokens, requested_cached)) {
+                cached = requested_cached;
+                warm = true;
+            } else if (requested_cached != 0u) {
+                ctx->warm_rejects++;
+            }
+            if (cached == (uint32_t)req.n &&
+                !rt->bank_logits_valid[b]) {
+                if (warm) ctx->warm_rejects++;
+                if (forked) ctx->fork_rejects++;
+                cached = 0u;
+                warm = false;
+                forked = false;
+            }
+            if (forked) {
+                ctx->fork_admits++;
+                ds4_metric_add(&ds4_metrics_get()->admits_fork, 1u);
+            } else if (warm) {
+                ctx->warm_admits++;
+                ds4_metric_add(&ds4_metrics_get()->admits_warm, 1u);
+            }
+            if (cached == 0u) {
+                bank_hist_reset(ctx, b);
+                rt->bank_logits_valid[b] = 0u;
+                ds4_metric_add(&ds4_metrics_get()->admits_cold, 1u);
+            }
+
+            ds4_family_cont_bank *cb = &bank[b];
+            cb->phase = FAMILY_CONT_PREFILL;
+            cb->user = req.user;
+            cb->prefill_base = cached;
+            cb->prefill_len = (uint32_t)req.n - cached;
+            cb->prefill_off = 0u;
+            if (cb->prefill_len != 0u) {
+                cb->prefill = xmalloc(
+                    (size_t)cb->prefill_len * sizeof(*cb->prefill));
+                memcpy(cb->prefill, req.tokens + cached,
+                       (size_t)cb->prefill_len * sizeof(*cb->prefill));
+            }
+            cb->max_new = effective_new;
+            cb->eos = req.eos >= 0 ? req.eos : ctx->e->vocab.eos_id;
+            cb->temperature = req.temperature;
+            cb->top_k = req.top_k;
+            cb->top_p = req.top_p;
+            cb->min_p = req.min_p;
+            cb->rng = req.seed;
+            cb->sample_override = req.sample_override;
+            cb->alive = req.alive;
+            memset(&cb->stats, 0, sizeof(cb->stats));
+            cb->stats.admit_sec = now_sec();
+            cb->stats.prefill_cached = cached;
+            cb->stats.prefill_computed = (uint32_t)req.n - cached;
+            ds4_metric_add(&ds4_metrics_get()->tokens_prefilled_cached, cached);
+            if (req.bank_used) *req.bank_used = (int)b;
+            if (req.on_admitted &&
+                !req.on_admitted(ud, req.user, (int)cached,
+                                 req.n - (int)cached, (int)b)) {
+                family_cont_publish_empty(ctx, bank, b, on_done, ud);
+            }
+        }
+        if (!ok) break;
+
+        uint32_t pb = MS;
+        for (uint32_t i = 0; i < MS; i++) {
+            const uint32_t cand = (prefill_cursor + i) % MS;
+            if (bank[cand].phase == FAMILY_CONT_PREFILL) {
+                pb = cand;
+                prefill_cursor = (cand + 1u) % MS;
+                break;
+            }
+        }
+        if (pb < MS) {
+            ds4_family_cont_bank *cb = &bank[pb];
+            if (cb->alive && !cb->alive(ud, cb->user)) {
+                family_cont_publish_empty(ctx, bank, pb, on_done, ud);
+            } else {
+                const uint32_t remain = cb->prefill_len - cb->prefill_off;
+                if (remain != 0u) {
+                    uint32_t n = remain;
+                    if (n > rt->shared_ws.prefill_cap)
+                        n = rt->shared_ws.prefill_cap;
+                    const uint32_t pos = cb->prefill_base + cb->prefill_off;
+                    const bool final = n == remain;
+                    rt->bank_logits_valid[pb] = 0u;
+                    if (!exaone_graph_prefill_chunk(
+                            &rt->graph[pb], &ctx->e->model, &ctx->e->weights,
+                            cb->prefill + cb->prefill_off, n, pos, final)) {
+                        ctx->bank_gen[pb]++;
+                        ctx->bank_hist_valid[pb] = 0u;
+                        ECG_ERR("continuous_generate: EXAONE prefill failed "
+                                "bank=%u pos=%u n=%u", pb, pos, n);
+                        ok = false;
+                        break;
+                    }
+                    bank_hist_append_n(
+                        ctx, pb, cb->prefill + cb->prefill_off, n);
+                    cb->prefill_off += n;
+                    ds4_metric_add(
+                        &ds4_metrics_get()->tokens_prefilled_computed, n);
+                    ds4_metrics_window_add(0u, 0u, n);
+                    if (final &&
+                        !exaone_batch_runtime_read_prefill_logits(rt, pb)) {
+                        ctx->bank_gen[pb]++;
+                        ctx->bank_hist_valid[pb] = 0u;
+                        ECG_ERR("continuous_generate: EXAONE prefill logits "
+                                "read failed for bank=%u", pb);
+                        ok = false;
+                        break;
+                    }
+                }
+                if (cb->prefill_off == cb->prefill_len) {
+                    if (!rt->bank_logits_valid[pb]) {
+                        ECG_ERR("continuous_generate: EXAONE bank %u has no "
+                                "frontier logits", pb);
+                        ok = false;
+                        break;
+                    }
+                    const int override = cb->sample_override
+                        ? cb->sample_override(ud, cb->user)
+                        : DS4_SAMPLE_OVERRIDE_NONE;
+                    const int token = sample_top_p_min_p_override(
+                        rt->bank_logits + (size_t)pb * DS4_N_VOCAB,
+                        DS4_N_VOCAB, cb->temperature, cb->top_k,
+                        cb->top_p, cb->min_p, &cb->rng, override);
+                    free(cb->prefill);
+                    cb->prefill = NULL;
+                    cb->generated = xmalloc(
+                        (size_t)cb->max_new * sizeof(*cb->generated));
+                    cb->generated[0] = token;
+                    cb->generated_len = 1u;
+                    cb->current = token;
+                    cb->stats.first_token_sec = now_sec();
+                    ds4_metric_add(&ds4_metrics_get()->tokens_decoded, 1u);
+                    ds4_metrics_window_add(1u, 0u, 0u);
+                    const bool hit_eos = token == cb->eos;
+                    const bool aborted = !hit_eos && on_token &&
+                        !on_token(ud, cb->user, token);
+                    if (hit_eos || cb->generated_len >= cb->max_new ||
+                        aborted) {
+                        family_cont_publish_generated(
+                            ctx, bank, pb, hit_eos ? 1 : 0, on_done, ud);
+                    } else {
+                        cb->phase = FAMILY_CONT_DECODE;
+                    }
+                }
+            }
+        }
+        if (!ok) break;
+
+        uint32_t decode_banks[DS4_EXAONE_DECODE_BATCH_MAX];
+        uint32_t decode_positions[DS4_EXAONE_DECODE_BATCH_MAX];
+        int decode_tokens[DS4_EXAONE_DECODE_BATCH_MAX];
+        uint32_t decode_count = 0u;
+        for (uint32_t b = 0; b < MS; b++) {
+            ds4_family_cont_bank *cb = &bank[b];
+            if (cb->phase != FAMILY_CONT_DECODE) continue;
+            const uint32_t pos = ctx->bank_hist_len[b];
+            if (pos >= ctx->seq_cap) {
+                ctx->bank_gen[b]++;
+                ctx->bank_hist_valid[b] = 0u;
+                ECG_ERR("continuous_generate: EXAONE bank %u reached "
+                        "context limit", b);
+                ok = false;
+                break;
+            }
+            decode_banks[decode_count] = b;
+            decode_positions[decode_count] = pos;
+            decode_tokens[decode_count] = cb->current;
+            decode_count++;
+        }
+        const uint32_t decode_cap =
+            rt->shared_ws.prefill_cap < DS4_EXAONE_DECODE_BATCH_MAX
+                ? rt->shared_ws.prefill_cap
+                : DS4_EXAONE_DECODE_BATCH_MAX;
+        for (uint32_t off = 0u; ok && off < decode_count;) {
+            uint32_t n = decode_count - off;
+            if (n > decode_cap) n = decode_cap;
+            if (n == 0u || !exaone_batch_runtime_decode(
+                    rt, &ctx->e->model, &ctx->e->weights,
+                    decode_banks + off, decode_tokens + off,
+                    decode_positions + off, n)) {
+                const uint32_t b = decode_banks[off];
+                ctx->bank_gen[b]++;
+                ctx->bank_hist_valid[b] = 0u;
+                ECG_ERR("continuous_generate: EXAONE decode failed "
+                        "rows=%u first_bank=%u pos=%u", n, b,
+                        decode_positions[off]);
+                ok = false;
+                break;
+            }
+            off += n;
+        }
+        for (uint32_t row = 0u; ok && row < decode_count; row++) {
+            const uint32_t b = decode_banks[row];
+            ds4_family_cont_bank *cb = &bank[b];
+            bank_hist_append(ctx, b, cb->current);
+            cb->stats.decode_steps++;
+            ds4_metric_add(&ds4_metrics_get()->decode_steps, 1u);
+            const int override = cb->sample_override
+                ? cb->sample_override(ud, cb->user)
+                : DS4_SAMPLE_OVERRIDE_NONE;
+            const int token = sample_top_p_min_p_override(
+                rt->bank_logits + (size_t)b * DS4_N_VOCAB,
+                DS4_N_VOCAB, cb->temperature, cb->top_k,
+                cb->top_p, cb->min_p, &cb->rng, override);
+            cb->generated[cb->generated_len++] = token;
+            cb->current = token;
+            ds4_metric_add(&ds4_metrics_get()->tokens_decoded, 1u);
+            ds4_metrics_window_add(1u, 1u, 0u);
+            const bool hit_eos = token == cb->eos;
+            const bool aborted = !hit_eos && on_token &&
+                !on_token(ud, cb->user, token);
+            if (hit_eos || cb->generated_len >= cb->max_new || aborted) {
+                family_cont_publish_generated(
+                    ctx, bank, b, hit_eos ? 1 : 0, on_done, ud);
+            }
+        }
+
+        const uint32_t busy = family_cont_busy_count(bank, MS);
+        uint32_t live = 0u;
+        for (uint32_t b = 0; b < MS; b++)
+            live += bank[b].phase == FAMILY_CONT_DECODE;
+        ds4_metric_set(&ds4_metrics_get()->banks_live, live);
+        if (ok && busy == 0u && admit_returned_none) break;
+    }
+
+    if (!ok) {
+        ds4_metric_add(&ds4_metrics_get()->cont_batch_failures, 1u);
+        for (uint32_t b = 0; b < MS; b++) {
+            if (bank[b].phase != FAMILY_CONT_FREE) {
+                ctx->bank_gen[b]++;
+                ctx->bank_hist_valid[b] = 0u;
+                rt->bank_logits_valid[b] = 0u;
+            }
+        }
+    }
+    for (uint32_t b = 0; b < MS; b++) {
+        free(bank[b].prefill);
+        free(bank[b].generated);
+    }
+    free(bank);
+    ds4_metric_set(&ds4_metrics_get()->banks_live, 0u);
+    return ok ? 0 : 1;
+#undef ECG_ERR
+}
+
 typedef struct {
     const ds4_tokens *prompts;
     const int *max_new;
@@ -44557,10 +45387,10 @@ typedef struct {
     int next;
     int completed;
     int failed;
-} ds4_solar_static_batch;
+} ds4_family_static_batch;
 
-static int solar_static_admit(void *ud, ds4_cont_request *req) {
-    ds4_solar_static_batch *batch = ud;
+static int family_static_admit(void *ud, ds4_cont_request *req) {
+    ds4_family_static_batch *batch = ud;
     if (batch->next >= batch->n) return 0;
     const int i = batch->next++;
     memset(req, 0, sizeof(*req));
@@ -44573,9 +45403,9 @@ static int solar_static_admit(void *ud, ds4_cont_request *req) {
     return 1;
 }
 
-static void solar_static_done(void *ud, void *user,
-                              const int *tokens, int n, int finish) {
-    ds4_solar_static_batch *batch = ud;
+static void family_static_done(void *ud, void *user,
+                               const int *tokens, int n, int finish) {
+    ds4_family_static_batch *batch = ud;
     const int i = (int)(uintptr_t)user - 1;
     if (!tokens) {
         batch->failed = 1;
@@ -44592,24 +45422,28 @@ static void solar_static_done(void *ud, void *user,
     }
 }
 
-static int solar_engine_batched_generate_ctx(
+static int family_engine_batched_generate_ctx(
         ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
         const int *max_new_tokens, const int *eos_ids,
         ds4_batch_gen_result *out, char *err, size_t errlen) {
-    ds4_solar_static_batch batch = {
+    ds4_family_static_batch batch = {
         .prompts = prompts,
         .max_new = max_new_tokens,
         .eos = eos_ids,
         .out = out,
         .n = n,
     };
-    const int rc = solar_engine_continuous_generate(
-        ctx, solar_static_admit, NULL, solar_static_done,
-        &batch, err, errlen);
+    const int rc = ctx->exaone
+        ? exaone_engine_continuous_generate(
+              ctx, family_static_admit, NULL, family_static_done,
+              &batch, err, errlen)
+        : solar_engine_continuous_generate(
+              ctx, family_static_admit, NULL, family_static_done,
+              &batch, err, errlen);
     if (rc != 0 || batch.failed || batch.completed != n) {
         if (err && errlen && err[0] == '\0') {
             snprintf(err, errlen,
-                     "batched_generate_ctx: Solar continuous adapter "
+                     "batched_generate_ctx: family continuous adapter "
                      "completed %d/%d", batch.completed, n);
         }
         for (int i = 0; i < n; i++) {
@@ -44636,6 +45470,10 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (!ds4_engine_supports_batching(ctx->e)) {
         CG_ERR("continuous_generate: this model does not yet implement the multi-sequence graph");
         return 1;
+    }
+    if (ctx->exaone) {
+        return exaone_engine_continuous_generate(
+            ctx, admit, on_token, on_done, ud, err, errlen);
     }
     if (ctx->solar) {
         const int rc = solar_engine_continuous_generate(
@@ -47693,7 +48531,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
 }
 #endif
 
-/* Plain-residual model families use the public session contract for scalar
+/* Native-session model families use the public session contract for scalar
  * generation.  This keeps CLI/embedding callers on the same graph and state
  * lifecycle as the server instead of entering DeepSeek's raw-SWA executor. */
 static int generate_public_session_argmax(
@@ -47758,7 +48596,12 @@ static int generate_public_session_argmax(
         }
 
         const int token = ds4_session_argmax(session);
-        if (token == eos) break;
+        if (token < 0) {
+            fprintf(stderr, "ds4: public-session argmax failed\n");
+            rc = 1;
+            break;
+        }
+        if (token == eos || ds4_token_is_stop(e, token)) break;
         if (emit) emit(emit_ud, token);
         if (token_trace) {
             fprintf(stderr,
@@ -47812,7 +48655,9 @@ int ds4_engine_generate_argmax(
         void              *emit_ud,
         ds4_session_progress_fn progress,
         void              *progress_ud) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3 ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
         return generate_public_session_argmax(
             e, prompt, n_predict, ctx_size, emit, done, emit_ud,
             progress, progress_ud);
@@ -47827,62 +48672,6 @@ int ds4_engine_generate_argmax(
             fprintf(stderr, "ds4: %s generation requested but the graph backend is unavailable\n",
                     ds4_backend_name(e->backend));
             return 1;
-        }
-        /* K-EXAONE has no standalone generate path: the session is the only
-         * driver, which keeps CLI generation and served requests on exactly
-         * one code path. */
-        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
-            ds4_session *s = NULL;
-            char err[256] = {0};
-            const double t_prefill0 = now_sec();
-            if (ds4_session_create(&s, e, ctx_size) != 0) {
-                fprintf(stderr, "ds4: failed to create EXAONE graph session\n");
-                return 1;
-            }
-            ds4_session_set_progress(s, progress, progress_ud);
-            if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
-                ds4_session_set_progress(s, NULL, NULL);
-                fprintf(stderr, "ds4: EXAONE prefill failed: %s\n", err);
-                ds4_session_free(s);
-                return 1;
-            }
-            ds4_session_set_progress(s, NULL, NULL);
-            const double t_prefill1 = now_sec();
-
-            int rc = 0;
-            int n_generated = 0;
-            const double t_decode0 = now_sec();
-            int token = ds4_session_argmax(s);
-            for (int i = 0; i < n_predict && ds4_session_pos(s) < ctx_size; i++) {
-                if (token < 0) {
-                    fprintf(stderr, "ds4: EXAONE argmax failed\n");
-                    rc = 1;
-                    break;
-                }
-                if (ds4_token_is_stop(e, token)) break;
-                if (emit) emit(emit_ud, token);
-                n_generated++;
-                if (i == n_predict - 1 || ds4_session_pos(s) + 1 >= ctx_size) break;
-                if (ds4_session_eval(s, token, err, sizeof(err)) == 0) {
-                    token = ds4_session_argmax(s);
-                } else {
-                    token = -1;
-                }
-                if (token < 0) {
-                    fprintf(stderr, "ds4: EXAONE decode failed: %s\n", err);
-                    rc = 1;
-                    break;
-                }
-            }
-            const double t_decode1 = now_sec();
-            if (done) done(emit_ud);
-            ds4_log(stderr,
-                    DS4_LOG_TIMING,
-                    "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-                    (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
-                    (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
-            ds4_session_free(s);
-            return rc;
         }
         return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
                                             n_predict, ctx_size, e->quality,
@@ -47909,9 +48698,9 @@ int ds4_engine_generate_argmax(
 
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 #ifndef DS4_NO_GPU
-    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
-                "ds4: DeepSeek graph diagnostic is unavailable for Solar Open2\n");
+                "ds4: DeepSeek graph diagnostic is unavailable for this model family\n");
         return 1;
     }
     if (!e->metal_ready) {
@@ -47929,9 +48718,9 @@ int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
 #ifndef DS4_NO_GPU
-    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
-                "ds4: DeepSeek full-graph diagnostic is unavailable for Solar Open2\n");
+                "ds4: DeepSeek full-graph diagnostic is unavailable for this model family\n");
         return 1;
     }
     if (!e->metal_ready) {
@@ -47949,9 +48738,9 @@ int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size) {
 #ifndef DS4_NO_GPU
-    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
-                "ds4: DeepSeek prompt-graph diagnostic is unavailable for Solar Open2\n");
+                "ds4: DeepSeek prompt-graph diagnostic is unavailable for this model family\n");
         return 1;
     }
     if (!e->metal_ready) {
@@ -47969,9 +48758,9 @@ int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, 
 }
 
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
-    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
-                "ds4: DeepSeek head diagnostic is unavailable for Solar Open2\n");
+                "ds4: DeepSeek head diagnostic is unavailable for this model family\n");
         return 1;
     }
     if (!prompt || prompt->len <= 0) {
@@ -48459,9 +49248,9 @@ int ds4_engine_motif3_forward_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
-    if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
-                "ds4: DeepSeek first-token diagnostic is unavailable for Solar Open2\n");
+                "ds4: DeepSeek first-token diagnostic is unavailable for this model family\n");
         return 1;
     }
     if (!prompt || prompt->len <= 0) {
@@ -48629,6 +49418,21 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         ds4_engine_close(e);
         *out = NULL;
         return 1;
+    }
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4 &&
+        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+        const char *dspark_path = opt->dspark_path;
+        if (!dspark_path || !dspark_path[0])
+            dspark_path = getenv("DS4_DSPARK_MODEL");
+        if ((opt->mtp_path && opt->mtp_path[0]) ||
+            (dspark_path && dspark_path[0])) {
+            fprintf(stderr,
+                    "ds4: MTP and DSpark support models are DeepSeek-only; "
+                    "remove --mtp/--dspark (or DS4_DSPARK_MODEL) for this model family\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
@@ -49005,7 +49809,8 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
 
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     (void)e;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
         return (uint64_t)DS4_N_EMBD;
     }
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -49022,11 +49827,11 @@ bool ds4_engine_supports_batching(ds4_engine *e) {
     if (!e || !ds4_backend_uses_graph(e->backend) || !e->metal_ready) {
         return false;
     }
-    /* The first EXAONE port is the common serial-session path.  Do not route
-     * it through DeepSeek's persistent banks until the dedicated batch
-     * driver is integrated. */
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) return false;
-    return true;
+    /* Solar and EXAONE dispatch to their own persistent-bank runtimes;
+     * DeepSeek retains the upstream multi-sequence graph.  Motif-3 currently
+     * serves through its exact native session rather than entering the
+     * incompatible DeepSeek bank graph. */
+    return DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MOTIF3;
 }
 
 int ds4_engine_model_id(ds4_engine *e) {
@@ -50534,6 +51339,39 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
     if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
     ds4_engine *e = s->engine;
+    if (ds4_session_is_motif3(s)) {
+        (void)probe_mtp;
+        if (!s->motif3_graph_ready ||
+            !s->motif3_graph.latent_cache_ready) {
+            if (errlen) snprintf(err, errlen,
+                                 "Motif-3 latent session is not initialized");
+            return 1;
+        }
+        if (!s->checkpoint_valid ||
+            s->motif3_graph.cache_len != (uint32_t)s->checkpoint.len) {
+            if (errlen) snprintf(err, errlen,
+                                 "Motif-3 decode requires a valid latent checkpoint");
+            return 1;
+        }
+        if ((uint32_t)s->checkpoint.len >= s->motif3_graph.ctx_cap) {
+            if (errlen) snprintf(err, errlen, "Motif-3 context reached (%u)",
+                                 s->motif3_graph.ctx_cap);
+            return 1;
+        }
+        if (!motif3_graph_forward_chunk(
+                &s->motif3_graph, &e->model, &e->weights,
+                &token, 1u, (uint32_t)s->checkpoint.len, s->logits)) {
+            if (errlen) snprintf(err, errlen,
+                                 "CUDA Motif-3 latent decode failed at position %d",
+                                 s->checkpoint.len);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
     if (ds4_session_is_exaone(s)) {
         ds4_exaone_gpu_graph *g = &s->exaone_graph;
         (void)probe_mtp;

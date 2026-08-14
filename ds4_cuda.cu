@@ -30683,16 +30683,92 @@ extern "C" int ds4_gpu_motif3_routed_moe_batch_tensor(
         ds4_tensor_device_idx(x) != logical_tier) {
         return 0;
     }
-    const char *gate_w = cuda_resolve_weight_ptr(
-            model_map, gate_offset, gate_total, logical_tier,
-            "Motif-3 expert gate IQ2_XXS");
-    const char *up_w = gate_w ? cuda_resolve_weight_ptr(
-            model_map, up_offset, gate_total, logical_tier,
-            "Motif-3 expert up IQ2_XXS") : NULL;
-    const char *down_w = up_w ? cuda_resolve_weight_ptr(
-            model_map, down_offset, down_total, logical_tier,
-            "Motif-3 expert down Q2_K") : NULL;
-    const float *coeff = down_w ? (const float *)cuda_resolve_weight_ptr(
+    /* The weight-owner defaults replace the raw IQ2/Q2 expert tensors with
+     * byte-neutral aligned artifacts.  Motif has 384 routed experts, so its
+     * native PolyNorm path cannot fall through the DeepSeek 256-expert MoE
+     * wrapper.  Resolve and consume the same artifacts here with the runtime
+     * expert count; otherwise use the raw VMM ranges. */
+    const uint64_t gate_aligned_bytes = ds4_mmq_iq2_xxs_aligned_bytes(
+            (int)expert_mid_dim, (int)expert_in_dim,
+            (int)n_total_expert);
+    const uint64_t down_aligned_bytes = ds4_mmq_q2_k_aligned_bytes(
+            (int)out_dim, (int)expert_mid_dim,
+            (int)n_total_expert);
+    const char *gate_aligned = gate_aligned_bytes
+        ? cuda_derived_weight_ptr(
+              model_map, gate_offset, gate_total,
+              CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+              expert_in_dim, expert_mid_dim, n_total_expert,
+              gate_aligned_bytes, "Motif-3 expert gate IQ2 aligned")
+        : NULL;
+    const char *up_aligned = gate_aligned && gate_aligned_bytes
+        ? cuda_derived_weight_ptr(
+              model_map, up_offset, gate_total,
+              CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+              expert_in_dim, expert_mid_dim, n_total_expert,
+              gate_aligned_bytes, "Motif-3 expert up IQ2 aligned")
+        : NULL;
+    const char *down_aligned = down_aligned_bytes
+        ? cuda_derived_weight_ptr(
+              model_map, down_offset, down_total,
+              CUDA_DERIVED_Q2_K_ALIGNED_MOE,
+              expert_mid_dim, out_dim, n_total_expert,
+              down_aligned_bytes, "Motif-3 expert down Q2 aligned")
+        : NULL;
+    const bool gate_soa = gate_aligned && up_aligned &&
+                          cuda_moe_iq2_aligned_enabled() &&
+                          cuda_mmq_aligned_tiles_enabled();
+    const bool down_soa = down_aligned &&
+                          cuda_moe_q2k_aligned_enabled() &&
+                          cuda_mmq_aligned_tiles_enabled();
+    if (gate_soa || down_soa) {
+        static bool logged_aligned = false;
+        if (!logged_aligned) {
+            logged_aligned = true;
+            fprintf(stderr,
+                    "ds4: Motif-3 aligned expert MMQ active "
+                    "(IQ2=%d Q2K=%d experts=%u)\n",
+                    gate_soa ? 1 : 0, down_soa ? 1 : 0,
+                    n_total_expert);
+        }
+    }
+
+    const cudaStream_t stream = (cudaStream_t)0;
+    const char *gate_w = NULL;
+    const char *up_w = NULL;
+    if (!gate_soa && gate_aligned && up_aligned &&
+        cuda_moe_iq2_aligned_enabled()) {
+        gate_w = cuda_moe_iq2_derepack_scratch(
+                0, gate_aligned, gate_offset, gate_total,
+                expert_mid_dim, expert_in_dim, n_total_expert, stream);
+        up_w = gate_w ? cuda_moe_iq2_derepack_scratch(
+                1, up_aligned, up_offset, gate_total,
+                expert_mid_dim, expert_in_dim, n_total_expert, stream) : NULL;
+    }
+    if (!gate_soa && (!gate_w || !up_w)) {
+        gate_w = cuda_resolve_weight_ptr(
+                model_map, gate_offset, gate_total, logical_tier,
+                "Motif-3 expert gate IQ2_XXS");
+        up_w = gate_w ? cuda_resolve_weight_ptr(
+                model_map, up_offset, gate_total, logical_tier,
+                "Motif-3 expert up IQ2_XXS") : NULL;
+    }
+
+    const char *down_w = NULL;
+    if (!down_soa && down_aligned && cuda_moe_q2k_aligned_enabled()) {
+        down_w = cuda_moe_q2k_derepack_scratch(
+                down_aligned, down_offset, down_total,
+                out_dim, expert_mid_dim, n_total_expert, stream);
+    }
+    if (!down_soa && !down_w) {
+        down_w = cuda_resolve_weight_ptr(
+                model_map, down_offset, down_total, logical_tier,
+                "Motif-3 expert down Q2_K");
+    }
+
+    const float *coeff = (gate_soa || (gate_w && up_w)) &&
+                         (down_soa || down_w)
+        ? (const float *)cuda_resolve_weight_ptr(
             model_map, polynorm_weight_offset, coeff_bytes, logical_tier,
             "Motif-3 expert PolyNorm coefficients") : NULL;
     const float *bias = coeff ? (const float *)cuda_resolve_weight_ptr(
@@ -30700,13 +30776,21 @@ extern "C" int ds4_gpu_motif3_routed_moe_batch_tensor(
             "Motif-3 expert PolyNorm bias") : NULL;
     if (!bias) return 0;
 
-    const cudaStream_t stream = (cudaStream_t)0;
-    int rc = ds4_mmq_iq2_xxs_moe_pair(
+    int rc = gate_soa
+        ? ds4_mmq_iq2_xxs_moe_pair_soa(
+            gate_aligned, up_aligned, (const float *)x->ptr,
+            (const int32_t *)selected->ptr,
+            (float *)gate->ptr, (float *)up->ptr,
+            (int)expert_mid_dim, (int)expert_in_dim,
+            (int)n_tokens, (int)n_total_expert,
+            (int)n_expert_used, stream)
+        : ds4_mmq_iq2_xxs_moe_pair(
             gate_w, up_w, (const float *)x->ptr,
             (const int32_t *)selected->ptr,
             (float *)gate->ptr, (float *)up->ptr,
             (int)expert_mid_dim, (int)expert_in_dim,
-            (int)n_tokens, (int)n_total_expert, (int)n_expert_used, stream);
+            (int)n_tokens, (int)n_total_expert,
+            (int)n_expert_used, stream);
     if (rc != 0) {
         fprintf(stderr, "ds4: Motif-3 IQ2_XXS gate/up MMQ returned %d\n", rc);
         return 0;
@@ -30734,7 +30818,15 @@ extern "C" int ds4_gpu_motif3_routed_moe_batch_tensor(
         return 0;
     }
 
-    rc = ds4_mmq_q2_K_moe(
+    rc = down_soa
+        ? ds4_mmq_q2_K_moe_soa(
+            down_aligned, (const float *)mid->ptr,
+            (const int32_t *)selected->ptr,
+            (float *)down->ptr,
+            (int)out_dim, (int)expert_mid_dim,
+            (int)assignments, (int)n_total_expert,
+            /*n_expert_used=*/1, stream)
+        : ds4_mmq_q2_K_moe(
             down_w, (const float *)mid->ptr,
             (const int32_t *)selected->ptr,
             (float *)down->ptr,
