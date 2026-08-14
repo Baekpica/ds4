@@ -70,8 +70,8 @@ log "(t) torn-snapshot hunt: boot + ${WAVE}-wide admission wave under poll hamme
 boot_tree /tmp/d0bshadow_boot.log || die "boot failed"
 # memgov D2-1: the governance mode board rides every boot; a stock boot
 # shows the tree defaults (update this expectation WITH each ratchet
-# commit).  D2-2b ratcheted BOOT and BANK, D2-4 ratcheted SERIAL.
-R "grep -q 'memgov modes: boot=enforce prewarm=observe bank=enforce serial=enforce static=observe' /tmp/d0bshadow_boot.log" \
+# commit).  D2-5 completed the board: ALL FIVE FAMILIES ENFORCE.
+R "grep -q 'memgov modes: boot=enforce prewarm=enforce bank=enforce serial=enforce static=enforce' /tmp/d0bshadow_boot.log" \
     || die "memgov mode board missing or not at tree defaults"
 grep -q . /dev/null   # no-op keeps set -u happy on empty locals below
 # SNAP0: the boot-settle ledger, BEFORE any request (leg (r) asserts the
@@ -226,7 +226,7 @@ for i in $(seq 240); do
 done
 [ "$BOOTED" = "1" ] || { R "tail -5 /tmp/d0bfit_boot.log"; die "(e) refused boot did not reach listening"; }
 SPID=$(R "pgrep -x ds4-server | head -1")
-R "grep -q 'memgov modes: boot=enforce prewarm=observe bank=enforce serial=enforce static=observe' /tmp/d0bfit_boot.log" \
+R "grep -q 'memgov modes: boot=enforce prewarm=enforce bank=enforce serial=enforce static=enforce' /tmp/d0bfit_boot.log" \
     || die "(e) mode board not at enforce defaults"
 ENF=$(R "grep -c 'memgov ENFORCE refuse site=boot_bank_fit' /tmp/d0bfit_boot.log" || true)
 [ "${ENF:-0}" -ge 1 ] || die "(e) no boot_bank_fit ENFORCE refusal in log"
@@ -243,6 +243,57 @@ R "curl -s -m 300 -X POST localhost:$PORT/v1/messages -H 'content-type: applicat
     -d '{\"model\":\"ds4\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Say OK.\"}]}'" \
     | grep -q '\"type\":\"message\"' || die "(e) refused-shape boot does not serve"
 log "(e) PASS (enforce_refusals=$ENF, per-call fallback serves)"
+
+log "(f) D2-5 full-board composite: every family's enforce refusal in one boot"
+# Pinned fit headroom (budget 0 -> BANK refuses the batch ctx at every
+# halving) + pinned operator floor (PREWARM's quote refuses -> prewarm
+# skipped; STATIC's per-call quote refuses -> single-path fallback).
+# The SERIAL lane still SERVES through it all: its protected term is
+# the session MARGIN, not the floor (the D2-4 law made visible).  Two
+# concurrent batchable requests coalesce, hit the per-call refusal,
+# and both still complete via the fallback.  This log
+# (/tmp/d0bboard_boot.log) carries INTENTIONAL refusal disclosures --
+# EXCLUDED from zero-DISAGREE audits BY PATH.
+[ -n "$SPID" ] && R "kill $SPID" 2>/dev/null; SPID=""
+R 'ps -eo pid,comm | awk '"'"'$2=="ds4-server"{print $1}'"'"' | xargs -r kill' 2>/dev/null
+sleep 10
+ssh -o ConnectTimeout=10 "$HOST" \
+    "cd $TEST_TREE && DS4_BATCH_FIT_HEADROOM_MB=1000000 DS4_MEM_FLOOR_GB=600 setsid nohup ./ds4-server -c $CTX > /tmp/d0bboard_boot.log 2>&1 < /dev/null & exit 0" &
+LP=$!; sleep 5; kill $LP 2>/dev/null || true
+BOOTED=0
+for i in $(seq 240); do
+    R "grep -q 'listening on http' /tmp/d0bboard_boot.log" && { BOOTED=1; break; }
+    R "ps -eo comm | grep -q '^ds4-server'" || break
+    sleep 2
+done
+[ "$BOOTED" = "1" ] || { R "tail -5 /tmp/d0bboard_boot.log"; die "(f) pinned-board boot did not reach listening"; }
+SPID=$(R "pgrep -x ds4-server | head -1")
+R "grep -q 'memgov ENFORCE refuse site=boot_bank_fit' /tmp/d0bboard_boot.log" \
+    || die "(f) no BANK fit refusal"
+R "grep -q 'memgov ENFORCE refuse site=boot_prewarm' /tmp/d0bboard_boot.log" \
+    || die "(f) no PREWARM refusal"
+R "grep -q 'skipping prewarm' /tmp/d0bboard_boot.log" \
+    || die "(f) prewarm not skipped on refusal"
+R "grep -q 'persistent batch ctx ready' /tmp/d0bboard_boot.log" \
+    && die "(f) a batch ctx was created despite the pinned headroom"
+# Two concurrent batchable requests -> coalesce -> per-call STATIC
+# refusal -> single-path fallback serves BOTH via the serial lane.
+FP=()
+for i in 1 2; do
+    R "curl -s -m 300 -X POST localhost:$PORT/v1/messages -H 'content-type: application/json' \
+        -d '{\"model\":\"ds4\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Board leg request $i: say OK.\"}]}' -o /tmp/d0bboard_r$i.json" &
+    FP+=($!)
+done
+for p in "${FP[@]}"; do wait "$p" 2>/dev/null || true; done
+OKS=$(R "grep -l '\"type\":\"message\"' /tmp/d0bboard_r*.json 2>/dev/null | wc -l")
+[ "$OKS" = "2" ] || { R "cat /tmp/d0bboard_r1.json /tmp/d0bboard_r2.json 2>/dev/null | head -4"; die "(f) fallback served $OKS/2"; }
+R "grep -q 'memgov ENFORCE refuse site=static_batch_percall' /tmp/d0bboard_boot.log" \
+    || die "(f) no STATIC per-call refusal (requests did not coalesce onto the per-call path?)"
+R "grep -q 'memgov refused the per-call graph' /tmp/d0bboard_boot.log" \
+    || die "(f) fallback reason line missing"
+STRAYF=$(R "grep 'memgov ENFORCE refuse' /tmp/d0bboard_boot.log | grep -vcE 'site=(boot_bank_fit|boot_prewarm|static_batch_percall)'" || true)
+[ "${STRAYF:-0}" = "0" ] || die "(f) unexpected enforce refusals beyond the pinned families ($STRAYF)"
+log "(f) PASS (BANK+PREWARM+STATIC refuse deterministically; serial fallback serves 2/2)"
 
 cleanup
 trap - EXIT

@@ -14136,24 +14136,51 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
             rc = ds4_engine_batched_generate_ctx(s->batch_ctx, prompts, n,
                                                  max_new, eos_ids, res, err, sizeof(err));
         } else {
-            /* memgov D0b-3 (S7): the per-call path creates a fresh
-             * right-sized graph behind gen_mu with NO fit quote -- the
-             * exact sec 6.1 gap D2 will close.  Shadow-quote it (live
-             * always proceeds: ADMIT), hold the debt as a transient
-             * lease across the call, release after (the path frees its
-             * graph internally). */
+            /* memgov D2-5 (S7): the per-call path creates a fresh graph
+             * behind gen_mu -- the sec 6.1 gap, now CLOSED: one governed
+             * quote BEFORE creation; a refusal never reaches the doomed
+             * alloc and degrades to the single path per job (whose own
+             * S6 governance then applies).  The claim estimates the
+             * BATCH's footprint (the _ex graph sizes its ring to the
+             * largest row, not to -c).  Protected term = the OPERATOR
+             * FLOOR, deliberately unlike the serial lane's margin: a
+             * serial refusal costs availability (503, against the
+             * reclaim charter), a per-call refusal costs only
+             * efficiency (the fallback serves every job) -- with an
+             * asymmetric cost the floor is the strictest honest brake.
+             * The transient lease (est->0) is mandatory around an
+             * admitted call. */
+            long fp_max = 0;
+            for (int i = 0; i < n; i++) {
+                const long fp = (long)prompts[i].len + (long)max_new[i];
+                if (fp > fp_max) fp_max = fp;
+            }
+            if (fp_max > ctx_size) fp_max = ctx_size;
             const uint64_t est =
-                ds4_engine_session_graph_bytes_estimate(s->engine, ctx_size);
+                ds4_engine_session_graph_bytes_estimate(s->engine, (int)fp_max);
             ds4_gov_claim scl = {0};
             scl.requester = DS4_GOVC_STATIC_BATCH;
             scl.memc = DS4_MEMC_SESSION_TENSORS;
             scl.domain = DS4_MEMD_UNIFIED_DEVICE;
             scl.proposed_outstanding = est;
-            ds4_gov_shadow_check("static_batch_percall", &scl, DS4_GOV_ADMIT);
-            ds4_gov_publish_use(DS4_GOVC_STATIC_BATCH, est, 0);
-            rc = ds4_engine_batched_generate_ex(s->engine, prompts, n, ctx_size,
-                                                max_new, eos_ids, res, err, sizeof(err));
-            ds4_gov_publish_use(DS4_GOVC_STATIC_BATCH, 0, 0);
+            const int sv = ds4_gov_governed_check("static_batch_percall",
+                                                  &scl, DS4_GOV_ADMIT);
+            if (sv != DS4_GOV_ADMIT) {
+                static int enf_disclosed = 0;
+                if (enf_disclosed < 16) {
+                    enf_disclosed++;
+                    fprintf(stderr,
+                            "ds4: memgov ENFORCE refuse site=static_batch_percall status=%d n=%d proposed=%llu\n",
+                            sv, n, (unsigned long long)est);
+                }
+                snprintf(err, sizeof(err), "memgov refused the per-call graph");
+                rc = 1;   /* the fallback below runs each job single */
+            } else {
+                ds4_gov_publish_use(DS4_GOVC_STATIC_BATCH, est, 0);
+                rc = ds4_engine_batched_generate_ex(s->engine, prompts, n, ctx_size,
+                                                    max_new, eos_ids, res, err, sizeof(err));
+                ds4_gov_publish_use(DS4_GOVC_STATIC_BATCH, 0, 0);
+            }
         }
         pthread_mutex_unlock(&s->gen_mu);
     }
@@ -26629,17 +26656,12 @@ static void test_mem_gov_modes(void) {
     ds4_gov_modes_init();
     for (int c = 0; c < DS4_GOVC__COUNT; c++)
         TEST_ASSERT(ds4_gov_mode(c) == DS4_GOV_MODE_OBSERVE);
-    /* Ship defaults (D2-2b + D2-4 ratchets): BOOT, BANK and SERIAL
-     * enforce, the unratcheted families observe.  This assertion IS the
-     * ratchet's unit-level record -- update it with each D2 default
-     * flip. */
+    /* Ship defaults (D2-2b/4/5 ratchets): THE FULL ENFORCE BOARD.
+     * This assertion IS the ratchet's unit-level record. */
     unsetenv("DS4_MEMGOV");
     ds4_gov_modes_init();
-    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_ENGINE_BOOT) == DS4_GOV_MODE_ENFORCE);
-    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_PREWARM) == DS4_GOV_MODE_OBSERVE);
-    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_BATCH_BANK_PLAN) == DS4_GOV_MODE_ENFORCE);
-    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_SERIAL_SESSION) == DS4_GOV_MODE_ENFORCE);
-    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_STATIC_BATCH) == DS4_GOV_MODE_OBSERVE);
+    for (int c = 0; c < DS4_GOVC__COUNT; c++)
+        TEST_ASSERT(ds4_gov_mode(c) == DS4_GOV_MODE_ENFORCE);
     /* The margin variant dispatches identically (same core, caller's
      * protected term): a class-refusing claim under enforce must refuse
      * through it exactly as the floored check would. */
@@ -26704,6 +26726,69 @@ static void test_mem_gov_governed_check(void) {
     TEST_ASSERT(ds4_metric_read(&ds4_metrics_get()->memgov_faults) == f0 + 1);
     unsetenv("DS4_MEMGOV_STATIC");
     ds4_gov_modes_init();
+}
+
+/* memgov D2-5 stage close: ORDER INDEPENDENCE.  Lease publications are
+ * absolute replacements (sec 6.2), so every permutation of the same
+ * final publications must yield an identical quote for a frozen claim
+ * -- the property that makes the seqlock's single-writer discipline
+ * sufficient (no ordering law needed beyond it).  Republication
+ * idempotence rides the same harness (replace, never accumulate). */
+static void test_mem_gov_order_independence(void) {
+    static const int cons[3] = { DS4_GOVC_ENGINE_BOOT,
+                                 DS4_GOVC_BATCH_BANK_PLAN,
+                                 DS4_GOVC_SERIAL_SESSION };
+    static const uint64_t vals[3][3] = {   /* intent, resident, reservation */
+        { 1000, 800, 0 }, { 500, 200, 0 }, { 300, 0, 128 },
+    };
+    static const int perms[6][3] = { {0,1,2},{0,2,1},{1,0,2},
+                                     {1,2,0},{2,0,1},{2,1,0} };
+    ds4_mem_observation obs;
+    memset(&obs, 0, sizeof(obs));
+    obs.status = DS4_MEMOBS_OK;
+    obs.source = DS4_MEMOBS_SRC_MEMINFO_AVAILABLE;
+    obs.free_bytes = 4096;
+    obs.total_bytes = 65536;
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_SERIAL_SESSION;
+    cl.memc = DS4_MEMC_SESSION_TENSORS;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 900;
+    cl.operation_transient = 64;
+    ds4_gov_quote q0;
+    memset(&q0, 0, sizeof(q0));
+    for (int p = 0; p < 7; p++) {           /* 6 permutations + republish */
+        ds4_gov_ledger lg;
+        memset(&lg, 0, sizeof(lg));
+        lg.floor_bytes = 512;
+        lg.substrate_outstanding = 32;
+        uint64_t faults = 0;
+        const int *ord = perms[p < 6 ? p : 0];
+        for (int i = 0; i < 3; i++) {
+            const int k = ord[i];
+            TEST_ASSERT(ds4_gov_lease_publish(&lg, cons[k], vals[k][0],
+                                              vals[k][1], vals[k][2],
+                                              &faults));
+        }
+        if (p == 6)   /* idempotence: republish one lease verbatim */
+            TEST_ASSERT(ds4_gov_lease_publish(&lg, cons[1], vals[1][0],
+                                              vals[1][1], vals[1][2],
+                                              &faults));
+        TEST_ASSERT(faults == 0);
+        const ds4_gov_quote q = ds4_gov_evaluate(&lg, &obs, &cl);
+        if (p == 0) {
+            q0 = q;
+            TEST_ASSERT(q.status == DS4_GOV_ADMIT);   /* sanity: fundable */
+        } else {
+            TEST_ASSERT(q.status == q0.status);
+            TEST_ASSERT(q.available == q0.available);
+            TEST_ASSERT(q.required == q0.required);
+            TEST_ASSERT(q.deficit == q0.deficit);
+            TEST_ASSERT(q.other_reservations == q0.other_reservations);
+            TEST_ASSERT(q.total_prospective_intent ==
+                        q0.total_prospective_intent);
+        }
+    }
 }
 
 /* memgov D1a-1: model-source table (pure logic from ds4_mem_census.h --
@@ -27197,6 +27282,7 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_gov_publication_shape();
     test_mem_gov_modes();
     test_mem_gov_governed_check();
+    test_mem_gov_order_independence();
     /* memgov D1a-1: model-source table resolution. */
     test_mem_src_table_bind_find();
     /* memgov D1a-2: semantic tensor classifier + tripwire relation. */

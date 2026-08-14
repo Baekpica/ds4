@@ -33516,16 +33516,19 @@ void ds4_gov_modes_init(void) {
      * enforce only inverts which side of that identical comparison
      * rules.  SERIAL ratcheted at D2-4 (its quote evaluates the
      * probe's own inequality -- margin, not floor -- so healthy legs
-     * agree; serial_reclaim_gate is the lane's oracle);
-     * PREWARM/STATIC ratchet at D2-5.
+     * agree; serial_reclaim_gate is the lane's oracle).  PREWARM and
+     * STATIC ratcheted at D2-5: THE FULL ENFORCE BOARD -- every
+     * family's quote rules its lane; refusals degrade to documented
+     * paths (no prewarm / single-path fallback), never new failure
+     * modes.
      * DS4_MEMGOV=observe is the one-word rollback to shadow-everywhere;
      * off stays the kill switch; per-family knobs win over both. */
     static const uint8_t defm[DS4_GOVC__COUNT] = {
         DS4_GOV_MODE_ENFORCE,   /* ENGINE_BOOT      (D2-2b) */
-        DS4_GOV_MODE_OBSERVE,   /* PREWARM          (D2-5)  */
+        DS4_GOV_MODE_ENFORCE,   /* PREWARM          (D2-5)  */
         DS4_GOV_MODE_ENFORCE,   /* BATCH_BANK_PLAN  (D2-2b) */
         DS4_GOV_MODE_ENFORCE,   /* SERIAL_SESSION   (D2-4)  */
-        DS4_GOV_MODE_OBSERVE,   /* STATIC_BATCH     (D2-5)  */
+        DS4_GOV_MODE_ENFORCE,   /* STATIC_BATCH     (D2-5)  */
     };
     int gdef = -1;
     const char *g = getenv("DS4_MEMGOV");
@@ -39146,6 +39149,34 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
                 warm_before += ds4_mem_cell_live(&cc);
         }
     }
+    /* memgov D2-5 (S8): the lease-before-run quote.  Prewarm grows by
+     * design; the DECLARED budget is 256 MiB -- the measured healthy
+     * delta is ~103 MiB against ~158 MiB of grown classes (the d0b (r)
+     * leg's census numbers), so 2x covers deep shapes with room.  The
+     * publication after the run stays the MEASURED delta (it replaces
+     * this declaration -- that replacement is the reconciliation the
+     * (r) leg asserts).  enforce: a refused quote skips the warm run
+     * and the first request pays the one-time driver costs -- the
+     * documented no-prewarm path, not a new failure mode. */
+    {
+        /* The PREWARM lease is DELTA-basis (the measured publication
+         * after the run is `grew`), so the declaration is the growth
+         * budget alone. */
+        ds4_gov_claim wcl = {0};
+        wcl.requester = DS4_GOVC_PREWARM;
+        wcl.memc = DS4_MEMC_SCRATCH_STICKY;
+        wcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        wcl.proposed_outstanding = 256ull << 20;
+        if (ds4_gov_governed_check("boot_prewarm", &wcl, DS4_GOV_ADMIT)
+                != DS4_GOV_ADMIT) {
+            fprintf(stderr, "ds4: memgov ENFORCE refuse site=boot_prewarm "
+                            "proposed=%llu; skipping prewarm -- first request "
+                            "pays the one-time driver costs\n",
+                    (unsigned long long)wcl.proposed_outstanding);
+            return;
+        }
+        ds4_gov_publish_use(DS4_GOVC_PREWARM, wcl.proposed_outstanding, 0);
+    }
     const int warm_len = 512;
     ds4_session *warm = NULL;
     if (ds4_session_create(&warm, e, warm_len + 16) == 0 && warm) {
@@ -39174,7 +39205,9 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
         /* Return device reserves the warm session no longer backs (unused
          * graph-pool slack); everything deliberately warmed stays resident. */
         ds4_gpu_boot_trim();
-        /* memgov D0b-3 (S8): what prewarm deliberately left resident. */
+        /* memgov D0b-3 (S8): what prewarm deliberately left resident --
+         * the MEASURED delta replaces the D2-5 declaration (that
+         * replacement IS the reconciliation the d0b (r) leg asserts). */
         if (warm_census) {
             ds4_mem_cell cc;
             uint64_t warm_after = 0;
@@ -39187,10 +39220,15 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
             const uint64_t grew = warm_after > warm_before
                                       ? warm_after - warm_before : 0;
             ds4_gov_publish_use(DS4_GOVC_PREWARM, grew, grew);
+        } else {
+            /* No census answer: the declaration cannot be reconciled --
+             * clear it rather than leave 256 MiB of phantom intent. */
+            ds4_gov_publish_use(DS4_GOVC_PREWARM, 0, 0);
         }
     } else {
         fprintf(stderr, "ds4: boot prewarm session unavailable; first "
                         "request pays the one-time driver costs\n");
+        ds4_gov_publish_use(DS4_GOVC_PREWARM, 0, 0);   /* clear the declaration */
     }
 #else
     (void)e;
