@@ -186,7 +186,7 @@ extract_decisions() { # $1 remote log  $2 local out
     R "grep -E 'batch fit|batch vmm|mem floor|boot ledger|refus|reject|no graph fits|admission|serial fit' $1" \
         | grep -v 'ds4: range plan ' \
         | grep -v 'batch fit: free=' \
-        | sed -E 's/^[0-9]{4} [0-9:]{8} //; s/free=[0-9.]+ GiB/free=# GiB/g; s/MemAvailable[= ][0-9.]+/MemAvailable=#/g; s/capacity [0-9.]+ GiB/capacity # GiB/g; s/max_seq [0-9]+/max_seq #/g; s/x [0-9]+ banks/x # banks/g; s/budget=[0-9.]+ GiB/budget=# GiB/g; s/\[plan [0-9.]+, capacity [0-9.]+\]/[plan #, capacity #]/g; s/only [0-9]+ MiB allocatable/only # MiB allocatable/g' \
+        | sed -E 's/^[0-9]{4} [0-9:]{8} //; s/free=[0-9.]+ GiB/free=# GiB/g; s/MemAvailable[= ][0-9.]+/MemAvailable=#/g; s/capacity [0-9.]+ GiB/capacity # GiB/g; s/max_seq [0-9]+/max_seq #/g; s/x [0-9]+ banks/x # banks/g; s/budget=[0-9.]+ GiB/budget=# GiB/g; s/\[plan [0-9.]+, capacity [0-9.]+\]/[plan #, capacity #]/g; s/only [0-9]+ MiB allocatable/only # MiB allocatable/g; s/ deficit=[0-9.]+ MiB avail=[0-9.]+ MiB//g' \
         > "$2"
 }
 # Fit-jitter adjudication for a free-derived integer decision: equal is

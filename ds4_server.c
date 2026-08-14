@@ -26274,7 +26274,133 @@ static void test_mem_census_trim_inject_driver(void) {
     TEST_ASSERT(ds4_gpu_trim_inject_fired() - fired0 == 2);
     TEST_ASSERT(ds4_gpu_mem_census_faults() == faults0);
 }
+
+/* memgov D4-2: ds4_gpu_tensor_trim_estimate is the exact trim preimage --
+ * interior-page arithmetic shared with trim, so a reclaim prepare's quote
+ * equals what commit's release can destroy, page for page, and edge pages
+ * are excluded on both sides (never quoted, never released). */
+static void test_reclaim_trim_estimate_preimage(void) {
+    ds4_gpu_tensor *warm = ds4_gpu_tensor_alloc(4096);
+    if (!warm) {
+        printf("    (trim-estimate test skipped: no GPU context)\n");
+        return;
+    }
+    ds4_gpu_tensor_free(warm);
+    const uint64_t page = ds4_gpu_vmm_demand_page();
+    if (page == 0) {
+        printf("    (trim-estimate test skipped: no VMM demand mapping)\n");
+        return;
+    }
+    ds4_gpu_tensor *t = ds4_gpu_tensor_reserve(4 * page);
+    TEST_ASSERT(t != NULL);
+    TEST_ASSERT(ds4_gpu_tensor_trim_estimate(t, 0, 4 * page) == 0);   /* unmapped */
+    TEST_ASSERT(ds4_gpu_tensor_ensure(t, 0, 4 * page) == 1);
+    /* Whole range: every page interior.  A sub-page span holds no whole
+     * page; a page-straddling span owns neither neighbor. */
+    TEST_ASSERT(ds4_gpu_tensor_trim_estimate(t, 0, 4 * page) == 4 * page);
+    TEST_ASSERT(ds4_gpu_tensor_trim_estimate(t, 0, page) == page);
+    TEST_ASSERT(ds4_gpu_tensor_trim_estimate(t, 0, page - 1) == 0);
+    TEST_ASSERT(ds4_gpu_tensor_trim_estimate(t, page / 2, page) == 0);
+    /* estimate == what trim releases, and the preimage empties exactly. */
+    const uint64_t est = ds4_gpu_tensor_trim_estimate(t, page, 3 * page);
+    TEST_ASSERT(est == 3 * page);
+    TEST_ASSERT(ds4_gpu_tensor_trim(t, page, 3 * page) == est);
+    TEST_ASSERT(ds4_gpu_tensor_trim_estimate(t, page, 3 * page) == 0);
+    TEST_ASSERT(ds4_gpu_tensor_trim_estimate(t, 0, 4 * page) == page);
+    /* An injected unmap failure keeps the failed page IN the preimage:
+     * the estimate tracks physical mapping, never intent. */
+    TEST_ASSERT(ds4_gpu_trim_inject_set(DS4_TRIM_INJECT_UNMAP, 1) == 1);
+    TEST_ASSERT(ds4_gpu_tensor_trim(t, 0, page) == 0);
+    TEST_ASSERT(ds4_gpu_tensor_trim_estimate(t, 0, page) == page);
+    TEST_ASSERT(ds4_gpu_trim_inject_set(DS4_TRIM_INJECT_OFF, 0) == 1);
+    TEST_ASSERT(ds4_gpu_tensor_trim(t, 0, page) == page);
+    TEST_ASSERT(ds4_gpu_tensor_trim_estimate(t, 0, 4 * page) == 0);
+    ds4_gpu_tensor_free(t);
+}
 #endif /* !DS4_NO_GPU */
+
+/* memgov D4-3: the reclaim status vocabulary is CLOSED -- counters and
+ * /metrics render every label by enum walk, so a new status must extend
+ * the enum, the string table, and this test together.  Also pins the
+ * typed UNSUPPORTED refusal on a contextless call (the no-backend stub
+ * and the NULL-argument path share it). */
+static void test_reclaim_status_vocabulary(void) {
+    TEST_ASSERT(DS4_RECLAIM_STATUS__COUNT == 6);
+    const char *want[] = {"ok", "partial", "stale_plan", "busy",
+                          "unsupported", "device_error"};
+    for (int rs = 0; rs < DS4_RECLAIM_STATUS__COUNT; rs++)
+        TEST_ASSERT(strcmp(ds4_reclaim_status_str(rs), want[rs]) == 0);
+    TEST_ASSERT(strcmp(ds4_reclaim_status_str(-1), "unknown") == 0);
+    TEST_ASSERT(strcmp(ds4_reclaim_status_str(DS4_RECLAIM_STATUS__COUNT),
+                       "unknown") == 0);
+    ds4_reclaim_plan p;
+    TEST_ASSERT(ds4_batch_ctx_reclaim_prepare(NULL, NULL, 0, 1, &p) ==
+                DS4_RECLAIM_UNSUPPORTED);
+    TEST_ASSERT(p.n == 0 && p.est_bytes == 0);
+    ds4_reclaim_result r;
+    TEST_ASSERT(ds4_batch_ctx_reclaim_commit(NULL, &p, &r) ==
+                DS4_RECLAIM_UNSUPPORTED);
+    TEST_ASSERT(r.status == DS4_RECLAIM_UNSUPPORTED && r.bytes_released == 0);
+    TEST_ASSERT(ds4_batch_ctx_reclaim_prepare(NULL, NULL, 0, 1, NULL) ==
+                DS4_RECLAIM_UNSUPPORTED);
+}
+
+/* memgov D4-2: the serial reclaim ranking -- cheapest warm value first
+ * (no-value banks by index, superseded records by LRU, shallow records by
+ * LRU) with retention protection as a HARD exclusion at every tier.  The
+ * depth tier (warm_pin_min) needs a live batch ctx for committed lengths
+ * and is exercised by the serial_reclaim gate instead; pin 0 keeps it out
+ * here. */
+static void test_serial_reclaim_rank_order(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.batch_ctx_max_seq = 6;
+    s.warm_pin_min = 0;
+    s.creg.grace_s = 60;   /* publish => in-grace => protected */
+    s.warm = calloc(6, sizeof(*s.warm));   /* plain calloc: the test link has no xcalloc */
+    TEST_ASSERT(s.warm != NULL);
+    struct { int b; const char *txt; uint64_t use; } recs[] = {
+        {0, "AAAA", 10},      /* superseded by bank 1's longer record */
+        {1, "AAAABBB", 20},   /* superseder: plain shallow */
+        {3, "CCCC", 5},       /* plain shallow, LRU-oldest */
+        {4, "DDDD", 30},      /* valid but protected: excluded */
+    };
+    for (size_t i = 0; i < sizeof(recs) / sizeof(recs[0]); i++) {
+        s.warm[recs[i].b].text = xstrdup(recs[i].txt);
+        s.warm[recs[i].b].len = strlen(recs[i].txt);
+        s.warm[recs[i].b].last_use = recs[i].use;
+        s.warm[recs[i].b].valid = true;
+    }
+    /* banks 2 and 5 hold no record; 4 and 5 carry a live in-grace tool
+     * continuation (the Inc 6c protection the ranking must honor). */
+    for (int b = 4; b <= 5; b++) {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        char id[32];
+        snprintf(id, sizeof(id), "toolu_rk%d", b);
+        tc.id = xstrdup(id);
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, b, 3, 50);
+        tool_calls_free(&calls);
+    }
+    uint32_t out[DS4_COALESCE_HARD_MAX];
+    const uint32_t n = serial_reclaim_rank(&s, out);
+    TEST_ASSERT(n == 4);
+    TEST_ASSERT(out[0] == 2);   /* tier 0: no retained value */
+    TEST_ASSERT(out[1] == 0);   /* tier 1: superseded */
+    TEST_ASSERT(out[2] == 3);   /* tier 2: shallow LRU-oldest first */
+    TEST_ASSERT(out[3] == 1);
+    /* Warm records off: every unprotected bank ranks no-value by index. */
+    void *wsave = s.warm;
+    s.warm = NULL;
+    const uint32_t n2 = serial_reclaim_rank(&s, out);
+    TEST_ASSERT(n2 == 4);
+    TEST_ASSERT(out[0] == 0 && out[1] == 1 && out[2] == 2 && out[3] == 3);
+    s.warm = wsave;
+    cont_registry_free(&s);
+    for (int b = 0; b < 6; b++) free(s.warm[b].text);
+    free(s.warm);
+}
 
 /* memgov D0a-3: publication preconditions on EVERY backend -- positional
  * name tables fully populated (a hole would misattribute a class in every
@@ -27449,7 +27575,12 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_census_trim_inject_parse();
 #ifndef DS4_NO_GPU
     test_mem_census_trim_inject_driver();
+    /* memgov D4-2: reclaim trim-preimage arithmetic. */
+    test_reclaim_trim_estimate_preimage();
 #endif
+    /* memgov D4-2/3: reclaim vocabulary + serial victim ranking. */
+    test_reclaim_status_vocabulary();
+    test_serial_reclaim_rank_order();
     test_mem_census_publication_shape();
     /* memgov D0a-2: typed observation legacy shim. */
     test_mem_obs_legacy_shim();

@@ -39,10 +39,15 @@
 # Legs:
 #   A (reclaim): Anthropic request under hog pressure SERVES (200) with
 #      engagement proven: +1 'prompt start' (lane), +1 'serial fit reclaim',
-#      >=1 trim line carrying 'for the serial lane (reclaim)'.
+#      >=1 line carrying 'for the serial lane (reclaim)'.
 #   C (recovery): a cont chat request then admits clean on trimmed banks.
 #   B (control): DS4_BATCH_VMM_TRIM=0, same shape -> the old 503 +
 #      'no graph fits', ZERO reclaim lines.  Causality.
+#   D (deep-pin, memgov D4-2): DS4_SERVER_PIN_MIN_TOKENS=25000 makes every
+#      tenant DEEP -- the server ranking hard-excludes all of them, the
+#      request refuses 503 with ZERO reclaim lines, and a post-hog replay
+#      of tenant 1 still WARM-HITS (ds4_admits_total{kind="warm"} moves):
+#      the D4 gate's "deep-pinned rows remain intact", proven by serving.
 #
 # memgov D0a-4 injection mode: INJECT=unmap:N (or release:N) arms
 # DS4_CUDA_TRIM_INJECT on leg A's boot only.  Leg A then ADDITIONALLY
@@ -360,5 +365,34 @@ INJ_B=$(count "trim inject" /tmp/reclaim_B.log)
 [ "$INJ_B" = "0" ] || die "leg B control: inject lines leaked into an injection-free boot ($INJ_B)"
 log "B PASS (control reproduces the old 503, zero reclaim lines)"
 stop_hog
+kill_server
+
+# ---- LEG D (deep-pin protection; memgov D4-2) ----
+settle_wait
+log "boot D (DS4_SERVER_PIN_MIN_TOKENS=25000: every ${TENANT_TOKENS}-token tenant is DEEP)"
+boot "DS4_SERVER_PIN_MIN_TOKENS=25000" /tmp/reclaim_D.log
+saturate /tmp/reclaim_td
+start_hog D
+CODE=$(anthropic_deep /tmp/reclaim_ddeep.out)
+RECL=$(count "serial fit reclaim" /tmp/reclaim_D.log)
+NOFIT=$(count "no graph fits" /tmp/reclaim_D.log)
+log "leg D: http=$CODE nofit=$NOFIT reclaim_lines=$RECL"
+[ "$CODE" = "503" ] || die "leg D: expected 503 (deep-pinned commons must not be spent), got $CODE"
+[ "$NOFIT" -ge 1 ] || die "leg D: refused without the 'no graph fits' line"
+[ "$RECL" = "0" ] || die "leg D: reclaim fired against deep-pinned banks ($RECL lines)"
+stop_hog
+# The promise is INTACT, proven by serving: a replay of tenant 1 must
+# reuse its untouched deep record's cached prefix (metrics, not log grep
+# -- cached prefill tokens are the admission path's own truth, and they
+# tick on the warm, fork, and partial-fork serve shapes alike; a trimmed
+# bank would cold-prefill and leave the counter flat).
+W0=$(remote "curl -s -m 20 localhost:$PORT/metrics | grep 'prefilled_total{kind=\"cached\"}' | awk '{print \$2}'")
+CODE=$(remote "curl -s -m 300 -o /tmp/reclaim_dreplay.out -w '%{http_code}' localhost:$PORT/v1/chat/completions \
+  -H 'Content-Type: application/json' --data-binary @/tmp/reclaim_t1.json")
+[ "$CODE" = "200" ] || die "leg D: post-hog replay failed (http $CODE)"
+remote "grep -q finish_reason /tmp/reclaim_dreplay.out" || die "leg D: replay has no finish_reason"
+W1=$(remote "curl -s -m 20 localhost:$PORT/metrics | grep 'prefilled_total{kind=\"cached\"}' | awk '{print \$2}'")
+[ "${W1:-0}" -gt "${W0:-0}" ] || die "leg D: replay cold-prefilled (cached $W0 -> $W1; deep record lost)"
+log "D PASS (deep-pinned commons intact: refused without spending, replay reused $((W1 - W0)) cached tokens)"
 
 log "SERIAL-RECLAIM GATE: ALL LEGS PASS"
