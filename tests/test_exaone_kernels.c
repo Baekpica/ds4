@@ -41,6 +41,35 @@ static void diff_f32(const char *what, const float *a, const float *b, size_t n,
     report(what, max_abs, max_rel, tol_abs, tol_rel);
 }
 
+/* Vector-level agreement for a quantized-activation GEMM. Per-element
+ * max-relative error is dominated by outputs near zero and does not reliably
+ * distinguish quantization noise from a transposed or misindexed expert. */
+static void diff_quant_gemm(const char *what, const float *got, const float *ref,
+                            size_t n, double tol_rel_rms) {
+    double se = 0.0, sr = 0.0, sg = 0.0, dot = 0.0;
+    double max_abs = 0.0, max_ref = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        const double g = got[i], r = ref[i], d = g - r;
+        se += d * d;
+        sr += r * r;
+        sg += g * g;
+        dot += g * r;
+        if (fabs(d) > max_abs) max_abs = fabs(d);
+        if (fabs(r) > max_ref) max_ref = fabs(r);
+    }
+    const double rel_rms = sr > 0.0 ? sqrt(se / sr)
+                                    : (se > 0.0 ? INFINITY : 0.0);
+    const double cosine = (sg > 0.0 && sr > 0.0)
+        ? dot / sqrt(sg * sr) : 0.0;
+    const int ok = rel_rms <= tol_rel_rms &&
+                   (1.0 - cosine) <= tol_rel_rms;
+    if (!ok) g_fail++;
+    printf("%-38s rel_rms=%.3e 1-cos=%.3e max_abs=%.2e "
+           "(|ref|max=%.2e)  %s\n",
+           what, rel_rms, 1.0 - cosine, max_abs, max_ref,
+           ok ? "ok" : "FAIL");
+}
+
 static float frand(uint64_t *s) {
     *s = *s * 6364136223846793005ULL + 1442695040888963407ULL;
     return (float)((int32_t)(*s >> 33) % 20000 - 10000) / 10000.0f;
@@ -451,9 +480,10 @@ static void test_moe_matmul(const ds4_model *m, const ds4_weights *wts) {
                 char label[96];
                 snprintf(label, sizeof(label), "moe matmul %s [%u x %u] L%u",
                          tensor_type_name(ty), in_dim, out_dim, il);
-                /* mmq quantizes the activation to Q8_1; the CPU side keeps
-                 * f32. 2e-2 relative is that difference, not slack. */
-                diff_f32(label, got, want, out_dim, 5e-3, 2e-2);
+                /* MMQ quantizes the activation to Q8_1 while the CPU oracle
+                 * keeps f32. 2e-2 bounds that vector-level noise; a wrong
+                 * expert index or transposed layout lands near one. */
+                diff_quant_gemm(label, got, want, out_dim, 2e-2);
                 free(want); free(got);
             }
             ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(gid); ds4_gpu_tensor_free(gx);
