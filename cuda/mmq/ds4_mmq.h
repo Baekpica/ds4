@@ -60,6 +60,18 @@ int ds4_mmq_solar_prefill_attn_hmma(
         int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
         int kv_cap, int window, float scale, cudaStream_t stream);
 
+// Motif-3 full-layer prefill in the compute-friendly MLA form used by the
+// official vLLM port: expanded GQA Q/K (192) and V (128), while decode keeps
+// the latent 512+64 MQA path.  One call attends a query chunk to one contiguous
+// expanded KV range and optionally emits per-row/head log-sum-exp for merging
+// chunked context ranges without materializing a full expanded KV cache.
+int ds4_mmq_motif3_prefill_attn_hmma(
+        float *heads, float *lse, const float *q,
+        const float *k, const float *v,
+        int n_query, int query_pos0, int n_kv, int kv_pos0,
+        int n_head, int n_head_kv, int qk_dim, int v_dim,
+        float scale, int window, cudaStream_t stream);
+
 // Dense matmul entry points. Per-type wrappers that all share the same
 // underlying mul_mat_q template, parameterised by the weight quant type.
 //

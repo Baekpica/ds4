@@ -27014,6 +27014,7 @@ struct ds4_vocab {
     str_i32_table user_defined;
     uint32_t user_defined_max_len;
     bool user_defined_first[256];
+    bool motif3_added_first[256];
 };
 
 struct ds4_engine {
@@ -27227,33 +27228,38 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
     }
 
     for (;;) {
-        int best_i = -1;
         int best_rank = INT32_MAX;
 
         for (int i = 0; i + 1 < n_sym; i++) {
             int rank = bpe_rank(vocab, &sym[i], &sym[i + 1]);
             if (rank >= 0 && rank < best_rank) {
                 best_rank = rank;
-                best_i = i;
             }
         }
 
-        if (best_i < 0) break;
+        if (best_rank == INT32_MAX) break;
 
-        owned_str merged;
-        merged.len = sym[best_i].len + sym[best_i + 1].len;
-        merged.ptr = xmalloc((size_t)merged.len);
-        memcpy(merged.ptr, sym[best_i].ptr, (size_t)sym[best_i].len);
-        memcpy(merged.ptr + sym[best_i].len, sym[best_i + 1].ptr, (size_t)sym[best_i + 1].len);
-
-        free(sym[best_i].ptr);
-        free(sym[best_i + 1].ptr);
-        sym[best_i] = merged;
-
-        for (int j = best_i + 1; j + 1 < n_sym; j++) {
-            sym[j] = sym[j + 1];
+        int write = 0;
+        for (int read = 0; read < n_sym;) {
+            if (read + 1 < n_sym &&
+                bpe_rank(vocab, &sym[read], &sym[read + 1]) == best_rank) {
+                owned_str merged;
+                merged.len = sym[read].len + sym[read + 1].len;
+                merged.ptr = xmalloc((size_t)merged.len);
+                memcpy(merged.ptr, sym[read].ptr, (size_t)sym[read].len);
+                memcpy(merged.ptr + sym[read].len, sym[read + 1].ptr,
+                       (size_t)sym[read + 1].len);
+                free(sym[read].ptr);
+                free(sym[read + 1].ptr);
+                sym[write++] = merged;
+                read += 2;
+            } else {
+                if (write != read) sym[write] = sym[read];
+                write++;
+                read++;
+            }
         }
-        n_sym--;
+        n_sym = write;
     }
 
     for (int i = 0; i < n_sym; i++) {
@@ -27687,6 +27693,7 @@ static bool motif3_added_token_lstrip(int token_id) {
 static bool motif3_added_token_at(const ds4_vocab *vocab, const char *text,
                                   uint64_t len, uint64_t pos,
                                   int *token_id, uint64_t *token_len) {
+    if (!vocab->motif3_added_first[(uint8_t)text[pos]]) return false;
     const int limit = vocab->n_vocab < 160 ? vocab->n_vocab : 160;
     int best_id = -1;
     uint64_t best_len = 0;
@@ -28389,6 +28396,10 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     for (int i = 0; i < vocab->n_vocab; i++) {
         if (!cursor_string(&c, &vocab->token[i])) ds4_die(c.error);
         table_put(&vocab->token_to_id, vocab->token[i], i);
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3 && i < 160 &&
+            vocab->token[i].len) {
+            vocab->motif3_added_first[(uint8_t)vocab->token[i].ptr[0]] = true;
+        }
     }
 
     /* Added USER_DEFINED tokens are partitioned before regex splitting by
@@ -34006,6 +34017,9 @@ typedef struct {
     ds4_gpu_tensor *value;
     ds4_gpu_tensor *lambda;
     ds4_gpu_tensor *attention;
+    ds4_gpu_tensor *attention_tmp;
+    ds4_gpu_tensor *attention_lse;
+    ds4_gpu_tensor *attention_tmp_lse;
     ds4_gpu_tensor *differential;
     ds4_gpu_tensor *block_out;
     ds4_gpu_tensor *dense_gate;
@@ -34967,7 +34981,9 @@ static void motif3_graph_free(ds4_motif3_gpu_graph *g) {
     M3_FREE(q_raw); M3_FREE(q_gate); M3_FREE(kv_raw); M3_FREE(kv_latent);
     M3_FREE(kv_norm); M3_FREE(kv_proj); M3_FREE(q_full);
     M3_FREE(q_absorbed); M3_FREE(latent_attention); M3_FREE(k_full);
-    M3_FREE(value); M3_FREE(lambda); M3_FREE(attention); M3_FREE(differential);
+    M3_FREE(value); M3_FREE(lambda); M3_FREE(attention);
+    M3_FREE(attention_tmp); M3_FREE(attention_lse);
+    M3_FREE(attention_tmp_lse); M3_FREE(differential);
     M3_FREE(block_out); M3_FREE(dense_gate); M3_FREE(dense_up); M3_FREE(dense_mid);
     M3_FREE(shared_gate); M3_FREE(shared_up); M3_FREE(shared_mid); M3_FREE(shared_out);
     M3_FREE(router_logits); M3_FREE(router_probs); M3_FREE(selected);
@@ -34986,7 +35002,7 @@ static void motif3_graph_free(ds4_motif3_gpu_graph *g) {
 }
 
 static bool motif3_graph_alloc(ds4_motif3_gpu_graph *g, uint32_t cap) {
-    if (!g || cap == 0 || cap > 256u) return false;
+    if (!g || cap == 0 || cap > 4096u) return false;
     memset(g, 0, sizeof(*g));
     g->cap = cap;
 #define M3_ALLOC(field, count, type) do {                                      \
@@ -35029,6 +35045,10 @@ static bool motif3_graph_alloc(ds4_motif3_gpu_graph *g, uint32_t cap) {
     M3_ALLOC(value, (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_VALUE_DIM, float);
     M3_ALLOC(lambda, (uint64_t)cap * (DS4_N_HEAD - DS4_N_NOISE_HEAD), float);
     M3_ALLOC(attention, (uint64_t)cap * DS4_N_HEAD * DS4_N_VALUE_DIM, float);
+    M3_ALLOC(attention_tmp,
+             (uint64_t)cap * DS4_N_HEAD * DS4_N_VALUE_DIM, float);
+    M3_ALLOC(attention_lse, (uint64_t)cap * DS4_N_HEAD, float);
+    M3_ALLOC(attention_tmp_lse, (uint64_t)cap * DS4_N_HEAD, float);
     M3_ALLOC(differential, (uint64_t)cap * (DS4_N_HEAD - DS4_N_NOISE_HEAD) * DS4_N_VALUE_DIM, float);
     M3_ALLOC(block_out, (uint64_t)cap * DS4_N_EMBD, float);
     M3_ALLOC(dense_gate, (uint64_t)cap * DS4_N_FF_DENSE, float);
@@ -35343,6 +35363,8 @@ static bool motif3_graph_attention_latent(
     const uint32_t signal_heads = DS4_N_HEAD - DS4_N_NOISE_HEAD;
     const uint32_t signal_dim = signal_heads * DS4_N_VALUE_DIM;
     const uint32_t kv_raw_dim = DS4_N_KV_LORA + DS4_N_ROT;
+    const uint32_t kv_proj_dim = DS4_N_HEAD_KV *
+        ((DS4_N_HEAD_DIM - DS4_N_ROT) + DS4_N_VALUE_DIM);
 #define M3_LATTN(expr, stage) do { if (!(expr)) {                             \
         fprintf(stderr, "ds4: Motif-3 layer %u latent attention failed at %s\n", \
                 il, stage); return false; } } while (0)
@@ -35419,31 +35441,113 @@ static bool motif3_graph_attention_latent(
             full ? g->inv_yarn : g->inv_swa,
             rows, cache_cap, kv_raw_dim, DS4_N_KV_LORA,
             DS4_N_ROT, !full), "cache latent/k_pe");
-    M3_LATTN(ds4_gpu_motif3_qk_absorb_q8_0_tensor(
-            g->q_absorbed, g->q_full, model->map, model->size,
-            l->attn_kv_b->abs_offset, rows,
-            DS4_N_HEAD, DS4_N_HEAD_KV,
-            DS4_N_HEAD / DS4_N_HEAD_KV,
-            DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
-            DS4_N_HEAD_DIM, DS4_N_VALUE_DIM), "absorb q/k");
     float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     if (full) {
         const float mscale = 0.1f * logf(DS4_ROPE_SCALE_FACTOR) + 1.0f;
         scale *= mscale * mscale;
     }
-    M3_LATTN(ds4_gpu_motif3_latent_attention_bf16_tensor(
-            g->latent_attention, g->q_full, g->q_absorbed,
-            g->layer_kv_latent[il], g->layer_k_pe[il],
-            rows, pos0, cache_cap, window, DS4_N_HEAD,
-            DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
-            DS4_N_ROT, scale), "latent attention");
-    M3_LATTN(ds4_gpu_motif3_value_project_q8_0_tensor(
-            g->attention, g->latent_attention,
-            model->map, model->size, l->attn_kv_b->abs_offset,
-            rows, DS4_N_HEAD, DS4_N_HEAD_KV,
-            DS4_N_HEAD / DS4_N_HEAD_KV,
-            DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
-            DS4_N_VALUE_DIM), "latent value projection");
+
+    /* Match the official split: full-layer prefill uses compute-friendly
+     * chunked MLA. SWA prefill and all decode retain the compact latent path. */
+    static int expanded_prefill = -1;
+    if (expanded_prefill < 0) {
+        const char *env = getenv("DS4_MOTIF3_PREFILL_EXPANDED");
+        expanded_prefill = (!env || strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    if (expanded_prefill && rows > 1u && full) {
+        M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
+                g->kv_proj, model->map, model->size,
+                l->attn_kv_b->abs_offset, DS4_N_KV_LORA,
+                kv_proj_dim, g->kv_norm, rows), "prefill current kv_b");
+        M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+                g->kv_proj, g->kv_proj,
+                (uint64_t)rows * kv_proj_dim),
+                "prefill current kv_b BF16");
+        M3_LATTN(ds4_gpu_motif3_prepare_qkv_tensor(
+                g->q_full, g->k_full, g->value,
+                g->q_raw, g->kv_raw, g->kv_proj,
+                g->positions, g->inv_yarn,
+                rows, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                DS4_N_ROT, DS4_N_VALUE_DIM, DS4_N_KV_LORA),
+                "prefill current qkv");
+        M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+                g->q_full, g->q_full, (uint64_t)rows * q_dim),
+                "prefill q BF16");
+        M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+                g->k_full, g->k_full,
+                (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM),
+                "prefill current k BF16");
+        M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+                g->value, g->value,
+                (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_VALUE_DIM),
+                "prefill current v BF16");
+        M3_LATTN(ds4_gpu_motif3_expanded_attention_range_tensor(
+                g->attention, g->attention_lse,
+                g->q_full, g->k_full, g->value,
+                rows, pos0, rows, pos0,
+                DS4_N_HEAD, DS4_N_HEAD_KV,
+                DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, scale),
+                "prefill current attention");
+
+        for (uint32_t cache_pos0 = 0; cache_pos0 < pos0;
+             cache_pos0 += g->cap) {
+            const uint32_t remaining = pos0 - cache_pos0;
+            const uint32_t cache_rows =
+                remaining < g->cap ? remaining : g->cap;
+            M3_LATTN(ds4_gpu_motif3_load_latent_kv_bf16_tensor(
+                    g->kv_norm, g->layer_kv_latent[il],
+                    cache_pos0, cache_rows, cache_cap, DS4_N_KV_LORA),
+                    "prefill prefix latent load");
+            M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
+                    g->kv_proj, model->map, model->size,
+                    l->attn_kv_b->abs_offset, DS4_N_KV_LORA,
+                    kv_proj_dim, g->kv_norm, cache_rows),
+                    "prefill prefix kv_b");
+            M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+                    g->kv_proj, g->kv_proj,
+                    (uint64_t)cache_rows * kv_proj_dim),
+                    "prefill prefix kv_b BF16");
+            M3_LATTN(ds4_gpu_motif3_prepare_cached_kv_tensor(
+                    g->k_full, g->value, g->kv_proj,
+                    g->layer_k_pe[il], cache_pos0, cache_rows, cache_cap,
+                    DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                    DS4_N_ROT, DS4_N_VALUE_DIM),
+                    "prefill prefix expanded kv");
+            M3_LATTN(ds4_gpu_motif3_expanded_attention_range_tensor(
+                    g->attention_tmp, g->attention_tmp_lse,
+                    g->q_full, g->k_full, g->value,
+                    rows, pos0, cache_rows, cache_pos0,
+                    DS4_N_HEAD, DS4_N_HEAD_KV,
+                    DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, scale),
+                    "prefill prefix attention");
+            M3_LATTN(ds4_gpu_motif3_merge_attention_states_tensor(
+                    g->attention, g->attention_lse,
+                    g->attention_tmp, g->attention_tmp_lse,
+                    rows, DS4_N_HEAD, DS4_N_VALUE_DIM),
+                    "prefill attention merge");
+        }
+    } else {
+        M3_LATTN(ds4_gpu_motif3_qk_absorb_q8_0_tensor(
+                g->q_absorbed, g->q_full, model->map, model->size,
+                l->attn_kv_b->abs_offset, rows,
+                DS4_N_HEAD, DS4_N_HEAD_KV,
+                DS4_N_HEAD / DS4_N_HEAD_KV,
+                DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
+                DS4_N_HEAD_DIM, DS4_N_VALUE_DIM), "absorb q/k");
+        M3_LATTN(ds4_gpu_motif3_latent_attention_bf16_tensor(
+                g->latent_attention, g->q_full, g->q_absorbed,
+                g->layer_kv_latent[il], g->layer_k_pe[il],
+                rows, pos0, cache_cap, window, DS4_N_HEAD,
+                DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
+                DS4_N_ROT, scale), "latent attention");
+        M3_LATTN(ds4_gpu_motif3_value_project_q8_0_tensor(
+                g->attention, g->latent_attention,
+                model->map, model->size, l->attn_kv_b->abs_offset,
+                rows, DS4_N_HEAD, DS4_N_HEAD_KV,
+                DS4_N_HEAD / DS4_N_HEAD_KV,
+                DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
+                DS4_N_VALUE_DIM), "latent value projection");
+    }
     M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
             g->attention, g->attention,
             (uint64_t)rows * DS4_N_HEAD * DS4_N_VALUE_DIM),
@@ -35611,7 +35715,7 @@ static bool motif3_graph_forward_impl(
             g->reduced, g->reduced, (uint64_t)rows * DS4_N_EMBD),
             "embedding BF16 boundary");
     M3_FORWARD(ds4_gpu_repeat_hc_rows_tensor(
-            g->hidden[0], g->reduced, rows, DS4_N_EMBD, DS4_N_HC),
+            g->hidden[0], g->reduced, DS4_N_EMBD, DS4_N_HC, rows),
             "mHC input expansion");
 
     uint32_t current = 0;
@@ -50146,7 +50250,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->engine = e;
         s->ctx_size = ctx_size;
         s->generation = 1u;
-        uint32_t motif_chunk = 256u;
+        uint32_t motif_chunk = 4096u;
         const char *chunk_env = getenv("DS4_MOTIF3_PREFILL_CHUNK");
         if (chunk_env && chunk_env[0]) {
             char *end = NULL;
@@ -50155,7 +50259,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 motif_chunk = (uint32_t)value;
         }
         if (motif_chunk == 0u) motif_chunk = 1u;
-        if (motif_chunk > 256u) motif_chunk = 256u;
+        if (motif_chunk > 4096u) motif_chunk = 4096u;
         if (motif_chunk > (uint32_t)ctx_size) motif_chunk = (uint32_t)ctx_size;
         s->prefill_cap = motif_chunk;
         if (!motif3_graph_alloc(&s->motif3_graph, s->prefill_cap) ||

@@ -66,6 +66,9 @@ enum derived_kind {
      * of its source tensor (~30 GiB would not fit twice), so it does not
      * count against --derive-budget-gb. */
     DERIVED_Q2_K_ALIGNED_MOE = 6,
+    /* Motif-3 MLA W_UV Q8_0 transposed across value rows.  ADDITIVE: raw
+     * kv_b remains served for the absorbed-key projection. */
+    DERIVED_MOTIF3_KV_B_VALUE_Q8_0 = 7,
 };
 
 enum weight_backend {
@@ -1202,6 +1205,8 @@ static bool ws_build_aligned_artifacts(uint32_t kind,
     std::vector<ds4_repack_artifact> arts;
     const bool ok = kind == DERIVED_Q8_0_ALIGNED_DENSE
         ? ds4_repack_build_q8_aligned(a, arts, repacked_bytes_out)
+        : kind == DERIVED_MOTIF3_KV_B_VALUE_Q8_0
+        ? ds4_repack_build_motif3_kv_b_value(a, arts, repacked_bytes_out)
         : kind == DERIVED_IQ2_XXS_ALIGNED_MOE
         ? ds4_repack_build_iq2_aligned(a, arts, repacked_bytes_out)
         : ds4_repack_build_q2k_aligned(a, arts, repacked_bytes_out);
@@ -1783,6 +1788,21 @@ int main(int argc, char **argv) {
                                         vmm_granularity,
                                         copy_chunk_bytes,
                                         &q8_repacked_bytes)) {
+            return 1;
+        }
+        uint64_t motif3_kv_b_value_bytes = 0;
+        if (!ws_build_aligned_artifacts(
+                DERIVED_MOTIF3_KV_B_VALUE_Q8_0,
+                "base",
+                base,
+                base_model_size,
+                base_records,
+                ranges,
+                backend,
+                device,
+                vmm_granularity,
+                copy_chunk_bytes,
+                &motif3_kv_b_value_bytes)) {
             return 1;
         }
     }

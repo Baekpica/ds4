@@ -10,6 +10,7 @@
 #include "mma.cuh"
 #include "ds4_mmq.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
@@ -317,6 +318,275 @@ __global__ void ds4_fattn_hmma_kernel(
     }
 }
 
+enum {
+    M3_FA_QK     = 192,
+    M3_FA_V      = 128,
+    M3_FA_WQ     = 16,
+    M3_FA_WARPS  = 4,
+    M3_FA_TQ     = M3_FA_WQ * M3_FA_WARPS,
+    M3_FA_TK     = 16,
+    M3_FA_PAD    = 8,
+    M3_FA_QK_ROW = M3_FA_QK + M3_FA_PAD,
+    M3_FA_V_ROW  = M3_FA_V + M3_FA_PAD,
+};
+
+typedef tile<16, 8, nv_bfloat162> motif_tile_a;
+typedef tile< 8, 8, nv_bfloat162> motif_tile_b;
+typedef tile<16, 8, float> motif_tile_c;
+
+/* Motif-3 full-attention prefill follows the compute-friendly MLA path from
+ * the official Motif vLLM port: W_UK/W_UV are materialized for one bounded KV
+ * chunk and attention runs at QK=192, V=128.  A caller can merge several KV
+ * chunks exactly from the returned log-sum-exp values, so no expanded 256K KV
+ * cache is required. */
+__global__ void motif3_fattn_hmma_kernel(
+        float * __restrict__ heads,
+        float * __restrict__ lse,
+        const float * __restrict__ q,
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const uint32_t n_query,
+        const uint32_t query_pos0,
+        const uint32_t n_kv,
+        const uint32_t kv_pos0,
+        const uint32_t n_head,
+        const uint32_t n_head_kv,
+        const float scale,
+        const uint32_t window) {
+    const uint32_t tq0 = blockIdx.x * M3_FA_TQ;
+    const uint32_t h = blockIdx.y;
+    if (tq0 >= n_query || h >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t kvh = h / group;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+
+    __shared__ __nv_bfloat16 s_q[M3_FA_TQ][M3_FA_QK_ROW];
+    __shared__ __nv_bfloat16 s_k[M3_FA_TK][M3_FA_QK_ROW];
+    __shared__ __nv_bfloat16 s_v[M3_FA_TK][M3_FA_V_ROW];
+
+    for (uint32_t idx = threadIdx.x; idx < M3_FA_TQ * M3_FA_QK;
+         idx += blockDim.x) {
+        const uint32_t r = idx / M3_FA_QK;
+        const uint32_t c = idx - r * M3_FA_QK;
+        const uint32_t t = tq0 + r < n_query ? tq0 + r : 0u;
+        s_q[r][c] = __float2bfloat16_rn(
+            q[((size_t)t * n_head + h) * M3_FA_QK + c]);
+    }
+    __syncthreads();
+
+    const uint32_t qrow[2] = {
+        warp * M3_FA_WQ + lane / 4,
+        warp * M3_FA_WQ + lane / 4 + 8u,
+    };
+    uint32_t qpos[2];
+    bool alive[2];
+    float row_m[2], row_l[2];
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        alive[r] = tq0 + qrow[r] < n_query;
+        qpos[r] = alive[r] ? query_pos0 + tq0 + qrow[r] : query_pos0;
+        row_m[r] = -INFINITY;
+        row_l[r] = 0.0f;
+    }
+
+    motif_tile_a qa[M3_FA_QK / 16];
+#pragma unroll
+    for (int kc = 0; kc < M3_FA_QK / 16; kc++) {
+#pragma unroll
+        for (int l = 0; l < motif_tile_a::ne; l++) {
+            const int i = (l % 2) * 8 + (int)(lane / 4);
+            const int j = (l / 2) * 4 + (int)(lane % 4);
+            qa[kc].x[l] = *(const nv_bfloat162 *)&s_q[
+                warp * M3_FA_WQ + i][kc * 16 + 2 * j];
+        }
+    }
+
+    motif_tile_c output[M3_FA_V / 8];
+    const uint32_t kv_last = kv_pos0 + n_kv - 1u;
+    uint32_t block_last = 0u;
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        if (alive[r]) block_last = max(block_last, min(qpos[r], kv_last));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        block_last = max(
+            block_last,
+            __shfl_xor_sync(0xffffffffu, block_last, offset));
+    __shared__ uint32_t shared_last;
+    if (threadIdx.x == 0u) shared_last = 0u;
+    __syncthreads();
+    if (lane == 0u) atomicMax(&shared_last, block_last);
+    __syncthreads();
+    block_last = shared_last;
+
+    uint32_t block_first = kv_pos0;
+    if (window > 0u) {
+        const uint32_t first_qpos = query_pos0 + tq0;
+        const uint32_t history = window - 1u;
+        if (first_qpos > history)
+            block_first = max(block_first, first_qpos - history);
+    }
+    if (block_last >= block_first) {
+        for (uint32_t kt0 = block_first; kt0 <= block_last; kt0 += M3_FA_TK) {
+            const uint32_t remaining = block_last - kt0 + 1u;
+            const uint32_t tile_len = remaining < (uint32_t)M3_FA_TK
+                ? remaining : (uint32_t)M3_FA_TK;
+            for (uint32_t idx = threadIdx.x * 4u;
+                 idx < M3_FA_TK * M3_FA_QK; idx += blockDim.x * 4u) {
+                const uint32_t r = idx / M3_FA_QK;
+                const uint32_t c = idx - r * M3_FA_QK;
+                const uint32_t src = r < tile_len ? kt0 + r : kt0;
+                const uint32_t local = src - kv_pos0;
+                const float4 x = *reinterpret_cast<const float4 *>(
+                    k + ((size_t)local * n_head_kv + kvh) * M3_FA_QK + c);
+                *reinterpret_cast<nv_bfloat162 *>(&s_k[r][c]) =
+                    __floats2bfloat162_rn(x.x, x.y);
+                *reinterpret_cast<nv_bfloat162 *>(&s_k[r][c + 2]) =
+                    __floats2bfloat162_rn(x.z, x.w);
+            }
+            for (uint32_t idx = threadIdx.x * 4u;
+                 idx < M3_FA_TK * M3_FA_V; idx += blockDim.x * 4u) {
+                const uint32_t r = idx / M3_FA_V;
+                const uint32_t c = idx - r * M3_FA_V;
+                const uint32_t src = r < tile_len ? kt0 + r : kt0;
+                const uint32_t local = src - kv_pos0;
+                const float4 x = *reinterpret_cast<const float4 *>(
+                    v + ((size_t)local * n_head_kv + kvh) * M3_FA_V + c);
+                *reinterpret_cast<nv_bfloat162 *>(&s_v[r][c]) =
+                    __floats2bfloat162_rn(x.x, x.y);
+                *reinterpret_cast<nv_bfloat162 *>(&s_v[r][c + 2]) =
+                    __floats2bfloat162_rn(x.z, x.w);
+            }
+            __syncthreads();
+
+            motif_tile_c scores[2];
+#pragma unroll
+            for (int nb = 0; nb < 2; nb++) {
+                motif_tile_c zero;
+                scores[nb] = zero;
+#pragma unroll
+                for (int kc = 0; kc < M3_FA_QK / 16; kc++) {
+                    motif_tile_b keys;
+#pragma unroll
+                    for (int l = 0; l < motif_tile_b::ne; l++) {
+                        const int i = (int)(lane / 4);
+                        const int j = l * 4 + (int)(lane % 4);
+                        keys.x[l] = *(const nv_bfloat162 *)&s_k[
+                            nb * 8 + i][kc * 16 + 2 * j];
+                    }
+                    mma(scores[nb], qa[kc], keys);
+                }
+            }
+
+            float tile_max[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+            for (int nb = 0; nb < 2; nb++) {
+#pragma unroll
+                for (int l = 0; l < motif_tile_c::ne; l++) {
+                    const int r = l / 2;
+                    const uint32_t p =
+                        kt0 + nb * 8u + (lane % 4u) * 2u + (l % 2u);
+                    float score = scores[nb].x[l] * scale;
+                    if (!alive[r] || p > qpos[r] ||
+                        (window > 0u && p + window <= qpos[r]) ||
+                        p >= kt0 + tile_len || p > kv_last) {
+                        score = -INFINITY;
+                    }
+                    scores[nb].x[l] = score;
+                    tile_max[r] = fmaxf(tile_max[r], score);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                tile_max[r] = fmaxf(
+                    tile_max[r],
+                    __shfl_xor_sync(0xffffffffu, tile_max[r], 1));
+                tile_max[r] = fmaxf(
+                    tile_max[r],
+                    __shfl_xor_sync(0xffffffffu, tile_max[r], 2));
+            }
+
+            float rescale[2];
+            float tile_sum[2] = {0.0f, 0.0f};
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                const float next_max = fmaxf(row_m[r], tile_max[r]);
+                rescale[r] = row_m[r] == -INFINITY
+                    ? 0.0f : __expf(row_m[r] - next_max);
+                row_m[r] = next_max;
+            }
+#pragma unroll
+            for (int nb = 0; nb < 2; nb++) {
+#pragma unroll
+                for (int l = 0; l < motif_tile_c::ne; l++) {
+                    const int r = l / 2;
+                    const float weight =
+                        scores[nb].x[l] == -INFINITY || row_m[r] == -INFINITY
+                            ? 0.0f : __expf(scores[nb].x[l] - row_m[r]);
+                    scores[nb].x[l] = weight;
+                    tile_sum[r] += weight;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 2; r++) {
+                tile_sum[r] +=
+                    __shfl_xor_sync(0xffffffffu, tile_sum[r], 1);
+                tile_sum[r] +=
+                    __shfl_xor_sync(0xffffffffu, tile_sum[r], 2);
+                row_l[r] = row_l[r] * rescale[r] + tile_sum[r];
+            }
+
+            motif_tile_a probabilities;
+#pragma unroll
+            for (int l = 0; l < motif_tile_a::ne; l++) {
+                probabilities.x[l] = __floats2bfloat162_rn(
+                    scores[l / 2].x[(l % 2) * 2],
+                    scores[l / 2].x[(l % 2) * 2 + 1]);
+            }
+#pragma unroll
+            for (int cb = 0; cb < M3_FA_V / 8; cb++) {
+#pragma unroll
+                for (int l = 0; l < motif_tile_c::ne; l++)
+                    output[cb].x[l] *= rescale[l / 2];
+                motif_tile_b values;
+#pragma unroll
+                for (int l = 0; l < motif_tile_b::ne; l++) {
+                    const int i = (int)(lane / 4);
+                    const int j = l * 4 + (int)(lane % 4);
+                    values.x[l] = __halves2bfloat162(
+                        s_v[2 * j][cb * 8 + i],
+                        s_v[2 * j + 1][cb * 8 + i]);
+                }
+                mma(output[cb], probabilities, values);
+            }
+            __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (int cb = 0; cb < M3_FA_V / 8; cb++) {
+#pragma unroll
+        for (int l = 0; l < motif_tile_c::ne; l++) {
+            const int r = l / 2;
+            if (!alive[r] || row_l[r] <= 0.0f) continue;
+            const uint32_t token = tq0 + qrow[r];
+            const int col = (int)(lane % 4) * 2 + (l % 2);
+            heads[((size_t)token * n_head + h) * M3_FA_V +
+                  cb * 8 + col] = output[cb].x[l] / row_l[r];
+        }
+    }
+    if (lse && (lane & 3u) == 0u) {
+#pragma unroll
+        for (int r = 0; r < 2; r++) {
+            if (!alive[r] || row_l[r] <= 0.0f) continue;
+            const uint32_t token = tq0 + qrow[r];
+            lse[(size_t)token * n_head + h] = row_m[r] + logf(row_l[r]);
+        }
+    }
+}
+
 }  // namespace
 
 extern "C" int ds4_mmq_exaone_prefill_attn_hmma(
@@ -373,5 +643,28 @@ extern "C" int ds4_mmq_solar_prefill_attn_hmma(
         return -1;
     }
 #undef DS4_SOLAR_FATTN_LAUNCH
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+extern "C" int ds4_mmq_motif3_prefill_attn_hmma(
+        float *heads, float *lse, const float *q,
+        const float *k, const float *v,
+        int n_query, int query_pos0, int n_kv, int kv_pos0,
+        int n_head, int n_head_kv, int qk_dim, int v_dim,
+        float scale, int window, cudaStream_t stream) {
+    if (!heads || !q || !k || !v || n_query <= 0 || query_pos0 < 0 ||
+        n_kv <= 0 || kv_pos0 < 0 || n_head <= 0 || n_head_kv <= 0 ||
+        n_head % n_head_kv != 0 || qk_dim != M3_FA_QK ||
+        v_dim != M3_FA_V || kv_pos0 > query_pos0 || window < 0) {
+        return -1;
+    }
+    const int device = ggml_cuda_get_device();
+    if (ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_AMPERE) return -1;
+    const dim3 grid((n_query + M3_FA_TQ - 1) / M3_FA_TQ, n_head, 1);
+    motif3_fattn_hmma_kernel<<<grid, M3_FA_WARPS * 32, 0, stream>>>(
+        heads, lse, q, k, v,
+        (uint32_t)n_query, (uint32_t)query_pos0,
+        (uint32_t)n_kv, (uint32_t)kv_pos0,
+        (uint32_t)n_head, (uint32_t)n_head_kv, scale, (uint32_t)window);
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }

@@ -766,6 +766,39 @@ __global__ static void repack_q8_0_aligned_kernel(
     memcpy(qs + blk * 32ull + p * 16ull, src + 2u + p * 16ull, 16u);
 }
 
+/* Motif-3 W_UV layout.  The raw kv_b tensor is [4096 rows, K=512] Q8_0,
+ * with 16 KV heads and [128 K rows, 128 V rows] per head.  A value-project
+ * warp owns consecutive V rows, so row-major raw codes make its lanes read
+ * 544 bytes apart.  Reorder only the V half as:
+ *   half scale[kv_head][k_block][value_dim]
+ *   int8 code[kv_head][k_block][k_in_block][value_dim]
+ * preserving every Q8 scale/code and the consumer's accumulation order. */
+__global__ static void repack_motif3_kv_b_value_q8_0_kernel(
+        __half *scale,
+        int8_t *code,
+        const unsigned char *raw) {
+    constexpr uint32_t kv_heads = 16u;
+    constexpr uint32_t qk_nope = 128u;
+    constexpr uint32_t value_dim = 128u;
+    constexpr uint32_t k_blocks = 16u;
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)kv_heads * k_blocks * value_dim;
+    if (gid >= n) return;
+    const uint32_t d = (uint32_t)(gid % value_dim);
+    const uint64_t hb = gid / value_dim;
+    const uint32_t b = (uint32_t)(hb % k_blocks);
+    const uint32_t kv_head = (uint32_t)(hb / k_blocks);
+    const uint32_t row = kv_head * (qk_nope + value_dim) + qk_nope + d;
+    const unsigned char *src = raw + ((uint64_t)row * k_blocks + b) * 34u;
+    uint16_t h;
+    memcpy(&h, src, sizeof(h));
+    scale[gid] = __ushort_as_half(h);
+    for (uint32_t k = 0; k < 32u; k++) {
+        code[(hb * 32u + k) * value_dim + d] =
+            (int8_t)src[2u + k];
+    }
+}
+
 /* One thread per dequantized element of the staged chunk.  Math is the
  * engine's lazy dequant_q8_0_to_f16_kernel (ds4_cuda.cu) verbatim -- the
  * first-touch cache and this prebuild must stay bit-identical.  The full
@@ -852,6 +885,19 @@ bool ds4_repack_q8_f16_candidate(const ds4_repack_tensor &t) {
     if (t.dims[0] % 32u != 0) return false;
     if (t.bytes == 0 || t.bytes % 34u != 0) return false;
     return t.name.find("attn_output_a.weight") != std::string::npos;
+}
+
+/* Motif-3 MLA W_UV candidates.  Keep this exact and model-local: the layout
+ * below depends on Motif-3's 16 KV heads, 512 latent columns and interleaved
+ * [128 absorbed-key rows, 128 value rows] per KV head. */
+bool ds4_repack_motif3_kv_b_value_candidate(const ds4_repack_tensor &t) {
+    if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
+    if (t.dims[0] != 512u || t.dims[1] != 4096u) return false;
+    if (t.bytes != (512ull / 32ull) * 4096ull * 34ull) return false;
+    static const char sfx[] = ".attn_kv_b.weight";
+    const size_t n = t.name.size();
+    const size_t sl = sizeof(sfx) - 1u;
+    return n > sl && t.name.compare(n - sl, sl, sfx) == 0;
 }
 
 /* ---- S5 parallel repack driver -------------------------------------------
@@ -1129,6 +1175,111 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
             count,
             (double)total_bytes / 1073741824.0,
             repack_now_sec() - t0,
+            nthreads);
+    if (repacked_bytes_out) *repacked_bytes_out = total_bytes;
+    return true;
+}
+
+/* Motif-3 MLA value projection artifact.  This is intentionally separate
+ * from the generic Q8 aligned tier: that row-major SoA still makes adjacent
+ * output lanes fetch blocks 512 columns apart.  Here adjacent lanes read
+ * adjacent scales/codes, matching the production W_UV warp traversal. */
+bool ds4_repack_build_motif3_kv_b_value(
+        const ds4_repack_build_args &a,
+        std::vector<ds4_repack_artifact> &out,
+        uint64_t *repacked_bytes_out) {
+    constexpr uint64_t kv_heads = 16u;
+    constexpr uint64_t k_blocks = 16u;
+    constexpr uint64_t value_dim = 128u;
+    constexpr uint64_t scale_bytes = kv_heads * k_blocks * value_dim * 2u;
+    constexpr uint64_t code_bytes =
+        kv_heads * k_blocks * 32u * value_dim;
+    constexpr uint64_t art_bytes = scale_bytes + code_bytes;
+
+    if (repacked_bytes_out) *repacked_bytes_out = 0;
+    ds4_repack_file m;
+    if (!repack_open_source(a, m)) return false;
+
+    const double t0 = repack_now_sec();
+    std::vector<repack_job> jobs;
+    bool ok = true;
+    for (const ds4_repack_tensor &t : *a.records) {
+        if (!ds4_repack_motif3_kv_b_value_candidate(t)) continue;
+        if (t.off > m.size || t.bytes > m.size - t.off) {
+            fprintf(stderr,
+                    "%s: Motif-3 kv_b value repack skipped %s: source range mismatch\n",
+                    a.log_prefix, t.name.c_str());
+            ok = false;
+            break;
+        }
+        repack_job j;
+        j.chunk = t.bytes;
+        j.art.t = &t;
+        j.art.kind = DS4_REPACK_MOTIF3_KV_B_VALUE_Q8_0;
+        j.art.bytes = art_bytes;
+        j.art.in_dim = t.dims[0];
+        j.art.out_dim = t.dims[1];
+        j.art.group_count = 1u;
+        if (!repack_alloc_artifact(a, "Motif-3 kv_b value", &j.art)) {
+            ok = false;
+            break;
+        }
+        jobs.push_back(j);
+    }
+
+    const int nthreads = repack_thread_count(jobs.size());
+    if (ok)
+        ok = run_repack_jobs(
+            a.log_prefix, "Motif-3 kv_b value", m, a.device, jobs,
+            [&m, &a](const repack_job &j, cudaStream_t stream,
+                     unsigned char *stage, uint64_t stage_bytes,
+                     unsigned char *scratch) -> bool {
+        const ds4_repack_tensor &t = *j.art.t;
+        if (!repack_read_upload(a.log_prefix, m, "Motif-3 kv_b value", t,
+                                stage, stage_bytes, scratch, 0u, t.bytes,
+                                stream)) {
+            return false;
+        }
+        __half *scale = (__half *)j.art.dev;
+        int8_t *code = (int8_t *)((char *)j.art.dev + scale_bytes);
+        constexpr uint64_t n = kv_heads * k_blocks * value_dim;
+        repack_motif3_kv_b_value_q8_0_kernel
+            <<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(
+                scale, code, scratch);
+        cudaError_t err = cudaGetLastError();
+        if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "%s: Motif-3 kv_b value repack kernel failed for %s: %s\n",
+                    a.log_prefix, t.name.c_str(), cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    });
+
+    if (!ok) {
+        for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
+        repack_close_source(a, m);
+        return false;
+    }
+
+    uint64_t total_bytes = 0;
+    uint32_t count = 0;
+    for (repack_job &j : jobs) {
+        out.push_back(j.art);
+        total_bytes += j.art.bytes;
+        count++;
+    }
+    repack_close_source(a, m);
+    if (count == 0) {
+        fprintf(stderr,
+                "%s: Motif-3 kv_b value repack found no candidate tensors in %s\n",
+                a.log_prefix, a.model_id);
+    }
+    fprintf(stderr,
+            "%s: Motif-3 kv_b value repack %s: %u tensors %.2f MiB in %.1fs (threads=%d)\n",
+            a.log_prefix, a.model_id, count,
+            (double)total_bytes / 1048576.0, repack_now_sec() - t0,
             nthreads);
     if (repacked_bytes_out) *repacked_bytes_out = total_bytes;
     return true;

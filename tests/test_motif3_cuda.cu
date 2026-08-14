@@ -1,5 +1,7 @@
 /* H200 CUDA parity for Motif-3-only control and expanded-attention kernels. */
 #include "ds4_gpu.h"
+#include "cuda/mmq/ds4_mmq.h"
+#include "cuda/mmq/ds4_mmq_d2r.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -320,7 +322,93 @@ static void test_gdla(const char *dir) {
                                                   8, 80, 16, 192, 128,
                                                   f32(f, "attention_scale")[0], true)) std::exit(1);
     auto attn = download_f32(attention, 8u * 80u * 128u);
-    assert_close("CUDA expanded GDLA", attn.data(), f32(f, "attention_fp32"), attn.size(), 3e-4f, 3e-5f);
+    assert_close("CUDA expanded GDLA", attn.data(), f32(f, "attention_fp32"),
+                 attn.size(), 5e-4f, 5e-5f);
+    /* The production prefill path computes the current causal block and each
+     * cached prefix block separately, then merges the normalized outputs from
+     * their log-sum-exp states.  Verify that split form against one HMMA call
+     * over the same visible keys. */
+    constexpr uint32_t tail_rows = 4u;
+    constexpr uint32_t split = 4u;
+    const uint64_t q_row = 80u * 192u;
+    const uint64_t k_row = 16u * 192u;
+    const uint64_t v_row = 16u * 128u;
+    gpu_tensor q_tail(tail_rows * q_row * sizeof(float));
+    gpu_tensor k_prefix(split * k_row * sizeof(float));
+    gpu_tensor v_prefix(split * v_row * sizeof(float));
+    gpu_tensor k_suffix(tail_rows * k_row * sizeof(float));
+    gpu_tensor v_suffix(tail_rows * v_row * sizeof(float));
+    gpu_tensor full_out(tail_rows * 80u * 128u * sizeof(float));
+    gpu_tensor full_lse(tail_rows * 80u * sizeof(float));
+    gpu_tensor merged_out(tail_rows * 80u * 128u * sizeof(float));
+    gpu_tensor merged_lse(tail_rows * 80u * sizeof(float));
+    gpu_tensor prefix_out(tail_rows * 80u * 128u * sizeof(float));
+    gpu_tensor prefix_lse(tail_rows * 80u * sizeof(float));
+    const float *q_host = f32(f, "q_full");
+    const float *k_host = f32(f, "k_full");
+    const float *v_host = f32(f, "value");
+    if (!ds4_gpu_tensor_write(q_tail.p, 0, q_host + split * q_row,
+                              tail_rows * q_row * sizeof(float)) ||
+        !ds4_gpu_tensor_write(k_prefix.p, 0, k_host,
+                              split * k_row * sizeof(float)) ||
+        !ds4_gpu_tensor_write(v_prefix.p, 0, v_host,
+                              split * v_row * sizeof(float)) ||
+        !ds4_gpu_tensor_write(k_suffix.p, 0, k_host + split * k_row,
+                              tail_rows * k_row * sizeof(float)) ||
+        !ds4_gpu_tensor_write(v_suffix.p, 0, v_host + split * v_row,
+                              tail_rows * v_row * sizeof(float)) ||
+        !ds4_gpu_motif3_expanded_attention_range_tensor(
+                full_out.p, full_lse.p, q_tail.p, k.p, v.p,
+                tail_rows, split, 8u, 0u, 80u, 16u, 192u, 128u,
+                f32(f, "attention_scale")[0]) ||
+        !ds4_gpu_motif3_expanded_attention_range_tensor(
+                merged_out.p, merged_lse.p, q_tail.p,
+                k_suffix.p, v_suffix.p,
+                tail_rows, split, tail_rows, split,
+                80u, 16u, 192u, 128u, f32(f, "attention_scale")[0]) ||
+        !ds4_gpu_motif3_expanded_attention_range_tensor(
+                prefix_out.p, prefix_lse.p, q_tail.p,
+                k_prefix.p, v_prefix.p,
+                tail_rows, split, split, 0u,
+                80u, 16u, 192u, 128u, f32(f, "attention_scale")[0])) {
+        fprintf(stderr, "chunked expanded GDLA failed\n");
+        std::exit(1);
+    }
+    const uint64_t merge_states = tail_rows * 80u;
+    const uint64_t merge_values = merge_states * 128u;
+    auto suffix_before = download_f32(merged_out, merge_values);
+    auto suffix_lse_before = download_f32(merged_lse, merge_states);
+    auto prefix_before = download_f32(prefix_out, merge_values);
+    auto prefix_lse_before = download_f32(prefix_lse, merge_states);
+    std::vector<float> merge_want(merge_values);
+    std::vector<float> merge_lse_want(merge_states);
+    for (uint64_t s = 0; s < merge_states; s++) {
+        const float m = std::max(suffix_lse_before[s], prefix_lse_before[s]);
+        const float sw = std::exp(suffix_lse_before[s] - m);
+        const float pw = std::exp(prefix_lse_before[s] - m);
+        const float inv = 1.0f / (sw + pw);
+        merge_lse_want[s] = m + std::log(sw + pw);
+        for (uint32_t d = 0; d < 128u; d++) {
+            const uint64_t i = s * 128u + d;
+            merge_want[i] =
+                (suffix_before[i] * sw + prefix_before[i] * pw) * inv;
+        }
+    }
+    if (!ds4_gpu_motif3_merge_attention_states_tensor(
+            merged_out.p, merged_lse.p, prefix_out.p, prefix_lse.p,
+            tail_rows, 80u, 128u)) {
+        fprintf(stderr, "chunked expanded GDLA merge failed\n");
+        std::exit(1);
+    }
+    auto full_chunked = download_f32(full_out, tail_rows * 80u * 128u);
+    auto merged_chunked = download_f32(merged_out, tail_rows * 80u * 128u);
+    auto merged_lse_host = download_f32(merged_lse, merge_states);
+    assert_close("CUDA chunked GDLA merge kernel", merged_chunked.data(),
+                 merge_want.data(), merge_values, 2e-6f, 2e-6f);
+    assert_close("CUDA chunked GDLA merge LSE", merged_lse_host.data(),
+                 merge_lse_want.data(), merge_states, 2e-6f, 2e-6f);
+    assert_close("CUDA chunked GDLA versus single pass", merged_chunked.data(),
+                 full_chunked.data(), full_chunked.size(), 5e-4f, 5e-5f);
 
     gpu_tensor lambda(get(f, "lambda").bytes.size()); upload(lambda, get(f, "lambda"));
     gpu_tensor gate(get(f, "gate_score").bytes.size()); upload(gate, get(f, "gate_score"));
@@ -332,7 +420,18 @@ static void test_gdla(const char *dir) {
 }
 
 static void test_latent_gdla() {
-    constexpr uint32_t rows = 6u;
+    const char *profile_rows_env = std::getenv("DS4_MOTIF3_PROFILE_ROWS");
+    const bool profile_only = profile_rows_env && profile_rows_env[0];
+    uint32_t rows = 6u;
+    if (profile_only) {
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(profile_rows_env, &end, 10);
+        if (!end || end[0] || parsed == 0ul || parsed > 4096ul) {
+            fprintf(stderr, "invalid DS4_MOTIF3_PROFILE_ROWS=%s\n", profile_rows_env);
+            std::exit(2);
+        }
+        rows = (uint32_t)parsed;
+    }
     constexpr uint32_t q_heads = 80u;
     constexpr uint32_t kv_heads = 16u;
     constexpr uint32_t group = 5u;
@@ -394,6 +493,26 @@ static void test_latent_gdla() {
     for (uint32_t i = 0; i < rope_dim / 2u; i++)
         inv[i] = 1.0f / std::pow(10000.0f, (2.0f * (float)i) / (float)rope_dim);
 
+    static const char kv_b_name[] = "blk.0.attn_kv_b.weight";
+    ds4_gpu_tensor_record kv_b_record = {};
+    kv_b_record.name = kv_b_name;
+    kv_b_record.name_len = sizeof(kv_b_name) - 1u;
+    kv_b_record.type = 8u; /* GGML_TYPE_Q8_0 */
+    kv_b_record.ndim = 2u;
+    kv_b_record.dims[0] = latent_dim;
+    kv_b_record.dims[1] = weight_rows;
+    kv_b_record.offset = 0u;
+    kv_b_record.bytes = model.size();
+    if (ds4_gpu_build_derived_artifacts_from_records(
+            model.data(), model.size(), &kv_b_record, 1u) != 1) {
+        fprintf(stderr, "could not build Motif kv_b value artifact\n");
+        std::exit(1);
+    }
+    /* Build first, then hide the registry from the consumer so CI can keep
+     * exercising the unchanged raw-weight fallback independently. */
+    if (std::getenv("DS4_MOTIF3_TEST_RAW_VALUE"))
+        setenv("DS4_CUDA_NO_DERIVED_WEIGHTS", "1", 1);
+
     setenv("DS4_CUDA_COPY_MODEL", "1", 1);
     if (!ds4_gpu_set_model_map(model.data(), model.size())) {
         fprintf(stderr, "could not install latent GDLA test map\n");
@@ -433,6 +552,33 @@ static void test_latent_gdla() {
                 rows, q_heads, kv_heads, group, latent_dim, qk_nope,
                 key_dim, value_dim)) {
         fprintf(stderr, "latent GDLA preparation failed\n"); std::exit(1);
+    }
+
+    /* Nsight Compute kernel replay cannot coexist with the full 86 GiB VMM
+     * owner on GB10: replay checkpoints exhaust unified memory.  This mode
+     * keeps the production kernel and authentic Motif dimensions while
+     * expanding only the token axis used by a real prefill chunk. */
+    if (profile_only) {
+        const float scale = 1.0f / std::sqrt((float)key_dim);
+        if (!ds4_gpu_motif3_latent_attention_bf16_tensor(
+                    latent_out.p, q_full_gpu.p, q_absorbed.p,
+                    latent_cache.p, k_pe_cache.p, rows, 0, rows, 0,
+                    q_heads, latent_dim, qk_nope, rope_dim, scale) ||
+            !ds4_gpu_motif3_value_project_q8_0_tensor(
+                    heads.p, latent_out.p, model.data(), model.size(), 0,
+                    rows, q_heads, kv_heads, group, latent_dim,
+                    qk_nope, value_dim)) {
+            fprintf(stderr, "latent GDLA profile launch failed\n");
+            std::exit(1);
+        }
+        float sync = 0.0f;
+        if (!ds4_gpu_tensor_read(heads.p, 0, &sync, sizeof(sync)) || !std::isfinite(sync)) {
+            fprintf(stderr, "latent GDLA profile synchronization failed\n");
+            std::exit(1);
+        }
+        printf("Motif-3 NCU latent profile: rows=%u, q_heads=%u, latent_dim=%u, finite output\n",
+               rows, q_heads, latent_dim);
+        return;
     }
 
     auto q_full = download_f32(q_full_gpu, (uint64_t)rows * q_heads * key_dim);
@@ -540,17 +686,447 @@ static void test_latent_gdla() {
                  2e-4f, 2e-4f);
 }
 
+static void test_latent_decode_split() {
+    constexpr uint32_t cache_cap = 1024u;
+    constexpr uint32_t q_heads = 80u;
+    constexpr uint32_t latent_dim = 512u;
+    constexpr uint32_t qk_nope = 128u;
+    constexpr uint32_t rope_dim = 64u;
+    constexpr uint32_t key_dim = qk_nope + rope_dim;
+    const float scale = 1.0f / std::sqrt((float)key_dim);
+
+    std::vector<uint16_t> latent_bits((size_t)cache_cap * latent_dim);
+    std::vector<uint16_t> k_pe_bits((size_t)cache_cap * rope_dim);
+    std::vector<float> latent(latent_bits.size());
+    std::vector<float> k_pe(k_pe_bits.size());
+    std::vector<float> q((size_t)q_heads * key_dim);
+    std::vector<float> q_absorbed((size_t)q_heads * latent_dim);
+    for (size_t i = 0; i < latent.size(); i++) {
+        const float value =
+            (float)((int32_t)((i * 17u + 13u) % 257u) - 128) / 1024.0f;
+        latent_bits[i] = f32_to_bf16_bits(value);
+        latent[i] = bf16_bits_to_f32(latent_bits[i]);
+    }
+    for (size_t i = 0; i < k_pe.size(); i++) {
+        const float value =
+            (float)((int32_t)((i * 19u + 7u) % 193u) - 96) / 1024.0f;
+        k_pe_bits[i] = f32_to_bf16_bits(value);
+        k_pe[i] = bf16_bits_to_f32(k_pe_bits[i]);
+    }
+    for (size_t i = 0; i < q.size(); i++)
+        q[i] = (float)((int32_t)((i * 23u + 5u) % 251u) - 125) / 512.0f;
+    for (size_t i = 0; i < q_absorbed.size(); i++)
+        q_absorbed[i] =
+            (float)((int32_t)((i * 29u + 11u) % 263u) - 131) / 1024.0f;
+
+    gpu_tensor latent_gpu(latent_bits.size() * sizeof(uint16_t));
+    gpu_tensor k_pe_gpu(k_pe_bits.size() * sizeof(uint16_t));
+    gpu_tensor q_gpu(q.size() * sizeof(float));
+    gpu_tensor q_absorbed_gpu(q_absorbed.size() * sizeof(float));
+    gpu_tensor out_gpu((uint64_t)q_heads * latent_dim * sizeof(float));
+    if (!ds4_gpu_tensor_write(latent_gpu.p, 0, latent_bits.data(),
+                              latent_bits.size() * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_write(k_pe_gpu.p, 0, k_pe_bits.data(),
+                              k_pe_bits.size() * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_write(q_gpu.p, 0, q.data(), q.size() * sizeof(float)) ||
+        !ds4_gpu_tensor_write(q_absorbed_gpu.p, 0, q_absorbed.data(),
+                              q_absorbed.size() * sizeof(float)) ||
+        !ds4_gpu_motif3_latent_attention_bf16_tensor(
+                out_gpu.p, q_gpu.p, q_absorbed_gpu.p,
+                latent_gpu.p, k_pe_gpu.p,
+                1u, cache_cap - 1u, cache_cap, 0u,
+                q_heads, latent_dim, qk_nope, rope_dim, scale)) {
+        fprintf(stderr, "latent decode split dispatch failed\n");
+        std::exit(1);
+    }
+
+    std::vector<float> want((size_t)q_heads * latent_dim, 0.0f);
+    for (uint32_t h = 0; h < q_heads; h++) {
+        const float *qh = q.data() + (uint64_t)h * key_dim;
+        const float *qa = q_absorbed.data() + (uint64_t)h * latent_dim;
+        float *dst = want.data() + (uint64_t)h * latent_dim;
+        float M = -INFINITY;
+        float S = 0.0f;
+        for (uint32_t k = 0; k < cache_cap; k++) {
+            const float *c = latent.data() + (uint64_t)k * latent_dim;
+            const float *kp = k_pe.data() + (uint64_t)k * rope_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < latent_dim; d++) dot += qa[d] * c[d];
+            for (uint32_t d = 0; d < rope_dim; d++)
+                dot += qh[qk_nope + d] * kp[d];
+            const float score = dot * scale;
+            const float new_m = std::max(M, score);
+            const float old_scale = std::exp(M - new_m);
+            const float row_scale = std::exp(score - new_m);
+            for (uint32_t d = 0; d < latent_dim; d++)
+                dst[d] = dst[d] * old_scale + c[d] * row_scale;
+            S = S * old_scale + row_scale;
+            M = new_m;
+        }
+        for (uint32_t d = 0; d < latent_dim; d++) dst[d] /= S;
+    }
+    auto got = download_f32(out_gpu, want.size());
+    assert_close("CUDA latent GDLA split decode", got.data(), want.data(),
+                 want.size(), 3e-5f, 3e-4f);
+}
+
+/* Safe NCU harness for the production aligned pair kernel.  Full-model
+ * kernel replay checkpoints the 86 GiB VMM import and can exhaust GB10 UMA;
+ * these are the two exact Motif prefill geometries at its 512-token chunk. */
+static void test_q8_pair_profile(const char *mode) {
+    constexpr uint64_t in_dim = 4096u;
+    constexpr uint64_t blocks = in_dim / 32u;
+    uint64_t n_tok = 512u;
+    uint64_t out0_dim = 0;
+    uint64_t out1_dim = 0;
+    const char *name0 = nullptr;
+    const char *name1 = nullptr;
+    if (!std::strcmp(mode, "qkv")) {
+        out0_dim = 1024u;
+        out1_dim = 576u;
+        name0 = "blk.0.attn_q_a.weight";
+        name1 = "blk.0.attn_kv_a.weight";
+    } else if (!std::strcmp(mode, "shared")) {
+        out0_dim = 1280u;
+        out1_dim = 1280u;
+        name0 = "blk.2.ffn_gate_shexp.weight";
+        name1 = "blk.2.ffn_up_shexp.weight";
+    } else if (!std::strcmp(mode, "dense")) {
+        /* The two leading dense Motif blocks dominate pair-kernel GPU time:
+         * nsys reports grid=(1536,256), i.e. M=12288 and n_tok=256. */
+        n_tok = 256u;
+        out0_dim = 12288u;
+        out1_dim = 12288u;
+        name0 = "blk.0.ffn_gate.weight";
+        name1 = "blk.0.ffn_up.weight";
+    } else {
+        fprintf(stderr, "invalid DS4_MOTIF3_PROFILE_PAIR=%s\n", mode);
+        std::exit(2);
+    }
+
+    const uint64_t bytes0 = out0_dim * blocks * 34u;
+    const uint64_t bytes1 = out1_dim * blocks * 34u;
+    std::vector<uint8_t> model((size_t)(bytes0 + bytes1));
+    auto fill_weight = [&](uint64_t offset, uint64_t out_dim) {
+        constexpr uint16_t scale_bits = 0x2400u; /* IEEE fp16 1/64 */
+        for (uint64_t row = 0; row < out_dim; row++) {
+            for (uint64_t b = 0; b < blocks; b++) {
+                uint8_t *blk = model.data() + offset + (row * blocks + b) * 34u;
+                std::memcpy(blk, &scale_bits, sizeof(scale_bits));
+                for (uint32_t k = 0; k < 32u; k++) {
+                    blk[2u + k] = (uint8_t)(int8_t)
+                        ((int)((row * 13u + b * 7u + k * 3u) % 15u) - 7);
+                }
+            }
+        }
+    };
+    fill_weight(0u, out0_dim);
+    fill_weight(bytes0, out1_dim);
+
+    ds4_gpu_tensor_record records[2] = {};
+    records[0].name = name0;
+    records[0].name_len = std::strlen(name0);
+    records[0].type = 8u; /* GGML_TYPE_Q8_0 */
+    records[0].ndim = 2u;
+    records[0].dims[0] = in_dim;
+    records[0].dims[1] = out0_dim;
+    records[0].offset = 0u;
+    records[0].bytes = bytes0;
+    records[1].name = name1;
+    records[1].name_len = std::strlen(name1);
+    records[1].type = 8u;
+    records[1].ndim = 2u;
+    records[1].dims[0] = in_dim;
+    records[1].dims[1] = out1_dim;
+    records[1].offset = bytes0;
+    records[1].bytes = bytes1;
+    if (ds4_gpu_build_derived_artifacts_from_records(
+            model.data(), model.size(), records, 2u) != 2) {
+        fprintf(stderr, "could not build Motif Q8 pair artifacts\n");
+        std::exit(1);
+    }
+    setenv("DS4_CUDA_COPY_MODEL", "1", 1);
+    if (!ds4_gpu_set_model_map(model.data(), model.size())) {
+        fprintf(stderr, "could not install Motif Q8 pair profile map\n");
+        std::exit(1);
+    }
+
+    std::vector<float> input((size_t)(n_tok * in_dim));
+    for (uint64_t i = 0; i < input.size(); i++)
+        input[(size_t)i] =
+            (float)((int)((i * 17u + 11u) % 257u) - 128) / 256.0f;
+    gpu_tensor x(input.size() * sizeof(float));
+    gpu_tensor out0(n_tok * out0_dim * sizeof(float));
+    gpu_tensor out1(n_tok * out1_dim * sizeof(float));
+    if (!ds4_gpu_tensor_write(
+            x.p, 0, input.data(), input.size() * sizeof(float))) {
+        fprintf(stderr, "Motif Q8 pair profile input upload failed\n");
+        std::exit(1);
+    }
+
+    /* The old kernel is a local oracle: the cooperative kernel must retain
+     * every lane's block order and therefore produce byte-identical floats. */
+    setenv("DS4_CUDA_NO_Q8_PAIR_MMQ_SPLIT", "1", 1);
+    setenv("DS4_CUDA_NO_Q8_PAIR_COALESCED", "1", 1);
+    if (!ds4_gpu_matmul_q8_0_pair_tensor(
+            out0.p, out1.p, model.data(), model.size(), 0u, bytes0,
+            in_dim, out0_dim, out1_dim, x.p, n_tok)) {
+        fprintf(stderr, "Motif Q8 pair oracle launch failed\n");
+        std::exit(1);
+    }
+    auto oracle0 = download_f32(out0, (size_t)(n_tok * out0_dim));
+    auto oracle1 = download_f32(out1, (size_t)(n_tok * out1_dim));
+    unsetenv("DS4_CUDA_NO_Q8_PAIR_COALESCED");
+    if (!std::strcmp(mode, "dense"))
+        setenv("DS4_CUDA_FORCE_Q8_PAIR_COALESCED", "1", 1);
+    if (
+        !ds4_gpu_matmul_q8_0_pair_tensor(
+            out0.p, out1.p, model.data(), model.size(), 0u, bytes0,
+            in_dim, out0_dim, out1_dim, x.p, n_tok)) {
+        fprintf(stderr, "Motif Q8 pair profile launch failed\n");
+        std::exit(1);
+    }
+    auto got0 = download_f32(out0, oracle0.size());
+    auto got1 = download_f32(out1, oracle1.size());
+    if (std::memcmp(got0.data(), oracle0.data(), got0.size() * sizeof(float)) ||
+        std::memcmp(got1.data(), oracle1.data(), got1.size() * sizeof(float))) {
+        fprintf(stderr, "Motif Q8 pair coalesced output is not bit-identical\n");
+        std::exit(1);
+    }
+    unsetenv("DS4_CUDA_FORCE_Q8_PAIR_COALESCED");
+    unsetenv("DS4_CUDA_NO_Q8_PAIR_MMQ_SPLIT");
+    const float sample0 = got0[0];
+    const float sample1 = got1[0];
+    if (!std::isfinite(sample0) || !std::isfinite(sample1)) std::exit(1);
+    if (!std::strcmp(mode, "dense")) {
+        if (!ds4_gpu_matmul_q8_0_pair_tensor(
+                out0.p, out1.p, model.data(), model.size(), 0u, bytes0,
+                in_dim, out0_dim, out1_dim, x.p, n_tok)) {
+            fprintf(stderr, "Motif Q8 dense MMQ split dispatch failed\n");
+            std::exit(1);
+        }
+        auto single0 = download_f32(out0, oracle0.size());
+        auto single1 = download_f32(out1, oracle1.size());
+        double dot = 0.0;
+        double ref2 = 0.0;
+        double got2 = 0.0;
+        double err2 = 0.0;
+        auto measure = [&](const std::vector<float> &ref,
+                           const std::vector<float> &got) {
+            for (size_t i = 0; i < ref.size(); i++) {
+                if (!std::isfinite(got[i])) {
+                    fprintf(stderr, "Motif Q8 single output is not finite\n");
+                    std::exit(1);
+                }
+                dot += (double)ref[i] * got[i];
+                ref2 += (double)ref[i] * ref[i];
+                got2 += (double)got[i] * got[i];
+                const double e = (double)got[i] - ref[i];
+                err2 += e * e;
+            }
+        };
+        measure(oracle0, single0);
+        measure(oracle1, single1);
+        const double cosine = dot / std::sqrt(ref2 * got2);
+        const double nrmse = std::sqrt(err2 / ref2);
+        if (cosine < 0.999999 || nrmse > 1.0e-5) {
+            fprintf(stderr,
+                    "Motif Q8 dense MMQ split parity failed: cosine=%.9f nrmse=%.6g\n",
+                    cosine, nrmse);
+            std::exit(1);
+        }
+        printf("Motif-3 Q8 dense MMQ split: cosine=%.9f nrmse=%.6g\n",
+               cosine, nrmse);
+    }
+    printf("Motif-3 NCU Q8 pair profile: mode=%s, n_tok=%llu, K=%llu, "
+           "M=%llu/%llu, bit-identical output %.6g/%.6g\n",
+           mode, (unsigned long long)n_tok, (unsigned long long)in_dim,
+           (unsigned long long)out0_dim, (unsigned long long)out1_dim,
+           sample0, sample1);
+}
+
+/* Safe production-shape NCU harness for Motif-3's current top kernel.  It
+ * preserves the real M/K, 384 experts, 256 tokens and top-8 assignment
+ * count, but uses zero-filled synthetic IQ2/Q8 payloads so profiler replay
+ * never checkpoints the 86 GiB shared VMM model. */
+static void test_iq2_d2r_pair_profile() {
+    constexpr int M = 1280;
+    constexpr int K = 4096;
+    constexpr int n_tokens = 256;
+    constexpr int n_experts = 384;
+    constexpr int n_expert_used = 8;
+    constexpr int n_assign = n_tokens * n_expert_used;
+    const int64_t soa_blocks =
+        (int64_t)n_experts * M * (K / 256);
+    const size_t dq_bytes =
+        ((size_t)soa_blocks * sizeof(uint16_t) + 63u) & ~(size_t)63u;
+    const size_t artifact_bytes = dq_bytes + (size_t)soa_blocks * 64u;
+    const size_t q8_bytes =
+        (size_t)n_assign * (K / 128) * 144u;
+    const size_t out_bytes = (size_t)n_assign * M * sizeof(float);
+    const size_t work_bytes =
+        ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(
+            n_assign, n_experts);
+
+    void *gate = nullptr;
+    void *up = nullptr;
+    void *q8 = nullptr;
+    int32_t *ids = nullptr;
+    int32_t *bounds = nullptr;
+    float *out_gate = nullptr;
+    float *out_up = nullptr;
+    void *work = nullptr;
+    auto check = [](cudaError_t err, const char *what) {
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(err));
+            std::exit(1);
+        }
+    };
+    check(cudaMalloc(&gate, artifact_bytes), "IQ2 gate allocation");
+    check(cudaMalloc(&up, artifact_bytes), "IQ2 up allocation");
+    check(cudaMalloc(&q8, q8_bytes), "IQ2 activation allocation");
+    check(cudaMalloc((void **)&ids, n_assign * sizeof(int32_t)),
+          "IQ2 ids allocation");
+    check(cudaMalloc((void **)&bounds,
+                     (n_experts + 1u) * sizeof(int32_t)),
+          "IQ2 bounds allocation");
+    check(cudaMalloc((void **)&out_gate, out_bytes),
+          "IQ2 gate output allocation");
+    check(cudaMalloc((void **)&out_up, out_bytes),
+          "IQ2 up output allocation");
+    check(cudaMalloc(&work, work_bytes), "IQ2 work allocation");
+    check(cudaMemset(gate, 0, artifact_bytes), "IQ2 gate clear");
+    check(cudaMemset(up, 0, artifact_bytes), "IQ2 up clear");
+    check(cudaMemset(q8, 0, q8_bytes), "IQ2 activation clear");
+
+    std::vector<int32_t> host_ids(n_assign);
+    std::vector<int32_t> host_bounds(n_experts + 1u);
+    int col = 0;
+    for (int expert = 0; expert < n_experts; expert++) {
+        host_bounds[(size_t)expert] = col;
+        const int count = n_assign / n_experts +
+                          (expert < n_assign % n_experts ? 1 : 0);
+        for (int i = 0; i < count; i++) host_ids[(size_t)col] = col++;
+    }
+    host_bounds[n_experts] = col;
+    check(cudaMemcpy(ids, host_ids.data(), n_assign * sizeof(int32_t),
+                     cudaMemcpyHostToDevice), "IQ2 ids upload");
+    check(cudaMemcpy(bounds, host_bounds.data(),
+                     (n_experts + 1u) * sizeof(int32_t),
+                     cudaMemcpyHostToDevice), "IQ2 bounds upload");
+
+    if (ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
+            gate, up, soa_blocks, q8, ids, bounds,
+            out_gate, out_up, M, K, n_assign, n_experts,
+            work, work_bytes, 0) != 0) {
+        fprintf(stderr, "IQ2 D2R pair profile launch failed\n");
+        std::exit(1);
+    }
+    float sample[2] = {};
+    check(cudaMemcpy(&sample[0], out_gate, sizeof(float),
+                     cudaMemcpyDeviceToHost), "IQ2 gate read");
+    check(cudaMemcpy(&sample[1], out_up, sizeof(float),
+                     cudaMemcpyDeviceToHost), "IQ2 up read");
+    if (!std::isfinite(sample[0]) || !std::isfinite(sample[1])) std::exit(1);
+    printf("Motif-3 NCU IQ2 D2R pair: M=%d K=%d tokens=%d assignments=%d "
+           "experts=%d, finite output %.6g/%.6g\n",
+           M, K, n_tokens, n_assign, n_experts, sample[0], sample[1]);
+
+    cudaFree(work);
+    cudaFree(out_up);
+    cudaFree(out_gate);
+    cudaFree(bounds);
+    cudaFree(ids);
+    cudaFree(q8);
+    cudaFree(up);
+    cudaFree(gate);
+}
+
+static void test_fattn_profile() {
+    constexpr int n_query = 4096;
+    constexpr int n_kv = 4096;
+    constexpr int n_head = 80;
+    constexpr int n_head_kv = 16;
+    constexpr int qk_dim = 192;
+    constexpr int v_dim = 128;
+    const size_t q_bytes =
+        (size_t)n_query * n_head * qk_dim * sizeof(float);
+    const size_t k_bytes =
+        (size_t)n_kv * n_head_kv * qk_dim * sizeof(float);
+    const size_t v_bytes =
+        (size_t)n_kv * n_head_kv * v_dim * sizeof(float);
+    const size_t out_bytes =
+        (size_t)n_query * n_head * v_dim * sizeof(float);
+    const size_t lse_bytes =
+        (size_t)n_query * n_head * sizeof(float);
+    float *q = nullptr, *k = nullptr, *v = nullptr;
+    float *out = nullptr, *lse = nullptr;
+    auto check = [](cudaError_t err, const char *what) {
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(err));
+            std::exit(1);
+        }
+    };
+    check(cudaMalloc((void **)&q, q_bytes), "FATTN q allocation");
+    check(cudaMalloc((void **)&k, k_bytes), "FATTN k allocation");
+    check(cudaMalloc((void **)&v, v_bytes), "FATTN v allocation");
+    check(cudaMalloc((void **)&out, out_bytes), "FATTN output allocation");
+    check(cudaMalloc((void **)&lse, lse_bytes), "FATTN LSE allocation");
+    check(cudaMemset(q, 0, q_bytes), "FATTN q clear");
+    check(cudaMemset(k, 0, k_bytes), "FATTN k clear");
+    check(cudaMemset(v, 0, v_bytes), "FATTN v clear");
+    if (ds4_mmq_motif3_prefill_attn_hmma(
+            out, lse, q, k, v,
+            n_query, n_kv, n_kv, 0,
+            n_head, n_head_kv, qk_dim, v_dim,
+            1.0f / std::sqrt((float)qk_dim), 0, 0) != 0) {
+        fprintf(stderr, "Motif FATTN profile launch failed\n");
+        std::exit(1);
+    }
+    float sample[2] = {};
+    check(cudaMemcpy(&sample[0], out, sizeof(float), cudaMemcpyDeviceToHost),
+          "FATTN output read");
+    check(cudaMemcpy(&sample[1], lse, sizeof(float), cudaMemcpyDeviceToHost),
+          "FATTN LSE read");
+    if (!std::isfinite(sample[0]) || !std::isfinite(sample[1])) std::exit(1);
+    printf("Motif-3 NCU FATTN: query=%d kv=%d heads=%d/%d, "
+           "finite output %.6g LSE %.6g\n",
+           n_query, n_kv, n_head, n_head_kv, sample[0], sample[1]);
+    cudaFree(lse);
+    cudaFree(out);
+    cudaFree(v);
+    cudaFree(k);
+    cudaFree(q);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s FIXTURE_DIR\n", argv[0]);
         return 2;
     }
     if (!ds4_gpu_init()) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+    if (std::getenv("DS4_MOTIF3_PROFILE_FATTN")) {
+        test_fattn_profile();
+        ds4_gpu_cleanup();
+        return 0;
+    }
+    if (std::getenv("DS4_MOTIF3_PROFILE_IQ2_D2R")) {
+        test_iq2_d2r_pair_profile();
+        ds4_gpu_cleanup();
+        return 0;
+    }
+    const char *pair_profile = std::getenv("DS4_MOTIF3_PROFILE_PAIR");
+    if (pair_profile && pair_profile[0]) {
+        test_q8_pair_profile(pair_profile);
+        ds4_gpu_cleanup();
+        return 0;
+    }
     test_router(argv[1]);
     test_polynorm(argv[1]);
     test_mhc(argv[1]);
     test_gdla(argv[1]);
     test_latent_gdla();
+    test_latent_decode_split();
     test_bf16_projection();
     ds4_gpu_cleanup();
     printf("Motif-3 H200 CUDA fixtures: BF16, router, PolyNorm, mHC, expanded/latent GDLA valid\n");

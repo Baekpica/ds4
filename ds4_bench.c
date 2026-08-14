@@ -703,6 +703,11 @@ int main(int argc, char **argv) {
 
         if (cfg.gen_tokens == 0) {
             /* Pure prefill benchmark: leave the live session at the frontier. */
+        } else if (frontier >= cfg.ctx_max) {
+            /* No later frontier consumes this session.  Avoid restoring a
+             * large checkpoint after the final decode measurement; besides
+             * being wasted work, model families with a native KV layout may
+             * not use the legacy serial snapshot representation. */
         } else if (distributed) {
             if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: distributed replay restore at %d failed: %s\n", frontier, err);

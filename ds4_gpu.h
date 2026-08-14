@@ -2421,6 +2421,27 @@ int ds4_gpu_motif3_store_latent_kv_bf16_tensor(
         uint32_t              rope_dim,
         bool                  ring);
 
+int ds4_gpu_motif3_load_latent_kv_bf16_tensor(
+        ds4_gpu_tensor       *kv_norm,
+        const ds4_gpu_tensor *kv_latent_cache,
+        uint32_t              cache_pos0,
+        uint32_t              rows,
+        uint32_t              cache_cap,
+        uint32_t              kv_latent_dim);
+
+int ds4_gpu_motif3_prepare_cached_kv_tensor(
+        ds4_gpu_tensor       *k_full,
+        ds4_gpu_tensor       *value,
+        const ds4_gpu_tensor *kv_proj,
+        const ds4_gpu_tensor *k_pe_cache,
+        uint32_t              cache_pos0,
+        uint32_t              rows,
+        uint32_t              cache_cap,
+        uint32_t              kv_heads,
+        uint32_t              key_dim,
+        uint32_t              rope_dim,
+        uint32_t              value_dim);
+
 int ds4_gpu_motif3_qk_absorb_q8_0_tensor(
         ds4_gpu_tensor       *q_absorbed,
         const ds4_gpu_tensor *q_full,
@@ -2501,6 +2522,31 @@ int ds4_gpu_motif3_expanded_attention_window_tensor(
         float                 scale,
         bool                  causal,
         uint32_t              window);
+
+int ds4_gpu_motif3_expanded_attention_range_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *lse,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              n_query,
+        uint32_t              query_pos0,
+        uint32_t              n_kv,
+        uint32_t              kv_pos0,
+        uint32_t              q_heads,
+        uint32_t              kv_heads,
+        uint32_t              key_dim,
+        uint32_t              value_dim,
+        float                 scale);
+
+int ds4_gpu_motif3_merge_attention_states_tensor(
+        ds4_gpu_tensor       *attention,
+        ds4_gpu_tensor       *lse,
+        const ds4_gpu_tensor *prefix_attention,
+        const ds4_gpu_tensor *prefix_lse,
+        uint32_t              rows,
+        uint32_t              q_heads,
+        uint32_t              value_dim);
 
 int ds4_gpu_motif3_differential_tensor(
         ds4_gpu_tensor       *out,

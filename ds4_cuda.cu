@@ -512,6 +512,9 @@ enum cuda_derived_kind {
      * (cuda_moe_q2k_derepack_scratch), and any remaining raw consumer falls
      * back to the client mmap. */
     CUDA_DERIVED_Q2_K_ALIGNED_MOE = 6,
+    /* Motif-3 MLA W_UV Q8_0: scales/codes transposed across its 128 value
+     * rows so a value-projection warp reads adjacent memory.  ADDITIVE. */
+    CUDA_DERIVED_MOTIF3_KV_B_VALUE_Q8_0 = 7,
 };
 
 struct cuda_derived_range {
@@ -634,6 +637,12 @@ static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
 static void *g_tt_scratch = NULL;
 static uint64_t g_tt_scratch_bytes = 0;
+/* Late attention/indexer scratch is declared with the other process-wide
+ * allocations so ds4_gpu_cleanup can release it as part of engine teardown. */
+static void *g_fp8_predecode_scratch = NULL;
+static uint64_t g_fp8_predecode_scratch_bytes = 0;
+static void *g_rr_scratch = NULL;
+static uint64_t g_rr_scratch_bytes = 0;
 
 /* Dedicated, capture-stable scratch for the split-K F16 matmul partials.
  * Allocated once in ds4_gpu_init (eager) and never grown/freed during graph
@@ -3016,6 +3025,20 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    ds4_cuda_invalidate_captured_graphs("GPU cleanup");
+    ds4_gpu_decode_scalars_cleanup();
+    ds4_gpu_decode_layer_scalars_cleanup();
+    if (g_row_dev != NULL) {
+        (void)cudaFree(g_row_dev);
+        g_row_dev = NULL;
+    }
+    for (int b = 0; b < 2; ++b) {
+        if (g_row_host[b] != NULL) {
+            (void)cudaFreeHost(g_row_host[b]);
+            g_row_host[b] = NULL;
+        }
+    }
+    g_row_dev_idx = 0;
     /* Opp C Phase 1A tripwire: when DS4_CUDA_FP8_KV_DEBUG is set, surface
      * how many decode blocks actually executed the FP8 read branch in
      * each kernel.  A nonzero count is the evidence that a matching
@@ -3067,10 +3090,25 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_tt_scratch = NULL;
         g_tt_scratch_bytes = 0;
     }
+    if (g_fp8_predecode_scratch) {
+        (void)cudaFree(g_fp8_predecode_scratch);
+        g_fp8_predecode_scratch = NULL;
+        g_fp8_predecode_scratch_bytes = 0;
+    }
+    if (g_rr_scratch) {
+        (void)cudaFree(g_rr_scratch);
+        g_rr_scratch = NULL;
+        g_rr_scratch_bytes = 0;
+    }
     if (g_f16_splitk_partials) {
         (void)cudaFree(g_f16_splitk_partials);
         g_f16_splitk_partials = NULL;
         g_f16_splitk_partials_bytes = 0;
+    }
+    if (g_attn_split_partials) {
+        (void)cudaFree(g_attn_split_partials);
+        g_attn_split_partials = NULL;
+        g_attn_split_partials_bytes = 0;
     }
     if (g_hc_stage_scratch) {
         (void)cudaFree(g_hc_stage_scratch);
@@ -4557,6 +4595,10 @@ static int cuda_build_derived_artifacts_from_catalog(
         ok = ds4_repack_build_q8_aligned(a, arts, &part);
         built_bytes += part;
     }
+    if (ok && build_q8) {
+        ok = ds4_repack_build_motif3_kv_b_value(a, arts, &part);
+        built_bytes += part;
+    }
     if (ok && build_f16) {
         /* Optional acceleration tier: a failed prebuild keeps the lazy
          * first-touch path and must not demote the aligned artifacts. */
@@ -5726,6 +5768,18 @@ __device__ __forceinline__ static int32_t dot_i8x32_aligned(const int8_t *qs32, 
     return sumi;
 }
 
+/* Half of an aligned Q8_0 block.  The pair-prefill kernel uses one lane per
+ * 16-byte half so a warp reads 16 consecutive blocks as a single contiguous
+ * 512-byte span instead of issuing one 32-byte strided transaction per lane. */
+__device__ __forceinline__ static int32_t dot_i8x16_aligned(int4 w, int4 x) {
+    int sumi = 0;
+    sumi = __dp4a(w.x, x.x, sumi);
+    sumi = __dp4a(w.y, x.y, sumi);
+    sumi = __dp4a(w.z, x.z, sumi);
+    sumi = __dp4a(w.w, x.w, sumi);
+    return sumi;
+}
+
 __global__ static DS4_CUDA_UNUSED void matmul_q8_0_kernel(
         float *out,
         const unsigned char *w,
@@ -6075,6 +6129,129 @@ __global__ static void matmul_q8_0_pair_preq_batch_warp8_kernel(
     if (lane == 0) {
         if (row < out0_dim) out0[tok * out0_dim + row] = acc0;
         if (row < out1_dim) out1[tok * out1_dim + row] = acc1;
+    }
+}
+
+/* Batched counterpart of the aligned pair kernel.  Keep one block row per
+ * (token, eight output rows), preserving the raw kernel's reduction order
+ * while avoiding the 34-byte interleaved scale/code loads. */
+__global__ static void matmul_q8_0_pair_preq_batch_aligned_warp8_kernel(
+        float *out0,
+        float *out1,
+        const int8_t *qs0,
+        const __half *dq0,
+        const int8_t *qs1,
+        const __half *dq1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if ((row >= out0_dim && row >= out1_dim) || tok >= n_tok) return;
+    const uint64_t rbase = row * blocks;
+    const int8_t *xqr = xq + tok * blocks * 32u;
+    const float *xsr = xscale + tok * blocks;
+    const int in0 = row < out0_dim;
+    const int in1 = row < out1_dim;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const int8_t *xqb = xqr + b * 32u;
+        const float xs = xsr[b];
+        if (in0) {
+            const int dot = dot_i8x32_aligned(qs0 + (rbase + b) * 32u, xqb);
+            acc0 += __half2float(dq0[rbase + b]) * xs * (float)dot;
+        }
+        if (in1) {
+            const int dot = dot_i8x32_aligned(qs1 + (rbase + b) * 32u, xqb);
+            acc1 += __half2float(dq1[rbase + b]) * xs * (float)dot;
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0) {
+        if (in0) out0[tok * out0_dim + row] = acc0;
+        if (in1) out1[tok * out1_dim + row] = acc1;
+    }
+}
+
+/* NCU on the Motif-3 production shapes found 79% excessive sectors in the
+ * aligned pair kernel: each lane owned a block, so both weights and xq were
+ * read with a 32-byte lane stride.  Keep that lane's block and float
+ * accumulation order, but have the full warp load two contiguous 16-block
+ * half-block passes.  Integer half-dots are shuffled back to the original
+ * owner lane; their sum is exact and the final warp reduction is unchanged. */
+__global__ static void matmul_q8_0_pair_preq_batch_aligned_coalesced_warp8_kernel(
+        float *out0,
+        float *out1,
+        const int8_t *qs0,
+        const __half *dq0,
+        const int8_t *qs1,
+        const __half *dq1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if ((row >= out0_dim && row >= out1_dim) || tok >= n_tok) return;
+    const uint64_t rbase = row * blocks;
+    const int8_t *xqr = xq + tok * blocks * 32u;
+    const float *xsr = xscale + tok * blocks;
+    const int in0 = row < out0_dim;
+    const int in1 = row < out1_dim;
+    const uint32_t owner_local = lane & 15u;
+    const uint32_t source0 = owner_local * 2u;
+    const uint32_t source1 = source0 + 1u;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (uint64_t outer = 0; outer < blocks; outer += 32u) {
+#pragma unroll
+        for (uint32_t pass = 0; pass < 2u; pass++) {
+            const uint64_t source_block = outer + pass * 16u + (lane >> 1u);
+            const uint64_t half_offset = (uint64_t)(lane & 1u) * 16u;
+            const int4 x4 = *(const int4 *)(xqr + source_block * 32u + half_offset);
+            int half_dot0 = 0;
+            int half_dot1 = 0;
+            if (in0) {
+                const int4 w4 = *(const int4 *)(
+                        qs0 + (rbase + source_block) * 32u + half_offset);
+                half_dot0 = dot_i8x16_aligned(w4, x4);
+            }
+            if (in1) {
+                const int4 w4 = *(const int4 *)(
+                        qs1 + (rbase + source_block) * 32u + half_offset);
+                half_dot1 = dot_i8x16_aligned(w4, x4);
+            }
+
+            const int dot0 = __shfl_sync(0xffffffffu, half_dot0, source0) +
+                             __shfl_sync(0xffffffffu, half_dot0, source1);
+            const int dot1 = __shfl_sync(0xffffffffu, half_dot1, source0) +
+                             __shfl_sync(0xffffffffu, half_dot1, source1);
+            const int owner = pass == 0u ? lane < 16u : lane >= 16u;
+            if (owner) {
+                const uint64_t b = outer + lane;
+                const float xs = xsr[b];
+                if (in0)
+                    acc0 += __half2float(dq0[rbase + b]) * xs * (float)dot0;
+                if (in1)
+                    acc1 += __half2float(dq1[rbase + b]) * xs * (float)dot1;
+            }
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0) {
+        if (in0) out0[tok * out0_dim + row] = acc0;
+        if (in1) out1[tok * out1_dim + row] = acc1;
     }
 }
 
@@ -9823,9 +10000,6 @@ __global__ static void __launch_bounds__(256, 4) attention_indexed_hg_partial_ke
  * grows scratch to the layer's required size; subsequent captured launches
  * reuse the same pointer.  cudaMalloc/cudaFree only ever run outside
  * capture because they only run when bytes > g_fp8_predecode_scratch_bytes. */
-static void *g_fp8_predecode_scratch = NULL;
-static uint64_t g_fp8_predecode_scratch_bytes = 0;
-
 static float *fp8_predecode_scratch_alloc(uint64_t bytes) {
     if (bytes == 0) return NULL;
     if (g_fp8_predecode_scratch_bytes >= bytes) {
@@ -16320,8 +16494,6 @@ __global__ static void __launch_bounds__(512) rr_coarse_mxf4_v3_kernel(
  * qsf word; legacy re-quant path: qc + qsf); the entry never runs on
  * capture steps, so the tt_scratch discipline (sync before free) is
  * trivially safe here. */
-static void *g_rr_scratch = NULL;
-static uint64_t g_rr_scratch_bytes = 0;
 static void *rr_scratch_ensure(uint64_t bytes) {
     static int oom_printed = 0;
     if (bytes == 0) return NULL;
@@ -20687,6 +20859,32 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         out1->bytes < n_tok * out1_dim * sizeof(float)) {
         return 0;
     }
+
+    /* Motif-3's two leading dense FFNs are M=12288/12288, N=256, K=4096.
+     * NCU shows the warp-per-row pair kernel spending >96% of issue slots on
+     * long scoreboards; nsys measures ~110 ms.  The existing common MMQ path
+     * serves the same two projections in ~1.0 ms total and matches the pair
+     * oracle at cosine 1.0 / NRMSE 4.2e-7.  Keep this as a narrow shape
+     * dispatch so unrelated model-family pair shapes remain untouched. */
+    if (in_dim == 4096u && out0_dim == 12288u && out1_dim == 12288u &&
+        n_tok >= 64u && getenv("DS4_CUDA_NO_Q8_PAIR_MMQ_SPLIT") == NULL) {
+        if (ds4_gpu_matmul_q8_0_tensor(
+                    out0, model_map, model_size, weight0_offset,
+                    in_dim, out0_dim, x, n_tok) &&
+            ds4_gpu_matmul_q8_0_tensor(
+                    out1, model_map, model_size, weight1_offset,
+                    in_dim, out1_dim, x, n_tok)) {
+            static int logged_pair_mmq_split = 0;
+            if (!logged_pair_mmq_split) {
+                logged_pair_mmq_split = 1;
+                fprintf(stderr,
+                        "ds4: Motif-3 dense Q8 pair split across common MMQ kernels\n");
+            }
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4: Motif-3 dense Q8 MMQ split declined; using pair fallback\n");
+    }
     const char *w0 = cuda_model_range_ptr(model_map, weight0_offset, weight0_bytes, "q8_0_pair0");
     const char *w1 = cuda_model_range_ptr(model_map, weight1_offset, weight1_bytes, "q8_0_pair1");
     if (!w0 || !w1) return 0;
@@ -20816,19 +21014,70 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                 use_dp4a);
     } else {
         dim3 grid(((unsigned)max_out + 7u) / 8u, (unsigned)n_tok, 1);
-        matmul_q8_0_pair_preq_batch_warp8_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
-                (float *)out0->ptr,
-                (float *)out1->ptr,
-                reinterpret_cast<const unsigned char *>(w0),
-                reinterpret_cast<const unsigned char *>(w1),
-                xq,
-                xscale,
-                in_dim,
-                out0_dim,
-                out1_dim,
-                n_tok,
-                blocks,
-                use_dp4a);
+        const char *w0_al = NULL;
+        const char *w1_al = NULL;
+        if (in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
+            const uint64_t b0 = ds4_mmq_q8_0_aligned_bytes((int)out0_dim, (int)in_dim);
+            const uint64_t b1 = ds4_mmq_q8_0_aligned_bytes((int)out1_dim, (int)in_dim);
+            if (b0 != 0 && b1 != 0) {
+                w0_al = cuda_derived_weight_ptr(model_map, weight0_offset, weight0_bytes,
+                                                CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+                                                in_dim, out0_dim, 1u, b0, "q8_pair0_batch");
+                w1_al = w0_al
+                    ? cuda_derived_weight_ptr(model_map, weight1_offset, weight1_bytes,
+                                              CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+                                              in_dim, out1_dim, 1u, b1, "q8_pair1_batch")
+                    : NULL;
+            }
+        }
+        if (w0_al && w1_al) {
+            const uint64_t dqb0 = (out0_dim * blocks * 2u + 63u) & ~63ull;
+            const uint64_t dqb1 = (out1_dim * blocks * 2u + 63u) & ~63ull;
+            const int force_coalesced =
+                getenv("DS4_CUDA_FORCE_Q8_PAIR_COALESCED") != NULL;
+            if (getenv("DS4_CUDA_NO_Q8_PAIR_COALESCED") == NULL &&
+                (max_out <= 2048u || force_coalesced)) {
+                matmul_q8_0_pair_preq_batch_aligned_coalesced_warp8_kernel<<<
+                    grid, 256, 0, ds4_current_stream()>>>(
+                        (float *)out0->ptr, (float *)out1->ptr,
+                        (const int8_t *)(w0_al + dqb0), (const __half *)w0_al,
+                        (const int8_t *)(w1_al + dqb1), (const __half *)w1_al,
+                        xq, xscale, out0_dim, out1_dim, n_tok, blocks);
+                static int logged_pair_coalesced = 0;
+                if (!logged_pair_coalesced) {
+                    logged_pair_coalesced = 1;
+                    fprintf(stderr,
+                            "ds4: q8 pair prefill using coalesced half-block loads\n");
+                }
+            } else {
+                matmul_q8_0_pair_preq_batch_aligned_warp8_kernel<<<
+                    grid, 256, 0, ds4_current_stream()>>>(
+                        (float *)out0->ptr, (float *)out1->ptr,
+                        (const int8_t *)(w0_al + dqb0), (const __half *)w0_al,
+                        (const int8_t *)(w1_al + dqb1), (const __half *)w1_al,
+                        xq, xscale, out0_dim, out1_dim, n_tok, blocks);
+            }
+            static int logged_pair_batch_al = 0;
+            if (!logged_pair_batch_al) {
+                logged_pair_batch_al = 1;
+                fprintf(stderr,
+                        "ds4: q8 pair prefill using aligned Q8_0 artifacts\n");
+            }
+        } else {
+            matmul_q8_0_pair_preq_batch_warp8_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
+                    (float *)out0->ptr,
+                    (float *)out1->ptr,
+                    reinterpret_cast<const unsigned char *>(w0),
+                    reinterpret_cast<const unsigned char *>(w1),
+                    xq,
+                    xscale,
+                    in_dim,
+                    out0_dim,
+                    out1_dim,
+                    n_tok,
+                    blocks,
+                    use_dp4a);
+        }
     }
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
 }
@@ -31441,6 +31690,108 @@ extern "C" int ds4_gpu_motif3_store_latent_kv_bf16_tensor(
     return cuda_ok(cudaGetLastError(), "Motif-3 latent KV BF16 store launch");
 }
 
+__global__ static void motif3_load_latent_kv_bf16_kernel(
+        float *kv_norm, const __nv_bfloat16 *latent_cache,
+        uint32_t cache_pos0, uint32_t rows,
+        uint32_t cache_cap, uint32_t latent_dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)rows * latent_dim;
+    if (i >= n) return;
+    const uint32_t row = (uint32_t)(i / latent_dim);
+    const uint32_t dim = (uint32_t)(i % latent_dim);
+    const uint32_t slot = cache_pos0 + row;
+    if (slot >= cache_cap) return;
+    kv_norm[i] = __bfloat162float(
+            latent_cache[(uint64_t)slot * latent_dim + dim]);
+}
+
+extern "C" int ds4_gpu_motif3_load_latent_kv_bf16_tensor(
+        ds4_gpu_tensor *kv_norm, const ds4_gpu_tensor *kv_latent_cache,
+        uint32_t cache_pos0, uint32_t rows,
+        uint32_t cache_cap, uint32_t kv_latent_dim) {
+    const uint64_t n = (uint64_t)rows * kv_latent_dim;
+    if (!kv_norm || !kv_latent_cache || rows == 0 || cache_cap == 0 ||
+        kv_latent_dim == 0 || cache_pos0 > cache_cap ||
+        rows > cache_cap - cache_pos0 ||
+        kv_norm->bytes < n * sizeof(float) ||
+        kv_latent_cache->bytes <
+            (uint64_t)cache_cap * kv_latent_dim * sizeof(__nv_bfloat16)) {
+        return 0;
+    }
+    motif3_load_latent_kv_bf16_kernel<<<(n + 255u) / 256u, 256>>>(
+            (float *)kv_norm->ptr,
+            (const __nv_bfloat16 *)kv_latent_cache->ptr,
+            cache_pos0, rows, cache_cap, kv_latent_dim);
+    return cuda_ok(cudaGetLastError(),
+                   "Motif-3 latent KV BF16 load launch");
+}
+
+__global__ static void motif3_prepare_cached_kv_kernel(
+        float *k_full, float *value, const float *kv_proj,
+        const __nv_bfloat16 *k_pe_cache,
+        uint32_t cache_pos0, uint32_t rows, uint32_t cache_cap,
+        uint32_t kv_heads, uint32_t key_dim,
+        uint32_t rope_dim, uint32_t value_dim) {
+    const uint32_t nope = key_dim - rope_dim;
+    const uint64_t per_head = (uint64_t)key_dim + value_dim;
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)rows * kv_heads * per_head;
+    if (i >= n) return;
+    const uint32_t dim = (uint32_t)(i % per_head);
+    const uint64_t rh = i / per_head;
+    const uint32_t head = (uint32_t)(rh % kv_heads);
+    const uint32_t row = (uint32_t)(rh / kv_heads);
+    const uint32_t slot = cache_pos0 + row;
+    if (slot >= cache_cap) return;
+    const uint64_t proj_base = ((uint64_t)row * kv_heads + head) *
+                               (nope + value_dim);
+    if (dim < nope) {
+        k_full[((uint64_t)row * kv_heads + head) * key_dim + dim] =
+            kv_proj[proj_base + dim];
+    } else if (dim < key_dim) {
+        k_full[((uint64_t)row * kv_heads + head) * key_dim + dim] =
+            __bfloat162float(k_pe_cache[(uint64_t)slot * rope_dim +
+                                         dim - nope]);
+    } else {
+        value[((uint64_t)row * kv_heads + head) * value_dim +
+              dim - key_dim] = kv_proj[proj_base + nope + dim - key_dim];
+    }
+}
+
+extern "C" int ds4_gpu_motif3_prepare_cached_kv_tensor(
+        ds4_gpu_tensor *k_full, ds4_gpu_tensor *value,
+        const ds4_gpu_tensor *kv_proj,
+        const ds4_gpu_tensor *k_pe_cache,
+        uint32_t cache_pos0, uint32_t rows, uint32_t cache_cap,
+        uint32_t kv_heads, uint32_t key_dim,
+        uint32_t rope_dim, uint32_t value_dim) {
+    if (!k_full || !value || !kv_proj || !k_pe_cache || rows == 0 ||
+        cache_cap == 0 || kv_heads == 0 || key_dim == 0 || rope_dim == 0 ||
+        rope_dim > key_dim || value_dim == 0 || cache_pos0 > cache_cap ||
+        rows > cache_cap - cache_pos0) return 0;
+    const uint32_t nope = key_dim - rope_dim;
+    const uint64_t kn = (uint64_t)rows * kv_heads * key_dim;
+    const uint64_t vn = (uint64_t)rows * kv_heads * value_dim;
+    const uint64_t pn = (uint64_t)rows * kv_heads * (nope + value_dim);
+    if (k_full->bytes < kn * sizeof(float) ||
+        value->bytes < vn * sizeof(float) ||
+        kv_proj->bytes < pn * sizeof(float) ||
+        k_pe_cache->bytes <
+            (uint64_t)cache_cap * rope_dim * sizeof(__nv_bfloat16)) {
+        return 0;
+    }
+    const uint64_t n = (uint64_t)rows * kv_heads *
+                       ((uint64_t)key_dim + value_dim);
+    motif3_prepare_cached_kv_kernel<<<(n + 255u) / 256u, 256>>>(
+            (float *)k_full->ptr, (float *)value->ptr,
+            (const float *)kv_proj->ptr,
+            (const __nv_bfloat16 *)k_pe_cache->ptr,
+            cache_pos0, rows, cache_cap, kv_heads,
+            key_dim, rope_dim, value_dim);
+    return cuda_ok(cudaGetLastError(),
+                   "Motif-3 cached expanded KV prepare launch");
+}
+
 __device__ __forceinline__ static float motif3_q8_0_weight_dev(
         const char *weight, uint64_t row_bytes,
         uint32_t row, uint32_t col) {
@@ -31472,6 +31823,42 @@ __global__ static void motif3_qk_absorb_q8_0_kernel(
     }
 }
 
+__global__ static void motif3_qk_absorb_q8_0_group5_kernel(
+        float *out, const float *q, const char *weight,
+        uint32_t rows, uint32_t q_heads, uint32_t latent_dim,
+        uint32_t qk_nope, uint32_t key_dim, uint32_t value_dim,
+        uint64_t row_bytes) {
+    const uint32_t kv_head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t head0 = kv_head * 5u;
+    if (token >= rows || head0 + 4u >= q_heads) return;
+    __shared__ float q_shared[5][128];
+    for (uint32_t h = 0; h < 5u; h++) {
+        q_shared[h][threadIdx.x] = q[
+            ((uint64_t)token * q_heads + head0 + h) * key_dim + threadIdx.x];
+    }
+    __syncthreads();
+    float *dst0 = out + ((uint64_t)token * q_heads + head0) * latent_dim;
+    const uint32_t row0 = kv_head * (qk_nope + value_dim);
+    for (uint32_t j = threadIdx.x; j < latent_dim; j += blockDim.x) {
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f, s4 = 0.0f;
+        for (uint32_t d = 0; d < qk_nope; d++) {
+            const float w = motif3_q8_0_weight_dev(
+                    weight, row_bytes, row0 + d, j);
+            s0 += q_shared[0][d] * w;
+            s1 += q_shared[1][d] * w;
+            s2 += q_shared[2][d] * w;
+            s3 += q_shared[3][d] * w;
+            s4 += q_shared[4][d] * w;
+        }
+        dst0[j] = s0;
+        dst0[latent_dim + j] = s1;
+        dst0[2u * latent_dim + j] = s2;
+        dst0[3u * latent_dim + j] = s3;
+        dst0[4u * latent_dim + j] = s4;
+    }
+}
+
 extern "C" int ds4_gpu_motif3_qk_absorb_q8_0_tensor(
         ds4_gpu_tensor *q_absorbed, const ds4_gpu_tensor *q_full,
         const void *model_map, uint64_t model_size, uint64_t kv_b_offset,
@@ -31497,11 +31884,22 @@ extern "C" int ds4_gpu_motif3_qk_absorb_q8_0_tensor(
             model_map, kv_b_offset, weight_bytes, tier,
             "Motif-3 absorbed K Q8_0");
     if (!weight) return 0;
-    dim3 grid(q_heads, rows, 1);
-    motif3_qk_absorb_q8_0_kernel<<<grid, 128>>>(
-            (float *)q_absorbed->ptr, (const float *)q_full->ptr,
-            weight, rows, q_heads, group_size, kv_latent_dim,
-            qk_nope, key_dim, value_dim, row_bytes);
+    const bool motif_shape = q_heads == 80u && kv_heads == 16u &&
+        group_size == 5u && kv_latent_dim == 512u && qk_nope == 128u &&
+        key_dim == 192u && value_dim == 128u;
+    if (motif_shape) {
+        dim3 grid(kv_heads, rows, 1);
+        motif3_qk_absorb_q8_0_group5_kernel<<<grid, 128>>>(
+                (float *)q_absorbed->ptr, (const float *)q_full->ptr,
+                weight, rows, q_heads, kv_latent_dim,
+                qk_nope, key_dim, value_dim, row_bytes);
+    } else {
+        dim3 grid(q_heads, rows, 1);
+        motif3_qk_absorb_q8_0_kernel<<<grid, 128>>>(
+                (float *)q_absorbed->ptr, (const float *)q_full->ptr,
+                weight, rows, q_heads, group_size, kv_latent_dim,
+                qk_nope, key_dim, value_dim, row_bytes);
+    }
     return cuda_ok(cudaGetLastError(), "Motif-3 Q/K absorption launch");
 }
 
@@ -31604,6 +32002,385 @@ __global__ static void motif3_latent_attention_bf16_kernel(
 #undef M3_STORE4
 }
 
+/* Decode specialization for long full-attention layers.  The generic kernel
+ * assigns one warp to each head, leaving only ten CTAs for Motif's 80 heads;
+ * at long context that serial key scan under-fills GB10.  Here one CTA owns a
+ * head and its eight warps scan disjoint key stripes, then merge their online
+ * softmax states in shared memory.  Total cache traffic is unchanged. */
+__global__ static void motif3_latent_attention_bf16_decode_split_kernel(
+        float *out, const float *q, const float *q_absorbed,
+        const __nv_bfloat16 *latent_cache,
+        const __nv_bfloat16 *k_pe_cache,
+        uint32_t pos0, uint32_t cache_cap, uint32_t window,
+        uint32_t q_heads, uint32_t latent_dim,
+        uint32_t qk_nope, uint32_t qk_rope, float scale) {
+    constexpr uint32_t kWarps = 8u;
+    const uint32_t head = blockIdx.x;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (head >= q_heads || warp >= kWarps || latent_dim != 512u ||
+        qk_rope != 64u) return;
+
+    const uint32_t end = pos0 + 1u;
+    const uint32_t visible = window ? min(end, window) : end;
+    const uint32_t first = end - visible;
+    const uint32_t key_dim = qk_nope + qk_rope;
+    const float *qh = q + (uint64_t)head * key_dim;
+    const float4 *low4 =
+        (const float4 *)(q_absorbed + (uint64_t)head * latent_dim);
+    const float4 low0 = low4[lane];
+    const float4 low1 = low4[lane + 32u];
+    const float4 low2 = low4[lane + 64u];
+    const float4 low3 = low4[lane + 96u];
+    float qrope[4] = {0.f, 0.f, 0.f, 0.f};
+    if (lane < 16u) {
+        qrope[0] = qh[qk_nope + lane * 4u + 0u];
+        qrope[1] = qh[qk_nope + lane * 4u + 1u];
+        qrope[2] = qh[qk_nope + lane * 4u + 2u];
+        qrope[3] = qh[qk_nope + lane * 4u + 3u];
+    }
+
+    float M = -FLT_MAX / 2.0f;
+    float S = 0.0f;
+    float4 o0 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+    for (uint32_t logical = first + warp; logical < end;
+         logical += kWarps) {
+        const uint32_t slot = window ? logical % cache_cap : logical;
+        if (slot >= cache_cap) continue;
+        const __nv_bfloat16 *kvrow =
+            latent_cache + (uint64_t)slot * latent_dim;
+        const uint32_t i0 = lane * 4u;
+        const uint32_t i1 = (lane + 32u) * 4u;
+        const uint32_t i2 = (lane + 64u) * 4u;
+        const uint32_t i3 = (lane + 96u) * 4u;
+#define M3_SPLIT_BF4(base) make_float4(                                      \
+            __bfloat162float(kvrow[(base) + 0u]),                            \
+            __bfloat162float(kvrow[(base) + 1u]),                            \
+            __bfloat162float(kvrow[(base) + 2u]),                            \
+            __bfloat162float(kvrow[(base) + 3u]))
+        const float4 k0 = M3_SPLIT_BF4(i0);
+        const float4 k1 = M3_SPLIT_BF4(i1);
+        const float4 k2 = M3_SPLIT_BF4(i2);
+        const float4 k3 = M3_SPLIT_BF4(i3);
+#undef M3_SPLIT_BF4
+        float partial =
+            low0.x*k0.x + low0.y*k0.y + low0.z*k0.z + low0.w*k0.w +
+            low1.x*k1.x + low1.y*k1.y + low1.z*k1.z + low1.w*k1.w +
+            low2.x*k2.x + low2.y*k2.y + low2.z*k2.z + low2.w*k2.w +
+            low3.x*k3.x + low3.y*k3.y + low3.z*k3.z + low3.w*k3.w;
+        if (lane < 16u) {
+            const __nv_bfloat16 *kp =
+                k_pe_cache + (uint64_t)slot * qk_rope + lane * 4u;
+            partial += qrope[0] * __bfloat162float(kp[0]) +
+                       qrope[1] * __bfloat162float(kp[1]) +
+                       qrope[2] * __bfloat162float(kp[2]) +
+                       qrope[3] * __bfloat162float(kp[3]);
+        }
+        for (uint32_t off = 16u; off > 0u; off >>= 1u)
+            partial += __shfl_xor_sync(0xffffffffu, partial, off);
+        const float score = partial * scale;
+        const float new_m = fmaxf(M, score);
+        const float old_scale = expf(M - new_m);
+        const float row_scale = expf(score - new_m);
+#define M3_SPLIT_ONLINE4(o, k) do {                                         \
+            (o).x = (o).x * old_scale + (k).x * row_scale;                   \
+            (o).y = (o).y * old_scale + (k).y * row_scale;                   \
+            (o).z = (o).z * old_scale + (k).z * row_scale;                   \
+            (o).w = (o).w * old_scale + (k).w * row_scale;                   \
+        } while (0)
+        M3_SPLIT_ONLINE4(o0, k0); M3_SPLIT_ONLINE4(o1, k1);
+        M3_SPLIT_ONLINE4(o2, k2); M3_SPLIT_ONLINE4(o3, k3);
+#undef M3_SPLIT_ONLINE4
+        S = S * old_scale + row_scale;
+        M = new_m;
+    }
+
+    __shared__ __align__(16) float partial_out[kWarps][512];
+    __shared__ float partial_m[kWarps];
+    __shared__ float partial_s[kWarps];
+    __shared__ float merge_weight[kWarps];
+    float4 *warp_out = (float4 *)partial_out[warp];
+    warp_out[lane] = o0;
+    warp_out[lane + 32u] = o1;
+    warp_out[lane + 64u] = o2;
+    warp_out[lane + 96u] = o3;
+    if (lane == 0u) {
+        partial_m[warp] = M;
+        partial_s[warp] = S;
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+        float merged_m = lane < kWarps ? partial_m[lane] : -FLT_MAX / 2.0f;
+        for (uint32_t off = 16u; off > 0u; off >>= 1u)
+            merged_m = fmaxf(merged_m,
+                             __shfl_down_sync(0xffffffffu, merged_m, off));
+        merged_m = __shfl_sync(0xffffffffu, merged_m, 0u);
+
+        float merged_s = 0.0f;
+        if (lane < kWarps) {
+            const float w = expf(partial_m[lane] - merged_m);
+            merge_weight[lane] = w;
+            merged_s = partial_s[lane] * w;
+        }
+        for (uint32_t off = 16u; off > 0u; off >>= 1u)
+            merged_s += __shfl_down_sync(0xffffffffu, merged_s, off);
+        merged_s = __shfl_sync(0xffffffffu, merged_s, 0u);
+        __syncwarp();
+
+        float4 merged[4] = {
+            make_float4(0.f, 0.f, 0.f, 0.f),
+            make_float4(0.f, 0.f, 0.f, 0.f),
+            make_float4(0.f, 0.f, 0.f, 0.f),
+            make_float4(0.f, 0.f, 0.f, 0.f),
+        };
+        for (uint32_t split = 0; split < kWarps; split++) {
+            const float w = merge_weight[split];
+            const float4 *src = (const float4 *)partial_out[split];
+            const float4 p0 = src[lane];
+            const float4 p1 = src[lane + 32u];
+            const float4 p2 = src[lane + 64u];
+            const float4 p3 = src[lane + 96u];
+#define M3_SPLIT_MERGE4(dst, src4) do {                                     \
+                (dst).x += (src4).x * w;                                    \
+                (dst).y += (src4).y * w;                                    \
+                (dst).z += (src4).z * w;                                    \
+                (dst).w += (src4).w * w;                                    \
+            } while (0)
+            M3_SPLIT_MERGE4(merged[0], p0);
+            M3_SPLIT_MERGE4(merged[1], p1);
+            M3_SPLIT_MERGE4(merged[2], p2);
+            M3_SPLIT_MERGE4(merged[3], p3);
+#undef M3_SPLIT_MERGE4
+        }
+        const float inv_s = merged_s > 0.0f ? 1.0f / merged_s : 0.0f;
+        float4 *dst = (float4 *)(out + (uint64_t)head * latent_dim);
+        for (uint32_t j = 0; j < 4u; j++) {
+            merged[j].x *= inv_s; merged[j].y *= inv_s;
+            merged[j].z *= inv_s; merged[j].w *= inv_s;
+        }
+        dst[lane] = merged[0];
+        dst[lane + 32u] = merged[1];
+        dst[lane + 64u] = merged[2];
+        dst[lane + 96u] = merged[3];
+    }
+}
+
+#define M3_ATTN_HG_HEADS 8u
+#define M3_ATTN_HG_ROWS  8u
+
+/* Long-context Motif decode, grouped by eight heads.  Unlike the per-head
+ * split above, each latent/K-RoPE row is converted from BF16 and staged once,
+ * then reused by all eight query heads.  The block emits one online-softmax
+ * partial per (head, context split); a fixed-order second kernel merges them. */
+__global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
+        float *partials,
+        const float *q, const float *q_absorbed,
+        const __nv_bfloat16 *latent_cache,
+        const __nv_bfloat16 *k_pe_cache,
+        uint32_t pos0, uint32_t cache_cap, uint32_t window,
+        uint32_t q_heads, uint32_t latent_dim,
+        uint32_t qk_nope, uint32_t qk_rope,
+        uint32_t split_count, float scale) {
+    __shared__ float latent_sm[M3_ATTN_HG_ROWS][512u + 4u];
+    __shared__ float k_pe_sm[M3_ATTN_HG_ROWS][64u + 4u];
+    __shared__ float prob_sm[M3_ATTN_HG_HEADS][M3_ATTN_HG_ROWS];
+    __shared__ float m_sm[M3_ATTN_HG_HEADS];
+    __shared__ float l_sm[M3_ATTN_HG_HEADS];
+    __shared__ float f_sm[M3_ATTN_HG_HEADS];
+
+    const uint32_t split = blockIdx.x;
+    const uint32_t head_group = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t head = head_group * M3_ATTN_HG_HEADS + warp;
+    if (split >= split_count || head >= q_heads || latent_dim != 512u ||
+        qk_rope != 64u) return;
+
+    const uint32_t end = pos0 + 1u;
+    const uint32_t visible = window ? min(end, window) : end;
+    const uint32_t first = end - visible;
+    const uint32_t chunk = (visible + split_count - 1u) / split_count;
+    const uint32_t lo = first + split * chunk;
+    const uint32_t hi = min(end, lo + chunk);
+    const uint32_t partial_stride = latent_dim + 2u;
+
+    float q_latent[16];
+    const float *qa = q_absorbed + (uint64_t)head * latent_dim;
+#pragma unroll
+    for (uint32_t k = 0; k < 16u; k++)
+        q_latent[k] = qa[lane + 32u * k];
+    const float *qh = q + (uint64_t)head * (qk_nope + qk_rope);
+    const float q_rope0 = qh[qk_nope + lane];
+    const float q_rope1 = qh[qk_nope + lane + 32u];
+
+    if (tid < M3_ATTN_HG_HEADS) {
+        m_sm[tid] = -INFINITY;
+        l_sm[tid] = 0.0f;
+    }
+    __syncthreads();
+    const uint32_t d0 = (tid * 2u) & 511u;
+    const uint32_t d1 = d0 + 1u;
+    float out0[M3_ATTN_HG_HEADS], out1[M3_ATTN_HG_HEADS];
+#pragma unroll
+    for (uint32_t h = 0; h < M3_ATTN_HG_HEADS; h++) {
+        out0[h] = 0.0f;
+        out1[h] = 0.0f;
+    }
+
+    for (uint32_t tile = lo; tile < hi; tile += M3_ATTN_HG_ROWS) {
+        const uint32_t nrows =
+            min((uint32_t)M3_ATTN_HG_ROWS, hi - tile);
+        for (uint32_t i4 = tid;
+             i4 < M3_ATTN_HG_ROWS * (latent_dim / 4u);
+             i4 += blockDim.x) {
+            const uint32_t row = i4 / (latent_dim / 4u);
+            const uint32_t dim = (i4 % (latent_dim / 4u)) * 4u;
+            float4 value = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (row < nrows) {
+                const uint32_t logical = tile + row;
+                const uint32_t slot = window ? logical % cache_cap : logical;
+                const __nv_bfloat16 *src =
+                    latent_cache + (uint64_t)slot * latent_dim + dim;
+                value = make_float4(
+                    __bfloat162float(src[0]), __bfloat162float(src[1]),
+                    __bfloat162float(src[2]), __bfloat162float(src[3]));
+            }
+            *(float4 *)&latent_sm[row][dim] = value;
+        }
+        for (uint32_t i4 = tid;
+             i4 < M3_ATTN_HG_ROWS * (qk_rope / 4u);
+             i4 += blockDim.x) {
+            const uint32_t row = i4 / (qk_rope / 4u);
+            const uint32_t dim = (i4 % (qk_rope / 4u)) * 4u;
+            float4 value = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (row < nrows) {
+                const uint32_t logical = tile + row;
+                const uint32_t slot = window ? logical % cache_cap : logical;
+                const __nv_bfloat16 *src =
+                    k_pe_cache + (uint64_t)slot * qk_rope + dim;
+                value = make_float4(
+                    __bfloat162float(src[0]), __bfloat162float(src[1]),
+                    __bfloat162float(src[2]), __bfloat162float(src[3]));
+            }
+            *(float4 *)&k_pe_sm[row][dim] = value;
+        }
+        __syncthreads();
+
+        float score[M3_ATTN_HG_ROWS];
+#pragma unroll
+        for (uint32_t row = 0; row < M3_ATTN_HG_ROWS; row++) {
+            float dot = 0.0f;
+#pragma unroll
+            for (uint32_t k = 0; k < 16u; k++)
+                dot = __fmaf_rn(q_latent[k],
+                                latent_sm[row][lane + 32u * k], dot);
+            dot = __fmaf_rn(q_rope0, k_pe_sm[row][lane], dot);
+            dot = __fmaf_rn(q_rope1, k_pe_sm[row][lane + 32u], dot);
+            for (uint32_t off = 16u; off > 0u; off >>= 1u)
+                dot += __shfl_down_sync(0xffffffffu, dot, off);
+            score[row] = dot * scale;
+        }
+        if (lane == 0u) {
+            float next_m = m_sm[warp];
+            for (uint32_t row = 0; row < nrows; row++)
+                next_m = fmaxf(next_m, score[row]);
+            const float rescale =
+                m_sm[warp] == -INFINITY ? 0.0f : expf(m_sm[warp] - next_m);
+            float add_l = 0.0f;
+#pragma unroll
+            for (uint32_t row = 0; row < M3_ATTN_HG_ROWS; row++) {
+                const float p = row < nrows ? expf(score[row] - next_m) : 0.0f;
+                prob_sm[warp][row] = p;
+                add_l += p;
+            }
+            m_sm[warp] = next_m;
+            l_sm[warp] = l_sm[warp] * rescale + add_l;
+            f_sm[warp] = rescale;
+        }
+        __syncthreads();
+
+        float value0[M3_ATTN_HG_ROWS], value1[M3_ATTN_HG_ROWS];
+#pragma unroll
+        for (uint32_t row = 0; row < M3_ATTN_HG_ROWS; row++) {
+            value0[row] = latent_sm[row][d0];
+            value1[row] = latent_sm[row][d1];
+        }
+#pragma unroll
+        for (uint32_t h = 0; h < M3_ATTN_HG_HEADS; h++) {
+            float a0 = out0[h] * f_sm[h];
+            float a1 = out1[h] * f_sm[h];
+#pragma unroll
+            for (uint32_t row = 0; row < M3_ATTN_HG_ROWS; row++) {
+                a0 = __fmaf_rn(prob_sm[h][row], value0[row], a0);
+                a1 = __fmaf_rn(prob_sm[h][row], value1[row], a1);
+            }
+            out0[h] = a0;
+            out1[h] = a1;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t h = 0; h < M3_ATTN_HG_HEADS; h++) {
+        const uint32_t global_head =
+            head_group * M3_ATTN_HG_HEADS + h;
+        float *dst = partials +
+            (uint64_t)(global_head * split_count + split) * partial_stride;
+        if (tid == 0u) {
+            dst[0] = m_sm[h];
+            dst[1] = l_sm[h];
+        }
+        dst[2u + d0] = out0[h];
+        dst[2u + d1] = out1[h];
+    }
+}
+
+__global__ static void motif3_latent_attention_bf16_decode_hg_combine_kernel(
+        float *out, const float *partials,
+        uint32_t q_heads, uint32_t latent_dim, uint32_t split_count) {
+    const uint32_t head = blockIdx.x;
+    if (head >= q_heads) return;
+    const uint32_t stride = latent_dim + 2u;
+    const float *base =
+        partials + (uint64_t)head * split_count * stride;
+    __shared__ float factor[16];
+    __shared__ float denom_sm;
+    if (threadIdx.x == 0u) {
+        float global_m = -INFINITY;
+        for (uint32_t split = 0; split < split_count; split++)
+            global_m = fmaxf(global_m, base[(uint64_t)split * stride]);
+        float denom = 0.0f;
+        for (uint32_t split = 0; split < split_count; split++) {
+            const float m = base[(uint64_t)split * stride];
+            const float f = m == -INFINITY ? 0.0f : expf(m - global_m);
+            factor[split] = f;
+            denom += f * base[(uint64_t)split * stride + 1u];
+        }
+        denom_sm = denom;
+    }
+    __syncthreads();
+    float *dst = out + (uint64_t)head * latent_dim;
+    for (uint32_t dim = threadIdx.x; dim < latent_dim; dim += blockDim.x) {
+        float value = 0.0f;
+        for (uint32_t split = 0; split < split_count; split++)
+            value += factor[split] *
+                base[(uint64_t)split * stride + 2u + dim];
+        dst[dim] = denom_sm > 0.0f ? value / denom_sm : 0.0f;
+    }
+}
+
+static uint32_t motif3_attention_decode_hg_split_count(uint32_t q_heads) {
+    const uint32_t groups = q_heads / M3_ATTN_HG_HEADS;
+    const uint32_t sm = g_cuda_sm_count > 0 ? (uint32_t)g_cuda_sm_count : 48u;
+    uint32_t split_count = (2u * sm + groups - 1u) / groups;
+    if (split_count < 4u) split_count = 4u;
+    if (split_count > 16u) split_count = 16u;
+    return split_count;
+}
+
 extern "C" int ds4_gpu_motif3_latent_attention_bf16_tensor(
         ds4_gpu_tensor *latent_out, const ds4_gpu_tensor *q_full,
         const ds4_gpu_tensor *q_absorbed,
@@ -31628,16 +32405,72 @@ extern "C" int ds4_gpu_motif3_latent_attention_bf16_tensor(
             (uint64_t)cache_cap * kv_latent_dim * cache_elem ||
         k_pe_cache->bytes <
             (uint64_t)cache_cap * qk_rope * cache_elem) return 0;
-    dim3 grid((q_heads + 7u) / 8u, rows, 1);
-    motif3_latent_attention_bf16_kernel<<<grid, 256>>>(
-            (float *)latent_out->ptr, (const float *)q_full->ptr,
-            (const float *)q_absorbed->ptr,
-            (const __nv_bfloat16 *)kv_latent_cache->ptr,
-            (const __nv_bfloat16 *)k_pe_cache->ptr,
-            rows, pos0, cache_cap, window, q_heads, kv_latent_dim,
-            qk_nope, qk_rope, scale);
+    static int decode_split = -1;
+    if (decode_split < 0) {
+        const char *env = getenv("DS4_MOTIF3_ATTN_SPLIT");
+        decode_split = (!env || strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    const uint32_t decode_visible =
+        rows == 1u ? (window ? min(pos0 + 1u, window) : pos0 + 1u) : 0u;
+    static int decode_hg = -1;
+    if (decode_hg < 0) {
+        const char *env = getenv("DS4_MOTIF3_ATTN_HG");
+        decode_hg = (!env || strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    if (decode_hg && rows == 1u && decode_visible >= 1024u &&
+        (q_heads % M3_ATTN_HG_HEADS) == 0u &&
+        g_attn_split_partials != NULL) {
+        const uint32_t split_count =
+            motif3_attention_decode_hg_split_count(q_heads);
+        const uint64_t partial_bytes =
+            (uint64_t)q_heads * split_count * (kv_latent_dim + 2u) *
+            sizeof(float);
+        if (partial_bytes <= g_attn_split_partials_bytes) {
+            dim3 partial_grid(split_count,
+                              q_heads / M3_ATTN_HG_HEADS, 1u);
+            motif3_latent_attention_bf16_decode_hg_partial_kernel
+                <<<partial_grid, 256>>>(
+                    g_attn_split_partials,
+                    (const float *)q_full->ptr,
+                    (const float *)q_absorbed->ptr,
+                    (const __nv_bfloat16 *)kv_latent_cache->ptr,
+                    (const __nv_bfloat16 *)k_pe_cache->ptr,
+                    pos0, cache_cap, window, q_heads, kv_latent_dim,
+                    qk_nope, qk_rope, split_count, scale);
+            if (!cuda_ok(cudaGetLastError(),
+                         "Motif-3 latent attention HG partial launch"))
+                return 0;
+            motif3_latent_attention_bf16_decode_hg_combine_kernel
+                <<<q_heads, 256>>>(
+                    (float *)latent_out->ptr, g_attn_split_partials,
+                    q_heads, kv_latent_dim, split_count);
+            return cuda_ok(cudaGetLastError(),
+                           "Motif-3 latent attention HG combine launch");
+        }
+    }
+    if (decode_split && rows == 1u && decode_visible >= 1024u) {
+        motif3_latent_attention_bf16_decode_split_kernel<<<q_heads, 256>>>(
+                (float *)latent_out->ptr, (const float *)q_full->ptr,
+                (const float *)q_absorbed->ptr,
+                (const __nv_bfloat16 *)kv_latent_cache->ptr,
+                (const __nv_bfloat16 *)k_pe_cache->ptr,
+                pos0, cache_cap, window, q_heads, kv_latent_dim,
+                qk_nope, qk_rope, scale);
+    } else {
+        dim3 grid((q_heads + 7u) / 8u, rows, 1);
+        motif3_latent_attention_bf16_kernel<<<grid, 256>>>(
+                (float *)latent_out->ptr, (const float *)q_full->ptr,
+                (const float *)q_absorbed->ptr,
+                (const __nv_bfloat16 *)kv_latent_cache->ptr,
+                (const __nv_bfloat16 *)k_pe_cache->ptr,
+                rows, pos0, cache_cap, window, q_heads, kv_latent_dim,
+                qk_nope, qk_rope, scale);
+    }
     return cuda_ok(cudaGetLastError(), "Motif-3 latent attention launch");
 }
+
+#undef M3_ATTN_HG_HEADS
+#undef M3_ATTN_HG_ROWS
 
 /* Q8_0 GGUF row dot: 34-byte blocks of one half scale + 32 int8 codes. */
 __device__ __forceinline__ static float motif3_q8_0_dot_row_dev(
@@ -31655,6 +32488,7 @@ __device__ __forceinline__ static float motif3_q8_0_dot_row_dev(
     }
     return acc;
 }
+
 
 __global__ static void motif3_value_project_q8_0_kernel(
         float *heads, const float *latent, const char *weight,
@@ -31681,6 +32515,45 @@ __global__ static void motif3_value_project_q8_0_kernel(
     }
 }
 
+/* Motif-3 W_UV using the value-row-transposed Q8 artifact.  For each Q8
+ * column block a warp reads adjacent value dimensions instead of 544-byte
+ * strided raw rows.  The b/k loop order and FP32 accumulation are identical
+ * to motif3_q8_0_dot_row_dev, so only the memory layout changes. */
+__global__ static void motif3_value_project_q8_0_transposed_kernel(
+        float *heads, const float *latent, const __half *scale,
+        const int8_t *code, uint32_t rows, uint32_t q_heads,
+        uint32_t group_size, uint32_t latent_dim, uint32_t value_dim) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (head >= q_heads || token >= rows) return;
+    extern __shared__ float xsh[];
+    const float *src = latent +
+        ((uint64_t)token * q_heads + head) * latent_dim;
+    for (uint32_t j = threadIdx.x; j < latent_dim; j += blockDim.x)
+        xsh[j] = src[j];
+    __syncthreads();
+
+    const uint32_t kv_head = head / group_size;
+    const uint32_t k_blocks = latent_dim >> 5;
+    float *dst = heads +
+        ((uint64_t)token * q_heads + head) * value_dim;
+    for (uint32_t d = threadIdx.x; d < value_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t b = 0; b < k_blocks; b++) {
+            const uint64_t hb = (uint64_t)kv_head * k_blocks + b;
+            const float dq = __half2float(scale[hb * value_dim + d]);
+            float s = 0.0f;
+            #pragma unroll 8
+            for (uint32_t k = 0; k < 32u; k++) {
+                s += (float)code[(hb * 32u + k) * value_dim + d] *
+                     xsh[b * 32u + k];
+            }
+            acc += dq * s;
+        }
+        dst[d] = acc;
+    }
+}
+
 extern "C" int ds4_gpu_motif3_value_project_q8_0_tensor(
         ds4_gpu_tensor *heads, const ds4_gpu_tensor *latent,
         const void *model_map, uint64_t model_size, uint64_t kv_b_offset,
@@ -31701,11 +32574,34 @@ extern "C" int ds4_gpu_motif3_value_project_q8_0_tensor(
         heads->bytes <
             (uint64_t)rows * q_heads * value_dim * sizeof(float)) return 0;
     const int tier = ds4_tensor_device_idx(heads);
+    constexpr uint64_t motif_scale_bytes = 16ull * 16ull * 128ull * 2ull;
+    constexpr uint64_t motif_code_bytes = 16ull * 16ull * 32ull * 128ull;
+    const bool motif_shape =
+        kv_heads == 16u && q_heads == 80u && group_size == 5u &&
+        kv_latent_dim == 512u && qk_nope == 128u && value_dim == 128u;
+    char *transposed = motif_shape
+        ? cuda_derived_weight_ptr(
+              model_map, kv_b_offset, weight_bytes,
+              CUDA_DERIVED_MOTIF3_KV_B_VALUE_Q8_0,
+              kv_latent_dim, weight_rows, 1u,
+              motif_scale_bytes + motif_code_bytes,
+              "Motif-3 latent V transposed Q8_0")
+        : NULL;
+    dim3 grid(q_heads, rows, 1);
+    if (transposed) {
+        motif3_value_project_q8_0_transposed_kernel
+            <<<grid, 128, (size_t)kv_latent_dim * sizeof(float)>>>(
+                (float *)heads->ptr, (const float *)latent->ptr,
+                (const __half *)transposed,
+                (const int8_t *)(transposed + motif_scale_bytes),
+                rows, q_heads, group_size, kv_latent_dim, value_dim);
+        return cuda_ok(cudaGetLastError(),
+                       "Motif-3 transposed latent V projection launch");
+    }
     const char *weight = cuda_resolve_weight_ptr(
             model_map, kv_b_offset, weight_bytes, tier,
             "Motif-3 latent V Q8_0");
     if (!weight) return 0;
-    dim3 grid(q_heads, rows, 1);
     motif3_value_project_q8_0_kernel<<<grid, 128,
         (size_t)kv_latent_dim * sizeof(float)>>>(
             (float *)heads->ptr, (const float *)latent->ptr, weight,
@@ -31758,6 +32654,98 @@ extern "C" int ds4_gpu_motif3_expanded_attention_window_tensor(
         uint32_t key_dim, uint32_t value_dim, float scale,
         bool causal, uint32_t window);
 
+extern "C" int ds4_gpu_motif3_expanded_attention_range_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *lse,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t n_query, uint32_t query_pos0,
+        uint32_t n_kv, uint32_t kv_pos0,
+        uint32_t q_heads, uint32_t kv_heads,
+        uint32_t key_dim, uint32_t value_dim, float scale) {
+    const uint64_t qn = (uint64_t)n_query * q_heads * key_dim;
+    const uint64_t kn = (uint64_t)n_kv * kv_heads * key_dim;
+    const uint64_t vn = (uint64_t)n_kv * kv_heads * value_dim;
+    const uint64_t on = (uint64_t)n_query * q_heads * value_dim;
+    const uint64_t ln = (uint64_t)n_query * q_heads;
+    if (!out || !q || !k || !v || n_query == 0 || n_kv == 0 ||
+        q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 ||
+        key_dim != 192u || value_dim != 128u || kv_pos0 > query_pos0 ||
+        out->bytes < on * sizeof(float) ||
+        (lse && lse->bytes < ln * sizeof(float)) ||
+        q->bytes < qn * sizeof(float) ||
+        k->bytes < kn * sizeof(float) ||
+        v->bytes < vn * sizeof(float)) return 0;
+    return ds4_mmq_motif3_prefill_attn_hmma(
+            (float *)out->ptr, lse ? (float *)lse->ptr : NULL,
+            (const float *)q->ptr, (const float *)k->ptr,
+            (const float *)v->ptr,
+            (int)n_query, (int)query_pos0, (int)n_kv, (int)kv_pos0,
+            (int)q_heads, (int)kv_heads, (int)key_dim, (int)value_dim,
+            scale, 0, ds4_current_stream()) == 0;
+}
+
+__global__ static void motif3_merge_attention_states_kernel(
+        float *attention, float *lse,
+        const float *prefix_attention, const float *prefix_lse,
+        uint32_t rows, uint32_t q_heads, uint32_t value_dim) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    if (row >= rows || head >= q_heads) return;
+    const uint64_t state = (uint64_t)row * q_heads + head;
+    __shared__ float suffix_weight;
+    __shared__ float prefix_weight;
+    __shared__ float merged_lse;
+    if (threadIdx.x == 0u) {
+        const float suffix_lse = lse[state];
+        const float prior_lse = prefix_lse[state];
+        const float m = fmaxf(suffix_lse, prior_lse);
+        if (isinf(m) && m < 0.0f) {
+            suffix_weight = 0.0f;
+            prefix_weight = 0.0f;
+            merged_lse = -INFINITY;
+        } else {
+            const float sw = expf(suffix_lse - m);
+            const float pw = expf(prior_lse - m);
+            const float inv = 1.0f / (sw + pw);
+            suffix_weight = sw * inv;
+            prefix_weight = pw * inv;
+            merged_lse = m + logf(sw + pw);
+        }
+    }
+    __syncthreads();
+    const uint64_t base = state * value_dim;
+    for (uint32_t d = threadIdx.x; d < value_dim; d += blockDim.x) {
+        attention[base + d] =
+            attention[base + d] * suffix_weight +
+            prefix_attention[base + d] * prefix_weight;
+    }
+    if (threadIdx.x == 0u) lse[state] = merged_lse;
+}
+
+extern "C" int ds4_gpu_motif3_merge_attention_states_tensor(
+        ds4_gpu_tensor *attention, ds4_gpu_tensor *lse,
+        const ds4_gpu_tensor *prefix_attention,
+        const ds4_gpu_tensor *prefix_lse,
+        uint32_t rows, uint32_t q_heads, uint32_t value_dim) {
+    const uint64_t states = (uint64_t)rows * q_heads;
+    const uint64_t values = states * value_dim;
+    if (!attention || !lse || !prefix_attention || !prefix_lse ||
+        rows == 0 || q_heads == 0 || value_dim == 0 ||
+        attention->bytes < values * sizeof(float) ||
+        prefix_attention->bytes < values * sizeof(float) ||
+        lse->bytes < states * sizeof(float) ||
+        prefix_lse->bytes < states * sizeof(float)) return 0;
+    dim3 grid(rows, q_heads, 1u);
+    const uint32_t threads = value_dim < 256u ? value_dim : 256u;
+    motif3_merge_attention_states_kernel<<<grid, threads>>>(
+            (float *)attention->ptr, (float *)lse->ptr,
+            (const float *)prefix_attention->ptr,
+            (const float *)prefix_lse->ptr,
+            rows, q_heads, value_dim);
+    return cuda_ok(cudaGetLastError(),
+                   "Motif-3 attention-state merge launch");
+}
+
 extern "C" int ds4_gpu_motif3_expanded_attention_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
@@ -31782,6 +32770,11 @@ extern "C" int ds4_gpu_motif3_expanded_attention_window_tensor(
         kv_heads == 0 || q_heads % kv_heads != 0 || key_dim == 0 || value_dim == 0 ||
         out->bytes < on * sizeof(float) || q->bytes < qn * sizeof(float) ||
         k->bytes < kn * sizeof(float) || v->bytes < vn * sizeof(float)) return 0;
+    if (causal && window == 0u && key_dim == 192u && value_dim == 128u) {
+        return ds4_gpu_motif3_expanded_attention_range_tensor(
+                out, NULL, q, k, v, rows, 0u, rows, 0u,
+                q_heads, kv_heads, key_dim, value_dim, scale);
+    }
     dim3 grid(rows, q_heads, 1);
     motif3_expanded_attention_kernel<<<grid, 1>>>(
             (float *)out->ptr, (const float *)q->ptr,

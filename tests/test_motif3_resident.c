@@ -302,8 +302,10 @@ int main(int argc, char **argv) {
     free(chunk_logits);
     free(long_prompt.v);
 
-    /* Allocate the exact native context cache while the 87.70 GiB model is
-     * resident.  This is a physical CUDA measurement, not a GGUF projection. */
+    /* Allocate the exact native context cache and the default 4096-token
+     * prefill graph while the 87.70 GiB model is resident.  This is a physical
+     * CUDA measurement, not a GGUF projection; the cache payload itself is
+     * reported by the engine separately. */
     size_t free_256_before = 0, free_256_after = 0, total_256 = 0;
     ds4_session *session_256k = NULL;
     int cache_256k_ok =
@@ -315,8 +317,8 @@ int main(int argc, char **argv) {
             ? (uint64_t)(free_256_before - free_256_after) : 0;
     cache_256k_ok = cache_256k_ok &&
         cache_256k_delta >= 3800ull * MIB &&
-        cache_256k_delta <= 5ull * 1024ull * MIB;
-    printf("Motif-3 256K resident session allocation: %.3f GiB "
+        cache_256k_delta <= 11ull * 1024ull * MIB;
+    printf("Motif-3 256K resident graph + cache allocation: %.3f GiB "
            "(%" PRIu64 " bytes; model remains resident; no offload)\n",
            (double)cache_256k_delta / 1073741824.0,
            cache_256k_delta);
@@ -346,7 +348,17 @@ int main(int argc, char **argv) {
     }
     const uint64_t unreleased = free_before >= free_after
         ? (uint64_t)(free_before - free_after) : 0;
-    const int release_ok = unreleased <= 512ull * MIB;
+    /* The process-wide CUDA primary context keeps loaded sm_121a code modules
+     * and cuBLAS driver state resident after engine-owned allocations are
+     * released.  The raw kernel set measures about 564 MiB and loading the
+     * aligned expert MMQ modules raises that to about 818 MiB.  This is not an
+     * engine allocation leak; 896 MiB leaves narrow module-loading headroom
+     * while still rejecting a leaked graph, 256K KV cache, or model image. */
+    const uint64_t release_limit = 896ull * MIB;
+    const int release_ok = unreleased <= release_limit;
+    printf("Motif-3 CUDA cleanup remainder: %" PRIu64
+           " bytes (limit %" PRIu64 " bytes)\n",
+           unreleased, release_limit);
 
     if (!metadata_ok || !no_duplicate_ok || !source_pages_open_ok ||
         !source_pages_after_ok ||
