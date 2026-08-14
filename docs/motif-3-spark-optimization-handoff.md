@@ -1,18 +1,19 @@
 # Motif-3 DGX Spark 최적화 작업 handoff
 
-기준 시각: **2026-08-14 12:25 KST** (재개 세션 진행 내역은 §0에 누적;
-후속 재개 결과는 §0.15까지 반영)
+기준 시각: **2026-08-14 16:55 KST** (재개 세션 진행 내역은 §0에 누적;
+후속 재개 결과는 §0.22까지 반영)
 
-상태: **§9.1–9.9 완료. 합성 BF16 projection 실패는 current full-copy보다
-같은 host 주소의 과거 range가 먼저 선택된 것이 원인이었고, 최소 resolver
-수정과 결정적 회귀 테스트로 해결했다(§0.12). CPU/server/Motif fixture,
-cuda-spark, synthetic long-context CUDA regression까지 통과했다. 코드 리뷰에서
-발견한 resident/long test의 v0.5.6.3 API 및 구식 full-copy 수명주기 충돌도
-VMM owner/import 계약으로 포트했다(§0.13). 전체 diff/warning review와 관련
-회귀 재실행도 완료했다(§0.14). 원본 네 commit의 v0.5.6.3 이식은
-`64c67a0`까지 완료했다(§0.15). 다음 단계는 메모리 preflight 뒤 VMM owner
-dry-run과 2K 실모델 gate다. 모델 프로세스·weight owner·서버는 아직
-실행하지 않았다.**
+상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
+K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
+Solar와 K-EXAONE은 2-bank continuous 요청, DeepSeek은 DSpark 자동 부착,
+Motif는 안전한 native serial session과 4개 API surface를 통과했다. Motif
+weight-owner의 기본 IQ2/Q2K aligned artifact를 384-expert 전용 경로에서 직접
+소비하도록 수정해 illegal access를 해소했고 실제 prefill/decode를 완료했다.
+현재 대형 프로세스는 모두 종료했으며 `clear_cache` 후 119 GiB available을
+확인했다. 최종 source/test/doc review와 CPU/CUDA 회귀를 완료했다.
+다음 단계는 `v0.5.6.3-dfm` Git publish, HF collection card 갱신,
+이후 nsys→ncu 기반 Motif 최적화와 strict 256K다.
+Spark 256K 통과 주장은 아직 금지다.**
 
 ## 0. 재개 세션 진행 내역 (2026-08-14, §9 순서 수행)
 
@@ -243,6 +244,95 @@ dry-run과 2K 실모델 gate다. 모델 프로세스·weight owner·서버는 �
       branch는 `upstream/batched-serving` 대비 ahead 4이고 소스 tracked
       worktree는 clean이다(생성 바이너리만 untracked).
 
+16. **통합 worktree 확정과 EXAONE 현행 serving 이식** —
+    - 실제 통합 경로를
+      `/home/sunghoon/workspace/ds4-exaone/ds4-model-families-v0563`, branch
+      `feature/model-families-v0563`로 확정했다.
+    - Motif v0.5.6.3 port 위에 Solar Open2 v0.5.6.3 라인을 merge하고,
+      K-EXAONE loader/tokenizer/chat/GPU graph를 model family로 편입했다.
+    - K-EXAONE은 Solar의 공통 continuous lifecycle을 따르되, LLLG KV는
+      bank별로 유지하고 prefill scratch와 weight-bound decode stage를 공유한다.
+      exact-frontier warm/fork, 2-row batched decode, 사전 메모리 fit을 연결했다.
+    - EXAONE durable bank payload는 wire layout이 없으므로 명시적으로
+      unavailable이며 DeepSeek walker로 잘못 직렬화하지 않는다.
+
+17. **Motif 실모델 VMM owner와 illegal-access root cause** —
+    - dry-run: logical 87.69 GiB, allocation 87.83 GiB, reserve 24 GiB,
+      free 약 119.31 GiB로 통과했다.
+    - 기본 owner는 raw 7.00 GiB + IQ2/Q2K aligned artifact 80.68 GiB,
+      207 POSIX FD로 ready가 됐다.
+    - 첫 worker는 layer 11에서 `ds4_mmq_iq2_xxs_moe_pair` illegal access.
+      `CUDA_LAUNCH_BLOCKING=1`로 raw expert pointer를 읽는 Motif 전용 MoE와,
+      raw tensor를 대체한 aligned manifest의 계약 충돌로 격리했다.
+    - IQ2/Q2K repack을 모두 끈 raw owner에서는 같은 모델이 prefill/decode를
+      통과해 모델/latent lifecycle 자체가 아니라 artifact dispatch 문제임을
+      확인했다.
+
+18. **Motif 384-expert aligned MoE 수정과 회귀** —
+    - `ds4_gpu_motif3_routed_moe_batch_tensor`가 runtime 384 experts로
+      `CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE`와
+      `CUDA_DERIVED_Q2_K_ALIGNED_MOE`를 resolve한다.
+    - gate/up은 `ds4_mmq_iq2_xxs_moe_pair_soa`, down은
+      `ds4_mmq_q2_K_moe_soa`를 직접 사용한다. aligned tile opt-out 시 기존
+      persistent derepack scratch, artifact가 없을 때 raw VMM range로 fallback한다.
+    - 기본 aligned owner에서 blocking/non-blocking 실제 prefill/decode를 모두
+      통과했고 로그로 `IQ2=1 Q2K=1 experts=384` engagement를 확인했다.
+    - Motif CUDA 6그룹, model-family kernel, EXAONE kernel, Solar KDA/chunk/KV/
+      output gate synthetic 회귀도 모두 통과했다.
+
+19. **남은 cross-family 잘못된 dispatch 차단** —
+    - Motif generate/session decode가 DeepSeek raw-SWA graph로 떨어지던 경로를
+      native public session과 latent decode로 연결했다.
+    - Motif는 전용 persistent bank가 생기기 전까지
+      `ds4_engine_supports_batching=false`로 두어 DeepSeek bank graph를 절대
+      할당하지 않고 server serial lane을 사용한다.
+    - DeepSeek 전용 graph/head/prompt/imatrix 진단은 family gate로 닫았다.
+    - MTP/DSpark가 Solar, K-EXAONE, Motif에 붙으면 engine open에서 즉시
+      명시적 오류를 내도록 했으며 실제 Motif+`DS4_DSPARK_MODEL` 거부를
+      exit 1로 확인했다.
+
+20. **네 모델 실모델 공통-command/API 회귀** —
+    - 공통 형식은
+      `DS4_CUDA_WEIGHT_IPC_MANIFEST=... ./ds4-server -m <GGUF> --cuda -c 2048`.
+      모델마다 바뀐 것은 GGUF와 해당 owner manifest뿐이다.
+    - DeepSeek V4 Flash: base 80.76 GiB + DSpark 6.49 GiB, aligned 72.56 GiB.
+      sibling DSpark 자동 부착, Chat 1건 완료/실패 0.
+    - Solar Open2: 11 shards 88.97 GiB, aligned IQ2 32.23 GiB. persistent
+      2 banks에서 동시 Chat 2건 모두 continuous, 실패 0.
+    - K-EXAONE: 3 shards 85.56 GiB, aligned IQ2 30.16 GiB. persistent
+      2 banks에서 동시 Chat 2건 모두 continuous, 실패 0.
+    - Motif-3: `/v1/models`, Chat, Completions, Responses, Anthropic Messages
+      각 1건 완료, 총 요청 실패 0, 종료 후 inflight 0. 현재 serial lane임을
+      `/v1/stats`로 확인했다.
+    - 위 값은 2K integration/lifecycle 증거이며 공개 성능 또는 long-context
+      결과로 사용하지 않는다.
+
+21. **메모리 정리와 Entrpi sync 확인** —
+    - 각 family 전환마다 worker→owner 순서로 Ctrl-C, PID/port 소멸,
+      `nvtop` compute process 0을 확인한 뒤 `/usr/local/bin/clear_cache`를
+      실행했다. 최종 `free -h`는 119 GiB available, swap 사용 약 737 MiB다.
+    - `git fetch upstream --tags --prune` 결과 Entrpi 최신 serving tag/branch는
+      계속 `v0.5.6.3`/`b9c97ad`; 통합 HEAD는
+      `upstream/batched-serving` 대비 behind 0이다.
+
+22. **publish 전 최종 source/test/doc review** —
+    - `git diff --check` 통과, conflict marker 0건. 생성 test binary는
+      untracked로 분리했고 source/doc만 stage 대상으로 확정했다.
+    - `make cpu`, `make cuda-spark`, server unit, model-family kernel,
+      Motif reference/loader/tokenizer/CUDA 6그룹, EXAONE kernel, Solar
+      KDA/prefill/chunk/gates/KV, `make cuda-regression`, quantizer build가
+      모두 통과했다. 남은 compiler warning은 clean Entrpi
+      `v0.5.6.3` baseline과 같다.
+    - `cuobjdump --list-elf` 기준 `ds4-server`/`ds4_weight_server`의
+      모든 cubin은 `sm_121a` 단일이다.
+    - 네 family의 다른 state/runtime은 직접 분기로 남기고
+      공통 wire contract만 공유했다. registry/plugin/graph-framework
+      추상화는 추가하지 않아 Entrpi/antirez 스타일과 후속
+      upstream PR 가능성을 보존했다.
+    - root README와 `docs/ds4-dfm-model-families.md`는 영어로 작성했고,
+      한국어는 사용자가 지정한
+      `DFM (독자 파운데이션 모델, 독파모)` 풀이에만 사용했다.
+
 남은 경계(사실로 기록):
 - 엔진 **static batch core**(`ds4_batch_generate_core`)는 여전히 per-seq
   eos 단일 비교 — 순수 코어에 vocab 접근이 없어 보류. 서버측 detok 절단이
@@ -287,7 +377,7 @@ Solar, Motif, EXAONE, GLM, DeepSeek 사이에서 바뀌는 것은 우선 GGUF �
 |---|---|
 | Mixed-Quant 모델 | `Baekpica/Motif-3-Mixed-Quant-GGUF` |
 | Mixed-Quant weight revision | `efd6044e25e7f8e3b459a737d021091e2e69b6c6` |
-| 양자화 | `MQ87-88-FIT`, 87.6957 GiB, 11 shards |
+| 양자화 | `MQ87-88-FIT`, 94.16 GB / 87.70 GiB, 11 shards |
 | 병합 GGUF | `/home/sunghoon/workspace/ds4-exaone/models/Motif-3-Mixed-Quant-GGUF/Motif-3-MQ87-88-FIT.gguf` |
 | 병합 GGUF 크기 | `94,162,541,472` bytes |
 | 병합 GGUF SHA-256 | `15755a735753bc1396e5ffa539e65a779a4fd769e8833360a4d743c4c60c2f25` |
@@ -298,7 +388,7 @@ Solar, Motif, EXAONE, GLM, DeepSeek 사이에서 바뀌는 것은 우선 GGUF �
 | 공식 vLLM 참고 구현 | `MotifTechnologies/vllm@4cd9eb4129883565e69d508038d783d59ee01867` |
 | private handoff | `hf://buckets/Baekpica/motif-3-spark-handoff` |
 
-로컬 private handoff는 145 files, 2,465,794,154 bytes다. 원격 전체 재다운로드 후 `manifests/SHA256SUMS`의 144개 항목이 모두 통과했고 private 상태 및 중복 GGUF 0개를 확인했다.
+로컬 private handoff는 145 files, 2,465,794,154 bytes다. 원격 전체 재다운로드 후 `manifests/SHA256SUMS`의 144개 항목이 모두 통과했고 private 상태 및 중복 GGUF 0개를 확인했다. 공개 카드의 decimal 크기는 `94.16 GB`로 표기하고 `87 GB` 또는 `88 GB`로 쓰지 않는다. binary 단위가 필요하면 `87.70 GiB`를 함께 쓴다.
 
 고정 revision의 weight를 Spark 작업 중 재양자화하거나 조용히 교체하지 않는다. 11개 원본 shard도 보존한다.
 
@@ -316,7 +406,7 @@ Spark에서 정확히 262,144-token prefill을 완료하고 실제 decode token�
 
 ## 4. 현재 호스트와 메모리 상태
 
-| 항목 | 2026-08-14 10:00 KST 현재 값 |
+| 항목 | 2026-08-14 16:55 KST 현재 값 |
 |---|---|
 | Host | `thinkstationpgx-8abc` |
 | Kernel | `6.17.0-1029-nvidia` |
@@ -325,7 +415,7 @@ Spark에서 정확히 262,144-token prefill을 완료하고 실제 decode token�
 | NVIDIA driver | `610.43.02` |
 | CUDA compiler | 13.3 |
 | Unified memory | 121 GiB total, 119 GiB available |
-| Swap | 15 GiB total, 0 used |
+| Swap | 15 GiB total, 약 737 MiB used |
 | Active model/weight server | 없음 |
 | tmux monitoring | `sunghoon` group에 `btop`과 `nvtop` pane 유지 |
 
@@ -381,8 +471,8 @@ feature/motif-3-model-loader@d878ea1a1d67bc0f0bd60e20e75b4a011aa2d8d9
 ### 실제 통합 worktree
 
 ```text
-/home/sunghoon/workspace/ds4-exaone/ds4-motif-3-v0563
-branch: feature/motif-3-v0563-port
+/home/sunghoon/workspace/ds4-exaone/ds4-model-families-v0563
+branch: feature/model-families-v0563
 base: b9c97adfb4a921096a4df24e672599067269a7e2 (v0.5.6.3)
 ```
 
@@ -395,7 +485,7 @@ upstream https://github.com/Entrpi/ds4.git
 
 향후 실제 최상위 upstream 검토 시 사용자가 지정한 `https://github.com/antirez/ds4`와의 관계를 명시적으로 정리한다. 현재 remote를 작업 도중 조용히 바꾸지 않는다.
 
-### 현재 cherry-pick 경계
+### 현재 통합 경계
 
 원본 네 commit은 v0.5.6.3 위에 다음 로컬 SHA로 모두 이식됐다.
 
@@ -406,9 +496,11 @@ ae0d3a2 Advertise Motif model ID from OpenAI server
 64c67a0 Preserve complete question in Motif 256K gate
 ```
 
-`CHERRY_PICK_HEAD`는 없고 branch는 base 대비 ahead 4다. conflict marker,
-staged/unstaged tracked 변경은 없다. 생성된 테스트/weight-server 바이너리는
-검증 산출물이므로 Git에 추가하지 않는다.
+이후 `6699c8a`에서 Solar Open2 v0.5.6.3 라인을 merge했고, K-EXAONE model
+family와 현행 common serving lifecycle commit이 그 위에 있다. `CHERRY_PICK_HEAD`는
+없다. 현재 최종 EXAONE persistent banks, Motif aligned-MoE/dispatch 수정,
+문서/version 변경은 publish 전 review를 위해 working tree에 있다. 생성된
+테스트/weight-server 바이너리는 검증 산출물이므로 Git에 추가하지 않는다.
 
 비교용 scratch worktree 두 개는 실제 산출물이 아니며 검토 후 제거했다.
 
@@ -458,6 +550,11 @@ clean v0.5.6.3 비교용 `scratch/ds4-v0563-baseline`만 upstream 회귀 판정
 fragment는 제거했고 DeepSeek/Motif의 작은 enum/switch 구조만 남겼다. GLM은
 추후 같은 dispatch에 독립 모델 패밀리로 추가한다.
 
+Solar와 K-EXAONE도 같은 `ds4-server`와 OpenAI Chat/Completions, Responses,
+Anthropic surface를 사용한다. Solar/K-EXAONE은 family-native persistent bank,
+DeepSeek은 upstream continuous graph, Motif는 native serial session으로 내부
+state lifecycle만 다르다. 외부 실행/HTTP 계약은 모델 경로만 바꾸는 형태다.
+
 ### 테스트 소스
 
 다음 테스트가 추가된 상태다.
@@ -473,8 +570,9 @@ tests/test_motif3_long.c
 
 새 v0.5.6.3 통합 worktree에서 CPU reference, CUDA primitive 6그룹,
 구조/loader, tokenizer/chat fixture가 모두 통과했다. resident/long binary도
-현행 API로 compile/link 및 manifest safety gate까지 확인했지만, full GGUF
-실행은 아직 하지 않았다.
+현행 API로 compile/link 및 manifest safety gate를 통과했다. 이후 §0.17–20의
+VMM owner/import로 full GGUF short prefill/decode와 공통 API까지 실행했다.
+32K 이상 resident/long gate는 아직 실행하지 않았다.
 
 ## 8. 일시 정지 시 빌드 상태 (2026-08-14 10:00 기준 — §0이 최신)
 
@@ -553,6 +651,7 @@ worker는 manifest import를 명시하고 같은 GGUF 경로를 사용한다.
 
 ```bash
 DS4_CUDA_WEIGHT_IPC_MANIFEST="$RUN/weights.manifest" \
+DS4_CUDA_WEIGHT_IPC_SCOPE=base \
 ./ds4-server -m "$MODEL" -c 2048 --host 0.0.0.0 --port 8001
 ```
 
@@ -584,7 +683,11 @@ DS4_CUDA_WEIGHT_IPC_MANIFEST="$RUN/weights.manifest" \
 - clocks 및 active process
 - correctness fixture/greedy token 결과
 
-잠재적인 속도 목표는 Solar Mixed-Quant와 납득 가능한 같은 order의 TTFM/prefill/decode다. 아직 Motif 실측치가 없으므로 구체적인 달성 숫자나 성능 향상을 미리 주장하지 않는다.
+잠재적인 속도 목표는 Solar Mixed-Quant와 납득 가능한 같은 order의 TTFM/prefill/decode다. 20-token 개발 gate에서 raw owner는 prefill 14.17 tok/s,
+decode 11.64 tok/s, aligned owner는 실행별 prefill 14.02–14.40 tok/s를 보였다.
+decode는 2–8 token 표본이라 9.12–15.50 tok/s로 분산이 커 기준점이나 공개
+성능으로 쓰지 않는다. nsys medium-prefill과 충분한 decode 표본 전에는
+구체적인 달성 숫자나 성능 향상을 주장하지 않는다.
 
 ## 12. nsys 사용 방식
 
@@ -704,16 +807,15 @@ Git과 HF 어느 쪽도 문서보다 먼저 갱신하지 않는다. model card�
 
 ## 17. 현재까지도 하지 않은 일
 
-- Git remote push (로컬 통합 commit은 완료)
-- Hugging Face upload
-- weight owner live allocation
-- inference worker 실행
-- `clear_cache` 재실행 (모델 프로세스를 하나도 띄우지 않았으므로 불필요)
+- 통합 branch/tag Git remote push
+- collection 전체 Hugging Face model-card 갱신
+- HF private handoff의 이번 재개 로그/문서 checkpoint
 - nsys/ncu profile
-- full-model correctness/benchmark (구조/fixture 테스트만 수행)
 - 32K 이상 Spark 실행
 - 256K 통과 주장
 
-다음 단계: §5의 `nvtop`+`btop`/PID/메모리 점검을 수행하고, §10의
-`ds4_weight_server --dry-run` preflight를 기록한다. 통과한 뒤에만 live VMM
-owner와 2K worker correctness/API gate로 넘어간다.
+완료된 항목은 VMM owner dry-run/live, raw/aligned Motif worker, 네 family
+공통-command 실제 API gate, 매 전환의 `clear_cache`, publish 전
+source/test/doc review다. 다음 단계는 Git publish와 영어 model-card
+갱신이다. 그 뒤 Motif
+owner를 다시 올려 §12의 nsys medium-prefill부터 재개한다.

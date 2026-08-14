@@ -20,6 +20,50 @@ This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
+## ds4-dfm
+
+This Baekpica release line extends the CUDA serving work in
+[Entrpi/ds4](https://github.com/Entrpi/ds4) with first-class model families for
+Korean **DFM (독자 파운데이션 모델, 독파모)** deployments. It is developed for
+serving very large GGUF models on one NVIDIA DGX Spark with 128 GB of unified
+memory. The implementation remains a narrow C/CUDA engine: every accepted
+architecture has an explicit metadata validator, tensor binder, prompt
+protocol, state lifecycle, and device kernel path.
+
+`v0.5.6.3-dfm` is based on Entrpi `v0.5.6.3` and currently integrates these
+deployed families:
+
+| Model family | GGUF architecture | Serving runtime |
+|---|---|---|
+| DeepSeek V4 Flash | `deepseek4` | Entrpi continuous-batch core; optional DSpark drafter |
+| Solar Open2 250B | `solar-open2` | Native recurrent/GQA persistent banks |
+| K-EXAONE 236B A23B | `exaone-moe` | Native LLLG persistent banks with shared prefill scratch |
+| Motif-3 | `motif3` | Native latent-KV session lane; multi-bank runtime not yet integrated |
+
+The serving command and HTTP contract do not change with the family; only the
+GGUF path and the matching weight-owner manifest change:
+
+```sh
+DS4_CUDA_WEIGHT_IPC_MANIFEST=/path/to/weights.manifest \
+DS4_CUDA_WEIGHT_IPC_SCOPE=base \
+./ds4-server -m /path/to/model-or-first-shard.gguf \
+  --cuda -c 131072 --host 0.0.0.0 --port 8001
+```
+
+The server exposes OpenAI Chat Completions, OpenAI Completions, OpenAI
+Responses, and Anthropic Messages at `/v1/chat/completions`,
+`/v1/completions`, `/v1/responses`, and `/v1/messages`. Model-specific
+tokenization, chat rendering, tool syntax, stop tokens, and recurrent/KV state
+stay behind this common surface. DeepSeek-only MTP and DSpark support models
+are rejected for the other families instead of entering an incompatible graph.
+
+All four families above have been loaded from their production mixed-quant
+GGUFs and exercised through the same server binary on the reference DGX Spark.
+That integration result is not a long-context claim: in particular, Motif-3
+has not yet passed a complete 262,144-token prefill followed by decode on the
+Spark. See [the DFM model-family guide](docs/ds4-dfm-model-families.md) for the
+weight-owner lifecycle, verified integration matrix, and current limits.
+
 ## About this fork: batched serving and a rebuilt CUDA engine
 
 This repository ([Entrpi/ds4](https://github.com/Entrpi/ds4)) is a fork of

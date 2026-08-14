@@ -5,6 +5,12 @@ generation surface supports TODAY, which serving lane executes it, and the
 known gaps. It is the frozen oracle for the API-promotion arc: later
 increments change routing and must update this file in the same commit.
 
+The wire contracts below are model-family neutral in `ds4-dfm`. DeepSeek uses
+the Entrpi continuous graph, Solar Open2 and K-EXAONE provide family-native
+persistent banks, and Motif-3 currently uses the serial native-session lane.
+Tokenizer, prompt/tool syntax, and stop-token handling are dispatched by the
+loaded model family without changing the endpoint schemas.
+
 DS4 serves four wire surfaces. "Surface" means a distinct wire contract
 (object types, stream events, ID scheme, finish mapping, error envelope),
 not an API vendor. OpenAI Chat and legacy Completions are different
