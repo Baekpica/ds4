@@ -502,6 +502,7 @@ typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK,
     SERVER_MODEL_SYNTAX_SOLAR_OPEN2,
     SERVER_MODEL_SYNTAX_MOTIF3,
+    SERVER_MODEL_SYNTAX_EXAONE,
 } server_model_syntax;
 
 typedef enum {
@@ -1093,7 +1094,8 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
 }
 
 static bool model_alias_disables_thinking(const char *model) {
-    return model && !strcmp(model, "deepseek-chat");
+    return model && (!strcmp(model, "deepseek-chat") ||
+                     !strcmp(model, "k-exaone-236b-a23b-chat"));
 }
 
 static bool model_alias_enables_thinking(const char *model) {
@@ -1103,20 +1105,22 @@ static bool model_alias_enables_thinking(const char *model) {
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_model_id(engine) == 2) return SERVER_MODEL_SYNTAX_SOLAR_OPEN2;
     if (ds4_engine_model_id(engine) == 3) return SERVER_MODEL_SYNTAX_MOTIF3;
+    if (ds4_engine_model_id(engine) == 4) return SERVER_MODEL_SYNTAX_EXAONE;
     return SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
 
 /* Family-aware generation stop.  ds4_token_is_stop is the engine's official
  * stop set (for DeepSeek exactly EOS; Motif-3 additionally stops on the
  * <|user|> and <|endofturn|> ids its generation_config pins).  The
- * think-control clause is Motif-only: in no-think mode a bare <think>/</think>
- * special token is turn drift, and ending the turn there keeps it out of
- * OpenAI content -- DeepSeek keeps upstream behavior (its think ids stream as
- * text). */
+ * think-control clause is for the turn-framed Motif/EXAONE families: in
+ * no-think mode a bare <think>/</think> special token is turn drift, and ending
+ * the turn there keeps it out of API content.  DeepSeek keeps upstream
+ * behavior (its think ids stream as text). */
 static bool server_token_ends_generation(ds4_engine *engine,
                                          const request *r, int token) {
     if (ds4_token_is_stop(engine, token)) return true;
-    return r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 &&
+    return (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
+            r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE) &&
            ds4_token_is_stop_for_think_mode(engine, token, r->think_mode);
 }
 
@@ -1124,6 +1128,7 @@ static const char *server_model_id_from_variant(int variant) {
     if (variant == 1) return "deepseek-v4-pro";
     if (variant == 2) return "solar-open2-250b";
     if (variant == 3) return "motif-3";
+    if (variant == 4) return "k-exaone-236b-a23b";
     return "deepseek-v4-flash";
 }
 
@@ -1137,7 +1142,11 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "deepseek-v4-pro") ||
             !strcmp(id, "solar-open2-250b") ||
             !strcmp(id, "motif-3") ||
-            !strcmp(id, "Motif-Technologies/Motif-3"));
+            !strcmp(id, "Motif-Technologies/Motif-3") ||
+            !strcmp(id, "k-exaone-236b-a23b") ||
+            !strcmp(id, "k-exaone-236b-a23b-chat") ||
+            !strcmp(id, "K-EXAONE-236B-A23B") ||
+            !strcmp(id, "LGAI-EXAONE/K-EXAONE-236B-A23B"));
 }
 
 /* A server knob may request partial warm reuse, but the model runtime is the
@@ -2801,6 +2810,66 @@ static void append_motif3_tool_calls_text(buf *out,
     }
 }
 
+static bool exaone_buf_put_trimmed(buf *out, const char *text) {
+    const char *begin = text ? text : "";
+    while (*begin && isspace((unsigned char)*begin)) begin++;
+    const char *end = begin + strlen(begin);
+    while (end > begin && isspace((unsigned char)end[-1])) end--;
+    buf_append(out, begin, (size_t)(end - begin));
+    return end > begin;
+}
+
+/* K-EXAONE uses the Hermes JSON body but its official template deliberately
+ * omits transport-only call ids from model input.  Preserve a sampled JSON
+ * body when available while canonicalizing the template-owned separator. */
+static void append_exaone_tool_calls_text(buf *out,
+                                          const tool_calls *calls,
+                                          bool content_before) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        const char *raw = calls->raw_tool_text;
+        while (*raw && isspace((unsigned char)*raw)) raw++;
+        if (content_before) buf_putc(out, '\n');
+        buf_puts(out, raw);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        if (content_before || i) buf_putc(out, '\n');
+        buf_puts(out, "<tool_call>{\"name\": ");
+        json_escape(out, tc->name ? tc->name : "");
+        buf_puts(out, ", \"arguments\": ");
+        buf_puts(out, tc->arguments && tc->arguments[0]
+                          ? tc->arguments : "null");
+        buf_puts(out, "}</tool_call>");
+    }
+}
+
+static void append_exaone_tools_declaration(buf *out,
+                                             const char *tool_schemas) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    buf_puts(out, "<|tool_declare|>\n# Tools\n");
+    const char *p = tool_schemas;
+    while (*p) {
+        json_ws(&p);
+        if (!*p) break;
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) {
+            buf_puts(out, "<tool>");
+            buf_puts(out, p);
+            buf_puts(out, "</tool>\n");
+            break;
+        }
+        char *schema = json_minify_raw_value(raw);
+        buf_puts(out, "<tool>");
+        buf_puts(out, schema ? schema : raw);
+        buf_puts(out, "</tool>\n");
+        free(schema);
+        free(raw);
+    }
+    buf_puts(out, "<|endofturn|>\n");
+}
+
 static void append_motif3_tools_system_text(
         buf *out, const char *tool_schemas,
         const tool_schema_orders *tool_orders) {
@@ -3037,6 +3106,75 @@ static void solar_collect_tool_result_message(const chat_msg *m,
         .len = m && m->content ? strlen(m->content) : 0,
         .id = chat_msg_tool_result_id_at(m, 0),
     });
+}
+
+static int render_exaone_tool_result_block(buf *out,
+                                            const chat_msgs *msgs,
+                                            int start) {
+    int end = start;
+    solar_tool_result_views views = {0};
+    while (msgs && end < msgs->len &&
+           chat_msg_is_model_tool_result(&msgs->v[end])) {
+        solar_collect_tool_result_message(&msgs->v[end], &views);
+        end++;
+    }
+
+    buf_puts(out, "<|tool|>\n");
+    for (int i = 0; i < views.len; i++) {
+        if (i) buf_putc(out, '\n');
+        buf_puts(out, "<tool_result>");
+        buf_append(out, views.v[i].text, views.v[i].len);
+        buf_puts(out, "</tool_result>");
+    }
+    buf_puts(out, "<|endofturn|>\n");
+    free(views.v);
+    return end;
+}
+
+/* Direct transcription of LGAI-EXAONE/K-EXAONE-236B-A23B's published
+ * chat_template.jinja.  Keep this family function concrete: the role framing
+ * differs from both Motif's start-of-turn protocol and Solar's im markers even
+ * though the generated tool-call JSON is Hermes-shaped. */
+static char *render_exaone_chat_prompt_text(
+        const chat_msgs *msgs, const char *tool_schemas,
+        ds4_think_mode think_mode) {
+    int last_user_idx = -1;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (!strcmp(msgs->v[i].role, "user") &&
+            !chat_msg_is_model_tool_result(&msgs->v[i]))
+            last_user_idx = i;
+    }
+
+    buf out = {0};
+    append_exaone_tools_declaration(&out, tool_schemas);
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (chat_msg_is_model_tool_result(m)) {
+            i = render_exaone_tool_result_block(&out, msgs, i) - 1;
+        } else if (role_is_system(m->role)) {
+            buf_puts(&out, "<|system|>\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|endofturn|>\n");
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<|user|>\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|endofturn|>\n");
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&out, "<|assistant|>\n<think>\n");
+            if (m->reasoning && m->reasoning[0] && i > last_user_idx)
+                exaone_buf_put_trimmed(&out, m->reasoning);
+            buf_puts(&out, "\n</think>\n\n");
+            const bool have_content =
+                exaone_buf_put_trimmed(&out, m->content);
+            append_exaone_tool_calls_text(&out, &m->calls, have_content);
+            buf_puts(&out, "<|endofturn|>\n");
+        }
+    }
+
+    buf_puts(&out, "<|assistant|>\n<think>\n");
+    if (!ds4_think_mode_enabled(think_mode))
+        buf_puts(&out, "\n</think>\n\n");
+    return buf_take(&out);
 }
 
 static void append_solar_tool_result_view(buf *out,
@@ -3330,6 +3468,25 @@ static char *render_motif3_live_tool_tail(
     return buf_take(&out);
 }
 
+static char *render_exaone_live_tool_tail(
+        const chat_msgs *msgs, int start,
+        ds4_think_mode think_mode) {
+    chat_msgs tail = {0};
+    if (msgs && start >= 0 && start < msgs->len) {
+        tail.v = msgs->v + start;
+        tail.len = msgs->len - start;
+        tail.cap = tail.len;
+    }
+    char *rendered = render_exaone_chat_prompt_text(&tail, NULL, think_mode);
+    buf out = {0};
+    /* <|endofturn|> is sampled as EOS and is therefore not evaluated into the
+     * live graph.  It is the first token of the continuation suffix. */
+    buf_puts(&out, "<|endofturn|>\n");
+    buf_puts(&out, rendered ? rendered : "");
+    free(rendered);
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_model(
         server_model_syntax syntax, const chat_msgs *msgs,
         const char *tool_schemas, const tool_schema_orders *tool_orders,
@@ -3339,6 +3496,8 @@ static char *render_chat_prompt_text_for_model(
         return render_motif3_chat_prompt_text(msgs, tool_schemas,
                                               tool_orders, think_mode);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_EXAONE)
+        return render_exaone_chat_prompt_text(msgs, tool_schemas, think_mode);
     return render_chat_prompt_text_choice_format(
         msgs, tool_schemas, tool_orders, think_mode, tool_choice, format);
 }
@@ -3361,6 +3520,8 @@ static char *render_live_tool_tail_for_model(
     (void)tool_orders;
     if (syntax == SERVER_MODEL_SYNTAX_MOTIF3)
         return render_motif3_live_tool_tail(msgs, start, think_mode);
+    if (syntax == SERVER_MODEL_SYNTAX_EXAONE)
+        return render_exaone_live_tool_tail(msgs, start, think_mode);
     return render_live_tool_tail_format(msgs, start, think_mode, format);
 }
 
@@ -3685,7 +3846,9 @@ static bool request_prepare_tool_choice(ds4_engine *e, request *r,
     ds4_tokenize_rendered_chat(e,
                                r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2
                                    ? DS4_SOLAR_TOOL_CALL_START
-                                   : "<｜DSML｜tool_calls>",
+                                   : r->chat_format == DS4_CHAT_FORMAT_EXAONE
+                                       ? "<tool_call>"
+                                       : "<｜DSML｜tool_calls>",
                                &r->required_tool_prefix);
     if (r->required_tool_prefix.len <= 0) {
         if (err && errlen)
@@ -3698,6 +3861,8 @@ static bool request_prepare_tool_choice(ds4_engine *e, request *r,
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    free(r->model);
+    r->model = xstrdup(server_model_id_from_engine(e));
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_messages = false;
@@ -3890,6 +4055,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
+    free(r->model);
+    r->model = xstrdup(server_model_id_from_engine(e));
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_messages = false;
@@ -4764,6 +4931,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
+    free(r->model);
+    r->model = xstrdup(server_model_id_from_engine(e));
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_input = false;
@@ -5049,6 +5218,8 @@ static bool parse_prompt(const char **p, char **out) {
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
+    free(r->model);
+    r->model = xstrdup(server_model_id_from_engine(e));
     r->model_syntax = server_model_syntax_for_engine(e);
     r->chat_format = ds4_engine_chat_format(e);
     const char *p = body;
@@ -5192,6 +5363,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     if (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
+        r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE ||
         r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
         /* Raw completion uses the loaded family's official chat protocol. */
         chat_msgs msgs = {0};
@@ -5362,9 +5534,11 @@ static const char *find_any_tool_start(const char *s) {
 
 static const char *find_tool_start_format(const char *s,
                                           ds4_chat_format format) {
-    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
-        ? (s ? strstr(s, DS4_SOLAR_TOOL_CALL_START) : NULL)
-        : find_any_tool_start(s ? s : "");
+    if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
+        return s ? strstr(s, DS4_SOLAR_TOOL_CALL_START) : NULL;
+    if (format == DS4_CHAT_FORMAT_EXAONE)
+        return s ? strstr(s, "<tool_call>") : NULL;
+    return find_any_tool_start(s ? s : "");
 }
 
 static const char *find_any_tool_end(const char *s) {
@@ -5383,9 +5557,11 @@ static const char *find_any_tool_end(const char *s) {
 
 static const char *find_tool_end_format(const char *s,
                                         ds4_chat_format format) {
-    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
-        ? (s ? strstr(s, DS4_SOLAR_TOOL_CALL_END) : NULL)
-        : find_any_tool_end(s ? s : "");
+    if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
+        return s ? strstr(s, DS4_SOLAR_TOOL_CALL_END) : NULL;
+    if (format == DS4_CHAT_FORMAT_EXAONE)
+        return s ? strstr(s, "</tool_call>") : NULL;
+    return find_any_tool_end(s ? s : "");
 }
 
 static void observe_tool_markers_format(const char *scan, bool *saw_start,
@@ -6003,7 +6179,7 @@ static bool parse_generated_message_ex_format(
     }
 }
 
-static bool parse_motif3_tool_call_json(const char *json, tool_call *tc) {
+static bool parse_hermes_tool_call_json(const char *json, tool_call *tc) {
     const char *p = json ? json : "";
     json_ws(&p);
     if (*p != '{') return false;
@@ -6053,10 +6229,11 @@ bad:
     return false;
 }
 
-/* Official Motif-3 emits one compact JSON object per <tool_call> wrapper.
- * Keep the exact sampled wrapper for cache replay while returning structured
- * OpenAI/Responses/Anthropic calls to clients. */
-static bool parse_motif3_generated_message_ex(const char *text,
+/* Motif-3 and K-EXAONE emit one JSON object per <tool_call> wrapper.  Their
+ * role framing differs, but the generated Hermes call body is the same.  Keep
+ * the exact sampled wrapper for cache replay while returning structured calls
+ * to every public API surface. */
+static bool parse_hermes_generated_message_ex(const char *text,
                                               bool require_thinking_closed,
                                               char **content_out,
                                               char **reasoning_out,
@@ -6073,7 +6250,7 @@ static bool parse_motif3_generated_message_ex(const char *text,
             if (!candidate || !strstr(candidate, tool_end)) {
                 fprintf(stderr,
                         "ds4-server: thinking not closed, ignoring incomplete "
-                        "Motif-3 tool call in reasoning\n");
+                        "Hermes tool call in reasoning\n");
                 ds4_local_unterminated_reasoning(text,
                                                   content_out, reasoning_out);
                 return true;
@@ -6103,7 +6280,7 @@ static bool parse_motif3_generated_message_ex(const char *text,
         if (!close) return false;
         char *json = xstrndup(p, (size_t)(close - p));
         tool_call tc = {0};
-        const bool ok = parse_motif3_tool_call_json(json, &tc);
+        const bool ok = parse_hermes_tool_call_json(json, &tc);
         free(json);
         if (!ok) return false;
         tool_calls_push(calls, tc);
@@ -6128,8 +6305,9 @@ static bool parse_generated_message_ex_for_model(
         bool require_thinking_closed, ds4_chat_format format,
         const tool_schema_orders *orders, char **content_out,
         char **reasoning_out, tool_calls *calls) {
-    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
-        return parse_motif3_generated_message_ex(
+    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
+        syntax == SERVER_MODEL_SYNTAX_EXAONE) {
+        return parse_hermes_generated_message_ex(
             text, require_thinking_closed, content_out, reasoning_out, calls);
     }
     return parse_generated_message_ex_format(
@@ -6277,9 +6455,10 @@ static bool try_repair_solar_tool_call(const char *s, size_t len, buf *out) {
 
 static bool try_repair_tool_call_format(const char *s, size_t len,
                                         ds4_chat_format format, buf *out) {
-    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
-        ? try_repair_solar_tool_call(s, len, out)
-        : try_repair_dsml(s, len, out);
+    if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
+        return try_repair_solar_tool_call(s, len, out);
+    if (format == DS4_CHAT_FORMAT_EXAONE) return false;
+    return try_repair_dsml(s, len, out);
 }
 
 static bool tool_call_format_has_repairable_truncation(
@@ -12967,9 +13146,16 @@ static size_t tool_marker_stream_safe_len(const char *text, size_t len,
         DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT, "<tool_call>"
     };
     const char *const solar_marks[1] = {DS4_SOLAR_TOOL_CALL_START};
-    const char *const *marks = format == DS4_CHAT_FORMAT_SOLAR_OPEN2
-        ? solar_marks : dsml_marks;
-    const int nmarks = format == DS4_CHAT_FORMAT_SOLAR_OPEN2 ? 1 : 3;
+    const char *const exaone_marks[1] = {"<tool_call>"};
+    const char *const *marks = dsml_marks;
+    int nmarks = 3;
+    if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
+        marks = solar_marks;
+        nmarks = 1;
+    } else if (format == DS4_CHAT_FORMAT_EXAONE) {
+        marks = exaone_marks;
+        nmarks = 1;
+    }
     if (!text || !len) return len;
     size_t safe = len;
     for (int m = 0; m < nmarks; m++) {
@@ -13378,12 +13564,23 @@ static void send_prefill_failure_response(server *s, const job *j,
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     buf suffix = {0};
+    const server_model_syntax syntax =
+        r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    if (syntax == SERVER_MODEL_SYNTAX_EXAONE) {
+        if (ds4_think_mode_enabled(r->think_mode)) {
+            exaone_buf_put_trimmed(&suffix, reasoning);
+            buf_puts(&suffix, "\n</think>\n\n");
+        }
+        const bool have_content = exaone_buf_put_trimmed(&suffix, content);
+        append_exaone_tool_calls_text(&suffix, calls, have_content);
+        buf_puts(&suffix, "<|endofturn|>\n");
+        return buf_take(&suffix);
+    }
     if (ds4_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
         buf_puts(&suffix, chat_think_end(r->chat_format));
     }
     buf_puts(&suffix, content ? content : "");
-    const server_model_syntax syntax = r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
     if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
         append_motif3_tool_calls_text(&suffix, calls, true);
         buf_puts(&suffix, "<|endofturn|>");
@@ -13405,6 +13602,19 @@ static char *build_responses_visible_assistant_suffix(const request *r,
                                                       const char *reasoning,
                                                       const tool_calls *calls) {
     buf suffix = {0};
+    const server_model_syntax syntax =
+        r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    if (syntax == SERVER_MODEL_SYNTAX_EXAONE) {
+        if (ds4_think_mode_enabled(r->think_mode)) {
+            if (r->reasoning_summary_emit && calls && calls->len > 0)
+                exaone_buf_put_trimmed(&suffix, reasoning);
+            buf_puts(&suffix, "\n</think>\n\n");
+        }
+        const bool have_content = exaone_buf_put_trimmed(&suffix, content);
+        append_exaone_tool_calls_text(&suffix, calls, have_content);
+        buf_puts(&suffix, "<|endofturn|>\n");
+        return buf_take(&suffix);
+    }
     /* This suffix mirrors what a Responses client can replay, not necessarily
      * every token in KV.  Hidden reasoning stays live in the session unless the
      * next client replay is expected to include it.  In practice, pi replays
@@ -13420,7 +13630,6 @@ static char *build_responses_visible_assistant_suffix(const request *r,
         buf_puts(&suffix, chat_think_end(r->chat_format));
     }
     buf_puts(&suffix, content ? content : "");
-    const server_model_syntax syntax = r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
     if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
         append_motif3_tool_calls_text(&suffix, calls, true);
         buf_puts(&suffix, "<|endofturn|>");
@@ -13444,6 +13653,7 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  *
  *   DSML:  prompt-without-final-<think> + </think> + visible-content + eos
  *   Solar: prompt-with-<|think:start|> + <|think:end|> + content + eos
+ *   EXAONE: prompt-with-<think> newline + empty reasoning close + content + eos
  *
  * is exactly the visible prefix that render_chat_prompt_text() will produce on
  * the next turn.  Do not rebuild the KV cache to erase hidden reasoning here:
@@ -13458,6 +13668,22 @@ static char *build_toolless_thinking_visible_prefix(const request *r,
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE) {
+        static const char generation_prefix[] = "<think>\n";
+        const size_t prefix_len = sizeof(generation_prefix) - 1;
+        if (pt_len < prefix_len ||
+            memcmp(r->prompt_text + pt_len - prefix_len,
+                   generation_prefix, prefix_len) != 0)
+            return NULL;
+
+        buf visible = {0};
+        buf_puts(&visible, r->prompt_text);
+        buf_puts(&visible, "\n</think>\n\n");
+        exaone_buf_put_trimmed(&visible, content);
+        if (terminal) buf_puts(&visible, "<|endofturn|>\n");
+        return buf_take(&visible);
+    }
+
     const char *think_tag = chat_think_start(r->chat_format);
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
@@ -14431,6 +14657,7 @@ decode_again:
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         j->req.model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 &&
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_EXAONE &&
         acc.saw_tool_start &&
         (!acc.saw_tool_end || tool_call_format_has_repairable_truncation(
                                   acc.text.ptr, acc.text.len,
@@ -14575,7 +14802,9 @@ decode_again:
              * reminder so it owns the corrected next action.  #13: a length
              * finish means the budget cut the call; recovery would decode
              * past max_tokens, so fall through to the raw-text fallback. */
-            if (!j->req.stream && !dsml_recovery_attempted &&
+            if (j->req.model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 &&
+                j->req.model_syntax != SERVER_MODEL_SYNTAX_EXAONE &&
+                !j->req.stream && !dsml_recovery_attempted &&
                 strcmp(final_finish, "length") != 0) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
@@ -17121,12 +17350,14 @@ static bool cont_stream_requires_partial_rewind(const job *j) {
 }
 
 /* A1: does this row need host-side text (stream projection or stop/tool scan)?
- * Motif no-think rows join so the think-control stop below finalizes from the
- * accumulator (clean text + verdict) instead of the raw engine buffer. */
+ * Motif/EXAONE no-think rows join so the think-control stop below finalizes
+ * from the accumulator (clean text + verdict) instead of the raw engine
+ * buffer. */
 static bool cont_needs_text(const request *r) {
     return r->stream || r->stops.len > 0 ||
            request_needs_cont_semantics(r) ||
-           (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 &&
+           ((r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
+             r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE) &&
             !ds4_think_mode_enabled(r->think_mode));
 }
 
@@ -17326,6 +17557,7 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
                               tool_calls *calls) {
     if (j->req.has_tools &&
         j->req.model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 &&
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_EXAONE &&
         st->acc.saw_tool_start &&
         (!st->acc.saw_tool_end || tool_call_format_has_repairable_truncation(
                                       st->acc.text.ptr, st->acc.text.len,
@@ -17588,11 +17820,12 @@ static int cont_on_token(void *ud, void *user, int token) {
     t_emit_job = j;                            /* W8a: send_all -> j->out (off the GPU path) */
     if (j->req.stream && !st->started) cont_stream_start(s, j); /* first token: headers + role preamble */
     if (st->failed || j->client_gone) { t_emit_job = NULL; return 0; }
-    /* Motif no-think: a bare think-control token ends the turn before it can
-     * reach the accumulator or the wire (parity with the serial driver's
-     * server_token_ends_generation).  Engine-level stop ids never get here --
-     * the cont core retires them as EOS. */
-    if (j->req.model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 &&
+    /* Motif/EXAONE no-think: a bare think-control token ends the turn before
+     * it can reach the accumulator or the wire (parity with the serial
+     * driver's server_token_ends_generation).  Engine-level stop ids never
+     * get here -- the cont core retires them as EOS. */
+    if ((j->req.model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
+         j->req.model_syntax == SERVER_MODEL_SYNTAX_EXAONE) &&
         ds4_token_is_stop_for_think_mode(s->engine, token, j->req.think_mode)) {
         if (!st->acc.verdict) st->acc.verdict = "stop";
         t_emit_job = NULL;
@@ -22091,6 +22324,8 @@ static void test_model_family_aliases(void) {
     TEST_ASSERT(server_model_alias_known("deepseek-v4-pro"));
     TEST_ASSERT(server_model_alias_known("motif-3"));
     TEST_ASSERT(server_model_alias_known("Motif-Technologies/Motif-3"));
+    TEST_ASSERT(server_model_alias_known("k-exaone-236b-a23b"));
+    TEST_ASSERT(server_model_alias_known("LGAI-EXAONE/K-EXAONE-236B-A23B"));
     TEST_ASSERT(!server_model_alias_known("glm-5.2"));
 }
 
@@ -22299,6 +22534,169 @@ static void test_render_motif3_chat_prompt_text(void) {
     free(prompt);
     chat_msgs_free(&msgs);
 }
+
+static void test_render_exaone_chat_prompt_text(void) {
+    const server_model_syntax exaone = SERVER_MODEL_SYNTAX_EXAONE;
+    chat_msgs msgs = {0};
+    chat_msg sys = {.role = xstrdup("system"),
+                    .content = xstrdup("You are precise.")};
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("Hello")};
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        exaone, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|system|>\nYou are precise.<|endofturn|>\n"
+        "<|user|>\nHello<|endofturn|>\n"
+        "<|assistant|>\n<think>\n"));
+    free(prompt);
+
+    prompt = render_chat_prompt_text_for_syntax(
+        exaone, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|system|>\nYou are precise.<|endofturn|>\n"
+        "<|user|>\nHello<|endofturn|>\n"
+        "<|assistant|>\n<think>\n\n</think>\n\n"));
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_exaone_tool_protocol(void) {
+    const server_model_syntax exaone = SERVER_MODEL_SYNTAX_EXAONE;
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"),
+                     .content = xstrdup("Weather?")};
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {.role = xstrdup("assistant"),
+                          .reasoning = xstrdup("  need weather  "),
+                          .content = xstrdup("")};
+    tool_call tc = {.id = xstrdup("call_weather_1"),
+                    .name = xstrdup("get_weather"),
+                    .arguments = xstrdup("{\"city\":\"Seoul\"}")};
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg result = {.role = xstrdup("tool"),
+                       .tool_call_id = xstrdup("call_weather_1"),
+                       .content = xstrdup("sunny")};
+    chat_msgs_push(&msgs, result);
+    /* Anthropic tool_result blocks are internally carried by a user message;
+     * EXAONE must still render them as the same native tool turn. */
+    chat_msg anthropic_result = {
+        .role = xstrdup("user"),
+        .tool_call_id = xstrdup("call_weather_1"),
+        .content = xstrdup("<tool_result>23 C</tool_result>"),
+    };
+    chat_msgs_push(&msgs, anthropic_result);
+
+    const char *schemas =
+        "{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\"}}";
+    char *prompt = render_chat_prompt_text_for_syntax(
+        exaone, &msgs, schemas, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|tool_declare|>\n# Tools\n"
+        "<tool>{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\"}}</tool>\n"
+        "<|endofturn|>\n"
+        "<|user|>\nWeather?<|endofturn|>\n"
+        "<|assistant|>\n<think>\nneed weather\n</think>\n\n"
+        "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\":\"Seoul\"}}</tool_call>"
+        "<|endofturn|>\n"
+        "<|tool|>\n<tool_result>sunny</tool_result>\n"
+        "<tool_result>23 C</tool_result><|endofturn|>\n"
+        "<|assistant|>\n<think>\n"));
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    const char *generated =
+        "<think>need weather</think>\n\n"
+        "<tool_call>{\"name\":\"get_weather\",\"arguments\":"
+        "{\"city\":\"Seoul\"}}</tool_call>\n"
+        "<tool_call>{\"name\":\"get_time\",\"arguments\":{}}</tool_call>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        exaone, generated, true, &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "need weather"));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(calls.len == 2);
+    TEST_ASSERT(calls.v[0].name &&
+                !strcmp(calls.v[0].name, "get_weather"));
+    TEST_ASSERT(calls.v[0].arguments &&
+                !strcmp(calls.v[0].arguments, "{\"city\":\"Seoul\"}"));
+    TEST_ASSERT(calls.v[1].name && !strcmp(calls.v[1].name, "get_time"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_exaone_continuation_and_marker_contract(void) {
+    tool_calls calls = {0};
+    tool_call tc = {.name = xstrdup("get_weather"),
+                    .arguments = xstrdup("{\"city\":\"Seoul\"}")};
+    tool_calls_push(&calls, tc);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_EXAONE;
+    r.chat_format = DS4_CHAT_FORMAT_EXAONE;
+    r.think_mode = DS4_THINK_HIGH;
+    char *suffix = build_tool_checkpoint_suffix(
+        &r, "", "  need weather  ", &calls);
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(!strcmp(suffix,
+        "need weather\n</think>\n\n"
+        "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\":\"Seoul\"}}</tool_call>"
+        "<|endofturn|>\n"));
+    free(suffix);
+
+    chat_msgs tail_msgs = {0};
+    chat_msg result = {.role = xstrdup("tool"),
+                       .tool_call_id = xstrdup("call_weather_1"),
+                       .content = xstrdup("sunny")};
+    chat_msgs_push(&tail_msgs, result);
+    char *tail = render_exaone_live_tool_tail(
+        &tail_msgs, 0, DS4_THINK_HIGH);
+    TEST_ASSERT(tail != NULL);
+    TEST_ASSERT(!strcmp(tail,
+        "<|endofturn|>\n"
+        "<|tool|>\n<tool_result>sunny</tool_result><|endofturn|>\n"
+        "<|assistant|>\n<think>\n"));
+    free(tail);
+    chat_msgs_free(&tail_msgs);
+
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_NONE;
+    sem_accum acc;
+    sem_accum_init(&acc, &r);
+    sem_feed feed = sem_accum_feed(
+        &acc, &r,
+        "<tool_call>{\"name\":\"get_weather\",\"arguments\":{}}",
+        strlen("<tool_call>{\"name\":\"get_weather\",\"arguments\":{}}"));
+    TEST_ASSERT(feed.entered_tool_block && acc.saw_tool_start);
+    feed = sem_accum_feed(&acc, &r, "</tool_call>", 12);
+    TEST_ASSERT(feed.tool_block_closed && acc.saw_tool_end);
+    /* A Hermes close ends one call, not necessarily the whole turn: allow a
+     * second official call before the model emits <|endofturn|>. */
+    TEST_ASSERT(acc.verdict == NULL);
+    sem_accum_free(&acc);
+
+    r.has_tools = false;
+    sem_accum_init(&acc, &r);
+    feed = sem_accum_feed(&acc, &r, "answer", 6);
+    TEST_ASSERT(!feed.hit_stop);
+    feed = sem_accum_feed(&acc, &r, "<tool_call>", 11);
+    TEST_ASSERT(feed.hit_stop && feed.tool_syntax_cut);
+    TEST_ASSERT(acc.text.ptr && !strcmp(acc.text.ptr, "answer"));
+    sem_accum_free(&acc);
+
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
 static void test_dsml_tool_args_preserve_call_order(void) {
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
@@ -22814,6 +23212,7 @@ static void test_no_tools_unclosed_thinking_uses_reasoning_channel(void) {
     } cases[] = {
         { DS4_CHAT_FORMAT_DSML, "unfinished DSML reasoning" },
         { DS4_CHAT_FORMAT_SOLAR_OPEN2, "unfinished Solar reasoning" },
+        { DS4_CHAT_FORMAT_EXAONE, "unfinished EXAONE reasoning" },
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -24583,8 +24982,11 @@ static void test_server_model_ids_cover_loaded_variants(void) {
     TEST_ASSERT(!strcmp(server_model_id_from_variant(1), "deepseek-v4-pro"));
     TEST_ASSERT(!strcmp(server_model_id_from_variant(2), "solar-open2-250b"));
     TEST_ASSERT(!strcmp(server_model_id_from_variant(3), "motif-3"));
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(4),
+                        "k-exaone-236b-a23b"));
     TEST_ASSERT(server_model_alias_known("solar-open2-250b"));
     TEST_ASSERT(server_model_alias_known("motif-3"));
+    TEST_ASSERT(server_model_alias_known("K-EXAONE-236B-A23B"));
 }
 
 static void test_partial_warm_policy_requires_runtime_support(void) {
@@ -28758,6 +29160,9 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_motif3_chat_prompt_text();
+    test_render_exaone_chat_prompt_text();
+    test_exaone_tool_protocol();
+    test_exaone_continuation_and_marker_contract();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();

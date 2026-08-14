@@ -48892,9 +48892,11 @@ const char *ds4_engine_model_name(ds4_engine *e) {
 
 ds4_chat_format ds4_engine_chat_format(ds4_engine *e) {
     (void)e;
-    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2
-        ? DS4_CHAT_FORMAT_SOLAR_OPEN2
-        : DS4_CHAT_FORMAT_DSML;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2)
+        return DS4_CHAT_FORMAT_SOLAR_OPEN2;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE)
+        return DS4_CHAT_FORMAT_EXAONE;
+    return DS4_CHAT_FORMAT_DSML;
 }
 
 int ds4_engine_layer_count(ds4_engine *e) {
