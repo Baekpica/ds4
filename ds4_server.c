@@ -13818,8 +13818,39 @@ static bool serial_session_ensure_fit(server *s, job *j) {
         }
         target = lo;
     }
+    /* memgov D2-4 (S6): the composite OWNER SWAP, after the actors (free +
+     * probe + reclaim trim + binary search) exactly as D2-3's -- the quote
+     * must see the POST-TRIM box, or it would refuse requests reclaim can
+     * serve (the receipt's pause-point hazard; serial_reclaim_gate is this
+     * lane's oracle).  One check per attempt on the composite verdict:
+     * observe returns legacy verbatim; enforce lets the quote gate the
+     * CREATE.  The probe's own refusal (target==0) is PHYSICAL truth the
+     * quote cannot override (scoping sec 4: the probe keeps deciding fit
+     * within an admitted attempt) -- that comparison is counted, the
+     * refusal stands.  "Deterministic deficits reject before work" needs
+     * the D4 structured-deficit quote (no class caps exist on this lane
+     * yet); recorded, not simulated.
+     * MARGIN, NOT FLOOR (the D2-2b pattern): the lane's legacy protection
+     * is the fit probe's own headroom -- the reclaim charter serves from
+     * the commons INSIDE the operator-floor band rather than 503ing
+     * beside idle cache (live-verified: leg A serves at 7.09 GiB free
+     * with a 5.46 GiB graph; a floor-term quote refused it, deficit 2.37
+     * GiB -- the one DISAGREE of the 08-14 re-stamp).  With the margin,
+     * quote and probe evaluate the SAME inequality and diverge only on
+     * real cross-lane ledger terms. */
+    const int legacy_v = target > 0 ? DS4_GOV_ADMIT : DS4_GOV_REFUSE_LIVE;
+    ds4_gov_claim scl = {0};
+    scl.requester = DS4_GOVC_SERIAL_SESSION;
+    scl.memc = DS4_MEMC_SESSION_TENSORS;
+    scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    scl.proposed_outstanding = ds4_engine_session_graph_bytes_estimate(
+        s->engine, (int)(target > 0 ? target : need_min));
+    const int final_v = ds4_gov_governed_check_margin(
+        "serial_rightsize", &scl, legacy_v,
+        ds4_session_graph_headroom_bytes());
     ds4_session *ns = NULL;
-    if (target > 0 && ds4_session_create(&ns, s->engine, (int)target) == 0) {
+    if (final_v == DS4_GOV_ADMIT && target > 0 &&
+        ds4_session_create(&ns, s->engine, (int)target) == 0) {
         s->session = ns;
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: serial session right-sized ctx=%d -> %ld (boot -c %d graph "
@@ -13827,40 +13858,41 @@ static bool serial_session_ensure_fit(server *s, job *j) {
                    "(DS4_SERVER_SERIAL_RIGHTSIZE=0 restores full--c alloc)",
                    cur_ctx, target, boot_ctx, j->req.prompt.len, budget,
                    pending ? "" : " [live serial state reset]");
-        /* memgov D0b-3 (S6): the right-size verdict, shadowed.  The live
-         * outcome is SERVED at target ctx; the claim is that absolute. */
-        {
-            const uint64_t est =
-                ds4_engine_session_graph_bytes_estimate(s->engine, (int)target);
-            ds4_gov_claim scl = {0};
-            scl.requester = DS4_GOVC_SERIAL_SESSION;
-            scl.memc = DS4_MEMC_SESSION_TENSORS;
-            scl.domain = DS4_MEMD_UNIFIED_DEVICE;
-            scl.proposed_outstanding = est;
-            ds4_gov_shadow_check("serial_rightsize", &scl, DS4_GOV_ADMIT);
-            ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, est);
-        }
+        /* The lane's absolute lease: the graph is committed at target. */
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION,
+                            scl.proposed_outstanding, scl.proposed_outstanding);
         return true;
     }
+    if (final_v != legacy_v && legacy_v == DS4_GOV_ADMIT) {
+        /* Enforce diverged from the legacy formula: the quote's refusal
+         * rules the create.  (The opposite direction -- quote admitting
+         * where the PROBE refused -- never acts: physical truth stands,
+         * and the shared core already counted+disclosed it.)  Bounded
+         * like the DISAGREE disclosure; the client 503 below is the
+         * frozen surface, unchanged. */
+        static int enf_disclosed = 0;
+        if (enf_disclosed < 16) {
+            enf_disclosed++;
+            fprintf(stderr,
+                    "ds4: memgov ENFORCE refuse site=serial_rightsize status=%d legacy=%d proposed=%llu prompt=%d\n",
+                    final_v, legacy_v,
+                    (unsigned long long)scl.proposed_outstanding,
+                    j->req.prompt.len);
+        }
+    }
     /* Refusal: restore the boot-shape session (lazy graph -> holds nothing)
-     * so the server keeps its invariant and later requests re-probe fresh. */
+     * so the server keeps its invariant and later requests re-probe fresh.
+     * The verdict was already counted above (governed on the create path,
+     * shadowed on the probe-refusal path); the "no graph fits" line prints
+     * only when the PROBE refused -- on an enforce refusal the graph fit
+     * and the memgov line above is the honest record. */
     if (ds4_session_create(&ns, s->engine, boot_ctx) == 0) s->session = ns;
     else die("serial right-size: could not restore the boot session");
-    server_log(DS4_LOG_WARNING,
-               "ds4-server: serial right-size: no graph fits (prompt=%d need_min=%ld boot -c %d); refusing 503",
-               j->req.prompt.len, need_min, boot_ctx);
-    /* memgov D0b-3 (S6): the refusal, shadowed at the minimal ask.  The
-     * restored boot-shape session is lazy and holds nothing. */
-    {
-        ds4_gov_claim scl = {0};
-        scl.requester = DS4_GOVC_SERIAL_SESSION;
-        scl.memc = DS4_MEMC_SESSION_TENSORS;
-        scl.domain = DS4_MEMD_UNIFIED_DEVICE;
-        scl.proposed_outstanding =
-            ds4_engine_session_graph_bytes_estimate(s->engine, (int)need_min);
-        ds4_gov_shadow_check("serial_rightsize", &scl, DS4_GOV_REFUSE_LIVE);
-        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
-    }
+    if (target <= 0)
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: serial right-size: no graph fits (prompt=%d need_min=%ld boot -c %d); refusing 503",
+                   j->req.prompt.len, need_min, boot_ctx);
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);   /* lazy: holds nothing */
     char msg[192];
     snprintf(msg, sizeof(msg),
              "Server is temporarily at capacity for a %d-token serial request "
@@ -26597,16 +26629,39 @@ static void test_mem_gov_modes(void) {
     ds4_gov_modes_init();
     for (int c = 0; c < DS4_GOVC__COUNT; c++)
         TEST_ASSERT(ds4_gov_mode(c) == DS4_GOV_MODE_OBSERVE);
-    /* Ship defaults (D2-2b ratchet): BOOT and BANK enforce, the
-     * unratcheted families observe.  This assertion IS the ratchet's
-     * unit-level record -- update it with each D2 default flip. */
+    /* Ship defaults (D2-2b + D2-4 ratchets): BOOT, BANK and SERIAL
+     * enforce, the unratcheted families observe.  This assertion IS the
+     * ratchet's unit-level record -- update it with each D2 default
+     * flip. */
     unsetenv("DS4_MEMGOV");
     ds4_gov_modes_init();
     TEST_ASSERT(ds4_gov_mode(DS4_GOVC_ENGINE_BOOT) == DS4_GOV_MODE_ENFORCE);
     TEST_ASSERT(ds4_gov_mode(DS4_GOVC_PREWARM) == DS4_GOV_MODE_OBSERVE);
     TEST_ASSERT(ds4_gov_mode(DS4_GOVC_BATCH_BANK_PLAN) == DS4_GOV_MODE_ENFORCE);
-    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_SERIAL_SESSION) == DS4_GOV_MODE_OBSERVE);
+    TEST_ASSERT(ds4_gov_mode(DS4_GOVC_SERIAL_SESSION) == DS4_GOV_MODE_ENFORCE);
     TEST_ASSERT(ds4_gov_mode(DS4_GOVC_STATIC_BATCH) == DS4_GOV_MODE_OBSERVE);
+    /* The margin variant dispatches identically (same core, caller's
+     * protected term): a class-refusing claim under enforce must refuse
+     * through it exactly as the floored check would. */
+    setenv("DS4_MEMGOV_STATIC", "enforce", 1);
+    ds4_gov_modes_init();
+    {
+        ds4_gov_claim mcl = {0};
+        mcl.requester = DS4_GOVC_STATIC_BATCH;
+        mcl.memc = DS4_MEMC_SESSION_TENSORS;
+        mcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        mcl.proposed_outstanding = 100;
+        mcl.class_limit = 10;
+        ds4_mem_observation mo;
+        memset(&mo, 0, sizeof(mo));
+        (void)ds4_gpu_mem_observe(&mo);
+        const int mwant = mo.status == DS4_MEMOBS_OK ? DS4_GOV_REFUSE_CLASS
+                                                     : DS4_GOV_ADMIT;
+        TEST_ASSERT(ds4_gov_governed_check_margin("unit", &mcl, DS4_GOV_ADMIT,
+                                                  1u << 20) == mwant);
+    }
+    unsetenv("DS4_MEMGOV_STATIC");
+    ds4_gov_modes_init();
     ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 5, 5);
     ds4_gov_snapshot(&lg);
     TEST_ASSERT(lg.lease[DS4_GOVC_SERIAL_SESSION].intent == 5);

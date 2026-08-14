@@ -70,8 +70,8 @@ log "(t) torn-snapshot hunt: boot + ${WAVE}-wide admission wave under poll hamme
 boot_tree /tmp/d0bshadow_boot.log || die "boot failed"
 # memgov D2-1: the governance mode board rides every boot; a stock boot
 # shows the tree defaults (update this expectation WITH each ratchet
-# commit).  D2-2b ratcheted BOOT and BANK to enforce.
-R "grep -q 'memgov modes: boot=enforce prewarm=observe bank=enforce serial=observe static=observe' /tmp/d0bshadow_boot.log" \
+# commit).  D2-2b ratcheted BOOT and BANK, D2-4 ratcheted SERIAL.
+R "grep -q 'memgov modes: boot=enforce prewarm=observe bank=enforce serial=enforce static=observe' /tmp/d0bshadow_boot.log" \
     || die "memgov mode board missing or not at tree defaults"
 grep -q . /dev/null   # no-op keeps set -u happy on empty locals below
 # SNAP0: the boot-settle ledger, BEFORE any request (leg (r) asserts the
@@ -226,7 +226,7 @@ for i in $(seq 240); do
 done
 [ "$BOOTED" = "1" ] || { R "tail -5 /tmp/d0bfit_boot.log"; die "(e) refused boot did not reach listening"; }
 SPID=$(R "pgrep -x ds4-server | head -1")
-R "grep -q 'memgov modes: boot=enforce prewarm=observe bank=enforce serial=observe static=observe' /tmp/d0bfit_boot.log" \
+R "grep -q 'memgov modes: boot=enforce prewarm=observe bank=enforce serial=enforce static=observe' /tmp/d0bfit_boot.log" \
     || die "(e) mode board not at enforce defaults"
 ENF=$(R "grep -c 'memgov ENFORCE refuse site=boot_bank_fit' /tmp/d0bfit_boot.log" || true)
 [ "${ENF:-0}" -ge 1 ] || die "(e) no boot_bank_fit ENFORCE refusal in log"

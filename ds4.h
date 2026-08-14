@@ -587,10 +587,21 @@ int  ds4_gov_mode(int consumer);
  * a backend with no memory answer keeps its historical behavior). */
 int  ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
                             int legacy_status);
+/* memgov D2-4: governed check whose protected term is the CALLER's own
+ * margin instead of the operator floor (the D2-2b fit pattern).  The
+ * serial right-size lane passes ds4_session_graph_headroom_bytes() so
+ * its quote evaluates the fit probe's own inequality (free >= margin +
+ * need) plus the ledger's cross-lane terms; the reclaim charter serves
+ * inside the operator-floor band by design. */
+int  ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
+                                   int legacy_status, uint64_t margin_bytes);
 /* Absolute session-graph intent for a ctx (the serial-reserve estimator,
  * exported): what a committed graph at this ctx costs, for SERIAL_SESSION
  * and STATIC_BATCH shadow claims. */
 uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx);
+/* The serial session fit gate's headroom (DS4_SESSION_GRAPH_HEADROOM_MB,
+ * default 1024 MiB) -- one source shared by the probe and the S6 claim. */
+uint64_t ds4_session_graph_headroom_bytes(void);
 
 /* =========================================================================
  * Live serving metrics (v0.2.x observability): ONE registry, THREE porcelains.

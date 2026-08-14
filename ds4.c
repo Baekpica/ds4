@@ -10104,6 +10104,22 @@ static uint64_t metal_graph_alloc_bytes_estimate(
     return bytes;
 }
 
+/* memgov D2-4: the serial session's protected margin, ONE source shared by
+ * the fit gate below and the S6 governor claim -- the probe and the quote
+ * evaluate the same inequality (free >= margin + need) and cannot drift.
+ * This margin, NOT the operator floor, is the serial lane's legacy
+ * protection level: the reclaim charter (lite-4) serves from the commons
+ * inside the floor band rather than 503ing beside idle cache. */
+uint64_t ds4_session_graph_headroom_bytes(void) {
+    uint64_t headroom = 1024ull << 20;
+    const char *he = getenv("DS4_SESSION_GRAPH_HEADROOM_MB");
+    if (he && he[0]) {
+        const long v = atol(he);
+        if (v >= 0) headroom = (uint64_t)v << 20;
+    }
+    return headroom;
+}
+
 /* Session-graph fit gate.  cudaMalloc on an integrated/unified box does not
  * fail cleanly when the ask exceeds MemAvailable -- the kernel reclaims and
  * swaps for tens of seconds and then the global OOM killer shoots the largest
@@ -10140,12 +10156,7 @@ static bool metal_graph_session_fit_check(
     const uint64_t need = metal_graph_alloc_bytes_estimate(weights, layer, raw_cap,
                                                            ctx_size, prefill_cap,
                                                            enable_mtp, enable_dspark);
-    uint64_t headroom = 1024ull << 20;
-    const char *he = getenv("DS4_SESSION_GRAPH_HEADROOM_MB");
-    if (he && he[0]) {
-        const long v = atol(he);
-        if (v >= 0) headroom = (uint64_t)v << 20;
-    }
+    const uint64_t headroom = ds4_session_graph_headroom_bytes();
     if (free_b >= need + headroom) return true;
     if (loud) {
         ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
@@ -33503,14 +33514,17 @@ void ds4_gov_modes_init(void) {
      * BOOT and BANK default ENFORCE -- their quotes ran AGREE across
      * every D2-1/2a/3 battery boot and the post-reboot fit check;
      * enforce only inverts which side of that identical comparison
-     * rules.  SERIAL ratchets at D2-4, PREWARM/STATIC at D2-5.
+     * rules.  SERIAL ratcheted at D2-4 (its quote evaluates the
+     * probe's own inequality -- margin, not floor -- so healthy legs
+     * agree; serial_reclaim_gate is the lane's oracle);
+     * PREWARM/STATIC ratchet at D2-5.
      * DS4_MEMGOV=observe is the one-word rollback to shadow-everywhere;
      * off stays the kill switch; per-family knobs win over both. */
     static const uint8_t defm[DS4_GOVC__COUNT] = {
         DS4_GOV_MODE_ENFORCE,   /* ENGINE_BOOT      (D2-2b) */
         DS4_GOV_MODE_OBSERVE,   /* PREWARM          (D2-5)  */
         DS4_GOV_MODE_ENFORCE,   /* BATCH_BANK_PLAN  (D2-2b) */
-        DS4_GOV_MODE_OBSERVE,   /* SERIAL_SESSION   (D2-4)  */
+        DS4_GOV_MODE_ENFORCE,   /* SERIAL_SESSION   (D2-4)  */
         DS4_GOV_MODE_OBSERVE,   /* STATIC_BATCH     (D2-5)  */
     };
     int gdef = -1;
@@ -33595,7 +33609,8 @@ void ds4_gov_snapshot(ds4_gov_ledger *out) {
  * observe and enforce read identically at the gate.  Returns the quote's
  * validated status. */
 static int gov_check_core(const char *site, const ds4_gov_claim *cl,
-                          int legacy_status, const uint64_t *floor_override) {
+                          int legacy_status, const uint64_t *floor_override,
+                          ds4_gov_quote *out_quote) {
     ds4_metrics *m = ds4_metrics_get();
     ds4_gov_ledger img;
     memset(&img, 0, sizeof(img));
@@ -33613,6 +33628,7 @@ static int gov_check_core(const char *site, const ds4_gov_claim *cl,
     memset(&o, 0, sizeof(o));
     (void)ds4_gpu_mem_observe(&o);
     const ds4_gov_quote q = ds4_gov_evaluate(&img, &o, cl);
+    if (out_quote) *out_quote = q;      /* D2-4: enforce clamps need the numbers */
     const int status = (q.status >= 0 && q.status < DS4_GOV_STATUS__COUNT)
                            ? q.status : DS4_GOV_FAULT;
     const int reason = ds4_gov_compare(legacy_status, status);
@@ -33664,7 +33680,7 @@ void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
                           int live_status) {
     if (!gov_check_args_ok(cl, live_status)) return;
     if (ds4_gov_mode(cl->requester) == DS4_GOV_MODE_OFF) return;   /* D2-1 */
-    (void)gov_check_core(site, cl, live_status, NULL);
+    (void)gov_check_core(site, cl, live_status, NULL, NULL);
 }
 
 /* Mode dispatch shared by the public governed check (operator floor) and
@@ -33672,11 +33688,13 @@ void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
  * one place the quote-status vocabulary meets the caller's boolean. */
 static int gov_governed_dispatch(const char *site, const ds4_gov_claim *cl,
                                  int legacy_status,
-                                 const uint64_t *floor_override) {
+                                 const uint64_t *floor_override,
+                                 ds4_gov_quote *out_quote) {
     if (!gov_check_args_ok(cl, legacy_status)) return legacy_status;
     const int mode = ds4_gov_mode(cl->requester);
     if (mode == DS4_GOV_MODE_OFF) return legacy_status;
-    const int qs = gov_check_core(site, cl, legacy_status, floor_override);
+    const int qs = gov_check_core(site, cl, legacy_status, floor_override,
+                                  out_quote);
     if (mode != DS4_GOV_MODE_ENFORCE) return legacy_status;
     switch (qs) {
     case DS4_GOV_ADMIT:
@@ -33697,7 +33715,17 @@ static int gov_governed_dispatch(const char *site, const ds4_gov_claim *cl,
 
 int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
                            int legacy_status) {
-    return gov_governed_dispatch(site, cl, legacy_status, NULL);
+    return gov_governed_dispatch(site, cl, legacy_status, NULL, NULL);
+}
+
+/* memgov D2-4: governed check whose protected term is the CALLER's own
+ * margin instead of the operator floor (the D2-2b fit pattern,
+ * exported).  The serial right-size lane passes the session-graph
+ * headroom so its quote evaluates the probe's own inequality plus the
+ * ledger's cross-lane terms. */
+int ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
+                                  int legacy_status, uint64_t margin_bytes) {
+    return gov_governed_dispatch(site, cl, legacy_status, &margin_bytes, NULL);
 }
 
 /* Absolute session-graph intent at a ctx: the serial-reserve estimator
@@ -34114,7 +34142,8 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                 fcl.proposed_outstanding = (uint64_t)n_eff * per_bank;
                 fcl.class_limit = budget != 0 ? budget : 1;
                 const int fv = gov_governed_dispatch("boot_bank_fit", &fcl,
-                                                     DS4_GOV_ADMIT, &headroom);
+                                                     DS4_GOV_ADMIT, &headroom,
+                                                     NULL);
                 if (fv != DS4_GOV_ADMIT) {
                     fprintf(stderr,
                             "ds4: memgov ENFORCE refuse site=boot_bank_fit status=%d legacy=%d proposed=%llu class_limit=%llu banks=%u requested=%u\n",
@@ -34180,7 +34209,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                 fcl.class_limit = budget2 != 0 ? budget2 : 1;
                 const int fv = gov_governed_dispatch("boot_bank_fit", &fcl,
                                                      DS4_GOV_ADMIT,
-                                                     &fit_headroom);
+                                                     &fit_headroom, NULL);
                 if (fv != DS4_GOV_ADMIT) {
                     fprintf(stderr,
                             "ds4: memgov ENFORCE refuse site=boot_bank_fit status=%d legacy=%d proposed=%llu class_limit=%llu banks=%u requested=%u (descent)\n",
@@ -34266,37 +34295,60 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
             const uint64_t commons_floor =
                 (uint64_t)ctx->max_seq * ds4_batch_vmm_floor_per_bank(&ctx->g);
             const uint64_t usable = ds4_mem_usable();   /* live free beyond the operator floor */
+            uint64_t want_legacy = want_pre_clamp;      /* the comparison target, every mode */
             if (usable != UINT64_MAX) {
                 const uint64_t sparable = usable > commons_floor ? usable - commons_floor : 0;
-                if (want > sparable) {
-                    fprintf(stderr,
-                            "ds4: serial reserve CLAMPED %.2f -> %.2f GiB (entitlement %ld tok needs "
-                            "more than the box can spare beside the bank floor %.2f GiB; serial "
-                            "requests above ~%s may refuse -- lower -c, raise --mem-floor-gb headroom, "
-                            "or set DS4_SERIAL_RESERVE_CTX)\n",
-                            (double)want / 1073741824.0, (double)sparable / 1073741824.0,
-                            ent, (double)commons_floor / 1073741824.0,
-                            sparable ? "the funded depth" : "any depth");
-                    want = sparable;
+                if (want_legacy > sparable) want_legacy = sparable;
+            }
+            /* memgov D2-4 (S3): the carve claim.  operation_transient
+             * carries the commons floor, so the quote's protected sum is
+             * the legacy arithmetic exactly -- plus the ledger's own
+             * reservation/unfunded terms, which legacy ignores (the
+             * honest difference enforce exists for).  Under enforce the
+             * quote's numbers PRODUCE the clamp: ADMIT carves the full
+             * entitlement, REFUSE_LIVE carves entitlement minus deficit,
+             * REFUSE_CLASS/FAULT fail closed to 0 (the commons keeps
+             * everything), no-observation keeps the legacy clamp (sec
+             * 6.4).  Same CLAMPED porcelain, the ruling arithmetic's own
+             * numbers.  observe/off: the legacy clamp verbatim. */
+            ds4_gov_claim scl = {0};
+            scl.requester = DS4_GOVC_SERIAL_SESSION;
+            scl.memc = DS4_MEMC_SESSION_TENSORS;
+            scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+            scl.proposed_outstanding = want_pre_clamp;
+            scl.operation_transient = commons_floor;
+            ds4_gov_quote sq;
+            memset(&sq, 0, sizeof(sq));
+            (void)gov_governed_dispatch("serial_reserve_carve", &scl,
+                                        want_legacy == want_pre_clamp
+                                            ? DS4_GOV_ADMIT
+                                            : DS4_GOV_REFUSE_LIVE,
+                                        NULL, &sq);
+            want = want_legacy;
+            if (ds4_gov_mode(DS4_GOVC_SERIAL_SESSION) == DS4_GOV_MODE_ENFORCE) {
+                switch (sq.status) {
+                case DS4_GOV_ADMIT:       want = want_pre_clamp; break;
+                case DS4_GOV_REFUSE_LIVE: want = want_pre_clamp > sq.deficit
+                                              ? want_pre_clamp - sq.deficit : 0;
+                                          break;
+                case DS4_GOV_REFUSE_CLASS:
+                case DS4_GOV_FAULT:       want = 0; break;   /* fail closed */
+                default:                  break;   /* no answer: legacy clamp */
                 }
             }
+            if (want < want_pre_clamp)
+                fprintf(stderr,
+                        "ds4: serial reserve CLAMPED %.2f -> %.2f GiB (entitlement %ld tok needs "
+                        "more than the box can spare beside the bank floor %.2f GiB; serial "
+                        "requests above ~%s may refuse -- lower -c, raise --mem-floor-gb headroom, "
+                        "or set DS4_SERIAL_RESERVE_CTX)\n",
+                        (double)want_pre_clamp / 1073741824.0, (double)want / 1073741824.0,
+                        ent, (double)commons_floor / 1073741824.0,
+                        want ? "the funded depth" : "any depth");
             ctx->serial_reserve = want;
-            /* memgov D0b-3 (S3): the live formula CLAMPS instead of
-             * refusing; a clamp is its way of saying the full entitlement
-             * cannot be funded live.  Publish the carve as the serial
-             * lane's own reservation, then shadow the pre-clamp ask. */
+            /* The carve is the serial lane's own reservation (sec 6.2:
+             * protected for others, spendable by the owner). */
             ds4_gov_publish_reservation(DS4_GOVC_SERIAL_SESSION, want);
-            {
-                ds4_gov_claim scl = {0};
-                scl.requester = DS4_GOVC_SERIAL_SESSION;
-                scl.memc = DS4_MEMC_SESSION_TENSORS;
-                scl.domain = DS4_MEMD_UNIFIED_DEVICE;
-                scl.proposed_outstanding = want_pre_clamp;
-                ds4_gov_shadow_check("serial_reserve_carve", &scl,
-                                     want == want_pre_clamp
-                                         ? DS4_GOV_ADMIT
-                                         : DS4_GOV_REFUSE_LIVE);
-            }
         }
     }
     if (ctx->sl.vmm) {
@@ -38806,6 +38858,11 @@ int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
                            int legacy_status) {
     (void)site; (void)cl;
     return legacy_status;   /* no governor: the legacy verdict rules */
+}
+int ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
+                                  int legacy_status, uint64_t margin_bytes) {
+    (void)site; (void)cl; (void)margin_bytes;
+    return legacy_status;
 }
 void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
     (void)consumer; (void)intent; (void)resident;

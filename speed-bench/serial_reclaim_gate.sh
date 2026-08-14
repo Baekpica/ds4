@@ -313,6 +313,16 @@ log "leg A: http=$CODE prompt_start=$PSTART reclaim_lines=$RECL trim_lines=$TRIM
 [ "$CODE" = "200" ] || die "leg A: reclaim fired (trim receipt in the A log shows released MiB) but the re-poll still missed -- post-trim free must exceed the need_min threshold; raise TENANT_TOKENS (more trimmable) or NEED_EST_MB (higher free-after)"
 [ "$PSTART" -ge 1 ] || die "leg A: served without the serial success marker (unexpected lane)"
 log "A PASS (served via reclaim: prompt_start=$PSTART reclaim=$RECL trim=$TRIM)"
+# memgov D2-4: under the SERIAL enforce default this serve is
+# quote-ADMITTED (margin calibration: the quote evaluates the fit
+# probe's own inequality).  ANY DISAGREE on this boot means quote and
+# probe drifted -- churn(24 tenants) + trim + serve is exactly the
+# composition this asserts (the D2-1 row-end refresh feeding the
+# quote's cross-lane terms).  Pre-margin evidence: the 08-14 re-stamp
+# logged ONE serial_rightsize SHADOW_STRICTER here (deficit 2.37 GiB,
+# the operator-floor term); the margin calibration retired it.
+DIS_A=$(remote "grep -c 'memgov shadow DISAGREE' /tmp/reclaim_A.log" || true)
+[ "${DIS_A:-0}" = "0" ] || die "leg A: memgov DISAGREE on the reclaim serve ($DIS_A)"
 if [ -n "$INJECT" ]; then
     ARMED=$(count "trim inject: armed" /tmp/reclaim_A.log)
     FIRED=$(count "trim inject: forced" /tmp/reclaim_A.log)
