@@ -4650,6 +4650,12 @@ uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint
     return 0;
 }
 
+uint64_t ds4_gpu_tensor_trim_estimate(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    /* Mirror of trim: no demand mapping, so the trim preimage is empty. */
+    (void)tensor; (void)offset; (void)bytes;
+    return 0;
+}
+
 uint64_t ds4_gpu_vmm_demand_page(void) {
     return 0;
 }

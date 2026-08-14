@@ -256,16 +256,62 @@ int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_tota
 int  ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                               ds4_batch_ctx **out, char *err, size_t errlen);
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx);
-/* deepmem lite-4 (minimal reclaim): trim FREE banks' demand-mapped cache
-   pages to recover up to want_bytes for a non-batch consumer (the serial
-   lane).  Context-owned mechanics; the CALLER owns exclusion (the server
-   calls under gen_mu with no continuous pass running).  Victim order:
-   invalid history first, then shortest committed history; a trimmed bank's
-   history is invalidated, so warm admits cannot reuse it (its next tenant
-   cold-resets).  Returns bytes released (also counted in the ctx trim
-   counters and the "batch vmm: trimmed" log line); 0 when nothing is
-   trimmable or DS4_BATCH_VMM_TRIM=0. */
-uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes);
+/* memgov D4-2: two-phase, context-owned idle-bank reclaim (revised plan
+ * sec 10; supersedes lite-4's whole-commons ds4_batch_ctx_trim_free).
+ * The SERVER ranks victims -- it owns warm value: supersession, LRU,
+ * deep pins, continuation protection -- and passes ordered bank ids;
+ * the CONTEXT owns the physical mechanics.
+ *
+ * prepare computes each bank's exact trim preimage (whole pages strictly
+ * inside its spans; edge pages shared with neighbor banks are excluded on
+ * both sides, never quoted and never released) and stamps the bank's
+ * lineage generation, taking banks in the caller's order until est covers
+ * want.  The caller persists whatever it wants to keep while the data is
+ * intact, then commit revalidates every stamp, synchronizes ONCE, trims
+ * in bulk, advances generations and invalidates engine history only for
+ * banks whose content was actually destroyed, and returns per-bank status
+ * plus exact bytes.  A partial driver failure preserves ownership and
+ * accounting for pages that were not released (the error-safe trim
+ * contract, D-1b); nothing-reclaimable is a normal empty plan, never an
+ * error.  Quiescence is the caller's (the server calls under gen_mu and
+ * the pass drivers hold gen_mu for their whole life); BUSY is the typed
+ * honesty check for everyone else.  DS4_BATCH_VMM_TRIM=0 disables both
+ * phases (UNSUPPORTED), one release, plan sec 10. */
+typedef enum {
+    DS4_RECLAIM_OK = 0,        /* every planned bank fully trimmed and released */
+    DS4_RECLAIM_PARTIAL,       /* progress, but some pages or banks failed/staled */
+    DS4_RECLAIM_STALE_PLAN,    /* every planned bank's generation moved; nothing touched */
+    DS4_RECLAIM_BUSY,          /* a batched pass is driving this context */
+    DS4_RECLAIM_UNSUPPORTED,   /* no trimmable substrate, or trim disabled */
+    DS4_RECLAIM_DEVICE_ERROR,  /* driver failure with zero bytes destroyed */
+} ds4_reclaim_status;
+typedef struct {
+    uint32_t bank;
+    uint64_t gen;         /* lineage stamp at prepare (ds4_batch_ctx_bank_generation) */
+    uint64_t est_bytes;   /* exact trim preimage at prepare */
+    uint64_t got_bytes;   /* bytes RELEASED at commit (<= bytes destroyed: a
+                           * release-failed page is destroyed but not returned) */
+    int      status;      /* per-bank ds4_reclaim_status (OK/PARTIAL/STALE_PLAN/DEVICE_ERROR) */
+} ds4_reclaim_bank;
+#define DS4_RECLAIM_MAX_BANKS 128   /* >= the engine's multiseq bound */
+typedef struct {
+    uint32_t n;
+    uint64_t want_bytes;
+    uint64_t est_bytes;   /* sum of banks[].est_bytes */
+    ds4_reclaim_bank banks[DS4_RECLAIM_MAX_BANKS];
+} ds4_reclaim_plan;
+typedef struct {
+    int      status;           /* aggregate ds4_reclaim_status */
+    uint32_t banks_reclaimed;  /* content destroyed; generation advanced */
+    uint32_t banks_stale;      /* skipped: generation moved between the phases */
+    uint64_t bytes_released;   /* returned to the system (census-exact) */
+} ds4_reclaim_result;
+int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_ids,
+                                  uint32_t n_ids, uint64_t want_bytes,
+                                  ds4_reclaim_plan *plan);
+int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
+                                 ds4_reclaim_result *result);
+const char *ds4_reclaim_status_str(int status);
 
 /* deepmem D-1c: page-interval union across per-bank credited spans -- the
  * pure arithmetic under the continuous-admission credit projection

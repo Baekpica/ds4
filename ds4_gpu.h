@@ -49,6 +49,13 @@ ds4_gpu_tensor *ds4_gpu_tensor_reserve(uint64_t bytes);
 int ds4_gpu_tensor_ensure(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
+/* memgov D4-2: the exact preimage of ds4_gpu_tensor_trim -- mapped bytes of
+ * the pages lying ENTIRELY inside [offset, offset+bytes), the same interior-
+ * page math trim releases (edge pages shared with neighboring spans are
+ * excluded on both sides: never quoted, never released).  Distinct from
+ * ds4_gpu_tensor_resident, which counts every OVERLAPPING page.  Pure host
+ * walk, no driver calls; 0 for eager tensors and trimless backends. */
+uint64_t ds4_gpu_tensor_trim_estimate(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 uint64_t ds4_gpu_vmm_demand_page(void);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);

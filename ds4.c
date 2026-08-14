@@ -32820,6 +32820,11 @@ struct ds4_batch_ctx {
      * in ds4.h).  Bumped at every site that replaces or invalidates a bank's
      * committed content; never on pure extension. */
     uint64_t       *bank_gen;
+    /* memgov D4-2: a batched pass is driving this context (set/cleared by
+     * the two pass entry points).  Reclaim prepare/commit answer BUSY
+     * instead of racing a pass -- structural today (server and pass
+     * drivers all hold gen_mu), typed honesty for every other caller. */
+    int             in_pass;
     uint64_t        warm_admits;     /* observability + gate hooks */
     uint64_t        warm_rejects;    /* n_cached>0 admits that degraded to cold */
     uint64_t        fork_admits;     /* A2b: fork_bank>0 admits served by copy (or */
@@ -33926,17 +33931,40 @@ static uint64_t ds4_batch_bank_trim_pages(ds4_batch_ctx *ctx, uint32_t b) {
  * read guards are proven against), and its next tenant cold-resets and
  * re-maps on the ensure-before-emit path.  DS4_BATCH_VMM_TRIM=0 disables
  * (A/B and field forensics only, not a ship mode). */
-static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
-                                          const uint8_t *live, const uint32_t *pflen,
-                                          const uint64_t *credit,
-                                          uint32_t target, int protect, uint64_t want,
-                                          const char *why) {
+/* memgov D4-2: one kill-switch read shared by the in-pass ladder and the
+ * reclaim protocol (DS4_BATCH_VMM_TRIM=0 -- A/B and field forensics only,
+ * not a ship mode; the plan sec 10 temporary enable switch). */
+static int ds4_batch_trim_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *e = getenv("DS4_BATCH_VMM_TRIM");
         enabled = !(e && e[0] == '0' && e[1] == '\0');
     }
-    if (!enabled || want == 0) return 0;
+    return enabled;
+}
+
+/* memgov D4-2: the one place a bank's destroyed content is acknowledged --
+ * lineage advance + engine history + per-layer mirror counters + emit keep.
+ * Shared by the in-pass ladder and reclaim commit so the invalidation set
+ * cannot drift between the two trim consumers. */
+static void ds4_batch_bank_mark_trimmed(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
+                                        uint32_t v) {
+    ctx->bank_gen[v]++;                    /* Inc 5a: trim destroys content */
+    ctx->bank_hist_valid[v] = 0u;
+    ctx->bank_hist_len[v]   = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->ms_n_comp[v][il] = 0u;
+        g->ms_n_index_comp[v][il] = 0u;
+    }
+    g->ms_emit_keep[v] = 0u;
+}
+
+static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
+                                          const uint8_t *live, const uint32_t *pflen,
+                                          const uint64_t *credit,
+                                          uint32_t target, int protect, uint64_t want,
+                                          const char *why) {
+    if (!ds4_batch_trim_enabled() || want == 0) return 0;
     const uint32_t MS = (uint32_t)ctx->max_seq;
     uint32_t order[DS4_MULTISEQ_MAX_SEQ];
     uint32_t n = 0;
@@ -33976,14 +34004,7 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         }
         const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
         if (got == 0) continue;                /* floor-resident: content intact, keep it */
-        ctx->bank_gen[v]++;                    /* Inc 5a: trim destroys content */
-        ctx->bank_hist_valid[v] = 0u;
-        ctx->bank_hist_len[v]   = 0u;
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            g->ms_n_comp[v][il] = 0u;
-            g->ms_n_index_comp[v][il] = 0u;
-        }
-        g->ms_emit_keep[v] = 0u;
+        ds4_batch_bank_mark_trimmed(ctx, g, v);
         freed += got;
         nb++;
     }
@@ -33998,24 +34019,150 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     return freed;
 }
 
-/* deepmem lite-4 (minimal reclaim): public context-owned trim for a
- * non-batch consumer -- the serial lane COLLECTS from the commons instead
- * of pre-paying for it (governance LEARNING 7: the commons is a cache
- * whose worst case is a re-prefill and whose pages return exactly).  The
- * CALLER owns exclusion: the server calls under gen_mu with no continuous
- * pass running, so no live/pflen/credit arrays exist and every bank is
- * either floor-resident or a warm record (the cache this spends).  Victim
- * order and history invalidation are the proven budget-pressure trim's;
- * server-side warm metadata needs no cleanup because the engine validates
- * every warm admit against bank history (advisory-matching law).  The
- * exact-deficit / server-ranked prepare-commit protocol is chartered D4
- * (revised plan §10); this is the ladder's step 2 pointed at the right
- * class, nothing more. */
-uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
-    if (!ctx || want_bytes == 0) return 0;
-    return ds4_batch_trim_free_banks(ctx, &ctx->g, NULL, NULL, NULL,
-                                     (uint32_t)ctx->max_seq, -1, want_bytes,
-                                     "for the serial lane (reclaim)");
+/* memgov D4-2: one bank's exact trim preimage across every slab family the
+ * credit projection charges -- the counting mirror of
+ * ds4_batch_bank_trim_pages (same offsets, same strides, same interior-page
+ * math via ds4_gpu_tensor_trim_estimate), so prepare's quote and commit's
+ * release cannot drift.  Pure host walk. */
+static uint64_t ds4_batch_bank_trim_estimate(ds4_batch_ctx *ctx, uint32_t b) {
+    ds4_batch_slabs *sl = &ctx->sl;
+    uint64_t est = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (sl->multi_comp[il])
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_comp[il],
+                                                (uint64_t)b * sl->comp_bank_bytes[il],
+                                                sl->comp_bank_bytes[il]);
+        if (sl->multi_comp_fp8[il]) {
+            const uint64_t f8b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES;
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_comp_fp8[il], (uint64_t)b * f8b, f8b);
+        }
+        if (sl->multi_index[il])
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_index[il],
+                                                (uint64_t)b * sl->index_bank_bytes[il],
+                                                sl->index_bank_bytes[il]);
+        if (sl->multi_index_fp4[il]) {
+            const uint64_t f4b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_index_fp4[il], (uint64_t)b * f4b, f4b);
+            const uint64_t s4b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_index_scale[il], (uint64_t)b * s4b, s4b);
+        }
+    }
+    return est;
+}
+
+/* memgov D4-2 (revised plan sec 10 steps 4+6): the two-phase reclaim
+ * protocol.  Contract, ordering rationale and the edge-page exclusion are
+ * documented at the ds4.h declaration.  prepare is a pure host walk over
+ * the caller's ranked ids; commit is the only phase that touches the
+ * driver, and it acknowledges destroyed content through the same
+ * mark-trimmed helper the in-pass ladder uses. */
+int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_ids,
+                                  uint32_t n_ids, uint64_t want_bytes,
+                                  ds4_reclaim_plan *plan) {
+    if (!plan) return DS4_RECLAIM_UNSUPPORTED;
+    memset(plan, 0, sizeof(*plan));
+    plan->want_bytes = want_bytes;
+    if (!ctx || !ds4_batch_trim_enabled()) return DS4_RECLAIM_UNSUPPORTED;
+    if (ctx->in_pass) return DS4_RECLAIM_BUSY;
+    if (!ordered_ids || n_ids == 0 || want_bytes == 0) return DS4_RECLAIM_OK;
+    uint8_t seen[DS4_MULTISEQ_MAX_SEQ] = {0};
+    for (uint32_t i = 0; i < n_ids && plan->est_bytes < want_bytes &&
+                         plan->n < DS4_RECLAIM_MAX_BANKS; i++) {
+        const uint32_t b = ordered_ids[i];
+        if (b >= (uint32_t)ctx->max_seq || seen[b]) continue;
+        seen[b] = 1;
+        const uint64_t est = ds4_batch_bank_trim_estimate(ctx, b);
+        if (est == 0) continue;               /* floor-resident: nothing mapped */
+        ds4_reclaim_bank *rb = &plan->banks[plan->n++];
+        rb->bank = b;
+        rb->gen = ctx->bank_gen[b];
+        rb->est_bytes = est;
+        rb->got_bytes = 0;
+        rb->status = DS4_RECLAIM_OK;          /* provisional until commit */
+        plan->est_bytes += est;
+    }
+    return DS4_RECLAIM_OK;
+}
+
+int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
+                                 ds4_reclaim_result *result) {
+    ds4_reclaim_result rr = {0};
+    rr.status = DS4_RECLAIM_OK;
+    if (!ctx || !plan || !ds4_batch_trim_enabled()) {
+        rr.status = DS4_RECLAIM_UNSUPPORTED;
+        if (result) *result = rr;
+        return rr.status;
+    }
+    if (ctx->in_pass) {
+        rr.status = DS4_RECLAIM_BUSY;
+        if (result) *result = rr;
+        return rr.status;
+    }
+    uint32_t stale = 0, failed = 0, partial = 0;
+    bool synced = false;
+    for (uint32_t i = 0; i < plan->n; i++) {
+        ds4_reclaim_bank *rb = &plan->banks[i];
+        const uint32_t v = rb->bank;
+        if (v >= (uint32_t)ctx->max_seq || ctx->bank_gen[v] != rb->gen) {
+            rb->status = DS4_RECLAIM_STALE_PLAN;   /* lineage moved; untouched */
+            stale++;
+            continue;
+        }
+        if (!synced) {
+            /* ONE off-capture sync before the first unmap (sticky-scratch
+             * law; plan sec 10 step 6).  A failed sync aborts the whole
+             * commit with nothing destroyed. */
+            if (!ds4_gpu_synchronize()) {
+                for (uint32_t k = i; k < plan->n; k++)
+                    plan->banks[k].status = DS4_RECLAIM_DEVICE_ERROR;
+                failed += plan->n - i;
+                break;
+            }
+            synced = true;
+        }
+        const uint64_t pre = ds4_batch_bank_trim_estimate(ctx, v);
+        if (pre == 0) {                        /* preimage vanished: stale, keep */
+            rb->status = DS4_RECLAIM_STALE_PLAN;
+            stale++;
+            continue;
+        }
+        const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
+        const uint64_t post = ds4_batch_bank_trim_estimate(ctx, v);
+        const uint64_t destroyed = pre > post ? pre - post : 0;
+        rb->got_bytes = got;
+        if (destroyed == 0) {
+            /* Every unmap failed: content intact, ownership retained (the
+             * error-safe trim contract) -- the bank stays a warm record. */
+            rb->status = DS4_RECLAIM_DEVICE_ERROR;
+            failed++;
+            continue;
+        }
+        ds4_batch_bank_mark_trimmed(ctx, &ctx->g, v);
+        rr.banks_reclaimed++;
+        rr.bytes_released += got;
+        if (destroyed == pre && got == destroyed) {
+            rb->status = DS4_RECLAIM_OK;
+        } else {
+            /* Pages survived (unmap failure) or were destroyed without
+             * being returned (release failure -> census slack): progress
+             * with a caveat, disclosed per bank. */
+            rb->status = DS4_RECLAIM_PARTIAL;
+            partial++;
+        }
+    }
+    rr.banks_stale = stale;
+    if (rr.banks_reclaimed > 0) {
+        rr.status = (partial == 0 && failed == 0 && stale == 0)
+                  ? DS4_RECLAIM_OK : DS4_RECLAIM_PARTIAL;
+        ctx->trim_banks += rr.banks_reclaimed;
+        ctx->trim_bytes += rr.bytes_released;
+    } else if (plan->n > 0 && stale == plan->n) {
+        rr.status = DS4_RECLAIM_STALE_PLAN;
+    } else if (failed > 0) {
+        rr.status = DS4_RECLAIM_DEVICE_ERROR;
+    }                                          /* else: empty plan -> OK */
+    if (result) *result = rr;
+    return rr.status;
 }
 
 static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
@@ -34964,7 +35111,22 @@ int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) {
     return ctx ? (int)ctx->seq_cap : 0;
 }
 
+static int ds4_engine_batched_generate_ctx_impl(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
+                                    const int *max_new_tokens, const int *eos_ids,
+                                    ds4_batch_gen_result *out, char *err, size_t errlen);
+
+/* memgov D4-2: same pass-liveness envelope as the continuous driver. */
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
+                                    const int *max_new_tokens, const int *eos_ids,
+                                    ds4_batch_gen_result *out, char *err, size_t errlen) {
+    if (ctx) ctx->in_pass = 1;
+    const int rc = ds4_engine_batched_generate_ctx_impl(ctx, prompts, n, max_new_tokens,
+                                                        eos_ids, out, err, errlen);
+    if (ctx) ctx->in_pass = 0;
+    return rc;
+}
+
+static int ds4_engine_batched_generate_ctx_impl(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {
 #define BCG_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
@@ -35771,7 +35933,30 @@ static void cont_stats_publish_done(ds4_batch_ctx *ctx, ds4_cont_seq_stats *sst,
     ctx->last_done_set = 1u;
 }
 
+static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
+                                   int (*admit)(void *ud, ds4_cont_request *req),
+                                   int (*on_token)(void *ud, void *user, int token),
+                                   void (*on_done)(void *ud, void *user,
+                                                   const int *tokens, int n, int finish),
+                                   void *ud, char *err, size_t errlen);
+
+/* memgov D4-2: the pass-liveness envelope -- reclaim prepare/commit answer
+ * BUSY while a pass drives the context.  A thin wrapper (not per-return
+ * flagging inside the loop) so every exit path clears it. */
 int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
+                                   int (*admit)(void *ud, ds4_cont_request *req),
+                                   int (*on_token)(void *ud, void *user, int token),
+                                   void (*on_done)(void *ud, void *user,
+                                                   const int *tokens, int n, int finish),
+                                   void *ud, char *err, size_t errlen) {
+    if (ctx) ctx->in_pass = 1;
+    const int rc = ds4_engine_continuous_generate_impl(ctx, admit, on_token,
+                                                       on_done, ud, err, errlen);
+    if (ctx) ctx->in_pass = 0;
+    return rc;
+}
+
+static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                                    int (*admit)(void *ud, ds4_cont_request *req),
                                    int (*on_token)(void *ud, void *user, int token),
                                    void (*on_done)(void *ud, void *user,
@@ -38859,9 +39044,18 @@ int ds4_cont_bank_stage_payload(ds4_batch_ctx *ctx, uint32_t bank,
     if (err && errlen) snprintf(err, errlen, "bank_stage_payload: build has no graph backend");
     return 1;
 }
-uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
-    (void)ctx; (void)want_bytes;
-    return 0;
+int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_ids,
+                                  uint32_t n_ids, uint64_t want_bytes,
+                                  ds4_reclaim_plan *plan) {
+    (void)ctx; (void)ordered_ids; (void)n_ids;
+    if (plan) { memset(plan, 0, sizeof(*plan)); plan->want_bytes = want_bytes; }
+    return DS4_RECLAIM_UNSUPPORTED;   /* no graph backend: nothing to trim */
+}
+int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
+                                 ds4_reclaim_result *result) {
+    (void)ctx; (void)plan;
+    if (result) { memset(result, 0, sizeof(*result)); result->status = DS4_RECLAIM_UNSUPPORTED; }
+    return DS4_RECLAIM_UNSUPPORTED;
 }
 uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx) {
     (void)e; (void)ctx;
@@ -38896,6 +39090,20 @@ void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
     (void)site; (void)cl; (void)live_status;
 }
 #endif
+
+/* memgov D4-2: typed reclaim status names for logs and counters (both
+ * build shapes; fixed vocabulary -- extend the enum and this together). */
+const char *ds4_reclaim_status_str(int status) {
+    switch (status) {
+    case DS4_RECLAIM_OK:           return "ok";
+    case DS4_RECLAIM_PARTIAL:      return "partial";
+    case DS4_RECLAIM_STALE_PLAN:   return "stale_plan";
+    case DS4_RECLAIM_BUSY:         return "busy";
+    case DS4_RECLAIM_UNSUPPORTED:  return "unsupported";
+    case DS4_RECLAIM_DEVICE_ERROR: return "device_error";
+    default:                       return "unknown";
+    }
+}
 
 int ds4_engine_generate_argmax(
         ds4_engine        *e,

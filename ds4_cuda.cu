@@ -4464,6 +4464,24 @@ extern "C" uint32_t ds4_gpu_trim_inject_fired(void) {
     return g_trim_inject_fired;
 }
 
+extern "C" uint64_t ds4_gpu_tensor_trim_estimate(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    /* The trim loop's page walk with the driver calls removed: mapped bytes
+     * of the pages entirely inside [offset, offset+bytes).  Shares trim's
+     * p0/p1x arithmetic below so quote and release cannot drift. */
+    if (!tensor || bytes == 0) return 0;
+    if (offset > tensor->bytes) return 0;
+    if (bytes > tensor->bytes - offset) bytes = tensor->bytes - offset;
+    const cuda_vmm_demand *d = cuda_vmm_demand_find(tensor->ptr, offset, bytes);
+    if (!d) return 0;                          /* eager allocation: nothing to trim */
+    const uint64_t rel = ((uint64_t)(uintptr_t)tensor->ptr + offset) - (uint64_t)d->va;
+    const uint64_t p0  = (rel + d->page - 1u) / d->page;
+    const uint64_t p1x = (rel + bytes) / d->page;
+    uint64_t est = 0;
+    for (uint64_t p = p0; p < p1x; p++)
+        if (d->pages[(size_t)p]) est += d->page;
+    return est;
+}
+
 extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
     /* Unmap the demand-mapped pages lying ENTIRELY inside [offset, offset+bytes)
      * of a ds4_gpu_tensor_reserve() tensor.  Interior pages only: the caller's

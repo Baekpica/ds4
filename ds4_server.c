@@ -13702,6 +13702,11 @@ static void serial_terminal_commit(server *s, job *j, api_style proto,
     terminal_sink_release(tb->len);
 }
 
+/* memgov D4-2: warm-value machinery defined with the cont path below;
+ * the serial reclaim consumer needs both ahead of its definition. */
+static void warm_rec_invalidate(server *s, int bank);
+static uint32_t serial_reclaim_rank(server *s, uint32_t *out);
+
 /* v0.5.2 inc1: make sure the serial session can actually allocate its graph
  * before generate_job commits to it.  The session is created at server -c
  * and its S6 lazy graph is sized by that ctx, NOT the request -- on a
@@ -13777,39 +13782,63 @@ static bool serial_session_ensure_fit(server *s, job *j) {
         }
         usleep(100 * 1000);
     }
-    /* deepmem D4-1 (structured reclaim want): before refusing, let the
-     * serial lane COLLECT from the commons -- free banks' demand-mapped
+    /* deepmem D4-2 (plan sec 10 steps 3-7): before refusing, let the
+     * serial lane COLLECT from the commons -- idle banks' demand-mapped
      * pages return exactly via trim and their worst case is a re-prefill
      * (governance LEARNING 7: when two classes contend, fund the
-     * reversible one last).  The quote's exact deficit bounds the collect:
-     * trim deficit + one more headroom of slack (the same shared margin
-     * the fit inequality already charges -- its 1 GiB default exceeds the
-     * measured post-trim MemAvailable drift band, so the re-poll cannot
-     * land exactly on the fit line and lose to kswapd), preserving the
-     * rest of the idle warm cache lite-4's whole-commons trim spent.  A
-     * numberless quote (fail-open leg mid-settle, or a probe refusal with
-     * no deficit) keeps the lite-4 shape: trim everything free rather
-     * than refuse beside idle cache.  Then re-run the same settle window;
-     * a still-unfittable request refuses exactly as before. */
+     * reversible one last).  The quote's exact deficit bounds the collect
+     * (deficit + one more headroom of slack: the shared margin's 1 GiB
+     * default exceeds the measured post-trim MemAvailable drift band, so
+     * the re-poll cannot land exactly on the fit line and lose to
+     * kswapd); a numberless quote keeps the lite-4 whole-commons shape.
+     * The SERVER ranks the victims by warm value (cheapest first;
+     * protected and deep-pinned banks are hard-excluded and remain
+     * intact), prepare quotes each bank's exact trim preimage against its
+     * lineage stamp, commit trims in bulk with one sync, and only banks
+     * whose content was actually destroyed lose their warm records --
+     * plan step 5's persist set is empty by construction (the pin tier
+     * IS the excluded set; preserved in place beats persist-then-
+     * destroy).  Then re-run the same settle window; a still-unfittable
+     * request refuses exactly as before, warm state uncorrupted. */
     if (!min_fits && s->batch_ctx) {
         uint64_t want = UINT64_MAX;
         if (fq.deficit_bytes > 0) {
             want = fq.deficit_bytes + fq.headroom_bytes;
             if (want < fq.deficit_bytes) want = UINT64_MAX;   /* saturate */
         }
-        const uint64_t freed = ds4_batch_ctx_trim_free(s->batch_ctx, want);
-        if (freed) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: serial fit reclaim: trimmed %.1f MiB of free-bank cache "
-                       "for a %d-token serial request (deficit %.1f MiB + %.1f MiB slack)",
-                       (double)freed / 1048576.0, j->req.prompt.len,
-                       (double)fq.deficit_bytes / 1048576.0,
-                       (double)fq.headroom_bytes / 1048576.0);
-            for (int tries = 0; tries < 20 && !min_fits; tries++) {
-                if (ds4_engine_session_graph_fit_quote(s->engine, (int)need_min, &fq))
-                    min_fits = true;
-                else
-                    usleep(100 * 1000);
+        uint32_t ordered[DS4_COALESCE_HARD_MAX];
+        const uint32_t nrank = serial_reclaim_rank(s, ordered);
+        ds4_reclaim_plan rplan;
+        if (nrank > 0 &&
+            ds4_batch_ctx_reclaim_prepare(s->batch_ctx, ordered, nrank, want,
+                                          &rplan) == DS4_RECLAIM_OK &&
+            rplan.n > 0) {
+            ds4_reclaim_result rr = {0};
+            (void)ds4_batch_ctx_reclaim_commit(s->batch_ctx, &rplan, &rr);
+            for (uint32_t i = 0; i < rplan.n; i++) {
+                const ds4_reclaim_bank *rb = &rplan.banks[i];
+                if (rb->status == DS4_RECLAIM_OK ||
+                    rb->status == DS4_RECLAIM_PARTIAL)
+                    warm_rec_invalidate(s, (int)rb->bank);   /* only reclaimed */
+            }
+            if (rr.bytes_released > 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: serial fit reclaim: %u bank(s), %.1f MiB released "
+                           "for the serial lane (reclaim) [%s, %u planned, %u stale] "
+                           "(deficit %.1f MiB + %.1f MiB slack, prompt=%d)",
+                           rr.banks_reclaimed,
+                           (double)rr.bytes_released / 1048576.0,
+                           ds4_reclaim_status_str(rr.status),
+                           rplan.n, rr.banks_stale,
+                           (double)fq.deficit_bytes / 1048576.0,
+                           (double)fq.headroom_bytes / 1048576.0,
+                           j->req.prompt.len);
+                for (int tries = 0; tries < 20 && !min_fits; tries++) {
+                    if (ds4_engine_session_graph_fit_quote(s->engine, (int)need_min, &fq))
+                        min_fits = true;
+                    else
+                        usleep(100 * 1000);
+                }
             }
         }
     }
@@ -14491,6 +14520,55 @@ static int warm_victim_pick(server *s, const bool *occ, int excl, bool evict_lru
     if (sup >= 0) return sup;
     if (!evict_lru) return -1;
     return lru >= 0 ? lru : deep_lru;
+}
+
+/* memgov D4-2 (plan sec 10 step 3): rank idle banks for the serial lane's
+ * reclaim, cheapest warm value first -- no-retained-value banks, then
+ * superseded records by LRU, then shallow records by LRU.  HARD exclusions,
+ * unlike the evict tiers' cold-admit fallbacks: retention-protected
+ * continuation banks and DEEP records (>= warm_pin_min committed).  The D4
+ * gate promises both remain intact, and a deep record preserved in place
+ * dominates the plan's persist-then-destroy step -- kv_cache_store_bank's
+ * pin tier is exactly the set excluded here, so the reclaim persist set is
+ * empty by construction.  A deep COMMITTED bank whose record was
+ * invalidated has no warm promise left (nothing can match it) and ranks as
+ * no-value.  Occupancy is structural: the pass drivers hold gen_mu for
+ * their whole life, so under gen_mu on the serial path no bank is live,
+ * prefilling or credited.  Returns the count written to out[] (capacity
+ * batch_ctx_max_seq). */
+static uint32_t serial_reclaim_rank(server *s, uint32_t *out) {
+    const int ms = s->batch_ctx_max_seq;
+    const double now = now_sec();
+    static const bool no_occ[DS4_COALESCE_HARD_MAX] = {false};
+    uint32_t n = 0;
+    for (int b = 0; b < ms; b++) {             /* tier 0: no retained value */
+        if (cont_registry_bank_protected(s, b, now)) continue;
+        if (s->warm && s->warm[b].valid) continue;
+        out[n++] = (uint32_t)b;
+    }
+    if (!s->warm) return n;   /* warm records off: every bank ranked no-value */
+    /* tiers 1+2: valid shallow records -- superseded first, then plain,
+     * each ascending last_use.  Tail insertion keeps the array ordered;
+     * ms <= 64 so the quadratic walk is noise beside one page trim. */
+    for (int tier = 1; tier <= 2; tier++) {
+        const uint32_t tier_lo = n;
+        for (int b = 0; b < ms; b++) {
+            if (cont_registry_bank_protected(s, b, now)) continue;
+            if (!s->warm[b].valid) continue;
+            if (s->warm_pin_min > 0 &&
+                ds4_batch_ctx_bank_committed(s->batch_ctx, b, NULL) >= s->warm_pin_min)
+                continue;                      /* deep: intact, always */
+            if ((warm_rec_superseded(s, no_occ, b) ? 1 : 2) != tier) continue;
+            uint32_t k = n++;
+            while (k > tier_lo &&
+                   s->warm[out[k - 1]].last_use > s->warm[b].last_use) {
+                out[k] = out[k - 1];
+                k--;
+            }
+            out[k] = (uint32_t)b;
+        }
+    }
+    return n;
 }
 
 /* v0.3 durable banks: victim pick for a DISK-tier restore.  Prefer a
