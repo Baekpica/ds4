@@ -254,6 +254,11 @@ log "(f) D2-5 full-board composite: every family's enforce refusal in one boot"
 # and both still complete via the fallback.  This log
 # (/tmp/d0bboard_boot.log) carries INTENTIONAL refusal disclosures --
 # EXCLUDED from zero-DISAGREE audits BY PATH.
+# COALESCE_WAIT_MS=1000 (second-run finding): the wait defaults to 0,
+# so the gather only groups jobs ALREADY queued -- concurrent curls
+# arrive with ms skew and each collapsed to run_job_single (served,
+# but never touching the per-call path this leg exists to refuse).
+# The knob exists exactly for burst-arrival skew.
 # BOOT pinned to OBSERVE (first-run finding, 08-14): the materializer's
 # claims also carry the floor, and on this box geometry (85 GiB model,
 # ~34 GiB slack) any floor big enough to refuse prewarm (>~30 GiB) also
@@ -266,7 +271,7 @@ log "(f) D2-5 full-board composite: every family's enforce refusal in one boot"
 R 'ps -eo pid,comm | awk '"'"'$2=="ds4-server"{print $1}'"'"' | xargs -r kill' 2>/dev/null
 sleep 10
 ssh -o ConnectTimeout=10 "$HOST" \
-    "cd $TEST_TREE && DS4_BATCH_FIT_HEADROOM_MB=1000000 DS4_MEM_FLOOR_GB=600 DS4_MEMGOV_BOOT=observe setsid nohup ./ds4-server -c $CTX > /tmp/d0bboard_boot.log 2>&1 < /dev/null & exit 0" &
+    "cd $TEST_TREE && DS4_BATCH_FIT_HEADROOM_MB=1000000 DS4_MEM_FLOOR_GB=600 DS4_MEMGOV_BOOT=observe DS4_SERVER_COALESCE_WAIT_MS=1000 setsid nohup ./ds4-server -c $CTX > /tmp/d0bboard_boot.log 2>&1 < /dev/null & exit 0" &
 LP=$!; sleep 5; kill $LP 2>/dev/null || true
 BOOTED=0
 for i in $(seq 240); do
