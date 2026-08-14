@@ -176,8 +176,16 @@ extract_decisions() { # $1 remote log  $2 local out
     # The D1a-4 range-plan porcelain ends in "refused N" and matches the
     # 'refus' family pattern -- excluded by construction (the control
     # cannot print it; d1a residency-gate l1 first-run finding).
+    # memgov D2-2b amendment (08-14): the fit CLAMP line's PRESENCE is
+    # free-input-derived (prints only when n < requested); a fresh-box
+    # T/C pair whose free sits AT the requested boundary can straddle
+    # the print threshold (residency l1 finding, T=31 clamped vs C=32
+    # unclamped).  Excluded from the byte-diff; fit_shape byte-compares
+    # its shape-derived operands when both sides print, and the
+    # presence-jitter rule in oracle_leg adjudicates asymmetry.
     R "grep -E 'batch fit|batch vmm|mem floor|boot ledger|refus|reject|no graph fits|admission|serial fit' $1" \
         | grep -v 'ds4: range plan ' \
+        | grep -v 'batch fit: free=' \
         | sed -E 's/^[0-9]{4} [0-9:]{8} //; s/free=[0-9.]+ GiB/free=# GiB/g; s/MemAvailable[= ][0-9.]+/MemAvailable=#/g; s/capacity [0-9.]+ GiB/capacity # GiB/g; s/max_seq [0-9]+/max_seq #/g; s/x [0-9]+ banks/x # banks/g; s/budget=[0-9.]+ GiB/budget=# GiB/g; s/\[plan [0-9.]+, capacity [0-9.]+\]/[plan #, capacity #]/g; s/only [0-9]+ MiB allocatable/only # MiB allocatable/g' \
         > "$2"
 }
@@ -193,6 +201,10 @@ print('DIVERGENT'); exit(1)"
 }
 fit_free_gib() { R "grep 'batch fit' $1 | head -1" | grep -o 'free=[0-9.]*' | cut -d= -f2; }
 fit_max_seq()  { R "grep 'batch fit' $1 | head -1" | grep -o 'max_seq [0-9]*' | awk '{print $2}'; }
+fit_requested() { R "grep -m1 'batch fit: free=' $1" | grep -o '(requested [0-9]*' | grep -o '[0-9]*'; }
+# The clamp line with free-input operands masked: what remains is
+# shape-derived (per_bank, headroom, substrate) and must byte-match.
+fit_shape() { R "grep -m1 'batch fit: free=' $1" | sed -E 's/free=[0-9.]+ GiB/free=# GiB/; s/max_seq [0-9]+/max_seq #/'; }
 vmm_banks()    { R "grep 'batch vmm' $1 | head -1" | grep -o 'x [0-9]* banks' | grep -o '[0-9]*'; }
 
 # ---- (a) decision oracle: three legs x (test, control) ----
@@ -215,11 +227,48 @@ oracle_leg() { # $1 name  $2 env  $3 ctx
             diff "/tmp/d0aclose_${name}_T.dec" "/tmp/d0aclose_${name}_C.dec" | head -12
             die "$name: decision families differ (normalized byte-diff)"
         fi
-        local ft fc mt mc bt bc mv bv
+        local ft fc mt mc bt bc mv bv req pres
         ft=$(fit_free_gib "/tmp/d0aclose_${name}_T.log"); fc=$(fit_free_gib "/tmp/d0aclose_${name}_C.log")
         mt=$(fit_max_seq  "/tmp/d0aclose_${name}_T.log"); mc=$(fit_max_seq  "/tmp/d0aclose_${name}_C.log")
         bt=$(vmm_banks    "/tmp/d0aclose_${name}_T.log"); bc=$(vmm_banks    "/tmp/d0aclose_${name}_C.log")
         log "(a) $name inputs: free T=$ft C=$fc GiB; max_seq T=$mt C=$mc; vmm_banks T=${bt:--} C=${bc:--}"
+        # D2-2b amendment: neither side clamped (fresh box funds the full
+        # request) -- no free-derived fit family printed; the vmm bank
+        # counts must be exactly equal.
+        if [ -z "$ft" ] && [ -z "$fc" ]; then
+            if [ "${bt:-}" = "${bc:-}" ]; then
+                log "(a) $name PASS (unclamped both sides; banks $bt/$bc exactly equal)"
+                return 0
+            fi
+            log "(a) $name: unclamped both sides but banks differ -- retrying pair once"
+            continue
+        fi
+        # D2-2b amendment: exactly ONE side clamped -- the presence-jitter
+        # shape (residency l1 finding).  The absent side funded its full
+        # request, which REQUIRES its budget to be the higher one, so
+        # direction is structural; only the one-step magnitude and the
+        # bank counts need checking.
+        if [ -z "$ft" ] || [ -z "$fc" ]; then
+            if [ -n "$ft" ]; then pres=$mt; req=$(fit_requested "/tmp/d0aclose_${name}_T.log")
+                if [ "$pres" = "$((req - 1))" ] && [ "$bt" = "$pres" ] && [ "$bc" = "$req" ]; then
+                    log "(a) $name PASS (max_seq=PRESENCE-JITTER $pres vs unclamped $req; banks $bt/$bc)"
+                    return 0
+                fi
+            else pres=$mc; req=$(fit_requested "/tmp/d0aclose_${name}_C.log")
+                if [ "$pres" = "$((req - 1))" ] && [ "$bc" = "$pres" ] && [ "$bt" = "$req" ]; then
+                    log "(a) $name PASS (max_seq=PRESENCE-JITTER unclamped $req vs $pres; banks $bt/$bc)"
+                    return 0
+                fi
+            fi
+            log "(a) $name: presence asymmetry beyond one step -- retrying pair once"
+            continue
+        fi
+        # Both clamped: the shape-derived operands must byte-match (this
+        # was the byte-diff's job before the clamp line left it).
+        if [ "$(fit_shape "/tmp/d0aclose_${name}_T.log")" != "$(fit_shape "/tmp/d0aclose_${name}_C.log")" ]; then
+            fit_shape "/tmp/d0aclose_${name}_T.log"; fit_shape "/tmp/d0aclose_${name}_C.log"
+            die "$name: fit-line shape mismatch (per_bank/headroom/substrate)"
+        fi
         # Input-quality precondition for the jitter adjudication: the free
         # inputs must sit inside a 1.0 GiB band or the derived comparison
         # judges BOX STATE, not the formula.  A violated precondition gets
@@ -287,9 +336,16 @@ print('census=%.2f sys_delta=%.2f diff=%.2f tol=%.2f -> %s' % (census, sys, abs(
 log "(b) reconciliation: $RECON (sources: /metrics census totals; /proc/meminfo MemAvailable ${PRE_MB}M->${POST_MB}M)"
 echo "$RECON" | grep -q 'OK$' || die "reconciliation outside tolerance"
 # Substrate tripwire bit-identity (census totals line vs fit line).
+# D2-2b amendment: an UNCLAMPED recon boot (fresh box funds the full
+# request) prints no fit line -- the tripwire is vacuous there, not a
+# failure; any clamped boot still asserts it.
 SUB_C=$(R "grep 'memory census totals:' /tmp/d0aclose_recon.log | head -1" | grep -o 'substrate_outstanding=[0-9.]*' | cut -d= -f2)
 SUB_F=$(R "grep 'batch fit' /tmp/d0aclose_recon.log | head -1" | grep -o 'substrate outstanding=[0-9.]*' | grep -o '[0-9.]*')
-[ "$SUB_C" = "$SUB_F" ] || die "substrate tripwire mismatch census=$SUB_C fit=$SUB_F"
+if [ -n "$SUB_F" ]; then
+    [ "$SUB_C" = "$SUB_F" ] || die "substrate tripwire mismatch census=$SUB_C fit=$SUB_F"
+else
+    log "(b) substrate tripwire: recon boot unclamped (no fit line) -- vacuous"
+fi
 log "(b) PASS (ENGINE_OTHER=0 faults=0 host_pin==registered substrate bit-identical)"
 
 # ---- (d2) ABBA perf close vs control (short decode leg) ----

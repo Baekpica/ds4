@@ -126,7 +126,17 @@ stable_avail() { # two reads within 150M (d0a ABORT-on-unstable law)
 # porcelain ends in "refused N" and would otherwise leak in through the
 # 'refus' family pattern (l1 first-run finding, 2026-08-12).
 extract_decisions() { # $1 remote log  $2 local out
+    # memgov D2-2b amendment (08-14): the fit CLAMP line is excluded from
+    # the byte-diff -- its PRESENCE is free-input-derived (prints only
+    # when n < requested), and on a fresh box whose free sits at the
+    # requested-count boundary (~23.2 GiB at 32 banks) a T/C pair can
+    # straddle the print threshold (observed: T clamps 31, C funds 32 --
+    # presence asymmetry no operand mask can absorb).  The line's
+    # shape-derived operands (per_bank, headroom, substrate) are still
+    # byte-compared by fit_shape when both sides print; max_seq keeps its
+    # separate jitter adjudication, extended with the presence rule.
     R "grep -E 'batch fit|batch vmm|mem floor|boot ledger|refus|reject|no graph fits|admission|serial fit' $1" \
+        | grep -v 'batch fit: free=' \
         | grep -v 'ds4: range plan ' \
         | sed -E 's/^[0-9]{4} [0-9:]{8} //; s/free=[0-9.]+ GiB/free=# GiB/g; s/MemAvailable[= ][0-9.]+/MemAvailable=#/g; s/capacity [0-9.]+ GiB/capacity # GiB/g; s/max_seq [0-9]+/max_seq #/g; s/x [0-9]+ banks/x # banks/g; s/budget=[0-9.]+ GiB/budget=# GiB/g; s/\[plan [0-9.]+, capacity [0-9.]+\]/[plan #, capacity #]/g' \
         > "$2"
@@ -140,6 +150,10 @@ print('DIVERGENT'); exit(1)"
 }
 fit_free_gib() { R "grep 'batch fit' $1 | head -1" | grep -o 'free=[0-9.]*' | cut -d= -f2; }
 fit_max_seq()  { R "grep 'batch fit' $1 | head -1" | grep -o 'max_seq [0-9]*' | awk '{print $2}'; }
+fit_requested() { R "grep -m1 'batch fit: free=' $1" | grep -o '(requested [0-9]*' | grep -o '[0-9]*'; }
+# The clamp line with its free-input operands masked: what remains is
+# shape-derived (per_bank, headroom, substrate) and must byte-match.
+fit_shape() { R "grep -m1 'batch fit: free=' $1" | sed -E 's/free=[0-9.]+ GiB/free=# GiB/; s/max_seq [0-9]+/max_seq #/'; }
 vmm_banks()    { R "grep 'batch vmm' $1 | head -1" | grep -o 'x [0-9]* banks' | grep -o '[0-9]*'; }
 
 # ---- shared assert batteries ----
@@ -203,12 +217,12 @@ pair_leg() { # $1 name  $2 env  $3 flags  $4.. expected sources
             diff "/tmp/d1ares_${name}_T.dec" "/tmp/d1ares_${name}_C.dec" | head -12
             die "$name: decision families differ (normalized byte-diff)"
         fi
-        local ft fc mt mc bt bc mv bv band
+        local ft fc mt mc bt bc mv bv band req pres
         ft=$(fit_free_gib "$TLOG"); fc=$(fit_free_gib "$CLOG")
         mt=$(fit_max_seq  "$TLOG"); mc=$(fit_max_seq  "$CLOG")
         bt=$(vmm_banks    "$TLOG"); bc=$(vmm_banks    "$CLOG")
         log "($name) inputs: free T=$ft C=$fc GiB; max_seq T=$mt C=$mc; vmm_banks T=${bt:--} C=${bc:--}"
-        if [ -z "$ft" ] || [ -z "$fc" ]; then
+        if [ -z "$ft" ] && [ -z "$fc" ]; then
             # Pinned-budget shapes (l5 raw: banks come straight from
             # DS4_BATCH_VMM_BUDGET_MB) print NO free-derived 'batch fit'
             # family -- there is nothing to band-check and no jitter
@@ -221,6 +235,34 @@ pair_leg() { # $1 name  $2 env  $3 flags  $4.. expected sources
             fi
             log "($name): no fit family and derived decisions unequal -- retrying pair once"
             continue
+        fi
+        if [ -z "$ft" ] || [ -z "$fc" ]; then
+            # Exactly ONE side clamped: the presence-jitter shape (08-14
+            # finding -- fresh-box free sits AT the requested boundary).
+            # The absent side funded its full request, which REQUIRES its
+            # budget to be the higher one, so direction is structural;
+            # only the one-step magnitude needs checking.  The present
+            # side's banks must equal its clamp, the absent side's banks
+            # its request.
+            if [ -n "$ft" ]; then pres=$mt; req=$(fit_requested "$TLOG"); mv="$bt/$bc"
+                if [ "$pres" = "$((req - 1))" ] && [ "$bt" = "$pres" ] && [ "$bc" = "$req" ]; then
+                    log "($name) PASS (max_seq=PRESENCE-JITTER $pres vs unclamped $req; banks $bt/$bc)"
+                    sleep 10; return 0
+                fi
+            else pres=$mc; req=$(fit_requested "$CLOG")
+                if [ "$pres" = "$((req - 1))" ] && [ "$bc" = "$pres" ] && [ "$bt" = "$req" ]; then
+                    log "($name) PASS (max_seq=PRESENCE-JITTER unclamped $req vs $pres; banks $bt/$bc)"
+                    sleep 10; return 0
+                fi
+            fi
+            log "($name): presence asymmetry beyond one step -- retrying pair once"
+            continue
+        fi
+        # Both clamped: the shape-derived operands must byte-match (this
+        # was the byte-diff's job before the clamp line left it).
+        if [ "$(fit_shape "$TLOG")" != "$(fit_shape "$CLOG")" ]; then
+            fit_shape "$TLOG"; fit_shape "$CLOG"
+            die "$name: fit-line shape mismatch (per_bank/headroom/substrate)"
         fi
         band=$(python3 -c "print(1 if abs($ft-$fc)<1.0 else 0)")
         if [ "$band" != "1" ]; then
