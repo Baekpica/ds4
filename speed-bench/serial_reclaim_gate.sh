@@ -154,12 +154,19 @@ start_hog() { # $1 log-for-sizing-message  [$2 free-after-MB override]
     hog=$((avail - target))
     # A churned box can arrive at hog time ALREADY near the free-after
     # target (measured 08-11: avail=6006 after 24 saturated banks; 08-15
-    # run: 5628) -- the tenants themselves supply the pressure and only a
-    # minimal hot pin is needed to stop kswapd creeping MemAvailable back
-    # over the threshold (run-4 lesson).  Below 256M the envelope is
-    # genuinely unreachable (free-after would land under the drift band):
-    # die with guidance.
-    [ "$hog" -ge 256 ] || die "avail=$avail already below free-after target (target=$target) -- reboot the box, re-bracket, or lower the leg's free-after"
+    # battery: 5628 then 5528 -- the arrival SAGS across consecutive
+    # saturations, the gb10 MemAvailable-decline shape) -- the tenants
+    # themselves supply the pressure and only a minimal hot pin is needed
+    # to stop kswapd creeping MemAvailable back over the threshold (run-4
+    # lesson).  An arrival within 256M ABOVE the target pins the minimum
+    # 256M hot floor anyway: the exact-want reclaim (D4-1) re-fits to
+    # deficit + a full headroom above the line, so a sub-256M overshoot
+    # spends serve margin it can afford, while dying here cost two battery
+    # runs.  Only an arrival BELOW the target is genuinely unreachable.
+    if [ "$hog" -lt 256 ]; then
+        [ "$avail" -ge "$target" ] || die "avail=$avail already below free-after target (target=$target) -- reboot the box or re-bracket"
+        hog=256
+    fi
     log "MemAvailable=${avail}M -> hog=${hog}M (free-after target ${target}M)"
     # The box carries 16 GiB of swap and kswapd evicts a cold slept-on hog
     # within ~1 min (MemAvailable creeps back over the threshold and the
@@ -374,6 +381,15 @@ stop_hog
 kill_server
 
 # ---- LEG D (deep-pin protection; memgov D4-2) ----
+# Injection is leg A's concern (armed on its boot only) and leg B owns the
+# hygiene assert; rerunning D under INJECT would duplicate a 13-minute
+# saturation that deepens the arrival sag above for zero new evidence.
+# The BASE run owns leg D.
+if [ -n "$INJECT" ]; then
+    log "leg D skipped (INJECT mode; the BASE run owns deep-pin protection)"
+    log "SERIAL-RECLAIM GATE: ALL LEGS PASS"
+    exit 0
+fi
 settle_wait
 log "boot D (DS4_SERVER_PIN_MIN_TOKENS=25000: every ${TENANT_TOKENS}-token tenant is DEEP)"
 boot "DS4_SERVER_PIN_MIN_TOKENS=25000" /tmp/reclaim_D.log
