@@ -1,7 +1,7 @@
 # Motif-3 DGX Spark 최적화 작업 handoff
 
-기준 시각: **2026-08-14 12:17 KST** (재개 세션 진행 내역은 §0에 누적;
-후속 재개 결과는 §0.14까지 반영)
+기준 시각: **2026-08-14 12:25 KST** (재개 세션 진행 내역은 §0에 누적;
+후속 재개 결과는 §0.15까지 반영)
 
 상태: **§9.1–9.9 완료. 합성 BF16 projection 실패는 current full-copy보다
 같은 host 주소의 과거 range가 먼저 선택된 것이 원인이었고, 최소 resolver
@@ -9,9 +9,10 @@
 cuda-spark, synthetic long-context CUDA regression까지 통과했다. 코드 리뷰에서
 발견한 resident/long test의 v0.5.6.3 API 및 구식 full-copy 수명주기 충돌도
 VMM owner/import 계약으로 포트했다(§0.13). 전체 diff/warning review와 관련
-회귀 재실행도 완료했다(§0.14). 다음 단계는 `git cherry-pick --continue`와
-남은 세 commit의 순차 이식이다. 모델 프로세스·weight owner·서버는
-아직 실행하지 않았다.**
+회귀 재실행도 완료했다(§0.14). 원본 네 commit의 v0.5.6.3 이식은
+`64c67a0`까지 완료했다(§0.15). 다음 단계는 메모리 preflight 뒤 VMM owner
+dry-run과 2K 실모델 gate다. 모델 프로세스·weight owner·서버는 아직
+실행하지 않았다.**
 
 ## 0. 재개 세션 진행 내역 (2026-08-14, §9 순서 수행)
 
@@ -223,6 +224,25 @@ VMM owner/import 계약으로 포트했다(§0.13). 전체 diff/warning review�
       전에 정확히 exit 2임을 확인했다. 따라서 이번 검증 중 full GGUF device
       load나 모델 프로세스 생성은 없었다.
 
+15. **원본 commit sequence 완료와 문서/API 충돌 해소** —
+    - `01e1be0` Add native Motif-3 loader and latent CUDA runtime
+    - `b085b1c` Document resident Motif-3 serving
+    - `ae0d3a2` Advertise Motif model ID from OpenAI server
+    - `64c67a0` Preserve complete question in Motif 256K gate
+    - README 충돌에서는 v0.5.6.3에서 제거된 `ds4_help.c`를 복원하지 않았고,
+      존재하지 않는 `--model/--ctx/--prefill-chunk/--batched-session` 예시를
+      현행 `-m/-c`와 VMM owner/import 명령으로 교체했다. 실모델 API·성능·
+      256K는 fixture 결과와 분리해 미검증 release gate로 명시했다.
+    - `/v1/models`는 여러 alias를 선택 가능한 모델처럼 나열하지 않고
+      `server_model_id_from_engine()`으로 실제 로드된 family 하나만 광고하는
+      v0.5.6.3 동작을 보존했다. DeepSeek 두 ID와 Motif 두 ID의 alias 단위
+      테스트를 추가했고 전체 server unit이 다시 통과했다.
+    - 마지막 commit의 v2 fixture 질문 tail 25-token 보존을 적용한 뒤 long
+      binary를 재링크했다. 262,144-token source fixture를 전달한 상태에서도
+      live manifest가 없으면 model open 전에 정확히 exit 2임을 재확인했다.
+      branch는 `upstream/batched-serving` 대비 ahead 4이고 소스 tracked
+      worktree는 clean이다(생성 바이너리만 untracked).
+
 남은 경계(사실로 기록):
 - 엔진 **static batch core**(`ds4_batch_generate_core`)는 여전히 per-seq
   eos 단일 비교 — 순수 코어에 vocab 접근이 없어 보류. 서버측 detok 절단이
@@ -232,6 +252,12 @@ VMM owner/import 계약으로 포트했다(§0.13). 전체 diff/warning review�
   round**(첫 블록 close에서 finish=tool_calls). Motif가 한 턴에 여러
   `<tool_call>`을 직렬 방출하는 케이스는 연속 턴으로 처리된다.
 - `make test`의 모델 의존 구간은 DeepSeek GGUF 확보 전까지 실행 불가.
+- 현재 `test_motif3_long`은 262,144-token **source fixture**에서 filler 64개를
+  제거해 262,080 prompt + 최대 64 decode를 native 262,144 window에 넣는다.
+  이는 full-window semantic/decode gate지만 §3의 더 엄격한 “262,144 prompt
+  prefill 뒤 decode”와는 다르다. 현행 session은 `prompt.len >= ctx_size`를
+  거부하고 Motif native cap도 262,144이므로, 최종 주장 전에 이 경계를
+  의도적으로 해결하거나 strict gate 미충족으로 남겨야 한다.
 
 ## 1. 최종 목표
 
@@ -371,30 +397,28 @@ upstream https://github.com/Entrpi/ds4.git
 
 ### 현재 cherry-pick 경계
 
-현재 `CHERRY_PICK_HEAD`:
+원본 네 commit은 v0.5.6.3 위에 다음 로컬 SHA로 모두 이식됐다.
 
 ```text
-0a360dbe46dd50d26e170300adf18993ac3ab1a0 Add native Motif-3 loader and latent CUDA runtime
+01e1be0 Add native Motif-3 loader and latent CUDA runtime
+b085b1c Document resident Motif-3 serving
+ae0d3a2 Advertise Motif model ID from OpenAI server
+64c67a0 Preserve complete question in Motif 256K gate
 ```
 
-남은 순서:
+`CHERRY_PICK_HEAD`는 없고 branch는 base 대비 ahead 4다. conflict marker,
+staged/unstaged tracked 변경은 없다. 생성된 테스트/weight-server 바이너리는
+검증 산출물이므로 Git에 추가하지 않는다.
 
-```text
-bbce7eecf54703ae315328d4e240531c5a9f1a22 Document resident Motif-3 serving
-fa3f24f84f52fc91a0769b2eca021c95b422746e Advertise Motif model ID from OpenAI server
-d878ea1a1d67bc0f0bd60e20e75b4a011aa2d8d9 Preserve complete question in Motif 256K gate
-```
-
-첫 cherry-pick의 모든 conflict marker는 해소했고 conflict 파일은 index에 stage했다. `git diff --check --cached`도 통과했다. 그러나 아직 `git cherry-pick --continue`하지 않았다. 빌드와 v0.5.6.3 call-site 통합을 완료한 뒤 continue해야 한다.
-
-비교용 scratch worktree 두 개는 실제 산출물이 아니다.
+비교용 scratch worktree 두 개는 실제 산출물이 아니며 검토 후 제거했다.
 
 ```text
 /home/sunghoon/workspace/ds4-exaone/scratch/ds4-motif-port-solarbase
 /home/sunghoon/workspace/ds4-exaone/scratch/ds4-motif-merge-v0563
 ```
 
-필요한 비교가 끝난 뒤 각 작업 상태를 확인하고 안전하게 abort/remove한다. 현재 통합 branch에 합치지 않는다.
+clean v0.5.6.3 비교용 `scratch/ds4-v0563-baseline`만 upstream 회귀 판정
+증거로 유지한다.
 
 ## 7. 현재까지 반영한 코드
 
@@ -498,8 +522,10 @@ ds4_server_cpu.o: compile pass (warning 있음)
 8. CPU/object build, server unit, Motif loader/reference/tokenizer test를 통과시킨다.
 9. **완료:** `make cuda-spark` 후 cubin `sm_121a`, CUDA primitive 및
    synthetic long-context regression을 통과시킨다(증거 §0.12).
-10. 그 뒤에만 `git cherry-pick --continue`하고 남은 세 commit을 순서대로 이식한다.
-11. 각 commit 뒤 `git diff --check`, 관련 test, 코드 리뷰를 수행한다.
+10. **완료:** `git cherry-pick --continue`와 남은 세 commit을 순서대로
+    이식했다(최종 `64c67a0`, 증거 §0.15).
+11. **완료:** 각 충돌을 현행 v0.5.6.3 lifecycle/API 기준으로 review하고
+    `git diff --check`, server unit, long safety gate를 재실행했다.
 
 ## 10. weight owner와 inference worker 운용 기준
 
@@ -638,7 +664,11 @@ ncu \
 - 메모리 peak와 종료 후 회수 확인
 - 가능하면 long-context semantic/needle fixture
 
-262,144 gate는 prompt가 정확히 요구 길이를 포함해야 하며, prefill 도중 중단되면 실패/미완료다. 245,760 같은 근접 수치를 256K로 반올림하지 않는다.
+262,144 strict gate는 prompt가 정확히 요구 길이를 포함해야 하며, prefill
+도중 중단되면 실패/미완료다. 245,760 같은 근접 수치를 256K로 반올림하지
+않는다. 현재 long harness의 262,080 prompt + 64 decode는 별도의
+“native-window-full” 증거로 기록하고 strict 262,144-prompt pass로 표기하지
+않는다.
 
 ## 15. API acceptance matrix
 
@@ -674,8 +704,7 @@ Git과 HF 어느 쪽도 문서보다 먼저 갱신하지 않는다. model card�
 
 ## 17. 현재까지도 하지 않은 일
 
-- cherry-pick continue/commit/push (모든 재개 세션 변경은 워킹트리
-  unstaged 상태로 staged cherry-pick 위에 얹혀 있다)
+- Git remote push (로컬 통합 commit은 완료)
 - Hugging Face upload
 - weight owner live allocation
 - inference worker 실행
@@ -685,6 +714,6 @@ Git과 HF 어느 쪽도 문서보다 먼저 갱신하지 않는다. model card�
 - 32K 이상 Spark 실행
 - 256K 통과 주장
 
-다음 단계: staged/unstaged 전체 diff와 새 회귀 테스트를 review하고
-`git diff --check`를 통과시킨 뒤, **§9.10 (`git cherry-pick --continue`)**으로
-넘어간다. 그 뒤 남은 세 commit을 순서대로 이식한다.
+다음 단계: §5의 `nvtop`+`btop`/PID/메모리 점검을 수행하고, §10의
+`ds4_weight_server --dry-run` preflight를 기록한다. 통과한 뒤에만 live VMM
+owner와 2K worker correctness/API gate로 넘어간다.
