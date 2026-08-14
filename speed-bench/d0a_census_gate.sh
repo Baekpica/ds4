@@ -362,10 +362,29 @@ log "(b) PASS (ENGINE_OTHER=0 faults=0 host_pin==registered substrate bit-identi
 # per-request path is stable).  Both sides boot --no-spec --no-mtp
 # (launch-defaults law: accept-rate variance alone busts a 5% band) and
 # pay one warmup request (graph capture + page warm) before measuring.
+# D2 stage-close amendment (08-14): every measurement boot gets the
+# stable-start guard -- the previous boot's ~110 GiB teardown can still
+# be reclaiming when the next launches, and an unsettled boot raced the
+# reclaim and was OOM-shot ~20 s in (C1 12:09; the SAME tree booted
+# clean 90 s later).  And `die` inside $() only kills the SUBSHELL --
+# the parent kept computing with boot-log text as a number -- so the
+# subshell now returns sentinel words and the PARENT validates.
+abba_settle() { # the teardown's reclaim must finish before a boot
+    for i in $(seq 60); do
+        [ "$(avail_mb)" -ge 90000 ] && return 0
+        sleep 5
+    done
+    return 1
+}
 abba_ms_tok() { # $1 tree -> echoes decode_tok_s of a measured 256-token request
     kill_server
+    abba_settle || { echo UNSETTLED; return 1; }
     BOOT_FLAGS="--no-spec --no-mtp"
-    boot_tree "$1" "" "$CTX" /tmp/d0aclose_abba.log || die "ABBA boot failed ($1)"
+    if ! boot_tree "$1" "" "$CTX" /tmp/d0aclose_abba.log; then
+        BOOT_FLAGS=""
+        echo BOOTFAIL
+        return 1
+    fi
     BOOT_FLAGS=""
     R "nvidia-smi --query-gpu=clocks.sm --format=csv,noheader 2>/dev/null || echo clocks=n/a" >&2
     R "curl -s -m 300 localhost:$PORT/v1/chat/completions -H 'Content-Type: application/json' \
@@ -373,14 +392,18 @@ abba_ms_tok() { # $1 tree -> echoes decode_tok_s of a measured 256-token request
     local out
     out=$(R "curl -s -m 300 localhost:$PORT/v1/chat/completions -H 'Content-Type: application/json' \
         -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Write a 400-word story about a ledger.\"}],\"max_tokens\":256}'")
-    echo "$out" | grep -q finish_reason || die "ABBA request failed ($1)"
+    echo "$out" | grep -q finish_reason || { echo REQFAIL; return 1; }
     echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['timings']['decode_tok_s'])"
 }
+abba_num() { # $1 label  $2 value: numeric or die (in the PARENT)
+    echo "$2" | grep -qE '^[0-9]+(\.[0-9]+)?$' \
+        || die "ABBA $1 measurement invalid ($2)"
+}
 log "(d2) ABBA decode close (T C C T, per-request timings, plain decode)"
-T1=$(abba_ms_tok "$TEST_TREE");  log "  T1=$T1 tok/s"
-C1=$(abba_ms_tok "$CTRL_TREE");  log "  C1=$C1 tok/s"
-C2=$(abba_ms_tok "$CTRL_TREE");  log "  C2=$C2 tok/s"
-T2=$(abba_ms_tok "$TEST_TREE");  log "  T2=$T2 tok/s"
+T1=$(abba_ms_tok "$TEST_TREE");  abba_num T1 "$T1"; log "  T1=$T1 tok/s"
+C1=$(abba_ms_tok "$CTRL_TREE");  abba_num C1 "$C1"; log "  C1=$C1 tok/s"
+C2=$(abba_ms_tok "$CTRL_TREE");  abba_num C2 "$C2"; log "  C2=$C2 tok/s"
+T2=$(abba_ms_tok "$TEST_TREE");  abba_num T2 "$T2"; log "  T2=$T2 tok/s"
 kill_server
 ABBA=$(python3 -c "
 t=($T1+$T2)/2; c=($C1+$C2)/2
