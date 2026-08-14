@@ -16,6 +16,10 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+/* Bank payloads written after the replay-key contract was hardened.  Legacy
+ * bank files do not carry this bit and must never enter automatic bank restore:
+ * an old prompt-only key can name a longer unfinished-thinking frontier. */
+#define DS4_KVSTORE_EXT_BANK_REPLAY_V1     (1u << 4)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -171,6 +175,15 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
+/* Automatic bank lookup is deliberately separate at the API boundary.  It
+ * accepts wire-compatible serial checkpoints plus bank records carrying
+ * DS4_KVSTORE_EXT_BANK_REPLAY_V1, but rejects legacy/unknown bank keys so an
+ * upgrade cannot restore incompatible frontier semantics.  Every result is a
+ * strict text prefix so the restored bank always recomputes frontier logits. */
+int ds4_kvstore_find_bank_text_prefix(ds4_kvstore *kc,
+                                      const char *prompt_text,
+                                      int model_id, int quant_bits,
+                                      int ctx_size);
 /* v0.5.1: the disk twin of the server's P1 partial ranking -- best stored
  * record by byte-LCP against the prompt (>= min_lcp, and the salvage must
  * cover at least 1/8 of the record so a near-useless deep record never pays

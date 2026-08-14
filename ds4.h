@@ -40,6 +40,14 @@ typedef enum {
     DS4_THINK_MAX,
 } ds4_think_mode;
 
+/* Model-facing chat/tool wire grammar.  HTTP frontends need this one narrow
+ * capability bit so they can render and parse the checkpoint's native prompt
+ * protocol without depending on private tensor/model-family internals. */
+typedef enum {
+    DS4_CHAT_FORMAT_DSML = 0,
+    DS4_CHAT_FORMAT_SOLAR_OPEN2 = 1,
+} ds4_chat_format;
+
 typedef enum {
     DS4_LOG_DEFAULT,
     DS4_LOG_PREFILL,
@@ -167,11 +175,16 @@ int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
+ds4_chat_format ds4_engine_chat_format(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 /* Number of hyper-connection lanes (n_hc); hidden_f32_values / n_hc == n_embd. */
 int ds4_engine_n_hc(ds4_engine *e);
+/* Whether this model/backend currently implements the static and continuous
+ * multi-sequence graph APIs.  Servers use this capability to select lanes
+ * without hard-coding model families. */
+bool ds4_engine_supports_batching(ds4_engine *e);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
@@ -322,12 +335,24 @@ int  ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx);
  * ctx size; legacy one-shot admission (=0) keeps the historical raw-ring bound.
  * Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx);
+/* Whether this persistent context can rewind a retained bank to an earlier
+ * committed prefix for partial fork/truncate reuse.  Exact-frontier warm and
+ * fork reuse are separate capabilities.  Returns false for NULL. */
+bool ds4_batch_ctx_supports_partial_reuse(const ds4_batch_ctx *ctx);
 /* Batched generation over a persistent context (W4); same semantics as
  * ds4_engine_batched_generate_ex but reuses ctx's graph + slabs.  n <= ctx max_seq,
  * Σ(prompt len) <= ctx max_total_tokens. Returns 0 on success. */
 int  ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                      const int *max_new_tokens, const int *eos_ids,
                                      ds4_batch_gen_result *out, char *err, size_t errlen);
+
+/* ds4_cont_request.sample_override result encoding.  Zero and one retain the
+ * original ABI (none / greedy); values >=2 carry an exact token id. */
+#define DS4_SAMPLE_OVERRIDE_NONE              0
+#define DS4_SAMPLE_OVERRIDE_GREEDY            1
+#define DS4_SAMPLE_OVERRIDE_TOKEN(token_id)   ((token_id) + 2)
+#define DS4_SAMPLE_OVERRIDE_IS_TOKEN(value)   ((value) >= 2)
+#define DS4_SAMPLE_OVERRIDE_TOKEN_ID(value)   ((value) - 2)
 
 /* Phase 2 W5: continuous batching (mid-flight admit/evict) over a persistent ctx.
  * The scheduler maintains a rolling active set of up to ctx max_seq sequences: each
@@ -351,17 +376,16 @@ typedef struct {
     float      min_p;       /* relative floor; <0 => 0                         */
     uint64_t   seed;        /* per-seq RNG seed (caller resolves 0 if it wants */
                             /* distinct streams; 0 is a fixed, valid sequence) */
-    /* Per-token sampling override (NULL = none).  When set, the engine calls
-     * this immediately before sampling EACH of the row's tokens (seed token
-     * and every decode/accept step); a nonzero return forces that one token
-     * to greedy argmax (temperature 0) while the rest of the sampling block
-     * still applies to non-overridden tokens.  This is how a caller samples
-     * structural tool-call syntax deterministically while payload keeps the
-     * request's own params (the serial path's per-token DSML override).
-     * Argmax consumes NO RNG draw, and the caller's decision may depend only
-     * on tokens already reported via on_token -- so seeded streams stay
-     * aligned between the plain and speculative decode paths.  `ud`/`user`
-     * are the same handles on_token receives. */
+    /* Per-token sampling override (NULL = none).  The callback result is one
+     * of DS4_SAMPLE_OVERRIDE_* below: NONE keeps this sequence's sampler,
+     * GREEDY forces argmax, and TOKEN(id) selects that exact vocabulary id.
+     * The engine calls it immediately before EACH target token (seed and
+     * decode/accept steps).  Exact-token forcing lets protocol adapters open
+     * required structural syntax without teaching the inference engine about
+     * a wire format; GREEDY keeps the existing deterministic DSML-body path.
+     * Both consume NO RNG draw.  The decision may depend only on tokens already
+     * reported via on_token, preserving seeded plain/speculative alignment.
+     * `ud`/`user` are the same handles on_token receives. */
     int      (*sample_override)(void *ud, void *user);
     /* v0.5.2: liveness probe for the ADMISSION PREFILL phase (may be NULL).
      * Polled between prefill chunks; return 0 when the request's client is

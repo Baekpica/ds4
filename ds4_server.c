@@ -500,8 +500,40 @@ typedef enum {
 
 typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK,
+    SERVER_MODEL_SYNTAX_SOLAR_OPEN2,
     SERVER_MODEL_SYNTAX_MOTIF3,
 } server_model_syntax;
+
+typedef enum {
+    TOOL_CHOICE_AUTO,
+    TOOL_CHOICE_NONE,
+    TOOL_CHOICE_REQUIRED,
+} tool_choice_mode;
+
+#define DS4_SOLAR_IM_START            "<|im:start|>"
+#define DS4_SOLAR_IM_CONTENT          "<|im:content|>"
+#define DS4_SOLAR_IM_END              "<|im:end|>"
+#define DS4_SOLAR_THINK_START         "<|think:start|>"
+#define DS4_SOLAR_THINK_END           "<|think:end|>"
+#define DS4_SOLAR_TOOL_START          "<|tool:start|>"
+#define DS4_SOLAR_TOOL_END            "<|tool:end|>"
+#define DS4_SOLAR_TOOL_CALL_START     "<|tool_call:start|>"
+#define DS4_SOLAR_TOOL_CALL_END       "<|tool_call:end|>"
+#define DS4_SOLAR_TOOL_ARG_START      "<|tool_arg:start|>"
+#define DS4_SOLAR_TOOL_ARG_VALUE      "<|tool_arg:value|>"
+#define DS4_SOLAR_TOOL_ARG_END        "<|tool_arg:end|>"
+#define DS4_SOLAR_TOOL_RESPONSE_START "<|tool_response:start|>"
+#define DS4_SOLAR_TOOL_RESPONSE_END   "<|tool_response:end|>"
+
+static const char *chat_think_start(ds4_chat_format format) {
+    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+        ? DS4_SOLAR_THINK_START : "<think>";
+}
+
+static const char *chat_think_end(ds4_chat_format format) {
+    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+        ? DS4_SOLAR_THINK_END : "</think>";
+}
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
     static uint64_t fallback_ctr;
@@ -556,6 +588,7 @@ typedef struct {
      * happens to be named "tool_search". */
     bool responses_tool_search;
     char **prop;
+    char **prop_type;
     int len;
     int cap;
 } tool_schema_order;
@@ -654,7 +687,20 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
+    ds4_chat_format chat_format;
     bool has_tools;
+    /* True when this request follows an assistant tool call with one or more
+     * tool results.  These turns need room after thinking for the actual tool
+     * answer even when tool_choice is automatic. */
+    bool has_tool_results;
+    tool_choice_mode tool_choice;
+    /* Model-native control tokens, tokenized with special-token awareness.
+     * Required T1 consumes the tool opener after thinking closes; required T1
+     * and a pending tool-result T2 may consume the thinking closer to preserve
+     * room for their visible action or answer.  The engine stays protocol-
+     * agnostic through sample_override. */
+    ds4_tokens required_tool_prefix;
+    ds4_tokens required_think_end_prefix;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
@@ -775,8 +821,12 @@ static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
     free(o->wire_name);
     free(o->namespace);
-    for (int i = 0; i < o->len; i++) free(o->prop[i]);
+    for (int i = 0; i < o->len; i++) {
+        free(o->prop[i]);
+        free(o->prop_type ? o->prop_type[i] : NULL);
+    }
     free(o->prop);
+    free(o->prop_type);
     memset(o, 0, sizeof(*o));
 }
 
@@ -786,12 +836,17 @@ static void tool_schema_orders_free(tool_schema_orders *orders) {
     memset(orders, 0, sizeof(*orders));
 }
 
-static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+static void tool_schema_order_prop_push(tool_schema_order *o, char *prop,
+                                        char *type) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
         o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+        o->prop_type = xrealloc(o->prop_type,
+                                (size_t)o->cap * sizeof(o->prop_type[0]));
     }
-    o->prop[o->len++] = prop;
+    o->prop[o->len] = prop;
+    o->prop_type[o->len] = type;
+    o->len++;
 }
 
 static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
@@ -821,6 +876,16 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
 
+static const char *tool_schema_order_prop_type(const tool_schema_order *order,
+                                               const char *name) {
+    if (!order || !name) return NULL;
+    for (int i = 0; i < order->len; i++) {
+        if (order->prop[i] && !strcmp(order->prop[i], name))
+            return order->prop_type ? order->prop_type[i] : NULL;
+    }
+    return NULL;
+}
+
 /* DS4_SERVER_DEFAULT_TEMP overrides the temperature a request gets when it
  * does not send one (agent frameworks routinely omit temperature).  Since
  * spec+tools, tools are batchable at any temperature (job_is_batchable), so
@@ -842,6 +907,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_LOW;
+    r->tool_choice = TOOL_CHOICE_AUTO;
 }
 
 static void request_free(request *r) {
@@ -854,6 +920,8 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    ds4_tokens_free(&r->required_tool_prefix);
+    ds4_tokens_free(&r->required_think_end_prefix);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -1033,6 +1101,7 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_model_id(engine) == 2) return SERVER_MODEL_SYNTAX_SOLAR_OPEN2;
     if (ds4_engine_model_id(engine) == 3) return SERVER_MODEL_SYNTAX_MOTIF3;
     return SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
@@ -1051,18 +1120,40 @@ static bool server_token_ends_generation(ds4_engine *engine,
            ds4_token_is_stop_for_think_mode(engine, token, r->think_mode);
 }
 
+static const char *server_model_id_from_variant(int variant) {
+    if (variant == 1) return "deepseek-v4-pro";
+    if (variant == 2) return "solar-open2-250b";
+    if (variant == 3) return "motif-3";
+    return "deepseek-v4-flash";
+}
+
 static const char *server_model_id_from_engine(ds4_engine *engine) {
-    if (ds4_engine_model_id(engine) == 3) return "motif-3";
-    return ds4_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+    return server_model_id_from_variant(ds4_engine_model_id(engine));
 }
 
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4-pro") ||
+            !strcmp(id, "solar-open2-250b") ||
             !strcmp(id, "motif-3") ||
             !strcmp(id, "Motif-Technologies/Motif-3"));
+}
+
+/* A server knob may request partial warm reuse, but the model runtime is the
+ * authority on whether a retained bank can be rewound to an earlier prefix. */
+static bool server_partial_warm_policy(bool requested, bool supported) {
+    return requested && supported;
+}
+
+static bool server_thinking_record_requires_rewind(int sampled_tokens,
+                                                   bool client_gone,
+                                                   bool semantic_or_transport_cut,
+                                                   bool split_think_close) {
+    /* tokens[0..n-2] are committed.  With only the seed/final sample (n==1),
+     * the bank still equals the prompt and no rewind is needed. */
+    return sampled_tokens > 1 &&
+           (client_gone || semantic_or_transport_cut || split_think_close);
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -1518,6 +1609,36 @@ done:
     return out;
 }
 
+static char *schema_property_type(const char *json) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return NULL;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return NULL;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(key);
+            char *type = NULL;
+            if (json_string(&p, &type)) return type;
+            return NULL;
+        }
+        free(key);
+        if (!json_skip_value(&p)) return NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1548,8 +1669,14 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
                     return false;
                 }
                 p++;
-                tool_schema_order_prop_push(order, prop);
-                if (!json_skip_value(&p)) return false;
+                char *property = NULL;
+                if (!json_raw_value(&p, &property)) {
+                    free(prop);
+                    return false;
+                }
+                char *type = schema_property_type(property);
+                free(property);
+                tool_schema_order_prop_push(order, prop, type);
                 json_ws(&p);
                 if (*p == ',') p++;
                 json_ws(&p);
@@ -2172,7 +2299,8 @@ bad:
     return false;
 }
 
-static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
+static void append_dsml_tools_prompt_text(buf *b, const char *tool_schemas,
+                                          bool tool_required) {
     if (!tool_schemas || !tool_schemas[0]) return;
     buf_puts(b,
         "## Tools\n\n"
@@ -2197,6 +2325,61 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
     buf_puts(b, tool_schemas);
     buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
                 "Use the exact parameter names from the schemas.");
+    if (tool_required) {
+        buf_puts(b,
+            "\n\n### Required Tool Use\n\n"
+            "You MUST call at least one available tool in this turn. "
+            "Do not end the turn with only reasoning or a final answer. "
+            "After any reasoning, emit a valid <｜DSML｜tool_calls> block.");
+    }
+}
+
+static void append_solar_tool_schema_blocks(buf *b, const char *tool_schemas) {
+    const char *p = tool_schemas ? tool_schemas : "";
+    while (*p) {
+        json_ws(&p);
+        if (!*p) break;
+        char *schema = NULL;
+        const char *before = p;
+        if (!json_raw_value(&p, &schema)) {
+            /* parse_tools_value only supplies JSON values.  Keep a defensive
+             * fallback so a future hosted-tool adapter cannot silently drop a
+             * schema if it violates that internal contract. */
+            buf_puts(b, DS4_SOLAR_TOOL_START);
+            buf_puts(b, before);
+            buf_puts(b, DS4_SOLAR_TOOL_END "\n");
+            return;
+        }
+        buf_puts(b, DS4_SOLAR_TOOL_START);
+        buf_puts(b, schema);
+        buf_puts(b, DS4_SOLAR_TOOL_END "\n");
+        free(schema);
+    }
+}
+
+/* Byte-for-byte counterpart of Solar Open2's embedded GGUF chat template.
+ * Keeping the model-native grammar here lets the common HTTP surface stay
+ * model-agnostic while ds4 remains the inference engine. */
+static void append_solar_tools_prompt_text(buf *b, const char *tool_schemas) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    buf_puts(b,
+        "## Tools\n"
+        "- You may invoke one or more tools to assist with the user's query.\n\n"
+        "### Available Tools\n");
+    append_solar_tool_schema_blocks(b, tool_schemas);
+    buf_puts(b,
+        "\n### Tool Call Instruction\n"
+        "- If using a tool, any reasoning must strictly precede the call. Do not append any text after the tool call.\n"
+        "- If no tool is required, answer directly from your knowledge without ever mentioning the availability or absence of tools.\n"
+        "- Each tool call MUST use this following format: "
+        DS4_SOLAR_TOOL_CALL_START "{example-tool-name}\n"
+        DS4_SOLAR_TOOL_ARG_START "{example-key-name-1}"
+        DS4_SOLAR_TOOL_ARG_VALUE "{example-value-1}"
+        DS4_SOLAR_TOOL_ARG_END "\n"
+        DS4_SOLAR_TOOL_ARG_START "{example-key-name-2}"
+        DS4_SOLAR_TOOL_ARG_VALUE "{example-value-2}"
+        DS4_SOLAR_TOOL_ARG_END "\n"
+        DS4_SOLAR_TOOL_CALL_END "\n");
 }
 
 static void json_escape(buf *b, const char *s);
@@ -2418,18 +2601,69 @@ static void append_motif3_tool_calls_text(buf *out,
                                           const tool_calls *calls,
                                           bool include_ids);
 
-static void append_tool_calls_text_for_syntax(buf *b,
-                                              server_model_syntax syntax,
-                                              const tool_calls *calls,
-                                              const tool_schema_orders *tool_orders) {
-    (void)tool_orders;
-    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
-        append_motif3_tool_calls_text(b, calls, true);
-    } else {
-        append_dsml_tool_calls_text(b, calls);
+static void append_solar_arg(buf *b, const json_arg *arg) {
+    buf_puts(b, DS4_SOLAR_TOOL_ARG_START);
+    buf_puts(b, arg->key ? arg->key : "");
+    buf_puts(b, DS4_SOLAR_TOOL_ARG_VALUE);
+    buf_puts(b, arg->value ? arg->value : "");
+    buf_puts(b, DS4_SOLAR_TOOL_ARG_END "\n");
+}
+
+static bool append_solar_arguments_from_json(buf *b, const char *json,
+                                             const tool_schema_order *order) {
+    json_args args = {0};
+    if (!json_args_parse(json, &args)) return false;
+    if (order) {
+        for (int i = 0; i < order->len; i++) {
+            int idx = json_args_find_unused(&args, order->prop[i]);
+            if (idx < 0) continue;
+            append_solar_arg(b, &args.v[idx]);
+            args.v[idx].used = true;
+        }
+    }
+    for (int i = 0; i < args.len; i++) {
+        if (!args.v[i].used) append_solar_arg(b, &args.v[i]);
+    }
+    json_args_free(&args);
+    return true;
+}
+
+static void append_solar_tool_calls_text(buf *b, const tool_calls *calls,
+                                         const tool_schema_orders *orders) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_dsml && calls->raw_dsml[0]) {
+        buf_puts(b, calls->raw_dsml);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        if (i) buf_putc(b, '\n');
+        buf_puts(b, DS4_SOLAR_TOOL_CALL_START);
+        buf_puts(b, tc->name ? tc->name : "");
+        buf_putc(b, '\n');
+        const tool_schema_order *order =
+            tool_schema_orders_find(orders, tc->name);
+        if (!append_solar_arguments_from_json(b, tc->arguments, order)) {
+            /* Malformed client replay should stay explicit model input rather
+             * than disappear.  The normal API parser validates generated JSON
+             * before it reaches this fallback. */
+            buf_puts(b, DS4_SOLAR_TOOL_ARG_START "arguments"
+                        DS4_SOLAR_TOOL_ARG_VALUE);
+            buf_puts(b, tc->arguments ? tc->arguments : "{}");
+            buf_puts(b, DS4_SOLAR_TOOL_ARG_END "\n");
+        }
+        buf_puts(b, DS4_SOLAR_TOOL_CALL_END);
     }
 }
 
+static void append_model_tool_calls_text(buf *b, const tool_calls *calls,
+                                         const tool_schema_orders *orders,
+                                         ds4_chat_format format) {
+    if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
+        append_solar_tool_calls_text(b, calls, orders);
+    else
+        append_dsml_tool_calls_text(b, calls);
+}
 static bool role_is_system(const char *role) {
     return !strcmp(role, "system") || !strcmp(role, "developer");
 }
@@ -2452,9 +2686,10 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
-static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
-                                     ds4_think_mode think_mode) {
+static char *render_dsml_chat_prompt_text_choice(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        tool_choice_mode tool_choice) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
@@ -2464,7 +2699,8 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
      * --kv-cache-boundary-trim-tokens chops a dynamic tail from the client
      * message instead of the much larger tool-schema region. */
     if (tool_schemas && tool_schemas[0]) {
-        append_tools_prompt_text(&system, tool_schemas);
+        append_dsml_tools_prompt_text(&system, tool_schemas,
+                                      tool_choice == TOOL_CHOICE_REQUIRED);
     }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
@@ -2681,17 +2917,283 @@ static char *render_motif3_chat_prompt_text(
     return buf_take(&out);
 }
 
-static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
-                                                const chat_msgs *msgs,
-                                                const char *tool_schemas,
-                                                const tool_schema_orders *tool_orders,
-                                                ds4_think_mode think_mode) {
-    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
-        return render_motif3_chat_prompt_text(msgs, tool_schemas,
-                                              tool_orders, think_mode);
+static void append_solar_tool_response_text(buf *b, const char *s) {
+    const char *end = DS4_SOLAR_TOOL_RESPONSE_END;
+    const size_t endlen = strlen(end);
+    const char *p = s ? s : "";
+    const char *limit = p + strlen(p);
+    while (p < limit) {
+        if ((size_t)(limit - p) >= endlen && !strncmp(p, end, endlen)) {
+            buf_puts(b, "&lt;");
+            p++;
+        } else {
+            buf_putc(b, *p++);
+        }
     }
-    return render_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
 }
+
+static void append_solar_tool_response_span(buf *b, const char *s, size_t n) {
+    char *text = xstrndup(s ? s : "", n);
+    append_solar_tool_response_text(b, text);
+    free(text);
+}
+
+static void append_solar_role_open(buf *b, const char *role);
+
+static bool chat_msg_is_model_tool_result(const chat_msg *m) {
+    if (!m || !m->role) return false;
+    if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) return true;
+    return !strcmp(m->role, "user") &&
+           ((m->tool_call_id && m->tool_call_id[0]) ||
+            m->tool_call_ids_len > 0);
+}
+
+static bool chat_history_has_pending_tool_results(const chat_msgs *msgs) {
+    bool saw_tool_result = false;
+    for (int i = msgs ? msgs->len - 1 : -1; i >= 0; i--) {
+        const chat_msg *m = &msgs->v[i];
+        if (!m->role || role_is_system(m->role)) continue;
+        if (chat_msg_is_model_tool_result(m)) {
+            saw_tool_result = true;
+            continue;
+        }
+        /* An assistant response resolves every older result.  User text after
+         * a still-pending result remains part of that result turn, while an
+         * output-only continuation has no assistant message to replay. */
+        if (!strcmp(m->role, "assistant")) return saw_tool_result;
+    }
+    return saw_tool_result;
+}
+
+typedef struct {
+    const char *text;
+    size_t len;
+    const char *id;
+    bool used;
+} solar_tool_result_view;
+
+typedef struct {
+    solar_tool_result_view *v;
+    int len;
+    int cap;
+} solar_tool_result_views;
+
+static void solar_tool_result_views_push(solar_tool_result_views *views,
+                                         solar_tool_result_view view) {
+    if (views->len == views->cap) {
+        views->cap = views->cap ? views->cap * 2 : 4;
+        views->v = xrealloc(views->v,
+                            (size_t)views->cap * sizeof(views->v[0]));
+    }
+    views->v[views->len++] = view;
+}
+
+static const char *chat_msg_tool_result_id_at(const chat_msg *m, int index) {
+    if (!m || index < 0) return NULL;
+    if (index < m->tool_call_ids_len) return m->tool_call_ids[index];
+    return index == 0 ? m->tool_call_id : NULL;
+}
+
+/* Anthropic tool_result blocks are kept in a user-role chat_msg for its wire
+ * validation contract.  The parser wraps each body in <tool_result> so it can
+ * coexist with the DSML renderer; unwrap that internal representation when the
+ * model grammar is Solar native.  If mixed free text makes the representation
+ * ambiguous, preserve the whole message as one result rather than dropping it. */
+static void solar_collect_tool_result_message(const chat_msg *m,
+                                              solar_tool_result_views *views) {
+    const int before = views->len;
+    if (m && m->role && !strcmp(m->role, "user") &&
+        ((m->tool_call_id && m->tool_call_id[0]) || m->tool_call_ids_len > 0)) {
+        const char *p = m->content ? m->content : "";
+        int result_index = 0;
+        bool exact = true;
+        while (*p) {
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (!*p) break;
+            const char *open = "<tool_result>";
+            const char *close = "</tool_result>";
+            if (strncmp(p, open, strlen(open))) {
+                exact = false;
+                break;
+            }
+            p += strlen(open);
+            const char *end = strstr(p, close);
+            if (!end) {
+                exact = false;
+                break;
+            }
+            solar_tool_result_views_push(views, (solar_tool_result_view){
+                .text = p,
+                .len = (size_t)(end - p),
+                .id = chat_msg_tool_result_id_at(m, result_index++),
+            });
+            p = end + strlen(close);
+        }
+        if (exact && views->len > before) return;
+        views->len = before;
+    }
+    solar_tool_result_views_push(views, (solar_tool_result_view){
+        .text = m && m->content ? m->content : "",
+        .len = m && m->content ? strlen(m->content) : 0,
+        .id = chat_msg_tool_result_id_at(m, 0),
+    });
+}
+
+static void append_solar_tool_result_view(buf *out,
+                                          solar_tool_result_view *view,
+                                          bool *first) {
+    if (!*first) buf_putc(out, '\n');
+    *first = false;
+    buf_puts(out, DS4_SOLAR_TOOL_RESPONSE_START);
+    append_solar_tool_response_span(out, view->text, view->len);
+    buf_puts(out, DS4_SOLAR_TOOL_RESPONSE_END);
+    view->used = true;
+}
+
+static int render_solar_tool_result_block(buf *out, const chat_msgs *msgs,
+                                          int start) {
+    int end = start;
+    solar_tool_result_views views = {0};
+    while (msgs && end < msgs->len &&
+           chat_msg_is_model_tool_result(&msgs->v[end])) {
+        solar_collect_tool_result_message(&msgs->v[end], &views);
+        end++;
+    }
+
+    append_solar_role_open(out, "tool");
+    bool first = true;
+    const chat_msg *prior = start > 0 ? &msgs->v[start - 1] : NULL;
+    if (prior && prior->role && !strcmp(prior->role, "assistant")) {
+        for (int c = 0; c < prior->calls.len; c++) {
+            const char *id = prior->calls.v[c].id;
+            if (!id || !id[0]) continue;
+            for (int i = 0; i < views.len; i++) {
+                if (!views.v[i].used && views.v[i].id &&
+                    !strcmp(views.v[i].id, id)) {
+                    append_solar_tool_result_view(out, &views.v[i], &first);
+                    break;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < views.len; i++) {
+        if (!views.v[i].used)
+            append_solar_tool_result_view(out, &views.v[i], &first);
+    }
+    free(views.v);
+    buf_puts(out, "\n" DS4_SOLAR_IM_END "\n");
+    return end;
+}
+
+static void append_solar_role_open(buf *b, const char *role) {
+    buf_puts(b, DS4_SOLAR_IM_START);
+    buf_puts(b, role);
+    buf_puts(b, DS4_SOLAR_IM_CONTENT);
+}
+
+static char *render_solar_chat_prompt_text_choice(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        tool_choice_mode tool_choice) {
+    /* Required mode is enforced at sampling time.  Keeping it out of the
+     * rendered prefix lets a normal required-T1/auto-T2 agent turn reuse KV. */
+    (void)tool_choice;
+    int last_user_idx = -1;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (!strcmp(msgs->v[i].role, "user") &&
+            !chat_msg_is_model_tool_result(&msgs->v[i]))
+            last_user_idx = i;
+    }
+
+    buf system = {0};
+    bool have_system = false;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!role_is_system(m->role)) continue;
+        if (!have_system) {
+            buf_puts(&system, "## System Prompt");
+            have_system = true;
+        }
+        buf_puts(&system, "\n\n");
+        buf_puts(&system, m->content ? m->content : "");
+    }
+    if (tool_schemas && tool_schemas[0]) {
+        if (system.len) buf_puts(&system, "\n\n");
+        append_solar_tools_prompt_text(&system, tool_schemas);
+    }
+
+    buf out = {0};
+    if (system.len) {
+        append_solar_role_open(&out, "system");
+        buf_append(&out, system.ptr, system.len);
+        buf_puts(&out, DS4_SOLAR_IM_END "\n");
+    }
+
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            continue;
+        } else if (!strcmp(m->role, "user") &&
+                   !chat_msg_is_model_tool_result(m)) {
+            append_solar_role_open(&out, "user");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, DS4_SOLAR_IM_END "\n");
+        } else if (chat_msg_is_model_tool_result(m)) {
+            i = render_solar_tool_result_block(&out, msgs, i) - 1;
+        } else if (!strcmp(m->role, "assistant")) {
+            append_solar_role_open(&out, "assistant");
+            buf_puts(&out, DS4_SOLAR_THINK_START);
+            if (m->reasoning && m->reasoning[0] && i > last_user_idx)
+                buf_puts(&out, m->reasoning);
+            buf_puts(&out, DS4_SOLAR_THINK_END);
+            buf_puts(&out, m->content ? m->content : "");
+            append_model_tool_calls_text(&out, &m->calls, tool_orders,
+                                         DS4_CHAT_FORMAT_SOLAR_OPEN2);
+            if (m->calls.len > 0) buf_putc(&out, '\n');
+            buf_puts(&out, DS4_SOLAR_IM_END "\n");
+        }
+    }
+
+    append_solar_role_open(&out, "assistant");
+    buf_puts(&out, DS4_SOLAR_THINK_START);
+    if (!ds4_think_mode_enabled(think_mode))
+        buf_puts(&out, DS4_SOLAR_THINK_END);
+
+    buf_free(&system);
+    return buf_take(&out);
+}
+
+static char *render_chat_prompt_text_choice_format(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        tool_choice_mode tool_choice, ds4_chat_format format) {
+    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+        ? render_solar_chat_prompt_text_choice(msgs, tool_schemas, tool_orders,
+                                               think_mode, tool_choice)
+        : render_dsml_chat_prompt_text_choice(msgs, tool_schemas, tool_orders,
+                                              think_mode, tool_choice);
+}
+
+#ifdef DS4_SERVER_TEST
+static char *render_chat_prompt_text_choice(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        tool_choice_mode tool_choice) {
+    return render_chat_prompt_text_choice_format(
+        msgs, tool_schemas, tool_orders, think_mode, tool_choice,
+        DS4_CHAT_FORMAT_DSML);
+}
+#endif
+
+#ifdef DS4_SERVER_TEST
+static char *render_chat_prompt_text(const chat_msgs *msgs,
+                                     const char *tool_schemas,
+                                     const tool_schema_orders *tool_orders,
+                                     ds4_think_mode think_mode) {
+    return render_chat_prompt_text_choice(msgs, tool_schemas, tool_orders,
+                                          think_mode, TOOL_CHOICE_AUTO);
+}
+#endif
 
 /* Render only the semantic tail that must be appended to the live KV for a
  * tool-result continuation.
@@ -2709,8 +3211,8 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
  * suffix tokenization happens later after the cache decision, using the live
  * token prefix as the boundary.  That avoids BPE merges across the visible
  * replay/live-KV boundary. */
-static char *render_live_tool_tail(const chat_msgs *msgs, int start,
-                                   ds4_think_mode think_mode) {
+static char *render_dsml_live_tool_tail(const chat_msgs *msgs, int start,
+                                        ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
     buf_puts(&out, "<｜end▁of▁sentence｜>");
@@ -2759,13 +3261,36 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
-static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
-    if (!m || !id || !id[0] || strcmp(m->role, "assistant")) return false;
-    for (int i = 0; i < m->calls.len; i++) {
-        if (m->calls.v[i].id && !strcmp(m->calls.v[i].id, id)) return true;
+static char *render_live_tool_tail_format(const chat_msgs *msgs, int start,
+                                          ds4_think_mode think_mode,
+                                          ds4_chat_format format) {
+    if (format != DS4_CHAT_FORMAT_SOLAR_OPEN2)
+        return render_dsml_live_tool_tail(msgs, start, think_mode);
+
+    chat_msgs tail = {0};
+    if (msgs && start >= 0 && start < msgs->len) {
+        tail.v = msgs->v + start;
+        tail.len = msgs->len - start;
+        tail.cap = tail.len;
     }
-    return false;
+    char *rendered = render_solar_chat_prompt_text_choice(
+        &tail, NULL, NULL, think_mode, TOOL_CHOICE_AUTO);
+    buf out = {0};
+    /* The sampled <|im:end|> is the engine EOS and is therefore not evaluated
+     * into KV.  Append it before the new tool-role suffix. */
+    buf_puts(&out, DS4_SOLAR_IM_END "\n");
+    buf_puts(&out, rendered ? rendered : "");
+    free(rendered);
+    return buf_take(&out);
 }
+
+#ifdef DS4_SERVER_TEST
+static char *render_live_tool_tail(const chat_msgs *msgs, int start,
+                                   ds4_think_mode think_mode) {
+    return render_live_tool_tail_format(msgs, start, think_mode,
+                                        DS4_CHAT_FORMAT_DSML);
+}
+#endif
 
 static char *render_motif3_live_tool_tail(
         const chat_msgs *msgs, int start,
@@ -2805,15 +3330,46 @@ static char *render_motif3_live_tool_tail(
     return buf_take(&out);
 }
 
-static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
-                                              const chat_msgs *msgs, int start,
-                                              const tool_schema_orders *tool_orders,
-                                              ds4_think_mode think_mode) {
-    (void)tool_orders;
+static char *render_chat_prompt_text_for_model(
+        server_model_syntax syntax, const chat_msgs *msgs,
+        const char *tool_schemas, const tool_schema_orders *tool_orders,
+        ds4_think_mode think_mode, tool_choice_mode tool_choice,
+        ds4_chat_format format) {
     if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
-        return render_motif3_live_tool_tail(msgs, start, think_mode);
+        return render_motif3_chat_prompt_text(msgs, tool_schemas,
+                                              tool_orders, think_mode);
     }
-    return render_live_tool_tail(msgs, start, think_mode);
+    return render_chat_prompt_text_choice_format(
+        msgs, tool_schemas, tool_orders, think_mode, tool_choice, format);
+}
+
+#ifdef DS4_SERVER_TEST
+static char *render_chat_prompt_text_for_syntax(
+        server_model_syntax syntax, const chat_msgs *msgs,
+        const char *tool_schemas, const tool_schema_orders *tool_orders,
+        ds4_think_mode think_mode) {
+    return render_chat_prompt_text_for_model(
+        syntax, msgs, tool_schemas, tool_orders, think_mode,
+        TOOL_CHOICE_AUTO, DS4_CHAT_FORMAT_DSML);
+}
+#endif
+
+static char *render_live_tool_tail_for_model(
+        server_model_syntax syntax, const chat_msgs *msgs, int start,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        ds4_chat_format format) {
+    (void)tool_orders;
+    if (syntax == SERVER_MODEL_SYNTAX_MOTIF3)
+        return render_motif3_live_tool_tail(msgs, start, think_mode);
+    return render_live_tool_tail_format(msgs, start, think_mode, format);
+}
+
+static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
+    if (!m || !id || !id[0] || strcmp(m->role, "assistant")) return false;
+    for (int i = 0; i < m->calls.len; i++) {
+        if (m->calls.v[i].id && !strcmp(m->calls.v[i].id, id)) return true;
+    }
+    return false;
 }
 
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
@@ -2926,8 +3482,9 @@ static void responses_prepare_live_continuation(request *r,
 
     free(r->responses_live_suffix_text);
     r->responses_live_suffix_text =
-        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
-                                         &r->tool_orders, r->think_mode);
+        render_live_tool_tail_for_model(
+            r->model_syntax, msgs, tail_start, &r->tool_orders,
+            r->think_mode, r->chat_format);
 }
 
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
@@ -3005,21 +3562,145 @@ static void anthropic_prepare_live_continuation(request *r,
 
     free(r->anthropic_live_suffix_text);
     r->anthropic_live_suffix_text =
-        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
-                                         &r->tool_orders, r->think_mode);
+        render_live_tool_tail_for_model(
+            r->model_syntax, msgs, tail_start, &r->tool_orders,
+            r->think_mode, r->chat_format);
 }
 
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+static bool parse_openai_tool_choice_value(const char **p,
+                                           tool_choice_mode *mode,
+                                           char *err, size_t errlen) {
+    json_ws(p);
+    if (**p != '"') {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     **p == '{' ? "forced tool_choice not supported" :
+                                   "invalid tool_choice");
+        }
+        return false;
+    }
+    char *choice = NULL;
+    if (!json_string(p, &choice)) return false;
+    bool ok = true;
+    if (!strcmp(choice, "auto"))       *mode = TOOL_CHOICE_AUTO;
+    else if (!strcmp(choice, "none"))  *mode = TOOL_CHOICE_NONE;
+    else if (!strcmp(choice, "required")) *mode = TOOL_CHOICE_REQUIRED;
+    else {
+        if (err && errlen)
+            snprintf(err, errlen, "tool_choice=%s not supported", choice);
+        ok = false;
+    }
+    free(choice);
+    return ok;
+}
+
+static bool parse_anthropic_tool_choice_value(const char **p,
+                                              tool_choice_mode *mode,
+                                              char *err, size_t errlen) {
+    json_ws(p);
+    if (**p != '{') {
+        if (err && errlen) snprintf(err, errlen, "invalid tool_choice");
+        return false;
+    }
+    (*p)++;
+    char *type = NULL;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            free(type);
+            type = NULL;
+            if (!json_string(p, &type)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto bad;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+    if (!type) goto bad;
+    if (!strcmp(type, "auto"))       *mode = TOOL_CHOICE_AUTO;
+    else if (!strcmp(type, "none"))  *mode = TOOL_CHOICE_NONE;
+    else if (!strcmp(type, "any"))   *mode = TOOL_CHOICE_REQUIRED;
+    else if (!strcmp(type, "tool")) {
+        if (err && errlen) snprintf(err, errlen, "forced tool_choice not supported");
+        free(type);
+        return false;
+    } else {
+        if (err && errlen)
+            snprintf(err, errlen, "tool_choice type=%s not supported", type);
+        free(type);
+        return false;
+    }
+    free(type);
+    return true;
+bad:
+    free(type);
+    if (err && errlen && !err[0]) snprintf(err, errlen, "invalid tool_choice");
+    return false;
+}
+
+static bool request_prepare_tool_choice(ds4_engine *e, request *r,
+                                        bool have_tool_schemas,
+                                        char *err, size_t errlen) {
+    r->chat_format = ds4_engine_chat_format(e);
+    r->has_tools = have_tool_schemas && r->tool_choice != TOOL_CHOICE_NONE;
+    if (r->tool_choice == TOOL_CHOICE_REQUIRED || r->has_tool_results) {
+        /* Required T1 and pending-result T2 may need to close an overlong
+         * thinking block before the request budget is exhausted. */
+        ds4_tokenize_rendered_chat(e, chat_think_end(r->chat_format),
+                                   &r->required_think_end_prefix);
+        if (r->required_think_end_prefix.len <= 0) {
+            if (err && errlen)
+                snprintf(err, errlen,
+                         "failed to tokenize thinking control prefix");
+            return false;
+        }
+    }
+    if (r->tool_choice != TOOL_CHOICE_REQUIRED) return true;
+    if (!have_tool_schemas) {
+        if (err && errlen)
+            snprintf(err, errlen,
+                     "tool_choice=required requires at least one tool");
+        return false;
+    }
+    ds4_tokenize_rendered_chat(e,
+                               r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+                                   ? DS4_SOLAR_TOOL_CALL_START
+                                   : "<｜DSML｜tool_calls>",
+                               &r->required_tool_prefix);
+    if (r->required_tool_prefix.len <= 0) {
+        if (err && errlen)
+            snprintf(err, errlen, "failed to tokenize required tool control prefix");
+        return false;
+    }
+    return true;
+}
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_messages = false;
-    bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = g_default_reasoning_effort;
@@ -3054,16 +3735,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "tool_choice")) {
-            json_ws(&p);
-            if (*p == '"') {
-                char *choice = NULL;
-                if (!json_string(&p, &choice)) {
-                    free(key);
-                    goto bad;
-                }
-                tool_choice_none = !strcmp(choice, "none");
-                free(choice);
-            } else if (!json_skip_value(&p)) {
+            if (!parse_openai_tool_choice_value(&p, &r->tool_choice,
+                                                err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -3181,7 +3854,15 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
-    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    r->has_tool_results = chat_history_has_pending_tool_results(&msgs);
+    if (!request_prepare_tool_choice(e, r,
+                                     tool_schemas && tool_schemas[0],
+                                     err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
@@ -3190,9 +3871,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_for_model(
+        r->model_syntax, &msgs, active_tool_schemas, &r->tool_orders,
+        r->think_mode, r->tool_choice, r->chat_format);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
@@ -3212,7 +3893,6 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_messages = false;
-    bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = g_default_reasoning_effort;
@@ -3254,48 +3934,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "tool_choice")) {
-            json_ws(&p);
-            if (*p == '{') {
-                p++;
-                json_ws(&p);
-                while (*p && *p != '}') {
-                    char *ckey = NULL;
-                    if (!json_string(&p, &ckey)) {
-                        free(key);
-                        goto bad;
-                    }
-                    json_ws(&p);
-                    if (*p != ':') {
-                        free(ckey);
-                        free(key);
-                        goto bad;
-                    }
-                    p++;
-                    if (!strcmp(ckey, "type")) {
-                        char *choice = NULL;
-                        if (!json_string(&p, &choice)) {
-                            free(ckey);
-                            free(key);
-                            goto bad;
-                        }
-                        tool_choice_none = !strcmp(choice, "none");
-                        free(choice);
-                    } else if (!json_skip_value(&p)) {
-                        free(ckey);
-                        free(key);
-                        goto bad;
-                    }
-                    free(ckey);
-                    json_ws(&p);
-                    if (*p == ',') p++;
-                    json_ws(&p);
-                }
-                if (*p != '}') {
-                    free(key);
-                    goto bad;
-                }
-                p++;
-            } else if (!json_skip_value(&p)) {
+            if (!parse_anthropic_tool_choice_value(&p, &r->tool_choice,
+                                                   err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -3395,7 +4035,16 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         system = NULL;
         chat_msgs_push(&msgs, msg);
     }
-    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    r->has_tool_results = chat_history_has_pending_tool_results(&msgs);
+    if (!request_prepare_tool_choice(e, r,
+                                     tool_schemas && tool_schemas[0],
+                                     err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
@@ -3416,9 +4065,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_for_model(
+        r->model_syntax, &msgs, active_tool_schemas, &r->tool_orders,
+        r->think_mode, r->tool_choice, r->chat_format);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
@@ -4118,7 +4767,6 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_input = false;
-    bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = g_default_reasoning_effort;
@@ -4179,41 +4827,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "tool_choice")) {
-            json_ws(&p);
-            if (*p == '"') {
-                char *choice = NULL;
-                if (!json_string(&p, &choice)) {
-                    free(key);
-                    goto bad;
-                }
-                /* DS4 honours "none" (disable tools) and "auto" (model decides).
-                 * "required" and explicit function targets need constrained
-                 * decoding we don't implement — reject so clients see the
-                 * limitation instead of silently downgrading to auto. */
-                if (!strcmp(choice, "none")) {
-                    tool_choice_none = true;
-                } else if (strcmp(choice, "auto") != 0) {
-                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
-                    free(choice);
-                    free(key);
-                    chat_msgs_free(&msgs);
-                    buf_free(&loaded_tool_schemas);
-                    free(instructions);
-                    free(tool_schemas);
-                    request_free(r);
-                    return false;
-                }
-                free(choice);
-            } else if (*p == '{') {
-                snprintf(err, errlen, "forced tool_choice not supported");
-                free(key);
-                chat_msgs_free(&msgs);
-                buf_free(&loaded_tool_schemas);
-                free(instructions);
-                free(tool_schemas);
-                request_free(r);
-                return false;
-            } else if (!json_skip_value(&p)) {
+            if (!parse_openai_tool_choice_value(&p, &r->tool_choice,
+                                                err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -4347,10 +4962,19 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
                    loaded_tool_schemas.len);
     }
+    r->has_tool_results = chat_history_has_pending_tool_results(&msgs);
+    if (!request_prepare_tool_choice(e, r, combined_tool_schemas.len != 0,
+                                     err, errlen)) {
+        chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     const char *active_tool_schemas =
-        (!tool_choice_none && combined_tool_schemas.len) ?
-        combined_tool_schemas.ptr : NULL;
-    r->has_tools = active_tool_schemas && active_tool_schemas[0];
+        r->has_tools ? combined_tool_schemas.ptr : NULL;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
@@ -4372,9 +4996,9 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
     request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_for_model(
+        r->model_syntax, &msgs, active_tool_schemas, &r->tool_orders,
+        r->think_mode, r->tool_choice, r->chat_format);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
@@ -4426,6 +5050,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
+    r->chat_format = ds4_engine_chat_format(e);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
@@ -4566,22 +5191,19 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
-    if (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
-        /* The raw-completion surface still speaks the loaded model's own
-         * protocol: one default-system + user turn through the official
-         * Motif template, byte-identical to the chat path's renderer. */
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
+        r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
+        /* Raw completion uses the loaded family's official chat protocol. */
         chat_msgs msgs = {0};
-        chat_msg sys = {0};
-        sys.role = xstrdup("system");
-        sys.content = xstrdup("You are a helpful assistant");
-        chat_msgs_push(&msgs, sys);
-        chat_msg user_msg = {0};
-        user_msg.role = xstrdup("user");
-        user_msg.content = prompt;
+        chat_msg system = {.role = xstrdup("system"),
+                           .content = xstrdup("You are a helpful assistant")};
+        chat_msgs_push(&msgs, system);
+        chat_msg user = {.role = xstrdup("user"), .content = prompt};
         prompt = NULL;
-        chat_msgs_push(&msgs, user_msg);
-        r->prompt_text = render_chat_prompt_text_for_syntax(
-            r->model_syntax, &msgs, NULL, NULL, r->think_mode);
+        chat_msgs_push(&msgs, user);
+        r->prompt_text = render_chat_prompt_text_for_model(
+            r->model_syntax, &msgs, NULL, NULL, r->think_mode,
+            TOOL_CHOICE_AUTO, r->chat_format);
         chat_msgs_free(&msgs);
     } else {
         buf rendered = {0};
@@ -4738,6 +5360,13 @@ static const char *find_any_tool_start(const char *s) {
     return best;
 }
 
+static const char *find_tool_start_format(const char *s,
+                                          ds4_chat_format format) {
+    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+        ? (s ? strstr(s, DS4_SOLAR_TOOL_CALL_START) : NULL)
+        : find_any_tool_start(s ? s : "");
+}
+
 static const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
@@ -4752,21 +5381,37 @@ static const char *find_any_tool_end(const char *s) {
     return best;
 }
 
-static void observe_tool_markers(const char *scan, bool *saw_start,
-                                 bool *saw_end, bool *orphan_end) {
+static const char *find_tool_end_format(const char *s,
+                                        ds4_chat_format format) {
+    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+        ? (s ? strstr(s, DS4_SOLAR_TOOL_CALL_END) : NULL)
+        : find_any_tool_end(s ? s : "");
+}
+
+static void observe_tool_markers_format(const char *scan, bool *saw_start,
+                                        bool *saw_end, bool *orphan_end,
+                                        ds4_chat_format format) {
     if (!scan) return;
     bool had_start = *saw_start;
-    const char *start = find_any_tool_start(scan);
+    const char *start = find_tool_start_format(scan, format);
     if (start) *saw_start = true;
 
     const char *end_scan = had_start ? scan : (start ? start : NULL);
-    const char *end = end_scan ? find_any_tool_end(end_scan) : NULL;
+    const char *end = end_scan ? find_tool_end_format(end_scan, format) : NULL;
     if (end) {
         *saw_end = true;
-    } else if (!had_start && !start && find_any_tool_end(scan)) {
+    } else if (!had_start && !start && find_tool_end_format(scan, format)) {
         if (orphan_end) *orphan_end = true;
     }
 }
+
+#ifdef DS4_SERVER_TEST
+static void observe_tool_markers(const char *scan, bool *saw_start,
+                                 bool *saw_end, bool *orphan_end) {
+    observe_tool_markers_format(scan, saw_start, saw_end, orphan_end,
+                                DS4_CHAT_FORMAT_DSML);
+}
+#endif
 
 static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
     while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
@@ -4927,16 +5572,23 @@ static bool dsml_parse_nested_params_object(const char **p_in,
     return true;
 }
 
-static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
+static void split_reasoning_content_format(const char *text, size_t n,
+                                           ds4_chat_format format,
+                                           char **content_out,
+                                           char **reasoning_out) {
     char *s = xstrndup(text ? text : "", n);
     char *body = s;
-    if (!strncmp(body, "<think>", 7)) body += 7;
+    const char *think_start = chat_think_start(format);
+    const char *think_end_marker = chat_think_end(format);
+    const size_t think_start_len = strlen(think_start);
+    const size_t think_end_len = strlen(think_end_marker);
+    if (!strncmp(body, think_start, think_start_len)) body += think_start_len;
 
-    char *think_end = strstr(body, "</think>");
+    char *think_end = strstr(body, think_end_marker);
     if (think_end) {
         *think_end = '\0';
         *reasoning_out = xstrdup(body);
-        *content_out = xstrdup(think_end + 8);
+        *content_out = xstrdup(think_end + think_end_len);
     } else {
         *reasoning_out = NULL;
         *content_out = xstrdup(s);
@@ -4967,9 +5619,209 @@ static void ds4_unterminated_reasoning_before_tool(const char *text,
     *content_out = xstrdup("");
 }
 
-static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
-                                       char **content_out, char **reasoning_out,
-                                       tool_calls *calls) {
+static void split_reasoning_content(const char *text, size_t n,
+                                    char **content_out, char **reasoning_out) {
+    split_reasoning_content_format(text, n, DS4_CHAT_FORMAT_DSML,
+                                   content_out, reasoning_out);
+}
+
+/* The response surface must keep an unfinished thinking turn out of visible
+ * assistant content even when the request declared no tools.  The structured
+ * tool parser already has this contract, but no-tools responses deliberately
+ * bypass tool extraction; preserve the same closed-thinking gate while doing
+ * only the content/reasoning split. */
+static void split_reasoning_response_format(const char *text, size_t n,
+                                            ds4_chat_format format,
+                                            bool require_thinking_closed,
+                                            char **content_out,
+                                            char **reasoning_out) {
+    char *s = xstrndup(text ? text : "", n);
+    const char *think_start = chat_think_start(format);
+    const char *think_end = chat_think_end(format);
+    if (require_thinking_closed && !find_last_substr(s, think_end)) {
+        const char *body = !strncmp(s, think_start, strlen(think_start))
+            ? s + strlen(think_start) : s;
+        *reasoning_out = xstrdup(body);
+        *content_out = xstrdup("");
+        free(s);
+        return;
+    }
+    split_reasoning_content_format(s, strlen(s), format,
+                                   content_out, reasoning_out);
+    free(s);
+}
+
+static char *trim_ascii_span_dup(const char *start, const char *end) {
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    return xstrndup(start, (size_t)(end - start));
+}
+
+static bool json_value_is_complete(const char *value, char **minified) {
+    const char *p = value ? value : "";
+    json_ws(&p);
+    if (!*p) return false;
+    const char *start = p;
+    if (!json_skip_value(&p)) return false;
+    json_ws(&p);
+    if (*p) return false;
+    char *raw = xstrndup(start, strlen(start));
+    char *min = json_minify_raw_value(raw);
+    free(raw);
+    if (minified) *minified = min;
+    else free(min);
+    return true;
+}
+
+static void solar_tool_arg_json_add(buf *args, const char *name,
+                                    const char *value, size_t value_len,
+                                    const char *expected_type) {
+    char *raw = xstrndup(value ? value : "", value_len);
+    char *trimmed = trim_ascii_span_dup(raw, raw + strlen(raw));
+    char *minified = NULL;
+    if (args->len) buf_puts(args, ", ");
+    json_escape(args, name ? name : "");
+    buf_puts(args, ": ");
+    if (expected_type && !strcmp(expected_type, "string")) {
+        json_escape(args, raw);
+    } else if (json_value_is_complete(trimmed, &minified)) {
+        buf_puts(args, minified);
+    } else {
+        /* Solar's template emits string arguments without JSON quotes. */
+        json_escape(args, raw);
+    }
+    free(minified);
+    free(trimmed);
+    free(raw);
+}
+
+static bool parse_solar_generated_message(const char *text,
+                                          bool require_thinking_closed,
+                                          const tool_schema_orders *orders,
+                                          char **content_out,
+                                          char **reasoning_out,
+                                          tool_calls *calls) {
+    text = text ? text : "";
+    const char *tool_search = text;
+    const char *think_end = find_last_substr(text, DS4_SOLAR_THINK_END);
+    if (require_thinking_closed) {
+        if (!think_end) {
+            const char *body = !strncmp(text, DS4_SOLAR_THINK_START,
+                                       strlen(DS4_SOLAR_THINK_START))
+                ? text + strlen(DS4_SOLAR_THINK_START) : text;
+            *reasoning_out = xstrdup(body);
+            *content_out = xstrdup("");
+            return true;
+        }
+        tool_search = think_end + strlen(DS4_SOLAR_THINK_END);
+    }
+
+    const char *start = strstr(tool_search, DS4_SOLAR_TOOL_CALL_START);
+    if (!start) {
+        split_reasoning_content_format(text, strlen(text),
+                                       DS4_CHAT_FORMAT_SOLAR_OPEN2,
+                                       content_out, reasoning_out);
+        return true;
+    }
+
+    const size_t content_len =
+        trim_tool_separator_ws(text, 0, (size_t)(start - text));
+    const char *p = start;
+    const char *raw_end = NULL;
+    for (;;) {
+        if (strncmp(p, DS4_SOLAR_TOOL_CALL_START,
+                    strlen(DS4_SOLAR_TOOL_CALL_START))) return false;
+        p += strlen(DS4_SOLAR_TOOL_CALL_START);
+        const char *name_end = strchr(p, '\n');
+        if (!name_end) return false;
+        char *name = trim_ascii_span_dup(p, name_end);
+        if (!name[0]) {
+            free(name);
+            return false;
+        }
+        const tool_schema_order *order = tool_schema_orders_find(orders, name);
+        p = name_end + 1;
+
+        buf args = {0};
+        bool call_closed = false;
+        while (*p) {
+            while (*p == '\r' || *p == '\n') p++;
+            if (!strncmp(p, DS4_SOLAR_TOOL_CALL_END,
+                         strlen(DS4_SOLAR_TOOL_CALL_END))) {
+                p += strlen(DS4_SOLAR_TOOL_CALL_END);
+                raw_end = p;
+                call_closed = true;
+                break;
+            }
+            if (strncmp(p, DS4_SOLAR_TOOL_ARG_START,
+                        strlen(DS4_SOLAR_TOOL_ARG_START))) {
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            p += strlen(DS4_SOLAR_TOOL_ARG_START);
+            const char *value_marker = strstr(p, DS4_SOLAR_TOOL_ARG_VALUE);
+            if (!value_marker) {
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            char *arg_name = trim_ascii_span_dup(p, value_marker);
+            p = value_marker + strlen(DS4_SOLAR_TOOL_ARG_VALUE);
+            const char *arg_end = strstr(p, DS4_SOLAR_TOOL_ARG_END);
+            if (!arg_end || !arg_name[0]) {
+                free(arg_name);
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            solar_tool_arg_json_add(
+                &args, arg_name, p, (size_t)(arg_end - p),
+                tool_schema_order_prop_type(order, arg_name));
+            free(arg_name);
+            p = arg_end + strlen(DS4_SOLAR_TOOL_ARG_END);
+        }
+        if (!call_closed) {
+            free(name);
+            buf_free(&args);
+            return false;
+        }
+
+        tool_call tc = {0};
+        tc.name = name;
+        buf wrapped = {0};
+        buf_putc(&wrapped, '{');
+        buf_puts(&wrapped, args.ptr ? args.ptr : "");
+        buf_putc(&wrapped, '}');
+        tc.arguments = buf_take(&wrapped);
+        tool_calls_push(calls, tc);
+        buf_free(&args);
+
+        const char *next = p;
+        while (*next && isspace((unsigned char)*next)) next++;
+        if (strncmp(next, DS4_SOLAR_TOOL_CALL_START,
+                    strlen(DS4_SOLAR_TOOL_CALL_START))) break;
+        p = next;
+    }
+
+    free(calls->raw_dsml);
+    calls->raw_dsml = xstrndup(start, (size_t)(raw_end - start));
+    split_reasoning_content_format(text, content_len,
+                                   DS4_CHAT_FORMAT_SOLAR_OPEN2,
+                                   content_out, reasoning_out);
+    return calls->len > 0;
+}
+
+static bool parse_generated_message_ex_format(
+        const char *text, bool require_thinking_closed,
+        ds4_chat_format format, const tool_schema_orders *orders,
+        char **content_out, char **reasoning_out,
+        tool_calls *calls) {
+    if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
+        return parse_solar_generated_message(text, require_thinking_closed,
+                                             orders,
+                                             content_out, reasoning_out, calls);
+    }
     text = text ? text : "";
     const char *tool_search = text;
 
@@ -4983,9 +5835,13 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            /* Model did not close thinking, ignore any DSML in reasoning */
-            fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            /* The whole generation is unfinished reasoning.  Keep DSML inert,
+             * expose no assistant content, and let the terminal semantic gate
+             * mark the response incomplete instead of printing a recurring
+             * warning or returning an empty successful tool turn. */
+            const char *body = !strncmp(text, "<think>", 7) ? text + 7 : text;
+            *reasoning_out = xstrdup(body);
+            *content_out = xstrdup("");
             return true;
         }
         tool_search = think_end + 8;
@@ -5267,21 +6123,40 @@ static bool parse_motif3_generated_message_ex(const char *text,
     return true;
 }
 
-static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
-                                                  const char *text,
-                                                  bool require_thinking_closed,
-                                                  char **content_out,
-                                                  char **reasoning_out,
-                                                  tool_calls *calls) {
+static bool parse_generated_message_ex_for_model(
+        server_model_syntax syntax, const char *text,
+        bool require_thinking_closed, ds4_chat_format format,
+        const tool_schema_orders *orders, char **content_out,
+        char **reasoning_out, tool_calls *calls) {
     if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
-        return parse_motif3_generated_message_ex(text,
-                                                 require_thinking_closed,
-                                                 content_out, reasoning_out,
-                                                 calls);
+        return parse_motif3_generated_message_ex(
+            text, require_thinking_closed, content_out, reasoning_out, calls);
     }
-    return parse_generated_message_ex(text, require_thinking_closed,
-                                      content_out, reasoning_out, calls);
+    return parse_generated_message_ex_format(
+        text, require_thinking_closed, format, orders,
+        content_out, reasoning_out, calls);
 }
+
+#ifdef DS4_SERVER_TEST
+static bool parse_generated_message_ex(const char *text,
+                                       bool require_thinking_closed,
+                                       char **content_out, char **reasoning_out,
+                                       tool_calls *calls) {
+    return parse_generated_message_ex_format(text, require_thinking_closed,
+                                             DS4_CHAT_FORMAT_DSML,
+                                             NULL,
+                                             content_out, reasoning_out, calls);
+}
+
+static bool parse_generated_message_ex_for_syntax(
+        server_model_syntax syntax, const char *text,
+        bool require_thinking_closed, char **content_out,
+        char **reasoning_out, tool_calls *calls) {
+    return parse_generated_message_ex_for_model(
+        syntax, text, require_thinking_closed, DS4_CHAT_FORMAT_DSML, NULL,
+        content_out, reasoning_out, calls);
+}
+#endif
 
 /* Try to repair a truncated DSML block.
  *
@@ -5347,6 +6222,75 @@ static bool try_repair_dsml(const char *s, size_t len, buf *out) {
     return true;
 }
 
+static size_t count_tool_marker(const char *s, const char *end,
+                                const char *marker) {
+    size_t n = 0;
+    const size_t marker_len = strlen(marker);
+    if (!s || !end || !marker_len) return 0;
+    while (s < end) {
+        const char *hit = strstr(s, marker);
+        if (!hit || hit >= end || (size_t)(end - hit) < marker_len) break;
+        n++;
+        s = hit + marker_len;
+    }
+    return n;
+}
+
+/* Solar's native grammar is flat: calls may be repeated, and a call contains
+ * zero or more non-nested argument records.  Repair only the suffix-truncation
+ * shapes that can be completed without guessing model payload: one open final
+ * call, optionally with one open argument whose value marker was already
+ * emitted.  The caller reparses the completed bytes before accepting them. */
+static bool try_repair_solar_tool_call(const char *s, size_t len, buf *out) {
+    if (!s || !len) return false;
+    const char *scan_start = s;
+    const char *think_end = find_last_substr(s, DS4_SOLAR_THINK_END);
+    if (think_end && (size_t)(think_end - s) < len)
+        scan_start = think_end + strlen(DS4_SOLAR_THINK_END);
+    const char *end = s + len;
+    if (scan_start > end) return false;
+
+    const size_t call_open = count_tool_marker(
+        scan_start, end, DS4_SOLAR_TOOL_CALL_START);
+    const size_t call_close = count_tool_marker(
+        scan_start, end, DS4_SOLAR_TOOL_CALL_END);
+    const size_t arg_open = count_tool_marker(
+        scan_start, end, DS4_SOLAR_TOOL_ARG_START);
+    const size_t arg_value = count_tool_marker(
+        scan_start, end, DS4_SOLAR_TOOL_ARG_VALUE);
+    const size_t arg_close = count_tool_marker(
+        scan_start, end, DS4_SOLAR_TOOL_ARG_END);
+
+    if (call_open == 0 || call_close > call_open ||
+        arg_close > arg_open || arg_value > arg_open)
+        return false;
+    if (call_open == call_close && arg_open == arg_close) return false;
+    if (call_open != call_close + 1 || arg_open > arg_close + 1)
+        return false;
+    if (arg_open != arg_value) return false;
+
+    buf_append(out, s, len);
+    if (arg_open == arg_close + 1) buf_puts(out, DS4_SOLAR_TOOL_ARG_END);
+    buf_puts(out, DS4_SOLAR_TOOL_CALL_END);
+    return true;
+}
+
+static bool try_repair_tool_call_format(const char *s, size_t len,
+                                        ds4_chat_format format, buf *out) {
+    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+        ? try_repair_solar_tool_call(s, len, out)
+        : try_repair_dsml(s, len, out);
+}
+
+static bool tool_call_format_has_repairable_truncation(
+        const char *s, size_t len, ds4_chat_format format) {
+    buf scratch = {0};
+    const bool repairable =
+        try_repair_tool_call_format(s, len, format, &scratch);
+    buf_free(&scratch);
+    return repairable;
+}
+
 static const char *tool_parse_failure_recovery_finish(const char *finish) {
     /* Once DSML failed to parse there is no executable tool call to report.
      * Preserve a true length stop, because callers can distinguish truncation
@@ -5356,18 +6300,14 @@ static const char *tool_parse_failure_recovery_finish(const char *finish) {
     return "stop";
 }
 
-static bool parse_generated_message_for_response(server_model_syntax syntax,
-                                                 const char *text,
-                                                 bool has_tools,
-                                                 bool saw_tool_start,
-                                                 bool require_thinking_closed,
-                                                 const char **finish_io,
-                                                 char *err,
-                                                 size_t errlen,
-                                                 char **content_out,
-                                                 char **reasoning_out,
-                                                 tool_calls *calls,
-                                                 bool *recovered_out) {
+static bool parse_generated_message_for_response_model(
+        server_model_syntax syntax,
+        const char *text, bool has_tools, bool saw_tool_start,
+        bool require_thinking_closed, ds4_chat_format format,
+        const tool_schema_orders *orders,
+        const char **finish_io, char *err, size_t errlen,
+        char **content_out, char **reasoning_out, tool_calls *calls,
+        bool *recovered_out) {
     if (recovered_out) *recovered_out = false;
 
     /* No tools declared: tool-call syntax is not executable on this request,
@@ -5375,17 +6315,16 @@ static bool parse_generated_message_for_response(server_model_syntax syntax,
      * tool_calls.  The accumulator's cut keeps DSML out of visible text
      * upstream; this gate makes the invariant structural for every caller. */
     if (!has_tools) {
-        split_reasoning_content(text ? text : "", text ? strlen(text) : 0,
-                                content_out, reasoning_out);
+        split_reasoning_response_format(text ? text : "",
+                                        text ? strlen(text) : 0, format,
+                                        require_thinking_closed,
+                                        content_out, reasoning_out);
         return true;
     }
 
-    bool parsed_ok = parse_generated_message_ex_for_syntax(syntax,
-                                                           text ? text : "",
-                                                           require_thinking_closed,
-                                                           content_out,
-                                                           reasoning_out,
-                                                           calls);
+    bool parsed_ok = parse_generated_message_ex_for_model(
+        syntax, text ? text : "", require_thinking_closed, format, orders,
+        content_out, reasoning_out, calls);
     if (parsed_ok) return true;
 
     free(*content_out);
@@ -5407,6 +6346,39 @@ static bool parse_generated_message_for_response(server_model_syntax syntax,
     }
     return false;
 }
+
+#ifdef DS4_SERVER_TEST
+static bool parse_generated_message_for_response(server_model_syntax syntax,
+                                                 const char *text,
+                                                 bool has_tools,
+                                                 bool saw_tool_start,
+                                                 bool require_thinking_closed,
+                                                 const char **finish_io,
+                                                 char *err,
+                                                 size_t errlen,
+                                                 char **content_out,
+                                                 char **reasoning_out,
+                                                 tool_calls *calls,
+                                                 bool *recovered_out) {
+    return parse_generated_message_for_response_model(
+        syntax, text, has_tools, saw_tool_start, require_thinking_closed,
+        DS4_CHAT_FORMAT_DSML, NULL, finish_io, err, errlen,
+        content_out, reasoning_out, calls, recovered_out);
+}
+
+static bool parse_generated_message_for_response_format(
+        const char *text, bool has_tools, bool saw_tool_start,
+        bool require_thinking_closed, ds4_chat_format format,
+        const tool_schema_orders *orders,
+        const char **finish_io, char *err, size_t errlen,
+        char **content_out, char **reasoning_out, tool_calls *calls,
+        bool *recovered_out) {
+    return parse_generated_message_for_response_model(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, text, has_tools, saw_tool_start,
+        require_thinking_closed, format, orders, finish_io, err, errlen,
+        content_out, reasoning_out, calls, recovered_out);
+}
+#endif
 
 static void append_json_object_string(buf *b, const char *json) {
     buf tmp = {0};
@@ -5936,7 +6908,7 @@ static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
 
 static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
-                                     bool final);
+                                     bool final, ds4_chat_format format);
 
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
@@ -6699,7 +7671,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
     if (st->mode == OPENAI_STREAM_THINKING) {
         if (!st->checked_think_prefix) {
-            const char *open = "<think>";
+            const char *open = chat_think_start(r->chat_format);
             const size_t open_len = strlen(open);
             if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
                 return true;
@@ -6710,7 +7682,8 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             st->checked_think_prefix = true;
         }
 
-        const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *think_close = chat_think_end(r->chat_format);
+        const char *close = strstr(raw + st->emit_pos, think_close);
         size_t limit;
         if (close) {
             limit = (size_t)(close - raw);
@@ -6719,7 +7692,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
              * character instead of flushing its dangling bytes. */
             limit = utf8_stream_safe_len(raw, st->emit_pos, raw_len, true);
         } else {
-            const size_t hold = strlen("</think>") - 1;
+            const size_t hold = strlen(think_close) - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
@@ -6741,7 +7714,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         if (close) {
-            st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->emit_pos = (size_t)(close - raw) + strlen(think_close);
             st->mode = OPENAI_STREAM_TEXT;
         } else if (final) {
             st->mode = OPENAI_STREAM_SUPPRESS;
@@ -6752,9 +7725,12 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = r->has_tools
+            ? find_tool_start_format(raw + st->emit_pos, r->chat_format)
+            : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+                                              r->has_tools, final,
+                                              r->chat_format);
         limit = openai_stream_align_limit(st, st->emit_pos, limit);
 
         if (limit > st->emit_pos) {
@@ -7480,7 +8456,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
              * regular output_text because the model was already inside the
              * think block when it produced its first token. The actual
              * mode change to TEXT happens only when `</think>` is observed. */
-            const char *open = "<think>";
+            const char *open = chat_think_start(r->chat_format);
             const size_t open_len = strlen(open);
             if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
                 return true;
@@ -7491,7 +8467,8 @@ static bool responses_sse_stream_update(int fd, const request *r,
             st->checked_think_prefix = true;
         }
 
-        const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *think_close = chat_think_end(r->chat_format);
+        const char *close = strstr(raw + st->emit_pos, think_close);
         size_t limit;
         if (close) {
             limit = (size_t)(close - raw);
@@ -7500,7 +8477,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
              * character instead of flushing its dangling bytes. */
             limit = utf8_stream_safe_len(raw, st->emit_pos, raw_len, true);
         } else {
-            const size_t hold = strlen("</think>") - 1;
+            const size_t hold = strlen(think_close) - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
@@ -7528,7 +8505,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
         }
 
         if (close) {
-            st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+            st->emit_pos = (size_t)(close - raw) + strlen(think_close);
             st->mode = RESP_STREAM_TEXT;
             st->reasoning_closed_naturally = true;
         } else if (final) {
@@ -7540,9 +8517,12 @@ static bool responses_sse_stream_update(int fd, const request *r,
     }
 
     if (st->mode == RESP_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = r->has_tools
+            ? find_tool_start_format(raw + st->emit_pos, r->chat_format)
+            : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+                                              r->has_tools, final,
+                                              r->chat_format);
 
         if (limit > st->emit_pos) {
             if (!st->message_item_opened) {
@@ -8372,12 +9352,12 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
 
 static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
-                                     bool final) {
+                                     bool final, ds4_chat_format format) {
     if (raw_len <= start) return raw_len;
 
     size_t limit = raw_len;
     if (has_tools) {
-        const char *tool = find_any_tool_start(raw + start);
+        const char *tool = find_tool_start_format(raw + start, format);
         if (tool) {
             limit = trim_tool_separator_ws(raw, start, (size_t)(tool - raw));
             return utf8_stream_safe_len(raw, start, limit, true);
@@ -8419,7 +9399,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
 
     if (st->mode == ANTH_STREAM_THINKING) {
         if (!st->checked_think_prefix) {
-            const char *open = "<think>";
+            const char *open = chat_think_start(r->chat_format);
             const size_t open_len = strlen(open);
             if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
                 return true;
@@ -8430,7 +9410,8 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             st->checked_think_prefix = true;
         }
 
-        const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *think_close = chat_think_end(r->chat_format);
+        const char *close = strstr(raw + st->emit_pos, think_close);
         size_t limit;
         if (close) {
             limit = (size_t)(close - raw);
@@ -8439,7 +9420,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
              * character instead of flushing its dangling bytes. */
             limit = utf8_stream_safe_len(raw, st->emit_pos, raw_len, true);
         } else {
-            const size_t hold = strlen("</think>") - 1;
+            const size_t hold = strlen(think_close) - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
@@ -8456,7 +9437,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         if (close || final) {
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
             if (close) {
-                st->emit_pos = (size_t)(close - raw) + strlen("</think>");
+                st->emit_pos = (size_t)(close - raw) + strlen(think_close);
                 st->mode = ANTH_STREAM_TEXT;
             } else {
                 st->mode = ANTH_STREAM_SUPPRESS;
@@ -8468,9 +9449,12 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = r->has_tools
+            ? find_tool_start_format(raw + st->emit_pos, r->chat_format)
+            : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+                                              r->has_tools, final,
+                                              r->chat_format);
 
         if (limit > st->emit_pos) {
             if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
@@ -8849,6 +9833,10 @@ struct server {
         size_t   len;
         uint64_t last_use;
         bool     valid;
+        /* A client/semantic cut or split think-close can leave a key shorter
+         * than the bank frontier.  Such a record is only a rewind hint: never
+         * exact-splice or persist it for binaries that lack this distinction. */
+        bool     partial_only;
         /* v0.5.1 inc3b: committed length at this bank lineage's last disk
          * persist (0 = never stored).  Pacing marker ONLY -- a stale value
          * delays or duplicates a checkpoint store, never corrupts one (the
@@ -9695,6 +10683,46 @@ static bool cont_registry_bank_claim(server *s, api_style proto,
     return ok;
 }
 
+static bool cont_record_bank_reference_matches(const cont_record *rec,
+                                                uint64_t live_gen,
+                                                int live_frontier) {
+    return rec && rec->state == CONT_REC_LIVE_FRONTIER &&
+           rec->owner == CONT_OWNER_BATCH_BANK && live_gen != 0 &&
+           live_frontier > 0 && rec->owner_gen == live_gen &&
+           rec->frontier == live_frontier;
+}
+
+typedef bool (*cont_bank_reference_query)(server *s, int bank,
+                                          uint64_t *gen, int *frontier,
+                                          void *user);
+
+static bool cont_engine_bank_reference_query(server *s, int bank,
+                                             uint64_t *gen, int *frontier,
+                                             void *user) {
+    (void)user;
+    if (!s || !s->batch_ctx || bank < 0 || bank >= s->batch_ctx_max_seq)
+        return false;
+    if (frontier)
+        *frontier = ds4_batch_ctx_bank_committed(s->batch_ctx, bank, NULL);
+    if (gen) *gen = ds4_batch_ctx_bank_generation(s->batch_ctx, bank);
+    return true;
+}
+
+/* Bank records deliberately remain LIVE after their frontier moves so a
+ * repeated output-only T2 reaches the worker and receives the protocol-native
+ * 409 instead of a parse-time 400.  That stale record must not reserve its old
+ * bank, though: no continuation can consume the reference once generation or
+ * committed length differs. */
+static bool cont_record_bank_reference_is_current(
+        server *s, const cont_record *rec,
+        cont_bank_reference_query query, void *query_user) {
+    if (!s || !rec || !query) return false;
+    uint64_t gen = 0;
+    int frontier = 0;
+    if (!query(s, rec->owner_id, &gen, &frontier, query_user)) return false;
+    return cont_record_bank_reference_matches(rec, gen, frontier);
+}
+
 /* Inc 6c: is this bank's frontier retention-protected right now?  True
  * while a LIVE bank-owned record naming the bank is inside its grace
  * window or validly hard-pinned by a queued continuation -- the
@@ -9709,13 +10737,21 @@ static bool cont_registry_bank_claim(server *s, api_style proto,
  * pressure (job_queue_aged still sheds a stuck head).  Read-only probe:
  * a TTL-stale record cannot protect (in_grace false; a pin can only be
  * acquired on a record that was LIVE at pin time), so no expire walk. */
-static bool cont_registry_bank_protected(server *s, int bank, double now) {
+/* Production callers hold gen_mu before entering these helpers.  The query
+ * reads batch_ctx while tool_mu protects the registry, preserving the global
+ * gen_mu -> tool_mu lock order.  Tests inject an immutable reference query so
+ * generation/frontier drift exercises the same registry loop. */
+static bool cont_registry_bank_protected_with_query(
+        server *s, int bank, double now,
+        cont_bank_reference_query query, void *query_user) {
     if (!s || bank < 0) return false;
     bool prot = false;
     pthread_mutex_lock(&s->tool_mu);
     for (cont_record *rec = s->creg.head; rec && !prot; rec = rec->next) {
         if (rec->owner != CONT_OWNER_BATCH_BANK || rec->owner_id != bank ||
             rec->state != CONT_REC_LIVE_FRONTIER) continue;
+        if (!cont_record_bank_reference_is_current(s, rec, query, query_user))
+            continue;
         const bool in_grace = s->creg.grace_s > 0 &&
             now - rec->publish_time < s->creg.grace_s;
         const bool pinned = rec->hard_refs > 0 &&
@@ -9726,16 +10762,65 @@ static bool cont_registry_bank_protected(server *s, int bank, double now) {
     return prot;
 }
 
+static bool cont_registry_bank_protected(server *s, int bank, double now) {
+    return cont_registry_bank_protected_with_query(
+        s, bank, now, cont_engine_bank_reference_query, NULL);
+}
+
+typedef uint64_t (*cont_bank_reclaim_callback)(server *s, uint64_t want,
+                                               void *user);
+
+/* The serial lane's emergency reclaim spends every batch bank.  A separate
+ * protection probe followed by trim would race a parser thread pinning an
+ * output-only T2 between those operations.  Keep tool_mu across the complete
+ * check-and-act sequence: production already holds gen_mu, so this preserves
+ * the global gen_mu -> tool_mu order, and the reclaim callback never re-enters
+ * the continuation registry. */
+static uint64_t cont_registry_reclaim_unprotected_with_query(
+        server *s, double now,
+        cont_bank_reference_query query, void *query_user,
+        cont_bank_reclaim_callback reclaim, void *reclaim_user,
+        bool *skipped_protected) {
+    if (skipped_protected) *skipped_protected = false;
+    if (!s || !query || !reclaim) return 0;
+
+    bool protected = false;
+    pthread_mutex_lock(&s->tool_mu);
+    for (cont_record *rec = s->creg.head; rec && !protected; rec = rec->next) {
+        if (rec->owner != CONT_OWNER_BATCH_BANK ||
+            rec->state != CONT_REC_LIVE_FRONTIER) continue;
+        if (!cont_record_bank_reference_is_current(s, rec, query, query_user))
+            continue;
+        const bool in_grace = s->creg.grace_s > 0 &&
+            now - rec->publish_time < s->creg.grace_s;
+        const bool pinned = rec->hard_refs > 0 &&
+            s->creg.pin_deadline_s > 0 && now < rec->pin_expiry;
+        protected = in_grace || pinned;
+    }
+    uint64_t freed = 0;
+    if (protected) {
+        if (skipped_protected) *skipped_protected = true;
+    } else {
+        freed = reclaim(s, UINT64_MAX, reclaim_user);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return freed;
+}
+
 /* Inc 6c: honest Retry-After for a fully protected bank set -- the SOONEST
  * moment any live bank record's protection (grace or pin) lapses, i.e. when
  * the first victim bank frees up.  Mirrors cont_registry_serial_hold's
  * retry arithmetic on the bank-owner side. */
-static int cont_registry_bank_hold_retry(server *s, double now) {
+static int cont_registry_bank_hold_retry_with_query(
+        server *s, double now,
+        cont_bank_reference_query query, void *query_user) {
     double left_min = -1.0;
     pthread_mutex_lock(&s->tool_mu);
     for (cont_record *rec = s->creg.head; rec; rec = rec->next) {
         if (rec->owner != CONT_OWNER_BATCH_BANK ||
             rec->state != CONT_REC_LIVE_FRONTIER) continue;
+        if (!cont_record_bank_reference_is_current(s, rec, query, query_user))
+            continue;
         const double grace_left = s->creg.grace_s > 0 ?
             s->creg.grace_s - (now - rec->publish_time) : 0.0;
         const double pin_left = (rec->hard_refs > 0 &&
@@ -9749,6 +10834,11 @@ static int cont_registry_bank_hold_retry(server *s, double now) {
     if (left_min <= 0) return 1;
     const int ra = (int)(left_min + 0.999);
     return ra < 1 ? 1 : ra;
+}
+
+static int cont_registry_bank_hold_retry(server *s, double now) {
+    return cont_registry_bank_hold_retry_with_query(
+        s, now, cont_engine_bank_reference_query, NULL);
 }
 
 /* Mint uniqueness: an id is in use while ANY record (any protocol, any
@@ -10516,10 +11606,12 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         {DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
         {"\n\n<tool_calls>", "</tool_calls>"},
         {"<tool_calls>", "</tool_calls>"},
+        {DS4_SOLAR_TOOL_CALL_START, DS4_SOLAR_TOOL_CALL_END},
     };
 
     const char *best = NULL;
     const char *best_end = NULL;
+    bool best_is_solar = false;
     for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
         const char *s = strstr(p, forms[i].start);
         if (!s || (best && s >= best)) continue;
@@ -10527,6 +11619,25 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         if (!e) continue;
         best = s;
         best_end = e + strlen(forms[i].end);
+        best_is_solar = !strcmp(forms[i].start, DS4_SOLAR_TOOL_CALL_START);
+    }
+    if (best_is_solar) {
+        /* A Solar assistant turn may contain several adjacent native calls.
+         * tool_memory stores the full sampled span for every call id, so the KV
+         * extension scanner must select that same whole span rather than the
+         * first call only. */
+        const size_t start_len = strlen(DS4_SOLAR_TOOL_CALL_START);
+        const size_t end_len = strlen(DS4_SOLAR_TOOL_CALL_END);
+        const char *next = best_end;
+        for (;;) {
+            while (*next && isspace((unsigned char)*next)) next++;
+            if (strncmp(next, DS4_SOLAR_TOOL_CALL_START, start_len)) break;
+            const char *e = strstr(next + start_len,
+                                   DS4_SOLAR_TOOL_CALL_END);
+            if (!e) break;
+            best_end = e + end_len;
+            next = best_end;
+        }
     }
     if (end_out) *end_out = best_end;
     return best;
@@ -10945,6 +12056,7 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
     if (min_committed <= 0) return;
     if (!s->kv.enabled || !s->batch_ctx || !s->warm) return;
     if (bank < 0 || bank >= s->batch_ctx_max_seq || !s->warm[bank].valid) return;
+    if (s->warm[bank].partial_only) return;
     if (!s->warm[bank].text || s->warm[bank].len == 0) return;
     const int *htok = NULL;
     const int hl = ds4_batch_ctx_bank_committed(s->batch_ctx, bank, &htok);
@@ -10966,7 +12078,8 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
     const bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                         s->session, s->serial_boot_ctx,
                         &tokens, (int)hl, reason,
-                        s->warm[bank].text, 0, "bank",
+                        s->warm[bank].text,
+                        DS4_KVSTORE_EXT_BANK_REPLAY_V1, "bank",
                         &hooks, &staged, err, sizeof(err));
     ds4_session_payload_file_free(&staged);
     if (ok) {
@@ -11099,10 +12212,10 @@ static int live_text_prefix_prompt(server *s, const request *req,
  * the registry record's execution reference (engine generation + committed
  * frontier, Inc 5a) and call-id set match exactly -- a session rebuilt to
  * the same position no longer revalidates a dead binding. */
-static int responses_live_continuation_prompt(server *s, const request *req,
-                                              int live_pos,
-                                              ds4_tokens *effective_prompt,
-                                              int *matched_ids) {
+static int responses_live_continuation_prompt_impl(
+        server *s, const request *req, int live_pos,
+        ds4_tokens *effective_prompt, int *matched_ids,
+        bool record_resolution) {
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_RESPONSES || !req->responses_live_suffix_text) return 0;
     if (req->responses_live_call_ids.len == 0) return 0;
@@ -11118,8 +12231,17 @@ static int responses_live_continuation_prompt(server *s, const request *req,
         s->engine, live_tokens, req->responses_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
-    ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
+    if (record_resolution)
+        ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
     return live_tokens->len;
+}
+
+static int responses_live_continuation_prompt(server *s, const request *req,
+                                              int live_pos,
+                                              ds4_tokens *effective_prompt,
+                                              int *matched_ids) {
+    return responses_live_continuation_prompt_impl(
+        s, req, live_pos, effective_prompt, matched_ids, true);
 }
 
 /* Tool-result Anthropic continuation.
@@ -11129,10 +12251,10 @@ static int responses_live_continuation_prompt(server *s, const request *req,
  * live local agent loop.  When the registry record's ids and execution
  * reference (generation + frontier, Inc 5a) match, continue from the sampled
  * DSML state and append only the user tool_result suffix. */
-static int anthropic_live_continuation_prompt(server *s, const request *req,
-                                              int live_pos,
-                                              ds4_tokens *effective_prompt,
-                                              int *matched_ids) {
+static int anthropic_live_continuation_prompt_impl(
+        server *s, const request *req, int live_pos,
+        ds4_tokens *effective_prompt, int *matched_ids,
+        bool record_resolution) {
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
     if (req->anthropic_live_call_ids.len == 0) return 0;
@@ -11148,8 +12270,17 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
         s->engine, live_tokens, req->anthropic_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
-    ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
+    if (record_resolution)
+        ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
     return live_tokens->len;
+}
+
+static int anthropic_live_continuation_prompt(server *s, const request *req,
+                                              int live_pos,
+                                              ds4_tokens *effective_prompt,
+                                              int *matched_ids) {
+    return anthropic_live_continuation_prompt_impl(
+        s, req, live_pos, effective_prompt, matched_ids, true);
 }
 
 /* Visible-replay Responses continuation.
@@ -11643,7 +12774,7 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
 
 typedef struct {
     bool inside;
-    char tail[8]; /* Long enough for "</think>". */
+    char tail[16]; /* Long enough for Solar's "<|think:start|>". */
     int tail_len;
 } thinking_state;
 
@@ -11660,8 +12791,13 @@ static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
             st->tail_len--;
         }
         st->tail[st->tail_len++] = p[i];
-        if (thinking_tail_ends_with(st, "<think>")) st->inside = true;
-        else if (thinking_tail_ends_with(st, "</think>")) st->inside = false;
+        if (thinking_tail_ends_with(st, "<think>") ||
+            thinking_tail_ends_with(st, DS4_SOLAR_THINK_START)) {
+            st->inside = true;
+        } else if (thinking_tail_ends_with(st, "</think>") ||
+                   thinking_tail_ends_with(st, DS4_SOLAR_THINK_END)) {
+            st->inside = false;
+        }
     }
 }
 
@@ -11706,12 +12842,15 @@ typedef struct {
                                   * codex compact-summary poisoning, 08-09. */
     bool think_gates_markers;    /* ds4_think_mode_enabled(think_mode) */
     bool count_reasoning;        /* Inc 7b: count generated reasoning tokens */
+    ds4_chat_format chat_format;
     bool tool_scan_waiting_for_think_close;
     size_t stop_scan_from;       /* rolling stop-window start */
     size_t tool_scan_from;       /* rolling marker-window start */
     bool saw_tool_start;
     bool saw_tool_end;
     bool saw_orphan_tool_end;
+    int required_tool_prefix_pos;
+    int required_think_end_prefix_pos;
     char *matched_stop;          /* owned; the stop text a scan hit (captured
                                   * before truncation) */
     const char *verdict;         /* NULL | "stop" | "tool_calls" -- beats the
@@ -11741,6 +12880,7 @@ static void sem_accum_init(sem_accum *a, const request *r) {
     a->cut_tool_syntax = r->kind == REQ_CHAT && !r->has_tools;
     a->think_gates_markers = ds4_think_mode_enabled(r->think_mode);
     a->count_reasoning = a->think_gates_markers;
+    a->chat_format = r->chat_format;
     a->tool_scan_waiting_for_think_close =
         a->think_gates_markers && a->thinking.inside;
 }
@@ -11756,19 +12896,83 @@ static void sem_accum_free(sem_accum *a) {
  * payload bodies (and everything outside a tool block) keep the request's
  * sampling params. */
 static dsml_decode_state sem_accum_dsml_state(const sem_accum *a) {
-    return a->track_tools ? a->dsml.decode : DSML_DECODE_OUTSIDE;
+    return a->track_tools && a->chat_format == DS4_CHAT_FORMAT_DSML
+        ? a->dsml.decode : DSML_DECODE_OUTSIDE;
+}
+
+static int agent_turn_reasoning_cap(const request *r) {
+    /* Reserve enough output budget for a small valid function call or the
+     * answer after a tool result.  Agent action/result turns must not spend the
+     * whole budget in hidden reasoning and return an empty visible response. */
+    const int reserve = 64;
+    int budget_cap = r->max_tokens > reserve ? r->max_tokens - reserve : 0;
+    int effort_cap = 64;
+    if (r->think_mode == DS4_THINK_HIGH) effort_cap = 256;
+    else if (r->think_mode == DS4_THINK_MAX) effort_cap = 512;
+    return budget_cap < effort_cap ? budget_cap : effort_cap;
+}
+
+/* One sampling contract for serial and continuous generation.  Required tool
+ * choice forces the canonical DSML opener token-by-token only after thinking
+ * closes; once the marker scanner enters the block, the existing structural
+ * greedy policy takes over while payload retains the request sampler. */
+static int sem_accum_sampling_override(sem_accum *a, const request *r) {
+    const bool required_pending = a && r &&
+        r->tool_choice == TOOL_CHOICE_REQUIRED &&
+        a->track_tools && !a->saw_tool_start;
+    const bool reserve_post_thinking = required_pending ||
+        (a && r && r->has_tool_results);
+    if (reserve_post_thinking && a->thinking.inside) {
+        if (a->completion >= agent_turn_reasoning_cap(r) &&
+            a->required_think_end_prefix_pos <
+                r->required_think_end_prefix.len) {
+            const int token = r->required_think_end_prefix.v[
+                a->required_think_end_prefix_pos++];
+            return DS4_SAMPLE_OVERRIDE_TOKEN(token);
+        }
+        return DS4_SAMPLE_OVERRIDE_NONE;
+    }
+    if (required_pending) {
+        if (a->required_tool_prefix_pos < r->required_tool_prefix.len) {
+            const int token =
+                r->required_tool_prefix.v[a->required_tool_prefix_pos++];
+            return DS4_SAMPLE_OVERRIDE_TOKEN(token);
+        }
+    }
+    const dsml_decode_state state = sem_accum_dsml_state(a);
+    if (dsml_decode_state_is_tool(state) &&
+        !dsml_decode_state_uses_payload_sampling(state)) {
+        return DS4_SAMPLE_OVERRIDE_GREEDY;
+    }
+    return DS4_SAMPLE_OVERRIDE_NONE;
+}
+
+static const char *sem_accum_terminal_finish(const sem_accum *a,
+                                             const char *finish) {
+    if (!finish) return "stop";
+    if (a && a->thinking.inside && strcmp(finish, "error") != 0 &&
+        strcmp(finish, "length") != 0) {
+        return "length";
+    }
+    return finish;
 }
 
 /* Cut-mode stream hold-back: never emit a text tail that could be the start
  * of a DSML tool-call start marker -- the no-tools cut must be able to keep
  * the whole marker off the wire, and bytes already sent cannot be unsent.
  * Same contract as stop_list_stream_safe_len, for the two marker spellings. */
-static size_t tool_marker_stream_safe_len(const char *text, size_t len) {
-    static const char *const marks[3] =
-        { DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT, "<tool_call>" };
+static size_t tool_marker_stream_safe_len(const char *text, size_t len,
+                                          ds4_chat_format format) {
+    static const char *const dsml_marks[3] = {
+        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT, "<tool_call>"
+    };
+    const char *const solar_marks[1] = {DS4_SOLAR_TOOL_CALL_START};
+    const char *const *marks = format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+        ? solar_marks : dsml_marks;
+    const int nmarks = format == DS4_CHAT_FORMAT_SOLAR_OPEN2 ? 1 : 3;
     if (!text || !len) return len;
     size_t safe = len;
-    for (int m = 0; m < 3; m++) {
+    for (int m = 0; m < nmarks; m++) {
         const size_t ml = strlen(marks[m]);
         size_t k = ml - 1 < len ? ml - 1 : len;
         for (; k >= 1; k--) {
@@ -11791,7 +12995,7 @@ static sem_feed sem_accum_feed(sem_accum *a, const request *r,
     if (a->count_reasoning && a->thinking.inside) a->reasoning_tokens++;
     buf_append(&a->text, piece, piece_len);
     thinking_state_feed(&a->thinking, piece, piece_len);
-    if (a->track_tools)
+    if (a->track_tools && a->chat_format == DS4_CHAT_FORMAT_DSML)
         dsml_decode_tracker_update(&a->dsml, a->text.ptr, a->text.len);
     a->completion++;
 
@@ -11811,7 +13015,8 @@ static sem_feed sem_accum_feed(sem_accum *a, const request *r,
      * reach the wire (delays at most strlen(marker)-1 bytes until the tail
      * disambiguates). */
     if (a->cut_tool_syntax) {
-        const size_t safe = tool_marker_stream_safe_len(a->text.ptr, a->text.len);
+        const size_t safe = tool_marker_stream_safe_len(
+            a->text.ptr, a->text.len, a->chat_format);
         if (f.emit_limit > safe) f.emit_limit = safe;
     }
 
@@ -11828,10 +13033,12 @@ static sem_feed sem_accum_feed(sem_accum *a, const request *r,
             a->tool_scan_from = a->text.len;
         } else {
             if (a->tool_scan_waiting_for_think_close) {
+                const char *think_marker = chat_think_end(a->chat_format);
                 const char *think_end = a->text.ptr ?
-                    find_last_substr(a->text.ptr, "</think>") : NULL;
+                    find_last_substr(a->text.ptr, think_marker) : NULL;
                 a->tool_scan_from = think_end ?
-                    (size_t)((think_end + 8) - a->text.ptr) : a->text.len;
+                    (size_t)((think_end + strlen(think_marker)) - a->text.ptr)
+                    : a->text.len;
                 if (a->tool_scan_from > a->text.len) a->tool_scan_from = a->text.len;
                 a->tool_scan_waiting_for_think_close = false;
             }
@@ -11840,8 +13047,9 @@ static sem_feed sem_accum_feed(sem_accum *a, const request *r,
             bool orphan_end = false;
             const bool old_start = a->saw_tool_start;
             const bool old_end = a->saw_tool_end;
-            observe_tool_markers(tool_scan, &a->saw_tool_start, &a->saw_tool_end,
-                                 &orphan_end);
+            observe_tool_markers_format(tool_scan, &a->saw_tool_start,
+                                        &a->saw_tool_end, &orphan_end,
+                                        a->chat_format);
             if (orphan_end && !a->saw_orphan_tool_end) {
                 a->saw_orphan_tool_end = true;
                 f.orphan_tool_end = true;
@@ -11852,7 +13060,8 @@ static sem_feed sem_accum_feed(sem_accum *a, const request *r,
                 /* Position captured HERE, on the think-gated scan pointer --
                  * a suffix re-search could land on non-executable DSML inside
                  * a closed think block. */
-                const char *m = find_any_tool_start(tool_scan);
+                const char *m = find_tool_start_format(tool_scan,
+                                                       a->chat_format);
                 if (m) cut_pos = (size_t)(m - a->text.ptr);
             }
             const size_t marker_hold = 80;
@@ -11883,13 +13092,14 @@ static sem_feed sem_accum_feed(sem_accum *a, const request *r,
         f.hit_stop = true;
         f.tool_syntax_cut = true;
         if (f.emit_limit > cut_pos) f.emit_limit = cut_pos;
-    } else if (a->track_tools && a->saw_tool_end && !a->verdict) {
+    } else if (a->track_tools && a->saw_tool_end && !a->verdict &&
+               a->chat_format == DS4_CHAT_FORMAT_DSML) {
         a->verdict = "tool_calls";
     }
     return f;
 }
 
-static char *rendered_chat_system_region(const char *prompt_text) {
+static char *rendered_dsml_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
     const char *p = prompt_text;
     const char *bos = "<｜begin▁of▁sentence｜>";
@@ -11916,19 +13126,45 @@ static char *rendered_chat_system_region(const char *prompt_text) {
     return xstrndup(p, (size_t)(end - p));
 }
 
-static char *build_invalid_dsml_tool_error_suffix(const request *r,
-                                                  const thinking_state *thinking,
-                                                  const char *detail) {
-    char *system = rendered_chat_system_region(r ? r->prompt_text : NULL);
+static char *rendered_solar_system_region(const char *prompt_text) {
+    if (!prompt_text) return xstrdup("");
+    const char *prefix = DS4_SOLAR_IM_START "system" DS4_SOLAR_IM_CONTENT;
+    const size_t prefix_len = strlen(prefix);
+    if (strncmp(prompt_text, prefix, prefix_len)) return xstrdup("");
+    const char *p = prompt_text + prefix_len;
+    const char *end = strstr(p, DS4_SOLAR_IM_END);
+    if (!end) end = p + strlen(p);
+    while (end > p && isspace((unsigned char)end[-1])) end--;
+    return xstrndup(p, (size_t)(end - p));
+}
+
+static char *rendered_chat_system_region(const request *r) {
+    return r && r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+        ? rendered_solar_system_region(r->prompt_text)
+        : rendered_dsml_system_region(r ? r->prompt_text : NULL);
+}
+
+static char *build_invalid_tool_error_suffix(const request *r,
+                                             const thinking_state *thinking,
+                                             const char *detail) {
+    const bool solar = r && r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2;
+    char *system = rendered_chat_system_region(r);
     buf tool_error = {0};
-    buf_puts(&tool_error, "Tool error: invalid DSML tool call");
+    buf_puts(&tool_error, solar ? "Tool error: invalid Solar tool call"
+                                : "Tool error: invalid DSML tool call");
     if (detail && detail[0]) {
         buf_puts(&tool_error, ": ");
         buf_puts(&tool_error, detail);
     }
-    buf_puts(&tool_error,
-             "\nThe previous assistant output was not executed because the DSML syntax was malformed. "
-             "Emit a new valid DSML tool call, or answer normally if no tool is needed.");
+    if (solar) {
+        buf_puts(&tool_error,
+                 "\nThe previous assistant output was not executed because the Solar tool syntax was malformed. "
+                 "Emit a new valid native Solar tool call, or answer normally if no tool is needed.");
+    } else {
+        buf_puts(&tool_error,
+                 "\nThe previous assistant output was not executed because the DSML syntax was malformed. "
+                 "Emit a new valid DSML tool call, or answer normally if no tool is needed.");
+    }
     if (system && system[0]) {
         buf_puts(&tool_error, "\n\nSystem prompt reminder:\n");
         buf_puts(&tool_error, system);
@@ -11936,12 +13172,26 @@ static char *build_invalid_dsml_tool_error_suffix(const request *r,
 
     buf suffix = {0};
     if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
-        buf_puts(&suffix, "</think>");
+        buf_puts(&suffix, chat_think_end(r->chat_format));
     }
-    buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
-    append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
-    buf_puts(&suffix, "</tool_result><｜Assistant｜>");
-    buf_puts(&suffix, r && ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    if (solar) {
+        buf_puts(&suffix, DS4_SOLAR_IM_END "\n");
+        append_solar_role_open(&suffix, "tool");
+        buf_puts(&suffix, DS4_SOLAR_TOOL_RESPONSE_START);
+        append_solar_tool_response_text(&suffix,
+                                        tool_error.ptr ? tool_error.ptr : "");
+        buf_puts(&suffix, DS4_SOLAR_TOOL_RESPONSE_END "\n"
+                          DS4_SOLAR_IM_END "\n");
+        append_solar_role_open(&suffix, "assistant");
+        buf_puts(&suffix, DS4_SOLAR_THINK_START);
+        if (!r || !ds4_think_mode_enabled(r->think_mode))
+            buf_puts(&suffix, DS4_SOLAR_THINK_END);
+    } else {
+        buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
+        append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
+        buf_puts(&suffix, "</tool_result><｜Assistant｜>");
+        buf_puts(&suffix, r && ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    }
 
     free(system);
     buf_free(&tool_error);
@@ -11971,12 +13221,12 @@ static bool append_rendered_suffix_to_live_session(server *s, const char *suffix
     return ok;
 }
 
-static bool continue_after_invalid_dsml(server *s, const request *r,
-                                        const thinking_state *thinking,
-                                        const char *detail,
-                                        int *tokens_appended,
-                                        char *err, size_t errlen) {
-    char *suffix = build_invalid_dsml_tool_error_suffix(r, thinking, detail);
+static bool continue_after_invalid_tool_call(server *s, const request *r,
+                                             const thinking_state *thinking,
+                                             const char *detail,
+                                             int *tokens_appended,
+                                             char *err, size_t errlen) {
+    char *suffix = build_invalid_tool_error_suffix(r, thinking, detail);
     bool ok = append_rendered_suffix_to_live_session(s, suffix,
                                                      tokens_appended,
                                                      err, errlen);
@@ -12130,15 +13380,21 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     buf suffix = {0};
     if (ds4_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
-        buf_puts(&suffix, "</think>");
+        buf_puts(&suffix, chat_think_end(r->chat_format));
     }
     buf_puts(&suffix, content ? content : "");
     const server_model_syntax syntax = r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
-    append_tool_calls_text_for_syntax(&suffix, syntax, calls,
-                                      r ? &r->tool_orders : NULL);
     if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
+        append_motif3_tool_calls_text(&suffix, calls, true);
         buf_puts(&suffix, "<|endofturn|>");
+    } else if (r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
+        append_model_tool_calls_text(&suffix, calls, &r->tool_orders,
+                                     r->chat_format);
+        if (calls && calls->len > 0) buf_putc(&suffix, '\n');
+        buf_puts(&suffix, DS4_SOLAR_IM_END "\n");
     } else {
+        append_model_tool_calls_text(&suffix, calls, &r->tool_orders,
+                                     r->chat_format);
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -12161,15 +13417,21 @@ static char *build_responses_visible_assistant_suffix(const request *r,
         if (r->reasoning_summary_emit && calls && calls->len > 0) {
             buf_puts(&suffix, reasoning ? reasoning : "");
         }
-        buf_puts(&suffix, "</think>");
+        buf_puts(&suffix, chat_think_end(r->chat_format));
     }
     buf_puts(&suffix, content ? content : "");
     const server_model_syntax syntax = r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
-    append_tool_calls_text_for_syntax(&suffix, syntax, calls,
-                                      r ? &r->tool_orders : NULL);
     if (syntax == SERVER_MODEL_SYNTAX_MOTIF3) {
+        append_motif3_tool_calls_text(&suffix, calls, true);
         buf_puts(&suffix, "<|endofturn|>");
+    } else if (r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
+        append_model_tool_calls_text(&suffix, calls, &r->tool_orders,
+                                     r->chat_format);
+        if (calls && calls->len > 0) buf_putc(&suffix, '\n');
+        buf_puts(&suffix, DS4_SOLAR_IM_END "\n");
     } else {
+        append_model_tool_calls_text(&suffix, calls, &r->tool_orders,
+                                     r->chat_format);
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -12180,7 +13442,8 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * reasoning bytes, so the next request would miss the session cache even though
  * the visible conversation prefix is logically the same.
  *
- *   prompt-without-final-<think> + </think> + visible-content + eos
+ *   DSML:  prompt-without-final-<think> + </think> + visible-content + eos
+ *   Solar: prompt-with-<|think:start|> + <|think:end|> + content + eos
  *
  * is exactly the visible prefix that render_chat_prompt_text() will produce on
  * the next turn.  Do not rebuild the KV cache to erase hidden reasoning here:
@@ -12188,13 +13451,14 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * Instead, remember the visible bytes as a key for the current sampled frontier.
  * The next request can then continue from live KV while tokenizing only the new
  * visible suffix. */
-static char *build_toolless_thinking_visible_text(const request *r,
-                                                  const char *content) {
+static char *build_toolless_thinking_visible_prefix(const request *r,
+                                                    const char *content,
+                                                    bool terminal) {
     if (!r || !r->prompt_text) return NULL;
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
-    const char *think_tag = "<think>";
+    const char *think_tag = chat_think_start(r->chat_format);
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
         memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
@@ -12202,12 +13466,23 @@ static char *build_toolless_thinking_visible_text(const request *r,
     }
 
     buf visible = {0};
-    buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    buf_puts(&visible, "</think>");
+    /* DSML renders an older tool-less assistant as </think> + content, so its
+     * generation-only <think> prefix must be removed.  Solar renders the
+     * older assistant as <|think:start|><|think:end|> + content and therefore
+     * keeps the start marker. */
+    const size_t prefix_len = r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2
+                                ? pt_len : pt_len - tag_len;
+    buf_append(&visible, r->prompt_text, prefix_len);
+    buf_puts(&visible, chat_think_end(r->chat_format));
     buf_puts(&visible, content ? content : "");
-    buf_puts(&visible,
-             r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ?
-             "<|endofturn|>" : "<｜end▁of▁sentence｜>");
+    if (terminal) {
+        if (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3)
+            buf_puts(&visible, "<|endofturn|>");
+        else if (r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
+            buf_puts(&visible, DS4_SOLAR_IM_END "\n");
+        else
+            buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    }
     return buf_take(&visible);
 }
 
@@ -12268,6 +13543,33 @@ static bool remember_motif3_no_think_tool_checkpoint(
                 ds4_session_pos(s->session), strlen(visible));
     free(visible);
     return true;
+}
+
+static char *build_toolless_thinking_visible_text(const request *r,
+                                                  const char *content) {
+    return build_toolless_thinking_visible_prefix(r, content, true);
+}
+
+/* A continuous bank never commits its final sampled token.  Its replay key
+ * must therefore stop before the terminal marker even when the sample was an
+ * EOS; the next request tokenizes that marker as the first suffix. */
+static char *build_cont_toolless_thinking_visible_key(const request *r,
+                                                      const char *content) {
+    return build_toolless_thinking_visible_prefix(r, content, false);
+}
+
+/* A multi-token think-close can straddle the uncommitted final sample.  In
+ * that case the bank ends in only a prefix of the marker, so a prompt-key
+ * exact splice would append the whole marker and duplicate those bytes. */
+static bool text_ends_with_proper_prefix(const char *text, const char *marker) {
+    if (!text || !marker) return false;
+    const size_t n = strlen(text);
+    const size_t m = strlen(marker);
+    if (n == 0 || m <= 1) return false;
+    size_t k = n < m - 1 ? n : m - 1;
+    for (; k > 0; k--)
+        if (!memcmp(text + n - k, marker, k)) return true;
+    return false;
 }
 
 static void remember_thinking_checkpoint(server *s, const job *j, const char *ctx,
@@ -12927,10 +14229,13 @@ decode_again:
             top_p = DS4_DEFAULT_TOP_P;
             min_p = DS4_DEFAULT_MIN_P;
         }
-        if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
+        const int sample_override = sem_accum_sampling_override(&acc, &j->req);
+        const bool exact_sample = DS4_SAMPLE_OVERRIDE_IS_TOKEN(sample_override);
+        if (sample_override == DS4_SAMPLE_OVERRIDE_GREEDY)
             temperature = 0.0f;
-        }
-        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        int token = exact_sample ?
+            DS4_SAMPLE_OVERRIDE_TOKEN_ID(sample_override) :
+            ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
         if (server_token_ends_generation(s->engine, &j->req, token)) {
             finish = "stop";
             break;
@@ -12938,7 +14243,7 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        if (!exact_sample && temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -13100,7 +14405,8 @@ decode_again:
                 break;
             }
 
-            if (acc.track_tools && acc.saw_tool_end) {
+            if (acc.track_tools && acc.saw_tool_end &&
+                j->req.chat_format == DS4_CHAT_FORMAT_DSML) {
                 finish = "tool_calls";
                 stop_decode = true;
                 break;
@@ -13121,10 +14427,15 @@ decode_again:
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
     }
+    finish = sem_accum_terminal_finish(&acc, finish);
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
-        j->req.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK &&
-        acc.saw_tool_start && !acc.saw_tool_end && strcmp(finish, "error") != 0)
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 &&
+        acc.saw_tool_start &&
+        (!acc.saw_tool_end || tool_call_format_has_repairable_truncation(
+                                  acc.text.ptr, acc.text.len,
+                                  j->req.chat_format)) &&
+        strcmp(finish, "error") != 0)
     {
         /* Deterministically complete a simple truncation.  Anything more than
          * missing closing tags stays model-owned: for non-streaming requests,
@@ -13134,12 +14445,15 @@ decode_again:
          * recovery below instead. */
         bool completed_truncation = false;
         buf repaired = {0};
-        if (try_repair_dsml(acc.text.ptr, acc.text.len, &repaired)) {
+        if (try_repair_tool_call_format(acc.text.ptr, acc.text.len,
+                                        j->req.chat_format, &repaired)) {
             /* Parse repaired text to verify it produces valid tool calls */
             tool_calls test_calls = {0};
             char *test_content = NULL;
             char *test_reasoning = NULL;
-            bool repair_ok = parse_generated_message_ex(repaired.ptr, false, &test_content, &test_reasoning, &test_calls);
+            bool repair_ok = parse_generated_message_ex_format(
+                repaired.ptr, false, j->req.chat_format, &j->req.tool_orders,
+                &test_content, &test_reasoning, &test_calls);
             free(test_content);
             free(test_reasoning);
             if (repair_ok && test_calls.len > 0) {
@@ -13186,11 +14500,9 @@ decode_again:
                            req_flags);
                 trace_event(s, trace_id,
                             "unterminated tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, &j->req, &acc.thinking,
-                                                "unterminated tool call",
-                                                &recovery_tokens,
-                                                recovery_err,
-                                                sizeof(recovery_err)))
+                if (continue_after_invalid_tool_call(
+                        s, &j->req, &acc.thinking, "unterminated tool call",
+                        &recovery_tokens, recovery_err, sizeof(recovery_err)))
                 {
                     dsml_recovery_attempted = true;
                     server_log(DS4_LOG_GENERATION,
@@ -13241,12 +14553,14 @@ decode_again:
     const char *final_finish = finish;
     bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
-        bool parsed_ok = parse_generated_message_for_response(
+        bool parsed_ok = parse_generated_message_for_response_model(
             j->req.model_syntax,
             acc.text.ptr ? acc.text.ptr : "",
             j->req.has_tools,
             acc.saw_tool_start,
             ds4_think_mode_enabled(j->req.think_mode),
+            j->req.chat_format,
+            &j->req.tool_orders,
             &final_finish,
             err,
             sizeof(err),
@@ -13273,11 +14587,9 @@ decode_again:
                            req_flags);
                 trace_event(s, trace_id,
                             "invalid tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, &j->req, &acc.thinking,
-                                                detail,
-                                                &recovery_tokens,
-                                                recovery_err,
-                                                sizeof(recovery_err)))
+                if (continue_after_invalid_tool_call(
+                        s, &j->req, &acc.thinking, detail, &recovery_tokens,
+                        recovery_err, sizeof(recovery_err)))
                 {
                     dsml_recovery_attempted = true;
                     server_log(DS4_LOG_GENERATION,
@@ -14256,6 +15568,108 @@ static void serial_terminal_commit(server *s, job *j, api_style proto,
     terminal_sink_release(tb->len);
 }
 
+static bool serial_session_reuse_ok(int cur_ctx, bool graph_pending,
+                                    long need_min, long request_cap,
+                                    bool current_graph_fits) {
+    if (cur_ctx < need_min) return false;
+    if (!graph_pending) return true;
+    /* A graphless boot-shape session has no state to preserve.  Do not let a
+     * tiny first serial request commit a deep full--c graph merely because it
+     * fits before the batch banks grow; cap it to what this conversation can
+     * use plus the continuation allowance. */
+    return cur_ctx <= request_cap && current_graph_fits;
+}
+
+typedef enum {
+    SERIAL_FRAME_CANONICAL = 0,
+    SERIAL_FRAME_RESOLVED_LIVE,
+    SERIAL_FRAME_REQUIRED_MISS,
+} serial_frame_kind;
+
+typedef enum {
+    SERIAL_FIT_REUSE = 0,
+    SERIAL_FIT_RESIZE,
+    SERIAL_FIT_REFUSE_PRESERVE,
+    SERIAL_FIT_PASS_NATIVE,
+} serial_fit_plan;
+
+static serial_fit_plan serial_session_fit_plan(
+        int cur_ctx, bool graph_pending, long need_min, long request_cap,
+        bool current_graph_fits, serial_frame_kind frame_kind) {
+    if (frame_kind == SERIAL_FRAME_REQUIRED_MISS)
+        return SERIAL_FIT_PASS_NATIVE;
+    if (serial_session_reuse_ok(cur_ctx, graph_pending, need_min, request_cap,
+                                current_graph_fits))
+        return SERIAL_FIT_REUSE;
+    if (frame_kind == SERIAL_FRAME_RESOLVED_LIVE)
+        return SERIAL_FIT_REFUSE_PRESERVE;
+    return SERIAL_FIT_RESIZE;
+}
+
+/* Size the same authoritative live frame that generate_job will sync, but do
+ * not consume registry state or increment resolution metrics.  In particular,
+ * an output-only Responses/Anthropic client frame can be only a few tokens
+ * while the effective frame is live_tokens + tool-result suffix near -c. */
+static serial_frame_kind serial_effective_frame_preflight(
+        server *s, const request *req, long *prompt_len) {
+    if (prompt_len) *prompt_len = req ? req->prompt.len : 0;
+    if (!s || !req || !s->session) return SERIAL_FRAME_CANONICAL;
+
+    const int live_pos = ds4_session_pos(s->session);
+    ds4_tokens effective = {0};
+    if (req->api == API_RESPONSES && req->responses_requires_live_tool_state) {
+        const int cached = responses_live_continuation_prompt_impl(
+            s, req, live_pos, &effective, NULL, false);
+        if (cached > 0) {
+            if (prompt_len) *prompt_len = effective.len;
+            ds4_tokens_free(&effective);
+            return SERIAL_FRAME_RESOLVED_LIVE;
+        }
+        ds4_tokens_free(&effective);
+        return SERIAL_FRAME_REQUIRED_MISS;
+    }
+
+    if (req->api == API_ANTHROPIC && req->anthropic_requires_live_tool_state) {
+        const int cached = anthropic_live_continuation_prompt_impl(
+            s, req, live_pos, &effective, NULL, false);
+        if (cached > 0) {
+            if (prompt_len) *prompt_len = effective.len;
+            ds4_tokens_free(&effective);
+            return SERIAL_FRAME_RESOLVED_LIVE;
+        }
+        ds4_tokens_free(&effective);
+        return SERIAL_FRAME_REQUIRED_MISS;
+    }
+
+    ds4_tokens_free(&effective);
+    return SERIAL_FRAME_CANONICAL;
+}
+
+static uint64_t serial_batch_reclaim_callback(server *s, uint64_t want,
+                                              void *user) {
+    (void)user;
+    return s && s->batch_ctx ? ds4_batch_ctx_trim_free(s->batch_ctx, want) : 0;
+}
+
+static bool serial_live_capacity_refuse(server *s, job *j,
+                                        long effective_prompt_len,
+                                        long need_min, int cur_ctx) {
+    server_log(DS4_LOG_WARNING,
+               "ds4-server: live serial continuation needs %ld tokens "
+               "(minimum=%ld) but retained session ctx=%d; preserving frontier and refusing 503",
+               effective_prompt_len, need_min, cur_ctx);
+    char msg[224];
+    snprintf(msg, sizeof(msg),
+             "Server cannot extend the retained %ld-token continuation inside "
+             "its %d-token serial context; retry with a smaller output budget "
+             "or replay the full history",
+             effective_prompt_len, cur_ctx);
+    wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req),
+                    503, msg);
+    j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
+    return false;
+}
+
 /* v0.5.2 inc1: make sure the serial session can actually allocate its graph
  * before generate_job commits to it.  The session is created at server -c
  * and its S6 lazy graph is sized by that ctx, NOT the request -- on a
@@ -14273,6 +15687,19 @@ static void serial_terminal_commit(server *s, job *j, api_style proto,
  * Worker thread only, under gen_mu (the session swap must exclude the cont
  * loop and the /v1/batch path).  Returns false after writing the refusal. */
 static bool serial_session_ensure_fit(server *s, job *j) {
+    long prompt_len = j->req.prompt.len;
+    const serial_frame_kind frame_kind =
+        serial_effective_frame_preflight(s, &j->req, &prompt_len);
+    if (frame_kind == SERIAL_FRAME_REQUIRED_MISS)
+        return true; /* generate_job emits the protocol-native 409. */
+
+    long budget = request_decode_budget(&j->req, s->default_tokens);
+    if (budget < 1) budget = 1;
+    const int cur_ctx = ds4_session_ctx(s->session);
+    long live_need_min = prompt_len + (budget < 1024 ? budget : 1024);
+    if (frame_kind == SERIAL_FRAME_RESOLVED_LIVE && cur_ctx < live_need_min)
+        return serial_live_capacity_refuse(s, j, prompt_len,
+                                           live_need_min, cur_ctx);
     if (!s->serial_rightsize) return true;
     /* Scope: bank-holding boots only (the field 500 class).  On a
      * serial-only deployment (no batch ctx) the full--c session IS the
@@ -14281,22 +15708,28 @@ static bool serial_session_ensure_fit(server *s, job *j) {
      * the serial disk tier -- its payloads are ring-images at the stamped
      * ctx and cannot load into a smaller session. */
     if (!s->batch_ctx) return true;
-    long budget = request_decode_budget(&j->req, s->default_tokens);
-    if (budget < 1) budget = 1;
     const int boot_ctx = s->serial_boot_ctx;
-    long need_full = (long)j->req.prompt.len + budget;
+    long need_full = prompt_len + budget;
     if (need_full > boot_ctx) need_full = boot_ctx;
     /* Below a minimal output window a truncated completion is useless --
      * refuse instead (the deep-serial guard upstream already 503s deep
      * cont-rejects; this is the same capacity class). */
-    long need_min = (long)j->req.prompt.len + (budget < 1024 ? budget : 1024);
+    long need_min = live_need_min;
     if (need_min > boot_ctx) need_min = boot_ctx;
+    long request_cap = need_full + 32768;
+    if (request_cap > boot_ctx) request_cap = boot_ctx;
 
-    const int cur_ctx = ds4_session_ctx(s->session);
     const bool pending = ds4_session_graph_pending(s->session) != 0;
-    if (cur_ctx >= need_min &&
-        (!pending || ds4_engine_session_graph_fits(s->engine, cur_ctx)))
+    bool current_fits = true;
+    if (pending && cur_ctx <= request_cap)
+        current_fits = ds4_engine_session_graph_fits(s->engine, cur_ctx);
+    const serial_fit_plan fit_plan = serial_session_fit_plan(
+        cur_ctx, pending, need_min, request_cap, current_fits, frame_kind);
+    if (fit_plan == SERIAL_FIT_REUSE || fit_plan == SERIAL_FIT_PASS_NATIVE)
         return true;   /* committed-and-big-enough, or pending-and-allocatable */
+    if (fit_plan == SERIAL_FIT_REFUSE_PRESERVE)
+        return serial_live_capacity_refuse(s, j, prompt_len,
+                                           need_min, cur_ctx);
 
     /* The current session cannot serve this request either way -- free it
      * BEFORE probing so a committed right-sized graph's own GiBs count as
@@ -14330,12 +15763,19 @@ static bool serial_session_ensure_fit(server *s, job *j) {
      * Then re-run the same settle window; a still-unfittable request
      * refuses exactly as before. */
     if (!min_fits && s->batch_ctx) {
-        const uint64_t freed = ds4_batch_ctx_trim_free(s->batch_ctx, UINT64_MAX);
+        bool skipped_protected = false;
+        const uint64_t freed = cont_registry_reclaim_unprotected_with_query(
+            s, now_sec(), cont_engine_bank_reference_query, NULL,
+            serial_batch_reclaim_callback, NULL, &skipped_protected);
+        if (skipped_protected) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: serial fit reclaim skipped: a live bank continuation is grace/pin protected");
+        }
         if (freed) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: serial fit reclaim: trimmed %.1f MiB of free-bank cache "
                        "for a %d-token serial request",
-                       (double)freed / 1048576.0, j->req.prompt.len);
+                       (double)freed / 1048576.0, (int)prompt_len);
             for (int tries = 0; tries < 20 && !min_fits; tries++) {
                 if (ds4_engine_session_graph_fits(s->engine, (int)need_min))
                     min_fits = true;
@@ -14351,8 +15791,7 @@ static bool serial_session_ensure_fit(server *s, job *j) {
          * responses APIs live here) grows for many turns inside one session
          * -- per-request-exact sizing would re-create every turn and
          * cold-prefill each time. */
-        long hi = need_full + 32768;
-        if (hi > boot_ctx) hi = boot_ctx;
+        long hi = request_cap;
         long lo = need_min;               /* invariant: lo fits */
         while (hi - lo > 1024) {
             const long mid = lo + (hi - lo) / 2;
@@ -14365,10 +15804,10 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     if (target > 0 && ds4_session_create(&ns, s->engine, (int)target) == 0) {
         s->session = ns;
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: serial session right-sized ctx=%d -> %ld (boot -c %d graph "
-                   "does not fit beside the batch banks; prompt=%d budget=%ld)%s "
+                   "ds4-server: serial session right-sized ctx=%d -> %ld (boot -c %d; "
+                   "request-bounded beside the batch banks, prompt=%d budget=%ld)%s "
                    "(DS4_SERVER_SERIAL_RIGHTSIZE=0 restores full--c alloc)",
-                   cur_ctx, target, boot_ctx, j->req.prompt.len, budget,
+                   cur_ctx, target, boot_ctx, (int)prompt_len, budget,
                    pending ? "" : " [live serial state reset]");
         return true;
     }
@@ -14378,12 +15817,12 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     else die("serial right-size: could not restore the boot session");
     server_log(DS4_LOG_WARNING,
                "ds4-server: serial right-size: no graph fits (prompt=%d need_min=%ld boot -c %d); refusing 503",
-               j->req.prompt.len, need_min, boot_ctx);
+               (int)prompt_len, need_min, boot_ctx);
     char msg[192];
     snprintf(msg, sizeof(msg),
              "Server is temporarily at capacity for a %d-token serial request "
              "(no session graph fits beside the batch banks); retry shortly",
-             j->req.prompt.len);
+             (int)prompt_len);
     wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 503, msg);
     j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
     return false;
@@ -14510,6 +15949,8 @@ static int detok_result_until_eos(server *s, const int *tokens, int n_tokens, in
     return emitted;
 }
 
+static int cont_usage_prompt_tokens(const request *r);
+
 /* Format one coalesced job's HTTP response from its generated tokens, mirroring
  * the non-streaming OpenAI tail of generate_job() (detok to first EOS, then
  * parse_generated_message_for_response for chat to split reasoning/content). */
@@ -14536,7 +15977,7 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
     int reasoning_tokens = 0;
     int emitted = detok_result_until_eos(s, r->tokens, n_tokens, eos, &text,
                                          &j->req, &reasoning_tokens);
-    const int prompt_tokens = j->req.prompt.len;
+    const int prompt_tokens = cont_usage_prompt_tokens(&j->req);
 
     if (j->req.kind == REQ_CHAT) {
         tool_calls calls = {0};
@@ -14544,12 +15985,13 @@ static void write_batch_completion(server *s, job *j, const ds4_batch_gen_result
         const char *fin = finish;
         char perr[160] = {0};
         bool recovered = false;
-        parse_generated_message_for_response(j->req.model_syntax,
-                                             text.ptr ? text.ptr : "",
-                                             false /*has_tools*/, false /*saw_tool_start*/,
-                                             ds4_think_mode_enabled(j->req.think_mode),
-                                             &fin, perr, sizeof(perr),
-                                             &content, &reasoning, &calls, &recovered);
+        parse_generated_message_for_response_model(
+            j->req.model_syntax, text.ptr ? text.ptr : "", false /*has_tools*/,
+            false /*saw_tool_start*/,
+            ds4_think_mode_enabled(j->req.think_mode), j->req.chat_format,
+            &j->req.tool_orders,
+            &fin, perr, sizeof(perr), &content, &reasoning, &calls,
+            &recovered);
         ds4_wire_session ws;
         ds4_wire_result res = {0};
         wire_init(&ws, wire_surface_for(&j->req), id);
@@ -14693,6 +16135,10 @@ typedef struct {
     job   **inflight;
 } cont_sched;
 
+/* Defined after struct cont_stream; retirement only needs its semantic verdict
+ * and transport-failure bit, so keep the state layout private there. */
+static bool cont_stream_requires_partial_rewind(const job *j);
+
 /* ---- A2a: per-bank warm start (retirement records + matching + placement).
  * All of this runs on the worker thread under gen_mu.  The matching is
  * ADVISORY: the engine validates every warm admit against its own committed
@@ -14715,6 +16161,7 @@ static void warm_rec_invalidate(server *s, int bank) {
     s->warm[bank].text = NULL;
     s->warm[bank].len = 0;
     s->warm[bank].valid = false;
+    s->warm[bank].partial_only = false;
     warm_records_gauge_refresh(s);
 }
 
@@ -14745,9 +16192,10 @@ static void cont_append_committed_text(server *s, buf *b, const int *tokens, int
  *     bank's committed frontier, which cont_warm_pick pairs with a tokenized
  *     suffix, so hidden reasoning stays in KV and is never re-prefilled.
  *
- * Same gates as should_remember_thinking_checkpoint(): chat only, tool-less,
- * a clean finish, and a closed thinking block.  Anything else retires without
- * a record, as before. */
+ * A completed/length-limited tool-less row records only a key whose suffix can
+ * be appended to the actual committed frontier.  Transport/semantic cuts, and
+ * a think-close split across the uncommitted last sample, are rewind-only;
+ * runtimes without partial restore retire those banks without a record. */
 static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
                              int finish) {
     if (!s->warm || j->cont_bank < 0 || j->cont_bank >= s->batch_ctx_max_seq) return;
@@ -14810,24 +16258,64 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
          * timeouts on a ~96k compression request, each re-prefilling for
          * minutes.  The bank's committed history begins with exactly the
          * admitted prompt tokens (frontier discipline), so the PROMPT text
-         * alone is a sound record: the retry partial-matches it at the full
-         * prompt and resumes.  The generated reasoning tail is deliberately
-         * NOT recorded (the next re-render drops reasoning); the partial
-         * cut truncates it on reuse. */
-        if (!(s->batch_ctx &&
-              ds4_batch_ctx_bank_committed(s->batch_ctx, bank, NULL) > 0))
+         * alone is a sound key while the committed generation is still inside
+         * thinking: the response parser exposes that tail as reasoning (never
+         * visible content), the next renderer drops old reasoning and appends
+         * exactly one think-close after the retained live tail.  If the close
+         * is already committed, key the committed VISIBLE prefix instead; a
+         * prompt-only exact splice would duplicate close/content.
+         *
+         * A transport failure or semantic stop has no replayable terminal
+         * transcript.  Such a prompt-only record is a partial-rewind hint only
+         * and is dropped on runtimes (Solar KDA) that cannot rewind. */
+        const int committed = s->batch_ctx ?
+            ds4_batch_ctx_bank_committed(s->batch_ctx, bank, NULL) : 0;
+        if (committed <= 0) return;
+
+        buf gen = {0};
+        cont_append_committed_text(s, &gen, tokens, n);
+        const char *think_close = chat_think_end(j->req.chat_format);
+        const char *close = gen.ptr ? strstr(gen.ptr, think_close) : NULL;
+        const bool close_boundary_partial = !close &&
+            text_ends_with_proper_prefix(gen.ptr, think_close);
+        const bool partial_only = server_thinking_record_requires_rewind(
+            n, j->client_gone, cont_stream_requires_partial_rewind(j),
+            close_boundary_partial);
+        if (partial_only && !s->warm_fork_partial) {
+            buf_free(&gen);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: unfinished thinking bank=%d drops rewind-only warm record",
+                       bank);
             return;
-        buf_puts(&tb, j->req.prompt_text);
-        server_log(DS4_LOG_GENERATION,
-                   "ds4-server: aborted decode bank=%d keeps %d-token prompt as warm record",
-                   bank, j->req.prompt.len);
+        }
+
+        if (!partial_only && close) {
+            char *visible = build_cont_toolless_thinking_visible_key(
+                &j->req, close + strlen(think_close));
+            buf_free(&gen);
+            if (!visible) return;
+            buf_puts(&tb, visible);
+            free(visible);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: length-limited thinking bank=%d keeps visible frontier prefix",
+                       bank);
+        } else {
+            buf_free(&gen);
+            buf_puts(&tb, j->req.prompt_text);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: unfinished thinking bank=%d keeps %d-token prompt%s",
+                       bank, j->req.prompt.len,
+                       partial_only ? " as rewind-only record" : " as live-tail key");
+        }
+        s->warm[bank].partial_only = partial_only;
     } else {
         if (j->req.kind != REQ_CHAT || j->req.has_tools) return;
         buf gen = {0};
         cont_append_committed_text(s, &gen, tokens, n);
-        const char *close = gen.ptr ? strstr(gen.ptr, "</think>") : NULL;
-        char *visible = close ? build_toolless_thinking_visible_text(
-                                    &j->req, close + strlen("</think>"))
+        const char *think_close = chat_think_end(j->req.chat_format);
+        const char *close = gen.ptr ? strstr(gen.ptr, think_close) : NULL;
+        char *visible = close ? build_cont_toolless_thinking_visible_key(
+                                    &j->req, close + strlen(think_close))
                               : NULL;
         buf_free(&gen);
         if (!visible) return;          /* not keyable -- retire without a record */
@@ -14867,7 +16355,8 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
 static bool warm_rec_superseded(const server *s, const bool *occ, int b) {
     if (s->warm[b].len == 0) return false;
     for (int o = 0; o < s->batch_ctx_max_seq; o++) {
-        if (o == b || occ[o] || !s->warm[o].valid) continue;
+        if (o == b || occ[o] || !s->warm[o].valid ||
+            s->warm[o].partial_only) continue;
         if (byte_prefix_match(s->warm[o].text, s->warm[o].len,
                               s->warm[b].text, s->warm[b].len))
             return true;
@@ -14965,7 +16454,7 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
     int best = -1;
     size_t best_len = 0;
     for (int b = 0; b < s->batch_ctx_max_seq; b++) {
-        if (occ[b] || !s->warm[b].valid) continue;
+        if (occ[b] || !s->warm[b].valid || s->warm[b].partial_only) continue;
         if (plen && s->warm[b].len > 0 && s->warm[b].len < plen &&
             s->warm[b].len > best_len &&
             byte_prefix_match(ptext, plen, s->warm[b].text, s->warm[b].len)) {
@@ -15028,7 +16517,8 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
      * exactly like a live retirement. */
     if (best < 0 && plen && s->kv.enabled) {
         int rb = -1;
-        const int didx = ds4_kvstore_find_text_prefix(&s->kv, ptext,
+        const int didx = ds4_kvstore_find_bank_text_prefix(
+                             &s->kv, ptext,
                              ds4_engine_model_id(s->engine),
                              ds4_engine_routed_quant_bits(s->engine),
                              s->serial_boot_ctx);   /* bank tier: serving ctx */
@@ -15045,6 +16535,7 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
                 s->warm[rb].text = rtext;
                 s->warm[rb].len = rlen;
                 s->warm[rb].valid = true;
+                s->warm[rb].partial_only = false;
                 s->warm[rb].last_use = ++s->warm_clock;
                 s->warm[rb].stored_tokens = rtok;   /* it IS the disk record */
                 warm_records_gauge_refresh(s);
@@ -15189,6 +16680,7 @@ warm_full_skipped:
                         s->warm[rb].text = rtext;
                         s->warm[rb].len = rlen;
                         s->warm[rb].valid = true;
+                        s->warm[rb].partial_only = false;
                         s->warm[rb].last_use = ++s->warm_clock;
                         s->warm[rb].stored_tokens = rtok;
                         warm_records_gauge_refresh(s);
@@ -15402,6 +16894,11 @@ static int cont_on_admitted(void *ud, void *user, int n_cached,
                             int n_computed, int bank);
 static void cont_prefill_heartbeat(cont_sched *cs, job *j);
 
+static bool request_needs_cont_semantics(const request *r) {
+    return r && r->kind == REQ_CHAT &&
+           (r->has_tools || r->has_tool_results);
+}
+
 /* v0.5.2 inc3: engine liveness probe for a pending admission prefill.
  * Runs on the worker thread between prefill chunks; the MSG_PEEK probe
  * never consumes request bytes.  Marks the job so every later path agrees.
@@ -15563,13 +17060,11 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
         req->min_p       = j->req.min_p;
     }
     req->seed        = resolve_job_seed(s, j);
-    /* Spec+tools: tools rows get generate_job's per-token DSML sampling
-     * override on the continuous path too -- the engine consults it before
-     * every target sample (plain AND speculative accept), so structural
-     * tool-call syntax is argmax'd at any request temperature while payload
-     * and reasoning keep the seq params above. */
-    req->sample_override = (j->req.kind == REQ_CHAT && j->req.has_tools) ?
-        cont_sample_override : NULL;
+    /* Agent rows get generate_job's per-token semantic override on the
+     * continuous path too.  Tool-capable rows force structural call syntax;
+     * a tools-omitted result T2 still needs its thinking cap/closer. */
+    req->sample_override = request_needs_cont_semantics(&j->req) ?
+                           cont_sample_override : NULL;
     /* v0.5.2 inc3: let the engine drop this admission mid-prefill if the
      * client dies (the zombie-reap probe, engine-polled between chunks).
      * Inc 4a: streaming rows register it unconditionally -- the same poll is
@@ -15620,12 +17115,17 @@ struct cont_stream {
     size_t plain_stream_pos;
 };
 
+static bool cont_stream_requires_partial_rewind(const job *j) {
+    return j && j->cstream &&
+           (j->cstream->failed || j->cstream->acc.verdict != NULL);
+}
+
 /* A1: does this row need host-side text (stream projection or stop/tool scan)?
  * Motif no-think rows join so the think-control stop below finalizes from the
  * accumulator (clean text + verdict) instead of the raw engine buffer. */
 static bool cont_needs_text(const request *r) {
     return r->stream || r->stops.len > 0 ||
-           (r->kind == REQ_CHAT && r->has_tools) ||
+           request_needs_cont_semantics(r) ||
            (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 &&
             !ds4_think_mode_enabled(r->think_mode));
 }
@@ -15640,22 +17140,17 @@ static cont_stream *cont_stream_ensure(job *j) {
     return j->cstream;
 }
 
-/* Spec+tools: ds4_cont_request.sample_override for tools rows (cont_admit
- * registers it only when kind==REQ_CHAT && has_tools).  The engine consults it
- * immediately before EVERY target sample of the row -- seed token, plain
- * decode step, and both speculative accept-loop sites -- and a nonzero return
- * forces that one token to greedy argmax.  The decision mirrors generate_job's
- * per-token DSML override bit-for-bit: structural tool-call syntax -> argmax,
- * payload string/JSON-string bodies (and everything outside a tool block) ->
- * the seq params.  Before the first sampled token no cstream exists; that is
- * the serial loop's freshly-init'd tracker (OUTSIDE) -> no override. */
+/* ds4_cont_request.sample_override for agent rows.  The engine consults it
+ * immediately before EVERY target sample -- seed, plain decode, and both
+ * speculative accept sites.  Tool rows mirror generate_job's structural DSML
+ * policy; a pending result row without schemas uses the same state machine only
+ * to reserve post-thinking answer budget.  Ensure the accumulator before the
+ * seed token so required T1 and result T2 controls also work when buffered. */
 static int cont_sample_override(void *ud, void *user) {
     (void)ud;
     job *j = user;
-    if (!j->cstream) return 0;
-    const dsml_decode_state state = sem_accum_dsml_state(&j->cstream->acc);
-    return dsml_decode_state_is_tool(state) &&
-           !dsml_decode_state_uses_payload_sampling(state);
+    cont_stream *st = cont_stream_ensure(j);
+    return sem_accum_sampling_override(&st->acc, &j->req);
 }
 
 /* Free the per-seq state without touching the socket (non-streaming rows, and
@@ -15682,6 +17177,44 @@ static void cont_stream_error_abort(job *j, const char *msg) {
     cont_stream_discard(j);
 }
 
+/* Most warm admissions report usage in the client's rendered-prompt frame:
+ * hidden sampled reasoning can make the engine's retained frame longer than
+ * the visible replay.  An output-only bank continuation is different: its
+ * request prompt is only the tool-result suffix, while the native usage/cache
+ * contract counts the complete effective model input, cached prefix included. */
+static bool cont_usage_uses_effective_frame(const request *r) {
+    return r && (r->needs & DS4_NEED_BANK_FRONTIER) != 0;
+}
+
+/* Buffered continuous terminals do not have the streaming state's frozen
+ * prompt_tokens field.  Reconstruct the validated wire frame from the engine
+ * split for output-only bank continuations; ordinary requests stay in their
+ * rendered client-prompt frame. */
+static int cont_usage_prompt_tokens(const request *r) {
+    if (!r) return 0;
+    if (!cont_usage_uses_effective_frame(r)) return r->prompt.len;
+    const int n_cached = r->cache_read_tokens > 0 ? r->cache_read_tokens : 0;
+    const int n_computed = r->cache_write_tokens > 0 ? r->cache_write_tokens : 0;
+    return n_cached <= INT_MAX - n_computed ? n_cached + n_computed : INT_MAX;
+}
+
+static int cont_usage_apply_engine_split(request *r,
+                                         int n_cached, int n_computed) {
+    if (!r) return 0;
+    if (n_cached < 0) n_cached = 0;
+    if (n_computed < 0) n_computed = 0;
+    if (cont_usage_uses_effective_frame(r)) {
+        r->cache_read_tokens = n_cached;
+        r->cache_write_tokens = n_computed;
+        return n_cached <= INT_MAX - n_computed ? n_cached + n_computed
+                                                 : INT_MAX;
+    }
+    const int p = r->prompt.len;
+    r->cache_write_tokens = n_computed > p ? p : n_computed;
+    r->cache_read_tokens  = p - r->cache_write_tokens;
+    return p;
+}
+
 /* Send SSE headers + the surface's protocol start and mint the completion id.
  * Sets failed (not started=false) on a write error so callers stop touching
  * the fd.  Inc 4a: normally called from cont_on_admitted (transport starts at
@@ -15692,7 +17225,7 @@ static void cont_stream_start(server *s, job *j) {
     snprintf(st->id, sizeof(st->id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
-    st->prompt_tokens = j->req.prompt.len;
+    if (st->prompt_tokens <= 0) st->prompt_tokens = j->req.prompt.len;
     st->started = true;
     st->last_keepalive = now_sec();
     wire_init(&st->wsess, wire_surface_for(&j->req), st->id);
@@ -15726,15 +17259,12 @@ static int cont_on_admitted(void *ud, void *user, int n_cached,
                             int n_computed, int bank) {
     cont_sched *cs = ud;
     job *j = user;
-    (void)n_cached;
     (void)bank;
-    {
-        const int p = j->req.prompt.len;
-        j->req.cache_write_tokens = n_computed > p ? p : n_computed;
-        j->req.cache_read_tokens  = p - j->req.cache_write_tokens;
-    }
+    const int usage_prompt_tokens =
+        cont_usage_apply_engine_split(&j->req, n_cached, n_computed);
     if (!j->req.stream) return 1;
     cont_stream *st = cont_stream_ensure(j);
+    st->prompt_tokens = usage_prompt_tokens;
     if (st->started) return j->client_gone ? 0 : 1;
     t_emit_job = j;
     cont_stream_start(cs->s, j);
@@ -15795,16 +17325,22 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
                               char **content, char **reasoning,
                               tool_calls *calls) {
     if (j->req.has_tools &&
-        j->req.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK &&
-        st->acc.saw_tool_start && !st->acc.saw_tool_end) {
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 &&
+        st->acc.saw_tool_start &&
+        (!st->acc.saw_tool_end || tool_call_format_has_repairable_truncation(
+                                      st->acc.text.ptr, st->acc.text.len,
+                                      j->req.chat_format))) {
         /* Budget/eviction cut the block: deterministically complete a simple
          * truncation (verify the repaired text actually parses to calls).
          * DSML-only, mirroring the serial driver's repair gate. */
         buf repaired = {0};
-        if (try_repair_dsml(st->acc.text.ptr, st->acc.text.len, &repaired)) {
+        if (try_repair_tool_call_format(st->acc.text.ptr, st->acc.text.len,
+                                        j->req.chat_format, &repaired)) {
             tool_calls tc = {0};
             char *c2 = NULL, *r2 = NULL;
-            if (parse_generated_message_ex(repaired.ptr, false, &c2, &r2, &tc) &&
+            if (parse_generated_message_ex_format(
+                    repaired.ptr, false, j->req.chat_format,
+                    &j->req.tool_orders, &c2, &r2, &tc) &&
                 tc.len > 0) {
                 free(st->acc.text.ptr);
                 st->acc.text.ptr = buf_take(&repaired);
@@ -15842,12 +17378,13 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
     }
     char perr[160] = {0};
     bool recovered = false;
-    parse_generated_message_for_response(j->req.model_syntax,
-                                         st->acc.text.ptr ? st->acc.text.ptr : "",
-                                         j->req.has_tools, st->acc.saw_tool_start,
-                                         ds4_think_mode_enabled(j->req.think_mode),
-                                         fin_io, perr, sizeof(perr),
-                                         content, reasoning, calls, &recovered);
+    parse_generated_message_for_response_model(
+        j->req.model_syntax,
+        st->acc.text.ptr ? st->acc.text.ptr : "", j->req.has_tools,
+        st->acc.saw_tool_start,
+        ds4_think_mode_enabled(j->req.think_mode), j->req.chat_format,
+        &j->req.tool_orders,
+        fin_io, perr, sizeof(perr), content, reasoning, calls, &recovered);
     if (recovered)
         server_log(DS4_LOG_WARNING,
                    "ds4-server: cont chat invalid tool call returned as assistant text finish=%s",
@@ -15884,6 +17421,7 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
     cont_stream *st = cont_stream_ensure(j);   /* empty completion (EOS at seed) still closes cleanly */
     if (!st->started) cont_stream_start(s, j);
     if (st->acc.verdict) fin = st->acc.verdict;
+    fin = sem_accum_terminal_finish(&st->acc, fin);
     /* A1: chat rows resolve tool calls/reasoning exactly like the single path;
      * the SSE machine already streamed tool deltas (TOOL mode), so finish_live
      * only emits the tool_calls delta when none were streamed. */
@@ -15949,7 +17487,8 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
              (unsigned long long)++s->seq);
     const char *fin = st->acc.verdict ? st->acc.verdict
                                       : (engine_finish ? "stop" : "length");
-    const int prompt_tokens = j->req.prompt.len;
+    fin = sem_accum_terminal_finish(&st->acc, fin);
+    const int prompt_tokens = cont_usage_prompt_tokens(&j->req);
 
     if (j->req.kind == REQ_CHAT) {
         tool_calls calls = {0};
@@ -15959,12 +17498,14 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         } else {
             char perr[160] = {0};
             bool recovered = false;
-            parse_generated_message_for_response(j->req.model_syntax,
-                                                 st->acc.text.ptr ? st->acc.text.ptr : "",
-                                                 false /*has_tools*/, false /*saw_tool_start*/,
-                                                 ds4_think_mode_enabled(j->req.think_mode),
-                                                 &fin, perr, sizeof(perr),
-                                                 &content, &reasoning, &calls, &recovered);
+            parse_generated_message_for_response_model(
+                j->req.model_syntax,
+                st->acc.text.ptr ? st->acc.text.ptr : "",
+                false /*has_tools*/, false /*saw_tool_start*/,
+                ds4_think_mode_enabled(j->req.think_mode), j->req.chat_format,
+                &j->req.tool_orders,
+                &fin, perr, sizeof(perr), &content, &reasoning, &calls,
+                &recovered);
         }
         ds4_wire_session ws;
         ds4_wire_result res = {0};
@@ -16191,14 +17732,12 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
              * warm shape) this is bit-identical to the old direct copy, so
              * usage.cached == timings.prefill_cached stays structural
              * there; timings ALWAYS keeps the effective frame (engine
-             * truth).  Invariant either way: usage's uncached prompt
-             * portion == min(prefill_computed, prompt). */
-            {
-                const int p = j->req.prompt.len;
-                const int w = (int)es.prefill_computed;
-                j->req.cache_write_tokens = w > p ? p : w;
-                j->req.cache_read_tokens  = p - j->req.cache_write_tokens;
-            }
+             * truth).  Output-only bank continuations (Responses function
+             * outputs and Anthropic tool results) are the exception: their
+             * wire usage also uses the effective frame because input_tokens
+             * includes the retained cached prefix. */
+            (void)cont_usage_apply_engine_split(
+                &j->req, (int)es.prefill_cached, (int)es.prefill_computed);
         }
     }
     /* Inc 3c: wire honors the client's zero budget exactly like the serial
@@ -16346,7 +17885,10 @@ static void *worker_main(void *arg) {
     server *s = arg;
     /* Coalescing config (read once; single worker thread). */
     const char *ce = getenv("DS4_SERVER_COALESCE");
-    const bool coalesce = !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+    const bool coalesce_requested =
+        !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+    const bool coalesce =
+        coalesce_requested && ds4_engine_supports_batching(s->engine);
     /* W5: continuous batching is the default serving path when a persistent batch
      * ctx exists; DS4_SERVER_CONTINUOUS=0 reverts to W3/W4 static coalescing. */
     const char *cc = getenv("DS4_SERVER_CONTINUOUS");
@@ -16567,11 +18109,18 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         max_completion);
 }
 
+static int server_model_context_window(const server *s) {
+    /* Serial right-sizing is an internal allocation detail.  Model clients
+     * need the configured serving limit so their own admission policy does
+     * not shrink after an unrelated request resized the serial graph. */
+    return s->serial_boot_ctx;
+}
+
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
-                             ds4_session_ctx(s->session),
+                             server_model_context_window(s),
                              s->default_tokens);
 }
 
@@ -16666,12 +18215,12 @@ static void server_load_codex_models(server *s) {
     const char *cw = strstr(arr, "\"context_window\"");
     const char *cwv = cw ? strchr(cw, ':') : NULL;
     const long file_ctx = cwv ? strtol(cwv + 1, NULL, 10) : 0;
-    const int live_ctx = ds4_session_ctx(s->session);
-    if (file_ctx > 0 && file_ctx != live_ctx)
+    const int boot_ctx = server_model_context_window(s);
+    if (file_ctx > 0 && file_ctx != boot_ctx)
         server_log(DS4_LOG_WARNING,
                    "ds4-server: codex models file declares context_window=%ld but "
                    "this boot is -c %d -- edit %s to match",
-                   file_ctx, live_ctx, path);
+                   file_ctx, boot_ctx, path);
     s->codex_models_json = arr;
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: codex models catalog spliced into /v1/models "
@@ -18511,7 +20060,11 @@ int main(int argc, char **argv) {
      * falls back to the per-call ds4_engine_batched_generate_ex. */
     {
         const char *ce = getenv("DS4_SERVER_COALESCE");
-        const bool coalesce_on = !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+        const bool coalesce_requested =
+            !(ce && ce[0] == '0' && ce[1] == '\0');   /* default ON */
+        const bool batching_supported =
+            ds4_engine_supports_batching(s.engine);
+        const bool coalesce_on = coalesce_requested && batching_supported;
         const char *cm = getenv("DS4_SERVER_COALESCE_MAX");
         /* W8 reassessment (2026-06-06): default raised 16->32.  Measured on GB10
          * (ctx=4096) max_seq=32 yields ~24% higher decode throughput than 16
@@ -18528,6 +20081,11 @@ int main(int argc, char **argv) {
         int cmaxtok = ct ? atoi(ct) : cmaxtok_dflt;
         if (cmaxtok <= 0) cmaxtok = cmaxtok_dflt;  /* unbounded coalesce -> size ctx to default */
         if (cmaxtok < cmax) cmaxtok = cmax;        /* need >=1 token per seq */
+        if (coalesce_requested && !batching_supported) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: model multi-sequence graph is not integrated yet; "
+                       "using the serial session lane");
+        }
         if (coalesce_on && cmax > 1) {
             char cerr[256] = {0};
             /* Fit-or-reduce: create_fit budgets the bank count from free
@@ -18559,9 +20117,19 @@ int main(int argc, char **argv) {
                         /* P1 partial forks (mid-prompt divergence reuse).
                          * DS4_SERVER_FORK_PARTIAL=0 = full-prefix matching
                          * only (the pre-P1 behavior); _MIN = minimum shared
-                         * canonical tokens worth a fork (default 128). */
+                         * canonical tokens worth a fork (default 192).
+                         * The ctx capability is authoritative: recurrent
+                         * runtimes such as Solar cannot rewind an arbitrary
+                         * KDA frontier and must keep exact warm/fork only. */
                         const char *pe = getenv("DS4_SERVER_FORK_PARTIAL");
-                        s.warm_fork_partial = !(pe && pe[0] == '0' && pe[1] == '\0');
+                        const bool partial_requested =
+                            !(pe && pe[0] == '0' && pe[1] == '\0');
+                        s.warm_fork_partial = server_partial_warm_policy(
+                            partial_requested,
+                            ds4_batch_ctx_supports_partial_reuse(s.batch_ctx));
+                        if (partial_requested && !s.warm_fork_partial)
+                            server_log(DS4_LOG_DEFAULT,
+                                       "ds4-server: partial bank reuse disabled by model runtime");
                         const char *pm = getenv("DS4_SERVER_FORK_PARTIAL_MIN");
                         s.warm_partial_min = (pm && pm[0]) ? atoi(pm) : 192;
                         /* v0.2 ws4: deep-record pin threshold for cold-admit
@@ -18577,7 +20145,8 @@ int main(int argc, char **argv) {
                         /* v0.5.1 inc3 kill switches (A/B): disk-tier partial
                          * restore + pin-tier bank checkpointing. */
                         const char *dp = getenv("DS4_SERVER_DISK_PARTIAL");
-                        s.warm_disk_partial = !(dp && dp[0] == '0' && dp[1] == '\0');
+                        s.warm_disk_partial = s.warm_fork_partial &&
+                            !(dp && dp[0] == '0' && dp[1] == '\0');
                         const char *bc = getenv("DS4_SERVER_BANK_CHECKPOINT");
                         s.warm_checkpoint = !(bc && bc[0] == '0' && bc[1] == '\0');
                     }
@@ -18616,6 +20185,9 @@ int main(int argc, char **argv) {
                 const char *why = !coalesce_on ? "DS4_SERVER_COALESCE=0" :
                                   cmax <= 1    ? "DS4_SERVER_COALESCE_MAX=1" :
                                                  "batch ctx creation failed";
+                if (!batching_supported) {
+                    why = "model multi-sequence graph unavailable";
+                }
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: speculative decode is ARMED but has no engine to run on: "
                            "the continuous batch path is disabled (%s), so every request decodes "
@@ -20069,6 +21641,403 @@ static void test_request_defaults_use_min_p_filtering(void) {
     request_free(&r);
 }
 
+static void test_tool_choice_contract_and_required_prefix(void) {
+    tool_choice_mode mode = TOOL_CHOICE_AUTO;
+    char err[160] = {0};
+    const char *p = "\"required\"";
+    TEST_ASSERT(parse_openai_tool_choice_value(&p, &mode, err, sizeof(err)));
+    TEST_ASSERT(mode == TOOL_CHOICE_REQUIRED);
+
+    p = "\"none\"";
+    TEST_ASSERT(parse_openai_tool_choice_value(&p, &mode, err, sizeof(err)));
+    TEST_ASSERT(mode == TOOL_CHOICE_NONE);
+
+    p = "\"unsupported\"";
+    err[0] = '\0';
+    TEST_ASSERT(!parse_openai_tool_choice_value(&p, &mode, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "not supported") != NULL);
+
+    p = "{\"type\":\"any\"}";
+    err[0] = '\0';
+    TEST_ASSERT(parse_anthropic_tool_choice_value(&p, &mode, err, sizeof(err)));
+    TEST_ASSERT(mode == TOOL_CHOICE_REQUIRED);
+
+    p = "{\"type\":\"tool\",\"name\":\"lookup\"}";
+    err[0] = '\0';
+    TEST_ASSERT(!parse_anthropic_tool_choice_value(&p, &mode, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "forced tool_choice") != NULL);
+
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("look it up")};
+    chat_msgs_push(&msgs, user);
+    char *prompt = render_chat_prompt_text_choice(
+        &msgs, "{\"name\":\"lookup\"}", NULL, DS4_THINK_NONE,
+        TOOL_CHOICE_REQUIRED);
+    TEST_ASSERT(strstr(prompt,
+        "You MUST call at least one available tool in this turn.") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.has_tools = true;
+    r.tool_choice = TOOL_CHOICE_REQUIRED;
+    r.think_mode = DS4_THINK_NONE;
+    ds4_tokens_push(&r.required_tool_prefix, 101);
+    ds4_tokens_push(&r.required_tool_prefix, 202);
+    sem_accum acc;
+    sem_accum_init(&acc, &r);
+    int ov = sem_accum_sampling_override(&acc, &r);
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_IS_TOKEN(ov));
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_TOKEN_ID(ov) == 101);
+    ov = sem_accum_sampling_override(&acc, &r);
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_IS_TOKEN(ov));
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_TOKEN_ID(ov) == 202);
+    sem_accum_free(&acc);
+
+    r.think_mode = DS4_THINK_LOW;
+    r.max_tokens = 128;
+    ds4_tokens_push(&r.required_think_end_prefix, 303);
+    sem_accum_init(&acc, &r);
+    acc.thinking.inside = true;
+    TEST_ASSERT(sem_accum_sampling_override(&acc, &r) ==
+                DS4_SAMPLE_OVERRIDE_NONE);
+    acc.completion = 64;
+    ov = sem_accum_sampling_override(&acc, &r);
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_IS_TOKEN(ov));
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_TOKEN_ID(ov) == 303);
+    sem_accum_free(&acc);
+    request_free(&r);
+}
+
+static void test_tool_result_turn_reserves_post_thinking_budget(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_LOW;
+    r.tool_choice = TOOL_CHOICE_AUTO;
+    r.has_tools = true;
+    ds4_tokens_push(&r.required_think_end_prefix, 303);
+
+    sem_accum acc;
+    sem_accum_init(&acc, &r);
+    acc.thinking.inside = true;
+    acc.completion = 64;
+    TEST_ASSERT(sem_accum_sampling_override(&acc, &r) ==
+                DS4_SAMPLE_OVERRIDE_NONE);
+    sem_accum_free(&acc);
+
+    r.has_tool_results = true;
+    r.has_tools = false;
+    TEST_ASSERT(request_needs_cont_semantics(&r));
+    TEST_ASSERT(cont_needs_text(&r));
+    sem_accum_init(&acc, &r);
+    acc.thinking.inside = true;
+    acc.completion = 63;
+    TEST_ASSERT(sem_accum_sampling_override(&acc, &r) ==
+                DS4_SAMPLE_OVERRIDE_NONE);
+    acc.completion = 64;
+    const int ov = sem_accum_sampling_override(&acc, &r);
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_IS_TOKEN(ov));
+    TEST_ASSERT(DS4_SAMPLE_OVERRIDE_TOKEN_ID(ov) == 303);
+    sem_accum_free(&acc);
+    request_free(&r);
+}
+
+static void test_tool_result_turn_detection_uses_pending_tail(void) {
+    chat_msgs msgs = {0};
+
+    /* Output-only continuation requests have no replayed assistant message. */
+    chat_msg tool = {.role = xstrdup("tool"),
+                     .content = xstrdup("value-one")};
+    chat_msgs_push(&msgs, tool);
+    TEST_ASSERT(chat_history_has_pending_tool_results(&msgs));
+
+    /* Anthropic appends system content after its messages; it must not hide
+     * the pending tool_result tail. */
+    chat_msg system = {.role = xstrdup("system"),
+                       .content = xstrdup("be precise")};
+    chat_msgs_push(&msgs, system);
+    TEST_ASSERT(chat_history_has_pending_tool_results(&msgs));
+
+    /* Once the assistant has answered that result, a later user question is
+     * a normal turn and must not inherit the short T2 reasoning cap. */
+    chat_msg assistant = {.role = xstrdup("assistant"),
+                          .content = xstrdup("value-one")};
+    chat_msgs_push(&msgs, assistant);
+    chat_msg user = {.role = xstrdup("user"),
+                     .content = xstrdup("Now explain the implications.")};
+    chat_msgs_push(&msgs, user);
+    TEST_ASSERT(!chat_history_has_pending_tool_results(&msgs));
+
+    chat_msgs_free(&msgs);
+
+    chat_msgs anthropic = {0};
+    chat_msg anthropic_result = {
+        .role = xstrdup("user"),
+        .content = xstrdup("<tool_result>value-two</tool_result>"),
+        .tool_call_id = xstrdup("toolu_pending"),
+    };
+    chat_msgs_push(&anthropic, anthropic_result);
+    TEST_ASSERT(chat_history_has_pending_tool_results(&anthropic));
+    chat_msgs_free(&anthropic);
+}
+
+static void test_solar_native_tool_protocol(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {.role = xstrdup("system"),
+                    .content = xstrdup("Be precise.")};
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {.role = xstrdup("user"),
+                     .content = xstrdup("Inspect /tmp")};
+    chat_msgs_push(&msgs, user);
+
+    const char *schemas =
+        "{\"name\":\"list_files\",\"description\":\"List files\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"},\"recursive\":{\"type\":\"boolean\"},"
+        "\"literal\":{\"type\":\"string\"}}}}";
+    char *prompt = render_chat_prompt_text_choice_format(
+        &msgs, schemas, NULL, DS4_THINK_LOW, TOOL_CHOICE_REQUIRED,
+        DS4_CHAT_FORMAT_SOLAR_OPEN2);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        DS4_SOLAR_IM_START "system" DS4_SOLAR_IM_CONTENT
+        "## System Prompt\n\nBe precise.\n\n## Tools") != NULL);
+    TEST_ASSERT(strstr(prompt, DS4_SOLAR_TOOL_START) != NULL);
+    TEST_ASSERT(strstr(prompt, DS4_SOLAR_TOOL_END) != NULL);
+    TEST_ASSERT(strstr(prompt, DS4_SOLAR_TOOL_CALL_START
+                               "{example-tool-name}") != NULL);
+    TEST_ASSERT(strstr(prompt, "DSML") == NULL);
+    TEST_ASSERT(strstr(prompt,
+        DS4_SOLAR_IM_START "user" DS4_SOLAR_IM_CONTENT "Inspect /tmp"
+        DS4_SOLAR_IM_END "\n" DS4_SOLAR_IM_START "assistant"
+        DS4_SOLAR_IM_CONTENT DS4_SOLAR_THINK_START) != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    const char *generated =
+        "I should inspect the directory."
+        DS4_SOLAR_THINK_END
+        DS4_SOLAR_TOOL_CALL_START "list_files\n"
+        DS4_SOLAR_TOOL_ARG_START "path" DS4_SOLAR_TOOL_ARG_VALUE "/tmp"
+        DS4_SOLAR_TOOL_ARG_END "\n"
+        DS4_SOLAR_TOOL_ARG_START "recursive" DS4_SOLAR_TOOL_ARG_VALUE "false"
+        DS4_SOLAR_TOOL_ARG_END "\n"
+        DS4_SOLAR_TOOL_ARG_START "literal" DS4_SOLAR_TOOL_ARG_VALUE "false"
+        DS4_SOLAR_TOOL_ARG_END "\n"
+        DS4_SOLAR_TOOL_CALL_END;
+    tool_calls calls = {0};
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders, schemas);
+    char *content = NULL;
+    char *reasoning = NULL;
+    TEST_ASSERT(parse_generated_message_ex_format(
+        generated, true, DS4_CHAT_FORMAT_SOLAR_OPEN2, &orders,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(!strcmp(calls.v[0].name, "list_files"));
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"recursive\": false") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"literal\": \"false\"") != NULL);
+    TEST_ASSERT(content && !content[0]);
+    TEST_ASSERT(reasoning && !strcmp(reasoning,
+                                     "I should inspect the directory."));
+    TEST_ASSERT(calls.raw_dsml &&
+                !strncmp(calls.raw_dsml, DS4_SOLAR_TOOL_CALL_START,
+                         strlen(DS4_SOLAR_TOOL_CALL_START)));
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.chat_format = DS4_CHAT_FORMAT_SOLAR_OPEN2;
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_LOW;
+    r.prompt_text = xstrdup(DS4_SOLAR_IM_START "assistant"
+                            DS4_SOLAR_IM_CONTENT DS4_SOLAR_THINK_START);
+    sem_accum acc;
+    sem_accum_init(&acc, &r);
+    TEST_ASSERT(acc.thinking.inside);
+    (void)sem_accum_feed(&acc, &r, "reason", 6);
+    (void)sem_accum_feed(&acc, &r, DS4_SOLAR_THINK_END,
+                         strlen(DS4_SOLAR_THINK_END));
+    TEST_ASSERT(!acc.thinking.inside);
+    (void)sem_accum_feed(&acc, &r, DS4_SOLAR_TOOL_CALL_START,
+                         strlen(DS4_SOLAR_TOOL_CALL_START));
+    TEST_ASSERT(acc.saw_tool_start);
+    sem_feed close = sem_accum_feed(&acc, &r, DS4_SOLAR_TOOL_CALL_END,
+                                    strlen(DS4_SOLAR_TOOL_CALL_END));
+    TEST_ASSERT(close.tool_block_closed && acc.saw_tool_end);
+    /* Solar may emit another native call before its <|im:end|> EOS. */
+    TEST_ASSERT(acc.verdict == NULL);
+    sem_accum_free(&acc);
+    request_free(&r);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_solar_tool_choice_prompt_is_cache_stable(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"),
+                     .content = xstrdup("Look up the current value.")};
+    chat_msgs_push(&msgs, user);
+    const char *schemas =
+        "{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"key\":{\"type\":\"string\"}}}}";
+
+    char *required = render_chat_prompt_text_choice_format(
+        &msgs, schemas, NULL, DS4_THINK_LOW, TOOL_CHOICE_REQUIRED,
+        DS4_CHAT_FORMAT_SOLAR_OPEN2);
+    char *automatic = render_chat_prompt_text_choice_format(
+        &msgs, schemas, NULL, DS4_THINK_LOW, TOOL_CHOICE_AUTO,
+        DS4_CHAT_FORMAT_SOLAR_OPEN2);
+
+    /* Required tool use is enforced by sem_accum_sampling_override().  It must
+     * not rewrite the reusable prompt prefix between an agent's required T1
+     * and automatic T2. */
+    TEST_ASSERT(!strcmp(required, automatic));
+
+    free(required);
+    free(automatic);
+    chat_msgs_free(&msgs);
+}
+
+static void test_solar_native_tool_recovery(void) {
+    const char *broken =
+        "Need a lookup." DS4_SOLAR_THINK_END
+        DS4_SOLAR_TOOL_CALL_START "lookup\n"
+        DS4_SOLAR_TOOL_ARG_START "query" DS4_SOLAR_TOOL_ARG_VALUE "solar open2";
+    buf repaired = {0};
+    TEST_ASSERT(try_repair_tool_call_format(
+        broken, strlen(broken), DS4_CHAT_FORMAT_SOLAR_OPEN2, &repaired));
+
+    const char *schemas =
+        "{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"query\":{\"type\":\"string\"}}}}";
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders, schemas);
+    tool_calls calls = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    TEST_ASSERT(parse_generated_message_ex_format(
+        repaired.ptr, true, DS4_CHAT_FORMAT_SOLAR_OPEN2, &orders,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "lookup"));
+    TEST_ASSERT(calls.v[0].arguments &&
+                strstr(calls.v[0].arguments,
+                       "\"query\": \"solar open2\"") != NULL);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+    buf_free(&repaired);
+
+    const char *two_calls_last_truncated =
+        DS4_SOLAR_THINK_END
+        DS4_SOLAR_TOOL_CALL_START "first\n" DS4_SOLAR_TOOL_CALL_END "\n"
+        DS4_SOLAR_TOOL_CALL_START "second\n"
+        DS4_SOLAR_TOOL_ARG_START "value" DS4_SOLAR_TOOL_ARG_VALUE "2"
+        DS4_SOLAR_TOOL_ARG_END "\n";
+    TEST_ASSERT(tool_call_format_has_repairable_truncation(
+        two_calls_last_truncated, strlen(two_calls_last_truncated),
+        DS4_CHAT_FORMAT_SOLAR_OPEN2));
+    const char *two_calls_complete =
+        DS4_SOLAR_THINK_END
+        DS4_SOLAR_TOOL_CALL_START "first\n" DS4_SOLAR_TOOL_CALL_END "\n"
+        DS4_SOLAR_TOOL_CALL_START "second\n" DS4_SOLAR_TOOL_CALL_END;
+    TEST_ASSERT(!tool_call_format_has_repairable_truncation(
+        two_calls_complete, strlen(two_calls_complete),
+        DS4_CHAT_FORMAT_SOLAR_OPEN2));
+
+    request r = {0};
+    r.chat_format = DS4_CHAT_FORMAT_SOLAR_OPEN2;
+    r.think_mode = DS4_THINK_LOW;
+    r.prompt_text = xstrdup(
+        DS4_SOLAR_IM_START "system" DS4_SOLAR_IM_CONTENT
+        "## System Prompt\n\nStay precise."
+        DS4_SOLAR_IM_END "\n"
+        DS4_SOLAR_IM_START "user" DS4_SOLAR_IM_CONTENT "Look it up"
+        DS4_SOLAR_IM_END "\n"
+        DS4_SOLAR_IM_START "assistant" DS4_SOLAR_IM_CONTENT
+        DS4_SOLAR_THINK_START);
+    thinking_state st = {.inside = true};
+    char *suffix = build_invalid_tool_error_suffix(
+        &r, &st, "missing argument terminator");
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(strstr(suffix, "DSML") == NULL);
+    TEST_ASSERT(strstr(suffix,
+        DS4_SOLAR_THINK_END DS4_SOLAR_IM_END "\n"
+        DS4_SOLAR_IM_START "tool" DS4_SOLAR_IM_CONTENT
+        DS4_SOLAR_TOOL_RESPONSE_START) == suffix);
+    TEST_ASSERT(strstr(suffix, "invalid Solar tool call") != NULL);
+    TEST_ASSERT(strstr(suffix,
+        "System prompt reminder:\n## System Prompt\n\nStay precise.") != NULL);
+    TEST_ASSERT(strstr(suffix,
+        DS4_SOLAR_TOOL_RESPONSE_END "\n" DS4_SOLAR_IM_END "\n"
+        DS4_SOLAR_IM_START "assistant" DS4_SOLAR_IM_CONTENT
+        DS4_SOLAR_THINK_START) != NULL);
+    free(suffix);
+    free(r.prompt_text);
+}
+
+static void test_solar_native_anthropic_tool_result_rendering(void) {
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("");
+    assistant.reasoning = xstrdup("use both tools");
+    tool_call first = {.id = xstrdup("call_a"), .name = xstrdup("first"),
+                       .arguments = xstrdup("{}")};
+    tool_call second = {.id = xstrdup("call_b"), .name = xstrdup("second"),
+                        .arguments = xstrdup("{}")};
+    tool_calls_push(&assistant.calls, first);
+    tool_calls_push(&assistant.calls, second);
+    chat_msgs_push(&msgs, assistant);
+
+    /* Anthropic permits tool_result blocks in any input order.  The GGUF chat
+     * template reorders them to the preceding assistant call order. */
+    chat_msg results = {0};
+    results.role = xstrdup("user");
+    results.content = xstrdup(
+        "<tool_result>result-b</tool_result>"
+        "<tool_result>result-a</tool_result>");
+    chat_msg_add_tool_call_id(&results, "call_b");
+    chat_msg_add_tool_call_id(&results, "call_a");
+    chat_msgs_push(&msgs, results);
+
+    char *prompt = render_chat_prompt_text_choice_format(
+        &msgs, NULL, NULL, DS4_THINK_LOW, TOOL_CHOICE_AUTO,
+        DS4_CHAT_FORMAT_SOLAR_OPEN2);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        DS4_SOLAR_THINK_START "use both tools" DS4_SOLAR_THINK_END) != NULL);
+    TEST_ASSERT(strstr(prompt,
+        DS4_SOLAR_IM_START "tool" DS4_SOLAR_IM_CONTENT) != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>") == NULL);
+    const char *a = strstr(prompt,
+        DS4_SOLAR_TOOL_RESPONSE_START "result-a" DS4_SOLAR_TOOL_RESPONSE_END);
+    const char *b = strstr(prompt,
+        DS4_SOLAR_TOOL_RESPONSE_START "result-b" DS4_SOLAR_TOOL_RESPONSE_END);
+    TEST_ASSERT(a != NULL && b != NULL && a < b);
+    free(prompt);
+
+    char *tail = render_live_tool_tail_format(
+        &msgs, 1, DS4_THINK_LOW, DS4_CHAT_FORMAT_SOLAR_OPEN2);
+    TEST_ASSERT(tail != NULL);
+    TEST_ASSERT(strstr(tail,
+        DS4_SOLAR_IM_START "tool" DS4_SOLAR_IM_CONTENT) != NULL);
+    TEST_ASSERT(strstr(tail, "<tool_result>") == NULL);
+    a = strstr(tail,
+        DS4_SOLAR_TOOL_RESPONSE_START "result-a" DS4_SOLAR_TOOL_RESPONSE_END);
+    b = strstr(tail,
+        DS4_SOLAR_TOOL_RESPONSE_START "result-b" DS4_SOLAR_TOOL_RESPONSE_END);
+    TEST_ASSERT(a != NULL && b != NULL && b < a);
+    free(tail);
+    chat_msgs_free(&msgs);
+}
+
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
     /* The three levels are distinct now; aliases round DOWN to the nearest. */
@@ -20777,7 +22746,7 @@ static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
         "<｜User｜>Hi<｜Assistant｜><think>");
     thinking_state st = {.inside = true};
 
-    char *suffix = build_invalid_dsml_tool_error_suffix(&r, &st, "missing invoke name");
+    char *suffix = build_invalid_tool_error_suffix(&r, &st, "missing invoke name");
     TEST_ASSERT(suffix != NULL);
     TEST_ASSERT(strstr(suffix, "</think><｜end▁of▁sentence｜><｜User｜><tool_result>") == suffix);
     TEST_ASSERT(strstr(suffix, "Tool error: invalid DSML tool call: missing invoke name") != NULL);
@@ -20812,6 +22781,154 @@ static void test_thinking_dsml_is_not_executable_before_think_close(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
+}
+
+static void test_unclosed_thinking_is_incomplete_reasoning(void) {
+    const char *raw =
+        "still reasoning " DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"lookup\">\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(raw, true, &content, &reasoning,
+                                           &calls));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(reasoning && !strcmp(reasoning, raw));
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    sem_accum acc = {0};
+    acc.thinking.inside = true;
+    TEST_ASSERT(!strcmp(sem_accum_terminal_finish(&acc, "stop"), "length"));
+    TEST_ASSERT(!strcmp(sem_accum_terminal_finish(&acc, "error"), "error"));
+    TEST_ASSERT(!strcmp(sem_accum_terminal_finish(&acc, "length"), "length"));
+}
+
+static void test_no_tools_unclosed_thinking_uses_reasoning_channel(void) {
+    const struct {
+        ds4_chat_format format;
+        const char *raw;
+    } cases[] = {
+        { DS4_CHAT_FORMAT_DSML, "unfinished DSML reasoning" },
+        { DS4_CHAT_FORMAT_SOLAR_OPEN2, "unfinished Solar reasoning" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *finish = "length";
+        char err[64] = {0};
+        char *content = NULL;
+        char *reasoning = NULL;
+        tool_calls calls = {0};
+        bool recovered = false;
+
+        TEST_ASSERT(parse_generated_message_for_response_format(
+            cases[i].raw, false, false, true, cases[i].format, NULL,
+            &finish, err, sizeof(err), &content, &reasoning, &calls,
+            &recovered));
+        TEST_ASSERT(content && content[0] == '\0');
+        TEST_ASSERT(reasoning && !strcmp(reasoning, cases[i].raw));
+        TEST_ASSERT(calls.len == 0);
+        TEST_ASSERT(!strcmp(finish, "length"));
+        TEST_ASSERT(!recovered);
+        TEST_ASSERT(err[0] == '\0');
+
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    }
+}
+
+static void test_length_limited_thinking_uses_nonterminal_visible_prefix(void) {
+    const ds4_chat_format formats[] = {
+        DS4_CHAT_FORMAT_DSML,
+        DS4_CHAT_FORMAT_SOLAR_OPEN2,
+    };
+    for (size_t fi = 0; fi < sizeof(formats) / sizeof(formats[0]); fi++) {
+        const ds4_chat_format format = formats[fi];
+        chat_msgs first = {0};
+        chat_msg u1 = {0};
+        u1.role = xstrdup("user");
+        u1.content = xstrdup("Explain the prefix contract");
+        chat_msgs_push(&first, u1);
+        char *prompt = render_chat_prompt_text_choice_format(
+            &first, NULL, NULL, DS4_THINK_LOW, TOOL_CHOICE_AUTO, format);
+
+        request r = {0};
+        r.think_mode = DS4_THINK_LOW;
+        r.chat_format = format;
+        r.prompt_text = xstrdup(prompt);
+        char *prefix = build_toolless_thinking_visible_prefix(
+            &r, "partial answer", false);
+        char *cont_key = build_cont_toolless_thinking_visible_key(
+            &r, "partial answer");
+        char *terminal = build_toolless_thinking_visible_text(
+            &r, "complete answer");
+        TEST_ASSERT(prefix != NULL);
+        TEST_ASSERT(cont_key != NULL);
+        TEST_ASSERT(terminal != NULL);
+        TEST_ASSERT(prefix && cont_key && !strcmp(prefix, cont_key));
+
+        chat_msgs partial_history = {0};
+        chat_msg ph_u1 = {0};
+        ph_u1.role = xstrdup("user");
+        ph_u1.content = xstrdup("Explain the prefix contract");
+        chat_msgs_push(&partial_history, ph_u1);
+        chat_msg ph_a = {0};
+        ph_a.role = xstrdup("assistant");
+        ph_a.reasoning = xstrdup("hidden reasoning");
+        ph_a.content = xstrdup("partial answer plus uncommitted tail");
+        chat_msgs_push(&partial_history, ph_a);
+        chat_msg ph_u2 = {0};
+        ph_u2.role = xstrdup("user");
+        ph_u2.content = xstrdup("continue");
+        chat_msgs_push(&partial_history, ph_u2);
+        char *partial_future = render_chat_prompt_text_choice_format(
+            &partial_history, NULL, NULL, DS4_THINK_LOW,
+            TOOL_CHOICE_AUTO, format);
+        TEST_ASSERT(prefix && strlen(partial_future) > strlen(prefix));
+        TEST_ASSERT(prefix && !memcmp(partial_future, prefix, strlen(prefix)));
+
+        chat_msgs terminal_history = {0};
+        chat_msg th_u1 = {0};
+        th_u1.role = xstrdup("user");
+        th_u1.content = xstrdup("Explain the prefix contract");
+        chat_msgs_push(&terminal_history, th_u1);
+        chat_msg th_a = {0};
+        th_a.role = xstrdup("assistant");
+        th_a.reasoning = xstrdup("hidden reasoning");
+        th_a.content = xstrdup("complete answer");
+        chat_msgs_push(&terminal_history, th_a);
+        chat_msg th_u2 = {0};
+        th_u2.role = xstrdup("user");
+        th_u2.content = xstrdup("continue");
+        chat_msgs_push(&terminal_history, th_u2);
+        char *terminal_future = render_chat_prompt_text_choice_format(
+            &terminal_history, NULL, NULL, DS4_THINK_LOW,
+            TOOL_CHOICE_AUTO, format);
+        TEST_ASSERT(terminal && strlen(terminal_future) > strlen(terminal));
+        TEST_ASSERT(terminal &&
+                    !memcmp(terminal_future, terminal, strlen(terminal)));
+
+        free(terminal_future);
+        free(partial_future);
+        chat_msgs_free(&terminal_history);
+        chat_msgs_free(&partial_history);
+        free(terminal);
+        free(cont_key);
+        free(prefix);
+        free(r.prompt_text);
+        free(prompt);
+        chat_msgs_free(&first);
+    }
+
+    TEST_ASSERT(text_ends_with_proper_prefix("reasoning</thi", "</think>"));
+    TEST_ASSERT(text_ends_with_proper_prefix("reasoning<|think:e",
+                                             DS4_SOLAR_THINK_END));
+    TEST_ASSERT(!text_ends_with_proper_prefix("reasoning", "</think>"));
+    TEST_ASSERT(!text_ends_with_proper_prefix("reasoning</think>", "</think>"));
 }
 
 static void test_thinking_dsml_after_think_close_is_executable(void) {
@@ -21666,6 +23783,36 @@ static void test_serial_terminal_commit_ladder(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* A graphless deep boot must not reuse its full--c serial shell for a tiny
+ * request merely because that graph fits at this instant: doing so consumes
+ * the batch lane's future deep-cache budget.  A committed graph, however,
+ * carries live continuation state and remains reusable when large enough. */
+static void test_serial_pending_session_respects_request_cap(void) {
+    TEST_ASSERT(!serial_session_reuse_ok(262144, true, 1050, 33818, true));
+    TEST_ASSERT(serial_session_reuse_ok(16384, true, 1050, 16384, true));
+    TEST_ASSERT(serial_session_reuse_ok(32768, true, 1050, 33818, true));
+    TEST_ASSERT(!serial_session_reuse_ok(32768, true, 1050, 33818, false));
+    TEST_ASSERT(serial_session_reuse_ok(262144, false, 1050, 33818, false));
+    TEST_ASSERT(!serial_session_reuse_ok(1024, false, 1050, 33818, true));
+
+    /* A mandatory output-only continuation is sized from its effective live
+     * frame, not its tiny client-frame prompt.  If the retained session cannot
+     * fit that frame, admission must refuse without freeing the only copy of
+     * the continuation frontier. */
+    TEST_ASSERT(serial_session_fit_plan(
+        32066, false, 251024, 262144, false,
+        SERIAL_FRAME_RESOLVED_LIVE) == SERIAL_FIT_REFUSE_PRESERVE);
+    TEST_ASSERT(serial_session_fit_plan(
+        262144, false, 251024, 262144, false,
+        SERIAL_FRAME_RESOLVED_LIVE) == SERIAL_FIT_REUSE);
+    TEST_ASSERT(serial_session_fit_plan(
+        32066, false, 64, 32800, false,
+        SERIAL_FRAME_REQUIRED_MISS) == SERIAL_FIT_PASS_NATIVE);
+    TEST_ASSERT(serial_session_fit_plan(
+        32066, false, 1024, 33792, false,
+        SERIAL_FRAME_CANONICAL) == SERIAL_FIT_REUSE);
+}
+
 /* Inc 5c: BATCH_BANK publication + claim -- per-bank supersession, owner
  * isolation from the serial tip, the caller-side generation/frontier
  * equality that refuses the queued-eviction ABA, and lazy TTL covering
@@ -21774,6 +23921,41 @@ static void test_cont_registry_bank_publish_claim(void) {
 /* Inc 6c: bank retention protection -- LIVE-only, grace-scoped, extended by
  * a valid hard pin, never by a demoted record; the hold Retry-After answers
  * the soonest protection lapse. */
+typedef struct {
+    int bank[4];
+    uint64_t gen[4];
+    int frontier[4];
+    int len;
+} test_cont_bank_references;
+
+typedef struct {
+    int calls;
+    uint64_t result;
+} test_cont_reclaim_state;
+
+static uint64_t test_cont_reclaim_callback(server *s, uint64_t want,
+                                           void *user) {
+    (void)s;
+    (void)want;
+    test_cont_reclaim_state *state = user;
+    state->calls++;
+    return state->result;
+}
+
+static bool test_cont_bank_reference_query(server *s, int bank,
+                                           uint64_t *gen, int *frontier,
+                                           void *user) {
+    (void)s;
+    test_cont_bank_references *refs = user;
+    for (int i = 0; refs && i < refs->len; i++) {
+        if (refs->bank[i] != bank) continue;
+        if (gen) *gen = refs->gen[i];
+        if (frontier) *frontier = refs->frontier[i];
+        return true;
+    }
+    return false;
+}
+
 static void test_cont_registry_bank_protection(void) {
     server s = {0};
     pthread_mutex_init(&s.tool_mu, NULL);
@@ -21790,25 +23972,98 @@ static void test_cont_registry_bank_protection(void) {
         tool_calls_free(&calls);
     }
     const double now = now_sec();
+    test_cont_bank_references refs = {
+        .bank = {5}, .gen = {3}, .frontier = {200}, .len = 1,
+    };
+    cont_record *live = s.creg.head;
+    TEST_ASSERT(live != NULL);
+    TEST_ASSERT(cont_record_bank_reference_matches(live, 3, 200));
+    TEST_ASSERT(!cont_record_bank_reference_matches(live, 4, 200));
+    TEST_ASSERT(!cont_record_bank_reference_matches(live, 3, 201));
     /* In grace: the record's bank is protected; other banks are not. */
-    TEST_ASSERT(cont_registry_bank_protected(&s, 5, now));
-    TEST_ASSERT(!cont_registry_bank_protected(&s, 4, now));
+    TEST_ASSERT(cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 4, now, test_cont_bank_reference_query, &refs));
+    /* Serial reclaim is an atomic check-and-act under tool_mu: one current
+     * grace/pin-protected bank blocks the all-bank trim callback entirely. */
+    test_cont_reclaim_state reclaim = {.calls = 0, .result = 77};
+    bool reclaim_skipped = false;
+    TEST_ASSERT(cont_registry_reclaim_unprotected_with_query(
+        &s, now, test_cont_bank_reference_query, &refs,
+        test_cont_reclaim_callback, &reclaim, &reclaim_skipped) == 0);
+    TEST_ASSERT(reclaim_skipped && reclaim.calls == 0);
+    /* Either side of the execution reference moving makes the record stale. */
+    refs.gen[0] = 4;
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    reclaim_skipped = true;
+    TEST_ASSERT(cont_registry_reclaim_unprotected_with_query(
+        &s, now, test_cont_bank_reference_query, &refs,
+        test_cont_reclaim_callback, &reclaim, &reclaim_skipped) == 77);
+    TEST_ASSERT(!reclaim_skipped && reclaim.calls == 1);
+    refs.gen[0] = 3;
+    refs.frontier[0] = 201;
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    refs.frontier[0] = 200;
     /* Honest Retry-After: bounded by the grace remaining. */
-    const int ra = cont_registry_bank_hold_retry(&s, now);
+    const int ra = cont_registry_bank_hold_retry_with_query(
+        &s, now, test_cont_bank_reference_query, &refs);
     TEST_ASSERT(ra >= 1 && ra <= 61);
+
+    /* A stale record with a nearly-expired grace must not shorten Retry-After
+     * for a different current bank. */
+    {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_prot2");
+        tool_calls_push(&calls, tc);
+        cont_registry_publish_bank(&s, API_RESPONSES, &calls, 6, 7, 80);
+        tool_calls_free(&calls);
+    }
+    refs.bank[1] = 6;
+    refs.gen[1] = 7;
+    refs.frontier[1] = 80;
+    refs.len = 2;
+    pthread_mutex_lock(&s.tool_mu);
+    for (cont_record *rec = s.creg.head; rec; rec = rec->next) {
+        if (rec->owner_id == 5) rec->publish_time = now - 55.0;
+        if (rec->owner_id == 6) rec->publish_time = now;
+    }
+    pthread_mutex_unlock(&s.tool_mu);
+    refs.gen[0] = 4;  /* bank 5 moved; only bank 6 remains protective */
+    const int current_only_ra = cont_registry_bank_hold_retry_with_query(
+        &s, now, test_cont_bank_reference_query, &refs);
+    TEST_ASSERT(current_only_ra >= 59 && current_only_ra <= 61);
+    refs.gen[0] = 3;
+    pthread_mutex_lock(&s.tool_mu);
+    for (cont_record *rec = s.creg.head; rec; rec = rec->next) {
+        if (rec->owner_id == 5) rec->publish_time = now;
+        if (rec->owner_id == 6 && rec->state == CONT_REC_LIVE_FRONTIER)
+            cont_registry_demote_locked(&s, rec);
+    }
+    pthread_mutex_unlock(&s.tool_mu);
     /* Grace lapsed, no pin: unprotected (still LIVE until TTL -- the claim
      * keeps working; only VICTIM protection ends with grace). */
     pthread_mutex_lock(&s.tool_mu);
     for (cont_record *rec = s.creg.head; rec; rec = rec->next)
         rec->publish_time -= 61.0;
     pthread_mutex_unlock(&s.tool_mu);
-    TEST_ASSERT(!cont_registry_bank_protected(&s, 5, now));
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
     /* A queued T2's hard pin re-protects past grace until its deadline. */
     void *pin = cont_registry_pin_live(&s, API_ANTHROPIC, "toolu_prot1");
     TEST_ASSERT(pin != NULL);
-    TEST_ASSERT(cont_registry_bank_protected(&s, 5, now));
+    TEST_ASSERT(cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    refs.frontier[0] = 201;
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
+    refs.frontier[0] = 200;
     cont_registry_unpin(&s, pin);
-    TEST_ASSERT(!cont_registry_bank_protected(&s, 5, now));
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
     /* A demoted record never protects, pinned or not (state gate first). */
     pin = cont_registry_pin_live(&s, API_ANTHROPIC, "toolu_prot1");
     TEST_ASSERT(pin != NULL);
@@ -21817,7 +24072,8 @@ static void test_cont_registry_bank_protection(void) {
         if (rec->state == CONT_REC_LIVE_FRONTIER)
             cont_registry_demote_locked(&s, rec);
     pthread_mutex_unlock(&s.tool_mu);
-    TEST_ASSERT(!cont_registry_bank_protected(&s, 5, now));
+    TEST_ASSERT(!cont_registry_bank_protected_with_query(
+        &s, 5, now, test_cont_bank_reference_query, &refs));
     cont_registry_unpin(&s, pin);
 
     cont_registry_free(&s);
@@ -22309,6 +24565,66 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_model_metadata_keeps_configured_context_after_session_rightsize(void) {
+    server s = {.serial_boot_ctx = 262144};
+    const int advertised_ctx = server_model_context_window(&s);
+    TEST_ASSERT(advertised_ctx == 262144);
+
+    buf b = {0};
+    append_model_json_values(&b, "solar-open2-250b", "Solar Open2 250B",
+                             advertised_ctx, 1024);
+    TEST_ASSERT(strstr(b.ptr, "\"context_length\":262144") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":1024") != NULL);
+    buf_free(&b);
+}
+
+static void test_server_model_ids_cover_loaded_variants(void) {
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(0), "deepseek-v4-flash"));
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(1), "deepseek-v4-pro"));
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(2), "solar-open2-250b"));
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(3), "motif-3"));
+    TEST_ASSERT(server_model_alias_known("solar-open2-250b"));
+    TEST_ASSERT(server_model_alias_known("motif-3"));
+}
+
+static void test_partial_warm_policy_requires_runtime_support(void) {
+    TEST_ASSERT(server_partial_warm_policy(true, true));
+    TEST_ASSERT(!server_partial_warm_policy(true, false));
+    TEST_ASSERT(!server_partial_warm_policy(false, true));
+    TEST_ASSERT(!server_partial_warm_policy(false, false));
+    TEST_ASSERT(!server_thinking_record_requires_rewind(1, true, true, true));
+    TEST_ASSERT(server_thinking_record_requires_rewind(2, true, false, false));
+    TEST_ASSERT(server_thinking_record_requires_rewind(2, false, true, false));
+    TEST_ASSERT(server_thinking_record_requires_rewind(2, false, false, true));
+    TEST_ASSERT(!server_thinking_record_requires_rewind(2, false, false, false));
+}
+
+static void test_rewind_only_record_cannot_supersede_exact_record(void) {
+    server s = {0};
+    s.batch_ctx_max_seq = 2;
+    s.warm = xmalloc(2 * sizeof(*s.warm));
+    memset(s.warm, 0, 2 * sizeof(*s.warm));
+    bool occ[2] = {false, false};
+
+    s.warm[0].valid = true;
+    s.warm[0].text = xstrdup("prefix");
+    s.warm[0].len = strlen(s.warm[0].text);
+    s.warm[0].partial_only = false;
+    s.warm[1].valid = true;
+    s.warm[1].text = xstrdup("prefix plus tail");
+    s.warm[1].len = strlen(s.warm[1].text);
+    s.warm[1].partial_only = true;
+    TEST_ASSERT(!warm_rec_superseded(&s, occ, 0));
+
+    s.warm[0].partial_only = true;
+    s.warm[1].partial_only = false;
+    TEST_ASSERT(warm_rec_superseded(&s, occ, 0));
+
+    free(s.warm[0].text);
+    free(s.warm[1].text);
+    free(s.warm);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -22600,10 +24916,11 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
-static void test_kv_text_stub_file_model(const char *dir, const char *text,
-                                         uint8_t model_id, uint8_t reason,
-                                         uint32_t tokens,
-                                         uint64_t payload_bytes) {
+static void test_kv_text_stub_file_model_ext(const char *dir, const char *text,
+                                             uint8_t model_id, uint8_t reason,
+                                             uint8_t ext_flags,
+                                             uint32_t tokens,
+                                             uint64_t payload_bytes) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
     char name[44];
@@ -22617,7 +24934,7 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
+    ds4_kvstore_fill_header(h, model_id, 2, reason, ext_flags, tokens, 0,
                             32768, 100, 100, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
@@ -22629,6 +24946,14 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static void test_kv_text_stub_file_model(const char *dir, const char *text,
+                                         uint8_t model_id, uint8_t reason,
+                                         uint32_t tokens,
+                                         uint64_t payload_bytes) {
+    test_kv_text_stub_file_model_ext(dir, text, model_id, reason, 0,
+                                     tokens, payload_bytes);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
@@ -22750,6 +25075,110 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     rmdir(dir);
 }
 
+static void test_kv_bank_records_require_replay_contract(void) {
+    char tmpl[] = "/tmp/ds4-kv-bank-contract-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *legacy = "legacy bank prefix";
+    const char *safe = "safe bank prefix";
+    const char *serial = "serial prefix";
+    const char *touched = "unknown touched bank";
+    const char *malformed = "marked serial prefix";
+    test_kv_text_stub_file_model_ext(
+        dir, legacy, 2, DS4_KVSTORE_REASON_BANK_CHECKPOINT, 0, 700, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, safe, 2, DS4_KVSTORE_REASON_BANK_CHECKPOINT,
+        DS4_KVSTORE_EXT_BANK_REPLAY_V1, 800, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, serial, 2, DS4_KVSTORE_REASON_COLD, 0, 600, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, touched, 2, DS4_KVSTORE_REASON_UNKNOWN, 0, 750, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, malformed, 2, DS4_KVSTORE_REASON_COLD,
+        DS4_KVSTORE_EXT_BANK_REPLAY_V1, 650, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "serial prefix tail", 2, 2, 32768) >= 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "serial prefix", 2, 2, 32768) >= 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "serial prefix", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "legacy bank prefix tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "safe bank prefix tail", 2, 2, 32768) >= 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "safe bank prefix", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "legacy bank prefix tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "unknown touched bank tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "unknown touched bank tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(
+                    &kc, "marked serial prefix tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "marked serial prefix tail", 2, 2, 32768) < 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "serial prefix tail", 2, 2, 32768) >= 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix(
+                    &kc, "safe bank prefix", 2, 2, 32768) < 0);
+    int idx = ds4_kvstore_find_bank_text_prefix(
+        &kc, "safe bank prefix tail", 2, 2, 32768);
+    TEST_ASSERT(idx >= 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].reason ==
+                               DS4_KVSTORE_REASON_BANK_CHECKPOINT);
+    TEST_ASSERT(idx >= 0 &&
+                (kc.entry[idx].ext_flags & DS4_KVSTORE_EXT_BANK_REPLAY_V1));
+    size_t lcp = 0;
+    TEST_ASSERT(ds4_kvstore_find_text_lcp(
+                    &kc, "legacy bank prefiX", 2, 2, 32768, 8, &lcp) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_lcp(
+                    &kc, "unknown touched banX", 2, 2, 32768, 8, &lcp) < 0);
+    TEST_ASSERT(ds4_kvstore_find_text_lcp(
+                    &kc, "marked serial prefiX", 2, 2, 32768, 8, &lcp) < 0);
+    idx = ds4_kvstore_find_text_lcp(
+        &kc, "safe bank prefiX", 2, 2, 32768, 8, &lcp);
+    TEST_ASSERT(idx >= 0 && lcp >= 8);
+
+    char safe_sha[41];
+    sha1_bytes_hex(safe, strlen(safe), safe_sha);
+    char safe_name[44];
+    snprintf(safe_name, sizeof(safe_name), "%.40s.kv", safe_sha);
+    char *safe_path = path_join(dir, safe_name);
+    ds4_kvstore_entry before = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(safe_path, safe_sha, &before));
+    TEST_ASSERT(before.reason == DS4_KVSTORE_REASON_BANK_CHECKPOINT);
+    TEST_ASSERT(ds4_kvstore_touch_file(safe_path, 3));
+    ds4_kvstore_entry after = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(safe_path, safe_sha, &after));
+    TEST_ASSERT(after.reason == DS4_KVSTORE_REASON_BANK_CHECKPOINT);
+    TEST_ASSERT(after.hits == 3);
+    TEST_ASSERT(after.ext_flags & DS4_KVSTORE_EXT_BANK_REPLAY_V1);
+    ds4_kvstore_entry_free(&before);
+    ds4_kvstore_entry_free(&after);
+
+    kv_cache_close(&kc);
+    const char *texts[] = {legacy, safe, serial, touched, malformed};
+    for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]); i++) {
+        char sha[41], name[44];
+        sha1_bytes_hex(texts[i], strlen(texts[i]), sha);
+        snprintf(name, sizeof(name), "%.40s.kv", sha);
+        char *path = path_join(dir, name);
+        unlink(path);
+        free(path);
+    }
+    free(safe_path);
+    rmdir(dir);
+}
+
 static void test_kv_tool_map_filters_by_dsml_text(void) {
     const char *dsml_keep =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -22803,6 +25232,61 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "zzzz") == NULL);
 
     chat_msgs_free(&msgs);
+    if (fp) fclose(fp);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
+static void test_kv_tool_map_persists_solar_multi_call(void) {
+    const char *native =
+        DS4_SOLAR_TOOL_CALL_START "first\n"
+        DS4_SOLAR_TOOL_ARG_START "value" DS4_SOLAR_TOOL_ARG_VALUE "1"
+        DS4_SOLAR_TOOL_ARG_END "\n" DS4_SOLAR_TOOL_CALL_END "\n"
+        DS4_SOLAR_TOOL_CALL_START "second\n"
+        DS4_SOLAR_TOOL_ARG_START "value" DS4_SOLAR_TOOL_ARG_VALUE "2"
+        DS4_SOLAR_TOOL_ARG_END "\n" DS4_SOLAR_TOOL_CALL_END;
+
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    tool_memory_put(&src, "call_first", native);
+    tool_memory_put(&src, "call_second", native);
+
+    buf checkpoint_text = {0};
+    buf_puts(&checkpoint_text, "prefix");
+    buf_puts(&checkpoint_text, native);
+    buf_puts(&checkpoint_text, DS4_SOLAR_IM_END "\n");
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t bytes = 0;
+    TEST_ASSERT(kv_tool_map_write(&src, fp, checkpoint_text.ptr, &bytes));
+    TEST_ASSERT(bytes > 0);
+    rewind(fp);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 2);
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {.role = xstrdup("assistant"),
+                          .content = xstrdup("")};
+    tool_call first = {.id = xstrdup("call_first"),
+                       .name = xstrdup("first"),
+                       .arguments = xstrdup("{}")};
+    tool_call second = {.id = xstrdup("call_second"),
+                        .name = xstrdup("second"),
+                        .arguments = xstrdup("{}")};
+    tool_calls_push(&assistant.calls, first);
+    tool_calls_push(&assistant.calls, second);
+    chat_msgs_push(&msgs, assistant);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&dst, &msgs, &stats);
+    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    if (msgs.v[0].calls.raw_dsml)
+        TEST_ASSERT(!strcmp(msgs.v[0].calls.raw_dsml, native));
+    TEST_ASSERT(stats.disk == 1);
+
+    chat_msgs_free(&msgs);
+    buf_free(&checkpoint_text);
     if (fp) fclose(fp);
     tool_memory_free(&src.tool_mem);
     tool_memory_free(&dst.tool_mem);
@@ -25074,6 +27558,156 @@ static void test_cont_admission_transport_and_heartbeat(void) {
     close(sv[1]);
 }
 
+/* An output-only T2 carries only the new tool result in the request JSON, but
+ * a bank continuation feeds the model the retained frontier plus that suffix.
+ * Native usage counts the effective model input, so Responses and Anthropic
+ * must both report the engine split rather than clamp to the tiny wire frame. */
+static void test_cont_bank_usage_uses_effective_frame(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    cont_sched cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.s = &s;
+
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.api = API_RESPONSES;
+    j.req.stream = true;
+    j.req.think_mode = DS4_THINK_NONE;
+    j.req.needs = DS4_NEED_BANK_FRONTIER;
+    j.req.prompt.len = 16;       /* canonical output-only request frame */
+
+    TEST_ASSERT(cont_on_admitted(&cs, &j, 260, 18, 0) == 1);
+    TEST_ASSERT(j.req.cache_read_tokens == 260);
+    TEST_ASSERT(j.req.cache_write_tokens == 18);
+    TEST_ASSERT(j.cstream && j.cstream->prompt_tokens == 278);
+
+    t_emit_job = &j;
+    cont_stream_finalize(&s, &j, "stop");
+    t_emit_job = NULL;
+    char *out = job_out_text(&j);
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":278") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":260") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_write_tokens\":18") != NULL);
+
+    free(out);
+    buf_free(&j.out);
+    request_free(&j.req);
+    pthread_cond_destroy(&j.cv);
+    pthread_mutex_destroy(&j.mu);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* Anthropic emits usage in message_start, before any token.  Cover that
+     * real wire path rather than relying only on the shared split helper. */
+    job anthropic_stream;
+    memset(&anthropic_stream, 0, sizeof(anthropic_stream));
+    anthropic_stream.fd = -1;  /* t_emit_job redirects transport into out */
+    pthread_mutex_init(&anthropic_stream.mu, NULL);
+    pthread_cond_init(&anthropic_stream.cv, NULL);
+    request_init(&anthropic_stream.req, REQ_CHAT, 128);
+    anthropic_stream.req.api = API_ANTHROPIC;
+    anthropic_stream.req.stream = true;
+    anthropic_stream.req.think_mode = DS4_THINK_NONE;
+    anthropic_stream.req.needs = DS4_NEED_BANK_FRONTIER;
+    anthropic_stream.req.prompt.len = 20;
+    TEST_ASSERT(cont_on_admitted(&cs, &anthropic_stream, 244, 22, 0) == 1);
+    out = job_out_text(&anthropic_stream);
+    TEST_ASSERT(strstr(out, "event: message_start") != NULL);
+    TEST_ASSERT(strstr(out, "\"input_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":244") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":22") != NULL);
+    free(out);
+    cont_stream_discard(&anthropic_stream);
+    buf_free(&anthropic_stream.out);
+    request_free(&anthropic_stream.req);
+    pthread_cond_destroy(&anthropic_stream.cv);
+    pthread_mutex_destroy(&anthropic_stream.mu);
+
+    /* Exercise the production buffered terminal too: unlike a stream it has
+     * no st->prompt_tokens field, so the serializer must recover the same
+     * effective frame from the request's validated engine split. */
+    job anthropic;
+    memset(&anthropic, 0, sizeof(anthropic));
+    pthread_mutex_init(&anthropic.mu, NULL);
+    pthread_cond_init(&anthropic.cv, NULL);
+    request_init(&anthropic.req, REQ_CHAT, 128);
+    anthropic.req.api = API_ANTHROPIC;
+    anthropic.req.stream = false;
+    anthropic.req.think_mode = DS4_THINK_NONE;
+    anthropic.req.has_tool_results = true;
+    anthropic.req.needs = DS4_NEED_BANK_FRONTIER;
+    anthropic.req.prompt.len = 20;  /* output-only tool_result request frame */
+    TEST_ASSERT(cont_on_admitted(&cs, &anthropic, 244, 22, 0) == 1);
+    TEST_ASSERT(anthropic.req.cache_read_tokens == 244);
+    TEST_ASSERT(anthropic.req.cache_write_tokens == 22);
+    cont_stream *anthropic_st = cont_stream_ensure(&anthropic);
+    (void)sem_accum_feed(&anthropic_st->acc, &anthropic.req,
+                         "answer", strlen("answer"));
+    t_emit_job = &anthropic;
+    write_cont_completion(&s, &anthropic, 1);
+    t_emit_job = NULL;
+    out = job_out_text(&anthropic);
+    TEST_ASSERT(strstr(out, "\"input_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_read_input_tokens\":244") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_creation_input_tokens\":22") != NULL);
+    free(out);
+    buf_free(&anthropic.out);
+    request_free(&anthropic.req);
+    pthread_cond_destroy(&anthropic.cv);
+    pthread_mutex_destroy(&anthropic.mu);
+
+    job responses;
+    memset(&responses, 0, sizeof(responses));
+    pthread_mutex_init(&responses.mu, NULL);
+    pthread_cond_init(&responses.cv, NULL);
+    request_init(&responses.req, REQ_CHAT, 128);
+    responses.req.api = API_RESPONSES;
+    responses.req.stream = false;
+    responses.req.think_mode = DS4_THINK_NONE;
+    responses.req.has_tool_results = true;
+    responses.req.needs = DS4_NEED_BANK_FRONTIER;
+    responses.req.prompt.len = 16;  /* output-only function_call_output frame */
+    TEST_ASSERT(cont_on_admitted(&cs, &responses, 260, 18, 0) == 1);
+    cont_stream *responses_st = cont_stream_ensure(&responses);
+    (void)sem_accum_feed(&responses_st->acc, &responses.req,
+                         "answer", strlen("answer"));
+    t_emit_job = &responses;
+    write_cont_completion(&s, &responses, 1);
+    t_emit_job = NULL;
+    out = job_out_text(&responses);
+    TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":278") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":260") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_write_tokens\":18") != NULL);
+    free(out);
+    buf_free(&responses.out);
+    request_free(&responses.req);
+    pthread_cond_destroy(&responses.cv);
+    pthread_mutex_destroy(&responses.mu);
+
+    /* Hidden reasoning can make the ENGINE split wider than an ordinary
+     * replayed prompt.  Without BANK_FRONTIER that request must stay in the
+     * client's rendered frame; do not generalize the output-only exception
+     * to every Anthropic warm hit. */
+    request ordinary;
+    request_init(&ordinary, REQ_CHAT, 128);
+    ordinary.api = API_ANTHROPIC;
+    ordinary.prompt.len = 20;
+    TEST_ASSERT(cont_usage_apply_engine_split(&ordinary, 244, 2) == 20);
+    TEST_ASSERT(ordinary.cache_read_tokens == 18);
+    TEST_ASSERT(ordinary.cache_write_tokens == 2);
+    TEST_ASSERT(cont_usage_prompt_tokens(&ordinary) == 20);
+    request_free(&ordinary);
+}
+
 /* Inc 4b: a promoted Anthropic stream on the CONT path projects through the
  * SAME machine the serial path uses -- the identical tape driven through the
  * real cont entry points (cont_stream_start / wire_update /
@@ -26107,6 +28741,13 @@ static void test_job_emit_backlog_eviction(void) {
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
+    test_tool_choice_contract_and_required_prefix();
+    test_tool_result_turn_reserves_post_thinking_budget();
+    test_tool_result_turn_detection_uses_pending_tail();
+    test_solar_native_tool_protocol();
+    test_solar_tool_choice_prompt_is_cache_stable();
+    test_solar_native_tool_recovery();
+    test_solar_native_anthropic_tool_result_rendering();
     test_reasoning_effort_mapping();
     test_model_family_aliases();
     test_api_thinking_controls_parse();
@@ -26133,6 +28774,10 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
+    test_server_model_ids_cover_loaded_variants();
+    test_model_metadata_keeps_configured_context_after_session_rightsize();
+    test_partial_warm_policy_requires_runtime_support();
+    test_rewind_only_record_cannot_supersede_exact_record();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
@@ -26160,6 +28805,9 @@ static void ds4_server_unit_tests_run(void) {
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
+    test_unclosed_thinking_is_incomplete_reasoning();
+    test_no_tools_unclosed_thinking_uses_reasoning_channel();
+    test_length_limited_thinking_uses_nonterminal_visible_prefix();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
@@ -26176,6 +28824,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_registry_record_unit_eviction();
     test_send_all_capture_redirect();
     test_serial_terminal_commit_ladder();
+    test_serial_pending_session_respects_request_cap();
     test_cont_registry_bank_publish_claim();
     test_cont_registry_bank_protection();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
@@ -26187,6 +28836,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
+    test_kv_tool_map_persists_solar_multi_call();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
@@ -26215,6 +28865,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
+    test_kv_bank_records_require_replay_contract();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();
@@ -26242,6 +28893,7 @@ static void ds4_server_unit_tests_run(void) {
     test_wire_finish_stream_matches_direct_dispatch();
     test_cont_completion_stream_matches_serial_oracle();
     test_cont_admission_transport_and_heartbeat();
+    test_cont_bank_usage_uses_effective_frame();
     test_cont_anthropic_stream_matches_serial_oracle();
     test_cont_responses_stream_matches_serial_oracle();
     test_sem_accum_feed_verdicts();

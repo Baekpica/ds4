@@ -37,11 +37,28 @@ int ds4_mmq_init(int device);
 // ggml's enum:
 //   8  = Q8_0
 //   10 = Q2_K
+//   11 = Q3_K
+//   12 = Q4_K
 //   16 = IQ2_XXS
 //
 //   ne11:      batch dimension (number of activation columns / tokens).
 //   n_experts: 0 for dense matmul, >0 for MoE (e.g. 256 for V4 Flash).
 int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
+
+// Tensor-core prefill attention for the production 128-wide GQA head.
+// The Solar entry decodes compressed K/V once per shared 16-key tile and
+// reuses it across 64 query rows. Returns 0 on success and -1 when the
+// shape or architecture is unsupported so callers can retain a fallback.
+int ds4_mmq_exaone_prefill_attn_hmma(
+        float *heads, const float *q, const void *kv,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
+        int kv_cap, int window, float scale, cudaStream_t stream);
+
+int ds4_mmq_solar_prefill_attn_hmma(
+        float *heads, const float *q, const void *kv,
+        int format, size_t row_bytes,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
+        int kv_cap, int window, float scale, cudaStream_t stream);
 
 // Dense matmul entry points. Per-type wrappers that all share the same
 // underlying mul_mat_q template, parameterised by the weight quant type.
@@ -101,8 +118,18 @@ int ds4_mmq_q8_0_quantize_ref(
 // Dense Q8_0 D2R on the kind-5 aligned artifact (weight server
 // --repack-q8-aligned).  Same in/out contract as ds4_mmq_q8_0_dense but W is
 // the ALIGNED artifact base ([half dq[nblk]][pad64][int8 qs]), and the shape
-// must satisfy M % 128 == 0 && K % 1024 == 0.  Callers gate on n_tok scale
+// must satisfy M % 128 == 0 && K % 128 == 0.  Callers gate on n_tok scale
 // and K <= 4096 (o_proj's K=8192 measured faster on mmq).
+enum {
+    DS4_MMQ_Q8_0_D2R_DEFAULT_MIN_COLS = 512,
+    DS4_MMQ_Q8_0_D2R_K128_DEFAULT_MIN_COLS = 4,
+};
+
+static inline int ds4_mmq_q8_0_dense_d2r_min_cols(
+        uint64_t K, int general_min_cols, int k128_min_cols) {
+    return K == 128u ? k128_min_cols : general_min_cols;
+}
+
 int ds4_mmq_q8_0_dense_d2r(
     const void  * W_aligned,
     const float * X_f32,
@@ -138,6 +165,18 @@ int ds4_mmq_q2_K_dense(
 
 int ds4_mmq_iq2_xxs_dense(
     const void  * W_iq2_xxs,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+// Q3_K is the Solar Open 2 mixed-quant recipe's routed-expert down type on
+// the interior MoE layers. The vendored mmq/mmvq templates already support
+// it; these entries expose the same contracts as the neighboring K-quants.
+int ds4_mmq_q3_K_dense(
+    const void  * W_q3_K,
     const float * X_f32,
     float       * out_f32,
     int           M,
@@ -218,6 +257,36 @@ int ds4_mmq_iq2_xxs_moe(
     int             n_expert_used,
     cudaStream_t    stream);
 
+int ds4_mmq_q3_K_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+// Same result/layout as the unbounded entry, but the caller supplies a
+// proven upper bound on rows routed to one expert.  Router-generated
+// expert_bounds remains authoritative for every read and write; the bound
+// only permits compact launch geometry.  A unique top-k router can safely
+// use the unflattened forward-token count after [token, slot] is flattened.
+int ds4_mmq_q3_K_moe_bounded(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
+    cudaStream_t    stream);
+
 // ds4 (P4 Inc3): same contract as ds4_mmq_q2_K_moe but W_soa is the aligned
 // row-pair-SoA artifact (weight server --repack-q2k-aligned, layout in
 // ds4_mmq_q2_k_aligned_bytes' comment) instead of the raw block stream.  The
@@ -249,6 +318,19 @@ int ds4_mmq_q4_K_moe(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q4_K_moe_bounded(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
     cudaStream_t    stream);
 
 // Paired MoE entries. Compute gate AND up over the same activation in a
@@ -291,6 +373,48 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     int             n_experts,
     int             n_expert_used,
     cudaStream_t    stream);
+
+/* Experimental atomic IQ2->Q3 wide-prefill handoff (n_tokens >= 512). The
+ * aligned IQ2 pair
+ * producer remains unchanged and materializes its canonical F32 gate/up
+ * outputs.  While that producer's expert map is still live, a separate
+ * 128-thread epilogue emits weighted SwiGLU directly as D4 Q8_1 into
+ * q8_scratch and the established Q3 compact worklist consumes the SAME
+ * ids_dst/expert_bounds.  The caller owns all scratch; no persistent
+ * allocation is made.  Returns -1 only for pre-launch refusal, and <= -2
+ * for any failure after a launch has been queued. */
+int ds4_mmq_iq2_xxs_q3_K_moe_handoff_soa(
+    const void    * W_gate_soa,
+    const void    * W_up_soa,
+    const void    * W_down_q3,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    float         * gate_f32,
+    float         * up_f32,
+    void          * q8_scratch,
+    size_t          q8_scratch_bytes,
+    float         * down_f32,
+    int             expert_mid_dim,
+    int             expert_in_dim,
+    int             out_dim,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+/* Focused byte-parity test hooks for the handoff's D4 epilogue. */
+int ds4_mmq_swiglu_weighted_q8_d4_emit_test(
+    const float *gate, const float *up, const float *router_weights,
+    const int32_t *ids_dst, void *q8_out, int K, int n_assign,
+    cudaStream_t stream);
+int ds4_mmq_q3_K_quantize_ref(
+    const float *x, const int32_t *ids_dst, void *q8_out,
+    int K, int n_assign, cudaStream_t stream);
+int ds4_mmq_q3_K_worklist_preflight_test(
+    int M, int K, int64_t ne_get_rows, int n_experts,
+    int64_t stride_row_x, int64_t stride_channel_x);
+
 
 /* v0.5 inc-9 (F7): fused target-prefill pipeline over the aligned-SoA
  * IQ2_XXS gate/up and Q2_K down artifacts.  Builds the expert-major
@@ -368,6 +492,24 @@ int ds4_mmq_q4_K_moe_pair(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// Paired Q4_K entry with a caller-proven expert-bucket bound.  The two
+// weights share one expert map and Q8_1 activation, then run through the
+// compact routed worklist.  Router ids remain authoritative.
+int ds4_mmq_q4_K_moe_pair_bounded(
+    const void    * W_a,
+    const void    * W_b,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_a,
+    float         * out_b,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
+    cudaStream_t    stream);
+
 // MoE vector matmul entries (Step 6). Same signature and semantics as the
 // ds4_mmq_<type>_moe entries above, but route through llama.cpp's mmvq
 // kernels instead of mmq. mmvq is structurally optimised for small batch
@@ -413,6 +555,18 @@ int ds4_mmq_q2_K_moe_vec(
     cudaStream_t    stream);
 
 int ds4_mmq_iq2_xxs_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q3_K_moe_vec(
     const void    * W,
     const float   * X_f32,
     const int32_t * ids,

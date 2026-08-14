@@ -36,6 +36,7 @@ bool ds4_mmq_q8_0_dense_d2r_available(int cc);
 // Dense Q8_0 D2R on the kind-5 aligned artifact (--repack-q8-aligned).
 // q8 = block_q8_1_mmq D4 activation buffer ([k128][col], stride N cols,
 // over-allocated >= 128 blocks past N*K/128 for the guarded last col tile).
+// Shapes require M % 128 == 0 and K % 128 == 0.
 int ds4_mmq_q8_0_dense_d2r_launch(
     const void   * W_aligned,
     const void   * q8,

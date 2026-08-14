@@ -1,6 +1,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_fp4.h>
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
@@ -25,6 +27,7 @@
 #include <vector>
 #include <string>
 #include <new>
+#include <mutex>
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -66,6 +69,18 @@ typedef struct ds4_gpu_candidate_cert_result {
     float    candidate_logit;
     float    max_bound;
 } ds4_gpu_candidate_cert_result;
+
+/* ds4_cuda.cu intentionally carries its C ABI declarations locally instead
+ * of including ds4_gpu.h. Keep the public Solar KV tag numerically mirrored. */
+#ifndef DS4_SOLAR_KV_FORMAT_DEFINED
+#define DS4_SOLAR_KV_FORMAT_DEFINED
+typedef enum {
+    DS4_SOLAR_KV_BF16       = 0,
+    DS4_SOLAR_KV_FP8        = 1,
+    DS4_SOLAR_KV_FP4        = 2,
+    DS4_SOLAR_KV_KFP8_VFP4 = 3,
+} ds4_solar_kv_format;
+#endif
 
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
@@ -127,6 +142,10 @@ static int g_model_cache_full;
  * lags), the conservative direction. */
 static uint64_t g_substrate_promotable_total;
 static uint64_t g_substrate_promotable_covered;
+
+/* Defined with the norm producer registry below; cleanup lives earlier in
+ * this translation unit, so keep the lifecycle hook visible here. */
+static void cuda_norm_q8_release(void);
 
 static void cuda_substrate_cover(const void *model_map, uint64_t bytes) {
     if (g_model_fd_host_base && model_map == g_model_fd_host_base)
@@ -3057,6 +3076,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaFree(g_hc_stage_scratch);
         g_hc_stage_scratch = NULL;
     }
+    cuda_norm_q8_release();
     for (int i = 0; i < 2; i++) {
         if (g_q8_fold_q80_buf[i]) { (void)cudaFree(g_q8_fold_q80_buf[i]); g_q8_fold_q80_buf[i] = NULL; }
         if (g_q8_fold_q81_buf[i]) { (void)cudaFree(g_q8_fold_q81_buf[i]); g_q8_fold_q81_buf[i] = NULL; }
@@ -4429,11 +4449,19 @@ static uint32_t cuda_moe_iq2_aligned_enabled(void);
 static uint32_t cuda_moe_q2k_aligned_enabled(void);
 static uint32_t cuda_q8_aligned_enabled(void);
 
-extern "C" int ds4_gpu_build_derived_artifacts(
-        const void *model_map,
-        uint64_t model_size,
-        const char *model_path) {
-    if (!model_map || model_size == 0 || !model_path || !model_path[0]) return 0;
+/* ds4_cuda.cu intentionally does not include ds4_gpu.h.  Keep this mirror in
+ * lockstep with the public catalog record there. */
+typedef struct {
+    const char *name;
+    uint32_t name_len;
+    uint32_t type;
+    uint32_t ndim;
+    uint64_t dims[4];
+    uint64_t offset;
+    uint64_t bytes;
+} ds4_gpu_tensor_record;
+
+static int cuda_derived_artifact_build_device(int *dev_out) {
     if (getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST") != NULL) return 0;
     if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) {
         g_derived_artifact_none_reason = "DS4_CUDA_NO_DERIVED_WEIGHTS is set";
@@ -4449,31 +4477,23 @@ extern "C" int ds4_gpu_build_derived_artifacts(
     if (cudaGetDevice(&dev) != cudaSuccess ||
         cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess ||
         !integrated) {
-        /* Discrete VRAM cannot hold the ~79 GiB artifact set next to the
-         * streamed model; the weight-server repack route stays the fast
-         * tier there. */
+        /* Discrete VRAM cannot hold the large artifact set next to the
+         * streamed model; the weight-server repack route remains available. */
         g_derived_artifact_none_reason =
             "discrete GPU (use ds4_weight_server --repack-*-aligned for the aligned tier)";
         return 0;
     }
+    *dev_out = dev;
+    return 1;
+}
 
-    ds4_repack_file m;
-    if (!ds4_repack_map_file("ds4", model_path, m)) {
-        g_derived_artifact_none_reason = "model reopen failed";
-        return 0;
-    }
-    if (m.size != model_size) {
-        ds4_repack_unmap_file(m);
-        g_derived_artifact_none_reason = "model size mismatch on reopen";
-        return 0;
-    }
-    std::vector<ds4_repack_tensor> records;
-    const bool catalog_ok = ds4_repack_collect_catalog("ds4", m, nullptr, &records);
-    ds4_repack_unmap_file(m);
-    if (!catalog_ok) {
-        g_derived_artifact_none_reason = "GGUF catalog parse failed";
-        return 0;
-    }
+static int cuda_build_derived_artifacts_from_catalog(
+        const void *model_map,
+        uint64_t model_size,
+        std::vector<ds4_repack_tensor> &records,
+        const char *model_path,
+        const uint8_t *source_data,
+        int dev) {
 
     /* The iq2/q2k artifacts REPLACE their raw residency (the whole-model
      * registration skip + walk uncap key on a COMPLETE replace set), so a
@@ -4515,6 +4535,8 @@ extern "C" int ds4_gpu_build_derived_artifacts(
     a.log_prefix = "ds4";
     a.model_id = "base";
     a.path = model_path;
+    a.source_data = source_data;
+    a.source_size = source_data ? model_size : 0;
     a.records = &records;
     a.device = dev;
     a.copy_chunk_bytes = 256ull * 1048576ull; /* weight-server --copy-chunk-mb default */
@@ -4579,9 +4601,11 @@ extern "C" int ds4_gpu_build_derived_artifacts(
     /* Replace-set completeness: the registration skip must only fire when
      * every iq2/q2k candidate raw is actually replaced. */
     int replaces_complete = build_moe ? 1 : 0;
+    uint64_t replace_candidates = 0;
     if (build_moe) {
         for (const ds4_repack_tensor &t : records) {
             if (!ds4_repack_iq2_candidate(t) && !ds4_repack_q2k_candidate(t)) continue;
+            replace_candidates++;
             bool have = false;
             for (const ds4_repack_artifact &art : arts) {
                 if (art.t == &t) { have = true; break; }
@@ -4589,13 +4613,106 @@ extern "C" int ds4_gpu_build_derived_artifacts(
             if (!have) { replaces_complete = 0; break; }
         }
     }
+    if (replace_candidates == 0) replaces_complete = 0;
     g_derived_replaces_complete = replaces_complete;
 
     g_derived_artifact_source = CUDA_DERIVED_ARTIFACTS_BUILT;
     g_derived_artifact_count = arts.size();
     g_derived_artifact_bytes = built_bytes;
     g_derived_artifact_build_secs = cuda_wall_sec() - t0;
+    g_derived_artifact_none_reason = NULL;
     return (int)arts.size();
+}
+
+extern "C" int ds4_gpu_build_derived_artifacts(
+        const void *model_map,
+        uint64_t model_size,
+        const char *model_path) {
+    if (!model_map || model_size == 0 || !model_path || !model_path[0]) return 0;
+    int dev = 0;
+    if (!cuda_derived_artifact_build_device(&dev)) return 0;
+
+    ds4_repack_file m;
+    if (!ds4_repack_map_file("ds4", model_path, m)) {
+        g_derived_artifact_none_reason = "model reopen failed";
+        return 0;
+    }
+    if (m.size != model_size) {
+        ds4_repack_unmap_file(m);
+        g_derived_artifact_none_reason = "model size mismatch on reopen";
+        return 0;
+    }
+    std::vector<ds4_repack_tensor> records;
+    const bool catalog_ok = ds4_repack_collect_catalog("ds4", m, nullptr, &records);
+    ds4_repack_unmap_file(m);
+    if (!catalog_ok) {
+        g_derived_artifact_none_reason = "GGUF catalog parse failed";
+        return 0;
+    }
+    return cuda_build_derived_artifacts_from_catalog(
+            model_map, model_size, records, model_path, NULL, dev);
+}
+
+extern "C" int ds4_gpu_build_derived_artifacts_from_records(
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_tensor_record *records_in,
+        uint32_t count) {
+    if (!model_map || model_size == 0 || !records_in || count == 0) return 0;
+    int dev = 0;
+    if (!cuda_derived_artifact_build_device(&dev)) return 0;
+
+    std::vector<ds4_repack_tensor> records;
+    records.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        const ds4_gpu_tensor_record &r = records_in[i];
+        if (!r.name || r.name_len == 0 || r.ndim == 0 || r.ndim > 4u ||
+            r.offset > model_size || r.bytes > model_size - r.offset) {
+            g_derived_artifact_none_reason =
+                "merged GGUF catalog has an invalid tensor record";
+            return 0;
+        }
+        ds4_repack_tensor t;
+        t.name.assign(r.name, r.name_len);
+        t.type = r.type;
+        t.ndim = r.ndim;
+        t.elements = 1;
+        for (uint32_t d = 0; d < r.ndim && d < 4u; d++) {
+            t.dims[d] = r.dims[d];
+            if (r.dims[d] != 0 && t.elements > UINT64_MAX / r.dims[d]) {
+                g_derived_artifact_none_reason = "merged GGUF catalog dimension overflow";
+                return 0;
+            }
+            t.elements *= r.dims[d];
+        }
+        t.off = r.offset;
+        t.bytes = r.bytes;
+        records.push_back(std::move(t));
+    }
+    return cuda_build_derived_artifacts_from_catalog(
+            model_map, model_size, records, NULL,
+            (const uint8_t *)model_map, dev);
+}
+
+extern "C" int ds4_gpu_model_map_replacements_complete(const void *model_map) {
+    return cuda_model_map_replaces_complete(model_map);
+}
+
+extern "C" int ds4_gpu_model_range_replaced(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes) {
+    if (!cuda_model_map_replaces_complete(model_map) || bytes == 0) return 0;
+    for (const cuda_derived_range &r : g_derived_ranges) {
+        if (r.host_base == model_map &&
+            r.source_offset == offset &&
+            r.source_bytes == bytes &&
+            (r.kind == CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE ||
+             r.kind == CUDA_DERIVED_Q2_K_ALIGNED_MOE)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 extern "C" void ds4_gpu_derived_artifact_stats(
@@ -6530,6 +6647,60 @@ __global__ static void rms_norm_weight_f16q8_kernel(float *out, __half *out16, c
         float v = xr[i] * scale * w[i];
         orow[i] = v;
         o16row[i] = __float2half(v);
+    }
+    __syncthreads();
+    const uint32_t lane = threadIdx.x & 31u;
+    for (uint32_t qb = threadIdx.x >> 5u; qb < (n >> 7u); qb += (blockDim.x >> 5u)) {
+        const float4 xi = *reinterpret_cast<const float4 *>(orow + (uint64_t)qb * 128u + lane * 4u);
+        float amax = fabsf(xi.x);
+        amax = fmaxf(amax, fabsf(xi.y));
+        amax = fmaxf(amax, fabsf(xi.z));
+        amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off, 32));
+        }
+        float rcp_amax;
+        asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp_amax) : "f"(amax));
+        const float d_inv = __fmul_rn(rcp_amax, 127.0f);
+        char4 q;
+        q.x = (int8_t)roundf(__fmul_rn(xi.x, d_inv));
+        q.y = (int8_t)roundf(__fmul_rn(xi.y, d_inv));
+        q.z = (int8_t)roundf(__fmul_rn(xi.z, d_inv));
+        q.w = (int8_t)roundf(__fmul_rn(xi.w, d_inv));
+        char *blk = y_q8 + ((uint64_t)qb * rows + row) * 144u;
+        *reinterpret_cast<char4 *>(blk + 16u + lane * 4u) = q;
+        if ((lane & 7u) == 0u) {
+            float d;
+            asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(d) : "f"(d_inv));
+            reinterpret_cast<float *>(blk)[lane >> 3u] = d;
+        }
+    }
+}
+
+/* F32-only counterpart used by the common plain model graph.  Keep the RMS
+ * body and Q8 D4 lowering identical to rms_norm_weight_f16q8_kernel; omitting
+ * the unused F16 mirror avoids one global store over the activation. */
+__global__ static void rms_norm_weight_q8_kernel(float *out, char *y_q8, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = xr[i] * scale * w[i];
     }
     __syncthreads();
     const uint32_t lane = threadIdx.x & 31u;
@@ -13779,6 +13950,78 @@ __global__ static void router_fused_rows_coop_kernel(
     }
 }
 
+/* Sigmoid router shared by plain-residual model families. Selection uses the
+ * optional correction bias, while the emitted/normalized weights come from
+ * the unbiased probabilities. Strict `>` preserves first-index tie breaking. */
+__global__ static void sigmoid_topk_router_kernel(
+        int32_t *selected,
+        float *weights,
+        const float *logits,
+        const float *bias,
+        uint32_t n_expert,
+        uint32_t n_used,
+        float weight_scale) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    extern __shared__ float scratch[];
+    float *prob = scratch;
+    float *score = scratch + n_expert;
+    const float *row = logits + (uint64_t)token * n_expert;
+
+    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
+        const float x = row[e];
+        const float p = !isfinite(x) ? 0.0f : x >= 0.0f
+            ? 1.0f / (1.0f + __expf(-x))
+            : __expf(x) / (1.0f + __expf(x));
+        const float correction = bias && isfinite(bias[e]) ? bias[e] : 0.0f;
+        prob[e] = p;
+        score[e] = p + correction;
+    }
+    __syncthreads();
+
+    if (tid == 0u) {
+        int32_t *ids = selected + (uint64_t)token * n_used;
+        float *out_weights = weights + (uint64_t)token * n_used;
+        float sum = 0.0f;
+        for (uint32_t slot = 0; slot < n_used; slot++) {
+            int32_t best = -1;
+            float best_score = -INFINITY;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                if (score[e] > best_score) {
+                    best_score = score[e];
+                    best = (int32_t)e;
+                }
+            }
+            ids[slot] = best;
+            out_weights[slot] = prob[(uint32_t)best];
+            sum += out_weights[slot];
+            score[(uint32_t)best] = -INFINITY;
+        }
+        sum = fmaxf(sum, 6.103515625e-5f);
+        for (uint32_t slot = 0; slot < n_used; slot++) {
+            out_weights[slot] = out_weights[slot] / sum * weight_scale;
+        }
+    }
+}
+
+__global__ static void swiglu_weighted_kernel(
+        float *mid,
+        const float *gate,
+        const float *up,
+        const float *weights,
+        uint32_t n_ff,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float g = gate[i];
+    float u = up[i];
+    /* Aligned SoA MMQ deliberately skips its standalone sanitize pass; all
+     * consumers sanitize at read, matching the mature routed-MoE path. */
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(u)) u = 0.0f;
+    mid[i] = (g / (1.0f + expf(-g))) * u * weights[i / n_ff];
+}
+
 __global__ static void swiglu_kernel(float *out, const float *gate, const float *up, uint32_t n, float clamp, float weight) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -16156,6 +16399,109 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
     mask[gid] = v;
 }
 
+__global__ static void embed_token_q8_0_kernel(
+        float *out,
+        const unsigned char *weights,
+        uint32_t token,
+        uint32_t n_embd) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    const uint64_t row_blocks = n_embd / 32u;
+    const unsigned char *block =
+        weights + ((uint64_t)token * row_blocks + (d >> 5)) * 34u;
+    const float scale = __half2float(*(const __half *)block);
+    out[d] = scale * (float)((const int8_t *)(block + 2))[d & 31u];
+}
+
+__global__ static void embed_tokens_q8_0_kernel(
+        float *out,
+        const int32_t *tokens,
+        const unsigned char *weights,
+        uint32_t n_vocab,
+        uint32_t n_tokens,
+        uint32_t n_embd) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)n_tokens * n_embd;
+    if (i >= count) return;
+    const uint32_t t = (uint32_t)(i / n_embd);
+    const uint32_t d = (uint32_t)(i - (uint64_t)t * n_embd);
+    const int32_t token = tokens[t];
+    if (token < 0 || (uint32_t)token >= n_vocab) {
+        out[i] = 0.0f;
+        return;
+    }
+    const uint64_t row_blocks = n_embd / 32u;
+    const unsigned char *block = weights +
+        ((uint64_t)(uint32_t)token * row_blocks + (d >> 5)) * 34u;
+    const float scale = __half2float(*(const __half *)block);
+    out[i] = scale * (float)((const int8_t *)(block + 2))[d & 31u];
+}
+
+extern "C" int ds4_gpu_embed_token_quant_tensor(
+        ds4_gpu_tensor *out,
+        const void       *model_map,
+        uint64_t          model_size,
+        uint64_t          weight_offset,
+        uint32_t          weight_type,
+        uint32_t          n_vocab,
+        uint32_t          token,
+        uint32_t          n_embd) {
+    if (!out || !model_map || weight_type != 8u || n_vocab == 0u ||
+        token >= n_vocab || n_embd == 0u || (n_embd & 31u) != 0u ||
+        out->bytes < (uint64_t)n_embd * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    if ((uint64_t)n_vocab > UINT64_MAX / row_bytes ||
+        weight_offset > model_size ||
+        (uint64_t)n_vocab * row_bytes > model_size - weight_offset) {
+        return 0;
+    }
+    const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
+        model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
+        "quant_token_embedding");
+    if (!weights) return 0;
+    embed_token_q8_0_kernel<<<(n_embd + 255u) / 256u, 256u, 0,
+                               ds4_current_stream()>>>(
+        (float *)out->ptr, weights, token, n_embd);
+    return cuda_ok(cudaGetLastError(), "Q8_0 token embedding launch");
+}
+
+extern "C" int ds4_gpu_embed_tokens_quant_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *tokens,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens,
+        uint32_t                n_embd) {
+    if (!out || !tokens || !model_map || weight_type != 8u || n_vocab == 0u ||
+        n_tokens == 0u || n_embd == 0u || (n_embd & 31u) != 0u) {
+        return 0;
+    }
+    const uint64_t count = (uint64_t)n_tokens * n_embd;
+    if (count > UINT64_MAX / sizeof(float) ||
+        tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+        out->bytes < count * sizeof(float)) return 0;
+    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    if ((uint64_t)n_vocab > UINT64_MAX / row_bytes ||
+        weight_offset > model_size ||
+        (uint64_t)n_vocab * row_bytes > model_size - weight_offset) {
+        return 0;
+    }
+    const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
+        model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
+        "quant_token_embedding_batch");
+    if (!weights) return 0;
+    embed_tokens_q8_0_kernel<<<(unsigned)((count + 255u) / 256u), 256u, 0,
+                                ds4_current_stream()>>>(
+        (float *)out->ptr, (const int32_t *)tokens->ptr, weights,
+        n_vocab, n_tokens, n_embd);
+    return cuda_ok(cudaGetLastError(), "Q8_0 token embedding batch launch");
+}
+
 extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     (void)n_vocab;
     if (!out_hc || !model_map || weight_offset >= model_size) return 0;
@@ -16198,33 +16544,6 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
     return cuda_ok(cudaGetLastError(), "embed tokens launch");
 }
 
-/* Batch token embedding straight from a Q8_0 GGUF row table (34-byte blocks
- * of one half scale + 32 int8 codes), ported from the Motif/EXAONE line.
- * Out-of-range ids embed as zeros instead of reading past the table --
- * safety-only guard, valid ids take the same numerical path. */
-__global__ static void embed_tokens_q8_0_kernel(
-        float *out,
-        const int32_t *tokens,
-        const unsigned char *w,
-        uint32_t n_vocab,
-        uint32_t n_tokens,
-        uint32_t n_embd) {
-    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n = (uint64_t)n_tokens * n_embd;
-    if (gid >= n) return;
-    uint32_t t = gid / n_embd;
-    uint32_t d = gid - (uint64_t)t * n_embd;
-    int32_t tok = tokens[t];
-    if (tok < 0 || (uint32_t)tok >= n_vocab) {
-        out[gid] = 0.0f;
-        return;
-    }
-    const uint64_t row_blocks = n_embd / 32u;
-    const unsigned char *blk = w + ((uint64_t)tok * row_blocks + (d >> 5)) * 34u;
-    const float scale = __half2float(*(const __half *)blk);
-    out[gid] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
-}
-
 extern "C" int ds4_gpu_embed_tokens_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *tokens,
@@ -16234,28 +16553,9 @@ extern "C" int ds4_gpu_embed_tokens_q8_0_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd) {
-    if (!out || !tokens || !model_map || n_tokens == 0 || n_embd == 0 ||
-        (n_embd & 31u) != 0u) {
-        return 0;
-    }
-    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
-    if (weight_offset > model_size ||
-        (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
-        out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
-        tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t)) {
-        return 0;
-    }
-    const char *w = cuda_model_range_ptr(model_map, weight_offset,
-                                         (uint64_t)n_vocab * row_bytes,
-                                         "token_embd_q8_0");
-    if (!w) return 0;
-    uint64_t n = (uint64_t)n_tokens * n_embd;
-    embed_tokens_q8_0_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
-        (float *)out->ptr,
-        (const int32_t *)tokens->ptr,
-        (const unsigned char *)w,
-        n_vocab, n_tokens, n_embd);
-    return cuda_ok(cudaGetLastError(), "embed tokens q8_0 launch");
+    return ds4_gpu_embed_tokens_quant_tensor(
+        out, tokens, model_map, model_size, weight_offset,
+        8u, n_vocab, n_tokens, n_embd);
 }
 
 /* Forward decl for the captured-vs-eager substrate probe (definition near
@@ -19447,6 +19747,19 @@ static struct {
 static void  *g_norm_q8_buf = NULL;
 static size_t g_norm_q8_cap = 0;
 
+static void cuda_norm_q8_release(void) {
+    g_norm_q8_reg.src = NULL;
+    g_norm_q8_reg.y = NULL;
+    g_norm_q8_reg.bytes = 0;
+    g_norm_q8_reg.rows = 0u;
+    g_norm_q8_reg.n = 0u;
+    if (g_norm_q8_buf) {
+        (void)cudaFree(g_norm_q8_buf);
+        g_norm_q8_buf = NULL;
+    }
+    g_norm_q8_cap = 0;
+}
+
 static int cuda_norm_q8emit_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -19467,6 +19780,77 @@ static void *cuda_norm_q8_lookup(const void *x, uint64_t n_tok, uint64_t k, size
     if ((uint64_t)g_norm_q8_reg.rows != n_tok || (uint64_t)g_norm_q8_reg.n != k) return NULL;
     if (bytes_out) *bytes_out = g_norm_q8_reg.bytes;
     return g_norm_q8_reg.y;
+}
+
+static char *cuda_norm_q8_prepare(uint32_t rows, uint32_t n,
+                                  size_t *payload_out) {
+    if (!cuda_norm_q8emit_enabled() || rows < 64u || (n & 127u) != 0u) {
+        return NULL;
+    }
+    const uint32_t nkseg = n >> 7u;
+    const size_t payload = (size_t)rows * nkseg * 144u;
+    const size_t need = payload + 128u * 144u;  /* consumer slack ceiling */
+    if (g_norm_q8_cap < need) {
+        /* Allocate for the largest normal prefill chunk immediately.  A later
+         * grow would cudaFree on the hot path and serialize the stream. */
+        const size_t floor_need =
+            (size_t)(rows > 4096u ? rows : 4096u) * nkseg * 144u +
+            128u * 144u;
+        cuda_norm_q8_release();
+        if (cudaMalloc(&g_norm_q8_buf, floor_need) == cudaSuccess) {
+            g_norm_q8_cap = floor_need;
+        } else {
+            /* Allocation is an optional optimization.  Do not let its sticky
+             * runtime error poison the classic RMS fallback launch. */
+            (void)cudaGetLastError();
+        }
+    }
+    if (payload_out) *payload_out = payload;
+    return (char *)g_norm_q8_buf;
+}
+
+static void cuda_norm_q8_publish(const void *src, uint32_t rows, uint32_t n) {
+    g_norm_q8_reg.src   = src;
+    g_norm_q8_reg.y     = g_norm_q8_buf;
+    g_norm_q8_reg.bytes = g_norm_q8_cap;
+    g_norm_q8_reg.rows  = rows;
+    g_norm_q8_reg.n     = n;
+}
+
+static void cuda_norm_q8_verify(const ds4_gpu_tensor *out, uint32_t rows,
+                                uint32_t n, size_t payload) {
+    if (getenv("DS4_CUDA_NORM_Q8EMIT_VERIFY") == NULL) return;
+    char *ref = NULL;
+    if (cudaMalloc((void **)&ref, payload) == cudaSuccess) {
+        if (ds4_mmq_q8_0_quantize_ref((const float *)out->ptr, ref,
+                                      payload, (int)rows, (int)n,
+                                      ds4_current_stream()) == 0) {
+            char *h_ref = (char *)malloc(payload);
+            char *h_got = (char *)malloc(payload);
+            if (h_ref && h_got) {
+                cudaMemcpy(h_ref, ref, payload, cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_got, g_norm_q8_buf, payload,
+                           cudaMemcpyDeviceToHost);
+                uint64_t bad = 0;
+                const uint64_t nblk = payload / 144u;
+                for (uint64_t ib = 0; ib < nblk; ib++) {
+                    if (memcmp(h_ref + ib * 144u, h_got + ib * 144u,
+                               144u) != 0) {
+                        bad++;
+                    }
+                }
+                fprintf(stderr,
+                        "ds4: norm q8emit VERIFY rows=%u blocks=%llu bad=%llu\n",
+                        rows, (unsigned long long)nblk,
+                        (unsigned long long)bad);
+            }
+            free(h_ref);
+            free(h_got);
+        }
+        cudaFree(ref);
+    } else {
+        (void)cudaGetLastError();
+    }
 }
 
 static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label);
@@ -19689,11 +20073,10 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
      * column-major output flattens to [n_tok, out_dim] row-major, which
      * is exactly what ds4 stores in out->ptr.  Q8_0 weight is already in
      * mmq's expected [out_dim rows, in_dim cols] row-major-of-blocks
-     * layout (the GGUF on-disk format).  mmq requires K (= in_dim) to
-     * be a multiple of QK_K = 256; V4 Flash satisfies this for every
-     * Q8_0 weight in the model, but we check anyway and fall through
-     * for any odd shapes. */
-    if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok > 0) {
+     * layout (the GGUF on-disk format).  Generic mmq requires K (= in_dim)
+     * to be a multiple of QK_K = 256.  The aligned D2R tier also covers
+     * K=128 shallow GEMMs, so enter at K % 128 and gate generic mmq below. */
+    if (ds4_cuda_use_mmq() && (in_dim % 128u == 0) && n_tok > 0) {
         /* Shape census for the dense-q8 lever (debug-only, default off). */
         static int shape_log = -1;
         if (shape_log < 0) shape_log = getenv("DS4_MMQ_DENSE_SHAPES") != NULL;
@@ -19702,25 +20085,41 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
                     label ? label : "?", (int)out_dim, (int)n_tok, (int)in_dim);
         }
         /* Dense-q8 D2R on the kind-5 aligned artifact (weight server
-         * --repack-q8-aligned; artifact presence is the opt-in).  Prefill-
-         * scale batches only; K=8192 (o_proj) stays on mmq which measured
-         * faster at deep K.  Kill switch DS4_MMQ_DENSE_D2R=0.  Fold order
-         * differs from mmq: value-parity, not bit-parity.  See the DENSE-Q8
-         * D2R PROTO ARC section of the D2R ledger. */
+         * --repack-q8-aligned; artifact presence is the opt-in).  Batch
+         * floors are shape-specific; K=8192 (o_proj) stays on mmq which
+         * measured faster at deep K.  Kill switch DS4_MMQ_DENSE_D2R=0.
+         * Fold order differs from mmq: value-parity, not bit-parity.  See
+         * the DENSE-Q8 D2R PROTO ARC section of the D2R ledger. */
         static int dense_d2r_en = -1;
-        static int dense_d2r_min_cols = 512;
+        static int dense_d2r_min_cols =
+            DS4_MMQ_Q8_0_D2R_DEFAULT_MIN_COLS;
+        static int dense_d2r_k128_min_cols =
+            DS4_MMQ_Q8_0_D2R_K128_DEFAULT_MIN_COLS;
         if (dense_d2r_en < 0) {
             const char *env = getenv("DS4_MMQ_DENSE_D2R");
             dense_d2r_en = (env && env[0] == '0') ? 0 : 1;
-            /* Batch floor: prefill-scale only by default; eval harnesses
-             * lower it so short-prompt quality runs exercise the kernel
-             * (incl. the guarded last col tile). */
+            /* General prefill-scale floor stays at 512.  The wide K=128
+             * shallow projection crosses over by N=4, covering short tool
+             * turns as well as Solar's two 256-token boot chunks.  N=1..3
+             * stay on the native warp path.  The global override applies to
+             * both floors; the shape-specific override can then tune or
+             * restore K=128 independently. */
             const char *mc = getenv("DS4_MMQ_DENSE_D2R_MIN_COLS");
-            if (mc && atoi(mc) > 0) dense_d2r_min_cols = atoi(mc);
+            if (mc && atoi(mc) > 0) {
+                dense_d2r_min_cols = atoi(mc);
+                dense_d2r_k128_min_cols = dense_d2r_min_cols;
+            }
+            const char *k128_mc = getenv("DS4_MMQ_DENSE_D2R_K128_MIN_COLS");
+            if (k128_mc && atoi(k128_mc) > 0) {
+                dense_d2r_k128_min_cols = atoi(k128_mc);
+            }
         }
-        if (dense_d2r_en && (int)n_tok >= dense_d2r_min_cols &&
+        const int dense_d2r_effective_min_cols =
+            ds4_mmq_q8_0_dense_d2r_min_cols(
+                in_dim, dense_d2r_min_cols, dense_d2r_k128_min_cols);
+        if (dense_d2r_en && (int)n_tok >= dense_d2r_effective_min_cols &&
             (out_dim % 128u) == 0 && out_dim >= 2048 &&
-            in_dim <= 4096 && (in_dim % 1024u) == 0 &&
+            in_dim <= 4096 && (in_dim % 128u) == 0 &&
             cuda_q8_aligned_enabled()) {
             const uint64_t q8_al_bytes = ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
             const char *w_al = q8_al_bytes != 0
@@ -19769,34 +20168,40 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
                         (unsigned long long)n_tok, (unsigned long long)in_dim);
             }
         }
-        /* p5c: same producer-q8 shortcut for the mmq tier (attn_q_a /
-         * attn_kv read the just-normed hidden). */
-        {
-            size_t nq8_bytes = 0;
-            void *nq8 = cuda_norm_q8_lookup(x->ptr, n_tok, in_dim, &nq8_bytes);
-            if (nq8) {
-                int prc = ds4_mmq_q8_0_dense_preq(
-                        wptr, nq8, nq8_bytes, (float *)out->ptr,
-                        (int)out_dim, (int)n_tok, (int)in_dim,
-                        ds4_mmq_stream_for_call());
-                if (prc == 0) {
-                    static int logged_mmq_preq = 0;
-                    if (!logged_mmq_preq) {
-                        logged_mmq_preq = 1;
-                        fprintf(stderr, "ds4: dense q8 mmq consuming producer q8 (flat-pool p5c, first label='%s' n_tok=%u)\n",
-                                label ? label : "?", (unsigned)n_tok);
+        if ((in_dim % 256u) == 0) {
+            /* p5c: same producer-q8 shortcut for the mmq tier (attn_q_a /
+             * attn_kv read the just-normed hidden). */
+            {
+                size_t nq8_bytes = 0;
+                void *nq8 = cuda_norm_q8_lookup(
+                        x->ptr, n_tok, in_dim, &nq8_bytes);
+                if (nq8) {
+                    int prc = ds4_mmq_q8_0_dense_preq(
+                            wptr, nq8, nq8_bytes, (float *)out->ptr,
+                            (int)out_dim, (int)n_tok, (int)in_dim,
+                            ds4_mmq_stream_for_call());
+                    if (prc == 0) {
+                        static int logged_mmq_preq = 0;
+                        if (!logged_mmq_preq) {
+                            logged_mmq_preq = 1;
+                            fprintf(stderr, "ds4: dense q8 mmq consuming producer q8 (flat-pool p5c, first label='%s' n_tok=%u)\n",
+                                    label ? label : "?", (unsigned)n_tok);
+                        }
+                        return 1;
                     }
-                    return 1;
                 }
             }
+            int rc = ds4_mmq_q8_0_dense(
+                    wptr, (const float *)x->ptr, (float *)out->ptr,
+                    (int)out_dim, (int)n_tok, (int)in_dim,
+                    /*stream=*/ds4_mmq_stream_for_call());
+            if (rc == 0) return 1;
+            /* On failure, fall through to the legacy paths below. */
+            fprintf(stderr, "ds4: ds4_mmq_q8_0_dense returned %d (label='%s' in=%llu out=%llu n_tok=%llu); falling back\n",
+                    rc, label ? label : "", (unsigned long long)in_dim,
+                    (unsigned long long)out_dim,
+                    (unsigned long long)n_tok);
         }
-        int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
-                                    (int)out_dim, (int)n_tok, (int)in_dim,
-                                    /*stream=*/ds4_mmq_stream_for_call());
-        if (rc == 0) return 1;
-        /* On failure, fall through to the legacy paths below. */
-        fprintf(stderr, "ds4: ds4_mmq_q8_0_dense returned %d (label='%s' in=%llu out=%llu n_tok=%llu); falling back\n",
-                rc, label ? label : "", (unsigned long long)in_dim, (unsigned long long)out_dim, (unsigned long long)n_tok);
     }
 
     const int force_native_attention_output_b =
@@ -21195,6 +21600,42 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 
+extern "C" int ds4_gpu_rms_norm_weight_rows_q8_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+    if (!out || !x || !model_map || weight_offset > model_size ||
+        model_size - weight_offset < (uint64_t)n * sizeof(float) ||
+        out->bytes < (uint64_t)n * rows * sizeof(float) ||
+        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(
+            model_map, weight_offset, (uint64_t)n * sizeof(float),
+            "rms_weight");
+    if (!wptr) return 0;
+    cuda_norm_q8_invalidate(out->ptr);
+    size_t payload = 0;
+    char *q8 = cuda_norm_q8_prepare(rows, n, &payload);
+    if (q8) {
+        rms_norm_weight_q8_kernel<<<rows, 256, 0, ds4_current_stream()>>>(
+                (float *)out->ptr, q8, (const float *)x->ptr,
+                (const float *)wptr, n, rows, eps);
+        if (!cuda_ok(cudaGetLastError(), "rms_norm_weight q8 launch")) {
+            return 0;
+        }
+        cuda_norm_q8_publish(out->ptr, rows, n);
+        static int logged_norm_q8_plain = 0;
+        if (!logged_norm_q8_plain) {
+            logged_norm_q8_plain = 1;
+            fprintf(stderr,
+                    "ds4: norm producer emits f32+q8 (flat-pool p5c, first rows=%u n=%u)\n",
+                    rows, n);
+        }
+        cuda_norm_q8_verify(out, rows, n, payload);
+        return 1;
+    }
+    rms_norm_weight_kernel<<<rows, 256, 0, ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr,
+            (const float *)wptr, n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "rms_norm_weight q8 fallback launch");
+}
+
 /* v0.5 inc-12c: rows entry for the dual-emit twin (see
  * rms_norm_weight_f16pair_kernel).  Returns 0 with both outputs untouched on
  * any precondition miss; the caller then runs the classic entry (and, for
@@ -21214,67 +21655,23 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_f16_tensor(ds4_gpu_tensor *out, ds4_
      * grow-only scratch only ever (re)allocates on this eager prefill
      * path (sticky-scratch law). */
     cuda_norm_q8_invalidate(out->ptr);
-    if (cuda_norm_q8emit_enabled() && rows >= 64u && (n & 127u) == 0u) {
-        const uint32_t nkseg = n >> 7u;
-        const size_t payload = (size_t)rows * nkseg * 144u;
-        const size_t need = payload + 128u * 144u;  /* consumer slack ceiling */
-        if (g_norm_q8_cap < need) {
-            /* Floor the allocation at the batch max chunk (4096 rows) so the
-             * buffer never regrows: the free+malloc pair stalls the stream
-             * ~33 ms (p4 re-receipt trace, 3 gaps totaling 98 ms/boot) and
-             * would recur in serving on the first larger chunk. */
-            const size_t floor_need =
-                (size_t)(rows > 4096u ? rows : 4096u) * nkseg * 144u +
-                128u * 144u;
-            if (g_norm_q8_buf) { cudaFree(g_norm_q8_buf); g_norm_q8_buf = NULL; }
-            g_norm_q8_cap = 0;
-            if (cudaMalloc(&g_norm_q8_buf, floor_need) == cudaSuccess) {
-                g_norm_q8_cap = floor_need;
-            }
-        }
-        if (g_norm_q8_buf) {
+    {
+        size_t payload = 0;
+        char *q8 = cuda_norm_q8_prepare(rows, n, &payload);
+        if (q8) {
             rms_norm_weight_f16q8_kernel<<<rows, 256, 0, ds4_current_stream()>>>(
                     (float *)out->ptr, (__half *)out_f16->ptr,
-                    (char *)g_norm_q8_buf, (const float *)x->ptr,
+                    q8, (const float *)x->ptr,
                     (const float *)wptr, n, rows, eps);
             if (!cuda_ok(cudaGetLastError(), "rms_norm_weight f16q8 launch")) return 0;
-            g_norm_q8_reg.src   = out->ptr;
-            g_norm_q8_reg.y     = g_norm_q8_buf;
-            g_norm_q8_reg.bytes = g_norm_q8_cap;
-            g_norm_q8_reg.rows  = rows;
-            g_norm_q8_reg.n     = n;
+            cuda_norm_q8_publish(out->ptr, rows, n);
             static int logged_norm_q8 = 0;
             if (!logged_norm_q8) {
                 logged_norm_q8 = 1;
                 fprintf(stderr, "ds4: norm producer triple-emits q8 (flat-pool p5c, first rows=%u n=%u)\n",
                         rows, n);
             }
-            if (getenv("DS4_CUDA_NORM_Q8EMIT_VERIFY") != NULL) {
-                /* In-situ byte-diff vs the reference quantizer over the
-                 * just-written f32 rows (p5a instrument pattern). */
-                char *ref = NULL;
-                if (cudaMalloc((void **)&ref, payload) == cudaSuccess) {
-                    if (ds4_mmq_q8_0_quantize_ref((const float *)out->ptr, ref,
-                                                  payload, (int)rows, (int)n,
-                                                  ds4_current_stream()) == 0) {
-                        char *h_ref = (char *)malloc(payload);
-                        char *h_got = (char *)malloc(payload);
-                        if (h_ref && h_got) {
-                            cudaMemcpy(h_ref, ref, payload, cudaMemcpyDeviceToHost);
-                            cudaMemcpy(h_got, g_norm_q8_buf, payload, cudaMemcpyDeviceToHost);
-                            uint64_t bad = 0;
-                            const uint64_t nblk = payload / 144u;
-                            for (uint64_t ib = 0; ib < nblk; ib++) {
-                                if (memcmp(h_ref + ib * 144u, h_got + ib * 144u, 144u) != 0) bad++;
-                            }
-                            fprintf(stderr, "ds4: norm q8emit VERIFY rows=%u blocks=%llu bad=%llu\n",
-                                    rows, (unsigned long long)nblk, (unsigned long long)bad);
-                        }
-                        free(h_ref); free(h_got);
-                    }
-                    cudaFree(ref);
-                }
-            }
+            cuda_norm_q8_verify(out, rows, n, payload);
             return 1;
         }
     }
@@ -24774,6 +25171,660 @@ extern "C" int ds4_gpu_attention_output_low_q8_batch_tensor(
                                                       blocks_a,
                                                       use_dp4a);
     return cuda_ok(cudaGetLastError(), "attention_output_low_q8_batch launch");
+}
+
+extern "C" int ds4_gpu_sigmoid_topk_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        int                     have_bias,
+        uint32_t                n_expert,
+        uint32_t                n_used,
+        uint32_t                n_tokens,
+        float                   weight_scale) {
+    if (!selected || !weights || !logits || n_expert == 0u ||
+        n_expert > 4096u || n_used == 0u ||
+        n_used > n_expert || n_tokens == 0u || !isfinite(weight_scale) ||
+        selected->bytes < (uint64_t)n_tokens * n_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_used * sizeof(float) ||
+        logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float)) {
+        return 0;
+    }
+    const float *bias = NULL;
+    if (have_bias) {
+        if (!model_map || bias_offset > model_size ||
+            (uint64_t)n_expert * sizeof(float) > model_size - bias_offset) {
+            return 0;
+        }
+        bias = (const float *)cuda_model_range_ptr(
+            model_map, bias_offset, (uint64_t)n_expert * sizeof(float),
+            "sigmoid_router_bias");
+        if (!bias) return 0;
+    }
+    const uint32_t shared_bytes = 2u * n_expert * (uint32_t)sizeof(float);
+    sigmoid_topk_router_kernel<<<n_tokens, 128u, shared_bytes,
+                                 ds4_current_stream()>>>(
+        (int32_t *)selected->ptr, (float *)weights->ptr,
+        (const float *)logits->ptr, bias, n_expert, n_used, weight_scale);
+    return cuda_ok(cudaGetLastError(), "sigmoid top-k router launch");
+}
+
+extern "C" int ds4_gpu_swiglu_weighted_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_ff,
+        uint64_t                count) {
+    if (!mid || !gate || !up || !weights || n_ff == 0u || count == 0u ||
+        count > UINT64_MAX / sizeof(float) ||
+        count % n_ff != 0u ||
+        mid->bytes < count * sizeof(float) ||
+        gate->bytes < count * sizeof(float) ||
+        up->bytes < count * sizeof(float) ||
+        weights->bytes < (count / n_ff) * sizeof(float)) {
+        return 0;
+    }
+    swiglu_weighted_kernel<<<(unsigned)((count + 255u) / 256u), 256u, 0,
+                              ds4_current_stream()>>>(
+        (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr,
+        (const float *)weights->ptr, n_ff, count);
+    return cuda_ok(cudaGetLastError(), "weighted SwiGLU launch");
+}
+
+static int routed_matmul_tensor_impl(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used,
+        uint32_t                max_rows_per_expert) {
+    if (!out || !x || !ids || !model_map || in_dim == 0u ||
+        (in_dim & 255u) != 0u || out_dim == 0u || n_expert == 0u ||
+        n_tokens == 0u || n_expert_used == 0u ||
+        n_expert_used > n_expert || in_dim > (uint32_t)INT_MAX ||
+        out_dim > (uint32_t)INT_MAX || n_tokens > (uint32_t)INT_MAX ||
+        n_expert > (uint32_t)INT_MAX || n_expert_used > (uint32_t)INT_MAX ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+        return 0;
+    }
+
+    const uint64_t assignments = (uint64_t)n_tokens * n_expert_used;
+    const uint64_t x_count = (uint64_t)n_tokens * in_dim;
+    if (x_count > UINT64_MAX / sizeof(float) ||
+        assignments > UINT64_MAX / sizeof(int32_t) ||
+        assignments > UINT64_MAX / out_dim ||
+        assignments * out_dim > UINT64_MAX / sizeof(float) ||
+        x->bytes < x_count * sizeof(float) ||
+        ids->bytes < assignments * sizeof(int32_t) ||
+        out->bytes < assignments * out_dim * sizeof(float) ||
+        max_rows_per_expert > assignments ||
+        max_rows_per_expert > (uint32_t)INT_MAX) {
+        return 0;
+    }
+
+    uint32_t block_size = 0u;
+    uint32_t block_width = 256u;
+    switch (weight_type) {
+    case 8u:  block_size = 34u; block_width = 32u; break;  /* Q8_0 */
+    case 10u: block_size = 84u; break;                     /* Q2_K */
+    case 11u: block_size = 110u; break;                    /* Q3_K */
+    case 12u: block_size = 144u; break;                    /* Q4_K */
+    case 16u: block_size = 66u; break;                     /* IQ2_XXS */
+    default:
+        fprintf(stderr, "ds4: routed matmul unsupported weight type %u\n",
+                weight_type);
+        return 0;
+    }
+    if (in_dim % block_width != 0u) return 0;
+    const uint64_t blocks_per_row = in_dim / block_width;
+    if ((uint64_t)n_expert > UINT64_MAX / out_dim ||
+        (uint64_t)n_expert * out_dim > UINT64_MAX / blocks_per_row ||
+        (uint64_t)n_expert * out_dim * blocks_per_row > UINT64_MAX / block_size) {
+        return 0;
+    }
+    const uint64_t required_bytes =
+        (uint64_t)n_expert * out_dim * blocks_per_row * block_size;
+    if (weight_bytes < required_bytes) return 0;
+    if (!ds4_cuda_use_mmq()) {
+        fprintf(stderr, "ds4: routed quantized matmul requires the MMQ tier\n");
+        return 0;
+    }
+
+    const char *weights = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "routed_expert_weights");
+    if (!weights) return 0;
+    const float *xp = (const float *)x->ptr;
+    const int32_t *idp = (const int32_t *)ids->ptr;
+    float *op = (float *)out->ptr;
+    const int M = (int)out_dim;
+    const int K = (int)in_dim;
+    const int NT = (int)n_tokens;
+    const int NE = (int)n_expert;
+    const int NU = (int)n_expert_used;
+    const bool use_vec = assignments <= 8u;
+    const char *bound_global = getenv("DS4_MMQ_EXPERT_BOUND");
+    const char *bound_type = weight_type == 11u
+        ? getenv("DS4_MMQ_Q3_BOUND")
+        : weight_type == 12u ? getenv("DS4_MMQ_Q4_BOUND") : NULL;
+    const bool use_bucket_bound =
+        !use_vec && max_rows_per_expert > 0u &&
+        !(bound_global && bound_global[0] == '0') &&
+        !(bound_type && bound_type[0] == '0');
+    const cudaStream_t stream = ds4_current_stream();
+    int rc = -1;
+    switch (weight_type) {
+    case 8u:
+        rc = use_vec
+            ? ds4_mmq_q8_0_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_q8_0_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        break;
+    case 10u:
+        rc = use_vec
+            ? ds4_mmq_q2_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_q2_K_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        break;
+    case 11u:
+        rc = use_vec
+            ? ds4_mmq_q3_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : use_bucket_bound
+                ? ds4_mmq_q3_K_moe_bounded(
+                      weights, xp, idp, op, M, K, NT, NE, NU,
+                      (int)max_rows_per_expert, stream)
+                : ds4_mmq_q3_K_moe(
+                      weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        if (use_bucket_bound) {
+            static bool logged_q3_bound = false;
+            if (!logged_q3_bound) {
+                logged_q3_bound = true;
+                fprintf(stderr,
+                        "ds4: Q3_K routed MMQ expert-bucket bound active "
+                        "(rows=%llu bound=%u)\n",
+                        (unsigned long long)assignments,
+                        max_rows_per_expert);
+            }
+        }
+        break;
+    case 12u:
+        rc = use_vec
+            ? ds4_mmq_q4_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : use_bucket_bound
+                ? ds4_mmq_q4_K_moe_bounded(
+                      weights, xp, idp, op, M, K, NT, NE, NU,
+                      (int)max_rows_per_expert, stream)
+                : ds4_mmq_q4_K_moe(
+                      weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        if (use_bucket_bound) {
+            static bool logged_q4_bound = false;
+            if (!logged_q4_bound) {
+                logged_q4_bound = true;
+                fprintf(stderr,
+                        "ds4: Q4_K routed MMQ expert-bucket bound active "
+                        "(rows=%llu bound=%u)\n",
+                        (unsigned long long)assignments,
+                        max_rows_per_expert);
+            }
+        }
+        break;
+    case 16u:
+        rc = use_vec
+            ? ds4_mmq_iq2_xxs_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_iq2_xxs_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        break;
+    }
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4: routed matmul type=%u rc=%d (M=%d K=%d tokens=%d used=%d)\n",
+                weight_type, rc, M, K, NT, NU);
+        return 0;
+    }
+    return cuda_ok(cudaGetLastError(), "routed quantized matmul launch");
+}
+
+extern "C" int ds4_gpu_routed_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used) {
+    return routed_matmul_tensor_impl(
+        out, x, ids, model_map, model_size, weight_offset, weight_bytes,
+        weight_type, in_dim, out_dim, n_expert, n_tokens, n_expert_used,
+        /*max_rows_per_expert=*/0u);
+}
+
+extern "C" int ds4_gpu_routed_matmul_bounded_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used,
+        uint32_t                max_rows_per_expert) {
+    if (max_rows_per_expert == 0u) return 0;
+    return routed_matmul_tensor_impl(
+        out, x, ids, model_map, model_size, weight_offset, weight_bytes,
+        weight_type, in_dim, out_dim, n_expert, n_tokens, n_expert_used,
+        max_rows_per_expert);
+}
+
+extern "C" int ds4_gpu_routed_gate_up_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                gate_bytes,
+        uint64_t                up_offset,
+        uint64_t                up_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used) {
+    if (!gate || !up || !x || !ids || !model_map || in_dim == 0u ||
+        out_dim == 0u || n_expert == 0u || n_tokens == 0u ||
+        n_expert_used == 0u || n_expert_used > n_expert ||
+        gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+        up_offset > model_size || up_bytes > model_size - up_offset) {
+        return 0;
+    }
+
+    const uint64_t assignments = (uint64_t)n_tokens * n_expert_used;
+    if (assignments > UINT64_MAX / out_dim ||
+        assignments * out_dim > UINT64_MAX / sizeof(float) ||
+        gate->bytes < assignments * out_dim * sizeof(float) ||
+        up->bytes < assignments * out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    /* Q4_K appears in Solar's shallow and tail routed layers. Pairing here
+     * lets gate/up share the expert map and activation quantize; prefill then
+     * uses the common compact worklist with the top-k bucket bound. */
+    const char *q4_pair_env = getenv("DS4_MMQ_Q4_PAIR");
+    const bool q4_pair_enabled =
+        !(q4_pair_env && q4_pair_env[0] == '0');
+    if (weight_type == 12u && in_dim % 256u == 0u &&
+        gate_bytes == up_bytes && ds4_cuda_use_mmq() && q4_pair_enabled) {
+        const uint64_t blocks_per_row = in_dim / 256u;
+        bool q4_shape_ok = (uint64_t)n_expert <= UINT64_MAX / out_dim;
+        uint64_t required_bytes = 0u;
+        if (q4_shape_ok) {
+            const uint64_t expert_rows = (uint64_t)n_expert * out_dim;
+            q4_shape_ok = expert_rows <= UINT64_MAX / blocks_per_row;
+            if (q4_shape_ok) {
+                const uint64_t blocks = expert_rows * blocks_per_row;
+                q4_shape_ok = blocks <= UINT64_MAX / 144u;
+                if (q4_shape_ok) required_bytes = blocks * 144u;
+            }
+        }
+        if (q4_shape_ok && gate_bytes >= required_bytes) {
+            const char *gate_raw = cuda_model_range_ptr(
+                model_map, gate_offset, gate_bytes,
+                "routed_gate_q4_pair_weights");
+            const char *up_raw = cuda_model_range_ptr(
+                model_map, up_offset, up_bytes,
+                "routed_up_q4_pair_weights");
+            if (gate_raw && up_raw) {
+                const cudaStream_t stream = ds4_mmq_stream_for_call();
+                const int rc = n_tokens == 1u
+                    ? ds4_mmq_q4_K_moe_pair_raw_vec(
+                          gate_raw, up_raw,
+                          (const float *)x->ptr, (const int32_t *)ids->ptr,
+                          (float *)gate->ptr, (float *)up->ptr,
+                          (int)out_dim, (int)in_dim, (int)n_tokens,
+                          (int)n_expert, (int)n_expert_used, stream)
+                    : ds4_mmq_q4_K_moe_pair_bounded(
+                          gate_raw, up_raw,
+                          (const float *)x->ptr, (const int32_t *)ids->ptr,
+                          (float *)gate->ptr, (float *)up->ptr,
+                          (int)out_dim, (int)in_dim, (int)n_tokens,
+                          (int)n_expert, (int)n_expert_used,
+                          (int)n_tokens, stream);
+                if (rc == 0) {
+                    static bool logged_q4_pair = false;
+                    if (!logged_q4_pair) {
+                        logged_q4_pair = true;
+                        fprintf(stderr,
+                                "ds4: routed gate/up using Q4_K pair (%s)\n",
+                                n_tokens == 1u ? "decode" : "bounded prefill");
+                    }
+                    return cuda_ok(cudaGetLastError(),
+                                   "routed Q4_K gate/up pair launch");
+                }
+            }
+        }
+    }
+
+    if (weight_type != 16u || (in_dim & 1023u) != 0u ||
+        gate_bytes != up_bytes || !ds4_cuda_use_mmq()) {
+        return ds4_gpu_routed_matmul_tensor(
+                    gate, x, ids, model_map, model_size,
+                    gate_offset, gate_bytes, weight_type,
+                    in_dim, out_dim, n_expert, n_tokens, n_expert_used) &&
+               ds4_gpu_routed_matmul_tensor(
+                    up, x, ids, model_map, model_size,
+                    up_offset, up_bytes, weight_type,
+                    in_dim, out_dim, n_expert, n_tokens, n_expert_used);
+    }
+
+    const uint64_t aligned_bytes = ds4_mmq_iq2_xxs_aligned_bytes(
+            (int)out_dim, (int)in_dim, (int)n_expert);
+    const char *gate_aligned = aligned_bytes
+        ? cuda_derived_weight_ptr(
+              model_map, gate_offset, gate_bytes,
+              CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+              in_dim, out_dim, n_expert, aligned_bytes,
+              "routed_gate_iq2_aligned")
+        : NULL;
+    const char *up_aligned = aligned_bytes
+        ? cuda_derived_weight_ptr(
+              model_map, up_offset, up_bytes,
+              CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+              in_dim, out_dim, n_expert, aligned_bytes,
+              "routed_up_iq2_aligned")
+        : NULL;
+
+    const cudaStream_t stream = ds4_mmq_stream_for_call();
+    int rc = -1;
+    if (gate_aligned && up_aligned && cuda_moe_iq2_aligned_enabled()) {
+        if (n_tokens == 1u) {
+            rc = ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
+                    gate_aligned, up_aligned,
+                    (const float *)x->ptr, (const int32_t *)ids->ptr,
+                    (float *)gate->ptr, (float *)up->ptr,
+                    (int)out_dim, (int)in_dim, (int)n_tokens,
+                    (int)n_expert, (int)n_expert_used, stream);
+        } else {
+            rc = ds4_mmq_iq2_xxs_moe_pair_soa(
+                    gate_aligned, up_aligned,
+                    (const float *)x->ptr, (const int32_t *)ids->ptr,
+                    (float *)gate->ptr, (float *)up->ptr,
+                    (int)out_dim, (int)in_dim, (int)n_tokens,
+                    (int)n_expert, (int)n_expert_used, stream);
+        }
+        if (rc == 0) {
+            static int logged = 0;
+            if (!logged) {
+                logged = 1;
+                fprintf(stderr,
+                        "ds4: routed gate/up using aligned IQ2 pair (%s)\n",
+                        n_tokens == 1u ? "decode" : "prefill");
+            }
+            return cuda_ok(cudaGetLastError(),
+                           "aligned routed gate/up pair launch");
+        }
+    }
+
+    const char *gate_raw = NULL;
+    const char *up_raw = NULL;
+    if (gate_aligned && up_aligned && cuda_moe_iq2_aligned_enabled()) {
+        gate_raw = cuda_moe_iq2_derepack_scratch(
+                0, gate_aligned, gate_offset, gate_bytes,
+                out_dim, in_dim, n_expert, stream);
+        up_raw = gate_raw ? cuda_moe_iq2_derepack_scratch(
+                1, up_aligned, up_offset, up_bytes,
+                out_dim, in_dim, n_expert, stream) : NULL;
+    }
+    if (!gate_raw) {
+        gate_raw = cuda_model_range_ptr(model_map, gate_offset, gate_bytes,
+                                        "routed_gate_weights");
+    }
+    if (!up_raw) {
+        up_raw = cuda_model_range_ptr(model_map, up_offset, up_bytes,
+                                      "routed_up_weights");
+    }
+    if (!gate_raw || !up_raw) return 0;
+    rc = ds4_mmq_iq2_xxs_moe_pair(
+            gate_raw, up_raw,
+            (const float *)x->ptr, (const int32_t *)ids->ptr,
+            (float *)gate->ptr, (float *)up->ptr,
+            (int)out_dim, (int)in_dim, (int)n_tokens,
+            (int)n_expert, (int)n_expert_used, stream);
+    return rc == 0 && cuda_ok(cudaGetLastError(),
+                              "routed gate/up pair launch");
+}
+
+static unsigned long long g_moe_iq2_q3_handoff_launches = 0;
+
+/* The handoff is an adopted production prefill path. Unset and exactly "1"
+ * enable it; exactly "0" and every other explicit value conservatively
+ * disable it before any CUDA work is submitted. */
+static bool cuda_moe_iq2_q3_handoff_enabled(void) {
+    const char *policy = getenv("DS4_CUDA_MOE_IQ2_Q3_HANDOFF");
+    return policy == nullptr ||
+           (policy[0] == '1' && policy[1] == '\0');
+}
+
+static bool cuda_q8_d4_bytes(uint64_t value_count, uint64_t *bytes) {
+    constexpr uint64_t values_per_block = 128u;
+    constexpr uint64_t bytes_per_block = 144u;
+    if (!bytes || value_count % values_per_block != 0u) return false;
+    const uint64_t blocks = value_count / values_per_block;
+    if (blocks > UINT64_MAX / bytes_per_block) return false;
+    *bytes = blocks * bytes_per_block;
+    return true;
+}
+
+extern "C" unsigned long long ds4_cuda_moe_iq2_q3_handoff_launches(void) {
+    return g_moe_iq2_q3_handoff_launches;
+}
+
+extern "C" int ds4_gpu_swiglu_weighted_q8_d4_emit_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, const ds4_gpu_tensor *router_weights,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim,
+        uint32_t n_assign) {
+    if (!q8_out || !gate || !up || !router_weights || !ids_dst ||
+        mid_dim == 0u || (mid_dim & 255u) != 0u || n_assign == 0u ||
+        mid_dim > (uint32_t)INT_MAX || n_assign > (uint32_t)INT_MAX ||
+        (uint64_t)n_assign > UINT64_MAX / mid_dim) return 0;
+    const uint64_t count = (uint64_t)n_assign * mid_dim;
+    if (count > UINT64_MAX / sizeof(float)) return 0;
+    uint64_t q8_bytes = 0;
+    if (!cuda_q8_d4_bytes(count, &q8_bytes)) return 0;
+    if (gate->bytes < count * sizeof(float) ||
+        up->bytes < count * sizeof(float) ||
+        router_weights->bytes < (uint64_t)n_assign * sizeof(float) ||
+        ids_dst->bytes < (uint64_t)n_assign * sizeof(int32_t) ||
+        q8_out->bytes < q8_bytes) return 0;
+    return ds4_mmq_swiglu_weighted_q8_d4_emit_test(
+        (const float *)gate->ptr, (const float *)up->ptr,
+        (const float *)router_weights->ptr,
+        (const int32_t *)ids_dst->ptr, q8_out->ptr,
+        (int)mid_dim, (int)n_assign, ds4_mmq_stream_for_call()) == 0;
+}
+
+extern "C" int ds4_gpu_q3_quantize_ref_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim,
+        uint32_t n_assign) {
+    if (!q8_out || !mid || !ids_dst || mid_dim == 0u ||
+        (mid_dim & 255u) != 0u || n_assign == 0u ||
+        mid_dim > (uint32_t)INT_MAX || n_assign > (uint32_t)INT_MAX ||
+        (uint64_t)n_assign > UINT64_MAX / mid_dim) return 0;
+    const uint64_t count = (uint64_t)n_assign * mid_dim;
+    if (count > UINT64_MAX / sizeof(float)) return 0;
+    uint64_t q8_bytes = 0;
+    if (!cuda_q8_d4_bytes(count, &q8_bytes)) return 0;
+    if (mid->bytes < count * sizeof(float) ||
+        ids_dst->bytes < (uint64_t)n_assign * sizeof(int32_t) ||
+        q8_out->bytes < q8_bytes) return 0;
+    return ds4_mmq_q3_K_quantize_ref(
+        (const float *)mid->ptr, (const int32_t *)ids_dst->ptr,
+        q8_out->ptr, (int)mid_dim, (int)n_assign,
+        ds4_mmq_stream_for_call()) == 0;
+}
+
+extern "C" int ds4_gpu_q3_worklist_preflight_test(
+        int32_t out_dim, int32_t mid_dim, int64_t n_assign,
+        int32_t n_expert, int64_t stride_row, int64_t stride_expert) {
+    return ds4_mmq_q3_K_worklist_preflight_test(
+        (int)out_dim, (int)mid_dim, n_assign, (int)n_expert,
+        stride_row, stride_expert);
+}
+
+extern "C" int ds4_gpu_routed_iq2_q3_handoff_tensor(
+        ds4_gpu_tensor *down, ds4_gpu_tensor *gate_scratch,
+        ds4_gpu_tensor *up_scratch, ds4_gpu_tensor *q8_scratch,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *router_weights,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t gate_bytes,
+        uint64_t up_offset, uint64_t up_bytes,
+        uint64_t down_offset, uint64_t down_bytes,
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        uint32_t n_expert, uint32_t n_tokens, uint32_t n_expert_used) {
+    if (!cuda_moe_iq2_q3_handoff_enabled() ||
+        !down || !gate_scratch || !up_scratch || !q8_scratch || !x ||
+        !ids || !router_weights || !model_map || gate_type != 16u ||
+        down_type != 11u || n_tokens < 512u || n_expert == 0u ||
+        n_expert_used == 0u || n_expert_used > n_expert ||
+        n_tokens >= (1u << 22) || n_expert_used >= (1u << 10) ||
+        in_dim > (uint32_t)INT_MAX || mid_dim > (uint32_t)INT_MAX ||
+        out_dim > (uint32_t)INT_MAX || n_expert > 32768u ||
+        n_tokens > (uint32_t)INT_MAX ||
+        n_expert_used > (uint32_t)INT_MAX ||
+        in_dim == 0u || (in_dim & 255u) != 0u ||
+        mid_dim == 0u || (mid_dim & 255u) != 0u || out_dim == 0u ||
+        gate_bytes != up_bytes || gate_offset > model_size ||
+        gate_bytes > model_size - gate_offset || up_offset > model_size ||
+        up_bytes > model_size - up_offset || down_offset > model_size ||
+        down_bytes > model_size - down_offset || !ds4_cuda_use_mmq() ||
+        !cuda_moe_iq2_aligned_enabled() ||
+        !cuda_mmq_aligned_tiles_enabled() ||
+        q8_scratch->bytes > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    if ((uint64_t)n_tokens > UINT64_MAX / n_expert_used) return 0;
+    const uint64_t assignments = (uint64_t)n_tokens * n_expert_used;
+    const uint64_t d2r_capacity64 =
+        (assignments + 63u) / 64u + (uint64_t)n_expert;
+    if (d2r_capacity64 > 65535u) return 0;
+    if (assignments > UINT64_MAX / mid_dim ||
+        assignments > UINT64_MAX / out_dim) return 0;
+    const uint64_t mid_count = assignments * mid_dim;
+    const uint64_t down_count = assignments * out_dim;
+    if (mid_count > (uint64_t)INT_MAX ||
+        mid_count > UINT64_MAX / sizeof(float) ||
+        down_count > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_tokens > UINT64_MAX / in_dim ||
+        (uint64_t)n_tokens * in_dim > UINT64_MAX / sizeof(float) ||
+        x->bytes < (uint64_t)n_tokens * in_dim * sizeof(float) ||
+        ids->bytes < assignments * sizeof(int32_t) ||
+        router_weights->bytes < assignments * sizeof(float) ||
+        gate_scratch->bytes < mid_count * sizeof(float) ||
+        up_scratch->bytes < mid_count * sizeof(float) ||
+        down->bytes < down_count * sizeof(float)) {
+        return 0;
+    }
+    /* routed_mid is the only reused scratch view. Its declared tensor bytes
+     * are the authoritative logical span (not the surrounding arena cap).
+     * The low-level preflight applies the architecture-specific MMQ slack. */
+    uint64_t q8_payload = 0;
+    constexpr uint64_t q8_slack = 128u * 144u;
+    if (!cuda_q8_d4_bytes(mid_count, &q8_payload) ||
+        q8_payload > UINT64_MAX - q8_slack ||
+        q8_scratch->bytes < q8_payload + q8_slack) {
+        return 0;
+    }
+    const uint64_t iq2_blocks_per_row = in_dim / 256u;
+    const uint64_t q3_blocks_per_row = mid_dim / 256u;
+    if ((uint64_t)n_expert > UINT64_MAX / mid_dim ||
+        (uint64_t)n_expert * mid_dim > UINT64_MAX / iq2_blocks_per_row ||
+        (uint64_t)n_expert > UINT64_MAX / out_dim ||
+        (uint64_t)n_expert * out_dim > UINT64_MAX / q3_blocks_per_row) {
+        return 0;
+    }
+    const uint64_t iq2_blocks =
+        (uint64_t)n_expert * mid_dim * iq2_blocks_per_row;
+    const uint64_t q3_blocks =
+        (uint64_t)n_expert * out_dim * q3_blocks_per_row;
+    /* The aligned IQ2 artifact rounds its 2-byte scale plane up to 64 bytes,
+     * then appends 64 bytes per block. Reserve the worst-case 63-byte round-up
+     * before calling the lower-level size helper. */
+    if (iq2_blocks > (UINT64_MAX - 63u) / 66u ||
+        q3_blocks > UINT64_MAX / 110u ||
+        gate_bytes < iq2_blocks * 66u || down_bytes < q3_blocks * 110u) {
+        return 0;
+    }
+
+    const uint64_t aligned_bytes = ds4_mmq_iq2_xxs_aligned_bytes(
+        (int)mid_dim, (int)in_dim, (int)n_expert);
+    const char *gate_aligned = aligned_bytes
+        ? cuda_derived_weight_ptr(
+              model_map, gate_offset, gate_bytes,
+              CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+              in_dim, mid_dim, n_expert, aligned_bytes,
+              "iq2_q3_gate_aligned")
+        : NULL;
+    const char *up_aligned = aligned_bytes
+        ? cuda_derived_weight_ptr(
+              model_map, up_offset, up_bytes,
+              CUDA_DERIVED_IQ2_XXS_ALIGNED_MOE,
+              in_dim, mid_dim, n_expert, aligned_bytes,
+              "iq2_q3_up_aligned")
+        : NULL;
+    const char *down_q3 = cuda_model_range_ptr(
+        model_map, down_offset, down_bytes, "iq2_q3_down_q3");
+    if (!gate_aligned || !up_aligned || !down_q3) return 0;
+
+    const int rc = ds4_mmq_iq2_xxs_q3_K_moe_handoff_soa(
+        gate_aligned, up_aligned, down_q3,
+        (const float *)x->ptr, (const int32_t *)ids->ptr,
+        (const float *)router_weights->ptr,
+        (float *)gate_scratch->ptr, (float *)up_scratch->ptr,
+        q8_scratch->ptr, (size_t)q8_scratch->bytes,
+        (float *)down->ptr, (int)mid_dim, (int)in_dim, (int)out_dim,
+        (int)n_tokens, (int)n_expert, (int)n_expert_used,
+        ds4_mmq_stream_for_call());
+    if (rc == -1) return 0;
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4: IQ2/Q3 shared-map handoff failed after launch rc=%d\n",
+                rc);
+        return -1;
+    }
+    ++g_moe_iq2_q3_handoff_launches;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr,
+                "ds4: IQ2/Q3 shared-map D4 handoff engaged "
+                "(default on; DS4_CUDA_MOE_IQ2_Q3_HANDOFF=0 disables; "
+                "tokens=%u mid=%u)\n", n_tokens, mid_dim);
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
@@ -31499,4 +32550,3066 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
         ds4_gpu_tensor_free(out_row);
     }
     return ok;
+}
+
+/* Solar Open2 full-attention KV correctness path. A row is self-contained so
+ * snapshots can copy live rows verbatim:
+ *
+ *   BF16       [K f16][V f16]
+ *   FP8        [K e4m3][V e4m3][K scales f16][V scales f16]
+ *   FP4        [K e2m1 packed][V e2m1 packed][K scales][V scales]
+ *   K8/V4      [K e4m3][V e2m1 packed][K scales][V scales]
+ *
+ * Scales are per position, K/V, and KV head. The attention kernel below is a
+ * deliberately ordinary-CUDA oracle/fallback. Optimized GB10 kernels can
+ * replace its launch sites without leaking model policy into the scheduler.
+ */
+static uint64_t solar_kv_row_bytes_impl(
+        uint32_t format,
+        uint32_t n_head_kv,
+        uint32_t head_dim) {
+    if (n_head_kv == 0u || head_dim == 0u) return 0u;
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    switch (format) {
+    case DS4_SOLAR_KV_BF16:
+        return kv_dim * 2u * sizeof(__half);
+    case DS4_SOLAR_KV_FP8:
+        return kv_dim * 2u + (uint64_t)n_head_kv * 2u * sizeof(__half);
+    case DS4_SOLAR_KV_FP4:
+        if ((head_dim & 1u) != 0u) return 0u;
+        return kv_dim + (uint64_t)n_head_kv * 2u * sizeof(__half);
+    case DS4_SOLAR_KV_KFP8_VFP4:
+        if ((head_dim & 1u) != 0u) return 0u;
+        return kv_dim + kv_dim / 2u +
+               (uint64_t)n_head_kv * 2u * sizeof(__half);
+    default:
+        return 0u;
+    }
+}
+
+static __device__ uint8_t solar_e4m3fn_encode(float x) {
+    if (!isfinite(x) || x == 0.0f) return 0u;
+    const uint8_t sign = x < 0.0f ? 0x80u : 0u;
+    const float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value_dev(mid) <= ax) lo = mid;
+        else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        const float bd = fabsf(ax - dsv4_e4m3fn_value_dev(best));
+        const float nd = fabsf(ax - dsv4_e4m3fn_value_dev(best + 1));
+        if (nd < bd ||
+            (nd == bd && (((best + 1) & 1) == 0) && ((best & 1) != 0))) {
+            best++;
+        }
+    }
+    return sign | (uint8_t)best;
+}
+
+static __device__ __forceinline__ float solar_e4m3fn_decode(uint8_t code) {
+    __nv_fp8_e4m3 value;
+    value.__x = code;
+    return (float)value;
+}
+
+static __device__ uint8_t solar_e2m1_encode(float x) {
+    if (!isfinite(x) || x == 0.0f) return 0u;
+    const uint8_t sign = x < 0.0f ? 0x8u : 0u;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - dsv4_e2m1fn_value_dev(0));
+    for (int i = 1; i < 8; i++) {
+        const float diff = fabsf(ax - dsv4_e2m1fn_value_dev(i));
+        if (diff < best_diff ||
+            (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign | (uint8_t)best;
+}
+
+static __device__ __forceinline__ float solar_e2m1_decode(uint8_t code) {
+    __nv_fp4_e2m1 value;
+    value.__x = code & 0x0fu;
+    return (float)value;
+}
+
+static __device__ float solar_scale_to_f16(
+        float amax, float quant_max, __half *stored) {
+    float scale = isfinite(amax) && amax > 0.0f ? amax / quant_max : 1.0f;
+    if (scale > 65504.0f) scale = 65504.0f;
+    __half half_scale = __float2half(scale);
+    float rounded = __half2float(half_scale);
+    if (!(rounded > 0.0f) || !isfinite(rounded)) {
+        half_scale = __float2half(5.960464477539063e-8f);
+        rounded = __half2float(half_scale);
+    }
+    *stored = half_scale;
+    return rounded;
+}
+
+static __global__ void solar_kv_store_bf16_kernel(
+        __half       *kv,
+        const float  *k,
+        const float  *v,
+        uint64_t      kv_dim,
+        uint32_t      n_tokens,
+        uint32_t      pos0,
+        uint32_t      kv_cap) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = kv_dim * n_tokens;
+    if (i >= count) return;
+    const uint32_t token = (uint32_t)(i / kv_dim);
+    const uint64_t elem = i - (uint64_t)token * kv_dim;
+    __half *row = kv + (uint64_t)((pos0 + token) % kv_cap) * kv_dim * 2u;
+    row[elem] = __float2half(k[i]);
+    row[kv_dim + elem] = __float2half(v[i]);
+}
+
+static __global__ void solar_kv_store_compressed_kernel(
+        uint8_t     *kv,
+        const float *k,
+        const float *v,
+        uint32_t     n_head_kv,
+        uint32_t     head_dim,
+        uint32_t     n_tokens,
+        uint32_t     pos0,
+        uint32_t     kv_cap,
+        uint32_t     format,
+        uint64_t     row_bytes) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    if (token >= n_tokens || head >= n_head_kv) return;
+
+    const uint32_t tid = threadIdx.x;
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    const uint64_t src = ((uint64_t)token * n_head_kv + head) * head_dim;
+    const uint32_t slot = (pos0 + token) % kv_cap;
+    uint8_t *row = kv + (uint64_t)slot * row_bytes;
+
+    __shared__ float k_abs[256];
+    __shared__ float v_abs[256];
+    float kmax = 0.0f, vmax = 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        const float kx = k[src + d];
+        const float vx = v[src + d];
+        if (isfinite(kx)) kmax = fmaxf(kmax, fabsf(kx));
+        if (isfinite(vx)) vmax = fmaxf(vmax, fabsf(vx));
+    }
+    k_abs[tid] = kmax;
+    v_abs[tid] = vmax;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            k_abs[tid] = fmaxf(k_abs[tid], k_abs[tid + stride]);
+            v_abs[tid] = fmaxf(v_abs[tid], v_abs[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    const uint64_t k_bytes =
+        format == DS4_SOLAR_KV_FP4 ? kv_dim / 2u : kv_dim;
+    const uint64_t v_bytes =
+        format == DS4_SOLAR_KV_FP8 ? kv_dim : kv_dim / 2u;
+    __half *scales = (__half *)(row + k_bytes + v_bytes);
+    __shared__ float kscale, vscale;
+    if (tid == 0u) {
+        kscale = solar_scale_to_f16(
+            k_abs[0], format == DS4_SOLAR_KV_FP4 ? 6.0f : 448.0f,
+            &scales[head]);
+        vscale = solar_scale_to_f16(
+            v_abs[0], format == DS4_SOLAR_KV_FP8 ? 448.0f : 6.0f,
+            &scales[n_head_kv + head]);
+    }
+    __syncthreads();
+
+    const uint64_t head0 = (uint64_t)head * head_dim;
+    if (format == DS4_SOLAR_KV_FP8 ||
+        format == DS4_SOLAR_KV_KFP8_VFP4) {
+        for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+            row[head0 + d] = solar_e4m3fn_encode(k[src + d] / kscale);
+        }
+    } else {
+        for (uint32_t pair = tid; pair < head_dim / 2u;
+             pair += blockDim.x) {
+            const uint32_t d = pair * 2u;
+            const uint8_t lo = solar_e2m1_encode(k[src + d] / kscale);
+            const uint8_t hi = solar_e2m1_encode(k[src + d + 1u] / kscale);
+            row[head0 / 2u + pair] = lo | (uint8_t)(hi << 4u);
+        }
+    }
+
+    uint8_t *vdata = row + k_bytes;
+    if (format == DS4_SOLAR_KV_FP8) {
+        for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+            vdata[head0 + d] = solar_e4m3fn_encode(v[src + d] / vscale);
+        }
+    } else {
+        for (uint32_t pair = tid; pair < head_dim / 2u;
+             pair += blockDim.x) {
+            const uint32_t d = pair * 2u;
+            const uint8_t lo = solar_e2m1_encode(v[src + d] / vscale);
+            const uint8_t hi = solar_e2m1_encode(v[src + d + 1u] / vscale);
+            vdata[head0 / 2u + pair] = lo | (uint8_t)(hi << 4u);
+        }
+    }
+}
+
+static __global__ void solar_kv_store_banks_bf16_kernel(
+        uint8_t        *kv_slab,
+        const uint32_t *bank_ids,
+        const uint32_t *positions,
+        const float    *k,
+        const float    *v,
+        uint64_t        bank_stride,
+        uint64_t        kv_dim,
+        uint32_t        n_tokens,
+        uint32_t        max_banks,
+        uint32_t        kv_cap) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = kv_dim * n_tokens;
+    if (i >= count) return;
+    const uint32_t token = (uint32_t)(i / kv_dim);
+    const uint32_t bank = bank_ids[token];
+    const uint32_t pos = positions[token];
+    if (bank >= max_banks || pos >= kv_cap) return;
+    const uint64_t elem = i - (uint64_t)token * kv_dim;
+    __half *row = (__half *)(kv_slab + (uint64_t)bank * bank_stride) +
+                  (uint64_t)pos * kv_dim * 2u;
+    row[elem] = __float2half(k[i]);
+    row[kv_dim + elem] = __float2half(v[i]);
+}
+
+static __global__ void solar_kv_store_banks_compressed_kernel(
+        uint8_t        *kv_slab,
+        const uint32_t *bank_ids,
+        const uint32_t *positions,
+        const float    *k,
+        const float    *v,
+        uint64_t        bank_stride,
+        uint32_t        n_head_kv,
+        uint32_t        head_dim,
+        uint32_t        n_tokens,
+        uint32_t        max_banks,
+        uint32_t        kv_cap,
+        uint32_t        format,
+        uint64_t        row_bytes) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    if (token >= n_tokens || head >= n_head_kv) return;
+    const uint32_t bank = bank_ids[token];
+    const uint32_t pos = positions[token];
+    if (bank >= max_banks || pos >= kv_cap) return;
+
+    const uint32_t tid = threadIdx.x;
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    const uint64_t src = ((uint64_t)token * n_head_kv + head) * head_dim;
+    uint8_t *row = kv_slab + (uint64_t)bank * bank_stride +
+                   (uint64_t)pos * row_bytes;
+
+    __shared__ float k_abs[256];
+    __shared__ float v_abs[256];
+    float kmax = 0.0f, vmax = 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        const float kx = k[src + d];
+        const float vx = v[src + d];
+        if (isfinite(kx)) kmax = fmaxf(kmax, fabsf(kx));
+        if (isfinite(vx)) vmax = fmaxf(vmax, fabsf(vx));
+    }
+    k_abs[tid] = kmax;
+    v_abs[tid] = vmax;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            k_abs[tid] = fmaxf(k_abs[tid], k_abs[tid + stride]);
+            v_abs[tid] = fmaxf(v_abs[tid], v_abs[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    const uint64_t k_bytes =
+        format == DS4_SOLAR_KV_FP4 ? kv_dim / 2u : kv_dim;
+    const uint64_t v_bytes =
+        format == DS4_SOLAR_KV_FP8 ? kv_dim : kv_dim / 2u;
+    __half *scales = (__half *)(row + k_bytes + v_bytes);
+    __shared__ float kscale, vscale;
+    if (tid == 0u) {
+        kscale = solar_scale_to_f16(
+            k_abs[0], format == DS4_SOLAR_KV_FP4 ? 6.0f : 448.0f,
+            &scales[head]);
+        vscale = solar_scale_to_f16(
+            v_abs[0], format == DS4_SOLAR_KV_FP8 ? 448.0f : 6.0f,
+            &scales[n_head_kv + head]);
+    }
+    __syncthreads();
+
+    const uint64_t head0 = (uint64_t)head * head_dim;
+    if (format == DS4_SOLAR_KV_FP8 ||
+        format == DS4_SOLAR_KV_KFP8_VFP4) {
+        for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+            row[head0 + d] = solar_e4m3fn_encode(k[src + d] / kscale);
+        }
+    } else {
+        for (uint32_t pair = tid; pair < head_dim / 2u;
+             pair += blockDim.x) {
+            const uint32_t d = pair * 2u;
+            const uint8_t lo = solar_e2m1_encode(k[src + d] / kscale);
+            const uint8_t hi = solar_e2m1_encode(k[src + d + 1u] / kscale);
+            row[head0 / 2u + pair] = lo | (uint8_t)(hi << 4u);
+        }
+    }
+
+    uint8_t *vdata = row + k_bytes;
+    if (format == DS4_SOLAR_KV_FP8) {
+        for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+            vdata[head0 + d] = solar_e4m3fn_encode(v[src + d] / vscale);
+        }
+    } else {
+        for (uint32_t pair = tid; pair < head_dim / 2u;
+             pair += blockDim.x) {
+            const uint32_t d = pair * 2u;
+            const uint8_t lo = solar_e2m1_encode(v[src + d] / vscale);
+            const uint8_t hi = solar_e2m1_encode(v[src + d + 1u] / vscale);
+            vdata[head0 / 2u + pair] = lo | (uint8_t)(hi << 4u);
+        }
+    }
+}
+
+static __device__ __forceinline__ float solar_kv_load(
+        const uint8_t *row,
+        uint32_t       format,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_head,
+        uint32_t       dim,
+        bool           value) {
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    const uint64_t elem = (uint64_t)kv_head * head_dim + dim;
+    if (format == DS4_SOLAR_KV_BF16) {
+        const __half *data = (const __half *)row;
+        return __half2float(data[(value ? kv_dim : 0u) + elem]);
+    }
+    const uint64_t k_bytes =
+        format == DS4_SOLAR_KV_FP4 ? kv_dim / 2u : kv_dim;
+    const uint64_t v_bytes =
+        format == DS4_SOLAR_KV_FP8 ? kv_dim : kv_dim / 2u;
+    const __half *scales = (const __half *)(row + k_bytes + v_bytes);
+    const float scale =
+        __half2float(scales[(value ? n_head_kv : 0u) + kv_head]);
+    const uint8_t *data = value ? row + k_bytes : row;
+    const bool fp8 = value ? format == DS4_SOLAR_KV_FP8
+                           : format != DS4_SOLAR_KV_FP4;
+    if (fp8) return solar_e4m3fn_decode(data[elem]) * scale;
+    const uint8_t packed = data[elem >> 1u];
+    const uint8_t code = (elem & 1u) ? packed >> 4u : packed & 0x0fu;
+    return solar_e2m1_decode(code) * scale;
+}
+
+static __device__ void solar_attention_range(
+        float         *out,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       kv_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        float          scale,
+        float         *out_max,
+        float         *out_sum) {
+    const uint32_t dim = threadIdx.x;
+    __shared__ float reduce[256];
+    __shared__ float running_max;
+    __shared__ float running_sum;
+    __shared__ float rescale;
+    __shared__ float weight;
+    float acc = 0.0f;
+    if (dim == 0u) {
+        running_max = -INFINITY;
+        running_sum = 0.0f;
+    }
+    __syncthreads();
+
+    const float qv = dim < head_dim ? q[dim] : 0.0f;
+    for (uint32_t pos = first; pos <= last; pos++) {
+        const uint8_t *row = kv + (uint64_t)(pos % kv_cap) * row_bytes;
+        reduce[dim] = dim < head_dim
+            ? qv * solar_kv_load(row, format, n_head_kv, head_dim,
+                                 kv_head, dim, false)
+            : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+            if (dim < stride) reduce[dim] += reduce[dim + stride];
+            __syncthreads();
+        }
+        if (dim == 0u) {
+            const float score = reduce[0] * scale;
+            const float next_max = fmaxf(running_max, score);
+            rescale = running_max == -INFINITY
+                ? 0.0f : __expf(running_max - next_max);
+            weight = __expf(score - next_max);
+            running_sum = running_sum * rescale + weight;
+            running_max = next_max;
+        }
+        __syncthreads();
+        if (dim < head_dim) {
+            acc = acc * rescale +
+                  weight * solar_kv_load(row, format, n_head_kv, head_dim,
+                                         kv_head, dim, true);
+        }
+        __syncthreads();
+    }
+    if (dim < head_dim && out) {
+        out[dim] = running_sum > 0.0f ? acc / running_sum : 0.0f;
+    }
+    if (dim == 0u) {
+        if (out_max) *out_max = running_max;
+        if (out_sum) *out_sum = running_sum;
+    }
+    __syncthreads();
+    if (dim < head_dim && out_max) out[dim] = acc;
+}
+
+/* The scalar anchor above assigns one thread to each head dimension and
+ * reduces every key with block-wide barriers.  That is a useful portability
+ * fallback, but it serializes the entire KV scan.  The production Solar head
+ * widths are multiples of a warp: give each warp independent key positions,
+ * use shuffles for Q.K, then merge the per-warp online-softmax states once at
+ * the end.  DPL is the number of 32-wide dimension slices owned by a lane. */
+template <int DPL>
+static __device__ __forceinline__ void solar_attention_warp_range(
+        float         *out,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       kv_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        float          scale,
+        float         *out_max,
+        float         *out_sum) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t nwarps = blockDim.x >> 5u;
+    float qv[DPL];
+    float acc[DPL];
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        const uint32_t dim = lane + (uint32_t)d * 32u;
+        qv[d] = q[dim];
+        acc[d] = 0.0f;
+    }
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    for (uint32_t pos = first + warp; pos <= last; pos += nwarps) {
+        const uint8_t *row = kv + (uint64_t)(pos % kv_cap) * row_bytes;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            dot += qv[d] * solar_kv_load(
+                row, format, n_head_kv, head_dim, kv_head, dim, false);
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+        }
+        const float score = dot * scale;
+        const float next_max = fmaxf(running_max, score);
+        const float rescale = running_max == -INFINITY
+            ? 0.0f : __expf(running_max - next_max);
+        const float weight = __expf(score - next_max);
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            acc[d] = acc[d] * rescale + weight * solar_kv_load(
+                row, format, n_head_kv, head_dim, kv_head, dim, true);
+        }
+        running_sum = running_sum * rescale + weight;
+        running_max = next_max;
+    }
+
+    __shared__ float warp_max[8];
+    __shared__ float warp_sum[8];
+    extern __shared__ float warp_acc[];
+    if (lane == 0u) {
+        warp_max[warp] = running_max;
+        warp_sum[warp] = running_sum;
+    }
+#pragma unroll
+    for (int d = 0; d < DPL; d++) {
+        const uint32_t dim = lane + (uint32_t)d * 32u;
+        warp_acc[(uint64_t)warp * head_dim + dim] = acc[d];
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+        float global_max = -INFINITY;
+        for (uint32_t w = 0; w < nwarps; w++) {
+            global_max = fmaxf(global_max, warp_max[w]);
+        }
+        float global_sum = 0.0f;
+        for (uint32_t w = 0; w < nwarps; w++) {
+            if (warp_max[w] != -INFINITY) {
+                global_sum += warp_sum[w] *
+                    __expf(warp_max[w] - global_max);
+            }
+        }
+        if (lane == 0u) {
+            if (out_max) *out_max = global_max;
+            if (out_sum) *out_sum = global_sum;
+        }
+        const float inverse_sum = global_sum > 0.0f
+            ? 1.0f / global_sum : 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            float merged = 0.0f;
+            for (uint32_t w = 0; w < nwarps; w++) {
+                if (warp_max[w] != -INFINITY) {
+                    merged += warp_acc[(uint64_t)w * head_dim + dim] *
+                        __expf(warp_max[w] - global_max);
+                }
+            }
+            out[dim] = out_max ? merged : merged * inverse_sum;
+        }
+    }
+}
+
+template <int DPL>
+static __global__ void solar_attention_decode_warp_kernel(
+        float         *heads,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        float          scale) {
+    const uint32_t head = blockIdx.x;
+    if (head >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t base = (uint64_t)head * head_dim;
+    solar_attention_warp_range<DPL>(
+        heads + base, q + base, kv, format, row_bytes, head / group,
+        n_head_kv, head_dim, kv_cap, first, last, scale, NULL, NULL);
+}
+
+template <int DPL>
+static __global__ void solar_attention_prefill_warp_kernel(
+        float         *heads,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_tokens,
+        uint32_t       pos0,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       window,
+        float          scale) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    if (token >= n_tokens || head >= n_head) return;
+    const uint32_t pos = pos0 + token;
+    uint32_t first = window && pos + 1u > window ? pos + 1u - window : 0u;
+    if (pos + 1u > kv_cap && first < pos + 1u - kv_cap) {
+        first = pos + 1u - kv_cap;
+    }
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t base = ((uint64_t)token * n_head + head) * head_dim;
+    solar_attention_warp_range<DPL>(
+        heads + base, q + base, kv, format, row_bytes, head / group,
+        n_head_kv, head_dim, kv_cap, first, pos, scale, NULL, NULL);
+}
+
+template <int DPL>
+static __global__ void solar_attention_split_warp_kernel(
+        float         *partials,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        uint32_t       chunk_len,
+        uint32_t       split_count,
+        float          scale) {
+    const uint32_t split = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    if (split >= split_count || head >= n_head) return;
+    const uint32_t chunk_first = first + split * chunk_len;
+    uint32_t chunk_last = chunk_first + chunk_len - 1u;
+    if (chunk_last > last) chunk_last = last;
+    float *part = partials +
+        ((uint64_t)head * split_count + split) * (head_dim + 2u);
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t qbase = (uint64_t)head * head_dim;
+    solar_attention_warp_range<DPL>(
+        part + 2u, q + qbase, kv, format, row_bytes, head / group,
+        n_head_kv, head_dim, kv_cap, chunk_first, chunk_last, scale,
+        part, part + 1u);
+}
+
+/* Solar production GQA is 64 query heads over 8 KV heads.  The per-head
+ * split kernel above therefore dequantizes and reads the same packed K/V row
+ * eight times.  This grouped kernel assigns one block to a KV head and two
+ * query heads to each warp.  A small key tile is decoded once into shared
+ * memory, then all query heads reuse it.  The online-softmax state remains
+ * independent per query head and the partial layout is unchanged, so the
+ * existing combine kernel remains the oracle/fallback seam. */
+template <int KEY_TILE>
+static __device__ __forceinline__ void
+solar_attention_gqa_grouped_split_block(
+        float         *partials,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       kv_cap,
+        uint32_t       split,
+        uint32_t       split_stride,
+        uint32_t       kv_head,
+        uint32_t       chunk_first,
+        uint32_t       chunk_last,
+        float          scale) {
+    constexpr uint32_t HEAD_DIM = 128u;
+    constexpr uint32_t DPL = HEAD_DIM / 32u;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head[2] = {
+        kv_head * group + warp * 2u,
+        kv_head * group + warp * 2u + 1u,
+    };
+    const bool active[2] = {
+        warp * 2u < group,
+        warp * 2u + 1u < group,
+    };
+
+    float qv[2][DPL];
+    float acc[2][DPL];
+    float running_max[2] = {-INFINITY, -INFINITY};
+    float running_sum[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+#pragma unroll
+        for (int d = 0; d < (int)DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            qv[h][d] = active[h]
+                ? q[(uint64_t)head[h] * HEAD_DIM + dim] : 0.0f;
+            acc[h][d] = 0.0f;
+        }
+    }
+
+    __shared__ float shared_k[KEY_TILE][HEAD_DIM];
+    __shared__ float shared_v[KEY_TILE][HEAD_DIM];
+    for (uint32_t tile_first = chunk_first; tile_first <= chunk_last;
+         tile_first += KEY_TILE) {
+        const uint32_t tile_count =
+            chunk_last - tile_first + 1u < (uint32_t)KEY_TILE
+                ? chunk_last - tile_first + 1u : (uint32_t)KEY_TILE;
+        const uint32_t tile_values = tile_count * HEAD_DIM * 2u;
+        for (uint32_t idx = threadIdx.x; idx < tile_values;
+             idx += blockDim.x) {
+            const uint32_t key = idx / (HEAD_DIM * 2u);
+            const uint32_t rem = idx - key * HEAD_DIM * 2u;
+            const bool value = rem >= HEAD_DIM;
+            const uint32_t dim = value ? rem - HEAD_DIM : rem;
+            const uint8_t *row = kv +
+                (uint64_t)((tile_first + key) % kv_cap) * row_bytes;
+            const float decoded = solar_kv_load(
+                row, format, n_head_kv, HEAD_DIM, kv_head, dim, value);
+            if (value) shared_v[key][dim] = decoded;
+            else shared_k[key][dim] = decoded;
+        }
+        __syncthreads();
+
+        if (warp * 2u < group) {
+            for (uint32_t key = 0u; key < tile_count; key++) {
+                float dot[2] = {0.0f, 0.0f};
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    if (!active[h]) continue;
+#pragma unroll
+                    for (int d = 0; d < (int)DPL; d++) {
+                        const uint32_t dim = lane + (uint32_t)d * 32u;
+                        dot[h] += qv[h][d] * shared_k[key][dim];
+                    }
+                }
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    dot[0] += __shfl_xor_sync(0xffffffffu, dot[0], offset);
+                    dot[1] += __shfl_xor_sync(0xffffffffu, dot[1], offset);
+                }
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    if (!active[h]) continue;
+                    const float score = dot[h] * scale;
+                    const float next_max = fmaxf(running_max[h], score);
+                    const float rescale = running_max[h] == -INFINITY
+                        ? 0.0f : __expf(running_max[h] - next_max);
+                    const float weight = __expf(score - next_max);
+#pragma unroll
+                    for (int d = 0; d < (int)DPL; d++) {
+                        const uint32_t dim = lane + (uint32_t)d * 32u;
+                        acc[h][d] = acc[h][d] * rescale +
+                                    weight * shared_v[key][dim];
+                    }
+                    running_sum[h] = running_sum[h] * rescale + weight;
+                    running_max[h] = next_max;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+        if (!active[h]) continue;
+        float *part = partials +
+            ((uint64_t)head[h] * split_stride + split) * (HEAD_DIM + 2u);
+        if (lane == 0u) {
+            part[0] = running_max[h];
+            part[1] = running_sum[h];
+        }
+#pragma unroll
+        for (int d = 0; d < (int)DPL; d++) {
+            const uint32_t dim = lane + (uint32_t)d * 32u;
+            part[2u + dim] = acc[h][d];
+        }
+    }
+}
+
+template <int KEY_TILE>
+static __global__ void solar_attention_gqa_grouped_split_kernel(
+        float         *partials,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        uint32_t       chunk_len,
+        uint32_t       split_count,
+        float          scale) {
+    const uint32_t split = blockIdx.x;
+    const uint32_t kv_head = blockIdx.y;
+    if (split >= split_count || kv_head >= n_head_kv) return;
+    const uint32_t chunk_first = first + split * chunk_len;
+    uint32_t chunk_last = chunk_first + chunk_len - 1u;
+    if (chunk_last > last) chunk_last = last;
+    solar_attention_gqa_grouped_split_block<KEY_TILE>(
+        partials, q, kv, format, row_bytes, n_head, n_head_kv, kv_cap,
+        split, split_count, kv_head, chunk_first, chunk_last, scale);
+}
+
+static __global__ void solar_attention_decode_kernel(
+        float         *heads,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        float          scale) {
+    const uint32_t head = blockIdx.x;
+    if (head >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t base = (uint64_t)head * head_dim;
+    solar_attention_range(heads + base, q + base, kv, format, row_bytes,
+                          head / group, n_head_kv, head_dim, kv_cap,
+                          first, last, scale, NULL, NULL);
+}
+
+static __global__ void solar_attention_prefill_kernel(
+        float         *heads,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_tokens,
+        uint32_t       pos0,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       window,
+        float          scale) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    if (token >= n_tokens || head >= n_head) return;
+    const uint32_t pos = pos0 + token;
+    uint32_t first = window && pos + 1u > window ? pos + 1u - window : 0u;
+    if (pos + 1u > kv_cap && first < pos + 1u - kv_cap) {
+        first = pos + 1u - kv_cap;
+    }
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t base = ((uint64_t)token * n_head + head) * head_dim;
+    solar_attention_range(heads + base, q + base, kv, format, row_bytes,
+                          head / group, n_head_kv, head_dim, kv_cap,
+                          first, pos, scale, NULL, NULL);
+}
+
+static __global__ void solar_attention_split_kernel(
+        float         *partials,
+        const float   *q,
+        const uint8_t *kv,
+        uint32_t       format,
+        uint64_t       row_bytes,
+        uint32_t       n_head,
+        uint32_t       n_head_kv,
+        uint32_t       head_dim,
+        uint32_t       kv_cap,
+        uint32_t       first,
+        uint32_t       last,
+        uint32_t       chunk_len,
+        uint32_t       split_count,
+        float          scale) {
+    const uint32_t split = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    if (split >= split_count || head >= n_head) return;
+    const uint32_t chunk_first = first + split * chunk_len;
+    uint32_t chunk_last = chunk_first + chunk_len - 1u;
+    if (chunk_last > last) chunk_last = last;
+    float *part = partials +
+        ((uint64_t)head * split_count + split) * (head_dim + 2u);
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t qbase = (uint64_t)head * head_dim;
+    solar_attention_range(part + 2u, q + qbase, kv, format, row_bytes,
+                          head / group, n_head_kv, head_dim, kv_cap,
+                          chunk_first, chunk_last, scale, part, part + 1u);
+}
+
+static __global__ void solar_attention_split_combine_kernel(
+        float       *heads,
+        const float *partials,
+        uint32_t     head_dim,
+        uint32_t     split_count) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t dim = threadIdx.x;
+    __shared__ float global_max;
+    __shared__ float inverse_sum;
+    if (dim == 0u) {
+        float max_value = -INFINITY;
+        for (uint32_t split = 0; split < split_count; split++) {
+            const float *part = partials +
+                ((uint64_t)head * split_count + split) * (head_dim + 2u);
+            max_value = fmaxf(max_value, part[0]);
+        }
+        float sum = 0.0f;
+        for (uint32_t split = 0; split < split_count; split++) {
+            const float *part = partials +
+                ((uint64_t)head * split_count + split) * (head_dim + 2u);
+            sum += part[1] * __expf(part[0] - max_value);
+        }
+        global_max = max_value;
+        inverse_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    }
+    __syncthreads();
+    if (dim < head_dim) {
+        float acc = 0.0f;
+        for (uint32_t split = 0; split < split_count; split++) {
+            const float *part = partials +
+                ((uint64_t)head * split_count + split) * (head_dim + 2u);
+            acc += part[2u + dim] * __expf(part[0] - global_max);
+        }
+        heads[(uint64_t)head * head_dim + dim] = acc * inverse_sum;
+    }
+}
+
+static __device__ __forceinline__ uint32_t solar_attention_first_position(
+        uint32_t pos, uint32_t window, uint32_t kv_cap) {
+    uint32_t first = window && pos + 1u > window ? pos + 1u - window : 0u;
+    if (pos + 1u > kv_cap && first < pos + 1u - kv_cap) {
+        first = pos + 1u - kv_cap;
+    }
+    return first;
+}
+
+template <int KEY_TILE>
+static __global__ void solar_attention_banks_gqa_grouped_split_kernel(
+        float          *partials,
+        const float    *q,
+        const uint8_t  *kv_slab,
+        const uint32_t *bank_ids,
+        const uint32_t *positions,
+        uint64_t        bank_stride,
+        uint32_t        n_tokens,
+        uint32_t        max_banks,
+        uint32_t        format,
+        uint64_t        row_bytes,
+        uint32_t        n_head,
+        uint32_t        n_head_kv,
+        uint32_t        kv_cap,
+        uint32_t        window,
+        uint32_t        chunk_len,
+        uint32_t        max_splits,
+        float           scale) {
+    constexpr uint32_t HEAD_DIM = 128u;
+    const uint32_t split = blockIdx.x;
+    const uint32_t kv_head = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (token >= n_tokens || kv_head >= n_head_kv) return;
+    const uint32_t bank = bank_ids[token];
+    const uint32_t pos = positions[token];
+    if (bank >= max_banks || pos >= kv_cap) return;
+    const uint32_t first =
+        solar_attention_first_position(pos, window, kv_cap);
+    const uint32_t split_count =
+        (pos - first + 1u + chunk_len - 1u) / chunk_len;
+    if (split >= split_count) return;
+    const uint32_t chunk_first = first + split * chunk_len;
+    uint32_t chunk_last = chunk_first + chunk_len - 1u;
+    if (chunk_last > pos) chunk_last = pos;
+    const uint64_t q_offset =
+        (uint64_t)token * n_head * HEAD_DIM;
+    const uint64_t partial_offset =
+        (uint64_t)token * n_head * max_splits * (HEAD_DIM + 2u);
+    solar_attention_gqa_grouped_split_block<KEY_TILE>(
+        partials + partial_offset, q + q_offset,
+        kv_slab + (uint64_t)bank * bank_stride,
+        format, row_bytes, n_head, n_head_kv, kv_cap,
+        split, max_splits, kv_head, chunk_first, chunk_last, scale);
+}
+
+static __global__ void solar_attention_banks_decode_kernel(
+        float          *heads,
+        const float    *q,
+        const uint8_t  *kv_slab,
+        const uint32_t *bank_ids,
+        const uint32_t *positions,
+        uint64_t        bank_stride,
+        uint32_t        n_tokens,
+        uint32_t        max_banks,
+        uint32_t        format,
+        uint64_t        row_bytes,
+        uint32_t        n_head,
+        uint32_t        n_head_kv,
+        uint32_t        head_dim,
+        uint32_t        kv_cap,
+        uint32_t        window,
+        float           scale) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (head >= n_head || token >= n_tokens) return;
+    const uint32_t bank = bank_ids[token];
+    const uint32_t pos = positions[token];
+    if (bank >= max_banks || pos >= kv_cap) return;
+    const uint32_t first =
+        solar_attention_first_position(pos, window, kv_cap);
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t base =
+        ((uint64_t)token * n_head + head) * head_dim;
+    solar_attention_range(
+        heads + base, q + base,
+        kv_slab + (uint64_t)bank * bank_stride,
+        format, row_bytes, head / group, n_head_kv, head_dim, kv_cap,
+        first, pos, scale, NULL, NULL);
+}
+
+static __global__ void solar_attention_banks_split_kernel(
+        float          *partials,
+        const float    *q,
+        const uint8_t  *kv_slab,
+        const uint32_t *bank_ids,
+        const uint32_t *positions,
+        uint64_t        bank_stride,
+        uint32_t        n_tokens,
+        uint32_t        max_banks,
+        uint32_t        format,
+        uint64_t        row_bytes,
+        uint32_t        n_head,
+        uint32_t        n_head_kv,
+        uint32_t        head_dim,
+        uint32_t        kv_cap,
+        uint32_t        window,
+        uint32_t        chunk_len,
+        uint32_t        max_splits,
+        float           scale) {
+    const uint32_t split = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (token >= n_tokens || head >= n_head) return;
+    const uint32_t bank = bank_ids[token];
+    const uint32_t pos = positions[token];
+    if (bank >= max_banks || pos >= kv_cap) return;
+    const uint32_t first =
+        solar_attention_first_position(pos, window, kv_cap);
+    const uint32_t split_count =
+        (pos - first + 1u + chunk_len - 1u) / chunk_len;
+    if (split >= split_count) return;
+    const uint32_t chunk_first = first + split * chunk_len;
+    uint32_t chunk_last = chunk_first + chunk_len - 1u;
+    if (chunk_last > pos) chunk_last = pos;
+    float *part = partials +
+        (((uint64_t)token * n_head + head) * max_splits + split) *
+        (head_dim + 2u);
+    const uint32_t group = n_head / n_head_kv;
+    const uint64_t qbase =
+        ((uint64_t)token * n_head + head) * head_dim;
+    solar_attention_range(
+        part + 2u, q + qbase,
+        kv_slab + (uint64_t)bank * bank_stride,
+        format, row_bytes, head / group, n_head_kv, head_dim, kv_cap,
+        chunk_first, chunk_last, scale, part, part + 1u);
+}
+
+static __global__ void solar_attention_banks_split_combine_kernel(
+        float          *heads,
+        const float    *partials,
+        const uint32_t *positions,
+        uint32_t        n_tokens,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        kv_cap,
+        uint32_t        window,
+        uint32_t        chunk_len,
+        uint32_t        max_splits) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t dim = threadIdx.x;
+    if (token >= n_tokens || head >= n_head) return;
+    const uint32_t pos = positions[token];
+    if (pos >= kv_cap) return;
+    const uint32_t first =
+        solar_attention_first_position(pos, window, kv_cap);
+    const uint32_t split_count =
+        (pos - first + 1u + chunk_len - 1u) / chunk_len;
+    __shared__ float global_max;
+    __shared__ float inverse_sum;
+    if (dim == 0u) {
+        float max_value = -INFINITY;
+        for (uint32_t split = 0; split < split_count; split++) {
+            const float *part = partials +
+                (((uint64_t)token * n_head + head) * max_splits + split) *
+                (head_dim + 2u);
+            max_value = fmaxf(max_value, part[0]);
+        }
+        float sum = 0.0f;
+        for (uint32_t split = 0; split < split_count; split++) {
+            const float *part = partials +
+                (((uint64_t)token * n_head + head) * max_splits + split) *
+                (head_dim + 2u);
+            sum += part[1] * __expf(part[0] - max_value);
+        }
+        global_max = max_value;
+        inverse_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    }
+    __syncthreads();
+    if (dim < head_dim) {
+        float acc = 0.0f;
+        for (uint32_t split = 0; split < split_count; split++) {
+            const float *part = partials +
+                (((uint64_t)token * n_head + head) * max_splits + split) *
+                (head_dim + 2u);
+            acc += part[2u + dim] * __expf(part[0] - global_max);
+        }
+        heads[((uint64_t)token * n_head + head) * head_dim + dim] =
+            acc * inverse_sum;
+    }
+}
+
+static uint32_t solar_attention_threads(uint32_t head_dim) {
+    if (head_dim == 0u || head_dim > 256u) return 0u;
+    uint32_t threads = 32u;
+    while (threads < head_dim) threads <<= 1u;
+    return threads;
+}
+
+static int solar_attention_grouped_gqa_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_CUDA_SOLAR_GQA_GROUPED");
+        enabled = !(value && value[0] == '0' && value[1] == '\0');
+    }
+    return enabled;
+}
+
+extern "C" uint64_t ds4_gpu_solar_kv_row_bytes(
+        ds4_solar_kv_format format,
+        uint32_t            n_head_kv,
+        uint32_t            head_dim) {
+    return solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+}
+
+extern "C" int ds4_gpu_solar_kv_store_tensor(
+        ds4_gpu_tensor       *kv,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                kv_cap,
+        ds4_solar_kv_format     format) {
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    if (!kv || !k || !v || n_head_kv == 0u || head_dim == 0u ||
+        head_dim > 256u || n_tokens == 0u || n_tokens > kv_cap ||
+        kv_cap == 0u || row_bytes == 0u ||
+        k->bytes < kv_dim * n_tokens * sizeof(float) ||
+        v->bytes < kv_dim * n_tokens * sizeof(float) ||
+        kv->bytes < (uint64_t)kv_cap * row_bytes) {
+        return 0;
+    }
+    if (format == DS4_SOLAR_KV_BF16) {
+        const uint64_t count = kv_dim * n_tokens;
+        const uint32_t threads = 256u;
+        const uint64_t blocks = (count + threads - 1u) / threads;
+        if (blocks > UINT32_MAX) return 0;
+        solar_kv_store_bf16_kernel<<<(uint32_t)blocks, threads, 0,
+                                     ds4_current_stream()>>>(
+            (__half *)kv->ptr, (const float *)k->ptr, (const float *)v->ptr,
+            kv_dim, n_tokens, pos0, kv_cap);
+    } else {
+        dim3 grid(n_tokens, n_head_kv, 1u);
+        solar_kv_store_compressed_kernel<<<grid, 256u, 0,
+                                           ds4_current_stream()>>>(
+            (uint8_t *)kv->ptr, (const float *)k->ptr,
+            (const float *)v->ptr, n_head_kv, head_dim, n_tokens, pos0,
+            kv_cap, (uint32_t)format, row_bytes);
+    }
+    return cuda_ok(cudaGetLastError(), "solar-open2 KV store");
+}
+
+extern "C" int ds4_gpu_solar_kv_store_banks_tensor(
+        ds4_gpu_tensor       *kv_slab,
+        const ds4_gpu_tensor *bank_ids,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                n_tokens,
+        uint32_t                max_banks,
+        uint64_t                bank_stride,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        ds4_solar_kv_format     format) {
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    const uint64_t cache_bytes = (uint64_t)kv_cap * row_bytes;
+    const uint64_t vector_bytes =
+        (uint64_t)n_tokens * kv_dim * sizeof(float);
+    if (!kv_slab || !bank_ids || !positions || !k || !v ||
+        n_tokens == 0u || max_banks == 0u || n_head_kv == 0u ||
+        head_dim == 0u || head_dim > 256u || kv_cap == 0u ||
+        row_bytes == 0u || bank_stride < cache_bytes ||
+        bank_stride > UINT64_MAX / max_banks ||
+        kv_slab->bytes < bank_stride * max_banks ||
+        bank_ids->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
+        positions->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
+        k->bytes < vector_bytes || v->bytes < vector_bytes) {
+        return 0;
+    }
+    if (format == DS4_SOLAR_KV_BF16) {
+        const uint64_t count = (uint64_t)n_tokens * kv_dim;
+        const uint32_t threads = 256u;
+        const uint64_t blocks = (count + threads - 1u) / threads;
+        if (blocks > UINT32_MAX) return 0;
+        solar_kv_store_banks_bf16_kernel<<<
+            (uint32_t)blocks, threads, 0, ds4_current_stream()>>>(
+            (uint8_t *)kv_slab->ptr,
+            (const uint32_t *)bank_ids->ptr,
+            (const uint32_t *)positions->ptr,
+            (const float *)k->ptr, (const float *)v->ptr,
+            bank_stride, kv_dim, n_tokens, max_banks, kv_cap);
+    } else {
+        dim3 grid(n_tokens, n_head_kv, 1u);
+        solar_kv_store_banks_compressed_kernel<<<
+            grid, 256u, 0, ds4_current_stream()>>>(
+            (uint8_t *)kv_slab->ptr,
+            (const uint32_t *)bank_ids->ptr,
+            (const uint32_t *)positions->ptr,
+            (const float *)k->ptr, (const float *)v->ptr,
+            bank_stride, n_head_kv, head_dim, n_tokens, max_banks,
+            kv_cap, (uint32_t)format, row_bytes);
+    }
+    return cuda_ok(cudaGetLastError(), "solar-open2 banked KV store");
+}
+
+static int solar_attention_validate(
+        const ds4_gpu_tensor *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim,
+        uint32_t              kv_cap,
+        ds4_solar_kv_format   format) {
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    const uint64_t values = (uint64_t)n_tokens * n_head * head_dim;
+    return heads && q && kv && n_tokens > 0u && n_head > 0u &&
+           n_head_kv > 0u && n_head % n_head_kv == 0u && kv_cap > 0u &&
+           solar_attention_threads(head_dim) > 0u && row_bytes > 0u &&
+           heads->bytes >= values * sizeof(float) &&
+           q->bytes >= values * sizeof(float) &&
+           kv->bytes >= (uint64_t)kv_cap * row_bytes;
+}
+
+extern "C" int ds4_gpu_solar_attention_decode_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        ds4_solar_kv_format     format) {
+    if (!solar_attention_validate(heads, q, kv, 1u, n_head, n_head_kv,
+                                  head_dim, kv_cap, format)) {
+        return 0;
+    }
+    uint32_t first = window && pos + 1u > window ? pos + 1u - window : 0u;
+    if (pos + 1u > kv_cap && first < pos + 1u - kv_cap) {
+        first = pos + 1u - kv_cap;
+    }
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    const uint32_t threads = solar_attention_threads(head_dim);
+    const uint32_t shmem =
+        (threads / 32u) * head_dim * (uint32_t)sizeof(float);
+#define DS4_SOLAR_DECODE_WARP_CASE(DPL)                                      \
+    case DPL:                                                                \
+        solar_attention_decode_warp_kernel<DPL><<<                           \
+            n_head, threads, shmem, ds4_current_stream()>>>(                 \
+            (float *)heads->ptr, (const float *)q->ptr,                      \
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,   \
+            n_head_kv, head_dim, kv_cap, first, pos,                         \
+            rsqrtf((float)head_dim));                                        \
+        break
+    switch (head_dim / 32u) {
+    DS4_SOLAR_DECODE_WARP_CASE(2);
+    DS4_SOLAR_DECODE_WARP_CASE(4);
+    DS4_SOLAR_DECODE_WARP_CASE(8);
+    default:
+        solar_attention_decode_kernel<<<
+            n_head, threads, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
+            n_head_kv, head_dim, kv_cap, first, pos,
+            rsqrtf((float)head_dim));
+        break;
+    }
+#undef DS4_SOLAR_DECODE_WARP_CASE
+    return cuda_ok(cudaGetLastError(), "solar-open2 attention decode");
+}
+
+extern "C" int ds4_gpu_solar_attention_decode_split_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        ds4_gpu_tensor       *partials,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        uint32_t                chunk_len,
+        ds4_solar_kv_format     format) {
+    if (!partials || chunk_len == 0u ||
+        !solar_attention_validate(heads, q, kv, 1u, n_head, n_head_kv,
+                                  head_dim, kv_cap, format)) {
+        return 0;
+    }
+    uint32_t first = window && pos + 1u > window ? pos + 1u - window : 0u;
+    if (pos + 1u > kv_cap && first < pos + 1u - kv_cap) {
+        first = pos + 1u - kv_cap;
+    }
+    const uint32_t span = pos - first + 1u;
+    const uint32_t split_count = (span + chunk_len - 1u) / chunk_len;
+    if (split_count <= 1u) {
+        return ds4_gpu_solar_attention_decode_tensor(
+            heads, q, kv, n_head, n_head_kv, head_dim, kv_cap, pos, window,
+            format);
+    }
+    const uint64_t partial_bytes =
+        (uint64_t)n_head * split_count * (head_dim + 2u) * sizeof(float);
+    if (partials->bytes < partial_bytes) return 0;
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    const uint32_t threads = solar_attention_threads(head_dim);
+    const uint32_t group = n_head / n_head_kv;
+    if (solar_attention_grouped_gqa_enabled() && head_dim == 128u &&
+        group >= 2u && group <= 8u) {
+        dim3 grouped_grid(split_count, n_head_kv, 1u);
+        solar_attention_gqa_grouped_split_kernel<8><<<
+            grouped_grid, 128u, 0u, ds4_current_stream()>>>(
+            (float *)partials->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
+            n_head_kv, kv_cap, first, pos, chunk_len, split_count,
+            rsqrtf((float)head_dim));
+        static int logged_grouped = 0;
+        if (!logged_grouped) {
+            logged_grouped = 1;
+            fprintf(stderr,
+                    "ds4: Solar grouped GQA split decode active "
+                    "(group=%u chunk=%u)\n",
+                    group, chunk_len);
+        }
+        solar_attention_split_combine_kernel<<<
+            n_head, threads, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, (const float *)partials->ptr,
+            head_dim, split_count);
+        return cuda_ok(cudaGetLastError(),
+                       "solar-open2 grouped split attention decode");
+    }
+    const uint32_t shmem =
+        (threads / 32u) * head_dim * (uint32_t)sizeof(float);
+    dim3 grid(split_count, n_head, 1u);
+#define DS4_SOLAR_SPLIT_WARP_CASE(DPL)                                       \
+    case DPL:                                                                \
+        solar_attention_split_warp_kernel<DPL><<<                            \
+            grid, threads, shmem, ds4_current_stream()>>>(                   \
+            (float *)partials->ptr, (const float *)q->ptr,                   \
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,   \
+            n_head_kv, head_dim, kv_cap, first, pos, chunk_len, split_count, \
+            rsqrtf((float)head_dim));                                        \
+        break
+    switch (head_dim / 32u) {
+    DS4_SOLAR_SPLIT_WARP_CASE(2);
+    DS4_SOLAR_SPLIT_WARP_CASE(4);
+    DS4_SOLAR_SPLIT_WARP_CASE(8);
+    default:
+        solar_attention_split_kernel<<<
+            grid, threads, 0, ds4_current_stream()>>>(
+            (float *)partials->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
+            n_head_kv, head_dim, kv_cap, first, pos, chunk_len, split_count,
+            rsqrtf((float)head_dim));
+        break;
+    }
+#undef DS4_SOLAR_SPLIT_WARP_CASE
+    solar_attention_split_combine_kernel<<<n_head, threads, 0,
+                                            ds4_current_stream()>>>(
+        (float *)heads->ptr, (const float *)partials->ptr,
+        head_dim, split_count);
+    return cuda_ok(cudaGetLastError(), "solar-open2 split attention decode");
+}
+
+extern "C" int ds4_gpu_solar_attention_decode_banks_split_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv_slab,
+        ds4_gpu_tensor       *partials,
+        const ds4_gpu_tensor *bank_ids,
+        const ds4_gpu_tensor *positions,
+        uint32_t                n_tokens,
+        uint32_t                max_banks,
+        uint64_t                bank_stride,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                max_position,
+        uint32_t                window,
+        uint32_t                chunk_len,
+        ds4_solar_kv_format     format) {
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    const uint64_t values = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t cache_bytes = (uint64_t)kv_cap * row_bytes;
+    if (!heads || !q || !kv_slab || !partials || !bank_ids || !positions ||
+        n_tokens == 0u || max_banks == 0u || n_head == 0u ||
+        n_head_kv == 0u || n_head % n_head_kv != 0u || kv_cap == 0u ||
+        max_position >= kv_cap || chunk_len == 0u ||
+        solar_attention_threads(head_dim) == 0u || row_bytes == 0u ||
+        heads->bytes < values * sizeof(float) ||
+        q->bytes < values * sizeof(float) ||
+        bank_ids->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
+        positions->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
+        bank_stride < cache_bytes || bank_stride > UINT64_MAX / max_banks ||
+        kv_slab->bytes < bank_stride * max_banks) {
+        return 0;
+    }
+    const uint32_t first =
+        window && max_position + 1u > window
+            ? max_position + 1u - window : 0u;
+    const uint32_t span = max_position - first + 1u;
+    const uint32_t max_splits = (span + chunk_len - 1u) / chunk_len;
+    const uint32_t threads = solar_attention_threads(head_dim);
+    if (max_splits <= 1u) {
+        dim3 grid(n_head, n_tokens, 1u);
+        solar_attention_banks_decode_kernel<<<
+            grid, threads, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv_slab->ptr,
+            (const uint32_t *)bank_ids->ptr,
+            (const uint32_t *)positions->ptr,
+            bank_stride, n_tokens, max_banks, (uint32_t)format,
+            row_bytes, n_head, n_head_kv, head_dim, kv_cap, window,
+            rsqrtf((float)head_dim));
+        return cuda_ok(cudaGetLastError(),
+                       "solar-open2 banked attention decode");
+    }
+    const uint64_t partial_values =
+        (uint64_t)n_tokens * n_head * max_splits * (head_dim + 2u);
+    if (partials->bytes < partial_values * sizeof(float)) return 0;
+    const uint32_t group = n_head / n_head_kv;
+    if (solar_attention_grouped_gqa_enabled() && head_dim == 128u &&
+        group >= 2u && group <= 8u) {
+        dim3 grouped_grid(max_splits, n_head_kv, n_tokens);
+        solar_attention_banks_gqa_grouped_split_kernel<8><<<
+            grouped_grid, 128u, 0u, ds4_current_stream()>>>(
+            (float *)partials->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv_slab->ptr,
+            (const uint32_t *)bank_ids->ptr,
+            (const uint32_t *)positions->ptr,
+            bank_stride, n_tokens, max_banks, (uint32_t)format, row_bytes,
+            n_head, n_head_kv, kv_cap, window, chunk_len, max_splits,
+            rsqrtf((float)head_dim));
+        static int logged_grouped_banks = 0;
+        if (!logged_grouped_banks) {
+            logged_grouped_banks = 1;
+            fprintf(stderr,
+                    "ds4: Solar grouped banked GQA split decode active "
+                    "(group=%u chunk=%u)\n",
+                    group, chunk_len);
+        }
+        dim3 combine_grid(n_head, n_tokens, 1u);
+        solar_attention_banks_split_combine_kernel<<<
+            combine_grid, threads, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, (const float *)partials->ptr,
+            (const uint32_t *)positions->ptr, n_tokens, n_head, head_dim,
+            kv_cap, window, chunk_len, max_splits);
+        return cuda_ok(cudaGetLastError(),
+                       "solar-open2 grouped banked split attention decode");
+    }
+    dim3 split_grid(max_splits, n_head, n_tokens);
+    solar_attention_banks_split_kernel<<<
+        split_grid, threads, 0, ds4_current_stream()>>>(
+        (float *)partials->ptr, (const float *)q->ptr,
+        (const uint8_t *)kv_slab->ptr,
+        (const uint32_t *)bank_ids->ptr,
+        (const uint32_t *)positions->ptr,
+        bank_stride, n_tokens, max_banks, (uint32_t)format, row_bytes,
+        n_head, n_head_kv, head_dim, kv_cap, window, chunk_len,
+        max_splits, rsqrtf((float)head_dim));
+    dim3 combine_grid(n_head, n_tokens, 1u);
+    solar_attention_banks_split_combine_kernel<<<
+        combine_grid, threads, 0, ds4_current_stream()>>>(
+        (float *)heads->ptr, (const float *)partials->ptr,
+        (const uint32_t *)positions->ptr, n_tokens, n_head, head_dim,
+        kv_cap, window, chunk_len, max_splits);
+    return cuda_ok(cudaGetLastError(),
+                   "solar-open2 banked split attention decode");
+}
+
+extern "C" int ds4_gpu_solar_attention_prefill_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                window,
+        ds4_solar_kv_format     format) {
+    if ((uint64_t)pos0 + n_tokens > kv_cap ||
+        !solar_attention_validate(heads, q, kv, n_tokens, n_head, n_head_kv,
+                                  head_dim, kv_cap, format)) {
+        return 0;
+    }
+    const uint64_t row_bytes =
+        solar_kv_row_bytes_impl((uint32_t)format, n_head_kv, head_dim);
+    /* Production default for the verified 128-wide Solar shape.  Keep the
+     * old environment variable as a diagnostic escape hatch: explicitly
+     * setting it to 0 restores the warp-parallel fallback. */
+    static int hmma_enabled = -1;
+    if (hmma_enabled < 0) {
+        const char *value = getenv("DS4_SOLAR_KV_PREFILL_HMMA");
+        hmma_enabled = !(value && value[0] == '0');
+    }
+    if (hmma_enabled && head_dim == 128u && n_tokens >= 64u) {
+        const int rc = ds4_mmq_solar_prefill_attn_hmma(
+            (float *)heads->ptr, (const float *)q->ptr, kv->ptr,
+            (int)format, (size_t)row_bytes, (int)n_tokens, (int)pos0,
+            (int)n_head, (int)n_head_kv, (int)head_dim, (int)kv_cap,
+            (int)window, rsqrtf((float)head_dim), ds4_current_stream());
+        if (rc == 0) {
+            static int logged = 0;
+            if (!logged) {
+                fprintf(stderr,
+                        "ds4: Solar compressed KV prefill using HMMA tiles\n");
+                logged = 1;
+            }
+            return 1;
+        }
+    }
+    const uint32_t threads = solar_attention_threads(head_dim);
+    const uint32_t shmem =
+        (threads / 32u) * head_dim * (uint32_t)sizeof(float);
+    dim3 grid(n_tokens, n_head, 1u);
+#define DS4_SOLAR_PREFILL_WARP_CASE(DPL)                                     \
+    case DPL:                                                                \
+        solar_attention_prefill_warp_kernel<DPL><<<                          \
+            grid, threads, shmem, ds4_current_stream()>>>(                   \
+            (float *)heads->ptr, (const float *)q->ptr,                      \
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_tokens, \
+            pos0, n_head, n_head_kv, head_dim, kv_cap, window,               \
+            rsqrtf((float)head_dim));                                        \
+        break
+    switch (head_dim / 32u) {
+    DS4_SOLAR_PREFILL_WARP_CASE(2);
+    DS4_SOLAR_PREFILL_WARP_CASE(4);
+    DS4_SOLAR_PREFILL_WARP_CASE(8);
+    default:
+        solar_attention_prefill_kernel<<<
+            grid, threads, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, (const float *)q->ptr,
+            (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_tokens,
+            pos0, n_head, n_head_kv, head_dim, kv_cap, window,
+            rsqrtf((float)head_dim));
+        break;
+    }
+#undef DS4_SOLAR_PREFILL_WARP_CASE
+    return cuda_ok(cudaGetLastError(), "solar-open2 attention prefill");
+}
+
+/* Solar Open 2 single-token KDA recurrence. One block owns one head and one
+ * thread owns a value-state column. That makes both state passes race-free:
+ * each thread decays and updates state[:, value_dim] while all threads share
+ * the normalized Q/K vectors. The generic path deliberately uses only
+ * ordinary CUDA math and shared memory; Hopper-specific tuning comes after
+ * official-fixture parity and must retain this fallback for sm_121. */
+static __device__ __forceinline__ float solar_kda_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+static __device__ __forceinline__ float solar_kda_silu(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+static __global__ void solar_kda_sequence_kernel(
+        float       *out,
+        float       *state,
+        float       *q_conv_state,
+        float       *k_conv_state,
+        float       *v_conv_state,
+        const float *q_raw,
+        const float *k_raw,
+        const float *v_raw,
+        const float *g_raw,
+        const float *beta_logits,
+        const float *q_conv_weight,
+        const float *k_conv_weight,
+        const float *v_conv_weight,
+        const float *decay_scale,
+        const float *dt_bias,
+        uint32_t     n_tokens,
+        uint32_t     n_head,
+        uint32_t     head_dim,
+        uint32_t     conv_kernel,
+        float        gate_lower_bound) {
+    __shared__ float q_vec[256];
+    __shared__ float k_vec[256];
+    __shared__ float v_vec[256];
+    __shared__ float q_sq[256];
+    __shared__ float k_sq[256];
+
+    const uint32_t head = blockIdx.x;
+    const uint32_t dim = threadIdx.x;
+    const uint64_t channel = (uint64_t)head * head_dim + dim;
+    const uint64_t vector_count = (uint64_t)n_head * head_dim;
+    const uint64_t state_head = (uint64_t)head * head_dim * head_dim;
+
+    /* One launch consumes an entire chunk. KDA is recurrent in sequence order,
+     * but the loop lives inside 64 concurrently resident head blocks rather
+     * than launching a PyTorch-style kernel for every token. */
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        float q = 0.0f;
+        float k = 0.0f;
+        float v = 0.0f;
+        if (dim < head_dim) {
+            float *qcs = q_conv_state + channel * conv_kernel;
+            float *kcs = k_conv_state + channel * conv_kernel;
+            float *vcs = v_conv_state + channel * conv_kernel;
+            for (uint32_t tap = 0; tap + 1u < conv_kernel; tap++) {
+                qcs[tap] = qcs[tap + 1u];
+                kcs[tap] = kcs[tap + 1u];
+                vcs[tap] = vcs[tap + 1u];
+            }
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            qcs[conv_kernel - 1u] = q_raw[token_base + channel];
+            kcs[conv_kernel - 1u] = k_raw[token_base + channel];
+            vcs[conv_kernel - 1u] = v_raw[token_base + channel];
+
+            const uint64_t weight_base = channel * conv_kernel;
+            for (uint32_t tap = 0; tap < conv_kernel; tap++) {
+                q += qcs[tap] * q_conv_weight[weight_base + tap];
+                k += kcs[tap] * k_conv_weight[weight_base + tap];
+                v += vcs[tap] * v_conv_weight[weight_base + tap];
+            }
+            q = solar_kda_silu(q);
+            k = solar_kda_silu(k);
+            v = solar_kda_silu(v);
+        }
+
+        q_vec[dim] = q;
+        k_vec[dim] = k;
+        v_vec[dim] = v;
+        q_sq[dim] = q * q;
+        k_sq[dim] = k * k;
+        __syncthreads();
+
+        for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+            if (dim < stride) {
+                q_sq[dim] += q_sq[dim + stride];
+                k_sq[dim] += k_sq[dim + stride];
+            }
+            __syncthreads();
+        }
+
+        if (dim < head_dim) {
+            const float q_inv = rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)head_dim);
+            const float k_inv = rsqrtf(k_sq[0] + 1.0e-6f);
+            q_vec[dim] *= q_inv;
+            k_vec[dim] *= k_inv;
+        }
+        __syncthreads();
+
+        if (dim < head_dim) {
+            const float beta = 2.0f /
+                (1.0f + expf(-beta_logits[(uint64_t)token * n_head + head]));
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            float memory = 0.0f;
+            for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
+                float gate = decay_scale[head] *
+                    solar_kda_softplus(g_raw[token_base +
+                                             (uint64_t)head * head_dim + key_dim] +
+                                       dt_bias[(uint64_t)head * head_dim + key_dim]);
+                if (gate < gate_lower_bound) gate = gate_lower_bound;
+                const uint64_t index =
+                    state_head + (uint64_t)key_dim * head_dim + dim;
+                const float decayed = state[index] * expf(gate);
+                state[index] = decayed;
+                memory += decayed * k_vec[key_dim];
+            }
+
+            const float delta = (v_vec[dim] - memory) * beta;
+            float result = 0.0f;
+            for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
+                const uint64_t index =
+                    state_head + (uint64_t)key_dim * head_dim + dim;
+                const float updated = state[index] + k_vec[key_dim] * delta;
+                state[index] = updated;
+                result += updated * q_vec[key_dim];
+            }
+            out[token_base + (uint64_t)head * head_dim + dim] = result;
+        }
+        __syncthreads();
+    }
+}
+
+static __global__ void solar_kda_banks_decode_kernel(
+        float          *out,
+        uint8_t        *state_slab,
+        uint64_t        state_bank_stride,
+        uint64_t        recurrent_offset,
+        uint64_t        q_conv_offset,
+        uint64_t        k_conv_offset,
+        uint64_t        v_conv_offset,
+        const uint32_t *bank_ids,
+        uint32_t        n_tokens,
+        uint32_t        max_banks,
+        const float    *q_raw,
+        const float    *k_raw,
+        const float    *v_raw,
+        const float    *g_raw,
+        const float    *beta_logits,
+        const float    *q_conv_weight,
+        const float    *k_conv_weight,
+        const float    *v_conv_weight,
+        const float    *decay_scale,
+        const float    *dt_bias,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        conv_kernel,
+        float           gate_lower_bound) {
+    __shared__ float q_vec[256];
+    __shared__ float k_vec[256];
+    __shared__ float v_vec[256];
+    __shared__ float q_sq[256];
+    __shared__ float k_sq[256];
+
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t dim = threadIdx.x;
+    if (token >= n_tokens || head >= n_head) return;
+    const uint32_t bank = bank_ids[token];
+    if (bank >= max_banks) return;
+    uint8_t *bank_state = state_slab + (uint64_t)bank * state_bank_stride;
+    float *state = (float *)(bank_state + recurrent_offset);
+    float *q_conv_state = (float *)(bank_state + q_conv_offset);
+    float *k_conv_state = (float *)(bank_state + k_conv_offset);
+    float *v_conv_state = (float *)(bank_state + v_conv_offset);
+    const uint64_t channel = (uint64_t)head * head_dim + dim;
+    const uint64_t vector_count = (uint64_t)n_head * head_dim;
+    const uint64_t token_base = (uint64_t)token * vector_count;
+    const uint64_t state_head = (uint64_t)head * head_dim * head_dim;
+
+    float q = 0.0f;
+    float k = 0.0f;
+    float v = 0.0f;
+    if (dim < head_dim) {
+        float *qcs = q_conv_state + channel * conv_kernel;
+        float *kcs = k_conv_state + channel * conv_kernel;
+        float *vcs = v_conv_state + channel * conv_kernel;
+        for (uint32_t tap = 0; tap + 1u < conv_kernel; tap++) {
+            qcs[tap] = qcs[tap + 1u];
+            kcs[tap] = kcs[tap + 1u];
+            vcs[tap] = vcs[tap + 1u];
+        }
+        qcs[conv_kernel - 1u] = q_raw[token_base + channel];
+        kcs[conv_kernel - 1u] = k_raw[token_base + channel];
+        vcs[conv_kernel - 1u] = v_raw[token_base + channel];
+        const uint64_t weight_base = channel * conv_kernel;
+        for (uint32_t tap = 0; tap < conv_kernel; tap++) {
+            q += qcs[tap] * q_conv_weight[weight_base + tap];
+            k += kcs[tap] * k_conv_weight[weight_base + tap];
+            v += vcs[tap] * v_conv_weight[weight_base + tap];
+        }
+        q = solar_kda_silu(q);
+        k = solar_kda_silu(k);
+        v = solar_kda_silu(v);
+    }
+
+    q_vec[dim] = q;
+    k_vec[dim] = k;
+    v_vec[dim] = v;
+    q_sq[dim] = q * q;
+    k_sq[dim] = k * k;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+        if (dim < stride) {
+            q_sq[dim] += q_sq[dim + stride];
+            k_sq[dim] += k_sq[dim + stride];
+        }
+        __syncthreads();
+    }
+    if (dim < head_dim) {
+        const float q_inv =
+            rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)head_dim);
+        const float k_inv = rsqrtf(k_sq[0] + 1.0e-6f);
+        q_vec[dim] *= q_inv;
+        k_vec[dim] *= k_inv;
+    }
+    __syncthreads();
+
+    if (dim < head_dim) {
+        const float beta = 2.0f /
+            (1.0f + expf(-beta_logits[(uint64_t)token * n_head + head]));
+        float memory = 0.0f;
+        for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
+            float gate = decay_scale[head] *
+                solar_kda_softplus(
+                    g_raw[token_base +
+                          (uint64_t)head * head_dim + key_dim] +
+                    dt_bias[(uint64_t)head * head_dim + key_dim]);
+            if (gate < gate_lower_bound) gate = gate_lower_bound;
+            const uint64_t index =
+                state_head + (uint64_t)key_dim * head_dim + dim;
+            const float decayed = state[index] * expf(gate);
+            state[index] = decayed;
+            memory += decayed * k_vec[key_dim];
+        }
+        const float delta = (v_vec[dim] - memory) * beta;
+        float result = 0.0f;
+        for (uint32_t key_dim = 0; key_dim < head_dim; key_dim++) {
+            const uint64_t index =
+                state_head + (uint64_t)key_dim * head_dim + dim;
+            const float updated = state[index] + k_vec[key_dim] * delta;
+            state[index] = updated;
+            result += updated * q_vec[key_dim];
+        }
+        out[token_base + (uint64_t)head * head_dim + dim] = result;
+    }
+}
+
+/* Chunked KDA prefill.
+ *
+ * The sequence kernel walks tokens one at a time, so an 8K prefill is 8K
+ * dependent passes over each head's 64 KiB state held in global memory. The
+ * chunked path instead materializes the same recurrence 64 tokens at a time
+ * through the delta-rule UT transform. With B_t the within-chunk inclusive
+ * cumulative log decay (per key channel) and S0 the state entering the chunk:
+ *
+ *   M[t][s]   = sum_d k_t[d] k_s[d] exp(B_t[d]-B_s[d])          (s < t)
+ *   U         = (I + diag(beta) M)^-1 diag(beta) (V - K~ S0),   K~_t = k_t exp(B_t)
+ *   S'        = diag(exp(B_last)) S0 + sum_s (k_s exp(B_last-B_s)) U_s^T
+ *   o_t       = (q_t exp(B_t)) S0 + sum_{s<=t} Mq[t][s] U_s,    Mq like M with q_t
+ *
+ * which is exactly the token recurrence unrolled, so decode, snapshots, fork
+ * and continuation keep their semantics; only float accumulation order moves,
+ * bounded by the FLA fixture tolerances. The gate clamp is -5, so a chunk can
+ * accumulate B down to -320: exp(B_t)/exp(-B_s) alone would overflow f32.
+ * Every pairwise exponent is therefore factored around the 16-row sub-block
+ * start r, exp(B_t-B_r)*exp(B_r-B_s), keeping off-diagonal factors <= 1 and
+ * diagonal-block factors <= exp(75), inside f32 range.
+ *
+ * Five launches per prefill call: prep (conv+SiLU+L2 norms+log gates),
+ * conv-state tail, per-chunk factorization (M, Mq, the triangular inverse,
+ * U_loc = T beta V and W = T beta K~, all chunk-parallel), the sequential
+ * chunk scan (state lives in registers, O_inter and the final U fall out),
+ * and the chunk-parallel intra output. Decode and sub-64-token appends stay
+ * on the recurrent kernel (lower launch cost and tighter replay numerics);
+ * setting DS4_SOLAR_KDA_STATE_PARTS forces that path for A/B diagnosis. */
+
+#define SOLAR_KDA_CHUNK 64u
+#define SOLAR_KDA_SUB 16u
+#define SOLAR_KDA_DIM 128u
+
+/* One block per (8 tokens, head), 128 threads. Reproduces the sequence
+ * kernel's conv + SiLU + L2 normalization + gate math bit-for-bit (same
+ * reduction tree), but writes token-parallel workspace rows instead of
+ * stepping state: qn (normalized, includes 1/sqrt(dim)), kn (normalized),
+ * vv (conv+SiLU v), gl (clamped log decay, kept in log space for the chunk
+ * prefix sums). One token per block measured faster than batching eight:
+ * the serialized reduction trees cost more than the launch grid saves. */
+static __global__ void solar_kda_chunk_prep_kernel(
+        float       *qn,
+        float       *kn,
+        float       *vv,
+        float       *gl,
+        const float *q_raw,
+        const float *k_raw,
+        const float *v_raw,
+        const float *g_raw,
+        const float *q_conv_state,
+        const float *k_conv_state,
+        const float *v_conv_state,
+        const float *q_conv_weight,
+        const float *k_conv_weight,
+        const float *v_conv_weight,
+        const float *decay_scale,
+        const float *dt_bias,
+        uint32_t     n_tokens,
+        uint32_t     n_head,
+        uint32_t     conv_kernel,
+        float        gate_lower_bound) {
+    __shared__ float q_sq[SOLAR_KDA_DIM];
+    __shared__ float k_sq[SOLAR_KDA_DIM];
+    __shared__ float q_norm_scale;
+    __shared__ float k_norm_scale;
+
+    const uint32_t head = blockIdx.y;
+    const uint32_t dim = threadIdx.x;
+    const uint64_t vector_count = (uint64_t)n_head * SOLAR_KDA_DIM;
+    const uint64_t channel = (uint64_t)head * SOLAR_KDA_DIM + dim;
+
+    {
+        const uint32_t token = blockIdx.x;
+        if (token >= n_tokens) return;
+
+        /* Taps reach back conv_kernel-1 raw tokens; positions before the
+         * launch come from the shift register, where launch-relative x[-m]
+         * sits in slot conv_kernel-m. */
+        float q = 0.0f;
+        float k = 0.0f;
+        float v = 0.0f;
+        for (uint32_t tap = 0; tap < conv_kernel; tap++) {
+            const int32_t src =
+                (int32_t)token - (int32_t)(conv_kernel - 1u) + (int32_t)tap;
+            float qv;
+            float kv;
+            float vv_in;
+            if (src >= 0) {
+                const uint64_t base = (uint64_t)src * vector_count + channel;
+                qv = q_raw[base];
+                kv = k_raw[base];
+                vv_in = v_raw[base];
+            } else {
+                const uint64_t slot = channel * conv_kernel +
+                    (uint32_t)((int32_t)conv_kernel + src);
+                qv = q_conv_state[slot];
+                kv = k_conv_state[slot];
+                vv_in = v_conv_state[slot];
+            }
+            const uint64_t weight = channel * conv_kernel + tap;
+            q += qv * q_conv_weight[weight];
+            k += kv * k_conv_weight[weight];
+            v += vv_in * v_conv_weight[weight];
+        }
+        q = solar_kda_silu(q);
+        k = solar_kda_silu(k);
+        v = solar_kda_silu(v);
+
+        q_sq[dim] = q * q;
+        k_sq[dim] = k * k;
+        __syncthreads();
+        for (uint32_t stride = SOLAR_KDA_DIM / 2u;
+             stride > 0u;
+             stride >>= 1u) {
+            if (dim < stride) {
+                q_sq[dim] += q_sq[dim + stride];
+                k_sq[dim] += k_sq[dim + stride];
+            }
+            __syncthreads();
+        }
+        if (dim == 0u) {
+            q_norm_scale =
+                rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)SOLAR_KDA_DIM);
+            k_norm_scale = rsqrtf(k_sq[0] + 1.0e-6f);
+        }
+        __syncthreads();
+
+        float gate = decay_scale[head] *
+            solar_kda_softplus(
+                g_raw[(uint64_t)token * vector_count + channel] +
+                dt_bias[channel]);
+        if (gate < gate_lower_bound) gate = gate_lower_bound;
+
+        /* Workspace planes are head-major [head][token][dim]: the chunk
+         * kernels then touch one contiguous 32 KiB span per (chunk, head)
+         * instead of 64 rows scattered 32 KiB apart, which is what keeps
+         * them L1-resident. */
+        const uint64_t row =
+            ((uint64_t)head * n_tokens + token) * SOLAR_KDA_DIM + dim;
+        qn[row] = q * q_norm_scale;
+        kn[row] = k * k_norm_scale;
+        vv[row] = v;
+        gl[row] = gate;
+    }
+}
+
+/* Advances the three shift registers to their post-launch contents in one
+ * pass. Slot i must hold raw[n-conv_kernel+i]; when n < conv_kernel that
+ * reads old slot n+i, which is always ahead of the slot being written, so
+ * ascending order needs no staging buffer. */
+static __global__ void solar_kda_chunk_conv_tail_kernel(
+        float       *q_conv_state,
+        float       *k_conv_state,
+        float       *v_conv_state,
+        const float *q_raw,
+        const float *k_raw,
+        const float *v_raw,
+        uint32_t     n_tokens,
+        uint64_t     vector_count,
+        uint32_t     conv_kernel) {
+    const uint64_t channel = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= vector_count) return;
+    for (uint32_t i = 0; i < conv_kernel; i++) {
+        const int32_t src =
+            (int32_t)n_tokens - (int32_t)conv_kernel + (int32_t)i;
+        const uint64_t slot = channel * conv_kernel + i;
+        if (src >= 0) {
+            const uint64_t base = (uint64_t)src * vector_count + channel;
+            q_conv_state[slot] = q_raw[base];
+            k_conv_state[slot] = k_raw[base];
+            v_conv_state[slot] = v_raw[base];
+        } else {
+            const uint64_t from =
+                channel * conv_kernel + (uint32_t)((int32_t)conv_kernel + src);
+            q_conv_state[slot] = q_conv_state[from];
+            k_conv_state[slot] = k_conv_state[from];
+            v_conv_state[slot] = v_conv_state[from];
+        }
+    }
+}
+
+/* Shared-memory plan for the factor kernel: the A/T matrix, the betas, and a
+ * region holding first the three factor tiles (rows padded to 129 floats so
+ * the strided pairwise dots stay bank-conflict free) and later the
+ * beta-scaled K~ rows (row-contiguous reads, no padding needed). B itself
+ * lives in the gl plane: the prefix pass rewrites it in place and later
+ * reads stay in L1, keeping the block under 50 KiB so two blocks share an
+ * SM. */
+#define SOLAR_KDA_ROW 132u
+#define SOLAR_KDA_SH_A 0u
+#define SOLAR_KDA_SH_BETA (SOLAR_KDA_CHUNK * (SOLAR_KDA_CHUNK + 1u))
+#define SOLAR_KDA_SH_TILE (SOLAR_KDA_SH_BETA + SOLAR_KDA_CHUNK)
+#define SOLAR_KDA_FACTOR_SHARED \
+    ((SOLAR_KDA_SH_TILE + SOLAR_KDA_CHUNK * SOLAR_KDA_DIM) * sizeof(float))
+
+/* One block per (chunk, head), 256 threads. Produces everything the scan
+ * needs that does not depend on the incoming state: the in-place prefix of
+ * the log decays (gl becomes B), the masked Mq matrix for the intra output,
+ * and the two triangular-solve products U_loc = T beta V and W = T beta K~,
+ * so the sequential scan only has to fold S0 in with dense math. */
+static __global__ void solar_kda_chunk_factor_kernel(
+        float       *gl,
+        float       *ul,
+        float       *ww,
+        float       *mq,
+        const float *qn,
+        const float *kn,
+        const float *vv,
+        const float *beta_logits,
+        uint32_t     n_tokens,
+        uint32_t     n_head) {
+    extern __shared__ float sh[];
+    float *sA = sh + SOLAR_KDA_SH_A;      /* [64][65] A, then T in place */
+    float *sBeta = sh + SOLAR_KDA_SH_BETA;
+    float *sTile = sh + SOLAR_KDA_SH_TILE; /* sub-block factors, then K~ */
+
+    const uint32_t chunk = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t base_token = chunk * SOLAR_KDA_CHUNK;
+    const uint32_t n = n_tokens - base_token < SOLAR_KDA_CHUNK
+        ? n_tokens - base_token : SOLAR_KDA_CHUNK;
+    const uint64_t plane =
+        ((uint64_t)head * n_tokens + base_token) * SOLAR_KDA_DIM;
+    float *glh = gl + plane;
+    const float *qnh = qn + plane;
+    const float *knh = kn + plane;
+    const float *vvh = vv + plane;
+
+    if (tid < SOLAR_KDA_DIM) {
+        float acc = 0.0f;
+        for (uint32_t t = 0; t < n; t++) {
+            acc += glh[t * SOLAR_KDA_DIM + tid];
+            glh[t * SOLAR_KDA_DIM + tid] = acc;
+        }
+    } else if (tid < SOLAR_KDA_DIM + SOLAR_KDA_CHUNK) {
+        const uint32_t t = tid - SOLAR_KDA_DIM;
+        sBeta[t] = t < n
+            ? 2.0f / (1.0f + expf(
+                  -beta_logits[(uint64_t)(base_token + t) * n_head + head]))
+            : 0.0f;
+    }
+    /* __syncthreads() also orders the block's global writes, so the B rows
+     * just written to glh are safe to read below. */
+    __syncthreads();
+
+    /* Sub-block sweep over the lower triangle: build the reference-factored
+     * row tiles, then one thread per (t,s) pair accumulates both the k-dot
+     * (into A, beta-scaled, strictly lower) and the q-dot (masked inclusive,
+     * straight to global Mq). */
+    float *rowLq = sTile;
+    float *rowLk = sTile + SOLAR_KDA_SUB * SOLAR_KDA_ROW;
+    float *rowR = sTile + 2u * SOLAR_KDA_SUB * SOLAR_KDA_ROW;
+    for (uint32_t bi = 0; bi < SOLAR_KDA_CHUNK / SOLAR_KDA_SUB; bi++) {
+        for (uint32_t bj = 0; bj <= bi; bj++) {
+            const uint32_t r0 = bi * SOLAR_KDA_SUB;
+            const uint32_t c0 = bj * SOLAR_KDA_SUB;
+            for (uint32_t idx = tid;
+                 idx < SOLAR_KDA_SUB * SOLAR_KDA_DIM;
+                 idx += blockDim.x) {
+                const uint32_t r = idx / SOLAR_KDA_DIM;
+                const uint32_t d = idx - r * SOLAR_KDA_DIM;
+                const uint32_t t = r0 + r;
+                const uint32_t s = c0 + r;
+                const float ref = glh[r0 * SOLAR_KDA_DIM + d];
+                float lq = 0.0f;
+                float lk = 0.0f;
+                float rr = 0.0f;
+                if (t < n) {
+                    const float decay =
+                        __expf(glh[t * SOLAR_KDA_DIM + d] - ref);
+                    lq = qnh[t * SOLAR_KDA_DIM + d] * decay;
+                    lk = knh[t * SOLAR_KDA_DIM + d] * decay;
+                }
+                if (s < n) {
+                    rr = knh[s * SOLAR_KDA_DIM + d] *
+                        __expf(ref - glh[s * SOLAR_KDA_DIM + d]);
+                }
+                rowLq[r * SOLAR_KDA_ROW + d] = lq;
+                rowLk[r * SOLAR_KDA_ROW + d] = lk;
+                rowR[r * SOLAR_KDA_ROW + d] = rr;
+            }
+            __syncthreads();
+
+            const uint32_t tr = tid / SOLAR_KDA_SUB;
+            const uint32_t sc = tid - tr * SOLAR_KDA_SUB;
+            const uint32_t t = r0 + tr;
+            const uint32_t s = c0 + sc;
+            float mk = 0.0f;
+            float mqv = 0.0f;
+            const float4 *r4 = (const float4 *)(rowR + sc * SOLAR_KDA_ROW);
+            const float4 *lk4 = (const float4 *)(rowLk + tr * SOLAR_KDA_ROW);
+            const float4 *lq4 = (const float4 *)(rowLq + tr * SOLAR_KDA_ROW);
+#pragma unroll 8
+            for (uint32_t d4 = 0; d4 < SOLAR_KDA_DIM / 4u; d4++) {
+                const float4 rv = r4[d4];
+                const float4 lk = lk4[d4];
+                const float4 lq = lq4[d4];
+                mk += lk.x * rv.x + lk.y * rv.y + lk.z * rv.z + lk.w * rv.w;
+                mqv += lq.x * rv.x + lq.y * rv.y + lq.z * rv.z + lq.w * rv.w;
+            }
+            sA[t * (SOLAR_KDA_CHUNK + 1u) + s] =
+                s < t ? sBeta[t] * mk : 0.0f;
+            mq[(((uint64_t)chunk * n_head + head) * SOLAR_KDA_CHUNK + t) *
+                   SOLAR_KDA_CHUNK + s] =
+                (s <= t && t < n && s < n) ? mqv : 0.0f;
+            __syncthreads();
+        }
+    }
+
+    /* In-place forward substitution: row i of (I + A)^-1 from the already
+     * inverted rows above it. Row i's original A values are still intact
+     * when its replacements are computed. */
+    if (tid == 0u) sA[0] = 1.0f;
+    __syncthreads();
+    for (uint32_t i = 1; i < SOLAR_KDA_CHUNK; i++) {
+        float acc = 0.0f;
+        if (tid < i) {
+            for (uint32_t k = tid; k < i; k++) {
+                acc -= sA[i * (SOLAR_KDA_CHUNK + 1u) + k] *
+                    sA[k * (SOLAR_KDA_CHUNK + 1u) + tid];
+            }
+        }
+        __syncthreads();
+        if (tid < i) {
+            sA[i * (SOLAR_KDA_CHUNK + 1u) + tid] = acc;
+        } else if (tid == i) {
+            sA[i * (SOLAR_KDA_CHUNK + 1u) + i] = 1.0f;
+        }
+        __syncthreads();
+    }
+
+    /* K~ rows with beta folded in, reusing the tile region (row-contiguous
+     * reads below, so no padding). */
+    for (uint32_t idx = tid;
+         idx < SOLAR_KDA_CHUNK * SOLAR_KDA_DIM;
+         idx += blockDim.x) {
+        const uint32_t r = idx >> 7;
+        const uint32_t d = idx & (SOLAR_KDA_DIM - 1u);
+        float value = 0.0f;
+        if (r < n) {
+            value = sBeta[r] * knh[r * SOLAR_KDA_DIM + d] *
+                __expf(glh[r * SOLAR_KDA_DIM + d]);
+        }
+        sTile[idx] = value;
+    }
+    __syncthreads();
+
+    /* U_loc and W rows through the lower-triangular T, as 4-row x 8-column
+     * register tiles: per s step each thread takes four T coefficients and
+     * two float4 right-hand-side vectors for 32 FMA. The s loop tops out at
+     * the tile's last row; the pairs it visits above a row's own diagonal
+     * all land in the zero-written upper halves of the diagonal sub-blocks,
+     * so they contribute nothing. V streams from global (staging it through
+     * shared crossed the two-blocks-per-SM boundary and lost more than it
+     * saved); K~ reads full shared rows, which touch every bank quad once. */
+    const uint32_t tg = (tid >> 4) * 4u;
+    const uint32_t dgc = (tid & 15u) * 8u;
+    float acc[4][8];
+#pragma unroll
+    for (uint32_t i = 0; i < 4u; i++)
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) acc[i][j] = 0.0f;
+    for (uint32_t s = 0; s < tg + 4u && s < n; s++) {
+        const float bs = sBeta[s];
+        const float4 va = *(const float4 *)
+            (vvh + (uint64_t)s * SOLAR_KDA_DIM + dgc);
+        const float4 vb = *(const float4 *)
+            (vvh + (uint64_t)s * SOLAR_KDA_DIM + dgc + 4u);
+        const float rv[8] = {va.x * bs, va.y * bs, va.z * bs, va.w * bs,
+                             vb.x * bs, vb.y * bs, vb.z * bs, vb.w * bs};
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const float coeff = sA[(tg + i) * (SOLAR_KDA_CHUNK + 1u) + s];
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) acc[i][j] += coeff * rv[j];
+        }
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 4u; i++) {
+        if (tg + i < n) {
+            float *urow = ul + plane +
+                (uint64_t)(tg + i) * SOLAR_KDA_DIM + dgc;
+            float4 oa;
+            float4 ob;
+            oa.x = acc[i][0]; oa.y = acc[i][1];
+            oa.z = acc[i][2]; oa.w = acc[i][3];
+            ob.x = acc[i][4]; ob.y = acc[i][5];
+            ob.z = acc[i][6]; ob.w = acc[i][7];
+            *(float4 *)urow = oa;
+            *(float4 *)(urow + 4u) = ob;
+        }
+    }
+
+#pragma unroll
+    for (uint32_t i = 0; i < 4u; i++)
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) acc[i][j] = 0.0f;
+    for (uint32_t s = 0; s < tg + 4u && s < n; s++) {
+        const float4 ka = *(const float4 *)
+            (sTile + s * SOLAR_KDA_DIM + dgc);
+        const float4 kb = *(const float4 *)
+            (sTile + s * SOLAR_KDA_DIM + dgc + 4u);
+        const float rk[8] = {ka.x, ka.y, ka.z, ka.w,
+                             kb.x, kb.y, kb.z, kb.w};
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const float coeff = sA[(tg + i) * (SOLAR_KDA_CHUNK + 1u) + s];
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) acc[i][j] += coeff * rk[j];
+        }
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 4u; i++) {
+        if (tg + i < n) {
+            float *wrow = ww + plane +
+                (uint64_t)(tg + i) * SOLAR_KDA_DIM + dgc;
+            float4 oa;
+            float4 ob;
+            oa.x = acc[i][0]; oa.y = acc[i][1];
+            oa.z = acc[i][2]; oa.w = acc[i][3];
+            ob.x = acc[i][4]; ob.y = acc[i][5];
+            ob.z = acc[i][6]; ob.w = acc[i][7];
+            *(float4 *)wrow = oa;
+            *(float4 *)(wrow + 4u) = ob;
+        }
+    }
+}
+
+/* The scan's shared plan: the 128x64 state slice (rows padded to 68 floats
+ * so column vectors stagger banks), one 64x128 operand tile reused for Q~,
+ * W and K^ in turn, and the slice's U rows (padded like the state). */
+#define SOLAR_KDA_SROW 68u
+#define SOLAR_KDA_SCAN_SHARED \
+    ((SOLAR_KDA_DIM * SOLAR_KDA_SROW + \
+      SOLAR_KDA_CHUNK * SOLAR_KDA_DIM + \
+      SOLAR_KDA_CHUNK * SOLAR_KDA_SROW) * sizeof(float))
+
+/* One block per (head, 64-column state slice), 256 threads, looping chunks
+ * in sequence order. The recurrence is column-separable, so each block keeps
+ * its 128x64 state slice in shared memory for the whole launch and runs the
+ * three per-chunk products as register-tiled GEMMs: a 16x16 thread grid with
+ * 4x4 (or 8x4) micro-tiles and float4 operands, eight FMA per shared vector
+ * instead of the one-load-one-FMA shuffle dots of the previous revision.
+ * O_inter = Q~ S0 and U = U_loc - W S0 share one 64x64 output shape; the
+ * state fold S = diag(e) S + K^T U owns disjoint micro-tiles of sS, so no
+ * cross-thread ordering is needed beyond the phase barriers. */
+static __global__ void solar_kda_chunk_scan_kernel(
+        float       *out,
+        float       *state,
+        float       *ul,
+        const float *ww,
+        const float *gl,
+        const float *qn,
+        const float *kn,
+        uint32_t     n_tokens,
+        uint32_t     n_head) {
+    extern __shared__ float sh[];
+    float *sS = sh;                                   /* [128][68] state */
+    float *sX = sS + SOLAR_KDA_DIM * SOLAR_KDA_SROW;  /* [64][128] Q~/W/K^ */
+    float *sU = sX + SOLAR_KDA_CHUNK * SOLAR_KDA_DIM; /* [64][68] U rows */
+
+    const uint32_t head = blockIdx.x;
+    const uint32_t slice = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint64_t vector_count = (uint64_t)n_head * SOLAR_KDA_DIM;
+    const uint64_t head_base = (uint64_t)head * SOLAR_KDA_DIM;
+    const uint64_t state_base = head_base * SOLAR_KDA_DIM;
+    const uint64_t plane0 = (uint64_t)head * n_tokens * SOLAR_KDA_DIM;
+    const uint32_t dv_base = slice * 64u;
+
+    for (uint32_t idx = tid;
+         idx < SOLAR_KDA_DIM * 64u;
+         idx += blockDim.x) {
+        const uint32_t kd = idx >> 6;
+        const uint32_t d = idx & 63u;
+        sS[kd * SOLAR_KDA_SROW + d] =
+            state[state_base + (uint64_t)kd * SOLAR_KDA_DIM + dv_base + d];
+    }
+
+    /* 64x64 outputs: 4 rows x 4 columns per thread. 128x64 state fold:
+     * 8 rows x 4 columns. */
+    const uint32_t tg = (tid >> 4) * 4u;
+    const uint32_t dg = (tid & 15u) * 4u;
+
+    const uint32_t n_chunks =
+        (n_tokens + SOLAR_KDA_CHUNK - 1u) / SOLAR_KDA_CHUNK;
+    for (uint32_t chunk = 0; chunk < n_chunks; chunk++) {
+        const uint32_t base_token = chunk * SOLAR_KDA_CHUNK;
+        const uint32_t n = n_tokens - base_token < SOLAR_KDA_CHUNK
+            ? n_tokens - base_token : SOLAR_KDA_CHUNK;
+        const uint64_t cbase = plane0 + (uint64_t)base_token * SOLAR_KDA_DIM;
+        const float *glh = gl + cbase;
+        const float *qnh = qn + cbase;
+        const float *knh = kn + cbase;
+        const float *wwh = ww + cbase;
+        float *ulh = ul + cbase;
+
+        __syncthreads();
+        for (uint32_t idx = tid;
+             idx < SOLAR_KDA_CHUNK * SOLAR_KDA_DIM;
+             idx += blockDim.x) {
+            const uint32_t t = idx >> 7;
+            sX[idx] = t < n ? qnh[idx] * __expf(glh[idx]) : 0.0f;
+        }
+        for (uint32_t idx = tid;
+             idx < SOLAR_KDA_CHUNK * 64u;
+             idx += blockDim.x) {
+            const uint32_t t = idx >> 6;
+            const uint32_t d = idx & 63u;
+            sU[t * SOLAR_KDA_SROW + d] = t < n
+                ? ulh[t * SOLAR_KDA_DIM + dv_base + d] : 0.0f;
+        }
+        __syncthreads();
+
+        float acc[4][4];
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++)
+#pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) acc[i][j] = 0.0f;
+        for (uint32_t k = 0; k < SOLAR_KDA_DIM; k += 4u) {
+            float sv[4][4];
+#pragma unroll
+            for (uint32_t r = 0; r < 4u; r++) {
+                const float4 v = *(const float4 *)
+                    (sS + (k + r) * SOLAR_KDA_SROW + dg);
+                sv[r][0] = v.x; sv[r][1] = v.y; sv[r][2] = v.z; sv[r][3] = v.w;
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) {
+                const float4 x = *(const float4 *)
+                    (sX + (tg + i) * SOLAR_KDA_DIM + k);
+                const float xa[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+                for (uint32_t r = 0; r < 4u; r++)
+#pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++)
+                        acc[i][j] += xa[r] * sv[r][j];
+            }
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            if (tg + i < n) {
+                float4 o;
+                o.x = acc[i][0]; o.y = acc[i][1];
+                o.z = acc[i][2]; o.w = acc[i][3];
+                *(float4 *)(out +
+                    (uint64_t)(base_token + tg + i) * vector_count +
+                    head_base + dv_base + dg) = o;
+            }
+        }
+        __syncthreads();
+
+        for (uint32_t idx = tid;
+             idx < SOLAR_KDA_CHUNK * SOLAR_KDA_DIM;
+             idx += blockDim.x) {
+            const uint32_t t = idx >> 7;
+            sX[idx] = t < n ? wwh[idx] : 0.0f;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++)
+#pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) acc[i][j] = 0.0f;
+        for (uint32_t k = 0; k < SOLAR_KDA_DIM; k += 4u) {
+            float sv[4][4];
+#pragma unroll
+            for (uint32_t r = 0; r < 4u; r++) {
+                const float4 v = *(const float4 *)
+                    (sS + (k + r) * SOLAR_KDA_SROW + dg);
+                sv[r][0] = v.x; sv[r][1] = v.y; sv[r][2] = v.z; sv[r][3] = v.w;
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) {
+                const float4 x = *(const float4 *)
+                    (sX + (tg + i) * SOLAR_KDA_DIM + k);
+                const float xa[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+                for (uint32_t r = 0; r < 4u; r++)
+#pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++)
+                        acc[i][j] += xa[r] * sv[r][j];
+            }
+        }
+        /* U = U_loc - W S0. Each (t, dv) micro-tile has one owner, so the
+         * in-place rewrite of sU needs no cross-thread ordering. */
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            float *urow = sU + (tg + i) * SOLAR_KDA_SROW + dg;
+            const float u0 = urow[0] - acc[i][0];
+            const float u1 = urow[1] - acc[i][1];
+            const float u2 = urow[2] - acc[i][2];
+            const float u3 = urow[3] - acc[i][3];
+            urow[0] = u0; urow[1] = u1; urow[2] = u2; urow[3] = u3;
+            if (tg + i < n) {
+                float4 o;
+                o.x = u0; o.y = u1; o.z = u2; o.w = u3;
+                *(float4 *)(ulh +
+                    (uint64_t)(tg + i) * SOLAR_KDA_DIM + dv_base + dg) = o;
+            }
+        }
+        __syncthreads();
+
+        /* K^ rows decay forward to the chunk end; the state rows decay all
+         * the way, before the fold accumulates the chunk's update. */
+        const uint32_t last = (n - 1u) * SOLAR_KDA_DIM;
+        for (uint32_t idx = tid;
+             idx < SOLAR_KDA_CHUNK * SOLAR_KDA_DIM;
+             idx += blockDim.x) {
+            const uint32_t t = idx >> 7;
+            const uint32_t d = idx & (SOLAR_KDA_DIM - 1u);
+            sX[idx] = t < n
+                ? knh[idx] * __expf(glh[last + d] - glh[idx]) : 0.0f;
+        }
+        for (uint32_t idx = tid;
+             idx < SOLAR_KDA_DIM * 64u;
+             idx += blockDim.x) {
+            const uint32_t kd = idx >> 6;
+            const uint32_t d = idx & 63u;
+            sS[kd * SOLAR_KDA_SROW + d] *= __expf(glh[last + kd]);
+        }
+        __syncthreads();
+
+        {
+            const uint32_t kg = (tid >> 4) * 8u;
+            float facc[8][4];
+#pragma unroll
+            for (uint32_t r = 0; r < 8u; r++)
+#pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) facc[r][j] = 0.0f;
+            for (uint32_t t = 0; t < SOLAR_KDA_CHUNK; t++) {
+                const float4 ka = *(const float4 *)
+                    (sX + t * SOLAR_KDA_DIM + kg);
+                const float4 kb = *(const float4 *)
+                    (sX + t * SOLAR_KDA_DIM + kg + 4u);
+                const float kr[8] = {ka.x, ka.y, ka.z, ka.w,
+                                     kb.x, kb.y, kb.z, kb.w};
+                const float4 uv = *(const float4 *)
+                    (sU + t * SOLAR_KDA_SROW + dg);
+                const float ua[4] = {uv.x, uv.y, uv.z, uv.w};
+#pragma unroll
+                for (uint32_t r = 0; r < 8u; r++)
+#pragma unroll
+                    for (uint32_t j = 0; j < 4u; j++)
+                        facc[r][j] += kr[r] * ua[j];
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < 8u; r++) {
+                float *srow = sS + (kg + r) * SOLAR_KDA_SROW + dg;
+#pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) srow[j] += facc[r][j];
+            }
+        }
+    }
+
+    __syncthreads();
+    for (uint32_t idx = tid;
+         idx < SOLAR_KDA_DIM * 64u;
+         idx += blockDim.x) {
+        const uint32_t kd = idx >> 6;
+        const uint32_t d = idx & 63u;
+        state[state_base + (uint64_t)kd * SOLAR_KDA_DIM + dv_base + d] =
+            sS[kd * SOLAR_KDA_SROW + d];
+    }
+}
+
+#define SOLAR_KDA_INTRA_SHARED \
+    ((SOLAR_KDA_CHUNK * (SOLAR_KDA_CHUNK + 1u) + \
+      SOLAR_KDA_CHUNK * SOLAR_KDA_DIM) * sizeof(float))
+
+/* One block per (chunk, head), 256 threads: out += masked Mq U as 4-row x
+ * 8-column register tiles, like the factor kernel's T products. Both the Mq
+ * tile and the chunk's U rows are staged through shared; the s loop tops
+ * out at the tile's last row, and the pairs above a row's own diagonal all
+ * land in Mq's zero-masked diagonal sub-blocks. */
+static __global__ void solar_kda_chunk_intra_kernel(
+        float       *out,
+        const float *mq,
+        const float *ul,
+        uint32_t     n_tokens,
+        uint32_t     n_head) {
+    extern __shared__ float sh[];
+    float *sM = sh;                                       /* [64][65] */
+    float *sU = sh + SOLAR_KDA_CHUNK * (SOLAR_KDA_CHUNK + 1u);
+
+    const uint32_t chunk = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t base_token = chunk * SOLAR_KDA_CHUNK;
+    const uint32_t n = n_tokens - base_token < SOLAR_KDA_CHUNK
+        ? n_tokens - base_token : SOLAR_KDA_CHUNK;
+    const uint64_t vector_count = (uint64_t)n_head * SOLAR_KDA_DIM;
+    const uint64_t head_base = (uint64_t)head * SOLAR_KDA_DIM;
+    const uint64_t mq_base =
+        ((uint64_t)chunk * n_head + head) * SOLAR_KDA_CHUNK * SOLAR_KDA_CHUNK;
+    const float *ulh = ul +
+        ((uint64_t)head * n_tokens + base_token) * SOLAR_KDA_DIM;
+
+    for (uint32_t idx = tid;
+         idx < SOLAR_KDA_CHUNK * SOLAR_KDA_CHUNK;
+         idx += blockDim.x) {
+        const uint32_t t = idx >> 6;
+        const uint32_t s = idx & (SOLAR_KDA_CHUNK - 1u);
+        sM[t * (SOLAR_KDA_CHUNK + 1u) + s] = mq[mq_base + idx];
+    }
+    for (uint32_t idx = tid;
+         idx < SOLAR_KDA_CHUNK * SOLAR_KDA_DIM;
+         idx += blockDim.x) {
+        sU[idx] = (idx >> 7) < n ? ulh[idx] : 0.0f;
+    }
+    __syncthreads();
+
+    const uint32_t tg = (tid >> 4) * 4u;
+    const uint32_t dgc = (tid & 15u) * 8u;
+    float acc[4][8];
+#pragma unroll
+    for (uint32_t i = 0; i < 4u; i++)
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) acc[i][j] = 0.0f;
+    for (uint32_t s = 0; s < tg + 4u && s < n; s++) {
+        const float4 ua = *(const float4 *)
+            (sU + s * SOLAR_KDA_DIM + dgc);
+        const float4 ub = *(const float4 *)
+            (sU + s * SOLAR_KDA_DIM + dgc + 4u);
+        const float rv[8] = {ua.x, ua.y, ua.z, ua.w,
+                             ub.x, ub.y, ub.z, ub.w};
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const float m = sM[(tg + i) * (SOLAR_KDA_CHUNK + 1u) + s];
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) acc[i][j] += m * rv[j];
+        }
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 4u; i++) {
+        if (tg + i < n) {
+            float *orow = out +
+                (uint64_t)(base_token + tg + i) * vector_count +
+                head_base + dgc;
+            float4 oa = *(const float4 *)orow;
+            float4 ob = *(const float4 *)(orow + 4u);
+            oa.x += acc[i][0]; oa.y += acc[i][1];
+            oa.z += acc[i][2]; oa.w += acc[i][3];
+            ob.x += acc[i][4]; ob.y += acc[i][5];
+            ob.z += acc[i][6]; ob.w += acc[i][7];
+            *(float4 *)orow = oa;
+            *(float4 *)(orow + 4u) = ob;
+        }
+    }
+}
+
+static bool solar_kda_chunk_layout(
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint64_t *plane_bytes,
+        uint64_t *mq_bytes,
+        uint64_t *total_bytes) {
+    if (n_tokens < SOLAR_KDA_CHUNK || n_head == 0u ||
+        head_dim != SOLAR_KDA_DIM) {
+        return false;
+    }
+    const uint64_t vector_count = (uint64_t)n_head * SOLAR_KDA_DIM;
+    if (vector_count > UINT64_MAX / n_tokens / sizeof(float)) return false;
+    const uint64_t plane_raw =
+        (uint64_t)n_tokens * vector_count * sizeof(float);
+    if (plane_raw > UINT64_MAX - 255u) return false;
+    const uint64_t plane = tt_align256_u64(plane_raw);
+    const uint64_t n_chunks = ((uint64_t)n_tokens - 1u) /
+        SOLAR_KDA_CHUNK + 1u;
+    const uint64_t mq_per =
+        (uint64_t)SOLAR_KDA_CHUNK * SOLAR_KDA_CHUNK * sizeof(float);
+    if (n_chunks > UINT64_MAX / n_head ||
+        n_chunks * n_head > UINT64_MAX / mq_per) {
+        return false;
+    }
+    const uint64_t mq_raw = n_chunks * n_head * mq_per;
+    if (mq_raw > UINT64_MAX - 255u) return false;
+    const uint64_t mq = tt_align256_u64(mq_raw);
+    if (plane > (UINT64_MAX - mq) / 6u) return false;
+    if (plane_bytes) *plane_bytes = plane;
+    if (mq_bytes) *mq_bytes = mq;
+    if (total_bytes) *total_bytes = 6u * plane + mq;
+    return true;
+}
+
+static uint64_t solar_kda_chunk_scratch_bytes(
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    uint64_t bytes = 0u;
+    return solar_kda_chunk_layout(
+        n_tokens, n_head, head_dim, NULL, NULL, &bytes) ? bytes : 0u;
+}
+
+static bool solar_kda_chunk_shmem_prepare(void) {
+    enum { SOLAR_KDA_MAX_CUDA_DEVICES = 64 };
+    static std::once_flag once[SOLAR_KDA_MAX_CUDA_DEVICES];
+    static int status[SOLAR_KDA_MAX_CUDA_DEVICES] = {0};
+    int device = -1;
+    if (!cuda_ok(cudaGetDevice(&device), "get Solar KDA CUDA device") ||
+        device < 0 || device >= SOLAR_KDA_MAX_CUDA_DEVICES) {
+        return false;
+    }
+    std::call_once(once[device], [device]() {
+        const bool ok =
+            cuda_ok(cudaFuncSetAttribute(
+                        solar_kda_chunk_factor_kernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        (int)SOLAR_KDA_FACTOR_SHARED),
+                    "Solar KDA factor shared-memory opt-in") &&
+            cuda_ok(cudaFuncSetAttribute(
+                        solar_kda_chunk_scan_kernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        (int)SOLAR_KDA_SCAN_SHARED),
+                    "Solar KDA scan shared-memory opt-in") &&
+            cuda_ok(cudaFuncSetAttribute(
+                        solar_kda_chunk_intra_kernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        (int)SOLAR_KDA_INTRA_SHARED),
+                    "Solar KDA intra shared-memory opt-in");
+        status[device] = ok ? 1 : -1;
+    });
+    return status[device] == 1;
+}
+
+static int solar_kda_chunk_prefill_launch(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *scratch_tensor,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              conv_kernel,
+        float                 gate_lower_bound,
+        const char           *what) {
+    uint64_t plane = 0u;
+    uint64_t mq_bytes = 0u;
+    uint64_t total = 0u;
+    if (!scratch_tensor ||
+        !solar_kda_chunk_layout(n_tokens, n_head, SOLAR_KDA_DIM,
+                                &plane, &mq_bytes, &total) ||
+        scratch_tensor->bytes < total || !solar_kda_chunk_shmem_prepare()) {
+        return 0;
+    }
+    (void)mq_bytes;
+    unsigned char *scratch = (unsigned char *)scratch_tensor->ptr;
+    float *qn = (float *)(scratch);
+    float *kn = (float *)(scratch + plane);
+    float *vv = (float *)(scratch + 2u * plane);
+    float *gl = (float *)(scratch + 3u * plane);
+    float *ul = (float *)(scratch + 4u * plane);
+    float *ww = (float *)(scratch + 5u * plane);
+    float *mq = (float *)(scratch + 6u * plane);
+
+    const uint64_t vector_count = (uint64_t)n_head * SOLAR_KDA_DIM;
+    const uint32_t n_chunks =
+        (n_tokens - 1u) / SOLAR_KDA_CHUNK + 1u;
+    cudaStream_t stream = ds4_current_stream();
+    dim3 prep_grid(n_tokens, n_head, 1u);
+    solar_kda_chunk_prep_kernel<<<prep_grid, SOLAR_KDA_DIM, 0, stream>>>(
+        qn, kn, vv, gl,
+        (const float *)q_raw->ptr, (const float *)k_raw->ptr,
+        (const float *)v_raw->ptr, (const float *)g_raw->ptr,
+        (const float *)q_conv_state->ptr, (const float *)k_conv_state->ptr,
+        (const float *)v_conv_state->ptr,
+        (const float *)q_conv_weight->ptr,
+        (const float *)k_conv_weight->ptr,
+        (const float *)v_conv_weight->ptr,
+        (const float *)decay_scale->ptr, (const float *)dt_bias->ptr,
+        n_tokens, n_head, conv_kernel, gate_lower_bound);
+    const uint32_t tail_blocks =
+        (uint32_t)((vector_count + 255u) / 256u);
+    solar_kda_chunk_conv_tail_kernel<<<tail_blocks, 256, 0, stream>>>(
+        (float *)q_conv_state->ptr, (float *)k_conv_state->ptr,
+        (float *)v_conv_state->ptr,
+        (const float *)q_raw->ptr, (const float *)k_raw->ptr,
+        (const float *)v_raw->ptr,
+        n_tokens, vector_count, conv_kernel);
+    dim3 chunk_grid(n_chunks, n_head, 1u);
+    solar_kda_chunk_factor_kernel
+        <<<chunk_grid, 256, SOLAR_KDA_FACTOR_SHARED, stream>>>(
+            gl, ul, ww, mq, qn, kn, vv,
+            (const float *)beta_logits->ptr, n_tokens, n_head);
+    dim3 scan_grid(n_head, 2u, 1u);
+    solar_kda_chunk_scan_kernel
+        <<<scan_grid, 256, SOLAR_KDA_SCAN_SHARED, stream>>>(
+            (float *)out->ptr, (float *)recurrent_state->ptr,
+            ul, ww, gl, qn, kn, n_tokens, n_head);
+    solar_kda_chunk_intra_kernel
+        <<<chunk_grid, 256, SOLAR_KDA_INTRA_SHARED, stream>>>(
+            (float *)out->ptr, mq, ul, n_tokens, n_head);
+    return cuda_ok(cudaGetLastError(), what);
+}
+
+
+static int solar_kda_sequence_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *scratch,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound,
+        const char             *what) {
+    if (!out || !recurrent_state || !q_conv_state || !k_conv_state ||
+        !v_conv_state || !q_raw || !k_raw || !v_raw || !g_raw ||
+        !beta_logits || !q_conv_weight || !k_conv_weight ||
+        !v_conv_weight || !decay_scale || !dt_bias ||
+        n_tokens == 0u || n_head == 0u || head_dim == 0u || head_dim > 256u ||
+        conv_kernel == 0u || conv_kernel > 16u || gate_lower_bound > 0.0f) {
+        return 0;
+    }
+
+    const uint64_t vector_count = (uint64_t)n_head * head_dim;
+    const uint64_t vector_bytes = vector_count * sizeof(float);
+    const uint64_t sequence_vector_bytes = (uint64_t)n_tokens * vector_bytes;
+    const uint64_t conv_bytes = vector_count * conv_kernel * sizeof(float);
+    const uint64_t state_bytes = vector_count * head_dim * sizeof(float);
+    const uint64_t head_bytes = (uint64_t)n_head * sizeof(float);
+    const uint64_t sequence_head_bytes = (uint64_t)n_tokens * head_bytes;
+    if (out->bytes < sequence_vector_bytes || recurrent_state->bytes < state_bytes ||
+        q_conv_state->bytes < conv_bytes || k_conv_state->bytes < conv_bytes ||
+        v_conv_state->bytes < conv_bytes || q_raw->bytes < sequence_vector_bytes ||
+        k_raw->bytes < sequence_vector_bytes || v_raw->bytes < sequence_vector_bytes ||
+        g_raw->bytes < sequence_vector_bytes || beta_logits->bytes < sequence_head_bytes ||
+        q_conv_weight->bytes < conv_bytes || k_conv_weight->bytes < conv_bytes ||
+        v_conv_weight->bytes < conv_bytes || decay_scale->bytes < head_bytes ||
+        dt_bias->bytes < vector_bytes) {
+        return 0;
+    }
+
+    const char *force_sequence = getenv("DS4_SOLAR_KDA_STATE_PARTS");
+    const uint64_t chunk_bytes =
+        solar_kda_chunk_scratch_bytes(
+            n_tokens, n_head, head_dim);
+    if (chunk_bytes && !(force_sequence && force_sequence[0]) && scratch) {
+        if (scratch->bytes < chunk_bytes) return 0;
+        static std::once_flag logged_chunked;
+        std::call_once(logged_chunked, []() {
+            fprintf(stderr,
+                    "ds4: Solar KDA prefill uses caller-owned 64-token "
+                    "delta-rule chunks\n");
+        });
+        return solar_kda_chunk_prefill_launch(
+            out, scratch, recurrent_state, q_conv_state, k_conv_state,
+            v_conv_state, q_raw, k_raw, v_raw, g_raw, beta_logits,
+            q_conv_weight, k_conv_weight, v_conv_weight, decay_scale,
+            dt_bias, n_tokens, n_head, conv_kernel, gate_lower_bound, what);
+    }
+
+    uint32_t threads = 1u;
+    while (threads < head_dim) threads <<= 1u;
+    solar_kda_sequence_kernel<<<n_head, threads, 0, ds4_current_stream()>>>(
+            (float *)out->ptr,
+            (float *)recurrent_state->ptr,
+            (float *)q_conv_state->ptr,
+            (float *)k_conv_state->ptr,
+            (float *)v_conv_state->ptr,
+            (const float *)q_raw->ptr,
+            (const float *)k_raw->ptr,
+            (const float *)v_raw->ptr,
+            (const float *)g_raw->ptr,
+            (const float *)beta_logits->ptr,
+            (const float *)q_conv_weight->ptr,
+            (const float *)k_conv_weight->ptr,
+            (const float *)v_conv_weight->ptr,
+            (const float *)decay_scale->ptr,
+            (const float *)dt_bias->ptr,
+            n_tokens, n_head, head_dim, conv_kernel, gate_lower_bound);
+    return cuda_ok(cudaGetLastError(), what);
+}
+
+extern "C" int ds4_gpu_solar_kda_decode_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound) {
+    return solar_kda_sequence_tensor(
+        out, NULL, recurrent_state, q_conv_state, k_conv_state, v_conv_state,
+        q_raw, k_raw, v_raw, g_raw, beta_logits,
+        q_conv_weight, k_conv_weight, v_conv_weight, decay_scale, dt_bias,
+        1u, n_head, head_dim, conv_kernel, gate_lower_bound,
+        "solar-open2 KDA decode");
+}
+
+extern "C" int ds4_gpu_solar_kda_decode_banks_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state_slab,
+        uint64_t                state_bank_stride,
+        uint64_t                recurrent_offset,
+        uint64_t                q_conv_offset,
+        uint64_t                k_conv_offset,
+        uint64_t                v_conv_offset,
+        const ds4_gpu_tensor *bank_ids,
+        uint32_t                n_tokens,
+        uint32_t                max_banks,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound) {
+    if (!out || !state_slab || !bank_ids || !q_raw || !k_raw || !v_raw ||
+        !g_raw || !beta_logits || !q_conv_weight || !k_conv_weight ||
+        !v_conv_weight || !decay_scale || !dt_bias || n_tokens == 0u ||
+        max_banks == 0u || n_head == 0u || head_dim == 0u ||
+        head_dim > 256u || conv_kernel == 0u || conv_kernel > 16u ||
+        gate_lower_bound > 0.0f ||
+        state_bank_stride > UINT64_MAX / max_banks ||
+        state_slab->bytes < state_bank_stride * max_banks ||
+        bank_ids->bytes < (uint64_t)n_tokens * sizeof(uint32_t)) {
+        return 0;
+    }
+    const uint64_t vector_count = (uint64_t)n_head * head_dim;
+    const uint64_t vector_bytes = vector_count * sizeof(float);
+    const uint64_t batch_vector_bytes = (uint64_t)n_tokens * vector_bytes;
+    const uint64_t state_bytes = vector_count * head_dim * sizeof(float);
+    const uint64_t conv_bytes =
+        vector_count * conv_kernel * sizeof(float);
+    const uint64_t head_bytes = (uint64_t)n_head * sizeof(float);
+    const uint64_t batch_head_bytes = (uint64_t)n_tokens * head_bytes;
+    const bool state_layout_ok =
+        recurrent_offset <= state_bank_stride &&
+        state_bytes <= state_bank_stride - recurrent_offset &&
+        q_conv_offset <= state_bank_stride &&
+        conv_bytes <= state_bank_stride - q_conv_offset &&
+        k_conv_offset <= state_bank_stride &&
+        conv_bytes <= state_bank_stride - k_conv_offset &&
+        v_conv_offset <= state_bank_stride &&
+        conv_bytes <= state_bank_stride - v_conv_offset;
+    if (!state_layout_ok || out->bytes < batch_vector_bytes ||
+        q_raw->bytes < batch_vector_bytes ||
+        k_raw->bytes < batch_vector_bytes ||
+        v_raw->bytes < batch_vector_bytes ||
+        g_raw->bytes < batch_vector_bytes ||
+        beta_logits->bytes < batch_head_bytes ||
+        q_conv_weight->bytes < conv_bytes ||
+        k_conv_weight->bytes < conv_bytes ||
+        v_conv_weight->bytes < conv_bytes ||
+        decay_scale->bytes < head_bytes || dt_bias->bytes < vector_bytes) {
+        return 0;
+    }
+    uint32_t threads = 1u;
+    while (threads < head_dim) threads <<= 1u;
+    dim3 grid(n_head, n_tokens, 1u);
+    solar_kda_banks_decode_kernel<<<
+        grid, threads, 0, ds4_current_stream()>>>(
+        (float *)out->ptr, (uint8_t *)state_slab->ptr,
+        state_bank_stride, recurrent_offset, q_conv_offset,
+        k_conv_offset, v_conv_offset,
+        (const uint32_t *)bank_ids->ptr, n_tokens, max_banks,
+        (const float *)q_raw->ptr, (const float *)k_raw->ptr,
+        (const float *)v_raw->ptr, (const float *)g_raw->ptr,
+        (const float *)beta_logits->ptr,
+        (const float *)q_conv_weight->ptr,
+        (const float *)k_conv_weight->ptr,
+        (const float *)v_conv_weight->ptr,
+        (const float *)decay_scale->ptr, (const float *)dt_bias->ptr,
+        n_head, head_dim, conv_kernel, gate_lower_bound);
+    return cuda_ok(cudaGetLastError(), "solar-open2 banked KDA decode");
+}
+
+extern "C" int ds4_gpu_solar_kda_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *scratch,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound) {
+    return solar_kda_sequence_tensor(
+        out, scratch, recurrent_state, q_conv_state, k_conv_state,
+        v_conv_state,
+        q_raw, k_raw, v_raw, g_raw, beta_logits,
+        q_conv_weight, k_conv_weight, v_conv_weight, decay_scale, dt_bias,
+        n_tokens, n_head, head_dim, conv_kernel, gate_lower_bound,
+        "solar-open2 KDA chunked prefill");
+}
+
+/* Solar output gates. Keeping these separate from the KDA recurrence makes
+ * the recurrence fixture useful on its own and gives the GQA branch the same
+ * elementwise sigmoid implementation. */
+static __global__ void solar_sigmoid_gate_kernel(
+        float *out, const float *x, const float *gate, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = x[i] / (1.0f + expf(-gate[i]));
+}
+
+static __global__ void solar_head_rms_sigmoid_gate_kernel(
+        float       *out,
+        const float *x,
+        const float *gate,
+        const float *weight,
+        uint32_t     n_head,
+        uint32_t     head_dim,
+        float        eps) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nth = blockDim.x;
+    const uint64_t base = (uint64_t)row * head_dim;
+    (void)n_head;
+
+    __shared__ float warp_sum[32];
+    float sumsq = 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += nth) {
+        const float v = x[base + d];
+        sumsq += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+    }
+    if ((tid & 31u) == 0u) warp_sum[tid >> 5] = sumsq;
+    __syncthreads();
+    if (tid < 32u) {
+        sumsq = tid < (nth + 31u) / 32u ? warp_sum[tid] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            sumsq += __shfl_xor_sync(0xffffffffu, sumsq, off);
+        }
+        if (tid == 0u) warp_sum[0] = sumsq;
+    }
+    __syncthreads();
+
+    const float scale = rsqrtf(warp_sum[0] / (float)head_dim + eps);
+    for (uint32_t d = tid; d < head_dim; d += nth) {
+        const float sigmoid = 1.0f / (1.0f + expf(-gate[base + d]));
+        out[base + d] = x[base + d] * scale * weight[d] * sigmoid;
+    }
+}
+
+extern "C" int ds4_gpu_solar_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        uint64_t                count) {
+    const uint64_t bytes = count * sizeof(float);
+    if (!out || !x || !gate || count == 0u ||
+        out->bytes < bytes || x->bytes < bytes || gate->bytes < bytes) {
+        return 0;
+    }
+    const uint32_t threads = 256u;
+    const uint64_t blocks = (count + threads - 1u) / threads;
+    if (blocks > UINT32_MAX) return 0;
+    solar_sigmoid_gate_kernel<<<(uint32_t)blocks, threads, 0,
+                                ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr,
+            (const float *)gate->ptr, count);
+    return cuda_ok(cudaGetLastError(), "solar-open2 GQA sigmoid gate");
+}
+
+extern "C" int ds4_gpu_solar_head_rms_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *weight,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   eps) {
+    if (!out || !x || !gate || !weight || n_tokens == 0u || n_head == 0u ||
+        head_dim == 0u || head_dim > 1024u || !(eps > 0.0f)) {
+        return 0;
+    }
+    const uint64_t count = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t bytes = count * sizeof(float);
+    if (out->bytes < bytes || x->bytes < bytes || gate->bytes < bytes ||
+        weight->bytes < (uint64_t)head_dim * sizeof(float)) {
+        return 0;
+    }
+    uint32_t threads = 32u;
+    while (threads < head_dim && threads < 1024u) threads <<= 1u;
+    const uint64_t rows = (uint64_t)n_tokens * n_head;
+    if (rows > UINT32_MAX) return 0;
+    solar_head_rms_sigmoid_gate_kernel<<<(uint32_t)rows, threads, 0,
+                                         ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr,
+            (const float *)gate->ptr, (const float *)weight->ptr,
+            n_head, head_dim, eps);
+    return cuda_ok(cudaGetLastError(),
+                   "solar-open2 KDA gated head RMS norm");
 }

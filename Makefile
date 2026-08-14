@@ -62,7 +62,7 @@ CUDA_SPARK_FLAGS :=
 MMQ_INCLUDES := -Icuda/mmq
 # -lcuda is required for the in-process VMM weight arena (CUDA driver API).
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcuda
-MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
+MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o cuda/mmq/ds4_fattn.o
 CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 METAL_LDLIBS := $(LDLIBS)
@@ -72,7 +72,12 @@ endif
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression \
         proof-cuda-smoke proof-cuda-long proof-cuda-opp-c print-version \
         test-motif3-loader test-motif3-reference test-motif3-tokenizer \
-        test-motif3-cuda test-motif3-resident
+        test-motif3-cuda test-motif3-resident \
+        test-mmq-parity test-model-family-kernels \
+        test-solar-loader test-solar-kda test-solar-kda-prefill \
+        test-solar-kda-chunk \
+        test-solar-gates test-solar-kv test-solar-tokenizer \
+        test-solar-forward test-solar-session
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -243,6 +248,27 @@ ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
 
+tests/test_solar_kda.o: tests/test_solar_kda.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_kda_prefill.o: tests/test_solar_kda_prefill.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_gates.o: tests/test_solar_gates.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_kv.o: tests/test_solar_kv.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_model_family_kernels.o: tests/test_model_family_kernels.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_forward.o: tests/test_solar_forward.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_session.o: tests/test_solar_session.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
@@ -270,7 +296,7 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h lin
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_repack.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_repack.h cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces. ds4_mmq.cu transitively pulls in mmq.cuh which has
@@ -299,8 +325,81 @@ cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq
 cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
 
+cuda/mmq/ds4_fattn.o: cuda/mmq/ds4_fattn.cu cuda/mmq/common.cuh cuda/mmq/mma.cuh cuda/mmq/ds4_mmq.h
+	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
+
+tests/test_repack_premapped: tests/test_repack_premapped.cu cuda/mmq/ds4_repack.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-repack-premapped: tests/test_repack_premapped
+	./tests/test_repack_premapped
+
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_solar_kda: tests/test_solar_kda.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-kda: tests/test_solar_kda
+	./tests/test_solar_kda
+
+tests/test_solar_kda_prefill: tests/test_solar_kda_prefill.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-kda-prefill: tests/test_solar_kda_prefill
+	./tests/test_solar_kda_prefill
+
+tests/test_solar_kda_chunk.o: tests/test_solar_kda_chunk.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_solar_kda_chunk: tests/test_solar_kda_chunk.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-kda-chunk: tests/test_solar_kda_chunk
+	./tests/test_solar_kda_chunk
+
+tests/test_solar_gates: tests/test_solar_gates.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-gates: tests/test_solar_gates
+	./tests/test_solar_gates
+
+tests/test_solar_kv: tests/test_solar_kv.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-kv: tests/test_solar_kv
+	./tests/test_solar_kv
+
+cuda/mmq/test/test_mmq_parity.o: cuda/mmq/test/test_mmq_parity.cu cuda/mmq/ds4_mmq.h
+	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
+
+tests/test_mmq_parity: cuda/mmq/test/test_mmq_parity.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-mmq-parity: tests/test_mmq_parity
+	./tests/test_mmq_parity
+
+tests/test_model_family_kernels: tests/test_model_family_kernels.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-model-family-kernels: tests/test_model_family_kernels
+	./tests/test_model_family_kernels
+
+tests/test_solar_forward: tests/test_solar_forward.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-forward: tests/test_solar_forward
+	@test -n "$(DS4_SOLAR_MODEL)" || \
+		{ echo "set DS4_SOLAR_MODEL to the first Solar GGUF shard" >&2; exit 2; }
+	./tests/test_solar_forward "$(DS4_SOLAR_MODEL)" 128 29497 132 4767
+
+tests/test_solar_session: tests/test_solar_session.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-solar-session: tests/test_solar_session
+	@test -n "$(DS4_SOLAR_MODEL)" || \
+		{ echo "set DS4_SOLAR_MODEL to the first Solar GGUF shard" >&2; exit 2; }
+	./tests/test_solar_session "$(DS4_SOLAR_MODEL)"
 
 ds4_weight_server: tools/ds4_weight_server.cu cuda/mmq/ds4_repack.o
 	$(NVCC) $(NVCCFLAGS) -o $@ tools/ds4_weight_server.cu cuda/mmq/ds4_repack.o $(CUDA_LDLIBS)
@@ -312,9 +411,32 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4-eval
+tests/test_split_gguf: tests/test_split_gguf.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+tests/test_solar_loader: tests/test_solar_loader.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-solar-loader: tests/test_solar_loader
+	@test -n "$(DS4_SOLAR_MODEL)" || \
+		{ echo "set DS4_SOLAR_MODEL to the first Solar GGUF shard" >&2; exit 2; }
+	./tests/test_solar_loader "$(DS4_SOLAR_MODEL)"
+
+tests/test_solar_tokenizer: tests/test_solar_tokenizer.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-solar-tokenizer: tests/test_solar_tokenizer
+	@test -n "$(DS4_SOLAR_MODEL)" || \
+		{ echo "set DS4_SOLAR_MODEL to the first Solar GGUF shard" >&2; exit 2; }
+	./tests/test_solar_tokenizer "$(DS4_SOLAR_MODEL)"
+
+test: ds4_test ds4-eval tests/test_split_gguf
 	./ds4-eval --self-test-extractors
 	./ds4_test
+	./tests/test_split_gguf
 
 # Metadata and full tensor-layout smoke. The structural GGUF is sparse, so
 # this validates all descriptors without materializing an 88 GiB copy.
@@ -368,4 +490,4 @@ tests/test_motif3_long: tests/test_motif3_long.o ds4_kvstore.o rax.o $(CORE_OBJS
 endif
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_long.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_long.o *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o

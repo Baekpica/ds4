@@ -521,6 +521,18 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_import_model_ipc_manifest(const void *model_map, uint64_t model_size, const char *manifest_path, const char *model_id);
+/* Engine-owned GGUF catalog entry.  Split models use offsets in the merged
+ * mapping, which no individual shard catalog can represent. */
+typedef struct {
+    const char *name;
+    uint32_t name_len;
+    uint32_t type;
+    uint32_t ndim;
+    uint64_t dims[4];
+    uint64_t offset;
+    uint64_t bytes;
+} ds4_gpu_tensor_record;
+
 /* Self-load aligned artifacts (v0.2.2): with no weight-server manifest, build
  * the aligned-SoA repack artifacts in-process at load (shared layout library
  * cuda/mmq/ds4_repack.cu) so self-load boots ride the same fast dispatches as
@@ -528,6 +540,14 @@ int ds4_gpu_import_model_ipc_manifest(const void *model_map, uint64_t model_size
  * model.  Returns the number of artifacts built (0 = raw tier; boot goes on).
  * Opt-outs: DS4_CUDA_NO_DERIVED_WEIGHTS, DS4_CUDA_BUILD_ARTIFACTS=0. */
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size, const char *model_path);
+/* Split-GGUF twin: consume the engine's merged catalog and mapping directly. */
+int ds4_gpu_build_derived_artifacts_from_records(
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_tensor_record *records, uint32_t count);
+/* Replacement residency queries used by the common startup cache planner. */
+int ds4_gpu_model_map_replacements_complete(const void *model_map);
+int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
+                                 uint64_t bytes);
 /* Aligned-artifact tier for observability: source 0=none 1=imported 2=built.
  * Any out pointer may be NULL. */
 void ds4_gpu_derived_artifact_stats(int *source, uint64_t *count, uint64_t *bytes, double *build_secs);
@@ -608,6 +628,30 @@ int ds4_gpu_embed_tokens_q8_0_tensor(
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens,
+        uint32_t                n_embd);
+
+/* Quantized token-table gathers for model families without hyper-connection
+ * replication. The current shared contract accepts Q8_0 (type 8), writes F32
+ * rows, and zeroes invalid token ids in the batched form. */
+int ds4_gpu_embed_token_quant_tensor(
+        ds4_gpu_tensor *out,
+        const void       *model_map,
+        uint64_t          model_size,
+        uint64_t          weight_offset,
+        uint32_t          weight_type,
+        uint32_t          n_vocab,
+        uint32_t          token,
+        uint32_t          n_embd);
+
+int ds4_gpu_embed_tokens_quant_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *tokens,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd);
@@ -1019,6 +1063,21 @@ int ds4_gpu_rms_norm_weight_tensor(
         float                   eps);
 
 int ds4_gpu_rms_norm_weight_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
+
+/* CUDA prefill producer: writes the same f32 RMS-norm result as the classic
+ * rows entry and, when profitable, also publishes its exact internal Q8_1
+ * activation mirror for following dense/MoE consumers.  The optimization is
+ * transparent: unsupported widths/backends and the runtime kill switch still
+ * produce the classic f32 output. */
+int ds4_gpu_rms_norm_weight_rows_q8_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         const void             *model_map,
@@ -1892,6 +1951,140 @@ int ds4_gpu_swiglu_tensor(
         float                   clamp,
         float                   weight);
 
+/* Model-family router semantics used by Solar Open 2 and EXAONE: sigmoid
+ * probabilities, top-k selection on probability + optional bias, then
+ * normalization of the selected UNBIASED probabilities and final scaling. */
+int ds4_gpu_sigmoid_topk_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        int                     have_bias,
+        uint32_t                n_expert,
+        uint32_t                n_used,
+        uint32_t                n_tokens,
+        float                   weight_scale);
+
+/* silu(gate) * up * weights[flat_index / n_ff]. */
+int ds4_gpu_swiglu_weighted_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_ff,
+        uint64_t                count);
+
+/* Quantized routed-expert matmul with the common [token, slot, row] output
+ * contract. The executor selects mmvq for at most eight assignments and MMQ
+ * above that; supported raw GGUF types are Q8_0, Q2_K, Q3_K, Q4_K and
+ * IQ2_XXS. Router weighting is intentionally a separate epilogue. */
+int ds4_gpu_routed_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used);
+
+/* Bounded wide-prefill variant.  max_rows_per_expert must be a caller-proven
+ * upper bound for the selected-id table; the GPU-generated expert bounds
+ * remain authoritative.  The regular entry above preserves the generic ABI
+ * and launch geometry for callers without that proof. */
+int ds4_gpu_routed_matmul_bounded_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used,
+        uint32_t                max_rows_per_expert);
+
+/* Paired routed gate/up projection.  The aligned IQ2 artifact tier shares
+ * one activation quantization and one assignment schedule; other types use
+ * the established single-projection fallback. */
+int ds4_gpu_routed_gate_up_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                gate_bytes,
+        uint64_t                up_offset,
+        uint64_t                up_bytes,
+        uint32_t                weight_type,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used);
+
+/* Default-on wide-prefill handoff (n_tokens >= 512) for Solar's IQ2_XXS
+ * gate/up + Q3_K down layers. The conservative floor keeps multi-sequence
+ * decode batches (currently capped at 128 rows) on the established path.
+ * DS4_CUDA_MOE_IQ2_Q3_HANDOFF=0 disables it; exactly 1 enables it explicitly,
+ * while any other explicit value disables it conservatively. Returns 1 only
+ * after the fused launch sequence is accepted, 0 when disabled or when the
+ * complete shape/artifact contract is refused before launch, and -1 after any
+ * launch-time failure (callers must not replay the classic chain after a
+ * partial launch). */
+int ds4_gpu_routed_iq2_q3_handoff_tensor(
+        ds4_gpu_tensor       *down,
+        ds4_gpu_tensor       *gate_scratch,
+        ds4_gpu_tensor       *up_scratch,
+        ds4_gpu_tensor       *q8_scratch,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *router_weights,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                gate_bytes,
+        uint64_t                up_offset,
+        uint64_t                up_bytes,
+        uint64_t                down_offset,
+        uint64_t                down_bytes,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint32_t                in_dim,
+        uint32_t                mid_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint32_t                n_tokens,
+        uint32_t                n_expert_used);
+
+/* Test/diagnostic proof that the handoff launched. */
+unsigned long long ds4_cuda_moe_iq2_q3_handoff_launches(void);
+
+int ds4_gpu_swiglu_weighted_q8_d4_emit_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, const ds4_gpu_tensor *router_weights,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim, uint32_t n_assign);
+int ds4_gpu_q3_quantize_ref_test(
+        ds4_gpu_tensor *q8_out, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids_dst, uint32_t mid_dim, uint32_t n_assign);
+int ds4_gpu_q3_worklist_preflight_test(
+        int32_t out_dim, int32_t mid_dim, int64_t n_assign,
+        int32_t n_expert, int64_t stride_row, int64_t stride_expert);
+
+
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,
@@ -2712,6 +2905,236 @@ int ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* Solar Open2 recurrent KDA. All tensors are f32 and device-resident. The
+ * convolution states are [head, dim, conv_kernel], and recurrent_state is
+ * [head, key_dim, value_dim]. A rewind must restore all four state tensors. */
+int ds4_gpu_solar_kda_decode_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound);
+
+/* Independent single-token rows backed by a bank-major Solar state slab.
+ * Offsets are byte offsets inside one bank; bank_ids selects the bank owned
+ * by each token row.  This is the continuous-batching decode primitive: unlike
+ * prefill, rows do not share or advance one recurrent state in sequence. */
+int ds4_gpu_solar_kda_decode_banks_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state_slab,
+        uint64_t                state_bank_stride,
+        uint64_t                recurrent_offset,
+        uint64_t                q_conv_offset,
+        uint64_t                k_conv_offset,
+        uint64_t                v_conv_offset,
+        const ds4_gpu_tensor *bank_ids,
+        uint32_t                n_tokens,
+        uint32_t                max_banks,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound);
+
+/* Bytes needed by the production-width chunked prefill path.  Zero means the
+ * shape or a sub-64-token short append uses the generic sequence path.  The
+ * caller owns this workspace, so independent graphs/sessions never share
+ * mutable CUDA scratch. */
+static inline uint64_t ds4_gpu_solar_kda_prefill_scratch_bytes(
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    enum { chunk = 64u, dim = 128u };
+    if (n_tokens < chunk || n_head == 0u || head_dim != dim) return 0u;
+    const uint64_t vector_count = (uint64_t)n_head * dim;
+    if (vector_count > UINT64_MAX / n_tokens / sizeof(float)) return 0u;
+    const uint64_t plane_raw =
+        (uint64_t)n_tokens * vector_count * sizeof(float);
+    if (plane_raw > UINT64_MAX - 255u) return 0u;
+    const uint64_t plane = (plane_raw + 255u) & ~UINT64_C(255);
+    const uint64_t n_chunks = ((uint64_t)n_tokens - 1u) / chunk + 1u;
+    const uint64_t mq_per =
+        (uint64_t)chunk * chunk * sizeof(float);
+    if (n_chunks > UINT64_MAX / n_head ||
+        n_chunks * n_head > UINT64_MAX / mq_per) {
+        return 0u;
+    }
+    const uint64_t mq_raw = n_chunks * n_head * mq_per;
+    if (mq_raw > UINT64_MAX - 255u) return 0u;
+    const uint64_t mq = (mq_raw + 255u) & ~UINT64_C(255);
+    return plane <= (UINT64_MAX - mq) / 6u ? 6u * plane + mq : 0u;
+}
+
+/* Token-major KDA continuation.  At Solar's 128-wide production shape,
+ * scratch selects the 64-token delta-rule transform; a NULL scratch retains
+ * the exact-order sequence fallback.  Both paths carry recurrent and
+ * convolution state across arbitrary caller chunks. */
+int ds4_gpu_solar_kda_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *scratch,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q_conv_state,
+        ds4_gpu_tensor       *k_conv_state,
+        ds4_gpu_tensor       *v_conv_state,
+        const ds4_gpu_tensor *q_raw,
+        const ds4_gpu_tensor *k_raw,
+        const ds4_gpu_tensor *v_raw,
+        const ds4_gpu_tensor *g_raw,
+        const ds4_gpu_tensor *beta_logits,
+        const ds4_gpu_tensor *q_conv_weight,
+        const ds4_gpu_tensor *k_conv_weight,
+        const ds4_gpu_tensor *v_conv_weight,
+        const ds4_gpu_tensor *decay_scale,
+        const ds4_gpu_tensor *dt_bias,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                conv_kernel,
+        float                   gate_lower_bound);
+
+int ds4_gpu_solar_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        uint64_t                count);
+
+int ds4_gpu_solar_head_rms_sigmoid_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *weight,
+        uint32_t                n_tokens,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   eps);
+
+/* Solar Open2 full-attention KV formats. BF16 is the correctness oracle;
+ * compressed rows keep one f16 scale per (position, K/V, KV head). */
+#ifndef DS4_SOLAR_KV_FORMAT_DEFINED
+#define DS4_SOLAR_KV_FORMAT_DEFINED
+typedef enum {
+    DS4_SOLAR_KV_BF16       = 0,
+    DS4_SOLAR_KV_FP8        = 1,
+    DS4_SOLAR_KV_FP4        = 2,
+    DS4_SOLAR_KV_KFP8_VFP4 = 3,
+} ds4_solar_kv_format;
+#endif
+
+uint64_t ds4_gpu_solar_kv_row_bytes(
+        ds4_solar_kv_format format,
+        uint32_t            n_head_kv,
+        uint32_t            head_dim);
+
+int ds4_gpu_solar_kv_store_tensor(
+        ds4_gpu_tensor       *kv,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                kv_cap,
+        ds4_solar_kv_format     format);
+
+/* One KV row per independent decode row.  kv_slab is bank-major, and each
+ * row selects both its bank and absolute position through device u32 arrays. */
+int ds4_gpu_solar_kv_store_banks_tensor(
+        ds4_gpu_tensor       *kv_slab,
+        const ds4_gpu_tensor *bank_ids,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                n_tokens,
+        uint32_t                max_banks,
+        uint64_t                bank_stride,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        ds4_solar_kv_format     format);
+
+int ds4_gpu_solar_attention_decode_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        ds4_solar_kv_format     format);
+
+int ds4_gpu_solar_attention_decode_split_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        ds4_gpu_tensor       *partials,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                pos,
+        uint32_t                window,
+        uint32_t                chunk_len,
+        ds4_solar_kv_format     format);
+
+/* Split-KV decode for independent bank rows.  max_position is the largest
+ * inclusive position in positions and bounds the launched split grid. */
+int ds4_gpu_solar_attention_decode_banks_split_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv_slab,
+        ds4_gpu_tensor       *partials,
+        const ds4_gpu_tensor *bank_ids,
+        const ds4_gpu_tensor *positions,
+        uint32_t                n_tokens,
+        uint32_t                max_banks,
+        uint64_t                bank_stride,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                max_position,
+        uint32_t                window,
+        uint32_t                chunk_len,
+        ds4_solar_kv_format     format);
+
+int ds4_gpu_solar_attention_prefill_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *kv,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        uint32_t                kv_cap,
+        uint32_t                window,
+        ds4_solar_kv_format     format);
 
 #ifdef __cplusplus
 }

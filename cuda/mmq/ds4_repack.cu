@@ -16,6 +16,7 @@
 #include <cstring>
 #include <climits>
 #include <thread>
+#include <utility>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -49,7 +50,165 @@ static void *repack_align_ptr(void *ptr, uint64_t align) {
 
 /* ---- file mapping + GGUF catalog ---------------------------------------- */
 
+static bool repack_gguf_split_count(const ds4_repack_file &m,
+                                     uint32_t &count);
+
+static int repack_open_direct_fd(int fd, uint64_t &align) {
+#if defined(__linux__) && defined(O_DIRECT)
+    if (getenv("DS4_CUDA_NO_DIRECT_IO") == nullptr) {
+        char proc_path[64];
+        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+        int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
+        if (direct_fd >= 0) {
+            if (align < 512) align = 512;
+            return direct_fd;
+        }
+    }
+#else
+    (void)fd;
+    (void)align;
+#endif
+    return -1;
+}
+
+static bool repack_split_sibling_path(const char *path, uint32_t index,
+                                      uint32_t count, char *out,
+                                      size_t out_len) {
+    const char *dash = strrchr(path, '-');
+    if (!dash) return false;
+    unsigned parsed_count = 0;
+    if (sscanf(dash, "-%05u.gguf", &parsed_count) != 1 ||
+        parsed_count != count || dash - path < 9) {
+        return false;
+    }
+    const char *of = dash - 3;
+    if (strncmp(of, "-of", 3) != 0) return false;
+    const char *num = of - 5;
+    if (num - path < 1 || num[-1] != '-') return false;
+    for (int i = 0; i < 5; i++) {
+        if (num[i] < '0' || num[i] > '9') return false;
+    }
+    const size_t prefix_len = (size_t)(num - path);
+    const int n = snprintf(out, out_len, "%.*s%05u-of-%05u.gguf",
+                           (int)prefix_len, path, index + 1u, count);
+    return n > 0 && (size_t)n < out_len;
+}
+
+static void repack_close_shards(std::vector<ds4_repack_shard> &shards) {
+    for (ds4_repack_shard &s : shards) {
+        if (s.direct_fd >= 0) close(s.direct_fd);
+        if (s.fd >= 0) close(s.fd);
+        s.direct_fd = -1;
+        s.fd = -1;
+    }
+    shards.clear();
+}
+
+static bool repack_map_split(const char *log_prefix, const char *path,
+                             uint32_t count, ds4_repack_file &m) {
+    if (count < 2u || count > 99999u) return false;
+    char expected[PATH_MAX];
+    if (!repack_split_sibling_path(path, 0, count,
+                                   expected, sizeof(expected)) ||
+        strcmp(path, expected) != 0) {
+        fprintf(stderr,
+                "%s: open split GGUFs through the first shard "
+                "(-00001-of-%05u.gguf): %s\n",
+                log_prefix, count, path);
+        return false;
+    }
+
+    const long page_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_l > 0 ? (uint64_t)page_l : 4096u;
+    std::vector<ds4_repack_shard> shards;
+    shards.reserve(count);
+    uint64_t total = 0;
+    uint64_t mapped = 0;
+    bool direct = false;
+    for (uint32_t i = 0; i < count; i++) {
+        char sibling[PATH_MAX];
+        if (!repack_split_sibling_path(path, i, count,
+                                       sibling, sizeof(sibling))) {
+            repack_close_shards(shards);
+            return false;
+        }
+        ds4_repack_shard s;
+        s.fd = open(sibling, O_RDONLY);
+        if (s.fd < 0) {
+            fprintf(stderr, "%s: open failed %s: %s\n",
+                    log_prefix, sibling, strerror(errno));
+            repack_close_shards(shards);
+            return false;
+        }
+        struct stat st;
+        if (fstat(s.fd, &st) != 0 || st.st_size <= 0) {
+            fprintf(stderr, "%s: stat failed %s\n", log_prefix, sibling);
+            close(s.fd);
+            s.fd = -1;
+            repack_close_shards(shards);
+            return false;
+        }
+        s.base = total;
+        s.size = (uint64_t)st.st_size;
+        if (st.st_blksize > 1) s.direct_align = (uint64_t)st.st_blksize;
+        s.direct_fd = repack_open_direct_fd(s.fd, s.direct_align);
+        direct = direct || s.direct_fd >= 0;
+        const uint64_t span = repack_align_up(s.size, page);
+        if (span > UINT64_MAX - total) {
+            if (s.direct_fd >= 0) close(s.direct_fd);
+            close(s.fd);
+            repack_close_shards(shards);
+            return false;
+        }
+        total += span;
+        mapped += s.size;
+        shards.push_back(s);
+    }
+    if (total > SIZE_MAX) {
+        repack_close_shards(shards);
+        return false;
+    }
+
+    int reserve_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    reserve_flags |= MAP_NORESERVE;
+#endif
+    void *region = mmap(nullptr, (size_t)total, PROT_NONE,
+                        reserve_flags, -1, 0);
+    if (region == MAP_FAILED) {
+        fprintf(stderr, "%s: cannot reserve split GGUF range: %s\n",
+                log_prefix, strerror(errno));
+        repack_close_shards(shards);
+        return false;
+    }
+    for (const ds4_repack_shard &s : shards) {
+        void *want = (uint8_t *)region + s.base;
+        void *got = mmap(want, (size_t)s.size, PROT_READ,
+                         MAP_SHARED | MAP_FIXED, s.fd, 0);
+        if (got == MAP_FAILED) {
+            fprintf(stderr, "%s: mmap failed for split shard: %s\n",
+                    log_prefix, strerror(errno));
+            munmap(region, (size_t)total);
+            repack_close_shards(shards);
+            return false;
+        }
+    }
+    m = {};
+    m.data = (const uint8_t *)region;
+    m.size = total;
+    m.shards = std::move(shards);
+    fprintf(stderr,
+            "%s: mapped %u GGUF shards (%.2f GiB) into one %.2f GiB "
+            "logical model%s\n",
+            log_prefix, count,
+            (double)mapped / 1073741824.0,
+            (double)total / 1073741824.0,
+            direct ? " with direct I/O" : "");
+    return true;
+}
+
 bool ds4_repack_map_file(const char *log_prefix, const char *path, ds4_repack_file &m) {
+    m = {};
     m.fd = open(path, O_RDONLY);
     if (m.fd < 0) {
         fprintf(stderr, "%s: open failed %s: %s\n", log_prefix, path, strerror(errno));
@@ -64,21 +223,6 @@ bool ds4_repack_map_file(const char *log_prefix, const char *path, ds4_repack_fi
     }
     m.size = (uint64_t)st.st_size;
     if (st.st_blksize > 1) m.direct_align = (uint64_t)st.st_blksize;
-#if defined(__linux__) && defined(O_DIRECT)
-    if (getenv("DS4_CUDA_NO_DIRECT_IO") == nullptr) {
-        char proc_path[64];
-        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", m.fd);
-        int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
-        if (direct_fd >= 0) {
-            m.direct_fd = direct_fd;
-            if (m.direct_align < 512) m.direct_align = 512;
-            fprintf(stderr, "%s: direct I/O enabled for %s align=%llu\n",
-                    log_prefix,
-                    path,
-                    (unsigned long long)m.direct_align);
-        }
-    }
-#endif
     void *p = mmap(NULL, (size_t)m.size, PROT_READ, MAP_SHARED, m.fd, 0);
     if (p == MAP_FAILED) {
         fprintf(stderr, "%s: mmap failed %s: %s\n", log_prefix, path, strerror(errno));
@@ -87,11 +231,27 @@ bool ds4_repack_map_file(const char *log_prefix, const char *path, ds4_repack_fi
         return false;
     }
     m.data = (const uint8_t *)p;
+    uint32_t split_count = 0;
+    if (!repack_gguf_split_count(m, split_count)) {
+        ds4_repack_unmap_file(m);
+        fprintf(stderr, "%s: invalid GGUF metadata in %s\n", log_prefix, path);
+        return false;
+    }
+    if (split_count > 1u) {
+        ds4_repack_unmap_file(m);
+        return repack_map_split(log_prefix, path, split_count, m);
+    }
+    m.direct_fd = repack_open_direct_fd(m.fd, m.direct_align);
+    if (m.direct_fd >= 0) {
+        fprintf(stderr, "%s: direct I/O enabled for %s align=%llu\n",
+                log_prefix, path, (unsigned long long)m.direct_align);
+    }
     return true;
 }
 
 void ds4_repack_unmap_file(ds4_repack_file &m) {
     if (m.data) munmap((void *)m.data, (size_t)m.size);
+    repack_close_shards(m.shards);
     if (m.direct_fd >= 0) close(m.direct_fd);
     if (m.fd >= 0) close(m.fd);
     m = {};
@@ -170,6 +330,50 @@ static bool skip_metadata_value(const ds4_repack_file &m, uint64_t &pos, uint32_
     return n != 0 && skip_bytes(m, pos, n);
 }
 
+static bool repack_gguf_split_count(const ds4_repack_file &m,
+                                     uint32_t &count) {
+    count = 0;
+    uint64_t pos = 0;
+    uint32_t magic = 0, version = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (!read_u32(m, pos, magic) || magic != 0x46554747u ||
+        !read_u32(m, pos, version) || version != 3u ||
+        !read_u64(m, pos, n_tensors) ||
+        !read_u64(m, pos, n_kv)) {
+        return false;
+    }
+    (void)n_tensors;
+    for (uint64_t i = 0; i < n_kv; i++) {
+        std::string key;
+        uint32_t type = 0;
+        if (!read_string(m, pos, key) || !read_u32(m, pos, type)) {
+            return false;
+        }
+        const uint64_t value_pos = pos;
+        if (!skip_metadata_value(m, pos, type)) return false;
+        if (key == "split.count") {
+            if (type == 2u) {
+                uint16_t value = 0;
+                if (value_pos > m.size || m.size - value_pos < sizeof(value)) {
+                    return false;
+                }
+                memcpy(&value, m.data + value_pos, sizeof(value));
+                count = value;
+            } else if (type == 4u) {
+                uint32_t value = 0;
+                if (value_pos > m.size || m.size - value_pos < sizeof(value)) {
+                    return false;
+                }
+                memcpy(&value, m.data + value_pos, sizeof(value));
+                count = value;
+            } else {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool tensor_type_info(uint32_t type, uint64_t &block_elems, uint64_t &block_bytes) {
     switch (type) {
     case 0: block_elems = 1; block_bytes = 4; return true;
@@ -205,10 +409,11 @@ static bool tensor_type_info(uint32_t type, uint64_t &block_elems, uint64_t &blo
     }
 }
 
-bool ds4_repack_collect_catalog(const char *log_prefix,
-                                const ds4_repack_file &m,
-                                std::vector<ds4_repack_span> *spans,
-                                std::vector<ds4_repack_tensor> *records) {
+static bool repack_collect_catalog_one(
+        const char *log_prefix,
+        const ds4_repack_file &m,
+        std::vector<ds4_repack_span> *spans,
+        std::vector<ds4_repack_tensor> *records) {
     uint64_t pos = 0;
     uint32_t magic = 0, version = 0;
     uint64_t n_tensors = 0, n_kv = 0;
@@ -286,7 +491,68 @@ bool ds4_repack_collect_catalog(const char *log_prefix,
     return true;
 }
 
+bool ds4_repack_collect_catalog(const char *log_prefix,
+                                const ds4_repack_file &m,
+                                std::vector<ds4_repack_span> *spans,
+                                std::vector<ds4_repack_tensor> *records) {
+    if (m.shards.empty()) {
+        return repack_collect_catalog_one(log_prefix, m, spans, records);
+    }
+    if (!m.data || m.size == 0) return false;
+    if (spans) spans->clear();
+    if (records) records->clear();
+    for (const ds4_repack_shard &s : m.shards) {
+        if (s.base > m.size || s.size > m.size - s.base) return false;
+        ds4_repack_file shard;
+        shard.data = m.data + s.base;
+        shard.size = s.size;
+        std::vector<ds4_repack_span> local_spans;
+        std::vector<ds4_repack_tensor> local_records;
+        if (!repack_collect_catalog_one(
+                log_prefix, shard,
+                spans ? &local_spans : nullptr,
+                records ? &local_records : nullptr)) {
+            return false;
+        }
+        if (spans) {
+            for (ds4_repack_span range : local_spans) {
+                if (range.off > UINT64_MAX - s.base ||
+                    range.end > UINT64_MAX - s.base) {
+                    return false;
+                }
+                range.off += s.base;
+                range.end += s.base;
+                spans->push_back(range);
+            }
+        }
+        if (records) {
+            for (ds4_repack_tensor &t : local_records) {
+                if (t.off > UINT64_MAX - s.base) return false;
+                t.off += s.base;
+                records->push_back(std::move(t));
+            }
+        }
+    }
+    return true;
+}
+
 /* ---- staged file reads --------------------------------------------------- */
+
+static bool repack_open_source(const ds4_repack_build_args &a,
+                               ds4_repack_file &m) {
+    if (a.source_data) {
+        m = ds4_repack_file();
+        m.data = a.source_data;
+        m.size = a.source_size;
+        return m.size != 0;
+    }
+    return a.path && ds4_repack_map_file(a.log_prefix, a.path, m);
+}
+
+static void repack_close_source(const ds4_repack_build_args &a,
+                                ds4_repack_file &m) {
+    if (!a.source_data) ds4_repack_unmap_file(m);
+}
 
 bool ds4_repack_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     uint64_t done = 0;
@@ -303,30 +569,110 @@ bool ds4_repack_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     return true;
 }
 
-bool ds4_repack_read_stage(const ds4_repack_file &m, void *stage, uint64_t stage_bytes,
-                           uint64_t file_off, uint64_t bytes, const char **payload) {
+static bool repack_read_one_file(int fd, int direct_fd, uint64_t direct_align,
+                                 uint64_t file_size, void *stage,
+                                 uint64_t stage_bytes, uint64_t file_off,
+                                 uint64_t bytes, const char **payload) {
     *payload = (const char *)stage;
+    if (fd < 0 || file_off > file_size || bytes > file_size - file_off) {
+        return false;
+    }
 #if defined(__linux__) && defined(O_DIRECT)
-    if (m.direct_fd >= 0 && m.direct_align > 1 && m.size != 0) {
-        const uint64_t aligned_off = repack_align_down(file_off, m.direct_align);
+    if (direct_fd >= 0 && direct_align > 1 && file_size != 0) {
+        const uint64_t aligned_off = repack_align_down(file_off, direct_align);
         const uint64_t delta = file_off - aligned_off;
-        const uint64_t read_size = repack_align_up(delta + bytes, m.direct_align);
-        if (aligned_off <= m.size && read_size <= stage_bytes && read_size <= m.size - aligned_off) {
+        const uint64_t read_size = repack_align_up(delta + bytes, direct_align);
+        if (aligned_off <= file_size && read_size <= stage_bytes &&
+            read_size <= file_size - aligned_off) {
             const int saved_errno = errno;
             errno = 0;
-            if (ds4_repack_pread_full(m.direct_fd, stage, read_size, aligned_off)) {
+            if (ds4_repack_pread_full(
+                    direct_fd, stage, read_size, aligned_off)) {
                 *payload = (const char *)stage + delta;
                 errno = saved_errno;
                 return true;
             }
-            const int direct_errno = errno;
-            errno = direct_errno;
         }
     }
 #else
+    (void)direct_fd;
+    (void)direct_align;
     (void)stage_bytes;
 #endif
-    return ds4_repack_pread_full(m.fd, stage, bytes, file_off);
+    return ds4_repack_pread_full(fd, stage, bytes, file_off);
+}
+
+bool ds4_repack_read_stage(const ds4_repack_file &m, void *stage, uint64_t stage_bytes,
+                           uint64_t file_off, uint64_t bytes, const char **payload) {
+    *payload = (const char *)stage;
+    if (file_off > m.size || bytes > m.size - file_off) return false;
+    if (!m.shards.empty()) {
+        const uint64_t end = file_off + bytes;
+        for (const ds4_repack_shard &s : m.shards) {
+            if (file_off >= s.base && end >= file_off &&
+                end <= s.base + s.size) {
+                return repack_read_one_file(
+                    s.fd, s.direct_fd, s.direct_align, s.size,
+                    stage, stage_bytes, file_off - s.base, bytes, payload);
+            }
+        }
+
+        /* Range planning may bridge a shard's page tail and the next small
+         * GGUF header.  Assemble that rare request with ordinary pread and
+         * synthesize the zero-filled page tail reserved by the merged map. */
+        if (bytes > stage_bytes) return false;
+        uint64_t pos = file_off;
+        uint64_t done = 0;
+        size_t shard_i = 0;
+        while (pos < end) {
+            while (shard_i + 1u < m.shards.size() &&
+                   pos >= m.shards[shard_i + 1u].base) {
+                shard_i++;
+            }
+            if (shard_i >= m.shards.size()) {
+                memset((char *)stage + done, 0, (size_t)(end - pos));
+                done += end - pos;
+                pos = end;
+                break;
+            }
+            const ds4_repack_shard &s = m.shards[shard_i];
+            if (pos < s.base) {
+                const uint64_t n = end - pos < s.base - pos
+                    ? end - pos : s.base - pos;
+                memset((char *)stage + done, 0, (size_t)n);
+                done += n;
+                pos += n;
+                continue;
+            }
+            const uint64_t file_end = s.base + s.size;
+            if (pos < file_end) {
+                const uint64_t n = end - pos < file_end - pos
+                    ? end - pos : file_end - pos;
+                if (!ds4_repack_pread_full(
+                        s.fd, (char *)stage + done, n, pos - s.base)) {
+                    return false;
+                }
+                done += n;
+                pos += n;
+                continue;
+            }
+            const uint64_t next = shard_i + 1u < m.shards.size()
+                ? m.shards[shard_i + 1u].base : m.size;
+            const uint64_t n = end - pos < next - pos ? end - pos : next - pos;
+            memset((char *)stage + done, 0, (size_t)n);
+            done += n;
+            pos += n;
+            if (pos >= next) shard_i++;
+        }
+        return done == bytes;
+    }
+    if (m.fd < 0 && m.data) {
+        *payload = (const char *)m.data + file_off;
+        return true;
+    }
+    return repack_read_one_file(
+        m.fd, m.direct_fd, m.direct_align, m.size,
+        stage, stage_bytes, file_off, bytes, payload);
 }
 
 /* ---- aligned repack kernels ---------------------------------------------- */
@@ -474,17 +820,24 @@ bool ds4_repack_q2k_candidate(const ds4_repack_tensor &t) {
 }
 
 /* Aligned-SoA Q8_0 dense candidates (--repack-q8-aligned): every 2D Q8_0
- * tensor big enough to matter whose row length satisfies the decode kernel's
- * K % 1024 constraint.  token_embd is excluded: it is consumed by row-gather,
- * never by the dense GEMV.  Unlike the IQ2 expert repack these artifacts are
- * ADDITIVE (raw stays served). */
+ * tensor big enough to matter whose row length satisfies either the decode
+ * kernel's K % 1024 contract or the tensor-core D2R kernel's wide K=128
+ * shallow-GEMM contract.  The latter is intentionally shape-gated at M>=8192
+ * so small Q8 tensors do not consume resident artifact memory.  token_embd is
+ * excluded: it is consumed by row-gather, never by a dense projection.
+ * Unlike the IQ2 expert repack these artifacts are ADDITIVE (raw stays
+ * served). */
 bool ds4_repack_q8_candidate(const ds4_repack_tensor &t) {
     if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
     if (t.dims[0] == 0 || t.dims[1] == 0) return false;
-    if (t.dims[0] % 1024u != 0) return false;
+    const bool decode_shape = t.dims[0] % 1024u == 0;
+    const bool shallow_d2r_shape = t.dims[0] == 128u && t.dims[1] >= 8192u;
+    if (!decode_shape && !shallow_d2r_shape) return false;
     /* 2 MiB floor: attn_kv (512 x 4096, 2.2 MiB) is an Inc4 pair-kernel
-     * consumer; anything smaller isn't worth an artifact. */
-    if (t.bytes < 2u * 1024u * 1024u || t.bytes % 34u != 0) return false;
+     * consumer.  K=128 D2R weights are only ~1.06 MiB each, but their wide
+     * prefill GEMM is precisely the admitted shallow shape above. */
+    if ((!shallow_d2r_shape && t.bytes < 2u * 1024u * 1024u) ||
+        t.bytes % 34u != 0) return false;
     if (t.name.find("token_embd") != std::string::npos) return false;
     return true;
 }
@@ -682,7 +1035,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
                                  uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    if (!repack_open_source(a, m)) return false;
     uint64_t chunk = a.copy_chunk_bytes / 34u * 34u;
     if (chunk < 34u * 32768u) chunk = 34u * 32768u;
 
@@ -752,7 +1105,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        repack_close_source(a, m);
         return false;
     }
 
@@ -764,7 +1117,7 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    repack_close_source(a, m);
     if (count == 0) {
         fprintf(stderr, "%s: --repack-q8-aligned found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);
@@ -790,7 +1143,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
                              uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    if (!repack_open_source(a, m)) return false;
     uint64_t chunk = a.copy_chunk_bytes / 34u * 34u;
     if (chunk < 34u * 32768u) chunk = 34u * 32768u;
 
@@ -855,7 +1208,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        repack_close_source(a, m);
         return false;
     }
 
@@ -867,7 +1220,7 @@ bool ds4_repack_build_q8_f16(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    repack_close_source(a, m);
     if (count == 0) {
         fprintf(stderr, "%s: q8 f16 prebuild found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);
@@ -895,7 +1248,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
                                   uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    if (!repack_open_source(a, m)) return false;
     uint64_t chunk = a.copy_chunk_bytes / 66u * 66u;
     if (chunk < 66u * 16384u) chunk = 66u * 16384u;
 
@@ -968,7 +1321,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        repack_close_source(a, m);
         return false;
     }
 
@@ -980,7 +1333,7 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    repack_close_source(a, m);
     if (count == 0) {
         fprintf(stderr, "%s: --repack-iq2-aligned found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);
@@ -1009,7 +1362,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
                                   uint64_t *repacked_bytes_out) {
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     ds4_repack_file m;
-    if (!ds4_repack_map_file(a.log_prefix, a.path, m)) return false;
+    if (!repack_open_source(a, m)) return false;
 
     const double t0 = repack_now_sec();
     std::vector<repack_job> jobs;
@@ -1092,7 +1445,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
 
     if (!ok) {
         for (repack_job &j : jobs) repack_free_artifact(a, &j.art);
-        ds4_repack_unmap_file(m);
+        repack_close_source(a, m);
         return false;
     }
 
@@ -1104,7 +1457,7 @@ bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
         count++;
     }
 
-    ds4_repack_unmap_file(m);
+    repack_close_source(a, m);
     if (count == 0) {
         fprintf(stderr, "%s: --repack-q2k-aligned found no candidate tensors in %s\n",
                 a.log_prefix, a.model_id);

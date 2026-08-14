@@ -3329,7 +3329,7 @@ int ds4_mmq_q8_0_dense_d2r_launch(
     using namespace dq8;
     if (!W_aligned || !q8 || !out ||
         M <= 0 || (M % kDqMTile) != 0 || N <= 0 || K <= 0 ||
-        (K % 1024) != 0 || (K >> 6) < kDqStages) {
+        (K % 128) != 0) {
         fprintf(stderr, "ds4_mmq_q8_0_dense_d2r_launch: bad args M=%d N=%d K=%d\n", M, N, K);
         return -1;
     }
