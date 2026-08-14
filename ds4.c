@@ -34012,6 +34012,33 @@ typedef struct {
  * type; nothing here is allocated at the worst case for all layers.
  */
 
+typedef struct ds4_exaone_batch_ws {
+    ds4_gpu_tensor *b_cur;
+    ds4_gpu_tensor *b_norm;
+    ds4_gpu_tensor *b_q;
+    ds4_gpu_tensor *b_k;
+    ds4_gpu_tensor *b_v;
+    ds4_gpu_tensor *b_heads;
+    ds4_gpu_tensor *b_attn_out;
+    ds4_gpu_tensor *b_ffn_out;
+    ds4_gpu_tensor *b_dense_gate;
+    ds4_gpu_tensor *b_dense_up;
+    ds4_gpu_tensor *b_dense_mid;
+    ds4_gpu_tensor *b_shared_gate;
+    ds4_gpu_tensor *b_shared_up;
+    ds4_gpu_tensor *b_shared_mid;
+    ds4_gpu_tensor *b_shared_out;
+    ds4_gpu_tensor *b_router_logits;
+    ds4_gpu_tensor *b_router_selected;
+    ds4_gpu_tensor *b_router_weights;
+    ds4_gpu_tensor *b_routed_gate;
+    ds4_gpu_tensor *b_routed_up;
+    ds4_gpu_tensor *b_routed_mid;
+    ds4_gpu_tensor *b_routed_down;
+    uint32_t prefill_cap;
+    uint64_t bytes;
+} ds4_exaone_batch_ws;
+
 typedef struct {
     uint32_t ctx_size;
     uint32_t prefill_cap;
@@ -34044,29 +34071,9 @@ typedef struct {
     ds4_gpu_tensor *routed_down;
     ds4_gpu_tensor *logits;
 
-    /* prefill (prefill_cap tokens); same stages, wider */
-    ds4_gpu_tensor *b_cur;
-    ds4_gpu_tensor *b_norm;
-    ds4_gpu_tensor *b_q;
-    ds4_gpu_tensor *b_k;
-    ds4_gpu_tensor *b_v;
-    ds4_gpu_tensor *b_heads;
-    ds4_gpu_tensor *b_attn_out;
-    ds4_gpu_tensor *b_ffn_out;
-    ds4_gpu_tensor *b_dense_gate;
-    ds4_gpu_tensor *b_dense_up;
-    ds4_gpu_tensor *b_dense_mid;
-    ds4_gpu_tensor *b_shared_gate;
-    ds4_gpu_tensor *b_shared_up;
-    ds4_gpu_tensor *b_shared_mid;
-    ds4_gpu_tensor *b_shared_out;
-    ds4_gpu_tensor *b_router_logits;
-    ds4_gpu_tensor *b_router_selected;
-    ds4_gpu_tensor *b_router_weights;
-    ds4_gpu_tensor *b_routed_gate;
-    ds4_gpu_tensor *b_routed_up;
-    ds4_gpu_tensor *b_routed_mid;
-    ds4_gpu_tensor *b_routed_down;
+    /* Prefill scratch is either private or borrowed by batch banks. */
+    ds4_exaone_batch_ws *ws;
+    bool ws_owned;
 
     ds4_gpu_tensor *layer_kv[DS4_MAX_LAYER];
     uint32_t        layer_kv_cap[DS4_MAX_LAYER];
@@ -34099,6 +34106,80 @@ static uint32_t exaone_graph_prefill_cap_for_context(uint32_t ctx_size,
     return cap;
 }
 
+static void exaone_batch_ws_free(ds4_exaone_batch_ws *w) {
+    if (!w) return;
+    ds4_gpu_tensor **all[] = {
+        &w->b_cur, &w->b_norm, &w->b_q, &w->b_k, &w->b_v, &w->b_heads,
+        &w->b_attn_out, &w->b_ffn_out,
+        &w->b_dense_gate, &w->b_dense_up, &w->b_dense_mid,
+        &w->b_shared_gate, &w->b_shared_up, &w->b_shared_mid,
+        &w->b_shared_out, &w->b_router_logits, &w->b_router_selected,
+        &w->b_router_weights, &w->b_routed_gate, &w->b_routed_up,
+        &w->b_routed_mid, &w->b_routed_down,
+    };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        ds4_gpu_tensor_free(*all[i]);
+        *all[i] = NULL;
+    }
+    memset(w, 0, sizeof(*w));
+}
+
+static bool exaone_batch_ws_alloc(ds4_exaone_batch_ws *w,
+                                  uint32_t prefill_cap,
+                                  uint64_t n_embd,
+                                  uint64_t q_dim,
+                                  uint64_t kv_dim) {
+    if (!w || prefill_cap == 0u) return false;
+    memset(w, 0, sizeof(*w));
+    w->prefill_cap = prefill_cap;
+    const uint64_t P = prefill_cap;
+    const uint64_t n_used = DS4_N_EXPERT_USED;
+    const uint64_t n_ff_exp = DS4_N_FF_EXP;
+    const uint64_t n_ff_shared =
+        DS4_N_FF_SHEXP ? DS4_N_FF_SHEXP : DS4_N_FF_EXP;
+    const uint64_t n_ff_dense = DS4_N_FF_DENSE;
+    uint64_t bytes = 0u;
+
+#define EXAONE_BATCH_ALLOC(field, elems)                                     \
+    do {                                                                      \
+        const uint64_t _bytes = (uint64_t)(elems) * sizeof(float);            \
+        w->field = ds4_gpu_tensor_alloc(_bytes);                              \
+        if (!w->field) {                                                      \
+            fprintf(stderr,                                                   \
+                    "ds4: exaone graph: batch %s allocation failed "          \
+                    "(%.1f MiB)\n", #field, (double)_bytes / 1048576.0);     \
+            exaone_batch_ws_free(w);                                          \
+            return false;                                                     \
+        }                                                                     \
+        bytes += _bytes;                                                      \
+    } while (0)
+    EXAONE_BATCH_ALLOC(b_cur,             P * n_embd);
+    EXAONE_BATCH_ALLOC(b_norm,            P * n_embd);
+    EXAONE_BATCH_ALLOC(b_q,               P * q_dim);
+    EXAONE_BATCH_ALLOC(b_k,               P * kv_dim);
+    EXAONE_BATCH_ALLOC(b_v,               P * kv_dim);
+    EXAONE_BATCH_ALLOC(b_heads,           P * q_dim);
+    EXAONE_BATCH_ALLOC(b_attn_out,        P * n_embd);
+    EXAONE_BATCH_ALLOC(b_ffn_out,         P * n_embd);
+    EXAONE_BATCH_ALLOC(b_dense_gate,      P * n_ff_dense);
+    EXAONE_BATCH_ALLOC(b_dense_up,        P * n_ff_dense);
+    EXAONE_BATCH_ALLOC(b_dense_mid,       P * n_ff_dense);
+    EXAONE_BATCH_ALLOC(b_shared_gate,     P * n_ff_shared);
+    EXAONE_BATCH_ALLOC(b_shared_up,       P * n_ff_shared);
+    EXAONE_BATCH_ALLOC(b_shared_mid,      P * n_ff_shared);
+    EXAONE_BATCH_ALLOC(b_shared_out,      P * n_embd);
+    EXAONE_BATCH_ALLOC(b_router_logits,   P * DS4_N_EXPERT);
+    EXAONE_BATCH_ALLOC(b_router_selected, P * n_used);
+    EXAONE_BATCH_ALLOC(b_router_weights,  P * n_used);
+    EXAONE_BATCH_ALLOC(b_routed_gate,     P * n_used * n_ff_exp);
+    EXAONE_BATCH_ALLOC(b_routed_up,       P * n_used * n_ff_exp);
+    EXAONE_BATCH_ALLOC(b_routed_mid,      P * n_used * n_ff_exp);
+    EXAONE_BATCH_ALLOC(b_routed_down,     P * n_used * n_embd);
+#undef EXAONE_BATCH_ALLOC
+    w->bytes = bytes;
+    return true;
+}
+
 static void exaone_graph_free(ds4_exaone_gpu_graph *g) {
     if (!g) return;
     ds4_gpu_tensor **all[] = {
@@ -34108,17 +34189,17 @@ static void exaone_graph_free(ds4_exaone_gpu_graph *g) {
         &g->router_logits, &g->router_selected, &g->router_weights,
         &g->routed_gate, &g->routed_up, &g->routed_mid, &g->routed_down,
         &g->logits,
-        &g->b_cur, &g->b_norm, &g->b_q, &g->b_k, &g->b_v, &g->b_heads,
-        &g->b_attn_out, &g->b_ffn_out, &g->b_dense_gate, &g->b_dense_up,
-        &g->b_dense_mid, &g->b_shared_gate, &g->b_shared_up, &g->b_shared_mid,
-        &g->b_shared_out, &g->b_router_logits, &g->b_router_selected,
-        &g->b_router_weights, &g->b_routed_gate, &g->b_routed_up,
-        &g->b_routed_mid, &g->b_routed_down,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         ds4_gpu_tensor_free(*all[i]);
         *all[i] = NULL;
     }
+    if (g->ws_owned && g->ws) {
+        exaone_batch_ws_free(g->ws);
+        free(g->ws);
+    }
+    g->ws = NULL;
+    g->ws_owned = false;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_kv[il]);
         g->layer_kv[il] = NULL;
@@ -34129,11 +34210,12 @@ static void exaone_graph_free(ds4_exaone_gpu_graph *g) {
 /* Allocation is deliberately verbose and accounted: the startup log has to
  * be able to say where every byte of the budget went, and an OOM here must
  * name the stage that failed rather than silently shrinking the context. */
-static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
-                               const ds4_model *model,
-                               const ds4_weights *weights,
-                               uint32_t ctx_size,
-                               uint32_t prefill_chunk) {
+static bool exaone_graph_alloc_with_ws(ds4_exaone_gpu_graph *g,
+                                       const ds4_model *model,
+                                       const ds4_weights *weights,
+                                       uint32_t ctx_size,
+                                       uint32_t prefill_chunk,
+                                       ds4_exaone_batch_ws *shared_ws) {
     (void)model;
     memset(g, 0, sizeof(*g));
     g->ctx_size = ctx_size;
@@ -34188,29 +34270,20 @@ static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
     EX_ALLOC(routed_down,     (uint64_t)n_used * g->n_embd,  "routed_down");
     EX_ALLOC(logits,          DS4_N_VOCAB,                   "logits");
 
-    EX_ALLOC(b_cur,             (uint64_t)P * g->n_embd,               "b_cur");
-    EX_ALLOC(b_norm,            (uint64_t)P * g->n_embd,               "b_norm");
-    EX_ALLOC(b_q,               (uint64_t)P * g->q_dim,                "b_q");
-    EX_ALLOC(b_k,               (uint64_t)P * g->kv_dim,               "b_k");
-    EX_ALLOC(b_v,               (uint64_t)P * g->kv_dim,               "b_v");
-    EX_ALLOC(b_heads,           (uint64_t)P * g->q_dim,                "b_heads");
-    EX_ALLOC(b_attn_out,        (uint64_t)P * g->n_embd,               "b_attn_out");
-    EX_ALLOC(b_ffn_out,         (uint64_t)P * g->n_embd,               "b_ffn_out");
-    EX_ALLOC(b_dense_gate,      (uint64_t)P * n_ff_dense,              "b_dense_gate");
-    EX_ALLOC(b_dense_up,        (uint64_t)P * n_ff_dense,              "b_dense_up");
-    EX_ALLOC(b_dense_mid,       (uint64_t)P * n_ff_dense,              "b_dense_mid");
-    EX_ALLOC(b_shared_gate,     (uint64_t)P * n_ff_shexp,              "b_shared_gate");
-    EX_ALLOC(b_shared_up,       (uint64_t)P * n_ff_shexp,              "b_shared_up");
-    EX_ALLOC(b_shared_mid,      (uint64_t)P * n_ff_shexp,              "b_shared_mid");
-    EX_ALLOC(b_shared_out,      (uint64_t)P * g->n_embd,               "b_shared_out");
-    EX_ALLOC(b_router_logits,   (uint64_t)P * DS4_N_EXPERT,            "b_router_logits");
-    EX_ALLOC(b_router_selected, (uint64_t)P * n_used,                  "b_router_selected");
-    EX_ALLOC(b_router_weights,  (uint64_t)P * n_used,                  "b_router_weights");
-    EX_ALLOC(b_routed_gate,     (uint64_t)P * n_used * n_ff_exp,       "b_routed_gate");
-    EX_ALLOC(b_routed_up,       (uint64_t)P * n_used * n_ff_exp,       "b_routed_up");
-    EX_ALLOC(b_routed_mid,      (uint64_t)P * n_used * n_ff_exp,       "b_routed_mid");
-    EX_ALLOC(b_routed_down,     (uint64_t)P * n_used * g->n_embd,      "b_routed_down");
 #undef EX_ALLOC
+    if (shared_ws && shared_ws->prefill_cap >= P) {
+        g->ws = shared_ws;
+        g->ws_owned = false;
+    } else {
+        g->ws = xcalloc(1, sizeof(*g->ws));
+        g->ws_owned = true;
+        if (!exaone_batch_ws_alloc(g->ws, P, g->n_embd,
+                                   g->q_dim, g->kv_dim)) {
+            exaone_graph_free(g);
+            return false;
+        }
+        ws += g->ws->bytes;
+    }
     g->workspace_bytes = ws;
 
     uint64_t kv_bytes = 0;
@@ -34242,6 +34315,15 @@ static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
     return true;
 }
 
+static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
+                               const ds4_model *model,
+                               const ds4_weights *weights,
+                               uint32_t ctx_size,
+                               uint32_t prefill_chunk) {
+    return exaone_graph_alloc_with_ws(g, model, weights, ctx_size,
+                                      prefill_chunk, NULL);
+}
+
 /* One transformer layer, prefill and decode sharing the body.
  *
  * `n_tok` is 1 for decode; the only other differences are which workspace
@@ -34265,13 +34347,13 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
     const bool sliding = exaone_graph_layer_is_sliding(il);
     const uint32_t kv_cap = g->layer_kv_cap[il];
 
-    ds4_gpu_tensor *norm     = batch ? g->b_norm     : g->norm;
-    ds4_gpu_tensor *q        = batch ? g->b_q        : g->q;
-    ds4_gpu_tensor *k        = batch ? g->b_k        : g->k;
-    ds4_gpu_tensor *v        = batch ? g->b_v        : g->v;
-    ds4_gpu_tensor *heads    = batch ? g->b_heads    : g->heads;
-    ds4_gpu_tensor *attn_out = batch ? g->b_attn_out : g->attn_out;
-    ds4_gpu_tensor *ffn_out  = batch ? g->b_ffn_out  : g->ffn_out;
+    ds4_gpu_tensor *norm     = batch ? g->ws->b_norm     : g->norm;
+    ds4_gpu_tensor *q        = batch ? g->ws->b_q        : g->q;
+    ds4_gpu_tensor *k        = batch ? g->ws->b_k        : g->k;
+    ds4_gpu_tensor *v        = batch ? g->ws->b_v        : g->v;
+    ds4_gpu_tensor *heads    = batch ? g->ws->b_heads    : g->heads;
+    ds4_gpu_tensor *attn_out = batch ? g->ws->b_attn_out : g->attn_out;
+    ds4_gpu_tensor *ffn_out  = batch ? g->ws->b_ffn_out  : g->ffn_out;
 
     /* --- attention --- */
     if (!ds4_gpu_exaone_rms_norm_tensor(norm, x, m->map, m->size,
@@ -34333,9 +34415,9 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
         /* Dense layer 0. Every token goes through it, which is why the recipe
          * keeps it at Q8_0. */
         const uint64_t n_ff = DS4_N_FF_DENSE;
-        ds4_gpu_tensor *gt = batch ? g->b_dense_gate : g->dense_gate;
-        ds4_gpu_tensor *ut = batch ? g->b_dense_up   : g->dense_up;
-        ds4_gpu_tensor *mt = batch ? g->b_dense_mid  : g->dense_mid;
+        ds4_gpu_tensor *gt = batch ? g->ws->b_dense_gate : g->dense_gate;
+        ds4_gpu_tensor *ut = batch ? g->ws->b_dense_up   : g->dense_up;
+        ds4_gpu_tensor *mt = batch ? g->ws->b_dense_mid  : g->dense_mid;
         if (!metal_graph_matmul_plain_tensor(gt, m, l->ffn_gate, n_embd, n_ff, norm, n_tok) ||
             !metal_graph_matmul_plain_tensor(ut, m, l->ffn_up,   n_embd, n_ff, norm, n_tok) ||
             !ds4_gpu_exaone_swiglu_tensor(mt, gt, ut, (uint64_t)n_tok * n_ff) ||
@@ -34346,9 +34428,9 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
 
     /* Sparse layer: router, top-8 routed experts, plus the shared expert that
      * every token goes through unweighted. */
-    ds4_gpu_tensor *rl  = batch ? g->b_router_logits   : g->router_logits;
-    ds4_gpu_tensor *sel = batch ? g->b_router_selected : g->router_selected;
-    ds4_gpu_tensor *rw  = batch ? g->b_router_weights  : g->router_weights;
+    ds4_gpu_tensor *rl  = batch ? g->ws->b_router_logits   : g->router_logits;
+    ds4_gpu_tensor *sel = batch ? g->ws->b_router_selected : g->router_selected;
+    ds4_gpu_tensor *rw  = batch ? g->ws->b_router_weights  : g->router_weights;
     if (!metal_graph_matmul_plain_tensor(rl, m, l->ffn_gate_inp, n_embd,
                                          DS4_N_EXPERT, norm, n_tok))
         return false;
@@ -34361,10 +34443,10 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
         return false;
 
     const uint64_t n_ff_exp = l->ffn_gate_exps->dim[1];
-    ds4_gpu_tensor *rg = batch ? g->b_routed_gate : g->routed_gate;
-    ds4_gpu_tensor *ru = batch ? g->b_routed_up   : g->routed_up;
-    ds4_gpu_tensor *rm = batch ? g->b_routed_mid  : g->routed_mid;
-    ds4_gpu_tensor *rd = batch ? g->b_routed_down : g->routed_down;
+    ds4_gpu_tensor *rg = batch ? g->ws->b_routed_gate : g->routed_gate;
+    ds4_gpu_tensor *ru = batch ? g->ws->b_routed_up   : g->routed_up;
+    ds4_gpu_tensor *rm = batch ? g->ws->b_routed_mid  : g->routed_mid;
+    ds4_gpu_tensor *rd = batch ? g->ws->b_routed_down : g->routed_down;
     /* Reuse the same routed-MoE executor as Solar/Motif.  K-EXAONE's
      * interior IQ2_XXS gate/up + Q3_K down layers can take the common D4
      * handoff for wide prefill; its Q4_K edge layers fall back before launch
@@ -34401,10 +34483,10 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
     }
 
     const uint64_t n_ff_shexp = l->ffn_gate_shexp->dim[1];
-    ds4_gpu_tensor *sg = batch ? g->b_shared_gate : g->shared_gate;
-    ds4_gpu_tensor *su = batch ? g->b_shared_up   : g->shared_up;
-    ds4_gpu_tensor *sm = batch ? g->b_shared_mid  : g->shared_mid;
-    ds4_gpu_tensor *so = batch ? g->b_shared_out  : g->shared_out;
+    ds4_gpu_tensor *sg = batch ? g->ws->b_shared_gate : g->shared_gate;
+    ds4_gpu_tensor *su = batch ? g->ws->b_shared_up   : g->shared_up;
+    ds4_gpu_tensor *sm = batch ? g->ws->b_shared_mid  : g->shared_mid;
+    ds4_gpu_tensor *so = batch ? g->ws->b_shared_out  : g->shared_out;
     if (!metal_graph_matmul_plain_tensor(sg, m, l->ffn_gate_shexp, n_embd, n_ff_shexp, norm, n_tok) ||
         !metal_graph_matmul_plain_tensor(su, m, l->ffn_up_shexp,   n_embd, n_ff_shexp, norm, n_tok) ||
         !ds4_gpu_exaone_swiglu_tensor(sm, sg, su, (uint64_t)n_tok * n_ff_shexp) ||
@@ -34455,7 +34537,7 @@ static bool exaone_graph_prefill_chunk(ds4_exaone_gpu_graph *g,
 
     for (uint32_t t = 0; t < n_tok; t++) {
         ds4_gpu_tensor *row = ds4_gpu_tensor_view(
-                g->b_cur, (uint64_t)t * g->n_embd * sizeof(float),
+                g->ws->b_cur, (uint64_t)t * g->n_embd * sizeof(float),
                 g->n_embd * sizeof(float));
         if (!row) return false;
         const int ok = ds4_gpu_embed_token_quant_tensor(
@@ -34466,13 +34548,13 @@ static bool exaone_graph_prefill_chunk(ds4_exaone_gpu_graph *g,
         if (!ok) return false;
     }
     for (uint32_t il = 0; il < n_exec; il++) {
-        if (!exaone_graph_layer(g, m, w, il, n_tok, pos0, g->b_cur)) {
+        if (!exaone_graph_layer(g, m, w, il, n_tok, pos0, g->ws->b_cur)) {
             fprintf(stderr, "ds4: exaone prefill failed at layer %u\n", il);
             return false;
         }
     }
     if (!want_logits) return true;
-    return exaone_graph_output_head(g, m, w, g->b_cur,
+    return exaone_graph_output_head(g, m, w, g->ws->b_cur,
                                     (uint64_t)(n_tok - 1u) * g->n_embd);
 }
 

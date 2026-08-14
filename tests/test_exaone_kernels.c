@@ -216,6 +216,46 @@ enum {
     T_USED     = 8,
 };
 
+static void test_shared_prefill_workspace(void) {
+    const uint32_t P = 2u;
+    const uint64_t n_embd = 256u;
+    const uint64_t q_dim = 512u;
+    const uint64_t kv_dim = 128u;
+    const uint64_t n_used = DS4_N_EXPERT_USED;
+    const uint64_t n_ff_shared =
+        DS4_N_FF_SHEXP ? DS4_N_FF_SHEXP : DS4_N_FF_EXP;
+    const uint64_t elems_per_token =
+        5u * n_embd + 2u * q_dim + 2u * kv_dim +
+        3u * DS4_N_FF_DENSE + 3u * n_ff_shared +
+        DS4_N_EXPERT + 2u * n_used +
+        3u * n_used * DS4_N_FF_EXP + n_used * n_embd;
+    const uint64_t expected_bytes =
+        (uint64_t)P * elems_per_token * sizeof(float);
+
+    ds4_exaone_batch_ws shared = {0};
+    bool ok = exaone_batch_ws_alloc(&shared, P, n_embd, q_dim, kv_dim) &&
+              shared.prefill_cap == P && shared.bytes == expected_bytes &&
+              shared.b_cur && shared.b_routed_down;
+    ds4_gpu_tensor *borrowed_cur = shared.b_cur;
+
+    ds4_model model = {0};
+    ds4_weights weights = {0};
+    ds4_exaone_gpu_graph graph = {0};
+    if (ok) {
+        ok = exaone_graph_alloc_with_ws(&graph, &model, &weights,
+                                         8u, P, &shared) &&
+             graph.ws == &shared && !graph.ws_owned;
+    }
+    exaone_graph_free(&graph);
+    ok = ok && shared.b_cur == borrowed_cur && shared.bytes == expected_bytes;
+    exaone_batch_ws_free(&shared);
+    ok = ok && !shared.b_cur && shared.bytes == 0u;
+
+    if (!ok) g_fail++;
+    printf("%-38s bytes=%.2f MiB  %s\n", "shared prefill workspace ownership",
+           (double)expected_bytes / 1048576.0, ok ? "ok" : "FAIL");
+}
+
 static void test_qk_norm_rope(void *map, uint64_t map_size, uint64_t w_off,
                               uint32_t pos0) {
     const uint32_t n_tok = 3;
@@ -679,6 +719,7 @@ int main(int argc, char **argv) {
     test_context_memory_plan();
     test_exaone_rewind_span();
     if (!ds4_gpu_init()) { fprintf(stderr, "ds4_gpu_init failed\n"); return 1; }
+    test_shared_prefill_workspace();
 
     /* Synthetic "model map": a QK-norm weight vector followed by a router
      * bias, at 256-byte-aligned offsets, registered the same way a real
