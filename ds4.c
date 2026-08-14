@@ -545,6 +545,14 @@ typedef struct {
     uint16_t dmin;
 } block_q2_K;
 
+/* EXAONE routed down projections use Q3_K. */
+typedef struct {
+    uint8_t  hmask[QK_K / 8];
+    uint8_t  qs[QK_K / 4];
+    uint8_t  scales[12];
+    uint16_t d;
+} block_q3_K;
+
 typedef struct {
     uint16_t d;
     uint16_t dmin;
@@ -565,6 +573,7 @@ typedef struct {
 
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
+DS4_STATIC_ASSERT(ds4_block_q3_k_size, sizeof(block_q3_K) == 110);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
@@ -2976,6 +2985,49 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
     }
     *s = sumf;
 #endif
+}
+
+/* Q3_K stores sixteen signed six-bit sub-block scales across 12 bytes. */
+static inline void q3_k_unpack_scales(const block_q3_K *xb, int8_t out[16]) {
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    memcpy(aux, xb->scales, 12);
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = ((aux[0]     ) & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = ((aux[1]     ) & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    memcpy(out, aux, 16);
+}
+
+static inline float q3_k_value_f32(const block_q3_K *blocks, uint32_t k) {
+    const uint32_t block = k / QK_K;
+    const uint32_t idx = k - block * QK_K;
+    const block_q3_K *xb = blocks + block;
+    const uint32_t half = idx / 128u;
+    const uint32_t r = idx - half * 128u;
+    const uint32_t j = r / 32u;
+    const uint32_t sub = (r - j * 32u) / 16u;
+    const uint32_t l = r & 15u;
+    int8_t sc[16];
+    q3_k_unpack_scales(xb, sc);
+    const uint32_t shift = j * 2u;
+    const uint32_t m = 1u << (half * 4u + j);
+    const uint32_t qi = half * 32u + sub * 16u + l;
+    const uint32_t hi = sub * 16u + l;
+    const int32_t lo = (int32_t)((xb->qs[qi] >> shift) & 3u);
+    const int32_t v = lo - ((xb->hmask[hi] & m) ? 0 : 4);
+    const int32_t s = (int32_t)sc[half * 8u + j * 2u + sub] - 32;
+    return f16_to_f32(xb->d) * (float)s * (float)v;
+}
+
+static float ds4_vec_dot_q3_K_f32(int n, const block_q3_K *x, const float *y) {
+    float sum = 0.0f;
+    for (int k = 0; k < n; k++) {
+        sum += q3_k_value_f32(x, (uint32_t)k) * y[k];
+    }
+    return sum;
 }
 
 static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const block_q8_K *y) {
