@@ -48,12 +48,12 @@ endif
 endif
 NVCC_EXTRA_FLAGS ?=
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math -std=c++17 $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread $(NVCC_EXTRA_FLAGS)
-# deepmem lite-2: DS4_CUDA_SPARK_HBM_CACHE is retired.  The startup span
-# cache is compiled unconditionally and gated at runtime (integrated
-# devices only; opt-out DS4_CUDA_NO_HBM_CACHE), so cuda-spark is now purely
-# an arch-selection alias for CUDA_ARCH=sm_121 and the 08-05 installer
+# deepmem lite-2 (plumbing deleted in D3-3): DS4_CUDA_SPARK_HBM_CACHE is
+# retired.  Startup weight promotion is compiled unconditionally and gated
+# at runtime (integrated devices only; policy knob DS4_WEIGHT_RESIDENCY,
+# legacy opt-out DS4_CUDA_NO_HBM_CACHE), so cuda-spark is purely an
+# arch-selection alias for CUDA_ARCH=sm_121 and the 08-05 installer
 # plan-overcommit class (forum 378855/65) cannot be built.
-CUDA_SPARK_FLAGS :=
 # Include path so cuda/mmq/*.cu can find its sibling vendored headers and
 # the ds4_ggml_stubs shim. The redirected ggml.h / ggml-impl.h / ggml-cuda.h
 # live alongside the vendored common.cuh.
@@ -112,7 +112,7 @@ all: help
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10 with Spark HBM weight cache"
+	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10 (sm_121a arch alias)"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -126,8 +126,8 @@ help:
 # pre-expanded NVCCFLAGS, where the parent's empty NVCC_ARCH_FLAGS would
 # erase it), so spark defines travel via NVCC_EXTRA_FLAGS instead.
 cuda-spark:
-	@printf '%s\n' '# written by make cuda-spark (see the config include note in Makefile)' 'CUDA_ARCH := sm_121' 'NVCC_EXTRA_FLAGS := $(CUDA_SPARK_FLAGS)' 'CFLAGS += $(CUDA_SPARK_FLAGS)' > .ds4-cuda-config.mk
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent $(CUDA_EXTRA_BINS) CUDA_ARCH=sm_121 CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCC_EXTRA_FLAGS="$(CUDA_SPARK_FLAGS)"
+	@printf '%s\n' '# written by make cuda-spark (see the config include note in Makefile)' 'CUDA_ARCH := sm_121' 'NVCC_EXTRA_FLAGS :=' > .ds4-cuda-config.mk
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent $(CUDA_EXTRA_BINS) CUDA_ARCH=sm_121 NVCC_EXTRA_FLAGS=""
 
 cuda-generic:
 	@printf '%s\n' '# written by make cuda-generic (see the config include note in Makefile)' 'CUDA_ARCH := native' > .ds4-cuda-config.mk

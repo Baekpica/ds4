@@ -54,27 +54,34 @@ The bandwidth figure is informational; we don't tier on it.
   that must remain after an anon huge-page model copy; below it the copy is
   skipped. See `DS4_MODEL_ANON_HUGE`.
 
-- `-DDS4_CUDA_SPARK_HBM_CACHE=1` (COMPILE-TIME define, not an env var; in the
-  Makefile's `CUDA_SPARK_FLAGS`, applied by the `cuda-spark` target but NOT by
-  a plain `make ds4-server`). Enables the startup HBM cache walk
-  (`accelerator_cache_model_tensor_spans`): every non-MoE tensor span (~8.4
-  GiB on V4-Flash: attn projections + compressor + indexer + shexp + dense
-  FFN + embedding + output head) is copied into `cudaMalloc` device memory at
-  boot (~0.5 s) and all decode reads of the dense half run at device rate.
-  WHY THIS MATTERS ON GB10 (measured 2026-07-02): GPU streaming reads of
-  `cudaHostRegister`'d host memory (mmap OR anon-THP) cap at ~161 GB/s while
-  `cudaMalloc` device memory reads at ~236 GB/s on the same LPDDR5x —
-  a hard substrate ceiling, not a kernel property (`micro_bw`). With the walk
-  on (plus the two-pass range-lookup fix, see below) base decode is 63.3
-  ms/tok vs 68.5 anon-THP / 73-74 without the define — and MoE spans drop
-  below their old "floor" (w1 0.280 &rarr; 0.261 ms) because dense reads stop
-  competing for mapped bandwidth. Managed memory (`cudaMallocManaged`, any
-  advise/prefetch combination) is NOT an escape hatch: it reads at the same
-  ~161 GB/s, and host code cannot dereference `cudaMalloc` pointers on GB10
-  (segfault), so full device residency of the MoE set needs the VMM-arena
-  loader follow-up, not a bigger cache cap. Opt-outs at runtime:
-  `DS4_CUDA_NO_HBM_CACHE=1`, cap via `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB`
-  (default 24).
+- `DS4_WEIGHT_RESIDENCY=eager|lazy|mapped` (memgov D3-2; per-source
+  overrides `DS4_WEIGHT_RESIDENCY_BASE` / `_MTP` / `_DRAFTER` win over the
+  global). ONE typed weight-residency policy per model source, resolved
+  once at engine open: `eager` (default) device-promotes the funded
+  non-expert plan at boot with lazy backfill on misses; `lazy` defers the
+  same promotions to first touch; `mapped` is TERMINAL host residency —
+  mapped units never device-promote, and on integrated (GB10) the raw
+  ATS-coherent mmap pointer serves them directly (capture-safe, no
+  per-range registrations). Setting it beside a legacy residency lever
+  (`DS4_CUDA_NO_HBM_CACHE` / `DS4_CUDA_NO_FD_CACHE` /
+  `DS4_CUDA_DIRECT_MODEL`) is a strict boot error; with it unset the
+  legacy shapes act as exact aliases (none = eager, `NO_HBM_CACHE` =
+  lazy, `NO_HBM_CACHE`+`NO_FD_CACHE` = mapped, `DIRECT_MODEL` = mapped).
+  The boot log prints the resolution:
+  `ds4: weight residency: base=... mtp=... drafter=... (explicit|legacy-alias)`.
+
+- HISTORY: `-DDS4_CUDA_SPARK_HBM_CACHE=1` (compile-time fork) is RETIRED
+  (deepmem lite-2; plumbing deleted in D3-3). Startup promotion is
+  compiled unconditionally, runtime-gated, and driven by the canonical
+  unit materializer (the old `accelerator_cache_model_tensor_spans` walk
+  is deleted). The substrate numbers that motivated device residency
+  (measured 2026-07-02, per-stream): GPU streaming reads of
+  `cudaHostRegister`'d host memory cap at ~161 GB/s while `cudaMalloc`
+  device memory reads ~236 GB/s on the same LPDDR5x; base decode 63.3
+  ms/tok with the walk vs 73-74 without. The whole-system re-measurement
+  under serving load is the D3-1 rent gate (speed-bench/rent_gate.sh),
+  which selects the release default. Promotion budget cap stays
+  `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB` (default 24).
 
 - Range-lookup fix note (no env var; 2026-07-02): `cuda_model_range_ptr` now
   resolves device-resident HBM cache copies in a first pass before the

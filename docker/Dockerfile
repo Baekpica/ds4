@@ -40,8 +40,9 @@ RUN apt-get update \
 WORKDIR /opt/ds4
 COPY . .
 
-# cuda-spark: -gencode arch=compute_121a,code=sm_121a plus the Spark
-# defines (DS4_CUDA_HAVE_MXF4, DS4_CUDA_SPARK_HBM_CACHE).  Verify with
+# cuda-spark: -gencode arch=compute_121a,code=sm_121a (+DS4_CUDA_HAVE_MXF4).
+# Purely an arch alias -- weight residency is a runtime policy
+# (DS4_WEIGHT_RESIDENCY), not a compile fork.  Verify with
 # `cuobjdump ds4_cuda.o | grep sm_121a` if in doubt.
 RUN make -j"$(nproc)" cuda-spark
 
