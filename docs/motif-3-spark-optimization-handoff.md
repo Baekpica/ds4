@@ -1,7 +1,7 @@
 # Motif-3 DGX Spark 최적화 작업 handoff
 
-기준 시각: **2026-08-14 17:00 KST** (재개 세션 진행 내역은 §0에 누적;
-후속 재개 결과는 §0.23까지 반영)
+기준 시각: **2026-08-14 16:57 KST** (재개 세션 진행 내역은 §0에 누적;
+후속 재개 결과는 §0.24까지 반영)
 
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
@@ -10,8 +10,9 @@ Motif는 안전한 native serial session과 4개 API surface를 통과했다. Mo
 weight-owner의 기본 IQ2/Q2K aligned artifact를 384-expert 전용 경로에서 직접
 소비하도록 수정해 illegal access를 해소했고 실제 prefill/decode를 완료했다.
 현재 대형 프로세스는 모두 종료했으며 `clear_cache` 후 119 GiB available을
-확인했다. 최종 source/test/doc review와 CPU/CUDA 회귀를 완료했다.
-다음 단계는 `v0.5.6.3-dfm` Git publish, HF collection card 갱신,
+확인했다. 최종 source/test/doc review와 CPU/CUDA 회귀를 완료했고
+`v0.5.6.3-dfm` Git publish도 완료했다. 다음 단계는
+HF collection card 갱신,
 이후 nsys→ncu 기반 Motif 최적화와 strict 256K다.
 Spark 256K 통과 주장은 아직 금지다.**
 
@@ -345,6 +346,18 @@ Spark 256K 통과 주장은 아직 금지다.**
       `https://github.com/Baekpica/ds4/tree/v0.5.6.3-dfm`을 사용해
       이 검증 release를 고정한다.
 
+24. **Git integration publish 완료** —
+    - 문서 갱신과 최종 회귀 완료 후 release commit
+      `a388f92ae8803ebefd0af4d92dc6093e1f8db8f7`을
+      `origin/feature/model-families-v0563`, `origin/dfm`, annotated tag
+      `v0.5.6.3-dfm`으로 publish했다.
+    - `git ls-remote`에서 두 branch와 tag peeled ref가 모두
+      `a388f92ae8803ebefd0af4d92dc6093e1f8db8f7`을 가리키는 것을
+      확인했다. GitHub API의 annotated tag object는
+      `d7db4840560618fa4e48d39ad3cc27ac487ebbf2`다.
+    - tag 생성 후 `ds4_server.o`를 재빌드해
+      `./ds4-server --version` = `ds4-server v0.5.6.3-dfm`을 확인했다.
+
 남은 경계(사실로 기록):
 - 엔진 **static batch core**(`ds4_batch_generate_core`)는 여전히 per-seq
   eos 단일 비교 — 순수 코어에 vocab 접근이 없어 보류. 서버측 detok 절단이
@@ -418,7 +431,7 @@ Spark에서 정확히 262,144-token prefill을 완료하고 실제 decode token�
 
 ## 4. 현재 호스트와 메모리 상태
 
-| 항목 | 2026-08-14 17:00 KST 현재 값 |
+| 항목 | 2026-08-14 16:57 KST 현재 값 |
 |---|---|
 | Host | `thinkstationpgx-8abc` |
 | Kernel | `6.17.0-1029-nvidia` |
@@ -819,7 +832,6 @@ Git과 HF 어느 쪽도 문서보다 먼저 갱신하지 않는다. model card�
 
 ## 17. 현재까지도 하지 않은 일
 
-- 통합 branch/tag Git remote push
 - collection 전체 Hugging Face model-card 갱신
 - HF private handoff의 이번 재개 로그/문서 checkpoint
 - nsys/ncu profile
@@ -828,6 +840,6 @@ Git과 HF 어느 쪽도 문서보다 먼저 갱신하지 않는다. model card�
 
 완료된 항목은 VMM owner dry-run/live, raw/aligned Motif worker, 네 family
 공통-command 실제 API gate, 매 전환의 `clear_cache`, publish 전
-source/test/doc review다. 다음 단계는 Git publish와 영어 model-card
-갱신이다. 그 뒤 Motif
+source/test/doc review, Git branch/tag publish다. 다음 단계는 영어
+model-card 갱신이다. 그 뒤 Motif
 owner를 다시 올려 §12의 nsys medium-prefill부터 재개한다.
