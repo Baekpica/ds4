@@ -26492,11 +26492,64 @@ static ds4_context_memory solar_graph_context_memory_estimate(
     return m;
 }
 
+static uint32_t exaone_graph_prefill_cap_for_context(uint32_t ctx_size,
+                                                      uint32_t requested);
+
+/* Exact K-EXAONE single-session projection.  Twelve LLLG global layers own
+ * full BF16 K/V, while the other 36 layers own a fixed 128-token ring.  The
+ * scratch expression mirrors every decode and P-row allocation in
+ * exaone_graph_alloc; keep the two adjacent in review even though the graph
+ * implementation lives below the Motif diagnostic executor. */
+static ds4_context_memory exaone_graph_context_memory_estimate(
+        uint32_t ctx, uint32_t requested_prefill) {
+    ds4_context_memory m = {0};
+    if (ctx == 0u || DS4_N_LAYER <= DS4_N_NEXTN_PREDICT ||
+        DS4_N_SWA == 0u || DS4_N_SWA_PERIOD == 0u) {
+        return m;
+    }
+    const uint32_t P =
+        exaone_graph_prefill_cap_for_context(ctx, requested_prefill);
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint64_t n_embd = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t n_used = DS4_N_EXPERT_USED;
+    const uint64_t n_ff_exp = DS4_N_FF_EXP;
+    const uint64_t n_ff_shared = DS4_N_FF_SHEXP;
+    const uint64_t n_ff_dense = DS4_N_FF_DENSE;
+    const uint64_t kv_row_bytes = kv_dim * 2u * sizeof(uint16_t);
+
+    m.prefill_cap = P;
+    m.raw_cap = ctx;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        const uint32_t cap = exaone_layer_is_sliding(il) ? DS4_N_SWA : ctx;
+        m.raw_bytes += (uint64_t)cap * kv_row_bytes;
+    }
+
+    const uint64_t decode_elems =
+        5u * n_embd + 2u * q_dim + 2u * kv_dim +
+        3u * n_ff_dense + 3u * n_ff_shared +
+        DS4_N_EXPERT + 2u * n_used +
+        3u * n_used * n_ff_exp + n_used * n_embd + DS4_N_VOCAB;
+    const uint64_t prefill_elems =
+        5u * n_embd + 2u * q_dim + 2u * kv_dim +
+        3u * n_ff_dense + 3u * n_ff_shared +
+        DS4_N_EXPERT + 2u * n_used +
+        3u * n_used * n_ff_exp + n_used * n_embd;
+    m.scratch_bytes =
+        (decode_elems + (uint64_t)P * prefill_elems) * sizeof(float);
+    m.total_bytes = m.raw_bytes + m.scratch_bytes;
+    return m;
+}
+
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
     if (ds4_backend_uses_graph(backend)) {
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
+            return exaone_graph_context_memory_estimate(ctx, 0u);
+        }
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
             return solar_graph_context_memory_estimate(backend, ctx);
         }
@@ -48984,12 +49037,75 @@ static bool solar_graph_session_fit_check(ds4_backend backend,
     return false;
 }
 
+/* K-EXAONE follows the same fail-clean unified-memory policy as Solar.  A
+ * 256K graph is roughly 12.42 GiB; trying that allocation after weights and
+ * artifacts have filled the box can otherwise drive GB10 into global OOM
+ * reclaim instead of returning a useful allocation error. */
+static bool exaone_graph_session_fit_check(ds4_backend backend,
+                                           uint32_t ctx_size,
+                                           uint32_t prefill_cap,
+                                           bool loud) {
+    const char *fe = getenv("DS4_SESSION_GRAPH_FIT");
+    if (fe && fe[0] == '0' && fe[1] == '\0') return true;
+    if (backend != DS4_BACKEND_CUDA || ctx_size > DS4_ROPE_ORIG_CTX) {
+        return false;
+    }
+
+    const ds4_context_memory plan =
+        exaone_graph_context_memory_estimate(ctx_size, prefill_cap);
+    if (plan.total_bytes == 0u || plan.prefill_cap != prefill_cap) {
+        if (loud) {
+            ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
+            fprintf(stderr,
+                    "ds4: EXAONE session graph plan is invalid "
+                    "(ctx=%u prefill_cap=%u planned=%u)\n",
+                    ctx_size, prefill_cap, plan.prefill_cap);
+        }
+        return false;
+    }
+
+    uint64_t free_b = 0u, total_b = 0u;
+    if (ds4_gpu_mem_info(&free_b, &total_b) != 0) return true;
+    const uint64_t sub_out = ds4_gpu_substrate_outstanding();
+    free_b = free_b > sub_out ? free_b - sub_out : 0u;
+
+    uint64_t headroom = 1024ull << 20;
+    const char *he = getenv("DS4_SESSION_GRAPH_HEADROOM_MB");
+    if (he && he[0]) {
+        const long value = atol(he);
+        if (value >= 0) headroom = (uint64_t)value << 20;
+    }
+    const bool fits = plan.total_bytes <= UINT64_MAX - headroom &&
+                      free_b >= plan.total_bytes + headroom;
+    if (fits) return true;
+    if (loud) {
+        ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
+        fprintf(stderr,
+                "ds4: EXAONE session graph fit check FAILED: need ~%.0f MiB "
+                "(+%.0f MiB headroom) but only %.0f MiB allocatable "
+                "(ctx=%u prefill_cap=%u, KV=%.2f GiB scratch=%.2f GiB); "
+                "refusing the alloc so the box survives "
+                "(DS4_SESSION_GRAPH_FIT=0 overrides)\n",
+                (double)plan.total_bytes / 1048576.0,
+                (double)headroom / 1048576.0,
+                (double)free_b / 1048576.0,
+                ctx_size, prefill_cap,
+                (double)plan.raw_bytes / 1073741824.0,
+                (double)plan.scratch_bytes / 1073741824.0);
+    }
+    return false;
+}
+
 /* One body for the eager (create) and lazy (ensure) alloc so the two cannot
  * drift: sizing, quality/power adoption, directional steering. */
 static int ds4_session_alloc_graph(ds4_session *s) {
     ds4_engine *e = s->engine;
     if (ds4_session_is_exaone(s)) {
-        if (!exaone_graph_alloc(&s->exaone_graph,
+        if (!exaone_graph_session_fit_check(e->backend,
+                                            (uint32_t)s->ctx_size,
+                                            s->prefill_cap,
+                                            /*loud=*/true) ||
+            !exaone_graph_alloc(&s->exaone_graph,
                                 &e->model,
                                 &e->weights,
                                 (uint32_t)s->ctx_size,
@@ -49091,8 +49207,12 @@ int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size) {
                                              /*loud=*/false) ? 1 : 0;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
-        return e->backend == DS4_BACKEND_CUDA &&
-               (uint32_t)ctx_size <= DS4_ROPE_ORIG_CTX;
+        const uint32_t prefill_cap =
+            exaone_graph_prefill_cap_for_context((uint32_t)ctx_size, 0u);
+        return exaone_graph_session_fit_check(e->backend,
+                                              (uint32_t)ctx_size,
+                                              prefill_cap,
+                                              /*loud=*/false) ? 1 : 0;
     }
     const uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);

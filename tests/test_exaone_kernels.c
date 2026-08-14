@@ -21,6 +21,26 @@
 
 static int g_fail = 0;
 
+static void test_context_memory_plan(void) {
+    g_ds4_shape = DS4_SHAPE_KEXAONE_236B;
+    const ds4_context_memory m =
+        ds4_context_memory_estimate(DS4_BACKEND_CUDA, 262144);
+    const int ok =
+        m.prefill_cap == 512u &&
+        m.raw_cap == 262144u &&
+        m.raw_bytes == UINT64_C(12903776256) &&
+        m.compressed_bytes == 0u &&
+        m.scratch_bytes == UINT64_C(429564480) &&
+        m.total_bytes == UINT64_C(13333340736);
+    if (!ok) g_fail++;
+    printf("%-38s KV=%.2f GiB scratch=%.2f GiB total=%.2f GiB  %s\n",
+           "262144-context memory plan",
+           (double)m.raw_bytes / 1073741824.0,
+           (double)m.scratch_bytes / 1073741824.0,
+           (double)m.total_bytes / 1073741824.0,
+           ok ? "ok" : "FAIL");
+}
+
 static void report(const char *what, double max_abs, double max_rel, double tol_abs,
                    double tol_rel) {
     const int ok = (max_abs <= tol_abs) || (max_rel <= tol_rel);
@@ -493,6 +513,7 @@ static void test_moe_matmul(const ds4_model *m, const ds4_weights *wts) {
 }
 
 int main(int argc, char **argv) {
+    test_context_memory_plan();
     if (!ds4_gpu_init()) { fprintf(stderr, "ds4_gpu_init failed\n"); return 1; }
 
     /* Synthetic "model map": a QK-norm weight vector followed by a router
