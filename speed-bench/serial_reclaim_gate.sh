@@ -143,18 +143,24 @@ kill_server() {
     log "WARN: server still draining after 60s"
 }
 
-start_hog() { # $1 log-for-sizing-message
-    local avail hog
+start_hog() { # $1 log-for-sizing-message  [$2 free-after-MB override]
+    local avail hog target
+    # Default free-after = the leg-A bracket (fail-then-serve needs the
+    # drift-proof two-sided window).  A leg whose requirement is ONE-SIDED
+    # (fail, full stop -- leg D) passes a LOWER override and overshoots:
+    # determinism is free when there is no post-trim recovery to protect.
+    target=${2:-$((NEED_EST_MB - RECLAIM_MARGIN_MB))}
     avail=$(remote "awk '/MemAvailable/{print int(\$2/1024)}' /proc/meminfo")
-    hog=$((avail - NEED_EST_MB + RECLAIM_MARGIN_MB))
+    hog=$((avail - target))
     # A churned box can arrive at hog time ALREADY near the free-after
-    # target (measured 08-11: avail=6006 after 24 saturated banks) -- the
-    # tenants themselves supply the pressure and only a minimal hot pin is
-    # needed to stop kswapd creeping MemAvailable back over the threshold
-    # (run-4 lesson).  Below 256M the envelope is genuinely unreachable
-    # (free-after would land under the drift band): die with guidance.
-    [ "$hog" -ge 256 ] || die "avail=$avail already below free-after target (need_est=$NEED_EST_MB margin=$RECLAIM_MARGIN_MB) -- reboot the box or re-bracket"
-    log "MemAvailable=${avail}M -> hog=${hog}M (free-after ~= need_est - margin)"
+    # target (measured 08-11: avail=6006 after 24 saturated banks; 08-15
+    # run: 5628) -- the tenants themselves supply the pressure and only a
+    # minimal hot pin is needed to stop kswapd creeping MemAvailable back
+    # over the threshold (run-4 lesson).  Below 256M the envelope is
+    # genuinely unreachable (free-after would land under the drift band):
+    # die with guidance.
+    [ "$hog" -ge 256 ] || die "avail=$avail already below free-after target (target=$target) -- reboot the box, re-bracket, or lower the leg's free-after"
+    log "MemAvailable=${avail}M -> hog=${hog}M (free-after target ${target}M)"
     # The box carries 16 GiB of swap and kswapd evicts a cold slept-on hog
     # within ~1 min (MemAvailable creeps back over the threshold and the
     # fit probe passes -- run-4 lesson).  Keep the pages HOT: continuous
@@ -372,7 +378,13 @@ settle_wait
 log "boot D (DS4_SERVER_PIN_MIN_TOKENS=25000: every ${TENANT_TOKENS}-token tenant is DEEP)"
 boot "DS4_SERVER_PIN_MIN_TOKENS=25000" /tmp/reclaim_D.log
 saturate /tmp/reclaim_td
-start_hog D
+# One-sided leg: only FIT-FAIL must hold, so overshoot the pin to a
+# free-after a full GiB below the bracketed threshold's low edge
+# ((6.02, 6.87) GiB) -- deterministic refusal under +-0.5 GiB drift, and
+# a wrongful reclaim still fails loudly on the RECL==0 causality assert.
+# Also rescues the churned-box arrival band (5.6-6.3 GiB) that starved
+# the leg-A-calibrated pin floor on the 08-15 first run.
+start_hog D 4500
 CODE=$(anthropic_deep /tmp/reclaim_ddeep.out)
 RECL=$(count "serial fit reclaim" /tmp/reclaim_D.log)
 NOFIT=$(count "no graph fits" /tmp/reclaim_D.log)
