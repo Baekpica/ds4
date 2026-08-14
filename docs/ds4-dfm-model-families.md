@@ -122,28 +122,73 @@ a second full-model owner beside the first one on the reference machine.
 
 ## Integration evidence for `v0.5.6.3-dfm`
 
-The following production GGUF gates were run on the same GB10 host with the
-same `ds4-server` binary and a 2,048-token development context:
+The following production GGUF integration gates were run on the same GB10
+host and release line with a 2,048-token development context. The Motif row
+also includes the later strict long-context gate documented below:
 
 | Family | Weight-owner evidence | Server evidence |
 |---|---|---|
 | DeepSeek V4 Flash | 80.76 GiB base plus 6.49 GiB DSpark; 72.56 GiB aligned artifacts | detected DSpark automatically; one Chat request completed with zero failures |
 | Solar Open2 250B | 11 shards, 88.97 GiB; 32.23 GiB aligned IQ2 artifacts | two persistent banks; two concurrent Chat requests completed on the continuous route |
 | K-EXAONE 236B A23B | 3 shards, 85.56 GiB; 30.16 GiB aligned IQ2 artifacts | two persistent banks; two concurrent Chat requests completed on the continuous route |
-| Motif-3 | 87.70 GiB; 80.68 GiB aligned IQ2/Q2K artifacts | native session loaded; Chat, Completions, Responses, and Messages each completed with zero request failures |
+| Motif-3 | 94,162,541,472-byte canonical GGUF; 7.00 GiB raw plus 86.07 GiB in 590 derived artifacts | all four API surfaces completed; strict 262,080-token prompt plus decode passed |
 
-The Motif aligned-artifact gate also completed a real prefill and decode after
-confirming the 384-expert IQ2/Q2K path was active. These are integration and
-kernel-lifecycle gates, not published quality or long-context performance
-claims.
+The Motif artifact is 94.16 GB, or 87.6957 GiB; 87.70 is its binary GiB size,
+not its decimal GB size. Its owner exported 644 VMM ranges: 54 raw ranges plus
+590 derived Q2_K, IQ2_XXS, Q8_0, and Motif W_UV value-layout artifacts. The
+worker imported those ranges without a duplicate model copy.
+
+## Motif-3 DGX Spark performance evidence
+
+The measured implementation is
+[`593d251`](https://github.com/Baekpica/ds4/commit/593d2511a10694f5a33fbafbd997ca24e819a853),
+built with CUDA 13.3 as `sm_121a` on one DGX Spark GB10 running driver
+610.43.02 and Linux 6.17.0-1029-nvidia. The server used the production
+MQ87-88 artifact, the VMM owner above, a 4,096-token prefill chunk, greedy
+sampling, no thinking, no speculation, and one request at a time.
+
+| Gate | Interface | Prompt | Prefill | Decode | Correctness |
+|---|---|---:|---:|---:|---|
+| 8K | `ds4-bench` | 8,192 | 457.28 tok/s | not measured | throughput fixture |
+| 32K | OpenAI Chat | 32,768 | 82.649 s; 396.47 tok/s | 43 in 4.799 s; 8.96 tok/s | beginning, middle, and end sentinels exact |
+| 256K | OpenAI Chat, `-c 262144` | 262,080 | 1,492.375 s; 175.61 tok/s | 43 in 17.072 s; 2.52 tok/s | all sentinels exact; `finish_reason=stop`; 262,123 total tokens |
+
+The two HTTP gates were non-streaming, so they do not provide an independent
+network-visible time-to-first-message measurement. The table reports the
+server's prompt-complete and decode timings and makes no separate TTFM claim.
+
+The 256K session reported 4,422,546,432 bytes (4.119 GiB) of latent KV and
+rotated-key payload. Including the default 4,096-token execution graph, its
+physical worker allocation was 9.703 GiB. Source-GGUF mapping RSS remained
+29,632 KiB after inference, and engine shutdown left 637,251,584 bytes of CUDA
+module/driver state, below the 896 MiB lifecycle gate. During the full request,
+the worker and owner both remained at `VmSwap: 0`; system memory retained about
+12 GiB available. Loaded clock samples remained between 2,398 and 2,411 MHz,
+so the earlier 611 MHz pin did not recur.
+
+Nsight Systems on the final 32K prefill ranked aggregate CUDA kernel time as
+expanded FATTN 15.5%, paired Q8 projection 11.0%, latent attention 9.7%, BF16
+rounding 8.5%, W_UV value projection 7.5%, routed gate/up 7.2%, and QK absorb
+4.1%. Focused 4,096-row Nsight Compute runs measured:
+
+| Kernel | Before | Final | Reduction |
+|---|---:|---:|---:|
+| expanded FATTN | 55.79 ms | 28.83 ms | 48.3% |
+| Motif group-5 QK absorb | 38.91 ms | 10.97 ms | 71.8% |
+
+The final strict gate JSON and server log were retained with SHA-256
+`b8551d5c96a0bdc1b6244275b79a5ac9ac9f8932862a93f6256ff51df00d7a9f` and
+`90b064268bcc31498e653d27fcf5087064910bf9a6963f4fe239dc295b0fbeda`,
+respectively.
 
 ## Current limits
 
 - Motif-3 does not yet have a native persistent multi-bank runtime, so it uses
   the safe serial session lane behind the same APIs.
-- Motif-3 has not yet completed a strict 262,144-token prompt followed by an
-  actual decode token on DGX Spark. It must not be described as a Spark 256K
-  pass until that run completes.
+- The Motif-3 256K result validates one strict serial request on this exact
+  artifact and GB10 host. It does not validate concurrent 256K banks or other
+  accelerators.
+- Motif-3 MTP remains default-off and has no published speedup claim.
 - EXAONE durable bank payload serialization is intentionally unavailable; its
   fixed banks support exact-frontier in-process reuse and fork copies.
 - Model cards contain only verified behavior and performance. Profiling

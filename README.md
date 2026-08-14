@@ -59,10 +59,12 @@ are rejected for the other families instead of entering an incompatible graph.
 
 All four families above have been loaded from their production mixed-quant
 GGUFs and exercised through the same server binary on the reference DGX Spark.
-That integration result is not a long-context claim: in particular, Motif-3
-has not yet passed a complete 262,144-token prefill followed by decode on the
-Spark. See [the DFM model-family guide](docs/ds4-dfm-model-families.md) for the
-weight-owner lifecycle, verified integration matrix, and current limits.
+Motif-3 also completed a strict OpenAI Chat gate at the 262,144-token context
+limit: 262,080 prompt tokens at 175.61 tok/s followed by 43 decoded tokens at
+2.52 tok/s, with all three retrieval sentinels exact. See
+[the DFM model-family guide](docs/ds4-dfm-model-families.md) for the pinned
+implementation, measurement conditions, Nsight evidence, weight-owner
+lifecycle, integration matrix, and current limits.
 
 ## About this fork: batched serving and a rebuilt CUDA engine
 
@@ -462,13 +464,14 @@ DS4_CUDA_WEIGHT_IPC_MANIFEST=/path/to/run/weights.manifest \
 ```
 
 The shared server surface includes OpenAI chat/completions, Responses, and
-Anthropic Messages, with streaming and non-streaming modes. Live Motif API,
-resident-memory, throughput, and 256K prefill-plus-decode results remain release
-gates; they are not implied by the loader and kernel fixture results. See
-[`docs/motif-3-spark-optimization-handoff.md`](docs/motif-3-spark-optimization-handoff.md)
-for the current verified boundary and exact test order. MTP is not enabled or
-described as a speedup until target-token identity and end-to-end throughput are
-measured.
+Anthropic Messages, with streaming and non-streaming modes. On the reference
+GB10, the verified Motif path reaches 457.28 tok/s at 8K prefill, 396.47 tok/s
+at a strict 32K OpenAI gate, and 175.61 tok/s prefill plus 2.52 tok/s decode at
+the strict 256K gate. These are single-run, greedy, no-thinking measurements;
+the native Motif lane remains serial. See
+[`docs/ds4-dfm-model-families.md`](docs/ds4-dfm-model-families.md) for exact
+conditions and correctness evidence. MTP is not enabled or described as a
+speedup until target-token identity and end-to-end throughput are measured.
 
 ## Speed
 

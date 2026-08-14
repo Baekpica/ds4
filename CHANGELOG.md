@@ -5,6 +5,21 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.5.6.3-dfm — 2026-08-15
+
+- Motif-3 now completes the strict single-GB10 256K OpenAI gate: 262,080
+  prompt tokens at 175.61 tok/s followed by 43 decoded tokens at 2.52 tok/s,
+  with exact beginning, middle, and end retrieval sentinels.
+- Full-attention prefill uses the official compute-friendly expanded MLA form
+  in 4,096-token chunks. Focused `sm_121a` kernels add float4 FATTN staging,
+  grouped shared-Q absorb, a transposed W_UV value artifact, and long-context
+  latent decode splitting.
+- Long-prompt byte-BPE merges all non-overlapping instances of the current
+  best-ranked pair per pass, removing the previous quadratic tokenization
+  bottleneck while retaining official Motif tokenizer parity.
+- DeepSeek, Solar Open2, K-EXAONE, and Motif-3 remain explicit model families
+  behind the same `ds4-server` command and API surface.
+
 ## v0.5.6.3 — 2026-08-11
 
 Memory-footprint fix for long-running serving on memory-tight boxes
