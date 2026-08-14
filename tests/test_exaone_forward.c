@@ -76,6 +76,37 @@ int main(int argc, char **argv) {
     }
     ds4_weights weights;
     weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
+    /* Optional slow/full-memory tier check.  Build before model-map
+     * registration, matching engine startup, so replacement residency and
+     * aligned dispatch are both covered when explicitly requested. */
+    if (getenv("DS4_TEST_DERIVED")) {
+        if (model.n_tensors > UINT32_MAX) {
+            fprintf(stderr, "too many tensors for derived-artifact catalog\n");
+            return 1;
+        }
+        ds4_gpu_tensor_record *records =
+            xcalloc((size_t)model.n_tensors, sizeof(*records));
+        for (uint64_t i = 0; i < model.n_tensors; i++) {
+            const ds4_tensor *t = &model.tensors[i];
+            records[i].name = t->name.ptr;
+            records[i].name_len = (uint32_t)t->name.len;
+            records[i].type = t->type;
+            records[i].ndim = t->ndim;
+            for (uint32_t d = 0; d < t->ndim && d < 4u; d++) {
+                records[i].dims[d] = t->dim[d];
+            }
+            records[i].offset = t->abs_offset;
+            records[i].bytes = t->bytes;
+        }
+        const int built = ds4_gpu_build_derived_artifacts_from_records(
+                model.map, model.size, records, (uint32_t)model.n_tensors);
+        free(records);
+        if (built <= 0) {
+            fprintf(stderr, "derived-artifact build was requested but produced none\n");
+            return 1;
+        }
+        fprintf(stderr, "derived artifacts: %d built\n", built);
+    }
     if (!ds4_gpu_set_model_map(model.map, model.size)) {
         fprintf(stderr, "model map registration failed\n");
         return 1;

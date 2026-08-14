@@ -34301,31 +34301,40 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
     ds4_gpu_tensor *ru = batch ? g->b_routed_up   : g->routed_up;
     ds4_gpu_tensor *rm = batch ? g->b_routed_mid  : g->routed_mid;
     ds4_gpu_tensor *rd = batch ? g->b_routed_down : g->routed_down;
-    if (!ds4_gpu_exaone_moe_matmul_tensor(rg, norm, sel, m->map, m->size,
-                                          l->ffn_gate_exps->abs_offset,
-                                          l->ffn_gate_exps->bytes,
-                                          l->ffn_gate_exps->type,
-                                          (uint32_t)n_embd, (uint32_t)n_ff_exp,
-                                          DS4_N_EXPERT, n_tok, n_used) ||
-        !ds4_gpu_exaone_moe_matmul_tensor(ru, norm, sel, m->map, m->size,
-                                          l->ffn_up_exps->abs_offset,
-                                          l->ffn_up_exps->bytes,
-                                          l->ffn_up_exps->type,
-                                          (uint32_t)n_embd, (uint32_t)n_ff_exp,
-                                          DS4_N_EXPERT, n_tok, n_used) ||
-        !ds4_gpu_exaone_swiglu_tensor(rm, rg, ru,
-                                      (uint64_t)n_tok * n_used * n_ff_exp))
+    /* Reuse the same routed-MoE executor as Solar/Motif.  K-EXAONE's
+     * interior IQ2_XXS gate/up + Q3_K down layers can take the common D4
+     * handoff for wide prefill; its Q4_K edge layers fall back before launch
+     * to the common paired gate/up, weighted SwiGLU and bounded down chain. */
+    const int iq2_q3_handoff = ds4_gpu_routed_iq2_q3_handoff_tensor(
+            rd, rg, ru, rm, norm, sel, rw, m->map, m->size,
+            l->ffn_gate_exps->abs_offset, l->ffn_gate_exps->bytes,
+            l->ffn_up_exps->abs_offset, l->ffn_up_exps->bytes,
+            l->ffn_down_exps->abs_offset, l->ffn_down_exps->bytes,
+            l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            (uint32_t)n_embd, (uint32_t)n_ff_exp, (uint32_t)n_embd,
+            DS4_N_EXPERT, n_tok, n_used);
+    if (iq2_q3_handoff < 0) return false;
+    if (iq2_q3_handoff == 0 &&
+        (!ds4_gpu_routed_gate_up_tensor(
+             rg, ru, norm, sel, m->map, m->size,
+             l->ffn_gate_exps->abs_offset, l->ffn_gate_exps->bytes,
+             l->ffn_up_exps->abs_offset, l->ffn_up_exps->bytes,
+             l->ffn_gate_exps->type,
+             (uint32_t)n_embd, (uint32_t)n_ff_exp, DS4_N_EXPERT,
+             n_tok, n_used) ||
+         !ds4_gpu_swiglu_weighted_tensor(
+             rm, rg, ru, rw, (uint32_t)n_ff_exp,
+             (uint64_t)n_tok * n_used * n_ff_exp) ||
+         /* selected is top-k without replacement for each token.  Once the
+          * assignments are flattened, one expert owns at most n_tok rows. */
+         !ds4_gpu_routed_matmul_bounded_tensor(
+             rd, rm, sel, m->map, m->size,
+             l->ffn_down_exps->abs_offset, l->ffn_down_exps->bytes,
+             l->ffn_down_exps->type,
+             (uint32_t)n_ff_exp, (uint32_t)n_embd, DS4_N_EXPERT,
+             n_tok * n_used, 1u, n_tok))) {
         return false;
-    /* The down pass treats each (token, slot) assignment as its own
-     * single-slot row, which is mmq's MoE contract for a gathered second
-     * stage; `sel` is reused unchanged as the id array. */
-    if (!ds4_gpu_exaone_moe_matmul_tensor(rd, rm, sel, m->map, m->size,
-                                          l->ffn_down_exps->abs_offset,
-                                          l->ffn_down_exps->bytes,
-                                          l->ffn_down_exps->type,
-                                          (uint32_t)n_ff_exp, (uint32_t)n_embd,
-                                          DS4_N_EXPERT, n_tok * n_used, 1u))
-        return false;
+    }
 
     const uint64_t n_ff_shexp = l->ffn_gate_shexp->dim[1];
     ds4_gpu_tensor *sg = batch ? g->b_shared_gate : g->shared_gate;
@@ -34338,8 +34347,13 @@ static bool exaone_graph_layer(ds4_exaone_gpu_graph *g,
         !metal_graph_matmul_plain_tensor(so, m, l->ffn_down_shexp, n_ff_shexp, n_embd, sm, n_tok))
         return false;
 
-    if (!ds4_gpu_exaone_moe_combine_tensor(ffn_out, rd, rw, so,
-                                           (uint32_t)n_embd, n_used, n_tok))
+    /* Router weights were folded into routed_mid before the down projection,
+     * so the common guarded sum is sufficient here; add the shared expert
+     * exactly once afterwards. */
+    if (!ds4_gpu_moe_sum_tensor(ffn_out, rd, (uint32_t)n_embd,
+                                n_used, n_tok) ||
+        !ds4_gpu_exaone_add_tensor(ffn_out, so,
+                                   (uint64_t)n_tok * n_embd))
         return false;
     return ds4_gpu_exaone_add_tensor(x, ffn_out, (uint64_t)n_tok * n_embd);
 }
@@ -48548,8 +48562,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         {
             const char *weight_manifest_probe = getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST");
             if ((!weight_manifest_probe || !weight_manifest_probe[0]) &&
-                !load_slice &&
-                DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_EXAONE_MOE) {
+                !load_slice) {
                 int built = 0;
                 if (e->model.split_count > 1u &&
                     e->model.n_tensors <= UINT32_MAX) {
