@@ -1321,6 +1321,164 @@ static int cuda_model_current_direct_available(const void *model_map) {
            (g_model_device_owned || g_model_registered);
 }
 
+static uint64_t cuda_parse_mib_env(const char *name, int *present) {
+    const char *env = getenv(name);
+    if (present) *present = 0;
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end != '\0') return 0;
+    if (present) *present = 1;
+    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
+    return (uint64_t)v * 1048576ull;
+}
+
+/* --------------------------------------------------------------------
+ * memgov D3-3b: the weight-resolve env vocabulary, read ONCE.
+ *
+ * Every knob the model-weight resolve graph consults -- tier selection,
+ * budgets, staging geometry, verbosity -- snapshots on first use and is
+ * never re-read: one vocabulary per boot, and the per-dispatch paths
+ * (cuda_derived_weight_ptr runs per matmul launch) stop paying an
+ * environ walk per call.  Parses are the legacy fragments moved, not
+ * rewritten.  Boot-once paths outside the resolve graph (prefetch,
+ * whole-model copy, artifact build) keep their own reads: env cannot
+ * change between those reads and this snapshot within one exec. */
+typedef struct {
+    /* tier selection */
+    int weight_cache;           /* DS4_CUDA_WEIGHT_CACHE set */
+    int weight_preload;         /* DS4_CUDA_WEIGHT_PRELOAD set */
+    int direct_model;           /* DS4_CUDA_DIRECT_MODEL set (fallback tier's test) */
+    int direct_model_nonempty;  /* ...set AND non-empty (range tier's stricter historical test) */
+    int no_fd_cache;            /* DS4_CUDA_NO_FD_CACHE set */
+    int verbose;                /* DS4_CUDA_WEIGHT_CACHE_VERBOSE set */
+    int keep_model_pages;       /* DS4_CUDA_KEEP_MODEL_PAGES set */
+    int vmm_arena_off;          /* DS4_CUDA_VMM_ARENA == "0" exactly */
+    int ipc_manifest;           /* DS4_CUDA_WEIGHT_IPC_MANIFEST set */
+    /* budgets + staging geometry (need-fit logic stays at the callers) */
+    uint64_t cache_limit_bytes; /* WEIGHT_CACHE_LIMIT_GB: 24 GiB default; present-unparseable = 0 (disables) */
+    uint64_t copy_chunk_bytes;  /* MODEL_COPY_CHUNK_MB: 64 MiB default, 16..4096 MiB clamp */
+    uint64_t arena_chunk_mb;    /* WEIGHT_ARENA_CHUNK_MB: 1792 default, 256..8192 clamp */
+    uint64_t vmm_chunk_mb;      /* VMM_ARENA_CHUNK_MB: 0 = match request, else 64..4096 clamp */
+    /* derived-weight + q8 cache family */
+    int no_derived;             /* DS4_CUDA_NO_DERIVED_WEIGHTS set */
+    int derived_verbose;        /* DS4_CUDA_DERIVED_WEIGHT_VERBOSE set */
+    int no_q8_f16_cache;
+    int q8_f16_all;
+    int no_attn_out_f16_cache;  /* DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE */
+    int no_attn_q_b_f16_cache;
+    int attn_out_preload;       /* DS4_CUDA_ATTENTION_OUTPUT_PRELOAD */
+    int no_q8_dp4a;
+    int no_q8_f32_cache;
+    int q8_f32_all;
+    int attn_q_b_f32_cache;
+    int q8_f32_large;
+    uint64_t q8_f16_limit_bytes;   /* Q8_F16_CACHE_MB: UINT64_MAX when unset/unparseable */
+    int q8_f16_reserve_present;    /* Q8_F16_CACHE_RESERVE_MB (total-dependent default stays at the caller) */
+    uint64_t q8_f16_reserve_bytes;
+} cuda_weight_env_t;
+
+static cuda_weight_env_t cuda_weight_env_read(void) {
+    cuda_weight_env_t e = {};
+    e.weight_cache = getenv("DS4_CUDA_WEIGHT_CACHE") != NULL;
+    e.weight_preload = getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL;
+    const char *direct = getenv("DS4_CUDA_DIRECT_MODEL");
+    e.direct_model = direct != NULL;
+    e.direct_model_nonempty = direct != NULL && direct[0] != '\0';
+    e.no_fd_cache = getenv("DS4_CUDA_NO_FD_CACHE") != NULL;
+    e.verbose = getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL;
+    e.keep_model_pages = getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL;
+    const char *vmm = getenv("DS4_CUDA_VMM_ARENA");
+    e.vmm_arena_off = vmm && vmm[0] == '0' && vmm[1] == '\0';
+    e.ipc_manifest = getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST") != NULL;
+    {
+        /* Default cap protects against OOM on UMA systems where a full
+         * ~80 GiB model would otherwise duplicate the mmap'd host pages
+         * into HBM-backed cudaMalloc allocations and exhaust the 121 GiB
+         * UMA pool.  24 GiB comfortably covers attn projections +
+         * embedding + output head + shared FFN; routed MoE experts
+         * (~65 GiB, only top-K active per token) fall back to the
+         * UVA-mapped pointer for cold lookups.  Tune up via
+         * DS4_CUDA_WEIGHT_CACHE_LIMIT_GB on hosts with more budget. */
+        uint64_t gb = 0;
+        const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env) gb = (uint64_t)v;
+            e.cache_limit_bytes = gb * 1073741824ull;
+        } else {
+            e.cache_limit_bytes = 24ull * 1073741824ull;
+        }
+    }
+    {
+        uint64_t mb = 64;
+        const char *env = getenv("DS4_CUDA_MODEL_COPY_CHUNK_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && v > 0) mb = (uint64_t)v;
+        }
+        if (mb < 16) mb = 16;
+        if (mb > 4096) mb = 4096;
+        e.copy_chunk_bytes = mb * 1048576ull;
+    }
+    {
+        uint64_t mb = 1792;
+        const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && v > 0) mb = (uint64_t)v;
+        }
+        if (mb < 256) mb = 256;
+        if (mb > 8192) mb = 8192;
+        e.arena_chunk_mb = mb;
+    }
+    {
+        uint64_t mb = 0;
+        const char *env = getenv("DS4_CUDA_VMM_ARENA_CHUNK_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && v > 0) mb = (uint64_t)v;
+        }
+        if (mb != 0) {
+            if (mb < 64) mb = 64;
+            if (mb > 4096) mb = 4096;
+        }
+        e.vmm_chunk_mb = mb;
+    }
+    e.no_derived = getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL;
+    e.derived_verbose = getenv("DS4_CUDA_DERIVED_WEIGHT_VERBOSE") != NULL;
+    e.no_q8_f16_cache = getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL;
+    e.q8_f16_all = getenv("DS4_CUDA_Q8_F16_ALL") != NULL;
+    e.no_attn_out_f16_cache = getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE") != NULL;
+    e.no_attn_q_b_f16_cache = getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") != NULL;
+    e.attn_out_preload = getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") != NULL;
+    e.no_q8_dp4a = getenv("DS4_CUDA_NO_Q8_DP4A") != NULL;
+    e.no_q8_f32_cache = getenv("DS4_CUDA_NO_Q8_F32_CACHE") != NULL;
+    e.q8_f32_all = getenv("DS4_CUDA_Q8_F32_ALL") != NULL;
+    e.attn_q_b_f32_cache = getenv("DS4_CUDA_ATTN_Q_B_F32_CACHE") != NULL;
+    e.q8_f32_large = getenv("DS4_CUDA_Q8_F32_LARGE") != NULL;
+    {
+        int present = 0;
+        const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
+        e.q8_f16_limit_bytes = present ? limit : UINT64_MAX;
+        e.q8_f16_reserve_bytes = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB",
+                                                    &e.q8_f16_reserve_present);
+    }
+    return e;
+}
+
+static const cuda_weight_env_t &cuda_weight_env(void) {
+    /* C++ magic static: thread-safe once-init -- the strict form of the
+     * g_vmm_supported lazy-cache idiom (resolve tiers run from server
+     * threads; the guard's acquire/release does the fencing). */
+    static const cuda_weight_env_t e = cuda_weight_env_read();
+    return e;
+}
+
 static int cuda_model_has_full_range(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     for (const cuda_model_range &r : g_model_ranges) {
@@ -1450,7 +1608,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_SPAN, DS4_MEMD_UNIFIED_DEVICE,
                             bytes, bytes, model_map);
     cuda_substrate_cover(model_map, bytes);   /* tripwire: promotion materialized */
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (cuda_weight_env().verbose) {
         fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "weights",
                 (double)bytes / 1048576.0,
@@ -1512,10 +1670,10 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     const char *resolved = cuda_model_range_resolve(model_map, offset, bytes, exact_r);
     if (resolved) return resolved;
 
+    const cuda_weight_env_t &we = cuda_weight_env();
     if (cuda_model_current_direct_available(model_map)) return cuda_model_ptr(model_map, offset);
     if (model_map == g_model_host_base && g_model_hmm_direct &&
-        getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
+        !we.weight_cache && !we.weight_preload) {
         return cuda_model_ptr(model_map, offset);
     }
     /* memgov D3-2: a TERMINAL host-mapped source on the coherent
@@ -1536,10 +1694,9 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             model_map == g_model_coherent_direct_map)
             return cuda_model_ptr(model_map, offset);
     }
-    const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
+    if (we.direct_model_nonempty) return cuda_model_ptr(model_map, offset);
 
-    if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
+    if (!we.no_fd_cache) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) return fd_ptr;
     }
@@ -1567,7 +1724,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                     (void)cudaGetLastError();
                     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
                 }
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                if (we.verbose) {
                     fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
                             what ? what : "weights",
                             (double)bytes / 1048576.0);
@@ -1598,7 +1755,8 @@ static char *cuda_derived_weight_ptr(
         uint32_t group_count,
         uint64_t bytes,
         const char *label) {
-    if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) return NULL;
+    const cuda_weight_env_t &we = cuda_weight_env();
+    if (we.no_derived) return NULL;
     for (const cuda_derived_range &r : g_derived_ranges) {
         if (r.host_base == model_map &&
             r.source_offset == source_offset &&
@@ -1608,7 +1766,7 @@ static char *cuda_derived_weight_ptr(
             r.out_dim == out_dim &&
             r.group_count == group_count &&
             bytes <= r.bytes) {
-            if (getenv("DS4_CUDA_DERIVED_WEIGHT_VERBOSE") != NULL) {
+            if (we.derived_verbose) {
                 fprintf(stderr, "ds4: CUDA derived weight hit %s %.2f MiB\n",
                         label ? label : "derived",
                         (double)r.bytes / 1048576.0);
@@ -1647,28 +1805,13 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_bytes = 0;
 }
 
-static uint64_t cuda_parse_mib_env(const char *name, int *present) {
-    const char *env = getenv(name);
-    if (present) *present = 0;
-    if (!env || !env[0]) return 0;
-    char *end = NULL;
-    unsigned long long v = strtoull(env, &end, 10);
-    if (end == env || *end != '\0') return 0;
-    if (present) *present = 1;
-    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
-    return (uint64_t)v * 1048576ull;
-}
-
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
-    int present = 0;
-    const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
-    return present ? limit : UINT64_MAX;
+    return cuda_weight_env().q8_f16_limit_bytes;
 }
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
-    int present = 0;
-    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", &present);
-    if (present) return reserve;
+    const cuda_weight_env_t &we = cuda_weight_env();
+    if (we.q8_f16_reserve_present) return we.q8_f16_reserve_bytes;
 
     if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
         return 512ull * 1048576ull;
@@ -1690,7 +1833,7 @@ static void cuda_q8_f16_cache_budget_notice(
         uint64_t total_bytes,
         uint64_t reserve_bytes,
         uint64_t limit_bytes) {
-    if (g_q8_f16_budget_notice_printed && getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") == NULL) return;
+    if (g_q8_f16_budget_notice_printed && !cuda_weight_env().verbose) return;
     g_q8_f16_budget_notice_printed = 1;
     if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
         fprintf(stderr,
@@ -1774,20 +1917,21 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
 }
 
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+    const cuda_weight_env_t &we = cuda_weight_env();
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
-    if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+    if (we.no_q8_f16_cache) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
-    if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
+    if (we.q8_f16_all) return 1;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
         strstr(label, "attn_output_b") != NULL ||
         strstr(label, "attention_output_a") != NULL ||
         strstr(label, "attention_output_b") != NULL) {
-        return getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE") == NULL;
+        return !we.no_attn_out_f16_cache;
     }
     if (strstr(label, "attn_q_b") != NULL) {
-        return getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL;
+        return !we.no_attn_q_b_f16_cache;
     }
     if (strstr(label, "ffn_gate_shexp") != NULL ||
         strstr(label, "ffn_up_shexp") != NULL ||
@@ -1798,7 +1942,7 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
            (in_dim == 2048u && out_dim == 4096u) ||
            (in_dim == 4096u && out_dim == 1024u) ||
            (in_dim == 4096u && out_dim == 512u) ||
-           (getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL &&
+           (!we.no_attn_q_b_f16_cache &&
             in_dim == 1024u && out_dim == 32768u);
 }
 
@@ -1817,25 +1961,26 @@ static int cuda_q8_label_is_attention_output_b(const char *label) {
 }
 
 static int cuda_q8_use_dp4a(void) {
-    return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
+    return !cuda_weight_env().no_q8_dp4a;
 }
 
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+    const cuda_weight_env_t &we = cuda_weight_env();
     if (cuda_q8_label_is_attention_output(label) &&
-        getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
-        getenv("DS4_CUDA_Q8_F16_ALL") == NULL) {
+        !we.attn_out_preload && !we.q8_f16_all) {
         return 0;
     }
     return cuda_q8_f16_cache_allowed(label, in_dim, out_dim);
 }
 
 static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
-    if (getenv("DS4_CUDA_NO_Q8_F32_CACHE") != NULL) return 0;
-    if (getenv("DS4_CUDA_Q8_F32_ALL") != NULL) return 1;
+    const cuda_weight_env_t &we = cuda_weight_env();
+    if (we.no_q8_f32_cache) return 0;
+    if (we.q8_f32_all) return 1;
     if (label && strstr(label, "attn_q_b") != NULL) {
-        return getenv("DS4_CUDA_ATTN_Q_B_F32_CACHE") != NULL;
+        return we.attn_q_b_f32_cache;
     }
-    return getenv("DS4_CUDA_Q8_F32_LARGE") != NULL &&
+    return we.q8_f32_large &&
            in_dim == 1024u && out_dim == 32768u;
 }
 
@@ -1900,7 +2045,7 @@ static const __half *cuda_q8_f16_ptr(
     g_q8_f16_bytes += out_bytes;
     cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
                             out_bytes, out_bytes, model_map);
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (cuda_weight_env().verbose) {
         fprintf(stderr, "ds4: CUDA cached q8 fp16 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
                 (double)g_q8_f16_bytes / 1073741824.0);
@@ -1966,7 +2111,7 @@ static float *cuda_q8_f32_ptr(
     g_q8_f32_bytes += out_bytes;
     cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
                             out_bytes, out_bytes, model_map);
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (cuda_weight_env().verbose) {
         fprintf(stderr, "ds4: CUDA cached q8 fp32 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
                 (double)g_q8_f32_bytes / 1073741824.0);
@@ -2450,8 +2595,7 @@ static double cuda_wall_sec(void) {
 }
 
 static int cuda_model_load_progress_enabled(void) {
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) return 0;
-    return 1;
+    return !cuda_weight_env().verbose;
 }
 
 static void cuda_model_load_progress_reset(void) {
@@ -2580,21 +2724,12 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
 }
 
 static uint64_t cuda_model_copy_chunk_bytes(void) {
-    uint64_t mb = 64;
-    const char *env = getenv("DS4_CUDA_MODEL_COPY_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 16) mb = 16;
-    if (mb > 4096) mb = 4096;
-    return mb * 1048576ull;
+    return cuda_weight_env().copy_chunk_bytes;
 }
 
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
-    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
+    if (cuda_weight_env().keep_model_pages || !model_map || bytes == 0 || offset > model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -2613,7 +2748,7 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    if (g_model_fd < 0 || cuda_weight_env().keep_model_pages || bytes == 0) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
@@ -2731,7 +2866,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             }
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                if (cuda_weight_env().verbose) {
                     fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n", strerror(direct_errno));
                 }
                 (void)close(g_model_direct_fd);
@@ -2748,22 +2883,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 }
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
-    uint64_t gb = 0;
-    const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env) gb = (uint64_t)v;
-        return gb * 1073741824ull;
-    }
-    /* Default cap protects against OOM on UMA systems where a full ~80 GiB
-     * model would otherwise duplicate the mmap'd host pages into HBM-backed
-     * cudaMalloc allocations and exhaust the 121 GiB UMA pool.  24 GiB
-     * comfortably covers attn projections + embedding + output head +
-     * shared FFN; routed MoE experts (~65 GiB, only top-K active per token)
-     * fall back to the UVA-mapped pointer for cold lookups.  Tune up via
-     * DS4_CUDA_WEIGHT_CACHE_LIMIT_GB on hosts with more memory budget. */
-    return 24ull * 1073741824ull;
+    return cuda_weight_env().cache_limit_bytes;
 }
 
 /* True iff model_map's expert raws were REPLACED by complete in-process
@@ -2790,16 +2910,7 @@ extern "C" int ds4_gpu_model_map_replaces_complete(const void *model_map) {
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 1792;
-    const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 256) mb = 256;
-    if (mb > 8192) mb = 8192;
-    uint64_t bytes = mb * 1048576ull;
+    uint64_t bytes = cuda_weight_env().arena_chunk_mb * 1048576ull;
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);
@@ -2816,9 +2927,9 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
 // caller transparently falls back to the cudaMalloc arena below.
 static int cuda_vmm_arena_supported(void) {
     if (g_vmm_supported != -1) return g_vmm_supported;
-    const char *off = getenv("DS4_CUDA_VMM_ARENA");
-    if (off && off[0] == '0' && off[1] == '\0') { g_vmm_supported = 0; return 0; }
-    if (getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST")) { g_vmm_supported = 0; return 0; }
+    const cuda_weight_env_t &we = cuda_weight_env();
+    if (we.vmm_arena_off) { g_vmm_supported = 0; return 0; }
+    if (we.ipc_manifest) { g_vmm_supported = 0; return 0; }
     if (!driver_ok(cuInit(0), "init for VMM probe")) { g_vmm_supported = 0; return 0; }
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); g_vmm_supported = 0; return 0; }
@@ -2844,7 +2955,7 @@ static int cuda_vmm_arena_supported(void) {
     g_vmm_supported = 1;
     int integrated = 0;
     (void)cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (we.verbose) {
         fprintf(stderr,
                 "ds4: CUDA VMM arena enabled (integrated=%d granularity=%llu)\n",
                 integrated, (unsigned long long)g_vmm_granularity);
@@ -2863,18 +2974,7 @@ static int cuda_vmm_arena_supported(void) {
 // users coalesce small allocations into fewer VMM mappings if the
 // driver's per-process mapping limit becomes a concern.
 static uint64_t cuda_vmm_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 0;
-    const char *env = getenv("DS4_CUDA_VMM_ARENA_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb != 0) {
-        if (mb < 64) mb = 64;
-        if (mb > 4096) mb = 4096;
-    }
-    uint64_t bytes = mb * 1048576ull;
+    uint64_t bytes = cuda_weight_env().vmm_chunk_mb * 1048576ull;
     if (bytes < need) bytes = need;
     if (g_vmm_granularity > 1) {
         const uint64_t g = g_vmm_granularity;
@@ -2969,7 +3069,7 @@ static char *cuda_vmm_arena_alloc(const void *model_map, uint64_t bytes,
     cuda_mem_note_alloc_srcidx(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
                                aligned, chunk_bytes, a.src);
 
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (cuda_weight_env().verbose) {
         uint64_t total = 0;
         for (const cuda_vmm_arena &it : g_vmm_arenas) total += it.alloc_bytes;
         fprintf(stderr,
@@ -3096,7 +3196,7 @@ static char *cuda_model_arena_alloc(const void *model_map, uint64_t bytes,
      * `requested`; the chunk's rounding tail is the cell's slack. */
     cuda_mem_note_alloc_srcidx(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
                                aligned, chunk, g_model_arenas.back().src);
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (cuda_weight_env().verbose) {
         uint64_t arena_bytes = 0;
         for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
         fprintf(stderr, "ds4: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
@@ -3113,7 +3213,7 @@ static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_
     if (cuda_model_current_direct_available(model_map) ||
         (model_map == g_model_host_base && g_model_hmm_direct) ||
         (model_map && model_map == g_model_coherent_direct_map) ||
-        getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+        cuda_weight_env().direct_model) {
         return cuda_model_ptr(model_map, offset);
     }
     return NULL;
@@ -3273,7 +3373,7 @@ static int cuda_unit_materialize_copy(const void *model_map,
     g_model_range_bytes += u->src_bytes;
     cuda_substrate_cover(model_map, u->src_bytes);   /* tripwire: unit materialized */
     cuda_model_load_progress_note(g_model_range_bytes);
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (cuda_weight_env().verbose) {
         fprintf(stderr, "ds4: CUDA materialized %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "unit",
                 (double)u->src_bytes / 1048576.0,
@@ -3360,7 +3460,7 @@ static const char *cuda_model_range_ptr_from_fd(
         mcl.operation_transient = g_model_plan_frozen ? u->src_bytes : 0;
         if (ds4_gov_governed_check("lazy_materialize", &mcl, legacy)
                 != DS4_GOV_ADMIT) {
-            if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            if (cuda_weight_env().verbose) {
                 fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
                         what ? what : "weights",
                         (double)bytes / 1048576.0,
