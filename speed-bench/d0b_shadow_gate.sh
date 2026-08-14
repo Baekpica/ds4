@@ -291,14 +291,18 @@ R "grep -q 'persistent batch ctx ready' /tmp/d0bboard_boot.log" \
     && die "(f) a batch ctx was created despite the pinned headroom"
 # Two concurrent batchable requests -> coalesce -> per-call STATIC
 # refusal -> single-path fallback serves BOTH via the serial lane.
+# OpenAI surface (third-run finding): the static lane's HOME surface
+# qualifies unconditionally in route_decide (the Anthropic surface
+# reaches static only via cont-promotion), and the ABBA leg proves
+# this exact request shape end-to-end.
 FP=()
 for i in 1 2; do
-    R "curl -s -m 300 -X POST localhost:$PORT/v1/messages -H 'content-type: application/json' \
-        -d '{\"model\":\"ds4\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Board leg request $i: say OK.\"}]}' -o /tmp/d0bboard_r$i.json" &
+    R "curl -s -m 300 -X POST localhost:$PORT/v1/chat/completions -H 'content-type: application/json' \
+        -d '{\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Board leg request $i: say OK.\"}]}' -o /tmp/d0bboard_r$i.json" &
     FP+=($!)
 done
 for p in "${FP[@]}"; do wait "$p" 2>/dev/null || true; done
-OKS=$(R "grep -l '\"type\":\"message\"' /tmp/d0bboard_r*.json 2>/dev/null | wc -l")
+OKS=$(R "grep -l 'finish_reason' /tmp/d0bboard_r*.json 2>/dev/null | wc -l")
 [ "$OKS" = "2" ] || { R "cat /tmp/d0bboard_r1.json /tmp/d0bboard_r2.json 2>/dev/null | head -4"; die "(f) fallback served $OKS/2"; }
 R "grep -q 'memgov ENFORCE refuse site=static_batch_percall' /tmp/d0bboard_boot.log" \
     || die "(f) no STATIC per-call refusal (requests did not coalesce onto the per-call path?)"
