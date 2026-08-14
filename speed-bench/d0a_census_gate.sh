@@ -192,12 +192,52 @@ extract_decisions() { # $1 remote log  $2 local out
 # Fit-jitter adjudication for a free-derived integer decision: equal is
 # clean; a one-step difference whose DIRECTION matches the free inputs is
 # the documented jitter shape (D0a-1 law); anything else is real.
-jitter_ok() { # $1 name  $2 val_T  $3 val_C  $4 free_T  $5 free_C
-    python3 -c "
-t,c,ft,fc=int($2),int($3),float($4),float($5)
-if t==c: print('EQUAL'); exit(0)
-if abs(t-c)==1 and ((t>c)==(ft>fc)): print('JITTER'); exit(0)
-print('DIVERGENT'); exit(1)"
+# D2-2b v2: formula-oracle adjudication of a T/C fit pair.  args:
+# T clamp line (may be empty = unclamped), C clamp line, T banks, C banks
+# ('-' = absent).  Prints PASS.../FAIL.../RETRY... -- FAIL means a side's
+# printed decision violates its own inputs (real, die); RETRY means
+# input noise (band/direction/distance), worth one fresh pair.
+fit_adjudicate() {
+    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import sys, re
+def parse(ln):
+    m = re.search(r'free=([0-9.]+) GiB headroom=([0-9.]+) GiB substrate outstanding=([0-9.]+) GiB per_bank=([0-9.]+) MiB -> max_seq ([0-9]+) \(requested ([0-9]+)\)', ln)
+    if not m: return None
+    return dict(free=float(m.group(1)), hr=float(m.group(2)), sub=float(m.group(3)),
+                pb=float(m.group(4)), n=int(m.group(5)), req=int(m.group(6)))
+t, c = parse(sys.argv[1]), parse(sys.argv[2])
+bt, bc = sys.argv[3], sys.argv[4]
+if t is None and c is None:
+    print(("PASS unclamped both; banks %s/%s exactly equal" % (bt, bc))
+          if bt == bc else ("RETRY unclamped both but banks %s vs %s" % (bt, bc)))
+    sys.exit(0)
+for side, d in (('T', t), ('C', c)):
+    if d is None: continue
+    budget = max(d['free'] - d['hr'] - d['sub'], 0.0) * 1024.0
+    if abs(int(budget / d['pb']) - d['n']) > 1:      # <=1: print-rounding at a boundary
+        print("FAIL %s formula self-check: inputs give %d, printed %d"
+              % (side, int(budget / d['pb']), d['n'])); sys.exit(0)
+pres = t or c
+req = pres['req']
+nt = t['n'] if t else req                            # unclamped side funded its request
+nc = c['n'] if c else req
+band_banks = 1 + int(1024.0 / pres['pb'])            # the 1.0 GiB band, in banks
+dist = nt - nc
+if t and c:
+    if abs(t['free'] - c['free']) >= 1.0:
+        print("RETRY free inputs outside the 1.0 GiB band (T=%.2f C=%.2f)"
+              % (t['free'], c['free'])); sys.exit(0)
+    if dist != 0 and (dist > 0) != (t['free'] > c['free']):
+        print("RETRY direction mismatch (n T=%d C=%d, free T=%.2f C=%.2f)"
+              % (nt, nc, t['free'], c['free'])); sys.exit(0)
+if abs(dist) > band_banks:
+    print("RETRY decision distance %d beyond band (%d banks)" % (dist, band_banks)); sys.exit(0)
+def bank_ok(b, n): return b in ('-', '') or int(b) == n
+if not bank_ok(bt, nt) or not bank_ok(bc, nc):
+    print("FAIL vmm banks do not match own plan (T %s/%d, C %s/%d)" % (bt, nt, bc, nc)); sys.exit(0)
+print("PASS formula-exact both sides; n T=%d C=%d dist=%d (band %d banks)"
+      % (nt, nc, dist, band_banks))
+PYEOF
 }
 fit_free_gib() { R "grep 'batch fit' $1 | head -1" | grep -o 'free=[0-9.]*' | cut -d= -f2; }
 fit_max_seq()  { R "grep 'batch fit' $1 | head -1" | grep -o 'max_seq [0-9]*' | awk '{print $2}'; }
@@ -232,66 +272,33 @@ oracle_leg() { # $1 name  $2 env  $3 ctx
         mt=$(fit_max_seq  "/tmp/d0aclose_${name}_T.log"); mc=$(fit_max_seq  "/tmp/d0aclose_${name}_C.log")
         bt=$(vmm_banks    "/tmp/d0aclose_${name}_T.log"); bc=$(vmm_banks    "/tmp/d0aclose_${name}_C.log")
         log "(a) $name inputs: free T=$ft C=$fc GiB; max_seq T=$mt C=$mc; vmm_banks T=${bt:--} C=${bc:--}"
-        # D2-2b amendment: neither side clamped (fresh box funds the full
-        # request) -- no free-derived fit family printed; the vmm bank
-        # counts must be exactly equal.
-        if [ -z "$ft" ] && [ -z "$fc" ]; then
-            if [ "${bt:-}" = "${bc:-}" ]; then
-                log "(a) $name PASS (unclamped both sides; banks $bt/$bc exactly equal)"
-                return 0
-            fi
-            log "(a) $name: unclamped both sides but banks differ -- retrying pair once"
-            continue
-        fi
-        # D2-2b amendment: exactly ONE side clamped -- the presence-jitter
-        # shape (residency l1 finding).  The absent side funded its full
-        # request, which REQUIRES its budget to be the higher one, so
-        # direction is structural; only the one-step magnitude and the
-        # bank counts need checking.
-        if [ -z "$ft" ] || [ -z "$fc" ]; then
-            if [ -n "$ft" ]; then pres=$mt; req=$(fit_requested "/tmp/d0aclose_${name}_T.log")
-                if [ "$pres" = "$((req - 1))" ] && [ "$bt" = "$pres" ] && [ "$bc" = "$req" ]; then
-                    log "(a) $name PASS (max_seq=PRESENCE-JITTER $pres vs unclamped $req; banks $bt/$bc)"
-                    return 0
-                fi
-            else pres=$mc; req=$(fit_requested "/tmp/d0aclose_${name}_C.log")
-                if [ "$pres" = "$((req - 1))" ] && [ "$bc" = "$pres" ] && [ "$bt" = "$req" ]; then
-                    log "(a) $name PASS (max_seq=PRESENCE-JITTER unclamped $req vs $pres; banks $bt/$bc)"
-                    return 0
-                fi
-            fi
-            log "(a) $name: presence asymmetry beyond one step -- retrying pair once"
-            continue
-        fi
-        # Both clamped: the shape-derived operands must byte-match (this
-        # was the byte-diff's job before the clamp line left it).
-        if [ "$(fit_shape "/tmp/d0aclose_${name}_T.log")" != "$(fit_shape "/tmp/d0aclose_${name}_C.log")" ]; then
+        # D2-2b v2 (residency l2 finding): THE FORMULA IS THE ORACLE.
+        # Both trees draw fit-time free from the same noisy boot-to-boot
+        # distribution (observed 21.8-23.5 GiB at the basemtp shape;
+        # mmap-mode MemAvailable accounting), so cross-side output
+        # equality was only ever a proxy that breaks when input noise
+        # reaches one bank.  fit_adjudicate asserts: each side's printed
+        # decision equals the formula on its OWN inputs (violation is
+        # REAL -> die); shape operands byte-match; free inputs in the
+        # 1.0 GiB band; cross distance bounded by band/per_bank+1 with
+        # direction tracking the inputs; each side's vmm banks equal its
+        # own funded plan.  Input-noise verdicts retry the pair.
+        if [ -n "$ft" ] && [ -n "$fc" ] && \
+           [ "$(fit_shape "/tmp/d0aclose_${name}_T.log")" != "$(fit_shape "/tmp/d0aclose_${name}_C.log")" ]; then
             fit_shape "/tmp/d0aclose_${name}_T.log"; fit_shape "/tmp/d0aclose_${name}_C.log"
             die "$name: fit-line shape mismatch (per_bank/headroom/substrate)"
         fi
-        # Input-quality precondition for the jitter adjudication: the free
-        # inputs must sit inside a 1.0 GiB band or the derived comparison
-        # judges BOX STATE, not the formula.  A violated precondition gets
-        # the same one-pair-retry as boundary jitter (fresh boots resample
-        # MemAvailable); two violations in a row die -- that is real drift
-        # (memavailable-decline law: reboot before decisive legs).
-        local band; band=$(python3 -c "print(1 if abs($ft-$fc)<1.0 else 0)")
-        if [ "$band" != "1" ]; then
-            log "(a) $name: free inputs outside the 1.0 GiB drift band -- retrying pair once"
-            continue
-        fi
-        mv=$(jitter_ok "$name/max_seq" "$mt" "$mc" "$ft" "$fc") || { log "(a) $name max_seq $mt vs $mc DIVERGENT"; mv=FAIL; }
-        bv=EQUAL
-        if [ -n "$bt" ] && [ -n "$bc" ]; then
-            bv=$(jitter_ok "$name/vmm_banks" "$bt" "$bc" "$ft" "$fc") || { log "(a) $name vmm_banks $bt vs $bc DIVERGENT"; bv=FAIL; }
-        fi
-        if [ "$mv" != "FAIL" ] && [ "$bv" != "FAIL" ]; then
-            log "(a) $name PASS (max_seq=$mv vmm_banks=$bv)"
-            return 0
-        fi
-        log "(a) $name: derived decision divergent -- retrying pair once"
+        local verdict
+        verdict=$(fit_adjudicate "$(R "grep -m1 'batch fit: free=' /tmp/d0aclose_${name}_T.log")" \
+                                 "$(R "grep -m1 'batch fit: free=' /tmp/d0aclose_${name}_C.log")" \
+                                 "${bt:--}" "${bc:--}")
+        case "$verdict" in
+        PASS*)  log "(a) $name PASS ($verdict)"; return 0 ;;
+        FAIL*)  die "$name: $verdict" ;;
+        *)      log "(a) $name: $verdict -- retrying pair once" ;;
+        esac
     done
-    die "$name: derived decisions diverge or inputs drift on both attempts -- NOT jitter"
+    die "$name: input noise on both attempts -- box state, not the formula (stable_avail law)"
 }
 oracle_leg eager  ""                       "$CTX"
 # nohbm: the vmm budget is PINNED on both trees (handoff law: pin the plan)

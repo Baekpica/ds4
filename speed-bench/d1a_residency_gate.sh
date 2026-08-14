@@ -141,19 +141,61 @@ extract_decisions() { # $1 remote log  $2 local out
         | sed -E 's/^[0-9]{4} [0-9:]{8} //; s/free=[0-9.]+ GiB/free=# GiB/g; s/MemAvailable[= ][0-9.]+/MemAvailable=#/g; s/capacity [0-9.]+ GiB/capacity # GiB/g; s/max_seq [0-9]+/max_seq #/g; s/x [0-9]+ banks/x # banks/g; s/budget=[0-9.]+ GiB/budget=# GiB/g; s/\[plan [0-9.]+, capacity [0-9.]+\]/[plan #, capacity #]/g' \
         > "$2"
 }
-jitter_ok() { # $1 name  $2 val_T  $3 val_C  $4 free_T  $5 free_C
-    python3 -c "
-t,c,ft,fc=int($2),int($3),float($4),float($5)
-if t==c: print('EQUAL'); exit(0)
-if abs(t-c)==1 and ((t>c)==(ft>fc)): print('JITTER'); exit(0)
-print('DIVERGENT'); exit(1)"
-}
 fit_free_gib() { R "grep 'batch fit' $1 | head -1" | grep -o 'free=[0-9.]*' | cut -d= -f2; }
 fit_max_seq()  { R "grep 'batch fit' $1 | head -1" | grep -o 'max_seq [0-9]*' | awk '{print $2}'; }
 fit_requested() { R "grep -m1 'batch fit: free=' $1" | grep -o '(requested [0-9]*' | grep -o '[0-9]*'; }
 # The clamp line with its free-input operands masked: what remains is
 # shape-derived (per_bank, headroom, substrate) and must byte-match.
 fit_shape() { R "grep -m1 'batch fit: free=' $1" | sed -E 's/free=[0-9.]+ GiB/free=# GiB/; s/max_seq [0-9]+/max_seq #/'; }
+# D2-2b v2: formula-oracle adjudication of a T/C fit pair.  args:
+# T clamp line (may be empty = unclamped), C clamp line, T banks, C banks
+# ('-' = absent).  Prints PASS.../FAIL.../RETRY... -- FAIL means a side's
+# printed decision violates its own inputs (real, die); RETRY means
+# input noise (band/direction/distance), worth one fresh pair.
+fit_adjudicate() {
+    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import sys, re
+def parse(ln):
+    m = re.search(r'free=([0-9.]+) GiB headroom=([0-9.]+) GiB substrate outstanding=([0-9.]+) GiB per_bank=([0-9.]+) MiB -> max_seq ([0-9]+) \(requested ([0-9]+)\)', ln)
+    if not m: return None
+    return dict(free=float(m.group(1)), hr=float(m.group(2)), sub=float(m.group(3)),
+                pb=float(m.group(4)), n=int(m.group(5)), req=int(m.group(6)))
+t, c = parse(sys.argv[1]), parse(sys.argv[2])
+bt, bc = sys.argv[3], sys.argv[4]
+if t is None and c is None:
+    # Neither side clamped: nothing derived from free -- vmm banks must
+    # be exactly equal (also the l5 pinned-budget path).
+    print(("PASS unclamped both; banks %s/%s exactly equal" % (bt, bc))
+          if bt == bc else ("RETRY unclamped both but banks %s vs %s" % (bt, bc)))
+    sys.exit(0)
+for side, d in (('T', t), ('C', c)):
+    if d is None: continue
+    budget = max(d['free'] - d['hr'] - d['sub'], 0.0) * 1024.0
+    if abs(int(budget / d['pb']) - d['n']) > 1:      # <=1: print-rounding at a boundary
+        print("FAIL %s formula self-check: inputs give %d, printed %d"
+              % (side, int(budget / d['pb']), d['n'])); sys.exit(0)
+pres = t or c
+req = pres['req']
+nt = t['n'] if t else req                            # unclamped side funded its request
+nc = c['n'] if c else req
+band_banks = 1 + int(1024.0 / pres['pb'])            # the 1.0 GiB band, in banks
+dist = nt - nc
+if t and c:
+    if abs(t['free'] - c['free']) >= 1.0:
+        print("RETRY free inputs outside the 1.0 GiB band (T=%.2f C=%.2f)"
+              % (t['free'], c['free'])); sys.exit(0)
+    if dist != 0 and (dist > 0) != (t['free'] > c['free']):
+        print("RETRY direction mismatch (n T=%d C=%d, free T=%.2f C=%.2f)"
+              % (nt, nc, t['free'], c['free'])); sys.exit(0)
+if abs(dist) > band_banks:
+    print("RETRY decision distance %d beyond band (%d banks)" % (dist, band_banks)); sys.exit(0)
+def bank_ok(b, n): return b in ('-', '') or int(b) == n
+if not bank_ok(bt, nt) or not bank_ok(bc, nc):
+    print("FAIL vmm banks do not match own plan (T %s/%d, C %s/%d)" % (bt, nt, bc, nc)); sys.exit(0)
+print("PASS formula-exact both sides; n T=%d C=%d dist=%d (band %d banks)"
+      % (nt, nc, dist, band_banks))
+PYEOF
+}
 vmm_banks()    { R "grep 'batch vmm' $1 | head -1" | grep -o 'x [0-9]* banks' | grep -o '[0-9]*'; }
 
 # ---- shared assert batteries ----
@@ -236,50 +278,34 @@ pair_leg() { # $1 name  $2 env  $3 flags  $4.. expected sources
             log "($name): no fit family and derived decisions unequal -- retrying pair once"
             continue
         fi
-        if [ -z "$ft" ] || [ -z "$fc" ]; then
-            # Exactly ONE side clamped: the presence-jitter shape (08-14
-            # finding -- fresh-box free sits AT the requested boundary).
-            # The absent side funded its full request, which REQUIRES its
-            # budget to be the higher one, so direction is structural;
-            # only the one-step magnitude needs checking.  The present
-            # side's banks must equal its clamp, the absent side's banks
-            # its request.
-            if [ -n "$ft" ]; then pres=$mt; req=$(fit_requested "$TLOG"); mv="$bt/$bc"
-                if [ "$pres" = "$((req - 1))" ] && [ "$bt" = "$pres" ] && [ "$bc" = "$req" ]; then
-                    log "($name) PASS (max_seq=PRESENCE-JITTER $pres vs unclamped $req; banks $bt/$bc)"
-                    sleep 10; return 0
-                fi
-            else pres=$mc; req=$(fit_requested "$CLOG")
-                if [ "$pres" = "$((req - 1))" ] && [ "$bc" = "$pres" ] && [ "$bt" = "$req" ]; then
-                    log "($name) PASS (max_seq=PRESENCE-JITTER unclamped $req vs $pres; banks $bt/$bc)"
-                    sleep 10; return 0
-                fi
-            fi
-            log "($name): presence asymmetry beyond one step -- retrying pair once"
-            continue
-        fi
-        # Both clamped: the shape-derived operands must byte-match (this
-        # was the byte-diff's job before the clamp line left it).
-        if [ "$(fit_shape "$TLOG")" != "$(fit_shape "$CLOG")" ]; then
+        # D2-2b v2 (l2 finding): THE FORMULA IS THE ORACLE.  Both trees
+        # draw fit-time free from the same noisy boot-to-boot
+        # distribution (observed 21.8-23.5 GiB on BOTH trees at the
+        # basemtp shape; mmap-mode MemAvailable accounting), so
+        # cross-side output equality was only ever a proxy that breaks
+        # when input noise reaches one bank (496 MiB).  The real
+        # invariants: (1) each side's printed decision equals the fit
+        # formula applied to its OWN inputs; (2) the shape-derived
+        # operands byte-match when both print; (3) free inputs sit in
+        # the 1.0 GiB band; (4) cross-side decision distance is bounded
+        # by band/per_bank+1 with direction tracking the inputs; (5)
+        # each side's vmm banks equal its own funded plan.  A formula
+        # self-check failure is REAL and dies; input-noise verdicts
+        # retry the pair.
+        if [ -n "$ft" ] && [ -n "$fc" ] && \
+           [ "$(fit_shape "$TLOG")" != "$(fit_shape "$CLOG")" ]; then
             fit_shape "$TLOG"; fit_shape "$CLOG"
             die "$name: fit-line shape mismatch (per_bank/headroom/substrate)"
         fi
-        band=$(python3 -c "print(1 if abs($ft-$fc)<1.0 else 0)")
-        if [ "$band" != "1" ]; then
-            log "($name): free inputs outside the 1.0 GiB drift band -- retrying pair once"
-            continue
-        fi
-        mv=$(jitter_ok "$name/max_seq" "$mt" "$mc" "$ft" "$fc") || { log "($name) max_seq $mt vs $mc DIVERGENT"; mv=FAIL; }
-        bv=EQUAL
-        if [ -n "$bt" ] && [ -n "$bc" ]; then
-            bv=$(jitter_ok "$name/vmm_banks" "$bt" "$bc" "$ft" "$fc") || { log "($name) vmm_banks $bt vs $bc DIVERGENT"; bv=FAIL; }
-        fi
-        if [ "$mv" != "FAIL" ] && [ "$bv" != "FAIL" ]; then
-            log "($name) PASS (max_seq=$mv vmm_banks=$bv)"
-            sleep 10
-            return 0
-        fi
-        log "($name): derived decision divergent -- retrying pair once"
+        local verdict
+        verdict=$(fit_adjudicate "$(R "grep -m1 'batch fit: free=' $TLOG")" \
+                                 "$(R "grep -m1 'batch fit: free=' $CLOG")" \
+                                 "${bt:--}" "${bc:--}")
+        case "$verdict" in
+        PASS*)  log "($name) PASS ($verdict)"; sleep 10; return 0 ;;
+        FAIL*)  die "$name: $verdict" ;;
+        *)      log "($name): $verdict -- retrying pair once" ;;
+        esac
     done
     die "$name: derived decisions diverge or inputs drift on both attempts -- NOT jitter"
 }
