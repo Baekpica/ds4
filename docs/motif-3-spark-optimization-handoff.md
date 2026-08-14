@@ -1,7 +1,7 @@
 # Motif-3 DGX Spark 최적화 작업 handoff
 
-기준 시각: **2026-08-14 16:55 KST** (재개 세션 진행 내역은 §0에 누적;
-후속 재개 결과는 §0.22까지 반영)
+기준 시각: **2026-08-14 17:00 KST** (재개 세션 진행 내역은 §0에 누적;
+후속 재개 결과는 §0.23까지 반영)
 
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
@@ -333,6 +333,18 @@ Spark 256K 통과 주장은 아직 금지다.**
       한국어는 사용자가 지정한
       `DFM (독자 파운데이션 모델, 독파모)` 풀이에만 사용했다.
 
+23. **Git publish ref 계약** —
+    - Entrpi 추적 branch와 DFM 산출물을 구분하기 위해
+      `origin/batched-serving`은 이번 publish에서 덮어쓰지 않는다.
+    - 검증된 통합 HEAD는 재현용
+      `feature/model-families-v0563`, 이후 Entrpi 증분을 계속 받을
+      moving branch `dfm`, 고정 release tag `v0.5.6.3-dfm`으로 같이
+      publish한다. `origin/main`의 서로 다른 antirez line은 force-push하지
+      않는다.
+    - 공개 model card의 engine 링크는 모호한 branch tip 대신
+      `https://github.com/Baekpica/ds4/tree/v0.5.6.3-dfm`을 사용해
+      이 검증 release를 고정한다.
+
 남은 경계(사실로 기록):
 - 엔진 **static batch core**(`ds4_batch_generate_core`)는 여전히 per-seq
   eos 단일 비교 — 순수 코어에 vocab 접근이 없어 보류. 서버측 detok 절단이
@@ -406,7 +418,7 @@ Spark에서 정확히 262,144-token prefill을 완료하고 실제 decode token�
 
 ## 4. 현재 호스트와 메모리 상태
 
-| 항목 | 2026-08-14 16:55 KST 현재 값 |
+| 항목 | 2026-08-14 17:00 KST 현재 값 |
 |---|---|
 | Host | `thinkstationpgx-8abc` |
 | Kernel | `6.17.0-1029-nvidia` |
