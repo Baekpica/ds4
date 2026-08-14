@@ -10143,11 +10143,19 @@ static bool metal_graph_session_fit_check(
         uint32_t                 prefill_cap,
         bool                     enable_mtp,
         bool                     enable_dspark,
-        bool                     loud) {
+        bool                     loud,
+        ds4_session_graph_fit_quote *q) {   /* memgov D4-1: optional quote out */
+    if (q) memset(q, 0, sizeof(*q));
     const char *fe = getenv("DS4_SESSION_GRAPH_FIT");
-    if (fe && fe[0] == '0' && fe[1] == '\0') return true;
+    if (fe && fe[0] == '0' && fe[1] == '\0') {
+        if (q) { q->fits = 1; q->fail_open = 1; }
+        return true;
+    }
     uint64_t free_b = 0, total_b = 0;
-    if (ds4_gpu_mem_info(&free_b, &total_b) != 0) return true;
+    if (ds4_gpu_mem_info(&free_b, &total_b) != 0) {
+        if (q) { q->fits = 1; q->fail_open = 1; }
+        return true;
+    }
     /* deepmem lite-3: pending substrate promotions (lazy fd-cache tier) will
      * take this much of "free" back mid-serving; the serial graph must fit
      * beside them, not instead of them. */
@@ -10157,7 +10165,17 @@ static bool metal_graph_session_fit_check(
                                                            ctx_size, prefill_cap,
                                                            enable_mtp, enable_dspark);
     const uint64_t headroom = ds4_session_graph_headroom_bytes();
-    if (free_b >= need + headroom) return true;
+    uint64_t ask = need + headroom;
+    if (ask < need) ask = UINT64_MAX;   /* saturate (plan sec 13: no wrap) */
+    const bool fits = free_b >= ask;
+    if (q) {
+        q->fits = fits ? 1 : 0;
+        q->need_bytes = need;
+        q->headroom_bytes = headroom;
+        q->avail_bytes = free_b;
+        q->deficit_bytes = fits ? 0 : ask - free_b;
+    }
+    if (fits) return true;
     if (loud) {
         ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
         fprintf(stderr,
@@ -10181,7 +10199,7 @@ static bool metal_graph_session_fit_ok(
         bool                     enable_dspark) {
     return metal_graph_session_fit_check(weights, layer, raw_cap, ctx_size,
                                          prefill_cap, enable_mtp, enable_dspark,
-                                         /*loud=*/true);
+                                         /*loud=*/true, NULL);
 }
 
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
@@ -39960,16 +39978,37 @@ int ds4_session_graph_pending(const ds4_session *s) {
  * session ctx that can actually allocate instead of letting a full--c lazy
  * alloc fail on a bank-holding box.  Fail-open exactly like the gate. */
 int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size) {
+    ds4_session_graph_fit_quote q;
+    return ds4_engine_session_graph_fit_quote(e, ctx_size, &q);
+}
+
+/* memgov D4-1: the structured quote behind the boolean probe -- same tiers,
+ * same fail-open legs (CPU and no-graph builds quote fits=1/fail_open=1,
+ * matching the probe's historical yes), numbers from the fit gate's own
+ * evaluation so quote and gate cannot drift.  NULL/invalid args are a
+ * caller bug, not a capacity verdict: fits=0 with fail_open=0 and zero
+ * deficit (nothing to reclaim toward). */
+int ds4_engine_session_graph_fit_quote(ds4_engine *e, int ctx_size,
+                                       ds4_session_graph_fit_quote *q) {
+    if (!q) return 0;
+    memset(q, 0, sizeof(*q));
     if (!e || ctx_size <= 0) return 0;
 #ifndef DS4_NO_GPU
-    if (e->backend == DS4_BACKEND_CPU) return 1;
+    if (e->backend == DS4_BACKEND_CPU) {
+        q->fits = 1;
+        q->fail_open = 1;
+        return 1;
+    }
     const uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
-    return metal_graph_session_fit_check(&e->weights, &e->weights.layer[0],
-                                         raw_cap, (uint32_t)ctx_size, prefill_cap,
-                                         e->mtp_ready, e->dspark_ready,
-                                         /*loud=*/false) ? 1 : 0;
+    (void)metal_graph_session_fit_check(&e->weights, &e->weights.layer[0],
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                        e->mtp_ready, e->dspark_ready,
+                                        /*loud=*/false, q);
+    return q->fits;
 #else
+    q->fits = 1;
+    q->fail_open = 1;
     return 1;
 #endif
 }

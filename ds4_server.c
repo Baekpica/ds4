@@ -13769,32 +13769,44 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     /* Freed graph bytes reach MemAvailable with driver-reclaim lag (the
      * WAIT_MEM class); give the floor probe a bounded settle window. */
     bool min_fits = false;
+    ds4_session_graph_fit_quote fq = {0};
     for (int tries = 0; tries < 20; tries++) {
-        if (ds4_engine_session_graph_fits(s->engine, (int)need_min)) {
+        if (ds4_engine_session_graph_fit_quote(s->engine, (int)need_min, &fq)) {
             min_fits = true;
             break;
         }
         usleep(100 * 1000);
     }
-    /* deepmem lite-4 (minimal reclaim): before refusing, let the serial
-     * lane COLLECT from the commons -- free banks' demand-mapped pages
-     * return exactly via trim and their worst case is a re-prefill
+    /* deepmem D4-1 (structured reclaim want): before refusing, let the
+     * serial lane COLLECT from the commons -- free banks' demand-mapped
+     * pages return exactly via trim and their worst case is a re-prefill
      * (governance LEARNING 7: when two classes contend, fund the
-     * reversible one last).  Minimal form: the fit probe reports no exact
-     * deficit yet (the structured quote is chartered D4), so trim
-     * everything free -- the alternative on this path is a user-visible
-     * 503, and a bank is only free here because no batch row wanted it.
-     * Then re-run the same settle window; a still-unfittable request
-     * refuses exactly as before. */
+     * reversible one last).  The quote's exact deficit bounds the collect:
+     * trim deficit + one more headroom of slack (the same shared margin
+     * the fit inequality already charges -- its 1 GiB default exceeds the
+     * measured post-trim MemAvailable drift band, so the re-poll cannot
+     * land exactly on the fit line and lose to kswapd), preserving the
+     * rest of the idle warm cache lite-4's whole-commons trim spent.  A
+     * numberless quote (fail-open leg mid-settle, or a probe refusal with
+     * no deficit) keeps the lite-4 shape: trim everything free rather
+     * than refuse beside idle cache.  Then re-run the same settle window;
+     * a still-unfittable request refuses exactly as before. */
     if (!min_fits && s->batch_ctx) {
-        const uint64_t freed = ds4_batch_ctx_trim_free(s->batch_ctx, UINT64_MAX);
+        uint64_t want = UINT64_MAX;
+        if (fq.deficit_bytes > 0) {
+            want = fq.deficit_bytes + fq.headroom_bytes;
+            if (want < fq.deficit_bytes) want = UINT64_MAX;   /* saturate */
+        }
+        const uint64_t freed = ds4_batch_ctx_trim_free(s->batch_ctx, want);
         if (freed) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: serial fit reclaim: trimmed %.1f MiB of free-bank cache "
-                       "for a %d-token serial request",
-                       (double)freed / 1048576.0, j->req.prompt.len);
+                       "for a %d-token serial request (deficit %.1f MiB + %.1f MiB slack)",
+                       (double)freed / 1048576.0, j->req.prompt.len,
+                       (double)fq.deficit_bytes / 1048576.0,
+                       (double)fq.headroom_bytes / 1048576.0);
             for (int tries = 0; tries < 20 && !min_fits; tries++) {
-                if (ds4_engine_session_graph_fits(s->engine, (int)need_min))
+                if (ds4_engine_session_graph_fit_quote(s->engine, (int)need_min, &fq))
                     min_fits = true;
                 else
                     usleep(100 * 1000);
@@ -13889,9 +13901,16 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     if (ds4_session_create(&ns, s->engine, boot_ctx) == 0) s->session = ns;
     else die("serial right-size: could not restore the boot session");
     if (target <= 0)
+        /* D4-1: the refusal carries the quote's exact deficit (the standing
+         * gate re-bracket pain: this line used to speak in tokens only).
+         * fq is the LAST quote taken -- post-trim when reclaim ran -- so
+         * the number is the residual shortfall, not the pre-trim ask. */
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: serial right-size: no graph fits (prompt=%d need_min=%ld boot -c %d); refusing 503",
-                   j->req.prompt.len, need_min, boot_ctx);
+                   "ds4-server: serial right-size: no graph fits (prompt=%d need_min=%ld boot -c %d "
+                   "deficit=%.1f MiB avail=%.1f MiB); refusing 503",
+                   j->req.prompt.len, need_min, boot_ctx,
+                   (double)fq.deficit_bytes / 1048576.0,
+                   (double)fq.avail_bytes / 1048576.0);
     ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);   /* lazy: holds nothing */
     char msg[192];
     snprintf(msg, sizeof(msg),

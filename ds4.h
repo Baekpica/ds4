@@ -580,7 +580,9 @@ int  ds4_gov_mode(int consumer);
  *               the legacy verdict, legacy rules);
  *   enforce  -> the quote rules and the legacy verdict becomes the
  *               counted comparison target (the matrix stays the oracle
- *               in both directions until D4 deletes the legacy formulas).
+ *               in both directions until a post-v0.5.7 increment deletes
+ *               the legacy formulas -- plan sec 12 gates that deletion on
+ *               a full release of field confidence; D4-0 adjudication).
  * Enforce policy for non-verdict quote statuses (sec 6.2/6.4): FAULT
  * fails CLOSED (returned as REFUSE_LIVE, disclosed); UNSUPPORTED and
  * RETRY_OBS defer to the legacy verdict (documented backend policy --
@@ -903,6 +905,27 @@ int ds4_session_prefill_cap(ds4_session *s);
  * gate right now (quiet probe; fail-open like the gate itself). */
 int ds4_session_graph_pending(const ds4_session *s);
 int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size);
+/* memgov D4-1: the structured fit quote (revised plan sec 10 step 1) -- the
+ * boolean probe's own terms, exposed.  need = the graph alloc estimate at
+ * ctx_size; headroom = the shared protected margin
+ * (ds4_session_graph_headroom_bytes); avail = allocatable bytes at quote
+ * time (pending substrate promotions already deducted); deficit =
+ * saturating max(0, need + headroom - avail), and deficit == 0 exactly when
+ * fits.  fail_open marks the probe's historical yes-without-numbers legs
+ * (fit gate disabled, budget-less backend, CPU): fits = 1 with every byte
+ * field 0.  The reclaim caller trims want = deficit + headroom from the
+ * idle commons instead of all of it.  Returns fits; the boolean probe above
+ * is this quote with the numbers discarded. */
+typedef struct {
+    int      fits;            /* 1 = a graph at ctx_size allocates now */
+    int      fail_open;       /* 1 = no budget answer; byte fields are 0 */
+    uint64_t need_bytes;      /* graph alloc estimate at ctx_size */
+    uint64_t headroom_bytes;  /* required slack on top of need */
+    uint64_t avail_bytes;     /* allocatable bytes at quote time */
+    uint64_t deficit_bytes;   /* saturating need + headroom - avail floor 0 */
+} ds4_session_graph_fit_quote;
+int ds4_engine_session_graph_fit_quote(ds4_engine *e, int ctx_size,
+                                       ds4_session_graph_fit_quote *q);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
