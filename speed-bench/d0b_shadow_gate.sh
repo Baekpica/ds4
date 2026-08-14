@@ -291,16 +291,17 @@ R "grep -q 'persistent batch ctx ready' /tmp/d0bboard_boot.log" \
     && die "(f) a batch ctx was created despite the pinned headroom"
 # Two concurrent batchable requests -> coalesce -> per-call STATIC
 # refusal -> single-path fallback serves BOTH via the serial lane.
-# OpenAI surface + GREEDY (third/fourth-run findings): the static lane
-# qualifies unconditionally only on its home surface, and it is
-# argmax-only (ROUTE_STATIC_MASK is empty -- needs-free shapes only),
-# so a default-temperature request carries the sampling need and
-# routes serial before the gather is consulted.  temperature:0 makes
+# OpenAI surface + GREEDY + NON-THINKING (findings 3-5, the last one
+# measured via route_decisions on a probe boot: cont_unavailable=2):
+# the static lane qualifies unconditionally only on its home surface
+# and only for NEEDS-FREE shapes -- buffered, greedy, non-thinking.
+# The server's default reasoning effort is LOW (thinking ON), which
+# sets DS4_NEED_THINKING; reasoning_effort:none + temperature:0 make
 # the pair needs-free.
 FP=()
 for i in 1 2; do
     R "curl -s -m 300 -X POST localhost:$PORT/v1/chat/completions -H 'content-type: application/json' \
-        -d '{\"max_tokens\":16,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"Board leg request $i: say OK.\"}]}' -o /tmp/d0bboard_r$i.json" &
+        -d '{\"max_tokens\":16,\"temperature\":0,\"reasoning_effort\":\"none\",\"messages\":[{\"role\":\"user\",\"content\":\"Board leg request $i: say OK.\"}]}' -o /tmp/d0bboard_r$i.json" &
     FP+=($!)
 done
 for p in "${FP[@]}"; do wait "$p" 2>/dev/null || true; done
