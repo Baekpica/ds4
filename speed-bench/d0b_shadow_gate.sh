@@ -291,14 +291,16 @@ R "grep -q 'persistent batch ctx ready' /tmp/d0bboard_boot.log" \
     && die "(f) a batch ctx was created despite the pinned headroom"
 # Two concurrent batchable requests -> coalesce -> per-call STATIC
 # refusal -> single-path fallback serves BOTH via the serial lane.
-# OpenAI surface (third-run finding): the static lane's HOME surface
-# qualifies unconditionally in route_decide (the Anthropic surface
-# reaches static only via cont-promotion), and the ABBA leg proves
-# this exact request shape end-to-end.
+# OpenAI surface + GREEDY (third/fourth-run findings): the static lane
+# qualifies unconditionally only on its home surface, and it is
+# argmax-only (ROUTE_STATIC_MASK is empty -- needs-free shapes only),
+# so a default-temperature request carries the sampling need and
+# routes serial before the gather is consulted.  temperature:0 makes
+# the pair needs-free.
 FP=()
 for i in 1 2; do
     R "curl -s -m 300 -X POST localhost:$PORT/v1/chat/completions -H 'content-type: application/json' \
-        -d '{\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Board leg request $i: say OK.\"}]}' -o /tmp/d0bboard_r$i.json" &
+        -d '{\"max_tokens\":16,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"Board leg request $i: say OK.\"}]}' -o /tmp/d0bboard_r$i.json" &
     FP+=($!)
 done
 for p in "${FP[@]}"; do wait "$p" 2>/dev/null || true; done
