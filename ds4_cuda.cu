@@ -106,6 +106,14 @@ static int g_model_registered;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
+/* Integrated self-load map: kernels may read the raw mmap pointer through
+ * ATS/HMM (the aligned-consumer fallback contract) even though hmm_direct
+ * stays 0 to keep routing through the promotion tiers.  Records WHICH map
+ * carries that coherence fact (a pointer, not a bool: later set_model_map
+ * calls for support maps take over the g_model_* globals while this map
+ * keeps serving), so refusal/degraded paths can serve its mapped pointer
+ * instead of failing (memgov enforce hardening). */
+static const void *g_model_coherent_direct_map;
 static int g_model_fd = -1;
 // Tracks which model_map owns g_model_fd. Set on the first set_model_map call
 // after set_model_fd. fd-based weight caching is refused for any other map
@@ -891,7 +899,13 @@ static uint64_t g_range_publish_refused;
  * census physics).  The gov entry points live in ds4.c (C linkage; the
  * standing local-fwd-decl law for cross-TU calls). */
 static int g_model_plan_frozen;
-static int g_in_unit_materialize;
+/* Set while a GOVERNED promotion publishes its range: the unit
+ * materializer and the cold device-copy tier both take a governor claim
+ * immediately before publication, so a post-freeze arena publication
+ * without this marker is by construction an unclaimed path. */
+static int g_in_governed_materialize;
+static const char *cuda_model_direct_fallback_ptr(const void *model_map,
+                                                  uint64_t offset);
 extern "C" void ds4_gov_publish_use(int consumer, uint64_t intent,
                                     uint64_t resident);
 extern "C" int ds4_gov_governed_check(const char *site,
@@ -927,7 +941,7 @@ static int cuda_model_range_publish(const cuda_model_range &nr) {
      * unregistered post-freeze allocation").  Loud + counted, never a
      * refusal: the range is real and the census must stay physical
      * truth -- the fault says the INTENT ledger was bypassed. */
-    if (g_model_plan_frozen && !g_in_unit_materialize &&
+    if (g_model_plan_frozen && !g_in_governed_materialize &&
         !nr.host_registered && !nr.imported_ipc && !nr.imported_vmm) {
         static int warned = 0;
         if (!warned) {
@@ -1371,6 +1385,23 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
                                                           uint64_t offset,
                                                           uint64_t bytes,
                                                           const char *what) {
+    /* memgov D2 hardening: the cold device-copy tier is a real promotion
+     * (unregistered device bytes), so it takes the same governed decision
+     * as the unit tiers.  Legacy verdict is ADMIT verbatim -- this tier
+     * historically had no gating ("caller is responsible for any policy
+     * gating"), so observe mode stays bit-identical.  A refusal degrades
+     * to the coherent mapped pointer where that is kernel-safe (integrated
+     * map), else NULL -- the caller's historical failure path. */
+    ds4_gov_claim mcl = {0};
+    mcl.requester = DS4_GOVC_ENGINE_BOOT;
+    mcl.memc = DS4_MEMC_WEIGHT_SPAN;
+    mcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    mcl.proposed_outstanding = g_model_range_bytes + bytes;
+    mcl.operation_transient = g_model_plan_frozen ? bytes : 0;
+    if (ds4_gov_governed_check("cold_materialize", &mcl, DS4_GOV_ADMIT)
+            != DS4_GOV_ADMIT) {
+        return cuda_model_direct_fallback_ptr(model_map, offset);
+    }
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
@@ -1396,7 +1427,10 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
             return NULL;
         }
     }
-    if (!cuda_model_range_publish({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0})) {
+    g_in_governed_materialize = 1;   /* claim taken above: funneled publication */
+    const int pub = cuda_model_range_publish({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0});
+    g_in_governed_materialize = 0;
+    if (!pub) {
         (void)cudaFree(dev);
         return NULL;
     }
@@ -3048,6 +3082,7 @@ static char *cuda_model_arena_alloc(const void *model_map, uint64_t bytes,
 static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
     if (cuda_model_current_direct_available(model_map) ||
         (model_map == g_model_host_base && g_model_hmm_direct) ||
+        (model_map && model_map == g_model_coherent_direct_map) ||
         getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return cuda_model_ptr(model_map, offset);
     }
@@ -3190,15 +3225,15 @@ static int cuda_unit_materialize_copy(const void *model_map,
     if (!cuda_stage_copy_to_dev(model_map, u->src_off, u->src_bytes, dev,
                                 direct_discard, what))
         return CUDA_MAT_FAILED;
-    /* memgov D2-2: this is the ONE claimed promotion path; the funnel's
-     * post-freeze tripwire keys on the marker (no early return between
-     * set and clear: publish is the next call). */
-    g_in_unit_materialize = 1;
+    /* memgov D2-2: a claimed promotion path; the funnel's post-freeze
+     * tripwire keys on the marker (no early return between set and
+     * clear: publish is the next call). */
+    g_in_governed_materialize = 1;
     const int pub = cuda_model_range_publish({model_map, u->src_off,
                                               u->src_bytes, dev,
                                               NULL, NULL, 0, 0, 1, 0, 0,
                                               0, 0, 0});
-    g_in_unit_materialize = 0;
+    g_in_governed_materialize = 0;
     if (!pub) return CUDA_MAT_FAILED;
     g_model_range_bytes += u->src_bytes;
     cuda_substrate_cover(model_map, u->src_bytes);   /* tripwire: unit materialized */
@@ -3880,6 +3915,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_device_owned = 0;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
+    g_model_coherent_direct_map = NULL;
     g_model_fd = -1;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
@@ -4429,6 +4465,10 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_registered_size = model_size;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
+    /* Re-mapping the coherent map re-derives its fact below; other maps'
+     * calls must not erase it (the base map keeps serving through it). */
+    if (model_map == g_model_coherent_direct_map)
+        g_model_coherent_direct_map = NULL;
     g_model_cache_full = 0;
     // Bind g_model_fd to this model on first registration. set_model_fd is
     // called once for the main model before the first set_model_map call;
@@ -4502,7 +4542,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
                  * demand — the same residency a weight-server import gives
                  * them.  Expert raws stay cold on disk; the raw mmap pointer
                  * (g_model_device_base) still serves the aligned-consumer
-                 * fallback reads through HMM at mmap rates. */
+                 * fallback reads through HMM at mmap rates.
+                 * memgov D2 hardening: that coherence fact is recorded so a
+                 * GOVERNED refusal of the promotion tiers (operator floor
+                 * under enforce) degrades to mapped-serve instead of
+                 * failing the resolve — routing still prefers promotion. */
+                g_model_coherent_direct_map = model_map;
                 fprintf(stderr,
                         "ds4: CUDA integrated + in-process artifacts: skipping full host "
                         "registration (%.2f GiB mmap left unpinned; expert weights served "
@@ -4555,6 +4600,7 @@ extern "C" void ds4_gpu_unregister_model_map(const void *base) {
      * host-registration state: device artifacts and imported ranges of other
      * maps are left alone. */
     if (!base) return;
+    if (g_model_coherent_direct_map == base) g_model_coherent_direct_map = NULL;
     if (g_model_registered && g_model_host_base == base) {
         (void)cudaHostUnregister((void *)base);
         cuda_pinned_file_note_unregister(base);
