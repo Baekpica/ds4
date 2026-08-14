@@ -269,10 +269,10 @@ static void cuda_mem_note_free_src(int cls, int dom, uint64_t requested,
 }
 
 extern "C" int ds4_gpu_model_source_bind(const void *map_base, uint64_t map_len,
-                                         int role, int fd,
+                                         int role, int fd, int residency,
                                          const char *name, const char *path) {
     return ds4_model_source_bind(&g_model_srcs, map_base, map_len, role, fd,
-                                 name, path, &g_mem_census_faults);
+                                 residency, name, path, &g_mem_census_faults);
 }
 
 extern "C" int ds4_gpu_model_source_count(void) {
@@ -1517,6 +1517,24 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
         return cuda_model_ptr(model_map, offset);
+    }
+    /* memgov D3-2: a TERMINAL host-mapped source on the coherent
+     * integrated map serves the raw ATS pointer HERE -- no promotion
+     * walk, no per-range registration, no API calls (capture-safe by
+     * construction).  The rent-gate M-leg forensics (08-14) showed why
+     * the register tier cannot be the mapped mechanism on this shape:
+     * page-rounded per-range registrations build a patchwork over the
+     * mmap, every later cold copy whose source intersects it fails
+     * 'invalid argument', and an unpublished fallback makes capture-time
+     * resolves re-walk the tiers into cudaMalloc-under-capture (poisoned
+     * decode graphs).  Registry hits above still win (imports, artifacts'
+     * derived ranges); discrete maps fall through to the register tier. */
+    {
+        const int msrc = cuda_mem_src_index(model_map);
+        if (msrc >= 0 && msrc < DS4_MSRC_MAX &&
+            g_model_srcs.v[msrc].residency == DS4_RESIDENCY_HOST_MAPPED &&
+            model_map == g_model_coherent_direct_map)
+            return cuda_model_ptr(model_map, offset);
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
     if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
@@ -3215,6 +3233,11 @@ enum {
     CUDA_MAT_ALREADY_READY,
     CUDA_MAT_SATISFIED_IMPORT,
     CUDA_MAT_HOST_MAPPED_BY_POLICY,
+    CUDA_MAT_LAZY_DEFERRED,          /* D3-2: source residency = lazy —
+                                        the eager pass leaves the unit to
+                                        first touch by SCHEDULE (vs the
+                                        budget's unfunded, which is a
+                                        REFUSAL of the same deferral) */
     CUDA_MAT_WAIVED_OPTIONAL,
     CUDA_MAT_FAILED,
     CUDA_MAT__COUNT
@@ -3295,6 +3318,18 @@ static const char *cuda_model_range_ptr_from_fd(
         : cuda_model_cache_limit_bytes();
     for (int ui = lo; ui <= hi; ui++) {
         const ds4_phys_unit *u = &units[ui];
+        /* memgov D3-2: HOST_MAPPED is a TERMINAL policy -- mapped units
+         * are lazy-INELIGIBLE (the D3-0 finding: this loop was policy-
+         * blind, so a single-lever NO_HBM boot device-promoted the very
+         * bytes the stamp said stay mapped).  NULL, not the direct
+         * fallback: the per-range register tier is the mapped serving
+         * mechanism, same as the legacy pair produced.  EXPERT_COLD
+         * eligibility is deliberately untouched (bug-for-bug; its own
+         * adjudication rides D3-4). */
+        if (u->policy == DS4_UPOL_HOST_MAPPED) {
+            g_materialize_outcomes[CUDA_MAT_HOST_MAPPED_BY_POLICY]++;
+            return NULL;
+        }
         int covered = 0;
         for (const cuda_model_range &r : g_model_ranges) {
             if (r.host_base != model_map || r.host_registered) continue;
@@ -5833,21 +5868,23 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
                 nm);
         return 1;
     }
-    /* Tripwire declaration (v0.5.6.3 substrate view): every promotable
-     * byte of the ACTIVE plan, before any policy or budget skip — the
-     * NO_HBM lever merely defers promotion to the lazy tier, which
-     * covers on materialization. */
+    /* Tripwire declaration (v0.5.6.3 substrate view): every byte that
+     * WILL eventually device-promote, before any budget skip.  memgov
+     * D3-2: DEVICE_PROMOTE units count whether the schedule is eager or
+     * lazy (the lazy tier covers on materialization); HOST_MAPPED units
+     * are TERMINAL host residents under the typed policy -- they never
+     * promote, so declaring them would charge the fit ~8 GiB for bytes
+     * mapped serving never takes back (the old pair-lever shape carried
+     * exactly that phantom outstanding). */
     if (g_model_fd_host_base && model_map == g_model_fd_host_base) {
         for (uint32_t i = 0; i < nu; i++) {
-            if (units[i].policy == DS4_UPOL_DEVICE_PROMOTE ||
-                units[i].policy == DS4_UPOL_HOST_MAPPED)
+            if (units[i].policy == DS4_UPOL_DEVICE_PROMOTE)
                 g_substrate_promotable_total += units[i].src_bytes;
         }
     }
     if (g_model_device_owned) {
         for (uint32_t i = 0; i < nu; i++) {
-            if (units[i].policy == DS4_UPOL_DEVICE_PROMOTE ||
-                units[i].policy == DS4_UPOL_HOST_MAPPED)
+            if (units[i].policy == DS4_UPOL_DEVICE_PROMOTE)
                 cuda_substrate_cover(model_map, units[i].src_bytes);
         }
         fprintf(stderr,
@@ -5855,6 +5892,11 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
                 nm);
         return 1;
     }
+    /* memgov D3-2: the eager-vs-lazy SCHEDULE is the source's, read from
+     * the handle resolved at bind -- never the environment. */
+    const int lazy_schedule =
+        src >= 0 && src < DS4_MSRC_MAX &&
+        g_model_srcs.v[src].residency == DS4_RESIDENCY_LAZY_COPY_DEVICE;
     const uint64_t limit = cuda_model_map_replaces_complete(model_map)
         ? UINT64_MAX
         : cuda_model_cache_limit_bytes();
@@ -5874,6 +5916,10 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
             continue;
         }
         if (u->policy != DS4_UPOL_DEVICE_PROMOTE) continue;
+        if (lazy_schedule) {
+            counts[CUDA_MAT_LAZY_DEFERRED]++;
+            continue;
+        }
         promote++;
         if (u->src_off > model_size || u->src_bytes > model_size - u->src_off) {
             /* The verify pass cannot see the map size; a unit outside the
@@ -5960,13 +6006,14 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
     fprintf(stderr,
             "ds4: materialize %s: funded %u/%u promote units (%u unfunded), "
             "populated %llu (%.2f GiB), ready %llu, import %llu, "
-            "mapped-policy %llu, failed %llu\n",
+            "mapped-policy %llu, lazy-policy %llu, failed %llu\n",
             nm, funded, promote, unfunded,
             (unsigned long long)counts[CUDA_MAT_POPULATED],
             (double)pop_bytes / 1073741824.0,
             (unsigned long long)counts[CUDA_MAT_ALREADY_READY],
             (unsigned long long)counts[CUDA_MAT_SATISFIED_IMPORT],
             (unsigned long long)counts[CUDA_MAT_HOST_MAPPED_BY_POLICY],
+            (unsigned long long)counts[CUDA_MAT_LAZY_DEFERRED],
             (unsigned long long)counts[CUDA_MAT_FAILED]);
     return failed ? 0 : 1;
 }

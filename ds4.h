@@ -519,7 +519,7 @@ uint32_t ds4_gpu_trim_inject_fired(void);
  * every weight class cell against its source rows, counting a census
  * fault on divergence (the standing gates assert faults == 0). */
 int  ds4_gpu_model_source_bind(const void *map_base, uint64_t map_len,
-                               int role, int fd,
+                               int role, int fd, int residency,
                                const char *name, const char *path);
 int  ds4_gpu_model_source_count(void);
 int  ds4_gpu_model_source_info(int idx, ds4_model_source *out);

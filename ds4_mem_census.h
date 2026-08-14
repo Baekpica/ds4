@@ -154,11 +154,27 @@ typedef enum {
     DS4_MSRC_ROLE_DRAFTER                /* speculative drafter (DSpark)   */
 } ds4_model_source_role;
 
+/* memgov D3-2: ONE typed engine residency policy per source (plan sec 12
+ * D3).  The value is RESOLVED ONCE at source bind from the first-class
+ * knob (DS4_WEIGHT_RESIDENCY[_BASE|_MTP|_DRAFTER]) or the legacy alias
+ * shape, and every consumer reads the handle -- never the environment. */
+enum {
+    DS4_RESIDENCY_EAGER_DEVICE = 0,      /* eager pass promotes the funded
+                                            plan; lazy tier backfills      */
+    DS4_RESIDENCY_LAZY_COPY_DEVICE,      /* same terminal residency, but
+                                            promotion defers to first
+                                            touch (the NO_HBM alias)       */
+    DS4_RESIDENCY_HOST_MAPPED            /* terminal host residency: mapped
+                                            units NEVER device-promote     */
+};
+
 typedef struct {
     const void *map_base;                /* host mmap base = source identity */
     uint64_t    map_len;
     int         role;                    /* ds4_model_source_role          */
     int         fd;                      /* file identity at open, -1 none */
+    uint8_t     residency;               /* DS4_RESIDENCY_* (resolved once
+                                            at bind; D3-2)                 */
     char        name[24];                /* semantic id ("base"/"mtp"/
                                             "drafter") -- deliberately the
                                             weight-server manifest model_id
@@ -185,7 +201,7 @@ static inline void ds4_msrc_copy_str(char *dst, uint64_t cap, const char *src) {
  * rows outlive a rebind by design (map identity is the row key). */
 static inline int ds4_model_source_bind(ds4_model_source_table *t,
                                         const void *map_base, uint64_t map_len,
-                                        int role, int fd,
+                                        int role, int fd, int residency,
                                         const char *name, const char *path,
                                         uint64_t *faults) {
     int i;
@@ -206,6 +222,7 @@ static inline int ds4_model_source_bind(ds4_model_source_table *t,
     t->v[i].map_len = map_len;
     t->v[i].role = role;
     t->v[i].fd = fd;
+    t->v[i].residency = (uint8_t)residency;
     ds4_msrc_copy_str(t->v[i].name, sizeof(t->v[i].name), name);
     ds4_msrc_copy_str(t->v[i].path, sizeof(t->v[i].path), path);
     return i;
@@ -234,6 +251,80 @@ static inline const char *ds4_model_source_role_name(int role) {
     case DS4_MSRC_ROLE_AUXILIARY: return "auxiliary";
     case DS4_MSRC_ROLE_DRAFTER:   return "drafter";
     default:                      return "unknown";
+    }
+}
+
+/* memgov D3-2: the residency resolver.  PURE -- the caller reads the
+ * environment once at engine open and passes what it found; the truth
+ * table below is CPU-unit-tested without env games.
+ *
+ * Precedence: an explicit DS4_WEIGHT_RESIDENCY[_<SRC>] value OWNS the
+ * decision and REFUSES to share it -- any legacy residency lever beside
+ * it is a strict conflict (one vocabulary per boot, the plan's "no
+ * interacting negative flags").  With no explicit value the legacy
+ * shapes keep their exact historical meaning as aliases:
+ *   (none)                  -> EAGER_DEVICE
+ *   NO_HBM_CACHE            -> LAZY_COPY_DEVICE (defers the SAME bytes)
+ *   NO_HBM_CACHE + NO_FD    -> HOST_MAPPED
+ *   DIRECT_MODEL (any mix)  -> HOST_MAPPED (raw-direct mechanism; the
+ *                              eager short-circuit + resolve tier keep
+ *                              serving it -- levers beside it stay the
+ *                              legal-but-inert legacy shape)
+ *   NO_FD alone             -> EAGER_DEVICE (mechanism-only lever: the
+ *                              lazy tier stays fenced at the resolve
+ *                              site; deprecated, not a conflict)       */
+typedef struct {
+    const char *explicit_val;            /* knob value or 0 (unset)       */
+    uint8_t legacy_no_hbm;               /* DS4_CUDA_NO_HBM_CACHE present */
+    uint8_t legacy_no_fd;                /* DS4_CUDA_NO_FD_CACHE present  */
+    uint8_t legacy_direct;               /* DS4_CUDA_DIRECT_MODEL present */
+} ds4_residency_inputs;
+
+static inline int ds4_msrc_str_eq(const char *a, const char *b) {
+    uint64_t i = 0;
+    if (!a || !b) return 0;
+    for (; a[i] && b[i]; i++) if (a[i] != b[i]) return 0;
+    return a[i] == b[i];
+}
+
+/* Returns DS4_RESIDENCY_* or -1 on conflict with *why set. */
+static inline int ds4_residency_resolve(const ds4_residency_inputs *in,
+                                        const char **why) {
+    static const char *w_unknown =
+        "unknown DS4_WEIGHT_RESIDENCY value (want eager|lazy|mapped)";
+    static const char *w_lever =
+        "DS4_WEIGHT_RESIDENCY set beside a legacy residency lever "
+        "(DS4_CUDA_NO_HBM_CACHE / DS4_CUDA_NO_FD_CACHE / "
+        "DS4_CUDA_DIRECT_MODEL): one vocabulary per boot -- drop the lever";
+    if (why) *why = 0;
+    if (!in) { if (why) *why = w_unknown; return -1; }
+    if (in->explicit_val && in->explicit_val[0]) {
+        if (in->legacy_no_hbm || in->legacy_no_fd || in->legacy_direct) {
+            if (why) *why = w_lever;
+            return -1;
+        }
+        if (ds4_msrc_str_eq(in->explicit_val, "eager"))
+            return DS4_RESIDENCY_EAGER_DEVICE;
+        if (ds4_msrc_str_eq(in->explicit_val, "lazy"))
+            return DS4_RESIDENCY_LAZY_COPY_DEVICE;
+        if (ds4_msrc_str_eq(in->explicit_val, "mapped"))
+            return DS4_RESIDENCY_HOST_MAPPED;
+        if (why) *why = w_unknown;
+        return -1;
+    }
+    if (in->legacy_direct) return DS4_RESIDENCY_HOST_MAPPED;
+    if (in->legacy_no_hbm)
+        return in->legacy_no_fd ? DS4_RESIDENCY_HOST_MAPPED
+                                : DS4_RESIDENCY_LAZY_COPY_DEVICE;
+    return DS4_RESIDENCY_EAGER_DEVICE;
+}
+
+static inline const char *ds4_residency_name(int r) {
+    switch (r) {
+    case DS4_RESIDENCY_EAGER_DEVICE:     return "eager";
+    case DS4_RESIDENCY_LAZY_COPY_DEVICE: return "lazy";
+    case DS4_RESIDENCY_HOST_MAPPED:      return "mapped";
+    default:                             return "unknown";
     }
 }
 

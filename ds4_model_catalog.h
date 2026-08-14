@@ -190,8 +190,12 @@ typedef struct {
     uint64_t max_unit_bytes;         /* soft span cap (live walk knob)   */
     uint64_t vmm_granularity;        /* rounding for VMM units (0 = none)*/
     /* Effective-policy provenance (captured boot flags, plan §5.1): the
-     * stamp is derived, the inputs say why. */
-    uint8_t  hbm_cache_on;           /* integrated startup walk enabled  */
+     * stamp is derived, the inputs say why.  memgov D3-2: the unit stamp
+     * is TIMING-AGNOSTIC -- device_promote says whether non-expert units
+     * ever device-promote (eager AND lazy residency both set it); the
+     * eager-vs-lazy schedule lives on the SOURCE handle, not the unit. */
+    uint8_t  device_promote;         /* non-expert units promote (source
+                                        residency != HOST_MAPPED)        */
     uint8_t  replaces_complete;      /* every replace-candidate has an
                                         artifact (self-load / manifest)  */
 } ds4_unit_compile_params;
@@ -203,7 +207,7 @@ static inline uint8_t ds4_unit_policy_of(uint32_t traits,
             ? DS4_UPOL_ARTIFACT_REPLACED
             : DS4_UPOL_EXPERT_COLD;
     }
-    return p->hbm_cache_on ? DS4_UPOL_DEVICE_PROMOTE : DS4_UPOL_HOST_MAPPED;
+    return p->device_promote ? DS4_UPOL_DEVICE_PROMOTE : DS4_UPOL_HOST_MAPPED;
 }
 
 static inline uint64_t ds4_unit_round_planned(uint64_t bytes, uint8_t alloc,

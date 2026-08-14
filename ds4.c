@@ -39361,6 +39361,54 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
+        /* memgov D3-2: resolve the per-source residency policy ONCE, here,
+         * from ONE read of the environment -- the handles carry it and no
+         * consumer reads these knobs again.  Legacy levers stay legal as
+         * aliases; the first-class knob refuses to share the boot with
+         * them (strict conflict = typed open failure, the plan's "no
+         * interacting negative flags"). */
+        int res_pol[3]; /* base, mtp, drafter -- the uts[]/cats[] order */
+        {
+            const ds4_residency_inputs common = {
+                NULL,
+                getenv("DS4_CUDA_NO_HBM_CACHE") != NULL,
+                getenv("DS4_CUDA_NO_FD_CACHE") != NULL,
+                getenv("DS4_CUDA_DIRECT_MODEL") != NULL,
+            };
+            const char *glob = getenv("DS4_WEIGHT_RESIDENCY");
+            const struct { const char *nm; const char *ov; } rsrc[3] = {
+                {"base",    getenv("DS4_WEIGHT_RESIDENCY_BASE")},
+                {"mtp",     getenv("DS4_WEIGHT_RESIDENCY_MTP")},
+                {"drafter", getenv("DS4_WEIGHT_RESIDENCY_DRAFTER")},
+            };
+            for (int ri = 0; ri < 3; ri++) {
+                ds4_residency_inputs in = common;
+                in.explicit_val = rsrc[ri].ov && rsrc[ri].ov[0] ? rsrc[ri].ov
+                                                                : glob;
+                const char *why = NULL;
+                res_pol[ri] = ds4_residency_resolve(&in, &why);
+                if (res_pol[ri] < 0) {
+                    fprintf(stderr,
+                            "ds4: residency policy conflict (%s): %s\n",
+                            rsrc[ri].nm, why ? why : "invalid");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            }
+            if (common.legacy_no_fd && !common.legacy_no_hbm && !glob)
+                fprintf(stderr,
+                        "ds4: DS4_CUDA_NO_FD_CACHE without DS4_CUDA_NO_HBM_CACHE "
+                        "is deprecated (mechanism-only lever); prefer "
+                        "DS4_WEIGHT_RESIDENCY=eager|mapped\n");
+            fprintf(stderr,
+                    "ds4: weight residency: base=%s mtp=%s drafter=%s (%s)\n",
+                    ds4_residency_name(res_pol[0]),
+                    ds4_residency_name(res_pol[1]),
+                    ds4_residency_name(res_pol[2]),
+                    glob || rsrc[0].ov || rsrc[1].ov || rsrc[2].ov
+                        ? "explicit" : "legacy-alias");
+        }
         /* memgov D1a-1: declare every served mmap as a model source BEFORE
          * its first weight-class allocation (the artifact build below is
          * the earliest) -- the backend attributes each WEIGHT_* census
@@ -39368,11 +39416,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          * the weight-server manifest model_id vocabulary. */
         (void)ds4_gpu_model_source_bind(e->model.map, e->model.size,
                                         DS4_MSRC_ROLE_PRIMARY, e->model.fd,
-                                        "base", opt->model_path);
+                                        res_pol[0], "base", opt->model_path);
         if (e->mtp_ready) {
             (void)ds4_gpu_model_source_bind(e->mtp_model.map, e->mtp_model.size,
                                             DS4_MSRC_ROLE_AUXILIARY,
-                                            e->mtp_model.fd,
+                                            e->mtp_model.fd, res_pol[1],
                                             "mtp", opt->mtp_path);
         }
         if (e->dspark_ready) {
@@ -39381,7 +39429,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             (void)ds4_gpu_model_source_bind(e->dspark_model.map,
                                             e->dspark_model.size,
                                             DS4_MSRC_ROLE_DRAFTER,
-                                            e->dspark_model.fd,
+                                            e->dspark_model.fd, res_pol[2],
                                             "drafter", dspark_prov);
         }
         /* memgov D1a-2: one semantic-catalog line per source — the D1a
@@ -39650,7 +39698,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 up.merge_gap = 65536;
                 up.max_unit_bytes = accelerator_cuda_preload_span_bytes();
                 up.vmm_granularity = 256;   /* the weight-arena bump align */
-                up.hbm_cache_on = getenv("DS4_CUDA_NO_HBM_CACHE") == NULL;
+                /* memgov D3-2: the stamp input is the RESOLVED per-source
+                 * policy (uts[] order == res_pol[] order); the env was
+                 * read exactly once, at the resolver above. */
+                up.device_promote =
+                    res_pol[si] != DS4_RESIDENCY_HOST_MAPPED;
                 up.replaces_complete =
                     ds4_gpu_model_map_replaces_complete(mm->map) != 0;
                 const int nu = ds4_units_compile(tin, n, &up, units);

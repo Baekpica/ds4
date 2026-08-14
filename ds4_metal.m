@@ -4532,10 +4532,10 @@ uint32_t ds4_gpu_trim_inject_fired(void) { return 0; }
  * makes no residency claims it cannot measure). */
 static ds4_model_source_table g_metal_model_srcs;
 int ds4_gpu_model_source_bind(const void *map_base, uint64_t map_len,
-                              int role, int fd,
+                              int role, int fd, int residency,
                               const char *name, const char *path) {
     return ds4_model_source_bind(&g_metal_model_srcs, map_base, map_len,
-                                 role, fd, name, path, NULL);
+                                 role, fd, residency, name, path, NULL);
 }
 int ds4_gpu_model_source_count(void) { return g_metal_model_srcs.count; }
 int ds4_gpu_model_source_info(int idx, ds4_model_source *out) {

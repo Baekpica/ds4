@@ -26813,22 +26813,33 @@ static void test_mem_src_table_bind_find(void) {
     memset(&t, 0, sizeof t);
 
     /* Bad descriptors fault and refuse. */
-    TEST_ASSERT(ds4_model_source_bind(&t, NULL, 10, 0, -1, "x", "p", &faults) == -1);
-    TEST_ASSERT(ds4_model_source_bind(&t, base_map, 0, 0, -1, "x", "p", &faults) == -1);
+    TEST_ASSERT(ds4_model_source_bind(&t, NULL, 10, 0, -1,
+                                      DS4_RESIDENCY_EAGER_DEVICE,
+                                      "x", "p", &faults) == -1);
+    TEST_ASSERT(ds4_model_source_bind(&t, base_map, 0, 0, -1,
+                                      DS4_RESIDENCY_EAGER_DEVICE,
+                                      "x", "p", &faults) == -1);
     TEST_ASSERT(faults == 2 && t.count == 0);
 
     const int b = ds4_model_source_bind(&t, base_map, base_len,
                                         DS4_MSRC_ROLE_PRIMARY, 7,
+                                        DS4_RESIDENCY_EAGER_DEVICE,
                                         "base", "/models/base.gguf", &faults);
     const int m = ds4_model_source_bind(&t, mtp_map, mtp_len,
                                         DS4_MSRC_ROLE_AUXILIARY, 8,
+                                        DS4_RESIDENCY_LAZY_COPY_DEVICE,
                                         "mtp", "/models/mtp.gguf", &faults);
     const int d = ds4_model_source_bind(&t, drafter_map, drafter_len,
                                         DS4_MSRC_ROLE_DRAFTER, 9,
+                                        DS4_RESIDENCY_HOST_MAPPED,
                                         "drafter", NULL, &faults);
     TEST_ASSERT(b == 0 && m == 1 && d == 2 && t.count == 3 && faults == 2);
     TEST_ASSERT(t.v[b].fd == 7 && t.v[d].path[0] == '\0');
     TEST_ASSERT(strcmp(t.v[m].name, "mtp") == 0);
+    /* memgov D3-2: the handle carries the resolved residency. */
+    TEST_ASSERT(t.v[b].residency == DS4_RESIDENCY_EAGER_DEVICE &&
+                t.v[m].residency == DS4_RESIDENCY_LAZY_COPY_DEVICE &&
+                t.v[d].residency == DS4_RESIDENCY_HOST_MAPPED);
 
     /* Resolution: base equality, interior containment, one-past-end and
      * unrelated pointers miss. */
@@ -26843,8 +26854,10 @@ static void test_mem_src_table_bind_find(void) {
     /* Rebind refreshes in place: the handle (= ledger row key) is stable. */
     TEST_ASSERT(ds4_model_source_bind(&t, mtp_map, mtp_len,
                                       DS4_MSRC_ROLE_AUXILIARY, 12,
+                                      DS4_RESIDENCY_EAGER_DEVICE,
                                       "mtp", "/models/mtp-v2.gguf", &faults) == m);
     TEST_ASSERT(t.count == 3 && t.v[m].fd == 12);
+    TEST_ASSERT(t.v[m].residency == DS4_RESIDENCY_EAGER_DEVICE);
     TEST_ASSERT(strcmp(t.v[m].path, "/models/mtp-v2.gguf") == 0);
 
     /* Overflow faults and refuses; the table keeps its bound entries.
@@ -26852,6 +26865,7 @@ static void test_mem_src_table_bind_find(void) {
     int accepted = 0;
     for (int i = 0; i < DS4_MSRC_MAX; i++)
         if (ds4_model_source_bind(&t, backing + 12288 + 16 * i, 8, 0, -1,
+                                  DS4_RESIDENCY_EAGER_DEVICE,
                                   "extra", NULL, &faults) >= 0)
             accepted++;
     TEST_ASSERT(t.count == DS4_MSRC_MAX);
@@ -26940,13 +26954,71 @@ static void test_model_catalog_classify(void) {
  * Every invariant the boot build reconciles is pinned here on synthetic
  * layouts: exact coverage, no overlap/split, policy homogeneity,
  * merge/cap rules, rounding exactness, slice exclusion, import rules. */
+/* memgov D3-2: the residency resolver's full truth table.  The resolver
+ * is pure -- no env reads -- so every legacy alias shape and every strict
+ * conflict is pinned here exactly as the engine-open block feeds it. */
+static void test_residency_resolver(void) {
+    const char *why = NULL;
+    ds4_residency_inputs in;
+
+    /* Legacy alias table: the historical shapes keep their meaning. */
+    memset(&in, 0, sizeof in);
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_EAGER_DEVICE);
+    in.legacy_no_hbm = 1;
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_LAZY_COPY_DEVICE);
+    in.legacy_no_fd = 1;
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_HOST_MAPPED);
+    memset(&in, 0, sizeof in);
+    in.legacy_no_fd = 1;                 /* mechanism-only lever: EAGER */
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_EAGER_DEVICE);
+    memset(&in, 0, sizeof in);
+    in.legacy_direct = 1;                /* raw-direct: terminal mapped */
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_HOST_MAPPED);
+    in.legacy_no_hbm = 1;                /* legacy-only mixes stay legal */
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_HOST_MAPPED);
+
+    /* Explicit knob owns the decision. */
+    memset(&in, 0, sizeof in);
+    in.explicit_val = "eager";
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_EAGER_DEVICE);
+    in.explicit_val = "lazy";
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_LAZY_COPY_DEVICE);
+    in.explicit_val = "mapped";
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_HOST_MAPPED);
+
+    /* Strict conflicts: explicit + ANY legacy lever refuses with a
+     * reason; unknown values refuse; empty string = unset. */
+    in.explicit_val = "mapped"; in.legacy_no_hbm = 1;
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == -1 && why != NULL);
+    memset(&in, 0, sizeof in);
+    in.explicit_val = "eager"; in.legacy_direct = 1; why = NULL;
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == -1 && why != NULL);
+    memset(&in, 0, sizeof in);
+    in.explicit_val = "lazy"; in.legacy_no_fd = 1; why = NULL;
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == -1 && why != NULL);
+    memset(&in, 0, sizeof in);
+    in.explicit_val = "device"; why = NULL;   /* unknown vocabulary */
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == -1 && why != NULL);
+    memset(&in, 0, sizeof in);
+    in.explicit_val = "";                     /* empty = unset -> alias */
+    in.legacy_no_hbm = 1;
+    TEST_ASSERT(ds4_residency_resolve(&in, &why) == DS4_RESIDENCY_LAZY_COPY_DEVICE);
+    TEST_ASSERT(ds4_residency_resolve(NULL, &why) == -1);
+
+    /* Names are total (publication-shape discipline). */
+    TEST_ASSERT(strcmp(ds4_residency_name(DS4_RESIDENCY_EAGER_DEVICE), "eager") == 0);
+    TEST_ASSERT(strcmp(ds4_residency_name(DS4_RESIDENCY_LAZY_COPY_DEVICE), "lazy") == 0);
+    TEST_ASSERT(strcmp(ds4_residency_name(DS4_RESIDENCY_HOST_MAPPED), "mapped") == 0);
+    TEST_ASSERT(strcmp(ds4_residency_name(99), "unknown") == 0);
+}
+
 static void test_unit_compiler_properties(void) {
     ds4_unit_compile_params p;
     memset(&p, 0, sizeof p);
     p.merge_gap = 64;
     p.max_unit_bytes = 4096;
     p.vmm_granularity = 256;
-    p.hbm_cache_on = 1;
+    p.device_promote = 1;
     p.replaces_complete = 0;
 
     /* Merge within gap + policy split + coverage/verify green. */
@@ -27024,10 +27096,10 @@ static void test_unit_compiler_properties(void) {
         TEST_ASSERT(ds4_units_verify(ts, 2, &pr, u, nu) == 0);
     }
 
-    /* hbm off: hot tensors plan HOST_MAPPED with no allocator. */
+    /* mapped residency: hot tensors plan HOST_MAPPED with no allocator. */
     {
         ds4_unit_compile_params ph = p;
-        ph.hbm_cache_on = 0;
+        ph.device_promote = 0;
         const ds4_unit_tensor_in ts[] = {{0, 100, 0, 1}};
         ds4_phys_unit u[1];
         TEST_ASSERT(ds4_units_compile(ts, 1, &ph, u) == 1);
@@ -27290,6 +27362,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_gov_order_independence();
     /* memgov D1a-1: model-source table resolution. */
     test_mem_src_table_bind_find();
+    /* memgov D3-2: per-source residency resolver truth table. */
+    test_residency_resolver();
     /* memgov D1a-2: semantic tensor classifier + tripwire relation. */
     test_model_catalog_classify();
     /* memgov D1a-3: unit-compiler properties. */
