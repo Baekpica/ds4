@@ -1,7 +1,7 @@
 # Motif-3 DGX Spark 최적화 작업 handoff
 
-기준 시각: **2026-08-14 16:57 KST** (재개 세션 진행 내역은 §0에 누적;
-후속 재개 결과는 §0.24까지 반영)
+기준 시각: **2026-08-14 17:00 KST** (재개 세션 진행 내역은 §0에 누적;
+후속 재개 결과는 §0.25까지 반영)
 
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
@@ -358,6 +358,23 @@ Spark 256K 통과 주장은 아직 금지다.**
     - tag 생성 후 `ds4_server.o`를 재빌드해
       `./ds4-server --version` = `ds4-server v0.5.6.3-dfm`을 확인했다.
 
+25. **HF collection card publish 전 문서 gate** —
+    - `hf collections info` 기준 collection
+      `Baekpica/ds4-mixed-quant-for-spark-6a79321cc8a55c35231d3ed3`의 model은
+      Motif-3, Solar Open2 250B, K-EXAONE 236B A23B 세 개다.
+    - 각 README의 소개/요약 직후에 동일한 영어 `## ds4-dfm`
+      section을 추가했다. 한국어는
+      `DFM (독자 파운데이션 모델, 독파모)` 풀이에만 사용했다.
+    - section은 one Spark/128 GB unified memory, 명시적 C/CUDA family
+      kernel, 공통 `ds4-server`/4 API surface, 고정 engine tag link를
+      설명한다. 성능·context·quality는 각 card의 기존 검증 범위를
+      넘지 않는다고 명시했다.
+    - upload 대상은 README 3개뿐이며 새 local SHA-256은
+      K-EXAONE `f41ccf78d866b35924964666bee0898234abb620a97d3e252f388ce6f96a15a1`,
+      Motif-3 `0885d9c62ea6daa28629bfc31a6834fe6588f8b86fbee9b71a9c5e371d5b0b5a`,
+      Solar `19565fe9d7b03d063a40f304bfc340089c213a2ee66bc344328cf12f0e4776ff`다.
+      GGUF/asset/manifest는 갱신하지 않는다.
+
 남은 경계(사실로 기록):
 - 엔진 **static batch core**(`ds4_batch_generate_core`)는 여전히 per-seq
   eos 단일 비교 — 순수 코어에 vocab 접근이 없어 보류. 서버측 detok 절단이
@@ -431,7 +448,7 @@ Spark에서 정확히 262,144-token prefill을 완료하고 실제 decode token�
 
 ## 4. 현재 호스트와 메모리 상태
 
-| 항목 | 2026-08-14 16:57 KST 현재 값 |
+| 항목 | 2026-08-14 17:00 KST 현재 값 |
 |---|---|
 | Host | `thinkstationpgx-8abc` |
 | Kernel | `6.17.0-1029-nvidia` |
