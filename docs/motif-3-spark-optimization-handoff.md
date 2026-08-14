@@ -1,7 +1,7 @@
 # Motif-3 DGX Spark 최적화 작업 handoff
 
-기준 시각: **2026-08-14 17:00 KST** (재개 세션 진행 내역은 §0에 누적;
-후속 재개 결과는 §0.25까지 반영)
+기준 시각: **2026-08-14 17:02 KST** (재개 세션 진행 내역은 §0에 누적;
+후속 재개 결과는 §0.26까지 반영)
 
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
@@ -11,9 +11,9 @@ weight-owner의 기본 IQ2/Q2K aligned artifact를 384-expert 전용 경로에�
 소비하도록 수정해 illegal access를 해소했고 실제 prefill/decode를 완료했다.
 현재 대형 프로세스는 모두 종료했으며 `clear_cache` 후 119 GiB available을
 확인했다. 최종 source/test/doc review와 CPU/CUDA 회귀를 완료했고
-`v0.5.6.3-dfm` Git publish도 완료했다. 다음 단계는
-HF collection card 갱신,
-이후 nsys→ncu 기반 Motif 최적화와 strict 256K다.
+`v0.5.6.3-dfm` Git publish와 HF collection card 갱신도 완료했다.
+다음 단계는 private handoff checkpoint, 이후 nsys→ncu 기반
+Motif 최적화와 strict 256K다.
 Spark 256K 통과 주장은 아직 금지다.**
 
 ## 0. 재개 세션 진행 내역 (2026-08-14, §9 순서 수행)
@@ -375,6 +375,18 @@ Spark 256K 통과 주장은 아직 금지다.**
       Solar `19565fe9d7b03d063a40f304bfc340089c213a2ee66bc344328cf12f0e4776ff`다.
       GGUF/asset/manifest는 갱신하지 않는다.
 
+26. **HF collection card publish/재검증 완료** —
+    - README 단일 파일만 각 model repo에 upload했다: Motif-3
+      `843b57ab6da24ac2583118e10e633929617d535e`, Solar
+      `75ecb81efd9f6e6f60f8aff39926b5788d318122`, K-EXAONE
+      `af82aa9c9cd5af593e07435abfa13b0cf2cc71f6`.
+    - 각 반환 commit을 `--revision` 으로 지정해 README를 새 디렉터리에
+      재다운로드했고, `cmp`와 SHA-256이 §0.25의 local 작성본과
+      세 파일 모두 byte-identical이었다.
+    - remote section 위치는 Motif/Solar line 52, K-EXAONE line 45의
+      `## ds4-dfm`이다. Motif의 `94.16 GB (87.70 GiB)` 소개와
+      one-Spark 256K 미통과 표기는 그대로 보존했다.
+
 남은 경계(사실로 기록):
 - 엔진 **static batch core**(`ds4_batch_generate_core`)는 여전히 per-seq
   eos 단일 비교 — 순수 코어에 vocab 접근이 없어 보류. 서버측 detok 절단이
@@ -448,7 +460,7 @@ Spark에서 정확히 262,144-token prefill을 완료하고 실제 decode token�
 
 ## 4. 현재 호스트와 메모리 상태
 
-| 항목 | 2026-08-14 17:00 KST 현재 값 |
+| 항목 | 2026-08-14 17:02 KST 현재 값 |
 |---|---|
 | Host | `thinkstationpgx-8abc` |
 | Kernel | `6.17.0-1029-nvidia` |
@@ -849,7 +861,6 @@ Git과 HF 어느 쪽도 문서보다 먼저 갱신하지 않는다. model card�
 
 ## 17. 현재까지도 하지 않은 일
 
-- collection 전체 Hugging Face model-card 갱신
 - HF private handoff의 이번 재개 로그/문서 checkpoint
 - nsys/ncu profile
 - 32K 이상 Spark 실행
@@ -857,6 +868,6 @@ Git과 HF 어느 쪽도 문서보다 먼저 갱신하지 않는다. model card�
 
 완료된 항목은 VMM owner dry-run/live, raw/aligned Motif worker, 네 family
 공통-command 실제 API gate, 매 전환의 `clear_cache`, publish 전
-source/test/doc review, Git branch/tag publish다. 다음 단계는 영어
-model-card 갱신이다. 그 뒤 Motif
+source/test/doc review, Git branch/tag publish, 영어 model-card 갱신이다.
+다음은 private HF handoff에 이 재개 문서 checkpoint를 보존한 뒤 Motif
 owner를 다시 올려 §12의 nsys medium-prefill부터 재개한다.
