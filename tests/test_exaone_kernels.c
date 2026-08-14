@@ -28,16 +28,40 @@ static void test_context_memory_plan(void) {
     const int ok =
         m.prefill_cap == 512u &&
         m.raw_cap == 262144u &&
-        m.raw_bytes == UINT64_C(12903776256) &&
+        exaone_graph_layer_kv_cap(0u, 262144u, m.prefill_cap) == 640u &&
+        exaone_graph_layer_kv_cap(3u, 262144u, m.prefill_cap) == 262144u &&
+        m.raw_bytes == UINT64_C(12979273728) &&
         m.compressed_bytes == 0u &&
         m.scratch_bytes == UINT64_C(429564480) &&
-        m.total_bytes == UINT64_C(13333340736);
+        m.total_bytes == UINT64_C(13408838208);
     if (!ok) g_fail++;
     printf("%-38s KV=%.2f GiB scratch=%.2f GiB total=%.2f GiB  %s\n",
            "262144-context memory plan",
            (double)m.raw_bytes / 1073741824.0,
            (double)m.scratch_bytes / 1073741824.0,
            (double)m.total_bytes / 1073741824.0,
+           ok ? "ok" : "FAIL");
+}
+
+static void test_exaone_rewind_span(void) {
+    ds4_engine engine = {0};
+    ds4_session session = {0};
+    session.engine = &engine;
+    session.exaone_graph_ready = true;
+    session.exaone_graph.ctx_size = 262144u;
+    session.exaone_graph.layer_kv[0] =
+        (ds4_gpu_tensor *)(uintptr_t)1u;
+    session.exaone_graph.layer_kv_cap[0] = 640u;
+    session.checkpoint_valid = true;
+
+    session.checkpoint.len = 500;
+    const int short_span = ds4_session_exaone_rewind_span(&session);
+    session.checkpoint.len = 1000;
+    const int wrapped_span = ds4_session_exaone_rewind_span(&session);
+    const int ok = short_span == 500 && wrapped_span == 513;
+    if (!ok) g_fail++;
+    printf("%-38s short=%d wrapped=%d  %s\n",
+           "diverged-prefix rewind span", short_span, wrapped_span,
            ok ? "ok" : "FAIL");
 }
 
@@ -350,6 +374,145 @@ static void test_attention_prefill(int sliding) {
     free(v); free(k); free(q); free(kv);
 }
 
+/* A chunk stores all of its K/V rows before attention consumes any row.  A
+ * sliding ring must therefore hold the logical window plus the whole chunk.
+ * Compare that path with the one-token-at-a-time oracle, which never loses a
+ * still-visible window. */
+static uint32_t prefill_vs_incremental_bad_rows(uint32_t kv_cap,
+                                                uint32_t n_tok,
+                                                uint32_t window) {
+    const uint32_t kv_dim = T_HEAD_KV * T_HEAD_DIM;
+    const size_t row = (size_t)T_HEAD * T_HEAD_DIM;
+    const size_t qn = (size_t)n_tok * row;
+    const size_t kvn = (size_t)n_tok * kv_dim;
+
+    uint64_t s = 90210;
+    float *q = xmalloc(qn * sizeof(float));
+    float *k = xmalloc(kvn * sizeof(float));
+    float *v = xmalloc(kvn * sizeof(float));
+    for (size_t i = 0; i < qn; i++) q[i] = frand(&s);
+    for (size_t i = 0; i < kvn; i++) {
+        k[i] = frand(&s) * 0.5f;
+        v[i] = frand(&s) * 0.5f;
+    }
+
+    ds4_gpu_tensor *gq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * sizeof(float));
+    ds4_gpu_tensor *gv = ds4_gpu_tensor_alloc(kvn * sizeof(float));
+    ds4_gpu_tensor_write(gq, 0, q, qn * sizeof(float));
+    ds4_gpu_tensor_write(gk, 0, k, kvn * sizeof(float));
+    ds4_gpu_tensor_write(gv, 0, v, kvn * sizeof(float));
+
+    const size_t ring_floats = (size_t)kv_cap * kv_dim;
+    ds4_gpu_tensor *ring_chunk =
+        ds4_gpu_tensor_alloc(ring_floats * 2u * sizeof(uint16_t));
+    ds4_gpu_tensor *ring_incr =
+        ds4_gpu_tensor_alloc(ring_floats * 2u * sizeof(uint16_t));
+    ds4_gpu_tensor *out_chunk = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *out_incr = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor_fill_f32(ring_chunk, 0.0f, ring_floats);
+    ds4_gpu_tensor_fill_f32(ring_incr, 0.0f, ring_floats);
+
+    uint32_t bad = UINT32_MAX;
+    if (!ds4_gpu_exaone_kv_store_tensor(
+            ring_chunk, gk, gv, kv_dim, n_tok, 0, kv_cap) ||
+        !ds4_gpu_exaone_attention_prefill_tensor(
+            out_chunk, gq, ring_chunk, n_tok, 0,
+            T_HEAD, T_HEAD_KV, T_HEAD_DIM, kv_cap, window)) {
+        printf("chunked prefill launch failed\n");
+        goto done;
+    }
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        ds4_gpu_tensor *kr = ds4_gpu_tensor_view(
+            gk, (uint64_t)t * kv_dim * sizeof(float),
+            kv_dim * sizeof(float));
+        ds4_gpu_tensor *vr = ds4_gpu_tensor_view(
+            gv, (uint64_t)t * kv_dim * sizeof(float),
+            kv_dim * sizeof(float));
+        ds4_gpu_tensor *qr = ds4_gpu_tensor_view(
+            gq, (uint64_t)t * row * sizeof(float), row * sizeof(float));
+        ds4_gpu_tensor *orow = ds4_gpu_tensor_view(
+            out_incr, (uint64_t)t * row * sizeof(float),
+            row * sizeof(float));
+        const int ok = kr && vr && qr && orow &&
+            ds4_gpu_exaone_kv_store_tensor(
+                ring_incr, kr, vr, kv_dim, 1u, t, kv_cap) &&
+            ds4_gpu_exaone_attention_decode_tensor(
+                orow, qr, ring_incr, T_HEAD, T_HEAD_KV, T_HEAD_DIM,
+                kv_cap, t, window);
+        ds4_gpu_tensor_free(kr);
+        ds4_gpu_tensor_free(vr);
+        ds4_gpu_tensor_free(qr);
+        ds4_gpu_tensor_free(orow);
+        if (!ok) {
+            printf("incremental prefill launch failed at %u\n", t);
+            goto done;
+        }
+    }
+
+    {
+        float *a = xmalloc(qn * sizeof(float));
+        float *b = xmalloc(qn * sizeof(float));
+        ds4_gpu_tensor_read(out_chunk, 0, a, qn * sizeof(float));
+        ds4_gpu_tensor_read(out_incr, 0, b, qn * sizeof(float));
+        bad = 0u;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            double worst = 0.0;
+            for (size_t i = 0; i < row; i++) {
+                const double d =
+                    fabs((double)a[(size_t)t * row + i] -
+                         (double)b[(size_t)t * row + i]);
+                if (d > worst) worst = d;
+            }
+            if (worst > 2e-5) bad++;
+        }
+        free(a);
+        free(b);
+    }
+
+done:
+    ds4_gpu_tensor_free(out_incr);
+    ds4_gpu_tensor_free(out_chunk);
+    ds4_gpu_tensor_free(ring_incr);
+    ds4_gpu_tensor_free(ring_chunk);
+    ds4_gpu_tensor_free(gv);
+    ds4_gpu_tensor_free(gk);
+    ds4_gpu_tensor_free(gq);
+    free(v);
+    free(k);
+    free(q);
+    return bad;
+}
+
+static uint32_t expected_bad_rows(uint32_t cap, uint32_t n_tok,
+                                  uint32_t window) {
+    const uint32_t resident_from = n_tok > cap ? n_tok - cap : 0u;
+    if (resident_from == 0u) return 0u;
+    const uint32_t first_good = resident_from + window - 1u;
+    return first_good < n_tok ? first_good : n_tok;
+}
+
+static void test_prefill_chunk_residency(void) {
+    const uint32_t n_tok = 200u;
+    const uint32_t window = 128u;
+    const uint32_t tight =
+        prefill_vs_incremental_bad_rows(window, n_tok, window);
+    const uint32_t sized =
+        prefill_vs_incremental_bad_rows(window + n_tok, n_tok, window);
+
+    printf("%-38s bad_rows=%u expected=%u  %s\n",
+           "sliding ring == window (undersized)", tight,
+           expected_bad_rows(window, n_tok, window),
+           tight == expected_bad_rows(window, n_tok, window) ? "ok" : "FAIL");
+    if (tight != expected_bad_rows(window, n_tok, window)) g_fail++;
+
+    printf("%-38s bad_rows=%u  %s\n",
+           "sliding ring == window + chunk", sized,
+           sized == 0u ? "ok" : "FAIL");
+    if (sized != 0u) g_fail++;
+}
+
 static void test_router(void *map, uint64_t map_size, uint64_t bias_off) {
     const uint32_t n_tok = 4;
     uint64_t s = 7;
@@ -514,6 +677,7 @@ static void test_moe_matmul(const ds4_model *m, const ds4_weights *wts) {
 
 int main(int argc, char **argv) {
     test_context_memory_plan();
+    test_exaone_rewind_span();
     if (!ds4_gpu_init()) { fprintf(stderr, "ds4_gpu_init failed\n"); return 1; }
 
     /* Synthetic "model map": a QK-norm weight vector followed by a router
@@ -545,6 +709,7 @@ int main(int argc, char **argv) {
     test_attention(0);
     test_attention_prefill(1);
     test_attention_prefill(0);
+    test_prefill_chunk_residency();
     test_router(map, map_size, bias_off);
     test_swiglu_and_combine();
 

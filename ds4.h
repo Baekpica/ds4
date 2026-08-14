@@ -745,6 +745,9 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+/* Largest live_pos-resume_pos span whose sliding-window KV is still resident.
+ * Returns 0 for non-EXAONE or unavailable graph sessions. */
+int ds4_session_exaone_rewind_span(ds4_session *s);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,

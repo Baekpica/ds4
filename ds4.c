@@ -26494,12 +26494,14 @@ static ds4_context_memory solar_graph_context_memory_estimate(
 
 static uint32_t exaone_graph_prefill_cap_for_context(uint32_t ctx_size,
                                                       uint32_t requested);
+static uint32_t exaone_graph_layer_kv_cap(uint32_t il, uint32_t ctx_size,
+                                          uint32_t prefill_cap);
 
 /* Exact K-EXAONE single-session projection.  Twelve LLLG global layers own
- * full BF16 K/V, while the other 36 layers own a fixed 128-token ring.  The
- * scratch expression mirrors every decode and P-row allocation in
- * exaone_graph_alloc; keep the two adjacent in review even though the graph
- * implementation lives below the Motif diagnostic executor. */
+ * full BF16 K/V, while the other 36 layers own the 128-token window plus one
+ * prefill chunk.  The scratch expression mirrors every decode and P-row
+ * allocation in exaone_graph_alloc; keep the two adjacent in review even
+ * though the implementation lives below the Motif diagnostic executor. */
 static ds4_context_memory exaone_graph_context_memory_estimate(
         uint32_t ctx, uint32_t requested_prefill) {
     ds4_context_memory m = {0};
@@ -26522,7 +26524,7 @@ static ds4_context_memory exaone_graph_context_memory_estimate(
     m.prefill_cap = P;
     m.raw_cap = ctx;
     for (uint32_t il = 0; il < n_exec; il++) {
-        const uint32_t cap = exaone_layer_is_sliding(il) ? DS4_N_SWA : ctx;
+        const uint32_t cap = exaone_graph_layer_kv_cap(il, ctx, P);
         m.raw_bytes += (uint64_t)cap * kv_row_bytes;
     }
 
@@ -34078,8 +34080,16 @@ static bool exaone_graph_layer_is_sliding(uint32_t il) {
     return exaone_layer_is_sliding(il);
 }
 
-static uint32_t exaone_graph_layer_kv_cap(uint32_t il, uint32_t ctx_size) {
-    return exaone_graph_layer_is_sliding(il) ? DS4_N_SWA : ctx_size;
+/* A prefill chunk stores all K/V rows before any row attends.  A sliding ring
+ * therefore has to retain the preceding logical window in addition to the
+ * current chunk; a window-only ring lets later rows overwrite nearly every
+ * earlier row in that same forward. */
+static uint32_t exaone_graph_layer_kv_cap(uint32_t il, uint32_t ctx_size,
+                                          uint32_t prefill_cap) {
+    if (!exaone_graph_layer_is_sliding(il)) return ctx_size;
+    uint64_t cap = (uint64_t)DS4_N_SWA + prefill_cap;
+    if (cap > ctx_size) cap = ctx_size;
+    return (uint32_t)cap;
 }
 
 static uint32_t exaone_graph_prefill_cap_for_context(uint32_t ctx_size,
@@ -34206,7 +34216,8 @@ static bool exaone_graph_alloc(ds4_exaone_gpu_graph *g,
     uint64_t kv_bytes = 0;
     for (uint32_t il = 0; il < n_exec; il++) {
         if (!weights->layer[il].attn_q) continue;
-        const uint32_t cap = exaone_graph_layer_kv_cap(il, ctx_size);
+        const uint32_t cap =
+            exaone_graph_layer_kv_cap(il, ctx_size, g->prefill_cap);
         const uint64_t bytes = (uint64_t)cap * g->kv_dim * 2u * sizeof(uint16_t);
         g->layer_kv[il] = ds4_gpu_tensor_alloc(bytes);
         if (!g->layer_kv[il]) {
@@ -49995,18 +50006,21 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return 1;
         }
 
-        /* Prefix reuse. The KV caches already hold every position of the
-         * common prefix, so only the tail needs computing. The sliding
-         * layers' rings are valid for the last DS4_N_SWA positions of what
-         * was written, which is exactly what their attention will read. */
+        /* Reuse an extending prefix, or a diverged prefix whose preceding
+         * sliding window is still resident in the widened ring. Client-side
+         * replay can retokenize the latest assistant turn, so exact extension
+         * alone would turn a small tail rewrite into a full cold prefill. */
         int start = 0;
-        if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
-            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
-            start = s->checkpoint.len;
-            if (start == prompt->len) start = prompt->len - 1;
-        } else {
-            s->checkpoint.len = 0;
+        if (s->checkpoint_valid) {
+            const int live = s->checkpoint.len;
+            const int common = ds4_session_common_prefix(s, prompt);
+            const int span = ds4_session_exaone_rewind_span(s);
+            start = common;
+            if (start > 0 && start == prompt->len) start = prompt->len - 1;
+            if (live - start > span) start = 0;
+            if (common < live) s->generation++;
         }
+        s->checkpoint.len = start;
         s->mtp_draft_valid = false;
 
         for (int done = start; done < prompt->len; ) {
@@ -50267,6 +50281,31 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     int i = 0;
     while (i < n && s->checkpoint.v[i] == prompt->v[i]) i++;
     return i;
+}
+
+int ds4_session_exaone_rewind_span(ds4_session *s) {
+#ifdef DS4_NO_GPU
+    (void)s;
+    return 0;
+#else
+    if (!s || !ds4_session_is_exaone(s) || !s->exaone_graph_ready) return 0;
+    const ds4_exaone_gpu_graph *g = &s->exaone_graph;
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    uint32_t narrowest = 0u;
+    bool bounded = false;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        if (!g->layer_kv[il] || !exaone_graph_layer_is_sliding(il)) continue;
+        if (!bounded || g->layer_kv_cap[il] < narrowest) {
+            narrowest = g->layer_kv_cap[il];
+            bounded = true;
+        }
+    }
+    if (!bounded) return (int)g->ctx_size;
+    const int live = s->checkpoint_valid ? s->checkpoint.len : 0;
+    if ((uint32_t)live <= narrowest) return live;
+    if (narrowest <= DS4_N_SWA) return 0;
+    return (int)(narrowest - DS4_N_SWA + 1u);
+#endif
 }
 
 int ds4_session_argmax(ds4_session *s) {
