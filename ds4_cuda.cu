@@ -912,7 +912,29 @@ extern "C" int ds4_gov_governed_check(const char *site,
                                       const ds4_gov_claim *cl,
                                       int legacy_status);
 extern "C" void ds4_gov_fault_tick(void);
-extern "C" void ds4_gpu_model_plan_freeze(void) { g_model_plan_frozen = 1; }
+extern "C" void ds4_gpu_model_plan_freeze(void) {
+    g_model_plan_frozen = 1;
+    /* memgov D3-4 census assert: at the freeze point a HOST_MAPPED
+     * source holds ZERO device bytes in the promotion classes (arena +
+     * span) -- the cells the rent-gate M legs pinned through serving.
+     * Derived artifacts are exempt by design: self-load artifacts ARE
+     * the mapped serving shape (WEIGHT_DERIVED, separate class).  A
+     * violation is the same fault family as the funnel tripwire. */
+    for (int s = 0; s < DS4_MSRC_MAX; s++) {
+        if (!g_model_srcs.v[s].map_base) continue;
+        if (g_model_srcs.v[s].residency != DS4_RESIDENCY_HOST_MAPPED) continue;
+        const uint64_t arena = ds4_mem_cell_live(
+            &g_mem_src_census[s][DS4_MEMC_WEIGHT_ARENA][DS4_MEMD_UNIFIED_DEVICE]);
+        const uint64_t span = ds4_mem_cell_live(
+            &g_mem_src_census[s][DS4_MEMC_WEIGHT_SPAN][DS4_MEMD_UNIFIED_DEVICE]);
+        if (arena == 0 && span == 0) continue;
+        fprintf(stderr,
+                "ds4: memgov mapped census violation at freeze "
+                "(src=%d arena=%llu span=%llu) -- mapped policy bypassed\n",
+                s, (unsigned long long)arena, (unsigned long long)span);
+        ds4_gov_fault_tick();
+    }
+}
 
 static int cuda_range_publish_refuse(const char *what, const void *map,
                                      uint64_t off, uint64_t bytes,
@@ -965,6 +987,33 @@ static int cuda_model_range_publish(const cuda_model_range &nr) {
     cuda_model_range &pr = g_model_ranges.back();
     cuda_range_stamp(pr.host_base, pr.offset, pr.bytes,
                      &pr.src, &pr.unit_lo, &pr.unit_hi);
+    /* memgov D3-4 mapped tripwire (sibling of the post-freeze tripwire
+     * above): device-backed bytes covering a unit whose policy is
+     * terminal HOST_MAPPED means some path promoted what the plan says
+     * stays mapped.  Loud + counted, never a refusal -- the census
+     * stays physical truth.  Healthy boots cannot fire it (the lazy
+     * tier is policy-fenced, the ATS tier serves the coherent map), so
+     * a firing marks a rogue promotion path or a DEGRADED boot's
+     * last-resort cold copy (registration failure) -- both worth a
+     * fault.  Imports keep their own authority (rider #48). */
+    if (!pr.host_registered && !pr.imported_ipc && !pr.imported_vmm &&
+        pr.src >= 0 && pr.src < DS4_MSRC_MAX && pr.unit_lo >= 0) {
+        const ds4_phys_unit *units = g_model_units_v[pr.src];
+        for (int ui = pr.unit_lo; units && ui <= pr.unit_hi; ui++) {
+            if (units[ui].policy != DS4_UPOL_HOST_MAPPED) continue;
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr,
+                        "ds4: memgov DEVICE bytes over a HOST_MAPPED unit "
+                        "(map=%p off=%llu bytes=%llu unit=%d) -- mapped policy bypassed\n",
+                        pr.host_base, (unsigned long long)pr.offset,
+                        (unsigned long long)pr.bytes, ui);
+            }
+            ds4_gov_fault_tick();
+            break;
+        }
+    }
     cuda_range_index_note(pr.host_base, pr.offset, g_model_ranges.size() - 1u);
     return 1;
 }
@@ -3338,6 +3387,9 @@ enum {
                                         first touch by SCHEDULE (vs the
                                         budget's unfunded, which is a
                                         REFUSAL of the same deferral) */
+    CUDA_MAT_EXPERT_COLD_BY_POLICY,  /* D3-4: fd-tier touch on a unit the
+                                        catalog stamps EXPERT_COLD — cold
+                                        by POLICY, never device-promoted */
     CUDA_MAT_WAIVED_OPTIONAL,
     CUDA_MAT_FAILED,
     CUDA_MAT__COUNT
@@ -3429,6 +3481,19 @@ static const char *cuda_model_range_ptr_from_fd(
         if (u->policy == DS4_UPOL_HOST_MAPPED) {
             g_materialize_outcomes[CUDA_MAT_HOST_MAPPED_BY_POLICY]++;
             return NULL;
+        }
+        /* memgov D3-4 adjudication: EXPERT_COLD stays cold by POLICY,
+         * not by budget accident.  Historically this loop device-
+         * promoted raw experts on first touch until the 24 GiB budget
+         * exhausted, THEN degraded -- an unplanned multi-GiB device
+         * charge that only ever ran on already-degraded boots (the
+         * shape needs NO_DERIVED_WEIGHTS + a failed/absent whole-map
+         * registration; every healthy shape serves experts through
+         * artifacts or a blanket tier first).  The exit below is the
+         * budget-exhausted exit verbatim, taken deterministically. */
+        if (u->policy == DS4_UPOL_EXPERT_COLD) {
+            g_materialize_outcomes[CUDA_MAT_EXPERT_COLD_BY_POLICY]++;
+            return cuda_model_direct_fallback_ptr(model_map, offset);
         }
         int covered = 0;
         for (const cuda_model_range &r : g_model_ranges) {
