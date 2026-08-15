@@ -63,6 +63,25 @@ tool-call syntax, streaming tails, thinking controls, and generation stop
 tokens. A listening port is not an acceptance result; `/v1/models`, a real
 generation request, and settled `/v1/stats` counters must all pass.
 
+## Common disk-KV contract
+
+`--kv-disk-dir` and `--kv-disk-space-mb` use the same server policy for every
+integrated family. DeepSeek/GLM keeps its compressed-KV payload, Solar keeps
+recurrent KDA plus GQA state, EXAONE keeps its full/sliding LLLG rings, and
+Motif-3 keeps normalized latent KV plus rotated `k_pe` rings. Serial sessions
+and continuous banks share the family payload format, validate their tagged
+layout before any restore, and reject truncated or cross-family data.
+
+```sh
+./ds4-server -m "$MODEL" --cuda -c 131072 \
+  --kv-disk-dir /path/to/ssd/ds4-kv --kv-disk-space-mb 32768
+```
+
+Successful loads remain on disk until the configured space-budget eviction
+removes them, so more than one restart can reuse a prefix. The cache is ordinary
+SSD persistence, not active-bank offload: context length and concurrency must
+still fit unified memory before the worker starts.
+
 ## Weight owner and inference worker
 
 On a 128 GB unified-memory machine, keep one weight owner alive and restart
@@ -212,8 +231,13 @@ the 611 MHz pin did not recur.
   accelerators.
 - Motif-3 serving uses plain decoding; MTP and DSpark support models remain
   DeepSeek-only.
-- EXAONE durable bank payload serialization is intentionally unavailable; its
-  fixed banks support exact-frontier in-process reuse and fork copies.
+- Solar, EXAONE, and Motif-3 serial snapshots now reject corrupted family tags,
+  and their continuous banks restore into a different idle bank before a
+  one-token warm suffix. The CUDA lifecycle gates passed on the production
+  mixed-quant GGUFs; DeepSeek/GLM retains the existing compressed-KV format.
+- Disk KV reduces repeated prefill across eviction or restart. It does not lower
+  the resident KV allocation of a live bank; the Motif Spark operating point
+  remains two banks at `-c 196608` with a 4,096-token prefill chunk.
 - Model cards contain only verified behavior and performance. Profiling
   results, failed experiments, and proposed kernels belong in the technical
   handoff until a release gate validates them.

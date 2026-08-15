@@ -834,9 +834,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 
 /* Durable pinned banks (v0.3): serialize / restore one cont BANK of a
  * batch ctx through the same wire format as a serial session payload (a
- * bank record is a valid serial checkpoint; its logits block and MTP tail
- * are zeros — restore is warm-admit + suffix prefill, which regenerates
- * both).  Save reads the bank's committed token history (bank_hist);
+ * bank record is a valid serial checkpoint; its logits block is zero, and
+ * model-family layouts omit unused speculative state — restore is warm-admit
+ * plus suffix prefill, which regenerates both). Save reads the bank's committed
+ * token history (bank_hist);
  * restore repopulates tensors + counters + bank_hist and marks the bank
  * warm-valid, so a following admit validates exactly like a live warm
  * bank.  Banks must be idle (evict/shutdown by construction); both calls

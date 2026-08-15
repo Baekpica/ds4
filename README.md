@@ -47,7 +47,8 @@ GGUF path and the matching weight-owner manifest change:
 DS4_CUDA_WEIGHT_IPC_MANIFEST=/path/to/weights.manifest \
 DS4_CUDA_WEIGHT_IPC_SCOPE=base \
 ./ds4-server -m /path/to/model-or-first-shard.gguf \
-  --cuda -c 131072 --host 0.0.0.0 --port 8001
+  --cuda -c 131072 --host 0.0.0.0 --port 8001 \
+  --kv-disk-dir /path/to/ssd/ds4-kv --kv-disk-space-mb 32768
 ```
 
 The server exposes OpenAI Chat Completions, OpenAI Completions, OpenAI
@@ -56,6 +57,10 @@ Responses, and Anthropic Messages at `/v1/chat/completions`,
 tokenization, chat rendering, tool syntax, stop tokens, and recurrent/KV state
 stay behind this common surface. DeepSeek-only MTP and DSpark support models
 are rejected for the other families instead of entering an incompatible graph.
+Serial checkpoints and idle continuous banks from every listed family can be
+saved to the same disk-KV service and restored after an inference-worker
+restart. Disk persistence avoids repeated prefill; it does not reduce the
+resident memory required by each active bank.
 
 All four families above have been loaded from their production mixed-quant
 GGUFs and exercised through the same server binary on the reference DGX Spark.
@@ -460,14 +465,12 @@ inference worker. Run the owner's `--dry-run` preflight first, then remove
 
 DS4_CUDA_WEIGHT_IPC_MANIFEST=/path/to/run/weights.manifest \
 DS4_CUDA_WEIGHT_IPC_SCOPE=base \
-DS4_SERVER_COALESCE_MAX=3 \
-DS4_SERVER_COALESCE_MAX_TOKENS=8192 \
-DS4_BATCH_FIT_HEADROOM_MB=6144 \
-DS4_MOTIF3_PREFILL_CHUNK=8192 \
-DS4_CONT_PREFILL_CHUNK=8192 \
-DS4_CONT_PREFILL_CHUNK_LIVE=8192 \
+DS4_SERVER_COALESCE_MAX=2 \
+DS4_SERVER_COALESCE_MAX_TOKENS=4096 \
+DS4_MOTIF3_PREFILL_CHUNK=4096 \
   ./ds4-server -m /path/to/Motif-3-MQ87-88-FIT.gguf -c 196608 \
-  --host 0.0.0.0 --port 8002 --no-spec
+  --host 0.0.0.0 --port 8002 --no-spec \
+  --kv-disk-dir /path/to/ssd/motif-3-kv --kv-disk-space-mb 32768
 ```
 
 The shared server surface includes OpenAI chat/completions, Responses, and
@@ -1271,11 +1274,13 @@ checkpoint bytes. The live in-memory checkpoint covers the current session; the
 disk KV cache makes useful prefixes survive session switches and server
 restarts.
 
-For RAM reasons there is currently only one live KV cache in memory. When a new
-unrelated session replaces it, the old checkpoint can only be resumed without
-re-processing if it was written to the disk KV cache. In other words, memory
-cache handles the active session; disk cache is the resume mechanism for
-different sessions.
+The serial lane has one live checkpoint, while the continuous lane has the
+number of resident banks selected at startup. When another session replaces a
+serial checkpoint or an idle bank is evicted, that prefix can only resume
+without re-processing if it was written to the disk KV cache. In other words,
+memory cache handles active sessions; disk cache is the resume mechanism for
+evicted sessions and worker restarts. This applies to DeepSeek/GLM, Solar,
+EXAONE, and Motif model-family payloads in `ds4-dfm`.
 
 Enable it with:
 
