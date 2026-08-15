@@ -35002,7 +35002,7 @@ static void motif3_graph_free(ds4_motif3_gpu_graph *g) {
 }
 
 static bool motif3_graph_alloc(ds4_motif3_gpu_graph *g, uint32_t cap) {
-    if (!g || cap == 0 || cap > 4096u) return false;
+    if (!g || cap == 0 || cap > 8192u) return false;
     memset(g, 0, sizeof(*g));
     g->cap = cap;
 #define M3_ALLOC(field, count, type) do {                                      \
@@ -50259,7 +50259,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 motif_chunk = (uint32_t)value;
         }
         if (motif_chunk == 0u) motif_chunk = 1u;
-        if (motif_chunk > 4096u) motif_chunk = 4096u;
+        if (motif_chunk > 8192u) motif_chunk = 8192u;
         if (motif_chunk > (uint32_t)ctx_size) motif_chunk = (uint32_t)ctx_size;
         s->prefill_cap = motif_chunk;
         if (!motif3_graph_alloc(&s->motif3_graph, s->prefill_cap) ||

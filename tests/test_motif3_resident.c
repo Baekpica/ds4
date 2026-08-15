@@ -141,6 +141,22 @@ int main(int argc, char **argv) {
         prompt.len > 0 && prompt.len <= 256 &&
         ds4_engine_motif3_forward_test(engine, &prompt) == 0;
 
+    ds4_session *wide_session = NULL;
+    setenv("DS4_MOTIF3_PREFILL_CHUNK", "8192", 1);
+    const int wide_chunk_ok =
+        ds4_session_create(&wide_session, engine, 8192) == 0 &&
+        ds4_session_prefill_cap(wide_session) == 8192;
+    if (!wide_chunk_ok) {
+        fprintf(stderr, "Motif-3 8192-token prefill chunk was not honored\n");
+    }
+    if (wide_session) ds4_session_free(wide_session);
+    unsetenv("DS4_MOTIF3_PREFILL_CHUNK");
+    if (!wide_chunk_ok) {
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+
     ds4_session *session = NULL;
     char session_err[256] = "";
     const int session_rc = ds4_session_create(&session, engine, 256);
@@ -363,17 +379,17 @@ int main(int argc, char **argv) {
     if (!metadata_ok || !no_duplicate_ok || !source_pages_open_ok ||
         !source_pages_after_ok ||
         !sparse_ok || !forward_ok ||
-        !session_ok || !chunk_ok || !cache_256k_ok ||
+        !wide_chunk_ok || !session_ok || !chunk_ok || !cache_256k_ok ||
         !release_ok || total != total_after) {
         fprintf(stderr,
                 "Motif-3 residency gate failed: metadata=%d no_duplicate=%d "
-                "source_open=%d source_after=%d sparse=%d forward=%d session=%d "
+                "source_open=%d source_after=%d sparse=%d forward=%d wide_chunk=%d session=%d "
                 "chunk=%d cache256=%d "
                 "release=%d "
                 "unreleased=%" PRIu64 "\n",
                 metadata_ok, no_duplicate_ok, source_pages_open_ok,
-                source_pages_after_ok, sparse_ok, forward_ok, session_ok,
-                chunk_ok, cache_256k_ok,
+                source_pages_after_ok, sparse_ok, forward_ok, wide_chunk_ok,
+                session_ok, chunk_ok, cache_256k_ok,
                 release_ok, unreleased);
         return 1;
     }
