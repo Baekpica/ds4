@@ -16592,6 +16592,39 @@ static void mem_obs_sample(ds4_mem_observation *o) {
 
 static double mem_gib(uint64_t bytes) { return (double)bytes / 1073741824.0; }
 
+/* memgov D5-1: ONE memory snapshot per render pass (plan sec 12: "render
+ * boot logs, stats and metrics from one snapshot epoch").  Census image,
+ * governor ledger and typed observation are captured back-to-back HERE --
+ * never mid-render, where a long emission separates them by an arbitrary
+ * number of writer epochs -- so every porcelain pairs a census image with
+ * the governor ledger of the same capture moment.  The two epochs are
+ * separate counters (each seqlock owns its own); coherence is the shared
+ * capture instant plus both stamps rendered as VALUES (sec 14: never
+ * labels), so readers compare scrapes only at equal epochs. */
+static void mem_render_capture(mem_census_image *img, ds4_gov_ledger *lg,
+                               ds4_mem_observation *o) {
+    mem_census_snapshot(img);
+    memset(lg, 0, sizeof(*lg));
+    ds4_gov_snapshot(lg);
+    mem_obs_sample(o);
+}
+
+/* memgov D5-1 (plan sec 14 "plan and snapshot generations"): the reclaim
+ * plan's generation surface as ONE value -- the sum of every bank's
+ * lineage generation.  Moves exactly when some bank's committed content
+ * is replaced or destroyed (admission reset, fork, restore, trim/reclaim,
+ * quarantine, overflow), never on pure extension: equal clocks bracket a
+ * lineage-quiet interval, and a moved clock is what a STALE_PLAN reclaim
+ * outcome between two scrapes looks like from the outside.  Lock-free by
+ * design: the ctx pointer is boot-stable, the per-bank counters monotonic
+ * (ds4_batch_ctx_bank_generation is the documented reader API). */
+static uint64_t bank_lineage_clock(server *s) {
+    uint64_t sum = 0;
+    for (int bk = 0; bk < s->batch_ctx_max_seq; bk++)
+        sum += ds4_batch_ctx_bank_generation(s->batch_ctx, bk);
+    return sum;
+}
+
 /* Prometheus text exposition (hand-rolled: it is just lines). */
 static void send_metrics(server *s, int fd) {
     ds4_metrics *m = ds4_metrics_get();
@@ -16787,8 +16820,11 @@ static void send_metrics(server *s, int fd) {
      * difference (census sec 4).  The whole family is ABSENT when the
      * backend keeps no census -- absence is not zero. */
     {
-        mem_census_image img;
-        mem_census_snapshot(&img);
+        /* memgov D5-1: ONE capture feeds every memory family below -- the
+         * census image and governor ledger of a render can no longer be
+         * separated by the writer epochs a long emission used to admit. */
+        mem_census_image img; ds4_gov_ledger lg; ds4_mem_observation o;
+        mem_render_capture(&img, &lg, &o);
         buf_printf(&b, "# TYPE ds4_memory_census_supported gauge\n"
                        "ds4_memory_census_supported %d\n", img.supported);
         if (img.supported) {
@@ -16836,9 +16872,7 @@ static void send_metrics(server *s, int fd) {
                        "ds4_memory_substrate_outstanding_bytes %llu\n",
                    (unsigned long long)ds4_gpu_substrate_outstanding());
 #endif
-        /* Render-time observation (fresh sample) + decision-site history. */
-        ds4_mem_observation o;
-        mem_obs_sample(&o);
+        /* Observation (sampled by the capture above) + decision-site history. */
         buf_puts(&b, "# TYPE ds4_memory_observation_info gauge\n");
         for (int st = 0; st < 3; st++)
             for (int so = 0; so < 3; so++)
@@ -16866,9 +16900,6 @@ static void send_metrics(server *s, int fd) {
          * the old/new comparison class.  Process counters, meaningful on
          * every backend (on Metal/CPU the cells accumulate obs_policy). */
         {
-            ds4_gov_ledger lg;
-            memset(&lg, 0, sizeof(lg));
-            ds4_gov_snapshot(&lg);
             buf_printf(&b, "# TYPE ds4_memory_governor_epoch gauge\n"
                            "ds4_memory_governor_epoch %llu\n",
                        (unsigned long long)lg.epoch);
@@ -16989,7 +17020,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                        "\"tokens_prefilled_computed\":%llu,"
                        "\"tokens_prefilled_cached\":%llu,\"prefill_tok_s_60s\":%.2f,"
                        "\"warm_records\":%llu,\"banks_live\":%llu,\"banks_total\":%llu,"
-                       "\"kv_pages_resident\":%llu}",
+                       "\"kv_pages_resident\":%llu,\"bank_lineage_clock\":%llu}",
                    (unsigned long long)ds4_metric_read(&m->admits_cold),
                    (unsigned long long)ds4_metric_read(&m->admits_warm),
                    (unsigned long long)ds4_metric_read(&m->admits_fork),
@@ -17003,14 +17034,18 @@ static void send_stats(server *s, int fd, bool as_json) {
                    (unsigned long long)ds4_metric_read(&m->warm_records),
                    (unsigned long long)ds4_metric_read(&m->banks_live),
                    (unsigned long long)ds4_metric_read(&m->banks_total),
-                   (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+                   (unsigned long long)ds4_metric_read(&m->kv_pages_resident),
+                   (unsigned long long)bank_lineage_clock(s));
         /* memgov D0a-3: memory section from ONE census image (fixed keys;
-         * classes/totals omitted entirely when the backend keeps none). */
+         * classes/totals omitted entirely when the backend keeps none).
+         * D5-1: the governor section below rides the SAME capture; both
+         * epochs render as values (plan sec 12/14). */
+        mem_census_image img; ds4_gov_ledger lg; ds4_mem_observation o;
+        mem_render_capture(&img, &lg, &o);
         {
-            mem_census_image img;
-            mem_census_snapshot(&img);
-            buf_printf(&b, ",\"memory\":{\"census_supported\":%s",
-                       img.supported ? "true" : "false");
+            buf_printf(&b, ",\"memory\":{\"census_supported\":%s,\"census_epoch\":%llu",
+                       img.supported ? "true" : "false",
+                       (unsigned long long)img.epoch);
             if (img.supported) {
                 uint64_t tl[DS4_MEMD__COUNT] = {0}, ts[DS4_MEMD__COUNT] = {0};
                 buf_puts(&b, ",\"classes\":{");
@@ -17039,8 +17074,6 @@ static void send_stats(server *s, int fd, bool as_json) {
                            (unsigned long long)ds4_gpu_substrate_outstanding());
 #endif
             }
-            ds4_mem_observation o;
-            mem_obs_sample(&o);
             buf_printf(&b, ",\"observation\":{\"status\":\"%s\",\"source\":\"%s\"",
                        mem_obs_status_names[o.status], mem_obs_source_names[o.source]);
             if (o.status == DS4_MEMOBS_OK)
@@ -17058,9 +17091,6 @@ static void send_stats(server *s, int fd, bool as_json) {
          * stats summarizes by reason, the board-glance question being
          * "does the shadow agree?"). */
         {
-            ds4_gov_ledger lg;
-            memset(&lg, 0, sizeof(lg));
-            ds4_gov_snapshot(&lg);
             buf_printf(&b, ",\"governor\":{\"shadow\":true,\"epoch\":%llu,"
                            "\"faults\":%llu,\"modes\":{",
                        (unsigned long long)lg.epoch,
@@ -17186,7 +17216,8 @@ static void send_stats(server *s, int fd, bool as_json) {
                    "warm_records:%llu\n"
                    "banks_live:%llu\n"
                    "banks_total:%llu\n"
-                   "kv_pages_resident:%llu\n",
+                   "kv_pages_resident:%llu\n"
+                   "bank_lineage_clock:%llu\n",
                (unsigned long long)ds4_metric_read(&m->admits_cold),
                (unsigned long long)ds4_metric_read(&m->admits_warm),
                (unsigned long long)ds4_metric_read(&m->admits_fork),
@@ -17200,13 +17231,18 @@ static void send_stats(server *s, int fd, bool as_json) {
                (unsigned long long)ds4_metric_read(&m->warm_records),
                (unsigned long long)ds4_metric_read(&m->banks_live),
                (unsigned long long)ds4_metric_read(&m->banks_total),
-               (unsigned long long)ds4_metric_read(&m->kv_pages_resident));
+               (unsigned long long)ds4_metric_read(&m->kv_pages_resident),
+               (unsigned long long)bank_lineage_clock(s));
     /* memgov D0a-3: status-board view of the same ONE census image --
-     * nonzero rows only (the complete fixed surface is /metrics). */
+     * nonzero rows only (the complete fixed surface is /metrics).
+     * D5-1: the governor board below rides the SAME capture; both epochs
+     * render as values. */
+    mem_census_image img; ds4_gov_ledger lg; ds4_mem_observation o;
+    mem_render_capture(&img, &lg, &o);
     {
-        mem_census_image img;
-        mem_census_snapshot(&img);
-        buf_printf(&b, "\n# Memory census\ncensus_supported:%d\n", img.supported);
+        buf_printf(&b, "\n# Memory census\ncensus_supported:%d\n"
+                       "census_epoch:%llu\n",
+                   img.supported, (unsigned long long)img.epoch);
         if (img.supported) {
             uint64_t tl[DS4_MEMD__COUNT] = {0}, ts[DS4_MEMD__COUNT] = {0};
             for (int d = 0; d < DS4_MEMD__COUNT; d++) {
@@ -17229,8 +17265,6 @@ static void send_stats(server *s, int fd, bool as_json) {
                        mem_gib(ts[DS4_MEMD_PINNED_HOST]),
                        (unsigned long long)img.faults);
         }
-        ds4_mem_observation o;
-        mem_obs_sample(&o);
         if (o.status == DS4_MEMOBS_OK)
             buf_printf(&b, "observation:%s free=%.2fGiB total=%.2fGiB\n",
                        mem_obs_source_names[o.source],
@@ -17241,10 +17275,9 @@ static void send_stats(server *s, int fd, bool as_json) {
     /* memgov D0b-4: governor board -- nonzero leases + decisions by
      * reason (full matrix in /metrics). */
     {
-        ds4_gov_ledger lg;
-        memset(&lg, 0, sizeof(lg));
-        ds4_gov_snapshot(&lg);
-        buf_printf(&b, "\n# Memory governor (shadow)\ngovernor_faults:%llu\n",
+        buf_printf(&b, "\n# Memory governor (shadow)\ngovernor_epoch:%llu\n"
+                       "governor_faults:%llu\n",
+                   (unsigned long long)lg.epoch,
                    (unsigned long long)ds4_metric_read(&m->memgov_faults));
         /* memgov D2-1: the mode board (always all five families). */
         buf_puts(&b, "modes:");
@@ -18712,8 +18745,13 @@ int main(int argc, char **argv) {
      * faults and the substrate tripwire via the SAME call the fit/floor
      * verdicts consume (bit-identity is a close-gate assert). */
     {
-        mem_census_image img;
-        mem_census_snapshot(&img);
+        /* D5-1: one capture moment for the whole boot block -- the census
+         * image the lines below render and the governor ledger the boot
+         * lease is computed FROM are the same instant (the observation is
+         * unrendered here; the capture is one call by design). */
+        mem_census_image img; ds4_gov_ledger lg; ds4_mem_observation o;
+        mem_render_capture(&img, &lg, &o);
+        (void)o;
         if (img.supported) {
             uint64_t tl[DS4_MEMD__COUNT] = {0}, ts[DS4_MEMD__COUNT] = {0};
             for (int d = 0; d < DS4_MEMD__COUNT; d++) {
@@ -18738,15 +18776,19 @@ int main(int argc, char **argv) {
                        mem_gib(ts[DS4_MEMD_PINNED_HOST]),
                        (unsigned long long)img.faults,
                        mem_gib(ds4_gpu_substrate_outstanding()));
+            /* D5-1: the boot block's snapshot stamps (plan sec 12: "render
+             * boot logs ... from one snapshot epoch").  Its own line -- the
+             * totals line's token set is gate-anchored. */
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: memory census epoch: census=%llu governor=%llu",
+                       (unsigned long long)img.epoch,
+                       (unsigned long long)lg.epoch);
             /* memgov D0b-3: the ENGINE_BOOT lease -- everything the boot
              * settled that other consumers do not own: total census live
              * minus the bank plan's pages and prewarm's growth (their own
              * leases).  Published once at boot settle; the close gate
              * reconciles the three leases against the census totals. */
             {
-                ds4_gov_ledger lg;
-                memset(&lg, 0, sizeof(lg));
-                ds4_gov_snapshot(&lg);
                 uint64_t total = tl[DS4_MEMD_UNIFIED_DEVICE] +
                                  tl[DS4_MEMD_PINNED_HOST];
                 uint64_t bank_live = ds4_mem_cell_live(
@@ -26427,6 +26469,35 @@ static void test_mem_census_publication_shape(void) {
                 o.source <= DS4_MEMOBS_SRC_MEMINFO_AVAILABLE);
 }
 
+/* memgov D5-1: the render capture -- one coherent moment for every
+ * porcelain.  A capture must never hand a renderer a torn stamp (odd =
+ * writer mid-note; even asserts double as a no-wedged-writer tripwire),
+ * and on a quiescent process two back-to-back captures must agree on
+ * BOTH stamps -- reading never advances an epoch, the property that
+ * makes "compare only equal epochs" (plan sec 12) usable at all.  Stubs
+ * report permanently even epochs, so every assert holds per-backend. */
+static void test_mem_render_capture_coherent(void) {
+    mem_census_image img1, img2;
+    ds4_gov_ledger lg1, lg2;
+    ds4_mem_observation o1, o2;
+    mem_render_capture(&img1, &lg1, &o1);
+    mem_render_capture(&img2, &lg2, &o2);
+    TEST_ASSERT((img1.epoch & 1u) == 0);
+    TEST_ASSERT((lg1.epoch & 1u) == 0);
+    TEST_ASSERT(img1.supported == img2.supported);
+    TEST_ASSERT(img1.epoch == img2.epoch);
+    TEST_ASSERT(lg1.epoch == lg2.epoch);
+    TEST_ASSERT(o1.status >= DS4_MEMOBS_OK &&
+                o1.status <= DS4_MEMOBS_QUERY_ERROR);
+    TEST_ASSERT(o2.status == o1.status);
+    /* The lineage clock's degenerate contract: no ctx reads as clock 0
+     * at any max_seq (the bank_generation API's NULL answer), so board
+     * consumers need no live-ctx special case. */
+    server s = {0};
+    s.batch_ctx_max_seq = 4;
+    TEST_ASSERT(bank_lineage_clock(&s) == 0);
+}
+
 static void test_mem_obs_legacy_shim(void) {
     /* D0a-2: every typed state must map to the EXACT legacy
      * ds4_gpu_mem_info contract -- rc 0 + outputs only on OK, rc 1 with
@@ -27582,6 +27653,8 @@ static void ds4_server_unit_tests_run(void) {
     test_reclaim_status_vocabulary();
     test_serial_reclaim_rank_order();
     test_mem_census_publication_shape();
+    /* memgov D5-1: one coherent capture per porcelain render. */
+    test_mem_render_capture_coherent();
     /* memgov D0a-2: typed observation legacy shim. */
     test_mem_obs_legacy_shim();
     /* memgov D0b-1: shadow-governor evaluator (pure core). */

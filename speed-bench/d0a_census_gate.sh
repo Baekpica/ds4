@@ -355,6 +355,42 @@ else
 fi
 log "(b) PASS (ENGINE_OTHER=0 faults=0 host_pin==registered substrate bit-identical)"
 
+# ---- (b2) D5-1 epoch-coherent porcelains (tip-only; (b)'s server still up) ----
+# One capture per render, both stamps in VALUES across every porcelain.
+# Boot stamps are older than render stamps (the boot lease publish alone
+# advances the governor), so cross-surface asserts compare only the
+# render-time scrapes of the idle server -- where reads never advance an
+# epoch, the property "compare only equal epochs" depends on.
+log "(b2) D5-1 epoch coherence (one snapshot per render)"
+EPB=$(R "grep -o 'memory census epoch: census=[0-9]* governor=[0-9]*' /tmp/d0aclose_recon.log | head -1")
+[ -n "$EPB" ] || die "boot log missing the D5-1 epoch line"
+CE_B=$(echo "$EPB" | grep -o 'census=[0-9]*' | cut -d= -f2)
+GE_B=$(echo "$EPB" | grep -o 'governor=[0-9]*' | cut -d= -f2)
+[ $((CE_B % 2)) -eq 0 ] && [ $((GE_B % 2)) -eq 0 ] \
+    || die "boot epoch stamps not even -- a porcelain rendered a torn image (census=$CE_B governor=$GE_B)"
+CE_1=$(R "grep '^ds4_memory_census_epoch' /tmp/d0aclose_metrics.txt" | awk '{print $NF}')
+GE_1=$(R "grep '^ds4_memory_governor_epoch' /tmp/d0aclose_metrics.txt" | awk '{print $NF}')
+[ -n "$CE_1" ] && [ -n "$GE_1" ] || die "metrics missing epoch gauges"
+[ $((CE_1 % 2)) -eq 0 ] && [ $((GE_1 % 2)) -eq 0 ] || die "metrics epoch stamps not even (census=$CE_1 governor=$GE_1)"
+R "curl -s -m 30 localhost:$PORT/metrics > /tmp/d0aclose_metrics2.txt" || die "metrics re-curl"
+CE_2=$(R "grep '^ds4_memory_census_epoch' /tmp/d0aclose_metrics2.txt" | awk '{print $NF}')
+GE_2=$(R "grep '^ds4_memory_governor_epoch' /tmp/d0aclose_metrics2.txt" | awk '{print $NF}')
+[ "$CE_1" = "$CE_2" ] && [ "$GE_1" = "$GE_2" ] \
+    || die "idle epochs moved across scrapes (census $CE_1->$CE_2 governor $GE_1->$GE_2)"
+R "curl -s -m 30 -H 'Accept: application/json' localhost:$PORT/v1/stats > /tmp/d0aclose_stats.json" || die "stats json curl"
+R "curl -s -m 30 localhost:$PORT/v1/stats > /tmp/d0aclose_stats.txt" || die "stats board curl"
+JQ=$(R "python3 -c \"import json;d=json.load(open('/tmp/d0aclose_stats.json'));print(d['memory']['census_epoch'],d['governor']['epoch'],d['cache']['bank_lineage_clock'])\"") \
+    || die "stats json missing D5-1 keys (census_epoch / governor epoch / bank_lineage_clock)"
+CE_J=$(echo "$JQ" | awk '{print $1}'); GE_J=$(echo "$JQ" | awk '{print $2}'); LC_J=$(echo "$JQ" | awk '{print $3}')
+[ "$CE_J" = "$CE_1" ] && [ "$GE_J" = "$GE_1" ] \
+    || die "stats JSON epochs != metrics (census $CE_J vs $CE_1, governor $GE_J vs $GE_1)"
+CE_T=$(R "grep '^census_epoch:' /tmp/d0aclose_stats.txt" | cut -d: -f2)
+GE_T=$(R "grep '^governor_epoch:' /tmp/d0aclose_stats.txt" | cut -d: -f2)
+LC_T=$(R "grep '^bank_lineage_clock:' /tmp/d0aclose_stats.txt" | cut -d: -f2)
+[ "$CE_T" = "$CE_1" ] && [ "$GE_T" = "$GE_1" ] || die "stats board epochs != metrics (census $CE_T governor $GE_T)"
+[ -n "$LC_J" ] && [ "$LC_J" = "$LC_T" ] || die "lineage clock JSON ($LC_J) != board ($LC_T)"
+log "(b2) PASS (census_epoch=$CE_1 governor_epoch=$GE_1 lineage_clock=$LC_J; boot even, metrics/json/board agree, idle-stable)"
+
 # ---- (d2) ABBA perf close vs control (short decode leg) ----
 # Instrument: the measured request's OWN timings.decode_tok_s (exact for
 # that request), never the 60s window gauge (run-1 lesson: the gauge read
