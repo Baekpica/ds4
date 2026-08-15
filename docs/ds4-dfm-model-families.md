@@ -80,7 +80,8 @@ layout before any restore, and reject truncated or cross-family data.
 Successful loads remain on disk until the configured space-budget eviction
 removes them, so more than one restart can reuse a prefix. The cache is ordinary
 SSD persistence, not active-bank offload: context length and concurrency must
-still fit unified memory before the worker starts.
+still fit unified memory before the worker starts. Its quant identity comes from
+the first populated routed-expert layer, including dense-first model families.
 
 ## Weight owner and inference worker
 
@@ -235,6 +236,9 @@ the 611 MHz pin did not recur.
   and their continuous banks restore into a different idle bank before a
   one-token warm suffix. The CUDA lifecycle gates passed on the production
   mixed-quant GGUFs; DeepSeek/GLM retains the existing compressed-KV format.
+- The 2026-08-15 Motif restart gate persisted a 738-token bank as 43.82 MiB,
+  then restored all 738 cached tokens in 33.1 ms and computed only the
+  24-token suffix. The cache file remained after the successful load.
 - Disk KV reduces repeated prefill across eviction or restart. It does not lower
   the resident KV allocation of a live bank; the Motif Spark operating point
   remains two banks at `-c 196608` with a 4,096-token prefill chunk.

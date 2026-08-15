@@ -39049,9 +39049,11 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
-    const ds4_tensor *gate = e->weights.layer[0].ffn_gate_exps;
-    if (!gate) return 0;
-    return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
+        if (gate) return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+    }
+    return 0;
 }
 
 bool ds4_engine_has_mtp(ds4_engine *e) {

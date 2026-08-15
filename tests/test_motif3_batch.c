@@ -140,6 +140,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Motif-3 engine open failed\n");
         return 1;
     }
+    if (ds4_engine_routed_quant_bits(engine) != 2) {
+        fprintf(stderr, "Motif-3 routed quant identity is not IQ2/Q2K\n");
+        ds4_engine_close(engine);
+        return 1;
+    }
 
     const char *text[3] = {
         "The capital of France is",
