@@ -10104,12 +10104,16 @@ static uint64_t metal_graph_alloc_bytes_estimate(
     return bytes;
 }
 
+#endif /* !DS4_NO_GPU */
+
 /* memgov D2-4: the serial session's protected margin, ONE source shared by
  * the fit gate below and the S6 governor claim -- the probe and the quote
  * evaluate the same inequality (free >= margin + need) and cannot drift.
  * This margin, NOT the operator floor, is the serial lane's legacy
  * protection level: the reclaim charter (lite-4) serves from the commons
- * inside the floor band rather than 503ing beside idle cache. */
+ * inside the floor band rather than 503ing beside idle cache.
+ * Backend-neutral (env + arithmetic only) and called unconditionally from
+ * the server's serial quote path, so it must stay OUTSIDE the GPU guard. */
 uint64_t ds4_session_graph_headroom_bytes(void) {
     uint64_t headroom = 1024ull << 20;
     const char *he = getenv("DS4_SESSION_GRAPH_HEADROOM_MB");
@@ -10120,6 +10124,7 @@ uint64_t ds4_session_graph_headroom_bytes(void) {
     return headroom;
 }
 
+#ifndef DS4_NO_GPU
 /* Session-graph fit gate.  cudaMalloc on an integrated/unified box does not
  * fail cleanly when the ask exceeds MemAvailable -- the kernel reclaims and
  * swaps for tens of seconds and then the global OOM killer shoots the largest
