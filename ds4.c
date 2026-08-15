@@ -10177,11 +10177,13 @@ static bool metal_graph_session_fit_check(
     }
     if (fits) return true;
     if (loud) {
+        /* The typed rejection family (D5-3) deliberately does NOT tick
+         * here: this gate also fires on non-admission paths (mid-request
+         * allocs, CLI boots), and the D4 server quote path refuses
+         * WITHOUT ever running it loud.  Serial admission rejections tick
+         * at the server's refusal sites, where the reason is exact; this
+         * legacy scalar keeps its frozen semantics. */
         ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
-        /* memgov D5-3: typed twin -- a fit deficit is by definition the
-         * transient live-headroom reason (fail-open legs never refuse). */
-        ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
-                           [DS4_REJLANE_SERIAL][DS4_REJECT_LIVE_HEADROOM], 1);
         fprintf(stderr,
                 "ds4: session graph fit check FAILED: need ~%.0f MiB (+%.0f MiB headroom) "
                 "but only %.0f MiB allocatable (ctx=%u prefill_cap=%u mtp=%d dspark=%d); "

@@ -13941,6 +13941,16 @@ static bool serial_session_ensure_fit(server *s, job *j) {
                    (double)fq.deficit_bytes / 1048576.0,
                    (double)fq.avail_bytes / 1048576.0);
     ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);   /* lazy: holds nothing */
+    /* memgov D5-3: the typed rejection, at the site that KNOWS the
+     * reason: an enforce divergence carries the quote's own refusal
+     * status; every other shape here (probe refusal, create failure
+     * after an admit) is a physical live-headroom shortfall -- exactly
+     * the transient the client 503 advertises with "retry shortly". */
+    ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                       [DS4_REJLANE_SERIAL]
+                       [(final_v != DS4_GOV_ADMIT && legacy_v == DS4_GOV_ADMIT)
+                            ? ds4_reject_reason_from_gov(final_v)
+                            : DS4_REJECT_LIVE_HEADROOM], 1);
     char msg[192];
     snprintf(msg, sizeof(msg),
              "Server is temporarily at capacity for a %d-token serial request "
@@ -15933,6 +15943,9 @@ static void generate_continuous_jobs(server *s, job *first) {
             server_log(DS4_LOG_WARNING,
                        "ds4-server: deep-serial guard: refusing serial fallback for %d-token prompt (max %d)",
                        jb->req.prompt.len, serial_max);
+            /* memgov D5-3: THE deep-ctx policy refusal -- never retried. */
+            ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                               [DS4_REJLANE_SERIAL][DS4_REJECT_DEEP_POLICY], 1);
             wire_http_error(jb->fd, s->enable_cors, wire_surface_for(&jb->req), 503, msg);
             jb->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
             job_finish(jb);
@@ -17618,12 +17631,11 @@ static void *client_main(void *arg) {
         ds4_metric_add(&mreg->requests_inflight, (uint64_t)-1);
         if (j.outcome == JOB_OUT_FAILED)
             ds4_metric_add(&mreg->requests_failed, 1);
-        else if (j.outcome == JOB_OUT_REFUSED_DEEP_SERIAL) {
+        else if (j.outcome == JOB_OUT_REFUSED_DEEP_SERIAL)
+            /* D5-3 note: the typed family ticks at the two REFUSAL sites
+             * (right-size capacity, deep-policy guard) -- this shared
+             * settle outcome cannot tell them apart.  Legacy scalar only. */
             ds4_metric_add(&mreg->requests_refused_deep_serial, 1);
-            /* memgov D5-3: typed twin -- deep-ctx policy, never retried. */
-            ds4_metric_add(&mreg->requests_rejected_typed
-                               [DS4_REJLANE_SERIAL][DS4_REJECT_DEEP_POLICY], 1);
-        }
         else if (j.outcome == JOB_OUT_SHED)
             /* Inc 2e: an enqueued request an admission bound later refused
              * (queue age is the only post-enqueue bound today).  Counted at
