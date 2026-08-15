@@ -391,6 +391,59 @@ LC_T=$(R "grep '^bank_lineage_clock:' /tmp/d0aclose_stats.txt" | cut -d: -f2)
 [ -n "$LC_J" ] && [ "$LC_J" = "$LC_T" ] || die "lineage clock JSON ($LC_J) != board ($LC_T)"
 log "(b2) PASS (census_epoch=$CE_1 governor_epoch=$GE_1 lineage_clock=$LC_J; boot even, metrics/json/board agree, idle-stable)"
 
+# ---- (b3) D5-2/3 families (tip-only; (b)'s server still up) ----
+# Residency units reconcile against the materialize boot lines: on the
+# unclamped eager recon boot populated/ready/import/lazy/failed are
+# EXACT (the boot pass is the only ticker before the scrape) while
+# mapped-policy is >= (post-boot touches re-tick it per miss).  Failures
+# and typed rejections must be all-zero on a healthy idle boot; the
+# legacy reject scalars stay present and untyped beside the new family.
+log "(b3) D5-2/3 families (residency units/failures, deficit gauge, typed rejections)"
+R "curl -s -m 30 localhost:$PORT/metrics" > /tmp/d0aclose_b3_metrics.txt || die "metrics curl (b3)"
+R "cat /tmp/d0aclose_recon.log" > /tmp/d0aclose_b3_recon.log || die "recon log fetch (b3)"
+B3=$(python3 - <<'PYEOF' 2>&1
+import re
+m = open('/tmp/d0aclose_b3_metrics.txt').read()
+log = open('/tmp/d0aclose_b3_recon.log').read()
+def cells(fam):
+    out = {}
+    for l in m.splitlines():
+        if l.startswith(fam + '{'):
+            labels, val = l.rsplit(' ', 1)
+            out[tuple(re.findall(r'(\w+)="([^"]+)"', labels))] = int(val)
+    return out
+u = cells('ds4_residency_units')
+f = cells('ds4_residency_failures_total')
+d = cells('ds4_memory_decision_deficit_bytes')
+r = cells('ds4_requests_rejected_total')
+assert len(u) == 4 * 8, ('units cardinality', len(u))
+assert len(f) == 3 * 2, ('failures cardinality', len(f))
+assert len(d) == 5, ('deficit cardinality', len(d))
+assert len(r) == 3 * 6, ('rejected cardinality', len(r))
+assert all(v == 0 for v in f.values()), ('failures nonzero', f)
+assert all(v == 0 for v in r.values()), ('rejections on idle boot', r)
+for legacy in ('ds4_cont_admit_rejects_total ', 'ds4_graph_fit_refusals_total '):
+    assert any(l.startswith(legacy) for l in m.splitlines()), ('legacy scalar gone', legacy)
+lines = re.findall(r'materialize \S+: funded \S+ promote units \(\d+ unfunded\), '
+                   r'populated (\d+) \([^)]*\), ready (\d+), import (\d+), '
+                   r'mapped-policy (\d+), lazy-policy (\d+), failed (\d+)', log)
+assert lines, 'no materialize lines in recon log'
+tot = [sum(int(t[i]) for t in lines) for i in range(6)]
+def urow(state):
+    return sum(v for k, v in u.items() if dict(k)['state'] == state)
+assert urow('populated') == tot[0], ('populated', urow('populated'), tot[0])
+assert urow('already_ready') == tot[1], ('ready', urow('already_ready'), tot[1])
+assert urow('satisfied_import') == tot[2], ('import', urow('satisfied_import'), tot[2])
+assert urow('host_mapped_by_policy') >= tot[3], ('mapped', urow('host_mapped_by_policy'), tot[3])
+assert urow('lazy_deferred') == tot[4], ('lazy', urow('lazy_deferred'), tot[4])
+assert urow('failed') == tot[5] == 0, ('failed', urow('failed'), tot[5])
+print('B3OK populated=%d ready=%d import=%d mapped_min=%d lazy=%d' %
+      (tot[0], tot[1], tot[2], tot[3], tot[4]))
+PYEOF
+)
+echo "$B3" | grep -q '^B3OK' || { echo "$B3" | tail -4; die "(b3) family asserts failed"; }
+log "(b3) PASS ($B3)"
+
 # ---- (d2) ABBA perf close vs control (short decode leg) ----
 # Instrument: the measured request's OWN timings.decode_tok_s (exact for
 # that request), never the 60s window gauge (run-1 lesson: the gauge read
