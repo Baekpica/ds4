@@ -35107,6 +35107,48 @@ static bool motif3_graph_alloc(ds4_motif3_gpu_graph *g, uint32_t cap) {
     return true;
 }
 
+static uint32_t motif3_graph_layer_cache_cap(
+        uint32_t ctx_cap, uint32_t prefill_cap, uint32_t il) {
+    const bool mtp = il == DS4_N_LAYER;
+    const bool full = !mtp && ds4_motif3_layer_is_full_attention(il);
+    uint64_t cap = ctx_cap;
+    if (!full) {
+        cap = (uint64_t)DS4_N_SWA + 1u + prefill_cap;
+        if (cap > ctx_cap) cap = ctx_cap;
+    }
+    return cap <= UINT32_MAX ? (uint32_t)cap : 0u;
+}
+
+static uint32_t motif3_graph_prefill_cap_for_context(uint32_t ctx_size) {
+    uint32_t cap = 4096u;
+    const char *env = getenv("DS4_MOTIF3_PREFILL_CHUNK");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long value = strtoul(env, &end, 10);
+        if (end != env && end[0] == '\0' && value <= UINT32_MAX)
+            cap = (uint32_t)value;
+    }
+    if (cap == 0u) cap = 1u;
+    if (cap > 8192u) cap = 8192u;
+    if (cap > ctx_size) cap = ctx_size;
+    return cap;
+}
+
+static uint64_t motif3_graph_cache_bytes(uint32_t ctx_cap,
+                                          uint32_t prefill_cap) {
+    uint64_t total = 0u;
+    for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
+        const uint32_t cap =
+            motif3_graph_layer_cache_cap(ctx_cap, prefill_cap, il);
+        const uint64_t row_bytes =
+            (uint64_t)(DS4_N_KV_LORA + DS4_N_ROT) * sizeof(uint16_t);
+        if (cap == 0u || (uint64_t)cap > (UINT64_MAX - total) / row_bytes)
+            return 0u;
+        total += (uint64_t)cap * row_bytes;
+    }
+    return total;
+}
+
 static bool motif3_graph_alloc_latent_cache(
         ds4_motif3_gpu_graph *g, uint32_t ctx_cap) {
     if (!g || !g->ready || g->latent_cache_ready || ctx_cap == 0 ||
@@ -35115,18 +35157,11 @@ static bool motif3_graph_alloc_latent_cache(
     }
     uint64_t total = 0;
     for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
-        const bool mtp = il == DS4_N_LAYER;
-        const bool full = !mtp && ds4_motif3_layer_is_full_attention(il);
-        uint64_t cap = ctx_cap;
-        if (!full) {
-            /* The entire current chunk is inserted before its causal
-             * attention launch.  Keep one chunk of slack beyond the visible
-             * window so future rows cannot overwrite history needed by the
-             * first query in that same chunk. */
-            cap = (uint64_t)DS4_N_SWA + 1u + g->cap;
-            if (cap > ctx_cap) cap = ctx_cap;
-        }
-        if (cap == 0 || cap > UINT32_MAX ||
+        /* The entire current chunk is inserted before its causal attention
+         * launch.  Sliding layers retain the visible window plus that chunk. */
+        const uint32_t cap =
+            motif3_graph_layer_cache_cap(ctx_cap, g->cap, il);
+        if (cap == 0 ||
             cap > UINT64_MAX / DS4_N_KV_LORA / sizeof(uint16_t) ||
             cap > UINT64_MAX / DS4_N_ROT / sizeof(uint16_t)) {
             motif3_graph_free(g);
@@ -35144,7 +35179,7 @@ static bool motif3_graph_alloc_latent_cache(
             motif3_graph_free(g);
             return false;
         }
-        g->layer_cache_cap[il] = (uint32_t)cap;
+        g->layer_cache_cap[il] = cap;
         total += latent_bytes + k_pe_bytes;
     }
     g->ctx_cap = ctx_cap;
@@ -35355,10 +35390,18 @@ static bool motif3_graph_attention(
     return true;
 }
 
-static bool motif3_graph_attention_latent(
+typedef struct {
+    ds4_gpu_tensor *kv_latent;
+    ds4_gpu_tensor *k_pe;
+    uint32_t cache_cap;
+    uint32_t pos;
+} ds4_motif3_decode_row;
+
+static bool motif3_graph_attention_latent_impl(
         ds4_motif3_gpu_graph *g, const ds4_model *model,
         const ds4_layer_weights *l, uint32_t rows,
-        uint32_t pos0, uint32_t il) {
+        uint32_t pos0, uint32_t il,
+        const ds4_motif3_decode_row *decode_rows) {
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint32_t signal_heads = DS4_N_HEAD - DS4_N_NOISE_HEAD;
     const uint32_t signal_dim = signal_heads * DS4_N_VALUE_DIM;
@@ -35371,7 +35414,8 @@ static bool motif3_graph_attention_latent(
     const bool mtp = il == DS4_N_LAYER;
     const uint32_t expected_cache_len = mtp ? g->mtp_cache_len : g->cache_len;
     if (!g->latent_cache_ready || il > DS4_N_LAYER ||
-        pos0 != expected_cache_len || pos0 + rows > g->ctx_cap) {
+        (!decode_rows &&
+         (pos0 != expected_cache_len || pos0 + rows > g->ctx_cap))) {
         fprintf(stderr,
                 "ds4: Motif-3 layer %u latent cache identity mismatch "
                 "(pos=%u rows=%u cached=%u ctx=%u)\n",
@@ -35435,12 +35479,38 @@ static bool motif3_graph_attention_latent(
     M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
             g->q_full, g->q_full, (uint64_t)rows * q_dim),
             "q full BF16");
-    M3_LATTN(ds4_gpu_motif3_store_latent_kv_bf16_tensor(
-            g->layer_kv_latent[il], g->layer_k_pe[il],
-            g->kv_norm, g->kv_raw, g->positions,
-            full ? g->inv_yarn : g->inv_swa,
-            rows, cache_cap, kv_raw_dim, DS4_N_KV_LORA,
-            DS4_N_ROT, !full), "cache latent/k_pe");
+    if (decode_rows) {
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor *kv_norm = ds4_gpu_tensor_view(
+                g->kv_norm, (uint64_t)r * DS4_N_KV_LORA * sizeof(float),
+                (uint64_t)DS4_N_KV_LORA * sizeof(float));
+            ds4_gpu_tensor *kv_raw = ds4_gpu_tensor_view(
+                g->kv_raw, (uint64_t)r * kv_raw_dim * sizeof(float),
+                (uint64_t)kv_raw_dim * sizeof(float));
+            ds4_gpu_tensor *position = ds4_gpu_tensor_view(
+                g->positions, (uint64_t)r * sizeof(int32_t), sizeof(int32_t));
+            const bool stored = kv_norm && kv_raw && position &&
+                decode_rows[r].kv_latent && decode_rows[r].k_pe &&
+                decode_rows[r].cache_cap != 0u &&
+                ds4_gpu_motif3_store_latent_kv_bf16_tensor(
+                    decode_rows[r].kv_latent, decode_rows[r].k_pe,
+                    kv_norm, kv_raw, position,
+                    full ? g->inv_yarn : g->inv_swa,
+                    1u, decode_rows[r].cache_cap, kv_raw_dim,
+                    DS4_N_KV_LORA, DS4_N_ROT, !full);
+            ds4_gpu_tensor_free(position);
+            ds4_gpu_tensor_free(kv_raw);
+            ds4_gpu_tensor_free(kv_norm);
+            M3_LATTN(stored, "cache banked latent/k_pe");
+        }
+    } else {
+        M3_LATTN(ds4_gpu_motif3_store_latent_kv_bf16_tensor(
+                g->layer_kv_latent[il], g->layer_k_pe[il],
+                g->kv_norm, g->kv_raw, g->positions,
+                full ? g->inv_yarn : g->inv_swa,
+                rows, cache_cap, kv_raw_dim, DS4_N_KV_LORA,
+                DS4_N_ROT, !full), "cache latent/k_pe");
+    }
     float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     if (full) {
         const float mscale = 0.1f * logf(DS4_ROPE_SCALE_FACTOR) + 1.0f;
@@ -35454,7 +35524,7 @@ static bool motif3_graph_attention_latent(
         const char *env = getenv("DS4_MOTIF3_PREFILL_EXPANDED");
         expanded_prefill = (!env || strcmp(env, "0") != 0) ? 1 : 0;
     }
-    if (expanded_prefill && rows > 1u && full) {
+    if (!decode_rows && expanded_prefill && rows > 1u && full) {
         M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
                 g->kv_proj, model->map, model->size,
                 l->attn_kv_b->abs_offset, DS4_N_KV_LORA,
@@ -35534,12 +35604,44 @@ static bool motif3_graph_attention_latent(
                 DS4_N_HEAD / DS4_N_HEAD_KV,
                 DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
                 DS4_N_HEAD_DIM, DS4_N_VALUE_DIM), "absorb q/k");
-        M3_LATTN(ds4_gpu_motif3_latent_attention_bf16_tensor(
-                g->latent_attention, g->q_full, g->q_absorbed,
-                g->layer_kv_latent[il], g->layer_k_pe[il],
-                rows, pos0, cache_cap, window, DS4_N_HEAD,
-                DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
-                DS4_N_ROT, scale), "latent attention");
+        if (decode_rows) {
+            for (uint32_t r = 0; r < rows; r++) {
+                const uint64_t latent_values =
+                    (uint64_t)DS4_N_HEAD * DS4_N_KV_LORA;
+                ds4_gpu_tensor *out = ds4_gpu_tensor_view(
+                    g->latent_attention,
+                    (uint64_t)r * latent_values * sizeof(float),
+                    latent_values * sizeof(float));
+                ds4_gpu_tensor *q = ds4_gpu_tensor_view(
+                    g->q_full, (uint64_t)r * q_dim * sizeof(float),
+                    (uint64_t)q_dim * sizeof(float));
+                ds4_gpu_tensor *qa = ds4_gpu_tensor_view(
+                    g->q_absorbed,
+                    (uint64_t)r * latent_values * sizeof(float),
+                    latent_values * sizeof(float));
+                uint32_t row_window = full ? 0u : DS4_N_SWA + 1u;
+                if (row_window > decode_rows[r].cache_cap)
+                    row_window = decode_rows[r].cache_cap;
+                const bool attended = out && q && qa &&
+                    ds4_gpu_motif3_latent_attention_bf16_tensor(
+                        out, q, qa, decode_rows[r].kv_latent,
+                        decode_rows[r].k_pe, 1u, decode_rows[r].pos,
+                        decode_rows[r].cache_cap, row_window, DS4_N_HEAD,
+                        DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
+                        DS4_N_ROT, scale);
+                ds4_gpu_tensor_free(qa);
+                ds4_gpu_tensor_free(q);
+                ds4_gpu_tensor_free(out);
+                M3_LATTN(attended, "banked latent attention");
+            }
+        } else {
+            M3_LATTN(ds4_gpu_motif3_latent_attention_bf16_tensor(
+                    g->latent_attention, g->q_full, g->q_absorbed,
+                    g->layer_kv_latent[il], g->layer_k_pe[il],
+                    rows, pos0, cache_cap, window, DS4_N_HEAD,
+                    DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
+                    DS4_N_ROT, scale), "latent attention");
+        }
         M3_LATTN(ds4_gpu_motif3_value_project_q8_0_tensor(
                 g->attention, g->latent_attention,
                 model->map, model->size, l->attn_kv_b->abs_offset,
@@ -35569,6 +35671,14 @@ static bool motif3_graph_attention_latent(
             "attention output BF16 boundary");
 #undef M3_LATTN
     return true;
+}
+
+static bool motif3_graph_attention_latent(
+        ds4_motif3_gpu_graph *g, const ds4_model *model,
+        const ds4_layer_weights *l, uint32_t rows,
+        uint32_t pos0, uint32_t il) {
+    return motif3_graph_attention_latent_impl(
+        g, model, l, rows, pos0, il, NULL);
 }
 
 static bool motif3_graph_ffn(
@@ -35966,6 +36076,293 @@ static bool motif3_graph_forward_mtp_diagnostic(
             (uint64_t)DS4_N_VOCAB * sizeof(host_logits[0])),
             "logits readback");
 #undef M3_MTP
+    return true;
+}
+
+enum { DS4_MOTIF3_DECODE_BATCH_MAX = DS4_MULTISEQ_MAX_SEQ };
+
+typedef struct ds4_motif3_batch_runtime {
+    uint32_t max_seq;
+    uint32_t ctx_size;
+    uint32_t prefill_cap;
+    uint64_t cache_bytes_per_bank;
+    ds4_motif3_gpu_graph graph;
+    ds4_gpu_tensor **kv_latent;
+    ds4_gpu_tensor **k_pe;
+    uint32_t *cache_len;
+    uint32_t *mtp_cache_len;
+    ds4_gpu_tensor *decode_logits;
+    ds4_gpu_tensor *bank_hidden;
+    float *decode_logits_host;
+    float *bank_logits;
+    uint8_t *bank_logits_valid;
+    uint8_t *bank_hidden_valid;
+} ds4_motif3_batch_runtime;
+
+static size_t motif3_batch_cache_index(uint32_t bank, uint32_t il) {
+    return (size_t)bank * (DS4_N_LAYER + 1u) + il;
+}
+
+static void motif3_batch_runtime_free(ds4_motif3_batch_runtime *rt) {
+    if (!rt) return;
+    for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
+        rt->graph.layer_kv_latent[il] = NULL;
+        rt->graph.layer_k_pe[il] = NULL;
+    }
+    motif3_graph_free(&rt->graph);
+    const size_t count = (size_t)rt->max_seq * (DS4_N_LAYER + 1u);
+    for (size_t i = 0; i < count; i++) {
+        ds4_gpu_tensor_free(rt->kv_latent ? rt->kv_latent[i] : NULL);
+        ds4_gpu_tensor_free(rt->k_pe ? rt->k_pe[i] : NULL);
+    }
+    free(rt->kv_latent);
+    free(rt->k_pe);
+    free(rt->cache_len);
+    free(rt->mtp_cache_len);
+    ds4_gpu_tensor_free(rt->decode_logits);
+    ds4_gpu_tensor_free(rt->bank_hidden);
+    free(rt->decode_logits_host);
+    free(rt->bank_logits);
+    free(rt->bank_logits_valid);
+    free(rt->bank_hidden_valid);
+    free(rt);
+}
+
+static bool motif3_batch_runtime_bind(ds4_motif3_batch_runtime *rt,
+                                      uint32_t bank) {
+    if (!rt || bank >= rt->max_seq) return false;
+    for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
+        const size_t i = motif3_batch_cache_index(bank, il);
+        if (!rt->kv_latent[i] || !rt->k_pe[i]) return false;
+        rt->graph.layer_kv_latent[il] = rt->kv_latent[i];
+        rt->graph.layer_k_pe[il] = rt->k_pe[i];
+        rt->graph.layer_cache_cap[il] = motif3_graph_layer_cache_cap(
+            rt->ctx_size, rt->prefill_cap, il);
+    }
+    rt->graph.ctx_cap = rt->ctx_size;
+    rt->graph.cache_len = rt->cache_len[bank];
+    rt->graph.mtp_cache_len = rt->mtp_cache_len[bank];
+    rt->graph.latent_cache_bytes = rt->cache_bytes_per_bank;
+    rt->graph.latent_cache_ready = true;
+    return true;
+}
+
+static void motif3_batch_runtime_reset_bank(
+        ds4_motif3_batch_runtime *rt, uint32_t bank) {
+    if (!rt || bank >= rt->max_seq) return;
+    rt->cache_len[bank] = 0u;
+    rt->mtp_cache_len[bank] = 0u;
+    rt->bank_logits_valid[bank] = 0u;
+    rt->bank_hidden_valid[bank] = 0u;
+}
+
+static bool motif3_batch_runtime_copy_bank(
+        ds4_motif3_batch_runtime *rt, uint32_t src, uint32_t dst) {
+    if (!rt || src >= rt->max_seq || dst >= rt->max_seq) return false;
+    if (src == dst) return true;
+    bool ok = true;
+    for (uint32_t il = 0; ok && il <= DS4_N_LAYER; il++) {
+        const uint32_t live = il == DS4_N_LAYER
+            ? rt->mtp_cache_len[src] : rt->cache_len[src];
+        const uint32_t cap = motif3_graph_layer_cache_cap(
+            rt->ctx_size, rt->prefill_cap, il);
+        const uint32_t rows = live < cap ? live : cap;
+        const size_t si = motif3_batch_cache_index(src, il);
+        const size_t di = motif3_batch_cache_index(dst, il);
+        const uint64_t latent_bytes =
+            (uint64_t)rows * DS4_N_KV_LORA * sizeof(uint16_t);
+        const uint64_t k_pe_bytes =
+            (uint64_t)rows * DS4_N_ROT * sizeof(uint16_t);
+        ok = (latent_bytes == 0u || ds4_gpu_tensor_copy(
+                  rt->kv_latent[di], 0, rt->kv_latent[si], 0,
+                  latent_bytes) != 0) &&
+             (k_pe_bytes == 0u || ds4_gpu_tensor_copy(
+                  rt->k_pe[di], 0, rt->k_pe[si], 0,
+                  k_pe_bytes) != 0);
+    }
+    if (ok && rt->bank_hidden_valid[src]) {
+        const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+        ok = ds4_gpu_tensor_copy(
+            rt->bank_hidden, (uint64_t)dst * row_bytes,
+            rt->bank_hidden, (uint64_t)src * row_bytes, row_bytes) != 0;
+    }
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+    if (!ok) {
+        motif3_batch_runtime_reset_bank(rt, dst);
+        return false;
+    }
+    rt->cache_len[dst] = rt->cache_len[src];
+    rt->mtp_cache_len[dst] = rt->mtp_cache_len[src];
+    rt->bank_hidden_valid[dst] = rt->bank_hidden_valid[src];
+    if (rt->bank_logits_valid[src]) {
+        memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
+               rt->bank_logits + (size_t)src * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->bank_logits_valid[dst] = 1u;
+    } else {
+        rt->bank_logits_valid[dst] = 0u;
+    }
+    return true;
+}
+
+static bool motif3_batch_runtime_prefill(
+        ds4_motif3_batch_runtime *rt, const ds4_model *model,
+        const ds4_weights *weights, uint32_t bank,
+        const int *tokens, uint32_t rows, uint32_t pos0, bool final) {
+    if (!rt || bank >= rt->max_seq || !tokens || rows == 0u ||
+        rows > rt->prefill_cap || pos0 != rt->cache_len[bank] ||
+        pos0 + rows > rt->ctx_size || !motif3_batch_runtime_bind(rt, bank)) {
+        return false;
+    }
+    float *logits = final
+        ? rt->bank_logits + (size_t)bank * DS4_N_VOCAB : NULL;
+    if (!motif3_graph_forward_chunk(
+            &rt->graph, model, weights, tokens, rows, pos0, logits)) {
+        motif3_batch_runtime_reset_bank(rt, bank);
+        return false;
+    }
+    rt->cache_len[bank] = rt->graph.cache_len;
+    rt->mtp_cache_len[bank] = rt->graph.mtp_cache_len;
+    if (!final) return true;
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const bool copied = ds4_gpu_tensor_copy(
+        rt->bank_hidden, (uint64_t)bank * row_bytes,
+        rt->graph.final_norm, (uint64_t)(rows - 1u) * row_bytes,
+        row_bytes) != 0 && ds4_gpu_synchronize() != 0;
+    rt->bank_logits_valid[bank] = copied ? 1u : 0u;
+    rt->bank_hidden_valid[bank] = copied ? 1u : 0u;
+    return copied;
+}
+
+static bool motif3_batch_runtime_decode(
+        ds4_motif3_batch_runtime *rt, const ds4_model *model,
+        const ds4_weights *weights, const uint32_t *banks,
+        const int *tokens, const uint32_t *positions, uint32_t rows) {
+    if (!rt || !model || !weights || !banks || !tokens || !positions ||
+        rows == 0u || rows > rt->max_seq || rows > rt->prefill_cap) {
+        return false;
+    }
+    if (getenv("DS4_MOTIF3_BATCH_TRACE")) {
+        fprintf(stderr, "ds4: Motif-3 banked decode rows=%u\n", rows);
+    }
+    int32_t token_ids[DS4_MOTIF3_DECODE_BATCH_MAX];
+    int32_t pos_ids[DS4_MOTIF3_DECODE_BATCH_MAX];
+    uint8_t seen[DS4_MOTIF3_DECODE_BATCH_MAX] = {0};
+    ds4_motif3_decode_row decode_rows[DS4_MOTIF3_DECODE_BATCH_MAX];
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint32_t bank = banks[r];
+        if (bank >= rt->max_seq || seen[bank] ||
+            positions[r] != rt->cache_len[bank] ||
+            positions[r] >= rt->ctx_size || tokens[r] < 0 ||
+            (uint32_t)tokens[r] >= DS4_N_VOCAB) {
+            return false;
+        }
+        seen[bank] = 1u;
+        token_ids[r] = tokens[r];
+        pos_ids[r] = (int32_t)positions[r];
+    }
+    ds4_motif3_gpu_graph *g = &rt->graph;
+    if (!ds4_gpu_tensor_write(
+            g->tokens, 0, token_ids, (uint64_t)rows * sizeof(token_ids[0])) ||
+        !ds4_gpu_tensor_write(
+            g->positions, 0, pos_ids, (uint64_t)rows * sizeof(pos_ids[0]))) {
+        return false;
+    }
+
+#define M3_BATCH(expr, stage) do { if (!(expr)) {                             \
+        fprintf(stderr, "ds4: Motif-3 banked decode failed at %s\n", stage); \
+        return false; } } while (0)
+    M3_BATCH(ds4_gpu_embed_tokens_q8_0_tensor(
+            g->reduced, g->tokens, model->map, model->size,
+            weights->token_embd->abs_offset, DS4_N_VOCAB, rows, DS4_N_EMBD),
+            "token embedding");
+    M3_BATCH(ds4_gpu_motif3_round_bf16_tensor(
+            g->reduced, g->reduced, (uint64_t)rows * DS4_N_EMBD),
+            "embedding BF16 boundary");
+    M3_BATCH(ds4_gpu_repeat_hc_rows_tensor(
+            g->hidden[0], g->reduced, DS4_N_EMBD, DS4_N_HC, rows),
+            "mHC input expansion");
+
+    uint32_t current = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        for (uint32_t r = 0; r < rows; r++) {
+            const size_t i = motif3_batch_cache_index(banks[r], il);
+            decode_rows[r].kv_latent = rt->kv_latent[i];
+            decode_rows[r].k_pe = rt->k_pe[i];
+            decode_rows[r].cache_cap = motif3_graph_layer_cache_cap(
+                rt->ctx_size, rt->prefill_cap, il);
+            decode_rows[r].pos = positions[r];
+        }
+        M3_BATCH(motif3_graph_begin_sublayer(
+                g, model, g->hidden[current], l->mhc_attn_rms_norm,
+                l->mhc_attn_proj_pre, l->mhc_attn_proj_post,
+                l->mhc_attn_proj_res, l->mhc_attn_alpha_pre,
+                l->mhc_attn_alpha_post, l->mhc_attn_alpha_res,
+                l->mhc_attn_bias_pre, l->mhc_attn_bias_post,
+                l->mhc_attn_bias_res, l->attn_norm,
+                rows, il, "attention"), "attention mHC pre");
+        M3_BATCH(motif3_graph_attention_latent_impl(
+                g, model, l, rows, 0u, il, decode_rows), "banked GDLA");
+        M3_BATCH(motif3_graph_finish_sublayer(
+                g, g->hidden[current ^ 1u], g->hidden[current],
+                rows, il, "attention"), "attention mHC post");
+        current ^= 1u;
+        M3_BATCH(motif3_graph_begin_sublayer(
+                g, model, g->hidden[current], l->mhc_ffn_rms_norm,
+                l->mhc_ffn_proj_pre, l->mhc_ffn_proj_post,
+                l->mhc_ffn_proj_res, l->mhc_ffn_alpha_pre,
+                l->mhc_ffn_alpha_post, l->mhc_ffn_alpha_res,
+                l->mhc_ffn_bias_pre, l->mhc_ffn_bias_post,
+                l->mhc_ffn_bias_res, l->ffn_norm,
+                rows, il, "FFN"), "FFN mHC pre");
+        M3_BATCH(motif3_graph_ffn(g, model, l, rows, il), "FFN");
+        M3_BATCH(motif3_graph_finish_sublayer(
+                g, g->hidden[current ^ 1u], g->hidden[current],
+                rows, il, "FFN"), "FFN mHC post");
+        current ^= 1u;
+    }
+    M3_BATCH(ds4_gpu_motif3_mean_expansion_tensor(
+            g->mean_hidden, g->hidden[current], rows,
+            DS4_N_HC, DS4_N_EMBD), "final mHC mean");
+    M3_BATCH(ds4_gpu_motif3_round_bf16_tensor(
+            g->mean_hidden, g->mean_hidden,
+            (uint64_t)rows * DS4_N_EMBD), "final mean BF16 boundary");
+    M3_BATCH(ds4_gpu_rms_norm_weight_rows_tensor(
+            g->final_norm, g->mean_hidden, model->map, model->size,
+            weights->output_norm->abs_offset, DS4_N_EMBD, rows, DS4_RMS_EPS),
+            "output norm");
+    M3_BATCH(ds4_gpu_motif3_round_bf16_tensor(
+            g->final_norm, g->final_norm,
+            (uint64_t)rows * DS4_N_EMBD), "output norm BF16 boundary");
+    M3_BATCH(ds4_gpu_matmul_q8_0_tensor(
+            rt->decode_logits, model->map, model->size,
+            weights->output->abs_offset, DS4_N_EMBD, DS4_N_VOCAB,
+            g->final_norm, rows), "LM head");
+    const uint64_t hidden_row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    for (uint32_t r = 0; r < rows; r++) {
+        M3_BATCH(ds4_gpu_tensor_copy(
+            rt->bank_hidden, (uint64_t)banks[r] * hidden_row_bytes,
+            g->final_norm, (uint64_t)r * hidden_row_bytes,
+            hidden_row_bytes), "bank hidden capture");
+    }
+    const uint64_t logits_bytes =
+        (uint64_t)rows * DS4_N_VOCAB * sizeof(float);
+    M3_BATCH(ds4_gpu_synchronize(), "synchronize");
+    M3_BATCH(ds4_gpu_tensor_read(
+            rt->decode_logits, 0, rt->decode_logits_host, logits_bytes),
+            "logits readback");
+#undef M3_BATCH
+
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint32_t bank = banks[r];
+        memcpy(rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+               rt->decode_logits_host + (size_t)r * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->cache_len[bank] = positions[r] + 1u;
+        rt->bank_logits_valid[bank] = 1u;
+        rt->bank_hidden_valid[bank] = 1u;
+    }
     return true;
 }
 
@@ -41548,6 +41945,7 @@ struct ds4_batch_ctx {
     ds4_engine     *e;
     ds4_solar_batch_runtime *solar; /* non-NULL selects the Solar dispatch */
     ds4_exaone_batch_runtime *exaone; /* non-NULL selects the EXAONE dispatch */
+    ds4_motif3_batch_runtime *motif3; /* non-NULL selects the Motif-3 dispatch */
     bool            supports_partial_reuse; /* explicit runtime capability */
     ds4_gpu_graph   g;
     ds4_batch_slabs sl;            /* allocated for max_seq banks */
@@ -41956,10 +42354,9 @@ static int solar_cont_bank_restore_payload(
 uint64_t ds4_cont_bank_payload_bytes(ds4_batch_ctx *ctx, uint32_t bank) {
     if (!ctx || bank >= (uint32_t)ctx->max_seq || !ctx->bank_hist_valid[bank] ||
         ctx->bank_hist_len[bank] == 0) return 0;
-    /* Durable EXAONE bank payloads need an LLLG-specific wire layout.  Keep
-     * checkpointing explicitly unavailable until that layout is implemented;
-     * falling into the DeepSeek walker would serialize unrelated fields. */
-    if (ctx->exaone) return 0u;
+    /* Family KV layouts need their own wire format.  Never fall through to
+     * the unrelated DeepSeek walker. */
+    if (ctx->exaone || ctx->motif3) return 0u;
     if (ctx->solar) return solar_cont_bank_payload_bytes(ctx, bank);
     ds4_gpu_graph *g = &ctx->g;
     ds4_gpu_graph *wg = ds4_cont_bank_walk_graph(ctx);
@@ -42007,9 +42404,9 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
         payload_set_err(err, errlen, "bank has no reuse-trustworthy committed history");
         return 1;
     }
-    if (ctx->exaone) {
+    if (ctx->exaone || ctx->motif3) {
         payload_set_err(err, errlen,
-                        "EXAONE bank payloads are not implemented");
+                        "model-family bank payloads are not implemented");
         return 1;
     }
     if (ctx->solar) {
@@ -42093,9 +42490,9 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
         payload_set_err(err, errlen, "invalid bank payload load");
         return 1;
     }
-    if (ctx->exaone) {
+    if (ctx->exaone || ctx->motif3) {
         payload_set_err(err, errlen,
-                        "EXAONE bank payloads are not implemented");
+                        "model-family bank payloads are not implemented");
         return 1;
     }
     if (ctx->solar) {
@@ -42460,6 +42857,112 @@ static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     return headroom;
 }
 
+static ds4_motif3_batch_runtime *motif3_batch_runtime_create(
+        ds4_engine *e, uint32_t ctx_size, uint32_t requested_seq,
+        uint32_t prefill_cap, bool fit) {
+    if (!e || ctx_size == 0u || requested_seq == 0u ||
+        requested_seq > DS4_MOTIF3_DECODE_BATCH_MAX ||
+        prefill_cap == 0u || prefill_cap > ctx_size ||
+        prefill_cap < requested_seq) {
+        return NULL;
+    }
+    ds4_motif3_batch_runtime *rt = xcalloc(1, sizeof(*rt));
+    rt->max_seq = requested_seq;
+    rt->ctx_size = ctx_size;
+    rt->prefill_cap = prefill_cap;
+    rt->cache_bytes_per_bank =
+        motif3_graph_cache_bytes(ctx_size, prefill_cap);
+    if (rt->cache_bytes_per_bank == 0u ||
+        !motif3_graph_alloc(&rt->graph, prefill_cap)) {
+        motif3_batch_runtime_free(rt);
+        return NULL;
+    }
+
+    const uint64_t per_bank = rt->cache_bytes_per_bank +
+        (uint64_t)(DS4_N_EMBD + DS4_N_VOCAB) * sizeof(float);
+    uint64_t free_b = 0u, total_b = 0u;
+    if (ds4_gpu_mem_info(&free_b, &total_b) == 0) {
+        const uint64_t outstanding = ds4_gpu_substrate_outstanding();
+        free_b = free_b > outstanding ? free_b - outstanding : 0u;
+        const uint64_t headroom = ds4_batch_fit_headroom_bytes((int)ctx_size);
+        const uint64_t budget = free_b > headroom ? free_b - headroom : 0u;
+        uint32_t affordable = per_bank ? (uint32_t)(budget / per_bank) : 0u;
+        if (affordable > requested_seq) affordable = requested_seq;
+        if (affordable < requested_seq) {
+            if (!fit || affordable == 0u) {
+                fprintf(stderr,
+                        "ds4: Motif-3 batch fit failed: %.2f GiB/bank x %u "
+                        "plus %.2f GiB headroom, %.2f GiB allocatable after "
+                        "shared workspace\n",
+                        (double)per_bank / 1073741824.0, requested_seq,
+                        (double)headroom / 1073741824.0,
+                        (double)free_b / 1073741824.0);
+                motif3_batch_runtime_free(rt);
+                return NULL;
+            }
+            fprintf(stderr,
+                    "ds4: Motif-3 batch fit: max_seq %u -> %u "
+                    "(%.2f GiB/bank, free %.2f GiB, headroom %.2f GiB)\n",
+                    requested_seq, affordable,
+                    (double)per_bank / 1073741824.0,
+                    (double)free_b / 1073741824.0,
+                    (double)headroom / 1073741824.0);
+            rt->max_seq = affordable;
+        }
+    }
+
+    const size_t cache_count =
+        (size_t)rt->max_seq * (DS4_N_LAYER + 1u);
+    rt->kv_latent = xcalloc(cache_count, sizeof(*rt->kv_latent));
+    rt->k_pe = xcalloc(cache_count, sizeof(*rt->k_pe));
+    rt->cache_len = xcalloc(rt->max_seq, sizeof(*rt->cache_len));
+    rt->mtp_cache_len = xcalloc(rt->max_seq, sizeof(*rt->mtp_cache_len));
+    rt->bank_logits_valid = xcalloc(
+        rt->max_seq, sizeof(*rt->bank_logits_valid));
+    rt->bank_hidden_valid = xcalloc(
+        rt->max_seq, sizeof(*rt->bank_hidden_valid));
+    for (uint32_t b = 0; b < rt->max_seq; b++) {
+        for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
+            const uint32_t cap = motif3_graph_layer_cache_cap(
+                ctx_size, prefill_cap, il);
+            const size_t i = motif3_batch_cache_index(b, il);
+            rt->kv_latent[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)cap * DS4_N_KV_LORA * sizeof(uint16_t));
+            rt->k_pe[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)cap * DS4_N_ROT * sizeof(uint16_t));
+            if (!rt->kv_latent[i] || !rt->k_pe[i]) {
+                fprintf(stderr,
+                        "ds4: Motif-3 batch cache allocation failed "
+                        "at bank %u layer %u\n", b, il);
+                motif3_batch_runtime_free(rt);
+                return NULL;
+            }
+        }
+    }
+    const uint64_t logits_bytes =
+        (uint64_t)rt->max_seq * DS4_N_VOCAB * sizeof(float);
+    rt->decode_logits = ds4_gpu_tensor_alloc(logits_bytes);
+    rt->bank_hidden = ds4_gpu_tensor_alloc(
+        (uint64_t)rt->max_seq * DS4_N_EMBD * sizeof(float));
+    rt->decode_logits_host = xcalloc(
+        (size_t)rt->max_seq * DS4_N_VOCAB,
+        sizeof(*rt->decode_logits_host));
+    rt->bank_logits = xcalloc(
+        (size_t)rt->max_seq * DS4_N_VOCAB,
+        sizeof(*rt->bank_logits));
+    if (!rt->decode_logits || !rt->bank_hidden ||
+        !motif3_batch_runtime_bind(rt, 0u)) {
+        motif3_batch_runtime_free(rt);
+        return NULL;
+    }
+    ds4_log(stderr, DS4_LOG_TIMING,
+            "ds4: Motif-3 batch runtime: %u banks, ctx %u, "
+            "prefill chunk %u, latent KV %.3f GiB/bank\n",
+            rt->max_seq, ctx_size, prefill_cap,
+            (double)rt->cache_bytes_per_bank / 1073741824.0);
+    return rt;
+}
+
 /* v0.5.4 governance inc1 (item 16): the OPERATOR memory floor -- system
  * memory every admission spend must leave untouched no matter what any
  * boot-time budget says.  Default 4 GiB; ds4-server --mem-floor-gb is the
@@ -42789,10 +43292,10 @@ static uint64_t solar_trim_bank_cuda(uint32_t b, void *user) {
  * class, nothing more. */
 uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
     if (!ctx || want_bytes == 0) return 0;
-    /* EXAONE banks currently use fixed CUDA allocations.  They are fit before
+    /* EXAONE and Motif banks use fixed CUDA allocations.  They are fit before
      * allocation and cannot be partially unmapped; never fall through to the
      * unrelated DeepSeek slab trimmer. */
-    if (ctx->exaone) return 0;
+    if (ctx->exaone || ctx->motif3) return 0;
     if (ctx->solar) {
         /* ds4_gpu_tensor_trim unmaps VMM pages.  gen_mu prevents new server
          * launches but does not drain work already queued on the device; match
@@ -42967,6 +43470,59 @@ static int exaone_batch_ctx_create_impl(
 #undef EBC_ERR
 }
 
+static int motif3_batch_ctx_create_impl(
+        ds4_engine *e, int ctx_size, int max_seq, bool fit,
+        ds4_batch_ctx **out, char *err, size_t errlen) {
+#define MBC_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
+    uint32_t prefill_cap =
+        motif3_graph_prefill_cap_for_context((uint32_t)ctx_size);
+    if (prefill_cap < (uint32_t)max_seq) prefill_cap = (uint32_t)max_seq;
+    if (prefill_cap > (uint32_t)ctx_size || prefill_cap > 8192u) {
+        MBC_ERR("batch_ctx_create: Motif-3 prefill/decode capacity is invalid "
+                "(ctx=%d max_seq=%d prefill=%u)",
+                ctx_size, max_seq, prefill_cap);
+        return 1;
+    }
+
+    ds4_batch_ctx *ctx = xcalloc(1, sizeof(*ctx));
+    ctx->e = e;
+    ctx->ctx_size = (uint32_t)ctx_size;
+    ctx->prefill_cap = prefill_cap;
+    ctx->raw_cap = (uint32_t)ctx_size;
+    ctx->seq_cap = (uint32_t)ctx_size;
+    ctx->max_seq = (uint32_t)max_seq;
+    ctx->motif3 = motif3_batch_runtime_create(
+        e, ctx->ctx_size, ctx->max_seq, ctx->prefill_cap, fit);
+    if (!ctx->motif3) {
+        MBC_ERR("batch_ctx_create: Motif-3 bank runtime allocation failed "
+                "(max_seq=%u ctx=%u prefill=%u)",
+                ctx->max_seq, ctx->ctx_size, ctx->prefill_cap);
+        free(ctx);
+        return 1;
+    }
+    ctx->max_seq = ctx->motif3->max_seq;
+    if ((uint64_t)ctx->max_seq * ctx->seq_cap >
+        SIZE_MAX / sizeof(*ctx->bank_hist)) {
+        MBC_ERR("batch_ctx_create: Motif-3 bank history size overflow");
+        motif3_batch_runtime_free(ctx->motif3);
+        free(ctx);
+        return 1;
+    }
+    ctx->bank_hist = xmalloc(
+        (size_t)ctx->max_seq * ctx->seq_cap * sizeof(*ctx->bank_hist));
+    ctx->bank_hist_len = xcalloc(
+        ctx->max_seq, sizeof(*ctx->bank_hist_len));
+    ctx->bank_hist_valid = xcalloc(
+        ctx->max_seq, sizeof(*ctx->bank_hist_valid));
+    ctx->bank_gen = xmalloc(ctx->max_seq * sizeof(*ctx->bank_gen));
+    for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b] = 1u;
+    ctx->supports_partial_reuse = false;
+    ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
+    *out = ctx;
+    return 0;
+#undef MBC_ERR
+}
+
 static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                                      bool fit, ds4_batch_ctx **out, char *err, size_t errlen) {
 #define BC_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
@@ -42990,6 +43546,10 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
         return exaone_batch_ctx_create_impl(
+            e, ctx_size, max_seq, fit, out, err, errlen);
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        return motif3_batch_ctx_create_impl(
             e, ctx_size, max_seq, fit, out, err, errlen);
     }
 
@@ -43332,6 +43892,15 @@ int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_t
 
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     if (!ctx) return;
+    if (ctx->motif3) {
+        motif3_batch_runtime_free(ctx->motif3);
+        free(ctx->bank_hist);
+        free(ctx->bank_hist_len);
+        free(ctx->bank_hist_valid);
+        free(ctx->bank_gen);
+        free(ctx);
+        return;
+    }
     if (ctx->exaone) {
         exaone_batch_runtime_free(ctx->exaone);
         free(ctx->bank_hist);
@@ -43826,8 +44395,8 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
     for (int i = 0; i < n; i++) {
         if (prompts[i].len <= 0) { BCG_ERR("batched_generate_ctx: prompt %d is empty", i); return 1; }
         const uint32_t L = (uint32_t)prompts[i].len;
-        if (ctx->exaone && L > ctx->seq_cap) {
-            BCG_ERR("batched_generate_ctx: EXAONE prompt %d length %u "
+        if ((ctx->exaone || ctx->motif3) && L > ctx->seq_cap) {
+            BCG_ERR("batched_generate_ctx: family prompt %d length %u "
                     "exceeds context %u", i, L, ctx->seq_cap);
             return 1;
         }
@@ -43838,7 +44407,7 @@ int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompt
         }
         n_packed += L;
     }
-    if (ctx->exaone) {
+    if (ctx->exaone || ctx->motif3) {
         return family_engine_batched_generate_ctx(
             ctx, prompts, n, max_new_tokens, eos_ids, out, err, errlen);
     }
@@ -45132,23 +45701,82 @@ static int solar_engine_continuous_generate(
 #undef SCG_ERR
 }
 
-/* EXAONE uses the same continuous-serving contract and lifecycle as Solar,
- * but keeps one LLLG KV graph per bank.  Prefill scratch and weight-bound
- * decode stages are shared; position-dependent attention selects each row's
- * graph explicitly in exaone_graph_decode_attention_rows. */
-static int exaone_engine_continuous_generate(
+/* EXAONE and Motif share this lifecycle.  Their explicit runtimes differ only
+ * at reset/copy/prefill/decode/logits; keeping those six operations here makes
+ * the public scheduling semantics identical without a generic callback layer. */
+static uint32_t family_banked_prefill_cap(const ds4_batch_ctx *ctx) {
+    return ctx->motif3 ? ctx->motif3->prefill_cap
+                       : ctx->exaone->shared_ws.prefill_cap;
+}
+
+static bool family_banked_logits_valid(
+        const ds4_batch_ctx *ctx, uint32_t bank) {
+    return ctx->motif3 ? ctx->motif3->bank_logits_valid[bank] != 0u
+                       : ctx->exaone->bank_logits_valid[bank] != 0u;
+}
+
+static float *family_banked_logits(ds4_batch_ctx *ctx, uint32_t bank) {
+    return (ctx->motif3 ? ctx->motif3->bank_logits
+                        : ctx->exaone->bank_logits) +
+           (size_t)bank * DS4_N_VOCAB;
+}
+
+static void family_banked_reset(ds4_batch_ctx *ctx, uint32_t bank) {
+    if (ctx->motif3) {
+        motif3_batch_runtime_reset_bank(ctx->motif3, bank);
+    } else {
+        ctx->exaone->bank_logits_valid[bank] = 0u;
+    }
+}
+
+static bool family_banked_copy(
+        ds4_batch_ctx *ctx, uint32_t src, uint32_t dst,
+        uint32_t tokens) {
+    return ctx->motif3
+        ? motif3_batch_runtime_copy_bank(ctx->motif3, src, dst)
+        : exaone_batch_runtime_copy_bank(ctx->exaone, src, dst, tokens);
+}
+
+static bool family_banked_prefill(
+        ds4_batch_ctx *ctx, uint32_t bank, const int *tokens,
+        uint32_t rows, uint32_t pos, bool final) {
+    if (ctx->motif3) {
+        return motif3_batch_runtime_prefill(
+            ctx->motif3, &ctx->e->model, &ctx->e->weights,
+            bank, tokens, rows, pos, final);
+    }
+    ctx->exaone->bank_logits_valid[bank] = 0u;
+    return exaone_graph_prefill_chunk(
+               &ctx->exaone->graph[bank], &ctx->e->model, &ctx->e->weights,
+               tokens, rows, pos, final) &&
+           (!final || exaone_batch_runtime_read_prefill_logits(
+               ctx->exaone, bank));
+}
+
+static bool family_banked_decode(
+        ds4_batch_ctx *ctx, const uint32_t *banks, const int *tokens,
+        const uint32_t *positions, uint32_t rows) {
+    return ctx->motif3
+        ? motif3_batch_runtime_decode(
+              ctx->motif3, &ctx->e->model, &ctx->e->weights,
+              banks, tokens, positions, rows)
+        : exaone_batch_runtime_decode(
+              ctx->exaone, &ctx->e->model, &ctx->e->weights,
+              banks, tokens, positions, rows);
+}
+
+static int family_banked_engine_continuous_generate(
         ds4_batch_ctx *ctx,
         int (*admit)(void *ud, ds4_cont_request *req),
         int (*on_token)(void *ud, void *user, int token),
         void (*on_done)(void *ud, void *user,
                         const int *tokens, int n, int finish),
         void *ud, char *err, size_t errlen) {
-#define ECG_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
-    ds4_exaone_batch_runtime *rt = ctx->exaone;
+#define FCG_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
     const uint32_t MS = ctx->max_seq;
     ds4_family_cont_bank *bank = xcalloc(MS, sizeof(*bank));
     uint32_t prefill_cursor = 0u;
-    bool ok = rt != NULL;
+    bool ok = ctx->exaone != NULL || ctx->motif3 != NULL;
     ctx->last_done_set = 0u;
     ds4_metric_set(&ds4_metrics_get()->banks_live, 0u);
 
@@ -45213,11 +45841,11 @@ static int exaone_engine_continuous_generate(
                         ctx, (uint32_t)src, req.tokens, requested_cached);
                 if (source_ok) {
                     if ((uint32_t)src != b) {
-                        if (!exaone_batch_runtime_copy_bank(
-                                rt, (uint32_t)src, b, requested_cached)) {
+                        if (!family_banked_copy(
+                                ctx, (uint32_t)src, b, requested_cached)) {
                             ctx->bank_gen[b]++;
                             ctx->bank_hist_valid[b] = 0u;
-                            ECG_ERR("continuous_generate: EXAONE fork copy "
+                            FCG_ERR("continuous_generate: family bank fork copy "
                                     "failed src=%d dst=%u", src, b);
                             ok = false;
                             break;
@@ -45243,7 +45871,7 @@ static int exaone_engine_continuous_generate(
                 ctx->warm_rejects++;
             }
             if (cached == (uint32_t)req.n &&
-                !rt->bank_logits_valid[b]) {
+                !family_banked_logits_valid(ctx, b)) {
                 if (warm) ctx->warm_rejects++;
                 if (forked) ctx->fork_rejects++;
                 cached = 0u;
@@ -45259,7 +45887,7 @@ static int exaone_engine_continuous_generate(
             }
             if (cached == 0u) {
                 bank_hist_reset(ctx, b);
-                rt->bank_logits_valid[b] = 0u;
+                family_banked_reset(ctx, b);
                 ds4_metric_add(&ds4_metrics_get()->admits_cold, 1u);
             }
 
@@ -45315,17 +45943,16 @@ static int exaone_engine_continuous_generate(
                 const uint32_t remain = cb->prefill_len - cb->prefill_off;
                 if (remain != 0u) {
                     uint32_t n = remain;
-                    if (n > rt->shared_ws.prefill_cap)
-                        n = rt->shared_ws.prefill_cap;
+                    const uint32_t cap = family_banked_prefill_cap(ctx);
+                    if (n > cap) n = cap;
                     const uint32_t pos = cb->prefill_base + cb->prefill_off;
                     const bool final = n == remain;
-                    rt->bank_logits_valid[pb] = 0u;
-                    if (!exaone_graph_prefill_chunk(
-                            &rt->graph[pb], &ctx->e->model, &ctx->e->weights,
-                            cb->prefill + cb->prefill_off, n, pos, final)) {
+                    if (!family_banked_prefill(
+                            ctx, pb, cb->prefill + cb->prefill_off,
+                            n, pos, final)) {
                         ctx->bank_gen[pb]++;
                         ctx->bank_hist_valid[pb] = 0u;
-                        ECG_ERR("continuous_generate: EXAONE prefill failed "
+                        FCG_ERR("continuous_generate: family bank prefill failed "
                                 "bank=%u pos=%u n=%u", pb, pos, n);
                         ok = false;
                         break;
@@ -45336,19 +45963,10 @@ static int exaone_engine_continuous_generate(
                     ds4_metric_add(
                         &ds4_metrics_get()->tokens_prefilled_computed, n);
                     ds4_metrics_window_add(0u, 0u, n);
-                    if (final &&
-                        !exaone_batch_runtime_read_prefill_logits(rt, pb)) {
-                        ctx->bank_gen[pb]++;
-                        ctx->bank_hist_valid[pb] = 0u;
-                        ECG_ERR("continuous_generate: EXAONE prefill logits "
-                                "read failed for bank=%u", pb);
-                        ok = false;
-                        break;
-                    }
                 }
                 if (cb->prefill_off == cb->prefill_len) {
-                    if (!rt->bank_logits_valid[pb]) {
-                        ECG_ERR("continuous_generate: EXAONE bank %u has no "
+                    if (!family_banked_logits_valid(ctx, pb)) {
+                        FCG_ERR("continuous_generate: family bank %u has no "
                                 "frontier logits", pb);
                         ok = false;
                         break;
@@ -45357,7 +45975,7 @@ static int exaone_engine_continuous_generate(
                         ? cb->sample_override(ud, cb->user)
                         : DS4_SAMPLE_OVERRIDE_NONE;
                     const int token = sample_top_p_min_p_override(
-                        rt->bank_logits + (size_t)pb * DS4_N_VOCAB,
+                        family_banked_logits(ctx, pb),
                         DS4_N_VOCAB, cb->temperature, cb->top_k,
                         cb->top_p, cb->min_p, &cb->rng, override);
                     free(cb->prefill);
@@ -45385,9 +46003,9 @@ static int exaone_engine_continuous_generate(
         }
         if (!ok) break;
 
-        uint32_t decode_banks[DS4_EXAONE_DECODE_BATCH_MAX];
-        uint32_t decode_positions[DS4_EXAONE_DECODE_BATCH_MAX];
-        int decode_tokens[DS4_EXAONE_DECODE_BATCH_MAX];
+        uint32_t decode_banks[DS4_MULTISEQ_MAX_SEQ];
+        uint32_t decode_positions[DS4_MULTISEQ_MAX_SEQ];
+        int decode_tokens[DS4_MULTISEQ_MAX_SEQ];
         uint32_t decode_count = 0u;
         for (uint32_t b = 0; b < MS; b++) {
             ds4_family_cont_bank *cb = &bank[b];
@@ -45396,7 +46014,7 @@ static int exaone_engine_continuous_generate(
             if (pos >= ctx->seq_cap) {
                 ctx->bank_gen[b]++;
                 ctx->bank_hist_valid[b] = 0u;
-                ECG_ERR("continuous_generate: EXAONE bank %u reached "
+                FCG_ERR("continuous_generate: family bank %u reached "
                         "context limit", b);
                 ok = false;
                 break;
@@ -45406,21 +46024,21 @@ static int exaone_engine_continuous_generate(
             decode_tokens[decode_count] = cb->current;
             decode_count++;
         }
+        const uint32_t family_cap = family_banked_prefill_cap(ctx);
         const uint32_t decode_cap =
-            rt->shared_ws.prefill_cap < DS4_EXAONE_DECODE_BATCH_MAX
-                ? rt->shared_ws.prefill_cap
-                : DS4_EXAONE_DECODE_BATCH_MAX;
+            family_cap < DS4_MULTISEQ_MAX_SEQ
+                ? family_cap : DS4_MULTISEQ_MAX_SEQ;
         for (uint32_t off = 0u; ok && off < decode_count;) {
             uint32_t n = decode_count - off;
             if (n > decode_cap) n = decode_cap;
-            if (n == 0u || !exaone_batch_runtime_decode(
-                    rt, &ctx->e->model, &ctx->e->weights,
+            if (n == 0u || !family_banked_decode(
+                    ctx,
                     decode_banks + off, decode_tokens + off,
                     decode_positions + off, n)) {
                 const uint32_t b = decode_banks[off];
                 ctx->bank_gen[b]++;
                 ctx->bank_hist_valid[b] = 0u;
-                ECG_ERR("continuous_generate: EXAONE decode failed "
+                FCG_ERR("continuous_generate: family bank decode failed "
                         "rows=%u first_bank=%u pos=%u", n, b,
                         decode_positions[off]);
                 ok = false;
@@ -45438,7 +46056,7 @@ static int exaone_engine_continuous_generate(
                 ? cb->sample_override(ud, cb->user)
                 : DS4_SAMPLE_OVERRIDE_NONE;
             const int token = sample_top_p_min_p_override(
-                rt->bank_logits + (size_t)b * DS4_N_VOCAB,
+                family_banked_logits(ctx, b),
                 DS4_N_VOCAB, cb->temperature, cb->top_k,
                 cb->top_p, cb->min_p, &cb->rng, override);
             cb->generated[cb->generated_len++] = token;
@@ -45468,7 +46086,7 @@ static int exaone_engine_continuous_generate(
             if (bank[b].phase != FAMILY_CONT_FREE) {
                 ctx->bank_gen[b]++;
                 ctx->bank_hist_valid[b] = 0u;
-                rt->bank_logits_valid[b] = 0u;
+                family_banked_reset(ctx, b);
             }
         }
     }
@@ -45479,7 +46097,7 @@ static int exaone_engine_continuous_generate(
     free(bank);
     ds4_metric_set(&ds4_metrics_get()->banks_live, 0u);
     return ok ? 0 : 1;
-#undef ECG_ERR
+#undef FCG_ERR
 }
 
 typedef struct {
@@ -45537,8 +46155,8 @@ static int family_engine_batched_generate_ctx(
         .out = out,
         .n = n,
     };
-    const int rc = ctx->exaone
-        ? exaone_engine_continuous_generate(
+    const int rc = (ctx->exaone || ctx->motif3)
+        ? family_banked_engine_continuous_generate(
               ctx, family_static_admit, NULL, family_static_done,
               &batch, err, errlen)
         : solar_engine_continuous_generate(
@@ -45575,8 +46193,8 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
         CG_ERR("continuous_generate: this model does not yet implement the multi-sequence graph");
         return 1;
     }
-    if (ctx->exaone) {
-        return exaone_engine_continuous_generate(
+    if (ctx->exaone || ctx->motif3) {
+        return family_banked_engine_continuous_generate(
             ctx, admit, on_token, on_done, ud, err, errlen);
     }
     if (ctx->solar) {
@@ -49931,11 +50549,9 @@ bool ds4_engine_supports_batching(ds4_engine *e) {
     if (!e || !ds4_backend_uses_graph(e->backend) || !e->metal_ready) {
         return false;
     }
-    /* Solar and EXAONE dispatch to their own persistent-bank runtimes;
-     * DeepSeek retains the upstream multi-sequence graph.  Motif-3 currently
-     * serves through its exact native session rather than entering the
-     * incompatible DeepSeek bank graph. */
-    return DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MOTIF3;
+    /* Solar, EXAONE, and Motif dispatch to family-specific persistent-bank
+     * runtimes; DeepSeek retains the upstream multi-sequence graph. */
+    return true;
 }
 
 int ds4_engine_model_id(ds4_engine *e) {
@@ -50104,6 +50720,16 @@ static bool exaone_graph_session_fit_check(ds4_backend backend,
  * drift: sizing, quality/power adoption, directional steering. */
 static int ds4_session_alloc_graph(ds4_session *s) {
     ds4_engine *e = s->engine;
+    if (ds4_session_is_motif3(s)) {
+        if (!motif3_graph_alloc(&s->motif3_graph, s->prefill_cap) ||
+            !motif3_graph_alloc_latent_cache(
+                &s->motif3_graph, (uint32_t)s->ctx_size)) {
+            s->motif3_graph_ready = false;
+            return 1;
+        }
+        s->motif3_graph_ready = true;
+        return 0;
+    }
     if (ds4_session_is_exaone(s)) {
         if (!exaone_graph_session_fit_check(e->backend,
                                             (uint32_t)s->ctx_size,
@@ -50250,26 +50876,16 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->engine = e;
         s->ctx_size = ctx_size;
         s->generation = 1u;
-        uint32_t motif_chunk = 4096u;
-        const char *chunk_env = getenv("DS4_MOTIF3_PREFILL_CHUNK");
-        if (chunk_env && chunk_env[0]) {
-            char *end = NULL;
-            const unsigned long value = strtoul(chunk_env, &end, 10);
-            if (end != chunk_env && *end == '\0' && value <= UINT32_MAX)
-                motif_chunk = (uint32_t)value;
-        }
-        if (motif_chunk == 0u) motif_chunk = 1u;
-        if (motif_chunk > 8192u) motif_chunk = 8192u;
-        if (motif_chunk > (uint32_t)ctx_size) motif_chunk = (uint32_t)ctx_size;
-        s->prefill_cap = motif_chunk;
-        if (!motif3_graph_alloc(&s->motif3_graph, s->prefill_cap) ||
-            !motif3_graph_alloc_latent_cache(
-                    &s->motif3_graph, (uint32_t)ctx_size)) {
+        s->prefill_cap =
+            motif3_graph_prefill_cap_for_context((uint32_t)ctx_size);
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        if (ds4_session_lazy_graph_enabled()) {
+            s->graph_pending = true;
+        } else if (ds4_session_alloc_graph(s) != 0) {
+            free(s->logits);
             free(s);
             return 1;
         }
-        s->motif3_graph_ready = true;
-        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         *out = s;
         return 0;
 #endif
@@ -50872,6 +51488,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 #ifndef DS4_NO_GPU
     if (ds4_session_is_motif3(s)) {
+        if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;
         if (!s->motif3_graph_ready ||
             !s->motif3_graph.latent_cache_ready) {
             snprintf(err, errlen, "Motif-3 latent session is not initialized");
