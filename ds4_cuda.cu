@@ -139,7 +139,17 @@ static int g_model_cache_full;
  * base-map-only and their maps stay host-registered), so declaring them
  * would overcharge lever boots.  Single-writer under the server's gen_mu
  * serialization; a racy reader sees a stale-HIGH outstanding (covered
- * lags), the conservative direction. */
+ * lags), the conservative direction.
+ *
+ * memgov D5-4 adjudication: these counters are NOT a retired coverage
+ * belt -- they ARE ds4_gpu_substrate_outstanding's data source, and that
+ * value is subtracted by every session-graph fit verdict, rendered on the
+ * census totals line and /metrics, and bit-identity-asserted by the
+ * standing gates.  Plan sec 12's "remove global coverage counters" is
+ * gated on "after all callers migrate": deletion rides the same
+ * post-v0.5.7 field-confidence gate as the legacy admission formulas
+ * (the D4-0 adjudication), when the physical plan becomes the sole
+ * decision authority. */
 static uint64_t g_substrate_promotable_total;
 static uint64_t g_substrate_promotable_covered;
 
@@ -1090,6 +1100,14 @@ static const char *g_derived_artifact_none_reason;
  * then (a partial set would leave some expert raws on the pageable tier
  * while still pinning ~90 GiB — the worst of both). */
 static int g_derived_replaces_complete;
+/* memgov D5-4 adjudication: g_model_range_bytes survives v0.5.7 -- it
+ * feeds the RETAINED legacy budget predicates (the D4-0 adjudication
+ * keeps legacy formulas until a full release of field confidence) and
+ * the cold/lazy/boot materialize claims' proposed_outstanding.  Plan
+ * sec 15's "replace promotable - g_model_range_bytes with a physical
+ * residency plan" deletes it only when those callers migrate -- a
+ * DECISION-INPUT change (enforce-mode verdicts + d0a oracle parity),
+ * post-v0.5.7 with the formula retirement. */
 static uint64_t g_model_range_bytes;
 static uint64_t g_derived_range_bytes;
 
