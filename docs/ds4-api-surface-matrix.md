@@ -6,8 +6,8 @@ known gaps. It is the frozen oracle for the API-promotion arc: later
 increments change routing and must update this file in the same commit.
 
 The wire contracts below are model-family neutral in `ds4-dfm`. DeepSeek uses
-the Entrpi continuous graph, Solar Open2 and K-EXAONE provide family-native
-persistent banks, and Motif-3 currently uses the serial native-session lane.
+the Entrpi continuous graph, while Solar Open2, K-EXAONE, and Motif-3 provide
+family-native persistent banks.
 Tokenizer, prompt/tool syntax, and stop-token handling are dispatched by the
 loaded model family without changing the endpoint schemas.
 

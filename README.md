@@ -38,7 +38,7 @@ deployed families:
 | DeepSeek V4 Flash | `deepseek4` | Entrpi continuous-batch core; optional DSpark drafter |
 | Solar Open2 250B | `solar-open2` | Native recurrent/GQA persistent banks |
 | K-EXAONE 236B A23B | `exaone-moe` | Native LLLG persistent banks with shared prefill scratch |
-| Motif-3 | `motif3` | Native latent-KV session lane; multi-bank runtime not yet integrated |
+| Motif-3 | `motif3` | Native latent-KV persistent banks |
 
 The serving command and HTTP contract do not change with the family; only the
 GGUF path and the matching weight-owner manifest change:
@@ -459,19 +459,28 @@ inference worker. Run the owner's `--dry-run` preflight first, then remove
   --reserve-gb 24 --no-repack-q8-aligned --dry-run
 
 DS4_CUDA_WEIGHT_IPC_MANIFEST=/path/to/run/weights.manifest \
-  ./ds4-server -m /path/to/Motif-3-MQ87-88-FIT.gguf -c 2048 \
-  --host 0.0.0.0 --port 8001
+DS4_CUDA_WEIGHT_IPC_SCOPE=base \
+DS4_SERVER_COALESCE_MAX=3 \
+DS4_SERVER_COALESCE_MAX_TOKENS=8192 \
+DS4_BATCH_FIT_HEADROOM_MB=6144 \
+DS4_MOTIF3_PREFILL_CHUNK=8192 \
+DS4_CONT_PREFILL_CHUNK=8192 \
+DS4_CONT_PREFILL_CHUNK_LIVE=8192 \
+  ./ds4-server -m /path/to/Motif-3-MQ87-88-FIT.gguf -c 196608 \
+  --host 0.0.0.0 --port 8002 --no-spec
 ```
 
 The shared server surface includes OpenAI chat/completions, Responses, and
 Anthropic Messages, with streaming and non-streaming modes. On the reference
 GB10, the verified Motif path reaches 457.28 tok/s at 8K prefill, 396.47 tok/s
 at a strict 32K OpenAI gate, and 175.61 tok/s prefill plus 2.52 tok/s decode at
-the strict 256K gate. These are single-run, greedy, no-thinking measurements;
-the native Motif lane remains serial. See
+the strict 256K gate. The non-speculative persistent runtime also completed
+three simultaneous 192-token Chat generations at `-c 196608` in 25.03 s
+(23.01 aggregate output tok/s, zero serial fallbacks), and an 8,214-token
+cold request exercised the 8,192-token prefill chunk at 266.3 tok/s. See
 [`docs/ds4-dfm-model-families.md`](docs/ds4-dfm-model-families.md) for exact
-conditions and correctness evidence. MTP is not enabled or described as a
-speedup until target-token identity and end-to-end throughput are measured.
+conditions and correctness evidence. Motif serving uses plain decode; MTP and
+DSpark support models remain DeepSeek-only.
 
 ## Speed
 

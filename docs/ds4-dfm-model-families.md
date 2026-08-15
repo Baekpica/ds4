@@ -38,7 +38,7 @@ This keeps the changes reviewable for a possible future upstream contribution.
 | DeepSeek V4 Flash | `general.architecture=deepseek4` | Entrpi compressed KV and continuous graph | continuous or serial |
 | Solar Open2 250B | `general.architecture=solar-open2` | recurrent KDA state plus compressed GQA KV | persistent multi-bank |
 | K-EXAONE 236B A23B | `general.architecture=exaone-moe` | LLLG full/sliding GQA KV | persistent multi-bank |
-| Motif-3 | `general.architecture=motif3` | normalized latent KV, rotated `k_pe`, and SWA rings | serial native session |
+| Motif-3 | `general.architecture=motif3` | normalized latent KV, rotated `k_pe`, and SWA rings | persistent multi-bank |
 
 The scheduler implementation may differ because the model states differ, but
 the operator and client contract is the same. Changing `-m` to a GGUF from a
@@ -131,12 +131,12 @@ also includes the later strict long-context gate documented below:
 | DeepSeek V4 Flash | 80.76 GiB base plus 6.49 GiB DSpark; 72.56 GiB aligned artifacts | detected DSpark automatically; one Chat request completed with zero failures |
 | Solar Open2 250B | 11 shards, 88.97 GiB; 32.23 GiB aligned IQ2 artifacts | two persistent banks; two concurrent Chat requests completed on the continuous route |
 | K-EXAONE 236B A23B | 3 shards, 85.56 GiB; 30.16 GiB aligned IQ2 artifacts | two persistent banks; two concurrent Chat requests completed on the continuous route |
-| Motif-3 | 94,162,541,472-byte canonical GGUF; 7.00 GiB raw plus 86.07 GiB in 590 derived artifacts | all four API surfaces completed; strict 262,080-token prompt plus decode passed |
+| Motif-3 | 94,162,541,472-byte canonical GGUF; current owner exports 7.00 GiB raw plus 80.68 GiB in 153 aligned expert artifacts | all four API surfaces, strict 262,080-token prompt plus decode, and three concurrent 196K-context banks passed |
 
 The Motif artifact is 94.16 GB, or 87.6957 GiB; 87.70 is its binary GiB size,
-not its decimal GB size. Its owner exported 644 VMM ranges: 54 raw ranges plus
-590 derived Q2_K, IQ2_XXS, Q8_0, and Motif W_UV value-layout artifacts. The
-worker imported those ranges without a duplicate model copy.
+not its decimal GB size. The current owner exported 207 VMM ranges: 54 raw
+ranges plus 153 aligned Q2_K and IQ2_XXS expert artifacts. The worker imported
+those ranges without a duplicate model copy.
 
 ## Motif-3 DGX Spark performance evidence
 
@@ -181,14 +181,37 @@ The final strict gate JSON and server log were retained with SHA-256
 `90b064268bcc31498e653d27fcf5087064910bf9a6963f4fe239dc295b0fbeda`,
 respectively.
 
+### Motif-3 196K multi-bank serving evidence
+
+The persistent-bank extension at `03b7002` and `cf605e0` was built as
+`sm_121a` and run with `-c 196608`, three banks, an 8,192-token prefill chunk,
+and `--no-spec`. The explicit 6 GiB batch-fit headroom left the measured
+configuration at three banks instead of the conservative default reducing it
+to two.
+
+| Gate | Result |
+|---|---|
+| API surface | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and `/v1/messages` each returned HTTP 200 with the native response shape |
+| 8K cold prefill | 8,214 prompt tokens at 266.3 tok/s; `LONG_OK` returned exactly |
+| Single decode | 192 output tokens; 490.4 ms TTFT, 12.9 tok/s decode, 15.350 s HTTP wall time |
+| Three simultaneous Chat requests | 192 output tokens each in 24.885--25.030 s; 23.01 aggregate output tok/s; server log `served=3 fallback=0` |
+
+After the gates, `/v1/stats` reported 11 completed requests, zero failures,
+zero serial requests, zero continuous-batch failures, three total and zero
+live banks, and zero speculative drafts. The VMM owner used 90,119 MiB, the
+worker used 22,283 MiB after the 8K requests, and the system retained about
+6.5 GiB available without an OOM event. Loaded SM clock remained 2,411 MHz;
+the 611 MHz pin did not recur.
+
 ## Current limits
 
-- Motif-3 does not yet have a native persistent multi-bank runtime, so it uses
-  the safe serial session lane behind the same APIs.
+- Motif-3 has three verified persistent banks at `-c 196608` on the reference
+  Spark. Concurrent 256K banks are not claimed.
 - The Motif-3 256K result validates one strict serial request on this exact
   artifact and GB10 host. It does not validate concurrent 256K banks or other
   accelerators.
-- Motif-3 MTP remains default-off and has no published speedup claim.
+- Motif-3 serving uses plain decoding; MTP and DSpark support models remain
+  DeepSeek-only.
 - EXAONE durable bank payload serialization is intentionally unavailable; its
   fixed banks support exact-frontier in-process reuse and fork copies.
 - Model cards contain only verified behavior and performance. Profiling

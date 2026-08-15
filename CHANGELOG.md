@@ -7,6 +7,10 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## v0.5.6.3-dfm — 2026-08-15
 
+- Motif-3 now has a native persistent three-bank runtime. On the reference
+  Spark, `-c 196608` with an 8,192-token prefill chunk completed three
+  simultaneous 192-token Chat generations with zero serial fallback and
+  23.01 aggregate output tok/s. Motif serving remains non-speculative.
 - Motif-3 now completes the strict single-GB10 256K OpenAI gate: 262,080
   prompt tokens at 175.61 tok/s followed by 43 decoded tokens at 2.52 tok/s,
   with exact beginning, middle, and end retrieval sentinels.
