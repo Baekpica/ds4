@@ -547,6 +547,17 @@ int      ds4_gpu_mem_census_epoch_verify(uint64_t began);
 /* D0a-2 typed observation provider (CUDA real; Metal reports
  * UNSUPPORTED).  ds4_gpu_mem_info is now a shim over this. */
 int  ds4_gpu_mem_observe(ds4_mem_observation *out);
+/* memgov D5-2: residency-plan observability readers (plan sec 14
+ * ds4_residency_units{policy,state} + ds4_residency_failures_total
+ * {model_role,stage}).  Monotonic engine counters over the PUBLIC
+ * vocabularies (ds4_mem_census.h): units keyed by source residency
+ * policy rows (DS4_RESUNIT_POLICY_ROWS; the last row is UNATTRIBUTED)
+ * x ds4_residency_unit_state; failures by ds4_model_source_role x
+ * DS4_RESSTAGE_*.  Nonzero = out of domain, or a backend that keeps no
+ * residency plan (Metal/CPU) -- porcelains render ABSENCE there, the
+ * census contract. */
+int  ds4_gpu_residency_units_read(int policy, int state, uint64_t *out);
+int  ds4_gpu_residency_failures_read(int role, int stage, uint64_t *out);
 /* D0a-4 trim failure-injection (TEST ONLY).  set() arms a bounded burst
  * at one driver site inside ds4_gpu_tensor_trim (DS4_TRIM_INJECT_UNMAP /
  * _RELEASE; OFF disarms) and always overrides the DS4_CUDA_TRIM_INJECT
@@ -772,6 +783,12 @@ typedef struct {
                              [DS4_GOV_STATUS__COUNT]
                              [DS4_GOV_CMP__COUNT];
     uint64_t memgov_faults;       /* publish/evaluate faults (gov ledger) */
+    /* memgov D5-2: last-decision deficit per consumer (plan sec 14
+     * ds4_memory_decision_deficit_bytes{consumer}, a GAUGE).  Written by
+     * every governed check from its quote -- an ADMIT writes 0, so the
+     * gauge always describes the most recent verdict, never a stale
+     * refusal. */
+    uint64_t memgov_deficit[DS4_GOVC__COUNT];
     /* memgov D4-3: reclaim outcome counters, fixed cardinality by
      * construction (ds4_reclaim_status is closed).  Per-BANK outcomes and
      * released bytes, ticked inside reclaim commit so every consumer is

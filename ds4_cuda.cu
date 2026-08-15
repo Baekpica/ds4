@@ -3374,27 +3374,62 @@ static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
  * Typed per-unit outcomes; ONE publication per unit (every device-copy
  * range stamps unit_lo == unit_hi by construction).  Plan decisions —
  * policy, coverage, budget funding — belong to the caller; the copy
- * transaction below is purely physical.  WAIVED_OPTIONAL is reserved
- * (no optional promote units exist in the 0731 catalogs); the enum
- * keeps the plan's fixed cardinality like the census classes. */
-enum {
-    CUDA_MAT_POPULATED = 0,
-    CUDA_MAT_ALREADY_READY,
-    CUDA_MAT_SATISFIED_IMPORT,
-    CUDA_MAT_HOST_MAPPED_BY_POLICY,
-    CUDA_MAT_LAZY_DEFERRED,          /* D3-2: source residency = lazy —
-                                        the eager pass leaves the unit to
-                                        first touch by SCHEDULE (vs the
-                                        budget's unfunded, which is a
-                                        REFUSAL of the same deferral) */
-    CUDA_MAT_EXPERT_COLD_BY_POLICY,  /* D3-4: fd-tier touch on a unit the
-                                        catalog stamps EXPERT_COLD — cold
-                                        by POLICY, never device-promoted */
-    CUDA_MAT_WAIVED_OPTIONAL,
-    CUDA_MAT_FAILED,
-    CUDA_MAT__COUNT
-};
-static uint64_t g_materialize_outcomes[CUDA_MAT__COUNT];
+ * transaction below is purely physical.  The outcome vocabulary is the
+ * PUBLIC ds4_residency_unit_state (ds4_mem_census.h, memgov D5-2; the
+ * former engine-private CUDA_MAT_* enum retired into it verbatim:
+ * LAZY_DEFERRED = source residency lazy, the eager pass defers to first
+ * touch by SCHEDULE vs the budget's unfunded REFUSAL of the same
+ * deferral (D3-2); EXPERT_COLD_BY_POLICY = fd-tier touch on a unit the
+ * catalog stamps cold by POLICY, never device-promoted (D3-4)).
+ *
+ * memgov D5-2: outcome counters keyed by the SOURCE's resolved residency
+ * policy (+ the unattributed row), read by the porcelains through
+ * ds4_gpu_residency_units_read.  FAILED outcomes additionally attribute
+ * {model_role, stage} for ds4_residency_failures_total.  Plain monotonic
+ * counters (metrics-registry discipline), no epoch bracket. */
+static uint64_t g_materialize_outcomes[DS4_RESUNIT_POLICY_ROWS][DS4_RESUNIT__COUNT];
+static uint64_t g_residency_failures[DS4_MSRC_ROLE__COUNT][DS4_RESSTAGE__COUNT];
+
+/* One tick funnel: src < 0 (or a bad policy byte) lands in the
+ * unattributed row, never dropped -- totals preserved by construction. */
+static void cuda_resunit_note_n(int src, int oc, uint64_t n) {
+    int pol = DS4_RESIDENCY__COUNT;
+    if (src >= 0 && src < DS4_MSRC_MAX) {
+        const int r = g_model_srcs.v[src].residency;
+        if (r >= 0 && r < DS4_RESIDENCY__COUNT) pol = r;
+    }
+    if (oc >= 0 && oc < DS4_RESUNIT__COUNT)
+        g_materialize_outcomes[pol][oc] += n;
+}
+
+static void cuda_resunit_fail_note_n(int src, int stage, uint64_t n) {
+    int role = DS4_MSRC_ROLE_PRIMARY;
+    if (src >= 0 && src < DS4_MSRC_MAX) {
+        const int r = g_model_srcs.v[src].role;
+        if (r >= 0 && r < DS4_MSRC_ROLE__COUNT) role = r;
+    }
+    if (stage >= 0 && stage < DS4_RESSTAGE__COUNT)
+        g_residency_failures[role][stage] += n;
+}
+
+/* memgov D5-2: porcelain readers.  Nonzero = out of the fixed domain
+ * (the absence answer on backends that keep no plan is the Metal/CPU
+ * stub's, mirroring the census read contract). */
+extern "C" int ds4_gpu_residency_units_read(int policy, int state,
+                                            uint64_t *out) {
+    if (!out || policy < 0 || policy >= DS4_RESUNIT_POLICY_ROWS ||
+        state < 0 || state >= DS4_RESUNIT__COUNT) return 1;
+    *out = g_materialize_outcomes[policy][state];
+    return 0;
+}
+
+extern "C" int ds4_gpu_residency_failures_read(int role, int stage,
+                                               uint64_t *out) {
+    if (!out || role < 0 || role >= DS4_MSRC_ROLE__COUNT ||
+        stage < 0 || stage >= DS4_RESSTAGE__COUNT) return 1;
+    *out = g_residency_failures[role][stage];
+    return 0;
+}
 
 /* Copy ONE funded unit into an arena carve and publish it.  Failure
  * leaves any carve behind (bump arenas cannot un-carve) — the census
@@ -3408,10 +3443,10 @@ static int cuda_unit_materialize_copy(const void *model_map,
                                       int direct_discard, const char *what) {
     char *dev = cuda_vmm_arena_alloc(model_map, u->src_bytes, what);
     if (!dev) dev = cuda_model_arena_alloc(model_map, u->src_bytes, what);
-    if (!dev) return CUDA_MAT_FAILED;
+    if (!dev) return DS4_RESUNIT_FAILED;
     if (!cuda_stage_copy_to_dev(model_map, u->src_off, u->src_bytes, dev,
                                 direct_discard, what))
-        return CUDA_MAT_FAILED;
+        return DS4_RESUNIT_FAILED;
     /* memgov D2-2: a claimed promotion path; the funnel's post-freeze
      * tripwire keys on the marker (no early return between set and
      * clear: publish is the next call). */
@@ -3421,7 +3456,7 @@ static int cuda_unit_materialize_copy(const void *model_map,
                                               NULL, NULL, 0, 0, 1, 0, 0,
                                               0, 0, 0});
     g_in_governed_materialize = 0;
-    if (!pub) return CUDA_MAT_FAILED;
+    if (!pub) return DS4_RESUNIT_FAILED;
     g_model_range_bytes += u->src_bytes;
     cuda_substrate_cover(model_map, u->src_bytes);   /* tripwire: unit materialized */
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -3431,7 +3466,7 @@ static int cuda_unit_materialize_copy(const void *model_map,
                 (double)u->src_bytes / 1048576.0,
                 (double)g_model_range_bytes / 1073741824.0);
     }
-    return CUDA_MAT_POPULATED;
+    return DS4_RESUNIT_POPULATED;
 }
 
 /* memgov D1b-2: the LAZY pass materializes CONTAINING UNITS through the
@@ -3479,7 +3514,7 @@ static const char *cuda_model_range_ptr_from_fd(
          * eligibility is deliberately untouched (bug-for-bug; its own
          * adjudication rides D3-4). */
         if (u->policy == DS4_UPOL_HOST_MAPPED) {
-            g_materialize_outcomes[CUDA_MAT_HOST_MAPPED_BY_POLICY]++;
+            cuda_resunit_note_n(src, DS4_RESUNIT_HOST_MAPPED_BY_POLICY, 1);
             return NULL;
         }
         /* memgov D3-4 adjudication: EXPERT_COLD stays cold by POLICY,
@@ -3492,7 +3527,7 @@ static const char *cuda_model_range_ptr_from_fd(
          * artifacts or a blanket tier first).  The exit below is the
          * budget-exhausted exit verbatim, taken deterministically. */
         if (u->policy == DS4_UPOL_EXPERT_COLD) {
-            g_materialize_outcomes[CUDA_MAT_EXPERT_COLD_BY_POLICY]++;
+            cuda_resunit_note_n(src, DS4_RESUNIT_EXPERT_COLD_BY_POLICY, 1);
             return cuda_model_direct_fallback_ptr(model_map, offset);
         }
         int covered = 0;
@@ -3535,8 +3570,10 @@ static const char *cuda_model_range_ptr_from_fd(
         }
         const int oc = cuda_unit_materialize_copy(model_map, u,
                                                   /*direct_discard=*/1, what);
-        g_materialize_outcomes[oc]++;
-        if (oc != CUDA_MAT_POPULATED) return NULL;
+        cuda_resunit_note_n(src, oc, 1);
+        if (oc == DS4_RESUNIT_FAILED)
+            cuda_resunit_fail_note_n(src, DS4_RESSTAGE_LAZY, 1);
+        if (oc != DS4_RESUNIT_POPULATED) return NULL;
     }
     /* Every needed unit is device-resident: the resolve that missed now
      * hits (single-unit requests — the live shape).  A multi-unit span
@@ -6088,19 +6125,19 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
      * eager to O_DIRECT + discard (the F4 measured mode). */
     const int direct_discard =
         getenv("DS4_CUDA_EAGER_SOURCE_DISCARD") != NULL;
-    uint64_t counts[CUDA_MAT__COUNT] = {0};
+    uint64_t counts[DS4_RESUNIT__COUNT] = {0};
     uint32_t promote = 0, funded = 0, unfunded = 0;
     uint64_t pop_bytes = 0;
     int failed = 0;
     for (uint32_t i = 0; i < nu && !failed; i++) {
         const ds4_phys_unit *u = &units[i];
         if (u->policy == DS4_UPOL_HOST_MAPPED) {
-            counts[CUDA_MAT_HOST_MAPPED_BY_POLICY]++;
+            counts[DS4_RESUNIT_HOST_MAPPED_BY_POLICY]++;
             continue;
         }
         if (u->policy != DS4_UPOL_DEVICE_PROMOTE) continue;
         if (lazy_schedule) {
-            counts[CUDA_MAT_LAZY_DEFERRED]++;
+            counts[DS4_RESUNIT_LAZY_DEFERRED]++;
             continue;
         }
         promote++;
@@ -6113,7 +6150,7 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
                     nm, i, (unsigned long long)u->src_off,
                     (unsigned long long)u->src_bytes,
                     (unsigned long long)model_size);
-            counts[CUDA_MAT_FAILED]++;
+            counts[DS4_RESUNIT_FAILED]++;
             failed = 1;
             continue;
         }
@@ -6128,8 +6165,8 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
             }
         }
         if (covered) {
-            counts[exact_hit ? CUDA_MAT_ALREADY_READY
-                             : CUDA_MAT_SATISFIED_IMPORT]++;
+            counts[exact_hit ? DS4_RESUNIT_ALREADY_READY
+                             : DS4_RESUNIT_SATISFIED_IMPORT]++;
             cuda_substrate_cover(model_map, u->src_bytes);
             continue;
         }
@@ -6167,7 +6204,7 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
         const int oc = cuda_unit_materialize_copy(model_map, u,
                                                   direct_discard, label);
         counts[oc]++;
-        if (oc == CUDA_MAT_POPULATED) {
+        if (oc == DS4_RESUNIT_POPULATED) {
             pop_bytes += u->src_bytes;
             /* Incremental boot lease: resident tracks the range registry
              * so each later unit's quote charges only ITS bytes.  The
@@ -6175,7 +6212,7 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
              * full census absolute (leases replace, never accumulate). */
             ds4_gov_publish_use(DS4_GOVC_ENGINE_BOOT,
                                 g_model_range_bytes, g_model_range_bytes);
-        } else if (oc == CUDA_MAT_FAILED) {
+        } else if (oc == DS4_RESUNIT_FAILED) {
             failed = 1;
         }
     }
@@ -6183,21 +6220,22 @@ extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
      * after engine open, and the pre-D1b walk left no staging behind.
      * The lazy tier re-allocates on its first miss. */
     cuda_model_stage_pool_release();
-    for (int i = 0; i < CUDA_MAT__COUNT; i++)
-        g_materialize_outcomes[i] += counts[i];
+    for (int i = 0; i < DS4_RESUNIT__COUNT; i++)
+        cuda_resunit_note_n(src, i, counts[i]);
+    cuda_resunit_fail_note_n(src, DS4_RESSTAGE_BOOT, counts[DS4_RESUNIT_FAILED]);
     if (populated_bytes) *populated_bytes = pop_bytes;
     fprintf(stderr,
             "ds4: materialize %s: funded %u/%u promote units (%u unfunded), "
             "populated %llu (%.2f GiB), ready %llu, import %llu, "
             "mapped-policy %llu, lazy-policy %llu, failed %llu\n",
             nm, funded, promote, unfunded,
-            (unsigned long long)counts[CUDA_MAT_POPULATED],
+            (unsigned long long)counts[DS4_RESUNIT_POPULATED],
             (double)pop_bytes / 1073741824.0,
-            (unsigned long long)counts[CUDA_MAT_ALREADY_READY],
-            (unsigned long long)counts[CUDA_MAT_SATISFIED_IMPORT],
-            (unsigned long long)counts[CUDA_MAT_HOST_MAPPED_BY_POLICY],
-            (unsigned long long)counts[CUDA_MAT_LAZY_DEFERRED],
-            (unsigned long long)counts[CUDA_MAT_FAILED]);
+            (unsigned long long)counts[DS4_RESUNIT_ALREADY_READY],
+            (unsigned long long)counts[DS4_RESUNIT_SATISFIED_IMPORT],
+            (unsigned long long)counts[DS4_RESUNIT_HOST_MAPPED_BY_POLICY],
+            (unsigned long long)counts[DS4_RESUNIT_LAZY_DEFERRED],
+            (unsigned long long)counts[DS4_RESUNIT_FAILED]);
     return failed ? 0 : 1;
 }
 

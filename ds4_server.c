@@ -16523,6 +16523,18 @@ static const char *gov_cmp_names[DS4_GOV_CMP__COUNT] = {
     "agree", "live_stricter", "shadow_stricter", "verdict_class",
     "obs_policy", "fault",
 };
+/* memgov D5-2: residency-unit vocabularies, positional against the
+ * public enums (ds4_mem_census.h); policy + role labels come from the
+ * header's own name fns so the surfaces cannot drift. */
+static const char *resunit_state_names[DS4_RESUNIT__COUNT] = {
+    "populated", "already_ready", "satisfied_import",
+    "host_mapped_by_policy", "lazy_deferred", "expert_cold_by_policy",
+    "waived_optional", "failed",
+};
+static const char *resstage_names[DS4_RESSTAGE__COUNT] = { "boot", "lazy" };
+static const char *resunit_policy_name(int p) {
+    return p < DS4_RESIDENCY__COUNT ? ds4_residency_name(p) : "unattributed";
+}
 
 typedef struct {
     ds4_mem_cell cells[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
@@ -16922,10 +16934,49 @@ static void send_metrics(server *s, int fd) {
                             gov_cmp_names[r],
                             (unsigned long long)ds4_metric_read(
                                 &m->memgov_decisions[c][st][r]));
+            /* memgov D5-2: last-decision deficit gauge (sec 14) -- an
+             * ADMIT writes 0, so a nonzero cell is a live refusal's
+             * shortfall in bytes, per consumer. */
+            buf_puts(&b, "# TYPE ds4_memory_decision_deficit_bytes gauge\n");
+            for (int c = 0; c < DS4_GOVC__COUNT; c++)
+                buf_printf(&b,
+                    "ds4_memory_decision_deficit_bytes{consumer=\"%s\"} %llu\n",
+                    gov_consumer_names[c],
+                    (unsigned long long)ds4_metric_read(&m->memgov_deficit[c]));
             buf_printf(&b, "# TYPE ds4_memory_governor_faults_total counter\n"
                            "ds4_memory_governor_faults_total %llu\n",
                        (unsigned long long)ds4_metric_read(&m->memgov_faults));
         }
+        /* memgov D5-2: residency-plan families -- units by source
+         * residency policy x outcome state, failures by model role x
+         * stage; closed public vocabularies (ds4_mem_census.h).  ABSENT
+         * where the backend keeps no plan (Metal/CPU), the census
+         * contract; all cells always emitted where supported. */
+#ifndef DS4_NO_GPU
+        {
+            uint64_t rv;
+            if (ds4_gpu_residency_units_read(0, 0, &rv) == 0) {
+                buf_puts(&b, "# TYPE ds4_residency_units counter\n");
+                for (int p = 0; p < DS4_RESUNIT_POLICY_ROWS; p++)
+                    for (int st = 0; st < DS4_RESUNIT__COUNT; st++) {
+                        (void)ds4_gpu_residency_units_read(p, st, &rv);
+                        buf_printf(&b,
+                            "ds4_residency_units{policy=\"%s\",state=\"%s\"} %llu\n",
+                            resunit_policy_name(p), resunit_state_names[st],
+                            (unsigned long long)rv);
+                    }
+                buf_puts(&b, "# TYPE ds4_residency_failures_total counter\n");
+                for (int r = 0; r < DS4_MSRC_ROLE__COUNT; r++)
+                    for (int sg = 0; sg < DS4_RESSTAGE__COUNT; sg++) {
+                        (void)ds4_gpu_residency_failures_read(r, sg, &rv);
+                        buf_printf(&b,
+                            "ds4_residency_failures_total{model_role=\"%s\",stage=\"%s\"} %llu\n",
+                            ds4_model_source_role_name(r), resstage_names[sg],
+                            (unsigned long long)rv);
+                    }
+            }
+        }
+#endif
     }
     http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4", b.ptr);
     buf_free(&b);
@@ -26498,6 +26549,54 @@ static void test_mem_render_capture_coherent(void) {
     TEST_ASSERT(bank_lineage_clock(&s) == 0);
 }
 
+/* memgov D5-2: residency families -- positional name tables complete,
+ * accessor domain contract (out-of-range = nonzero on EVERY backend;
+ * Metal reports unsupported so porcelains render absence, and where
+ * supported every in-domain cell reads), and the deficit gauge's
+ * ADMIT-writes-0 law through a real shadow check. */
+static void test_residency_family_shape(void) {
+    for (int st = 0; st < DS4_RESUNIT__COUNT; st++)
+        TEST_ASSERT(resunit_state_names[st] && resunit_state_names[st][0]);
+    for (int sg = 0; sg < DS4_RESSTAGE__COUNT; sg++)
+        TEST_ASSERT(resstage_names[sg] && resstage_names[sg][0]);
+    TEST_ASSERT(strcmp(resunit_policy_name(DS4_RESIDENCY_EAGER_DEVICE),
+                       "eager") == 0);
+    TEST_ASSERT(strcmp(resunit_policy_name(DS4_RESIDENCY__COUNT),
+                       "unattributed") == 0);
+    TEST_ASSERT(strcmp(ds4_model_source_role_name(DS4_MSRC_ROLE_DRAFTER),
+                       "drafter") == 0);
+    uint64_t rv = 42;
+    TEST_ASSERT(ds4_gpu_residency_units_read(-1, 0, &rv) != 0);
+    TEST_ASSERT(ds4_gpu_residency_units_read(0, DS4_RESUNIT__COUNT, &rv) != 0);
+    TEST_ASSERT(ds4_gpu_residency_units_read(DS4_RESUNIT_POLICY_ROWS, 0, &rv) != 0);
+    TEST_ASSERT(ds4_gpu_residency_failures_read(DS4_MSRC_ROLE__COUNT, 0, &rv) != 0);
+    TEST_ASSERT(ds4_gpu_residency_failures_read(0, DS4_RESSTAGE__COUNT, &rv) != 0);
+    if (ds4_gpu_residency_units_read(0, 0, &rv) == 0) {
+        for (int p = 0; p < DS4_RESUNIT_POLICY_ROWS; p++)
+            for (int st = 0; st < DS4_RESUNIT__COUNT; st++)
+                TEST_ASSERT(ds4_gpu_residency_units_read(p, st, &rv) == 0);
+        for (int r = 0; r < DS4_MSRC_ROLE__COUNT; r++)
+            for (int sg = 0; sg < DS4_RESSTAGE__COUNT; sg++)
+                TEST_ASSERT(ds4_gpu_residency_failures_read(r, sg, &rv) == 0);
+    }
+    /* Deficit gauge: a well-formed ADMIT-shaped claim writes 0 for its
+     * consumer.  Mode off legitimately skips the decision core (and so
+     * the gauge) -- assert the law only where the core runs, whatever
+     * mode an earlier fixture left behind. */
+    if (ds4_gov_mode(DS4_GOVC_STATIC_BATCH) != DS4_GOV_MODE_OFF) {
+        ds4_gov_claim cl = {0};
+        cl.requester = DS4_GOVC_STATIC_BATCH;
+        cl.memc = DS4_MEMC_SESSION_TENSORS;
+        cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        cl.proposed_outstanding = 1;
+        ds4_metric_set(&ds4_metrics_get()->memgov_deficit[DS4_GOVC_STATIC_BATCH],
+                       777);
+        ds4_gov_shadow_check("unit-d52", &cl, DS4_GOV_ADMIT);
+        TEST_ASSERT(ds4_metric_read(
+            &ds4_metrics_get()->memgov_deficit[DS4_GOVC_STATIC_BATCH]) == 0);
+    }
+}
+
 static void test_mem_obs_legacy_shim(void) {
     /* D0a-2: every typed state must map to the EXACT legacy
      * ds4_gpu_mem_info contract -- rc 0 + outputs only on OK, rc 1 with
@@ -27655,6 +27754,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_census_publication_shape();
     /* memgov D5-1: one coherent capture per porcelain render. */
     test_mem_render_capture_coherent();
+    /* memgov D5-2: residency families + deficit gauge. */
+    test_residency_family_shape();
     /* memgov D0a-2: typed observation legacy shim. */
     test_mem_obs_legacy_shim();
     /* memgov D0b-1: shadow-governor evaluator (pure core). */

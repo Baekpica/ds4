@@ -151,7 +151,8 @@ typedef enum {
     DS4_MSRC_ROLE_PRIMARY = 0,           /* the checkpoint being served    */
     DS4_MSRC_ROLE_AUXILIARY,             /* support model bound to the
                                             primary (MTP head)             */
-    DS4_MSRC_ROLE_DRAFTER                /* speculative drafter (DSpark)   */
+    DS4_MSRC_ROLE_DRAFTER,               /* speculative drafter (DSpark)   */
+    DS4_MSRC_ROLE__COUNT                 /* D5-2: metrics cardinality      */
 } ds4_model_source_role;
 
 /* memgov D3-2: ONE typed engine residency policy per source (plan sec 12
@@ -164,8 +165,9 @@ enum {
     DS4_RESIDENCY_LAZY_COPY_DEVICE,      /* same terminal residency, but
                                             promotion defers to first
                                             touch (the NO_HBM alias)       */
-    DS4_RESIDENCY_HOST_MAPPED            /* terminal host residency: mapped
+    DS4_RESIDENCY_HOST_MAPPED,           /* terminal host residency: mapped
                                             units NEVER device-promote     */
+    DS4_RESIDENCY__COUNT                 /* D5-2: metrics cardinality      */
 };
 
 typedef struct {
@@ -327,6 +329,41 @@ static inline const char *ds4_residency_name(int r) {
     default:                             return "unknown";
     }
 }
+
+/* =========================================================================
+ * memgov D5-2: residency-unit materialize outcomes -- THE public
+ * vocabulary behind ds4_residency_units{policy,state} (plan sec 14).
+ * One enum shared by the engine's tick sites and every porcelain: the
+ * engine-private CUDA_MAT_* names, retired in favor of these.  Fixed
+ * cardinality like the census classes; WAIVED_OPTIONAL stays reserved
+ * (no optional promote units exist in the 0731 catalogs).  The metrics
+ * family keys these by the SOURCE's resolved residency policy
+ * (DS4_RESIDENCY_*): a mapped-policy UNIT under an eager source ticks
+ * {policy=eager, state=host_mapped_by_policy} -- the label carries the
+ * source story, the state the unit story.  Row DS4_RESIDENCY__COUNT is
+ * the UNATTRIBUTED bucket (tick outside any bound source), so totals
+ * are preserved by construction. */
+typedef enum {
+    DS4_RESUNIT_POPULATED = 0,        /* copied + published                */
+    DS4_RESUNIT_ALREADY_READY,        /* exact covering range pre-existed  */
+    DS4_RESUNIT_SATISFIED_IMPORT,     /* covered by a wider import range   */
+    DS4_RESUNIT_HOST_MAPPED_BY_POLICY,
+    DS4_RESUNIT_LAZY_DEFERRED,        /* schedule defers to first touch    */
+    DS4_RESUNIT_EXPERT_COLD_BY_POLICY,
+    DS4_RESUNIT_WAIVED_OPTIONAL,      /* reserved                          */
+    DS4_RESUNIT_FAILED,
+    DS4_RESUNIT__COUNT
+} ds4_residency_unit_state;
+
+#define DS4_RESUNIT_POLICY_ROWS (DS4_RESIDENCY__COUNT + 1)
+
+/* Failure attribution stages for ds4_residency_failures_total
+ * {model_role,stage}: the eager boot pass vs the lazy first-touch tier. */
+enum {
+    DS4_RESSTAGE_BOOT = 0,
+    DS4_RESSTAGE_LAZY,
+    DS4_RESSTAGE__COUNT
+};
 
 /* =========================================================================
  * memgov D0a-2: typed memory observation.

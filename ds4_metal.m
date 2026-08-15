@@ -4517,6 +4517,17 @@ int ds4_gpu_mem_observe(ds4_mem_observation *out) {
     }
     return 1;
 }
+/* memgov D5-2: Metal keeps no residency plan -- the units/failures
+ * families report unsupported (nonzero) and porcelains render ABSENCE,
+ * the census contract. */
+int ds4_gpu_residency_units_read(int policy, int state, uint64_t *out) {
+    (void)policy; (void)state; (void)out;
+    return 1;
+}
+int ds4_gpu_residency_failures_read(int role, int stage, uint64_t *out) {
+    (void)role; (void)stage; (void)out;
+    return 1;
+}
 /* D0a-4: no VMM trim on Metal -- nothing to inject into.  0 = unsupported
  * (the unit suite's skip gate). */
 int ds4_gpu_trim_inject_set(int site, uint32_t count) {

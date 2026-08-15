@@ -33659,6 +33659,9 @@ static int gov_check_core(const char *site, const ds4_gov_claim *cl,
                            ? q.status : DS4_GOV_FAULT;
     const int reason = ds4_gov_compare(legacy_status, status);
     ds4_metric_add(&m->memgov_decisions[cl->requester][status][reason], 1);
+    /* memgov D5-2: the deficit gauge tracks the LAST verdict verbatim
+     * (an ADMIT writes 0) -- sec 14's decision retryability signal. */
+    ds4_metric_set(&m->memgov_deficit[cl->requester], q.deficit);
     if (status == DS4_GOV_FAULT)
         ds4_metric_add(&m->memgov_faults, 1);
     /* Disclose early REAL disagreements (not the documented OBS_POLICY
