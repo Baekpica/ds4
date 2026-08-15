@@ -10178,6 +10178,10 @@ static bool metal_graph_session_fit_check(
     if (fits) return true;
     if (loud) {
         ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
+        /* memgov D5-3: typed twin -- a fit deficit is by definition the
+         * transient live-headroom reason (fail-open legs never refuse). */
+        ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                           [DS4_REJLANE_SERIAL][DS4_REJECT_LIVE_HEADROOM], 1);
         fprintf(stderr,
                 "ds4: session graph fit check FAILED: need ~%.0f MiB (+%.0f MiB headroom) "
                 "but only %.0f MiB allocatable (ctx=%u prefill_cap=%u mtp=%d dspark=%d); "
@@ -36645,6 +36649,10 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 if (final_verdict != DS4_GOV_ADMIT) {
                     ctx->mem_rejects++;
                     ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
+                    /* memgov D5-3: typed twin of the frozen scalar. */
+                    ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                                       [DS4_REJLANE_CONT]
+                                       [ds4_reject_reason_from_gov(final_verdict)], 1);
                     if (final_verdict == verdict &&
                         verdict == DS4_GOV_REFUSE_CLASS) {
                         fprintf(stderr,

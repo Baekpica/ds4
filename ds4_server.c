@@ -14214,6 +14214,12 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
             const int sv = ds4_gov_governed_check("static_batch_percall",
                                                   &scl, DS4_GOV_ADMIT);
             if (sv != DS4_GOV_ADMIT) {
+                /* memgov D5-3: typed rejection (the refusal itself falls
+                 * back to the single path; the family records the refusal
+                 * of the batched graph). */
+                ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                                   [DS4_REJLANE_STATIC]
+                                   [ds4_reject_reason_from_gov(sv)], 1);
                 static int enf_disclosed = 0;
                 if (enf_disclosed < 16) {
                     enf_disclosed++;
@@ -16535,6 +16541,15 @@ static const char *resstage_names[DS4_RESSTAGE__COUNT] = { "boot", "lazy" };
 static const char *resunit_policy_name(int p) {
     return p < DS4_RESIDENCY__COUNT ? ds4_residency_name(p) : "unattributed";
 }
+/* memgov D5-3: typed-rejection vocabularies, positional against the
+ * closed lane/reason enums (ds4.h). */
+static const char *rejlane_names[DS4_REJLANE__COUNT] = {
+    "continuous", "serial", "static",
+};
+static const char *reject_reason_names[DS4_REJECT__COUNT] = {
+    "class_budget", "live_headroom", "obs_retry", "unsupported", "fault",
+    "deep_policy",
+};
 
 typedef struct {
     ds4_mem_cell cells[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
@@ -16720,6 +16735,18 @@ static void send_metrics(server *s, int fd) {
     buf_printf(&b, "# TYPE ds4_graph_fit_refusals_total counter\n"
                    "ds4_graph_fit_refusals_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->graph_fit_refusals));
+    /* memgov D5-3: THE typed rejection family, beside the frozen legacy
+     * scalars above (plan sec 12: a new fixed-cardinality family, never
+     * labeled children under the legacy names).  Reason names carry D6's
+     * retryability law; all cells always emitted. */
+    buf_puts(&b, "# TYPE ds4_requests_rejected_total counter\n");
+    for (int ln = 0; ln < DS4_REJLANE__COUNT; ln++)
+        for (int rr = 0; rr < DS4_REJECT__COUNT; rr++)
+            buf_printf(&b,
+                "ds4_requests_rejected_total{lane=\"%s\",reason=\"%s\"} %llu\n",
+                rejlane_names[ln], reject_reason_names[rr],
+                (unsigned long long)ds4_metric_read(
+                    &m->requests_rejected_typed[ln][rr]));
     /* memgov D4-3: reclaim outcome families, full fixed cardinality (the
      * status vocabulary is closed; absent activity renders as zeros). */
     buf_puts(&b, "# TYPE ds4_reclaim_banks_total counter\n");
@@ -17591,8 +17618,12 @@ static void *client_main(void *arg) {
         ds4_metric_add(&mreg->requests_inflight, (uint64_t)-1);
         if (j.outcome == JOB_OUT_FAILED)
             ds4_metric_add(&mreg->requests_failed, 1);
-        else if (j.outcome == JOB_OUT_REFUSED_DEEP_SERIAL)
+        else if (j.outcome == JOB_OUT_REFUSED_DEEP_SERIAL) {
             ds4_metric_add(&mreg->requests_refused_deep_serial, 1);
+            /* memgov D5-3: typed twin -- deep-ctx policy, never retried. */
+            ds4_metric_add(&mreg->requests_rejected_typed
+                               [DS4_REJLANE_SERIAL][DS4_REJECT_DEEP_POLICY], 1);
+        }
         else if (j.outcome == JOB_OUT_SHED)
             /* Inc 2e: an enqueued request an admission bound later refused
              * (queue age is the only post-enqueue bound today).  Counted at
@@ -26578,6 +26609,26 @@ static void test_residency_family_shape(void) {
         for (int r = 0; r < DS4_MSRC_ROLE__COUNT; r++)
             for (int sg = 0; sg < DS4_RESSTAGE__COUNT; sg++)
                 TEST_ASSERT(ds4_gpu_residency_failures_read(r, sg, &rv) == 0);
+    }
+    /* memgov D5-3: rejection vocabulary -- tables complete, the gov
+     * mapping lands every refusal status on its documented reason, and
+     * every mapped value is in-domain (the tick sites index raw). */
+    for (int ln = 0; ln < DS4_REJLANE__COUNT; ln++)
+        TEST_ASSERT(rejlane_names[ln] && rejlane_names[ln][0]);
+    for (int rr = 0; rr < DS4_REJECT__COUNT; rr++)
+        TEST_ASSERT(reject_reason_names[rr] && reject_reason_names[rr][0]);
+    TEST_ASSERT(ds4_reject_reason_from_gov(DS4_GOV_REFUSE_CLASS) ==
+                DS4_REJECT_CLASS_BUDGET);
+    TEST_ASSERT(ds4_reject_reason_from_gov(DS4_GOV_REFUSE_LIVE) ==
+                DS4_REJECT_LIVE_HEADROOM);
+    TEST_ASSERT(ds4_reject_reason_from_gov(DS4_GOV_RETRY_OBS) ==
+                DS4_REJECT_OBS_RETRY);
+    TEST_ASSERT(ds4_reject_reason_from_gov(DS4_GOV_UNSUPPORTED) ==
+                DS4_REJECT_UNSUPPORTED);
+    TEST_ASSERT(ds4_reject_reason_from_gov(DS4_GOV_FAULT) == DS4_REJECT_FAULT);
+    for (int st = 0; st < DS4_GOV_STATUS__COUNT; st++) {
+        const int rr = ds4_reject_reason_from_gov(st);
+        TEST_ASSERT(rr >= 0 && rr < DS4_REJECT__COUNT);
     }
     /* Deficit gauge: a well-formed ADMIT-shaped claim writes 0 for its
      * consumer.  Mode off legitimately skips the decision core (and so

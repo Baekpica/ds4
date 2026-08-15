@@ -704,6 +704,42 @@ uint64_t ds4_session_graph_headroom_bytes(void);
  * Inc 5b adds continuation_hold: serial work refused because the session is
  * reserved for a live tool continuation (grace window or queued hard pin). */
 #define DS4_METRICS_SHED_REASONS 6
+/* memgov D5-3 (plan sec 12 items 4-5): THE typed rejection family --
+ * ds4_requests_rejected_total{lane,reason} -- ONE new fixed-cardinality
+ * family beside the FROZEN legacy scalars (ds4_cont_admit_rejects_total,
+ * ds4_graph_fit_refusals_total, ds4_requests_refused_deep_serial_total
+ * render byte-identically forever; never labeled children under those
+ * names).  lane = which admission lane refused the work; reason carries
+ * D6's retryability law by NAME: LIVE_HEADROOM and OBS_RETRY are the
+ * only reasons a future scheduler may requeue (unstarted work only) --
+ * CLASS_BUDGET, UNSUPPORTED, FAULT and DEEP_POLICY are never retried
+ * (plan sec 12 D6). */
+enum {
+    DS4_REJLANE_CONT = 0,      /* continuous admission (bank grant)      */
+    DS4_REJLANE_SERIAL,        /* serial session lane (fit + policy)     */
+    DS4_REJLANE_STATIC,        /* static batch per-call graph            */
+    DS4_REJLANE__COUNT
+};
+enum {
+    DS4_REJECT_CLASS_BUDGET = 0,  /* plan/class budget: never retry      */
+    DS4_REJECT_LIVE_HEADROOM,     /* live free-memory deficit: transient */
+    DS4_REJECT_OBS_RETRY,         /* observation snapshot busy: transient*/
+    DS4_REJECT_UNSUPPORTED,       /* shape/backend: never                */
+    DS4_REJECT_FAULT,             /* internal fault: never               */
+    DS4_REJECT_DEEP_POLICY,       /* deep-ctx serial policy: never       */
+    DS4_REJECT__COUNT
+};
+/* The governed-check refusal statuses map 1:1 onto reasons; ADMIT never
+ * reaches a tick site (callers tick only on refusal). */
+static inline int ds4_reject_reason_from_gov(int gov_status) {
+    switch (gov_status) {
+    case DS4_GOV_REFUSE_CLASS: return DS4_REJECT_CLASS_BUDGET;
+    case DS4_GOV_REFUSE_LIVE:  return DS4_REJECT_LIVE_HEADROOM;
+    case DS4_GOV_RETRY_OBS:    return DS4_REJECT_OBS_RETRY;
+    case DS4_GOV_UNSUPPORTED:  return DS4_REJECT_UNSUPPORTED;
+    default:                   return DS4_REJECT_FAULT;
+    }
+}
 typedef struct {
     uint64_t stamp;               /* monotonic second this bucket belongs to */
     uint64_t dec_tok, dec_steps, pf_tok;
@@ -720,6 +756,10 @@ typedef struct {
     /* engine admission + refusals */
     uint64_t graph_fit_refusals;            /* session-graph fit gate said no */
     uint64_t cont_admit_rejects;            /* comp-cache budget rejects */
+    /* memgov D5-3: the typed rejection family (lane x reason enums above,
+     * both closed).  Ticked BESIDE the legacy scalars, which stay frozen;
+     * every cell renders on /metrics. */
+    uint64_t requests_rejected_typed[DS4_REJLANE__COUNT][DS4_REJECT__COUNT];
     uint64_t cont_batch_failures;           /* continuous run ended in error */
     uint64_t admits_cold, admits_warm, admits_fork;
     uint64_t admits_partial_fork, admits_partial_truncate;
