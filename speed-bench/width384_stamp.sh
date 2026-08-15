@@ -98,7 +98,7 @@ PYEOF
 log "p99_n1: $(cat "$OUT/p99.txt")"
 
 # ---- width: W concurrent OMITTED-budget streams ------------------------
-adm0=$(( $(m ds4_admits_cold_total 2>/dev/null || echo 0) ))
+adm0=$(( $(m 'ds4_admits_total{kind="cold"}' 2>/dev/null || echo 0) ))
 rej0=$(m ds4_cont_admit_rejects_total); rej0=${rej0:-0}
 floor0=$(ssh "$R" "grep -cF 'cont admit rejected on memory floor' $RWORK/srv.log" 2>/dev/null); floor0=${floor0:-0}
 log "width: firing $W concurrent OMITTED-budget streams"
