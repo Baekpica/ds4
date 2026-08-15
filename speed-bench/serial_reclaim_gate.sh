@@ -376,7 +376,15 @@ log "leg B: http=$CODE nofit=$NOFIT reclaim_lines=$RECL"
 [ "$RECL" = "0" ] || die "leg B control: reclaim fired with trim disabled"
 INJ_B=$(count "trim inject" /tmp/reclaim_B.log)
 [ "$INJ_B" = "0" ] || die "leg B control: inject lines leaked into an injection-free boot ($INJ_B)"
-log "B PASS (control reproduces the old 503, zero reclaim lines)"
+# memgov D5-3: the typed rejection family under a REAL refusal -- the
+# loud fit check ticks legacy + typed at ONE funnel, so the typed
+# serial/live_headroom cell must EQUAL ds4_graph_fit_refusals_total on
+# this boot (behavioral proof; the d0a (b3) leg only sees zeros).
+TYP_B=$(remote "curl -s -m 20 localhost:$PORT/metrics | grep 'ds4_requests_rejected_total{lane=\"serial\",reason=\"live_headroom\"}' | awk '{print \$2}'")
+LEG_B=$(remote "curl -s -m 20 localhost:$PORT/metrics | grep '^ds4_graph_fit_refusals_total' | awk '{print \$2}'")
+[ -n "$TYP_B" ] && [ "$TYP_B" -ge 1 ] || die "leg B: typed serial/live_headroom cell missing or zero after a refusal (got '$TYP_B')"
+[ "$TYP_B" = "$LEG_B" ] || die "leg B: typed serial/live_headroom ($TYP_B) != legacy graph_fit_refusals ($LEG_B) -- the twin ticks diverged"
+log "B PASS (control reproduces the old 503, zero reclaim lines, typed=legacy=$TYP_B)"
 stop_hog
 kill_server
 
