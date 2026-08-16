@@ -4285,6 +4285,7 @@ extern "C" int ds4_gpu_mem_observe(ds4_mem_observation *out) {
     o.status = DS4_MEMOBS_OK;
     o.source = DS4_MEMOBS_SRC_CUDA_FREE;
     uint64_t free_out = (uint64_t)free_b;
+    o.cuda_free_bytes = (uint64_t)free_b;   /* MG-2: raw pair, disclosed */
 #ifdef __linux__
     /* Integrated/unified (GB10): cudaMemGetInfo's free tracks MemFree and
      * ignores reclaimable page cache -- on this box often tens of GB of cold
@@ -4321,6 +4322,7 @@ extern "C" int ds4_gpu_mem_observe(ds4_mem_observation *out) {
                      * mapping's page cache does not thrash decode.  Trust
                      * MemAvailable; the caller's own headroom is the margin. */
                     uint64_t avail = kb * 1024ull;
+                    o.meminfo_avail_bytes = avail;   /* MG-2: raw pair */
                     if (avail > free_out) {
                         free_out = avail;
                         o.source = DS4_MEMOBS_SRC_MEMINFO_AVAILABLE;
@@ -4353,6 +4355,23 @@ extern "C" void ds4_gpu_boot_trim(void) {
     if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
     (void)cudaDeviceGraphMemTrim(dev);
     (void)cudaGetLastError();
+}
+
+/* memgaps MG-1: the boot trim, callable at refusal time, reporting what
+ * the typed observation got back.  Session churn (right-size regrows,
+ * serial free/create, per-call static graphs) re-accumulates freed-graph
+ * pool reserve after the one boot trim; on unified boxes that reserve
+ * depresses the ONE estimate every admission verdict consumes.  The
+ * delta rides ds4_gpu_mem_observe -- the same answer the verdicts read
+ * -- so it measures the return where it matters.  Kernel-side noise can
+ * ride the delta; callers treat it as disclosure, not ledger. */
+extern "C" uint64_t ds4_gpu_own_trim(void) {
+    ds4_mem_observation a, b;
+    const int a_ok = ds4_gpu_mem_observe(&a) == 0 && a.status == DS4_MEMOBS_OK;
+    ds4_gpu_boot_trim();
+    if (!a_ok) return 0;
+    if (ds4_gpu_mem_observe(&b) != 0 || b.status != DS4_MEMOBS_OK) return 0;
+    return b.free_bytes > a.free_bytes ? b.free_bytes - a.free_bytes : 0;
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
@@ -6278,8 +6297,20 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
-    fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
-            label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
+    /* memgaps gap-4: raw cuda free tracks MemFree on unified boxes and
+     * under-reports by the reclaimable cache; print the budget answer
+     * beside it so the report cannot mislead an operator. */
+    ds4_mem_observation o;
+    (void)ds4_gpu_mem_observe(&o);
+    if (o.status == DS4_MEMOBS_OK && o.meminfo_avail_bytes != 0)
+        fprintf(stderr,
+                "ds4: CUDA memory report %s: free %.2f MiB (meminfo-available %.2f MiB) total %.2f MiB\n",
+                label ? label : "", (double)free_b / 1048576.0,
+                (double)o.meminfo_avail_bytes / 1048576.0,
+                (double)total_b / 1048576.0);
+    else
+        fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
+                label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {

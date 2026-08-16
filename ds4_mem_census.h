@@ -393,6 +393,14 @@ typedef struct {
     int source;                      /* ds4_mem_obs_source of free_bytes  */
     uint64_t free_bytes;
     uint64_t total_bytes;
+    /* memgaps MG-2 (2026-08-16): the raw pair behind the max-of-two pick
+     * (0 = that source had no answer this call).  Decisions keep
+     * consuming free_bytes; these exist so porcelains can render BOTH
+     * estimates -- the aged-box divergence between a low meminfo answer
+     * and admissions that still succeed is the field signature of the
+     * kernel-estimate drift, and the D6 correction's data source. */
+    uint64_t cuda_free_bytes;
+    uint64_t meminfo_avail_bytes;
 } ds4_mem_observation;
 
 /* Typed -> legacy ds4_gpu_mem_info semantics: rc 0 + outputs only on OK;

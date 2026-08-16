@@ -10124,6 +10124,44 @@ uint64_t ds4_session_graph_headroom_bytes(void) {
     return headroom;
 }
 
+/* memgaps MG-1 (2026-08-16): release the engine's OWN reclaimable device
+ * reserve before any live-memory refusal.  The graph pool keeps freed
+ * session/static graph backing as reserve for the process lifetime (the
+ * one boot trim at prewarm aside); on unified boxes that reserve
+ * depresses the ONE observation every admission verdict consumes, so an
+ * aged server refuses organic work beside its own hoard.  Refusal
+ * ladders call this after their legacy actors (bank trim, reclaim
+ * collect) and before the final verdict; admits never pay the driver
+ * call.  Backend-neutral and OUTSIDE the GPU guard (the CPU leg must
+ * LINK: matrix law) -- backends without the reserve concept recover 0
+ * and disclose nothing.  DS4_MEM_OWN_TRIM=0 is the kill switch. */
+uint64_t ds4_mem_own_trim(const char *site) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_MEM_OWN_TRIM");
+        enabled = !(e && e[0] == '0' && e[1] == '\0');
+    }
+    if (!enabled) return 0;
+    uint64_t recovered = 0;
+#ifndef DS4_NO_GPU
+    recovered = ds4_gpu_own_trim();
+#endif
+    ds4_metrics *m = ds4_metrics_get();
+    ds4_metric_add(&m->mem_own_trim_calls, 1);
+    if (recovered != 0) {
+        ds4_metric_add(&m->mem_own_trim_recovered, recovered);
+        static int disclosed = 0;
+        if (disclosed < 16) {
+            disclosed++;
+            fprintf(stderr,
+                    "ds4: mem own-trim site=%s recovered=%.1f MiB (graph-pool "
+                    "reserve returned before refusal)\n",
+                    site ? site : "?", (double)recovered / 1048576.0);
+        }
+    }
+    return recovered;
+}
+
 #ifndef DS4_NO_GPU
 /* Session-graph fit gate.  cudaMalloc on an integrated/unified box does not
  * fail cleanly when the ask exceeds MemAvailable -- the kernel reclaims and
@@ -36645,6 +36683,12 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                                                       mneed - usable, NULL) > 0)
                             usable = ds4_mem_usable_beyond(ctx->serial_reserve);
                     }
+                    /* memgaps MG-1: still short -> return the engine's own
+                     * graph-pool reserve and re-ask.  Precedes the governed
+                     * check below so enforce quotes also see the post-trim
+                     * box (actors first, in live order: the D2-3 pattern). */
+                    if (mneed > usable && ds4_mem_own_trim("cont_admit") > 0)
+                        usable = ds4_mem_usable_beyond(ctx->serial_reserve);
                     if (mneed > usable) verdict = DS4_GOV_REFUSE_LIVE;
                 }
                 /* D2-1 (artifact 2, epoch-58): a zero-growth admit spends

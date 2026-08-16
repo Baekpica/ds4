@@ -662,6 +662,17 @@ uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx);
 /* The serial session fit gate's headroom (DS4_SESSION_GRAPH_HEADROOM_MB,
  * default 1024 MiB) -- one source shared by the probe and the S6 claim. */
 uint64_t ds4_session_graph_headroom_bytes(void);
+/* memgaps MG-1 (2026-08-16): release the engine's OWN reclaimable device
+ * reserve (unused graph-pool backing -- trimmed once at boot before this;
+ * session churn re-accumulates it for the process lifetime) before a
+ * live-memory refusal.  ds4_gpu_own_trim is the backend primitive: trim,
+ * then report what the typed observation got back (0 on stubs and non-OK
+ * observations).  ds4_mem_own_trim is the counted, disclosed,
+ * backend-neutral wrapper the refusal ladders call AFTER their legacy
+ * actors and BEFORE the final verdict; admits never pay the driver call.
+ * DS4_MEM_OWN_TRIM=0 is the kill switch (default on). */
+uint64_t ds4_gpu_own_trim(void);
+uint64_t ds4_mem_own_trim(const char *site);
 
 /* =========================================================================
  * Live serving metrics (v0.2.x observability): ONE registry, THREE porcelains.
@@ -837,6 +848,11 @@ typedef struct {
      * tick nothing; the families still render every label. */
     uint64_t reclaim_banks[DS4_RECLAIM_STATUS__COUNT];
     uint64_t reclaim_bytes[DS4_RECLAIM_STATUS__COUNT];
+    /* memgaps MG-1: own-reserve trims at refusal ladders -- calls, and
+     * bytes the typed observation recovered (sec 14 naming:
+     * ds4_mem_own_trim_{calls,recovered_bytes}_total). */
+    uint64_t mem_own_trim_calls;
+    uint64_t mem_own_trim_recovered;
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);

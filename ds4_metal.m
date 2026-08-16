@@ -4628,6 +4628,12 @@ void ds4_gpu_boot_trim(void) {
     /* No graph-pool reserve concept on Metal. */
 }
 
+uint64_t ds4_gpu_own_trim(void) {
+    /* memgaps MG-1: no graph-pool reserve concept on Metal -- nothing to
+     * return, nothing recovered (the wrapper's disclosure stays silent). */
+    return 0;
+}
+
 void ds4_gpu_unregister_model_map(const void *base) {
     /* No host-registration concept on Metal (shared unified buffers). */
     (void)base;

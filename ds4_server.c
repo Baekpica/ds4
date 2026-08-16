@@ -13772,7 +13772,10 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);   /* memgov D0b-3 */
 
     /* Freed graph bytes reach MemAvailable with driver-reclaim lag (the
-     * WAIT_MEM class); give the floor probe a bounded settle window. */
+     * WAIT_MEM class); give the floor probe a bounded settle window.
+     * memgaps MG-1: part of that lag is reserve the graph pool would
+     * keep -- return it up front so the settle loop polls for less. */
+    (void)ds4_mem_own_trim("serial_wait_mem");
     bool min_fits = false;
     ds4_session_graph_fit_quote fq = {0};
     for (int tries = 0; tries < 20; tries++) {
@@ -14221,8 +14224,15 @@ static void generate_batch_jobs(server *s, job **jobs, int n) {
             scl.memc = DS4_MEMC_SESSION_TENSORS;
             scl.domain = DS4_MEMD_UNIFIED_DEVICE;
             scl.proposed_outstanding = est;
-            const int sv = ds4_gov_governed_check("static_batch_percall",
-                                                  &scl, DS4_GOV_ADMIT);
+            int sv = ds4_gov_governed_check("static_batch_percall",
+                                            &scl, DS4_GOV_ADMIT);
+            /* memgaps MG-1: a live refusal is typed-retryable by its own
+             * contract -- return the engine's graph-pool reserve and
+             * re-ask ONCE.  Both attempts count in the decisions matrix
+             * (honest retries, not a re-vote). */
+            if (sv != DS4_GOV_ADMIT && ds4_mem_own_trim("static_percall") > 0)
+                sv = ds4_gov_governed_check("static_batch_percall",
+                                            &scl, DS4_GOV_ADMIT);
             if (sv != DS4_GOV_ADMIT) {
                 /* memgov D5-3: typed rejection (the refusal itself falls
                  * back to the single path; the family records the refusal
@@ -16932,11 +16942,19 @@ static void send_metrics(server *s, int fd) {
                            mem_obs_status_names[st], mem_obs_source_names[so],
                            (o.status == st && o.source == so) ? 1 : 0);
         if (o.status == DS4_MEMOBS_OK)
+            /* memgaps MG-2: the raw pair behind the max-of-two pick rides
+             * the same capture -- kind="free" stays the decided answer;
+             * a low meminfo_available beside succeeding admissions is the
+             * aged-box kernel-estimate drift signature (0 = no answer). */
             buf_printf(&b, "# TYPE ds4_memory_observation_bytes gauge\n"
                            "ds4_memory_observation_bytes{kind=\"free\"} %llu\n"
-                           "ds4_memory_observation_bytes{kind=\"total\"} %llu\n",
+                           "ds4_memory_observation_bytes{kind=\"total\"} %llu\n"
+                           "ds4_memory_observation_bytes{kind=\"cuda_free\"} %llu\n"
+                           "ds4_memory_observation_bytes{kind=\"meminfo_available\"} %llu\n",
                        (unsigned long long)o.free_bytes,
-                       (unsigned long long)o.total_bytes);
+                       (unsigned long long)o.total_bytes,
+                       (unsigned long long)o.cuda_free_bytes,
+                       (unsigned long long)o.meminfo_avail_bytes);
         buf_puts(&b, "# TYPE ds4_memory_observation_calls_total counter\n");
         for (int so = 0; so < 3; so++)
             buf_printf(&b, "ds4_memory_observation_calls_total{source=\"%s\"} %llu\n",
@@ -16945,6 +16963,13 @@ static void send_metrics(server *s, int fd) {
         buf_printf(&b, "# TYPE ds4_memory_observation_errors_total counter\n"
                        "ds4_memory_observation_errors_total %llu\n",
                    (unsigned long long)ds4_metric_read(&m->memobs_errors));
+        /* memgaps MG-1: own-reserve trims at refusal ladders. */
+        buf_printf(&b, "# TYPE ds4_mem_own_trim_calls_total counter\n"
+                       "ds4_mem_own_trim_calls_total %llu\n"
+                       "# TYPE ds4_mem_own_trim_recovered_bytes_total counter\n"
+                       "ds4_mem_own_trim_recovered_bytes_total %llu\n",
+                   (unsigned long long)ds4_metric_read(&m->mem_own_trim_calls),
+                   (unsigned long long)ds4_metric_read(&m->mem_own_trim_recovered));
         /* memgov D0b-4: the shadow governor.  Leases (one ledger image
          * through the seqlock), then the full fixed-cardinality decision
          * matrix (plan sec 14 ds4_memory_decisions_total) -- all cells
@@ -17168,9 +17193,14 @@ static void send_stats(server *s, int fd, bool as_json) {
             buf_printf(&b, ",\"observation\":{\"status\":\"%s\",\"source\":\"%s\"",
                        mem_obs_status_names[o.status], mem_obs_source_names[o.source]);
             if (o.status == DS4_MEMOBS_OK)
-                buf_printf(&b, ",\"free_bytes\":%llu,\"total_bytes\":%llu",
+                /* memgaps MG-2: the raw pair (0 = no answer this call). */
+                buf_printf(&b, ",\"free_bytes\":%llu,\"total_bytes\":%llu"
+                               ",\"cuda_free_bytes\":%llu"
+                               ",\"meminfo_available_bytes\":%llu",
                            (unsigned long long)o.free_bytes,
-                           (unsigned long long)o.total_bytes);
+                           (unsigned long long)o.total_bytes,
+                           (unsigned long long)o.cuda_free_bytes,
+                           (unsigned long long)o.meminfo_avail_bytes);
             buf_printf(&b, ",\"calls_cuda_free\":%llu,\"calls_meminfo_available\":%llu,"
                            "\"errors\":%llu}}",
                        (unsigned long long)ds4_metric_read(&m->memobs_calls[DS4_MEMOBS_SRC_CUDA_FREE]),
@@ -17357,9 +17387,15 @@ static void send_stats(server *s, int fd, bool as_json) {
                        (unsigned long long)img.faults);
         }
         if (o.status == DS4_MEMOBS_OK)
-            buf_printf(&b, "observation:%s free=%.2fGiB total=%.2fGiB\n",
+            /* memgaps MG-2: both raw estimates on the glance surface --
+             * meminfo low beside admissions succeeding = the aged-box
+             * kernel-estimate drift signature. */
+            buf_printf(&b, "observation:%s free=%.2fGiB total=%.2fGiB "
+                           "(cuda_free=%.2fGiB meminfo_available=%.2fGiB)\n",
                        mem_obs_source_names[o.source],
-                       mem_gib(o.free_bytes), mem_gib(o.total_bytes));
+                       mem_gib(o.free_bytes), mem_gib(o.total_bytes),
+                       mem_gib(o.cuda_free_bytes),
+                       mem_gib(o.meminfo_avail_bytes));
         else
             buf_printf(&b, "observation:%s\n", mem_obs_status_names[o.status]);
     }
