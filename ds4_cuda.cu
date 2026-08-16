@@ -18118,12 +18118,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
          * decode2-exact, output-head vocab top-k) does. */
         uint32_t                n_comp_max,
         uint32_t                il_for_decode1) {
-    if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
-        top_k > n_comp ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
-        return 0;
-    }
     /* PC5 activation: substrate present, valid il, non-zero max, not opted
      * out via env.  Specialization basis becomes n_comp_max (capture-stable)
      * and the kernel reads n_actual from g_layer_dev[il].n_index_comp at
@@ -18140,18 +18134,34 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     const uint32_t n_spec = pc5_active
         ? (n_comp >= n_comp_max ? n_comp : n_comp_max)
         : n_comp;
+    /* #32 fix: under PC5 the kernels' band (scores row stride + scan
+     * ceiling) must ALSO be the capture-stable maximum, not the n_comp
+     * the capture step happened to see -- a captured graph replays for
+     * the whole generation while the scorer (same substrate, comp_cap
+     * grid) extends the live count past the capture-time value.  With
+     * the band at the session cap the live count can never exceed it
+     * (the cache cannot hold more rows than comp_cap), so the stream512
+     * guard's clamp becomes unreachable and every decode row is
+     * selectable.  Legacy callers (n_comp_max=0) are untouched. */
+    const uint32_t n_band = pc5_active ? n_spec : n_comp;
+    if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
+        top_k > n_band ||
+        scores->bytes < (uint64_t)n_tokens * n_band * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
+        return 0;
+    }
     if (top_k == 512u && n_spec <= 1024u &&
         getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
         indexer_topk_1024_kernel<<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
-                                                     n_comp, n_tokens, top_k, ls);
+                                                     n_band, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_spec <= 2048u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k, ls);
+                                                           n_band, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
     if (top_k == 512u && n_spec <= 4096u &&
@@ -18174,14 +18184,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k, ls);
+                                                                                 n_band, n_tokens, top_k, ls);
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
                 }
             }
         }
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k, ls);
+                                                           n_band, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
     if (top_k == 512u && n_spec <= 8192u &&
@@ -18205,14 +18215,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k, ls);
+                                                                                 n_band, n_tokens, top_k, ls);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
                 }
             }
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                (const float *)scores->ptr,
-                                                               n_comp, n_tokens, top_k, ls);
+                                                               n_band, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
     /* inc-4: streaming exact top-512 replaces the chunked tree at n_spec >
@@ -18223,19 +18233,23 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
      * scan.  Grid <<<n_tokens, 512>>> + static smem + zero scratch = the
      * capture-stable shape that lifts the >8192-row cont-capture exclusion
      * (ds4.c eligibility); the chunked tree below survives only as the
-     * DS4_CUDA_NO_TOPK_STREAM forensic escape. */
+     * DS4_CUDA_NO_TOPK_STREAM forensic escape.  #32: the escape is EAGER
+     * territory -- under PC5 the stream is mandatory (the tree's chunk
+     * grid/scratch are n_comp-derived and would re-open the stale-band
+     * class on a captured graph). */
     if (top_k == 512u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL) {
+        (pc5_active ||
+         (getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+          getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL))) {
         indexer_topk_stream512_kernel<<<n_tokens, 512, 0, ds4_current_stream()>>>(
                 (uint32_t *)selected->ptr,
                 (const float *)scores->ptr,
-                n_comp, n_tokens, top_k, ls);
+                n_band, n_tokens, top_k, ls);
         static int logged_topk_stream = 0;
         if (!logged_topk_stream) {
             logged_topk_stream = 1;
             fprintf(stderr, "ds4: indexer topk stream active (first n_comp=%u n_tokens=%u %s)\n",
-                    n_comp, n_tokens, pc5_active ? "captured" : "eager");
+                    n_band, n_tokens, pc5_active ? "captured" : "eager");
         }
         /* 13d-1 adjudication instrument: with DS4_CUDA_TOPK_STREAM_VERIFY on
          * an EAGER leg, save the stream selection, fall through into the
@@ -18290,7 +18304,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         dim3 grid_chunks(n_tokens, n_chunks, 1);
         indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024, 0, ds4_current_stream()>>>(cur,
                                                                     (const float *)scores->ptr,
-                                                                    n_comp,
+                                                                    n_band,
                                                                     n_tokens,
                                                                     top_k,
                                                                     candidate_stride,
@@ -18306,7 +18320,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                     next,
                     cur,
                     (const float *)scores->ptr,
-                    n_comp,
+                    n_band,
                     n_tokens,
                     top_k,
                     n_sets,
@@ -18323,7 +18337,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                  cur,
                                                                  (const float *)scores->ptr,
-                                                                 n_comp,
+                                                                 n_band,
                                                                  n_tokens,
                                                                  top_k,
                                                                  n_sets * top_k,
@@ -18368,7 +18382,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     }
     indexer_topk_kernel<<<n_tokens, 1, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                          (const float *)scores->ptr,
-                                         n_comp, n_tokens, top_k, ls);
+                                         n_band, n_tokens, top_k, ls);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
 }
 
