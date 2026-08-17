@@ -1143,6 +1143,7 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "solar-open2-250b") ||
             !strcmp(id, "motif-3") ||
             !strcmp(id, "Motif-Technologies/Motif-3") ||
+            !strcmp(id, "Motif-3-Mixed-Quant-GGUF") ||
             !strcmp(id, "k-exaone-236b-a23b") ||
             !strcmp(id, "k-exaone-236b-a23b-chat") ||
             !strcmp(id, "K-EXAONE-236B-A23B") ||
@@ -9964,6 +9965,7 @@ static bool client_disconnected(int fd);   /* zombie-reap probe (defined below) 
 
 struct server {
     ds4_engine *engine;
+    const char *model_id;       /* optional --model-id advertisement override */
     ds4_session *session;
     int default_tokens;
     char *codex_models_json;    /* v0.5.7: optional ModelInfo array text
@@ -18349,10 +18351,116 @@ static int server_model_context_window(const server *s) {
     return s->serial_boot_ctx;
 }
 
+/* /v1/models default when --model-id is omitted: prefer a parent directory
+ * that looks like a published artifact bucket (*-GGUF / *Mixed-Quant*),
+ * otherwise the GGUF file stem with a llama.cpp shard suffix stripped.
+ * Family ids (motif-3, solar-open2-250b, ...) stay as request aliases. */
+static bool server_parent_is_generic_dir(const char *parent) {
+    return !parent || !parent[0] ||
+           !strcmp(parent, ".") || !strcmp(parent, "..") ||
+           !strcmp(parent, "gguf") || !strcmp(parent, "GGUF") ||
+           !strcmp(parent, "models") || !strcmp(parent, "model") ||
+           !strcmp(parent, "weights") || !strcmp(parent, "artifacts") ||
+           !strcmp(parent, "tmp") || !strcmp(parent, "temp") ||
+           !strcmp(parent, "scratch") || !strcmp(parent, "data");
+}
+
+static bool server_parent_is_gguf_artifact_dir(const char *parent) {
+    size_t n;
+    if (server_parent_is_generic_dir(parent)) return false;
+    if (strstr(parent, "Mixed-Quant")) return true;
+    n = strlen(parent);
+    return n > 4 &&
+           (parent[n - 4] == 'G' || parent[n - 4] == 'g') &&
+           (parent[n - 3] == 'G' || parent[n - 3] == 'g') &&
+           (parent[n - 2] == 'U' || parent[n - 2] == 'u') &&
+           (parent[n - 1] == 'F' || parent[n - 1] == 'f');
+}
+
+static void server_strip_gguf_ext(char *name) {
+    size_t n = strlen(name);
+    if (n >= 5 && name[n - 5] == '.' &&
+        (name[n - 4] == 'g' || name[n - 4] == 'G') &&
+        (name[n - 3] == 'g' || name[n - 3] == 'G') &&
+        (name[n - 2] == 'u' || name[n - 2] == 'U') &&
+        (name[n - 1] == 'f' || name[n - 1] == 'F'))
+        name[n - 5] = '\0';
+}
+
+static void server_strip_gguf_shard_suffix(char *name) {
+    /* Foo-00001-of-00011 → Foo */
+    size_t n = strlen(name);
+    size_t i = n;
+    while (i > 0 && name[i - 1] >= '0' && name[i - 1] <= '9') i--;
+    if (i == n || i < 4 || strncmp(name + i - 4, "-of-", 4) != 0) return;
+    size_t of = i - 4;
+    size_t d = of;
+    while (d > 0 && name[d - 1] >= '0' && name[d - 1] <= '9') d--;
+    if (d == of || d == 0 || name[d - 1] != '-') return;
+    name[d - 1] = '\0';
+}
+
+static const char *server_model_id_from_gguf_path(const char *path,
+                                                 char *dst, size_t dst_n) {
+    const char *end, *base, *parent_end, *parent;
+    size_t n, parent_len, base_len;
+    char stem[256];
+
+    if (!path || !path[0] || !dst || dst_n == 0) return NULL;
+    n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') n--;
+    end = path + n;
+    base = end;
+    while (base > path && base[-1] != '/') base--;
+    base_len = (size_t)(end - base);
+    if (base_len == 0 || base_len >= sizeof(stem)) return NULL;
+    memcpy(stem, base, base_len);
+    stem[base_len] = '\0';
+    server_strip_gguf_ext(stem);
+    server_strip_gguf_shard_suffix(stem);
+    if (!stem[0]) return NULL;
+
+    parent = NULL;
+    parent_len = 0;
+    if (base > path) {
+        parent_end = base - 1;
+        parent = parent_end;
+        while (parent > path && parent[-1] != '/') parent--;
+        parent_len = (size_t)(parent_end - parent);
+    }
+    if (parent_len > 0 && parent_len < dst_n) {
+        char parent_name[256];
+        if (parent_len < sizeof(parent_name)) {
+            memcpy(parent_name, parent, parent_len);
+            parent_name[parent_len] = '\0';
+            if (server_parent_is_gguf_artifact_dir(parent_name)) {
+                memcpy(dst, parent_name, parent_len + 1);
+                return dst;
+            }
+        }
+    }
+    if (strlen(stem) >= dst_n) return NULL;
+    memcpy(dst, stem, strlen(stem) + 1);
+    return dst;
+}
+
+static const char *server_advertised_model_id(const server *s) {
+    return s->model_id ? s->model_id : server_model_id_from_engine(s->engine);
+}
+
+static const char *server_advertised_model_name(const server *s) {
+    return s->model_id ? s->model_id : ds4_engine_model_name(s->engine);
+}
+
+static bool server_model_id_known(const server *s, const char *id) {
+    return server_model_alias_known(id) ||
+           (s->model_id && id && !strcmp(id, s->model_id));
+}
+
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
-                             ds4_engine_model_name(s->engine),
+                             server_advertised_model_name(s),
                              server_model_context_window(s),
                              s->default_tokens);
 }
@@ -18467,7 +18575,7 @@ static bool send_models(server *s, int fd) {
      * selectable models when the `model` field never switches weights. */
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, server_model_id_from_engine(s->engine));
+    append_model_json(&b, s, server_advertised_model_id(s));
     buf_puts(&b, "]");
     if (s->codex_models_json) {
         buf_puts(&b, ",\"models\":");
@@ -18596,7 +18704,7 @@ static void handle_batch(server *s, int fd, const char *body) {
         const int eos = ds4_token_eos(s->engine);
         buf b = {0};
         buf_puts(&b, "{\"object\":\"batch\",\"model\":");
-        json_escape(&b, model ? model : server_model_id_from_engine(s->engine));
+        json_escape(&b, model ? model : server_advertised_model_id(s));
         buf_puts(&b, ",\"completions\":[");
         for (int i = 0; i < n; i++) {
             if (i) buf_putc(&b, ',');
@@ -18826,7 +18934,7 @@ static void send_stats(server *s, int fd, bool as_json) {
     buf b = {0};
     if (as_json) {
         buf_puts(&b, "{\"server\":{\"model\":");
-        json_escape(&b, server_model_id_from_engine(s->engine));
+        json_escape(&b, server_advertised_model_id(s));
         buf_printf(&b, ",\"context\":%d,\"max_seq\":%d,\"uptime_seconds\":%llu,"
                        "\"requests_inflight\":%llu,"
                        "\"artifact_source\":\"%s\",\"derived_artifacts\":%llu}",
@@ -18928,7 +19036,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                    "requests_inflight:%llu\n"
                    "artifact_source:%s\n"
                    "derived_artifacts:%llu\n\n",
-               server_model_id_from_engine(s->engine),
+               server_advertised_model_id(s),
                s->serial_boot_ctx, s->batch_ctx_max_seq,
                (unsigned long long)up,
                (unsigned long long)ds4_metric_read(&m->requests_inflight),
@@ -19070,7 +19178,7 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        server_model_id_known(s, hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -19176,7 +19284,7 @@ static void *client_main(void *arg) {
     }
     if (!req.model_from_request) {
         free(req.model);
-        req.model = xstrdup(server_model_id_from_engine(s->engine));
+        req.model = xstrdup(server_advertised_model_id(s));
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
@@ -19359,6 +19467,8 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
+    const char *model_id;
+    char model_id_buf[256];
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
@@ -19369,6 +19479,11 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
 } server_config;
+
+static const char *server_config_model_id(const server_config *c) {
+    if (c->model_id && c->model_id[0]) return c->model_id;
+    return c->model_id_buf[0] ? c->model_id_buf : NULL;
+}
 
 static int parse_int_arg(const char *s, const char *opt) {
     char *end = NULL;
@@ -19454,6 +19569,9 @@ static void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
+        "  --model-id ID\n"
+        "      Advertise this ID and name from /v1/models. Default: GGUF\n"
+        "      artifact name (parent *GGUF / *Mixed-Quant* dir, else file stem).\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --dspark FILE\n"
@@ -19949,6 +20067,13 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
             model_set = true;
+        } else if (!strcmp(arg, "--model-id")) {
+            c.model_id = need_arg(&i, argc, argv, arg);
+            if (!c.model_id[0]) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --model-id must not be empty");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
             mtp_set = true;
@@ -20089,6 +20214,13 @@ static server_config parse_options(int argc, char **argv) {
     }
     launch_resolve_defaults(&c, model_set, mtp_set,
                             preset_spark, no_mtp, no_dspark, no_spec);
+    /* Keep --model-id as an argv pointer (stable).  The GGUF-derived
+     * default lives only in model_id_buf so a by-value return does not
+     * leave a pointer into this stack frame. */
+    if (!c.model_id)
+        server_model_id_from_gguf_path(c.engine.model_path,
+                                       c.model_id_buf,
+                                       sizeof(c.model_id_buf));
     return c;
 }
 
@@ -20186,6 +20318,10 @@ int main(int argc, char **argv) {
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
+    s.model_id = server_config_model_id(&cfg);
+    if (s.model_id)
+        server_log(DS4_LOG_DEFAULT, "ds4-server: advertising model id %s",
+                   s.model_id);
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     /* v0.5.2 inc1: serial right-sizing (see serial_session_ensure_fit). */
@@ -22324,6 +22460,7 @@ static void test_model_family_aliases(void) {
     TEST_ASSERT(server_model_alias_known("deepseek-v4-pro"));
     TEST_ASSERT(server_model_alias_known("motif-3"));
     TEST_ASSERT(server_model_alias_known("Motif-Technologies/Motif-3"));
+    TEST_ASSERT(server_model_alias_known("Motif-3-Mixed-Quant-GGUF"));
     TEST_ASSERT(server_model_alias_known("k-exaone-236b-a23b"));
     TEST_ASSERT(server_model_alias_known("LGAI-EXAONE/K-EXAONE-236B-A23B"));
     TEST_ASSERT(!server_model_alias_known("glm-5.2"));
@@ -24986,7 +25123,76 @@ static void test_server_model_ids_cover_loaded_variants(void) {
                         "k-exaone-236b-a23b"));
     TEST_ASSERT(server_model_alias_known("solar-open2-250b"));
     TEST_ASSERT(server_model_alias_known("motif-3"));
+    TEST_ASSERT(server_model_alias_known("Motif-3-Mixed-Quant-GGUF"));
     TEST_ASSERT(server_model_alias_known("K-EXAONE-236B-A23B"));
+}
+
+static void test_model_id_from_gguf_path(void) {
+    char buf[256];
+    TEST_ASSERT(!strcmp(server_model_id_from_gguf_path("foo.gguf", buf, sizeof(buf)),
+                        "foo"));
+    TEST_ASSERT(!strcmp(server_model_id_from_gguf_path("/tmp/foo.gguf", buf, sizeof(buf)),
+                        "foo"));
+    TEST_ASSERT(!strcmp(server_model_id_from_gguf_path(
+                            "/home/x/gguf/ds4flash.gguf", buf, sizeof(buf)),
+                        "ds4flash"));
+    TEST_ASSERT(!strcmp(server_model_id_from_gguf_path(
+                            "/home/x/models/Motif-3-Mixed-Quant-GGUF/Motif-3-MQ87-88-FIT.gguf",
+                            buf, sizeof(buf)),
+                        "Motif-3-Mixed-Quant-GGUF"));
+    TEST_ASSERT(!strcmp(server_model_id_from_gguf_path(
+                            "/home/x/models/Solar-Open2-250B-Mixed-Quant-GGUF/"
+                            "Solar-Open2-250B-MXQ-v1-00001-of-00011.gguf",
+                            buf, sizeof(buf)),
+                        "Solar-Open2-250B-Mixed-Quant-GGUF"));
+    TEST_ASSERT(!strcmp(server_model_id_from_gguf_path(
+                            "K-EXAONE-236B-A23B-MXQ-v1-00001-of-00003.gguf",
+                            buf, sizeof(buf)),
+                        "K-EXAONE-236B-A23B-MXQ-v1"));
+}
+
+static void test_model_id_option(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(server_config_model_id(&defaults) != NULL);
+    TEST_ASSERT(!strcmp(server_config_model_id(&defaults), "ds4flash"));
+
+    char *derived_argv[] = {
+        "ds4-server", "-m",
+        "/models/Motif-3-Mixed-Quant-GGUF/Motif-3-MQ87-88-FIT.gguf"
+    };
+    server_config derived = parse_options(3, derived_argv);
+    TEST_ASSERT(server_config_model_id(&derived) != NULL);
+    TEST_ASSERT(!strcmp(server_config_model_id(&derived),
+                        "Motif-3-Mixed-Quant-GGUF"));
+
+    char *custom_argv[] = {
+        "ds4-server", "-m",
+        "/models/Motif-3-Mixed-Quant-GGUF/Motif-3-MQ87-88-FIT.gguf",
+        "--model-id", "custom-id"
+    };
+    server_config custom = parse_options(5, custom_argv);
+    TEST_ASSERT(server_config_model_id(&custom) != NULL);
+    TEST_ASSERT(!strcmp(server_config_model_id(&custom), "custom-id"));
+
+    server s = {
+        .model_id = server_config_model_id(&derived),
+        .serial_boot_ctx = 196608,
+        .default_tokens = 1024,
+    };
+    TEST_ASSERT(!strcmp(server_advertised_model_id(&s),
+                        "Motif-3-Mixed-Quant-GGUF"));
+    TEST_ASSERT(!strcmp(server_advertised_model_name(&s),
+                        "Motif-3-Mixed-Quant-GGUF"));
+    TEST_ASSERT(server_model_id_known(&s, "Motif-3-Mixed-Quant-GGUF"));
+    TEST_ASSERT(server_model_id_known(&s, "motif-3"));
+
+    buf b = {0};
+    append_model_json(&b, &s, server_advertised_model_id(&s));
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"Motif-3-Mixed-Quant-GGUF\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"Motif-3-Mixed-Quant-GGUF\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context_length\":196608") != NULL);
+    buf_free(&b);
 }
 
 static void test_partial_warm_policy_requires_runtime_support(void) {
@@ -29180,6 +29386,8 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
     test_server_model_ids_cover_loaded_variants();
+    test_model_id_from_gguf_path();
+    test_model_id_option();
     test_model_metadata_keeps_configured_context_after_session_rightsize();
     test_partial_warm_policy_requires_runtime_support();
     test_rewind_only_record_cannot_supersede_exact_record();

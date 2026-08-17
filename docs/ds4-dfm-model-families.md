@@ -60,7 +60,11 @@ Every family is served by `ds4-server` and exposes:
 
 The model-family dispatch covers prompt rendering, generated-message parsing,
 tool-call syntax, streaming tails, thinking controls, and generation stop
-tokens. A listening port is not an acceptance result; `/v1/models`, a real
+tokens. `--model-id` sets the `/v1/models` id for every family. When it is
+omitted, the server parses the GGUF path: a parent directory ending in
+`GGUF` or containing `Mixed-Quant` (the usual artifact bucket) wins,
+otherwise the file stem with any `-00001-of-00011` shard suffix removed.
+A listening port is not an acceptance result; `/v1/models`, a real
 generation request, and settled `/v1/stats` counters must all pass.
 
 ## Common disk-KV contract
