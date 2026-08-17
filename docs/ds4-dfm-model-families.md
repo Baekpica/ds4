@@ -148,9 +148,8 @@ a second full-model owner beside the first one on the reference machine.
 
 This cut absorbs Entrpi `v0.6.0` (`c8956e0`) on the same GB10 host
 (driver 610.43.02, CUDA 13.3, `sm_121a` cubins only). The gates below
-are fixture, unit, and structural GGUF checks on this binary, plus a
-remeasured Motif 8K `ds4-bench` point. The Motif 32K/256K HTTP numbers
-remain those of `v0.5.6.3-dfm`.
+are fixture, unit, and structural GGUF checks on this binary. The Motif
+8K/32K/256K published numbers remain those of `v0.5.6.3-dfm`.
 
 | Family | Gate | Result |
 |---|---|---|
@@ -167,6 +166,12 @@ stays `UNSUPPORTED` for EXAONE/Motif/Solar because those banks use
 fixed CUDA allocations. The Motif CUDA fixture also required restoring
 the DFM rule that a current whole-model device copy wins over a stale
 range keyed by a recycled host address.
+
+The published Motif 8K `ds4-bench` point requires the VMM owner's
+aligned Q8 artifacts (the `q8 pair prefill using aligned Q8_0 artifacts`
+path). `--no-repack-q8-aligned` falls through to the raw Q8 pair kernel
+and is not that point. A `v0.6.0-dfm` remeasure on the aligned-Q8 owner
+stayed in the same band and is not a new published number.
 
 ## Integration evidence for `v0.5.6.3-dfm`
 
@@ -190,19 +195,17 @@ those ranges without a duplicate model copy.
 
 The 32K/256K HTTP gates used
 [`593d251`](https://github.com/Baekpica/ds4/commit/593d2511a10694f5a33fbafbd997ca24e819a853).
-The 8K `ds4-bench` throughput below was remeasured on
-[`cedd956`](https://github.com/Baekpica/ds4/commit/cedd95644e159600825df7ab288a764834581fa2)
-(`v0.6.0-dfm`), built with CUDA 13.3 as `sm_121a` on one DGX Spark GB10
-running driver 610.43.02 and Linux 6.17.0-1029-nvidia. The bench imported
-the production MQ87-88 artifact from a VMM owner with aligned IQ2, Q2K, and
-Q8 artifacts (644 ranges, 96,035 MiB), a 4,096-token prefill chunk, greedy
-sampling, no thinking, no speculation, and one request at a time. Loaded SM
-clock was 2,411 MHz. The same command with `--no-repack-q8-aligned` measured
-290.96 / 12.11 tok/s and is not the published 8K point.
+The 8K `ds4-bench` throughput below used
+[`cc2f277`](https://github.com/Baekpica/ds4/commit/cc2f27712482318aef4d83c30f59974739166990)
+(FATTN occupancy: drop the Q shared tile so three CTAs fit on GB10), built with CUDA 13.3
+as `sm_121a` on one DGX Spark GB10 running driver 610.43.02 and Linux
+6.17.0-1029-nvidia. The server used the production MQ87-88 artifact, the VMM
+owner above, a 4,096-token prefill chunk, greedy sampling, no thinking, no
+speculation, and one request at a time.
 
 | Gate | Interface | Prompt | Prefill | Decode | Correctness |
 |---|---|---:|---:|---:|---|
-| 8K | `ds4-bench` | 8,192 | 520.39 tok/s | 64 tokens at 12.24 tok/s | throughput fixture; prefill-only 520.39, decode-run 516.83 / 12.24 |
+| 8K | `ds4-bench` | 8,192 | 519.55 tok/s | 64 tokens at 12.28 tok/s | throughput fixture; prefill-only 519.55, decode-run 516.17 / 12.28 |
 | 32K | OpenAI Chat | 32,768 | 82.649 s; 396.47 tok/s | 43 in 4.799 s; 8.96 tok/s | beginning, middle, and end sentinels exact |
 | 256K | OpenAI Chat, `-c 262144` | 262,080 | 1,492.375 s; 175.61 tok/s | 43 in 17.072 s; 2.52 tok/s | all sentinels exact; `finish_reason=stop`; 262,123 total tokens |
 
