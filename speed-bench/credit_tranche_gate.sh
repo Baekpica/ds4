@@ -168,8 +168,15 @@ sleep 2
 push_row K4 35 "Tell me a very long and winding story about a train conductor."
 sleep 8
 AK1=$(admits_now)
-[ $((AK1 - AK0)) -ge 3 ] || fail "leg K: only $((AK1-AK0)) rows arrived (push failure, not a verdict)"
 REJ3=$(srv_count 'rejected on comp-cache budget')
+# MT-7: arrivals = admits + budget rejects (each push lands as exactly one).
+# The admission band (+~2% on legacy's phantom-inflated unions) moved the
+# refusal boundary at the midpoint pin from after-3 to after-2 rows, so the
+# oracle asserts the SHAPE -- pushes all arrived, some admitted, some
+# refused -- never an exact admit count at a mid-band pin.
+ARR=$((AK1 - AK0 + REJ3 - REJ2))
+[ $ARR -ge 4 ] || fail "leg K: only $ARR pushes arrived as verdicts (admits+rejects; push failure, not a verdict)"
+[ $((AK1 - AK0)) -ge 2 ] || fail "leg K: only $((AK1-AK0)) admits before refusal (pin implausibly tight)"
 [ "$REJ3" -gt "$REJ2" ] || fail "leg K: legacy full credits did NOT refuse at the pin (tranche A/B broken)"
 SER1=$SER0
 for i in $(seq 1 16); do
@@ -204,7 +211,13 @@ sleep 15
 # boundary's next-tranche pages (~16 MiB expected at 4096 tok across the
 # layer slabs) do not.  An unlucky page phase grants once; cumulative
 # growth guarantees refusal by the following boundary -- poll generously.
-boot "DS4_CONT_ADMIT_TRANCHE=4096"
+# MT-7: both XR boots pin the admission band to 1024 (physics-exact) -- the
+# pin derives from the QUOTE while resident tops out at the unbanded page
+# extent, so a banded quote inflates the pin ~2 MiB above what the verdict
+# ever reaches and starves the refusal margin at page granularity.  This
+# leg tests the extension-refusal machinery; the band has its own units +
+# deep-gate asserts.
+boot "DS4_CONT_ADMIT_TRANCHE=4096 DS4_CONT_ADMIT_BAND_X1024=1024"
 push_row P1 20 "Count upward from 1, one number per line, without stopping and without any commentary."
 sleep 8
 U1=$(union_at 1)
@@ -212,7 +225,7 @@ U1=$(union_at 1)
 ssh "$R" "pkill -x curl" 2>/dev/null
 XPIN=$((U1 + 4))
 log "leg XR: single-row union $U1 MiB -> pinning budget $XPIN MiB (tranche 4096)"
-boot "DS4_CONT_ADMIT_TRANCHE=4096 DS4_BATCH_VMM_BUDGET_MB=$XPIN"
+boot "DS4_CONT_ADMIT_TRANCHE=4096 DS4_CONT_ADMIT_BAND_X1024=1024 DS4_BATCH_VMM_BUDGET_MB=$XPIN"
 RF0=$(metric ds4_cont_credit_extension_refused_total)
 ssh "$R" "rm -f /tmp/ctg_XR.json"
 push_row XR 600 "Count upward from 1, one number per line, without stopping and without any commentary."

@@ -32905,6 +32905,13 @@ struct ds4_batch_ctx {
      * instead of racing a pass -- structural today (server and pass
      * drivers all hold gen_mu), typed honesty for every other caller. */
     int             in_pass;
+    /* MT-7 (v0.6.1 memory truth): live commit rates as of the last funding
+     * check -- census-observed slab bytes per committed token vs the packed
+     * shape-derived rate the projection charges.  Written under gen_mu
+     * (funding checks run inside the pass); read racily by /metrics
+     * (aligned u64, advisory). */
+    uint64_t        rate_obs_bpt;
+    uint64_t        rate_phys_bpt;
     uint64_t        warm_admits;     /* observability + gate hooks */
     uint64_t        warm_rejects;    /* n_cached>0 admits that degraded to cold */
     uint64_t        fork_admits;     /* A2b: fork_bank>0 admits served by copy (or */
@@ -33929,6 +33936,57 @@ static uint64_t credit_union_family(const ds4_gpu_tensor *t, uint64_t stride,
                                  credit_union_run_need, (void *)(uintptr_t)t);
 }
 
+/* MT-7 (v0.6.1 memory truth): the disclosed admission band.  The union
+ * projection below charges future page-rounded extents EXACTLY, so the only
+ * honest margin left is the measured transient peak during admission --
+ * leg2a memcal stamped 1.02x steady for sequential chunked admits (receipts
+ * local/docs/v061/leg2a/); the deep-admission A/B re-stamps the default if
+ * the concurrent shape measures hotter.  1024 = physics-exact (kill
+ * switch); clamp mirrors ds4_cont_admit_band_apply. */
+uint32_t ds4_cont_admit_band_x1024(void) {
+    static uint32_t band = 0;
+    if (band == 0) {
+        uint32_t v = 1045u;
+        const char *e = getenv("DS4_CONT_ADMIT_BAND_X1024");
+        if (e && e[0]) {
+            const long x = atol(e);
+            if (x > 0) v = (uint32_t)x;
+        }
+        if (v < 1024u) v = 1024u;
+        if (v > 2048u) v = 2048u;
+        band = v;
+    }
+    return band;
+}
+
+/* MT-7: the shape-derived packed commit rate (bytes per committed token)
+ * of the demand-mapped families the projection charges -- the SAME family
+ * selection as ds4_batch_credit_union_projection (fp8 codes displace the
+ * F32 comp extent when present; likewise fp4 index codes; eager scale
+ * slabs excluded on both sides).  This is the physics floor the live
+ * observed rate is compared against: an observed rate ABOVE it beyond
+ * page-floor amortization means per-token growth the projection does not
+ * know about. */
+static uint64_t ds4_batch_slabs_packed_bpt(const ds4_batch_ctx *ctx) {
+    const ds4_batch_slabs *sl = &ctx->sl;
+    double bpt = 0.0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        double row = 0.0;
+        if (sl->multi_comp_fp8[il])
+            row += (double)DS4_OPP_C_FP8_ROW_BYTES;
+        else if (sl->multi_comp[il])
+            row += (double)(DS4_N_HEAD_DIM * sizeof(float));
+        if (sl->multi_index_fp4[il])
+            row += (double)DS4_INDEXER_FP4_ROW_BYTES;
+        else if (sl->multi_index[il])
+            row += (double)(DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        bpt += row / (double)ratio;
+    }
+    return (uint64_t)(bpt + 0.5);
+}
+
 /* Inc 0b (governance, review 2.2): page-union LIFETIME projection.  Every
  * live admission carries a credit -- its full normalized target
  * min(prompt + decode budget, seq_cap) -- from install until the row ends,
@@ -33938,7 +33996,10 @@ static uint64_t credit_union_family(const ds4_gpu_tensor *t, uint64_t stride,
  * short-prompt/huge-output row could promise the same headroom).  Returns
  * the pages the candidate target plus every credited bank may still map,
  * beyond what is resident -- the quantity both the comp-cache budget check
- * and the live memory-floor verdict charge. */
+ * and the live memory-floor verdict charge.  MT-7: scaled by the disclosed
+ * admission band (default = the measured transient peak) at the tail, so
+ * every consumer -- admission, extension, row-end lease refresh -- charges
+ * one truth. */
 static uint64_t ds4_batch_credit_union_projection(const ds4_batch_ctx *ctx,
                                                   const uint64_t *credit,
                                                   uint32_t cand, uint64_t cand_len) {
@@ -33971,7 +34032,7 @@ static uint64_t ds4_batch_credit_union_projection(const ds4_batch_ctx *ctx,
                                         page, credit, nb, cand, cand_len);
         /* fp4 scale slab: eager, fully paid at boot -- never projected. */
     }
-    return need;
+    return ds4_cont_admit_band_apply(need, ds4_cont_admit_band_x1024());
 }
 
 /* memgov D2-1 (artifact 1, D0b receipt DISAGREE audit): rows release their
@@ -34139,6 +34200,11 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
  * pins the row to its funded boundary.  dbgctx is the caller's context
  * fragment for the DS4_ADMIT_DEBUG line (admission: prompt/budget split;
  * extension: pos/glen). */
+/* MT-7: minimum committed-token sample before the live commit rate is
+ * compared against physics -- below this, page floors (one demand page per
+ * layer x family x bank minimum) dominate the average and the comparison
+ * is noise, not signal. */
+#define DS4_CONT_RATE_MIN_TOKENS 65536u
 typedef struct {
     uint64_t mneed, mres, usable;
     int      legacy;   /* the legacy composite verdict (porcelain select) */
@@ -34154,16 +34220,47 @@ static int ds4_batch_cont_fund_check(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     memset(q, 0, sizeof(*q));
     q->mneed = ds4_batch_credit_union_projection(ctx, credit, b, flen);
     q->mres  = ds4_batch_slabs_cache_resident(&ctx->sl);
+    /* MT-7 live-rate feedback: publish the observed vs shape-derived commit
+     * rates at every funding check (admission frequency, host-only walks).
+     * The observed rate is NOT charged -- the union above is page-exact and
+     * an average-based multiplier would double-charge its page floors; the
+     * disclosed band carries the measured transient margin instead.  The
+     * tripwire is the zero-headroom law's tell: observed > 2x packed on a
+     * real sample means per-token growth the projection does not know
+     * about -- surface it loud, once. */
+    {
+        uint64_t tokens = 0;
+        for (uint32_t ci = 0; ci < MS; ci++)
+            if (ctx->bank_hist_valid[ci]) tokens += ctx->bank_hist_len[ci];
+        ctx->rate_obs_bpt  = tokens ? q->mres / tokens : 0;
+        ctx->rate_phys_bpt = ds4_batch_slabs_packed_bpt(ctx);
+        static int rate_warned = 0;
+        if (!rate_warned &&
+            ds4_cont_rate_anomalous(q->mres, tokens, ctx->rate_phys_bpt,
+                                    DS4_CONT_RATE_MIN_TOKENS)) {
+            rate_warned = 1;
+            fprintf(stderr,
+                    "ds4: WARNING cont commit rate %llu B/tok exceeds 2x the "
+                    "packed shape rate %llu B/tok (%llu tokens resident) -- "
+                    "unprojected per-token growth, investigate\n",
+                    (unsigned long long)ctx->rate_obs_bpt,
+                    (unsigned long long)ctx->rate_phys_bpt,
+                    (unsigned long long)tokens);
+        }
+    }
     /* Admission forensics (Inc 0b): DS4_ADMIT_DEBUG=1 prints the verdict
      * inputs per funding check -- the tell for a credit that silently
      * under-charges. */
     if (getenv("DS4_ADMIT_DEBUG")) {
         fprintf(stderr,
-                "ds4: admit debug bank=%u %s flen=%llu mneed=%.1f MiB mres=%.1f MiB budget=%.1f MiB sub_out=%.1f MiB credits=",
+                "ds4: admit debug bank=%u %s flen=%llu mneed=%.1f MiB mres=%.1f MiB budget=%.1f MiB sub_out=%.1f MiB rate_obs=%llu rate_phys=%llu band=%u credits=",
                 b, dbgctx, (unsigned long long)flen,
                 (double)q->mneed / 1048576.0, (double)q->mres / 1048576.0,
                 (double)ctx->comp_map_budget / 1048576.0,
-                (double)ds4_gpu_substrate_outstanding() / 1048576.0);
+                (double)ds4_gpu_substrate_outstanding() / 1048576.0,
+                (unsigned long long)ctx->rate_obs_bpt,
+                (unsigned long long)ctx->rate_phys_bpt,
+                ds4_cont_admit_band_x1024());
         for (uint32_t ci = 0; ci < MS; ci++)
             fprintf(stderr, "%s%llu", ci ? "," : "",
                     (unsigned long long)credit[ci]);
@@ -35417,6 +35514,17 @@ int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) {
  * returns raw_cap, the historical bound. */
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) {
     return ctx ? (int)ctx->seq_cap : 0;
+}
+
+/* MT-7: the live commit rates as of the last funding check.  Aligned u64
+ * fields written under gen_mu; racy reads are advisory (metrics), the
+ * serving-observability contract. */
+int ds4_batch_ctx_commit_rate(const ds4_batch_ctx *ctx,
+                              uint64_t *obs_bpt, uint64_t *phys_bpt) {
+    if (!ctx) return 0;
+    if (obs_bpt)  *obs_bpt  = ctx->rate_obs_bpt;
+    if (phys_bpt) *phys_bpt = ctx->rate_phys_bpt;
+    return 1;
 }
 
 static int ds4_engine_batched_generate_ctx_impl(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
@@ -39305,6 +39413,11 @@ int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) { (void)ctx; (void)bank; return 0u; }
 int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+int ds4_batch_ctx_commit_rate(const ds4_batch_ctx *ctx,
+                              uint64_t *obs_bpt, uint64_t *phys_bpt) {
+    (void)ctx; (void)obs_bpt; (void)phys_bpt; return 0;
+}
+uint32_t ds4_cont_admit_band_x1024(void) { return 1024u; }
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {

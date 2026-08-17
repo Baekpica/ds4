@@ -16934,6 +16934,22 @@ static void send_metrics(server *s, int fd) {
                    "ds4_cont_credit_extension_refused_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_credit_ext_granted),
                (unsigned long long)ds4_metric_read(&m->cont_credit_ext_refused));
+    /* MT-7 (v0.6.1 memory truth): the live commit rates (census-observed
+     * slab bytes per committed token vs the packed shape rate the union
+     * projection charges) + the disclosed admission band.  Racy aligned-u64
+     * reads of ctx fields; readers never take gen_mu. */
+    if (s->batch_ctx) {
+        uint64_t obs = 0, phys = 0;
+        if (ds4_batch_ctx_commit_rate(s->batch_ctx, &obs, &phys))
+            buf_printf(&b,
+                "# TYPE ds4_cont_commit_bytes_per_token gauge\n"
+                "ds4_cont_commit_bytes_per_token{kind=\"observed\"} %llu\n"
+                "ds4_cont_commit_bytes_per_token{kind=\"packed\"} %llu\n"
+                "# TYPE ds4_cont_admit_band_x1024 gauge\n"
+                "ds4_cont_admit_band_x1024 %u\n",
+                (unsigned long long)obs, (unsigned long long)phys,
+                ds4_cont_admit_band_x1024());
+    }
     /* MT-3: serial idle reaps (each one returned the session graph's GiBs). */
     buf_printf(&b, "# TYPE ds4_serial_idle_reaps_total counter\n"
                    "ds4_serial_idle_reaps_total %llu\n",
@@ -19068,11 +19084,12 @@ int main(int argc, char **argv) {
                         s.warm_checkpoint = !(bc && bc[0] == '0' && bc[1] == '\0');
                     }
                     server_log(DS4_LOG_DEFAULT,
-                               "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d prefill_chunk=%u seq_cap=%d)%s",
+                               "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d prefill_chunk=%u seq_cap=%d admit_band=%u)%s",
                                got_seq, cmaxtok, cfg.ctx_size,
                                ds4_batch_ctx_raw_cap(s.batch_ctx),
                                ds4_cont_prefill_chunk_tokens(),
                                ds4_batch_ctx_seq_cap(s.batch_ctx),
+                               ds4_cont_admit_band_x1024(),
                                got_seq < cmax ? " [reduced from requested to fit memory]" : "");
                     made = true;
                     break;
@@ -25881,6 +25898,37 @@ static void test_coalesce_max_default_tiers(void) {
     TEST_ASSERT(coalesce_max_default(786432) == 4);    /* the leg2a shape */
 }
 
+/* MT-7: the disclosed admission band -- clamp, physics floor, round-up. */
+static void test_cont_admit_band_apply(void) {
+    /* 1024 = physics-exact: identity at any need */
+    TEST_ASSERT(ds4_cont_admit_band_apply(0, 1024) == 0);
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 1024) == 1048576);
+    /* the default 1045 (~1.02x): rounds UP, never shrinks a nonzero need */
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 1045) == 1070080);
+    TEST_ASSERT(ds4_cont_admit_band_apply(1, 1045) == 2);
+    /* clamp low: anything below 1024 charges physics-exact */
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 0) == 1048576);
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 512) == 1048576);
+    /* clamp high: 2048 is the sanity cap (2x physics) */
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 4096) == 2097152);
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 2048) == 2097152);
+}
+
+/* MT-7: the commit-rate tripwire -- sample gate, 2x boundary, guards. */
+static void test_cont_rate_anomalous(void) {
+    /* below the sample gate: page floors dominate, never trips */
+    TEST_ASSERT(!ds4_cont_rate_anomalous(1u << 30, 100, 4096, 65536));
+    /* zero physics rate or zero min_tokens: undefined comparison, no trip */
+    TEST_ASSERT(!ds4_cont_rate_anomalous(1u << 30, 100000, 0, 65536));
+    TEST_ASSERT(!ds4_cont_rate_anomalous(1u << 30, 100000, 4096, 0));
+    /* at the boundary exactly (obs == 2x phys): not anomalous */
+    TEST_ASSERT(!ds4_cont_rate_anomalous(2ull * 4096 * 100000, 100000, 4096, 65536));
+    /* one byte past: trips */
+    TEST_ASSERT(ds4_cont_rate_anomalous(2ull * 4096 * 100000 + 1, 100000, 4096, 65536));
+    /* the healthy ship shape: obs ~= phys, never trips */
+    TEST_ASSERT(!ds4_cont_rate_anomalous(4300ull * 500000, 500000, 4096, 65536));
+}
+
 /* Inc 7a: the extracted accumulator's own contract -- verdict precedence,
  * stop capture + truncation, one-shot transitions, think-gated markers.
  * The serial/cont byte equivalence is pinned by the oracle tests above;
@@ -28226,6 +28274,8 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_credit_ext_due_shapes();
     test_cont_credit_refuse_bmax_clamp();
     test_coalesce_max_default_tiers();
+    test_cont_admit_band_apply();
+    test_cont_rate_anomalous();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();

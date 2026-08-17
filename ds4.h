@@ -390,6 +390,33 @@ static inline uint32_t ds4_cont_credit_refuse_bmax(uint32_t glen, uint64_t pos,
     const uint64_t left = credit_end > pos ? credit_end - pos : 0u;
     return glen + (uint32_t)left;
 }
+/* MT-7 (v0.6.1 memory truth): the disclosed admission band -- the ONLY
+ * multiplier ever applied to the page-union projection.  band_x1024 is a
+ * fixed-point factor (1024 = physics-exact, the floor; 2048 = the sanity
+ * cap); the charge rounds UP so a nonzero need never shrinks.  The union
+ * arithmetic already charges future page-rounded extents exactly, so the
+ * band carries only the MEASURED transient margin (peak/steady during
+ * admission) -- never an observed-average rate, which would double-charge
+ * the page floors the union has already counted. */
+static inline uint64_t ds4_cont_admit_band_apply(uint64_t need,
+                                                 uint32_t band_x1024) {
+    uint32_t b = band_x1024;
+    if (b < 1024u) b = 1024u;
+    if (b > 2048u) b = 2048u;
+    return (need * b + 1023u) / 1024u;
+}
+/* MT-7: the live commit-rate tripwire (zero-headroom law: no unexplained
+ * gaps).  Anomalous when the OBSERVED slab bytes per committed token exceed
+ * 2x the shape-derived packed rate with a meaningful sample -- the tell for
+ * per-token growth the projection does not know about.  Small samples are
+ * page-floor dominated (every layer x family rounds up to a whole demand
+ * page) and never trip. */
+static inline int ds4_cont_rate_anomalous(uint64_t resident_bytes,
+                                          uint64_t tokens, uint64_t phys_bpt,
+                                          uint64_t min_tokens) {
+    if (tokens < min_tokens || min_tokens == 0 || phys_bpt == 0) return 0;
+    return resident_bytes > 2u * phys_bpt * tokens ? 1 : 0;
+}
 /* Bank count of the persistent ctx (create_fit may size it below the
  * requested cap).  Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx);
@@ -401,6 +428,19 @@ int  ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx);
 /* MT-5 hygiene: the cont admission chunk width (DS4_CONT_PREFILL_CHUNK,
  * default 4096) -- the input that shapes raw_cap; for boot-ledger honesty. */
 uint32_t ds4_cont_prefill_chunk_tokens(void);
+/* MT-7: the disclosed admission band (DS4_CONT_ADMIT_BAND_X1024, default
+ * 1045 = the leg2a-measured 1.02x sequential transient peak, rounded up;
+ * clamped to [1024, 2048]; 1024 = physics-exact charging).  Applied inside
+ * ds4_batch_credit_union_projection, so admission, extension, and row-end
+ * lease refreshes all charge the same truth. */
+uint32_t ds4_cont_admit_band_x1024(void);
+/* MT-7: census-observed vs shape-derived commit rates of the persistent
+ * ctx's demand-mapped cache slabs, bytes per committed token.  obs = slab
+ * resident / valid committed tokens as of the last funding check (0 before
+ * any); phys = the packed per-token rate the projection charges, from the
+ * live slab config.  Returns 0 and writes nothing if ctx is NULL. */
+int ds4_batch_ctx_commit_rate(const ds4_batch_ctx *ctx,
+                              uint64_t *obs_bpt, uint64_t *phys_bpt);
 /* Per-sequence committed-token bound (prompt + generation) of the CONTINUOUS
  * path: the admit pre-check + decode budget cap.  With chunked admission
  * (DS4_CONT_PREFILL_CHUNK > 0, the default) the raw ring wraps and this is the
