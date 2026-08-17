@@ -167,8 +167,8 @@ those ranges without a duplicate model copy.
 The 32K/256K HTTP gates used
 [`593d251`](https://github.com/Baekpica/ds4/commit/593d2511a10694f5a33fbafbd997ca24e819a853).
 The 8K `ds4-bench` throughput below used
-[`c14dc52`](https://github.com/Baekpica/ds4/commit/c14dc52fa715a42c5f55f1fb714c1bb5537f81f2)
-(attention BF16 store fuse on prepare/V/differential), built with CUDA 13.3
+[`cc2f277`](https://github.com/Baekpica/ds4/commit/cc2f27712482318aef4d83c30f59974739166990)
+(FATTN occupancy: drop the Q shared tile so three CTAs fit on GB10), built with CUDA 13.3
 as `sm_121a` on one DGX Spark GB10 running driver 610.43.02 and Linux
 6.17.0-1029-nvidia. The server used the production MQ87-88 artifact, the VMM
 owner above, a 4,096-token prefill chunk, greedy sampling, no thinking, no
@@ -176,7 +176,7 @@ speculation, and one request at a time.
 
 | Gate | Interface | Prompt | Prefill | Decode | Correctness |
 |---|---|---:|---:|---:|---|
-| 8K | `ds4-bench` | 8,192 | 513.15 tok/s | 64 tokens at 12.28 tok/s | throughput fixture; prefill-only 513.15, decode-run 511.32 / 12.28 |
+| 8K | `ds4-bench` | 8,192 | 519.55 tok/s | 64 tokens at 12.28 tok/s | throughput fixture; prefill-only 519.55, decode-run 516.17 / 12.28 |
 | 32K | OpenAI Chat | 32,768 | 82.649 s; 396.47 tok/s | 43 in 4.799 s; 8.96 tok/s | beginning, middle, and end sentinels exact |
 | 256K | OpenAI Chat, `-c 262144` | 262,080 | 1,492.375 s; 175.61 tok/s | 43 in 17.072 s; 2.52 tok/s | all sentinels exact; `finish_reason=stop`; 262,123 total tokens |
 
