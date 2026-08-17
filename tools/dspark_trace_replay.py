@@ -99,10 +99,12 @@ class PolicyParams:
     alpha: float = DEFAULT_ALPHA
     minev: int = DEFAULT_MINEV
     budget: float = DEFAULT_BUDGET
-    # Debt floor: debt is clamped at -credit_cap. 0 reproduces the engine
-    # shadow (reflected walk -- false-quenches long bursty winners); large
-    # values approach pure cumulative regret (never quenches stationary
-    # winners, slower to react to a mid-request regime change).
+    # Debt floor: debt is clamped at -credit_cap.  0 reproduces the
+    # PHASE-1 clamped shadow (reflected walk -- false-quenches long
+    # bursty winners; REJECTED at calibration); the shipped engine runs
+    # ccap=inf (pure net cumulative regret) since Phase 2.  This
+    # dataclass default stays 0.0 for the selftest's fixed expectations;
+    # the CLI replay path defaults to inf to match the engine.
     credit_cap: float = 0.0
 
 
@@ -716,7 +718,7 @@ def print_single_summary(summary: ReplaySummary) -> None:
     print(
         "PARAMS "
         f"guard={params.guard:g} alpha={params.alpha:g} minev={params.minev} "
-        f"budget={params.budget:g} cost={summary.cost:g}"
+        f"budget={params.budget:g} ccap={params.credit_cap:g} cost={summary.cost:g}"
     )
     print(f"REQUESTS: n={summary.n_requests}")
     print(
@@ -1070,7 +1072,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     replay_parser.add_argument(
         "--credit-cap",
         type=_finite_cli_float,
-        help="debt floor (-credit_cap); 0 = engine shadow, large = cumulative regret",
+        help="debt floor (-credit_cap); default inf = shipped engine (pure "
+        "net regret); 0 = the rejected Phase-1 clamped shadow",
     )
     replay_parser.add_argument(
         "--cost",
@@ -1118,7 +1121,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             alpha=DEFAULT_ALPHA if args.alpha is None else args.alpha,
             minev=DEFAULT_MINEV if args.minev is None else args.minev,
             budget=DEFAULT_BUDGET if args.budget is None else args.budget,
-            credit_cap=0.0 if args.credit_cap is None else args.credit_cap,
+            credit_cap=math.inf if args.credit_cap is None else args.credit_cap,
         )
         return command_replay(args.logs, args.grid, params, args.cost, args.csv)
 

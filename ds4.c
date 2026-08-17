@@ -1084,6 +1084,7 @@ void ds4_metrics_window_rates(double *dec_tok_s, double *pf_tok_s, double *tok_p
     if (tok_per_step) *tok_per_step = steps ? (double)tok / (double)steps : 0.0;
 }
 
+__attribute__((unused))   /* referenced only under GPU-guarded shapes */
 static void sleep_sec(double sec) {
     if (sec <= 0.0 || !isfinite(sec)) return;
     struct timespec req;
@@ -1521,6 +1522,10 @@ typedef struct {
      * and leaves every existing CPU/GPU kernel path shard-agnostic. */
     uint32_t split_count;
     int *split_fds;       /* descriptors for shards 1..split_count-1 */
+    /* memgov D1a-2: per-tensor semantic traits (ds4_model_catalog.h),
+     * classified once at model_open from the exact-name binding
+     * knowledge.  Consumers index it in tensor order. */
+    uint8_t *tensor_traits;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -1764,6 +1769,7 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    free(m->tensor_traits);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->split_fds) {
         for (uint32_t i = 0; i + 1 < m->split_count; i++) {
@@ -2139,6 +2145,16 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
         m->fd = -1;
         model_open_split(m, path, split_count, mmap_flags);
     }
+    /* memgov D1a-2: build the semantic catalog after tensors are final
+     * (including after a split remap). */
+    if (m->n_tensors != 0) {
+        m->tensor_traits = xmalloc((size_t)m->n_tensors);
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            const ds4_tensor *t = &m->tensors[i];
+            m->tensor_traits[i] = (uint8_t)ds4_tensor_catalog_classify(
+                t->name.ptr, t->name.len, t->ndim, t->type, t->dim, t->bytes);
+        }
+    }
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -2403,12 +2419,14 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
-/* deepmem lite-2: the startup span walk is compiled UNCONDITIONALLY (the
- * DS4_CUDA_SPARK_HBM_CACHE compile fork is retired); runtime policy lives
- * in ds4_gpu_cache_model_range (integrated devices only, opt-out
- * DS4_CUDA_NO_HBM_CACHE).  Eager-before-the-plan is the accounting fix:
- * these promotions land before the bank fit samples free memory, so any
- * build plans honestly (the 08-05 29-vs-13-bank divergence class). */
+/* deepmem lite-2 / memgov D1b-1: the eager residency pass is compiled
+ * UNCONDITIONALLY (the DS4_CUDA_SPARK_HBM_CACHE compile fork is
+ * retired); runtime policy lives in the bound canonical-unit table +
+ * ds4_gpu_materialize_model_plan (integrated devices only, opt-out
+ * DS4_CUDA_NO_HBM_CACHE via the table's policy stamps).  Eager-before-
+ * the-plan is the accounting fix: these promotions land before the bank
+ * fit samples free memory, so any build plans honestly (the 08-05
+ * 29-vs-13-bank divergence class). */
 typedef struct {
     uint64_t off;
     uint64_t end;
@@ -2529,7 +2547,20 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 
     const double t0 = now_sec();
     uint64_t cached = 0;
-    if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+    /* memgov D1b-1: the eager pass materializes the map's BOUND unit
+     * table (compiled + verified + bound just above the pre-cache calls
+     * in engine open).  The walk's private span compiler is gone — the
+     * table is the only enumeration, slice-aware active sets included,
+     * and the routed-expert skip (~65 GiB of cold top-K experts that
+     * would starve the hot non-MoE tensors) is the units' policy stamp
+     * from the D1a-2 catalog.  `cached` reports bytes actually
+     * device-copied (POPULATED), never policy skips — the deepmem
+     * lite-2 honesty rule. */
+    if (ds4_gpu_model_map_replacements_complete(m->map)) {
+        if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+    } else if (!ds4_gpu_materialize_model_plan(m->map, m->size, &cached)) {
+        return false;
+    }
     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -12889,7 +12920,9 @@ static bool metal_graph_load_directional_steering(
     float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
     bool ok = read_f32_binary_file(path, dirs, n);
     if (ok) {
+        ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
         g->directional_steering_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
+        ds4_gpu_mem_scope_end();
         ok = g->directional_steering_dirs != NULL &&
              ds4_gpu_tensor_write(g->directional_steering_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
     }
@@ -12990,7 +13023,11 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
 }
 
 static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
-    return managed ? ds4_gpu_tensor_alloc_managed(bytes) : ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_mem_scope_begin(DS4_MEMC_KV_PRIMARY);
+    ds4_gpu_tensor *t = managed ? ds4_gpu_tensor_alloc_managed(bytes)
+                                : ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_mem_scope_end();
+    return t;
 }
 
 /* =========================================================================
@@ -13121,14 +13158,18 @@ static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint3
 
 static bool metal_graph_ensure_ffn_out(ds4_gpu_graph *g) {
     if (!g->ffn_out) {
+        ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
         g->ffn_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_mem_scope_end();
     }
     return g->ffn_out != NULL;
 }
 
 static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
     if (!g->batch_ffn_out) {
+        ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
         g->batch_ffn_out = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+        ds4_gpu_mem_scope_end();
     }
     return g->batch_ffn_out != NULL;
 }
@@ -13265,6 +13306,65 @@ static uint64_t metal_graph_alloc_bytes_estimate(
     return bytes;
 }
 
+#endif /* !DS4_NO_GPU */
+
+/* memgov D2-4: the serial session's protected margin, ONE source shared by
+ * the fit gate below and the S6 governor claim -- the probe and the quote
+ * evaluate the same inequality (free >= margin + need) and cannot drift.
+ * This margin, NOT the operator floor, is the serial lane's legacy
+ * protection level: the reclaim charter (lite-4) serves from the commons
+ * inside the floor band rather than 503ing beside idle cache.
+ * Backend-neutral (env + arithmetic only) and called unconditionally from
+ * the server's serial quote path, so it must stay OUTSIDE the GPU guard. */
+uint64_t ds4_session_graph_headroom_bytes(void) {
+    uint64_t headroom = 1024ull << 20;
+    const char *he = getenv("DS4_SESSION_GRAPH_HEADROOM_MB");
+    if (he && he[0]) {
+        const long v = atol(he);
+        if (v >= 0) headroom = (uint64_t)v << 20;
+    }
+    return headroom;
+}
+
+/* memgaps MG-1 (2026-08-16): release the engine's OWN reclaimable device
+ * reserve before any live-memory refusal.  The graph pool keeps freed
+ * session/static graph backing as reserve for the process lifetime (the
+ * one boot trim at prewarm aside); on unified boxes that reserve
+ * depresses the ONE observation every admission verdict consumes, so an
+ * aged server refuses organic work beside its own hoard.  Refusal
+ * ladders call this after their legacy actors (bank trim, reclaim
+ * collect) and before the final verdict; admits never pay the driver
+ * call.  Backend-neutral and OUTSIDE the GPU guard (the CPU leg must
+ * LINK: matrix law) -- backends without the reserve concept recover 0
+ * and disclose nothing.  DS4_MEM_OWN_TRIM=0 is the kill switch. */
+uint64_t ds4_mem_own_trim(const char *site) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_MEM_OWN_TRIM");
+        enabled = !(e && e[0] == '0' && e[1] == '\0');
+    }
+    if (!enabled) return 0;
+    uint64_t recovered = 0;
+#ifndef DS4_NO_GPU
+    recovered = ds4_gpu_own_trim();
+#endif
+    ds4_metrics *m = ds4_metrics_get();
+    ds4_metric_add(&m->mem_own_trim_calls, 1);
+    if (recovered != 0) {
+        ds4_metric_add(&m->mem_own_trim_recovered, recovered);
+        static int disclosed = 0;
+        if (disclosed < 16) {
+            disclosed++;
+            fprintf(stderr,
+                    "ds4: mem own-trim site=%s recovered=%.1f MiB (graph-pool "
+                    "reserve returned before refusal)\n",
+                    site ? site : "?", (double)recovered / 1048576.0);
+        }
+    }
+    return recovered;
+}
+
+#ifndef DS4_NO_GPU
 /* Session-graph fit gate.  cudaMalloc on an integrated/unified box does not
  * fail cleanly when the ask exceeds MemAvailable -- the kernel reclaims and
  * swaps for tens of seconds and then the global OOM killer shoots the largest
@@ -13288,11 +13388,19 @@ static bool metal_graph_session_fit_check(
         uint32_t                 prefill_cap,
         bool                     enable_mtp,
         bool                     enable_dspark,
-        bool                     loud) {
+        bool                     loud,
+        ds4_session_graph_fit_quote *q) {   /* memgov D4-1: optional quote out */
+    if (q) memset(q, 0, sizeof(*q));
     const char *fe = getenv("DS4_SESSION_GRAPH_FIT");
-    if (fe && fe[0] == '0' && fe[1] == '\0') return true;
+    if (fe && fe[0] == '0' && fe[1] == '\0') {
+        if (q) { q->fits = 1; q->fail_open = 1; }
+        return true;
+    }
     uint64_t free_b = 0, total_b = 0;
-    if (ds4_gpu_mem_info(&free_b, &total_b) != 0) return true;
+    if (ds4_gpu_mem_info(&free_b, &total_b) != 0) {
+        if (q) { q->fits = 1; q->fail_open = 1; }
+        return true;
+    }
     /* deepmem lite-3: pending substrate promotions (lazy fd-cache tier) will
      * take this much of "free" back mid-serving; the serial graph must fit
      * beside them, not instead of them. */
@@ -13301,14 +13409,25 @@ static bool metal_graph_session_fit_check(
     const uint64_t need = metal_graph_alloc_bytes_estimate(weights, layer, raw_cap,
                                                            ctx_size, prefill_cap,
                                                            enable_mtp, enable_dspark);
-    uint64_t headroom = 1024ull << 20;
-    const char *he = getenv("DS4_SESSION_GRAPH_HEADROOM_MB");
-    if (he && he[0]) {
-        const long v = atol(he);
-        if (v >= 0) headroom = (uint64_t)v << 20;
+    const uint64_t headroom = ds4_session_graph_headroom_bytes();
+    uint64_t ask = need + headroom;
+    if (ask < need) ask = UINT64_MAX;   /* saturate (plan sec 13: no wrap) */
+    const bool fits = free_b >= ask;
+    if (q) {
+        q->fits = fits ? 1 : 0;
+        q->need_bytes = need;
+        q->headroom_bytes = headroom;
+        q->avail_bytes = free_b;
+        q->deficit_bytes = fits ? 0 : ask - free_b;
     }
-    if (free_b >= need + headroom) return true;
+    if (fits) return true;
     if (loud) {
+        /* The typed rejection family (D5-3) deliberately does NOT tick
+         * here: this gate also fires on non-admission paths (mid-request
+         * allocs, CLI boots), and the D4 server quote path refuses
+         * WITHOUT ever running it loud.  Serial admission rejections tick
+         * at the server's refusal sites, where the reason is exact; this
+         * legacy scalar keeps its frozen semantics. */
         ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
         fprintf(stderr,
                 "ds4: session graph fit check FAILED: need ~%.0f MiB (+%.0f MiB headroom) "
@@ -13331,7 +13450,7 @@ static bool metal_graph_session_fit_ok(
         bool                     enable_dspark) {
     return metal_graph_session_fit_check(weights, layer, raw_cap, ctx_size,
                                          prefill_cap, enable_mtp, enable_dspark,
-                                         /*loud=*/true);
+                                         /*loud=*/true, NULL);
 }
 
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
@@ -13807,7 +13926,12 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, false);
+    /* memgov D0a-1: every session-graph tensor the creator allocates lands
+     * on the SESSION_TENSORS census class.  Accounting only. */
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
+    const bool ok = metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, false);
+    ds4_gpu_mem_scope_end();
+    return ok;
 }
 
 static uint32_t metal_graph_raw_span_for_batch(
@@ -14172,7 +14296,9 @@ static ds4_gpu_tensor *metal_graph_comp_emit_scratch(ds4_gpu_graph *g, uint64_t 
     const uint64_t need = rows ? rows : 1u;
     if (g->comp_emit_scratch && g->comp_emit_scratch_rows >= need)
         return g->comp_emit_scratch;
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SCRATCH_STICKY);
     ds4_gpu_tensor *nt = ds4_gpu_tensor_alloc(need * DS4_N_HEAD_DIM * sizeof(float));
+    ds4_gpu_mem_scope_end();
     if (!nt) {
         fprintf(stderr, "ds4: fp8-primary emit scratch alloc failed (%llu rows)\n",
                 (unsigned long long)need);
@@ -14210,7 +14336,9 @@ static ds4_gpu_tensor *metal_graph_index_emit_scratch(ds4_gpu_graph *g, uint64_t
     const uint64_t need = rows ? rows : 1u;
     if (g->index_emit_scratch && g->index_emit_scratch_rows >= need)
         return g->index_emit_scratch;
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SCRATCH_STICKY);
     ds4_gpu_tensor *nt = ds4_gpu_tensor_alloc(need * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    ds4_gpu_mem_scope_end();
     if (!nt) {
         fprintf(stderr, "ds4: fp4-primary index emit scratch alloc failed (%llu rows)\n",
                 (unsigned long long)need);
@@ -24595,6 +24723,7 @@ static bool metal_graph_dspark_markov_refine(
         ds4_gpu_tensor           *prev_embed,  /* [nb*markov_rank] f32 scratch */
         ds4_gpu_tensor           *bias,        /* [nb*vocab] f32 scratch */
         int32_t                  *out_cand) {
+    (void)g;   /* kept in the signature for call-shape parity */
     if (nb == 0 || B == 0 || !base_logits || !cand_dev || !prev_embed || !bias || !out_cand) return false;
     const uint32_t mr   = (uint32_t)dw->markov_w2->dim[0];     /* rank (256) */
     const uint32_t mv   = (uint32_t)dw->markov_w1->dim[1];     /* markov table vocab rows */
@@ -26037,7 +26166,9 @@ static bool metal_graph_verify_decode2_exact(
         uint32_t cert_candidate = token1 >= 0 ? (uint32_t)token1 : UINT32_MAX;
         if (cert_enabled) {
             const double t0 = cert_timing ? now_sec() : 0.0;
+            ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
             ok = metal_graph_prepare_output_certifier(g, model, weights, weights->output->dim[1]);
+            ds4_gpu_mem_scope_end();
             if (cert_timing) cert_prepare_ms = (now_sec() - t0) * 1000.0;
         }
         if (ok && cert_enabled) {
@@ -31312,10 +31443,12 @@ static bool metal_graph_multiseq_bench(
      * forward, so repeated fixed-position decodes never accumulate (robust even
      * if CTX did land on a ratio boundary). */
     #define BENCH_RESET_COUNTERS(NN) do {                                  \
+        const uint32_t bench_nn_ = (NN);   /* named bound: a literal 0u    \
+            bound draws -Wtype-limits; the fold is identical */            \
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {                    \
             g->layer_n_comp[il]       = primed_n_comp_max[il];             \
             g->layer_n_index_comp[il] = primed_n_index_comp_max[il];       \
-            for (uint32_t s = 0; s < (NN); s++) {                          \
+            for (uint32_t s = 0; s < bench_nn_; s++) {                     \
                 g->ms_n_comp[s][il]       = primed_n_comp_max[il];         \
                 g->ms_n_index_comp[s][il] = primed_n_index_comp_max[il];   \
             }                                                              \
@@ -36325,7 +36458,9 @@ static bool metal_graph_dspark_capture_hc(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     if (n_tok == 0 || n_tok > g->prefill_cap || cap_layers[2] >= (uint32_t)DS4_N_LAYER) return false;
     ds4_gpu_tensor *cap[3] = {0};
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
     for (int k = 0; k < 3; k++) cap[k] = ds4_gpu_tensor_alloc((uint64_t)n_tok * hc_dim * sizeof(float));
+    ds4_gpu_mem_scope_end();
     float *host = xmalloc((size_t)n_tok * hc_dim * sizeof(float));
     bool ok = cap[0] && cap[1] && cap[2] && host;
 
@@ -37133,7 +37268,11 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
     const bool candidates_match = ok && cand0_diff <= 1.0e-3f && cand1_diff <= 1.0e-3f;
 
     const double cert_prepare_t0 = ok ? now_sec() : 0.0;
-    if (ok) ok = metal_graph_prepare_output_certifier(g, &e->model, &e->weights, vocab_dim);
+    if (ok) {
+        ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
+        ok = metal_graph_prepare_output_certifier(g, &e->model, &e->weights, vocab_dim);
+        ds4_gpu_mem_scope_end();
+    }
     const double cert_prepare_ms = ok ? (now_sec() - cert_prepare_t0) * 1000.0 : 0.0;
     ds4_gpu_candidate_cert_result cert;
     memset(&cert, 0, sizeof(cert));
@@ -38077,6 +38216,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
 #endif
 }
 
+#ifndef DS4_NO_GPU
 /* Increment B: the per-layer tensor walk of a session payload, over one
  * payload_region.  Serial save passes the zero-offset region; the bank
  * serializer passes seq-strided offsets + that bank's counters.  Byte
@@ -38086,7 +38226,6 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
  * GPU-only like every caller: payload_region and ds4_gpu_graph do not exist
  * under DS4_NO_GPU, and each public entry point already stubs the CPU build
  * before reaching these walkers. */
-#ifndef DS4_NO_GPU
 static int session_payload_write_region(ds4_gpu_graph *g, const payload_region *reg,
                                         uint32_t row_flags, FILE *fp, uint8_t *buf,
                                         char *err, size_t errlen) {
@@ -38500,7 +38639,7 @@ static int session_payload_read_region(ds4_gpu_graph *g, const payload_region *r
     }
     return rc;
 }
-#endif /* !DS4_NO_GPU: session payload region walkers */
+#endif /* !DS4_NO_GPU */
 
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
@@ -41583,6 +41722,7 @@ int ds4_engine_batched_generate_ex(
         size_t                        errlen) {
 #define BG_API_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
     if (out) for (int i = 0; i < (n > 0 ? n : 0); i++) { out[i].tokens = NULL; out[i].n_tokens = 0; out[i].finish = 0; }
+    (void)max_new_tokens; (void)eos_ids;   /* consumed on GPU shapes only */
     if (!e || !prompts || !out) { BG_API_ERR("batched_generate: null argument"); return 1; }
     if (n <= 0 || n > DS4_MULTISEQ_MAX_SEQ) { BG_API_ERR("batched_generate: n=%d out of [1,%d]", n, DS4_MULTISEQ_MAX_SEQ); return 1; }
     if (ctx_size <= 0) { BG_API_ERR("batched_generate: ctx_size must be > 0"); return 1; }
@@ -41673,11 +41813,14 @@ int ds4_engine_batched_generate_ex(
     }
 
     ds4_gpu_graph g;
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
     if (!metal_graph_alloc_raw_cap(&g, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, prefill_cap, false, false)) {
+        ds4_gpu_mem_scope_end();
         BG_API_ERR("batched_generate: graph alloc failed (raw_cap=%u prefill_cap=%u)", raw_cap, prefill_cap);
         return 1;
     }
+    ds4_gpu_mem_scope_end();
     g.quality = e->quality;
     g.power_percent = e->power_percent > 0 ? (uint32_t)e->power_percent : 100u;
 
@@ -42391,6 +42534,11 @@ struct ds4_batch_ctx {
      * in ds4.h).  Bumped at every site that replaces or invalidates a bank's
      * committed content; never on pure extension. */
     uint64_t       *bank_gen;
+    /* memgov D4-2: a batched pass is driving this context (set/cleared by
+     * the two pass entry points).  Reclaim prepare/commit answer BUSY
+     * instead of racing a pass -- structural today (server and pass
+     * drivers all hold gen_mu), typed honesty for every other caller. */
+    int             in_pass;
     uint64_t        warm_admits;     /* observability + gate hooks */
     uint64_t        warm_rejects;    /* n_cached>0 admits that degraded to cold */
     uint64_t        fork_admits;     /* A2b: fork_bank>0 admits served by copy (or */
@@ -42404,6 +42552,14 @@ struct ds4_batch_ctx {
      * the budget is an ops/gate constant, never refreshed from live memory. */
     uint64_t        comp_map_budget;
     uint8_t         comp_map_budget_pinned;
+    /* memgov D0b-4: the bank plan's eager boot cost (BATCH_BANK census
+     * minus the demand-mapped families' resident, captured once after
+     * every bank-scope boot allocation).  The governor ledger is
+     * ABSOLUTE, the live budget formulas are family-relative; this
+     * constant converts between them (x > budget <=> eager + x >
+     * eager + budget), so the lease reconciles against the census
+     * while every shadow verdict stays bit-identical. */
+    uint64_t        bank_census_eager;
     /* Governance inc2 (#8, field 378855/49): bytes carved out of every
      * bank-growth verdict so the serial lane always has room for a
      * right-sized session graph (entitlement ctx, default 32768 tokens,
@@ -43531,10 +43687,32 @@ static uint64_t ds4_mem_floor_bytes(void) {
  * (inc0b_receipt_2026-08-06.md).  One term, one place: every usable()
  * consumer (floor verdict, serial-reserve clamp, reject prints) inherits. */
 static uint64_t ds4_mem_usable(void) {
-    uint64_t lfree = 0, ltotal = 0;
-    if (ds4_gpu_mem_info(&lfree, &ltotal) != 0) return UINT64_MAX;
+    ds4_mem_observation o;
+    (void)ds4_gpu_mem_observe(&o);
+    /* D0a-3: decision-site observation counters (rendered by /metrics and
+     * /v1/stats).  Relaxed adds; no decision reads them. */
+    if (o.status == DS4_MEMOBS_OK) {
+        const int src = (o.source >= 0 &&
+                         o.source <= DS4_MEMOBS_SRC_MEMINFO_AVAILABLE)
+                            ? o.source : DS4_MEMOBS_SRC_NONE;
+        ds4_metric_add(&ds4_metrics_get()->memobs_calls[src], 1);
+    } else {
+        ds4_metric_add(&ds4_metrics_get()->memobs_errors, 1);
+    }
+    /* D0a-2: one-time source disclosure -- which estimate the live gate
+     * actually consumes (the integrated max-of-two pick was previously
+     * silent).  Values and the UINT64_MAX fail-open are bit-identical to
+     * the pre-typed ds4_gpu_mem_info path. */
+    static int obs_logged = 0;
+    if (!obs_logged && o.status == DS4_MEMOBS_OK) {
+        obs_logged = 1;
+        fprintf(stderr, "ds4: mem observation source=%s\n",
+                o.source == DS4_MEMOBS_SRC_MEMINFO_AVAILABLE
+                    ? "meminfo-available" : "cuda-free");
+    }
+    if (o.status != DS4_MEMOBS_OK) return UINT64_MAX;
     const uint64_t fl = ds4_mem_floor_bytes();
-    uint64_t u = lfree > fl ? lfree - fl : 0;
+    uint64_t u = o.free_bytes > fl ? o.free_bytes - fl : 0;
     const uint64_t sub = ds4_gpu_substrate_outstanding();
     return u > sub ? u - sub : 0;
 }
@@ -43545,6 +43723,285 @@ static uint64_t ds4_mem_usable_beyond(uint64_t reserve) {
     const uint64_t u = ds4_mem_usable();
     if (u == UINT64_MAX) return u;
     return u > reserve ? u - reserve : 0;
+}
+
+/* =========================================================================
+ * memgov D0b-3: the SHADOW governor ledger (plan sec 6.2/12).
+ *
+ * One process-global lease ledger.  Writers are the decision/publication
+ * sites, all under gen_mu or pre-listener boot -- the same single-writer
+ * precondition the census tripwires, enforced by the same seqlock
+ * primitives over the ledger's own epoch word (violations count into
+ * memgov_faults).  Readers (shadow evaluation, D0b-4 porcelain) snapshot
+ * through the protocol and never block.
+ *
+ * SHADOW CONTRACT: nothing in this block reads back into any live
+ * verdict.  The evaluator's quotes are counted and disclosed, full stop.
+ * Enforcement is D2's, behind its own gate. */
+static ds4_gov_ledger g_gov_ledger;
+
+/* memgov D2-1: the governance mode table (plan sec 12 D2).  One byte per
+ * consumer family, parsed once at engine open; every entry point below
+ * short-circuits on OFF so the kill switch means ZERO governor activity
+ * for that family (no evaluation, no publication -- snapshots then read
+ * an empty lease, a documented consequence).  Before init the accessor
+ * answers OBSERVE: a missed init keeps the D0b shadow alive rather than
+ * silently disabling it. */
+static uint8_t g_gov_mode[DS4_GOVC__COUNT];
+static int g_gov_modes_ready;
+
+int ds4_gov_mode(int consumer) {
+    if (consumer < 0 || consumer >= DS4_GOVC__COUNT)
+        return DS4_GOV_MODE_OFF;
+    return g_gov_modes_ready ? g_gov_mode[consumer] : DS4_GOV_MODE_OBSERVE;
+}
+
+void ds4_gov_modes_init(void) {
+    /* Env map: index == ds4_gov_consumer.  BANK covers the whole
+     * BATCH_BANK lane (fit + budget + cont admission -- one lease, one
+     * knob); the D2 defaults ratchet per increment. */
+    static const char *knob[DS4_GOVC__COUNT] = {
+        "DS4_MEMGOV_BOOT",      /* DS4_GOVC_ENGINE_BOOT     */
+        "DS4_MEMGOV_PREWARM",   /* DS4_GOVC_PREWARM         */
+        "DS4_MEMGOV_BANK",      /* DS4_GOVC_BATCH_BANK_PLAN */
+        "DS4_MEMGOV_SERIAL",    /* DS4_GOVC_SERIAL_SESSION  */
+        "DS4_MEMGOV_STATIC",    /* DS4_GOVC_STATIC_BATCH    */
+    };
+    /* D2-2b ratchet (the box gates the ratchet, not the machinery):
+     * BOOT and BANK default ENFORCE -- their quotes ran AGREE across
+     * every D2-1/2a/3 battery boot and the post-reboot fit check;
+     * enforce only inverts which side of that identical comparison
+     * rules.  SERIAL ratcheted at D2-4 (its quote evaluates the
+     * probe's own inequality -- margin, not floor -- so healthy legs
+     * agree; serial_reclaim_gate is the lane's oracle).  PREWARM and
+     * STATIC ratcheted at D2-5: THE FULL ENFORCE BOARD -- every
+     * family's quote rules its lane; refusals degrade to documented
+     * paths (no prewarm / single-path fallback), never new failure
+     * modes.
+     * DS4_MEMGOV=observe is the one-word rollback to shadow-everywhere;
+     * off stays the kill switch; per-family knobs win over both. */
+    static const uint8_t defm[DS4_GOVC__COUNT] = {
+        DS4_GOV_MODE_ENFORCE,   /* ENGINE_BOOT      (D2-2b) */
+        DS4_GOV_MODE_ENFORCE,   /* PREWARM          (D2-5)  */
+        DS4_GOV_MODE_ENFORCE,   /* BATCH_BANK_PLAN  (D2-2b) */
+        DS4_GOV_MODE_ENFORCE,   /* SERIAL_SESSION   (D2-4)  */
+        DS4_GOV_MODE_ENFORCE,   /* STATIC_BATCH     (D2-5)  */
+    };
+    int gdef = -1;
+    const char *g = getenv("DS4_MEMGOV");
+    if (g && g[0]) {
+        gdef = ds4_gov_mode_parse(g);
+        if (gdef < 0)
+            fprintf(stderr, "ds4: memgov: DS4_MEMGOV=%s unrecognized "
+                            "(off|observe|enforce); keeping per-family "
+                            "defaults\n", g);
+    }
+    for (int c = 0; c < DS4_GOVC__COUNT; c++) {
+        int m = gdef >= 0 ? gdef : defm[c];
+        const char *v = getenv(knob[c]);
+        if (v && v[0]) {
+            const int pm = ds4_gov_mode_parse(v);
+            if (pm >= 0) m = pm;
+            else fprintf(stderr, "ds4: memgov: %s=%s unrecognized "
+                                 "(off|observe|enforce); keeping %s\n",
+                         knob[c], v, ds4_gov_mode_name(m));
+        }
+        g_gov_mode[c] = (uint8_t)m;
+    }
+    g_gov_modes_ready = 1;
+}
+
+/* memgov D2-2: the governor fault family, callable from the CUDA TU
+ * (the post-freeze funnel tripwire) without dragging the metrics
+ * registry across the language boundary. */
+void ds4_gov_fault_tick(void) {
+    ds4_metric_add(&ds4_metrics_get()->memgov_faults, 1);
+}
+
+void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
+    if (ds4_gov_mode(consumer) == DS4_GOV_MODE_OFF) return;   /* D2-1 kill */
+    uint64_t *faults = &ds4_metrics_get()->memgov_faults;
+    ds4_gov_epoch_write_begin(&g_gov_ledger.epoch, faults);
+    if (consumer >= 0 && consumer < DS4_GOVC__COUNT)
+        (void)ds4_gov_lease_publish(&g_gov_ledger, consumer, intent, resident,
+                                    g_gov_ledger.lease[consumer].reservation,
+                                    faults);
+    else
+        (*faults)++;
+    ds4_gov_epoch_write_end(&g_gov_ledger.epoch, faults);
+}
+
+void ds4_gov_publish_reservation(int consumer, uint64_t reservation) {
+    if (ds4_gov_mode(consumer) == DS4_GOV_MODE_OFF) return;   /* D2-1 kill */
+    uint64_t *faults = &ds4_metrics_get()->memgov_faults;
+    ds4_gov_epoch_write_begin(&g_gov_ledger.epoch, faults);
+    if (consumer >= 0 && consumer < DS4_GOVC__COUNT)
+        (void)ds4_gov_lease_publish(&g_gov_ledger, consumer,
+                                    g_gov_ledger.lease[consumer].intent,
+                                    g_gov_ledger.lease[consumer].resident,
+                                    reservation, faults);
+    else
+        (*faults)++;
+    ds4_gov_epoch_write_end(&g_gov_ledger.epoch, faults);
+}
+
+void ds4_gov_snapshot(ds4_gov_ledger *out) {
+    if (!out) return;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        const uint64_t began = ds4_gov_epoch_read_begin(&g_gov_ledger.epoch);
+        if (began & 1u) continue;
+        *out = g_gov_ledger;
+        if (ds4_gov_epoch_read_verify(&g_gov_ledger.epoch, began)) {
+            out->epoch = began;
+            return;
+        }
+    }
+    /* Exhausted (a writer wedged mid-publish -- the tripwire class): the
+     * last copy stands, counted.  Shadow quotes from it can only feed
+     * counters, never a decision. */
+    ds4_metric_add(&ds4_metrics_get()->memgov_faults, 1);
+}
+
+/* Shared evaluation core (D0b-3 body, extracted for D2-2): snapshot +
+ * observe + evaluate + count + bounded disclosure.  legacy_status is the
+ * legacy formula's verdict mapped onto the quote vocabulary; the matrix
+ * cell and the DISAGREE line keep the same orientation in every mode, so
+ * observe and enforce read identically at the gate.  Returns the quote's
+ * validated status. */
+static int gov_check_core(const char *site, const ds4_gov_claim *cl,
+                          int legacy_status, const uint64_t *floor_override,
+                          ds4_gov_quote *out_quote) {
+    ds4_metrics *m = ds4_metrics_get();
+    ds4_gov_ledger img;
+    memset(&img, 0, sizeof(img));
+    ds4_gov_snapshot(&img);
+    /* floor/substrate/observation are sampled HERE, closest in time to
+     * the legacy verdict the caller just took -- residual sampling skew
+     * is a real (and wanted) disagreement source, not an error.
+     * D2-2b: floor_override substitutes the caller's OWN protected
+     * margin for the operator floor (the boot fit protects its planning
+     * headroom, not the live floor -- scoping sec 7); the quote records
+     * whichever it used. */
+    img.floor_bytes = floor_override ? *floor_override : ds4_mem_floor_bytes();
+    img.substrate_outstanding = ds4_gpu_substrate_outstanding();
+    ds4_mem_observation o;
+    memset(&o, 0, sizeof(o));
+    (void)ds4_gpu_mem_observe(&o);
+    const ds4_gov_quote q = ds4_gov_evaluate(&img, &o, cl);
+    if (out_quote) *out_quote = q;      /* D2-4: enforce clamps need the numbers */
+    const int status = (q.status >= 0 && q.status < DS4_GOV_STATUS__COUNT)
+                           ? q.status : DS4_GOV_FAULT;
+    const int reason = ds4_gov_compare(legacy_status, status);
+    ds4_metric_add(&m->memgov_decisions[cl->requester][status][reason], 1);
+    /* memgov D5-2: the deficit gauge tracks the LAST verdict verbatim
+     * (an ADMIT writes 0) -- sec 14's decision retryability signal. */
+    ds4_metric_set(&m->memgov_deficit[cl->requester], q.deficit);
+    if (status == DS4_GOV_FAULT)
+        ds4_metric_add(&m->memgov_faults, 1);
+    /* Disclose early REAL disagreements (not the documented OBS_POLICY
+     * divergence -- live fails open where the backend has no answer, a
+     * counted policy fact, not news).  Bounded so a systematic
+     * disagreement cannot flood serving logs; the counters carry the
+     * full story for the gate. */
+    if (reason != DS4_GOV_CMP_AGREE && reason != DS4_GOV_CMP_OBS_POLICY) {
+        static int disclosed = 0;
+        if (disclosed < 16) {
+            disclosed++;
+            fprintf(stderr,
+                    "ds4: memgov shadow DISAGREE site=%s consumer=%d "
+                    "live=%d shadow=%d reason=%d proposed=%llu old=%llu "
+                    "prospective=%llu available=%llu required=%llu "
+                    "deficit=%llu class_limit=%llu epoch=%llu\n",
+                    site ? site : "?", cl->requester, legacy_status, status,
+                    reason,
+                    (unsigned long long)q.proposed_intent,
+                    (unsigned long long)q.old_intent,
+                    (unsigned long long)(q.total_prospective_intent),
+                    (unsigned long long)q.available,
+                    (unsigned long long)q.required,
+                    (unsigned long long)q.deficit,
+                    (unsigned long long)q.class_limit,
+                    (unsigned long long)q.epoch);
+        }
+    }
+    return status;
+}
+
+/* 1 = a well-formed (claim, legacy verdict) pair; malformed pairs fault
+ * (programming error, counted, never a crash). */
+static int gov_check_args_ok(const ds4_gov_claim *cl, int legacy_status) {
+    if (cl && cl->requester >= 0 && cl->requester < DS4_GOVC__COUNT &&
+        (legacy_status == DS4_GOV_ADMIT ||
+         legacy_status == DS4_GOV_REFUSE_CLASS ||
+         legacy_status == DS4_GOV_REFUSE_LIVE))
+        return 1;
+    ds4_metric_add(&ds4_metrics_get()->memgov_faults, 1);
+    return 0;
+}
+
+void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
+                          int live_status) {
+    if (!gov_check_args_ok(cl, live_status)) return;
+    if (ds4_gov_mode(cl->requester) == DS4_GOV_MODE_OFF) return;   /* D2-1 */
+    (void)gov_check_core(site, cl, live_status, NULL, NULL);
+}
+
+/* Mode dispatch shared by the public governed check (operator floor) and
+ * the boot fit's floored variant (D2-2b).  The enforce mapping is the
+ * one place the quote-status vocabulary meets the caller's boolean. */
+static int gov_governed_dispatch(const char *site, const ds4_gov_claim *cl,
+                                 int legacy_status,
+                                 const uint64_t *floor_override,
+                                 ds4_gov_quote *out_quote) {
+    if (!gov_check_args_ok(cl, legacy_status)) return legacy_status;
+    const int mode = ds4_gov_mode(cl->requester);
+    if (mode == DS4_GOV_MODE_OFF) return legacy_status;
+    const int qs = gov_check_core(site, cl, legacy_status, floor_override,
+                                  out_quote);
+    if (mode != DS4_GOV_MODE_ENFORCE) return legacy_status;
+    switch (qs) {
+    case DS4_GOV_ADMIT:
+    case DS4_GOV_REFUSE_CLASS:
+    case DS4_GOV_REFUSE_LIVE:
+        return qs;                     /* the quote rules              */
+    case DS4_GOV_FAULT:
+        /* sec 6.2: impossible states fail CLOSED for new allocations.
+         * Disclosed once per site burst via the core's DISAGREE line
+         * (a FAULT is never CMP_AGREE). */
+        return DS4_GOV_REFUSE_LIVE;
+    default:
+        /* UNSUPPORTED / RETRY_OBS: documented backend policy -- no
+         * memory answer keeps the historical behavior (sec 6.4). */
+        return legacy_status;
+    }
+}
+
+int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
+                           int legacy_status) {
+    return gov_governed_dispatch(site, cl, legacy_status, NULL, NULL);
+}
+
+/* memgov D2-4: governed check whose protected term is the CALLER's own
+ * margin instead of the operator floor (the D2-2b fit pattern,
+ * exported).  The serial right-size lane passes the session-graph
+ * headroom so its quote evaluates the probe's own inequality plus the
+ * ledger's cross-lane terms. */
+int ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
+                                  int legacy_status, uint64_t margin_bytes) {
+    return gov_governed_dispatch(site, cl, legacy_status, &margin_bytes, NULL);
+}
+
+/* Absolute session-graph intent at a ctx: the serial-reserve estimator
+ * (v0.5.6 governance) exported for SERIAL_SESSION / STATIC_BATCH shadow
+ * claims.  Estimate, not measurement -- the scoping table marks these
+ * rows BOUNDED. */
+uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx) {
+    if (!e || ctx <= 0) return 0;
+    const uint32_t spc = metal_graph_prefill_cap_for_prompt(ctx);
+    const uint32_t src = metal_graph_raw_cap_for_context(ctx, spc);
+    return metal_graph_alloc_bytes_estimate(&e->weights, &e->weights.layer[0],
+                                            src, (uint32_t)ctx, spc,
+                                            e->mtp_ready, e->dspark_ready);
 }
 
 /* R5 Inc1b: resident bytes across the comp/index cache slabs (page multiples
@@ -43649,6 +44106,25 @@ static uint64_t ds4_batch_credit_union_projection(const ds4_batch_ctx *ctx,
     return need;
 }
 
+/* memgov D2-1 (artifact 1, D0b receipt DISAGREE audit): rows release their
+ * lifetime credit at five terminal sites; without a refresh the BATCH_BANK
+ * lease carries the dead union as phantom unfunded debt (intent - resident)
+ * until the next admission -- shadow-stricter refusals under pressure, the
+ * epoch-56 class, and the very staleness the D0b close chartered to D2.
+ * Re-publish the lane's absolute at every row end: the union over the
+ * REMAINING credits (cand_len 0 contributes nothing -- the header contract)
+ * plus the same page scan the admission's resident term uses.  Row ends are
+ * durable points; this is the admission-time walk's cost, never per-token. */
+static void ds4_batch_gov_refresh_rowend(ds4_batch_ctx *ctx,
+                                         const uint64_t *credit, uint32_t b) {
+    if (ds4_gov_mode(DS4_GOVC_BATCH_BANK_PLAN) == DS4_GOV_MODE_OFF) return;
+    const uint64_t mres = ds4_batch_slabs_cache_resident(&ctx->sl);
+    const uint64_t mneed = ds4_batch_credit_union_projection(ctx, credit, b, 0u);
+    ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
+                        ctx->bank_census_eager + mres + mneed,
+                        ctx->bank_census_eager + mres);
+}
+
 /* v0.5.1 Inc2 (field #31): release ONE bank's demand-mapped cache pages
  * across every slab family the projection above charges (same offsets, same
  * strides).  Only pages entirely inside the bank's span come back -- strides
@@ -43692,17 +44168,40 @@ static uint64_t ds4_batch_bank_trim_pages(ds4_batch_ctx *ctx, uint32_t b) {
  * read guards are proven against), and its next tenant cold-resets and
  * re-maps on the ensure-before-emit path.  DS4_BATCH_VMM_TRIM=0 disables
  * (A/B and field forensics only, not a ship mode). */
-static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
-                                          const uint8_t *live, const uint32_t *pflen,
-                                          const uint64_t *credit,
-                                          uint32_t target, int protect, uint64_t want,
-                                          const char *why) {
+/* memgov D4-2: one kill-switch read shared by the in-pass ladder and the
+ * reclaim protocol (DS4_BATCH_VMM_TRIM=0 -- A/B and field forensics only,
+ * not a ship mode; the plan sec 10 temporary enable switch). */
+static int ds4_batch_trim_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *e = getenv("DS4_BATCH_VMM_TRIM");
         enabled = !(e && e[0] == '0' && e[1] == '\0');
     }
-    if (!enabled || want == 0) return 0;
+    return enabled;
+}
+
+/* memgov D4-2: the one place a bank's destroyed content is acknowledged --
+ * lineage advance + engine history + per-layer mirror counters + emit keep.
+ * Shared by the in-pass ladder and reclaim commit so the invalidation set
+ * cannot drift between the two trim consumers. */
+static void ds4_batch_bank_mark_trimmed(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
+                                        uint32_t v) {
+    ctx->bank_gen[v]++;                    /* Inc 5a: trim destroys content */
+    ctx->bank_hist_valid[v] = 0u;
+    ctx->bank_hist_len[v]   = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->ms_n_comp[v][il] = 0u;
+        g->ms_n_index_comp[v][il] = 0u;
+    }
+    g->ms_emit_keep[v] = 0u;
+}
+
+static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
+                                          const uint8_t *live, const uint32_t *pflen,
+                                          const uint64_t *credit,
+                                          uint32_t target, int protect, uint64_t want,
+                                          const char *why) {
+    if (!ds4_batch_trim_enabled() || want == 0) return 0;
     const uint32_t MS = (uint32_t)ctx->max_seq;
     uint32_t order[DS4_MULTISEQ_MAX_SEQ];
     uint32_t n = 0;
@@ -43742,14 +44241,7 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         }
         const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
         if (got == 0) continue;                /* floor-resident: content intact, keep it */
-        ctx->bank_gen[v]++;                    /* Inc 5a: trim destroys content */
-        ctx->bank_hist_valid[v] = 0u;
-        ctx->bank_hist_len[v]   = 0u;
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            g->ms_n_comp[v][il] = 0u;
-            g->ms_n_index_comp[v][il] = 0u;
-        }
-        g->ms_emit_keep[v] = 0u;
+        ds4_batch_bank_mark_trimmed(ctx, g, v);
         freed += got;
         nb++;
     }
@@ -43841,6 +44333,212 @@ uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
     return ds4_batch_trim_free_banks(ctx, &ctx->g, NULL, NULL, NULL,
                                      (uint32_t)ctx->max_seq, -1, want_bytes,
                                      "for the serial lane (reclaim)");
+}
+
+
+/* memgov D4-2: one bank's exact trim preimage across every slab family the
+ * credit projection charges -- the counting mirror of
+ * ds4_batch_bank_trim_pages (same offsets, same strides, same interior-page
+ * math via ds4_gpu_tensor_trim_estimate), so prepare's quote and commit's
+ * release cannot drift.  Pure host walk. */
+static uint64_t ds4_batch_bank_trim_estimate(ds4_batch_ctx *ctx, uint32_t b) {
+    ds4_batch_slabs *sl = &ctx->sl;
+    uint64_t est = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (sl->multi_comp[il])
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_comp[il],
+                                                (uint64_t)b * sl->comp_bank_bytes[il],
+                                                sl->comp_bank_bytes[il]);
+        if (sl->multi_comp_fp8[il]) {
+            const uint64_t f8b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES;
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_comp_fp8[il], (uint64_t)b * f8b, f8b);
+        }
+        if (sl->multi_index[il])
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_index[il],
+                                                (uint64_t)b * sl->index_bank_bytes[il],
+                                                sl->index_bank_bytes[il]);
+        if (sl->multi_index_fp4[il]) {
+            const uint64_t f4b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_INDEXER_FP4_ROW_BYTES;
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_index_fp4[il], (uint64_t)b * f4b, f4b);
+            const uint64_t s4b = (uint64_t)ctx->g.layer_comp_cap[il] * DS4_INDEXER_FP4_SCALE_BYTES;
+            est += ds4_gpu_tensor_trim_estimate(sl->multi_index_scale[il], (uint64_t)b * s4b, s4b);
+        }
+    }
+    return est;
+}
+
+/* memgov D4-2 (revised plan sec 10 steps 4+6): the two-phase reclaim
+ * protocol.  Contract, ordering rationale and the edge-page exclusion are
+ * documented at the ds4.h declaration.  prepare is a pure host walk over
+ * the caller's ranked ids; commit is the only phase that touches the
+ * driver, and it acknowledges destroyed content through the same
+ * mark-trimmed helper the in-pass ladder uses. */
+/* memgov D4-3: temporary per-request reclaim ceiling (plan sec 10 -- kept
+ * one release beside the DS4_BATCH_VMM_TRIM kill switch, then deleted).
+ * DS4_BATCH_RECLAIM_MAX_BANKS / DS4_BATCH_RECLAIM_MAX_MB bound ONE
+ * prepare's plan; 0/unset = unbounded, the lite-4 field envelope v0.5.6
+ * validated -- the ceiling is an ops lever for deployments that want a
+ * smaller blast radius per serial request, not a new default. */
+static void ds4_batch_reclaim_ceiling(uint32_t *max_banks, uint64_t *max_bytes) {
+    static uint32_t banks = UINT32_MAX;
+    static uint64_t bytes = UINT64_MAX;
+    static int seen = 0;
+    if (!seen) {
+        seen = 1;
+        const char *eb = getenv("DS4_BATCH_RECLAIM_MAX_BANKS");
+        if (eb && eb[0]) {
+            const long v = atol(eb);
+            if (v > 0) banks = (uint32_t)v;
+        }
+        const char *em = getenv("DS4_BATCH_RECLAIM_MAX_MB");
+        if (em && em[0]) {
+            const long v = atol(em);
+            if (v > 0) bytes = (uint64_t)v << 20;
+        }
+    }
+    *max_banks = banks;
+    *max_bytes = bytes;
+}
+
+int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_ids,
+                                  uint32_t n_ids, uint64_t want_bytes,
+                                  ds4_reclaim_plan *plan) {
+    if (!plan) return DS4_RECLAIM_UNSUPPORTED;
+    memset(plan, 0, sizeof(*plan));
+    plan->want_bytes = want_bytes;
+    if (!ctx || !ds4_batch_trim_enabled()) return DS4_RECLAIM_UNSUPPORTED;
+    if (ctx->exaone || ctx->motif3) return DS4_RECLAIM_UNSUPPORTED;
+    if (ctx->solar) return DS4_RECLAIM_UNSUPPORTED;
+    if (ctx->in_pass) return DS4_RECLAIM_BUSY;
+    if (!ordered_ids || n_ids == 0 || want_bytes == 0) return DS4_RECLAIM_OK;
+    uint32_t cap_banks;
+    uint64_t cap_bytes;
+    ds4_batch_reclaim_ceiling(&cap_banks, &cap_bytes);
+    const uint64_t capped_want = want_bytes < cap_bytes ? want_bytes : cap_bytes;
+    if (cap_banks > DS4_RECLAIM_MAX_BANKS) cap_banks = DS4_RECLAIM_MAX_BANKS;
+    uint8_t seen[DS4_MULTISEQ_MAX_SEQ] = {0};
+    for (uint32_t i = 0; i < n_ids && plan->est_bytes < capped_want &&
+                         plan->n < cap_banks; i++) {
+        const uint32_t b = ordered_ids[i];
+        if (b >= (uint32_t)ctx->max_seq || seen[b]) continue;
+        seen[b] = 1;
+        const uint64_t est = ds4_batch_bank_trim_estimate(ctx, b);
+        if (est == 0) continue;               /* floor-resident: nothing mapped */
+        ds4_reclaim_bank *rb = &plan->banks[plan->n++];
+        rb->bank = b;
+        rb->gen = ctx->bank_gen[b];
+        rb->est_bytes = est;
+        rb->got_bytes = 0;
+        rb->status = DS4_RECLAIM_OK;          /* provisional until commit */
+        plan->est_bytes += est;
+    }
+    if (plan->est_bytes < want_bytes &&
+        (capped_want < want_bytes || plan->n == cap_banks)) {
+        /* Loud when the ceiling binds (the serial-reserve clamp law): the
+         * caller sees a smaller plan than the deficit asked for. */
+        static int ceil_disclosed = 0;
+        if (ceil_disclosed < 8) {
+            ceil_disclosed++;
+            fprintf(stderr,
+                    "ds4: batch reclaim: ceiling bound the plan (%u bank(s), %.1f MiB of "
+                    "%.1f MiB wanted; DS4_BATCH_RECLAIM_MAX_BANKS/MAX_MB)\n",
+                    plan->n, (double)plan->est_bytes / 1048576.0,
+                    (double)want_bytes / 1048576.0);
+        }
+    }
+    return DS4_RECLAIM_OK;
+}
+
+int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
+                                 ds4_reclaim_result *result) {
+    ds4_reclaim_result rr = {0};
+    rr.status = DS4_RECLAIM_OK;
+    if (!ctx || !plan || !ds4_batch_trim_enabled()) {
+        rr.status = DS4_RECLAIM_UNSUPPORTED;
+        if (result) *result = rr;
+        return rr.status;
+    }
+    if (ctx->in_pass) {
+        rr.status = DS4_RECLAIM_BUSY;
+        if (result) *result = rr;
+        return rr.status;
+    }
+    uint32_t stale = 0, failed = 0, partial = 0;
+    bool synced = false;
+    for (uint32_t i = 0; i < plan->n; i++) {
+        ds4_reclaim_bank *rb = &plan->banks[i];
+        const uint32_t v = rb->bank;
+        if (v >= (uint32_t)ctx->max_seq || ctx->bank_gen[v] != rb->gen) {
+            rb->status = DS4_RECLAIM_STALE_PLAN;   /* lineage moved; untouched */
+            stale++;
+            continue;
+        }
+        if (!synced) {
+            /* ONE off-capture sync before the first unmap (sticky-scratch
+             * law; plan sec 10 step 6).  A failed sync aborts the whole
+             * commit with nothing destroyed. */
+            if (!ds4_gpu_synchronize()) {
+                for (uint32_t k = i; k < plan->n; k++)
+                    plan->banks[k].status = DS4_RECLAIM_DEVICE_ERROR;
+                failed += plan->n - i;
+                break;
+            }
+            synced = true;
+        }
+        const uint64_t pre = ds4_batch_bank_trim_estimate(ctx, v);
+        if (pre == 0) {                        /* preimage vanished: stale, keep */
+            rb->status = DS4_RECLAIM_STALE_PLAN;
+            stale++;
+            continue;
+        }
+        const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
+        const uint64_t post = ds4_batch_bank_trim_estimate(ctx, v);
+        const uint64_t destroyed = pre > post ? pre - post : 0;
+        rb->got_bytes = got;
+        if (destroyed == 0) {
+            /* Every unmap failed: content intact, ownership retained (the
+             * error-safe trim contract) -- the bank stays a warm record. */
+            rb->status = DS4_RECLAIM_DEVICE_ERROR;
+            failed++;
+            continue;
+        }
+        ds4_batch_bank_mark_trimmed(ctx, &ctx->g, v);
+        rr.banks_reclaimed++;
+        rr.bytes_released += got;
+        if (destroyed == pre && got == destroyed) {
+            rb->status = DS4_RECLAIM_OK;
+        } else {
+            /* Pages survived (unmap failure) or were destroyed without
+             * being returned (release failure -> census slack): progress
+             * with a caveat, disclosed per bank. */
+            rb->status = DS4_RECLAIM_PARTIAL;
+            partial++;
+        }
+    }
+    rr.banks_stale = stale;
+    if (rr.banks_reclaimed > 0) {
+        rr.status = (partial == 0 && failed == 0 && stale == 0)
+                  ? DS4_RECLAIM_OK : DS4_RECLAIM_PARTIAL;
+        ctx->trim_banks += rr.banks_reclaimed;
+        ctx->trim_bytes += rr.bytes_released;
+    } else if (plan->n > 0 && stale == plan->n) {
+        rr.status = DS4_RECLAIM_STALE_PLAN;
+    } else if (failed > 0) {
+        rr.status = DS4_RECLAIM_DEVICE_ERROR;
+    }                                          /* else: empty plan -> OK */
+    /* memgov D4-3: exact per-bank outcome counters (plan sec 14 families).
+     * One tick per planned bank by its FINAL status; bytes follow the bank
+     * so a partial's shortfall is visible as bytes[partial] < est. */
+    for (uint32_t i = 0; i < plan->n; i++) {
+        const ds4_reclaim_bank *rb = &plan->banks[i];
+        if (rb->status >= 0 && rb->status < DS4_RECLAIM_STATUS__COUNT) {
+            ds4_metric_add(&ds4_metrics_get()->reclaim_banks[rb->status], 1);
+            ds4_metric_add(&ds4_metrics_get()->reclaim_bytes[rb->status],
+                           rb->got_bytes);
+        }
+    }
+    if (result) *result = rr;
+    return rr.status;
 }
 
 static int solar_batch_ctx_create_impl(
@@ -44164,6 +44862,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
      * growth: tmp pools, capture graphs, logits staging.  DS4_BATCH_FIT=0
      * keeps caller-driven sizing.  Backends with no memory query (Metal)
      * skip the budget and rely on the descent loop below. */
+    uint64_t fit_per_bank = 0, fit_headroom = 0;   /* armed iff the budget ran */
     if (fit) {
         const char *fe = getenv("DS4_BATCH_FIT");
         uint64_t free_b = 0, total_b = 0;
@@ -44185,6 +44884,52 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
             uint64_t budget = free_b > headroom ? free_b - headroom : 0;
             budget = budget > sub_out ? budget - sub_out : 0;
             uint32_t n = (uint32_t)(budget / per_bank);
+            fit_per_bank = per_bank;
+            fit_headroom = headroom;
+            /* memgov D2-2b (plan sec 12 consumer 2): the governed fit.
+             * The quote validates what legacy is about to POKE (n_eff
+             * banks) under the fit's own arithmetic -- class_limit is
+             * the boot budget (pinned to 1 when zero: 0 means uncapped
+             * to the evaluator), the protected margin is the planning
+             * HEADROOM, not the operator floor (the ledger is near-
+             * empty here by design; ENGINE_BOOT publishes at settle).
+             * Legacy maps to ADMIT always: the old poke proceeded at
+             * max(n, 2) and used physical alloc failure as its verdict.
+             * enforce: a plan below 2 funded banks is a typed refusal
+             * of the batch ctx -- the server's fit-or-reduce shell
+             * lands serial-only and the drain-to-OOM overcommit class
+             * dies with the forced-2 poke.  observe/off: the poke
+             * stays verbatim (rollback), the quote only counts. */
+            {
+                /* n_eff is EXACTLY the plan legacy pokes below: the
+                 * forced floor when the budget funds fewer than 2, else
+                 * the funded count capped at the caller's request (a
+                 * budget that funds more than requested allocates only
+                 * max_seq banks -- quote the poke, not the surplus). */
+                const uint32_t n_eff = n < 2u ? 2u
+                                     : n < ctx->max_seq ? n : ctx->max_seq;
+                ds4_gov_claim fcl = {0};
+                fcl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+                fcl.memc = DS4_MEMC_BATCH_BANK;
+                fcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+                fcl.proposed_outstanding = (uint64_t)n_eff * per_bank;
+                fcl.class_limit = budget != 0 ? budget : 1;
+                const int fv = gov_governed_dispatch("boot_bank_fit", &fcl,
+                                                     DS4_GOV_ADMIT, &headroom,
+                                                     NULL);
+                if (fv != DS4_GOV_ADMIT) {
+                    fprintf(stderr,
+                            "ds4: memgov ENFORCE refuse site=boot_bank_fit status=%d legacy=%d proposed=%llu class_limit=%llu banks=%u requested=%u\n",
+                            fv, DS4_GOV_ADMIT,
+                            (unsigned long long)fcl.proposed_outstanding,
+                            (unsigned long long)fcl.class_limit,
+                            n_eff, ctx->max_seq);
+                    BC_ERR("batch_ctx_create: memgov refused the bank plan (budget funds %u banks, floor is 2; serial-only boot)", n);
+                    metal_graph_free(&ctx->g);
+                    free(ctx);
+                    return 1;
+                }
+            }
             if (n < 2u) n = 2u;   /* still try the floor: a failing 2-bank slab
                                    * alloc is a ~2-GB poke, not a 20-GB one */
             if (n < ctx->max_seq) {
@@ -44215,6 +44960,44 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         /* Finer than halving so a near-miss budget doesn't cost half the banks. */
         uint32_t next = ctx->max_seq * 3u / 4u;
         if (next < 2u) next = 2u;
+        /* memgov D2-2b: each physical descent re-quotes the adapted plan
+         * against a FRESH budget (a failed alloc can mean free moved
+         * since the boot quote); enforce refuses a descent the budget
+         * cannot fund instead of poking it.  When the re-read gives no
+         * answer the quote is skipped -- legacy keeps ruling exactly as
+         * on query-less backends (sec 6.4); unreachable in practice when
+         * the boot quote admitted, kept for the resilience path's
+         * honesty. */
+        if (fit_per_bank != 0) {
+            uint64_t free2 = 0, total2 = 0;
+            if (ds4_gpu_mem_info(&free2, &total2) == 0) {
+                const uint64_t sub2 = ds4_gpu_substrate_outstanding();
+                uint64_t budget2 = free2 > fit_headroom ? free2 - fit_headroom : 0;
+                budget2 = budget2 > sub2 ? budget2 - sub2 : 0;
+                ds4_gov_claim fcl = {0};
+                fcl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+                fcl.memc = DS4_MEMC_BATCH_BANK;
+                fcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+                fcl.proposed_outstanding = (uint64_t)next * fit_per_bank;
+                fcl.class_limit = budget2 != 0 ? budget2 : 1;
+                const int fv = gov_governed_dispatch("boot_bank_fit", &fcl,
+                                                     DS4_GOV_ADMIT,
+                                                     &fit_headroom, NULL);
+                if (fv != DS4_GOV_ADMIT) {
+                    fprintf(stderr,
+                            "ds4: memgov ENFORCE refuse site=boot_bank_fit status=%d legacy=%d proposed=%llu class_limit=%llu banks=%u requested=%u (descent)\n",
+                            fv, DS4_GOV_ADMIT,
+                            (unsigned long long)fcl.proposed_outstanding,
+                            (unsigned long long)fcl.class_limit,
+                            next, ctx->max_seq);
+                    BC_ERR("batch_ctx_create: memgov refused the descent plan (%u banks after alloc failure at %u; serial-only boot)",
+                           next, ctx->max_seq);
+                    metal_graph_free(&ctx->g);
+                    free(ctx);
+                    return 1;
+                }
+            }
+        }
         fprintf(stderr, "ds4: batch fit: %s alloc failed at max_seq=%u, retrying at %u\n",
                 slabs_ok ? "MTP slab" : "slab", ctx->max_seq, next);
         ctx->max_seq = next;
@@ -44280,25 +45063,65 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                                                  src, (uint32_t)ent, spc,
                                                  e->mtp_ready, e->dspark_ready) +
                 (1024ull << 20);
+            const uint64_t want_pre_clamp = want;   /* memgov D0b-3 (S3) */
             /* Clamp to what remains after the commons keeps its own floor. */
             const uint64_t commons_floor =
                 (uint64_t)ctx->max_seq * ds4_batch_vmm_floor_per_bank(&ctx->g);
             const uint64_t usable = ds4_mem_usable();   /* live free beyond the operator floor */
+            uint64_t want_legacy = want_pre_clamp;      /* the comparison target, every mode */
             if (usable != UINT64_MAX) {
                 const uint64_t sparable = usable > commons_floor ? usable - commons_floor : 0;
-                if (want > sparable) {
-                    fprintf(stderr,
-                            "ds4: serial reserve CLAMPED %.2f -> %.2f GiB (entitlement %ld tok needs "
-                            "more than the box can spare beside the bank floor %.2f GiB; serial "
-                            "requests above ~%s may refuse -- lower -c, raise --mem-floor-gb headroom, "
-                            "or set DS4_SERIAL_RESERVE_CTX)\n",
-                            (double)want / 1073741824.0, (double)sparable / 1073741824.0,
-                            ent, (double)commons_floor / 1073741824.0,
-                            sparable ? "the funded depth" : "any depth");
-                    want = sparable;
+                if (want_legacy > sparable) want_legacy = sparable;
+            }
+            /* memgov D2-4 (S3): the carve claim.  operation_transient
+             * carries the commons floor, so the quote's protected sum is
+             * the legacy arithmetic exactly -- plus the ledger's own
+             * reservation/unfunded terms, which legacy ignores (the
+             * honest difference enforce exists for).  Under enforce the
+             * quote's numbers PRODUCE the clamp: ADMIT carves the full
+             * entitlement, REFUSE_LIVE carves entitlement minus deficit,
+             * REFUSE_CLASS/FAULT fail closed to 0 (the commons keeps
+             * everything), no-observation keeps the legacy clamp (sec
+             * 6.4).  Same CLAMPED porcelain, the ruling arithmetic's own
+             * numbers.  observe/off: the legacy clamp verbatim. */
+            ds4_gov_claim scl = {0};
+            scl.requester = DS4_GOVC_SERIAL_SESSION;
+            scl.memc = DS4_MEMC_SESSION_TENSORS;
+            scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+            scl.proposed_outstanding = want_pre_clamp;
+            scl.operation_transient = commons_floor;
+            ds4_gov_quote sq;
+            memset(&sq, 0, sizeof(sq));
+            (void)gov_governed_dispatch("serial_reserve_carve", &scl,
+                                        want_legacy == want_pre_clamp
+                                            ? DS4_GOV_ADMIT
+                                            : DS4_GOV_REFUSE_LIVE,
+                                        NULL, &sq);
+            want = want_legacy;
+            if (ds4_gov_mode(DS4_GOVC_SERIAL_SESSION) == DS4_GOV_MODE_ENFORCE) {
+                switch (sq.status) {
+                case DS4_GOV_ADMIT:       want = want_pre_clamp; break;
+                case DS4_GOV_REFUSE_LIVE: want = want_pre_clamp > sq.deficit
+                                              ? want_pre_clamp - sq.deficit : 0;
+                                          break;
+                case DS4_GOV_REFUSE_CLASS:
+                case DS4_GOV_FAULT:       want = 0; break;   /* fail closed */
+                default:                  break;   /* no answer: legacy clamp */
                 }
             }
+            if (want < want_pre_clamp)
+                fprintf(stderr,
+                        "ds4: serial reserve CLAMPED %.2f -> %.2f GiB (entitlement %ld tok needs "
+                        "more than the box can spare beside the bank floor %.2f GiB; serial "
+                        "requests above ~%s may refuse -- lower -c, raise --mem-floor-gb headroom, "
+                        "or set DS4_SERIAL_RESERVE_CTX)\n",
+                        (double)want_pre_clamp / 1073741824.0, (double)want / 1073741824.0,
+                        ent, (double)commons_floor / 1073741824.0,
+                        want ? "the funded depth" : "any depth");
             ctx->serial_reserve = want;
+            /* The carve is the serial lane's own reservation (sec 6.2:
+             * protected for others, spendable by the owner). */
+            ds4_gov_publish_reservation(DS4_GOVC_SERIAL_SESSION, want);
         }
     }
     if (ctx->sl.vmm) {
@@ -44407,6 +45230,23 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     /* This is a positive declaration, not a non-Solar inference: future
      * runtimes remain safely disabled until they implement prefix rewind. */
     ctx->supports_partial_reuse = true;
+    /* memgov D0b-4 (S1/S2): the bank plan's boot lease -- an absolute
+     * publication, no quote (there is no live boolean at boot; the fit
+     * retry-down IS the decision).  Captured after EVERY bank-scope
+     * boot allocation (slabs, mtp/dspark, stashes) so the lease equals
+     * the BATCH_BANK census; the eager constant (census minus the
+     * demand-mapped families) converts the family-relative admission
+     * formulas to this absolute basis at S4/S5. */
+    {
+        ds4_mem_cell cc;
+        uint64_t bank_census = 0;
+        if (ds4_gpu_mem_census_read(DS4_MEMC_BATCH_BANK,
+                                    DS4_MEMD_UNIFIED_DEVICE, &cc) == 0)
+            bank_census = ds4_mem_cell_live(&cc);
+        const uint64_t r0 = ds4_batch_slabs_cache_resident(&ctx->sl);
+        ctx->bank_census_eager = bank_census > r0 ? bank_census - r0 : 0;
+        ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN, bank_census, bank_census);
+    }
     *out = ctx;
     return 0;
 #undef BC_ERR
@@ -44414,12 +45254,18 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
 
 int ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                          ds4_batch_ctx **out, char *err, size_t errlen) {
-    return ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, false, out, err, errlen);
+    ds4_gpu_mem_scope_begin(DS4_MEMC_BATCH_BANK);
+    const int rc = ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, false, out, err, errlen);
+    ds4_gpu_mem_scope_end();
+    return rc;
 }
 
 int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                              ds4_batch_ctx **out, char *err, size_t errlen) {
-    return ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, true, out, err, errlen);
+    ds4_gpu_mem_scope_begin(DS4_MEMC_BATCH_BANK);
+    const int rc = ds4_batch_ctx_create_impl(e, ctx_size, max_seq, max_total_tokens, true, out, err, errlen);
+    ds4_gpu_mem_scope_end();
+    return rc;
 }
 
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
@@ -44909,7 +45755,22 @@ static int family_engine_batched_generate_ctx(
         const int *max_new_tokens, const int *eos_ids,
         ds4_batch_gen_result *out, char *err, size_t errlen);
 
+static int ds4_engine_batched_generate_ctx_impl(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
+                                    const int *max_new_tokens, const int *eos_ids,
+                                    ds4_batch_gen_result *out, char *err, size_t errlen);
+
+/* memgov D4-2: same pass-liveness envelope as the continuous driver. */
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
+                                    const int *max_new_tokens, const int *eos_ids,
+                                    ds4_batch_gen_result *out, char *err, size_t errlen) {
+    if (ctx) ctx->in_pass = 1;
+    const int rc = ds4_engine_batched_generate_ctx_impl(ctx, prompts, n, max_new_tokens,
+                                                        eos_ids, out, err, errlen);
+    if (ctx) ctx->in_pass = 0;
+    return rc;
+}
+
+static int ds4_engine_batched_generate_ctx_impl(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {
 #define BCG_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
@@ -46711,7 +47572,30 @@ static int family_engine_batched_generate_ctx(
     return 0;
 }
 
+static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
+                                   int (*admit)(void *ud, ds4_cont_request *req),
+                                   int (*on_token)(void *ud, void *user, int token),
+                                   void (*on_done)(void *ud, void *user,
+                                                   const int *tokens, int n, int finish),
+                                   void *ud, char *err, size_t errlen);
+
+/* memgov D4-2: the pass-liveness envelope -- reclaim prepare/commit answer
+ * BUSY while a pass drives the context.  A thin wrapper (not per-return
+ * flagging inside the loop) so every exit path clears it. */
 int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
+                                   int (*admit)(void *ud, ds4_cont_request *req),
+                                   int (*on_token)(void *ud, void *user, int token),
+                                   void (*on_done)(void *ud, void *user,
+                                                   const int *tokens, int n, int finish),
+                                   void *ud, char *err, size_t errlen) {
+    if (ctx) ctx->in_pass = 1;
+    const int rc = ds4_engine_continuous_generate_impl(ctx, admit, on_token,
+                                                       on_done, ud, err, errlen);
+    if (ctx) ctx->in_pass = 0;
+    return rc;
+}
+
+static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                                    int (*admit)(void *ud, ds4_cont_request *req),
                                    int (*on_token)(void *ud, void *user, int token),
                                    void (*on_done)(void *ud, void *user,
@@ -47005,6 +47889,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * gathered markov_w1 rows, mk_bias the [MS*vocab] per-bank bias.  Allocated once;
      * the block draft reuses vlogits as the base-logits dst (vcap_rows = MS*B >= nl*B). */
     const uint32_t mk_rank = dspark_mode ? (uint32_t)dw->markov_w2->dim[0] : 0u;
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
     ds4_gpu_tensor *mk_cand = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)DS4_DSPARK_BLOCK * MS * sizeof(int32_t)) : NULL;
     ds4_gpu_tensor *mk_prev = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)MS * mk_rank * sizeof(float)) : NULL;
     ds4_gpu_tensor *mk_bias = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)MS * DS4_N_VOCAB * sizeof(float)) : NULL;
@@ -47013,6 +47898,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
      * its head ON DEVICE and the on-device Markov refine reads it ON DEVICE, so a
      * device tensor is required.  Sized like vlogits (vcap_rows = min(MS*B, prefill_cap)). */
     ds4_gpu_tensor *mk_logits = dspark_mode ? ds4_gpu_tensor_alloc((uint64_t)vcap_rows * DS4_N_VOCAB * sizeof(float)) : NULL;
+    ds4_gpu_mem_scope_end();
     /* D4.5e: host position/seq_id scratch for injecting a PREFILL chunk's target hidden
      * into the bank's DSpark ring (so the drafter attends real prefix KV, not zero slots,
      * from the first decode step).  Sized for the widest prefill chunk (prefill_cap). */
@@ -47283,40 +48169,92 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                                   want, NULL) > 0)
                         mres = ds4_batch_slabs_cache_resident(&ctx->sl);
                 }
+                /* memgov D0b-3 (S4/S5): ONE claim for both live verdicts,
+                 * built from the exact inputs the class check consumes
+                 * (post class-trim mres).  proposed is the ABSOLUTE
+                 * post-fault total: the plan's eager boot cost + resident
+                 * + the whole union's unfaulted growth (the projection
+                 * already carries every credit and this candidate, sec
+                 * 6.2's do-not-resum rule).  D0b-4: the eager constant
+                 * shifts BOTH proposed and the class limit, so the class
+                 * verdict is the live check verbatim (x > budget <=>
+                 * eager + x > eager + budget) while the ledger stays on
+                 * the census basis. */
+                ds4_gov_claim scl = {0};
+                scl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+                scl.memc = DS4_MEMC_BATCH_BANK;
+                scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+                scl.proposed_outstanding = ctx->bank_census_eager + mres + mneed;
+                scl.class_limit = ctx->comp_map_budget != 0
+                                ? ctx->bank_census_eager + ctx->comp_map_budget : 0;
+                /* memgov D2-3: the boolean OWNER swap (plan sec 12 D2
+                 * consumer 3).  The legacy formulas and their trim
+                 * ACTORS run first, in live order -- class verdict after
+                 * the class trim above; floor trim then floor verdict
+                 * only when the class passed (a class refusal never
+                 * reached the floor trim before D2-3 either: side-effect
+                 * parity).  ONE governed check per growth admission
+                 * takes the composite legacy verdict (leg (d)'s cells ==
+                 * growth admissions stands); observe -- the default
+                 * until the D2-2b ratchet -- returns that verdict, so
+                 * behavior is bit-identical; enforce lets the quote
+                 * rule.  The frozen reject porcelain prints only when
+                 * its own formula refused (true numbers); an enforce
+                 * divergence discloses in the memgov format instead. */
+                int verdict = DS4_GOV_ADMIT;
+                uint64_t usable = 0;
                 if (ctx->comp_map_budget != 0 && mneed != 0 &&
                     mres + mneed > ctx->comp_map_budget) {
-                    ctx->mem_rejects++;
-                    ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
-                    fprintf(stderr,
-                            "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + projected credits %.1f MiB > budget %.1f MiB)\n",
-                            b, (double)mres / 1048576.0,
-                            (double)mneed / 1048576.0,
-                            (double)ctx->comp_map_budget / 1048576.0);
-                    on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
-                    continue;
-                }
-                /* v0.5.4 governance inc1 (item 16): the budget above is a
-                 * boot-time PLAN and cannot see memory the box lost since
-                 * boot.  Every admission spend must ALSO fit live free
-                 * memory beyond the operator floor.  The union projection
-                 * already carries every credit's unfaulted growth, so mneed
-                 * IS the floor charge.  Trim can hand pages back (unmap is
-                 * exact and immediate), so it runs before the verdict;
-                 * credited banks stay inviolable. */
-                if (mneed != 0) {
-                    /* inc2: the serial reserve is spoken for -- growth may
-                     * not spend it (the serial lane's lazy graph draws from
-                     * this same pool at request time). */
-                    uint64_t usable = ds4_mem_usable_beyond(ctx->serial_reserve);
+                    verdict = DS4_GOV_REFUSE_CLASS;
+                } else if (mneed != 0) {
+                    /* v0.5.4 governance inc1 (item 16): the budget above
+                     * is a boot-time PLAN and cannot see memory the box
+                     * lost since boot.  Every admission spend must ALSO
+                     * fit live free memory beyond the operator floor.
+                     * The union projection already carries every
+                     * credit's unfaulted growth, so mneed IS the floor
+                     * charge.  Trim can hand pages back (unmap is exact
+                     * and immediate), so it runs before the verdict;
+                     * credited banks stay inviolable.  inc2: the serial
+                     * reserve is spoken for -- growth may not spend it
+                     * (the serial lane's lazy graph draws from this same
+                     * pool at request time). */
+                    usable = ds4_mem_usable_beyond(ctx->serial_reserve);
                     if (mneed > usable) {
                         if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
                                                       (fork || partial) ? (int)fsrc : -1,
                                                       mneed - usable, NULL) > 0)
                             usable = ds4_mem_usable_beyond(ctx->serial_reserve);
                     }
-                    if (mneed > usable) {
-                        ctx->mem_rejects++;
-                        ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
+                    /* memgaps MG-1: still short -> return the engine's own
+                     * graph-pool reserve and re-ask.  Precedes the governed
+                     * check below so enforce quotes also see the post-trim
+                     * box (actors first, in live order: the D2-3 pattern). */
+                    if (mneed > usable && ds4_mem_own_trim("cont_admit") > 0)
+                        usable = ds4_mem_usable_beyond(ctx->serial_reserve);
+                    if (mneed > usable) verdict = DS4_GOV_REFUSE_LIVE;
+                }
+                /* D2-1 (artifact 2, epoch-58): a zero-growth admit spends
+                 * nothing and takes NO verdict in any mode; the
+                 * publication below is the honest absolute refresh. */
+                const int final_verdict = mneed != 0
+                    ? ds4_gov_governed_check("cont_admit", &scl, verdict)
+                    : DS4_GOV_ADMIT;
+                if (final_verdict != DS4_GOV_ADMIT) {
+                    ctx->mem_rejects++;
+                    ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
+                    /* memgov D5-3: typed twin of the frozen scalar. */
+                    ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                                       [DS4_REJLANE_CONT]
+                                       [ds4_reject_reason_from_gov(final_verdict)], 1);
+                    if (final_verdict == verdict &&
+                        verdict == DS4_GOV_REFUSE_CLASS) {
+                        fprintf(stderr,
+                                "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + projected credits %.1f MiB > budget %.1f MiB)\n",
+                                b, (double)mres / 1048576.0,
+                                (double)mneed / 1048576.0,
+                                (double)ctx->comp_map_budget / 1048576.0);
+                    } else if (final_verdict == verdict) {
                         fprintf(stderr,
                                 "ds4: cont admit rejected on memory floor (bank %u: projected credits %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor + %.2f GiB serial reserve + %.1f MiB substrate outstanding -- the box cannot fund this admission; --mem-floor-gb and DS4_SERIAL_RESERVE_CTX govern)\n",
                                 b, (double)mneed / 1048576.0,
@@ -47324,10 +48262,31 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                 (double)ds4_mem_floor_bytes() / 1073741824.0,
                                 (double)ctx->serial_reserve / 1073741824.0,
                                 (double)ds4_gpu_substrate_outstanding() / 1048576.0);
-                        on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
-                        continue;
+                    } else {
+                        /* Enforce diverged from the legacy formula: the
+                         * quote's refusal rules.  Bounded like the
+                         * DISAGREE disclosure (which the shared core
+                         * already printed with the full quote). */
+                        static int enf_disclosed = 0;
+                        if (enf_disclosed < 16) {
+                            enf_disclosed++;
+                            fprintf(stderr,
+                                    "ds4: memgov ENFORCE refuse site=cont_admit bank=%u status=%d legacy=%d proposed=%llu class_limit=%llu\n",
+                                    b, final_verdict, verdict,
+                                    (unsigned long long)scl.proposed_outstanding,
+                                    (unsigned long long)scl.class_limit);
+                        }
                     }
+                    on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
+                    continue;
                 }
+                /* Admission granted -- publish the lane's absolute lease
+                 * (intent = eager cost + post-fault total, resident =
+                 * eager cost + what the page scan sees: the census
+                 * basis). */
+                ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
+                                    ctx->bank_census_eager + mres + mneed,
+                                    ctx->bank_census_eager + mres);
             }
             /* R4: ADMISSION = INSTALL ONLY.  Bank state is prepared here (reset /
              * fork copy / warm reuse) and the tokens to prefill are parked in the
@@ -47523,6 +48482,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     usr[b] = NULL;
                     live[b] = 0u;
                     credit[b] = 0u;   /* Inc 0b: release the lifetime credit */
+                    ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
                     continue;
                 }
                 uint32_t n_live_now = 0;
@@ -47644,6 +48604,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     usr[b] = NULL;
                     live[b] = 0u;
                     credit[b] = 0u;   /* Inc 0b: release the lifetime credit */
+                    ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
                     ok = true;
                     continue;
                 }
@@ -47685,6 +48646,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                         cont_stats_publish_done(ctx, sst, b, glen[b]);
                         on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                         free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; credit[b] = 0u;
+                        ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
                         if (dspark_trace)
                             ds4_dspark_trace_flush(b, Dspec, &dspark_tb[b],
                                                    dspark_shadow_guard, dspark_shadow_alpha,
@@ -48044,6 +49006,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                     cont_stats_publish_done(ctx, sst, b, glen[b]);
                     on_done(ud, usr[b], gbuf[b], (int)glen[b], done_eos);
                     free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; credit[b] = 0u;
+                    ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
                 }
             }
             if (dspark_prof && dspark_now) dspark_t_accept_s += now_sec() - accept_t0;
@@ -48571,6 +49534,7 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                 cont_stats_publish_done(ctx, sst, b, glen[b]);
                 on_done(ud, usr[b], gbuf[b], (int)glen[b], hit_eos ? 1 : 0);
                 free(gbuf[b]); gbuf[b] = NULL; live[b] = 0u; credit[b] = 0u;
+                ds4_batch_gov_refresh_rowend(ctx, credit, b);   /* D2-1 */
             }
         }
         /* v0.2.x observability: one registry update per plain decode step. */
@@ -49783,6 +50747,74 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
     if (err && errlen) snprintf(err, errlen, "continuous_generate: build has no graph backend");
     return 1;
 }
+int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_ids,
+                                  uint32_t n_ids, uint64_t want_bytes,
+                                  ds4_reclaim_plan *plan) {
+    (void)ctx; (void)ordered_ids; (void)n_ids;
+    if (plan) { memset(plan, 0, sizeof(*plan)); plan->want_bytes = want_bytes; }
+    return DS4_RECLAIM_UNSUPPORTED;   /* no graph backend: nothing to trim */
+}
+int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
+                                 ds4_reclaim_result *result) {
+    (void)ctx; (void)plan;
+    if (result) { memset(result, 0, sizeof(*result)); result->status = DS4_RECLAIM_UNSUPPORTED; }
+    return DS4_RECLAIM_UNSUPPORTED;
+}
+uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx) {
+    (void)e; (void)ctx;
+    return 0;
+}
+/* memgov shadow governor: no graph backend means no substrate to govern.
+ * Publishes drop, checks don't tick, snapshots read as the empty ledger. */
+void ds4_gov_modes_init(void) {}
+int ds4_gov_mode(int consumer) {
+    (void)consumer;
+    return DS4_GOV_MODE_OBSERVE;   /* harmless: the entry points are stubs */
+}
+void ds4_gov_fault_tick(void) {}
+int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
+                           int legacy_status) {
+    (void)site; (void)cl;
+    return legacy_status;   /* no governor: the legacy verdict rules */
+}
+int ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
+                                  int legacy_status, uint64_t margin_bytes) {
+    (void)site; (void)cl; (void)margin_bytes;
+    return legacy_status;
+}
+void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
+    (void)consumer; (void)intent; (void)resident;
+}
+void ds4_gov_publish_reservation(int consumer, uint64_t reservation) {
+    (void)consumer; (void)reservation;
+}
+void ds4_gov_snapshot(ds4_gov_ledger *out) {
+    if (out) memset(out, 0, sizeof(*out));
+}
+void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
+                          int live_status) {
+    (void)site; (void)cl; (void)live_status;
+}
+/* Metal/CPU census stubs: permanently even epoch, unsupported observation,
+ * no residency plan.  Matches ds4_metal.m so DS4_NO_GPU server tests link. */
+uint64_t ds4_gpu_mem_census_epoch_begin(void) { return 0; }
+int ds4_gpu_mem_census_epoch_verify(uint64_t began) { return began == 0; }
+int ds4_gpu_mem_observe(ds4_mem_observation *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        out->status = DS4_MEMOBS_UNSUPPORTED;
+        out->source = DS4_MEMOBS_SRC_NONE;
+    }
+    return 1;
+}
+int ds4_gpu_residency_units_read(int policy, int state, uint64_t *out) {
+    (void)policy; (void)state; (void)out;
+    return 1;
+}
+int ds4_gpu_residency_failures_read(int role, int stage, uint64_t *out) {
+    (void)role; (void)stage; (void)out;
+    return 1;
+}
 #endif
 
 /* Native-session model families use the public session contract for scalar
@@ -49897,6 +50929,20 @@ static int generate_public_session_argmax(
     free(trace_logits);
     ds4_session_free(session);
     return rc;
+}
+
+/* memgov D4-2: typed reclaim status names for logs and counters (both
+ * build shapes; fixed vocabulary -- extend the enum and this together). */
+const char *ds4_reclaim_status_str(int status) {
+    switch (status) {
+    case DS4_RECLAIM_OK:           return "ok";
+    case DS4_RECLAIM_PARTIAL:      return "partial";
+    case DS4_RECLAIM_STALE_PLAN:   return "stale_plan";
+    case DS4_RECLAIM_BUSY:         return "busy";
+    case DS4_RECLAIM_UNSUPPORTED:  return "unsupported";
+    case DS4_RECLAIM_DEVICE_ERROR: return "device_error";
+    default:                       return "unknown";
+    }
 }
 
 int ds4_engine_generate_argmax(
@@ -50572,6 +51618,51 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
         return;
     e->boot_prewarm_done = true;
     const double warm_t0 = now_sec();
+    /* memgov D0b-3 (S8): prewarm allocates by design (post-placement
+     * headroom growth); its lease is the census delta of the classes it
+     * grows -- a BOUNDED publication (scoping sec 2), exact when nothing
+     * else allocates during boot prewarm (boot is single-threaded). */
+    uint64_t warm_before = 0;
+    int warm_census = 0;
+    {
+        ds4_mem_cell cc;
+        if (ds4_gpu_mem_census_read(DS4_MEMC_SCRATCH_STICKY,
+                                    DS4_MEMD_UNIFIED_DEVICE, &cc) == 0) {
+            warm_census = 1;
+            warm_before = ds4_mem_cell_live(&cc);
+            if (ds4_gpu_mem_census_read(DS4_MEMC_KERNEL_PARTIALS,
+                                        DS4_MEMD_UNIFIED_DEVICE, &cc) == 0)
+                warm_before += ds4_mem_cell_live(&cc);
+        }
+    }
+    /* memgov D2-5 (S8): the lease-before-run quote.  Prewarm grows by
+     * design; the DECLARED budget is 256 MiB -- the measured healthy
+     * delta is ~103 MiB against ~158 MiB of grown classes (the d0b (r)
+     * leg's census numbers), so 2x covers deep shapes with room.  The
+     * publication after the run stays the MEASURED delta (it replaces
+     * this declaration -- that replacement is the reconciliation the
+     * (r) leg asserts).  enforce: a refused quote skips the warm run
+     * and the first request pays the one-time driver costs -- the
+     * documented no-prewarm path, not a new failure mode. */
+    {
+        /* The PREWARM lease is DELTA-basis (the measured publication
+         * after the run is `grew`), so the declaration is the growth
+         * budget alone. */
+        ds4_gov_claim wcl = {0};
+        wcl.requester = DS4_GOVC_PREWARM;
+        wcl.memc = DS4_MEMC_SCRATCH_STICKY;
+        wcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        wcl.proposed_outstanding = 256ull << 20;
+        if (ds4_gov_governed_check("boot_prewarm", &wcl, DS4_GOV_ADMIT)
+                != DS4_GOV_ADMIT) {
+            fprintf(stderr, "ds4: memgov ENFORCE refuse site=boot_prewarm "
+                            "proposed=%llu; skipping prewarm -- first request "
+                            "pays the one-time driver costs\n",
+                    (unsigned long long)wcl.proposed_outstanding);
+            return;
+        }
+        ds4_gov_publish_use(DS4_GOVC_PREWARM, wcl.proposed_outstanding, 0);
+    }
     const int warm_len = 512;
     ds4_session *warm = NULL;
     if (ds4_session_create(&warm, e, warm_len + 16) == 0 && warm) {
@@ -50600,9 +51691,30 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
         /* Return device reserves the warm session no longer backs (unused
          * graph-pool slack); everything deliberately warmed stays resident. */
         ds4_gpu_boot_trim();
+        /* memgov D0b-3 (S8): what prewarm deliberately left resident --
+         * the MEASURED delta replaces the D2-5 declaration (that
+         * replacement IS the reconciliation the d0b (r) leg asserts). */
+        if (warm_census) {
+            ds4_mem_cell cc;
+            uint64_t warm_after = 0;
+            if (ds4_gpu_mem_census_read(DS4_MEMC_SCRATCH_STICKY,
+                                        DS4_MEMD_UNIFIED_DEVICE, &cc) == 0)
+                warm_after += ds4_mem_cell_live(&cc);
+            if (ds4_gpu_mem_census_read(DS4_MEMC_KERNEL_PARTIALS,
+                                        DS4_MEMD_UNIFIED_DEVICE, &cc) == 0)
+                warm_after += ds4_mem_cell_live(&cc);
+            const uint64_t grew = warm_after > warm_before
+                                      ? warm_after - warm_before : 0;
+            ds4_gov_publish_use(DS4_GOVC_PREWARM, grew, grew);
+        } else {
+            /* No census answer: the declaration cannot be reconciled --
+             * clear it rather than leave 256 MiB of phantom intent. */
+            ds4_gov_publish_use(DS4_GOVC_PREWARM, 0, 0);
+        }
     } else {
         fprintf(stderr, "ds4: boot prewarm session unavailable; first "
                         "request pays the one-time driver costs\n");
+        ds4_gov_publish_use(DS4_GOVC_PREWARM, 0, 0);   /* clear the declaration */
     }
 #else
     (void)e;
@@ -50610,6 +51722,10 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
 }
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    /* memgov D2-1: parse the governance mode table before the first
+     * decision or publication site can run (they all live behind an open
+     * engine).  Idempotent; the unit suite re-invokes it directly. */
+    ds4_gov_modes_init();
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -50641,6 +51757,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     uint32_t load_layer_start = opt->load_layer_start;
     uint32_t load_layer_end = opt->load_layer_end;
     bool load_output = opt->load_output;
+    /* consumed on GPU shapes only */
+    (void)load_slice; (void)load_layer_start;
+    (void)load_layer_end; (void)load_output;
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE &&
         opt->distributed.layers.set)
     {
@@ -50756,6 +51875,102 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          * startup promotion and any cold fallback copy from the merged map. */
         (void)ds4_gpu_set_model_fd(e->model.split_count > 1u
                                    ? -1 : e->model.fd);
+        /* memgov D3-2: resolve the per-source residency policy ONCE, here,
+         * from ONE read of the environment -- the handles carry it and no
+         * consumer reads these knobs again.  Legacy levers stay legal as
+         * aliases; the first-class knob refuses to share the boot with
+         * them (strict conflict = typed open failure, the plan's "no
+         * interacting negative flags"). */
+        int res_pol[3]; /* base, mtp, drafter -- the uts[]/cats[] order */
+        {
+            const ds4_residency_inputs common = {
+                NULL,
+                getenv("DS4_CUDA_NO_HBM_CACHE") != NULL,
+                getenv("DS4_CUDA_NO_FD_CACHE") != NULL,
+                getenv("DS4_CUDA_DIRECT_MODEL") != NULL,
+            };
+            const char *glob = getenv("DS4_WEIGHT_RESIDENCY");
+            const struct { const char *nm; const char *ov; } rsrc[3] = {
+                {"base",    getenv("DS4_WEIGHT_RESIDENCY_BASE")},
+                {"mtp",     getenv("DS4_WEIGHT_RESIDENCY_MTP")},
+                {"drafter", getenv("DS4_WEIGHT_RESIDENCY_DRAFTER")},
+            };
+            for (int ri = 0; ri < 3; ri++) {
+                ds4_residency_inputs in = common;
+                in.explicit_val = rsrc[ri].ov && rsrc[ri].ov[0] ? rsrc[ri].ov
+                                                                : glob;
+                const char *why = NULL;
+                res_pol[ri] = ds4_residency_resolve(&in, &why);
+                if (res_pol[ri] < 0) {
+                    fprintf(stderr,
+                            "ds4: residency policy conflict (%s): %s\n",
+                            rsrc[ri].nm, why ? why : "invalid");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            }
+            if (common.legacy_no_fd && !common.legacy_no_hbm && !glob)
+                fprintf(stderr,
+                        "ds4: DS4_CUDA_NO_FD_CACHE without DS4_CUDA_NO_HBM_CACHE "
+                        "is deprecated (mechanism-only lever); prefer "
+                        "DS4_WEIGHT_RESIDENCY=eager|mapped\n");
+            fprintf(stderr,
+                    "ds4: weight residency: base=%s mtp=%s drafter=%s (%s)\n",
+                    ds4_residency_name(res_pol[0]),
+                    ds4_residency_name(res_pol[1]),
+                    ds4_residency_name(res_pol[2]),
+                    glob || rsrc[0].ov || rsrc[1].ov || rsrc[2].ov
+                        ? "explicit" : "legacy-alias");
+        }
+        /* memgov D1a-1: declare every served mmap as a model source BEFORE
+         * its first weight-class allocation (the artifact build below is
+         * the earliest) -- the backend attributes each WEIGHT_* census
+         * note to a source row by map containment.  Names deliberately use
+         * the weight-server manifest model_id vocabulary. */
+        (void)ds4_gpu_model_source_bind(e->model.map, e->model.size,
+                                        DS4_MSRC_ROLE_PRIMARY, e->model.fd,
+                                        res_pol[0], "base", opt->model_path);
+        if (e->mtp_ready) {
+            (void)ds4_gpu_model_source_bind(e->mtp_model.map, e->mtp_model.size,
+                                            DS4_MSRC_ROLE_AUXILIARY,
+                                            e->mtp_model.fd, res_pol[1],
+                                            "mtp", opt->mtp_path);
+        }
+        if (e->dspark_ready) {
+            const char *dspark_prov = opt->dspark_path && opt->dspark_path[0]
+                ? opt->dspark_path : getenv("DS4_DSPARK_MODEL");
+            (void)ds4_gpu_model_source_bind(e->dspark_model.map,
+                                            e->dspark_model.size,
+                                            DS4_MSRC_ROLE_DRAFTER,
+                                            e->dspark_model.fd, res_pol[2],
+                                            "drafter", dspark_prov);
+        }
+        /* memgov D1a-2: one semantic-catalog line per source — the D1a
+         * gate's positive engagement signal (the tripwire at the pre-cache
+         * site is its negative twin). */
+        {
+            const struct { const char *nm; const ds4_model *mm; int on; } cats[] = {
+                {"base", &e->model, 1},
+                {"mtp", &e->mtp_model, e->mtp_ready},
+                {"drafter", &e->dspark_model, e->dspark_ready},
+            };
+            for (size_t ci = 0; ci < sizeof(cats) / sizeof(cats[0]); ci++) {
+                ds4_model_catalog_counts cc;
+                if (!cats[ci].on) continue;
+                ds4_model_catalog_count(cats[ci].mm->tensor_traits,
+                                        cats[ci].mm->n_tensors, &cc);
+                fprintf(stderr,
+                        "ds4: model catalog %s: %llu tensors, %llu routed-expert, "
+                        "%llu artifact-replaced, %llu artifact-additive, %llu optional\n",
+                        cats[ci].nm,
+                        (unsigned long long)cc.tensors,
+                        (unsigned long long)cc.routed,
+                        (unsigned long long)cc.replaced,
+                        (unsigned long long)cc.additive,
+                        (unsigned long long)cc.optional);
+            }
+        }
 #ifndef __APPLE__
         /* Self-load aligned artifacts: with no weight-server manifest, build
          * the aligned-SoA repack artifacts in-process BEFORE the model map
@@ -50963,12 +52178,117 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             ds4_metric_set(&ds4_metrics_get()->derived_artifact_bytes, art_bytes);
         }
 #endif
-        // Pre-cache main and support-model tensor spans into device memory at
-        // startup, so the first decode, MTP draft, or DSpark block doesn't pay
-        // a multi-second cudaMemcpy cost in the hot path.  The previous
-        // !e->mtp_ready guard skipped both pre-caches when MTP was loaded,
-        // which left the entire 3.6 GiB Q4_K MoE weight set to be copied
-        // synchronously on the first MTP routed_moe invocation.
+        /* memgov D1a-3/D1b-1: compile + verify + BIND the canonical unit
+         * table per source BEFORE the eager pass — plan-first ordering
+         * (D1b-1 inverted the D1a-3 observer placement): the pass below
+         * materializes exactly these units, and every boot publication
+         * stamps at publish (the report's backfill now covers only
+         * pre-open publications such as manifest imports).  Active set =
+         * the boot slice for the base map (§5.1: a slice boot enumerates
+         * only its intervals), everything for support models.  Any
+         * compile/verify violation counts a census fault, which every
+         * standing gate asserts zero, and a corrupt table is NOT bound —
+         * the eager pass then skips rather than promote off-plan.
+         * CUDA-only like the census (OBS-policy): the policy stamps are
+         * the CUDA residency plan (VMM arena / HBM promote); Metal keeps
+         * descriptors + catalogs but plans no device residency here. */
+#ifndef __APPLE__
+        {
+            const struct { const char *nm; const ds4_model *mm; int on; int sliced; } uts[] = {
+                {"base", &e->model, 1, load_slice},
+                {"mtp", &e->mtp_model, e->mtp_ready, 0},
+                {"drafter", &e->dspark_model, e->dspark_ready, 0},
+            };
+            for (size_t si = 0; si < sizeof(uts) / sizeof(uts[0]); si++) {
+                if (!uts[si].on || uts[si].mm->n_tensors == 0) continue;
+                const ds4_model *mm = uts[si].mm;
+                const uint32_t n = (uint32_t)mm->n_tensors;
+                ds4_unit_tensor_in *tin = xmalloc((size_t)n * sizeof(tin[0]));
+                ds4_phys_unit *units = xmalloc((size_t)n * sizeof(units[0]));
+                ds4_model_map_span_vec sl_spans = {NULL, 0, 0, 0};
+                bool have_slice = false;
+                if (uts[si].sliced) {
+                    have_slice = weights_model_map_spans(&e->weights,
+                                                         load_layer_start,
+                                                         load_layer_end,
+                                                         load_output,
+                                                         &sl_spans);
+                }
+                for (uint32_t i = 0; i < n; i++) {
+                    const ds4_tensor *t = &mm->tensors[i];
+                    tin[i].off = t->abs_offset;
+                    tin[i].bytes = t->bytes;
+                    tin[i].traits = mm->tensor_traits ? mm->tensor_traits[i] : 0;
+                    tin[i].active = 1;
+                    if (have_slice) {
+                        tin[i].active = 0;
+                        for (uint32_t sj = 0; sj < sl_spans.len; sj++) {
+                            if (t->abs_offset >= sl_spans.v[sj].off &&
+                                t->abs_offset + t->bytes <= sl_spans.v[sj].end) {
+                                tin[i].active = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                free(sl_spans.v);
+                ds4_unit_compile_params up;
+                memset(&up, 0, sizeof up);
+                up.merge_gap = 65536;
+                up.max_unit_bytes = accelerator_cuda_preload_span_bytes();
+                up.vmm_granularity = 256;   /* the weight-arena bump align */
+                /* memgov D3-2: the stamp input is the RESOLVED per-source
+                 * policy (uts[] order == res_pol[] order); the env was
+                 * read exactly once, at the resolver above. */
+                up.device_promote =
+                    res_pol[si] != DS4_RESIDENCY_HOST_MAPPED;
+                up.replaces_complete =
+                    ds4_gpu_model_map_replaces_complete(mm->map) != 0;
+                const int nu = ds4_units_compile(tin, n, &up, units);
+                uint32_t viol = nu < 0 ? 1
+                    : ds4_units_verify(tin, n, &up, units, nu);
+                ds4_unit_table_counts uc;
+                ds4_units_count(units, nu < 0 ? 0 : nu, &uc);
+                fprintf(stderr,
+                        "ds4: model units %s: %llu units, covered %.2f GiB, "
+                        "planned %.2f GiB, promote %.2f GiB, cold %.2f GiB "
+                        "(verify=%u)\n",
+                        uts[si].nm,
+                        (unsigned long long)uc.units,
+                        (double)uc.covered_bytes / 1073741824.0,
+                        (double)uc.planned_bytes / 1073741824.0,
+                        (double)uc.promote_bytes / 1073741824.0,
+                        (double)uc.cold_bytes / 1073741824.0,
+                        viol);
+                if (viol != 0) {
+                    fprintf(stderr,
+                            "ds4: UNIT-TABLE FAULT: %s compile/verify "
+                            "violations=%u\n",
+                            uts[si].nm, viol);
+                    ds4_gpu_mem_census_fault_note();
+                }
+                /* memgov D1a-4: a clean table becomes THE plan -- the
+                 * range-publication funnel stamps every published weight
+                 * range with its unit span (the boot report backfills the
+                 * publications that preceded this bind).  A corrupt table
+                 * must not become the plan; bind faults internally. */
+                if (nu > 0 && viol == 0 &&
+                    ds4_gpu_model_units_bind(mm->map, units, (uint32_t)nu) != 0) {
+                    fprintf(stderr, "ds4: UNIT-TABLE FAULT: %s bind failed\n",
+                            uts[si].nm);
+                }
+                free(tin);
+                free(units);
+            }
+        }
+#endif
+        // Eager residency pass: materialize each bound plan into device
+        // memory at startup, so the first decode, MTP draft, or DSpark
+        // block doesn't pay a multi-second copy cost in the hot path.
+        // The previous !e->mtp_ready guard skipped both pre-caches when
+        // MTP was loaded, which left the entire 3.6 GiB Q4_K MoE weight
+        // set to be copied synchronously on the first MTP routed_moe
+        // invocation.
         if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
@@ -50978,9 +52298,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         /* Also populate the HBM cache for the MTP support model when loaded.
          * Without this, MTP-block tensor reads at decode time hit the UVA-
-         * mapped pointer (slow) instead of cudaMalloc'd HBM copies (fast).
-         * The MoE expert filter in accelerator_cache_model_tensor_spans
-         * skips `mtp.0.ffn_*_exps.weight` automatically. */
+         * mapped pointer (slow) instead of device copies (fast).  The MTP
+         * plan's expert-cold policy keeps `mtp.0.ffn_*_exps.weight` off
+         * the eager pass automatically. */
         if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
             fprintf(stderr, "ds4: %s failed to prepare MTP startup model cache\n",
                     ds4_backend_name(e->backend));
@@ -50995,6 +52315,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* memgov D1a-1: per-source residency lines + ledger reconciliation
+         * against the census cells (no-op on Metal).  Post-pre-cache is the
+         * interesting snapshot; the reconciliation invariant itself holds at
+         * any instant by the dual-write construction. */
+        ds4_gpu_report_model_sources();
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
         /* v0.5 inc-14b: boot prewarm (see ds4_engine_boot_prewarm).  Callers
@@ -51355,34 +52680,59 @@ int ds4_session_graph_pending(const ds4_session *s) {
  * session ctx that can actually allocate instead of letting a full--c lazy
  * alloc fail on a bank-holding box.  Fail-open exactly like the gate. */
 int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size) {
+    ds4_session_graph_fit_quote q;
+    return ds4_engine_session_graph_fit_quote(e, ctx_size, &q);
+}
+
+/* memgov D4-1: the structured quote behind the boolean probe -- same tiers,
+ * same fail-open legs (CPU and no-graph builds quote fits=1/fail_open=1,
+ * matching the probe's historical yes), numbers from the fit gate's own
+ * evaluation so quote and gate cannot drift.  NULL/invalid args are a
+ * caller bug, not a capacity verdict: fits=0 with fail_open=0 and zero
+ * deficit (nothing to reclaim toward). */
+int ds4_engine_session_graph_fit_quote(ds4_engine *e, int ctx_size,
+                                       ds4_session_graph_fit_quote *q) {
+    if (!q) return 0;
+    memset(q, 0, sizeof(*q));
     if (!e || ctx_size <= 0) return 0;
 #ifndef DS4_NO_GPU
-    if (e->backend == DS4_BACKEND_CPU) return 1;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3)
-        return e->backend == DS4_BACKEND_CUDA && ctx_size <= 262144;
+    if (e->backend == DS4_BACKEND_CPU) {
+        q->fits = 1;
+        q->fail_open = 1;
+        return 1;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
+        q->fits = (e->backend == DS4_BACKEND_CUDA && ctx_size <= 262144) ? 1 : 0;
+        return q->fits;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
         const uint32_t prefill_cap =
             solar_graph_prefill_cap_for_context((uint32_t)ctx_size);
-        return solar_graph_session_fit_check(e->backend,
+        q->fits = solar_graph_session_fit_check(e->backend,
                                              (uint32_t)ctx_size,
                                              prefill_cap,
                                              /*loud=*/false) ? 1 : 0;
+        return q->fits;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
         const uint32_t prefill_cap =
             exaone_graph_prefill_cap_for_context((uint32_t)ctx_size, 0u);
-        return exaone_graph_session_fit_check(e->backend,
+        q->fits = exaone_graph_session_fit_check(e->backend,
                                               (uint32_t)ctx_size,
                                               prefill_cap,
                                               /*loud=*/false) ? 1 : 0;
+        return q->fits;
     }
     const uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
-    return metal_graph_session_fit_check(&e->weights, &e->weights.layer[0],
-                                         raw_cap, (uint32_t)ctx_size, prefill_cap,
-                                         e->mtp_ready, e->dspark_ready,
-                                         /*loud=*/false) ? 1 : 0;
+    (void)metal_graph_session_fit_check(&e->weights, &e->weights.layer[0],
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                        e->mtp_ready, e->dspark_ready,
+                                        /*loud=*/false, q);
+    return q->fits;
 #else
+    q->fits = 1;
+    q->fail_open = 1;
     return 1;
 #endif
 }
@@ -51727,6 +53077,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen) {
+    (void)output_hc;   /* consumed on GPU shapes only */
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -54223,7 +55574,9 @@ void ds4_session_invalidate(ds4_session *s) {
 
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
+#ifndef DS4_NO_GPU
     const int old_pos = s->checkpoint.len;
+#endif
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     /* Inc 5a: a strict truncation lets a later extension regrow to an old

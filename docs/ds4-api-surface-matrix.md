@@ -1,6 +1,9 @@
 # DS4 API surface matrix
 
-Status: v0.5.6 Inc 0a baseline. This document records what each HTTP
+Status: v0.5.6 Inc 0a baseline, re-verified at v0.6.0 — the
+memory-governance arc changed no routing and no wire contract (its
+typed rejection reasons are a /metrics family; the error envelopes are
+unchanged). This document records what each HTTP
 generation surface supports TODAY, which serving lane executes it, and the
 known gaps. It is the frozen oracle for the API-promotion arc: later
 increments change routing and must update this file in the same commit.

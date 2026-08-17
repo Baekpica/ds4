@@ -4488,6 +4488,89 @@ int ds4_gpu_init(void) {
     return 1;
 }
 
+/* memgov D0a-1 census stubs: Metal keeps no allocation census (the class
+ * taxonomy is CUDA-backend accounting).  Scope tags no-op; a census read
+ * reports unsupported (nonzero) so gates cannot mistake absence for zero. */
+void ds4_gpu_mem_scope_begin(int consumer_class) { (void)consumer_class; }
+void ds4_gpu_mem_scope_end(void) {}
+int ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out) {
+    (void)consumer_class; (void)domain; (void)out;
+    return 1;
+}
+uint64_t ds4_gpu_mem_census_faults(void) { return 0; }
+void ds4_gpu_mem_census_fault_note(void) {}
+int ds4_gpu_model_map_replaces_complete(const void *model_map) {
+    (void)model_map;
+    return 0;
+}
+/* D0b-2: no registry, no writers -- a permanently even, never-changing
+ * epoch, so any reader copy trivially verifies. */
+uint64_t ds4_gpu_mem_census_epoch_begin(void) { return 0; }
+int ds4_gpu_mem_census_epoch_verify(uint64_t began) { return began == 0; }
+int ds4_gpu_mem_observe(ds4_mem_observation *out) {
+    /* Same truth ds4_gpu_mem_info always told (no reliable free-memory
+     * answer on Metal), now as a typed state instead of a bare rc. */
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        out->status = DS4_MEMOBS_UNSUPPORTED;
+        out->source = DS4_MEMOBS_SRC_NONE;
+    }
+    return 1;
+}
+/* memgov D5-2: Metal keeps no residency plan -- the units/failures
+ * families report unsupported (nonzero) and porcelains render ABSENCE,
+ * the census contract. */
+int ds4_gpu_residency_units_read(int policy, int state, uint64_t *out) {
+    (void)policy; (void)state; (void)out;
+    return 1;
+}
+int ds4_gpu_residency_failures_read(int role, int stage, uint64_t *out) {
+    (void)role; (void)stage; (void)out;
+    return 1;
+}
+/* D0a-4: no VMM trim on Metal -- nothing to inject into.  0 = unsupported
+ * (the unit suite's skip gate). */
+int ds4_gpu_trim_inject_set(int site, uint32_t count) {
+    (void)site; (void)count;
+    return 0;
+}
+uint32_t ds4_gpu_trim_inject_fired(void) { return 0; }
+
+/* memgov D1a-1: source descriptors are backend-neutral (the pure table
+ * from ds4_mem_census.h), so Metal keeps them; the per-source ledger is
+ * CUDA accounting, so reads report unsupported (nonzero) like the census
+ * stub above, and the residency report stays silent (OBS-policy: Metal
+ * makes no residency claims it cannot measure). */
+static ds4_model_source_table g_metal_model_srcs;
+int ds4_gpu_model_source_bind(const void *map_base, uint64_t map_len,
+                              int role, int fd, int residency,
+                              const char *name, const char *path) {
+    return ds4_model_source_bind(&g_metal_model_srcs, map_base, map_len,
+                                 role, fd, residency, name, path, NULL);
+}
+int ds4_gpu_model_source_count(void) { return g_metal_model_srcs.count; }
+int ds4_gpu_model_source_info(int idx, ds4_model_source *out) {
+    if (!out || idx < 0 || idx >= g_metal_model_srcs.count) return 1;
+    *out = g_metal_model_srcs.v[idx];
+    return 0;
+}
+int ds4_gpu_mem_src_census_read(int src_idx, int consumer_class, int domain,
+                                ds4_mem_cell *out) {
+    (void)src_idx; (void)consumer_class; (void)domain; (void)out;
+    return 1;
+}
+void ds4_gpu_report_model_sources(void) {}
+/* memgov D1a-4: unit tables describe the CUDA residency plan; Metal
+ * plans no device residency here (OBS-policy), so bind is unsupported
+ * like the ledger reads above. */
+int ds4_gpu_model_units_bind(const void *map_base, const ds4_phys_unit *units,
+                             uint32_t count) {
+    (void)map_base; (void)units; (void)count;
+    return 1;
+}
+/* memgov D2-2: no residency plan on Metal -- freeze is a no-op. */
+void ds4_gpu_model_plan_freeze(void) {}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
@@ -4545,6 +4628,12 @@ void ds4_gpu_boot_trim(void) {
     /* No graph-pool reserve concept on Metal. */
 }
 
+uint64_t ds4_gpu_own_trim(void) {
+    /* memgaps MG-1: no graph-pool reserve concept on Metal -- nothing to
+     * return, nothing recovered (the wrapper's disclosure stays silent). */
+    return 0;
+}
+
 void ds4_gpu_unregister_model_map(const void *base) {
     /* No host-registration concept on Metal (shared unified buffers). */
     (void)base;
@@ -4574,6 +4663,12 @@ uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64_t offset, 
 
 uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
     /* Metal has no demand-mapped reservations; nothing is trimmable. */
+    (void)tensor; (void)offset; (void)bytes;
+    return 0;
+}
+
+uint64_t ds4_gpu_tensor_trim_estimate(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    /* Mirror of trim: no demand mapping, so the trim preimage is empty. */
     (void)tensor; (void)offset; (void)bytes;
     return 0;
 }

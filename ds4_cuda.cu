@@ -31,6 +31,9 @@
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
+#include "ds4_mem_census.h"
+#include "ds4_model_catalog.h" /* memgov D1a-4: unit tables for range stamps */
+#include "ds4_mem_gov.h"      /* memgov D0b: epoch protocol primitives */
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -53,6 +56,10 @@ struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
+    int memc;   /* census consumer class captured at alloc/reserve time
+                   (ds4_mem_consumer_class); calloc zero = ENGINE_OTHER.
+                   Frees and demand-page ensures charge this class so the
+                   engine-side scope only has to bracket creation. */
 };
 
 typedef struct ds4_gpu_top2_result {
@@ -116,6 +123,14 @@ static int g_model_registered;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
+/* Integrated self-load map: kernels may read the raw mmap pointer through
+ * ATS/HMM (the aligned-consumer fallback contract) even though hmm_direct
+ * stays 0 to keep routing through the promotion tiers.  Records WHICH map
+ * carries that coherence fact (a pointer, not a bool: later set_model_map
+ * calls for support maps take over the g_model_* globals while this map
+ * keeps serving), so refusal/degraded paths can serve its mapped pointer
+ * instead of failing (memgov enforce hardening). */
+static const void *g_model_coherent_direct_map;
 static int g_model_fd = -1;
 // Tracks which model_map owns g_model_fd. Set on the first set_model_map call
 // after set_model_fd. fd-based weight caching is refused for any other map
@@ -127,11 +142,13 @@ static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
 /* deepmem lite-3 (tripwire): base-map promotable-span accounting.  `total`
- * is declared by the startup walk's ds4_gpu_cache_model_range calls (every
- * non-expert span chunk flows through it on EVERY boot, integrated devices
- * only); `covered` grows as spans become device-resident or provably never
- * will (walk populate, fd-cache promotion, dup/dedup/limit/device-owned
- * skips).  The DS4_CUDA_NO_HBM_CACHE lever skip deliberately does NOT
+ * is declared up front by ds4_gpu_materialize_model_plan from the bound
+ * unit table's ACTIVE promote + host-mapped units (memgov D1b-1 — a slice
+ * boot therefore declares its slice's bytes, not the whole map's;
+ * integrated devices only); `covered` grows as units become device-
+ * resident or provably never will (materialized units, fd-cache
+ * promotion, ready/import/limit/device-owned skips).  The
+ * DS4_CUDA_NO_HBM_CACHE lever's HOST_MAPPED policy deliberately does NOT
  * cover -- those bytes are the deferred device promotions the boot plan
  * and the live verdicts must charge (outstanding = total - covered: ~0 on
  * eager boots, ~8 GiB under the lever).  Scope is the fd-owner base map
@@ -139,7 +156,17 @@ static int g_model_cache_full;
  * base-map-only and their maps stay host-registered), so declaring them
  * would overcharge lever boots.  Single-writer under the server's gen_mu
  * serialization; a racy reader sees a stale-HIGH outstanding (covered
- * lags), the conservative direction. */
+ * lags), the conservative direction.
+ *
+ * memgov D5-4 adjudication: these counters are NOT a retired coverage
+ * belt -- they ARE ds4_gpu_substrate_outstanding's data source, and that
+ * value is subtracted by every session-graph fit verdict, rendered on the
+ * census totals line and /metrics, and bit-identity-asserted by the
+ * standing gates.  Plan sec 12's "remove global coverage counters" is
+ * gated on "after all callers migrate": deletion rides the same
+ * post-v0.5.7 field-confidence gate as the legacy admission formulas
+ * (the D4-0 adjudication), when the physical plan becomes the sole
+ * decision authority. */
 static uint64_t g_substrate_promotable_total;
 static uint64_t g_substrate_promotable_covered;
 
@@ -151,6 +178,217 @@ static void cuda_substrate_cover(const void *model_map, uint64_t bytes) {
     if (g_model_fd_host_base && model_map == g_model_fd_host_base)
         g_substrate_promotable_covered += bytes;
 }
+
+/* --------------------------------------------------------------------
+ * memgov D0a-1: allocation-census registry (accounting only).
+ *
+ * One cell per consumer class x domain (arithmetic in ds4.h so the server
+ * unit suite drives it CPU-only); every allocation/release site in this
+ * file records {requested, committed} on its census row
+ * (local/docs/v057/d0a_census_table.md).  NOTHING reads these cells on a
+ * decision path -- D0a's contract is zero decision change.
+ *
+ * Concurrency (memgov D0b-2, plan sec 6.3): every writer (boot loader,
+ * admissions, sticky-scratch growth, teardown) runs under the server's
+ * gen_mu / boot single-thread serialization -- a PRECONDITION the epoch
+ * brackets below TRIPWIRE rather than assume (write_begin faults on an
+ * odd epoch, write_end on an even one; both self-heal parity).  Every
+ * note transaction brackets with ds4_gov_epoch_write_begin/_end, so a
+ * reader (server mem_census_snapshot) that samples epoch -> cells ->
+ * epoch discards any copy taken across an in-flight note.  The cell
+ * writes themselves stay plain: a torn reader copy is DISCARDED by
+ * verify, which is the seqlock's documented benign race (formally a
+ * C-standard data race; the fences in the primitives order it on real
+ * targets).  The scope stack below is single-writer-only state that no
+ * reader snapshots; it stays outside the brackets.
+ *
+ * The scope stack attributes ds4_gpu_tensor_alloc/_reserve traffic to the
+ * bracketing subsystem (ENGINE_OTHER when unbracketed -- the close gate
+ * asserts that class settles to zero live bytes).  Depth is generous:
+ * real nesting today is engine-boundary -> at most one inner helper. */
+static ds4_mem_cell g_mem_census[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
+static uint64_t g_mem_census_faults;
+static uint64_t g_mem_census_epoch;   /* D0b-2 seqlock (ds4_mem_gov.h) */
+static int g_mem_scope_stack[8];
+static int g_mem_scope_depth;
+
+static void cuda_mem_note_alloc(int cls, int dom, uint64_t requested,
+                                uint64_t committed) {
+    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT)
+        g_mem_census_faults++;
+    else
+        ds4_mem_cell_note_alloc(&g_mem_census[cls][dom], requested, committed,
+                                &g_mem_census_faults);
+    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+}
+
+static void cuda_mem_note_free(int cls, int dom, uint64_t requested,
+                               uint64_t committed) {
+    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT)
+        g_mem_census_faults++;
+    else
+        ds4_mem_cell_note_free(&g_mem_census[cls][dom], requested, committed,
+                               &g_mem_census_faults);
+    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+}
+
+/* ---------------------------------------------------------------------
+ * memgov D1a-1: model source table + per-source weight side-ledger.
+ *
+ * The engine binds each served mmap (base / MTP / drafter) before its
+ * first weight-class allocation; every WEIGHT_* note below then mirrors
+ * into a source row resolved by map containment.  Both writes happen
+ * under ONE epoch bracket, so in a fault-free ledger the rows of a
+ * weight class sum to its census cell EXACTLY (over-free clamps at row
+ * scope can diverge only alongside a counted fault, which every gate
+ * asserts zero).  Row DS4_MSRC_MAX is the UNATTRIBUTED bucket -- weight
+ * traffic outside every bound map (kernel unit tests that map-swap
+ * without an engine); serving boots reconcile it at zero. */
+static ds4_model_source_table g_model_srcs;
+static ds4_mem_cell
+    g_mem_src_census[DS4_MSRC_MAX + 1][DS4_MEMC__COUNT][DS4_MEMD__COUNT];
+
+static int cuda_mem_src_index(const void *p) {
+    const int i = ds4_model_source_find(&g_model_srcs, p);
+    return i >= 0 ? i : DS4_MSRC_MAX;
+}
+
+static void cuda_mem_note_alloc_srcidx(int cls, int dom, uint64_t requested,
+                                       uint64_t committed, int src) {
+    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT ||
+        src < 0 || src > DS4_MSRC_MAX) {
+        g_mem_census_faults++;
+    } else {
+        ds4_mem_cell_note_alloc(&g_mem_census[cls][dom], requested, committed,
+                                &g_mem_census_faults);
+        ds4_mem_cell_note_alloc(&g_mem_src_census[src][cls][dom], requested,
+                                committed, &g_mem_census_faults);
+    }
+    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+}
+
+static void cuda_mem_note_free_srcidx(int cls, int dom, uint64_t requested,
+                                      uint64_t committed, int src) {
+    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT ||
+        src < 0 || src > DS4_MSRC_MAX) {
+        g_mem_census_faults++;
+    } else {
+        ds4_mem_cell_note_free(&g_mem_census[cls][dom], requested, committed,
+                               &g_mem_census_faults);
+        ds4_mem_cell_note_free(&g_mem_src_census[src][cls][dom], requested,
+                               committed, &g_mem_census_faults);
+    }
+    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+}
+
+/* Pointer-attributed variants: src resolves by containment of `p` (the
+ * map base at most sites; an interior pointer at host-register sites). */
+static void cuda_mem_note_alloc_src(int cls, int dom, uint64_t requested,
+                                    uint64_t committed, const void *p) {
+    cuda_mem_note_alloc_srcidx(cls, dom, requested, committed,
+                               cuda_mem_src_index(p));
+}
+
+static void cuda_mem_note_free_src(int cls, int dom, uint64_t requested,
+                                   uint64_t committed, const void *p) {
+    cuda_mem_note_free_srcidx(cls, dom, requested, committed,
+                              cuda_mem_src_index(p));
+}
+
+extern "C" int ds4_gpu_model_source_bind(const void *map_base, uint64_t map_len,
+                                         int role, int fd, int residency,
+                                         const char *name, const char *path) {
+    return ds4_model_source_bind(&g_model_srcs, map_base, map_len, role, fd,
+                                 residency, name, path, &g_mem_census_faults);
+}
+
+extern "C" int ds4_gpu_model_source_count(void) {
+    return g_model_srcs.count;
+}
+
+extern "C" int ds4_gpu_model_source_info(int idx, ds4_model_source *out) {
+    if (!out || idx < 0 || idx >= g_model_srcs.count) return 1;
+    *out = g_model_srcs.v[idx];
+    return 0;
+}
+
+extern "C" int ds4_gpu_mem_src_census_read(int src_idx, int consumer_class,
+                                           int domain, ds4_mem_cell *out) {
+    if (!out || src_idx < 0 || src_idx > DS4_MSRC_MAX ||
+        consumer_class < 0 || consumer_class >= DS4_MEMC__COUNT ||
+        domain < 0 || domain >= DS4_MEMD__COUNT)
+        return 1;
+    *out = g_mem_src_census[src_idx][consumer_class][domain];
+    return 0;
+}
+
+static int cuda_mem_scope_class(void) {
+    return g_mem_scope_depth > 0 ? g_mem_scope_stack[g_mem_scope_depth - 1]
+                                 : DS4_MEMC_ENGINE_OTHER;
+}
+
+extern "C" void ds4_gpu_mem_scope_begin(int consumer_class) {
+    if (consumer_class < 0 || consumer_class >= DS4_MEMC__COUNT ||
+        g_mem_scope_depth >= (int)(sizeof(g_mem_scope_stack) /
+                                   sizeof(g_mem_scope_stack[0]))) {
+        g_mem_census_faults++;
+        return;
+    }
+    g_mem_scope_stack[g_mem_scope_depth++] = consumer_class;
+}
+
+extern "C" void ds4_gpu_mem_scope_end(void) {
+    if (g_mem_scope_depth <= 0) {
+        g_mem_census_faults++;
+        return;
+    }
+    g_mem_scope_depth--;
+}
+
+extern "C" int ds4_gpu_mem_census_read(int consumer_class, int domain,
+                                       ds4_mem_cell *out) {
+    if (!out || consumer_class < 0 || consumer_class >= DS4_MEMC__COUNT ||
+        domain < 0 || domain >= DS4_MEMD__COUNT)
+        return 1;
+    *out = g_mem_census[consumer_class][domain];
+    return 0;
+}
+
+extern "C" uint64_t ds4_gpu_mem_census_faults(void) {
+    return g_mem_census_faults;
+}
+
+/* memgov D1a-2: engine-side integrity fault (catalog tripwire).  Bare
+ * monotonic bump like the scope-tag faults -- no epoch bracket needed. */
+extern "C" void ds4_gpu_mem_census_fault_note(void) {
+    g_mem_census_faults++;
+}
+
+/* D0b-2: reader half of the registry seqlock (writer half brackets the
+ * note wrappers above).  Exposed as begin/verify so the server's
+ * snapshot loop drives the protocol without touching the epoch word. */
+extern "C" uint64_t ds4_gpu_mem_census_epoch_begin(void) {
+    return ds4_gov_epoch_read_begin(&g_mem_census_epoch);
+}
+
+extern "C" int ds4_gpu_mem_census_epoch_verify(uint64_t began) {
+    return ds4_gov_epoch_read_verify(&g_mem_census_epoch, began);
+}
+
+/* Census: per-slot committed bytes of the pinned staging pool.  File-scope
+ * because TWO paths free the slots (growth in cuda_model_stage_pool_alloc,
+ * model close), and a partial-failure growth attempt leaves earlier slots
+ * allocated at the NEW size while g_model_stage_bytes stays 0 -- the
+ * pool-level size cannot price either free pass. */
+static uint64_t g_mem_stage_slot_bytes[4];
+/* Census: bytes behind g_model_device_base when g_model_device_owned
+ * (whole-model copies -- two success sites, one close-path free). */
+static uint64_t g_mem_device_owned_bytes;
+
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 
@@ -449,12 +687,25 @@ struct cuda_model_range {
     CUmemGenericAllocationHandle vmm_handle;
     CUdeviceptr vmm_va;
     uint64_t vmm_alloc_bytes;
+    /* memgov D1a-4 publication stamps (funnel-owned; sites never set them).
+     * src = ledger row; unit_lo/unit_hi = inclusive canonical-unit span
+     * intersecting the range, -1/-1 before the source's table binds (the
+     * report backfills those once the plan exists). */
+    int src;
+    int unit_lo;
+    int unit_hi;
 };
 
 struct cuda_model_arena {
     char *device_ptr;
     uint64_t bytes;
     uint64_t used;
+    /* D1a-1 ledger row of the map this chunk was created for.  The fd-cache
+     * path (the only arena consumer) is hard-gated to ONE map, so owner
+     * attribution is exact; crediting bumps to the owner rather than the
+     * triggering map keeps per-row frees mirroring per-row allocs even if
+     * that gate ever widens. */
+    int src;
 };
 
 // In-process VMM-backed weight arena. Uses cuMemCreate + cuMemAddressReserve +
@@ -470,6 +721,7 @@ struct cuda_vmm_arena {
     CUdeviceptr va;
     uint64_t alloc_bytes;
     uint64_t used;
+    int src;                    /* D1a-1 ledger row (see cuda_model_arena) */
 };
 
 struct cuda_q8_f16_range {
@@ -479,6 +731,9 @@ struct cuda_q8_f16_range {
     uint64_t in_dim;
     uint64_t out_dim;
     __half *device_ptr;
+    int src;                    /* D1a-4 stamps (see cuda_model_range) */
+    int unit_lo;
+    int unit_hi;
 };
 
 struct cuda_q8_f32_range {
@@ -488,6 +743,9 @@ struct cuda_q8_f32_range {
     uint64_t in_dim;
     uint64_t out_dim;
     float *device_ptr;
+    int src;                    /* D1a-4 stamps (see cuda_model_range) */
+    int unit_lo;
+    int unit_hi;
 };
 
 enum cuda_derived_kind {
@@ -532,19 +790,318 @@ struct cuda_derived_range {
     CUmemGenericAllocationHandle vmm_handle;
     CUdeviceptr vmm_va;
     uint64_t vmm_alloc_bytes;
+    int src;                    /* D1a-4 stamps (see cuda_model_range); the
+                                   unit span covers source_offset/_bytes */
+    int unit_lo;
+    int unit_hi;
 };
+
+/* memgov D1a-1: the exact-hit indexes key on (source map, offset) -- a
+ * bare file offset is only unique WITHIN one gguf, and base/MTP/drafter
+ * are independent maps whose offsets overlap freely (two maps used to
+ * share one flat slot, disambiguated only by host_base re-checks plus a
+ * linear-scan fallback).  Equality is exact on both fields; the hash
+ * only needs spread (splitmix mix).  The host_base re-checks at every
+ * hit site REMAIN load-bearing: ds4_gpu_unregister_model_map neuters
+ * entries in place by nulling host_base, and a stale index entry must
+ * keep missing against them. */
+struct cuda_range_key {
+    const void *host_base;
+    uint64_t offset;
+    bool operator==(const cuda_range_key &o) const {
+        return host_base == o.host_base && offset == o.offset;
+    }
+};
+struct cuda_range_key_hash {
+    size_t operator()(const cuda_range_key &k) const {
+        uint64_t h = (uint64_t)(uintptr_t)k.host_base ^
+                     (k.offset + 0x9e3779b97f4a7c15ull);
+        h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 27; h *= 0x94d049bb133111ebull;
+        h ^= h >> 31;
+        return (size_t)h;
+    }
+};
+typedef std::unordered_map<cuda_range_key, size_t, cuda_range_key_hash>
+    cuda_range_index;
 
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::vector<cuda_vmm_arena> g_vmm_arenas;
 static int g_vmm_supported = -1;        // -1 = unprobed, 0 = no, 1 = yes
 static uint64_t g_vmm_granularity = 0;  // recommended VMM granularity, bytes
-static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
+static cuda_range_index g_model_range_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
-static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
+static cuda_range_index g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
-static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
+static cuda_range_index g_q8_f32_by_offset;
 static std::vector<cuda_derived_range> g_derived_ranges;
+
+/* Index write for model-range entries.  D1a-4: internal to
+ * cuda_model_range_publish -- no push site touches the index directly.
+ * (The D1a-1 lookup micro-parity shadow that once dual-wrote a legacy
+ * flat index here retired in D1b-3: with both promotion passes
+ * materializing plan units, the re-keyed resolve had held divergent=0
+ * across every close battery from D1a-1 through D1b-2.) */
+static void cuda_range_index_note(const void *host_base, uint64_t offset,
+                                  size_t idx) {
+    g_model_range_by_offset[cuda_range_key{host_base, offset}] = idx;
+}
+
+/* --------------------------------------------------------------------
+ * memgov D1a-4: the checked range-publication funnel (plan §5.3).
+ *
+ * ONE checked helper per registry replaces the direct push sites: it
+ * refuses anomalous publications, stamps the source handle + canonical-
+ * unit span onto the published range, and owns the by-offset index.
+ * A refusal counts a census fault (every standing gate asserts zero)
+ * and prints one loud line; the caller routes it into its own
+ * allocation-failure path, so serving degrades to the next residency
+ * tier instead of trusting a corrupted registry.  After this, a range
+ * that exists is a range the plan knows.
+ *
+ * Refusal semantics, derived from what healthy flows actually publish:
+ * - model ranges refuse SAME-TIER interval overlap (host_registered
+ *   equal).  Device copies deliberately overlay the whole-map
+ *   registered view (the two-pass resolve prefers them), so cross-tier
+ *   overlap is the design, and a cross-tier exact-key collision stays
+ *   last-write-wins -- that is the promotion path.  Every caller
+ *   already dedups against the registry before allocating (resolve /
+ *   the S6 coverage belt), so a same-tier overlap here means double
+ *   residency of the same source bytes: silent VRAM double-booking
+ *   under the old push, a loud fault now.
+ * - derived artifacts refuse source-interval overlap within one KIND
+ *   for one map (one source span legitimately carries artifacts of
+ *   SEVERAL kinds: aligned Q8 + f16 colmajor from the same tensor).
+ * - the q8 dequant caches are exact-key registries: refuse a duplicate
+ *   live key (a hit with matching metadata never republishes, so a
+ *   duplicate means a metadata-mismatched shadow entry).
+ * Neutered entries (host_base nulled by ds4_gpu_unregister_model_map)
+ * match no live map and never block a publication; their stale index
+ * slots are legitimately reclaimed by overwrite. */
+static ds4_phys_unit *g_model_units_v[DS4_MSRC_MAX];
+static uint32_t g_model_units_n[DS4_MSRC_MAX];
+
+extern "C" int ds4_gpu_model_units_bind(const void *map_base,
+                                        const ds4_phys_unit *units,
+                                        uint32_t count) {
+    const int row = ds4_model_source_find(&g_model_srcs, map_base);
+    if (row < 0 || row >= DS4_MSRC_MAX || (count != 0 && !units)) {
+        g_mem_census_faults++;
+        return 1;
+    }
+    ds4_phys_unit *copy = NULL;
+    if (count != 0) {
+        copy = (ds4_phys_unit *)malloc((size_t)count * sizeof(*copy));
+        if (!copy) {
+            g_mem_census_faults++;
+            return 1;
+        }
+        memcpy(copy, units, (size_t)count * sizeof(*copy));
+    }
+    free(g_model_units_v[row]);     /* rebind refreshes in place */
+    g_model_units_v[row] = copy;
+    g_model_units_n[row] = count;
+    return 0;
+}
+
+/* Stamp resolution: source row by map containment, unit span by binary
+ * search of the row's bound table.  Publications that precede the table
+ * bind (the pre-cache walk and manifest imports run inside model open;
+ * the tables compile after) stamp -1/-1 and are backfilled by
+ * ds4_gpu_report_model_sources once the plan exists. */
+static void cuda_range_stamp(const void *map, uint64_t off, uint64_t bytes,
+                             int *src, int *unit_lo, int *unit_hi) {
+    *src = cuda_mem_src_index(map);
+    *unit_lo = *unit_hi = -1;
+    if (*src >= 0 && *src < DS4_MSRC_MAX)
+        ds4_units_span_of(g_model_units_v[*src], g_model_units_n[*src],
+                          off, bytes, unit_lo, unit_hi);
+}
+
+static uint64_t g_range_publish_refused;
+
+/* =========================================================================
+ * memgov D2-2: plan freeze + governed materialization plumbing.
+ *
+ * The server freezes the plan at boot settle; after freeze, a device-copy
+ * (arena) range may enter the funnel ONLY through the unit materializer,
+ * whose every promotion carries a governor claim.  The tripwire guards
+ * future rogue promotion paths -- on this tree the materializer is already
+ * the only arena publisher (D1b "multi 0" invariant), so a firing means a
+ * regression, counted into the governor fault family (ledger intent, not
+ * census physics).  The gov entry points live in ds4.c (C linkage; the
+ * standing local-fwd-decl law for cross-TU calls). */
+static int g_model_plan_frozen;
+/* Set while a GOVERNED promotion publishes its range: the unit
+ * materializer and the cold device-copy tier both take a governor claim
+ * immediately before publication, so a post-freeze arena publication
+ * without this marker is by construction an unclaimed path. */
+static int g_in_governed_materialize;
+static const char *cuda_model_direct_fallback_ptr(const void *model_map,
+                                                  uint64_t offset);
+extern "C" void ds4_gov_publish_use(int consumer, uint64_t intent,
+                                    uint64_t resident);
+extern "C" int ds4_gov_governed_check(const char *site,
+                                      const ds4_gov_claim *cl,
+                                      int legacy_status);
+extern "C" void ds4_gov_fault_tick(void);
+extern "C" void ds4_gpu_model_plan_freeze(void) {
+    g_model_plan_frozen = 1;
+    /* memgov D3-4 census assert: at the freeze point a HOST_MAPPED
+     * source holds ZERO device bytes in the promotion classes (arena +
+     * span) -- the cells the rent-gate M legs pinned through serving.
+     * Derived artifacts are exempt by design: self-load artifacts ARE
+     * the mapped serving shape (WEIGHT_DERIVED, separate class).  A
+     * violation is the same fault family as the funnel tripwire. */
+    for (int s = 0; s < DS4_MSRC_MAX; s++) {
+        if (!g_model_srcs.v[s].map_base) continue;
+        if (g_model_srcs.v[s].residency != DS4_RESIDENCY_HOST_MAPPED) continue;
+        const uint64_t arena = ds4_mem_cell_live(
+            &g_mem_src_census[s][DS4_MEMC_WEIGHT_ARENA][DS4_MEMD_UNIFIED_DEVICE]);
+        const uint64_t span = ds4_mem_cell_live(
+            &g_mem_src_census[s][DS4_MEMC_WEIGHT_SPAN][DS4_MEMD_UNIFIED_DEVICE]);
+        if (arena == 0 && span == 0) continue;
+        fprintf(stderr,
+                "ds4: memgov mapped census violation at freeze "
+                "(src=%d arena=%llu span=%llu) -- mapped policy bypassed\n",
+                s, (unsigned long long)arena, (unsigned long long)span);
+        ds4_gov_fault_tick();
+    }
+}
+
+static int cuda_range_publish_refuse(const char *what, const void *map,
+                                     uint64_t off, uint64_t bytes,
+                                     const char *why) {
+    g_range_publish_refused++;
+    ds4_gpu_mem_census_fault_note();
+    fprintf(stderr,
+            "ds4: RANGE-PUBLISH REFUSED %s map=%p off=%llu bytes=%llu (%s)\n",
+            what, map, (unsigned long long)off, (unsigned long long)bytes, why);
+    return 0;
+}
+
+static int cuda_iv_overlap(uint64_t a_off, uint64_t a_bytes,
+                           uint64_t b_off, uint64_t b_bytes) {
+    return a_off < b_off + b_bytes && b_off < a_off + a_bytes;
+}
+
+/* Publish one model range: checks, stamps, vector push, index claim.
+ * Returns 1 published, 0 refused (fault counted; caller frees/unwinds
+ * exactly like its allocation-failure path). */
+static int cuda_model_range_publish(const cuda_model_range &nr) {
+    if (nr.bytes == 0 || nr.offset + nr.bytes < nr.offset)
+        return cuda_range_publish_refuse("model", nr.host_base, nr.offset,
+                                         nr.bytes, "empty/overflowed interval");
+    /* memgov D2-2 post-freeze tripwire (plan sec 12 D2 gate: "no
+     * unregistered post-freeze allocation").  Loud + counted, never a
+     * refusal: the range is real and the census must stay physical
+     * truth -- the fault says the INTENT ledger was bypassed. */
+    if (g_model_plan_frozen && !g_in_governed_materialize &&
+        !nr.host_registered && !nr.imported_ipc && !nr.imported_vmm) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: memgov POST-FREEZE arena range without a claim "
+                    "(map=%p off=%llu bytes=%llu) -- ungoverned promotion path\n",
+                    nr.host_base, (unsigned long long)nr.offset,
+                    (unsigned long long)nr.bytes);
+        }
+        ds4_gov_fault_tick();
+    }
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base != nr.host_base) continue;
+        if ((r.host_registered != 0) != (nr.host_registered != 0)) continue;
+        if (cuda_iv_overlap(nr.offset, nr.bytes, r.offset, r.bytes))
+            return cuda_range_publish_refuse("model", nr.host_base, nr.offset,
+                                             nr.bytes, "same-tier overlap");
+    }
+    g_model_ranges.push_back(nr);
+    cuda_model_range &pr = g_model_ranges.back();
+    cuda_range_stamp(pr.host_base, pr.offset, pr.bytes,
+                     &pr.src, &pr.unit_lo, &pr.unit_hi);
+    /* memgov D3-4 mapped tripwire (sibling of the post-freeze tripwire
+     * above): device-backed bytes covering a unit whose policy is
+     * terminal HOST_MAPPED means some path promoted what the plan says
+     * stays mapped.  Loud + counted, never a refusal -- the census
+     * stays physical truth.  Healthy boots cannot fire it (the lazy
+     * tier is policy-fenced, the ATS tier serves the coherent map), so
+     * a firing marks a rogue promotion path or a DEGRADED boot's
+     * last-resort cold copy (registration failure) -- both worth a
+     * fault.  Imports keep their own authority (rider #48). */
+    if (!pr.host_registered && !pr.imported_ipc && !pr.imported_vmm &&
+        pr.src >= 0 && pr.src < DS4_MSRC_MAX && pr.unit_lo >= 0) {
+        const ds4_phys_unit *units = g_model_units_v[pr.src];
+        for (int ui = pr.unit_lo; units && ui <= pr.unit_hi; ui++) {
+            if (units[ui].policy != DS4_UPOL_HOST_MAPPED) continue;
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr,
+                        "ds4: memgov DEVICE bytes over a HOST_MAPPED unit "
+                        "(map=%p off=%llu bytes=%llu unit=%d) -- mapped policy bypassed\n",
+                        pr.host_base, (unsigned long long)pr.offset,
+                        (unsigned long long)pr.bytes, ui);
+            }
+            ds4_gov_fault_tick();
+            break;
+        }
+    }
+    cuda_range_index_note(pr.host_base, pr.offset, g_model_ranges.size() - 1u);
+    return 1;
+}
+
+static int cuda_derived_range_publish(const cuda_derived_range &nr) {
+    if (nr.source_bytes == 0 ||
+        nr.source_offset + nr.source_bytes < nr.source_offset)
+        return cuda_range_publish_refuse("derived", nr.host_base,
+                                         nr.source_offset, nr.source_bytes,
+                                         "empty/overflowed interval");
+    for (const cuda_derived_range &r : g_derived_ranges) {
+        if (r.host_base != nr.host_base || r.kind != nr.kind) continue;
+        if (cuda_iv_overlap(nr.source_offset, nr.source_bytes,
+                            r.source_offset, r.source_bytes))
+            return cuda_range_publish_refuse("derived", nr.host_base,
+                                             nr.source_offset, nr.source_bytes,
+                                             "same-kind source overlap");
+    }
+    g_derived_ranges.push_back(nr);
+    cuda_derived_range &pr = g_derived_ranges.back();
+    cuda_range_stamp(pr.host_base, pr.source_offset, pr.source_bytes,
+                     &pr.src, &pr.unit_lo, &pr.unit_hi);
+    return 1;
+}
+
+static int cuda_q8_f16_publish(const cuda_q8_f16_range &nr) {
+    auto it = g_q8_f16_by_offset.find(cuda_range_key{nr.host_base, nr.offset});
+    if (it != g_q8_f16_by_offset.end() &&
+        g_q8_f16_ranges[it->second].host_base == nr.host_base)
+        return cuda_range_publish_refuse("q8_f16", nr.host_base, nr.offset,
+                                         nr.weight_bytes, "duplicate live key");
+    g_q8_f16_ranges.push_back(nr);
+    cuda_q8_f16_range &pr = g_q8_f16_ranges.back();
+    cuda_range_stamp(pr.host_base, pr.offset, pr.weight_bytes,
+                     &pr.src, &pr.unit_lo, &pr.unit_hi);
+    g_q8_f16_by_offset[cuda_range_key{pr.host_base, pr.offset}] =
+        g_q8_f16_ranges.size() - 1u;
+    return 1;
+}
+
+static int cuda_q8_f32_publish(const cuda_q8_f32_range &nr) {
+    auto it = g_q8_f32_by_offset.find(cuda_range_key{nr.host_base, nr.offset});
+    if (it != g_q8_f32_by_offset.end() &&
+        g_q8_f32_ranges[it->second].host_base == nr.host_base)
+        return cuda_range_publish_refuse("q8_f32", nr.host_base, nr.offset,
+                                         nr.weight_bytes, "duplicate live key");
+    g_q8_f32_ranges.push_back(nr);
+    cuda_q8_f32_range &pr = g_q8_f32_ranges.back();
+    cuda_range_stamp(pr.host_base, pr.offset, pr.weight_bytes,
+                     &pr.src, &pr.unit_lo, &pr.unit_hi);
+    g_q8_f32_by_offset[cuda_range_key{pr.host_base, pr.offset}] =
+        g_q8_f32_ranges.size() - 1u;
+    return 1;
+}
 /* Aligned-artifact tier accounting (v0.2.2 self-load artifacts): which
  * producer put the aligned repack artifacts on device — the weight-server
  * manifest import or the in-process self-load build — plus its cost.  The
@@ -567,16 +1124,18 @@ static const char *g_derived_artifact_none_reason;
  * then (a partial set would leave some expert raws on the pageable tier
  * while still pinning ~90 GiB — the worst of both). */
 static int g_derived_replaces_complete;
+/* memgov D5-4 adjudication: g_model_range_bytes survives v0.5.7 -- it
+ * feeds the RETAINED legacy budget predicates (the D4-0 adjudication
+ * keeps legacy formulas until a full release of field confidence) and
+ * the cold/lazy/boot materialize claims' proposed_outstanding.  Plan
+ * sec 15's "replace promotable - g_model_range_bytes with a physical
+ * residency plan" deletes it only when those callers migrate -- a
+ * DECISION-INPUT change (enforce-mode verdicts + d0a oracle parity),
+ * post-v0.5.7 with the formula retirement. */
 static uint64_t g_model_range_bytes;
-/* S6 (2026-07-07): HBM-cache coverage dedup vs imported manifest ranges --
- * bytes the startup walk SKIPPED because a device-resident range (WS VMM/IPC
- * import, or an earlier populated copy) already fully covers the span.
- * Surfaced in ds4_gpu_print_memory_report.  NOTE: in manifest configs the
- * walk's byte-budget check usually short-circuits first (imports count
- * against the same budget), so this fires only for sub-limit imports. */
+static uint64_t g_derived_range_bytes;
 static uint64_t g_hbm_cache_dedup_bytes;
 static int g_hbm_cache_dedup_logged;
-static uint64_t g_derived_range_bytes;
 
 /* Pinned FILE-BACKED registration accounting.  cudaHostRegister pins the
  * pages, but the kernel keeps counting pinned page-cache pages as
@@ -617,12 +1176,21 @@ static void cuda_pinned_file_note_register(const void *base, uint64_t bytes) {
     if (bytes == 0 || !cuda_host_range_is_file_backed(base)) return;
     g_pinned_file_reg[(uintptr_t)base] = bytes;
     g_pinned_file_bytes += bytes;
+    /* Census: every model-map cudaHostRegister site funnels through here,
+     * so this ONE pair keeps the WEIGHT_HOST_PIN cell reconciled 1:1 with
+     * g_pinned_file_bytes (a d0a gate assert).  D1a-1: `base` is the map
+     * itself or a page-aligned interior pointer -- containment resolves
+     * the source row either way. */
+    cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_HOST_PIN, DS4_MEMD_PINNED_HOST,
+                            bytes, bytes, base);
 }
 
 static void cuda_pinned_file_note_unregister(const void *base) {
     auto it = g_pinned_file_reg.find((uintptr_t)base);
     if (it == g_pinned_file_reg.end()) return;
     g_pinned_file_bytes -= it->second <= g_pinned_file_bytes ? it->second : g_pinned_file_bytes;
+    cuda_mem_note_free_src(DS4_MEMC_WEIGHT_HOST_PIN, DS4_MEMD_PINNED_HOST,
+                           it->second, it->second, base);
     g_pinned_file_reg.erase(it);
 }
 static uint64_t g_q8_f16_bytes;
@@ -769,6 +1337,8 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
          * recapture cost decays to zero. */
         ds4_cuda_invalidate_captured_graphs(what ? what : "cuda_tmp resize");
         (void)cudaFree(g_cuda_tmp);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_cuda_tmp_bytes, g_cuda_tmp_bytes);
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
@@ -790,6 +1360,8 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
      * argmax flip downstream.  Zeroing on (re)alloc makes the read-before-write
      * deterministic.  Cheap: resizes are rare (sticky high-water buffer). */
     if (ptr) (void)cudaMemset(ptr, 0, (size_t)bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
@@ -802,6 +1374,8 @@ static void *tt_scratch_ensure(uint64_t bytes, const char *what) {
     (void)cudaDeviceSynchronize();
     if (g_tt_scratch) {
         (void)cudaFree(g_tt_scratch);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_tt_scratch_bytes, g_tt_scratch_bytes);
         g_tt_scratch = NULL;
         g_tt_scratch_bytes = 0;
     }
@@ -817,6 +1391,8 @@ static void *tt_scratch_ensure(uint64_t bytes, const char *what) {
         return NULL;
     }
     if (ptr) (void)cudaMemset(ptr, 0, (size_t)bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
     g_tt_scratch = ptr;
     g_tt_scratch_bytes = bytes;
     return g_tt_scratch;
@@ -844,6 +1420,164 @@ static int cuda_model_current_direct_available(const void *model_map) {
            (g_model_device_owned || g_model_registered);
 }
 
+static uint64_t cuda_parse_mib_env(const char *name, int *present) {
+    const char *env = getenv(name);
+    if (present) *present = 0;
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end != '\0') return 0;
+    if (present) *present = 1;
+    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
+    return (uint64_t)v * 1048576ull;
+}
+
+/* --------------------------------------------------------------------
+ * memgov D3-3b: the weight-resolve env vocabulary, read ONCE.
+ *
+ * Every knob the model-weight resolve graph consults -- tier selection,
+ * budgets, staging geometry, verbosity -- snapshots on first use and is
+ * never re-read: one vocabulary per boot, and the per-dispatch paths
+ * (cuda_derived_weight_ptr runs per matmul launch) stop paying an
+ * environ walk per call.  Parses are the legacy fragments moved, not
+ * rewritten.  Boot-once paths outside the resolve graph (prefetch,
+ * whole-model copy, artifact build) keep their own reads: env cannot
+ * change between those reads and this snapshot within one exec. */
+typedef struct {
+    /* tier selection */
+    int weight_cache;           /* DS4_CUDA_WEIGHT_CACHE set */
+    int weight_preload;         /* DS4_CUDA_WEIGHT_PRELOAD set */
+    int direct_model;           /* DS4_CUDA_DIRECT_MODEL set (fallback tier's test) */
+    int direct_model_nonempty;  /* ...set AND non-empty (range tier's stricter historical test) */
+    int no_fd_cache;            /* DS4_CUDA_NO_FD_CACHE set */
+    int verbose;                /* DS4_CUDA_WEIGHT_CACHE_VERBOSE set */
+    int keep_model_pages;       /* DS4_CUDA_KEEP_MODEL_PAGES set */
+    int vmm_arena_off;          /* DS4_CUDA_VMM_ARENA == "0" exactly */
+    int ipc_manifest;           /* DS4_CUDA_WEIGHT_IPC_MANIFEST set */
+    /* budgets + staging geometry (need-fit logic stays at the callers) */
+    uint64_t cache_limit_bytes; /* WEIGHT_CACHE_LIMIT_GB: 24 GiB default; present-unparseable = 0 (disables) */
+    uint64_t copy_chunk_bytes;  /* MODEL_COPY_CHUNK_MB: 64 MiB default, 16..4096 MiB clamp */
+    uint64_t arena_chunk_mb;    /* WEIGHT_ARENA_CHUNK_MB: 1792 default, 256..8192 clamp */
+    uint64_t vmm_chunk_mb;      /* VMM_ARENA_CHUNK_MB: 0 = match request, else 64..4096 clamp */
+    /* derived-weight + q8 cache family */
+    int no_derived;             /* DS4_CUDA_NO_DERIVED_WEIGHTS set */
+    int derived_verbose;        /* DS4_CUDA_DERIVED_WEIGHT_VERBOSE set */
+    int no_q8_f16_cache;
+    int q8_f16_all;
+    int no_attn_out_f16_cache;  /* DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE */
+    int no_attn_q_b_f16_cache;
+    int attn_out_preload;       /* DS4_CUDA_ATTENTION_OUTPUT_PRELOAD */
+    int no_q8_dp4a;
+    int no_q8_f32_cache;
+    int q8_f32_all;
+    int attn_q_b_f32_cache;
+    int q8_f32_large;
+    uint64_t q8_f16_limit_bytes;   /* Q8_F16_CACHE_MB: UINT64_MAX when unset/unparseable */
+    int q8_f16_reserve_present;    /* Q8_F16_CACHE_RESERVE_MB (total-dependent default stays at the caller) */
+    uint64_t q8_f16_reserve_bytes;
+} cuda_weight_env_t;
+
+static cuda_weight_env_t cuda_weight_env_read(void) {
+    cuda_weight_env_t e = {};
+    e.weight_cache = getenv("DS4_CUDA_WEIGHT_CACHE") != NULL;
+    e.weight_preload = getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL;
+    const char *direct = getenv("DS4_CUDA_DIRECT_MODEL");
+    e.direct_model = direct != NULL;
+    e.direct_model_nonempty = direct != NULL && direct[0] != '\0';
+    e.no_fd_cache = getenv("DS4_CUDA_NO_FD_CACHE") != NULL;
+    e.verbose = getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL;
+    e.keep_model_pages = getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL;
+    const char *vmm = getenv("DS4_CUDA_VMM_ARENA");
+    e.vmm_arena_off = vmm && vmm[0] == '0' && vmm[1] == '\0';
+    e.ipc_manifest = getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST") != NULL;
+    {
+        /* Default cap protects against OOM on UMA systems where a full
+         * ~80 GiB model would otherwise duplicate the mmap'd host pages
+         * into HBM-backed cudaMalloc allocations and exhaust the 121 GiB
+         * UMA pool.  24 GiB comfortably covers attn projections +
+         * embedding + output head + shared FFN; routed MoE experts
+         * (~65 GiB, only top-K active per token) fall back to the
+         * UVA-mapped pointer for cold lookups.  Tune up via
+         * DS4_CUDA_WEIGHT_CACHE_LIMIT_GB on hosts with more budget. */
+        uint64_t gb = 0;
+        const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env) gb = (uint64_t)v;
+            e.cache_limit_bytes = gb * 1073741824ull;
+        } else {
+            e.cache_limit_bytes = 24ull * 1073741824ull;
+        }
+    }
+    {
+        uint64_t mb = 64;
+        const char *env = getenv("DS4_CUDA_MODEL_COPY_CHUNK_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && v > 0) mb = (uint64_t)v;
+        }
+        if (mb < 16) mb = 16;
+        if (mb > 4096) mb = 4096;
+        e.copy_chunk_bytes = mb * 1048576ull;
+    }
+    {
+        uint64_t mb = 1792;
+        const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && v > 0) mb = (uint64_t)v;
+        }
+        if (mb < 256) mb = 256;
+        if (mb > 8192) mb = 8192;
+        e.arena_chunk_mb = mb;
+    }
+    {
+        uint64_t mb = 0;
+        const char *env = getenv("DS4_CUDA_VMM_ARENA_CHUNK_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && v > 0) mb = (uint64_t)v;
+        }
+        if (mb != 0) {
+            if (mb < 64) mb = 64;
+            if (mb > 4096) mb = 4096;
+        }
+        e.vmm_chunk_mb = mb;
+    }
+    e.no_derived = getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL;
+    e.derived_verbose = getenv("DS4_CUDA_DERIVED_WEIGHT_VERBOSE") != NULL;
+    e.no_q8_f16_cache = getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL;
+    e.q8_f16_all = getenv("DS4_CUDA_Q8_F16_ALL") != NULL;
+    e.no_attn_out_f16_cache = getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE") != NULL;
+    e.no_attn_q_b_f16_cache = getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") != NULL;
+    e.attn_out_preload = getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") != NULL;
+    e.no_q8_dp4a = getenv("DS4_CUDA_NO_Q8_DP4A") != NULL;
+    e.no_q8_f32_cache = getenv("DS4_CUDA_NO_Q8_F32_CACHE") != NULL;
+    e.q8_f32_all = getenv("DS4_CUDA_Q8_F32_ALL") != NULL;
+    e.attn_q_b_f32_cache = getenv("DS4_CUDA_ATTN_Q_B_F32_CACHE") != NULL;
+    e.q8_f32_large = getenv("DS4_CUDA_Q8_F32_LARGE") != NULL;
+    {
+        int present = 0;
+        const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
+        e.q8_f16_limit_bytes = present ? limit : UINT64_MAX;
+        e.q8_f16_reserve_bytes = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB",
+                                                    &e.q8_f16_reserve_present);
+    }
+    return e;
+}
+
+static const cuda_weight_env_t &cuda_weight_env(void) {
+    /* C++ magic static: thread-safe once-init -- the strict form of the
+     * g_vmm_supported lazy-cache idiom (resolve tiers run from server
+     * threads; the guard's acquire/release does the fencing). */
+    static const cuda_weight_env_t e = cuda_weight_env_read();
+    return e;
+}
+
 static int cuda_model_has_full_range(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     for (const cuda_model_range &r : g_model_ranges) {
@@ -858,26 +1592,26 @@ static void cuda_model_preserve_current_direct_mapping(void) {
 
     if (!cuda_model_has_full_range(g_model_host_base, g_model_registered_size)) {
         if (g_model_device_owned && g_model_device_base) {
-            g_model_ranges.push_back({
-                g_model_host_base,
-                0,
-                g_model_registered_size,
-                (char *)g_model_device_base,
-                NULL,
-                NULL,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0
-            });
-            g_model_range_by_offset[0] = g_model_ranges.size() - 1u;
-            g_model_range_bytes += g_model_registered_size;
+            if (cuda_model_range_publish({
+                    g_model_host_base,
+                    0,
+                    g_model_registered_size,
+                    (char *)g_model_device_base,
+                    NULL,
+                    NULL,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                })) {
+                g_model_range_bytes += g_model_registered_size;
+            }
         } else if (g_model_registered && g_model_device_base) {
-            g_model_ranges.push_back({
+            (void)cuda_model_range_publish({
                 g_model_host_base,
                 0,
                 g_model_registered_size,
@@ -893,7 +1627,6 @@ static void cuda_model_preserve_current_direct_mapping(void) {
                 0,
                 0
             });
-            g_model_range_by_offset[0] = g_model_ranges.size() - 1u;
         }
     }
 
@@ -909,13 +1642,33 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
                                                           uint64_t offset,
                                                           uint64_t bytes,
                                                           const char *what) {
+    /* memgov D2 hardening: the cold device-copy tier is a real promotion
+     * (unregistered device bytes), so it takes the same governed decision
+     * as the unit tiers.  Legacy verdict is ADMIT verbatim -- this tier
+     * historically had no gating ("caller is responsible for any policy
+     * gating"), so observe mode stays bit-identical.  A refusal degrades
+     * to the coherent mapped pointer where that is kernel-safe (integrated
+     * map), else NULL -- the caller's historical failure path. */
+    ds4_gov_claim mcl = {0};
+    mcl.requester = DS4_GOVC_ENGINE_BOOT;
+    mcl.memc = DS4_MEMC_WEIGHT_SPAN;
+    mcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    mcl.proposed_outstanding = g_model_range_bytes + bytes;
+    mcl.operation_transient = g_model_plan_frozen ? bytes : 0;
+    if (ds4_gov_governed_check("cold_materialize", &mcl, DS4_GOV_ADMIT)
+            != DS4_GOV_ADMIT) {
+        return cuda_model_direct_fallback_ptr(model_map, offset);
+    }
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
         fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
                 what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
-        return NULL;
+        /* Physical failure degrades exactly like a governed refusal
+         * (0998f5a's contract): mapped-serve where coherent, else the
+         * historical NULL. */
+        return cuda_model_direct_fallback_ptr(model_map, offset);
     }
 
     const char *src = (const char *)model_map + offset;
@@ -924,27 +1677,81 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
         err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
+            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s (serving mapped)\n",
                     what ? what : "weights",
                     (double)done / 1048576.0,
                     (double)bytes / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaFree(dev);
             (void)cudaGetLastError();
-            return NULL;
+            /* Probe-proven shape (rent-gate M leg, 08-14): the per-range
+             * register tier page-rounds its registrations, so a tiny
+             * neighbor tensor can land with its source STRADDLING a
+             * registration boundary -- its own registration fails with
+             * HostMemoryAlreadyRegistered (silent by design) and the
+             * cudaMemcpy here rejects the boundary-crossing source with
+             * invalid argument (kv_rms_weight, deterministic).  The raw
+             * coherent map serves any host range regardless of
+             * registration geometry; degrade, never dead-resolve. */
+            return cuda_model_direct_fallback_ptr(model_map, offset);
         }
     }
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0});
-    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_in_governed_materialize = 1;   /* claim taken above: funneled publication */
+    const int pub = cuda_model_range_publish({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0});
+    g_in_governed_materialize = 0;
+    if (!pub) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
     g_model_range_bytes += bytes;
+    cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_SPAN, DS4_MEMD_UNIFIED_DEVICE,
+                            bytes, bytes, model_map);
     cuda_substrate_cover(model_map, bytes);   /* tripwire: promotion materialized */
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (cuda_weight_env().verbose) {
         fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "weights",
                 (double)bytes / 1048576.0,
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return (const char *)dev;
+}
+
+/* Pure registry resolve (no side effects): the exact-hit candidate, then
+ * the ordered scans.  Two passes: device-resident copies must win over the
+ * whole-model registered mapping even though the registered range was
+ * pushed first (a single ordered scan returned the mapped pointer for
+ * every offset interior to a cached span, silently starving the HBM cache
+ * -- only exact span-start offsets ever hit it via the index).  NULL means
+ * "no registry answer"; the caller continues to the cold fallbacks.
+ * Shared by the live lookup and the D1a-1 parity probe, which differ only
+ * in WHICH index supplied the exact candidate. */
+static const char *cuda_model_range_resolve(const void *model_map,
+                                            uint64_t offset, uint64_t bytes,
+                                            const cuda_model_range *exact_r) {
+    const uint64_t end = offset + bytes;
+    if (exact_r && exact_r->host_base == model_map && end >= offset &&
+        bytes <= exact_r->bytes) {
+        return exact_r->device_ptr;
+    }
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && !r.host_registered &&
+            offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+            return r.device_ptr + (offset - r.offset);
+        }
+    }
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+            return r.device_ptr + (offset - r.offset);
+        }
+        if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
+            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
+            const uintptr_t h1 = h0 + bytes;
+            const uintptr_t r0 = (uintptr_t)r.registered_base;
+            const uintptr_t r1 = r0 + r.registered_bytes;
+            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
+        }
+    }
+    return NULL;
 }
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
@@ -966,46 +1773,40 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
      * tables (measured on plain decode at GB10).  Cache lookup runs first; the
      * registered-mapped shortcut below is the cold fallback when an allocation
      * hasn't been pre-populated. */
-    const uint64_t end = offset + bytes;
-    auto exact = g_model_range_by_offset.find(offset);
-    if (exact != g_model_range_by_offset.end()) {
-        const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
-    }
-    /* Two passes: device-resident copies must win over the whole-model
-     * registered mapping even though the registered range was pushed first
-     * (a single ordered scan returned the mapped pointer for every offset
-     * interior to a cached span, silently starving the HBM cache -- only
-     * exact span-start offsets ever hit it via the map above). */
-    for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && !r.host_registered &&
-            offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
-            return r.device_ptr + (offset - r.offset);
-        }
-    }
-    for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
-            return r.device_ptr + (offset - r.offset);
-        }
-        if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
-            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
-            const uintptr_t h1 = h0 + bytes;
-            const uintptr_t r0 = (uintptr_t)r.registered_base;
-            const uintptr_t r1 = r0 + r.registered_bytes;
-            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
-        }
-    }
+    const cuda_model_range *exact_r = NULL;
+    auto exact = g_model_range_by_offset.find(cuda_range_key{model_map, offset});
+    if (exact != g_model_range_by_offset.end())
+        exact_r = &g_model_ranges[exact->second];
+    const char *resolved = cuda_model_range_resolve(model_map, offset, bytes, exact_r);
+    if (resolved) return resolved;
 
+    const cuda_weight_env_t &we = cuda_weight_env();
     if (cuda_model_current_direct_available(model_map)) return cuda_model_ptr(model_map, offset);
     if (model_map == g_model_host_base && g_model_hmm_direct &&
-        getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
+        !we.weight_cache && !we.weight_preload) {
         return cuda_model_ptr(model_map, offset);
     }
-    const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
+    /* memgov D3-2: a TERMINAL host-mapped source on the coherent
+     * integrated map serves the raw ATS pointer HERE -- no promotion
+     * walk, no per-range registration, no API calls (capture-safe by
+     * construction).  The rent-gate M-leg forensics (08-14) showed why
+     * the register tier cannot be the mapped mechanism on this shape:
+     * page-rounded per-range registrations build a patchwork over the
+     * mmap, every later cold copy whose source intersects it fails
+     * 'invalid argument', and an unpublished fallback makes capture-time
+     * resolves re-walk the tiers into cudaMalloc-under-capture (poisoned
+     * decode graphs).  Registry hits above still win (imports, artifacts'
+     * derived ranges); discrete maps fall through to the register tier. */
+    {
+        const int msrc = cuda_mem_src_index(model_map);
+        if (msrc >= 0 && msrc < DS4_MSRC_MAX &&
+            g_model_srcs.v[msrc].residency == DS4_RESIDENCY_HOST_MAPPED &&
+            model_map == g_model_coherent_direct_map)
+            return cuda_model_ptr(model_map, offset);
+    }
+    if (we.direct_model_nonempty) return cuda_model_ptr(model_map, offset);
 
-    if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
+    if (!we.no_fd_cache) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) return fd_ptr;
     }
@@ -1027,9 +1828,13 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
                 char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
-                g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                if (!cuda_model_range_publish({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0})) {
+                    (void)cudaHostUnregister((void *)reg_addr);
+                    cuda_pinned_file_note_unregister((void *)reg_addr);
+                    (void)cudaGetLastError();
+                    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
+                }
+                if (we.verbose) {
                     fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
                             what ? what : "weights",
                             (double)bytes / 1048576.0);
@@ -1089,7 +1894,8 @@ static char *cuda_derived_weight_ptr(
         uint32_t group_count,
         uint64_t bytes,
         const char *label) {
-    if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) return NULL;
+    const cuda_weight_env_t &we = cuda_weight_env();
+    if (we.no_derived) return NULL;
     for (const cuda_derived_range &r : g_derived_ranges) {
         if (r.host_base == model_map &&
             r.source_offset == source_offset &&
@@ -1099,7 +1905,7 @@ static char *cuda_derived_weight_ptr(
             r.out_dim == out_dim &&
             r.group_count == group_count &&
             bytes <= r.bytes) {
-            if (getenv("DS4_CUDA_DERIVED_WEIGHT_VERBOSE") != NULL) {
+            if (we.derived_verbose) {
                 fprintf(stderr, "ds4: CUDA derived weight hit %s %.2f MiB\n",
                         label ? label : "derived",
                         (double)r.bytes / 1048576.0);
@@ -1111,6 +1917,25 @@ static char *cuda_derived_weight_ptr(
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
+    /* D1a-1: one bulk class note (unchanged shape) + per-source rows
+     * summed from the live ranges -- each range's alloc attributed by
+     * host_base, so the rows mirror the cell exactly.  Runs mid-serving
+     * too (cuBLAS-failure disable path), not just at teardown. */
+    uint64_t by_src[DS4_MSRC_MAX + 1] = {0};
+    for (const cuda_q8_f16_range &r : g_q8_f16_ranges)
+        by_src[cuda_mem_src_index(r.host_base)] +=
+            r.in_dim * r.out_dim * sizeof(__half);
+    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    ds4_mem_cell_note_free(
+        &g_mem_census[DS4_MEMC_WEIGHT_DERIVED][DS4_MEMD_UNIFIED_DEVICE],
+        g_q8_f16_bytes, g_q8_f16_bytes, &g_mem_census_faults);
+    for (int s = 0; s <= DS4_MSRC_MAX; s++) {
+        if (by_src[s] == 0) continue;
+        ds4_mem_cell_note_free(
+            &g_mem_src_census[s][DS4_MEMC_WEIGHT_DERIVED][DS4_MEMD_UNIFIED_DEVICE],
+            by_src[s], by_src[s], &g_mem_census_faults);
+    }
+    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -1119,28 +1944,13 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_bytes = 0;
 }
 
-static uint64_t cuda_parse_mib_env(const char *name, int *present) {
-    const char *env = getenv(name);
-    if (present) *present = 0;
-    if (!env || !env[0]) return 0;
-    char *end = NULL;
-    unsigned long long v = strtoull(env, &end, 10);
-    if (end == env || *end != '\0') return 0;
-    if (present) *present = 1;
-    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
-    return (uint64_t)v * 1048576ull;
-}
-
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
-    int present = 0;
-    const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
-    return present ? limit : UINT64_MAX;
+    return cuda_weight_env().q8_f16_limit_bytes;
 }
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
-    int present = 0;
-    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", &present);
-    if (present) return reserve;
+    const cuda_weight_env_t &we = cuda_weight_env();
+    if (we.q8_f16_reserve_present) return we.q8_f16_reserve_bytes;
 
     if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
         return 512ull * 1048576ull;
@@ -1162,7 +1972,7 @@ static void cuda_q8_f16_cache_budget_notice(
         uint64_t total_bytes,
         uint64_t reserve_bytes,
         uint64_t limit_bytes) {
-    if (g_q8_f16_budget_notice_printed && getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") == NULL) return;
+    if (g_q8_f16_budget_notice_printed && !cuda_weight_env().verbose) return;
     g_q8_f16_budget_notice_printed = 1;
     if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
         fprintf(stderr,
@@ -1246,20 +2056,21 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
 }
 
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+    const cuda_weight_env_t &we = cuda_weight_env();
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
-    if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+    if (we.no_q8_f16_cache) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
-    if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
+    if (we.q8_f16_all) return 1;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
         strstr(label, "attn_output_b") != NULL ||
         strstr(label, "attention_output_a") != NULL ||
         strstr(label, "attention_output_b") != NULL) {
-        return getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE") == NULL;
+        return !we.no_attn_out_f16_cache;
     }
     if (strstr(label, "attn_q_b") != NULL) {
-        return getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL;
+        return !we.no_attn_q_b_f16_cache;
     }
     if (strstr(label, "ffn_gate_shexp") != NULL ||
         strstr(label, "ffn_up_shexp") != NULL ||
@@ -1270,7 +2081,7 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
            (in_dim == 2048u && out_dim == 4096u) ||
            (in_dim == 4096u && out_dim == 1024u) ||
            (in_dim == 4096u && out_dim == 512u) ||
-           (getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL &&
+           (!we.no_attn_q_b_f16_cache &&
             in_dim == 1024u && out_dim == 32768u);
 }
 
@@ -1289,25 +2100,26 @@ static int cuda_q8_label_is_attention_output_b(const char *label) {
 }
 
 static int cuda_q8_use_dp4a(void) {
-    return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
+    return !cuda_weight_env().no_q8_dp4a;
 }
 
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+    const cuda_weight_env_t &we = cuda_weight_env();
     if (cuda_q8_label_is_attention_output(label) &&
-        getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
-        getenv("DS4_CUDA_Q8_F16_ALL") == NULL) {
+        !we.attn_out_preload && !we.q8_f16_all) {
         return 0;
     }
     return cuda_q8_f16_cache_allowed(label, in_dim, out_dim);
 }
 
 static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
-    if (getenv("DS4_CUDA_NO_Q8_F32_CACHE") != NULL) return 0;
-    if (getenv("DS4_CUDA_Q8_F32_ALL") != NULL) return 1;
+    const cuda_weight_env_t &we = cuda_weight_env();
+    if (we.no_q8_f32_cache) return 0;
+    if (we.q8_f32_all) return 1;
     if (label && strstr(label, "attn_q_b") != NULL) {
-        return getenv("DS4_CUDA_ATTN_Q_B_F32_CACHE") != NULL;
+        return we.attn_q_b_f32_cache;
     }
-    return getenv("DS4_CUDA_Q8_F32_LARGE") != NULL &&
+    return we.q8_f32_large &&
            in_dim == 1024u && out_dim == 32768u;
 }
 
@@ -1318,7 +2130,7 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t in_dim,
         uint64_t out_dim,
         const char *label) {
-    auto exact = g_q8_f16_by_offset.find(offset);
+    auto exact = g_q8_f16_by_offset.find(cuda_range_key{model_map, offset});
     if (exact != g_q8_f16_by_offset.end()) {
         const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
         if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
@@ -1365,10 +2177,14 @@ static const __half *cuda_q8_f16_ptr(
         cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
         return NULL;
     }
-    g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
-    g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
+    if (!cuda_q8_f16_publish({model_map, offset, weight_bytes, in_dim, out_dim, dev})) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
     g_q8_f16_bytes += out_bytes;
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
+                            out_bytes, out_bytes, model_map);
+    if (cuda_weight_env().verbose) {
         fprintf(stderr, "ds4: CUDA cached q8 fp16 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
                 (double)g_q8_f16_bytes / 1073741824.0);
@@ -1383,7 +2199,7 @@ static float *cuda_q8_f32_ptr(
         uint64_t in_dim,
         uint64_t out_dim,
         const char *label) {
-    auto exact = g_q8_f32_by_offset.find(offset);
+    auto exact = g_q8_f32_by_offset.find(cuda_range_key{model_map, offset});
     if (exact != g_q8_f32_by_offset.end()) {
         const cuda_q8_f32_range &r = g_q8_f32_ranges[exact->second];
         if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
@@ -1427,10 +2243,14 @@ static float *cuda_q8_f32_ptr(
         (void)cudaFree(dev);
         return NULL;
     }
-    g_q8_f32_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
-    g_q8_f32_by_offset[offset] = g_q8_f32_ranges.size() - 1u;
+    if (!cuda_q8_f32_publish({model_map, offset, weight_bytes, in_dim, out_dim, dev})) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
     g_q8_f32_bytes += out_bytes;
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_DERIVED, DS4_MEMD_UNIFIED_DEVICE,
+                            out_bytes, out_bytes, model_map);
+    if (cuda_weight_env().verbose) {
         fprintf(stderr, "ds4: CUDA cached q8 fp32 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
                 (double)g_q8_f32_bytes / 1073741824.0);
@@ -1496,16 +2316,24 @@ extern "C" int ds4_gpu_decode_scalars_init(void) {
         g_decode_host = NULL;
         return 0;
     }
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                        sizeof(*g_decode_host), sizeof(*g_decode_host));
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                        sizeof(*g_decode_host), sizeof(*g_decode_host));
     return 1;
 }
 
 extern "C" void ds4_gpu_decode_scalars_cleanup(void) {
     if (g_decode_dev != NULL) {
         cudaFree(g_decode_dev);
+        cuda_mem_note_free(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                           sizeof(*g_decode_host), sizeof(*g_decode_host));
         g_decode_dev = NULL;
     }
     if (g_decode_host != NULL) {
         cudaFreeHost(g_decode_host);
+        cuda_mem_note_free(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                           sizeof(*g_decode_host), sizeof(*g_decode_host));
         g_decode_host = NULL;
     }
 }
@@ -1722,17 +2550,27 @@ extern "C" int ds4_gpu_decode_layer_scalars_init(void) {
         return 0;
     }
     g_layer_dev_idx = 0;
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                        2u * bytes, 2u * bytes);
     return 1;
 }
 
 extern "C" void ds4_gpu_decode_layer_scalars_cleanup(void) {
+    const size_t bytes = (size_t)DS4_LAYER_SCALARS_COUNT *
+                         sizeof(struct ds4_layer_scalars);
     if (g_layer_dev != NULL) {
         cudaFree(g_layer_dev);
+        cuda_mem_note_free(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                           bytes, bytes);
         g_layer_dev = NULL;
     }
     for (int b = 0; b < 2; ++b) {
         if (g_layer_host[b] != NULL) {
             cudaFreeHost(g_layer_host[b]);
+            cuda_mem_note_free(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                               bytes, bytes);
             g_layer_host[b] = NULL;
         }
     }
@@ -1855,6 +2693,10 @@ extern "C" int ds4_gpu_decode_row_scalars_init(void) {
         return 0;
     }
     g_row_dev_idx = 0;
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCALARS_MIRROR, DS4_MEMD_PINNED_HOST,
+                        2u * bytes, 2u * bytes);
     return 1;
 }
 
@@ -1892,8 +2734,7 @@ static double cuda_wall_sec(void) {
 }
 
 static int cuda_model_load_progress_enabled(void) {
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) return 0;
-    return 1;
+    return !cuda_weight_env().verbose;
 }
 
 static void cuda_model_load_progress_reset(void) {
@@ -2022,21 +2863,12 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
 }
 
 static uint64_t cuda_model_copy_chunk_bytes(void) {
-    uint64_t mb = 64;
-    const char *env = getenv("DS4_CUDA_MODEL_COPY_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 16) mb = 16;
-    if (mb > 4096) mb = 4096;
-    return mb * 1048576ull;
+    return cuda_weight_env().copy_chunk_bytes;
 }
 
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
-#if defined(MADV_DONTNEED)
-    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
+#if defined(POSIX_MADV_DONTNEED)
+    if (cuda_weight_env().keep_model_pages || !model_map || bytes == 0 || offset > model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -2055,7 +2887,7 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    if (g_model_fd < 0 || cuda_weight_env().keep_model_pages || bytes == 0) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
@@ -2081,8 +2913,11 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
     return (void *)(((p + a - 1u) / a) * a);
 }
 
-static int cuda_model_stage_pool_alloc(uint64_t bytes) {
-    if (g_model_stage_bytes >= bytes) return 1;
+/* memgov D1b-2 fix: release the pinned staging slots.  The eager pass
+ * calls this when its pass ends so no pinned residue survives to the
+ * bank fit (the pre-D1b walk had none); the lazy tier re-allocates on
+ * its first miss through the normal grow path below. */
+static void cuda_model_stage_pool_release(void) {
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -2090,11 +2925,20 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
         if (g_model_stage_raw[i]) {
             (void)cudaFreeHost(g_model_stage_raw[i]);
+            cuda_mem_note_free(DS4_MEMC_STAGE_PIN, DS4_MEMD_PINNED_HOST,
+                               g_mem_stage_slot_bytes[i],
+                               g_mem_stage_slot_bytes[i]);
+            g_mem_stage_slot_bytes[i] = 0;
             g_model_stage_raw[i] = NULL;
             g_model_stage[i] = NULL;
         }
     }
     g_model_stage_bytes = 0;
+}
+
+static int cuda_model_stage_pool_alloc(uint64_t bytes) {
+    if (g_model_stage_bytes >= bytes) return 1;
+    cuda_model_stage_pool_release();
     if (!g_model_upload_stream) {
         cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
         if (err != cudaSuccess) {
@@ -2110,6 +2954,9 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
             (void)cudaGetLastError();
             return 0;
         }
+        cuda_mem_note_alloc(DS4_MEMC_STAGE_PIN, DS4_MEMD_PINNED_HOST,
+                            bytes, bytes);
+        g_mem_stage_slot_bytes[i] = bytes;
         g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], g_model_direct_align);
         err = cudaEventCreateWithFlags(&g_model_stage_event[i], cudaEventDisableTiming);
         if (err != cudaSuccess) {
@@ -2158,7 +3005,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             }
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                if (cuda_weight_env().verbose) {
                     fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n", strerror(direct_errno));
                 }
                 (void)close(g_model_direct_fd);
@@ -2175,22 +3022,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 }
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
-    uint64_t gb = 0;
-    const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env) gb = (uint64_t)v;
-        return gb * 1073741824ull;
-    }
-    /* Default cap protects against OOM on UMA systems where a full ~80 GiB
-     * model would otherwise duplicate the mmap'd host pages into HBM-backed
-     * cudaMalloc allocations and exhaust the 121 GiB UMA pool.  24 GiB
-     * comfortably covers attn projections + embedding + output head +
-     * shared FFN; routed MoE experts (~65 GiB, only top-K active per token)
-     * fall back to the UVA-mapped pointer for cold lookups.  Tune up via
-     * DS4_CUDA_WEIGHT_CACHE_LIMIT_GB on hosts with more memory budget. */
-    return 24ull * 1073741824ull;
+    return cuda_weight_env().cache_limit_bytes;
 }
 
 /* True iff model_map's expert raws were REPLACED by complete in-process
@@ -2211,17 +3043,13 @@ static int cuda_model_map_replaces_complete(const void *model_map) {
     return 0;
 }
 
+/* memgov D1a-3: the unit compiler's policy-provenance input. */
+extern "C" int ds4_gpu_model_map_replaces_complete(const void *model_map) {
+    return cuda_model_map_replaces_complete(model_map);
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 1792;
-    const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 256) mb = 256;
-    if (mb > 8192) mb = 8192;
-    uint64_t bytes = mb * 1048576ull;
+    uint64_t bytes = cuda_weight_env().arena_chunk_mb * 1048576ull;
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);
@@ -2238,9 +3066,9 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
 // caller transparently falls back to the cudaMalloc arena below.
 static int cuda_vmm_arena_supported(void) {
     if (g_vmm_supported != -1) return g_vmm_supported;
-    const char *off = getenv("DS4_CUDA_VMM_ARENA");
-    if (off && off[0] == '0' && off[1] == '\0') { g_vmm_supported = 0; return 0; }
-    if (getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST")) { g_vmm_supported = 0; return 0; }
+    const cuda_weight_env_t &we = cuda_weight_env();
+    if (we.vmm_arena_off) { g_vmm_supported = 0; return 0; }
+    if (we.ipc_manifest) { g_vmm_supported = 0; return 0; }
     if (!driver_ok(cuInit(0), "init for VMM probe")) { g_vmm_supported = 0; return 0; }
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); g_vmm_supported = 0; return 0; }
@@ -2266,7 +3094,7 @@ static int cuda_vmm_arena_supported(void) {
     g_vmm_supported = 1;
     int integrated = 0;
     (void)cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (we.verbose) {
         fprintf(stderr,
                 "ds4: CUDA VMM arena enabled (integrated=%d granularity=%llu)\n",
                 integrated, (unsigned long long)g_vmm_granularity);
@@ -2285,18 +3113,7 @@ static int cuda_vmm_arena_supported(void) {
 // users coalesce small allocations into fewer VMM mappings if the
 // driver's per-process mapping limit becomes a concern.
 static uint64_t cuda_vmm_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 0;
-    const char *env = getenv("DS4_CUDA_VMM_ARENA_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb != 0) {
-        if (mb < 64) mb = 64;
-        if (mb > 4096) mb = 4096;
-    }
-    uint64_t bytes = mb * 1048576ull;
+    uint64_t bytes = cuda_weight_env().vmm_chunk_mb * 1048576ull;
     if (bytes < need) bytes = need;
     if (g_vmm_granularity > 1) {
         const uint64_t g = g_vmm_granularity;
@@ -2310,7 +3127,8 @@ static uint64_t cuda_vmm_arena_chunk_bytes(uint64_t need) {
 // cudaMalloc arena. Read-only PROT for the mapped range; weight upload
 // happens through a separate PROT_READWRITE alias the caller obtains by
 // running the same pinned-staged copy path the cudaMalloc arena uses.
-static char *cuda_vmm_arena_alloc(uint64_t bytes, const char *what) {
+static char *cuda_vmm_arena_alloc(const void *model_map, uint64_t bytes,
+                                  const char *what) {
     if (bytes == 0) return NULL;
     if (!cuda_vmm_arena_supported()) return NULL;
     const uint64_t align = 256u;
@@ -2322,6 +3140,9 @@ static char *cuda_vmm_arena_alloc(uint64_t bytes, const char *what) {
         if (used_aligned <= a.alloc_bytes && aligned <= a.alloc_bytes - used_aligned) {
             char *ptr = (char *)(uintptr_t)(a.va + used_aligned);
             a.used = used_aligned + aligned;
+            cuda_mem_note_alloc_srcidx(DS4_MEMC_WEIGHT_ARENA,
+                                       DS4_MEMD_UNIFIED_DEVICE,
+                                       aligned, 0, a.src);
             return ptr;
         }
     }
@@ -2382,9 +3203,12 @@ static char *cuda_vmm_arena_alloc(uint64_t bytes, const char *what) {
     a.va = va;
     a.alloc_bytes = chunk_bytes;
     a.used = aligned;
+    a.src = cuda_mem_src_index(model_map);
     g_vmm_arenas.push_back(a);
+    cuda_mem_note_alloc_srcidx(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
+                               aligned, chunk_bytes, a.src);
 
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (cuda_weight_env().verbose) {
         uint64_t total = 0;
         for (const cuda_vmm_arena &it : g_vmm_arenas) total += it.alloc_bytes;
         fprintf(stderr,
@@ -2404,6 +3228,8 @@ static void cuda_vmm_arenas_release_all(void) {
             (void)cuMemAddressFree(a.va, (size_t)a.alloc_bytes);
         }
         if (a.handle) (void)cuMemRelease(a.handle);
+        cuda_mem_note_free_srcidx(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
+                                  a.used, a.alloc_bytes, a.src);
     }
     g_vmm_arenas.clear();
 }
@@ -2469,7 +3295,8 @@ static cuda_vmm_demand *cuda_vmm_demand_find(const void *p, uint64_t offset, uin
     return NULL;
 }
 
-static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
+static char *cuda_model_arena_alloc(const void *model_map, uint64_t bytes,
+                                    const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
@@ -2480,6 +3307,9 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         if (used <= a.bytes && aligned <= a.bytes - used) {
             char *ptr = a.device_ptr + used;
             a.used = used + aligned;
+            cuda_mem_note_alloc_srcidx(DS4_MEMC_WEIGHT_ARENA,
+                                       DS4_MEMD_UNIFIED_DEVICE,
+                                       aligned, 0, a.src);
             return ptr;
         }
     }
@@ -2499,8 +3329,13 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         g_model_cache_full = 1;
         return NULL;
     }
-    g_model_arenas.push_back({(char *)dev, chunk, aligned});
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    g_model_arenas.push_back({(char *)dev, chunk, aligned,
+                              cuda_mem_src_index(model_map)});
+    /* Census: chunk commit + this call's bump.  Bump asks accumulate on
+     * `requested`; the chunk's rounding tail is the cell's slack. */
+    cuda_mem_note_alloc_srcidx(DS4_MEMC_WEIGHT_ARENA, DS4_MEMD_UNIFIED_DEVICE,
+                               aligned, chunk, g_model_arenas.back().src);
+    if (cuda_weight_env().verbose) {
         uint64_t arena_bytes = 0;
         for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
         fprintf(stderr, "ds4: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
@@ -2516,55 +3351,46 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
 static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
     if (cuda_model_current_direct_available(model_map) ||
         (model_map == g_model_host_base && g_model_hmm_direct) ||
-        getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+        (model_map && model_map == g_model_coherent_direct_map) ||
+        cuda_weight_env().direct_model) {
         return cuda_model_ptr(model_map, offset);
     }
     return NULL;
 }
 
-static const char *cuda_model_range_ptr_from_fd(
-        const void *model_map,
-        uint64_t offset,
-        uint64_t bytes,
-        const char *what) {
-    if (g_model_fd < 0 || bytes == 0) return NULL;
-    // fd-cache reads from g_model_fd at `offset`. The fd belongs to the model
-    // that was registered first via set_model_map after set_model_fd; using it
-    // for any other model_map would read bytes from the wrong file. Refuse and
-    // let the caller fall through to the cudaMemcpy path (which dereferences
-    // `model_map + offset` directly, the correct host pointer for any
-    // registered mmap).
-    if (g_model_fd_host_base && model_map != g_model_fd_host_base) return NULL;
-    const uint64_t limit = cuda_model_map_replaces_complete(model_map)
-        ? UINT64_MAX
-        : cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
-        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-            fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
-                    what ? what : "weights",
-                    (double)bytes / 1048576.0,
-                    (double)limit / 1073741824.0);
-        }
-        return cuda_model_direct_fallback_ptr(model_map, offset);
-    }
-
-    // Prefer the VMM arena when supported: same backing storage the
-    // ds4_weight_server uses, gives us 2 MiB device pages and a 1.7-2.0x
-    // prefill win on PRO 6000. Hard-gated off when the sidecar is in use
-    // (DS4_CUDA_WEIGHT_IPC_MANIFEST), soft-gated by DS4_CUDA_VMM_ARENA=0.
-    // On any driver error during allocation we transparently retry via the
-    // existing cudaMalloc arena, so this is never a correctness regression.
-    char *dev = cuda_vmm_arena_alloc(bytes, what);
-    if (!dev) dev = cuda_model_arena_alloc(bytes, what);
-    if (!dev) {
-        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
-        return cuda_model_direct_fallback_ptr(model_map, offset);
-    }
+/* --------------------------------------------------------------------
+ * memgov D1b-1: ONE staged upload pipeline (plan §5.4).
+ *
+ * Both promotion modes copy source bytes into a device carve through
+ * the same 4-slot pinned staging pipeline; the source fill is the only
+ * per-map difference: fd reads for the map that owns g_model_fd, a
+ * host-pointer memcpy from the mapped file for every other map — which
+ * the fd tier could never serve.
+ *
+ * `direct_discard` selects the SOURCE MODE — the two behaviors are
+ * policy-coupled by design:
+ *   0 (eager default): memcpy FROM THE MAP, no discard — the pre-D1b
+ *     walk's exact mechanism, so the boot faults MAPPED file pages and
+ *     the MemAvailable trajectory the bank fit samples mid-boot is
+ *     control-identical by construction.  The D1b-2 close probes
+ *     measured both alternatives deflating the fit input: O_DIRECT
+ *     leaves no page-cache credit at all (~0.8 GiB, ~2 banks), and
+ *     buffered preads fill UNMAPPED cache that MemAvailable credits
+ *     less than mapped file pages (~0.4 GiB residual).
+ *   1 (lazy always; eager under DS4_CUDA_EAGER_SOURCE_DISCARD): fd reads
+ *     (O_DIRECT when available) + per-chunk source-page discard — the
+ *     lazy tier's historical behavior, and the F4 measured mode for
+ *     eager.
+ * Registered support-map pages are pinned and are never madvised. */
+static int cuda_stage_copy_to_dev(const void *model_map, uint64_t offset,
+                                  uint64_t bytes, char *dev,
+                                  int direct_discard, const char *what) {
+    const int fd_source = g_model_fd >= 0 && g_model_fd_host_base &&
+                          model_map == g_model_fd_host_base;
     cudaError_t err = cudaSuccess;
-
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return 0;
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
@@ -2577,17 +3403,25 @@ static const char *cuda_model_range_ptr_from_fd(
                 fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(err));
                 (void)cudaGetLastError();
-                return NULL;
+                return 0;
             }
         }
         const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
-                                   offset + copied, n, &payload)) {
-            fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
-                    what ? what : "weights",
-                    (double)copied / 1048576.0,
-                    strerror(errno));
-            return NULL;
+        if (fd_source && direct_discard) {
+            if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+                                       offset + copied, n, &payload)) {
+                fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
+                        what ? what : "weights",
+                        (double)copied / 1048576.0,
+                        strerror(errno));
+                return 0;
+            }
+        } else {
+            /* Map source: faults MAPPED file pages, the pre-D1b walk's
+             * exact cache shape (the fit-time credit, see above). */
+            memcpy(g_model_stage[bi],
+                   (const char *)model_map + offset + copied, (size_t)n);
+            payload = (const char *)g_model_stage[bi];
         }
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice, g_model_upload_stream);
@@ -2597,17 +3431,19 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
-            return NULL;
+            return 0;
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
             (void)cudaGetLastError();
-            return NULL;
+            return 0;
         }
-        cuda_model_drop_file_pages(offset + copied, n);
-        cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
+        if (direct_discard && fd_source) {
+            cuda_model_drop_file_pages(offset + copied, n);
+            cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
+        }
         copied += n;
         cuda_model_load_progress_note(g_model_range_bytes + copied);
         chunk_idx++;
@@ -2617,21 +3453,227 @@ static const char *cuda_model_range_ptr_from_fd(
         fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
         (void)cudaGetLastError();
-        return NULL;
+        return 0;
     }
+    return 1;
+}
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0});
-    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-    g_model_range_bytes += bytes;
-    cuda_substrate_cover(model_map, bytes);   /* tripwire: fd promotion materialized */
+/* --------------------------------------------------------------------
+ * memgov D1b-1: the canonical materializer (plan §5.4).
+ *
+ * Typed per-unit outcomes; ONE publication per unit (every device-copy
+ * range stamps unit_lo == unit_hi by construction).  Plan decisions —
+ * policy, coverage, budget funding — belong to the caller; the copy
+ * transaction below is purely physical.  The outcome vocabulary is the
+ * PUBLIC ds4_residency_unit_state (ds4_mem_census.h, memgov D5-2; the
+ * former engine-private CUDA_MAT_* enum retired into it verbatim:
+ * LAZY_DEFERRED = source residency lazy, the eager pass defers to first
+ * touch by SCHEDULE vs the budget's unfunded REFUSAL of the same
+ * deferral (D3-2); EXPERT_COLD_BY_POLICY = fd-tier touch on a unit the
+ * catalog stamps cold by POLICY, never device-promoted (D3-4)).
+ *
+ * memgov D5-2: outcome counters keyed by the SOURCE's resolved residency
+ * policy (+ the unattributed row), read by the porcelains through
+ * ds4_gpu_residency_units_read.  FAILED outcomes additionally attribute
+ * {model_role, stage} for ds4_residency_failures_total.  Plain monotonic
+ * counters (metrics-registry discipline), no epoch bracket. */
+static uint64_t g_materialize_outcomes[DS4_RESUNIT_POLICY_ROWS][DS4_RESUNIT__COUNT];
+static uint64_t g_residency_failures[DS4_MSRC_ROLE__COUNT][DS4_RESSTAGE__COUNT];
+
+/* One tick funnel: src < 0 (or a bad policy byte) lands in the
+ * unattributed row, never dropped -- totals preserved by construction. */
+static void cuda_resunit_note_n(int src, int oc, uint64_t n) {
+    int pol = DS4_RESIDENCY__COUNT;
+    if (src >= 0 && src < DS4_MSRC_MAX) {
+        const int r = g_model_srcs.v[src].residency;
+        if (r >= 0 && r < DS4_RESIDENCY__COUNT) pol = r;
+    }
+    if (oc >= 0 && oc < DS4_RESUNIT__COUNT)
+        g_materialize_outcomes[pol][oc] += n;
+}
+
+static void cuda_resunit_fail_note_n(int src, int stage, uint64_t n) {
+    int role = DS4_MSRC_ROLE_PRIMARY;
+    if (src >= 0 && src < DS4_MSRC_MAX) {
+        const int r = g_model_srcs.v[src].role;
+        if (r >= 0 && r < DS4_MSRC_ROLE__COUNT) role = r;
+    }
+    if (stage >= 0 && stage < DS4_RESSTAGE__COUNT)
+        g_residency_failures[role][stage] += n;
+}
+
+/* memgov D5-2: porcelain readers.  Nonzero = out of the fixed domain
+ * (the absence answer on backends that keep no plan is the Metal/CPU
+ * stub's, mirroring the census read contract). */
+extern "C" int ds4_gpu_residency_units_read(int policy, int state,
+                                            uint64_t *out) {
+    if (!out || policy < 0 || policy >= DS4_RESUNIT_POLICY_ROWS ||
+        state < 0 || state >= DS4_RESUNIT__COUNT) return 1;
+    *out = g_materialize_outcomes[policy][state];
+    return 0;
+}
+
+extern "C" int ds4_gpu_residency_failures_read(int role, int stage,
+                                               uint64_t *out) {
+    if (!out || role < 0 || role >= DS4_MSRC_ROLE__COUNT ||
+        stage < 0 || stage >= DS4_RESSTAGE__COUNT) return 1;
+    *out = g_residency_failures[role][stage];
+    return 0;
+}
+
+/* Copy ONE funded unit into an arena carve and publish it.  Failure
+ * leaves any carve behind (bump arenas cannot un-carve) — the census
+ * already holds it as arena slack: the transactional-residue rule, same
+ * as the fd tier's precedent.  VMM arena preferred when supported: same
+ * backing storage the ds4_weight_server uses, 2 MiB device pages,
+ * 1.7-2.0x prefill on PRO 6000; hard-gated off under an IPC manifest,
+ * transparent cudaMalloc-arena retry on driver errors. */
+static int cuda_unit_materialize_copy(const void *model_map,
+                                      const ds4_phys_unit *u,
+                                      int direct_discard, const char *what) {
+    char *dev = cuda_vmm_arena_alloc(model_map, u->src_bytes, what);
+    if (!dev) dev = cuda_model_arena_alloc(model_map, u->src_bytes, what);
+    if (!dev) return DS4_RESUNIT_FAILED;
+    if (!cuda_stage_copy_to_dev(model_map, u->src_off, u->src_bytes, dev,
+                                direct_discard, what))
+        return DS4_RESUNIT_FAILED;
+    /* memgov D2-2: a claimed promotion path; the funnel's post-freeze
+     * tripwire keys on the marker (no early return between set and
+     * clear: publish is the next call). */
+    g_in_governed_materialize = 1;
+    const int pub = cuda_model_range_publish({model_map, u->src_off,
+                                              u->src_bytes, dev,
+                                              NULL, NULL, 0, 0, 1, 0, 0,
+                                              0, 0, 0});
+    g_in_governed_materialize = 0;
+    if (!pub) return DS4_RESUNIT_FAILED;
+    g_model_range_bytes += u->src_bytes;
+    cuda_substrate_cover(model_map, u->src_bytes);   /* tripwire: unit materialized */
     cuda_model_load_progress_note(g_model_range_bytes);
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA fd-cached %s %.2f MiB (total %.2f GiB)\n",
-                what ? what : "weights",
-                (double)bytes / 1048576.0,
+    if (cuda_weight_env().verbose) {
+        fprintf(stderr, "ds4: CUDA materialized %s %.2f MiB (total %.2f GiB)\n",
+                what ? what : "unit",
+                (double)u->src_bytes / 1048576.0,
                 (double)g_model_range_bytes / 1073741824.0);
     }
-    return (const char *)dev;
+    return DS4_RESUNIT_POPULATED;
+}
+
+/* memgov D1b-2: the LAZY pass materializes CONTAINING UNITS through the
+ * same core as the eager pass — arbitrary-extent promotions cease to
+ * exist.  Eligibility is the historical fd tier's, unchanged: fd-owner
+ * base map only (any other map would read bytes from the wrong file —
+ * the caller falls through to the registered-mapping/populate tiers,
+ * whose host pointers are correct for every mmap), per-unit budget fit,
+ * source-page discard always on (the historical lazy behavior; the
+ * D1b-1 gate applies to the EAGER pass only).  Requests never straddle
+ * units on live paths (a unit boundary never splits a tensor, and
+ * consumers request within tensors); a theoretical multi-unit span
+ * materializes its units and then falls through to the mapped tiers if
+ * the re-resolve still misses (no contiguity across carves) — the same
+ * degradation the funnel-refusal path already takes.  No bound table =
+ * no lazy promotion (plan-first: a range that exists is a range the
+ * plan knows). */
+static const char *cuda_model_range_ptr_from_fd(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what) {
+    if (g_model_fd < 0 || bytes == 0) return NULL;
+    if (g_model_fd_host_base && model_map != g_model_fd_host_base) return NULL;
+    const int src = cuda_mem_src_index(model_map);
+    const ds4_phys_unit *units =
+        (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_v[src] : NULL;
+    const uint32_t nu =
+        (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_n[src] : 0;
+    if (!units || nu == 0) return NULL;
+    int lo = -1, hi = -1;
+    ds4_units_span_of(units, nu, offset, bytes, &lo, &hi);
+    if (lo < 0) return NULL;
+    const uint64_t limit = cuda_model_map_replaces_complete(model_map)
+        ? UINT64_MAX
+        : cuda_model_cache_limit_bytes();
+    for (int ui = lo; ui <= hi; ui++) {
+        const ds4_phys_unit *u = &units[ui];
+        /* memgov D3-2: HOST_MAPPED is a TERMINAL policy -- mapped units
+         * are lazy-INELIGIBLE (the D3-0 finding: this loop was policy-
+         * blind, so a single-lever NO_HBM boot device-promoted the very
+         * bytes the stamp said stay mapped).  NULL, not the direct
+         * fallback: the per-range register tier is the mapped serving
+         * mechanism, same as the legacy pair produced.  EXPERT_COLD
+         * eligibility is deliberately untouched (bug-for-bug; its own
+         * adjudication rides D3-4). */
+        if (u->policy == DS4_UPOL_HOST_MAPPED) {
+            cuda_resunit_note_n(src, DS4_RESUNIT_HOST_MAPPED_BY_POLICY, 1);
+            return NULL;
+        }
+        /* memgov D3-4 adjudication: EXPERT_COLD stays cold by POLICY,
+         * not by budget accident.  Historically this loop device-
+         * promoted raw experts on first touch until the 24 GiB budget
+         * exhausted, THEN degraded -- an unplanned multi-GiB device
+         * charge that only ever ran on already-degraded boots (the
+         * shape needs NO_DERIVED_WEIGHTS + a failed/absent whole-map
+         * registration; every healthy shape serves experts through
+         * artifacts or a blanket tier first).  The exit below is the
+         * budget-exhausted exit verbatim, taken deterministically. */
+        if (u->policy == DS4_UPOL_EXPERT_COLD) {
+            cuda_resunit_note_n(src, DS4_RESUNIT_EXPERT_COLD_BY_POLICY, 1);
+            return cuda_model_direct_fallback_ptr(model_map, offset);
+        }
+        int covered = 0;
+        for (const cuda_model_range &r : g_model_ranges) {
+            if (r.host_base != model_map || r.host_registered) continue;
+            if (r.offset <= u->src_off &&
+                r.offset + r.bytes >= u->src_off + u->src_bytes) {
+                covered = 1;
+                break;
+            }
+        }
+        if (covered) continue;
+        /* memgov D2-2: the lazy miss is the same governed decision as
+         * the eager unit.  Post-freeze the ENGINE_BOOT lease holds the
+         * boot absolute (resident >= any range-scoped proposal, so the
+         * shrink rule spends nothing) and the honest physical ask rides
+         * operation_transient instead -- one claim shape, two lifecycle
+         * phases.  Any non-ADMIT takes the legacy exhausted path
+         * (direct mapped fallback; correctness never depends on the
+         * promotion). */
+        const int legacy = (g_model_range_bytes >= limit ||
+                            u->src_bytes > limit - g_model_range_bytes)
+                               ? DS4_GOV_REFUSE_CLASS : DS4_GOV_ADMIT;
+        ds4_gov_claim mcl = {0};
+        mcl.requester = DS4_GOVC_ENGINE_BOOT;
+        mcl.memc = DS4_MEMC_WEIGHT_ARENA;
+        mcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        mcl.proposed_outstanding = g_model_range_bytes + u->src_bytes;
+        mcl.class_limit = limit == UINT64_MAX ? 0 : (limit ? limit : 1);
+        mcl.operation_transient = g_model_plan_frozen ? u->src_bytes : 0;
+        if (ds4_gov_governed_check("lazy_materialize", &mcl, legacy)
+                != DS4_GOV_ADMIT) {
+            if (cuda_weight_env().verbose) {
+                fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
+                        what ? what : "weights",
+                        (double)bytes / 1048576.0,
+                        (double)limit / 1073741824.0);
+            }
+            return cuda_model_direct_fallback_ptr(model_map, offset);
+        }
+        const int oc = cuda_unit_materialize_copy(model_map, u,
+                                                  /*direct_discard=*/1, what);
+        cuda_resunit_note_n(src, oc, 1);
+        if (oc == DS4_RESUNIT_FAILED)
+            cuda_resunit_fail_note_n(src, DS4_RESSTAGE_LAZY, 1);
+        if (oc != DS4_RESUNIT_POPULATED) return NULL;
+    }
+    /* Every needed unit is device-resident: the resolve that missed now
+     * hits (single-unit requests — the live shape).  A multi-unit span
+     * with no single covering range returns NULL and the mapped tiers
+     * serve. */
+    const cuda_model_range *exact_r = NULL;
+    auto exact = g_model_range_by_offset.find(cuda_range_key{model_map, offset});
+    if (exact != g_model_range_by_offset.end())
+        exact_r = &g_model_ranges[exact->second];
+    return cuda_model_range_resolve(model_map, offset, bytes, exact_r);
 }
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
@@ -2737,6 +3779,9 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     g_model_device_base = (const char *)dev;
     g_model_device_owned = 1;
     g_model_hmm_direct = 0;
+    cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_WHOLE, DS4_MEMD_UNIFIED_DEVICE,
+                            model_size, model_size, model_map);
+    g_mem_device_owned_bytes = model_size;
     const double t1 = cuda_wall_sec();
     fprintf(stderr,
             "ds4: CUDA model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
@@ -2755,11 +3800,17 @@ static void cuda_model_range_release_all(void) {
             if (r.vmm_handle) {
                 (void)cuMemRelease(r.vmm_handle);
             }
+            cuda_mem_note_free_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                                   r.bytes, r.vmm_alloc_bytes, r.host_base);
         } else if (r.imported_ipc && r.device_ptr) {
             (void)cudaIpcCloseMemHandle(r.device_ptr);
+            cuda_mem_note_free_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                                   r.bytes, r.bytes, r.host_base);
         } else if (r.device_ptr) {
             /* In-process self-load artifact (plain cudaMalloc). */
             (void)cudaFree(r.device_ptr);
+            cuda_mem_note_free_src(DS4_MEMC_WEIGHT_ARTIFACT, DS4_MEMD_UNIFIED_DEVICE,
+                                   r.bytes, r.bytes, r.host_base);
         }
     }
     g_derived_ranges.clear();
@@ -2781,14 +3832,25 @@ static void cuda_model_range_release_all(void) {
             if (r.vmm_handle) {
                 (void)cuMemRelease(r.vmm_handle);
             }
+            cuda_mem_note_free_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                                   r.bytes, r.vmm_alloc_bytes, r.host_base);
         } else if (r.imported_ipc && r.device_ptr) {
             (void)cudaIpcCloseMemHandle(r.device_ptr);
+            cuda_mem_note_free_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                                   r.bytes, r.bytes, r.host_base);
         } else if (r.device_ptr && !r.arena_allocated) {
             (void)cudaFree(r.device_ptr);
+            cuda_mem_note_free_src(DS4_MEMC_WEIGHT_SPAN, DS4_MEMD_UNIFIED_DEVICE,
+                                   r.bytes, r.bytes, r.host_base);
         }
     }
     for (const cuda_model_arena &a : g_model_arenas) {
-        if (a.device_ptr) (void)cudaFree(a.device_ptr);
+        if (a.device_ptr) {
+            (void)cudaFree(a.device_ptr);
+            cuda_mem_note_free_srcidx(DS4_MEMC_WEIGHT_ARENA,
+                                      DS4_MEMD_UNIFIED_DEVICE,
+                                      a.used, a.bytes, a.src);
+        }
     }
     g_model_arenas.clear();
     // VMM-backed arenas own the device VA + handle for many ranges in
@@ -2799,6 +3861,8 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
+    g_hbm_cache_dedup_bytes = 0;
+    g_hbm_cache_dedup_logged = 0;
     g_substrate_promotable_total = 0;     /* tripwire: census dies with the ranges */
     g_substrate_promotable_covered = 0;
     cuda_model_load_progress_reset();
@@ -2912,6 +3976,9 @@ extern "C" int ds4_gpu_init(void) {
         if (cudaMalloc(&g_cublas_ws, cublas_ws_bytes) == cudaSuccess) {
             g_cublas_ws_bytes = cublas_ws_bytes;
             (void)cublasSetWorkspace(g_cublas, g_cublas_ws, g_cublas_ws_bytes);
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE,
+                                cublas_ws_bytes, cublas_ws_bytes);
         } else {
             (void)cudaGetLastError();
             g_cublas_ws = NULL;
@@ -2931,6 +3998,8 @@ extern "C" int ds4_gpu_init(void) {
         if (cudaMalloc(&p, (size_t)bytes) == cudaSuccess) {
             g_f16_splitk_partials = (float *)p;
             g_f16_splitk_partials_bytes = bytes;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE, bytes, bytes);
         } else {
             (void)cudaGetLastError();
         }
@@ -2942,6 +4011,9 @@ extern "C" int ds4_gpu_init(void) {
         void *p = NULL;
         if (cudaMalloc(&p, 256u * sizeof(float)) == cudaSuccess) {
             g_hc_stage_scratch = (float *)p;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE,
+                                256u * sizeof(float), 256u * sizeof(float));
         } else {
             (void)cudaGetLastError();
         }
@@ -2954,6 +4026,10 @@ extern "C" int ds4_gpu_init(void) {
         void *p = NULL;
         if (cudaMalloc(&p, 8u * 2048u * sizeof(float)) == cudaSuccess) {
             g_router_fused_partials = (float *)p;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE,
+                                8u * 2048u * sizeof(float),
+                                8u * 2048u * sizeof(float));
         } else {
             (void)cudaGetLastError();
         }
@@ -2966,6 +4042,10 @@ extern "C" int ds4_gpu_init(void) {
         void *p = NULL;
         if (cudaMalloc(&p, 8u * 2u * 2048u * sizeof(float)) == cudaSuccess) {
             g_comp_pair_partials = (float *)p;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE,
+                                8u * 2u * 2048u * sizeof(float),
+                                8u * 2u * 2048u * sizeof(float));
         } else {
             (void)cudaGetLastError();
         }
@@ -2983,13 +4063,21 @@ extern "C" int ds4_gpu_init(void) {
         const uint64_t q81_bytes = (8192u / 32u) * 36u;
         if (g_q8_fold_q80_buf[i] == NULL) {
             void *p = NULL;
-            if (cudaMalloc(&p, (size_t)q80_bytes) == cudaSuccess) g_q8_fold_q80_buf[i] = (int8_t *)p;
-            else (void)cudaGetLastError();
+            if (cudaMalloc(&p, (size_t)q80_bytes) == cudaSuccess) {
+                g_q8_fold_q80_buf[i] = (int8_t *)p;
+                cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                    DS4_MEMD_UNIFIED_DEVICE,
+                                    q80_bytes, q80_bytes);
+            } else (void)cudaGetLastError();
         }
         if (g_q8_fold_q81_buf[i] == NULL) {
             void *p = NULL;
-            if (cudaMalloc(&p, (size_t)q81_bytes) == cudaSuccess) g_q8_fold_q81_buf[i] = p;
-            else (void)cudaGetLastError();
+            if (cudaMalloc(&p, (size_t)q81_bytes) == cudaSuccess) {
+                g_q8_fold_q81_buf[i] = p;
+                cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                    DS4_MEMD_UNIFIED_DEVICE,
+                                    q81_bytes, q81_bytes);
+            } else (void)cudaGetLastError();
         }
     }
     /* SM count for the flash-decode attention split gate. */
@@ -3006,6 +4094,8 @@ extern "C" int ds4_gpu_init(void) {
         if (cudaMalloc(&p, (size_t)bytes) == cudaSuccess) {
             g_attn_split_partials = (float *)p;
             g_attn_split_partials_bytes = bytes;
+            cuda_mem_note_alloc(DS4_MEMC_KERNEL_PARTIALS,
+                                DS4_MEMD_UNIFIED_DEVICE, bytes, bytes);
         } else {
             (void)cudaGetLastError();
         }
@@ -3067,6 +4157,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     if (g_cublas_ws) {
         (void)cudaFree(g_cublas_ws);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           g_cublas_ws_bytes, g_cublas_ws_bytes);
         g_cublas_ws = NULL;
         g_cublas_ws_bytes = 0;
     }
@@ -3074,6 +4166,24 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
+    {
+        /* D1a-1: bulk class note + per-source rows (see the f16 twin). */
+        uint64_t by_src[DS4_MSRC_MAX + 1] = {0};
+        for (const cuda_q8_f32_range &r : g_q8_f32_ranges)
+            by_src[cuda_mem_src_index(r.host_base)] +=
+                r.in_dim * r.out_dim * sizeof(float);
+        ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+        ds4_mem_cell_note_free(
+            &g_mem_census[DS4_MEMC_WEIGHT_DERIVED][DS4_MEMD_UNIFIED_DEVICE],
+            g_q8_f32_bytes, g_q8_f32_bytes, &g_mem_census_faults);
+        for (int s = 0; s <= DS4_MSRC_MAX; s++) {
+            if (by_src[s] == 0) continue;
+            ds4_mem_cell_note_free(
+                &g_mem_src_census[s][DS4_MEMC_WEIGHT_DERIVED][DS4_MEMD_UNIFIED_DEVICE],
+                by_src[s], by_src[s], &g_mem_census_faults);
+        }
+        ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+    }
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -3082,11 +4192,15 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_q8_f32_bytes = 0;
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_cuda_tmp_bytes, g_cuda_tmp_bytes);
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
     if (g_tt_scratch) {
         (void)cudaFree(g_tt_scratch);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_tt_scratch_bytes, g_tt_scratch_bytes);
         g_tt_scratch = NULL;
         g_tt_scratch_bytes = 0;
     }
@@ -3102,6 +4216,9 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     if (g_f16_splitk_partials) {
         (void)cudaFree(g_f16_splitk_partials);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           g_f16_splitk_partials_bytes,
+                           g_f16_splitk_partials_bytes);
         g_f16_splitk_partials = NULL;
         g_f16_splitk_partials_bytes = 0;
     }
@@ -3112,20 +4229,44 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     if (g_hc_stage_scratch) {
         (void)cudaFree(g_hc_stage_scratch);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           256u * sizeof(float), 256u * sizeof(float));
         g_hc_stage_scratch = NULL;
     }
     cuda_norm_q8_release();
-    for (int i = 0; i < 2; i++) {
-        if (g_q8_fold_q80_buf[i]) { (void)cudaFree(g_q8_fold_q80_buf[i]); g_q8_fold_q80_buf[i] = NULL; }
-        if (g_q8_fold_q81_buf[i]) { (void)cudaFree(g_q8_fold_q81_buf[i]); g_q8_fold_q81_buf[i] = NULL; }
+    {
+        const uint64_t q80_bytes = 8192u + 16u + (8192u / 32u) * sizeof(float);
+        const uint64_t q81_bytes = (8192u / 32u) * 36u;
+        for (int i = 0; i < 2; i++) {
+            if (g_q8_fold_q80_buf[i]) {
+                (void)cudaFree(g_q8_fold_q80_buf[i]);
+                cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS,
+                                   DS4_MEMD_UNIFIED_DEVICE,
+                                   q80_bytes, q80_bytes);
+                g_q8_fold_q80_buf[i] = NULL;
+            }
+            if (g_q8_fold_q81_buf[i]) {
+                (void)cudaFree(g_q8_fold_q81_buf[i]);
+                cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS,
+                                   DS4_MEMD_UNIFIED_DEVICE,
+                                   q81_bytes, q81_bytes);
+                g_q8_fold_q81_buf[i] = NULL;
+            }
+        }
     }
     cuda_q8_fold_reset();
     if (g_router_fused_partials) {
         (void)cudaFree(g_router_fused_partials);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           8u * 2048u * sizeof(float),
+                           8u * 2048u * sizeof(float));
         g_router_fused_partials = NULL;
     }
     if (g_comp_pair_partials) {
         (void)cudaFree(g_comp_pair_partials);
+        cuda_mem_note_free(DS4_MEMC_KERNEL_PARTIALS, DS4_MEMD_UNIFIED_DEVICE,
+                           8u * 2u * 2048u * sizeof(float),
+                           8u * 2u * 2048u * sizeof(float));
         g_comp_pair_partials = NULL;
     }
     for (size_t i = 0; i < 4; i++) {
@@ -3135,6 +4276,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
         if (g_model_stage_raw[i]) {
             (void)cudaFreeHost(g_model_stage_raw[i]);
+            cuda_mem_note_free(DS4_MEMC_STAGE_PIN, DS4_MEMD_PINNED_HOST,
+                               g_mem_stage_slot_bytes[i],
+                               g_mem_stage_slot_bytes[i]);
+            g_mem_stage_slot_bytes[i] = 0;
             g_model_stage_raw[i] = NULL;
             g_model_stage[i] = NULL;
         }
@@ -3146,6 +4291,13 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     if (g_model_device_owned && g_model_device_base) {
         (void)cudaFree((void *)g_model_device_base);
+        /* D1a-1: device_owned surviving to teardown implies no later
+         * set_model_map displaced it, so g_model_host_base is still the
+         * owning map. */
+        cuda_mem_note_free_src(DS4_MEMC_WEIGHT_WHOLE, DS4_MEMD_UNIFIED_DEVICE,
+                               g_mem_device_owned_bytes,
+                               g_mem_device_owned_bytes, g_model_host_base);
+        g_mem_device_owned_bytes = 0;
     }
     if (g_model_registered && g_model_host_base) {
         (void)cudaHostUnregister((void *)g_model_host_base);
@@ -3158,6 +4310,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_device_owned = 0;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
+    g_model_coherent_direct_map = NULL;
     g_model_fd = -1;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
@@ -3184,6 +4337,8 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->memc = cuda_mem_scope_class();
+    cuda_mem_note_alloc(t->memc, DS4_MEMD_UNIFIED_DEVICE, bytes, bytes);
     return t;
 }
 
@@ -3197,6 +4352,8 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->memc = cuda_mem_scope_class();
+    cuda_mem_note_alloc(t->memc, DS4_MEMD_UNIFIED_DEVICE, bytes, bytes);
     return t;
 }
 
@@ -3236,15 +4393,27 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     return free_bytes - context_bytes < reserve_bytes;
 }
 
-extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+/* memgov D0a-2: THE typed memory-observation provider.  Body is the old
+ * ds4_gpu_mem_info verbatim plus status/source stamping; ds4_gpu_mem_info
+ * below is now a shim over this (ds4_mem_obs_to_legacy), so every legacy
+ * caller sees bit-identical values and return codes. */
+extern "C" int ds4_gpu_mem_observe(ds4_mem_observation *out) {
+    ds4_mem_observation o;
+    memset(&o, 0, sizeof(o));
+    o.status = DS4_MEMOBS_QUERY_ERROR;
+    o.source = DS4_MEMOBS_SRC_NONE;
     size_t free_b = 0;
     size_t total_b = 0;
     cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
+        if (out) *out = o;
         return 1;
     }
+    o.status = DS4_MEMOBS_OK;
+    o.source = DS4_MEMOBS_SRC_CUDA_FREE;
     uint64_t free_out = (uint64_t)free_b;
+    o.cuda_free_bytes = (uint64_t)free_b;   /* MG-2: raw pair, disclosed */
 #ifdef __linux__
     /* Integrated/unified (GB10): cudaMemGetInfo's free tracks MemFree and
      * ignores reclaimable page cache -- on this box often tens of GB of cold
@@ -3281,7 +4450,11 @@ extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
                      * mapping's page cache does not thrash decode.  Trust
                      * MemAvailable; the caller's own headroom is the margin. */
                     uint64_t avail = kb * 1024ull;
-                    if (avail > free_out) free_out = avail;
+                    o.meminfo_avail_bytes = avail;   /* MG-2: raw pair */
+                    if (avail > free_out) {
+                        free_out = avail;
+                        o.source = DS4_MEMOBS_SRC_MEMINFO_AVAILABLE;
+                    }
                     break;
                 }
             }
@@ -3290,9 +4463,16 @@ extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
     }
     (void)cudaGetLastError();
 #endif
-    if (free_bytes) *free_bytes = free_out;
-    if (total_bytes) *total_bytes = (uint64_t)total_b;
+    o.free_bytes = free_out;
+    o.total_bytes = (uint64_t)total_b;
+    if (out) *out = o;
     return 0;
+}
+
+extern "C" int ds4_gpu_mem_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+    ds4_mem_observation o;
+    (void)ds4_gpu_mem_observe(&o);
+    return ds4_mem_obs_to_legacy(&o, free_bytes, total_bytes);
 }
 
 extern "C" void ds4_gpu_boot_trim(void) {
@@ -3305,6 +4485,23 @@ extern "C" void ds4_gpu_boot_trim(void) {
     (void)cudaGetLastError();
 }
 
+/* memgaps MG-1: the boot trim, callable at refusal time, reporting what
+ * the typed observation got back.  Session churn (right-size regrows,
+ * serial free/create, per-call static graphs) re-accumulates freed-graph
+ * pool reserve after the one boot trim; on unified boxes that reserve
+ * depresses the ONE estimate every admission verdict consumes.  The
+ * delta rides ds4_gpu_mem_observe -- the same answer the verdicts read
+ * -- so it measures the return where it matters.  Kernel-side noise can
+ * ride the delta; callers treat it as disclosure, not ledger. */
+extern "C" uint64_t ds4_gpu_own_trim(void) {
+    ds4_mem_observation a, b;
+    const int a_ok = ds4_gpu_mem_observe(&a) == 0 && a.status == DS4_MEMOBS_OK;
+    ds4_gpu_boot_trim();
+    if (!a_ok) return 0;
+    if (ds4_gpu_mem_observe(&b) != 0 || b.status != DS4_MEMOBS_OK) return 0;
+    return b.free_bytes > a.free_bytes ? b.free_bytes - a.free_bytes : 0;
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
@@ -3312,6 +4509,13 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
+    /* memgov D0a-3: a view is a WINDOW into the base's allocation -- pages
+     * ensured (or trimmed) through it charge the base's census class, not
+     * the ambient scope at view creation.  Without this, the emit-site
+     * ensure_rows hooks (which run through per-bank slab views installed
+     * at admission) charged ENGINE_OTHER ~2 pages/layer per new tenant --
+     * measured 84 MiB on the first admission. */
+    t->memc = base->memc;
     return t;
 }
 
@@ -3341,6 +4545,9 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_reserve(uint64_t bytes) {
     t->ptr = (void *)(uintptr_t)va;
     t->bytes = bytes;
     t->owner = 2;                              /* reserved: freed via the registry */
+    /* Census: a reservation is VIRTUAL -- no cell charge here.  Physical
+     * commitment lands page-by-page in ds4_gpu_tensor_ensure below. */
+    t->memc = cuda_mem_scope_class();
     return t;
 }
 
@@ -3384,6 +4591,8 @@ extern "C" int ds4_gpu_tensor_ensure(const ds4_gpu_tensor *tensor, uint64_t offs
         }
         d->pages[(size_t)p] = h;
         d->mapped += d->page;
+        cuda_mem_note_alloc(tensor->memc, DS4_MEMD_UNIFIED_DEVICE,
+                            d->page, d->page);
     }
     return 1;
 }
@@ -3403,6 +4612,78 @@ extern "C" uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64
     return res;
 }
 
+/* memgov D0a-4: trim failure-injection (TEST ONLY).  Forces the two driver
+ * failures the loop below must survive.  An injected unmap failure takes
+ * the exact keep-everything path a real one takes (skip the page BEFORE
+ * touching the driver).  An injected release failure skips the REAL
+ * cuMemRelease, deliberately orphaning the handle: the leak is physical,
+ * so the cell's slack claim stays reconcilable against the allocator and
+ * cudaMemGetInfo -- an injection that released anyway would make the
+ * ledger lie about reality.  Armed as a bounded burst (first N candidate
+ * driver calls fail, then the hook disarms) via DS4_CUDA_TRIM_INJECT=
+ * unmap:N|release:N, or programmatically by units through
+ * ds4_gpu_trim_inject_set, which always wins over the env.  Single-writer
+ * like the census registry: trim runs on the engine thread only. */
+static int      g_trim_inject_env_seen = 0;
+static int      g_trim_inject_site = DS4_TRIM_INJECT_OFF;
+static uint32_t g_trim_inject_left = 0;
+static uint32_t g_trim_inject_fired = 0;
+
+static void cuda_trim_inject_env_once(void) {
+    if (g_trim_inject_env_seen) return;
+    g_trim_inject_env_seen = 1;
+    const char *e = getenv("DS4_CUDA_TRIM_INJECT");
+    if (!e || !*e) return;
+    if (!ds4_trim_inject_parse(e, &g_trim_inject_site, &g_trim_inject_left)) {
+        fprintf(stderr, "ds4: trim inject: bad spec '%s' (want unmap:N|release:N) -- off\n", e);
+        return;
+    }
+    fprintf(stderr, "ds4: trim inject: armed %s x%u (TEST ONLY)\n",
+            g_trim_inject_site == DS4_TRIM_INJECT_UNMAP ? "unmap" : "release",
+            g_trim_inject_left);
+}
+
+static int cuda_trim_inject_fire(int site) {
+    if (g_trim_inject_site != site || g_trim_inject_left == 0) return 0;
+    g_trim_inject_left--;
+    g_trim_inject_fired++;
+    fprintf(stderr, "ds4: trim inject: forced %s failure (%u left)\n",
+            site == DS4_TRIM_INJECT_UNMAP ? "cuMemUnmap" : "cuMemRelease",
+            g_trim_inject_left);
+    return 1;
+}
+
+extern "C" int ds4_gpu_trim_inject_set(int site, uint32_t count) {
+    cuda_trim_inject_env_once();   /* a later env parse must not clobber this */
+    const int valid = (site == DS4_TRIM_INJECT_UNMAP ||
+                       site == DS4_TRIM_INJECT_RELEASE);
+    g_trim_inject_site = valid ? site : DS4_TRIM_INJECT_OFF;
+    g_trim_inject_left = valid ? count : 0;
+    return 1;                      /* CUDA backend: injection supported */
+}
+
+extern "C" uint32_t ds4_gpu_trim_inject_fired(void) {
+    return g_trim_inject_fired;
+}
+
+extern "C" uint64_t ds4_gpu_tensor_trim_estimate(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    /* The trim loop's page walk with the driver calls removed: mapped bytes
+     * of the pages entirely inside [offset, offset+bytes).  Shares trim's
+     * p0/p1x arithmetic below so quote and release cannot drift. */
+    if (!tensor || bytes == 0) return 0;
+    if (offset > tensor->bytes) return 0;
+    if (bytes > tensor->bytes - offset) bytes = tensor->bytes - offset;
+    const cuda_vmm_demand *d = cuda_vmm_demand_find(tensor->ptr, offset, bytes);
+    if (!d) return 0;                          /* eager allocation: nothing to trim */
+    const uint64_t rel = ((uint64_t)(uintptr_t)tensor->ptr + offset) - (uint64_t)d->va;
+    const uint64_t p0  = (rel + d->page - 1u) / d->page;
+    const uint64_t p1x = (rel + bytes) / d->page;
+    uint64_t est = 0;
+    for (uint64_t p = p0; p < p1x; p++)
+        if (d->pages[(size_t)p]) est += d->page;
+    return est;
+}
+
 extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
     /* Unmap the demand-mapped pages lying ENTIRELY inside [offset, offset+bytes)
      * of a ds4_gpu_tensor_reserve() tensor.  Interior pages only: the caller's
@@ -3418,6 +4699,7 @@ extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t o
     if (bytes > tensor->bytes - offset) bytes = tensor->bytes - offset;
     cuda_vmm_demand *d = cuda_vmm_demand_find(tensor->ptr, offset, bytes);
     if (!d) return 0;                          /* eager allocation: nothing to trim */
+    cuda_trim_inject_env_once();
     const uint64_t rel = ((uint64_t)(uintptr_t)tensor->ptr + offset) - (uint64_t)d->va;
     const uint64_t p0  = (rel + d->page - 1u) / d->page;   /* first page fully inside */
     const uint64_t p1x = (rel + bytes) / d->page;          /* exclusive end page */
@@ -3430,15 +4712,24 @@ extern "C" uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t o
          * after a successful unmap is a physical leak: accounting follows
          * the mapping (the VA no longer reads it), but the bytes were NOT
          * returned to the system, so they are not counted as released. */
+        if (cuda_trim_inject_fire(DS4_TRIM_INJECT_UNMAP))
+            continue;
         if (!driver_ok(cuMemUnmap(d->va + (CUdeviceptr)(p * d->page),
                                   (size_t)d->page),
                        "VMM trim page unmap"))
             continue;
-        const int rel_ok = driver_ok(cuMemRelease(d->pages[(size_t)p]),
+        const int rel_ok = cuda_trim_inject_fire(DS4_TRIM_INJECT_RELEASE) ? 0 :
+                           driver_ok(cuMemRelease(d->pages[(size_t)p]),
                                      "VMM trim page release");
         d->pages[(size_t)p] = 0;
         d->mapped -= d->page;
         if (rel_ok) released += d->page;
+        /* Census mirrors the D-1b semantics exactly: the ask (mapping) is
+         * gone either way, but a release failure did NOT return the bytes
+         * -- freed_committed stays behind and the residue shows up as
+         * cell slack, never as an undercharge. */
+        cuda_mem_note_free(tensor->memc, DS4_MEMD_UNIFIED_DEVICE,
+                           d->page, rel_ok ? d->page : 0);
     }
     return released;
 }
@@ -3454,6 +4745,8 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
                 (void)cuMemUnmap(d->va + (CUdeviceptr)(p * d->page), (size_t)d->page);
                 (void)cuMemRelease(d->pages[p]);
             }
+            cuda_mem_note_free(tensor->memc, DS4_MEMD_UNIFIED_DEVICE,
+                               d->mapped, d->mapped);
             (void)cuMemAddressFree(d->va, (size_t)d->span);
             g_vmm_demand.erase(g_vmm_demand.begin() + (ptrdiff_t)i);
             delete d;
@@ -3462,7 +4755,11 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
         free(tensor);
         return;
     }
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner && tensor->ptr) {
+        (void)cudaFree(tensor->ptr);
+        cuda_mem_note_free(tensor->memc, DS4_MEMD_UNIFIED_DEVICE,
+                           tensor->bytes, tensor->bytes);
+    }
     free(tensor);
 }
 
@@ -3600,6 +4897,10 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_registered_size = model_size;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
+    /* Re-mapping the coherent map re-derives its fact below; other maps'
+     * calls must not erase it (the base map keeps serving through it). */
+    if (model_map == g_model_coherent_direct_map)
+        g_model_coherent_direct_map = NULL;
     g_model_cache_full = 0;
     // Bind g_model_fd to this model on first registration. set_model_fd is
     // called once for the main model before the first set_model_map call;
@@ -3622,6 +4923,10 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
             if (err == cudaSuccess) {
                 g_model_device_base = (const char *)dev;
                 g_model_device_owned = 1;
+                cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_WHOLE,
+                                        DS4_MEMD_UNIFIED_DEVICE,
+                                        model_size, model_size, model_map);
+                g_mem_device_owned_bytes = model_size;
                 const double t1 = clock() / (double)CLOCKS_PER_SEC;
                 fprintf(stderr, "ds4: CUDA model copy complete in %.3fs\n", t1 - t0);
                 return 1;
@@ -3669,7 +4974,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
                  * demand — the same residency a weight-server import gives
                  * them.  Expert raws stay cold on disk; the raw mmap pointer
                  * (g_model_device_base) still serves the aligned-consumer
-                 * fallback reads through HMM at mmap rates. */
+                 * fallback reads through HMM at mmap rates.
+                 * memgov D2 hardening: that coherence fact is recorded so a
+                 * GOVERNED refusal of the promotion tiers (operator floor
+                 * under enforce) degrades to mapped-serve instead of
+                 * failing the resolve — routing still prefers promotion. */
+                g_model_coherent_direct_map = model_map;
                 fprintf(stderr,
                         "ds4: CUDA integrated + in-process artifacts: skipping full host "
                         "registration (%.2f GiB mmap left unpinned; expert weights served "
@@ -3722,6 +5032,7 @@ extern "C" void ds4_gpu_unregister_model_map(const void *base) {
      * host-registration state: device artifacts and imported ranges of other
      * maps are left alone. */
     if (!base) return;
+    if (g_model_coherent_direct_map == base) g_model_coherent_direct_map = NULL;
     if (g_model_registered && g_model_host_base == base) {
         (void)cudaHostUnregister((void *)base);
         cuda_pinned_file_note_unregister(base);
@@ -4011,24 +5322,30 @@ static int import_vmm_allocation(
         return 0;
     }
 
-    g_model_ranges.push_back({
-        model_map,
-        (uint64_t)off,
-        (uint64_t)bytes,
-        (char *)va,
-        NULL,
-        NULL,
-        0,
-        0,
-        0,
-        0,
-        1,
-        handle,
-        va,
-        (uint64_t)alloc_bytes,
-    });
-    g_model_range_by_offset[(uint64_t)off] = g_model_ranges.size() - 1u;
+    if (!cuda_model_range_publish({
+            model_map,
+            (uint64_t)off,
+            (uint64_t)bytes,
+            (char *)va,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            0,
+            1,
+            handle,
+            va,
+            (uint64_t)alloc_bytes,
+        })) {
+        (void)cuMemUnmap(va, (size_t)alloc_bytes);
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return 0;
+    }
     g_model_range_bytes += (uint64_t)bytes;
+    cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                            (uint64_t)bytes, (uint64_t)alloc_bytes, model_map);
     *imported_bytes += (uint64_t)bytes;
     *imported_ranges += 1;
     return 1;
@@ -4121,23 +5438,30 @@ static int import_vmm_derived_allocation(
         return 0;
     }
 
-    g_derived_ranges.push_back({
-        model_map,
-        (uint64_t)source_off,
-        (uint64_t)source_bytes,
-        (uint32_t)kind,
-        (uint64_t)in_dim,
-        (uint64_t)out_dim,
-        (uint32_t)group_count,
-        (uint64_t)bytes,
-        (char *)va,
-        0,
-        1,
-        handle,
-        va,
-        (uint64_t)alloc_bytes,
-    });
+    if (!cuda_derived_range_publish({
+            model_map,
+            (uint64_t)source_off,
+            (uint64_t)source_bytes,
+            (uint32_t)kind,
+            (uint64_t)in_dim,
+            (uint64_t)out_dim,
+            (uint32_t)group_count,
+            (uint64_t)bytes,
+            (char *)va,
+            0,
+            1,
+            handle,
+            va,
+            (uint64_t)alloc_bytes,
+        })) {
+        (void)cuMemUnmap(va, (size_t)alloc_bytes);
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return 0;
+    }
     g_derived_range_bytes += (uint64_t)bytes;
+    cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                            (uint64_t)bytes, (uint64_t)alloc_bytes, model_map);
     *imported_bytes += (uint64_t)bytes;
     *imported_ranges += 1;
     return 1;
@@ -4353,23 +5677,31 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
                 ok = 0;
                 break;
             }
-            g_derived_ranges.push_back({
-                model_map,
-                (uint64_t)source_off,
-                (uint64_t)source_bytes,
-                (uint32_t)kind,
-                (uint64_t)in_dim,
-                (uint64_t)out_dim,
-                (uint32_t)group_count,
-                (uint64_t)derived_bytes,
-                (char *)dev,
-                1,
-                0,
-                0,
-                0,
-                0,
-            });
+            if (!cuda_derived_range_publish({
+                    model_map,
+                    (uint64_t)source_off,
+                    (uint64_t)source_bytes,
+                    (uint32_t)kind,
+                    (uint64_t)in_dim,
+                    (uint64_t)out_dim,
+                    (uint32_t)group_count,
+                    (uint64_t)derived_bytes,
+                    (char *)dev,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                })) {
+                (void)cudaIpcCloseMemHandle(dev);
+                (void)cudaGetLastError();
+                ok = 0;
+                break;
+            }
             g_derived_range_bytes += (uint64_t)derived_bytes;
+            cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                                    (uint64_t)derived_bytes,
+                                    (uint64_t)derived_bytes, model_map);
             imported_derived_bytes += (uint64_t)derived_bytes;
             imported_derived_ranges++;
             continue;
@@ -4415,24 +5747,30 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
             ok = 0;
             break;
         }
-        g_model_ranges.push_back({
-            model_map,
-            (uint64_t)off,
-            (uint64_t)bytes,
-            (char *)dev,
-            NULL,
-            NULL,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-        });
-        g_model_range_by_offset[(uint64_t)off] = g_model_ranges.size() - 1u;
+        if (!cuda_model_range_publish({
+                model_map,
+                (uint64_t)off,
+                (uint64_t)bytes,
+                (char *)dev,
+                NULL,
+                NULL,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+            })) {
+            (void)cudaIpcCloseMemHandle(dev);
+            (void)cudaGetLastError();
+            ok = 0;
+            break;
+        }
         g_model_range_bytes += (uint64_t)bytes;
+        cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_IMPORT, DS4_MEMD_UNIFIED_DEVICE,
+                                (uint64_t)bytes, (uint64_t)bytes, model_map);
         imported_bytes += (uint64_t)bytes;
         imported_ranges++;
     }
@@ -4620,24 +5958,36 @@ static int cuda_build_derived_artifacts_from_catalog(
         return 0;
     }
 
-    for (const ds4_repack_artifact &art : arts) {
-        g_derived_ranges.push_back({
-            model_map,
-            art.t->off,
-            art.t->bytes,
-            art.kind,
-            art.in_dim,
-            art.out_dim,
-            art.group_count,
-            art.bytes,
-            (char *)art.dev,
-            0,
-            0,
-            0,
-            0,
-            0,
-        });
+    uint64_t published = 0;
+    for (ds4_repack_artifact &art : arts) {
+        if (!cuda_derived_range_publish({
+                model_map,
+                art.t->off,
+                art.t->bytes,
+                art.kind,
+                art.in_dim,
+                art.out_dim,
+                art.group_count,
+                art.bytes,
+                (char *)art.dev,
+                0,
+                0,
+                0,
+                0,
+                0,
+            })) {
+            /* D1a-4 refusal: free the orphan build and mark the artifact
+             * absent (nulled dev) so the completeness scan below cannot
+             * count a REPLACE candidate the registry never accepted. */
+            (void)cudaFree(art.dev);
+            built_bytes -= art.bytes;
+            art.dev = NULL;
+            continue;
+        }
         g_derived_range_bytes += art.bytes;
+        cuda_mem_note_alloc_src(DS4_MEMC_WEIGHT_ARTIFACT, DS4_MEMD_UNIFIED_DEVICE,
+                                art.bytes, art.bytes, model_map);
+        published++;
     }
 
     /* Replace-set completeness: the registration skip must only fire when
@@ -4650,7 +6000,7 @@ static int cuda_build_derived_artifacts_from_catalog(
             replace_candidates++;
             bool have = false;
             for (const ds4_repack_artifact &art : arts) {
-                if (art.t == &t) { have = true; break; }
+                if (art.t == &t && art.dev) { have = true; break; }
             }
             if (!have) { replaces_complete = 0; break; }
         }
@@ -4659,11 +6009,11 @@ static int cuda_build_derived_artifacts_from_catalog(
     g_derived_replaces_complete = replaces_complete;
 
     g_derived_artifact_source = CUDA_DERIVED_ARTIFACTS_BUILT;
-    g_derived_artifact_count = arts.size();
+    g_derived_artifact_count = published;
     g_derived_artifact_bytes = built_bytes;
     g_derived_artifact_build_secs = cuda_wall_sec() - t0;
     g_derived_artifact_none_reason = NULL;
-    return (int)arts.size();
+    return (int)published;
 }
 
 extern "C" int ds4_gpu_build_derived_artifacts(
@@ -4795,18 +6145,369 @@ extern "C" void ds4_gpu_report_derived_artifacts(void) {
     }
 }
 
-/* Returns 0 = allocation/copy FAILURE, 1 = span POPULATED into a device
- * copy, 2 = SKIPPED by policy (opt-out, discrete device, budget, already
- * covered).  deepmem lite-2: compiled unconditionally (the
- * DS4_CUDA_SPARK_HBM_CACHE compile fork is retired) and defaults ON for
- * INTEGRATED devices only.  On GB10-class unified memory the deferred
- * device promotions this pre-pays are exactly the bytes the bank planner
- * otherwise cannot see (hbm_cache_ab_2026-08-05.md: 29-vs-13-bank
- * overcommit, admission collapse at depth); on discrete devices the
- * historical shape is preserved (no startup walk; the lazy fd-cache tier
- * still promotes on demand).  Callers reporting "prepared" bytes must
- * count rc==1 only -- the old success/no-op boolean let the boot line
- * overstate residency by the full attempted total. */
+/* memgov D1a-1: per-source boot residency lines + ledger reconciliation.
+ * Every WEIGHT_* note dual-writes cell + source row under one epoch
+ * bracket, so in a fault-free ledger the rows of each weight class sum
+ * to its census cell EXACTLY; a divergence here is an attribution bug
+ * and counts a census fault (every standing gate asserts faults == 0).
+ * Weight classes are the contiguous enum run ARENA..HOST_PIN. */
+extern "C" void ds4_gpu_report_model_sources(void) {
+    /* D1a-4 backfill: boot publications precede the unit-table binds (the
+     * pre-cache walk and manifest imports run inside model open; the
+     * tables compile after), so ranges published early carry the -1/-1
+     * no-plan marker.  Stamp them now from the bound tables -- the stamp
+     * is a pure function of (map, interval), so late stamping is exact.
+     * Publications after the binds stamp at publish time, keeping the
+     * "every live range is plan-known" invariant continuous post-boot. */
+    for (cuda_model_range &r : g_model_ranges) {
+        if (r.host_base && r.unit_lo < 0)
+            cuda_range_stamp(r.host_base, r.offset, r.bytes,
+                             &r.src, &r.unit_lo, &r.unit_hi);
+    }
+    for (cuda_derived_range &r : g_derived_ranges) {
+        if (r.host_base && r.unit_lo < 0)
+            cuda_range_stamp(r.host_base, r.source_offset, r.source_bytes,
+                             &r.src, &r.unit_lo, &r.unit_hi);
+    }
+    for (cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        if (r.host_base && r.unit_lo < 0)
+            cuda_range_stamp(r.host_base, r.offset, r.weight_bytes,
+                             &r.src, &r.unit_lo, &r.unit_hi);
+    }
+    for (cuda_q8_f32_range &r : g_q8_f32_ranges) {
+        if (r.host_base && r.unit_lo < 0)
+            cuda_range_stamp(r.host_base, r.offset, r.weight_bytes,
+                             &r.src, &r.unit_lo, &r.unit_hi);
+    }
+    for (int i = 0; i < g_model_srcs.count; i++) {
+        const ds4_model_source *s = &g_model_srcs.v[i];
+        uint64_t dev_live = 0;
+        for (int cls = DS4_MEMC_WEIGHT_ARENA; cls <= DS4_MEMC_WEIGHT_HOST_PIN; cls++)
+            dev_live += ds4_mem_cell_live(
+                &g_mem_src_census[i][cls][DS4_MEMD_UNIFIED_DEVICE]);
+        const uint64_t pin_live = ds4_mem_cell_live(
+            &g_mem_src_census[i][DS4_MEMC_WEIGHT_HOST_PIN][DS4_MEMD_PINNED_HOST]);
+        fprintf(stderr,
+                "ds4: model source %s [%s]: map %.2f GiB, device %.2f GiB, "
+                "host-pinned %.2f GiB (%s)\n",
+                s->name,
+                ds4_model_source_role_name(s->role),
+                (double)s->map_len / 1073741824.0,
+                (double)dev_live / 1073741824.0,
+                (double)pin_live / 1073741824.0,
+                s->path[0] ? s->path : "-");
+    }
+    {
+        uint64_t un_dev = 0, un_pin = 0;
+        for (int cls = DS4_MEMC_WEIGHT_ARENA; cls <= DS4_MEMC_WEIGHT_HOST_PIN; cls++) {
+            un_dev += ds4_mem_cell_live(
+                &g_mem_src_census[DS4_MSRC_MAX][cls][DS4_MEMD_UNIFIED_DEVICE]);
+            un_pin += ds4_mem_cell_live(
+                &g_mem_src_census[DS4_MSRC_MAX][cls][DS4_MEMD_PINNED_HOST]);
+        }
+        if (un_dev || un_pin) {
+            fprintf(stderr,
+                    "ds4: model source UNATTRIBUTED: device %.2f GiB, "
+                    "host-pinned %.2f GiB (weight traffic outside every bound map)\n",
+                    (double)un_dev / 1073741824.0,
+                    (double)un_pin / 1073741824.0);
+        }
+    }
+    int mismatches = 0;
+    for (int cls = DS4_MEMC_WEIGHT_ARENA; cls <= DS4_MEMC_WEIGHT_HOST_PIN; cls++) {
+        for (int dom = 0; dom < DS4_MEMD__COUNT; dom++) {
+            ds4_mem_cell sum = {0, 0, 0, 0, 0, 0};
+            for (int s = 0; s <= DS4_MSRC_MAX; s++) {
+                const ds4_mem_cell *c = &g_mem_src_census[s][cls][dom];
+                sum.requested += c->requested;
+                sum.committed += c->committed;
+                sum.freed_requested += c->freed_requested;
+                sum.freed_committed += c->freed_committed;
+            }
+            const ds4_mem_cell *cell = &g_mem_census[cls][dom];
+            if (sum.requested != cell->requested ||
+                sum.committed != cell->committed ||
+                sum.freed_requested != cell->freed_requested ||
+                sum.freed_committed != cell->freed_committed) {
+                mismatches++;
+                g_mem_census_faults++;
+                fprintf(stderr,
+                        "ds4: MEM-CENSUS FAULT: source ledger mismatch "
+                        "class=%d dom=%d cell live=%llu rows live=%llu\n",
+                        cls, dom,
+                        (unsigned long long)ds4_mem_cell_live(cell),
+                        (unsigned long long)(sum.committed - sum.freed_committed));
+            }
+        }
+    }
+    if (mismatches == 0 && g_model_srcs.count > 0) {
+        fprintf(stderr,
+                "ds4: model-source ledger reconciled: %d weight classes x %d "
+                "domains == census cells (%d sources)\n",
+                DS4_MEMC_WEIGHT_HOST_PIN - DS4_MEMC_WEIGHT_ARENA + 1,
+                (int)DS4_MEMD__COUNT,
+                g_model_srcs.count);
+    }
+    /* D1a-4: one range-plan line per source -- live publications vs how
+     * many the plan knows (unit-stamped).  planned == total is the gate
+     * assertion; refused publications already faulted one by one. */
+    for (int i = 0; i < g_model_srcs.count; i++) {
+        uint32_t nm = 0, nm_planned = 0, nd = 0, nd_planned = 0;
+        uint32_t nq = 0, nq_planned = 0, nm_multi = 0;
+        for (const cuda_model_range &r : g_model_ranges) {
+            if (!r.host_base || r.src != i) continue;
+            nm++;
+            if (r.unit_lo >= 0) nm_planned++;
+            /* memgov D1b-3: with both promotion passes materializing
+             * plan units, every DEVICE-COPY range is exactly one unit.
+             * Imports legitimately span unit runs (one coalesced
+             * interval satisfies many units) and the registered
+             * whole-map view spans everything -- both excluded.  The
+             * gates assert multi == 0: an extent-shaped copy
+             * reappearing anywhere is a materializer regression. */
+            if (!r.host_registered && !r.imported_ipc && !r.imported_vmm &&
+                r.unit_lo >= 0 && r.unit_lo != r.unit_hi)
+                nm_multi++;
+        }
+        for (const cuda_derived_range &r : g_derived_ranges) {
+            if (!r.host_base || r.src != i) continue;
+            nd++;
+            if (r.unit_lo >= 0) nd_planned++;
+        }
+        for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+            if (!r.host_base || r.src != i) continue;
+            nq++;
+            if (r.unit_lo >= 0) nq_planned++;
+        }
+        for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
+            if (!r.host_base || r.src != i) continue;
+            nq++;
+            if (r.unit_lo >= 0) nq_planned++;
+        }
+        fprintf(stderr,
+                "ds4: range plan %s: model %u/%u planned, derived %u/%u, "
+                "q8 %u/%u, multi %u, refused %llu\n",
+                g_model_srcs.v[i].name,
+                nm_planned, nm, nd_planned, nd, nq_planned, nq, nm_multi,
+                (unsigned long long)g_range_publish_refused);
+    }
+}
+
+/* memgov D1b-1: the EAGER pass — materialize a map's funded residency
+ * plan (its bound canonical-unit table) before serve.  Replaces the
+ * walk's private span compiler + ds4_gpu_cache_model_range: the table
+ * IS the enumeration, slice-aware active sets included, so a slice boot
+ * promotes exactly its plan (closes the D1a-4 5/10 slice-blindness
+ * measurement).  Defaults ON for INTEGRATED devices only — on GB10-class
+ * unified memory the deferred promotions this pre-pays are exactly the
+ * bytes the bank planner otherwise cannot see (hbm_cache_ab_2026-08-05:
+ * 29-vs-13-bank overcommit); discrete devices keep the historical shape
+ * (no eager pass; the lazy fd tier still promotes on demand).
+ *
+ * Per-unit outcomes, decided in plan order:
+ *   HOST_MAPPED_BY_POLICY  non-promote policy (NO_HBM boots) — declared
+ *                          to the substrate tripwire, never copied
+ *   ALREADY_READY          an exact-offset device range covers the unit
+ *                          (a prior materialization)
+ *   SATISFIED_IMPORT       ONE other device-resident interval fully
+ *                          covers it — the ds4_unit_import_satisfied
+ *                          rule evaluated over the live registry
+ *                          (host-registered ranges never count); this
+ *                          replaces the S6 coverage belt for the eager
+ *                          pass at unit granularity
+ *   POPULATED              arena carve + staged copy + funnel publish
+ *   FAILED                 allocation/copy/publication failure — the
+ *                          caller aborts engine open (old walk contract)
+ * Budget-unfunded promote units take NO outcome: they are not in the
+ * funded plan (the porcelain reports them) and stay lazy-eligible,
+ * mirroring the old walk's per-chunk skip.  Expert-cold and
+ * artifact-replaced units are the cold tier by design and are not the
+ * eager pass's units at all.
+ *
+ * The substrate tripwire declares the ACTIVE promotable bytes up front —
+ * on slice boots this is the slice's bytes, correcting the old walk's
+ * slice-blind declaration (a slice boot's "substrate outstanding" now
+ * reflects its own plan). */
+extern "C" int ds4_gpu_materialize_model_plan(const void *model_map,
+                                              uint64_t model_size,
+                                              uint64_t *populated_bytes) {
+    if (populated_bytes) *populated_bytes = 0;
+    if (!model_map || model_size == 0) return 1;
+    {
+        int dev = 0, integrated = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess)
+            (void)cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
+        if (!integrated) return 1;
+    }
+    const int src = cuda_mem_src_index(model_map);
+    const ds4_phys_unit *units =
+        (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_v[src] : NULL;
+    const uint32_t nu =
+        (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_n[src] : 0;
+    const char *nm = src >= 0 ? g_model_srcs.v[src].name : "?";
+    if (!units || nu == 0) {
+        /* Plan-first contract: no bound table, no eager promotion (a
+         * corrupt table must not become the plan — the compile/bind
+         * path already counted its fault loudly).  Lazy tiers serve. */
+        fprintf(stderr,
+                "ds4: materialize %s: no bound unit table; eager pass skipped\n",
+                nm);
+        return 1;
+    }
+    /* Tripwire declaration (v0.5.6.3 substrate view): every byte that
+     * WILL eventually device-promote, before any budget skip.  memgov
+     * D3-2: DEVICE_PROMOTE units count whether the schedule is eager or
+     * lazy (the lazy tier covers on materialization); HOST_MAPPED units
+     * are TERMINAL host residents under the typed policy -- they never
+     * promote, so declaring them would charge the fit ~8 GiB for bytes
+     * mapped serving never takes back (the old pair-lever shape carried
+     * exactly that phantom outstanding). */
+    if (g_model_fd_host_base && model_map == g_model_fd_host_base) {
+        for (uint32_t i = 0; i < nu; i++) {
+            if (units[i].policy == DS4_UPOL_DEVICE_PROMOTE)
+                g_substrate_promotable_total += units[i].src_bytes;
+        }
+    }
+    if (g_model_device_owned) {
+        for (uint32_t i = 0; i < nu; i++) {
+            if (units[i].policy == DS4_UPOL_DEVICE_PROMOTE)
+                cuda_substrate_cover(model_map, units[i].src_bytes);
+        }
+        fprintf(stderr,
+                "ds4: materialize %s: device-owned map; plan covered, no copies\n",
+                nm);
+        return 1;
+    }
+    /* memgov D3-2: the eager-vs-lazy SCHEDULE is the source's, read from
+     * the handle resolved at bind -- never the environment. */
+    const int lazy_schedule =
+        src >= 0 && src < DS4_MSRC_MAX &&
+        g_model_srcs.v[src].residency == DS4_RESIDENCY_LAZY_COPY_DEVICE;
+    const uint64_t limit = cuda_model_map_replaces_complete(model_map)
+        ? UINT64_MAX
+        : cuda_model_cache_limit_bytes();
+    /* Coupled source mode (see cuda_stage_copy_to_dev): default buffered
+     * + no discard = the pre-D1b boot's page-cache shape; the env flips
+     * eager to O_DIRECT + discard (the F4 measured mode). */
+    const int direct_discard =
+        getenv("DS4_CUDA_EAGER_SOURCE_DISCARD") != NULL;
+    uint64_t counts[DS4_RESUNIT__COUNT] = {0};
+    uint32_t promote = 0, funded = 0, unfunded = 0;
+    uint64_t pop_bytes = 0;
+    int failed = 0;
+    for (uint32_t i = 0; i < nu && !failed; i++) {
+        const ds4_phys_unit *u = &units[i];
+        if (u->policy == DS4_UPOL_HOST_MAPPED) {
+            counts[DS4_RESUNIT_HOST_MAPPED_BY_POLICY]++;
+            continue;
+        }
+        if (u->policy != DS4_UPOL_DEVICE_PROMOTE) continue;
+        if (lazy_schedule) {
+            counts[DS4_RESUNIT_LAZY_DEFERRED]++;
+            continue;
+        }
+        promote++;
+        if (u->src_off > model_size || u->src_bytes > model_size - u->src_off) {
+            /* The verify pass cannot see the map size; a unit outside the
+             * map would send the host-memcpy source out of bounds.  Loud
+             * failure, same contract as the old walk's span check. */
+            fprintf(stderr,
+                    "ds4: materialize %s: unit %u outside map (off=%llu bytes=%llu size=%llu)\n",
+                    nm, i, (unsigned long long)u->src_off,
+                    (unsigned long long)u->src_bytes,
+                    (unsigned long long)model_size);
+            counts[DS4_RESUNIT_FAILED]++;
+            failed = 1;
+            continue;
+        }
+        int covered = 0, exact_hit = 0;
+        for (const cuda_model_range &r : g_model_ranges) {
+            if (r.host_base != model_map || r.host_registered) continue;
+            if (r.offset <= u->src_off &&
+                r.offset + r.bytes >= u->src_off + u->src_bytes) {
+                covered = 1;
+                exact_hit = (r.offset == u->src_off);
+                break;
+            }
+        }
+        if (covered) {
+            counts[exact_hit ? DS4_RESUNIT_ALREADY_READY
+                             : DS4_RESUNIT_SATISFIED_IMPORT]++;
+            cuda_substrate_cover(model_map, u->src_bytes);
+            continue;
+        }
+        /* memgov D2-2: every promotion is a GOVERNED decision.  The
+         * claim's class verdict carries the legacy budget predicate
+         * verbatim (proposed = range + unit vs the same limit, so
+         * observe mode is bit-identical); the live verdict adds the
+         * honest marginal charge -- during the eager pass the
+         * incremental ENGINE_BOOT publications below keep resident ==
+         * range, so unfunded == this unit's bytes (never the whole
+         * accumulated range).  A REFUSE (any kind, incl. fail-closed
+         * FAULT) lands exactly on the legacy unfunded path: the unit
+         * stays lazy-eligible, nothing is lost. */
+        const int legacy = (g_model_range_bytes >= limit ||
+                            u->src_bytes > limit - g_model_range_bytes)
+                               ? DS4_GOV_REFUSE_CLASS : DS4_GOV_ADMIT;
+        ds4_gov_claim mcl = {0};
+        mcl.requester = DS4_GOVC_ENGINE_BOOT;
+        mcl.memc = DS4_MEMC_WEIGHT_ARENA;
+        mcl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        mcl.proposed_outstanding = g_model_range_bytes + u->src_bytes;
+        /* class_limit 0 = UNCAPPED to the evaluator: complete-map
+         * replacement (UINT64_MAX) maps there; a zero limit must refuse
+         * any ask, so it pins to 1. */
+        mcl.class_limit = limit == UINT64_MAX ? 0 : (limit ? limit : 1);
+        if (ds4_gov_governed_check("boot_materialize", &mcl, legacy)
+                != DS4_GOV_ADMIT) {
+            unfunded++;
+            cuda_substrate_cover(model_map, u->src_bytes);   /* budget-capped: will not promote eagerly */
+            continue;
+        }
+        funded++;
+        char label[64];
+        snprintf(label, sizeof(label), "%s unit:%u", nm, i);
+        const int oc = cuda_unit_materialize_copy(model_map, u,
+                                                  direct_discard, label);
+        counts[oc]++;
+        if (oc == DS4_RESUNIT_POPULATED) {
+            pop_bytes += u->src_bytes;
+            /* Incremental boot lease: resident tracks the range registry
+             * so each later unit's quote charges only ITS bytes.  The
+             * server's boot-settle publication replaces this with the
+             * full census absolute (leases replace, never accumulate). */
+            ds4_gov_publish_use(DS4_GOVC_ENGINE_BOOT,
+                                g_model_range_bytes, g_model_range_bytes);
+        } else if (oc == DS4_RESUNIT_FAILED) {
+            failed = 1;
+        }
+    }
+    /* No pinned residue past the pass: the bank fit samples MemAvailable
+     * after engine open, and the pre-D1b walk left no staging behind.
+     * The lazy tier re-allocates on its first miss. */
+    cuda_model_stage_pool_release();
+    for (int i = 0; i < DS4_RESUNIT__COUNT; i++)
+        cuda_resunit_note_n(src, i, counts[i]);
+    cuda_resunit_fail_note_n(src, DS4_RESSTAGE_BOOT, counts[DS4_RESUNIT_FAILED]);
+    if (populated_bytes) *populated_bytes = pop_bytes;
+    fprintf(stderr,
+            "ds4: materialize %s: funded %u/%u promote units (%u unfunded), "
+            "populated %llu (%.2f GiB), ready %llu, import %llu, "
+            "mapped-policy %llu, lazy-policy %llu, failed %llu\n",
+            nm, funded, promote, unfunded,
+            (unsigned long long)counts[DS4_RESUNIT_POPULATED],
+            (double)pop_bytes / 1073741824.0,
+            (unsigned long long)counts[DS4_RESUNIT_ALREADY_READY],
+            (unsigned long long)counts[DS4_RESUNIT_SATISFIED_IMPORT],
+            (unsigned long long)counts[DS4_RESUNIT_HOST_MAPPED_BY_POLICY],
+            (unsigned long long)counts[DS4_RESUNIT_LAZY_DEFERRED],
+            (unsigned long long)counts[DS4_RESUNIT_FAILED]);
+    return failed ? 0 : 1;
+}
+
+/* DFM remainder walk helper.  Unit-table materialize skips EXPERT_COLD
+ * even when replacements are complete; those leftover raw stacks still
+ * need a device copy or Motif/Solar/EXAONE starve the hot path. */
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 2;
     if (offset > model_size || bytes > model_size - offset) return 0;
@@ -4816,50 +6517,26 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
             (void)cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
         if (!integrated) return 2;
     }
-    /* Tripwire declaration: every promotable base-map chunk is declared
-     * here (the walk feeds all of them through on every boot).  The skip
-     * branches below cover bytes that will never promote lazily; the
-     * NO_HBM_CACHE lever skip does NOT -- it merely defers the promotion
-     * to the fd-cache tier, which covers on materialization. */
     if (g_model_fd_host_base && model_map == g_model_fd_host_base)
         g_substrate_promotable_total += bytes;
-    /* Startup walk: force-populate the device-resident HBM cache so hot
-     * tensors hit cudaMalloc copies rather than the UVA-mapped fallback.
-     * Skip silently if over budget or opted out — the mapped pointer still
-     * works for any tensor we don't pre-cache. */
     if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 2;
     if (g_model_device_owned) { cuda_substrate_cover(model_map, bytes); return 2; }
-    /* Self-load artifacts mode: this map's expert raws live in device
-     * artifacts and the whole-model registration was skipped, so the walk
-     * must device-copy ALL of its remaining (non-expert) spans — the same
-     * residency a weight-server import gives them.  The cap still applies
-     * to every other map (MTP / DSpark support models stay registered). */
     const uint64_t limit = cuda_model_map_replaces_complete(model_map)
         ? UINT64_MAX
         : cuda_model_cache_limit_bytes();
     if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) {
-        cuda_substrate_cover(model_map, bytes);   /* budget-capped: will not promote */
+        cuda_substrate_cover(model_map, bytes);
         return 2;
     }
     const char *what = label ? label : "model_tensor";
-    /* Skip if this span is already populated. */
-    auto exact = g_model_range_by_offset.find(offset);
+    auto exact = g_model_range_by_offset.find(cuda_range_key{model_map, offset});
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
         if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) {
-            cuda_substrate_cover(model_map, bytes);   /* already device-resident */
+            cuda_substrate_cover(model_map, bytes);
             return 2;
         }
     }
-    /* S6 (2026-07-07): coverage dedup vs imported manifest ranges.  WS
-     * VMM/IPC imports land in g_model_ranges as LARGE coalesced device
-     * ranges; the exact-offset check above misses any tensor INTERIOR to
-     * one.  A covered span already reads through the imported pointer at
-     * the same device-resident speed class (cuda_model_range_ptr's first
-     * pass prefers it), so a duplicate copy buys nothing.  In practice the
-     * byte-budget check above short-circuits for full-model manifests
-     * (imports count against the budget; cmthbm15 measured ZERO double-book
-     * in ship configs) -- this is the belt for sub-limit import scopes. */
     const uint64_t span_end = offset + bytes;
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_base == model_map && !r.host_registered &&
@@ -4872,12 +6549,14 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
                         "range (imported manifest span); skipping duplicate copies\n",
                         what);
             }
-            cuda_substrate_cover(model_map, bytes);   /* import-covered */
+            cuda_substrate_cover(model_map, bytes);
             return 2;
         }
     }
-    /* populate credits coverage itself at the range-registration funnel */
-    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what) != NULL;
+    const char *p = cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
+    if (!p) return 0;
+    if (p == (const char *)model_map + offset) return 2;
+    return 1;
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
@@ -4941,8 +6620,20 @@ extern "C" int ds4_gpu_release_model_source_pages(
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
-    fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
-            label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
+    /* memgaps gap-4: raw cuda free tracks MemFree on unified boxes and
+     * under-reports by the reclaimable cache; print the budget answer
+     * beside it so the report cannot mislead an operator. */
+    ds4_mem_observation o;
+    (void)ds4_gpu_mem_observe(&o);
+    if (o.status == DS4_MEMOBS_OK && o.meminfo_avail_bytes != 0)
+        fprintf(stderr,
+                "ds4: CUDA memory report %s: free %.2f MiB (meminfo-available %.2f MiB) total %.2f MiB\n",
+                label ? label : "", (double)free_b / 1048576.0,
+                (double)o.meminfo_avail_bytes / 1048576.0,
+                (double)total_b / 1048576.0);
+    else
+        fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
+                label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
     if (g_hbm_cache_dedup_bytes != 0) {
         fprintf(stderr,
                 "ds4: HBM cache dedup: %.2f GiB of startup-walk spans were already "
@@ -10034,7 +11725,12 @@ static float *fp8_predecode_scratch_alloc(uint64_t bytes) {
         if (!ds4_capture_active()) (void)cudaDeviceSynchronize();
         ds4_cuda_invalidate_captured_graphs("fp8 predecode scratch resize");
         (void)cudaFree(g_fp8_predecode_scratch);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_fp8_predecode_scratch_bytes,
+                           g_fp8_predecode_scratch_bytes);
     }
+    cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
     g_fp8_predecode_scratch = ptr;
     g_fp8_predecode_scratch_bytes = bytes;
     return (float *)g_fp8_predecode_scratch;
@@ -11111,7 +12807,7 @@ __device__ static float tt_warp_max_f32(float v) {
     return v;
 }
 
-__device__ static float tt_dot4_f32(float4 a, float4 b) {
+[[maybe_unused]] __device__ static float tt_dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 
@@ -16501,6 +18197,8 @@ static void *rr_scratch_ensure(uint64_t bytes) {
     (void)cudaDeviceSynchronize();
     if (g_rr_scratch) {
         (void)cudaFree(g_rr_scratch);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                           g_rr_scratch_bytes, g_rr_scratch_bytes);
         g_rr_scratch = NULL;
         g_rr_scratch_bytes = 0;
     }
@@ -16516,6 +18214,8 @@ static void *rr_scratch_ensure(uint64_t bytes) {
         return NULL;
     }
     (void)cudaMemset(ptr, 0, (size_t)bytes);
+    cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                        bytes, bytes);
     g_rr_scratch = ptr;
     g_rr_scratch_bytes = bytes;
     return g_rr_scratch;
@@ -17185,12 +18885,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
          * decode2-exact, output-head vocab top-k) does. */
         uint32_t                n_comp_max,
         uint32_t                il_for_decode1) {
-    if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
-        top_k > n_comp ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
-        return 0;
-    }
     /* PC5 activation: substrate present, valid il, non-zero max, not opted
      * out via env.  Specialization basis becomes n_comp_max (capture-stable)
      * and the kernel reads n_actual from g_layer_dev[il].n_index_comp at
@@ -17207,18 +18901,34 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     const uint32_t n_spec = pc5_active
         ? (n_comp >= n_comp_max ? n_comp : n_comp_max)
         : n_comp;
+    /* #32 fix: under PC5 the kernels' band (scores row stride + scan
+     * ceiling) must ALSO be the capture-stable maximum, not the n_comp
+     * the capture step happened to see -- a captured graph replays for
+     * the whole generation while the scorer (same substrate, comp_cap
+     * grid) extends the live count past the capture-time value.  With
+     * the band at the session cap the live count can never exceed it
+     * (the cache cannot hold more rows than comp_cap), so the stream512
+     * guard's clamp becomes unreachable and every decode row is
+     * selectable.  Legacy callers (n_comp_max=0) are untouched. */
+    const uint32_t n_band = pc5_active ? n_spec : n_comp;
+    if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
+        top_k > n_band ||
+        scores->bytes < (uint64_t)n_tokens * n_band * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
+        return 0;
+    }
     if (top_k == 512u && n_spec <= 1024u &&
         getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
         indexer_topk_1024_kernel<<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
-                                                     n_comp, n_tokens, top_k, ls);
+                                                     n_band, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_spec <= 2048u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k, ls);
+                                                           n_band, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
     if (top_k == 512u && n_spec <= 4096u &&
@@ -17241,14 +18951,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k, ls);
+                                                                                 n_band, n_tokens, top_k, ls);
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
                 }
             }
         }
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k, ls);
+                                                           n_band, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
     if (top_k == 512u && n_spec <= 8192u &&
@@ -17272,14 +18982,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k, ls);
+                                                                                 n_band, n_tokens, top_k, ls);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
                 }
             }
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                (const float *)scores->ptr,
-                                                               n_comp, n_tokens, top_k, ls);
+                                                               n_band, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
     /* inc-4: streaming exact top-512 replaces the chunked tree at n_spec >
@@ -17290,19 +19000,23 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
      * scan.  Grid <<<n_tokens, 512>>> + static smem + zero scratch = the
      * capture-stable shape that lifts the >8192-row cont-capture exclusion
      * (ds4.c eligibility); the chunked tree below survives only as the
-     * DS4_CUDA_NO_TOPK_STREAM forensic escape. */
+     * DS4_CUDA_NO_TOPK_STREAM forensic escape.  #32: the escape is EAGER
+     * territory -- under PC5 the stream is mandatory (the tree's chunk
+     * grid/scratch are n_comp-derived and would re-open the stale-band
+     * class on a captured graph). */
     if (top_k == 512u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL) {
+        (pc5_active ||
+         (getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+          getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL))) {
         indexer_topk_stream512_kernel<<<n_tokens, 512, 0, ds4_current_stream()>>>(
                 (uint32_t *)selected->ptr,
                 (const float *)scores->ptr,
-                n_comp, n_tokens, top_k, ls);
+                n_band, n_tokens, top_k, ls);
         static int logged_topk_stream = 0;
         if (!logged_topk_stream) {
             logged_topk_stream = 1;
             fprintf(stderr, "ds4: indexer topk stream active (first n_comp=%u n_tokens=%u %s)\n",
-                    n_comp, n_tokens, pc5_active ? "captured" : "eager");
+                    n_band, n_tokens, pc5_active ? "captured" : "eager");
         }
         /* 13d-1 adjudication instrument: with DS4_CUDA_TOPK_STREAM_VERIFY on
          * an EAGER leg, save the stream selection, fall through into the
@@ -17357,7 +19071,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         dim3 grid_chunks(n_tokens, n_chunks, 1);
         indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024, 0, ds4_current_stream()>>>(cur,
                                                                     (const float *)scores->ptr,
-                                                                    n_comp,
+                                                                    n_band,
                                                                     n_tokens,
                                                                     top_k,
                                                                     candidate_stride,
@@ -17373,7 +19087,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                     next,
                     cur,
                     (const float *)scores->ptr,
-                    n_comp,
+                    n_band,
                     n_tokens,
                     top_k,
                     n_sets,
@@ -17390,7 +19104,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                  cur,
                                                                  (const float *)scores->ptr,
-                                                                 n_comp,
+                                                                 n_band,
                                                                  n_tokens,
                                                                  top_k,
                                                                  n_sets * top_k,
@@ -17435,7 +19149,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     }
     indexer_topk_kernel<<<n_tokens, 1, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                          (const float *)scores->ptr,
-                                         n_comp, n_tokens, top_k, ls);
+                                         n_band, n_tokens, top_k, ls);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
 }
 
@@ -19672,7 +21386,12 @@ static const char *cuda_moe_iq2_derepack_scratch(
     static uint64_t buf_bytes[2] = {0, 0};
     static uint64_t tag[2]       = {UINT64_MAX, UINT64_MAX};
     if (buf_bytes[which] < raw_bytes) {
-        if (buf[which]) { (void)cudaFree(buf[which]); buf[which] = NULL; buf_bytes[which] = 0; tag[which] = UINT64_MAX; }
+        if (buf[which]) {
+            (void)cudaFree(buf[which]);
+            cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                               buf_bytes[which], buf_bytes[which]);
+            buf[which] = NULL; buf_bytes[which] = 0; tag[which] = UINT64_MAX;
+        }
         cudaError_t err = cudaMalloc(&buf[which], raw_bytes);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: iq2 derepack scratch alloc failed (%.1f MiB): %s; using mmap raw\n",
@@ -19683,6 +21402,8 @@ static const char *cuda_moe_iq2_derepack_scratch(
         }
         buf_bytes[which] = raw_bytes;
         tag[which] = UINT64_MAX;
+        cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                            raw_bytes, raw_bytes);
         fprintf(stderr, "ds4: iq2 derepack scratch active (%s, %.1f MiB)\n",
                 which == 0 ? "gate" : "up", (double)raw_bytes / (1024.0 * 1024.0));
     }
@@ -19726,7 +21447,12 @@ static const char *cuda_moe_q2k_derepack_scratch(
     static uint64_t buf_bytes = 0;
     static uint64_t tag       = UINT64_MAX;
     if (buf_bytes < raw_bytes) {
-        if (buf) { (void)cudaFree(buf); buf = NULL; buf_bytes = 0; tag = UINT64_MAX; }
+        if (buf) {
+            (void)cudaFree(buf);
+            cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                               buf_bytes, buf_bytes);
+            buf = NULL; buf_bytes = 0; tag = UINT64_MAX;
+        }
         cudaError_t err = cudaMalloc(&buf, raw_bytes);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: q2k derepack scratch alloc failed (%.1f MiB): %s; using mmap raw\n",
@@ -19737,6 +21463,8 @@ static const char *cuda_moe_q2k_derepack_scratch(
         }
         buf_bytes = raw_bytes;
         tag = UINT64_MAX;
+        cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY, DS4_MEMD_UNIFIED_DEVICE,
+                            raw_bytes, raw_bytes);
         fprintf(stderr, "ds4: q2k derepack scratch active (down, %.1f MiB)\n",
                 (double)raw_bytes / (1024.0 * 1024.0));
     }
@@ -19927,6 +21655,9 @@ static void cuda_norm_q8_release(void) {
     g_norm_q8_reg.n = 0u;
     if (g_norm_q8_buf) {
         (void)cudaFree(g_norm_q8_buf);
+        cuda_mem_note_free(DS4_MEMC_SCRATCH_STICKY,
+                           DS4_MEMD_UNIFIED_DEVICE,
+                           g_norm_q8_cap, g_norm_q8_cap);
         g_norm_q8_buf = NULL;
     }
     g_norm_q8_cap = 0;
@@ -19971,6 +21702,9 @@ static char *cuda_norm_q8_prepare(uint32_t rows, uint32_t n,
         cuda_norm_q8_release();
         if (cudaMalloc(&g_norm_q8_buf, floor_need) == cudaSuccess) {
             g_norm_q8_cap = floor_need;
+            cuda_mem_note_alloc(DS4_MEMC_SCRATCH_STICKY,
+                                DS4_MEMD_UNIFIED_DEVICE,
+                                floor_need, floor_need);
         } else {
             /* Allocation is an optional optimization.  Do not let its sticky
              * runtime error poison the classic RMS fallback launch. */

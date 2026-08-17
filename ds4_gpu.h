@@ -56,6 +56,13 @@ ds4_gpu_tensor *ds4_gpu_tensor_reserve(uint64_t bytes);
 int ds4_gpu_tensor_ensure(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 uint64_t ds4_gpu_tensor_resident(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 uint64_t ds4_gpu_tensor_trim(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
+/* memgov D4-2: the exact preimage of ds4_gpu_tensor_trim -- mapped bytes of
+ * the pages lying ENTIRELY inside [offset, offset+bytes), the same interior-
+ * page math trim releases (edge pages shared with neighboring spans are
+ * excluded on both sides: never quoted, never released).  Distinct from
+ * ds4_gpu_tensor_resident, which counts every OVERLAPPING page.  Pure host
+ * walk, no driver calls; 0 for eager tensors and trimless backends. */
+uint64_t ds4_gpu_tensor_trim_estimate(const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 uint64_t ds4_gpu_vmm_demand_page(void);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
@@ -559,7 +566,24 @@ int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, cons
    outlives its allocation poisons later cudaMemcpy calls whose host buffers
    land on the recycled pages.  No-op when the base was never registered. */
 void ds4_gpu_unregister_model_map(const void *base);
+/* DFM aligned-mixed remainder walk: promote unreplaced expert/edge
+ * spans when the replace set is complete.  Unit-table materialize
+ * leaves those EXPERT_COLD.  0 = failure, 1 = populated, 2 = skipped. */
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+/* memgov D1b-1: the EAGER residency pass — materialize the map's funded
+ * plan (its bound canonical-unit table) before serve.  Replaces the old
+ * per-span walk (ds4_gpu_cache_model_range): the table IS the
+ * enumeration, so slice boots promote exactly their plan.  Returns 0
+ * only when a funded unit fails to materialize (callers abort engine
+ * open, the old walk's failure contract); discrete devices and unbound
+ * tables skip the pass (the lazy tier still promotes on demand).
+ * populated_bytes (optional) reports bytes actually device-copied. */
+int ds4_gpu_materialize_model_plan(const void *model_map, uint64_t model_size, uint64_t *populated_bytes);
+/* memgov D2-2: freeze the residency plan at boot settle.  After freeze,
+ * arena ranges may enter the publication funnel only through the unit
+ * materializer (whose promotions carry governor claims); a bypass counts
+ * a governor fault (loud once).  Metal/no-GPU: no plan, no-op. */
+void ds4_gpu_model_plan_freeze(void);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 /* R5 Inc1a: device memory snapshot for budget-computed batch-bank sizing.

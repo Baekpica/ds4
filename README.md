@@ -30,7 +30,7 @@ memory. The implementation remains a narrow C/CUDA engine: every accepted
 architecture has an explicit metadata validator, tensor binder, prompt
 protocol, state lifecycle, and device kernel path.
 
-`v0.5.6.3-dfm` is based on Entrpi `v0.5.6.3` and currently integrates these
+`v0.6.0-dfm` is based on Entrpi `v0.6.0` and currently integrates these
 deployed families:
 
 | Model family | GGUF architecture | Serving runtime |
@@ -948,7 +948,11 @@ Supported endpoints:
 - `POST /v1/completions`
 - `POST /v1/messages`
 - `GET /metrics` (Prometheus text: request outcomes, token totals, rolling
-  decode tok/s, live banks, admission classes, speculation counters)
+  decode tok/s, live banks, admission classes, speculation counters; since
+  v0.6.0 also the memory families — allocation census by class and domain,
+  the availability observation with both raw estimates behind it, governor
+  decisions per consumer, reclaim outcomes, and typed request rejections
+  labelled by lane and reason)
 - `GET /v1/stats` (human-readable status board; JSON with
   `Accept: application/json` — `watch -n2 curl -s :8000/v1/stats` works)
 
@@ -1308,10 +1312,35 @@ Enable it with:
 > more than batch depth — it is off by default because a serial session
 > graph and deep batch serving cannot both be funded at large `--ctx` on
 > a 128 GiB box, and the batch path should win that tie; the boot line
-> reports the carve-out when you turn it on. Since v0.5.5 the pool's own
-> budget is derived from the bank plan (banks × per-bank extent) rather
-> than a boot-time free-memory sample, so it no longer drifts with the
-> memory weather at startup.
+> reports the carve-out when you turn it on. The pool's own budget is
+> the bank plan's allowance (banks × per-bank extent) capped to measured
+> capacity at boot-settle and floored at two full banks (v0.5.6.3 — the
+> uncapped plan allowance could authorize more than the box could
+> afford, which drained memory under sustained load); the boot ledger
+> prints `budget=[chosen] [plan X, capacity Y]`, and
+> `DS4_BATCH_VMM_BUDGET_MB` still pins it explicitly.
+>
+> **Since v0.6.0 a memory governor decides all of this.** Every consumer
+> that can grow memory — engine boot, prewarm, the bank plan, the serial
+> session, the per-call batch graph — asks one evaluator, which weighs
+> the ask against one availability observation and one ledger of what
+> the other lanes hold. Refusals are typed with a reason that says
+> whether a retry can succeed, and they are counted per lane in
+> `/metrics`. Before any refusal for lack of memory, the engine first
+> collects what it can return: idle banks' pages via trim (the serial
+> lane ranks and reclaims from the commons rather than failing beside
+> idle cache), then its own unused CUDA graph-pool reserve
+> (`DS4_MEM_OWN_TRIM=0` opts out). `DS4_MEMGOV=observe` is the one-word
+> rollback — the governor keeps evaluating and reporting, but the
+> pre-v0.6.0 formulas decide again.
+>
+> One reading note for long-lived servers: the kernel's available-memory
+> estimate drifts downward as the mapped model's page-cache residency
+> grows, even though allocations still succeed and nothing is leaking. A
+> restart resets the reading. `/metrics` shows both raw estimates behind
+> the number the engine uses (`ds4_memory_observation_bytes{kind=…}`),
+> so a low estimate beside served requests is identifiable as the
+> accounting artifact it is.
 
 The cache key is the SHA1 of the rendered byte prefix, and files are named
 `<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state

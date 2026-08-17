@@ -4,9 +4,9 @@
 **DFM (독자 파운데이션 모델, 독파모)** model families with DwarfStar. It follows
 the CUDA serving base in [Entrpi/ds4](https://github.com/Entrpi/ds4), which in
 turn follows [antirez/ds4](https://github.com/antirez/ds4). The versioning rule
-is deliberately small: an Entrpi release such as `v0.5.6.3` becomes
-`v0.5.6.3-dfm` after the additional model families pass this repository's
-integration gates.
+is deliberately small: an Entrpi release such as `v0.6.0` becomes
+`v0.6.0-dfm` after the additional model families pass this repository's
+integration gates. The previous integrated cut was `v0.5.6.3-dfm`.
 
 The reference target is one NVIDIA DGX Spark with a GB10 GPU and 128 GB of
 unified memory. Other operating systems and accelerators are not release
@@ -143,6 +143,30 @@ Before changing large models:
 
 `clear_cache` does not reclaim allocations from a live CUDA process. Never run
 a second full-model owner beside the first one on the reference machine.
+
+## Integration evidence for `v0.6.0-dfm`
+
+This cut absorbs Entrpi `v0.6.0` (`c8956e0`) on the same GB10 host
+(driver 610.43.02, CUDA 13.3, `sm_121a` cubins only). The gates below
+are fixture, unit, and structural GGUF checks on this binary. They do
+not re-measure the Motif 8K/32K/256K serving numbers, which remain
+those of `v0.5.6.3-dfm`.
+
+| Family | Gate | Result |
+|---|---|---|
+| DeepSeek | `ds4-eval --self-test-extractors`, `ds4_test --server`, `tests/test_split_gguf` | passed. No DeepSeek GGUF on this host, so model-dependent GPU tests were not rerun. |
+| Solar Open2 | `test-solar-loader` / `test-solar-tokenizer` on MXQ-v1 11 shards; CUDA KDA, chunked prefill, gates, compressed KV | passed |
+| K-EXAONE | `test-exaone-kernels` vs CPU (no model path: routed-expert matmul skipped); tokenizer load of the 3-shard MXQ | passed |
+| Motif-3 | official-final CUDA fixtures (BF16, router, PolyNorm, mHC, expanded/latent GDLA); `test-motif3-loader` / `test-motif3-tokenizer` on `Motif-3-MQ87-88-FIT.gguf` | passed |
+| Shared | `test-model-family-kernels` | passed |
+
+The merge keeps DFM family generate, split-GGUF remaps, and aligned
+mixed-quant remainder caching. Upstream's memory governor, own-reserve
+trim, and two-phase reclaim are in; `ds4_batch_ctx_reclaim_prepare`
+stays `UNSUPPORTED` for EXAONE/Motif/Solar because those banks use
+fixed CUDA allocations. The Motif CUDA fixture also required restoring
+the DFM rule that a current whole-model device copy wins over a stale
+range keyed by a recycled host address.
 
 ## Integration evidence for `v0.5.6.3-dfm`
 

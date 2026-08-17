@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "ds4_mem_census.h"
+#include "ds4_model_catalog.h"
+#include "ds4_mem_gov.h"     /* memgov D0b: shadow governor core (leaf) */
+
 /* Public engine boundary.
  *
  * The CLI and server should treat ds4_engine as the loaded model and
@@ -266,15 +270,66 @@ int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_tota
 int  ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_total_tokens,
                               ds4_batch_ctx **out, char *err, size_t errlen);
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx);
-/* deepmem lite-4 (minimal reclaim): trim FREE banks' demand-mapped cache
-   pages to recover up to want_bytes for a non-batch consumer (the serial
-   lane).  Context-owned mechanics; the CALLER owns exclusion (the server
-   calls under gen_mu with no continuous pass running).  Victim order:
-   invalid history first, then shortest committed history; a trimmed bank's
-   history is invalidated, so warm admits cannot reuse it (its next tenant
-   cold-resets).  Returns bytes released (also counted in the ctx trim
-   counters and the "batch vmm: trimmed" log line); 0 when nothing is
-   trimmable or DS4_BATCH_VMM_TRIM=0. */
+/* memgov D4-2: two-phase, context-owned idle-bank reclaim (revised plan
+ * sec 10; supersedes lite-4's whole-commons ds4_batch_ctx_trim_free).
+ * The SERVER ranks victims -- it owns warm value: supersession, LRU,
+ * deep pins, continuation protection -- and passes ordered bank ids;
+ * the CONTEXT owns the physical mechanics.
+ *
+ * prepare computes each bank's exact trim preimage (whole pages strictly
+ * inside its spans; edge pages shared with neighbor banks are excluded on
+ * both sides, never quoted and never released) and stamps the bank's
+ * lineage generation, taking banks in the caller's order until est covers
+ * want.  The caller persists whatever it wants to keep while the data is
+ * intact, then commit revalidates every stamp, synchronizes ONCE, trims
+ * in bulk, advances generations and invalidates engine history only for
+ * banks whose content was actually destroyed, and returns per-bank status
+ * plus exact bytes.  A partial driver failure preserves ownership and
+ * accounting for pages that were not released (the error-safe trim
+ * contract, D-1b); nothing-reclaimable is a normal empty plan, never an
+ * error.  Quiescence is the caller's (the server calls under gen_mu and
+ * the pass drivers hold gen_mu for their whole life); BUSY is the typed
+ * honesty check for everyone else.  DS4_BATCH_VMM_TRIM=0 disables both
+ * phases (UNSUPPORTED), one release, plan sec 10. */
+typedef enum {
+    DS4_RECLAIM_OK = 0,        /* every planned bank fully trimmed and released */
+    DS4_RECLAIM_PARTIAL,       /* progress, but some pages or banks failed/staled */
+    DS4_RECLAIM_STALE_PLAN,    /* every planned bank's generation moved; nothing touched */
+    DS4_RECLAIM_BUSY,          /* a batched pass is driving this context */
+    DS4_RECLAIM_UNSUPPORTED,   /* no trimmable substrate, or trim disabled */
+    DS4_RECLAIM_DEVICE_ERROR,  /* driver failure with zero bytes destroyed */
+    DS4_RECLAIM_STATUS__COUNT,
+} ds4_reclaim_status;
+typedef struct {
+    uint32_t bank;
+    uint64_t gen;         /* lineage stamp at prepare (ds4_batch_ctx_bank_generation) */
+    uint64_t est_bytes;   /* exact trim preimage at prepare */
+    uint64_t got_bytes;   /* bytes RELEASED at commit (<= bytes destroyed: a
+                           * release-failed page is destroyed but not returned) */
+    int      status;      /* per-bank ds4_reclaim_status (OK/PARTIAL/STALE_PLAN/DEVICE_ERROR) */
+} ds4_reclaim_bank;
+#define DS4_RECLAIM_MAX_BANKS 128   /* >= the engine's multiseq bound */
+typedef struct {
+    uint32_t n;
+    uint64_t want_bytes;
+    uint64_t est_bytes;   /* sum of banks[].est_bytes */
+    ds4_reclaim_bank banks[DS4_RECLAIM_MAX_BANKS];
+} ds4_reclaim_plan;
+typedef struct {
+    int      status;           /* aggregate ds4_reclaim_status */
+    uint32_t banks_reclaimed;  /* content destroyed; generation advanced */
+    uint32_t banks_stale;      /* skipped: generation moved between the phases */
+    uint64_t bytes_released;   /* returned to the system (census-exact) */
+} ds4_reclaim_result;
+int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_ids,
+                                  uint32_t n_ids, uint64_t want_bytes,
+                                  ds4_reclaim_plan *plan);
+int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
+                                 ds4_reclaim_result *result);
+const char *ds4_reclaim_status_str(int status);
+/* DFM family fallback: Solar/EXAONE/Motif reclaim_prepare is UNSUPPORTED
+ * (fixed CUDA allocs, not DeepSeek VMM slabs).  The serial lane still
+ * trims those family banks via this whole-commons helper. */
 uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes);
 
 /* deepmem D-1c: page-interval union across per-bank credited spans -- the
@@ -488,6 +543,167 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                     void *ud, char *err, size_t errlen);
 
 /* =========================================================================
+ * memgov D0a-1: allocation-census registry (accounting ONLY).
+ *
+ * Types + checked arithmetic live in ds4_mem_census.h (a dependency-free
+ * leaf header shared with ds4_cuda.cu, which self-carries its signatures
+ * and does not include this file); the unit suite drives that exact
+ * production math without a GPU (the D-1c ds4_credit_union_runs
+ * precedent).  This block declares the backend surface only.
+ *
+ * Backend surface (CUDA: real; Metal: stubs -- read returns nonzero).
+ * Scope tags attribute ds4_gpu_tensor_alloc/_reserve funnel traffic to a
+ * consumer class without touching the funnel's 200+ engine call sites:
+ * control-plane code brackets a subsystem (session create, KV create,
+ * batch-ctx create, artifact build, drafter load) and every funnel
+ * allocation inside lands on that class.  Nesting is supported; unmatched
+ * end or overflow counts a fault.  Control-plane only by contract -- the
+ * decode/capture hot path allocates nothing (capture-refusal disciplines)
+ * and therefore never touches the scope.  ds4_gpu_mem_census_read copies
+ * one cell (returns 0) so gates/units can reconcile; rendering porcelain
+ * is D0a-3's. */
+void ds4_gpu_mem_scope_begin(int consumer_class);
+void ds4_gpu_mem_scope_end(void);
+int  ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out);
+uint64_t ds4_gpu_mem_census_faults(void);
+/* D0b-2 versioned snapshots (plan sec 6.3): the registry's seqlock epoch
+ * (ds4_mem_gov.h primitives).  A reader samples begin, copies cells +
+ * faults, then verify(began) -- nonzero means the copy is coherent.
+ * Stubs (Metal/CPU) report a permanently even, never-changing epoch, so
+ * readers there trivially verify (the census itself is UNSUPPORTED). */
+uint64_t ds4_gpu_mem_census_epoch_begin(void);
+int      ds4_gpu_mem_census_epoch_verify(uint64_t began);
+/* D0a-2 typed observation provider (CUDA real; Metal reports
+ * UNSUPPORTED).  ds4_gpu_mem_info is now a shim over this. */
+int  ds4_gpu_mem_observe(ds4_mem_observation *out);
+/* memgov D5-2: residency-plan observability readers (plan sec 14
+ * ds4_residency_units{policy,state} + ds4_residency_failures_total
+ * {model_role,stage}).  Monotonic engine counters over the PUBLIC
+ * vocabularies (ds4_mem_census.h): units keyed by source residency
+ * policy rows (DS4_RESUNIT_POLICY_ROWS; the last row is UNATTRIBUTED)
+ * x ds4_residency_unit_state; failures by ds4_model_source_role x
+ * DS4_RESSTAGE_*.  Nonzero = out of domain, or a backend that keeps no
+ * residency plan (Metal/CPU) -- porcelains render ABSENCE there, the
+ * census contract. */
+int  ds4_gpu_residency_units_read(int policy, int state, uint64_t *out);
+int  ds4_gpu_residency_failures_read(int role, int stage, uint64_t *out);
+/* D0a-4 trim failure-injection (TEST ONLY).  set() arms a bounded burst
+ * at one driver site inside ds4_gpu_tensor_trim (DS4_TRIM_INJECT_UNMAP /
+ * _RELEASE; OFF disarms) and always overrides the DS4_CUDA_TRIM_INJECT
+ * env spec; returns 1 where injection is supported (CUDA), 0 on stubs --
+ * units use that return as their skip gate.  fired() is the lifetime
+ * engagement counter gates assert on. */
+int      ds4_gpu_trim_inject_set(int site, uint32_t count);
+uint32_t ds4_gpu_trim_inject_fired(void);
+/* memgov D1a-1: model source handles + per-source weight ledger.  bind()
+ * declares one host mmap as a served model source (descriptor types in
+ * ds4_mem_census.h) and must run before the map's first weight-class
+ * allocation; the backend then attributes every WEIGHT_* census note to
+ * a source row by map containment.  src_census_read() copies one row
+ * cell -- src index DS4_MSRC_MAX is the UNATTRIBUTED bucket -- returns
+ * nonzero where unsupported (Metal keeps descriptors but no ledger).
+ * report() prints the per-source boot residency lines and reconciles
+ * every weight class cell against its source rows, counting a census
+ * fault on divergence (the standing gates assert faults == 0). */
+int  ds4_gpu_model_source_bind(const void *map_base, uint64_t map_len,
+                               int role, int fd, int residency,
+                               const char *name, const char *path);
+int  ds4_gpu_model_source_count(void);
+int  ds4_gpu_model_source_info(int idx, ds4_model_source *out);
+int  ds4_gpu_mem_src_census_read(int src_idx, int consumer_class, int domain,
+                                 ds4_mem_cell *out);
+void ds4_gpu_report_model_sources(void);
+/* memgov D1a-2: engine-side census-integrity fault (the catalog-vs-
+ * heuristic tripwire feeds the SAME faults counter every standing gate
+ * asserts zero).  Monotonic bump, no epoch bracket (the scope-tag
+ * precedent); Metal stub is a no-op (no census there). */
+void ds4_gpu_mem_census_fault_note(void);
+/* memgov D1a-3: policy provenance for the unit compiler — nonzero when
+ * every replace-kind artifact candidate of this map is served by a
+ * device artifact (self-load build or manifest import), the condition
+ * under which raw expert ranges are never device-allocated.  Metal
+ * stub returns 0. */
+int  ds4_gpu_model_map_replaces_complete(const void *model_map);
+/* memgov D1a-4: bind a source's compiled canonical-unit table (D1a-3) to
+ * the backend as THE residency plan.  The range-publication funnel stamps
+ * every published weight range with its source row + intersecting unit
+ * span; the boot report backfills publications that preceded the bind.
+ * The backend copies the table (process-lifetime, rebind refreshes in
+ * place -- the source-table law).  Requires the map already bound as a
+ * source; returns nonzero (and faults) otherwise.  Metal stub returns
+ * nonzero: units describe the CUDA residency plan (OBS-policy). */
+int  ds4_gpu_model_units_bind(const void *map_base, const ds4_phys_unit *units,
+                              uint32_t count);
+/* memgov D0b-3: the SHADOW governor.  One process-global lease ledger
+ * (ds4_mem_gov.h types) written under the same single-writer discipline
+ * as the census and read through the same seqlock protocol.  Publishes
+ * are ABSOLUTE (sec 6.2); _use and _reservation set their fields
+ * independently so the two owners of a lane (boot carve vs session
+ * growth) never clobber each other.  ds4_gov_shadow_check evaluates a
+ * claim against a fresh ledger image + floor + substrate + observation,
+ * compares with the LIVE formula's verdict (mapped by the caller onto
+ * ADMIT / REFUSE_CLASS / REFUSE_LIVE), ticks exactly one
+ * memgov_decisions cell, and stderr-discloses early real disagreements.
+ * LOG-AND-COUNT ONLY: nothing here influences any live decision (D2). */
+void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident);
+void ds4_gov_publish_reservation(int consumer, uint64_t reservation);
+void ds4_gov_snapshot(ds4_gov_ledger *out);
+void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
+                          int live_status);
+/* memgov D2-1: the per-consumer governance mode table (off | observe |
+ * enforce, ds4_mem_gov.h vocabulary).  Parsed ONCE by _init at engine
+ * open -- DS4_MEMGOV sets every family, DS4_MEMGOV_{BOOT,BANK,SERIAL,
+ * STATIC,PREWARM} win per family; an unrecognized value warns loudly and
+ * keeps the tree default.  ds4_gov_mode never touches the environment
+ * (no hot-path getenv) and returns OBSERVE before init so a missed init
+ * can never silently disable the shadow.  OFF is the kill switch: the
+ * publish/check entry points above become no-ops for that consumer. */
+void ds4_gov_modes_init(void);
+int  ds4_gov_mode(int consumer);
+/* memgov D2-2: the one entry point for a site WITH enforce plumbing.
+ * Returns the status that GOVERNS the caller's behavior:
+ *   off      -> legacy_status, zero governor activity;
+ *   observe  -> legacy_status (the D0b contract: quote counted against
+ *               the legacy verdict, legacy rules);
+ *   enforce  -> the quote rules and the legacy verdict becomes the
+ *               counted comparison target (the matrix stays the oracle
+ *               in both directions until a post-v0.5.7 increment deletes
+ *               the legacy formulas -- plan sec 12 gates that deletion on
+ *               a full release of field confidence; D4-0 adjudication).
+ * Enforce policy for non-verdict quote statuses (sec 6.2/6.4): FAULT
+ * fails CLOSED (returned as REFUSE_LIVE, disclosed); UNSUPPORTED and
+ * RETRY_OBS defer to the legacy verdict (documented backend policy --
+ * a backend with no memory answer keeps its historical behavior). */
+int  ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
+                            int legacy_status);
+/* memgov D2-4: governed check whose protected term is the CALLER's own
+ * margin instead of the operator floor (the D2-2b fit pattern).  The
+ * serial right-size lane passes ds4_session_graph_headroom_bytes() so
+ * its quote evaluates the fit probe's own inequality (free >= margin +
+ * need) plus the ledger's cross-lane terms; the reclaim charter serves
+ * inside the operator-floor band by design. */
+int  ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
+                                   int legacy_status, uint64_t margin_bytes);
+/* Absolute session-graph intent for a ctx (the serial-reserve estimator,
+ * exported): what a committed graph at this ctx costs, for SERIAL_SESSION
+ * and STATIC_BATCH shadow claims. */
+uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx);
+/* The serial session fit gate's headroom (DS4_SESSION_GRAPH_HEADROOM_MB,
+ * default 1024 MiB) -- one source shared by the probe and the S6 claim. */
+uint64_t ds4_session_graph_headroom_bytes(void);
+/* memgaps MG-1 (2026-08-16): release the engine's OWN reclaimable device
+ * reserve (unused graph-pool backing -- trimmed once at boot before this;
+ * session churn re-accumulates it for the process lifetime) before a
+ * live-memory refusal.  ds4_gpu_own_trim is the backend primitive: trim,
+ * then report what the typed observation got back (0 on stubs and non-OK
+ * observations).  ds4_mem_own_trim is the counted, disclosed,
+ * backend-neutral wrapper the refusal ladders call AFTER their legacy
+ * actors and BEFORE the final verdict; admits never pay the driver call.
+ * DS4_MEM_OWN_TRIM=0 is the kill switch (default on). */
+uint64_t ds4_gpu_own_trim(void);
+uint64_t ds4_mem_own_trim(const char *site);
+
+/* =========================================================================
  * Live serving metrics (v0.2.x observability): ONE registry, THREE porcelains.
  *
  * A single global registry of monotonic counters + gauges, incremented by the
@@ -528,6 +744,42 @@ int  ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
  * Inc 5b adds continuation_hold: serial work refused because the session is
  * reserved for a live tool continuation (grace window or queued hard pin). */
 #define DS4_METRICS_SHED_REASONS 6
+/* memgov D5-3 (plan sec 12 items 4-5): THE typed rejection family --
+ * ds4_requests_rejected_total{lane,reason} -- ONE new fixed-cardinality
+ * family beside the FROZEN legacy scalars (ds4_cont_admit_rejects_total,
+ * ds4_graph_fit_refusals_total, ds4_requests_refused_deep_serial_total
+ * render byte-identically forever; never labeled children under those
+ * names).  lane = which admission lane refused the work; reason carries
+ * D6's retryability law by NAME: LIVE_HEADROOM and OBS_RETRY are the
+ * only reasons a future scheduler may requeue (unstarted work only) --
+ * CLASS_BUDGET, UNSUPPORTED, FAULT and DEEP_POLICY are never retried
+ * (plan sec 12 D6). */
+enum {
+    DS4_REJLANE_CONT = 0,      /* continuous admission (bank grant)      */
+    DS4_REJLANE_SERIAL,        /* serial session lane (fit + policy)     */
+    DS4_REJLANE_STATIC,        /* static batch per-call graph            */
+    DS4_REJLANE__COUNT
+};
+enum {
+    DS4_REJECT_CLASS_BUDGET = 0,  /* plan/class budget: never retry      */
+    DS4_REJECT_LIVE_HEADROOM,     /* live free-memory deficit: transient */
+    DS4_REJECT_OBS_RETRY,         /* observation snapshot busy: transient*/
+    DS4_REJECT_UNSUPPORTED,       /* shape/backend: never                */
+    DS4_REJECT_FAULT,             /* internal fault: never               */
+    DS4_REJECT_DEEP_POLICY,       /* deep-ctx serial policy: never       */
+    DS4_REJECT__COUNT
+};
+/* The governed-check refusal statuses map 1:1 onto reasons; ADMIT never
+ * reaches a tick site (callers tick only on refusal). */
+static inline int ds4_reject_reason_from_gov(int gov_status) {
+    switch (gov_status) {
+    case DS4_GOV_REFUSE_CLASS: return DS4_REJECT_CLASS_BUDGET;
+    case DS4_GOV_REFUSE_LIVE:  return DS4_REJECT_LIVE_HEADROOM;
+    case DS4_GOV_RETRY_OBS:    return DS4_REJECT_OBS_RETRY;
+    case DS4_GOV_UNSUPPORTED:  return DS4_REJECT_UNSUPPORTED;
+    default:                   return DS4_REJECT_FAULT;
+    }
+}
 typedef struct {
     uint64_t stamp;               /* monotonic second this bucket belongs to */
     uint64_t dec_tok, dec_steps, pf_tok;
@@ -544,6 +796,10 @@ typedef struct {
     /* engine admission + refusals */
     uint64_t graph_fit_refusals;            /* session-graph fit gate said no */
     uint64_t cont_admit_rejects;            /* comp-cache budget rejects */
+    /* memgov D5-3: the typed rejection family (lane x reason enums above,
+     * both closed).  Ticked BESIDE the legacy scalars, which stay frozen;
+     * every cell renders on /metrics. */
+    uint64_t requests_rejected_typed[DS4_REJLANE__COUNT][DS4_REJECT__COUNT];
     uint64_t cont_batch_failures;           /* continuous run ended in error */
     uint64_t admits_cold, admits_warm, admits_fork;
     uint64_t admits_partial_fork, admits_partial_truncate;
@@ -591,6 +847,41 @@ typedef struct {
      * cut-list check reads). */
     uint64_t batch_genmu_wait_ns;
     uint64_t batch_genmu_waits;
+    /* memgov D0a-3: typed-observation history at the DECISION site (O1,
+     * the ds4_mem_usable live gate) -- OK answers by winning source, plus
+     * non-OK calls.  The porcelains sample the CURRENT observation fresh
+     * at render time; these counters carry what the gate actually
+     * consumed over the process lifetime. */
+    uint64_t memobs_calls[DS4_MEMOBS_SRC_MEMINFO_AVAILABLE + 1];
+    uint64_t memobs_errors;
+    /* memgov D0b-3: shadow-decision counters, fixed cardinality by
+     * construction (consumer x shadow status x comparison reason; all
+     * three enums are closed).  Every ds4_gov_shadow_check ticks exactly
+     * one cell; /metrics renders the full family (absence-is-never-zero
+     * does not apply -- these are process counters, not backend state). */
+    uint64_t memgov_decisions[DS4_GOVC__COUNT]
+                             [DS4_GOV_STATUS__COUNT]
+                             [DS4_GOV_CMP__COUNT];
+    uint64_t memgov_faults;       /* publish/evaluate faults (gov ledger) */
+    /* memgov D5-2: last-decision deficit per consumer (plan sec 14
+     * ds4_memory_decision_deficit_bytes{consumer}, a GAUGE).  Written by
+     * every governed check from its quote -- an ADMIT writes 0, so the
+     * gauge always describes the most recent verdict, never a stale
+     * refusal. */
+    uint64_t memgov_deficit[DS4_GOVC__COUNT];
+    /* memgov D4-3: reclaim outcome counters, fixed cardinality by
+     * construction (ds4_reclaim_status is closed).  Per-BANK outcomes and
+     * released bytes, ticked inside reclaim commit so every consumer is
+     * counted -- plan sec 14's ds4_reclaim_{banks,bytes}_total{result}
+     * families.  Request-level BUSY/UNSUPPORTED refusals plan no banks and
+     * tick nothing; the families still render every label. */
+    uint64_t reclaim_banks[DS4_RECLAIM_STATUS__COUNT];
+    uint64_t reclaim_bytes[DS4_RECLAIM_STATUS__COUNT];
+    /* memgaps MG-1: own-reserve trims at refusal ladders -- calls, and
+     * bytes the typed observation recovered (sec 14 naming:
+     * ds4_mem_own_trim_{calls,recovered_bytes}_total). */
+    uint64_t mem_own_trim_calls;
+    uint64_t mem_own_trim_recovered;
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);
@@ -780,6 +1071,27 @@ int ds4_session_prefill_cap(ds4_session *s);
  * gate right now (quiet probe; fail-open like the gate itself). */
 int ds4_session_graph_pending(const ds4_session *s);
 int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size);
+/* memgov D4-1: the structured fit quote (revised plan sec 10 step 1) -- the
+ * boolean probe's own terms, exposed.  need = the graph alloc estimate at
+ * ctx_size; headroom = the shared protected margin
+ * (ds4_session_graph_headroom_bytes); avail = allocatable bytes at quote
+ * time (pending substrate promotions already deducted); deficit =
+ * saturating max(0, need + headroom - avail), and deficit == 0 exactly when
+ * fits.  fail_open marks the probe's historical yes-without-numbers legs
+ * (fit gate disabled, budget-less backend, CPU): fits = 1 with every byte
+ * field 0.  The reclaim caller trims want = deficit + headroom from the
+ * idle commons instead of all of it.  Returns fits; the boolean probe above
+ * is this quote with the numbers discarded. */
+typedef struct {
+    int      fits;            /* 1 = a graph at ctx_size allocates now */
+    int      fail_open;       /* 1 = no budget answer; byte fields are 0 */
+    uint64_t need_bytes;      /* graph alloc estimate at ctx_size */
+    uint64_t headroom_bytes;  /* required slack on top of need */
+    uint64_t avail_bytes;     /* allocatable bytes at quote time */
+    uint64_t deficit_bytes;   /* saturating need + headroom - avail floor 0 */
+} ds4_session_graph_fit_quote;
+int ds4_engine_session_graph_fit_quote(ds4_engine *e, int ctx_size,
+                                       ds4_session_graph_fit_quote *q);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
