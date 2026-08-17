@@ -132,10 +132,10 @@ enum {
     DS4_MAX_EXPERT_SHARED    = 1,
     DS4_MAX_FF_EXP           = 3072,
     DS4_MAX_HASH_LAYER       = 3,
-    DS4_MAX_SWA              = 128,
+    DS4_MAX_SWA              = 513,
     DS4_MAX_INDEXER_HEAD     = 64,
     DS4_MAX_INDEXER_HEAD_DIM = 128,
-    DS4_MAX_INDEXER_TOP_K    = 1024,
+    DS4_MAX_INDEXER_TOP_K    = 2048,
     DS4_MAX_HC               = 4,
     DS4_MAX_HC_SINKHORN_ITER = 20,
 };
@@ -145,6 +145,7 @@ typedef enum {
     DS4_MODEL_FAMILY_SOLAR_OPEN2 = 1,
     DS4_MODEL_FAMILY_MOTIF3      = 2,
     DS4_MODEL_FAMILY_EXAONE_MOE  = 3,
+    DS4_MODEL_FAMILY_DOTS3_NOTE  = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -153,6 +154,7 @@ typedef enum {
     DS4_VARIANT_SOLAR_OPEN2_250B = 2,
     DS4_VARIANT_MOTIF3          = 3,
     DS4_VARIANT_KEXAONE_236B    = 4,
+    DS4_VARIANT_DOTS3_NOTE_PREV = 5,
 } ds4_variant;
 
 typedef struct {
@@ -190,6 +192,14 @@ typedef struct {
     uint32_t n_kv_lora;
     uint32_t n_key_mla;
     uint32_t n_value_mla;
+    /* dots3-note runs two MLA geometries in one model: the 13 full-attention
+     * layers use n_head/n_kv_lora/n_key_mla above, while the 33 sliding-window
+     * layers (and the MTP block) use these swa_* widths with the same n_rot
+     * and n_value_mla.  No other family sets them. */
+    uint32_t n_swa_head;
+    uint32_t n_swa_kv_lora;
+    uint32_t n_swa_key_mla;
+    uint32_t n_full_attn_count;
     uint32_t n_kda_head_dim;
     uint32_t n_ssm_conv;
     bool use_rope;
@@ -201,6 +211,7 @@ typedef struct {
     float expert_weight_scale;
     float swiglu_clamp_exp;
     float rope_freq_base;
+    float rope_freq_base_swa;   /* dots3-note: SWA layers rotate at 5e4, full layers at 8e7 */
     float rope_scale_factor;
     float rope_yarn_beta_fast;
     float rope_yarn_beta_slow;
@@ -425,6 +436,67 @@ static const ds4_shape DS4_SHAPE_KEXAONE_236B = {
     .rope_orig_ctx = 262144,
 };
 
+/* dots-studio/dots3-note-prev, language+MTP conversion.  Pinned to source
+ * revision 1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b.  Two MLA geometries share
+ * one model: 13 full-attention layers (0, then 1,5,...,45) run 128 heads over
+ * a 512-wide latent with the DSA lightning indexer (top-2048), the other 33
+ * layers run 64 heads over a 1024-wide latent inside a 513-token sliding
+ * window.  Both geometries share n_rot=64 (interleaved rope, no scaling), a
+ * 128-dim value head, an RMSNorm on the shared rope key, and a headwise
+ * sigmoid output gate.  blk.46 is the MTP block (SWA geometry, dense FFN),
+ * counted in n_layer like K-EXAONE's NextN block and never executed by
+ * target-model serving. */
+static const ds4_shape DS4_SHAPE_DOTS3_NOTE_PREV = {
+    .name = "dots3-note-prev",
+    .family = DS4_MODEL_FAMILY_DOTS3_NOTE,
+    .variant = DS4_VARIANT_DOTS3_NOTE_PREV,
+    .n_layer = 47,                /* 46 text layers + 1 MTP block */
+    .n_embd = 5120,
+    .n_vocab = 152064,
+    .n_head = 128,
+    .n_head_kv = 128,             /* full-attention MLA expands per query head */
+    .n_head_dim = 192,            /* full qk head dim: nope 128 + rope 64 */
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_out_group = 0,
+    .n_lora_q = 1024,             /* shared by both geometries */
+    .n_lora_o = 0,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 1536,
+    .n_ff_dense = 13824,          /* dense layer 0 and the MTP block's MLP */
+    .n_hash_layer = 0,
+    .n_swa = 513,
+    .n_swa_period = 4,            /* full layers: il==0 or il%4==1 */
+    .n_indexer_head = 64,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 2048,
+    .n_hc = 0,
+    .n_hc_sinkhorn_iter = 0,
+    .n_nextn_predict = 1,
+    .n_leading_dense = 1,
+    .n_kv_lora = 512,
+    .n_key_mla = 192,
+    .n_value_mla = 128,
+    .n_swa_head = 64,
+    .n_swa_kv_lora = 1024,
+    .n_swa_key_mla = 256,         /* swa qk head dim: nope 192 + rope 64 */
+    .n_full_attn_count = 13,
+    .use_rope = true,
+    .rms_eps = 1.0e-5f,
+    .hc_eps = 0.0f,
+    .expert_weight_scale = 1.0f,  /* routed_scaling_factor */
+    .swiglu_clamp_exp = 0.0f,
+    .rope_freq_base = 80000000.0f,
+    .rope_freq_base_swa = 50000.0f,
+    .rope_scale_factor = 1.0f,    /* rope_scaling: null */
+    .rope_yarn_beta_fast = 0.0f,
+    .rope_yarn_beta_slow = 0.0f,
+    .compress_rope_freq_base = 0.0f,
+    .rope_orig_ctx = 524288,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -511,6 +583,11 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
 #define DS4_SWIGLU_CLAMP_EXP          (g_ds4_shape.swiglu_clamp_exp)
 #define DS4_ROPE_FREQ_BASE            (g_ds4_shape.rope_freq_base)
+#define DS4_ROPE_FREQ_BASE_SWA        (g_ds4_shape.rope_freq_base_swa)
+#define DS4_N_SWA_HEAD                (g_ds4_shape.n_swa_head)
+#define DS4_N_SWA_KV_LORA             (g_ds4_shape.n_swa_kv_lora)
+#define DS4_N_SWA_KEY_MLA             (g_ds4_shape.n_swa_key_mla)
+#define DS4_N_FULL_ATTN_COUNT         (g_ds4_shape.n_full_attn_count)
 #define DS4_ROPE_SCALE_FACTOR         (g_ds4_shape.rope_scale_factor)
 #define DS4_ROPE_YARN_BETA_FAST       (g_ds4_shape.rope_yarn_beta_fast)
 #define DS4_ROPE_YARN_BETA_SLOW       (g_ds4_shape.rope_yarn_beta_slow)
@@ -858,6 +935,17 @@ static bool ds4_solar_layer_is_gqa(uint32_t il) {
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_SOLAR_OPEN2) return false;
     if (il >= DS4_N_LAYER) ds4_die("Solar layer index is outside the loaded model layout");
     return (il % 4u) == 0u;
+}
+
+/* dots3-note interleaves full attention as {0, 1, 5, 9, ..., 45}: layer 0 plus
+ * every fourth layer starting at 1.  Full layers carry MLA+DSA at the wide
+ * geometry; every other layer, including the trailing MTP block, is a 513-token
+ * sliding-window MLA at the narrow geometry. */
+static bool ds4_dots3_layer_is_full_attention(uint32_t il) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DOTS3_NOTE) return false;
+    if (il >= DS4_N_LAYER) ds4_die("dots3-note layer index is outside the loaded model layout");
+    if (DS4_N_NEXTN_PREDICT != 0 && il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) return false;
+    return il == 0u || (DS4_N_SWA_PERIOD != 0 && (il % DS4_N_SWA_PERIOD) == 1u);
 }
 
 static const char *solar_kv_format_name(ds4_solar_kv_format format) {
@@ -2334,25 +2422,34 @@ static void model_summary(const ds4_model *m) {
 
     model_get_string(m, "general.name", &name);
     model_get_string(m, "general.architecture", &arch);
-    if (!model_get_u32(m, "deepseek4.block_count", &layers))
-        model_get_u32(m, "motif3.block_count", &layers);
-    if (!model_get_u64_compat(m, "deepseek4.context_length", &ctx_train))
-        model_get_u64_compat(m, "motif3.context_length", &ctx_train);
-    if (!model_get_u32(m, "deepseek4.attention.head_count", &n_head))
-        model_get_u32(m, "motif3.attention.head_count", &n_head);
-    if (!model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv))
-        model_get_u32(m, "motif3.attention.head_count_kv", &n_head_kv);
-    if (!model_get_u32(m, "deepseek4.attention.key_length", &head_dim))
-        model_get_u32(m, "motif3.attention.key_length", &head_dim);
-    if (!model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa))
-        model_get_u32(m, "motif3.attention.sliding_window", &n_swa);
+    if (!model_get_u32(m, "deepseek4.block_count", &layers) &&
+        !model_get_u32(m, "motif3.block_count", &layers))
+        model_get_u32(m, "dots3-note.block_count", &layers);
+    if (!model_get_u64_compat(m, "deepseek4.context_length", &ctx_train) &&
+        !model_get_u64_compat(m, "motif3.context_length", &ctx_train))
+        model_get_u64_compat(m, "dots3-note.context_length", &ctx_train);
+    if (!model_get_u32(m, "deepseek4.attention.head_count", &n_head) &&
+        !model_get_u32(m, "motif3.attention.head_count", &n_head))
+        model_get_u32(m, "dots3-note.attention.head_count", &n_head);
+    if (!model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv) &&
+        !model_get_u32(m, "motif3.attention.head_count_kv", &n_head_kv))
+        model_get_u32(m, "dots3-note.attention.head_count_kv", &n_head_kv);
+    if (!model_get_u32(m, "deepseek4.attention.key_length", &head_dim) &&
+        !model_get_u32(m, "motif3.attention.key_length", &head_dim))
+        model_get_u32(m, "dots3-note.attention.key_length", &head_dim);
+    if (!model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa) &&
+        !model_get_u32(m, "motif3.attention.sliding_window", &n_swa))
+        model_get_u32(m, "dots3-note.sliding_window", &n_swa);
     model_get_u32(m, "deepseek4.attention.indexer.head_count", &indexer_heads);
     model_get_u32(m, "deepseek4.attention.indexer.key_length", &indexer_head_dim);
-    model_get_u32(m, "deepseek4.attention.indexer.top_k", &indexer_top_k);
-    if (!model_get_u32(m, "deepseek4.expert_count", &n_expert))
-        model_get_u32(m, "motif3.expert_count", &n_expert);
-    if (!model_get_u32(m, "deepseek4.expert_used_count", &n_expert_used))
-        model_get_u32(m, "motif3.expert_used_count", &n_expert_used);
+    if (!model_get_u32(m, "deepseek4.attention.indexer.top_k", &indexer_top_k))
+        model_get_u32(m, "dots3-note.index_topk", &indexer_top_k);
+    if (!model_get_u32(m, "deepseek4.expert_count", &n_expert) &&
+        !model_get_u32(m, "motif3.expert_count", &n_expert))
+        model_get_u32(m, "dots3-note.expert_count", &n_expert);
+    if (!model_get_u32(m, "deepseek4.expert_used_count", &n_expert_used) &&
+        !model_get_u32(m, "motif3.expert_used_count", &n_expert_used))
+        model_get_u32(m, "dots3-note.expert_used_count", &n_expert_used);
     model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
     model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used);
 
@@ -3600,6 +3697,16 @@ typedef struct {
     ds4_tensor *nextn_enorm;
     ds4_tensor *nextn_hnorm;
     ds4_tensor *nextn_shared_head_norm;
+    /* dots3-note extras.  attn_k_rope_norm is an RMSNorm over the shared
+     * 64-dim rope key applied before rotation; the headwise output gate
+     * reuses attn_gate.  The DSA lightning indexer keeps its own projections;
+     * its k_norm is a LayerNorm with bias, the only one in this engine. */
+    ds4_tensor *attn_k_rope_norm;
+    ds4_tensor *attn_idx_q_b;
+    ds4_tensor *attn_idx_k;
+    ds4_tensor *attn_idx_w;
+    ds4_tensor *attn_idx_k_norm;
+    ds4_tensor *attn_idx_k_norm_bias;
 } ds4_layer_weights;
 
 typedef struct {
@@ -3617,6 +3724,10 @@ typedef struct {
     ds4_tensor *motif_mtp_input_proj;
     ds4_tensor *motif_mtp_final_norm;
     ds4_layer_weights motif_mtp;
+    /* dots3-note keeps its MTP block inside block_count as blk.46 (bound in
+     * layer[] like K-EXAONE's NextN), but the MTP embedding table is a
+     * separate top-level tensor. */
+    ds4_tensor *dots3_token_embd_mtp;
 } ds4_weights;
 
 typedef struct {
@@ -4182,6 +4293,178 @@ static void weights_validate_motif3_layout(
     }
 }
 
+static bool weights_dots3_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l ||
+        !l->attn_norm ||
+        !l->attn_q_a ||
+        !l->attn_q_a_norm ||
+        !l->attn_q_b ||
+        !l->attn_kv_a_mqa ||
+        !l->attn_kv_a_norm ||
+        !l->attn_kv_b ||
+        !l->attn_k_rope_norm ||
+        !l->attn_gate ||
+        !l->attn_output ||
+        !l->ffn_norm) {
+        return false;
+    }
+    if (ds4_dots3_layer_is_full_attention(il)) {
+        if (!l->attn_idx_q_b || !l->attn_idx_k || !l->attn_idx_w ||
+            !l->attn_idx_k_norm || !l->attn_idx_k_norm_bias) {
+            return false;
+        }
+    }
+    const bool is_nextn = DS4_N_NEXTN_PREDICT != 0 &&
+                          il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+    if (il < DS4_N_LEADING_DENSE || is_nextn) {
+        if (!l->ffn_gate || !l->ffn_up || !l->ffn_down) return false;
+    } else {
+        if (!l->ffn_gate_inp ||
+            !l->ffn_exp_probs_b ||
+            !l->ffn_gate_exps ||
+            !l->ffn_up_exps ||
+            !l->ffn_down_exps ||
+            !l->ffn_gate_shexp ||
+            !l->ffn_up_shexp ||
+            !l->ffn_down_shexp) {
+            return false;
+        }
+    }
+    if (is_nextn) {
+        return l->nextn_eh_proj && l->nextn_enorm && l->nextn_hnorm &&
+               l->nextn_shared_head_norm;
+    }
+    return true;
+}
+
+/* The MQ87 conversion keeps the tiny in-attention norm vectors (q_a_norm,
+ * kv_a_norm, k_rope_norm) as Q8_0 rows; only the residual-stream norms and
+ * the indexer LayerNorm stay F32. */
+static void weights_validate_dots3_attention(const ds4_layer_weights *l, uint32_t il) {
+    const bool full = ds4_dots3_layer_is_full_attention(il);
+    const uint64_t heads = full ? DS4_N_HEAD : DS4_N_SWA_HEAD;
+    const uint64_t kv_lora = full ? DS4_N_KV_LORA : DS4_N_SWA_KV_LORA;
+    const uint64_t qk_dim = full ? DS4_N_KEY_MLA : DS4_N_SWA_KEY_MLA;
+    const uint64_t nope = qk_dim - DS4_N_ROT;
+    const uint64_t v_dim = DS4_N_VALUE_MLA;
+
+    tensor_expect_layout(l->attn_norm,       DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(l->attn_q_a,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+    tensor_expect_layout(l->attn_q_a_norm,   DS4_TENSOR_Q8_0, 1, DS4_N_LORA_Q, 0, 0);
+    tensor_expect_layout(l->attn_q_b,        DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, heads * qk_dim, 0);
+    tensor_expect_layout(l->attn_kv_a_mqa,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, kv_lora + DS4_N_ROT, 0);
+    tensor_expect_layout(l->attn_kv_a_norm,  DS4_TENSOR_Q8_0, 1, kv_lora, 0, 0);
+    tensor_expect_layout(l->attn_kv_b,       DS4_TENSOR_Q8_0, 2, kv_lora, heads * (nope + v_dim), 0);
+    tensor_expect_layout(l->attn_k_rope_norm, DS4_TENSOR_Q8_0, 1, DS4_N_ROT, 0, 0);
+    tensor_expect_layout(l->attn_gate,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, heads, 0);
+    tensor_expect_layout(l->attn_output,     DS4_TENSOR_Q8_0, 2, heads * v_dim, DS4_N_EMBD, 0);
+
+    if (full) {
+        tensor_expect_layout(l->attn_idx_q_b, DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q,
+                             (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM, 0);
+        tensor_expect_layout(l->attn_idx_k, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD,
+                             DS4_N_INDEXER_HEAD_DIM, 0);
+        tensor_expect_layout(l->attn_idx_w, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD,
+                             DS4_N_INDEXER_HEAD, 0);
+        tensor_expect_layout(l->attn_idx_k_norm, DS4_TENSOR_F32, 1,
+                             DS4_N_INDEXER_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_idx_k_norm_bias, DS4_TENSOR_F32, 1,
+                             DS4_N_INDEXER_HEAD_DIM, 0, 0);
+    }
+}
+
+static void weights_validate_dots3_dense_ffn(const ds4_layer_weights *l) {
+    tensor_expect_layout(l->ffn_gate, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+    tensor_expect_layout(l->ffn_up,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+    tensor_expect_layout(l->ffn_down, DS4_TENSOR_Q8_0, 2, DS4_N_FF_DENSE, DS4_N_EMBD, 0);
+}
+
+static void weights_validate_dots3_sparse_ffn(const ds4_layer_weights *l) {
+    tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2,
+                         DS4_N_EMBD, DS4_N_EXPERT, 0);
+    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1,
+                         DS4_N_EXPERT, 0, 0);
+    tensor_expect_layout(l->ffn_gate_exps, DS4_TENSOR_IQ2_XXS, 3,
+                         DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+    tensor_expect_layout(l->ffn_up_exps, DS4_TENSOR_IQ2_XXS, 3,
+                         DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+    tensor_expect_layout(l->ffn_down_exps, DS4_TENSOR_Q2_K, 3,
+                         DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+    tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2,
+                         DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_layout(l->ffn_up_shexp, DS4_TENSOR_Q8_0, 2,
+                         DS4_N_EMBD, DS4_N_FF_EXP, 0);
+    tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2,
+                         DS4_N_FF_EXP, DS4_N_EMBD, 0);
+}
+
+static void weights_validate_dots3_note_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    if (!w) ds4_die("internal error: missing weights while validating dots3-note layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in dots3-note layout");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in dots3-note layout");
+    }
+
+    if (require_token_embd && !w->token_embd) {
+        ds4_die("required dots3-note token embedding tensor is missing");
+    }
+    if (w->token_embd) {
+        tensor_expect_layout(w->token_embd, DS4_TENSOR_Q8_0, 2,
+                             DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required dots3-note output head is missing");
+    if (weights_have_partial_output_head(w) && !have_output) {
+        ds4_die("partial dots3-note output head in GGUF");
+    }
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(w->output, DS4_TENSOR_Q8_0, 2,
+                             DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_dots3_layer_has_required(l, il)) {
+            fprintf(stderr, "ds4: required dots3-note tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        weights_validate_dots3_attention(l, il);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        const bool is_nextn = DS4_N_NEXTN_PREDICT != 0 &&
+                              il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+        if (il < DS4_N_LEADING_DENSE || is_nextn) {
+            weights_validate_dots3_dense_ffn(l);
+        } else {
+            weights_validate_dots3_sparse_ffn(l);
+        }
+        if (is_nextn) {
+            tensor_expect_layout(l->nextn_eh_proj, DS4_TENSOR_Q8_0, 2,
+                                 2u * (uint64_t)DS4_N_EMBD, DS4_N_EMBD, 0);
+            tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_shared_head_norm, DS4_TENSOR_F32, 1,
+                                 DS4_N_EMBD, 0, 0);
+        }
+    }
+
+    /* The MTP embedding table travels with a full-model bind even though
+     * target-model serving never executes the MTP block. */
+    if (layer_start == 0 && layer_end == DS4_N_LAYER - 1u) {
+        if (!w->dots3_token_embd_mtp) {
+            ds4_die("official dots3-note MTP topology is incomplete");
+        }
+        tensor_expect_layout(w->dots3_token_embd_mtp, DS4_TENSOR_Q8_0, 2,
+                             DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+}
+
 static bool weights_solar_open2_layer_has_required(
         const ds4_layer_weights *l,
         uint32_t                 il) {
@@ -4481,6 +4764,14 @@ static void weights_validate_layout(const ds4_weights *w) {
                                        DS4_N_LAYER - 1u,
                                        true,
                                        true);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        weights_validate_dots3_note_layout(w,
+                                           0,
+                                           DS4_N_LAYER - 1u,
+                                           true,
+                                           true);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
@@ -5050,6 +5341,79 @@ static void config_validate_motif3_model(const ds4_model *m) {
     config_expect_u32("full_attention_layer_count", full_layers, 14);
 }
 
+static void config_validate_dots3_note_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_DOTS3_NOTE_PREV;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_layer = required_u32(m, "dots3-note.block_count");
+    const uint64_t n_ctx = required_u64_compat(m, "dots3-note.context_length");
+    const uint32_t n_embd = required_u32(m, "dots3-note.embedding_length");
+    const uint32_t n_vocab = required_u32(m, "dots3-note.vocab_size");
+    const uint32_t n_ff_dense = required_u32(m, "dots3-note.feed_forward_length");
+    const uint32_t n_leading_dense = required_u32(m, "dots3-note.leading_dense_block_count");
+    const uint32_t n_expert = required_u32(m, "dots3-note.expert_count");
+    const uint32_t n_expert_used = required_u32(m, "dots3-note.expert_used_count");
+    const uint32_t n_ff_exp = required_u32(m, "dots3-note.expert_feed_forward_length");
+    const uint32_t n_expert_shared = required_u32(m, "dots3-note.expert_shared_count");
+    const uint32_t n_head = required_u32(m, "dots3-note.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "dots3-note.attention.head_count_kv");
+    const uint32_t n_head_dim = required_u32(m, "dots3-note.attention.key_length");
+    const uint32_t n_value_dim = required_u32(m, "dots3-note.attention.value_length");
+    const uint32_t n_swa = required_u32(m, "dots3-note.sliding_window");
+    const uint32_t n_index_topk = required_u32(m, "dots3-note.index_topk");
+    const uint32_t n_lora_q = required_u32(m, "dots3-note.q_lora_rank");
+    const uint32_t n_kv_lora = required_u32(m, "dots3-note.kv_lora_rank");
+    const uint32_t n_swa_kv_lora = required_u32(m, "dots3-note.swa_kv_lora_rank");
+    const uint32_t n_full = required_u32(m, "dots3-note.full_attention_count");
+
+    config_expect_u32("block_count", n_layer, DS4_N_LAYER);
+    config_expect_u64("context_length", n_ctx, UINT64_C(524288));
+    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
+    config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
+    config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
+    config_expect_u32("leading_dense_block_count", n_leading_dense, DS4_N_LEADING_DENSE);
+    config_expect_u32("expert_count", n_expert, DS4_N_EXPERT);
+    config_expect_u32("expert_used_count", n_expert_used, DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length", n_ff_exp, DS4_N_FF_EXP);
+    config_expect_u32("expert_shared_count", n_expert_shared, DS4_N_EXPERT_SHARED);
+    config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv", n_head_kv, DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length", n_head_dim, DS4_N_KEY_MLA);
+    config_expect_u32("attention.value_length", n_value_dim, DS4_N_VALUE_MLA);
+    config_expect_u32("sliding_window", n_swa, DS4_N_SWA);
+    config_expect_u32("index_topk", n_index_topk, DS4_N_INDEXER_TOP_K);
+    config_expect_u32("q_lora_rank", n_lora_q, DS4_N_LORA_Q);
+    config_expect_u32("kv_lora_rank", n_kv_lora, DS4_N_KV_LORA);
+    config_expect_u32("swa_kv_lora_rank", n_swa_kv_lora, DS4_N_SWA_KV_LORA);
+    config_expect_u32("full_attention_count", n_full, DS4_N_FULL_ATTN_COUNT);
+
+    config_expect_bool("language_only",
+                       required_bool(m, "dots3-note.language_only"), true);
+    config_expect_bool("mtp.present",
+                       required_bool(m, "dots3-note.mtp.present"), true);
+
+    config_expect_f32("rope.freq_base",
+                      required_f32(m, "dots3-note.rope.freq_base"), DS4_ROPE_FREQ_BASE);
+    config_expect_f32("rope.freq_base_swa",
+                      required_f32(m, "dots3-note.rope.freq_base_swa"), DS4_ROPE_FREQ_BASE_SWA);
+    config_expect_f32("attention.layer_norm_rms_epsilon",
+                      required_f32(m, "dots3-note.attention.layer_norm_rms_epsilon"),
+                      DS4_RMS_EPS);
+
+    ds4_str config_sha = {0};
+    if (!model_get_string(m, "dots3-note.source.config_sha256", &config_sha) ||
+        !ds4_streq(config_sha,
+                   "99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833")) {
+        ds4_die("dots3-note GGUF does not match the pinned official preview config");
+    }
+
+    uint32_t full_layers = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_dots3_layer_is_full_attention(il)) full_layers++;
+    }
+    config_expect_u32("full_attention_layer_count", full_layers, DS4_N_FULL_ATTN_COUNT);
+}
+
 static void config_validate_solar_open2_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_SOLAR_OPEN2_250B;
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
@@ -5268,6 +5632,10 @@ static void config_validate_model(const ds4_model *m) {
         config_validate_motif3_model(m);
         return;
     }
+    if (ds4_streq(arch, "dots3-note")) {
+        config_validate_dots3_note_model(m);
+        return;
+    }
     fprintf(stderr, "ds4: unsupported GGUF architecture: %.*s\n",
             (int)arch.len, arch.ptr);
     exit(1);
@@ -5408,6 +5776,62 @@ static void weights_bind_motif3_mtp(ds4_weights *w, const ds4_model *m) {
     l->ffn_polynorm_bias = required_tensor(m, "mtp.0.ffn_polynorm.bias");
 }
 
+/* dots3-note binds both MLA geometries through the same field set; the layer
+ * kind decides the tensor widths, which weights_validate_dots3_attention pins
+ * exactly.  The DSA indexer exists only on full-attention layers, and the
+ * trailing blk.46 MTP block adds the eh_proj/enorm/hnorm/shared_head_norm
+ * quartet on top of a dense FFN, K-EXAONE NextN style. */
+static void weights_bind_dots3_note_layer(
+        ds4_layer_weights *l,
+        const ds4_model   *m,
+        uint32_t           il) {
+    l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q_a = required_tensorf(m, "blk.%u.attn_q_a.weight", il);
+    l->attn_q_a_norm = required_tensorf(m, "blk.%u.attn_q_a_norm.weight", il);
+    l->attn_q_b = required_tensorf(m, "blk.%u.attn_q_b.weight", il);
+    l->attn_kv_a_mqa = required_tensorf(m, "blk.%u.attn_kv_a_mqa.weight", il);
+    l->attn_kv_a_norm = required_tensorf(m, "blk.%u.attn_kv_a_norm.weight", il);
+    l->attn_kv_b = required_tensorf(m, "blk.%u.attn_kv_b.weight", il);
+    l->attn_k_rope_norm = required_tensorf(m, "blk.%u.attn_k_rope_norm.weight", il);
+    l->attn_gate = required_tensorf(m, "blk.%u.attn_gate.weight", il);
+    l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+
+    if (ds4_dots3_layer_is_full_attention(il)) {
+        l->attn_idx_q_b = required_tensorf(m, "blk.%u.attn_idx_q_b.weight", il);
+        l->attn_idx_k = required_tensorf(m, "blk.%u.attn_idx_k.weight", il);
+        l->attn_idx_w = required_tensorf(m, "blk.%u.attn_idx_w.weight", il);
+        l->attn_idx_k_norm = required_tensorf(m, "blk.%u.attn_idx_k_norm.weight", il);
+        l->attn_idx_k_norm_bias = required_tensorf(m, "blk.%u.attn_idx_k_norm.bias", il);
+    }
+
+    l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+
+    const bool is_nextn = DS4_N_NEXTN_PREDICT != 0 &&
+                          il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+    if (il < DS4_N_LEADING_DENSE || is_nextn) {
+        l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_up   = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+        l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+    } else {
+        l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+        l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+        l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+        l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+        l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+        l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+        l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+        l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+    }
+
+    if (is_nextn) {
+        l->nextn_eh_proj = required_tensorf(m, "blk.%u.eh_proj.weight", il);
+        l->nextn_enorm   = required_tensorf(m, "blk.%u.enorm.weight", il);
+        l->nextn_hnorm   = required_tensorf(m, "blk.%u.hnorm.weight", il);
+        l->nextn_shared_head_norm =
+            required_tensorf(m, "blk.%u.shared_head_norm.weight", il);
+    }
+}
+
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
 
@@ -5476,6 +5900,17 @@ static void weights_bind(
             weights_bind_motif3_layer(&w->layer[il], m, il);
         }
         weights_bind_motif3_mtp(w, m);
+        weights_validate_layout(w);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        w->token_embd = required_tensor(m, "token_embd.weight");
+        w->output_norm = required_tensor(m, "output_norm.weight");
+        w->output = required_tensor(m, "output.weight");
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            weights_bind_dots3_note_layer(&w->layer[il], m, il);
+        }
+        w->dots3_token_embd_mtp = required_tensor(m, "token_embd_mtp.weight");
         weights_validate_layout(w);
         return;
     }
@@ -27134,6 +27569,12 @@ struct ds4_vocab {
     int tool_schema_start_id;
     int tool_schema_end_id;
     int dsml_id;
+    /* dots3-note closes each role with its own marker instead of one
+     * end-of-turn token, and its EOS is <|endofassistant|>, so the literal
+     * "<|endoftext|>" needs a dedicated id that is not the EOS. */
+    int dots3_endofsystem_id;
+    int dots3_endofuser_id;
+    int dots3_endoftext_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
     /* USER_DEFINED tokens, matched as literal text before the regex split.
@@ -28391,6 +28832,61 @@ static void bpe_tokenize_text_exaone(const ds4_vocab *vocab, const char *text,
  */
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
+/* dots3-note declares tokenizer.ggml.pre="qwen2", and the Solar splitter is
+ * that same ordered Qwen2 regex.  But its USER_DEFINED scan runs only at
+ * piece starts, and the ` ?[^\s\p{L}\p{N}]+` alternative swallows " <", so a
+ * marker like " <no_think>" would never be seen.  HF matches added tokens as
+ * a partition pass over the whole text before the regex; mirror that here and
+ * feed the ordinary spans to the Solar splitter.  Every dots3 added marker
+ * starts with ASCII '<', which cannot occur inside a UTF-8 continuation, so a
+ * per-byte scan is safe. */
+static void bpe_tokenize_text_dots3(const ds4_vocab *vocab, const char *text,
+                                    token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t span = 0;
+    uint64_t pos = 0;
+    while (pos < len) {
+        int id = -1;
+        uint64_t hit = 0;
+        if (vocab->user_defined_max_len &&
+            vocab->user_defined_first[(uint8_t)text[pos]]) {
+            uint64_t want = len - pos;
+            if (want > vocab->user_defined_max_len) want = vocab->user_defined_max_len;
+            for (uint64_t n = want; n >= 1; n--) {
+                if (table_get(&vocab->user_defined, text + pos, n, &id)) {
+                    hit = n;
+                    break;
+                }
+            }
+        }
+        if (!hit) {
+            pos++;
+            continue;
+        }
+        if (pos > span) {
+            char *tmp = xmalloc(pos - span + 1);
+            memcpy(tmp, text + span, pos - span);
+            tmp[pos - span] = '\0';
+            bpe_tokenize_text_solar(vocab, tmp, out);
+            free(tmp);
+        }
+        token_vec_push(out, id);
+        pos += hit;
+        span = pos;
+    }
+    if (len > span) {
+        if (span == 0) {
+            bpe_tokenize_text_solar(vocab, text, out);
+        } else {
+            char *tmp = xmalloc(len - span + 1);
+            memcpy(tmp, text + span, len - span);
+            tmp[len - span] = '\0';
+            bpe_tokenize_text_solar(vocab, tmp, out);
+            free(tmp);
+        }
+    }
+}
+
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
         bpe_tokenize_text_motif3(vocab, text, out);
@@ -28398,6 +28894,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
         bpe_tokenize_text_solar(vocab, text, out);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        bpe_tokenize_text_dots3(vocab, text, out);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
@@ -28506,6 +29006,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->arg_value_end_id = -1;
     vocab->tool_schema_start_id = -1;
     vocab->tool_schema_end_id = -1;
+    vocab->dots3_endofsystem_id = -1;
+    vocab->dots3_endofuser_id = -1;
+    vocab->dots3_endoftext_id = -1;
 
     ds4_array_ref tokens;
     ds4_array_ref merges;
@@ -28595,6 +29098,43 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->latent_start_id = vocab_lookup(vocab, "<latent>");
         vocab->latent_pad_id = vocab_lookup(vocab, "<latent_pad>");
         vocab->latent_end_id = vocab_lookup(vocab, "</latent>");
+        vocab->dsml_id = -1;
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        /* Qwen2.5-derived vocabulary.  BOS metadata points at <|endoftext|>
+         * but the official template never emits it; EOS is <|endofassistant|>
+         * and generation also stops at <|endoftext|> (generation_config
+         * eos_token_id = [151643, 151668]).  The <think>/<no_think>/
+         * <dots_function_*> markers are USER_DEFINED added tokens, so the
+         * qwen2 splitter matches them as literal text. */
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id))
+            vocab->bos_id = vocab_lookup(vocab, "<|endoftext|>");
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id))
+            vocab->eos_id = vocab_lookup(vocab, "<|endofassistant|>");
+        vocab->system_id = vocab_lookup(vocab, "<|system|>");
+        vocab->user_id = vocab_lookup(vocab, "<|user|>");
+        vocab->assistant_id = vocab_lookup(vocab, "<|assistant|>");
+        vocab->dots3_endofsystem_id = vocab_lookup(vocab, "<|endofsystem|>");
+        vocab->dots3_endofuser_id = vocab_lookup(vocab, "<|endofuser|>");
+        vocab->dots3_endoftext_id = vocab_lookup(vocab, "<|endoftext|>");
+        vocab->start_of_turn_id = -1;
+        vocab->end_of_turn_id = -1;
+        vocab->tool_id = -1;
+        vocab->reference_id = -1;
+        vocab->plan_start_id = -1;
+        vocab->plan_end_id = -1;
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup(vocab, "<dots_function_call>");
+        vocab->tool_call_end_id = vocab_lookup(vocab, "</dots_function_call>");
+        vocab->tool_response_start_id = vocab_lookup(vocab, "<dots_function_response>");
+        vocab->tool_response_end_id = vocab_lookup(vocab, "</dots_function_response>");
+        vocab->latent_start_id = -1;
+        vocab->latent_pad_id = -1;
+        vocab->latent_end_id = -1;
         vocab->dsml_id = -1;
         return;
     }
@@ -28852,6 +29392,41 @@ static void encode_chat_prompt(
         encode_chat_prompt_solar(vocab, system, prompt, think_mode, out);
         return;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        /* Official chat_template.jinja: no BOS, a system block always opens
+         * the prompt (stock persona when none is given), enable_thinking=false
+         * appends <no_think> inside the user turn and prefills an empty think
+         * block after <|assistant|>; thinking mode leaves the model to open
+         * <think> itself. */
+        if (vocab->system_id < 0 || vocab->user_id < 0 ||
+            vocab->assistant_id < 0 || vocab->dots3_endofsystem_id < 0 ||
+            vocab->dots3_endofuser_id < 0 || vocab->eos_id < 0 ||
+            vocab->think_start_id < 0 || vocab->think_end_id < 0) {
+            ds4_die("dots3-note tokenizer is missing an official chat marker");
+        }
+        token_vec_push(out, vocab->system_id);
+        bpe_tokenize_text(vocab,
+                          system && system[0] ? system : "You are a helpful assistant.",
+                          out);
+        token_vec_push(out, vocab->dots3_endofsystem_id);
+        token_vec_push(out, vocab->user_id);
+        bpe_tokenize_text(vocab, prompt, out);
+        if (!ds4_think_mode_enabled(think_mode)) {
+            const size_t plen = strlen(prompt);
+            if (plen < 10 || strcmp(prompt + plen - 10, "<no_think>") != 0) {
+                bpe_tokenize_text(vocab, "<no_think>", out);
+            }
+        }
+        token_vec_push(out, vocab->dots3_endofuser_id);
+        token_vec_push(out, vocab->assistant_id);
+        if (!ds4_think_mode_enabled(think_mode)) {
+            token_vec_push(out, vocab->think_start_id);
+            bpe_tokenize_text(vocab, "\n\n", out);
+            token_vec_push(out, vocab->think_end_id);
+            bpe_tokenize_text(vocab, "\n\n", out);
+        }
+        return;
+    }
     token_vec_push(out, vocab->bos_id);
     {
         /* Effort prefix ahead of the system message, matching the reference
@@ -28881,6 +29456,17 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         const char *text;
         int token;
     } specials[] = {
+        /* dots3-note first: its role markers are CONTROL tokens the qwen2
+         * splitter cannot reach from text, and its "<|endoftext|>" must not
+         * resolve to the (different) EOS entry below.  The ids are -1 for
+         * every other family, so these rows never fire elsewhere. */
+        {"<|endoftext|>",           vocab->dots3_endoftext_id},
+        {"<|endofsystem|>",         vocab->dots3_endofsystem_id},
+        {"<|endofuser|>",           vocab->dots3_endofuser_id},
+        {"<|endofassistant|>",      vocab->dots3_endofuser_id >= 0 ? vocab->eos_id : -1},
+        {"<|system|>",              vocab->dots3_endofsystem_id >= 0 ? vocab->system_id : -1},
+        {"<|user|>",                vocab->dots3_endofuser_id >= 0 ? vocab->user_id : -1},
+        {"<|assistant|>",           vocab->dots3_endofuser_id >= 0 ? vocab->assistant_id : -1},
         {"<|endoftext|>",           vocab->eos_id},
         {"<|beginoftext|>",         vocab->bos_id},
         {"<|startofturn|>",         vocab->start_of_turn_id},
@@ -28997,7 +29583,9 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) return;
+    /* Solar and dots3-note templates emit no BOS. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) return;
     token_vec_push(tokens, e->vocab.bos_id);
 }
 
@@ -29012,7 +29600,8 @@ void ds4_encode_chat_prompt(
 
 void ds4_chat_append_effort_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3 ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) return;
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) return;
     const char *effort = ds4_think_effort_prefix(mode);
     if (effort[0]) bpe_tokenize_text(&e->vocab, effort, tokens);
 }
@@ -29040,6 +29629,34 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
             bpe_tokenize_text(vocab, content, tokens);
         }
         token_vec_push(tokens, vocab->end_of_turn_id);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            token_vec_push(tokens, vocab->system_id);
+            bpe_tokenize_text(vocab, content, tokens);
+            token_vec_push(tokens, vocab->dots3_endofsystem_id);
+        } else if (!strcmp(role, "assistant")) {
+            token_vec_push(tokens, vocab->assistant_id);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+            token_vec_push(tokens, vocab->eos_id); /* <|endofassistant|> */
+        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            /* Tool results render inside a user turn as a
+             * <dots_function_response> block per the official template. */
+            token_vec_push(tokens, vocab->user_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            token_vec_push(tokens, vocab->tool_response_start_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            bpe_tokenize_wrapped_payload_text(vocab, content,
+                                              "</dots_function_response>", tokens);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            token_vec_push(tokens, vocab->tool_response_end_id);
+            token_vec_push(tokens, vocab->dots3_endofuser_id);
+        } else {
+            token_vec_push(tokens, vocab->user_id);
+            bpe_tokenize_text(vocab, content, tokens);
+            token_vec_push(tokens, vocab->dots3_endofuser_id);
+        }
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
@@ -29097,6 +29714,16 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        token_vec_push(tokens, e->vocab.assistant_id);
+        if (!ds4_think_mode_enabled(think_mode)) {
+            token_vec_push(tokens, e->vocab.think_start_id);
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
+            token_vec_push(tokens, e->vocab.think_end_id);
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
+        }
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
         token_vec_push(tokens, e->vocab.start_of_turn_id);
         token_vec_push(tokens, e->vocab.assistant_id);
@@ -29254,6 +29881,12 @@ static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
          * OpenAI-compatible content string. */
         return (vocab->user_id >= 0 && token == vocab->user_id) ||
                (vocab->end_of_turn_id >= 0 && token == vocab->end_of_turn_id);
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        /* generation_config pins eos_token_id to [151643, 151668]:
+         * <|endoftext|> stops generation alongside <|endofassistant|>. */
+        return vocab->dots3_endoftext_id >= 0 &&
+               token == vocab->dots3_endoftext_id;
     }
     return false;
 }

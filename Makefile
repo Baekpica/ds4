@@ -16,6 +16,7 @@ METAL_SRCS := $(wildcard metal/*.metal)
 DS4_MOTIF3_MODEL ?=
 DS4_MOTIF3_FIXTURES ?= ../motif-3-mixed-ds4/fixtures/official-final
 DS4_EXAONE_MODEL ?=
+DS4_DOTS3_MODEL ?=
 CUDA_EXTRA_BINS :=
 
 ifeq ($(UNAME_S),Darwin)
@@ -74,6 +75,8 @@ endif
         proof-cuda-smoke proof-cuda-long proof-cuda-opp-c print-version \
         test-motif3-loader test-motif3-reference test-motif3-tokenizer \
         test-motif3-cuda test-motif3-resident \
+        test-dots3-loader test-dots3-tokenizer test-dots3-reference \
+        test-dots3-resident test-dots3-batch \
         test-mmq-parity test-model-family-kernels \
         test-solar-loader test-solar-kda test-solar-kda-prefill \
         test-solar-kda-chunk \
@@ -499,12 +502,30 @@ test-motif3-loader: tests/test_motif3_loader
 		{ echo "set DS4_MOTIF3_MODEL to the structural or completed GGUF" >&2; exit 2; }
 	./tests/test_motif3_loader "$(DS4_MOTIF3_MODEL)"
 
+tests/test_dots3_loader: tests/test_dots3_loader.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-dots3-loader: tests/test_dots3_loader
+	@test -n "$(DS4_DOTS3_MODEL)" || \
+		{ echo "set DS4_DOTS3_MODEL to the first dots3 GGUF shard" >&2; exit 2; }
+	./tests/test_dots3_loader "$(DS4_DOTS3_MODEL)"
+
 tests/test_motif3_reference: tests/test_motif3_reference.c ds4.c ds4.h
 	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
 		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
 
 test-motif3-reference: tests/test_motif3_reference
 	./tests/test_motif3_reference "$(DS4_MOTIF3_FIXTURES)"
+
+tests/test_dots3_tokenizer: tests/test_dots3_tokenizer.c tests/dots3_tokenizer_goldens.inc ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-dots3-tokenizer: tests/test_dots3_tokenizer
+	@test -n "$(DS4_DOTS3_MODEL)" || \
+		{ echo "set DS4_DOTS3_MODEL to the first dots3 GGUF shard" >&2; exit 2; }
+	./tests/test_dots3_tokenizer "$(DS4_DOTS3_MODEL)"
 
 tests/test_motif3_tokenizer: tests/test_motif3_tokenizer.c ds4.c ds4.h
 	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
