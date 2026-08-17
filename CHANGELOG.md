@@ -5,6 +5,73 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.6.0 — 2026-08-17
+
+The memory governor is authoritative. The shadow accounting arc built
+across v0.5.6.x (typed observation, allocation census, epoch-coherent
+snapshots, governed checks) now makes the real admission decisions for
+all five memory consumers — engine boot, prewarm, the bank plan, the
+serial session, and the per-call batch graph. `DS4_MEMGOV=observe` is
+the one-word rollback to shadow-everywhere. (Development receipts for
+this release carry historical v0.5.7 naming; the arc was renumbered at
+cut prep.)
+
+- Governor enforcement across all five consumer families: one typed
+  observation, one lease ledger, one evaluator; every refusal is typed
+  with a reason that carries retryability
+  (`ds4_requests_rejected_total{lane,reason}`; legacy scalars frozen
+  byte-identical). Two-phase server-ranked idle-bank reclaim lets the
+  serial lane collect from the commons before refusing — exact-deficit
+  trims, warm records preserved unless content is actually destroyed.
+  Per-source residency policy is now typed (eager / lazy / host-mapped)
+  and chosen by measurement rather than by name heuristics.
+- FIX (affects every v0.5.x): the captured serial decode path baked its
+  top-k scoring band at capture time, sized to the prompt — decode rows
+  appended after capture were invisible to the attention selector and
+  the stream guard clamped (the TOPK-BOUND-VIOL tripwire that found
+  it stays in the binary). The band is now the capture-stable session
+  cap at every launch site. Serial decode selection changes as a
+  result; quality re-stamped through the full gate battery.
+- FIX (aged servers): the CUDA graph pool's freed-graph reserve was
+  released exactly once per process, at boot. Long-lived servers
+  accumulated reserve that counted against their own admission checks
+  and floor-rejected organic work beside it (soak-measured: an 11.5 h
+  server sagged ~1.3 GB and refused ~6 requests/cycle; a restart
+  zeroed both). Refusal paths now return engine-owned reserve before
+  any live-memory refusal (`DS4_MEM_OWN_TRIM=0` opts out), counted and
+  disclosed.
+- Memory observability: /metrics, /v1/stats, and the board now render
+  the raw estimate pair behind the availability answer (`cuda_free` vs
+  `meminfo_available`) plus own-trim counters, all from one
+  epoch-coherent snapshot per render. A low kernel estimate beside
+  succeeding admissions is an accounting artifact, not a leak — the
+  cross-boot experiment showed every kernel bucket flat across
+  boot/kill cycles while the estimate re-scored page-cache state.
+- Launch defaults prefer the 0731 checkpoint and retire MTP beside
+  0731 bases. The DSpark trace-replay tool now defaults to the shipped
+  quench controller, so an explicit replay reproduces serving behavior
+  instead of a rejected prototype. The shipped break-even guard (2.16,
+  unchanged since v0.5.0) was re-validated at corpus scale this cycle:
+  59 traces, a flat plateau from 2.16 to 2.30, quench lifting the
+  corpus floor from 0.731 to 0.962.
+- Field builds are warning-clean on all three backends (CUDA, Metal,
+  CPU), and the release gate now fails on any warning at all. The pass
+  was annotation-only, proved by object-code identity (18 of 20
+  objects byte-identical in their code sections, including the entire
+  engine and every kernel), plus one real hardening fix: the daily
+  update-check now handles a pathologically long `$HOME` instead of
+  writing a truncated stamp path.
+- Release evidence: 24 h enforcement soak, 48/48 cycles clean (six
+  saturation pulses, observe-rollback slice mid-run, zero faults);
+  bit-exact golden vectors across eager/lazy/mapped; width-384 live
+  stamp; the full gate battery including the two new gates
+  (`topk_band_gate.sh`, `memdrift_attrib.sh`).
+- Known limitation, chartered as the first 0.6.x item: weight-server
+  manifest imports currently trust path and size — a swapped file of
+  identical name and size would be accepted silently. A content-
+  identity check on import is designed but deliberately not rushed
+  into this release.
+
 ## v0.5.6.3 — 2026-08-11
 
 Memory-footprint fix for long-running serving on memory-tight boxes
