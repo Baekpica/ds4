@@ -70,11 +70,16 @@ serial_turn(){ # $1 = out tag; a return_token_ids non-streaming turn = serial ho
 
 # ---------- Leg R: quiet-server reap ----------
 boot "DS4_SERIAL_IDLE_REAP_S=15"
+# MT-5 reclassified the persistent BATCH ctx's graph tensors into
+# SESSION_TENSORS (a no-serial boot shows ~4.5 GiB in the class), so the
+# reap oracle is the DELTA back to this boot baseline -- never absolute
+# zero.  ST0 = the batch share.
+ST0=$(census_mib session_tensors); ST0=${ST0:-0}
 HTTP=$(serial_turn r1)
 [ "$HTTP" = "200" ] || fail "leg R: serial turn HTTP $HTTP"
 LI=$(lease_mib intent); LR=$(lease_mib resident); ST=$(census_mib session_tensors)
 [ -n "$LI" ] && [ "$LI" -ge 500 ] && [ "$LI" = "$LR" ] || fail "leg R: committed lease ${LI:-?}/${LR:-?} MiB (expected equal, >= 500)"
-[ "$ST" -ge 500 ] || fail "leg R: session_tensors $ST MiB after commit"
+[ "$ST" -ge $((ST0 + 500)) ] || fail "leg R: session_tensors $ST MiB after commit (boot baseline $ST0)"
 M1=$(memavail_mib)
 log "leg R: committed (lease ${LI} MiB, session_tensors ${ST} MiB, MemAvailable ${M1} MiB); idling 35s past the 15s window"
 sleep 35
@@ -83,7 +88,7 @@ RP=$(metric1 ds4_serial_idle_reaps_total)
 [ "$(srv_count 'serial idle reap')" -ge 1 ] || fail "leg R: counter without the reap log line"
 LI2=$(lease_mib intent); ST2=$(census_mib session_tensors)
 [ "${LI2:-1}" = "0" ] || fail "leg R: lease intent $LI2 MiB after reap (phantom)"
-[ "${ST2:-999}" -lt 64 ] || fail "leg R: session_tensors $ST2 MiB after reap (graph not freed)"
+[ "${ST2:-99999}" -le $((ST0 + 64)) ] || fail "leg R: session_tensors $ST2 MiB after reap (boot baseline $ST0; serial graph not freed)"
 M2=$(memavail_mib)
 [ $((M2 - M1)) -ge 2500 ] || fail "leg R: MemAvailable recovered only $((M2-M1)) MiB (expected >= 2500 of the ~${LI} MiB graph)"
 log "R PASS (reap x${RP}; lease -> 0; session_tensors ${ST} -> ${ST2} MiB; MemAvailable +$((M2-M1)) MiB)"

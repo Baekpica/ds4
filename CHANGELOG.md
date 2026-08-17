@@ -5,6 +5,63 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.6.1 — 2026-08-17
+
+Memory truth. Admission charges what a request will actually commit —
+measured, not feared. A field trace showed the projection charging
+4.9 GiB for a 245k-token bank whose real packed commit was ~750 MiB
+(~6.5x pessimism from charging virtual extents and phantom decode
+budgets), refusing an admission the box could fund six times over and
+evicting work onto the expensive serial lane. Seven increments delete
+that class end to end; the concurrent charter shape — a 500k-token
+admission in flight while two 245k admissions land beside it — now
+serves with zero refusals on a 128 GiB box, and decode under ~1M
+resident bank tokens runs within 2% of an empty box.
+
+- Tranche decode credit (`DS4_CONT_ADMIT_TRANCHE`, default 32768;
+  0 = legacy): admission credits the prompt plus one decode tranche
+  instead of a ~393k-token phantom budget for every request that omits
+  max_tokens; live rows extend credit tranche-by-tranche under the same
+  funding verdict, and a refused extension finishes the row cleanly at
+  its funded boundary (`finish_reason: length`) instead of rejecting
+  the whole request up front.
+- Honest serial lifecycle: the session graph's cost is published as a
+  lease when committed and released when freed (no phantom intent), and
+  an idle reaper (`DS4_SERIAL_IDLE_REAP_S`, default 120) returns the
+  whole right-sized session — measured +5.3 GiB back — after idle,
+  re-allocating lazily on the next serial request. Fixed a leak where
+  freeing a serial session stranded its captured layer-graph
+  executables until an unrelated pool resize.
+- Defaults re-derived from measurement: ctx-aware bank grant (32 banks
+  through 16k, halving against a ~1 Mi fundable-token depth, floor 4),
+  flat 6 GiB fit headroom replacing the 8 GiB deep tier, prewarm gated
+  on its real consumers, and the boot "context buffers" print labeled
+  as the estimate it is (now including the FP8/FP4 mirror terms).
+- Pool truth: captured-graph executables are census-visible
+  (`graph_exec` class, driver-measured per slot, released verbatim at
+  destroy) with an idle sweep on the pressure ladder; the q8-f16 cache
+  budget and managed-KV routing read the typed observation instead of
+  raw driver numbers.
+- `--no-serial` (env twin `DS4_SERVER_NO_SERIAL=1`): opt-in cont-only
+  serving; every serial-lane execution path answers a typed 503
+  (`reason="lane_disabled"`). Fixed a latent `/v1/models` race with the
+  reaper, and the cont bank plan now sizes from the configured ctx.
+- Disclosed admission band (`DS4_CONT_ADMIT_BAND_X1024`, default 1045):
+  the only margin left in the projection is the measured transient peak
+  (leg-calibrated 1.02x sequential), applied uniformly so admission,
+  extension, and lease refreshes charge one truth. Live commit-rate
+  feedback exports observed vs packed bytes-per-token
+  (`ds4_cont_commit_bytes_per_token`) with a loud one-shot warning if
+  observed ever exceeds 2x physics — measured on the ship config:
+  observed 4366 B/tok vs packed 4142 (1.054, page-floor amortization).
+- Standing deep battery: `speed-bench/memcal_gate.sh` (E0-E5
+  calibration: 4.67 KiB/tok all-in at 507k admitted tokens) and
+  `speed-bench/deep_admit_ab_gate.sh` (the charter A/B: truth credit
+  serves the concurrent deep shape, union 4692 MiB, loaded-decode
+  1.019x; the legacy credit at a budget 1.2x that union reproduces the
+  field refusal chain on demand) join six fast memory-truth gates in
+  the release battery.
+
 ## v0.6.0 — 2026-08-17
 
 The memory governor is authoritative. The shadow accounting arc built
