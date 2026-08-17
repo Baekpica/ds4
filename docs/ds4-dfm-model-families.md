@@ -160,16 +160,19 @@ those ranges without a duplicate model copy.
 
 ## Motif-3 DGX Spark performance evidence
 
-The measured implementation is
-[`593d251`](https://github.com/Baekpica/ds4/commit/593d2511a10694f5a33fbafbd997ca24e819a853),
-built with CUDA 13.3 as `sm_121a` on one DGX Spark GB10 running driver
-610.43.02 and Linux 6.17.0-1029-nvidia. The server used the production
-MQ87-88 artifact, the VMM owner above, a 4,096-token prefill chunk, greedy
-sampling, no thinking, no speculation, and one request at a time.
+The 32K/256K HTTP gates used
+[`593d251`](https://github.com/Baekpica/ds4/commit/593d2511a10694f5a33fbafbd997ca24e819a853).
+The 8K `ds4-bench` throughput below used
+[`65dd3cc`](https://github.com/Baekpica/ds4/commit/65dd3cc9fdf5bce0de57de40e0fc90af65b5c046)
+(BF16 producer fuse plus vectorized latent key loads), built with CUDA 13.3
+as `sm_121a` on one DGX Spark GB10 running driver 610.43.02 and Linux
+6.17.0-1029-nvidia. The server used the production MQ87-88 artifact, the VMM
+owner above, a 4,096-token prefill chunk, greedy sampling, no thinking, no
+speculation, and one request at a time.
 
 | Gate | Interface | Prompt | Prefill | Decode | Correctness |
 |---|---|---:|---:|---:|---|
-| 8K | `ds4-bench` | 8,192 | 457.28 tok/s | not measured | throughput fixture |
+| 8K | `ds4-bench` | 8,192 | 497.41 tok/s | 64 tokens at 12.19 tok/s | throughput fixture; repeat 498.06 then 497.41 |
 | 32K | OpenAI Chat | 32,768 | 82.649 s; 396.47 tok/s | 43 in 4.799 s; 8.96 tok/s | beginning, middle, and end sentinels exact |
 | 256K | OpenAI Chat, `-c 262144` | 262,080 | 1,492.375 s; 175.61 tok/s | 43 in 17.072 s; 2.52 tok/s | all sentinels exact; `finish_reason=stop`; 262,123 total tokens |
 
