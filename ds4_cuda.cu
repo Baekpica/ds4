@@ -31255,6 +31255,18 @@ __device__ __forceinline__ static float motif3_bf16_boundary(float x) {
     return __bfloat162float(__float2bfloat16_rn(x));
 }
 
+/* Four BF16s as one 8-byte load.  The latent-attention key scan used to
+ * issue 16 scalar converts per key; 8K nsys put that kernel at 10.7%. */
+__device__ __forceinline__ static float4 motif3_load_bf16x4(
+        const __nv_bfloat16 *p) {
+    const uint2 u = *reinterpret_cast<const uint2 *>(p);
+    const float2 lo = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162 *>(&u.x));
+    const float2 hi = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162 *>(&u.y));
+    return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
 template <bool RoundBf16>
 __global__ static void motif3_mhc_apply_pre_kernel(
         float *out, const float *hidden, const float *h_pre,
@@ -32019,28 +32031,20 @@ __global__ static void motif3_latent_attention_bf16_kernel(
         const uint32_t i1 = (lane + 32u) * 4u;
         const uint32_t i2 = (lane + 64u) * 4u;
         const uint32_t i3 = (lane + 96u) * 4u;
-#define M3_BF4(base) make_float4(                                              \
-            __bfloat162float(kvrow[(base) + 0u]),                              \
-            __bfloat162float(kvrow[(base) + 1u]),                              \
-            __bfloat162float(kvrow[(base) + 2u]),                              \
-            __bfloat162float(kvrow[(base) + 3u]))
-        const float4 k0 = M3_BF4(i0);
-        const float4 k1 = M3_BF4(i1);
-        const float4 k2 = M3_BF4(i2);
-        const float4 k3 = M3_BF4(i3);
-#undef M3_BF4
+        const float4 k0 = motif3_load_bf16x4(kvrow + i0);
+        const float4 k1 = motif3_load_bf16x4(kvrow + i1);
+        const float4 k2 = motif3_load_bf16x4(kvrow + i2);
+        const float4 k3 = motif3_load_bf16x4(kvrow + i3);
         float partial =
             low0.x*k0.x + low0.y*k0.y + low0.z*k0.z + low0.w*k0.w +
             low1.x*k1.x + low1.y*k1.y + low1.z*k1.z + low1.w*k1.w +
             low2.x*k2.x + low2.y*k2.y + low2.z*k2.z + low2.w*k2.w +
             low3.x*k3.x + low3.y*k3.y + low3.z*k3.z + low3.w*k3.w;
         if (lane < 16u) {
-            const __nv_bfloat16 *kp =
-                k_pe_cache + (uint64_t)slot * qk_rope + lane * 4u;
-            partial += qrope[0] * __bfloat162float(kp[0]) +
-                       qrope[1] * __bfloat162float(kp[1]) +
-                       qrope[2] * __bfloat162float(kp[2]) +
-                       qrope[3] * __bfloat162float(kp[3]);
+            const float4 kp = motif3_load_bf16x4(
+                    k_pe_cache + (uint64_t)slot * qk_rope + lane * 4u);
+            partial += qrope[0] * kp.x + qrope[1] * kp.y +
+                       qrope[2] * kp.z + qrope[3] * kp.w;
         }
         for (uint32_t off = 16u; off > 0u; off >>= 1u)
             partial += __shfl_xor_sync(0xffffffffu, partial, off);
@@ -32124,28 +32128,20 @@ __global__ static void motif3_latent_attention_bf16_decode_split_kernel(
         const uint32_t i1 = (lane + 32u) * 4u;
         const uint32_t i2 = (lane + 64u) * 4u;
         const uint32_t i3 = (lane + 96u) * 4u;
-#define M3_SPLIT_BF4(base) make_float4(                                      \
-            __bfloat162float(kvrow[(base) + 0u]),                            \
-            __bfloat162float(kvrow[(base) + 1u]),                            \
-            __bfloat162float(kvrow[(base) + 2u]),                            \
-            __bfloat162float(kvrow[(base) + 3u]))
-        const float4 k0 = M3_SPLIT_BF4(i0);
-        const float4 k1 = M3_SPLIT_BF4(i1);
-        const float4 k2 = M3_SPLIT_BF4(i2);
-        const float4 k3 = M3_SPLIT_BF4(i3);
-#undef M3_SPLIT_BF4
+        const float4 k0 = motif3_load_bf16x4(kvrow + i0);
+        const float4 k1 = motif3_load_bf16x4(kvrow + i1);
+        const float4 k2 = motif3_load_bf16x4(kvrow + i2);
+        const float4 k3 = motif3_load_bf16x4(kvrow + i3);
         float partial =
             low0.x*k0.x + low0.y*k0.y + low0.z*k0.z + low0.w*k0.w +
             low1.x*k1.x + low1.y*k1.y + low1.z*k1.z + low1.w*k1.w +
             low2.x*k2.x + low2.y*k2.y + low2.z*k2.z + low2.w*k2.w +
             low3.x*k3.x + low3.y*k3.y + low3.z*k3.z + low3.w*k3.w;
         if (lane < 16u) {
-            const __nv_bfloat16 *kp =
-                k_pe_cache + (uint64_t)slot * qk_rope + lane * 4u;
-            partial += qrope[0] * __bfloat162float(kp[0]) +
-                       qrope[1] * __bfloat162float(kp[1]) +
-                       qrope[2] * __bfloat162float(kp[2]) +
-                       qrope[3] * __bfloat162float(kp[3]);
+            const float4 kp = motif3_load_bf16x4(
+                    k_pe_cache + (uint64_t)slot * qk_rope + lane * 4u);
+            partial += qrope[0] * kp.x + qrope[1] * kp.y +
+                       qrope[2] * kp.z + qrope[3] * kp.w;
         }
         for (uint32_t off = 16u; off > 0u; off >>= 1u)
             partial += __shfl_xor_sync(0xffffffffu, partial, off);
@@ -32314,9 +32310,7 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
                 const uint32_t slot = window ? logical % cache_cap : logical;
                 const __nv_bfloat16 *src =
                     latent_cache + (uint64_t)slot * latent_dim + dim;
-                value = make_float4(
-                    __bfloat162float(src[0]), __bfloat162float(src[1]),
-                    __bfloat162float(src[2]), __bfloat162float(src[3]));
+                value = motif3_load_bf16x4(src);
             }
             *(float4 *)&latent_sm[row][dim] = value;
         }
@@ -32331,9 +32325,7 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
                 const uint32_t slot = window ? logical % cache_cap : logical;
                 const __nv_bfloat16 *src =
                     k_pe_cache + (uint64_t)slot * qk_rope + dim;
-                value = make_float4(
-                    __bfloat162float(src[0]), __bfloat162float(src[1]),
-                    __bfloat162float(src[2]), __bfloat162float(src[3]));
+                value = motif3_load_bf16x4(src);
             }
             *(float4 *)&k_pe_sm[row][dim] = value;
         }
