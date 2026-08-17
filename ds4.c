@@ -40632,6 +40632,13 @@ void ds4_session_free(ds4_session *s) {
          * graph left 746 MiB of stuck intent after its free).  Absolute
          * publish: after free the session lane holds nothing. */
         ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
+        /* MT-6 (audit V9/V11): the serial per-layer exec pool bakes this
+         * graph's tensor pointers by value -- after the free every entry
+         * is stale (never replayed, but leaked until an unrelated scratch
+         * resize used to sweep it).  Drop it with the graph; the next
+         * session recaptures.  Engine-side free, engine-side drop (the
+         * MT-2 law), so reap/right-size/prewarm frees all pass through. */
+        (void)ds4_cuda_layer_graphs_drop();
     }
 #endif
     token_vec_free(&s->checkpoint);

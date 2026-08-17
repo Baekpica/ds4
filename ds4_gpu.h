@@ -468,6 +468,12 @@ void ds4_cuda_cont_graph_stats_maybe_print(uint32_t every);
  * No-op on Metal. */
 void ds4_gpu_invalidate_captured_graphs(const char *why);
 
+/* MT-6 (audit V9/V11): drop the SERIAL per-layer captured-exec pool.
+ * Called by ds4_session_free -- every entry bakes the freed graph's
+ * tensor pointers, so the pool is stale in whole.  Returns the count
+ * dropped; no-op (0) on Metal. */
+int ds4_cuda_layer_graphs_drop(void);
+
 /* Captured-decode per-kernel hash dump (DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1).
  * Permanent, env-gated, no-op-when-off diagnostic for localizing a
  * captured-graph-vs-eager output divergence by hashing each shim's output
