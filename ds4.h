@@ -805,6 +805,9 @@ typedef struct {
      * would have refused the whole request at admission). */
     uint64_t cont_credit_ext_granted;
     uint64_t cont_credit_ext_refused;
+    /* MT-3: idle reaper freed the committed serial session graph (the
+     * bytes returned to the box; next serial re-allocs right-sized). */
+    uint64_t serial_idle_reaps;
     /* memgov D5-3: the typed rejection family (lane x reason enums above,
      * both closed).  Ticked BESIDE the legacy scalars, which stay frozen;
      * every cell renders on /metrics. */

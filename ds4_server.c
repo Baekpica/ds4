@@ -8427,6 +8427,18 @@ struct server {
      * DS4_SERVER_SERIAL_RIGHTSIZE=0 restores the fail-at-full--c behavior. */
     bool serial_rightsize;
     int  serial_boot_ctx;
+    /* MT-3 (v0.6.1 memory truth): idle reaper for the committed serial
+     * session graph on bank-holding boots.  A single serial detour used to
+     * convert ~5 GiB permanently (the graph was freed only at replace or
+     * shutdown); after serial_idle_reap_s seconds without serial use the
+     * worker replaces the session with a fresh pending boot-ctx one (the
+     * proven right-size replace shape) and the bytes return to the box.
+     * Checked from the dequeue tick (quiet server) AND from cont_admit
+     * (the worker lives inside the cont loop under load -- that is
+     * exactly when the cont lane wants the memory back).  0 = off.
+     * last_serial_use is worker-owned (stamped after serial-runner jobs). */
+    int    serial_idle_reap_s;
+    double last_serial_use;
     /* v0.5.2 inc3: abort work for dead clients (field: "memory never
      * released after interruption").  Streaming rows already aborted via
      * failed sends; non-streaming rows decoded to their full budget and
@@ -13470,10 +13482,33 @@ static void job_shed_aged(server *s, job *j, const char *site) {
     job_finish(j);
 }
 
+/* MT-3: the serial idle reaper (defined after serial_session_ensure_fit,
+ * whose replace shape it reuses).  due() is a cheap worker-owned check;
+ * _locked() performs the swap and expects gen_mu HELD. */
+static bool serial_idle_reap_due(const server *s);
+static void serial_session_idle_reap_locked(server *s);
+
 static job *dequeue(server *s) {
     for (;;) {
         pthread_mutex_lock(&s->mu);
-        while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+        while (!s->head && !s->stopping) {
+            /* MT-3: a timed wait so the idle worker can notice a reap-due
+             * serial graph.  Lock order is gen_mu -> s->mu, so the swap
+             * must run OUTSIDE s->mu; the due-check reads worker-owned
+             * state only.  A 10 s tick on an idle server is noise. */
+            struct timespec dl;
+            clock_gettime(CLOCK_REALTIME, &dl);
+            dl.tv_sec += 10;
+            if (pthread_cond_timedwait(&s->cv, &s->mu, &dl) != 0 &&
+                serial_idle_reap_due(s)) {
+                pthread_mutex_unlock(&s->mu);
+                pthread_mutex_lock(&s->gen_mu);
+                if (serial_idle_reap_due(s))   /* unchanged: worker-owned */
+                    serial_session_idle_reap_locked(s);
+                pthread_mutex_unlock(&s->gen_mu);
+                pthread_mutex_lock(&s->mu);
+            }
+        }
         if (!s->head) {
             pthread_mutex_unlock(&s->mu);
             return NULL;
@@ -13983,6 +14018,45 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req), 503, msg);
     j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
     return false;
+}
+
+/* MT-3 (v0.6.1 memory truth): the serial idle reaper.  A committed serial
+ * session graph used to live until replace or shutdown -- a single serial
+ * detour permanently converted ~5 GiB on bank-holding boots (the leg-1
+ * cliff's residue).  After serial_idle_reap_s seconds without serial use,
+ * replace the session with a fresh PENDING boot-ctx one -- exactly the
+ * proven right-size replace shape: free (which publishes the MT-2 lease
+ * release), clear the live records, demote the registry (continuations
+ * get the honest native 409: replay full history), return the graph
+ * pool's reserve, re-create lazy.  The next serial request right-sizes
+ * from scratch (checkpoint content was device-side and is gone -- the
+ * demote makes that honest).  Worker thread only, gen_mu HELD (the same
+ * ownership domain as ensure_fit's swap).  Scope: bank-holding boots --
+ * on a serial-only deployment the graph IS the serving path. */
+static bool serial_idle_reap_due(const server *s) {
+    return s->serial_idle_reap_s > 0 && s->batch_ctx && s->session &&
+           !ds4_session_graph_pending(s->session) &&
+           now_sec() - s->last_serial_use > (double)s->serial_idle_reap_s;
+}
+static void serial_session_idle_reap_locked(server *s) {
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: serial idle reap: freeing the session graph (ctx=%d, "
+               "idle %.0fs > %ds window; next serial request re-allocs "
+               "right-sized; DS4_SERIAL_IDLE_REAP_S=0 disables)",
+               ds4_session_ctx(s->session),
+               now_sec() - s->last_serial_use, s->serial_idle_reap_s);
+    ds4_session_free(s->session);   /* MT-2: publishes the lease release */
+    s->session = NULL;
+    responses_live_clear(s);
+    thinking_live_clear(s);
+    cont_registry_demote_serial(s);
+    /* The freed graph leaves driver graph-pool reserve behind; return it
+     * so the reap's recovery is complete and visible (the MG-1 pattern). */
+    (void)ds4_mem_own_trim("serial_idle_reap");
+    ds4_session *ns = NULL;
+    if (ds4_session_create(&ns, s->engine, s->serial_boot_ctx) == 0) s->session = ns;
+    else die("serial idle reap: could not restore the boot session");
+    ds4_metric_add(&ds4_metrics_get()->serial_idle_reaps, 1);
 }
 
 /* The original single-request path: serialize the GPU, run, signal done. */
@@ -15126,6 +15200,12 @@ static int cont_alive(void *ud, void *user) {
 static int cont_admit(void *ud, ds4_cont_request *req) {
     cont_sched *cs = ud;
     server *s = cs->s;
+    /* MT-3: the worker lives INSIDE the cont loop under load, so the
+     * dequeue tick never fires exactly when the cont lane most wants the
+     * idle serial graph's ~5 GiB back.  Same thread, gen_mu held, and the
+     * serial session is quiescent by construction (serial jobs run on
+     * this very thread).  The due-check is two loads. */
+    if (serial_idle_reap_due(s)) serial_session_idle_reap_locked(s);
     /* Reserve a free in-flight slot BEFORE removing any job from the FIFO, so a
      * job is never dequeued (nor the primed job consumed) when it cannot be
      * placed -- otherwise it would be silently dropped and its client would hang.
@@ -16084,12 +16164,19 @@ static void *worker_main(void *arg) {
             job *batch[DS4_COALESCE_HARD_MAX];
             batch[0] = j;
             int n = coalesce_gather(s, batch, cmax, cwait, cmaxtok);
-            if (n == 1) run_job_single(s, j);
-            else        generate_batch_jobs(s, batch, n);
+            if (n == 1) {
+                /* Single-member gather collapses to the serial runner --
+                 * it uses the session, so it counts as serial use (MT-3). */
+                run_job_single(s, j);
+                s->last_serial_use = now_sec();
+            } else {
+                generate_batch_jobs(s, batch, n);
+            }
         } else {
             /* ROUTE_LANE_SERIAL -- and defensively ROUTE_LANE_NONE, which the
              * parse layer's durable-reference rejection makes unreachable. */
             run_job_single(s, j);
+            s->last_serial_use = now_sec();   /* MT-3: idle window restarts */
         }
     }
     return NULL;
@@ -16783,6 +16870,10 @@ static void send_metrics(server *s, int fd) {
                    "ds4_cont_credit_extension_refused_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_credit_ext_granted),
                (unsigned long long)ds4_metric_read(&m->cont_credit_ext_refused));
+    /* MT-3: serial idle reaps (each one returned the session graph's GiBs). */
+    buf_printf(&b, "# TYPE ds4_serial_idle_reaps_total counter\n"
+                   "ds4_serial_idle_reaps_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->serial_idle_reaps));
     buf_printf(&b, "# TYPE ds4_cont_batch_failures_total counter\n"
                    "ds4_cont_batch_failures_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_batch_failures));
@@ -17366,6 +17457,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                    "cont_admit_rejects:%llu\n"
                    "cont_credit_ext_granted:%llu\n"
                    "cont_credit_ext_refused:%llu\n"
+                   "serial_idle_reaps:%llu\n"
                    "graph_fit_refusals:%llu\n"
                    "tokens_prefilled_computed:%llu\n"
                    "tokens_prefilled_cached:%llu\n"
@@ -17383,6 +17475,7 @@ static void send_stats(server *s, int fd, bool as_json) {
                (unsigned long long)ds4_metric_read(&m->cont_admit_rejects),
                (unsigned long long)ds4_metric_read(&m->cont_credit_ext_granted),
                (unsigned long long)ds4_metric_read(&m->cont_credit_ext_refused),
+               (unsigned long long)ds4_metric_read(&m->serial_idle_reaps),
                (unsigned long long)ds4_metric_read(&m->graph_fit_refusals),
                (unsigned long long)ds4_metric_read(&m->tokens_prefilled_computed),
                (unsigned long long)ds4_metric_read(&m->tokens_prefilled_cached),
@@ -18704,6 +18797,11 @@ int main(int argc, char **argv) {
     {
         const char *sr = getenv("DS4_SERVER_SERIAL_RIGHTSIZE");
         s.serial_rightsize = !(sr && sr[0] == '0' && sr[1] == '\0');
+        /* MT-3: serial idle reap window (seconds; 0 = off). */
+        const char *ir = getenv("DS4_SERIAL_IDLE_REAP_S");
+        s.serial_idle_reap_s = ir && ir[0] ? atoi(ir) : 120;
+        if (s.serial_idle_reap_s < 0) s.serial_idle_reap_s = 0;
+        s.last_serial_use = now_sec();
         /* v0.5.2 inc3: dead-client abort (see the server struct comment). */
         const char *da = getenv("DS4_SERVER_DISCONNECT_ABORT");
         s.disconnect_abort = !(da && da[0] == '0' && da[1] == '\0');
