@@ -35248,18 +35248,12 @@ static bool motif3_graph_begin_sublayer(
             bias_post->abs_offset, bias_res->abs_offset,
             rows, DS4_N_HC, DS4_N_HC_SINKHORN_ITER, 1.0f), "controls");
     M3_BEGIN(ds4_gpu_motif3_mhc_apply_pre_tensor(
-            g->reduced, hidden, g->h_pre, rows, DS4_N_HC, DS4_N_EMBD),
+            g->reduced, hidden, g->h_pre, rows, DS4_N_HC, DS4_N_EMBD, 1),
             "apply_h_pre");
-    M3_BEGIN(ds4_gpu_motif3_round_bf16_tensor(
-            g->reduced, g->reduced, (uint64_t)rows * DS4_N_EMBD),
-            "reduced BF16 boundary");
-    M3_BEGIN(ds4_gpu_rms_norm_weight_rows_tensor(
+    M3_BEGIN(ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
             g->norm, g->reduced, model->map, model->size,
             sublayer_norm->abs_offset, DS4_N_EMBD, rows, DS4_RMS_EPS),
             "sublayer RMSNorm");
-    M3_BEGIN(ds4_gpu_motif3_round_bf16_tensor(
-            g->norm, g->norm, (uint64_t)rows * DS4_N_EMBD),
-            "norm BF16 boundary");
 #undef M3_BEGIN
     return true;
 }
@@ -35270,9 +35264,7 @@ static bool motif3_graph_finish_sublayer(
         uint32_t il, const char *which) {
     if (!ds4_gpu_motif3_mhc_combine_tensor(
             next, hidden, g->block_out, g->h_post, g->h_res,
-            rows, DS4_N_HC, DS4_N_EMBD) ||
-        !ds4_gpu_motif3_round_bf16_tensor(
-            next, next, (uint64_t)rows * DS4_N_HC * DS4_N_EMBD)) {
+            rows, DS4_N_HC, DS4_N_EMBD, 1)) {
         fprintf(stderr, "ds4: Motif-3 layer %u %s mHC combine failed\n",
                 il, which);
         return false;
@@ -35322,13 +35314,10 @@ static bool motif3_graph_attention(
     M3_ATTN(ds4_gpu_motif3_split_kv_latent_tensor(
             g->kv_latent, g->kv_raw, rows, kv_raw_dim, DS4_N_KV_LORA),
             "split kv latent");
-    M3_ATTN(ds4_gpu_rms_norm_weight_rows_tensor(
+    M3_ATTN(ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
             g->kv_norm, g->kv_latent, model->map, model->size,
             l->attn_kv_a_norm->abs_offset, DS4_N_KV_LORA, rows, DS4_RMS_EPS),
             "kv norm");
-    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
-            g->kv_norm, g->kv_norm, (uint64_t)rows * DS4_N_KV_LORA),
-            "kv norm BF16 boundary");
     M3_ATTN(ds4_gpu_matmul_q8_0_tensor(
             g->kv_proj, model->map, model->size, l->attn_kv_b->abs_offset,
             DS4_N_KV_LORA, kv_proj_dim, g->kv_norm, rows), "kv_b");
@@ -35452,13 +35441,10 @@ static bool motif3_graph_attention_latent_impl(
     M3_LATTN(ds4_gpu_motif3_split_kv_latent_tensor(
             g->kv_latent, g->kv_raw, rows, kv_raw_dim, DS4_N_KV_LORA),
             "split kv latent");
-    M3_LATTN(ds4_gpu_rms_norm_weight_rows_tensor(
+    M3_LATTN(ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
             g->kv_norm, g->kv_latent, model->map, model->size,
             l->attn_kv_a_norm->abs_offset, DS4_N_KV_LORA, rows, DS4_RMS_EPS),
             "kv norm");
-    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
-            g->kv_norm, g->kv_norm, (uint64_t)rows * DS4_N_KV_LORA),
-            "kv norm BF16 boundary");
     M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
             g->lambda, model->map, model->size, l->attn_lambda->abs_offset,
             DS4_N_EMBD, signal_heads, g->norm, rows), "lambda");
@@ -35879,18 +35865,12 @@ static bool motif3_graph_forward_impl(
     }
 
     M3_FORWARD(ds4_gpu_motif3_mean_expansion_tensor(
-            g->mean_hidden, g->hidden[current], rows, DS4_N_HC, DS4_N_EMBD),
+            g->mean_hidden, g->hidden[current], rows, DS4_N_HC, DS4_N_EMBD, 1),
             "final mHC mean");
-    M3_FORWARD(ds4_gpu_motif3_round_bf16_tensor(
-            g->mean_hidden, g->mean_hidden, (uint64_t)rows * DS4_N_EMBD),
-            "final mean BF16 boundary");
-    M3_FORWARD(ds4_gpu_rms_norm_weight_rows_tensor(
+    M3_FORWARD(ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
             g->final_norm, g->mean_hidden, model->map, model->size,
             weights->output_norm->abs_offset, DS4_N_EMBD, rows, DS4_RMS_EPS),
             "output norm");
-    M3_FORWARD(ds4_gpu_motif3_round_bf16_tensor(
-            g->final_norm, g->final_norm, (uint64_t)rows * DS4_N_EMBD),
-            "output norm BF16 boundary");
 
     ds4_gpu_tensor *last = ds4_gpu_tensor_view(
             g->final_norm, (uint64_t)(rows - 1u) * DS4_N_EMBD * sizeof(float),
@@ -35988,13 +35968,10 @@ static bool motif3_graph_forward_mtp_diagnostic(
     M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
             g->reduced, g->reduced, (uint64_t)mtp_rows * DS4_N_EMBD),
             "embedding BF16 boundary");
-    M3_MTP(ds4_gpu_rms_norm_weight_rows_tensor(
+    M3_MTP(ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
             g->norm, g->reduced, model->map, model->size,
             weights->motif_mtp_embed_norm->abs_offset,
             DS4_N_EMBD, mtp_rows, DS4_RMS_EPS), "embed_norm");
-    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
-            g->norm, g->norm, (uint64_t)mtp_rows * DS4_N_EMBD),
-            "embed_norm BF16 boundary");
 
     ds4_gpu_tensor *previous = ds4_gpu_tensor_view(
             g->final_norm, 0,
@@ -36016,13 +35993,10 @@ static bool motif3_graph_forward_mtp_diagnostic(
             g->reduced, g->reduced, (uint64_t)mtp_rows * DS4_N_EMBD),
             "input projection BF16 boundary");
 
-    M3_MTP(ds4_gpu_rms_norm_weight_rows_tensor(
+    M3_MTP(ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
             g->norm, g->reduced, model->map, model->size,
             weights->motif_mtp_input_norm->abs_offset,
             DS4_N_EMBD, mtp_rows, DS4_RMS_EPS), "input layernorm");
-    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
-            g->norm, g->norm, (uint64_t)mtp_rows * DS4_N_EMBD),
-            "input norm BF16 boundary");
     g->mtp_cache_len = 0;
     M3_MTP(motif3_graph_attention_latent(
             g, model, l, mtp_rows, 0u, DS4_N_LAYER),
@@ -36035,13 +36009,10 @@ static bool motif3_graph_forward_mtp_diagnostic(
             g->mean_hidden, g->mean_hidden,
             (uint64_t)mtp_rows * DS4_N_EMBD),
             "attention residual BF16 boundary");
-    M3_MTP(ds4_gpu_rms_norm_weight_rows_tensor(
+    M3_MTP(ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
             g->norm, g->mean_hidden, model->map, model->size,
             l->ffn_norm->abs_offset,
             DS4_N_EMBD, mtp_rows, DS4_RMS_EPS), "post-attention norm");
-    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
-            g->norm, g->norm, (uint64_t)mtp_rows * DS4_N_EMBD),
-            "post-attention norm BF16 boundary");
     M3_MTP(motif3_graph_ffn(g, model, l, mtp_rows, DS4_N_LAYER),
             "dense PolyNorm FFN");
     M3_MTP(ds4_gpu_add_tensor(
@@ -36050,13 +36021,10 @@ static bool motif3_graph_forward_mtp_diagnostic(
     M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
             g->reduced, g->reduced, (uint64_t)mtp_rows * DS4_N_EMBD),
             "FFN residual BF16 boundary");
-    M3_MTP(ds4_gpu_rms_norm_weight_rows_tensor(
+    M3_MTP(ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
             g->final_norm, g->reduced, model->map, model->size,
             weights->motif_mtp_final_norm->abs_offset,
             DS4_N_EMBD, mtp_rows, DS4_RMS_EPS), "final_layernorm");
-    M3_MTP(ds4_gpu_motif3_round_bf16_tensor(
-            g->final_norm, g->final_norm,
-            (uint64_t)mtp_rows * DS4_N_EMBD), "final norm BF16 boundary");
     ds4_gpu_tensor *last = ds4_gpu_tensor_view(
             g->final_norm,
             (uint64_t)(mtp_rows - 1u) * DS4_N_EMBD * sizeof(float),
@@ -36324,17 +36292,11 @@ static bool motif3_batch_runtime_decode(
     }
     M3_BATCH(ds4_gpu_motif3_mean_expansion_tensor(
             g->mean_hidden, g->hidden[current], rows,
-            DS4_N_HC, DS4_N_EMBD), "final mHC mean");
-    M3_BATCH(ds4_gpu_motif3_round_bf16_tensor(
-            g->mean_hidden, g->mean_hidden,
-            (uint64_t)rows * DS4_N_EMBD), "final mean BF16 boundary");
-    M3_BATCH(ds4_gpu_rms_norm_weight_rows_tensor(
+            DS4_N_HC, DS4_N_EMBD, 1), "final mHC mean");
+    M3_BATCH(ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
             g->final_norm, g->mean_hidden, model->map, model->size,
             weights->output_norm->abs_offset, DS4_N_EMBD, rows, DS4_RMS_EPS),
             "output norm");
-    M3_BATCH(ds4_gpu_motif3_round_bf16_tensor(
-            g->final_norm, g->final_norm,
-            (uint64_t)rows * DS4_N_EMBD), "output norm BF16 boundary");
     M3_BATCH(ds4_gpu_matmul_q8_0_tensor(
             rt->decode_logits, model->map, model->size,
             weights->output->abs_offset, DS4_N_EMBD, DS4_N_VOCAB,

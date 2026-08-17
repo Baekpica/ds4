@@ -31251,6 +31251,11 @@ extern "C" int ds4_gpu_motif3_mhc_controls_model_tensor(
     return cuda_ok(cudaGetLastError(), "Motif-3 model mHC controls launch");
 }
 
+__device__ __forceinline__ static float motif3_bf16_boundary(float x) {
+    return __bfloat162float(__float2bfloat16_rn(x));
+}
+
+template <bool RoundBf16>
 __global__ static void motif3_mhc_apply_pre_kernel(
         float *out, const float *hidden, const float *h_pre,
         uint32_t rows, uint32_t expansion, uint32_t hidden_size) {
@@ -31263,7 +31268,7 @@ __global__ static void motif3_mhc_apply_pre_kernel(
     for (uint32_t e = 0; e < expansion; e++)
         sum += hidden[((uint64_t)row * expansion + e) * hidden_size + col] *
                h_pre[(uint64_t)row * expansion + e];
-    out[i] = sum;
+    out[i] = RoundBf16 ? motif3_bf16_boundary(sum) : sum;
 }
 
 __global__ static void motif3_mhc_apply_res_kernel(
@@ -31286,15 +31291,20 @@ __global__ static void motif3_mhc_apply_res_kernel(
 extern "C" int ds4_gpu_motif3_mhc_apply_pre_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *hidden,
         const ds4_gpu_tensor *h_pre, uint32_t rows,
-        uint32_t expansion, uint32_t hidden_size) {
+        uint32_t expansion, uint32_t hidden_size, int round_bf16) {
     const uint64_t in_n = (uint64_t)rows * expansion * hidden_size;
     const uint64_t out_n = (uint64_t)rows * hidden_size;
     if (!out || !hidden || !h_pre || rows == 0 || expansion == 0 || hidden_size == 0 ||
         out->bytes < out_n * sizeof(float) || hidden->bytes < in_n * sizeof(float) ||
         h_pre->bytes < (uint64_t)rows * expansion * sizeof(float)) return 0;
-    motif3_mhc_apply_pre_kernel<<<(out_n + 255u) / 256u, 256>>>(
-            (float *)out->ptr, (const float *)hidden->ptr,
-            (const float *)h_pre->ptr, rows, expansion, hidden_size);
+    if (round_bf16)
+        motif3_mhc_apply_pre_kernel<true><<<(out_n + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const float *)hidden->ptr,
+                (const float *)h_pre->ptr, rows, expansion, hidden_size);
+    else
+        motif3_mhc_apply_pre_kernel<false><<<(out_n + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const float *)hidden->ptr,
+                (const float *)h_pre->ptr, rows, expansion, hidden_size);
     return cuda_ok(cudaGetLastError(), "Motif-3 mHC pre apply launch");
 }
 
@@ -31312,6 +31322,7 @@ extern "C" int ds4_gpu_motif3_mhc_apply_res_tensor(
     return cuda_ok(cudaGetLastError(), "Motif-3 mHC residual apply launch");
 }
 
+template <bool RoundBf16>
 __global__ static void motif3_mhc_combine_kernel(
         float *out, const float *hidden, const float *block_out,
         const float *h_post, const float *h_res,
@@ -31329,14 +31340,14 @@ __global__ static void motif3_mhc_combine_kernel(
         sum += h_res[((uint64_t)row * expansion + out_e) * expansion + in_e] *
                hidden[((uint64_t)row * expansion + in_e) * hidden_size + col];
     }
-    out[i] = sum;
+    out[i] = RoundBf16 ? motif3_bf16_boundary(sum) : sum;
 }
 
 extern "C" int ds4_gpu_motif3_mhc_combine_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *hidden,
         const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *h_post,
         const ds4_gpu_tensor *h_res, uint32_t rows,
-        uint32_t expansion, uint32_t hidden_size) {
+        uint32_t expansion, uint32_t hidden_size, int round_bf16) {
     const uint64_t n = (uint64_t)rows * expansion * hidden_size;
     if (!out || !hidden || !block_out || !h_post || !h_res || rows == 0 ||
         expansion == 0 || hidden_size == 0 || out->bytes < n * sizeof(float) ||
@@ -31345,13 +31356,20 @@ extern "C" int ds4_gpu_motif3_mhc_combine_tensor(
         h_post->bytes < (uint64_t)rows * expansion * sizeof(float) ||
         h_res->bytes < (uint64_t)rows * expansion * expansion * sizeof(float) ||
         out->ptr == hidden->ptr) return 0;
-    motif3_mhc_combine_kernel<<<(n + 255u) / 256u, 256>>>(
-            (float *)out->ptr, (const float *)hidden->ptr,
-            (const float *)block_out->ptr, (const float *)h_post->ptr,
-            (const float *)h_res->ptr, rows, expansion, hidden_size);
+    if (round_bf16)
+        motif3_mhc_combine_kernel<true><<<(n + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const float *)hidden->ptr,
+                (const float *)block_out->ptr, (const float *)h_post->ptr,
+                (const float *)h_res->ptr, rows, expansion, hidden_size);
+    else
+        motif3_mhc_combine_kernel<false><<<(n + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const float *)hidden->ptr,
+                (const float *)block_out->ptr, (const float *)h_post->ptr,
+                (const float *)h_res->ptr, rows, expansion, hidden_size);
     return cuda_ok(cudaGetLastError(), "Motif-3 mHC combine launch");
 }
 
+template <bool RoundBf16>
 __global__ static void motif3_mean_expansion_kernel(
         float *out, const float *hidden,
         uint32_t rows, uint32_t expansion, uint32_t hidden_size) {
@@ -31363,28 +31381,35 @@ __global__ static void motif3_mean_expansion_kernel(
     float sum = 0.0f;
     for (uint32_t e = 0; e < expansion; e++)
         sum += hidden[((uint64_t)row * expansion + e) * hidden_size + col];
-    out[i] = sum / (float)expansion;
+    const float mean = sum / (float)expansion;
+    out[i] = RoundBf16 ? motif3_bf16_boundary(mean) : mean;
 }
 
 extern "C" int ds4_gpu_motif3_mean_expansion_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *hidden,
-        uint32_t rows, uint32_t expansion, uint32_t hidden_size) {
+        uint32_t rows, uint32_t expansion, uint32_t hidden_size,
+        int round_bf16) {
     const uint64_t in_n = (uint64_t)rows * expansion * hidden_size;
     const uint64_t out_n = (uint64_t)rows * hidden_size;
     if (!out || !hidden || rows == 0 || expansion == 0 || hidden_size == 0 ||
         out->bytes < out_n * sizeof(float) || hidden->bytes < in_n * sizeof(float)) {
         return 0;
     }
-    motif3_mean_expansion_kernel<<<(out_n + 255u) / 256u, 256>>>(
-            (float *)out->ptr, (const float *)hidden->ptr,
-            rows, expansion, hidden_size);
+    if (round_bf16)
+        motif3_mean_expansion_kernel<true><<<(out_n + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const float *)hidden->ptr,
+                rows, expansion, hidden_size);
+    else
+        motif3_mean_expansion_kernel<false><<<(out_n + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const float *)hidden->ptr,
+                rows, expansion, hidden_size);
     return cuda_ok(cudaGetLastError(), "Motif-3 expansion mean launch");
 }
 
 __global__ static void motif3_round_bf16_kernel(
         float *out, const float *in, uint64_t n) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __bfloat162float(__float2bfloat16_rn(in[i]));
+    if (i < n) out[i] = motif3_bf16_boundary(in[i]);
 }
 
 extern "C" int ds4_gpu_motif3_round_bf16_tensor(
@@ -31394,6 +31419,51 @@ extern "C" int ds4_gpu_motif3_round_bf16_tensor(
     motif3_round_bf16_kernel<<<(count + 255u) / 256u, 256>>>(
             (float *)out->ptr, (const float *)in->ptr, count);
     return cuda_ok(cudaGetLastError(), "Motif-3 BF16 boundary launch");
+}
+
+/* Same reduction as rms_norm_weight_kernel, then the Motif BF16 store
+ * boundary.  8K nsys spent 8.1% of GPU time in a follow-up round launch
+ * after norms; fusing removes that extra read/write of the activation. */
+__global__ static void motif3_rms_norm_round_bf16_kernel(
+        float *out, const float *x, const float *w,
+        uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+        orow[i] = motif3_bf16_boundary(xr[i] * scale * w[i]);
+}
+
+extern "C" int ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t n,
+        uint32_t rows, float eps) {
+    if (!out || !x || !model_map || weight_offset > model_size ||
+        model_size - weight_offset < (uint64_t)n * sizeof(float) ||
+        out->bytes < (uint64_t)n * rows * sizeof(float) ||
+        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(
+            model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
+    if (!wptr) return 0;
+    cuda_norm_q8_invalidate(out->ptr);
+    motif3_rms_norm_round_bf16_kernel<<<rows, 256, 0, ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr, (const float *)wptr,
+            n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "Motif-3 RMSNorm BF16 launch");
 }
 
 __global__ static void concat_rows_f32_kernel(

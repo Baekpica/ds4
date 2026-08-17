@@ -159,6 +159,61 @@ static float bf16_bits_to_f32(uint16_t value) {
     return out;
 }
 
+static void test_round_bf16(void) {
+    const uint64_t sizes[] = {1, 3, 4, 7, 128, 4096, 4097};
+    for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+        const uint64_t n = sizes[s];
+        std::vector<float> in((size_t)n);
+        std::vector<float> want((size_t)n);
+        for (uint64_t i = 0; i < n; i++) {
+            const float x = (float)((int64_t)i - 2048) * 0.017578125f +
+                            ((i & 1ull) ? 1.23456789e-4f : -9.87654321e-5f);
+            in[i] = x;
+            want[i] = bf16_bits_to_f32(f32_to_bf16_bits(x));
+        }
+        gpu_tensor src(n * sizeof(float));
+        gpu_tensor dst(n * sizeof(float));
+        if (!ds4_gpu_tensor_write(src.p, 0, in.data(), n * sizeof(float))) {
+            fprintf(stderr, "round_bf16 upload failed\n");
+            std::exit(1);
+        }
+        if (!ds4_gpu_motif3_round_bf16_tensor(dst.p, src.p, n)) {
+            fprintf(stderr, "round_bf16 launch failed n=%llu\n",
+                    (unsigned long long)n);
+            std::exit(1);
+        }
+        const std::vector<float> got = download_f32(dst, n);
+        for (uint64_t i = 0; i < n; i++) {
+            uint32_t gb, wb;
+            std::memcpy(&gb, &got[i], sizeof(gb));
+            std::memcpy(&wb, &want[i], sizeof(wb));
+            if (gb != wb) {
+                fprintf(stderr,
+                        "round_bf16 mismatch n=%llu i=%llu got=0x%08x want=0x%08x\n",
+                        (unsigned long long)n, (unsigned long long)i, gb, wb);
+                std::exit(1);
+            }
+        }
+        if (!ds4_gpu_motif3_round_bf16_tensor(src.p, src.p, n)) {
+            fprintf(stderr, "round_bf16 inplace launch failed n=%llu\n",
+                    (unsigned long long)n);
+            std::exit(1);
+        }
+        const std::vector<float> inplace = download_f32(src, n);
+        for (uint64_t i = 0; i < n; i++) {
+            uint32_t gb, wb;
+            std::memcpy(&gb, &inplace[i], sizeof(gb));
+            std::memcpy(&wb, &want[i], sizeof(wb));
+            if (gb != wb) {
+                fprintf(stderr,
+                        "round_bf16 inplace mismatch n=%llu i=%llu\n",
+                        (unsigned long long)n, (unsigned long long)i);
+                std::exit(1);
+            }
+        }
+    }
+}
+
 static void test_bf16_projection() {
     /* Authentic Motif mHC proj_res shape: [16, 4 * hidden_size]. */
     constexpr uint64_t in_dim = 4u * 4096u;
@@ -285,12 +340,28 @@ static void test_mhc(const char *dir) {
     assert_close("CUDA mHC Sinkhorn", res.data(), f32(f, "h_res"), 64, 4e-6f, 4e-5f);
     gpu_tensor reduced(4u * 4096u * sizeof(float));
     gpu_tensor mixed(4u * 4u * 4096u * sizeof(float));
-    if (!ds4_gpu_motif3_mhc_apply_pre_tensor(reduced.p, tensors[9]->p, h_pre.p, 4, 4, 4096) ||
+    if (!ds4_gpu_motif3_mhc_apply_pre_tensor(reduced.p, tensors[9]->p, h_pre.p, 4, 4, 4096, 0) ||
         !ds4_gpu_motif3_mhc_apply_res_tensor(mixed.p, tensors[9]->p, h_res.p, 4, 4, 4096)) std::exit(1);
     auto reduced_h = download_f32(reduced, 4u * 4096u);
     auto mixed_h = download_f32(mixed, 4u * 4u * 4096u);
     assert_close("CUDA mHC pre apply", reduced_h.data(), f32(f, "reduced_input"), 4u * 4096u, 3e-6f, 3e-5f);
     assert_close("CUDA mHC residual apply", mixed_h.data(), f32(f, "residual_mixed"), 4u * 4u * 4096u, 3e-6f, 3e-5f);
+    gpu_tensor reduced_round(4u * 4096u * sizeof(float));
+    gpu_tensor reduced_fused(4u * 4096u * sizeof(float));
+    if (!ds4_gpu_motif3_round_bf16_tensor(reduced_round.p, reduced.p, 4u * 4096u) ||
+        !ds4_gpu_motif3_mhc_apply_pre_tensor(reduced_fused.p, tensors[9]->p, h_pre.p,
+                                             4, 4, 4096, 1)) std::exit(1);
+    const auto want_round = download_f32(reduced_round, 4u * 4096u);
+    const auto got_fused = download_f32(reduced_fused, 4u * 4096u);
+    for (uint32_t i = 0; i < 4u * 4096u; i++) {
+        uint32_t gb, wb;
+        std::memcpy(&gb, &got_fused[i], sizeof(gb));
+        std::memcpy(&wb, &want_round[i], sizeof(wb));
+        if (gb != wb) {
+            fprintf(stderr, "mHC pre BF16 fuse mismatch at %u\n", i);
+            std::exit(1);
+        }
+    }
     for (gpu_tensor *t : tensors) delete t;
 }
 
@@ -1121,6 +1192,7 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return 0;
     }
+    test_round_bf16();
     test_router(argv[1]);
     test_polynorm(argv[1]);
     test_mhc(argv[1]);

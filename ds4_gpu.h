@@ -2330,7 +2330,8 @@ int ds4_gpu_motif3_mhc_apply_pre_tensor(
         const ds4_gpu_tensor *h_pre,
         uint32_t                rows,
         uint32_t                expansion,
-        uint32_t                hidden_size);
+        uint32_t                hidden_size,
+        int                     round_bf16);
 
 int ds4_gpu_motif3_mhc_apply_res_tensor(
         ds4_gpu_tensor       *out,
@@ -2348,14 +2349,26 @@ int ds4_gpu_motif3_mhc_combine_tensor(
         const ds4_gpu_tensor *h_res,
         uint32_t              rows,
         uint32_t              expansion,
-        uint32_t              hidden_size);
+        uint32_t              hidden_size,
+        int                   round_bf16);
 
 int ds4_gpu_motif3_mean_expansion_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *hidden,
         uint32_t              rows,
         uint32_t              expansion,
-        uint32_t              hidden_size);
+        uint32_t              hidden_size,
+        int                   round_bf16);
+
+int ds4_gpu_motif3_rms_norm_round_bf16_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n,
+        uint32_t              rows,
+        float                 eps);
 
 int ds4_gpu_motif3_round_bf16_tensor(
         ds4_gpu_tensor       *out,
