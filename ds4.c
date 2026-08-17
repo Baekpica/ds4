@@ -34076,6 +34076,133 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     return freed;
 }
 
+/* MT-1b (v0.6.1 memory truth): ONE funding verdict for continuous-lane
+ * cache growth, shared by ADMISSION (candidate bank b at target flen) and
+ * mid-flight credit EXTENSION (live bank b extending to flen).  Runs the
+ * exact legacy admission order: page-union projection -> comp-cache class
+ * check (with free-bank class trim) -> live memory-floor check (free-bank
+ * trim, then the MG-1 own-trim re-ask) -> ONE governed check; on ADMIT
+ * publishes the lane's absolute lease.  The union's candidate override
+ * (ds4_credit_union_runs: bank b contributes flen INSTEAD of credit[b])
+ * makes the extension exact -- mneed is the unfunded growth of the whole
+ * union with b at its proposed end, never a double charge of b's already
+ * resident span.  Porcelains and reject metrics stay with the callers:
+ * an admission refusal rejects the request, an extension refusal only
+ * pins the row to its funded boundary.  dbgctx is the caller's context
+ * fragment for the DS4_ADMIT_DEBUG line (admission: prompt/budget split;
+ * extension: pos/glen). */
+typedef struct {
+    uint64_t mneed, mres, usable;
+    int      legacy;   /* the legacy composite verdict (porcelain select) */
+    ds4_gov_claim scl;
+} ds4_cont_fund_quote;
+static int ds4_batch_cont_fund_check(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
+                                     const uint8_t *live, const uint32_t *pflen,
+                                     const uint64_t *credit, uint32_t b,
+                                     int protect, uint64_t flen,
+                                     const char *dbgctx,
+                                     ds4_cont_fund_quote *q) {
+    const uint32_t MS = (uint32_t)ctx->max_seq;
+    memset(q, 0, sizeof(*q));
+    q->mneed = ds4_batch_credit_union_projection(ctx, credit, b, flen);
+    q->mres  = ds4_batch_slabs_cache_resident(&ctx->sl);
+    /* Admission forensics (Inc 0b): DS4_ADMIT_DEBUG=1 prints the verdict
+     * inputs per funding check -- the tell for a credit that silently
+     * under-charges. */
+    if (getenv("DS4_ADMIT_DEBUG")) {
+        fprintf(stderr,
+                "ds4: admit debug bank=%u %s flen=%llu mneed=%.1f MiB mres=%.1f MiB budget=%.1f MiB sub_out=%.1f MiB credits=",
+                b, dbgctx, (unsigned long long)flen,
+                (double)q->mneed / 1048576.0, (double)q->mres / 1048576.0,
+                (double)ctx->comp_map_budget / 1048576.0,
+                (double)ds4_gpu_substrate_outstanding() / 1048576.0);
+        for (uint32_t ci = 0; ci < MS; ci++)
+            fprintf(stderr, "%s%llu", ci ? "," : "",
+                    (unsigned long long)credit[ci]);
+        fprintf(stderr, "\n");
+    }
+    /* #15 governance (2026-08-04): the plan-derived budget (max_seq x full
+     * cache extent) cannot be stale.  Live-memory truth is the mem-floor
+     * verdict below. */
+    /* v0.5.1 Inc2 (field #31): before rejecting, shed FREE banks' pages
+     * (credited banks are never victims).  Trim frees only un-credited
+     * banks' pages, so the union need is unchanged -- only the resident
+     * answer moves. */
+    if (ctx->comp_map_budget != 0 && q->mneed != 0 &&
+        q->mres + q->mneed > ctx->comp_map_budget) {
+        const uint64_t want = q->mres + q->mneed - ctx->comp_map_budget;
+        if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
+                                      protect, want, NULL) > 0)
+            q->mres = ds4_batch_slabs_cache_resident(&ctx->sl);
+    }
+    /* memgov D0b-3 (S4/S5): ONE claim for both live verdicts, built from
+     * the exact inputs the class check consumes (post class-trim mres).
+     * proposed is the ABSOLUTE post-fault total: the plan's eager boot
+     * cost + resident + the whole union's unfaulted growth (the projection
+     * already carries every credit and this candidate, sec 6.2's
+     * do-not-resum rule).  D0b-4: the eager constant shifts BOTH proposed
+     * and the class limit, so the class verdict is the live check verbatim
+     * (x > budget <=> eager + x > eager + budget) while the ledger stays
+     * on the census basis. */
+    q->scl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+    q->scl.memc = DS4_MEMC_BATCH_BANK;
+    q->scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    q->scl.proposed_outstanding = ctx->bank_census_eager + q->mres + q->mneed;
+    q->scl.class_limit = ctx->comp_map_budget != 0
+                       ? ctx->bank_census_eager + ctx->comp_map_budget : 0;
+    /* memgov D2-3: the boolean OWNER swap (plan sec 12 D2 consumer 3).
+     * The legacy formulas and their trim ACTORS run first, in live order
+     * -- class verdict after the class trim above; floor trim then floor
+     * verdict only when the class passed.  ONE governed check per growth
+     * admission takes the composite legacy verdict; observe returns that
+     * verdict verbatim, enforce lets the quote rule. */
+    int verdict = DS4_GOV_ADMIT;
+    if (ctx->comp_map_budget != 0 && q->mneed != 0 &&
+        q->mres + q->mneed > ctx->comp_map_budget) {
+        verdict = DS4_GOV_REFUSE_CLASS;
+    } else if (q->mneed != 0) {
+        /* v0.5.4 governance inc1 (item 16): the budget above is a
+         * boot-time PLAN and cannot see memory the box lost since boot.
+         * Every admission spend must ALSO fit live free memory beyond the
+         * operator floor.  The union projection already carries every
+         * credit's unfaulted growth, so mneed IS the floor charge.  Trim
+         * can hand pages back (unmap is exact and immediate), so it runs
+         * before the verdict; credited banks stay inviolable.  inc2: the
+         * serial reserve is spoken for -- growth may not spend it (the
+         * serial lane's lazy graph draws from this same pool at request
+         * time). */
+        q->usable = ds4_mem_usable_beyond(ctx->serial_reserve);
+        if (q->mneed > q->usable) {
+            if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
+                                          protect, q->mneed - q->usable,
+                                          NULL) > 0)
+                q->usable = ds4_mem_usable_beyond(ctx->serial_reserve);
+        }
+        /* memgaps MG-1: still short -> return the engine's own graph-pool
+         * reserve and re-ask.  Precedes the governed check below so
+         * enforce quotes also see the post-trim box (actors first, in
+         * live order: the D2-3 pattern). */
+        if (q->mneed > q->usable && ds4_mem_own_trim("cont_admit") > 0)
+            q->usable = ds4_mem_usable_beyond(ctx->serial_reserve);
+        if (q->mneed > q->usable) verdict = DS4_GOV_REFUSE_LIVE;
+    }
+    q->legacy = verdict;
+    /* D2-1 (artifact 2, epoch-58): a zero-growth spend takes NO verdict
+     * in any mode; the publication below is the honest absolute refresh. */
+    const int final_verdict = q->mneed != 0
+        ? ds4_gov_governed_check("cont_admit", &q->scl, verdict)
+        : DS4_GOV_ADMIT;
+    if (final_verdict == DS4_GOV_ADMIT) {
+        /* Funding granted -- publish the lane's absolute lease (intent =
+         * eager cost + post-fault total, resident = eager cost + what the
+         * page scan sees: the census basis). */
+        ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
+                            ctx->bank_census_eager + q->mres + q->mneed,
+                            ctx->bank_census_eager + q->mres);
+    }
+    return final_verdict;
+}
+
 /* memgov D4-2: one bank's exact trim preimage across every slab family the
  * credit projection charges -- the counting mirror of
  * ds4_batch_bank_trim_pages (same offsets, same strides, same interior-page
@@ -36139,6 +36266,12 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
      * projection charges every credit, so a landed bank's future decode
      * growth stays represented; 0 = no live credit. */
     uint64_t *credit = xcalloc(MS, sizeof(uint64_t));
+    /* MT-1b (v0.6.1 memory truth): the row's TRUE normalized target
+     * min(prompt + requested decode budget, seq_cap).  credit[b] advances
+     * toward it tranche-by-tranche; credit[b] == btgt[b] means fully
+     * funded (no extension due).  An extension refusal pins btgt to the
+     * funded boundary so the row stops asking. */
+    uint64_t *btgt   = xcalloc(MS, sizeof(uint64_t));
     double   *pft0   = xcalloc(MS, sizeof(double));     /* install time (timing log) */
     /* v0.2.x observability: per-bank serving stats (registry + timings). */
     ds4_cont_seq_stats *sst = xcalloc(MS, sizeof(ds4_cont_seq_stats));
@@ -36151,7 +36284,13 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
     int      sampled[DS4_MULTISEQ_MAX_SEQ];   /* S1.0b: token the base model sampled per row */
     bool ok = live && usr && posv && cur && beos && bmax && glen && gbuf &&
               btemp && btopk && btopp && bminp && brng && logits && seedlog &&
-              pftok && pflen && pfoff && pfbase && pft0 && sst;
+              pftok && pflen && pfoff && pfbase && pft0 && sst && btgt;
+    /* MT-1b: decode-credit tranche size.  Admission credits min(prompt +
+     * min(budget, tranche), seq_cap); the decode loop extends live rows'
+     * credit tranche-by-tranche under the same funding verdict.  0 =
+     * legacy lifetime-at-admission credit (kill switch, bit-exact). */
+    uint64_t admit_tranche = 32768;
+    { const char *te = getenv("DS4_CONT_ADMIT_TRANCHE"); if (te && te[0]) { long v = atol(te); if (v >= 0) admit_tranche = (uint64_t)v; } }
 
     /* S1.0b: per-bank MTP draft probe (DS4_CONT_MTP_DRAFT_PROBE).  Runs the
      * per-bank drafter in lockstep with the real decode (depth 1), seeded from
@@ -36577,16 +36716,28 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
             uint32_t mn = req.max_new > 0 ? (uint32_t)req.max_new : 1u;
             const uint32_t cap = seq_cap > L ? seq_cap - L : 1u;   /* frontier bound (R2: ring wraps; comp caches bound the seq) */
             if (mn > cap) mn = cap;
+            /* MT-1b (v0.6.1 memory truth): admission credits only the next
+             * TRANCHE of the decode budget -- min(mn, tranche) -- instead
+             * of the whole (server-defaulted, typically 393216) budget.
+             * The decode loop extends the credit tranche-by-tranche under
+             * the SAME funding verdict (ds4_batch_cont_fund_check), so a
+             * 64-token agent turn no longer charges ~1.6 GiB of phantom
+             * future decode.  bmax/gbuf/trace still size from the TRUE
+             * budget mn; btgt records the true normalized target the
+             * extensions walk toward.  admit_tranche == 0 restores the
+             * lifetime-at-admission credit verbatim (kill switch). */
+            const uint32_t mncr = (admit_tranche != 0 && (uint64_t)mn > admit_tranche)
+                                ? (uint32_t)admit_tranche : mn;
             /* R5 Inc1b: budget the cache pages this admission may map (prompt
-             * + generation budget, capped at seq_cap) BEFORE installing it.
-             * Mapping is grow-only -- bank reuse rides its existing pages for
-             * free, and the projection charges only the extent beyond what is
-             * resident -- so once the budget is truly spent only requests
-             * fitting an already-grown bank pass.  The warm/fork match
-             * counters above count VALIDATION, so a budget-rejected match
-             * still ticks them. */
-            const uint64_t flen = (uint64_t)L + mn > seq_cap ? seq_cap
-                                                             : (uint64_t)L + mn;
+             * + credited generation budget, capped at seq_cap) BEFORE
+             * installing it.  Mapping is grow-only -- bank reuse rides its
+             * existing pages for free, and the projection charges only the
+             * extent beyond what is resident -- so once the budget is truly
+             * spent only requests fitting an already-grown bank pass.  The
+             * warm/fork match counters above count VALIDATION, so a
+             * budget-rejected match still ticks them. */
+            const uint64_t flen = (uint64_t)L + mncr > seq_cap ? seq_cap
+                                                               : (uint64_t)L + mncr;
             if (ctx->sl.vmm) {
                 /* Inc 0b (governance, review 2.2): LIFETIME page-union
                  * projection.  The old `outstanding` sum charged pending
@@ -36595,113 +36746,18 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                  * from the accounting and a later short-prompt/huge-output
                  * row could promise the same headroom (field 376884/129 was
                  * the prompt-side variant of the same double-booking).
-                 * Every live row now holds a credit for its full normalized
-                 * target until it ends; the union avoids double-charging
-                 * the edge pages neighbor banks share. */
-                const uint64_t mneed =
-                    ds4_batch_credit_union_projection(ctx, credit, b, flen);
-                uint64_t mres = ds4_batch_slabs_cache_resident(&ctx->sl);
-                /* Admission forensics (Inc 0b): DS4_ADMIT_DEBUG=1 prints the
-                 * verdict inputs per admission -- the tell for a credit that
-                 * silently under-charges. */
-                if (getenv("DS4_ADMIT_DEBUG")) {
-                    fprintf(stderr,
-                            "ds4: admit debug bank=%u flen=%llu mneed=%.1f MiB mres=%.1f MiB budget=%.1f MiB sub_out=%.1f MiB credits=",
-                            b, (unsigned long long)flen,
-                            (double)mneed / 1048576.0, (double)mres / 1048576.0,
-                            (double)ctx->comp_map_budget / 1048576.0,
-                            (double)ds4_gpu_substrate_outstanding() / 1048576.0);
-                    for (uint32_t ci = 0; ci < MS; ci++)
-                        fprintf(stderr, "%s%llu", ci ? "," : "",
-                                (unsigned long long)credit[ci]);
-                    fprintf(stderr, "\n");
-                }
-                /* #15 governance (2026-08-04): the plan-derived budget
-                 * (max_seq x full cache extent) cannot be stale.  Live-memory
-                 * truth is the mem-floor verdict below. */
-                /* v0.5.1 Inc2 (field #31): before rejecting, shed FREE banks'
-                 * pages (credited banks are never victims).  Trim frees only
-                 * un-credited banks' pages, so the union need is unchanged --
-                 * only the resident answer moves. */
-                if (ctx->comp_map_budget != 0 && mneed != 0 &&
-                    mres + mneed > ctx->comp_map_budget) {
-                    const uint64_t want = mres + mneed - ctx->comp_map_budget;
-                    if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
-                                                  (fork || partial) ? (int)fsrc : -1,
-                                                  want, NULL) > 0)
-                        mres = ds4_batch_slabs_cache_resident(&ctx->sl);
-                }
-                /* memgov D0b-3 (S4/S5): ONE claim for both live verdicts,
-                 * built from the exact inputs the class check consumes
-                 * (post class-trim mres).  proposed is the ABSOLUTE
-                 * post-fault total: the plan's eager boot cost + resident
-                 * + the whole union's unfaulted growth (the projection
-                 * already carries every credit and this candidate, sec
-                 * 6.2's do-not-resum rule).  D0b-4: the eager constant
-                 * shifts BOTH proposed and the class limit, so the class
-                 * verdict is the live check verbatim (x > budget <=>
-                 * eager + x > eager + budget) while the ledger stays on
-                 * the census basis. */
-                ds4_gov_claim scl = {0};
-                scl.requester = DS4_GOVC_BATCH_BANK_PLAN;
-                scl.memc = DS4_MEMC_BATCH_BANK;
-                scl.domain = DS4_MEMD_UNIFIED_DEVICE;
-                scl.proposed_outstanding = ctx->bank_census_eager + mres + mneed;
-                scl.class_limit = ctx->comp_map_budget != 0
-                                ? ctx->bank_census_eager + ctx->comp_map_budget : 0;
-                /* memgov D2-3: the boolean OWNER swap (plan sec 12 D2
-                 * consumer 3).  The legacy formulas and their trim
-                 * ACTORS run first, in live order -- class verdict after
-                 * the class trim above; floor trim then floor verdict
-                 * only when the class passed (a class refusal never
-                 * reached the floor trim before D2-3 either: side-effect
-                 * parity).  ONE governed check per growth admission
-                 * takes the composite legacy verdict (leg (d)'s cells ==
-                 * growth admissions stands); observe -- the default
-                 * until the D2-2b ratchet -- returns that verdict, so
-                 * behavior is bit-identical; enforce lets the quote
-                 * rule.  The frozen reject porcelain prints only when
-                 * its own formula refused (true numbers); an enforce
-                 * divergence discloses in the memgov format instead. */
-                int verdict = DS4_GOV_ADMIT;
-                uint64_t usable = 0;
-                if (ctx->comp_map_budget != 0 && mneed != 0 &&
-                    mres + mneed > ctx->comp_map_budget) {
-                    verdict = DS4_GOV_REFUSE_CLASS;
-                } else if (mneed != 0) {
-                    /* v0.5.4 governance inc1 (item 16): the budget above
-                     * is a boot-time PLAN and cannot see memory the box
-                     * lost since boot.  Every admission spend must ALSO
-                     * fit live free memory beyond the operator floor.
-                     * The union projection already carries every
-                     * credit's unfaulted growth, so mneed IS the floor
-                     * charge.  Trim can hand pages back (unmap is exact
-                     * and immediate), so it runs before the verdict;
-                     * credited banks stay inviolable.  inc2: the serial
-                     * reserve is spoken for -- growth may not spend it
-                     * (the serial lane's lazy graph draws from this same
-                     * pool at request time). */
-                    usable = ds4_mem_usable_beyond(ctx->serial_reserve);
-                    if (mneed > usable) {
-                        if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
-                                                      (fork || partial) ? (int)fsrc : -1,
-                                                      mneed - usable, NULL) > 0)
-                            usable = ds4_mem_usable_beyond(ctx->serial_reserve);
-                    }
-                    /* memgaps MG-1: still short -> return the engine's own
-                     * graph-pool reserve and re-ask.  Precedes the governed
-                     * check below so enforce quotes also see the post-trim
-                     * box (actors first, in live order: the D2-3 pattern). */
-                    if (mneed > usable && ds4_mem_own_trim("cont_admit") > 0)
-                        usable = ds4_mem_usable_beyond(ctx->serial_reserve);
-                    if (mneed > usable) verdict = DS4_GOV_REFUSE_LIVE;
-                }
-                /* D2-1 (artifact 2, epoch-58): a zero-growth admit spends
-                 * nothing and takes NO verdict in any mode; the
-                 * publication below is the honest absolute refresh. */
-                const int final_verdict = mneed != 0
-                    ? ds4_gov_governed_check("cont_admit", &scl, verdict)
-                    : DS4_GOV_ADMIT;
+                 * Every live row holds a credit for its funded target until
+                 * it ends; the union avoids double-charging the edge pages
+                 * neighbor banks share.  MT-1b: the ladder itself lives in
+                 * ds4_batch_cont_fund_check, shared with the mid-flight
+                 * extension. */
+                char dbgctx[96];
+                snprintf(dbgctx, sizeof dbgctx,
+                         "prompt=%u decode_budget=%u budget_req=%u", L, mncr, mn);
+                ds4_cont_fund_quote q;
+                const int final_verdict = ds4_batch_cont_fund_check(
+                    ctx, g, live, pflen, credit, b,
+                    (fork || partial) ? (int)fsrc : -1, flen, dbgctx, &q);
                 if (final_verdict != DS4_GOV_ADMIT) {
                     ctx->mem_rejects++;
                     ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
@@ -36709,21 +36765,23 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                     ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
                                        [DS4_REJLANE_CONT]
                                        [ds4_reject_reason_from_gov(final_verdict)], 1);
-                    if (final_verdict == verdict &&
-                        verdict == DS4_GOV_REFUSE_CLASS) {
+                    if (final_verdict == q.legacy &&
+                        q.legacy == DS4_GOV_REFUSE_CLASS) {
                         fprintf(stderr,
-                                "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + projected credits %.1f MiB > budget %.1f MiB)\n",
-                                b, (double)mres / 1048576.0,
-                                (double)mneed / 1048576.0,
-                                (double)ctx->comp_map_budget / 1048576.0);
-                    } else if (final_verdict == verdict) {
+                                "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + projected credits %.1f MiB > budget %.1f MiB; candidate prompt=%u + decode_budget=%u -> credit_end=%llu of seq_cap %u)\n",
+                                b, (double)q.mres / 1048576.0,
+                                (double)q.mneed / 1048576.0,
+                                (double)ctx->comp_map_budget / 1048576.0,
+                                L, mncr, (unsigned long long)flen, seq_cap);
+                    } else if (final_verdict == q.legacy) {
                         fprintf(stderr,
-                                "ds4: cont admit rejected on memory floor (bank %u: projected credits %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor + %.2f GiB serial reserve + %.1f MiB substrate outstanding -- the box cannot fund this admission; --mem-floor-gb and DS4_SERIAL_RESERVE_CTX govern)\n",
-                                b, (double)mneed / 1048576.0,
-                                (double)usable / 1048576.0,
+                                "ds4: cont admit rejected on memory floor (bank %u: projected credits %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor + %.2f GiB serial reserve + %.1f MiB substrate outstanding; candidate prompt=%u + decode_budget=%u -> credit_end=%llu of seq_cap %u -- the box cannot fund this admission; --mem-floor-gb and DS4_SERIAL_RESERVE_CTX govern)\n",
+                                b, (double)q.mneed / 1048576.0,
+                                (double)q.usable / 1048576.0,
                                 (double)ds4_mem_floor_bytes() / 1073741824.0,
                                 (double)ctx->serial_reserve / 1073741824.0,
-                                (double)ds4_gpu_substrate_outstanding() / 1048576.0);
+                                (double)ds4_gpu_substrate_outstanding() / 1048576.0,
+                                L, mncr, (unsigned long long)flen, seq_cap);
                     } else {
                         /* Enforce diverged from the legacy formula: the
                          * quote's refusal rules.  Bounded like the
@@ -36734,21 +36792,14 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                             enf_disclosed++;
                             fprintf(stderr,
                                     "ds4: memgov ENFORCE refuse site=cont_admit bank=%u status=%d legacy=%d proposed=%llu class_limit=%llu\n",
-                                    b, final_verdict, verdict,
-                                    (unsigned long long)scl.proposed_outstanding,
-                                    (unsigned long long)scl.class_limit);
+                                    b, final_verdict, q.legacy,
+                                    (unsigned long long)q.scl.proposed_outstanding,
+                                    (unsigned long long)q.scl.class_limit);
                         }
                     }
                     on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
                     continue;
                 }
-                /* Admission granted -- publish the lane's absolute lease
-                 * (intent = eager cost + post-fault total, resident =
-                 * eager cost + what the page scan sees: the census
-                 * basis). */
-                ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
-                                    ctx->bank_census_eager + mres + mneed,
-                                    ctx->bank_census_eager + mres);
             }
             /* R4: ADMISSION = INSTALL ONLY.  Bank state is prepared here (reset /
              * fork copy / warm reuse) and the tokens to prefill are parked in the
@@ -36790,7 +36841,9 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 pfbase[b] = P;
                 pflen[b]  = S;
                 pfoff[b]  = 0u;
-                credit[b] = flen;   /* Inc 0b: the lifetime promise, released at row end */
+                credit[b] = flen;   /* Inc 0b: the funded promise, released at row end */
+                btgt[b]   = (uint64_t)L + mn > seq_cap ? seq_cap
+                                                       : (uint64_t)L + mn;   /* MT-1b: true target */
                 pft0[b]   = now_sec();
                 pfq[(pfq_h + pfq_n) % MS] = b;
                 pfq_n++;
@@ -37196,6 +37249,45 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
             g->layer_n_index_comp[il] = mi;
         }
 
+        /* MT-1b: extend live rows' tranche credit BEFORE the step, so no
+         * forward ever writes past the funded end (the spec verify pack
+         * writes draft KV rows AHEAD of acceptance, hence the Dspec term
+         * in the margin).  Grant -> credit[b] advances one tranche and the
+         * union projection stays exact (the candidate override replaces
+         * credit[b]).  Refuse -> the row is pinned to its funded boundary:
+         * bmax clamps to the funded remainder and the existing terminal
+         * check finishes it there with finish=length -- strictly better
+         * than the legacy shape, which refused the whole request at
+         * admission.  Warm continuation re-admits from the bank. */
+        if (admit_tranche != 0) {
+            const uint64_t ext_margin = (uint64_t)(spec_accept ? Dspec : 0u) + 2u;
+            for (uint32_t b = 0; b < MS; b++) {
+                uint64_t nf = 0;
+                if (!live[b]) continue;
+                if (!ds4_cont_credit_ext_due(posv[b], credit[b], btgt[b],
+                                             ext_margin, admit_tranche, &nf))
+                    continue;
+                char dbgctx[96];
+                snprintf(dbgctx, sizeof dbgctx, "extend pos=%u glen=%u",
+                         posv[b], glen[b]);
+                ds4_cont_fund_quote q;
+                if (ds4_batch_cont_fund_check(ctx, g, live, pflen, credit, b,
+                                              -1, nf, dbgctx, &q) == DS4_GOV_ADMIT) {
+                    credit[b] = nf;
+                    ds4_metric_add(&ds4_metrics_get()->cont_credit_ext_granted, 1);
+                } else {
+                    fprintf(stderr,
+                            "ds4: cont credit-extension refused bank=%u pos=%u credit_end=%llu target=%llu -> row finishes at the funded boundary (finish=length)\n",
+                            b, posv[b], (unsigned long long)credit[b],
+                            (unsigned long long)btgt[b]);
+                    const uint32_t nbm = ds4_cont_credit_refuse_bmax(glen[b], posv[b],
+                                                                     credit[b]);
+                    if (nbm < bmax[b]) bmax[b] = nbm;
+                    btgt[b] = credit[b];   /* boundary is final: stop asking */
+                    ds4_metric_add(&ds4_metrics_get()->cont_credit_ext_refused, 1);
+                }
+            }
+        }
         /* ---- DECODE one step over live banks. ---- */
         uint32_t k = 0;   /* rows decoded by the plain path (0 in the spec branch -> probe skipped) */
         if (spec_accept) {
@@ -37257,6 +37349,17 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 if (dspark_quench && qn_quenched[b]) {
                     if (dspark_prof && nd > 0u) dspark_prof_quench_saved_rows += (uint64_t)nd;
                     nd = 0u;
+                }
+                /* MT-1b: verify rows write KV at posv..posv+nd BEFORE
+                 * acceptance -- never past the funded end.  The extension
+                 * check above keeps rows margin ahead of their boundary, so
+                 * this bound only bites in the last steps after a refusal
+                 * (tranche-gated: legacy keeps its exact shape). */
+                if (admit_tranche != 0) {
+                    const uint64_t fund_left = credit[b] > posv[b]
+                                             ? credit[b] - posv[b] : 0u;
+                    if ((uint64_t)nd + 1u > fund_left)
+                        nd = fund_left > 1u ? (uint32_t)(fund_left - 1u) : 0u;
                 }
                 /* D4.5g adaptive gate: spec-off window (settled-plain or plain-probe)
                  * for the solo bank -> verify the committed row only this step. */
@@ -38151,7 +38254,7 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
     free(btemp); free(btopk); free(btopp); free(bminp); free(brng); free(bsoc);
     free(balive);
     free(bcancel);
-    free(pftok); free(pflen); free(pfoff); free(pfbase); free(credit); free(pft0); free(sst);
+    free(pftok); free(pflen); free(pfoff); free(pfbase); free(credit); free(btgt); free(pft0); free(sst);
     free(logits); free(seedlog);
     ds4_metric_set(&ds4_metrics_get()->banks_live, 0);
     free(dbuf); free(ndr); free(vqtok); free(vpos); free(vsid); free(vfirst); free(vnr); free(vlogits);

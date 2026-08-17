@@ -16771,6 +16771,13 @@ static void send_metrics(server *s, int fd) {
     buf_printf(&b, "# TYPE ds4_cont_admit_rejects_total counter\n"
                    "ds4_cont_admit_rejects_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_admit_rejects));
+    /* MT-1b (v0.6.1 memory truth): mid-flight tranche credit extensions. */
+    buf_printf(&b, "# TYPE ds4_cont_credit_extension_granted_total counter\n"
+                   "ds4_cont_credit_extension_granted_total %llu\n"
+                   "# TYPE ds4_cont_credit_extension_refused_total counter\n"
+                   "ds4_cont_credit_extension_refused_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->cont_credit_ext_granted),
+               (unsigned long long)ds4_metric_read(&m->cont_credit_ext_refused));
     buf_printf(&b, "# TYPE ds4_cont_batch_failures_total counter\n"
                    "ds4_cont_batch_failures_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_batch_failures));
@@ -17151,6 +17158,7 @@ static void send_stats(server *s, int fd, bool as_json) {
         buf_printf(&b, ",\"cache\":{\"admits_cold\":%llu,\"admits_warm\":%llu,"
                        "\"admits_fork\":%llu,\"admits_partial_fork\":%llu,"
                        "\"admits_partial_truncate\":%llu,\"cont_admit_rejects\":%llu,"
+                       "\"cont_credit_ext_granted\":%llu,\"cont_credit_ext_refused\":%llu,"
                        "\"graph_fit_refusals\":%llu,"
                        "\"tokens_prefilled_computed\":%llu,"
                        "\"tokens_prefilled_cached\":%llu,\"prefill_tok_s_60s\":%.2f,"
@@ -17162,6 +17170,8 @@ static void send_stats(server *s, int fd, bool as_json) {
                    (unsigned long long)ds4_metric_read(&m->admits_partial_fork),
                    (unsigned long long)ds4_metric_read(&m->admits_partial_truncate),
                    (unsigned long long)ds4_metric_read(&m->cont_admit_rejects),
+                   (unsigned long long)ds4_metric_read(&m->cont_credit_ext_granted),
+                   (unsigned long long)ds4_metric_read(&m->cont_credit_ext_refused),
                    (unsigned long long)ds4_metric_read(&m->graph_fit_refusals),
                    (unsigned long long)ds4_metric_read(&m->tokens_prefilled_computed),
                    (unsigned long long)ds4_metric_read(&m->tokens_prefilled_cached),
@@ -17349,6 +17359,8 @@ static void send_stats(server *s, int fd, bool as_json) {
                    "admits_partial_fork:%llu\n"
                    "admits_partial_truncate:%llu\n"
                    "cont_admit_rejects:%llu\n"
+                   "cont_credit_ext_granted:%llu\n"
+                   "cont_credit_ext_refused:%llu\n"
                    "graph_fit_refusals:%llu\n"
                    "tokens_prefilled_computed:%llu\n"
                    "tokens_prefilled_cached:%llu\n"
@@ -17364,6 +17376,8 @@ static void send_stats(server *s, int fd, bool as_json) {
                (unsigned long long)ds4_metric_read(&m->admits_partial_fork),
                (unsigned long long)ds4_metric_read(&m->admits_partial_truncate),
                (unsigned long long)ds4_metric_read(&m->cont_admit_rejects),
+               (unsigned long long)ds4_metric_read(&m->cont_credit_ext_granted),
+               (unsigned long long)ds4_metric_read(&m->cont_credit_ext_refused),
                (unsigned long long)ds4_metric_read(&m->graph_fit_refusals),
                (unsigned long long)ds4_metric_read(&m->tokens_prefilled_computed),
                (unsigned long long)ds4_metric_read(&m->tokens_prefilled_cached),
@@ -25617,6 +25631,43 @@ static void test_credit_union_sums_per_run_need(void) {
     TEST_ASSERT(need == 2 * page);   /* only the second run still charges */
 }
 
+/* MT-1b (v0.6.1 memory truth): pure tranche-extension arithmetic (ds4.h
+ * inlines).  Pins the margin trigger (due exactly when pos + margin
+ * reaches the credited end), the tranche walk with its true-target clamp,
+ * the legacy kill switch, and the funded-boundary invariant: an extension
+ * is due BEFORE the margin's worth of steps can reach the boundary, and
+ * the refusal clamp finishes the row with its last KV write at
+ * credit_end - 1. */
+static void test_cont_credit_ext_due_shapes(void) {
+    uint64_t nf = 0;
+
+    /* tranche 0 = legacy kill switch: never due, even at the boundary */
+    TEST_ASSERT(!ds4_cont_credit_ext_due(999, 1000, 5000, 8, 0, &nf));
+    /* fully funded (credit_end == target): nothing to extend */
+    TEST_ASSERT(!ds4_cont_credit_ext_due(999, 1000, 1000, 8, 100, &nf));
+    /* far from the boundary: not due */
+    TEST_ASSERT(!ds4_cont_credit_ext_due(500, 1000, 5000, 8, 100, &nf));
+    /* the margin trigger is exact: pos + margin < end -> wait; == -> due */
+    TEST_ASSERT(!ds4_cont_credit_ext_due(991, 1000, 5000, 8, 100, &nf));
+    TEST_ASSERT(ds4_cont_credit_ext_due(992, 1000, 5000, 8, 100, &nf));
+    TEST_ASSERT(nf == 1100);            /* one tranche */
+    /* the last tranche clamps at the true target */
+    TEST_ASSERT(ds4_cont_credit_ext_due(995, 1000, 1050, 8, 100, &nf));
+    TEST_ASSERT(nf == 1050);
+    /* a huge tranche funds the remainder in one step */
+    TEST_ASSERT(ds4_cont_credit_ext_due(995, 1000, 5000, 8, 1u << 20, &nf));
+    TEST_ASSERT(nf == 5000);
+}
+static void test_cont_credit_refuse_bmax_clamp(void) {
+    /* row at pos 990 with 40 generated, funded through 1000: 10 more
+     * tokens -> terminal fires at glen 50 with the last KV row at 999 */
+    TEST_ASSERT(ds4_cont_credit_refuse_bmax(40, 990, 1000) == 50);
+    /* at the boundary exactly: zero remain, terminal fires immediately */
+    TEST_ASSERT(ds4_cont_credit_refuse_bmax(40, 1000, 1000) == 40);
+    /* pathological pos past end floors at glen (never extends the cap) */
+    TEST_ASSERT(ds4_cont_credit_refuse_bmax(40, 1005, 1000) == 40);
+}
+
 /* Inc 7a: the extracted accumulator's own contract -- verdict precedence,
  * stop capture + truncation, one-shot transitions, think-gated markers.
  * The serial/cont byte equivalence is pinned by the oracle tests above;
@@ -27916,6 +27967,8 @@ static void ds4_server_unit_tests_run(void) {
     test_request_decode_budget_three_states();
     test_credit_union_merge_shapes();
     test_credit_union_sums_per_run_need();
+    test_cont_credit_ext_due_shapes();
+    test_cont_credit_refuse_bmax_clamp();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();

@@ -359,6 +359,37 @@ static inline uint64_t ds4_credit_union_runs(
         need += run_need(user, run_p0 * page, (run_p1 - run_p0 + 1u) * page);
     return need;
 }
+/* MT-1b (v0.6.1 memory truth): pure arithmetic under the mid-flight tranche
+ * credit extension, header-inline so unit tests pin it without a GPU.
+ * A row admitted under DS4_CONT_ADMIT_TRANCHE holds credit for only its
+ * next tranche of decode growth; when its absolute position pos comes
+ * within `margin` of the credited end and the true normalized target lies
+ * beyond, an extension attempt is due.  margin must cover the widest
+ * single decode step (1 committed token + the speculative verify depth:
+ * those draft rows write KV BEFORE acceptance), so no forward ever touches
+ * rows past the funded end.  tranche == 0 is the legacy kill switch:
+ * never due.  Returns 1 and sets *next_end = min(credit_end + tranche,
+ * target) when an attempt is due. */
+static inline int ds4_cont_credit_ext_due(uint64_t pos, uint64_t credit_end,
+                                          uint64_t target, uint64_t margin,
+                                          uint64_t tranche, uint64_t *next_end) {
+    if (tranche == 0 || credit_end >= target) return 0;
+    if (pos + margin < credit_end) return 0;
+    uint64_t nf = credit_end + tranche;
+    if (nf > target) nf = target;
+    *next_end = nf;
+    return 1;
+}
+/* MT-1b: the refusal clamp -- the generation cap that finishes a row
+ * EXACTLY at its funded boundary.  A row at absolute position pos with
+ * glen tokens generated may emit (credit_end - pos) more before its KV
+ * would touch an unfunded row, so the terminal check (glen >= bmax) fires
+ * on the last funded token: positions written stay in [0, credit_end). */
+static inline uint32_t ds4_cont_credit_refuse_bmax(uint32_t glen, uint64_t pos,
+                                                   uint64_t credit_end) {
+    const uint64_t left = credit_end > pos ? credit_end - pos : 0u;
+    return glen + (uint32_t)left;
+}
 /* Bank count of the persistent ctx (create_fit may size it below the
  * requested cap).  Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx);
@@ -767,6 +798,13 @@ typedef struct {
     /* engine admission + refusals */
     uint64_t graph_fit_refusals;            /* session-graph fit gate said no */
     uint64_t cont_admit_rejects;            /* comp-cache budget rejects */
+    /* MT-1b (v0.6.1 memory truth): mid-flight tranche credit extensions.
+     * granted = a live row's credit end advanced one tranche; refused =
+     * the funding verdict said no and the row was pinned to its funded
+     * boundary (it finishes there with finish=length -- the legacy scheme
+     * would have refused the whole request at admission). */
+    uint64_t cont_credit_ext_granted;
+    uint64_t cont_credit_ext_refused;
     /* memgov D5-3: the typed rejection family (lane x reason enums above,
      * both closed).  Ticked BESIDE the legacy scalars, which stay frozen;
      * every cell renders on /metrics. */
