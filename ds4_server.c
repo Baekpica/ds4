@@ -13763,15 +13763,15 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     const bool pending = ds4_session_graph_pending(s->session) != 0;
     if (cur_ctx >= need_min &&
         (!pending || ds4_engine_session_graph_fits(s->engine, cur_ctx))) {
-        /* memgov D0b-3 (S6): refresh the lane's absolute lease.  BOUNDED
-         * (scoping sec 2): a pending graph commits within THIS request,
-         * so intent==resident with a commit-lead window, no quote (no
-         * memory verdict was taken on this path). */
-        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION,
-                            ds4_engine_session_graph_bytes_estimate(s->engine,
-                                                                    cur_ctx),
-                            ds4_engine_session_graph_bytes_estimate(s->engine,
-                                                                    cur_ctx));
+        /* memgov D0b-3 (S6) + MT-2: refresh the lane's absolute lease
+         * HONESTLY -- a still-pending graph is declared intent with zero
+         * resident (the burst lands in ds4_session_alloc_graph, which
+         * publishes the commit), so the build window's unfunded debt is
+         * visible to every other lane's governed quote.  No quote here
+         * (no memory verdict was taken on this path). */
+        const uint64_t est = ds4_engine_session_graph_bytes_estimate(s->engine,
+                                                                     cur_ctx);
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, pending ? 0 : est);
         return true;   /* committed-and-big-enough, or pending-and-allocatable */
     }
 
@@ -13918,9 +13918,14 @@ static bool serial_session_ensure_fit(server *s, job *j) {
                    "(DS4_SERVER_SERIAL_RIGHTSIZE=0 restores full--c alloc)",
                    cur_ctx, target, boot_ctx, j->req.prompt.len, budget,
                    pending ? "" : " [live serial state reset]");
-        /* The lane's absolute lease: the graph is committed at target. */
+        /* MT-2: the lane's absolute lease -- INTENT at target, resident 0:
+         * the session was created with its graph PENDING; the burst (and
+         * the resident flip) land in ds4_session_alloc_graph when this
+         * request's first root API ensures it.  Publishing intent==resident
+         * here was the commit-lead window: the ~GiB build read as fully
+         * funded before any byte landed. */
         ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION,
-                            scl.proposed_outstanding, scl.proposed_outstanding);
+                            scl.proposed_outstanding, 0);
         return true;
     }
     if (final_v != legacy_v && legacy_v == DS4_GOV_ADMIT) {
@@ -26930,6 +26935,49 @@ static void test_mem_gov_evaluate_verdicts(void) {
     TEST_ASSERT(q.status == DS4_GOV_REFUSE_LIVE && q.deficit == 1);
 }
 
+/* MT-2 (v0.6.1 memory truth): the serial build-window lease lifecycle as
+ * seen by a BANK claim.  ds4_session_alloc_graph publishes (est, 0) before
+ * the burst, (est, est) at commit, (0, 0) on failure/release; the
+ * evaluator's cross-lane term (others' intent - resident) must charge the
+ * whole window and drop to zero at commit -- the committed bytes are
+ * already invisible to raw free, so charging them again would double-count
+ * (no false admit during the window, no false refuse after commit). */
+static void test_mem_gov_serial_window_lease(void) {
+    ds4_gov_ledger lg = mem_gov_test_ledger();
+    uint64_t faults = 0;
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+    cl.memc = DS4_MEMC_BATCH_BANK;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 1500;      /* own unfunded = 500 */
+    cl.class_limit = 0;
+
+    /* Baseline (serial lease empty): required = floor 600 + sub 50
+     * + serial reserve 200 + own unfunded 500 = 1350. */
+    ds4_mem_observation o = mem_gov_test_obs(1350);
+    ds4_gov_quote q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_ADMIT && q.required == 1350);
+
+    /* Window OPEN: serial declares intent 5000, nothing landed.  The
+     * bank's quote must charge the full unfunded window. */
+    ds4_gov_lease_publish(&lg, DS4_GOVC_SERIAL_SESSION, 5000, 0, 200, &faults);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_REFUSE_LIVE);
+    TEST_ASSERT(q.required == 1350 + 5000 && q.deficit == 5000);
+
+    /* COMMIT: bytes landed (est, est) -- unfunded drops to zero, raw
+     * free now carries the graph; required returns to baseline. */
+    ds4_gov_lease_publish(&lg, DS4_GOVC_SERIAL_SESSION, 5000, 5000, 200, &faults);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_ADMIT && q.required == 1350);
+
+    /* RELEASE (graph freed): identical required -- no phantom remains. */
+    ds4_gov_lease_publish(&lg, DS4_GOVC_SERIAL_SESSION, 0, 0, 200, &faults);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_ADMIT && q.required == 1350);
+    TEST_ASSERT(faults == 0);
+}
+
 static void test_mem_gov_requester_asymmetry(void) {
     /* sec 6.2: the serial requester spends its own reserve; a batch
      * requester must treat it as spoken for.  Identical numbers, the two
@@ -27998,6 +28046,7 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_obs_legacy_shim();
     /* memgov D0b-1: shadow-governor evaluator (pure core). */
     test_mem_gov_evaluate_verdicts();
+    test_mem_gov_serial_window_lease();
     test_mem_gov_requester_asymmetry();
     test_mem_gov_absolute_replacement();
     test_mem_gov_observation_policy();

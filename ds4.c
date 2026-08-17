@@ -40355,18 +40355,44 @@ static bool ds4_session_lazy_graph_enabled(void) {
 }
 
 /* One body for the eager (create) and lazy (ensure) alloc so the two cannot
- * drift: sizing, quality/power adoption, directional steering. */
+ * drift: sizing, quality/power adoption, directional steering.
+ * MT-2 (v0.6.1 memory truth): this body is THE serial-graph burst -- every
+ * root API's lazy ensure and the eager create both land here -- so the
+ * honest lease lifecycle lives here too: intent declared BEFORE the burst
+ * (est, 0), committed at success (est, est), released on failure (0, 0).
+ * That closes the D0b-3 "commit-lead window": until now the server
+ * published intent==resident while the graph was still pending, so the
+ * multi-GiB build window contributed ZERO unfunded debt to the other
+ * lanes' governed quotes (the false-admit race of the leg-1 anatomy) --
+ * and five of the seven ensure entry points carried no lease at all.
+ * The estimate uses the alloc's own arguments, so lease and burst cannot
+ * drift.  MT-2 census: the whole body runs under SESSION_TENSORS -- the
+ * pc-scaled prefill scratch group (~3.98 GiB at pc 4096) and the indexer
+ * scratch previously fell through to ENGINE_OTHER (the leg-1 mystery
+ * reading), violating the documented ENGINE_OTHER live == 0 invariant. */
 static int ds4_session_alloc_graph(ds4_session *s) {
     ds4_engine *e = s->engine;
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(s->ctx_size, s->prefill_cap);
+    const uint64_t est = metal_graph_alloc_bytes_estimate(&e->weights, &e->weights.layer[0],
+                                                          raw_cap, (uint32_t)s->ctx_size,
+                                                          s->prefill_cap,
+                                                          e->mtp_ready, e->dspark_ready);
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, 0);
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
     if (!metal_graph_session_fit_ok(&e->weights, &e->weights.layer[0],
                                     raw_cap, (uint32_t)s->ctx_size, s->prefill_cap,
-                                    e->mtp_ready, e->dspark_ready))
+                                    e->mtp_ready, e->dspark_ready)) {
+        ds4_gpu_mem_scope_end();
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
         return 1;
+    }
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)s->ctx_size, s->prefill_cap,
-                                   e->mtp_ready, e->dspark_ready))
+                                   e->mtp_ready, e->dspark_ready)) {
+        ds4_gpu_mem_scope_end();
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
         return 1;
+    }
     s->graph.quality = e->quality;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&s->graph,
@@ -40375,8 +40401,12 @@ static int ds4_session_alloc_graph(ds4_session *s) {
                                                e->directional_steering_ffn_scale)) {
         metal_graph_free(&s->graph);
         memset(&s->graph, 0, sizeof(s->graph));
+        ds4_gpu_mem_scope_end();
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
         return 1;
     }
+    ds4_gpu_mem_scope_end();
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, est);
     return 0;
 }
 
@@ -40528,6 +40558,13 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     else {
         metal_graph_free(&s->graph);
+        /* MT-2: the symmetric lease release.  ds4_session_alloc_graph
+         * published this session's commit (est, est); without the release
+         * a freed session leaves a PHANTOM lease other lanes' quotes
+         * charge forever (live-caught: the boot prewarm session's ctx-528
+         * graph left 746 MiB of stuck intent after its free).  Absolute
+         * publish: after free the session lane holds nothing. */
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
     }
 #endif
     token_vec_free(&s->checkpoint);
