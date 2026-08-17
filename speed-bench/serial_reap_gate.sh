@@ -131,5 +131,27 @@ LI4=$(lease_mib intent)
 [ -n "$LI4" ] && [ "$LI4" -ge 500 ] || fail "leg O: committed lease ${LI4:-?} MiB should persist with reap off"
 log "O PASS (window 0: graph persists, lease ${LI4} MiB)"
 
+# ---------- Leg E: eager-graph mode declines (teb fast-leg death repro) ----
+# DS4_SESSION_LAZY_GRAPH=0 makes every session create materialize the full
+# graph.  Pre-fix, the reaper freed ~6 GiB, re-materialized it in the same
+# call, and re-fired every dequeue tick (1438 cycles in the field repro)
+# until a recreate lost the fit race and die()d the server.  The fix: the
+# due-check declines in eager mode.  Assert: window elapsed, ZERO reaps,
+# server alive, serial still serves, lease intact.
+boot "DS4_SERIAL_IDLE_REAP_S=15 DS4_SESSION_LAZY_GRAPH=0"
+HTTP=$(serial_turn e1)
+[ "$HTTP" = "200" ] || fail "leg E: serial turn HTTP $HTTP"
+LE0=$(lease_mib intent)
+[ -n "$LE0" ] && [ "$LE0" -ge 500 ] || fail "leg E: committed lease ${LE0:-?} MiB"
+sleep 40
+ssh "$R" "pgrep -x ${BIN:0:15} >/dev/null" || fail "leg E: server DIED in eager mode (the teb death shape)"
+[ "$(metric1 ds4_serial_idle_reaps_total)" = "0" ] || fail "leg E: reap fired in eager-graph mode"
+[ "$(srv_count 'serial idle reap')" = "0" ] || fail "leg E: reap log line in eager-graph mode"
+LE1=$(lease_mib intent)
+[ "$LE1" = "$LE0" ] || fail "leg E: lease moved ${LE0} -> ${LE1} MiB with no reap allowed"
+HTTP=$(serial_turn e2)
+[ "$HTTP" = "200" ] || fail "leg E: post-window serial turn HTTP $HTTP"
+log "E PASS (eager mode: zero reaps past the window, server alive, lease ${LE1} MiB intact)"
+
 ssh "$R" "pkill -x ${BIN:0:15}" 2>/dev/null
 log "ALL LEGS PASS — artifacts in $OUT ($BIN killed, $R left free)"

@@ -14042,7 +14042,14 @@ static bool serial_session_ensure_fit(server *s, job *j) {
  * ownership domain as ensure_fit's swap).  Scope: bank-holding boots --
  * on a serial-only deployment the graph IS the serving path. */
 static bool serial_idle_reap_due(const server *s) {
-    return s->serial_idle_reap_s > 0 && s->batch_ctx && s->session &&
+    /* teb fast-leg death (08-17, 1438-cycle repro): in eager-graph mode
+     * (DS4_SESSION_LAZY_GRAPH=0) the recreate below re-materializes the
+     * full graph in the same call -- the reap frees ~6 GiB, re-allocates
+     * it, the fresh session reads non-pending, and the due-check re-fires
+     * every dequeue tick until a recreate loses the fit race and dies.
+     * Eager mode asked for a permanently materialized session: never reap. */
+    return s->serial_idle_reap_s > 0 && ds4_session_lazy_graph() &&
+           s->batch_ctx && s->session &&
            !ds4_session_graph_pending(s->session) &&
            now_sec() - s->last_serial_use > (double)s->serial_idle_reap_s;
 }
@@ -14053,6 +14060,10 @@ static void serial_session_idle_reap_locked(server *s) {
                "right-sized; DS4_SERIAL_IDLE_REAP_S=0 disables)",
                ds4_session_ctx(s->session),
                now_sec() - s->last_serial_use, s->serial_idle_reap_s);
+    /* The reap restarts the idle window -- without this, a session that
+     * reads non-pending after the recreate keeps the due-check firing
+     * every dequeue tick (the teb loop's second leg). */
+    s->last_serial_use = now_sec();
     ds4_session_free(s->session);   /* MT-2: publishes the lease release */
     s->session = NULL;
     responses_live_clear(s);

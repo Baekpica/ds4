@@ -1117,6 +1117,10 @@ int ds4_session_prefill_cap(ds4_session *s);
  * still deferred, and whether a session graph at ctx_size would pass the fit
  * gate right now (quiet probe; fail-open like the gate itself). */
 int ds4_session_graph_pending(const ds4_session *s);
+/* MT-3: whether session creates defer the graph alloc (DS4_SESSION_LAZY_GRAPH,
+ * default ON; =0 pins eager materialization).  The idle reaper only runs in
+ * lazy mode -- an eager recreate would re-materialize what the reap freed. */
+int ds4_session_lazy_graph(void);
 int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size);
 /* memgov D4-1: the structured fit quote (revised plan sec 10 step 1) -- the
  * boolean probe's own terms, exposed.  need = the graph alloc estimate at

@@ -40533,6 +40533,14 @@ static bool ds4_session_lazy_graph_enabled(void) {
     const char *e = getenv("DS4_SESSION_LAZY_GRAPH");
     return !(e && e[0] == '0' && e[1] == '\0');   /* default ON */
 }
+/* MT-3 hotfix (teb fast-leg death, 08-17): exported so the server's idle
+ * reaper can decline in eager-graph mode -- with DS4_SESSION_LAZY_GRAPH=0
+ * every recreate materializes the full graph, so a reap frees ~6 GiB only
+ * to re-allocate it in the same call: pure churn with a fatal endpoint
+ * when a recreate loses the fit race against live banks. */
+int ds4_session_lazy_graph(void) {
+    return ds4_session_lazy_graph_enabled() ? 1 : 0;
+}
 
 /* One body for the eager (create) and lazy (ensure) alloc so the two cannot
  * drift: sizing, quality/power adoption, directional steering.
