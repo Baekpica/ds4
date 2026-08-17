@@ -772,6 +772,7 @@ enum {
     DS4_REJECT_UNSUPPORTED,       /* shape/backend: never                */
     DS4_REJECT_FAULT,             /* internal fault: never               */
     DS4_REJECT_DEEP_POLICY,       /* deep-ctx serial policy: never       */
+    DS4_REJECT_LANE_DISABLED,     /* MT-4: --no-serial refusal: never    */
     DS4_REJECT__COUNT
 };
 /* The governed-check refusal statuses map 1:1 onto reasons; ADMIT never

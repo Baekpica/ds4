@@ -8427,6 +8427,14 @@ struct server {
      * DS4_SERVER_SERIAL_RIGHTSIZE=0 restores the fail-at-full--c behavior. */
     bool serial_rightsize;
     int  serial_boot_ctx;
+    /* MT-4 (audit V3): opt-in cont-only mode (--no-serial /
+     * DS4_SERVER_NO_SERIAL=1).  s->session stays NULL; run_job_single --
+     * the ONE choke point every serial execution path flows through
+     * (direct route, static single-member collapse, static memgov
+     * fallback, cont stranded fallback) -- refuses with a typed 503
+     * (DS4_REJECT_LANE_DISABLED) instead of serving.  Default OFF:
+     * the serial routes carry real traffic (audit V3's R1-R12). */
+    bool no_serial;
     /* MT-3 (v0.6.1 memory truth): idle reaper for the committed serial
      * session graph on bank-holding boots.  A single serial detour used to
      * convert ~5 GiB permanently (the graph was freed only at replace or
@@ -14061,6 +14069,30 @@ static void serial_session_idle_reap_locked(server *s) {
 
 /* The original single-request path: serialize the GPU, run, signal done. */
 static void run_job_single(server *s, job *j) {
+    /* MT-4 (audit V3): --no-serial refuses HERE -- the one choke point
+     * every serial execution flows through (the direct SERIAL route,
+     * the static single-member collapse, the static memgov fallback,
+     * and the cont stranded fallback -- the last two never pass
+     * route_decide, which is why the refusal does not live there).
+     * Same typed 503 shape as the deep-serial guard (R13). */
+    if (s->no_serial) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "This server runs cont-only (--no-serial); the request "
+                 "requires the serial path (%d-token prompt) and is not "
+                 "served here", j->req.prompt.len);
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: --no-serial: refusing serial-lane request "
+                   "(prompt=%d tokens, surface=%d)",
+                   j->req.prompt.len, (int)wire_surface_for(&j->req));
+        ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                           [DS4_REJLANE_SERIAL][DS4_REJECT_LANE_DISABLED], 1);
+        wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req),
+                        503, msg);
+        j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
+        job_finish(j);
+        return;
+    }
     pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
     int hold_retry = 0;
     if (cont_registry_serial_hold(s, &j->req, now_sec(), &hold_retry)) {
@@ -16364,10 +16396,16 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
 }
 
 static void append_model_json(buf *b, const server *s, const char *id) {
+    /* MT-4 (R18): the CONFIGURED context, never ds4_session_ctx(s->session)
+     * -- this renders on CLIENT threads while right-sizing and the MT-3
+     * idle reaper swap the session under gen_mu (the documented v0.5.2
+     * rule every other client-thread site already follows).  The reaper
+     * recreates at serial_boot_ctx, so the advertised value was constant
+     * anyway; under --no-serial there is no session at all. */
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
-                             ds4_session_ctx(s->session),
+                             s->serial_boot_ctx,
                              s->default_tokens);
 }
 
@@ -16462,7 +16500,9 @@ static void server_load_codex_models(server *s) {
     const char *cw = strstr(arr, "\"context_window\"");
     const char *cwv = cw ? strchr(cw, ':') : NULL;
     const long file_ctx = cwv ? strtol(cwv + 1, NULL, 10) : 0;
-    const int live_ctx = ds4_session_ctx(s->session);
+    /* MT-4 (R19): the configured -c, not the session (boot thread, but
+     * under --no-serial there is no session at all). */
+    const int live_ctx = s->serial_boot_ctx;
     if (file_ctx > 0 && file_ctx != live_ctx)
         server_log(DS4_LOG_WARNING,
                    "ds4-server: codex models file declares context_window=%ld but "
@@ -16706,7 +16746,7 @@ static const char *rejlane_names[DS4_REJLANE__COUNT] = {
 };
 static const char *reject_reason_names[DS4_REJECT__COUNT] = {
     "class_budget", "live_headroom", "obs_retry", "unsupported", "fault",
-    "deep_policy",
+    "deep_policy", "lane_disabled",
 };
 
 typedef struct {
@@ -17929,6 +17969,8 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    bool no_serial;    /* MT-4 (audit V3): opt-in cont-only mode; the serial
+                        * lane refuses typed 503s instead of serving. */
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -18617,6 +18659,10 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--no-serial")) {
+            /* MT-4 (audit V3): cont-only serving.  DS4_SERVER_NO_SERIAL=1
+             * is the env twin (gates + containerized launches). */
+            c.no_serial = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--reasoning-effort")) {
@@ -18720,6 +18766,10 @@ static server_config parse_options(int argc, char **argv) {
     }
     launch_resolve_defaults(&c, model_set, mtp_set,
                             preset_spark, no_mtp, no_dspark, no_spec);
+    if (!c.no_serial) {   /* MT-4: env twin of --no-serial */
+        const char *ne = getenv("DS4_SERVER_NO_SERIAL");
+        c.no_serial = ne && ne[0] == '1' && ne[1] == '\0';
+    }
     return c;
 }
 
@@ -18806,8 +18856,15 @@ int main(int argc, char **argv) {
         return rc;
     }
 
+    /* MT-4 (audit V3): under --no-serial the boot session is never created
+     * -- the serial lane refuses (run_job_single's typed 503) instead of
+     * serving, and every boot/client consumer reads cfg.ctx_size /
+     * serial_boot_ctx (R18/R19).  The lazy graph made the session cheap,
+     * but its EXISTENCE is what a cont-only deployment opts out of: one
+     * serial detour is a multi-GiB conversion (the leg-1 cliff). */
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
+    if (!cfg.no_serial &&
+        ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
                    ds4_backend_name(cfg.engine.backend));
         ds4_engine_close(engine);
@@ -18821,6 +18878,11 @@ int main(int argc, char **argv) {
     s.default_tokens = cfg.default_tokens;
     /* v0.5.2 inc1: serial right-sizing (see serial_session_ensure_fit). */
     s.serial_boot_ctx = cfg.ctx_size;
+    s.no_serial = cfg.no_serial;
+    if (s.no_serial)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --no-serial: cont-only serving; serial-lane "
+                   "requests get typed 503 refusals (reason=lane_disabled)");
     {
         const char *sr = getenv("DS4_SERVER_SERIAL_RIGHTSIZE");
         s.serial_rightsize = !(sr && sr[0] == '0' && sr[1] == '\0');
@@ -18939,12 +19001,16 @@ int main(int argc, char **argv) {
          * ctx=4096, so we fit-or-reduce below rather than silently falling back to
          * the per-call static path (which loses W5-W8 continuous features).
          * MT-5 (audit V6): the 32 stands only through the measured regime --
-         * coalesce_max_default scales it down with ctx (see its comment). */
-        int cmax = cm ? atoi(cm) : coalesce_max_default(ds4_session_ctx(s.session));
+         * coalesce_max_default scales it down with ctx (see its comment).
+         * MT-4 (R19): size from cfg.ctx_size, not the serial session's ctx
+         * -- the cont bank plan derives from the CONFIGURED context (the
+         * two were equal at boot anyway; under --no-serial there is no
+         * session to ask). */
+        int cmax = cm ? atoi(cm) : coalesce_max_default(cfg.ctx_size);
         if (cmax < 1) cmax = 1;
         if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
         const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
-        const int cmaxtok_dflt = coalesce_max_tokens_default(ds4_session_ctx(s.session));
+        const int cmaxtok_dflt = coalesce_max_tokens_default(cfg.ctx_size);
         int cmaxtok = ct ? atoi(ct) : cmaxtok_dflt;
         if (cmaxtok <= 0) cmaxtok = cmaxtok_dflt;  /* unbounded coalesce -> size ctx to default */
         if (cmaxtok < cmax) cmaxtok = cmax;        /* need >=1 token per seq */
@@ -18958,7 +19024,7 @@ int main(int argc, char **argv) {
             int try_seq = cmax;
             bool made = false;
             while (try_seq >= 2) {
-                if (ds4_batch_ctx_create_fit(s.engine, ds4_session_ctx(s.session), try_seq, cmaxtok,
+                if (ds4_batch_ctx_create_fit(s.engine, cfg.ctx_size, try_seq, cmaxtok,
                                              &s.batch_ctx, cerr, sizeof(cerr)) == 0) {
                     const int got_seq = ds4_batch_ctx_max_seq(s.batch_ctx);  /* may be < try_seq (budget fit) */
                     s.batch_ctx_max_seq = got_seq;
@@ -19003,7 +19069,7 @@ int main(int argc, char **argv) {
                     }
                     server_log(DS4_LOG_DEFAULT,
                                "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d prefill_chunk=%u seq_cap=%d)%s",
-                               got_seq, cmaxtok, ds4_session_ctx(s.session),
+                               got_seq, cmaxtok, cfg.ctx_size,
                                ds4_batch_ctx_raw_cap(s.batch_ctx),
                                ds4_cont_prefill_chunk_tokens(),
                                ds4_batch_ctx_seq_cap(s.batch_ctx),
@@ -19233,7 +19299,8 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    const ds4_tokens *tokens = ds4_session_tokens(s.session);
+    /* MT-4: NULL-safe under --no-serial (no session, nothing to persist). */
+    const ds4_tokens *tokens = s.session ? ds4_session_tokens(s.session) : NULL;
     if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
