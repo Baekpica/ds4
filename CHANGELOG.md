@@ -47,9 +47,23 @@ cut prep.)
   succeeding admissions is an accounting artifact, not a leak — the
   cross-boot experiment showed every kernel bucket flat across
   boot/kill cycles while the estimate re-scored page-cache state.
-- Launch defaults prefer the 0731 checkpoint and retire MTP beside
-  0731 bases. The DSpark trace-replay tool now defaults to the shipped
-  quench controller, so an explicit replay reproduces serving behavior
+- The zero-config launch defaults are now checkpoint-generation aware
+  (serving-gguf audit 2026-08-12: the compiled-in default file names
+  were the pre-0731 set, so a raw `ds4-server -c N` on a box holding
+  both generations silently served the old checkpoint). Resolution
+  prefers the -0731 file names and falls back to the previous-
+  generation names; the generation is detected from the resolved base
+  file name — the same scheme as the ds4-on-spark installer, so
+  GGUF_FILE overrides keep working in both directions. The 0731
+  checkpoint has no MTP head (replaced upstream by the DSpark stages),
+  so the legacy MTP gguf never auto-attaches beside a 0731 base —
+  `--preset spark` included — and the boot line says so
+  (`mtp=retired`). An explicit `--mtp` still wins, as do all existing
+  flags and env overrides. Gate: `launch_defaults_gate.sh` new
+  `gen_resolve` fake-layout leg plus 0731-shape assertions on the
+  zero-config and preset legs.
+- The DSpark trace-replay tool now defaults to the shipped quench
+  controller, so an explicit replay reproduces serving behavior
   instead of a rejected prototype. The shipped break-even guard (2.16,
   unchanged since v0.5.0) was re-validated at corpus scale this cycle:
   59 traces, a flat plateau from 2.16 to 2.30, quench lifting the

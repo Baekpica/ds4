@@ -7,7 +7,7 @@
 #
 #   leg zero_config   ./ds4-server -c $CTX --port $PORT      (no -m, no env)
 #       asserts: one launch-defaults boot line naming model+mtp+dspark and
-#       arming DS4_CONT_MTP_MODE=2 + DS4_CONT_DSPARK=1; MTP + DSpark loaded;
+#       arming DS4_CONT_MTP_MODE=2 + DS4_CONT_DSPARK=1; DSpark loaded;
 #       aligned fast-path artifacts present; a completion succeeds; the
 #       request drove speculative drafts (ds4_spec_drafts_total > 0).
 #   leg no_spec       ./ds4-server --no-spec -c $CTX --port $PORT
@@ -15,6 +15,24 @@
 #       a completion still succeeds on the plain continuous path.
 #   leg preset_spark  ./ds4-server --preset spark -c $CTX --port $PORT
 #       asserts: same full-stack tells as zero_config.
+#
+# v0.5.7 — generation-aware resolution (serving-gguf audit 2026-08-12: the
+# compiled-in default names were the PRE-0731 set, so raw `ds4-server -c N`
+# silently served the old checkpoint for 11 days after the 08-01 cutover):
+# resolution now prefers the -0731 file names, falls back to the legacy
+# names, detects the generation from the resolved base file name (same
+# scheme as the ds4-on-spark installer), and never auto-attaches the legacy
+# MTP head beside a 0731 base (0731 retired MTP; explicit --mtp still wins).
+#   leg gen_resolve   fake-layout boot-line asserts, NO real models (the
+#       launch-defaults line prints before engine open; each probe dies on
+#       engine open by design).  A dir holding BOTH generations must
+#       resolve the -0731 base + -0731 drafter with mtp=retired; a
+#       legacy-only dir must fall back to the legacy names (MTP-droppable
+#       default); a 0731-base + legacy-drafter dir must take the lossless
+#       drafter fallback and still retire MTP.
+#   legs zero_config / preset_spark assert the 0731 shape: the boxes'
+#       ~/gguf holds both generations since the 08-12 serving swap, so
+#       zero-config must resolve -0731 names and never load MTP.
 #
 # v0.5.1 inc4 — MTP accept guard legs.  The ggufs carry NO generation
 # metadata, so support-model health is judged by MEASUREMENT (spec decode is
@@ -122,15 +140,67 @@ completion(){
 
 metric(){ curl -s -m 10 "http://127.0.0.1:$TUNNEL_PORT/metrics" | grep -oE "^$1 [0-9]+" | awk '{print $2}'; }
 
+# ---- leg 0: generation resolution (fake layouts, boot line only) ----------
+# Touched empty files exercise resolution without real models: the launch-
+# defaults line prints before engine open, then the probe dies on the empty
+# gguf (expected).  Runs on unused port 18999 beside whatever is up.
+B0731_NAME=DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+BLEG_NAME=DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+MTP_NAME=DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+D0731_NAME=DSpark-drafter-Q2K-Q8-0731.gguf
+DLEG_NAME=DSpark-drafter-Q2K-Q8.gguf
+
+gen_probe(){ # $1=case $2=fake gguf dir
+  ssh "$R" "cd $BINDIR; DS4_GGUF_DIR=$2 timeout 30 ./ds4-server -c 4096 --port 18999 \
+      > $RWORK/gen_$1.log 2>&1; exit 0"
+  ssh "$R" "cat $RWORK/gen_$1.log" > "$OUT/gen_$1.log"
+  grep -q 'launch defaults:' "$OUT/gen_$1.log" || fail "gen_resolve/$1: no launch-defaults boot line"
+}
+gen_line_has(){ grep -q "$2" "$OUT/gen_$1.log"; }
+
+ssh "$R" "mkdir -p $RWORK/genfake_both $RWORK/genfake_legacy $RWORK/genfake_mixed
+  cd $RWORK/genfake_both   && touch $B0731_NAME $BLEG_NAME $MTP_NAME $D0731_NAME $DLEG_NAME
+  cd $RWORK/genfake_legacy && touch $BLEG_NAME $MTP_NAME $DLEG_NAME
+  cd $RWORK/genfake_mixed  && touch $B0731_NAME $DLEG_NAME
+  exit 0"
+
+gen_probe both "$RWORK/genfake_both"
+gen_line_has both "model=$RWORK/genfake_both/$B0731_NAME" \
+  || fail "gen_resolve/both: -0731 base not preferred over legacy"
+gen_line_has both "dspark=$RWORK/genfake_both/$D0731_NAME" \
+  || fail "gen_resolve/both: -0731 drafter not preferred over legacy"
+gen_line_has both 'mtp=retired' \
+  || fail "gen_resolve/both: MTP not retired beside a 0731 base"
+gen_line_has both "mtp=$RWORK" \
+  && fail "gen_resolve/both: an MTP path auto-attached beside a 0731 base"
+
+gen_probe legacy "$RWORK/genfake_legacy"
+gen_line_has legacy "model=$RWORK/genfake_legacy/$BLEG_NAME" \
+  || fail "gen_resolve/legacy: legacy base fallback broken"
+gen_line_has legacy "dspark=$RWORK/genfake_legacy/$DLEG_NAME" \
+  || fail "gen_resolve/legacy: legacy drafter fallback broken"
+gen_line_has legacy 'mtp=dropped' \
+  || fail "gen_resolve/legacy: MTP-droppable default missing on legacy gen"
+
+gen_probe mixed "$RWORK/genfake_mixed"
+gen_line_has mixed "model=$RWORK/genfake_mixed/$B0731_NAME" \
+  || fail "gen_resolve/mixed: 0731 base not resolved"
+gen_line_has mixed "dspark=$RWORK/genfake_mixed/$DLEG_NAME" \
+  || fail "gen_resolve/mixed: legacy-drafter fallback beside 0731 base broken"
+gen_line_has mixed 'mtp=retired' \
+  || fail "gen_resolve/mixed: MTP not retired beside a 0731 base"
+log "gen_resolve PASS (both/legacy/mixed fake layouts)"
+
 # ---- leg 1: zero-config ---------------------------------------------------
-# v0.2.4 MTP-droppable default: with a drafter beside the base model the
-# launch defaults arm DSpark-only spec and DROP the MTP head (~3.55 GiB;
-# teb fast MTP-less is counter-identical and slightly faster, 240K deep
-# within noise). --mtp / --preset spark still load it (leg 3 covers that).
+# v0.2.4 MTP-droppable default + v0.5.7 generation preference: with both
+# generations in ~/gguf (the box state since the 08-12 serving swap) the
+# launch defaults must resolve the -0731 base + -0731 drafter and retire
+# the MTP head (0731 has no MTP; ~3.55 GiB saved on legacy too — teb fast
+# MTP-less is counter-identical).  --mtp still force-loads one.
 boot zero_config
-srv_has zero_config 'launch defaults:.*model=.*mtp=dropped.*dspark=.*DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1' \
-  || fail "zero_config: launch-defaults boot line missing/incomplete (want mtp=dropped)"
-srv_has zero_config 'MTP support model loaded'  && fail "zero_config: MTP loaded despite armed drafter (MTP-droppable default)"
+srv_has zero_config 'launch defaults:.*model=[^ ]*-0731\.gguf.*mtp=retired.*dspark=[^ ]*-0731\.gguf.*DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1' \
+  || fail "zero_config: launch-defaults boot line missing/incomplete (want -0731 names + mtp=retired)"
+srv_has zero_config 'MTP support model loaded'  && fail "zero_config: MTP loaded beside a 0731 base (retired head)"
 srv_has zero_config 'DSpark drafter loaded'     || fail "zero_config: drafter not loaded"
 [ "$(ssh "$R" "grep -c aligned $RWORK/srv_zero_config.log")" -gt 0 ] \
   || fail "zero_config: no aligned fast-path artifacts (perf-cliff tell)"
@@ -148,8 +218,12 @@ completion no_spec
 log "no_spec PASS"
 
 # ---- leg 3: --preset spark -------------------------------------------------
+# On a 0731 base the strict preset's "full stack" is base + drafter: 0731
+# retired the MTP head, so the preset must neither demand nor load one.
 boot preset_spark --preset spark
-srv_has preset_spark 'MTP support model loaded' || fail "preset_spark: MTP not loaded"
+srv_has preset_spark 'launch defaults:.*model=[^ ]*-0731\.gguf.*mtp=retired.*dspark=[^ ]*-0731\.gguf' \
+  || fail "preset_spark: launch-defaults boot line missing/incomplete (want -0731 names + mtp=retired)"
+srv_has preset_spark 'MTP support model loaded' && fail "preset_spark: MTP loaded beside a 0731 base (retired head)"
 srv_has preset_spark 'DSpark drafter loaded'    || fail "preset_spark: drafter not loaded"
 completion preset_spark
 log "preset_spark PASS"

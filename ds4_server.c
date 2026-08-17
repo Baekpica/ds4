@@ -18019,10 +18019,21 @@ static ds4_backend default_server_backend(void) {
  * the full stack a hard requirement; --no-mtp / --no-dspark / --no-spec opt
  * out per component.  File-name env overrides (DS4_GGUF_DIR, GGUF_FILE,
  * MTP_FILE, DSPARK_FILE) match the ds4-serve wrapper.
+ *
+ * Two checkpoint generations exist in the field since the 0731 refresh
+ * (2026-08-01): resolution prefers the -0731 file names and falls back to
+ * the previous-generation names, and the generation is detected from the
+ * resolved base file name so GGUF_FILE keeps working in both directions —
+ * the same scheme as the ds4-on-spark installer.  The 0731 checkpoint has
+ * no MTP head (the single-block MTP module was replaced upstream by the
+ * DSpark stages), so the legacy MTP gguf must never auto-attach beside a
+ * 0731 base; an explicit --mtp always wins.
  * ------------------------------------------------------------------------ */
-#define LAUNCH_BASE_GGUF   "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
-#define LAUNCH_MTP_GGUF    "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
-#define LAUNCH_DSPARK_GGUF "DSpark-drafter-Q2K-Q8.gguf"
+#define LAUNCH_BASE_GGUF_0731   "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+#define LAUNCH_BASE_GGUF        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+#define LAUNCH_MTP_GGUF         "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
+#define LAUNCH_DSPARK_GGUF_0731 "DSpark-drafter-Q2K-Q8-0731.gguf"
+#define LAUNCH_DSPARK_GGUF      "DSpark-drafter-Q2K-Q8.gguf"
 
 static bool launch_file_ok(const char *path) {
     struct stat st;
@@ -18039,6 +18050,25 @@ static char *launch_join(const char *dir, const char *name) {
 static const char *launch_name(const char *env, const char *fallback) {
     const char *v = getenv(env);
     return (v && v[0]) ? v : fallback;
+}
+
+/* Checkpoint generation from the base file NAME (never the directory —
+ * gating dirs like ~/gguf0731 hold either generation). */
+static bool launch_gen_0731(const char *path) {
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    const char *name = slash ? slash + 1 : path;
+    return name && strstr(name, "-0731") != NULL;
+}
+
+/* Join dir/preferred, falling back to dir/fallback when the preferred file
+ * is absent.  Returns the first candidate that exists, or the FALLBACK path
+ * (for the caller's error message) when neither does. */
+static char *launch_join_pref(const char *dir, const char *preferred,
+                              const char *fallback) {
+    char *cand = launch_join(dir, preferred);
+    if (launch_file_ok(cand)) return cand;
+    free(cand);
+    return launch_join(dir, fallback);
 }
 
 static void launch_append(char *buf, size_t cap, int *off, const char *fmt, ...) {
@@ -18071,7 +18101,13 @@ static void launch_resolve_defaults(server_config *c,
             const char *home = getenv("HOME");
             if (home && home[0]) dir = dirbuf = launch_join(home, "gguf");
         }
-        char *cand = dir ? launch_join(dir, launch_name("GGUF_FILE", LAUNCH_BASE_GGUF)) : NULL;
+        const char *envfile = getenv("GGUF_FILE");
+        char *cand = NULL;
+        if (dir) {
+            cand = (envfile && envfile[0])
+                 ? launch_join(dir, envfile)   /* env names the file exactly */
+                 : launch_join_pref(dir, LAUNCH_BASE_GGUF_0731, LAUNCH_BASE_GGUF);
+        }
         if (launch_file_ok(cand)) {
             c->engine.model_path = cand;   /* lives for the process */
             auto_model = true;
@@ -18079,14 +18115,18 @@ static void launch_resolve_defaults(server_config *c,
             if (preset_spark) {
                 server_log(DS4_LOG_DEFAULT,
                            "ds4-server: --preset spark: base model not found at %s "
-                           "(set DS4_GGUF_DIR/GGUF_FILE or pass -m)",
-                           cand ? cand : "$HOME/gguf/" LAUNCH_BASE_GGUF);
+                           "(-0731 preferred; set DS4_GGUF_DIR/GGUF_FILE or pass -m)",
+                           cand ? cand : "$HOME/gguf/" LAUNCH_BASE_GGUF_0731);
                 exit(2);
             }
             free(cand);
         }
         free(dirbuf);
     }
+
+    /* Everything below keys off the generation of the base we ended up
+     * with, however it was chosen (auto, env, or explicit -m). */
+    bool gen_0731 = launch_gen_0731(c->engine.model_path);
 
     /* Siblings are looked up beside the resolved base model.  A relative -m
      * combined with --chdir would be stat'd against the launch cwd while the
@@ -18115,7 +18155,18 @@ static void launch_resolve_defaults(server_config *c,
         if (denv && denv[0]) dspark_named = true;   /* env picks drafter + its own arming */
     }
     if (!no_spec && !no_dspark && !dspark_named && sib) {
-        char *cand = launch_join(sib, launch_name("DSPARK_FILE", LAUNCH_DSPARK_GGUF));
+        const char *denvf = getenv("DSPARK_FILE");
+        char *cand;
+        if (denvf && denvf[0]) {
+            cand = launch_join(sib, denvf);
+        } else if (gen_0731) {
+            /* Generation-matched drafter first; the legacy drafter beside a
+             * 0731 base is a lossless (verification-exact) fallback, and
+             * the accept guard floors genuinely broken pairings. */
+            cand = launch_join_pref(sib, LAUNCH_DSPARK_GGUF_0731, LAUNCH_DSPARK_GGUF);
+        } else {
+            cand = launch_join(sib, LAUNCH_DSPARK_GGUF);
+        }
         if (launch_file_ok(cand)) {
             c->engine.dspark_path = cand;
             auto_dspark = true;
@@ -18144,9 +18195,15 @@ static void launch_resolve_defaults(server_config *c,
         const char *de = getenv("DS4_CONT_DSPARK");
         if (de && (!de[0] || !strcmp(de, "0"))) drafter_armed = false;
     }
-    bool dropped_mtp = false;
+    /* 0731 retired the MTP head entirely: never auto-attach one beside a
+     * 0731 base, --preset spark included (its "full stack" on 0731 is base
+     * + drafter).  MTP_FILE cannot re-enable this — only an explicit --mtp
+     * does (mtp_set skips this whole block, accept guard still floors it). */
+    bool dropped_mtp = false, retired_mtp = false;
     if (!no_spec && !no_mtp && !mtp_set && sib) {
-        if (drafter_armed && !preset_spark) {
+        if (gen_0731) {
+            retired_mtp = true;
+        } else if (drafter_armed && !preset_spark) {
             dropped_mtp = true;
         } else {
             char *cand = launch_join(sib, launch_name("MTP_FILE", LAUNCH_MTP_GGUF));
@@ -18194,7 +18251,7 @@ static void launch_resolve_defaults(server_config *c,
     }
 
     if (auto_model || auto_mtp || auto_dspark || armed_mode || armed_dspark ||
-        dropped_mtp) {
+        dropped_mtp || retired_mtp) {
         char line[2048];
         int off = 0;
         launch_append(line, sizeof(line), &off, "ds4-server: launch defaults:");
@@ -18205,6 +18262,9 @@ static void launch_resolve_defaults(server_config *c,
         if (dropped_mtp)
             launch_append(line, sizeof(line), &off,
                           " mtp=dropped(drafter armed; --mtp overrides)");
+        if (retired_mtp)
+            launch_append(line, sizeof(line), &off,
+                          " mtp=retired(0731 base has no MTP head; --mtp overrides)");
         if (auto_dspark)
             launch_append(line, sizeof(line), &off, " dspark=%s", c->engine.dspark_path);
         if (armed_mode)
