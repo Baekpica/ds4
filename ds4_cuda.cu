@@ -28,6 +28,7 @@
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_mem_census.h"
 #include "ds4_model_catalog.h" /* memgov D1a-4: unit tables for range stamps */
+#include "ds4_weight_identity.h" /* rider #48: manifest content fingerprint */
 #include "ds4_mem_gov.h"      /* memgov D0b: epoch protocol primitives */
 
 #ifndef M_PI
@@ -5356,6 +5357,80 @@ static int import_vmm_derived_allocation(
     return 1;
 }
 
+/* Rider #48: verify the manifest's content fingerprint for model_id
+ * against this process's own mapping of the model file, BEFORE any range
+ * is published (a mismatch after partial publication would need rollback).
+ * The manifest is a few KiB, so a dedicated pre-scan pass is cheap and
+ * keeps the check independent of record order in the file.
+ * Returns 2 = verified, 1 = proceed unverified (no record / unknown algo /
+ * check disabled), 0 = refuse (fingerprint or size mismatch: the weight
+ * server is serving different bytes than this engine's file). */
+static int manifest_content_identity_check(const char *manifest_path,
+                                           const void *model_map,
+                                           uint64_t model_size,
+                                           const char *model_id) {
+    const char *knob = getenv("DS4_WEIGHT_FP_CHECK");
+    if (knob && knob[0] == '0' && knob[1] == '\0') {
+        fprintf(stderr,
+                "ds4: CUDA weight manifest content check DISABLED for %s "
+                "(DS4_WEIGHT_FP_CHECK=0); identity by model id + size only\n",
+                model_id);
+        return 1;
+    }
+    FILE *fp = fopen(manifest_path, "r");
+    if (!fp) return 1; /* the caller re-opens and reports open failures */
+    char line[4096];
+    int found = 0;
+    unsigned long long rec_size = 0;
+    char rec_algo[64] = {0};
+    char rec_hex[64] = {0};
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        char rec[32] = {0};
+        char id[64] = {0};
+        if (sscanf(p, "%31s %63s %llu %63s %63s",
+                   rec, id, &rec_size, rec_algo, rec_hex) != 5) continue;
+        if (strcmp(rec, "content") != 0 || strcmp(id, model_id) != 0) continue;
+        found = 1;
+        break;
+    }
+    fclose(fp);
+    if (!found) {
+        fprintf(stderr,
+                "ds4: CUDA weight manifest carries no content fingerprint for "
+                "%s (older ds4_weight_server); identity by model id + size "
+                "only\n",
+                model_id);
+        return 1;
+    }
+    if (strcmp(rec_algo, DS4_WFP_ALGO) != 0) {
+        fprintf(stderr,
+                "ds4: CUDA weight manifest content fingerprint for %s uses "
+                "unknown algo %s (this engine speaks %s); identity by model "
+                "id + size only\n",
+                model_id, rec_algo, DS4_WFP_ALGO);
+        return 1;
+    }
+    uint64_t local_fp = ds4_weight_content_fingerprint(model_map, model_size);
+    uint64_t manifest_fp = (uint64_t)strtoull(rec_hex, NULL, 16);
+    if ((uint64_t)rec_size != model_size || manifest_fp != local_fp) {
+        fprintf(stderr,
+                "ds4: CUDA weight manifest CONTENT IDENTITY MISMATCH for %s: "
+                "manifest %s size=%llu, local %016llx size=%llu. The weight "
+                "server is serving different bytes than this engine's model "
+                "file; restart ds4_weight_server on the current gguf.\n",
+                model_id,
+                rec_hex,
+                rec_size,
+                (unsigned long long)local_fp,
+                (unsigned long long)model_size);
+        return 0;
+    }
+    return 2;
+}
+
 extern "C" int ds4_gpu_import_model_ipc_manifest(
         const void *model_map,
         uint64_t model_size,
@@ -5365,6 +5440,11 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         !model_id || !model_id[0]) {
         return 0;
     }
+    int content_state = manifest_content_identity_check(manifest_path,
+                                                        model_map,
+                                                        model_size,
+                                                        model_id);
+    if (content_state == 0) return 0;
     FILE *fp = fopen(manifest_path, "r");
     if (!fp) {
         fprintf(stderr, "ds4: CUDA shared weight manifest open failed: %s: %s\n",
@@ -5675,11 +5755,12 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         return 0;
     }
     fprintf(stderr,
-            "ds4: CUDA imported shared %s weight cache for %s: %.2f GiB across %llu ranges",
+            "ds4: CUDA imported shared %s weight cache for %s: %.2f GiB across %llu ranges%s",
             vmm_manifest ? "VMM" : "IPC",
             model_id,
             (double)imported_bytes / 1073741824.0,
-            (unsigned long long)imported_ranges);
+            (unsigned long long)imported_ranges,
+            content_state == 2 ? " (content identity verified)" : "");
     if (imported_derived_ranges != 0) {
         fprintf(stderr,
                 " plus %.2f MiB across %llu derived artifacts",

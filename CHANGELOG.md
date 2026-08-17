@@ -5,6 +5,21 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## Unreleased
+
+- Weight-server manifest content identity (closes the limitation
+  chartered at v0.6.0): the manifest now carries a per-model content
+  fingerprint (`content <id> <size> <algo> <hex>`, strided FNV-1a
+  sample: full head and tail windows plus one page per 16 MiB) and the
+  engine verifies it against its own mapping of the model file before
+  importing any range. A weight server left holding a superseded
+  checkpoint of identical size is now refused loudly at boot instead
+  of feeding stale bytes silently. Old manifests without the record
+  still import, with a one-line notice; unknown fingerprint algos
+  downgrade to the same notice; `DS4_WEIGHT_FP_CHECK=0` disables
+  verification. This is mixup detection, not tamper-proofing: bytes
+  between sample windows are not covered.
+
 ## v0.6.1 — 2026-08-17
 
 Memory truth. Admission charges what a request will actually commit —

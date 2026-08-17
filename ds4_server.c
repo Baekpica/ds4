@@ -4,6 +4,7 @@
 #include "ds4_gpu.h"   /* memgov D0a-4: the driver-boundary census unit */
 #endif
 #include "ds4_kvstore.h"
+#include "ds4_weight_identity.h" /* rider #48: fingerprint units */
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -25940,6 +25941,55 @@ static void test_cont_rate_anomalous(void) {
     TEST_ASSERT(!ds4_cont_rate_anomalous(4300ull * 500000, 500000, 4096, 65536));
 }
 
+/* Rider #48: content fingerprint determinism + size folding on the
+ * small-file full-hash branch. */
+static void test_weight_fp_small(void) {
+    unsigned char buf[4096];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (unsigned char)(i * 7u + 3u);
+    uint64_t a = ds4_weight_content_fingerprint(buf, sizeof(buf));
+    TEST_ASSERT(a == ds4_weight_content_fingerprint(buf, sizeof(buf)));
+    /* any flipped byte differs (small files hash fully) */
+    buf[2048] ^= 0x40u;
+    TEST_ASSERT(a != ds4_weight_content_fingerprint(buf, sizeof(buf)));
+    buf[2048] ^= 0x40u;
+    TEST_ASSERT(a == ds4_weight_content_fingerprint(buf, sizeof(buf)));
+    /* equal prefix, different length differs (the size fold) */
+    TEST_ASSERT(a != ds4_weight_content_fingerprint(buf, sizeof(buf) - 1));
+    /* empty/NULL are stable and distinct from data */
+    TEST_ASSERT(ds4_weight_content_fingerprint(NULL, 0) ==
+                ds4_weight_content_fingerprint(NULL, 0));
+    TEST_ASSERT(a != ds4_weight_content_fingerprint(NULL, 0));
+}
+
+/* Rider #48: the strided-sample geometry contract on large files -- head,
+ * tail, and stride pages are covered; bytes BETWEEN sample windows are
+ * invisible BY DESIGN (mixup detection, not tamper-proofing).  This test
+ * pins both directions so a geometry change that silently widens or
+ * narrows coverage fails here first. */
+static void test_weight_fp_stride_geometry(void) {
+    const uint64_t n = 24ull << 20; /* head 4M + strides at 16M + tail 4M */
+    unsigned char *buf = (unsigned char *)calloc(1, (size_t)n);
+    TEST_ASSERT(buf != NULL);
+    uint64_t fp0 = ds4_weight_content_fingerprint(buf, n);
+    /* head window covered */
+    buf[100] = 1;
+    TEST_ASSERT(fp0 != ds4_weight_content_fingerprint(buf, n));
+    buf[100] = 0;
+    /* stride page at 16 MiB covered */
+    buf[(16ull << 20) + 100] = 1;
+    TEST_ASSERT(fp0 != ds4_weight_content_fingerprint(buf, n));
+    buf[(16ull << 20) + 100] = 0;
+    /* tail window covered */
+    buf[n - 100] = 1;
+    TEST_ASSERT(fp0 != ds4_weight_content_fingerprint(buf, n));
+    buf[n - 100] = 0;
+    /* between windows: invisible by design */
+    buf[(8ull << 20) + 100] = 1;
+    TEST_ASSERT(fp0 == ds4_weight_content_fingerprint(buf, n));
+    buf[(8ull << 20) + 100] = 0;
+    free(buf);
+}
+
 /* Inc 7a: the extracted accumulator's own contract -- verdict precedence,
  * stop capture + truncation, one-shot transitions, think-gated markers.
  * The serial/cont byte equivalence is pinned by the oracle tests above;
@@ -28287,6 +28337,8 @@ static void ds4_server_unit_tests_run(void) {
     test_coalesce_max_default_tiers();
     test_cont_admit_band_apply();
     test_cont_rate_anomalous();
+    test_weight_fp_small();
+    test_weight_fp_stride_geometry();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();
