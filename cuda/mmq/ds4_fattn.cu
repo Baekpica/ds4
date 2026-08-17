@@ -339,7 +339,11 @@ typedef tile<16, 8, float> motif_tile_c;
  * chunk and attention runs at QK=192, V=128.  A caller can merge several KV
  * chunks exactly from the returned log-sum-exp values, so no expanded 256K KV
  * cache is required. */
-__global__ void motif3_fattn_hmma_kernel(
+/* GB10 has 100 KiB shared / SM. Staging Q+K+V was 36 KiB and capped the
+ * kernel at two CTAs; Q already lives in qa[] for the whole K walk, so
+ * loading it once from global frees enough shared memory for three CTAs. */
+__global__ __launch_bounds__(M3_FA_WARPS * 32, 3)
+void motif3_fattn_hmma_kernel(
         float * __restrict__ heads,
         float * __restrict__ lse,
         const float * __restrict__ q,
@@ -361,19 +365,11 @@ __global__ void motif3_fattn_hmma_kernel(
     const uint32_t warp = threadIdx.x >> 5;
     const uint32_t lane = threadIdx.x & 31u;
 
-    __shared__ __nv_bfloat16 s_q[M3_FA_TQ][M3_FA_QK_ROW];
     __shared__ __nv_bfloat16 s_k[M3_FA_TK][M3_FA_QK_ROW];
     __shared__ __nv_bfloat16 s_v[M3_FA_TK][M3_FA_V_ROW];
-
-    for (uint32_t idx = threadIdx.x; idx < M3_FA_TQ * M3_FA_QK;
-         idx += blockDim.x) {
-        const uint32_t r = idx / M3_FA_QK;
-        const uint32_t c = idx - r * M3_FA_QK;
-        const uint32_t t = tq0 + r < n_query ? tq0 + r : 0u;
-        s_q[r][c] = __float2bfloat16_rn(
-            q[((size_t)t * n_head + h) * M3_FA_QK + c]);
-    }
-    __syncthreads();
+    static_assert(3u * (sizeof(s_k) + sizeof(s_v) + sizeof(uint32_t)) <=
+                      102400u,
+                  "Motif FATTN shared memory no longer fits three GB10 CTAs");
 
     const uint32_t qrow[2] = {
         warp * M3_FA_WQ + lane / 4,
@@ -397,8 +393,12 @@ __global__ void motif3_fattn_hmma_kernel(
         for (int l = 0; l < motif_tile_a::ne; l++) {
             const int i = (l % 2) * 8 + (int)(lane / 4);
             const int j = (l / 2) * 4 + (int)(lane % 4);
-            qa[kc].x[l] = *(const nv_bfloat162 *)&s_q[
-                warp * M3_FA_WQ + i][kc * 16 + 2 * j];
+            const uint32_t row = warp * M3_FA_WQ + (uint32_t)i;
+            const uint32_t col = (uint32_t)kc * 16u + 2u * (uint32_t)j;
+            const uint32_t t = tq0 + row < n_query ? tq0 + row : 0u;
+            const float2 xy = *reinterpret_cast<const float2 *>(
+                q + ((size_t)t * n_head + h) * M3_FA_QK + col);
+            qa[kc].x[l] = __floats2bfloat162_rn(xy.x, xy.y);
         }
     }
 

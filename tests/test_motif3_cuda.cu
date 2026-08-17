@@ -1256,14 +1256,30 @@ static void test_fattn_profile() {
     check(cudaMemset(q, 0, q_bytes), "FATTN q clear");
     check(cudaMemset(k, 0, k_bytes), "FATTN k clear");
     check(cudaMemset(v, 0, v_bytes), "FATTN v clear");
-    if (ds4_mmq_motif3_prefill_attn_hmma(
-            out, lse, q, k, v,
-            n_query, n_kv, n_kv, 0,
-            n_head, n_head_kv, qk_dim, v_dim,
-            1.0f / std::sqrt((float)qk_dim), 0, 0) != 0) {
-        fprintf(stderr, "Motif FATTN profile launch failed\n");
-        std::exit(1);
-    }
+    auto launch = [&]() {
+        if (ds4_mmq_motif3_prefill_attn_hmma(
+                out, lse, q, k, v,
+                n_query, n_kv, n_kv, 0,
+                n_head, n_head_kv, qk_dim, v_dim,
+                1.0f / std::sqrt((float)qk_dim), 0, 0) != 0) {
+            fprintf(stderr, "Motif FATTN profile launch failed\n");
+            std::exit(1);
+        }
+    };
+    launch();
+    check(cudaDeviceSynchronize(), "FATTN warmup sync");
+    cudaEvent_t e0, e1;
+    check(cudaEventCreate(&e0), "FATTN event0");
+    check(cudaEventCreate(&e1), "FATTN event1");
+    constexpr int kReps = 8;
+    check(cudaEventRecord(e0), "FATTN t0");
+    for (int i = 0; i < kReps; ++i) launch();
+    check(cudaEventRecord(e1), "FATTN t1");
+    check(cudaEventSynchronize(e1), "FATTN timed sync");
+    float elapsed_ms = 0.0f;
+    check(cudaEventElapsedTime(&elapsed_ms, e0, e1), "FATTN elapsed");
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
     float sample[2] = {};
     check(cudaMemcpy(&sample[0], out, sizeof(float), cudaMemcpyDeviceToHost),
           "FATTN output read");
@@ -1271,8 +1287,9 @@ static void test_fattn_profile() {
           "FATTN LSE read");
     if (!std::isfinite(sample[0]) || !std::isfinite(sample[1])) std::exit(1);
     printf("Motif-3 NCU FATTN: query=%d kv=%d heads=%d/%d, "
-           "finite output %.6g LSE %.6g\n",
-           n_query, n_kv, n_head, n_head_kv, sample[0], sample[1]);
+           "finite output %.6g LSE %.6g, %.3f ms/launch\n",
+           n_query, n_kv, n_head, n_head_kv, sample[0], sample[1],
+           elapsed_ms / (float)kReps);
     cudaFree(lse);
     cudaFree(out);
     cudaFree(v);
