@@ -159,6 +159,20 @@ static float bf16_bits_to_f32(uint16_t value) {
     return out;
 }
 
+static void assert_bits_equal(const char *name, const float *got,
+                              const float *want, uint64_t n) {
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t gb, wb;
+        std::memcpy(&gb, &got[i], sizeof(gb));
+        std::memcpy(&wb, &want[i], sizeof(wb));
+        if (gb != wb) {
+            fprintf(stderr, "%s mismatch at %llu: got=0x%08x want=0x%08x\n",
+                    name, (unsigned long long)i, gb, wb);
+            std::exit(1);
+        }
+    }
+}
+
 static void test_round_bf16(void) {
     const uint64_t sizes[] = {1, 3, 4, 7, 128, 4096, 4097};
     for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
@@ -212,6 +226,87 @@ static void test_round_bf16(void) {
             }
         }
     }
+}
+
+static void test_prepare_q_bf16_fuse(void) {
+    constexpr uint32_t rows = 3u;
+    constexpr uint32_t heads = 4u;
+    constexpr uint32_t key_dim = 192u;
+    constexpr uint32_t rope_dim = 64u;
+    const uint64_t n = (uint64_t)rows * heads * key_dim;
+    std::vector<float> q_raw((size_t)n);
+    std::vector<int32_t> positions(rows);
+    std::vector<float> inv(rope_dim / 2u);
+    for (uint64_t i = 0; i < n; i++)
+        q_raw[i] = (float)((int32_t)((i * 29u + 11u) % 257u) - 128) / 256.0f;
+    for (uint32_t r = 0; r < rows; r++) positions[r] = (int32_t)(r * 17u + 3u);
+    for (uint32_t i = 0; i < rope_dim / 2u; i++)
+        inv[i] = 1.0f / std::pow(10000.0f, (2.0f * (float)i) / (float)rope_dim);
+    gpu_tensor q_in(n * sizeof(float));
+    gpu_tensor q_plain(n * sizeof(float));
+    gpu_tensor q_round(n * sizeof(float));
+    gpu_tensor q_fused(n * sizeof(float));
+    gpu_tensor pos(rows * sizeof(int32_t));
+    gpu_tensor freq((rope_dim / 2u) * sizeof(float));
+    if (!ds4_gpu_tensor_write(q_in.p, 0, q_raw.data(), n * sizeof(float)) ||
+        !ds4_gpu_tensor_write(pos.p, 0, positions.data(),
+                              rows * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(freq.p, 0, inv.data(),
+                              (rope_dim / 2u) * sizeof(float)) ||
+        !ds4_gpu_motif3_prepare_q_tensor(q_plain.p, q_in.p, pos.p, freq.p,
+                                         rows, heads, key_dim, rope_dim, 0) ||
+        !ds4_gpu_motif3_round_bf16_tensor(q_round.p, q_plain.p, n) ||
+        !ds4_gpu_motif3_prepare_q_tensor(q_fused.p, q_in.p, pos.p, freq.p,
+                                         rows, heads, key_dim, rope_dim, 1)) {
+        fprintf(stderr, "prepare_q BF16 fuse launch failed\n");
+        std::exit(1);
+    }
+    const auto want = download_f32(q_round, n);
+    const auto got = download_f32(q_fused, n);
+    assert_bits_equal("prepare_q BF16 fuse", got.data(), want.data(), n);
+}
+
+static void test_differential_bf16_fuse(void) {
+    constexpr uint32_t rows = 2u;
+    constexpr uint32_t kv_heads = 16u;
+    constexpr uint32_t group = 5u;
+    constexpr uint32_t value_dim = 128u;
+    const uint64_t attn_n = (uint64_t)rows * kv_heads * group * value_dim;
+    const uint64_t out_n = (uint64_t)rows * kv_heads * (group - 1u) * value_dim;
+    const uint64_t lambda_n = (uint64_t)rows * kv_heads * (group - 1u);
+    std::vector<float> attention((size_t)attn_n);
+    std::vector<float> lambda((size_t)lambda_n);
+    std::vector<float> gate((size_t)out_n);
+    for (uint64_t i = 0; i < attn_n; i++)
+        attention[i] = (float)((int32_t)((i * 17u + 5u) % 251u) - 125) / 128.0f;
+    for (uint64_t i = 0; i < lambda_n; i++)
+        lambda[i] = (float)((int32_t)((i * 13u + 3u) % 97u) - 48) / 16.0f;
+    for (uint64_t i = 0; i < out_n; i++)
+        gate[i] = (float)((int32_t)((i * 19u + 7u) % 113u) - 56) / 16.0f;
+    gpu_tensor attn(attn_n * sizeof(float));
+    gpu_tensor lam(lambda_n * sizeof(float));
+    gpu_tensor g(out_n * sizeof(float));
+    gpu_tensor plain(out_n * sizeof(float));
+    gpu_tensor rounded(out_n * sizeof(float));
+    gpu_tensor fused(out_n * sizeof(float));
+    if (!ds4_gpu_tensor_write(attn.p, 0, attention.data(),
+                              attn_n * sizeof(float)) ||
+        !ds4_gpu_tensor_write(lam.p, 0, lambda.data(),
+                              lambda_n * sizeof(float)) ||
+        !ds4_gpu_tensor_write(g.p, 0, gate.data(), out_n * sizeof(float)) ||
+        !ds4_gpu_motif3_differential_tensor(plain.p, attn.p, lam.p, g.p,
+                                            rows, kv_heads, group,
+                                            value_dim, 0) ||
+        !ds4_gpu_motif3_round_bf16_tensor(rounded.p, plain.p, out_n) ||
+        !ds4_gpu_motif3_differential_tensor(fused.p, attn.p, lam.p, g.p,
+                                            rows, kv_heads, group,
+                                            value_dim, 1)) {
+        fprintf(stderr, "differential BF16 fuse launch failed\n");
+        std::exit(1);
+    }
+    const auto want = download_f32(rounded, out_n);
+    const auto got = download_f32(fused, out_n);
+    assert_bits_equal("differential BF16 fuse", got.data(), want.data(), out_n);
 }
 
 static void test_bf16_projection() {
@@ -485,7 +580,7 @@ static void test_gdla(const char *dir) {
     gpu_tensor gate(get(f, "gate_score").bytes.size()); upload(gate, get(f, "gate_score"));
     gpu_tensor diff(8u * 64u * 128u * sizeof(float));
     if (!ds4_gpu_motif3_differential_tensor(diff.p, attention.p, lambda.p, gate.p,
-                                             8, 16, 5, 128)) std::exit(1);
+                                             8, 16, 5, 128, 0)) std::exit(1);
     auto d = download_f32(diff, 8u * 64u * 128u);
     assert_close("CUDA differential GDLA", d.data(), f32(f, "diff_attention_fp32"), d.size(), 4e-4f, 4e-5f);
 }
@@ -611,7 +706,7 @@ static void test_latent_gdla() {
     }
     if (!ds4_gpu_motif3_prepare_q_tensor(q_full_gpu.p, q_raw_gpu.p,
                                           positions_gpu.p, inv_gpu.p,
-                                          rows, q_heads, key_dim, rope_dim) ||
+                                          rows, q_heads, key_dim, rope_dim, 0) ||
         !ds4_gpu_motif3_round_bf16_tensor(q_full_gpu.p, q_full_gpu.p,
                                            (uint64_t)rows * q_heads * key_dim) ||
         !ds4_gpu_motif3_store_latent_kv_bf16_tensor(
@@ -638,7 +733,7 @@ static void test_latent_gdla() {
             !ds4_gpu_motif3_value_project_q8_0_tensor(
                     heads.p, latent_out.p, model.data(), model.size(), 0,
                     rows, q_heads, kv_heads, group, latent_dim,
-                    qk_nope, value_dim)) {
+                    qk_nope, value_dim, 0)) {
             fprintf(stderr, "latent GDLA profile launch failed\n");
             std::exit(1);
         }
@@ -705,7 +800,7 @@ static void test_latent_gdla() {
         !ds4_gpu_motif3_value_project_q8_0_tensor(
                 heads.p, latent_out.p, model.data(), model.size(), 0,
                 rows, q_heads, kv_heads, group, latent_dim,
-                qk_nope, value_dim)) {
+                qk_nope, value_dim, 0)) {
         fprintf(stderr, "latent GDLA attention failed\n"); std::exit(1);
     }
 
@@ -755,6 +850,21 @@ static void test_latent_gdla() {
     assert_close("CUDA latent GDLA vs expanded identity",
                  heads_got.data(), heads_want.data(), heads_want.size(),
                  2e-4f, 2e-4f);
+    gpu_tensor heads_round(heads_want.size() * sizeof(float));
+    gpu_tensor heads_fused(heads_want.size() * sizeof(float));
+    if (!ds4_gpu_motif3_round_bf16_tensor(heads_round.p, heads.p,
+                                           heads_want.size()) ||
+        !ds4_gpu_motif3_value_project_q8_0_tensor(
+                heads_fused.p, latent_out.p, model.data(), model.size(), 0,
+                rows, q_heads, kv_heads, group, latent_dim,
+                qk_nope, value_dim, 1)) {
+        fprintf(stderr, "latent V BF16 fuse launch failed\n");
+        std::exit(1);
+    }
+    const auto want_round = download_f32(heads_round, heads_want.size());
+    const auto got_fused = download_f32(heads_fused, heads_want.size());
+    assert_bits_equal("value_project BF16 fuse", got_fused.data(),
+                      want_round.data(), heads_want.size());
 }
 
 static void test_latent_decode_split() {
@@ -1193,6 +1303,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     test_round_bf16();
+    test_prepare_q_bf16_fuse();
+    test_differential_bf16_fuse();
     test_router(argv[1]);
     test_polynorm(argv[1]);
     test_mhc(argv[1]);

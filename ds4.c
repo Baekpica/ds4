@@ -35337,15 +35337,7 @@ static bool motif3_graph_attention(
             g->q_raw, g->kv_raw, g->kv_proj,
             g->positions, full ? g->inv_yarn : g->inv_swa,
             rows, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-            DS4_N_ROT, DS4_N_VALUE_DIM, DS4_N_KV_LORA), "prepare qkv");
-    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
-            g->q_full, g->q_full, (uint64_t)rows * q_dim), "q full BF16");
-    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
-            g->k_full, g->k_full,
-            (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM), "k full BF16");
-    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
-            g->value, g->value,
-            (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_VALUE_DIM), "value BF16");
+            DS4_N_ROT, DS4_N_VALUE_DIM, DS4_N_KV_LORA, 1), "prepare qkv");
     float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     if (full) {
         const float mscale = 0.1f * logf(DS4_ROPE_SCALE_FACTOR) + 1.0f;
@@ -35363,11 +35355,8 @@ static bool motif3_graph_attention(
     M3_ATTN(ds4_gpu_motif3_differential_tensor(
             g->differential, g->attention, g->lambda, g->q_gate,
             rows, DS4_N_HEAD_KV,
-            DS4_N_HEAD / DS4_N_HEAD_KV, DS4_N_VALUE_DIM),
+            DS4_N_HEAD / DS4_N_HEAD_KV, DS4_N_VALUE_DIM, 1),
             "differential/gate");
-    M3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
-            g->differential, g->differential,
-            (uint64_t)rows * signal_dim), "differential BF16 boundary");
     M3_ATTN(ds4_gpu_matmul_q8_0_tensor(
             g->block_out, model->map, model->size,
             l->attn_output->abs_offset, signal_dim, DS4_N_EMBD,
@@ -35461,10 +35450,7 @@ static bool motif3_graph_attention_latent_impl(
     M3_LATTN(ds4_gpu_motif3_prepare_q_tensor(
             g->q_full, g->q_raw, g->positions,
             full ? g->inv_yarn : g->inv_swa,
-            rows, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT), "prepare q");
-    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
-            g->q_full, g->q_full, (uint64_t)rows * q_dim),
-            "q full BF16");
+            rows, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 1), "prepare q");
     if (decode_rows) {
         for (uint32_t r = 0; r < rows; r++) {
             ds4_gpu_tensor *kv_norm = ds4_gpu_tensor_view(
@@ -35524,19 +35510,8 @@ static bool motif3_graph_attention_latent_impl(
                 g->q_raw, g->kv_raw, g->kv_proj,
                 g->positions, g->inv_yarn,
                 rows, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-                DS4_N_ROT, DS4_N_VALUE_DIM, DS4_N_KV_LORA),
+                DS4_N_ROT, DS4_N_VALUE_DIM, DS4_N_KV_LORA, 1),
                 "prefill current qkv");
-        M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
-                g->q_full, g->q_full, (uint64_t)rows * q_dim),
-                "prefill q BF16");
-        M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
-                g->k_full, g->k_full,
-                (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM),
-                "prefill current k BF16");
-        M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
-                g->value, g->value,
-                (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_VALUE_DIM),
-                "prefill current v BF16");
         M3_LATTN(ds4_gpu_motif3_expanded_attention_range_tensor(
                 g->attention, g->attention_lse,
                 g->q_full, g->k_full, g->value,
@@ -35582,6 +35557,12 @@ static bool motif3_graph_attention_latent_impl(
                     rows, DS4_N_HEAD, DS4_N_VALUE_DIM),
                     "prefill attention merge");
         }
+        /* Expanded full-layer prefill still materializes FATTN in FP32.
+         * Keep the official BF16 store boundary before differential. */
+        M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
+                g->attention, g->attention,
+                (uint64_t)rows * DS4_N_HEAD * DS4_N_VALUE_DIM),
+                "attention BF16 boundary");
     } else {
         M3_LATTN(ds4_gpu_motif3_qk_absorb_q8_0_tensor(
                 g->q_absorbed, g->q_full, model->map, model->size,
@@ -35634,20 +35615,13 @@ static bool motif3_graph_attention_latent_impl(
                 rows, DS4_N_HEAD, DS4_N_HEAD_KV,
                 DS4_N_HEAD / DS4_N_HEAD_KV,
                 DS4_N_KV_LORA, DS4_N_HEAD_DIM - DS4_N_ROT,
-                DS4_N_VALUE_DIM), "latent value projection");
+                DS4_N_VALUE_DIM, 1), "latent value projection");
     }
-    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
-            g->attention, g->attention,
-            (uint64_t)rows * DS4_N_HEAD * DS4_N_VALUE_DIM),
-            "attention BF16 boundary");
     M3_LATTN(ds4_gpu_motif3_differential_tensor(
             g->differential, g->attention, g->lambda, g->q_gate,
             rows, DS4_N_HEAD_KV,
-            DS4_N_HEAD / DS4_N_HEAD_KV, DS4_N_VALUE_DIM),
+            DS4_N_HEAD / DS4_N_HEAD_KV, DS4_N_VALUE_DIM, 1),
             "differential/gate");
-    M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
-            g->differential, g->differential,
-            (uint64_t)rows * signal_dim), "differential BF16 boundary");
     M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
             g->block_out, model->map, model->size,
             l->attn_output->abs_offset, signal_dim, DS4_N_EMBD,

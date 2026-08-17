@@ -2404,7 +2404,8 @@ int ds4_gpu_motif3_prepare_qkv_tensor(
         uint32_t              key_dim,
         uint32_t              rope_dim,
         uint32_t              value_dim,
-        uint32_t              kv_latent_dim);
+        uint32_t              kv_latent_dim,
+        int                   round_bf16);
 
 /* Production Motif-3 latent-cache path.  The cache stores normalized latent
  * KV and already-rotated k_pe in BF16; full-attention layers use a linear
@@ -2418,7 +2419,8 @@ int ds4_gpu_motif3_prepare_q_tensor(
         uint32_t              rows,
         uint32_t              q_heads,
         uint32_t              key_dim,
-        uint32_t              rope_dim);
+        uint32_t              rope_dim,
+        int                   round_bf16);
 
 int ds4_gpu_motif3_store_latent_kv_bf16_tensor(
         ds4_gpu_tensor       *kv_latent_cache,
@@ -2498,7 +2500,8 @@ int ds4_gpu_motif3_value_project_q8_0_tensor(
         uint32_t              group_size,
         uint32_t              kv_latent_dim,
         uint32_t              qk_nope,
-        uint32_t              value_dim);
+        uint32_t              value_dim,
+        int                   round_bf16);
 
 int ds4_gpu_motif3_rope_tensor(
         ds4_gpu_tensor       *out,
@@ -2569,7 +2572,8 @@ int ds4_gpu_motif3_differential_tensor(
         uint32_t                rows,
         uint32_t                kv_heads,
         uint32_t                group_size,
-        uint32_t                value_dim);
+        uint32_t                value_dim,
+        int                     round_bf16);
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,

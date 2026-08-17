@@ -31576,6 +31576,7 @@ extern "C" int ds4_gpu_motif3_split_kv_latent_tensor(
     return cuda_ok(cudaGetLastError(), "Motif-3 split KV latent launch");
 }
 
+template <bool RoundBf16>
 __global__ static void motif3_prepare_q_kernel(
         float *q_full, const float *q_raw, const int32_t *positions,
         const float *inv_freq, uint32_t rows, uint32_t heads,
@@ -31587,24 +31588,27 @@ __global__ static void motif3_prepare_q_kernel(
     const uint64_t rh = i / key_dim;
     const uint32_t row = (uint32_t)(rh / heads);
     const uint32_t nope = key_dim - rope_dim;
+    float v;
     if (dim < nope) {
-        q_full[i] = q_raw[i];
-        return;
+        v = q_raw[i];
+    } else {
+        const uint32_t rope_i = dim - nope;
+        const uint32_t half = rope_dim / 2u;
+        const uint32_t freq = rope_i % half;
+        const uint64_t base = rh * key_dim + nope;
+        const float angle_f = (float)positions[row] * inv_freq[freq];
+        double sine_d, cosine_d;
+        sincos((double)angle_f, &sine_d, &cosine_d);
+        const float first = q_raw[base + freq];
+        const float second = q_raw[base + half + freq];
+        v = rope_i < half
+            ? first * (float)cosine_d - second * (float)sine_d
+            : second * (float)cosine_d + first * (float)sine_d;
     }
-    const uint32_t rope_i = dim - nope;
-    const uint32_t half = rope_dim / 2u;
-    const uint32_t freq = rope_i % half;
-    const uint64_t base = rh * key_dim + nope;
-    const float angle_f = (float)positions[row] * inv_freq[freq];
-    double sine_d, cosine_d;
-    sincos((double)angle_f, &sine_d, &cosine_d);
-    const float first = q_raw[base + freq];
-    const float second = q_raw[base + half + freq];
-    q_full[i] = rope_i < half
-        ? first * (float)cosine_d - second * (float)sine_d
-        : second * (float)cosine_d + first * (float)sine_d;
+    q_full[i] = RoundBf16 ? motif3_bf16_boundary(v) : v;
 }
 
+template <bool RoundBf16>
 __global__ static void motif3_prepare_kv_kernel(
         float *k_full, float *value, const float *kv_raw,
         const float *kv_proj, const int32_t *positions,
@@ -31623,8 +31627,9 @@ __global__ static void motif3_prepare_kv_kernel(
     const uint64_t proj_base = ((uint64_t)row * kv_heads + head) *
                                (nope + value_dim);
     if (dim < nope) {
+        const float v = kv_proj[proj_base + dim];
         k_full[((uint64_t)row * kv_heads + head) * key_dim + dim] =
-            kv_proj[proj_base + dim];
+            RoundBf16 ? motif3_bf16_boundary(v) : v;
     } else if (dim < key_dim) {
         const uint32_t rope_i = dim - nope;
         const uint32_t half = rope_dim / 2u;
@@ -31636,14 +31641,16 @@ __global__ static void motif3_prepare_kv_kernel(
         sincos((double)angle_f, &sine_d, &cosine_d);
         const float first = kv_raw[raw_base + freq];
         const float second = kv_raw[raw_base + half + freq];
-        k_full[((uint64_t)row * kv_heads + head) * key_dim + dim] =
-            rope_i < half
+        const float v = rope_i < half
             ? first * (float)cosine_d - second * (float)sine_d
             : second * (float)cosine_d + first * (float)sine_d;
+        k_full[((uint64_t)row * kv_heads + head) * key_dim + dim] =
+            RoundBf16 ? motif3_bf16_boundary(v) : v;
     } else {
         const uint32_t vd = dim - key_dim;
+        const float v = kv_proj[proj_base + nope + vd];
         value[((uint64_t)row * kv_heads + head) * value_dim + vd] =
-            kv_proj[proj_base + nope + vd];
+            RoundBf16 ? motif3_bf16_boundary(v) : v;
     }
 }
 
@@ -31654,7 +31661,7 @@ extern "C" int ds4_gpu_motif3_prepare_qkv_tensor(
         const ds4_gpu_tensor *positions, const ds4_gpu_tensor *inv_freq,
         uint32_t rows, uint32_t q_heads, uint32_t kv_heads,
         uint32_t key_dim, uint32_t rope_dim, uint32_t value_dim,
-        uint32_t kv_latent_dim) {
+        uint32_t kv_latent_dim, int round_bf16) {
     if (!q_full || !k_full || !value || !q_raw || !kv_raw || !kv_proj ||
         !positions || !inv_freq || rows == 0 || q_heads == 0 || kv_heads == 0 ||
         key_dim == 0 || rope_dim == 0 || (rope_dim & 1u) || rope_dim > key_dim ||
@@ -31669,17 +31676,30 @@ extern "C" int ds4_gpu_motif3_prepare_qkv_tensor(
         kv_proj->bytes < (uint64_t)rows * kv_heads * (nope + value_dim) * sizeof(float) ||
         positions->bytes < (uint64_t)rows * sizeof(int32_t) ||
         inv_freq->bytes < (uint64_t)(rope_dim / 2u) * sizeof(float)) return 0;
-    motif3_prepare_q_kernel<<<(qn + 255u) / 256u, 256>>>(
-            (float *)q_full->ptr, (const float *)q_raw->ptr,
-            (const int32_t *)positions->ptr, (const float *)inv_freq->ptr,
-            rows, q_heads, key_dim, rope_dim);
+    if (round_bf16)
+        motif3_prepare_q_kernel<true><<<(qn + 255u) / 256u, 256>>>(
+                (float *)q_full->ptr, (const float *)q_raw->ptr,
+                (const int32_t *)positions->ptr, (const float *)inv_freq->ptr,
+                rows, q_heads, key_dim, rope_dim);
+    else
+        motif3_prepare_q_kernel<false><<<(qn + 255u) / 256u, 256>>>(
+                (float *)q_full->ptr, (const float *)q_raw->ptr,
+                (const int32_t *)positions->ptr, (const float *)inv_freq->ptr,
+                rows, q_heads, key_dim, rope_dim);
     if (!cuda_ok(cudaGetLastError(), "Motif-3 prepare Q launch")) return 0;
     const uint64_t kvn = (uint64_t)rows * kv_heads * (key_dim + value_dim);
-    motif3_prepare_kv_kernel<<<(kvn + 255u) / 256u, 256>>>(
-            (float *)k_full->ptr, (float *)value->ptr,
-            (const float *)kv_raw->ptr, (const float *)kv_proj->ptr,
-            (const int32_t *)positions->ptr, (const float *)inv_freq->ptr,
-            rows, kv_heads, key_dim, rope_dim, value_dim, kv_latent_dim);
+    if (round_bf16)
+        motif3_prepare_kv_kernel<true><<<(kvn + 255u) / 256u, 256>>>(
+                (float *)k_full->ptr, (float *)value->ptr,
+                (const float *)kv_raw->ptr, (const float *)kv_proj->ptr,
+                (const int32_t *)positions->ptr, (const float *)inv_freq->ptr,
+                rows, kv_heads, key_dim, rope_dim, value_dim, kv_latent_dim);
+    else
+        motif3_prepare_kv_kernel<false><<<(kvn + 255u) / 256u, 256>>>(
+                (float *)k_full->ptr, (float *)value->ptr,
+                (const float *)kv_raw->ptr, (const float *)kv_proj->ptr,
+                (const int32_t *)positions->ptr, (const float *)inv_freq->ptr,
+                rows, kv_heads, key_dim, rope_dim, value_dim, kv_latent_dim);
     return cuda_ok(cudaGetLastError(), "Motif-3 prepare KV launch");
 }
 
@@ -31687,7 +31707,7 @@ extern "C" int ds4_gpu_motif3_prepare_q_tensor(
         ds4_gpu_tensor *q_full, const ds4_gpu_tensor *q_raw,
         const ds4_gpu_tensor *positions, const ds4_gpu_tensor *inv_freq,
         uint32_t rows, uint32_t q_heads, uint32_t key_dim,
-        uint32_t rope_dim) {
+        uint32_t rope_dim, int round_bf16) {
     const uint64_t n = (uint64_t)rows * q_heads * key_dim;
     if (!q_full || !q_raw || !positions || !inv_freq || rows == 0 ||
         q_heads == 0 || key_dim == 0 || rope_dim == 0 ||
@@ -31698,10 +31718,16 @@ extern "C" int ds4_gpu_motif3_prepare_q_tensor(
         inv_freq->bytes < (uint64_t)(rope_dim / 2u) * sizeof(float)) {
         return 0;
     }
-    motif3_prepare_q_kernel<<<(n + 255u) / 256u, 256>>>(
-            (float *)q_full->ptr, (const float *)q_raw->ptr,
-            (const int32_t *)positions->ptr, (const float *)inv_freq->ptr,
-            rows, q_heads, key_dim, rope_dim);
+    if (round_bf16)
+        motif3_prepare_q_kernel<true><<<(n + 255u) / 256u, 256>>>(
+                (float *)q_full->ptr, (const float *)q_raw->ptr,
+                (const int32_t *)positions->ptr, (const float *)inv_freq->ptr,
+                rows, q_heads, key_dim, rope_dim);
+    else
+        motif3_prepare_q_kernel<false><<<(n + 255u) / 256u, 256>>>(
+                (float *)q_full->ptr, (const float *)q_raw->ptr,
+                (const int32_t *)positions->ptr, (const float *)inv_freq->ptr,
+                rows, q_heads, key_dim, rope_dim);
     return cuda_ok(cudaGetLastError(), "Motif-3 latent prepare Q launch");
 }
 
@@ -32552,6 +32578,7 @@ __device__ __forceinline__ static float motif3_q8_0_dot_row_dev(
 }
 
 
+template <bool RoundBf16>
 __global__ static void motif3_value_project_q8_0_kernel(
         float *heads, const float *latent, const char *weight,
         uint32_t rows, uint32_t q_heads, uint32_t group_size,
@@ -32571,9 +32598,10 @@ __global__ static void motif3_value_project_q8_0_kernel(
     float *dst = heads +
         ((uint64_t)token * q_heads + head) * value_dim;
     for (uint32_t d = threadIdx.x; d < value_dim; d += blockDim.x) {
-        dst[d] = motif3_q8_0_dot_row_dev(
+        const float acc = motif3_q8_0_dot_row_dev(
                 weight + (uint64_t)(row0 + d) * row_bytes,
                 xsh, latent_dim);
+        dst[d] = RoundBf16 ? motif3_bf16_boundary(acc) : acc;
     }
 }
 
@@ -32581,6 +32609,7 @@ __global__ static void motif3_value_project_q8_0_kernel(
  * column block a warp reads adjacent value dimensions instead of 544-byte
  * strided raw rows.  The b/k loop order and FP32 accumulation are identical
  * to motif3_q8_0_dot_row_dev, so only the memory layout changes. */
+template <bool RoundBf16>
 __global__ static void motif3_value_project_q8_0_transposed_kernel(
         float *heads, const float *latent, const __half *scale,
         const int8_t *code, uint32_t rows, uint32_t q_heads,
@@ -32612,7 +32641,7 @@ __global__ static void motif3_value_project_q8_0_transposed_kernel(
             }
             acc += dq * s;
         }
-        dst[d] = acc;
+        dst[d] = RoundBf16 ? motif3_bf16_boundary(acc) : acc;
     }
 }
 
@@ -32621,7 +32650,7 @@ extern "C" int ds4_gpu_motif3_value_project_q8_0_tensor(
         const void *model_map, uint64_t model_size, uint64_t kv_b_offset,
         uint32_t rows, uint32_t q_heads, uint32_t kv_heads,
         uint32_t group_size, uint32_t kv_latent_dim,
-        uint32_t qk_nope, uint32_t value_dim) {
+        uint32_t qk_nope, uint32_t value_dim, int round_bf16) {
     if (!heads || !latent || !model_map || rows == 0 || q_heads == 0 ||
         kv_heads == 0 || group_size == 0 || q_heads != kv_heads * group_size ||
         kv_latent_dim == 0 || (kv_latent_dim & 31u) ||
@@ -32651,12 +32680,20 @@ extern "C" int ds4_gpu_motif3_value_project_q8_0_tensor(
         : NULL;
     dim3 grid(q_heads, rows, 1);
     if (transposed) {
-        motif3_value_project_q8_0_transposed_kernel
-            <<<grid, 128, (size_t)kv_latent_dim * sizeof(float)>>>(
-                (float *)heads->ptr, (const float *)latent->ptr,
-                (const __half *)transposed,
-                (const int8_t *)(transposed + motif_scale_bytes),
-                rows, q_heads, group_size, kv_latent_dim, value_dim);
+        if (round_bf16)
+            motif3_value_project_q8_0_transposed_kernel<true>
+                <<<grid, 128, (size_t)kv_latent_dim * sizeof(float)>>>(
+                    (float *)heads->ptr, (const float *)latent->ptr,
+                    (const __half *)transposed,
+                    (const int8_t *)(transposed + motif_scale_bytes),
+                    rows, q_heads, group_size, kv_latent_dim, value_dim);
+        else
+            motif3_value_project_q8_0_transposed_kernel<false>
+                <<<grid, 128, (size_t)kv_latent_dim * sizeof(float)>>>(
+                    (float *)heads->ptr, (const float *)latent->ptr,
+                    (const __half *)transposed,
+                    (const int8_t *)(transposed + motif_scale_bytes),
+                    rows, q_heads, group_size, kv_latent_dim, value_dim);
         return cuda_ok(cudaGetLastError(),
                        "Motif-3 transposed latent V projection launch");
     }
@@ -32664,11 +32701,18 @@ extern "C" int ds4_gpu_motif3_value_project_q8_0_tensor(
             model_map, kv_b_offset, weight_bytes, tier,
             "Motif-3 latent V Q8_0");
     if (!weight) return 0;
-    motif3_value_project_q8_0_kernel<<<grid, 128,
-        (size_t)kv_latent_dim * sizeof(float)>>>(
-            (float *)heads->ptr, (const float *)latent->ptr, weight,
-            rows, q_heads, group_size, kv_latent_dim,
-            qk_nope, value_dim, row_bytes);
+    if (round_bf16)
+        motif3_value_project_q8_0_kernel<true><<<grid, 128,
+            (size_t)kv_latent_dim * sizeof(float)>>>(
+                (float *)heads->ptr, (const float *)latent->ptr, weight,
+                rows, q_heads, group_size, kv_latent_dim,
+                qk_nope, value_dim, row_bytes);
+    else
+        motif3_value_project_q8_0_kernel<false><<<grid, 128,
+            (size_t)kv_latent_dim * sizeof(float)>>>(
+                (float *)heads->ptr, (const float *)latent->ptr, weight,
+                rows, q_heads, group_size, kv_latent_dim,
+                qk_nope, value_dim, row_bytes);
     return cuda_ok(cudaGetLastError(), "Motif-3 latent V projection launch");
 }
 
@@ -32846,6 +32890,7 @@ extern "C" int ds4_gpu_motif3_expanded_attention_window_tensor(
     return cuda_ok(cudaGetLastError(), "Motif-3 expanded attention launch");
 }
 
+template <bool RoundBf16>
 __global__ static void motif3_differential_kernel(
         float *out, const float *attention, const float *lambda,
         const float *gate, uint32_t rows, uint32_t kv_heads,
@@ -32868,16 +32913,17 @@ __global__ static void motif3_differential_kernel(
                                                   kv_heads * signal_heads +
                                                   kvh * signal_heads + signal]));
     const float g = 1.0f / (1.0f + expf(-gate[control]));
-    out[control] = (attention[attn_base + (uint64_t)signal * value_dim + d] -
-                    lam * attention[attn_base +
-                                     (uint64_t)(group_size - 1u) * value_dim + d]) * g;
+    const float v = (attention[attn_base + (uint64_t)signal * value_dim + d] -
+                     lam * attention[attn_base +
+                                      (uint64_t)(group_size - 1u) * value_dim + d]) * g;
+    out[control] = RoundBf16 ? motif3_bf16_boundary(v) : v;
 }
 
 extern "C" int ds4_gpu_motif3_differential_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *attention,
         const ds4_gpu_tensor *lambda, const ds4_gpu_tensor *gate,
         uint32_t rows, uint32_t kv_heads, uint32_t group_size,
-        uint32_t value_dim) {
+        uint32_t value_dim, int round_bf16) {
     const uint32_t signal_heads = group_size ? group_size - 1u : 0u;
     const uint64_t out_n = (uint64_t)rows * kv_heads * signal_heads * value_dim;
     const uint64_t attn_n = (uint64_t)rows * kv_heads * group_size * value_dim;
@@ -32886,10 +32932,16 @@ extern "C" int ds4_gpu_motif3_differential_tensor(
         group_size < 2u || value_dim == 0 || out->bytes < out_n * sizeof(float) ||
         attention->bytes < attn_n * sizeof(float) ||
         lambda->bytes < lambda_n * sizeof(float) || gate->bytes < out_n * sizeof(float)) return 0;
-    motif3_differential_kernel<<<(out_n + 255u) / 256u, 256>>>(
-            (float *)out->ptr, (const float *)attention->ptr,
-            (const float *)lambda->ptr, (const float *)gate->ptr,
-            rows, kv_heads, group_size, value_dim);
+    if (round_bf16)
+        motif3_differential_kernel<true><<<(out_n + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const float *)attention->ptr,
+                (const float *)lambda->ptr, (const float *)gate->ptr,
+                rows, kv_heads, group_size, value_dim);
+    else
+        motif3_differential_kernel<false><<<(out_n + 255u) / 256u, 256>>>(
+                (float *)out->ptr, (const float *)attention->ptr,
+                (const float *)lambda->ptr, (const float *)gate->ptr,
+                rows, kv_heads, group_size, value_dim);
     return cuda_ok(cudaGetLastError(), "Motif-3 differential attention launch");
 }
 
