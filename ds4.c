@@ -10101,7 +10101,11 @@ static uint64_t metal_graph_alloc_bytes_estimate(
     bytes += 3ull * pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float);
     bytes += pc * (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
     bytes += (uint64_t)DS4_MULTISEQ_MAX_SEQ * DS4_N_VOCAB * sizeof(float);
-    bytes += 64ull << 20;   /* slack: the dozens of sub-MiB buffers above + views */
+    /* Slack: the dozens of sub-MiB buffers above + views.  MT-5 (audit V13):
+     * raised 64 -> 96 MiB -- the per-bank slab views' ensure_rows hooks alone
+     * charge ~84 MiB on first admission (measured, see ds4_gpu_tensor_view),
+     * so 64 under-counted the real footprint this estimate funds. */
+    bytes += 96ull << 20;
     return bytes;
 }
 
@@ -10356,8 +10360,9 @@ static bool metal_graph_alloc_raw_cap(
     g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     /* Opp C Phase 1A: the FP8 compressed-KV mirror is allocated only when
-     * DS4_CUDA_FP8_KV is enabled.  Default OFF -> these buffers stay NULL
-     * (g was memset above) and the build is byte-identical to today. */
+     * DS4_CUDA_FP8_KV is enabled -- default ON since v0.2.4 (packed
+     * primaries ship default); =0 restores F32-primary and leaves these
+     * NULL (g was memset above). */
     const bool fp8_kv = ds4_cuda_fp8_kv_enabled() != 0;
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -10407,8 +10412,9 @@ static bool metal_graph_alloc_raw_cap(
                         managed_kv_cache,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 /* P2 Inc3a: packed FP4 indexer mirror, gated on DS4_CUDA_FP4_INDEX
-                 * (default OFF -> these stay NULL).  Same comp_cap row count as
-                 * the F32 index cache it shadows; row=64 codes + 16 scale bytes. */
+                 * -- default ON since v0.2.4 (=0 restores F32-primary, these
+                 * stay NULL).  Same comp_cap row count as the F32 index cache
+                 * it shadows; row=64 codes + 16 scale bytes. */
                 if (ds4_cuda_fp4_index_enabled()) {
                     g->layer_index_comp_cache_fp4[il] = metal_graph_alloc_kv_cache_tensor(
                             managed_kv_cache,
@@ -22270,6 +22276,13 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
                       m.raw_cap *
                       DS4_N_HEAD_DIM *
                       sizeof(float);
+        /* MT-5 (audit V13): count the FP8/FP4 packed mirrors the alloc
+         * actually makes (metal_graph_alloc_raw_cap; same gates as the
+         * serial fit estimator at metal_graph_alloc_bytes_estimate) --
+         * omitting them under-stated the boot print by ~3.2 GiB at deep
+         * ctx with packed primaries default ON. */
+        const bool fp8_kv = ds4_cuda_fp8_kv_enabled() != 0;
+        const bool fp4_index = ds4_cuda_fp4_index_enabled() != 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
@@ -22277,10 +22290,16 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
             m.compressed_bytes += (uint64_t)layer_comp_cap *
                                   DS4_N_HEAD_DIM *
                                   (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            if (fp8_kv)
+                m.compressed_bytes += (uint64_t)layer_comp_cap *
+                                      (DS4_OPP_C_FP8_ROW_BYTES + DS4_OPP_C_FP8_SCALE_BYTES);
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
                                       sizeof(float);
+                if (fp4_index)
+                    m.compressed_bytes += (uint64_t)layer_comp_cap *
+                                          (DS4_INDEXER_FP4_ROW_BYTES + DS4_INDEXER_FP4_SCALE_BYTES);
             }
         }
         uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
@@ -28625,6 +28644,10 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
      * block (inj_kv prefix-copy).  Must reproduce the single-bank accept (pos0 ~0.906,
      * commit ~3.92) -- validates metal_graph_eval_dspark_block_ms at N=1. */
     const bool ms_mode = getenv("DS4_DSPARK_BLOCK_MS") != NULL;
+    /* MT-5 (audit V13): these env-gated selftest buffers are exactly what
+     * DS4_MEMC_DIAG was declared for and never wired to -- unscoped they
+     * land in ENGINE_OTHER and violate its live==0 invariant during runs. */
+    ds4_gpu_mem_scope_begin(DS4_MEMC_DIAG);
     ds4_dspark_slabs ms_slab; memset(&ms_slab, 0, sizeof(ms_slab));
     bool ms_slab_ok = !ms_mode || ds4_dspark_slabs_alloc(&ms_slab, g, 1u);
     if (ms_mode && !ms_slab_ok) { fprintf(stderr, "ds4: dspark block MS: slab alloc failed\n"); }
@@ -28640,6 +28663,7 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
         mk_bias = ds4_gpu_tensor_alloc((uint64_t)vocab * sizeof(float));          /* [nb*vocab] */
         if (!mk_cand || !mk_prev || !mk_bias) { fprintf(stderr, "ds4: markov-dev scratch alloc failed\n"); }
     }
+    ds4_gpu_mem_scope_end();
 
     FILE *f = fopen(trace_path, "rb");
     if (!f) { fprintf(stderr, "ds4: cannot open trace %s\n", trace_path); return 1; }
@@ -28662,8 +28686,10 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
     float *blk = xmalloc((size_t)B * vocab * sizeof(float));
     float *refined = xmalloc((size_t)vocab * sizeof(float));
     ds4_gpu_tensor *inj_kv[DS4_DSPARK_N_LAYER] = {0};
+    ds4_gpu_mem_scope_begin(DS4_MEMC_DIAG);   /* MT-5: selftest class, see above */
     for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++)
         inj_kv[li] = ds4_gpu_tensor_alloc((uint64_t)pc * DS4_N_HEAD_DIM * sizeof(float));
+    ds4_gpu_mem_scope_end();
     bool alloc_ok = concat && hc_buf && toks && pos_host && prev_embed && blk && refined;
     for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) alloc_ok = alloc_ok && inj_kv[li];
 
@@ -33405,7 +33431,8 @@ static uint64_t ds4_batch_vmm_floor_per_bank(const ds4_gpu_graph *g) {
  * comp_map_budget (which grants the floors back -- fit and the page budget
  * split the same free memory, no double-booking of the headroom).  The
  * compressor STATE slabs stay eager and keep counting. */
-static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, bool vmm_comp) {
+static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, bool vmm_comp,
+                                           bool dspark) {
     const uint64_t raw_bank = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
     uint64_t per_bank = vmm_comp ? ds4_batch_vmm_floor_per_bank(g) : 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -33450,20 +33477,41 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
         per_bank += (uint64_t)DS4_N_VOCAB * sizeof(float); /* draft logits row */
         per_bank += 3ull * sizeof(int32_t);                /* draft tokens/ids/n_raw */
     }
+    /* MT-5 (audit V13): the D4.5d DSpark injected-KV rings are eager per-bank
+     * allocations (ds4_dspark_slabs_alloc: one raw ring per drafter layer) that
+     * the fit division never charged -- ~13.5 MiB/bank invisible to the plan
+     * whenever a drafter is loaded. */
+    if (dspark)
+        per_bank += (uint64_t)DS4_DSPARK_N_LAYER * raw_bank;
     return per_bank;
 }
 
 /* R5 Inc1a/1b shared knob: bytes the bank-count fit and the comp-page budget
  * both leave free for runtime growth (tmp pools, capture graphs, logits
- * staging).  Ctx-aware default (2026-07-03): short-ctx boots (<=16k) run
- * safely at 6144 MiB (N=8 agg +20% cross-box from the extra banks, N=1
- * neutral), but at 57k ctx the extra resident slabs steal page cache from
- * the mmap weights and decode regresses ~7%, so long-ctx keeps 8192.
- * DS4_BATCH_FIT_HEADROOM_MB overrides both regimes. */
+ * staging).  MT-5 (audit V7) re-derivation, 2026-08-17: flat 6144 MiB.
+ * The old deep tier (8192 above 16k, stamped 2026-07-03: "at 57k ctx the
+ * extra resident slabs steal page cache from the mmap weights and decode
+ * regresses ~7%") guarded a cause the V6 ctx-aware bank grant removed --
+ * the slab pressure came from the 32-bank default planting ~450 MiB/bank
+ * of eager remainder regardless of ctx; the deep default is now 4-16
+ * banks.  Where the knob actually lands (measured, mt5_defaults_gate):
+ * the deep budget is min(plan, max(res + (free - headroom) + floors,
+ * floor_work)) -- three regimes.  At the gate shape the v0.5.6.3
+ * two-full-banks floor_work ruled (17.97 GiB both headrooms, free at
+ * the vmm block sat below the window); in the capacity-bound window
+ * (free-at-vmm roughly headroom+floor_work .. headroom+plan) the flip
+ * is a live +2 GiB of admission capacity (~450-500k tokens at the
+ * honest rate); plan-bound boots never see it.  Never worse than 8192
+ * in any regime.  The loaded-decode question (does spending the extra
+ * allowance into the page-cache zone still cost the documented ~7%?)
+ * belongs to the MT-7 deep-admission A/B, which measures decode under
+ * actually-deep residency -- at-rest decode cannot see an unspent
+ * allowance.  mt5_defaults_gate leg H pins the regime arithmetic.
+ * DS4_BATCH_FIT_HEADROOM_MB overrides. */
 static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     const char *he = getenv("DS4_BATCH_FIT_HEADROOM_MB");
-    uint64_t headroom = (ctx_size > 0 && ctx_size <= 16384) ? (6144ull << 20)
-                                                            : (8192ull << 20);
+    uint64_t headroom = 6144ull << 20;
+    (void)ctx_size;
     if (he && he[0]) {
         const long hv = atol(he);
         if (hv >= 0) headroom = (uint64_t)hv << 20;
@@ -34481,8 +34529,17 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         }
     }
 
-    if (!metal_graph_alloc_raw_cap(&ctx->g, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp, e->dspark_ready)) {
+    /* MT-5 (audit V13 / MT-2 sweep): the shared batch graph's activation and
+     * state tensors are SESSION_TENSORS -- the same class metal_graph_alloc
+     * gives these tensor kinds on the serial path.  Without this inner scope
+     * they inherit the caller's BATCH_BANK bracket and inflate
+     * bank_census_eager below with ~GiB of non-bank graph tensors (the
+     * census scope is a stack, so the bank bracket resumes at scope_end). */
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
+    const bool graph_ok = metal_graph_alloc_raw_cap(&ctx->g, &e->weights, &e->weights.layer[0],
+                                   raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp, e->dspark_ready);
+    ds4_gpu_mem_scope_end();
+    if (!graph_ok) {
         BC_ERR("batch_ctx_create: graph alloc failed (raw_cap=%u prefill_cap=%u)", raw_cap, prefill_cap);
         free(ctx);
         return 1;
@@ -34506,7 +34563,8 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
          * at boot (resident floor 0); their growth is budgeted per-admission
          * below.  Eager mode keeps the full Inc1a per-bank cost. */
         const uint64_t per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, ctx->mtp,
-                                                             ds4_batch_vmm_comp_enabled());
+                                                             ds4_batch_vmm_comp_enabled(),
+                                                             e->dspark_ready);
         if (!(fe && fe[0] == '0' && fe[1] == '\0') &&
             per_bank != 0 && ds4_gpu_mem_info(&free_b, &total_b) == 0) {
             const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
@@ -34762,8 +34820,8 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     }
     if (ctx->sl.vmm) {
         const uint64_t floor_pb = ds4_batch_vmm_floor_per_bank(&ctx->g);
-        const uint64_t cache_per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, false, false) -
-                                        ds4_batch_slabs_bank_bytes(&ctx->g, false, true) + floor_pb;
+        const uint64_t cache_per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, false, false, false) -
+                                        ds4_batch_slabs_bank_bytes(&ctx->g, false, true, false) + floor_pb;
         /* #15 governance (2026-08-04, resolves the Inc0 adjudication): the
          * budget's UPPER bound is the FIT PLAN's own allowance -- max_seq
          * banks at their full per-bank cache extent.  Resident cache pages
@@ -35336,6 +35394,15 @@ uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) {
 
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) {
     return ctx ? (int)ctx->raw_cap : 0;
+}
+
+/* MT-5 hygiene (audit V13): the admission chunk width that SHAPES the raw
+ * ring (raw_cap = align256(window + min(prefill_cap, chunk))), exposed so
+ * the server's boot ledger can print the shaping input next to the number
+ * it shaped instead of presenting an env-dependent raw_ring as zero-config
+ * output. */
+uint32_t ds4_cont_prefill_chunk_tokens(void) {
+    return bg_prefill_chunk_tokens();
 }
 
 /* R5 Inc1a: actual bank count, which create_fit may have sized below the

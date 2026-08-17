@@ -16107,6 +16107,30 @@ static int coalesce_max_tokens_default(int ctx) {
     return ctx > 0 && ctx < 4096 ? ctx : 4096;
 }
 
+/* MT-5 (v0.6.1 memory truth, audit V6): ctx-aware coalesce/bank default,
+ * shared by the worker's static gather bound and the persistent batch-ctx
+ * bank count (the two DS4_SERVER_COALESCE_MAX read sites drifted 16 vs 32
+ * after the W8 flip raised only the boot site).  The W8 measurement that
+ * picked 32 was taken at ctx=4096; at deep ctx the box cannot fund
+ * anywhere near 32 banks of KV -- leg2a measured ~1 Mi fundable resident
+ * tokens on the 128 GiB ship box -- and every surplus granted bank
+ * strands its eager remainder (~450 MiB: raw ring, state slabs, MTP
+ * checkpoints; the comp/index caches are demand-mapped) as bytes the
+ * comp page budget could otherwise spend on admissions (~4.5 GiB back at
+ * -c 786432).  So: keep 32 verbatim through the measured regime
+ * (ctx <= 16384), then halve while banks x ctx exceeds the fundable
+ * depth, floored at 4 (A2b fork-fanout width).  32 @ 32k, 16 @ 57k,
+ * 8 @ 131k, 4 @ 262k+.  DS4_SERVER_COALESCE_MAX overrides; the boot
+ * fit still clamps down on smaller boxes. */
+#define DS4_COALESCE_FUNDABLE_TOKENS (1u << 20)
+static int coalesce_max_default(int ctx) {
+    if (ctx <= 16384) return 32;
+    int b = 32;
+    while (b > 4 && (uint64_t)b * (uint64_t)ctx > DS4_COALESCE_FUNDABLE_TOKENS)
+        b /= 2;
+    return b;
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     /* Coalescing config (read once; single worker thread). */
@@ -16117,7 +16141,7 @@ static void *worker_main(void *arg) {
     const char *cc = getenv("DS4_SERVER_CONTINUOUS");
     const bool continuous = !(cc && cc[0] == '0' && cc[1] == '\0');  /* default ON */
     const char *cm = getenv("DS4_SERVER_COALESCE_MAX");
-    int cmax = cm ? atoi(cm) : 16;
+    int cmax = cm ? atoi(cm) : coalesce_max_default(s->serial_boot_ctx);
     if (cmax < 1) cmax = 1;
     if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
     const char *cw = getenv("DS4_SERVER_COALESCE_WAIT_MS");
@@ -17947,8 +17971,11 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+    /* MT-5 (audit V13): this line allocates NOTHING and never described the
+     * batch template (banks/scratch print their own ledgers at create time)
+     * -- say so, instead of presenting a paper number as a boot cost. */
     server_log(DS4_LOG_DEFAULT,
-               "ds4-server: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
+               "ds4-server: context buffers ESTIMATE %.2f MiB (single-session shape; ctx=%d, backend=%s, prefill_cap=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
                (double)m.total_bytes / (1024.0 * 1024.0),
                ctx_size,
                ds4_backend_name(backend),
@@ -18910,8 +18937,10 @@ int main(int argc, char **argv) {
          * amortizing the ~51ms fixed forward cost.  This dwarfs the ~3% CUDA-graph
          * ceiling that deprioritized W8c/W8b.  max_seq=64 did NOT fit GB10 KV at
          * ctx=4096, so we fit-or-reduce below rather than silently falling back to
-         * the per-call static path (which loses W5-W8 continuous features). */
-        int cmax = cm ? atoi(cm) : 32;
+         * the per-call static path (which loses W5-W8 continuous features).
+         * MT-5 (audit V6): the 32 stands only through the measured regime --
+         * coalesce_max_default scales it down with ctx (see its comment). */
+        int cmax = cm ? atoi(cm) : coalesce_max_default(ds4_session_ctx(s.session));
         if (cmax < 1) cmax = 1;
         if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
         const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
@@ -18973,9 +19002,10 @@ int main(int argc, char **argv) {
                         s.warm_checkpoint = !(bc && bc[0] == '0' && bc[1] == '\0');
                     }
                     server_log(DS4_LOG_DEFAULT,
-                               "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d seq_cap=%d)%s",
+                               "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d prefill_chunk=%u seq_cap=%d)%s",
                                got_seq, cmaxtok, ds4_session_ctx(s.session),
                                ds4_batch_ctx_raw_cap(s.batch_ctx),
+                               ds4_cont_prefill_chunk_tokens(),
                                ds4_batch_ctx_seq_cap(s.batch_ctx),
                                got_seq < cmax ? " [reduced from requested to fit memory]" : "");
                     made = true;
@@ -25770,6 +25800,19 @@ static void test_cont_credit_refuse_bmax_clamp(void) {
     /* pathological pos past end floors at glen (never extends the cap) */
     TEST_ASSERT(ds4_cont_credit_refuse_bmax(40, 1005, 1000) == 40);
 }
+/* MT-5 (audit V6): the ctx-aware requested-banks default.  Anchors: 32
+ * through the W8-measured regime (<=16384), halving against the ~1 Mi
+ * fundable-token depth, floor 4 (fork fanout). */
+static void test_coalesce_max_default_tiers(void) {
+    TEST_ASSERT(coalesce_max_default(4096)   == 32);   /* the W8 shape */
+    TEST_ASSERT(coalesce_max_default(16384)  == 32);   /* regime boundary */
+    TEST_ASSERT(coalesce_max_default(32768)  == 32);   /* 32 x 32k == anchor */
+    TEST_ASSERT(coalesce_max_default(57344)  == 16);   /* the mid-ctx shape */
+    TEST_ASSERT(coalesce_max_default(131072) == 8);
+    TEST_ASSERT(coalesce_max_default(262144) == 4);
+    TEST_ASSERT(coalesce_max_default(524288) == 4);    /* floor holds */
+    TEST_ASSERT(coalesce_max_default(786432) == 4);    /* the leg2a shape */
+}
 
 /* Inc 7a: the extracted accumulator's own contract -- verdict precedence,
  * stop capture + truncation, one-shot transitions, think-gated markers.
@@ -28115,6 +28158,7 @@ static void ds4_server_unit_tests_run(void) {
     test_credit_union_sums_per_run_need();
     test_cont_credit_ext_due_shapes();
     test_cont_credit_refuse_bmax_clamp();
+    test_coalesce_max_default_tiers();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();

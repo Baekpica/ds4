@@ -19812,11 +19812,18 @@ static void ds4_cuda_capture_warm_tmp_scratch(void) {
      * Pre-warm to the theoretical maximum: max n_comp = comp_cap = 8194
      * (per the existing g_decode_dev / indexer_topk_tree commentary above),
      * head_dim = 512, sizeof(float) = 4 -> ~16 MiB.  Round to 32 MiB to
-     * leave headroom for any future config bump.  This is only paid when
-     * DS4_CUDA_FP8_KV_PREDECODE will actually be exercised; without the
-     * env flag the scratch helper is never called and the cudaMalloc is
-     * a waste, but at 32 MiB on a 96 GB device the cost is negligible. */
-    (void)fp8_predecode_scratch_alloc((uint64_t)32 * 1024 * 1024);
+     * leave headroom for any future config bump.  MT-5 (audit V8): the
+     * comment here used to call the flag opt-in -- P2 Inc2b made predecode
+     * default ON and serial deep decode consumes it (the bank_persist_gate
+     * P8 capture bug this prewarm prevents was hit on that path), so in
+     * the ship config the 32 MiB is load-bearing.  Gate it on the SAME
+     * enabled() gates the consumers check (mirror present AND predecode on):
+     * in any other config the scratch helper is provably never called and
+     * the prewarm is waste. */
+    if (ds4_cuda_fp8_kv_enabled() && ds4_cuda_fp8_kv_predecode_enabled()) {
+        (void)fp8_predecode_scratch_alloc((uint64_t)32 * 1024 * 1024);
+        fprintf(stderr, "ds4: fp8 predecode scratch prewarmed (32 MiB)\n");
+    }
 }
 
 /* Step 6 diagnostic: cudaPeekAtLastError check used to localize the

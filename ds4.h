@@ -398,6 +398,9 @@ int  ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx);
  * prompt+budget by it (one-shot prefill, no wrap), but the continuous path's
  * per-sequence bound is ds4_batch_ctx_seq_cap.  Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx);
+/* MT-5 hygiene: the cont admission chunk width (DS4_CONT_PREFILL_CHUNK,
+ * default 4096) -- the input that shapes raw_cap; for boot-ledger honesty. */
+uint32_t ds4_cont_prefill_chunk_tokens(void);
 /* Per-sequence committed-token bound (prompt + generation) of the CONTINUOUS
  * path: the admit pre-check + decode budget cap.  With chunked admission
  * (DS4_CONT_PREFILL_CHUNK > 0, the default) the raw ring wraps and this is the
