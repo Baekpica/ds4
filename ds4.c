@@ -785,6 +785,7 @@ void ds4_metrics_window_rates(double *dec_tok_s, double *pf_tok_s, double *tok_p
     if (tok_per_step) *tok_per_step = steps ? (double)tok / (double)steps : 0.0;
 }
 
+__attribute__((unused))   /* referenced only under GPU-guarded shapes */
 static void sleep_sec(double sec) {
     if (sec <= 0.0 || !isfinite(sec)) return;
     struct timespec req;
@@ -20437,6 +20438,7 @@ static bool metal_graph_dspark_markov_refine(
         ds4_gpu_tensor           *prev_embed,  /* [nb*markov_rank] f32 scratch */
         ds4_gpu_tensor           *bias,        /* [nb*vocab] f32 scratch */
         int32_t                  *out_cand) {
+    (void)g;   /* kept in the signature for call-shape parity */
     if (nb == 0 || B == 0 || !base_logits || !cand_dev || !prev_embed || !bias || !out_cand) return false;
     const uint32_t mr   = (uint32_t)dw->markov_w2->dim[0];     /* rank (256) */
     const uint32_t mv   = (uint32_t)dw->markov_w1->dim[1];     /* markov table vocab rows */
@@ -25515,10 +25517,12 @@ static bool metal_graph_multiseq_bench(
      * forward, so repeated fixed-position decodes never accumulate (robust even
      * if CTX did land on a ratio boundary). */
     #define BENCH_RESET_COUNTERS(NN) do {                                  \
+        const uint32_t bench_nn_ = (NN);   /* named bound: a literal 0u    \
+            bound draws -Wtype-limits; the fold is identical */            \
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {                    \
             g->layer_n_comp[il]       = primed_n_comp_max[il];             \
             g->layer_n_index_comp[il] = primed_n_index_comp_max[il];       \
-            for (uint32_t s = 0; s < (NN); s++) {                          \
+            for (uint32_t s = 0; s < bench_nn_; s++) {                     \
                 g->ms_n_comp[s][il]       = primed_n_comp_max[il];         \
                 g->ms_n_index_comp[s][il] = primed_n_index_comp_max[il];   \
             }                                                              \
@@ -32678,6 +32682,7 @@ int ds4_engine_batched_generate_ex(
         size_t                        errlen) {
 #define BG_API_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
     if (out) for (int i = 0; i < (n > 0 ? n : 0); i++) { out[i].tokens = NULL; out[i].n_tokens = 0; out[i].finish = 0; }
+    (void)max_new_tokens; (void)eos_ids;   /* consumed on GPU shapes only */
     if (!e || !prompts || !out) { BG_API_ERR("batched_generate: null argument"); return 1; }
     if (n <= 0 || n > DS4_MULTISEQ_MAX_SEQ) { BG_API_ERR("batched_generate: n=%d out of [1,%d]", n, DS4_MULTISEQ_MAX_SEQ); return 1; }
     if (ctx_size <= 0) { BG_API_ERR("batched_generate: ctx_size must be > 0"); return 1; }
@@ -39616,6 +39621,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     uint32_t load_layer_start = opt->load_layer_start;
     uint32_t load_layer_end = opt->load_layer_end;
     bool load_output = opt->load_output;
+    /* consumed on GPU shapes only */
+    (void)load_slice; (void)load_layer_start;
+    (void)load_layer_end; (void)load_output;
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE &&
         opt->distributed.layers.set)
     {
@@ -40595,6 +40603,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen) {
+    (void)output_hc;   /* consumed on GPU shapes only */
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;

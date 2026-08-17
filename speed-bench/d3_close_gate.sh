@@ -121,8 +121,11 @@ log "(1) rsync + clean build at $TIP"
 rsync -a --files-from=<(git ls-files) . "$HOST:$TEST_TREE/" || die "rsync"
 R "cd $TEST_TREE && make clean >/dev/null 2>&1; make -j6 cuda-spark > $BUILD_LOG 2>&1 && make ds4_test >> $BUILD_LOG 2>&1" \
     || die "build: $(R "tail -3 $BUILD_LOG" | tr '\n' ' ')"
-R "sig(){ grep -E ': warning|warning #' \"\$1\" | sed -E -e 's|tests/\.\./||' -e 's/[:(][0-9]+[):]?[0-9]*//g' | sort -u; }; \
-   diff <(sig $REF_BUILD_LOG) <(sig $BUILD_LOG) >/dev/null" || die "warn signature-set parity vs $REF_BUILD_LOG"
+# v0.6.0 quiet-build law: the tip builds with ZERO warnings (the old
+# signature-set parity vs the 14-warning control baseline is retired --
+# any warning at all is now the failure).
+R "! grep -E ': warning|warning #' $BUILD_LOG | grep -q ." \
+    || { R "grep -E ': warning|warning #' $BUILD_LOG | head -5"; die "quiet-build law: warnings in tip build"; }
 for b in ds4-server ds4_test; do
     R "/usr/local/cuda/bin/cuobjdump $TEST_TREE/$b 2>/dev/null | grep -q 'arch = sm_121a'" || die "$b not sm_121a"
 done

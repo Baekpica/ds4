@@ -12258,7 +12258,7 @@ __device__ static float tt_warp_max_f32(float v) {
     return v;
 }
 
-__device__ static float tt_dot4_f32(float4 a, float4 b) {
+[[maybe_unused]] __device__ static float tt_dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 

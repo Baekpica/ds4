@@ -120,7 +120,7 @@ struct alignas(16) SmemInvariants {
 
 static_assert(sizeof(SmemInvariants) <= 128, "shared invariant table must stay small");
 
-__device__ __forceinline__ uint32_t q2k_dm_bits(const uint2 * __restrict__ dm2,
+[[maybe_unused]] __device__ __forceinline__ uint32_t q2k_dm_bits(const uint2 * __restrict__ dm2,
                                                 uint64_t pblk, int parity) {
     const uint2 d = dm2[pblk];
     return parity ? d.y : d.x;
@@ -132,7 +132,7 @@ __device__ __forceinline__ float2 half2_bits_to_float2(uint32_t bits) {
     return __half22float2(h);
 }
 
-__device__ __forceinline__ uint8_t q2k_scale_byte(const int4 * __restrict__ sc4,
+[[maybe_unused]] __device__ __forceinline__ uint8_t q2k_scale_byte(const int4 * __restrict__ sc4,
                                                   uint64_t pblk, int parity, int sub16) {
     const int w = sub16 >> 2;
     const int4 s = sc4[pblk * 2ull + (uint64_t)(w >> 1)];
@@ -141,7 +141,7 @@ __device__ __forceinline__ uint8_t q2k_scale_byte(const int4 * __restrict__ sc4,
     return (uint8_t)((sw >> (8 * (sub16 & 3))) & 0xFFu);
 }
 
-__device__ __forceinline__ void q2k_scale_packs_for_half(
+[[maybe_unused]] __device__ __forceinline__ void q2k_scale_packs_for_half(
         const int4 * __restrict__ sc4, uint64_t pblk, int parity, int half,
         uint32_t &pack_lo4, uint32_t &pack_hi4) {
     const int4 s = sc4[pblk * 2ull + (uint64_t)half];
@@ -165,7 +165,7 @@ __device__ __forceinline__ void q2k_scale_packs_from_int4(
     }
 }
 
-__device__ __forceinline__ uint8_t q2k_scale_from_packs(
+[[maybe_unused]] __device__ __forceinline__ uint8_t q2k_scale_from_packs(
         uint32_t pack_lo4, uint32_t pack_hi4, int t, int sub_in_k32) {
     const int sub = 2 * t + sub_in_k32;
     const uint32_t pack = (sub < 4) ? pack_lo4 : pack_hi4;
@@ -179,7 +179,7 @@ __device__ __forceinline__ uint8_t q2k_scale_from_packs_t(uint32_t pack_lo4, uin
     return (uint8_t)((pack >> (8 * (sub & 3))) & 0xFFu);
 }
 
-__device__ __forceinline__ uint32_t q2k_decode_scaled_reg(uint32_t word, int t, uint8_t scale_byte) {
+[[maybe_unused]] __device__ __forceinline__ uint32_t q2k_decode_scaled_reg(uint32_t word, int t, uint8_t scale_byte) {
     const uint32_t q = (word >> (2 * t)) & 0x03030303u;
     return q * (uint32_t)(scale_byte & 0x0Fu);
 }
@@ -272,7 +272,7 @@ __device__ __forceinline__ void cp_async_wait_keep(int keep_groups) {
     }
 }
 
-__device__ __forceinline__ int cp_async_keep_for_tile(int tile_iter, int k_iters) {
+[[maybe_unused]] __device__ __forceinline__ int cp_async_keep_for_tile(int tile_iter, int k_iters) {
     int keep = kStages - 1;
     const int newer = k_iters - tile_iter - 1;
     if (keep > newer) {
@@ -1429,14 +1429,14 @@ __device__ __forceinline__ void iq2_gateup_fused_mainloop(
     }
 }
 
-__device__ __forceinline__ void fold_element_k32(
+[[maybe_unused]] __device__ __forceinline__ void fold_element_k32(
         float &acc, int c, float2 dm, uint16_t min_pack, const Q8Fix2 &fix) {
     acc += (float)c * dm.x * fix.d8;
     acc -= dm.y * (float)(min_pack & 0xFFu) * fix.sum0;
     acc -= dm.y * (float)((min_pack >> 8) & 0xFFu) * fix.sum1;
 }
 
-__device__ __forceinline__ void fold_element_k64(
+[[maybe_unused]] __device__ __forceinline__ void fold_element_k64(
         float &acc, int c, float2 dm, uint32_t min_pack4, const Q8Fix4 &fix) {
     acc += (float)c * dm.x * fix.d8;
     acc -= dm.y * (float)(min_pack4 & 0xFFu) * fix.sum0;
@@ -1445,7 +1445,7 @@ __device__ __forceinline__ void fold_element_k64(
     acc -= dm.y * (float)((min_pack4 >> 24) & 0xFFu) * fix.sum3;
 }
 
-__device__ __forceinline__ float q2k_bias_k32(float dmin, uint16_t min_pack,
+[[maybe_unused]] __device__ __forceinline__ float q2k_bias_k32(float dmin, uint16_t min_pack,
                                                const Q8Fix2 &fix) {
     const float min0 = (float)(min_pack & 0xFFu);
     const float min1 = (float)((min_pack >> 8) & 0xFFu);

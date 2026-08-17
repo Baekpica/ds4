@@ -2743,6 +2743,7 @@ static void anthropic_prepare_live_continuation(request *r,
  * prompt plus the small amount of protocol state needed to translate the reply. */
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
+    (void)ctx_size;   /* parser-signature parity across the four surfaces */
     request_init(r, REQ_CHAT, def_tokens);
     const char *p = body;
     bool got_messages = false;
@@ -2933,6 +2934,7 @@ bad:
 
 static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
+    (void)ctx_size;   /* parser-signature parity across the four surfaces */
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
     const char *p = body;
@@ -3837,6 +3839,7 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
 
 static bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
+    (void)ctx_size;   /* parser-signature parity across the four surfaces */
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
     const char *p = body;
@@ -4146,6 +4149,7 @@ static bool parse_prompt(const char **p, char **out) {
 
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
+    (void)ctx_size;   /* parser-signature parity across the four surfaces */
     request_init(r, REQ_COMPLETION, def_tokens);
     const char *p = body;
     char *prompt = NULL;
@@ -9691,9 +9695,21 @@ static void wire_result_set_finish(ds4_wire_result *res, const char *finish) {
     res->status = DS4_STATUS_SUCCEEDED;
     res->stop_cause = DS4_STOP_EOS;
     if (!finish) return;
+    /* GCC's -Wstring-compare fires on the caller path where `finish`
+     * statically points at the "length"/"stop" literals (shorter than
+     * "tool_calls", so that ONE path's compare is decidable) — but the
+     * extractor repoints the caller's pointer at runtime, so the compare
+     * is load-bearing on the other paths.  Certified false positive. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstring-compare"
+#endif
     if (!strcmp(finish, "tool_calls"))  res->stop_cause = DS4_STOP_TOOL_COMPLETE;
     else if (!strcmp(finish, "length")) res->stop_cause = DS4_STOP_TOKEN_LIMIT;
     else if (!strcmp(finish, "error"))  res->status = DS4_STATUS_ENGINE_FAILED;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 /* Streamed tool ids: parsed calls inherit the ids the SSE machine already
@@ -16555,12 +16571,15 @@ static const char *gov_cmp_names[DS4_GOV_CMP__COUNT] = {
 /* memgov D5-2: residency-unit vocabularies, positional against the
  * public enums (ds4_mem_census.h); policy + role labels come from the
  * header's own name fns so the surfaces cannot drift. */
+__attribute__((unused))   /* rendered only on GPU-guarded shapes */
 static const char *resunit_state_names[DS4_RESUNIT__COUNT] = {
     "populated", "already_ready", "satisfied_import",
     "host_mapped_by_policy", "lazy_deferred", "expert_cold_by_policy",
     "waived_optional", "failed",
 };
+__attribute__((unused))
 static const char *resstage_names[DS4_RESSTAGE__COUNT] = { "boot", "lazy" };
+__attribute__((unused))
 static const char *resunit_policy_name(int p) {
     return p < DS4_RESIDENCY__COUNT ? ds4_residency_name(p) : "unattributed";
 }
@@ -18251,11 +18270,18 @@ static bool update_check_due(void) {
     const char *home = getenv("HOME");
     if (!home || !home[0]) return false;
     char dir[512], stamp[512];
-    snprintf(dir, sizeof(dir), "%s/.cache", home);
+    /* Truncation-checked (the only real fix in the v0.6.0 quiet-build
+     * pass): a pathological $HOME longer than the buffers means no
+     * usable stamp path — skip the check rather than stat a mangled
+     * name.  Cold path (once daily at most). */
+    if ((size_t)snprintf(dir, sizeof(dir), "%s/.cache", home) >= sizeof(dir))
+        return false;
     (void)mkdir(dir, 0755);
-    snprintf(dir, sizeof(dir), "%s/.cache/ds4", home);
+    if ((size_t)snprintf(dir, sizeof(dir), "%s/.cache/ds4", home) >= sizeof(dir))
+        return false;
     (void)mkdir(dir, 0755);
-    snprintf(stamp, sizeof(stamp), "%s/update-check", dir);
+    if ((size_t)snprintf(stamp, sizeof(stamp), "%s/update-check", dir) >= sizeof(stamp))
+        return false;
     struct stat st;
     if (stat(stamp, &st) == 0 && time(NULL) - st.st_mtime < 24 * 3600) return false;
     FILE *f = fopen(stamp, "w");
