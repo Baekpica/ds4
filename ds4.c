@@ -32906,6 +32906,13 @@ struct ds4_batch_ctx {
      * in ds4.h).  Bumped at every site that replaces or invalidates a bank's
      * committed content; never on pure extension. */
     uint64_t       *bank_gen;
+    /* v0.6.2 Inc 3: per-bank last content activity, in ticks of a
+     * process-monotonic use clock (stamped at history commit points --
+     * cold reset, fork, restore, per-token append; never wall time, so
+     * replays order identically).  The trim victim order's recency
+     * term: among idle valid banks, oldest activity trims first. */
+    uint64_t       *bank_last_use;
+    uint64_t        use_clock;
     /* memgov D4-2: a batched pass is driving this context (set/cleared by
      * the two pass entry points).  Reclaim prepare/commit answer BUSY
      * instead of racing a pass -- structural today (server and pass
@@ -33334,6 +33341,7 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
     ctx->bank_gen[bank]++;   /* Inc 5a: restored content is a new lineage */
     ctx->bank_hist_len[bank] = saved_tokens;
     ctx->bank_hist_valid[bank] = 1;
+    ctx->bank_last_use[bank] = ++ctx->use_clock;   /* v0.6.2 Inc 3: recency */
     return 0;
 }
 
@@ -34168,8 +34176,12 @@ static uint64_t ds4_batch_bank_trim_pages(ds4_batch_ctx *ctx, uint32_t b) {
 }
 
 /* v0.5.1 Inc2: shed FREE banks' cache pages under admission budget pressure,
- * cheapest warm value first -- history-invalid banks, then valid banks by
- * ascending committed prefix (rebuilding a short prefix costs least).  Live,
+ * cheapest warm value first.  v0.6.2 Inc 3: "cheapest" now aligns with
+ * warm-record eviction -- history-invalid banks, then valid banks by
+ * OLDEST content activity (LRU), with ascending committed prefix as the
+ * equal-recency tiebreak; the old shortest-prefix-only order re-trimmed
+ * recently-hot small banks while ancient deep trunks sat immortal
+ * (DS4_BATCH_TRIM_VICTIM=hist restores it).  Live,
  * pending-prefill, target, and fork/partial-source banks are never victims.
  * One device sync before the first unmap: admission runs on the host between
  * step launches, so the sync is provably off-capture (sticky-scratch law).
@@ -34206,6 +34218,19 @@ static void ds4_batch_bank_mark_trimmed(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     g->ms_emit_keep[v] = 0u;
 }
 
+/* v0.6.2 Inc 3: the victim-order kill switch.  DS4_BATCH_TRIM_VICTIM=hist
+ * restores the pre-v0.6.2 shortest-history-first order; the default
+ * blends recency with restore cost (ds4_trim_victim_cheaper, ds4.h). */
+static int ds4_batch_trim_victim_hist_order(void) {
+    static int hist = -1;
+    if (hist < 0) {
+        const char *e = getenv("DS4_BATCH_TRIM_VICTIM");
+        hist = e && e[0] == 'h' && e[1] == 'i' && e[2] == 's' && e[3] == 't' &&
+               !e[4];
+    }
+    return hist;
+}
+
 static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
                                           const uint8_t *live, const uint32_t *pflen,
                                           const uint64_t *credit,
@@ -34224,16 +34249,22 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         if ((live && live[i]) || (pflen && pflen[i]) || (credit && credit[i])) continue;
         order[n++] = i;
     }
-    for (uint32_t a = 1; a < n; a++) {         /* insertion sort by victim cost */
+    /* v0.6.2 Inc 3: insertion sort, cheapest victim first -- invalid
+     * history, then oldest content activity, then shortest history (the
+     * eviction-aligned blend; comparison in ds4.h, CPU-unit-tested). */
+    const int hist_order = ds4_batch_trim_victim_hist_order();
+    for (uint32_t a = 1; a < n; a++) {
         const uint32_t x = order[a];
-        const uint64_t kx = ctx->bank_hist_valid[x]
-                          ? (1ull << 32) + ctx->bank_hist_len[x] : 0;
+        const ds4_trim_victim_key kx = { ctx->bank_hist_valid[x],
+                                         ctx->bank_hist_len[x],
+                                         ctx->bank_last_use[x] };
         uint32_t j = a;
         while (j > 0) {
             const uint32_t y = order[j - 1];
-            const uint64_t ky = ctx->bank_hist_valid[y]
-                              ? (1ull << 32) + ctx->bank_hist_len[y] : 0;
-            if (ky <= kx) break;
+            const ds4_trim_victim_key ky = { ctx->bank_hist_valid[y],
+                                             ctx->bank_hist_len[y],
+                                             ctx->bank_last_use[y] };
+            if (!ds4_trim_victim_cheaper(&kx, &ky, hist_order)) break;
             order[j] = y;
             j--;
         }
@@ -34249,11 +34280,23 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
             if (!ds4_gpu_synchronize()) return freed;
             synced = true;
         }
+        /* v0.6.2 Inc 3: capture the victim's identity BEFORE the mark
+         * wipes it -- the trim line names victims now (bank, bytes,
+         * hist_len, recency), not just count and total. */
+        const uint8_t  v_valid = ctx->bank_hist_valid[v];
+        const uint32_t v_hist  = ctx->bank_hist_len[v];
+        const uint64_t v_use   = ctx->bank_last_use[v];
         const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
         if (got == 0) continue;                /* floor-resident: content intact, keep it */
         ds4_batch_bank_mark_trimmed(ctx, g, v);
         freed += got;
         nb++;
+        fprintf(stderr,
+                "ds4: batch vmm: trim victim bank=%u released=%.1f MiB "
+                "hist=%u tok last_use=%llu%s\n",
+                v, (double)got / 1048576.0, v_hist,
+                (unsigned long long)v_use,
+                v_valid ? "" : " (history already invalid)");
     }
     if (nb) {
         ctx->trim_banks += nb;
@@ -35158,6 +35201,8 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     /* Inc 5a: generations start at 1 (0 = "no bank" to registry readers). */
     ctx->bank_gen        = xmalloc((size_t)ctx->max_seq * sizeof(uint64_t));
     for (uint32_t bg = 0; bg < ctx->max_seq; bg++) ctx->bank_gen[bg] = 1u;
+    /* v0.6.2 Inc 3: recency starts at 0 = never used. */
+    ctx->bank_last_use   = xcalloc(ctx->max_seq, sizeof(uint64_t));
     /* P1: one stashed compressed row per (bank, layer) for the partial-fork
      * boundary-row restore (see ms_emit_keep).  Tiny vs the slabs
      * (max_seq x n_layer x head_dim floats); allocated unconditionally so the
@@ -35241,6 +35286,7 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     free(ctx->bank_hist_len);
     free(ctx->bank_hist_valid);
     free(ctx->bank_gen);
+    free(ctx->bank_last_use);
     free(ctx);
 }
 
@@ -35252,6 +35298,7 @@ static void bank_hist_reset(ds4_batch_ctx *ctx, uint32_t b) {
     ctx->bank_gen[b]++;   /* Inc 5a: lineage replacement */
     ctx->bank_hist_len[b] = 0u;
     ctx->bank_hist_valid[b] = 1u;
+    ctx->bank_last_use[b] = ++ctx->use_clock;   /* v0.6.2 Inc 3: recency */
 }
 static void bank_hist_invalidate_all(ds4_batch_ctx *ctx) {
     for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b]++;   /* Inc 5a */
@@ -35265,6 +35312,7 @@ static void bank_hist_append(ds4_batch_ctx *ctx, uint32_t b, int tok) {
         return;
     }
     ctx->bank_hist[(size_t)b * ctx->seq_cap + ctx->bank_hist_len[b]++] = tok;
+    ctx->bank_last_use[b] = ++ctx->use_clock;   /* v0.6.2 Inc 3: recency */
 }
 static void bank_hist_append_n(ds4_batch_ctx *ctx, uint32_t b, const int *tok, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) bank_hist_append(ctx, b, tok[i]);
@@ -35379,6 +35427,9 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
     ctx->bank_gen[dst]++;   /* Inc 5a: fork-by-copy replaces dst's lineage */
     ctx->bank_hist_len[dst]   = (uint32_t)P;
     ctx->bank_hist_valid[dst] = 1u;
+    /* v0.6.2 Inc 3: both sides are hot -- the copy touched src's content. */
+    ctx->bank_last_use[dst] = ++ctx->use_clock;
+    ctx->bank_last_use[src] = ++ctx->use_clock;
     /* v0.5.5 (task #14): the boundary-row suppression travels with the
      * CONTENT, never with the bank.  dst's prior life may have left a stale
      * ms_emit_keep (set by the partial-fork rewind, cleared only by cold
@@ -35642,6 +35693,9 @@ static bool bank_fork_copy_cut(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst, u
     ctx->bank_gen[dst]++;
     ctx->bank_hist_len[dst]   = R;
     ctx->bank_hist_valid[dst] = 1u;
+    /* v0.6.2 Inc 3: the source trunk was read too (src==dst harmless). */
+    ctx->bank_last_use[dst] = ++ctx->use_clock;
+    ctx->bank_last_use[src] = ++ctx->use_clock;
     g->ms_emit_keep[dst] = R / 4u + 1u;            /* ratio-4 row threshold only */
     return true;
 }

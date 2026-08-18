@@ -27153,6 +27153,38 @@ static void test_mem_census_trim_inject_parse(void) {
     TEST_ASSERT(site == -7 && n == 77);
 }
 
+/* v0.6.2 Inc 3: the trim-victim blend (pure core, ds4.h).  The plan's
+ * synthetic 3-bank scenario: an invalid bank beats everything; among
+ * valid banks the OLDEST activity wins regardless of history length
+ * (the old order's inversion); equal recency falls back to shortest
+ * history; the hist kill switch restores shortest-history-only. */
+static void test_trim_victim_blend_order(void) {
+    const ds4_trim_victim_key inv   = { 0,      0, 900 };  /* invalid, hot  */
+    const ds4_trim_victim_key old_deep  = { 1, 700000,  10 };
+    const ds4_trim_victim_key hot_small = { 1,   2000, 500 };
+    /* Invalid history is always the cheapest victim, both orders. */
+    TEST_ASSERT(ds4_trim_victim_cheaper(&inv, &old_deep, 0));
+    TEST_ASSERT(ds4_trim_victim_cheaper(&inv, &hot_small, 0));
+    TEST_ASSERT(ds4_trim_victim_cheaper(&inv, &hot_small, 1));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&old_deep, &inv, 0));
+    /* THE inversion the increment exists for: the ancient deep trunk
+     * trims before the recently-hot small bank... */
+    TEST_ASSERT(ds4_trim_victim_cheaper(&old_deep, &hot_small, 0));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&hot_small, &old_deep, 0));
+    /* ...and the hist kill switch restores the old choice. */
+    TEST_ASSERT(ds4_trim_victim_cheaper(&hot_small, &old_deep, 1));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&old_deep, &hot_small, 1));
+    /* Equal recency: shortest history is the cheaper re-prefill. */
+    const ds4_trim_victim_key tie_a = { 1, 100, 42 };
+    const ds4_trim_victim_key tie_b = { 1, 200, 42 };
+    TEST_ASSERT(ds4_trim_victim_cheaper(&tie_a, &tie_b, 0));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&tie_b, &tie_a, 0));
+    /* Two invalids compare equal (stable sort keeps index order). */
+    const ds4_trim_victim_key inv2 = { 0, 5, 5 };
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&inv, &inv2, 0));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&inv2, &inv, 0));
+}
+
 /* v0.6.2 Inc 0: reconciliation arithmetic (pure core).  The equation
  * under test: observed raw drop = census growth + one-time charges +
  * residual, signed in every term, flagged strictly over the tolerance. */
@@ -28719,6 +28751,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_census_trim_inject_parse();
     /* v0.6.2 Inc 0: reconciliation arithmetic. */
     test_mem_reconcile_arithmetic();
+    /* v0.6.2 Inc 3: trim-victim blend order. */
+    test_trim_victim_blend_order();
 #ifndef DS4_NO_GPU
     test_mem_census_trim_inject_driver();
     /* memgov D4-2: reclaim trim-preimage arithmetic. */

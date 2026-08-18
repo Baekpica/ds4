@@ -315,6 +315,33 @@ int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
                                  ds4_reclaim_result *result);
 const char *ds4_reclaim_status_str(int status);
 
+/* v0.6.2 Inc 3: trim-victim comparison (pure; unit-tested on CPU, the
+ * D-1c extraction pattern).  Returns 1 when x is the CHEAPER victim.
+ * Order aligns with warm-record eviction (invalid > LRU; "superseded"
+ * has no engine-side analog): invalid history first (content already
+ * worthless), then valid banks by last content activity -- oldest
+ * first -- with committed length as the equal-recency tiebreak
+ * (shortest history = cheapest re-prefill).  hist_order = the
+ * DS4_BATCH_TRIM_VICTIM=hist kill switch: valid banks by shortest
+ * history alone, the pre-v0.6.2 order (it kept deep trunks immortal
+ * under budget pressure while re-trimming recently-hot small banks --
+ * the +76% over-reclaim receipt's thrash shape). */
+typedef struct {
+    uint8_t  hist_valid;
+    uint32_t hist_len;
+    uint64_t last_use;
+} ds4_trim_victim_key;
+
+static inline int ds4_trim_victim_cheaper(const ds4_trim_victim_key *x,
+                                          const ds4_trim_victim_key *y,
+                                          int hist_order) {
+    if (x->hist_valid != y->hist_valid) return !x->hist_valid;
+    if (!x->hist_valid) return 0;              /* both invalid: stable */
+    if (hist_order) return x->hist_len < y->hist_len;
+    if (x->last_use != y->last_use) return x->last_use < y->last_use;
+    return x->hist_len < y->hist_len;
+}
+
 /* deepmem D-1c: page-interval union across per-bank credited spans -- the
  * pure arithmetic under the continuous-admission credit projection
  * (credit_union_family in ds4.c), extracted header-inline so unit tests can
