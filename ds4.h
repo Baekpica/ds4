@@ -242,10 +242,11 @@ int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_tota
  * before allocating, instead of the caller probing by failing whole creates
  * (on unified memory those probes can summon the OOM killer before they
  * fail).  Residual slab failures descend by 3/4 internally.  Knobs:
- * DS4_BATCH_FIT=0 keeps caller-driven sizing, DS4_BATCH_FIT_HEADROOM_MB
- * (default 8192) reserves runtime growth room.  Backends with no memory
- * query (Metal) skip the budget.  Read the chosen width back with
- * ds4_batch_ctx_max_seq.
+ * DS4_BATCH_FIT=0 keeps caller-driven sizing; the headroom derives as
+ * live floor + boot-burst margin (v0.6.2 Inc 2; DS4_BATCH_FIT_HEADROOM_MB
+ * pins it, DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores the static 6144).
+ * Backends with no memory query (Metal) skip the budget.  Read the chosen
+ * width back with ds4_batch_ctx_max_seq.
  * R5 Inc1b: on backends with VMM (CUDA) the ctx-scaled compressed/indexer
  * cache slabs are demand-mapped virtual reservations by default -- they cost
  * the bank-count budget nothing at boot and map physical pages only as

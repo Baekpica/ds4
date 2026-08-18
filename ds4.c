@@ -33520,14 +33520,52 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
  * belongs to the MT-7 deep-admission A/B, which measures decode under
  * actually-deep residency -- at-rest decode cannot see an unspent
  * allowance.  mt5_defaults_gate leg H pins the regime arithmetic.
- * DS4_BATCH_FIT_HEADROOM_MB overrides. */
+ * DS4_BATCH_FIT_HEADROOM_MB overrides.
+ *
+ * v0.6.2 Inc 2: the flat constant DERIVES now -- headroom = the
+ * operator's live floor + the boot-burst margin (runtime growth the
+ * boot has not materialized yet: capture graphs, sticky scratch depth,
+ * logits staging).  The static 6144 was these two summed for the
+ * SHIPPED floor only (4096 + ~2048) -- on any other floor it was a
+ * fiction: a stripped 1 GiB-floor box paid a phantom 3 GiB of planning
+ * margin nothing would ever use (run-3 calibration: floor 1024, leg
+ * min free 1,122 MiB -- the box never needed the static margin's
+ * band).  Deriving keeps EXACT value parity at shipped defaults
+ * (4096 + 2048 = 6144) and returns the difference to the fundable
+ * pool everywhere else.  The burst term is the measured constant
+ * (DS4_BATCH_FIT_BURST_MB pins it; battery legs on desktop-state and
+ * stripped-state boots are its receipt).  Precedence: an explicit
+ * DS4_BATCH_FIT_HEADROOM_MB pin rules everything (unchanged);
+ * DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores the static 6144.  The
+ * derivation disclosed once per boot on its own line. */
+static uint64_t ds4_mem_floor_bytes(void);
 static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     const char *he = getenv("DS4_BATCH_FIT_HEADROOM_MB");
-    uint64_t headroom = 6144ull << 20;
     (void)ctx_size;
     if (he && he[0]) {
         const long hv = atol(he);
-        if (hv >= 0) headroom = (uint64_t)hv << 20;
+        if (hv >= 0) return (uint64_t)hv << 20;
+    }
+    { const char *de = getenv("DS4_BATCH_FIT_HEADROOM_DERIVED");
+      if (de && de[0] == '0' && de[1] == '\0')
+          return 6144ull << 20; }      /* kill switch: the V7 static */
+    uint64_t burst = 2048ull << 20;
+    { const char *be = getenv("DS4_BATCH_FIT_BURST_MB");
+      if (be && be[0]) {
+          const long bv = atol(be);
+          if (bv >= 0) burst = (uint64_t)bv << 20;
+      } }
+    const uint64_t floor = ds4_mem_floor_bytes();
+    const uint64_t headroom = floor + burst;
+    static int disclosed;              /* boot-path call sites only */
+    if (!disclosed) {
+        disclosed = 1;
+        fprintf(stderr,
+                "ds4: batch fit headroom: floor %.2f GiB + boot-burst %.2f "
+                "GiB = %.2f GiB (derived; DS4_BATCH_FIT_HEADROOM_MB pins, "
+                "DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores static 6144)\n",
+                (double)floor / 1073741824.0, (double)burst / 1073741824.0,
+                (double)headroom / 1073741824.0);
     }
     return headroom;
 }
@@ -34692,7 +34730,8 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
      * count from what is actually free instead of letting the caller probe by
      * failing whole creates (blind halving both risks the OOM killer on
      * unified memory and can strand a third of the achievable banks).
-     * DS4_BATCH_FIT_HEADROOM_MB (default 8192) reserves room for runtime
+     * The fit headroom (v0.6.2 Inc 2: derived = live floor + boot-burst
+     * margin; DS4_BATCH_FIT_HEADROOM_MB pins) reserves room for runtime
      * growth: tmp pools, capture graphs, logits staging.  DS4_BATCH_FIT=0
      * keeps caller-driven sizing.  Backends with no memory query (Metal)
      * skip the budget and rely on the descent loop below. */
