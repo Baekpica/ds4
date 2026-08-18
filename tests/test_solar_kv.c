@@ -481,6 +481,99 @@ int main(void) {
     free(v_alt);
     free(k_alt);
 
+    puts("== 512-token HMMA prefill + split decode ==");
+    /* 512-token K-FP8/V-FP4 path: n_tokens>=64 takes the production HMMA
+     * prefill kernel and the grouped split decode kernel.  A default-path
+     * occupancy or KEY_TILE change must still match the direct decode
+     * oracle and stay finite. */
+    {
+        enum { L_TOK = 512, L_CAP = 576, L_CHUNK = 64 };
+        const size_t l_q = (size_t)L_TOK * T_HEAD * T_DIM;
+        const size_t l_kv = (size_t)L_TOK * T_HEAD_KV * T_DIM;
+        const size_t l_row = (size_t)T_HEAD * T_DIM;
+        float *lq = malloc(l_q * sizeof(float));
+        float *lk = malloc(l_kv * sizeof(float));
+        float *lv = malloc(l_kv * sizeof(float));
+        float *l_pref = malloc(l_q * sizeof(float));
+        float *l_dec = malloc(l_row * sizeof(float));
+        float *l_split = malloc(l_row * sizeof(float));
+        CHECK(lq && lk && lv && l_pref && l_dec && l_split,
+              "512-token host alloc");
+        for (size_t i = 0; i < l_q; i++) {
+            lq[i] = 0.11f * sinf(0.017f * (float)(i + 3u));
+        }
+        for (size_t i = 0; i < l_kv; i++) {
+            lk[i] = 0.19f * cosf(0.013f * (float)(i + 5u));
+            lv[i] = 0.23f * sinf(0.011f * (float)(i + 7u));
+        }
+        ds4_gpu_tensor *dlq = ds4_gpu_tensor_alloc(l_q * sizeof(float));
+        ds4_gpu_tensor *dlk = ds4_gpu_tensor_alloc(l_kv * sizeof(float));
+        ds4_gpu_tensor *dlv = ds4_gpu_tensor_alloc(l_kv * sizeof(float));
+        ds4_gpu_tensor *dlout = ds4_gpu_tensor_alloc(l_q * sizeof(float));
+        ds4_gpu_tensor *dldec = ds4_gpu_tensor_alloc(l_row * sizeof(float));
+        ds4_gpu_tensor *dlsplit = ds4_gpu_tensor_alloc(l_row * sizeof(float));
+        const uint32_t l_parts = (L_TOK + L_CHUNK - 1u) / L_CHUNK;
+        ds4_gpu_tensor *dlpart = ds4_gpu_tensor_alloc(
+            (uint64_t)T_HEAD * l_parts * (T_DIM + 2u) * sizeof(float));
+        CHECK(dlq && dlk && dlv && dlout && dldec && dlsplit && dlpart,
+              "512-token device alloc");
+        CHECK(ds4_gpu_tensor_write(dlq, 0, lq, l_q * sizeof(float)), "write lq");
+        CHECK(ds4_gpu_tensor_write(dlk, 0, lk, l_kv * sizeof(float)), "write lk");
+        CHECK(ds4_gpu_tensor_write(dlv, 0, lv, l_kv * sizeof(float)), "write lv");
+        const uint64_t lrowb = ds4_gpu_solar_kv_row_bytes(
+            DS4_SOLAR_KV_KFP8_VFP4, T_HEAD_KV, T_DIM);
+        ds4_gpu_tensor *dlcache =
+            ds4_gpu_tensor_alloc((uint64_t)L_CAP * lrowb);
+        CHECK(dlcache, "512-token cache");
+        CHECK(ds4_gpu_solar_kv_store_tensor(
+                  dlcache, dlk, dlv, T_HEAD_KV, T_DIM, L_TOK, 0u, L_CAP,
+                  DS4_SOLAR_KV_KFP8_VFP4),
+              "512-token store");
+        CHECK(ds4_gpu_solar_attention_prefill_tensor(
+                  dlout, dlq, dlcache, L_TOK, 0u, T_HEAD, T_HEAD_KV, T_DIM,
+                  L_CAP, 0u, DS4_SOLAR_KV_KFP8_VFP4),
+              "512-token HMMA prefill");
+        CHECK(ds4_gpu_tensor_read(dlout, 0, l_pref, l_q * sizeof(float)),
+              "read 512-token prefill");
+        for (size_t i = 0; i < l_q; i++) {
+            CHECK(isfinite(l_pref[i]), "512-token prefill finite");
+        }
+        ds4_gpu_tensor *dlq_last = ds4_gpu_tensor_view(
+            dlq, (uint64_t)(L_TOK - 1u) * l_row * sizeof(float),
+            l_row * sizeof(float));
+        CHECK(dlq_last, "512-token last Q");
+        CHECK(ds4_gpu_solar_attention_decode_tensor(
+                  dldec, dlq_last, dlcache, T_HEAD, T_HEAD_KV, T_DIM, L_CAP,
+                  L_TOK - 1u, 0u, DS4_SOLAR_KV_KFP8_VFP4),
+              "512-token direct decode");
+        CHECK(ds4_gpu_solar_attention_decode_split_tensor(
+                  dlsplit, dlq_last, dlcache, dlpart, T_HEAD, T_HEAD_KV,
+                  T_DIM, L_CAP, L_TOK - 1u, 0u, L_CHUNK,
+                  DS4_SOLAR_KV_KFP8_VFP4),
+              "512-token split decode");
+        CHECK(ds4_gpu_tensor_read(dldec, 0, l_dec, l_row * sizeof(float)),
+              "read 512-token direct");
+        CHECK(ds4_gpu_tensor_read(dlsplit, 0, l_split, l_row * sizeof(float)),
+              "read 512-token split");
+        compare_vector("512-token split vs direct", l_split, l_dec,
+                       l_row, 2.0e-5, 2.0e-5);
+        ds4_gpu_tensor_free(dlq_last);
+        ds4_gpu_tensor_free(dlcache);
+        ds4_gpu_tensor_free(dlpart);
+        ds4_gpu_tensor_free(dlsplit);
+        ds4_gpu_tensor_free(dldec);
+        ds4_gpu_tensor_free(dlout);
+        ds4_gpu_tensor_free(dlv);
+        ds4_gpu_tensor_free(dlk);
+        ds4_gpu_tensor_free(dlq);
+        free(l_split);
+        free(l_dec);
+        free(l_pref);
+        free(lv);
+        free(lk);
+        free(lq);
+    }
+
     const uint64_t ctx = 1048576u;
     puts("== 1M / 12 GQA-layer KV projection ==");
     for (int f = DS4_SOLAR_KV_BF16; f <= DS4_SOLAR_KV_KFP8_VFP4; f++) {
