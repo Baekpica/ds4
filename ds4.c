@@ -35030,15 +35030,49 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
          * force deterministic rejects). */
         const uint64_t plan_allow = (uint64_t)ctx->max_seq * cache_per_bank;
         uint64_t capacity_allow = plan_allow;   /* no memory answer: plan-only */
+        uint64_t floor_work = 0, raw_capacity = 0;
+        int floor_packed = 0, floor_bound = 0;
         { uint64_t vfree = 0, vtotal = 0;
           if (ds4_gpu_mem_info(&vfree, &vtotal) == 0) {
               const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
               const uint64_t res = ds4_batch_slabs_cache_resident(&ctx->sl);
-              const uint64_t floor_work = 2u * cache_per_bank +
-                                          (uint64_t)ctx->max_seq * floor_pb;
-              capacity_allow = res + (vfree > headroom ? vfree - headroom : 0) +
+              /* v0.6.2 Inc 1: the anti-thrash floor in PACKED terms.  The
+               * v0.5.6.3 c3 guarantee -- the budget can never be so small
+               * that every warm record is a trim victim -- wants two
+               * FULL-DEPTH WORKING SETS, and a full-depth bank COMMITS
+               * rate_phys x seq_cap bytes (2.9 GiB at -c 786432), not its
+               * virtual extent (13.4 GiB there): denominating the floor in
+               * virtual bytes clamped capacity UP past the raw sample by
+               * that 4.6x and the class check never engaged at depth (the
+               * dcl_run2 receipt; 35.45-vs-69.93 at -c 1048576).  The
+               * packed term is banded (x1045/1024) because the floor funds
+               * what ADMISSION would actually charge, and rides the same
+               * rate the boot ledger prints and D-1a family coverage the
+               * budget verdict counts (ds4_batch_slabs_packed_bpt ==
+               * ds4_batch_slabs_cache_resident's families by contract).
+               * DS4_BATCH_VMM_FLOOR_PACKED=0 restores the virtual
+               * denomination; the boot line discloses which ruled and
+               * when the floor (either one) still binds capacity. */
+              { const char *fp = getenv("DS4_BATCH_VMM_FLOOR_PACKED");
+                floor_packed = !(fp && fp[0] == '0' && fp[1] == '\0'); }
+              if (floor_packed) {
+                  const uint64_t bpt = ds4_batch_slabs_packed_bpt(ctx);
+                  const uint64_t packed_bank =
+                      bpt * (uint64_t)ctx->seq_cap *
+                      (uint64_t)ds4_cont_admit_band_x1024() / 1024u;
+                  floor_work = 2u * packed_bank +
                                (uint64_t)ctx->max_seq * floor_pb;
-              if (capacity_allow < floor_work) capacity_allow = floor_work;
+              } else {
+                  floor_work = 2u * cache_per_bank +
+                               (uint64_t)ctx->max_seq * floor_pb;
+              }
+              raw_capacity = res + (vfree > headroom ? vfree - headroom : 0) +
+                             (uint64_t)ctx->max_seq * floor_pb;
+              capacity_allow = raw_capacity;
+              if (capacity_allow < floor_work) {
+                  capacity_allow = floor_work;
+                  floor_bound = 1;
+              }
           } }
         ctx->comp_map_budget = plan_allow < capacity_allow ? plan_allow
                                                            : capacity_allow;
@@ -35048,17 +35082,34 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         { const char *be = getenv("DS4_BATCH_VMM_BUDGET_MB");
           if (be && be[0]) { const long bv = atol(be);
             if (bv > 0) { ctx->comp_map_budget = (uint64_t)bv << 20; ctx->comp_map_budget_pinned = 1u; } } }
+        char floorbuf[48];
+        if (floor_work)
+            snprintf(floorbuf, sizeof(floorbuf), "%s %.2f GiB",
+                     floor_packed ? "packed" : "virtual",
+                     (double)floor_work / 1073741824.0);
+        else
+            snprintf(floorbuf, sizeof(floorbuf), "n/a (no memory answer)");
         fprintf(stderr,
-                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB [plan %.2f, capacity %.2f], mem floor=%.1f GiB, serial reserve=%.2f GiB, substrate outstanding=%.2f GiB%s)\n",
+                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB [plan %.2f, capacity %.2f], work floor=%s, mem floor=%.1f GiB, serial reserve=%.2f GiB, substrate outstanding=%.2f GiB%s)\n",
                 (unsigned long long)(ds4_gpu_vmm_demand_page() >> 10),
                 (double)cache_per_bank / 1048576.0, (double)floor_pb / 1048576.0,
                 ctx->max_seq, (double)ctx->comp_map_budget / 1073741824.0,
                 (double)plan_allow / 1073741824.0,
                 (double)capacity_allow / 1073741824.0,
+                floorbuf,
                 (double)ds4_mem_floor_bytes() / 1073741824.0,
                 (double)ctx->serial_reserve / 1073741824.0,
                 (double)ds4_gpu_substrate_outstanding() / 1073741824.0,
                 g_slab_vmm_fallbacks ? " -- WITH EAGER FALLBACKS, see above" : "");
+        /* v0.6.2 Inc 1: the binding disclosure -- its own line so gates
+         * key on presence/absence, never on token position. */
+        if (floor_bound)
+            fprintf(stderr,
+                    "ds4: batch vmm: budget floored to two %s banks "
+                    "(raw capacity %.2f GiB < work floor %.2f GiB)\n",
+                    floor_packed ? "packed" : "virtual",
+                    (double)raw_capacity / 1073741824.0,
+                    (double)floor_work / 1073741824.0);
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
      * R2: sized by seq_cap (the committed-token bound), not the raw ring. */
