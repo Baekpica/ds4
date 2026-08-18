@@ -34296,7 +34296,7 @@ extern "C" int ds4_gpu_motif3_latent_attention_bf16_tensor(
 #undef M3_ATTN_HG_HEADS
 #undef M3_ATTN_HG_ROWS
 
-template <bool RoundBf16>
+template <bool RoundBf16, uint32_t kValueDim>
 __global__ static void motif3_value_project_q8_0_kernel(
         float *heads, const float *latent, const char *weight,
         uint32_t rows, uint32_t q_heads, uint32_t group_size,
@@ -34313,11 +34313,12 @@ __global__ static void motif3_value_project_q8_0_kernel(
     __syncthreads();
     const uint32_t kv_head = head / group_size;
     const uint32_t row0 = kv_head * (qk_nope + value_dim) + qk_nope;
+    const uint32_t values = kValueDim ? kValueDim : value_dim;
     float *dst = heads +
         ((uint64_t)token * q_heads + head) * value_dim;
     /* Decode is faster without paying a warp reduction per value row. */
     if (rows == 1u) {
-        for (uint32_t d = threadIdx.x; d < value_dim; d += blockDim.x) {
+        for (uint32_t d = threadIdx.x; d < values; d += blockDim.x) {
             const char *row = weight + (uint64_t)(row0 + d) * row_bytes;
             float acc = 0.0f;
             for (uint32_t b = 0; b < (latent_dim >> 5); b++) {
@@ -34336,19 +34337,36 @@ __global__ static void motif3_value_project_q8_0_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warps = blockDim.x >> 5u;
-    for (uint32_t d = warp; d < value_dim; d += warps) {
-        const char *row = weight + (uint64_t)(row0 + d) * row_bytes;
-        float acc = 0.0f;
+    constexpr uint32_t values_per_warp = 4u;
+    for (uint32_t d0 = warp * values_per_warp; d0 < values;
+         d0 += warps * values_per_warp) {
+        float acc[values_per_warp] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (uint32_t b = 0; b < (latent_dim >> 5); b++) {
-            const char *blk = row + (uint64_t)b * 34u;
-            const int8_t *q = (const int8_t *)(blk + 2);
-            const float dot = warp_sum_f32((float)q[lane] *
-                                            xsh[b * 32u + lane]);
-            if (lane == 0u)
-                acc += __half2float(*(const __half *)blk) * dot;
+            const float x = xsh[b * 32u + lane];
+#pragma unroll
+            for (uint32_t v = 0; v < values_per_warp; v++) {
+                const uint32_t d = d0 + v;
+                if constexpr (kValueDim == 0u)
+                    if (d >= value_dim) continue;
+                const char *row =
+                    weight + (uint64_t)(row0 + d) * row_bytes;
+                const char *blk = row + (uint64_t)b * 34u;
+                const int8_t *q = (const int8_t *)(blk + 2);
+                const float dot = warp_sum_f32((float)q[lane] * x);
+                if (lane == 0u)
+                    acc[v] += __half2float(*(const __half *)blk) * dot;
+            }
         }
-        if (lane == 0u)
-            dst[d] = RoundBf16 ? motif3_bf16_boundary(acc) : acc;
+        if (lane == 0u) {
+#pragma unroll
+            for (uint32_t v = 0; v < values_per_warp; v++) {
+                const uint32_t d = d0 + v;
+                if constexpr (kValueDim == 0u)
+                    if (d >= value_dim) continue;
+                dst[d] = RoundBf16
+                    ? motif3_bf16_boundary(acc[v]) : acc[v];
+            }
+        }
     }
 }
 
@@ -34448,18 +34466,20 @@ extern "C" int ds4_gpu_motif3_value_project_q8_0_tensor(
             model_map, kv_b_offset, weight_bytes, tier,
             "Motif-3 latent V Q8_0");
     if (!weight) return 0;
-    if (round_bf16)
-        motif3_value_project_q8_0_kernel<true><<<grid, 128,
-            (size_t)kv_latent_dim * sizeof(float)>>>(
-                (float *)heads->ptr, (const float *)latent->ptr, weight,
-                rows, q_heads, group_size, kv_latent_dim,
-                qk_nope, value_dim, row_bytes);
-    else
-        motif3_value_project_q8_0_kernel<false><<<grid, 128,
-            (size_t)kv_latent_dim * sizeof(float)>>>(
-                (float *)heads->ptr, (const float *)latent->ptr, weight,
-                rows, q_heads, group_size, kv_latent_dim,
-                qk_nope, value_dim, row_bytes);
+#define M3_VALUE_LAUNCH(round_, dim_)                                        \
+    motif3_value_project_q8_0_kernel<round_, dim_><<<grid, 128,              \
+        (size_t)kv_latent_dim * sizeof(float)>>>(                            \
+            (float *)heads->ptr, (const float *)latent->ptr, weight,         \
+            rows, q_heads, group_size, kv_latent_dim,                        \
+            qk_nope, value_dim, row_bytes)
+    if (value_dim == 128u) {
+        if (round_bf16) M3_VALUE_LAUNCH(true, 128u);
+        else M3_VALUE_LAUNCH(false, 128u);
+    } else {
+        if (round_bf16) M3_VALUE_LAUNCH(true, 0u);
+        else M3_VALUE_LAUNCH(false, 0u);
+    }
+#undef M3_VALUE_LAUNCH
     return cuda_ok(cudaGetLastError(), "Motif-3 latent V projection launch");
 }
 
