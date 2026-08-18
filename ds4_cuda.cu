@@ -3895,6 +3895,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
  * accept an `extern __constant__` declaration alongside a later
  * definition, so we don't forward-declare the symbol. */
 static int ds4_cuda_fp8_kv_decode_table_init(void);
+extern "C" void ds4_gpu_boot_trim(void);
 extern "C" int ds4_cuda_fp8_kv_enabled(void);
 extern "C" int ds4_cuda_fp8_kv_debug_enabled(void);
 extern "C" int ds4_cuda_fp4_index_enabled(void);  /* P2 Inc3 */
@@ -4323,6 +4324,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
     }
+    ds4_gpu_boot_trim();
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);

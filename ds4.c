@@ -52838,8 +52838,11 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 
 static void dots3_ref_dequant_row(
         const ds4_model *m, const ds4_tensor *t, uint64_t expert,
-        uint64_t row, float *out) {
+        uint64_t row, float *out, uint64_t out_n) {
     const uint64_t in_dim = t->dim[0];
+    if (in_dim > out_n) {
+        ds4_die("dots3 reference dequant row exceeds scratch");
+    }
     const uint8_t *base = (const uint8_t *)m->map + t->abs_offset;
     if (t->ndim == 3) {
         base += expert * (t->bytes / t->dim[2]);
@@ -52879,11 +52882,11 @@ static void dots3_ref_dequant_row(
  * projection, dequantizing one output row at a time. */
 static void dots3_ref_matvec(
         const ds4_model *m, const ds4_tensor *t, uint64_t expert,
-        const float *in, float *out, float *scratch) {
+        const float *in, float *out, float *scratch, uint64_t scratch_n) {
     const uint64_t in_dim = t->dim[0];
     const uint64_t out_dim = t->dim[1];
     for (uint64_t o = 0; o < out_dim; o++) {
-        dots3_ref_dequant_row(m, t, expert, o, scratch);
+        dots3_ref_dequant_row(m, t, expert, o, scratch, scratch_n);
         double acc = 0.0;
         for (uint64_t i = 0; i < in_dim; i++) {
             acc += (double)scratch[i] * in[i];
@@ -52915,8 +52918,8 @@ static void dots3_ref_rope(float *x, uint32_t pos, uint32_t rot,
 
 /* Dequantize one norm vector (Q8_0 or F32) into `out`. */
 static void dots3_ref_norm_weight(
-        const ds4_model *m, const ds4_tensor *t, float *out) {
-    dots3_ref_dequant_row(m, t, 0, 0, out);
+        const ds4_model *m, const ds4_tensor *t, float *out, uint64_t out_n) {
+    dots3_ref_dequant_row(m, t, 0, 0, out, out_n);
 }
 
 int ds4_engine_dots3_reference_logits(
@@ -52931,19 +52934,31 @@ int ds4_engine_dots3_reference_logits(
     const uint32_t n_embd = DS4_N_EMBD;
     const uint32_t wide_q = DS4_N_HEAD * DS4_N_KEY_MLA;
     const uint32_t wide_v = DS4_N_HEAD * DS4_N_VALUE_MLA;
+    /* kv_b writes heads*(nope+v); full is 128*(128+128)=32768, wider than
+     * the packed q/k width n_head*n_key_mla. */
+    const uint32_t kv_b_n = DS4_N_HEAD *
+        ((DS4_N_KEY_MLA - DS4_N_ROT) + DS4_N_VALUE_MLA);
+    /* One dequant row: full attn_output in_dim is n_head*n_value_mla=16384,
+     * which is wider than the dense FF (13824). */
+    const uint32_t row_n = wide_v > DS4_N_FF_DENSE ? wide_v : DS4_N_FF_DENSE;
     const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    int rc = 1;
+
+    fprintf(stderr,
+            "ds4: dots3 CPU reference: %u tokens across %u layers "
+            "(single-thread dequant)\n", n, n_exec);
 
     float *x = xmalloc((size_t)n * n_embd * sizeof(float));
     float *h = xmalloc((size_t)n * n_embd * sizeof(float));
-    float *scratch = xmalloc((size_t)DS4_N_FF_DENSE * sizeof(float));
-    float *nw = xmalloc((size_t)DS4_N_SWA_KV_LORA * sizeof(float));
+    float *scratch = xmalloc((size_t)row_n * sizeof(float));
+    float *nw = xmalloc((size_t)n_embd * sizeof(float));
     float *q_lora = xmalloc((size_t)DS4_N_LORA_Q * sizeof(float));
     float *q = xmalloc((size_t)n * wide_q * sizeof(float));
     float *k = xmalloc((size_t)n * wide_q * sizeof(float));
     float *v = xmalloc((size_t)n * wide_v * sizeof(float));
     float *kv_raw = xmalloc((size_t)(DS4_N_SWA_KV_LORA + DS4_N_ROT) * sizeof(float));
     float *c_lat = xmalloc((size_t)DS4_N_SWA_KV_LORA * sizeof(float));
-    float *kv_proj = xmalloc((size_t)wide_q * sizeof(float));
+    float *kv_proj = xmalloc((size_t)kv_b_n * sizeof(float));
     float *scores = xmalloc((size_t)n * sizeof(float));
     float *attn = xmalloc((size_t)wide_v * sizeof(float));
     float *gate = xmalloc((size_t)DS4_N_HEAD * sizeof(float));
@@ -52954,9 +52969,9 @@ int ds4_engine_dots3_reference_logits(
     float *bias = xmalloc((size_t)DS4_N_EXPERT * sizeof(float));
 
     for (uint32_t t = 0; t < n; t++) {
-        if (tokens[t] < 0 || (uint32_t)tokens[t] >= DS4_N_VOCAB) return 1;
+        if (tokens[t] < 0 || (uint32_t)tokens[t] >= DS4_N_VOCAB) goto done;
         dots3_ref_dequant_row(m, w->token_embd, 0, (uint64_t)tokens[t],
-                              x + (uint64_t)t * n_embd);
+                              x + (uint64_t)t * n_embd, n_embd);
     }
 
     for (uint32_t il = 0; il < n_exec; il++) {
@@ -52976,29 +52991,29 @@ int ds4_engine_dots3_reference_logits(
         for (uint32_t t = 0; t < n; t++) {
             const float *xt = x + (uint64_t)t * n_embd;
             float *ht = h + (uint64_t)t * n_embd;
-            dots3_ref_norm_weight(m, l->attn_norm, nw);
+            dots3_ref_norm_weight(m, l->attn_norm, nw, n_embd);
             dots3_ref_rms(xt, nw, ht, n_embd, DS4_RMS_EPS);
 
-            dots3_ref_matvec(m, l->attn_q_a, 0, ht, q_lora, scratch);
-            dots3_ref_norm_weight(m, l->attn_q_a_norm, nw);
+            dots3_ref_matvec(m, l->attn_q_a, 0, ht, q_lora, scratch, row_n);
+            dots3_ref_norm_weight(m, l->attn_q_a_norm, nw, n_embd);
             dots3_ref_rms(q_lora, nw, q_lora, DS4_N_LORA_Q, DS4_RMS_EPS);
             for (uint32_t i = 0; i < DS4_N_LORA_Q; i++) q_lora[i] *= q_rescale;
             float *qt = q + (uint64_t)t * wide_q;
-            dots3_ref_matvec(m, l->attn_q_b, 0, q_lora, qt, scratch);
+            dots3_ref_matvec(m, l->attn_q_b, 0, q_lora, qt, scratch, row_n);
             for (uint32_t hh = 0; hh < heads; hh++) {
                 dots3_ref_rope(qt + (uint64_t)hh * qk, t, DS4_N_ROT, nope, theta);
             }
 
-            dots3_ref_matvec(m, l->attn_kv_a_mqa, 0, ht, kv_raw, scratch);
-            dots3_ref_norm_weight(m, l->attn_kv_a_norm, nw);
+            dots3_ref_matvec(m, l->attn_kv_a_mqa, 0, ht, kv_raw, scratch, row_n);
+            dots3_ref_norm_weight(m, l->attn_kv_a_norm, nw, n_embd);
             dots3_ref_rms(kv_raw, nw, c_lat, kv_lora, DS4_RMS_EPS);
             for (uint32_t i = 0; i < kv_lora; i++) c_lat[i] *= kv_rescale;
             float k_pe[DS4_MAX_ROT];
-            dots3_ref_norm_weight(m, l->attn_k_rope_norm, nw);
+            dots3_ref_norm_weight(m, l->attn_k_rope_norm, nw, n_embd);
             dots3_ref_rms(kv_raw + kv_lora, nw, k_pe, DS4_N_ROT, DS4_RMS_EPS);
             dots3_ref_rope(k_pe, t, DS4_N_ROT, 0, theta);
 
-            dots3_ref_matvec(m, l->attn_kv_b, 0, c_lat, kv_proj, scratch);
+            dots3_ref_matvec(m, l->attn_kv_b, 0, c_lat, kv_proj, scratch, row_n);
             float *kt = k + (uint64_t)t * wide_q;
             float *vt = v + (uint64_t)t * wide_v;
             for (uint32_t hh = 0; hh < heads; hh++) {
@@ -53042,14 +53057,14 @@ int ds4_engine_dots3_reference_logits(
                     oh[d] = (float)(acc / denom);
                 }
             }
-            dots3_ref_matvec(m, l->attn_gate, 0, ht, gate, scratch);
+            dots3_ref_matvec(m, l->attn_gate, 0, ht, gate, scratch, row_n);
             for (uint32_t hh = 0; hh < heads; hh++) {
                 const float g = 1.0f / (1.0f + expf(-gate[hh]));
                 for (uint32_t d = 0; d < DS4_N_VALUE_MLA; d++) {
                     attn[(uint64_t)hh * DS4_N_VALUE_MLA + d] *= g;
                 }
             }
-            dots3_ref_matvec(m, l->attn_output, 0, attn, ff_o, scratch);
+            dots3_ref_matvec(m, l->attn_output, 0, attn, ff_o, scratch, row_n);
             float *xt_mut = x + (uint64_t)t * n_embd;
             for (uint32_t i = 0; i < n_embd; i++) xt_mut[i] += ff_o[i];
             (void)xt;
@@ -53058,19 +53073,19 @@ int ds4_engine_dots3_reference_logits(
         for (uint32_t t = 0; t < n; t++) {
             float *xt = x + (uint64_t)t * n_embd;
             float *ht = h + (uint64_t)t * n_embd;
-            dots3_ref_norm_weight(m, l->ffn_norm, nw);
+            dots3_ref_norm_weight(m, l->ffn_norm, nw, n_embd);
             dots3_ref_rms(xt, nw, ht, n_embd, DS4_RMS_EPS);
             if (!l->ffn_gate_exps) {
-                dots3_ref_matvec(m, l->ffn_gate, 0, ht, ff_a, scratch);
-                dots3_ref_matvec(m, l->ffn_up, 0, ht, ff_b, scratch);
+                dots3_ref_matvec(m, l->ffn_gate, 0, ht, ff_a, scratch, row_n);
+                dots3_ref_matvec(m, l->ffn_up, 0, ht, ff_b, scratch, row_n);
                 for (uint32_t i = 0; i < DS4_N_FF_DENSE; i++) {
                     ff_a[i] = ff_a[i] / (1.0f + expf(-ff_a[i])) * ff_b[i];
                 }
-                dots3_ref_matvec(m, l->ffn_down, 0, ff_a, ff_o, scratch);
+                dots3_ref_matvec(m, l->ffn_down, 0, ff_a, ff_o, scratch, row_n);
                 for (uint32_t i = 0; i < n_embd; i++) xt[i] += ff_o[i];
                 continue;
             }
-            dots3_ref_matvec(m, l->ffn_gate_inp, 0, ht, router, scratch);
+            dots3_ref_matvec(m, l->ffn_gate_inp, 0, ht, router, scratch, row_n);
             memcpy(bias,
                    (const uint8_t *)m->map + l->ffn_exp_probs_b->abs_offset,
                    (size_t)DS4_N_EXPERT * sizeof(float));
@@ -53104,37 +53119,40 @@ int ds4_engine_dots3_reference_logits(
             memset(acc_out, 0, sizeof(float) * n_embd);
             for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
                 const uint64_t ex = (uint64_t)sel[slot];
-                dots3_ref_matvec(m, l->ffn_gate_exps, ex, ht, ff_a, scratch);
-                dots3_ref_matvec(m, l->ffn_up_exps, ex, ht, ff_b, scratch);
+                dots3_ref_matvec(m, l->ffn_gate_exps, ex, ht, ff_a, scratch, row_n);
+                dots3_ref_matvec(m, l->ffn_up_exps, ex, ht, ff_b, scratch, row_n);
                 for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
                     ff_a[i] = ff_a[i] / (1.0f + expf(-ff_a[i])) * ff_b[i];
                 }
-                dots3_ref_matvec(m, l->ffn_down_exps, ex, ff_a, ff_o, scratch);
+                dots3_ref_matvec(m, l->ffn_down_exps, ex, ff_a, ff_o, scratch, row_n);
                 for (uint32_t i = 0; i < n_embd; i++) {
                     acc_out[i] += sel_w[slot] * ff_o[i];
                 }
             }
-            dots3_ref_matvec(m, l->ffn_gate_shexp, 0, ht, ff_a, scratch);
-            dots3_ref_matvec(m, l->ffn_up_shexp, 0, ht, ff_b, scratch);
+            dots3_ref_matvec(m, l->ffn_gate_shexp, 0, ht, ff_a, scratch, row_n);
+            dots3_ref_matvec(m, l->ffn_up_shexp, 0, ht, ff_b, scratch, row_n);
             for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
                 ff_a[i] = ff_a[i] / (1.0f + expf(-ff_a[i])) * ff_b[i];
             }
-            dots3_ref_matvec(m, l->ffn_down_shexp, 0, ff_a, ff_o, scratch);
+            dots3_ref_matvec(m, l->ffn_down_shexp, 0, ff_a, ff_o, scratch, row_n);
             for (uint32_t i = 0; i < n_embd; i++) {
                 xt[i] += acc_out[i] + ff_o[i];
             }
         }
     }
 
-    dots3_ref_norm_weight(m, w->output_norm, nw);
+    dots3_ref_norm_weight(m, w->output_norm, nw, n_embd);
     dots3_ref_rms(x + (uint64_t)(n - 1u) * n_embd, nw, h, n_embd, DS4_RMS_EPS);
-    dots3_ref_matvec(m, w->output, 0, h, logits_out, scratch);
+    dots3_ref_matvec(m, w->output, 0, h, logits_out, scratch, row_n);
+    fprintf(stderr, "ds4: dots3 CPU reference done\n");
+    rc = 0;
 
+done:
     free(bias); free(router); free(ff_o); free(ff_b); free(ff_a);
     free(gate); free(attn); free(scores); free(kv_proj); free(c_lat);
     free(kv_raw); free(v); free(k); free(q); free(q_lora); free(nw);
     free(scratch); free(h); free(x);
-    return 0;
+    return rc;
 }
 
 static DS4_MAYBE_UNUSED float motif3_bf16_round_reference(float value) {
@@ -55541,6 +55559,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             s->checkpoint_valid = false;
             s->checkpoint.len = 0;
             s->dots3_graph.cache_len = 0;
+        }
+        /* ponytail: replay at most one partial chunk until MoE tiers are parity-stable. */
+        const uint32_t tail = (uint32_t)start % s->prefill_cap;
+        if (tail != 0) {
+            start -= (int)tail;
+            s->dots3_graph.cache_len = (uint32_t)start;
         }
         while (start < prompt->len) {
             uint32_t rows = (uint32_t)(prompt->len - start);

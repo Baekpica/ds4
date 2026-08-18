@@ -7,6 +7,8 @@ turn follows [antirez/ds4](https://github.com/antirez/ds4). The versioning rule
 is deliberately small: an Entrpi release such as `v0.6.0` becomes
 `v0.6.0-dfm` after the additional model families pass this repository's
 integration gates. The previous integrated cut was `v0.5.6.3-dfm`.
+The branch also carries selected non-DFM family ports, currently dots3-note
+Preview; that inclusion does not classify the source model as a Korean DFM.
 
 The reference target is one NVIDIA DGX Spark with a GB10 GPU and 128 GB of
 unified memory. Other operating systems and accelerators are not release
@@ -27,7 +29,8 @@ The implementation stays close to upstream's style:
 - genuinely different attention, recurrent state, or expert math gets a
   direct family path;
 - no plugin registry, graph framework, or broad abstraction layer is added;
-- DeepSeek MTP and DSpark support models remain DeepSeek-only.
+- external MTP and DSpark support models remain DeepSeek-only. The embedded
+  dots3-note MTP block is bound and validated but is not executed yet.
 
 This keeps the changes reviewable for a possible future upstream contribution.
 
@@ -39,6 +42,7 @@ This keeps the changes reviewable for a possible future upstream contribution.
 | Solar Open2 250B | `general.architecture=solar-open2` | recurrent KDA state plus compressed GQA KV | persistent multi-bank |
 | K-EXAONE 236B A23B | `general.architecture=exaone-moe` | LLLG full/sliding GQA KV | persistent multi-bank |
 | Motif-3 | `general.architecture=motif3` | normalized latent KV, rotated `k_pe`, and SWA rings | persistent multi-bank |
+| dots3-note Preview | `general.architecture=dots3-note` | dual-geometry latent KV, DSA keys, and SWA rings | serial |
 
 The scheduler implementation may differ because the model states differ, but
 the operator and client contract is the same. Changing `-m` to a GGUF from a
@@ -71,10 +75,11 @@ generation request, and settled `/v1/stats` counters must all pass.
 
 `--kv-disk-dir` and `--kv-disk-space-mb` use the same server policy for every
 integrated family. DeepSeek/GLM keeps its compressed-KV payload, Solar keeps
-recurrent KDA plus GQA state, EXAONE keeps its full/sliding LLLG rings, and
-Motif-3 keeps normalized latent KV plus rotated `k_pe` rings. Serial sessions
-and continuous banks share the family payload format, validate their tagged
-layout before any restore, and reject truncated or cross-family data.
+recurrent KDA plus GQA state, EXAONE keeps its full/sliding LLLG rings,
+Motif-3 keeps normalized latent KV plus rotated `k_pe` rings, and dots3-note
+keeps its full/SWA latent KV plus DSA keys. Serial sessions and continuous
+banks share the family payload format, validate their tagged layout before
+any restore, and reject truncated or cross-family data.
 
 ```sh
 ./ds4-server -m "$MODEL" --cuda -c 131072 \
@@ -114,7 +119,7 @@ If the memory preflight passes, run the same command without `--dry-run` in a
 durable tmux session. Do not start a worker until the owner reports both
 `broker listening` and `ready manifest=...`.
 
-The worker command is common to all four families:
+The worker command is common to all five families:
 
 ```sh
 DS4_CUDA_WEIGHT_IPC_MANIFEST="$RUN/weights.manifest" \
@@ -126,7 +131,8 @@ DS4_CUDA_WEIGHT_IPC_SCOPE=base \
 For a split model, `MODEL` is its first shard. DeepSeek can place a DSpark
 drafter beside the base model; the standard launch resolver attaches it
 automatically when its expected file name is present. The other families do
-not accept MTP or DSpark attachments.
+not accept external MTP or DSpark attachments; dots3-note's in-file MTP block
+is currently validation-only.
 
 ## DGX Spark memory hygiene
 
@@ -157,6 +163,7 @@ are fixture, unit, and structural GGUF checks on this binary. The Motif
 | Solar Open2 | `test-solar-loader` / `test-solar-tokenizer` on MXQ-v1 11 shards; CUDA KDA, chunked prefill, gates, compressed KV | passed |
 | K-EXAONE | `test-exaone-kernels` vs CPU (no model path: routed-expert matmul skipped); tokenizer load of the 3-shard MXQ | passed |
 | Motif-3 | official-final CUDA fixtures (BF16, router, PolyNorm, mHC, expanded/latent GDLA); `test-motif3-loader` / `test-motif3-tokenizer` on `Motif-3-MQ87-88-FIT.gguf` | passed |
+| dots3-note | 10-shard loader/tokenizer; CPU/GPU forward; 1600-token chunk/ring and prefix reuse; DSA boundary; 256K resident allocation/cleanup; 4K Chat | passed on `dots3-note-prev-MQ87` |
 | Shared | `test-model-family-kernels` | passed |
 
 The merge keeps DFM family generate, split-GGUF remaps, and aligned
@@ -261,6 +268,11 @@ the 611 MHz pin did not recur.
 
 ## Current limits
 
+- dots3-note is text-only and serial. The source 524,288-token metadata is
+  preserved, but the release evidence currently covers a 262,144-context
+  allocation and a short 4K server request, not a 524,288-token prefill.
+- dots3-note DSA above top-2048 has a deterministic 2,600-token smoke; exact
+  CPU/GPU parity is gated in the dense-equivalent range at or below 2,048.
 - Motif-3 has three verified persistent banks at `-c 196608` on the reference
   Spark. Concurrent 256K banks are not claimed.
 - The Motif-3 256K result validates one strict serial request on this exact
