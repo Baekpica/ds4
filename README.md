@@ -501,6 +501,19 @@ refusing for lack of memory the engine first collects what it can
 return: idle banks' pages via trim, then its own unused CUDA graph-pool
 reserve (`DS4_MEM_OWN_TRIM=0` opts out).
 
+Since v0.6.2 the account also proves itself. Every floor and margin in
+the plan is derived from a measurement rather than a constant: the
+bank count is priced from the live budget at boot, the anti-thrash
+floor prices working sets at what they actually commit (not their
+virtual extents, which overclaimed 4x at deep context), and the
+planning headroom derives from the operator's memory floor. The boot
+ledger prints the arithmetic behind each of these decisions, and while
+serving, an idle-tick reconciliation line checks the box's raw memory
+drop since boot against what the engine's own ledger explains, logging
+the signed residual (also on `/v1/stats` and `/metrics`) — an
+unexplained phantom or leak surfaces as a named number, not a field
+report.
+
 The proving runs for v0.6.1: a zero-config boot at `-c 786432` admitted
 three ingestions of about 755 thousand tokens each, back to back, and
 held **2.26 million tokens of context resident and warm at once** on

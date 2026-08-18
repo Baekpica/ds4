@@ -5,30 +5,27 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
-## Unreleased
+## v0.6.2 — 2026-08-19
 
-- Default context raised to 262144 on CUDA builds (was 32768; Metal/CPU
-  keep 32768). Rationale: with the v0.6 memory model a deep window is
-  demand-mapped and nearly free until used, while the old 32k default
-  was a footgun — a defaults boot could not fit even one long agentic
-  request (prompt plus the 32768-token decode budget assumed when
-  `max_tokens` is omitted). At 262144 the bank plan still derives 4
-  banks. Users chasing maximum concurrency for shallow batch work set
-  `-c` low explicitly, as they already tune the bank count. The default
-  resolves after flag parsing, so `--metal`/`--cpu` on a CUDA build get
-  the conservative default.
-- Weight-server manifest content identity (closes the limitation
-  chartered at v0.6.0): the manifest now carries a per-model content
-  fingerprint (`content <id> <size> <algo> <hex>`, strided FNV-1a
-  sample: full head and tail windows plus one page per 16 MiB) and the
-  engine verifies it against its own mapping of the model file before
-  importing any range. A weight server left holding a superseded
-  checkpoint of identical size is now refused loudly at boot instead
-  of feeding stale bytes silently. Old manifests without the record
-  still import, with a one-line notice; unknown fingerprint algos
-  downgrade to the same notice; `DS4_WEIGHT_FP_CHECK=0` disables
-  verification. This is mixup detection, not tamper-proofing: bytes
-  between sample windows are not covered.
+Real budgets. v0.6.1 made admission charge what a request actually
+commits; this release makes every remaining floor and margin a
+measurement too, and makes the account prove itself continuously. The
+anti-thrash floor was still denominated in virtual extents — pricing
+two full-depth working sets at 26.71 GiB at `-c 786432` where they
+really commit 6.68 — so the budget's capacity leg never engaged
+honestly at depth; the boot bank count came from a frozen ladder; the
+planning headroom was a constant tuned for one configuration; trim
+picked victims by history length, keeping deep trunks immortal under
+pressure while re-trimming recently-hot banks; and nothing checked the
+box's raw memory drop against the engine's own ledger. This release
+closes all of it: the shipped 262144 default now boots 9 banks where
+the ladder froze 4, capacity governs the budget honestly at depth, a
+stripped 1 GiB-floor box gets ~3 GiB of planning margin back, and an
+idle-tick reconciliation line holds the unexplained residual to
+2–19 MiB against a 256 MiB tolerance across the gate battery. One
+disclosed constant remains: the boot-burst half of the derived
+headroom ships as a 2048 MiB default pending its own measurement.
+
 - Governed bank plan: the boot bank count is priced from the live
   memory budget instead of a frozen fundable-token ladder. Above 16k
   context the plan asks what the budget actually funds at the same
@@ -39,19 +36,6 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
   verbatim. An explicit `DS4_SERVER_COALESCE_MAX` still rules AND
   disarms the sizing — the operator's number is a deterministic pin;
   `DS4_BATCH_FIT_KV=0` restores the ladder end to end.
-- Reconciliation line (the zero-headroom law made continuous): at every
-  idle tick the server reconciles the box's raw available-memory drop
-  since boot settle against what its own allocation census plus the
-  named one-time charges explain, and logs the signed residual instead
-  of silently absorbing it — a future phantom or leak surfaces as a
-  named number, not a field report. Fresh copies on `/v1/stats` and
-  `/metrics`; `DS4_MEM_RECONCILE_TOL_MB` (default 256) flags the line,
-  `DS4_MEM_RECONCILE_STRICT=1` emits a distinct token for gate scripts.
-  The ~650 MiB census-invisible first-admit warmup (driver module
-  loads, JIT, host allocator growth) is captured once as a named
-  one-time charge (`DS4_MEM_RECONCILE_WARMUP_MB` pins it); the serial
-  session's memory row now publishes the allocator's own measured bytes
-  instead of the estimate once the graph commits.
 - The KV budget's anti-thrash floor is priced in committed terms: the
   guarantee was always "two full-depth working sets", but it was
   denominated in virtual per-bank extents (13.4 GiB at `-c 786432`)
@@ -78,6 +62,42 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
   (bank, bytes released, history length, recency) ahead of the summary
   line, and the boot ledger discloses the active order.
   `DS4_BATCH_TRIM_VICTIM=hist` restores the old order.
+- Reconciliation line (the zero-headroom law made continuous): at every
+  idle tick the server reconciles the box's raw available-memory drop
+  since boot settle against what its own allocation census plus the
+  named one-time charges explain, and logs the signed residual instead
+  of silently absorbing it — a future phantom or leak surfaces as a
+  named number, not a field report. Fresh copies on `/v1/stats` and
+  `/metrics`; `DS4_MEM_RECONCILE_TOL_MB` (default 256) flags the line,
+  `DS4_MEM_RECONCILE_STRICT=1` emits a distinct token for gate scripts.
+  The ~650 MiB census-invisible first-admit warmup (driver module
+  loads, JIT, host allocator growth) is captured once as a named
+  one-time charge (`DS4_MEM_RECONCILE_WARMUP_MB` pins it); the serial
+  session's memory row now publishes the allocator's own measured bytes
+  instead of the estimate once the graph commits.
+- Default context raised to 262144 on CUDA builds (was 32768; Metal/CPU
+  keep 32768). Rationale: with the v0.6 memory model a deep window is
+  demand-mapped and nearly free until used, while the old 32k default
+  was a footgun — a defaults boot could not fit even one long agentic
+  request (prompt plus the 32768-token decode budget assumed when
+  `max_tokens` is omitted). At 262144 the governed bank plan still
+  funds a healthy bank count (9 on the reference box). Users chasing
+  maximum concurrency for shallow batch work set `-c` low explicitly,
+  as they already tune the bank count. The default resolves after flag
+  parsing, so `--metal`/`--cpu` on a CUDA build get the conservative
+  default.
+- Weight-server manifest content identity (closes the limitation
+  chartered at v0.6.0): the manifest now carries a per-model content
+  fingerprint (`content <id> <size> <algo> <hex>`, strided FNV-1a
+  sample: full head and tail windows plus one page per 16 MiB) and the
+  engine verifies it against its own mapping of the model file before
+  importing any range. A weight server left holding a superseded
+  checkpoint of identical size is now refused loudly at boot instead
+  of feeding stale bytes silently. Old manifests without the record
+  still import, with a one-line notice; unknown fingerprint algos
+  downgrade to the same notice; `DS4_WEIGHT_FP_CHECK=0` disables
+  verification. This is mixup detection, not tamper-proofing: bytes
+  between sample windows are not covered.
 
 ## v0.6.1 — 2026-08-17
 
