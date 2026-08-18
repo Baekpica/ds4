@@ -35192,6 +35192,16 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                     floor_packed ? "packed" : "virtual",
                     (double)raw_capacity / 1073741824.0,
                     (double)floor_work / 1073741824.0);
+        /* v0.6.2 Inc 3: the victim-order boot disclosure (the default
+         * changed; per-trim lines never print on a quiet boot). */
+        if (ds4_batch_trim_enabled())
+            fprintf(stderr,
+                    "ds4: batch vmm: trim victim order=%s\n",
+                    ds4_batch_trim_victim_hist_order()
+                        ? "hist (shortest history; pre-v0.6.2)"
+                        : "recency blend (invalid > oldest activity > "
+                          "shortest history; DS4_BATCH_TRIM_VICTIM=hist "
+                          "restores)");
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
      * R2: sized by seq_cap (the committed-token bound), not the raw ring. */

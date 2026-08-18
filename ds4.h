@@ -993,14 +993,11 @@ typedef struct {
      * ds4_mem_own_trim_{calls,recovered_bytes}_total). */
     uint64_t mem_own_trim_calls;
     uint64_t mem_own_trim_recovered;
-    /* v0.6.2 Inc 0: the reconciliation line.  residual is SIGNED (stored
-     * through an int64 cast; porcelains render %lld) -- the ledger can
-     * over-explain as honestly as it under-explains.  flagged counts idle
-     * computes whose |residual| exceeded the tolerance; onetime is the
-     * named one-time-charge total (first-admit warmup) the compute
-     * subtracts. */
-    uint64_t mem_reconcile_residual;   /* gauge (int64 via cast) */
-    uint64_t mem_reconcile_onetime;    /* gauge */
+    /* v0.6.2 Inc 0: the reconciliation line.  ONE process counter --
+     * idle-tick computes whose |residual| exceeded the tolerance.  The
+     * residual/onetime values themselves are never stored here: /metrics
+     * and /v1/stats each render a FRESH compute from their own capture
+     * (a stored gauge would just be the idle tick's stale echo). */
     uint64_t mem_reconcile_flagged;    /* counter */
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;

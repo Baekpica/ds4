@@ -8456,9 +8456,14 @@ struct server {
      * the worker's idle tick never reads a half-written baseline; the
      * raw SOURCE is pinned at arm time (MemAvailable on integrated,
      * cuda-free otherwise) -- the max-of-two winner can flip sources
-     * mid-run and would corrupt the delta.  rec_onetime/rec_warmup_state
-     * are worker-owned after boot (atomic word reads from porcelains).
-     * Pure logging: nothing here feeds a verdict. */
+     * mid-run and would corrupt the delta.  rec_onetime and
+     * rec_warmup_state are worker-owned after boot; porcelains read
+     * both as atomic words, and the warmup capture stores onetime
+     * (relaxed) BEFORE state (release), so a reader that acquires
+     * state==captured is guaranteed to see the charge (readers load
+     * state FIRST for exactly this pairing).  The env-pin path writes
+     * both in main before the worker starts (happens-before via
+     * pthread_create).  Pure logging: nothing here feeds a verdict. */
     int      rec_supported;      /* baseline armed (atomic release/acquire) */
     int      rec_src;            /* ds4_mem_obs_source of the raw field */
     uint64_t rec_boot_raw;       /* raw source value at boot settle */
@@ -17000,10 +17005,13 @@ static void mem_reconcile_idle_tick(server *s, int final_line) {
      * tight the bracket was; DS4_MEM_RECONCILE_WARMUP_MB pins instead. */
     const uint64_t done = ds4_metric_read(&m->requests_completed) +
                           ds4_metric_read(&m->requests_failed);
-    if (s->rec_warmup_state == 0 && done > 0) {
+    if (__atomic_load_n(&s->rec_warmup_state, __ATOMIC_RELAXED) == 0 &&
+        done > 0) {
         const uint64_t w = r.residual > 0 ? (uint64_t)r.residual : 0;
+        /* Store order charge-then-state (release): a reader acquiring
+         * state==captured must see the charge (struct comment). */
         __atomic_store_n(&s->rec_onetime, w, __ATOMIC_RELAXED);
-        s->rec_warmup_state = 1;
+        __atomic_store_n(&s->rec_warmup_state, 1, __ATOMIC_RELEASE);
         onetime = w;
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: mem reconcile: first-admit warmup %.1f MiB "
@@ -17015,8 +17023,6 @@ static void mem_reconcile_idle_tick(server *s, int final_line) {
                                       s->rec_boot_census, now_census,
                                       onetime, s->rec_tol_bytes);
     }
-    ds4_metric_set(&m->mem_reconcile_residual, (uint64_t)r.residual);
-    ds4_metric_set(&m->mem_reconcile_onetime, onetime);
     if (r.flagged) ds4_metric_add(&m->mem_reconcile_flagged, 1);
     const int64_t moved = r.residual - s->rec_last_printed;
     const int64_t mvmag = moved < 0 ? -moved : moved;
@@ -17630,11 +17636,15 @@ static void send_stats(server *s, int fd, bool as_json) {
              * signed fields render as signed decimals. */
             {
                 ds4_mem_reconcile rr; uint64_t ot = 0, nraw = 0, ncen = 0;
+                /* state FIRST (acquire): pairs with the capture's
+                 * charge-then-state release so "captured" implies the
+                 * onetime the compute below loads is the charge. */
+                int ws = (int)__atomic_load_n(&s->rec_warmup_state,
+                                              __ATOMIC_ACQUIRE);
+                if (ws < 0 || ws > 2) ws = 0;
                 if (mem_reconcile_from(s, &img, &o, &rr, &ot, &nraw, &ncen)) {
                     static const char *wname[3] =
                         { "pending", "captured", "pinned" };
-                    int ws = s->rec_warmup_state;
-                    if (ws < 0 || ws > 2) ws = 0;
                     buf_printf(&b,
                         ",\"reconcile\":{\"supported\":true,\"source\":\"%s\","
                         "\"boot_raw\":%llu,\"now_raw\":%llu,"
@@ -27219,6 +27229,11 @@ static void test_mem_reconcile_arithmetic(void) {
      * counter errs HIGH, the tripwire convention). */
     r = ds4_mem_reconcile_compute(UINT64_MAX, 0, 0, 0, 0, 5);
     TEST_ASSERT(r.observed_delta == INT64_MAX && r.flagged);
+    /* Every signed STEP saturates too: max drop beside max census
+     * shrink would wrap the naive subtraction; it pins at +INT64_MAX. */
+    r = ds4_mem_reconcile_compute(UINT64_MAX, 0, UINT64_MAX, 0, 0, 5);
+    TEST_ASSERT(r.explained == -INT64_MAX);
+    TEST_ASSERT(r.residual == INT64_MAX && r.flagged);
 }
 
 #ifndef DS4_NO_GPU
