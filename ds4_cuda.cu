@@ -37860,6 +37860,155 @@ static __global__ void solar_kda_sequence_kernel(
     }
 }
 
+/* Production head_dim=128 decode/short-append path.  The 128x128 recurrent
+ * tile (64 KiB) is staged in shared memory for the whole launch: one global
+ * load at entry, one store at exit.  The two-pass update used to write the
+ * decayed tile back to DRAM and read it again; that extra 64 KiB trip is
+ * the traffic this kernel drops.  Dynamic smem is 73 KiB (padded rows so
+ * the 128-wide column walk is bank-conflict free). */
+#define SOLAR_KDA_HD 128u
+#define SOLAR_KDA_SSTATE_ROW 132u
+#define SOLAR_KDA_RESIDENT_SMEM                                                \
+    ((SOLAR_KDA_HD * SOLAR_KDA_SSTATE_ROW + 256u * 5u + SOLAR_KDA_HD) *        \
+     sizeof(float))
+
+static __global__ void solar_kda_sequence_resident_kernel(
+        float       *out,
+        float       *state,
+        float       *q_conv_state,
+        float       *k_conv_state,
+        float       *v_conv_state,
+        const float *q_raw,
+        const float *k_raw,
+        const float *v_raw,
+        const float *g_raw,
+        const float *beta_logits,
+        const float *q_conv_weight,
+        const float *k_conv_weight,
+        const float *v_conv_weight,
+        const float *decay_scale,
+        const float *dt_bias,
+        uint32_t     n_tokens,
+        uint32_t     n_head,
+        uint32_t     conv_kernel,
+        float        gate_lower_bound) {
+    extern __shared__ float sh[];
+    float *s_state = sh;
+    float *q_vec = s_state + SOLAR_KDA_HD * SOLAR_KDA_SSTATE_ROW;
+    float *k_vec = q_vec + 256u;
+    float *v_vec = k_vec + 256u;
+    float *q_sq = v_vec + 256u;
+    float *k_sq = q_sq + 256u;
+    float *s_exp = k_sq + 256u;
+
+    const uint32_t head = blockIdx.x;
+    const uint32_t dim = threadIdx.x;
+    const uint64_t channel = (uint64_t)head * SOLAR_KDA_HD + dim;
+    const uint64_t vector_count = (uint64_t)n_head * SOLAR_KDA_HD;
+    const uint64_t state_head = (uint64_t)head * SOLAR_KDA_HD * SOLAR_KDA_HD;
+
+    if (dim < SOLAR_KDA_HD) {
+        for (uint32_t key = 0; key < SOLAR_KDA_HD; key++) {
+            s_state[key * SOLAR_KDA_SSTATE_ROW + dim] =
+                state[state_head + (uint64_t)key * SOLAR_KDA_HD + dim];
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        float q = 0.0f;
+        float k = 0.0f;
+        float v = 0.0f;
+        if (dim < SOLAR_KDA_HD) {
+            float *qcs = q_conv_state + channel * conv_kernel;
+            float *kcs = k_conv_state + channel * conv_kernel;
+            float *vcs = v_conv_state + channel * conv_kernel;
+            for (uint32_t tap = 0; tap + 1u < conv_kernel; tap++) {
+                qcs[tap] = qcs[tap + 1u];
+                kcs[tap] = kcs[tap + 1u];
+                vcs[tap] = vcs[tap + 1u];
+            }
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            qcs[conv_kernel - 1u] = q_raw[token_base + channel];
+            kcs[conv_kernel - 1u] = k_raw[token_base + channel];
+            vcs[conv_kernel - 1u] = v_raw[token_base + channel];
+            const uint64_t weight_base = channel * conv_kernel;
+            for (uint32_t tap = 0; tap < conv_kernel; tap++) {
+                q += qcs[tap] * q_conv_weight[weight_base + tap];
+                k += kcs[tap] * k_conv_weight[weight_base + tap];
+                v += vcs[tap] * v_conv_weight[weight_base + tap];
+            }
+            q = solar_kda_silu(q);
+            k = solar_kda_silu(k);
+            v = solar_kda_silu(v);
+        }
+
+        q_vec[dim] = q;
+        k_vec[dim] = k;
+        v_vec[dim] = v;
+        q_sq[dim] = q * q;
+        k_sq[dim] = k * k;
+        __syncthreads();
+
+        for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+            if (dim < stride) {
+                q_sq[dim] += q_sq[dim + stride];
+                k_sq[dim] += k_sq[dim + stride];
+            }
+            __syncthreads();
+        }
+
+        if (dim < SOLAR_KDA_HD) {
+            const float q_inv =
+                rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)SOLAR_KDA_HD);
+            const float k_inv = rsqrtf(k_sq[0] + 1.0e-6f);
+            q_vec[dim] *= q_inv;
+            k_vec[dim] *= k_inv;
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            float gate = decay_scale[head] *
+                solar_kda_softplus(
+                    g_raw[token_base +
+                          (uint64_t)head * SOLAR_KDA_HD + dim] +
+                    dt_bias[(uint64_t)head * SOLAR_KDA_HD + dim]);
+            if (gate < gate_lower_bound) gate = gate_lower_bound;
+            s_exp[dim] = expf(gate);
+        }
+        __syncthreads();
+
+        if (dim < SOLAR_KDA_HD) {
+            const float beta = 2.0f /
+                (1.0f + expf(-beta_logits[(uint64_t)token * n_head + head]));
+            const uint64_t token_base = (uint64_t)token * vector_count;
+            float memory = 0.0f;
+            for (uint32_t key_dim = 0; key_dim < SOLAR_KDA_HD; key_dim++) {
+                const float decayed =
+                    s_state[key_dim * SOLAR_KDA_SSTATE_ROW + dim] *
+                    s_exp[key_dim];
+                s_state[key_dim * SOLAR_KDA_SSTATE_ROW + dim] = decayed;
+                memory += decayed * k_vec[key_dim];
+            }
+            const float delta = (v_vec[dim] - memory) * beta;
+            float result = 0.0f;
+            for (uint32_t key_dim = 0; key_dim < SOLAR_KDA_HD; key_dim++) {
+                const float updated =
+                    s_state[key_dim * SOLAR_KDA_SSTATE_ROW + dim] +
+                    k_vec[key_dim] * delta;
+                s_state[key_dim * SOLAR_KDA_SSTATE_ROW + dim] = updated;
+                result += updated * q_vec[key_dim];
+            }
+            out[token_base + (uint64_t)head * SOLAR_KDA_HD + dim] = result;
+        }
+        __syncthreads();
+    }
+
+    if (dim < SOLAR_KDA_HD) {
+        for (uint32_t key = 0; key < SOLAR_KDA_HD; key++) {
+            state[state_head + (uint64_t)key * SOLAR_KDA_HD + dim] =
+                s_state[key * SOLAR_KDA_SSTATE_ROW + dim];
+        }
+    }
+}
+
 static __global__ void solar_kda_banks_decode_kernel(
         float          *out,
         uint8_t        *state_slab,
@@ -37982,6 +38131,147 @@ static __global__ void solar_kda_banks_decode_kernel(
             result += updated * q_vec[key_dim];
         }
         out[token_base + (uint64_t)head * head_dim + dim] = result;
+    }
+}
+
+static __global__ void solar_kda_banks_decode_resident_kernel(
+        float          *out,
+        uint8_t        *state_slab,
+        uint64_t        state_bank_stride,
+        uint64_t        recurrent_offset,
+        uint64_t        q_conv_offset,
+        uint64_t        k_conv_offset,
+        uint64_t        v_conv_offset,
+        const uint32_t *bank_ids,
+        uint32_t        n_tokens,
+        uint32_t        max_banks,
+        const float    *q_raw,
+        const float    *k_raw,
+        const float    *v_raw,
+        const float    *g_raw,
+        const float    *beta_logits,
+        const float    *q_conv_weight,
+        const float    *k_conv_weight,
+        const float    *v_conv_weight,
+        const float    *decay_scale,
+        const float    *dt_bias,
+        uint32_t        n_head,
+        uint32_t        conv_kernel,
+        float           gate_lower_bound) {
+    extern __shared__ float sh_bank[];
+    float *s_state = sh_bank;
+    float *q_vec = s_state + SOLAR_KDA_HD * SOLAR_KDA_SSTATE_ROW;
+    float *k_vec = q_vec + 256u;
+    float *v_vec = k_vec + 256u;
+    float *q_sq = v_vec + 256u;
+    float *k_sq = q_sq + 256u;
+    float *s_exp = k_sq + 256u;
+
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t dim = threadIdx.x;
+    /* Every thread must reach the syncthreads below, so a dead bank or
+     * OOB token cannot return early. */
+    const bool in_range = token < n_tokens && head < n_head;
+    const uint32_t bank = in_range ? bank_ids[token] : 0u;
+    const bool live = in_range && bank < max_banks;
+    uint8_t *bank_state = state_slab + (uint64_t)bank * state_bank_stride;
+    float *state = (float *)(bank_state + recurrent_offset);
+    float *q_conv_state = (float *)(bank_state + q_conv_offset);
+    float *k_conv_state = (float *)(bank_state + k_conv_offset);
+    float *v_conv_state = (float *)(bank_state + v_conv_offset);
+    const uint64_t channel = (uint64_t)head * SOLAR_KDA_HD + dim;
+    const uint64_t vector_count = (uint64_t)n_head * SOLAR_KDA_HD;
+    const uint64_t token_base = (uint64_t)token * vector_count;
+    const uint64_t state_head = (uint64_t)head * SOLAR_KDA_HD * SOLAR_KDA_HD;
+
+    if (live && dim < SOLAR_KDA_HD) {
+        for (uint32_t key = 0; key < SOLAR_KDA_HD; key++) {
+            s_state[key * SOLAR_KDA_SSTATE_ROW + dim] =
+                state[state_head + (uint64_t)key * SOLAR_KDA_HD + dim];
+        }
+    }
+    __syncthreads();
+
+    float q = 0.0f;
+    float k = 0.0f;
+    float v = 0.0f;
+    if (live && dim < SOLAR_KDA_HD) {
+        float *qcs = q_conv_state + channel * conv_kernel;
+        float *kcs = k_conv_state + channel * conv_kernel;
+        float *vcs = v_conv_state + channel * conv_kernel;
+        for (uint32_t tap = 0; tap + 1u < conv_kernel; tap++) {
+            qcs[tap] = qcs[tap + 1u];
+            kcs[tap] = kcs[tap + 1u];
+            vcs[tap] = vcs[tap + 1u];
+        }
+        qcs[conv_kernel - 1u] = q_raw[token_base + channel];
+        kcs[conv_kernel - 1u] = k_raw[token_base + channel];
+        vcs[conv_kernel - 1u] = v_raw[token_base + channel];
+        const uint64_t weight_base = channel * conv_kernel;
+        for (uint32_t tap = 0; tap < conv_kernel; tap++) {
+            q += qcs[tap] * q_conv_weight[weight_base + tap];
+            k += kcs[tap] * k_conv_weight[weight_base + tap];
+            v += vcs[tap] * v_conv_weight[weight_base + tap];
+        }
+        q = solar_kda_silu(q);
+        k = solar_kda_silu(k);
+        v = solar_kda_silu(v);
+    }
+
+    q_vec[dim] = q;
+    k_vec[dim] = k;
+    v_vec[dim] = v;
+    q_sq[dim] = q * q;
+    k_sq[dim] = k * k;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+        if (dim < stride) {
+            q_sq[dim] += q_sq[dim + stride];
+            k_sq[dim] += k_sq[dim + stride];
+        }
+        __syncthreads();
+    }
+    if (live && dim < SOLAR_KDA_HD) {
+        const float q_inv =
+            rsqrtf(q_sq[0] + 1.0e-6f) * rsqrtf((float)SOLAR_KDA_HD);
+        const float k_inv = rsqrtf(k_sq[0] + 1.0e-6f);
+        q_vec[dim] *= q_inv;
+        k_vec[dim] *= k_inv;
+        float gate = decay_scale[head] *
+            solar_kda_softplus(
+                g_raw[token_base +
+                      (uint64_t)head * SOLAR_KDA_HD + dim] +
+                dt_bias[(uint64_t)head * SOLAR_KDA_HD + dim]);
+        if (gate < gate_lower_bound) gate = gate_lower_bound;
+        s_exp[dim] = expf(gate);
+    }
+    __syncthreads();
+
+    if (live && dim < SOLAR_KDA_HD) {
+        const float beta = 2.0f /
+            (1.0f + expf(-beta_logits[(uint64_t)token * n_head + head]));
+        float memory = 0.0f;
+        for (uint32_t key_dim = 0; key_dim < SOLAR_KDA_HD; key_dim++) {
+            const float decayed =
+                s_state[key_dim * SOLAR_KDA_SSTATE_ROW + dim] * s_exp[key_dim];
+            s_state[key_dim * SOLAR_KDA_SSTATE_ROW + dim] = decayed;
+            memory += decayed * k_vec[key_dim];
+        }
+        const float delta = (v_vec[dim] - memory) * beta;
+        float result = 0.0f;
+        for (uint32_t key_dim = 0; key_dim < SOLAR_KDA_HD; key_dim++) {
+            const float updated =
+                s_state[key_dim * SOLAR_KDA_SSTATE_ROW + dim] +
+                k_vec[key_dim] * delta;
+            s_state[key_dim * SOLAR_KDA_SSTATE_ROW + dim] = updated;
+            result += updated * q_vec[key_dim];
+        }
+        out[token_base + (uint64_t)head * SOLAR_KDA_HD + dim] = result;
+        for (uint32_t key = 0; key < SOLAR_KDA_HD; key++) {
+            state[state_head + (uint64_t)key * SOLAR_KDA_HD + dim] =
+                s_state[key * SOLAR_KDA_SSTATE_ROW + dim];
+        }
     }
 }
 
@@ -38965,6 +39255,45 @@ static int solar_kda_sequence_tensor(
 
     uint32_t threads = 1u;
     while (threads < head_dim) threads <<= 1u;
+    if (head_dim == SOLAR_KDA_HD) {
+        static int resident_attr = 0;
+        if (!resident_attr) {
+            const cudaError_t aerr = cudaFuncSetAttribute(
+                solar_kda_sequence_resident_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)SOLAR_KDA_RESIDENT_SMEM);
+            if (aerr != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: KDA resident smem attr failed: %s\n",
+                        cudaGetErrorString(aerr));
+                return 0;
+            }
+            resident_attr = 1;
+            fprintf(stderr,
+                    "ds4: Solar KDA decode keeps the 64 KiB state tile "
+                    "in shared memory\n");
+        }
+        solar_kda_sequence_resident_kernel<<<
+            n_head, threads, SOLAR_KDA_RESIDENT_SMEM,
+            ds4_current_stream()>>>(
+            (float *)out->ptr,
+            (float *)recurrent_state->ptr,
+            (float *)q_conv_state->ptr,
+            (float *)k_conv_state->ptr,
+            (float *)v_conv_state->ptr,
+            (const float *)q_raw->ptr,
+            (const float *)k_raw->ptr,
+            (const float *)v_raw->ptr,
+            (const float *)g_raw->ptr,
+            (const float *)beta_logits->ptr,
+            (const float *)q_conv_weight->ptr,
+            (const float *)k_conv_weight->ptr,
+            (const float *)v_conv_weight->ptr,
+            (const float *)decay_scale->ptr,
+            (const float *)dt_bias->ptr,
+            n_tokens, n_head, conv_kernel, gate_lower_bound);
+        return cuda_ok(cudaGetLastError(), what);
+    }
     solar_kda_sequence_kernel<<<n_head, threads, 0, ds4_current_stream()>>>(
             (float *)out->ptr,
             (float *)recurrent_state->ptr,
@@ -39081,6 +39410,38 @@ extern "C" int ds4_gpu_solar_kda_decode_banks_tensor(
     uint32_t threads = 1u;
     while (threads < head_dim) threads <<= 1u;
     dim3 grid(n_head, n_tokens, 1u);
+    if (head_dim == SOLAR_KDA_HD) {
+        static int resident_attr = 0;
+        if (!resident_attr) {
+            const cudaError_t aerr = cudaFuncSetAttribute(
+                solar_kda_banks_decode_resident_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)SOLAR_KDA_RESIDENT_SMEM);
+            if (aerr != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: KDA banked resident smem attr failed: %s\n",
+                        cudaGetErrorString(aerr));
+                return 0;
+            }
+            resident_attr = 1;
+        }
+        solar_kda_banks_decode_resident_kernel<<<
+            grid, threads, SOLAR_KDA_RESIDENT_SMEM,
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (uint8_t *)state_slab->ptr,
+            state_bank_stride, recurrent_offset, q_conv_offset,
+            k_conv_offset, v_conv_offset,
+            (const uint32_t *)bank_ids->ptr, n_tokens, max_banks,
+            (const float *)q_raw->ptr, (const float *)k_raw->ptr,
+            (const float *)v_raw->ptr, (const float *)g_raw->ptr,
+            (const float *)beta_logits->ptr,
+            (const float *)q_conv_weight->ptr,
+            (const float *)k_conv_weight->ptr,
+            (const float *)v_conv_weight->ptr,
+            (const float *)decay_scale->ptr, (const float *)dt_bias->ptr,
+            n_head, conv_kernel, gate_lower_bound);
+        return cuda_ok(cudaGetLastError(), "solar-open2 banked KDA decode");
+    }
     solar_kda_banks_decode_kernel<<<
         grid, threads, 0, ds4_current_stream()>>>(
         (float *)out->ptr, (uint8_t *)state_slab->ptr,
