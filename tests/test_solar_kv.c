@@ -538,6 +538,23 @@ int main(void) {
         for (size_t i = 0; i < l_q; i++) {
             CHECK(isfinite(l_pref[i]), "512-token prefill finite");
         }
+        {
+            /* Pair kernel (default) must match the one-head kernel. */
+            float *l_one = malloc(l_q * sizeof(float));
+            CHECK(l_one, "512-token one-head host alloc");
+            CHECK(setenv("DS4_SOLAR_FATTN_GQA2", "0", 1) == 0,
+                  "force one-head FATTN");
+            CHECK(ds4_gpu_solar_attention_prefill_tensor(
+                      dlout, dlq, dlcache, L_TOK, 0u, T_HEAD, T_HEAD_KV,
+                      T_DIM, L_CAP, 0u, DS4_SOLAR_KV_KFP8_VFP4),
+                  "512-token one-head prefill");
+            CHECK(ds4_gpu_tensor_read(dlout, 0, l_one, l_q * sizeof(float)),
+                  "read 512-token one-head");
+            CHECK(unsetenv("DS4_SOLAR_FATTN_GQA2") == 0, "restore GQA pair");
+            compare_vector("512-token GQA2 vs one-head", l_pref, l_one,
+                           l_q, 2.0e-5, 2.0e-5);
+            free(l_one);
+        }
         ds4_gpu_tensor *dlq_last = ds4_gpu_tensor_view(
             dlq, (uint64_t)(L_TOK - 1u) * l_row * sizeof(float),
             l_row * sizeof(float));

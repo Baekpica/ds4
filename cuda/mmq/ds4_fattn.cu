@@ -6,6 +6,13 @@
  * use m16n8k16 HMMA with online softmax between them. Compressed Solar
  * K/V is decoded once per shared tile with the per-row scale reused
  * across the 128 dims, so all 64 query rows share one dequant.
+ *
+ * When n_head/n_head_kv is even and at least 2, the GQA-pair kernel
+ * launches instead: grid.y = n_head/2, block 256. Warps 0-3 and 4-7
+ * own consecutive Q heads that share one KV head, so the same 32-key
+ * tile is dequantized once for both. Q stays in qa[] registers so the
+ * extra head does not push static shared memory past 48 KiB. Eight
+ * Q heads in one block still does not fit registers or shared memory.
  */
 #include "common.cuh"
 #include "mma.cuh"
@@ -522,6 +529,158 @@ __global__ void ds4_fattn_hmma_kernel(
     }
 }
 
+__device__ __forceinline__ void solar_fattn_load_qa(
+        tile_a        qa[FA_HD / 16],
+        const float  *q,
+        uint32_t      tq0,
+        uint32_t      n_tokens,
+        uint32_t      n_head,
+        uint32_t      h,
+        uint32_t      warp,
+        uint32_t      lane) {
+#pragma unroll
+    for (int kc = 0; kc < FA_HD / 16; kc++) {
+#pragma unroll
+        for (int l = 0; l < tile_a::ne; l++) {
+            const int i = (l % 2) * 8 + (int)(lane / 4);
+            const int j = (l / 2) * 4 + (int)(lane % 4);
+            const uint32_t row = warp * FA_WQ + (uint32_t)i;
+            const uint32_t col = (uint32_t)kc * 16u + 2u * (uint32_t)j;
+            const uint32_t t = tq0 + row < n_tokens ? tq0 + row : 0u;
+            const float2 xy = *reinterpret_cast<const float2 *>(
+                q + ((size_t)t * n_head + h) * FA_HD + col);
+            qa[kc].x[l] = __floats2half2_rn(xy.x, xy.y);
+        }
+    }
+}
+
+/* Two even-grouped Q heads share one dequantized K/V tile.  Eight warps:
+ * 0-3 own head 2*by, 4-7 own head 2*by+1.  Fragment loads use the local
+ * lane (threadIdx.x % 32), not raw threadIdx.x / 4, so warps 4-7 keep
+ * the same HMMA layout as warps 0-3. */
+template <int KV_FORMAT>
+__global__ void ds4_fattn_hmma_gqa2_kernel(
+        float * __restrict__ heads,
+        const float * __restrict__ q,
+        const void * __restrict__ kv,
+        const uint64_t row_bytes,
+        const uint32_t n_tokens,
+        const uint32_t pos0,
+        const uint32_t n_head,
+        const uint32_t n_head_kv,
+        const uint32_t kv_cap,
+        const uint32_t window,
+        const float scale) {
+    constexpr uint32_t N_Q = 2u;
+    constexpr uint32_t GROUP_THREADS = (uint32_t)FA_WARPS * 32u;
+    const uint32_t tq0 = blockIdx.x * FA_TQ;
+    const uint32_t h0 = blockIdx.y * N_Q;
+    if (tq0 >= n_tokens || h0 + 1u >= n_head) return;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t kvh = h0 / group;
+    const uint32_t kv_dim = n_head_kv * FA_HD;
+    const uint32_t local = threadIdx.x % GROUP_THREADS;
+    const uint32_t hi = threadIdx.x / GROUP_THREADS;
+    const uint32_t h = h0 + hi;
+    const uint32_t warp = local >> 5;
+    const uint32_t lane = local & 31u;
+
+    __shared__ __half s_k[FA_TK][FA_ROW];
+    __shared__ __half s_v[FA_TK][FA_ROW];
+    static_assert(sizeof(s_k) + sizeof(s_v) + 2u * sizeof(uint32_t) <=
+                      49152u,
+                  "GQA-pair FATTN must stay under 48 KiB static shared");
+
+    tile_a qa[FA_HD / 16];
+    solar_fattn_load_qa(qa, q, tq0, n_tokens, n_head, h, warp, lane);
+
+    const uint32_t qrow[2] = {
+        warp * FA_WQ + lane / 4,
+        warp * FA_WQ + lane / 4 + 8u,
+    };
+    uint32_t qpos[2], qfirst[2];
+    bool alive[2];
+    float row_m[2], row_l[2];
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        alive[r] = tq0 + qrow[r] < n_tokens;
+        qpos[r] = alive[r] ? pos0 + tq0 + qrow[r] : pos0;
+        qfirst[r] = window && qpos[r] + 1u > window
+            ? qpos[r] + 1u - window : 0u;
+        row_m[r] = -INFINITY;
+        row_l[r] = 0.0f;
+    }
+
+    tile_c output[FA_HD / 8];
+    uint32_t block_first = 0xffffffffu;
+    uint32_t block_last = 0u;
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        if (!alive[r]) continue;
+        block_first = min(block_first, qfirst[r]);
+        block_last = max(block_last, qpos[r]);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        block_first = min(
+            block_first,
+            __shfl_xor_sync(0xffffffffu, block_first, offset));
+        block_last = max(
+            block_last,
+            __shfl_xor_sync(0xffffffffu, block_last, offset));
+    }
+    __shared__ uint32_t shared_first;
+    __shared__ uint32_t shared_last;
+    if (threadIdx.x == 0u) {
+        shared_first = 0xffffffffu;
+        shared_last = 0u;
+    }
+    __syncthreads();
+    if (lane == 0u) {
+        atomicMin(&shared_first, block_first);
+        atomicMax(&shared_last, block_last);
+    }
+    __syncthreads();
+    block_first = shared_first;
+    block_last = shared_last;
+    if (block_first == 0xffffffffu) return;
+
+    for (uint32_t kt0 = block_first; kt0 <= block_last; kt0 += FA_TK) {
+        const uint32_t remaining = block_last - kt0 + 1u;
+        const uint32_t tile_len = remaining < (uint32_t)FA_TK
+            ? remaining : (uint32_t)FA_TK;
+        solar_fattn_fill_kv_tile<KV_FORMAT>(
+            s_k, s_v, kv, row_bytes, n_head_kv, kvh, kv_dim, kv_cap,
+            kt0, tile_len);
+        __syncthreads();
+        const uint32_t first_len = tile_len < (uint32_t)FA_CONSUME
+            ? tile_len : (uint32_t)FA_CONSUME;
+        solar_fattn_consume_16(
+            output, row_m, row_l, qa, s_k, s_v, alive, qpos, qfirst,
+            kt0, first_len, lane, scale);
+        if (tile_len > (uint32_t)FA_CONSUME) {
+            solar_fattn_consume_16(
+                output, row_m, row_l, qa, s_k + FA_CONSUME, s_v + FA_CONSUME,
+                alive, qpos, qfirst, kt0 + (uint32_t)FA_CONSUME,
+                tile_len - (uint32_t)FA_CONSUME, lane, scale);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int cb = 0; cb < FA_HD / 8; cb++) {
+#pragma unroll
+        for (int l = 0; l < tile_c::ne; l++) {
+            const int r = l / 2;
+            if (!alive[r] || row_l[r] <= 0.0f) continue;
+            const uint32_t token = tq0 + qrow[r];
+            const int col = (int)(lane % 4) * 2 + (l % 2);
+            heads[((size_t)token * n_head + h) * FA_HD + cb * 8 + col] =
+                output[cb].x[l] / row_l[r];
+        }
+    }
+}
+
 enum {
     M3_FA_QK     = 192,
     M3_FA_V      = 128,
@@ -793,6 +952,40 @@ void motif3_fattn_hmma_kernel(
 
 }  // namespace
 
+static int solar_fattn_gqa_pair(int n_head, int n_head_kv) {
+    if (n_head_kv <= 0 || n_head % n_head_kv != 0) return 0;
+    const int group = n_head / n_head_kv;
+    if (group < 2 || (group % 2) != 0) return 0;
+    /* Diagnostic only: DS4_SOLAR_FATTN_GQA2=0 restores the one-head
+     * kernel so tests can compare the pair path against it. */
+    const char *value = getenv("DS4_SOLAR_FATTN_GQA2");
+    if (value && value[0] == '0') return 0;
+    return 1;
+}
+
+template <int FORMAT>
+static void solar_fattn_launch(
+        float *heads, const float *q, const void *kv, uint64_t row_bytes,
+        int n_tokens, int pos0, int n_head, int n_head_kv, int kv_cap,
+        int window, float scale, cudaStream_t stream) {
+    const int tiles = (n_tokens + FA_TQ - 1) / FA_TQ;
+    if (solar_fattn_gqa_pair(n_head, n_head_kv)) {
+        const dim3 grid(tiles, n_head / 2, 1);
+        ds4_fattn_hmma_gqa2_kernel<FORMAT>
+            <<<grid, FA_WARPS * 32 * 2, 0, stream>>>(
+                heads, q, kv, row_bytes, (uint32_t)n_tokens,
+                (uint32_t)pos0, (uint32_t)n_head, (uint32_t)n_head_kv,
+                (uint32_t)kv_cap, (uint32_t)window, scale);
+        return;
+    }
+    const dim3 grid(tiles, n_head, 1);
+    ds4_fattn_hmma_kernel<FORMAT>
+        <<<grid, FA_WARPS * 32, 0, stream>>>(
+            heads, q, kv, row_bytes, (uint32_t)n_tokens, (uint32_t)pos0,
+            (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)kv_cap,
+            (uint32_t)window, scale);
+}
+
 extern "C" int ds4_mmq_exaone_prefill_attn_hmma(
         float *heads, const float *q, const void *kv,
         int n_tokens, int pos0, int n_head, int n_head_kv, int head_dim,
@@ -804,12 +997,9 @@ extern "C" int ds4_mmq_exaone_prefill_attn_hmma(
     }
     const int device = ggml_cuda_get_device();
     if (ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_AMPERE) return -1;
-    const dim3 grid((n_tokens + FA_TQ - 1) / FA_TQ, n_head, 1);
-    ds4_fattn_hmma_kernel<SOLAR_KV_BF16>
-        <<<grid, FA_WARPS * 32, 0, stream>>>(
-            heads, q, kv, 0u, (uint32_t)n_tokens, (uint32_t)pos0,
-            (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)kv_cap,
-            (uint32_t)window, scale);
+    solar_fattn_launch<SOLAR_KV_BF16>(
+        heads, q, kv, 0u, n_tokens, pos0, n_head, n_head_kv, kv_cap,
+        window, scale, stream);
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 
@@ -826,27 +1016,25 @@ extern "C" int ds4_mmq_solar_prefill_attn_hmma(
     }
     const int device = ggml_cuda_get_device();
     if (ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_AMPERE) return -1;
-    const dim3 grid((n_tokens + FA_TQ - 1) / FA_TQ, n_head, 1);
-#define DS4_SOLAR_FATTN_LAUNCH(FORMAT)                                      \
-    ds4_fattn_hmma_kernel<FORMAT>                                           \
-        <<<grid, FA_WARPS * 32, 0, stream>>>(                               \
-            heads, q, kv, (uint64_t)row_bytes,                              \
-            (uint32_t)n_tokens, (uint32_t)pos0, (uint32_t)n_head,           \
-            (uint32_t)n_head_kv, (uint32_t)kv_cap, (uint32_t)window, scale)
     switch (format) {
     case SOLAR_KV_FP8:
-        DS4_SOLAR_FATTN_LAUNCH(SOLAR_KV_FP8);
+        solar_fattn_launch<SOLAR_KV_FP8>(
+            heads, q, kv, (uint64_t)row_bytes, n_tokens, pos0, n_head,
+            n_head_kv, kv_cap, window, scale, stream);
         break;
     case SOLAR_KV_FP4:
-        DS4_SOLAR_FATTN_LAUNCH(SOLAR_KV_FP4);
+        solar_fattn_launch<SOLAR_KV_FP4>(
+            heads, q, kv, (uint64_t)row_bytes, n_tokens, pos0, n_head,
+            n_head_kv, kv_cap, window, scale, stream);
         break;
     case SOLAR_KV_KFP8_VFP4:
-        DS4_SOLAR_FATTN_LAUNCH(SOLAR_KV_KFP8_VFP4);
+        solar_fattn_launch<SOLAR_KV_KFP8_VFP4>(
+            heads, q, kv, (uint64_t)row_bytes, n_tokens, pos0, n_head,
+            n_head_kv, kv_cap, window, scale, stream);
         break;
     default:
         return -1;
     }
-#undef DS4_SOLAR_FATTN_LAUNCH
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 
