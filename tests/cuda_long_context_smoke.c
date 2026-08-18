@@ -19,10 +19,8 @@ static double getenv_seconds(const char *name, double fallback) {
     return end != s && v > 0.0 ? v : fallback;
 }
 
-static int check_large_topk(void) {
-    const uint32_t n_comp = 32768;
-    const uint32_t n_tokens = 32;
-    const uint32_t top_k = 512;
+static int check_large_topk(uint32_t n_comp, uint32_t n_tokens,
+                            uint32_t top_k, const char *limit_env) {
     const uint64_t score_count = (uint64_t)n_comp * n_tokens;
     float *scores_host = (float *)malloc((size_t)score_count * sizeof(float));
     uint32_t *selected_host = (uint32_t *)malloc((size_t)n_tokens * top_k * sizeof(uint32_t));
@@ -64,7 +62,7 @@ static int check_large_topk(void) {
         }
     }
     if (rc == 0) {
-        const double max_seconds = getenv_seconds("DS4_CUDA_TOPK_REGRESSION_SEC", 2.0);
+        const double max_seconds = getenv_seconds(limit_env, 2.0);
         fprintf(stderr, "cuda-regression: top-k n_comp=%u n_tokens=%u elapsed=%.3fs\n",
                 n_comp, n_tokens, elapsed);
         if (elapsed > max_seconds) {
@@ -156,7 +154,10 @@ static int check_decode_attention_overflow_path(void) {
 
 int main(void) {
     if (!ds4_gpu_init()) return 1;
-    int rc = check_large_topk();
+    int rc = check_large_topk(32768u, 32u, 512u,
+                              "DS4_CUDA_TOPK_REGRESSION_SEC");
+    if (check_large_topk(12288u, 4u, 2048u,
+                         "DS4_CUDA_TOPK2048_REGRESSION_SEC") != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");

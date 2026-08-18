@@ -49,7 +49,6 @@ enum {
      * becomes an out-of-bounds write at long context. */
     DS4_CUDA_ATTENTION_SCORE_CAP = 8192u,
     DS4_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
-    DS4_CUDA_TOPK_MERGE_GROUP = 8u
 };
 
 struct ds4_gpu_tensor {
@@ -18963,10 +18962,10 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                            n_band, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
-    if (top_k == 512u && n_spec <= 8192u &&
+    if ((top_k == 512u || top_k == 2048u) && n_spec <= 8192u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
-        if (n_spec > 4096u) {
+        if (n_spec > 4096u || top_k == 2048u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
             int dev = 0;
@@ -19049,17 +19048,19 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         }
         /* fall through into the chunked-tree tier */
     }
-    if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+    if ((top_k == 512u || top_k == 2048u) &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
         const uint32_t chunk_n = 4096u;
+        const uint32_t merge_group = chunk_n / top_k;
         /* Chunk count sized off n_spec so captured grid covers any future
          * n_actual; chunk_pow2 kernel early-returns/masks past n_actual. */
         const uint32_t n_chunks = (n_spec + chunk_n - 1u) / chunk_n;
         const uint32_t candidate_stride = n_chunks * top_k;
         uint32_t n_sets = n_chunks;
         uint64_t scratch_u32_per_token = candidate_stride;
-        while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
-            n_sets = (n_sets + DS4_CUDA_TOPK_MERGE_GROUP - 1u) / DS4_CUDA_TOPK_MERGE_GROUP;
+        while (n_sets > merge_group) {
+            n_sets = (n_sets + merge_group - 1u) / merge_group;
             scratch_u32_per_token += (uint64_t)n_sets * top_k;
         }
         if (scratch_u32_per_token > UINT64_MAX / n_tokens / sizeof(uint32_t)) return 0;
@@ -19080,8 +19081,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                     ls);
         if (!cuda_ok(cudaGetLastError(), "indexer topk chunk launch")) return 0;
 
-        while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
-            const uint32_t next_sets = (n_sets + DS4_CUDA_TOPK_MERGE_GROUP - 1u) / DS4_CUDA_TOPK_MERGE_GROUP;
+        while (n_sets > merge_group) {
+            const uint32_t next_sets = (n_sets + merge_group - 1u) / merge_group;
             const uint32_t next_stride = next_sets * top_k;
             uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
             dim3 grid_merge(n_tokens, next_sets, 1);
@@ -19093,7 +19094,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                     n_tokens,
                     top_k,
                     n_sets,
-                    DS4_CUDA_TOPK_MERGE_GROUP,
+                    merge_group,
                     cur_stride,
                     next_stride,
                     ls);
