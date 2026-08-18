@@ -511,6 +511,14 @@ cheapest to restore), not refused. Decode measured at parity with an empty box a
 cost was about 4.3 KiB per token of resident context at the deep shape
 (4.8 at 450k banks; deeper banks amortize the page floors).
 
+The window itself reaches the model's full million: at `-c 1048576`
+(the checkpoint's exact YaRN window, 65536 x 16) a single conversation
+of **975,246 tokens** was admitted and then continued warm in place,
+with a 2.0 s time to first token and 453 tokens decoded at 88 ms per
+token at that depth, speculative decoding still accepting 63 percent
+of its drafts. The last ~30k tokens up to the absolute 1,048,576
+limit are not yet qualified.
+
 Two decisions cover most operator needs: the context limit `-c` (the
 per-request ceiling; prompt plus decode budget must fit under it) and
 the bank count (how many requests hold warm context at once; an
