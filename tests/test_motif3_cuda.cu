@@ -590,13 +590,14 @@ static void test_latent_gdla() {
     const char *dots_profile = std::getenv("DS4_DOTS3_PROFILE_ATTN");
     const bool dots_full = dots_profile && !std::strcmp(dots_profile, "full");
     const bool dots_swa = dots_profile && !std::strcmp(dots_profile, "swa");
-    if (dots_profile && !dots_full && !dots_swa) {
+    const bool dots_dsa = dots_profile && !std::strcmp(dots_profile, "dsa");
+    if (dots_profile && !dots_full && !dots_swa && !dots_dsa) {
         fprintf(stderr, "invalid DS4_DOTS3_PROFILE_ATTN=%s\n", dots_profile);
         std::exit(2);
     }
     const bool profile_only = (profile_rows_env && profile_rows_env[0]) ||
-        dots_full || dots_swa;
-    uint32_t rows = dots_profile ? 1600u : 6u;
+        dots_full || dots_swa || dots_dsa;
+    uint32_t rows = dots_dsa ? 16u : dots_profile ? 1600u : 6u;
     if (profile_rows_env && profile_rows_env[0]) {
         char *end = nullptr;
         const unsigned long parsed = std::strtoul(profile_rows_env, &end, 10);
@@ -606,7 +607,8 @@ static void test_latent_gdla() {
         }
         rows = (uint32_t)parsed;
     }
-    const uint32_t q_heads = dots_full ? 128u : dots_swa ? 64u : 80u;
+    const uint32_t q_heads = (dots_full || dots_dsa) ? 128u :
+        dots_swa ? 64u : 80u;
     const uint32_t kv_heads = dots_profile ? q_heads : 16u;
     const uint32_t group = dots_profile ? 1u : 5u;
     const uint32_t latent_dim = dots_swa ? 1024u : 512u;
@@ -649,6 +651,13 @@ static void test_latent_gdla() {
     std::vector<float> kv_raw((size_t)rows * kv_raw_dim);
     std::vector<float> inv(rope_dim / 2u);
     std::vector<int32_t> positions(rows);
+    std::vector<int32_t> selected;
+    if (dots_dsa) {
+        selected.assign((size_t)rows * rows, (int32_t)rows);
+        for (uint32_t t = 0; t < rows; t++)
+            for (uint32_t j = 0; j <= t; j++)
+                selected[(size_t)t * rows + j] = (int32_t)j;
+    }
     for (size_t i = 0; i < q_raw.size(); i++)
         q_raw[i] = (float)((int32_t)((i * 29u + 11u) % 257u) - 128) / 256.0f;
     for (size_t i = 0; i < kv_norm.size(); i++)
@@ -704,12 +713,19 @@ static void test_latent_gdla() {
     gpu_tensor k_pe_cache((uint64_t)rows * rope_dim * sizeof(uint16_t));
     gpu_tensor q_absorbed((uint64_t)rows * q_heads * latent_dim * sizeof(float));
     gpu_tensor latent_out((uint64_t)rows * q_heads * latent_dim * sizeof(float));
+    gpu_tensor latent_ref(dots_dsa
+        ? (uint64_t)rows * q_heads * latent_dim * sizeof(float)
+        : sizeof(float));
+    gpu_tensor selected_gpu(dots_dsa
+        ? (uint64_t)rows * rows * sizeof(int32_t) : sizeof(int32_t));
     gpu_tensor heads((uint64_t)rows * q_heads * value_dim * sizeof(float));
     if (!ds4_gpu_tensor_write(q_raw_gpu.p, 0, q_raw.data(), q_raw.size() * sizeof(float)) ||
         !ds4_gpu_tensor_write(kv_norm_gpu.p, 0, kv_norm.data(), kv_norm.size() * sizeof(float)) ||
         !ds4_gpu_tensor_write(kv_raw_gpu.p, 0, kv_raw.data(), kv_raw.size() * sizeof(float)) ||
         !ds4_gpu_tensor_write(positions_gpu.p, 0, positions.data(), positions.size() * sizeof(int32_t)) ||
-        !ds4_gpu_tensor_write(inv_gpu.p, 0, inv.data(), inv.size() * sizeof(float))) {
+        !ds4_gpu_tensor_write(inv_gpu.p, 0, inv.data(), inv.size() * sizeof(float)) ||
+        (dots_dsa && !ds4_gpu_tensor_write(
+            selected_gpu.p, 0, selected.data(), selected.size() * sizeof(int32_t)))) {
         fprintf(stderr, "latent GDLA upload failed\n"); std::exit(1);
     }
     if (!ds4_gpu_motif3_prepare_q_tensor(q_full_gpu.p, q_raw_gpu.p,
@@ -734,16 +750,26 @@ static void test_latent_gdla() {
      * expanding only the token axis used by a real prefill chunk. */
     if (profile_only) {
         const float scale = 1.0f / std::sqrt((float)key_dim);
-        const bool attention_ok = dots_profile
+        bool attention_ok = true;
+        if (dots_dsa) {
+            attention_ok = ds4_gpu_dots3_latent_attention_tensor(
+                latent_ref.p, q_full_gpu.p, q_absorbed.p,
+                latent_cache.p, k_pe_cache.p, nullptr, 0u,
+                rows, 0u, rows, 0u, q_heads, latent_dim,
+                qk_nope, rope_dim, scale);
+        }
+        attention_ok = attention_ok && (dots_profile
             ? ds4_gpu_dots3_latent_attention_tensor(
                   latent_out.p, q_full_gpu.p, q_absorbed.p,
-                  latent_cache.p, k_pe_cache.p, nullptr, 0u,
-                  rows, 0u, rows, dots_swa ? 513u : 0u,
-                  q_heads, latent_dim, qk_nope, rope_dim, scale)
+                  latent_cache.p, k_pe_cache.p,
+                  dots_dsa ? selected_gpu.p : nullptr,
+                  dots_dsa ? rows : 0u, rows, 0u, rows,
+                  dots_swa ? 513u : 0u, q_heads, latent_dim,
+                  qk_nope, rope_dim, scale)
             : ds4_gpu_motif3_latent_attention_bf16_tensor(
                   latent_out.p, q_full_gpu.p, q_absorbed.p,
                   latent_cache.p, k_pe_cache.p, rows, 0, rows, 0,
-                  q_heads, latent_dim, qk_nope, rope_dim, scale);
+                  q_heads, latent_dim, qk_nope, rope_dim, scale));
         if (!attention_ok ||
             !ds4_gpu_motif3_value_project_q8_0_tensor(
                     heads.p, latent_out.p, model.data(), model.size(), 0,
@@ -756,6 +782,17 @@ static void test_latent_gdla() {
         if (!ds4_gpu_tensor_read(heads.p, 0, &sync, sizeof(sync)) || !std::isfinite(sync)) {
             fprintf(stderr, "latent GDLA profile synchronization failed\n");
             std::exit(1);
+        }
+        if (dots_dsa) {
+            auto ref = download_f32(
+                latent_ref, (uint64_t)rows * q_heads * latent_dim);
+            auto got = download_f32(
+                latent_out, (uint64_t)rows * q_heads * latent_dim);
+            if (std::memcmp(ref.data(), got.data(),
+                            ref.size() * sizeof(float))) {
+                fprintf(stderr, "dots3 DSA/full latent parity failed\n");
+                std::exit(1);
+            }
         }
         printf("%s NCU attention profile: rows=%u, q_heads=%u, "
                "latent_dim=%u, finite output\n",

@@ -34924,7 +34924,7 @@ extern "C" int ds4_gpu_dots3_store_latent_kpe_tensor(
  * groups so both the 512-wide full layers and the 1024-wide SWA layers fit.
  * With `selected` the walk visits the DSA top-k ids (skipping non-causal
  * filler); otherwise it walks the window/causal range like Motif-3. */
-template <uint32_t kGroups>
+template <uint32_t kGroups, bool kUseSelection, bool kUseWindow>
 __global__ static void dots3_latent_attention_kernel(
         float *out, const float *q, const float *q_absorbed,
         const __nv_bfloat16 *latent_cache, const __nv_bfloat16 *k_pe_cache,
@@ -34943,7 +34943,7 @@ __global__ static void dots3_latent_attention_kernel(
 
     const uint32_t qpos = pos0 + token;
     const uint32_t end = qpos + 1u;
-    const uint32_t visible = window ? min(end, window) : end;
+    const uint32_t visible = kUseWindow ? min(end, window) : end;
     const uint32_t first = end - visible;
     const uint32_t key_dim = qk_nope + qk_rope;
     const float *qh = q + ((uint64_t)token * q_heads + head) * key_dim;
@@ -34965,10 +34965,10 @@ __global__ static void dots3_latent_attention_kernel(
     float4 o[storage_groups];
 #pragma unroll
     for (uint32_t g = 0; g < groups; g++) o[g] = make_float4(0.f, 0.f, 0.f, 0.f);
-    const uint32_t count = selected ? sel_stride : visible;
+    const uint32_t count = kUseSelection ? sel_stride : visible;
     for (uint32_t j = 0; j < count; j++) {
         uint32_t logical;
-        if (selected) {
+        if constexpr (kUseSelection) {
             const int32_t id = selected[(uint64_t)token * sel_stride + j];
             /* Top-k filler rows carry non-causal ids; the official sparse
              * fallback masks them with token_indices <= cache_position. */
@@ -34977,7 +34977,7 @@ __global__ static void dots3_latent_attention_kernel(
         } else {
             logical = first + j;
         }
-        const uint32_t slot = window ? logical % cache_cap : logical;
+        const uint32_t slot = kUseWindow ? logical % cache_cap : logical;
         if (slot >= cache_cap) continue;
         const __nv_bfloat16 *kvrow = latent_cache + (uint64_t)slot * latent_dim;
         float partial = 0.0f;
@@ -35044,8 +35044,9 @@ extern "C" int ds4_gpu_dots3_latent_attention_tensor(
         k_pe_cache->bytes <
             (uint64_t)cache_cap * qk_rope * sizeof(__nv_bfloat16)) return 0;
     dim3 grid((q_heads + 7u) / 8u, rows, 1);
-#define D3_LAUNCH(groups_)                                                   \
-    dots3_latent_attention_kernel<groups_><<<grid, 256>>>(                   \
+#define D3_LAUNCH(groups_, selection_, window_)                              \
+    dots3_latent_attention_kernel<groups_, selection_, window_>              \
+        <<<grid, 256>>>(                                                      \
             (float *)out->ptr, (const float *)q->ptr,                        \
             (const float *)q_absorbed->ptr,                                  \
             (const __nv_bfloat16 *)latent_cache->ptr,                        \
@@ -35053,9 +35054,16 @@ extern "C" int ds4_gpu_dots3_latent_attention_tensor(
             selected ? (const int32_t *)selected->ptr : NULL, sel_stride,    \
             rows, pos0, cache_cap, window, q_heads, latent_dim,              \
             qk_nope, qk_rope, scale)
-    if (latent_dim == 512u) D3_LAUNCH(4u);
-    else if (latent_dim == 1024u) D3_LAUNCH(8u);
-    else D3_LAUNCH(0u);
+#define D3_LAUNCH_GEOMETRY(selection_, window_) do {                         \
+        if (latent_dim == 512u) D3_LAUNCH(4u, selection_, window_);          \
+        else if (latent_dim == 1024u) D3_LAUNCH(8u, selection_, window_);    \
+        else D3_LAUNCH(0u, selection_, window_);                             \
+    } while (0)
+    if (selected && window) D3_LAUNCH_GEOMETRY(true, true);
+    else if (selected) D3_LAUNCH_GEOMETRY(true, false);
+    else if (window) D3_LAUNCH_GEOMETRY(false, true);
+    else D3_LAUNCH_GEOMETRY(false, false);
+#undef D3_LAUNCH_GEOMETRY
 #undef D3_LAUNCH
     return cuda_ok(cudaGetLastError(), "dots3 latent attention launch");
 }
