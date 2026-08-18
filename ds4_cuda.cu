@@ -36794,9 +36794,10 @@ static __global__ void solar_attention_split_warp_kernel(
  * split kernel above therefore dequantizes and reads the same packed K/V row
  * eight times.  This grouped kernel assigns one block to a KV head and two
  * query heads to each warp.  A small key tile is decoded once into shared
- * memory, then all query heads reuse it.  The online-softmax state remains
- * independent per query head and the partial layout is unchanged, so the
- * existing combine kernel remains the oracle/fallback seam. */
+ * memory, then all query heads reuse it.  Production tiles are 32 keys
+ * with one K/V scale and a 4-wide packed load per key.  Online-softmax
+ * state stays independent per query head and the partial layout is
+ * unchanged, so the existing combine kernel remains the fallback. */
 template <int KEY_TILE>
 static __device__ __forceinline__ void
 solar_attention_gqa_grouped_split_block(
@@ -36845,24 +36846,69 @@ solar_attention_gqa_grouped_split_block(
 
     __shared__ float shared_k[KEY_TILE][HEAD_DIM];
     __shared__ float shared_v[KEY_TILE][HEAD_DIM];
+    __shared__ float scale_k[KEY_TILE];
+    __shared__ float scale_v[KEY_TILE];
     for (uint32_t tile_first = chunk_first; tile_first <= chunk_last;
          tile_first += KEY_TILE) {
         const uint32_t tile_count =
             chunk_last - tile_first + 1u < (uint32_t)KEY_TILE
                 ? chunk_last - tile_first + 1u : (uint32_t)KEY_TILE;
-        const uint32_t tile_values = tile_count * HEAD_DIM * 2u;
-        for (uint32_t idx = threadIdx.x; idx < tile_values;
-             idx += blockDim.x) {
-            const uint32_t key = idx / (HEAD_DIM * 2u);
-            const uint32_t rem = idx - key * HEAD_DIM * 2u;
-            const bool value = rem >= HEAD_DIM;
-            const uint32_t dim = value ? rem - HEAD_DIM : rem;
-            const uint8_t *row = kv +
-                (uint64_t)((tile_first + key) % kv_cap) * row_bytes;
-            const float decoded = solar_kv_load(
-                row, format, n_head_kv, HEAD_DIM, kv_head, dim, value);
-            if (value) shared_v[key][dim] = decoded;
-            else shared_k[key][dim] = decoded;
+        /* Production K-FP8/V-FP4: one scale per key, then 4-wide packed
+         * loads.  Other formats keep the scalar helper. */
+        if (format == (uint32_t)DS4_SOLAR_KV_KFP8_VFP4) {
+            const uint64_t k_bytes = (uint64_t)n_head_kv * HEAD_DIM;
+            if (threadIdx.x < tile_count) {
+                const uint8_t *row = kv +
+                    (uint64_t)((tile_first + threadIdx.x) % kv_cap) *
+                    row_bytes;
+                const __half *scales =
+                    (const __half *)(row + k_bytes + k_bytes / 2u);
+                scale_k[threadIdx.x] = __half2float(scales[kv_head]);
+                scale_v[threadIdx.x] =
+                    __half2float(scales[n_head_kv + kv_head]);
+            }
+            __syncthreads();
+            constexpr uint32_t NGRP = HEAD_DIM / 4u;
+            for (uint32_t idx = threadIdx.x; idx < tile_count * NGRP;
+                 idx += blockDim.x) {
+                const uint32_t key = idx / NGRP;
+                const uint32_t c = (idx - key * NGRP) * 4u;
+                const uint8_t *row = kv +
+                    (uint64_t)((tile_first + key) % kv_cap) * row_bytes;
+                const uint64_t kbase = (uint64_t)kv_head * HEAD_DIM + c;
+                const uint32_t kpack =
+                    *reinterpret_cast<const uint32_t *>(row + kbase);
+                const uint16_t vpack =
+                    *reinterpret_cast<const uint16_t *>(
+                        row + k_bytes + (kbase >> 1u));
+                const float sk = scale_k[key];
+                const float sv = scale_v[key];
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const uint8_t kc = (uint8_t)(kpack >> (8 * i));
+                    const uint8_t vc =
+                        (uint8_t)((vpack >> (4 * i)) & 0x0fu);
+                    shared_k[key][c + (uint32_t)i] =
+                        solar_e4m3fn_decode(kc) * sk;
+                    shared_v[key][c + (uint32_t)i] =
+                        solar_e2m1_decode(vc) * sv;
+                }
+            }
+        } else {
+            const uint32_t tile_values = tile_count * HEAD_DIM * 2u;
+            for (uint32_t idx = threadIdx.x; idx < tile_values;
+                 idx += blockDim.x) {
+                const uint32_t key = idx / (HEAD_DIM * 2u);
+                const uint32_t rem = idx - key * HEAD_DIM * 2u;
+                const bool value = rem >= HEAD_DIM;
+                const uint32_t dim = value ? rem - HEAD_DIM : rem;
+                const uint8_t *row = kv +
+                    (uint64_t)((tile_first + key) % kv_cap) * row_bytes;
+                const float decoded = solar_kv_load(
+                    row, format, n_head_kv, HEAD_DIM, kv_head, dim, value);
+                if (value) shared_v[key][dim] = decoded;
+                else shared_k[key][dim] = decoded;
+            }
         }
         __syncthreads();
 
@@ -37488,7 +37534,7 @@ extern "C" int ds4_gpu_solar_attention_decode_split_tensor(
     if (solar_attention_grouped_gqa_enabled() && head_dim == 128u &&
         group >= 2u && group <= 8u) {
         dim3 grouped_grid(split_count, n_head_kv, 1u);
-        solar_attention_gqa_grouped_split_kernel<8><<<
+        solar_attention_gqa_grouped_split_kernel<32><<<
             grouped_grid, 128u, 0u, ds4_current_stream()>>>(
             (float *)partials->ptr, (const float *)q->ptr,
             (const uint8_t *)kv->ptr, (uint32_t)format, row_bytes, n_head,
@@ -37604,7 +37650,7 @@ extern "C" int ds4_gpu_solar_attention_decode_banks_split_tensor(
     if (solar_attention_grouped_gqa_enabled() && head_dim == 128u &&
         group >= 2u && group <= 8u) {
         dim3 grouped_grid(max_splits, n_head_kv, n_tokens);
-        solar_attention_banks_gqa_grouped_split_kernel<8><<<
+        solar_attention_banks_gqa_grouped_split_kernel<32><<<
             grouped_grid, 128u, 0u, ds4_current_stream()>>>(
             (float *)partials->ptr, (const float *)q->ptr,
             (const uint8_t *)kv_slab->ptr,
