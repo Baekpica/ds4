@@ -34979,6 +34979,7 @@ typedef struct {
     ds4_gpu_tensor *routed_up;
     ds4_gpu_tensor *routed_mid;
     ds4_gpu_tensor *routed_down;
+    ds4_gpu_tensor *routed_out;
     ds4_gpu_tensor *ffn_out;
     ds4_gpu_tensor *final_norm;
     ds4_gpu_tensor *logits;
@@ -37001,6 +37002,7 @@ static void dots3_graph_free(ds4_dots3_gpu_graph *g) {
     D3_FREE(shared_gate); D3_FREE(shared_up); D3_FREE(shared_mid); D3_FREE(shared_out);
     D3_FREE(router_logits); D3_FREE(selected); D3_FREE(route_weights);
     D3_FREE(routed_gate); D3_FREE(routed_up); D3_FREE(routed_mid); D3_FREE(routed_down);
+    D3_FREE(routed_out);
     D3_FREE(ffn_out); D3_FREE(final_norm); D3_FREE(logits);
     D3_FREE(idx_k); D3_FREE(idx_q); D3_FREE(idx_w); D3_FREE(idx_scores);
     D3_FREE(idx_selected);
@@ -37109,6 +37111,7 @@ static bool dots3_graph_alloc(ds4_dots3_gpu_graph *g, uint32_t cap) {
     D3_ALLOC(routed_up, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP, float);
     D3_ALLOC(routed_mid, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP, float);
     D3_ALLOC(routed_down, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_EMBD, float);
+    D3_ALLOC(routed_out, (uint64_t)cap * DS4_N_EMBD, float);
     D3_ALLOC(ffn_out, (uint64_t)cap * DS4_N_EMBD, float);
     D3_ALLOC(final_norm, DS4_N_EMBD, float);
     D3_ALLOC(logits, DS4_N_VOCAB, float);
@@ -37440,39 +37443,30 @@ static bool dots3_graph_ffn(
             model->map, model->size, l->ffn_exp_probs_b->abs_offset,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, rows), "router top-8");
 
-    const uint64_t n_ff_exp = l->ffn_gate_exps->dim[1];
-    const int handoff = ds4_gpu_routed_iq2_q3_handoff_tensor(
-            g->routed_down, g->routed_gate, g->routed_up, g->routed_mid,
-            g->norm, g->selected, g->route_weights, model->map, model->size,
-            l->ffn_gate_exps->abs_offset, l->ffn_gate_exps->bytes,
-            l->ffn_up_exps->abs_offset, l->ffn_up_exps->bytes,
-            l->ffn_down_exps->abs_offset, l->ffn_down_exps->bytes,
+    /* The VMM owner replaces the raw IQ2_XXS/Q2_K expert payloads with
+     * byte-neutral aligned artifacts, so the routed pipeline must be the
+     * aligned-aware one (the DeepSeek executor, whose accepted quant pair is
+     * exactly this IQ2_XXS gate/up + Q2_K down).  Route weights are folded
+     * before the down projection; clamp 0 keeps the plain official SwiGLU. */
+    const uint64_t expert_mid_dim = l->ffn_gate_exps->dim[1];
+    const uint64_t gate_row_bytes = l->ffn_gate_exps->bytes /
+        ((uint64_t)DS4_N_EXPERT * expert_mid_dim);
+    const uint64_t down_row_bytes = l->ffn_down_exps->bytes /
+        ((uint64_t)DS4_N_EXPERT * DS4_N_EMBD);
+    bool mid_is_f16 = false;
+    D3_FFN(ds4_gpu_routed_moe_batch_tensor(
+            g->routed_out, g->routed_gate, g->routed_up, g->routed_mid,
+            g->routed_down, model->map, model->size,
+            l->ffn_gate_exps->abs_offset,
+            l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset,
             l->ffn_gate_exps->type, l->ffn_down_exps->type,
-            (uint32_t)DS4_N_EMBD, (uint32_t)n_ff_exp, (uint32_t)DS4_N_EMBD,
-            DS4_N_EXPERT, rows, DS4_N_EXPERT_USED);
-    if (handoff < 0) return false;
-    if (handoff == 0) {
-        D3_FFN(ds4_gpu_routed_gate_up_tensor(
-                g->routed_gate, g->routed_up, g->norm, g->selected,
-                model->map, model->size,
-                l->ffn_gate_exps->abs_offset, l->ffn_gate_exps->bytes,
-                l->ffn_up_exps->abs_offset, l->ffn_up_exps->bytes,
-                l->ffn_gate_exps->type,
-                (uint32_t)DS4_N_EMBD, (uint32_t)n_ff_exp, DS4_N_EXPERT,
-                rows, DS4_N_EXPERT_USED), "routed gate/up");
-        D3_FFN(ds4_gpu_swiglu_weighted_tensor(
-                g->routed_mid, g->routed_gate, g->routed_up, g->route_weights,
-                (uint32_t)n_ff_exp,
-                (uint64_t)rows * DS4_N_EXPERT_USED * n_ff_exp),
-                "routed swiglu");
-        D3_FFN(ds4_gpu_routed_matmul_bounded_tensor(
-                g->routed_down, g->routed_mid, g->selected,
-                model->map, model->size,
-                l->ffn_down_exps->abs_offset, l->ffn_down_exps->bytes,
-                l->ffn_down_exps->type,
-                (uint32_t)n_ff_exp, (uint32_t)DS4_N_EMBD, DS4_N_EXPERT,
-                rows * DS4_N_EXPERT_USED, 1u, rows), "routed down");
-    }
+            l->ffn_gate_exps->bytes / DS4_N_EXPERT, gate_row_bytes,
+            l->ffn_down_exps->bytes / DS4_N_EXPERT, down_row_bytes,
+            (uint32_t)DS4_N_EMBD, (uint32_t)expert_mid_dim,
+            (uint32_t)DS4_N_EMBD, g->selected, g->route_weights,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, 0.0f, g->norm,
+            il, rows, &mid_is_f16), "routed experts");
     D3_FFN(ds4_gpu_matmul_q8_0_pair_tensor(
             g->shared_gate, g->shared_up, model->map, model->size,
             l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
@@ -37485,14 +37479,9 @@ static bool dots3_graph_ffn(
             g->shared_out, model->map, model->size,
             l->ffn_down_shexp->abs_offset, DS4_N_FF_EXP, DS4_N_EMBD,
             g->shared_mid, rows), "shared down");
-    /* Route weights were folded into routed_mid; sum the eight expert rows
-     * then add the unweighted shared expert. */
-    D3_FFN(ds4_gpu_moe_sum_tensor(
-            g->ffn_out, g->routed_down, (uint32_t)DS4_N_EMBD,
-            DS4_N_EXPERT_USED, rows), "routed sum");
-    D3_FFN(ds4_gpu_exaone_add_tensor(
-            g->ffn_out, g->shared_out, (uint64_t)rows * DS4_N_EMBD),
-            "shared add");
+    D3_FFN(ds4_gpu_add_tensor(
+            g->ffn_out, g->routed_out, g->shared_out,
+            (uint32_t)(rows * DS4_N_EMBD)), "routed/shared sum");
 #undef D3_FFN
     return true;
 }
