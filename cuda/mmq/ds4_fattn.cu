@@ -9,10 +9,11 @@
  *
  * When n_head/n_head_kv is even and at least 2, the GQA-pair kernel
  * launches instead: grid.y = n_head/2, block 256. Warps 0-3 and 4-7
- * own consecutive Q heads that share one KV head, so the same 32-key
- * tile is dequantized once for both. Q stays in qa[] registers so the
- * extra head does not push static shared memory past 48 KiB. Eight
- * Q heads in one block still does not fit registers or shared memory.
+ * own consecutive Q heads that share one KV head. That kernel walks
+ * 64-key tiles (four 16-key consume steps) so the deep K walk syncs
+ * half as often as the one-head 32-key path. Q stays in qa[] registers
+ * so the 64-key K/V staging stays under 48 KiB. Eight Q heads in one
+ * block still does not fit registers or shared memory.
  */
 #include "common.cuh"
 #include "mma.cuh"
@@ -92,11 +93,12 @@ __device__ __forceinline__ void solar_fattn_kv_bytes(
     *v_bytes = FORMAT == SOLAR_KV_FP8 ? kv_dim : kv_dim / 2u;
 }
 
-/* Decode one 32-key (or shorter) K/V tile.  Per-row K/V scales are read
+/* Decode one TK-key (or shorter) K/V tile.  Per-row K/V scales are read
  * once and reused across the 128 dims.  Compressed formats convert four
  * consecutive dims per thread so the packed row is touched with aligned
- * 4-byte / 2-byte loads. */
-template <int FORMAT>
+ * 4-byte / 2-byte loads.  TK is 32 on the one-head kernel and 64 on the
+ * GQA-pair kernel. */
+template <int FORMAT, int TK = FA_TK>
 __device__ __forceinline__ void solar_fattn_fill_kv_tile(
         __half        s_k[][FA_ROW],
         __half        s_v[][FA_ROW],
@@ -108,9 +110,9 @@ __device__ __forceinline__ void solar_fattn_fill_kv_tile(
         uint32_t      kv_cap,
         uint32_t      kt0,
         uint32_t      tile_len) {
-    __shared__ float scale_k[FA_TK];
-    __shared__ float scale_v[FA_TK];
-    if (threadIdx.x < FA_TK) {
+    __shared__ float scale_k[TK];
+    __shared__ float scale_v[TK];
+    if (threadIdx.x < (uint32_t)TK) {
         const uint32_t r = threadIdx.x;
         const uint32_t src = r < tile_len ? kt0 + r : kt0;
         if constexpr (FORMAT == SOLAR_KV_BF16) {
@@ -129,7 +131,8 @@ __device__ __forceinline__ void solar_fattn_fill_kv_tile(
     __syncthreads();
 
     constexpr uint32_t NGRP = FA_HD / 4u;
-    for (uint32_t idx = threadIdx.x; idx < FA_TK * NGRP; idx += blockDim.x) {
+    for (uint32_t idx = threadIdx.x; idx < (uint32_t)TK * NGRP;
+         idx += blockDim.x) {
         const uint32_t r = idx / NGRP;
         const uint32_t g = idx - r * NGRP;
         const uint32_t c = g * 4u;
@@ -143,14 +146,47 @@ __device__ __forceinline__ void solar_fattn_fill_kv_tile(
                 row + kv_dim + c);
             *reinterpret_cast<float2 *>(&s_k[r][c]) = k2;
             *reinterpret_cast<float2 *>(&s_v[r][c]) = v2;
-        } else {
-            uint64_t k_bytes = 0, v_bytes = 0;
-            solar_fattn_kv_bytes<FORMAT>(n_head_kv, &k_bytes, &v_bytes);
+        } else if constexpr (FORMAT == SOLAR_KV_KFP8_VFP4) {
+            const uint64_t k_bytes = (uint64_t)n_head_kv * FA_HD;
             const uint8_t *row = (const uint8_t *)kv +
                 (uint64_t)(src % kv_cap) * row_bytes;
             const float sk = scale_k[r];
             const float sv = scale_v[r];
-            const uint64_t ke = (uint64_t)kvh * FA_HD + c;
+            const uint64_t kbase = (uint64_t)kvh * FA_HD + c;
+            const uint32_t kpack = *reinterpret_cast<const uint32_t *>(
+                row + kbase);
+            const uint16_t vpack = *reinterpret_cast<const uint16_t *>(
+                row + k_bytes + (kbase >> 1u));
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const uint8_t kc = (uint8_t)(kpack >> (8 * i));
+                const uint8_t vc = (uint8_t)((vpack >> (4 * i)) & 0x0fu);
+                s_k[r][c + (uint32_t)i] = __float2half(
+                    solar_fattn_e4m3(kc) * sk);
+                s_v[r][c + (uint32_t)i] = __float2half(
+                    solar_fattn_e2m1(vc) * sv);
+            }
+        } else if constexpr (FORMAT == SOLAR_KV_FP8) {
+            const uint64_t kv_elems = (uint64_t)n_head_kv * FA_HD;
+            const uint8_t *row = (const uint8_t *)kv +
+                (uint64_t)(src % kv_cap) * row_bytes;
+            const float sk = scale_k[r];
+            const float sv = scale_v[r];
+            const uint64_t e = (uint64_t)kvh * FA_HD + c;
+            const uint32_t kpack = *reinterpret_cast<const uint32_t *>(
+                row + e);
+            const uint32_t vpack = *reinterpret_cast<const uint32_t *>(
+                row + kv_elems + e);
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                s_k[r][c + (uint32_t)i] = __float2half(
+                    solar_fattn_e4m3((uint8_t)(kpack >> (8 * i))) * sk);
+                s_v[r][c + (uint32_t)i] = __float2half(
+                    solar_fattn_e4m3((uint8_t)(vpack >> (8 * i))) * sv);
+            }
+        } else {
+            const uint8_t *row = (const uint8_t *)kv +
+                (uint64_t)(src % kv_cap) * row_bytes;
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 s_k[r][c + (uint32_t)i] = __float2half(
@@ -159,119 +195,7 @@ __device__ __forceinline__ void solar_fattn_fill_kv_tile(
                 s_v[r][c + (uint32_t)i] = __float2half(
                     solar_fattn_kv_load<FORMAT, true>(
                         row, n_head_kv, kvh, c + (uint32_t)i));
-                (void)sk;
-                (void)sv;
-                (void)ke;
             }
-        }
-    }
-}
-
-/* Specialized 4-wide dequant for the production K-FP8/V-FP4 row so the
- * per-row scale is applied from registers and the packed bytes are read
- * with aligned word loads.  Other formats keep the scalar helper above. */
-template <>
-__device__ __forceinline__ void solar_fattn_fill_kv_tile<SOLAR_KV_KFP8_VFP4>(
-        __half        s_k[][FA_ROW],
-        __half        s_v[][FA_ROW],
-        const void   *kv,
-        uint64_t      row_bytes,
-        uint32_t      n_head_kv,
-        uint32_t      kvh,
-        uint32_t      kv_dim,
-        uint32_t      kv_cap,
-        uint32_t      kt0,
-        uint32_t      tile_len) {
-    (void)kv_dim;
-    __shared__ float scale_k[FA_TK];
-    __shared__ float scale_v[FA_TK];
-    const uint64_t k_bytes = (uint64_t)n_head_kv * FA_HD;
-    const uint64_t v_bytes = k_bytes / 2u;
-    if (threadIdx.x < FA_TK) {
-        const uint32_t r = threadIdx.x;
-        const uint32_t src = r < tile_len ? kt0 + r : kt0;
-        const uint8_t *row = (const uint8_t *)kv +
-            (uint64_t)(src % kv_cap) * row_bytes;
-        const __half *scales = (const __half *)(row + k_bytes + v_bytes);
-        scale_k[r] = __half2float(scales[kvh]);
-        scale_v[r] = __half2float(scales[n_head_kv + kvh]);
-    }
-    __syncthreads();
-
-    constexpr uint32_t NGRP = FA_HD / 4u;
-    for (uint32_t idx = threadIdx.x; idx < FA_TK * NGRP; idx += blockDim.x) {
-        const uint32_t r = idx / NGRP;
-        const uint32_t g = idx - r * NGRP;
-        const uint32_t c = g * 4u;
-        const uint32_t src = r < tile_len ? kt0 + r : kt0;
-        const uint8_t *row = (const uint8_t *)kv +
-            (uint64_t)(src % kv_cap) * row_bytes;
-        const float sk = scale_k[r];
-        const float sv = scale_v[r];
-        const uint64_t kbase = (uint64_t)kvh * FA_HD + c;
-        const uint32_t kpack = *reinterpret_cast<const uint32_t *>(
-            row + kbase);
-        const uint16_t vpack = *reinterpret_cast<const uint16_t *>(
-            row + k_bytes + (kbase >> 1u));
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            const uint8_t kc = (uint8_t)(kpack >> (8 * i));
-            const uint8_t vc = (uint8_t)((vpack >> (4 * i)) & 0x0fu);
-            s_k[r][c + (uint32_t)i] = __float2half(
-                solar_fattn_e4m3(kc) * sk);
-            s_v[r][c + (uint32_t)i] = __float2half(
-                solar_fattn_e2m1(vc) * sv);
-        }
-    }
-}
-
-template <>
-__device__ __forceinline__ void solar_fattn_fill_kv_tile<SOLAR_KV_FP8>(
-        __half        s_k[][FA_ROW],
-        __half        s_v[][FA_ROW],
-        const void   *kv,
-        uint64_t      row_bytes,
-        uint32_t      n_head_kv,
-        uint32_t      kvh,
-        uint32_t      kv_dim,
-        uint32_t      kv_cap,
-        uint32_t      kt0,
-        uint32_t      tile_len) {
-    (void)kv_dim;
-    __shared__ float scale_k[FA_TK];
-    __shared__ float scale_v[FA_TK];
-    const uint64_t kv_elems = (uint64_t)n_head_kv * FA_HD;
-    if (threadIdx.x < FA_TK) {
-        const uint32_t r = threadIdx.x;
-        const uint32_t src = r < tile_len ? kt0 + r : kt0;
-        const uint8_t *row = (const uint8_t *)kv +
-            (uint64_t)(src % kv_cap) * row_bytes;
-        const __half *scales = (const __half *)(row + kv_elems + kv_elems);
-        scale_k[r] = __half2float(scales[kvh]);
-        scale_v[r] = __half2float(scales[n_head_kv + kvh]);
-    }
-    __syncthreads();
-
-    constexpr uint32_t NGRP = FA_HD / 4u;
-    for (uint32_t idx = threadIdx.x; idx < FA_TK * NGRP; idx += blockDim.x) {
-        const uint32_t r = idx / NGRP;
-        const uint32_t g = idx - r * NGRP;
-        const uint32_t c = g * 4u;
-        const uint32_t src = r < tile_len ? kt0 + r : kt0;
-        const uint8_t *row = (const uint8_t *)kv +
-            (uint64_t)(src % kv_cap) * row_bytes;
-        const float sk = scale_k[r];
-        const float sv = scale_v[r];
-        const uint64_t e = (uint64_t)kvh * FA_HD + c;
-        const uint32_t kpack = *reinterpret_cast<const uint32_t *>(row + e);
-        const uint32_t vpack = *reinterpret_cast<const uint32_t *>(
-            row + kv_elems + e);
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            s_k[r][c + (uint32_t)i] = __float2half(
-                solar_fattn_e4m3((uint8_t)(kpack >> (8 * i))) * sk);
-            s_v[r][c + (uint32_t)i] = __float2half(
-                solar_fattn_e4m3((uint8_t)(vpack >> (8 * i))) * sv);
         }
     }
 }
@@ -572,6 +496,7 @@ __global__ void ds4_fattn_hmma_gqa2_kernel(
         const uint32_t window,
         const float scale) {
     constexpr uint32_t N_Q = 2u;
+    constexpr uint32_t FA_TK2 = 64u;
     constexpr uint32_t GROUP_THREADS = (uint32_t)FA_WARPS * 32u;
     const uint32_t tq0 = blockIdx.x * FA_TQ;
     const uint32_t h0 = blockIdx.y * N_Q;
@@ -585,11 +510,11 @@ __global__ void ds4_fattn_hmma_gqa2_kernel(
     const uint32_t warp = local >> 5;
     const uint32_t lane = local & 31u;
 
-    __shared__ __half s_k[FA_TK][FA_ROW];
-    __shared__ __half s_v[FA_TK][FA_ROW];
+    __shared__ __half s_k[FA_TK2][FA_ROW];
+    __shared__ __half s_v[FA_TK2][FA_ROW];
     static_assert(sizeof(s_k) + sizeof(s_v) + 2u * sizeof(uint32_t) <=
                       49152u,
-                  "GQA-pair FATTN must stay under 48 KiB static shared");
+                  "GQA-pair FATTN 64-key tile must stay under 48 KiB");
 
     tile_a qa[FA_HD / 16];
     solar_fattn_load_qa(qa, q, tq0, n_tokens, n_head, h, warp, lane);
@@ -645,24 +570,20 @@ __global__ void ds4_fattn_hmma_gqa2_kernel(
     block_last = shared_last;
     if (block_first == 0xffffffffu) return;
 
-    for (uint32_t kt0 = block_first; kt0 <= block_last; kt0 += FA_TK) {
+    for (uint32_t kt0 = block_first; kt0 <= block_last; kt0 += FA_TK2) {
         const uint32_t remaining = block_last - kt0 + 1u;
-        const uint32_t tile_len = remaining < (uint32_t)FA_TK
-            ? remaining : (uint32_t)FA_TK;
-        solar_fattn_fill_kv_tile<KV_FORMAT>(
+        const uint32_t tile_len = remaining < FA_TK2 ? remaining : FA_TK2;
+        solar_fattn_fill_kv_tile<KV_FORMAT, (int)FA_TK2>(
             s_k, s_v, kv, row_bytes, n_head_kv, kvh, kv_dim, kv_cap,
             kt0, tile_len);
         __syncthreads();
-        const uint32_t first_len = tile_len < (uint32_t)FA_CONSUME
-            ? tile_len : (uint32_t)FA_CONSUME;
-        solar_fattn_consume_16(
-            output, row_m, row_l, qa, s_k, s_v, alive, qpos, qfirst,
-            kt0, first_len, lane, scale);
-        if (tile_len > (uint32_t)FA_CONSUME) {
+        for (uint32_t step = 0; step < FA_TK2; step += (uint32_t)FA_CONSUME) {
+            if (step >= tile_len) break;
+            const uint32_t step_len = tile_len - step < (uint32_t)FA_CONSUME
+                ? tile_len - step : (uint32_t)FA_CONSUME;
             solar_fattn_consume_16(
-                output, row_m, row_l, qa, s_k + FA_CONSUME, s_v + FA_CONSUME,
-                alive, qpos, qfirst, kt0 + (uint32_t)FA_CONSUME,
-                tile_len - (uint32_t)FA_CONSUME, lane, scale);
+                output, row_m, row_l, qa, s_k + step, s_v + step,
+                alive, qpos, qfirst, kt0 + step, step_len, lane, scale);
         }
         __syncthreads();
     }
