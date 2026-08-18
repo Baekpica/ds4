@@ -29,6 +29,55 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
   downgrade to the same notice; `DS4_WEIGHT_FP_CHECK=0` disables
   verification. This is mixup detection, not tamper-proofing: bytes
   between sample windows are not covered.
+- Governed bank plan: the boot bank count is priced from the live
+  memory budget instead of a frozen fundable-token ladder. Above 16k
+  context the plan asks what the budget actually funds at the same
+  per-token rate admissions are charged (so plan and admission cannot
+  disagree): a 262144 default boot now grants 9 banks where the ladder
+  froze 4, a 524288 boot grants 6 (08-18 box state; the count follows
+  the box). At or below 16384 the measured 32-bank regime stands
+  verbatim. An explicit `DS4_SERVER_COALESCE_MAX` still rules AND
+  disarms the sizing — the operator's number is a deterministic pin;
+  `DS4_BATCH_FIT_KV=0` restores the ladder end to end.
+- Reconciliation line (the zero-headroom law made continuous): at every
+  idle tick the server reconciles the box's raw available-memory drop
+  since boot settle against what its own allocation census plus the
+  named one-time charges explain, and logs the signed residual instead
+  of silently absorbing it — a future phantom or leak surfaces as a
+  named number, not a field report. Fresh copies on `/v1/stats` and
+  `/metrics`; `DS4_MEM_RECONCILE_TOL_MB` (default 256) flags the line,
+  `DS4_MEM_RECONCILE_STRICT=1` emits a distinct token for gate scripts.
+  The ~650 MiB census-invisible first-admit warmup (driver module
+  loads, JIT, host allocator growth) is captured once as a named
+  one-time charge (`DS4_MEM_RECONCILE_WARMUP_MB` pins it); the serial
+  session's memory row now publishes the allocator's own measured bytes
+  instead of the estimate once the graph commits.
+- The KV budget's anti-thrash floor is priced in committed terms: the
+  guarantee was always "two full-depth working sets", but it was
+  denominated in virtual per-bank extents (13.4 GiB at `-c 786432`)
+  when a full bank actually commits ~2.9 GiB — the floor clamped the
+  measured capacity answer up by ~4.6x and the budget's capacity leg
+  never engaged honestly at depth. The floor now prices two full-depth
+  banks at the packed rate admissions are charged (band included). The
+  boot ledger names which floor ruled (`work floor=packed|virtual`) and
+  prints its own line whenever the floor is what bound capacity.
+  `DS4_BATCH_VMM_FLOOR_PACKED=0` restores the old denomination.
+- The boot planning headroom derives from the operator floor: the
+  static 6144 MiB was the shipped 4 GiB floor plus ~2 GiB of runtime
+  growth margin bundled for one configuration only. It is now computed
+  as `--mem-floor-gb` + `DS4_BATCH_FIT_BURST_MB` (default 2048) — the
+  same 6144 at shipped defaults, ~3 GiB returned to the fundable pool
+  on a stripped 1 GiB-floor box. `DS4_BATCH_FIT_HEADROOM_MB` still
+  pins outright; `DS4_BATCH_FIT_HEADROOM_DERIVED=0` restores the
+  static value.
+- Trim victims are chosen like warm-record eviction and named in the
+  log: invalid content first, then the longest-idle bank (shortest
+  history breaks ties), replacing shortest-history-first — which kept
+  deep trunks immortal under budget pressure while re-trimming
+  recently-hot small banks. Each trim now logs one line per victim
+  (bank, bytes released, history length, recency) ahead of the summary
+  line, and the boot ledger discloses the active order.
+  `DS4_BATCH_TRIM_VICTIM=hist` restores the old order.
 
 ## v0.6.1 — 2026-08-17
 
