@@ -544,6 +544,17 @@ tests/test_motif3_cuda: tests/test_motif3_cuda.cu ds4.o ds4_distributed.o ds4_cu
 test-motif3-cuda: tests/test_motif3_cuda
 	./tests/test_motif3_cuda "$(DS4_MOTIF3_FIXTURES)"
 
+tests/test_dots3_resident.o: tests/test_dots3_resident.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_dots3_resident: tests/test_dots3_resident.o ds4_kvstore.o rax.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-dots3-resident: tests/test_dots3_resident
+	@test -n "$(DS4_DOTS3_MODEL)" || \
+		{ echo "set DS4_DOTS3_MODEL to the first dots3 GGUF shard" >&2; exit 2; }
+	CUDA_VISIBLE_DEVICES=0 ./tests/test_dots3_resident "$(DS4_DOTS3_MODEL)"
+
 tests/test_motif3_resident.o: tests/test_motif3_resident.c ds4.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 

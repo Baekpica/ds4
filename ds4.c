@@ -948,6 +948,21 @@ static bool ds4_dots3_layer_is_full_attention(uint32_t il) {
     return il == 0u || (DS4_N_SWA_PERIOD != 0 && (il % DS4_N_SWA_PERIOD) == 1u);
 }
 
+/* dots3-note per-layer MLA geometry.  Full layers run the wide profile from
+ * the shape literal; SWA layers (and the MTP block) run the narrow one.
+ * n_rot and the 128-dim value head are shared. */
+static uint32_t ds4_dots3_layer_heads(uint32_t il) {
+    return ds4_dots3_layer_is_full_attention(il) ? DS4_N_HEAD : DS4_N_SWA_HEAD;
+}
+static uint32_t ds4_dots3_layer_kv_lora(uint32_t il) {
+    return ds4_dots3_layer_is_full_attention(il) ? DS4_N_KV_LORA
+                                                 : DS4_N_SWA_KV_LORA;
+}
+static uint32_t ds4_dots3_layer_qk_dim(uint32_t il) {
+    return ds4_dots3_layer_is_full_attention(il) ? DS4_N_KEY_MLA
+                                                 : DS4_N_SWA_KEY_MLA;
+}
+
 static const char *solar_kv_format_name(ds4_solar_kv_format format) {
     switch (format) {
     case DS4_SOLAR_KV_BF16: return "bf16";
@@ -2809,6 +2824,112 @@ static inline uint16_t f32_to_f16(float f) {
     if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
     return (uint16_t)half;
 #endif
+}
+
+/* FP8 E4M3 (finite-only: bias 7, max 448) round trip, matching the CUDA
+ * __nv_fp8_e4m3 SATFINITE cast for the pre-clamped values the dots3 indexer
+ * feeds it.  Round to nearest even via the default FP environment. */
+static DS4_MAYBE_UNUSED float dots3_e4m3_roundtrip(float x) {
+    if (x != x) return 0.0f;
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    float a = fabsf(x);
+    if (a >= 448.0f) return sign * 448.0f;
+    if (a == 0.0f) return 0.0f;
+    int e = (int)floorf(log2f(a));
+    if (e < -6) {
+        /* Subnormals: steps of 2^-9. */
+        float q = nearbyintf(a * 512.0f);
+        if (q > 7.0f) q = 7.0f;   /* 8/512 == the smallest normal */
+        if (q == 8.0f) return sign * 0.015625f;
+        return sign * q / 512.0f;
+    }
+    float scale = ldexpf(1.0f, e);
+    float m = a / scale;                 /* [1, 2) up to rounding */
+    float q = nearbyintf((m - 1.0f) * 8.0f);
+    if (q >= 8.0f) {
+        e += 1;
+        q = 0.0f;
+    }
+    if (e > 8 || (e == 8 && q > 6.0f)) return sign * 448.0f;
+    return sign * (1.0f + q / 8.0f) * ldexpf(1.0f, e);
+}
+
+/* Per-token FP8 block round trip: scale = clamped absmax / 448 over each
+ * 128-dim block, exactly the reference quantize_indexer_fp8. */
+static DS4_MAYBE_UNUSED void dots3_fp8_block_roundtrip(float *x, uint32_t n) {
+    for (uint32_t b = 0; b + 128u <= n; b += 128u) {
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < 128u; i++) amax = fmaxf(amax, fabsf(x[b + i]));
+        const float scale = fmaxf(amax, 1.0e-4f) / 448.0f;
+        for (uint32_t i = 0; i < 128u; i++) {
+            const float q = fminf(fmaxf(x[b + i] / scale, -448.0f), 448.0f);
+            x[b + i] = dots3_e4m3_roundtrip(q) * scale;
+        }
+    }
+}
+
+/* Host dequantizers for the dots3 CPU reference and the tiny Q8_0 norm
+ * vectors the GPU graph pre-expands.  Q8_0 is 34-byte blocks (f16 scale + 32
+ * int8); IQ2_XXS and Q2_K follow the llama.cpp reference layouts. */
+static void dots3_dequant_q8_0(const uint8_t *src, float *out, uint64_t n) {
+    for (uint64_t b = 0; b < n / 32u; b++) {
+        const uint8_t *blk = src + b * 34u;
+        uint16_t d16;
+        memcpy(&d16, blk, sizeof(d16));
+        const float d = f16_to_f32(d16);
+        const int8_t *qs = (const int8_t *)(blk + 2);
+        for (uint32_t i = 0; i < 32u; i++) {
+            out[b * 32u + i] = d * (float)qs[i];
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void dots3_dequant_iq2_xxs_block(
+        const block_iq2_xxs *blk, float *out) {
+    const float d = f16_to_f32(blk->d);
+    for (uint32_t ib = 0; ib < QK_K / 32u; ib++) {
+        uint32_t aux32[2];
+        memcpy(aux32, blk->qs + 4u * ib, sizeof(aux32));
+        const uint8_t *aux8 = (const uint8_t *)aux32;
+        const float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;
+        for (uint32_t l = 0; l < 4u; l++) {
+            const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+            const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7u * l)) & 127u];
+            for (uint32_t j = 0; j < 8u; j++) {
+                out[32u * ib + 8u * l + j] = db * (float)grid[j] *
+                    ((signs & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+            }
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void dots3_dequant_q2_K_block(
+        const block_q2_K *blk, float *out) {
+    const float d = f16_to_f32(blk->d);
+    const float dmin = f16_to_f32(blk->dmin);
+    const uint8_t *q = blk->qs;
+    uint32_t is = 0;
+    for (uint32_t n = 0; n < QK_K; n += 128u) {
+        uint32_t shift = 0;
+        for (uint32_t j = 0; j < 4u; j++) {
+            uint8_t sc = blk->scales[is++];
+            float dl = d * (float)(sc & 0xF);
+            float ml = dmin * (float)(sc >> 4);
+            for (uint32_t l = 0; l < 16u; l++) {
+                out[n + 32u * j + l] =
+                    dl * (float)((q[l] >> shift) & 3u) - ml;
+            }
+            sc = blk->scales[is++];
+            dl = d * (float)(sc & 0xF);
+            ml = dmin * (float)(sc >> 4);
+            for (uint32_t l = 16u; l < 32u; l++) {
+                out[n + 32u * j + l] =
+                    dl * (float)((q[l] >> shift) & 3u) - ml;
+            }
+            shift += 2u;
+        }
+        q += 32u;
+    }
 }
 
 static void f16_round_inplace_cpu(float *x, uint32_t n) {
@@ -34812,6 +34933,72 @@ typedef struct {
     ds4_gpu_tensor *layer_k_pe[DS4_MAX_LAYER];
     uint32_t layer_cache_cap[DS4_MAX_LAYER];
 } ds4_motif3_gpu_graph;
+
+/* dots3-note graph.  Latent-MLA only: prefill and decode both run the
+ * absorbed formulation over the BF16 latent + rotated-k_pe caches, full
+ * layers additionally through the DSA top-2048 selection; the independent
+ * expanded-form reference lives on the CPU (ds4_engine_dots3_reference_*).
+ * Scratch is sized for the wide geometry so both layer kinds share buffers.
+ * The MTP block (blk.46) is bound and validated but never executed here, so
+ * it owns no cache slot. */
+typedef struct {
+    bool ready;
+    bool cache_ready;
+    uint32_t cap;              /* prefill chunk rows */
+    uint32_t ctx_cap;
+    uint32_t cache_len;
+    uint32_t idx_sub;          /* indexer score sub-chunk (queries) */
+    uint64_t cache_bytes;
+    ds4_gpu_tensor *tokens;
+    ds4_gpu_tensor *positions;
+    ds4_gpu_tensor *inv_full;  /* interleaved-rope inverse freqs, theta 8e7 */
+    ds4_gpu_tensor *inv_swa;   /* theta 5e4 */
+    ds4_gpu_tensor *x;
+    ds4_gpu_tensor *norm;
+    ds4_gpu_tensor *q_lora;    /* q_a output, normed + rescale folded */
+    ds4_gpu_tensor *q_raw;
+    ds4_gpu_tensor *q_absorbed;
+    ds4_gpu_tensor *latent_out;
+    ds4_gpu_tensor *kv_raw;
+    ds4_gpu_tensor *kv_norm;
+    ds4_gpu_tensor *k_pe;
+    ds4_gpu_tensor *attention;
+    ds4_gpu_tensor *gate_logits;
+    ds4_gpu_tensor *block_out;
+    ds4_gpu_tensor *dense_gate;
+    ds4_gpu_tensor *dense_up;
+    ds4_gpu_tensor *dense_mid;
+    ds4_gpu_tensor *shared_gate;
+    ds4_gpu_tensor *shared_up;
+    ds4_gpu_tensor *shared_mid;
+    ds4_gpu_tensor *shared_out;
+    ds4_gpu_tensor *router_logits;
+    ds4_gpu_tensor *selected;
+    ds4_gpu_tensor *route_weights;
+    ds4_gpu_tensor *routed_gate;
+    ds4_gpu_tensor *routed_up;
+    ds4_gpu_tensor *routed_mid;
+    ds4_gpu_tensor *routed_down;
+    ds4_gpu_tensor *ffn_out;
+    ds4_gpu_tensor *final_norm;
+    ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *idx_k;
+    ds4_gpu_tensor *idx_q;
+    ds4_gpu_tensor *idx_w;
+    ds4_gpu_tensor *idx_scores;    /* idx_sub x ctx_cap, cache-time alloc */
+    ds4_gpu_tensor *idx_selected;  /* cap x top_k */
+    /* Dequantized (Q8_0 -> F32) in-attention norm vectors with the official
+     * sqrt(n_embd/rank) LoRA rescale folded into q_a/kv_a. */
+    ds4_gpu_tensor *w_q_a_norm[DS4_MAX_LAYER];
+    ds4_gpu_tensor *w_kv_a_norm[DS4_MAX_LAYER];
+    ds4_gpu_tensor *w_k_rope_norm[DS4_MAX_LAYER];
+    ds4_gpu_tensor *w_idx_k_norm[DS4_MAX_LAYER];
+    ds4_gpu_tensor *w_idx_k_norm_bias[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_kv_latent[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_k_pe[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_idx_k[DS4_MAX_LAYER];
+    uint32_t layer_cache_cap[DS4_MAX_LAYER];
+} ds4_dots3_gpu_graph;
 #endif
 #ifndef DS4_NO_GPU
 /* =========================================================================
@@ -35697,6 +35884,8 @@ struct ds4_session {
     ds4_gpu_graph graph;
     ds4_motif3_gpu_graph motif3_graph;
     bool motif3_graph_ready;
+    ds4_dots3_gpu_graph dots3_graph;
+    bool dots3_graph_ready;
     ds4_solar_gpu_graph solar_graph;
     bool solar_graph_ready;
     bool solar_state_valid;
@@ -36784,6 +36973,614 @@ static bool motif3_graph_forward_mtp_diagnostic(
             (uint64_t)DS4_N_VOCAB * sizeof(host_logits[0])),
             "logits readback");
 #undef M3_MTP
+    return true;
+}
+
+/* =========================================================================
+ * dots3-note GPU graph
+ * =========================================================================
+ *
+ * Latent-MLA execution for both dots3 geometries.  Prefill and decode share
+ * one chunked path: project, norm (with the official LoRA rescale folded
+ * into the pre-expanded norm weights), rotate with interleaved rope, store
+ * BF16 latent + k_pe, absorb W_UK into Q, then run the online-softmax latent
+ * attention -- windowed on SWA layers, DSA top-2048 selected on full layers
+ * once the causal prefix exceeds the top-k.  The headwise sigmoid gate scales
+ * the value heads before the output projection.  FFN is the shared
+ * sigmoid-router + IQ2_XXS/Q2_K routed pipeline with the official noaux_tc
+ * normalization.  blk.46 (MTP) never executes. */
+
+static void dots3_graph_free(ds4_dots3_gpu_graph *g) {
+    if (!g) return;
+#define D3_FREE(field) do { ds4_gpu_tensor_free(g->field); g->field = NULL; } while (0)
+    D3_FREE(tokens); D3_FREE(positions); D3_FREE(inv_full); D3_FREE(inv_swa);
+    D3_FREE(x); D3_FREE(norm); D3_FREE(q_lora); D3_FREE(q_raw);
+    D3_FREE(q_absorbed); D3_FREE(latent_out); D3_FREE(kv_raw); D3_FREE(kv_norm);
+    D3_FREE(k_pe); D3_FREE(attention); D3_FREE(gate_logits); D3_FREE(block_out);
+    D3_FREE(dense_gate); D3_FREE(dense_up); D3_FREE(dense_mid);
+    D3_FREE(shared_gate); D3_FREE(shared_up); D3_FREE(shared_mid); D3_FREE(shared_out);
+    D3_FREE(router_logits); D3_FREE(selected); D3_FREE(route_weights);
+    D3_FREE(routed_gate); D3_FREE(routed_up); D3_FREE(routed_mid); D3_FREE(routed_down);
+    D3_FREE(ffn_out); D3_FREE(final_norm); D3_FREE(logits);
+    D3_FREE(idx_k); D3_FREE(idx_q); D3_FREE(idx_w); D3_FREE(idx_scores);
+    D3_FREE(idx_selected);
+#undef D3_FREE
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->w_q_a_norm[il]);
+        ds4_gpu_tensor_free(g->w_kv_a_norm[il]);
+        ds4_gpu_tensor_free(g->w_k_rope_norm[il]);
+        ds4_gpu_tensor_free(g->w_idx_k_norm[il]);
+        ds4_gpu_tensor_free(g->w_idx_k_norm_bias[il]);
+        ds4_gpu_tensor_free(g->layer_kv_latent[il]);
+        ds4_gpu_tensor_free(g->layer_k_pe[il]);
+        ds4_gpu_tensor_free(g->layer_idx_k[il]);
+    }
+    memset(g, 0, sizeof(*g));
+}
+
+static uint32_t dots3_graph_prefill_cap_for_context(uint32_t ctx_size) {
+    uint32_t cap = 4096u;
+    const char *env = getenv("DS4_DOTS3_PREFILL_CHUNK");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long value = strtoul(env, &end, 10);
+        if (end != env && end[0] == '\0' && value <= UINT32_MAX)
+            cap = (uint32_t)value;
+    }
+    if (cap == 0u) cap = 1u;
+    if (cap > 8192u) cap = 8192u;
+    if (cap > ctx_size) cap = ctx_size;
+    return cap;
+}
+
+/* SWA rings must retain the previous 512-token window while the whole chunk
+ * is inserted ahead of its causal attention launch.  Full layers (and their
+ * DSA key caches) hold the entire context.  The MTP block owns no cache. */
+static uint32_t dots3_graph_layer_cache_cap(
+        uint32_t ctx_cap, uint32_t prefill_cap, uint32_t il) {
+    if (DS4_N_NEXTN_PREDICT != 0 && il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER)
+        return 0u;
+    if (ds4_dots3_layer_is_full_attention(il)) return ctx_cap;
+    uint64_t cap = (uint64_t)DS4_N_SWA + prefill_cap;
+    if (cap > ctx_cap) cap = ctx_cap;
+    return (uint32_t)cap;
+}
+
+static DS4_MAYBE_UNUSED uint64_t dots3_graph_cache_bytes(
+        uint32_t ctx_cap, uint32_t prefill_cap) {
+    uint64_t total = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t cap = dots3_graph_layer_cache_cap(ctx_cap, prefill_cap, il);
+        if (!cap) continue;
+        const uint64_t row = (uint64_t)ds4_dots3_layer_kv_lora(il) + DS4_N_ROT;
+        total += (uint64_t)cap * row * sizeof(uint16_t);
+        if (ds4_dots3_layer_is_full_attention(il)) {
+            total += (uint64_t)cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        }
+    }
+    return total;
+}
+
+static bool dots3_graph_alloc(ds4_dots3_gpu_graph *g, uint32_t cap) {
+    if (!g || cap == 0 || cap > 8192u) return false;
+    memset(g, 0, sizeof(*g));
+    g->cap = cap;
+    g->idx_sub = cap < 128u ? cap : 128u;
+    const uint64_t wide_q = (uint64_t)DS4_N_HEAD * DS4_N_KEY_MLA;          /* 24576 */
+    const uint64_t wide_latent = (uint64_t)DS4_N_HEAD * DS4_N_KV_LORA;    /* == 64*1024 */
+    const uint64_t wide_value = (uint64_t)DS4_N_HEAD * DS4_N_VALUE_MLA;   /* 16384 */
+    const uint64_t kv_raw_dim = (uint64_t)DS4_N_SWA_KV_LORA + DS4_N_ROT;  /* 1088 */
+#define D3_ALLOC(field, count, type) do {                                      \
+        uint64_t d3_count_ = (uint64_t)(count);                                \
+        if (d3_count_ > UINT64_MAX / sizeof(type) ||                           \
+            !(g->field = ds4_gpu_tensor_alloc(d3_count_ * sizeof(type)))) {    \
+            fprintf(stderr, "ds4: dots3 graph allocation failed: %s\n", #field); \
+            dots3_graph_free(g);                                               \
+            return false;                                                      \
+        }                                                                      \
+    } while (0)
+    D3_ALLOC(tokens, cap, int32_t);
+    D3_ALLOC(positions, cap, int32_t);
+    D3_ALLOC(inv_full, DS4_N_ROT / 2u, float);
+    D3_ALLOC(inv_swa, DS4_N_ROT / 2u, float);
+    D3_ALLOC(x, (uint64_t)cap * DS4_N_EMBD, float);
+    D3_ALLOC(norm, (uint64_t)cap * DS4_N_EMBD, float);
+    D3_ALLOC(q_lora, (uint64_t)cap * DS4_N_LORA_Q, float);
+    D3_ALLOC(q_raw, (uint64_t)cap * wide_q, float);
+    D3_ALLOC(q_absorbed, (uint64_t)cap * wide_latent, float);
+    D3_ALLOC(latent_out, (uint64_t)cap * wide_latent, float);
+    D3_ALLOC(kv_raw, (uint64_t)cap * kv_raw_dim, float);
+    D3_ALLOC(kv_norm, (uint64_t)cap * DS4_N_SWA_KV_LORA, float);
+    D3_ALLOC(k_pe, (uint64_t)cap * DS4_N_ROT, float);
+    D3_ALLOC(attention, (uint64_t)cap * wide_value, float);
+    D3_ALLOC(gate_logits, (uint64_t)cap * DS4_N_HEAD, float);
+    D3_ALLOC(block_out, (uint64_t)cap * DS4_N_EMBD, float);
+    D3_ALLOC(dense_gate, (uint64_t)cap * DS4_N_FF_DENSE, float);
+    D3_ALLOC(dense_up, (uint64_t)cap * DS4_N_FF_DENSE, float);
+    D3_ALLOC(dense_mid, (uint64_t)cap * DS4_N_FF_DENSE, float);
+    D3_ALLOC(shared_gate, (uint64_t)cap * DS4_N_FF_EXP, float);
+    D3_ALLOC(shared_up, (uint64_t)cap * DS4_N_FF_EXP, float);
+    D3_ALLOC(shared_mid, (uint64_t)cap * DS4_N_FF_EXP, float);
+    D3_ALLOC(shared_out, (uint64_t)cap * DS4_N_EMBD, float);
+    D3_ALLOC(router_logits, (uint64_t)cap * DS4_N_EXPERT, float);
+    D3_ALLOC(selected, (uint64_t)cap * DS4_N_EXPERT_USED, int32_t);
+    D3_ALLOC(route_weights, (uint64_t)cap * DS4_N_EXPERT_USED, float);
+    D3_ALLOC(routed_gate, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP, float);
+    D3_ALLOC(routed_up, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP, float);
+    D3_ALLOC(routed_mid, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP, float);
+    D3_ALLOC(routed_down, (uint64_t)cap * DS4_N_EXPERT_USED * DS4_N_EMBD, float);
+    D3_ALLOC(ffn_out, (uint64_t)cap * DS4_N_EMBD, float);
+    D3_ALLOC(final_norm, DS4_N_EMBD, float);
+    D3_ALLOC(logits, DS4_N_VOCAB, float);
+    D3_ALLOC(idx_k, (uint64_t)cap * DS4_N_INDEXER_HEAD_DIM, float);
+    D3_ALLOC(idx_q, (uint64_t)cap * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM, float);
+    D3_ALLOC(idx_w, (uint64_t)cap * DS4_N_INDEXER_HEAD, float);
+    D3_ALLOC(idx_selected, (uint64_t)cap * DS4_N_INDEXER_TOP_K, int32_t);
+#undef D3_ALLOC
+
+    float inv_full[DS4_MAX_ROT / 2u];
+    float inv_swa[DS4_MAX_ROT / 2u];
+    for (uint32_t i = 0; i < DS4_N_ROT / 2u; i++) {
+        const float expo = (2.0f * (float)i) / (float)DS4_N_ROT;
+        inv_full[i] = 1.0f / powf(DS4_ROPE_FREQ_BASE, expo);
+        inv_swa[i] = 1.0f / powf(DS4_ROPE_FREQ_BASE_SWA, expo);
+    }
+    if (!ds4_gpu_tensor_write(g->inv_full, 0, inv_full,
+                              (uint64_t)(DS4_N_ROT / 2u) * sizeof(float)) ||
+        !ds4_gpu_tensor_write(g->inv_swa, 0, inv_swa,
+                              (uint64_t)(DS4_N_ROT / 2u) * sizeof(float))) {
+        dots3_graph_free(g);
+        return false;
+    }
+    g->ready = true;
+    return true;
+}
+
+/* Dequantize one Q8_0 (or copy one F32) norm vector from the model map into
+ * a device buffer, folding `scale` in.  The official forward multiplies the
+ * q_a / kv_a norm output by sqrt(n_embd / rank); scaling the norm weight is
+ * algebraically identical and free at run time. */
+static ds4_gpu_tensor *dots3_graph_upload_norm(
+        const ds4_model *m, const ds4_tensor *t, uint32_t dim, float scale) {
+    if (!t || t->dim[0] != dim) return NULL;
+    float *host = xmalloc((size_t)dim * sizeof(float));
+    const uint8_t *src = (const uint8_t *)m->map + t->abs_offset;
+    if (t->type == DS4_TENSOR_Q8_0) {
+        dots3_dequant_q8_0(src, host, dim);
+    } else if (t->type == DS4_TENSOR_F32) {
+        memcpy(host, src, (size_t)dim * sizeof(float));
+    } else {
+        free(host);
+        return NULL;
+    }
+    if (scale != 1.0f) {
+        for (uint32_t i = 0; i < dim; i++) host[i] *= scale;
+    }
+    ds4_gpu_tensor *dev = ds4_gpu_tensor_alloc((uint64_t)dim * sizeof(float));
+    const bool ok = dev &&
+        ds4_gpu_tensor_write(dev, 0, host, (uint64_t)dim * sizeof(float));
+    free(host);
+    if (!ok) {
+        ds4_gpu_tensor_free(dev);
+        return NULL;
+    }
+    return dev;
+}
+
+static bool dots3_graph_alloc_cache(
+        ds4_dots3_gpu_graph *g, const ds4_model *model,
+        const ds4_weights *weights, uint32_t ctx_cap) {
+    if (!g || !g->ready || g->cache_ready || ctx_cap == 0 ||
+        ctx_cap > 524288u || DS4_N_LAYER > DS4_MAX_LAYER) {
+        return false;
+    }
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    uint64_t total = 0;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        const bool full = ds4_dots3_layer_is_full_attention(il);
+        const uint32_t kv_lora = ds4_dots3_layer_kv_lora(il);
+        const float q_scale = sqrtf((float)DS4_N_EMBD / (float)DS4_N_LORA_Q);
+        const float kv_scale = sqrtf((float)DS4_N_EMBD / (float)kv_lora);
+        g->w_q_a_norm[il] = dots3_graph_upload_norm(
+                model, l->attn_q_a_norm, DS4_N_LORA_Q, q_scale);
+        g->w_kv_a_norm[il] = dots3_graph_upload_norm(
+                model, l->attn_kv_a_norm, kv_lora, kv_scale);
+        g->w_k_rope_norm[il] = dots3_graph_upload_norm(
+                model, l->attn_k_rope_norm, DS4_N_ROT, 1.0f);
+        bool ok = g->w_q_a_norm[il] && g->w_kv_a_norm[il] &&
+                  g->w_k_rope_norm[il];
+        if (ok && full) {
+            g->w_idx_k_norm[il] = dots3_graph_upload_norm(
+                    model, l->attn_idx_k_norm, DS4_N_INDEXER_HEAD_DIM, 1.0f);
+            g->w_idx_k_norm_bias[il] = dots3_graph_upload_norm(
+                    model, l->attn_idx_k_norm_bias, DS4_N_INDEXER_HEAD_DIM, 1.0f);
+            ok = g->w_idx_k_norm[il] && g->w_idx_k_norm_bias[il];
+        }
+        if (!ok) {
+            fprintf(stderr, "ds4: dots3 norm upload failed at layer %u\n", il);
+            dots3_graph_free(g);
+            return false;
+        }
+
+        const uint32_t cap = dots3_graph_layer_cache_cap(ctx_cap, g->cap, il);
+        const uint64_t latent_bytes = (uint64_t)cap * kv_lora * sizeof(uint16_t);
+        const uint64_t k_pe_bytes = (uint64_t)cap * DS4_N_ROT * sizeof(uint16_t);
+        g->layer_kv_latent[il] = ds4_gpu_tensor_alloc(latent_bytes);
+        g->layer_k_pe[il] = ds4_gpu_tensor_alloc(k_pe_bytes);
+        if (!g->layer_kv_latent[il] || !g->layer_k_pe[il]) {
+            fprintf(stderr, "ds4: dots3 latent cache allocation failed at layer %u\n", il);
+            dots3_graph_free(g);
+            return false;
+        }
+        total += latent_bytes + k_pe_bytes;
+        if (full) {
+            const uint64_t idx_bytes =
+                (uint64_t)cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            g->layer_idx_k[il] = ds4_gpu_tensor_alloc(idx_bytes);
+            if (!g->layer_idx_k[il]) {
+                fprintf(stderr, "ds4: dots3 indexer cache allocation failed at layer %u\n", il);
+                dots3_graph_free(g);
+                return false;
+            }
+            total += idx_bytes;
+        }
+        g->layer_cache_cap[il] = cap;
+    }
+    const uint64_t score_bytes =
+        (uint64_t)g->idx_sub * ctx_cap * sizeof(float);
+    g->idx_scores = ds4_gpu_tensor_alloc(score_bytes);
+    if (!g->idx_scores) {
+        fprintf(stderr, "ds4: dots3 indexer score scratch allocation failed\n");
+        dots3_graph_free(g);
+        return false;
+    }
+    total += score_bytes;
+    g->ctx_cap = ctx_cap;
+    g->cache_len = 0;
+    g->cache_bytes = total;
+    g->cache_ready = true;
+    fprintf(stderr,
+            "ds4: dots3 resident KV allocated: ctx=%u, %.3f GiB "
+            "(latent+k_pe BF16, DSA keys F32, SWA rings)\n",
+            ctx_cap, (double)total / 1073741824.0);
+    return true;
+}
+
+static bool dots3_graph_attention(
+        ds4_dots3_gpu_graph *g, const ds4_model *model,
+        const ds4_layer_weights *l, uint32_t rows,
+        uint32_t pos0, uint32_t il) {
+    const bool full = ds4_dots3_layer_is_full_attention(il);
+    const uint32_t heads = ds4_dots3_layer_heads(il);
+    const uint32_t kv_lora = ds4_dots3_layer_kv_lora(il);
+    const uint32_t qk_dim = ds4_dots3_layer_qk_dim(il);
+    const uint32_t nope = qk_dim - DS4_N_ROT;
+    const uint32_t kv_raw_dim = kv_lora + DS4_N_ROT;
+    const uint32_t cache_cap = g->layer_cache_cap[il];
+    const ds4_gpu_tensor *inv = full ? g->inv_full : g->inv_swa;
+    const float scale = 1.0f / sqrtf((float)qk_dim);
+#define D3_ATTN(expr, stage) do { if (!(expr)) {                              \
+        fprintf(stderr, "ds4: dots3 layer %u attention failed at %s\n",      \
+                il, stage); return false; } } while (0)
+
+    /* Queries: q_a -> RMSNorm (rescale folded) -> q_b -> tail rope. */
+    D3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->q_raw, model->map, model->size, l->attn_q_a->abs_offset,
+            DS4_N_EMBD, DS4_N_LORA_Q, g->norm, rows), "q_a");
+    D3_ATTN(ds4_gpu_dots3_rms_norm_dev_tensor(
+            g->q_lora, g->q_raw, g->w_q_a_norm[il], DS4_N_LORA_Q,
+            DS4_N_LORA_Q, 0u, rows, DS4_RMS_EPS), "q_a norm");
+    D3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->q_raw, model->map, model->size, l->attn_q_b->abs_offset,
+            DS4_N_LORA_Q, (uint64_t)heads * qk_dim, g->q_lora, rows), "q_b");
+    D3_ATTN(ds4_gpu_dots3_rope_interleaved_tensor(
+            g->q_raw, g->positions, inv, rows, heads, qk_dim,
+            DS4_N_ROT, nope), "q rope");
+
+    /* Compressed KV: split, norm both parts, rotate k_pe, store BF16. */
+    D3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->kv_raw, model->map, model->size, l->attn_kv_a_mqa->abs_offset,
+            DS4_N_EMBD, kv_raw_dim, g->norm, rows), "kv_a");
+    D3_ATTN(ds4_gpu_dots3_rms_norm_dev_tensor(
+            g->kv_norm, g->kv_raw, g->w_kv_a_norm[il], kv_lora,
+            kv_raw_dim, 0u, rows, DS4_RMS_EPS), "kv norm");
+    D3_ATTN(ds4_gpu_dots3_rms_norm_dev_tensor(
+            g->k_pe, g->kv_raw, g->w_k_rope_norm[il], DS4_N_ROT,
+            kv_raw_dim, kv_lora, rows, DS4_RMS_EPS), "k_pe norm");
+    D3_ATTN(ds4_gpu_dots3_rope_interleaved_tensor(
+            g->k_pe, g->positions, inv, rows, 1u, DS4_N_ROT,
+            DS4_N_ROT, 0u), "k_pe rope");
+    D3_ATTN(ds4_gpu_dots3_store_latent_kpe_tensor(
+            g->layer_kv_latent[il], g->layer_k_pe[il], g->kv_norm, g->k_pe,
+            g->positions, rows, cache_cap, kv_lora, DS4_N_ROT, !full),
+            "latent store");
+
+    /* DSA lightning indexer on full layers: keys always (the cache must be
+     * complete before any later query needs it), selection only once the
+     * causal prefix can exceed top-k. */
+    const ds4_gpu_tensor *selection = NULL;
+    if (full) {
+        D3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+                g->idx_k, model->map, model->size, l->attn_idx_k->abs_offset,
+                DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM, g->norm, rows), "idx k");
+        D3_ATTN(ds4_gpu_dots3_layernorm_dev_tensor(
+                g->idx_k, g->w_idx_k_norm[il], g->w_idx_k_norm_bias[il],
+                DS4_N_INDEXER_HEAD_DIM, rows, 1.0e-6f), "idx k norm");
+        D3_ATTN(ds4_gpu_dots3_rope_interleaved_tensor(
+                g->idx_k, g->positions, g->inv_full, rows, 1u,
+                DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT, 0u), "idx k rope");
+        D3_ATTN(ds4_gpu_motif3_round_bf16_tensor(
+                g->idx_k, g->idx_k,
+                (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM), "idx k bf16");
+        D3_ATTN(ds4_gpu_dots3_fp8_roundtrip_tensor(g->idx_k, rows), "idx k fp8");
+        D3_ATTN(ds4_gpu_dots3_idx_store_tensor(
+                g->layer_idx_k[il], g->idx_k, g->positions, rows, cache_cap),
+                "idx k store");
+
+        const uint32_t end = pos0 + rows;
+        if (end > DS4_N_INDEXER_TOP_K) {
+            D3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+                    g->idx_q, model->map, model->size,
+                    l->attn_idx_q_b->abs_offset, DS4_N_LORA_Q,
+                    (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
+                    g->q_lora, rows), "idx q");
+            D3_ATTN(ds4_gpu_dots3_rope_interleaved_tensor(
+                    g->idx_q, g->positions, g->inv_full, rows,
+                    DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                    DS4_N_ROT, 0u), "idx q rope");
+            D3_ATTN(ds4_gpu_dots3_fp8_roundtrip_tensor(
+                    g->idx_q, rows * DS4_N_INDEXER_HEAD), "idx q fp8");
+            D3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+                    g->idx_w, model->map, model->size,
+                    l->attn_idx_w->abs_offset, DS4_N_EMBD,
+                    DS4_N_INDEXER_HEAD, g->norm, rows), "idx w");
+            D3_ATTN(ds4_gpu_dots3_scale_tensor(
+                    g->idx_w,
+                    1.0f / sqrtf((float)DS4_N_INDEXER_HEAD_DIM *
+                                 (float)DS4_N_INDEXER_HEAD),
+                    (uint64_t)rows * DS4_N_INDEXER_HEAD), "idx w scale");
+            for (uint32_t sub = 0; sub < rows; sub += g->idx_sub) {
+                const uint32_t sub_rows =
+                    rows - sub < g->idx_sub ? rows - sub : g->idx_sub;
+                ds4_gpu_tensor *q_view = ds4_gpu_tensor_view(
+                        g->idx_q,
+                        (uint64_t)sub * DS4_N_INDEXER_HEAD *
+                            DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        (uint64_t)sub_rows * DS4_N_INDEXER_HEAD *
+                            DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                ds4_gpu_tensor *w_view = ds4_gpu_tensor_view(
+                        g->idx_w,
+                        (uint64_t)sub * DS4_N_INDEXER_HEAD * sizeof(float),
+                        (uint64_t)sub_rows * DS4_N_INDEXER_HEAD * sizeof(float));
+                ds4_gpu_tensor *p_view = ds4_gpu_tensor_view(
+                        g->positions, (uint64_t)sub * sizeof(int32_t),
+                        (uint64_t)sub_rows * sizeof(int32_t));
+                ds4_gpu_tensor *s_view = ds4_gpu_tensor_view(
+                        g->idx_selected,
+                        (uint64_t)sub * DS4_N_INDEXER_TOP_K * sizeof(int32_t),
+                        (uint64_t)sub_rows * DS4_N_INDEXER_TOP_K *
+                            sizeof(int32_t));
+                const bool sub_ok = q_view && w_view && p_view && s_view &&
+                    ds4_gpu_dots3_idx_score_tensor(
+                        g->idx_scores, q_view, w_view, g->layer_idx_k[il],
+                        p_view, sub_rows, end, cache_cap) &&
+                    ds4_gpu_indexer_topk_tensor(
+                        s_view, g->idx_scores, end, sub_rows,
+                        DS4_N_INDEXER_TOP_K, 0u, UINT32_MAX);
+                ds4_gpu_tensor_free(s_view);
+                ds4_gpu_tensor_free(p_view);
+                ds4_gpu_tensor_free(w_view);
+                ds4_gpu_tensor_free(q_view);
+                D3_ATTN(sub_ok, "idx score/top-k");
+            }
+            selection = g->idx_selected;
+        }
+    }
+
+    /* Absorb W_UK into Q, run the latent attention, project values, gate. */
+    D3_ATTN(ds4_gpu_motif3_qk_absorb_q8_0_tensor(
+            g->q_absorbed, g->q_raw, model->map, model->size,
+            l->attn_kv_b->abs_offset, rows, heads, heads, 1u,
+            kv_lora, nope, qk_dim, DS4_N_VALUE_MLA), "qk absorb");
+    D3_ATTN(ds4_gpu_dots3_latent_attention_tensor(
+            g->latent_out, g->q_raw, g->q_absorbed,
+            g->layer_kv_latent[il], g->layer_k_pe[il],
+            selection, selection ? DS4_N_INDEXER_TOP_K : 0u,
+            rows, pos0, cache_cap, full ? 0u : DS4_N_SWA,
+            heads, kv_lora, nope, DS4_N_ROT, scale), "latent attention");
+    D3_ATTN(ds4_gpu_motif3_value_project_q8_0_tensor(
+            g->attention, g->latent_out, model->map, model->size,
+            l->attn_kv_b->abs_offset, rows, heads, heads, 1u,
+            kv_lora, nope, DS4_N_VALUE_MLA, 0), "value projection");
+    D3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->gate_logits, model->map, model->size, l->attn_gate->abs_offset,
+            DS4_N_EMBD, heads, g->norm, rows), "gate projection");
+    D3_ATTN(ds4_gpu_dots3_gate_mul_tensor(
+            g->attention, g->gate_logits, rows, heads, DS4_N_VALUE_MLA),
+            "headwise gate");
+    D3_ATTN(ds4_gpu_matmul_q8_0_tensor(
+            g->block_out, model->map, model->size, l->attn_output->abs_offset,
+            (uint64_t)heads * DS4_N_VALUE_MLA, DS4_N_EMBD,
+            g->attention, rows), "output projection");
+#undef D3_ATTN
+    return true;
+}
+
+static bool dots3_graph_ffn(
+        ds4_dots3_gpu_graph *g, const ds4_model *model,
+        const ds4_layer_weights *l, uint32_t rows, uint32_t il) {
+#define D3_FFN(expr, stage) do { if (!(expr)) {                               \
+        fprintf(stderr, "ds4: dots3 layer %u FFN failed at %s\n",            \
+                il, stage); return false; } } while (0)
+    if (!l->ffn_gate_exps) {
+        D3_FFN(ds4_gpu_matmul_q8_0_pair_tensor(
+                g->dense_gate, g->dense_up, model->map, model->size,
+                l->ffn_gate->abs_offset, l->ffn_up->abs_offset,
+                DS4_N_EMBD, DS4_N_FF_DENSE, DS4_N_FF_DENSE,
+                g->norm, rows), "dense gate/up");
+        D3_FFN(ds4_gpu_exaone_swiglu_tensor(
+                g->dense_mid, g->dense_gate, g->dense_up,
+                (uint64_t)rows * DS4_N_FF_DENSE), "dense swiglu");
+        D3_FFN(ds4_gpu_matmul_q8_0_tensor(
+                g->ffn_out, model->map, model->size, l->ffn_down->abs_offset,
+                DS4_N_FF_DENSE, DS4_N_EMBD, g->dense_mid, rows), "dense down");
+        return true;
+#undef D3_FFN
+    }
+#define D3_FFN(expr, stage) do { if (!(expr)) {                               \
+        fprintf(stderr, "ds4: dots3 layer %u FFN failed at %s\n",            \
+                il, stage); return false; } } while (0)
+    D3_FFN(ds4_gpu_matmul_f32_tensor(
+            g->router_logits, model->map, model->size,
+            l->ffn_gate_inp->abs_offset, DS4_N_EMBD, DS4_N_EXPERT,
+            g->norm, rows), "router projection");
+    D3_FFN(ds4_gpu_dots3_router_tensor(
+            g->selected, g->route_weights, g->router_logits,
+            model->map, model->size, l->ffn_exp_probs_b->abs_offset,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, rows), "router top-8");
+
+    const uint64_t n_ff_exp = l->ffn_gate_exps->dim[1];
+    const int handoff = ds4_gpu_routed_iq2_q3_handoff_tensor(
+            g->routed_down, g->routed_gate, g->routed_up, g->routed_mid,
+            g->norm, g->selected, g->route_weights, model->map, model->size,
+            l->ffn_gate_exps->abs_offset, l->ffn_gate_exps->bytes,
+            l->ffn_up_exps->abs_offset, l->ffn_up_exps->bytes,
+            l->ffn_down_exps->abs_offset, l->ffn_down_exps->bytes,
+            l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            (uint32_t)DS4_N_EMBD, (uint32_t)n_ff_exp, (uint32_t)DS4_N_EMBD,
+            DS4_N_EXPERT, rows, DS4_N_EXPERT_USED);
+    if (handoff < 0) return false;
+    if (handoff == 0) {
+        D3_FFN(ds4_gpu_routed_gate_up_tensor(
+                g->routed_gate, g->routed_up, g->norm, g->selected,
+                model->map, model->size,
+                l->ffn_gate_exps->abs_offset, l->ffn_gate_exps->bytes,
+                l->ffn_up_exps->abs_offset, l->ffn_up_exps->bytes,
+                l->ffn_gate_exps->type,
+                (uint32_t)DS4_N_EMBD, (uint32_t)n_ff_exp, DS4_N_EXPERT,
+                rows, DS4_N_EXPERT_USED), "routed gate/up");
+        D3_FFN(ds4_gpu_swiglu_weighted_tensor(
+                g->routed_mid, g->routed_gate, g->routed_up, g->route_weights,
+                (uint32_t)n_ff_exp,
+                (uint64_t)rows * DS4_N_EXPERT_USED * n_ff_exp),
+                "routed swiglu");
+        D3_FFN(ds4_gpu_routed_matmul_bounded_tensor(
+                g->routed_down, g->routed_mid, g->selected,
+                model->map, model->size,
+                l->ffn_down_exps->abs_offset, l->ffn_down_exps->bytes,
+                l->ffn_down_exps->type,
+                (uint32_t)n_ff_exp, (uint32_t)DS4_N_EMBD, DS4_N_EXPERT,
+                rows * DS4_N_EXPERT_USED, 1u, rows), "routed down");
+    }
+    D3_FFN(ds4_gpu_matmul_q8_0_pair_tensor(
+            g->shared_gate, g->shared_up, model->map, model->size,
+            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_FF_EXP, g->norm, rows),
+            "shared gate/up");
+    D3_FFN(ds4_gpu_exaone_swiglu_tensor(
+            g->shared_mid, g->shared_gate, g->shared_up,
+            (uint64_t)rows * DS4_N_FF_EXP), "shared swiglu");
+    D3_FFN(ds4_gpu_matmul_q8_0_tensor(
+            g->shared_out, model->map, model->size,
+            l->ffn_down_shexp->abs_offset, DS4_N_FF_EXP, DS4_N_EMBD,
+            g->shared_mid, rows), "shared down");
+    /* Route weights were folded into routed_mid; sum the eight expert rows
+     * then add the unweighted shared expert. */
+    D3_FFN(ds4_gpu_moe_sum_tensor(
+            g->ffn_out, g->routed_down, (uint32_t)DS4_N_EMBD,
+            DS4_N_EXPERT_USED, rows), "routed sum");
+    D3_FFN(ds4_gpu_exaone_add_tensor(
+            g->ffn_out, g->shared_out, (uint64_t)rows * DS4_N_EMBD),
+            "shared add");
+#undef D3_FFN
+    return true;
+}
+
+/* One chunk of the latent forward: prefill (rows > 1) and decode (rows == 1)
+ * share this body.  pos0 must equal cache_len; logits, when requested, are
+ * the last row's. */
+static bool dots3_graph_forward_chunk(
+        ds4_dots3_gpu_graph *g, const ds4_model *model,
+        const ds4_weights *weights, const int *tokens,
+        uint32_t rows, uint32_t pos0, float *host_logits) {
+    if (!g || !g->ready || !g->cache_ready || !model || !weights || !tokens ||
+        rows == 0 || rows > g->cap || pos0 != g->cache_len ||
+        pos0 + rows > g->ctx_cap) {
+        return false;
+    }
+    int32_t *token_ids = xmalloc((size_t)rows * sizeof(token_ids[0]));
+    int32_t *positions = xmalloc((size_t)rows * sizeof(positions[0]));
+    bool ok = true;
+    for (uint32_t i = 0; i < rows; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) ok = false;
+        token_ids[i] = tokens[i];
+        positions[i] = (int32_t)(pos0 + i);
+    }
+    if (ok) ok = ds4_gpu_tensor_write(
+            g->tokens, 0, token_ids, (uint64_t)rows * sizeof(token_ids[0])) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(
+            g->positions, 0, positions,
+            (uint64_t)rows * sizeof(positions[0])) != 0;
+    free(positions);
+    free(token_ids);
+    if (!ok) return false;
+
+#define D3_FORWARD(expr, stage) do { if (!(expr)) {                           \
+        fprintf(stderr, "ds4: dots3 forward failed at %s\n", stage);         \
+        return false; } } while (0)
+    D3_FORWARD(ds4_gpu_embed_tokens_q8_0_tensor(
+            g->x, g->tokens, model->map, model->size,
+            weights->token_embd->abs_offset, DS4_N_VOCAB, rows, DS4_N_EMBD),
+            "token embedding");
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const bool trace = getenv("DS4_DOTS3_FORWARD_TRACE") != NULL;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        D3_FORWARD(ds4_gpu_rms_norm_weight_rows_tensor(
+                g->norm, g->x, model->map, model->size,
+                l->attn_norm->abs_offset, (uint32_t)DS4_N_EMBD, rows,
+                DS4_RMS_EPS), "attention norm");
+        D3_FORWARD(dots3_graph_attention(g, model, l, rows, pos0, il),
+                   "attention");
+        D3_FORWARD(ds4_gpu_exaone_add_tensor(
+                g->x, g->block_out, (uint64_t)rows * DS4_N_EMBD),
+                "attention residual");
+        D3_FORWARD(ds4_gpu_rms_norm_weight_rows_tensor(
+                g->norm, g->x, model->map, model->size,
+                l->ffn_norm->abs_offset, (uint32_t)DS4_N_EMBD, rows,
+                DS4_RMS_EPS), "FFN norm");
+        D3_FORWARD(dots3_graph_ffn(g, model, l, rows, il), "FFN");
+        D3_FORWARD(ds4_gpu_exaone_add_tensor(
+                g->x, g->ffn_out, (uint64_t)rows * DS4_N_EMBD),
+                "FFN residual");
+        if (trace) {
+            fprintf(stderr, "ds4: dots3 forward layer %u/%u\n",
+                    il + 1u, n_exec);
+        }
+    }
+    if (host_logits) {
+        ds4_gpu_tensor *last = ds4_gpu_tensor_view(
+                g->x, (uint64_t)(rows - 1u) * DS4_N_EMBD * sizeof(float),
+                (uint64_t)DS4_N_EMBD * sizeof(float));
+        if (!last) return false;
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(
+                g->final_norm, last, model->map, model->size,
+                weights->output_norm->abs_offset, (uint32_t)DS4_N_EMBD, 1u,
+                DS4_RMS_EPS) != 0;
+        ds4_gpu_tensor_free(last);
+        D3_FORWARD(ok, "output norm");
+        D3_FORWARD(ds4_gpu_matmul_q8_0_tensor(
+                g->logits, model->map, model->size,
+                weights->output->abs_offset, DS4_N_EMBD, DS4_N_VOCAB,
+                g->final_norm, 1u), "LM head");
+        D3_FORWARD(ds4_gpu_tensor_read(
+                g->logits, 0, host_logits,
+                (uint64_t)DS4_N_VOCAB * sizeof(host_logits[0])),
+                "logits readback");
+    }
+#undef D3_FORWARD
+    g->cache_len = pos0 + rows;
     return true;
 }
 
@@ -38045,6 +38842,7 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
 #define DS4_SESSION_SOLAR_LAYOUT_MAGIC UINT32_C(0x33524c53) /* "SLR3" */
 #define DS4_SESSION_EXAONE_LAYOUT_MAGIC UINT32_C(0x33415845) /* "EXA3" */
 #define DS4_SESSION_MOTIF3_LAYOUT_MAGIC UINT32_C(0x3346544d) /* "MTF3" */
+#define DS4_SESSION_DOTS3_LAYOUT_MAGIC  UINT32_C(0x33535444) /* "DTS3" */
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
@@ -38663,6 +39461,212 @@ static int motif3_payload_restore_graph(
     *tokens_out = tokens;
     return 0;
 }
+
+/* dots3-note serial payload: tokens, logits, then per executable layer the
+ * live BF16 latent + k_pe rows (per-layer geometry) and, on full-attention
+ * layers, the F32 DSA key rows.  Ring layers persist their raw slot span so
+ * a restore reproduces the exact position->slot mapping. */
+static uint64_t dots3_payload_bytes_for_graph(
+        const ds4_dots3_gpu_graph *g, uint32_t n_tokens) {
+    if (!g || !g->cache_ready || n_tokens == 0u ||
+        n_tokens >= g->ctx_cap || g->cap == 0u ||
+        g->cache_len != n_tokens) {
+        return 0u;
+    }
+    uint64_t bytes =
+        (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    if (!payload_u64_add(&bytes, (uint64_t)n_tokens * sizeof(uint32_t)) ||
+        !payload_u64_add(&bytes, (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        return 0u;
+    }
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        const uint32_t cap = dots3_graph_layer_cache_cap(g->ctx_cap, g->cap, il);
+        if (!g->layer_kv_latent[il] || !g->layer_k_pe[il] ||
+            cap == 0u || g->layer_cache_cap[il] != cap) {
+            return 0u;
+        }
+        const uint32_t rows = n_tokens < cap ? n_tokens : cap;
+        const uint64_t latent_row = (uint64_t)ds4_dots3_layer_kv_lora(il) *
+                                    sizeof(uint16_t);
+        if (!payload_u64_add(&bytes, (uint64_t)rows * latent_row) ||
+            !payload_u64_add(&bytes,
+                             (uint64_t)rows * DS4_N_ROT * sizeof(uint16_t))) {
+            return 0u;
+        }
+        if (ds4_dots3_layer_is_full_attention(il)) {
+            if (!g->layer_idx_k[il] ||
+                !payload_u64_add(&bytes,
+                                 (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM *
+                                     sizeof(float))) {
+                return 0u;
+            }
+        }
+    }
+    return bytes;
+}
+
+static int dots3_payload_save_graph(
+        ds4_dots3_gpu_graph *g, const int *tokens, uint32_t n_tokens,
+        const float *logits, FILE *fp, char *err, size_t errlen) {
+    if (!fp || !tokens || dots3_payload_bytes_for_graph(g, n_tokens) == 0u) {
+        payload_set_err(err, errlen, "invalid dots3 session payload layout");
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) {
+            payload_set_err(err, errlen,
+                            "dots3 session payload contains an invalid token");
+            return 1;
+        }
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator before dots3 snapshot");
+        return 1;
+    }
+    const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC,
+        DS4_SESSION_PAYLOAD_VERSION,
+        g->ctx_cap,
+        g->cap,
+        DS4_N_KV_LORA,
+        DS4_SESSION_DOTS3_LAYOUT_MAGIC,
+        DS4_N_SWA_KV_LORA,
+        n_tokens,
+        DS4_N_LAYER,
+        DS4_N_ROT,
+        DS4_N_INDEXER_HEAD_DIM,
+        DS4_N_VOCAB,
+        n_tokens,
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (payload_write_u32(fp, (uint32_t)tokens[i], err, errlen) != 0)
+            return 1;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = payload_write_logits(fp, logits, buf, err, errlen);
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t il = 0; rc == 0 && il < n_exec; il++) {
+        const uint32_t cap = dots3_graph_layer_cache_cap(g->ctx_cap, g->cap, il);
+        const uint32_t rows = n_tokens < cap ? n_tokens : cap;
+        const uint64_t latent_row = (uint64_t)ds4_dots3_layer_kv_lora(il) *
+                                    sizeof(uint16_t);
+        rc = payload_write_tensor_span(
+            fp, g->layer_kv_latent[il], 0, (uint64_t)rows * latent_row,
+            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0) {
+            rc = payload_write_tensor_span(
+                fp, g->layer_k_pe[il], 0,
+                (uint64_t)rows * DS4_N_ROT * sizeof(uint16_t),
+                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+        if (rc == 0 && ds4_dots3_layer_is_full_attention(il)) {
+            rc = payload_write_tensor_span(
+                fp, g->layer_idx_k[il], 0,
+                (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+    }
+    free(buf);
+    return rc;
+}
+
+static int dots3_payload_restore_graph(
+        ds4_dots3_gpu_graph *g, FILE *fp, uint64_t *remaining,
+        const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS],
+        int **tokens_out, float *logits, char *err, size_t errlen) {
+    const uint32_t n_tokens = h[7];
+    if (!g || !fp || !remaining || !tokens_out || !logits ||
+        h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
+        h[1] != DS4_SESSION_PAYLOAD_VERSION ||
+        h[2] != g->ctx_cap || h[3] != g->cap ||
+        h[4] != DS4_N_KV_LORA ||
+        h[5] != DS4_SESSION_DOTS3_LAYOUT_MAGIC ||
+        h[6] != DS4_N_SWA_KV_LORA || h[8] != DS4_N_LAYER ||
+        h[9] != DS4_N_ROT || h[10] != DS4_N_INDEXER_HEAD_DIM ||
+        h[11] != DS4_N_VOCAB || h[12] != n_tokens) {
+        payload_set_err(err, errlen,
+                        "session payload was written for a different dots3 layout");
+        return 1;
+    }
+    g->cache_len = n_tokens;
+    const uint64_t total = dots3_payload_bytes_for_graph(g, n_tokens);
+    const uint64_t header_bytes =
+        (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    if (total == 0u || *remaining != total - header_bytes) {
+        g->cache_len = 0u;
+        payload_set_err(err, errlen,
+                        "dots3 session payload byte count does not match its header");
+        return 1;
+    }
+    int *tokens = xmalloc((size_t)n_tokens * sizeof(*tokens));
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < n_tokens; i++) {
+        uint32_t tok = 0u;
+        rc = payload_read_u32(fp, &tok, remaining, err, errlen);
+        if (rc == 0 && tok >= DS4_N_VOCAB) {
+            payload_set_err(err, errlen,
+                            "dots3 session payload contains an invalid token");
+            rc = 1;
+        }
+        tokens[i] = (int)tok;
+    }
+    if (rc == 0) {
+        rc = payload_read_bytes(
+            fp, logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
+            remaining, err, errlen);
+    }
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator before dots3 restore");
+        rc = 1;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t il = 0; rc == 0 && il < n_exec; il++) {
+        const uint32_t cap = dots3_graph_layer_cache_cap(g->ctx_cap, g->cap, il);
+        const uint32_t rows = n_tokens < cap ? n_tokens : cap;
+        const uint64_t latent_row = (uint64_t)ds4_dots3_layer_kv_lora(il) *
+                                    sizeof(uint16_t);
+        rc = payload_read_tensor_span(
+            fp, g->layer_kv_latent[il], 0, (uint64_t)rows * latent_row,
+            buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+        if (rc == 0) {
+            rc = payload_read_tensor_span(
+                fp, g->layer_k_pe[il], 0,
+                (uint64_t)rows * DS4_N_ROT * sizeof(uint16_t),
+                buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+        }
+        if (rc == 0 && ds4_dots3_layer_is_full_attention(il)) {
+            rc = payload_read_tensor_span(
+                fp, g->layer_idx_k[il], 0,
+                (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+        }
+    }
+    free(buf);
+    if (rc == 0 && *remaining != 0u) {
+        payload_set_err(err, errlen,
+                        "dots3 session payload has trailing bytes");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator after dots3 restore");
+        rc = 1;
+    }
+    if (rc != 0) {
+        free(tokens);
+        g->cache_len = 0u;
+        return rc;
+    }
+    *tokens_out = tokens;
+    return 0;
+}
 #endif
 
 static DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const ds4_gpu_tensor *tensor,
@@ -38760,6 +39764,10 @@ static bool ds4_session_is_solar(const ds4_session *s) {
 
 static DS4_MAYBE_UNUSED bool ds4_session_is_exaone(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE;
+}
+
+static DS4_MAYBE_UNUSED bool ds4_session_is_dots3(const ds4_session *s) {
+    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE;
 }
 static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
@@ -41034,6 +42042,14 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         return motif3_payload_bytes_for_graph(
             &s->motif3_graph, (uint32_t)s->checkpoint.len);
     }
+    if (ds4_session_is_dots3(s)) {
+        if (!s->dots3_graph_ready ||
+            s->dots3_graph.cache_len != (uint32_t)s->checkpoint.len) {
+            return 0u;
+        }
+        return dots3_payload_bytes_for_graph(
+            &s->dots3_graph, (uint32_t)s->checkpoint.len);
+    }
     if (ds4_session_is_exaone(s)) {
         if (!s->exaone_graph_ready) return 0u;
         return exaone_payload_bytes_for_graph(
@@ -41202,6 +42218,18 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         }
         return motif3_payload_save_graph(
             &s->motif3_graph, s->checkpoint.v,
+            (uint32_t)s->checkpoint.len, s->logits,
+            fp, err, errlen);
+    }
+    if (ds4_session_is_dots3(s)) {
+        if (!s->dots3_graph_ready ||
+            s->dots3_graph.cache_len != (uint32_t)s->checkpoint.len) {
+            payload_set_err(err, errlen,
+                            "dots3 graph has no valid latent state to snapshot");
+            return 1;
+        }
+        return dots3_payload_save_graph(
+            &s->dots3_graph, s->checkpoint.v,
             (uint32_t)s->checkpoint.len, s->logits,
             fp, err, errlen);
     }
@@ -41630,6 +42658,13 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             s->motif3_graph.cache_len = 0u;
             s->motif3_graph.mtp_cache_len = 0u;
         }
+    } else if (ds4_session_is_dots3(s)) {
+        s->checkpoint_valid = false;
+        s->checkpoint.len = 0;
+        s->mtp_draft_valid = false;
+        if (s->dots3_graph_ready) {
+            s->dots3_graph.cache_len = 0u;
+        }
     } else if (ds4_session_is_exaone(s)) {
         s->checkpoint_valid = false;
         s->checkpoint.len = 0;
@@ -41659,7 +42694,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return session_solar_load_payload(
             s, fp, &remaining, h, err, errlen);
     }
-    if (ds4_session_is_motif3(s) || ds4_session_is_exaone(s)) {
+    if (ds4_session_is_motif3(s) || ds4_session_is_exaone(s) ||
+        ds4_session_is_dots3(s)) {
         if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;
         float *new_logits = xmalloc(
             (size_t)DS4_N_VOCAB * sizeof(*new_logits));
@@ -41667,6 +42703,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         const int rc = ds4_session_is_motif3(s)
             ? motif3_payload_restore_graph(
                   &s->motif3_graph, fp, &remaining, h,
+                  &tokens, new_logits, err, errlen)
+            : ds4_session_is_dots3(s)
+            ? dots3_payload_restore_graph(
+                  &s->dots3_graph, fp, &remaining, h,
                   &tokens, new_logits, err, errlen)
             : exaone_payload_restore_graph(
                   &s->exaone_graph, fp, &remaining, h,
@@ -41679,6 +42719,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             if (ds4_session_is_motif3(s)) {
                 s->motif3_graph.cache_len = 0u;
                 s->motif3_graph.mtp_cache_len = 0u;
+            }
+            if (ds4_session_is_dots3(s)) {
+                s->dots3_graph.cache_len = 0u;
             }
             return 1;
         }
@@ -51792,6 +52835,319 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+/* =========================================================================
+ * dots3-note CPU reference forward
+ * =========================================================================
+ *
+ * A literal FP32 transcription of the official Dots3NoteText equations over
+ * the dequantized MQ87 tensors, for short prompts.  There are no official
+ * activation fixtures for this family, so this is the independent
+ * implementation the CUDA graph is gated against: same weights, same math,
+ * different code path.  Within 2048 tokens the DSA selection covers the whole
+ * causal prefix, so the dense causal/windowed attention here is exactly the
+ * official behavior. */
+
+static void dots3_ref_dequant_row(
+        const ds4_model *m, const ds4_tensor *t, uint64_t expert,
+        uint64_t row, float *out) {
+    const uint64_t in_dim = t->dim[0];
+    const uint8_t *base = (const uint8_t *)m->map + t->abs_offset;
+    if (t->ndim == 3) {
+        base += expert * (t->bytes / t->dim[2]);
+    }
+    switch (t->type) {
+    case DS4_TENSOR_F32:
+        memcpy(out, (const float *)base + row * in_dim,
+               (size_t)in_dim * sizeof(float));
+        return;
+    case DS4_TENSOR_Q8_0:
+        dots3_dequant_q8_0(base + row * ((in_dim / 32u) * 34u), out, in_dim);
+        return;
+    case DS4_TENSOR_IQ2_XXS: {
+        const uint8_t *rp = base + row * ((in_dim / QK_K) * sizeof(block_iq2_xxs));
+        for (uint64_t b = 0; b < in_dim / QK_K; b++) {
+            dots3_dequant_iq2_xxs_block(
+                (const block_iq2_xxs *)(rp + b * sizeof(block_iq2_xxs)),
+                out + b * QK_K);
+        }
+        return;
+    }
+    case DS4_TENSOR_Q2_K: {
+        const uint8_t *rp = base + row * ((in_dim / QK_K) * sizeof(block_q2_K));
+        for (uint64_t b = 0; b < in_dim / QK_K; b++) {
+            dots3_dequant_q2_K_block(
+                (const block_q2_K *)(rp + b * sizeof(block_q2_K)),
+                out + b * QK_K);
+        }
+        return;
+    }
+    default:
+        ds4_die("dots3 reference cannot dequantize this tensor type");
+    }
+}
+
+/* out[o] = sum_i W[i, o] * in[i] over a whole (possibly expert-sliced)
+ * projection, dequantizing one output row at a time. */
+static void dots3_ref_matvec(
+        const ds4_model *m, const ds4_tensor *t, uint64_t expert,
+        const float *in, float *out, float *scratch) {
+    const uint64_t in_dim = t->dim[0];
+    const uint64_t out_dim = t->dim[1];
+    for (uint64_t o = 0; o < out_dim; o++) {
+        dots3_ref_dequant_row(m, t, expert, o, scratch);
+        double acc = 0.0;
+        for (uint64_t i = 0; i < in_dim; i++) {
+            acc += (double)scratch[i] * in[i];
+        }
+        out[o] = (float)acc;
+    }
+}
+
+static void dots3_ref_rms(const float *in, const float *w, float *out,
+                          uint32_t dim, float eps) {
+    double ss = 0.0;
+    for (uint32_t i = 0; i < dim; i++) ss += (double)in[i] * in[i];
+    const float inv = 1.0f / sqrtf((float)(ss / dim) + eps);
+    for (uint32_t i = 0; i < dim; i++) out[i] = in[i] * inv * w[i];
+}
+
+static void dots3_ref_rope(float *x, uint32_t pos, uint32_t rot,
+                           uint32_t offset, float base) {
+    for (uint32_t f = 0; f < rot / 2u; f++) {
+        const float inv = 1.0f / powf(base, (2.0f * (float)f) / (float)rot);
+        double s, c;
+        sincos((double)((float)pos * inv), &s, &c);
+        const float even = x[offset + 2u * f];
+        const float odd = x[offset + 2u * f + 1u];
+        x[offset + 2u * f] = even * (float)c - odd * (float)s;
+        x[offset + 2u * f + 1u] = odd * (float)c + even * (float)s;
+    }
+}
+
+/* Dequantize one norm vector (Q8_0 or F32) into `out`. */
+static void dots3_ref_norm_weight(
+        const ds4_model *m, const ds4_tensor *t, float *out) {
+    dots3_ref_dequant_row(m, t, 0, 0, out);
+}
+
+int ds4_engine_dots3_reference_logits(
+        ds4_engine *e, const int *tokens, int n_tokens, float *logits_out) {
+    if (!e || !tokens || !logits_out || n_tokens <= 0 || n_tokens > 256 ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        return 1;
+    }
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+    const uint32_t n = (uint32_t)n_tokens;
+    const uint32_t n_embd = DS4_N_EMBD;
+    const uint32_t wide_q = DS4_N_HEAD * DS4_N_KEY_MLA;
+    const uint32_t wide_v = DS4_N_HEAD * DS4_N_VALUE_MLA;
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+
+    float *x = xmalloc((size_t)n * n_embd * sizeof(float));
+    float *h = xmalloc((size_t)n * n_embd * sizeof(float));
+    float *scratch = xmalloc((size_t)DS4_N_FF_DENSE * sizeof(float));
+    float *nw = xmalloc((size_t)DS4_N_SWA_KV_LORA * sizeof(float));
+    float *q_lora = xmalloc((size_t)DS4_N_LORA_Q * sizeof(float));
+    float *q = xmalloc((size_t)n * wide_q * sizeof(float));
+    float *k = xmalloc((size_t)n * wide_q * sizeof(float));
+    float *v = xmalloc((size_t)n * wide_v * sizeof(float));
+    float *kv_raw = xmalloc((size_t)(DS4_N_SWA_KV_LORA + DS4_N_ROT) * sizeof(float));
+    float *c_lat = xmalloc((size_t)DS4_N_SWA_KV_LORA * sizeof(float));
+    float *kv_proj = xmalloc((size_t)wide_q * sizeof(float));
+    float *scores = xmalloc((size_t)n * sizeof(float));
+    float *attn = xmalloc((size_t)wide_v * sizeof(float));
+    float *gate = xmalloc((size_t)DS4_N_HEAD * sizeof(float));
+    float *ff_a = xmalloc((size_t)DS4_N_FF_DENSE * sizeof(float));
+    float *ff_b = xmalloc((size_t)DS4_N_FF_DENSE * sizeof(float));
+    float *ff_o = xmalloc((size_t)n_embd * sizeof(float));
+    float *router = xmalloc((size_t)DS4_N_EXPERT * sizeof(float));
+    float *bias = xmalloc((size_t)DS4_N_EXPERT * sizeof(float));
+
+    for (uint32_t t = 0; t < n; t++) {
+        if (tokens[t] < 0 || (uint32_t)tokens[t] >= DS4_N_VOCAB) return 1;
+        dots3_ref_dequant_row(m, w->token_embd, 0, (uint64_t)tokens[t],
+                              x + (uint64_t)t * n_embd);
+    }
+
+    for (uint32_t il = 0; il < n_exec; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const bool full = ds4_dots3_layer_is_full_attention(il);
+        const uint32_t heads = ds4_dots3_layer_heads(il);
+        const uint32_t kv_lora = ds4_dots3_layer_kv_lora(il);
+        const uint32_t qk = ds4_dots3_layer_qk_dim(il);
+        const uint32_t nope = qk - DS4_N_ROT;
+        const float theta = full ? DS4_ROPE_FREQ_BASE : DS4_ROPE_FREQ_BASE_SWA;
+        const float q_rescale = sqrtf((float)n_embd / (float)DS4_N_LORA_Q);
+        const float kv_rescale = sqrtf((float)n_embd / (float)kv_lora);
+        const float scale = 1.0f / sqrtf((float)qk);
+
+        /* Projections + rope for every token first; attention below needs the
+         * whole chunk's K/V. */
+        for (uint32_t t = 0; t < n; t++) {
+            const float *xt = x + (uint64_t)t * n_embd;
+            float *ht = h + (uint64_t)t * n_embd;
+            dots3_ref_norm_weight(m, l->attn_norm, nw);
+            dots3_ref_rms(xt, nw, ht, n_embd, DS4_RMS_EPS);
+
+            dots3_ref_matvec(m, l->attn_q_a, 0, ht, q_lora, scratch);
+            dots3_ref_norm_weight(m, l->attn_q_a_norm, nw);
+            dots3_ref_rms(q_lora, nw, q_lora, DS4_N_LORA_Q, DS4_RMS_EPS);
+            for (uint32_t i = 0; i < DS4_N_LORA_Q; i++) q_lora[i] *= q_rescale;
+            float *qt = q + (uint64_t)t * wide_q;
+            dots3_ref_matvec(m, l->attn_q_b, 0, q_lora, qt, scratch);
+            for (uint32_t hh = 0; hh < heads; hh++) {
+                dots3_ref_rope(qt + (uint64_t)hh * qk, t, DS4_N_ROT, nope, theta);
+            }
+
+            dots3_ref_matvec(m, l->attn_kv_a_mqa, 0, ht, kv_raw, scratch);
+            dots3_ref_norm_weight(m, l->attn_kv_a_norm, nw);
+            dots3_ref_rms(kv_raw, nw, c_lat, kv_lora, DS4_RMS_EPS);
+            for (uint32_t i = 0; i < kv_lora; i++) c_lat[i] *= kv_rescale;
+            float k_pe[DS4_MAX_ROT];
+            dots3_ref_norm_weight(m, l->attn_k_rope_norm, nw);
+            dots3_ref_rms(kv_raw + kv_lora, nw, k_pe, DS4_N_ROT, DS4_RMS_EPS);
+            dots3_ref_rope(k_pe, t, DS4_N_ROT, 0, theta);
+
+            dots3_ref_matvec(m, l->attn_kv_b, 0, c_lat, kv_proj, scratch);
+            float *kt = k + (uint64_t)t * wide_q;
+            float *vt = v + (uint64_t)t * wide_v;
+            for (uint32_t hh = 0; hh < heads; hh++) {
+                const float *src = kv_proj + (uint64_t)hh * (nope + DS4_N_VALUE_MLA);
+                memcpy(kt + (uint64_t)hh * qk, src, nope * sizeof(float));
+                memcpy(kt + (uint64_t)hh * qk + nope, k_pe,
+                       DS4_N_ROT * sizeof(float));
+                memcpy(vt + (uint64_t)hh * DS4_N_VALUE_MLA, src + nope,
+                       DS4_N_VALUE_MLA * sizeof(float));
+            }
+        }
+
+        for (uint32_t t = 0; t < n; t++) {
+            const float *xt = x + (uint64_t)t * n_embd;
+            float *ht = h + (uint64_t)t * n_embd;
+            const uint32_t first =
+                (!full && t + 1u > DS4_N_SWA) ? t + 1u - DS4_N_SWA : 0u;
+            for (uint32_t hh = 0; hh < heads; hh++) {
+                const float *qh = q + (uint64_t)t * wide_q + (uint64_t)hh * qk;
+                float max_score = -INFINITY;
+                for (uint32_t s = first; s <= t; s++) {
+                    const float *kh = k + (uint64_t)s * wide_q + (uint64_t)hh * qk;
+                    double dot = 0.0;
+                    for (uint32_t d = 0; d < qk; d++) dot += (double)qh[d] * kh[d];
+                    scores[s] = (float)dot * scale;
+                    if (scores[s] > max_score) max_score = scores[s];
+                }
+                double denom = 0.0;
+                for (uint32_t s = first; s <= t; s++) {
+                    scores[s] = expf(scores[s] - max_score);
+                    denom += scores[s];
+                }
+                float *oh = attn + (uint64_t)hh * DS4_N_VALUE_MLA;
+                for (uint32_t d = 0; d < DS4_N_VALUE_MLA; d++) {
+                    double acc = 0.0;
+                    for (uint32_t s = first; s <= t; s++) {
+                        acc += (double)scores[s] *
+                               v[(uint64_t)s * wide_v +
+                                 (uint64_t)hh * DS4_N_VALUE_MLA + d];
+                    }
+                    oh[d] = (float)(acc / denom);
+                }
+            }
+            dots3_ref_matvec(m, l->attn_gate, 0, ht, gate, scratch);
+            for (uint32_t hh = 0; hh < heads; hh++) {
+                const float g = 1.0f / (1.0f + expf(-gate[hh]));
+                for (uint32_t d = 0; d < DS4_N_VALUE_MLA; d++) {
+                    attn[(uint64_t)hh * DS4_N_VALUE_MLA + d] *= g;
+                }
+            }
+            dots3_ref_matvec(m, l->attn_output, 0, attn, ff_o, scratch);
+            float *xt_mut = x + (uint64_t)t * n_embd;
+            for (uint32_t i = 0; i < n_embd; i++) xt_mut[i] += ff_o[i];
+            (void)xt;
+        }
+
+        for (uint32_t t = 0; t < n; t++) {
+            float *xt = x + (uint64_t)t * n_embd;
+            float *ht = h + (uint64_t)t * n_embd;
+            dots3_ref_norm_weight(m, l->ffn_norm, nw);
+            dots3_ref_rms(xt, nw, ht, n_embd, DS4_RMS_EPS);
+            if (!l->ffn_gate_exps) {
+                dots3_ref_matvec(m, l->ffn_gate, 0, ht, ff_a, scratch);
+                dots3_ref_matvec(m, l->ffn_up, 0, ht, ff_b, scratch);
+                for (uint32_t i = 0; i < DS4_N_FF_DENSE; i++) {
+                    ff_a[i] = ff_a[i] / (1.0f + expf(-ff_a[i])) * ff_b[i];
+                }
+                dots3_ref_matvec(m, l->ffn_down, 0, ff_a, ff_o, scratch);
+                for (uint32_t i = 0; i < n_embd; i++) xt[i] += ff_o[i];
+                continue;
+            }
+            dots3_ref_matvec(m, l->ffn_gate_inp, 0, ht, router, scratch);
+            memcpy(bias,
+                   (const uint8_t *)m->map + l->ffn_exp_probs_b->abs_offset,
+                   (size_t)DS4_N_EXPERT * sizeof(float));
+            float probs[384];
+            float sel_score[384];
+            for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+                probs[i] = 1.0f / (1.0f + expf(-router[i]));
+                sel_score[i] = probs[i] + bias[i];
+            }
+            int sel[8];
+            float sel_w[8];
+            float sum = 0.0f;
+            for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+                int best = -1;
+                float best_score = -INFINITY;
+                for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+                    if (sel_score[i] > best_score) {
+                        best_score = sel_score[i];
+                        best = (int)i;
+                    }
+                }
+                sel[slot] = best;
+                sel_w[slot] = probs[best];
+                sum += probs[best];
+                sel_score[best] = -INFINITY;
+            }
+            for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+                sel_w[slot] /= (sum + 1.0e-20f);
+            }
+            float acc_out[5120];
+            memset(acc_out, 0, sizeof(float) * n_embd);
+            for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+                const uint64_t ex = (uint64_t)sel[slot];
+                dots3_ref_matvec(m, l->ffn_gate_exps, ex, ht, ff_a, scratch);
+                dots3_ref_matvec(m, l->ffn_up_exps, ex, ht, ff_b, scratch);
+                for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
+                    ff_a[i] = ff_a[i] / (1.0f + expf(-ff_a[i])) * ff_b[i];
+                }
+                dots3_ref_matvec(m, l->ffn_down_exps, ex, ff_a, ff_o, scratch);
+                for (uint32_t i = 0; i < n_embd; i++) {
+                    acc_out[i] += sel_w[slot] * ff_o[i];
+                }
+            }
+            dots3_ref_matvec(m, l->ffn_gate_shexp, 0, ht, ff_a, scratch);
+            dots3_ref_matvec(m, l->ffn_up_shexp, 0, ht, ff_b, scratch);
+            for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
+                ff_a[i] = ff_a[i] / (1.0f + expf(-ff_a[i])) * ff_b[i];
+            }
+            dots3_ref_matvec(m, l->ffn_down_shexp, 0, ff_a, ff_o, scratch);
+            for (uint32_t i = 0; i < n_embd; i++) {
+                xt[i] += acc_out[i] + ff_o[i];
+            }
+        }
+    }
+
+    dots3_ref_norm_weight(m, w->output_norm, nw);
+    dots3_ref_rms(x + (uint64_t)(n - 1u) * n_embd, nw, h, n_embd, DS4_RMS_EPS);
+    dots3_ref_matvec(m, w->output, 0, h, logits_out, scratch);
+
+    free(bias); free(router); free(ff_o); free(ff_b); free(ff_a);
+    free(gate); free(attn); free(scores); free(kv_proj); free(c_lat);
+    free(kv_raw); free(v); free(k); free(q); free(q_lora); free(nw);
+    free(scratch); free(h); free(x);
+    return 0;
+}
+
 static DS4_MAYBE_UNUSED float motif3_bf16_round_reference(float value) {
     uint32_t bits;
     memcpy(&bits, &value, sizeof(bits));
@@ -52177,6 +53533,79 @@ int ds4_engine_motif3_forward_test(ds4_engine *e, const ds4_tokens *prompt) {
     free(logits);
     motif3_graph_free(&graph);
     return finite ? 0 : 1;
+#endif
+}
+
+/* dots3 forward gate: the CUDA latent graph against the FP32 CPU reference
+ * (official equations over the same dequantized weights), plus GPU
+ * self-consistency between a one-shot prefill and a split prefill+decode.
+ * Tolerances absorb Q8_K activation quantization on the GPU expert path and
+ * the BF16 latent cache; the argmax must agree exactly. */
+int ds4_engine_dots3_forward_test(ds4_engine *e, const ds4_tokens *prompt) {
+#ifdef DS4_NO_GPU
+    (void)e; (void)prompt;
+    fprintf(stderr, "ds4: dots3 forward test requires a GPU build\n");
+    return 1;
+#else
+    if (!e || !prompt || prompt->len < 4 || prompt->len > 64 ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        fprintf(stderr, "ds4: dots3 forward test needs 4..64 prompt tokens\n");
+        return 1;
+    }
+    const uint32_t n = (uint32_t)prompt->len;
+    ds4_dots3_gpu_graph graph;
+    if (!dots3_graph_alloc(&graph, n) ||
+        !dots3_graph_alloc_cache(&graph, &e->model, &e->weights, 4096u)) {
+        fprintf(stderr, "ds4: dots3 forward test graph alloc failed\n");
+        return 1;
+    }
+    float *gpu_one = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *gpu_split = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *ref = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    bool ok = dots3_graph_forward_chunk(
+            &graph, &e->model, &e->weights, prompt->v, n, 0u, gpu_one);
+    if (ok) {
+        graph.cache_len = 0u;
+        ok = dots3_graph_forward_chunk(
+                &graph, &e->model, &e->weights, prompt->v, n - 1u, 0u, NULL) &&
+             dots3_graph_forward_chunk(
+                &graph, &e->model, &e->weights, prompt->v + (n - 1u), 1u,
+                n - 1u, gpu_split);
+    }
+    if (ok) {
+        ok = ds4_engine_dots3_reference_logits(e, prompt->v, (int)n, ref) == 0;
+    }
+    if (ok) {
+        double dot_r = 0.0, nr = 0.0, ng = 0.0;
+        double dot_s = 0.0, ns = 0.0;
+        uint32_t argmax_gpu = 0, argmax_split = 0, argmax_ref = 0;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            dot_r += (double)gpu_one[i] * ref[i];
+            nr += (double)ref[i] * ref[i];
+            ng += (double)gpu_one[i] * gpu_one[i];
+            dot_s += (double)gpu_one[i] * gpu_split[i];
+            ns += (double)gpu_split[i] * gpu_split[i];
+            if (gpu_one[i] > gpu_one[argmax_gpu]) argmax_gpu = i;
+            if (gpu_split[i] > gpu_split[argmax_split]) argmax_split = i;
+            if (ref[i] > ref[argmax_ref]) argmax_ref = i;
+        }
+        const double cos_ref = dot_r / (sqrt(nr) * sqrt(ng) + 1e-30);
+        const double cos_split = dot_s / (sqrt(ng) * sqrt(ns) + 1e-30);
+        fprintf(stderr,
+                "ds4: dots3 forward gate: cos(gpu,ref)=%.6f "
+                "cos(one,split)=%.6f argmax gpu=%u split=%u ref=%u\n",
+                cos_ref, cos_split, argmax_gpu, argmax_split, argmax_ref);
+        ok = cos_ref > 0.99 && cos_split > 0.999 &&
+             argmax_gpu == argmax_ref && argmax_gpu == argmax_split;
+        for (uint32_t i = 0; ok && i < DS4_N_VOCAB; i++) {
+            if (!isfinite(gpu_one[i]) || !isfinite(ref[i])) ok = false;
+        }
+    }
+    free(ref);
+    free(gpu_split);
+    free(gpu_one);
+    dots3_graph_free(&graph);
+    return ok ? 0 : 1;
 #endif
 }
 
@@ -53039,6 +54468,10 @@ bool ds4_engine_supports_batching(ds4_engine *e) {
     if (!e || !ds4_backend_uses_graph(e->backend) || !e->metal_ready) {
         return false;
     }
+    /* dots3 serves through serial latent sessions for now; its persistent
+     * multi-bank runtime is future work, and refusing here routes the
+     * server onto the serial lane instead of the DeepSeek bank body. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) return false;
     /* Solar, EXAONE, and Motif dispatch to family-specific persistent-bank
      * runtimes; DeepSeek retains the upstream multi-sequence graph. */
     return true;
@@ -53220,6 +54653,16 @@ static int ds4_session_alloc_graph(ds4_session *s) {
         s->motif3_graph_ready = true;
         return 0;
     }
+    if (ds4_session_is_dots3(s)) {
+        if (!dots3_graph_alloc(&s->dots3_graph, s->prefill_cap) ||
+            !dots3_graph_alloc_cache(&s->dots3_graph, &e->model,
+                                     &e->weights, (uint32_t)s->ctx_size)) {
+            s->dots3_graph_ready = false;
+            return 1;
+        }
+        s->dots3_graph_ready = true;
+        return 0;
+    }
     if (ds4_session_is_exaone(s)) {
         if (!exaone_graph_session_fit_check(e->backend,
                                             (uint32_t)s->ctx_size,
@@ -53338,6 +54781,10 @@ int ds4_engine_session_graph_fit_quote(ds4_engine *e, int ctx_size,
         q->fits = (e->backend == DS4_BACKEND_CUDA && ctx_size <= 262144) ? 1 : 0;
         return q->fits;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+        q->fits = (e->backend == DS4_BACKEND_CUDA && ctx_size <= 524288) ? 1 : 0;
+        return q->fits;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
         const uint32_t prefill_cap =
             solar_graph_prefill_cap_for_context((uint32_t)ctx_size);
@@ -53372,6 +54819,36 @@ int ds4_engine_session_graph_fit_quote(ds4_engine *e, int ctx_size,
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
+#ifdef DS4_NO_GPU
+        fprintf(stderr, "ds4: dots3 sessions require the CUDA backend\n");
+        return 1;
+#else
+        if (ctx_size > 524288 || e->backend != DS4_BACKEND_CUDA ||
+            !e->metal_ready ||
+            e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr,
+                    "ds4: dots3 native sessions require one resident CUDA model\n");
+            return 1;
+        }
+        ds4_session *s = xcalloc(1, sizeof(*s));
+        s->engine = e;
+        s->ctx_size = ctx_size;
+        s->generation = 1u;
+        s->prefill_cap =
+            dots3_graph_prefill_cap_for_context((uint32_t)ctx_size);
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        if (ds4_session_lazy_graph_enabled()) {
+            s->graph_pending = true;
+        } else if (ds4_session_alloc_graph(s) != 0) {
+            free(s->logits);
+            free(s);
+            return 1;
+        }
+        *out = s;
+        return 0;
+#endif
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
         /* Production Motif sessions keep only normalized latent KV + rotated
          * k_pe.  Expanded historical K/V is reserved for the independent
@@ -53521,6 +54998,9 @@ void ds4_session_free(ds4_session *s) {
         } else if (ds4_session_is_motif3(s)) {
             motif3_graph_free(&s->motif3_graph);
             s->motif3_graph_ready = false;
+        } else if (ds4_session_is_dots3(s)) {
+            dots3_graph_free(&s->dots3_graph);
+            s->dots3_graph_ready = false;
         } else {
             metal_graph_free(&s->graph);
         }
@@ -53554,7 +55034,7 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     s->engine->power_percent = power_percent;
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s) && !ds4_session_is_motif3(s) &&
-        !ds4_session_is_exaone(s))
+        !ds4_session_is_exaone(s) && !ds4_session_is_dots3(s))
         s->graph.power_percent = (uint32_t)power_percent;
 #endif
     return 0;
@@ -53583,7 +55063,7 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
         return 1;
     }
     if (ds4_session_is_solar(s) || ds4_session_is_exaone(s) ||
-        ds4_session_is_motif3(s)) {
+        ds4_session_is_motif3(s) || ds4_session_is_dots3(s)) {
         if (errlen) snprintf(err, errlen,
                              "layer-slice sessions do not support this model family");
         return 1;
@@ -54042,6 +55522,51 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 s->checkpoint_valid = false;
                 s->checkpoint.len = 0;
                 s->motif3_graph.cache_len = 0;
+                return 1;
+            }
+            start += (int)rows;
+            if (s->progress) {
+                s->progress(s->progress_ud, "prefill_chunk",
+                            start, prompt->len);
+            }
+        }
+        ds4_tokens_copy(&s->checkpoint, prompt);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+    if (ds4_session_is_dots3(s)) {
+        if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;
+        if (!s->dots3_graph_ready || !s->dots3_graph.cache_ready) {
+            snprintf(err, errlen, "dots3 latent session is not initialized");
+            return 1;
+        }
+        int start = 0;
+        if (s->checkpoint_valid &&
+            s->dots3_graph.cache_len == (uint32_t)s->checkpoint.len &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+            if (start == prompt->len) return 0;
+        } else {
+            s->checkpoint_valid = false;
+            s->checkpoint.len = 0;
+            s->dots3_graph.cache_len = 0;
+        }
+        while (start < prompt->len) {
+            uint32_t rows = (uint32_t)(prompt->len - start);
+            if (rows > s->prefill_cap) rows = s->prefill_cap;
+            const bool last = start + (int)rows == prompt->len;
+            if (!dots3_graph_forward_chunk(
+                        &s->dots3_graph, &s->engine->model,
+                        &s->engine->weights, prompt->v + start,
+                        rows, (uint32_t)start, last ? s->logits : NULL)) {
+                snprintf(err, errlen,
+                         "CUDA dots3 latent prefill failed at position %d",
+                         start);
+                s->checkpoint_valid = false;
+                s->checkpoint.len = 0;
+                s->dots3_graph.cache_len = 0;
                 return 1;
             }
             start += (int)rows;
@@ -54606,6 +56131,38 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                 &token, 1u, (uint32_t)s->checkpoint.len, s->logits)) {
             if (errlen) snprintf(err, errlen,
                                  "CUDA Motif-3 latent decode failed at position %d",
+                                 s->checkpoint.len);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+    if (ds4_session_is_dots3(s)) {
+        (void)probe_mtp;
+        if (!s->dots3_graph_ready || !s->dots3_graph.cache_ready) {
+            if (errlen) snprintf(err, errlen,
+                                 "dots3 latent session is not initialized");
+            return 1;
+        }
+        if (!s->checkpoint_valid ||
+            s->dots3_graph.cache_len != (uint32_t)s->checkpoint.len) {
+            if (errlen) snprintf(err, errlen,
+                                 "dots3 decode requires a valid latent checkpoint");
+            return 1;
+        }
+        if ((uint32_t)s->checkpoint.len >= s->dots3_graph.ctx_cap) {
+            if (errlen) snprintf(err, errlen, "dots3 context reached (%u)",
+                                 s->dots3_graph.ctx_cap);
+            return 1;
+        }
+        if (!dots3_graph_forward_chunk(
+                &s->dots3_graph, &e->model, &e->weights,
+                &token, 1u, (uint32_t)s->checkpoint.len, s->logits)) {
+            if (errlen) snprintf(err, errlen,
+                                 "CUDA dots3 latent decode failed at position %d",
                                  s->checkpoint.len);
             s->checkpoint_valid = false;
             return 1;

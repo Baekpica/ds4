@@ -506,6 +506,7 @@ typedef enum {
     SERVER_MODEL_SYNTAX_SOLAR_OPEN2,
     SERVER_MODEL_SYNTAX_MOTIF3,
     SERVER_MODEL_SYNTAX_EXAONE,
+    SERVER_MODEL_SYNTAX_DOTS3,
 } server_model_syntax;
 
 typedef enum {
@@ -1109,6 +1110,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_model_id(engine) == 2) return SERVER_MODEL_SYNTAX_SOLAR_OPEN2;
     if (ds4_engine_model_id(engine) == 3) return SERVER_MODEL_SYNTAX_MOTIF3;
     if (ds4_engine_model_id(engine) == 4) return SERVER_MODEL_SYNTAX_EXAONE;
+    if (ds4_engine_model_id(engine) == 5) return SERVER_MODEL_SYNTAX_DOTS3;
     return SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
 
@@ -1123,7 +1125,8 @@ static bool server_token_ends_generation(ds4_engine *engine,
                                          const request *r, int token) {
     if (ds4_token_is_stop(engine, token)) return true;
     return (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
-            r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE) &&
+            r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE ||
+            r->model_syntax == SERVER_MODEL_SYNTAX_DOTS3) &&
            ds4_token_is_stop_for_think_mode(engine, token, r->think_mode);
 }
 
@@ -1132,6 +1135,7 @@ static const char *server_model_id_from_variant(int variant) {
     if (variant == 2) return "solar-open2-250b";
     if (variant == 3) return "motif-3";
     if (variant == 4) return "k-exaone-236b-a23b";
+    if (variant == 5) return "dots3-note-prev";
     return "deepseek-v4-flash";
 }
 
@@ -1150,7 +1154,10 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "k-exaone-236b-a23b") ||
             !strcmp(id, "k-exaone-236b-a23b-chat") ||
             !strcmp(id, "K-EXAONE-236B-A23B") ||
-            !strcmp(id, "LGAI-EXAONE/K-EXAONE-236B-A23B"));
+            !strcmp(id, "LGAI-EXAONE/K-EXAONE-236B-A23B") ||
+            !strcmp(id, "dots3-note-prev") ||
+            !strcmp(id, "dots-studio/dots3-note-prev") ||
+            !strcmp(id, "dots3-note-prev-Mixed-Quant-GGUF"));
 }
 
 /* A server knob may request partial warm reuse, but the model runtime is the
@@ -2990,6 +2997,240 @@ static char *render_motif3_chat_prompt_text(
     return buf_take(&out);
 }
 
+/* Re-emit raw JSON with Python json.dumps spacing (", " and ": ").  The
+ * official dots3 template renders each tool via jinja tojson, which is
+ * json.dumps of the parsed object; clients send arbitrary whitespace, so a
+ * byte-faithful prompt needs this normalization. */
+static void dots3_pyspace_json(buf *out, const char *raw) {
+    const char *p = raw ? raw : "";
+    bool in_string = false;
+    while (*p) {
+        const char c = *p;
+        if (in_string) {
+            buf_putc(out, c);
+            if (c == '\\' && p[1]) {
+                buf_putc(out, p[1]);
+                p += 2;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            p++;
+            continue;
+        }
+        if (isspace((unsigned char)c)) {
+            p++;
+            continue;
+        }
+        buf_putc(out, c);
+        if (c == '"') in_string = true;
+        if (c == ',' || c == ':') buf_putc(out, ' ');
+        p++;
+    }
+}
+
+/* One official <dots_function_call> block for one call.  The template writes
+ * string argument values raw and everything else as tojson. */
+static void append_dots3_tool_call_text(buf *out, const tool_call *tc) {
+    buf_puts(out, "\n<dots_function_call>\n<invoke name=\"");
+    buf_puts(out, tc->name ? tc->name : "");
+    buf_puts(out, "\">");
+    const char *p = tc->arguments ? tc->arguments : "";
+    json_ws(&p);
+    if (*p == '{') {
+        p++;
+        json_ws(&p);
+        while (*p && *p != '}') {
+            char *key = NULL;
+            if (!json_string(&p, &key)) break;
+            json_ws(&p);
+            if (*p != ':') { free(key); break; }
+            p++;
+            json_ws(&p);
+            char *value = NULL;
+            const bool is_string = *p == '"';
+            char *plain = NULL;
+            if (is_string) {
+                if (!json_string(&p, &plain)) { free(key); break; }
+            } else if (!json_raw_value(&p, &value)) {
+                free(key);
+                break;
+            }
+            buf_puts(out, "\n<parameter name=\"");
+            buf_puts(out, key);
+            buf_puts(out, "\">\n");
+            if (is_string) {
+                buf_puts(out, plain ? plain : "");
+            } else {
+                dots3_pyspace_json(out, value);
+            }
+            buf_puts(out, "\n</parameter>");
+            free(plain);
+            free(value);
+            free(key);
+            json_ws(&p);
+            if (*p == ',') p++;
+            json_ws(&p);
+        }
+    }
+    buf_puts(out, "\n</invoke>\n</dots_function_call>");
+}
+
+static void append_dots3_tool_calls_text(buf *out, const tool_calls *calls) {
+    if (!calls) return;
+    for (int i = 0; i < calls->len; i++) {
+        append_dots3_tool_call_text(out, &calls->v[i]);
+    }
+}
+
+static void append_dots3_tools_system_text(buf *out,
+                                           const char *tool_schemas) {
+    buf_puts(out,
+        "\n\n# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> "
+        "XML tags:\n<tools>");
+    const char *p = tool_schemas ? tool_schemas : "";
+    while (*p) {
+        const char *end = strchr(p, '\n');
+        const size_t n = end ? (size_t)(end - p) : strlen(p);
+        char *line = xstrndup(p, n);
+        buf_puts(out, "\n{\"type\": \"function\", \"function\": ");
+        dots3_pyspace_json(out, line);
+        buf_putc(out, '}');
+        free(line);
+        p += n;
+        if (*p == '\n') p++;
+    }
+    buf_puts(out,
+        "\n</tools>\n\n"
+        "When making tool calls, use XML format to invoke tools and pass "
+        "parameters:\n\n"
+        "<dots_function_call>\n"
+        "<invoke name=\"tool-name-1\">\n"
+        "<parameter name=\"param-key-1\">\n"
+        "param-value-1\n"
+        "</parameter>\n"
+        "<parameter name=\"param-key-2\">\n"
+        "param-value-2\n"
+        "</parameter>\n"
+        "...\n"
+        "</invoke>\n"
+        "</dots_function_call>");
+}
+
+/* Byte-for-byte rendering of the official dots3-note chat_template.jinja
+ * (SHA 2475e840..., embedded in the GGUF).  No BOS; a system block always
+ * opens the prompt; enable_thinking=false appends <no_think> inside every
+ * user turn and prefills an empty think block; assistant history keeps its
+ * reasoning inside <think> tags (clear_thinking defaults to false); tool
+ * results merge consecutive messages into one user turn. */
+static char *render_dots3_chat_prompt_text(
+        const chat_msgs *msgs, const char *tool_schemas,
+        ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    const bool have_tools = tool_schemas && tool_schemas[0];
+    const bool first_system = msgs && msgs->len > 0 &&
+        role_is_system(msgs->v[0].role);
+
+    buf out = {0};
+    buf_puts(&out, "<|system|>");
+    if (first_system) {
+        buf_puts(&out, msgs->v[0].content ? msgs->v[0].content : "");
+    } else {
+        buf_puts(&out, "You are a helpful assistant.");
+    }
+    if (have_tools) append_dots3_tools_system_text(&out, tool_schemas);
+    buf_puts(&out, "<|endofsystem|>");
+
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        const bool is_user = m->role && !strcmp(m->role, "user");
+        if (i == 0 && first_system) continue;
+        if (is_user || role_is_system(m->role)) {
+            const char *content = m->content ? m->content : "";
+            buf_puts(&out, "<|user|>");
+            buf_puts(&out, content);
+            if (is_user && !think) {
+                const size_t clen = strlen(content);
+                if (clen < 10 ||
+                    strcmp(content + clen - 10, "<no_think>") != 0) {
+                    buf_puts(&out, "<no_think>");
+                }
+            }
+            buf_puts(&out, "<|endofuser|>");
+        } else if (m->role && !strcmp(m->role, "assistant")) {
+            const char *content = m->content ? m->content : "";
+            char *reason_heap = NULL;
+            char *content_heap = NULL;
+            const char *reasoning = m->reasoning ? m->reasoning : "";
+            if (!reasoning[0]) {
+                const char *close = strstr(content, "</think>");
+                if (close) {
+                    /* content.split('</think>')[0].rstrip('\n')
+                     *        .split('<think>')[-1].lstrip('\n') */
+                    const char *rb = content;
+                    const char *open = NULL;
+                    for (const char *scan = content; scan < close;
+                         scan = strstr(scan, "<think>")) {
+                        if (!scan || scan >= close) break;
+                        open = scan;
+                        scan += 7;
+                    }
+                    if (open) rb = open + 7;
+                    const char *re = close;
+                    while (re > rb && re[-1] == '\n') re--;
+                    while (rb < re && rb[0] == '\n') rb++;
+                    reason_heap = xstrndup(rb, (size_t)(re - rb));
+                    const char *cb = close + 8;
+                    while (cb[0] == '\n') cb++;
+                    content_heap = xstrdup(cb);
+                    reasoning = reason_heap;
+                    content = content_heap;
+                }
+            }
+            /* reasoning_content | trim */
+            const char *tb = reasoning;
+            while (*tb && isspace((unsigned char)*tb)) tb++;
+            const char *te = tb + strlen(tb);
+            while (te > tb && isspace((unsigned char)te[-1])) te--;
+
+            buf_puts(&out, "<|assistant|>");
+            if (!think) {
+                buf_puts(&out, "<think>\n\n</think>\n\n");
+                buf_puts(&out, content);
+            } else if (te > tb) {
+                buf_puts(&out, "<think>\n");
+                buf_append(&out, tb, (size_t)(te - tb));
+                buf_puts(&out, "\n</think>\n\n");
+                buf_puts(&out, content);
+            } else {
+                buf_puts(&out, content);
+            }
+            append_dots3_tool_calls_text(&out, &m->calls);
+            buf_puts(&out, "<|endofassistant|>");
+            free(content_heap);
+            free(reason_heap);
+        } else if (m->role && (!strcmp(m->role, "tool") ||
+                               !strcmp(m->role, "function"))) {
+            const bool group_start = i == 0 ||
+                (strcmp(msgs->v[i - 1].role, "tool") &&
+                 strcmp(msgs->v[i - 1].role, "function"));
+            const bool group_end = i + 1 == msgs->len ||
+                (strcmp(msgs->v[i + 1].role, "tool") &&
+                 strcmp(msgs->v[i + 1].role, "function"));
+            if (group_start) buf_puts(&out, "<|user|>");
+            buf_puts(&out, "\n<dots_function_response>\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "\n</dots_function_response>");
+            if (group_end) buf_puts(&out, "<|endofuser|>");
+        }
+    }
+
+    buf_puts(&out, "<|assistant|>");
+    if (!think) buf_puts(&out, "<think>\n\n</think>\n\n");
+    return buf_take(&out);
+}
+
 static void append_solar_tool_response_text(buf *b, const char *s) {
     const char *end = DS4_SOLAR_TOOL_RESPONSE_END;
     const size_t endlen = strlen(end);
@@ -3491,6 +3732,50 @@ static char *render_exaone_live_tool_tail(
     return buf_take(&out);
 }
 
+/* dots3 continuation after live tool results: the sampled assistant turn
+ * stopped at <|endofassistant|> (EOS, never evaluated into the graph), so it
+ * opens the suffix; tool results merge into one user turn per the official
+ * template, and the next assistant turn opens with the think-mode prefix. */
+static char *render_dots3_live_tool_tail(
+        const chat_msgs *msgs, int start,
+        ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    buf_puts(&out, "<|endofassistant|>");
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role) || !strcmp(m->role, "user")) {
+            const char *content = m->content ? m->content : "";
+            buf_puts(&out, "<|user|>");
+            buf_puts(&out, content);
+            if (!strcmp(m->role, "user") && !think) {
+                const size_t clen = strlen(content);
+                if (clen < 10 ||
+                    strcmp(content + clen - 10, "<no_think>") != 0) {
+                    buf_puts(&out, "<no_think>");
+                }
+            }
+            buf_puts(&out, "<|endofuser|>");
+        } else if (!strcmp(m->role, "tool") ||
+                   !strcmp(m->role, "function")) {
+            const bool group_start = i == start ||
+                (strcmp(msgs->v[i - 1].role, "tool") &&
+                 strcmp(msgs->v[i - 1].role, "function"));
+            const bool group_end = i + 1 == msgs->len ||
+                (strcmp(msgs->v[i + 1].role, "tool") &&
+                 strcmp(msgs->v[i + 1].role, "function"));
+            if (group_start) buf_puts(&out, "<|user|>");
+            buf_puts(&out, "\n<dots_function_response>\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "\n</dots_function_response>");
+            if (group_end) buf_puts(&out, "<|endofuser|>");
+        }
+    }
+    buf_puts(&out, "<|assistant|>");
+    if (!think) buf_puts(&out, "<think>\n\n</think>\n\n");
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_model(
         server_model_syntax syntax, const chat_msgs *msgs,
         const char *tool_schemas, const tool_schema_orders *tool_orders,
@@ -3502,6 +3787,8 @@ static char *render_chat_prompt_text_for_model(
     }
     if (syntax == SERVER_MODEL_SYNTAX_EXAONE)
         return render_exaone_chat_prompt_text(msgs, tool_schemas, think_mode);
+    if (syntax == SERVER_MODEL_SYNTAX_DOTS3)
+        return render_dots3_chat_prompt_text(msgs, tool_schemas, think_mode);
     return render_chat_prompt_text_choice_format(
         msgs, tool_schemas, tool_orders, think_mode, tool_choice, format);
 }
@@ -3526,6 +3813,8 @@ static char *render_live_tool_tail_for_model(
         return render_motif3_live_tool_tail(msgs, start, think_mode);
     if (syntax == SERVER_MODEL_SYNTAX_EXAONE)
         return render_exaone_live_tool_tail(msgs, start, think_mode);
+    if (syntax == SERVER_MODEL_SYNTAX_DOTS3)
+        return render_dots3_live_tool_tail(msgs, start, think_mode);
     return render_live_tool_tail_format(msgs, start, think_mode, format);
 }
 
@@ -5372,6 +5661,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
     if (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
         r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE ||
+        r->model_syntax == SERVER_MODEL_SYNTAX_DOTS3 ||
         r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
         /* Raw completion uses the loaded family's official chat protocol. */
         chat_msgs msgs = {0};
@@ -5533,6 +5823,7 @@ static const char *find_any_tool_start(const char *s) {
         strstr(s, DS4_TOOL_CALLS_START_SHORT),
         strstr(s, "<tool_calls>"),
         strstr(s, "<tool_call>"),      /* Motif-3 per-call wrapper */
+        strstr(s, "<dots_function_call>"),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -5556,6 +5847,7 @@ static const char *find_any_tool_end(const char *s) {
         strstr(s, DS4_TOOL_CALLS_END_SHORT),
         strstr(s, "</tool_calls>"),
         strstr(s, "</tool_call>"),     /* Motif-3 per-call wrapper */
+        strstr(s, "</dots_function_call>"),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -6308,6 +6600,144 @@ static bool parse_hermes_generated_message_ex(const char *text,
     return true;
 }
 
+/* One <invoke name="...">...</invoke> body -> a tool_call.  Parameter values
+ * arrive framed by single newlines; a value that parses as one complete JSON
+ * value keeps its type, anything else becomes a JSON string, inverting the
+ * official template's raw-string/tojson split. */
+static bool parse_dots3_invoke(const char *body, const char *body_end,
+                               tool_call *tc) {
+    static const char name_open[] = "<invoke name=\"";
+    static const char param_open[] = "<parameter name=\"";
+    static const char param_close[] = "</parameter>";
+    const char *p = strstr(body, name_open);
+    if (!p || p >= body_end) return false;
+    p += sizeof(name_open) - 1;
+    const char *name_end = strchr(p, '"');
+    if (!name_end || name_end >= body_end) return false;
+    tc->name = xstrndup(p, (size_t)(name_end - p));
+    p = name_end + 1;
+    if (*p == '>') p++;
+
+    buf args = {0};
+    buf_putc(&args, '{');
+    int n_args = 0;
+    while (true) {
+        const char *open = strstr(p, param_open);
+        if (!open || open >= body_end) break;
+        const char *key = open + sizeof(param_open) - 1;
+        const char *key_end = strchr(key, '"');
+        if (!key_end || key_end >= body_end) break;
+        const char *value = key_end + 1;
+        if (*value == '>') value++;
+        if (*value == '\n') value++;
+        const char *close = strstr(value, param_close);
+        if (!close || close > body_end) break;
+        const char *value_end = close;
+        if (value_end > value && value_end[-1] == '\n') value_end--;
+        if (n_args) buf_puts(&args, ", ");
+        char *key_str = xstrndup(key, (size_t)(key_end - key));
+        json_escape(&args, key_str);
+        free(key_str);
+        buf_puts(&args, ": ");
+        char *raw = xstrndup(value, (size_t)(value_end - value));
+        const char *probe = raw;
+        char *value_json = NULL;
+        json_ws(&probe);
+        const bool typed = json_raw_value(&probe, &value_json) &&
+                           (json_ws(&probe), *probe == '\0');
+        if (typed) {
+            buf_puts(&args, value_json);
+        } else {
+            json_escape(&args, raw);
+        }
+        free(value_json);
+        free(raw);
+        n_args++;
+        p = close + sizeof(param_close) - 1;
+    }
+    buf_putc(&args, '}');
+    tc->arguments = buf_take(&args);
+    return tc->name && tc->name[0];
+}
+
+/* dots3 generated-message parser: optional <think> block, free content, then
+ * one or more <dots_function_call> blocks each holding one or more invokes. */
+static bool parse_dots3_generated_message_ex(const char *text,
+                                             bool require_thinking_closed,
+                                             char **content_out,
+                                             char **reasoning_out,
+                                             tool_calls *calls) {
+    static const char tool_start[] = "<dots_function_call>";
+    static const char tool_end[] = "</dots_function_call>";
+    text = text ? text : "";
+    const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
+    if (require_thinking_closed) {
+        const char *think_end = find_last_substr(text, "</think>");
+        if (!think_end) {
+            const char *candidate = strstr(text, tool_start);
+            if (!candidate || !strstr(candidate, tool_end)) {
+                fprintf(stderr,
+                        "ds4-server: thinking not closed, ignoring incomplete "
+                        "dots3 tool call in reasoning\n");
+                ds4_local_unterminated_reasoning(text,
+                                                  content_out, reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + 8;
+        }
+    }
+
+    const char *start = strstr(tool_search, tool_start);
+    if (!start) {
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        return true;
+    }
+    const char *raw_block_start = start;
+    if (start > text && start[-1] == '\n') raw_block_start = start - 1;
+    const size_t content_len = trim_tool_separator_ws(
+        text, 0, (size_t)(raw_block_start - text));
+    const char *p = start;
+    while (true) {
+        p = skip_ascii_ws(p);
+        if (strncmp(p, tool_start, strlen(tool_start)) != 0) break;
+        p += strlen(tool_start);
+        const char *close = strstr(p, tool_end);
+        if (!close) return false;
+        const char *invoke = p;
+        while (invoke < close) {
+            const char *next = strstr(invoke, "<invoke name=\"");
+            if (!next || next >= close) break;
+            const char *invoke_end = strstr(next, "</invoke>");
+            if (!invoke_end || invoke_end > close) invoke_end = close;
+            tool_call tc = {0};
+            if (!parse_dots3_invoke(next, invoke_end, &tc)) {
+                free(tc.name);
+                free(tc.arguments);
+                return false;
+            }
+            tool_calls_push(calls, tc);
+            invoke = invoke_end;
+        }
+        p = close + strlen(tool_end);
+    }
+    if (calls->len == 0) return false;
+    free(calls->raw_tool_text);
+    calls->raw_tool_text = xstrndup(raw_block_start,
+                                    (size_t)(p - raw_block_start));
+    if (recovered_unclosed_tool) {
+        ds4_unterminated_reasoning_before_tool(text, content_len,
+                                               content_out, reasoning_out);
+    } else {
+        split_reasoning_content(text, content_len,
+                                content_out, reasoning_out);
+    }
+    return true;
+}
+
 static bool parse_generated_message_ex_for_model(
         server_model_syntax syntax, const char *text,
         bool require_thinking_closed, ds4_chat_format format,
@@ -6316,6 +6746,10 @@ static bool parse_generated_message_ex_for_model(
     if (syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
         syntax == SERVER_MODEL_SYNTAX_EXAONE) {
         return parse_hermes_generated_message_ex(
+            text, require_thinking_closed, content_out, reasoning_out, calls);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_DOTS3) {
+        return parse_dots3_generated_message_ex(
             text, require_thinking_closed, content_out, reasoning_out, calls);
     }
     return parse_generated_message_ex_format(
@@ -13168,13 +13602,14 @@ static const char *sem_accum_terminal_finish(const sem_accum *a,
  * Same contract as stop_list_stream_safe_len, for the two marker spellings. */
 static size_t tool_marker_stream_safe_len(const char *text, size_t len,
                                           ds4_chat_format format) {
-    static const char *const dsml_marks[3] = {
-        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT, "<tool_call>"
+    static const char *const dsml_marks[4] = {
+        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT, "<tool_call>",
+        "<dots_function_call>"
     };
     const char *const solar_marks[1] = {DS4_SOLAR_TOOL_CALL_START};
     const char *const exaone_marks[1] = {"<tool_call>"};
     const char *const *marks = dsml_marks;
-    int nmarks = 3;
+    int nmarks = 4;
     if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
         marks = solar_marks;
         nmarks = 1;
@@ -13602,6 +14037,20 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
         buf_puts(&suffix, "<|endofturn|>\n");
         return buf_take(&suffix);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_DOTS3) {
+        /* Next-turn official render of this assistant tool turn: history
+         * keeps its reasoning, no-think history matches the generation
+         * prefill, and <|endofassistant|> closes the turn. */
+        if (ds4_think_mode_enabled(r->think_mode)) {
+            buf_puts(&suffix, "<think>\n");
+            motif3_buf_put_trimmed(&suffix, reasoning);
+            buf_puts(&suffix, "\n</think>\n\n");
+        }
+        buf_puts(&suffix, content ? content : "");
+        append_dots3_tool_calls_text(&suffix, calls);
+        buf_puts(&suffix, "<|endofassistant|>");
+        return buf_take(&suffix);
+    }
     if (ds4_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
         buf_puts(&suffix, chat_think_end(r->chat_format));
@@ -13649,6 +14098,18 @@ static char *build_responses_visible_assistant_suffix(const request *r,
      * reasoning in the remembered visible prefix when this assistant turn ended
      * in tool calls.  A client that does replay final-answer reasoning will not
      * match this visible shortcut and can still use exact token-prefix replay. */
+    if (syntax == SERVER_MODEL_SYNTAX_DOTS3) {
+        if (ds4_think_mode_enabled(r->think_mode) &&
+            r->reasoning_summary_emit && calls && calls->len > 0) {
+            buf_puts(&suffix, "<think>\n");
+            motif3_buf_put_trimmed(&suffix, reasoning);
+            buf_puts(&suffix, "\n</think>\n\n");
+        }
+        buf_puts(&suffix, content ? content : "");
+        append_dots3_tool_calls_text(&suffix, calls);
+        buf_puts(&suffix, "<|endofassistant|>");
+        return buf_take(&suffix);
+    }
     if (ds4_think_mode_enabled(r->think_mode)) {
         if (r->reasoning_summary_emit && calls && calls->len > 0) {
             buf_puts(&suffix, reasoning ? reasoning : "");
@@ -14684,6 +15145,7 @@ decode_again:
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         j->req.model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 &&
         j->req.model_syntax != SERVER_MODEL_SYNTAX_EXAONE &&
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_DOTS3 &&
         acc.saw_tool_start &&
         (!acc.saw_tool_end || tool_call_format_has_repairable_truncation(
                                   acc.text.ptr, acc.text.len,
@@ -14830,6 +15292,7 @@ decode_again:
              * past max_tokens, so fall through to the raw-text fallback. */
             if (j->req.model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 &&
                 j->req.model_syntax != SERVER_MODEL_SYNTAX_EXAONE &&
+                j->req.model_syntax != SERVER_MODEL_SYNTAX_DOTS3 &&
                 !j->req.stream && !dsml_recovery_attempted &&
                 strcmp(final_finish, "length") != 0) {
                 int recovery_tokens = 0;
@@ -17630,7 +18093,8 @@ static bool cont_needs_text(const request *r) {
     return r->stream || r->stops.len > 0 ||
            request_needs_cont_semantics(r) ||
            ((r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
-             r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE) &&
+             r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE ||
+             r->model_syntax == SERVER_MODEL_SYNTAX_DOTS3) &&
             !ds4_think_mode_enabled(r->think_mode));
 }
 
@@ -17831,6 +18295,7 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
     if (j->req.has_tools &&
         j->req.model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 &&
         j->req.model_syntax != SERVER_MODEL_SYNTAX_EXAONE &&
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_DOTS3 &&
         st->acc.saw_tool_start &&
         (!st->acc.saw_tool_end || tool_call_format_has_repairable_truncation(
                                       st->acc.text.ptr, st->acc.text.len,
@@ -18098,7 +18563,8 @@ static int cont_on_token(void *ud, void *user, int token) {
      * driver's server_token_ends_generation).  Engine-level stop ids never
      * get here -- the cont core retires them as EOS. */
     if ((j->req.model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
-         j->req.model_syntax == SERVER_MODEL_SYNTAX_EXAONE) &&
+         j->req.model_syntax == SERVER_MODEL_SYNTAX_EXAONE ||
+         j->req.model_syntax == SERVER_MODEL_SYNTAX_DOTS3) &&
         ds4_token_is_stop_for_think_mode(s->engine, token, j->req.think_mode)) {
         if (!st->acc.verdict) st->acc.verdict = "stop";
         t_emit_job = NULL;
@@ -23589,6 +24055,135 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     TEST_ASSERT(client < user_m);
     free(prompt);
     chat_msgs_free(&msgs);
+}
+
+/* Expected bytes come from rendering the official chat_template.jinja
+ * (SHA 2475e840...) with jinja2 + the HF tojson policy; see
+ * scratch/dots3/template-renders.json in the workspace for the generator. */
+static void test_render_dots3_chat_prompt_text(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello!");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_DOTS3, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|system|>You are a helpful assistant.<|endofsystem|>"
+        "<|user|>Hello!<|endofuser|>"
+        "<|assistant|>"));
+    free(prompt);
+
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_DOTS3, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|system|>You are a helpful assistant.<|endofsystem|>"
+        "<|user|>Hello!<no_think><|endofuser|>"
+        "<|assistant|><think>\n\n</think>\n\n"));
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    /* Assistant history keeps its reasoning; tool results merge into one
+     * user turn; the tool call renders as the official invoke block. */
+    chat_msgs flow = {0};
+    chat_msg u1 = {.role = xstrdup("user"), .content = xstrdup("One plus one?")};
+    chat_msgs_push(&flow, u1);
+    chat_msg a1 = {.role = xstrdup("assistant"),
+                   .content = xstrdup("<think>\nadding\n</think>\n\nTwo.")};
+    chat_msgs_push(&flow, a1);
+    chat_msg u2 = {.role = xstrdup("user"), .content = xstrdup("Double it.")};
+    chat_msgs_push(&flow, u2);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_DOTS3, &flow, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|system|>You are a helpful assistant.<|endofsystem|>"
+        "<|user|>One plus one?<|endofuser|>"
+        "<|assistant|><think>\nadding\n</think>\n\nTwo.<|endofassistant|>"
+        "<|user|>Double it.<|endofuser|>"
+        "<|assistant|>"));
+    free(prompt);
+    chat_msgs_free(&flow);
+
+    chat_msgs tools = {0};
+    chat_msg u3 = {.role = xstrdup("user"), .content = xstrdup("Weather?")};
+    chat_msgs_push(&tools, u3);
+    chat_msg a2 = {.role = xstrdup("assistant"), .content = xstrdup("")};
+    tool_call tc = {0};
+    tc.name = xstrdup("get_weather");
+    tc.arguments = xstrdup("{\"city\": \"Seoul\", \"days\": 3}");
+    tool_calls_push(&a2.calls, tc);
+    chat_msgs_push(&tools, a2);
+    chat_msg t1 = {.role = xstrdup("tool"), .content = xstrdup("{\"temp\": 31}")};
+    chat_msgs_push(&tools, t1);
+    chat_msg t2 = {.role = xstrdup("tool"), .content = xstrdup("{\"temp\": 29}")};
+    chat_msgs_push(&tools, t2);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_DOTS3, &tools, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|assistant|>\n<dots_function_call>\n"
+        "<invoke name=\"get_weather\">\n"
+        "<parameter name=\"city\">\nSeoul\n</parameter>\n"
+        "<parameter name=\"days\">\n3\n</parameter>\n"
+        "</invoke>\n</dots_function_call><|endofassistant|>") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|user|>\n<dots_function_response>\n{\"temp\": 31}\n"
+        "</dots_function_response>\n<dots_function_response>\n{\"temp\": 29}\n"
+        "</dots_function_response><|endofuser|>") != NULL);
+    free(prompt);
+    chat_msgs_free(&tools);
+}
+
+static void test_parse_dots3_tool_call_message(void) {
+    tool_calls calls = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    const bool ok = parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_DOTS3,
+        "<think>\nplan\n</think>\n\nChecking now.\n"
+        "<dots_function_call>\n"
+        "<invoke name=\"get_weather\">\n"
+        "<parameter name=\"city\">\nSeoul\n</parameter>\n"
+        "<parameter name=\"days\">\n3\n</parameter>\n"
+        "</invoke>\n"
+        "</dots_function_call>",
+        true, &content, &reasoning, &calls);
+    TEST_ASSERT(ok);
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(!strcmp(calls.v[0].name, "get_weather"));
+    TEST_ASSERT(!strcmp(calls.v[0].arguments,
+                        "{\"city\": \"Seoul\", \"days\": 3}"));
+    /* The shared split keeps raw spans: reasoning is the exact text between
+     * the think tags and content keeps its leading separator, matching the
+     * other families' parse convention. */
+    TEST_ASSERT(content && !strcmp(content, "\n\nChecking now."));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "\nplan\n"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    /* Two invokes inside one block. */
+    tool_calls multi = {0};
+    content = NULL;
+    reasoning = NULL;
+    const bool ok2 = parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_DOTS3,
+        "</think>\n\n<dots_function_call>\n"
+        "<invoke name=\"a\">\n<parameter name=\"x\">\n1\n</parameter>\n</invoke>\n"
+        "<invoke name=\"b\">\n<parameter name=\"y\">\ntwo\n</parameter>\n</invoke>\n"
+        "</dots_function_call>",
+        true, &content, &reasoning, &multi);
+    TEST_ASSERT(ok2);
+    TEST_ASSERT(multi.len == 2);
+    TEST_ASSERT(!strcmp(multi.v[0].arguments, "{\"x\": 1}"));
+    TEST_ASSERT(!strcmp(multi.v[1].arguments, "{\"y\": \"two\"}"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&multi);
 }
 
 static void test_render_motif3_chat_prompt_text(void) {
@@ -31734,6 +32329,8 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_motif3_chat_prompt_text();
+    test_render_dots3_chat_prompt_text();
+    test_parse_dots3_tool_call_message();
     test_render_exaone_chat_prompt_text();
     test_exaone_tool_protocol();
     test_exaone_continuation_and_marker_contract();

@@ -2598,6 +2598,101 @@ int ds4_gpu_motif3_differential_tensor(
         uint32_t                group_size,
         uint32_t                value_dim,
         int                     round_bf16);
+
+/* dots3-note: interleaved-rope dual-geometry latent MLA, headwise output
+ * gate, official noaux_tc router, and the DSA lightning indexer (LayerNorm
+ * with bias, FP8-E4M3 round trip, causal scores, shared top-k). */
+int ds4_gpu_dots3_rms_norm_dev_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *in,
+        const ds4_gpu_tensor *weight,
+        uint32_t                dim,
+        uint32_t                in_stride,
+        uint32_t                in_off,
+        uint32_t                rows,
+        float                   eps);
+int ds4_gpu_dots3_layernorm_dev_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *weight,
+        const ds4_gpu_tensor *bias,
+        uint32_t                dim,
+        uint32_t                rows,
+        float                   eps);
+int ds4_gpu_dots3_rope_interleaved_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *positions,
+        const ds4_gpu_tensor *inv_freq,
+        uint32_t                rows,
+        uint32_t                heads,
+        uint32_t                head_dim,
+        uint32_t                rot_dim,
+        uint32_t                rot_off);
+int ds4_gpu_dots3_store_latent_kpe_tensor(
+        ds4_gpu_tensor       *latent_cache,
+        ds4_gpu_tensor       *k_pe_cache,
+        const ds4_gpu_tensor *latent,
+        const ds4_gpu_tensor *k_pe,
+        const ds4_gpu_tensor *positions,
+        uint32_t                rows,
+        uint32_t                cache_cap,
+        uint32_t                latent_dim,
+        uint32_t                rope_dim,
+        bool                    ring);
+int ds4_gpu_dots3_latent_attention_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *q_absorbed,
+        const ds4_gpu_tensor *latent_cache,
+        const ds4_gpu_tensor *k_pe_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t                sel_stride,
+        uint32_t                rows,
+        uint32_t                pos0,
+        uint32_t                cache_cap,
+        uint32_t                window,
+        uint32_t                q_heads,
+        uint32_t                latent_dim,
+        uint32_t                qk_nope,
+        uint32_t                qk_rope,
+        float                   scale);
+int ds4_gpu_dots3_gate_mul_tensor(
+        ds4_gpu_tensor       *attn,
+        const ds4_gpu_tensor *gate_logits,
+        uint32_t                rows,
+        uint32_t                heads,
+        uint32_t                value_dim);
+int ds4_gpu_dots3_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint32_t                n_expert,
+        uint32_t                n_used,
+        uint32_t                n_tokens);
+int ds4_gpu_dots3_fp8_roundtrip_tensor(
+        ds4_gpu_tensor       *x,
+        uint32_t                n_blocks);
+int ds4_gpu_dots3_idx_store_tensor(
+        ds4_gpu_tensor       *cache,
+        const ds4_gpu_tensor *rows_data,
+        const ds4_gpu_tensor *positions,
+        uint32_t                rows,
+        uint32_t                cache_cap);
+int ds4_gpu_dots3_idx_score_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q_idx,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *q_positions,
+        uint32_t                n_queries,
+        uint32_t                n_keys,
+        uint32_t                key_cache_cap);
+int ds4_gpu_dots3_scale_tensor(
+        ds4_gpu_tensor       *x,
+        float                   scale,
+        uint64_t                n);
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
