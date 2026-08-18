@@ -587,9 +587,17 @@ static void test_gdla(const char *dir) {
 
 static void test_latent_gdla() {
     const char *profile_rows_env = std::getenv("DS4_MOTIF3_PROFILE_ROWS");
-    const bool profile_only = profile_rows_env && profile_rows_env[0];
-    uint32_t rows = 6u;
-    if (profile_only) {
+    const char *dots_profile = std::getenv("DS4_DOTS3_PROFILE_ATTN");
+    const bool dots_full = dots_profile && !std::strcmp(dots_profile, "full");
+    const bool dots_swa = dots_profile && !std::strcmp(dots_profile, "swa");
+    if (dots_profile && !dots_full && !dots_swa) {
+        fprintf(stderr, "invalid DS4_DOTS3_PROFILE_ATTN=%s\n", dots_profile);
+        std::exit(2);
+    }
+    const bool profile_only = (profile_rows_env && profile_rows_env[0]) ||
+        dots_full || dots_swa;
+    uint32_t rows = dots_profile ? 1600u : 6u;
+    if (profile_rows_env && profile_rows_env[0]) {
         char *end = nullptr;
         const unsigned long parsed = std::strtoul(profile_rows_env, &end, 10);
         if (!end || end[0] || parsed == 0ul || parsed > 4096ul) {
@@ -598,17 +606,17 @@ static void test_latent_gdla() {
         }
         rows = (uint32_t)parsed;
     }
-    constexpr uint32_t q_heads = 80u;
-    constexpr uint32_t kv_heads = 16u;
-    constexpr uint32_t group = 5u;
-    constexpr uint32_t latent_dim = 512u;
-    constexpr uint32_t qk_nope = 128u;
+    const uint32_t q_heads = dots_full ? 128u : dots_swa ? 64u : 80u;
+    const uint32_t kv_heads = dots_profile ? q_heads : 16u;
+    const uint32_t group = dots_profile ? 1u : 5u;
+    const uint32_t latent_dim = dots_swa ? 1024u : 512u;
+    const uint32_t qk_nope = dots_swa ? 192u : 128u;
     constexpr uint32_t rope_dim = 64u;
-    constexpr uint32_t key_dim = qk_nope + rope_dim;
+    const uint32_t key_dim = qk_nope + rope_dim;
     constexpr uint32_t value_dim = 128u;
-    constexpr uint32_t kv_raw_dim = latent_dim + rope_dim;
-    constexpr uint64_t row_bytes = (latent_dim / 32u) * 34u;
-    constexpr uint32_t weight_rows = kv_heads * (qk_nope + value_dim);
+    const uint32_t kv_raw_dim = latent_dim + rope_dim;
+    const uint64_t row_bytes = (latent_dim / 32u) * 34u;
+    const uint32_t weight_rows = kv_heads * (qk_nope + value_dim);
     constexpr float weight_scale = 1.0f / 64.0f;
 
     /* A deterministic authentic-shape Q8_0 kv_b matrix lets this test prove
@@ -669,7 +677,7 @@ static void test_latent_gdla() {
     kv_b_record.dims[1] = weight_rows;
     kv_b_record.offset = 0u;
     kv_b_record.bytes = model.size();
-    if (ds4_gpu_build_derived_artifacts_from_records(
+    if (!dots_profile && ds4_gpu_build_derived_artifacts_from_records(
             model.data(), model.size(), &kv_b_record, 1u) != 1) {
         fprintf(stderr, "could not build Motif kv_b value artifact\n");
         std::exit(1);
@@ -722,14 +730,21 @@ static void test_latent_gdla() {
 
     /* Nsight Compute kernel replay cannot coexist with the full 86 GiB VMM
      * owner on GB10: replay checkpoints exhaust unified memory.  This mode
-     * keeps the production kernel and authentic Motif dimensions while
+     * keeps the production kernels and exact model-family dimensions while
      * expanding only the token axis used by a real prefill chunk. */
     if (profile_only) {
         const float scale = 1.0f / std::sqrt((float)key_dim);
-        if (!ds4_gpu_motif3_latent_attention_bf16_tensor(
-                    latent_out.p, q_full_gpu.p, q_absorbed.p,
-                    latent_cache.p, k_pe_cache.p, rows, 0, rows, 0,
-                    q_heads, latent_dim, qk_nope, rope_dim, scale) ||
+        const bool attention_ok = dots_profile
+            ? ds4_gpu_dots3_latent_attention_tensor(
+                  latent_out.p, q_full_gpu.p, q_absorbed.p,
+                  latent_cache.p, k_pe_cache.p, nullptr, 0u,
+                  rows, 0u, rows, dots_swa ? 513u : 0u,
+                  q_heads, latent_dim, qk_nope, rope_dim, scale)
+            : ds4_gpu_motif3_latent_attention_bf16_tensor(
+                  latent_out.p, q_full_gpu.p, q_absorbed.p,
+                  latent_cache.p, k_pe_cache.p, rows, 0, rows, 0,
+                  q_heads, latent_dim, qk_nope, rope_dim, scale);
+        if (!attention_ok ||
             !ds4_gpu_motif3_value_project_q8_0_tensor(
                     heads.p, latent_out.p, model.data(), model.size(), 0,
                     rows, q_heads, kv_heads, group, latent_dim,
@@ -742,7 +757,9 @@ static void test_latent_gdla() {
             fprintf(stderr, "latent GDLA profile synchronization failed\n");
             std::exit(1);
         }
-        printf("Motif-3 NCU latent profile: rows=%u, q_heads=%u, latent_dim=%u, finite output\n",
+        printf("%s NCU attention profile: rows=%u, q_heads=%u, "
+               "latent_dim=%u, finite output\n",
+               dots_profile ? "dots3-note" : "Motif-3",
                rows, q_heads, latent_dim);
         return;
     }

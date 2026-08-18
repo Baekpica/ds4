@@ -34342,10 +34342,10 @@ __global__ static void motif3_value_project_q8_0_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warps = blockDim.x >> 5u;
-    constexpr uint32_t values_per_warp = 4u;
+    constexpr uint32_t values_per_warp = 16u;
     for (uint32_t d0 = warp * values_per_warp; d0 < values;
          d0 += warps * values_per_warp) {
-        float acc[values_per_warp] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float acc[values_per_warp] = {};
         for (uint32_t b = 0; b < (latent_dim >> 5); b++) {
             const float x = xsh[b * 32u + lane];
 #pragma unroll
