@@ -22601,9 +22601,14 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
      * long scoreboards; nsys measures ~110 ms.  The existing common MMQ path
      * serves the same two projections in ~1.0 ms total and matches the pair
      * oracle at cosine 1.0 / NRMSE 4.2e-7.  Keep this as a narrow shape
-     * dispatch so unrelated model-family pair shapes remain untouched. */
-    if (in_dim == 4096u && out0_dim == 12288u && out1_dim == 12288u &&
-        n_tok >= 64u && getenv("DS4_CUDA_NO_Q8_PAIR_MMQ_SPLIT") == NULL) {
+     * dispatch so unrelated model-family pair shapes remain untouched.  The
+     * same split also covers dots3-note's exact dense/shared pair shapes. */
+    const bool motif_dense = in_dim == 4096u &&
+        out0_dim == 12288u && out1_dim == 12288u;
+    const bool dots3_pair = in_dim == 5120u && out0_dim == out1_dim &&
+        (out0_dim == 1536u || out0_dim == 13824u);
+    if ((motif_dense || dots3_pair) && n_tok >= 64u &&
+        getenv("DS4_CUDA_NO_Q8_PAIR_MMQ_SPLIT") == NULL) {
         if (ds4_gpu_matmul_q8_0_tensor(
                     out0, model_map, model_size, weight0_offset,
                     in_dim, out0_dim, x, n_tok) &&
@@ -22614,7 +22619,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             if (!logged_pair_mmq_split) {
                 logged_pair_mmq_split = 1;
                 fprintf(stderr,
-                        "ds4: Motif-3 dense Q8 pair split across common MMQ kernels\n");
+                        "ds4: dense Q8 pair split across common MMQ kernels\n");
             }
             return 1;
         }

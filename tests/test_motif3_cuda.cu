@@ -951,12 +951,11 @@ static void test_latent_decode_split() {
                  want.size(), 3e-5f, 3e-4f);
 }
 
-/* Safe NCU harness for the production aligned pair kernel.  Full-model
+/* Safe NCU harness for the production pair kernels.  Full-model
  * kernel replay checkpoints the 86 GiB VMM import and can exhaust GB10 UMA;
- * these are the two exact Motif prefill geometries at its 512-token chunk. */
+ * these modes cover exact Motif and dots3-note prefill geometries. */
 static void test_q8_pair_profile(const char *mode) {
-    constexpr uint64_t in_dim = 4096u;
-    constexpr uint64_t blocks = in_dim / 32u;
+    uint64_t in_dim = 4096u;
     uint64_t n_tok = 512u;
     uint64_t out0_dim = 0;
     uint64_t out1_dim = 0;
@@ -980,11 +979,26 @@ static void test_q8_pair_profile(const char *mode) {
         out1_dim = 12288u;
         name0 = "blk.0.ffn_gate.weight";
         name1 = "blk.0.ffn_up.weight";
+    } else if (!std::strcmp(mode, "dots-shared")) {
+        in_dim = 5120u;
+        n_tok = 1600u;
+        out0_dim = 1536u;
+        out1_dim = 1536u;
+        name0 = "blk.2.ffn_gate_shexp.weight";
+        name1 = "blk.2.ffn_up_shexp.weight";
+    } else if (!std::strcmp(mode, "dots-dense")) {
+        in_dim = 5120u;
+        n_tok = 1600u;
+        out0_dim = 13824u;
+        out1_dim = 13824u;
+        name0 = "blk.0.ffn_gate.weight";
+        name1 = "blk.0.ffn_up.weight";
     } else {
         fprintf(stderr, "invalid DS4_MOTIF3_PROFILE_PAIR=%s\n", mode);
         std::exit(2);
     }
 
+    const uint64_t blocks = in_dim / 32u;
     const uint64_t bytes0 = out0_dim * blocks * 34u;
     const uint64_t bytes1 = out1_dim * blocks * 34u;
     std::vector<uint8_t> model((size_t)(bytes0 + bytes1));
@@ -1026,6 +1040,8 @@ static void test_q8_pair_profile(const char *mode) {
         fprintf(stderr, "could not build Motif Q8 pair artifacts\n");
         std::exit(1);
     }
+    if (!std::strncmp(mode, "dots-", 5u))
+        setenv("DS4_CUDA_NO_DERIVED_WEIGHTS", "1", 1);
     setenv("DS4_CUDA_COPY_MODEL", "1", 1);
     if (!ds4_gpu_set_model_map(model.data(), model.size())) {
         fprintf(stderr, "could not install Motif Q8 pair profile map\n");
@@ -1058,7 +1074,10 @@ static void test_q8_pair_profile(const char *mode) {
     auto oracle0 = download_f32(out0, (size_t)(n_tok * out0_dim));
     auto oracle1 = download_f32(out1, (size_t)(n_tok * out1_dim));
     unsetenv("DS4_CUDA_NO_Q8_PAIR_COALESCED");
-    if (!std::strcmp(mode, "dense"))
+    const bool split_profile = !std::strcmp(mode, "dense") ||
+        !std::strcmp(mode, "dots-shared") ||
+        !std::strcmp(mode, "dots-dense");
+    if (split_profile)
         setenv("DS4_CUDA_FORCE_Q8_PAIR_COALESCED", "1", 1);
     if (
         !ds4_gpu_matmul_q8_0_pair_tensor(
@@ -1079,7 +1098,7 @@ static void test_q8_pair_profile(const char *mode) {
     const float sample0 = got0[0];
     const float sample1 = got1[0];
     if (!std::isfinite(sample0) || !std::isfinite(sample1)) std::exit(1);
-    if (!std::strcmp(mode, "dense")) {
+    if (split_profile) {
         if (!ds4_gpu_matmul_q8_0_pair_tensor(
                 out0.p, out1.p, model.data(), model.size(), 0u, bytes0,
                 in_dim, out0_dim, out1_dim, x.p, n_tok)) {
@@ -1116,10 +1135,10 @@ static void test_q8_pair_profile(const char *mode) {
                     cosine, nrmse);
             std::exit(1);
         }
-        printf("Motif-3 Q8 dense MMQ split: cosine=%.9f nrmse=%.6g\n",
+        printf("Q8 dense MMQ split: cosine=%.9f nrmse=%.6g\n",
                cosine, nrmse);
     }
-    printf("Motif-3 NCU Q8 pair profile: mode=%s, n_tok=%llu, K=%llu, "
+    printf("NCU Q8 pair profile: mode=%s, n_tok=%llu, K=%llu, "
            "M=%llu/%llu, bit-identical output %.6g/%.6g\n",
            mode, (unsigned long long)n_tok, (unsigned long long)in_dim,
            (unsigned long long)out0_dim, (unsigned long long)out1_dim,
