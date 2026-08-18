@@ -33694,8 +33694,12 @@ __global__ static void dots3_qk_absorb_q8_0_kernel(
                 __half2float(*(const __half *)block);
             const int8_t *qs = (const int8_t *)(block + 2);
 #pragma unroll
-            for (uint32_t v = 0; v < kValuesPerThread; v++)
-                sum[v] += qd_scale * (float)qs[(j + v) & 31u];
+            for (uint32_t v = 0; v < kValuesPerThread; v += 2u) {
+                const uint16_t packed = *(const uint16_t *)(
+                    qs + ((j + v) & 31u));
+                sum[v] += qd_scale * (float)(int8_t)(packed & 0xffu);
+                sum[v + 1u] += qd_scale * (float)(int8_t)(packed >> 8u);
+            }
         }
 #pragma unroll
         for (uint32_t v = 0; v < kValuesPerThread; v++)
