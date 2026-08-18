@@ -33767,15 +33767,16 @@ extern "C" int ds4_gpu_motif3_qk_absorb_q8_0_tensor(
     const bool motif_shape = q_heads == 80u && kv_heads == 16u &&
         group_size == 5u && kv_latent_dim == 512u && qk_nope == 128u &&
         key_dim == 192u && value_dim == 128u;
-    const bool dots_shape = group_size == 1u && q_heads == kv_heads &&
-        value_dim == 128u &&
-        ((q_heads == 128u && kv_latent_dim == 512u && qk_nope == 128u &&
-          key_dim == 192u) ||
-         (q_heads == 64u && kv_latent_dim == 1024u && qk_nope == 192u &&
-          key_dim == 256u));
-    if (dots_shape) {
+    const bool dots_full_shape = group_size == 1u && q_heads == 128u &&
+        kv_heads == 128u && kv_latent_dim == 512u && qk_nope == 128u &&
+        key_dim == 192u && value_dim == 128u;
+    const bool dots_swa_shape = group_size == 1u && q_heads == 64u &&
+        kv_heads == 64u && kv_latent_dim == 1024u && qk_nope == 192u &&
+        key_dim == 256u && value_dim == 128u;
+    if (dots_full_shape || dots_swa_shape) {
         dim3 grid(q_heads, rows, 1);
-        dots3_qk_absorb_q8_0_kernel<4u><<<grid, 128>>>(
+        const uint32_t threads = dots_full_shape ? 64u : 128u;
+        dots3_qk_absorb_q8_0_kernel<8u><<<grid, threads>>>(
                 (float *)q_absorbed->ptr, (const float *)q_full->ptr,
                 weight, rows, q_heads, kv_latent_dim,
                 qk_nope, key_dim, value_dim, row_bytes);
