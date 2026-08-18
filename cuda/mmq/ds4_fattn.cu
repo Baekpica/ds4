@@ -2,9 +2,10 @@
  *
  * Layout (head_dim 128 only): grid (ceil(n_tokens/64), n_head), block 128
  * threads. Each warp owns 16 query rows. The block stages 64 Q rows and
- * walks 16-key K/V tiles; Q.K^T and P.V use m16n8k16 HMMA with online
- * softmax between them. Compressed Solar K/V is decoded once per shared
- * tile, so all 64 query rows reuse it.
+ * walks 32-key K/V tiles (two 16-key HMMA consume steps). Q.K^T and P.V
+ * use m16n8k16 HMMA with online softmax between them. Compressed Solar
+ * K/V is decoded once per shared tile with the per-row scale reused
+ * across the 128 dims, so all 64 query rows share one dequant.
  */
 #include "common.cuh"
 #include "mma.cuh"
@@ -24,7 +25,8 @@ enum {
     FA_WQ      = 16,
     FA_WARPS   = 4,
     FA_TQ      = FA_WQ * FA_WARPS,
-    FA_TK      = 16,
+    FA_TK      = 32,
+    FA_CONSUME = 16,
     FA_PAD     = 8,
     FA_ROW     = FA_HD + FA_PAD,
     SOLAR_KV_BF16 = 0,
@@ -70,6 +72,317 @@ __device__ __forceinline__ float solar_fattn_kv_load(
         const uint8_t packed = data[elem >> 1u];
         const uint8_t code = (elem & 1u) ? packed >> 4u : packed & 0x0fu;
         return solar_fattn_e2m1(code) * scale;
+    }
+}
+
+template <int FORMAT>
+__device__ __forceinline__ void solar_fattn_kv_bytes(
+        uint32_t  n_head_kv,
+        uint64_t *k_bytes,
+        uint64_t *v_bytes) {
+    const uint64_t kv_dim = (uint64_t)n_head_kv * FA_HD;
+    *k_bytes = FORMAT == SOLAR_KV_FP4 ? kv_dim / 2u : kv_dim;
+    *v_bytes = FORMAT == SOLAR_KV_FP8 ? kv_dim : kv_dim / 2u;
+}
+
+/* Decode one 32-key (or shorter) K/V tile.  Per-row K/V scales are read
+ * once and reused across the 128 dims.  Compressed formats convert four
+ * consecutive dims per thread so the packed row is touched with aligned
+ * 4-byte / 2-byte loads. */
+template <int FORMAT>
+__device__ __forceinline__ void solar_fattn_fill_kv_tile(
+        __half        s_k[][FA_ROW],
+        __half        s_v[][FA_ROW],
+        const void   *kv,
+        uint64_t      row_bytes,
+        uint32_t      n_head_kv,
+        uint32_t      kvh,
+        uint32_t      kv_dim,
+        uint32_t      kv_cap,
+        uint32_t      kt0,
+        uint32_t      tile_len) {
+    __shared__ float scale_k[FA_TK];
+    __shared__ float scale_v[FA_TK];
+    if (threadIdx.x < FA_TK) {
+        const uint32_t r = threadIdx.x;
+        const uint32_t src = r < tile_len ? kt0 + r : kt0;
+        if constexpr (FORMAT == SOLAR_KV_BF16) {
+            scale_k[r] = 1.0f;
+            scale_v[r] = 1.0f;
+        } else {
+            uint64_t k_bytes = 0, v_bytes = 0;
+            solar_fattn_kv_bytes<FORMAT>(n_head_kv, &k_bytes, &v_bytes);
+            const uint8_t *row = (const uint8_t *)kv +
+                (uint64_t)(src % kv_cap) * row_bytes;
+            const __half *scales = (const __half *)(row + k_bytes + v_bytes);
+            scale_k[r] = __half2float(scales[kvh]);
+            scale_v[r] = __half2float(scales[n_head_kv + kvh]);
+        }
+    }
+    __syncthreads();
+
+    constexpr uint32_t NGRP = FA_HD / 4u;
+    for (uint32_t idx = threadIdx.x; idx < FA_TK * NGRP; idx += blockDim.x) {
+        const uint32_t r = idx / NGRP;
+        const uint32_t g = idx - r * NGRP;
+        const uint32_t c = g * 4u;
+        const uint32_t src = r < tile_len ? kt0 + r : kt0;
+        if constexpr (FORMAT == SOLAR_KV_BF16) {
+            const __half *row = (const __half *)kv +
+                (size_t)(src % kv_cap) * kv_dim * 2u +
+                (size_t)kvh * FA_HD;
+            const float2 k2 = *reinterpret_cast<const float2 *>(row + c);
+            const float2 v2 = *reinterpret_cast<const float2 *>(
+                row + kv_dim + c);
+            *reinterpret_cast<float2 *>(&s_k[r][c]) = k2;
+            *reinterpret_cast<float2 *>(&s_v[r][c]) = v2;
+        } else {
+            uint64_t k_bytes = 0, v_bytes = 0;
+            solar_fattn_kv_bytes<FORMAT>(n_head_kv, &k_bytes, &v_bytes);
+            const uint8_t *row = (const uint8_t *)kv +
+                (uint64_t)(src % kv_cap) * row_bytes;
+            const float sk = scale_k[r];
+            const float sv = scale_v[r];
+            const uint64_t ke = (uint64_t)kvh * FA_HD + c;
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                s_k[r][c + (uint32_t)i] = __float2half(
+                    solar_fattn_kv_load<FORMAT, false>(
+                        row, n_head_kv, kvh, c + (uint32_t)i));
+                s_v[r][c + (uint32_t)i] = __float2half(
+                    solar_fattn_kv_load<FORMAT, true>(
+                        row, n_head_kv, kvh, c + (uint32_t)i));
+                (void)sk;
+                (void)sv;
+                (void)ke;
+            }
+        }
+    }
+}
+
+/* Specialized 4-wide dequant for the production K-FP8/V-FP4 row so the
+ * per-row scale is applied from registers and the packed bytes are read
+ * with aligned word loads.  Other formats keep the scalar helper above. */
+template <>
+__device__ __forceinline__ void solar_fattn_fill_kv_tile<SOLAR_KV_KFP8_VFP4>(
+        __half        s_k[][FA_ROW],
+        __half        s_v[][FA_ROW],
+        const void   *kv,
+        uint64_t      row_bytes,
+        uint32_t      n_head_kv,
+        uint32_t      kvh,
+        uint32_t      kv_dim,
+        uint32_t      kv_cap,
+        uint32_t      kt0,
+        uint32_t      tile_len) {
+    (void)kv_dim;
+    __shared__ float scale_k[FA_TK];
+    __shared__ float scale_v[FA_TK];
+    const uint64_t k_bytes = (uint64_t)n_head_kv * FA_HD;
+    const uint64_t v_bytes = k_bytes / 2u;
+    if (threadIdx.x < FA_TK) {
+        const uint32_t r = threadIdx.x;
+        const uint32_t src = r < tile_len ? kt0 + r : kt0;
+        const uint8_t *row = (const uint8_t *)kv +
+            (uint64_t)(src % kv_cap) * row_bytes;
+        const __half *scales = (const __half *)(row + k_bytes + v_bytes);
+        scale_k[r] = __half2float(scales[kvh]);
+        scale_v[r] = __half2float(scales[n_head_kv + kvh]);
+    }
+    __syncthreads();
+
+    constexpr uint32_t NGRP = FA_HD / 4u;
+    for (uint32_t idx = threadIdx.x; idx < FA_TK * NGRP; idx += blockDim.x) {
+        const uint32_t r = idx / NGRP;
+        const uint32_t g = idx - r * NGRP;
+        const uint32_t c = g * 4u;
+        const uint32_t src = r < tile_len ? kt0 + r : kt0;
+        const uint8_t *row = (const uint8_t *)kv +
+            (uint64_t)(src % kv_cap) * row_bytes;
+        const float sk = scale_k[r];
+        const float sv = scale_v[r];
+        const uint64_t kbase = (uint64_t)kvh * FA_HD + c;
+        const uint32_t kpack = *reinterpret_cast<const uint32_t *>(
+            row + kbase);
+        const uint16_t vpack = *reinterpret_cast<const uint16_t *>(
+            row + k_bytes + (kbase >> 1u));
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const uint8_t kc = (uint8_t)(kpack >> (8 * i));
+            const uint8_t vc = (uint8_t)((vpack >> (4 * i)) & 0x0fu);
+            s_k[r][c + (uint32_t)i] = __float2half(
+                solar_fattn_e4m3(kc) * sk);
+            s_v[r][c + (uint32_t)i] = __float2half(
+                solar_fattn_e2m1(vc) * sv);
+        }
+    }
+}
+
+template <>
+__device__ __forceinline__ void solar_fattn_fill_kv_tile<SOLAR_KV_FP8>(
+        __half        s_k[][FA_ROW],
+        __half        s_v[][FA_ROW],
+        const void   *kv,
+        uint64_t      row_bytes,
+        uint32_t      n_head_kv,
+        uint32_t      kvh,
+        uint32_t      kv_dim,
+        uint32_t      kv_cap,
+        uint32_t      kt0,
+        uint32_t      tile_len) {
+    (void)kv_dim;
+    __shared__ float scale_k[FA_TK];
+    __shared__ float scale_v[FA_TK];
+    const uint64_t kv_elems = (uint64_t)n_head_kv * FA_HD;
+    if (threadIdx.x < FA_TK) {
+        const uint32_t r = threadIdx.x;
+        const uint32_t src = r < tile_len ? kt0 + r : kt0;
+        const uint8_t *row = (const uint8_t *)kv +
+            (uint64_t)(src % kv_cap) * row_bytes;
+        const __half *scales = (const __half *)(row + kv_elems + kv_elems);
+        scale_k[r] = __half2float(scales[kvh]);
+        scale_v[r] = __half2float(scales[n_head_kv + kvh]);
+    }
+    __syncthreads();
+
+    constexpr uint32_t NGRP = FA_HD / 4u;
+    for (uint32_t idx = threadIdx.x; idx < FA_TK * NGRP; idx += blockDim.x) {
+        const uint32_t r = idx / NGRP;
+        const uint32_t g = idx - r * NGRP;
+        const uint32_t c = g * 4u;
+        const uint32_t src = r < tile_len ? kt0 + r : kt0;
+        const uint8_t *row = (const uint8_t *)kv +
+            (uint64_t)(src % kv_cap) * row_bytes;
+        const float sk = scale_k[r];
+        const float sv = scale_v[r];
+        const uint64_t e = (uint64_t)kvh * FA_HD + c;
+        const uint32_t kpack = *reinterpret_cast<const uint32_t *>(row + e);
+        const uint32_t vpack = *reinterpret_cast<const uint32_t *>(
+            row + kv_elems + e);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            s_k[r][c + (uint32_t)i] = __float2half(
+                solar_fattn_e4m3((uint8_t)(kpack >> (8 * i))) * sk);
+            s_v[r][c + (uint32_t)i] = __float2half(
+                solar_fattn_e4m3((uint8_t)(vpack >> (8 * i))) * sv);
+        }
+    }
+}
+
+__device__ __forceinline__ void solar_fattn_consume_16(
+        tile_c          output[FA_HD / 8],
+        float           row_m[2],
+        float           row_l[2],
+        const tile_a    qa[FA_HD / 16],
+        const __half  (*s_k)[FA_ROW],
+        const __half  (*s_v)[FA_ROW],
+        const bool      alive[2],
+        const uint32_t  qpos[2],
+        const uint32_t  qfirst[2],
+        uint32_t        kt0,
+        uint32_t        tile_len,
+        uint32_t        lane,
+        float           scale) {
+    if (tile_len == 0u) return;
+    tile_c scores[2];
+#pragma unroll
+    for (int nb = 0; nb < 2; nb++) {
+        tile_c zero;
+        scores[nb] = zero;
+#pragma unroll
+        for (int kc = 0; kc < FA_HD / 16; kc++) {
+            tile_b keys;
+#pragma unroll
+            for (int l = 0; l < tile_b::ne; l++) {
+                const int i = (int)(lane / 4);
+                const int j = l * 4 + (int)(lane % 4);
+                keys.x[l] = *(const half2 *)&s_k[
+                    nb * 8 + i][kc * 16 + 2 * j];
+            }
+            mma(scores[nb], qa[kc], keys);
+        }
+    }
+
+    float tile_max[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+    for (int nb = 0; nb < 2; nb++) {
+#pragma unroll
+        for (int l = 0; l < tile_c::ne; l++) {
+            const int r = l / 2;
+            const uint32_t p =
+                kt0 + nb * 8u + (lane % 4u) * 2u + (l % 2u);
+            float score = scores[nb].x[l] * scale;
+            if (!alive[r] || p > qpos[r] || p < qfirst[r] ||
+                p >= kt0 + tile_len) {
+                score = -INFINITY;
+            }
+            scores[nb].x[l] = score;
+            tile_max[r] = fmaxf(tile_max[r], score);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        tile_max[r] = fmaxf(
+            tile_max[r],
+            __shfl_xor_sync(0xffffffffu, tile_max[r], 1));
+        tile_max[r] = fmaxf(
+            tile_max[r],
+            __shfl_xor_sync(0xffffffffu, tile_max[r], 2));
+    }
+
+    float rescale[2];
+    float tile_sum[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        const float next_max = fmaxf(row_m[r], tile_max[r]);
+        rescale[r] = row_m[r] == -INFINITY
+            ? 0.0f : __expf(row_m[r] - next_max);
+        row_m[r] = next_max;
+    }
+#pragma unroll
+    for (int nb = 0; nb < 2; nb++) {
+#pragma unroll
+        for (int l = 0; l < tile_c::ne; l++) {
+            const int r = l / 2;
+            const float weight =
+                scores[nb].x[l] == -INFINITY || row_m[r] == -INFINITY
+                    ? 0.0f : __expf(scores[nb].x[l] - row_m[r]);
+            scores[nb].x[l] = weight;
+            tile_sum[r] += weight;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+        tile_sum[r] +=
+            __shfl_xor_sync(0xffffffffu, tile_sum[r], 1);
+        tile_sum[r] +=
+            __shfl_xor_sync(0xffffffffu, tile_sum[r], 2);
+        row_l[r] = row_l[r] * rescale[r] + tile_sum[r];
+    }
+
+    tile_a probabilities;
+#pragma unroll
+    for (int l = 0; l < tile_a::ne; l++) {
+        probabilities.x[l] = __floats2half2_rn(
+            scores[l / 2].x[(l % 2) * 2],
+            scores[l / 2].x[(l % 2) * 2 + 1]);
+    }
+#pragma unroll
+    for (int cb = 0; cb < FA_HD / 8; cb++) {
+#pragma unroll
+        for (int l = 0; l < tile_c::ne; l++) {
+            output[cb].x[l] *= rescale[l / 2];
+        }
+        tile_b values;
+#pragma unroll
+        for (int l = 0; l < tile_b::ne; l++) {
+            const int i = (int)(lane / 4);
+            const int j = l * 4 + (int)(lane % 4);
+            values.x[l] = __halves2half2(
+                s_v[2 * j][cb * 8 + i],
+                s_v[2 * j + 1][cb * 8 + i]);
+        }
+        mma(output[cb], probabilities, values);
     }
 }
 
@@ -177,129 +490,20 @@ __global__ void ds4_fattn_hmma_kernel(
         const uint32_t remaining = block_last - kt0 + 1u;
         const uint32_t tile_len = remaining < (uint32_t)FA_TK
             ? remaining : (uint32_t)FA_TK;
-        for (uint32_t idx = threadIdx.x; idx < FA_TK * FA_HD;
-             idx += blockDim.x) {
-            const uint32_t r = idx / FA_HD;
-            const uint32_t c = idx - r * FA_HD;
-            const uint32_t src = r < tile_len ? kt0 + r : kt0;
-            if constexpr (KV_FORMAT == SOLAR_KV_BF16) {
-                const __half *row = (const __half *)kv +
-                    (size_t)(src % kv_cap) * kv_dim * 2u +
-                    (size_t)kvh * FA_HD;
-                s_k[r][c] = row[c];
-                s_v[r][c] = row[kv_dim + c];
-            } else {
-                const uint8_t *row = (const uint8_t *)kv +
-                    (uint64_t)(src % kv_cap) * row_bytes;
-                s_k[r][c] = __float2half(
-                    solar_fattn_kv_load<KV_FORMAT, false>(
-                        row, n_head_kv, kvh, c));
-                s_v[r][c] = __float2half(
-                    solar_fattn_kv_load<KV_FORMAT, true>(
-                        row, n_head_kv, kvh, c));
-            }
-        }
+        solar_fattn_fill_kv_tile<KV_FORMAT>(
+            s_k, s_v, kv, row_bytes, n_head_kv, kvh, kv_dim, kv_cap,
+            kt0, tile_len);
         __syncthreads();
-
-        tile_c scores[2];
-#pragma unroll
-        for (int nb = 0; nb < 2; nb++) {
-            tile_c zero;
-            scores[nb] = zero;
-#pragma unroll
-            for (int kc = 0; kc < FA_HD / 16; kc++) {
-                tile_b keys;
-#pragma unroll
-                for (int l = 0; l < tile_b::ne; l++) {
-                    const int i = (int)(lane / 4);
-                    const int j = l * 4 + (int)(lane % 4);
-                    keys.x[l] = *(const half2 *)&s_k[
-                        nb * 8 + i][kc * 16 + 2 * j];
-                }
-                mma(scores[nb], qa[kc], keys);
-            }
-        }
-
-        float tile_max[2] = {-INFINITY, -INFINITY};
-#pragma unroll
-        for (int nb = 0; nb < 2; nb++) {
-#pragma unroll
-            for (int l = 0; l < tile_c::ne; l++) {
-                const int r = l / 2;
-                const uint32_t p =
-                    kt0 + nb * 8u + (lane % 4u) * 2u + (l % 2u);
-                float score = scores[nb].x[l] * scale;
-                if (!alive[r] || p > qpos[r] || p < qfirst[r] ||
-                    p >= kt0 + tile_len) {
-                    score = -INFINITY;
-                }
-                scores[nb].x[l] = score;
-                tile_max[r] = fmaxf(tile_max[r], score);
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < 2; r++) {
-            tile_max[r] = fmaxf(
-                tile_max[r],
-                __shfl_xor_sync(0xffffffffu, tile_max[r], 1));
-            tile_max[r] = fmaxf(
-                tile_max[r],
-                __shfl_xor_sync(0xffffffffu, tile_max[r], 2));
-        }
-
-        float rescale[2];
-        float tile_sum[2] = {0.0f, 0.0f};
-#pragma unroll
-        for (int r = 0; r < 2; r++) {
-            const float next_max = fmaxf(row_m[r], tile_max[r]);
-            rescale[r] = row_m[r] == -INFINITY
-                ? 0.0f : __expf(row_m[r] - next_max);
-            row_m[r] = next_max;
-        }
-#pragma unroll
-        for (int nb = 0; nb < 2; nb++) {
-#pragma unroll
-            for (int l = 0; l < tile_c::ne; l++) {
-                const int r = l / 2;
-                const float weight =
-                    scores[nb].x[l] == -INFINITY || row_m[r] == -INFINITY
-                        ? 0.0f : __expf(scores[nb].x[l] - row_m[r]);
-                scores[nb].x[l] = weight;
-                tile_sum[r] += weight;
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < 2; r++) {
-            tile_sum[r] +=
-                __shfl_xor_sync(0xffffffffu, tile_sum[r], 1);
-            tile_sum[r] +=
-                __shfl_xor_sync(0xffffffffu, tile_sum[r], 2);
-            row_l[r] = row_l[r] * rescale[r] + tile_sum[r];
-        }
-
-        tile_a probabilities;
-#pragma unroll
-        for (int l = 0; l < tile_a::ne; l++) {
-            probabilities.x[l] = __floats2half2_rn(
-                scores[l / 2].x[(l % 2) * 2],
-                scores[l / 2].x[(l % 2) * 2 + 1]);
-        }
-#pragma unroll
-        for (int cb = 0; cb < FA_HD / 8; cb++) {
-#pragma unroll
-            for (int l = 0; l < tile_c::ne; l++) {
-                output[cb].x[l] *= rescale[l / 2];
-            }
-            tile_b values;
-#pragma unroll
-            for (int l = 0; l < tile_b::ne; l++) {
-                const int i = (int)(lane / 4);
-                const int j = l * 4 + (int)(lane % 4);
-                values.x[l] = __halves2half2(
-                    s_v[2 * j][cb * 8 + i],
-                    s_v[2 * j + 1][cb * 8 + i]);
-            }
-            mma(output[cb], probabilities, values);
+        const uint32_t first_len = tile_len < (uint32_t)FA_CONSUME
+            ? tile_len : (uint32_t)FA_CONSUME;
+        solar_fattn_consume_16(
+            output, row_m, row_l, qa, s_k, s_v, alive, qpos, qfirst,
+            kt0, first_len, lane, scale);
+        if (tile_len > (uint32_t)FA_CONSUME) {
+            solar_fattn_consume_16(
+                output, row_m, row_l, qa, s_k + FA_CONSUME, s_v + FA_CONSUME,
+                alive, qpos, qfirst, kt0 + (uint32_t)FA_CONSUME,
+                tile_len - (uint32_t)FA_CONSUME, lane, scale);
         }
         __syncthreads();
     }
