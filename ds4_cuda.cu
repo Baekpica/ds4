@@ -19615,6 +19615,15 @@ static int ds4_cuda_moe_graphs_enabled(void) {
     return enabled;
 }
 
+/* Inner moe/dense graphs recapture on every n_tok=1 Solar decode step
+ * (34,089 instantiate+destroy calls in a 192-token decode-only nsys on
+ * GB10).  Solar's plain graph is not wrapped by the outer layer/cont
+ * cache, so width-1 capture never hits.  Skip it and run the kernels
+ * eagerly; prefill widths still use the inner cache. */
+static int ds4_cuda_inner_graphs_want(uint32_t n_tok) {
+    return ds4_cuda_moe_graphs_enabled() && n_tok > 1u;
+}
+
 static uint64_t moe_graph_hash(const struct moe_graph_key *k) {
     /* FNV-1a over the key bytes. */
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -21829,7 +21838,8 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
         if (ds4_capture_active()) {
             moe_stream = ds4_current_stream();
         } else {
-            moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
+            moe_stream = ds4_cuda_inner_graphs_want((uint32_t)n_tok)
+                ? ds4_cuda_moe_stream() : (cudaStream_t)0;
         }
         /* R3 inner-bypass (Step 5, hardened in Step 6).  When an outer
          * per-layer capture is active, skip the inner dense-graph cache
@@ -21842,7 +21852,8 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
          * moe_stream == ds4_current_stream() during outer capture (set
          * just above), so they fold into the outer graph as proper nodes
          * with explicit dependencies on the surrounding work. */
-        if (ds4_cuda_moe_graphs_enabled() && moe_stream && !ds4_capture_active()) {
+        if (ds4_cuda_inner_graphs_want((uint32_t)n_tok) && moe_stream &&
+            !ds4_capture_active()) {
             ds4_cuda_capture_warm_tmp_scratch();
             struct dense_graph_key dkey;
             memset(&dkey, 0, sizeof(dkey));
@@ -30778,13 +30789,15 @@ static int routed_moe_launch(
             if (ds4_capture_active()) {
                 moe_stream = ds4_current_stream();
             } else {
-                moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
+                moe_stream = ds4_cuda_inner_graphs_want(n_tokens)
+                    ? ds4_cuda_moe_stream() : (cudaStream_t)0;
             }
             /* R3 inner-bypass (Step 5, hardened in Step 6).  When an outer
              * per-layer capture is active, skip the inner MoE-graph cache
              * entirely (both HIT path and MISS path are unsafe under outer
              * capture -- see the matching guard at the dense Q8_0 site). */
-            if (ds4_cuda_moe_graphs_enabled() && moe_stream && !ds4_capture_active()) {
+            if (ds4_cuda_inner_graphs_want(n_tokens) && moe_stream &&
+                !ds4_capture_active()) {
                 ds4_cuda_capture_warm_tmp_scratch();
                 struct moe_graph_key key;
                 memset(&key, 0, sizeof(key));
