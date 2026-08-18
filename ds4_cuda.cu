@@ -33672,6 +33672,37 @@ __global__ static void motif3_qk_absorb_q8_0_kernel(
     }
 }
 
+template <uint32_t kValuesPerThread>
+__global__ static void dots3_qk_absorb_q8_0_kernel(
+        float *out, const float *q, const char *weight,
+        uint32_t rows, uint32_t q_heads, uint32_t latent_dim,
+        uint32_t qk_nope, uint32_t key_dim, uint32_t value_dim,
+        uint64_t row_bytes) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (head >= q_heads || token >= rows) return;
+    const float *qh = q + ((uint64_t)token * q_heads + head) * key_dim;
+    float *dst = out + ((uint64_t)token * q_heads + head) * latent_dim;
+    const uint32_t row0 = head * (qk_nope + value_dim);
+    for (uint32_t j = threadIdx.x * kValuesPerThread; j < latent_dim;
+         j += blockDim.x * kValuesPerThread) {
+        float sum[kValuesPerThread] = {};
+        for (uint32_t d = 0; d < qk_nope; d++) {
+            const char *block = weight + (uint64_t)(row0 + d) * row_bytes +
+                                (uint64_t)(j >> 5u) * 34u;
+            const float qd_scale = qh[d] *
+                __half2float(*(const __half *)block);
+            const int8_t *qs = (const int8_t *)(block + 2);
+#pragma unroll
+            for (uint32_t v = 0; v < kValuesPerThread; v++)
+                sum[v] += qd_scale * (float)qs[(j + v) & 31u];
+        }
+#pragma unroll
+        for (uint32_t v = 0; v < kValuesPerThread; v++)
+            dst[j + v] = sum[v];
+    }
+}
+
 __global__ static void motif3_qk_absorb_q8_0_group5_kernel(
         float *out, const float *q, const char *weight,
         uint32_t rows, uint32_t q_heads, uint32_t latent_dim,
@@ -33736,7 +33767,19 @@ extern "C" int ds4_gpu_motif3_qk_absorb_q8_0_tensor(
     const bool motif_shape = q_heads == 80u && kv_heads == 16u &&
         group_size == 5u && kv_latent_dim == 512u && qk_nope == 128u &&
         key_dim == 192u && value_dim == 128u;
-    if (motif_shape) {
+    const bool dots_shape = group_size == 1u && q_heads == kv_heads &&
+        value_dim == 128u &&
+        ((q_heads == 128u && kv_latent_dim == 512u && qk_nope == 128u &&
+          key_dim == 192u) ||
+         (q_heads == 64u && kv_latent_dim == 1024u && qk_nope == 192u &&
+          key_dim == 256u));
+    if (dots_shape) {
+        dim3 grid(q_heads, rows, 1);
+        dots3_qk_absorb_q8_0_kernel<4u><<<grid, 128>>>(
+                (float *)q_absorbed->ptr, (const float *)q_full->ptr,
+                weight, rows, q_heads, kv_latent_dim,
+                qk_nope, key_dim, value_dim, row_bytes);
+    } else if (motif_shape) {
         dim3 grid(kv_heads, rows, 1);
         motif3_qk_absorb_q8_0_group5_kernel<<<grid, 128>>>(
                 (float *)q_absorbed->ptr, (const float *)q_full->ptr,

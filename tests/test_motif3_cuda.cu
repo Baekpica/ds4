@@ -744,6 +744,30 @@ static void test_latent_gdla() {
         fprintf(stderr, "latent GDLA preparation failed\n"); std::exit(1);
     }
 
+    if (dots_dsa) {
+        const auto q_full = download_f32(
+            q_full_gpu, (uint64_t)rows * q_heads * key_dim);
+        const auto q_abs = download_f32(
+            q_absorbed, (uint64_t)rows * q_heads * latent_dim);
+        constexpr uint32_t sample[][3] = {
+            {0u, 0u, 0u}, {7u, 63u, 257u}, {15u, 127u, 511u},
+        };
+        float got[3], want[3] = {};
+        for (uint32_t i = 0; i < 3u; i++) {
+            const uint32_t t = sample[i][0];
+            const uint32_t h = sample[i][1];
+            const uint32_t j = sample[i][2];
+            const float *qh = q_full.data() +
+                ((uint64_t)t * q_heads + h) * key_dim;
+            for (uint32_t d = 0; d < qk_nope; d++)
+                want[i] += qh[d] * weight(
+                    h * (qk_nope + value_dim) + d, j);
+            got[i] = q_abs[((uint64_t)t * q_heads + h) * latent_dim + j];
+        }
+        assert_close("CUDA Dots absorbed Q/K samples", got, want, 3u,
+                     2e-5f, 2e-5f);
+    }
+
     /* Nsight Compute kernel replay cannot coexist with the full 86 GiB VMM
      * owner on GB10: replay checkpoints exhaust unified memory.  This mode
      * keeps the production kernels and exact model-family dimensions while
