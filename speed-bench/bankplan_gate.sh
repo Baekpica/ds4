@@ -130,7 +130,7 @@ boot(){ # $1 = ctx  $2 = extra env (may be empty)
 srv_grep(){ SSH "$R" "grep -m1 \"$1\" $SRV 2>/dev/null; exit 0" 2>/dev/null; }
 srv_count(){ local c; c=$(SSH "$R" "grep -c \"$1\" $SRV 2>/dev/null; exit 0" 2>/dev/null | tail -1); echo "${c:-0}"; }
 ready_field(){ srv_grep "persistent batch ctx ready" | sed -n "s/.*$1=\([0-9]*\).*/\1/p"; }
-metric(){ SSH "$R" "curl -s -m 10 http://127.0.0.1:$PORT/metrics | grep -E '^$1( |{)' | head -1 | grep -oE '[0-9.]+\$'; exit 0" 2>/dev/null; }
+metric(){ SSH "$R" "curl -s -m 10 http://127.0.0.1:$PORT/metrics | grep -E '^$1[ {]' | head -1 | grep -oE '[0-9.]+\$'; exit 0" 2>/dev/null; }
 metric_sum(){ SSH "$R" "curl -s -m 10 http://127.0.0.1:$PORT/metrics | awk '/^$1[{ ]/{s+=\$NF} END{printf \"%d\\n\", s}'; exit 0" 2>/dev/null; }
 save_ledger(){ # $1 = tag: preserve the decisive boot lines
   SSH "$R" "grep -E 'batch fit|batch vmm|persistent batch ctx ready|kv plan' $SRV 2>/dev/null; exit 0" 2>/dev/null > "$OUT/ledger_$1.txt"

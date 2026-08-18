@@ -40,7 +40,7 @@ does all of this, plus the DSpark drafter setup, with one command.)
 ```sh
 ./download_model.sh q2-imatrix    # 96/128 GB machines; see Model Weights
 make cuda-spark                   # DGX Spark / GB10; plain make = macOS Metal
-./ds4-server --host 0.0.0.0       # CUDA defaults: ctx 262144, 4 banks
+./ds4-server --host 0.0.0.0       # CUDA defaults: ctx 262144, banks sized from free memory
 ```
 
 On a standard install that is the whole launch: the base model resolves
@@ -528,7 +528,7 @@ than refusing). The knobs:
 | Knob | Default | What it does and when to change it |
 |---|---|---|
 | `-c` / `--ctx` | `262144` on CUDA, `32768` on Metal/CPU (ds4-on-spark's `ds4-serve` passes `524288`) | The per-request context ceiling. Each request must fit its prompt plus its decode budget under this, or it gets a typed 400. Raise it for deeper documents (786432 is the deepest proven); unused context is demand-mapped, so a deep ceiling costs almost nothing until a request fills it. |
-| `DS4_SERVER_COALESCE_MAX` | unset: derived from `-c` (32 banks at 32k context, halving as context grows, 4 from 256k up) | How many requests can hold warm context at once (the bank count). Set it (1..64) to override the derivation, e.g. more, shallower banks for high-concurrency batch work. Boot may reduce the count to fit memory, never raise it, and it is fixed until restart. A request beyond the bank count evicts the least-recently-used idle bank. |
+| `DS4_SERVER_COALESCE_MAX` | unset: sized from the live memory budget at boot — 32 through 16k context (the measured regime); above that, as many full-depth-fundable banks as the budget covers (floor 4, cap 32), priced at the same per-token rate admissions are charged. The boot ledger prints the arithmetic (`kv plan` line). Where no memory answer exists (Metal/CPU), a static halving ladder rules instead. | How many requests can hold warm context at once (the bank count). Set it (1..64) to override — an explicit value also disarms the budget sizing, so your number rules (e.g. more, shallower banks for high-concurrency batch work). Boot may still reduce the count to fit memory, never raise it, and it is fixed until restart. A request beyond the bank count evicts the least-recently-used idle bank. |
 | `--mem-floor-gb` (env `DS4_MEM_FLOOR_GB`) | `4` | The engine never admits work that would leave the system under this many GiB of free memory: it reclaims idle cache first and refuses with a typed error if that is not enough. Lower it (down to 1) on a dedicated serving box to fund more context; raise it on a machine you also work on. |
 | `max_tokens` (request field, not a flag) | `32768` assumed when the client omits it | The decode budget a request is charged at admission, on top of its prompt. Agents that omit it are charged the full 32768, so set it explicitly when a deep prompt must fit: prompt + `max_tokens` must stay under `-c`. An oversized value is clamped and reported as `length`, never an error. |
 | `DS4_CONT_ADMIT_BAND_X1024` | `1045` | Admission charges each request its measured memory need times a small safety margin, expressed in 1024ths: 1045/1024 means about 2% above the measurement, absorbing allocation transients. Set `1024` to charge exactly the measured need; raise it if admitted work ever brushes the floor. |
