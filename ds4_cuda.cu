@@ -34296,24 +34296,6 @@ extern "C" int ds4_gpu_motif3_latent_attention_bf16_tensor(
 #undef M3_ATTN_HG_HEADS
 #undef M3_ATTN_HG_ROWS
 
-/* Q8_0 GGUF row dot: 34-byte blocks of one half scale + 32 int8 codes. */
-__device__ __forceinline__ static float motif3_q8_0_dot_row_dev(
-        const char *row, const float *x, uint32_t n_cols) {
-    float acc = 0.0f;
-    const uint32_t nb = n_cols >> 5;
-    for (uint32_t b = 0; b < nb; b++) {
-        const char *blk = row + (uint64_t)b * 34u;
-        const float d = __half2float(*(const __half *)blk);
-        const int8_t *q = (const int8_t *)(blk + 2);
-        float s = 0.0f;
-        #pragma unroll 8
-        for (uint32_t k = 0; k < 32u; k++) s += (float)q[k] * x[b * 32u + k];
-        acc += d * s;
-    }
-    return acc;
-}
-
-
 template <bool RoundBf16>
 __global__ static void motif3_value_project_q8_0_kernel(
         float *heads, const float *latent, const char *weight,
@@ -34333,11 +34315,40 @@ __global__ static void motif3_value_project_q8_0_kernel(
     const uint32_t row0 = kv_head * (qk_nope + value_dim) + qk_nope;
     float *dst = heads +
         ((uint64_t)token * q_heads + head) * value_dim;
-    for (uint32_t d = threadIdx.x; d < value_dim; d += blockDim.x) {
-        const float acc = motif3_q8_0_dot_row_dev(
-                weight + (uint64_t)(row0 + d) * row_bytes,
-                xsh, latent_dim);
-        dst[d] = RoundBf16 ? motif3_bf16_boundary(acc) : acc;
+    /* Decode is faster without paying a warp reduction per value row. */
+    if (rows == 1u) {
+        for (uint32_t d = threadIdx.x; d < value_dim; d += blockDim.x) {
+            const char *row = weight + (uint64_t)(row0 + d) * row_bytes;
+            float acc = 0.0f;
+            for (uint32_t b = 0; b < (latent_dim >> 5); b++) {
+                const char *blk = row + (uint64_t)b * 34u;
+                const int8_t *q = (const int8_t *)(blk + 2);
+                float dot = 0.0f;
+#pragma unroll 8
+                for (uint32_t k = 0; k < 32u; k++)
+                    dot += (float)q[k] * xsh[b * 32u + k];
+                acc += __half2float(*(const __half *)blk) * dot;
+            }
+            dst[d] = RoundBf16 ? motif3_bf16_boundary(acc) : acc;
+        }
+        return;
+    }
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warps = blockDim.x >> 5u;
+    for (uint32_t d = warp; d < value_dim; d += warps) {
+        const char *row = weight + (uint64_t)(row0 + d) * row_bytes;
+        float acc = 0.0f;
+        for (uint32_t b = 0; b < (latent_dim >> 5); b++) {
+            const char *blk = row + (uint64_t)b * 34u;
+            const int8_t *q = (const int8_t *)(blk + 2);
+            const float dot = warp_sum_f32((float)q[lane] *
+                                            xsh[b * 32u + lane]);
+            if (lane == 0u)
+                acc += __half2float(*(const __half *)blk) * dot;
+        }
+        if (lane == 0u)
+            dst[d] = RoundBf16 ? motif3_bf16_boundary(acc) : acc;
     }
 }
 
