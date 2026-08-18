@@ -31,7 +31,8 @@
 #       present, ESTIMATE labeling present.
 #   P:  -c 16384 PREDECODE=0    -> no prewarm line; a completion still
 #       serves (scalar fp8 path).
-#   D:  -c 524288 default boot  -> max_seq=4 prefill_chunk=4096; census:
+#   D:  -c 524288 default boot  -> max_seq GOVERNED [4,32] (v0.6.2 bank
+#       plan; the frozen 4 is dead), prefill_chunk=4096; census:
 #       engine_other < 64 MiB, session_tensors >= 512 MiB (graph-tensor
 #       reclass), batch_bank < 4 GiB (banks only); vmm budget line parsed.
 #   H:  -c 524288 HEADROOM=8192 -> same max_seq + IDENTICAL plan/budget as
@@ -109,51 +110,66 @@ HTTP=$(ssh "$R" "curl -s -m 120 -o /tmp/mt5_p.json -w '%{http_code}' \
 log "P PASS (no prewarm, scalar path serves)"
 
 # ---------- Leg D: deep defaults ----------
+# Governed bank plan (v0.6.2): the deep default is priced from the LIVE
+# budget (the frozen ctx-aware 4 is dead) -- the grant is box-dependent
+# in [4, 32] and the MT GATE LAW (assert the request/regime, never a
+# pinned grant) binds here too.  The bank census bound scales with the
+# grant (~1 GiB/bank eager remainder at this shape).
 boot 524288 ""
 MS=$(ready_field max_seq); PC=$(ready_field prefill_chunk)
-[ "$MS" = "4" ] || fail "leg D: max_seq $MS at ctx 524288 (expected ctx-aware 4)"
+[ -n "$MS" ] && [ "$MS" -ge 4 ] && [ "$MS" -le 32 ] \
+  || fail "leg D: max_seq ${MS:-?} outside the governed [4,32] at ctx 524288"
+[ "$(srv_count 'kv plan')" -ge 1 ] || fail "leg D: governed kv-plan line missing at 524288"
+D_MS=$MS
 [ "$PC" = "4096" ] || fail "leg D: prefill_chunk $PC missing from ready ledger"
 EO=$(census_mib engine_other); ST=$(census_mib session_tensors); BB=$(census_mib batch_bank)
 [ -n "$EO" ] && [ "$EO" -lt 64 ] || fail "leg D: engine_other ${EO:-?} MiB (invariant < 64)"
 [ -n "$ST" ] && [ "$ST" -ge 512 ] || fail "leg D: session_tensors ${ST:-?} MiB (graph reclass expected >= 512)"
-[ -n "$BB" ] && [ "$BB" -lt 4096 ] || fail "leg D: batch_bank ${BB:-?} MiB (banks-only census expected < 4 GiB)"
+[ -n "$BB" ] && [ "$BB" -lt $((MS * 1024)) ] \
+  || fail "leg D: batch_bank ${BB:-?} MiB (expected < ~1 GiB/bank x $MS banks)"
 D_PLAN=$(vmm_field plan); D_BUD=$(vmm_field budget); D_CAP=$(vmm_field capacity)
 [ -n "$D_PLAN" ] && [ -n "$D_BUD" ] && [ -n "$D_CAP" ] || fail "leg D: vmm budget line unparsed"
-log "D PASS (max_seq=4 prefill_chunk=4096; censuses eo=${EO} st=${ST} bb=${BB} MiB; plan=$D_PLAN budget=$D_BUD capacity=$D_CAP GiB)"
+D_NB=$(srv_grep "batch vmm:" | sed -n 's/.*MiB\/bank x \([0-9]*\) banks.*/\1/p')
+D_WF=$(srv_grep "batch vmm:" | sed -n 's/.*work floor=packed \([0-9.]*\) GiB.*/\1/p')
+[ -n "$D_NB" ] && [ -n "$D_WF" ] || fail "leg D: banks/packed-work-floor unparsed from vmm line"
+log "D PASS (max_seq=$MS governed, prefill_chunk=4096; censuses eo=${EO} st=${ST} bb=${BB} MiB; plan=$D_PLAN budget=$D_BUD capacity=$D_CAP wf=$D_WF GiB)"
 
-# ---------- Leg H: headroom arithmetic (V7) ----------
-# The deep budget has THREE regimes: min(plan, capacity) with capacity =
-# max(res + (free - headroom) + floors, floor_work), floor_work = the
-# v0.5.6.3 two-full-banks working floor (2 x cache_per_bank + banks x
-# floor_pb, computable from the vmm print).  The headroom knob shows only
-# in the capacity-bound regime; when floor_work rules (run-2 observed:
-# capacity == floor_work == 17.97 GiB both sides at -c 524288), the two
-# boots are IDENTICAL by design.  Assert what holds in every regime:
-# identical plans, budget = min(plan, capacity), capacity >= floor_work,
-# and the delta is either ~0 (floor/plan-ruled) or ~2 GiB (capacity-
-# bound, the knob's 1:1 signature).  Log the observed regime.
+# ---------- Leg H: headroom arithmetic (V7, re-derived at v0.6.2) ----------
+# The deep budget stays min(plan, capacity) with capacity = max(res +
+# (free - headroom) + floors, work floor) -- but the work floor is
+# PACKED now (Inc 1: the vmm line prints it, `work floor=packed X GiB`;
+# the old 2 x virtual arithmetic is the killed phantom), the stock
+# headroom DERIVES (Inc 2: floor 4096 + burst 2048 = the same 6144),
+# and the BANK GRANT follows the budget (governed plan), so a tighter
+# headroom may legitimately shrink the grant and with it plan_allow.
+# Assert what holds in every regime: per-bank plan rate identical
+# across boots, budget = min(plan, capacity), capacity >= the printed
+# packed work floor, and the capacity delta is ~0 (floor/plan-ruled)
+# or ~+2 GiB (capacity-bound: pin 8192 vs derived 6144), cross-boot
+# MemAvailable drift tolerated.  Log the observed regime.
 boot 524288 "DS4_BATCH_FIT_HEADROOM_MB=8192"
 MS=$(ready_field max_seq)
-[ "$MS" = "4" ] || fail "leg H: max_seq $MS under headroom 8192 (bank plan moved)"
+[ -n "$MS" ] && [ "$MS" -ge 4 ] && [ "$MS" -le "$D_MS" ] \
+  || fail "leg H: max_seq ${MS:-?} vs D's $D_MS (a tighter headroom can only shrink the governed grant)"
 H_PLAN=$(vmm_field plan); H_BUD=$(vmm_field budget); H_CAP=$(vmm_field capacity)
-H_VIRT=$(srv_grep "batch vmm:" | sed -n 's/.*virtual \([0-9.]*\) MiB.*/\1/p')
-H_FLPB=$(srv_grep "batch vmm:" | sed -n 's/.*floor \([0-9.]*\) MiB\/bank x \([0-9]*\) banks.*/\1/p')
-H_NB=$(srv_grep "batch vmm:" | sed -n 's/.*floor [0-9.]* MiB\/bank x \([0-9]*\) banks.*/\1/p')
-[ "$H_PLAN" = "$D_PLAN" ] || fail "leg H: plan $H_PLAN != $D_PLAN (plans must be identical)"
-FLOOR_WORK=$(python3 -c "print(round((2*$H_VIRT + $H_NB*$H_FLPB)/1024.0, 2))")
+H_NB=$(srv_grep "batch vmm:" | sed -n 's/.*MiB\/bank x \([0-9]*\) banks.*/\1/p')
+H_WF=$(srv_grep "batch vmm:" | sed -n 's/.*work floor=packed \([0-9.]*\) GiB.*/\1/p')
+[ -n "$H_NB" ] && [ -n "$H_WF" ] || fail "leg H: banks/packed-work-floor unparsed"
+python3 -c "exit(0 if abs($H_PLAN/$H_NB - $D_PLAN/$D_NB) <= 0.05 else 1)" \
+  || fail "leg H: per-bank plan rate moved ($H_PLAN/$H_NB vs $D_PLAN/$D_NB GiB/bank)"
 CAP_DELTA=$(python3 -c "print(round($D_CAP - $H_CAP, 2))")
-python3 -c "exit(0 if $D_CAP >= $FLOOR_WORK - 0.05 and $H_CAP >= $FLOOR_WORK - 0.05 else 1)" \
-  || fail "leg H: capacity below floor_work $FLOOR_WORK GiB (D=$D_CAP H=$H_CAP)"
+python3 -c "exit(0 if $D_CAP >= $D_WF - 0.05 and $H_CAP >= $H_WF - 0.05 else 1)" \
+  || fail "leg H: capacity below the packed work floor (D: $D_CAP vs $D_WF; H: $H_CAP vs $H_WF)"
 python3 -c "exit(0 if abs($CAP_DELTA) <= 0.2 or (1.0 <= $CAP_DELTA <= 3.0) else 1)" \
   || fail "leg H: capacity delta $CAP_DELTA GiB fits no regime (~0 floor/plan-ruled, ~+2 capacity-bound)"
 python3 -c "exit(0 if abs($D_BUD - min($D_PLAN, $D_CAP)) < 0.05 and abs($H_BUD - min($H_PLAN, $H_CAP)) < 0.05 else 1)" \
   || fail "leg H: budget != min(plan, capacity) (D: $D_BUD vs min($D_PLAN,$D_CAP); H: $H_BUD vs min($H_PLAN,$H_CAP))"
 REGIME=$(python3 -c "
 d=abs($CAP_DELTA)
-if abs($D_CAP - $FLOOR_WORK) <= 0.05: print('floor-ruled (floor_work=%s GiB)' % $FLOOR_WORK)
+if abs($D_CAP - $D_WF) <= 0.05: print('floor-ruled (packed work floor=%s GiB)' % $D_WF)
 elif d <= 0.2: print('plan-ruled')
-else: print('capacity-bound (+%s GiB at 6144)' % $CAP_DELTA)")
-log "H PASS (plan identical; regime: $REGIME; budget=min(plan,capacity) both sides: D=$D_BUD H=$H_BUD GiB)"
+else: print('capacity-bound (+%s GiB: pin 8192 vs derived 6144)' % $CAP_DELTA)")
+log "H PASS (per-bank rate identical; regime: $REGIME; budget=min(plan,capacity) both sides: D=$D_BUD H=$H_BUD GiB)"
 
 # ---------- Leg O: env override wins ----------
 boot 524288 "DS4_SERVER_COALESCE_MAX=8"
