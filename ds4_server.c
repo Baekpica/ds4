@@ -18101,7 +18101,9 @@ static void usage(FILE *fp) {
         "  --mtp-margin F\n"
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
         "  -c, --ctx N\n"
-        "      Context size allocated at startup. Default: 32768\n"
+        "      Context size. Default: 262144 on CUDA (unused context is demand-mapped,\n"
+        "      so a deep window is nearly free until used); 32768 on Metal/CPU (the\n"
+        "      window is allocated at startup).\n"
         "  -n, --tokens N\n"
         "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
         "  -t, --threads N\n"
@@ -18188,11 +18190,13 @@ static void usage(FILE *fp) {
         "  ds4-server -c 49152 --host 0.0.0.0    # full stack on a standard install\n"
         "\n"
         "Normal server command:\n"
-        "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
+        "  ./ds4-server --ctx 524288 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
         "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
-        "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
+        "  On Metal/CPU, larger --ctx values allocate more KV memory at startup and the\n"
+        "  startup log prints the estimate; on CUDA, unused context is demand-mapped and\n"
+        "  each admission is charged what it will actually use.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
         "  -h, --help\n"
@@ -18596,7 +18600,7 @@ static server_config parse_options(int argc, char **argv) {
         },
         .host = "127.0.0.1",
         .port = 8000,
-        .ctx_size = 32768,
+        .ctx_size = 0, /* 0 = per-backend default, resolved after flags */
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
@@ -18791,6 +18795,13 @@ static server_config parse_options(int argc, char **argv) {
     if (no_spec && (mtp_set || c.engine.dspark_path)) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: --no-spec conflicts with --mtp/--dspark");
         exit(2);
+    }
+    if (c.ctx_size <= 0) {
+        /* Deep default on CUDA, where unused context is demand-mapped
+         * (v0.6) and one long agent request must fit a defaults boot;
+         * conservative on Metal/CPU, where the window is allocated at
+         * startup. */
+        c.ctx_size = c.engine.backend == DS4_BACKEND_CUDA ? 262144 : 32768;
     }
     launch_resolve_defaults(&c, model_set, mtp_set,
                             preset_spark, no_mtp, no_dspark, no_spec);

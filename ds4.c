@@ -34277,7 +34277,8 @@ static int ds4_batch_cont_fund_check(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         q->mres + q->mneed > ctx->comp_map_budget) {
         const uint64_t want = q->mres + q->mneed - ctx->comp_map_budget;
         if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
-                                      protect, want, NULL) > 0)
+                                      protect, want,
+                                      "under class-budget pressure") > 0)
             q->mres = ds4_batch_slabs_cache_resident(&ctx->sl);
     }
     /* memgov D0b-3 (S4/S5): ONE claim for both live verdicts, built from
@@ -34320,7 +34321,7 @@ static int ds4_batch_cont_fund_check(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         if (q->mneed > q->usable) {
             if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
                                           protect, q->mneed - q->usable,
-                                          NULL) > 0)
+                                          "to honor the memory floor") > 0)
                 q->usable = ds4_mem_usable_beyond(ctx->serial_reserve);
         }
         /* memgaps MG-1: still short -> return the engine's own graph-pool

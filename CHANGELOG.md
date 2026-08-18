@@ -7,6 +7,16 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- Default context raised to 262144 on CUDA builds (was 32768; Metal/CPU
+  keep 32768). Rationale: with the v0.6 memory model a deep window is
+  demand-mapped and nearly free until used, while the old 32k default
+  was a footgun — a defaults boot could not fit even one long agentic
+  request (prompt plus the 32768-token decode budget assumed when
+  `max_tokens` is omitted). At 262144 the bank plan still derives 4
+  banks. Users chasing maximum concurrency for shallow batch work set
+  `-c` low explicitly, as they already tune the bank count. The default
+  resolves after flag parsing, so `--metal`/`--cpu` on a CUDA build get
+  the conservative default.
 - Weight-server manifest content identity (closes the limitation
   chartered at v0.6.0): the manifest now carries a per-model content
   fingerprint (`content <id> <size> <algo> <hex>`, strided FNV-1a
