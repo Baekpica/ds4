@@ -34888,6 +34888,7 @@ extern "C" int ds4_gpu_dots3_store_latent_kpe_tensor(
  * groups so both the 512-wide full layers and the 1024-wide SWA layers fit.
  * With `selected` the walk visits the DSA top-k ids (skipping non-causal
  * filler); otherwise it walks the window/causal range like Motif-3. */
+template <uint32_t kGroups>
 __global__ static void dots3_latent_attention_kernel(
         float *out, const float *q, const float *q_absorbed,
         const __nv_bfloat16 *latent_cache, const __nv_bfloat16 *k_pe_cache,
@@ -34899,7 +34900,8 @@ __global__ static void dots3_latent_attention_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t head = blockIdx.x * 8u + warp;
-    const uint32_t groups = latent_dim / 128u;
+    constexpr uint32_t storage_groups = kGroups ? kGroups : 8u;
+    const uint32_t groups = kGroups ? kGroups : latent_dim / 128u;
     if (token >= rows || head >= q_heads || groups > 8u ||
         (latent_dim & 127u) || qk_rope != 64u) return;
 
@@ -34911,7 +34913,8 @@ __global__ static void dots3_latent_attention_kernel(
     const float *qh = q + ((uint64_t)token * q_heads + head) * key_dim;
     const float4 *low4 = (const float4 *)(q_absorbed +
         ((uint64_t)token * q_heads + head) * latent_dim);
-    float4 low[8];
+    float4 low[storage_groups];
+#pragma unroll
     for (uint32_t g = 0; g < groups; g++) low[g] = low4[lane + 32u * g];
     float qrope[4] = {0.f, 0.f, 0.f, 0.f};
     if (lane < 16u) {
@@ -34923,7 +34926,8 @@ __global__ static void dots3_latent_attention_kernel(
 
     float M = -FLT_MAX / 2.0f;
     float S = 0.0f;
-    float4 o[8];
+    float4 o[storage_groups];
+#pragma unroll
     for (uint32_t g = 0; g < groups; g++) o[g] = make_float4(0.f, 0.f, 0.f, 0.f);
     const uint32_t count = selected ? sel_stride : visible;
     for (uint32_t j = 0; j < count; j++) {
@@ -34941,7 +34945,8 @@ __global__ static void dots3_latent_attention_kernel(
         if (slot >= cache_cap) continue;
         const __nv_bfloat16 *kvrow = latent_cache + (uint64_t)slot * latent_dim;
         float partial = 0.0f;
-        float4 k[8];
+        float4 k[storage_groups];
+#pragma unroll
         for (uint32_t g = 0; g < groups; g++) {
             k[g] = motif3_load_bf16x4(kvrow + (lane + 32u * g) * 4u);
             partial += low[g].x * k[g].x + low[g].y * k[g].y +
@@ -34959,6 +34964,7 @@ __global__ static void dots3_latent_attention_kernel(
         const float new_m = fmaxf(M, score);
         const float old_scale = expf(M - new_m);
         const float row_scale = expf(score - new_m);
+#pragma unroll
         for (uint32_t g = 0; g < groups; g++) {
             o[g].x = o[g].x * old_scale + k[g].x * row_scale;
             o[g].y = o[g].y * old_scale + k[g].y * row_scale;
@@ -34971,6 +34977,7 @@ __global__ static void dots3_latent_attention_kernel(
     const float inv_s = S > 0.0f ? 1.0f / S : 0.0f;
     float4 *dst = (float4 *)(out +
         ((uint64_t)token * q_heads + head) * latent_dim);
+#pragma unroll
     for (uint32_t g = 0; g < groups; g++) {
         o[g].x *= inv_s; o[g].y *= inv_s; o[g].z *= inv_s; o[g].w *= inv_s;
         dst[lane + 32u * g] = o[g];
@@ -35001,14 +35008,19 @@ extern "C" int ds4_gpu_dots3_latent_attention_tensor(
         k_pe_cache->bytes <
             (uint64_t)cache_cap * qk_rope * sizeof(__nv_bfloat16)) return 0;
     dim3 grid((q_heads + 7u) / 8u, rows, 1);
-    dots3_latent_attention_kernel<<<grid, 256>>>(
-            (float *)out->ptr, (const float *)q->ptr,
-            (const float *)q_absorbed->ptr,
-            (const __nv_bfloat16 *)latent_cache->ptr,
-            (const __nv_bfloat16 *)k_pe_cache->ptr,
-            selected ? (const int32_t *)selected->ptr : NULL, sel_stride,
-            rows, pos0, cache_cap, window, q_heads, latent_dim,
-            qk_nope, qk_rope, scale);
+#define D3_LAUNCH(groups_)                                                   \
+    dots3_latent_attention_kernel<groups_><<<grid, 256>>>(                   \
+            (float *)out->ptr, (const float *)q->ptr,                        \
+            (const float *)q_absorbed->ptr,                                  \
+            (const __nv_bfloat16 *)latent_cache->ptr,                        \
+            (const __nv_bfloat16 *)k_pe_cache->ptr,                          \
+            selected ? (const int32_t *)selected->ptr : NULL, sel_stride,    \
+            rows, pos0, cache_cap, window, q_heads, latent_dim,              \
+            qk_nope, qk_rope, scale)
+    if (latent_dim == 512u) D3_LAUNCH(4u);
+    else if (latent_dim == 1024u) D3_LAUNCH(8u);
+    else D3_LAUNCH(0u);
+#undef D3_LAUNCH
     return cuda_ok(cudaGetLastError(), "dots3 latent attention launch");
 }
 
