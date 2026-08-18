@@ -39418,6 +39418,7 @@ int ds4_batch_ctx_commit_rate(const ds4_batch_ctx *ctx,
     (void)ctx; (void)obs_bpt; (void)phys_bpt; return 0;
 }
 uint32_t ds4_cont_admit_band_x1024(void) { return 1024u; }
+uint32_t ds4_cont_prefill_chunk_tokens(void) { return 4096u; }
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {
@@ -40533,15 +40534,6 @@ static bool ds4_session_lazy_graph_enabled(void) {
     const char *e = getenv("DS4_SESSION_LAZY_GRAPH");
     return !(e && e[0] == '0' && e[1] == '\0');   /* default ON */
 }
-/* MT-3 hotfix (teb fast-leg death, 08-17): exported so the server's idle
- * reaper can decline in eager-graph mode -- with DS4_SESSION_LAZY_GRAPH=0
- * every recreate materializes the full graph, so a reap frees ~6 GiB only
- * to re-allocate it in the same call: pure churn with a fatal endpoint
- * when a recreate loses the fit race against live banks. */
-int ds4_session_lazy_graph(void) {
-    return ds4_session_lazy_graph_enabled() ? 1 : 0;
-}
-
 /* One body for the eager (create) and lazy (ensure) alloc so the two cannot
  * drift: sizing, quality/power adoption, directional steering.
  * MT-2 (v0.6.1 memory truth): this body is THE serial-graph burst -- every
@@ -40614,6 +40606,19 @@ static int ds4_session_ensure_graph(ds4_session *s, char *err, size_t errlen) {
     return 0;
 }
 #endif
+
+/* MT-3 hotfix (teb fast-leg death, 08-17): exported so the server's idle
+ * reaper can decline in eager-graph mode -- with DS4_SESSION_LAZY_GRAPH=0
+ * every recreate materializes the full graph, so a reap frees ~6 GiB only
+ * to re-allocate it in the same call: pure churn with a fatal endpoint
+ * when a recreate loses the fit race against live banks. */
+int ds4_session_lazy_graph(void) {
+#ifndef DS4_NO_GPU
+    return ds4_session_lazy_graph_enabled() ? 1 : 0;
+#else
+    return 0;   /* no graph backend: no session graph to reap */
+#endif
+}
 
 /* v0.5.2: whether this session's graph alloc is still deferred (S6 lazy
  * graph).  A pending session can still be re-created at a different ctx for
