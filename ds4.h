@@ -754,6 +754,12 @@ int  ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
  * exported): what a committed graph at this ctx costs, for SERIAL_SESSION
  * and STATIC_BATCH shadow claims. */
 uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx);
+/* v0.6.2 Inc 0: the MEASURED committed-graph bytes for the same lease row
+ * (census SESSION_TENSORS delta across the alloc's scope bracket) -- the
+ * estimate reconciled against the allocator's own account.  0 while the
+ * graph is pending or where the backend keeps no census; callers fall
+ * back to the estimate then. */
+uint64_t ds4_session_graph_bytes_committed(const ds4_session *s);
 /* The serial session fit gate's headroom (DS4_SESSION_GRAPH_HEADROOM_MB,
  * default 1024 MiB) -- one source shared by the probe and the S6 claim. */
 uint64_t ds4_session_graph_headroom_bytes(void);
@@ -959,6 +965,15 @@ typedef struct {
      * ds4_mem_own_trim_{calls,recovered_bytes}_total). */
     uint64_t mem_own_trim_calls;
     uint64_t mem_own_trim_recovered;
+    /* v0.6.2 Inc 0: the reconciliation line.  residual is SIGNED (stored
+     * through an int64 cast; porcelains render %lld) -- the ledger can
+     * over-explain as honestly as it under-explains.  flagged counts idle
+     * computes whose |residual| exceeded the tolerance; onetime is the
+     * named one-time-charge total (first-admit warmup) the compute
+     * subtracts. */
+    uint64_t mem_reconcile_residual;   /* gauge (int64 via cast) */
+    uint64_t mem_reconcile_onetime;    /* gauge */
+    uint64_t mem_reconcile_flagged;    /* counter */
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);

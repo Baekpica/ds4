@@ -8448,6 +8448,28 @@ struct server {
      * last_serial_use is worker-owned (stamped after serial-runner jobs). */
     int    serial_idle_reap_s;
     double last_serial_use;
+    /* v0.6.2 Inc 0: the reconciliation line -- governor/census ledger +
+     * named one-time charges vs the raw free-memory delta since boot
+     * settle (plan-v062 Inc 0; the zero-headroom law made continuous).
+     * Baseline is armed ONCE in the boot census block (main thread,
+     * pre-listener) and gated by rec_supported with release/acquire so
+     * the worker's idle tick never reads a half-written baseline; the
+     * raw SOURCE is pinned at arm time (MemAvailable on integrated,
+     * cuda-free otherwise) -- the max-of-two winner can flip sources
+     * mid-run and would corrupt the delta.  rec_onetime/rec_warmup_state
+     * are worker-owned after boot (atomic word reads from porcelains).
+     * Pure logging: nothing here feeds a verdict. */
+    int      rec_supported;      /* baseline armed (atomic release/acquire) */
+    int      rec_src;            /* ds4_mem_obs_source of the raw field */
+    uint64_t rec_boot_raw;       /* raw source value at boot settle */
+    uint64_t rec_boot_census;    /* census live, both domains, at boot settle */
+    uint64_t rec_onetime;        /* named one-time charges (first-admit warmup) */
+    int      rec_warmup_state;   /* 0=unmeasured 1=captured 2=env-pinned */
+    int64_t  rec_last_printed;   /* residual at the last printed line */
+    int      rec_printed_once;
+    int      rec_last_flagged;   /* flagged state at the last printed line */
+    uint64_t rec_tol_bytes;      /* DS4_MEM_RECONCILE_TOL_MB (default 256) */
+    int      rec_strict;         /* DS4_MEM_RECONCILE_STRICT=1 (gates) */
     /* v0.5.2 inc3: abort work for dead clients (field: "memory never
      * released after interruption").  Streaming rows already aborted via
      * failed sends; non-streaming rows decoded to their full budget and
@@ -13496,6 +13518,9 @@ static void job_shed_aged(server *s, job *j, const char *site) {
  * _locked() performs the swap and expects gen_mu HELD. */
 static bool serial_idle_reap_due(const server *s);
 static void serial_session_idle_reap_locked(server *s);
+/* v0.6.2 Inc 0: the reconciliation tick (defined with the memory
+ * porcelains below) -- rides the same 10 s idle cadence as the reaper. */
+static void mem_reconcile_idle_tick(server *s, int final_line);
 
 static job *dequeue(server *s) {
     for (;;) {
@@ -13508,13 +13533,17 @@ static job *dequeue(server *s) {
             struct timespec dl;
             clock_gettime(CLOCK_REALTIME, &dl);
             dl.tv_sec += 10;
-            if (pthread_cond_timedwait(&s->cv, &s->mu, &dl) != 0 &&
-                serial_idle_reap_due(s)) {
+            if (pthread_cond_timedwait(&s->cv, &s->mu, &dl) != 0) {
                 pthread_mutex_unlock(&s->mu);
-                pthread_mutex_lock(&s->gen_mu);
-                if (serial_idle_reap_due(s))   /* unchanged: worker-owned */
-                    serial_session_idle_reap_locked(s);
-                pthread_mutex_unlock(&s->gen_mu);
+                if (serial_idle_reap_due(s)) {
+                    pthread_mutex_lock(&s->gen_mu);
+                    if (serial_idle_reap_due(s))   /* unchanged: worker-owned */
+                        serial_session_idle_reap_locked(s);
+                    pthread_mutex_unlock(&s->gen_mu);
+                }
+                /* v0.6.2 Inc 0: the reconciliation tick -- never under
+                 * s->mu (it reads /proc and takes the census snap lock). */
+                mem_reconcile_idle_tick(s, 0);
                 pthread_mutex_lock(&s->mu);
             }
         }
@@ -13815,7 +13844,13 @@ static bool serial_session_ensure_fit(server *s, job *j) {
          * (no memory verdict was taken on this path). */
         const uint64_t est = ds4_engine_session_graph_bytes_estimate(s->engine,
                                                                      cur_ctx);
-        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, pending ? 0 : est);
+        /* v0.6.2 Inc 0: a COMMITTED graph re-publishes on its measured
+         * basis (the alloc's census delta); the estimate keeps pricing
+         * declared-but-pending intent, where no measurement exists. */
+        const uint64_t meas = pending ? 0
+            : ds4_session_graph_bytes_committed(s->session);
+        const uint64_t use = meas ? meas : est;
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, use, pending ? 0 : use);
         return true;   /* committed-and-big-enough, or pending-and-allocatable */
     }
 
@@ -16292,6 +16327,9 @@ static void *worker_main(void *arg) {
             s->last_serial_use = now_sec();   /* MT-3: idle window restarts */
         }
     }
+    /* v0.6.2 Inc 0: the forced final reconcile line -- gate legs assert
+     * the residual after a clean stop (DS4_MEM_RECONCILE_STRICT=1). */
+    mem_reconcile_idle_tick(s, 1);
     return NULL;
 }
 
@@ -16907,6 +16945,108 @@ static uint64_t bank_lineage_clock(server *s) {
     return sum;
 }
 
+/* =========================================================================
+ * v0.6.2 Inc 0: the reconciliation line (plan-v062 Inc 0) -- the
+ * zero-headroom law made continuous.  The armed baseline (boot census
+ * block) pairs with one render capture; observed raw drop = census
+ * growth + named one-time charges + RESIDUAL, and the residual prints
+ * named or flags over the tolerance instead of being silently absorbed
+ * by the live floor check.  Pure logging: nothing here feeds a verdict.
+ *
+ * mem_reconcile_from is callable from any thread: the baseline is
+ * acquire-gated, rec_onetime reads as an atomic word (worker-owned after
+ * boot), and the capture primitives are the lock-free porcelain set. */
+static int mem_reconcile_from(server *s, const mem_census_image *img,
+                              const ds4_mem_observation *o,
+                              ds4_mem_reconcile *out, uint64_t *onetime_out,
+                              uint64_t *now_raw_out, uint64_t *now_census_out) {
+    if (!__atomic_load_n(&s->rec_supported, __ATOMIC_ACQUIRE)) return 0;
+    if (!img->supported || o->status != DS4_MEMOBS_OK) return 0;
+    const uint64_t raw = s->rec_src == DS4_MEMOBS_SRC_MEMINFO_AVAILABLE
+        ? o->meminfo_avail_bytes : o->cuda_free_bytes;
+    if (raw == 0) return 0;            /* pinned source kept no answer */
+    uint64_t census = 0;
+    for (int c = 0; c < DS4_MEMC__COUNT; c++)
+        for (int d = 0; d < DS4_MEMD__COUNT; d++)
+            census += ds4_mem_cell_live(&img->cells[c][d]);
+    const uint64_t onetime =
+        __atomic_load_n(&s->rec_onetime, __ATOMIC_RELAXED);
+    if (onetime_out) *onetime_out = onetime;
+    if (now_raw_out) *now_raw_out = raw;
+    if (now_census_out) *now_census_out = census;
+    *out = ds4_mem_reconcile_compute(s->rec_boot_raw, raw,
+                                     s->rec_boot_census, census,
+                                     onetime, s->rec_tol_bytes);
+    return 1;
+}
+
+/* The idle tick (rides the dequeue 10 s wait, worker thread, no locks
+ * held) and the forced final line at worker shutdown.  Print policy: the
+ * first compute, any >=64 MiB residual move, a flag flip, and the final
+ * line -- a quiet idle server prints once and stays quiet. */
+static void mem_reconcile_idle_tick(server *s, int final_line) {
+    mem_census_image img; ds4_gov_ledger lg; ds4_mem_observation o;
+    mem_render_capture(&img, &lg, &o);
+    (void)lg;
+    ds4_mem_reconcile r; uint64_t onetime = 0, now_raw = 0, now_census = 0;
+    if (!mem_reconcile_from(s, &img, &o, &r, &onetime, &now_raw, &now_census))
+        return;
+    ds4_metrics *m = ds4_metrics_get();
+    /* First-admit warmup capture: the first idle reconcile after real
+     * work completed takes the positive residual as THE named one-time
+     * charge (census-invisible driver/runtime warmup: module loads, JIT,
+     * host allocator growth).  Self-calibrating and disclosed -- the
+     * covered-request count prints so a receipt reader can judge how
+     * tight the bracket was; DS4_MEM_RECONCILE_WARMUP_MB pins instead. */
+    const uint64_t done = ds4_metric_read(&m->requests_completed) +
+                          ds4_metric_read(&m->requests_failed);
+    if (s->rec_warmup_state == 0 && done > 0) {
+        const uint64_t w = r.residual > 0 ? (uint64_t)r.residual : 0;
+        __atomic_store_n(&s->rec_onetime, w, __ATOMIC_RELAXED);
+        s->rec_warmup_state = 1;
+        onetime = w;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: mem reconcile: first-admit warmup %.1f MiB "
+                   "captured as the named one-time charge (covers %llu "
+                   "completed request(s); DS4_MEM_RECONCILE_WARMUP_MB pins, "
+                   "0 disables)",
+                   (double)w / 1048576.0, (unsigned long long)done);
+        r = ds4_mem_reconcile_compute(s->rec_boot_raw, now_raw,
+                                      s->rec_boot_census, now_census,
+                                      onetime, s->rec_tol_bytes);
+    }
+    ds4_metric_set(&m->mem_reconcile_residual, (uint64_t)r.residual);
+    ds4_metric_set(&m->mem_reconcile_onetime, onetime);
+    if (r.flagged) ds4_metric_add(&m->mem_reconcile_flagged, 1);
+    const int64_t moved = r.residual - s->rec_last_printed;
+    const int64_t mvmag = moved < 0 ? -moved : moved;
+    if (final_line || !s->rec_printed_once ||
+        mvmag >= 64 * 1048576ll || r.flagged != s->rec_last_flagged) {
+        server_log(r.flagged ? DS4_LOG_WARNING : DS4_LOG_DEFAULT,
+                   "ds4-server: mem reconcile%s: drop %+.2f GiB since boot = "
+                   "census %+.2f GiB + onetime %.1f MiB + residual %+.1f MiB "
+                   "(tol %.0f MiB)%s",
+                   final_line ? " final" : "",
+                   (double)r.observed_delta / 1073741824.0,
+                   (double)r.census_growth / 1073741824.0,
+                   (double)onetime / 1048576.0,
+                   (double)r.residual / 1048576.0,
+                   (double)s->rec_tol_bytes / 1048576.0,
+                   r.flagged ? " FLAGGED" : "");
+        s->rec_printed_once = 1;
+        s->rec_last_printed = r.residual;
+        s->rec_last_flagged = r.flagged;
+    }
+    /* The gate token (DS4_MEM_RECONCILE_STRICT=1): capacity legs assert
+     * NO line of this shape at leg end.  Logging, never a verdict. */
+    if (r.flagged && s->rec_strict)
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: mem reconcile STRICT: residual %+.1f MiB "
+                   "exceeds tol %.0f MiB (unexplained by census + onetime)",
+                   (double)r.residual / 1048576.0,
+                   (double)s->rec_tol_bytes / 1048576.0);
+}
+
 /* Prometheus text exposition (hand-rolled: it is just lines). */
 static void send_metrics(server *s, int fd) {
     ds4_metrics *m = ds4_metrics_get();
@@ -17229,6 +17369,23 @@ static void send_metrics(server *s, int fd) {
                        "ds4_mem_own_trim_recovered_bytes_total %llu\n",
                    (unsigned long long)ds4_metric_read(&m->mem_own_trim_calls),
                    (unsigned long long)ds4_metric_read(&m->mem_own_trim_recovered));
+        /* v0.6.2 Inc 0: the reconciliation family, computed FRESH from
+         * this render's own capture (on-demand truth, not the idle
+         * tick's last echo); omitted when no baseline could arm (the
+         * absence-not-zero census convention).  residual is SIGNED. */
+        {
+            ds4_mem_reconcile rr; uint64_t ot = 0;
+            if (mem_reconcile_from(s, &img, &o, &rr, &ot, NULL, NULL))
+                buf_printf(&b,
+                    "# TYPE ds4_mem_reconcile_residual_bytes gauge\n"
+                    "ds4_mem_reconcile_residual_bytes %lld\n"
+                    "# TYPE ds4_mem_reconcile_onetime_bytes gauge\n"
+                    "ds4_mem_reconcile_onetime_bytes %llu\n",
+                    (long long)rr.residual, (unsigned long long)ot);
+            buf_printf(&b, "# TYPE ds4_mem_reconcile_flagged_total counter\n"
+                           "ds4_mem_reconcile_flagged_total %llu\n",
+                       (unsigned long long)ds4_metric_read(&m->mem_reconcile_flagged));
+        }
         /* memgov D0b-4: the shadow governor.  Leases (one ledger image
          * through the seqlock), then the full fixed-cardinality decision
          * matrix (plan sec 14 ds4_memory_decisions_total) -- all cells
@@ -17464,10 +17621,42 @@ static void send_stats(server *s, int fd, bool as_json) {
                            (unsigned long long)o.cuda_free_bytes,
                            (unsigned long long)o.meminfo_avail_bytes);
             buf_printf(&b, ",\"calls_cuda_free\":%llu,\"calls_meminfo_available\":%llu,"
-                           "\"errors\":%llu}}",
+                           "\"errors\":%llu}",
                        (unsigned long long)ds4_metric_read(&m->memobs_calls[DS4_MEMOBS_SRC_CUDA_FREE]),
                        (unsigned long long)ds4_metric_read(&m->memobs_calls[DS4_MEMOBS_SRC_MEMINFO_AVAILABLE]),
                        (unsigned long long)ds4_metric_read(&m->memobs_errors));
+            /* v0.6.2 Inc 0: the reconciliation object, computed FRESH
+             * from this render's capture (the on-demand surface).  All
+             * signed fields render as signed decimals. */
+            {
+                ds4_mem_reconcile rr; uint64_t ot = 0, nraw = 0, ncen = 0;
+                if (mem_reconcile_from(s, &img, &o, &rr, &ot, &nraw, &ncen)) {
+                    static const char *wname[3] =
+                        { "pending", "captured", "pinned" };
+                    int ws = s->rec_warmup_state;
+                    if (ws < 0 || ws > 2) ws = 0;
+                    buf_printf(&b,
+                        ",\"reconcile\":{\"supported\":true,\"source\":\"%s\","
+                        "\"boot_raw\":%llu,\"now_raw\":%llu,"
+                        "\"observed_delta\":%lld,\"census_growth\":%lld,"
+                        "\"onetime\":%llu,\"residual\":%lld,\"tol\":%llu,"
+                        "\"flagged\":%s,\"strict\":%s,\"warmup\":\"%s\"}",
+                        mem_obs_source_names[s->rec_src],
+                        (unsigned long long)s->rec_boot_raw,
+                        (unsigned long long)nraw,
+                        (long long)rr.observed_delta,
+                        (long long)rr.census_growth,
+                        (unsigned long long)ot,
+                        (long long)rr.residual,
+                        (unsigned long long)s->rec_tol_bytes,
+                        rr.flagged ? "true" : "false",
+                        s->rec_strict ? "true" : "false",
+                        wname[ws]);
+                } else {
+                    buf_puts(&b, ",\"reconcile\":{\"supported\":false}");
+                }
+            }
+            buf_putc(&b, '}');
         }
         /* memgov D0b-4: governor section -- leases + decisions by reason
          * (the full consumer x result x reason matrix lives in /metrics;
@@ -18974,6 +19163,24 @@ int main(int argc, char **argv) {
         const char *ir = getenv("DS4_SERIAL_IDLE_REAP_S");
         s.serial_idle_reap_s = ir && ir[0] ? atoi(ir) : 120;
         if (s.serial_idle_reap_s < 0) s.serial_idle_reap_s = 0;
+        /* v0.6.2 Inc 0: reconciliation tolerance (absolute; the residual
+         * band a healthy box holds) + gate strictness.  An explicit
+         * DS4_MEM_RECONCILE_WARMUP_MB PINS the one-time warmup charge and
+         * disarms the self-calibrating capture (the --mem-floor-gb
+         * pattern: explicit value = deterministic behavior for gates). */
+        const char *rt = getenv("DS4_MEM_RECONCILE_TOL_MB");
+        long tol_mb = rt && rt[0] ? atol(rt) : 256;
+        if (tol_mb < 0) tol_mb = 0;
+        s.rec_tol_bytes = (uint64_t)tol_mb * 1048576ull;
+        const char *rs = getenv("DS4_MEM_RECONCILE_STRICT");
+        s.rec_strict = rs && rs[0] == '1' && rs[1] == '\0';
+        const char *rw = getenv("DS4_MEM_RECONCILE_WARMUP_MB");
+        if (rw && rw[0]) {
+            long wmb = atol(rw);
+            if (wmb < 0) wmb = 0;
+            s.rec_onetime = (uint64_t)wmb * 1048576ull;
+            s.rec_warmup_state = 2;   /* pinned: auto-capture disarmed */
+        }
         s.last_serial_use = now_sec();
         /* v0.5.2 inc3: dead-client abort (see the server struct comment). */
         const char *da = getenv("DS4_SERVER_DISCONNECT_ABORT");
@@ -19278,7 +19485,6 @@ int main(int argc, char **argv) {
          * unrendered here; the capture is one call by design). */
         mem_census_image img; ds4_gov_ledger lg; ds4_mem_observation o;
         mem_render_capture(&img, &lg, &o);
-        (void)o;
         if (img.supported) {
             uint64_t tl[DS4_MEMD__COUNT] = {0}, ts[DS4_MEMD__COUNT] = {0};
             for (int d = 0; d < DS4_MEMD__COUNT; d++) {
@@ -19343,6 +19549,34 @@ int main(int argc, char **argv) {
                  * later arena promotions must carry claims (the lazy
                  * materializer does; the funnel tripwires bypasses). */
                 ds4_gpu_model_plan_freeze();
+                /* v0.6.2 Inc 0: arm the reconciliation baseline at the
+                 * SAME settle instant the boot lease is computed from.
+                 * The raw source is pinned now: MemAvailable where the
+                 * box answers it (integrated), cuda-free otherwise --
+                 * the max-of-two winner can flip sources mid-run and a
+                 * flipped source makes the delta a fiction.  Release
+                 * store: the worker thread is already running its idle
+                 * tick and must never read a half-written baseline. */
+                if (o.status == DS4_MEMOBS_OK &&
+                    (o.meminfo_avail_bytes || o.cuda_free_bytes)) {
+                    const int msrc = o.meminfo_avail_bytes
+                        ? DS4_MEMOBS_SRC_MEMINFO_AVAILABLE
+                        : DS4_MEMOBS_SRC_CUDA_FREE;
+                    s.rec_src = msrc;
+                    s.rec_boot_raw = o.meminfo_avail_bytes
+                        ? o.meminfo_avail_bytes : o.cuda_free_bytes;
+                    s.rec_boot_census = total;
+                    __atomic_store_n(&s.rec_supported, 1, __ATOMIC_RELEASE);
+                    server_log(DS4_LOG_DEFAULT,
+                               "ds4-server: mem reconcile: baseline armed "
+                               "(%s %.2f GiB, census live %.2f GiB, tol %.0f "
+                               "MiB%s%s)",
+                               mem_obs_source_names[msrc],
+                               mem_gib(s.rec_boot_raw), mem_gib(total),
+                               (double)s.rec_tol_bytes / 1048576.0,
+                               s.rec_strict ? ", STRICT" : "",
+                               s.rec_warmup_state == 2 ? ", warmup pinned" : "");
+                }
             }
         }
     }
@@ -26919,6 +27153,42 @@ static void test_mem_census_trim_inject_parse(void) {
     TEST_ASSERT(site == -7 && n == 77);
 }
 
+/* v0.6.2 Inc 0: reconciliation arithmetic (pure core).  The equation
+ * under test: observed raw drop = census growth + one-time charges +
+ * residual, signed in every term, flagged strictly over the tolerance. */
+static void test_mem_reconcile_arithmetic(void) {
+    /* A fully explained drop: residual 0, unflagged. */
+    ds4_mem_reconcile r = ds4_mem_reconcile_compute(
+        /*boot_raw*/ 100, /*now_raw*/ 60,
+        /*boot_census*/ 10, /*now_census*/ 50,
+        /*onetime*/ 0, /*tol*/ 5);
+    TEST_ASSERT(r.observed_delta == 40 && r.census_growth == 40);
+    TEST_ASSERT(r.residual == 0 && !r.flagged);
+    /* One-time charges explain the census-invisible part. */
+    r = ds4_mem_reconcile_compute(100, 50, 10, 40, 20, 5);
+    TEST_ASSERT(r.observed_delta == 50 && r.explained == 50);
+    TEST_ASSERT(r.residual == 0 && !r.flagged);
+    /* Unexplained consumption flags positive... */
+    r = ds4_mem_reconcile_compute(100, 40, 10, 40, 0, 5);
+    TEST_ASSERT(r.residual == 30 && r.flagged);
+    /* ...and over-explanation flags negative (the box returned memory
+     * the ledger still charges): |residual| governs. */
+    r = ds4_mem_reconcile_compute(100, 90, 10, 60, 0, 5);
+    TEST_ASSERT(r.residual == -40 && r.flagged);
+    /* Exactly at tol does NOT flag (strictly-over threshold). */
+    r = ds4_mem_reconcile_compute(100, 95, 10, 10, 0, 5);
+    TEST_ASSERT(r.residual == 5 && !r.flagged);
+    /* The raw answer can rise past boot (a neighbor exited) while the
+     * census shrank: both terms go negative and still reconcile. */
+    r = ds4_mem_reconcile_compute(100, 120, 50, 30, 0, 5);
+    TEST_ASSERT(r.observed_delta == -20 && r.census_growth == -20);
+    TEST_ASSERT(r.residual == 0 && !r.flagged);
+    /* Saturated inputs clamp to INT64_MAX instead of wrapping (a stale
+     * counter errs HIGH, the tripwire convention). */
+    r = ds4_mem_reconcile_compute(UINT64_MAX, 0, 0, 0, 0, 5);
+    TEST_ASSERT(r.observed_delta == INT64_MAX && r.flagged);
+}
+
 #ifndef DS4_NO_GPU
 /* memgov D0a-4: drive the D-1b trim-failure semantics at the REAL driver
  * boundary.  Runs only where the backend supports injection (CUDA) AND
@@ -28447,6 +28717,8 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_census_arena_slack_shape();
     test_mem_census_trim_residue_shape();
     test_mem_census_trim_inject_parse();
+    /* v0.6.2 Inc 0: reconciliation arithmetic. */
+    test_mem_reconcile_arithmetic();
 #ifndef DS4_NO_GPU
     test_mem_census_trim_inject_driver();
     /* memgov D4-2: reclaim trim-preimage arithmetic. */

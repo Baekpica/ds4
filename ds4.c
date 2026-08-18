@@ -28237,6 +28237,12 @@ struct ds4_session {
      * touch the graph.  Always false for CPU and distributed-coordinator
      * sessions and when DS4_SESSION_LAZY_GRAPH=0. */
     bool graph_pending;
+    /* v0.6.2 Inc 0: the committed graph's MEASURED bytes -- the census
+     * SESSION_TENSORS delta across the alloc's scope bracket (0 =
+     * pending, failed, or a backend keeping no census).  The serial
+     * lease's committed-row basis; the estimate keeps pricing pending
+     * intent, where no measurement can exist yet. */
+    uint64_t graph_alloc_bytes;
 };
 
 #ifndef DS4_NO_GPU
@@ -40625,6 +40631,20 @@ static bool ds4_session_lazy_graph_enabled(void) {
  * pc-scaled prefill scratch group (~3.98 GiB at pc 4096) and the indexer
  * scratch previously fell through to ENGINE_OTHER (the leg-1 mystery
  * reading), violating the documented ENGINE_OTHER live == 0 invariant. */
+/* v0.6.2 Inc 0: one census cell's live bytes, read plainly -- every
+ * caller holds the single-writer domain (gen_mu or pre-listener boot),
+ * so a before/after pair brackets exactly this thread's own notes and
+ * the porcelain epoch dance is unnecessary.  0 where the backend keeps
+ * no census (Metal/CPU): the measurement then reads absent and the
+ * estimate keeps the row. */
+static uint64_t session_tensors_census_live(void) {
+    ds4_mem_cell cell;
+    if (ds4_gpu_mem_census_read(DS4_MEMC_SESSION_TENSORS,
+                                DS4_MEMD_UNIFIED_DEVICE, &cell) != 0)
+        return 0;
+    return ds4_mem_cell_live(&cell);
+}
+
 static int ds4_session_alloc_graph(ds4_session *s) {
     ds4_engine *e = s->engine;
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(s->ctx_size, s->prefill_cap);
@@ -40633,6 +40653,8 @@ static int ds4_session_alloc_graph(ds4_session *s) {
                                                           s->prefill_cap,
                                                           e->mtp_ready, e->dspark_ready);
     ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, 0);
+    s->graph_alloc_bytes = 0;
+    const uint64_t census_before = session_tensors_census_live();
     ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
     if (!metal_graph_session_fit_ok(&e->weights, &e->weights.layer[0],
                                     raw_cap, (uint32_t)s->ctx_size, s->prefill_cap,
@@ -40661,7 +40683,28 @@ static int ds4_session_alloc_graph(ds4_session *s) {
         return 1;
     }
     ds4_gpu_mem_scope_end();
-    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, est);
+    /* v0.6.2 Inc 0: reconcile the estimate row against the allocator's
+     * own account.  The scope bracket above tagged every byte of this
+     * alloc SESSION_TENSORS, so the cell delta IS the measured graph --
+     * the "Estimate, not measurement" caveat the scoping table carries
+     * for this row closes here, and the committed lease publishes on
+     * the measured basis (identical quote arithmetic either way: a
+     * committed graph has zero unfunded debt). */
+    const uint64_t measured_delta = session_tensors_census_live();
+    const uint64_t measured = measured_delta > census_before
+        ? measured_delta - census_before : 0;
+    s->graph_alloc_bytes = measured;
+    if (measured) {
+        const double drift = est
+            ? ((double)measured - (double)est) * 100.0 / (double)est : 0.0;
+        fprintf(stderr, "ds4: serial graph estimate reconcile: est=%.1f MiB "
+                        "measured=%.1f MiB drift=%+.1f%%%s (lease basis = "
+                        "measured)\n",
+                (double)est / 1048576.0, (double)measured / 1048576.0,
+                drift, fabs(drift) > 10.0 ? " DIVERGENT" : "");
+    }
+    const uint64_t lease = measured ? measured : est;
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, lease, lease);
     return 0;
 }
 
@@ -40705,6 +40748,14 @@ int ds4_session_graph_pending(const ds4_session *s) {
     (void)s;
     return 0;
 #endif
+}
+
+/* v0.6.2 Inc 0: the committed graph's measured bytes (see the struct
+ * field).  0 for pending/CPU/distributed sessions -- callers fall back
+ * to the estimate row. */
+uint64_t ds4_session_graph_bytes_committed(const ds4_session *s) {
+    if (!s || s->graph_pending) return 0;
+    return s->graph_alloc_bytes;
 }
 
 /* v0.5.2: would a session graph at this ctx pass the fit gate right now?

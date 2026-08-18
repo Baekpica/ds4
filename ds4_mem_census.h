@@ -416,6 +416,48 @@ static inline int ds4_mem_obs_to_legacy(const ds4_mem_observation *o,
 }
 
 /* =========================================================================
+ * v0.6.2 Inc 0: reconciliation arithmetic (pure).
+ *
+ * The zero-headroom law made continuous: the box's raw free-memory answer
+ * (MemAvailable on integrated CUDA) moved since boot settle by SOME
+ * amount; the census explains part of it (live committed growth), the
+ * named one-time charges (census-invisible driver/runtime warmup) explain
+ * more; whatever is left is the RESIDUAL -- a phantom, a leak, another
+ * process, or kernel-estimate drift, but never silent.  Signed
+ * throughout: the kernel can also RETURN memory (reclaim, a neighbor
+ * exiting), and a negative residual is as reportable as a positive one.
+ * Inputs clamp to INT64_MAX before the signed arithmetic (a saturated
+ * census counter errs HIGH, the tripwire convention); real boxes sit
+ * orders of magnitude below the clamp, so a clamped input is itself an
+ * impossible-state tell, never a rounding event. */
+typedef struct {
+    int64_t observed_delta;   /* raw-source drop since boot (+ = consumed) */
+    int64_t census_growth;    /* census live growth since boot (signed)    */
+    int64_t explained;        /* census_growth + one-time charges          */
+    int64_t residual;         /* observed_delta - explained                */
+    int flagged;              /* |residual| > tol                          */
+} ds4_mem_reconcile;
+
+static inline int64_t ds4_mem_i64_clamp(uint64_t v) {
+    return v > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)v;
+}
+
+static inline ds4_mem_reconcile ds4_mem_reconcile_compute(
+        uint64_t boot_raw, uint64_t now_raw,
+        uint64_t boot_census_live, uint64_t now_census_live,
+        uint64_t onetime_bytes, uint64_t tol_bytes) {
+    ds4_mem_reconcile r;
+    r.observed_delta = ds4_mem_i64_clamp(boot_raw) - ds4_mem_i64_clamp(now_raw);
+    r.census_growth  = ds4_mem_i64_clamp(now_census_live) -
+                       ds4_mem_i64_clamp(boot_census_live);
+    r.explained = r.census_growth + ds4_mem_i64_clamp(onetime_bytes);
+    r.residual  = r.observed_delta - r.explained;
+    const int64_t mag = r.residual < 0 ? -r.residual : r.residual;
+    r.flagged = mag > ds4_mem_i64_clamp(tol_bytes);
+    return r;
+}
+
+/* =========================================================================
  * memgov D0a-4: trim failure-injection (TEST ONLY).
  *
  * ds4_gpu_tensor_trim survives two driver failures with distinct ledger
