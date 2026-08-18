@@ -417,6 +417,27 @@ static inline int ds4_cont_rate_anomalous(uint64_t resident_bytes,
     if (tokens < min_tokens || min_tokens == 0 || phys_bpt == 0) return 0;
     return resident_bytes > 2u * phys_bpt * tokens ? 1 : 0;
 }
+/* Governed cont bank plan: pure KV-aware boot-plan arithmetic, header-inline
+ * so unit tests pin it without a GPU (the MT-1b precedent).  The MT-5
+ * ladder's criterion -- banks x ctx <= fundable tokens -- priced from the
+ * LIVE budget: bank_commit is one bank's full-depth KV commit (seq_cap x
+ * banded packed rate; KV ONLY -- the eager slab remainder stays the eager
+ * fit's separate bound, exactly as the ladder never priced it), so a boot
+ * never grants banks whose KV the budget can never fund to depth.
+ * plan_floor is the count worth granting even when full-depth funding
+ * falls short (4 = the A2b fork-fanout width, the ladder's floor): floor
+ * banks ride the admission gate like they always did.  n_eager still caps
+ * the result -- a floor the eager slabs cannot fund is not granted.
+ * bank_commit == 0 (no physics answer) keeps the eager fit's count. */
+static inline uint32_t ds4_batch_plan_kv_banks(uint64_t budget,
+                                               uint64_t bank_commit,
+                                               uint32_t n_eager,
+                                               uint32_t plan_floor) {
+    if (bank_commit == 0) return n_eager;
+    uint64_t n_kv = budget / bank_commit;
+    if (n_kv < plan_floor) n_kv = plan_floor;
+    return n_kv < n_eager ? (uint32_t)n_kv : n_eager;
+}
 /* Bank count of the persistent ctx (create_fit may size it below the
  * requested cap).  Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx);

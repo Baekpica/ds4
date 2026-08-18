@@ -16165,7 +16165,12 @@ static int coalesce_max_tokens_default(int ctx) {
  * (ctx <= 16384), then halve while banks x ctx exceeds the fundable
  * depth, floored at 4 (A2b fork-fanout width).  32 @ 32k, 16 @ 57k,
  * 8 @ 131k, 4 @ 262k+.  DS4_SERVER_COALESCE_MAX overrides; the boot
- * fit still clamps down on smaller boxes. */
+ * fit still clamps down on smaller boxes.
+ * Governed cont bank plan (v0.6.2): this static ladder is now the
+ * FALLBACK -- coalesce_max_boot below asks the live budget first, and the
+ * worker's gather bound reads the boot outcome (batch_ctx_max_seq), so
+ * the two read sites agree by construction instead of by shared
+ * arithmetic.  The ladder keeps ruling wherever the budget cannot answer. */
 #define DS4_COALESCE_FUNDABLE_TOKENS (1u << 20)
 static int coalesce_max_default(int ctx) {
     if (ctx <= 16384) return 32;
@@ -16173,6 +16178,34 @@ static int coalesce_max_default(int ctx) {
     while (b > 4 && (uint64_t)b * (uint64_t)ctx > DS4_COALESCE_FUNDABLE_TOKENS)
         b /= 2;
     return b;
+}
+
+/* Governed cont bank plan (v0.6.2): the boot-site bank request.  The MT-5
+ * ladder above prices its criterion (banks x ctx <= fundable tokens) with
+ * a frozen constant; post v0.6.1 the engine's governed fit prices the
+ * SAME criterion from the LIVE budget and the shape-derived banded packed
+ * rate (create_fit's kv plan -- the same truth admissions are charged),
+ * so where a live memory answer exists the honest request is the measured
+ * CEILING -- 32, the W8 regime pick (raises past 32 stay env-only via
+ * DS4_SERVER_COALESCE_MAX, hard cap 64: the V6 note stands, 32 is
+ * measured only through its regime) -- and the fit admits what the box
+ * actually funds.  Without a memory answer (Metal/CPU), or with the fit
+ * or its kv plan disarmed (DS4_BATCH_FIT=0 / DS4_BATCH_FIT_KV=0 -- the
+ * engine reads the same envs, so the two sites cannot drift), the ladder
+ * keeps ruling: requesting 32 blind at deep ctx is exactly the
+ * OOM-killer probe R5 Inc1a exists to prevent. */
+static void mem_obs_sample(ds4_mem_observation *o);   /* defined with the metrics render */
+static int coalesce_max_boot(int ctx) {
+    const char *fe = getenv("DS4_BATCH_FIT");
+    const char *ke = getenv("DS4_BATCH_FIT_KV");
+    if ((fe && fe[0] == '0' && fe[1] == '\0') ||
+        (ke && ke[0] == '0' && ke[1] == '\0'))
+        return coalesce_max_default(ctx);
+    ds4_mem_observation obs;
+    mem_obs_sample(&obs);
+    if (obs.status != DS4_MEMOBS_OK)
+        return coalesce_max_default(ctx);
+    return 32;
 }
 
 static void *worker_main(void *arg) {
@@ -16185,7 +16218,19 @@ static void *worker_main(void *arg) {
     const char *cc = getenv("DS4_SERVER_CONTINUOUS");
     const bool continuous = !(cc && cc[0] == '0' && cc[1] == '\0');  /* default ON */
     const char *cm = getenv("DS4_SERVER_COALESCE_MAX");
-    int cmax = cm ? atoi(cm) : coalesce_max_default(s->serial_boot_ctx);
+    /* Governed cont bank plan (v0.6.2): with a persistent batch ctx the
+     * gather bound is the ctx's ACTUAL bank count -- the boot request
+     * after the governed fit sized it (W4's contract, "every coalesced
+     * group fits", now by construction; the pre-v0.6.2 shared-ladder
+     * arrangement still let a fit-reduced boot drift below the worker's
+     * bound).  Without one (creation failed, or coalescing off) the
+     * static ladder keeps ruling: the per-call fallback path allocates
+     * per gather, so a live-budget-sized bound would be the deep-ctx
+     * blind probe again.  batch_ctx and batch_ctx_max_seq are set before
+     * this thread starts and never change. */
+    int cmax = cm            ? atoi(cm)
+             : s->batch_ctx  ? s->batch_ctx_max_seq
+                             : coalesce_max_default(s->serial_boot_ctx);
     if (cmax < 1) cmax = 1;
     if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
     const char *cw = getenv("DS4_SERVER_COALESCE_WAIT_MS");
@@ -19044,10 +19089,23 @@ int main(int argc, char **argv) {
          * MT-4 (R19): size from cfg.ctx_size, not the serial session's ctx
          * -- the cont bank plan derives from the CONFIGURED context (the
          * two were equal at boot anyway; under --no-serial there is no
-         * session to ask). */
-        int cmax = cm ? atoi(cm) : coalesce_max_default(cfg.ctx_size);
+         * session to ask).
+         * Governed cont bank plan (v0.6.2): coalesce_max_boot requests the
+         * regime ceiling wherever a live memory answer exists and leaves
+         * the sizing to create_fit's kv plan (which prices full-depth bank
+         * commits from the actual budget); the MT-5 ladder rules only
+         * where the budget cannot answer. */
+        int cmax = cm ? atoi(cm) : coalesce_max_boot(cfg.ctx_size);
         if (cmax < 1) cmax = 1;
         if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
+        /* Governed cont bank plan (v0.6.2): an EXPLICIT bank request
+         * disarms the fit's kv plan -- the operator's number rules, with
+         * the eager fit + descent still the physical safety (the plan is
+         * a DEFAULT-sizing mechanism; without this, a deep-ctx
+         * DS4_SERVER_COALESCE_MAX=6 would be silently cut to the plan's
+         * floor).  Pre-listener single thread; same env-transport
+         * pattern as --mem-floor-gb / DS4_MEM_FLOOR_GB. */
+        if (cm && cmax > 1) setenv("DS4_BATCH_FIT_KV", "0", 1);
         const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
         const int cmaxtok_dflt = coalesce_max_tokens_default(cfg.ctx_size);
         int cmaxtok = ct ? atoi(ct) : cmaxtok_dflt;
@@ -25921,6 +25979,32 @@ static void test_coalesce_max_default_tiers(void) {
     TEST_ASSERT(coalesce_max_default(786432) == 4);    /* the leg2a shape */
 }
 
+/* Governed cont bank plan (v0.6.2): the pure KV-aware plan bound the
+ * engine's create_fit applies (ds4_batch_plan_kv_banks).  Shapes mirror
+ * the ship box: tens-of-GiB boot budgets, kv-bank commits (seq_cap x
+ * banded packed rate) from the deep ledger. */
+static void test_batch_plan_kv_banks(void) {
+    const uint64_t GiB = 1ull << 30;
+    /* deep ctx: full-depth funding runs out below the floor -- the A2b
+     * fanout floor holds (floor banks ride the admission gate, exactly
+     * the ladder's 4 @ 262k+ posture) */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, 16 * GiB, 100u, 4u) == 4u);
+    /* mid ctx: the live budget funds MORE than the frozen ladder said
+     * (the v0.6.1 pessimism kill: 12 fully-funded banks where the ladder
+     * froze 8) */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, 4 * GiB, 100u, 4u) == 12u);
+    /* the eager fit still caps: a floor the eager slabs cannot fund is
+     * not granted */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, 16 * GiB, 3u, 4u) == 3u);
+    /* shallow ctx: plan-bound above the eager count changes nothing */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, GiB / 2, 32u, 4u) == 32u);
+    /* no physics answer -> the eager fit's count passes through */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, 0, 7u, 4u) == 7u);
+    /* zero budget still grants the floor (the fit's own 2-bank poke and
+     * the physical descent stay the safety below it) */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(0, 16 * GiB, 100u, 4u) == 4u);
+}
+
 /* MT-7: the disclosed admission band -- clamp, physics floor, round-up. */
 static void test_cont_admit_band_apply(void) {
     /* 1024 = physics-exact: identity at any need */
@@ -28346,6 +28430,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cont_credit_ext_due_shapes();
     test_cont_credit_refuse_bmax_clamp();
     test_coalesce_max_default_tiers();
+    test_batch_plan_kv_banks();
     test_cont_admit_band_apply();
     test_cont_rate_anomalous();
     test_weight_fp_small();

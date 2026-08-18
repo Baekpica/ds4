@@ -33526,6 +33526,16 @@ static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     return headroom;
 }
 
+/* Governed cont bank plan: the KV-aware plan bound inside the Inc1a fit
+ * (see the create_impl block).  DS4_BATCH_FIT_KV=0 is the A/B kill switch
+ * -- it restores the eager-remainder-only fit AND tells the server's boot
+ * default to keep the MT-5 static ladder (ds4_server reads the same env,
+ * the serial-guard agreement precedent: one knob, two sites, no drift). */
+static bool ds4_batch_fit_kv_plan_enabled(void) {
+    const char *e = getenv("DS4_BATCH_FIT_KV");
+    return !(e && e[0] == '0' && e[1] == '\0');
+}
+
 /* v0.5.4 governance inc1 (item 16): the OPERATOR memory floor -- system
  * memory every admission spend must leave untouched no matter what any
  * boot-time budget says.  Default 4 GiB; ds4-server --mem-floor-gb is the
@@ -33981,6 +33991,33 @@ static uint64_t ds4_batch_slabs_packed_bpt(const ds4_batch_ctx *ctx) {
         if (sl->multi_index_fp4[il])
             row += (double)DS4_INDEXER_FP4_ROW_BYTES;
         else if (sl->multi_index[il])
+            row += (double)(DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        bpt += row / (double)ratio;
+    }
+    return (uint64_t)(bpt + 0.5);
+}
+
+/* Governed cont bank plan: the SAME physics from the GRAPH's cache config,
+ * for the boot fit -- which runs before ds4_batch_slabs_alloc, when the
+ * slab presence above does not exist yet.  Slab presence mirrors these
+ * exact flags (saved_comp_fp8 = layer_comp_cache_fp8 and multi_comp_fp8
+ * is allocated iff saved_comp_fp8; likewise fp4/index/comp), so the two
+ * rates are one number at any given config -- the boot ledger prints this
+ * one and ds4_batch_ctx_commit_rate reports the slab one; gates assert
+ * they agree. */
+static uint64_t ds4_graph_packed_bpt(const ds4_gpu_graph *g) {
+    double bpt = 0.0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        double row = 0.0;
+        if (g->layer_comp_cache_fp8[il])
+            row += (double)DS4_OPP_C_FP8_ROW_BYTES;
+        else if (g->layer_attn_comp_cache[il])
+            row += (double)(DS4_N_HEAD_DIM * sizeof(float));
+        if (g->layer_index_comp_cache_fp4[il])
+            row += (double)DS4_INDEXER_FP4_ROW_BYTES;
+        else if (g->layer_index_comp_cache[il])
             row += (double)(DS4_N_INDEXER_HEAD_DIM * sizeof(float));
         bpt += row / (double)ratio;
     }
@@ -34676,6 +34713,43 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
             uint64_t budget = free_b > headroom ? free_b - headroom : 0;
             budget = budget > sub_out ? budget - sub_out : 0;
             uint32_t n = (uint32_t)(budget / per_bank);
+            /* Governed cont bank plan (v0.6.2): when the comp/index caches
+             * are demand-mapped the per_bank above is the eager REMAINDER
+             * only, so at deep ctx this division grants banks whose KV
+             * the box can never fund to depth -- every surplus bank
+             * stranding its remainder (the MT-5 harm the static
+             * DS4_COALESCE_FUNDABLE_TOKENS ladder froze at the leg2a
+             * measurement).  Price the ladder's own criterion (banks x
+             * ctx <= fundable tokens) from the LIVE budget instead: one
+             * bank's full-depth KV commits seq_cap x the shape-derived
+             * packed rate x the disclosed admission band -- the same
+             * truth admissions are charged (MT-7), so plan and admission
+             * cannot disagree.  KV-ONLY divisor, exactly the ladder's
+             * semantic: the eager remainder stays the separate bound
+             * above (pricing it into this divisor would cut the measured
+             * 32-bank regime, where the eager term dominates -- 32 x
+             * ~450 MiB vs 32 x ~0.25 GiB of KV at 16k).  Floor 4 (A2b
+             * fork fanout, the ladder's floor); the eager n still caps.
+             * Regime guard mirrors coalesce_max_default: ctx <= 16384 is
+             * the W8-measured regime where 32 stands verbatim (V6 law) --
+             * a noisy-low boot pool must not cut it.  Eager comp mode
+             * needs no bound (its per_bank carries the ctx-sized caches).
+             * DS4_BATCH_FIT_KV=0 restores the eager-only fit. */
+            if (ctx_size > 16384 &&
+                ds4_batch_vmm_comp_enabled() && ds4_batch_fit_kv_plan_enabled()) {
+                const uint64_t bpt = ds4_graph_packed_bpt(&ctx->g);
+                const uint64_t kv_bank = ds4_cont_admit_band_apply(
+                        (uint64_t)ctx->seq_cap * bpt, ds4_cont_admit_band_x1024());
+                const uint32_t n_plan = ds4_batch_plan_kv_banks(budget, kv_bank, n, 4u);
+                if (n_plan != n)
+                    fprintf(stderr,
+                            "ds4: batch fit: kv plan: budget=%.2f GiB kv-bank commit=%.1f MiB "
+                            "(%u tok x %llu B/tok x band %u/1024) -> max_seq %u (eager fit %u)\n",
+                            (double)budget / 1073741824.0, (double)kv_bank / 1048576.0,
+                            ctx->seq_cap, (unsigned long long)bpt,
+                            ds4_cont_admit_band_x1024(), n_plan, n);
+                n = n_plan;
+            }
             fit_per_bank = per_bank;
             fit_headroom = headroom;
             /* memgov D2-2b (plan sec 12 consumer 2): the governed fit.
