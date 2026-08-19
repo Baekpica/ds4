@@ -7,6 +7,17 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **Think-dial observability** — serving log lines now carry
+  `think=<none|low|high|max>` (the request's effort dial; the THINKING
+  flag remains the live inside-think state), and the continuous lane
+  gains the per-request completion line it never had
+  (`cont chat ctx=... gen=... think=... finish=...`); previously a
+  cont-served request was log-invisible and seeing its effort needed
+  serial debug plus `--trace`. A `think_modes` counter family lands in
+  `/v1/stats` and `/metrics` (`ds4_requests_think_total{mode=...}`).
+  The agent now warns when `--think-max` steps down below the 384K
+  context floor (CLI and eval already warned; the server honors
+  explicit levels at any context since v0.5.4).
 - **Chunked request bodies** — the HTTP reader now decodes
   `Transfer-Encoding: chunked` request bodies (proxies such as
   llama-swap, gpustack, and Open WebUI chains re-frame bodies as

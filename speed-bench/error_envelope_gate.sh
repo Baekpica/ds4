@@ -34,6 +34,13 @@
 #     ch_rf        chunked body carrying json_object -> the Inc 1 typed 400
 #                  (proves the DECODED body reaches the parser end-to-end)
 #
+#   think-dial observability (v0.6.3 Inc 3)
+#     th_high      reasoning_effort high -> 200; srv.log carries think=high
+#                  AND think=low (the dial rides every progress line);
+#                  ds4_requests_think_total{mode="high"} >= 1;
+#                  /v1/stats think_modes family present with positive
+#                  high/low counts
+#
 #   stop honesty (Inc 2c)
 #     anth_stop    /v1/messages with stop_sequences:["beta"] on an echo
 #                  prompt -> 200 with "stop_reason":"stop_sequence" AND
@@ -280,6 +287,23 @@ c=$(chpost ch_rf /v1/chat/completions '{"response_format":{"type":"json_object"}
 code_is ch_rf "$c" 400
 has ch_rf "response_format type 'json_object' is not implemented"
 log "ch_rf PASS (chunked body reaches the parser; typed refusal fires)"
+
+# ---- think-dial observability (v0.6.3 Inc 3) -------------------------------
+c=$(post th_high /v1/chat/completions '{"max_tokens":8,"temperature":0,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}')
+code_is th_high "$c" 200
+ssh "$R" "grep -q 'think=high' $SRV" || fail "th_high: no think=high on a serving line"
+ssh "$R" "grep -q 'think=low' $SRV" || fail "th_high: think=low absent (dial should ride every progress line)"
+tm=$(lmetric 'ds4_requests_think_total{mode="high"}')
+[ "${tm:-0}" -ge 1 ] || fail "th_high: ds4_requests_think_total{mode=high} = ${tm:-unset}"
+curl -s -m 10 -H 'Accept: application/json' "$BASE/v1/stats" > "$OUT/th_stats.json"
+grep -q '"think_modes":{"none":' "$OUT/th_stats.json" || fail "th_stats: think_modes family missing from /v1/stats"
+python3 -c "
+import json,sys
+d = json.load(open('$OUT/th_stats.json'))
+tm = d['think_modes']
+sys.exit(0 if tm['high'] >= 1 and tm['low'] >= 1 else 1)
+" || fail "th_stats: high/low counts not positive in /v1/stats think_modes"
+log "th_high PASS (think= on the serving line; counter family in /metrics + /v1/stats)"
 
 # ---- stop honesty (Inc 2c): a matched stop is stop_sequence, not end_turn --
 c=$(post anth_stop /v1/messages '{"model":"m","max_tokens":128,"stop_sequences":["beta"],"messages":[{"role":"user","content":"Repeat exactly: alpha beta gamma"}]}')

@@ -11338,6 +11338,7 @@ static bool stream_heartbeat_emit(int fd, const request *r,
 }
 
 static void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
+                                ds4_think_mode think_mode,
                                 bool responses_protocol,
                                 bool tools, bool thinking,
                                 bool dsml_start, bool dsml_end,
@@ -11356,11 +11357,16 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     char flags[80];
     log_flags(flags, sizeof(flags), responses_protocol,
               tools, thinking, dsml_start, dsml_end);
+    /* v0.6.3 Inc 3: the request's effort DIAL rides every progress line
+     * (the THINKING flag is the live inside-think state, a different
+     * fact) -- the field's way to see which effort a request ran at
+     * without serial debug + --trace. */
     server_log(DS4_LOG_GENERATION,
-               "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               "ds4-server: %s ctx=%s gen=%d think=%s%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",
                ctx,
                completion,
+               ds4_think_mode_name(think_mode),
                flags[0] ? " " : "",
                flags,
                chunk_tps,
@@ -12738,6 +12744,7 @@ decode_again:
 
             if (acc.completion >= next_decode_log) {
                 log_decode_progress(j->req.kind, prompt_tokens, acc.completion,
+                                    j->req.think_mode,
                                     responses_protocol,
                                     j->req.has_tools,
                                     acc.thinking.inside,
@@ -12872,6 +12879,7 @@ decode_again:
 
     if (acc.completion > last_decode_log_completion) {
         log_decode_progress(j->req.kind, prompt_tokens, acc.completion,
+                            j->req.think_mode,
                             responses_protocol,
                             j->req.has_tools,
                             acc.thinking.inside,
@@ -13177,9 +13185,10 @@ decode_again:
                   acc.saw_tool_end);
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       "ds4-server: chat ctx=%s gen=%d think=%s%s%s finish=%s error=\"%s\" %.3fs",
                        ctx_span,
                        acc.completion,
+                       ds4_think_mode_name(j->req.think_mode),
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -13187,9 +13196,10 @@ decode_again:
                        now_sec() - t0);
         } else {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       "ds4-server: chat ctx=%s gen=%d think=%s%s%s finish=%s %.3fs",
                        ctx_span,
                        acc.completion,
+                       ds4_think_mode_name(j->req.think_mode),
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -13205,10 +13215,11 @@ decode_again:
                   false);
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       "ds4-server: %s ctx=%s gen=%d think=%s%s%s finish=%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
                        acc.completion,
+                       ds4_think_mode_name(j->req.think_mode),
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -13216,10 +13227,11 @@ decode_again:
                        now_sec() - t0);
         } else {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       "ds4-server: %s ctx=%s gen=%d think=%s%s%s finish=%s %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
                        acc.completion,
+                       ds4_think_mode_name(j->req.think_mode),
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -15860,6 +15872,26 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
     }
 }
 
+/* v0.6.3 Inc 3: the cont lane's per-request completion line.  The serial
+ * runner always logged one (generate_job's finish= lines); cont rows were
+ * log-invisible per request, which is why seeing a request's effort dial
+ * needed serial debug + --trace (378855, tayaee44's documented
+ * workaround).  One line per settled row: tokens, dial, finish, lifetime. */
+static void log_cont_completion(const job *j, const cont_stream *st,
+                                int prompt_tokens, const char *fin) {
+    char ctx[48];
+    request_ctx_span(ctx, sizeof(ctx), prompt_tokens,
+                     prompt_tokens + st->acc.completion);
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: cont %s ctx=%s gen=%d think=%s finish=%s %.3fs",
+               j->req.kind == REQ_CHAT ? "chat" : "completion",
+               ctx,
+               st->acc.completion,
+               ds4_think_mode_name(j->req.think_mode),
+               fin,
+               now_sec() - j->t_arrive);
+}
+
 /* Flush any held-back tail, emit the finish chunk + [DONE], and free the state.
  * fin is "stop" (EOS) or "length" (budget/aborted); a host-side scan verdict
  * (stop string / closed tool block) overrides it.  Does NOT job_finish (caller
@@ -15912,6 +15944,7 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
         }
         if (!ok) st->failed = true;
     }
+    log_cont_completion(j, st, st->prompt_tokens, fin);
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
@@ -15988,6 +16021,7 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
         wire_free(&ws);
     }
+    log_cont_completion(j, st, prompt_tokens, fin);
     cont_stream_discard(j);
 }
 
@@ -17353,6 +17387,13 @@ static void send_metrics(server *s, int fd) {
                    shed_reason_names[ri],
                    (unsigned long long)ds4_metric_read(&m->requests_shed[ri]));
     }
+    /* v0.6.3 Inc 3: requests by effort dial (ds4_think_mode order). */
+    buf_puts(&b, "# TYPE ds4_requests_think_total counter\n");
+    for (int ti = 0; ti < 4; ti++) {
+        buf_printf(&b, "ds4_requests_think_total{mode=\"%s\"} %llu\n",
+                   ds4_think_mode_name((ds4_think_mode)ti),
+                   (unsigned long long)ds4_metric_read(&m->requests_think[ti]));
+    }
     {
         pthread_mutex_lock(&s->mu);
         const int    nclients = s->clients;
@@ -17767,6 +17808,15 @@ static void send_stats(server *s, int fd, bool as_json) {
             buf_printf(&b, "%s\"%s\":%llu",
                        ri ? "," : "", route_reason_names[ri],
                        (unsigned long long)ds4_metric_read(&m->route_decisions[ri]));
+        }
+        buf_putc(&b, '}');
+        /* v0.6.3 Inc 3: requests by effort dial (ds4_think_mode order). */
+        buf_puts(&b, ",\"think_modes\":{");
+        for (int ti = 0; ti < 4; ti++) {
+            buf_printf(&b, "%s\"%s\":%llu",
+                       ti ? "," : "",
+                       ds4_think_mode_name((ds4_think_mode)ti),
+                       (unsigned long long)ds4_metric_read(&m->requests_think[ti]));
         }
         buf_putc(&b, '}');
         /* Inc 2e: sheds + live backpressure (s->mu = queue lock, not gen_mu). */
@@ -18338,6 +18388,9 @@ static void *client_main(void *arg) {
     }
     ds4_metric_add(&ds4_metrics_get()->requests_started, 1);
     ds4_metric_add(&ds4_metrics_get()->requests_inflight, 1);
+    /* v0.6.3 Inc 3: per-dial request counter (enum is the closed set
+     * none/low/high/max = 0..3; parse never produces anything else). */
+    ds4_metric_add(&ds4_metrics_get()->requests_think[j.req.think_mode], 1);
     /* W8a: drain worker-produced output to the socket on THIS (client) thread, so a
      * slow client never blocks the GPU worker.  The continuous path appends bytes
      * via job_emit (under j.mu) and signals; we send whatever is buffered with j.mu

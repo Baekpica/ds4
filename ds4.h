@@ -937,6 +937,10 @@ typedef struct {
     uint64_t route_decisions[DS4_METRICS_ROUTE_REASONS];
     /* admission-bound sheds (v0.5.6 Inc 2e; see DS4_METRICS_SHED_REASONS) */
     uint64_t requests_shed[DS4_METRICS_SHED_REASONS];
+    /* v0.6.3 Inc 3: requests by reasoning-effort dial, ds4_think_mode
+     * order (none, low, high, max) -- answers "did my high-effort
+     * requests actually run high" without serial debug + --trace. */
+    uint64_t requests_think[4];
     uint64_t out_backlog_bytes;   /* gauge: stream bytes buffered for slow readers */
     /* continuation registry (v0.5.6 Inc 5a; server-owned semantics) */
     uint64_t creg_published;      /* records published at tool-turn terminals */
