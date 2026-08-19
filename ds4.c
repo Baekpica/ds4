@@ -33541,8 +33541,12 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
  * band).  Deriving keeps EXACT value parity at shipped defaults
  * (4096 + 2048 = 6144) and returns the difference to the fundable
  * pool everywhere else.  The burst term is the measured constant
- * (DS4_BATCH_FIT_BURST_MB pins it; battery legs on desktop-state and
- * stripped-state boots are its receipt).  Precedence: an explicit
+ * (DS4_BATCH_FIT_BURST_MB pins it).  Receipts, both regimes: the
+ * direct boot-window transient measures 0.31-0.38 GiB at -c 262144
+ * (v0.6.3 rider, local/docs/v063/rider-boot-burst-receipt.md), and
+ * the v0.6.2 run-3 deep battery consumed the margin to ~0.1 GiB
+ * above a 1 GiB floor -- the constant is the DEPTH allowance, and it
+ * covers boot with a wide berth.  Precedence: an explicit
  * DS4_BATCH_FIT_HEADROOM_MB pin rules everything (unchanged);
  * DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores the static 6144.  The
  * derivation disclosed once per boot on its own line. */
