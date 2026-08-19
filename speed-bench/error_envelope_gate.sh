@@ -26,6 +26,14 @@
 #     rf_anth      messages output_format json_schema -> 400 native envelope
 #     rf_after     normal chat on the same boot -> 200 (no wedge)
 #
+#   chunked request bodies (v0.6.3 Inc 2)
+#     ch_chat      chat via Transfer-Encoding: chunked -> 200, zero contract
+#     ch_anth      messages chunked -> 200 output_tokens 0
+#     ch_comp      completions chunked -> 200 text_completion
+#     ch_resp      responses chunked -> 200 output_tokens 0
+#     ch_rf        chunked body carrying json_object -> the Inc 1 typed 400
+#                  (proves the DECODED body reaches the parser end-to-end)
+#
 #   stop honesty (Inc 2c)
 #     anth_stop    /v1/messages with stop_sequences:["beta"] on an echo
 #                  prompt -> 200 with "stop_reason":"stop_sequence" AND
@@ -153,6 +161,12 @@ post(){
   curl -s -m 180 -o "$OUT/$1.json" -w '%{http_code}' "$BASE$2" \
        -H 'Content-Type: application/json' -d "$3"
 }
+# chpost <leg> <path> <json>  -> body sent with Transfer-Encoding: chunked
+# (curl really chunks a stdin --data-binary body when the header is set)
+chpost(){
+  printf '%s' "$3" | curl -s -m 180 -o "$OUT/$1.json" -w '%{http_code}' "$BASE$2" \
+       -H 'Content-Type: application/json' -H 'Transfer-Encoding: chunked' --data-binary @-
+}
 # hpost <leg> <path> <json>  -> also captures response HEADERS in $OUT/<leg>.hdr
 hpost(){
   curl -s -m 180 -o "$OUT/$1.json" -D "$OUT/$1.hdr" -w '%{http_code}' "$BASE$2" \
@@ -240,6 +254,32 @@ log "rf_anth PASS (native envelope)"
 c=$(post rf_after /v1/chat/completions '{"max_tokens":8,"temperature":0,"messages":[{"role":"user","content":"still serving?"}]}')
 code_is rf_after "$c" 200
 log "rf_after PASS (server healthy after refusals)"
+
+# ---- chunked request bodies (v0.6.3 Inc 2) ---------------------------------
+c=$(chpost ch_chat /v1/chat/completions '{"max_tokens":0,"temperature":0,"messages":[{"role":"user","content":"hi"}]}')
+code_is ch_chat "$c" 200
+has ch_chat '"completion_tokens":0'
+log "ch_chat PASS (chunked body decoded, oa_zero contract held)"
+
+c=$(chpost ch_anth /v1/messages '{"model":"m","max_tokens":0,"messages":[{"role":"user","content":"prewarm via chunked"}]}')
+code_is ch_anth "$c" 200
+has ch_anth '"output_tokens":0'
+log "ch_anth PASS"
+
+c=$(chpost ch_comp /v1/completions '{"max_tokens":1,"temperature":0,"prompt":"hi"}')
+code_is ch_comp "$c" 200
+has ch_comp '"text_completion"'
+log "ch_comp PASS"
+
+c=$(chpost ch_resp /v1/responses '{"max_output_tokens":0,"input":"prewarm chunked"}')
+code_is ch_resp "$c" 200
+has ch_resp '"output_tokens":0'
+log "ch_resp PASS"
+
+c=$(chpost ch_rf /v1/chat/completions '{"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hi"}]}')
+code_is ch_rf "$c" 400
+has ch_rf "response_format type 'json_object' is not implemented"
+log "ch_rf PASS (chunked body reaches the parser; typed refusal fires)"
 
 # ---- stop honesty (Inc 2c): a matched stop is stop_sequence, not end_turn --
 c=$(post anth_stop /v1/messages '{"model":"m","max_tokens":128,"stop_sequences":["beta"],"messages":[{"role":"user","content":"Repeat exactly: alpha beta gamma"}]}')

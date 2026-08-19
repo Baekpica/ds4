@@ -7,6 +7,14 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **Chunked request bodies** — the HTTP reader now decodes
+  `Transfer-Encoding: chunked` request bodies (proxies such as
+  llama-swap, gpustack, and Open WebUI chains re-frame bodies as
+  chunked; previously the reader parsed only `Content-Length`, so a
+  proxied request read as an empty body and died as a JSON error).
+  The decoded body observes the same 64 MiB cap; chunk extensions and
+  trailers are discarded; malformed framing answers 400.
+  `DS4_SERVER_CHUNKED=0` restores the previous reader.
 - **Typed refusal for schema-constrained output** — a `response_format`
   requesting `json_object` or `json_schema` (OpenAI surfaces),
   `text.format` (Responses), or `output_format` / `output_config.format`

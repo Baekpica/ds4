@@ -16521,6 +16521,116 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+/* v0.6.3 Inc 2: Transfer-Encoding: chunked request bodies.  Proxies in
+ * front of this server (llama-swap, gpustack, Open WebUI chains) re-frame
+ * bodies as chunked; before this the reader saw no Content-Length and
+ * parsed an empty body, so every proxied request died as a JSON error
+ * (ds4-on-spark#15's likely shape).  DS4_SERVER_CHUNKED=0 restores the
+ * pre-v0.6.3 reader (kill switch; read per request so tests can flip it). */
+static bool http_chunked_enabled(void) {
+    const char *e = getenv("DS4_SERVER_CHUNKED");
+    return !(e && !strcmp(e, "0"));
+}
+
+static bool header_chunked(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= 18 && strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
+            for (size_t i = 18; i + 7 <= len; i++)
+                if (strncasecmp(line + i, "chunked", 7) == 0) return true;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
+/* Pull socket bytes into b until a full line ('\n'-terminated) exists at
+ * or after pos; returns the index just past the '\n', or -1 on EOF or a
+ * line longer than max_line (framing lines are tiny; a huge one is a
+ * protocol error, not a large body). */
+static ssize_t chunk_line_end(int fd, buf *b, size_t pos, size_t max_line) {
+    size_t scan = pos;
+    for (;;) {
+        for (; scan < b->len; scan++)
+            if (b->ptr[scan] == '\n') return (ssize_t)(scan + 1);
+        if (b->len - pos > max_line) return -1;
+        char tmp[8192];
+        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        buf_append(b, tmp, (size_t)n);
+    }
+}
+
+/* Decode a chunked body into r->body.  The decoder consumes from the
+ * header read-ahead first and pulls more only when a complete piece is
+ * missing; consumed framing is compacted away each chunk, so raw
+ * buffering stays bounded by one chunk regardless of body size.  Chunk
+ * extensions and trailers are discarded.  The DECODED body observes the
+ * same max_body cap as Content-Length bodies; bare-LF line endings are
+ * tolerated exactly like the header parser's. */
+static bool read_chunked_body(int fd, buf *b, size_t pos, http_request *r,
+                              size_t max_body) {
+    buf body = {0};
+    for (;;) {
+        if (pos > 0) {
+            memmove(b->ptr, b->ptr + pos, b->len - pos);
+            b->len -= pos;
+            pos = 0;
+        }
+        ssize_t le = chunk_line_end(fd, b, pos, 8192);
+        if (le < 0) goto fail;
+        /* Size line: hex first (strtoul's own whitespace-skip would walk
+         * a blank line into the next chunk's payload, so require a digit
+         * up front), optional ";extension" or trailing spaces discarded. */
+        if (!isxdigit((unsigned char)b->ptr[pos])) goto fail;
+        char *endp = NULL;
+        unsigned long sz = strtoul(b->ptr + pos, &endp, 16);
+        while (endp < b->ptr + le && (*endp == ' ' || *endp == '\t')) endp++;
+        if (*endp != ';' && *endp != '\r' && *endp != '\n') goto fail;
+        pos = (size_t)le;
+        if (sz == 0) break;
+        if (sz > max_body || body.len + sz > max_body) goto fail;
+        while (b->len < pos + sz) {
+            char tmp[8192];
+            ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) goto fail;
+            buf_append(b, tmp, (size_t)n);
+        }
+        buf_append(&body, b->ptr + pos, sz);
+        pos += sz;
+        /* The payload's trailing CRLF is exactly an empty line. */
+        ssize_t crlf = chunk_line_end(fd, b, pos, 2);
+        if (crlf < 0) goto fail;
+        size_t l2 = (size_t)crlf - pos;
+        if (!(l2 == 1 || (l2 == 2 && b->ptr[pos] == '\r'))) goto fail;
+        pos = (size_t)crlf;
+    }
+    /* Trailer lines until a blank one, all discarded. */
+    for (;;) {
+        ssize_t le = chunk_line_end(fd, b, pos, 8192);
+        if (le < 0) goto fail;
+        size_t linelen = (size_t)le - pos;
+        bool blank = linelen == 1 || (linelen == 2 && b->ptr[pos] == '\r');
+        pos = (size_t)le;
+        if (blank) break;
+    }
+    r->body_len = body.len;
+    r->body = xmalloc(body.len + 1);
+    if (body.len) memcpy(r->body, body.ptr, body.len);
+    r->body[body.len] = '\0';
+    buf_free(&body);
+    return true;
+fail:
+    buf_free(&body);
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -16551,6 +16661,12 @@ static bool read_http_request(int fd, http_request *r) {
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     r->accept_json = header_accepts_json(b.ptr, (size_t)hend);
+    if (header_chunked(b.ptr, (size_t)hend) && http_chunked_enabled()) {
+        /* RFC 7230 3.3.3: Transfer-Encoding wins over any Content-Length. */
+        if (!read_chunked_body(fd, &b, (size_t)hend, r, max_body)) goto fail;
+        buf_free(&b);
+        return true;
+    }
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
@@ -26773,10 +26889,10 @@ static void test_cont_budget_cut_toolcall_keeps_length(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
-/* Contract record: the HTTP reader parses only Content-Length and Accept;
- * an Idempotency-Key header is accepted and silently discarded, so a retry
- * is a NEW generation with new IDs.  Documented unsupported in
- * docs/ds4-api-surface-matrix.md. */
+/* Contract record: the HTTP reader parses Content-Length,
+ * Transfer-Encoding (v0.6.3), and Accept; an Idempotency-Key header is
+ * accepted and silently discarded, so a retry is a NEW generation with
+ * new IDs.  Documented unsupported in docs/ds4-api-surface-matrix.md. */
 static void test_idempotency_key_header_is_ignored(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -26803,6 +26919,105 @@ static void test_idempotency_key_header_is_ignored(void) {
     http_request_free(&hr);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* v0.6.3 Inc 2: chunked request decoding.  Every wire image is written
+ * whole then the write side shut down, so a decoder that over-reads hits
+ * EOF and fails instead of hanging.  The kill-switch leg pins the
+ * pre-v0.6.3 behavior (chunked read as a zero-length body) -- that is the
+ * shape the field's proxied requests died with. */
+static bool chunked_reader_run(const char *wire, http_request *hr) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return false;
+    memset(hr, 0, sizeof(*hr));
+    const ssize_t n = (ssize_t)strlen(wire);
+    bool ok = send(sv[0], wire, (size_t)n, 0) == n;
+    shutdown(sv[0], SHUT_WR);
+    ok = ok && read_http_request(sv[1], hr);
+    close(sv[0]);
+    close(sv[1]);
+    return ok;
+}
+
+static void test_chunked_request_decoding(void) {
+    http_request hr;
+
+    /* Single chunk. */
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "b\r\nhello world\r\n0\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 11 && !strcmp(hr.body, "hello world"));
+    http_request_free(&hr);
+
+    /* Multiple chunks, an extension, and a trailer. */
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: v\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 11 && !strcmp(hr.body, "hello world"));
+    http_request_free(&hr);
+
+    /* Terminator only: empty body, still a successful read. */
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "0\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 0 && hr.body[0] == '\0');
+    http_request_free(&hr);
+
+    /* RFC 7230 3.3.3: Transfer-Encoding wins over Content-Length. */
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/responses HTTP/1.1\r\n"
+        "Content-Length: 5\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "b\r\nhello world\r\n0\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 11 && !strcmp(hr.body, "hello world"));
+    http_request_free(&hr);
+
+    /* Garbage size line -> read fails (caller answers 400). */
+    TEST_ASSERT(!chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "zz\r\nhello\r\n0\r\n\r\n", &hr));
+
+    /* Payload not followed by CRLF -> framing error. */
+    TEST_ASSERT(!chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "5\r\nhelloX0\r\n\r\n", &hr));
+
+    /* A blank size line must not let strtoul walk into the payload. */
+    TEST_ASSERT(!chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "\r\n5\r\nhello\r\n0\r\n\r\n", &hr));
+
+    /* A declared chunk larger than the body cap refuses. */
+    TEST_ASSERT(!chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "4000001\r\n", &hr));
+
+    /* Kill switch pins the pre-v0.6.3 reader: chunked reads as a
+     * zero-length body (no Content-Length parsed). */
+    setenv("DS4_SERVER_CHUNKED", "0", 1);
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "b\r\nhello world\r\n0\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 0);
+    http_request_free(&hr);
+    unsetenv("DS4_SERVER_CHUNKED");
 }
 
 /* Contract record: non-null Responses previous_response_id / conversation
@@ -28969,6 +29184,7 @@ static void ds4_server_unit_tests_run(void) {
     test_weight_fp_small();
     test_weight_fp_stride_geometry();
     test_idempotency_key_header_is_ignored();
+    test_chunked_request_decoding();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();
     test_anthropic_stop_sequence_native_shape();

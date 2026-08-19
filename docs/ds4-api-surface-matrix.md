@@ -115,7 +115,9 @@ registry and trust domain").
   "not supported; replay full input instead". DS4 serves a stateless
   Responses subset; clients replay full history. Literal `null` is
   accepted and ignored.
-- **`Idempotency-Key`**: the HTTP reader parses only `Content-Length` and
+- **`Idempotency-Key`**: the HTTP reader parses only `Content-Length`,
+  `Transfer-Encoding` (chunked request bodies, v0.6.3;
+  `DS4_SERVER_CHUNKED=0` restores the Content-Length-only reader), and
   `Accept`; the header is accepted and discarded, so a retry is a new
   generation with new IDs.
 - **`/v1/batch`** is a bulk scheduling consumer, not a projection surface.
