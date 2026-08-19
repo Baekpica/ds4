@@ -266,6 +266,32 @@ worker used 22,283 MiB after the 8K requests, and the system retained about
 6.5 GiB available without an OOM event. Loaded SM clock remained 2,411 MHz;
 the 611 MHz pin did not recur.
 
+## Solar Open2 DGX Spark performance evidence
+
+The numbers below used
+[`b2e52b9`](https://github.com/Baekpica/ds4/commit/b2e52b9048ba339327539212de1c47d009dde126)
+on `origin/dfm`, built with CUDA 13.3 as `sm_121a` on one DGX Spark GB10
+(driver 610.43.02, Linux 6.17.0-1029-nvidia). The GGUF is MXQ-v1 11 shards
+(`Solar-Open2-250B-MXQ-v1`, 95,533,532,160 bytes). A long-lived VMM owner
+(`--backend vmm --scope base --reserve-gb 16`, 453 derived aligned artifacts)
+served a restartable worker at `--cuda -c 196608` with three persistent banks
+and a 4,096-token prefill chunk. Requests were OpenAI Chat with thinking
+disabled, exact-cold (`cached_tokens=0`), and 128 decode tokens. Each cell is
+the median of three. Loaded SM clocks stayed between 2,411 and 2,561 MHz.
+`banks_total=3` still admitted after the runs.
+
+| Depth | Prompt tokens | Prefill | Decode p50 | Decode API |
+|---|---:|---:|---:|---:|
+| 8K | 8,222 | 1,050.7 tok/s | 19.05 tok/s | 18.9 tok/s |
+| 64K | 66,761 | 804.5 tok/s | 13.07 tok/s | 14.1 tok/s |
+
+On the same host and artifact, before this default-path series, 8K decode was
+17.5 tok/s and 64K average prefill was 710 tok/s. The landed commits are
+`3651787`, `5d2a96c`, `fd3a426`, `7563969`, `262ff8b`, and `b2e52b9`.
+`test-solar-kv` reported 512-token GQA2 vs one-head `rel_rms=0` and split vs
+direct `rel_rms=8.45e-7`. Incremental `T(64K)−T(60K)` last-4K is not a
+published metric. 1,048,576-token serving is not claimed.
+
 ## Current limits
 
 - dots3-note is text-only and serial. The source 524,288-token metadata is
@@ -280,6 +306,8 @@ the 611 MHz pin did not recur.
   accelerators.
 - Motif-3 serving uses plain decoding; MTP and DSpark support models remain
   DeepSeek-only.
+- Solar Open2 serving is verified at `-c 196608` with three banks on this
+  host. The source 1,048,576-token metadata is not a measured Spark pass.
 - Solar, EXAONE, and Motif-3 serial snapshots now reject corrupted family tags,
   and their continuous banks restore into a different idle bank before a
   one-token warm suffix. The CUDA lifecycle gates passed on the production
