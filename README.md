@@ -49,8 +49,9 @@ armed, and every automatic decision is stated on one boot line, never
 silently. Since v0.6 unused context is demand-mapped, so a deep `-c`
 costs almost nothing until a request actually uses it; the CUDA default
 of 262144 exists so that a long agentic session fits a defaults boot,
-and `-c` raises it (524288 is the installer default, 786432 the deepest
-proven; see [Memory and capacity](#memory-and-capacity)).
+and `-c` raises it (524288 is the installer default; the model's full
+1M window at `-c 1048576` is proven with a 975k-token conversation;
+see [Memory and capacity](#memory-and-capacity)).
 
 Then talk to it with any OpenAI or Anthropic client:
 
@@ -523,6 +524,16 @@ cheapest to restore), not refused. Decode measured at parity with an empty box a
 450k-token depth and within 15 percent at 755k. The observed all-in
 cost was about 4.3 KiB per token of resident context at the deep shape
 (4.8 at 450k banks; deeper banks amortize the page floors).
+
+The measured ceiling sits higher. With the admission floor lowered to
+1 GiB on a dedicated box, the same governor held **3,019,176 tokens of
+active context** — four ingestions of about 755 thousand tokens each,
+a needle retrieved exactly from every one, and honest, instant
+refusals for every further ask with the floor intact. The disclosed
+cost: at that full squeeze decode runs 2.6x slower than on an empty
+box (the OS starts reclaiming file-backed weight pages), where the
+2.26M shipped-floor stamp is 1.14x. The step-by-step recipe is in the
+[ds4-on-spark README](https://github.com/Entrpi/ds4-on-spark#reaching-3m-tokens-of-active-context).
 
 The window itself reaches the model's full million: at `-c 1048576`
 (the checkpoint's exact YaRN window, 65536 x 16) a single conversation
@@ -1290,10 +1301,11 @@ results, each receipted there:
   governed by a terminal yield-quench controller: 1.33-1.47x upstream
   across the 2k-128k frontier (v0.4.1 stamp), deep decode 45.7 ms/tok
   at 240K (v0.5.0 stamp).
-- **Memory truth (v0.6).** One governor account for every allocation:
-  2.26M tokens of context resident and warm on one 128 GB Spark at zero
-  config, typed refusals, a 4 GiB floor, idle trim. See
-  [Memory and capacity](#memory-and-capacity).
+- **Memory truth (v0.6).** One governor account for every allocation,
+  every floor and margin measured, and a continuous self-audit of the
+  ledger since v0.6.2: measured to 3M tokens of active context on one
+  128 GB Spark (2.26M at zero config), typed refusals, a 4 GiB floor,
+  idle trim. See [Memory and capacity](#memory-and-capacity).
 - **Ops.** A resident weight server imports the 81 GiB model into
   engine processes in seconds (VMM-backed IPC, manifest with a
   content-identity check), and standalone boots build the same aligned
