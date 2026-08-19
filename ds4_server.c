@@ -969,7 +969,109 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
     return true;
 }
 
-static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
+/* v0.6.3: schema-constrained output modes get a typed refusal instead of the
+ * silent free-text fallback the field mistook for support (ds4-on-spark#10).
+ * Absent, null, and plain-text formats stay accepted -- OpenAI SDKs attach
+ * {"type":"text"} casually.  `field` names the wire key ("response_format",
+ * "text.format", "output_format") so the refusal matches the surface. */
+static bool output_format_type_supported(const char *field, const char *type,
+                                         char *err, size_t errlen) {
+    if (!strcmp(type, "text")) return true;
+    if (!strcmp(type, "json_object") || !strcmp(type, "json_schema")) {
+        snprintf(err, errlen,
+                 "%s type '%s' is not implemented: structured output is "
+                 "unsupported; omit %s or use type \"text\"",
+                 field, type, field);
+        return false;
+    }
+    snprintf(err, errlen, "%s type '%s' is not supported", field, type);
+    return false;
+}
+
+static bool parse_output_format_value(const char **p, const char *field,
+                                      char *err, size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p == '"') {
+        /* String shorthand ("json_object") is not documented wire surface,
+         * but tolerating it here keeps every spelling of a schema request
+         * refusable instead of silently skipped. */
+        char *type = NULL;
+        if (!json_string(p, &type)) return false;
+        const bool ok = output_format_type_supported(field, type, err, errlen);
+        free(type);
+        return ok;
+    }
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    char *type = NULL;
+    bool ok = true;
+    while (ok && **p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) { ok = false; break; }
+        json_ws(p);
+        if (**p != ':') { free(key); ok = false; break; }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            json_ws(p);
+            free(type);
+            type = NULL;
+            if (!json_string(p, &type)) ok = false;
+        } else if (!json_skip_value(p)) {
+            ok = false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (ok && **p == '}') (*p)++; else ok = false;
+    /* A typeless object constrains nothing, so it stays accepted. */
+    if (ok && type) ok = output_format_type_supported(field, type, err, errlen);
+    free(type);
+    return ok;
+}
+
+/* The Responses surface nests its output format one level down:
+ * text.format.  Everything else under "text" (verbosity, ...) is skipped
+ * as before; only the format object is inspected for the #10 refusal. */
+static bool parse_responses_text_value(const char **p, char *err, size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "format")) {
+            if (!parse_output_format_value(p, "text.format", err, errlen)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_output_config_effort(const char **p, ds4_think_mode *effort,
+                                       char *err, size_t errlen) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '{') return json_skip_value(p);
@@ -986,6 +1088,11 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
         (*p)++;
         if (!strcmp(key, "effort")) {
             if (!parse_reasoning_effort_value(p, effort)) {
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "format")) {
+            if (!parse_output_format_value(p, "output_config.format", err, errlen)) {
                 free(key);
                 return false;
             }
@@ -2893,6 +3000,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "response_format")) {
+            if (!parse_output_format_value(&p, "response_format", err, errlen)) {
+                free(key);
+                goto bad;
+            }
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
@@ -3089,7 +3201,12 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             got_thinking = true;
         } else if (!strcmp(key, "output_config")) {
-            if (!parse_output_config_effort(&p, &reasoning_effort)) {
+            if (!parse_output_config_effort(&p, &reasoning_effort, err, errlen)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "output_format")) {
+            if (!parse_output_format_value(&p, "output_format", err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -4006,6 +4123,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                  * thinking. Other effort values choose between HIGH and MAX. */
                 if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
             }
+        } else if (!strcmp(key, "text")) {
+            if (!parse_responses_text_value(&p, err, errlen)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "previous_response_id") ||
                    !strcmp(key, "conversation"))
         {
@@ -4271,6 +4393,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             got_thinking = true;
         } else if (!strcmp(key, "stop")) {
             if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "response_format")) {
+            if (!parse_output_format_value(&p, "response_format", err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -21039,9 +21166,11 @@ static void test_api_thinking_controls_parse(void) {
     TEST_ASSERT(enabled);
 
     ds4_think_mode mode = DS4_THINK_LOW;
+    char oc_err[160] = {0};
     const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
-    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode));
+    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode, oc_err, sizeof(oc_err)));
     TEST_ASSERT(mode == DS4_THINK_MAX);
+    TEST_ASSERT(oc_err[0] == '\0');
 
     const char *openai_effort = "\"xhigh\"";
     mode = DS4_THINK_LOW;
@@ -26790,6 +26919,93 @@ static void test_error_envelopes_native_shapes(void) {
         TEST_ASSERT(!parse_completion_request(NULL, "{\"max_tokens\":-1}",
                                               128, 4096, &pr, err, sizeof(err)));
         TEST_ASSERT(strstr(err, "max_tokens must be >= 0") != NULL);
+    }
+
+    /* v0.6.3: response_format contract (ds4-on-spark#10).  Plain, null,
+     * and typeless formats stay accepted -- proved by the parse failing
+     * LATER on the missing required field, so the format itself was not
+     * the objection.  Schema-constrained modes refuse with a typed
+     * message naming the mode, on every surface and in every spelling
+     * (nested schema first, string shorthand, output_config nesting). */
+    {
+        char err[160];
+        request pr;
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{\"type\":\"text\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing messages") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":null}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing messages") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing messages") != NULL);
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{\"type\":\"json_object\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "response_format type 'json_object' is not implemented") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{\"json_schema\":{\"schema\":{\"type\":\"object\"}},"
+            "\"type\":\"json_schema\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "'json_schema' is not implemented") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{\"type\":\"xml\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "response_format type 'xml' is not supported") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":\"json_object\"}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "'json_object' is not implemented") != NULL);
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_completion_request(NULL,
+            "{\"response_format\":{\"type\":\"text\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing prompt") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_completion_request(NULL,
+            "{\"response_format\":{\"type\":\"json_object\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "response_format type 'json_object' is not implemented") != NULL);
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_responses_request(NULL, NULL,
+            "{\"text\":{\"format\":{\"type\":\"text\"},\"verbosity\":\"low\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing input") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_responses_request(NULL, NULL,
+            "{\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"x\"}}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "text.format type 'json_schema' is not implemented") != NULL);
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
+            "{\"output_format\":null}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing messages") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
+            "{\"output_format\":{\"type\":\"json_schema\",\"schema\":{}}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "output_format type 'json_schema' is not implemented") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
+            "{\"output_config\":{\"effort\":\"high\",\"format\":{\"type\":\"json_object\"}}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "output_config.format type 'json_object' is not implemented") != NULL);
     }
 
     /* Responses stream, no machine yet: protocol event, sequence 0. */

@@ -17,6 +17,15 @@
 #     resp_neg     /v1/responses max_output_tokens:-3 -> 400 names the field
 #     not_found    GET /nope -> 404 OpenAI envelope (historical owner)
 #
+#   response_format typed refusal (v0.6.3 Inc 1; ds4-on-spark#10)
+#     rf_text      chat response_format {"type":"text"} -> 200 (accepted)
+#     rf_obj       chat json_object -> 400 typed message + OpenAI envelope
+#     rf_schema    chat json_schema, nested schema before type -> 400
+#     rf_comp      completions json_object -> 400
+#     rf_resp      responses text.format json_schema -> 400 names text.format
+#     rf_anth      messages output_format json_schema -> 400 native envelope
+#     rf_after     normal chat on the same boot -> 200 (no wedge)
+#
 #   stop honesty (Inc 2c)
 #     anth_stop    /v1/messages with stop_sequences:["beta"] on an echo
 #                  prompt -> 200 with "stop_reason":"stop_sequence" AND
@@ -195,6 +204,42 @@ c=$(curl -s -m 20 -o "$OUT/not_found.json" -w '%{http_code}' "$BASE/nope")
 code_is not_found "$c" 404
 has not_found '"error":{"message":'
 log "not_found PASS (historical-owner envelope)"
+
+# ---- response_format typed refusal (v0.6.3 Inc 1; ds4-on-spark#10) ---------
+c=$(post rf_text /v1/chat/completions '{"max_tokens":0,"temperature":0,"response_format":{"type":"text"},"messages":[{"role":"user","content":"hi"}]}')
+code_is rf_text "$c" 200
+log "rf_text PASS (type text accepted unchanged)"
+
+c=$(post rf_obj /v1/chat/completions '{"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hi"}]}')
+code_is rf_obj "$c" 400
+has rf_obj "response_format type 'json_object' is not implemented"
+has rf_obj '"error":{"message":'
+log "rf_obj PASS (typed refusal, OpenAI envelope)"
+
+c=$(post rf_schema /v1/chat/completions '{"response_format":{"json_schema":{"name":"x","schema":{"type":"object"}},"type":"json_schema"},"messages":[{"role":"user","content":"hi"}]}')
+code_is rf_schema "$c" 400
+has rf_schema "json_schema' is not implemented"
+log "rf_schema PASS (nested schema before type still refused)"
+
+c=$(post rf_comp /v1/completions '{"response_format":{"type":"json_object"},"prompt":"hi"}')
+code_is rf_comp "$c" 400
+has rf_comp "not implemented"
+log "rf_comp PASS"
+
+c=$(post rf_resp /v1/responses '{"text":{"format":{"type":"json_schema","name":"x"}},"input":"hi"}')
+code_is rf_resp "$c" 400
+has rf_resp "text.format type 'json_schema' is not implemented"
+log "rf_resp PASS (nested text.format named)"
+
+c=$(post rf_anth /v1/messages '{"model":"m","max_tokens":8,"output_format":{"type":"json_schema","schema":{}},"messages":[{"role":"user","content":"hi"}]}')
+code_is rf_anth "$c" 400
+has rf_anth '"type":"error","error":{"type":"invalid_request_error"'
+has rf_anth "output_format type 'json_schema' is not implemented"
+log "rf_anth PASS (native envelope)"
+
+c=$(post rf_after /v1/chat/completions '{"max_tokens":8,"temperature":0,"messages":[{"role":"user","content":"still serving?"}]}')
+code_is rf_after "$c" 200
+log "rf_after PASS (server healthy after refusals)"
 
 # ---- stop honesty (Inc 2c): a matched stop is stop_sequence, not end_turn --
 c=$(post anth_stop /v1/messages '{"model":"m","max_tokens":128,"stop_sequences":["beta"],"messages":[{"role":"user","content":"Repeat exactly: alpha beta gamma"}]}')

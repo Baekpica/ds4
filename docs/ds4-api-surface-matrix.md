@@ -102,6 +102,14 @@ registry and trust domain").
 
 ## Explicitly unsupported
 
+- **Schema-constrained output** (v0.6.3): `response_format` with type
+  `json_object`/`json_schema` (OpenAI Chat and Completion),
+  `text.format` (Responses), and `output_format` / `output_config.format`
+  (Anthropic) are refused at parse time with HTTP 400 and a typed
+  message naming the mode, in the endpoint's native envelope
+  (ds4-on-spark#10). `{"type":"text"}`, `null`, omitted, and a typeless
+  object are accepted unchanged; the string spelling of a schema mode
+  is refused too. Decode is never schema-constrained.
 - **Responses durable references**: non-null `previous_response_id` or
   `conversation` values are rejected at parse time with
   "not supported; replay full input instead". DS4 serves a stateless

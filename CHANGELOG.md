@@ -5,6 +5,18 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## Unreleased
+
+- **Typed refusal for schema-constrained output** — a `response_format`
+  requesting `json_object` or `json_schema` (OpenAI surfaces),
+  `text.format` (Responses), or `output_format` / `output_config.format`
+  (Anthropic) now answers HTTP 400 with a message naming the mode, in
+  the endpoint's native error envelope, instead of silently serving
+  free text a client would try to parse as JSON. Plain `{"type":"text"}`,
+  `null`, and omitted stay accepted; the string spelling of a schema
+  mode is refused too rather than skipped. Structured output itself
+  (constraining decode to a schema) remains unimplemented and tracked.
+
 ## v0.6.2 — 2026-08-19
 
 Real budgets. v0.6.1 made admission charge what a request actually
