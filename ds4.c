@@ -34352,7 +34352,7 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     uint32_t nb = 0;
     bool synced = false;
     for (uint32_t a = 0; a < n && freed < want; a++) {
-        const uint32_t v = order[a];
+        uint32_t v = order[a];
         if (!synced) {
             /* cuda_ok convention: nonzero = success */
             if (!ds4_gpu_synchronize()) return freed;
@@ -34360,10 +34360,11 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         }
         /* v0.6.2 Inc 3: capture the victim's identity BEFORE the mark
          * wipes it -- the trim line names victims now (bank, bytes,
-         * hist_len, recency), not just count and total. */
-        const uint8_t  v_valid = ctx->bank_hist_valid[v];
-        const uint32_t v_hist  = ctx->bank_hist_len[v];
-        const uint64_t v_use   = ctx->bank_last_use[v];
+         * hist_len, recency), not just count and total.  (Mutable: the
+         * best-fit swap below may substitute the victim in place.) */
+        uint8_t  v_valid = ctx->bank_hist_valid[v];
+        uint32_t v_hist  = ctx->bank_hist_len[v];
+        uint64_t v_use   = ctx->bank_last_use[v];
         /* v0.6.3 Inc 6 (best-fit victims): if THIS victim's release would
          * cover the remaining deficit, it is the FINAL victim -- scan the
          * rest of the order for a same-validity-class candidate that also
@@ -34416,15 +34417,21 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
                         c, (double)cest[pick] / 1048576.0,
                         (double)remaining / 1048576.0, v,
                         (double)cest[0] / 1048576.0, v_hist);
-                a--;      /* re-enter the loop body on the swapped-in victim
-                             so its identity is re-captured for the log */
-                continue;
+                /* Substitute in place -- re-entering the loop would re-run
+                 * this scan (provably a no-swap) and print a contradictory
+                 * "kept default" line plus a duplicate census on the very
+                 * surface built for adjudication. */
+                v = c;
+                v_valid = ctx->bank_hist_valid[v];
+                v_hist  = ctx->bank_hist_len[v];
+                v_use   = ctx->bank_last_use[v];
+            } else {
+                /* Kept-default disclosure -- a silent negative here cost
+                 * three gate runs; say WHY the scan kept the recency pick. */
+                fprintf(stderr,
+                        "ds4: batch vmm: best-fit kept default bank=%u "
+                        "(%u candidates scanned)\n", v, m - 1u);
             }
-            /* Kept-default disclosure -- a silent negative here cost three
-             * gate runs; say WHY the scan kept the recency pick. */
-            fprintf(stderr,
-                    "ds4: batch vmm: best-fit kept default bank=%u "
-                    "(%u candidates scanned)\n", v, m - 1u);
         }
         const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
         if (got == 0) continue;                /* floor-resident: content intact, keep it */
