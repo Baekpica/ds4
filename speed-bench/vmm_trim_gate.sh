@@ -44,6 +44,29 @@ TEN_TOK=${TEN_TOK:-3000}
 # 10x2 tenants; 700 never binds (0 trims), 250 starves (16 serial bounces).
 BUDGET_MB=${BUDGET_MB:-450}
 CONTROL=${CONTROL:-0}
+# v0.6.3 Inc 6: FIT=1 is a DIAGNOSTIC mode, NOT a battery leg.  Measured
+# on receipt (08-20, three shapes): at small ctx the per-bank slab stride
+# barely exceeds the 2 MiB VMM page, so only phase-aligned banks (bank 0)
+# ever hold interior pages -- every other bank estimates ~0 and the
+# best-fit substitution cannot engage live here.  The policy is pinned by
+# the synthetic unit (test_trim_bestfit_pick, --server family; the v0.6.2
+# victim-order precedent) and observable in the field via the
+# 'best-fit candidate/victim/kept default' disclosure lines.  Run FIT=1
+# to watch the scan's census on a live box.
+# (The tail-trim predecessor was refuted on receipt: page granularity +
+# the raw-ring warm-fork floor cap per-victim tail yield below one VMM
+# page at any context -- see the v0.6.3 plan.)
+# FITSHAPE env: FIT_BUDGET_MB (280) TEN_TOK_DEEP (15500)
+# TEN_TOK_SMALL (3500) TENANTS_FIT (4) TEN_TOK_SHALLOW (1000).
+FIT=${FIT:-0}
+if [ "$FIT" = 1 ]; then
+  BUDGET_MB=${FIT_BUDGET_MB:-280}
+  TEN_TOK_DEEP=${TEN_TOK_DEEP:-15500}
+  TEN_TOK_SMALL=${TEN_TOK_SMALL:-7000}
+  TENANTS_FIT=${TENANTS_FIT:-4}
+  TEN_TOK_SHALLOW=${TEN_TOK_SHALLOW:-1000}
+  FIT_SMALL_MAX=${FIT_SMALL_MAX:-8500}
+fi
 PORT=${PORT:-8000}
 TUNNEL=${TUNNEL_PORT:-18000}
 HEADROOM_MB=${HEADROOM_MB:-6272}
@@ -64,12 +87,25 @@ TRIMENV=""
 [ "$CONTROL" = 1 ] && TRIMENV="DS4_BATCH_VMM_TRIM=0"
 log "mode=$([ "$CONTROL" = 1 ] && echo CONTROL || echo TRIM-ON) budget=${BUDGET_MB}MB ctx=$CTX tenants=${TENANTS}x${ROUNDS} @${TEN_TOK}tok"
 
+if [ "$FIT" = 1 ]; then
+  N=$TENANTS_FIT
+  log "build FIT shape: deep @${TEN_TOK_DEEP}tok + small @${TEN_TOK_SMALL}tok + $N shallow @${TEN_TOK_SHALLOW}tok"
+  python3 "$HERE/needle_prompt.py" "$TEN_TOK_DEEP" "$OUT/ten_deep.json" 0.30 "TGDEEP-VMM-9999" deepseek-chat 99 \
+    >> "$DRV" || fail "deep tenant prompt"
+  python3 "$HERE/needle_prompt.py" "$TEN_TOK_SMALL" "$OUT/ten_small.json" 0.50 "TGSMALL-VMM-8888" deepseek-chat 88 \
+    >> "$DRV" || fail "small tenant prompt"
+  for i in $(seq 1 "$N"); do
+    python3 "$HERE/needle_prompt.py" "$TEN_TOK_SHALLOW" "$OUT/ten_$i.json" 0.50 "TG$i-VMM-$((1000+i))" deepseek-chat "$i" \
+      >> "$DRV" || fail "tenant $i prompt"
+  done
+else
 N=$((TENANTS * ROUNDS))
 log "build $N distinct tenant prompts (rotated corpora, unique codes)"
 for i in $(seq 1 "$N"); do
   python3 "$HERE/needle_prompt.py" "$TEN_TOK" "$OUT/ten_$i.json" 0.50 "TG$i-VMM-$((1000+i))" deepseek-chat "$i" \
     >> "$DRV" || fail "tenant $i prompt"
 done
+fi
 
 log "boot: killing old ds4-server on $R"
 ssh "$R" "pkill -x ds4-server; sleep 2; pkill -9 -x ds4-server; rm -f /tmp/ds4.lock; exit 0"
@@ -105,6 +141,55 @@ curl -s -m 5 "http://127.0.0.1:$TUNNEL/v1/models" >/dev/null 2>&1 || {
 }
 URL="http://127.0.0.1:$TUNNEL/v1/chat/completions"
 OFF0=$(ssh "$R" "wc -l < $SRV")
+
+# ---------------------------- FIT=1 leg --------------------------------------
+if [ "$FIT" = 1 ]; then
+  log "FIT: admit the deep tenant FIRST (oldest activity = default recency pick)"
+  python3 "$HERE/sse_probe_client.py" "$OUT/ten_deep.json" "$URL" "TDEEP" > "$OUT/ten_deep.out" 2>&1 \
+    || fail "deep tenant rc=$?: $(tail -1 "$OUT/ten_deep.out")"
+  grep -q "TGDEEP-VMM-9999" "$OUT/ten_deep.out" || fail "deep tenant needle miss"
+
+  log "FIT: admit the small tenant (the covering victim best-fit must prefer)"
+  python3 "$HERE/sse_probe_client.py" "$OUT/ten_small.json" "$URL" "TSMALL" > "$OUT/ten_small.out" 2>&1 \
+    || fail "small tenant rc=$?: $(tail -1 "$OUT/ten_small.out")"
+  grep -q "TGSMALL-VMM-8888" "$OUT/ten_small.out" || fail "small tenant needle miss"
+
+  # a just-finished bank sits in the pending->live seed window still holding
+  # its admission credit, and credited banks are never trim victims -- give
+  # the credit time to lapse or the small bank is invisible to the scan.
+  log "FIT: 10s credit-lapse pause before the storm"
+  sleep 10
+
+  log "FIT: shallow storm ($N tenants) against the ${BUDGET_MB}MB budget"
+  MISS=0
+  for i in $(seq 1 "$N"); do
+    python3 "$HERE/sse_probe_client.py" "$OUT/ten_$i.json" "$URL" "T$i" > "$OUT/ten_$i.out" 2>&1 \
+      || { MISS=$((MISS+1)); log "tenant $i: client rc!=0: $(tail -1 "$OUT/ten_$i.out")"; continue; }
+    grep -q "TG$i-VMM-$((1000+i))" "$OUT/ten_$i.out" || { MISS=$((MISS+1)); log "tenant $i: NEEDLE MISS"; }
+  done
+
+  ssh "$R" "tail -n +$((OFF0+1)) $SRV" > "$OUT/srv_seg.log"
+  FITS=$(grep -c 'batch vmm: best-fit victim' "$OUT/srv_seg.log" || true)
+  REJL=$(grep -c 'cont admit rejected' "$OUT/srv_seg.log" || true)
+  ILL=$(grep -ci 'illegal' "$OUT/srv_seg.log" || true)
+  BF=$(grep -c 'continuous batch failed' "$OUT/srv_seg.log" || true)
+  FIRSTHIST=$(grep -m1 'batch vmm: trim victim' "$OUT/srv_seg.log" | grep -oE 'hist=[0-9]+' | grep -oE '[0-9]+' || echo 0)
+  grep -E 'batch vmm: (best-fit victim|trim victim|trimmed)' "$OUT/srv_seg.log" | head -8 | tee -a "$DRV"
+
+  log "cleanup: killing ds4-server on $R"
+  ssh "$R" "pkill -x ds4-server; sleep 2; pkill -9 -x ds4-server; rm -f /tmp/ds4.lock; exit 0" 2>/dev/null
+
+  [ "$ILL" -eq 0 ] && [ "$BF" -eq 0 ] || fail "health counters dirty (illegal=$ILL batch-failed=$BF)"
+  [ "$MISS" -eq 0 ] || fail "tenant misses: $MISS"
+  [ "$REJL" -eq 0 ] || fail "admit-rejects=$REJL with trim ON"
+  [ "$FITS" -ge 1 ] || fail "0 'best-fit victim' lines — the substitution never engaged; retune FIT_BUDGET_MB"
+  [ "${FIRSTHIST:-0}" -ge 1 ] || fail "no 'trim victim' line found"
+  [ "$FIRSTHIST" -lt "$FIT_SMALL_MAX" ] \
+    || fail "first victim hist=$FIRSTHIST >= $FIT_SMALL_MAX — the deep trunk died despite a covering small victim"
+  log "VMM-TRIM GATE (FIT): ALL PASS — best-fit substitutions=$FITS, first victim hist=$FIRSTHIST (< $FIT_SMALL_MAX), rejects=0, needles exact"
+  exit 0
+fi
+# ------------------------------------------------------------------------------
 
 MISS=0; REJ=0; OKN=0
 for i in $(seq 1 "$N"); do

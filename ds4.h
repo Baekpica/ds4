@@ -489,6 +489,18 @@ uint32_t ds4_cont_prefill_chunk_tokens(void);
 uint32_t ds4_prefill_fence_rows(void);
 int ds4_serial_prefill_fenced(int ctx_size, int prompt_len,
                               uint32_t *width_out, uint32_t *fence_out);
+/* v0.6.3 Inc 6: pure best-fit final-victim pick.  Candidate 0 is the
+ * recency-blend default (its estimate MUST already cover remaining);
+ * candidates 1..n-1 follow in blend order.  Returns the index of the
+ * chosen victim: the same-validity-class candidate with the smallest
+ * covering release estimate, ties broken toward the smaller history
+ * (equal bytes freed, less warm value destroyed), 0 when no candidate
+ * beats the default.  Pure -- unit-gated like the v0.6.2 victim-order
+ * blend (live small-ctx legs cannot exercise it: VMM page-phase
+ * alignment makes bank 0 the only bank with interior pages there). */
+uint32_t ds4_trim_bestfit_pick(const uint64_t *est, const uint8_t *valid,
+                               const uint32_t *hist, uint32_t n,
+                               uint64_t remaining);
 /* MT-7: the disclosed admission band (DS4_CONT_ADMIT_BAND_X1024, default
  * 1045 = the leg2a-measured 1.02x sequential transient peak, rounded up;
  * clamped to [1024, 2048]; 1024 = physics-exact charging).  Applied inside

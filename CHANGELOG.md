@@ -7,6 +7,23 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **Best-fit trim victims** — admission-pressure reclaim used to
+  walk victims purely in recency order, so a deep trunk could die
+  for a deficit a small idle bank would have covered (measured:
+  want 1,646 MiB, released a 2,896 MiB bank, +76% over-reclaim and
+  the deepest warm context destroyed). When one victim's release
+  covers the whole remaining deficit, the engine now picks the
+  smallest such victim in the same validity class, and among equal
+  releases the shallowest one (same bytes freed, less warm context
+  destroyed); earlier victims in a multi-bank reclaim keep the
+  recency order (they are consumed whole either way). The substitution is disclosed
+  (`best-fit victim` line) and the trim summary reports released vs
+  wanted. `DS4_BATCH_TRIM_BESTFIT=0` restores the pure recency
+  walk. (A prefix-preserving tail trim was prototyped and refuted
+  on receipt: VMM page granularity plus the raw-ring warm-fork
+  floor cap its yield below one page per slab at any context, so
+  whole-bank release with a better-chosen victim is the honest
+  fix.)
 - **Whole-prompt depth fence** — the whole-prompt probe modes
   (`DS4_METAL_PREFILL_CHUNK<=0`, or an explicit chunk wider than
   8,192) could submit single forwards of unbounded depth into

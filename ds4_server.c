@@ -29182,6 +29182,61 @@ static void test_prefill_depth_fence(void) {
     else unsetenv("DS4_PREFILL_NOFENCE");
 }
 
+/* v0.6.3 Inc 6: the best-fit final-victim pick is pure arithmetic -- the
+ * v0.6.2 victim-order precedent (synthetic scenarios pin the policy; the
+ * ladder's disclosure lines carry field engagement evidence, since live
+ * small-ctx legs cannot exercise it: VMM page-phase alignment leaves only
+ * phase-aligned banks with interior pages there). */
+static void test_trim_bestfit_pick(void) {
+    /* the receipt scenario: the default (deep, oldest) covers, but a
+     * smaller covering victim sits later in the order */
+    {
+        const uint64_t est[]  = {2896, 1700, 900};
+        const uint8_t  val[]  = {1, 1, 1};
+        const uint32_t hist[] = {200000, 90000, 40000};
+        /* want 1646: est 900 does not cover; 1700 does and beats 2896 */
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 1646) == 1u);
+    }
+    /* equal covering estimates: prefer the shallower victim */
+    {
+        const uint64_t est[]  = {42, 42, 42};
+        const uint8_t  val[]  = {1, 1, 1};
+        const uint32_t hist[] = {13823, 3562, 9000};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 13) == 1u);
+    }
+    /* class guard: never trade an invalid-history default up into a
+     * valid bank (and vice versa) */
+    {
+        const uint64_t est[]  = {42, 20, 41};
+        const uint8_t  val[]  = {0, 1, 0};
+        const uint32_t hist[] = {0, 500, 0};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 13) == 2u);
+    }
+    /* non-covering candidates are skipped even if smaller */
+    {
+        const uint64_t est[]  = {42, 12, 41};
+        const uint8_t  val[]  = {1, 1, 1};
+        const uint32_t hist[] = {9000, 100, 8000};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 13) == 2u);
+    }
+    /* nothing beats the default -> 0 */
+    {
+        const uint64_t est[]  = {42, 5, 6};
+        const uint8_t  val[]  = {1, 1, 1};
+        const uint32_t hist[] = {9000, 10, 20};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 13) == 0u);
+    }
+    /* single candidate and degenerate inputs */
+    {
+        const uint64_t est[]  = {42};
+        const uint8_t  val[]  = {1};
+        const uint32_t hist[] = {9000};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 1, 13) == 0u);
+        TEST_ASSERT(ds4_trim_bestfit_pick(NULL, val, hist, 1, 13) == 0u);
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 0, 13) == 0u);
+    }
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -29337,6 +29392,7 @@ static void ds4_server_unit_tests_run(void) {
     test_idempotency_key_header_is_ignored();
     test_chunked_request_decoding();
     test_prefill_depth_fence();
+    test_trim_bestfit_pick();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();
     test_anthropic_stop_sequence_native_shape();

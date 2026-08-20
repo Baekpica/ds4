@@ -7077,6 +7077,25 @@ int ds4_serial_prefill_fenced(int ctx_size, int prompt_len,
     return fence != 0u && width > fence;
 }
 
+/* v0.6.3 Inc 6: pure best-fit final-victim pick -- see the ds4.h contract.
+ * Shared-section placement: unit-tested on every backend (the v0.6.2
+ * victim-order precedent: policy pinned by a synthetic unit, engagement
+ * observable via the ladder's disclosure lines). */
+uint32_t ds4_trim_bestfit_pick(const uint64_t *est, const uint8_t *valid,
+                               const uint32_t *hist, uint32_t n,
+                               uint64_t remaining) {
+    if (!est || !valid || !hist || n == 0u) return 0u;
+    uint32_t best = 0u;
+    for (uint32_t i = 1u; i < n; i++) {
+        if (valid[i] != valid[0]) continue;
+        if (est[i] < remaining) continue;
+        if (est[i] < est[best] ||
+            (est[i] == est[best] && hist[i] < hist[best]))
+            best = i;
+    }
+    return best;
+}
+
 /* Allocate all CPU decode temporaries once.  This keeps generation deterministic
  * from the VM's point of view and makes accidental hot-loop malloc visible. */
 static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
@@ -34219,6 +34238,21 @@ static uint64_t ds4_batch_bank_trim_pages(ds4_batch_ctx *ctx, uint32_t b) {
     return freed;
 }
 
+/* v0.6.3 Inc 6: the whole-bank estimate twin is defined below the ladder;
+ * the best-fit final-victim scan uses it. */
+static uint64_t ds4_batch_bank_trim_estimate(ds4_batch_ctx *ctx, uint32_t b);
+
+/* v0.6.3 Inc 6 kill switch: DS4_BATCH_TRIM_BESTFIT=0 restores the pure
+ * recency-blend victim walk (no size-fit refinement).  Default ON. */
+static int ds4_batch_trim_bestfit_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_BATCH_TRIM_BESTFIT");
+        enabled = !(e && e[0] == '0' && e[1] == '\0');
+    }
+    return enabled;
+}
+
 /* v0.5.1 Inc2: shed FREE banks' cache pages under admission budget pressure,
  * cheapest warm value first.  v0.6.2 Inc 3: "cheapest" now aligns with
  * warm-record eviction -- history-invalid banks, then valid banks by
@@ -34330,6 +34364,68 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         const uint8_t  v_valid = ctx->bank_hist_valid[v];
         const uint32_t v_hist  = ctx->bank_hist_len[v];
         const uint64_t v_use   = ctx->bank_last_use[v];
+        /* v0.6.3 Inc 6 (best-fit victims): if THIS victim's release would
+         * cover the remaining deficit, it is the FINAL victim -- scan the
+         * rest of the order for a same-validity-class candidate that also
+         * covers but releases less.  The v0.6.2 receipt this kills: a
+         * 2,896 MiB trunk died for a 1,646 MiB want while smaller covering
+         * victims sat later in the recency order.  Non-final victims keep
+         * the pure recency-blend order (they are consumed whole either
+         * way); the class guard never trades an invalid-history pick up
+         * into a valid bank.  DS4_BATCH_TRIM_BESTFIT=0 restores the pure
+         * blend walk. */
+        const uint64_t remaining = want - freed;
+        if (ds4_batch_trim_bestfit_enabled() &&
+            ds4_batch_bank_trim_estimate(ctx, v) >= remaining) {
+            /* Gather the remaining order into candidate arrays (index 0 =
+             * the default pick) and let the pure policy choose.  NOTE
+             * (measured, 08-20): at small ctx the bank stride barely
+             * exceeds the VMM page, so only phase-aligned banks ever have
+             * interior pages and the pick rarely differs from the default
+             * there -- the policy earns its keep at production strides
+             * (many pages per bank).  It is unit-gated (v0.6.2 victim-
+             * order precedent); these disclosure lines are the field
+             * engagement evidence. */
+            uint64_t cest[DS4_MULTISEQ_MAX_SEQ];
+            uint8_t  cval[DS4_MULTISEQ_MAX_SEQ];
+            uint32_t chist[DS4_MULTISEQ_MAX_SEQ];
+            uint32_t m = 0;
+            for (uint32_t b2 = a; b2 < n; b2++) {
+                const uint32_t c = order[b2];
+                cest[m]  = ds4_batch_bank_trim_estimate(ctx, c);
+                cval[m]  = ctx->bank_hist_valid[c];
+                chist[m] = ctx->bank_hist_len[c];
+                if (b2 > a && cval[m] == v_valid)
+                    fprintf(stderr,
+                            "ds4: batch vmm: best-fit candidate bank=%u "
+                            "est=%.1f MiB hist=%u tok%s\n",
+                            c, (double)cest[m] / 1048576.0, chist[m],
+                            cest[m] >= remaining ? " (covers)" : "");
+                m++;
+            }
+            const uint32_t pick = ds4_trim_bestfit_pick(cest, cval, chist,
+                                                        m, remaining);
+            if (pick != 0u) {
+                const uint32_t c = order[a + pick];
+                order[a + pick] = order[a];
+                order[a] = c;
+                fprintf(stderr,
+                        "ds4: batch vmm: best-fit victim bank=%u (%.1f MiB "
+                        "covers want %.1f MiB) preferred over bank=%u "
+                        "(%.1f MiB, hist=%u tok)\n",
+                        c, (double)cest[pick] / 1048576.0,
+                        (double)remaining / 1048576.0, v,
+                        (double)cest[0] / 1048576.0, v_hist);
+                a--;      /* re-enter the loop body on the swapped-in victim
+                             so its identity is re-captured for the log */
+                continue;
+            }
+            /* Kept-default disclosure -- a silent negative here cost three
+             * gate runs; say WHY the scan kept the recency pick. */
+            fprintf(stderr,
+                    "ds4: batch vmm: best-fit kept default bank=%u "
+                    "(%u candidates scanned)\n", v, m - 1u);
+        }
         const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
         if (got == 0) continue;                /* floor-resident: content intact, keep it */
         ds4_batch_bank_mark_trimmed(ctx, g, v);
@@ -34346,8 +34442,9 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         ctx->trim_banks += nb;
         ctx->trim_bytes += freed;
         fprintf(stderr,
-                "ds4: batch vmm: trimmed %u bank(s), %.1f MiB released %s\n",
-                nb, (double)freed / 1048576.0,
+                "ds4: batch vmm: trimmed %u bank(s), %.1f MiB released "
+                "(want %.1f MiB) %s\n",
+                nb, (double)freed / 1048576.0, (double)want / 1048576.0,
                 why ? why : "under budget pressure");
     }
     return freed;
