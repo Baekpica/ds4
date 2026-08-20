@@ -37083,6 +37083,12 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
     double   *ad_wall   = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;
     double   *ad_ms_cur = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;   /* 0 = no estimate yet */
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
+    /* Draft-gate census (instrument for the tok/step gap): per live-bank
+     * step, WHY did the drafter emit zero drafts?  Codegen C1 measured
+     * ~15 of 71 steps drafting nothing with quench OFF -- these counters
+     * name the thief.  Printed beside CONT_MTP_ACCEPT at shutdown. */
+    uint64_t  dg_drafted = 0, dg_noseed = 0, dg_kv = 0, dg_quench = 0,
+              dg_adwin = 0, dg_concgate = 0;
     /* v0.5.1 inc4: were the drafts the accept loop is consuming produced by
      * the MTP arms (vs DSpark)?  Set at each step's draft production; the
      * accept guard only accounts MTP-sourced drafts. */
@@ -38395,7 +38401,10 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 } else if (dspark_mode && !dspark_now) {
                     /* D4.5e gate: DSpark concurrency-gated OFF this step -> draft nothing, so
                      * the next step's verify is 1 row/bank (plain batched decode). */
-                    for (uint32_t b = 0; b < MS; b++) ndr[b] = 0u;
+                    for (uint32_t b = 0; b < MS; b++) {
+                        if (live[b]) dg_concgate++;
+                        ndr[b] = 0u;
+                    }
                 } else if (dspark_mode) {
                     /* D4.5d/E7: DSpark BLOCK draft.  For every still-live committed bank,
                      * draft a [bonus,noise*4] block at positions [posv[b]..posv[b]+4] with
@@ -38410,14 +38419,16 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                     uint32_t nl = 0;
                     for (uint32_t b = 0; b < MS; b++) {
                         ndr[b] = 0u;
-                        if (!live[b] || cfirst[b] == UINT32_MAX) continue;
+                        if (!live[b]) continue;
+                        if (cfirst[b] == UINT32_MAX) { dg_noseed++; continue; }
                         /* D4.5f: kv-gated bank -> no drafts (its verify packs nd=0 anyway). */
-                        if (dspark_max_kv != 0u && posv[b] >= dspark_max_kv) continue;
+                        if (dspark_max_kv != 0u && posv[b] >= dspark_max_kv) { dg_kv++; continue; }
                         /* Phase 2: terminally quenched bank follows the same no-draft path. */
-                        if (dspark_quench && qn_quenched[b]) continue;
+                        if (dspark_quench && qn_quenched[b]) { dg_quench++; continue; }
                         /* D4.5g: spec-off window -> no drafts this step (re-entry pays a
                          * 1-step ramp: the first spec step packs 0 drafts and re-seeds). */
-                        if (ad_active && b == ad_b && !ad_eff_spec) continue;
+                        if (ad_active && b == ad_b && !ad_eff_spec) { dg_adwin++; continue; }
+                        dg_drafted++;
                         Pbank[nl]   = (int32_t)posv[b];
                         bonusv[nl]  = cur[b];
                         bankmap[nl] = b;
@@ -38726,6 +38737,12 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 (unsigned long long)mtp_acc_drafts, (unsigned long long)mtp_acc_hits,
                 mtp_acc_drafts ? 100.0 * (double)mtp_acc_hits / (double)mtp_acc_drafts : 0.0,
                 mtp_acc_steps ? (double)mtp_acc_emit / (double)mtp_acc_steps : 0.0);
+    if (dspark_mode)
+        fprintf(stderr, "ds4: CONT_MTP_DRAFTGATE drafted=%llu noseed=%llu kv=%llu "
+                "quench=%llu adwin=%llu concgate=%llu (bank-steps)\n",
+                (unsigned long long)dg_drafted, (unsigned long long)dg_noseed,
+                (unsigned long long)dg_kv, (unsigned long long)dg_quench,
+                (unsigned long long)dg_adwin, (unsigned long long)dg_concgate);
 
     if (dspark_prof) {
         const double denom = dspark_prof_steps ? (double)dspark_prof_steps : 1.0;
