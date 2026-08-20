@@ -14284,6 +14284,37 @@ static void run_job_single(server *s, job *j) {
         job_finish(j);
         return;
     }
+    /* v0.6.3 Inc 5: whole-prompt depth fence (1M-audit Findings 3-10).
+     * With DS4_METAL_PREFILL_CHUNK<=0 (or an explicit width past the
+     * fence) this lane would submit a single forward wider than the
+     * proven 8,192-row ceiling -- unqualified kernels, crash-or-silence
+     * failure mode.  Refuse typed BEFORE any session/graph allocation;
+     * ds4_session_sync repeats the fence for non-server callers.
+     * DS4_PREFILL_NOFENCE=1 lifts both. */
+    {
+        uint32_t fence_w = 0, fence_r = 0;
+        if (ds4_serial_prefill_fenced(s->serial_boot_ctx, j->req.prompt.len,
+                                      &fence_w, &fence_r)) {
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                     "Whole-prompt prefill is fenced: this request needs a "
+                     "single %u-row forward, past the proven %u-row ceiling "
+                     "(DS4_METAL_PREFILL_CHUNK is a probe lever, unqualified "
+                     "at this depth); unset it or set DS4_PREFILL_NOFENCE=1",
+                     fence_w, fence_r);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: whole-prompt depth fence: refusing serial "
+                       "request (forward=%u rows > fence=%u, prompt=%d tokens)",
+                       fence_w, fence_r, j->req.prompt.len);
+            ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                               [DS4_REJLANE_SERIAL][DS4_REJECT_DEEP_POLICY], 1);
+            wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req),
+                            503, msg);
+            j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
+            job_finish(j);
+            return;
+        }
+    }
     pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
     int hold_retry = 0;
     if (cont_registry_serial_hold(s, &j->req, now_sec(), &hold_retry)) {
@@ -19426,6 +19457,30 @@ int main(int argc, char **argv) {
 #endif
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
+    {
+        /* v0.6.3 Inc 5: the whole-prompt probe modes get a boot disclosure
+         * (the env had none; its failure mode used to be a depth crash). */
+        uint32_t fence_w = 0, fence_r = 0;
+        (void)ds4_serial_prefill_fenced(cfg.ctx_size, cfg.ctx_size,
+                                        &fence_w, &fence_r);
+        if (fence_w > 8192u) {
+            if (fence_r != 0u) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: serial prefill widened to %u-row "
+                           "forwards by DS4_METAL_PREFILL_CHUNK (probe lever): "
+                           "requests past the %u-row fence get a typed refusal; "
+                           "DS4_PREFILL_NOFENCE=1 lifts the fence",
+                           fence_w, fence_r);
+            } else {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: whole-prompt depth fence LIFTED "
+                           "(DS4_PREFILL_NOFENCE=1): serial forwards up to %u "
+                           "rows will be attempted; unqualified past 8192, "
+                           "expect crashes or wrong output at depth",
+                           fence_w);
+            }
+        }
+    }
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {
             .ctx_size = cfg.ctx_size,
@@ -29084,6 +29139,49 @@ static void test_unit_span_lookup(void) {
     TEST_ASSERT(lo == -1 && hi == -1);
 }
 
+/* v0.6.3 Inc 5: whole-prompt depth fence predicate.  Pure env+arith --
+ * pin the default-config immunity, the fenced shapes, the boundary, and
+ * the escape hatch. */
+static void test_prefill_depth_fence(void) {
+    const char *old_chunk = getenv("DS4_METAL_PREFILL_CHUNK");
+    const char *old_nofence = getenv("DS4_PREFILL_NOFENCE");
+    char *saved_chunk = old_chunk ? xstrdup(old_chunk) : NULL;
+    char *saved_nofence = old_nofence ? xstrdup(old_nofence) : NULL;
+    uint32_t w = 0, f = 0;
+
+    /* Default config: chunked at 4096; the fence is unreachable. */
+    unsetenv("DS4_METAL_PREFILL_CHUNK");
+    unsetenv("DS4_PREFILL_NOFENCE");
+    TEST_ASSERT(ds4_prefill_fence_rows() == 8192u);
+    TEST_ASSERT(!ds4_serial_prefill_fenced(32768, 20000, &w, &f));
+    TEST_ASSERT(w == 4096u && f == 8192u);
+
+    /* Whole-prompt mode: the cap pins to ctx; a deep prompt trips it. */
+    setenv("DS4_METAL_PREFILL_CHUNK", "0", 1);
+    TEST_ASSERT(ds4_serial_prefill_fenced(32768, 20000, &w, &f));
+    TEST_ASSERT(w == 20000u && f == 8192u);
+    /* Boundary is inclusive: exactly 8192 rows is proven territory. */
+    TEST_ASSERT(!ds4_serial_prefill_fenced(32768, 8192, &w, &f));
+    TEST_ASSERT(w == 8192u);
+    /* An explicit wide chunk trips it too (the chunked branch submits
+     * cap-wide forwards). */
+    setenv("DS4_METAL_PREFILL_CHUNK", "16384", 1);
+    TEST_ASSERT(ds4_serial_prefill_fenced(1048576, 100000, &w, &f));
+    TEST_ASSERT(w == 16384u);
+
+    /* The escape hatch lifts the fence entirely. */
+    setenv("DS4_PREFILL_NOFENCE", "1", 1);
+    TEST_ASSERT(ds4_prefill_fence_rows() == 0u);
+    setenv("DS4_METAL_PREFILL_CHUNK", "0", 1);
+    TEST_ASSERT(!ds4_serial_prefill_fenced(1048576, 1000000, &w, &f));
+    TEST_ASSERT(w == 1000000u && f == 0u);
+
+    if (saved_chunk) { setenv("DS4_METAL_PREFILL_CHUNK", saved_chunk, 1); free(saved_chunk); }
+    else unsetenv("DS4_METAL_PREFILL_CHUNK");
+    if (saved_nofence) { setenv("DS4_PREFILL_NOFENCE", saved_nofence, 1); free(saved_nofence); }
+    else unsetenv("DS4_PREFILL_NOFENCE");
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -29238,6 +29336,7 @@ static void ds4_server_unit_tests_run(void) {
     test_weight_fp_stride_geometry();
     test_idempotency_key_header_is_ignored();
     test_chunked_request_decoding();
+    test_prefill_depth_fence();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();
     test_anthropic_stop_sequence_native_shape();

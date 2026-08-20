@@ -7,6 +7,17 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **Whole-prompt depth fence** — the whole-prompt probe modes
+  (`DS4_METAL_PREFILL_CHUNK<=0`, or an explicit chunk wider than
+  8,192) could submit single forwards of unbounded depth into
+  kernels that are unqualified past 8,192 rows, failing as a crash
+  or silently wrong output. Such requests now get a typed refusal
+  naming the lever (server: typed 503 before any allocation; engine:
+  a named error for direct callers), and the boot log discloses the
+  mode whenever it is active. `DS4_PREFILL_NOFENCE=1` lifts the
+  fence for deliberate probe runs. The default chunked path cannot
+  hit the fence. Also fixes doc drift: `DS4_CONT_PREFILL_CHUNK_LIVE`
+  defaults to 512, not the documented 4096.
 - **The full 1,048,576-token window, qualified to the last token** —
   the deepest ~32k tokens of the window (compressed rows past 7,936,
   first crossed at 1,015,936 resident) previously rode a fixed-size

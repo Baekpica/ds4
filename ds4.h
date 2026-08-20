@@ -477,6 +477,18 @@ int  ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx);
 /* MT-5 hygiene: the cont admission chunk width (DS4_CONT_PREFILL_CHUNK,
  * default 4096) -- the input that shapes raw_cap; for boot-ledger honesty. */
 uint32_t ds4_cont_prefill_chunk_tokens(void);
+/* v0.6.3 Inc 5: whole-prompt depth fence.  fence_rows() is the single-
+ * forward ceiling (8192), or 0 when DS4_PREFILL_NOFENCE=1 lifts it.
+ * serial_prefill_fenced() answers whether a serial request of prompt_len
+ * under ctx_size would submit a forward wider than the fence (the session
+ * prefill cap mirrors DS4_METAL_PREFILL_CHUNK; <=0 pins it to ctx_size =
+ * whole-prompt one-shot).  Lets the server refuse with a typed envelope
+ * BEFORE session/graph allocation; ds4_session_sync enforces the same
+ * fence for direct callers.  width_out/fence_out (optional) receive the
+ * offending forward width and the fence for the refusal message. */
+uint32_t ds4_prefill_fence_rows(void);
+int ds4_serial_prefill_fenced(int ctx_size, int prompt_len,
+                              uint32_t *width_out, uint32_t *fence_out);
 /* MT-7: the disclosed admission band (DS4_CONT_ADMIT_BAND_X1024, default
  * 1045 = the leg2a-measured 1.02x sequential transient peak, rounded up;
  * clamped to [1024, 2048]; 1024 = physics-exact charging).  Applied inside

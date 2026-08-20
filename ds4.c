@@ -7044,6 +7044,39 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
     return cap;
 }
 
+/* v0.6.3 Inc 5: whole-prompt depth fence (the 1M-audit Findings 3-10
+ * class).  DS4_METAL_PREFILL_CHUNK<=0 pins the session prefill cap to
+ * the context size -- every serial prefill becomes ONE forward over the
+ * whole prompt -- and an explicit value past the fence widens each
+ * chunked forward the same way.  Above 8,192 rows a single forward is
+ * unqualified territory (fixed grid and integer ceilings in the generic
+ * kernels; the failure is a crash or, worse, silently wrong output),
+ * while every proven one-submission ceiling in the engine agrees on
+ * 8,192 (the cont chunk clamp, the raw ring cap).  The fence refuses by
+ * name instead; DS4_PREFILL_NOFENCE=1 lifts it, so the probe lever
+ * stays usable for anyone deliberately measuring past the line. */
+#define DS4_PREFILL_FENCE_ROWS 8192u
+
+uint32_t ds4_prefill_fence_rows(void) {
+    const char *env = getenv("DS4_PREFILL_NOFENCE");
+    if (env && env[0] && atoi(env) != 0) return 0;
+    return DS4_PREFILL_FENCE_ROWS;
+}
+
+int ds4_serial_prefill_fenced(int ctx_size, int prompt_len,
+                              uint32_t *width_out, uint32_t *fence_out) {
+    const uint32_t fence = ds4_prefill_fence_rows();
+    /* Mirror the session-create sizing call (prompt argument = ctx), then
+     * bound by the actual prompt: the widest single forward this request
+     * can submit is min(prefill_cap, prompt_len). */
+    uint32_t width = ds4_default_prefill_cap_for_prompt(ctx_size);
+    if (prompt_len > 0 && (uint32_t)prompt_len < width)
+        width = (uint32_t)prompt_len;
+    if (width_out) *width_out = width;
+    if (fence_out) *fence_out = fence;
+    return fence != 0u && width > fence;
+}
+
 /* Allocate all CPU decode temporaries once.  This keeps generation deterministic
  * from the VM's point of view and makes accidental hot-loop malloc visible. */
 static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
@@ -41651,6 +41684,28 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             token_vec_push(&s->checkpoint, prompt->v[i]);
         }
         return 0;
+    }
+
+    /* v0.6.3 Inc 5: whole-prompt depth fence -- the widest single forward
+     * this sync will submit is min(prefill_cap, prompt len); past the
+     * fence the generic kernels are unqualified (see
+     * ds4_prefill_fence_rows), so refuse by name, before any state is
+     * torn down.  The server refuses the same class with a typed
+     * envelope before allocation; this is the belt-and-braces for
+     * direct engine callers (CLI, agent, API embedders). */
+    {
+        const uint32_t fence = ds4_prefill_fence_rows();
+        uint32_t width = s->prefill_cap;
+        if ((uint32_t)prompt->len < width) width = (uint32_t)prompt->len;
+        if (fence != 0u && width > fence) {
+            snprintf(err, errlen,
+                     "whole-prompt prefill fenced: a single %u-row forward "
+                     "exceeds the %u-row fence (DS4_METAL_PREFILL_CHUNK<=0 "
+                     "or >%u is a probe lever, unqualified at depth); unset "
+                     "it or set DS4_PREFILL_NOFENCE=1",
+                     width, fence, fence);
+            return 1;
+        }
     }
 
     bool ok;

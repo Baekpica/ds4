@@ -617,5 +617,61 @@ c=$(post slow_reader_after /v1/chat/completions '{"max_tokens":16,"temperature":
 code_is slow_reader_after "$c" 200
 log "slow_reader PASS (aggregate backlog eviction counted shed{slow_reader}=$sr1 + canceled; server healthy after)"
 
+# ---- boot E: whole-prompt depth fence (v0.6.3 Inc 5) ------------------------
+# Serial-only + DS4_METAL_PREFILL_CHUNK=0: every serial prefill is one
+# whole-prompt forward.  Past 8192 rows that territory is unqualified, so
+# the request must get a TYPED 503 naming the lever (not a crash, not a
+# generic 500), the boot log must disclose the mode, and the escape env
+# must genuinely lift the fence.
+BOOT_ENV="DS4_SERVER_CONTINUOUS=0 DS4_SERVER_COALESCE=0 DS4_METAL_PREFILL_CHUNK=0" boot
+ssh "$R" "grep -q 'serial prefill widened' $SRV" \
+  || fail "fence boot: whole-prompt boot disclosure line missing from srv.log"
+
+# ~8.5k words (> 8192 tokens, safely under the 16384 ctx parse gate).
+python3 - > "$OUT/fence_req.json" <<'PY'
+import json
+words = "alpha bravo charlie delta echo foxtrot golf hotel india juliet " * 850
+print(json.dumps({"model": "m", "max_tokens": 8, "temperature": 0,
+                  "messages": [{"role": "user", "content": words}]}))
+PY
+fr0=$(lmetric 'ds4_requests_rejected_total{lane="serial",reason="deep_policy"}')
+c=$(curl -s -m 60 -o "$OUT/fence_refuse.json" -w '%{http_code}' "$BASE/v1/messages" \
+     -H 'Content-Type: application/json' -d @"$OUT/fence_req.json")
+code_is fence_refuse "$c" 503
+has fence_refuse 'Whole-prompt prefill is fenced'
+has fence_refuse 'DS4_PREFILL_NOFENCE'
+ssh "$R" "grep -q 'whole-prompt depth fence: refusing serial request' $SRV" \
+  || fail "fence_refuse: typed refusal line missing from srv.log"
+fr1=$(lmetric 'ds4_requests_rejected_total{lane="serial",reason="deep_policy"}')
+[ "${fr1:-0}" -gt "${fr0:-0}" ] || fail "fence_refuse: rejected{serial,deep_policy} never incremented (${fr0:-?} -> ${fr1:-?})"
+# a short prompt still serves whole-prompt (width under the fence)
+c=$(post fence_small /v1/chat/completions '{"max_tokens":8,"temperature":0,"messages":[{"role":"user","content":"hi"}]}')
+code_is fence_small "$c" 200
+log "fence_refuse PASS (typed 503 names the lever; counter ${fr0:-0} -> $fr1; short prompt still 200)"
+
+# escape hatch: the same deep request must get PAST the fence with
+# DS4_PREFILL_NOFENCE=1.  What happens in unqualified territory is NOT
+# asserted -- measured 08-20: this exact shape (a 12,755-row one-shot)
+# fails TODAY as a clean typed 500 'cuda prefill failed', which is the
+# fence's justification, not a defect.  The lever's contract: the fence
+# genuinely lifts (no typed 503, no refusal line), whatever happens
+# comes back as an ENVELOPE (200 or a typed 500 -- never a crash or a
+# dropped connection), and the server serves the next request.
+BOOT_ENV="DS4_SERVER_CONTINUOUS=0 DS4_SERVER_COALESCE=0 DS4_METAL_PREFILL_CHUNK=0 DS4_PREFILL_NOFENCE=1" boot
+ssh "$R" "grep -q 'depth fence LIFTED' $SRV" \
+  || fail "fence_lift boot: LIFTED disclosure line missing from srv.log"
+c=$(curl -s -m 180 -o "$OUT/fence_lift.json" -w '%{http_code}' "$BASE/v1/messages" \
+     -H 'Content-Type: application/json' -d @"$OUT/fence_req.json")
+[ "$c" = 200 ] || [ "$c" = 500 ] \
+  || fail "fence_lift: HTTP $c, want 200 or a typed 500 ($(head -c 300 "$OUT/fence_lift.json"))"
+lacks fence_lift 'Whole-prompt prefill is fenced'
+if [ "$c" = 200 ]; then has fence_lift '"stop_reason"'
+else has fence_lift '"type":"error","error":{"type":"api_error"'; fi
+ssh "$R" "grep -q 'whole-prompt depth fence: refusing' $SRV" \
+  && fail "fence_lift: fence refused despite DS4_PREFILL_NOFENCE=1"
+c=$(post fence_lift_after /v1/chat/completions '{"max_tokens":8,"temperature":0,"messages":[{"role":"user","content":"still healthy?"}]}')
+code_is fence_lift_after "$c" 200
+log "fence_lift PASS (fence lifted: deep one-shot reached the engine, outcome stayed an envelope, server healthy after)"
+
 ssh "$R" "pkill -x ds4-server; exit 0"
 log "ALL LEGS PASS — artifacts in $OUT (server killed, $R left free)"
