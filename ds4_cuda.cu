@@ -24337,6 +24337,58 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
             0, 0, ratio);
     return cuda_ok(cudaGetLastError(), "compressor state set launch");
 }
+/* v0.6.3 Inc 4 (audit Finding 1): the HG flash-decode tier, factored so the
+ * deep dispatch can try it BEFORE the fixed-score-buffer paths.  HG reads
+ * live n_raw/raw_start/n_comp from the scalar substrate and has no fixed
+ * score buffer, so it serves any depth -- the 7,936-compressed-row cap
+ * (DS4_CUDA_ATTENTION_SCORE_CAP - RAW cap, first crossed at resident
+ * 1,015,936 tokens) is a fixed-smem property of the generic kernels only.
+ * Mask/draft/width gating stays at the call sites (those shapes are not
+ * ported to HG).  Returns 1 = launched (launch result in *rc), 0 =
+ * ineligible in this state (partials missing/too small, escape env, or a
+ * non-HG head geometry). */
+static int attention_decode_try_hg(
+        ds4_gpu_tensor *heads, const float *sinks,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t n_tokens, uint32_t pos0,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        uint32_t n_comp, uint32_t comp_cap, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim,
+        const int32_t *pos_dev, const int32_t *seq_dev,
+        const struct ds4_decode_scalars *s_override,
+        const struct ds4_layer_scalars *ls_override,
+        const unsigned char *fp8_codes, const float *fp8_sc,
+        const char *what_partial, const char *what_combine,
+        int *rc) {
+    if (!(head_dim == 512u && (n_head % DS4_ATTN_HG_HEADS) == 0u &&
+          g_attn_split_partials != NULL &&
+          getenv("DS4_CUDA_NO_ATTN_HG") == NULL))
+        return 0;
+    const uint32_t hg_split = attention_decode_hg_n_split(n_head);
+    const uint64_t hg_need = (uint64_t)n_tokens * n_head * hg_split *
+                             (head_dim + 2u) * sizeof(float);
+    if (hg_need > g_attn_split_partials_bytes) return 0;
+    dim3 hg_grid(hg_split, n_head / DS4_ATTN_HG_HEADS, n_tokens);
+    attention_decode_hg_partial_kernel<<<hg_grid, 256, 0, ds4_current_stream()>>>(
+            g_attn_split_partials,
+            (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+            comp_cap, window, ratio, n_head, head_dim, hg_split,
+            pos_dev, seq_dev,
+            s_override, ls_override,
+            fp8_codes, fp8_sc);
+    if (!cuda_ok(cudaGetLastError(), what_partial)) { *rc = 0; return 1; }
+    dim3 hgc_grid(n_tokens, n_head, 1);
+    attention_decode_hg_combine_kernel<<<hgc_grid, 256, 0, ds4_current_stream()>>>(
+            (float *)heads->ptr, sinks, g_attn_split_partials,
+            n_head, head_dim, hg_split);
+    *rc = cuda_ok(cudaGetLastError(), what_combine);
+    return 1;
+}
+
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -24390,6 +24442,25 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
     const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
+        /* v0.6.3 Inc 4 (audit Finding 1): past the fixed-buffer cap the
+         * generic kernels cannot serve, but HG and the online kernel can
+         * (both uncapped, both reading live substrate scalars).  Pre-fix
+         * this branch skipped HG entirely, so the deepest ~32k tokens of
+         * the 1M window rode the slower online kernel, and HG-ineligible
+         * states failed outright. */
+        if (!use_mask) {
+            int rc = 0;
+            if (attention_decode_try_hg(heads, sinks, q, raw_kv, comp_kv,
+                                        1u, 0u, n_raw, raw_cap, raw_start,
+                                        n_comp, 0u, 0u, 0u, n_head, head_dim,
+                                        NULL, NULL,
+                                        (const struct ds4_decode_scalars *)scalars,
+                                        ls_override, fp8_codes, fp8_sc,
+                                        "attention decode hg partial launch",
+                                        "attention decode hg combine launch",
+                                        &rc))
+                return rc;
+        }
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
@@ -24426,32 +24497,18 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
      * deterministic partition + fixed-order combine (the split path's allowed
      * class); fp8-vs-F32 identity structural (shared staged-f32 chains).
      * DS4_CUDA_NO_ATTN_HG = diagnostic escape (A/B only), not ship state. */
-    if (head_dim == 512u && (n_head % DS4_ATTN_HG_HEADS) == 0u && !use_mask &&
-        g_attn_split_partials != NULL &&
-        getenv("DS4_CUDA_NO_ATTN_HG") == NULL) {
-        const uint32_t hg_split = attention_decode_hg_n_split(n_head);
-        const uint64_t hg_need = (uint64_t)n_head * hg_split * (head_dim + 2u) * sizeof(float);
-        if (hg_need <= g_attn_split_partials_bytes) {
-            dim3 hg_grid(hg_split, n_head / DS4_ATTN_HG_HEADS, 1);
-            attention_decode_hg_partial_kernel<<<hg_grid, 256, 0, ds4_current_stream()>>>(
-                    g_attn_split_partials,
-                    (const float *)q->ptr,
-                    (const float *)raw_kv->ptr,
-                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                    1u, 0u, n_raw, raw_cap, raw_start, n_comp,
-                    /*comp_cap=*/0u, /*window=*/0u, /*ratio=*/0u,
-                    n_head, head_dim, hg_split,
-                    /*positions=*/NULL, /*seq_id=*/NULL,
-                    (const struct ds4_decode_scalars *)scalars,
-                    ls_override,
-                    fp8_codes, fp8_sc);
-            if (!cuda_ok(cudaGetLastError(), "attention decode hg partial launch")) return 0;
-            dim3 hgc_grid(1, n_head, 1);
-            attention_decode_hg_combine_kernel<<<hgc_grid, 256, 0, ds4_current_stream()>>>(
-                    (float *)heads->ptr, sinks, g_attn_split_partials,
-                    n_head, head_dim, hg_split);
-            return cuda_ok(cudaGetLastError(), "attention decode hg combine launch");
-        }
+    if (!use_mask) {
+        int rc = 0;
+        if (attention_decode_try_hg(heads, sinks, q, raw_kv, comp_kv,
+                                    1u, 0u, n_raw, raw_cap, raw_start,
+                                    n_comp, 0u, 0u, 0u, n_head, head_dim,
+                                    NULL, NULL,
+                                    (const struct ds4_decode_scalars *)scalars,
+                                    ls_override, fp8_codes, fp8_sc,
+                                    "attention decode hg partial launch",
+                                    "attention decode hg combine launch",
+                                    &rc))
+            return rc;
     }
     /* Flash-decode split: when the per-head decode grid under-fills the machine
      * (n_head < SM count, e.g. 64 heads on the PRO 6000's 188 SMs), split each
@@ -24844,7 +24901,32 @@ static int attention_decode_batch_launch(
         }
     }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        if (!force_main_kernel && !use_comp_mask && head_dim == 512u &&
+        /* v0.6.3 Inc 4 (audit Finding 1): past the fixed-buffer cap, HG
+         * first (uncapped, live substrate scalars -- the default deep
+         * decode shape), then the online kernel WITH the live overrides.
+         * Pre-fix the online fallback here refused every substrate caller
+         * (force_main_kernel) and passed NULL overrides, so a captured
+         * node froze its n_comp argument and the deepest rows vanished
+         * silently on replay past the cap; passing s/ls_override makes
+         * the captured online node read live scalars exactly like the
+         * main kernel does (positions rows already read live positions).
+         * Mask and draft-span shapes keep the honest reject -- neither is
+         * ported to the uncapped kernels nor on the deep-decode ledger. */
+        if (!use_comp_mask && draft_n_raw_dev == NULL && n_tokens <= 8u) {
+            int rc = 0;
+            if (attention_decode_try_hg(heads, sinks, q, raw_kv, comp_kv,
+                                        n_tokens, pos0, n_raw, raw_cap,
+                                        raw_start, n_comp, comp_cap, window,
+                                        ratio, n_head, head_dim,
+                                        pos_dev, seq_dev,
+                                        s_override, ls_override,
+                                        fp8_codes, fp8_sc,
+                                        "attention decode hg batch partial launch",
+                                        "attention decode hg batch combine launch",
+                                        &rc))
+                return rc;
+        }
+        if (!use_comp_mask && draft_n_raw_dev == NULL && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
@@ -24863,7 +24945,7 @@ static int attention_decode_batch_launch(
                                                                               n_head,
                                                                               head_dim,
                                                                               pos_dev, seq_dev, comp_cap,
-                                                                              /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL,
+                                                                              s_override, ls_override,
                                                                               fp8_codes,
                                                                               fp8_sc);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
@@ -24903,32 +24985,19 @@ static int attention_decode_batch_launch(
      * wide admission chunks keep the tiers above.  Mask and draft-span
      * callers stay on the main kernel (not ported; neither is on the
      * deep-decode ledger). */
-    if (head_dim == 512u && (n_head % DS4_ATTN_HG_HEADS) == 0u &&
-        !use_comp_mask && draft_n_raw_dev == NULL && n_tokens <= 8u &&
-        g_attn_split_partials != NULL &&
-        getenv("DS4_CUDA_NO_ATTN_HG") == NULL) {
-        const uint32_t hg_split = attention_decode_hg_n_split(n_head);
-        const uint64_t hg_need = (uint64_t)n_tokens * n_head * hg_split *
-                                 (head_dim + 2u) * sizeof(float);
-        if (hg_need <= g_attn_split_partials_bytes) {
-            dim3 hg_grid(hg_split, n_head / DS4_ATTN_HG_HEADS, n_tokens);
-            attention_decode_hg_partial_kernel<<<hg_grid, 256, 0, ds4_current_stream()>>>(
-                    g_attn_split_partials,
-                    (const float *)q->ptr,
-                    (const float *)raw_kv->ptr,
-                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
-                    comp_cap, window, ratio, n_head, head_dim, hg_split,
-                    pos_dev, seq_dev,
-                    s_override, ls_override,
-                    fp8_codes, fp8_sc);
-            if (!cuda_ok(cudaGetLastError(), "attention decode hg batch partial launch")) return 0;
-            dim3 hgc_grid(n_tokens, n_head, 1);
-            attention_decode_hg_combine_kernel<<<hgc_grid, 256, 0, ds4_current_stream()>>>(
-                    (float *)heads->ptr, sinks, g_attn_split_partials,
-                    n_head, head_dim, hg_split);
-            return cuda_ok(cudaGetLastError(), "attention decode hg batch combine launch");
-        }
+    if (!use_comp_mask && draft_n_raw_dev == NULL && n_tokens <= 8u) {
+        int rc = 0;
+        if (attention_decode_try_hg(heads, sinks, q, raw_kv, comp_kv,
+                                    n_tokens, pos0, n_raw, raw_cap, raw_start,
+                                    n_comp, comp_cap, window, ratio,
+                                    n_head, head_dim,
+                                    pos_dev, seq_dev,
+                                    s_override, ls_override,
+                                    fp8_codes, fp8_sc,
+                                    "attention decode hg batch partial launch",
+                                    "attention decode hg batch combine launch",
+                                    &rc))
+            return rc;
     }
     dim3 grid(n_tokens, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,

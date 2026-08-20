@@ -154,10 +154,118 @@ static int check_decode_attention_overflow_path(void) {
     return rc;
 }
 
+/* v0.6.3 Inc 4 (audit Finding 1): the batched decode entry past the
+ * 7,936-compressed-row fixed-buffer cap WITH the capture substrate
+ * present.  Pre-fix this exact call rejected outright ("score buffer too
+ * small"): substrate forced the generic kernel and the deep branch
+ * refused every substrate caller.  Post-fix it serves via HG or the
+ * online kernel with live overrides.  The comp rows PAST the cap carry a
+ * distinctive key/value so a silently truncated read fails numerically,
+ * not just structurally: full attention puts well over 1.0 into element
+ * 0, truncation leaves it near zero. */
+static int check_decode_attention_overflow_substrate(void) {
+    const uint32_t n_head = 8;
+    const uint32_t head_dim = 512;
+    const uint32_t ratio = 128;
+    const uint32_t n_comp = 8100;              /* > 7,936 = the cap */
+    const uint32_t deep_first = 7936;
+    const uint32_t n_raw = 128;
+    const uint32_t raw_cap = 128;
+    const uint32_t pos0 = n_comp * ratio - 1;  /* qpos+1 = n_comp*ratio */
+    const uint64_t q_count = (uint64_t)n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+
+    float *sinks = (float *)calloc(n_head, sizeof(float));
+    float *q_host = (float *)calloc((size_t)q_count, sizeof(float));
+    float *raw_host = (float *)calloc((size_t)raw_count, sizeof(float));
+    float *comp_host = (float *)calloc((size_t)comp_count, sizeof(float));
+    float *heads_host = (float *)calloc((size_t)q_count, sizeof(float));
+    if (!sinks || !q_host || !raw_host || !comp_host || !heads_host) return 1;
+
+    for (uint32_t h = 0; h < n_head; h++) q_host[(uint64_t)h * head_dim] = 8.0f;
+    for (uint32_t c = deep_first; c < n_comp; c++) {
+        comp_host[(uint64_t)c * head_dim] = 8.0f;
+    }
+
+    if (!ds4_gpu_decode_scalars_init()) return 1;
+    ds4_gpu_decode_scalars_set(pos0, raw_cap, /*raw_window=*/n_raw, ratio,
+                               n_comp, /*flags=*/0, /*token=*/0);
+    if (!ds4_gpu_decode_scalars_flush()) return 1;
+    const void *scalars = ds4_gpu_decode_scalars_device_ptr();
+    if (!scalars) return 1;
+
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    int rc = 1;
+    if (heads && q && raw && comp &&
+        ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float)) &&
+        ds4_gpu_attention_decode_mixed_batch_heads_tensor(heads,
+                                                          sinks,
+                                                          n_head * sizeof(float),
+                                                          0,
+                                                          q,
+                                                          raw,
+                                                          comp,
+                                                          0,        /* comp_kv_f16 */
+                                                          NULL,     /* comp_mask */
+                                                          0,
+                                                          1,        /* n_tokens */
+                                                          pos0,
+                                                          n_raw,
+                                                          raw_cap,
+                                                          0,        /* raw_start */
+                                                          n_comp,
+                                                          n_comp,   /* comp_cap */
+                                                          n_raw,    /* window */
+                                                          ratio,
+                                                          n_head,
+                                                          head_dim,
+                                                          NULL,     /* comp_fp8 */
+                                                          NULL,     /* comp_scale */
+                                                          NULL,     /* positions */
+                                                          NULL,     /* seq_id */
+                                                          0,        /* allow_mseq_heads8 */
+                                                          scalars,
+                                                          UINT32_MAX,
+                                                          UINT32_MAX) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(heads, 0, heads_host, q_count * sizeof(float))) {
+        rc = 0;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float v = heads_host[(uint64_t)h * head_dim];
+            if (v < 1.0f) {
+                fprintf(stderr, "substrate overflow path truncated deep rows head=%u value=%f\n",
+                        h, (double)v);
+                rc = 1;
+            }
+        }
+    } else {
+        fprintf(stderr, "substrate overflow path: call failed (pre-fix reject shape)\n");
+    }
+
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(heads);
+    ds4_gpu_decode_scalars_cleanup();
+    free(heads_host);
+    free(comp_host);
+    free(raw_host);
+    free(q_host);
+    free(sinks);
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
+    if (check_decode_attention_overflow_substrate() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;

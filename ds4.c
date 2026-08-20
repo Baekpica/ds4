@@ -33175,7 +33175,14 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
     const uint32_t saved_comp_cap = h[6];
     const uint32_t saved_tokens = h[7];
     const uint32_t saved_raw_live = h[12];
-    if (saved_tokens >= ctx->seq_cap) {
+    /* v0.6.3 Inc 4 (audit Finding 2): an EXACTLY-full bank restores --
+     * bank_hist has seq_cap slots, so == fills it precisely, and there is
+     * no spare-slot invariant downstream: bank_hist_append invalidates on
+     * overflow instead of writing, and the admission install bound
+     * (min(prompt + budget, seq_cap)) keeps decode atop a full bank
+     * honest.  The old >= rejected the one payload a full-context
+     * persist legitimately produces. */
+    if (saved_tokens > ctx->seq_cap) {
         payload_set_err(err, errlen, "bank payload does not fit current per-bank token bound");
         return 1;
     }

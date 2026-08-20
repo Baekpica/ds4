@@ -535,13 +535,17 @@ box (the OS starts reclaiming file-backed weight pages), where the
 2.26M shipped-floor stamp is 1.14x. The step-by-step recipe is in the
 [ds4-on-spark README](https://github.com/Entrpi/ds4-on-spark#reaching-3m-tokens-of-active-context).
 
-The window itself reaches the model's full million: at `-c 1048576`
-(the checkpoint's exact YaRN window, 65536 x 16) a single conversation
-of **975,246 tokens** was admitted and then continued warm in place,
-with a 2.0 s time to first token and 453 tokens decoded at 88 ms per
-token at that depth, speculative decoding still accepting 63 percent
-of its drafts. The last ~30k tokens up to the absolute 1,048,576
-limit are not yet qualified.
+The window itself is now qualified to its edge: at `-c 1048576` (the
+checkpoint's exact YaRN window, 65536 x 16) a single prompt of
+**1,029,340 tokens** was ingested with a needle at 99.9% depth and
+retrieved exactly — on the default decode path and again with the
+accelerated attention path disabled, the fallback that previously
+truncated the deepest rows silently past 1,015,936 resident tokens.
+A 975,246-token conversation was separately admitted and continued
+warm in place, with a 2.0 s time to first token and 453 tokens
+decoded at 88 ms per token at that depth, speculative decoding still
+accepting 63 percent of its drafts. A bank persisted at exactly its
+token bound now restores cleanly across a restart.
 
 Two decisions cover most operator needs: the context limit `-c` (the
 per-request ceiling; prompt plus decode budget must fit under it) and
@@ -551,7 +555,7 @@ than refusing). The knobs:
 
 | Knob | Default | What it does and when to change it |
 |---|---|---|
-| `-c` / `--ctx` | `262144` on CUDA, `32768` on Metal/CPU (ds4-on-spark's `ds4-serve` passes `524288`) | The per-request context ceiling. Each request must fit its prompt plus its decode budget under this, or it gets a typed 400. Raise it for deeper documents (a 975k-token conversation at `-c 1048576` is the deepest proven); unused context is demand-mapped, so a deep ceiling costs almost nothing until a request fills it. |
+| `-c` / `--ctx` | `262144` on CUDA, `32768` on Metal/CPU (ds4-on-spark's `ds4-serve` passes `524288`) | The per-request context ceiling. Each request must fit its prompt plus its decode budget under this, or it gets a typed 400. Raise it for deeper documents (a 1,029,340-token prompt at `-c 1048576`, the model's full window, is the deepest proven); unused context is demand-mapped, so a deep ceiling costs almost nothing until a request fills it. |
 | `DS4_SERVER_COALESCE_MAX` | unset: sized from the live memory budget at boot — 32 through 16k context (the measured regime); above that, as many full-depth-fundable banks as the budget covers (floor 4, cap 32), priced at the same per-token rate admissions are charged. The boot ledger prints the arithmetic (`kv plan` line). Where no memory answer exists (Metal/CPU), a static halving ladder rules instead. | How many requests can hold warm context at once (the bank count). Set it (1..64) to override — an explicit value also disarms the budget sizing, so your number rules (e.g. more, shallower banks for high-concurrency batch work). Boot may still reduce the count to fit memory, never raise it, and it is fixed until restart. A request beyond the bank count evicts the least-recently-used idle bank. |
 | `--mem-floor-gb` (env `DS4_MEM_FLOOR_GB`) | `4` | The engine never admits work that would leave the system under this many GiB of free memory: it reclaims idle cache first and refuses with a typed error if that is not enough. Lower it (down to 1) on a dedicated serving box to fund more context; raise it on a machine you also work on. The boot planning headroom now derives from this floor plus a boot-burst margin (`DS4_BATCH_FIT_BURST_MB`, default 2048; boot line `batch fit headroom:`), so lowering the floor also returns planning margin to the fundable pool — `DS4_BATCH_FIT_HEADROOM_MB` pins the headroom outright, `DS4_BATCH_FIT_HEADROOM_DERIVED=0` restores the old static 6144. |
 | `max_tokens` (request field, not a flag) | `32768` assumed when the client omits it | The decode budget a request is charged at admission, on top of its prompt. Agents that omit it are charged the full 32768, so set it explicitly when a deep prompt must fit: prompt + `max_tokens` must stay under `-c`. An oversized value is clamped and reported as `length`, never an error. |

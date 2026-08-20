@@ -7,6 +7,20 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **The full 1,048,576-token window, qualified to the last token** —
+  the deepest ~32k tokens of the window (compressed rows past 7,936,
+  first crossed at 1,015,936 resident) previously rode a fixed-size
+  score buffer on the fallback decode paths: the head-group flash
+  kernel was skipped past the cap, a captured fallback froze its row
+  count and silently dropped the deepest rows on replay, and
+  substrate callers refused outright. The dispatch now tries the
+  uncapped head-group kernel first at depth and gives the online
+  fallback live per-request scalars, so every supported decode shape
+  serves the full window (audit Finding 1). An exactly-full persisted
+  bank also restores now instead of being rejected by an off-by-one
+  bound (Finding 2). Gate: tail-needle legs at 1,029,340 prompt tokens
+  (needle at 99.9% depth, retrieved exactly) on both the default and
+  forced-fallback paths, plus an exact-fill persist/restore leg.
 - **Think-dial observability** — serving log lines now carry
   `think=<none|low|high|max>` (the request's effort dial; the THINKING
   flag remains the live inside-think state), and the continuous lane
