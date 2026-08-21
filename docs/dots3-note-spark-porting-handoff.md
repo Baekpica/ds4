@@ -239,8 +239,50 @@ DS4_CUDA_WEIGHT_IPC_MANIFEST=$RUN/weights.manifest DS4_CUDA_WEIGHT_IPC_SCOPE=bas
 - 예상 1순위 후보: ① `dots3_latent_attention_kernel`(경합/점유율 미조정;
   full 레이어 decode에 motif처럼 split-K 변형 필요할 것) ② `dots3_idx_score`
   (블록당 32KB smem, 나이브 dot; 512K decode에서 layer당 ~4.3 GFLOP)
-  ③ value_project가 raw Q8 폴백(motif式 transposed 아티팩트를 dots3 형상
-  [512,32768]/[1024,20480]에 추가하면 개선) ④ aligned-Q8 owner 재검토.
+  ③ value_project raw Q8 폴백은 아래 §7.1에서 해소 ④ aligned-Q8 owner 재검토.
+
+### 7.1 2026-08-21 value-project transposed Q8 반영
+
+측정 기준은 `6500480`, aligned-Q8 VMM owner(`--reserve-gb 24`), 공식
+`modeling_dots3_note.py`의 고정 8192-token 입력과 greedy 64-token decode다.
+Solar worker/owner를 순서대로 내린 뒤 시작했고, 각 owner 전환마다
+`htop`/`nvtop`/`clear_cache`로 Compute PID 0과 118–119 GiB available을
+확인했다.
+
+- nsys: raw `motif3_value_project_q8_0_kernel<false,128>`가 전체 GPU kernel
+  시간의 29.7%(13.615 s / 3,128 launches)로 1위였다. 마지막 decode 창은
+  aligned dense vec 23.9%, full latent attention 22.1%, SWA latent attention
+  14.8% 순이었다.
+- owner 없는 4K-row production-shape fixture NCU: raw value projection
+  134.11 ms, SM/memory throughput 98.79%, L2 hit 98.06%, achieved occupancy
+  74.36%(register 제한). 풀모델 standalone NCU는 unified-memory OOM을
+  일으켰으므로 폐기했고, 이후 NCU는 16 GiB cgroup의 fixture만 사용한다.
+- 구현: 기존 Motif W_UV transposed artifact를 정확한 Dots3 full
+  `[512,32768]`와 SWA `[1024,20480]` 형상에만 확장했다. owner는 47개
+  artifact 399.50 MiB를 추가하며 raw fallback과 같은 scale/code를 쓴다.
+
+동일 owner 아래에서 구 바이너리(raw)와 새 바이너리(transposed)를
+교차하지 않고 연속 A/B했다.
+
+| 8K cell | raw A | transposed B | delta |
+|---|---:|---:|---:|
+| prefill run 1 | 215.92 tok/s | 280.88 tok/s | +30.1% |
+| prefill run 2 | 213.64 tok/s | 276.51 tok/s | +29.4% |
+| prefill mean | 214.78 tok/s | 278.70 tok/s | **+29.8%** |
+| decode | 11.55 tok/s | 11.86 tok/s | +2.7% |
+| decode steady | 11.67 tok/s | 11.98 tok/s | +2.7% |
+| first token | 0.1425 s | 0.1382 s | -3.0% |
+
+frontier logits는 비트 동일이 아니다. raw/B 모두 argmax 284이고,
+`rel_rms=5.934e-2`, `1-cos=1.631e-3`, max-abs 0.9435, top-3 동일,
+top-16 교집합 15/16이다. 이는 Q8 dot의 reduction 순서가 바뀐 결과다.
+이번 반영은 같은 argmax와 위 수치 오차를 성능과 함께 기록하며,
+bit-exact 주장은 하지 않는다.
+fixture는 Motif 기존 회귀와 Dots3 full/SWA transposed sample을 각각
+독립 FP32 dot과 비교한다. repack premapped, Dots3 loader/tokenizer,
+model-family kernel, MMQ parity, CUDA long-context 회귀도 통과했다. 추가
+최적화 사이클은 사용자 요청으로 중단했으며, 중단된 cycle-2 nsys
+산출물은 성능 근거로 사용하지 않는다.
 
 ## 8. 열린 경계 / 알려진 한계 (정직하게 유지할 것)
 

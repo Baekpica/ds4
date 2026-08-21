@@ -776,8 +776,8 @@ enum cuda_derived_kind {
      * (cuda_moe_q2k_derepack_scratch), and any remaining raw consumer falls
      * back to the client mmap. */
     CUDA_DERIVED_Q2_K_ALIGNED_MOE = 6,
-    /* Motif-3 MLA W_UV Q8_0: scales/codes transposed across its 128 value
-     * rows so a value-projection warp reads adjacent memory.  ADDITIVE. */
+    /* Motif-3/Dots3 MLA W_UV Q8_0: scales/codes transposed across its 128
+     * value rows so a value-projection warp reads adjacent memory. ADDITIVE. */
     CUDA_DERIVED_MOTIF3_KV_B_VALUE_Q8_0 = 7,
 };
 
@@ -34852,18 +34852,25 @@ extern "C" int ds4_gpu_motif3_value_project_q8_0_tensor(
         heads->bytes <
             (uint64_t)rows * q_heads * value_dim * sizeof(float)) return 0;
     const int tier = ds4_tensor_device_idx(heads);
-    constexpr uint64_t motif_scale_bytes = 16ull * 16ull * 128ull * 2ull;
-    constexpr uint64_t motif_code_bytes = 16ull * 16ull * 32ull * 128ull;
+    const uint64_t k_blocks = kv_latent_dim / 32u;
+    const uint64_t scale_bytes =
+        (uint64_t)kv_heads * k_blocks * value_dim * 2u;
+    const uint64_t code_bytes =
+        (uint64_t)kv_heads * k_blocks * 32u * value_dim;
     const bool motif_shape =
         kv_heads == 16u && q_heads == 80u && group_size == 5u &&
         kv_latent_dim == 512u && qk_nope == 128u && value_dim == 128u;
-    char *transposed = motif_shape
+    const bool dots_shape = group_size == 1u && q_heads == kv_heads &&
+        value_dim == 128u &&
+        ((kv_heads == 128u && kv_latent_dim == 512u && qk_nope == 128u) ||
+         (kv_heads == 64u && kv_latent_dim == 1024u && qk_nope == 192u));
+    char *transposed = (motif_shape || dots_shape)
         ? cuda_derived_weight_ptr(
               model_map, kv_b_offset, weight_bytes,
               CUDA_DERIVED_MOTIF3_KV_B_VALUE_Q8_0,
               kv_latent_dim, weight_rows, 1u,
-              motif_scale_bytes + motif_code_bytes,
-              "Motif-3 latent V transposed Q8_0")
+              scale_bytes + code_bytes,
+              "MLA latent V transposed Q8_0")
         : NULL;
     dim3 grid(q_heads, rows, 1);
     if (transposed) {
@@ -34872,14 +34879,14 @@ extern "C" int ds4_gpu_motif3_value_project_q8_0_tensor(
                 <<<grid, 128, (size_t)kv_latent_dim * sizeof(float)>>>(
                     (float *)heads->ptr, (const float *)latent->ptr,
                     (const __half *)transposed,
-                    (const int8_t *)(transposed + motif_scale_bytes),
+                    (const int8_t *)(transposed + scale_bytes),
                     rows, q_heads, group_size, kv_latent_dim, value_dim);
         else
             motif3_value_project_q8_0_transposed_kernel<false>
                 <<<grid, 128, (size_t)kv_latent_dim * sizeof(float)>>>(
                     (float *)heads->ptr, (const float *)latent->ptr,
                     (const __half *)transposed,
-                    (const int8_t *)(transposed + motif_scale_bytes),
+                    (const int8_t *)(transposed + scale_bytes),
                     rows, q_heads, group_size, kv_latent_dim, value_dim);
         return cuda_ok(cudaGetLastError(),
                        "Motif-3 transposed latent V projection launch");

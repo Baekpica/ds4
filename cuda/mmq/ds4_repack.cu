@@ -766,21 +766,20 @@ __global__ static void repack_q8_0_aligned_kernel(
     memcpy(qs + blk * 32ull + p * 16ull, src + 2u + p * 16ull, 16u);
 }
 
-/* Motif-3 W_UV layout.  The raw kv_b tensor is [4096 rows, K=512] Q8_0,
- * with 16 KV heads and [128 K rows, 128 V rows] per head.  A value-project
- * warp owns consecutive V rows, so row-major raw codes make its lanes read
- * 544 bytes apart.  Reorder only the V half as:
+/* Motif-3/Dots3 W_UV layout.  A value-project warp owns consecutive V rows,
+ * so row-major raw codes make its lanes read hundreds of bytes apart.
+ * Reorder only the V half as:
  *   half scale[kv_head][k_block][value_dim]
  *   int8 code[kv_head][k_block][k_in_block][value_dim]
  * preserving every Q8 scale/code and the consumer's accumulation order. */
 __global__ static void repack_motif3_kv_b_value_q8_0_kernel(
         __half *scale,
         int8_t *code,
-        const unsigned char *raw) {
-    constexpr uint32_t kv_heads = 16u;
-    constexpr uint32_t qk_nope = 128u;
+        const unsigned char *raw,
+        uint32_t kv_heads,
+        uint32_t qk_nope,
+        uint32_t k_blocks) {
     constexpr uint32_t value_dim = 128u;
-    constexpr uint32_t k_blocks = 16u;
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint64_t n = (uint64_t)kv_heads * k_blocks * value_dim;
     if (gid >= n) return;
@@ -887,17 +886,36 @@ bool ds4_repack_q8_f16_candidate(const ds4_repack_tensor &t) {
     return t.name.find("attn_output_a.weight") != std::string::npos;
 }
 
-/* Motif-3 MLA W_UV candidates.  Keep this exact and model-local: the layout
- * below depends on Motif-3's 16 KV heads, 512 latent columns and interleaved
- * [128 absorbed-key rows, 128 value rows] per KV head. */
-bool ds4_repack_motif3_kv_b_value_candidate(const ds4_repack_tensor &t) {
+static bool repack_mla_kv_b_value_shape(
+        const ds4_repack_tensor &t,
+        uint32_t *kv_heads_out,
+        uint32_t *qk_nope_out) {
     if (t.type != 8u || t.ndim != 2u) return false; /* GGML_TYPE_Q8_0 */
-    if (t.dims[0] != 512u || t.dims[1] != 4096u) return false;
-    if (t.bytes != (512ull / 32ull) * 4096ull * 34ull) return false;
+    uint32_t kv_heads = 0u;
+    uint32_t qk_nope = 0u;
+    if (t.dims[0] == 512u && t.dims[1] == 4096u) {
+        kv_heads = 16u; qk_nope = 128u;       /* Motif-3 */
+    } else if (t.dims[0] == 512u && t.dims[1] == 32768u) {
+        kv_heads = 128u; qk_nope = 128u;      /* Dots3 full attention */
+    } else if (t.dims[0] == 1024u && t.dims[1] == 20480u) {
+        kv_heads = 64u; qk_nope = 192u;       /* Dots3 SWA */
+    } else {
+        return false;
+    }
+    if (t.bytes != (t.dims[0] / 32u) * t.dims[1] * 34u) return false;
     static const char sfx[] = ".attn_kv_b.weight";
     const size_t n = t.name.size();
     const size_t sl = sizeof(sfx) - 1u;
-    return n > sl && t.name.compare(n - sl, sl, sfx) == 0;
+    if (n <= sl || t.name.compare(n - sl, sl, sfx) != 0) return false;
+    if (kv_heads_out) *kv_heads_out = kv_heads;
+    if (qk_nope_out) *qk_nope_out = qk_nope;
+    return true;
+}
+
+/* Keep the admitted geometries exact: the artifact layout depends on the
+ * model family's interleaved [absorbed-key rows, 128 value rows] grouping. */
+bool ds4_repack_motif3_kv_b_value_candidate(const ds4_repack_tensor &t) {
+    return repack_mla_kv_b_value_shape(t, nullptr, nullptr);
 }
 
 /* ---- S5 parallel repack driver -------------------------------------------
@@ -1188,13 +1206,7 @@ bool ds4_repack_build_motif3_kv_b_value(
         const ds4_repack_build_args &a,
         std::vector<ds4_repack_artifact> &out,
         uint64_t *repacked_bytes_out) {
-    constexpr uint64_t kv_heads = 16u;
-    constexpr uint64_t k_blocks = 16u;
     constexpr uint64_t value_dim = 128u;
-    constexpr uint64_t scale_bytes = kv_heads * k_blocks * value_dim * 2u;
-    constexpr uint64_t code_bytes =
-        kv_heads * k_blocks * 32u * value_dim;
-    constexpr uint64_t art_bytes = scale_bytes + code_bytes;
 
     if (repacked_bytes_out) *repacked_bytes_out = 0;
     ds4_repack_file m;
@@ -1204,7 +1216,8 @@ bool ds4_repack_build_motif3_kv_b_value(
     std::vector<repack_job> jobs;
     bool ok = true;
     for (const ds4_repack_tensor &t : *a.records) {
-        if (!ds4_repack_motif3_kv_b_value_candidate(t)) continue;
+        uint32_t kv_heads = 0u;
+        if (!repack_mla_kv_b_value_shape(t, &kv_heads, nullptr)) continue;
         if (t.off > m.size || t.bytes > m.size - t.off) {
             fprintf(stderr,
                     "%s: Motif-3 kv_b value repack skipped %s: source range mismatch\n",
@@ -1216,7 +1229,8 @@ bool ds4_repack_build_motif3_kv_b_value(
         j.chunk = t.bytes;
         j.art.t = &t;
         j.art.kind = DS4_REPACK_MOTIF3_KV_B_VALUE_Q8_0;
-        j.art.bytes = art_bytes;
+        const uint64_t k_blocks = t.dims[0] / 32u;
+        j.art.bytes = kv_heads * k_blocks * value_dim * 34u;
         j.art.in_dim = t.dims[0];
         j.art.out_dim = t.dims[1];
         j.art.group_count = 1u;
@@ -1235,17 +1249,24 @@ bool ds4_repack_build_motif3_kv_b_value(
                      unsigned char *stage, uint64_t stage_bytes,
                      unsigned char *scratch) -> bool {
         const ds4_repack_tensor &t = *j.art.t;
+        uint32_t kv_heads = 0u;
+        uint32_t qk_nope = 0u;
+        if (!repack_mla_kv_b_value_shape(t, &kv_heads, &qk_nope)) return false;
         if (!repack_read_upload(a.log_prefix, m, "Motif-3 kv_b value", t,
                                 stage, stage_bytes, scratch, 0u, t.bytes,
                                 stream)) {
             return false;
         }
+        const uint64_t k_blocks = t.dims[0] / 32u;
+        const uint64_t scale_bytes =
+            (uint64_t)kv_heads * k_blocks * value_dim * 2u;
         __half *scale = (__half *)j.art.dev;
         int8_t *code = (int8_t *)((char *)j.art.dev + scale_bytes);
-        constexpr uint64_t n = kv_heads * k_blocks * value_dim;
+        const uint64_t n = (uint64_t)kv_heads * k_blocks * value_dim;
         repack_motif3_kv_b_value_q8_0_kernel
             <<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(
-                scale, code, scratch);
+                scale, code, scratch, kv_heads, qk_nope,
+                (uint32_t)k_blocks);
         cudaError_t err = cudaGetLastError();
         if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess) {

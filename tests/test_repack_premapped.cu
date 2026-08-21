@@ -141,6 +141,27 @@ static int test_q8_candidate_shapes() {
     if (ds4_repack_q8_candidate(tiny)) {
         return fail("tiny K=128 Q8 tensor should not allocate an artifact");
     }
+
+    ds4_repack_tensor kv_b;
+    kv_b.name = "blk.1.attn_kv_b.weight";
+    kv_b.type = 8u;
+    kv_b.ndim = 2u;
+    kv_b.dims[0] = 512u;
+    kv_b.dims[1] = 32768u;
+    kv_b.bytes = (kv_b.dims[0] / 32u) * kv_b.dims[1] * 34u;
+    if (!ds4_repack_motif3_kv_b_value_candidate(kv_b)) {
+        return fail("Dots3 full kv_b was not a transposed-value candidate");
+    }
+    kv_b.dims[0] = 1024u;
+    kv_b.dims[1] = 20480u;
+    kv_b.bytes = (kv_b.dims[0] / 32u) * kv_b.dims[1] * 34u;
+    if (!ds4_repack_motif3_kv_b_value_candidate(kv_b)) {
+        return fail("Dots3 SWA kv_b was not a transposed-value candidate");
+    }
+    kv_b.dims[1]++;
+    if (ds4_repack_motif3_kv_b_value_candidate(kv_b)) {
+        return fail("unknown kv_b geometry should not allocate an artifact");
+    }
     std::puts("q8 aligned candidate shapes: ok");
     return 0;
 }

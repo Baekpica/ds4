@@ -588,6 +588,8 @@ static void test_gdla(const char *dir) {
 static void test_latent_gdla() {
     const char *profile_rows_env = std::getenv("DS4_MOTIF3_PROFILE_ROWS");
     const char *dots_profile = std::getenv("DS4_DOTS3_PROFILE_ATTN");
+    const bool profile_transposed =
+        std::getenv("DS4_DOTS3_PROFILE_TRANSPOSED") != nullptr;
     const bool dots_full = dots_profile && !std::strcmp(dots_profile, "full");
     const bool dots_swa = dots_profile && !std::strcmp(dots_profile, "swa");
     const bool dots_dsa = dots_profile && !std::strcmp(dots_profile, "dsa");
@@ -686,8 +688,9 @@ static void test_latent_gdla() {
     kv_b_record.dims[1] = weight_rows;
     kv_b_record.offset = 0u;
     kv_b_record.bytes = model.size();
-    if (!dots_profile && ds4_gpu_build_derived_artifacts_from_records(
-            model.data(), model.size(), &kv_b_record, 1u) != 1) {
+    if ((!dots_profile || profile_transposed) &&
+        ds4_gpu_build_derived_artifacts_from_records(
+            model.data(), model.size(), &kv_b_record, 1u) < 1) {
         fprintf(stderr, "could not build Motif kv_b value artifact\n");
         std::exit(1);
     }
@@ -806,6 +809,33 @@ static void test_latent_gdla() {
         if (!ds4_gpu_tensor_read(heads.p, 0, &sync, sizeof(sync)) || !std::isfinite(sync)) {
             fprintf(stderr, "latent GDLA profile synchronization failed\n");
             std::exit(1);
+        }
+        if (profile_transposed && rows <= 16u) {
+            const auto latent_host = download_f32(
+                latent_out, (uint64_t)rows * q_heads * latent_dim);
+            const auto heads_host = download_f32(
+                heads, (uint64_t)rows * q_heads * value_dim);
+            const uint32_t sample_t[] = {0u, rows - 1u, rows - 1u};
+            const uint32_t sample_h[] = {0u, q_heads / 2u, q_heads - 1u};
+            const uint32_t sample_d[] = {0u, 63u, 127u};
+            float got[3] = {};
+            float want[3] = {};
+            for (uint32_t i = 0; i < 3u; i++) {
+                const uint32_t t = sample_t[i];
+                const uint32_t h = sample_h[i];
+                const uint32_t d = sample_d[i];
+                const uint32_t kh = h / group;
+                const float *src = latent_host.data() +
+                    ((uint64_t)t * q_heads + h) * latent_dim;
+                for (uint32_t j = 0; j < latent_dim; j++) {
+                    want[i] += src[j] * weight(
+                        kh * (qk_nope + value_dim) + qk_nope + d, j);
+                }
+                got[i] = heads_host[
+                    ((uint64_t)t * q_heads + h) * value_dim + d];
+            }
+            assert_close("CUDA Dots transposed value samples",
+                         got, want, 3u, 2e-4f, 2e-4f);
         }
         if (dots_dsa) {
             auto ref = download_f32(
@@ -1400,6 +1430,11 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (!ds4_gpu_init()) { fprintf(stderr, "CUDA init failed\n"); return 1; }
+    if (std::getenv("DS4_DOTS3_PROFILE_ATTN")) {
+        test_latent_gdla();
+        ds4_gpu_cleanup();
+        return 0;
+    }
     if (std::getenv("DS4_MOTIF3_PROFILE_FATTN")) {
         test_fattn_profile();
         ds4_gpu_cleanup();
