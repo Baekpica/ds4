@@ -226,13 +226,14 @@ Speed of Light (승자 CTA):
 사이클 6 반영 (FATTN HMMA TK=32). Owner는 tmux `motif3-v062-owner`에
 살아 있음. ncu를 하려면 먼저 이 owner를 내리고 `clear_cache`할 것.
 
-1. Q8 dense vec occupancy / HG L1TEX / FATTN TK=64 / Motif GQA-pair는
-   닫힘. ncu는 마이크로벤치만.
-2. 다음 후보: prefill q8 pair (전체 12.4%), 또는 shexp-down
-   `K=1280` aligned 확장(decode ~1.8%, owner artifact 재빌드).
+1. Q8 dense vec occupancy / HG L1TEX / FATTN TK=64 / Motif GQA-pair /
+   Q8 pair tok8 타일은 닫힘. ncu는 마이크로벤치만. 합성 +38%가
+   엔진 TU e2e에서 −6%가 됐다.
+2. 다음 후보: shexp-down `K=1280` aligned 확장(decode ~1.8%,
+   owner artifact 재빌드), 또는 256K 센티널.
 3. 최종 게이트: 가능하면 256K 센티널. 문서 → 커밋 → `HEAD:dfm`.
-   모델 카드에는 검증된 숫자만. 사이클 5–6 숫자를 새 published 8K로
-   올리지 말 것 — 256K 미검증.
+   태그 `v0.6.2-dfm`은 통합 컷에 고정. 모델 카드 8K/32K remesure는
+   `a09ff4f` 기준이며 256K는 재측정하지 않음.
 
 ## 8. 재개 명령
 

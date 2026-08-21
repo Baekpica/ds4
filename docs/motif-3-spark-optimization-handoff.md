@@ -268,6 +268,23 @@ prefill 546.7 / decode 12.8). CSV:
 다음 후보: q8 pair prefill (전체 12.4%), shexp-down K=1280 aligned
 (decode ~1.8%, owner artifact 재빌드), 가능하면 256K 센티널.
 
+### §A.12 사이클 7 — Q8 pair tok8 타일 (원복)
+
+가설: coalesced pair가 토큰마다 weight row를 재독한다. 합성
+(`scratch/motif3-opt-v062/bench-q8-pair.cu`, shexp M=1280 K=4096 N=4096)
+에서 TOK=8이 **+38.5%**, rms 0. TOK=16은 스필로 손해. dense
+M=12288는 기존 `max_out<=2048` 캡이 맞고 coalesced가 stride보다
+느리다.
+
+엔진 이식 후 e2e는 반대: 8K prefill 627.19→587.74, 32K
+545.62→515.07. 대형 `ds4_cuda.cu` TU에서 레지스터/점유율이
+합성 벤치와 달랐다. 커널은 사이클 6 상태로 원복, 8K 재측정
+625.45(밴드 복귀), `test-motif3-cuda` 통과. Q8 pair 토큰 타일은
+닫힌 길.
+
+다음 후보: shexp-down `K=1280` aligned (owner artifact 재빌드),
+또는 256K 센티널. 풀모델 ncu 금지.
+
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
 Solar와 K-EXAONE은 2-bank continuous 요청, DeepSeek은 DSpark 자동 부착,
