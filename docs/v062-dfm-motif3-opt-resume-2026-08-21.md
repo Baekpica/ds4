@@ -15,9 +15,9 @@ Entrpi `v0.6.2` 흡수와 `v0.6.2-dfm` 태그는 끝났고, Motif nsys→A/B 사
 재부팅했다. 지금 호스트는 클린(118 GiB available, GPU 프로세스 0).
 HG16 마이크로벤치 ncu는 유효하고, fattn 풀모델 ncu는 실패했다.
 
-목표(원본 `/goal`)는 아직 끝나지 않았다. 사이클 1–3·5는 반영,
-사이클 4는 원복. 남은 것은 여지 소진(prefill fattn 등)과
-가능하면 256K 센티널, 그리고 최종 문서 게이트다.
+목표(원본 `/goal`)는 아직 끝나지 않았다. 사이클 1–3·5·6은 반영,
+사이클 4는 원복. 남은 것은 q8-pair / shexp-down 또는 닫힌 길
+기록, 가능하면 256K 센티널, 그리고 최종 문서 게이트다.
 
 ## 1. 원본 목표 (축소 금지)
 
@@ -223,15 +223,15 @@ Speed of Light (승자 CTA):
 
 ## 7. 다음에 할 일 (순서 고정)
 
-사이클 5 반영 (HG16 cp.async BF16 더블버퍼). Owner는 tmux
-`motif3-v062-owner`에 살아 있음. ncu를 하려면 먼저 이 owner를 내리고
-`clear_cache`할 것.
+사이클 6 반영 (FATTN HMMA TK=32). Owner는 tmux `motif3-v062-owner`에
+살아 있음. ncu를 하려면 먼저 이 owner를 내리고 `clear_cache`할 것.
 
-1. Q8 dense vec occupancy는 닫힘 (253–270 GB/s). ncu는 마이크로벤치만.
-2. HG L1TEX hide는 반영. 다음 후보는 prefill fattn/q8-pair, 또는
-   shexp-down `K=1280` aligned 확장(decode ~1.8%, owner artifact 재빌드).
+1. Q8 dense vec occupancy / HG L1TEX / FATTN TK=64 / Motif GQA-pair는
+   닫힘. ncu는 마이크로벤치만.
+2. 다음 후보: prefill q8 pair (전체 12.4%), 또는 shexp-down
+   `K=1280` aligned 확장(decode ~1.8%, owner artifact 재빌드).
 3. 최종 게이트: 가능하면 256K 센티널. 문서 → 커밋 → `HEAD:dfm`.
-   모델 카드에는 검증된 숫자만. 사이클 5 숫자를 새 published 8K로
+   모델 카드에는 검증된 숫자만. 사이클 5–6 숫자를 새 published 8K로
    올리지 말 것 — 256K 미검증.
 
 ## 8. 재개 명령

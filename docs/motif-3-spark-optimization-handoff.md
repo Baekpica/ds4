@@ -229,6 +229,45 @@ prefill 519.4 / decode 12.7). CSV:
 +18%, 8K decode **+20.5%** (12.62→15.21), 32K decode **+34.5%**
 (9.68→13.02).
 
+### §A.11 사이클 6 — Motif FATTN HMMA TK=32 (반영)
+
+재-nsys 전체 76 s의 1위는 `motif3_fattn_hmma` 18.4%. 출하 TK=16은
+K 타일마다 syncthreads. 합성 벤치
+(`scratch/motif3-opt-v062/bench-fattn-tk.cu`, owner 유지):
+
+| shape | TK16 | TK32 | Δ | TK16 vs TK32 rms |
+|---|---:|---:|---:|---|
+| chunk-4k (qpos0=0) | 10.15 ms | 8.99 ms | +12.9% | 0 |
+| late-16k | 79.86 ms | 62.41 ms | +28.0% | 0 |
+| late-32k | 185.57 ms | 141.54 ms | **+31.1%** | 0 |
+| SWA late (win=129) | 3.22 ms | 3.09 ms | +4.2% | — |
+
+TK=64는 3-CTA 예산을 깨고 전부 손해. GQA 80/16=5라 Solar식
+2-head pair는 홀수 그룹 + 256-thread CTA가 이미 TK16보다 느림
+(닫힘). 엔진은 `M3_FA_TK=32`, consume를 16-key 스텝 2회로 유지,
+`__launch_bounds__(128, 3)` 유지 (~21 KiB smem).
+
+full-model A/B (owner 동일 세션, c5 바이너리 재측정):
+
+| cell | c5 | TK32 | Δ |
+|---|---:|---:|---:|
+| 8K prefill | 616.27 | **627.19** | +1.8% |
+| 32K prefill | 519.57 | **545.62** | **+5.0%** |
+| 8K decode | 15.21 | 15.06 | 불변(노이즈) |
+| 32K decode | 13.00 | 12.95 | 불변 |
+
+정합성: `test-motif3-cuda` 통과, 32K 센티널 **ALL-EXACT** (HTTP
+prefill 546.7 / decode 12.8). CSV:
+`scratch/motif3-opt-v062/logs/fattn-tk32-*.csv`,
+`logs/c5-recheck-32k.csv`, `logs/sent-fattn-tk32.txt`.
+
+시작점 대비 누적: 8K prefill **+21%** (519.9→627.2), 32K prefill
+**+23%** (445.0→545.6). decode는 사이클 5와 동일 밴드. 이 숫자를
+새 published 8K로 올리지 말 것 — 256K 미검증.
+
+다음 후보: q8 pair prefill (전체 12.4%), shexp-down K=1280 aligned
+(decode ~1.8%, owner artifact 재빌드), 가능하면 256K 센티널.
+
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
 Solar와 K-EXAONE은 2-bank continuous 요청, DeepSeek은 DSpark 자동 부착,

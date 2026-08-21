@@ -608,7 +608,7 @@ enum {
     M3_FA_WQ     = 16,
     M3_FA_WARPS  = 4,
     M3_FA_TQ     = M3_FA_WQ * M3_FA_WARPS,
-    M3_FA_TK     = 16,
+    M3_FA_TK     = 32,
     M3_FA_PAD    = 8,
     M3_FA_QK_ROW = M3_FA_QK + M3_FA_PAD,
     M3_FA_V_ROW  = M3_FA_V + M3_FA_PAD,
@@ -625,7 +625,9 @@ typedef tile<16, 8, float> motif_tile_c;
  * cache is required. */
 /* GB10 has 100 KiB shared / SM. Staging Q+K+V was 36 KiB and capped the
  * kernel at two CTAs; Q already lives in qa[] for the whole K walk, so
- * loading it once from global frees enough shared memory for three CTAs. */
+ * loading it once from global frees enough shared memory for three CTAs.
+ * TK=32 (two 16-key consume steps) stays under the 3-CTA budget (~21 KiB);
+ * TK=64 drops to two CTAs and is slower on the late-chunk Motif walk. */
 __global__ __launch_bounds__(M3_FA_WARPS * 32, 3)
 void motif3_fattn_hmma_kernel(
         float * __restrict__ heads,
@@ -745,6 +747,9 @@ void motif3_fattn_hmma_kernel(
             }
             __syncthreads();
 
+#pragma unroll
+            for (int step = 0; step < M3_FA_TK / 16; step++) {
+            const uint32_t kbase = (uint32_t)step * 16u;
             motif_tile_c scores[2];
 #pragma unroll
             for (int nb = 0; nb < 2; nb++) {
@@ -758,7 +763,7 @@ void motif3_fattn_hmma_kernel(
                         const int i = (int)(lane / 4);
                         const int j = l * 4 + (int)(lane % 4);
                         keys.x[l] = *(const nv_bfloat162 *)&s_k[
-                            nb * 8 + i][kc * 16 + 2 * j];
+                            kbase + nb * 8 + i][kc * 16 + 2 * j];
                     }
                     mma(scores[nb], qa[kc], keys);
                 }
@@ -771,7 +776,7 @@ void motif3_fattn_hmma_kernel(
                 for (int l = 0; l < motif_tile_c::ne; l++) {
                     const int r = l / 2;
                     const uint32_t p =
-                        kt0 + nb * 8u + (lane % 4u) * 2u + (l % 2u);
+                        kt0 + kbase + nb * 8u + (lane % 4u) * 2u + (l % 2u);
                     float score = scores[nb].x[l] * scale;
                     if (!alive[r] || p > qpos[r] ||
                         (window > 0u && p + window <= qpos[r]) ||
@@ -840,10 +845,11 @@ void motif3_fattn_hmma_kernel(
                     const int i = (int)(lane / 4);
                     const int j = l * 4 + (int)(lane % 4);
                     values.x[l] = __halves2bfloat162(
-                        s_v[2 * j][cb * 8 + i],
-                        s_v[2 * j + 1][cb * 8 + i]);
+                        s_v[kbase + 2 * j][cb * 8 + i],
+                        s_v[kbase + 2 * j + 1][cb * 8 + i]);
                 }
                 mma(output[cb], probabilities, values);
+            }
             }
             __syncthreads();
         }
