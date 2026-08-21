@@ -5,8 +5,16 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
-## Unreleased
+## v0.6.3 — 2026-08-21
 
+- **Numerics note** — the decode-dispatch change in the full-window
+  work (below) shifts some temperature-0 generation trajectories: the
+  frozen eval battery holds quality parity (needle retrieval perfect
+  at every depth, code suites exact, everything else within the ±1
+  band; receipts in the release notes), while benchmark scores that
+  hinge on a handful of long scenarios can move a few points between
+  kernel paths. Tool-eval-bench restamps at 83/100/82/80 on this
+  lineage.
 - **Best-fit trim victims** — admission-pressure reclaim used to
   walk victims purely in recency order, so a deep trunk could die
   for a deficit a small idle bank would have covered (measured:
