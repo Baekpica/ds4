@@ -1,7 +1,123 @@
 # Motif-3 DGX Spark 최적화 작업 handoff
 
 기준 시각: **2026-08-14 17:02 KST** (재개 세션 진행 내역은 §0에 누적;
-후속 재개 결과는 §0.26까지 반영)
+후속 재개 결과는 §0.26까지 반영; **v0.6.2-dfm 최적화 세션은 §A에 누적**)
+
+## §A. v0.6.2-dfm 최적화 세션 (2026-08-21 KST)
+
+전제: Entrpi `v0.6.2` 흡수 후 `v0.6.2-dfm` 태그 publish 완료. 이 세션의
+목표는 (1) 깊은 컨텍스트에서 prefill/decode가 급락하는 현상의 완화(에이전트
+활용 시나리오), (2) 절대 속도 향상. 모든 측정은 GB10 (driver 610.43.02,
+CUDA 13.3, sm_121a), MQ87-88 병합 GGUF, aligned-Q8 VMM owner
+(`--reserve-gb 24`), `context-32768.txt` 코퍼스, greedy·no-think 조건.
+
+### §A.0 v0.6.2-dfm 베이스라인 (merge 직후, 70d5823)
+
+| cell | prefill tok/s | decode tok/s |
+|---|---:|---:|
+| 8K prefill ×2 | 519.90 / 518.02 | — |
+| 8K decode(64) | 515.84 | 12.62 |
+| 32K decode(64) | 445.03 | 9.68 |
+
+v0.6.0-dfm 리메저 밴드(520.39/516.83, 12.24)와 동일 — merge 성능 회귀 없음.
+
+### §A.1 nsys 32K decode-window 분해 (gen 128, GPU busy 96.6%)
+
+sqlite에서 마지막 13.0 s(decode 창)만 집계:
+
+| % | kernel | 성격 |
+|---:|---|---|
+| 32.0 | `motif3_latent_attention_bf16_decode_hg_partial` | **깊이 비례** (14 full layers × 10 head-group KV 재독) |
+| 18.9 | `q8_0_aligned_dense_vec` | dense Q8 matvec, roofline 근접 |
+| 22.5 | `mul_mat_q` ×2 (MoE gate/up + down) | roofline 대비 ~2배 여지 |
+| 4.2 | rms_norm_weight | 157회/token |
+| 3.3/3.2/2.0 | qk_absorb / q8 pair / value_project | — |
+
+decode 103.5 ms/token 중 attention ≈ 33 ms가 유일한 depth-linear 항 —
+256K에서 ~8× 성장해 지배(공개 2.52 tok/s의 실체).
+
+### §A.2 사이클 1 — latent flash-decode head-group 확장 (d03bd89, 반영)
+
+원인: 80 heads / 8 heads-per-CTA = 10그룹이 latent 링을 각각 재독 +
+CTA당 8-row 타일 직렬 barrier 체인. 마이크로벤치 스캔
+(`scratch/motif3-opt-v062/bench-hg-scan.cu`, 합성 80-head fixture)에서
+(warp당 2 heads × 8 warps = 16 heads/CTA, 16-row 타일, split =
+visible/4096 clamp [32,64])이 8K/32K/256K에서 2.03x/1.84x/2.15x,
+출력 rel_rms ~1e-6 (split-order 재결합).
+
+full-model A/B (owner 동일 세션):
+
+| cell | base | HG16 | Δ |
+|---|---:|---:|---:|
+| 8K decode | 12.62 | 13.14 | +4.1% |
+| 32K decode | 9.68 | **11.28** | **+16.5%** |
+| 8K/32K prefill | 519.9/445.0 | 519.6/445.0 | 불변 |
+
+정합성: 8K frontier logits **비트 동일**(prefill 무변경 확인),
+Motif CUDA fixture 6그룹 통과, 32K OpenAI Chat 센티널 게이트
+**3/3 exact** (HTTP decode 11.2 tok/s; 공개 시절 8.96 대비 +25%).
+greedy 텍스트는 base 대비 토큰 수준 분기 — softmax 분할 순서 변경의
+예상 드리프트(과거 FATTN occupancy/absorb 최적화와 동일 클래스)로,
+게이트 기준은 센티널 정확성이다.
+
+### §A.3 사이클 2 — SWA prefill의 expanded/HMMA 라우팅 (진행 중)
+
+nsys prefill 분해(32K, 74.6 s): fattn_hmma 15.7%, q8 pair 12.3%,
+value_project 8.7%(대부분 SWA latent 경로), gateup_iq2 8.1%, SWA latent
+generic ~6.5%, f32_to_bf16 5.4%(43,884회), qk_absorb 4.5%, round_bf16
+3.2%(66,650회). SWA prefill이 latent 경로(rows×80 heads의 W_UV 사영)로
+지불하는 ~15%를, window 지원이 이미 있는 HMMA FATTN
+(`ds4_mmq_motif3_prefill_attn_hmma`)으로 회수한다. 구현:
+`expanded_attention_range`에 window 관통, SWA 프리픽스는 ring 랩 기준
+최대 2개 선형 슬롯 세그먼트로 분할해 기존 load/kv_b/prepare/merge
+시퀀스 재사용, FATTN epilogue가 빈 쿼리 행에 0/-inf 중립 partial을
+기록하도록 수정(스테일 merge 방지).
+
+결과 (b0db5a1, 반영):
+
+| cell | 사이클1 후 | 사이클2 후 | Δ |
+|---|---:|---:|---:|
+| 8K prefill | 519.6 | **620.9 / 620.0** | +19.5% |
+| 32K prefill | 445.0 | **526.6** | +18.3% |
+| 8K/32K decode | 13.14 / 11.28 | 13.14 / 11.27 | 불변 |
+
+32K 센티널 게이트 3/3 exact, TTFT 73.4→62.8 s. Motif CUDA fixture
+(공식 expanded GDLA 대조 포함)·model-family kernels 통과. 8K frontier
+logits는 rel_rms 1.4e-1로 이동(argmax·top-4 불변) — SWA prefill이
+absorbed-latent 반올림 경계 대신 공식 expanded 경계를 갖게 된 결과로,
+full 레이어가 이미 채택한 것과 같은 트레이드다.
+
+### §A.4 사이클 3 — MoE 디코드의 D2R 스케줄 편입 (진행 중)
+
+nsys 디코드 창에서 MoE `mul_mat_q`(gate/up+down)가 22.5%로, roofline
+추정(~10.8 ms/token) 대비 ~2배. 원인: SoA D2R MoE 커널은 존재하지만
+`d2r_min_cols()` 기본 1024 게이트에 걸려 디코드(8 assignments)가 classic
+MMQ 타일로 낙하. env probe(`DS4_MMQ_D2R_MIN_COLS=1`):
+
+| cell | 기본 | D2R 강제 | Δ |
+|---|---:|---:|---:|
+| 8K decode | 13.14 | **15.06** | +14.6% |
+| 32K decode | 11.27 | **12.66** | +12.3% |
+| prefill | 620/527 | 619/521 | ~불변 |
+
+반영: 공유 기본값(1024, DeepSeek prefill 믹스 기준)을 옮기지 않고, SoA
+MoE 엔트리 2종에 명시적 `d2r_ncols_floor` 파라미터(0=기존 정책)를 추가해
+Motif 라우티드 디스패치만 8을 전달. 타 패밀리·DeepSeek 호출부는 0으로
+무변경. 반영 A/B: 8K decode 15.10 / 32K decode 12.73 tok/s (probe 재현),
+prefill 불변, 32K 센티널 3/3 exact (HTTP decode 12.5), mmq-parity·CUDA
+fixture·family kernels 통과. 커밋 완료.
+
+### §A.5 3사이클 누적 (v0.6.2-dfm 베이스라인 대비)
+
+| cell | 베이스라인 | 3사이클 후 | 누적 Δ |
+|---|---:|---:|---:|
+| 8K prefill | 519.9 | ~620 | **+19%** |
+| 32K prefill | 445.0 | 524.9 | **+18%** |
+| 8K decode | 12.62 | 15.10 | **+19.6%** |
+| 32K decode | 9.68 | 12.73 | **+31.5%** |
+
+깊이 축: 32K decode 개선폭(+31.5%)이 8K(+19.6%)보다 커 깊이-감쇠가
+완화됨(HG16의 depth-linear 항 절반). 256K 검증은 최종 게이트에서.
 
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
