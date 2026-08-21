@@ -27842,7 +27842,8 @@ extern "C" int ds4_gpu_routed_gate_up_tensor(
                     (const float *)x->ptr, (const int32_t *)ids->ptr,
                     (float *)gate->ptr, (float *)up->ptr,
                     (int)out_dim, (int)in_dim, (int)n_tokens,
-                    (int)n_expert, (int)n_expert_used, stream);
+                    (int)n_expert, (int)n_expert_used,
+                    /*d2r_ncols_floor=*/0, stream);
         }
         if (rc == 0) {
             static int logged = 0;
@@ -31824,6 +31825,7 @@ mmq_moe_path:
                                                   (int)expert_mid_dim, (int)expert_in_dim,
                                                   (int)n_tokens, (int)n_experts_total,
                                                   (int)n_expert_used,
+                                                  /*d2r_ncols_floor=*/0,
                                                   /*stream=*/ds4_mmq_stream_for_call());
                 pair_done = (rc == 0);
                 if (!pair_done) {
@@ -31898,6 +31900,7 @@ mmq_moe_path:
                                           (float *)down->ptr,
                                           (int)out_dim, (int)expert_mid_dim,
                                           (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1,
+                                          /*d2r_ncols_floor=*/0,
                                           /*stream=*/ds4_mmq_stream_for_call());
                 down_done = (rc == 0);
                 if (!down_done) {
@@ -33060,7 +33063,10 @@ extern "C" int ds4_gpu_motif3_routed_moe_batch_tensor(
             (float *)gate->ptr, (float *)up->ptr,
             (int)expert_mid_dim, (int)expert_in_dim,
             (int)n_tokens, (int)n_total_expert,
-            (int)n_expert_used, stream)
+            /* Motif decode (8 assignments) measures 13.14 -> 15.06 tok/s
+             * at 8K on the D2R schedule; prefill shapes sit far above
+             * either floor, so this only moves the decode engagement. */
+            (int)n_expert_used, /*d2r_ncols_floor=*/8, stream)
         : ds4_mmq_iq2_xxs_moe_pair(
             gate_w, up_w, (const float *)x->ptr,
             (const int32_t *)selected->ptr,
@@ -33102,7 +33108,7 @@ extern "C" int ds4_gpu_motif3_routed_moe_batch_tensor(
             (float *)down->ptr,
             (int)out_dim, (int)expert_mid_dim,
             (int)assignments, (int)n_total_expert,
-            /*n_expert_used=*/1, stream)
+            /*n_expert_used=*/1, /*d2r_ncols_floor=*/8, stream)
         : ds4_mmq_q2_K_moe(
             down_w, (const float *)mid->ptr,
             (const int32_t *)selected->ptr,

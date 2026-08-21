@@ -1267,7 +1267,12 @@ int ds4_mmq_moe_impl(
         /* Optional caller-proven maximum expert bucket size.  Router ids are
          * still authoritative through expert_bounds; this value only removes
          * launch tiles that cannot contain a routed row. */
-        int64_t         ncols_max_hint = 0) {
+        int64_t         ncols_max_hint = 0,
+        /* Optional D2R engagement floor.  The global d2r_min_cols() default
+         * (1024) was tuned on the DeepSeek prefill mix; a family whose
+         * decode shape measures faster on the D2R schedule passes its own
+         * floor here instead of moving the shared default. */
+        int64_t         d2r_ncols_floor = 0) {
 
     if (!W || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -1447,7 +1452,9 @@ int ds4_mmq_moe_impl(
     }
 
     if (type == GGML_TYPE_Q2_K && x_soa != nullptr && d2r_enabled() &&
-        K % 256 == 0 && M % 2 == 0 && ne_get_rows >= d2r_min_cols()) {
+        K % 256 == 0 && M % 2 == 0 &&
+        ne_get_rows >= (d2r_ncols_floor > 0 ? d2r_ncols_floor
+                                            : d2r_min_cols())) {
         static int d2r_avail_cc = -1;
         static int d2r_avail = 0;
         if (d2r_avail_cc != cc) {
@@ -1732,7 +1739,9 @@ int ds4_mmq_moe_pair_impl(
          * still authoritative through expert_bounds. A positive hint also
          * opts Q3_K/Q4_K pairs into the compact routed worklist. */
         int64_t         ncols_max_hint = 0,
-        const ds4_mmq_q3_handoff *q3_handoff = nullptr) {
+        const ds4_mmq_q3_handoff *q3_handoff = nullptr,
+        /* See ds4_mmq_moe_impl: family D2R engagement floor (0 = policy). */
+        int64_t         d2r_ncols_floor = 0) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
@@ -2205,7 +2214,8 @@ int ds4_mmq_moe_pair_impl(
     bool gate_up_done = false;
     if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
         d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
-        ne_get_rows >= d2r_min_cols()) {
+        ne_get_rows >= (d2r_ncols_floor > 0 ? d2r_ncols_floor
+                                            : d2r_min_cols())) {
         static int d2r_iq2_avail_cc = -1;
         static int d2r_iq2_avail = 0;
         if (d2r_iq2_avail_cc != cc) {
@@ -2553,6 +2563,7 @@ extern "C" int ds4_mmq_q3_K_moe_bounded(
 extern "C" int ds4_mmq_q2_K_moe_soa(
         const void * W_soa, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        int d2r_ncols_floor,
         cudaStream_t stream) {
     if (M <= 0 || M % 2 != 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_mmq_q2_K_moe_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
@@ -2565,7 +2576,9 @@ extern "C" int ds4_mmq_q2_K_moe_soa(
     return ds4_mmq_moe_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_moe_soa", W_soa, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             (const char *)W_soa, npair,
-                                            /*sanitize_out=*/false);
+                                            /*sanitize_out=*/false,
+                                            /*ncols_max_hint=*/0,
+                                            (int64_t)d2r_ncols_floor);
 }
 
 extern "C" int ds4_mmq_q4_K_moe(
@@ -2609,6 +2622,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         const void * Wa_soa, const void * Wb_soa,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        int d2r_ncols_floor,
         cudaStream_t stream) {
     if (M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_mmq_iq2_xxs_moe_pair_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
@@ -2620,7 +2634,11 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
         (const char *)Wa_soa, (const char *)Wb_soa, nblk,
-        /*sanitize_out=*/false);
+        /*sanitize_out=*/false,
+        /*fused_down=*/nullptr,
+        /*ncols_max_hint=*/0,
+        /*q3_handoff=*/nullptr,
+        (int64_t)d2r_ncols_floor);
 }
 
 extern "C" int ds4_mmq_iq2_xxs_q3_K_moe_handoff_soa(

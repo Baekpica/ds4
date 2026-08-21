@@ -318,6 +318,7 @@ int ds4_mmq_q2_K_moe_soa(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
+    int             d2r_ncols_floor,   /* 0 = the shared d2r_min_cols policy */
     cudaStream_t    stream);
 
 int ds4_mmq_q3_K_moe(
@@ -396,6 +397,7 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
+    int             d2r_ncols_floor,   /* 0 = the shared d2r_min_cols policy */
     cudaStream_t    stream);
 
 /* Experimental atomic IQ2->Q3 wide-prefill handoff (n_tokens >= 512). The
