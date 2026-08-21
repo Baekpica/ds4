@@ -526,17 +526,17 @@ static void test_gdla(const char *dir) {
         !ds4_gpu_motif3_expanded_attention_range_tensor(
                 full_out.p, full_lse.p, q_tail.p, k.p, v.p,
                 tail_rows, split, 8u, 0u, 80u, 16u, 192u, 128u,
-                f32(f, "attention_scale")[0]) ||
+                f32(f, "attention_scale")[0], 0u) ||
         !ds4_gpu_motif3_expanded_attention_range_tensor(
                 merged_out.p, merged_lse.p, q_tail.p,
                 k_suffix.p, v_suffix.p,
                 tail_rows, split, tail_rows, split,
-                80u, 16u, 192u, 128u, f32(f, "attention_scale")[0]) ||
+                80u, 16u, 192u, 128u, f32(f, "attention_scale")[0], 0u) ||
         !ds4_gpu_motif3_expanded_attention_range_tensor(
                 prefix_out.p, prefix_lse.p, q_tail.p,
                 k_prefix.p, v_prefix.p,
                 tail_rows, split, split, 0u,
-                80u, 16u, 192u, 128u, f32(f, "attention_scale")[0])) {
+                80u, 16u, 192u, 128u, f32(f, "attention_scale")[0], 0u)) {
         fprintf(stderr, "chunked expanded GDLA failed\n");
         std::exit(1);
     }

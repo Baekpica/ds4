@@ -34920,7 +34920,8 @@ extern "C" int ds4_gpu_motif3_expanded_attention_range_tensor(
         uint32_t n_query, uint32_t query_pos0,
         uint32_t n_kv, uint32_t kv_pos0,
         uint32_t q_heads, uint32_t kv_heads,
-        uint32_t key_dim, uint32_t value_dim, float scale) {
+        uint32_t key_dim, uint32_t value_dim, float scale,
+        uint32_t window) {
     const uint64_t qn = (uint64_t)n_query * q_heads * key_dim;
     const uint64_t kn = (uint64_t)n_kv * kv_heads * key_dim;
     const uint64_t vn = (uint64_t)n_kv * kv_heads * value_dim;
@@ -34940,7 +34941,7 @@ extern "C" int ds4_gpu_motif3_expanded_attention_range_tensor(
             (const float *)v->ptr,
             (int)n_query, (int)query_pos0, (int)n_kv, (int)kv_pos0,
             (int)q_heads, (int)kv_heads, (int)key_dim, (int)value_dim,
-            scale, 0, ds4_current_stream()) == 0;
+            scale, (int)window, ds4_current_stream()) == 0;
 }
 
 __global__ static void motif3_merge_attention_states_kernel(
@@ -35029,10 +35030,12 @@ extern "C" int ds4_gpu_motif3_expanded_attention_window_tensor(
         kv_heads == 0 || q_heads % kv_heads != 0 || key_dim == 0 || value_dim == 0 ||
         out->bytes < on * sizeof(float) || q->bytes < qn * sizeof(float) ||
         k->bytes < kn * sizeof(float) || v->bytes < vn * sizeof(float)) return 0;
-    if (causal && window == 0u && key_dim == 192u && value_dim == 128u) {
+    if (causal && key_dim == 192u && value_dim == 128u) {
+        /* The HMMA range path prunes per query tile, so it serves the SWA
+         * window as well as the dense causal case. */
         return ds4_gpu_motif3_expanded_attention_range_tensor(
                 out, NULL, q, k, v, rows, 0u, rows, 0u,
-                q_heads, kv_heads, key_dim, value_dim, scale);
+                q_heads, kv_heads, key_dim, value_dim, scale, window);
     }
     dim3 grid(rows, q_heads, 1);
     motif3_expanded_attention_kernel<<<grid, 1>>>(

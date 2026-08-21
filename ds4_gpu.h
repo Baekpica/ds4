@@ -2583,7 +2583,8 @@ int ds4_gpu_motif3_expanded_attention_range_tensor(
         uint32_t              kv_heads,
         uint32_t              key_dim,
         uint32_t              value_dim,
-        float                 scale);
+        float                 scale,
+        uint32_t              window);
 
 int ds4_gpu_motif3_merge_attention_states_tensor(
         ds4_gpu_tensor       *attention,

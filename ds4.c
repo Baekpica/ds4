@@ -36477,7 +36477,8 @@ static bool motif3_graph_attention_latent_impl(
         const char *env = getenv("DS4_MOTIF3_PREFILL_EXPANDED");
         expanded_prefill = (!env || strcmp(env, "0") != 0) ? 1 : 0;
     }
-    if (!decode_rows && expanded_prefill && rows > 1u && full) {
+    if (!decode_rows && expanded_prefill && rows > 1u) {
+        const uint32_t attn_window = full ? 0u : window;
         M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
                 g->kv_proj, model->map, model->size,
                 l->attn_kv_b->abs_offset, DS4_N_KV_LORA,
@@ -36489,7 +36490,7 @@ static bool motif3_graph_attention_latent_impl(
         M3_LATTN(ds4_gpu_motif3_prepare_qkv_tensor(
                 g->q_full, g->k_full, g->value,
                 g->q_raw, g->kv_raw, g->kv_proj,
-                g->positions, g->inv_yarn,
+                g->positions, full ? g->inv_yarn : g->inv_swa,
                 rows, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
                 DS4_N_ROT, DS4_N_VALUE_DIM, DS4_N_KV_LORA, 1),
                 "prefill current qkv");
@@ -36498,17 +36499,30 @@ static bool motif3_graph_attention_latent_impl(
                 g->q_full, g->k_full, g->value,
                 rows, pos0, rows, pos0,
                 DS4_N_HEAD, DS4_N_HEAD_KV,
-                DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, scale),
+                DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, scale, attn_window),
                 "prefill current attention");
 
-        for (uint32_t cache_pos0 = 0; cache_pos0 < pos0;
-             cache_pos0 += g->cap) {
-            const uint32_t remaining = pos0 - cache_pos0;
-            const uint32_t cache_rows =
-                remaining < g->cap ? remaining : g->cap;
+        /* Prefix walk.  Full layers rebuild the whole linear latent cache
+         * in prefill-cap chunks.  SWA layers only need the last
+         * (window - 1) cached positions, which live in a ring whose slots
+         * can wrap once; each linear slot segment reuses the same
+         * load / kv_b / prepare / attend / merge sequence, and the HMMA
+         * range kernel's per-query-tile window pruning keeps the segment
+         * pass O(rows + window). */
+        uint32_t prefix_logical0 = 0u;
+        if (!full) {
+            const uint32_t hist = window > 0u ? window - 1u : 0u;
+            prefix_logical0 = pos0 > hist ? pos0 - hist : 0u;
+        }
+        for (uint32_t logical0 = prefix_logical0; logical0 < pos0; ) {
+            const uint32_t slot0 = full ? logical0 : logical0 % cache_cap;
+            uint32_t cache_rows = pos0 - logical0;
+            if (cache_rows > g->cap) cache_rows = g->cap;
+            if (slot0 + cache_rows > cache_cap)
+                cache_rows = cache_cap - slot0;
             M3_LATTN(ds4_gpu_motif3_load_latent_kv_bf16_tensor(
                     g->kv_norm, g->layer_kv_latent[il],
-                    cache_pos0, cache_rows, cache_cap, DS4_N_KV_LORA),
+                    slot0, cache_rows, cache_cap, DS4_N_KV_LORA),
                     "prefill prefix latent load");
             M3_LATTN(ds4_gpu_matmul_q8_0_tensor(
                     g->kv_proj, model->map, model->size,
@@ -36521,25 +36535,26 @@ static bool motif3_graph_attention_latent_impl(
                     "prefill prefix kv_b BF16");
             M3_LATTN(ds4_gpu_motif3_prepare_cached_kv_tensor(
                     g->k_full, g->value, g->kv_proj,
-                    g->layer_k_pe[il], cache_pos0, cache_rows, cache_cap,
+                    g->layer_k_pe[il], slot0, cache_rows, cache_cap,
                     DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
                     DS4_N_ROT, DS4_N_VALUE_DIM),
                     "prefill prefix expanded kv");
             M3_LATTN(ds4_gpu_motif3_expanded_attention_range_tensor(
                     g->attention_tmp, g->attention_tmp_lse,
                     g->q_full, g->k_full, g->value,
-                    rows, pos0, cache_rows, cache_pos0,
+                    rows, pos0, cache_rows, logical0,
                     DS4_N_HEAD, DS4_N_HEAD_KV,
-                    DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, scale),
+                    DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, scale, attn_window),
                     "prefill prefix attention");
             M3_LATTN(ds4_gpu_motif3_merge_attention_states_tensor(
                     g->attention, g->attention_lse,
                     g->attention_tmp, g->attention_tmp_lse,
                     rows, DS4_N_HEAD, DS4_N_VALUE_DIM),
                     "prefill attention merge");
+            logical0 += cache_rows;
         }
-        /* Expanded full-layer prefill still materializes FATTN in FP32.
-         * Keep the official BF16 store boundary before differential. */
+        /* Expanded prefill still materializes FATTN in FP32.  Keep the
+         * official BF16 store boundary before differential. */
         M3_LATTN(ds4_gpu_motif3_round_bf16_tensor(
                 g->attention, g->attention,
                 (uint64_t)rows * DS4_N_HEAD * DS4_N_VALUE_DIM),

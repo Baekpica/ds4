@@ -854,19 +854,25 @@ void motif3_fattn_hmma_kernel(
 #pragma unroll
         for (int l = 0; l < motif_tile_c::ne; l++) {
             const int r = l / 2;
-            if (!alive[r] || row_l[r] <= 0.0f) continue;
+            if (!alive[r]) continue;
             const uint32_t token = tq0 + qrow[r];
             const int col = (int)(lane % 4) * 2 + (l % 2);
+            /* A query row that saw no keys (an out-of-window SWA prefix
+             * segment) must still publish a neutral partial: zero output
+             * with -inf LSE, so the state merge weighs it out instead of
+             * blending whatever the scratch buffer held before. */
             heads[((size_t)token * n_head + h) * M3_FA_V +
-                  cb * 8 + col] = output[cb].x[l] / row_l[r];
+                  cb * 8 + col] = row_l[r] > 0.0f
+                ? output[cb].x[l] / row_l[r] : 0.0f;
         }
     }
     if (lse && (lane & 3u) == 0u) {
 #pragma unroll
         for (int r = 0; r < 2; r++) {
-            if (!alive[r] || row_l[r] <= 0.0f) continue;
+            if (!alive[r]) continue;
             const uint32_t token = tq0 + qrow[r];
-            lse[(size_t)token * n_head + h] = row_m[r] + logf(row_l[r]);
+            lse[(size_t)token * n_head + h] = row_l[r] > 0.0f
+                ? row_m[r] + logf(row_l[r]) : -INFINITY;
         }
     }
 }
