@@ -34349,16 +34349,18 @@ __global__ static void motif3_latent_attention_bf16_decode_split_kernel(
  * bf16, so heads per CTA divides the depth-dependent decode cost, while
  * the tile depth divides the per-CTA __syncthreads chain that bounds the
  * kernel once the re-reads hit L2.  Each warp folds its two heads' dots
- * out of one shared-tile read.  GB10 scan (scratch/motif3-opt-v062,
- * synthetic 80-head fixture): 2.03x/1.84x/2.15x over the 8-head 8-row
- * shape at 8K/32K/256K visible. */
+ * out of one shared-tile read.  Every thread still accumulates all
+ * sixteen heads at its unique (d0,d1): the dim mapping is block-wide, so
+ * a warp-local write would cover only 64 of 512 dims.  GB10 scan
+ * (scratch/motif3-opt-v062, synthetic 80-head fixture): 2.03x/1.84x/2.15x
+ * over the 8-head 8-row shape at 8K/32K/256K visible. */
 #define M3_ATTN_HG_HEADS 16u
 #define M3_ATTN_HG_WARP_HEADS 2u
 #define M3_ATTN_HG_ROWS  16u
 
-/* Long-context Motif decode, grouped by eight heads.  Unlike the per-head
+/* Long-context Motif decode, grouped by sixteen heads.  Unlike the per-head
  * split above, each latent/K-RoPE row is converted from BF16 and staged once,
- * then reused by all eight query heads.  The block emits one online-softmax
+ * then reused by the CTA's query heads.  The block emits one online-softmax
  * partial per (head, context split); a fixed-order second kernel merges them. */
 __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
         float *partials,
@@ -34686,6 +34688,7 @@ extern "C" int ds4_gpu_motif3_latent_attention_bf16_tensor(
 }
 
 #undef M3_ATTN_HG_HEADS
+#undef M3_ATTN_HG_WARP_HEADS
 #undef M3_ATTN_HG_ROWS
 
 template <bool RoundBf16, uint32_t kValueDim>

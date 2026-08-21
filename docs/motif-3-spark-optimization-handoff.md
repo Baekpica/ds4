@@ -1,7 +1,9 @@
 # Motif-3 DGX Spark 최적화 작업 handoff
 
 기준 시각: **2026-08-14 17:02 KST** (재개 세션 진행 내역은 §0에 누적;
-후속 재개 결과는 §0.26까지 반영; **v0.6.2-dfm 최적화 세션은 §A에 누적**)
+후속 재개 결과는 §0.26까지 반영; **v0.6.2-dfm 최적화 세션은 §A에 누적**.
+재개 에이전트용 단권 핸드오프:
+`docs/v062-dfm-motif3-opt-resume-2026-08-21.md`)
 
 ## §A. v0.6.2-dfm 최적화 세션 (2026-08-21 KST)
 
@@ -60,7 +62,7 @@ greedy 텍스트는 base 대비 토큰 수준 분기 — softmax 분할 순서 �
 예상 드리프트(과거 FATTN occupancy/absorb 최적화와 동일 클래스)로,
 게이트 기준은 센티널 정확성이다.
 
-### §A.3 사이클 2 — SWA prefill의 expanded/HMMA 라우팅 (진행 중)
+### §A.3 사이클 2 — SWA prefill의 expanded/HMMA 라우팅 (b0db5a1, 반영)
 
 nsys prefill 분해(32K, 74.6 s): fattn_hmma 15.7%, q8 pair 12.3%,
 value_project 8.7%(대부분 SWA latent 경로), gateup_iq2 8.1%, SWA latent
@@ -87,7 +89,7 @@ logits는 rel_rms 1.4e-1로 이동(argmax·top-4 불변) — SWA prefill이
 absorbed-latent 반올림 경계 대신 공식 expanded 경계를 갖게 된 결과로,
 full 레이어가 이미 채택한 것과 같은 트레이드다.
 
-### §A.4 사이클 3 — MoE 디코드의 D2R 스케줄 편입 (진행 중)
+### §A.4 사이클 3 — MoE 디코드의 D2R 스케줄 편입 (91823ca, 반영)
 
 nsys 디코드 창에서 MoE `mul_mat_q`(gate/up+down)가 22.5%로, roofline
 추정(~10.8 ms/token) 대비 ~2배. 원인: SoA D2R MoE 커널은 존재하지만
@@ -118,6 +120,50 @@ fixture·family kernels 통과. 커밋 완료.
 
 깊이 축: 32K decode 개선폭(+31.5%)이 8K(+19.6%)보다 커 깊이-감쇠가
 완화됨(HG16의 depth-linear 항 절반). 256K 검증은 최종 게이트에서.
+
+### §A.6 2026-08-21 11:47 재부팅 (검증)
+
+사이클 3 푸시 후 owner를 내리고 ncu 창을 열었다. HG16 마이크로벤치
+ncu(`scratch/motif3-opt-v062/ncu/hg16-256k.txt`)는 완료. 이어서
+`run-ncu-real.sh`가 owner 없이 standalone `ds4-bench`로 풀 모델
+artifact 86.07 GiB + device 93.08 GiB를 올린 채 fattn ncu를 시작해
+11:35 systemd-oomd가 user.slice 압력 72%로 tmux-spawn을 죽였다.
+사용자는 11:47에 재기동. 커널 OOM killer 기록은 없다. 재발 방지:
+ncu는 마이크로벤치만, 풀모델 `ds4-bench`/`ds4-server`에 ncu 금지.
+상세는 `docs/v062-dfm-motif3-opt-resume-2026-08-21.md` §4.
+
+### §A.7 HG16 ncu (유효) — 사이클 4 입력
+
+`hg_partial_t<2,16>` @ 256K: SM/Mem 둘 다 63.35%, theoretical
+occupancy 33.3% (regs **그리고** smem이 CTA를 2개/SM로 제한),
+L1TEX scoreboard stall 33.8%, L2 11%. 각 스레드가 16헤드
+`out0[16]/out1[16]`를 모두 accumulate하는 것이 레지스터 폭주.
+워프-로컬 2-head value accum이 다음 가설. 재부팅 직후 호스트는
+118 GiB available, GPU 프로세스 0.
+
+### §A.8 사이클 4 — HG16 워프-로컬 accum (원복)
+
+ncu: occupancy 33%가 regs+smem 공동 제한, L1TEX stall 33.8%.
+가설: 각 워프가 자기 2헤드만 accumulate/기록하면 레지스터와 value
+FMA가 줄어든다.
+
+첫 마이크로벤치(`bench-hg-occ.cu` 초기본)는 1.08–1.15x + rms 0으로
+보였으나, `partials`를 런치마다 제로화하지 않아 워프가 쓰지 않은
+448/512 차원이 기준 출력에 남았다. 엔진 이식 후
+`test-motif3-cuda`가 `CUDA latent GDLA split decode mismatch at 10849:
+got 0`으로 실패 — 블록 전역 `(d0,d1)` 매핑에서 워프-로컬 쓰기는
+헤드당 64차원만 덮는다. 커널 원복, 픽스처 재통과.
+
+정직 재측정(partials memset, 동일 지오메트리):
+
+| variant | 8K | 32K | 256K | rms |
+|---|---:|---:|---:|---|
+| reload-smem (value 배열 제거) | 1.00x | 1.00x | 1.00x | 0 |
+| bf16 latent smem | 0.97x | 0.97x | 0.97x | 0 |
+| bf16+reload | 0.97x | 0.97x | 0.98x | 0 |
+
+HG16 점유율/레지스터 변형은 해소 가능 병목이 아니다. 다음 사이클은
+사이클 3 바이너리로 **재-nsys** 한 뒤 새 1위를 고른다.
 
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
