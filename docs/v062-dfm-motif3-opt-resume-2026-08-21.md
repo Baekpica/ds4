@@ -15,9 +15,10 @@ Entrpi `v0.6.2` 흡수와 `v0.6.2-dfm` 태그는 끝났고, Motif nsys→A/B 사
 재부팅했다. 지금 호스트는 클린(118 GiB available, GPU 프로세스 0).
 HG16 마이크로벤치 ncu는 유효하고, fattn 풀모델 ncu는 실패했다.
 
-목표(원본 `/goal`)는 아직 끝나지 않았다. 사이클 1–3·5·6은 반영,
-사이클 4는 원복. 남은 것은 q8-pair / shexp-down 또는 닫힌 길
-기록, 가능하면 256K 센티널, 그리고 최종 문서 게이트다.
+목표(원본 `/goal`)의 측정 게이트는 채워졌다. 사이클 1–3·5·6은 반영,
+사이클 4·7·8은 원복/닫힘. 256K 직렬 센티널은 2026-08-21 17:49 KST에
+통과(262,080 prefill 238.59 tok/s, 43 decode 5.97 tok/s, ALL-EXACT).
+문서 커밋/`HEAD:dfm`/카드 반영은 아직이다. 태그 `v0.6.2-dfm`은 고정.
 
 ## 1. 원본 목표 (축소 금지)
 
@@ -227,13 +228,13 @@ Speed of Light (승자 CTA):
 살아 있음. ncu를 하려면 먼저 이 owner를 내리고 `clear_cache`할 것.
 
 1. Q8 dense vec occupancy / HG L1TEX / FATTN TK=64 / Motif GQA-pair /
-   Q8 pair tok8 타일은 닫힘. ncu는 마이크로벤치만. 합성 +38%가
-   엔진 TU e2e에서 −6%가 됐다.
-2. 다음 후보: shexp-down `K=1280` aligned 확장(decode ~1.8%,
-   owner artifact 재빌드), 또는 256K 센티널.
-3. 최종 게이트: 가능하면 256K 센티널. 문서 → 커밋 → `HEAD:dfm`.
-   태그 `v0.6.2-dfm`은 통합 컷에 고정. 모델 카드 8K/32K remesure는
-   `a09ff4f` 기준이며 256K는 재측정하지 않음.
+   Q8 pair tok8 / shexp-down K=1280 aligned 는 닫힘. ncu는
+   마이크로벤치만. shexp-down 합성 +4.2%는 토큰당 0.02 ms
+   (~0.03% e2e)라 owner 재빌드 가치가 없다.
+2. 256K 직렬 센티널은 통과. 증거
+   `scratch/motif3-opt-v062/logs/sent-256k-summary.txt`.
+3. 문서 커밋 → `HEAD:dfm` (요청 시). 태그 `v0.6.2-dfm`은 통합
+   컷에 고정. 모델 카드 256K 행은 아직 `v0.5.6.3-dfm` 숫자.
 
 ## 8. 재개 명령
 

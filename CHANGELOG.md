@@ -7,9 +7,16 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## v0.6.2-dfm — 2026-08-21
 
+- Motif-3 strict 256K serial Chat remesure on this line: 262,080-token
+  prefill 1,098.433 s at 238.59 tok/s and 43 decode tokens in 7.205 s
+  at 5.97 tok/s; all three sentinels exact; `finish_reason=stop`.
+  Versus the `v0.5.6.3-dfm` published row (175.61 / 2.52) that is
+  +35.9% prefill and +137% decode. Concurrent 256K banks are not
+  claimed. shexp-down K=1280 aligned was measured and closed
+  (synthetic +4.2%, ~0.03% e2e).
 - Motif-3 prefill FATTN now walks K in 32-key tiles (still three CTAs
   on GB10). Same-session 32K prefill 519.57→545.62 tok/s; 8K prefill
-  616.27→627.19. 32K HTTP sentinels exact. 256K not remesured.
+  616.27→627.19. 32K HTTP sentinels exact.
 - Motif-3 HG16 decode now prefetches the next BF16 KV tile with
   `cp.async` while scoring the current one. Hides the L1TEX miss that
   ncu put at 33.8% of the depth-linear kernel; 32K decode 12.73→13.02

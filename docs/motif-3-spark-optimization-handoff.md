@@ -285,6 +285,62 @@ M=12288는 기존 `max_out<=2048` 캡이 맞고 coalesced가 stride보다
 다음 후보: shexp-down `K=1280` aligned (owner artifact 재빌드),
 또는 256K 센티널. 풀모델 ncu 금지.
 
+### §A.13 사이클 8 — shexp-down K=1280 aligned (닫힘)
+
+가설: Motif `ffn_down_shexp`는 M=4096, K=1280이라 aligned decode
+커널의 `K % 1024 == 0` 계약 밖으로 raw mmvq에 떨어진다. 테일 가드
+(nb=40 = 32+8)를 넣으면 같은 SoA 경로를 탈 수 있다. owner는 이
+형상을 아직 만들지 않는다(`ds4_repack_q8_candidate`가
+`dims[0] % 1024 == 0`).
+
+합성 벤치 (`scratch/motif3-opt-v062/bench-shexp-down-k1280.cu`,
+owner 유지, ncu 없음):
+
+| path | us | GB/s | Δ |
+|---|---:|---:|---:|
+| raw packed Q8 GEMV | 6.423 | 867 | — |
+| aligned tail | 6.167 | 903 | +4.2% |
+
+51층 × 0.02 ms = 토큰당 0.02 ms. 15 tok/s decode(~67 ms/tok)의
+~0.03%. 아티팩트 재빌드는 51텐서 ≈ 284 MiB + owner 재시작이 필요하고
+이득이 그 비용을 못 이긴다. 커널/후보 게이트/owner 모두 불변.
+로그: `scratch/motif3-opt-v062/logs/c8-shexp-down.txt`.
+
+닫힌 길 추가: shexp-down K=1280 aligned. 다음 게이트는 256K 센티널.
+
+### §A.14 256K 직렬 센티널 (통과, 2026-08-21 17:30–17:49 KST)
+
+엔진 팁 `2c81427` (커널은 `a09ff4f` FATTN TK=32까지). owner는 기존
+tmux `motif3-v062-owner` (`--reserve-gb 24`). 워커는 직렬
+`DS4_SERVER_COALESCE_MAX=1`, `-c 262144`, 공식
+`context-262144-server.txt` + system, thinking off, greedy,
+`max_tokens=64`. 스크립트 `scratch/motif3-opt-v062/sentinel-256k.sh`.
+
+| 항목 | 값 |
+|---|---|
+| prompt | **262,080** (cached=0) |
+| prefill | **1,098.433 s; 238.59 tok/s** |
+| decode | **43 in 7.205 s; 5.97 tok/s** |
+| finish | `stop`; total 262,123 |
+| 센티널 | **ALL-EXACT** 3/3 JSON |
+| route | `openai_chat.serial=1` |
+| KV | 4.119 GiB (4,422,546,432 B) |
+| worker | 10,429 MiB; available 11–12 GiB |
+| clocks | 2,411–2,496 MHz (611 pin 없음) |
+| VmSwap | owner 0, worker 0 |
+
+공개 `v0.5.6.3-dfm` 행(175.61 / 2.52) 대비 prefill **+35.9%**,
+decode **+137%**. HG16+L1TEX가 256K 깊이에서 드러난 결과와 맞다.
+245,760에서 멈추지 않았고 decode가 실제 43토큰을 냈다. 동시 256K
+뱅크는 주장하지 않는다.
+
+증거 SHA-256:
+`sent-256k-response.json`
+`f4aafb4c969c46889daceb64feb01177c4682e75efff555a6539202f78cd42aa`,
+`server-256k.log`
+`4f6e2bdb9c1cf607bf4d02da2575c73e0b9af0fbf103923d1907eb16cd711096`.
+요약: `scratch/motif3-opt-v062/logs/sent-256k-summary.txt`.
+
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
 Solar와 K-EXAONE은 2-bank continuous 요청, DeepSeek은 DSpark 자동 부착,

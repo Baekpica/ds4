@@ -189,14 +189,16 @@ tok/s, 32K decode run 445.03 prefill + 9.68 decode tok/s.
 
 A later Motif-only optimization series on the same `dfm` line
 (`d03bd89` HG16, `b0db5a1` SWA→HMMA, `91823ca` MoE D2R,
-`a8e9e61` HG16 cp.async, `a09ff4f` FATTN TK=32) remesured 8K/32K on
-the same artifact and host. Current tip (`a09ff4f`): 8K prefill
+`a8e9e61` HG16 cp.async, `a09ff4f` FATTN TK=32) remesured 8K/32K and
+then the strict 256K serial Chat gate on the same artifact and host.
+Current tip (`2c81427`, kernels through `a09ff4f`): 8K prefill
 627.19 tok/s and decode 15.06 tok/s; 32K prefill 545.62 tok/s and
-decode 12.95 tok/s; 32K OpenAI sentinels exact (546.7 / 12.8). The
-`v0.6.2-dfm` **tag is not moved**. The published Motif 256K row below
-remains the `v0.5.6.3-dfm` evidence; 256K was not remesured on this
-binary. Do not treat the 8K/32K remesure as a new published 256K
-number.
+decode 12.95 tok/s; 32K OpenAI sentinels exact (546.7 / 12.8); 256K
+OpenAI Chat 262,080-token prefill **238.59 tok/s** and 43 decode tokens
+at **5.97 tok/s**, sentinels exact, `finish_reason=stop`. The
+`v0.6.2-dfm` **tag is not moved**. The published table below still
+shows the `v0.5.6.3-dfm` 8K/32K/256K rows; the remesure is recorded
+after that table and is not a new tag.
 
 ## Integration evidence for `v0.6.0-dfm`
 
@@ -276,6 +278,29 @@ module/driver state, below the 896 MiB lifecycle gate. During the full request,
 the worker and owner both remained at `VmSwap: 0`; system memory retained about
 12 GiB available. Loaded clock samples remained between 2,398 and 2,411 MHz,
 so the earlier 611 MHz pin did not recur.
+
+### Motif-3 remesure on the `v0.6.2-dfm` line (2026-08-21)
+
+Same host, same MQ87-88 GGUF, same aligned-Q8 VMM owner (`--reserve-gb 24`),
+same 4,096-token prefill chunk, greedy, no thinking, no speculation. Engine
+tip `2c81427` (kernels through `a09ff4f`). The 256K cell used the official
+`context-262144-server.txt` Chat fixture and `DS4_SERVER_COALESCE_MAX=1`
+(serial lane, `-c 262144`).
+
+| Gate | Interface | Prompt | Prefill | Decode | Correctness |
+|---|---|---:|---:|---:|---|
+| 8K | `ds4-bench` | 8,192 | 627.19 tok/s | 64 tokens at 15.06 tok/s | throughput fixture |
+| 32K | OpenAI Chat | 32,768 | 546.7 tok/s | 12.8 tok/s | beginning, middle, and end sentinels exact |
+| 256K | OpenAI Chat, `-c 262144` | 262,080 | 1,098.433 s; 238.59 tok/s | 43 in 7.205 s; 5.97 tok/s | all sentinels exact; `finish_reason=stop`; 262,123 total tokens; `cached_tokens=0` |
+
+Versus the `v0.5.6.3-dfm` published 256K row this is +35.9% prefill and
++137% decode. The 256K worker held 10,429 MiB with 4.119 GiB of latent KV;
+owner and worker `VmSwap` stayed 0; available memory stayed 11–12 GiB;
+SM clocks sampled 2,411–2,496 MHz. Concurrent 256K banks are still not
+claimed. Evidence:
+`scratch/motif3-opt-v062/logs/sent-256k-summary.txt`
+(response SHA-256
+`f4aafb4c969c46889daceb64feb01177c4682e75efff555a6539202f78cd42aa`).
 
 Nsight Systems on the final 32K prefill ranked aggregate CUDA kernel time as
 expanded FATTN 15.5%, paired Q8 projection 11.0%, latent attention 9.7%, BF16
