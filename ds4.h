@@ -514,9 +514,11 @@ int ds4_batch_ctx_commit_rate(const ds4_batch_ctx *ctx,
  * ctx size; legacy one-shot admission (=0) keeps the historical raw-ring bound.
  * Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx);
-/* Whether this persistent context can rewind a retained bank to an earlier
- * committed prefix for partial fork/truncate reuse.  Exact-frontier warm and
- * fork reuse are separate capabilities.  Returns false for NULL. */
+/* Whether this persistent context can restore an earlier committed prefix for
+ * partial fork/truncate reuse.  The replay base is model-specific (for example,
+ * a retained Solar KDA checkpoint or a compressed-KV group boundary); a cut
+ * with no safe base degrades to cold.  Exact-frontier reuse is separate.
+ * Returns false for NULL. */
 bool ds4_batch_ctx_supports_partial_reuse(const ds4_batch_ctx *ctx);
 /* Batched generation over a persistent context (W4); same semantics as
  * ds4_engine_batched_generate_ex but reuses ctx's graph + slabs.  n <= ctx max_seq,
@@ -616,18 +618,12 @@ typedef struct {
      * admit (no copy).
      * P1 (partial-prefix fork): n_cached BELOW the source's committed length
      * requests reuse of just the shared prefix -- the request DIVERGES from
-     * the source mid-prompt.  The engine rewinds to the replay base
-     * R = (n_cached - 4) aligned down to the model's largest compress ratio
-     * (128 on Flash: the boundary where every layer's in-progress pooling
-     * group is rebuildable), validates tokens[0..R+4) against the source
-     * history, clones only the state below R, and re-prefills the shared
-     * tail [R, n_cached) together with the divergent suffix -- so the
-     * admit's pos_base is R, not n_cached, and cuts below ~(align + 4)
-     * tokens degrade to cold (no reuse worth having there anyway).  src ==
-     * target is an in-place truncate-reuse (no copies; the bank's committed
-     * state rewinds to R).  Unsatisfiable cuts (too short, or a wrapped
-     * source ring that no longer covers the replay's attention window)
-     * degrade to cold like any other validation failure. */
+     * the source mid-prompt.  After validating the shared tokens, the engine
+     * restores its nearest safe model-specific replay base R <= n_cached and
+     * prefills [R,n).  Compressed-KV models use an aligned group boundary;
+     * Solar uses a retained KDA checkpoint.  on_admitted reports R as the
+     * actual cached count.  src == target is an in-place truncate-reuse.
+     * A cut with no safe base degrades to cold. */
     int        fork_bank;   /* source bank id + 1; 0 = no fork                */
 } ds4_cont_request;
 /* A2a: a bank's committed token history (engine-authoritative bookkeeping for

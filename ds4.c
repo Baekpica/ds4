@@ -43588,6 +43588,20 @@ int ds4_engine_batched_generate(
 }
 
 #ifndef DS4_NO_GPU
+enum {
+    SOLAR_PARTIAL_CHECKPOINT_SLOTS = 32,
+    SOLAR_PARTIAL_PERIODIC_TARGET = 24,
+};
+
+typedef struct {
+    uint64_t bank_refs[2];
+    uint64_t last_use;
+    uint32_t pos;
+    uint8_t logits_valid;
+} ds4_solar_checkpoint;
+
+static uint64_t ds4_mem_usable_beyond(uint64_t reserve);
+
 /* Solar's continuous lane reuses one plain-residual compute graph while the
  * mutable model state lives in independent banks.  The graph only borrows the
  * currently selected bank's tensor views; the runtime owns every view/slab and
@@ -43619,6 +43633,16 @@ typedef struct ds4_solar_batch_runtime {
      * mutate/replay recurrent state merely to recover logits. */
     float   *bank_logits;
     uint8_t *bank_logits_valid;
+
+    /* Partial-prefix reuse keeps a bounded, shared pool of immutable KDA
+     * checkpoints.  Exact forks inherit references instead of duplicating the
+     * 157.5 MiB recurrent state; each bank's existing GQA rows remain the
+     * prefix source.  The VMM slab maps slots only as they are captured. */
+    ds4_gpu_tensor *checkpoint_slab;
+    ds4_solar_checkpoint checkpoint[SOLAR_PARTIAL_CHECKPOINT_SLOTS];
+    float *checkpoint_logits;
+    uint64_t checkpoint_clock;
+    uint32_t checkpoint_stride;
 
     /* Packed active rows for the fused decode seam.  Activations live in the
      * common plain batch workspace; these tensors only carry bank metadata,
@@ -43660,6 +43684,7 @@ static void solar_batch_runtime_free(ds4_solar_batch_runtime *rt) {
         ds4_gpu_tensor_free(rt->kv_slab[il]);
     }
     ds4_gpu_tensor_free(rt->state_slab);
+    ds4_gpu_tensor_free(rt->checkpoint_slab);
     ds4_gpu_tensor_free(rt->decode_attn_split);
     ds4_gpu_tensor_free(rt->decode_logits);
     ds4_gpu_tensor_free(rt->decode_positions);
@@ -43667,6 +43692,7 @@ static void solar_batch_runtime_free(ds4_solar_batch_runtime *rt) {
     free(rt->decode_logits_host);
     free(rt->bank_logits);
     free(rt->bank_logits_valid);
+    free(rt->checkpoint_logits);
     solar_graph_free(&rt->graph);
     free(rt);
 }
@@ -43722,6 +43748,209 @@ static bool solar_batch_runtime_ensure_kv(ds4_solar_batch_runtime *rt,
 }
 
 static uint64_t solar_batch_span_need(const ds4_gpu_tensor *tensor,
+                                      uint64_t offset, uint64_t bytes);
+
+static bool solar_checkpoint_ref(const ds4_solar_checkpoint *cp,
+                                 uint32_t bank) {
+    return cp && bank < DS4_MULTISEQ_MAX_SEQ &&
+           (cp->bank_refs[bank >> 6u] & (1ull << (bank & 63u))) != 0u;
+}
+
+static void solar_checkpoint_set_ref(ds4_solar_checkpoint *cp,
+                                     uint32_t bank) {
+    cp->bank_refs[bank >> 6u] |= 1ull << (bank & 63u);
+}
+
+static void solar_checkpoint_clear_ref(ds4_solar_checkpoint *cp,
+                                       uint32_t bank) {
+    cp->bank_refs[bank >> 6u] &= ~(1ull << (bank & 63u));
+    if (cp->bank_refs[0] == 0u && cp->bank_refs[1] == 0u) {
+        cp->pos = 0u;
+        cp->logits_valid = 0u;
+    }
+}
+
+static void solar_batch_runtime_drop_checkpoints(
+        ds4_solar_batch_runtime *rt, uint32_t bank) {
+    if (!rt || bank >= rt->max_seq) return;
+    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        if (solar_checkpoint_ref(&rt->checkpoint[i], bank))
+            solar_checkpoint_clear_ref(&rt->checkpoint[i], bank);
+    }
+}
+
+static void solar_batch_runtime_inherit_checkpoints(
+        ds4_solar_batch_runtime *rt, uint32_t src, uint32_t dst,
+        uint32_t cut) {
+    if (!rt || src >= rt->max_seq || dst >= rt->max_seq) return;
+    if (src == dst) {
+        for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
+            ds4_solar_checkpoint *cp = &rt->checkpoint[i];
+            if (solar_checkpoint_ref(cp, dst) && cp->pos > cut)
+                solar_checkpoint_clear_ref(cp, dst);
+        }
+        return;
+    }
+    solar_batch_runtime_drop_checkpoints(rt, dst);
+    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_solar_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos != 0u && cp->pos <= cut &&
+            solar_checkpoint_ref(cp, src)) {
+            solar_checkpoint_set_ref(cp, dst);
+        }
+    }
+}
+
+static int solar_batch_runtime_find_checkpoint(
+        ds4_solar_batch_runtime *rt, uint32_t bank, uint32_t cut,
+        uint32_t request_len) {
+    int best = -1;
+    uint32_t best_pos = 0u;
+    if (!rt || bank >= rt->max_seq) return -1;
+    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_solar_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos == 0u || cp->pos > cut || cp->pos < best_pos ||
+            !solar_checkpoint_ref(cp, bank) ||
+            (cp->pos == request_len && !cp->logits_valid)) {
+            continue;
+        }
+        best = (int)i;
+        best_pos = cp->pos;
+    }
+    return best;
+}
+
+static bool solar_batch_runtime_capture_checkpoint(
+        ds4_solar_batch_runtime *rt, uint32_t bank, uint32_t pos,
+        bool logits_valid, uint64_t reserve) {
+    if (!rt || !rt->checkpoint_slab || !rt->checkpoint_logits ||
+        bank >= rt->max_seq || pos == 0u) {
+        return false;
+    }
+    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_solar_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos != pos || !solar_checkpoint_ref(cp, bank)) continue;
+        if (logits_valid && rt->bank_logits_valid[bank] &&
+            !cp->logits_valid) {
+            memcpy(rt->checkpoint_logits + (size_t)i * DS4_N_VOCAB,
+                   rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+            cp->logits_valid = 1u;
+        }
+        cp->last_use = ++rt->checkpoint_clock;
+        return true;
+    }
+
+    uint32_t slot = SOLAR_PARTIAL_CHECKPOINT_SLOTS;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        const ds4_solar_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos == 0u) {
+            slot = i;
+            break;
+        }
+        if (cp->last_use < oldest) {
+            oldest = cp->last_use;
+            slot = i;
+        }
+    }
+    if (slot >= SOLAR_PARTIAL_CHECKPOINT_SLOTS) return false;
+    const uint64_t off = (uint64_t)slot * rt->graph.state_bytes;
+    const uint64_t need = solar_batch_span_need(
+        rt->checkpoint_slab, off, rt->graph.state_bytes);
+    const uint64_t usable = ds4_mem_usable_beyond(reserve);
+    if (need != 0u && usable != UINT64_MAX && need > usable) return false;
+    if (ds4_gpu_tensor_ensure(
+            rt->checkpoint_slab, off, rt->graph.state_bytes) == 0 ||
+        ds4_gpu_tensor_copy(
+            rt->checkpoint_slab, off,
+            rt->state_slab, (uint64_t)bank * rt->graph.state_bytes,
+            rt->graph.state_bytes) == 0) {
+        return false;
+    }
+
+    ds4_solar_checkpoint *cp = &rt->checkpoint[slot];
+    memset(cp, 0, sizeof(*cp));
+    cp->pos = pos;
+    cp->last_use = ++rt->checkpoint_clock;
+    solar_checkpoint_set_ref(cp, bank);
+    if (logits_valid && rt->bank_logits_valid[bank]) {
+        memcpy(rt->checkpoint_logits + (size_t)slot * DS4_N_VOCAB,
+               rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        cp->logits_valid = 1u;
+    }
+    return true;
+}
+
+static bool solar_batch_runtime_checkpoint_due(
+        const ds4_solar_batch_runtime *rt, uint32_t before,
+        uint32_t after) {
+    return rt && rt->checkpoint_stride != 0u && after > before &&
+           before / rt->checkpoint_stride != after / rt->checkpoint_stride;
+}
+
+static bool solar_batch_runtime_restore_checkpoint(
+        ds4_solar_batch_runtime *rt, uint32_t src, uint32_t dst,
+        uint32_t slot, uint32_t cut, uint32_t *pos_out) {
+    if (!rt || src >= rt->max_seq || dst >= rt->max_seq ||
+        slot >= SOLAR_PARTIAL_CHECKPOINT_SLOTS) {
+        return false;
+    }
+    ds4_solar_checkpoint *cp = &rt->checkpoint[slot];
+    const uint32_t pos = cp->pos;
+    if (pos == 0u || pos > cut || !solar_checkpoint_ref(cp, src) ||
+        !solar_batch_runtime_ensure_state(rt, dst) ||
+        !solar_batch_runtime_ensure_kv(rt, dst, pos) ||
+        ds4_gpu_tensor_copy(
+            rt->state_slab, (uint64_t)dst * rt->graph.state_bytes,
+            rt->checkpoint_slab, (uint64_t)slot * rt->graph.state_bytes,
+            rt->graph.state_bytes) == 0) {
+        return false;
+    }
+    if (src != dst) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (!ds4_solar_layer_is_gqa(il)) continue;
+            const uint64_t bytes =
+                (uint64_t)pos * rt->graph.base.kv_row_bytes;
+            if (bytes != 0u &&
+                ds4_gpu_tensor_copy(
+                    rt->kv_slab[il],
+                    (uint64_t)dst * rt->kv_bank_bytes[il],
+                    rt->kv_slab[il],
+                    (uint64_t)src * rt->kv_bank_bytes[il], bytes) == 0) {
+                return false;
+            }
+        }
+    }
+    if (cp->logits_valid) {
+        memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
+               rt->checkpoint_logits + (size_t)slot * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->bank_logits_valid[dst] = 1u;
+    } else {
+        rt->bank_logits_valid[dst] = 0u;
+    }
+    cp->last_use = ++rt->checkpoint_clock;
+    solar_batch_runtime_inherit_checkpoints(rt, src, dst, cut);
+    if (pos_out) *pos_out = pos;
+    return true;
+}
+
+static uint64_t solar_batch_runtime_trim_unused_checkpoints(
+        ds4_solar_batch_runtime *rt) {
+    if (!rt || !rt->checkpoint_slab) return 0u;
+    uint64_t freed = 0u;
+    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        if (rt->checkpoint[i].pos != 0u) continue;
+        freed += ds4_gpu_tensor_trim(
+            rt->checkpoint_slab, (uint64_t)i * rt->graph.state_bytes,
+            rt->graph.state_bytes);
+    }
+    return freed;
+}
+
+static uint64_t solar_batch_span_need(const ds4_gpu_tensor *tensor,
                                       uint64_t offset, uint64_t bytes) {
     if (!tensor || bytes == 0u) return 0u;
     const uint64_t resident =
@@ -43768,6 +43997,7 @@ static uint64_t solar_batch_runtime_projected_need(
 
 static bool solar_batch_runtime_reset_bank(ds4_solar_batch_runtime *rt,
                                            uint32_t bank) {
+    solar_batch_runtime_drop_checkpoints(rt, bank);
     if (!solar_batch_runtime_ensure_state(rt, bank) ||
         !solar_batch_runtime_bind(rt, bank) ||
         !solar_graph_reset_state(&rt->graph)) {
@@ -43810,6 +44040,7 @@ static bool solar_batch_runtime_copy_bank(ds4_solar_batch_runtime *rt,
     } else {
         rt->bank_logits_valid[dst] = 0u;
     }
+    solar_batch_runtime_inherit_checkpoints(rt, src, dst, UINT32_MAX);
     return true;
 }
 
@@ -44083,6 +44314,27 @@ static ds4_solar_batch_runtime *solar_batch_runtime_create(
         return NULL;
     }
 
+    const char *partial_env = getenv("DS4_SERVER_FORK_PARTIAL");
+    const bool partial_enabled =
+        !(partial_env && partial_env[0] == '0' && partial_env[1] == '\0');
+    if (partial_enabled && rt->graph.state_bytes <=
+        UINT64_MAX / SOLAR_PARTIAL_CHECKPOINT_SLOTS) {
+        rt->checkpoint_slab = ds4_gpu_tensor_reserve(
+            rt->graph.state_bytes * SOLAR_PARTIAL_CHECKPOINT_SLOTS);
+    }
+    if (rt->checkpoint_slab) {
+        rt->checkpoint_logits = xcalloc(
+            (size_t)SOLAR_PARTIAL_CHECKPOINT_SLOTS * DS4_N_VOCAB,
+            sizeof(*rt->checkpoint_logits));
+        uint64_t stride = ((uint64_t)ctx_size +
+                           SOLAR_PARTIAL_PERIODIC_TARGET - 1u) /
+                          SOLAR_PARTIAL_PERIODIC_TARGET;
+        if (stride < 4096u) stride = 4096u;
+        stride = (stride + 4095u) & ~4095ull;
+        rt->checkpoint_stride = stride > UINT32_MAX
+            ? UINT32_MAX : (uint32_t)stride;
+    }
+
     const uint64_t kda_dim =
         (uint64_t)DS4_N_HEAD * DS4_N_KDA_HEAD_DIM;
     const uint64_t recurrent_bytes =
@@ -44172,9 +44424,13 @@ static ds4_solar_batch_runtime *solar_batch_runtime_create(
     }
     ds4_log(stderr, DS4_LOG_TIMING,
             "ds4: Solar batch runtime: %u banks, KDA %.2f MiB/bank, "
-            "GQA KV %.2f GiB virtual/bank\n",
+            "GQA KV %.2f GiB virtual/bank, partial=%u x %.2f MiB "
+            "shared checkpoints stride=%u\n",
             max_seq, (double)rt->graph.state_bytes / 1048576.0,
-            (double)rt->graph.base.kv_bytes / 1073741824.0);
+            (double)rt->graph.base.kv_bytes / 1073741824.0,
+            rt->checkpoint_slab ? SOLAR_PARTIAL_CHECKPOINT_SLOTS : 0u,
+            (double)rt->graph.state_bytes / 1048576.0,
+            rt->checkpoint_stride);
     return rt;
 }
 
@@ -44270,8 +44526,8 @@ struct ds4_batch_ctx {
     uint64_t        fork_admits;     /* A2b: fork_bank>0 admits served by copy (or */
     uint64_t        fork_rejects;    /* the src==dst warm degenerate) vs degraded  */
     uint64_t        fork_partial;    /* P1: of fork_admits, those served below the
-                                      * source frontier (prefix cut + group replay;
-                                      * src==dst = in-place truncate-reuse) */
+                                      * source frontier from a safe replay base;
+                                      * src==dst = in-place truncate-reuse */
     /* R5 Inc1b: page budget for the demand-mapped comp/index slabs (bytes;
      * 0 = no gating) + admits rejected because mapping the request's projected
      * committed length would bust it.  pinned = DS4_BATCH_VMM_BUDGET_MB set:
@@ -44545,6 +44801,7 @@ static int solar_cont_bank_restore_payload(
                         "Solar bank payload byte count does not match its header");
         return 1;
     }
+    solar_batch_runtime_drop_checkpoints(rt, bank);
     if (!solar_batch_runtime_ensure_state(rt, bank) ||
         !solar_batch_runtime_ensure_kv(rt, bank, saved_live)) {
         payload_set_err(err, errlen,
@@ -46194,20 +46451,26 @@ static int solar_trim_sync_cuda(void *user) {
 static uint64_t solar_trim_bank_cuda(uint32_t b, void *user) {
     ds4_batch_ctx *ctx = user;
     ds4_solar_batch_runtime *rt = ctx->solar;
-    uint64_t got = ds4_gpu_tensor_trim(
+    uint64_t live_got = ds4_gpu_tensor_trim(
         rt->state_slab, (uint64_t)b * rt->graph.state_bytes,
         rt->graph.state_bytes);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!ds4_solar_layer_is_gqa(il)) continue;
-        got += ds4_gpu_tensor_trim(
+        live_got += ds4_gpu_tensor_trim(
             rt->kv_slab[il], (uint64_t)b * rt->kv_bank_bytes[il],
             rt->kv_bank_bytes[il]);
     }
-    if (got != 0u) {
+    solar_batch_runtime_drop_checkpoints(rt, b);
+    const uint64_t checkpoint_got =
+        solar_batch_runtime_trim_unused_checkpoints(rt);
+    const uint64_t got = live_got + checkpoint_got;
+    if (live_got != 0u) {
         ctx->bank_gen[b]++;
         ctx->bank_hist_valid[b] = 0u;
         ctx->bank_hist_len[b] = 0u;
         rt->bank_logits_valid[b] = 0u;
+    }
+    if (got != 0u) {
         ctx->trim_banks++;
         ctx->trim_bytes += got;
     }
@@ -46668,6 +46931,7 @@ static int solar_batch_ctx_create_impl(
      * share bank_hist_reset/touch with the upstream cont core, so the
      * recency array must exist wherever those helpers can run. */
     ctx->bank_last_use = xcalloc(ctx->max_seq, sizeof(*ctx->bank_last_use));
+    ctx->supports_partial_reuse = ctx->solar->checkpoint_slab != NULL;
     ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
     *out = ctx;
     return 0;
@@ -47523,7 +47787,10 @@ static void bank_hist_reset(ds4_batch_ctx *ctx, uint32_t b) {
     ctx->bank_last_use[b] = ++ctx->use_clock;   /* v0.6.2 Inc 3: recency */
 }
 static void bank_hist_invalidate_all(ds4_batch_ctx *ctx) {
-    for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b]++;   /* Inc 5a */
+    for (uint32_t b = 0; b < ctx->max_seq; b++) {
+        ctx->bank_gen[b]++;   /* Inc 5a */
+        if (ctx->solar) solar_batch_runtime_drop_checkpoints(ctx->solar, b);
+    }
     memset(ctx->bank_hist_valid, 0, (size_t)ctx->max_seq);
 }
 static void bank_hist_append(ds4_batch_ctx *ctx, uint32_t b, int tok) {
@@ -49004,18 +49271,25 @@ static int solar_engine_continuous_generate(
 
             uint32_t cached = 0u;
             bool forked = false;
+            bool partial = false;
             bool warm = false;
             const uint32_t requested_cached =
                 req.n_cached > 0 && req.n_cached <= req.n
                     ? (uint32_t)req.n_cached : 0u;
 
             if (src >= 0 && requested_cached != 0u) {
-                const bool source_ok =
+                const bool source_idle =
                     (uint32_t)src < MS &&
                     bank[src].phase == FAMILY_CONT_FREE &&
-                    family_cont_history_exact(
-                        ctx, (uint32_t)src, req.tokens, requested_cached);
-                if (source_ok) {
+                    ctx->bank_hist_valid[src];
+                const uint32_t source_frontier = source_idle
+                    ? ctx->bank_hist_len[src] : 0u;
+                const bool source_prefix = source_idle &&
+                    requested_cached <= source_frontier &&
+                    memcmp(ctx->bank_hist + (size_t)src * ctx->seq_cap,
+                           req.tokens,
+                           (size_t)requested_cached * sizeof(*req.tokens)) == 0;
+                if (source_prefix && requested_cached == source_frontier) {
                     if ((uint32_t)src != b) {
                         if (!solar_batch_runtime_copy_bank(
                                 rt, (uint32_t)src, b, requested_cached)) {
@@ -49035,6 +49309,42 @@ static int solar_engine_continuous_generate(
                     }
                     cached = requested_cached;
                     forked = true;
+                } else if (source_prefix &&
+                           requested_cached < source_frontier) {
+                    const int checkpoint =
+                        solar_batch_runtime_find_checkpoint(
+                            rt, (uint32_t)src, requested_cached,
+                            (uint32_t)req.n);
+                    uint32_t checkpoint_pos = 0u;
+                    if (checkpoint >= 0) {
+                        if (!solar_batch_runtime_restore_checkpoint(
+                                rt, (uint32_t)src, b,
+                                (uint32_t)checkpoint, requested_cached,
+                                &checkpoint_pos)) {
+                            ctx->bank_gen[b]++;
+                            ctx->bank_hist_valid[b] = 0u;
+                            solar_batch_runtime_drop_checkpoints(rt, b);
+                            SCG_ERR("continuous_generate: Solar checkpoint restore "
+                                    "failed src=%d dst=%u cut=%u",
+                                    src, b, requested_cached);
+                            ok = false;
+                            break;
+                        }
+                        if ((uint32_t)src != b) {
+                            memcpy(ctx->bank_hist + (size_t)b * ctx->seq_cap,
+                                   ctx->bank_hist +
+                                       (size_t)src * ctx->seq_cap,
+                                   (size_t)checkpoint_pos * sizeof(int));
+                        }
+                        ctx->bank_gen[b]++;
+                        ctx->bank_hist_len[b] = checkpoint_pos;
+                        ctx->bank_hist_valid[b] = 1u;
+                        cached = checkpoint_pos;
+                        forked = true;
+                        partial = true;
+                    } else {
+                        ctx->fork_rejects++;
+                    }
                 } else {
                     ctx->fork_rejects++;
                 }
@@ -49056,11 +49366,21 @@ static int solar_engine_continuous_generate(
                 warm = false;
                 if (forked) ctx->fork_rejects++;
                 forked = false;
+                partial = false;
             }
 
             if (forked) {
                 ctx->fork_admits++;
-                ds4_metric_add(&ds4_metrics_get()->admits_fork, 1u);
+                if (partial) {
+                    ctx->fork_partial++;
+                    ds4_metric_add(
+                        (uint32_t)src == b
+                            ? &ds4_metrics_get()->admits_partial_truncate
+                            : &ds4_metrics_get()->admits_partial_fork,
+                        1u);
+                } else {
+                    ds4_metric_add(&ds4_metrics_get()->admits_fork, 1u);
+                }
             } else if (warm) {
                 ctx->warm_admits++;
                 ds4_metric_add(&ds4_metrics_get()->admits_warm, 1u);
@@ -49177,6 +49497,11 @@ static int solar_engine_continuous_generate(
                         ok = false;
                         break;
                     }
+                    if (!final && solar_batch_runtime_checkpoint_due(
+                            rt, pos, pos + n)) {
+                        (void)solar_batch_runtime_capture_checkpoint(
+                            rt, pb, pos + n, false, ctx->serial_reserve);
+                    }
                 }
 
                 if (sb->prefill_off == sb->prefill_len) {
@@ -49186,6 +49511,11 @@ static int solar_engine_continuous_generate(
                         ok = false;
                         break;
                     }
+                    /* Every request boundary is a semantic checkpoint.  A
+                     * repeated exact retry at the same frontier is a no-op. */
+                    (void)solar_batch_runtime_capture_checkpoint(
+                        rt, pb, ctx->bank_hist_len[pb], true,
+                        ctx->serial_reserve);
                     const int sample_override = sb->sample_override ?
                         sb->sample_override(ud, sb->user) :
                         DS4_SAMPLE_OVERRIDE_NONE;
@@ -49270,6 +49600,12 @@ static int solar_engine_continuous_generate(
             const uint32_t b = decode_banks[row];
             ds4_family_cont_bank *sb = &bank[b];
             bank_hist_append(ctx, b, sb->current);
+            if (solar_batch_runtime_checkpoint_due(
+                    rt, decode_positions[row], ctx->bank_hist_len[b])) {
+                (void)solar_batch_runtime_capture_checkpoint(
+                    rt, b, ctx->bank_hist_len[b], true,
+                    ctx->serial_reserve);
+            }
             sb->stats.decode_steps++;
             ds4_metric_add(&ds4_metrics_get()->decode_steps, 1u);
 

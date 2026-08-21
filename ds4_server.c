@@ -17352,7 +17352,7 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
          *
          * A transport failure or semantic stop has no replayable terminal
          * transcript.  Such a prompt-only record is a partial-rewind hint only
-         * and is dropped on runtimes (Solar KDA) that cannot rewind. */
+         * and is dropped on runtimes without a safe restore base. */
         const int committed = s->batch_ctx ?
             ds4_batch_ctx_bank_committed(s->batch_ctx, bank, NULL) : 0;
         if (committed <= 0) return;
@@ -17772,10 +17772,9 @@ warm_full_skipped:
      * then cut at the token-LCP between the trunk's committed history and the
      * request's CANONICAL tokens -- the cached prefix is then a canonical
      * token prefix of the request, so no re-tokenization is needed and the
-     * engine's prefix memcmp validates it directly (it also aligns the cut
-     * down and replays the boundary group; pos_base in the admit line is the
-     * engine truth).  The trunk record survives a fork, so siblings sharing
-     * the prefix keep matching it. */
+     * engine's prefix memcmp validates it directly.  The engine then chooses
+     * its safe model-specific replay base at or below the proposed cut.  The
+     * trunk record survives a fork, so siblings keep matching it. */
     if (s->warm_fork_partial && plen) {
         int pb = -1;
         size_t plcp = 0;
@@ -17858,7 +17857,7 @@ warm_full_skipped:
                                pb);
                     goto warm_partial_skipped;
                 }
-                req->n_cached  = cut;                /* engine aligns + validates */
+                req->n_cached  = cut;                /* engine validates + restores */
                 req->fork_bank = pb + 1;
                 s->warm[pb].last_use = ++s->warm_clock;
                 if (ft >= 0) {
@@ -22352,8 +22351,8 @@ int main(int argc, char **argv) {
                          * only (the pre-P1 behavior); _MIN = minimum shared
                          * canonical tokens worth a fork (default 192).
                          * The ctx capability is authoritative: recurrent
-                         * runtimes such as Solar cannot rewind an arbitrary
-                         * KDA frontier and must keep exact warm/fork only. */
+                         * runtimes may advertise retained state checkpoints;
+                         * runtimes with no safe restore base keep exact reuse. */
                         const char *pe = getenv("DS4_SERVER_FORK_PARTIAL");
                         const bool partial_requested =
                             !(pe && pe[0] == '0' && pe[1] == '\0');
@@ -22371,9 +22370,9 @@ int main(int argc, char **argv) {
                         const char *pn = getenv("DS4_SERVER_PIN_MIN_TOKENS");
                         s.warm_pin_min = (pn && pn[0]) ? atoi(pn) : 65536;
                         if (s.warm_pin_min < 0) s.warm_pin_min = 0;
-                        /* The engine's replay base aligns down to the largest
-                         * compress ratio (128 on Flash) -- cuts below align+4
-                         * degrade to cold, so don't bother issuing them. */
+                        /* Compressed-KV runtimes may replay from an aligned
+                         * group boundary; retain the common small-cut floor so
+                         * partial setup is only attempted when useful. */
                         if (s.warm_partial_min < 136) s.warm_partial_min = 136;
                         /* v0.5.1 inc3 kill switches (A/B): disk-tier partial
                          * restore + pin-tier bank checkpointing. */

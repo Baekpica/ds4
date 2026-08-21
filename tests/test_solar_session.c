@@ -76,6 +76,7 @@ struct solar_cont_test {
     int first_cached;
     int first_max_new;
     int first_place_bank;
+    int first_fork_bank;
     int next_admit;
     int allow_second;
     int alive_calls;
@@ -135,6 +136,7 @@ static int solar_cont_admit(void *ud, ds4_cont_request *req) {
     if (i == 0) {
         req->place_bank = test->first_place_bank;
         req->n_cached = test->first_cached;
+        req->fork_bank = test->first_fork_bank;
     }
     return 1;
 }
@@ -163,9 +165,180 @@ static void solar_cont_on_done(void *ud, void *user, const int *tokens,
     test->done++;
 }
 
+static int expect_solar_partial(
+        ds4_batch_ctx *ctx, const ds4_tokens *prompt,
+        int source_bank, int source_len, int cut, int expected_cached,
+        int cold_bank, int partial_bank, char *err, size_t errlen) {
+    solar_cont_test cold = {0};
+    cold.prompt[0] = prompt;
+    cold.n_requests = 1;
+    cold.first_max_new = 1;
+    cold.first_place_bank = cold_bank + 1;
+    cold.user[0].test = &cold;
+    cold.user[0].id = 0;
+    cold.bank_used[0] = -1;
+    cold.admitted_cached[0] = -1;
+    cold.admitted_computed[0] = -1;
+    cold.admitted_bank[0] = -1;
+    err[0] = '\0';
+    if (ds4_engine_continuous_generate(
+            ctx, solar_cont_admit, solar_cont_on_token,
+            solar_cont_on_done, &cold, err, errlen) != 0 ||
+        cold.failed || cold.done != 1 || cold.n_tokens[0] != 1 ||
+        cold.admitted_cached[0] != 0 ||
+        cold.admitted_computed[0] != prompt->len ||
+        cold.admitted_bank[0] != cold_bank) {
+        fprintf(stderr,
+                "Solar partial cold oracle failed: %s done=%d split=%d+%d "
+                "bank=%d\n",
+                err, cold.done, cold.admitted_cached[0],
+                cold.admitted_computed[0], cold.admitted_bank[0]);
+        return 1;
+    }
+
+    solar_cont_test partial = {0};
+    partial.prompt[0] = prompt;
+    partial.n_requests = 1;
+    partial.first_cached = cut;
+    partial.first_max_new = 1;
+    partial.first_place_bank = partial_bank + 1;
+    partial.first_fork_bank = source_bank + 1;
+    partial.user[0].test = &partial;
+    partial.user[0].id = 0;
+    partial.bank_used[0] = -1;
+    partial.admitted_cached[0] = -1;
+    partial.admitted_computed[0] = -1;
+    partial.admitted_bank[0] = -1;
+    err[0] = '\0';
+    if (ds4_engine_continuous_generate(
+            ctx, solar_cont_admit, solar_cont_on_token,
+            solar_cont_on_done, &partial, err, errlen) != 0 ||
+        partial.failed || partial.done != 1 || partial.n_tokens[0] != 1 ||
+        partial.tokens[0][0] != cold.tokens[0][0] ||
+        partial.admitted_cached[0] != expected_cached ||
+        partial.admitted_computed[0] != prompt->len - expected_cached ||
+        partial.admitted_bank[0] != partial_bank ||
+        ds4_batch_ctx_bank_committed(ctx, source_bank, NULL) != source_len ||
+        ds4_batch_ctx_bank_committed(ctx, partial_bank, NULL) != prompt->len) {
+        fprintf(stderr,
+                "Solar partial fork failed: %s done=%d token=%d/%d "
+                "cut=%d split=%d+%d bank=%d source=%d destination=%d\n",
+                err, partial.done, partial.tokens[0][0], cold.tokens[0][0],
+                cut, partial.admitted_cached[0],
+                partial.admitted_computed[0], partial.admitted_bank[0],
+                ds4_batch_ctx_bank_committed(ctx, source_bank, NULL),
+                ds4_batch_ctx_bank_committed(ctx, partial_bank, NULL));
+        return 1;
+    }
+    fprintf(stderr,
+            "Solar partial fork: source=%d cut=%d checkpoint=%d replay=%d "
+            "token=%d\n",
+            source_len, cut, expected_cached,
+            prompt->len - expected_cached, partial.tokens[0][0]);
+    return 0;
+}
+
+static int run_solar_cont_request(
+        ds4_batch_ctx *ctx, const ds4_tokens *prompt, int cached,
+        int max_new, int place_bank, int fork_bank,
+        solar_cont_test *test, char *err, size_t errlen) {
+    memset(test, 0, sizeof(*test));
+    test->prompt[0] = prompt;
+    test->n_requests = 1;
+    test->first_cached = cached;
+    test->first_max_new = max_new;
+    test->first_place_bank = place_bank + 1;
+    test->first_fork_bank = fork_bank + 1;
+    test->user[0].test = test;
+    test->user[0].id = 0;
+    test->bank_used[0] = -1;
+    test->admitted_cached[0] = -1;
+    test->admitted_computed[0] = -1;
+    test->admitted_bank[0] = -1;
+    err[0] = '\0';
+    return ds4_engine_continuous_generate(
+               ctx, solar_cont_admit, solar_cont_on_token,
+               solar_cont_on_done, test, err, errlen) != 0 ||
+           test->failed || test->done != 1 || test->n_tokens[0] != max_new;
+}
+
+static int run_solar_partial_gate(ds4_engine *engine,
+                                  const ds4_tokens *seed) {
+    ds4_batch_ctx *ctx = NULL;
+    ds4_tokens source = {0};
+    ds4_tokens branch = {0};
+    solar_cont_test req = {0};
+    char err[256] = "";
+    int failed = 0;
+
+    if (ds4_batch_ctx_create_fit(
+            engine, 128, 4, 16, &ctx, err, sizeof(err)) != 0 ||
+        !ctx || !ds4_batch_ctx_supports_partial_reuse(ctx)) {
+        fprintf(stderr, "Solar partial gate context failed: %s\n", err);
+        failed = 1;
+        goto done;
+    }
+    for (int i = 0; i < 16; i++)
+        ds4_tokens_push(&source, seed->v[i % seed->len]);
+    if (run_solar_cont_request(
+            ctx, &source, 0, 1, 0, -1, &req, err, sizeof(err)) ||
+        req.admitted_cached[0] != 0 || req.admitted_computed[0] != 16 ||
+        ds4_batch_ctx_bank_committed(ctx, 0, NULL) != 16) {
+        fprintf(stderr, "Solar partial gate source failed: %s\n", err);
+        failed = 1;
+        goto done;
+    }
+
+    for (int target = 24; target <= 32; target += 8) {
+        const int cached = source.len;
+        while (source.len < target)
+            ds4_tokens_push(&source, seed->v[source.len % seed->len]);
+        if (run_solar_cont_request(
+                ctx, &source, cached, 1, 0, -1,
+                &req, err, sizeof(err)) ||
+            req.admitted_cached[0] != cached ||
+            req.admitted_computed[0] != target - cached ||
+            ds4_batch_ctx_bank_committed(ctx, 0, NULL) != target) {
+            fprintf(stderr,
+                    "Solar partial gate checkpoint %d failed: %s split=%d+%d\n",
+                    target, err, req.admitted_cached[0],
+                    req.admitted_computed[0]);
+            failed = 1;
+            goto done;
+        }
+    }
+
+    const int cuts[2] = {19, 27};
+    const int checkpoints[2] = {16, 24};
+    for (int n = 0; n < 2; n++) {
+        ds4_tokens_free(&branch);
+        for (int i = 0; i < cuts[n]; i++)
+            ds4_tokens_push(&branch, source.v[i]);
+        int diverge = (source.v[cuts[n]] + 1) %
+                      ds4_engine_vocab_size(engine);
+        ds4_tokens_push(&branch, diverge);
+        if (expect_solar_partial(
+                ctx, &branch, 0, 32, cuts[n], checkpoints[n],
+                2, 3, err, sizeof(err)) != 0) {
+            failed = 1;
+            goto done;
+        }
+    }
+
+done:
+    ds4_tokens_free(&branch);
+    ds4_tokens_free(&source);
+    ds4_batch_ctx_destroy(ctx);
+    return failed;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <first-model-shard.gguf>\n", argv[0]);
+    const int partial_only = argc == 3 &&
+        strcmp(argv[2], "--partial-only") == 0;
+    if (argc != 2 && !partial_only) {
+        fprintf(stderr,
+                "usage: %s <first-model-shard.gguf> [--partial-only]\n",
+                argv[0]);
         return 2;
     }
     if (setenv("DS4_METAL_PREFILL_CHUNK", "3", 1) != 0 ||
@@ -225,6 +398,10 @@ int main(int argc, char **argv) {
     ds4_tokens_push(&prompt_alt, 29497);
     ds4_tokens_push(&prompt_alt, 132);
     ds4_tokens_push(&prompt_alt, 4768);
+    if (partial_only) {
+        failed = run_solar_partial_gate(engine, &prompt);
+        goto cleanup;
+    }
     if (ds4_session_create(&session, engine, 128) != 0) {
         fprintf(stderr, "Solar session creation failed\n");
         failed = 1;
@@ -511,13 +688,6 @@ int main(int argc, char **argv) {
         batch_ctx == NULL || ds4_batch_ctx_max_seq(batch_ctx) != 4 ||
         ds4_batch_ctx_seq_cap(batch_ctx) != 128) {
         fprintf(stderr, "Solar batch context creation failed: %s\n", err);
-        failed = 1;
-        goto cleanup;
-    }
-    if (ds4_batch_ctx_supports_partial_reuse(batch_ctx)) {
-        fprintf(stderr,
-                "Solar batch context incorrectly advertises partial reuse\n");
-        ds4_batch_ctx_destroy(batch_ctx);
         failed = 1;
         goto cleanup;
     }
@@ -1027,7 +1197,11 @@ cleanup:
     ds4_tokens_free(&prompt_alt);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
-    puts(failed ? "Solar public session lifecycle FAILED"
-                : "Solar public session lifecycle passed");
+    if (partial_only)
+        puts(failed ? "Solar partial reuse checkpoint gate FAILED"
+                    : "Solar partial reuse checkpoint gate passed");
+    else
+        puts(failed ? "Solar public session lifecycle FAILED"
+                    : "Solar public session lifecycle passed");
     return failed ? 1 : 0;
 }
