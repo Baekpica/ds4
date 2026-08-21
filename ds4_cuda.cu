@@ -33,6 +33,7 @@
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_mem_census.h"
 #include "ds4_model_catalog.h" /* memgov D1a-4: unit tables for range stamps */
+#include "ds4_weight_identity.h" /* rider #48: manifest content fingerprint */
 #include "ds4_mem_gov.h"      /* memgov D0b: epoch protocol primitives */
 
 #ifndef M_PI
@@ -210,6 +211,12 @@ static uint64_t g_mem_census_faults;
 static uint64_t g_mem_census_epoch;   /* D0b-2 seqlock (ds4_mem_gov.h) */
 static int g_mem_scope_stack[8];
 static int g_mem_scope_depth;
+
+/* MT-6 (gap-3 closes): the typed observation provider, defined later in
+ * this file; declared here so the early-file budget/routing decisions
+ * (q8-f16 cache, managed-KV) read the ONE observation instead of raw
+ * cudaMemGetInfo. */
+extern "C" int ds4_gpu_mem_observe(ds4_mem_observation *out);
 
 static void cuda_mem_note_alloc(int cls, int dom, uint64_t requested,
                                 uint64_t committed) {
@@ -2014,18 +2021,19 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
         return 0;
     }
 
-    size_t free_b = 0;
-    size_t total_b = 0;
-    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA q8 fp16 cache memory query failed: %s; using q8 kernels\n",
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
+    /* MT-6 (audit V10, gap-3/C11): the budget reads the ONE typed
+     * observation every other verdict reads, not a second raw
+     * cudaMemGetInfo answer -- on GB10 the raw read under-counted free
+     * by the reclaimable page cache, refusing cache builds the box could
+     * fund.  Same conservative reserve below, honest free above it. */
+    ds4_mem_observation obs;
+    if (ds4_gpu_mem_observe(&obs) != 0 || obs.status != DS4_MEMOBS_OK) {
+        fprintf(stderr, "ds4: CUDA q8 fp16 cache memory query failed; using q8 kernels\n");
         return 0;
     }
 
-    const uint64_t free_bytes = (uint64_t)free_b;
-    const uint64_t total_bytes = (uint64_t)total_b;
+    const uint64_t free_bytes = obs.free_bytes;
+    const uint64_t total_bytes = obs.total_bytes;
     const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes);
     if (request_bytes > free_bytes ||
         free_bytes - request_bytes < reserve_bytes) {
@@ -4379,16 +4387,18 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     const uint64_t large_context = 8ull * 1073741824ull;
     if (context_bytes < large_context) return 0;
 
-    size_t free_b = 0;
-    size_t total_b = 0;
-    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
+    /* MT-6 (audit V10 twin, gap-3/C12): route the mid-band decision through
+     * the ONE typed observation (max of cuda free and MemAvailable on
+     * integrated parts) instead of a second raw cudaMemGetInfo answer that
+     * under-counts reclaimable page cache and steered borderline contexts
+     * to managed-VA for no reason.  The >=8 GiB unconditional tier above
+     * is untouched. */
+    ds4_mem_observation obs;
+    if (ds4_gpu_mem_observe(&obs) != 0 || obs.status != DS4_MEMOBS_OK)
         return 0;
-    }
 
-    const uint64_t free_bytes = (uint64_t)free_b;
-    const uint64_t total_bytes = (uint64_t)total_b;
+    const uint64_t free_bytes = obs.free_bytes;
+    const uint64_t total_bytes = obs.total_bytes;
     const uint64_t reserve_bytes = cuda_managed_kv_reserve_bytes(total_bytes);
     if (context_bytes > free_bytes) return 1;
     return free_bytes - context_bytes < reserve_bytes;
@@ -4494,9 +4504,17 @@ extern "C" void ds4_gpu_boot_trim(void) {
  * delta rides ds4_gpu_mem_observe -- the same answer the verdicts read
  * -- so it measures the return where it matters.  Kernel-side noise can
  * ride the delta; callers treat it as disclosure, not ledger. */
+/* MT-6 (audit V9): idle exec-pool sweep, defined with the pools below. */
+static uint64_t ds4_cuda_graph_exec_idle_trim(void);
+
 extern "C" uint64_t ds4_gpu_own_trim(void) {
     ds4_mem_observation a, b;
     const int a_ok = ds4_gpu_mem_observe(&a) == 0 && a.status == DS4_MEMOBS_OK;
+    /* MT-6 (audit V9): shed idle captured-graph execs first -- the sweep's
+     * driver-side frees are what cudaDeviceGraphMemTrim below then returns,
+     * and the whole action rides the same observe bracket so the disclosed
+     * delta stays one number. */
+    (void)ds4_cuda_graph_exec_idle_trim();
     ds4_gpu_boot_trim();
     if (!a_ok) return 0;
     if (ds4_gpu_mem_observe(&b) != 0 || b.status != DS4_MEMOBS_OK) return 0;
@@ -5468,6 +5486,80 @@ static int import_vmm_derived_allocation(
     return 1;
 }
 
+/* Rider #48: verify the manifest's content fingerprint for model_id
+ * against this process's own mapping of the model file, BEFORE any range
+ * is published (a mismatch after partial publication would need rollback).
+ * The manifest is a few KiB, so a dedicated pre-scan pass is cheap and
+ * keeps the check independent of record order in the file.
+ * Returns 2 = verified, 1 = proceed unverified (no record / unknown algo /
+ * check disabled), 0 = refuse (fingerprint or size mismatch: the weight
+ * server is serving different bytes than this engine's file). */
+static int manifest_content_identity_check(const char *manifest_path,
+                                           const void *model_map,
+                                           uint64_t model_size,
+                                           const char *model_id) {
+    const char *knob = getenv("DS4_WEIGHT_FP_CHECK");
+    if (knob && knob[0] == '0' && knob[1] == '\0') {
+        fprintf(stderr,
+                "ds4: CUDA weight manifest content check DISABLED for %s "
+                "(DS4_WEIGHT_FP_CHECK=0); identity by model id + size only\n",
+                model_id);
+        return 1;
+    }
+    FILE *fp = fopen(manifest_path, "r");
+    if (!fp) return 1; /* the caller re-opens and reports open failures */
+    char line[4096];
+    int found = 0;
+    unsigned long long rec_size = 0;
+    char rec_algo[64] = {0};
+    char rec_hex[64] = {0};
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        char rec[32] = {0};
+        char id[64] = {0};
+        if (sscanf(p, "%31s %63s %llu %63s %63s",
+                   rec, id, &rec_size, rec_algo, rec_hex) != 5) continue;
+        if (strcmp(rec, "content") != 0 || strcmp(id, model_id) != 0) continue;
+        found = 1;
+        break;
+    }
+    fclose(fp);
+    if (!found) {
+        fprintf(stderr,
+                "ds4: CUDA weight manifest carries no content fingerprint for "
+                "%s (older ds4_weight_server); identity by model id + size "
+                "only\n",
+                model_id);
+        return 1;
+    }
+    if (strcmp(rec_algo, DS4_WFP_ALGO) != 0) {
+        fprintf(stderr,
+                "ds4: CUDA weight manifest content fingerprint for %s uses "
+                "unknown algo %s (this engine speaks %s); identity by model "
+                "id + size only\n",
+                model_id, rec_algo, DS4_WFP_ALGO);
+        return 1;
+    }
+    uint64_t local_fp = ds4_weight_content_fingerprint(model_map, model_size);
+    uint64_t manifest_fp = (uint64_t)strtoull(rec_hex, NULL, 16);
+    if ((uint64_t)rec_size != model_size || manifest_fp != local_fp) {
+        fprintf(stderr,
+                "ds4: CUDA weight manifest CONTENT IDENTITY MISMATCH for %s: "
+                "manifest %s size=%llu, local %016llx size=%llu. The weight "
+                "server is serving different bytes than this engine's model "
+                "file; restart ds4_weight_server on the current gguf.\n",
+                model_id,
+                rec_hex,
+                rec_size,
+                (unsigned long long)local_fp,
+                (unsigned long long)model_size);
+        return 0;
+    }
+    return 2;
+}
+
 extern "C" int ds4_gpu_import_model_ipc_manifest(
         const void *model_map,
         uint64_t model_size,
@@ -5477,6 +5569,11 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         !model_id || !model_id[0]) {
         return 0;
     }
+    int content_state = manifest_content_identity_check(manifest_path,
+                                                        model_map,
+                                                        model_size,
+                                                        model_id);
+    if (content_state == 0) return 0;
     FILE *fp = fopen(manifest_path, "r");
     if (!fp) {
         fprintf(stderr, "ds4: CUDA shared weight manifest open failed: %s: %s\n",
@@ -5787,11 +5884,12 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         return 0;
     }
     fprintf(stderr,
-            "ds4: CUDA imported shared %s weight cache for %s: %.2f GiB across %llu ranges",
+            "ds4: CUDA imported shared %s weight cache for %s: %.2f GiB across %llu ranges%s",
             vmm_manifest ? "VMM" : "IPC",
             model_id,
             (double)imported_bytes / 1073741824.0,
-            (unsigned long long)imported_ranges);
+            (unsigned long long)imported_ranges,
+            content_state == 2 ? " (content identity verified)" : "");
     if (imported_derived_ranges != 0) {
         fprintf(stderr,
                 " plus %.2f MiB across %llu derived artifacts",
@@ -19447,6 +19545,9 @@ struct moe_graph_entry {
     cudaGraphExec_t exec;
     int valid;
     uint64_t hits;
+    uint64_t exec_bytes;   /* MT-6 (audit V9): empirical instantiate cost,
+                            * noted to DS4_MEMC_GRAPH_EXEC; released verbatim
+                            * at destroy so the ledger stays symmetric. */
 };
 
 #define DS4_MOE_GRAPH_CACHE_SIZE 256
@@ -19456,6 +19557,56 @@ static struct moe_graph_entry g_moe_graphs[DS4_MOE_GRAPH_CACHE_SIZE];
 /* Explicit stream used for the captured routed_moe_launch sequence.
  * Lazily created at first use.  Must be non-default so capture is legal. */
 static cudaStream_t g_moe_stream = NULL;
+
+/* MT-6 (audit V9): the GRAPH_EXEC census wiring, shared by all four exec
+ * pools.  Exec memory is driver-owned and unsized by any API, so the class
+ * is accounted EMPIRICALLY (the D0a design's stated shape): observe free
+ * around cudaGraphInstantiate, note the delta to DS4_MEMC_GRAPH_EXEC, and
+ * record it on the slot so the destroy releases the SAME number -- the
+ * ledger stays symmetric even when the driver returns pages lazily.  A
+ * failed observation (or a delta the noise floor swallows) notes 0: the
+ * class err is under-count, never phantom bytes. */
+static cudaError_t cuda_graph_instantiate_noted(cudaGraphExec_t *exec,
+                                                cudaGraph_t graph,
+                                                uint64_t *bytes_out) {
+    ds4_mem_observation a, b;
+    const int a_ok = ds4_gpu_mem_observe(&a) == 0 && a.status == DS4_MEMOBS_OK;
+    const cudaError_t ge = cudaGraphInstantiate(exec, graph, NULL, NULL, 0);
+    uint64_t delta = 0;
+    if (ge == cudaSuccess && a_ok &&
+        ds4_gpu_mem_observe(&b) == 0 && b.status == DS4_MEMOBS_OK) {
+        /* Prefer the DRIVER's own free counter (MG-2 exposes the raw pair):
+         * exec memory is a driver-internal allocation, so cuda_free moves
+         * by exactly it, while the max-of-two answer can ride MemAvailable
+         * jitter from concurrent page-cache movement -- and one-sided
+         * clamping would turn that jitter into systematic over-count. */
+        const uint64_t af = a.cuda_free_bytes != 0 && b.cuda_free_bytes != 0
+                          ? a.cuda_free_bytes : a.free_bytes;
+        const uint64_t bf = a.cuda_free_bytes != 0 && b.cuda_free_bytes != 0
+                          ? b.cuda_free_bytes : b.free_bytes;
+        if (af > bf) delta = af - bf;
+        /* Sanity clamp: a single exec is KBs..MBs of driver state.  A
+         * delta beyond this is concurrent-activity noise, not the exec;
+         * noting it would plant phantom bytes the destroy releases from
+         * the wrong pocket.  Under-count is the honest failure mode. */
+        if (delta > (256ull << 20)) delta = 0;
+    }
+    if (ge == cudaSuccess && delta != 0)
+        cuda_mem_note_alloc(DS4_MEMC_GRAPH_EXEC, DS4_MEMD_UNIFIED_DEVICE,
+                            delta, delta);
+    if (bytes_out) *bytes_out = ge == cudaSuccess ? delta : 0;
+    return ge;
+}
+
+static void cuda_graph_exec_destroy_noted(cudaGraphExec_t exec,
+                                          uint64_t *bytes_inout) {
+    cudaGraphExecDestroy(exec);
+    if (bytes_inout && *bytes_inout != 0) {
+        cuda_mem_note_free(DS4_MEMC_GRAPH_EXEC, DS4_MEMD_UNIFIED_DEVICE,
+                           *bytes_inout, *bytes_inout);
+        *bytes_inout = 0;
+    }
+}
 
 static cudaStream_t ds4_cuda_moe_stream(void) {
     if (!g_moe_stream) {
@@ -19808,6 +19959,7 @@ struct dense_graph_entry {
     cudaGraphExec_t exec;
     int valid;
     uint64_t hits;
+    uint64_t exec_bytes;   /* MT-6 (audit V9): see moe_graph_entry */
 };
 
 #define DS4_DENSE_GRAPH_CACHE_SIZE 1024
@@ -19910,6 +20062,7 @@ struct layer_graph_entry {
                                           * warmed -- cudaMalloc/cudaFree
                                           * are forbidden inside capture. */
     uint64_t                   hits;
+    uint64_t                   exec_bytes;  /* MT-6 (audit V9): see moe_graph_entry */
 };
 
 /* Deterministic cache: one fixed slot per (il, flags, ping-pong parity).
@@ -20480,7 +20633,8 @@ static void ds4_cuda_invalidate_captured_graphs(const char *why) {
     n += ds4_cuda_cont_graphs_drop();
     for (uint32_t i = 0; i < DS4_LAYER_GRAPH_CACHE_SIZE; i++) {
         if (!g_layer_graphs[i].valid) continue;
-        cudaGraphExecDestroy(g_layer_graphs[i].exec);
+        cuda_graph_exec_destroy_noted(g_layer_graphs[i].exec,
+                                      &g_layer_graphs[i].exec_bytes);
         g_layer_graphs[i].valid = 0;
         g_layer_graphs[i].hits = 0;
         /* forum-#65: a recapture after invalidation must RE-RUN the eager
@@ -20495,14 +20649,16 @@ static void ds4_cuda_invalidate_captured_graphs(const char *why) {
     }
     for (uint32_t i = 0; i < DS4_DENSE_GRAPH_CACHE_SIZE; i++) {
         if (!g_dense_graphs[i].valid) continue;
-        cudaGraphExecDestroy(g_dense_graphs[i].exec);
+        cuda_graph_exec_destroy_noted(g_dense_graphs[i].exec,
+                                      &g_dense_graphs[i].exec_bytes);
         g_dense_graphs[i].valid = 0;
         g_dense_graphs[i].hits = 0;
         n++;
     }
     for (uint32_t i = 0; i < DS4_MOE_GRAPH_CACHE_SIZE; i++) {
         if (!g_moe_graphs[i].valid) continue;
-        cudaGraphExecDestroy(g_moe_graphs[i].exec);
+        cuda_graph_exec_destroy_noted(g_moe_graphs[i].exec,
+                                      &g_moe_graphs[i].exec_bytes);
         g_moe_graphs[i].valid = 0;
         g_moe_graphs[i].hits = 0;
         n++;
@@ -20560,11 +20716,18 @@ static void ds4_cuda_capture_warm_tmp_scratch(void) {
      * Pre-warm to the theoretical maximum: max n_comp = comp_cap = 8194
      * (per the existing g_decode_dev / indexer_topk_tree commentary above),
      * head_dim = 512, sizeof(float) = 4 -> ~16 MiB.  Round to 32 MiB to
-     * leave headroom for any future config bump.  This is only paid when
-     * DS4_CUDA_FP8_KV_PREDECODE will actually be exercised; without the
-     * env flag the scratch helper is never called and the cudaMalloc is
-     * a waste, but at 32 MiB on a 96 GB device the cost is negligible. */
-    (void)fp8_predecode_scratch_alloc((uint64_t)32 * 1024 * 1024);
+     * leave headroom for any future config bump.  MT-5 (audit V8): the
+     * comment here used to call the flag opt-in -- P2 Inc2b made predecode
+     * default ON and serial deep decode consumes it (the bank_persist_gate
+     * P8 capture bug this prewarm prevents was hit on that path), so in
+     * the ship config the 32 MiB is load-bearing.  Gate it on the SAME
+     * enabled() gates the consumers check (mirror present AND predecode on):
+     * in any other config the scratch helper is provably never called and
+     * the prewarm is waste. */
+    if (ds4_cuda_fp8_kv_enabled() && ds4_cuda_fp8_kv_predecode_enabled()) {
+        (void)fp8_predecode_scratch_alloc((uint64_t)32 * 1024 * 1024);
+        fprintf(stderr, "ds4: fp8 predecode scratch prewarmed (32 MiB)\n");
+    }
 }
 
 /* Step 6 diagnostic: cudaPeekAtLastError check used to localize the
@@ -20626,7 +20789,7 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
         if (ge != cudaSuccess) {
             fprintf(stderr, "ds4: cudaGraphLaunch (layer %u) failed: %s; recapturing\n",
                     il, cudaGetErrorString(ge));
-            cudaGraphExecDestroy(slot->exec);
+            cuda_graph_exec_destroy_noted(slot->exec, &slot->exec_bytes);
             slot->valid = 0;
             slot->hits = 0;
             /* Fall through to capture path below. */
@@ -20647,7 +20810,7 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
      * it but return -1 (eager); on the second sighting, BEGIN capture. */
     if (!slot->warmed || memcmp(&slot->key, key, sizeof(*key)) != 0) {
         if (slot->valid) {
-            cudaGraphExecDestroy(slot->exec);
+            cuda_graph_exec_destroy_noted(slot->exec, &slot->exec_bytes);
             slot->valid = 0;
             slot->hits = 0;
         }
@@ -20661,7 +20824,7 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
     /* Capture path.  Evict any stale exec at this slot; install the new
      * key; begin capture; signal caller to encode the body. */
     if (slot->valid) {
-        cudaGraphExecDestroy(slot->exec);
+        cuda_graph_exec_destroy_noted(slot->exec, &slot->exec_bytes);
         slot->valid = 0;
         slot->hits = 0;
     }
@@ -20717,7 +20880,7 @@ extern "C" void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
     }
 
     cudaGraphExec_t exec = NULL;
-    ge = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    ge = cuda_graph_instantiate_noted(&exec, graph, &slot->exec_bytes);
     cudaGraphDestroy(graph);
     if (ge != cudaSuccess) {
         fprintf(stderr, "ds4: cudaGraphInstantiate (layer %u) failed: %s\n",
@@ -20738,7 +20901,7 @@ extern "C" void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
     if (ge != cudaSuccess) {
         fprintf(stderr, "ds4: cudaGraphLaunch (layer %u, first replay) failed: %s\n",
                 il, cudaGetErrorString(ge));
-        cudaGraphExecDestroy(exec);
+        cuda_graph_exec_destroy_noted(exec, &slot->exec_bytes);
         slot->valid = 0;
         return;
     }
@@ -20797,6 +20960,7 @@ struct cont_graph_entry {
     int                         valid;
     int                         warmed;
     uint64_t                    hits;
+    uint64_t                    exec_bytes;  /* MT-6 (audit V9): see moe_graph_entry */
 };
 
 /* Hot population at steady state: 43 layers x 2 hc parities x emit/no-emit
@@ -20890,7 +21054,7 @@ extern "C" int ds4_cuda_cont_graph_begin_or_replay(
         if (ge != cudaSuccess) {
             fprintf(stderr, "ds4: cudaGraphLaunch (cont layer %u) failed: %s; recapturing\n",
                     il, cudaGetErrorString(ge));
-            cudaGraphExecDestroy(slot->exec);
+            cuda_graph_exec_destroy_noted(slot->exec, &slot->exec_bytes);
             slot->valid = 0;
             slot->hits = 0;
             /* fall through to warm/capture below */
@@ -20907,7 +21071,7 @@ extern "C" int ds4_cuda_cont_graph_begin_or_replay(
      * before anything is recorded.  Second sighting captures. */
     if (!slot->warmed || memcmp(&slot->key, key, sizeof(*key)) != 0) {
         if (slot->valid) {
-            cudaGraphExecDestroy(slot->exec);
+            cuda_graph_exec_destroy_noted(slot->exec, &slot->exec_bytes);
             slot->valid = 0;
             slot->hits = 0;
         }
@@ -20917,7 +21081,7 @@ extern "C" int ds4_cuda_cont_graph_begin_or_replay(
         return -1;
     }
     if (slot->valid) {
-        cudaGraphExecDestroy(slot->exec);
+        cuda_graph_exec_destroy_noted(slot->exec, &slot->exec_bytes);
         slot->valid = 0;
         slot->hits = 0;
     }
@@ -20954,7 +21118,7 @@ extern "C" void ds4_cuda_cont_graph_end_or_commit(uint32_t il) {
         return;
     }
     cudaGraphExec_t exec = NULL;
-    ge = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    ge = cuda_graph_instantiate_noted(&exec, graph, &slot->exec_bytes);
     cudaGraphDestroy(graph);
     if (ge != cudaSuccess) {
         fprintf(stderr, "ds4: cudaGraphInstantiate (cont layer %u) failed: %s\n",
@@ -20973,7 +21137,7 @@ extern "C" void ds4_cuda_cont_graph_end_or_commit(uint32_t il) {
     if (ge != cudaSuccess) {
         fprintf(stderr, "ds4: cudaGraphLaunch (cont layer %u, first replay) failed: %s\n",
                 il, cudaGetErrorString(ge));
-        cudaGraphExecDestroy(exec);
+        cuda_graph_exec_destroy_noted(exec, &slot->exec_bytes);
         slot->valid = 0;
         return;
     }
@@ -20984,12 +21148,104 @@ static int ds4_cuda_cont_graphs_drop(void) {
     int n = 0;
     for (uint32_t i = 0; i < DS4_CONT_GRAPH_CACHE_SIZE; i++) {
         if (!g_cont_graphs[i].valid) continue;
-        cudaGraphExecDestroy(g_cont_graphs[i].exec);
+        cuda_graph_exec_destroy_noted(g_cont_graphs[i].exec,
+                                      &g_cont_graphs[i].exec_bytes);
         g_cont_graphs[i].valid = 0;
         g_cont_graphs[i].hits = 0;
         n++;
     }
     return n;
+}
+
+/* MT-6 (audit V9/V11 gotcha): drop the SERIAL per-layer exec pool.  Called
+ * by the engine when a session graph is freed (idle reap, right-size
+ * replace, shutdown): every layer exec bakes that graph's tensor pointers
+ * by value, so after the free the whole pool is stale -- never replayed
+ * (the next session's fresh addresses miss the keys) but LEAKED until an
+ * unrelated scratch resize used to sweep it.  Targeted at the layer pool
+ * only: cont/dense/moe execs serve the batch lane and must survive a
+ * serial teardown (stale dense entries from the freed session die in the
+ * idle sweep below instead). */
+extern "C" int ds4_cuda_layer_graphs_drop(void) {
+    if (g_layer_graph_capturing_slot != NULL || ds4_capture_active())
+        return 0;   /* never destroy execs under an open capture */
+    int n = 0;
+    for (uint32_t i = 0; i < DS4_LAYER_GRAPH_CACHE_SIZE; i++) {
+        if (!g_layer_graphs[i].valid) continue;
+        cuda_graph_exec_destroy_noted(g_layer_graphs[i].exec,
+                                      &g_layer_graphs[i].exec_bytes);
+        g_layer_graphs[i].valid = 0;
+        g_layer_graphs[i].hits = 0;
+        g_layer_graphs[i].warmed = 0;   /* forum-#65: re-warm before recapture */
+        n++;
+    }
+    if (n > 0)
+        fprintf(stderr, "ds4: dropped %d serial layer exec(s) with the session graph\n", n);
+    return n;
+}
+
+/* MT-6 (audit V9): idle exec sweep, invoked from ds4_gpu_own_trim -- i.e.
+ * only at the refusal-ladder pressure sites and the serial idle reaper.
+ * Predicate: a valid exec with hits==0 has not replayed since the last
+ * sweep (or since its capture) -- typically a stale shape variant (an
+ * earlier phase's width/emit key) the serving mix moved off of.  Sweeping
+ * it trades a possible recapture (~ms) for driver pool bytes at the exact
+ * moment an admission is short.  Survivors' hits reset so the next sweep
+ * measures a fresh window.  warmed resets with the destroy: the eager
+ * re-warm costs one pass and keeps the forum-#65 class impossible by
+ * construction rather than by reasoning about which allocator sizes
+ * survived the pressure event.  DS4_GRAPH_EXEC_TRIM=0 disables. */
+static uint64_t ds4_cuda_graph_exec_idle_trim(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("DS4_GRAPH_EXEC_TRIM");
+        en = !(e && e[0] == '0' && e[1] == '\0');
+    }
+    if (!en) return 0;
+    if (g_layer_graph_capturing_slot != NULL || ds4_capture_active())
+        return 0;   /* never destroy execs under an open capture */
+    uint64_t freed = 0;
+    int n = 0;
+    for (uint32_t i = 0; i < DS4_LAYER_GRAPH_CACHE_SIZE; i++) {
+        struct layer_graph_entry *sl = &g_layer_graphs[i];
+        if (!sl->valid) continue;
+        if (sl->hits == 0) {
+            freed += sl->exec_bytes;
+            cuda_graph_exec_destroy_noted(sl->exec, &sl->exec_bytes);
+            sl->valid = 0; sl->warmed = 0; n++;
+        } else sl->hits = 0;
+    }
+    for (uint32_t i = 0; i < DS4_CONT_GRAPH_CACHE_SIZE; i++) {
+        struct cont_graph_entry *sl = &g_cont_graphs[i];
+        if (!sl->valid) continue;
+        if (sl->hits == 0) {
+            freed += sl->exec_bytes;
+            cuda_graph_exec_destroy_noted(sl->exec, &sl->exec_bytes);
+            sl->valid = 0; sl->warmed = 0; n++;
+        } else sl->hits = 0;
+    }
+    for (uint32_t i = 0; i < DS4_DENSE_GRAPH_CACHE_SIZE; i++) {
+        struct dense_graph_entry *sl = &g_dense_graphs[i];
+        if (!sl->valid) continue;
+        if (sl->hits == 0) {
+            freed += sl->exec_bytes;
+            cuda_graph_exec_destroy_noted(sl->exec, &sl->exec_bytes);
+            sl->valid = 0; n++;
+        } else sl->hits = 0;
+    }
+    for (uint32_t i = 0; i < DS4_MOE_GRAPH_CACHE_SIZE; i++) {
+        struct moe_graph_entry *sl = &g_moe_graphs[i];
+        if (!sl->valid) continue;
+        if (sl->hits == 0) {
+            freed += sl->exec_bytes;
+            cuda_graph_exec_destroy_noted(sl->exec, &sl->exec_bytes);
+            sl->valid = 0; n++;
+        } else sl->hits = 0;
+    }
+    if (n > 0)
+        fprintf(stderr, "ds4: graph-exec idle trim: %d exec(s), %.1f MiB noted\n",
+                n, (double)freed / 1048576.0);
+    return freed;
 }
 
 extern "C" void ds4_cuda_cont_graph_stats_maybe_print(uint32_t every) {
@@ -21874,12 +22130,12 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
                 }
                 fprintf(stderr, "ds4: cudaGraphLaunch (dense) failed: %s; recapturing\n",
                         cudaGetErrorString(ge));
-                cudaGraphExecDestroy(dslot->exec);
+                cuda_graph_exec_destroy_noted(dslot->exec, &dslot->exec_bytes);
                 dslot->valid = 0;
             }
             memcpy(&dslot->key, &dkey, sizeof(dkey));
             if (dslot->valid) {
-                cudaGraphExecDestroy(dslot->exec);
+                cuda_graph_exec_destroy_noted(dslot->exec, &dslot->exec_bytes);
                 dslot->valid = 0;
                 dslot->hits = 0;
             }
@@ -21943,7 +22199,7 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
             if (ge == cudaSuccess) {
                 if (rc == 0) {
                     cudaGraphExec_t exec;
-                    ge = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+                    ge = cuda_graph_instantiate_noted(&exec, graph, &dslot->exec_bytes);
                     if (ge == cudaSuccess) {
                         dslot->exec = exec;
                         dslot->valid = 1;
@@ -26788,12 +27044,26 @@ static int cuda_attention_output_q8_batch_impl(
             }
         }
     }
+    /* MT-6 (audit V10): the cublas+f16-cache fallback for out_a is
+     * DEFAULT OFF -- the fused own kernel (default ON, aligned artifact)
+     * replaced it, and the fallback's lazy q8->f16 build is the multi-GiB
+     * WEIGHT_DERIVED latent charge the audit flagged.  When outa_own
+     * declines (no artifact, off-shape, quality mode) the classic
+     * rope_tail+pack / native tiers below serve instead -- no cache
+     * build.  DS4_CUDA_CUBLAS_ATTENTION_OUTPUT_A=1 re-opts into the
+     * cublas path for deployments that measured it faster than the
+     * classic pair on their shape. */
+    static int out_a_cublas_optin = -1;
+    if (out_a_cublas_optin < 0) {
+        const char *oe = getenv("DS4_CUDA_CUBLAS_ATTENTION_OUTPUT_A");
+        out_a_cublas_optin = oe && oe[0] == '1' && oe[1] == '\0';
+    }
     if (!outa_own_served &&
         !out_a_use_mc &&
         !g_quality_mode &&
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
+        out_a_cublas_optin) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
     /* inc-10 F2 decline: the fused entry only replaces the classic
@@ -30831,7 +31101,8 @@ static int routed_moe_launch(
                     if (ge != cudaSuccess) {
                         fprintf(stderr, "ds4: cudaGraphLaunch failed: %s; recapturing\n",
                                 cudaGetErrorString(ge));
-                        cudaGraphExecDestroy(graph_slot->exec);
+                        cuda_graph_exec_destroy_noted(graph_slot->exec,
+                                                      &graph_slot->exec_bytes);
                         graph_slot->valid = 0;
                         /* fall through to capture path below */
                     } else {
@@ -30847,7 +31118,8 @@ static int routed_moe_launch(
                 if (graph_slot->valid) {
                     /* Hash collision with a different key - tear down the
                      * old exec before recapturing for the new one. */
-                    cudaGraphExecDestroy(graph_slot->exec);
+                    cuda_graph_exec_destroy_noted(graph_slot->exec,
+                                                  &graph_slot->exec_bytes);
                     graph_slot->valid = 0;
                     graph_slot->hits = 0;
                 }
@@ -31331,7 +31603,8 @@ static int routed_moe_launch(
                 ds4_capture_set_stream((cudaStream_t)0);  /* restore: capture done */
                 if (ge == cudaSuccess) {
                     cudaGraphExec_t exec;
-                    ge = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+                    ge = cuda_graph_instantiate_noted(&exec, graph,
+                                                      &graph_slot->exec_bytes);
                     if (ge == cudaSuccess) {
                         graph_slot->exec = exec;
                         graph_slot->valid = 1;

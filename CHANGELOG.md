@@ -5,6 +5,170 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.6.2-dfm — 2026-08-21
+
+- Absorbs Entrpi `v0.6.2` (the memory-truth arc: honest decode credit,
+  transient serial-graph leases, serial idle reaper, GRAPH_EXEC pool
+  truth, ctx-aware bank grants, live commit-rate feedback,
+  `--no-serial`, manifest content identity at import, governed cont
+  bank plan, packed work floor, derived fit headroom, eviction-aligned
+  trim victims, and the continuous ledger reconciliation line) while
+  keeping the DFM model-family paths for Solar Open2, K-EXAONE,
+  Motif-3, and dots3-note, including the family session graphs, the
+  aligned mixed-quant expert artifacts, and the family-aware
+  `/v1/models` advertisement.
+
+## v0.6.2 — 2026-08-19
+
+Real budgets. v0.6.1 made admission charge what a request actually
+commits; this release makes every remaining floor and margin a
+measurement too, and makes the account prove itself continuously. The
+anti-thrash floor was still denominated in virtual extents — pricing
+two full-depth working sets at 26.71 GiB at `-c 786432` where they
+really commit 6.68 — so the budget's capacity leg never engaged
+honestly at depth; the boot bank count came from a frozen ladder; the
+planning headroom was a constant tuned for one configuration; trim
+picked victims by history length, keeping deep trunks immortal under
+pressure while re-trimming recently-hot banks; and nothing checked the
+box's raw memory drop against the engine's own ledger. This release
+closes all of it: the shipped 262144 default now boots 9 banks where
+the ladder froze 4, capacity governs the budget honestly at depth, a
+stripped 1 GiB-floor box gets ~3 GiB of planning margin back, and an
+idle-tick reconciliation line holds the unexplained residual to
+2–19 MiB against a 256 MiB tolerance across the gate battery. One
+disclosed constant remains: the boot-burst half of the derived
+headroom ships as a 2048 MiB default pending its own measurement.
+
+- Governed bank plan: the boot bank count is priced from the live
+  memory budget instead of a frozen fundable-token ladder. Above 16k
+  context the plan asks what the budget actually funds at the same
+  per-token rate admissions are charged (so plan and admission cannot
+  disagree): a 262144 default boot now grants 9 banks where the ladder
+  froze 4, a 524288 boot grants 6 (08-18 box state; the count follows
+  the box). At or below 16384 the measured 32-bank regime stands
+  verbatim. An explicit `DS4_SERVER_COALESCE_MAX` still rules AND
+  disarms the sizing — the operator's number is a deterministic pin;
+  `DS4_BATCH_FIT_KV=0` restores the ladder end to end.
+- The KV budget's anti-thrash floor is priced in committed terms: the
+  guarantee was always "two full-depth working sets", but it was
+  denominated in virtual per-bank extents (13.4 GiB at `-c 786432`)
+  when a full bank actually commits ~2.9 GiB — the floor clamped the
+  measured capacity answer up by ~4.6x and the budget's capacity leg
+  never engaged honestly at depth. The floor now prices two full-depth
+  banks at the packed rate admissions are charged (band included). The
+  boot ledger names which floor ruled (`work floor=packed|virtual`) and
+  prints its own line whenever the floor is what bound capacity.
+  `DS4_BATCH_VMM_FLOOR_PACKED=0` restores the old denomination.
+- The boot planning headroom derives from the operator floor: the
+  static 6144 MiB was the shipped 4 GiB floor plus ~2 GiB of runtime
+  growth margin bundled for one configuration only. It is now computed
+  as `--mem-floor-gb` + `DS4_BATCH_FIT_BURST_MB` (default 2048) — the
+  same 6144 at shipped defaults, ~3 GiB returned to the fundable pool
+  on a stripped 1 GiB-floor box. `DS4_BATCH_FIT_HEADROOM_MB` still
+  pins outright; `DS4_BATCH_FIT_HEADROOM_DERIVED=0` restores the
+  static value.
+- Trim victims are chosen like warm-record eviction and named in the
+  log: invalid content first, then the longest-idle bank (shortest
+  history breaks ties), replacing shortest-history-first — which kept
+  deep trunks immortal under budget pressure while re-trimming
+  recently-hot small banks. Each trim now logs one line per victim
+  (bank, bytes released, history length, recency) ahead of the summary
+  line, and the boot ledger discloses the active order.
+  `DS4_BATCH_TRIM_VICTIM=hist` restores the old order.
+- Reconciliation line (the zero-headroom law made continuous): at every
+  idle tick the server reconciles the box's raw available-memory drop
+  since boot settle against what its own allocation census plus the
+  named one-time charges explain, and logs the signed residual instead
+  of silently absorbing it — a future phantom or leak surfaces as a
+  named number, not a field report. Fresh copies on `/v1/stats` and
+  `/metrics`; `DS4_MEM_RECONCILE_TOL_MB` (default 256) flags the line,
+  `DS4_MEM_RECONCILE_STRICT=1` emits a distinct token for gate scripts.
+  The ~650 MiB census-invisible first-admit warmup (driver module
+  loads, JIT, host allocator growth) is captured once as a named
+  one-time charge (`DS4_MEM_RECONCILE_WARMUP_MB` pins it); the serial
+  session's memory row now publishes the allocator's own measured bytes
+  instead of the estimate once the graph commits.
+- Default context raised to 262144 on CUDA builds (was 32768; Metal/CPU
+  keep 32768). Rationale: with the v0.6 memory model a deep window is
+  demand-mapped and nearly free until used, while the old 32k default
+  was a footgun — a defaults boot could not fit even one long agentic
+  request (prompt plus the 32768-token decode budget assumed when
+  `max_tokens` is omitted). At 262144 the governed bank plan still
+  funds a healthy bank count (9 on the reference box). Users chasing
+  maximum concurrency for shallow batch work set `-c` low explicitly,
+  as they already tune the bank count. The default resolves after flag
+  parsing, so `--metal`/`--cpu` on a CUDA build get the conservative
+  default.
+- Weight-server manifest content identity (closes the limitation
+  chartered at v0.6.0): the manifest now carries a per-model content
+  fingerprint (`content <id> <size> <algo> <hex>`, strided FNV-1a
+  sample: full head and tail windows plus one page per 16 MiB) and the
+  engine verifies it against its own mapping of the model file before
+  importing any range. A weight server left holding a superseded
+  checkpoint of identical size is now refused loudly at boot instead
+  of feeding stale bytes silently. Old manifests without the record
+  still import, with a one-line notice; unknown fingerprint algos
+  downgrade to the same notice; `DS4_WEIGHT_FP_CHECK=0` disables
+  verification. This is mixup detection, not tamper-proofing: bytes
+  between sample windows are not covered.
+
+## v0.6.1 — 2026-08-17
+
+Memory truth. Admission charges what a request will actually commit —
+measured, not feared. A field trace showed the projection charging
+4.9 GiB for a 245k-token bank whose real packed commit was ~750 MiB
+(~6.5x pessimism from charging virtual extents and phantom decode
+budgets), refusing an admission the box could fund six times over and
+evicting work onto the expensive serial lane. Seven increments delete
+that class end to end; the concurrent charter shape — a 500k-token
+admission in flight while two 245k admissions land beside it — now
+serves with zero refusals on a 128 GiB box, and decode under ~1M
+resident bank tokens runs within 2% of an empty box.
+
+- Tranche decode credit (`DS4_CONT_ADMIT_TRANCHE`, default 32768;
+  0 = legacy): admission credits the prompt plus one decode tranche
+  instead of a ~393k-token phantom budget for every request that omits
+  max_tokens; live rows extend credit tranche-by-tranche under the same
+  funding verdict, and a refused extension finishes the row cleanly at
+  its funded boundary (`finish_reason: length`) instead of rejecting
+  the whole request up front.
+- Honest serial lifecycle: the session graph's cost is published as a
+  lease when committed and released when freed (no phantom intent), and
+  an idle reaper (`DS4_SERIAL_IDLE_REAP_S`, default 120) returns the
+  whole right-sized session — measured +5.3 GiB back — after idle,
+  re-allocating lazily on the next serial request. Fixed a leak where
+  freeing a serial session stranded its captured layer-graph
+  executables until an unrelated pool resize.
+- Defaults re-derived from measurement: ctx-aware bank grant (32 banks
+  through 16k, halving against a ~1 Mi fundable-token depth, floor 4),
+  flat 6 GiB fit headroom replacing the 8 GiB deep tier, prewarm gated
+  on its real consumers, and the boot "context buffers" print labeled
+  as the estimate it is (now including the FP8/FP4 mirror terms).
+- Pool truth: captured-graph executables are census-visible
+  (`graph_exec` class, driver-measured per slot, released verbatim at
+  destroy) with an idle sweep on the pressure ladder; the q8-f16 cache
+  budget and managed-KV routing read the typed observation instead of
+  raw driver numbers.
+- `--no-serial` (env twin `DS4_SERVER_NO_SERIAL=1`): opt-in cont-only
+  serving; every serial-lane execution path answers a typed 503
+  (`reason="lane_disabled"`). Fixed a latent `/v1/models` race with the
+  reaper, and the cont bank plan now sizes from the configured ctx.
+- Disclosed admission band (`DS4_CONT_ADMIT_BAND_X1024`, default 1045):
+  the only margin left in the projection is the measured transient peak
+  (leg-calibrated 1.02x sequential), applied uniformly so admission,
+  extension, and lease refreshes charge one truth. Live commit-rate
+  feedback exports observed vs packed bytes-per-token
+  (`ds4_cont_commit_bytes_per_token`) with a loud one-shot warning if
+  observed ever exceeds 2x physics — measured on the ship config:
+  observed 4366 B/tok vs packed 4142 (1.054, page-floor amortization).
+- Standing deep battery: `speed-bench/memcal_gate.sh` (E0-E5
+  calibration: 4.67 KiB/tok all-in at 507k admitted tokens) and
+  `speed-bench/deep_admit_ab_gate.sh` (the charter A/B: truth credit
+  serves the concurrent deep shape, union 4692 MiB, loaded-decode
+  1.019x; the legacy credit at a budget 1.2x that union reproduces the
+  field refusal chain on demand) join six fast memory-truth gates in
+  the release battery.
+
 ## v0.6.0-dfm — 2026-08-17
 
 - Absorbs Entrpi `v0.6.0` (authoritative memory governor, serial

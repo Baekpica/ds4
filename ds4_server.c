@@ -4,6 +4,7 @@
 #include "ds4_gpu.h"   /* memgov D0a-4: the driver-boundary census unit */
 #endif
 #include "ds4_kvstore.h"
+#include "ds4_weight_identity.h" /* rider #48: fingerprint units */
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -10495,6 +10496,53 @@ struct server {
      * DS4_SERVER_SERIAL_RIGHTSIZE=0 restores the fail-at-full--c behavior. */
     bool serial_rightsize;
     int  serial_boot_ctx;
+    /* MT-4 (audit V3): opt-in cont-only mode (--no-serial /
+     * DS4_SERVER_NO_SERIAL=1).  s->session stays NULL; run_job_single --
+     * the ONE choke point every serial execution path flows through
+     * (direct route, static single-member collapse, static memgov
+     * fallback, cont stranded fallback) -- refuses with a typed 503
+     * (DS4_REJECT_LANE_DISABLED) instead of serving.  Default OFF:
+     * the serial routes carry real traffic (audit V3's R1-R12). */
+    bool no_serial;
+    /* MT-3 (v0.6.1 memory truth): idle reaper for the committed serial
+     * session graph on bank-holding boots.  A single serial detour used to
+     * convert ~5 GiB permanently (the graph was freed only at replace or
+     * shutdown); after serial_idle_reap_s seconds without serial use the
+     * worker replaces the session with a fresh pending boot-ctx one (the
+     * proven right-size replace shape) and the bytes return to the box.
+     * Checked from the dequeue tick (quiet server) AND from cont_admit
+     * (the worker lives inside the cont loop under load -- that is
+     * exactly when the cont lane wants the memory back).  0 = off.
+     * last_serial_use is worker-owned (stamped after serial-runner jobs). */
+    int    serial_idle_reap_s;
+    double last_serial_use;
+    /* v0.6.2 Inc 0: the reconciliation line -- governor/census ledger +
+     * named one-time charges vs the raw free-memory delta since boot
+     * settle (plan-v062 Inc 0; the zero-headroom law made continuous).
+     * Baseline is armed ONCE in the boot census block (main thread,
+     * pre-listener) and gated by rec_supported with release/acquire so
+     * the worker's idle tick never reads a half-written baseline; the
+     * raw SOURCE is pinned at arm time (MemAvailable on integrated,
+     * cuda-free otherwise) -- the max-of-two winner can flip sources
+     * mid-run and would corrupt the delta.  rec_onetime and
+     * rec_warmup_state are worker-owned after boot; porcelains read
+     * both as atomic words, and the warmup capture stores onetime
+     * (relaxed) BEFORE state (release), so a reader that acquires
+     * state==captured is guaranteed to see the charge (readers load
+     * state FIRST for exactly this pairing).  The env-pin path writes
+     * both in main before the worker starts (happens-before via
+     * pthread_create).  Pure logging: nothing here feeds a verdict. */
+    int      rec_supported;      /* baseline armed (atomic release/acquire) */
+    int      rec_src;            /* ds4_mem_obs_source of the raw field */
+    uint64_t rec_boot_raw;       /* raw source value at boot settle */
+    uint64_t rec_boot_census;    /* census live, both domains, at boot settle */
+    uint64_t rec_onetime;        /* named one-time charges (first-admit warmup) */
+    int      rec_warmup_state;   /* 0=unmeasured 1=captured 2=env-pinned */
+    int64_t  rec_last_printed;   /* residual at the last printed line */
+    int      rec_printed_once;
+    int      rec_last_flagged;   /* flagged state at the last printed line */
+    uint64_t rec_tol_bytes;      /* DS4_MEM_RECONCILE_TOL_MB (default 256) */
+    int      rec_strict;         /* DS4_MEM_RECONCILE_STRICT=1 (gates) */
     /* v0.5.2 inc3: abort work for dead clients (field: "memory never
      * released after interruption").  Streaming rows already aborted via
      * failed sends; non-streaming rows decoded to their full budget and
@@ -16038,10 +16086,40 @@ static void job_shed_aged(server *s, job *j, const char *site) {
     job_finish(j);
 }
 
+/* MT-3: the serial idle reaper (defined after serial_session_ensure_fit,
+ * whose replace shape it reuses).  due() is a cheap worker-owned check;
+ * _locked() performs the swap and expects gen_mu HELD. */
+static bool serial_idle_reap_due(const server *s);
+static void serial_session_idle_reap_locked(server *s);
+/* v0.6.2 Inc 0: the reconciliation tick (defined with the memory
+ * porcelains below) -- rides the same 10 s idle cadence as the reaper. */
+static void mem_reconcile_idle_tick(server *s, int final_line);
+
 static job *dequeue(server *s) {
     for (;;) {
         pthread_mutex_lock(&s->mu);
-        while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+        while (!s->head && !s->stopping) {
+            /* MT-3: a timed wait so the idle worker can notice a reap-due
+             * serial graph.  Lock order is gen_mu -> s->mu, so the swap
+             * must run OUTSIDE s->mu; the due-check reads worker-owned
+             * state only.  A 10 s tick on an idle server is noise. */
+            struct timespec dl;
+            clock_gettime(CLOCK_REALTIME, &dl);
+            dl.tv_sec += 10;
+            if (pthread_cond_timedwait(&s->cv, &s->mu, &dl) != 0) {
+                pthread_mutex_unlock(&s->mu);
+                if (serial_idle_reap_due(s)) {
+                    pthread_mutex_lock(&s->gen_mu);
+                    if (serial_idle_reap_due(s))   /* unchanged: worker-owned */
+                        serial_session_idle_reap_locked(s);
+                    pthread_mutex_unlock(&s->gen_mu);
+                }
+                /* v0.6.2 Inc 0: the reconciliation tick -- never under
+                 * s->mu (it reads /proc and takes the census snap lock). */
+                mem_reconcile_idle_tick(s, 0);
+                pthread_mutex_lock(&s->mu);
+            }
+        }
         if (!s->head) {
             pthread_mutex_unlock(&s->mu);
             return NULL;
@@ -16448,11 +16526,23 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     const serial_fit_plan fit_plan = serial_session_fit_plan(
         cur_ctx, pending, need_min, request_cap, current_fits, frame_kind);
     if (fit_plan == SERIAL_FIT_REUSE || fit_plan == SERIAL_FIT_PASS_NATIVE) {
-        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION,
-                            ds4_engine_session_graph_bytes_estimate(s->engine,
-                                                                    cur_ctx),
-                            ds4_engine_session_graph_bytes_estimate(s->engine,
-                                                                    cur_ctx));
+        /* memgov D0b-3 (S6) + MT-2: refresh the lane's absolute lease
+         * HONESTLY -- a still-pending graph is declared intent with zero
+         * resident (the burst lands in ds4_session_alloc_graph, which
+         * publishes the commit), so the build window's unfunded debt is
+         * visible to every other lane's governed quote.  No quote here
+         * (no memory verdict was taken on this path). */
+        const uint64_t est = ds4_engine_session_graph_bytes_estimate(s->engine,
+                                                                     cur_ctx);
+        /* v0.6.2 Inc 0: a COMMITTED graph re-publishes on its measured
+         * basis (the alloc's census delta); the estimate keeps pricing
+         * declared-but-pending intent, where no measurement exists.  DFM
+         * family graphs commit through their own alloc branches and report
+         * no census delta, so they price on the family sizing estimate. */
+        const uint64_t meas = pending ? 0
+            : ds4_session_graph_bytes_committed(s->session);
+        const uint64_t use = meas ? meas : est;
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, use, pending ? 0 : use);
         return true;   /* committed-and-big-enough, or pending-and-allocatable */
     }
     if (fit_plan == SERIAL_FIT_REFUSE_PRESERVE)
@@ -16625,9 +16715,14 @@ static bool serial_session_ensure_fit(server *s, job *j) {
                    "(DS4_SERVER_SERIAL_RIGHTSIZE=0 restores full--c alloc)",
                    cur_ctx, target, boot_ctx, (int)prompt_len, budget,
                    pending ? "" : " [live serial state reset]");
-        /* The lane's absolute lease: the graph is committed at target. */
+        /* MT-2: the lane's absolute lease -- INTENT at target, resident 0:
+         * the session was created with its graph PENDING; the burst (and
+         * the resident flip) land in ds4_session_alloc_graph when this
+         * request's first root API ensures it.  Publishing intent==resident
+         * here was the commit-lead window: the ~GiB build read as fully
+         * funded before any byte landed. */
         ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION,
-                            scl.proposed_outstanding, scl.proposed_outstanding);
+                            scl.proposed_outstanding, 0);
         return true;
     }
     if (final_v != legacy_v && legacy_v == DS4_GOV_ADMIT) {
@@ -16687,8 +16782,82 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     return false;
 }
 
+/* MT-3 (v0.6.1 memory truth): the serial idle reaper.  A committed serial
+ * session graph used to live until replace or shutdown -- a single serial
+ * detour permanently converted ~5 GiB on bank-holding boots (the leg-1
+ * cliff's residue).  After serial_idle_reap_s seconds without serial use,
+ * replace the session with a fresh PENDING boot-ctx one -- exactly the
+ * proven right-size replace shape: free (which publishes the MT-2 lease
+ * release), clear the live records, demote the registry (continuations
+ * get the honest native 409: replay full history), return the graph
+ * pool's reserve, re-create lazy.  The next serial request right-sizes
+ * from scratch (checkpoint content was device-side and is gone -- the
+ * demote makes that honest).  Worker thread only, gen_mu HELD (the same
+ * ownership domain as ensure_fit's swap).  Scope: bank-holding boots --
+ * on a serial-only deployment the graph IS the serving path. */
+static bool serial_idle_reap_due(const server *s) {
+    /* teb fast-leg death (08-17, 1438-cycle repro): in eager-graph mode
+     * (DS4_SESSION_LAZY_GRAPH=0) the recreate below re-materializes the
+     * full graph in the same call -- the reap frees ~6 GiB, re-allocates
+     * it, the fresh session reads non-pending, and the due-check re-fires
+     * every dequeue tick until a recreate loses the fit race and dies.
+     * Eager mode asked for a permanently materialized session: never reap. */
+    return s->serial_idle_reap_s > 0 && ds4_session_lazy_graph() &&
+           s->batch_ctx && s->session &&
+           !ds4_session_graph_pending(s->session) &&
+           now_sec() - s->last_serial_use > (double)s->serial_idle_reap_s;
+}
+static void serial_session_idle_reap_locked(server *s) {
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: serial idle reap: freeing the session graph (ctx=%d, "
+               "idle %.0fs > %ds window; next serial request re-allocs "
+               "right-sized; DS4_SERIAL_IDLE_REAP_S=0 disables)",
+               ds4_session_ctx(s->session),
+               now_sec() - s->last_serial_use, s->serial_idle_reap_s);
+    /* The reap restarts the idle window -- without this, a session that
+     * reads non-pending after the recreate keeps the due-check firing
+     * every dequeue tick (the teb loop's second leg). */
+    s->last_serial_use = now_sec();
+    ds4_session_free(s->session);   /* MT-2: publishes the lease release */
+    s->session = NULL;
+    responses_live_clear(s);
+    thinking_live_clear(s);
+    cont_registry_demote_serial(s);
+    /* The freed graph leaves driver graph-pool reserve behind; return it
+     * so the reap's recovery is complete and visible (the MG-1 pattern). */
+    (void)ds4_mem_own_trim("serial_idle_reap");
+    ds4_session *ns = NULL;
+    if (ds4_session_create(&ns, s->engine, s->serial_boot_ctx) == 0) s->session = ns;
+    else die("serial idle reap: could not restore the boot session");
+    ds4_metric_add(&ds4_metrics_get()->serial_idle_reaps, 1);
+}
+
 /* The original single-request path: serialize the GPU, run, signal done. */
 static void run_job_single(server *s, job *j) {
+    /* MT-4 (audit V3): --no-serial refuses HERE -- the one choke point
+     * every serial execution flows through (the direct SERIAL route,
+     * the static single-member collapse, the static memgov fallback,
+     * and the cont stranded fallback -- the last two never pass
+     * route_decide, which is why the refusal does not live there).
+     * Same typed 503 shape as the deep-serial guard (R13). */
+    if (s->no_serial) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "This server runs cont-only (--no-serial); the request "
+                 "requires the serial path (%d-token prompt) and is not "
+                 "served here", j->req.prompt.len);
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: --no-serial: refusing serial-lane request "
+                   "(prompt=%d tokens, surface=%d)",
+                   j->req.prompt.len, (int)wire_surface_for(&j->req));
+        ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                           [DS4_REJLANE_SERIAL][DS4_REJECT_LANE_DISABLED], 1);
+        wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req),
+                        503, msg);
+        j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
+        job_finish(j);
+        return;
+    }
     pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
     int hold_retry = 0;
     if (cont_registry_serial_hold(s, &j->req, now_sec(), &hold_retry)) {
@@ -17887,6 +18056,12 @@ static int cont_alive(void *ud, void *user) {
 static int cont_admit(void *ud, ds4_cont_request *req) {
     cont_sched *cs = ud;
     server *s = cs->s;
+    /* MT-3: the worker lives INSIDE the cont loop under load, so the
+     * dequeue tick never fires exactly when the cont lane most wants the
+     * idle serial graph's ~5 GiB back.  Same thread, gen_mu held, and the
+     * serial session is quiescent by construction (serial jobs run on
+     * this very thread).  The due-check is two loads. */
+    if (serial_idle_reap_due(s)) serial_session_idle_reap_locked(s);
     /* Reserve a free in-flight slot BEFORE removing any job from the FIFO, so a
      * job is never dequeued (nor the primed job consumed) when it cannot be
      * placed -- otherwise it would be silently dropped and its client would hang.
@@ -18856,6 +19031,63 @@ static int coalesce_max_tokens_default(int ctx) {
     return ctx > 0 && ctx < 4096 ? ctx : 4096;
 }
 
+/* MT-5 (v0.6.1 memory truth, audit V6): ctx-aware coalesce/bank default,
+ * shared by the worker's static gather bound and the persistent batch-ctx
+ * bank count (the two DS4_SERVER_COALESCE_MAX read sites drifted 16 vs 32
+ * after the W8 flip raised only the boot site).  The W8 measurement that
+ * picked 32 was taken at ctx=4096; at deep ctx the box cannot fund
+ * anywhere near 32 banks of KV -- leg2a measured ~1 Mi fundable resident
+ * tokens on the 128 GiB ship box -- and every surplus granted bank
+ * strands its eager remainder (~450 MiB: raw ring, state slabs, MTP
+ * checkpoints; the comp/index caches are demand-mapped) as bytes the
+ * comp page budget could otherwise spend on admissions (~4.5 GiB back at
+ * -c 786432).  So: keep 32 verbatim through the measured regime
+ * (ctx <= 16384), then halve while banks x ctx exceeds the fundable
+ * depth, floored at 4 (A2b fork-fanout width).  32 @ 32k, 16 @ 57k,
+ * 8 @ 131k, 4 @ 262k+.  DS4_SERVER_COALESCE_MAX overrides; the boot
+ * fit still clamps down on smaller boxes.
+ * Governed cont bank plan (v0.6.2): this static ladder is now the
+ * FALLBACK -- coalesce_max_boot below asks the live budget first, and the
+ * worker's gather bound reads the boot outcome (batch_ctx_max_seq), so
+ * the two read sites agree by construction instead of by shared
+ * arithmetic.  The ladder keeps ruling wherever the budget cannot answer. */
+#define DS4_COALESCE_FUNDABLE_TOKENS (1u << 20)
+static int coalesce_max_default(int ctx) {
+    if (ctx <= 16384) return 32;
+    int b = 32;
+    while (b > 4 && (uint64_t)b * (uint64_t)ctx > DS4_COALESCE_FUNDABLE_TOKENS)
+        b /= 2;
+    return b;
+}
+
+/* Governed cont bank plan (v0.6.2): the boot-site bank request.  The MT-5
+ * ladder above prices its criterion (banks x ctx <= fundable tokens) with
+ * a frozen constant; post v0.6.1 the engine's governed fit prices the
+ * SAME criterion from the LIVE budget and the shape-derived banded packed
+ * rate (create_fit's kv plan -- the same truth admissions are charged),
+ * so where a live memory answer exists the honest request is the measured
+ * CEILING -- 32, the W8 regime pick (raises past 32 stay env-only via
+ * DS4_SERVER_COALESCE_MAX, hard cap 64: the V6 note stands, 32 is
+ * measured only through its regime) -- and the fit admits what the box
+ * actually funds.  Without a memory answer (Metal/CPU), or with the fit
+ * or its kv plan disarmed (DS4_BATCH_FIT=0 / DS4_BATCH_FIT_KV=0 -- the
+ * engine reads the same envs, so the two sites cannot drift), the ladder
+ * keeps ruling: requesting 32 blind at deep ctx is exactly the
+ * OOM-killer probe R5 Inc1a exists to prevent. */
+static void mem_obs_sample(ds4_mem_observation *o);   /* defined with the metrics render */
+static int coalesce_max_boot(int ctx) {
+    const char *fe = getenv("DS4_BATCH_FIT");
+    const char *ke = getenv("DS4_BATCH_FIT_KV");
+    if ((fe && fe[0] == '0' && fe[1] == '\0') ||
+        (ke && ke[0] == '0' && ke[1] == '\0'))
+        return coalesce_max_default(ctx);
+    ds4_mem_observation obs;
+    mem_obs_sample(&obs);
+    if (obs.status != DS4_MEMOBS_OK)
+        return coalesce_max_default(ctx);
+    return 32;
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     /* Coalescing config (read once; single worker thread). */
@@ -18869,7 +19101,19 @@ static void *worker_main(void *arg) {
     const char *cc = getenv("DS4_SERVER_CONTINUOUS");
     const bool continuous = !(cc && cc[0] == '0' && cc[1] == '\0');  /* default ON */
     const char *cm = getenv("DS4_SERVER_COALESCE_MAX");
-    int cmax = cm ? atoi(cm) : 16;
+    /* Governed cont bank plan (v0.6.2): with a persistent batch ctx the
+     * gather bound is the ctx's ACTUAL bank count -- the boot request
+     * after the governed fit sized it (W4's contract, "every coalesced
+     * group fits", now by construction; the pre-v0.6.2 shared-ladder
+     * arrangement still let a fit-reduced boot drift below the worker's
+     * bound).  Without one (creation failed, or coalescing off) the
+     * static ladder keeps ruling: the per-call fallback path allocates
+     * per gather, so a live-budget-sized bound would be the deep-ctx
+     * blind probe again.  batch_ctx and batch_ctx_max_seq are set before
+     * this thread starts and never change. */
+    int cmax = cm            ? atoi(cm)
+             : s->batch_ctx  ? s->batch_ctx_max_seq
+                             : coalesce_max_default(s->serial_boot_ctx);
     if (cmax < 1) cmax = 1;
     if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
     const char *cw = getenv("DS4_SERVER_COALESCE_WAIT_MS");
@@ -18916,14 +19160,24 @@ static void *worker_main(void *arg) {
             job *batch[DS4_COALESCE_HARD_MAX];
             batch[0] = j;
             int n = coalesce_gather(s, batch, cmax, cwait, cmaxtok);
-            if (n == 1) run_job_single(s, j);
-            else        generate_batch_jobs(s, batch, n);
+            if (n == 1) {
+                /* Single-member gather collapses to the serial runner --
+                 * it uses the session, so it counts as serial use (MT-3). */
+                run_job_single(s, j);
+                s->last_serial_use = now_sec();
+            } else {
+                generate_batch_jobs(s, batch, n);
+            }
         } else {
             /* ROUTE_LANE_SERIAL -- and defensively ROUTE_LANE_NONE, which the
              * parse layer's durable-reference rejection makes unreachable. */
             run_job_single(s, j);
+            s->last_serial_use = now_sec();   /* MT-3: idle window restarts */
         }
     }
+    /* v0.6.2 Inc 0: the forced final reconcile line -- gate legs assert
+     * the residual after a clean stop (DS4_MEM_RECONCILE_STRICT=1). */
+    mem_reconcile_idle_tick(s, 1);
     return NULL;
 }
 
@@ -19198,6 +19452,12 @@ static bool server_model_id_known(const server *s, const char *id) {
 }
 
 static void append_model_json(buf *b, const server *s, const char *id) {
+    /* MT-4 (R18): the CONFIGURED context, never ds4_session_ctx(s->session)
+     * -- this renders on CLIENT threads while right-sizing and the MT-3
+     * idle reaper swap the session under gen_mu (the documented v0.5.2
+     * rule every other client-thread site already follows).  The reaper
+     * recreates at serial_boot_ctx, so the advertised value was constant
+     * anyway; under --no-serial there is no session at all. */
     append_model_json_values(b,
                              id,
                              server_advertised_model_name(s),
@@ -19540,7 +19800,7 @@ static const char *rejlane_names[DS4_REJLANE__COUNT] = {
 };
 static const char *reject_reason_names[DS4_REJECT__COUNT] = {
     "class_budget", "live_headroom", "obs_retry", "unsupported", "fault",
-    "deep_policy",
+    "deep_policy", "lane_disabled",
 };
 
 typedef struct {
@@ -19644,6 +19904,109 @@ static uint64_t bank_lineage_clock(server *s) {
     return sum;
 }
 
+/* =========================================================================
+ * v0.6.2 Inc 0: the reconciliation line (plan-v062 Inc 0) -- the
+ * zero-headroom law made continuous.  The armed baseline (boot census
+ * block) pairs with one render capture; observed raw drop = census
+ * growth + named one-time charges + RESIDUAL, and the residual prints
+ * named or flags over the tolerance instead of being silently absorbed
+ * by the live floor check.  Pure logging: nothing here feeds a verdict.
+ *
+ * mem_reconcile_from is callable from any thread: the baseline is
+ * acquire-gated, rec_onetime reads as an atomic word (worker-owned after
+ * boot), and the capture primitives are the lock-free porcelain set. */
+static int mem_reconcile_from(server *s, const mem_census_image *img,
+                              const ds4_mem_observation *o,
+                              ds4_mem_reconcile *out, uint64_t *onetime_out,
+                              uint64_t *now_raw_out, uint64_t *now_census_out) {
+    if (!__atomic_load_n(&s->rec_supported, __ATOMIC_ACQUIRE)) return 0;
+    if (!img->supported || o->status != DS4_MEMOBS_OK) return 0;
+    const uint64_t raw = s->rec_src == DS4_MEMOBS_SRC_MEMINFO_AVAILABLE
+        ? o->meminfo_avail_bytes : o->cuda_free_bytes;
+    if (raw == 0) return 0;            /* pinned source kept no answer */
+    uint64_t census = 0;
+    for (int c = 0; c < DS4_MEMC__COUNT; c++)
+        for (int d = 0; d < DS4_MEMD__COUNT; d++)
+            census += ds4_mem_cell_live(&img->cells[c][d]);
+    const uint64_t onetime =
+        __atomic_load_n(&s->rec_onetime, __ATOMIC_RELAXED);
+    if (onetime_out) *onetime_out = onetime;
+    if (now_raw_out) *now_raw_out = raw;
+    if (now_census_out) *now_census_out = census;
+    *out = ds4_mem_reconcile_compute(s->rec_boot_raw, raw,
+                                     s->rec_boot_census, census,
+                                     onetime, s->rec_tol_bytes);
+    return 1;
+}
+
+/* The idle tick (rides the dequeue 10 s wait, worker thread, no locks
+ * held) and the forced final line at worker shutdown.  Print policy: the
+ * first compute, any >=64 MiB residual move, a flag flip, and the final
+ * line -- a quiet idle server prints once and stays quiet. */
+static void mem_reconcile_idle_tick(server *s, int final_line) {
+    mem_census_image img; ds4_gov_ledger lg; ds4_mem_observation o;
+    mem_render_capture(&img, &lg, &o);
+    (void)lg;
+    ds4_mem_reconcile r; uint64_t onetime = 0, now_raw = 0, now_census = 0;
+    if (!mem_reconcile_from(s, &img, &o, &r, &onetime, &now_raw, &now_census))
+        return;
+    ds4_metrics *m = ds4_metrics_get();
+    /* First-admit warmup capture: the first idle reconcile after real
+     * work completed takes the positive residual as THE named one-time
+     * charge (census-invisible driver/runtime warmup: module loads, JIT,
+     * host allocator growth).  Self-calibrating and disclosed -- the
+     * covered-request count prints so a receipt reader can judge how
+     * tight the bracket was; DS4_MEM_RECONCILE_WARMUP_MB pins instead. */
+    const uint64_t done = ds4_metric_read(&m->requests_completed) +
+                          ds4_metric_read(&m->requests_failed);
+    if (__atomic_load_n(&s->rec_warmup_state, __ATOMIC_RELAXED) == 0 &&
+        done > 0) {
+        const uint64_t w = r.residual > 0 ? (uint64_t)r.residual : 0;
+        /* Store order charge-then-state (release): a reader acquiring
+         * state==captured must see the charge (struct comment). */
+        __atomic_store_n(&s->rec_onetime, w, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->rec_warmup_state, 1, __ATOMIC_RELEASE);
+        onetime = w;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: mem reconcile: first-admit warmup %.1f MiB "
+                   "captured as the named one-time charge (covers %llu "
+                   "completed request(s); DS4_MEM_RECONCILE_WARMUP_MB pins, "
+                   "0 disables)",
+                   (double)w / 1048576.0, (unsigned long long)done);
+        r = ds4_mem_reconcile_compute(s->rec_boot_raw, now_raw,
+                                      s->rec_boot_census, now_census,
+                                      onetime, s->rec_tol_bytes);
+    }
+    if (r.flagged) ds4_metric_add(&m->mem_reconcile_flagged, 1);
+    const int64_t moved = r.residual - s->rec_last_printed;
+    const int64_t mvmag = moved < 0 ? -moved : moved;
+    if (final_line || !s->rec_printed_once ||
+        mvmag >= 64 * 1048576ll || r.flagged != s->rec_last_flagged) {
+        server_log(r.flagged ? DS4_LOG_WARNING : DS4_LOG_DEFAULT,
+                   "ds4-server: mem reconcile%s: drop %+.2f GiB since boot = "
+                   "census %+.2f GiB + onetime %.1f MiB + residual %+.1f MiB "
+                   "(tol %.0f MiB)%s",
+                   final_line ? " final" : "",
+                   (double)r.observed_delta / 1073741824.0,
+                   (double)r.census_growth / 1073741824.0,
+                   (double)onetime / 1048576.0,
+                   (double)r.residual / 1048576.0,
+                   (double)s->rec_tol_bytes / 1048576.0,
+                   r.flagged ? " FLAGGED" : "");
+        s->rec_printed_once = 1;
+        s->rec_last_printed = r.residual;
+        s->rec_last_flagged = r.flagged;
+    }
+    /* The gate token (DS4_MEM_RECONCILE_STRICT=1): capacity legs assert
+     * NO line of this shape at leg end.  Logging, never a verdict. */
+    if (r.flagged && s->rec_strict)
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: mem reconcile STRICT: residual %+.1f MiB "
+                   "exceeds tol %.0f MiB (unexplained by census + onetime)",
+                   (double)r.residual / 1048576.0,
+                   (double)s->rec_tol_bytes / 1048576.0);
+}
+
 /* Prometheus text exposition (hand-rolled: it is just lines). */
 static void send_metrics(server *s, int fd) {
     ds4_metrics *m = ds4_metrics_get();
@@ -19721,6 +20084,33 @@ static void send_metrics(server *s, int fd) {
     buf_printf(&b, "# TYPE ds4_cont_admit_rejects_total counter\n"
                    "ds4_cont_admit_rejects_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_admit_rejects));
+    /* MT-1b (v0.6.1 memory truth): mid-flight tranche credit extensions. */
+    buf_printf(&b, "# TYPE ds4_cont_credit_extension_granted_total counter\n"
+                   "ds4_cont_credit_extension_granted_total %llu\n"
+                   "# TYPE ds4_cont_credit_extension_refused_total counter\n"
+                   "ds4_cont_credit_extension_refused_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->cont_credit_ext_granted),
+               (unsigned long long)ds4_metric_read(&m->cont_credit_ext_refused));
+    /* MT-7 (v0.6.1 memory truth): the live commit rates (census-observed
+     * slab bytes per committed token vs the packed shape rate the union
+     * projection charges) + the disclosed admission band.  Racy aligned-u64
+     * reads of ctx fields; readers never take gen_mu. */
+    if (s->batch_ctx) {
+        uint64_t obs = 0, phys = 0;
+        if (ds4_batch_ctx_commit_rate(s->batch_ctx, &obs, &phys))
+            buf_printf(&b,
+                "# TYPE ds4_cont_commit_bytes_per_token gauge\n"
+                "ds4_cont_commit_bytes_per_token{kind=\"observed\"} %llu\n"
+                "ds4_cont_commit_bytes_per_token{kind=\"packed\"} %llu\n"
+                "# TYPE ds4_cont_admit_band_x1024 gauge\n"
+                "ds4_cont_admit_band_x1024 %u\n",
+                (unsigned long long)obs, (unsigned long long)phys,
+                ds4_cont_admit_band_x1024());
+    }
+    /* MT-3: serial idle reaps (each one returned the session graph's GiBs). */
+    buf_printf(&b, "# TYPE ds4_serial_idle_reaps_total counter\n"
+                   "ds4_serial_idle_reaps_total %llu\n",
+               (unsigned long long)ds4_metric_read(&m->serial_idle_reaps));
     buf_printf(&b, "# TYPE ds4_cont_batch_failures_total counter\n"
                    "ds4_cont_batch_failures_total %llu\n",
                (unsigned long long)ds4_metric_read(&m->cont_batch_failures));
@@ -19939,6 +20329,23 @@ static void send_metrics(server *s, int fd) {
                        "ds4_mem_own_trim_recovered_bytes_total %llu\n",
                    (unsigned long long)ds4_metric_read(&m->mem_own_trim_calls),
                    (unsigned long long)ds4_metric_read(&m->mem_own_trim_recovered));
+        /* v0.6.2 Inc 0: the reconciliation family, computed FRESH from
+         * this render's own capture (on-demand truth, not the idle
+         * tick's last echo); omitted when no baseline could arm (the
+         * absence-not-zero census convention).  residual is SIGNED. */
+        {
+            ds4_mem_reconcile rr; uint64_t ot = 0;
+            if (mem_reconcile_from(s, &img, &o, &rr, &ot, NULL, NULL))
+                buf_printf(&b,
+                    "# TYPE ds4_mem_reconcile_residual_bytes gauge\n"
+                    "ds4_mem_reconcile_residual_bytes %lld\n"
+                    "# TYPE ds4_mem_reconcile_onetime_bytes gauge\n"
+                    "ds4_mem_reconcile_onetime_bytes %llu\n",
+                    (long long)rr.residual, (unsigned long long)ot);
+            buf_printf(&b, "# TYPE ds4_mem_reconcile_flagged_total counter\n"
+                           "ds4_mem_reconcile_flagged_total %llu\n",
+                       (unsigned long long)ds4_metric_read(&m->mem_reconcile_flagged));
+        }
         /* memgov D0b-4: the shadow governor.  Leases (one ledger image
          * through the seqlock), then the full fixed-cardinality decision
          * matrix (plan sec 14 ds4_memory_decisions_total) -- all cells
@@ -20101,6 +20508,7 @@ static void send_stats(server *s, int fd, bool as_json) {
         buf_printf(&b, ",\"cache\":{\"admits_cold\":%llu,\"admits_warm\":%llu,"
                        "\"admits_fork\":%llu,\"admits_partial_fork\":%llu,"
                        "\"admits_partial_truncate\":%llu,\"cont_admit_rejects\":%llu,"
+                       "\"cont_credit_ext_granted\":%llu,\"cont_credit_ext_refused\":%llu,"
                        "\"graph_fit_refusals\":%llu,"
                        "\"tokens_prefilled_computed\":%llu,"
                        "\"tokens_prefilled_cached\":%llu,\"prefill_tok_s_60s\":%.2f,"
@@ -20112,6 +20520,8 @@ static void send_stats(server *s, int fd, bool as_json) {
                    (unsigned long long)ds4_metric_read(&m->admits_partial_fork),
                    (unsigned long long)ds4_metric_read(&m->admits_partial_truncate),
                    (unsigned long long)ds4_metric_read(&m->cont_admit_rejects),
+                   (unsigned long long)ds4_metric_read(&m->cont_credit_ext_granted),
+                   (unsigned long long)ds4_metric_read(&m->cont_credit_ext_refused),
                    (unsigned long long)ds4_metric_read(&m->graph_fit_refusals),
                    (unsigned long long)ds4_metric_read(&m->tokens_prefilled_computed),
                    (unsigned long long)ds4_metric_read(&m->tokens_prefilled_cached),
@@ -20171,10 +20581,46 @@ static void send_stats(server *s, int fd, bool as_json) {
                            (unsigned long long)o.cuda_free_bytes,
                            (unsigned long long)o.meminfo_avail_bytes);
             buf_printf(&b, ",\"calls_cuda_free\":%llu,\"calls_meminfo_available\":%llu,"
-                           "\"errors\":%llu}}",
+                           "\"errors\":%llu}",
                        (unsigned long long)ds4_metric_read(&m->memobs_calls[DS4_MEMOBS_SRC_CUDA_FREE]),
                        (unsigned long long)ds4_metric_read(&m->memobs_calls[DS4_MEMOBS_SRC_MEMINFO_AVAILABLE]),
                        (unsigned long long)ds4_metric_read(&m->memobs_errors));
+            /* v0.6.2 Inc 0: the reconciliation object, computed FRESH
+             * from this render's capture (the on-demand surface).  All
+             * signed fields render as signed decimals. */
+            {
+                ds4_mem_reconcile rr; uint64_t ot = 0, nraw = 0, ncen = 0;
+                /* state FIRST (acquire): pairs with the capture's
+                 * charge-then-state release so "captured" implies the
+                 * onetime the compute below loads is the charge. */
+                int ws = (int)__atomic_load_n(&s->rec_warmup_state,
+                                              __ATOMIC_ACQUIRE);
+                if (ws < 0 || ws > 2) ws = 0;
+                if (mem_reconcile_from(s, &img, &o, &rr, &ot, &nraw, &ncen)) {
+                    static const char *wname[3] =
+                        { "pending", "captured", "pinned" };
+                    buf_printf(&b,
+                        ",\"reconcile\":{\"supported\":true,\"source\":\"%s\","
+                        "\"boot_raw\":%llu,\"now_raw\":%llu,"
+                        "\"observed_delta\":%lld,\"census_growth\":%lld,"
+                        "\"onetime\":%llu,\"residual\":%lld,\"tol\":%llu,"
+                        "\"flagged\":%s,\"strict\":%s,\"warmup\":\"%s\"}",
+                        mem_obs_source_names[s->rec_src],
+                        (unsigned long long)s->rec_boot_raw,
+                        (unsigned long long)nraw,
+                        (long long)rr.observed_delta,
+                        (long long)rr.census_growth,
+                        (unsigned long long)ot,
+                        (long long)rr.residual,
+                        (unsigned long long)s->rec_tol_bytes,
+                        rr.flagged ? "true" : "false",
+                        s->rec_strict ? "true" : "false",
+                        wname[ws]);
+                } else {
+                    buf_puts(&b, ",\"reconcile\":{\"supported\":false}");
+                }
+            }
+            buf_putc(&b, '}');
         }
         /* memgov D0b-4: governor section -- leases + decisions by reason
          * (the full consumer x result x reason matrix lives in /metrics;
@@ -20299,6 +20745,9 @@ static void send_stats(server *s, int fd, bool as_json) {
                    "admits_partial_fork:%llu\n"
                    "admits_partial_truncate:%llu\n"
                    "cont_admit_rejects:%llu\n"
+                   "cont_credit_ext_granted:%llu\n"
+                   "cont_credit_ext_refused:%llu\n"
+                   "serial_idle_reaps:%llu\n"
                    "graph_fit_refusals:%llu\n"
                    "tokens_prefilled_computed:%llu\n"
                    "tokens_prefilled_cached:%llu\n"
@@ -20314,6 +20763,9 @@ static void send_stats(server *s, int fd, bool as_json) {
                (unsigned long long)ds4_metric_read(&m->admits_partial_fork),
                (unsigned long long)ds4_metric_read(&m->admits_partial_truncate),
                (unsigned long long)ds4_metric_read(&m->cont_admit_rejects),
+               (unsigned long long)ds4_metric_read(&m->cont_credit_ext_granted),
+               (unsigned long long)ds4_metric_read(&m->cont_credit_ext_refused),
+               (unsigned long long)ds4_metric_read(&m->serial_idle_reaps),
                (unsigned long long)ds4_metric_read(&m->graph_fit_refusals),
                (unsigned long long)ds4_metric_read(&m->tokens_prefilled_computed),
                (unsigned long long)ds4_metric_read(&m->tokens_prefilled_cached),
@@ -20745,6 +21197,8 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    bool no_serial;    /* MT-4 (audit V3): opt-in cont-only mode; the serial
+                        * lane refuses typed 503s instead of serving. */
 } server_config;
 
 static const char *server_config_model_id(const server_config *c) {
@@ -20792,8 +21246,11 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+    /* MT-5 (audit V13): this line allocates NOTHING and never described the
+     * batch template (banks/scratch print their own ledgers at create time)
+     * -- say so, instead of presenting a paper number as a boot cost. */
     server_log(DS4_LOG_DEFAULT,
-               "ds4-server: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
+               "ds4-server: context buffers ESTIMATE %.2f MiB (single-session shape; ctx=%d, backend=%s, prefill_cap=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
                (double)m.total_bytes / (1024.0 * 1024.0),
                ctx_size,
                ds4_backend_name(backend),
@@ -20852,7 +21309,9 @@ static void usage(FILE *fp) {
         "  --mtp-margin F\n"
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
         "  -c, --ctx N\n"
-        "      Context size allocated at startup. Default: 32768\n"
+        "      Context size. Default: 262144 on CUDA (unused context is demand-mapped,\n"
+        "      so a deep window is nearly free until used); 32768 on Metal/CPU (the\n"
+        "      window is allocated at startup).\n"
         "  -n, --tokens N\n"
         "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
         "  -t, --threads N\n"
@@ -20939,11 +21398,13 @@ static void usage(FILE *fp) {
         "  ds4-server -c 49152 --host 0.0.0.0    # full stack on a standard install\n"
         "\n"
         "Normal server command:\n"
-        "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
+        "  ./ds4-server --ctx 524288 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
         "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
-        "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
+        "  On Metal/CPU, larger --ctx values allocate more KV memory at startup and the\n"
+        "  startup log prints the estimate; on CUDA, unused context is demand-mapped and\n"
+        "  each admission is charged what it will actually use.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
         "  -h, --help\n"
@@ -21347,7 +21808,7 @@ static server_config parse_options(int argc, char **argv) {
         },
         .host = "127.0.0.1",
         .port = 8000,
-        .ctx_size = 32768,
+        .ctx_size = 0, /* 0 = per-backend default, resolved after flags */
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
@@ -21445,6 +21906,10 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--no-serial")) {
+            /* MT-4 (audit V3): cont-only serving.  DS4_SERVER_NO_SERIAL=1
+             * is the env twin (gates + containerized launches). */
+            c.no_serial = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--reasoning-effort")) {
@@ -21546,6 +22011,13 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: --no-spec conflicts with --mtp/--dspark");
         exit(2);
     }
+    if (c.ctx_size <= 0) {
+        /* Deep default on CUDA, where unused context is demand-mapped
+         * (v0.6) and one long agent request must fit a defaults boot;
+         * conservative on Metal/CPU, where the window is allocated at
+         * startup. */
+        c.ctx_size = c.engine.backend == DS4_BACKEND_CUDA ? 262144 : 32768;
+    }
     launch_resolve_defaults(&c, model_set, mtp_set,
                             preset_spark, no_mtp, no_dspark, no_spec);
     /* Keep --model-id as an argv pointer (stable).  The GGUF-derived
@@ -21555,6 +22027,10 @@ static server_config parse_options(int argc, char **argv) {
         server_model_id_from_gguf_path(c.engine.model_path,
                                        c.model_id_buf,
                                        sizeof(c.model_id_buf));
+    if (!c.no_serial) {   /* MT-4: env twin of --no-serial */
+        const char *ne = getenv("DS4_SERVER_NO_SERIAL");
+        c.no_serial = ne && ne[0] == '1' && ne[1] == '\0';
+    }
     return c;
 }
 
@@ -21641,8 +22117,15 @@ int main(int argc, char **argv) {
         return rc;
     }
 
+    /* MT-4 (audit V3): under --no-serial the boot session is never created
+     * -- the serial lane refuses (run_job_single's typed 503) instead of
+     * serving, and every boot/client consumer reads cfg.ctx_size /
+     * serial_boot_ctx (R18/R19).  The lazy graph made the session cheap,
+     * but its EXISTENCE is what a cont-only deployment opts out of: one
+     * serial detour is a multi-GiB conversion (the leg-1 cliff). */
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
+    if (!cfg.no_serial &&
+        ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
                    ds4_backend_name(cfg.engine.backend));
         ds4_engine_close(engine);
@@ -21660,9 +22143,37 @@ int main(int argc, char **argv) {
     s.default_tokens = cfg.default_tokens;
     /* v0.5.2 inc1: serial right-sizing (see serial_session_ensure_fit). */
     s.serial_boot_ctx = cfg.ctx_size;
+    s.no_serial = cfg.no_serial;
+    if (s.no_serial)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --no-serial: cont-only serving; serial-lane "
+                   "requests get typed 503 refusals (reason=lane_disabled)");
     {
         const char *sr = getenv("DS4_SERVER_SERIAL_RIGHTSIZE");
         s.serial_rightsize = !(sr && sr[0] == '0' && sr[1] == '\0');
+        /* MT-3: serial idle reap window (seconds; 0 = off). */
+        const char *ir = getenv("DS4_SERIAL_IDLE_REAP_S");
+        s.serial_idle_reap_s = ir && ir[0] ? atoi(ir) : 120;
+        if (s.serial_idle_reap_s < 0) s.serial_idle_reap_s = 0;
+        /* v0.6.2 Inc 0: reconciliation tolerance (absolute; the residual
+         * band a healthy box holds) + gate strictness.  An explicit
+         * DS4_MEM_RECONCILE_WARMUP_MB PINS the one-time warmup charge and
+         * disarms the self-calibrating capture (the --mem-floor-gb
+         * pattern: explicit value = deterministic behavior for gates). */
+        const char *rt = getenv("DS4_MEM_RECONCILE_TOL_MB");
+        long tol_mb = rt && rt[0] ? atol(rt) : 256;
+        if (tol_mb < 0) tol_mb = 0;
+        s.rec_tol_bytes = (uint64_t)tol_mb * 1048576ull;
+        const char *rs = getenv("DS4_MEM_RECONCILE_STRICT");
+        s.rec_strict = rs && rs[0] == '1' && rs[1] == '\0';
+        const char *rw = getenv("DS4_MEM_RECONCILE_WARMUP_MB");
+        if (rw && rw[0]) {
+            long wmb = atol(rw);
+            if (wmb < 0) wmb = 0;
+            s.rec_onetime = (uint64_t)wmb * 1048576ull;
+            s.rec_warmup_state = 2;   /* pinned: auto-capture disarmed */
+        }
+        s.last_serial_use = now_sec();
         /* v0.5.2 inc3: dead-client abort (see the server struct comment). */
         const char *da = getenv("DS4_SERVER_DISCONNECT_ABORT");
         s.disconnect_abort = !(da && da[0] == '0' && da[1] == '\0');
@@ -21775,12 +22286,31 @@ int main(int argc, char **argv) {
          * amortizing the ~51ms fixed forward cost.  This dwarfs the ~3% CUDA-graph
          * ceiling that deprioritized W8c/W8b.  max_seq=64 did NOT fit GB10 KV at
          * ctx=4096, so we fit-or-reduce below rather than silently falling back to
-         * the per-call static path (which loses W5-W8 continuous features). */
-        int cmax = cm ? atoi(cm) : 32;
+         * the per-call static path (which loses W5-W8 continuous features).
+         * MT-5 (audit V6): the 32 stands only through the measured regime --
+         * coalesce_max_default scales it down with ctx (see its comment).
+         * MT-4 (R19): size from cfg.ctx_size, not the serial session's ctx
+         * -- the cont bank plan derives from the CONFIGURED context (the
+         * two were equal at boot anyway; under --no-serial there is no
+         * session to ask).
+         * Governed cont bank plan (v0.6.2): coalesce_max_boot requests the
+         * regime ceiling wherever a live memory answer exists and leaves
+         * the sizing to create_fit's kv plan (which prices full-depth bank
+         * commits from the actual budget); the MT-5 ladder rules only
+         * where the budget cannot answer. */
+        int cmax = cm ? atoi(cm) : coalesce_max_boot(cfg.ctx_size);
         if (cmax < 1) cmax = 1;
         if (cmax > DS4_COALESCE_HARD_MAX) cmax = DS4_COALESCE_HARD_MAX;
+        /* Governed cont bank plan (v0.6.2): an EXPLICIT bank request
+         * disarms the fit's kv plan -- the operator's number rules, with
+         * the eager fit + descent still the physical safety (the plan is
+         * a DEFAULT-sizing mechanism; without this, a deep-ctx
+         * DS4_SERVER_COALESCE_MAX=6 would be silently cut to the plan's
+         * floor).  Pre-listener single thread; same env-transport
+         * pattern as --mem-floor-gb / DS4_MEM_FLOOR_GB. */
+        if (cm && cmax > 1) setenv("DS4_BATCH_FIT_KV", "0", 1);
         const char *ct = getenv("DS4_SERVER_COALESCE_MAX_TOKENS");
-        const int cmaxtok_dflt = coalesce_max_tokens_default(ds4_session_ctx(s.session));
+        const int cmaxtok_dflt = coalesce_max_tokens_default(cfg.ctx_size);
         int cmaxtok = ct ? atoi(ct) : cmaxtok_dflt;
         if (cmaxtok <= 0) cmaxtok = cmaxtok_dflt;  /* unbounded coalesce -> size ctx to default */
         if (cmaxtok < cmax) cmaxtok = cmax;        /* need >=1 token per seq */
@@ -21799,7 +22329,7 @@ int main(int argc, char **argv) {
             int try_seq = cmax;
             bool made = false;
             while (try_seq >= 2) {
-                if (ds4_batch_ctx_create_fit(s.engine, ds4_session_ctx(s.session), try_seq, cmaxtok,
+                if (ds4_batch_ctx_create_fit(s.engine, cfg.ctx_size, try_seq, cmaxtok,
                                              &s.batch_ctx, cerr, sizeof(cerr)) == 0) {
                     const int got_seq = ds4_batch_ctx_max_seq(s.batch_ctx);  /* may be < try_seq (budget fit) */
                     s.batch_ctx_max_seq = got_seq;
@@ -21854,10 +22384,12 @@ int main(int argc, char **argv) {
                         s.warm_checkpoint = !(bc && bc[0] == '0' && bc[1] == '\0');
                     }
                     server_log(DS4_LOG_DEFAULT,
-                               "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d seq_cap=%d)%s",
-                               got_seq, cmaxtok, ds4_session_ctx(s.session),
+                               "ds4-server: persistent batch ctx ready (max_seq=%d max_tokens=%d ctx=%d raw_ring=%d prefill_chunk=%u seq_cap=%d admit_band=%u)%s",
+                               got_seq, cmaxtok, cfg.ctx_size,
                                ds4_batch_ctx_raw_cap(s.batch_ctx),
+                               ds4_cont_prefill_chunk_tokens(),
                                ds4_batch_ctx_seq_cap(s.batch_ctx),
+                               ds4_cont_admit_band_x1024(),
                                got_seq < cmax ? " [reduced from requested to fit memory]" : "");
                     made = true;
                     break;
@@ -21968,7 +22500,6 @@ int main(int argc, char **argv) {
          * unrendered here; the capture is one call by design). */
         mem_census_image img; ds4_gov_ledger lg; ds4_mem_observation o;
         mem_render_capture(&img, &lg, &o);
-        (void)o;
         if (img.supported) {
             uint64_t tl[DS4_MEMD__COUNT] = {0}, ts[DS4_MEMD__COUNT] = {0};
             for (int d = 0; d < DS4_MEMD__COUNT; d++) {
@@ -22033,6 +22564,34 @@ int main(int argc, char **argv) {
                  * later arena promotions must carry claims (the lazy
                  * materializer does; the funnel tripwires bypasses). */
                 ds4_gpu_model_plan_freeze();
+                /* v0.6.2 Inc 0: arm the reconciliation baseline at the
+                 * SAME settle instant the boot lease is computed from.
+                 * The raw source is pinned now: MemAvailable where the
+                 * box answers it (integrated), cuda-free otherwise --
+                 * the max-of-two winner can flip sources mid-run and a
+                 * flipped source makes the delta a fiction.  Release
+                 * store: the worker thread is already running its idle
+                 * tick and must never read a half-written baseline. */
+                if (o.status == DS4_MEMOBS_OK &&
+                    (o.meminfo_avail_bytes || o.cuda_free_bytes)) {
+                    const int msrc = o.meminfo_avail_bytes
+                        ? DS4_MEMOBS_SRC_MEMINFO_AVAILABLE
+                        : DS4_MEMOBS_SRC_CUDA_FREE;
+                    s.rec_src = msrc;
+                    s.rec_boot_raw = o.meminfo_avail_bytes
+                        ? o.meminfo_avail_bytes : o.cuda_free_bytes;
+                    s.rec_boot_census = total;
+                    __atomic_store_n(&s.rec_supported, 1, __ATOMIC_RELEASE);
+                    server_log(DS4_LOG_DEFAULT,
+                               "ds4-server: mem reconcile: baseline armed "
+                               "(%s %.2f GiB, census live %.2f GiB, tol %.0f "
+                               "MiB%s%s)",
+                               mem_obs_source_names[msrc],
+                               mem_gib(s.rec_boot_raw), mem_gib(total),
+                               (double)s.rec_tol_bytes / 1048576.0,
+                               s.rec_strict ? ", STRICT" : "",
+                               s.rec_warmup_state == 2 ? ", warmup pinned" : "");
+                }
             }
         }
     }
@@ -22087,7 +22646,8 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    const ds4_tokens *tokens = ds4_session_tokens(s.session);
+    /* MT-4: NULL-safe under --no-serial (no session, nothing to persist). */
+    const ds4_tokens *tokens = s.session ? ds4_session_tokens(s.session) : NULL;
     if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
@@ -30153,6 +30713,162 @@ static void test_credit_union_sums_per_run_need(void) {
     TEST_ASSERT(need == 2 * page);   /* only the second run still charges */
 }
 
+/* MT-1b (v0.6.1 memory truth): pure tranche-extension arithmetic (ds4.h
+ * inlines).  Pins the margin trigger (due exactly when pos + margin
+ * reaches the credited end), the tranche walk with its true-target clamp,
+ * the legacy kill switch, and the funded-boundary invariant: an extension
+ * is due BEFORE the margin's worth of steps can reach the boundary, and
+ * the refusal clamp finishes the row with its last KV write at
+ * credit_end - 1. */
+static void test_cont_credit_ext_due_shapes(void) {
+    uint64_t nf = 0;
+
+    /* tranche 0 = legacy kill switch: never due, even at the boundary */
+    TEST_ASSERT(!ds4_cont_credit_ext_due(999, 1000, 5000, 8, 0, &nf));
+    /* fully funded (credit_end == target): nothing to extend */
+    TEST_ASSERT(!ds4_cont_credit_ext_due(999, 1000, 1000, 8, 100, &nf));
+    /* far from the boundary: not due */
+    TEST_ASSERT(!ds4_cont_credit_ext_due(500, 1000, 5000, 8, 100, &nf));
+    /* the margin trigger is exact: pos + margin < end -> wait; == -> due */
+    TEST_ASSERT(!ds4_cont_credit_ext_due(991, 1000, 5000, 8, 100, &nf));
+    TEST_ASSERT(ds4_cont_credit_ext_due(992, 1000, 5000, 8, 100, &nf));
+    TEST_ASSERT(nf == 1100);            /* one tranche */
+    /* the last tranche clamps at the true target */
+    TEST_ASSERT(ds4_cont_credit_ext_due(995, 1000, 1050, 8, 100, &nf));
+    TEST_ASSERT(nf == 1050);
+    /* a huge tranche funds the remainder in one step */
+    TEST_ASSERT(ds4_cont_credit_ext_due(995, 1000, 5000, 8, 1u << 20, &nf));
+    TEST_ASSERT(nf == 5000);
+}
+static void test_cont_credit_refuse_bmax_clamp(void) {
+    /* row at pos 990 with 40 generated, funded through 1000: 10 more
+     * tokens -> terminal fires at glen 50 with the last KV row at 999 */
+    TEST_ASSERT(ds4_cont_credit_refuse_bmax(40, 990, 1000) == 50);
+    /* at the boundary exactly: zero remain, terminal fires immediately */
+    TEST_ASSERT(ds4_cont_credit_refuse_bmax(40, 1000, 1000) == 40);
+    /* pathological pos past end floors at glen (never extends the cap) */
+    TEST_ASSERT(ds4_cont_credit_refuse_bmax(40, 1005, 1000) == 40);
+}
+/* MT-5 (audit V6): the ctx-aware requested-banks default.  Anchors: 32
+ * through the W8-measured regime (<=16384), halving against the ~1 Mi
+ * fundable-token depth, floor 4 (fork fanout). */
+static void test_coalesce_max_default_tiers(void) {
+    TEST_ASSERT(coalesce_max_default(4096)   == 32);   /* the W8 shape */
+    TEST_ASSERT(coalesce_max_default(16384)  == 32);   /* regime boundary */
+    TEST_ASSERT(coalesce_max_default(32768)  == 32);   /* 32 x 32k == anchor */
+    TEST_ASSERT(coalesce_max_default(57344)  == 16);   /* the mid-ctx shape */
+    TEST_ASSERT(coalesce_max_default(131072) == 8);
+    TEST_ASSERT(coalesce_max_default(262144) == 4);
+    TEST_ASSERT(coalesce_max_default(524288) == 4);    /* floor holds */
+    TEST_ASSERT(coalesce_max_default(786432) == 4);    /* the leg2a shape */
+}
+
+/* Governed cont bank plan (v0.6.2): the pure KV-aware plan bound the
+ * engine's create_fit applies (ds4_batch_plan_kv_banks).  Shapes mirror
+ * the ship box: tens-of-GiB boot budgets, kv-bank commits (seq_cap x
+ * banded packed rate) from the deep ledger. */
+static void test_batch_plan_kv_banks(void) {
+    const uint64_t GiB = 1ull << 30;
+    /* deep ctx: full-depth funding runs out below the floor -- the A2b
+     * fanout floor holds (floor banks ride the admission gate, exactly
+     * the ladder's 4 @ 262k+ posture) */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, 16 * GiB, 100u, 4u) == 4u);
+    /* mid ctx: the live budget funds MORE than the frozen ladder said
+     * (the v0.6.1 pessimism kill: 12 fully-funded banks where the ladder
+     * froze 8) */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, 4 * GiB, 100u, 4u) == 12u);
+    /* the eager fit still caps: a floor the eager slabs cannot fund is
+     * not granted */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, 16 * GiB, 3u, 4u) == 3u);
+    /* shallow ctx: plan-bound above the eager count changes nothing */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, GiB / 2, 32u, 4u) == 32u);
+    /* no physics answer -> the eager fit's count passes through */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(48 * GiB, 0, 7u, 4u) == 7u);
+    /* zero budget still grants the floor (the fit's own 2-bank poke and
+     * the physical descent stay the safety below it) */
+    TEST_ASSERT(ds4_batch_plan_kv_banks(0, 16 * GiB, 100u, 4u) == 4u);
+}
+
+/* MT-7: the disclosed admission band -- clamp, physics floor, round-up. */
+static void test_cont_admit_band_apply(void) {
+    /* 1024 = physics-exact: identity at any need */
+    TEST_ASSERT(ds4_cont_admit_band_apply(0, 1024) == 0);
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 1024) == 1048576);
+    /* the default 1045 (~1.02x): rounds UP, never shrinks a nonzero need */
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 1045) == 1070080);
+    TEST_ASSERT(ds4_cont_admit_band_apply(1, 1045) == 2);
+    /* clamp low: anything below 1024 charges physics-exact */
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 0) == 1048576);
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 512) == 1048576);
+    /* clamp high: 2048 is the sanity cap (2x physics) */
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 4096) == 2097152);
+    TEST_ASSERT(ds4_cont_admit_band_apply(1048576, 2048) == 2097152);
+}
+
+/* MT-7: the commit-rate tripwire -- sample gate, 2x boundary, guards. */
+static void test_cont_rate_anomalous(void) {
+    /* below the sample gate: page floors dominate, never trips */
+    TEST_ASSERT(!ds4_cont_rate_anomalous(1u << 30, 100, 4096, 65536));
+    /* zero physics rate or zero min_tokens: undefined comparison, no trip */
+    TEST_ASSERT(!ds4_cont_rate_anomalous(1u << 30, 100000, 0, 65536));
+    TEST_ASSERT(!ds4_cont_rate_anomalous(1u << 30, 100000, 4096, 0));
+    /* at the boundary exactly (obs == 2x phys): not anomalous */
+    TEST_ASSERT(!ds4_cont_rate_anomalous(2ull * 4096 * 100000, 100000, 4096, 65536));
+    /* one byte past: trips */
+    TEST_ASSERT(ds4_cont_rate_anomalous(2ull * 4096 * 100000 + 1, 100000, 4096, 65536));
+    /* the healthy ship shape: obs ~= phys, never trips */
+    TEST_ASSERT(!ds4_cont_rate_anomalous(4300ull * 500000, 500000, 4096, 65536));
+}
+
+/* Rider #48: content fingerprint determinism + size folding on the
+ * small-file full-hash branch. */
+static void test_weight_fp_small(void) {
+    unsigned char buf[4096];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (unsigned char)(i * 7u + 3u);
+    uint64_t a = ds4_weight_content_fingerprint(buf, sizeof(buf));
+    TEST_ASSERT(a == ds4_weight_content_fingerprint(buf, sizeof(buf)));
+    /* any flipped byte differs (small files hash fully) */
+    buf[2048] ^= 0x40u;
+    TEST_ASSERT(a != ds4_weight_content_fingerprint(buf, sizeof(buf)));
+    buf[2048] ^= 0x40u;
+    TEST_ASSERT(a == ds4_weight_content_fingerprint(buf, sizeof(buf)));
+    /* equal prefix, different length differs (the size fold) */
+    TEST_ASSERT(a != ds4_weight_content_fingerprint(buf, sizeof(buf) - 1));
+    /* empty/NULL are stable and distinct from data */
+    TEST_ASSERT(ds4_weight_content_fingerprint(NULL, 0) ==
+                ds4_weight_content_fingerprint(NULL, 0));
+    TEST_ASSERT(a != ds4_weight_content_fingerprint(NULL, 0));
+}
+
+/* Rider #48: the strided-sample geometry contract on large files -- head,
+ * tail, and stride pages are covered; bytes BETWEEN sample windows are
+ * invisible BY DESIGN (mixup detection, not tamper-proofing).  This test
+ * pins both directions so a geometry change that silently widens or
+ * narrows coverage fails here first. */
+static void test_weight_fp_stride_geometry(void) {
+    const uint64_t n = 24ull << 20; /* head 4M + strides at 16M + tail 4M */
+    unsigned char *buf = (unsigned char *)calloc(1, (size_t)n);
+    TEST_ASSERT(buf != NULL);
+    uint64_t fp0 = ds4_weight_content_fingerprint(buf, n);
+    /* head window covered */
+    buf[100] = 1;
+    TEST_ASSERT(fp0 != ds4_weight_content_fingerprint(buf, n));
+    buf[100] = 0;
+    /* stride page at 16 MiB covered */
+    buf[(16ull << 20) + 100] = 1;
+    TEST_ASSERT(fp0 != ds4_weight_content_fingerprint(buf, n));
+    buf[(16ull << 20) + 100] = 0;
+    /* tail window covered */
+    buf[n - 100] = 1;
+    TEST_ASSERT(fp0 != ds4_weight_content_fingerprint(buf, n));
+    buf[n - 100] = 0;
+    /* between windows: invisible by design */
+    buf[(8ull << 20) + 100] = 1;
+    TEST_ASSERT(fp0 == ds4_weight_content_fingerprint(buf, n));
+    buf[(8ull << 20) + 100] = 0;
+    free(buf);
+}
+
 /* Inc 7a: the extracted accumulator's own contract -- verdict precedence,
  * stop capture + truncation, one-shot transitions, think-gated markers.
  * The serial/cont byte equivalence is pinned by the oracle tests above;
@@ -30988,6 +31704,79 @@ static void test_mem_census_trim_inject_parse(void) {
     TEST_ASSERT(site == -7 && n == 77);
 }
 
+/* v0.6.2 Inc 3: the trim-victim blend (pure core, ds4.h).  The plan's
+ * synthetic 3-bank scenario: an invalid bank beats everything; among
+ * valid banks the OLDEST activity wins regardless of history length
+ * (the old order's inversion); equal recency falls back to shortest
+ * history; the hist kill switch restores shortest-history-only. */
+static void test_trim_victim_blend_order(void) {
+    const ds4_trim_victim_key inv   = { 0,      0, 900 };  /* invalid, hot  */
+    const ds4_trim_victim_key old_deep  = { 1, 700000,  10 };
+    const ds4_trim_victim_key hot_small = { 1,   2000, 500 };
+    /* Invalid history is always the cheapest victim, both orders. */
+    TEST_ASSERT(ds4_trim_victim_cheaper(&inv, &old_deep, 0));
+    TEST_ASSERT(ds4_trim_victim_cheaper(&inv, &hot_small, 0));
+    TEST_ASSERT(ds4_trim_victim_cheaper(&inv, &hot_small, 1));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&old_deep, &inv, 0));
+    /* THE inversion the increment exists for: the ancient deep trunk
+     * trims before the recently-hot small bank... */
+    TEST_ASSERT(ds4_trim_victim_cheaper(&old_deep, &hot_small, 0));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&hot_small, &old_deep, 0));
+    /* ...and the hist kill switch restores the old choice. */
+    TEST_ASSERT(ds4_trim_victim_cheaper(&hot_small, &old_deep, 1));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&old_deep, &hot_small, 1));
+    /* Equal recency: shortest history is the cheaper re-prefill. */
+    const ds4_trim_victim_key tie_a = { 1, 100, 42 };
+    const ds4_trim_victim_key tie_b = { 1, 200, 42 };
+    TEST_ASSERT(ds4_trim_victim_cheaper(&tie_a, &tie_b, 0));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&tie_b, &tie_a, 0));
+    /* Two invalids compare equal (stable sort keeps index order). */
+    const ds4_trim_victim_key inv2 = { 0, 5, 5 };
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&inv, &inv2, 0));
+    TEST_ASSERT(!ds4_trim_victim_cheaper(&inv2, &inv, 0));
+}
+
+/* v0.6.2 Inc 0: reconciliation arithmetic (pure core).  The equation
+ * under test: observed raw drop = census growth + one-time charges +
+ * residual, signed in every term, flagged strictly over the tolerance. */
+static void test_mem_reconcile_arithmetic(void) {
+    /* A fully explained drop: residual 0, unflagged. */
+    ds4_mem_reconcile r = ds4_mem_reconcile_compute(
+        /*boot_raw*/ 100, /*now_raw*/ 60,
+        /*boot_census*/ 10, /*now_census*/ 50,
+        /*onetime*/ 0, /*tol*/ 5);
+    TEST_ASSERT(r.observed_delta == 40 && r.census_growth == 40);
+    TEST_ASSERT(r.residual == 0 && !r.flagged);
+    /* One-time charges explain the census-invisible part. */
+    r = ds4_mem_reconcile_compute(100, 50, 10, 40, 20, 5);
+    TEST_ASSERT(r.observed_delta == 50 && r.explained == 50);
+    TEST_ASSERT(r.residual == 0 && !r.flagged);
+    /* Unexplained consumption flags positive... */
+    r = ds4_mem_reconcile_compute(100, 40, 10, 40, 0, 5);
+    TEST_ASSERT(r.residual == 30 && r.flagged);
+    /* ...and over-explanation flags negative (the box returned memory
+     * the ledger still charges): |residual| governs. */
+    r = ds4_mem_reconcile_compute(100, 90, 10, 60, 0, 5);
+    TEST_ASSERT(r.residual == -40 && r.flagged);
+    /* Exactly at tol does NOT flag (strictly-over threshold). */
+    r = ds4_mem_reconcile_compute(100, 95, 10, 10, 0, 5);
+    TEST_ASSERT(r.residual == 5 && !r.flagged);
+    /* The raw answer can rise past boot (a neighbor exited) while the
+     * census shrank: both terms go negative and still reconcile. */
+    r = ds4_mem_reconcile_compute(100, 120, 50, 30, 0, 5);
+    TEST_ASSERT(r.observed_delta == -20 && r.census_growth == -20);
+    TEST_ASSERT(r.residual == 0 && !r.flagged);
+    /* Saturated inputs clamp to INT64_MAX instead of wrapping (a stale
+     * counter errs HIGH, the tripwire convention). */
+    r = ds4_mem_reconcile_compute(UINT64_MAX, 0, 0, 0, 0, 5);
+    TEST_ASSERT(r.observed_delta == INT64_MAX && r.flagged);
+    /* Every signed STEP saturates too: max drop beside max census
+     * shrink would wrap the naive subtraction; it pins at +INT64_MAX. */
+    r = ds4_mem_reconcile_compute(UINT64_MAX, 0, UINT64_MAX, 0, 0, 5);
+    TEST_ASSERT(r.explained == -INT64_MAX);
+    TEST_ASSERT(r.residual == INT64_MAX && r.flagged);
+}
+
 #ifndef DS4_NO_GPU
 /* memgov D0a-4: drive the D-1b trim-failure semantics at the REAL driver
  * boundary.  Runs only where the backend supports injection (CUDA) AND
@@ -31414,6 +32203,49 @@ static void test_mem_gov_evaluate_verdicts(void) {
     o = mem_gov_test_obs(1449);
     q = ds4_gov_evaluate(&lg, &o, &cl);
     TEST_ASSERT(q.status == DS4_GOV_REFUSE_LIVE && q.deficit == 1);
+}
+
+/* MT-2 (v0.6.1 memory truth): the serial build-window lease lifecycle as
+ * seen by a BANK claim.  ds4_session_alloc_graph publishes (est, 0) before
+ * the burst, (est, est) at commit, (0, 0) on failure/release; the
+ * evaluator's cross-lane term (others' intent - resident) must charge the
+ * whole window and drop to zero at commit -- the committed bytes are
+ * already invisible to raw free, so charging them again would double-count
+ * (no false admit during the window, no false refuse after commit). */
+static void test_mem_gov_serial_window_lease(void) {
+    ds4_gov_ledger lg = mem_gov_test_ledger();
+    uint64_t faults = 0;
+    ds4_gov_claim cl = {0};
+    cl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+    cl.memc = DS4_MEMC_BATCH_BANK;
+    cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    cl.proposed_outstanding = 1500;      /* own unfunded = 500 */
+    cl.class_limit = 0;
+
+    /* Baseline (serial lease empty): required = floor 600 + sub 50
+     * + serial reserve 200 + own unfunded 500 = 1350. */
+    ds4_mem_observation o = mem_gov_test_obs(1350);
+    ds4_gov_quote q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_ADMIT && q.required == 1350);
+
+    /* Window OPEN: serial declares intent 5000, nothing landed.  The
+     * bank's quote must charge the full unfunded window. */
+    ds4_gov_lease_publish(&lg, DS4_GOVC_SERIAL_SESSION, 5000, 0, 200, &faults);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_REFUSE_LIVE);
+    TEST_ASSERT(q.required == 1350 + 5000 && q.deficit == 5000);
+
+    /* COMMIT: bytes landed (est, est) -- unfunded drops to zero, raw
+     * free now carries the graph; required returns to baseline. */
+    ds4_gov_lease_publish(&lg, DS4_GOVC_SERIAL_SESSION, 5000, 5000, 200, &faults);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_ADMIT && q.required == 1350);
+
+    /* RELEASE (graph freed): identical required -- no phantom remains. */
+    ds4_gov_lease_publish(&lg, DS4_GOVC_SERIAL_SESSION, 0, 0, 200, &faults);
+    q = ds4_gov_evaluate(&lg, &o, &cl);
+    TEST_ASSERT(q.status == DS4_GOV_ADMIT && q.required == 1350);
+    TEST_ASSERT(faults == 0);
 }
 
 static void test_mem_gov_requester_asymmetry(void) {
@@ -32482,6 +33314,14 @@ static void ds4_server_unit_tests_run(void) {
     test_request_decode_budget_three_states();
     test_credit_union_merge_shapes();
     test_credit_union_sums_per_run_need();
+    test_cont_credit_ext_due_shapes();
+    test_cont_credit_refuse_bmax_clamp();
+    test_coalesce_max_default_tiers();
+    test_batch_plan_kv_banks();
+    test_cont_admit_band_apply();
+    test_cont_rate_anomalous();
+    test_weight_fp_small();
+    test_weight_fp_stride_geometry();
     test_idempotency_key_header_is_ignored();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();
@@ -32494,6 +33334,10 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_census_arena_slack_shape();
     test_mem_census_trim_residue_shape();
     test_mem_census_trim_inject_parse();
+    /* v0.6.2 Inc 0: reconciliation arithmetic. */
+    test_mem_reconcile_arithmetic();
+    /* v0.6.2 Inc 3: trim-victim blend order. */
+    test_trim_victim_blend_order();
 #ifndef DS4_NO_GPU
     test_mem_census_trim_inject_driver();
     /* memgov D4-2: reclaim trim-preimage arithmetic. */
@@ -32511,6 +33355,7 @@ static void ds4_server_unit_tests_run(void) {
     test_mem_obs_legacy_shim();
     /* memgov D0b-1: shadow-governor evaluator (pure core). */
     test_mem_gov_evaluate_verdicts();
+    test_mem_gov_serial_window_lease();
     test_mem_gov_requester_asymmetry();
     test_mem_gov_absolute_replacement();
     test_mem_gov_observation_policy();

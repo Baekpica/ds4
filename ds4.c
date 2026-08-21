@@ -13858,7 +13858,11 @@ static uint64_t metal_graph_alloc_bytes_estimate(
     bytes += 3ull * pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float);
     bytes += pc * (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
     bytes += (uint64_t)DS4_MULTISEQ_MAX_SEQ * DS4_N_VOCAB * sizeof(float);
-    bytes += 64ull << 20;   /* slack: the dozens of sub-MiB buffers above + views */
+    /* Slack: the dozens of sub-MiB buffers above + views.  MT-5 (audit V13):
+     * raised 64 -> 96 MiB -- the per-bank slab views' ensure_rows hooks alone
+     * charge ~84 MiB on first admission (measured, see ds4_gpu_tensor_view),
+     * so 64 under-counted the real footprint this estimate funds. */
+    bytes += 96ull << 20;
     return bytes;
 }
 
@@ -14113,8 +14117,9 @@ static bool metal_graph_alloc_raw_cap(
     g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     /* Opp C Phase 1A: the FP8 compressed-KV mirror is allocated only when
-     * DS4_CUDA_FP8_KV is enabled.  Default OFF -> these buffers stay NULL
-     * (g was memset above) and the build is byte-identical to today. */
+     * DS4_CUDA_FP8_KV is enabled -- default ON since v0.2.4 (packed
+     * primaries ship default); =0 restores F32-primary and leaves these
+     * NULL (g was memset above). */
     const bool fp8_kv = ds4_cuda_fp8_kv_enabled() != 0;
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -14164,8 +14169,9 @@ static bool metal_graph_alloc_raw_cap(
                         managed_kv_cache,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 /* P2 Inc3a: packed FP4 indexer mirror, gated on DS4_CUDA_FP4_INDEX
-                 * (default OFF -> these stay NULL).  Same comp_cap row count as
-                 * the F32 index cache it shadows; row=64 codes + 16 scale bytes. */
+                 * -- default ON since v0.2.4 (=0 restores F32-primary, these
+                 * stay NULL).  Same comp_cap row count as the F32 index cache
+                 * it shadows; row=64 codes + 16 scale bytes. */
                 if (ds4_cuda_fp4_index_enabled()) {
                     g->layer_index_comp_cache_fp4[il] = metal_graph_alloc_kv_cache_tensor(
                             managed_kv_cache,
@@ -27302,6 +27308,13 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
                       m.raw_cap *
                       DS4_N_HEAD_DIM *
                       sizeof(float);
+        /* MT-5 (audit V13): count the FP8/FP4 packed mirrors the alloc
+         * actually makes (metal_graph_alloc_raw_cap; same gates as the
+         * serial fit estimator at metal_graph_alloc_bytes_estimate) --
+         * omitting them under-stated the boot print by ~3.2 GiB at deep
+         * ctx with packed primaries default ON. */
+        const bool fp8_kv = ds4_cuda_fp8_kv_enabled() != 0;
+        const bool fp4_index = ds4_cuda_fp4_index_enabled() != 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
@@ -27309,10 +27322,16 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
             m.compressed_bytes += (uint64_t)layer_comp_cap *
                                   DS4_N_HEAD_DIM *
                                   (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            if (fp8_kv)
+                m.compressed_bytes += (uint64_t)layer_comp_cap *
+                                      (DS4_OPP_C_FP8_ROW_BYTES + DS4_OPP_C_FP8_SCALE_BYTES);
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
                                       sizeof(float);
+                if (fp4_index)
+                    m.compressed_bytes += (uint64_t)layer_comp_cap *
+                                          (DS4_INDEXER_FP4_ROW_BYTES + DS4_INDEXER_FP4_SCALE_BYTES);
             }
         }
         uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
@@ -35923,6 +35942,12 @@ struct ds4_session {
      * touch the graph.  Always false for CPU and distributed-coordinator
      * sessions and when DS4_SESSION_LAZY_GRAPH=0. */
     bool graph_pending;
+    /* v0.6.2 Inc 0: the committed graph's MEASURED bytes -- the census
+     * SESSION_TENSORS delta across the alloc's scope bracket (0 =
+     * pending, failed, or a backend keeping no census).  The serial
+     * lease's committed-row basis; the estimate keeps pricing pending
+     * intent, where no measurement can exist yet. */
+    uint64_t graph_alloc_bytes;
 };
 
 #ifndef DS4_NO_GPU
@@ -38258,6 +38283,10 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
      * block (inj_kv prefix-copy).  Must reproduce the single-bank accept (pos0 ~0.906,
      * commit ~3.92) -- validates metal_graph_eval_dspark_block_ms at N=1. */
     const bool ms_mode = getenv("DS4_DSPARK_BLOCK_MS") != NULL;
+    /* MT-5 (audit V13): these env-gated selftest buffers are exactly what
+     * DS4_MEMC_DIAG was declared for and never wired to -- unscoped they
+     * land in ENGINE_OTHER and violate its live==0 invariant during runs. */
+    ds4_gpu_mem_scope_begin(DS4_MEMC_DIAG);
     ds4_dspark_slabs ms_slab; memset(&ms_slab, 0, sizeof(ms_slab));
     bool ms_slab_ok = !ms_mode || ds4_dspark_slabs_alloc(&ms_slab, g, 1u);
     if (ms_mode && !ms_slab_ok) { fprintf(stderr, "ds4: dspark block MS: slab alloc failed\n"); }
@@ -38273,6 +38302,7 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
         mk_bias = ds4_gpu_tensor_alloc((uint64_t)vocab * sizeof(float));          /* [nb*vocab] */
         if (!mk_cand || !mk_prev || !mk_bias) { fprintf(stderr, "ds4: markov-dev scratch alloc failed\n"); }
     }
+    ds4_gpu_mem_scope_end();
 
     FILE *f = fopen(trace_path, "rb");
     if (!f) { fprintf(stderr, "ds4: cannot open trace %s\n", trace_path); return 1; }
@@ -38295,8 +38325,10 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
     float *blk = xmalloc((size_t)B * vocab * sizeof(float));
     float *refined = xmalloc((size_t)vocab * sizeof(float));
     ds4_gpu_tensor *inj_kv[DS4_DSPARK_N_LAYER] = {0};
+    ds4_gpu_mem_scope_begin(DS4_MEMC_DIAG);   /* MT-5: selftest class, see above */
     for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++)
         inj_kv[li] = ds4_gpu_tensor_alloc((uint64_t)pc * DS4_N_HEAD_DIM * sizeof(float));
+    ds4_gpu_mem_scope_end();
     bool alloc_ok = concat && hc_buf && toks && pos_host && prev_embed && blk && refined;
     for (uint32_t li = 0; li < DS4_DSPARK_N_LAYER; li++) alloc_ok = alloc_ok && inj_kv[li];
 
@@ -44199,11 +44231,25 @@ struct ds4_batch_ctx {
      * in ds4.h).  Bumped at every site that replaces or invalidates a bank's
      * committed content; never on pure extension. */
     uint64_t       *bank_gen;
+    /* v0.6.2 Inc 3: per-bank last content activity, in ticks of a
+     * process-monotonic use clock (stamped at history commit points --
+     * cold reset, fork, restore, per-token append; never wall time, so
+     * replays order identically).  The trim victim order's recency
+     * term: among idle valid banks, oldest activity trims first. */
+    uint64_t       *bank_last_use;
+    uint64_t        use_clock;
     /* memgov D4-2: a batched pass is driving this context (set/cleared by
      * the two pass entry points).  Reclaim prepare/commit answer BUSY
      * instead of racing a pass -- structural today (server and pass
      * drivers all hold gen_mu), typed honesty for every other caller. */
     int             in_pass;
+    /* MT-7 (v0.6.1 memory truth): live commit rates as of the last funding
+     * check -- census-observed slab bytes per committed token vs the packed
+     * shape-derived rate the projection charges.  Written under gen_mu
+     * (funding checks run inside the pass); read racily by /metrics
+     * (aligned u64, advisory). */
+    uint64_t        rate_obs_bpt;
+    uint64_t        rate_phys_bpt;
     uint64_t        warm_admits;     /* observability + gate hooks */
     uint64_t        warm_rejects;    /* n_cached>0 admits that degraded to cold */
     uint64_t        fork_admits;     /* A2b: fork_bank>0 admits served by copy (or */
@@ -45034,6 +45080,7 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
     ctx->bank_gen[bank]++;   /* Inc 5a: restored content is a new lineage */
     ctx->bank_hist_len[bank] = saved_tokens;
     ctx->bank_hist_valid[bank] = 1;
+    ctx->bank_last_use[bank] = ++ctx->use_clock;   /* v0.6.2 Inc 3: recency */
     return 0;
 }
 
@@ -45144,7 +45191,8 @@ static uint64_t ds4_batch_vmm_floor_per_bank(const ds4_gpu_graph *g) {
  * comp_map_budget (which grants the floors back -- fit and the page budget
  * split the same free memory, no double-booking of the headroom).  The
  * compressor STATE slabs stay eager and keep counting. */
-static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, bool vmm_comp) {
+static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, bool vmm_comp,
+                                           bool dspark) {
     const uint64_t raw_bank = (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
     uint64_t per_bank = vmm_comp ? ds4_batch_vmm_floor_per_bank(g) : 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -45189,23 +45237,82 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
         per_bank += (uint64_t)DS4_N_VOCAB * sizeof(float); /* draft logits row */
         per_bank += 3ull * sizeof(int32_t);                /* draft tokens/ids/n_raw */
     }
+    /* MT-5 (audit V13): the D4.5d DSpark injected-KV rings are eager per-bank
+     * allocations (ds4_dspark_slabs_alloc: one raw ring per drafter layer) that
+     * the fit division never charged -- ~13.5 MiB/bank invisible to the plan
+     * whenever a drafter is loaded. */
+    if (dspark)
+        per_bank += (uint64_t)DS4_DSPARK_N_LAYER * raw_bank;
     return per_bank;
 }
 
 /* R5 Inc1a/1b shared knob: bytes the bank-count fit and the comp-page budget
  * both leave free for runtime growth (tmp pools, capture graphs, logits
- * staging).  Ctx-aware default (2026-07-03): short-ctx boots (<=16k) run
- * safely at 6144 MiB (N=8 agg +20% cross-box from the extra banks, N=1
- * neutral), but at 57k ctx the extra resident slabs steal page cache from
- * the mmap weights and decode regresses ~7%, so long-ctx keeps 8192.
- * DS4_BATCH_FIT_HEADROOM_MB overrides both regimes. */
+ * staging).  MT-5 (audit V7) re-derivation, 2026-08-17: flat 6144 MiB.
+ * The old deep tier (8192 above 16k, stamped 2026-07-03: "at 57k ctx the
+ * extra resident slabs steal page cache from the mmap weights and decode
+ * regresses ~7%") guarded a cause the V6 ctx-aware bank grant removed --
+ * the slab pressure came from the 32-bank default planting ~450 MiB/bank
+ * of eager remainder regardless of ctx; the deep default is now 4-16
+ * banks.  Where the knob actually lands (measured, mt5_defaults_gate):
+ * the deep budget is min(plan, max(res + (free - headroom) + floors,
+ * floor_work)) -- three regimes.  At the gate shape the v0.5.6.3
+ * two-full-banks floor_work ruled (17.97 GiB both headrooms, free at
+ * the vmm block sat below the window); in the capacity-bound window
+ * (free-at-vmm roughly headroom+floor_work .. headroom+plan) the flip
+ * is a live +2 GiB of admission capacity (~450-500k tokens at the
+ * honest rate); plan-bound boots never see it.  Never worse than 8192
+ * in any regime.  The loaded-decode question (does spending the extra
+ * allowance into the page-cache zone still cost the documented ~7%?)
+ * belongs to the MT-7 deep-admission A/B, which measures decode under
+ * actually-deep residency -- at-rest decode cannot see an unspent
+ * allowance.  mt5_defaults_gate leg H pins the regime arithmetic.
+ * DS4_BATCH_FIT_HEADROOM_MB overrides.
+ *
+ * v0.6.2 Inc 2: the flat constant DERIVES now -- headroom = the
+ * operator's live floor + the boot-burst margin (runtime growth the
+ * boot has not materialized yet: capture graphs, sticky scratch depth,
+ * logits staging).  The static 6144 was these two summed for the
+ * SHIPPED floor only (4096 + ~2048) -- on any other floor it was a
+ * fiction: a stripped 1 GiB-floor box paid a phantom 3 GiB of planning
+ * margin nothing would ever use (run-3 calibration: floor 1024, leg
+ * min free 1,122 MiB -- the box never needed the static margin's
+ * band).  Deriving keeps EXACT value parity at shipped defaults
+ * (4096 + 2048 = 6144) and returns the difference to the fundable
+ * pool everywhere else.  The burst term is the measured constant
+ * (DS4_BATCH_FIT_BURST_MB pins it; battery legs on desktop-state and
+ * stripped-state boots are its receipt).  Precedence: an explicit
+ * DS4_BATCH_FIT_HEADROOM_MB pin rules everything (unchanged);
+ * DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores the static 6144.  The
+ * derivation disclosed once per boot on its own line. */
+static uint64_t ds4_mem_floor_bytes(void);
 static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     const char *he = getenv("DS4_BATCH_FIT_HEADROOM_MB");
-    uint64_t headroom = (ctx_size > 0 && ctx_size <= 16384) ? (6144ull << 20)
-                                                            : (8192ull << 20);
+    (void)ctx_size;
     if (he && he[0]) {
         const long hv = atol(he);
-        if (hv >= 0) headroom = (uint64_t)hv << 20;
+        if (hv >= 0) return (uint64_t)hv << 20;
+    }
+    { const char *de = getenv("DS4_BATCH_FIT_HEADROOM_DERIVED");
+      if (de && de[0] == '0' && de[1] == '\0')
+          return 6144ull << 20; }      /* kill switch: the V7 static */
+    uint64_t burst = 2048ull << 20;
+    { const char *be = getenv("DS4_BATCH_FIT_BURST_MB");
+      if (be && be[0]) {
+          const long bv = atol(be);
+          if (bv >= 0) burst = (uint64_t)bv << 20;
+      } }
+    const uint64_t floor = ds4_mem_floor_bytes();
+    const uint64_t headroom = floor + burst;
+    static int disclosed;              /* boot-path call sites only */
+    if (!disclosed) {
+        disclosed = 1;
+        fprintf(stderr,
+                "ds4: batch fit headroom: floor %.2f GiB + boot-burst %.2f "
+                "GiB = %.2f GiB (derived; DS4_BATCH_FIT_HEADROOM_MB pins, "
+                "DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores static 6144)\n",
+                (double)floor / 1073741824.0, (double)burst / 1073741824.0,
+                (double)headroom / 1073741824.0);
     }
     return headroom;
 }
@@ -45314,6 +45421,16 @@ static ds4_motif3_batch_runtime *motif3_batch_runtime_create(
             rt->max_seq, ctx_size, prefill_cap,
             (double)rt->cache_bytes_per_bank / 1073741824.0);
     return rt;
+}
+
+/* Governed cont bank plan: the KV-aware plan bound inside the Inc1a fit
+ * (see the create_impl block).  DS4_BATCH_FIT_KV=0 is the A/B kill switch
+ * -- it restores the eager-remainder-only fit AND tells the server's boot
+ * default to keep the MT-5 static ladder (ds4_server reads the same env,
+ * the serial-guard agreement precedent: one knob, two sites, no drift). */
+static bool ds4_batch_fit_kv_plan_enabled(void) {
+    const char *e = getenv("DS4_BATCH_FIT_KV");
+    return !(e && e[0] == '0' && e[1] == '\0');
 }
 
 /* v0.5.4 governance inc1 (item 16): the OPERATOR memory floor -- system
@@ -45726,6 +45843,84 @@ static uint64_t credit_union_family(const ds4_gpu_tensor *t, uint64_t stride,
                                  credit_union_run_need, (void *)(uintptr_t)t);
 }
 
+/* MT-7 (v0.6.1 memory truth): the disclosed admission band.  The union
+ * projection below charges future page-rounded extents EXACTLY, so the only
+ * honest margin left is the measured transient peak during admission --
+ * leg2a memcal stamped 1.02x steady for sequential chunked admits (receipts
+ * local/docs/v061/leg2a/); the deep-admission A/B re-stamps the default if
+ * the concurrent shape measures hotter.  1024 = physics-exact (kill
+ * switch); clamp mirrors ds4_cont_admit_band_apply. */
+uint32_t ds4_cont_admit_band_x1024(void) {
+    static uint32_t band = 0;
+    if (band == 0) {
+        uint32_t v = 1045u;
+        const char *e = getenv("DS4_CONT_ADMIT_BAND_X1024");
+        if (e && e[0]) {
+            const long x = atol(e);
+            if (x > 0) v = (uint32_t)x;
+        }
+        if (v < 1024u) v = 1024u;
+        if (v > 2048u) v = 2048u;
+        band = v;
+    }
+    return band;
+}
+
+/* MT-7: the shape-derived packed commit rate (bytes per committed token)
+ * of the demand-mapped families the projection charges -- the SAME family
+ * selection as ds4_batch_credit_union_projection (fp8 codes displace the
+ * F32 comp extent when present; likewise fp4 index codes; eager scale
+ * slabs excluded on both sides).  This is the physics floor the live
+ * observed rate is compared against: an observed rate ABOVE it beyond
+ * page-floor amortization means per-token growth the projection does not
+ * know about. */
+static uint64_t ds4_batch_slabs_packed_bpt(const ds4_batch_ctx *ctx) {
+    const ds4_batch_slabs *sl = &ctx->sl;
+    double bpt = 0.0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        double row = 0.0;
+        if (sl->multi_comp_fp8[il])
+            row += (double)DS4_OPP_C_FP8_ROW_BYTES;
+        else if (sl->multi_comp[il])
+            row += (double)(DS4_N_HEAD_DIM * sizeof(float));
+        if (sl->multi_index_fp4[il])
+            row += (double)DS4_INDEXER_FP4_ROW_BYTES;
+        else if (sl->multi_index[il])
+            row += (double)(DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        bpt += row / (double)ratio;
+    }
+    return (uint64_t)(bpt + 0.5);
+}
+
+/* Governed cont bank plan: the SAME physics from the GRAPH's cache config,
+ * for the boot fit -- which runs before ds4_batch_slabs_alloc, when the
+ * slab presence above does not exist yet.  Slab presence mirrors these
+ * exact flags (saved_comp_fp8 = layer_comp_cache_fp8 and multi_comp_fp8
+ * is allocated iff saved_comp_fp8; likewise fp4/index/comp), so the two
+ * rates are one number at any given config -- the boot ledger prints this
+ * one and ds4_batch_ctx_commit_rate reports the slab one; gates assert
+ * they agree. */
+static uint64_t ds4_graph_packed_bpt(const ds4_gpu_graph *g) {
+    double bpt = 0.0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        double row = 0.0;
+        if (g->layer_comp_cache_fp8[il])
+            row += (double)DS4_OPP_C_FP8_ROW_BYTES;
+        else if (g->layer_attn_comp_cache[il])
+            row += (double)(DS4_N_HEAD_DIM * sizeof(float));
+        if (g->layer_index_comp_cache_fp4[il])
+            row += (double)DS4_INDEXER_FP4_ROW_BYTES;
+        else if (g->layer_index_comp_cache[il])
+            row += (double)(DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        bpt += row / (double)ratio;
+    }
+    return (uint64_t)(bpt + 0.5);
+}
+
 /* Inc 0b (governance, review 2.2): page-union LIFETIME projection.  Every
  * live admission carries a credit -- its full normalized target
  * min(prompt + decode budget, seq_cap) -- from install until the row ends,
@@ -45735,7 +45930,10 @@ static uint64_t credit_union_family(const ds4_gpu_tensor *t, uint64_t stride,
  * short-prompt/huge-output row could promise the same headroom).  Returns
  * the pages the candidate target plus every credited bank may still map,
  * beyond what is resident -- the quantity both the comp-cache budget check
- * and the live memory-floor verdict charge. */
+ * and the live memory-floor verdict charge.  MT-7: scaled by the disclosed
+ * admission band (default = the measured transient peak) at the tail, so
+ * every consumer -- admission, extension, row-end lease refresh -- charges
+ * one truth. */
 static uint64_t ds4_batch_credit_union_projection(const ds4_batch_ctx *ctx,
                                                   const uint64_t *credit,
                                                   uint32_t cand, uint64_t cand_len) {
@@ -45768,7 +45966,7 @@ static uint64_t ds4_batch_credit_union_projection(const ds4_batch_ctx *ctx,
                                         page, credit, nb, cand, cand_len);
         /* fp4 scale slab: eager, fully paid at boot -- never projected. */
     }
-    return need;
+    return ds4_cont_admit_band_apply(need, ds4_cont_admit_band_x1024());
 }
 
 /* memgov D2-1 (artifact 1, D0b receipt DISAGREE audit): rows release their
@@ -45823,8 +46021,12 @@ static uint64_t ds4_batch_bank_trim_pages(ds4_batch_ctx *ctx, uint32_t b) {
 }
 
 /* v0.5.1 Inc2: shed FREE banks' cache pages under admission budget pressure,
- * cheapest warm value first -- history-invalid banks, then valid banks by
- * ascending committed prefix (rebuilding a short prefix costs least).  Live,
+ * cheapest warm value first.  v0.6.2 Inc 3: "cheapest" now aligns with
+ * warm-record eviction -- history-invalid banks, then valid banks by
+ * OLDEST content activity (LRU), with ascending committed prefix as the
+ * equal-recency tiebreak; the old shortest-prefix-only order re-trimmed
+ * recently-hot small banks while ancient deep trunks sat immortal
+ * (DS4_BATCH_TRIM_VICTIM=hist restores it).  Live,
  * pending-prefill, target, and fork/partial-source banks are never victims.
  * One device sync before the first unmap: admission runs on the host between
  * step launches, so the sync is provably off-capture (sticky-scratch law).
@@ -45861,6 +46063,19 @@ static void ds4_batch_bank_mark_trimmed(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     g->ms_emit_keep[v] = 0u;
 }
 
+/* v0.6.2 Inc 3: the victim-order kill switch.  DS4_BATCH_TRIM_VICTIM=hist
+ * restores the pre-v0.6.2 shortest-history-first order; the default
+ * blends recency with restore cost (ds4_trim_victim_cheaper, ds4.h). */
+static int ds4_batch_trim_victim_hist_order(void) {
+    static int hist = -1;
+    if (hist < 0) {
+        const char *e = getenv("DS4_BATCH_TRIM_VICTIM");
+        hist = e && e[0] == 'h' && e[1] == 'i' && e[2] == 's' && e[3] == 't' &&
+               !e[4];
+    }
+    return hist;
+}
+
 static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
                                           const uint8_t *live, const uint32_t *pflen,
                                           const uint64_t *credit,
@@ -45879,16 +46094,22 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         if ((live && live[i]) || (pflen && pflen[i]) || (credit && credit[i])) continue;
         order[n++] = i;
     }
-    for (uint32_t a = 1; a < n; a++) {         /* insertion sort by victim cost */
+    /* v0.6.2 Inc 3: insertion sort, cheapest victim first -- invalid
+     * history, then oldest content activity, then shortest history (the
+     * eviction-aligned blend; comparison in ds4.h, CPU-unit-tested). */
+    const int hist_order = ds4_batch_trim_victim_hist_order();
+    for (uint32_t a = 1; a < n; a++) {
         const uint32_t x = order[a];
-        const uint64_t kx = ctx->bank_hist_valid[x]
-                          ? (1ull << 32) + ctx->bank_hist_len[x] : 0;
+        const ds4_trim_victim_key kx = { ctx->bank_hist_valid[x],
+                                         ctx->bank_hist_len[x],
+                                         ctx->bank_last_use[x] };
         uint32_t j = a;
         while (j > 0) {
             const uint32_t y = order[j - 1];
-            const uint64_t ky = ctx->bank_hist_valid[y]
-                              ? (1ull << 32) + ctx->bank_hist_len[y] : 0;
-            if (ky <= kx) break;
+            const ds4_trim_victim_key ky = { ctx->bank_hist_valid[y],
+                                             ctx->bank_hist_len[y],
+                                             ctx->bank_last_use[y] };
+            if (!ds4_trim_victim_cheaper(&kx, &ky, hist_order)) break;
             order[j] = y;
             j--;
         }
@@ -45904,11 +46125,23 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
             if (!ds4_gpu_synchronize()) return freed;
             synced = true;
         }
+        /* v0.6.2 Inc 3: capture the victim's identity BEFORE the mark
+         * wipes it -- the trim line names victims now (bank, bytes,
+         * hist_len, recency), not just count and total. */
+        const uint8_t  v_valid = ctx->bank_hist_valid[v];
+        const uint32_t v_hist  = ctx->bank_hist_len[v];
+        const uint64_t v_use   = ctx->bank_last_use[v];
         const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
         if (got == 0) continue;                /* floor-resident: content intact, keep it */
         ds4_batch_bank_mark_trimmed(ctx, g, v);
         freed += got;
         nb++;
+        fprintf(stderr,
+                "ds4: batch vmm: trim victim bank=%u released=%.1f MiB "
+                "hist=%u tok last_use=%llu%s\n",
+                v, (double)got / 1048576.0, v_hist,
+                (unsigned long long)v_use,
+                v_valid ? "" : " (history already invalid)");
     }
     if (nb) {
         ctx->trim_banks += nb;
@@ -46000,6 +46233,170 @@ uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
                                      "for the serial lane (reclaim)");
 }
 
+
+/* MT-1b (v0.6.1 memory truth): ONE funding verdict for continuous-lane
+ * cache growth, shared by ADMISSION (candidate bank b at target flen) and
+ * mid-flight credit EXTENSION (live bank b extending to flen).  Runs the
+ * exact legacy admission order: page-union projection -> comp-cache class
+ * check (with free-bank class trim) -> live memory-floor check (free-bank
+ * trim, then the MG-1 own-trim re-ask) -> ONE governed check; on ADMIT
+ * publishes the lane's absolute lease.  The union's candidate override
+ * (ds4_credit_union_runs: bank b contributes flen INSTEAD of credit[b])
+ * makes the extension exact -- mneed is the unfunded growth of the whole
+ * union with b at its proposed end, never a double charge of b's already
+ * resident span.  Porcelains and reject metrics stay with the callers:
+ * an admission refusal rejects the request, an extension refusal only
+ * pins the row to its funded boundary.  dbgctx is the caller's context
+ * fragment for the DS4_ADMIT_DEBUG line (admission: prompt/budget split;
+ * extension: pos/glen). */
+/* MT-7: minimum committed-token sample before the live commit rate is
+ * compared against physics -- below this, page floors (one demand page per
+ * layer x family x bank minimum) dominate the average and the comparison
+ * is noise, not signal. */
+#define DS4_CONT_RATE_MIN_TOKENS 65536u
+typedef struct {
+    uint64_t mneed, mres, usable;
+    int      legacy;   /* the legacy composite verdict (porcelain select) */
+    ds4_gov_claim scl;
+} ds4_cont_fund_quote;
+static int ds4_batch_cont_fund_check(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
+                                     const uint8_t *live, const uint32_t *pflen,
+                                     const uint64_t *credit, uint32_t b,
+                                     int protect, uint64_t flen,
+                                     const char *dbgctx,
+                                     ds4_cont_fund_quote *q) {
+    const uint32_t MS = (uint32_t)ctx->max_seq;
+    memset(q, 0, sizeof(*q));
+    q->mneed = ds4_batch_credit_union_projection(ctx, credit, b, flen);
+    q->mres  = ds4_batch_slabs_cache_resident(&ctx->sl);
+    /* MT-7 live-rate feedback: publish the observed vs shape-derived commit
+     * rates at every funding check (admission frequency, host-only walks).
+     * The observed rate is NOT charged -- the union above is page-exact and
+     * an average-based multiplier would double-charge its page floors; the
+     * disclosed band carries the measured transient margin instead.  The
+     * tripwire is the zero-headroom law's tell: observed > 2x packed on a
+     * real sample means per-token growth the projection does not know
+     * about -- surface it loud, once. */
+    {
+        uint64_t tokens = 0;
+        for (uint32_t ci = 0; ci < MS; ci++)
+            if (ctx->bank_hist_valid[ci]) tokens += ctx->bank_hist_len[ci];
+        ctx->rate_obs_bpt  = tokens ? q->mres / tokens : 0;
+        ctx->rate_phys_bpt = ds4_batch_slabs_packed_bpt(ctx);
+        static int rate_warned = 0;
+        if (!rate_warned &&
+            ds4_cont_rate_anomalous(q->mres, tokens, ctx->rate_phys_bpt,
+                                    DS4_CONT_RATE_MIN_TOKENS)) {
+            rate_warned = 1;
+            fprintf(stderr,
+                    "ds4: WARNING cont commit rate %llu B/tok exceeds 2x the "
+                    "packed shape rate %llu B/tok (%llu tokens resident) -- "
+                    "unprojected per-token growth, investigate\n",
+                    (unsigned long long)ctx->rate_obs_bpt,
+                    (unsigned long long)ctx->rate_phys_bpt,
+                    (unsigned long long)tokens);
+        }
+    }
+    /* Admission forensics (Inc 0b): DS4_ADMIT_DEBUG=1 prints the verdict
+     * inputs per funding check -- the tell for a credit that silently
+     * under-charges. */
+    if (getenv("DS4_ADMIT_DEBUG")) {
+        fprintf(stderr,
+                "ds4: admit debug bank=%u %s flen=%llu mneed=%.1f MiB mres=%.1f MiB budget=%.1f MiB sub_out=%.1f MiB rate_obs=%llu rate_phys=%llu band=%u credits=",
+                b, dbgctx, (unsigned long long)flen,
+                (double)q->mneed / 1048576.0, (double)q->mres / 1048576.0,
+                (double)ctx->comp_map_budget / 1048576.0,
+                (double)ds4_gpu_substrate_outstanding() / 1048576.0,
+                (unsigned long long)ctx->rate_obs_bpt,
+                (unsigned long long)ctx->rate_phys_bpt,
+                ds4_cont_admit_band_x1024());
+        for (uint32_t ci = 0; ci < MS; ci++)
+            fprintf(stderr, "%s%llu", ci ? "," : "",
+                    (unsigned long long)credit[ci]);
+        fprintf(stderr, "\n");
+    }
+    /* #15 governance (2026-08-04): the plan-derived budget (max_seq x full
+     * cache extent) cannot be stale.  Live-memory truth is the mem-floor
+     * verdict below. */
+    /* v0.5.1 Inc2 (field #31): before rejecting, shed FREE banks' pages
+     * (credited banks are never victims).  Trim frees only un-credited
+     * banks' pages, so the union need is unchanged -- only the resident
+     * answer moves. */
+    if (ctx->comp_map_budget != 0 && q->mneed != 0 &&
+        q->mres + q->mneed > ctx->comp_map_budget) {
+        const uint64_t want = q->mres + q->mneed - ctx->comp_map_budget;
+        if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
+                                      protect, want,
+                                      "under class-budget pressure") > 0)
+            q->mres = ds4_batch_slabs_cache_resident(&ctx->sl);
+    }
+    /* memgov D0b-3 (S4/S5): ONE claim for both live verdicts, built from
+     * the exact inputs the class check consumes (post class-trim mres).
+     * proposed is the ABSOLUTE post-fault total: the plan's eager boot
+     * cost + resident + the whole union's unfaulted growth (the projection
+     * already carries every credit and this candidate, sec 6.2's
+     * do-not-resum rule).  D0b-4: the eager constant shifts BOTH proposed
+     * and the class limit, so the class verdict is the live check verbatim
+     * (x > budget <=> eager + x > eager + budget) while the ledger stays
+     * on the census basis. */
+    q->scl.requester = DS4_GOVC_BATCH_BANK_PLAN;
+    q->scl.memc = DS4_MEMC_BATCH_BANK;
+    q->scl.domain = DS4_MEMD_UNIFIED_DEVICE;
+    q->scl.proposed_outstanding = ctx->bank_census_eager + q->mres + q->mneed;
+    q->scl.class_limit = ctx->comp_map_budget != 0
+                       ? ctx->bank_census_eager + ctx->comp_map_budget : 0;
+    /* memgov D2-3: the boolean OWNER swap (plan sec 12 D2 consumer 3).
+     * The legacy formulas and their trim ACTORS run first, in live order
+     * -- class verdict after the class trim above; floor trim then floor
+     * verdict only when the class passed.  ONE governed check per growth
+     * admission takes the composite legacy verdict; observe returns that
+     * verdict verbatim, enforce lets the quote rule. */
+    int verdict = DS4_GOV_ADMIT;
+    if (ctx->comp_map_budget != 0 && q->mneed != 0 &&
+        q->mres + q->mneed > ctx->comp_map_budget) {
+        verdict = DS4_GOV_REFUSE_CLASS;
+    } else if (q->mneed != 0) {
+        /* v0.5.4 governance inc1 (item 16): the budget above is a
+         * boot-time PLAN and cannot see memory the box lost since boot.
+         * Every admission spend must ALSO fit live free memory beyond the
+         * operator floor.  The union projection already carries every
+         * credit's unfaulted growth, so mneed IS the floor charge.  Trim
+         * can hand pages back (unmap is exact and immediate), so it runs
+         * before the verdict; credited banks stay inviolable.  inc2: the
+         * serial reserve is spoken for -- growth may not spend it (the
+         * serial lane's lazy graph draws from this same pool at request
+         * time). */
+        q->usable = ds4_mem_usable_beyond(ctx->serial_reserve);
+        if (q->mneed > q->usable) {
+            if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
+                                          protect, q->mneed - q->usable,
+                                          "to honor the memory floor") > 0)
+                q->usable = ds4_mem_usable_beyond(ctx->serial_reserve);
+        }
+        /* memgaps MG-1: still short -> return the engine's own graph-pool
+         * reserve and re-ask.  Precedes the governed check below so
+         * enforce quotes also see the post-trim box (actors first, in
+         * live order: the D2-3 pattern). */
+        if (q->mneed > q->usable && ds4_mem_own_trim("cont_admit") > 0)
+            q->usable = ds4_mem_usable_beyond(ctx->serial_reserve);
+        if (q->mneed > q->usable) verdict = DS4_GOV_REFUSE_LIVE;
+    }
+    q->legacy = verdict;
+    /* D2-1 (artifact 2, epoch-58): a zero-growth spend takes NO verdict
+     * in any mode; the publication below is the honest absolute refresh. */
+    const int final_verdict = q->mneed != 0
+        ? ds4_gov_governed_check("cont_admit", &q->scl, verdict)
+        : DS4_GOV_ADMIT;
+    if (final_verdict == DS4_GOV_ADMIT) {
+        /* Funding granted -- publish the lane's absolute lease (intent =
+         * eager cost + post-fault total, resident = eager cost + what the
+         * page scan sees: the census basis). */
+        ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
+                            ctx->bank_census_eager + q->mres + q->mneed,
+                            ctx->bank_census_eager + q->mres);
+    }
+    return final_verdict;
+}
 
 /* memgov D4-2: one bank's exact trim preimage across every slab family the
  * credit projection charges -- the counting mirror of
@@ -46510,8 +46907,17 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         }
     }
 
-    if (!metal_graph_alloc_raw_cap(&ctx->g, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp, e->dspark_ready)) {
+    /* MT-5 (audit V13 / MT-2 sweep): the shared batch graph's activation and
+     * state tensors are SESSION_TENSORS -- the same class metal_graph_alloc
+     * gives these tensor kinds on the serial path.  Without this inner scope
+     * they inherit the caller's BATCH_BANK bracket and inflate
+     * bank_census_eager below with ~GiB of non-bank graph tensors (the
+     * census scope is a stack, so the bank bracket resumes at scope_end). */
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
+    const bool graph_ok = metal_graph_alloc_raw_cap(&ctx->g, &e->weights, &e->weights.layer[0],
+                                   raw_cap, (uint32_t)ctx_size, prefill_cap, ctx->mtp, e->dspark_ready);
+    ds4_gpu_mem_scope_end();
+    if (!graph_ok) {
         BC_ERR("batch_ctx_create: graph alloc failed (raw_cap=%u prefill_cap=%u)", raw_cap, prefill_cap);
         free(ctx);
         return 1;
@@ -46523,7 +46929,8 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
      * count from what is actually free instead of letting the caller probe by
      * failing whole creates (blind halving both risks the OOM killer on
      * unified memory and can strand a third of the achievable banks).
-     * DS4_BATCH_FIT_HEADROOM_MB (default 8192) reserves room for runtime
+     * The fit headroom (v0.6.2 Inc 2: derived = live floor + boot-burst
+     * margin; DS4_BATCH_FIT_HEADROOM_MB pins) reserves room for runtime
      * growth: tmp pools, capture graphs, logits staging.  DS4_BATCH_FIT=0
      * keeps caller-driven sizing.  Backends with no memory query (Metal)
      * skip the budget and rely on the descent loop below. */
@@ -46535,7 +46942,8 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
          * at boot (resident floor 0); their growth is budgeted per-admission
          * below.  Eager mode keeps the full Inc1a per-bank cost. */
         const uint64_t per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, ctx->mtp,
-                                                             ds4_batch_vmm_comp_enabled());
+                                                             ds4_batch_vmm_comp_enabled(),
+                                                             e->dspark_ready);
         if (!(fe && fe[0] == '0' && fe[1] == '\0') &&
             per_bank != 0 && ds4_gpu_mem_info(&free_b, &total_b) == 0) {
             const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
@@ -46549,6 +46957,43 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
             uint64_t budget = free_b > headroom ? free_b - headroom : 0;
             budget = budget > sub_out ? budget - sub_out : 0;
             uint32_t n = (uint32_t)(budget / per_bank);
+            /* Governed cont bank plan (v0.6.2): when the comp/index caches
+             * are demand-mapped the per_bank above is the eager REMAINDER
+             * only, so at deep ctx this division grants banks whose KV
+             * the box can never fund to depth -- every surplus bank
+             * stranding its remainder (the MT-5 harm the static
+             * DS4_COALESCE_FUNDABLE_TOKENS ladder froze at the leg2a
+             * measurement).  Price the ladder's own criterion (banks x
+             * ctx <= fundable tokens) from the LIVE budget instead: one
+             * bank's full-depth KV commits seq_cap x the shape-derived
+             * packed rate x the disclosed admission band -- the same
+             * truth admissions are charged (MT-7), so plan and admission
+             * cannot disagree.  KV-ONLY divisor, exactly the ladder's
+             * semantic: the eager remainder stays the separate bound
+             * above (pricing it into this divisor would cut the measured
+             * 32-bank regime, where the eager term dominates -- 32 x
+             * ~450 MiB vs 32 x ~0.25 GiB of KV at 16k).  Floor 4 (A2b
+             * fork fanout, the ladder's floor); the eager n still caps.
+             * Regime guard mirrors coalesce_max_default: ctx <= 16384 is
+             * the W8-measured regime where 32 stands verbatim (V6 law) --
+             * a noisy-low boot pool must not cut it.  Eager comp mode
+             * needs no bound (its per_bank carries the ctx-sized caches).
+             * DS4_BATCH_FIT_KV=0 restores the eager-only fit. */
+            if (ctx_size > 16384 &&
+                ds4_batch_vmm_comp_enabled() && ds4_batch_fit_kv_plan_enabled()) {
+                const uint64_t bpt = ds4_graph_packed_bpt(&ctx->g);
+                const uint64_t kv_bank = ds4_cont_admit_band_apply(
+                        (uint64_t)ctx->seq_cap * bpt, ds4_cont_admit_band_x1024());
+                const uint32_t n_plan = ds4_batch_plan_kv_banks(budget, kv_bank, n, 4u);
+                if (n_plan != n)
+                    fprintf(stderr,
+                            "ds4: batch fit: kv plan: budget=%.2f GiB kv-bank commit=%.1f MiB "
+                            "(%u tok x %llu B/tok x band %u/1024) -> max_seq %u (eager fit %u)\n",
+                            (double)budget / 1073741824.0, (double)kv_bank / 1048576.0,
+                            ctx->seq_cap, (unsigned long long)bpt,
+                            ds4_cont_admit_band_x1024(), n_plan, n);
+                n = n_plan;
+            }
             fit_per_bank = per_bank;
             fit_headroom = headroom;
             /* memgov D2-2b (plan sec 12 consumer 2): the governed fit.
@@ -46791,8 +47236,8 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     }
     if (ctx->sl.vmm) {
         const uint64_t floor_pb = ds4_batch_vmm_floor_per_bank(&ctx->g);
-        const uint64_t cache_per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, false, false) -
-                                        ds4_batch_slabs_bank_bytes(&ctx->g, false, true) + floor_pb;
+        const uint64_t cache_per_bank = ds4_batch_slabs_bank_bytes(&ctx->g, false, false, false) -
+                                        ds4_batch_slabs_bank_bytes(&ctx->g, false, true, false) + floor_pb;
         /* #15 governance (2026-08-04, resolves the Inc0 adjudication): the
          * budget's UPPER bound is the FIT PLAN's own allowance -- max_seq
          * banks at their full per-bank cache extent.  Resident cache pages
@@ -46823,15 +47268,49 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
          * force deterministic rejects). */
         const uint64_t plan_allow = (uint64_t)ctx->max_seq * cache_per_bank;
         uint64_t capacity_allow = plan_allow;   /* no memory answer: plan-only */
+        uint64_t floor_work = 0, raw_capacity = 0;
+        int floor_packed = 0, floor_bound = 0;
         { uint64_t vfree = 0, vtotal = 0;
           if (ds4_gpu_mem_info(&vfree, &vtotal) == 0) {
               const uint64_t headroom = ds4_batch_fit_headroom_bytes(ctx_size);
               const uint64_t res = ds4_batch_slabs_cache_resident(&ctx->sl);
-              const uint64_t floor_work = 2u * cache_per_bank +
-                                          (uint64_t)ctx->max_seq * floor_pb;
-              capacity_allow = res + (vfree > headroom ? vfree - headroom : 0) +
+              /* v0.6.2 Inc 1: the anti-thrash floor in PACKED terms.  The
+               * v0.5.6.3 c3 guarantee -- the budget can never be so small
+               * that every warm record is a trim victim -- wants two
+               * FULL-DEPTH WORKING SETS, and a full-depth bank COMMITS
+               * rate_phys x seq_cap bytes (2.9 GiB at -c 786432), not its
+               * virtual extent (13.4 GiB there): denominating the floor in
+               * virtual bytes clamped capacity UP past the raw sample by
+               * that 4.6x and the class check never engaged at depth (the
+               * dcl_run2 receipt; 35.45-vs-69.93 at -c 1048576).  The
+               * packed term is banded (x1045/1024) because the floor funds
+               * what ADMISSION would actually charge, and rides the same
+               * rate the boot ledger prints and D-1a family coverage the
+               * budget verdict counts (ds4_batch_slabs_packed_bpt ==
+               * ds4_batch_slabs_cache_resident's families by contract).
+               * DS4_BATCH_VMM_FLOOR_PACKED=0 restores the virtual
+               * denomination; the boot line discloses which ruled and
+               * when the floor (either one) still binds capacity. */
+              { const char *fp = getenv("DS4_BATCH_VMM_FLOOR_PACKED");
+                floor_packed = !(fp && fp[0] == '0' && fp[1] == '\0'); }
+              if (floor_packed) {
+                  const uint64_t bpt = ds4_batch_slabs_packed_bpt(ctx);
+                  const uint64_t packed_bank =
+                      bpt * (uint64_t)ctx->seq_cap *
+                      (uint64_t)ds4_cont_admit_band_x1024() / 1024u;
+                  floor_work = 2u * packed_bank +
                                (uint64_t)ctx->max_seq * floor_pb;
-              if (capacity_allow < floor_work) capacity_allow = floor_work;
+              } else {
+                  floor_work = 2u * cache_per_bank +
+                               (uint64_t)ctx->max_seq * floor_pb;
+              }
+              raw_capacity = res + (vfree > headroom ? vfree - headroom : 0) +
+                             (uint64_t)ctx->max_seq * floor_pb;
+              capacity_allow = raw_capacity;
+              if (capacity_allow < floor_work) {
+                  capacity_allow = floor_work;
+                  floor_bound = 1;
+              }
           } }
         ctx->comp_map_budget = plan_allow < capacity_allow ? plan_allow
                                                            : capacity_allow;
@@ -46841,17 +47320,44 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
         { const char *be = getenv("DS4_BATCH_VMM_BUDGET_MB");
           if (be && be[0]) { const long bv = atol(be);
             if (bv > 0) { ctx->comp_map_budget = (uint64_t)bv << 20; ctx->comp_map_budget_pinned = 1u; } } }
+        char floorbuf[48];
+        if (floor_work)
+            snprintf(floorbuf, sizeof(floorbuf), "%s %.2f GiB",
+                     floor_packed ? "packed" : "virtual",
+                     (double)floor_work / 1073741824.0);
+        else
+            snprintf(floorbuf, sizeof(floorbuf), "n/a (no memory answer)");
         fprintf(stderr,
-                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB [plan %.2f, capacity %.2f], mem floor=%.1f GiB, serial reserve=%.2f GiB, substrate outstanding=%.2f GiB%s)\n",
+                "ds4: batch vmm: comp/index slabs demand-mapped (page=%llu KiB, virtual %.1f MiB/bank, floor %.1f MiB/bank x %u banks, budget=%.2f GiB [plan %.2f, capacity %.2f], work floor=%s, mem floor=%.1f GiB, serial reserve=%.2f GiB, substrate outstanding=%.2f GiB%s)\n",
                 (unsigned long long)(ds4_gpu_vmm_demand_page() >> 10),
                 (double)cache_per_bank / 1048576.0, (double)floor_pb / 1048576.0,
                 ctx->max_seq, (double)ctx->comp_map_budget / 1073741824.0,
                 (double)plan_allow / 1073741824.0,
                 (double)capacity_allow / 1073741824.0,
+                floorbuf,
                 (double)ds4_mem_floor_bytes() / 1073741824.0,
                 (double)ctx->serial_reserve / 1073741824.0,
                 (double)ds4_gpu_substrate_outstanding() / 1073741824.0,
                 g_slab_vmm_fallbacks ? " -- WITH EAGER FALLBACKS, see above" : "");
+        /* v0.6.2 Inc 1: the binding disclosure -- its own line so gates
+         * key on presence/absence, never on token position. */
+        if (floor_bound)
+            fprintf(stderr,
+                    "ds4: batch vmm: budget floored to two %s banks "
+                    "(raw capacity %.2f GiB < work floor %.2f GiB)\n",
+                    floor_packed ? "packed" : "virtual",
+                    (double)raw_capacity / 1073741824.0,
+                    (double)floor_work / 1073741824.0);
+        /* v0.6.2 Inc 3: the victim-order boot disclosure (the default
+         * changed; per-trim lines never print on a quiet boot). */
+        if (ds4_batch_trim_enabled())
+            fprintf(stderr,
+                    "ds4: batch vmm: trim victim order=%s\n",
+                    ds4_batch_trim_victim_hist_order()
+                        ? "hist (shortest history; pre-v0.6.2)"
+                        : "recency blend (invalid > oldest activity > "
+                          "shortest history; DS4_BATCH_TRIM_VICTIM=hist "
+                          "restores)");
     }
     /* A2a: per-bank committed-history records (host-side, tiny vs the slabs).
      * R2: sized by seq_cap (the committed-token bound), not the raw ring. */
@@ -46861,6 +47367,8 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     /* Inc 5a: generations start at 1 (0 = "no bank" to registry readers). */
     ctx->bank_gen        = xmalloc((size_t)ctx->max_seq * sizeof(uint64_t));
     for (uint32_t bg = 0; bg < ctx->max_seq; bg++) ctx->bank_gen[bg] = 1u;
+    /* v0.6.2 Inc 3: recency starts at 0 = never used. */
+    ctx->bank_last_use   = xcalloc(ctx->max_seq, sizeof(uint64_t));
     /* P1: one stashed compressed row per (bank, layer) for the partial-fork
      * boundary-row restore (see ms_emit_keep).  Tiny vs the slabs
      * (max_seq x n_layer x head_dim floats); allocated unconditionally so the
@@ -46974,6 +47482,7 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     free(ctx->bank_hist_len);
     free(ctx->bank_hist_valid);
     free(ctx->bank_gen);
+    free(ctx->bank_last_use);
     free(ctx);
 }
 
@@ -46985,6 +47494,7 @@ static void bank_hist_reset(ds4_batch_ctx *ctx, uint32_t b) {
     ctx->bank_gen[b]++;   /* Inc 5a: lineage replacement */
     ctx->bank_hist_len[b] = 0u;
     ctx->bank_hist_valid[b] = 1u;
+    ctx->bank_last_use[b] = ++ctx->use_clock;   /* v0.6.2 Inc 3: recency */
 }
 static void bank_hist_invalidate_all(ds4_batch_ctx *ctx) {
     for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b]++;   /* Inc 5a */
@@ -46998,6 +47508,7 @@ static void bank_hist_append(ds4_batch_ctx *ctx, uint32_t b, int tok) {
         return;
     }
     ctx->bank_hist[(size_t)b * ctx->seq_cap + ctx->bank_hist_len[b]++] = tok;
+    ctx->bank_last_use[b] = ++ctx->use_clock;   /* v0.6.2 Inc 3: recency */
 }
 static void bank_hist_append_n(ds4_batch_ctx *ctx, uint32_t b, const int *tok, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) bank_hist_append(ctx, b, tok[i]);
@@ -47112,6 +47623,9 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
     ctx->bank_gen[dst]++;   /* Inc 5a: fork-by-copy replaces dst's lineage */
     ctx->bank_hist_len[dst]   = (uint32_t)P;
     ctx->bank_hist_valid[dst] = 1u;
+    /* v0.6.2 Inc 3: both sides are hot -- the copy touched src's content. */
+    ctx->bank_last_use[dst] = ++ctx->use_clock;
+    ctx->bank_last_use[src] = ++ctx->use_clock;
     /* v0.5.5 (task #14): the boundary-row suppression travels with the
      * CONTENT, never with the bank.  dst's prior life may have left a stale
      * ms_emit_keep (set by the partial-fork rewind, cleared only by cold
@@ -47375,6 +47889,9 @@ static bool bank_fork_copy_cut(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst, u
     ctx->bank_gen[dst]++;
     ctx->bank_hist_len[dst]   = R;
     ctx->bank_hist_valid[dst] = 1u;
+    /* v0.6.2 Inc 3: the source trunk was read too (src==dst harmless). */
+    ctx->bank_last_use[dst] = ++ctx->use_clock;
+    ctx->bank_last_use[src] = ++ctx->use_clock;
     g->ms_emit_keep[dst] = R / 4u + 1u;            /* ratio-4 row threshold only */
     return true;
 }
@@ -47395,6 +47912,15 @@ uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) {
 
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) {
     return ctx ? (int)ctx->raw_cap : 0;
+}
+
+/* MT-5 hygiene (audit V13): the admission chunk width that SHAPES the raw
+ * ring (raw_cap = align256(window + min(prefill_cap, chunk))), exposed so
+ * the server's boot ledger can print the shaping input next to the number
+ * it shaped instead of presenting an env-dependent raw_ring as zero-config
+ * output. */
+uint32_t ds4_cont_prefill_chunk_tokens(void) {
+    return bg_prefill_chunk_tokens();
 }
 
 /* R5 Inc1a: actual bank count, which create_fit may have sized below the
@@ -47419,6 +47945,17 @@ static int family_engine_batched_generate_ctx(
         ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
         const int *max_new_tokens, const int *eos_ids,
         ds4_batch_gen_result *out, char *err, size_t errlen);
+
+/* MT-7: the live commit rates as of the last funding check.  Aligned u64
+ * fields written under gen_mu; racy reads are advisory (metrics), the
+ * serving-observability contract. */
+int ds4_batch_ctx_commit_rate(const ds4_batch_ctx *ctx,
+                              uint64_t *obs_bpt, uint64_t *phys_bpt) {
+    if (!ctx) return 0;
+    if (obs_bpt)  *obs_bpt  = ctx->rate_obs_bpt;
+    if (phys_bpt) *phys_bpt = ctx->rate_phys_bpt;
+    return 1;
+}
 
 static int ds4_engine_batched_generate_ctx_impl(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
@@ -49342,6 +49879,12 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
      * projection charges every credit, so a landed bank's future decode
      * growth stays represented; 0 = no live credit. */
     uint64_t *credit = xcalloc(MS, sizeof(uint64_t));
+    /* MT-1b (v0.6.1 memory truth): the row's TRUE normalized target
+     * min(prompt + requested decode budget, seq_cap).  credit[b] advances
+     * toward it tranche-by-tranche; credit[b] == btgt[b] means fully
+     * funded (no extension due).  An extension refusal pins btgt to the
+     * funded boundary so the row stops asking. */
+    uint64_t *btgt   = xcalloc(MS, sizeof(uint64_t));
     double   *pft0   = xcalloc(MS, sizeof(double));     /* install time (timing log) */
     /* v0.2.x observability: per-bank serving stats (registry + timings). */
     ds4_cont_seq_stats *sst = xcalloc(MS, sizeof(ds4_cont_seq_stats));
@@ -49354,7 +49897,13 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
     int      sampled[DS4_MULTISEQ_MAX_SEQ];   /* S1.0b: token the base model sampled per row */
     bool ok = live && usr && posv && cur && beos && bmax && glen && gbuf &&
               btemp && btopk && btopp && bminp && brng && logits && seedlog &&
-              pftok && pflen && pfoff && pfbase && pft0 && sst;
+              pftok && pflen && pfoff && pfbase && pft0 && sst && btgt;
+    /* MT-1b: decode-credit tranche size.  Admission credits min(prompt +
+     * min(budget, tranche), seq_cap); the decode loop extends live rows'
+     * credit tranche-by-tranche under the same funding verdict.  0 =
+     * legacy lifetime-at-admission credit (kill switch, bit-exact). */
+    uint64_t admit_tranche = 32768;
+    { const char *te = getenv("DS4_CONT_ADMIT_TRANCHE"); if (te && te[0]) { long v = atol(te); if (v >= 0) admit_tranche = (uint64_t)v; } }
 
     /* S1.0b: per-bank MTP draft probe (DS4_CONT_MTP_DRAFT_PROBE).  Runs the
      * per-bank drafter in lockstep with the real decode (depth 1), seeded from
@@ -49780,16 +50329,28 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
             uint32_t mn = req.max_new > 0 ? (uint32_t)req.max_new : 1u;
             const uint32_t cap = seq_cap > L ? seq_cap - L : 1u;   /* frontier bound (R2: ring wraps; comp caches bound the seq) */
             if (mn > cap) mn = cap;
+            /* MT-1b (v0.6.1 memory truth): admission credits only the next
+             * TRANCHE of the decode budget -- min(mn, tranche) -- instead
+             * of the whole (server-defaulted, typically 393216) budget.
+             * The decode loop extends the credit tranche-by-tranche under
+             * the SAME funding verdict (ds4_batch_cont_fund_check), so a
+             * 64-token agent turn no longer charges ~1.6 GiB of phantom
+             * future decode.  bmax/gbuf/trace still size from the TRUE
+             * budget mn; btgt records the true normalized target the
+             * extensions walk toward.  admit_tranche == 0 restores the
+             * lifetime-at-admission credit verbatim (kill switch). */
+            const uint32_t mncr = (admit_tranche != 0 && (uint64_t)mn > admit_tranche)
+                                ? (uint32_t)admit_tranche : mn;
             /* R5 Inc1b: budget the cache pages this admission may map (prompt
-             * + generation budget, capped at seq_cap) BEFORE installing it.
-             * Mapping is grow-only -- bank reuse rides its existing pages for
-             * free, and the projection charges only the extent beyond what is
-             * resident -- so once the budget is truly spent only requests
-             * fitting an already-grown bank pass.  The warm/fork match
-             * counters above count VALIDATION, so a budget-rejected match
-             * still ticks them. */
-            const uint64_t flen = (uint64_t)L + mn > seq_cap ? seq_cap
-                                                             : (uint64_t)L + mn;
+             * + credited generation budget, capped at seq_cap) BEFORE
+             * installing it.  Mapping is grow-only -- bank reuse rides its
+             * existing pages for free, and the projection charges only the
+             * extent beyond what is resident -- so once the budget is truly
+             * spent only requests fitting an already-grown bank pass.  The
+             * warm/fork match counters above count VALIDATION, so a
+             * budget-rejected match still ticks them. */
+            const uint64_t flen = (uint64_t)L + mncr > seq_cap ? seq_cap
+                                                               : (uint64_t)L + mncr;
             if (ctx->sl.vmm) {
                 /* Inc 0b (governance, review 2.2): LIFETIME page-union
                  * projection.  The old `outstanding` sum charged pending
@@ -49798,113 +50359,18 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                  * from the accounting and a later short-prompt/huge-output
                  * row could promise the same headroom (field 376884/129 was
                  * the prompt-side variant of the same double-booking).
-                 * Every live row now holds a credit for its full normalized
-                 * target until it ends; the union avoids double-charging
-                 * the edge pages neighbor banks share. */
-                const uint64_t mneed =
-                    ds4_batch_credit_union_projection(ctx, credit, b, flen);
-                uint64_t mres = ds4_batch_slabs_cache_resident(&ctx->sl);
-                /* Admission forensics (Inc 0b): DS4_ADMIT_DEBUG=1 prints the
-                 * verdict inputs per admission -- the tell for a credit that
-                 * silently under-charges. */
-                if (getenv("DS4_ADMIT_DEBUG")) {
-                    fprintf(stderr,
-                            "ds4: admit debug bank=%u flen=%llu mneed=%.1f MiB mres=%.1f MiB budget=%.1f MiB sub_out=%.1f MiB credits=",
-                            b, (unsigned long long)flen,
-                            (double)mneed / 1048576.0, (double)mres / 1048576.0,
-                            (double)ctx->comp_map_budget / 1048576.0,
-                            (double)ds4_gpu_substrate_outstanding() / 1048576.0);
-                    for (uint32_t ci = 0; ci < MS; ci++)
-                        fprintf(stderr, "%s%llu", ci ? "," : "",
-                                (unsigned long long)credit[ci]);
-                    fprintf(stderr, "\n");
-                }
-                /* #15 governance (2026-08-04): the plan-derived budget
-                 * (max_seq x full cache extent) cannot be stale.  Live-memory
-                 * truth is the mem-floor verdict below. */
-                /* v0.5.1 Inc2 (field #31): before rejecting, shed FREE banks'
-                 * pages (credited banks are never victims).  Trim frees only
-                 * un-credited banks' pages, so the union need is unchanged --
-                 * only the resident answer moves. */
-                if (ctx->comp_map_budget != 0 && mneed != 0 &&
-                    mres + mneed > ctx->comp_map_budget) {
-                    const uint64_t want = mres + mneed - ctx->comp_map_budget;
-                    if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
-                                                  (fork || partial) ? (int)fsrc : -1,
-                                                  want, NULL) > 0)
-                        mres = ds4_batch_slabs_cache_resident(&ctx->sl);
-                }
-                /* memgov D0b-3 (S4/S5): ONE claim for both live verdicts,
-                 * built from the exact inputs the class check consumes
-                 * (post class-trim mres).  proposed is the ABSOLUTE
-                 * post-fault total: the plan's eager boot cost + resident
-                 * + the whole union's unfaulted growth (the projection
-                 * already carries every credit and this candidate, sec
-                 * 6.2's do-not-resum rule).  D0b-4: the eager constant
-                 * shifts BOTH proposed and the class limit, so the class
-                 * verdict is the live check verbatim (x > budget <=>
-                 * eager + x > eager + budget) while the ledger stays on
-                 * the census basis. */
-                ds4_gov_claim scl = {0};
-                scl.requester = DS4_GOVC_BATCH_BANK_PLAN;
-                scl.memc = DS4_MEMC_BATCH_BANK;
-                scl.domain = DS4_MEMD_UNIFIED_DEVICE;
-                scl.proposed_outstanding = ctx->bank_census_eager + mres + mneed;
-                scl.class_limit = ctx->comp_map_budget != 0
-                                ? ctx->bank_census_eager + ctx->comp_map_budget : 0;
-                /* memgov D2-3: the boolean OWNER swap (plan sec 12 D2
-                 * consumer 3).  The legacy formulas and their trim
-                 * ACTORS run first, in live order -- class verdict after
-                 * the class trim above; floor trim then floor verdict
-                 * only when the class passed (a class refusal never
-                 * reached the floor trim before D2-3 either: side-effect
-                 * parity).  ONE governed check per growth admission
-                 * takes the composite legacy verdict (leg (d)'s cells ==
-                 * growth admissions stands); observe -- the default
-                 * until the D2-2b ratchet -- returns that verdict, so
-                 * behavior is bit-identical; enforce lets the quote
-                 * rule.  The frozen reject porcelain prints only when
-                 * its own formula refused (true numbers); an enforce
-                 * divergence discloses in the memgov format instead. */
-                int verdict = DS4_GOV_ADMIT;
-                uint64_t usable = 0;
-                if (ctx->comp_map_budget != 0 && mneed != 0 &&
-                    mres + mneed > ctx->comp_map_budget) {
-                    verdict = DS4_GOV_REFUSE_CLASS;
-                } else if (mneed != 0) {
-                    /* v0.5.4 governance inc1 (item 16): the budget above
-                     * is a boot-time PLAN and cannot see memory the box
-                     * lost since boot.  Every admission spend must ALSO
-                     * fit live free memory beyond the operator floor.
-                     * The union projection already carries every
-                     * credit's unfaulted growth, so mneed IS the floor
-                     * charge.  Trim can hand pages back (unmap is exact
-                     * and immediate), so it runs before the verdict;
-                     * credited banks stay inviolable.  inc2: the serial
-                     * reserve is spoken for -- growth may not spend it
-                     * (the serial lane's lazy graph draws from this same
-                     * pool at request time). */
-                    usable = ds4_mem_usable_beyond(ctx->serial_reserve);
-                    if (mneed > usable) {
-                        if (ds4_batch_trim_free_banks(ctx, g, live, pflen, credit, b,
-                                                      (fork || partial) ? (int)fsrc : -1,
-                                                      mneed - usable, NULL) > 0)
-                            usable = ds4_mem_usable_beyond(ctx->serial_reserve);
-                    }
-                    /* memgaps MG-1: still short -> return the engine's own
-                     * graph-pool reserve and re-ask.  Precedes the governed
-                     * check below so enforce quotes also see the post-trim
-                     * box (actors first, in live order: the D2-3 pattern). */
-                    if (mneed > usable && ds4_mem_own_trim("cont_admit") > 0)
-                        usable = ds4_mem_usable_beyond(ctx->serial_reserve);
-                    if (mneed > usable) verdict = DS4_GOV_REFUSE_LIVE;
-                }
-                /* D2-1 (artifact 2, epoch-58): a zero-growth admit spends
-                 * nothing and takes NO verdict in any mode; the
-                 * publication below is the honest absolute refresh. */
-                const int final_verdict = mneed != 0
-                    ? ds4_gov_governed_check("cont_admit", &scl, verdict)
-                    : DS4_GOV_ADMIT;
+                 * Every live row holds a credit for its funded target until
+                 * it ends; the union avoids double-charging the edge pages
+                 * neighbor banks share.  MT-1b: the ladder itself lives in
+                 * ds4_batch_cont_fund_check, shared with the mid-flight
+                 * extension. */
+                char dbgctx[96];
+                snprintf(dbgctx, sizeof dbgctx,
+                         "prompt=%u decode_budget=%u budget_req=%u", L, mncr, mn);
+                ds4_cont_fund_quote q;
+                const int final_verdict = ds4_batch_cont_fund_check(
+                    ctx, g, live, pflen, credit, b,
+                    (fork || partial) ? (int)fsrc : -1, flen, dbgctx, &q);
                 if (final_verdict != DS4_GOV_ADMIT) {
                     ctx->mem_rejects++;
                     ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1);
@@ -49912,21 +50378,23 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                     ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
                                        [DS4_REJLANE_CONT]
                                        [ds4_reject_reason_from_gov(final_verdict)], 1);
-                    if (final_verdict == verdict &&
-                        verdict == DS4_GOV_REFUSE_CLASS) {
+                    if (final_verdict == q.legacy &&
+                        q.legacy == DS4_GOV_REFUSE_CLASS) {
                         fprintf(stderr,
-                                "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + projected credits %.1f MiB > budget %.1f MiB)\n",
-                                b, (double)mres / 1048576.0,
-                                (double)mneed / 1048576.0,
-                                (double)ctx->comp_map_budget / 1048576.0);
-                    } else if (final_verdict == verdict) {
+                                "ds4: cont admit rejected on comp-cache budget (bank %u: resident %.1f MiB + projected credits %.1f MiB > budget %.1f MiB; candidate prompt=%u + decode_budget=%u -> credit_end=%llu of seq_cap %u)\n",
+                                b, (double)q.mres / 1048576.0,
+                                (double)q.mneed / 1048576.0,
+                                (double)ctx->comp_map_budget / 1048576.0,
+                                L, mncr, (unsigned long long)flen, seq_cap);
+                    } else if (final_verdict == q.legacy) {
                         fprintf(stderr,
-                                "ds4: cont admit rejected on memory floor (bank %u: projected credits %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor + %.2f GiB serial reserve + %.1f MiB substrate outstanding -- the box cannot fund this admission; --mem-floor-gb and DS4_SERIAL_RESERVE_CTX govern)\n",
-                                b, (double)mneed / 1048576.0,
-                                (double)usable / 1048576.0,
+                                "ds4: cont admit rejected on memory floor (bank %u: projected credits %.1f MiB, usable %.1f MiB beyond the %.1f GiB floor + %.2f GiB serial reserve + %.1f MiB substrate outstanding; candidate prompt=%u + decode_budget=%u -> credit_end=%llu of seq_cap %u -- the box cannot fund this admission; --mem-floor-gb and DS4_SERIAL_RESERVE_CTX govern)\n",
+                                b, (double)q.mneed / 1048576.0,
+                                (double)q.usable / 1048576.0,
                                 (double)ds4_mem_floor_bytes() / 1073741824.0,
                                 (double)ctx->serial_reserve / 1073741824.0,
-                                (double)ds4_gpu_substrate_outstanding() / 1048576.0);
+                                (double)ds4_gpu_substrate_outstanding() / 1048576.0,
+                                L, mncr, (unsigned long long)flen, seq_cap);
                     } else {
                         /* Enforce diverged from the legacy formula: the
                          * quote's refusal rules.  Bounded like the
@@ -49937,21 +50405,14 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                             enf_disclosed++;
                             fprintf(stderr,
                                     "ds4: memgov ENFORCE refuse site=cont_admit bank=%u status=%d legacy=%d proposed=%llu class_limit=%llu\n",
-                                    b, final_verdict, verdict,
-                                    (unsigned long long)scl.proposed_outstanding,
-                                    (unsigned long long)scl.class_limit);
+                                    b, final_verdict, q.legacy,
+                                    (unsigned long long)q.scl.proposed_outstanding,
+                                    (unsigned long long)q.scl.class_limit);
                         }
                     }
                     on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
                     continue;
                 }
-                /* Admission granted -- publish the lane's absolute lease
-                 * (intent = eager cost + post-fault total, resident =
-                 * eager cost + what the page scan sees: the census
-                 * basis). */
-                ds4_gov_publish_use(DS4_GOVC_BATCH_BANK_PLAN,
-                                    ctx->bank_census_eager + mres + mneed,
-                                    ctx->bank_census_eager + mres);
             }
             /* R4: ADMISSION = INSTALL ONLY.  Bank state is prepared here (reset /
              * fork copy / warm reuse) and the tokens to prefill are parked in the
@@ -49993,7 +50454,9 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 pfbase[b] = P;
                 pflen[b]  = S;
                 pfoff[b]  = 0u;
-                credit[b] = flen;   /* Inc 0b: the lifetime promise, released at row end */
+                credit[b] = flen;   /* Inc 0b: the funded promise, released at row end */
+                btgt[b]   = (uint64_t)L + mn > seq_cap ? seq_cap
+                                                       : (uint64_t)L + mn;   /* MT-1b: true target */
                 pft0[b]   = now_sec();
                 pfq[(pfq_h + pfq_n) % MS] = b;
                 pfq_n++;
@@ -50403,6 +50866,45 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
             g->layer_n_index_comp[il] = mi;
         }
 
+        /* MT-1b: extend live rows' tranche credit BEFORE the step, so no
+         * forward ever writes past the funded end (the spec verify pack
+         * writes draft KV rows AHEAD of acceptance, hence the Dspec term
+         * in the margin).  Grant -> credit[b] advances one tranche and the
+         * union projection stays exact (the candidate override replaces
+         * credit[b]).  Refuse -> the row is pinned to its funded boundary:
+         * bmax clamps to the funded remainder and the existing terminal
+         * check finishes it there with finish=length -- strictly better
+         * than the legacy shape, which refused the whole request at
+         * admission.  Warm continuation re-admits from the bank. */
+        if (admit_tranche != 0) {
+            const uint64_t ext_margin = (uint64_t)(spec_accept ? Dspec : 0u) + 2u;
+            for (uint32_t b = 0; b < MS; b++) {
+                uint64_t nf = 0;
+                if (!live[b]) continue;
+                if (!ds4_cont_credit_ext_due(posv[b], credit[b], btgt[b],
+                                             ext_margin, admit_tranche, &nf))
+                    continue;
+                char dbgctx[96];
+                snprintf(dbgctx, sizeof dbgctx, "extend pos=%u glen=%u",
+                         posv[b], glen[b]);
+                ds4_cont_fund_quote q;
+                if (ds4_batch_cont_fund_check(ctx, g, live, pflen, credit, b,
+                                              -1, nf, dbgctx, &q) == DS4_GOV_ADMIT) {
+                    credit[b] = nf;
+                    ds4_metric_add(&ds4_metrics_get()->cont_credit_ext_granted, 1);
+                } else {
+                    fprintf(stderr,
+                            "ds4: cont credit-extension refused bank=%u pos=%u credit_end=%llu target=%llu -> row finishes at the funded boundary (finish=length)\n",
+                            b, posv[b], (unsigned long long)credit[b],
+                            (unsigned long long)btgt[b]);
+                    const uint32_t nbm = ds4_cont_credit_refuse_bmax(glen[b], posv[b],
+                                                                     credit[b]);
+                    if (nbm < bmax[b]) bmax[b] = nbm;
+                    btgt[b] = credit[b];   /* boundary is final: stop asking */
+                    ds4_metric_add(&ds4_metrics_get()->cont_credit_ext_refused, 1);
+                }
+            }
+        }
         /* ---- DECODE one step over live banks. ---- */
         uint32_t k = 0;   /* rows decoded by the plain path (0 in the spec branch -> probe skipped) */
         if (spec_accept) {
@@ -50464,6 +50966,17 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 if (dspark_quench && qn_quenched[b]) {
                     if (dspark_prof && nd > 0u) dspark_prof_quench_saved_rows += (uint64_t)nd;
                     nd = 0u;
+                }
+                /* MT-1b: verify rows write KV at posv..posv+nd BEFORE
+                 * acceptance -- never past the funded end.  The extension
+                 * check above keeps rows margin ahead of their boundary, so
+                 * this bound only bites in the last steps after a refusal
+                 * (tranche-gated: legacy keeps its exact shape). */
+                if (admit_tranche != 0) {
+                    const uint64_t fund_left = credit[b] > posv[b]
+                                             ? credit[b] - posv[b] : 0u;
+                    if ((uint64_t)nd + 1u > fund_left)
+                        nd = fund_left > 1u ? (uint32_t)(fund_left - 1u) : 0u;
                 }
                 /* D4.5g adaptive gate: spec-off window (settled-plain or plain-probe)
                  * for the solo bank -> verify the committed row only this step. */
@@ -51373,7 +51886,7 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
     free(btemp); free(btopk); free(btopp); free(bminp); free(brng); free(bsoc);
     free(balive);
     free(bcancel);
-    free(pftok); free(pflen); free(pfoff); free(pfbase); free(credit); free(pft0); free(sst);
+    free(pftok); free(pflen); free(pfoff); free(pfbase); free(credit); free(btgt); free(pft0); free(sst);
     free(logits); free(seedlog);
     ds4_metric_set(&ds4_metrics_get()->banks_live, 0);
     free(dbuf); free(ndr); free(vqtok); free(vpos); free(vsid); free(vfirst); free(vnr); free(vlogits);
@@ -52394,6 +52907,12 @@ bool ds4_batch_ctx_supports_partial_reuse(const ds4_batch_ctx *ctx) {
     (void)ctx;
     return false;
 }
+int ds4_batch_ctx_commit_rate(const ds4_batch_ctx *ctx,
+                              uint64_t *obs_bpt, uint64_t *phys_bpt) {
+    (void)ctx; (void)obs_bpt; (void)phys_bpt; return 0;
+}
+uint32_t ds4_cont_admit_band_x1024(void) { return 1024u; }
+uint32_t ds4_cont_prefill_chunk_tokens(void) { return 4096u; }
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens, const int *eos_ids,
                                     ds4_batch_gen_result *out, char *err, size_t errlen) {
@@ -54647,7 +55166,35 @@ static bool exaone_graph_session_fit_check(ds4_backend backend,
 }
 
 /* One body for the eager (create) and lazy (ensure) alloc so the two cannot
- * drift: sizing, quality/power adoption, directional steering. */
+ * drift: sizing, quality/power adoption, directional steering.
+ * MT-2 (v0.6.1 memory truth): this body is THE serial-graph burst -- every
+ * root API's lazy ensure and the eager create both land here -- so the
+ * honest lease lifecycle lives here too: intent declared BEFORE the burst
+ * (est, 0), committed at success (est, est), released on failure (0, 0).
+ * That closes the D0b-3 "commit-lead window": until now the server
+ * published intent==resident while the graph was still pending, so the
+ * multi-GiB build window contributed ZERO unfunded debt to the other
+ * lanes' governed quotes (the false-admit race of the leg-1 anatomy) --
+ * and five of the seven ensure entry points carried no lease at all.
+ * The estimate uses the alloc's own arguments, so lease and burst cannot
+ * drift.  MT-2 census: the whole body runs under SESSION_TENSORS -- the
+ * pc-scaled prefill scratch group (~3.98 GiB at pc 4096) and the indexer
+ * scratch previously fell through to ENGINE_OTHER (the leg-1 mystery
+ * reading), violating the documented ENGINE_OTHER live == 0 invariant. */
+/* v0.6.2 Inc 0: one census cell's live bytes, read plainly -- every
+ * caller holds the single-writer domain (gen_mu or pre-listener boot),
+ * so a before/after pair brackets exactly this thread's own notes and
+ * the porcelain epoch dance is unnecessary.  0 where the backend keeps
+ * no census (Metal/CPU): the measurement then reads absent and the
+ * estimate keeps the row. */
+static uint64_t session_tensors_census_live(void) {
+    ds4_mem_cell cell;
+    if (ds4_gpu_mem_census_read(DS4_MEMC_SESSION_TENSORS,
+                                DS4_MEMD_UNIFIED_DEVICE, &cell) != 0)
+        return 0;
+    return ds4_mem_cell_live(&cell);
+}
+
 static int ds4_session_alloc_graph(ds4_session *s) {
     ds4_engine *e = s->engine;
     if (ds4_session_is_motif3(s)) {
@@ -54706,14 +55253,28 @@ static int ds4_session_alloc_graph(ds4_session *s) {
         return 0;
     }
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(s->ctx_size, s->prefill_cap);
+    const uint64_t est = metal_graph_alloc_bytes_estimate(&e->weights, &e->weights.layer[0],
+                                                          raw_cap, (uint32_t)s->ctx_size,
+                                                          s->prefill_cap,
+                                                          e->mtp_ready, e->dspark_ready);
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, 0);
+    s->graph_alloc_bytes = 0;
+    const uint64_t census_before = session_tensors_census_live();
+    ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
     if (!metal_graph_session_fit_ok(&e->weights, &e->weights.layer[0],
                                     raw_cap, (uint32_t)s->ctx_size, s->prefill_cap,
-                                    e->mtp_ready, e->dspark_ready))
+                                    e->mtp_ready, e->dspark_ready)) {
+        ds4_gpu_mem_scope_end();
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
         return 1;
+    }
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)s->ctx_size, s->prefill_cap,
-                                   e->mtp_ready, e->dspark_ready))
+                                   e->mtp_ready, e->dspark_ready)) {
+        ds4_gpu_mem_scope_end();
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
         return 1;
+    }
     s->graph.quality = e->quality;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&s->graph,
@@ -54722,8 +55283,33 @@ static int ds4_session_alloc_graph(ds4_session *s) {
                                                e->directional_steering_ffn_scale)) {
         metal_graph_free(&s->graph);
         memset(&s->graph, 0, sizeof(s->graph));
+        ds4_gpu_mem_scope_end();
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
         return 1;
     }
+    ds4_gpu_mem_scope_end();
+    /* v0.6.2 Inc 0: reconcile the estimate row against the allocator's
+     * own account.  The scope bracket above tagged every byte of this
+     * alloc SESSION_TENSORS, so the cell delta IS the measured graph --
+     * the "Estimate, not measurement" caveat the scoping table carries
+     * for this row closes here, and the committed lease publishes on
+     * the measured basis (identical quote arithmetic either way: a
+     * committed graph has zero unfunded debt). */
+    const uint64_t measured_delta = session_tensors_census_live();
+    const uint64_t measured = measured_delta > census_before
+        ? measured_delta - census_before : 0;
+    s->graph_alloc_bytes = measured;
+    if (measured) {
+        const double drift = est
+            ? ((double)measured - (double)est) * 100.0 / (double)est : 0.0;
+        fprintf(stderr, "ds4: serial graph estimate reconcile: est=%.1f MiB "
+                        "measured=%.1f MiB drift=%+.1f%%%s (lease basis = "
+                        "measured)\n",
+                (double)est / 1048576.0, (double)measured / 1048576.0,
+                drift, fabs(drift) > 10.0 ? " DIVERGENT" : "");
+    }
+    const uint64_t lease = measured ? measured : est;
+    ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, lease, lease);
     return 0;
 }
 
@@ -54744,6 +55330,19 @@ static int ds4_session_ensure_graph(ds4_session *s, char *err, size_t errlen) {
 }
 #endif
 
+/* MT-3 hotfix (teb fast-leg death, 08-17): exported so the server's idle
+ * reaper can decline in eager-graph mode -- with DS4_SESSION_LAZY_GRAPH=0
+ * every recreate materializes the full graph, so a reap frees ~6 GiB only
+ * to re-allocate it in the same call: pure churn with a fatal endpoint
+ * when a recreate loses the fit race against live banks. */
+int ds4_session_lazy_graph(void) {
+#ifndef DS4_NO_GPU
+    return ds4_session_lazy_graph_enabled() ? 1 : 0;
+#else
+    return 0;   /* no graph backend: no session graph to reap */
+#endif
+}
+
 /* v0.5.2: whether this session's graph alloc is still deferred (S6 lazy
  * graph).  A pending session can still be re-created at a different ctx for
  * free; once the graph exists its capacity is committed. */
@@ -54754,6 +55353,14 @@ int ds4_session_graph_pending(const ds4_session *s) {
     (void)s;
     return 0;
 #endif
+}
+
+/* v0.6.2 Inc 0: the committed graph's measured bytes (see the struct
+ * field).  0 for pending/CPU/distributed sessions -- callers fall back
+ * to the estimate row. */
+uint64_t ds4_session_graph_bytes_committed(const ds4_session *s) {
+    if (!s || s->graph_pending) return 0;
+    return s->graph_alloc_bytes;
 }
 
 /* v0.5.2: would a session graph at this ctx pass the fit gate right now?
@@ -55010,6 +55617,23 @@ void ds4_session_free(ds4_session *s) {
             s->dots3_graph_ready = false;
         } else {
             metal_graph_free(&s->graph);
+            /* MT-2: the symmetric lease release.  ds4_session_alloc_graph
+             * published this session's commit (est, est); without the release
+             * a freed session leaves a PHANTOM lease other lanes' quotes
+             * charge forever (live-caught: the boot prewarm session's ctx-528
+             * graph left 746 MiB of stuck intent after its free).  Absolute
+             * publish: after free the session lane holds nothing.  The DFM
+             * family graphs above never publish this lease (their alloc
+             * branches return before the serial-session publish), so the
+             * release stays with the metal graph it balances. */
+            ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
+            /* MT-6 (audit V9/V11): the serial per-layer exec pool bakes this
+             * graph's tensor pointers by value -- after the free every entry
+             * is stale (never replayed, but leaked until an unrelated scratch
+             * resize used to sweep it).  Drop it with the graph; the next
+             * session recaptures.  Engine-side free, engine-side drop (the
+             * MT-2 law), so reap/right-size/prewarm frees all pass through. */
+            (void)ds4_cuda_layer_graphs_drop();
         }
     }
 #endif

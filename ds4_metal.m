@@ -462,6 +462,11 @@ int ds4_cuda_fp4_index_enabled(void) {
     return 0;
 }
 
+/* MT-6 (audit V9): CUDA-only captured-exec pool; Metal has none to drop. */
+int ds4_cuda_layer_graphs_drop(void) {
+    return 0;
+}
+
 int ds4_cuda_layer_graph_begin_or_replay(uint32_t il,
                                            const struct ds4_layer_graph_key *key) {
     (void)il; (void)key;

@@ -256,10 +256,11 @@ int  ds4_batch_ctx_create(ds4_engine *e, int ctx_size, int max_seq, int max_tota
  * before allocating, instead of the caller probing by failing whole creates
  * (on unified memory those probes can summon the OOM killer before they
  * fail).  Residual slab failures descend by 3/4 internally.  Knobs:
- * DS4_BATCH_FIT=0 keeps caller-driven sizing, DS4_BATCH_FIT_HEADROOM_MB
- * (default 8192) reserves runtime growth room.  Backends with no memory
- * query (Metal) skip the budget.  Read the chosen width back with
- * ds4_batch_ctx_max_seq.
+ * DS4_BATCH_FIT=0 keeps caller-driven sizing; the headroom derives as
+ * live floor + boot-burst margin (v0.6.2 Inc 2; DS4_BATCH_FIT_HEADROOM_MB
+ * pins it, DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores the static 6144).
+ * Backends with no memory query (Metal) skip the budget.  Read the chosen
+ * width back with ds4_batch_ctx_max_seq.
  * R5 Inc1b: on backends with VMM (CUDA) the ctx-scaled compressed/indexer
  * cache slabs are demand-mapped virtual reservations by default -- they cost
  * the bank-count budget nothing at boot and map physical pages only as
@@ -332,6 +333,33 @@ const char *ds4_reclaim_status_str(int status);
  * trims those family banks via this whole-commons helper. */
 uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes);
 
+/* v0.6.2 Inc 3: trim-victim comparison (pure; unit-tested on CPU, the
+ * D-1c extraction pattern).  Returns 1 when x is the CHEAPER victim.
+ * Order aligns with warm-record eviction (invalid > LRU; "superseded"
+ * has no engine-side analog): invalid history first (content already
+ * worthless), then valid banks by last content activity -- oldest
+ * first -- with committed length as the equal-recency tiebreak
+ * (shortest history = cheapest re-prefill).  hist_order = the
+ * DS4_BATCH_TRIM_VICTIM=hist kill switch: valid banks by shortest
+ * history alone, the pre-v0.6.2 order (it kept deep trunks immortal
+ * under budget pressure while re-trimming recently-hot small banks --
+ * the +76% over-reclaim receipt's thrash shape). */
+typedef struct {
+    uint8_t  hist_valid;
+    uint32_t hist_len;
+    uint64_t last_use;
+} ds4_trim_victim_key;
+
+static inline int ds4_trim_victim_cheaper(const ds4_trim_victim_key *x,
+                                          const ds4_trim_victim_key *y,
+                                          int hist_order) {
+    if (x->hist_valid != y->hist_valid) return !x->hist_valid;
+    if (!x->hist_valid) return 0;              /* both invalid: stable */
+    if (hist_order) return x->hist_len < y->hist_len;
+    if (x->last_use != y->last_use) return x->last_use < y->last_use;
+    return x->hist_len < y->hist_len;
+}
+
 /* deepmem D-1c: page-interval union across per-bank credited spans -- the
  * pure arithmetic under the continuous-admission credit projection
  * (credit_union_family in ds4.c), extracted header-inline so unit tests can
@@ -377,6 +405,85 @@ static inline uint64_t ds4_credit_union_runs(
         need += run_need(user, run_p0 * page, (run_p1 - run_p0 + 1u) * page);
     return need;
 }
+/* MT-1b (v0.6.1 memory truth): pure arithmetic under the mid-flight tranche
+ * credit extension, header-inline so unit tests pin it without a GPU.
+ * A row admitted under DS4_CONT_ADMIT_TRANCHE holds credit for only its
+ * next tranche of decode growth; when its absolute position pos comes
+ * within `margin` of the credited end and the true normalized target lies
+ * beyond, an extension attempt is due.  margin must cover the widest
+ * single decode step (1 committed token + the speculative verify depth:
+ * those draft rows write KV BEFORE acceptance), so no forward ever touches
+ * rows past the funded end.  tranche == 0 is the legacy kill switch:
+ * never due.  Returns 1 and sets *next_end = min(credit_end + tranche,
+ * target) when an attempt is due. */
+static inline int ds4_cont_credit_ext_due(uint64_t pos, uint64_t credit_end,
+                                          uint64_t target, uint64_t margin,
+                                          uint64_t tranche, uint64_t *next_end) {
+    if (tranche == 0 || credit_end >= target) return 0;
+    if (pos + margin < credit_end) return 0;
+    uint64_t nf = credit_end + tranche;
+    if (nf > target) nf = target;
+    *next_end = nf;
+    return 1;
+}
+/* MT-1b: the refusal clamp -- the generation cap that finishes a row
+ * EXACTLY at its funded boundary.  A row at absolute position pos with
+ * glen tokens generated may emit (credit_end - pos) more before its KV
+ * would touch an unfunded row, so the terminal check (glen >= bmax) fires
+ * on the last funded token: positions written stay in [0, credit_end). */
+static inline uint32_t ds4_cont_credit_refuse_bmax(uint32_t glen, uint64_t pos,
+                                                   uint64_t credit_end) {
+    const uint64_t left = credit_end > pos ? credit_end - pos : 0u;
+    return glen + (uint32_t)left;
+}
+/* MT-7 (v0.6.1 memory truth): the disclosed admission band -- the ONLY
+ * multiplier ever applied to the page-union projection.  band_x1024 is a
+ * fixed-point factor (1024 = physics-exact, the floor; 2048 = the sanity
+ * cap); the charge rounds UP so a nonzero need never shrinks.  The union
+ * arithmetic already charges future page-rounded extents exactly, so the
+ * band carries only the MEASURED transient margin (peak/steady during
+ * admission) -- never an observed-average rate, which would double-charge
+ * the page floors the union has already counted. */
+static inline uint64_t ds4_cont_admit_band_apply(uint64_t need,
+                                                 uint32_t band_x1024) {
+    uint32_t b = band_x1024;
+    if (b < 1024u) b = 1024u;
+    if (b > 2048u) b = 2048u;
+    return (need * b + 1023u) / 1024u;
+}
+/* MT-7: the live commit-rate tripwire (zero-headroom law: no unexplained
+ * gaps).  Anomalous when the OBSERVED slab bytes per committed token exceed
+ * 2x the shape-derived packed rate with a meaningful sample -- the tell for
+ * per-token growth the projection does not know about.  Small samples are
+ * page-floor dominated (every layer x family rounds up to a whole demand
+ * page) and never trip. */
+static inline int ds4_cont_rate_anomalous(uint64_t resident_bytes,
+                                          uint64_t tokens, uint64_t phys_bpt,
+                                          uint64_t min_tokens) {
+    if (tokens < min_tokens || min_tokens == 0 || phys_bpt == 0) return 0;
+    return resident_bytes > 2u * phys_bpt * tokens ? 1 : 0;
+}
+/* Governed cont bank plan: pure KV-aware boot-plan arithmetic, header-inline
+ * so unit tests pin it without a GPU (the MT-1b precedent).  The MT-5
+ * ladder's criterion -- banks x ctx <= fundable tokens -- priced from the
+ * LIVE budget: bank_commit is one bank's full-depth KV commit (seq_cap x
+ * banded packed rate; KV ONLY -- the eager slab remainder stays the eager
+ * fit's separate bound, exactly as the ladder never priced it), so a boot
+ * never grants banks whose KV the budget can never fund to depth.
+ * plan_floor is the count worth granting even when full-depth funding
+ * falls short (4 = the A2b fork-fanout width, the ladder's floor): floor
+ * banks ride the admission gate like they always did.  n_eager still caps
+ * the result -- a floor the eager slabs cannot fund is not granted.
+ * bank_commit == 0 (no physics answer) keeps the eager fit's count. */
+static inline uint32_t ds4_batch_plan_kv_banks(uint64_t budget,
+                                               uint64_t bank_commit,
+                                               uint32_t n_eager,
+                                               uint32_t plan_floor) {
+    if (bank_commit == 0) return n_eager;
+    uint64_t n_kv = budget / bank_commit;
+    if (n_kv < plan_floor) n_kv = plan_floor;
+    return n_kv < n_eager ? (uint32_t)n_kv : n_eager;
+}
 /* Bank count of the persistent ctx (create_fit may size it below the
  * requested cap).  Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx);
@@ -385,6 +492,22 @@ int  ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx);
  * prompt+budget by it (one-shot prefill, no wrap), but the continuous path's
  * per-sequence bound is ds4_batch_ctx_seq_cap.  Returns 0 if ctx is NULL. */
 int  ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx);
+/* MT-5 hygiene: the cont admission chunk width (DS4_CONT_PREFILL_CHUNK,
+ * default 4096) -- the input that shapes raw_cap; for boot-ledger honesty. */
+uint32_t ds4_cont_prefill_chunk_tokens(void);
+/* MT-7: the disclosed admission band (DS4_CONT_ADMIT_BAND_X1024, default
+ * 1045 = the leg2a-measured 1.02x sequential transient peak, rounded up;
+ * clamped to [1024, 2048]; 1024 = physics-exact charging).  Applied inside
+ * ds4_batch_credit_union_projection, so admission, extension, and row-end
+ * lease refreshes all charge the same truth. */
+uint32_t ds4_cont_admit_band_x1024(void);
+/* MT-7: census-observed vs shape-derived commit rates of the persistent
+ * ctx's demand-mapped cache slabs, bytes per committed token.  obs = slab
+ * resident / valid committed tokens as of the last funding check (0 before
+ * any); phys = the packed per-token rate the projection charges, from the
+ * live slab config.  Returns 0 and writes nothing if ctx is NULL. */
+int ds4_batch_ctx_commit_rate(const ds4_batch_ctx *ctx,
+                              uint64_t *obs_bpt, uint64_t *phys_bpt);
 /* Per-sequence committed-token bound (prompt + generation) of the CONTINUOUS
  * path: the admit pre-check + decode budget cap.  With chunked admission
  * (DS4_CONT_PREFILL_CHUNK > 0, the default) the raw ring wraps and this is the
@@ -688,6 +811,12 @@ int  ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
  * exported): what a committed graph at this ctx costs, for SERIAL_SESSION
  * and STATIC_BATCH shadow claims. */
 uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx);
+/* v0.6.2 Inc 0: the MEASURED committed-graph bytes for the same lease row
+ * (census SESSION_TENSORS delta across the alloc's scope bracket) -- the
+ * estimate reconciled against the allocator's own account.  0 while the
+ * graph is pending or where the backend keeps no census; callers fall
+ * back to the estimate then. */
+uint64_t ds4_session_graph_bytes_committed(const ds4_session *s);
 /* The serial session fit gate's headroom (DS4_SESSION_GRAPH_HEADROOM_MB,
  * default 1024 MiB) -- one source shared by the probe and the S6 claim. */
 uint64_t ds4_session_graph_headroom_bytes(void);
@@ -767,6 +896,7 @@ enum {
     DS4_REJECT_UNSUPPORTED,       /* shape/backend: never                */
     DS4_REJECT_FAULT,             /* internal fault: never               */
     DS4_REJECT_DEEP_POLICY,       /* deep-ctx serial policy: never       */
+    DS4_REJECT_LANE_DISABLED,     /* MT-4: --no-serial refusal: never    */
     DS4_REJECT__COUNT
 };
 /* The governed-check refusal statuses map 1:1 onto reasons; ADMIT never
@@ -796,6 +926,16 @@ typedef struct {
     /* engine admission + refusals */
     uint64_t graph_fit_refusals;            /* session-graph fit gate said no */
     uint64_t cont_admit_rejects;            /* comp-cache budget rejects */
+    /* MT-1b (v0.6.1 memory truth): mid-flight tranche credit extensions.
+     * granted = a live row's credit end advanced one tranche; refused =
+     * the funding verdict said no and the row was pinned to its funded
+     * boundary (it finishes there with finish=length -- the legacy scheme
+     * would have refused the whole request at admission). */
+    uint64_t cont_credit_ext_granted;
+    uint64_t cont_credit_ext_refused;
+    /* MT-3: idle reaper freed the committed serial session graph (the
+     * bytes returned to the box; next serial re-allocs right-sized). */
+    uint64_t serial_idle_reaps;
     /* memgov D5-3: the typed rejection family (lane x reason enums above,
      * both closed).  Ticked BESIDE the legacy scalars, which stay frozen;
      * every cell renders on /metrics. */
@@ -882,6 +1022,12 @@ typedef struct {
      * ds4_mem_own_trim_{calls,recovered_bytes}_total). */
     uint64_t mem_own_trim_calls;
     uint64_t mem_own_trim_recovered;
+    /* v0.6.2 Inc 0: the reconciliation line.  ONE process counter --
+     * idle-tick computes whose |residual| exceeded the tolerance.  The
+     * residual/onetime values themselves are never stored here: /metrics
+     * and /v1/stats each render a FRESH compute from their own capture
+     * (a stored gauge would just be the idle tick's stale echo). */
+    uint64_t mem_reconcile_flagged;    /* counter */
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);
@@ -1073,6 +1219,10 @@ int ds4_session_prefill_cap(ds4_session *s);
  * still deferred, and whether a session graph at ctx_size would pass the fit
  * gate right now (quiet probe; fail-open like the gate itself). */
 int ds4_session_graph_pending(const ds4_session *s);
+/* MT-3: whether session creates defer the graph alloc (DS4_SESSION_LAZY_GRAPH,
+ * default ON; =0 pins eager materialization).  The idle reaper only runs in
+ * lazy mode -- an eager recreate would re-materialize what the reap freed. */
+int ds4_session_lazy_graph(void);
 int ds4_engine_session_graph_fits(ds4_engine *e, int ctx_size);
 /* memgov D4-1: the structured fit quote (revised plan sec 10 step 1) -- the
  * boolean probe's own terms, exposed.  need = the graph alloc estimate at

@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "../cuda/mmq/ds4_repack.h"
+#include "../ds4_weight_identity.h" /* rider #48: manifest content fingerprint */
 
 /* File mapping, the GGUF tensor catalog, and the aligned repack builders
  * live in the shared layout library (cuda/mmq/ds4_repack.{h,cu}) so the
@@ -1251,9 +1252,60 @@ static bool ws_build_aligned_artifacts(uint32_t kind,
     return true;
 }
 
+/* Rider #48: one content record per served model file so importers can
+ * refuse when this server is holding a superseded checkpoint (identity
+ * used to be model_id + size only, and same-size checkpoint swaps passed).
+ * The fingerprint runs over a fresh private mapping of the file taken
+ * here, at manifest-write time: if the file was replaced after upload,
+ * the record describes the NEW bytes, importers of the OLD uploaded
+ * ranges mismatch, and the swap is caught instead of served. */
+struct content_entry {
+    std::string model_id;
+    uint64_t model_size;
+    uint64_t fp;
+};
+
+static bool fingerprint_model_file(const char *model_id, const char *path,
+                                   uint64_t expect_size,
+                                   std::vector<content_entry> &contents) {
+    /* DFM split GGUFs: the identity the importer checks is the LOGICAL
+     * model -- the page-spanned shard concatenation both repack_map_split
+     * here and the engine's model_open_split lay out identically.  A raw
+     * stat of the first shard would neither match the plan's logical size
+     * nor the importer's mapped bytes, so take the same logical mapping
+     * the plan pass used.  Single files map 1:1 and are unchanged. */
+    mapped_file m;
+    if (!map_file(path, m)) {
+        fprintf(stderr, "ds4_weight_server: content fingerprint map failed %s\n",
+                path);
+        return false;
+    }
+    if (m.size != expect_size) {
+        fprintf(stderr,
+                "ds4_weight_server: %s changed size during startup "
+                "(%llu at plan, %llu now): %s\n",
+                model_id,
+                (unsigned long long)expect_size,
+                (unsigned long long)m.size,
+                path);
+        unmap_file(m);
+        return false;
+    }
+    content_entry e;
+    e.model_id = model_id;
+    e.model_size = m.size;
+    e.fp = ds4_weight_content_fingerprint(m.data, m.size);
+    unmap_file(m);
+    fprintf(stderr, "ds4_weight_server: content fingerprint %s %s %016llx\n",
+            model_id, DS4_WFP_ALGO, (unsigned long long)e.fp);
+    contents.push_back(e);
+    return true;
+}
+
 static bool write_manifest(const char *path, const std::vector<owned_range> &ranges,
                            int device, const char *scope, const char *lock_file,
-                           weight_backend backend, const char *broker_path) {
+                           weight_backend backend, const char *broker_path,
+                           const std::vector<content_entry> &contents) {
     std::string tmp = std::string(path) + ".tmp";
     FILE *fp = fopen(tmp.c_str(), "w");
     if (!fp) {
@@ -1281,6 +1333,16 @@ static bool write_manifest(const char *path, const std::vector<owned_range> &ran
     if (backend == WEIGHT_BACKEND_VMM) {
         fprintf(fp, "# broker <unix-socket-path>\n");
         fprintf(fp, "broker %s\n", broker_path ? broker_path : "");
+    }
+    if (!contents.empty()) {
+        fprintf(fp, "# content <model-id> <model-size> <algo> <fingerprint-hex>\n");
+        for (const content_entry &c : contents) {
+            fprintf(fp, "content %s %llu %s %016llx\n",
+                    c.model_id.c_str(),
+                    (unsigned long long)c.model_size,
+                    DS4_WFP_ALGO,
+                    (unsigned long long)c.fp);
+        }
     }
     if (backend == WEIGHT_BACKEND_VMM) {
         fprintf(fp, "# alloc <alloc-id> <model-id> <model-size> <offset> <bytes> <alloc-bytes>\n");
@@ -1856,6 +1918,14 @@ int main(int argc, char **argv) {
                 (double)derived_bytes_used / 1048576.0,
                 (double)derive_budget_bytes / 1048576.0);
     }
+    std::vector<content_entry> contents;
+    if (want_base &&
+        !fingerprint_model_file("base", base, base_model_size, contents)) return 1;
+    if (want_mtp &&
+        !fingerprint_model_file("mtp", mtp, mtp_model_size, contents)) return 1;
+    if (drafter &&
+        !fingerprint_model_file("drafter", drafter, drafter_model_size, contents)) return 1;
+
     std::string default_broker_socket;
     fd_broker broker;
     if (backend == WEIGHT_BACKEND_VMM) {
@@ -1866,7 +1936,7 @@ int main(int argc, char **argv) {
         }
         if (!fd_broker_start(broker, broker_socket)) return 1;
     }
-    if (!write_manifest(manifest, ranges, device, scope, lock_file, backend, broker_socket)) return 1;
+    if (!write_manifest(manifest, ranges, device, scope, lock_file, backend, broker_socket, contents)) return 1;
 
     fprintf(stderr,
             "ds4_weight_server: ready manifest=%s ranges=%zu. Keep this process alive while workers run.\n",
