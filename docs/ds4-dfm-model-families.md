@@ -150,6 +150,44 @@ Before changing large models:
 `clear_cache` does not reclaim allocations from a live CUDA process. Never run
 a second full-model owner beside the first one on the reference machine.
 
+## Integration evidence for `v0.6.2-dfm`
+
+This cut absorbs Entrpi `v0.6.2` (`d183482`) — the v0.6.1/v0.6.2
+memory-truth arc: honest decode credit, transient serial-graph leases,
+the serial idle reaper, GRAPH_EXEC pool truth, ctx-aware defaults,
+live commit-rate feedback, `--no-serial`, manifest content identity,
+the governed cont bank plan, the packed work floor, derived fit
+headroom, eviction-aligned trim victims, and the continuous ledger
+reconciliation line — on the same GB10 host (driver 610.43.02,
+CUDA 13.3, `sm_121a` cubins only).
+
+Two family-side reconciliations were required beyond conflict hunks:
+
+- Upstream's rider #48 content fingerprint stats the model path; the
+  DFM split-GGUF models map shards into one logical range. The weight
+  server now fingerprints that logical mapping (identical layout to the
+  engine's `model_open_split`), so split models keep booting and the
+  Motif single-file import reports `content identity verified`.
+- Upstream's v0.6.2 Inc 3 recency array (`bank_last_use`) is stamped by
+  `bank_hist_reset`, which the family persistent-bank lanes share. The
+  Solar/EXAONE/Motif batch contexts now allocate it; without the fix the
+  first cold family admission crashed the worker (reproduced under gdb).
+
+Gates on this binary: server unit suite, extractor self-test,
+split-GGUF test, `test-model-family-kernels`, `test-mmq-parity`,
+Motif loader/tokenizer/reference/CUDA six groups, EXAONE
+kernels/reference, Solar loader/tokenizer/KDA/prefill/chunk/gates/KV
+plus the repaired full forward integration, dots3 loader/tokenizer,
+and `make cuda-regression` — all passed. A live VMM owner + worker gate
+on the Motif MQ87-88 artifact answered all four API surfaces
+(4 requests, 0 failures, continuous route, 32 banks at `-c 2048`).
+
+Same-host `ds4-bench` parity against the `v0.6.0-dfm` band (owner with
+aligned Q8 artifacts, context-32768 corpus, greedy): 8K prefill
+519.90 / 518.02 tok/s, 8K decode run 515.84 prefill + 12.62 decode
+tok/s, 32K decode run 445.03 prefill + 9.68 decode tok/s. The published
+Motif numbers below remain the `v0.5.6.3-dfm` evidence.
+
 ## Integration evidence for `v0.6.0-dfm`
 
 This cut absorbs Entrpi `v0.6.0` (`c8956e0`) on the same GB10 host
