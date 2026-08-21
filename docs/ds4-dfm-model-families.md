@@ -185,8 +185,18 @@ on the Motif MQ87-88 artifact answered all four API surfaces
 Same-host `ds4-bench` parity against the `v0.6.0-dfm` band (owner with
 aligned Q8 artifacts, context-32768 corpus, greedy): 8K prefill
 519.90 / 518.02 tok/s, 8K decode run 515.84 prefill + 12.62 decode
-tok/s, 32K decode run 445.03 prefill + 9.68 decode tok/s. The published
-Motif numbers below remain the `v0.5.6.3-dfm` evidence.
+tok/s, 32K decode run 445.03 prefill + 9.68 decode tok/s.
+
+A later Motif-only optimization series on the same `dfm` line
+(`d03bd89` HG16, `b0db5a1` SWA→HMMA, `91823ca` MoE D2R,
+`a8e9e61` HG16 cp.async, `a09ff4f` FATTN TK=32) remesured 8K/32K on
+the same artifact and host. Current tip (`a09ff4f`): 8K prefill
+627.19 tok/s and decode 15.06 tok/s; 32K prefill 545.62 tok/s and
+decode 12.95 tok/s; 32K OpenAI sentinels exact (546.7 / 12.8). The
+`v0.6.2-dfm` **tag is not moved**. The published Motif 256K row below
+remains the `v0.5.6.3-dfm` evidence; 256K was not remesured on this
+binary. Do not treat the 8K/32K remesure as a new published 256K
+number.
 
 ## Integration evidence for `v0.6.0-dfm`
 

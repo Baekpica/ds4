@@ -7,10 +7,17 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## v0.6.2-dfm — 2026-08-21
 
+- Motif-3 prefill FATTN now walks K in 32-key tiles (still three CTAs
+  on GB10). Same-session 32K prefill 519.57→545.62 tok/s; 8K prefill
+  616.27→627.19. 32K HTTP sentinels exact. 256K not remesured.
 - Motif-3 HG16 decode now prefetches the next BF16 KV tile with
   `cp.async` while scoring the current one. Hides the L1TEX miss that
   ncu put at 33.8% of the depth-linear kernel; 32K decode 12.73→13.02
   tok/s, synthetic 256K kernel +19.3%.
+- Motif-3 decode HG16 (16 heads/CTA), SWA prefill through windowed
+  HMMA, and Motif routed-expert D2R with `d2r_ncols_floor=8` are in
+  this line. Merge-day 8K/32K (519.9 / 12.62, 445.0 / 9.68) is the
+  baseline; current `dfm` tip is the remesure above.
 - Absorbs Entrpi `v0.6.2` (the memory-truth arc: honest decode credit,
   transient serial-graph leases, serial idle reaper, GRAPH_EXEC pool
   truth, ctx-aware bank grants, live commit-rate feedback,
