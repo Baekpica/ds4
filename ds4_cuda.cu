@@ -34335,8 +34335,20 @@ __global__ static void motif3_latent_attention_bf16_decode_split_kernel(
     }
 }
 
-#define M3_ATTN_HG_HEADS 8u
-#define M3_ATTN_HG_ROWS  8u
+/* Head-group flash decode: 16 heads per CTA (8 warps x 2 heads/warp) so
+ * the 80-head GDLA walks the latent cache in 5 head groups instead of 10,
+ * and 16-row KV tiles so each CTA pays half as many staging barriers per
+ * visible token.  The KV tile in shared memory is the whole point of the
+ * grouping: DRAM traffic per decode token is groups x visible x (512+64)
+ * bf16, so heads per CTA divides the depth-dependent decode cost, while
+ * the tile depth divides the per-CTA __syncthreads chain that bounds the
+ * kernel once the re-reads hit L2.  Each warp folds its two heads' dots
+ * out of one shared-tile read.  GB10 scan (scratch/motif3-opt-v062,
+ * synthetic 80-head fixture): 2.03x/1.84x/2.15x over the 8-head 8-row
+ * shape at 8K/32K/256K visible. */
+#define M3_ATTN_HG_HEADS 16u
+#define M3_ATTN_HG_WARP_HEADS 2u
+#define M3_ATTN_HG_ROWS  16u
 
 /* Long-context Motif decode, grouped by eight heads.  Unlike the per-head
  * split above, each latent/K-RoPE row is converted from BF16 and staged once,
@@ -34363,8 +34375,9 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
-    const uint32_t head = head_group * M3_ATTN_HG_HEADS + warp;
-    if (split >= split_count || head >= q_heads || latent_dim != 512u ||
+    const uint32_t head0 =
+        head_group * M3_ATTN_HG_HEADS + warp * M3_ATTN_HG_WARP_HEADS;
+    if (split >= split_count || head0 >= q_heads || latent_dim != 512u ||
         qk_rope != 64u) return;
 
     const uint32_t end = pos0 + 1u;
@@ -34375,14 +34388,20 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
     const uint32_t hi = min(end, lo + chunk);
     const uint32_t partial_stride = latent_dim + 2u;
 
-    float q_latent[16];
-    const float *qa = q_absorbed + (uint64_t)head * latent_dim;
+    float q_latent0[16], q_latent1[16];
+    const float *qa0 = q_absorbed + (uint64_t)head0 * latent_dim;
+    const float *qa1 = qa0 + latent_dim;
 #pragma unroll
-    for (uint32_t k = 0; k < 16u; k++)
-        q_latent[k] = qa[lane + 32u * k];
-    const float *qh = q + (uint64_t)head * (qk_nope + qk_rope);
-    const float q_rope0 = qh[qk_nope + lane];
-    const float q_rope1 = qh[qk_nope + lane + 32u];
+    for (uint32_t k = 0; k < 16u; k++) {
+        q_latent0[k] = qa0[lane + 32u * k];
+        q_latent1[k] = qa1[lane + 32u * k];
+    }
+    const float *qh0 = q + (uint64_t)head0 * (qk_nope + qk_rope);
+    const float *qh1 = qh0 + (qk_nope + qk_rope);
+    const float q_rope00 = qh0[qk_nope + lane];
+    const float q_rope01 = qh0[qk_nope + lane + 32u];
+    const float q_rope10 = qh1[qk_nope + lane];
+    const float q_rope11 = qh1[qk_nope + lane + 32u];
 
     if (tid < M3_ATTN_HG_HEADS) {
         m_sm[tid] = -INFINITY;
@@ -34433,36 +34452,59 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
         }
         __syncthreads();
 
-        float score[M3_ATTN_HG_ROWS];
+        float score0[M3_ATTN_HG_ROWS], score1[M3_ATTN_HG_ROWS];
 #pragma unroll
         for (uint32_t row = 0; row < M3_ATTN_HG_ROWS; row++) {
-            float dot = 0.0f;
+            float dot0 = 0.0f, dot1 = 0.0f;
 #pragma unroll
-            for (uint32_t k = 0; k < 16u; k++)
-                dot = __fmaf_rn(q_latent[k],
-                                latent_sm[row][lane + 32u * k], dot);
-            dot = __fmaf_rn(q_rope0, k_pe_sm[row][lane], dot);
-            dot = __fmaf_rn(q_rope1, k_pe_sm[row][lane + 32u], dot);
-            for (uint32_t off = 16u; off > 0u; off >>= 1u)
-                dot += __shfl_down_sync(0xffffffffu, dot, off);
-            score[row] = dot * scale;
+            for (uint32_t k = 0; k < 16u; k++) {
+                const float kv = latent_sm[row][lane + 32u * k];
+                dot0 = __fmaf_rn(q_latent0[k], kv, dot0);
+                dot1 = __fmaf_rn(q_latent1[k], kv, dot1);
+            }
+            const float kp0 = k_pe_sm[row][lane];
+            const float kp1 = k_pe_sm[row][lane + 32u];
+            dot0 = __fmaf_rn(q_rope00, kp0, dot0);
+            dot0 = __fmaf_rn(q_rope01, kp1, dot0);
+            dot1 = __fmaf_rn(q_rope10, kp0, dot1);
+            dot1 = __fmaf_rn(q_rope11, kp1, dot1);
+            for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+                dot0 += __shfl_down_sync(0xffffffffu, dot0, off);
+                dot1 += __shfl_down_sync(0xffffffffu, dot1, off);
+            }
+            score0[row] = dot0 * scale;
+            score1[row] = dot1 * scale;
         }
         if (lane == 0u) {
-            float next_m = m_sm[warp];
-            for (uint32_t row = 0; row < nrows; row++)
-                next_m = fmaxf(next_m, score[row]);
-            const float rescale =
-                m_sm[warp] == -INFINITY ? 0.0f : expf(m_sm[warp] - next_m);
-            float add_l = 0.0f;
+            const uint32_t h0 = warp * M3_ATTN_HG_WARP_HEADS;
+            const uint32_t h1 = h0 + 1u;
+            float next_m0 = m_sm[h0], next_m1 = m_sm[h1];
+            for (uint32_t row = 0; row < nrows; row++) {
+                next_m0 = fmaxf(next_m0, score0[row]);
+                next_m1 = fmaxf(next_m1, score1[row]);
+            }
+            const float rescale0 =
+                m_sm[h0] == -INFINITY ? 0.0f : expf(m_sm[h0] - next_m0);
+            const float rescale1 =
+                m_sm[h1] == -INFINITY ? 0.0f : expf(m_sm[h1] - next_m1);
+            float add_l0 = 0.0f, add_l1 = 0.0f;
 #pragma unroll
             for (uint32_t row = 0; row < M3_ATTN_HG_ROWS; row++) {
-                const float p = row < nrows ? expf(score[row] - next_m) : 0.0f;
-                prob_sm[warp][row] = p;
-                add_l += p;
+                const float p0 =
+                    row < nrows ? expf(score0[row] - next_m0) : 0.0f;
+                const float p1 =
+                    row < nrows ? expf(score1[row] - next_m1) : 0.0f;
+                prob_sm[h0][row] = p0;
+                prob_sm[h1][row] = p1;
+                add_l0 += p0;
+                add_l1 += p1;
             }
-            m_sm[warp] = next_m;
-            l_sm[warp] = l_sm[warp] * rescale + add_l;
-            f_sm[warp] = rescale;
+            m_sm[h0] = next_m0;
+            l_sm[h0] = l_sm[h0] * rescale0 + add_l0;
+            f_sm[h0] = rescale0;
+            m_sm[h1] = next_m1;
+            l_sm[h1] = l_sm[h1] * rescale1 + add_l1;
+            f_sm[h1] = rescale1;
         }
         __syncthreads();
 
@@ -34510,7 +34552,7 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_combine_kernel(
     const uint32_t stride = latent_dim + 2u;
     const float *base =
         partials + (uint64_t)head * split_count * stride;
-    __shared__ float factor[16];
+    __shared__ float factor[64];
     __shared__ float denom_sm;
     if (threadIdx.x == 0u) {
         float global_m = -INFINITY;
@@ -34536,12 +34578,16 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_combine_kernel(
     }
 }
 
-static uint32_t motif3_attention_decode_hg_split_count(uint32_t q_heads) {
-    const uint32_t groups = q_heads / M3_ATTN_HG_HEADS;
-    const uint32_t sm = g_cuda_sm_count > 0 ? (uint32_t)g_cuda_sm_count : 48u;
-    uint32_t split_count = (2u * sm + groups - 1u) / groups;
-    if (split_count < 4u) split_count = 4u;
-    if (split_count > 16u) split_count = 16u;
+static uint32_t motif3_attention_decode_hg_split_count(uint32_t visible) {
+    /* The per-CTA tile walk is a serial barrier chain, so the split count
+     * follows depth instead of the SM count: hold roughly 4096 visible
+     * tokens per split, floored at 32 so shallow contexts still fill the
+     * machine, capped at 64 (the combine factor array and the shared
+     * partials scratch are sized for 64).  GB10 scan: 32 within 5% of
+     * best at 8K-128K, 64 best at 256K. */
+    uint32_t split_count = visible / 4096u;
+    if (split_count < 32u) split_count = 32u;
+    if (split_count > 64u) split_count = 64u;
     return split_count;
 }
 
@@ -34585,7 +34631,7 @@ extern "C" int ds4_gpu_motif3_latent_attention_bf16_tensor(
         (q_heads % M3_ATTN_HG_HEADS) == 0u &&
         g_attn_split_partials != NULL) {
         const uint32_t split_count =
-            motif3_attention_decode_hg_split_count(q_heads);
+            motif3_attention_decode_hg_split_count(decode_visible);
         const uint64_t partial_bytes =
             (uint64_t)q_heads * split_count * (kv_latent_dim + 2u) *
             sizeof(float);
