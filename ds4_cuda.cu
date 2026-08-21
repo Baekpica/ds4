@@ -34353,15 +34353,57 @@ __global__ static void motif3_latent_attention_bf16_decode_split_kernel(
  * sixteen heads at its unique (d0,d1): the dim mapping is block-wide, so
  * a warp-local write would cover only 64 of 512 dims.  GB10 scan
  * (scratch/motif3-opt-v062, synthetic 80-head fixture): 2.03x/1.84x/2.15x
- * over the 8-head 8-row shape at 8K/32K/256K visible. */
+ * over the 8-head 8-row shape at 8K/32K/256K visible.
+ *
+ * Cycle 5 (2026-08-21): stage the KV tile in BF16 and hide the next-tile
+ * L1TEX miss behind compute with a two-buffer cp.async pipeline.  ncu on
+ * the HG16 winner had 33.8% L1TEX scoreboard stall; occupancy variants
+ * (cycle 4) were a dead end (regs+smem already 2 CTA/SM).  Synthetic
+ * 80-head scan: +4.7% / +7.8% / +19.3% at 8K/32K/256K, rms 0 vs the
+ * blocking FP32-stage kernel.  Smem stays ~38 KiB so occupancy holds. */
 #define M3_ATTN_HG_HEADS 16u
 #define M3_ATTN_HG_WARP_HEADS 2u
 #define M3_ATTN_HG_ROWS  16u
 
-/* Long-context Motif decode, grouped by sixteen heads.  Unlike the per-head
- * split above, each latent/K-RoPE row is converted from BF16 and staged once,
- * then reused by the CTA's query heads.  The block emits one online-softmax
- * partial per (head, context split); a fixed-order second kernel merges them. */
+__device__ __forceinline__ static void motif3_hg_issue_tile_async(
+        __nv_bfloat16 lat_bf[M3_ATTN_HG_ROWS][512],
+        __nv_bfloat16 kpe_bf[M3_ATTN_HG_ROWS][64],
+        const __nv_bfloat16 *latent_cache,
+        const __nv_bfloat16 *k_pe_cache,
+        uint32_t tile, uint32_t nrows, uint32_t tid,
+        uint32_t cache_cap, uint32_t window) {
+    for (uint32_t i = tid; i < M3_ATTN_HG_ROWS * 64u; i += 256u) {
+        const uint32_t row = i / 64u;
+        const uint32_t c8 = i % 64u;
+        const bool pred = row < nrows;
+        uint32_t slot = 0u;
+        if (pred) {
+            const uint32_t logical = tile + row;
+            slot = window ? logical % cache_cap : logical;
+        }
+        const __nv_bfloat16 *src =
+            latent_cache + (uint64_t)slot * 512u + c8 * 8u;
+        tt_cp_async_16B(&lat_bf[row][c8 * 8u], src, pred);
+    }
+    if (tid < 128u) {
+        const uint32_t row = tid / 8u;
+        const uint32_t c8 = tid % 8u;
+        const bool pred = row < nrows;
+        uint32_t slot = 0u;
+        if (pred) {
+            const uint32_t logical = tile + row;
+            slot = window ? logical % cache_cap : logical;
+        }
+        const __nv_bfloat16 *src =
+            k_pe_cache + (uint64_t)slot * 64u + c8 * 8u;
+        tt_cp_async_16B(&kpe_bf[row][c8 * 8u], src, pred);
+    }
+    tt_cp_async_commit();
+}
+
+/* Long-context Motif decode, grouped by sixteen heads.  Each CTA stages one
+ * 16-row KV tile and walks it for two heads per warp.  The next tile is
+ * cp.async-prefetched into the alternate BF16 buffer during softmax/value. */
 __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
         float *partials,
         const float *q, const float *q_absorbed,
@@ -34371,8 +34413,8 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
         uint32_t q_heads, uint32_t latent_dim,
         uint32_t qk_nope, uint32_t qk_rope,
         uint32_t split_count, float scale) {
-    __shared__ float latent_sm[M3_ATTN_HG_ROWS][512u + 4u];
-    __shared__ float k_pe_sm[M3_ATTN_HG_ROWS][64u + 4u];
+    __shared__ __nv_bfloat16 lat_bf[2][M3_ATTN_HG_ROWS][512];
+    __shared__ __nv_bfloat16 kpe_bf[2][M3_ATTN_HG_ROWS][64];
     __shared__ float prob_sm[M3_ATTN_HG_HEADS][M3_ATTN_HG_ROWS];
     __shared__ float m_sm[M3_ATTN_HG_HEADS];
     __shared__ float l_sm[M3_ATTN_HG_HEADS];
@@ -34415,7 +34457,6 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
         m_sm[tid] = -INFINITY;
         l_sm[tid] = 0.0f;
     }
-    __syncthreads();
     const uint32_t d0 = (tid * 2u) & 511u;
     const uint32_t d1 = d0 + 1u;
     float out0[M3_ATTN_HG_HEADS], out1[M3_ATTN_HG_HEADS];
@@ -34425,40 +34466,26 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
         out1[h] = 0.0f;
     }
 
+    uint32_t buf = 0u;
+    if (lo < hi) {
+        motif3_hg_issue_tile_async(lat_bf[0], kpe_bf[0], latent_cache,
+                                   k_pe_cache, lo, min((uint32_t)M3_ATTN_HG_ROWS, hi - lo),
+                                   tid, cache_cap, window);
+        tt_cp_async_wait_group<0>();
+    }
+    __syncthreads();
+
     for (uint32_t tile = lo; tile < hi; tile += M3_ATTN_HG_ROWS) {
         const uint32_t nrows =
             min((uint32_t)M3_ATTN_HG_ROWS, hi - tile);
-        for (uint32_t i4 = tid;
-             i4 < M3_ATTN_HG_ROWS * (latent_dim / 4u);
-             i4 += blockDim.x) {
-            const uint32_t row = i4 / (latent_dim / 4u);
-            const uint32_t dim = (i4 % (latent_dim / 4u)) * 4u;
-            float4 value = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (row < nrows) {
-                const uint32_t logical = tile + row;
-                const uint32_t slot = window ? logical % cache_cap : logical;
-                const __nv_bfloat16 *src =
-                    latent_cache + (uint64_t)slot * latent_dim + dim;
-                value = motif3_load_bf16x4(src);
-            }
-            *(float4 *)&latent_sm[row][dim] = value;
-        }
-        for (uint32_t i4 = tid;
-             i4 < M3_ATTN_HG_ROWS * (qk_rope / 4u);
-             i4 += blockDim.x) {
-            const uint32_t row = i4 / (qk_rope / 4u);
-            const uint32_t dim = (i4 % (qk_rope / 4u)) * 4u;
-            float4 value = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (row < nrows) {
-                const uint32_t logical = tile + row;
-                const uint32_t slot = window ? logical % cache_cap : logical;
-                const __nv_bfloat16 *src =
-                    k_pe_cache + (uint64_t)slot * qk_rope + dim;
-                value = motif3_load_bf16x4(src);
-            }
-            *(float4 *)&k_pe_sm[row][dim] = value;
-        }
-        __syncthreads();
+        const uint32_t next = tile + M3_ATTN_HG_ROWS;
+        const uint32_t nrows_n =
+            next < hi ? min((uint32_t)M3_ATTN_HG_ROWS, hi - next) : 0u;
+        const uint32_t nbuf = buf ^ 1u;
+        if (nrows_n)
+            motif3_hg_issue_tile_async(lat_bf[nbuf], kpe_bf[nbuf],
+                                       latent_cache, k_pe_cache, next, nrows_n,
+                                       tid, cache_cap, window);
 
         float score0[M3_ATTN_HG_ROWS], score1[M3_ATTN_HG_ROWS];
 #pragma unroll
@@ -34466,12 +34493,13 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
             float dot0 = 0.0f, dot1 = 0.0f;
 #pragma unroll
             for (uint32_t k = 0; k < 16u; k++) {
-                const float kv = latent_sm[row][lane + 32u * k];
+                const float kv =
+                    __bfloat162float(lat_bf[buf][row][lane + 32u * k]);
                 dot0 = __fmaf_rn(q_latent0[k], kv, dot0);
                 dot1 = __fmaf_rn(q_latent1[k], kv, dot1);
             }
-            const float kp0 = k_pe_sm[row][lane];
-            const float kp1 = k_pe_sm[row][lane + 32u];
+            const float kp0 = __bfloat162float(kpe_bf[buf][row][lane]);
+            const float kp1 = __bfloat162float(kpe_bf[buf][row][lane + 32u]);
             dot0 = __fmaf_rn(q_rope00, kp0, dot0);
             dot0 = __fmaf_rn(q_rope01, kp1, dot0);
             dot1 = __fmaf_rn(q_rope10, kp0, dot1);
@@ -34516,25 +34544,24 @@ __global__ static void motif3_latent_attention_bf16_decode_hg_partial_kernel(
         }
         __syncthreads();
 
-        float value0[M3_ATTN_HG_ROWS], value1[M3_ATTN_HG_ROWS];
-#pragma unroll
-        for (uint32_t row = 0; row < M3_ATTN_HG_ROWS; row++) {
-            value0[row] = latent_sm[row][d0];
-            value1[row] = latent_sm[row][d1];
-        }
 #pragma unroll
         for (uint32_t h = 0; h < M3_ATTN_HG_HEADS; h++) {
             float a0 = out0[h] * f_sm[h];
             float a1 = out1[h] * f_sm[h];
 #pragma unroll
             for (uint32_t row = 0; row < M3_ATTN_HG_ROWS; row++) {
-                a0 = __fmaf_rn(prob_sm[h][row], value0[row], a0);
-                a1 = __fmaf_rn(prob_sm[h][row], value1[row], a1);
+                a0 = __fmaf_rn(prob_sm[h][row],
+                               __bfloat162float(lat_bf[buf][row][d0]), a0);
+                a1 = __fmaf_rn(prob_sm[h][row],
+                               __bfloat162float(lat_bf[buf][row][d1]), a1);
             }
             out0[h] = a0;
             out1[h] = a1;
         }
+        if (nrows_n)
+            tt_cp_async_wait_group<0>();
         __syncthreads();
+        buf = nbuf;
     }
 
 #pragma unroll

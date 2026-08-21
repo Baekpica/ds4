@@ -165,6 +165,70 @@ got 0`으로 실패 — 블록 전역 `(d0,d1)` 매핑에서 워프-로컬 쓰�
 HG16 점유율/레지스터 변형은 해소 가능 병목이 아니다. 다음 사이클은
 사이클 3 바이너리로 **재-nsys** 한 뒤 새 1위를 고른다.
 
+### §A.9 재-nsys 32K gen128 (사이클 3 바이너리, 2026-08-21 12:37)
+
+Owner IPC, `ds4-bench` HEAD `a530fd6` (커널은 91823ca와 동일).
+CSV: prefill 521.43 tok/s, decode 12.71 tok/s (128 tok) — 사이클 3
+밴드 재현. 산출: `scratch/motif3-opt-v062/nsys/v062-c3-32k-gen128.*`.
+
+전체 76 s(prefill 지배): fattn_hmma 18.4%, q8 pair batch 12.4%,
+gateup_iq2_d2r 9.6%, f32_to_bf16 5.5% (43,884회), down_q2k_d2r 5.4%.
+
+**Decode 창** (첫 HG launch → 끝, GPU 커널 9.558 s, 128 tok ≈ 74.7
+ms/token; 사이클 전 103.5 ms에서 하락):
+
+| % | kernel | 비고 |
+|---:|---|---|
+| 25.2 | `q8_0_aligned_dense_vec` | 34,300회, ~268/token. 절대속도 1위. 깊이 무관. aligned N=1 경로, 과거 roofline 근접 |
+| 22.5 | HG16 `hg_partial` | 1,792회 = 14 full × 128. **남은 깊이 비례항**. 사이클 4 점유율 변형은 닫힘 |
+| 10.8+5.7 | D2R MoE gateup+down | 사이클 3 반영 후. 구 22.5% classic MMQ에서 하락 |
+| 5.5 | rms_norm_weight | 20,350회 |
+| 4.4 | qk_absorb group5 | |
+| 4.3 | q8 pair aligned | |
+| 4.2 | `motif3_latent_attention_bf16` (비-HG) | 4,992회 = 39 SWA × 128. window=129라 HG 게이트(≥1024) 밖 |
+
+사이클 5 후보 우선순위: (1) dense vec — 마이크로벤치 ncu만, owner
+down, (2) HG L1TEX coalescing (점유율 말고 접근 패턴), (3) prefill
+fattn/q8-pair. 풀모델 ncu 금지.
+
+### §A.10 사이클 5 — HG16 cp.async BF16 더블버퍼 (반영)
+
+Q8 dense vec occupancy 변형은 Motif 형상 마이크로벤치에서 닫힘
+(`scratch/motif3-opt-v062/logs/q8-dense-motif.txt`): 큰 GEMV는 이미
+253–270 GB/s, 2-row/2-warp는 손해. shexp down `K=1280`은 aligned
+계약(`K % 1024 == 0`) 밖.
+
+ncu L1TEX scoreboard 33.8%를 숨기기 위해 HG16 KV 타일을 BF16
+공유메모리에 두고 다음 타일을 compute 중 `cp.async` (기존
+`tt_cp_async_*` 재사용). 점유율은 ~38 KiB로 2 CTA/SM 유지.
+합성 80-head (`bench-hg-l1tex.cu`):
+
+| ctx | shipped | db_bf16 | Δ | rms |
+|---:|---:|---:|---:|---:|
+| 8K | 0.281 ms | 0.268 ms | +4.7% | 0 |
+| 32K | 1.119 ms | 1.038 ms | +7.8% | 0 |
+| 256K | 8.513 ms | 7.135 ms | **+19.3%** | 0 |
+
+full-model A/B (owner 동일, 사이클 3 대비):
+
+| cell | c3 | c5 | Δ |
+|---|---:|---:|---:|
+| 8K decode | 15.10 | **15.21** | +0.7% |
+| 32K decode | 12.73 | **13.02** | +2.3% |
+| 8K prefill | 621.7 | 616–622 | 불변 |
+
+e2e가 커널 Δ보다 작은 이유: HG는 decode의 22.5%. 32K에서
+0.225 × 7.8% ≈ 1.8%와 측정 +2.3%가 맞는다. 256K에선 깊이 비례항이
+커져 커널 +19%가 더 많이 드러난다.
+
+정합성: Motif CUDA fixture 통과, 32K 센티널 **ALL-EXACT** (HTTP
+prefill 519.4 / decode 12.7). CSV:
+`scratch/motif3-opt-v062/logs/l1tex-*.csv`.
+
+시작점(v0.6.2-dfm merge) 대비 누적: 8K prefill +19%, 32K prefill
++18%, 8K decode **+20.5%** (12.62→15.21), 32K decode **+34.5%**
+(9.68→13.02).
+
 상태: **Entrpi `v0.5.6.3` 위의 통합 worktree에서 DeepSeek, Solar Open2,
 K-EXAONE, Motif-3를 같은 `ds4-server -m <GGUF>` 형태로 실모델 로드했다.
 Solar와 K-EXAONE은 2-bank continuous 요청, DeepSeek은 DSpark 자동 부착,
