@@ -119,7 +119,8 @@ int main(int argc, char **argv) {
     ds4_solar_gpu_graph graph;
     int failed = 0;
 
-    if (!solar_graph_alloc(&graph, &model, &weights, ctx, n_tokens)) {
+    if (!solar_graph_alloc(&graph, &model, &weights, DS4_BACKEND_CUDA,
+                           ctx, n_tokens)) {
         fprintf(stderr, "Solar graph allocation failed\n");
         failed = 1;
         goto cleanup;
@@ -136,7 +137,8 @@ int main(int argc, char **argv) {
     solar_graph_free(&graph);
 
     if (!failed &&
-        !solar_graph_alloc(&graph, &model, &weights, ctx, n_tokens)) {
+        !solar_graph_alloc(&graph, &model, &weights, DS4_BACKEND_CUDA,
+                           ctx, n_tokens)) {
         fprintf(stderr, "Solar decode graph allocation failed\n");
         failed = 1;
     }

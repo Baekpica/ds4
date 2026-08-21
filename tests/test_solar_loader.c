@@ -7,6 +7,15 @@
  */
 #include "../ds4.c"
 
+/* This standalone shape links ds4.c without the CUDA objects and relies on
+ * --gc-sections.  ds4_context_memory_estimate stays reachable because the
+ * sizing assertions below call it, and since v0.6.2 (MT-5) its DeepSeek
+ * branch reads the packed-KV runtime flags from ds4_cuda.cu.  The Solar
+ * family branch this test exercises returns before those reads, so the
+ * definitions only need to exist for the linker, not to be correct. */
+int ds4_cuda_fp8_kv_enabled(void) { return 1; }
+int ds4_cuda_fp4_index_enabled(void) { return 1; }
+
 typedef struct {
     int sync_ok;
     int sync_calls;

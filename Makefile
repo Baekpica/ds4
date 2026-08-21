@@ -390,7 +390,10 @@ tests/test_model_family_kernels: tests/test_model_family_kernels.o ds4.o ds4_dis
 test-model-family-kernels: tests/test_model_family_kernels
 	./tests/test_model_family_kernels
 
-tests/test_solar_forward: tests/test_solar_forward.o ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+# The test includes ds4.c directly for its static graph seams, so it must
+# not also link ds4.o (duplicate externs); ds4_cuda.o resolves against the
+# test object's own copy.
+tests/test_solar_forward: tests/test_solar_forward.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-solar-forward: tests/test_solar_forward
