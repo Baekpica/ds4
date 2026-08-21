@@ -46649,6 +46649,10 @@ static int solar_batch_ctx_create_impl(
                                    sizeof(*ctx->bank_hist_valid));
     ctx->bank_gen = xmalloc(ctx->max_seq * sizeof(*ctx->bank_gen));
     for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b] = 1u;
+    /* v0.6.2 Inc 3: recency starts at 0 = never used.  The family lanes
+     * share bank_hist_reset/touch with the upstream cont core, so the
+     * recency array must exist wherever those helpers can run. */
+    ctx->bank_last_use = xcalloc(ctx->max_seq, sizeof(*ctx->bank_last_use));
     ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
     *out = ctx;
     return 0;
@@ -46755,6 +46759,8 @@ static int exaone_batch_ctx_create_impl(
         ctx->max_seq, sizeof(*ctx->bank_hist_valid));
     ctx->bank_gen = xmalloc(ctx->max_seq * sizeof(*ctx->bank_gen));
     for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b] = 1u;
+    /* v0.6.2 Inc 3 recency array; see the Solar create note. */
+    ctx->bank_last_use = xcalloc(ctx->max_seq, sizeof(*ctx->bank_last_use));
     ctx->supports_partial_reuse = false;
     ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
     *out = ctx;
@@ -46808,6 +46814,8 @@ static int motif3_batch_ctx_create_impl(
         ctx->max_seq, sizeof(*ctx->bank_hist_valid));
     ctx->bank_gen = xmalloc(ctx->max_seq * sizeof(*ctx->bank_gen));
     for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b] = 1u;
+    /* v0.6.2 Inc 3 recency array; see the Solar create note. */
+    ctx->bank_last_use = xcalloc(ctx->max_seq, sizeof(*ctx->bank_last_use));
     ctx->supports_partial_reuse = false;
     ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
     *out = ctx;
@@ -47449,6 +47457,7 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
         free(ctx->bank_hist_len);
         free(ctx->bank_hist_valid);
         free(ctx->bank_gen);
+        free(ctx->bank_last_use);
         free(ctx);
         return;
     }
@@ -47458,6 +47467,7 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
         free(ctx->bank_hist_len);
         free(ctx->bank_hist_valid);
         free(ctx->bank_gen);
+        free(ctx->bank_last_use);
         free(ctx);
         return;
     }
@@ -47467,6 +47477,7 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
         free(ctx->bank_hist_len);
         free(ctx->bank_hist_valid);
         free(ctx->bank_gen);
+        free(ctx->bank_last_use);
         free(ctx);
         return;
     }
