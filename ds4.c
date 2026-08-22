@@ -36130,6 +36130,36 @@ static uint64_t motif3_graph_cache_bytes(uint32_t ctx_cap,
     return total;
 }
 
+/* Exact bytes requested by motif3_graph_alloc + its latent-cache allocator. */
+static uint64_t motif3_graph_memory_estimate(uint32_t ctx_cap) {
+    if (ctx_cap == 0u || ctx_cap > 262144u) return 0u;
+    const uint32_t cap = motif3_graph_prefill_cap_for_context(ctx_cap);
+    const uint64_t cache = motif3_graph_cache_bytes(ctx_cap, cap);
+    if (cache == 0u) return 0u;
+
+    const uint64_t row_f32 =
+        3u * DS4_N_HC * DS4_N_EMBD +
+        4u * DS4_N_HC + 2u * DS4_N_HC * DS4_N_HC +
+        9u * DS4_N_EMBD + 2u * DS4_N_LORA_Q +
+        2u * DS4_N_HEAD * DS4_N_HEAD_DIM +
+        2u * (DS4_N_HEAD - DS4_N_NOISE_HEAD) * DS4_N_VALUE_DIM +
+        3u * DS4_N_KV_LORA + DS4_N_ROT +
+        DS4_N_HEAD_KV * (DS4_N_HEAD_DIM - DS4_N_ROT + DS4_N_VALUE_DIM) +
+        2u * DS4_N_HEAD * DS4_N_KV_LORA +
+        DS4_N_HEAD_KV * (DS4_N_HEAD_DIM + DS4_N_VALUE_DIM) +
+        (DS4_N_HEAD - DS4_N_NOISE_HEAD) +
+        2u * DS4_N_HEAD * DS4_N_VALUE_DIM + 2u * DS4_N_HEAD +
+        3u * DS4_N_FF_DENSE + 3u * DS4_N_FF_EXP +
+        2u * DS4_N_EXPERT + DS4_N_EXPERT_USED +
+        3u * DS4_N_EXPERT_USED * DS4_N_FF_EXP +
+        DS4_N_EXPERT_USED * DS4_N_EMBD;
+    const uint64_t row_i32 = 2u + DS4_N_EXPERT_USED;
+    const uint64_t fixed_f32 = DS4_N_ROT + DS4_N_VOCAB;
+    return cache +
+        ((uint64_t)cap * row_f32 + fixed_f32) * sizeof(float) +
+        (uint64_t)cap * row_i32 * sizeof(int32_t);
+}
+
 static bool motif3_graph_alloc_latent_cache(
         ds4_motif3_gpu_graph *g, uint32_t ctx_cap) {
     if (!g || !g->ready || g->latent_cache_ready || ctx_cap == 0 ||
@@ -37101,6 +37131,47 @@ static DS4_MAYBE_UNUSED uint64_t dots3_graph_cache_bytes(
         }
     }
     return total;
+}
+
+/* Exact bytes requested by dots3_graph_alloc + its cache/norm allocator. */
+static uint64_t dots3_graph_memory_estimate(uint32_t ctx_cap) {
+    if (ctx_cap == 0u || ctx_cap > 524288u ||
+        DS4_N_LAYER < DS4_N_NEXTN_PREDICT) {
+        return 0u;
+    }
+    const uint32_t cap = dots3_graph_prefill_cap_for_context(ctx_cap);
+    const uint64_t cache = dots3_graph_cache_bytes(ctx_cap, cap);
+    if (cache == 0u) return 0u;
+
+    const uint64_t row_f32 =
+        6u * DS4_N_EMBD + DS4_N_LORA_Q +
+        DS4_N_HEAD * DS4_N_KEY_MLA +
+        2u * DS4_N_HEAD * DS4_N_KV_LORA +
+        2u * DS4_N_SWA_KV_LORA + 2u * DS4_N_ROT +
+        DS4_N_HEAD * DS4_N_VALUE_MLA + DS4_N_HEAD +
+        3u * DS4_N_FF_DENSE + 3u * DS4_N_FF_EXP +
+        DS4_N_EXPERT + DS4_N_EXPERT_USED +
+        3u * DS4_N_EXPERT_USED * DS4_N_FF_EXP +
+        DS4_N_EXPERT_USED * DS4_N_EMBD +
+        DS4_N_INDEXER_HEAD_DIM +
+        DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM +
+        DS4_N_INDEXER_HEAD;
+    const uint64_t row_i32 =
+        2u + DS4_N_EXPERT_USED + DS4_N_INDEXER_TOP_K;
+    const uint64_t fixed_f32 =
+        DS4_N_ROT + DS4_N_EMBD + DS4_N_VOCAB;
+    uint64_t norm_f32 = 0u;
+    const uint32_t n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t il = 0; il < n_exec; il++) {
+        norm_f32 += DS4_N_LORA_Q + ds4_dots3_layer_kv_lora(il) + DS4_N_ROT;
+        if (ds4_dots3_layer_is_full_attention(il))
+            norm_f32 += 2u * DS4_N_INDEXER_HEAD_DIM;
+    }
+    const uint32_t idx_sub = cap < 128u ? cap : 128u;
+    return cache +
+        ((uint64_t)cap * row_f32 + fixed_f32 + norm_f32 +
+         (uint64_t)idx_sub * ctx_cap) * sizeof(float) +
+        (uint64_t)cap * row_i32 * sizeof(int32_t);
 }
 
 static bool dots3_graph_alloc(ds4_dots3_gpu_graph *g, uint32_t cap) {
@@ -46051,6 +46122,16 @@ int ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
  * rows BOUNDED. */
 uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx) {
     if (!e || ctx <= 0) return 0;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2)
+        return solar_graph_context_memory_estimate(
+            e->backend, (uint32_t)ctx).total_bytes;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE)
+        return exaone_graph_context_memory_estimate(
+            (uint32_t)ctx, 0u).total_bytes;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3)
+        return motif3_graph_memory_estimate((uint32_t)ctx);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE)
+        return dots3_graph_memory_estimate((uint32_t)ctx);
     const uint32_t spc = metal_graph_prefill_cap_for_prompt(ctx);
     const uint32_t src = metal_graph_raw_cap_for_context(ctx, spc);
     return metal_graph_alloc_bytes_estimate(&e->weights, &e->weights.layer[0],

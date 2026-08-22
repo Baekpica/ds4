@@ -68,6 +68,32 @@ static void test_batch_memory_plan(void) {
            ok ? "ok" : "FAIL");
 }
 
+static void test_family_session_graph_memory_plan(void) {
+    const ds4_shape saved = g_ds4_shape;
+    const struct {
+        ds4_shape shape;
+        int ctx;
+    } cases[] = {
+        {DS4_SHAPE_SOLAR_OPEN2_250B, 196608},
+        {DS4_SHAPE_KEXAONE_236B, 262144},
+        {DS4_SHAPE_MOTIF3, 262144},
+        {DS4_SHAPE_DOTS3_NOTE_PREV, 524288},
+    };
+    ds4_engine engine = {.backend = DS4_BACKEND_CUDA};
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        g_ds4_shape = cases[i].shape;
+        const uint64_t bytes =
+            ds4_engine_session_graph_bytes_estimate(&engine, cases[i].ctx);
+        const int ok = bytes != 0u;
+        if (!ok) g_fail++;
+        printf("%-38s %-22s %.2f GiB  %s\n",
+               "family session graph plan", DS4_MODEL_SHAPE_NAME,
+               (double)bytes / 1073741824.0, ok ? "ok" : "FAIL");
+    }
+    g_ds4_shape = saved;
+}
+
 static void test_exaone_rewind_span(void) {
     ds4_engine engine = {0};
     ds4_session session = {0};
@@ -767,6 +793,7 @@ static void test_moe_matmul(const ds4_model *m, const ds4_weights *wts) {
 int main(int argc, char **argv) {
     test_context_memory_plan();
     test_batch_memory_plan();
+    test_family_session_graph_memory_plan();
     test_exaone_rewind_span();
     if (!ds4_gpu_init()) { fprintf(stderr, "ds4_gpu_init failed\n"); return 1; }
     test_shared_prefill_workspace();
