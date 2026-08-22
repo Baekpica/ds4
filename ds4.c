@@ -37686,6 +37686,56 @@ static bool dots3_graph_forward_chunk(
 
 enum { DS4_MOTIF3_DECODE_BATCH_MAX = DS4_MULTISEQ_MAX_SEQ };
 
+/* Shared partial-prefix checkpoint bookkeeping (Solar + Motif-3).  A slot is
+ * an immutable snapshot of the non-rewindable part of one bank's state at a
+ * committed position: Solar's KDA recurrent+conv state, Motif-3's SWA window
+ * rows.  Banks hold reference bits instead of copies, so exact forks inherit
+ * snapshots for free and a slot's pages become reclaimable exactly when the
+ * last referencing lineage dies. */
+enum {
+    DS4_PARTIAL_CHECKPOINT_SLOTS = 32,
+    DS4_PARTIAL_PERIODIC_TARGET = 24,
+};
+
+typedef struct {
+    uint64_t bank_refs[2];
+    uint64_t last_use;
+    uint32_t pos;
+    uint8_t logits_valid;
+} ds4_partial_checkpoint;
+
+static bool partial_checkpoint_ref(const ds4_partial_checkpoint *cp,
+                                   uint32_t bank) {
+    return cp && bank < DS4_MULTISEQ_MAX_SEQ &&
+           (cp->bank_refs[bank >> 6u] & (1ull << (bank & 63u))) != 0u;
+}
+
+static void partial_checkpoint_set_ref(ds4_partial_checkpoint *cp,
+                                       uint32_t bank) {
+    cp->bank_refs[bank >> 6u] |= 1ull << (bank & 63u);
+}
+
+static void partial_checkpoint_clear_ref(ds4_partial_checkpoint *cp,
+                                         uint32_t bank) {
+    cp->bank_refs[bank >> 6u] &= ~(1ull << (bank & 63u));
+    if (cp->bank_refs[0] == 0u && cp->bank_refs[1] == 0u) {
+        cp->pos = 0u;
+        cp->logits_valid = 0u;
+    }
+}
+
+static uint64_t ds4_mem_usable_beyond(uint64_t reserve);
+
+/* Unmapped remainder of a demand-mapped span: what a capture would still
+ * have to page in.  Zero means the span is already resident. */
+static uint64_t batch_span_need(const ds4_gpu_tensor *tensor,
+                                uint64_t offset, uint64_t bytes) {
+    if (!tensor || bytes == 0u) return 0u;
+    const uint64_t resident =
+        ds4_gpu_tensor_resident(tensor, offset, bytes);
+    return resident < bytes ? bytes - resident : 0u;
+}
+
 typedef struct ds4_motif3_batch_runtime {
     uint32_t max_seq;
     uint32_t ctx_size;
@@ -37702,10 +37752,283 @@ typedef struct ds4_motif3_batch_runtime {
     float *bank_logits;
     uint8_t *bank_logits_valid;
     uint8_t *bank_hidden_valid;
+
+    /* Partial-prefix reuse.  Motif-3 keeps positional latent KV everywhere,
+     * so full-attention layers rewind by copying rows [0,pos) straight from
+     * the source bank; the ONLY non-rewindable state is each SWA layer's
+     * 128-row window, whose ring slots are overwritten as the frontier
+     * advances.  A checkpoint therefore stores just the window rows of every
+     * SWA layer at a committed position (~5.5 MiB vs Solar's 157.5 MiB KDA
+     * state).  The VMM slab maps slots only as they are captured; the MTP
+     * block is excluded because the banked lane never advances it. */
+    ds4_gpu_tensor *checkpoint_slab;
+    ds4_partial_checkpoint checkpoint[DS4_PARTIAL_CHECKPOINT_SLOTS];
+    float *checkpoint_logits;
+    uint64_t checkpoint_clock;
+    uint64_t checkpoint_slot_bytes;
+    uint32_t checkpoint_stride;
 } ds4_motif3_batch_runtime;
 
 static size_t motif3_batch_cache_index(uint32_t bank, uint32_t il) {
     return (size_t)bank * (DS4_N_LAYER + 1u) + il;
+}
+
+/* One SWA layer's fixed checkpoint extent: the DS4_N_SWA window rows a resume
+ * needs, latent block first, then the RoPE k_pe block. */
+static uint64_t motif3_checkpoint_layer_bytes(void) {
+    return (uint64_t)DS4_N_SWA *
+           (DS4_N_KV_LORA + DS4_N_ROT) * sizeof(uint16_t);
+}
+
+static void motif3_batch_runtime_drop_checkpoints(
+        ds4_motif3_batch_runtime *rt, uint32_t bank) {
+    if (!rt || bank >= rt->max_seq) return;
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        if (partial_checkpoint_ref(&rt->checkpoint[i], bank))
+            partial_checkpoint_clear_ref(&rt->checkpoint[i], bank);
+    }
+}
+
+static void motif3_batch_runtime_inherit_checkpoints(
+        ds4_motif3_batch_runtime *rt, uint32_t src, uint32_t dst,
+        uint32_t cut) {
+    if (!rt || src >= rt->max_seq || dst >= rt->max_seq) return;
+    if (src == dst) {
+        for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+            ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+            if (partial_checkpoint_ref(cp, dst) && cp->pos > cut)
+                partial_checkpoint_clear_ref(cp, dst);
+        }
+        return;
+    }
+    motif3_batch_runtime_drop_checkpoints(rt, dst);
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos != 0u && cp->pos <= cut &&
+            partial_checkpoint_ref(cp, src)) {
+            partial_checkpoint_set_ref(cp, dst);
+        }
+    }
+}
+
+static int motif3_batch_runtime_find_checkpoint(
+        ds4_motif3_batch_runtime *rt, uint32_t bank, uint32_t cut,
+        uint32_t request_len) {
+    int best = -1;
+    uint32_t best_pos = 0u;
+    if (!rt || bank >= rt->max_seq) return -1;
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos == 0u || cp->pos > cut || cp->pos < best_pos ||
+            !partial_checkpoint_ref(cp, bank) ||
+            (cp->pos == request_len && !cp->logits_valid)) {
+            continue;
+        }
+        best = (int)i;
+        best_pos = cp->pos;
+    }
+    return best;
+}
+
+/* Move one SWA layer's window rows between a bank's ring cache and a
+ * checkpoint slot.  The ring places logical position p at slot p % cap, so
+ * the h = min(pos, DS4_N_SWA) rows before pos occupy at most two contiguous
+ * slot segments; the checkpoint stores them compactly in logical order.
+ * At capture time the bank frontier IS pos, so every window row is still
+ * resident (h <= window < cap by construction of the layer cache). */
+static bool motif3_checkpoint_window_copy(
+        ds4_motif3_batch_runtime *rt, uint32_t bank, uint32_t il,
+        uint64_t slot_off, uint32_t pos, bool to_slab) {
+    const uint32_t cap = motif3_graph_layer_cache_cap(
+        rt->ctx_size, rt->prefill_cap, il);
+    const uint32_t h = pos < DS4_N_SWA ? pos : DS4_N_SWA;
+    if (cap == 0u || h == 0u) return h == 0u;
+    const size_t ci = motif3_batch_cache_index(bank, il);
+    const uint64_t latent_row = (uint64_t)DS4_N_KV_LORA * sizeof(uint16_t);
+    const uint64_t k_pe_row = (uint64_t)DS4_N_ROT * sizeof(uint16_t);
+    const uint64_t k_pe_base = slot_off + (uint64_t)DS4_N_SWA * latent_row;
+    uint32_t logical = pos - h;
+    uint64_t stored = 0u;
+    while (stored < h) {
+        const uint32_t slot0 = logical % cap;
+        uint32_t rows = h - (uint32_t)stored;
+        if (slot0 + rows > cap) rows = cap - slot0;
+        const uint64_t slab_latent = slot_off + stored * latent_row;
+        const uint64_t slab_k_pe = k_pe_base + stored * k_pe_row;
+        const uint64_t ring_latent = (uint64_t)slot0 * latent_row;
+        const uint64_t ring_k_pe = (uint64_t)slot0 * k_pe_row;
+        const bool ok = to_slab
+            ? ds4_gpu_tensor_copy(
+                  rt->checkpoint_slab, slab_latent,
+                  rt->kv_latent[ci], ring_latent,
+                  (uint64_t)rows * latent_row) != 0 &&
+              ds4_gpu_tensor_copy(
+                  rt->checkpoint_slab, slab_k_pe,
+                  rt->k_pe[ci], ring_k_pe,
+                  (uint64_t)rows * k_pe_row) != 0
+            : ds4_gpu_tensor_copy(
+                  rt->kv_latent[ci], ring_latent,
+                  rt->checkpoint_slab, slab_latent,
+                  (uint64_t)rows * latent_row) != 0 &&
+              ds4_gpu_tensor_copy(
+                  rt->k_pe[ci], ring_k_pe,
+                  rt->checkpoint_slab, slab_k_pe,
+                  (uint64_t)rows * k_pe_row) != 0;
+        if (!ok) return false;
+        logical += rows;
+        stored += rows;
+    }
+    return true;
+}
+
+static bool motif3_batch_runtime_capture_checkpoint(
+        ds4_motif3_batch_runtime *rt, uint32_t bank, uint32_t pos,
+        bool logits_valid, uint64_t reserve) {
+    if (!rt || !rt->checkpoint_slab || !rt->checkpoint_logits ||
+        bank >= rt->max_seq || pos == 0u) {
+        return false;
+    }
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos != pos || !partial_checkpoint_ref(cp, bank)) continue;
+        if (logits_valid && rt->bank_logits_valid[bank] &&
+            !cp->logits_valid) {
+            memcpy(rt->checkpoint_logits + (size_t)i * DS4_N_VOCAB,
+                   rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+            cp->logits_valid = 1u;
+        }
+        cp->last_use = ++rt->checkpoint_clock;
+        return true;
+    }
+
+    uint32_t slot = DS4_PARTIAL_CHECKPOINT_SLOTS;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        const ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos == 0u) {
+            slot = i;
+            break;
+        }
+        if (cp->last_use < oldest) {
+            oldest = cp->last_use;
+            slot = i;
+        }
+    }
+    if (slot >= DS4_PARTIAL_CHECKPOINT_SLOTS) return false;
+    const uint64_t off = (uint64_t)slot * rt->checkpoint_slot_bytes;
+    const uint64_t need = batch_span_need(
+        rt->checkpoint_slab, off, rt->checkpoint_slot_bytes);
+    const uint64_t usable = ds4_mem_usable_beyond(reserve);
+    if (need != 0u && usable != UINT64_MAX && need > usable) return false;
+    if (ds4_gpu_tensor_ensure(
+            rt->checkpoint_slab, off, rt->checkpoint_slot_bytes) == 0) {
+        return false;
+    }
+    uint64_t layer_off = off;
+    const uint64_t layer_bytes = motif3_checkpoint_layer_bytes();
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_motif3_layer_is_full_attention(il)) continue;
+        if (!motif3_checkpoint_window_copy(
+                rt, bank, il, layer_off, pos, true)) {
+            return false;
+        }
+        layer_off += layer_bytes;
+    }
+
+    ds4_partial_checkpoint *cp = &rt->checkpoint[slot];
+    memset(cp, 0, sizeof(*cp));
+    cp->pos = pos;
+    cp->last_use = ++rt->checkpoint_clock;
+    partial_checkpoint_set_ref(cp, bank);
+    if (logits_valid && rt->bank_logits_valid[bank]) {
+        memcpy(rt->checkpoint_logits + (size_t)slot * DS4_N_VOCAB,
+               rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        cp->logits_valid = 1u;
+    }
+    return true;
+}
+
+static bool motif3_batch_runtime_checkpoint_due(
+        const ds4_motif3_batch_runtime *rt, uint32_t before,
+        uint32_t after) {
+    return rt && rt->checkpoint_stride != 0u && after > before &&
+           before / rt->checkpoint_stride != after / rt->checkpoint_stride;
+}
+
+static bool motif3_batch_runtime_restore_checkpoint(
+        ds4_motif3_batch_runtime *rt, uint32_t src, uint32_t dst,
+        uint32_t slot, uint32_t cut, uint32_t *pos_out) {
+    if (!rt || src >= rt->max_seq || dst >= rt->max_seq ||
+        slot >= DS4_PARTIAL_CHECKPOINT_SLOTS) {
+        return false;
+    }
+    ds4_partial_checkpoint *cp = &rt->checkpoint[slot];
+    const uint32_t pos = cp->pos;
+    if (pos == 0u || pos > cut || !partial_checkpoint_ref(cp, src)) {
+        return false;
+    }
+    uint64_t layer_off = (uint64_t)slot * rt->checkpoint_slot_bytes;
+    const uint64_t layer_bytes = motif3_checkpoint_layer_bytes();
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_motif3_layer_is_full_attention(il)) continue;
+        if (!motif3_checkpoint_window_copy(
+                rt, dst, il, layer_off, pos, false)) {
+            return false;
+        }
+        layer_off += layer_bytes;
+    }
+    if (src != dst) {
+        /* Full-attention layers keep their whole history in the source
+         * bank; the shared prefix below the checkpoint copies directly. */
+        const uint64_t latent_bytes =
+            (uint64_t)pos * DS4_N_KV_LORA * sizeof(uint16_t);
+        const uint64_t k_pe_bytes =
+            (uint64_t)pos * DS4_N_ROT * sizeof(uint16_t);
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (!ds4_motif3_layer_is_full_attention(il)) continue;
+            const size_t si = motif3_batch_cache_index(src, il);
+            const size_t di = motif3_batch_cache_index(dst, il);
+            if (ds4_gpu_tensor_copy(
+                    rt->kv_latent[di], 0, rt->kv_latent[si], 0,
+                    latent_bytes) == 0 ||
+                ds4_gpu_tensor_copy(
+                    rt->k_pe[di], 0, rt->k_pe[si], 0,
+                    k_pe_bytes) == 0) {
+                return false;
+            }
+        }
+    }
+    if (ds4_gpu_synchronize() == 0) return false;
+    rt->cache_len[dst] = pos;
+    rt->mtp_cache_len[dst] = 0u;
+    rt->bank_hidden_valid[dst] = 0u;
+    if (cp->logits_valid) {
+        memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
+               rt->checkpoint_logits + (size_t)slot * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->bank_logits_valid[dst] = 1u;
+    } else {
+        rt->bank_logits_valid[dst] = 0u;
+    }
+    cp->last_use = ++rt->checkpoint_clock;
+    motif3_batch_runtime_inherit_checkpoints(rt, src, dst, cut);
+    if (pos_out) *pos_out = pos;
+    return true;
+}
+
+static uint64_t motif3_batch_runtime_trim_unused_checkpoints(
+        ds4_motif3_batch_runtime *rt) {
+    if (!rt || !rt->checkpoint_slab) return 0u;
+    uint64_t freed = 0u;
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        if (rt->checkpoint[i].pos != 0u) continue;
+        freed += ds4_gpu_tensor_trim(
+            rt->checkpoint_slab, (uint64_t)i * rt->checkpoint_slot_bytes,
+            rt->checkpoint_slot_bytes);
+    }
+    return freed;
 }
 
 static void motif3_batch_runtime_free(ds4_motif3_batch_runtime *rt) {
@@ -37726,6 +38049,8 @@ static void motif3_batch_runtime_free(ds4_motif3_batch_runtime *rt) {
     free(rt->mtp_cache_len);
     ds4_gpu_tensor_free(rt->decode_logits);
     ds4_gpu_tensor_free(rt->bank_hidden);
+    ds4_gpu_tensor_free(rt->checkpoint_slab);
+    free(rt->checkpoint_logits);
     free(rt->decode_logits_host);
     free(rt->bank_logits);
     free(rt->bank_logits_valid);
@@ -37755,6 +38080,7 @@ static bool motif3_batch_runtime_bind(ds4_motif3_batch_runtime *rt,
 static void motif3_batch_runtime_reset_bank(
         ds4_motif3_batch_runtime *rt, uint32_t bank) {
     if (!rt || bank >= rt->max_seq) return;
+    motif3_batch_runtime_drop_checkpoints(rt, bank);
     rt->cache_len[bank] = 0u;
     rt->mtp_cache_len[bank] = 0u;
     rt->bank_logits_valid[bank] = 0u;
@@ -37807,6 +38133,7 @@ static bool motif3_batch_runtime_copy_bank(
     } else {
         rt->bank_logits_valid[dst] = 0u;
     }
+    motif3_batch_runtime_inherit_checkpoints(rt, src, dst, UINT32_MAX);
     return true;
 }
 
@@ -43659,20 +43986,6 @@ int ds4_engine_batched_generate(
 }
 
 #ifndef DS4_NO_GPU
-enum {
-    SOLAR_PARTIAL_CHECKPOINT_SLOTS = 32,
-    SOLAR_PARTIAL_PERIODIC_TARGET = 24,
-};
-
-typedef struct {
-    uint64_t bank_refs[2];
-    uint64_t last_use;
-    uint32_t pos;
-    uint8_t logits_valid;
-} ds4_solar_checkpoint;
-
-static uint64_t ds4_mem_usable_beyond(uint64_t reserve);
-
 /* Solar's continuous lane reuses one plain-residual compute graph while the
  * mutable model state lives in independent banks.  The graph only borrows the
  * currently selected bank's tensor views; the runtime owns every view/slab and
@@ -43710,7 +44023,7 @@ typedef struct ds4_solar_batch_runtime {
      * 157.5 MiB recurrent state; each bank's existing GQA rows remain the
      * prefix source.  The VMM slab maps slots only as they are captured. */
     ds4_gpu_tensor *checkpoint_slab;
-    ds4_solar_checkpoint checkpoint[SOLAR_PARTIAL_CHECKPOINT_SLOTS];
+    ds4_partial_checkpoint checkpoint[DS4_PARTIAL_CHECKPOINT_SLOTS];
     float *checkpoint_logits;
     uint64_t checkpoint_clock;
     uint32_t checkpoint_stride;
@@ -43818,35 +44131,12 @@ static bool solar_batch_runtime_ensure_kv(ds4_solar_batch_runtime *rt,
     return true;
 }
 
-static uint64_t solar_batch_span_need(const ds4_gpu_tensor *tensor,
-                                      uint64_t offset, uint64_t bytes);
-
-static bool solar_checkpoint_ref(const ds4_solar_checkpoint *cp,
-                                 uint32_t bank) {
-    return cp && bank < DS4_MULTISEQ_MAX_SEQ &&
-           (cp->bank_refs[bank >> 6u] & (1ull << (bank & 63u))) != 0u;
-}
-
-static void solar_checkpoint_set_ref(ds4_solar_checkpoint *cp,
-                                     uint32_t bank) {
-    cp->bank_refs[bank >> 6u] |= 1ull << (bank & 63u);
-}
-
-static void solar_checkpoint_clear_ref(ds4_solar_checkpoint *cp,
-                                       uint32_t bank) {
-    cp->bank_refs[bank >> 6u] &= ~(1ull << (bank & 63u));
-    if (cp->bank_refs[0] == 0u && cp->bank_refs[1] == 0u) {
-        cp->pos = 0u;
-        cp->logits_valid = 0u;
-    }
-}
-
 static void solar_batch_runtime_drop_checkpoints(
         ds4_solar_batch_runtime *rt, uint32_t bank) {
     if (!rt || bank >= rt->max_seq) return;
-    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
-        if (solar_checkpoint_ref(&rt->checkpoint[i], bank))
-            solar_checkpoint_clear_ref(&rt->checkpoint[i], bank);
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        if (partial_checkpoint_ref(&rt->checkpoint[i], bank))
+            partial_checkpoint_clear_ref(&rt->checkpoint[i], bank);
     }
 }
 
@@ -43855,19 +44145,19 @@ static void solar_batch_runtime_inherit_checkpoints(
         uint32_t cut) {
     if (!rt || src >= rt->max_seq || dst >= rt->max_seq) return;
     if (src == dst) {
-        for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
-            ds4_solar_checkpoint *cp = &rt->checkpoint[i];
-            if (solar_checkpoint_ref(cp, dst) && cp->pos > cut)
-                solar_checkpoint_clear_ref(cp, dst);
+        for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+            ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+            if (partial_checkpoint_ref(cp, dst) && cp->pos > cut)
+                partial_checkpoint_clear_ref(cp, dst);
         }
         return;
     }
     solar_batch_runtime_drop_checkpoints(rt, dst);
-    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
-        ds4_solar_checkpoint *cp = &rt->checkpoint[i];
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_partial_checkpoint *cp = &rt->checkpoint[i];
         if (cp->pos != 0u && cp->pos <= cut &&
-            solar_checkpoint_ref(cp, src)) {
-            solar_checkpoint_set_ref(cp, dst);
+            partial_checkpoint_ref(cp, src)) {
+            partial_checkpoint_set_ref(cp, dst);
         }
     }
 }
@@ -43878,10 +44168,10 @@ static int solar_batch_runtime_find_checkpoint(
     int best = -1;
     uint32_t best_pos = 0u;
     if (!rt || bank >= rt->max_seq) return -1;
-    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
-        ds4_solar_checkpoint *cp = &rt->checkpoint[i];
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_partial_checkpoint *cp = &rt->checkpoint[i];
         if (cp->pos == 0u || cp->pos > cut || cp->pos < best_pos ||
-            !solar_checkpoint_ref(cp, bank) ||
+            !partial_checkpoint_ref(cp, bank) ||
             (cp->pos == request_len && !cp->logits_valid)) {
             continue;
         }
@@ -43898,9 +44188,9 @@ static bool solar_batch_runtime_capture_checkpoint(
         bank >= rt->max_seq || pos == 0u) {
         return false;
     }
-    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
-        ds4_solar_checkpoint *cp = &rt->checkpoint[i];
-        if (cp->pos != pos || !solar_checkpoint_ref(cp, bank)) continue;
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos != pos || !partial_checkpoint_ref(cp, bank)) continue;
         if (logits_valid && rt->bank_logits_valid[bank] &&
             !cp->logits_valid) {
             memcpy(rt->checkpoint_logits + (size_t)i * DS4_N_VOCAB,
@@ -43912,10 +44202,10 @@ static bool solar_batch_runtime_capture_checkpoint(
         return true;
     }
 
-    uint32_t slot = SOLAR_PARTIAL_CHECKPOINT_SLOTS;
+    uint32_t slot = DS4_PARTIAL_CHECKPOINT_SLOTS;
     uint64_t oldest = UINT64_MAX;
-    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
-        const ds4_solar_checkpoint *cp = &rt->checkpoint[i];
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        const ds4_partial_checkpoint *cp = &rt->checkpoint[i];
         if (cp->pos == 0u) {
             slot = i;
             break;
@@ -43925,9 +44215,9 @@ static bool solar_batch_runtime_capture_checkpoint(
             slot = i;
         }
     }
-    if (slot >= SOLAR_PARTIAL_CHECKPOINT_SLOTS) return false;
+    if (slot >= DS4_PARTIAL_CHECKPOINT_SLOTS) return false;
     const uint64_t off = (uint64_t)slot * rt->graph.state_bytes;
-    const uint64_t need = solar_batch_span_need(
+    const uint64_t need = batch_span_need(
         rt->checkpoint_slab, off, rt->graph.state_bytes);
     const uint64_t usable = ds4_mem_usable_beyond(reserve);
     if (need != 0u && usable != UINT64_MAX && need > usable) return false;
@@ -43940,11 +44230,11 @@ static bool solar_batch_runtime_capture_checkpoint(
         return false;
     }
 
-    ds4_solar_checkpoint *cp = &rt->checkpoint[slot];
+    ds4_partial_checkpoint *cp = &rt->checkpoint[slot];
     memset(cp, 0, sizeof(*cp));
     cp->pos = pos;
     cp->last_use = ++rt->checkpoint_clock;
-    solar_checkpoint_set_ref(cp, bank);
+    partial_checkpoint_set_ref(cp, bank);
     if (logits_valid && rt->bank_logits_valid[bank]) {
         memcpy(rt->checkpoint_logits + (size_t)slot * DS4_N_VOCAB,
                rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
@@ -43965,12 +44255,12 @@ static bool solar_batch_runtime_restore_checkpoint(
         ds4_solar_batch_runtime *rt, uint32_t src, uint32_t dst,
         uint32_t slot, uint32_t cut, uint32_t *pos_out) {
     if (!rt || src >= rt->max_seq || dst >= rt->max_seq ||
-        slot >= SOLAR_PARTIAL_CHECKPOINT_SLOTS) {
+        slot >= DS4_PARTIAL_CHECKPOINT_SLOTS) {
         return false;
     }
-    ds4_solar_checkpoint *cp = &rt->checkpoint[slot];
+    ds4_partial_checkpoint *cp = &rt->checkpoint[slot];
     const uint32_t pos = cp->pos;
-    if (pos == 0u || pos > cut || !solar_checkpoint_ref(cp, src) ||
+    if (pos == 0u || pos > cut || !partial_checkpoint_ref(cp, src) ||
         !solar_batch_runtime_ensure_state(rt, dst) ||
         !solar_batch_runtime_ensure_kv(rt, dst, pos) ||
         ds4_gpu_tensor_copy(
@@ -44012,21 +44302,13 @@ static uint64_t solar_batch_runtime_trim_unused_checkpoints(
         ds4_solar_batch_runtime *rt) {
     if (!rt || !rt->checkpoint_slab) return 0u;
     uint64_t freed = 0u;
-    for (uint32_t i = 0; i < SOLAR_PARTIAL_CHECKPOINT_SLOTS; i++) {
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
         if (rt->checkpoint[i].pos != 0u) continue;
         freed += ds4_gpu_tensor_trim(
             rt->checkpoint_slab, (uint64_t)i * rt->graph.state_bytes,
             rt->graph.state_bytes);
     }
     return freed;
-}
-
-static uint64_t solar_batch_span_need(const ds4_gpu_tensor *tensor,
-                                      uint64_t offset, uint64_t bytes) {
-    if (!tensor || bytes == 0u) return 0u;
-    const uint64_t resident =
-        ds4_gpu_tensor_resident(tensor, offset, bytes);
-    return resident < bytes ? bytes - resident : 0u;
 }
 
 static uint64_t solar_batch_runtime_bank_need(
@@ -44036,14 +44318,14 @@ static uint64_t solar_batch_runtime_bank_need(
         end_pos > rt->graph.base.ctx_size) {
         return UINT64_MAX;
     }
-    uint64_t need = solar_batch_span_need(
+    uint64_t need = batch_span_need(
         rt->state_slab, (uint64_t)bank * rt->graph.state_bytes,
         rt->graph.state_bytes);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!ds4_solar_layer_is_gqa(il)) continue;
         const uint64_t bytes =
             (uint64_t)end_pos * rt->graph.base.kv_row_bytes;
-        const uint64_t add = solar_batch_span_need(
+        const uint64_t add = batch_span_need(
             rt->kv_slab[il], (uint64_t)bank * rt->kv_bank_bytes[il],
             bytes);
         if (add > UINT64_MAX - need) return UINT64_MAX;
@@ -44389,17 +44671,17 @@ static ds4_solar_batch_runtime *solar_batch_runtime_create(
     const bool partial_enabled =
         !(partial_env && partial_env[0] == '0' && partial_env[1] == '\0');
     if (partial_enabled && rt->graph.state_bytes <=
-        UINT64_MAX / SOLAR_PARTIAL_CHECKPOINT_SLOTS) {
+        UINT64_MAX / DS4_PARTIAL_CHECKPOINT_SLOTS) {
         rt->checkpoint_slab = ds4_gpu_tensor_reserve(
-            rt->graph.state_bytes * SOLAR_PARTIAL_CHECKPOINT_SLOTS);
+            rt->graph.state_bytes * DS4_PARTIAL_CHECKPOINT_SLOTS);
     }
     if (rt->checkpoint_slab) {
         rt->checkpoint_logits = xcalloc(
-            (size_t)SOLAR_PARTIAL_CHECKPOINT_SLOTS * DS4_N_VOCAB,
+            (size_t)DS4_PARTIAL_CHECKPOINT_SLOTS * DS4_N_VOCAB,
             sizeof(*rt->checkpoint_logits));
         uint64_t stride = ((uint64_t)ctx_size +
-                           SOLAR_PARTIAL_PERIODIC_TARGET - 1u) /
-                          SOLAR_PARTIAL_PERIODIC_TARGET;
+                           DS4_PARTIAL_PERIODIC_TARGET - 1u) /
+                          DS4_PARTIAL_PERIODIC_TARGET;
         if (stride < 4096u) stride = 4096u;
         stride = (stride + 4095u) & ~4095ull;
         rt->checkpoint_stride = stride > UINT32_MAX
@@ -44499,7 +44781,7 @@ static ds4_solar_batch_runtime *solar_batch_runtime_create(
             "shared checkpoints stride=%u\n",
             max_seq, (double)rt->graph.state_bytes / 1048576.0,
             (double)rt->graph.base.kv_bytes / 1073741824.0,
-            rt->checkpoint_slab ? SOLAR_PARTIAL_CHECKPOINT_SLOTS : 0u,
+            rt->checkpoint_slab ? DS4_PARTIAL_CHECKPOINT_SLOTS : 0u,
             (double)rt->graph.state_bytes / 1048576.0,
             rt->checkpoint_stride);
     return rt;
@@ -45758,11 +46040,49 @@ static ds4_motif3_batch_runtime *motif3_batch_runtime_create(
         motif3_batch_runtime_free(rt);
         return NULL;
     }
+
+    /* Partial-prefix checkpoint pool: SWA window rows only (the rewindable
+     * full-attention prefix stays in the source bank), so a slot is small
+     * enough to reserve eagerly and map on demand.  Same policy knobs as
+     * Solar: DS4_SERVER_FORK_PARTIAL=0 skips even the VA reservation, and
+     * the periodic stride targets DS4_PARTIAL_PERIODIC_TARGET snapshots
+     * across the context in 4096-token-aligned steps. */
+    uint32_t swa_layers = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_motif3_layer_is_full_attention(il)) swa_layers++;
+    }
+    rt->checkpoint_slot_bytes = swa_layers * motif3_checkpoint_layer_bytes();
+    const char *partial_env = getenv("DS4_SERVER_FORK_PARTIAL");
+    const bool partial_enabled =
+        !(partial_env && partial_env[0] == '0' && partial_env[1] == '\0');
+    if (partial_enabled && rt->checkpoint_slot_bytes != 0u &&
+        rt->checkpoint_slot_bytes <=
+            UINT64_MAX / DS4_PARTIAL_CHECKPOINT_SLOTS) {
+        rt->checkpoint_slab = ds4_gpu_tensor_reserve(
+            rt->checkpoint_slot_bytes * DS4_PARTIAL_CHECKPOINT_SLOTS);
+    }
+    if (rt->checkpoint_slab) {
+        rt->checkpoint_logits = xcalloc(
+            (size_t)DS4_PARTIAL_CHECKPOINT_SLOTS * DS4_N_VOCAB,
+            sizeof(*rt->checkpoint_logits));
+        uint64_t stride = ((uint64_t)ctx_size +
+                           DS4_PARTIAL_PERIODIC_TARGET - 1u) /
+                          DS4_PARTIAL_PERIODIC_TARGET;
+        if (stride < 4096u) stride = 4096u;
+        stride = (stride + 4095u) & ~4095ull;
+        rt->checkpoint_stride = stride > UINT32_MAX
+            ? UINT32_MAX : (uint32_t)stride;
+    }
+
     ds4_log(stderr, DS4_LOG_TIMING,
             "ds4: Motif-3 batch runtime: %u banks, ctx %u, "
-            "prefill chunk %u, latent KV %.3f GiB/bank\n",
+            "prefill chunk %u, latent KV %.3f GiB/bank, "
+            "partial=%u x %.2f MiB shared checkpoints stride=%u\n",
             rt->max_seq, ctx_size, prefill_cap,
-            (double)rt->cache_bytes_per_bank / 1073741824.0);
+            (double)rt->cache_bytes_per_bank / 1073741824.0,
+            rt->checkpoint_slab ? DS4_PARTIAL_CHECKPOINT_SLOTS : 0u,
+            (double)rt->checkpoint_slot_bytes / 1048576.0,
+            rt->checkpoint_stride);
     return rt;
 }
 
@@ -47176,7 +47496,9 @@ static int motif3_batch_ctx_create_impl(
     for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b] = 1u;
     /* v0.6.2 Inc 3 recency array; see the Solar create note. */
     ctx->bank_last_use = xcalloc(ctx->max_seq, sizeof(*ctx->bank_last_use));
-    ctx->supports_partial_reuse = false;
+    /* Capability, not policy: present exactly when the runtime reserved its
+     * SWA-window checkpoint pool (DS4_SERVER_FORK_PARTIAL=0 leaves it NULL). */
+    ctx->supports_partial_reuse = ctx->motif3->checkpoint_slab != NULL;
     ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
     *out = ctx;
     return 0;
@@ -47871,6 +48193,7 @@ static void bank_hist_invalidate_all(ds4_batch_ctx *ctx) {
     for (uint32_t b = 0; b < ctx->max_seq; b++) {
         ctx->bank_gen[b]++;   /* Inc 5a */
         if (ctx->solar) solar_batch_runtime_drop_checkpoints(ctx->solar, b);
+        if (ctx->motif3) motif3_batch_runtime_drop_checkpoints(ctx->motif3, b);
     }
     memset(ctx->bank_hist_valid, 0, (size_t)ctx->max_seq);
 }
@@ -49867,17 +50190,25 @@ static int family_banked_engine_continuous_generate(
 
             uint32_t cached = 0u;
             bool forked = false;
+            bool partial = false;
             bool warm = false;
             const uint32_t requested_cached =
                 req.n_cached > 0 && req.n_cached <= req.n
                     ? (uint32_t)req.n_cached : 0u;
             if (src >= 0 && requested_cached != 0u) {
-                const bool source_ok =
+                const bool source_idle =
                     (uint32_t)src < MS &&
                     bank[src].phase == FAMILY_CONT_FREE &&
-                    family_cont_history_exact(
-                        ctx, (uint32_t)src, req.tokens, requested_cached);
-                if (source_ok) {
+                    ctx->bank_hist_valid[src];
+                const uint32_t source_frontier = source_idle
+                    ? ctx->bank_hist_len[src] : 0u;
+                const bool source_prefix = source_idle &&
+                    requested_cached <= source_frontier &&
+                    memcmp(ctx->bank_hist + (size_t)src * ctx->seq_cap,
+                           req.tokens,
+                           (size_t)requested_cached *
+                               sizeof(*req.tokens)) == 0;
+                if (source_prefix && requested_cached == source_frontier) {
                     if ((uint32_t)src != b) {
                         if (!family_banked_copy(
                                 ctx, (uint32_t)src, b, requested_cached)) {
@@ -49897,6 +50228,50 @@ static int family_banked_engine_continuous_generate(
                     }
                     cached = requested_cached;
                     forked = true;
+                } else if (source_prefix &&
+                           requested_cached < source_frontier &&
+                           ctx->motif3) {
+                    /* P1 (Motif-3): the request diverges inside the source
+                     * bank's history.  Rewind to the nearest SWA-window
+                     * checkpoint at or below the cut; full-attention rows
+                     * below it copy straight from the source bank, and the
+                     * shared tail replays with the divergent suffix.  EXAONE
+                     * keeps exact-frontier reuse only (no checkpoint pool). */
+                    const int checkpoint =
+                        motif3_batch_runtime_find_checkpoint(
+                            ctx->motif3, (uint32_t)src, requested_cached,
+                            (uint32_t)req.n);
+                    uint32_t checkpoint_pos = 0u;
+                    if (checkpoint >= 0) {
+                        if (!motif3_batch_runtime_restore_checkpoint(
+                                ctx->motif3, (uint32_t)src, b,
+                                (uint32_t)checkpoint, requested_cached,
+                                &checkpoint_pos)) {
+                            ctx->bank_gen[b]++;
+                            ctx->bank_hist_valid[b] = 0u;
+                            motif3_batch_runtime_drop_checkpoints(
+                                ctx->motif3, b);
+                            FCG_ERR("continuous_generate: Motif-3 checkpoint "
+                                    "restore failed src=%d dst=%u cut=%u",
+                                    src, b, requested_cached);
+                            ok = false;
+                            break;
+                        }
+                        if ((uint32_t)src != b) {
+                            memcpy(ctx->bank_hist + (size_t)b * ctx->seq_cap,
+                                   ctx->bank_hist +
+                                       (size_t)src * ctx->seq_cap,
+                                   (size_t)checkpoint_pos * sizeof(int));
+                        }
+                        ctx->bank_gen[b]++;
+                        ctx->bank_hist_len[b] = checkpoint_pos;
+                        ctx->bank_hist_valid[b] = 1u;
+                        cached = checkpoint_pos;
+                        forked = true;
+                        partial = true;
+                    } else {
+                        ctx->fork_rejects++;
+                    }
                 } else {
                     ctx->fork_rejects++;
                 }
@@ -49915,10 +50290,20 @@ static int family_banked_engine_continuous_generate(
                 cached = 0u;
                 warm = false;
                 forked = false;
+                partial = false;
             }
             if (forked) {
                 ctx->fork_admits++;
-                ds4_metric_add(&ds4_metrics_get()->admits_fork, 1u);
+                if (partial) {
+                    ctx->fork_partial++;
+                    ds4_metric_add(
+                        (uint32_t)src == b
+                            ? &ds4_metrics_get()->admits_partial_truncate
+                            : &ds4_metrics_get()->admits_partial_fork,
+                        1u);
+                } else {
+                    ds4_metric_add(&ds4_metrics_get()->admits_fork, 1u);
+                }
             } else if (warm) {
                 ctx->warm_admits++;
                 ds4_metric_add(&ds4_metrics_get()->admits_warm, 1u);
@@ -50001,6 +50386,17 @@ static int family_banked_engine_continuous_generate(
                     ds4_metric_add(
                         &ds4_metrics_get()->tokens_prefilled_computed, n);
                     ds4_metrics_window_add(0u, 0u, n);
+                    /* Long-prefill periodic snapshot: the SWA window at this
+                     * chunk boundary is still fully ring-resident (frontier
+                     * == pos + n), which is exactly what a later partial
+                     * fork below this point needs.  No logits mid-prompt. */
+                    if (ctx->motif3 && !final &&
+                        motif3_batch_runtime_checkpoint_due(
+                            ctx->motif3, pos, pos + n)) {
+                        (void)motif3_batch_runtime_capture_checkpoint(
+                            ctx->motif3, pb, pos + n, false,
+                            ctx->serial_reserve);
+                    }
                 }
                 if (cb->prefill_off == cb->prefill_len) {
                     if (!family_banked_logits_valid(ctx, pb)) {
@@ -50008,6 +50404,13 @@ static int family_banked_engine_continuous_generate(
                                 "frontier logits", pb);
                         ok = false;
                         break;
+                    }
+                    /* Every request boundary is a semantic checkpoint.  A
+                     * repeated exact retry at the same frontier is a no-op. */
+                    if (ctx->motif3) {
+                        (void)motif3_batch_runtime_capture_checkpoint(
+                            ctx->motif3, pb, ctx->bank_hist_len[pb], true,
+                            ctx->serial_reserve);
                     }
                     const int override = cb->sample_override
                         ? cb->sample_override(ud, cb->user)
@@ -50088,6 +50491,15 @@ static int family_banked_engine_continuous_generate(
             const uint32_t b = decode_banks[row];
             ds4_family_cont_bank *cb = &bank[b];
             bank_hist_append(ctx, b, cb->current);
+            /* Decode-side periodic snapshot; the fresh step logits make it
+             * usable even for a zero-suffix cut at exactly this frontier. */
+            if (ctx->motif3 && motif3_batch_runtime_checkpoint_due(
+                    ctx->motif3, decode_positions[row],
+                    ctx->bank_hist_len[b])) {
+                (void)motif3_batch_runtime_capture_checkpoint(
+                    ctx->motif3, b, ctx->bank_hist_len[b], true,
+                    ctx->serial_reserve);
+            }
             cb->stats.decode_steps++;
             ds4_metric_add(&ds4_metrics_get()->decode_steps, 1u);
             const int override = cb->sample_override
