@@ -92,6 +92,25 @@ SSD persistence, not active-bank offload: context length and concurrency must
 still fit unified memory before the worker starts. Its quant identity comes from
 the first populated routed-expert layer, including dense-first model families.
 
+## Partial prefix reuse (Solar, Motif-3)
+
+Live continuous banks additionally reuse prompts that diverge INSIDE a
+retained conversation, not just at its exact frontier. Both families share a
+32-slot, demand-mapped, LRU checkpoint pool (`ds4_partial_checkpoint`):
+Solar snapshots its 157.5 MiB KDA recurrent state, Motif-3 only each SWA
+layer's 128-row window (39 layers, 5.48 MiB/slot). Request boundaries are
+semantic checkpoints; long prefills and decode add stride-aligned ones
+(`max(4096, ctx/24)` rounded to 4096). A partial fork restores the nearest
+checkpoint at or below the token LCP, copies the positional rows (Solar GQA,
+Motif-3 full-attention latent) from the source bank, and replays only the
+gap. `DS4_SERVER_FORK_PARTIAL=0` disables capture and even the VA
+reservation. EXAONE and dots3-note banks keep exact-frontier reuse only.
+
+Verified on this host: Solar 6K/10K branches of a 12K source 2.85x/4.62x
+TTFT (`docs/solar-partial-reuse-2026-08-21.md`); Motif-3 7.1K/14.1K
+branches of a 16.8K source 2.18x/6.50x TTFT, byte-identical output, +0.23%
+capture cost (`docs/motif3-partial-reuse-2026-08-22.md`).
+
 ## Weight owner and inference worker
 
 On a 128 GB unified-memory machine, keep one weight owner alive and restart

@@ -7,6 +7,30 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## v0.6.2-dfm — 2026-08-21
 
+- Motif-3 partial prefix reuse on the continuous lane: the Solar
+  checkpoint bookkeeping is generalized (`ds4_partial_checkpoint`) and
+  Motif-3 banks snapshot each SWA layer's 128-row window (39 layers,
+  5.48 MiB/slot, 32-slot demand-mapped pool) at request boundaries and
+  4096-aligned strides; a partial fork restores the nearest checkpoint
+  at or below the divergence, copies full-attention latent rows from
+  the source bank, and replays only the gap. Live 64K A/B: branches at
+  7.1K/14.1K of a 16.8K source cached 4,096/12,288 tokens for 2.18x /
+  6.50x TTFT, byte-identical output, +0.23% source capture cost
+  (`docs/motif3-partial-reuse-2026-08-22.md`). EXAONE keeps
+  exact-frontier reuse only.
+- Solar partial prefix reuse: 32-slot shared KDA checkpoint pool with
+  request-boundary and periodic capture; live 64K A/B measured 2.85x /
+  4.62x TTFT on 6K/10K branches with byte-identical output
+  (`docs/solar-partial-reuse-2026-08-21.md`).
+- Per-family session graph memory estimates: the session lane now
+  quotes Solar/EXAONE/Motif-3/dots3 graph planners instead of the
+  DeepSeek metal-graph formula; covered by a no-model plan gate in
+  `test_exaone_kernels`.
+- Known issue: the full three-bank `test_motif3_batch` regression
+  drifts from the serial oracle at row 1 tokens 3-4; it reproduces
+  byte-identically with the pre-checkpoint `042bcea` binary, so it
+  predates the reuse work (suspected Motif perf-cycle drift; tracked
+  separately). The `--partial-only` gate and live A/B pass.
 - Motif-3 strict 256K serial Chat remesure on this line: 262,080-token
   prefill 1,098.433 s at 238.59 tok/s and 43 decode tokens in 7.205 s
   at 5.97 tok/s; all three sentinels exact; `finish_reason=stop`.

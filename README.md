@@ -650,7 +650,7 @@ than refusing). The knobs:
 | `DS4_MEMGOV` | unset (the governor's verdicts are binding) | Set to `observe` to fall back to the pre-v0.6 memory formulas: the governor keeps evaluating and reporting on `/metrics`, but stops deciding. The one-word escape hatch if a memory decision ever looks wrong. |
 | `DS4_MEM_RECONCILE_TOL_MB` | `256` | When idle, the server reconciles the box's available-memory drop since boot against what its own allocation ledger explains and logs the residual (`mem reconcile:` line, also on `/v1/stats` and `/metrics`); a residual beyond this many MiB is marked `FLAGGED`. `DS4_MEM_RECONCILE_STRICT=1` adds a distinct `mem reconcile STRICT` line for gate scripts to assert on; `DS4_MEM_RECONCILE_WARMUP_MB` pins the named one-time warmup charge instead of letting the first idle pass self-calibrate it. Pure reporting — no admission decision reads it. |
 | `DS4_CONT_PREFILL_CHUNK` / `DS4_CONT_PREFILL_CHUNK_LIVE` | `4096` / `4096` | Long prompts are ingested this many tokens at a time so a big admission never blocks the server. The `_LIVE` value applies while other requests are actively decoding: smaller keeps live decode smoother, larger ingests faster. |
-| `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves and captures no KDA checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
+| `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves and captures no KDA checkpoints, and Motif-3 no SWA-window checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
 | `DS4_SERVER_CONTINUOUS` | `1` (continuous batching on) | Set to `0` to serve one request at a time on the old serial path. Only worth considering for single-user, latency-critical setups. |
 | `DS4_BATCH_VMM_BUDGET_MB` | unset: sized automatically (the bank plan's allowance, capped to measured capacity at boot, floored at two full-depth **packed** working sets — what two full banks actually commit at the admission-charged rate, not their virtual extents; `DS4_BATCH_VMM_FLOOR_PACKED=0` restores the old virtual-extent floor) | Hard cap on the KV pool, in MiB. Set it to pin the pool to a known size; either way the boot ledger prints `budget=[chosen] [plan X, capacity Y]` plus the work floor that applied, and a separate line whenever the floor is what ruled. |
 | `DS4_BATCH_VMM_TRIM` | `1` (reclaim allowed) | When an admission does not fit, the engine may release idle banks' memory to fund it; the reclaimed conversation then needs a disk restore or re-prefill when it returns. Set to `0` to forbid that: resident context is never sacrificed, and the admission is refused instead. Victims are chosen like warm-record eviction — invalid content first, then the longest-idle bank (shortest history breaks ties) — and the log names each victim with its bytes, history length, and recency; `DS4_BATCH_TRIM_VICTIM=hist` restores the old shortest-history-only order. |
@@ -702,13 +702,16 @@ memory cache handles active sessions; disk cache is the resume mechanism for
 evicted sessions and worker restarts. This applies to DeepSeek/GLM, Solar,
 EXAONE, and Motif model-family payloads in `ds4-dfm`.
 
-Solar's continuous lane keeps more reuse depth than the bank count alone: a
-32-slot, demand-mapped pool shares immutable KDA checkpoints across exact
-forks. Request boundaries are checkpoints, and long prefills add roughly 24
-evenly spaced checkpoints across `-c`. A partial match restores the nearest
-checkpoint below the cut and replays only the gap. The pool is bounded and
-best-effort under the memory floor; its GQA rows and token lookup remain tied
-to a retained bank, so this is not an unbounded radix-tree cache.
+The Solar and Motif-3 continuous lanes keep more reuse depth than the bank
+count alone: a 32-slot, demand-mapped pool shares immutable checkpoints across
+exact forks — Solar snapshots its 157.5 MiB KDA recurrent state, Motif-3 only
+each SWA layer's 128-row window (5.48 MiB). Request boundaries are
+checkpoints, and long prefills add roughly 24 evenly spaced checkpoints across
+`-c`. A partial match restores the nearest checkpoint below the cut, copies
+the rewindable positional rows (Solar GQA, Motif-3 full-attention latent)
+straight from the source bank, and replays only the gap. The pool is bounded
+and best-effort under the memory floor; its positional rows and token lookup
+remain tied to a retained bank, so this is not an unbounded radix-tree cache.
 
 Enable it with:
 
