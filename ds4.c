@@ -30014,6 +30014,8 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
     if (!vocab || token < 0) return false;
     if (token == vocab->eos_id) return true;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 &&
+        vocab->eot_id >= 0 && token == vocab->eot_id) return true;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
         /* The official final generation_config pins eos_token_id to
          * [0, 3, 6]: end-of-text, user, and end-of-turn.  In particular,

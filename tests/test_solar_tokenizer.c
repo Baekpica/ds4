@@ -117,6 +117,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL: Solar generation stop is not <|im:end|>\n");
         return 1;
     }
+    if (!ds4_token_is_stop(&engine, vocab.im_end_id)) {
+        fprintf(stderr, "FAIL: Solar <|im:end|> is not in the generation stop set\n");
+        return 1;
+    }
 
     vocab_free(&vocab);
     model_close(&model);
