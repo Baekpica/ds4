@@ -20,11 +20,11 @@ C golden baseline: `v0.6.3-dfm`
 | web utility | yes | no | C | — | — |
 | server (four surfaces) | yes | no | C | — | — |
 | distributed runtime | yes | no | C | — | — |
-| CLI / bench / agent host | yes | no | C | — | — |
+| CLI / bench / agent host | yes | shadow `ds4-rs` / `ds4-bench-rs` | C | — | — |
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
 | Metal backend | native | unchanged | native | — | n/a |
 | CUDA / MMQ / VMM | native | unchanged | native | green (C baseline) | green (published band) |
-| FFI bridge (`ds4_bridge`) | n/a | skeleton | n/a | — | — |
+| FFI bridge (`ds4_bridge`) | n/a | linked | n/a | FFI error path green | — |
 | proof harness on Rust path | C binaries | no | C | — | — |
 
 ## Phase checklist
@@ -34,7 +34,7 @@ C golden baseline: `v0.6.3-dfm`
 | 0 | Freeze baseline + this document set | **done** (docs-only commit) |
 | 1 | Cargo workspace + FFI skeleton | **done** (`cargo check --workspace`, `make rust-bridge`) |
 | 2 | `ds4-core` safe wrappers | **done** (unit tests; no live model) |
-| 3 | Shadow `ds4-rs` / `ds4-bench-rs` | not started |
+| 3 | Shadow `ds4-rs` / `ds4-bench-rs` | **linked** (`make ds4-rs`); same-model token/perf gate pending |
 | 4 | KV store port + 4-way matrix | not started |
 | 5 | Web utility port | not started |
 | 6 | Distributed runtime port | not started |
@@ -52,9 +52,10 @@ C golden baseline: `v0.6.3-dfm`
 | `ds4-bench` | C |
 | `ds4-eval` | C |
 | `ds4-agent` | C |
+| `ds4-rs` / `ds4-bench-rs` | Rust host, same C CUDA core (`make ds4-rs`) |
 | `ds4_weight_server` | native CUDA (unchanged) |
 
-No `*-rs` shadows exist yet.
+Phase 3 live parity (same GGUF, token/KV/prefill/decode/memory) has not been run. Do that in tmux + `scripts/guarded-run.sh`; do not load a production GGUF from an interactive agent session.
 
 ## Known remaining C dependency
 
@@ -68,5 +69,6 @@ non-blocking compile).
   correctness or performance fixes only, then rerun this matrix.
 - `SPLIT_READINESS.md` must not be added until the §26 required
   list is evidence-green.
-- Unsafe-audit command once crates exist:
-  `rg -n 'unsafe \{' crates/`
+- Unsafe-audit command: `rg -n 'unsafe \{' crates/`
+  Current hits are only `crates/ds4-core` FFI adapters. `ds4-sys` is
+  `extern "C"` declarations. Application crates have none.

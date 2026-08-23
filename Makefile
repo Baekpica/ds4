@@ -83,7 +83,7 @@ endif
         test-solar-gates test-solar-kv test-solar-tokenizer \
         test-solar-forward test-solar-session \
         test-exaone-ref test-exaone-kernels test-exaone-batch \
-        rust-bridge
+        rust-bridge ds4-rs ds4-bench-rs
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -94,6 +94,8 @@ help:
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test         Build and run tests"
 	@echo "  make rust-bridge  Compile native/bridge/ds4_bridge.o (Rust FFI skeleton)"
+	@echo "  make ds4-rs       Build Rust shadow ./ds4-rs (same C core)"
+	@echo "  make ds4-bench-rs Build Rust shadow ./ds4-bench-rs"
 	@echo "  make clean        Remove build outputs"
 
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -134,6 +136,8 @@ help:
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests (reuses the last cuda-* configuration)"
 	@echo "  make rust-bridge         Compile native/bridge/ds4_bridge.o (Rust FFI skeleton)"
+	@echo "  make ds4-rs              Build Rust shadow ./ds4-rs (same C core + CUDA objects)"
+	@echo "  make ds4-bench-rs        Build Rust shadow ./ds4-bench-rs"
 	@echo "  make clean               Remove build outputs (keeps the recorded cuda configuration)"
 
 # GB10 / DGX Spark is compute capability 12.1. Without an explicit -arch,
@@ -222,6 +226,34 @@ rust-bridge: native/bridge/ds4_bridge.o
 
 native/bridge/ds4_bridge.o: native/bridge/ds4_bridge.c native/bridge/ds4_bridge.h ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ native/bridge/ds4_bridge.c
+
+# Phase 3 shadows: Rust main, existing C/CUDA objects. Do not replace ./ds4.
+DS4_RS_ROOT := $(abspath .)
+DS4_RS_LINK_OBJS := native/bridge/ds4_bridge.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+DS4_RS_LIBS := -C link-arg=-framework -C link-arg=Foundation \
+	-C link-arg=-framework -C link-arg=Metal -C link-arg=-lm
+else
+DS4_RS_GCCLIB := $(dir $(shell gcc -print-libgcc-file-name))
+DS4_RS_LIBS := -C link-arg=-L$(CUDA_HOME)/targets/sbsa-linux/lib \
+	-C link-arg=-L$(CUDA_HOME)/lib64 \
+	-C link-arg=-L$(DS4_RS_GCCLIB) \
+	-C link-arg=-lcudart -C link-arg=-lcublas -C link-arg=-lcuda \
+	-C link-arg=-lstdc++ -C link-arg=-latomic -C link-arg=-lgcc \
+	-C link-arg=-ldl -C link-arg=-lm -C link-arg=-lpthread -C link-arg=-lc
+endif
+
+ds4-rs: native/bridge/ds4_bridge.o $(CORE_OBJS)
+	cargo rustc -p ds4-cli --bin ds4-rs --release --features native -- \
+		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
+		$(DS4_RS_LIBS)
+	cp -f target/release/ds4-rs $@
+
+ds4-bench-rs: native/bridge/ds4_bridge.o $(CORE_OBJS)
+	cargo rustc -p ds4-cli --bin ds4-bench-rs --release --features native -- \
+		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
+		$(DS4_RS_LIBS)
+	cp -f target/release/ds4-bench-rs $@
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -596,4 +628,4 @@ tests/test_motif3_long: tests/test_motif3_long.o ds4_kvstore.o rax.o $(CORE_OBJS
 endif
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_batch tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_batch.o tests/test_motif3_long.o tests/test_exaone_ref tests/test_exaone_kernels tests/test_exaone_batch tests/test_exaone_ref.o tests/test_exaone_kernels.o tests/test_exaone_batch.o *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o native/bridge/ds4_bridge.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-rs ds4-bench-rs ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_batch tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_batch.o tests/test_motif3_long.o tests/test_exaone_ref tests/test_exaone_kernels tests/test_exaone_batch tests/test_exaone_ref.o tests/test_exaone_kernels.o tests/test_exaone_batch.o *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o native/bridge/ds4_bridge.o

@@ -8,3 +8,20 @@ description = "CLI / bench host (shadow binaries in Phase 3)"
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "ds4-rs"
+path = "src/bin/ds4-rs.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "ds4-bench-rs"
+path = "src/bin/ds4-bench-rs.rs"
+required-features = ["native"]
+
+[features]
+default = []
+native = []
+
+[dependencies]
+ds4-core = { path = "../ds4-core" }

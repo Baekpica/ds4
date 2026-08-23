@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "ds4-cli"
 version = "0.6.3"
+dependencies = [
+ "ds4-core",
+]
 
 [[package]]
 name = "ds4-core"
