@@ -102,8 +102,9 @@ armed, and every automatic decision is stated on one boot line, never
 silently. Since v0.6 unused context is demand-mapped, so a deep `-c`
 costs almost nothing until a request actually uses it; the CUDA default
 of 262144 exists so that a long agentic session fits a defaults boot,
-and `-c` raises it (524288 is the installer default, 786432 the deepest
-proven; see [Memory and capacity](#memory-and-capacity)).
+and `-c` raises it (524288 is the installer default; the model's full
+1M window at `-c 1048576` is proven with a 975k-token conversation;
+see [Memory and capacity](#memory-and-capacity)).
 
 Then talk to it with any OpenAI or Anthropic client:
 
@@ -626,13 +627,27 @@ cheapest to restore), not refused. Decode measured at parity with an empty box a
 cost was about 4.3 KiB per token of resident context at the deep shape
 (4.8 at 450k banks; deeper banks amortize the page floors).
 
-The window itself reaches the model's full million: at `-c 1048576`
-(the checkpoint's exact YaRN window, 65536 x 16) a single conversation
-of **975,246 tokens** was admitted and then continued warm in place,
-with a 2.0 s time to first token and 453 tokens decoded at 88 ms per
-token at that depth, speculative decoding still accepting 63 percent
-of its drafts. The last ~30k tokens up to the absolute 1,048,576
-limit are not yet qualified.
+The measured ceiling sits higher. With the admission floor lowered to
+1 GiB on a dedicated box, the same governor held **3,019,176 tokens of
+active context** — four ingestions of about 755 thousand tokens each,
+a needle retrieved exactly from every one, and honest, instant
+refusals for every further ask with the floor intact. The disclosed
+cost: at that full squeeze decode runs 2.6x slower than on an empty
+box (the OS starts reclaiming file-backed weight pages), where the
+2.26M shipped-floor stamp is 1.14x. The step-by-step recipe is in the
+[ds4-on-spark README](https://github.com/Entrpi/ds4-on-spark#reaching-3m-tokens-of-active-context).
+
+The window itself is now qualified to its edge: at `-c 1048576` (the
+checkpoint's exact YaRN window, 65536 x 16) a single prompt of
+**1,029,340 tokens** was ingested with a needle at 99.9% depth and
+retrieved exactly — on the default decode path and again with the
+accelerated attention path disabled, the fallback that previously
+truncated the deepest rows silently past 1,015,936 resident tokens.
+A 975,246-token conversation was separately admitted and continued
+warm in place, with a 2.0 s time to first token and 453 tokens
+decoded at 88 ms per token at that depth, speculative decoding still
+accepting 63 percent of its drafts. A bank persisted at exactly its
+token bound now restores cleanly across a restart.
 
 Two decisions cover most operator needs: the context limit `-c` (the
 per-request ceiling; prompt plus decode budget must fit under it) and
@@ -642,18 +657,18 @@ than refusing). The knobs:
 
 | Knob | Default | What it does and when to change it |
 |---|---|---|
-| `-c` / `--ctx` | `262144` on CUDA, `32768` on Metal/CPU (ds4-on-spark's `ds4-serve` passes `524288`) | The per-request context ceiling. Each request must fit its prompt plus its decode budget under this, or it gets a typed 400. Raise it for deeper documents (a 975k-token conversation at `-c 1048576` is the deepest proven); unused context is demand-mapped, so a deep ceiling costs almost nothing until a request fills it. |
+| `-c` / `--ctx` | `262144` on CUDA, `32768` on Metal/CPU (ds4-on-spark's `ds4-serve` passes `524288`) | The per-request context ceiling. Each request must fit its prompt plus its decode budget under this, or it gets a typed 400. Raise it for deeper documents (a 1,029,340-token prompt at `-c 1048576`, the model's full window, is the deepest proven); unused context is demand-mapped, so a deep ceiling costs almost nothing until a request fills it. |
 | `DS4_SERVER_COALESCE_MAX` | unset: sized from the live memory budget at boot — 32 through 16k context (the measured regime); above that, as many full-depth-fundable banks as the budget covers (floor 4, cap 32), priced at the same per-token rate admissions are charged. The boot ledger prints the arithmetic (`kv plan` line). Where no memory answer exists (Metal/CPU), a static halving ladder rules instead. | How many requests can hold warm context at once (the bank count). Set it (1..64) to override — an explicit value also disarms the budget sizing, so your number rules (e.g. more, shallower banks for high-concurrency batch work). Boot may still reduce the count to fit memory, never raise it, and it is fixed until restart. A request beyond the bank count evicts the least-recently-used idle bank. |
 | `--mem-floor-gb` (env `DS4_MEM_FLOOR_GB`) | `4` | The engine never admits work that would leave the system under this many GiB of free memory: it reclaims idle cache first and refuses with a typed error if that is not enough. Lower it (down to 1) on a dedicated serving box to fund more context; raise it on a machine you also work on. The boot planning headroom now derives from this floor plus a boot-burst margin (`DS4_BATCH_FIT_BURST_MB`, default 2048; boot line `batch fit headroom:`), so lowering the floor also returns planning margin to the fundable pool — `DS4_BATCH_FIT_HEADROOM_MB` pins the headroom outright, `DS4_BATCH_FIT_HEADROOM_DERIVED=0` restores the old static 6144. |
 | `max_tokens` (request field, not a flag) | `32768` assumed when the client omits it | The decode budget a request is charged at admission, on top of its prompt. Agents that omit it are charged the full 32768, so set it explicitly when a deep prompt must fit: prompt + `max_tokens` must stay under `-c`. An oversized value is clamped and reported as `length`, never an error. |
 | `DS4_CONT_ADMIT_BAND_X1024` | `1045` | Admission charges each request its measured memory need times a small safety margin, expressed in 1024ths: 1045/1024 means about 2% above the measurement, absorbing allocation transients. Set `1024` to charge exactly the measured need; raise it if admitted work ever brushes the floor. |
 | `DS4_MEMGOV` | unset (the governor's verdicts are binding) | Set to `observe` to fall back to the pre-v0.6 memory formulas: the governor keeps evaluating and reporting on `/metrics`, but stops deciding. The one-word escape hatch if a memory decision ever looks wrong. |
 | `DS4_MEM_RECONCILE_TOL_MB` | `256` | When idle, the server reconciles the box's available-memory drop since boot against what its own allocation ledger explains and logs the residual (`mem reconcile:` line, also on `/v1/stats` and `/metrics`); a residual beyond this many MiB is marked `FLAGGED`. `DS4_MEM_RECONCILE_STRICT=1` adds a distinct `mem reconcile STRICT` line for gate scripts to assert on; `DS4_MEM_RECONCILE_WARMUP_MB` pins the named one-time warmup charge instead of letting the first idle pass self-calibrate it. Pure reporting — no admission decision reads it. |
-| `DS4_CONT_PREFILL_CHUNK` / `DS4_CONT_PREFILL_CHUNK_LIVE` | `4096` / `4096` | Long prompts are ingested this many tokens at a time so a big admission never blocks the server. The `_LIVE` value applies while other requests are actively decoding: smaller keeps live decode smoother, larger ingests faster. |
+| `DS4_CONT_PREFILL_CHUNK` / `DS4_CONT_PREFILL_CHUNK_LIVE` | `4096` / `512` | Long prompts are ingested this many tokens at a time so a big admission never blocks the server. The `_LIVE` value applies while other requests are actively decoding: smaller keeps live decode smoother, larger ingests faster. |
 | `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves and captures no KDA checkpoints, and Motif-3 no SWA-window checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
 | `DS4_SERVER_CONTINUOUS` | `1` (continuous batching on) | Set to `0` to serve one request at a time on the old serial path. Only worth considering for single-user, latency-critical setups. |
 | `DS4_BATCH_VMM_BUDGET_MB` | unset: sized automatically (the bank plan's allowance, capped to measured capacity at boot, floored at two full-depth **packed** working sets — what two full banks actually commit at the admission-charged rate, not their virtual extents; `DS4_BATCH_VMM_FLOOR_PACKED=0` restores the old virtual-extent floor) | Hard cap on the KV pool, in MiB. Set it to pin the pool to a known size; either way the boot ledger prints `budget=[chosen] [plan X, capacity Y]` plus the work floor that applied, and a separate line whenever the floor is what ruled. |
-| `DS4_BATCH_VMM_TRIM` | `1` (reclaim allowed) | When an admission does not fit, the engine may release idle banks' memory to fund it; the reclaimed conversation then needs a disk restore or re-prefill when it returns. Set to `0` to forbid that: resident context is never sacrificed, and the admission is refused instead. Victims are chosen like warm-record eviction — invalid content first, then the longest-idle bank (shortest history breaks ties) — and the log names each victim with its bytes, history length, and recency; `DS4_BATCH_TRIM_VICTIM=hist` restores the old shortest-history-only order. |
+| `DS4_BATCH_VMM_TRIM` | `1` (reclaim allowed) | When an admission does not fit, the engine may release idle banks' memory to fund it; the reclaimed conversation then needs a disk restore or re-prefill when it returns. Set to `0` to forbid that: resident context is never sacrificed, and the admission is refused instead. Victims are chosen like warm-record eviction — invalid content first, then the longest-idle bank (shortest history breaks ties) — and the log names each victim with its bytes, history length, and recency; `DS4_BATCH_TRIM_VICTIM=hist` restores the old shortest-history-only order. When one victim's release would cover the whole remaining deficit, the engine now picks the smallest such victim in the same validity class instead of the first in recency order — so a deep trunk no longer dies for a deficit a small idle bank could fund (the `best-fit victim` log line discloses the substitution, and the trim summary reports released vs wanted); `DS4_BATCH_TRIM_BESTFIT=0` restores the pure recency order. |
 | `DS4_SERIAL_RESERVE_CTX` | unset (no reserve) | Set to a token count to reserve memory at boot for the single-request serial lane, for deployments where that lane matters more than batch depth. The boot line reports the carve-out. |
 | `DS4_WEIGHT_FP_CHECK` | `1` (verify) | Weight-server imports verify the manifest's content fingerprint against the local model file and refuse a mismatch (a stale weight server serving different bytes). Set to `0` to skip the check. |
 
@@ -987,7 +1002,12 @@ Sessions prefill long prompts in 4096-token chunks by default. Set
 to match the strict official-vector checkpoint path, or
 `DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
 allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
-as an explicit run configuration.
+as an explicit run configuration. Single forwards wider than 8,192 rows are
+fenced: that territory is unqualified (fixed grid and integer ceilings in the
+one-shot kernels, with crash-or-silently-wrong failure modes), so the server
+refuses such a request with a typed error naming the lever, and the boot log
+discloses the mode whenever it is active. Set `DS4_PREFILL_NOFENCE=1` to lift
+the fence for a deliberate probe run.
 Chunked Metal prefill reuses the same range-capable layer-major graph for each
 chunk, preserving absolute compressor/indexer boundaries while avoiding the old
 per-layer chunk dispatch path.
@@ -1406,10 +1426,11 @@ results, each receipted there:
   governed by a terminal yield-quench controller: 1.33-1.47x upstream
   across the 2k-128k frontier (v0.4.1 stamp), deep decode 45.7 ms/tok
   at 240K (v0.5.0 stamp).
-- **Memory truth (v0.6).** One governor account for every allocation:
-  2.26M tokens of context resident and warm on one 128 GB Spark at zero
-  config, typed refusals, a 4 GiB floor, idle trim. See
-  [Memory and capacity](#memory-and-capacity).
+- **Memory truth (v0.6).** One governor account for every allocation,
+  every floor and margin measured, and a continuous self-audit of the
+  ledger since v0.6.2: measured to 3M tokens of active context on one
+  128 GB Spark (2.26M at zero config), typed refusals, a 4 GiB floor,
+  idle trim. See [Memory and capacity](#memory-and-capacity).
 - **Ops.** A resident weight server imports the 81 GiB model into
   engine processes in seconds (VMM-backed IPC, manifest with a
   content-identity check), and standalone boots build the same aligned

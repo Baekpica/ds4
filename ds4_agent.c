@@ -9690,6 +9690,19 @@ int main(int argc, char **argv) {
                 cfg.chdir_path, strerror(errno));
         return 1;
     }
+    /* v0.6.3 Inc 3: the agent was the last binary that stepped the effort
+     * dial down silently (CLI and eval both warn; the server honors
+     * explicit levels at any context since v0.5.4).  Same message shape
+     * as the CLI's, printed before the model loads. */
+    if (cfg.gen.think_mode == DS4_THINK_HIGH &&
+        effective_think_mode(&cfg) != DS4_THINK_HIGH)
+    {
+        fprintf(stderr,
+                "ds4-agent: warning: --think-max needs --ctx >= %u; ctx=%d uses "
+                "normal thinking instead\n",
+                ds4_think_effort_min_context(),
+                cfg.gen.ctx_size);
+    }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
     log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);

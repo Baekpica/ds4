@@ -17,6 +17,30 @@
 #     resp_neg     /v1/responses max_output_tokens:-3 -> 400 names the field
 #     not_found    GET /nope -> 404 OpenAI envelope (historical owner)
 #
+#   response_format typed refusal (v0.6.3 Inc 1; ds4-on-spark#10)
+#     rf_text      chat response_format {"type":"text"} -> 200 (accepted)
+#     rf_obj       chat json_object -> 400 typed message + OpenAI envelope
+#     rf_schema    chat json_schema, nested schema before type -> 400
+#     rf_comp      completions json_object -> 400
+#     rf_resp      responses text.format json_schema -> 400 names text.format
+#     rf_anth      messages output_format json_schema -> 400 native envelope
+#     rf_after     normal chat on the same boot -> 200 (no wedge)
+#
+#   chunked request bodies (v0.6.3 Inc 2)
+#     ch_chat      chat via Transfer-Encoding: chunked -> 200, zero contract
+#     ch_anth      messages chunked -> 200 output_tokens 0
+#     ch_comp      completions chunked -> 200 text_completion
+#     ch_resp      responses chunked -> 200 output_tokens 0
+#     ch_rf        chunked body carrying json_object -> the Inc 1 typed 400
+#                  (proves the DECODED body reaches the parser end-to-end)
+#
+#   think-dial observability (v0.6.3 Inc 3)
+#     th_high      reasoning_effort high -> 200; srv.log carries think=high
+#                  AND think=low (the dial rides every progress line);
+#                  ds4_requests_think_total{mode="high"} >= 1;
+#                  /v1/stats think_modes family present with positive
+#                  high/low counts
+#
 #   stop honesty (Inc 2c)
 #     anth_stop    /v1/messages with stop_sequences:["beta"] on an echo
 #                  prompt -> 200 with "stop_reason":"stop_sequence" AND
@@ -144,6 +168,12 @@ post(){
   curl -s -m 180 -o "$OUT/$1.json" -w '%{http_code}' "$BASE$2" \
        -H 'Content-Type: application/json' -d "$3"
 }
+# chpost <leg> <path> <json>  -> body sent with Transfer-Encoding: chunked
+# (curl really chunks a stdin --data-binary body when the header is set)
+chpost(){
+  printf '%s' "$3" | curl -s -m 180 -o "$OUT/$1.json" -w '%{http_code}' "$BASE$2" \
+       -H 'Content-Type: application/json' -H 'Transfer-Encoding: chunked' --data-binary @-
+}
 # hpost <leg> <path> <json>  -> also captures response HEADERS in $OUT/<leg>.hdr
 hpost(){
   curl -s -m 180 -o "$OUT/$1.json" -D "$OUT/$1.hdr" -w '%{http_code}' "$BASE$2" \
@@ -195,6 +225,85 @@ c=$(curl -s -m 20 -o "$OUT/not_found.json" -w '%{http_code}' "$BASE/nope")
 code_is not_found "$c" 404
 has not_found '"error":{"message":'
 log "not_found PASS (historical-owner envelope)"
+
+# ---- response_format typed refusal (v0.6.3 Inc 1; ds4-on-spark#10) ---------
+c=$(post rf_text /v1/chat/completions '{"max_tokens":0,"temperature":0,"response_format":{"type":"text"},"messages":[{"role":"user","content":"hi"}]}')
+code_is rf_text "$c" 200
+log "rf_text PASS (type text accepted unchanged)"
+
+c=$(post rf_obj /v1/chat/completions '{"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hi"}]}')
+code_is rf_obj "$c" 400
+has rf_obj "response_format type 'json_object' is not implemented"
+has rf_obj '"error":{"message":'
+log "rf_obj PASS (typed refusal, OpenAI envelope)"
+
+c=$(post rf_schema /v1/chat/completions '{"response_format":{"json_schema":{"name":"x","schema":{"type":"object"}},"type":"json_schema"},"messages":[{"role":"user","content":"hi"}]}')
+code_is rf_schema "$c" 400
+has rf_schema "json_schema' is not implemented"
+log "rf_schema PASS (nested schema before type still refused)"
+
+c=$(post rf_comp /v1/completions '{"response_format":{"type":"json_object"},"prompt":"hi"}')
+code_is rf_comp "$c" 400
+has rf_comp "not implemented"
+log "rf_comp PASS"
+
+c=$(post rf_resp /v1/responses '{"text":{"format":{"type":"json_schema","name":"x"}},"input":"hi"}')
+code_is rf_resp "$c" 400
+has rf_resp "text.format type 'json_schema' is not implemented"
+log "rf_resp PASS (nested text.format named)"
+
+c=$(post rf_anth /v1/messages '{"model":"m","max_tokens":8,"output_format":{"type":"json_schema","schema":{}},"messages":[{"role":"user","content":"hi"}]}')
+code_is rf_anth "$c" 400
+has rf_anth '"type":"error","error":{"type":"invalid_request_error"'
+has rf_anth "output_format type 'json_schema' is not implemented"
+log "rf_anth PASS (native envelope)"
+
+c=$(post rf_after /v1/chat/completions '{"max_tokens":8,"temperature":0,"messages":[{"role":"user","content":"still serving?"}]}')
+code_is rf_after "$c" 200
+log "rf_after PASS (server healthy after refusals)"
+
+# ---- chunked request bodies (v0.6.3 Inc 2) ---------------------------------
+c=$(chpost ch_chat /v1/chat/completions '{"max_tokens":0,"temperature":0,"messages":[{"role":"user","content":"hi"}]}')
+code_is ch_chat "$c" 200
+has ch_chat '"completion_tokens":0'
+log "ch_chat PASS (chunked body decoded, oa_zero contract held)"
+
+c=$(chpost ch_anth /v1/messages '{"model":"m","max_tokens":0,"messages":[{"role":"user","content":"prewarm via chunked"}]}')
+code_is ch_anth "$c" 200
+has ch_anth '"output_tokens":0'
+log "ch_anth PASS"
+
+c=$(chpost ch_comp /v1/completions '{"max_tokens":1,"temperature":0,"prompt":"hi"}')
+code_is ch_comp "$c" 200
+has ch_comp '"text_completion"'
+log "ch_comp PASS"
+
+c=$(chpost ch_resp /v1/responses '{"max_output_tokens":0,"input":"prewarm chunked"}')
+code_is ch_resp "$c" 200
+has ch_resp '"output_tokens":0'
+log "ch_resp PASS"
+
+c=$(chpost ch_rf /v1/chat/completions '{"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hi"}]}')
+code_is ch_rf "$c" 400
+has ch_rf "response_format type 'json_object' is not implemented"
+log "ch_rf PASS (chunked body reaches the parser; typed refusal fires)"
+
+# ---- think-dial observability (v0.6.3 Inc 3) -------------------------------
+c=$(post th_high /v1/chat/completions '{"max_tokens":8,"temperature":0,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}')
+code_is th_high "$c" 200
+ssh "$R" "grep -q 'think=high' $SRV" || fail "th_high: no think=high on a serving line"
+ssh "$R" "grep -q 'think=low' $SRV" || fail "th_high: think=low absent (dial should ride every progress line)"
+tm=$(lmetric 'ds4_requests_think_total{mode="high"}')
+[ "${tm:-0}" -ge 1 ] || fail "th_high: ds4_requests_think_total{mode=high} = ${tm:-unset}"
+curl -s -m 10 -H 'Accept: application/json' "$BASE/v1/stats" > "$OUT/th_stats.json"
+grep -q '"think_modes":{"none":' "$OUT/th_stats.json" || fail "th_stats: think_modes family missing from /v1/stats"
+python3 -c "
+import json,sys
+d = json.load(open('$OUT/th_stats.json'))
+tm = d['think_modes']
+sys.exit(0 if tm['high'] >= 1 and tm['low'] >= 1 else 1)
+" || fail "th_stats: high/low counts not positive in /v1/stats think_modes"
+log "th_high PASS (think= on the serving line; counter family in /metrics + /v1/stats)"
 
 # ---- stop honesty (Inc 2c): a matched stop is stop_sequence, not end_turn --
 c=$(post anth_stop /v1/messages '{"model":"m","max_tokens":128,"stop_sequences":["beta"],"messages":[{"role":"user","content":"Repeat exactly: alpha beta gamma"}]}')
@@ -507,6 +616,62 @@ ssh "$R" "kill $STALL_PID 2>/dev/null; exit 0"
 c=$(post slow_reader_after /v1/chat/completions '{"max_tokens":16,"temperature":0,"messages":[{"role":"user","content":"still healthy?"}]}')
 code_is slow_reader_after "$c" 200
 log "slow_reader PASS (aggregate backlog eviction counted shed{slow_reader}=$sr1 + canceled; server healthy after)"
+
+# ---- boot E: whole-prompt depth fence (v0.6.3 Inc 5) ------------------------
+# Serial-only + DS4_METAL_PREFILL_CHUNK=0: every serial prefill is one
+# whole-prompt forward.  Past 8192 rows that territory is unqualified, so
+# the request must get a TYPED 503 naming the lever (not a crash, not a
+# generic 500), the boot log must disclose the mode, and the escape env
+# must genuinely lift the fence.
+BOOT_ENV="DS4_SERVER_CONTINUOUS=0 DS4_SERVER_COALESCE=0 DS4_METAL_PREFILL_CHUNK=0" boot
+ssh "$R" "grep -q 'serial prefill widened' $SRV" \
+  || fail "fence boot: whole-prompt boot disclosure line missing from srv.log"
+
+# ~8.5k words (> 8192 tokens, safely under the 16384 ctx parse gate).
+python3 - > "$OUT/fence_req.json" <<'PY'
+import json
+words = "alpha bravo charlie delta echo foxtrot golf hotel india juliet " * 850
+print(json.dumps({"model": "m", "max_tokens": 8, "temperature": 0,
+                  "messages": [{"role": "user", "content": words}]}))
+PY
+fr0=$(lmetric 'ds4_requests_rejected_total{lane="serial",reason="deep_policy"}')
+c=$(curl -s -m 60 -o "$OUT/fence_refuse.json" -w '%{http_code}' "$BASE/v1/messages" \
+     -H 'Content-Type: application/json' -d @"$OUT/fence_req.json")
+code_is fence_refuse "$c" 503
+has fence_refuse 'Whole-prompt prefill is fenced'
+has fence_refuse 'DS4_PREFILL_NOFENCE'
+ssh "$R" "grep -q 'whole-prompt depth fence: refusing serial request' $SRV" \
+  || fail "fence_refuse: typed refusal line missing from srv.log"
+fr1=$(lmetric 'ds4_requests_rejected_total{lane="serial",reason="deep_policy"}')
+[ "${fr1:-0}" -gt "${fr0:-0}" ] || fail "fence_refuse: rejected{serial,deep_policy} never incremented (${fr0:-?} -> ${fr1:-?})"
+# a short prompt still serves whole-prompt (width under the fence)
+c=$(post fence_small /v1/chat/completions '{"max_tokens":8,"temperature":0,"messages":[{"role":"user","content":"hi"}]}')
+code_is fence_small "$c" 200
+log "fence_refuse PASS (typed 503 names the lever; counter ${fr0:-0} -> $fr1; short prompt still 200)"
+
+# escape hatch: the same deep request must get PAST the fence with
+# DS4_PREFILL_NOFENCE=1.  What happens in unqualified territory is NOT
+# asserted -- measured 08-20: this exact shape (a 12,755-row one-shot)
+# fails TODAY as a clean typed 500 'cuda prefill failed', which is the
+# fence's justification, not a defect.  The lever's contract: the fence
+# genuinely lifts (no typed 503, no refusal line), whatever happens
+# comes back as an ENVELOPE (200 or a typed 500 -- never a crash or a
+# dropped connection), and the server serves the next request.
+BOOT_ENV="DS4_SERVER_CONTINUOUS=0 DS4_SERVER_COALESCE=0 DS4_METAL_PREFILL_CHUNK=0 DS4_PREFILL_NOFENCE=1" boot
+ssh "$R" "grep -q 'depth fence LIFTED' $SRV" \
+  || fail "fence_lift boot: LIFTED disclosure line missing from srv.log"
+c=$(curl -s -m 180 -o "$OUT/fence_lift.json" -w '%{http_code}' "$BASE/v1/messages" \
+     -H 'Content-Type: application/json' -d @"$OUT/fence_req.json")
+[ "$c" = 200 ] || [ "$c" = 500 ] \
+  || fail "fence_lift: HTTP $c, want 200 or a typed 500 ($(head -c 300 "$OUT/fence_lift.json"))"
+lacks fence_lift 'Whole-prompt prefill is fenced'
+if [ "$c" = 200 ]; then has fence_lift '"stop_reason"'
+else has fence_lift '"type":"error","error":{"type":"api_error"'; fi
+ssh "$R" "grep -q 'whole-prompt depth fence: refusing' $SRV" \
+  && fail "fence_lift: fence refused despite DS4_PREFILL_NOFENCE=1"
+c=$(post fence_lift_after /v1/chat/completions '{"max_tokens":8,"temperature":0,"messages":[{"role":"user","content":"still healthy?"}]}')
+code_is fence_lift_after "$c" 200
+log "fence_lift PASS (fence lifted: deep one-shot reached the engine, outcome stayed an envelope, server healthy after)"
 
 ssh "$R" "pkill -x ds4-server; exit 0"
 log "ALL LEGS PASS — artifacts in $OUT (server killed, $R left free)"

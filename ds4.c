@@ -10259,6 +10259,58 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
     return cap;
 }
 
+/* v0.6.3 Inc 5: whole-prompt depth fence (the 1M-audit Findings 3-10
+ * class).  DS4_METAL_PREFILL_CHUNK<=0 pins the session prefill cap to
+ * the context size -- every serial prefill becomes ONE forward over the
+ * whole prompt -- and an explicit value past the fence widens each
+ * chunked forward the same way.  Above 8,192 rows a single forward is
+ * unqualified territory (fixed grid and integer ceilings in the generic
+ * kernels; the failure is a crash or, worse, silently wrong output),
+ * while every proven one-submission ceiling in the engine agrees on
+ * 8,192 (the cont chunk clamp, the raw ring cap).  The fence refuses by
+ * name instead; DS4_PREFILL_NOFENCE=1 lifts it, so the probe lever
+ * stays usable for anyone deliberately measuring past the line. */
+#define DS4_PREFILL_FENCE_ROWS 8192u
+
+uint32_t ds4_prefill_fence_rows(void) {
+    const char *env = getenv("DS4_PREFILL_NOFENCE");
+    if (env && env[0] && atoi(env) != 0) return 0;
+    return DS4_PREFILL_FENCE_ROWS;
+}
+
+int ds4_serial_prefill_fenced(int ctx_size, int prompt_len,
+                              uint32_t *width_out, uint32_t *fence_out) {
+    const uint32_t fence = ds4_prefill_fence_rows();
+    /* Mirror the session-create sizing call (prompt argument = ctx), then
+     * bound by the actual prompt: the widest single forward this request
+     * can submit is min(prefill_cap, prompt_len). */
+    uint32_t width = ds4_default_prefill_cap_for_prompt(ctx_size);
+    if (prompt_len > 0 && (uint32_t)prompt_len < width)
+        width = (uint32_t)prompt_len;
+    if (width_out) *width_out = width;
+    if (fence_out) *fence_out = fence;
+    return fence != 0u && width > fence;
+}
+
+/* v0.6.3 Inc 6: pure best-fit final-victim pick -- see the ds4.h contract.
+ * Shared-section placement: unit-tested on every backend (the v0.6.2
+ * victim-order precedent: policy pinned by a synthetic unit, engagement
+ * observable via the ladder's disclosure lines). */
+uint32_t ds4_trim_bestfit_pick(const uint64_t *est, const uint8_t *valid,
+                               const uint32_t *hist, uint32_t n,
+                               uint64_t remaining) {
+    if (!est || !valid || !hist || n == 0u) return 0u;
+    uint32_t best = 0u;
+    for (uint32_t i = 1u; i < n; i++) {
+        if (valid[i] != valid[0]) continue;
+        if (est[i] < remaining) continue;
+        if (est[i] < est[best] ||
+            (est[i] == est[best] && hist[i] < hist[best]))
+            best = i;
+    }
+    return best;
+}
+
 /* Allocate all CPU decode temporaries once.  This keeps generation deterministic
  * from the VM's point of view and makes accidental hot-loop malloc visible. */
 static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
@@ -45541,7 +45593,14 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
     const uint32_t saved_comp_cap = h[6];
     const uint32_t saved_tokens = h[7];
     const uint32_t saved_raw_live = h[12];
-    if (saved_tokens >= ctx->seq_cap) {
+    /* v0.6.3 Inc 4 (audit Finding 2): an EXACTLY-full bank restores --
+     * bank_hist has seq_cap slots, so == fills it precisely, and there is
+     * no spare-slot invariant downstream: bank_hist_append invalidates on
+     * overflow instead of writing, and the admission install bound
+     * (min(prompt + budget, seq_cap)) keeps decode atop a full bank
+     * honest.  The old >= rejected the one payload a full-context
+     * persist legitimately produces. */
+    if (saved_tokens > ctx->seq_cap) {
         payload_set_err(err, errlen, "bank payload does not fit current per-bank token bound");
         return 1;
     }
@@ -45907,8 +45966,12 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
  * band).  Deriving keeps EXACT value parity at shipped defaults
  * (4096 + 2048 = 6144) and returns the difference to the fundable
  * pool everywhere else.  The burst term is the measured constant
- * (DS4_BATCH_FIT_BURST_MB pins it; battery legs on desktop-state and
- * stripped-state boots are its receipt).  Precedence: an explicit
+ * (DS4_BATCH_FIT_BURST_MB pins it).  Receipts, both regimes: the
+ * direct boot-window transient measures 0.31-0.38 GiB at -c 262144
+ * (v0.6.3 rider, local/docs/v063/rider-boot-burst-receipt.md), and
+ * the v0.6.2 run-3 deep battery consumed the margin to ~0.1 GiB
+ * above a 1 GiB floor -- the constant is the DEPTH allowance, and it
+ * covers boot with a wide berth.  Precedence: an explicit
  * DS4_BATCH_FIT_HEADROOM_MB pin rules everything (unchanged);
  * DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores the static 6144.  The
  * derivation disclosed once per boot on its own line. */
@@ -46695,6 +46758,21 @@ static uint64_t ds4_batch_bank_trim_pages(ds4_batch_ctx *ctx, uint32_t b) {
     return freed;
 }
 
+/* v0.6.3 Inc 6: the whole-bank estimate twin is defined below the ladder;
+ * the best-fit final-victim scan uses it. */
+static uint64_t ds4_batch_bank_trim_estimate(ds4_batch_ctx *ctx, uint32_t b);
+
+/* v0.6.3 Inc 6 kill switch: DS4_BATCH_TRIM_BESTFIT=0 restores the pure
+ * recency-blend victim walk (no size-fit refinement).  Default ON. */
+static int ds4_batch_trim_bestfit_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_BATCH_TRIM_BESTFIT");
+        enabled = !(e && e[0] == '0' && e[1] == '\0');
+    }
+    return enabled;
+}
+
 /* v0.5.1 Inc2: shed FREE banks' cache pages under admission budget pressure,
  * cheapest warm value first.  v0.6.2 Inc 3: "cheapest" now aligns with
  * warm-record eviction -- history-invalid banks, then valid banks by
@@ -46794,7 +46872,7 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     uint32_t nb = 0;
     bool synced = false;
     for (uint32_t a = 0; a < n && freed < want; a++) {
-        const uint32_t v = order[a];
+        uint32_t v = order[a];
         if (!synced) {
             /* cuda_ok convention: nonzero = success */
             if (!ds4_gpu_synchronize()) return freed;
@@ -46802,10 +46880,79 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         }
         /* v0.6.2 Inc 3: capture the victim's identity BEFORE the mark
          * wipes it -- the trim line names victims now (bank, bytes,
-         * hist_len, recency), not just count and total. */
-        const uint8_t  v_valid = ctx->bank_hist_valid[v];
-        const uint32_t v_hist  = ctx->bank_hist_len[v];
-        const uint64_t v_use   = ctx->bank_last_use[v];
+         * hist_len, recency), not just count and total.  (Mutable: the
+         * best-fit swap below may substitute the victim in place.) */
+        uint8_t  v_valid = ctx->bank_hist_valid[v];
+        uint32_t v_hist  = ctx->bank_hist_len[v];
+        uint64_t v_use   = ctx->bank_last_use[v];
+        /* v0.6.3 Inc 6 (best-fit victims): if THIS victim's release would
+         * cover the remaining deficit, it is the FINAL victim -- scan the
+         * rest of the order for a same-validity-class candidate that also
+         * covers but releases less.  The v0.6.2 receipt this kills: a
+         * 2,896 MiB trunk died for a 1,646 MiB want while smaller covering
+         * victims sat later in the recency order.  Non-final victims keep
+         * the pure recency-blend order (they are consumed whole either
+         * way); the class guard never trades an invalid-history pick up
+         * into a valid bank.  DS4_BATCH_TRIM_BESTFIT=0 restores the pure
+         * blend walk. */
+        const uint64_t remaining = want - freed;
+        if (ds4_batch_trim_bestfit_enabled() &&
+            ds4_batch_bank_trim_estimate(ctx, v) >= remaining) {
+            /* Gather the remaining order into candidate arrays (index 0 =
+             * the default pick) and let the pure policy choose.  NOTE
+             * (measured, 08-20): at small ctx the bank stride barely
+             * exceeds the VMM page, so only phase-aligned banks ever have
+             * interior pages and the pick rarely differs from the default
+             * there -- the policy earns its keep at production strides
+             * (many pages per bank).  It is unit-gated (v0.6.2 victim-
+             * order precedent); these disclosure lines are the field
+             * engagement evidence. */
+            uint64_t cest[DS4_MULTISEQ_MAX_SEQ];
+            uint8_t  cval[DS4_MULTISEQ_MAX_SEQ];
+            uint32_t chist[DS4_MULTISEQ_MAX_SEQ];
+            uint32_t m = 0;
+            for (uint32_t b2 = a; b2 < n; b2++) {
+                const uint32_t c = order[b2];
+                cest[m]  = ds4_batch_bank_trim_estimate(ctx, c);
+                cval[m]  = ctx->bank_hist_valid[c];
+                chist[m] = ctx->bank_hist_len[c];
+                if (b2 > a && cval[m] == v_valid)
+                    fprintf(stderr,
+                            "ds4: batch vmm: best-fit candidate bank=%u "
+                            "est=%.1f MiB hist=%u tok%s\n",
+                            c, (double)cest[m] / 1048576.0, chist[m],
+                            cest[m] >= remaining ? " (covers)" : "");
+                m++;
+            }
+            const uint32_t pick = ds4_trim_bestfit_pick(cest, cval, chist,
+                                                        m, remaining);
+            if (pick != 0u) {
+                const uint32_t c = order[a + pick];
+                order[a + pick] = order[a];
+                order[a] = c;
+                fprintf(stderr,
+                        "ds4: batch vmm: best-fit victim bank=%u (%.1f MiB "
+                        "covers want %.1f MiB) preferred over bank=%u "
+                        "(%.1f MiB, hist=%u tok)\n",
+                        c, (double)cest[pick] / 1048576.0,
+                        (double)remaining / 1048576.0, v,
+                        (double)cest[0] / 1048576.0, v_hist);
+                /* Substitute in place -- re-entering the loop would re-run
+                 * this scan (provably a no-swap) and print a contradictory
+                 * "kept default" line plus a duplicate census on the very
+                 * surface built for adjudication. */
+                v = c;
+                v_valid = ctx->bank_hist_valid[v];
+                v_hist  = ctx->bank_hist_len[v];
+                v_use   = ctx->bank_last_use[v];
+            } else {
+                /* Kept-default disclosure -- a silent negative here cost
+                 * three gate runs; say WHY the scan kept the recency pick. */
+                fprintf(stderr,
+                        "ds4: batch vmm: best-fit kept default bank=%u "
+                        "(%u candidates scanned)\n", v, m - 1u);
+            }
+        }
         const uint64_t got = ds4_batch_bank_trim_pages(ctx, v);
         if (got == 0) continue;                /* floor-resident: content intact, keep it */
         ds4_batch_bank_mark_trimmed(ctx, g, v);
@@ -46822,8 +46969,9 @@ static uint64_t ds4_batch_trim_free_banks(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
         ctx->trim_banks += nb;
         ctx->trim_bytes += freed;
         fprintf(stderr,
-                "ds4: batch vmm: trimmed %u bank(s), %.1f MiB released %s\n",
-                nb, (double)freed / 1048576.0,
+                "ds4: batch vmm: trimmed %u bank(s), %.1f MiB released "
+                "(want %.1f MiB) %s\n",
+                nb, (double)freed / 1048576.0, (double)want / 1048576.0,
                 why ? why : "under budget pressure");
     }
     return freed;
@@ -50995,6 +51143,12 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
     double   *ad_wall   = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;
     double   *ad_ms_cur = dspark_adapt_gate ? xcalloc(MS, sizeof(double)) : NULL;   /* 0 = no estimate yet */
     uint64_t  mtp_acc_steps = 0, mtp_acc_drafts = 0, mtp_acc_hits = 0, mtp_acc_emit = 0;
+    /* Draft-gate census (instrument for the tok/step gap): per live-bank
+     * step, WHY did the drafter emit zero drafts?  Codegen C1 measured
+     * ~15 of 71 steps drafting nothing with quench OFF -- these counters
+     * name the thief.  Printed beside CONT_MTP_ACCEPT at shutdown. */
+    uint64_t  dg_drafted = 0, dg_noseed = 0, dg_kv = 0, dg_quench = 0,
+              dg_adwin = 0, dg_concgate = 0;
     /* v0.5.1 inc4: were the drafts the accept loop is consuming produced by
      * the MTP arms (vs DSpark)?  Set at each step's draft production; the
      * accept guard only accounts MTP-sourced drafts. */
@@ -52321,7 +52475,10 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 } else if (dspark_mode && !dspark_now) {
                     /* D4.5e gate: DSpark concurrency-gated OFF this step -> draft nothing, so
                      * the next step's verify is 1 row/bank (plain batched decode). */
-                    for (uint32_t b = 0; b < MS; b++) ndr[b] = 0u;
+                    for (uint32_t b = 0; b < MS; b++) {
+                        if (live[b]) dg_concgate++;
+                        ndr[b] = 0u;
+                    }
                 } else if (dspark_mode) {
                     /* D4.5d/E7: DSpark BLOCK draft.  For every still-live committed bank,
                      * draft a [bonus,noise*4] block at positions [posv[b]..posv[b]+4] with
@@ -52336,14 +52493,16 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                     uint32_t nl = 0;
                     for (uint32_t b = 0; b < MS; b++) {
                         ndr[b] = 0u;
-                        if (!live[b] || cfirst[b] == UINT32_MAX) continue;
+                        if (!live[b]) continue;
+                        if (cfirst[b] == UINT32_MAX) { dg_noseed++; continue; }
                         /* D4.5f: kv-gated bank -> no drafts (its verify packs nd=0 anyway). */
-                        if (dspark_max_kv != 0u && posv[b] >= dspark_max_kv) continue;
+                        if (dspark_max_kv != 0u && posv[b] >= dspark_max_kv) { dg_kv++; continue; }
                         /* Phase 2: terminally quenched bank follows the same no-draft path. */
-                        if (dspark_quench && qn_quenched[b]) continue;
+                        if (dspark_quench && qn_quenched[b]) { dg_quench++; continue; }
                         /* D4.5g: spec-off window -> no drafts this step (re-entry pays a
                          * 1-step ramp: the first spec step packs 0 drafts and re-seeds). */
-                        if (ad_active && b == ad_b && !ad_eff_spec) continue;
+                        if (ad_active && b == ad_b && !ad_eff_spec) { dg_adwin++; continue; }
+                        dg_drafted++;
                         Pbank[nl]   = (int32_t)posv[b];
                         bonusv[nl]  = cur[b];
                         bankmap[nl] = b;
@@ -52657,6 +52816,12 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 (unsigned long long)mtp_acc_drafts, (unsigned long long)mtp_acc_hits,
                 mtp_acc_drafts ? 100.0 * (double)mtp_acc_hits / (double)mtp_acc_drafts : 0.0,
                 mtp_acc_steps ? (double)mtp_acc_emit / (double)mtp_acc_steps : 0.0);
+    if (dspark_mode)
+        fprintf(stderr, "ds4: CONT_MTP_DRAFTGATE drafted=%llu noseed=%llu kv=%llu "
+                "quench=%llu adwin=%llu concgate=%llu (bank-steps)\n",
+                (unsigned long long)dg_drafted, (unsigned long long)dg_noseed,
+                (unsigned long long)dg_kv, (unsigned long long)dg_quench,
+                (unsigned long long)dg_adwin, (unsigned long long)dg_concgate);
 
     if (dspark_prof) {
         const double denom = dspark_prof_steps ? (double)dspark_prof_steps : 1.0;
@@ -57322,6 +57487,28 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             token_vec_push(&s->checkpoint, prompt->v[i]);
         }
         return 0;
+    }
+
+    /* v0.6.3 Inc 5: whole-prompt depth fence -- the widest single forward
+     * this sync will submit is min(prefill_cap, prompt len); past the
+     * fence the generic kernels are unqualified (see
+     * ds4_prefill_fence_rows), so refuse by name, before any state is
+     * torn down.  The server refuses the same class with a typed
+     * envelope before allocation; this is the belt-and-braces for
+     * direct engine callers (CLI, agent, API embedders). */
+    {
+        const uint32_t fence = ds4_prefill_fence_rows();
+        uint32_t width = s->prefill_cap;
+        if ((uint32_t)prompt->len < width) width = (uint32_t)prompt->len;
+        if (fence != 0u && width > fence) {
+            snprintf(err, errlen,
+                     "whole-prompt prefill fenced: a single %u-row forward "
+                     "exceeds the %u-row fence (DS4_METAL_PREFILL_CHUNK<=0 "
+                     "or >%u is a probe lever, unqualified at depth); unset "
+                     "it or set DS4_PREFILL_NOFENCE=1",
+                     width, fence, fence);
+            return 1;
+        }
     }
 
     bool ok;

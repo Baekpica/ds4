@@ -5,6 +5,87 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.6.3 — 2026-08-21
+
+- **Numerics note** — the decode-dispatch change in the full-window
+  work (below) shifts some temperature-0 generation trajectories: the
+  frozen eval battery holds quality parity (needle retrieval perfect
+  at every depth, code suites exact, everything else within the ±1
+  band; receipts in the release notes), while benchmark scores that
+  hinge on a handful of long scenarios can move a few points between
+  kernel paths. Tool-eval-bench restamps at 83/100/82/80 on this
+  lineage.
+- **Best-fit trim victims** — admission-pressure reclaim used to
+  walk victims purely in recency order, so a deep trunk could die
+  for a deficit a small idle bank would have covered (measured:
+  want 1,646 MiB, released a 2,896 MiB bank, +76% over-reclaim and
+  the deepest warm context destroyed). When one victim's release
+  covers the whole remaining deficit, the engine now picks the
+  smallest such victim in the same validity class, and among equal
+  releases the shallowest one (same bytes freed, less warm context
+  destroyed); earlier victims in a multi-bank reclaim keep the
+  recency order (they are consumed whole either way). The substitution is disclosed
+  (`best-fit victim` line) and the trim summary reports released vs
+  wanted. `DS4_BATCH_TRIM_BESTFIT=0` restores the pure recency
+  walk. (A prefix-preserving tail trim was prototyped and refuted
+  on receipt: VMM page granularity plus the raw-ring warm-fork
+  floor cap its yield below one page per slab at any context, so
+  whole-bank release with a better-chosen victim is the honest
+  fix.)
+- **Whole-prompt depth fence** — the whole-prompt probe modes
+  (`DS4_METAL_PREFILL_CHUNK<=0`, or an explicit chunk wider than
+  8,192) could submit single forwards of unbounded depth into
+  kernels that are unqualified past 8,192 rows, failing as a crash
+  or silently wrong output. Such requests now get a typed refusal
+  naming the lever (server: typed 503 before any allocation; engine:
+  a named error for direct callers), and the boot log discloses the
+  mode whenever it is active. `DS4_PREFILL_NOFENCE=1` lifts the
+  fence for deliberate probe runs. The default chunked path cannot
+  hit the fence. Also fixes doc drift: `DS4_CONT_PREFILL_CHUNK_LIVE`
+  defaults to 512, not the documented 4096.
+- **The full 1,048,576-token window, qualified to the last token** —
+  the deepest ~32k tokens of the window (compressed rows past 7,936,
+  first crossed at 1,015,936 resident) previously rode a fixed-size
+  score buffer on the fallback decode paths: the head-group flash
+  kernel was skipped past the cap, a captured fallback froze its row
+  count and silently dropped the deepest rows on replay, and
+  substrate callers refused outright. The dispatch now tries the
+  uncapped head-group kernel first at depth and gives the online
+  fallback live per-request scalars, so every supported decode shape
+  serves the full window (audit Finding 1). An exactly-full persisted
+  bank also restores now instead of being rejected by an off-by-one
+  bound (Finding 2). Gate: tail-needle legs at 1,029,340 prompt tokens
+  (needle at 99.9% depth, retrieved exactly) on both the default and
+  forced-fallback paths, plus an exact-fill persist/restore leg.
+- **Think-dial observability** — serving log lines now carry
+  `think=<none|low|high|max>` (the request's effort dial; the THINKING
+  flag remains the live inside-think state), and the continuous lane
+  gains the per-request completion line it never had
+  (`cont chat ctx=... gen=... think=... finish=...`); previously a
+  cont-served request was log-invisible and seeing its effort needed
+  serial debug plus `--trace`. A `think_modes` counter family lands in
+  `/v1/stats` and `/metrics` (`ds4_requests_think_total{mode=...}`).
+  The agent now warns when `--think-max` steps down below the 384K
+  context floor (CLI and eval already warned; the server honors
+  explicit levels at any context since v0.5.4).
+- **Chunked request bodies** — the HTTP reader now decodes
+  `Transfer-Encoding: chunked` request bodies (proxies such as
+  llama-swap, gpustack, and Open WebUI chains re-frame bodies as
+  chunked; previously the reader parsed only `Content-Length`, so a
+  proxied request read as an empty body and died as a JSON error).
+  The decoded body observes the same 64 MiB cap; chunk extensions and
+  trailers are discarded; malformed framing answers 400.
+  `DS4_SERVER_CHUNKED=0` restores the previous reader.
+- **Typed refusal for schema-constrained output** — a `response_format`
+  requesting `json_object` or `json_schema` (OpenAI surfaces),
+  `text.format` (Responses), or `output_format` / `output_config.format`
+  (Anthropic) now answers HTTP 400 with a message naming the mode, in
+  the endpoint's native error envelope, instead of silently serving
+  free text a client would try to parse as JSON. Plain `{"type":"text"}`,
+  `null`, and omitted stay accepted; the string spelling of a schema
+  mode is refused too rather than skipped. Structured output itself
+  (constraining decode to a schema) remains unimplemented and tracked.
+
 ## v0.6.2-dfm — 2026-08-21
 
 - Motif-3 partial prefix reuse on the continuous lane: the Solar

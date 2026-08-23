@@ -1064,7 +1064,109 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
     return true;
 }
 
-static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
+/* v0.6.3: schema-constrained output modes get a typed refusal instead of the
+ * silent free-text fallback the field mistook for support (ds4-on-spark#10).
+ * Absent, null, and plain-text formats stay accepted -- OpenAI SDKs attach
+ * {"type":"text"} casually.  `field` names the wire key ("response_format",
+ * "text.format", "output_format") so the refusal matches the surface. */
+static bool output_format_type_supported(const char *field, const char *type,
+                                         char *err, size_t errlen) {
+    if (!strcmp(type, "text")) return true;
+    if (!strcmp(type, "json_object") || !strcmp(type, "json_schema")) {
+        snprintf(err, errlen,
+                 "%s type '%s' is not implemented: structured output is "
+                 "unsupported; omit %s or use type \"text\"",
+                 field, type, field);
+        return false;
+    }
+    snprintf(err, errlen, "%s type '%s' is not supported", field, type);
+    return false;
+}
+
+static bool parse_output_format_value(const char **p, const char *field,
+                                      char *err, size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p == '"') {
+        /* String shorthand ("json_object") is not documented wire surface,
+         * but tolerating it here keeps every spelling of a schema request
+         * refusable instead of silently skipped. */
+        char *type = NULL;
+        if (!json_string(p, &type)) return false;
+        const bool ok = output_format_type_supported(field, type, err, errlen);
+        free(type);
+        return ok;
+    }
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    char *type = NULL;
+    bool ok = true;
+    while (ok && **p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) { ok = false; break; }
+        json_ws(p);
+        if (**p != ':') { free(key); ok = false; break; }
+        (*p)++;
+        if (!strcmp(key, "type")) {
+            json_ws(p);
+            free(type);
+            type = NULL;
+            if (!json_string(p, &type)) ok = false;
+        } else if (!json_skip_value(p)) {
+            ok = false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (ok && **p == '}') (*p)++; else ok = false;
+    /* A typeless object constrains nothing, so it stays accepted. */
+    if (ok && type) ok = output_format_type_supported(field, type, err, errlen);
+    free(type);
+    return ok;
+}
+
+/* The Responses surface nests its output format one level down:
+ * text.format.  Everything else under "text" (verbosity, ...) is skipped
+ * as before; only the format object is inspected for the #10 refusal. */
+static bool parse_responses_text_value(const char **p, char *err, size_t errlen) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "format")) {
+            if (!parse_output_format_value(p, "text.format", err, errlen)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool parse_output_config_effort(const char **p, ds4_think_mode *effort,
+                                       char *err, size_t errlen) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '{') return json_skip_value(p);
@@ -1081,6 +1183,11 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
         (*p)++;
         if (!strcmp(key, "effort")) {
             if (!parse_reasoning_effort_value(p, effort)) {
+                free(key);
+                return false;
+            }
+        } else if (!strcmp(key, "format")) {
+            if (!parse_output_format_value(p, "output_config.format", err, errlen)) {
                 free(key);
                 return false;
             }
@@ -4297,6 +4404,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "response_format")) {
+            if (!parse_output_format_value(&p, "response_format", err, errlen)) {
+                free(key);
+                goto bad;
+            }
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
@@ -4464,7 +4576,12 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             got_thinking = true;
         } else if (!strcmp(key, "output_config")) {
-            if (!parse_output_config_effort(&p, &reasoning_effort)) {
+            if (!parse_output_config_effort(&p, &reasoning_effort, err, errlen)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "output_format")) {
+            if (!parse_output_format_value(&p, "output_format", err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -5360,6 +5477,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                  * thinking. Other effort values choose between HIGH and MAX. */
                 if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
             }
+        } else if (!strcmp(key, "text")) {
+            if (!parse_responses_text_value(&p, err, errlen)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "previous_response_id") ||
                    !strcmp(key, "conversation"))
         {
@@ -5639,6 +5761,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             got_thinking = true;
         } else if (!strcmp(key, "stop")) {
             if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "response_format")) {
+            if (!parse_output_format_value(&p, "response_format", err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -13427,6 +13554,7 @@ static bool stream_heartbeat_emit(int fd, const request *r,
 }
 
 static void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
+                                ds4_think_mode think_mode,
                                 bool responses_protocol,
                                 bool tools, bool thinking,
                                 bool dsml_start, bool dsml_end,
@@ -13445,11 +13573,16 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     char flags[80];
     log_flags(flags, sizeof(flags), responses_protocol,
               tools, thinking, dsml_start, dsml_end);
+    /* v0.6.3 Inc 3: the request's effort DIAL rides every progress line
+     * (the THINKING flag is the live inside-think state, a different
+     * fact) -- the field's way to see which effort a request ran at
+     * without serial debug + --trace. */
     server_log(DS4_LOG_GENERATION,
-               "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               "ds4-server: %s ctx=%s gen=%d think=%s%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",
                ctx,
                completion,
+               ds4_think_mode_name(think_mode),
                flags[0] ? " " : "",
                flags,
                chunk_tps,
@@ -15148,6 +15281,7 @@ decode_again:
 
             if (acc.completion >= next_decode_log) {
                 log_decode_progress(j->req.kind, prompt_tokens, acc.completion,
+                                    j->req.think_mode,
                                     responses_protocol,
                                     j->req.has_tools,
                                     acc.thinking.inside,
@@ -15294,6 +15428,7 @@ decode_again:
 
     if (acc.completion > last_decode_log_completion) {
         log_decode_progress(j->req.kind, prompt_tokens, acc.completion,
+                            j->req.think_mode,
                             responses_protocol,
                             j->req.has_tools,
                             acc.thinking.inside,
@@ -15618,9 +15753,10 @@ decode_again:
                   acc.saw_tool_end);
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       "ds4-server: chat ctx=%s gen=%d think=%s%s%s finish=%s error=\"%s\" %.3fs",
                        ctx_span,
                        acc.completion,
+                       ds4_think_mode_name(j->req.think_mode),
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -15628,9 +15764,10 @@ decode_again:
                        now_sec() - t0);
         } else {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       "ds4-server: chat ctx=%s gen=%d think=%s%s%s finish=%s %.3fs",
                        ctx_span,
                        acc.completion,
+                       ds4_think_mode_name(j->req.think_mode),
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -15646,10 +15783,11 @@ decode_again:
                   false);
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                       "ds4-server: %s ctx=%s gen=%d think=%s%s%s finish=%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
                        acc.completion,
+                       ds4_think_mode_name(j->req.think_mode),
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -15657,10 +15795,11 @@ decode_again:
                        now_sec() - t0);
         } else {
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
+                       "ds4-server: %s ctx=%s gen=%d think=%s%s%s finish=%s %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
                        acc.completion,
+                       ds4_think_mode_name(j->req.think_mode),
                        flags[0] ? " " : "",
                        flags,
                        final_finish,
@@ -16857,6 +16996,37 @@ static void run_job_single(server *s, job *j) {
         j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
         job_finish(j);
         return;
+    }
+    /* v0.6.3 Inc 5: whole-prompt depth fence (1M-audit Findings 3-10).
+     * With DS4_METAL_PREFILL_CHUNK<=0 (or an explicit width past the
+     * fence) this lane would submit a single forward wider than the
+     * proven 8,192-row ceiling -- unqualified kernels, crash-or-silence
+     * failure mode.  Refuse typed BEFORE any session/graph allocation;
+     * ds4_session_sync repeats the fence for non-server callers.
+     * DS4_PREFILL_NOFENCE=1 lifts both. */
+    {
+        uint32_t fence_w = 0, fence_r = 0;
+        if (ds4_serial_prefill_fenced(s->serial_boot_ctx, j->req.prompt.len,
+                                      &fence_w, &fence_r)) {
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                     "Whole-prompt prefill is fenced: this request needs a "
+                     "single %u-row forward, past the proven %u-row ceiling "
+                     "(DS4_METAL_PREFILL_CHUNK is a probe lever, unqualified "
+                     "at this depth); unset it or set DS4_PREFILL_NOFENCE=1",
+                     fence_w, fence_r);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: whole-prompt depth fence: refusing serial "
+                       "request (forward=%u rows > fence=%u, prompt=%d tokens)",
+                       fence_w, fence_r, j->req.prompt.len);
+            ds4_metric_add(&ds4_metrics_get()->requests_rejected_typed
+                               [DS4_REJLANE_SERIAL][DS4_REJECT_DEEP_POLICY], 1);
+            wire_http_error(j->fd, s->enable_cors, wire_surface_for(&j->req),
+                            503, msg);
+            j->outcome = JOB_OUT_REFUSED_DEEP_SERIAL;
+            job_finish(j);
+            return;
+        }
     }
     pthread_mutex_lock(&s->gen_mu);     /* W2: exclude the /v1/batch GPU path */
     int hold_retry = 0;
@@ -18557,6 +18727,26 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
     }
 }
 
+/* v0.6.3 Inc 3: the cont lane's per-request completion line.  The serial
+ * runner always logged one (generate_job's finish= lines); cont rows were
+ * log-invisible per request, which is why seeing a request's effort dial
+ * needed serial debug + --trace (378855, tayaee44's documented
+ * workaround).  One line per settled row: tokens, dial, finish, lifetime. */
+static void log_cont_completion(const job *j, const cont_stream *st,
+                                int prompt_tokens, const char *fin) {
+    char ctx[48];
+    request_ctx_span(ctx, sizeof(ctx), prompt_tokens,
+                     prompt_tokens + st->acc.completion);
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: cont %s ctx=%s gen=%d think=%s finish=%s %.3fs",
+               j->req.kind == REQ_CHAT ? "chat" : "completion",
+               ctx,
+               st->acc.completion,
+               ds4_think_mode_name(j->req.think_mode),
+               fin,
+               now_sec() - j->t_arrive);
+}
+
 /* Flush any held-back tail, emit the finish chunk + [DONE], and free the state.
  * fin is "stop" (EOS) or "length" (budget/aborted); a host-side scan verdict
  * (stop string / closed tool block) overrides it.  Does NOT job_finish (caller
@@ -18610,6 +18800,7 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
         }
         if (!ok) st->failed = true;
     }
+    log_cont_completion(j, st, st->prompt_tokens, fin);
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
@@ -18690,6 +18881,7 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         wire_finish_buffered(j->fd, s->enable_cors, &j->req, &ws, &res);
         wire_free(&ws);
     }
+    log_cont_completion(j, st, prompt_tokens, fin);
     cont_stream_discard(j);
 }
 
@@ -19236,6 +19428,116 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+/* v0.6.3 Inc 2: Transfer-Encoding: chunked request bodies.  Proxies in
+ * front of this server (llama-swap, gpustack, Open WebUI chains) re-frame
+ * bodies as chunked; before this the reader saw no Content-Length and
+ * parsed an empty body, so every proxied request died as a JSON error
+ * (ds4-on-spark#15's likely shape).  DS4_SERVER_CHUNKED=0 restores the
+ * pre-v0.6.3 reader (kill switch; read per request so tests can flip it). */
+static bool http_chunked_enabled(void) {
+    const char *e = getenv("DS4_SERVER_CHUNKED");
+    return !(e && !strcmp(e, "0"));
+}
+
+static bool header_chunked(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= 18 && strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
+            for (size_t i = 18; i + 7 <= len; i++)
+                if (strncasecmp(line + i, "chunked", 7) == 0) return true;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
+/* Pull socket bytes into b until a full line ('\n'-terminated) exists at
+ * or after pos; returns the index just past the '\n', or -1 on EOF or a
+ * line longer than max_line (framing lines are tiny; a huge one is a
+ * protocol error, not a large body). */
+static ssize_t chunk_line_end(int fd, buf *b, size_t pos, size_t max_line) {
+    size_t scan = pos;
+    for (;;) {
+        for (; scan < b->len; scan++)
+            if (b->ptr[scan] == '\n') return (ssize_t)(scan + 1);
+        if (b->len - pos > max_line) return -1;
+        char tmp[8192];
+        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        buf_append(b, tmp, (size_t)n);
+    }
+}
+
+/* Decode a chunked body into r->body.  The decoder consumes from the
+ * header read-ahead first and pulls more only when a complete piece is
+ * missing; consumed framing is compacted away each chunk, so raw
+ * buffering stays bounded by one chunk regardless of body size.  Chunk
+ * extensions and trailers are discarded.  The DECODED body observes the
+ * same max_body cap as Content-Length bodies; bare-LF line endings are
+ * tolerated exactly like the header parser's. */
+static bool read_chunked_body(int fd, buf *b, size_t pos, http_request *r,
+                              size_t max_body) {
+    buf body = {0};
+    for (;;) {
+        if (pos > 0) {
+            memmove(b->ptr, b->ptr + pos, b->len - pos);
+            b->len -= pos;
+            pos = 0;
+        }
+        ssize_t le = chunk_line_end(fd, b, pos, 8192);
+        if (le < 0) goto fail;
+        /* Size line: hex first (strtoul's own whitespace-skip would walk
+         * a blank line into the next chunk's payload, so require a digit
+         * up front), optional ";extension" or trailing spaces discarded. */
+        if (!isxdigit((unsigned char)b->ptr[pos])) goto fail;
+        char *endp = NULL;
+        unsigned long sz = strtoul(b->ptr + pos, &endp, 16);
+        while (endp < b->ptr + le && (*endp == ' ' || *endp == '\t')) endp++;
+        if (*endp != ';' && *endp != '\r' && *endp != '\n') goto fail;
+        pos = (size_t)le;
+        if (sz == 0) break;
+        if (sz > max_body || body.len + sz > max_body) goto fail;
+        while (b->len < pos + sz) {
+            char tmp[8192];
+            ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) goto fail;
+            buf_append(b, tmp, (size_t)n);
+        }
+        buf_append(&body, b->ptr + pos, sz);
+        pos += sz;
+        /* The payload's trailing CRLF is exactly an empty line. */
+        ssize_t crlf = chunk_line_end(fd, b, pos, 2);
+        if (crlf < 0) goto fail;
+        size_t l2 = (size_t)crlf - pos;
+        if (!(l2 == 1 || (l2 == 2 && b->ptr[pos] == '\r'))) goto fail;
+        pos = (size_t)crlf;
+    }
+    /* Trailer lines until a blank one, all discarded. */
+    for (;;) {
+        ssize_t le = chunk_line_end(fd, b, pos, 8192);
+        if (le < 0) goto fail;
+        size_t linelen = (size_t)le - pos;
+        bool blank = linelen == 1 || (linelen == 2 && b->ptr[pos] == '\r');
+        pos = (size_t)le;
+        if (blank) break;
+    }
+    r->body_len = body.len;
+    r->body = xmalloc(body.len + 1);
+    if (body.len) memcpy(r->body, body.ptr, body.len);
+    r->body[body.len] = '\0';
+    buf_free(&body);
+    return true;
+fail:
+    buf_free(&body);
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -19266,6 +19568,12 @@ static bool read_http_request(int fd, http_request *r) {
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     r->accept_json = header_accepts_json(b.ptr, (size_t)hend);
+    if (header_chunked(b.ptr, (size_t)hend) && http_chunked_enabled()) {
+        /* RFC 7230 3.3.3: Transfer-Encoding wins over any Content-Length. */
+        if (!read_chunked_body(fd, &b, (size_t)hend, r, max_body)) goto fail;
+        buf_free(&b);
+        return true;
+    }
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
@@ -20063,6 +20371,13 @@ static void send_metrics(server *s, int fd) {
                    shed_reason_names[ri],
                    (unsigned long long)ds4_metric_read(&m->requests_shed[ri]));
     }
+    /* v0.6.3 Inc 3: requests by effort dial (ds4_think_mode order). */
+    buf_puts(&b, "# TYPE ds4_requests_think_total counter\n");
+    for (int ti = 0; ti < 4; ti++) {
+        buf_printf(&b, "ds4_requests_think_total{mode=\"%s\"} %llu\n",
+                   ds4_think_mode_name((ds4_think_mode)ti),
+                   (unsigned long long)ds4_metric_read(&m->requests_think[ti]));
+    }
     {
         pthread_mutex_lock(&s->mu);
         const int    nclients = s->clients;
@@ -20477,6 +20792,15 @@ static void send_stats(server *s, int fd, bool as_json) {
             buf_printf(&b, "%s\"%s\":%llu",
                        ri ? "," : "", route_reason_names[ri],
                        (unsigned long long)ds4_metric_read(&m->route_decisions[ri]));
+        }
+        buf_putc(&b, '}');
+        /* v0.6.3 Inc 3: requests by effort dial (ds4_think_mode order). */
+        buf_puts(&b, ",\"think_modes\":{");
+        for (int ti = 0; ti < 4; ti++) {
+            buf_printf(&b, "%s\"%s\":%llu",
+                       ti ? "," : "",
+                       ds4_think_mode_name((ds4_think_mode)ti),
+                       (unsigned long long)ds4_metric_read(&m->requests_think[ti]));
         }
         buf_putc(&b, '}');
         /* Inc 2e: sheds + live backpressure (s->mu = queue lock, not gen_mu). */
@@ -21048,6 +21372,9 @@ static void *client_main(void *arg) {
     }
     ds4_metric_add(&ds4_metrics_get()->requests_started, 1);
     ds4_metric_add(&ds4_metrics_get()->requests_inflight, 1);
+    /* v0.6.3 Inc 3: per-dial request counter (enum is the closed set
+     * none/low/high/max = 0..3; parse never produces anything else). */
+    ds4_metric_add(&ds4_metrics_get()->requests_think[j.req.think_mode], 1);
     /* W8a: drain worker-produced output to the socket on THIS (client) thread, so a
      * slow client never blocks the GPU worker.  The continuous path appends bytes
      * via job_emit (under j.mu) and signals; we send whatever is buffered with j.mu
@@ -22107,6 +22434,30 @@ int main(int argc, char **argv) {
 #endif
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
+    {
+        /* v0.6.3 Inc 5: the whole-prompt probe modes get a boot disclosure
+         * (the env had none; its failure mode used to be a depth crash). */
+        uint32_t fence_w = 0, fence_r = 0;
+        (void)ds4_serial_prefill_fenced(cfg.ctx_size, cfg.ctx_size,
+                                        &fence_w, &fence_r);
+        if (fence_w > 8192u) {
+            if (fence_r != 0u) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: serial prefill widened to %u-row "
+                           "forwards by DS4_METAL_PREFILL_CHUNK (probe lever): "
+                           "requests past the %u-row fence get a typed refusal; "
+                           "DS4_PREFILL_NOFENCE=1 lifts the fence",
+                           fence_w, fence_r);
+            } else {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: whole-prompt depth fence LIFTED "
+                           "(DS4_PREFILL_NOFENCE=1): serial forwards up to %u "
+                           "rows will be attempted; unqualified past 8192, "
+                           "expect crashes or wrong output at depth",
+                           fence_w);
+            }
+        }
+    }
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {
             .ctx_size = cfg.ctx_size,
@@ -24451,9 +24802,11 @@ static void test_api_thinking_controls_parse(void) {
     TEST_ASSERT(enabled);
 
     ds4_think_mode mode = DS4_THINK_LOW;
+    char oc_err[160] = {0};
     const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
-    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode));
+    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode, oc_err, sizeof(oc_err)));
     TEST_ASSERT(mode == DS4_THINK_MAX);
+    TEST_ASSERT(oc_err[0] == '\0');
 
     const char *openai_effort = "\"xhigh\"";
     mode = DS4_THINK_LOW;
@@ -31184,10 +31537,10 @@ static void test_cont_budget_cut_toolcall_keeps_length(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
-/* Contract record: the HTTP reader parses only Content-Length and Accept;
- * an Idempotency-Key header is accepted and silently discarded, so a retry
- * is a NEW generation with new IDs.  Documented unsupported in
- * docs/ds4-api-surface-matrix.md. */
+/* Contract record: the HTTP reader parses Content-Length,
+ * Transfer-Encoding (v0.6.3), and Accept; an Idempotency-Key header is
+ * accepted and silently discarded, so a retry is a NEW generation with
+ * new IDs.  Documented unsupported in docs/ds4-api-surface-matrix.md. */
 static void test_idempotency_key_header_is_ignored(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -31214,6 +31567,105 @@ static void test_idempotency_key_header_is_ignored(void) {
     http_request_free(&hr);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* v0.6.3 Inc 2: chunked request decoding.  Every wire image is written
+ * whole then the write side shut down, so a decoder that over-reads hits
+ * EOF and fails instead of hanging.  The kill-switch leg pins the
+ * pre-v0.6.3 behavior (chunked read as a zero-length body) -- that is the
+ * shape the field's proxied requests died with. */
+static bool chunked_reader_run(const char *wire, http_request *hr) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return false;
+    memset(hr, 0, sizeof(*hr));
+    const ssize_t n = (ssize_t)strlen(wire);
+    bool ok = send(sv[0], wire, (size_t)n, 0) == n;
+    shutdown(sv[0], SHUT_WR);
+    ok = ok && read_http_request(sv[1], hr);
+    close(sv[0]);
+    close(sv[1]);
+    return ok;
+}
+
+static void test_chunked_request_decoding(void) {
+    http_request hr;
+
+    /* Single chunk. */
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "b\r\nhello world\r\n0\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 11 && !strcmp(hr.body, "hello world"));
+    http_request_free(&hr);
+
+    /* Multiple chunks, an extension, and a trailer. */
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: v\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 11 && !strcmp(hr.body, "hello world"));
+    http_request_free(&hr);
+
+    /* Terminator only: empty body, still a successful read. */
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/completions HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "0\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 0 && hr.body[0] == '\0');
+    http_request_free(&hr);
+
+    /* RFC 7230 3.3.3: Transfer-Encoding wins over Content-Length. */
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/responses HTTP/1.1\r\n"
+        "Content-Length: 5\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "b\r\nhello world\r\n0\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 11 && !strcmp(hr.body, "hello world"));
+    http_request_free(&hr);
+
+    /* Garbage size line -> read fails (caller answers 400). */
+    TEST_ASSERT(!chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "zz\r\nhello\r\n0\r\n\r\n", &hr));
+
+    /* Payload not followed by CRLF -> framing error. */
+    TEST_ASSERT(!chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "5\r\nhelloX0\r\n\r\n", &hr));
+
+    /* A blank size line must not let strtoul walk into the payload. */
+    TEST_ASSERT(!chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "\r\n5\r\nhello\r\n0\r\n\r\n", &hr));
+
+    /* A declared chunk larger than the body cap refuses. */
+    TEST_ASSERT(!chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "4000001\r\n", &hr));
+
+    /* Kill switch pins the pre-v0.6.3 reader: chunked reads as a
+     * zero-length body (no Content-Length parsed). */
+    setenv("DS4_SERVER_CHUNKED", "0", 1);
+    TEST_ASSERT(chunked_reader_run(
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "b\r\nhello world\r\n0\r\n\r\n", &hr));
+    TEST_ASSERT(hr.body_len == 0);
+    http_request_free(&hr);
+    unsetenv("DS4_SERVER_CHUNKED");
 }
 
 /* Contract record: non-null Responses previous_response_id / conversation
@@ -31330,6 +31782,93 @@ static void test_error_envelopes_native_shapes(void) {
         TEST_ASSERT(!parse_completion_request(NULL, "{\"max_tokens\":-1}",
                                               128, 4096, &pr, err, sizeof(err)));
         TEST_ASSERT(strstr(err, "max_tokens must be >= 0") != NULL);
+    }
+
+    /* v0.6.3: response_format contract (ds4-on-spark#10).  Plain, null,
+     * and typeless formats stay accepted -- proved by the parse failing
+     * LATER on the missing required field, so the format itself was not
+     * the objection.  Schema-constrained modes refuse with a typed
+     * message naming the mode, on every surface and in every spelling
+     * (nested schema first, string shorthand, output_config nesting). */
+    {
+        char err[160];
+        request pr;
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{\"type\":\"text\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing messages") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":null}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing messages") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing messages") != NULL);
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{\"type\":\"json_object\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "response_format type 'json_object' is not implemented") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{\"json_schema\":{\"schema\":{\"type\":\"object\"}},"
+            "\"type\":\"json_schema\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "'json_schema' is not implemented") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":{\"type\":\"xml\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "response_format type 'xml' is not supported") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_chat_request(NULL, NULL,
+            "{\"response_format\":\"json_object\"}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "'json_object' is not implemented") != NULL);
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_completion_request(NULL,
+            "{\"response_format\":{\"type\":\"text\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing prompt") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_completion_request(NULL,
+            "{\"response_format\":{\"type\":\"json_object\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "response_format type 'json_object' is not implemented") != NULL);
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_responses_request(NULL, NULL,
+            "{\"text\":{\"format\":{\"type\":\"text\"},\"verbosity\":\"low\"}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing input") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_responses_request(NULL, NULL,
+            "{\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"x\"}}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "text.format type 'json_schema' is not implemented") != NULL);
+
+        err[0] = '\0';
+        TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
+            "{\"output_format\":null}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "missing messages") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
+            "{\"output_format\":{\"type\":\"json_schema\",\"schema\":{}}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "output_format type 'json_schema' is not implemented") != NULL);
+        err[0] = '\0';
+        TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
+            "{\"output_config\":{\"effort\":\"high\",\"format\":{\"type\":\"json_object\"}}}",
+            128, 4096, &pr, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "output_config.format type 'json_object' is not implemented") != NULL);
     }
 
     /* Responses stream, no machine yet: protocol event, sequence 0. */
@@ -33140,6 +33679,104 @@ static void test_unit_span_lookup(void) {
     TEST_ASSERT(lo == -1 && hi == -1);
 }
 
+/* v0.6.3 Inc 5: whole-prompt depth fence predicate.  Pure env+arith --
+ * pin the default-config immunity, the fenced shapes, the boundary, and
+ * the escape hatch. */
+static void test_prefill_depth_fence(void) {
+    const char *old_chunk = getenv("DS4_METAL_PREFILL_CHUNK");
+    const char *old_nofence = getenv("DS4_PREFILL_NOFENCE");
+    char *saved_chunk = old_chunk ? xstrdup(old_chunk) : NULL;
+    char *saved_nofence = old_nofence ? xstrdup(old_nofence) : NULL;
+    uint32_t w = 0, f = 0;
+
+    /* Default config: chunked at 4096; the fence is unreachable. */
+    unsetenv("DS4_METAL_PREFILL_CHUNK");
+    unsetenv("DS4_PREFILL_NOFENCE");
+    TEST_ASSERT(ds4_prefill_fence_rows() == 8192u);
+    TEST_ASSERT(!ds4_serial_prefill_fenced(32768, 20000, &w, &f));
+    TEST_ASSERT(w == 4096u && f == 8192u);
+
+    /* Whole-prompt mode: the cap pins to ctx; a deep prompt trips it. */
+    setenv("DS4_METAL_PREFILL_CHUNK", "0", 1);
+    TEST_ASSERT(ds4_serial_prefill_fenced(32768, 20000, &w, &f));
+    TEST_ASSERT(w == 20000u && f == 8192u);
+    /* Boundary is inclusive: exactly 8192 rows is proven territory. */
+    TEST_ASSERT(!ds4_serial_prefill_fenced(32768, 8192, &w, &f));
+    TEST_ASSERT(w == 8192u);
+    /* An explicit wide chunk trips it too (the chunked branch submits
+     * cap-wide forwards). */
+    setenv("DS4_METAL_PREFILL_CHUNK", "16384", 1);
+    TEST_ASSERT(ds4_serial_prefill_fenced(1048576, 100000, &w, &f));
+    TEST_ASSERT(w == 16384u);
+
+    /* The escape hatch lifts the fence entirely. */
+    setenv("DS4_PREFILL_NOFENCE", "1", 1);
+    TEST_ASSERT(ds4_prefill_fence_rows() == 0u);
+    setenv("DS4_METAL_PREFILL_CHUNK", "0", 1);
+    TEST_ASSERT(!ds4_serial_prefill_fenced(1048576, 1000000, &w, &f));
+    TEST_ASSERT(w == 1000000u && f == 0u);
+
+    if (saved_chunk) { setenv("DS4_METAL_PREFILL_CHUNK", saved_chunk, 1); free(saved_chunk); }
+    else unsetenv("DS4_METAL_PREFILL_CHUNK");
+    if (saved_nofence) { setenv("DS4_PREFILL_NOFENCE", saved_nofence, 1); free(saved_nofence); }
+    else unsetenv("DS4_PREFILL_NOFENCE");
+}
+
+/* v0.6.3 Inc 6: the best-fit final-victim pick is pure arithmetic -- the
+ * v0.6.2 victim-order precedent (synthetic scenarios pin the policy; the
+ * ladder's disclosure lines carry field engagement evidence, since live
+ * small-ctx legs cannot exercise it: VMM page-phase alignment leaves only
+ * phase-aligned banks with interior pages there). */
+static void test_trim_bestfit_pick(void) {
+    /* the receipt scenario: the default (deep, oldest) covers, but a
+     * smaller covering victim sits later in the order */
+    {
+        const uint64_t est[]  = {2896, 1700, 900};
+        const uint8_t  val[]  = {1, 1, 1};
+        const uint32_t hist[] = {200000, 90000, 40000};
+        /* want 1646: est 900 does not cover; 1700 does and beats 2896 */
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 1646) == 1u);
+    }
+    /* equal covering estimates: prefer the shallower victim */
+    {
+        const uint64_t est[]  = {42, 42, 42};
+        const uint8_t  val[]  = {1, 1, 1};
+        const uint32_t hist[] = {13823, 3562, 9000};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 13) == 1u);
+    }
+    /* class guard: never trade an invalid-history default up into a
+     * valid bank (and vice versa) */
+    {
+        const uint64_t est[]  = {42, 20, 41};
+        const uint8_t  val[]  = {0, 1, 0};
+        const uint32_t hist[] = {0, 500, 0};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 13) == 2u);
+    }
+    /* non-covering candidates are skipped even if smaller */
+    {
+        const uint64_t est[]  = {42, 12, 41};
+        const uint8_t  val[]  = {1, 1, 1};
+        const uint32_t hist[] = {9000, 100, 8000};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 13) == 2u);
+    }
+    /* nothing beats the default -> 0 */
+    {
+        const uint64_t est[]  = {42, 5, 6};
+        const uint8_t  val[]  = {1, 1, 1};
+        const uint32_t hist[] = {9000, 10, 20};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 3, 13) == 0u);
+    }
+    /* single candidate and degenerate inputs */
+    {
+        const uint64_t est[]  = {42};
+        const uint8_t  val[]  = {1};
+        const uint32_t hist[] = {9000};
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 1, 13) == 0u);
+        TEST_ASSERT(ds4_trim_bestfit_pick(NULL, val, hist, 1, 13) == 0u);
+        TEST_ASSERT(ds4_trim_bestfit_pick(est, val, hist, 0, 13) == 0u);
+    }
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
@@ -33322,6 +33959,9 @@ static void ds4_server_unit_tests_run(void) {
     test_weight_fp_small();
     test_weight_fp_stride_geometry();
     test_idempotency_key_header_is_ignored();
+    test_chunked_request_decoding();
+    test_prefill_depth_fence();
+    test_trim_bestfit_pick();
     test_responses_durable_references_rejected_at_parse();
     test_error_envelopes_native_shapes();
     test_anthropic_stop_sequence_native_shape();

@@ -495,6 +495,30 @@ int  ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx);
 /* MT-5 hygiene: the cont admission chunk width (DS4_CONT_PREFILL_CHUNK,
  * default 4096) -- the input that shapes raw_cap; for boot-ledger honesty. */
 uint32_t ds4_cont_prefill_chunk_tokens(void);
+/* v0.6.3 Inc 5: whole-prompt depth fence.  fence_rows() is the single-
+ * forward ceiling (8192), or 0 when DS4_PREFILL_NOFENCE=1 lifts it.
+ * serial_prefill_fenced() answers whether a serial request of prompt_len
+ * under ctx_size would submit a forward wider than the fence (the session
+ * prefill cap mirrors DS4_METAL_PREFILL_CHUNK; <=0 pins it to ctx_size =
+ * whole-prompt one-shot).  Lets the server refuse with a typed envelope
+ * BEFORE session/graph allocation; ds4_session_sync enforces the same
+ * fence for direct callers.  width_out/fence_out (optional) receive the
+ * offending forward width and the fence for the refusal message. */
+uint32_t ds4_prefill_fence_rows(void);
+int ds4_serial_prefill_fenced(int ctx_size, int prompt_len,
+                              uint32_t *width_out, uint32_t *fence_out);
+/* v0.6.3 Inc 6: pure best-fit final-victim pick.  Candidate 0 is the
+ * recency-blend default (its estimate MUST already cover remaining);
+ * candidates 1..n-1 follow in blend order.  Returns the index of the
+ * chosen victim: the same-validity-class candidate with the smallest
+ * covering release estimate, ties broken toward the smaller history
+ * (equal bytes freed, less warm value destroyed), 0 when no candidate
+ * beats the default.  Pure -- unit-gated like the v0.6.2 victim-order
+ * blend (live small-ctx legs cannot exercise it: VMM page-phase
+ * alignment makes bank 0 the only bank with interior pages there). */
+uint32_t ds4_trim_bestfit_pick(const uint64_t *est, const uint8_t *valid,
+                               const uint32_t *hist, uint32_t n,
+                               uint64_t remaining);
 /* MT-7: the disclosed admission band (DS4_CONT_ADMIT_BAND_X1024, default
  * 1045 = the leg2a-measured 1.02x sequential transient peak, rounded up;
  * clamped to [1024, 2048]; 1024 = physics-exact charging).  Applied inside
@@ -962,6 +986,10 @@ typedef struct {
     uint64_t route_decisions[DS4_METRICS_ROUTE_REASONS];
     /* admission-bound sheds (v0.5.6 Inc 2e; see DS4_METRICS_SHED_REASONS) */
     uint64_t requests_shed[DS4_METRICS_SHED_REASONS];
+    /* v0.6.3 Inc 3: requests by reasoning-effort dial, ds4_think_mode
+     * order (none, low, high, max) -- answers "did my high-effort
+     * requests actually run high" without serial debug + --trace. */
+    uint64_t requests_think[4];
     uint64_t out_backlog_bytes;   /* gauge: stream bytes buffered for slow readers */
     /* continuation registry (v0.5.6 Inc 5a; server-owned semantics) */
     uint64_t creg_published;      /* records published at tool-turn terminals */
