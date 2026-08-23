@@ -1,0 +1,1 @@
+location.href+'\n'+document.readyState+'\n'+((document.body&&document.body.innerText)||'').length

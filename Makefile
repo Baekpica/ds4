@@ -83,7 +83,7 @@ endif
         test-solar-gates test-solar-kv test-solar-tokenizer \
         test-solar-forward test-solar-session \
         test-exaone-ref test-exaone-kernels test-exaone-batch \
-        rust-bridge ds4-rs ds4-bench-rs test-kv-parity
+        rust-bridge ds4-rs ds4-bench-rs test-kv-parity test-web-parity
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -95,6 +95,7 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make rust-bridge  Compile native/bridge/ds4_bridge.o (Rust FFI skeleton)"
 	@echo "  make test-kv-parity  C↔Rust KVC 4-way matrix (Phase 4)"
+	@echo "  make test-web-parity C↔Rust web encode/wire + mock CDP (Phase 5)"
 	@echo "  make ds4-rs       Build Rust shadow ./ds4-rs (same C core)"
 	@echo "  make ds4-bench-rs Build Rust shadow ./ds4-bench-rs"
 	@echo "  make clean        Remove build outputs"
@@ -140,6 +141,7 @@ help:
 	@echo "  make ds4-rs              Build Rust shadow ./ds4-rs (same C core + CUDA objects)"
 	@echo "  make ds4-bench-rs        Build Rust shadow ./ds4-bench-rs"
 	@echo "  make test-kv-parity      C↔Rust KVC 4-way matrix (Phase 4)"
+	@echo "  make test-web-parity     C↔Rust web encode/wire + mock CDP (Phase 5)"
 	@echo "  make clean               Remove build outputs (keeps the recorded cuda configuration)"
 
 # GB10 / DGX Spark is compute capability 12.1. Without an explicit -arch,
@@ -263,6 +265,13 @@ tests/parity/kv_c_oracle: tests/parity/kv_c_oracle.c tests/parity/kv_c_stubs.c d
 
 test-kv-parity: tests/parity/kv_c_oracle
 	DS4_KV_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/kv_c_oracle cargo test -p ds4-kv
+
+# Phase 5: C encode/wire oracle + Rust search/visit against a mock CDP.
+tests/parity/web_c_oracle: tests/parity/web_c_oracle.c
+	$(CC) $(CFLAGS) -o $@ tests/parity/web_c_oracle.c
+
+test-web-parity: tests/parity/web_c_oracle
+	DS4_WEB_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/web_c_oracle cargo test -p ds4-web
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -637,4 +646,4 @@ tests/test_motif3_long: tests/test_motif3_long.o ds4_kvstore.o rax.o $(CORE_OBJS
 endif
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-rs ds4-bench-rs ds4_weight_server tests/parity/kv_c_oracle tests/parity/kv_c_oracle.o tests/parity/kv_c_stubs.o ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_batch tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_batch.o tests/test_motif3_long.o tests/test_exaone_ref tests/test_exaone_kernels tests/test_exaone_batch tests/test_exaone_ref.o tests/test_exaone_kernels.o tests/test_exaone_batch.o *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o native/bridge/ds4_bridge.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-rs ds4-bench-rs ds4_weight_server tests/parity/kv_c_oracle tests/parity/kv_c_oracle.o tests/parity/kv_c_stubs.o tests/parity/web_c_oracle tests/parity/web_c_oracle.o ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_batch tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_batch.o tests/test_motif3_long.o tests/test_exaone_ref tests/test_exaone_kernels tests/test_exaone_batch tests/test_exaone_ref.o tests/test_exaone_kernels.o tests/test_exaone_batch.o *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o native/bridge/ds4_bridge.o

@@ -5,6 +5,7 @@ members = [
     "crates/ds4-core",
     "crates/ds4-cli",
     "crates/ds4-kv",
+    "crates/ds4-web",
     "crates/ds4-server",
     "crates/ds4-dist",
 ]

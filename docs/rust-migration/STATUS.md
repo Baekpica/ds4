@@ -17,7 +17,7 @@ C golden baseline: `v0.6.3-dfm`
 | tokenizer | yes | no | C | — | — |
 | session lifecycle | yes | wrapper | C | — | — |
 | KV store | yes | yes (envelope + policy) | C | 4-way green | n/a |
-| web utility | yes | no | C | — | — |
+| web utility | yes | yes (blocking I/O) | C (`ds4-agent`) | encode/wire + mock CDP green | n/a |
 | server (four surfaces) | yes | no | C | — | — |
 | distributed runtime | yes | no | C | — | — |
 | CLI / bench / agent host | yes | shadow `ds4-rs` / `ds4-bench-rs` | C | — | — |
@@ -36,7 +36,7 @@ C golden baseline: `v0.6.3-dfm`
 | 2 | `ds4-core` safe wrappers | **done** (unit tests; no live model) |
 | 3 | Shadow `ds4-rs` / `ds4-bench-rs` | **linked** (`make ds4-rs`); same-model token/perf gate pending |
 | 4 | KV store port + 4-way matrix | **format/policy green** (`make test-kv-parity`); live session payload still C |
-| 5 | Web utility port | not started |
+| 5 | Web utility port | **done** (`make test-web-parity`); `ds4-agent` still links C `ds4_web.c` |
 | 6 | Distributed runtime port | not started |
 | 7 | Server shadow by feature | not started |
 | 8 | `ds4.c` decomposition | not started |
@@ -71,4 +71,4 @@ non-blocking compile).
   list is evidence-green.
 - Unsafe-audit command: `rg -n 'unsafe \{' crates/`
   Current hits are only `crates/ds4-core` FFI adapters. `ds4-sys` is
-  `extern "C"` declarations. Application crates have none.
+  `extern "C"` declarations. `ds4-kv` and `ds4-web` have none.
