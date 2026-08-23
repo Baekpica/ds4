@@ -1,0 +1,10 @@
+[package]
+name = "ds4-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HTTP wire surfaces (Phase 7)"
+
+[lib]
+path = "src/lib.rs"

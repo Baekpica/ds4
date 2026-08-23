@@ -1,0 +1,10 @@
+[package]
+name = "ds4-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Unsafe FFI bindings to native/bridge/ds4_bridge.h"
+
+[lib]
+path = "src/lib.rs"

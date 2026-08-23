@@ -24,7 +24,7 @@ C golden baseline: `v0.6.3-dfm`
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
 | Metal backend | native | unchanged | native | — | n/a |
 | CUDA / MMQ / VMM | native | unchanged | native | green (C baseline) | green (published band) |
-| FFI bridge (`ds4_bridge`) | n/a | no | n/a | — | — |
+| FFI bridge (`ds4_bridge`) | n/a | skeleton | n/a | — | — |
 | proof harness on Rust path | C binaries | no | C | — | — |
 
 ## Phase checklist
@@ -32,7 +32,7 @@ C golden baseline: `v0.6.3-dfm`
 | Phase | Name | State |
 |---|---|---|
 | 0 | Freeze baseline + this document set | **done** (docs-only commit) |
-| 1 | Cargo workspace + FFI skeleton | not started |
+| 1 | Cargo workspace + FFI skeleton | **done** (`cargo check --workspace`, `make rust-bridge`) |
 | 2 | `ds4-core` safe wrappers | not started |
 | 3 | Shadow `ds4-rs` / `ds4-bench-rs` | not started |
 | 4 | KV store port + 4-way matrix | not started |

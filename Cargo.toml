@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ds4-sys",
+    "crates/ds4-core",
+    "crates/ds4-cli",
+    "crates/ds4-kv",
+    "crates/ds4-server",
+    "crates/ds4-dist",
+]
+
+[workspace.package]
+version = "0.6.3"
+edition = "2021"
+license = "MIT"
+publish = false

@@ -1,0 +1,10 @@
+[package]
+name = "ds4-kv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "KVC checkpoint store (Phase 4)"
+
+[lib]
+path = "src/lib.rs"

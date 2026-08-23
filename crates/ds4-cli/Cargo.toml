@@ -1,0 +1,10 @@
+[package]
+name = "ds4-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "CLI / bench host (shadow binaries in Phase 3)"
+
+[lib]
+path = "src/lib.rs"
