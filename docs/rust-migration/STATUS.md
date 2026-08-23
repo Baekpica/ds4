@@ -15,7 +15,7 @@ C golden baseline: `v0.6.3-dfm`
 | model metadata | yes | no | C | — | n/a |
 | GGUF loading (mmap) | yes | no | C | — | — |
 | tokenizer | yes | no | C | — | — |
-| session lifecycle | yes | no | C | — | — |
+| session lifecycle | yes | wrapper | C | — | — |
 | KV store | yes | no | C | — | — |
 | web utility | yes | no | C | — | — |
 | server (four surfaces) | yes | no | C | — | — |
@@ -33,7 +33,7 @@ C golden baseline: `v0.6.3-dfm`
 |---|---|---|
 | 0 | Freeze baseline + this document set | **done** (docs-only commit) |
 | 1 | Cargo workspace + FFI skeleton | **done** (`cargo check --workspace`, `make rust-bridge`) |
-| 2 | `ds4-core` safe wrappers | not started |
+| 2 | `ds4-core` safe wrappers | **done** (unit tests; no live model) |
 | 3 | Shadow `ds4-rs` / `ds4-bench-rs` | not started |
 | 4 | KV store port + 4-way matrix | not started |
 | 5 | Web utility port | not started |

@@ -14,7 +14,7 @@ the later independent `dfm-rs` repository, not to this branch.
 |---|---|
 | Branch | `rust-host` |
 | C golden baseline | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
-| Current phase | Phase 1 complete. Phase 2 next (`ds4-core` safe wrappers). |
+| Current phase | Phase 2 complete. Phase 3 next (shadow `ds4-rs` / linkage). |
 | Default production path | C (`ds4`, `ds4-server`, `ds4-bench`, `ds4-agent`) |
 | Target production path | Rust host + unchanged native CUDA/MMQ backend |
 | Repo split | **not started**. Requires `SPLIT_READINESS.md` green. |

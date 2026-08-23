@@ -8,3 +8,6 @@ description = "Safe host wrappers around ds4-sys (Phase 2)"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+ds4-sys = { path = "../ds4-sys" }

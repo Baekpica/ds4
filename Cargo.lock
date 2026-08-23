@@ -9,6 +9,9 @@ version = "0.6.3"
 [[package]]
 name = "ds4-core"
 version = "0.6.3"
+dependencies = [
+ "ds4-sys",
+]
 
 [[package]]
 name = "ds4-dist"
