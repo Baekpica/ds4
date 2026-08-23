@@ -45179,9 +45179,15 @@ static int solar_cont_bank_restore_payload(
                         "bank payload was written for a different Solar layout");
         return 1;
     }
+    /* v0.6.3 Inc 4 (audit Finding 2), mirrored for the Solar bank lane:
+     * an EXACTLY-full bank restores.  bank_hist has seq_cap slots, so ==
+     * fills it precisely, and the shared admission install bound
+     * (min(prompt + budget, seq_cap)) keeps decode atop a full bank
+     * honest -- the old >= rejected the one payload a full bank
+     * legitimately persists. */
     if (saved_ctx == 0u || saved_ctx > ctx->ctx_size ||
-        saved_tokens == 0u || saved_tokens >= saved_ctx ||
-        saved_tokens >= ctx->seq_cap || saved_live != saved_tokens) {
+        saved_tokens == 0u || saved_tokens > saved_ctx ||
+        saved_tokens > ctx->seq_cap || saved_live != saved_tokens) {
         payload_set_err(err, errlen,
                         "Solar bank payload does not fit the current context");
         return 1;
@@ -45323,7 +45329,10 @@ static int exaone_cont_bank_restore_payload(
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0)
             return 1;
     }
-    if (h[7] == 0u || h[7] >= ctx->seq_cap) {
+    /* v0.6.3 Inc 4 (audit Finding 2), mirrored for the EXAONE bank lane:
+     * == seq_cap fills bank_hist exactly and the shared admission bound
+     * keeps decode atop a full bank honest, so only > refuses. */
+    if (h[7] == 0u || h[7] > ctx->seq_cap) {
         payload_set_err(err, errlen,
                         "EXAONE bank payload does not fit current token bound");
         return 1;
@@ -45397,7 +45406,10 @@ static int motif3_cont_bank_restore_payload(
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0)
             return 1;
     }
-    if (h[7] == 0u || h[7] >= ctx->seq_cap) {
+    /* v0.6.3 Inc 4 (audit Finding 2), mirrored for the Motif-3 bank lane:
+     * == seq_cap fills bank_hist exactly and the shared admission bound
+     * keeps decode atop a full bank honest, so only > refuses. */
+    if (h[7] == 0u || h[7] > ctx->seq_cap) {
         payload_set_err(err, errlen,
                         "Motif-3 bank payload does not fit current token bound");
         return 1;
