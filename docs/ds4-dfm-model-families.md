@@ -169,6 +169,58 @@ Before changing large models:
 `clear_cache` does not reclaim allocations from a live CUDA process. Never run
 a second full-model owner beside the first one on the reference machine.
 
+## Integration evidence for `v0.6.3-dfm`
+
+This cut absorbs Entrpi `v0.6.3` (`d92d93a`) — typed refusal for
+schema-constrained output, chunked request bodies, think-dial
+observability (the cont completion line and the `think_modes`
+counter family), the full-1M decode dispatch (HG-before-cap,
+live-scalar fallback, exact-full bank restore), the whole-prompt
+depth fence, and best-fit trim victims — on the same GB10 host
+(driver 610.43.02, CUDA 13.3, `sm_121a` cubins only).
+
+One family-side reconciliation was required beyond conflict hunks:
+upstream's exact-full bank restore fix (Inc 4 audit Finding 2)
+covered only the DeepSeek payload lane, while the Solar, EXAONE,
+and Motif-3 cont bank restores carried the same `>= seq_cap`
+off-by-one. The family batch contexts share `bank_hist` (seq_cap
+slots) and the admission install bound, so the three family lanes
+now accept the exactly-full payload a full bank legitimately
+persists.
+
+Scope facts verified in review: the engine-side depth fence guards
+the DeepSeek/GLM metal session path — the four family sessions
+branch out of `ds4_session_sync` before it and chunk by the shared
+default prefill cap (≤ 4096 under default env) — while the
+server-side fence covers every family's serial lane; best-fit trim
+victims operate on the VMM slab lane only (family banks keep fixed
+CUDA allocations and remain non-reclaimable); the full-1M HG
+dispatch is DeepSeek MLA-only (head_dim-512 guard). The shared
+surfaces — typed refusal, chunked bodies, think counters, the cont
+completion line — reach every family through the common request
+machinery.
+
+Gates on this binary: extractor self-test, `ds4_test --server`
+(including the new v0.6.3 refusal/fence/think units), the
+split-GGUF test, `test-model-family-kernels`, `test-mmq-parity`,
+`cuda-regression` (including the new substrate overflow leg), Motif
+loader/tokenizer/reference/CUDA, EXAONE kernels/reference, Solar
+loader/tokenizer/KDA/KDA-prefill/KDA-chunk/gates/KV plus the full
+forward integration, and dots3 loader/tokenizer — all passed. Bare
+`ds4_test` model-dependent DeepSeek GPU tests were not rerun (no
+DeepSeek GGUF on this host, as in previous cuts).
+
+A live VMM owner + worker gate on the Motif MQ87-88 artifact
+(aligned-artifact owner, 644 exported ranges, worker at `-c 2048`,
+32 banks) answered all four API surfaces on the continuous route
+with 4 requests and 0 failures. The v0.6.3 typed `response_format`
+refusal answered HTTP 400 in the native envelope on the family
+lane, and the new `cont chat ... think=... finish=...` completion
+line and `ds4_requests_think_total` counters were observed live.
+
+The published Motif-3 and Solar tables below are unchanged: no
+remeasure was run for this cut and earlier tags are not moved.
+
 ## Integration evidence for `v0.6.2-dfm`
 
 This cut absorbs Entrpi `v0.6.2` (`d183482`) — the v0.6.1/v0.6.2
