@@ -5,6 +5,7 @@
 /ds4-agent
 /ds4-rs
 /ds4-bench-rs
+/tests/parity/kv_c_oracle
 /ds4_native
 /ds4_server_test
 /ds4_test

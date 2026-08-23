@@ -16,7 +16,7 @@ C golden baseline: `v0.6.3-dfm`
 | GGUF loading (mmap) | yes | no | C | — | — |
 | tokenizer | yes | no | C | — | — |
 | session lifecycle | yes | wrapper | C | — | — |
-| KV store | yes | no | C | — | — |
+| KV store | yes | yes (envelope + policy) | C | 4-way green | n/a |
 | web utility | yes | no | C | — | — |
 | server (four surfaces) | yes | no | C | — | — |
 | distributed runtime | yes | no | C | — | — |
@@ -35,7 +35,7 @@ C golden baseline: `v0.6.3-dfm`
 | 1 | Cargo workspace + FFI skeleton | **done** (`cargo check --workspace`, `make rust-bridge`) |
 | 2 | `ds4-core` safe wrappers | **done** (unit tests; no live model) |
 | 3 | Shadow `ds4-rs` / `ds4-bench-rs` | **linked** (`make ds4-rs`); same-model token/perf gate pending |
-| 4 | KV store port + 4-way matrix | not started |
+| 4 | KV store port + 4-way matrix | **format/policy green** (`make test-kv-parity`); live session payload still C |
 | 5 | Web utility port | not started |
 | 6 | Distributed runtime port | not started |
 | 7 | Server shadow by feature | not started |
