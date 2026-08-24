@@ -194,10 +194,15 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
     Ok(parsed)
 }
 
+const DEEPSEEK_BOS: &str = "<｜begin▁of▁sentence｜>";
+
+fn is_rendered_chat_prompt(prompt: &str) -> bool {
+    prompt.starts_with(DEEPSEEK_BOS)
+}
+
 /// Proof-harness dump: mirror of the C CLI `run_logprob_dump` loop
-/// (top_logprobs -> argmax -> write step -> stop check -> eval).  The
-/// prompt encodes through the engine chat template for exact `-p` token
-/// parity; token text and the stop set come from the host vocab.
+/// (top_logprobs -> argmax -> write step -> stop check -> eval).  Prompt
+/// rendering follows the C CLI; token text and the stop set use the host vocab.
 fn run_logprob_dump(model: &ds4_core::Model, args: &ShadowArgs) -> Result<i32, String> {
     use std::io::Write;
 
@@ -211,9 +216,12 @@ fn run_logprob_dump(model: &ds4_core::Model, args: &ShadowArgs) -> Result<i32, S
         (None, None) => return Err("--dump-logprobs requires -p or --prompt-file".into()),
     };
     let think = if args.nothink { THINK_NONE } else { THINK_LOW };
-    let prompt = model
-        .encode_chat_prompt(None, &prompt_text, think)
-        .map_err(|e| e.to_string())?;
+    let prompt = if is_rendered_chat_prompt(&prompt_text) {
+        model.tokenize_rendered_chat(&prompt_text)
+    } else {
+        model.encode_chat_prompt(None, &prompt_text, think)
+    }
+    .map_err(|e| e.to_string())?;
     let n_prompt = prompt.len() as i32;
 
     /* C defaults ctx to 262144 on CUDA; the ids do not depend on ctx size,
@@ -562,6 +570,14 @@ mod tests {
         let parsed = parse_args(args(&["--tokens", "1, 2,3", "--predict", "4"])).unwrap();
         assert_eq!(parsed.tokens, vec![1, 2, 3]);
         assert_eq!(parsed.predict, 4);
+    }
+
+    #[test]
+    fn detects_rendered_chat_prompt() {
+        assert!(is_rendered_chat_prompt(
+            "<｜begin▁of▁sentence｜>already rendered"
+        ));
+        assert!(!is_rendered_chat_prompt("plain user prompt"));
     }
 
     #[test]
