@@ -49,6 +49,8 @@ pub struct ds4_bridge_batch_ctx {
     _opaque: [u8; 0],
 }
 
+pub type ds4_bridge_prefill_fn = Option<unsafe extern "C" fn(*mut c_void, i32, i32)>;
+
 pub type ds4_bridge_backend = c_int;
 
 pub const DS4_BRIDGE_BACKEND_CUDA: ds4_bridge_backend = 0;
@@ -292,6 +294,16 @@ extern "C" {
         s: *mut ds4_bridge_session,
         tokens: *const i32,
         n_tokens: c_int,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_session_sync_cb(
+        s: *mut ds4_bridge_session,
+        tokens: *const i32,
+        n_tokens: c_int,
+        progress: ds4_bridge_prefill_fn,
+        ud: *mut c_void,
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;

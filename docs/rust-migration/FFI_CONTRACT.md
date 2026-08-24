@@ -75,6 +75,7 @@ widen the existing ones to dump internals.
 | `ds4_bridge_session_create` | `ds4_session_create` |
 | `ds4_bridge_session_free` | `ds4_session_free` |
 | `ds4_bridge_session_sync` | prefix tokens → `ds4_session_sync` |
+| `ds4_bridge_session_sync_cb` | one `ds4_session_sync` plus call-scoped durable `prefill_chunk` frontiers |
 | `ds4_bridge_eval` | `ds4_session_eval` one token |
 | `ds4_bridge_session_argmax` | greedy next id |
 | `ds4_bridge_session_pos` | native committed timeline (host `SessionLedger` is authoritative) |
@@ -97,6 +98,15 @@ widen the existing ones to dump internals.
 | `ds4_bridge_mem_census_snap` | process-global CUDA census image (seqlock + last-stable torn cache); `supported=0` when the backend keeps no census |
 | `ds4_bridge_mem_observe_snap` | typed observation (`status`/`source` + free/total/cuda_free/meminfo) |
 | `ds4_bridge_mem_substrate_outstanding` | `ds4_gpu_substrate_outstanding` (0 on Metal/CPU stubs) |
+
+`ds4_bridge_session_sync_cb` borrows its token buffer, callback, and userdata
+until the call returns. The callback runs synchronously on the calling thread,
+receives only native `prefill_chunk` events (never `prefill_display`), and is
+cleared before both successful and failed returns. It must not re-enter
+sync/eval. The safe wrapper exposes a scoped `PrefillCheckpoint` instead of the
+session; that value permits exact `prompt[..current]` inspection and synchronous
+payload save only. Rust contains callback panics before they reach C, and the
+host ledger commits the full prompt only after native sync succeeds.
 
 Family/shape identify (`ds4-core::identify_gguf`) is host-owned: it
 mmaps GGUF metadata and does **not** call `ds4_bridge_model_open`.

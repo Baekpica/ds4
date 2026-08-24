@@ -18,6 +18,9 @@ typedef struct ds4_bridge_model ds4_bridge_model;
 typedef struct ds4_bridge_session ds4_bridge_session;
 typedef struct ds4_bridge_snapshot ds4_bridge_snapshot;
 
+/* Durable prefill frontiers only. Callback runs on the sync calling thread. */
+typedef void (*ds4_bridge_prefill_fn)(void *ud, int32_t current, int32_t total);
+
 enum {
     DS4_BRIDGE_BACKEND_CUDA = 0,
     DS4_BRIDGE_BACKEND_METAL = 1,
@@ -103,6 +106,10 @@ void ds4_bridge_session_free(ds4_bridge_session *s);
 int ds4_bridge_session_sync(ds4_bridge_session *s,
                             const int32_t *tokens, int n_tokens,
                             char *err, size_t errlen);
+int ds4_bridge_session_sync_cb(ds4_bridge_session *s,
+                               const int32_t *tokens, int n_tokens,
+                               ds4_bridge_prefill_fn progress, void *ud,
+                               char *err, size_t errlen);
 int ds4_bridge_eval(ds4_bridge_session *s, int32_t token,
                     char *err, size_t errlen);
 int ds4_bridge_session_argmax(ds4_bridge_session *s);

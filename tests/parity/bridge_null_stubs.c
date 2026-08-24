@@ -19,6 +19,14 @@ int64_t bridge_payload_load_offset;
 uint64_t bridge_payload_load_bytes;
 int bridge_routed_quant_bits;
 unsigned bridge_boot_prewarm_calls;
+int bridge_sync_rc;
+unsigned bridge_sync_calls;
+unsigned bridge_progress_sets;
+unsigned bridge_progress_clears;
+int bridge_progress_active;
+
+static ds4_session_progress_fn bridge_progress;
+static void *bridge_progress_ud;
 
 void ds4_host_tensor_dir_install(const ds4_host_tensor_dir *d) { (void)d; }
 void ds4_host_tensor_dir_clear(void) {}
@@ -51,7 +59,26 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 }
 void ds4_session_free(ds4_session *s) { (void)s; STUB("ds4_session_free"); }
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    (void)s; (void)prompt; (void)err; (void)errlen; STUB("ds4_session_sync");
+    (void)s; (void)err; (void)errlen;
+    bridge_sync_calls++;
+    if (bridge_progress) {
+        bridge_progress(bridge_progress_ud, "prefill_display", 1024, prompt->len);
+        bridge_progress(bridge_progress_ud, "prefill_chunk", 0, prompt->len);
+        bridge_progress(bridge_progress_ud, "prefill_chunk", 4096, prompt->len);
+        bridge_progress(bridge_progress_ud, "prefill_chunk", prompt->len, prompt->len);
+    }
+    return bridge_sync_rc;
+}
+void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
+    (void)s;
+    bridge_progress = fn;
+    bridge_progress_ud = ud;
+    bridge_progress_active = fn != NULL;
+    if (fn) {
+        bridge_progress_sets++;
+    } else {
+        bridge_progress_clears++;
+    }
 }
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     (void)s; (void)token; (void)err; (void)errlen; STUB("ds4_session_eval");

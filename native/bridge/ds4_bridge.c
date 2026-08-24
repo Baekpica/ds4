@@ -274,11 +274,33 @@ void ds4_bridge_session_free(ds4_bridge_session *s)
     free(s);
 }
 
-int ds4_bridge_session_sync(ds4_bridge_session *s,
-                            const int32_t *tokens, int n_tokens,
-                            char *err, size_t errlen)
+typedef struct {
+    ds4_bridge_prefill_fn progress;
+    void *ud;
+} sync_tramp;
+
+static void sync_tramp_progress(void *ud, const char *event,
+                                int current, int total)
+{
+    sync_tramp *t = ud;
+
+    if (!t || !t->progress || !event) {
+        return;
+    }
+    if (strcmp(event, "prefill_chunk") != 0) {
+        return;
+    }
+    t->progress(t->ud, (int32_t)current, (int32_t)total);
+}
+
+static int session_sync(ds4_bridge_session *s,
+                        const int32_t *tokens, int n_tokens,
+                        ds4_bridge_prefill_fn progress, void *ud,
+                        char *err, size_t errlen)
 {
     ds4_tokens prompt;
+    sync_tramp t;
+    int rc;
 
     if (!s || !s->session) {
         set_err(err, errlen, "session is NULL");
@@ -298,7 +320,31 @@ int ds4_bridge_session_sync(ds4_bridge_session *s,
     prompt.v = (int *)(void *)tokens;
     prompt.len = n_tokens;
     prompt.cap = n_tokens;
-    return ds4_session_sync(s->session, &prompt, err, errlen);
+    if (!progress) {
+        return ds4_session_sync(s->session, &prompt, err, errlen);
+    }
+
+    t.progress = progress;
+    t.ud = ud;
+    ds4_session_set_progress(s->session, sync_tramp_progress, &t);
+    rc = ds4_session_sync(s->session, &prompt, err, errlen);
+    ds4_session_set_progress(s->session, NULL, NULL);
+    return rc;
+}
+
+int ds4_bridge_session_sync(ds4_bridge_session *s,
+                            const int32_t *tokens, int n_tokens,
+                            char *err, size_t errlen)
+{
+    return session_sync(s, tokens, n_tokens, NULL, NULL, err, errlen);
+}
+
+int ds4_bridge_session_sync_cb(ds4_bridge_session *s,
+                               const int32_t *tokens, int n_tokens,
+                               ds4_bridge_prefill_fn progress, void *ud,
+                               char *err, size_t errlen)
+{
+    return session_sync(s, tokens, n_tokens, progress, ud, err, errlen);
 }
 
 int ds4_bridge_eval(ds4_bridge_session *s, int32_t token,

@@ -15,6 +15,7 @@ mod layout;
 mod mapped;
 mod mem;
 mod payload;
+mod progress;
 mod session;
 mod shape;
 mod tensors;
@@ -50,6 +51,7 @@ pub use payload::{
     LAYOUT_DOTS3, LAYOUT_EXAONE, LAYOUT_MOTIF3, LAYOUT_SOLAR, MAGIC as PAYLOAD_MAGIC,
     U32_FIELDS as PAYLOAD_U32_FIELDS, VERSION as PAYLOAD_VERSION,
 };
+pub use progress::PrefillCheckpoint;
 pub use shape::{
     dump_oracle, route_architecture, select_shape_from_metadata, shape_for_variant, ArchRoute,
     DeepSeekDims, ModelFamily, Shape, Variant, SHAPE_DOTS3_NOTE_PREV, SHAPE_FLASH,
@@ -560,6 +562,58 @@ fn cstring_payload_path(path: &Path) -> Result<CString> {
     })
 }
 
+fn save_payload_checked(
+    raw: NonNull<ds4_bridge_session>,
+    path: &Path,
+    expected: &[i32],
+    family: ModelFamily,
+    ctx: i32,
+) -> Result<()> {
+    let c_path = cstring_payload_path(path)?;
+    let mut err = [0u8; 512];
+    let rc = unsafe {
+        ds4_bridge_session_save_payload(
+            raw.as_ptr(),
+            c_path.as_ptr(),
+            err.as_mut_ptr() as *mut c_char,
+            err.len(),
+        )
+    };
+    if rc != 0 {
+        return Err(fail(rc, &err));
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| Error {
+        code: 1,
+        message: format!("failed to reopen session payload: {e}"),
+    })?;
+    let payload_bytes = file
+        .metadata()
+        .map_err(|e| Error {
+            code: 1,
+            message: format!("failed to measure session payload: {e}"),
+        })?
+        .len();
+    let prefix = crate::payload::read_prefix_range(
+        &mut file,
+        0,
+        payload_bytes,
+        family,
+        ctx,
+    )
+    .map_err(|e| Error {
+        code: 1,
+        message: e.to_string(),
+    })?;
+    let expected: Vec<u32> = expected.iter().map(|&token| token as u32).collect();
+    if prefix.tokens != expected {
+        return Err(Error {
+            code: 1,
+            message: "host/native token mismatch".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Host-resolved DeepSeek sibling (MTP / DSpark drafter): the path CString
 /// and the packed bind map must outlive the bridge open call.
 struct FfiSupport {
@@ -909,7 +963,7 @@ impl Session<'_> {
         self.host.plan_sync(tokens, span)
     }
 
-    pub fn sync(&mut self, tokens: &TokenBuffer) -> Result<()> {
+    fn check_sync(&self, tokens: &TokenBuffer) -> Result<SyncPlan> {
         if tokens.len() > i32::MAX as usize {
             return Err(Error {
                 code: 1,
@@ -929,6 +983,11 @@ impl Session<'_> {
                 message: "whole-prompt prefill fenced".into(),
             });
         }
+        Ok(plan)
+    }
+
+    pub fn sync(&mut self, tokens: &TokenBuffer) -> Result<()> {
+        let plan = self.check_sync(tokens)?;
         let mut err = [0u8; 512];
         let rc = unsafe {
             ds4_bridge_session_sync(
@@ -1108,50 +1167,13 @@ impl Session<'_> {
                 message: "session has no valid checkpoint to save".into(),
             });
         }
-        let path = path.as_ref();
-        let c_path = cstring_payload_path(path)?;
-        let mut err = [0u8; 512];
-        let rc = unsafe {
-            ds4_bridge_session_save_payload(
-                self.raw.as_ptr(),
-                c_path.as_ptr(),
-                err.as_mut_ptr() as *mut c_char,
-                err.len(),
-            )
-        };
-        if rc != 0 {
-            return Err(fail(rc, &err));
-        }
-        let mut file = std::fs::File::open(path).map_err(|e| Error {
-            code: 1,
-            message: format!("failed to reopen session payload: {e}"),
-        })?;
-        let payload_bytes = file
-            .metadata()
-            .map_err(|e| Error {
-                code: 1,
-                message: format!("failed to measure session payload: {e}"),
-            })?
-            .len();
-        let prefix = crate::payload::read_prefix_range(
-            &mut file,
-            0,
-            payload_bytes,
+        save_payload_checked(
+            self.raw,
+            path.as_ref(),
+            self.host.tokens(),
             self.host.family,
             self.host.ctx,
         )
-        .map_err(|e| Error {
-            code: 1,
-            message: e.to_string(),
-        })?;
-        let host_tok: Vec<u32> = self.host.tokens().iter().map(|&t| t as u32).collect();
-        if prefix.tokens != host_tok {
-            return Err(Error {
-                code: 1,
-                message: "host/native token mismatch".into(),
-            });
-        }
-        Ok(())
     }
 
     /// Host validates the DSV4 prefix independently, then native restores the

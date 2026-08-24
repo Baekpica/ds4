@@ -14,6 +14,11 @@ extern int64_t bridge_payload_load_offset;
 extern uint64_t bridge_payload_load_bytes;
 extern int bridge_routed_quant_bits;
 extern unsigned bridge_boot_prewarm_calls;
+extern int bridge_sync_rc;
+extern unsigned bridge_sync_calls;
+extern unsigned bridge_progress_sets;
+extern unsigned bridge_progress_clears;
+extern int bridge_progress_active;
 
 struct ds4_bridge_model {
     ds4_engine *engine;
@@ -27,6 +32,23 @@ struct ds4_bridge_session {
 static void fail(const char *m) {
     fprintf(stderr, "bridge_null_oracle: %s\n", m);
     exit(1);
+}
+
+static int progress_current[8];
+static int progress_total[8];
+static int progress_n;
+
+static void record_progress(void *ud, int32_t current, int32_t total) {
+    int *cookie = ud;
+    if (!cookie || *cookie != 42) {
+        fail("progress userdata");
+    }
+    if (progress_n >= (int)(sizeof(progress_current) / sizeof(progress_current[0]))) {
+        fail("progress overflow");
+    }
+    progress_current[progress_n] = current;
+    progress_total[progress_n] = total;
+    progress_n++;
 }
 
 int main(void) {
@@ -80,6 +102,83 @@ int main(void) {
     if (ds4_bridge_session_argmax_excluding(NULL, 7) != -1)
         fail("argmax_excluding");
     if (ds4_bridge_session_pos(NULL) != -1) fail("pos");
+
+    {
+        static int32_t prompt[6800];
+        ds4_session *fake_native = malloc(1);
+        struct ds4_bridge_session fake = {NULL, fake_native};
+        int cookie = 42;
+        if (!fake_native) {
+            fail("sync callback fake session");
+        }
+
+        memset(err, 0, sizeof(err));
+        if (ds4_bridge_session_sync_cb(NULL, prompt, 6800, record_progress,
+                                       &cookie, err, sizeof(err)) == 0) {
+            fail("sync callback NULL session");
+        }
+        if (!strstr(err, "NULL")) {
+            fail("sync callback NULL err");
+        }
+
+        bridge_sync_rc = 0;
+        bridge_sync_calls = 0;
+        bridge_progress_sets = 0;
+        bridge_progress_clears = 0;
+        progress_n = 0;
+        if (ds4_bridge_session_sync_cb(&fake, prompt, 6800, record_progress,
+                                       &cookie, err, sizeof(err)) != 0) {
+            fail("sync callback success");
+        }
+        if (bridge_sync_calls != 1) {
+            fail("sync callback call count");
+        }
+        if (bridge_progress_sets != 1 || bridge_progress_clears != 1) {
+            fail("sync callback install lifecycle");
+        }
+        if (bridge_progress_active) {
+            fail("sync callback left installed");
+        }
+        if (progress_n != 3) {
+            fail("sync callback event count");
+        }
+        if (progress_current[0] != 0 || progress_current[1] != 4096 ||
+            progress_current[2] != 6800) {
+            fail("sync callback cadence");
+        }
+        for (int i = 0; i < progress_n; i++) {
+            if (progress_total[i] != 6800) {
+                fail("sync callback total");
+            }
+        }
+
+        bridge_sync_rc = 7;
+        progress_n = 0;
+        if (ds4_bridge_session_sync_cb(&fake, prompt, 6800, record_progress,
+                                       &cookie, err, sizeof(err)) != 7) {
+            fail("sync callback failure rc");
+        }
+        if (bridge_progress_sets != 2 || bridge_progress_clears != 2) {
+            fail("sync callback failure cleanup");
+        }
+        if (bridge_progress_active) {
+            fail("sync callback failure left installed");
+        }
+
+        bridge_sync_rc = 0;
+        progress_n = 0;
+        if (ds4_bridge_session_sync(&fake, prompt, 6800,
+                                    err, sizeof(err)) != 0) {
+            fail("legacy sync success");
+        }
+        if (bridge_progress_sets != 2 || bridge_progress_clears != 2) {
+            fail("legacy sync installed callback");
+        }
+        if (progress_n != 0) {
+            fail("legacy sync forwarded progress");
+        }
+        free(fake_native);
+    }
 
     memset(err, 0, sizeof(err));
     if (ds4_bridge_session_load_payload_range(NULL, "/tmp/missing", 0, 1,
