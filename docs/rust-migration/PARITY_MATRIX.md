@@ -36,9 +36,9 @@ C core:
 
 | Check | Pass |
 |---|---|
-| Token output | Motif live: C CLI emitted `hi`; Rust CLI `--tokens 1,8320 --predict 8` emitted 9 ids. Same-prompt server pair both returned `Hi.` / stop / 13+2 |
+| Token output | Fixed-seed sampled C/Rust stdout is byte-identical (`ae12f463...`); post-port greedy stdout is also exact (`a12b7cb4...`). Same-prompt server pair returned `Hi.` / stop / 13+2 |
 | KV behavior | save/load round-trip matches C (synthetic). Live Rust benchmark restored the 64-token frontier before incrementally syncing to 128; checkpoint sizes were 18,632,800 and 24,556,624 bytes |
-| Prefill / decode tok/s | C CLI 60.15 / 7.88; C server 86.3 / 10.6. Rust benchmark smoke printed both timings, but matched C/Rust ABBA is still pending |
+| Prefill / decode tok/s | Local C/Rust benchmark ABBA is green below; full production-path performance remains pending |
 | Memory | sequential; C server peak `nvidia-smi` 102833 MiB, Rust server 99077 MiB; teardown + `clear_cache` returned ~115 GiB available |
 
 If FFI alone regresses performance, **stop**. Do not port subsystems
