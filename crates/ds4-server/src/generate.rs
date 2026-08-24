@@ -66,6 +66,10 @@ pub trait DecodeIo {
     fn token_text(&self, token: i32) -> Result<Vec<u8>, GenerateError>;
     fn token_is_stop(&self, token: i32) -> bool;
     fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError>;
+    fn sync_prompt(&mut self, _prompt: &[u8], tokens: &[i32]) -> Result<i32, GenerateError> {
+        self.sync(tokens)?;
+        Ok(0)
+    }
     fn eval(&mut self, token: i32) -> Result<(), GenerateError>;
     fn sample(&mut self, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: &mut u64)
         -> i32;
@@ -438,16 +442,16 @@ pub(crate) fn generate_terminal_at(
         ReqKind::Chat => engine.tokenize_rendered_chat(&prompt)?,
     };
     let t_prefill = Instant::now();
-    engine.sync(&tokens)?;
+    let cached = engine.sync_prompt(&prompt, &tokens)?;
     let decode_t0 = Instant::now();
     let mut first_tok = None;
     let mut decode_steps = 0i32;
 
-    let prompt_n = tokens.len() as i32;
+    let prompt_n = engine.pos();
     let mut rng = parsed.seed;
     let mut req = stream_req_from_parsed(&parsed, engine.model_id());
-    /* Serial cold path: no prefix reuse yet, so the whole prompt is a KV write. */
-    req.cache_write_tokens = prompt_n;
+    req.cache_read_tokens = cached.clamp(0, prompt_n);
+    req.cache_write_tokens = prompt_n - req.cache_read_tokens;
     let syntax = syntax_for_model_id(engine.model_id());
     let mut acc;
     let mut finish;

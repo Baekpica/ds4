@@ -2,8 +2,8 @@
 
 use ds4_server::{
     generate_and_write, handle_client_inner, generation_blocked, stop_list_find_from, ContStepper,
-    ParseEnv, ParsedRequest, ReqTimings, ScriptedDecode, ScriptedStep, ServerConfig, ServerInner,
-    ThinkMode, CREATED_TEST, TAPE_PLAIN,
+    DecodeIo, GenerateError, ParseEnv, ParsedRequest, ReqTimings, ScriptedDecode, ScriptedStep,
+    ServerConfig, ServerInner, ThinkMode, CREATED_TEST, TAPE_PLAIN,
 };
 use ds4_server::parse::parse_request;
 use ds4_server::route::WireSurface;
@@ -34,6 +34,96 @@ fn user_req() -> ParsedRequest {
     r.think_mode = ThinkMode::None;
     r.temperature = 0.0;
     r
+}
+
+struct PromptSyncDecode {
+    inner: ScriptedDecode,
+    cached_tokens: i32,
+    effective_prompt_pos: i32,
+    prompt_sync_calls: usize,
+    sync_calls: usize,
+}
+
+impl PromptSyncDecode {
+    fn new(inner: ScriptedDecode, cached_tokens: i32, effective_prompt_pos: i32) -> Self {
+        Self {
+            inner,
+            cached_tokens,
+            effective_prompt_pos,
+            prompt_sync_calls: 0,
+            sync_calls: 0,
+        }
+    }
+}
+
+impl DecodeIo for PromptSyncDecode {
+    fn model_id(&self) -> i32 {
+        self.inner.model_id()
+    }
+
+    fn tokenize_text(&self, text: &str) -> Result<Vec<i32>, GenerateError> {
+        self.inner.tokenize_text(text)
+    }
+
+    fn tokenize_rendered_chat(&self, text: &[u8]) -> Result<Vec<i32>, GenerateError> {
+        self.inner.tokenize_rendered_chat(text)
+    }
+
+    fn tokenizes_control_literals(&self) -> bool {
+        self.inner.tokenizes_control_literals()
+    }
+
+    fn token_text(&self, token: i32) -> Result<Vec<u8>, GenerateError> {
+        self.inner.token_text(token)
+    }
+
+    fn token_is_stop(&self, token: i32) -> bool {
+        self.inner.token_is_stop(token)
+    }
+
+    fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError> {
+        self.sync_calls += 1;
+        self.inner.sync(tokens)
+    }
+
+    fn sync_prompt(&mut self, _prompt: &[u8], tokens: &[i32]) -> Result<i32, GenerateError> {
+        self.prompt_sync_calls += 1;
+        self.inner.live = tokens.to_vec();
+        self.inner.pos = self.effective_prompt_pos;
+        Ok(self.cached_tokens)
+    }
+
+    fn eval(&mut self, token: i32) -> Result<(), GenerateError> {
+        self.inner.eval(token)
+    }
+
+    fn sample(
+        &mut self,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        rng: &mut u64,
+    ) -> i32 {
+        self.inner
+            .sample(temperature, top_k, top_p, min_p, rng)
+    }
+
+    fn pos(&self) -> i32 {
+        self.inner.pos()
+    }
+
+    fn ctx(&self) -> i32 {
+        self.inner.ctx()
+    }
+
+    fn generation(&self) -> u64 {
+        self.inner.generation()
+    }
+
+    fn session_tokens(&self) -> Vec<i32> {
+        self.inner.session_tokens()
+    }
 }
 
 #[test]
@@ -86,6 +176,74 @@ fn scripted_buffered_openai_has_text_and_stop() {
     );
     assert!(s.contains("\"timings\":{\"ttft_ms\":"), "serial path should emit timings: {s}");
     assert!(s.contains("\"prefill_tokens\":1"), "{s}");
+}
+
+#[test]
+fn prompt_sync_reports_buffered_cache_usage_from_effective_pos() {
+    let parsed = user_req();
+    let inner = ScriptedDecode::from_pieces(
+        &TAPE_PLAIN
+            .iter()
+            .map(|s| s.as_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let mut engine = PromptSyncDecode::new(inner, 4, 6);
+    let mut out = Vec::new();
+
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "chatcmpl-cache-buffered",
+        CREATED_TEST,
+        false,
+        16,
+        &mut out,
+    )
+    .unwrap();
+
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("\"prompt_tokens\":6"), "{s}");
+    assert!(
+        s.contains("\"cached_tokens\":4,\"cache_write_tokens\":2"),
+        "cache writes must use effective engine pos minus cache reads: {s}"
+    );
+    assert_eq!(engine.prompt_sync_calls, 1);
+    assert_eq!(engine.sync_calls, 0);
+}
+
+#[test]
+fn prompt_sync_reports_streaming_cache_usage_from_effective_pos() {
+    let mut parsed = user_req();
+    parsed.stream = true;
+    parsed.stream_include_usage = true;
+    let inner = ScriptedDecode::from_pieces(
+        &TAPE_PLAIN
+            .iter()
+            .map(|s| s.as_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let mut engine = PromptSyncDecode::new(inner, 4, 6);
+    let mut out = Vec::new();
+
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "chatcmpl-cache-stream",
+        CREATED_TEST,
+        false,
+        16,
+        &mut out,
+    )
+    .unwrap();
+
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("\"prompt_tokens\":6"), "{s}");
+    assert!(
+        s.contains("\"cached_tokens\":4,\"cache_write_tokens\":2"),
+        "stream usage must use effective engine pos minus cache reads: {s}"
+    );
+    assert_eq!(engine.prompt_sync_calls, 1);
+    assert_eq!(engine.sync_calls, 0);
 }
 
 #[test]
@@ -292,9 +450,7 @@ fn tools_req() -> ParsedRequest {
     parsed
 }
 
-#[test]
-fn scripted_invalid_dsml_retries_and_emits_tool_calls() {
-    let parsed = tools_req();
+fn retrying_tool_decode() -> ScriptedDecode {
     let invalid = concat!(
         "<｜DSML｜tool_calls>\n",
         "<｜DSML｜invoke>\n",
@@ -309,7 +465,7 @@ fn scripted_invalid_dsml_retries_and_emits_tool_calls() {
         "</｜DSML｜invoke>\n",
         "</｜DSML｜tool_calls>"
     );
-    let mut engine = ScriptedDecode {
+    ScriptedDecode {
         steps: vec![
             ScriptedStep {
                 token: 1,
@@ -329,7 +485,13 @@ fn scripted_invalid_dsml_retries_and_emits_tool_calls() {
         ],
         suffix_tokens: vec![10, 11],
         ..ScriptedDecode::from_pieces(&[b"x"])
-    };
+    }
+}
+
+#[test]
+fn scripted_invalid_dsml_retries_and_emits_tool_calls() {
+    let parsed = tools_req();
+    let mut engine = retrying_tool_decode();
     let mut out = Vec::new();
     generate_and_write(
         &mut engine,
@@ -347,6 +509,28 @@ fn scripted_invalid_dsml_retries_and_emits_tool_calls() {
     assert!(s.contains("\"name\":\"bash\""), "{s}");
     assert!(s.contains("ls"), "{s}");
     assert!(engine.idx >= 2, "second decode pass should consume the valid call");
+}
+
+#[test]
+fn recovery_suffix_uses_sync_not_prompt_sync() {
+    let parsed = tools_req();
+    let mut engine = PromptSyncDecode::new(retrying_tool_decode(), 0, 1);
+    let mut out = Vec::new();
+
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "chatcmpl-cache-retry",
+        CREATED_TEST,
+        false,
+        16,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(engine.prompt_sync_calls, 1, "only the initial prompt uses the hook");
+    assert_eq!(engine.sync_calls, 1, "the recovery suffix uses ordinary sync");
+    assert!(engine.inner.idx >= 2, "the retry must run a second decode pass");
 }
 
 #[test]
