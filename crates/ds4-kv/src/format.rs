@@ -317,6 +317,22 @@ pub(crate) fn write_stream(
     payload_bytes: u64,
     trailer: &[u8],
 ) -> Result<(), FormatError> {
+    let tmp = stage_stream(path, header, text, payload, payload_bytes, trailer)?;
+    let result = fs::rename(&tmp, path).map_err(FormatError::Io);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+pub(crate) fn stage_stream(
+    path: &Path,
+    header: &Header,
+    text: &[u8],
+    payload: &mut impl Read,
+    payload_bytes: u64,
+    trailer: &[u8],
+) -> Result<PathBuf, FormatError> {
     if text.len() > u32::MAX as usize {
         return Err(FormatError::TextLenMismatch);
     }
@@ -332,7 +348,7 @@ pub(crate) fn write_stream(
             Err(e) => return Err(FormatError::Io(e)),
         }
     };
-    let result = (|| {
+    let result: Result<(), FormatError> = (|| {
         let h = fill_header(
             header.model_id,
             header.quant_bits,
@@ -357,13 +373,13 @@ pub(crate) fn write_stream(
         f.write_all(trailer)?;
         f.flush()?;
         drop(f);
-        fs::rename(&tmp, path)?;
         Ok(())
     })();
-    if result.is_err() {
+    if let Err(error) = result {
         let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
-    result
+    Ok(tmp)
 }
 
 pub fn read_path(path: &Path) -> Result<Record, FormatError> {
@@ -638,6 +654,34 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(&path).unwrap(), encode_file(&rec));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_stream_leaves_destination_until_commit() {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-stream-stage-{}", std::process::id()));
+        let path = dir.join("entry.kv");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"original KVC bytes").unwrap();
+
+        let rec = sample();
+        let mut payload = rec.payload.as_slice();
+        let staged = stage_stream(
+            &path,
+            &rec.header,
+            &rec.text,
+            &mut payload,
+            rec.payload.len() as u64,
+            &rec.trailer,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"original KVC bytes");
+        assert_eq!(fs::read(&staged).unwrap(), encode_file(&rec));
+
+        fs::rename(staged, &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), encode_file(&rec));
         let _ = fs::remove_dir_all(&dir);
     }
 }
