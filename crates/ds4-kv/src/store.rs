@@ -195,6 +195,63 @@ impl Store {
         self.find_prefix(prompt, model_id, quant_bits, ctx_size, false)
     }
 
+    /// Reopen the selected file and repeat the C loader's header, text, and
+    /// filename-hash checks before a native payload restore consumes it.
+    pub fn text_prefix_candidate(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+    ) -> io::Result<Option<(PathBuf, Envelope)>> {
+        let Some(index) = self.find_text_prefix(prompt, model_id, quant_bits, ctx_size) else {
+            return Ok(None);
+        };
+        let entry = self.entries[index].clone();
+        let envelope = read_envelope(&entry.path).map_err(format_io_error)?;
+        let header = &envelope.header;
+        let unchanged = header.model_id == entry.header.model_id
+            && header.quant_bits == entry.header.quant_bits
+            && header.ctx_size == entry.header.ctx_size
+            && header.tokens == entry.header.tokens
+            && header.text_bytes == entry.header.text_bytes;
+        let bank_without_logits = is_bank_replay_v1(header.reason, header.ext_flags)
+            && envelope.text.len() == prompt.len();
+        if !is_automatic_exact_replay(header.reason, header.ext_flags)
+            || !unchanged
+            || header.model_id != model_id
+            || bank_without_logits
+            || envelope.text.len() > prompt.len()
+            || text_sha_hex(&envelope.text) != entry.sha
+            || !prompt.starts_with(&envelope.text)
+        {
+            return Ok(None);
+        }
+        Ok(Some((entry.path, envelope)))
+    }
+
+    pub fn touch_hit(&mut self, path: &Path) -> io::Result<()> {
+        let envelope = read_envelope(path).map_err(format_io_error)?;
+        let header = envelope.header;
+        let raw = fill_header(
+            header.model_id,
+            header.quant_bits,
+            header.reason,
+            header.ext_flags,
+            header.tokens,
+            header.hits.wrapping_add(1),
+            header.ctx_size,
+            header.created_at,
+            now_secs(),
+            header.payload_bytes,
+        );
+        let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+        file.write_all(&raw)?;
+        file.flush()?;
+        self.refresh();
+        Ok(())
+    }
+
     pub fn find_bank_text_prefix(
         &mut self,
         prompt: &[u8],
@@ -725,6 +782,58 @@ mod tests {
         assert_eq!(replaced.header.model_id, 1);
         assert_eq!(replaced.payload, payload);
         assert!(sibling.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn candidate_reopens_and_validates_text() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-candidate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let path = store.write(rec(b"shared prefix", 512)).unwrap();
+
+        let (got_path, envelope) = store
+            .text_prefix_candidate(b"shared prefix and suffix", 0, 2, 8192)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_path, path);
+        assert_eq!(envelope.text, b"shared prefix");
+
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start((crate::format::FIXED_HEADER + 4) as u64))
+            .unwrap();
+        file.write_all(b"X").unwrap();
+        file.flush().unwrap();
+        assert!(store
+            .text_prefix_candidate(b"shared prefix and suffix", 0, 2, 8192)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn touch_hit_preserves_payload_and_trailer() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-touch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let mut record = rec(b"shared prefix", 512);
+        record.header.hits = 7;
+        record.header.created_at = 42;
+        record.header.last_used = 43;
+        record.payload = b"opaque payload".to_vec();
+        record.trailer = b"trailer".to_vec();
+        let path = store.write(record).unwrap();
+        let before = read_path(&path).unwrap();
+        let started = now_secs();
+
+        store.touch_hit(&path).unwrap();
+        let after = read_path(&path).unwrap();
+        assert_eq!(after.header.hits, before.header.hits + 1);
+        assert_eq!(after.header.created_at, before.header.created_at);
+        assert!(after.header.last_used >= started);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.payload, before.payload);
+        assert_eq!(after.trailer, before.trailer);
         let _ = fs::remove_dir_all(&dir);
     }
 }
