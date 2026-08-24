@@ -12,3 +12,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "ds4-server-rs"
 path = "src/bin/ds4-server-rs.rs"
+required-features = ["native"]
+
+[features]
+default = []
+native = ["dep:ds4-core"]
+
+[dependencies]
+ds4-core = { path = "../ds4-core", optional = true }

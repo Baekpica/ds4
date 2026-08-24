@@ -355,9 +355,29 @@ fn tcp_models_options_unknown_bad_http() {
     assert_eq!(out, rust_head.into_bytes());
 
     let out = one_shot(&cfg, b"GET /metrics HTTP/1.1\r\n\r\n");
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.starts_with("HTTP/1.1 200 OK"));
+    assert!(s.contains("ds4_uptime_seconds "));
+    assert!(s.contains("ds4_route_requests_total{surface=\"openai_chat\",lane=\"serial\"} 0"));
+    assert!(s.contains("ds4_requests_shed_total{reason=\"clients\"} 0"));
+    assert!(s.contains("ds4_memory_census_supported 0"));
+    assert!(s.contains("ds4_memory_substrate_outstanding_bytes 0"));
+
+    let out = one_shot(&cfg, b"GET /v1/stats HTTP/1.1\r\n\r\n");
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.starts_with("HTTP/1.1 200 OK"));
+    assert!(s.contains("\"routes\":{"));
+    assert!(s.contains("\"sheds\":{"));
+    assert!(s.contains("\"memory\":{\"census_supported\":false"));
+    assert!(s.contains("\"governor\":{\"shadow\":true"));
+
+    let out = one_shot(
+        &cfg,
+        b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 45\r\n\r\n{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+    );
     assert_eq!(
         out,
-        wire_http_error_bytes(WireSurface::OpenaiChat, 404, "unknown endpoint", true, None)
+        wire_http_error_bytes(WireSurface::OpenaiChat, 503, "model not loaded", true, None)
     );
 
     let out = one_shot(&cfg, b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");

@@ -346,10 +346,11 @@ pub fn json_content(p: &mut Json<'_>) -> Option<String> {
     Some(b)
 }
 
-/// Surrounding quotes included, matching `json_escape`.
-pub fn json_escape(s: &str) -> String {
+/// Surrounding quotes included, matching C `json_escape`. Walks raw bytes
+/// so a held-back UTF-8 fragment can be escaped the same way as C.
+pub fn json_escape_bytes(s: &[u8]) -> Vec<u8> {
     let mut out = vec![b'"'];
-    for c in s.bytes() {
+    for &c in s {
         match c {
             b'"' | b'\\' => {
                 out.push(b'\\');
@@ -366,5 +367,99 @@ pub fn json_escape(s: &str) -> String {
         }
     }
     out.push(b'"');
-    String::from_utf8(out).expect("json_escape preserves UTF-8")
+    out
+}
+
+/// Surrounding quotes included, matching `json_escape`.
+pub fn json_escape(s: &str) -> String {
+    String::from_utf8(json_escape_bytes(s.as_bytes())).expect("json_escape preserves UTF-8")
+}
+
+/// C `json_minify_raw_value`: drop insignificant whitespace outside strings.
+pub fn json_minify_raw_value(json: &str) -> String {
+    let src = if json.is_empty() { "null" } else { json };
+    let mut p = Json::new(src);
+    p.ws();
+    let start = p.i;
+    if !json_skip_value(&mut p) {
+        return src.to_string();
+    }
+    let end = p.i;
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    for &c in &bytes[start..end] {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else if c == b'"' {
+            in_string = true;
+            out.push(c);
+        } else if !is_c_space(c) {
+            out.push(c);
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonArg {
+    pub key: String,
+    pub value: String,
+    pub is_string: bool,
+    pub used: bool,
+}
+
+/// C `json_args_parse`. Does not consume the closing `}`.
+pub fn json_args_parse(json: &str) -> Option<Vec<JsonArg>> {
+    let mut p = Json::new(json);
+    p.ws();
+    if p.bump() != Some(b'{') {
+        return None;
+    }
+    p.ws();
+    let mut args = Vec::new();
+    while p.peek().is_some() && p.peek() != Some(b'}') {
+        let Some(key) = json_string(&mut p) else {
+            return None;
+        };
+        p.ws();
+        if p.bump() != Some(b':') {
+            return None;
+        }
+        p.ws();
+        let (is_string, value) = if p.peek() == Some(b'"') {
+            let Some(v) = json_string(&mut p) else {
+                return None;
+            };
+            (true, v)
+        } else {
+            let Some(raw) = json_raw_value(&mut p) else {
+                return None;
+            };
+            (false, json_minify_raw_value(&raw))
+        };
+        args.push(JsonArg {
+            key,
+            value,
+            is_string,
+            used: false,
+        });
+        p.ws();
+        if p.peek() == Some(b',') {
+            p.i += 1;
+        }
+        p.ws();
+    }
+    if p.peek() != Some(b'}') {
+        return None;
+    }
+    Some(args)
 }

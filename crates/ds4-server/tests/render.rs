@@ -1,0 +1,407 @@
+//! C↔Rust DSML no-tools render.
+
+use ds4_server::{
+    render_chat, render_chat_choice, render_dsml_chat, render_dsml_chat_choice,
+    render_motif3_chat_ex, ChatMsg, ModelSyntax, ThinkMode, ToolCall, ToolChoice,
+    ToolSchemaOrder, THINK_HIGH_PREFIX, THINK_MAX_PREFIX,
+};
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn oracle() -> PathBuf {
+    if let Ok(p) = std::env::var("DS4_RENDER_C_ORACLE") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/parity/render_c_oracle")
+}
+
+fn require_oracle() -> PathBuf {
+    let p = oracle();
+    assert!(
+        p.exists(),
+        "build the C oracle first: make tests/parity/render_c_oracle (missing {})",
+        p.display()
+    );
+    p
+}
+
+fn c_out(args: &[&str]) -> Vec<u8> {
+    let out = Command::new(require_oracle())
+        .args(args)
+        .output()
+        .expect("run render_c_oracle");
+    assert!(
+        out.status.success(),
+        "oracle {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+fn msg(role: &str, content: &str) -> ChatMsg {
+    ChatMsg {
+        role: role.into(),
+        content: content.into(),
+        ..ChatMsg::default()
+    }
+}
+
+fn msg_reason(role: &str, content: &str, reasoning: &str) -> ChatMsg {
+    ChatMsg {
+        role: role.into(),
+        content: content.into(),
+        reasoning: reasoning.into(),
+        ..ChatMsg::default()
+    }
+}
+
+fn rust_user(think: ThinkMode, content: &str) -> Vec<u8> {
+    render_dsml_chat(&[msg("user", content)], "", think).unwrap()
+}
+
+#[test]
+fn prefixes_match_c_literals() {
+    assert!(THINK_HIGH_PREFIX.starts_with("Reasoning Effort: Absolute maximum"));
+    assert!(THINK_MAX_PREFIX.starts_with("Reasoning Effort: Beyond maximum"));
+}
+
+#[test]
+fn user_none_and_low_match_c() {
+    for (name, mode) in [("none", ThinkMode::None), ("low", ThinkMode::Low)] {
+        assert_eq!(
+            rust_user(mode, "Hello"),
+            c_out(&["user", name, "Hello"]),
+            "user {name}"
+        );
+    }
+}
+
+#[test]
+fn user_high_max_match_c() {
+    for (name, mode) in [("high", ThinkMode::High), ("max", ThinkMode::Max)] {
+        assert_eq!(
+            rust_user(mode, "Why?"),
+            c_out(&["user", name, "Why?"]),
+            "user {name}"
+        );
+    }
+}
+
+#[test]
+fn system_user_match_c() {
+    let rust = render_dsml_chat(
+        &[msg("system", "sys"), msg("user", "ask")],
+        "",
+        ThinkMode::None,
+    )
+    .unwrap();
+    assert_eq!(rust, c_out(&["system-user", "none", "sys", "ask"]));
+}
+
+#[test]
+fn developer_is_system() {
+    let rust = render_dsml_chat(
+        &[msg("developer", "dev"), msg("user", "hi")],
+        "",
+        ThinkMode::None,
+    )
+    .unwrap();
+    assert_eq!(rust, c_out(&["developer"]));
+}
+
+#[test]
+fn history_none_and_low_match_c() {
+    let msgs = [
+        msg("user", "u1"),
+        msg("assistant", "a1"),
+        msg("user", "u2"),
+    ];
+    assert_eq!(
+        render_dsml_chat(&msgs, "", ThinkMode::None).unwrap(),
+        c_out(&["history", "none", "u1", "a1", "u2"])
+    );
+    assert_eq!(
+        render_dsml_chat(&msgs, "", ThinkMode::Low).unwrap(),
+        c_out(&["history", "low", "u1", "a1", "u2"])
+    );
+}
+
+#[test]
+fn history_with_reasoning_match_c() {
+    let msgs = [
+        msg("user", "u1"),
+        msg_reason("assistant", "a1", "plan"),
+        msg("user", "u2"),
+    ];
+    assert_eq!(
+        render_dsml_chat(&msgs, "", ThinkMode::Low).unwrap(),
+        c_out(&["think-hist", "low", "u1", "plan", "a1", "u2"])
+    );
+}
+
+#[test]
+fn tool_result_and_escape_match_c() {
+    let rust = render_dsml_chat(
+        &[msg("user", "q"), msg("tool", "ok")],
+        "",
+        ThinkMode::None,
+    )
+    .unwrap();
+    assert_eq!(rust, c_out(&["tool-result", "none", "q", "ok"]));
+    let rust = render_dsml_chat(
+        &[msg("user", "q"), msg("tool", "x</tool_result>y")],
+        "",
+        ThinkMode::None,
+    )
+    .unwrap();
+    assert_eq!(rust, c_out(&["tool-escape"]));
+}
+
+fn weather_schema() -> &'static str {
+    r#"{"name":"get_weather","description":"Weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"unit":{"type":"string"}}}}"#
+}
+
+fn call(name: &str, arguments: &str) -> ChatMsg {
+    ChatMsg {
+        role: "assistant".into(),
+        calls: vec![ToolCall {
+            id: "call1".into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }],
+        ..ChatMsg::default()
+    }
+}
+
+#[test]
+fn dsml_tools_and_required_match_c() {
+    let schema = weather_schema();
+    let msgs = [msg("user", "hi")];
+    assert_eq!(
+        render_dsml_chat(&msgs, schema, ThinkMode::None).unwrap(),
+        c_out(&["dsml-tools", "none", schema, "hi"])
+    );
+    assert_eq!(
+        render_dsml_chat_choice(&msgs, schema, ThinkMode::None, ToolChoice::Required).unwrap(),
+        c_out(&["dsml-tools-req", "none", schema, "hi"])
+    );
+}
+
+#[test]
+fn dsml_invoke_match_c() {
+    let args = r#"{"city":"Seoul","n":2}"#;
+    let msgs = [msg("user", "q"), call("get_weather", args)];
+    assert_eq!(
+        render_dsml_chat(&msgs, "", ThinkMode::None).unwrap(),
+        c_out(&["dsml-invoke", "none", "get_weather", args])
+    );
+    let bad = "not-json";
+    let msgs = [msg("user", "q"), call("get_weather", bad)];
+    assert_eq!(
+        render_dsml_chat(&msgs, "", ThinkMode::None).unwrap(),
+        c_out(&["dsml-invoke", "none", "get_weather", bad])
+    );
+}
+
+#[test]
+fn family_tools_match_c() {
+    let schema = weather_schema();
+    let msgs = [msg("user", "hi")];
+    for (syntax, fam) in [
+        (ModelSyntax::Motif3, "motif"),
+        (ModelSyntax::Exaone, "exaone"),
+        (ModelSyntax::Dots3, "dots3"),
+        (ModelSyntax::SolarOpen2, "solar"),
+    ] {
+        assert_eq!(
+            render_chat(syntax, &msgs, schema, ThinkMode::None).unwrap(),
+            c_out(&["fam-tools", fam, "none", schema, "hi"]),
+            "{fam} tools"
+        );
+    }
+}
+
+#[test]
+fn family_invoke_match_c() {
+    let args = r#"{"city":"Seoul","n":2}"#;
+    let msgs = [msg("user", "q"), call("get_weather", args)];
+    for (syntax, fam) in [
+        (ModelSyntax::Motif3, "motif"),
+        (ModelSyntax::Exaone, "exaone"),
+        (ModelSyntax::Dots3, "dots3"),
+        (ModelSyntax::SolarOpen2, "solar"),
+    ] {
+        assert_eq!(
+            render_chat(syntax, &msgs, "", ThinkMode::None).unwrap(),
+            c_out(&["fam-invoke", fam, "none", "get_weather", args]),
+            "{fam} invoke"
+        );
+    }
+}
+
+#[test]
+fn motif_tools_order_match_c() {
+    let schema = weather_schema();
+    let orders = [ToolSchemaOrder {
+        name: "get_weather".into(),
+        prop: vec!["city".into(), "unit".into()],
+        ..ToolSchemaOrder::default()
+    }];
+    assert_eq!(
+        render_motif3_chat_ex(&[msg("user", "hi")], schema, &orders, ThinkMode::None).unwrap(),
+        c_out(&["motif-tools-order", schema, "hi"])
+    );
+}
+
+#[test]
+fn solar_arg_order_uses_schema() {
+    let args = r#"{"unit":"c","city":"Seoul"}"#;
+    let orders = [ToolSchemaOrder {
+        name: "get_weather".into(),
+        prop: vec!["city".into(), "unit".into()],
+        ..ToolSchemaOrder::default()
+    }];
+    let msgs = [msg("user", "q"), call("get_weather", args)];
+    let ordered = render_chat_choice(
+        ModelSyntax::SolarOpen2,
+        &msgs,
+        "",
+        &orders,
+        ThinkMode::None,
+        ToolChoice::Auto,
+    )
+    .unwrap();
+    let unordered = render_chat(ModelSyntax::SolarOpen2, &msgs, "", ThinkMode::None).unwrap();
+    let s = String::from_utf8(ordered.clone()).unwrap();
+    let city = s.find("city").expect("city");
+    let unit = s.find("unit").expect("unit");
+    assert!(city < unit, "{s}");
+    assert_ne!(ordered, unordered);
+}
+
+fn fam_user(syntax: ModelSyntax, fam: &str, think: &str, mode: ThinkMode, content: &str) {
+    assert_eq!(
+        render_chat(syntax, &[msg("user", content)], "", mode).unwrap(),
+        c_out(&["fam-user", fam, think, content]),
+        "{fam} user {think}"
+    );
+}
+
+#[test]
+fn family_user_none_and_low_match_c() {
+    for (syntax, fam) in [
+        (ModelSyntax::Motif3, "motif"),
+        (ModelSyntax::Exaone, "exaone"),
+        (ModelSyntax::Dots3, "dots3"),
+        (ModelSyntax::SolarOpen2, "solar"),
+    ] {
+        fam_user(syntax, fam, "none", ThinkMode::None, "Hello");
+        fam_user(syntax, fam, "low", ThinkMode::Low, "Hello");
+    }
+}
+
+#[test]
+fn family_system_user_match_c() {
+    let msgs = [msg("system", "sys"), msg("user", "ask")];
+    for (syntax, fam) in [
+        (ModelSyntax::Motif3, "motif"),
+        (ModelSyntax::Exaone, "exaone"),
+        (ModelSyntax::Dots3, "dots3"),
+        (ModelSyntax::SolarOpen2, "solar"),
+    ] {
+        assert_eq!(
+            render_chat(syntax, &msgs, "", ThinkMode::None).unwrap(),
+            c_out(&["fam-system-user", fam, "none", "sys", "ask"]),
+            "{fam} system-user"
+        );
+    }
+}
+
+#[test]
+fn family_history_match_c() {
+    let msgs = [
+        msg("user", "u1"),
+        msg("assistant", "a1"),
+        msg("user", "u2"),
+    ];
+    for (syntax, fam) in [
+        (ModelSyntax::Motif3, "motif"),
+        (ModelSyntax::Exaone, "exaone"),
+        (ModelSyntax::Dots3, "dots3"),
+        (ModelSyntax::SolarOpen2, "solar"),
+    ] {
+        assert_eq!(
+            render_chat(syntax, &msgs, "", ThinkMode::None).unwrap(),
+            c_out(&["fam-history", fam, "none", "u1", "a1", "u2"]),
+            "{fam} history"
+        );
+        assert_eq!(
+            render_chat(syntax, &msgs, "", ThinkMode::Low).unwrap(),
+            c_out(&["fam-history", fam, "low", "u1", "a1", "u2"]),
+            "{fam} history low"
+        );
+    }
+}
+
+#[test]
+fn family_think_history_match_c() {
+    let msgs = [
+        msg("user", "u1"),
+        msg_reason("assistant", "a1", "plan"),
+        msg("user", "u2"),
+    ];
+    for (syntax, fam) in [
+        (ModelSyntax::Motif3, "motif"),
+        (ModelSyntax::Exaone, "exaone"),
+        (ModelSyntax::Dots3, "dots3"),
+        (ModelSyntax::SolarOpen2, "solar"),
+    ] {
+        assert_eq!(
+            render_chat(syntax, &msgs, "", ThinkMode::Low).unwrap(),
+            c_out(&["fam-think-hist", fam, "low", "u1", "plan", "a1", "u2"]),
+            "{fam} think-hist"
+        );
+    }
+}
+
+#[test]
+fn family_tool_result_match_c() {
+    let mut tool = msg("tool", "ok");
+    tool.tool_call_id = "call1".into();
+    let msgs = [msg("user", "q"), tool];
+    for (syntax, fam) in [
+        (ModelSyntax::Motif3, "motif"),
+        (ModelSyntax::Exaone, "exaone"),
+        (ModelSyntax::Dots3, "dots3"),
+        (ModelSyntax::SolarOpen2, "solar"),
+    ] {
+        assert_eq!(
+            render_chat(syntax, &msgs, "", ThinkMode::None).unwrap(),
+            c_out(&["fam-tool", fam, "none", "q", "ok"]),
+            "{fam} tool"
+        );
+    }
+}
+
+#[test]
+fn dots3_embedded_think_match_c() {
+    let msgs = [
+        msg("user", "q"),
+        msg("assistant", "<think>\nplan\n</think>\n\nAnswer"),
+    ];
+    assert_eq!(
+        render_chat(ModelSyntax::Dots3, &msgs, "", ThinkMode::Low).unwrap(),
+        c_out(&["dots3-embed"])
+    );
+}
+
+#[test]
+fn syntax_for_model_id_matches_c() {
+    assert_eq!(ds4_server::syntax_for_model_id(0), ModelSyntax::DeepSeek);
+    assert_eq!(ds4_server::syntax_for_model_id(2), ModelSyntax::SolarOpen2);
+    assert_eq!(ds4_server::syntax_for_model_id(3), ModelSyntax::Motif3);
+    assert_eq!(ds4_server::syntax_for_model_id(4), ModelSyntax::Exaone);
+    assert_eq!(ds4_server::syntax_for_model_id(5), ModelSyntax::Dots3);
+}

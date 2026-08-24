@@ -45,6 +45,7 @@ fn env() -> ParseEnv {
         default_tokens: 393216,
         default_effort: ds4_server::ThinkMode::Low,
         default_temp: ds4_server::default_temperature(),
+        live_ids: Vec::new(),
     }
 }
 
@@ -300,6 +301,8 @@ fn simple_success_dumps_match_c() {
     );
     assert!(r.has_tools);
     assert_eq!(r.tool_choice, ToolChoice::Auto);
+    assert_eq!(r.tool_orders.len(), 1);
+    assert_eq!(r.tool_orders[0].name, "lookup");
 }
 
 #[test]

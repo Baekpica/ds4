@@ -1,0 +1,675 @@
+//! Incremental DSML → OpenAI / Anthropic live tool projection.
+//! Copied from `ds4_server.c` at v0.6.3-dfm. Final parse stays authoritative.
+
+use crate::json::json_escape_bytes;
+use crate::parse::ToolCall;
+use crate::stream::utf8_stream_safe_len;
+use crate::tools::{
+    dsml_attr, dsml_unescape_text, DSML_INVOKE_END, DSML_INVOKE_END_SHORT, DSML_INVOKE_START,
+    DSML_INVOKE_START_SHORT, DSML_PARAM_END, DSML_PARAM_END_SHORT, DSML_PARAM_START,
+    DSML_PARAM_START_SHORT, DSML_TOOL_CALLS_END, DSML_TOOL_CALLS_END_SHORT, DSML_TOOL_CALLS_START,
+    DSML_TOOL_CALLS_START_SHORT,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DsmlToolState {
+    BetweenInvokes,
+    BetweenParams,
+    ParamValue,
+    Done,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DsmlSyntax {
+    pub tool_calls_start: &'static [u8],
+    pub tool_calls_end: &'static [u8],
+    pub invoke_start: &'static [u8],
+    pub invoke_end: &'static [u8],
+    pub param_start: &'static [u8],
+    pub param_end: &'static [u8],
+}
+
+pub const DSML_SYNTAXES: [DsmlSyntax; 3] = [
+    DsmlSyntax {
+        tool_calls_start: DSML_TOOL_CALLS_START.as_bytes(),
+        tool_calls_end: DSML_TOOL_CALLS_END.as_bytes(),
+        invoke_start: DSML_INVOKE_START.as_bytes(),
+        invoke_end: DSML_INVOKE_END.as_bytes(),
+        param_start: DSML_PARAM_START.as_bytes(),
+        param_end: DSML_PARAM_END.as_bytes(),
+    },
+    DsmlSyntax {
+        tool_calls_start: DSML_TOOL_CALLS_START_SHORT.as_bytes(),
+        tool_calls_end: DSML_TOOL_CALLS_END_SHORT.as_bytes(),
+        invoke_start: DSML_INVOKE_START_SHORT.as_bytes(),
+        invoke_end: DSML_INVOKE_END_SHORT.as_bytes(),
+        param_start: DSML_PARAM_START_SHORT.as_bytes(),
+        param_end: DSML_PARAM_END_SHORT.as_bytes(),
+    },
+    DsmlSyntax {
+        tool_calls_start: b"<tool_calls>",
+        tool_calls_end: b"</tool_calls>",
+        invoke_start: b"<invoke",
+        invoke_end: b"</invoke>",
+        param_start: b"<parameter",
+        param_end: b"</parameter>",
+    },
+];
+
+#[derive(Debug, Clone)]
+pub struct DsmlToolStream {
+    pub state: DsmlToolState,
+    pub syn: Option<DsmlSyntax>,
+    pub parse_pos: usize,
+    pub index: i32,
+    pub active: bool,
+    pub emitted_any: bool,
+    pub args_open: bool,
+    first_param: bool,
+    param_is_string: bool,
+    ids: Vec<String>,
+    id_prefix: &'static str,
+}
+
+impl Default for DsmlToolStream {
+    fn default() -> Self {
+        Self {
+            state: DsmlToolState::BetweenInvokes,
+            syn: None,
+            parse_pos: 0,
+            index: 0,
+            active: false,
+            emitted_any: false,
+            args_open: false,
+            first_param: false,
+            param_is_string: false,
+            ids: Vec::new(),
+            id_prefix: "call_",
+        }
+    }
+}
+
+impl DsmlToolStream {
+    pub fn with_prefix(prefix: &'static str) -> Self {
+        Self {
+            id_prefix: prefix,
+            ..Self::default()
+        }
+    }
+
+    pub fn init(&mut self, raw: &[u8], pos: usize) -> bool {
+        let prefix = self.id_prefix;
+        *self = Self::with_prefix(prefix);
+        self.active = true;
+        self.state = DsmlToolState::BetweenInvokes;
+        for syn in DSML_SYNTAXES {
+            if raw_full_lit(raw, pos, syn.tool_calls_start) {
+                self.syn = Some(syn);
+                self.parse_pos = pos + syn.tool_calls_start.len();
+                return true;
+            }
+        }
+        self.active = false;
+        self.state = DsmlToolState::Error;
+        false
+    }
+
+    pub fn id_at(&mut self, index: i32) -> String {
+        if index < 0 {
+            return String::new();
+        }
+        let i = index as usize;
+        while self.ids.len() <= i {
+            self.ids.push(String::new());
+        }
+        if self.ids[i].is_empty() {
+            self.ids[i] = format!("{}{index}", self.id_prefix);
+        }
+        self.ids[i].clone()
+    }
+
+    pub fn apply_ids(&self, calls: &mut [ToolCall]) {
+        let n = calls.len().min(self.ids.len());
+        for i in 0..n {
+            if calls[i].id.is_empty() && !self.ids[i].is_empty() {
+                calls[i].id = self.ids[i].clone();
+            }
+        }
+    }
+
+    fn fail(&mut self) -> bool {
+        self.active = false;
+        self.state = DsmlToolState::Error;
+        true
+    }
+
+    pub fn update<S: ToolSink>(&mut self, sink: &mut S, raw: &[u8]) -> bool {
+        let Some(syn) = self.syn else {
+            return true;
+        };
+        while self.active && self.parse_pos < raw.len() {
+            match self.state {
+                DsmlToolState::BetweenInvokes => {
+                    while self.parse_pos < raw.len() && raw[self.parse_pos].is_ascii_whitespace() {
+                        self.parse_pos += 1;
+                    }
+                    if self.parse_pos >= raw.len() {
+                        return true;
+                    }
+                    if raw_full_lit(raw, self.parse_pos, syn.tool_calls_end) {
+                        self.parse_pos += syn.tool_calls_end.len();
+                        self.active = false;
+                        self.state = DsmlToolState::Done;
+                        return true;
+                    }
+                    if raw_partial_any(raw, self.parse_pos, syn.tool_calls_end, syn.invoke_start) {
+                        return true;
+                    }
+                    if raw_full_lit(raw, self.parse_pos, syn.invoke_start) {
+                        let before = self.parse_pos;
+                        let before_state = self.state;
+                        if !self.start_invoke(sink, raw) {
+                            return false;
+                        }
+                        if self.parse_pos == before && self.state == before_state {
+                            return true;
+                        }
+                        continue;
+                    }
+                    return self.fail();
+                }
+                DsmlToolState::BetweenParams => {
+                    while self.parse_pos < raw.len() && raw[self.parse_pos].is_ascii_whitespace() {
+                        self.parse_pos += 1;
+                    }
+                    if self.parse_pos >= raw.len() {
+                        return true;
+                    }
+                    if raw_full_lit(raw, self.parse_pos, syn.invoke_end) {
+                        if self.args_open && !sink.args_fragment(self.index, b"}") {
+                            return false;
+                        }
+                        self.args_open = false;
+                        if !sink.close_invoke(self.index) {
+                            return false;
+                        }
+                        self.parse_pos += syn.invoke_end.len();
+                        self.index += 1;
+                        self.state = DsmlToolState::BetweenInvokes;
+                        continue;
+                    }
+                    if raw_partial_any(raw, self.parse_pos, syn.invoke_end, syn.param_start) {
+                        return true;
+                    }
+                    if raw_full_lit(raw, self.parse_pos, syn.param_start) {
+                        let before = self.parse_pos;
+                        let before_state = self.state;
+                        if !self.start_param(sink, raw) {
+                            return false;
+                        }
+                        if self.parse_pos == before && self.state == before_state {
+                            return true;
+                        }
+                        continue;
+                    }
+                    return self.fail();
+                }
+                DsmlToolState::ParamValue => {
+                    if let Some(end) = find_lit_bounded(&raw[self.parse_pos..], syn.param_end) {
+                        if !self.finish_param(sink, raw, self.parse_pos + end) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let limit = tool_param_value_stream_safe_len(
+                        raw,
+                        self.parse_pos,
+                        syn.param_end,
+                        self.param_is_string,
+                    );
+                    if limit > self.parse_pos {
+                        let ok = if self.param_is_string {
+                            emit_string_value(sink, self.index, &raw[self.parse_pos..limit])
+                        } else {
+                            sink.args_fragment(self.index, &raw[self.parse_pos..limit])
+                        };
+                        if !ok {
+                            return false;
+                        }
+                        self.parse_pos = limit;
+                    }
+                    return true;
+                }
+                DsmlToolState::Done | DsmlToolState::Error => return true,
+            }
+        }
+        true
+    }
+
+    fn start_invoke<S: ToolSink>(&mut self, sink: &mut S, raw: &[u8]) -> bool {
+        let Some(rel) = raw[self.parse_pos..].iter().position(|&c| c == b'>') else {
+            return true;
+        };
+        let tag = &raw[self.parse_pos..self.parse_pos + rel + 1];
+        let Some(name) = dsml_attr(tag, "name") else {
+            return self.fail();
+        };
+        let id = self.id_at(self.index);
+        if !sink.start_invoke(self.index, &id, &name) {
+            return false;
+        }
+        if !sink.args_fragment(self.index, b"{") {
+            return false;
+        }
+        self.emitted_any = true;
+        self.args_open = true;
+        self.first_param = true;
+        self.parse_pos = self.parse_pos + rel + 1;
+        self.state = DsmlToolState::BetweenParams;
+        true
+    }
+
+    fn start_param<S: ToolSink>(&mut self, sink: &mut S, raw: &[u8]) -> bool {
+        let Some(rel) = raw[self.parse_pos..].iter().position(|&c| c == b'>') else {
+            return true;
+        };
+        let tag = &raw[self.parse_pos..self.parse_pos + rel + 1];
+        let (Some(name), Some(is_string)) = (dsml_attr(tag, "name"), dsml_attr(tag, "string")) else {
+            return self.fail();
+        };
+        let string_value = is_string == b"true";
+        if !emit_param_prefix(sink, self.index, &name, string_value, self.first_param) {
+            return false;
+        }
+        self.first_param = false;
+        self.param_is_string = string_value;
+        self.parse_pos = self.parse_pos + rel + 1;
+        self.state = DsmlToolState::ParamValue;
+        true
+    }
+
+    fn finish_param<S: ToolSink>(&mut self, sink: &mut S, raw: &[u8], value_end: usize) -> bool {
+        let syn = self.syn.unwrap();
+        if value_end > self.parse_pos {
+            let ok = if self.param_is_string {
+                emit_string_value(sink, self.index, &raw[self.parse_pos..value_end])
+            } else {
+                sink.args_fragment(self.index, &raw[self.parse_pos..value_end])
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if self.param_is_string && !sink.args_fragment(self.index, b"\"") {
+            return false;
+        }
+        self.parse_pos = value_end + syn.param_end.len();
+        self.state = DsmlToolState::BetweenParams;
+        true
+    }
+}
+
+pub trait ToolSink {
+    fn start_invoke(&mut self, index: i32, id: &str, name: &[u8]) -> bool;
+    fn args_fragment(&mut self, index: i32, text: &[u8]) -> bool;
+    fn close_invoke(&mut self, index: i32) -> bool;
+}
+
+fn emit_param_prefix<S: ToolSink>(
+    sink: &mut S,
+    index: i32,
+    name: &[u8],
+    is_string: bool,
+    first: bool,
+) -> bool {
+    let mut frag = Vec::new();
+    if !first {
+        frag.push(b',');
+    }
+    frag.extend(json_escape_bytes(name));
+    frag.push(b':');
+    if is_string {
+        frag.push(b'"');
+    }
+    sink.args_fragment(index, &frag)
+}
+
+fn emit_string_value<S: ToolSink>(sink: &mut S, index: i32, text: &[u8]) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    let unescaped = dsml_unescape_text(text);
+    let frag = json_escape_fragment(&unescaped);
+    sink.args_fragment(index, &frag)
+}
+
+pub fn json_escape_fragment(s: &[u8]) -> Vec<u8> {
+    let full = json_escape_bytes(s);
+    if full.len() >= 2 {
+        full[1..full.len() - 1].to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+fn raw_full_lit(raw: &[u8], pos: usize, lit: &[u8]) -> bool {
+    pos <= raw.len() && raw.len() - pos >= lit.len() && raw[pos..].starts_with(lit)
+}
+
+fn raw_partial_lit(raw: &[u8], pos: usize, lit: &[u8]) -> bool {
+    if pos > raw.len() || raw.len() - pos >= lit.len() {
+        return false;
+    }
+    raw[pos..] == lit[..raw.len() - pos]
+}
+
+fn raw_partial_any(raw: &[u8], pos: usize, a: &[u8], b: &[u8]) -> bool {
+    raw_partial_lit(raw, pos, a) || raw_partial_lit(raw, pos, b)
+}
+
+fn find_lit_bounded(s: &[u8], lit: &[u8]) -> Option<usize> {
+    if lit.is_empty() {
+        return Some(0);
+    }
+    s.windows(lit.len()).position(|w| w == lit)
+}
+
+fn dsml_entity_stream_safe_len(raw: &[u8], start: usize, limit: usize) -> usize {
+    const ENTS: &[&[u8]] = &[b"&amp;", b"&lt;", b"&gt;", b"&quot;", b"&apos;"];
+    let max_ent = 6;
+    let scan = if limit > start + max_ent {
+        limit - max_ent
+    } else {
+        start
+    };
+    for i in (scan + 1..=limit).rev() {
+        if raw[i - 1] != b'&' {
+            continue;
+        }
+        let amp = i - 1;
+        let tail = limit - amp;
+        for ent in ENTS {
+            if tail < ent.len() && raw[amp..].starts_with(&ent[..tail]) {
+                return amp;
+            }
+        }
+        break;
+    }
+    limit
+}
+
+fn tool_param_value_stream_safe_len(
+    raw: &[u8],
+    start: usize,
+    param_end: &[u8],
+    is_string: bool,
+) -> usize {
+    let raw_len = raw.len();
+    let mut limit = raw_len;
+    let end_len = param_end.len();
+    let scan = if raw_len > start + end_len {
+        raw_len - end_len
+    } else {
+        start
+    };
+    for i in (scan + 1..=raw_len).rev() {
+        if raw[i - 1] != b'<' {
+            continue;
+        }
+        let marker = i - 1;
+        let tail = raw_len - marker;
+        if tail < end_len && raw[marker..].starts_with(&param_end[..tail]) {
+            limit = marker;
+        }
+        break;
+    }
+    if is_string {
+        limit = dsml_entity_stream_safe_len(raw, start, limit);
+    }
+    utf8_stream_safe_len(raw, start, limit, false)
+}
+
+/// Tape dumps matching `tests/parity/tool_stream_c_oracle`.
+pub fn dump_script(name: &str) -> Vec<u8> {
+    use crate::parse::ToolCall;
+    use crate::route::{Api, ReqKind, ThinkMode};
+    use crate::stream::{
+        anthropic_sse_finish_live, anthropic_sse_start_live, anthropic_sse_stream_update,
+        openai_sse_finish_live, openai_sse_stream_update, openai_stream_start, sse_chunk,
+        ChatFormat, StreamReq, Writer, CREATED_TEST,
+    };
+
+    let swapped_bash = [ToolCall {
+        name: "bash".into(),
+        arguments: "{\"description\":\"list files\",\"command\":\"ls -la\",\"timeout\":10}".into(),
+        ..Default::default()
+    }];
+
+    let mut r = StreamReq {
+        kind: ReqKind::Chat,
+        api: Api::Openai,
+        model: "deepseek-v4-flash".into(),
+        think_mode: ThinkMode::None,
+        has_tools: true,
+        stream: true,
+        chat_format: ChatFormat::DeepSeek,
+        ..StreamReq::default()
+    };
+
+    match name {
+        "openai-partial" => {
+            let mut w = Writer::new(CREATED_TEST);
+            sse_chunk(&mut w, &r, "chatcmpl_partial_tool", None, None);
+            let mut st = openai_stream_start(&r);
+            let raw1 = format!(
+                "Before.\n\n{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo partial",
+                DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
+            );
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_partial_tool", &mut st, raw1.as_bytes(), false);
+            let raw2 = format!(
+                "Before.\n\n{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo partial done{}\n{}\n{}",
+                DSML_TOOL_CALLS_START,
+                DSML_INVOKE_START,
+                DSML_PARAM_START,
+                DSML_PARAM_END,
+                DSML_INVOKE_END,
+                DSML_TOOL_CALLS_END
+            );
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_partial_tool", &mut st, raw2.as_bytes(), false);
+            openai_sse_finish_live(
+                &mut w,
+                &r,
+                "chatcmpl_partial_tool",
+                &mut st,
+                raw2.as_bytes(),
+                "tool_calls",
+                10,
+                4,
+                &[],
+            );
+            w.out
+        }
+        "openai-raw" => {
+            let mut w = Writer::new(CREATED_TEST);
+            let mut st = openai_stream_start(&r);
+            let raw = format!(
+                "{}\n{} name=\"edit\">\n{} name=\"edits\" string=\"false\">[1,2,3",
+                DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
+            );
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_raw_tool", &mut st, raw.as_bytes(), false);
+            w.out
+        }
+        "openai-wait-tag" => {
+            let mut w = Writer::new(CREATED_TEST);
+            let mut st = openai_stream_start(&r);
+            let raw1 = format!("{}\n{}", DSML_TOOL_CALLS_START, DSML_INVOKE_START);
+            openai_sse_stream_update(
+                &mut w,
+                &r,
+                "chatcmpl_incomplete_tool",
+                &mut st,
+                raw1.as_bytes(),
+                false,
+            );
+            let raw2 = format!(
+                "{}\n{} name=\"bash\">\n{}",
+                DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
+            );
+            openai_sse_stream_update(
+                &mut w,
+                &r,
+                "chatcmpl_incomplete_tool",
+                &mut st,
+                raw2.as_bytes(),
+                false,
+            );
+            w.out
+        }
+        "openai-entity" => {
+            let mut w = Writer::new(CREATED_TEST);
+            let mut st = openai_stream_start(&r);
+            let raw1 = format!(
+                "{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo &amp",
+                DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
+            );
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_entity_tool", &mut st, raw1.as_bytes(), false);
+            let raw2 = format!(
+                "{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo &amp; done{}\n{}\n{}",
+                DSML_TOOL_CALLS_START,
+                DSML_INVOKE_START,
+                DSML_PARAM_START,
+                DSML_PARAM_END,
+                DSML_INVOKE_END,
+                DSML_TOOL_CALLS_END
+            );
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_entity_tool", &mut st, raw2.as_bytes(), false);
+            w.out
+        }
+        "openai-think-tool" => {
+            r.think_mode = ThinkMode::Low;
+            let mut w = Writer::new(CREATED_TEST);
+            sse_chunk(&mut w, &r, "chatcmpl_test", None, None);
+            let mut st = openai_stream_start(&r);
+            let raw1 = "<think>need a tool</think>Hello.\n\n";
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_test", &mut st, raw1.as_bytes(), false);
+            let raw2 = format!(
+                "<think>need a tool</think>Hello.\n\n{}\n",
+                DSML_TOOL_CALLS_START
+            );
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_test", &mut st, raw2.as_bytes(), false);
+            openai_sse_finish_live(
+                &mut w,
+                &r,
+                "chatcmpl_test",
+                &mut st,
+                raw2.as_bytes(),
+                "tool_calls",
+                10,
+                8,
+                &swapped_bash,
+            );
+            w.out
+        }
+        "anthropic-partial" => {
+            r.api = Api::Anthropic;
+            let mut w = Writer::new(CREATED_TEST);
+            let mut st = anthropic_sse_start_live(&mut w, &r, "msg_tool", 7);
+            let raw1 = format!(
+                "Before.\n\n{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo partial",
+                DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
+            );
+            anthropic_sse_stream_update(&mut w, &r, "msg_tool", &mut st, raw1.as_bytes(), false);
+            let raw2 = format!(
+                "Before.\n\n{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo partial done{}\n{}\n{}",
+                DSML_TOOL_CALLS_START,
+                DSML_INVOKE_START,
+                DSML_PARAM_START,
+                DSML_PARAM_END,
+                DSML_INVOKE_END,
+                DSML_TOOL_CALLS_END
+            );
+            anthropic_sse_stream_update(&mut w, &r, "msg_tool", &mut st, raw2.as_bytes(), false);
+            anthropic_sse_finish_live(
+                &mut w,
+                &r,
+                "msg_tool",
+                &mut st,
+                raw2.as_bytes(),
+                "tool_calls",
+                None,
+                5,
+                &[],
+            );
+            w.out
+        }
+        "anthropic-think-tool" => {
+            r.api = Api::Anthropic;
+            r.think_mode = ThinkMode::Low;
+            let mut w = Writer::new(CREATED_TEST);
+            let mut st = anthropic_sse_start_live(&mut w, &r, "msg_test", 10);
+            let raw1 = "need a tool</think>Hello.\n\n";
+            anthropic_sse_stream_update(&mut w, &r, "msg_test", &mut st, raw1.as_bytes(), false);
+            let raw2 = format!("need a tool</think>Hello.\n\n{}\n", DSML_TOOL_CALLS_START);
+            anthropic_sse_stream_update(&mut w, &r, "msg_test", &mut st, raw2.as_bytes(), false);
+            anthropic_sse_finish_live(
+                &mut w,
+                &r,
+                "msg_test",
+                &mut st,
+                raw2.as_bytes(),
+                "tool_calls",
+                None,
+                8,
+                &swapped_bash,
+            );
+            w.out
+        }
+        "openai-utf8" => {
+            let mut w = Writer::new(CREATED_TEST);
+            let mut st = openai_stream_start(&r);
+            let mut raw1 = format!(
+                "{}\n{} name=\"write\">\n{} name=\"content\" string=\"true\">flag ",
+                DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
+            )
+            .into_bytes();
+            raw1.extend_from_slice(&[0xf0, 0x9f]);
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_utf8_tool", &mut st, &raw1, false);
+            let mut raw2 = format!(
+                "{}\n{} name=\"write\">\n{} name=\"content\" string=\"true\">flag ",
+                DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
+            )
+            .into_bytes();
+            raw2.extend_from_slice(&[0xf0, 0x9f, 0x9a, 0xa9]);
+            raw2.extend_from_slice(
+                format!(
+                    " done{}\n{}\n{}",
+                    DSML_PARAM_END, DSML_INVOKE_END, DSML_TOOL_CALLS_END
+                )
+                .as_bytes(),
+            );
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_utf8_tool", &mut st, &raw2, false);
+            w.out
+        }
+        "openai-multi" => {
+            let mut w = Writer::new(CREATED_TEST);
+            let mut st = openai_stream_start(&r);
+            let raw = format!(
+                "{}\n{} name=\"read\">\n{} name=\"path\" string=\"true\">a.c{}\n{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">wc -l a.c{}\n{}\n{}",
+                DSML_TOOL_CALLS_START,
+                DSML_INVOKE_START,
+                DSML_PARAM_START,
+                DSML_PARAM_END,
+                DSML_INVOKE_END,
+                DSML_INVOKE_START,
+                DSML_PARAM_START,
+                DSML_PARAM_END,
+                DSML_INVOKE_END,
+                DSML_TOOL_CALLS_END
+            );
+            openai_sse_stream_update(&mut w, &r, "chatcmpl_multi_tool", &mut st, raw.as_bytes(), false);
+            w.out
+        }
+        _ => b"ERROR unknown-script\n".to_vec(),
+    }
+}

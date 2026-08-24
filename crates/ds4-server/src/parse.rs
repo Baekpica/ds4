@@ -39,6 +39,8 @@ pub struct ChatMsg {
     pub tool_call_id: String,
     pub tool_call_ids: Vec<String>,
     pub calls: Vec<ToolCall>,
+    pub raw_dsml: String,
+    pub raw_tool_text: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -57,6 +59,8 @@ pub struct ParseEnv {
     pub default_tokens: i32,
     pub default_effort: ThinkMode,
     pub default_temp: f32,
+    /// LIVE call ids for this surface at parse time (C `*_live_has_call_id`).
+    pub live_ids: Vec<String>,
 }
 
 impl Default for ParseEnv {
@@ -66,6 +70,7 @@ impl Default for ParseEnv {
             default_tokens: 393216,
             default_effort: ThinkMode::Low,
             default_temp: default_temperature(),
+            live_ids: Vec::new(),
         }
     }
 }
@@ -98,14 +103,18 @@ pub struct ParsedRequest {
     pub has_tools: bool,
     pub has_tool_results: bool,
     pub tool_choice: ToolChoice,
+    pub required_tool_prefix: Vec<i32>,
+    pub required_think_end_prefix: Vec<i32>,
     pub stops: Vec<String>,
     pub reasoning_summary_emit: bool,
     pub responses_requires_live_tool_state: bool,
     pub responses_requires_live_reasoning: bool,
     pub anthropic_requires_live_tool_state: bool,
     pub live_state_bank_owned: bool,
+    pub live_call_ids: Vec<String>,
     pub messages: Vec<ChatMsg>,
     pub tool_schemas: String,
+    pub tool_orders: Vec<ToolSchemaOrder>,
     pub prompt_text: Option<String>,
     pub needs: u32,
 }
@@ -131,14 +140,18 @@ impl ParsedRequest {
             has_tools: false,
             has_tool_results: false,
             tool_choice: ToolChoice::Auto,
+            required_tool_prefix: Vec::new(),
+            required_think_end_prefix: Vec::new(),
             stops: Vec::new(),
             reasoning_summary_emit: false,
             responses_requires_live_tool_state: false,
             responses_requires_live_reasoning: false,
             anthropic_requires_live_tool_state: false,
             live_state_bank_owned: false,
+            live_call_ids: Vec::new(),
             messages: Vec::new(),
             tool_schemas: String::new(),
+            tool_orders: Vec::new(),
             prompt_text: None,
             needs: 0,
         }
@@ -1337,7 +1350,15 @@ fn apply_think_aliases(r: &ParsedRequest, got_thinking: bool, enabled: bool) -> 
     e
 }
 
-fn anthropic_validate_tool_results(msgs: &[ChatMsg], err: &mut String) -> Result<bool, ()> {
+fn id_is_live(live: &[String], id: &str) -> bool {
+    live.iter().any(|x| x == id)
+}
+
+fn anthropic_validate_tool_results(
+    msgs: &[ChatMsg],
+    live: &[String],
+    err: &mut String,
+) -> Result<bool, ()> {
     let mut requires_live = false;
     for (i, m) in msgs.iter().enumerate() {
         if m.role != "user" || (m.tool_call_id.is_empty() && m.tool_call_ids.is_empty()) {
@@ -1345,7 +1366,7 @@ fn anthropic_validate_tool_results(msgs: &[ChatMsg], err: &mut String) -> Result
         }
         for id in collect_tool_call_ids(m) {
             let prior = find_prior_call(msgs, i, &id);
-            if prior.is_none() {
+            if prior.is_none() && !id_is_live(live, &id) {
                 *err = format!(
                     "Anthropic continuation state is not available for tool_use_id {id}; retry by replaying the full messages history"
                 );
@@ -1362,6 +1383,7 @@ fn anthropic_validate_tool_results(msgs: &[ChatMsg], err: &mut String) -> Result
 fn responses_validate_tool_outputs(
     msgs: &[ChatMsg],
     think: ThinkMode,
+    live: &[String],
     err: &mut String,
 ) -> Result<(bool, bool), ()> {
     let mut live_tool = false;
@@ -1373,7 +1395,7 @@ fn responses_validate_tool_outputs(
         }
         for id in collect_tool_call_ids(m) {
             let prior = find_prior_call(msgs, i, &id);
-            if prior.is_none() {
+            if prior.is_none() && !id_is_live(live, &id) {
                 *err = format!(
                     "Responses continuation state is not available for call_id {id}; retry by replaying the full input history"
                 );
@@ -1964,9 +1986,9 @@ pub fn parse_chat_request(env: &ParseEnv, body: &str) -> Result<ParsedRequest, S
         return Err(err);
     }
     apply_think(&mut r, got_thinking, thinking_enabled, reasoning_effort);
-    let _ = orders;
     r.messages = msgs;
     r.tool_schemas = tool_schemas;
+    r.tool_orders = orders;
     r.finish_needs();
     Ok(r)
 }
@@ -2109,6 +2131,7 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
     let mut msgs = Vec::new();
     let mut system = None;
     let mut tool_schemas = String::new();
+    let mut orders = Vec::new();
 
     p.ws();
     if p.bump() != Some(b'{') {
@@ -2142,8 +2165,9 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
             }
         } else if key == "tools" {
             match parse_tools_value(&mut p) {
-                Some((s, _)) => {
+                Some((s, o)) => {
                     tool_schemas = s;
+                    orders = o;
                     true
                 }
                 None => false,
@@ -2252,12 +2276,14 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
         return Err(err);
     }
     apply_think(&mut r, got_thinking, thinking_enabled, reasoning_effort);
-    match anthropic_validate_tool_results(&msgs, &mut err) {
+    match anthropic_validate_tool_results(&msgs, &env.live_ids, &mut err) {
         Ok(live) => r.anthropic_requires_live_tool_state = live,
         Err(()) => return Err(err),
     }
+    r.live_call_ids = crate::cont::live_tool_result_ids(Api::Anthropic, &msgs);
     r.messages = msgs;
     r.tool_schemas = tool_schemas;
+    r.tool_orders = orders;
     r.finish_needs();
     Ok(r)
 }
@@ -2435,16 +2461,17 @@ pub fn parse_responses_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
         return Err(err);
     }
     apply_think(&mut r, got_thinking, thinking_enabled, reasoning_effort);
-    match responses_validate_tool_outputs(&msgs, r.think_mode, &mut err) {
+    match responses_validate_tool_outputs(&msgs, r.think_mode, &env.live_ids, &mut err) {
         Ok((t, reason)) => {
             r.responses_requires_live_tool_state = t;
             r.responses_requires_live_reasoning = reason;
         }
         Err(()) => return Err(err),
     }
+    r.live_call_ids = crate::cont::live_tool_result_ids(Api::Responses, &msgs);
     r.messages = msgs;
     r.tool_schemas = combined;
-    let _ = orders;
+    r.tool_orders = orders;
     r.finish_needs();
     Ok(r)
 }
