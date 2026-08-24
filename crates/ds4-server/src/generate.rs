@@ -371,6 +371,56 @@ pub fn generate_and_write(
     default_tokens: i32,
     out: &mut impl Write,
 ) -> Result<GenerateOutcome, GenerateError> {
+    generate_and_write_at(
+        engine,
+        parsed,
+        job_id,
+        created,
+        cors,
+        default_tokens,
+        Instant::now(),
+        out,
+    )
+}
+
+/// Queue-aware serial entry point. `t_arrive` is captured by the HTTP owner;
+/// callers outside the queued server should use [`generate_and_write`].
+pub fn generate_and_write_at(
+    engine: &mut dyn DecodeIo,
+    parsed: &ParsedRequest,
+    job_id: &str,
+    created: i64,
+    cors: bool,
+    default_tokens: i32,
+    t_arrive: Instant,
+    out: &mut impl Write,
+) -> Result<GenerateOutcome, GenerateError> {
+    let (outcome, terminal) = generate_terminal_at(
+        engine,
+        parsed,
+        job_id,
+        created,
+        cors,
+        default_tokens,
+        t_arrive,
+        out,
+    )?;
+    out.write_all(&terminal).map_err(|_| GenerateError::Io)?;
+    Ok(outcome)
+}
+
+/// Runs serial generation while withholding only the final wire terminal.
+/// Streaming headers/deltas still flow through `out` as they are produced.
+pub(crate) fn generate_terminal_at(
+    engine: &mut dyn DecodeIo,
+    parsed: &ParsedRequest,
+    job_id: &str,
+    created: i64,
+    cors: bool,
+    default_tokens: i32,
+    t_arrive: Instant,
+    out: &mut impl Write,
+) -> Result<(GenerateOutcome, Vec<u8>), GenerateError> {
     if let Some(msg) = generation_blocked(parsed, engine.model_id()) {
         return Err(GenerateError::Unsupported(msg));
     }
@@ -378,7 +428,6 @@ pub fn generate_and_write(
     let mut parsed = parsed.clone();
     prepare_required_prefixes(engine, &mut parsed, chat_format_for_syntax(syntax_for_model_id(engine.model_id())))?;
 
-    let t_arrive = Instant::now();
     let prompt = render_prompt(&parsed, engine.model_id())?;
     let tokens = match parsed.kind {
         ReqKind::Completion => {
@@ -387,6 +436,7 @@ pub fn generate_and_write(
         }
         ReqKind::Chat => engine.tokenize_rendered_chat(&prompt)?,
     };
+    let t_prefill = Instant::now();
     engine.sync(&tokens)?;
     let decode_t0 = Instant::now();
     let mut first_tok = None;
@@ -569,7 +619,7 @@ pub fn generate_and_write(
             req.timings = ReqTimings {
                 valid: true,
                 ttft_ms: t_first.duration_since(t_arrive).as_secs_f64() * 1e3,
-                prefill_ms: decode_t0.duration_since(t_arrive).as_secs_f64() * 1e3,
+                prefill_ms: decode_t0.duration_since(t_prefill).as_secs_f64() * 1e3,
                 decode_ms: Instant::now().duration_since(t_first).as_secs_f64() * 1e3,
                 prefill_tokens: prompt_n,
                 prefill_cached: req.cache_read_tokens,
@@ -589,7 +639,7 @@ pub fn generate_and_write(
         finish = "tool_calls";
     }
     let matched_stop = acc.matched_stop.clone();
-    if req.stream {
+    let terminal = if req.stream {
         match req.api {
             Api::Openai if req.kind == ReqKind::Completion => {
                 sse_chunk(&mut w, &req, job_id, None, Some(finish));
@@ -642,7 +692,7 @@ pub fn generate_and_write(
                 }
             }
         }
-        flush(&mut w, out)?;
+        std::mem::take(&mut w.out)
     } else {
         let bytes = match req.api {
             Api::Anthropic => anthropic_final_response(
@@ -688,9 +738,9 @@ pub fn generate_and_write(
                 &parsed_gen.calls,
             ),
         };
-        out.write_all(&bytes).map_err(|_| GenerateError::Io)?;
-    }
-    Ok(GenerateOutcome {
+        bytes
+    };
+    let outcome = GenerateOutcome {
         tool_ids: parsed_gen
             .calls
             .iter()
@@ -700,7 +750,8 @@ pub fn generate_and_write(
         generation: engine.generation(),
         frontier: engine.pos(),
         finish: finish.to_string(),
-    })
+    };
+    Ok((outcome, terminal))
 }
 
 fn last_delta(raw: &[u8], emit_limit: usize, piece_len: usize) -> Option<&[u8]> {
