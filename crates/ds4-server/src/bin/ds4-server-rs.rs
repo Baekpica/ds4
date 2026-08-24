@@ -3,6 +3,7 @@
 //! Incremental live DSML tool projection is host-owned.
 
 use ds4_core::{Backend, Model};
+use ds4_server::kv_cli::DiskKvArgs;
 use ds4_server::{
     accept_loop, accept_loop_with_engine, accept_loop_with_engine_cont, listen,
     model_id_from_gguf_path, ContLane, NativeDecode, ServerConfig,
@@ -14,8 +15,15 @@ fn main() {
     let mut backend = Backend::Cuda;
     let mut n_threads = 0i32;
     let mut cont_width = 2i32;
+    let mut kv = DiskKvArgs::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if kv
+            .parse_arg(&arg, &mut args)
+            .unwrap_or_else(|error| cli_error(&error))
+        {
+            continue;
+        }
         match arg.as_str() {
             "--listen" => {
                 cfg.listen_host = args.next().unwrap_or_else(|| usage());
@@ -94,6 +102,7 @@ fn main() {
         },
         None => None,
     };
+    let kv_store = if model.is_some() { kv.open() } else { None };
 
     let listener = listen(&cfg).unwrap_or_else(|e| {
         eprintln!(
@@ -136,6 +145,9 @@ fn main() {
             None
         };
         let mut engine = NativeDecode::new(model, cfg.ctx).with_vocab(model.vocab());
+        if let Some(store) = kv_store {
+            engine = engine.with_store(store);
+        }
         match lane {
             Some(mut lane) => {
                 accept_loop_with_engine_cont(listener, cfg, &mut engine, &mut lane)
@@ -147,9 +159,16 @@ fn main() {
     }
 }
 
+fn cli_error(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(2);
+}
+
 fn usage() -> ! {
     eprintln!(
-        "usage: ds4-server-rs --listen HOST PORT [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--cont-width N] [--cors]"
+        "usage: ds4-server-rs --listen HOST PORT [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--cont-width N] [--cors]\n\
+         Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-cache-min-tokens N]\n\
+         [--kv-cache-reject-different-quant]"
     );
     std::process::exit(2);
 }

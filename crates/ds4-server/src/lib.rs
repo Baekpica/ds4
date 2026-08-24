@@ -8,6 +8,7 @@ pub mod format;
 pub mod generate;
 pub mod http;
 pub mod json;
+pub mod kv_cli;
 pub mod metrics;
 pub mod models;
 pub mod parse;
