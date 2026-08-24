@@ -7,11 +7,14 @@ use crate::sha1::sha1_hex;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const FIXED_HEADER: usize = 48;
 pub const MAGIC: [u8; 3] = [b'K', b'V', b'C'];
 pub const VERSION: u8 = 1;
 pub const PAYLOAD_ABI: u8 = 2;
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub const EXT_TOOL_MAP: u8 = 1 << 0;
 pub const EXT_RESPONSES_VISIBLE: u8 = 1 << 1;
@@ -306,6 +309,63 @@ pub fn write_path(path: &Path, record: &Record) -> Result<(), FormatError> {
     Ok(())
 }
 
+pub(crate) fn write_stream(
+    path: &Path,
+    header: &Header,
+    text: &[u8],
+    payload: &mut impl Read,
+    payload_bytes: u64,
+    trailer: &[u8],
+) -> Result<(), FormatError> {
+    if text.len() > u32::MAX as usize {
+        return Err(FormatError::TextLenMismatch);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let (tmp, mut f) = loop {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("kv.tmp.{}.{}", std::process::id(), seq));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(FormatError::Io(e)),
+        }
+    };
+    let result = (|| {
+        let h = fill_header(
+            header.model_id,
+            header.quant_bits,
+            header.reason,
+            header.ext_flags,
+            header.tokens,
+            header.hits,
+            header.ctx_size,
+            header.created_at,
+            header.last_used,
+            payload_bytes,
+        );
+        f.write_all(&h)?;
+        let mut raw_text_bytes = [0u8; 4];
+        le_put32(&mut raw_text_bytes, text.len() as u32);
+        f.write_all(&raw_text_bytes)?;
+        f.write_all(text)?;
+        let copied = io::copy(&mut payload.take(payload_bytes), &mut f)?;
+        if copied != payload_bytes {
+            return Err(FormatError::Truncated);
+        }
+        f.write_all(trailer)?;
+        f.flush()?;
+        drop(f);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 pub fn read_path(path: &Path) -> Result<Record, FormatError> {
     let mut f = fs::File::open(path)?;
     let mut bytes = Vec::new();
@@ -423,6 +483,23 @@ pub fn is_automatic_exact_replay(reason: Reason, ext_flags: u8) -> bool {
 mod tests {
     use super::*;
 
+    struct ErrorAfterPrefix {
+        offset: usize,
+    }
+
+    impl Read for ErrorAfterPrefix {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            const PREFIX: &[u8] = b"DSV4";
+            if self.offset == PREFIX.len() {
+                return Err(io::Error::other("injected payload read failure"));
+            }
+            let n = buf.len().min(PREFIX.len() - self.offset);
+            buf[..n].copy_from_slice(&PREFIX[self.offset..self.offset + n]);
+            self.offset += n;
+            Ok(n)
+        }
+    }
+
     fn sample() -> Record {
         Record {
             header: Header {
@@ -496,5 +573,71 @@ mod tests {
         let sha = text_sha_hex(b"hello");
         assert_eq!(sha.len(), 40);
         assert_eq!(sha_hex_name(&format!("{sha}.kv")).as_deref(), Some(sha.as_str()));
+    }
+
+    #[test]
+    fn stream_failure_preserves_destination_and_removes_temp() {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-stream-failure-{}", std::process::id()));
+        let path = dir.join("entry.kv");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"original KVC bytes").unwrap();
+
+        let rec = sample();
+        let mut payload = ErrorAfterPrefix { offset: 0 };
+        let result = write_stream(&path, &rec.header, &rec.text, &mut payload, 8, &rec.trailer);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original KVC bytes");
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, [std::ffi::OsString::from("entry.kv")]);
+
+        let mut short_payload = &b"DSV4"[..];
+        let result = write_stream(
+            &path,
+            &rec.header,
+            &rec.text,
+            &mut short_payload,
+            8,
+            &rec.trailer,
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original KVC bytes");
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("entry.kv")]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_layout_matches_buffered_encoder() {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-stream-layout-{}", std::process::id()));
+        let path = dir.join("entry.kv");
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut rec = sample();
+        rec.trailer = b"KVT1 trailer".to_vec();
+        let mut payload = rec.payload.as_slice();
+        write_stream(
+            &path,
+            &rec.header,
+            &rec.text,
+            &mut payload,
+            rec.payload.len() as u64,
+            &rec.trailer,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), encode_file(&rec));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
