@@ -917,7 +917,7 @@ pub(crate) fn generate_terminal_at(
                 ttft_ms: t_first.duration_since(t_arrive).as_secs_f64() * 1e3,
                 prefill_ms: decode_t0.duration_since(t_prefill).as_secs_f64() * 1e3,
                 decode_ms: Instant::now().duration_since(t_first).as_secs_f64() * 1e3,
-                prefill_tokens: prompt_n,
+                prefill_tokens: prompt_n - req.cache_read_tokens,
                 prefill_cached: req.cache_read_tokens,
                 decode_tokens: completion,
                 decode_steps,

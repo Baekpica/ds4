@@ -235,6 +235,8 @@ fn prompt_sync_reports_buffered_cache_usage_from_effective_pos() {
         s.contains("\"cached_tokens\":4,\"cache_write_tokens\":2"),
         "cache writes must use effective engine pos minus cache reads: {s}"
     );
+    assert!(s.contains("\"prefill_tokens\":2"), "{s}");
+    assert!(s.contains("\"prefill_cached_tokens\":4"), "{s}");
     assert_eq!(engine.prompt_sync_calls, 1);
     assert_eq!(engine.sync_calls, 0);
     assert_eq!(engine.disk_eligible, [true]);
